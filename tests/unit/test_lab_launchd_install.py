@@ -27,6 +27,96 @@ ROOT = Path(__file__).resolve().parents[2]
 TRUSTED_GIT = Path("/usr/bin/git")
 
 
+def _binding(path: Path) -> dict[str, object]:
+    observed = path.lstat()
+    return {
+        "path": str(path),
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "device": observed.st_dev,
+        "inode": observed.st_ino,
+    }
+
+
+def test_validate_binding_rejects_same_content_inode_swap_during_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "agent.plist"
+    replacement = tmp_path / "replacement.plist"
+    path.write_bytes(b"same")
+    replacement.write_bytes(b"same")
+    path.chmod(0o600)
+    replacement.chmod(0o600)
+    binding = _binding(path)
+    replaced = False
+    original_read_bytes = Path.read_bytes
+    original_os_read = install_module.os.read
+
+    def replace_once() -> None:
+        nonlocal replaced
+        if not replaced:
+            replaced = True
+            os.replace(replacement, path)
+
+    def racing_path_read(candidate: Path) -> bytes:
+        if candidate == path:
+            replace_once()
+        return original_read_bytes(candidate)
+
+    def racing_os_read(descriptor: int, size: int) -> bytes:
+        replace_once()
+        return original_os_read(descriptor, size)
+
+    monkeypatch.setattr(Path, "read_bytes", racing_path_read)
+    monkeypatch.setattr(install_module.os, "read", racing_os_read)
+
+    with pytest.raises(LabLaunchdInstallError, match="changed"):
+        LabLaunchdInstaller._validate_binding(binding, path)
+
+    assert replaced
+
+
+def test_read_existing_rejects_same_content_inode_swap_during_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "com.roxor.rquant-lab-worker.plist"
+    path = tmp_path / name
+    replacement = tmp_path / "replacement.plist"
+    path.write_bytes(b"same")
+    replacement.write_bytes(b"same")
+    path.chmod(0o600)
+    replacement.chmod(0o600)
+    replaced = False
+    original_read_bytes = Path.read_bytes
+    original_os_read = install_module.os.read
+
+    def replace_once() -> None:
+        nonlocal replaced
+        if not replaced:
+            replaced = True
+            os.replace(replacement, path)
+
+    def racing_path_read(candidate: Path) -> bytes:
+        if candidate == path:
+            replace_once()
+        return original_read_bytes(candidate)
+
+    def racing_os_read(descriptor: int, size: int) -> bytes:
+        replace_once()
+        return original_os_read(descriptor, size)
+
+    monkeypatch.setattr(Path, "read_bytes", racing_path_read)
+    monkeypatch.setattr(install_module.os, "read", racing_os_read)
+    installer = object.__new__(LabLaunchdInstaller)
+    installer.launch_agents_dir = tmp_path
+
+    with pytest.raises(LabLaunchdInstallError, match="changed"):
+        installer._read_existing(name)
+
+    assert replaced
+
+
 def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, str]:
     repo = tmp_path / "repo"
     (repo / "src" / "rquant").mkdir(parents=True)

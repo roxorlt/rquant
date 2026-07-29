@@ -266,6 +266,7 @@ def _validate_daemon_argv(
         "--deployment-generation",
         "--deployment-generation-fd",
         "--deployment-lock-path",
+        "--startup-deadline-monotonic",
     ):
         if forbidden in daemon_argv:
             raise WrapperError("deployment generation arguments are wrapper-controlled")
@@ -364,16 +365,25 @@ def _acquire_immutable_generation(code_root: Path, raw_path: str) -> tuple[Path,
         raise WrapperError("deployment generation lock is unavailable") from exc
 
 
-def _git_commit(root: Path, *, git_path: Path, git_identity: _PathIdentity) -> str:
+def _git_commit(
+    root: Path,
+    *,
+    git_path: Path,
+    git_identity: _PathIdentity,
+    deadline_monotonic: float,
+) -> str:
     _assert_trusted_git(git_path, git_identity)
+    if time.monotonic() >= deadline_monotonic:
+        raise subprocess.TimeoutExpired([str(git_path), "rev-parse", "HEAD^{commit}"], 0)
     try:
         result = run_contained(
             [str(git_path), "rev-parse", "--verify", "HEAD^{commit}"],
             cwd=root,
-            deadline_monotonic=time.monotonic() + 5,
+            deadline_monotonic=deadline_monotonic,
             check=True,
             text=True,
             env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"},
+            may_spawn_background_descendants=False,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise WrapperError("checkout commit cannot be verified") from exc
@@ -397,7 +407,7 @@ def _run_preflight(
     handoff_label: str | None = None,
     daemon_command: str,
     immutable_generation: bool = False,
-    deadline_monotonic: float | None = None,
+    deadline_monotonic: float,
 ) -> None:
     _assert_trusted_git(git_path, git_identity)
     command = [
@@ -427,9 +437,10 @@ def _run_preflight(
     result = run_contained(
         command,
         cwd=root,
-        deadline_monotonic=deadline_monotonic or (time.monotonic() + 15),
+        deadline_monotonic=deadline_monotonic,
         check=False,
         pass_fds=(deployment_lock_fd,),
+        may_spawn_background_descendants=False,
     )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()[:2048]
@@ -450,7 +461,7 @@ def _run_prepared_sentinel_preflight(
     root: Path,
     daemon_command: str,
     immutable_generation: bool = False,
-    deadline_monotonic: float | None = None,
+    deadline_monotonic: float,
 ) -> None:
     command = [
         str(python),
@@ -468,8 +479,9 @@ def _run_prepared_sentinel_preflight(
     result = run_contained(
         command,
         cwd=root,
-        deadline_monotonic=deadline_monotonic or (time.monotonic() + 15),
+        deadline_monotonic=deadline_monotonic,
         check=False,
+        may_spawn_background_descendants=False,
     )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()[:2048]
@@ -681,6 +693,7 @@ def main(argv: list[str] | None = None) -> int:
             root,
             git_path=trusted_git,
             git_identity=trusted_git_identity,
+            deadline_monotonic=startup_deadline,
         )
         _run_preflight(
             python=python,
@@ -743,6 +756,7 @@ def main(argv: list[str] | None = None) -> int:
                 root,
                 git_path=trusted_git,
                 git_identity=trusted_git_identity,
+                deadline_monotonic=startup_deadline,
             )
             != expected_commit
         ):
@@ -787,6 +801,7 @@ def main(argv: list[str] | None = None) -> int:
                 root,
                 git_path=trusted_git,
                 git_identity=trusted_git_identity,
+                deadline_monotonic=startup_deadline,
             )
             != expected_commit
         ):
@@ -827,6 +842,7 @@ def main(argv: list[str] | None = None) -> int:
                 root,
                 git_path=trusted_git,
                 git_identity=trusted_git_identity,
+                deadline_monotonic=startup_deadline,
             )
             != expected_commit
         ):

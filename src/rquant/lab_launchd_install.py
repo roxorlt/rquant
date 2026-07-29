@@ -38,6 +38,7 @@ LAB_LAUNCHD_LABELS = (
 )
 _STATE_SCHEMA_VERSION = 2
 _TRANSACTION_SCHEMA_VERSION = 1
+_MAX_BOUND_FILE_BYTES = 4 * 1024 * 1024
 
 
 class LabLaunchdInstallError(RuntimeError):
@@ -101,6 +102,71 @@ def _write_all(descriptor: int, payload: bytes) -> None:
         offset += written
 
 
+def _read_bound_regular_file(
+    path: Path,
+    *,
+    label: str,
+    require_private: bool,
+) -> tuple[bytes, os.stat_result]:
+    parent = _private_directory(path.parent, label=f"{label} parent")
+    root_fd = -1
+    descriptor = -1
+    try:
+        root_fd = os.open(
+            path.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened_parent = os.fstat(root_fd)
+        if (opened_parent.st_dev, opened_parent.st_ino) != (parent.st_dev, parent.st_ino):
+            raise LabLaunchdInstallError(f"{label} parent identity changed")
+        descriptor = os.open(
+            path.name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=root_fd,
+        )
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.getuid()
+            or opened.st_nlink != 1
+            or (require_private and stat.S_IMODE(opened.st_mode) != 0o600)
+            or opened.st_size < 0
+            or opened.st_size > _MAX_BOUND_FILE_BYTES
+        ):
+            raise LabLaunchdInstallError(f"{label} identity is unsafe")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, min(65536, _MAX_BOUND_FILE_BYTES + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > _MAX_BOUND_FILE_BYTES:
+                raise LabLaunchdInstallError(f"{label} is too large")
+        rebound = os.fstat(descriptor)
+        active = os.stat(path.name, dir_fd=root_fd, follow_symlinks=False)
+        current_parent = path.parent.lstat()
+        stable_fields = ("st_dev", "st_ino", "st_mode", "st_uid", "st_nlink", "st_size")
+        if (
+            any(getattr(rebound, field) != getattr(opened, field) for field in stable_fields)
+            or (active.st_dev, active.st_ino) != (opened.st_dev, opened.st_ino)
+            or (current_parent.st_dev, current_parent.st_ino)
+            != (opened_parent.st_dev, opened_parent.st_ino)
+        ):
+            raise LabLaunchdInstallError(f"{label} changed during read")
+        return b"".join(chunks), opened
+    except LabLaunchdInstallError:
+        raise
+    except OSError as exc:
+        raise LabLaunchdInstallError(f"{label} is unavailable") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if root_fd >= 0:
+            os.close(root_fd)
+
+
 class LabLaunchdInstaller:
     def __init__(
         self,
@@ -153,6 +219,7 @@ class LabLaunchdInstaller:
             command,
             cwd=self.checkout_root,
             deadline_monotonic=min(self._hard_deadline, time.monotonic() + timeout),
+            may_spawn_background_descendants=False,
         )
 
     @property
@@ -394,8 +461,12 @@ class LabLaunchdInstaller:
         path = self.launch_agents_dir / name
         if not os.path.lexists(path):
             return None
-        _regular_identity(path, label=f"installed launchd plist {name}")
-        return path.read_bytes()
+        payload, _identity = _read_bound_regular_file(
+            path,
+            label=f"installed launchd plist {name}",
+            require_private=True,
+        )
+        return payload
 
     def _replace(
         self,
@@ -1343,21 +1414,14 @@ class LabLaunchdInstaller:
             "inode",
         }:
             raise LabLaunchdInstallError("installed launchd plist binding is invalid")
-        try:
-            observed = path.lstat()
-        except OSError as exc:
-            raise LabLaunchdInstallError("registered launchd plist is unavailable") from exc
-        if (
-            not stat.S_ISREG(observed.st_mode)
-            or stat.S_ISLNK(observed.st_mode)
-            or observed.st_uid != os.getuid()
-            or observed.st_nlink != 1
-            or (require_private and stat.S_IMODE(observed.st_mode) != 0o600)
-        ):
-            raise LabLaunchdInstallError("registered launchd plist identity is unsafe")
+        payload, observed = _read_bound_regular_file(
+            path,
+            label="registered launchd plist",
+            require_private=require_private,
+        )
         if (
             binding.get("path") != str(path)
-            or binding.get("sha256") != hashlib.sha256(path.read_bytes()).hexdigest()
+            or binding.get("sha256") != hashlib.sha256(payload).hexdigest()
             or type(binding.get("device")) is not int
             or type(binding.get("inode")) is not int
             or binding.get("device") != observed.st_dev

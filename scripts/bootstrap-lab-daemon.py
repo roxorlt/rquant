@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import importlib.util
+import math
 import os
 import stat
 import subprocess
@@ -150,6 +151,7 @@ def _run_preflight(
         check=False,
         deadline_monotonic=deadline_monotonic,
         pass_fds=(lock_fd,),
+        may_spawn_background_descendants=False,
     )
     if result.returncode != 0:
         raise BootstrapError("Lab runtime preflight failed before import")
@@ -175,11 +177,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--deployment-lock-path", required=True)
     parser.add_argument("--deployment-lock-fd", required=True, type=int)
     parser.add_argument("--expected-launcher", required=True)
-    parser.add_argument("--startup-deadline-monotonic", type=float)
+    parser.add_argument("--startup-deadline-monotonic", required=True, type=float)
     parser.add_argument("--provisional-handoff-label")
     parser.add_argument("daemon_argv", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
-    startup_deadline = args.startup_deadline_monotonic or (time.monotonic() + 15)
+    startup_deadline = args.startup_deadline_monotonic
+    if not math.isfinite(startup_deadline) or time.monotonic() >= startup_deadline:
+        parser.error("startup deadline is invalid or expired")
     try:
         daemon_argv = list(args.daemon_argv)
         if daemon_argv and daemon_argv[0] == "--":
@@ -273,7 +277,12 @@ def main(argv: list[str] | None = None) -> int:
         sys.path[:] = [str(src), str(site_packages), *stdlib_paths]
         sys.prefix = str(venv)
         sys.exec_prefix = str(venv)
-        sys.argv = [str(launcher), *daemon_argv]
+        sys.argv = [
+            str(launcher),
+            *daemon_argv,
+            "--startup-deadline-monotonic",
+            str(startup_deadline),
+        ]
 
         from rquant.cli import main as rquant_main
 

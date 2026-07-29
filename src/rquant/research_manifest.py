@@ -104,9 +104,12 @@ def _run_trusted_git(
         [str(binding.path), *arguments],
         cwd=cwd,
         text=text,
-        deadline_monotonic=deadline_monotonic or (time.monotonic() + 3),
+        deadline_monotonic=(
+            deadline_monotonic if deadline_monotonic is not None else time.monotonic() + 3
+        ),
         check=False,
         env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"},
+        may_spawn_background_descendants=False,
     )
     if bind_trusted_git_executable(binding.path) != binding:
         raise ValueError("trusted Git executable identity changed")

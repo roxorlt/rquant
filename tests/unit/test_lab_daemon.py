@@ -6,6 +6,7 @@ import os
 import shutil
 import sqlite3
 import stat
+import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -80,6 +81,46 @@ def test_daemon_readiness_is_generation_bound_and_monotonic(tmp_path: Path) -> N
     assert observed == second
     assert observed.environment_generation_id == "b" * 64
     assert observed.operation_id == "a" * 32
+
+
+def test_readiness_close_fails_closed_without_forgetting_live_thread(tmp_path: Path) -> None:
+    authority = tmp_path / "authority"
+    authority.mkdir(mode=0o700)
+    lock_path = authority / "rquant.lock"
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    entered = threading.Event()
+    release = threading.Event()
+    publisher = LabDaemonReadinessPublisher(
+        deployment_lock_path=lock_path,
+        deployment_lock_fd=lock_fd,
+        label="com.roxor.rquant-lab-worker",
+        operation_id="a" * 32,
+        environment_generation_id="b" * 64,
+        code_sha="c" * 40,
+        heartbeat_interval_seconds=0.1,
+    )
+    publisher.start()
+
+    def blocked_publish() -> object:
+        entered.set()
+        release.wait(timeout=5)
+        return object()
+
+    publisher.publish_once = blocked_publish  # type: ignore[method-assign]
+    try:
+        assert entered.wait(timeout=1)
+        thread = publisher._thread
+        assert thread is not None
+        with pytest.raises(RuntimeError, match="readiness.*did not stop"):
+            publisher.close()
+        assert publisher._thread is thread
+        assert thread.is_alive()
+    finally:
+        release.set()
+        if publisher._thread is not None:
+            publisher._thread.join(timeout=2)
+        publisher.close()
+        os.close(lock_fd)
 
 
 def test_daemon_readiness_rejects_invalid_generation_before_namespace_creation(

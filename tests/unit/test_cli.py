@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import subprocess
 import sys
+import time
 from datetime import date, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,6 +23,7 @@ _LAB_EXPECTED_ROOT = "/tmp/rquant-expected"
 _LAB_TRUSTED_GIT = "/usr/bin/git"
 _LAB_GENERATION = "1" * 40
 _LAB_DEPLOYMENT_LOCK = "/tmp/.rquant-deploy/rquant-expected.lock"
+_LAB_STARTUP_DEADLINE = 9_999_999_999.0
 _LAB_GENERATION_ARGUMENTS = [
     "--deployment-generation",
     _LAB_GENERATION,
@@ -33,6 +36,22 @@ _LAB_GENERATION_ARGUMENTS = [
     "--deployment-environment-generation",
     "b" * 64,
 ]
+_LAB_DAEMON_GENERATION_ARGUMENTS = [
+    *_LAB_GENERATION_ARGUMENTS,
+    "--startup-deadline-monotonic",
+    str(_LAB_STARTUP_DEADLINE),
+]
+
+
+def test_lab_startup_deadline_binding_rejects_missing_or_expired_value() -> None:
+    from rquant.cli import _lab_startup_deadline_binding
+
+    with pytest.raises(RuntimeError, match="startup deadline"):
+        _lab_startup_deadline_binding(argparse.Namespace())
+    with pytest.raises(RuntimeError, match="startup deadline"):
+        _lab_startup_deadline_binding(
+            argparse.Namespace(startup_deadline_monotonic=time.monotonic() - 1)
+        )
 
 
 class _FakeLabSqliteAuthority:
@@ -3726,7 +3745,7 @@ class TestLabSchedulerCli:
         monkeypatch.setattr(
             lab_daemon,
             "require_lab_runtime_binding",
-            lambda _root, _git: "1" * 40,
+            lambda _root, _git, **_kwargs: "1" * 40,
         )
         monkeypatch.setattr(lab_daemon, "verify_lab_runtime_prepared", lambda *_a, **_k: {})
         monkeypatch.setattr(
@@ -3767,7 +3786,7 @@ class TestLabSchedulerCli:
                 _LAB_EXPECTED_ROOT,
                 "--trusted-git-path",
                 _LAB_TRUSTED_GIT,
-                *_LAB_GENERATION_ARGUMENTS,
+                *_LAB_DAEMON_GENERATION_ARGUMENTS,
                 "--once",
             ]
         )
@@ -3786,7 +3805,7 @@ class TestLabSchedulerCli:
                 _LAB_EXPECTED_ROOT,
                 "--trusted-git-path",
                 _LAB_TRUSTED_GIT,
-                *_LAB_GENERATION_ARGUMENTS,
+                *_LAB_DAEMON_GENERATION_ARGUMENTS,
             ]
         )
 
@@ -3822,6 +3841,7 @@ class TestLabSchedulerCli:
                     once=True,
                     expected_checkout_root=_LAB_EXPECTED_ROOT,
                     trusted_git_path=_LAB_TRUSTED_GIT,
+                    startup_deadline_monotonic=_LAB_STARTUP_DEADLINE,
                 )
             )
 
@@ -3918,6 +3938,7 @@ class TestLabSchedulerCli:
                 once=True,
                 expected_checkout_root=_LAB_EXPECTED_ROOT,
                 trusted_git_path=_LAB_TRUSTED_GIT,
+                startup_deadline_monotonic=_LAB_STARTUP_DEADLINE,
             )
         )
 
@@ -3994,6 +4015,7 @@ class TestLabSchedulerCli:
                 once=False,
                 expected_checkout_root=_LAB_EXPECTED_ROOT,
                 trusted_git_path=_LAB_TRUSTED_GIT,
+                startup_deadline_monotonic=_LAB_STARTUP_DEADLINE,
             )
         )
 
@@ -4021,7 +4043,7 @@ class TestLabWorkerCli:
         monkeypatch.setattr(
             lab_daemon,
             "require_lab_runtime_binding",
-            lambda _root, _git: "1" * 40,
+            lambda _root, _git, **_kwargs: "1" * 40,
         )
         monkeypatch.setattr(lab_daemon, "verify_lab_runtime_prepared", lambda *_a, **_k: {})
         monkeypatch.setattr(
@@ -4042,7 +4064,7 @@ class TestLabWorkerCli:
                 _LAB_EXPECTED_ROOT,
                 "--trusted-git-path",
                 _LAB_TRUSTED_GIT,
-                *_LAB_GENERATION_ARGUMENTS,
+                *_LAB_DAEMON_GENERATION_ARGUMENTS,
                 "--worker-id",
                 "worker-a",
                 "--once",
@@ -4061,7 +4083,7 @@ class TestLabWorkerCli:
                 _LAB_EXPECTED_ROOT,
                 "--trusted-git-path",
                 _LAB_TRUSTED_GIT,
-                *_LAB_GENERATION_ARGUMENTS,
+                *_LAB_DAEMON_GENERATION_ARGUMENTS,
             ]
         )
 
@@ -4098,6 +4120,7 @@ class TestLabWorkerCli:
                     once=True,
                     expected_checkout_root=_LAB_EXPECTED_ROOT,
                     trusted_git_path=_LAB_TRUSTED_GIT,
+                    startup_deadline_monotonic=_LAB_STARTUP_DEADLINE,
                 )
             )
 
@@ -4153,6 +4176,7 @@ class TestLabWorkerCli:
                 once=True,
                 expected_checkout_root=_LAB_EXPECTED_ROOT,
                 trusted_git_path=_LAB_TRUSTED_GIT,
+                startup_deadline_monotonic=_LAB_STARTUP_DEADLINE,
             )
         )
 
@@ -4229,7 +4253,7 @@ class TestLabWorkerCli:
         monkeypatch.setattr(
             lab_daemon,
             "require_lab_runtime_binding",
-            lambda _root, _git: current["sha"],
+            lambda _root, _git, **_kwargs: current["sha"],
         )
         monkeypatch.setattr(
             lab_daemon,
@@ -4245,6 +4269,7 @@ class TestLabWorkerCli:
             once=True,
             expected_checkout_root=_LAB_EXPECTED_ROOT,
             trusted_git_path=_LAB_TRUSTED_GIT,
+            startup_deadline_monotonic=_LAB_STARTUP_DEADLINE,
         )
 
         assert cmd_lab_worker(args) == 0
@@ -4307,6 +4332,7 @@ class TestLabWorkerCli:
                 once=False,
                 expected_checkout_root=_LAB_EXPECTED_ROOT,
                 trusted_git_path=_LAB_TRUSTED_GIT,
+                startup_deadline_monotonic=_LAB_STARTUP_DEADLINE,
             )
         )
 

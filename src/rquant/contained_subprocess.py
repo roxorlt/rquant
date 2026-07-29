@@ -384,6 +384,9 @@ class _DarwinKqueueProcessTracker:
             with self._condition:
                 self._error = exc
                 self._condition.notify_all()
+        finally:
+            with suppress(OSError):
+                self._queue.close()
 
     def poll(self, *, deadline: float) -> dict[int, ProcessIdentity]:
         with self._condition:
@@ -400,12 +403,13 @@ class _DarwinKqueueProcessTracker:
     def close(self) -> None:
         self._stop.set()
         if self._thread is not None:
-            self._thread.join(timeout=0.2)
+            self._thread.join(timeout=max(0.0, self._deadline - time.monotonic()))
             if self._thread.is_alive():
                 raise ContainedProcessError("kernel process tracker did not stop")
             self._thread = None
-        with suppress(OSError):
-            self._queue.close()
+        else:
+            with suppress(OSError):
+                self._queue.close()
 
 
 class _LinuxSubreaperProcessTracker:
@@ -801,8 +805,15 @@ def _merge_kernel_identities(
 
 
 def _terminate_blocked_root(process: subprocess.Popen[str], *, deadline: float) -> None:
-    with suppress(ProcessLookupError):
+    signal_error: PermissionError | None = None
+    try:
         os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except PermissionError as exc:
+        signal_error = exc
+        with suppress(ProcessLookupError):
+            process.kill()
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise ContainedProcessError("blocked subprocess cleanup deadline expired")
@@ -810,6 +821,10 @@ def _terminate_blocked_root(process: subprocess.Popen[str], *, deadline: float) 
         process.communicate(timeout=remaining)
     except subprocess.TimeoutExpired as exc:
         raise ContainedProcessError("blocked subprocess could not be reaped") from exc
+    if signal_error is not None:
+        raise ContainedProcessError(
+            "blocked process group could not be signalled"
+        ) from signal_error
 
 
 def _cleanup_process_tree(
@@ -825,6 +840,15 @@ def _cleanup_process_tree(
     initial_inventory: Mapping[int, _ProcessObservation] | None = None,
 ) -> None:
     kernel_error: BaseException | None = None
+    process_group_errors: list[PermissionError] = []
+
+    def signal_process_group(signum: int) -> None:
+        try:
+            os.killpg(process.pid, signum)
+        except ProcessLookupError:
+            return
+        except PermissionError as exc:
+            process_group_errors.append(exc)
 
     def merge_kernel() -> None:
         nonlocal kernel_error
@@ -840,16 +864,14 @@ def _cleanup_process_tree(
         except BaseException as exc:
             kernel_error = exc
 
-    with suppress(ProcessLookupError):
-        os.killpg(process.pid, signal.SIGSTOP)
+    signal_process_group(signal.SIGSTOP)
     merge_kernel()
     if initial_inventory is not None:
         if root_identity is not None:
             _signal_identity(root_identity, signal.SIGSTOP, initial_inventory)
             root = initial_inventory.get(process.pid)
             if root is not None and root.identity == root_identity:
-                with suppress(ProcessLookupError):
-                    os.killpg(process.pid, signal.SIGSTOP)
+                signal_process_group(signal.SIGSTOP)
         for identity in tuple(known.values()):
             _signal_identity(identity, signal.SIGSTOP, initial_inventory)
     stable = 0
@@ -865,8 +887,7 @@ def _cleanup_process_tree(
             _signal_identity(root_identity, signal.SIGSTOP, inventory)
             root = inventory.get(process.pid)
             if root is not None and root.identity == root_identity:
-                with suppress(ProcessLookupError):
-                    os.killpg(process.pid, signal.SIGSTOP)
+                signal_process_group(signal.SIGSTOP)
         for identity in tuple(known.values()):
             _signal_identity(identity, signal.SIGSTOP, inventory)
             _signal_bound_identity(identity, signal.SIGSTOP)
@@ -883,8 +904,7 @@ def _cleanup_process_tree(
         _signal_bound_identity(identity, signal.SIGKILL)
     if root_identity is not None:
         _signal_identity(root_identity, signal.SIGKILL, inventory)
-    with suppress(ProcessLookupError):
-        os.killpg(process.pid, signal.SIGKILL)
+    signal_process_group(signal.SIGKILL)
 
     remaining = deadline - clock()
     if remaining <= 0:
@@ -916,6 +936,13 @@ def _cleanup_process_tree(
                 raise ContainedProcessError(
                     "kernel process tracking failed during cleanup"
                 ) from kernel_error
+            if process_group_errors:
+                raise ContainedProcessError(
+                    "process group signalling failed during containment cleanup"
+                ) from ExceptionGroup(
+                    "process group signal failures",
+                    process_group_errors,
+                )
             return
         for identity in alive.values():
             _signal_identity(identity, signal.SIGKILL, inventory)
@@ -937,8 +964,16 @@ def run_contained(
     sleep: Sleep = time.sleep,
     cancellation_check: Callable[[], bool] | None = None,
     kernel_tracker_factory: KernelTrackerFactory = _create_kernel_tracker,
+    may_spawn_background_descendants: bool,
 ) -> subprocess.CompletedProcess[str]:
-    """Run one command and contain every observed descendant within one deadline."""
+    """Run one command within one absolute deadline and clean up its process tree.
+
+    ``may_spawn_background_descendants`` is a required launch capability declaration.
+    Darwin refuses ``True`` before spawning because its available process APIs cannot
+    prove containment after a descendant reparents and discards inherited evidence.
+    Passing ``False`` is therefore a caller guarantee that the command does not
+    intentionally daemonize; it is not a stronger Darwin kernel guarantee.
+    """
 
     remaining = deadline_monotonic - clock()
     if remaining <= 0:
@@ -947,6 +982,10 @@ def run_contained(
     execution_deadline = deadline_monotonic - cleanup_reserve
     if execution_deadline <= clock():
         raise subprocess.TimeoutExpired(list(args), 0)
+    if sys.platform == "darwin" and may_spawn_background_descendants:
+        raise ContainedProcessError(
+            "Darwin cannot prove containment for background-capable commands; startup refused"
+        )
     containment_token = secrets.token_hex(32)
     process_environment = dict(os.environ if env is None else env)
     process_environment[_CONTAINMENT_ENVIRONMENT_KEY] = containment_token
@@ -998,15 +1037,28 @@ def run_contained(
             raise ContainedProcessError("contained process was cancelled before startup")
         kernel_tracker.poll(deadline=deadline_monotonic)
     except BaseException:
+        startup_cleanup_errors: list[BaseException] = []
         try:
             _terminate_blocked_root(process, deadline=deadline_monotonic)
-        finally:
+        except BaseException as exc:
+            startup_cleanup_errors.append(exc)
+        try:
+            kernel_tracker.close()
+        except BaseException as exc:
+            startup_cleanup_errors.append(exc)
+        if gate_write >= 0:
             try:
-                kernel_tracker.close()
-            finally:
-                with suppress(OSError):
-                    os.close(gate_write)
-                _close_file_descriptors(darwin_pipe_anchor_fds)
+                os.close(gate_write)
+            except OSError as exc:
+                startup_cleanup_errors.append(exc)
+        _close_file_descriptors(darwin_pipe_anchor_fds)
+        if startup_cleanup_errors:
+            raise ContainedProcessError(
+                "contained subprocess startup cleanup failed"
+            ) from BaseExceptionGroup(
+                "contained subprocess startup cleanup failures",
+                startup_cleanup_errors,
+            )
         raise
 
     def observe(deadline: float) -> dict[int, _ProcessObservation]:
@@ -1041,6 +1093,7 @@ def run_contained(
     tracker_stop = threading.Event()
     tracker_thread: threading.Thread | None = None
     tracker_errors: list[BaseException] = []
+    cleanup_errors: list[BaseException] = []
     tracker_last_inventory: Mapping[int, _ProcessObservation] | None = None
     root_exit_observed_at: float | None = None
     last_inventory: Mapping[int, _ProcessObservation] | None = None
@@ -1050,9 +1103,12 @@ def run_contained(
         nonlocal tracker_thread
         tracker_stop.set()
         if tracker_thread is not None:
-            tracker_thread.join(timeout=max(0.0, min(0.2, deadline_monotonic - clock())))
+            tracker_thread.join(timeout=max(0.0, deadline_monotonic - clock()))
             if tracker_thread.is_alive():
-                raise ContainedProcessError("process containment tracker did not stop")
+                cleanup_errors.append(
+                    ContainedProcessError("process containment tracker did not stop")
+                )
+                return
             tracker_thread = None
 
     def track_process_tree() -> None:
@@ -1165,68 +1221,93 @@ def run_contained(
                 continue
         body_completed = True
     except subprocess.TimeoutExpired:
-        stop_tracker()
+        tracker_stop.set()
         if tracker_last_inventory is not None:
             last_inventory = tracker_last_inventory
-        _cleanup_process_tree(
-            process,
-            known,
-            root_identity=root_identity,
-            deadline=deadline_monotonic,
-            inventory_provider=observe,
-            clock=clock,
-            sleep=sleep,
-            kernel_tracker=kernel_tracker,
-            initial_inventory=last_inventory,
-        )
+        try:
+            _cleanup_process_tree(
+                process,
+                known,
+                root_identity=root_identity,
+                deadline=deadline_monotonic,
+                inventory_provider=observe,
+                clock=clock,
+                sleep=sleep,
+                kernel_tracker=kernel_tracker,
+                initial_inventory=last_inventory,
+            )
+        except BaseException as exc:
+            cleanup_errors.append(exc)
         raise
     except _ContainedSignal as exc:
         caught_signal = exc
-        stop_tracker()
+        tracker_stop.set()
         if tracker_last_inventory is not None:
             last_inventory = tracker_last_inventory
-        _cleanup_process_tree(
-            process,
-            known,
-            root_identity=root_identity,
-            deadline=deadline_monotonic,
-            inventory_provider=observe,
-            clock=clock,
-            sleep=sleep,
-            kernel_tracker=kernel_tracker,
-            initial_inventory=last_inventory,
-        )
+        try:
+            _cleanup_process_tree(
+                process,
+                known,
+                root_identity=root_identity,
+                deadline=deadline_monotonic,
+                inventory_provider=observe,
+                clock=clock,
+                sleep=sleep,
+                kernel_tracker=kernel_tracker,
+                initial_inventory=last_inventory,
+            )
+        except BaseException as cleanup_exc:
+            cleanup_errors.append(cleanup_exc)
         body_completed = True
     except BaseException:
-        stop_tracker()
+        tracker_stop.set()
         if tracker_last_inventory is not None:
             last_inventory = tracker_last_inventory
-        _cleanup_process_tree(
-            process,
-            known,
-            root_identity=root_identity,
-            deadline=deadline_monotonic,
-            inventory_provider=observe,
-            clock=clock,
-            sleep=sleep,
-            kernel_tracker=kernel_tracker,
-            initial_inventory=last_inventory,
-        )
+        try:
+            _cleanup_process_tree(
+                process,
+                known,
+                root_identity=root_identity,
+                deadline=deadline_monotonic,
+                inventory_provider=observe,
+                clock=clock,
+                sleep=sleep,
+                kernel_tracker=kernel_tracker,
+                initial_inventory=last_inventory,
+            )
+        except BaseException as exc:
+            cleanup_errors.append(exc)
         raise
     finally:
-        finalizer_completed = False
-        try:
-            if gate_write >= 0:
+        if gate_write >= 0:
+            try:
                 os.close(gate_write)
-            if tracker_thread is not None:
+            except OSError as exc:
+                cleanup_errors.append(exc)
+        if tracker_thread is not None:
+            try:
                 stop_tracker()
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+        try:
             kernel_tracker.close()
-            for signum, previous in previous_handlers.items():
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+        for signum, previous in previous_handlers.items():
+            try:
                 signal.signal(signum, previous)
-            finalizer_completed = True
-        finally:
-            if not body_completed or not finalizer_completed:
-                _close_file_descriptors(darwin_pipe_anchor_fds)
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+        if not body_completed or cleanup_errors:
+            _close_file_descriptors(darwin_pipe_anchor_fds)
+        if cleanup_errors:
+            details = "; ".join(str(error) or type(error).__name__ for error in cleanup_errors)
+            raise ContainedProcessError(
+                f"contained subprocess cleanup failed: {details}"
+            ) from BaseExceptionGroup(
+                "contained subprocess cleanup failures",
+                cleanup_errors,
+            )
 
     if caught_signal is not None:
         _close_file_descriptors(darwin_pipe_anchor_fds)

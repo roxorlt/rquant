@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import importlib.util
+import math
 import os
 import re
 import stat
@@ -1184,6 +1185,7 @@ def require_lab_runtime_binding(
     deployment_generation: str | None = None,
     deployment_lock_path: Path | None = None,
     deployment_generation_fd: int | None = None,
+    startup_deadline_monotonic: float | None = None,
 ) -> str:
     """Read and verify all live process identities before daemon I/O starts."""
     expected_candidate = _canonical_absolute_path(
@@ -1204,6 +1206,7 @@ def require_lab_runtime_binding(
             deployment_generation=deployment_generation,
             deployment_lock_path=Path(deployment_lock_path),
             deployment_generation_fd=int(deployment_generation_fd),
+            startup_deadline_monotonic=startup_deadline_monotonic,
         )
     expected, _expected_venv = _require_physical_checkout_virtualenv(
         expected_checkout_root,
@@ -1329,11 +1332,17 @@ def _require_immutable_lab_runtime_binding(
     deployment_generation: str,
     deployment_lock_path: Path,
     deployment_generation_fd: int,
+    startup_deadline_monotonic: float | None,
 ) -> str:
     import rquant
     from rquant.release_generation import ReleaseGenerationAuthority
     from rquant.research_manifest import bind_trusted_git_executable
 
+    if startup_deadline_monotonic is None:
+        raise LabDaemonConfigurationError("Lab authority deadline binding is missing")
+    authority_deadline = startup_deadline_monotonic
+    if not math.isfinite(authority_deadline) or time.monotonic() >= authority_deadline:
+        raise LabDaemonConfigurationError("Lab startup deadline is invalid or expired")
     if _CODE_SHA.fullmatch(deployment_generation) is None:
         raise LabDaemonConfigurationError("deployment generation SHA mismatch")
     try:
@@ -1377,6 +1386,7 @@ def _require_immutable_lab_runtime_binding(
             lock_fd=deployment_generation_fd,
             python_path=Path(sys.executable),
             git_path=trusted_git.path,
+            overall_deadline_monotonic=authority_deadline,
         ).verify(
             expected_commit=deployment_generation,
             provisional_handoff_label=provisional,
@@ -1447,6 +1457,7 @@ class LabRuntimeGuard:
                 observed = require_lab_runtime_binding(
                     self.expected_checkout_root,
                     self.trusted_git_path,
+                    startup_deadline_monotonic=time.monotonic() + 3,
                     **binding,
                 )
         except LabDaemonConfigurationError:
@@ -2149,9 +2160,13 @@ class LabDaemonReadinessPublisher:
 
     def close(self) -> None:
         self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=max(1.0, self.heartbeat_interval_seconds * 2))
-            self._thread = None
+        thread = self._thread
+        if thread is None:
+            return
+        thread.join(timeout=max(1.0, self.heartbeat_interval_seconds * 2))
+        if thread.is_alive():
+            raise RuntimeError("daemon readiness publisher did not stop within its deadline")
+        self._thread = None
 
     def __enter__(self) -> LabDaemonReadinessPublisher:
         self.start()

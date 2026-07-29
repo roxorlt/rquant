@@ -629,6 +629,7 @@ def _run_process_group(
         deadline_monotonic=time.monotonic() + timeout_seconds,
         env=env,
         text=text,
+        may_spawn_background_descendants=False,
     )
 
 
@@ -3528,6 +3529,7 @@ def _verify_generation_runtime(
             ],
             cwd=root,
             deadline_monotonic=time.monotonic() + timeout_seconds,
+            may_spawn_background_descendants=False,
             check=True,
             text=True,
         )

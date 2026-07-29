@@ -162,6 +162,7 @@ def _git_command(
                 "GIT_OPTIONAL_LOCKS": "0",
                 "GIT_TERMINAL_PROMPT": "0",
             },
+            may_spawn_background_descendants=False,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise PreflightError("Git checkout verification failed closed") from exc

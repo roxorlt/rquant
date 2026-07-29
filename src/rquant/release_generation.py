@@ -1615,14 +1615,15 @@ def _trusted_executable_binding(path: Path, *, label: str) -> dict[str, object]:
     }
 
 
-def _blocking_timeout(
+def _blocking_deadline(
     cap_seconds: float,
     timeout_provider: Callable[[float], float] | None,
 ) -> float:
-    timeout = cap_seconds if timeout_provider is None else timeout_provider(cap_seconds)
-    if not math.isfinite(timeout) or timeout <= 0 or timeout > cap_seconds:
-        raise ReleaseGenerationError("release generation command timeout is invalid")
-    return timeout
+    now = time.monotonic()
+    deadline = now + cap_seconds if timeout_provider is None else timeout_provider(cap_seconds)
+    if not math.isfinite(deadline) or deadline <= now:
+        raise ReleaseGenerationError("release generation command deadline is invalid")
+    return deadline
 
 
 def _contained_run(
@@ -1635,15 +1636,16 @@ def _contained_run(
     text: bool = True,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[Any]:
-    timeout = _blocking_timeout(cap_seconds, timeout_provider)
+    deadline = _blocking_deadline(cap_seconds, timeout_provider)
     try:
         return run_contained(
             arguments,
             cwd=cwd,
-            deadline_monotonic=time.monotonic() + timeout,
+            deadline_monotonic=deadline,
             check=check,
             text=text,
             env=env,
+            may_spawn_background_descendants=False,
         )
     except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
         raise ReleaseGenerationError("release generation command failed") from exc
@@ -2711,13 +2713,9 @@ class ReleaseGenerationAuthority:
         if time.monotonic() >= self.overall_deadline_monotonic:
             raise ReleaseGenerationError("immutable release environment build timed out")
 
-    def _remaining_command_timeout(self, cap_seconds: float) -> float:
+    def _absolute_command_deadline(self, _cap_seconds: float) -> float:
         self._checkpoint()
-        remaining = self.overall_deadline_monotonic - time.monotonic()
-        timeout = min(cap_seconds, self.command_timeout_seconds, remaining)
-        if timeout <= 0:
-            raise ReleaseGenerationError("immutable release environment build timed out")
-        return timeout
+        return self.overall_deadline_monotonic
 
     def _build_environment(
         self,
@@ -2759,12 +2757,10 @@ class ReleaseGenerationAuthority:
                 result = run_contained(
                     command,
                     cwd=self.repo if project_root is None else project_root,
-                    deadline_monotonic=min(
-                        time.monotonic() + self.command_timeout_seconds,
-                        self.overall_deadline_monotonic,
-                    ),
+                    deadline_monotonic=self.overall_deadline_monotonic,
                     env=environment,
                     cancellation_check=self._cancellation_check,
+                    may_spawn_background_descendants=False,
                 )
             except ReleaseGenerationError:
                 raise
@@ -2834,7 +2830,7 @@ class ReleaseGenerationAuthority:
                 "rev-parse",
                 "--verify",
                 "HEAD^{commit}",
-                timeout_provider=self._remaining_command_timeout,
+                timeout_provider=self._absolute_command_deadline,
             )
             if commit != expected_commit:
                 raise ReleaseGenerationError("release checkout commit does not match marker")
@@ -2858,7 +2854,7 @@ class ReleaseGenerationAuthority:
             venv,
             manifest,
             checkpoint=self._checkpoint,
-            timeout_provider=self._remaining_command_timeout,
+            timeout_provider=self._absolute_command_deadline,
         )
         venv_identity = _identity(venv, label="release venv", directory=True)
         selected_python = venv / "bin" / "python"
@@ -2888,7 +2884,7 @@ class ReleaseGenerationAuthority:
             )
         version, abi = _python_facts(
             selected_python,
-            timeout_provider=self._remaining_command_timeout,
+            timeout_provider=self._absolute_command_deadline,
         )
         major_minor = ".".join(version.split(".")[:2])
         site_packages = venv / "lib" / f"python{major_minor}" / "site-packages"
@@ -3755,7 +3751,7 @@ class ReleaseGenerationAuthority:
             Path(selector.environment_path),
             manifest,
             checkpoint=self._checkpoint,
-            timeout_provider=self._remaining_command_timeout,
+            timeout_provider=self._absolute_command_deadline,
         )
         self._assert_lock()
         return selector
@@ -4024,7 +4020,7 @@ class ReleaseGenerationAuthority:
             _assert_tracked_clean(
                 self.repo,
                 self.git_path,
-                timeout_provider=self._remaining_command_timeout,
+                timeout_provider=self._absolute_command_deadline,
             )
         self._assert_lock()
         return published
@@ -4367,7 +4363,7 @@ class ReleaseGenerationAuthority:
             raise ReleaseGenerationError("deployment Python is outside source release venv")
         system_python, system_python_identity, system_python_sha256 = _venv_system_interpreter(
             self.python_path,
-            timeout_provider=self._remaining_command_timeout,
+            timeout_provider=self._absolute_command_deadline,
         )
         source_bytes = _private_tree_size(
             source_venv,
@@ -4375,7 +4371,7 @@ class ReleaseGenerationAuthority:
             system_python_identity=system_python_identity,
             system_python_sha256=system_python_sha256,
             checkpoint=self._checkpoint,
-            timeout_provider=self._remaining_command_timeout,
+            timeout_provider=self._absolute_command_deadline,
         )
         if allow_gc:
             self.garbage_collect_environments(
@@ -4425,7 +4421,7 @@ class ReleaseGenerationAuthority:
                         expected_commit=expected_commit,
                         destination=code_root,
                         checkpoint=self._checkpoint,
-                        timeout_provider=self._remaining_command_timeout,
+                        timeout_provider=self._absolute_command_deadline,
                     )
                     self._build_environment(
                         staging_path,
@@ -4464,7 +4460,7 @@ class ReleaseGenerationAuthority:
                         system_python_identity=system_python_identity,
                         system_python_sha256=system_python_sha256,
                         checkpoint=self._checkpoint,
-                        timeout_provider=self._remaining_command_timeout,
+                        timeout_provider=self._absolute_command_deadline,
                     )
                 except BaseException:
                     if staging_path.exists() and not staging_path.is_symlink():
@@ -4479,7 +4475,7 @@ class ReleaseGenerationAuthority:
                     system_python_identity=system_python_identity,
                     system_python_sha256=system_python_sha256,
                     checkpoint=self._checkpoint,
-                    timeout_provider=self._remaining_command_timeout,
+                    timeout_provider=self._absolute_command_deadline,
                 )
                 active_environment = _identity(
                     self.environment_root,
@@ -4504,7 +4500,7 @@ class ReleaseGenerationAuthority:
                     system_python_sha256=system_python_sha256,
                     uv_binding=self.uv_binding,
                     checkpoint=self._checkpoint,
-                    timeout_provider=self._remaining_command_timeout,
+                    timeout_provider=self._absolute_command_deadline,
                 )
                 manifest_hash = _payload_hash(manifest, checkpoint=self._checkpoint)
                 root_fd, root_identity = _private_lock_root(self.lock_path.parent)
@@ -4535,7 +4531,7 @@ class ReleaseGenerationAuthority:
                     final_path,
                     manifest,
                     checkpoint=self._checkpoint,
-                    timeout_provider=self._remaining_command_timeout,
+                    timeout_provider=self._absolute_command_deadline,
                 )
                 manifest_hash = _payload_hash(manifest, checkpoint=self._checkpoint)
             selector = EnvironmentSelector(
@@ -4637,7 +4633,7 @@ class ReleaseGenerationAuthority:
         _assert_tracked_clean(
             self.repo,
             self.git_path,
-            timeout_provider=self._remaining_command_timeout,
+            timeout_provider=self._absolute_command_deadline,
         )
         transaction = self._transaction_record(
             operation_id=operation_id,

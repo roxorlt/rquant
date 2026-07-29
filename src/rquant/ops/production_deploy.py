@@ -119,18 +119,22 @@ def _run_process_group(
     args: list[str],
     *,
     cwd: Path,
-    timeout_seconds: float,
+    deadline_monotonic: float,
     check: bool,
     pass_fds: tuple[int, ...] = (),
     env: dict[str, str] | None = None,
+    may_spawn_background_descendants: bool = False,
 ) -> subprocess.CompletedProcess[str]:
+    if monotonic_time.monotonic() >= deadline_monotonic:
+        raise subprocess.TimeoutExpired(args, 0)
     return run_contained(
         args,
         cwd=cwd,
-        deadline_monotonic=monotonic_time.monotonic() + timeout_seconds,
+        deadline_monotonic=deadline_monotonic,
         check=check,
         pass_fds=pass_fds,
         env=env,
+        may_spawn_background_descendants=may_spawn_background_descendants,
     )
 
 
@@ -153,11 +157,10 @@ class SubprocessRunner:
         self._trusted_git_path = trusted_git
         self._command_timeout_seconds = command_timeout_seconds
         self._overall_timeout_seconds = overall_timeout_seconds
-        computed_deadline = monotonic_time.monotonic() + overall_timeout_seconds
         self._deadline = (
-            computed_deadline
+            monotonic_time.monotonic() + overall_timeout_seconds
             if overall_deadline_monotonic is None
-            else min(computed_deadline, overall_deadline_monotonic)
+            else overall_deadline_monotonic
         )
         if not math.isfinite(self._deadline):
             raise PolicyError("deployment overall deadline is invalid")
@@ -194,7 +197,7 @@ class SubprocessRunner:
             return _run_process_group(
                 args,
                 cwd=self._cwd,
-                timeout_seconds=min(self._command_timeout_seconds, remaining),
+                deadline_monotonic=self._deadline,
                 check=check,
                 env=environment,
             )
@@ -248,13 +251,11 @@ class IsolatedGenerationFinalizer:
         assert config.lock_fd is not None
         assert config.lock_path is not None
         assert config.python_path is not None
+        if config.overall_deadline_monotonic is None:
+            raise PolicyError("generation finalizer requires the original deployment deadline")
         if config.lab_lifecycle_mode == "installed" and config.handoff_lock_fd is None:
             raise PolicyError("installed finalizer requires inherited Lab handoff lock")
-        remaining = (
-            config.overall_deadline_monotonic - monotonic_time.monotonic()
-            if config.overall_deadline_monotonic is not None
-            else config.command_timeout_seconds
-        )
+        remaining = config.overall_deadline_monotonic - monotonic_time.monotonic()
         if remaining <= 0:
             raise DeployError("deployment overall timeout expired before generation finalizer")
         command = [
@@ -295,7 +296,7 @@ class IsolatedGenerationFinalizer:
         command.extend(
             [
                 "--overall-deadline-monotonic",
-                str(config.overall_deadline_monotonic or (monotonic_time.monotonic() + remaining)),
+                str(config.overall_deadline_monotonic),
                 "--",
                 "--target",
                 expected_commit,
@@ -305,7 +306,7 @@ class IsolatedGenerationFinalizer:
             completed = _run_process_group(
                 command,
                 cwd=config.repo,
-                timeout_seconds=min(config.command_timeout_seconds, remaining),
+                deadline_monotonic=config.overall_deadline_monotonic,
                 check=True,
                 pass_fds=tuple(pass_fds),
             )

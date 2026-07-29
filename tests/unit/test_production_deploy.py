@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 import rquant.ops.production_deploy as production_deploy
+from rquant.contained_subprocess import ContainedProcessError
 from rquant.ops.production_deploy import (
     ALL_LONG_RUNNING_SERVICES,
     LAB_LAUNCHD_HANDOFF_LABELS,
@@ -940,7 +941,7 @@ def test_installed_finalizer_inherits_outer_generation_and_handoff_locks(
         args: list[str],
         *,
         cwd: Path,
-        timeout_seconds: float,
+        deadline_monotonic: float,
         check: bool,
         pass_fds: tuple[int, ...] = (),
         env: dict[str, str] | None = None,
@@ -948,7 +949,7 @@ def test_installed_finalizer_inherits_outer_generation_and_handoff_locks(
         captured.update(
             args=args,
             cwd=cwd,
-            timeout_seconds=timeout_seconds,
+            deadline_monotonic=deadline_monotonic,
             check=check,
             pass_fds=pass_fds,
             env=env,
@@ -975,6 +976,7 @@ def test_installed_finalizer_inherits_outer_generation_and_handoff_locks(
             "lab_lifecycle_mode": "installed",
             "handoff_operation_id": "d" * 32,
             "handoff_labels": LAB_LAUNCHD_HANDOFF_LABELS,
+            "overall_deadline_monotonic": time.monotonic() + 30,
         }
     )
     try:
@@ -1702,12 +1704,12 @@ def test_subprocess_runner_marks_mutating_git_for_process_group_write_locking(
         args: list[str],
         *,
         cwd: Path,
-        timeout_seconds: float,
+        deadline_monotonic: float,
         check: bool,
         pass_fds: tuple[int, ...] = (),
         env: dict[str, str],
     ) -> subprocess.CompletedProcess[str]:
-        del cwd, timeout_seconds, check, pass_fds
+        del cwd, deadline_monotonic, check, pass_fds
         captured.append(env)
         return subprocess.CompletedProcess(args, 0, "", "")
 
@@ -1730,12 +1732,12 @@ def test_subprocess_runner_uses_explicit_trusted_git_binding_for_lock_policy(
         args: list[str],
         *,
         cwd: Path,
-        timeout_seconds: float,
+        deadline_monotonic: float,
         check: bool,
         pass_fds: tuple[int, ...] = (),
         env: dict[str, str],
     ) -> subprocess.CompletedProcess[str]:
-        del cwd, timeout_seconds, check, pass_fds
+        del cwd, deadline_monotonic, check, pass_fds
         captured.append(env)
         return subprocess.CompletedProcess(args, 0, "", "")
 
@@ -1797,12 +1799,14 @@ def test_process_runner_timeout_contains_detached_grandchild(tmp_path: Path) -> 
         "start_new_session=True); time.sleep(5)"
     )
 
-    with pytest.raises(subprocess.TimeoutExpired):
+    expected = ContainedProcessError if sys.platform == "darwin" else subprocess.TimeoutExpired
+    with pytest.raises(expected):
         production_deploy._run_process_group(
             [sys.executable, "-c", child, str(marker)],
             cwd=tmp_path,
-            timeout_seconds=0.2,
+            deadline_monotonic=time.monotonic() + 0.2,
             check=True,
+            may_spawn_background_descendants=True,
         )
     time.sleep(0.5)
 
@@ -1850,6 +1854,64 @@ def test_subprocess_runner_uses_inherited_end_to_end_deadline(tmp_path: Path) ->
 
     with pytest.raises(DeployError, match="overall timeout"):
         runner.run([sys.executable, "-c", "raise SystemExit(0)"])
+
+
+def test_subprocess_runner_preserves_exact_inherited_absolute_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inherited_deadline = time.monotonic() + 30
+    captured: list[float] = []
+
+    def fake_run_process_group(
+        args: list[str],
+        *,
+        cwd: Path,
+        deadline_monotonic: float,
+        check: bool,
+        pass_fds: tuple[int, ...] = (),
+        env: dict[str, str],
+    ) -> subprocess.CompletedProcess[str]:
+        del cwd, check, pass_fds, env
+        captured.append(deadline_monotonic)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(production_deploy, "_run_process_group", fake_run_process_group)
+    runner = SubprocessRunner(
+        tmp_path,
+        command_timeout_seconds=1,
+        overall_timeout_seconds=2,
+        overall_deadline_monotonic=inherited_deadline,
+    )
+
+    runner.run([sys.executable, "-c", "raise SystemExit(0)"])
+
+    assert runner.deadline_monotonic == inherited_deadline
+    assert captured == [inherited_deadline]
+
+
+def test_process_group_helper_rejects_expired_absolute_deadline_before_spawn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = False
+
+    def forbidden_run(*_args: object, **_kwargs: object) -> object:
+        nonlocal started
+        started = True
+        raise AssertionError("expired deadline must prevent process startup")
+
+    monkeypatch.setattr(production_deploy, "run_contained", forbidden_run)
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        production_deploy._run_process_group(
+            [sys.executable, "-c", "pass"],
+            cwd=tmp_path,
+            deadline_monotonic=time.monotonic() - 1,
+            check=True,
+        )
+
+    assert not started
 
 
 def test_real_git_repository_deploys_annotated_fast_forward_tag(
@@ -1931,6 +1993,7 @@ def test_real_git_repository_deploys_annotated_fast_forward_tag(
 
 
 @pytest.mark.parametrize("signum", (signal.SIGTERM, signal.SIGINT))
+@pytest.mark.skipif(sys.platform == "darwin", reason="Darwin rejects background-capable commands")
 def test_subprocess_runner_reaps_process_group_before_signal_releases_parent(
     tmp_path: Path,
     signum: signal.Signals,
@@ -1945,10 +2008,12 @@ def test_subprocess_runner_reaps_process_group_before_signal_releases_parent(
         "Path(sys.argv[1]).write_text('ready'); time.sleep(.6)"
     )
     harness = (
-        "import sys; from pathlib import Path; "
+        "import sys,time; from pathlib import Path; "
         "from rquant.ops.production_deploy import _run_process_group; "
         f"_run_process_group([sys.executable,'-c',{child_program!r},"
-        "sys.argv[1],sys.argv[2]],cwd=Path(sys.argv[3]),timeout_seconds=10,check=True)"
+        "sys.argv[1],sys.argv[2]],cwd=Path(sys.argv[3]),"
+        "deadline_monotonic=time.monotonic()+10,check=True,"
+        "may_spawn_background_descendants=True)"
     )
     process = subprocess.Popen(
         [sys.executable, "-c", harness, str(ready), str(late_mutation), str(tmp_path)],
@@ -1966,6 +2031,7 @@ def test_subprocess_runner_reaps_process_group_before_signal_releases_parent(
     assert not late_mutation.exists()
 
 
+@pytest.mark.skipif(sys.platform == "darwin", reason="Darwin rejects background-capable commands")
 def test_process_runner_base_exception_contains_detached_grandchild(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2011,8 +2077,9 @@ def test_process_runner_base_exception_contains_detached_grandchild(
         production_deploy._run_process_group(
             [sys.executable, "-c", child, str(marker)],
             cwd=tmp_path,
-            timeout_seconds=0.5,
+            deadline_monotonic=time.monotonic() + 0.5,
             check=True,
+            may_spawn_background_descendants=True,
         )
     time.sleep(0.5)
 

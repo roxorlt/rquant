@@ -149,6 +149,11 @@ plist 和三个 label 均已不存在时，重复卸载是严格只读的成功 
 常规 A→B installed 发布无需再次人工运行 installer：handoff 在目标 daemon bootstrap 前使用同一
 identity-bound journal 将三份 plist 及 local/registered state 原子推进到 B；失败则先停止 B、恢复 A
 文件身份与 loaded 集合，再恢复 A authority。旧 generation 保留到 B 的 commit 与 readiness 完成。
+
+子进程收容能力按平台显式分级：Linux 使用 subreaper/pidfd 跟踪后代；Darwin 的 kqueue 不支持
+`NOTE_TRACK/NOTE_CHILD`，因此任何调用方声明“可能产生后台后代”的命令都会在实际启动前被拒绝。
+Darwin 只运行可信、声明不后台化的短命令，并使用启动闸门、进程身份、进程组和管道证据做故障
+清理；这里不提供对恶意清环境、关闭证据 FD 后主动脱离的沙箱保证。
 P1.5b **没有**向 `~/Library/LaunchAgents` 写文件，也没有执行真实 `launchctl bootstrap/kickstart`；
 这些实际安装、健康观察和回滚演练只在 P1.5d 人工基础设施窗口进行。
 

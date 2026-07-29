@@ -29,15 +29,20 @@ STRICT_JSON = ROOT / "scripts" / "strict_json.py"
 _ORIGINAL_OS_WALK = os.walk
 
 
-@pytest.mark.parametrize("script", (WRAPPER, BOOTSTRAP))
+@pytest.mark.parametrize("script", (WRAPPER, BOOTSTRAP, ROOT / "src" / "rquant" / "lab_daemon.py"))
 def test_daemon_release_authority_inherits_original_startup_deadline(script: Path) -> None:
     tree = ast.parse(script.read_text(encoding="utf-8"), filename=str(script))
     constructors = [
         node
         for node in ast.walk(tree)
         if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "ReleaseGenerationAuthority"
+        and (
+            (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "ReleaseGenerationAuthority"
+            )
+            or (isinstance(node.func, ast.Name) and node.func.id == "ReleaseGenerationAuthority")
+        )
     ]
 
     assert constructors
@@ -51,7 +56,39 @@ def test_daemon_release_authority_inherits_original_startup_deadline(script: Pat
         assert isinstance(deadlines["overall_deadline_monotonic"], ast.Name)
         assert deadlines["overall_deadline_monotonic"].id in {
             "startup_deadline",
+            "startup_deadline_monotonic",
+            "authority_deadline",
         }
+
+
+def test_git_commit_rejects_expired_original_deadline_before_subprocess(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkout, _executable, _marker = _runtime_checkout(
+        tmp_path,
+        publish_generation=False,
+    )
+    namespace = runpy.run_path(str(WRAPPER))
+    git_path, git_identity = namespace["_require_trusted_git"](TRUSTED_GIT)
+    started = False
+
+    def forbidden_run(*_args: object, **_kwargs: object) -> object:
+        nonlocal started
+        started = True
+        raise AssertionError("expired deadline must prevent Git startup")
+
+    monkeypatch.setitem(namespace["_git_commit"].__globals__, "run_contained", forbidden_run)
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        namespace["_git_commit"](
+            checkout,
+            git_path=git_path,
+            git_identity=git_identity,
+            deadline_monotonic=time.monotonic() - 1,
+        )
+
+    assert not started
 
 
 def _complete_deployment_intent(
@@ -1266,6 +1303,7 @@ def test_lab_runtime_wrapper_readonly_git_preserves_index_and_disables_optional_
         checkout,
         git_path=git_path,
         git_identity=git_identity,
+        deadline_monotonic=time.monotonic() + 5,
     )
     after = index.stat()
     assert environments

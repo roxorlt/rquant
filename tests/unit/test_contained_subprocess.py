@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import shutil
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -91,6 +93,26 @@ class _SequenceKernelTracker:
 
     def close(self) -> None:
         return None
+
+
+class _CloseFailingKernelTracker:
+    def __init__(self) -> None:
+        self.identity: contained.ProcessIdentity | None = None
+
+    def register_root(self, pid: int, *, deadline: float) -> contained.ProcessIdentity:
+        del deadline
+        observed = contained._process_observation(pid)
+        assert observed is not None
+        self.identity = observed.identity
+        return observed.identity
+
+    def poll(self, *, deadline: float) -> dict[int, contained.ProcessIdentity]:
+        del deadline
+        assert self.identity is not None
+        return {self.identity.pid: self.identity}
+
+    def close(self) -> None:
+        raise contained.ContainedProcessError("close boom")
 
 
 def _tracker_factory(
@@ -305,6 +327,208 @@ def test_signal_latch_raises_once_and_defers_consecutive_signal() -> None:
     assert latch.first_signum == signal.SIGTERM
 
 
+def test_kernel_tracker_close_failure_restores_signal_handlers(tmp_path: Path) -> None:
+    tracker = _CloseFailingKernelTracker()
+    before = {signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)}
+
+    with pytest.raises(contained.ContainedProcessError, match="close boom"):
+        contained.run_contained(
+            [sys.executable, "-c", "pass"],
+            cwd=tmp_path,
+            deadline_monotonic=time.monotonic() + 2,
+            kernel_tracker_factory=lambda: tracker,
+            may_spawn_background_descendants=False,
+        )
+
+    assert {signum: signal.getsignal(signum) for signum in before} == before
+
+
+def test_nested_run_restores_outer_then_original_signal_handlers(tmp_path: Path) -> None:
+    before = {signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)}
+    cancellation_checks = 0
+    inner_handlers: dict[int, object] = {}
+
+    def cancellation_check() -> bool:
+        nonlocal cancellation_checks
+        cancellation_checks += 1
+        if cancellation_checks != 2:
+            return False
+        outer_handlers = {
+            signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)
+        }
+        inner_handlers.update(outer_handlers)
+        contained.run_contained(
+            [sys.executable, "-c", "pass"],
+            cwd=tmp_path,
+            deadline_monotonic=time.monotonic() + 2,
+            may_spawn_background_descendants=False,
+        )
+        assert {signum: signal.getsignal(signum) for signum in outer_handlers} == outer_handlers
+        return False
+
+    contained.run_contained(
+        [sys.executable, "-c", "pass"],
+        cwd=tmp_path,
+        deadline_monotonic=time.monotonic() + 3,
+        cancellation_check=cancellation_check,
+        may_spawn_background_descendants=False,
+    )
+
+    assert inner_handlers
+    assert {signum: signal.getsignal(signum) for signum in before} == before
+
+
+def test_cleanup_permission_error_does_not_skip_root_reap(monkeypatch) -> None:
+    class Process(_FinishedProcess):
+        communicated = False
+
+        def communicate(self, *, timeout: float) -> tuple[str, str]:
+            self.communicated = True
+            return super().communicate(timeout=timeout)
+
+    process = Process()
+    inventories = iter(
+        (
+            {100: _observation(100, 1, 1)},
+            {100: _observation(100, 1, 1)},
+            {100: _observation(100, 1, 1)},
+            {100: _observation(100, 1, 1)},
+            {},
+        )
+    )
+
+    def deny_group(_pid: int, _signum: int) -> None:
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(contained.os, "killpg", deny_group)
+    monkeypatch.setattr(contained.os, "kill", lambda _pid, _signum: None)
+
+    with pytest.raises(contained.ContainedProcessError, match="process group"):
+        contained._cleanup_process_tree(
+            process,  # type: ignore[arg-type]
+            {},
+            root_identity=contained.ProcessIdentity(100, (1, 0)),
+            deadline=10,
+            inventory_provider=lambda _deadline: next(inventories),
+            clock=lambda: 1,
+            sleep=lambda _seconds: None,
+        )
+
+    assert process.communicated
+
+
+def test_blocked_user_tracker_does_not_prevent_root_reap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_inventory = contained.process_inventory
+    real_popen = contained.subprocess.Popen
+    tracker_entered = threading.Event()
+    release_tracker = threading.Event()
+    spawned: list[subprocess.Popen[str]] = []
+
+    def blocking_inventory(
+        deadline: float,
+        **kwargs: object,
+    ) -> dict[int, contained._ProcessObservation]:
+        if threading.current_thread().name.startswith("rquant-containment-"):
+            tracker_entered.set()
+            release_tracker.wait(timeout=2)
+            return {}
+        return real_inventory(deadline, **kwargs)  # type: ignore[arg-type]
+
+    def capturing_popen(*args: object, **kwargs: object) -> subprocess.Popen[str]:
+        process = real_popen(*args, **kwargs)
+        spawned.append(process)
+        return process
+
+    monkeypatch.setattr(contained, "process_inventory", blocking_inventory)
+    monkeypatch.setattr(contained.subprocess, "Popen", capturing_popen)
+    try:
+        with pytest.raises(contained.ContainedProcessError, match="tracker did not stop"):
+            contained.run_contained(
+                [sys.executable, "-c", "import time; time.sleep(10)"],
+                cwd=tmp_path,
+                deadline_monotonic=time.monotonic() + 0.5,
+                inventory_provider=blocking_inventory,
+                may_spawn_background_descendants=False,
+            )
+        assert tracker_entered.is_set()
+        assert spawned and spawned[0].returncode is not None
+    finally:
+        release_tracker.set()
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin capability gate")
+def test_darwin_background_capable_command_is_rejected_before_spawn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spawned = False
+
+    def forbidden_spawn(*_args: object, **_kwargs: object) -> object:
+        nonlocal spawned
+        spawned = True
+        raise AssertionError("background-capable command must not start")
+
+    monkeypatch.setattr(contained.subprocess, "Popen", forbidden_spawn)
+
+    with pytest.raises(contained.ContainedProcessError, match="Darwin.*background"):
+        contained.run_contained(
+            [sys.executable, "-c", "import os; os.setsid()"],
+            cwd=tmp_path,
+            deadline_monotonic=time.monotonic() + 1,
+            may_spawn_background_descendants=True,
+        )
+
+    assert not spawned
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin capability gate")
+def test_darwin_native_detacher_is_refused_before_root_can_fork(tmp_path: Path) -> None:
+    compiler = shutil.which("cc")
+    if compiler is None:
+        pytest.skip("native compiler is unavailable")
+    source = tmp_path / "detach.c"
+    executable = tmp_path / "detach"
+    marker = tmp_path / "escaped"
+    source.write_text(
+        """
+#include <fcntl.h>
+#include <stdlib.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+    pid_t child = fork();
+    if (child == 0) {
+        if (fork() == 0) {
+            setsid();
+            unsetenv("RQUANT_CONTAINMENT_TOKEN");
+            for (int fd = 0; fd < 1024; fd++) close(fd);
+            usleep(200000);
+            int out = open(argv[1], O_CREAT | O_WRONLY, 0600);
+            if (out >= 0) close(out);
+        }
+        _exit(0);
+    }
+    _exit(argc < 2);
+}
+""",
+        encoding="ascii",
+    )
+    subprocess.run([compiler, str(source), "-o", str(executable)], check=True)
+
+    with pytest.raises(contained.ContainedProcessError, match="startup refused"):
+        contained.run_contained(
+            [str(executable), str(marker)],
+            cwd=tmp_path,
+            deadline_monotonic=time.monotonic() + 1,
+            may_spawn_background_descendants=True,
+        )
+
+    time.sleep(0.25)
+    assert not marker.exists()
+
+
 def test_short_command_budget_reserves_three_quarters_for_containment_cleanup() -> None:
     assert contained._cleanup_reserve_seconds(0.2) == pytest.approx(0.15)
     assert contained._cleanup_reserve_seconds(0.6) == pytest.approx(0.3)
@@ -328,6 +552,7 @@ def test_successful_root_with_live_detached_descendant_fails_closed(
             cwd=tmp_path,
             deadline_monotonic=contained.time.monotonic() + 1,
             check=True,
+            may_spawn_background_descendants=True,
         )
     except contained.ContainedProcessError:
         pass
@@ -355,6 +580,7 @@ def test_immediate_cancellation_happens_after_kernel_registration_but_before_gat
             inventory_provider=lambda _deadline: {},
             cancellation_check=cancel,
             kernel_tracker_factory=_tracker_factory(tracker),
+            may_spawn_background_descendants=False,
         )
 
     time.sleep(0.05)
@@ -373,6 +599,7 @@ def test_kernel_registration_failure_keeps_startup_gate_closed(tmp_path: Path) -
             deadline_monotonic=time.monotonic() + 1,
             inventory_provider=lambda _deadline: {},
             kernel_tracker_factory=_tracker_factory(tracker),
+            may_spawn_background_descendants=False,
         )
 
     time.sleep(0.05)
@@ -393,6 +620,7 @@ def test_empty_startup_inventory_keeps_gate_closed_after_kernel_registration(
             deadline_monotonic=time.monotonic() + 1,
             inventory_provider=lambda _deadline: {},
             kernel_tracker_factory=_tracker_factory(tracker),
+            may_spawn_background_descendants=False,
         )
 
     time.sleep(0.05)
@@ -419,6 +647,7 @@ def test_kernel_track_error_fails_closed_and_stops_root(tmp_path: Path) -> None:
             deadline_monotonic=time.monotonic() + 1,
             inventory_provider=lambda _deadline: {},
             kernel_tracker_factory=_tracker_factory(tracker),
+            may_spawn_background_descendants=False,
         )
 
     time.sleep(0.15)
@@ -439,7 +668,8 @@ def test_immediate_setsid_descendant_never_escapes_over_repeated_trials(
     )
     markers: list[Path] = []
 
-    for trial in range(100):
+    trials = 1 if sys.platform == "darwin" else 25
+    for trial in range(trials):
         marker = tmp_path / f"escaped-{trial}"
         started = tmp_path / f"started-{trial}"
         markers.append(marker)
@@ -448,8 +678,9 @@ def test_immediate_setsid_descendant_never_escapes_over_repeated_trials(
                 [sys.executable, "-c", child, str(marker), str(started)],
                 cwd=tmp_path,
                 deadline_monotonic=time.monotonic() + 0.6,
+                may_spawn_background_descendants=True,
             )
-        assert started.exists()
+        assert started.exists() is (sys.platform != "darwin")
 
     time.sleep(0.15)
     assert not any(marker.exists() for marker in markers)
@@ -637,6 +868,7 @@ def test_darwin_pipe_identity_remains_anchored_through_final_inventory(
         deadline_monotonic=time.monotonic() + 2,
         inventory_provider=inventory,
         kernel_tracker_factory=_tracker_factory(tracker),
+        may_spawn_background_descendants=False,
     )
 
     assert result.returncode == 0

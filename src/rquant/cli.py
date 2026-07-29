@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import signal
 import socket
@@ -2963,6 +2964,16 @@ def _lab_deployment_generation_binding(args: argparse.Namespace) -> dict[str, ob
     }
 
 
+def _lab_startup_deadline_binding(args: argparse.Namespace) -> dict[str, float]:
+    deadline = getattr(args, "startup_deadline_monotonic", None)
+    if deadline is None:
+        raise RuntimeError("Lab startup deadline binding is missing")
+    absolute_deadline = float(deadline)
+    if not math.isfinite(absolute_deadline) or time.monotonic() >= absolute_deadline:
+        raise RuntimeError("Lab startup deadline binding is invalid or expired")
+    return {"startup_deadline_monotonic": absolute_deadline}
+
+
 def _lab_daemon_readiness_context(
     args: argparse.Namespace,
     *,
@@ -3062,6 +3073,7 @@ def cmd_lab_runtime_prepare(args: argparse.Namespace) -> int:
     code_sha = require_lab_runtime_binding(
         Path(args.expected_checkout_root),
         trusted_git_path,
+        **_lab_startup_deadline_binding(args),
         **generation_binding,
     )
     runtime_guard = LabRuntimeGuard(
@@ -3124,6 +3136,7 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
     code_sha = require_lab_runtime_binding(
         Path(args.expected_checkout_root),
         trusted_git_path,
+        **_lab_startup_deadline_binding(args),
         **generation_binding,
     )
     runtime_guard = LabRuntimeGuard(
@@ -3309,6 +3322,7 @@ def cmd_lab_worker(args: argparse.Namespace) -> int:
     code_sha = require_lab_runtime_binding(
         Path(args.expected_checkout_root),
         trusted_git_path,
+        **_lab_startup_deadline_binding(args),
         **generation_binding,
     )
     runtime_guard = LabRuntimeGuard(
@@ -3424,6 +3438,7 @@ def cmd_lab_finalizer(args: argparse.Namespace) -> int:
     code_sha = require_lab_runtime_binding(
         Path(args.expected_checkout_root),
         trusted_git_path,
+        **_lab_startup_deadline_binding(args),
         **generation_binding,
     )
     runtime_guard = LabRuntimeGuard(
@@ -5219,6 +5234,7 @@ def build_parser() -> argparse.ArgumentParser:
     lab_runtime_prepare_p.add_argument("--deployment-generation", required=True)
     lab_runtime_prepare_p.add_argument("--deployment-lock-path", required=True)
     lab_runtime_prepare_p.add_argument("--deployment-generation-fd", required=True, type=int)
+    lab_runtime_prepare_p.add_argument("--startup-deadline-monotonic", required=True, type=float)
     lab_runtime_prepare_p.add_argument("--deployment-operation-id")
     lab_runtime_prepare_p.add_argument("--deployment-environment-generation")
 
@@ -5257,6 +5273,7 @@ def build_parser() -> argparse.ArgumentParser:
     lab_scheduler_p.add_argument("--deployment-generation", required=True)
     lab_scheduler_p.add_argument("--deployment-lock-path", required=True)
     lab_scheduler_p.add_argument("--deployment-generation-fd", required=True, type=int)
+    lab_scheduler_p.add_argument("--startup-deadline-monotonic", required=True, type=float)
     lab_scheduler_p.add_argument("--deployment-operation-id")
     lab_scheduler_p.add_argument("--deployment-environment-generation")
     lab_scheduler_p.add_argument(
@@ -5282,6 +5299,7 @@ def build_parser() -> argparse.ArgumentParser:
     lab_worker_p.add_argument("--deployment-generation", required=True)
     lab_worker_p.add_argument("--deployment-lock-path", required=True)
     lab_worker_p.add_argument("--deployment-generation-fd", required=True, type=int)
+    lab_worker_p.add_argument("--startup-deadline-monotonic", required=True, type=float)
     lab_worker_p.add_argument("--deployment-operation-id")
     lab_worker_p.add_argument("--deployment-environment-generation")
     lab_worker_p.add_argument(
@@ -5312,6 +5330,7 @@ def build_parser() -> argparse.ArgumentParser:
     lab_finalizer_p.add_argument("--deployment-generation", required=True)
     lab_finalizer_p.add_argument("--deployment-lock-path", required=True)
     lab_finalizer_p.add_argument("--deployment-generation-fd", required=True, type=int)
+    lab_finalizer_p.add_argument("--startup-deadline-monotonic", required=True, type=float)
     lab_finalizer_p.add_argument("--deployment-operation-id")
     lab_finalizer_p.add_argument("--deployment-environment-generation")
     lab_finalizer_p.add_argument(
