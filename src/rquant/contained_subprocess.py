@@ -23,6 +23,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+_SIGNAL_STATE_ATTEMPTS = 3
+
 
 class ContainedProcessError(RuntimeError):
     """A process tree could not be started, stopped, or proven contained."""
@@ -46,22 +48,63 @@ class _ContainedSignalLatch:
             self.first_signum = signum
 
 
+def _record_cleanup_error(
+    errors: list[BaseException],
+    error: BaseException,
+) -> None:
+    if not any(existing is error for existing in errors):
+        errors.append(error)
+
+
+def _attach_cleanup_error_group(
+    primary_exception: BaseException,
+    errors: Sequence[BaseException],
+    *,
+    error_label: str,
+    note: str,
+) -> None:
+    cleanup_errors: list[BaseException] = []
+    for error in errors:
+        if error is not primary_exception:
+            _record_cleanup_error(cleanup_errors, error)
+    if not cleanup_errors:
+        return
+    primary_exception.cleanup_error_group = BaseExceptionGroup(  # type: ignore[attr-defined]
+        error_label,
+        cleanup_errors,
+    )
+    if note not in getattr(primary_exception, "__notes__", ()):
+        primary_exception.add_note(note)
+
+
 class _SignalRestoration(list[BaseException]):
     def __init__(
         self,
         errors: Sequence[BaseException],
         *,
         previous_mask: set[signal.Signals] | None,
+        handlers_restored: bool = True,
     ) -> None:
         super().__init__(errors)
         self._previous_mask = previous_mask
+        self._handlers_restored = handlers_restored
         self._released = False
 
     def release(self) -> None:
-        if self._released or self._previous_mask is None:
+        if self._released:
             return
-        self._released = True
+        if not self._handlers_restored:
+            raise ContainedProcessError(
+                "signal mask release refused because latch handlers remain installed"
+            )
+        if self._previous_mask is None:
+            self._released = True
+            return
         signal.pthread_sigmask(signal.SIG_SETMASK, self._previous_mask)
+        observed_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        if observed_mask != self._previous_mask:
+            raise ContainedProcessError("signal mask release could not be verified")
+        self._released = True
 
     def release_and_replay(
         self,
@@ -71,39 +114,132 @@ class _SignalRestoration(list[BaseException]):
         *,
         error_label: str,
     ) -> None:
-        replay_error = (
+        protected_replay_error = (
             _latched_signal_replay_error(latch.first_signum, previous_handlers)
             if latch.first_signum is not None
             else None
         )
-        boundary_error: BaseException | None = None
-        try:
-            self.release()
-            if replay_error is None and latch.first_signum is not None:
-                replay_error = _latched_signal_replay_error(
-                    latch.first_signum,
-                    previous_handlers,
+        for _attempt in range(_SIGNAL_STATE_ATTEMPTS):
+            try:
+                if not self._released:
+                    self.release()
+                if protected_replay_error is None:
+                    return
+                _attach_cleanup_error_group(
+                    protected_replay_error,
+                    cleanup_errors,
+                    error_label=error_label,
+                    note="contained subprocess cleanup also failed",
                 )
-            protected_replay_error = replay_error
-        except BaseException as exc:
-            if replay_error is None:
-                if cleanup_errors:
-                    cleanup_group = BaseExceptionGroup(error_label, cleanup_errors)
-                    exc.cleanup_error_group = cleanup_group  # type: ignore[attr-defined]
-                    exc.add_note("contained subprocess cleanup also failed")
-                raise
-            boundary_error = exc
-            protected_replay_error = replay_error
+                raise protected_replay_error
+            except BaseException as exc:
+                if exc is protected_replay_error and self._released:
+                    raise
+                if protected_replay_error is None:
+                    protected_replay_error = exc
+                elif exc is not protected_replay_error:
+                    _record_cleanup_error(cleanup_errors, exc)
 
         if protected_replay_error is None:
             return
-        if boundary_error is not None and boundary_error is not protected_replay_error:
-            cleanup_errors.append(boundary_error)
-        if cleanup_errors:
-            cleanup_group = BaseExceptionGroup(error_label, cleanup_errors)
-            protected_replay_error.cleanup_error_group = cleanup_group  # type: ignore[attr-defined]
-            protected_replay_error.add_note("contained subprocess cleanup also failed")
+        try:
+            _attach_cleanup_error_group(
+                protected_replay_error,
+                cleanup_errors,
+                error_label=error_label,
+                note="contained subprocess cleanup also failed",
+            )
+        except BaseException as exc:
+            if exc is not protected_replay_error:
+                _record_cleanup_error(cleanup_errors, exc)
         raise protected_replay_error
+
+
+def _signal_handlers_match(observed: object, expected: object) -> bool:
+    return observed is expected or observed == expected
+
+
+def _set_signal_handler_verified(
+    signum: int,
+    handler: object,
+    errors: list[BaseException],
+) -> bool:
+    for _attempt in range(_SIGNAL_STATE_ATTEMPTS):
+        transition_failed = False
+        try:
+            signal.signal(signum, handler)
+        except BaseException as exc:
+            transition_failed = True
+            _record_cleanup_error(errors, exc)
+        try:
+            observed = signal.getsignal(signum)
+            if not _signal_handlers_match(observed, handler):
+                if not transition_failed:
+                    _record_cleanup_error(
+                        errors,
+                        ContainedProcessError(
+                            f"signal handler restoration could not be verified for {signum}"
+                        ),
+                    )
+                continue
+        except BaseException as exc:
+            _record_cleanup_error(errors, exc)
+            continue
+        return True
+    return False
+
+
+def _read_signal_mask_bounded(
+    errors: list[BaseException],
+) -> set[signal.Signals] | None:
+    for _attempt in range(_SIGNAL_STATE_ATTEMPTS):
+        try:
+            return signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        except BaseException as exc:
+            _record_cleanup_error(errors, exc)
+    return None
+
+
+def _set_signal_mask_bounded(
+    how: int,
+    mask: set[signal.Signals] | frozenset[int],
+    errors: list[BaseException],
+) -> set[signal.Signals] | None:
+    previous_mask = _read_signal_mask_bounded(errors)
+    if previous_mask is None:
+        return None
+    expected_mask = {*previous_mask, *mask} if how == signal.SIG_BLOCK else set(mask)
+    for _attempt in range(_SIGNAL_STATE_ATTEMPTS):
+        transition_failed = False
+        try:
+            signal.pthread_sigmask(how, mask)
+        except BaseException as exc:
+            transition_failed = True
+            _record_cleanup_error(errors, exc)
+        try:
+            observed_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        except BaseException as exc:
+            _record_cleanup_error(errors, exc)
+            continue
+        if observed_mask == expected_mask:
+            return previous_mask
+        if not transition_failed:
+            _record_cleanup_error(
+                errors,
+                ContainedProcessError("signal mask transition could not be verified"),
+            )
+    return None
+
+
+def _restore_signal_handlers_verified(
+    previous_handlers: Mapping[int, object],
+    errors: list[BaseException],
+) -> bool:
+    restored = True
+    for signum, previous in previous_handlers.items():
+        if not _set_signal_handler_verified(signum, previous, errors):
+            restored = False
+    return restored
 
 
 def _install_signal_latch(
@@ -118,32 +254,83 @@ def _install_signal_latch(
     if not hasattr(signal, "pthread_sigmask"):
         raise ContainedProcessError("atomic signal arbitration is unavailable")
 
-    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, active)
+    mask_errors: list[BaseException] = []
+    previous_mask = _set_signal_mask_bounded(signal.SIG_BLOCK, active, mask_errors)
+    if previous_mask is None:
+        primary_exception = mask_errors[0]
+        if len(mask_errors) > 1:
+            primary_exception.cleanup_error_group = BaseExceptionGroup(  # type: ignore[attr-defined]
+                "signal latch installation mask failures",
+                mask_errors[1:],
+            )
+            primary_exception.add_note("signal latch installation mask retries also failed")
+        raise primary_exception
+
     installed: dict[int, object] = {}
+    touched: dict[int, object] = {}
     try:
         for signum in (signal.SIGINT, signal.SIGTERM):
             if signum not in active:
                 continue
+            touched[signum] = candidates[signum]
             signal.signal(signum, latch.handle)
+            if not _signal_handlers_match(signal.getsignal(signum), latch.handle):
+                raise ContainedProcessError(
+                    f"signal latch installation could not be verified for {signum}"
+                )
             installed[signum] = candidates[signum]
     except BaseException as primary_exception:
         rollback_errors: list[BaseException] = []
-        for signum, previous in installed.items():
-            try:
-                signal.signal(signum, previous)
-            except BaseException as exc:
-                rollback_errors.append(exc)
-        installed.clear()
-        if rollback_errors:
-            rollback_group = BaseExceptionGroup(
-                "signal latch installation rollback failures",
-                rollback_errors,
+        rollback_complete = _restore_signal_handlers_verified(touched, rollback_errors)
+        if rollback_complete:
+            release_errors: list[BaseException] = []
+            _set_signal_mask_bounded(
+                signal.SIG_SETMASK,
+                previous_mask,
+                release_errors,
             )
-            primary_exception.cleanup_error_group = rollback_group  # type: ignore[attr-defined]
-            primary_exception.add_note("signal latch installation rollback also failed")
+            for error in release_errors:
+                _record_cleanup_error(rollback_errors, error)
+        _attach_cleanup_error_group(
+            primary_exception,
+            rollback_errors,
+            error_label="signal latch installation rollback failures",
+            note="signal latch installation rollback also failed",
+        )
         raise
-    finally:
-        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+
+    release_errors = []
+    if _set_signal_mask_bounded(signal.SIG_SETMASK, previous_mask, release_errors) is None:
+        primary_exception = release_errors[0]
+        rollback_errors: list[BaseException] = []
+        for error in release_errors[1:]:
+            _record_cleanup_error(rollback_errors, error)
+        reblock_errors: list[BaseException] = []
+        rollback_blocked = (
+            _set_signal_mask_bounded(signal.SIG_BLOCK, active, reblock_errors) is not None
+        )
+        for error in reblock_errors:
+            _record_cleanup_error(rollback_errors, error)
+        handlers_restored = rollback_blocked and _restore_signal_handlers_verified(
+            installed,
+            rollback_errors,
+        )
+        if handlers_restored:
+            recovery_cleanup = [primary_exception, *rollback_errors]
+            recovery = _SignalRestoration((), previous_mask=previous_mask)
+            recovery.release_and_replay(
+                latch,
+                candidates,
+                recovery_cleanup,
+                error_label="signal latch installation release failures",
+            )
+        _attach_cleanup_error_group(
+            primary_exception,
+            rollback_errors,
+            error_label="signal latch installation release failures",
+            note="signal latch installation release also failed",
+        )
+        raise primary_exception
     return installed, frozenset(installed)
 
 
@@ -156,16 +343,29 @@ def _restore_signal_handlers_atomically(
         return _SignalRestoration((), previous_mask=None)
 
     errors: list[BaseException] = []
-    try:
-        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, active_signals)
-    except BaseException as exc:
-        return _SignalRestoration((exc,), previous_mask=None)
+    previous_mask = _set_signal_mask_bounded(signal.SIG_BLOCK, active_signals, errors)
+    handlers_restored = True
+    if previous_mask is None:
+        current_mask = _set_signal_mask_bounded(signal.SIG_BLOCK, set(), errors)
+        if current_mask is not None:
+            blocked_mask = {*current_mask, *active_signals}
+            if _set_signal_mask_bounded(signal.SIG_SETMASK, blocked_mask, errors) is not None:
+                previous_mask = current_mask
+        if previous_mask is None:
+            return _SignalRestoration(
+                errors,
+                previous_mask=None,
+                handlers_restored=False,
+            )
 
-    for signum, previous in previous_handlers.items():
-        try:
-            signal.signal(signum, previous)
-        except BaseException as exc:
-            errors.append(exc)
+    handlers_restored = _restore_signal_handlers_verified(previous_handlers, errors)
+
+    if not handlers_restored:
+        return _SignalRestoration(
+            errors,
+            previous_mask=previous_mask,
+            handlers_restored=False,
+        )
 
     # Signals delivered while the handlers were being restored are pending because
     # the whole set is blocked. Setting a pending signal to SIG_IGN discards that
@@ -186,14 +386,29 @@ def _restore_signal_handlers_atomically(
         for signum in drainable:
             latch.handle(signum, None)
             previous = previous_handlers[signum]
-            try:
-                signal.signal(signum, signal.SIG_IGN)
-                signal.signal(signum, previous)
-            except BaseException as exc:
-                errors.append(exc)
+            ignored = _set_signal_handler_verified(signum, signal.SIG_IGN, errors)
+            restored = _set_signal_handler_verified(signum, previous, errors)
+            handlers_restored = ignored and restored and handlers_restored
     else:
         errors.append(ContainedProcessError("signal arbitration did not quiesce"))
-    return _SignalRestoration(errors, previous_mask=previous_mask)
+    for signum, previous in previous_handlers.items():
+        try:
+            observed = signal.getsignal(signum)
+            if not _signal_handlers_match(observed, previous):
+                handlers_restored = False
+                errors.append(
+                    ContainedProcessError(
+                        f"signal handler restoration could not be verified for {signum}"
+                    )
+                )
+        except BaseException as exc:
+            handlers_restored = False
+            errors.append(exc)
+    return _SignalRestoration(
+        errors,
+        previous_mask=previous_mask,
+        handlers_restored=handlers_restored,
+    )
 
 
 def _latched_signal_replay_error(
@@ -225,6 +440,7 @@ def _finish_signal_restoration(
     *,
     primary_exception: BaseException | None,
     error_label: str,
+    replay_ready: bool = True,
 ) -> None:
     restoration = _restore_signal_handlers_atomically(
         previous_handlers,
@@ -232,6 +448,24 @@ def _finish_signal_restoration(
         latch,
     )
     cleanup_errors.extend(restoration)
+    if not replay_ready:
+        cleanup_group = BaseExceptionGroup(error_label, cleanup_errors)
+        if latch.first_signum is not None:
+            deferred_signal = _ContainedSignal(latch.first_signum)
+            deferred_signal.cleanup_error_group = cleanup_group  # type: ignore[attr-defined]
+            deferred_signal.add_note(
+                "contained subprocess signal replay deferred until anchors are closed"
+            )
+            raise deferred_signal
+        if primary_exception is not None:
+            primary_exception.cleanup_error_group = cleanup_group  # type: ignore[attr-defined]
+            primary_exception.add_note(
+                "contained subprocess cleanup failed closed with managed signals blocked"
+            )
+            return
+        raise ContainedProcessError(
+            "contained subprocess cleanup failed closed because anchor closure is unproven"
+        ) from cleanup_group
     restoration.release_and_replay(
         latch,
         previous_handlers,
@@ -288,10 +522,49 @@ _MAX_DARWIN_FD_LIST_BYTES = 4 * 1024 * 1024
 DarwinPipeMarker = tuple[int, int]
 
 
-def _close_file_descriptors(descriptors: list[int]) -> None:
-    while descriptors:
-        with suppress(OSError):
-            os.close(descriptors.pop())
+def _file_descriptor_is_closed(
+    descriptor: int,
+    cleanup_errors: list[BaseException],
+) -> bool:
+    try:
+        os.fstat(descriptor)
+    except OSError as exc:
+        if exc.errno == errno.EBADF:
+            return True
+        _record_cleanup_error(cleanup_errors, exc)
+    except BaseException as exc:
+        _record_cleanup_error(cleanup_errors, exc)
+    return False
+
+
+def _close_file_descriptors(
+    descriptors: list[int],
+    cleanup_errors: list[BaseException],
+) -> bool:
+    for descriptor in reversed(tuple(descriptors)):
+        closed = False
+        for _attempt in range(_SIGNAL_STATE_ATTEMPTS):
+            try:
+                os.close(descriptor)
+            except OSError as exc:
+                if exc.errno == errno.EBADF:
+                    closed = True
+                    break
+                _record_cleanup_error(cleanup_errors, exc)
+                if _file_descriptor_is_closed(descriptor, cleanup_errors):
+                    closed = True
+                    break
+            except BaseException as exc:
+                _record_cleanup_error(cleanup_errors, exc)
+                if _file_descriptor_is_closed(descriptor, cleanup_errors):
+                    closed = True
+                    break
+            else:
+                closed = True
+                break
+        if closed:
+            descriptors.remove(descriptor)
+    return not descriptors
 
 
 def _cleanup_reserve_seconds(remaining: float) -> float:
@@ -1268,7 +1541,10 @@ def run_contained(
                 kernel_tracker.close()
             except BaseException as exc:
                 startup_cleanup_errors.append(exc)
-        _close_file_descriptors(darwin_pipe_anchor_fds)
+        anchors_closed = _close_file_descriptors(
+            darwin_pipe_anchor_fds,
+            startup_cleanup_errors,
+        )
         _finish_signal_restoration(
             previous_handlers,
             active_signals,
@@ -1276,6 +1552,7 @@ def run_contained(
             startup_cleanup_errors,
             primary_exception=primary_exception,
             error_label="contained subprocess startup cleanup failures",
+            replay_ready=anchors_closed,
         )
         raise
 
@@ -1501,7 +1778,10 @@ def run_contained(
         except BaseException as exc:
             cleanup_errors.append(exc)
         if primary_exception is not None:
-            _close_file_descriptors(darwin_pipe_anchor_fds)
+            anchors_closed = _close_file_descriptors(
+                darwin_pipe_anchor_fds,
+                cleanup_errors,
+            )
             _finish_signal_restoration(
                 previous_handlers,
                 active_signals,
@@ -1509,6 +1789,7 @@ def run_contained(
                 cleanup_errors,
                 primary_exception=primary_exception,
                 error_label="contained subprocess cleanup failures",
+                replay_ready=anchors_closed,
             )
     try:
         remaining = deadline_monotonic - clock()
@@ -1548,7 +1829,10 @@ def run_contained(
             )
         return completed
     finally:
-        _close_file_descriptors(darwin_pipe_anchor_fds)
+        anchors_closed = _close_file_descriptors(
+            darwin_pipe_anchor_fds,
+            cleanup_errors,
+        )
         _finish_signal_restoration(
             previous_handlers,
             active_signals,
@@ -1556,6 +1840,7 @@ def run_contained(
             cleanup_errors,
             primary_exception=sys.exception(),
             error_label="contained subprocess cleanup failures",
+            replay_ready=anchors_closed,
         )
 
 
