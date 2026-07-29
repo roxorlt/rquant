@@ -2493,6 +2493,136 @@ os._exit(result)
     assert completed.returncode == 0, completed.stderr.decode(errors="replace")
 
 
+@pytest.mark.skipif(
+    not hasattr(signal, "pthread_sigmask"),
+    reason="atomic signal-mask arbitration requires pthread_sigmask",
+)
+@pytest.mark.parametrize("has_primary", (True, False), ids=("with-primary", "without-primary"))
+@pytest.mark.parametrize("outer_mode", ("escape", "catch-reraise"))
+def test_nested_exact_signal_exception_remains_authoritative(
+    has_primary: bool,
+    outer_mode: str,
+) -> None:
+    program = """
+import os
+import signal
+import sys
+
+from rquant import contained_subprocess as contained
+
+has_primary = sys.argv[1] == "1"
+outer_mode = sys.argv[2]
+managed = (signal.SIGINT, signal.SIGTERM)
+real_signal = contained.signal.signal
+real_sigmask = contained.signal.pthread_sigmask
+host_handlers = {signum: signal.getsignal(signum) for signum in managed}
+host_mask = real_sigmask(signal.SIG_BLOCK, set())
+starting_mask = host_mask.difference(managed)
+real_sigmask(signal.SIG_SETMASK, starting_mask)
+
+exact_error = (
+    LookupError("nested signal escaped unchanged")
+    if outer_mode == "escape"
+    else RuntimeError("nested signal caught and re-raised")
+)
+outer_calls = []
+inner_calls = []
+caught_nested = []
+
+def inner_handler(signum, _frame):
+    inner_calls.append(signum)
+    raise exact_error
+
+def outer_handler(signum, _frame):
+    outer_calls.append(signum)
+    if outer_mode == "escape":
+        os.kill(os.getpid(), signal.SIGINT)
+        return
+    try:
+        os.kill(os.getpid(), signal.SIGINT)
+    except BaseException as exc:
+        caught_nested.append(exc)
+        raise exact_error
+
+real_signal(signal.SIGTERM, outer_handler)
+real_signal(signal.SIGINT, inner_handler)
+latch = contained._ContainedSignalLatch()
+previous_handlers, active_signals = contained._install_signal_latch(latch)
+restoration = contained._restore_signal_handlers_atomically(
+    previous_handlers,
+    active_signals,
+    latch,
+)
+
+first_queued = False
+
+def queue_first_at_unmask(how, mask):
+    global first_queued
+    target = set(mask)
+    if how == signal.SIG_SETMASK and target == starting_mask and not first_queued:
+        first_queued = True
+        os.kill(os.getpid(), signal.SIGTERM)
+    return real_sigmask(how, target)
+
+contained.signal.pthread_sigmask = queue_first_at_unmask
+primary = RuntimeError("existing primary") if has_primary else None
+result = 90
+try:
+    cleanup_errors = list(restoration)
+    try:
+        if primary is None:
+            restoration.release_and_replay(
+                latch,
+                previous_handlers,
+                cleanup_errors,
+                primary_exception=None,
+                error_label="contained subprocess cleanup failures",
+            )
+        else:
+            try:
+                raise primary
+            finally:
+                restoration.release_and_replay(
+                    latch,
+                    previous_handlers,
+                    cleanup_errors,
+                    primary_exception=sys.exception(),
+                    error_label="contained subprocess cleanup failures",
+                )
+    except BaseException as exc:
+        expected_caught = [] if outer_mode == "escape" else [exact_error]
+        result = 0 if (
+            exc is exact_error
+            and caught_nested == expected_caught
+            and outer_calls == [signal.SIGTERM]
+            and inner_calls == [signal.SIGINT]
+            and getattr(exc, "cleanup_error_group", None) is None
+            and real_sigmask(signal.SIG_BLOCK, set()) == starting_mask
+            and all(
+                signal.getsignal(signum) is previous_handlers[signum]
+                for signum in managed
+            )
+        ) else 91
+finally:
+    contained.signal.pthread_sigmask = real_sigmask
+    real_sigmask(signal.SIG_BLOCK, set(managed))
+    for signum, handler in host_handlers.items():
+        real_signal(signum, handler)
+    real_sigmask(signal.SIG_SETMASK, host_mask)
+
+os._exit(result)
+"""
+
+    completed = subprocess.run(
+        [sys.executable, "-c", program, str(int(has_primary)), outer_mode],
+        check=False,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert completed.returncode == 0, completed.stderr.decode(errors="replace")
+
+
 def test_latched_signal_transfers_authority_to_outer_latch() -> None:
     outer_latch = contained._ContainedSignalLatch()
 

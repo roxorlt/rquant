@@ -231,7 +231,6 @@ class _SignalHandlerInvocationTracker:
         handler = self._previous_handlers[signum]
         assert callable(handler)
         authority_transferred = _is_nested_signal_latch_handler(handler) and not self._invocations
-        invocation_index = len(self._invocations)
         invocation = _SignalHandlerInvocation(
             signum,
             replay_error=(
@@ -243,12 +242,8 @@ class _SignalHandlerInvocationTracker:
         try:
             handler(signum, frame)
         except BaseException as exc:
-            raised_by_later_invocation = any(
-                later.replay_error is exc for later in self._invocations[invocation_index + 1 :]
-            )
-            if not raised_by_later_invocation:
-                invocation.replay_error = exc
-                invocation.authority_transferred = False
+            invocation.replay_error = exc
+            invocation.authority_transferred = False
             raise
         if invocation.authority_transferred:
             return
