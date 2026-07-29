@@ -1970,6 +1970,7 @@ class LabDaemonReadinessPublisher:
         self.started_at = self.now_provider()
         self._stop = Event()
         self._thread: Thread | None = None
+        self._thread_state = "created"
         self._daemon_authority_lease_fd = -1
         self._verify_lock()
         if daemon_authority_lease_fd is not None:
@@ -2167,34 +2168,69 @@ class LabDaemonReadinessPublisher:
                 self._stop.set()
 
     def start(self) -> LabDaemonReadiness:
-        if self._thread is not None:
+        if self._thread_state != "created":
             raise RuntimeError("daemon readiness publisher is already started")
         heartbeat = self.publish_once()
-        self._thread = Thread(target=self._run, name=f"readiness-{self.label}", daemon=True)
-        self._thread.start()
+        thread = Thread(target=self._run, name=f"readiness-{self.label}", daemon=True)
+        self._thread = thread
+        try:
+            thread.start()
+        except BaseException as primary_exception:
+            self._thread = None
+            self._thread_state = "stopped"
+            self._stop.set()
+            try:
+                self._release_authority_lease()
+            except BaseException as cleanup_error:
+                cleanup_group = BaseExceptionGroup(
+                    "daemon readiness startup cleanup failures",
+                    [cleanup_error],
+                )
+                primary_exception.cleanup_error_group = cleanup_group  # type: ignore[attr-defined]
+                primary_exception.add_note("daemon readiness startup cleanup also failed")
+            raise
+        self._thread_state = "started"
         return heartbeat
+
+    def _release_authority_lease(self) -> None:
+        if self._daemon_authority_lease_fd < 0:
+            return
+        descriptor = self._daemon_authority_lease_fd
+        os.close(descriptor)
+        self._daemon_authority_lease_fd = -1
 
     def close(self) -> None:
         self._stop.set()
         thread = self._thread
         if thread is None:
-            if self._daemon_authority_lease_fd >= 0:
-                os.close(self._daemon_authority_lease_fd)
-                self._daemon_authority_lease_fd = -1
+            self._thread_state = "stopped"
+            self._release_authority_lease()
+            return
+        if self._thread_state == "created":
+            self._thread = None
+            self._thread_state = "stopped"
+            self._release_authority_lease()
             return
         thread.join(timeout=max(1.0, self.heartbeat_interval_seconds * 2))
         if thread.is_alive():
             raise RuntimeError("daemon readiness publisher did not stop within its deadline")
         self._thread = None
-        if self._daemon_authority_lease_fd >= 0:
-            os.close(self._daemon_authority_lease_fd)
-            self._daemon_authority_lease_fd = -1
+        self._thread_state = "stopped"
+        self._release_authority_lease()
 
     def __enter__(self) -> LabDaemonReadinessPublisher:
         try:
             self.start()
-        except BaseException:
-            self.close()
+        except BaseException as primary_exception:
+            try:
+                self.close()
+            except BaseException as cleanup_error:
+                cleanup_group = BaseExceptionGroup(
+                    "daemon readiness context cleanup failures",
+                    [cleanup_error],
+                )
+                primary_exception.cleanup_error_group = cleanup_group  # type: ignore[attr-defined]
+                primary_exception.add_note("daemon readiness context cleanup also failed")
             raise
         return self
 

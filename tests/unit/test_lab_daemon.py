@@ -173,6 +173,73 @@ def test_readiness_live_thread_keeps_daemon_authority_lease(tmp_path: Path) -> N
     second.release()
 
 
+@pytest.mark.parametrize(
+    "label",
+    (
+        "com.roxor.rquant-lab-scheduler",
+        "com.roxor.rquant-lab-worker",
+        "com.roxor.rquant-lab-finalizer",
+    ),
+)
+def test_readiness_thread_start_failure_preserves_error_and_releases_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    label: str,
+) -> None:
+    from rquant import lab_daemon
+
+    authority = tmp_path / "authority"
+    authority.mkdir(mode=0o700)
+    deployment_lock_path = authority / "rquant.lock"
+    deployment_lock_fd = os.open(deployment_lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    lock_root = tmp_path / "runtime" / "locks"
+    lock_root.parent.mkdir(mode=0o700)
+    daemon_lock = LabDaemonLock(lock_root, label.rsplit("-", 1)[-1])
+    daemon_lock.acquire()
+    lease_fd = daemon_lock.duplicate_authority_lease()
+    publisher = LabDaemonReadinessPublisher(
+        deployment_lock_path=deployment_lock_path,
+        deployment_lock_fd=deployment_lock_fd,
+        daemon_authority_lease_fd=lease_fd,
+        label=label,
+        operation_id="a" * 32,
+        environment_generation_id="b" * 64,
+        code_sha="c" * 40,
+        heartbeat_interval_seconds=0.1,
+    )
+    primary = OSError("start boom")
+
+    class FailingThread:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def start(self) -> None:
+            raise primary
+
+        def join(self, *, timeout: float) -> None:
+            pytest.fail(f"unstarted thread was joined with timeout={timeout}")
+
+        def is_alive(self) -> bool:
+            return False
+
+    monkeypatch.setattr(lab_daemon, "Thread", FailingThread)
+    try:
+        with pytest.raises(OSError) as caught:
+            publisher.start()
+        assert caught.value is primary
+        assert publisher._thread is None
+        assert publisher._thread_state == "stopped"
+        assert publisher._daemon_authority_lease_fd == -1
+        with pytest.raises(OSError):
+            os.fstat(lease_fd)
+        publisher.close()
+        publisher.close()
+    finally:
+        publisher.close()
+        daemon_lock.release()
+        os.close(deployment_lock_fd)
+
+
 def test_daemon_readiness_rejects_invalid_generation_before_namespace_creation(
     tmp_path: Path,
 ) -> None:

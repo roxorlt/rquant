@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import signal
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +14,7 @@ from rquant.lab_daemon import LabDaemonConfigurationError
 EXPECTED_ROOT = "/tmp/rquant-expected"
 TRUSTED_GIT = "/usr/bin/git"
 GENERATION = "1" * 40
+STARTUP_DEADLINE = 9_999_999_999.0
 
 
 @pytest.fixture(autouse=True)
@@ -46,6 +48,12 @@ def test_parser_registers_finalizer_and_keeps_legacy_lab_run() -> None:
             "/tmp/.rquant-deploy/rquant-expected.lock",
             "--deployment-generation-fd",
             "9",
+            "--startup-deadline-monotonic",
+            str(STARTUP_DEADLINE),
+            "--deployment-operation-id",
+            "a" * 32,
+            "--deployment-environment-generation",
+            "b" * 64,
             "--once",
         ]
     )
@@ -85,6 +93,83 @@ def test_parser_registers_generation_bound_launchd_install_lifecycle() -> None:
     assert uninstall.no_deactivate is True
 
 
+@pytest.mark.parametrize(
+    "label",
+    (
+        "com.roxor.rquant-lab-scheduler",
+        "com.roxor.rquant-lab-worker",
+        "com.roxor.rquant-lab-finalizer",
+    ),
+)
+def test_cli_readiness_context_releases_lease_when_heartbeat_thread_start_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    label: str,
+) -> None:
+    from rquant import lab_daemon
+    from rquant.cli import _lab_daemon_readiness_context
+    from rquant.config import settings
+
+    deployment_lock = tmp_path / "deployment.lock"
+    deployment_fd = os.open(deployment_lock, os.O_RDWR | os.O_CREAT, 0o600)
+    daemon_authority = tmp_path / "daemon.lock"
+    daemon_fd = os.open(daemon_authority, os.O_RDWR | os.O_CREAT, 0o600)
+    duplicated: list[int] = []
+    primary = OSError("start boom")
+
+    class RuntimeGuard:
+        @staticmethod
+        def verify() -> str:
+            return "c" * 40
+
+    class DaemonLock:
+        @staticmethod
+        def duplicate_authority_lease() -> int:
+            descriptor = os.dup(daemon_fd)
+            duplicated.append(descriptor)
+            return descriptor
+
+    class FailingThread:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def start(self) -> None:
+            raise primary
+
+        def join(self, *, timeout: float) -> None:
+            pytest.fail(f"unstarted thread was joined with timeout={timeout}")
+
+        def is_alive(self) -> bool:
+            return False
+
+    monkeypatch.setattr(lab_daemon, "Thread", FailingThread)
+    monkeypatch.setattr(settings, "lab_readiness_dir", tmp_path / "readiness")
+    args = argparse.Namespace(
+        deployment_generation=GENERATION,
+        deployment_lock_path=deployment_lock,
+        deployment_generation_fd=deployment_fd,
+        deployment_operation_id="a" * 32,
+        deployment_environment_generation="b" * 64,
+    )
+    try:
+        context = _lab_daemon_readiness_context(
+            args,
+            label=label,
+            code_sha="c" * 40,
+            runtime_guard=RuntimeGuard(),
+            daemon_lock=DaemonLock(),
+        )
+        with pytest.raises(OSError) as caught, context:
+            pytest.fail("heartbeat thread start failure must not enter the daemon body")
+        assert caught.value is primary
+        assert len(duplicated) == 1
+        with pytest.raises(OSError):
+            os.fstat(duplicated[0])
+    finally:
+        os.close(daemon_fd)
+        os.close(deployment_fd)
+
+
 def test_scheduler_rejects_missing_authority_configuration_before_sqlite(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -94,7 +179,7 @@ def test_scheduler_rejects_missing_authority_configuration_before_sqlite(
     monkeypatch.setattr(
         lab_daemon,
         "require_lab_runtime_binding",
-        lambda _root, _git: "1" * 40,
+        lambda _root, _git, **_kwargs: "1" * 40,
     )
     monkeypatch.setattr(settings, "lab_finalizer_authority_key_id", "")
     monkeypatch.setattr(settings, "lab_finalizer_authority_key_path", None)
@@ -111,6 +196,7 @@ def test_scheduler_rejects_missing_authority_configuration_before_sqlite(
                 once=True,
                 expected_checkout_root=EXPECTED_ROOT,
                 trusted_git_path=TRUSTED_GIT,
+                startup_deadline_monotonic=STARTUP_DEADLINE,
             )
         )
 
@@ -126,7 +212,7 @@ def test_worker_rejects_unlisted_identity_before_constructing_worker(
     monkeypatch.setattr(
         lab_daemon,
         "require_lab_runtime_binding",
-        lambda _root, _git: "1" * 40,
+        lambda _root, _git, **_kwargs: "1" * 40,
     )
     monkeypatch.setattr(
         lab_worker,
@@ -141,6 +227,7 @@ def test_worker_rejects_unlisted_identity_before_constructing_worker(
                 once=True,
                 expected_checkout_root=EXPECTED_ROOT,
                 trusted_git_path=TRUSTED_GIT,
+                startup_deadline_monotonic=STARTUP_DEADLINE,
             )
         )
 
@@ -225,7 +312,7 @@ def test_finalizer_once_uses_readonly_reader_and_commit_spool(
     monkeypatch.setattr(
         lab_daemon,
         "require_lab_runtime_binding",
-        lambda _root, _git: "1" * 40,
+        lambda _root, _git, **_kwargs: "1" * 40,
     )
     monkeypatch.setattr(
         lab_daemon,
@@ -260,6 +347,7 @@ def test_finalizer_once_uses_readonly_reader_and_commit_spool(
             once=True,
             expected_checkout_root=EXPECTED_ROOT,
             trusted_git_path=TRUSTED_GIT,
+            startup_deadline_monotonic=STARTUP_DEADLINE,
         )
     )
 
@@ -280,7 +368,7 @@ def test_finalizer_requires_prepared_runtime_before_state_or_sqlite_access(
     monkeypatch.setattr(
         lab_daemon,
         "require_lab_runtime_binding",
-        lambda _root, _git: "1" * 40,
+        lambda _root, _git, **_kwargs: "1" * 40,
     )
     monkeypatch.setattr(
         lab_daemon,
@@ -310,6 +398,7 @@ def test_finalizer_requires_prepared_runtime_before_state_or_sqlite_access(
                 once=True,
                 expected_checkout_root=EXPECTED_ROOT,
                 trusted_git_path=TRUSTED_GIT,
+                startup_deadline_monotonic=STARTUP_DEADLINE,
             )
         )
 
@@ -400,7 +489,7 @@ def test_finalizer_forever_installs_both_stop_signals(
     monkeypatch.setattr(
         lab_daemon,
         "require_lab_runtime_binding",
-        lambda _root, _git: "1" * 40,
+        lambda _root, _git, **_kwargs: "1" * 40,
     )
     monkeypatch.setattr(
         lab_daemon,
@@ -433,6 +522,7 @@ def test_finalizer_forever_installs_both_stop_signals(
             once=False,
             expected_checkout_root=EXPECTED_ROOT,
             trusted_git_path=TRUSTED_GIT,
+            startup_deadline_monotonic=STARTUP_DEADLINE,
         )
     )
 

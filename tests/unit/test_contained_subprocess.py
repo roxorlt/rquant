@@ -327,6 +327,208 @@ def test_signal_latch_raises_once_and_defers_consecutive_signal() -> None:
     assert latch.first_signum == signal.SIGTERM
 
 
+def test_pipe_failure_closes_created_kernel_tracker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tracker = _FakeKernelTracker(identity=contained.ProcessIdentity(1, (1, 0)))
+    primary = OSError("pipe boom")
+    monkeypatch.setattr(contained.os, "pipe", lambda: (_ for _ in ()).throw(primary))
+
+    with pytest.raises(OSError) as caught:
+        contained.run_contained(
+            [sys.executable, "-c", "pass"],
+            cwd=tmp_path,
+            deadline_monotonic=time.monotonic() + 2,
+            kernel_tracker_factory=lambda: tracker,
+            may_spawn_background_descendants=False,
+        )
+
+    assert caught.value is primary
+    assert tracker.closed
+
+
+def test_popen_failure_closes_gate_descriptors_and_tracker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tracker = _FakeKernelTracker(identity=contained.ProcessIdentity(1, (1, 0)))
+    primary = OSError("spawn boom")
+    real_pipe = contained.os.pipe
+    gate_fds: list[int] = []
+
+    def recording_pipe() -> tuple[int, int]:
+        descriptors = real_pipe()
+        gate_fds.extend(descriptors)
+        return descriptors
+
+    monkeypatch.setattr(contained.os, "pipe", recording_pipe)
+    monkeypatch.setattr(
+        contained.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(primary),
+    )
+
+    with pytest.raises(OSError) as caught:
+        contained.run_contained(
+            [sys.executable, "-c", "pass"],
+            cwd=tmp_path,
+            deadline_monotonic=time.monotonic() + 2,
+            kernel_tracker_factory=lambda: tracker,
+            may_spawn_background_descendants=False,
+        )
+
+    assert caught.value is primary
+    assert tracker.closed
+    assert len(gate_fds) == 2
+    for descriptor in gate_fds:
+        with pytest.raises(OSError):
+            contained.os.fstat(descriptor)
+
+
+def test_parent_gate_close_failure_reaps_blocked_root_and_closes_resources(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tracker = _FakeKernelTracker(identity=contained.ProcessIdentity(1, (1, 0)))
+    primary = OSError("parent close boom")
+    real_pipe = contained.os.pipe
+    real_close = contained.os.close
+    real_popen = contained.subprocess.Popen
+    gate_fds: list[int] = []
+    spawned: list[subprocess.Popen[str]] = []
+    failed = False
+
+    def recording_pipe() -> tuple[int, int]:
+        descriptors = real_pipe()
+        gate_fds.extend(descriptors)
+        return descriptors
+
+    def fail_first_parent_close(descriptor: int) -> None:
+        nonlocal failed
+        if gate_fds and descriptor == gate_fds[0] and not failed:
+            failed = True
+            raise primary
+        real_close(descriptor)
+
+    def capturing_popen(*args: object, **kwargs: object) -> subprocess.Popen[str]:
+        process = real_popen(*args, **kwargs)
+        spawned.append(process)
+        monkeypatch.setattr(contained.os, "close", fail_first_parent_close)
+        return process
+
+    monkeypatch.setattr(contained.os, "pipe", recording_pipe)
+    monkeypatch.setattr(contained.subprocess, "Popen", capturing_popen)
+
+    with pytest.raises(OSError) as caught:
+        contained.run_contained(
+            [sys.executable, "-c", "pass"],
+            cwd=tmp_path,
+            deadline_monotonic=time.monotonic() + 2,
+            kernel_tracker_factory=lambda: tracker,
+            may_spawn_background_descendants=False,
+        )
+
+    assert caught.value is primary
+    assert tracker.closed
+    assert spawned and spawned[0].returncode is not None
+    for descriptor in gate_fds:
+        with pytest.raises(OSError):
+            contained.os.fstat(descriptor)
+
+
+def test_first_signal_is_replayed_when_tracker_close_fails_and_second_signal_arrives(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tracker = _CloseFailingKernelTracker()
+    real_cleanup = contained._cleanup_process_tree
+    real_kill = contained.os.kill
+    checks = 0
+    replayed: list[int] = []
+
+    def interrupt_on_second_check() -> bool:
+        nonlocal checks
+        checks += 1
+        if checks == 2:
+            handler = signal.getsignal(signal.SIGTERM)
+            assert callable(handler)
+            handler(signal.SIGTERM, None)
+        return False
+
+    def cleanup_with_consecutive_signal(*args: object, **kwargs: object) -> None:
+        handler = signal.getsignal(signal.SIGINT)
+        assert callable(handler)
+        handler(signal.SIGINT, None)
+        real_cleanup(*args, **kwargs)  # type: ignore[arg-type]
+
+    def record_replay(pid: int, signum: int) -> None:
+        if pid == contained.os.getpid():
+            replayed.append(signum)
+            return
+        real_kill(pid, signum)
+
+    monkeypatch.setattr(contained, "_cleanup_process_tree", cleanup_with_consecutive_signal)
+    monkeypatch.setattr(contained.os, "kill", record_replay)
+
+    with pytest.raises(SystemExit) as caught:
+        contained.run_contained(
+            [sys.executable, "-c", "pass"],
+            cwd=tmp_path,
+            deadline_monotonic=time.monotonic() + 2,
+            cancellation_check=interrupt_on_second_check,
+            kernel_tracker_factory=lambda: tracker,
+            may_spawn_background_descendants=False,
+        )
+
+    assert caught.value.code == 128 + signal.SIGTERM
+    assert replayed == [signal.SIGTERM]
+
+
+def test_signal_is_replayed_when_process_cleanup_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_cleanup = contained._cleanup_process_tree
+    real_kill = contained.os.kill
+    checks = 0
+    replayed: list[int] = []
+
+    def interrupt_on_second_check() -> bool:
+        nonlocal checks
+        checks += 1
+        if checks == 2:
+            handler = signal.getsignal(signal.SIGTERM)
+            assert callable(handler)
+            handler(signal.SIGTERM, None)
+        return False
+
+    def failing_cleanup(*args: object, **kwargs: object) -> None:
+        real_cleanup(*args, **kwargs)  # type: ignore[arg-type]
+        raise contained.ContainedProcessError("kill boom")
+
+    def record_replay(pid: int, signum: int) -> None:
+        if pid == contained.os.getpid():
+            replayed.append(signum)
+            return
+        real_kill(pid, signum)
+
+    monkeypatch.setattr(contained, "_cleanup_process_tree", failing_cleanup)
+    monkeypatch.setattr(contained.os, "kill", record_replay)
+
+    with pytest.raises(SystemExit) as caught:
+        contained.run_contained(
+            [sys.executable, "-c", "pass"],
+            cwd=tmp_path,
+            deadline_monotonic=time.monotonic() + 2,
+            cancellation_check=interrupt_on_second_check,
+            may_spawn_background_descendants=False,
+        )
+
+    assert caught.value.code == 128 + signal.SIGTERM
+    assert replayed == [signal.SIGTERM]
+
+
 def test_kernel_tracker_close_failure_restores_signal_handlers(tmp_path: Path) -> None:
     tracker = _CloseFailingKernelTracker()
     before = {signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)}

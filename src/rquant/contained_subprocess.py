@@ -989,33 +989,37 @@ def run_contained(
     containment_token = secrets.token_hex(32)
     process_environment = dict(os.environ if env is None else env)
     process_environment[_CONTAINMENT_ENVIRONMENT_KEY] = containment_token
-    kernel_tracker = kernel_tracker_factory()
-    gate_read, gate_write = os.pipe()
-    helper_command = [
-        sys.executable,
-        "-I",
-        "-S",
-        str(Path(__file__).resolve(strict=True)),
-        "--contained-child",
-        str(gate_read),
-        "--",
-        *args,
-    ]
-    process = subprocess.Popen(
-        helper_command,
-        cwd=cwd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=text,
-        start_new_session=True,
-        pass_fds=(*pass_fds, gate_read),
-        env=process_environment,
-    )
-    os.close(gate_read)
+    kernel_tracker: _KernelProcessTracker | None = None
+    gate_read = gate_write = -1
+    process: subprocess.Popen[str] | None = None
     darwin_pipe_markers: frozenset[DarwinPipeMarker] = frozenset()
     darwin_pipe_anchor_fds: list[int] = []
 
     try:
+        kernel_tracker = kernel_tracker_factory()
+        gate_read, gate_write = os.pipe()
+        helper_command = [
+            sys.executable,
+            "-I",
+            "-S",
+            str(Path(__file__).resolve(strict=True)),
+            "--contained-child",
+            str(gate_read),
+            "--",
+            *args,
+        ]
+        process = subprocess.Popen(
+            helper_command,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=text,
+            start_new_session=True,
+            pass_fds=(*pass_fds, gate_read),
+            env=process_environment,
+        )
+        os.close(gate_read)
+        gate_read = -1
         if sys.platform == "darwin":
             if process.stdout is None or process.stderr is None:
                 raise ContainedProcessError("Darwin containment pipes are unavailable")
@@ -1038,18 +1042,22 @@ def run_contained(
         kernel_tracker.poll(deadline=deadline_monotonic)
     except BaseException as primary_exception:
         startup_cleanup_errors: list[BaseException] = []
-        try:
-            _terminate_blocked_root(process, deadline=deadline_monotonic)
-        except BaseException as exc:
-            startup_cleanup_errors.append(exc)
-        try:
-            kernel_tracker.close()
-        except BaseException as exc:
-            startup_cleanup_errors.append(exc)
-        if gate_write >= 0:
+        if process is not None:
             try:
-                os.close(gate_write)
-            except OSError as exc:
+                _terminate_blocked_root(process, deadline=deadline_monotonic)
+            except BaseException as exc:
+                startup_cleanup_errors.append(exc)
+        for descriptor in (gate_read, gate_write):
+            if descriptor < 0:
+                continue
+            try:
+                os.close(descriptor)
+            except BaseException as exc:
+                startup_cleanup_errors.append(exc)
+        if kernel_tracker is not None:
+            try:
+                kernel_tracker.close()
+            except BaseException as exc:
                 startup_cleanup_errors.append(exc)
         _close_file_descriptors(darwin_pipe_anchor_fds)
         if startup_cleanup_errors:
@@ -1060,6 +1068,9 @@ def run_contained(
             primary_exception.cleanup_error_group = cleanup_group  # type: ignore[attr-defined]
             primary_exception.add_note("contained subprocess startup cleanup also failed")
         raise
+
+    assert process is not None
+    assert kernel_tracker is not None
 
     def observe(deadline: float) -> dict[int, _ProcessObservation]:
         if inventory_provider is process_inventory:
@@ -1280,6 +1291,8 @@ def run_contained(
         raise
     finally:
         primary_exception = sys.exception()
+        if primary_exception is None and caught_signal is not None:
+            primary_exception = caught_signal
         if gate_write >= 0:
             try:
                 os.close(gate_write)

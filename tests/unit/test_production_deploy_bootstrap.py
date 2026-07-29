@@ -6385,6 +6385,9 @@ def test_bootstrap_runner_base_exception_contains_detached_grandchild(
             self.returncode: int | None = None
             self.crashed = False
 
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._process, name)
+
         def communicate(self, *args: object, **kwargs: object) -> tuple[str, str]:
             if not self.crashed:
                 self.crashed = True
