@@ -68,6 +68,7 @@ from rquant.research_run_spec import (
     ResourceClass,
 )
 from rquant.strict_json import (
+    canonical_json_bytes,
     canonical_model_json_bytes,
     strict_json_loads,
     strict_model_validate_canonical_json,
@@ -1483,26 +1484,14 @@ def _canonical_shard_payload(value: str) -> str:
     )
     if not isinstance(parsed, dict):
         raise ValueError("shard payload must encode a JSON object")
-    return json.dumps(
-        parsed,
-        ensure_ascii=True,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    )
+    return canonical_json_bytes(parsed).decode("utf-8")
 
 
 def _canonical_stored_json_object(value: str, *, field: str) -> str:
     parsed = strict_json_loads(value)
     if not isinstance(parsed, dict):
         raise ValueError(f"{field} must encode a JSON object")
-    canonical = json.dumps(
-        parsed,
-        ensure_ascii=True,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    )
+    canonical = canonical_json_bytes(parsed).decode("utf-8")
     if value != canonical:
         raise ValueError(f"{field} JSON is not canonical")
     return canonical
@@ -1701,12 +1690,7 @@ def _sqlite_shard_row_valid(
                     "work_unit_name": work_unit_name,
                     "work_units": work_units,
                 }
-            shard_name = json.dumps(
-                shard_identity,
-                ensure_ascii=True,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
+            shard_name = canonical_json_bytes(shard_identity).decode("utf-8")
             expected_shard_id = uuid5(
                 NAMESPACE_URL,
                 f"rquant:lab-shard:{shard_name}",
@@ -4037,16 +4021,40 @@ class LabJobReader:
             raise ValueError("job list filters exceed the SQL parameter budget")
         return clauses, parameters
 
-    @staticmethod
-    def _validate_list_specs(rows: list[sqlite3.Row]) -> None:
-        for row in rows:
+    @classmethod
+    def _validate_authoritative_graph(cls, connection: sqlite3.Connection) -> None:
+        """Validate every persistent reader authority before applying visibility filters."""
+
+        foreign_key_error = connection.execute("PRAGMA foreign_key_check").fetchone()
+        if foreign_key_error is not None:
+            raise InvalidStoredJobError("Lab job graph contains a foreign-key violation")
+        validators: tuple[tuple[str, Callable[[sqlite3.Row], object]], ...] = (
+            ("lab_job", cls._job_from_row),
+            ("lab_shard", cls._shard_from_row),
+            ("lab_event", cls._event_from_row),
+            ("lab_lease", cls._lease_from_row),
+            ("lab_artifact", cls._artifact_from_row),
+            ("lab_command", _command_record_from_row),
+            ("lab_worker_report", _worker_report_record_from_row),
+            ("lab_artifact_commit", _artifact_commit_record_from_row),
+            ("lab_job_result_artifact", _result_artifact_evidence_from_row),
+        )
+        for table, validator in validators:
+            for row in connection.execute(f"SELECT * FROM {table}").fetchall():
+                validator(row)
+
+        for row in connection.execute("SELECT * FROM lab_scheduler_state").fetchall():
             try:
-                spec_json = str(row["spec_json"])
-                strict_model_validate_canonical_json(ResearchRunSpec, spec_json)
+                if str(row["state_key"]) != "claim_job_cursor":
+                    raise ValueError("state key is unsupported")
+                _load_time(str(row["claim_cursor_created_at"]))
+                _canonical_uuid_text(
+                    row["claim_cursor_job_id"],
+                    field="lab_scheduler_state.claim_cursor_job_id",
+                )
+                _load_time(str(row["updated_at"]))
             except Exception as exc:
-                raise InvalidStoredJobError(
-                    f"invalid stored lab job {row['job_id']}: {exc}"
-                ) from exc
+                raise InvalidStoredJobError("invalid stored scheduler state") from exc
 
     @classmethod
     def _summary_from_row(cls, row: sqlite3.Row) -> LabJobSummary:
@@ -4123,18 +4131,7 @@ class LabJobReader:
             raise ValueError("job list query exceeds the SQL parameter budget")
         page_where = f" WHERE {' AND '.join(page_clauses)}" if page_clauses else ""
         with self._read_snapshot(label="job list") as connection:
-            validation_clauses, validation_parameters = self._job_filters_sql(
-                selected_filters,
-                include_keyword=False,
-            )
-            validation_where = (
-                f" WHERE {' AND '.join(validation_clauses)}" if validation_clauses else ""
-            )
-            validation_rows = connection.execute(
-                f"SELECT j.job_id, j.spec_json FROM lab_job AS j{validation_where}",
-                validation_parameters,
-            ).fetchall()
-            self._validate_list_specs(validation_rows)
+            self._validate_authoritative_graph(connection)
             total_row = connection.execute(
                 f"SELECT COUNT(*) AS total_count FROM lab_job AS j{total_where}",
                 parameters,

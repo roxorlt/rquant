@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import plistlib
 import shutil
 import signal
 import subprocess
@@ -278,6 +279,7 @@ def _checkout(
         package / "contained_subprocess.py",
     )
     shutil.copy2(ROOT / "src" / "rquant" / "strict_json.py", package / "strict_json.py")
+    shutil.copy2(ROOT / "src" / "rquant" / "private_fs.py", package / "private_fs.py")
     shutil.copy2(
         ROOT / "src" / "rquant" / "lab_launchd_install.py",
         package / "lab_launchd_install.py",
@@ -1827,7 +1829,12 @@ def test_installed_rollout_commits_only_after_generation_bound_readiness(
     }
     for name in prior_modules:
         sys.modules.pop(name, None)
+    checkout_src = str(checkout / "src")
+    sys.path.insert(0, checkout_src)
     try:
+        from rquant.ops import production_deploy as checkout_deployer
+
+        monkeypatch.setattr(checkout_deployer, "is_protected_market_window", lambda _now: False)
         result = module.main(
             _command(
                 checkout,
@@ -1838,6 +1845,7 @@ def test_installed_rollout_commits_only_after_generation_bound_readiness(
             )[4:]
         )
     finally:
+        sys.path.remove(checkout_src)
         for name in tuple(sys.modules):
             if name == "rquant" or name.startswith("rquant."):
                 sys.modules.pop(name, None)
@@ -1855,6 +1863,17 @@ def test_installed_rollout_commits_only_after_generation_bound_readiness(
     assert committed.transaction_sha256 == completed.content_hash()
     assert not lock_path.with_name(f"{lock_path.stem}.intent.prepared.json").exists()
     assert loaded == set(module.LAB_LAUNCHD_LABELS)
+    local_install = json.loads(
+        lock_path.with_name(f"{lock_path.stem}.lab-local-install.json").read_text(encoding="utf-8")
+    )
+    assert local_install["code_sha"] == target
+    generation = local_install["environment_generation_id"]
+    for label in module.LAB_LAUNCHD_LABELS:
+        plist_path = Path(local_install["launch_agents_dir"]) / f"{label}.plist"
+        plist = plistlib.loads(plist_path.read_bytes())
+        arguments = plist["ProgramArguments"]
+        assert str(lock_path.parent / f"{lock_path.stem}.venvs" / generation) in arguments[0]
+        assert target in arguments
 
 
 @pytest.mark.parametrize(
@@ -1915,7 +1934,12 @@ def test_explicit_resume_converges_readiness_commit_crash_windows(
     }
     for name in prior_modules:
         sys.modules.pop(name, None)
+    checkout_src = str(checkout / "src")
+    sys.path.insert(0, checkout_src)
     try:
+        from rquant.ops import production_deploy as checkout_deployer
+
+        monkeypatch.setattr(checkout_deployer, "is_protected_market_window", lambda _now: False)
         assert (
             module.main(
                 _command(
@@ -1972,6 +1996,7 @@ def test_explicit_resume_converges_readiness_commit_crash_windows(
             )[4:]
         )
     finally:
+        sys.path.remove(checkout_src)
         for name in tuple(sys.modules):
             if name == "rquant" or name.startswith("rquant."):
                 sys.modules.pop(name, None)
@@ -2051,7 +2076,12 @@ def test_installed_readiness_failure_rolls_back_previous_generation_and_labels(
     }
     for name in prior_modules:
         sys.modules.pop(name, None)
+    checkout_src = str(checkout / "src")
+    sys.path.insert(0, checkout_src)
     try:
+        from rquant.ops import production_deploy as checkout_deployer
+
+        monkeypatch.setattr(checkout_deployer, "is_protected_market_window", lambda _now: False)
         result = module.main(
             _command(
                 checkout,
@@ -2062,6 +2092,7 @@ def test_installed_readiness_failure_rolls_back_previous_generation_and_labels(
             )[4:]
         )
     finally:
+        sys.path.remove(checkout_src)
         for name in tuple(sys.modules):
             if name == "rquant" or name.startswith("rquant."):
                 sys.modules.pop(name, None)
@@ -2085,6 +2116,14 @@ def test_installed_readiness_failure_rolls_back_previous_generation_and_labels(
     assert any(item["stage"] == "handoff_rebound" for item in completed.stage_history)
     assert committed.transaction_sha256 == completed.content_hash()
     assert loaded == set(module.LAB_LAUNCHD_LABELS)
+    local_install = json.loads(
+        lock_path.with_name(f"{lock_path.stem}.lab-local-install.json").read_text(encoding="utf-8")
+    )
+    assert local_install["code_sha"] == previous
+    for label in module.LAB_LAUNCHD_LABELS:
+        plist_path = Path(local_install["launch_agents_dir"]) / f"{label}.plist"
+        arguments = plistlib.loads(plist_path.read_bytes())["ProgramArguments"]
+        assert previous in arguments
 
 
 def test_recovery_target_binding_is_verified_before_launchd_handoff(
@@ -2190,6 +2229,107 @@ def test_lab_handoff_restores_all_managed_daemons_and_verifies_readiness(
     assert loaded == initially_loaded
     assert handoff.stopped == list(module.LAB_LAUNCHD_LABELS)
     assert sum(call[0] == "bootstrap" for call in calls) == 3
+
+
+def test_lab_handoff_prepares_exact_target_before_first_bootout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, root, lock_path = _handoff_fixture(tmp_path)
+    _install_lab_handoff(module, root, lock_path)
+    loaded = set(module.LAB_LAUNCHD_LABELS)
+    events: list[str] = []
+
+    def fake_launchctl(
+        arguments: list[str],
+        *,
+        check: bool,
+        timeout_seconds: float,
+    ) -> subprocess.CompletedProcess[str]:
+        del check, timeout_seconds
+        action = arguments[0]
+        label = arguments[-1].rsplit("/", 1)[-1]
+        if action == "print":
+            return subprocess.CompletedProcess(arguments, 0 if label in loaded else 113)
+        assert action == "bootout"
+        assert events == ["target-ready"]
+        loaded.remove(label)
+        return subprocess.CompletedProcess(arguments, 0)
+
+    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_launchctl", fake_launchctl)
+    handoff = module._LabLaunchdHandoff(
+        root=root,
+        lock_path=lock_path,
+        timeout_seconds=1,
+    )
+
+    def prepare_intent(operation_id: str, labels: tuple[str, ...]) -> tuple[str, str]:
+        assert labels == tuple(module.LAB_LAUNCHD_LABELS)
+        return "1" * 32, operation_id
+
+    def prepare_target(operation_id: str, target_sha: str) -> None:
+        assert operation_id == "1" * 32
+        assert target_sha == "b" * 40
+        assert loaded == set(module.LAB_LAUNCHD_LABELS)
+        events.append("target-ready")
+
+    handoff.prepare(
+        dry_run=False,
+        target_ref="b" * 40,
+        target_sha="b" * 40,
+        action="deploy",
+        prepare_intent=prepare_intent,
+        prepare_target=prepare_target,
+        now=datetime(2026, 7, 27, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert loaded == set()
+
+
+def test_lab_handoff_target_candidate_failure_leaves_current_daemons_loaded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, root, lock_path = _handoff_fixture(tmp_path)
+    _install_lab_handoff(module, root, lock_path)
+    loaded = set(module.LAB_LAUNCHD_LABELS)
+    mutations: list[str] = []
+
+    def fake_launchctl(
+        arguments: list[str],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        action = arguments[0]
+        label = arguments[-1].rsplit("/", 1)[-1]
+        if action == "print":
+            return subprocess.CompletedProcess(arguments, 0 if label in loaded else 113)
+        mutations.append(action)
+        return subprocess.CompletedProcess(arguments, 0)
+
+    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_launchctl", fake_launchctl)
+    handoff = module._LabLaunchdHandoff(root=root, lock_path=lock_path, timeout_seconds=1)
+
+    def reject_candidate(_operation_id: str, _target: str) -> None:
+        raise module.DeployBootstrapError("candidate failed")
+
+    try:
+        with pytest.raises(module.DeployBootstrapError, match="candidate failed"):
+            handoff.prepare(
+                dry_run=False,
+                target_ref="b" * 40,
+                target_sha="b" * 40,
+                action="deploy",
+                prepare_intent=lambda operation_id, _labels: ("1" * 32, operation_id),
+                prepare_target=reject_candidate,
+                now=datetime(2026, 7, 27, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+            )
+    finally:
+        handoff.close()
+
+    assert loaded == set(module.LAB_LAUNCHD_LABELS)
+    assert mutations == []
 
 
 def test_lab_handoff_fails_before_bootout_when_any_managed_daemon_is_missing(
@@ -2581,6 +2721,27 @@ def test_generation_lock_wait_never_sleeps_past_remaining_budget(
         os.close(held)
 
     assert sleeps == [pytest.approx(0.009)]
+
+
+def test_generation_lock_expired_inherited_deadline_has_no_side_effect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _bootstrap_module()
+    root = tmp_path / "rquant"
+    root.mkdir()
+    lock_path = tmp_path / ".rquant-deploy" / "rquant.lock"
+    monkeypatch.setattr(module.time, "monotonic", lambda: 100.0)
+
+    with pytest.raises(module.DeployBootstrapError, match="deadline"):
+        module._acquire_lock(
+            root,
+            lock_path,
+            timeout_seconds=30,
+            deadline_monotonic=99.9,
+        )
+
+    assert not lock_path.parent.exists()
 
 
 def test_lab_handoff_refuses_to_stop_daemons_in_protected_window(
@@ -4746,7 +4907,7 @@ def test_bootstrap_runner_timeout_contains_detached_grandchild(tmp_path: Path) -
     marker = tmp_path / "detached-grandchild-survived"
     grandchild = (
         "import sys,time; from pathlib import Path; "
-        "time.sleep(.3); Path(sys.argv[1]).write_text('late')"
+        "time.sleep(1); Path(sys.argv[1]).write_text('late')"
     )
     child = (
         "import subprocess,sys,time; "
@@ -4754,13 +4915,15 @@ def test_bootstrap_runner_timeout_contains_detached_grandchild(tmp_path: Path) -
         "start_new_session=True); time.sleep(5)"
     )
 
+    started = time.monotonic()
     with pytest.raises(subprocess.TimeoutExpired):
         module._run_process_group(
             [sys.executable, "-c", child, str(marker)],
             cwd=tmp_path,
-            timeout_seconds=0.2,
+            timeout_seconds=0.5,
         )
-    time.sleep(0.5)
+    assert time.monotonic() - started < 1
+    time.sleep(1.1)
 
     assert not marker.exists()
 

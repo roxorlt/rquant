@@ -17,6 +17,7 @@ import pytest
 from pydantic import ValidationError
 
 import rquant.lab_job_protocol as lab_job_protocol
+import rquant.private_fs as private_fs
 from rquant.lab_job_protocol import (
     CancelJobCommand,
     InvalidCommandEnvelopeError,
@@ -164,10 +165,10 @@ def test_rename_noreplace_retries_eintr_then_succeeds(
 ) -> None:
     function = _FakeRenameFunction([errno.EINTR] * interruption_count + [0])
     libc = _FakeRenameLibc(darwin=function)
-    monkeypatch.setattr(lab_job_protocol.sys, "platform", "darwin")
-    monkeypatch.setattr(lab_job_protocol.ctypes, "CDLL", lambda *_args, **_kwargs: libc)
+    monkeypatch.setattr(private_fs.sys, "platform", "darwin")
+    monkeypatch.setattr(private_fs.ctypes, "CDLL", lambda *_args, **_kwargs: libc)
 
-    lab_job_protocol._rename_noreplace(11, "source", 12, "entry")
+    private_fs.rename_noreplace_at(11, "source", 12, "entry")
 
     assert len(function.calls) == interruption_count + 1
     assert all(call[-1] == 0x00000004 for call in function.calls)
@@ -178,10 +179,10 @@ def test_rename_noreplace_linux_branch_uses_noreplace_flag(
 ) -> None:
     function = _FakeRenameFunction([errno.EINTR, 0])
     libc = _FakeRenameLibc(linux=function)
-    monkeypatch.setattr(lab_job_protocol.sys, "platform", "linux")
-    monkeypatch.setattr(lab_job_protocol.ctypes, "CDLL", lambda *_args, **_kwargs: libc)
+    monkeypatch.setattr(private_fs.sys, "platform", "linux")
+    monkeypatch.setattr(private_fs.ctypes, "CDLL", lambda *_args, **_kwargs: libc)
 
-    lab_job_protocol._rename_noreplace(21, "source", 22, "entry")
+    private_fs.rename_noreplace_at(21, "source", 22, "entry")
 
     assert len(function.calls) == 2
     assert all(call[-1] == 0x00000001 for call in function.calls)
@@ -191,11 +192,11 @@ def test_rename_noreplace_linux_without_renameat2_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     libc = _FakeRenameLibc()
-    monkeypatch.setattr(lab_job_protocol.sys, "platform", "linux")
-    monkeypatch.setattr(lab_job_protocol.ctypes, "CDLL", lambda *_args, **_kwargs: libc)
+    monkeypatch.setattr(private_fs.sys, "platform", "linux")
+    monkeypatch.setattr(private_fs.ctypes, "CDLL", lambda *_args, **_kwargs: libc)
 
     with pytest.raises(OSError) as captured:
-        lab_job_protocol._rename_noreplace(21, "source", 22, "entry")
+        private_fs.rename_noreplace_at(21, "source", 22, "entry")
 
     assert captured.value.errno == errno.ENOTSUP
 
@@ -207,11 +208,11 @@ def test_rename_noreplace_preserves_non_eintr_errors(
 ) -> None:
     function = _FakeRenameFunction([error_number])
     libc = _FakeRenameLibc(darwin=function)
-    monkeypatch.setattr(lab_job_protocol.sys, "platform", "darwin")
-    monkeypatch.setattr(lab_job_protocol.ctypes, "CDLL", lambda *_args, **_kwargs: libc)
+    monkeypatch.setattr(private_fs.sys, "platform", "darwin")
+    monkeypatch.setattr(private_fs.ctypes, "CDLL", lambda *_args, **_kwargs: libc)
 
     with pytest.raises(OSError) as captured:
-        lab_job_protocol._rename_noreplace(11, "source", 12, "entry")
+        private_fs.rename_noreplace_at(11, "source", 12, "entry")
 
     assert captured.value.errno == error_number
     assert isinstance(captured.value, FileExistsError) is (error_number == errno.EEXIST)
@@ -221,10 +222,10 @@ def test_rename_noreplace_preserves_non_eintr_errors(
 def test_rename_noreplace_unsupported_platform_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(lab_job_protocol.sys, "platform", "unsupported")
+    monkeypatch.setattr(private_fs.sys, "platform", "unsupported")
 
     with pytest.raises(OSError) as captured:
-        lab_job_protocol._rename_noreplace(11, "source", 12, "entry")
+        private_fs.rename_noreplace_at(11, "source", 12, "entry")
 
     assert captured.value.errno == errno.ENOTSUP
 
@@ -235,8 +236,8 @@ def test_persistent_rename_eintr_is_bounded_without_prepared_evidence(
 ) -> None:
     function = _FakeRenameFunction([], repeated_error=errno.EINTR)
     libc = _FakeRenameLibc(darwin=function)
-    monkeypatch.setattr(lab_job_protocol.sys, "platform", "darwin")
-    monkeypatch.setattr(lab_job_protocol.ctypes, "CDLL", lambda *_args, **_kwargs: libc)
+    monkeypatch.setattr(private_fs.sys, "platform", "darwin")
+    monkeypatch.setattr(private_fs.ctypes, "CDLL", lambda *_args, **_kwargs: libc)
     spool = LabCommandSpool(tmp_path / "commands")
     source = spool.pending_dir / f"{uuid4()}.json"
     source.write_text("{broken", encoding="utf-8")
@@ -247,9 +248,7 @@ def test_persistent_rename_eintr_is_bounded_without_prepared_evidence(
             spool._isolate_owned_entry_locked(source, observed, reason="persistent_eintr")
 
         assert captured.value.errno == errno.EINTR
-        assert len(function.calls) == (attempt + 1) * (
-            lab_job_protocol._RENAME_NOREPLACE_MAX_ATTEMPTS
-        )
+        assert len(function.calls) == (attempt + 1) * (private_fs._RENAME_NOREPLACE_MAX_ATTEMPTS)
         assert source.read_text(encoding="utf-8") == "{broken"
         assert tuple(spool.quarantine_dir.glob("owned-entry-*.dead")) == ()
 

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import math
 import os
 import stat
@@ -24,6 +23,12 @@ from rquant.lab_artifacts import (
     LabJobArtifactManifest,
 )
 from rquant.lab_jobs import LabArtifactPreviewAuthority, LabJobReader
+from rquant.strict_json import (
+    StrictJsonError,
+    canonical_json_bytes,
+    strict_canonical_json_loads,
+    strict_model_validate_canonical_json,
+)
 
 ArtifactScalar: TypeAlias = str | int | float | bool | None
 
@@ -374,12 +379,7 @@ class ArtifactPreviewReader:
                                 f"Parquet preview cell exceeds byte budget: {relative_path}"
                             )
                         value = _preview_scalar(array[row_index].as_py())
-                        encoded = json.dumps(
-                            value,
-                            ensure_ascii=True,
-                            separators=(",", ":"),
-                            allow_nan=False,
-                        ).encode("utf-8")
+                        encoded = canonical_json_bytes(value)
                         row_serialized_bytes += len(encoded) + (1 if row else 0)
                         if (
                             serialized_bytes + row_serialized_bytes + (1 if rows else 0)
@@ -477,7 +477,10 @@ class ArtifactPreviewReader:
                 label="manifest.json",
             )
             try:
-                manifest = LabJobArtifactManifest.model_validate_json(manifest_bytes)
+                manifest = strict_model_validate_canonical_json(
+                    LabJobArtifactManifest,
+                    manifest_bytes,
+                )
             except Exception as exc:
                 raise ArtifactPreviewIntegrityError("artifact manifest is invalid") from exc
             if manifest_bytes != manifest.canonical_json_bytes():
@@ -548,18 +551,9 @@ class ArtifactPreviewReader:
             )
             try:
                 report = report_bytes.decode("utf-8", errors="strict")
-                metrics = json.loads(metrics_bytes)
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                metrics = strict_canonical_json_loads(metrics_bytes)
+            except (UnicodeDecodeError, StrictJsonError) as exc:
                 raise ArtifactPreviewIntegrityError("artifact text payload is invalid") from exc
-            canonical_metrics = json.dumps(
-                metrics,
-                ensure_ascii=True,
-                sort_keys=True,
-                separators=(",", ":"),
-                allow_nan=False,
-            ).encode("utf-8")
-            if canonical_metrics != metrics_bytes:
-                raise ArtifactPreviewIntegrityError("metrics.json is not canonical JSON")
 
             table_entries = tuple(item for item in manifest.files if item.parquet is not None)
             available_tables = tuple(

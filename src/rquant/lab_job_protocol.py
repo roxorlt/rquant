@@ -2,17 +2,13 @@
 
 from __future__ import annotations
 
-import ctypes
-import errno
 import fcntl
 import fnmatch
 import hashlib
 import heapq
-import json
 import os
 import re
 import stat
-import sys
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
@@ -23,8 +19,10 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from rquant.private_fs import rename_noreplace_at
 from rquant.research_run_spec import ResearchRunSpec
 from rquant.strict_json import (
+    canonical_json_bytes,
     canonical_model_json_bytes,
     strict_model_validate_canonical_json,
 )
@@ -39,7 +37,6 @@ _LabSpoolFileType = Literal[
     "char_device",
     "other",
 ]
-_RENAME_NOREPLACE_MAX_ATTEMPTS = 8
 
 
 @dataclass(frozen=True)
@@ -48,57 +45,6 @@ class _ManagedDirectoryIdentity:
     inode: int
     mode: int
     owner: int
-
-
-def _rename_noreplace(
-    source_dir_fd: int,
-    source_name: str,
-    destination_dir_fd: int,
-    destination_name: str,
-) -> None:
-    """Atomically move one directory entry and fail if the destination exists."""
-
-    libc = ctypes.CDLL(None, use_errno=True)
-    if sys.platform == "darwin":
-        function = libc.renameatx_np
-        flags = 0x00000004  # RENAME_EXCL
-    elif sys.platform.startswith("linux"):
-        try:
-            function = libc.renameat2
-        except AttributeError as exc:
-            raise OSError(errno.ENOTSUP, "renameat2 is unavailable") from exc
-        flags = 0x00000001  # RENAME_NOREPLACE
-    else:
-        raise OSError(errno.ENOTSUP, "atomic no-clobber rename is unsupported")
-    function.argtypes = (
-        ctypes.c_int,
-        ctypes.c_char_p,
-        ctypes.c_int,
-        ctypes.c_char_p,
-        ctypes.c_uint,
-    )
-    function.restype = ctypes.c_int
-    error_number = 0
-    for _attempt in range(_RENAME_NOREPLACE_MAX_ATTEMPTS):
-        result = function(
-            source_dir_fd,
-            os.fsencode(source_name),
-            destination_dir_fd,
-            os.fsencode(destination_name),
-            flags,
-        )
-        if result == 0:
-            return
-        error_number = ctypes.get_errno()
-        if error_number != errno.EINTR:
-            break
-    if error_number == errno.EEXIST:
-        raise FileExistsError(
-            error_number,
-            os.strerror(error_number),
-            destination_name,
-        )
-    raise OSError(error_number, os.strerror(error_number), source_name)
 
 
 class RequestContentConflictError(RuntimeError):
@@ -200,14 +146,7 @@ def _command_hash(command: LabCommand) -> str:
             "job_id": str(command.job_id),
             "reason": command.reason,
         }
-    canonical = json.dumps(
-        payload,
-        ensure_ascii=True,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    )
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
 
 
 class LabCommandEnvelope(LabProtocolModel):
@@ -326,7 +265,7 @@ class _LabOwnedEntryIsolationEvidence(LabProtocolModel):
 
     def canonical_json_bytes(self) -> bytes:
         excluded = {"invalid_evidence"} if self.invalid_evidence is None else set()
-        return self.model_dump_json(exclude=excluded).encode("utf-8")
+        return canonical_json_bytes(self.model_dump(mode="json", exclude=excluded))
 
 
 @dataclass(frozen=True)
@@ -1124,7 +1063,7 @@ class LabCommandSpool:
             if destination_name == "entry":
                 self._before_owned_entry_move(source, container)
             self._guard_mutation()
-            _rename_noreplace(
+            rename_noreplace_at(
                 source_fd,
                 source_name,
                 container_fd,

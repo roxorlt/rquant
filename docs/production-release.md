@@ -22,10 +22,12 @@
    绑定的 prepared runtime sentinel。macOS installed 发布还会先只读解析已有 handoff record 并
    执行交易时间门禁；缺失/不符时零写失败，incomplete handoff 即使是 dry-run 也在窗口内直接
    返回 75，既不 fetch，也不改 `FETCH_HEAD`、refs 或 lock namespace。窗口外才有界 fetch 并解析精确 target，
-   随后取得稳定 handoff lock，在第一次 `bootout` 前原子写入 typed prepared deployment intent，
-   其中固定 previous/target/ref、完整 change plan、当前 marker/environment generation、handoff
-   operation 与 installation identity；再停止原先 loaded 的三个 Lab launchd daemon，确认其 shared
-   generation lock 已释放后取得独占锁；Linux 无此本地 launchd 步骤。之后验证当前已提交代际，
+   随后取得稳定 handoff lock，并在 A 仍 loaded 时持共享 generation lock 构建、封存、preflight B 的
+   exact-SHA 不可变代码/环境候选，同时从 B 候选渲染并验证三份 generation-bound plist。只有 B
+   候选完整可用后，才在第一次 `bootout` 前原子写入 typed prepared deployment intent，其中固定
+   previous/target/ref、完整 change plan、当前 marker/environment generation、handoff operation 与
+   installation identity；再停止原先 loaded 的三个 Lab launchd daemon，确认其 shared generation
+   lock 已释放后取得独占锁；Linux 无此本地 launchd 步骤。B 预备失败时 A 保持原样。之后验证当前已提交代际，
    才导入项目
    deployer。bootstrap 与 deployer 的所有 Git 子命令都固定使用已验证的绝对
    `RQUANT_TRUSTED_GIT_PATH`，不读取 `PATH` 中的 `git`；所有只读核对显式设置
@@ -210,7 +212,9 @@ identity 串行化，bootout 原 loaded label 并确认其 generation shared loc
 generation exclusive lock。每个 plist 与 local/registered state 的原 inode 都通过同文件系统
 quarantine rename 和 fsync journal 保护；任一写入、bootstrap、kickstart 或 bootout 失败都会恢复
 原 bytes/inode、两份状态与精确 loaded 集合。未登记的同名 plist 即使内容合法、权限为 `0600` 也
-视为 foreign file，绝不覆盖。复跑相同 generation 幂等，成功卸载则同时移除 local 与 registered
+视为 foreign file，绝不覆盖。quarantine、temp publish 和 rollback restore 都使用父目录 FD 下的
+原子 no-clobber rename；目标或备份竞态出现 foreign occupant 时保留证据并失败关闭。复跑相同
+generation 幂等，成功卸载则同时移除 local 与 registered
 installation authority，重新安装前必须重新登记。P1.5b 只交付并测试了该能力，**尚未在本机安装或加载**；P1.5d 才执行上述命令并做
 真实 launchd readiness/rollback 演练。初始化和登记模式不要求
 launchd 已安装或 loaded；常规 `macos-lab + installed` 发布则反过来强制 installation state 与三个
@@ -258,6 +262,9 @@ sync、partial restart、post-preflight、timer 恢复、环境封存、marker/c
 删除；保留关系不使用 mtime 推断，因此时钟回拨或更新的 orphan 不会改变回滚代际。其他严格受控的旧完成/失败目录
 才会解冻删除。扫描、删除数、回收字节、前后磁盘与保留集合写入 owner-only
 `<lock-stem>.generation-gc.jsonl`。磁盘预算不足时发布在复制前失败，不会留下完整 staging。
+统一引用收集器还会枚举每一份严格命名的 completed deployment intent archive；archive 必须是
+descriptor-bound、非 symlink、canonical authority，任一未知文件名或损坏 archive 都让 GC 在删除前
+失败关闭，不能只保留当前两个硬编码 intent 路径。
 
 不可变 venv 由物理绑定的 uv 在新的 generation 目录内执行 `uv venv --relocatable` 与
 `uv sync --frozen --active`，不复制现用的几百 MB 环境。`RQUANT_DEPLOY_UV` 可指定绝对路径；
@@ -306,8 +313,14 @@ label 独立匹配 launchctl PID 和新 marker，并在稳定窗口内由同一 
 `RQUANT_DEPLOY_COMMAND_TIMEOUT_SECONDS` 限制单次 Git/uv/preflight/launchctl 子命令，
 `RQUANT_DEPLOY_OVERALL_TIMEOUT_SECONDS` 限制整个发布、handoff、失败恢复和锁重取；所有路径继承
 同一个绝对 deadline，预算耗尽后不再执行恢复副作用，只保留可继续的持久 authority。阻塞命令统一
-由有界进程树收容器运行，持续追踪 PID identity，并在 SIGINT/SIGTERM/timeout/BaseException 时停止
-生成源、终止原进程组及 setsid 后代、复核无存活身份后才释放生命周期锁。
+由有界进程树收容器运行；root 在实际命令启动前通过闸门完成 PID identity 取证，后代继承每次运行
+唯一 token，tracker 从闸门释放前持续按 parent graph、token 与 PID start identity 扫描。在
+SIGINT/SIGTERM/timeout/BaseException 时先停止生成源，再反复终止并复核原进程组、立即脱离的
+`setsid` 后代与 cleanup 期间新 fork；平台无法证明收容时失败关闭，不释放成功权威。
+
+所有持久 release/deployment/installation/handoff/runtime/protocol JSON 共用同一 exact canonical
+UTF-8 合约：`ensure_ascii=false`、排序键、紧凑分隔符、禁止 NaN、无尾随换行。reader 同时拒绝重复键
+和任何非规范 bytes；旧 ASCII 转义或 pretty JSON 不会被静默接受，需显式迁移。
 
 以下非秘钥部署控制项可以放在 repo `.env`：`RQUANT_DEPLOY_UV`、单命令/整体 timeout、
 generation GC 宽限期/最小剩余磁盘、`RQUANT_RELEASE_PROFILE`、`RQUANT_LAB_LIFECYCLE_MODE` 与

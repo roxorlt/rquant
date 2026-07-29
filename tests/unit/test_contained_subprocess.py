@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import signal
 import sys
+import time
+from pathlib import Path
+
+import pytest
 
 from rquant import contained_subprocess as contained
 
@@ -123,3 +127,76 @@ def test_successful_root_with_live_detached_descendant_fails_closed(
 
     contained.time.sleep(0.35)
     assert not marker.exists()
+
+
+def test_cancellation_after_spawn_still_inventories_before_cleanup(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+
+    def inventory(_deadline: float) -> dict[int, contained._ProcessObservation]:
+        events.append("inventory")
+        return {}
+
+    def cancel() -> bool:
+        events.append("cancel")
+        return True
+
+    with pytest.raises(contained.ContainedProcessError):
+        contained.run_contained(
+            [sys.executable, "-c", "import time; time.sleep(1)"],
+            cwd=tmp_path,
+            deadline_monotonic=time.monotonic() + 1,
+            inventory_provider=inventory,
+            cancellation_check=cancel,
+        )
+
+    assert events[0] == "inventory"
+
+
+def test_immediate_setsid_descendant_never_escapes_over_repeated_trials(
+    tmp_path: Path,
+) -> None:
+    child = (
+        "import os,subprocess,sys;"
+        "subprocess.Popen([sys.executable,'-c',"
+        "\"import pathlib,sys,time;time.sleep(.08);pathlib.Path(sys.argv[1]).write_text('x')\","
+        "sys.argv[1]],start_new_session=True);os._exit(0)"
+    )
+    markers: list[Path] = []
+
+    for trial in range(101):
+        marker = tmp_path / f"escaped-{trial}"
+        markers.append(marker)
+        with pytest.raises(contained.ContainedProcessError):
+            contained.run_contained(
+                [sys.executable, "-c", child, str(marker)],
+                cwd=tmp_path,
+                deadline_monotonic=time.monotonic() + 0.6,
+            )
+
+    time.sleep(0.15)
+    assert not any(marker.exists() for marker in markers)
+
+
+def test_p15b_production_paths_use_only_shared_contained_subprocess() -> None:
+    root = Path(__file__).resolve().parents[2]
+    production_paths = (
+        root / "scripts" / "bootstrap-lab-daemon.py",
+        root / "scripts" / "bootstrap-production-deploy.py",
+        root / "scripts" / "preflight-lab-runtime.py",
+        root / "scripts" / "run-lab-daemon.py",
+        root / "src" / "rquant" / "research_manifest.py",
+        root / "src" / "rquant" / "release_generation.py",
+        root / "src" / "rquant" / "lab_launchd_install.py",
+        root / "src" / "rquant" / "ops" / "production_deploy.py",
+    )
+
+    violations = {
+        str(path.relative_to(root)): token
+        for path in production_paths
+        for token in ("subprocess.run(", "subprocess.Popen(")
+        if token in path.read_text(encoding="utf-8")
+    }
+
+    assert violations == {}

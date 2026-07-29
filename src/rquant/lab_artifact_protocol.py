@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import json
 import os
 import re
 import stat
@@ -29,6 +28,7 @@ from rquant.lab_job_protocol import (
 )
 from rquant.research_run_spec import DatasetSnapshotIdentity
 from rquant.strict_json import (
+    canonical_json_bytes,
     canonical_model_json_bytes,
     strict_model_validate_canonical_json,
 )
@@ -69,13 +69,7 @@ class LabArtifactCommit(LabArtifactCommitProtocolModel):
         return self
 
     def canonical_json_bytes(self) -> bytes:
-        return json.dumps(
-            self.model_dump(mode="json"),
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode("utf-8")
+        return canonical_json_bytes(self.model_dump(mode="json"))
 
 
 @dataclass(frozen=True)
@@ -140,13 +134,7 @@ class LabFinalizerAuthorityClaims(LabArtifactCommitProtocolModel):
         return self
 
     def canonical_json_bytes(self) -> bytes:
-        return json.dumps(
-            self.model_dump(mode="json"),
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode("utf-8")
+        return canonical_json_bytes(self.model_dump(mode="json"))
 
 
 class LabFinalizerAuthorityProof(LabArtifactCommitProtocolModel):
@@ -256,13 +244,7 @@ class LabArtifactCommitEnvelope(LabArtifactCommitProtocolModel):
         ):
             raise ValueError("authority proof does not match artifact commit identity")
         expected = hashlib.sha256(
-            json.dumps(
-                self.model_dump(mode="json", exclude={"content_hash"}),
-                ensure_ascii=True,
-                sort_keys=True,
-                separators=(",", ":"),
-                allow_nan=False,
-            ).encode("utf-8")
+            canonical_json_bytes(self.model_dump(mode="json", exclude={"content_hash"}))
         ).hexdigest()
         if self.content_hash and self.content_hash != expected:
             raise ValueError("content_hash does not match canonical artifact commit content")

@@ -35,6 +35,7 @@ def _load_strict_json() -> tuple[
     type[ValueError],
     Callable[[str | bytes | bytearray], Any],
     Callable[..., Any],
+    Callable[..., bytes],
 ]:
     path = Path(__file__).resolve().parents[2] / "scripts" / "strict_json.py"
     spec = importlib.util.spec_from_file_location("_rquant_strict_json", path)
@@ -46,10 +47,16 @@ def _load_strict_json() -> tuple[
         module.StrictJsonError,
         module.strict_json_loads,
         module.strict_canonical_json_loads,
+        module.canonical_json_bytes,
     )
 
 
-StrictJsonError, strict_json_loads, strict_canonical_json_loads = _load_strict_json()
+(
+    StrictJsonError,
+    strict_json_loads,
+    strict_canonical_json_loads,
+    canonical_json_bytes,
+) = _load_strict_json()
 
 
 def _load_contained_runner() -> tuple[
@@ -522,7 +529,7 @@ class ReleaseGenerationMarker:
     published_at: str
 
     def content_hash(self) -> str:
-        payload = json.dumps(asdict(self), sort_keys=True, separators=(",", ":")).encode()
+        payload = canonical_json_bytes(asdict(self))
         return hashlib.sha256(payload).hexdigest()
 
     @classmethod
@@ -594,7 +601,7 @@ class DeploymentIntent:
             values.pop("initial_handoff_operation_id")
         if not self.handoff_labels:
             values.pop("handoff_labels")
-        payload = json.dumps(values, sort_keys=True, separators=(",", ":")).encode()
+        payload = canonical_json_bytes(values)
         return hashlib.sha256(payload).hexdigest()
 
     @classmethod
@@ -1526,6 +1533,7 @@ _RELEASE_CODE_EXACT_FILES = frozenset(
 def _release_code_member(path: str) -> bool:
     return (
         path in _RELEASE_CODE_EXACT_FILES
+        or ("/" not in path and path.endswith(".py"))
         or path.startswith("src/rquant/")
         or (path.startswith("deploy/launchd/com.roxor.rquant-lab-") and path.endswith(".plist"))
     )
@@ -1942,7 +1950,7 @@ def _canonical_json_chunks(
     *,
     checkpoint: Callable[[], None] | None = None,
 ) -> Iterator[bytes]:
-    encoder = json.JSONEncoder(sort_keys=True, separators=(",", ":"))
+    encoder = json.JSONEncoder(ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     for encoded_text in encoder.iterencode(payload):
         if checkpoint is not None:
             checkpoint()
@@ -2527,7 +2535,13 @@ class ReleaseGenerationAuthority:
             raise ReleaseGenerationError("immutable release environment build timed out")
         return timeout
 
-    def _build_environment(self, destination: Path, *, system_python: Path) -> None:
+    def _build_environment(
+        self,
+        destination: Path,
+        *,
+        system_python: Path,
+        project_root: Path | None = None,
+    ) -> None:
         self._checkpoint()
         if self._environment_builder is not None:
             self._environment_builder(destination)
@@ -2560,7 +2574,7 @@ class ReleaseGenerationAuthority:
             try:
                 result = run_contained(
                     command,
-                    cwd=self.repo,
+                    cwd=self.repo if project_root is None else project_root,
                     deadline_monotonic=min(
                         time.monotonic() + self.command_timeout_seconds,
                         self.overall_deadline_monotonic,
@@ -2619,6 +2633,7 @@ class ReleaseGenerationAuthority:
         expected_commit: str,
         selector: EnvironmentSelector,
         manifest: dict[str, Any],
+        verify_checkout: bool = True,
     ) -> ReleaseGenerationMarker:
         if len(expected_commit) != 40 or any(c not in "0123456789abcdef" for c in expected_commit):
             raise ReleaseGenerationError("release commit must be a lowercase full SHA")
@@ -2628,7 +2643,7 @@ class ReleaseGenerationAuthority:
         if self.immutable_code_root is not None and self.immutable_code_root != code_root:
             raise ReleaseGenerationError("immutable release code selector is stale")
         commit = expected_commit
-        if self.immutable_code_root is None:
+        if self.immutable_code_root is None and verify_checkout:
             commit = _git_output(
                 self.repo,
                 self.git_path,
@@ -2843,6 +2858,57 @@ class ReleaseGenerationAuthority:
                 ),
                 source=f"{path.name} derived target",
             )
+
+        intent_archive_pattern = re.compile(
+            rf"{re.escape(self.intent_path.stem)}\.([0-9a-f]{{32}})\.completed\.json"
+        )
+        intent_archive_prefix = f"{self.intent_path.stem}."
+        root_fd, root_identity = _private_lock_root(self.lock_path.parent)
+        try:
+            for name in sorted(os.listdir(root_fd)):
+                self._checkpoint()
+                archive_match = intent_archive_pattern.fullmatch(name)
+                if archive_match is None:
+                    if name.startswith(intent_archive_prefix) and name.endswith(".completed.json"):
+                        raise ReleaseGenerationError(
+                            "completed deployment intent archive name is invalid"
+                        )
+                    continue
+                payload, _archive_identity = _read_private_json(
+                    root_fd=root_fd,
+                    root_path=self.lock_path.parent,
+                    name=name,
+                    maximum_bytes=MAX_INTENT_BYTES,
+                    checkpoint=self._checkpoint,
+                )
+                intent = DeploymentIntent.from_payload(payload)
+                if intent.operation_id != archive_match.group(1) or intent.stage != "completed":
+                    raise ReleaseGenerationError(
+                        "completed deployment intent archive binding is invalid"
+                    )
+                deployment_intents.append(intent)
+                references.add(
+                    intent.previous_generation_id,
+                    source=f"{name} previous",
+                    optional=True,
+                )
+                references.add(
+                    _environment_generation_id(
+                        operation_id=intent.operation_id,
+                        commit=intent.previous_sha,
+                    ),
+                    source=f"{name} derived previous",
+                )
+                references.add(
+                    _environment_generation_id(
+                        operation_id=intent.operation_id,
+                        commit=intent.target_sha,
+                    ),
+                    source=f"{name} derived target",
+                )
+            self._assert_root(root_fd, root_identity)
+        finally:
+            os.close(root_fd)
 
         local_install_path = self.lock_path.with_name(
             f"{self.lock_path.stem}.lab-local-install.json"
@@ -3075,7 +3141,7 @@ class ReleaseGenerationAuthority:
                 raise ReleaseGenerationError("generation GC audit is unsafe")
             _write_all(
                 descriptor,
-                (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode(),
+                canonical_json_bytes(payload, trailing_newline=True),
             )
             os.fsync(descriptor)
             self._assert_root(root_fd, root_identity)
@@ -3463,13 +3529,7 @@ class ReleaseGenerationAuthority:
                 raise ReleaseGenerationError("Lab installation checkout authority is invalid")
             installation = LabInstallationIdentity(
                 path=str(self.lock_path.with_name(install_name)),
-                sha256=hashlib.sha256(
-                    json.dumps(
-                        installation_payload,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    ).encode()
-                ).hexdigest(),
+                sha256=hashlib.sha256(canonical_json_bytes(installation_payload)).hexdigest(),
                 device=installation_file_identity.device,
                 inode=installation_file_identity.inode,
             )
@@ -3993,6 +4053,8 @@ class ReleaseGenerationAuthority:
         operation_id: str,
         transaction_kind: str,
         previous_generation_id: str,
+        activate_selector: bool = True,
+        allow_gc: bool = True,
     ) -> tuple[EnvironmentSelector, dict[str, Any]]:
         self._checkpoint()
         source_venv = self.repo / ".venv"
@@ -4011,10 +4073,15 @@ class ReleaseGenerationAuthority:
             checkpoint=self._checkpoint,
             timeout_provider=self._remaining_command_timeout,
         )
-        self.garbage_collect_environments(
-            reason=f"pre-publish:{transaction_kind}",
-            required_bytes=source_bytes,
-        )
+        if allow_gc:
+            self.garbage_collect_environments(
+                reason=f"pre-publish:{transaction_kind}",
+                required_bytes=source_bytes,
+            )
+        elif shutil.disk_usage(self.environment_root.parent).free < (
+            source_bytes + self.minimum_free_bytes
+        ):
+            raise ReleaseGenerationError("release generation disk budget is insufficient")
         generation_id = _environment_generation_id(
             operation_id=operation_id,
             commit=expected_commit,
@@ -4047,20 +4114,25 @@ class ReleaseGenerationAuthority:
                 os.mkdir(staging_name, 0o700, dir_fd=environment_fd)
                 try:
                     self._checkpoint()
-                    self._build_environment(staging_path, system_python=system_python)
+                    code_root = generation_code_root(staging_path)
+                    _materialize_release_code(
+                        repo=self.repo,
+                        git_path=self.git_path,
+                        expected_commit=expected_commit,
+                        destination=code_root,
+                        checkpoint=self._checkpoint,
+                        timeout_provider=self._remaining_command_timeout,
+                    )
+                    self._build_environment(
+                        staging_path,
+                        system_python=system_python,
+                        project_root=code_root,
+                    )
                     _rebind_environment_console_scripts(
                         staging_path,
                         final_path,
                         source_venv,
                         checkpoint=self._checkpoint,
-                    )
-                    _materialize_release_code(
-                        repo=self.repo,
-                        git_path=self.git_path,
-                        expected_commit=expected_commit,
-                        destination=generation_code_root(staging_path),
-                        checkpoint=self._checkpoint,
-                        timeout_provider=self._remaining_command_timeout,
                     )
                     self._checkpoint()
                     self._mutation_hook("environment_staged")
@@ -4174,31 +4246,62 @@ class ReleaseGenerationAuthority:
                 manifest_sha256=manifest_hash,
                 published_at=datetime.now(UTC).isoformat(),
             )
-            try:
-                _prior, selector_identity = self._read_selector()
-            except ReleaseGenerationRecordMissingError:
-                pass
-                selector_identity = None
-            root_fd, root_identity = _private_lock_root(self.lock_path.parent)
-            try:
-                self._assert_root(root_fd, root_identity)
-                _write_private_json(
-                    root_fd=root_fd,
-                    root_path=self.lock_path.parent,
-                    name=self.environment_selector_path.name,
-                    payload=asdict(selector),
-                    require_absent=selector_identity is None,
-                    expected_identity=selector_identity,
-                    maximum_bytes=MAX_MARKER_BYTES,
-                    checkpoint=self._checkpoint,
-                )
-                self._assert_root(root_fd, root_identity)
-            finally:
-                os.close(root_fd)
-            self._mutation_hook("environment_selector_published")
+            if activate_selector:
+                try:
+                    _prior, selector_identity = self._read_selector()
+                except ReleaseGenerationRecordMissingError:
+                    selector_identity = None
+                root_fd, root_identity = _private_lock_root(self.lock_path.parent)
+                try:
+                    self._assert_root(root_fd, root_identity)
+                    _write_private_json(
+                        root_fd=root_fd,
+                        root_path=self.lock_path.parent,
+                        name=self.environment_selector_path.name,
+                        payload=asdict(selector),
+                        require_absent=selector_identity is None,
+                        expected_identity=selector_identity,
+                        maximum_bytes=MAX_MARKER_BYTES,
+                        checkpoint=self._checkpoint,
+                    )
+                    self._assert_root(root_fd, root_identity)
+                finally:
+                    os.close(root_fd)
+                self._mutation_hook("environment_selector_published")
             return selector, manifest
         finally:
             os.close(environment_fd)
+
+    def prepare_environment_candidate(
+        self,
+        *,
+        expected_commit: str,
+        operation_id: str,
+    ) -> ReleaseGenerationMarker:
+        """Build and verify an unselected deployment generation while readers stay live."""
+
+        self._assert_lock()
+        intent, _identity_value = self._read_intent_record(self.prepared_intent_path)
+        if (
+            intent.operation_id != operation_id
+            or intent.target_sha != expected_commit
+            or intent.stage != "planned"
+        ):
+            raise ReleaseGenerationError("prepared generation candidate intent changed")
+        selector, manifest = self._publish_environment(
+            expected_commit=expected_commit,
+            operation_id=operation_id,
+            transaction_kind="deployment",
+            previous_generation_id=intent.previous_generation_id,
+            activate_selector=False,
+            allow_gc=False,
+        )
+        return self._facts(
+            expected_commit=expected_commit,
+            selector=selector,
+            manifest=manifest,
+            verify_checkout=False,
+        )
 
     def invalidate(self) -> None:
         if not self.writable:
@@ -4259,9 +4362,7 @@ class ReleaseGenerationAuthority:
             selector=selector,
             manifest=manifest,
         )
-        payload = (
-            json.dumps(asdict(marker), sort_keys=True, separators=(",", ":")) + "\n"
-        ).encode()
+        payload = canonical_json_bytes(asdict(marker), trailing_newline=True)
         root_fd, root_identity = _private_lock_root(self.lock_path.parent)
         temporary_name = f".{self.marker_path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
         descriptor = -1

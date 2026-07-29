@@ -11,6 +11,7 @@ import importlib.util
 import json
 import math
 import os
+import plistlib
 import re
 import secrets
 import stat
@@ -43,6 +44,7 @@ def _load_strict_json() -> tuple[
     type[ValueError],
     Callable[[str | bytes | bytearray], object],
     Callable[..., object],
+    Callable[..., bytes],
 ]:
     path = Path(__file__).resolve().with_name("strict_json.py")
     spec = importlib.util.spec_from_file_location("_rquant_bootstrap_strict_json", path)
@@ -54,10 +56,16 @@ def _load_strict_json() -> tuple[
         module.StrictJsonError,
         module.strict_json_loads,
         module.strict_canonical_json_loads,
+        module.canonical_json_bytes,
     )
 
 
-StrictJsonError, strict_json_loads, strict_canonical_json_loads = _load_strict_json()
+(
+    StrictJsonError,
+    strict_json_loads,
+    strict_canonical_json_loads,
+    canonical_json_bytes,
+) = _load_strict_json()
 
 
 def _load_contained_runner() -> Callable[..., subprocess.CompletedProcess[object]]:
@@ -450,10 +458,17 @@ def _acquire_lock(
     shared: bool = False,
     timeout_seconds: float = 0,
     create: bool = True,
+    deadline_monotonic: float | None = None,
 ) -> int:
     expected = root.parent / ".rquant-deploy" / f"{root.name}.lock"
     if lock_path != expected:
         raise DeployBootstrapError("deployment lock does not match checkout binding")
+    started = time.monotonic()
+    deadline = started + timeout_seconds
+    if deadline_monotonic is not None:
+        deadline = min(deadline, deadline_monotonic)
+    if deadline_monotonic is not None and deadline_monotonic <= started:
+        raise DeployBootstrapError("deployment generation lock deadline expired")
     try:
         if create:
             lock_path.parent.mkdir(mode=0o700, exist_ok=True)
@@ -478,7 +493,6 @@ def _acquire_lock(
         ):
             raise DeployBootstrapError("deployment generation lock is unsafe")
         operation = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
-        deadline = time.monotonic() + timeout_seconds
         while True:
             try:
                 fcntl.flock(descriptor, operation | fcntl.LOCK_NB)
@@ -675,7 +689,7 @@ def _atomic_private_json(path: Path, payload: dict[str, object], *, absent: bool
             0o600,
             dir_fd=root_fd,
         )
-        encoded = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        encoded = canonical_json_bytes(payload, trailing_newline=True)
         offset = 0
         while offset < len(encoded):
             written = os.write(descriptor, encoded[offset:])
@@ -2002,9 +2016,7 @@ def _lab_installation_identity(lock_path: Path, payload: dict[str, object]) -> d
         raise DeployBootstrapError("Lab launchd installation state must have mode 0600")
     return {
         "path": str(path),
-        "sha256": hashlib.sha256(
-            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest(),
+        "sha256": hashlib.sha256(canonical_json_bytes(payload)).hexdigest(),
         "device": observed.st_dev,
         "inode": observed.st_ino,
     }
@@ -2408,6 +2420,7 @@ class _LabLaunchdHandoff:
         target_sha: str,
         action: str,
         prepare_intent: Callable[[str, tuple[str, ...]], tuple[str, str]] | None = None,
+        prepare_target: Callable[[str, str], None] | None = None,
         now: datetime | None = None,
     ) -> None:
         if (
@@ -2515,6 +2528,12 @@ class _LabLaunchdHandoff:
                 release_profile=self.release_profile,
                 lifecycle_mode=self.lifecycle_mode,
             )
+        if prepare_target is not None:
+            if not self.prepared_intent_operation_id:
+                raise DeployBootstrapError(
+                    "target Lab generation requires a prepared deployment intent"
+                )
+            prepare_target(self.prepared_intent_operation_id, self.target_sha)
         for label, plist in self.plists.items():
             _physical_file(plist, label=f"Lab launchd plist {label}")
             physically_loaded = self._is_loaded(label)
@@ -2697,6 +2716,7 @@ def _finalize_installed_readiness(
                 LAUNCHD_HANDOFF_TIMEOUT_SECONDS,
                 max(0.0, overall_deadline_monotonic - time.monotonic()),
             ),
+            deadline_monotonic=overall_deadline_monotonic,
         )
         active = _private_json(
             _stable_record_path(lock_path, "lab-handoff"),
@@ -3220,7 +3240,13 @@ def _persist_prepared_deployment_intent(
     overall_deadline_monotonic: float,
 ) -> str:
     authority_module = _load_release_authority(root / "src" / "rquant" / "release_generation.py")
-    shared_lock_fd = _acquire_lock(root, lock_path, shared=True, create=False)
+    shared_lock_fd = _acquire_lock(
+        root,
+        lock_path,
+        shared=True,
+        create=False,
+        deadline_monotonic=overall_deadline_monotonic,
+    )
     try:
         authority = authority_module.ReleaseGenerationAuthority(
             repo=root,
@@ -3276,6 +3302,94 @@ def _persist_prepared_deployment_intent(
         return str(intent.operation_id), str(intent.handoff_operation_id)
     except authority_module.ReleaseGenerationError as exc:
         raise DeployBootstrapError("prepared deployment intent is invalid") from exc
+    finally:
+        os.close(shared_lock_fd)
+
+
+def _prepare_installed_target_candidate(
+    *,
+    root: Path,
+    lock_path: Path,
+    python_path: Path,
+    git_path: Path,
+    uv_path: Path,
+    prepared_operation_id: str,
+    target_sha: str,
+    command_timeout_seconds: float,
+    overall_deadline_monotonic: float,
+) -> None:
+    """Seal target code/environment and validate its plist templates before bootout."""
+
+    authority_module = _load_release_authority(root / "src" / "rquant" / "release_generation.py")
+    shared_lock_fd = _acquire_lock(
+        root,
+        lock_path,
+        shared=True,
+        create=False,
+        deadline_monotonic=overall_deadline_monotonic,
+    )
+    try:
+        authority = authority_module.ReleaseGenerationAuthority(
+            repo=root,
+            lock_path=lock_path,
+            lock_fd=shared_lock_fd,
+            python_path=python_path,
+            git_path=git_path,
+            uv_path=uv_path,
+            command_timeout_seconds=command_timeout_seconds,
+            overall_deadline_monotonic=overall_deadline_monotonic,
+        )
+        marker = authority.prepare_environment_candidate(
+            expected_commit=target_sha,
+            operation_id=prepared_operation_id,
+        )
+        environment = Path(marker.venv_path)
+        code_root = authority_module.generation_code_root(environment)
+        replacements = {
+            "__RQUANT_GENERATION_PYTHON__": str(environment / "bin" / "python"),
+            "__RQUANT_CODE_ROOT__": str(code_root),
+            "__RQUANT_COMMIT__": target_sha,
+            "__RQUANT_TRUSTED_GIT__": str(git_path),
+            "__RQUANT_DEPLOYMENT_LOCK__": str(lock_path),
+            "__RQUANT_LAUNCHER__": str(environment / "bin" / "rquant"),
+            "__RQUANT_WORKER_ID__": "rquant-mac-primary",
+            "__RQUANT_STDOUT__": "/private/tmp/rquant-lab-candidate.stdout.log",
+            "__RQUANT_STDERR__": "/private/tmp/rquant-lab-candidate.stderr.log",
+        }
+
+        def substitute(value: object) -> object:
+            if isinstance(value, str):
+                for token, replacement in replacements.items():
+                    value = value.replace(token, replacement)
+                if "__RQUANT_" in value:
+                    raise DeployBootstrapError("target Lab plist contains an unresolved token")
+                return value
+            if isinstance(value, list):
+                return [substitute(item) for item in value]
+            if isinstance(value, dict):
+                return {key: substitute(item) for key, item in value.items()}
+            return value
+
+        for label in LAB_LAUNCHD_LABELS:
+            template = code_root / "deploy" / "launchd" / f"{label}.plist"
+            _physical_file(template, label=f"target Lab plist template {label}")
+            try:
+                document = substitute(plistlib.loads(template.read_bytes()))
+                encoded = plistlib.dumps(document, fmt=plistlib.FMT_XML, sort_keys=True)
+                reparsed = plistlib.loads(encoded)
+            except (OSError, plistlib.InvalidFileException) as exc:
+                raise DeployBootstrapError("target Lab plist candidate is invalid") from exc
+            arguments = reparsed.get("ProgramArguments") if isinstance(reparsed, dict) else None
+            if (
+                reparsed.get("Label") != label
+                or not isinstance(arguments, list)
+                or str(environment / "bin" / "python") not in arguments
+                or str(code_root) not in arguments
+                or target_sha not in arguments
+            ):
+                raise DeployBootstrapError("target Lab plist candidate binding is invalid")
+    except authority_module.ReleaseGenerationError as exc:
+        raise DeployBootstrapError("target Lab generation candidate is invalid") from exc
     finally:
         os.close(shared_lock_fd)
 
@@ -3933,6 +4047,7 @@ def main(argv: list[str] | None = None) -> int:
                     supersedes_operation_id="",
                 )
                 prepare_intent = None
+                prepare_target = None
                 if handoff.enabled and handoff_action == "deploy" and not dry_run:
                     if not previous_sha or target_plan is None:
                         raise DeployBootstrapError("deployment target plan is unavailable")
@@ -3957,12 +4072,26 @@ def main(argv: list[str] | None = None) -> int:
                             overall_deadline_monotonic=overall_deadline_monotonic,
                         )
 
+                    def prepare_target(prepared_operation_id: str, commit_sha: str) -> None:
+                        _prepare_installed_target_candidate(
+                            root=root,
+                            lock_path=lock_path,
+                            python_path=python_path,
+                            git_path=git_path,
+                            uv_path=uv_path,
+                            prepared_operation_id=prepared_operation_id,
+                            target_sha=commit_sha,
+                            command_timeout_seconds=args.command_timeout_seconds,
+                            overall_deadline_monotonic=overall_deadline_monotonic,
+                        )
+
                 handoff.prepare(
                     dry_run=dry_run,
                     target_ref=target_ref,
                     target_sha=target_sha,
                     action=handoff_action,
                     prepare_intent=prepare_intent,
+                    prepare_target=prepare_target,
                 )
             lock_fd = _acquire_lock(
                 root,
@@ -3974,6 +4103,7 @@ def main(argv: list[str] | None = None) -> int:
                     if handoff is not None and handoff.stopped
                     else 0
                 ),
+                deadline_monotonic=overall_deadline_monotonic,
             )
         authority_path = root / "src" / "rquant" / "release_generation.py"
         generation_mode = (
@@ -4398,6 +4528,7 @@ def main(argv: list[str] | None = None) -> int:
                         LAUNCHD_HANDOFF_TIMEOUT_SECONDS,
                         remaining,
                     ),
+                    deadline_monotonic=recovery_handoff.deadline,
                 )
                 recovery_values = _replace_deployment_target(
                     deploy_argv,

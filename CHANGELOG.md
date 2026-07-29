@@ -79,6 +79,14 @@
 
 ### Fixed
 
+- **Strategy Lab P1.5b 第四轮生产边界收口**：所有阻塞/变异子进程统一使用带继承 token、启动闸门、
+  PID 代际和持续后代扫描的有界收容器，立即 `setsid` 并退出的根进程也不能遗留写入者。macOS A→B
+  发布会在 A 仍运行时先构建并验证 B 的不可变代码、环境和三份 generation-bound plist，之后才允许
+  `bootout`；安装 journal 与备份改为 descriptor-bound、原子 no-clobber，干净卸载可幂等复跑。
+  release GC 现在枚举并严格校验全部 completed intent archive；所有持久 authority/protocol JSON 共用
+  raw UTF-8 canonical 编码，转义或非规范旧记录明确失败关闭。Strategy Lab 列表在任何筛选、计数或
+  分页前先在同一只读快照中验证完整 SQLite 权威图，隐藏损坏记录不能被过滤条件绕过。
+
 - **Strategy Lab P1.5b 恢复、安装与持久数据边界加固**：recovery successor 的完整物理
   supersede 链会先原子写回 typed deployment intent 并重读确认，之后才允许任何 launchd mutation，
   相反 action 重试仍保持精确 A→B→C history。launchd 安装/卸载改用独立且与 handoff 兼容的事务锁，

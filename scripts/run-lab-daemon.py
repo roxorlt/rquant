@@ -397,6 +397,7 @@ def _run_preflight(
     handoff_label: str | None = None,
     daemon_command: str,
     immutable_generation: bool = False,
+    deadline_monotonic: float | None = None,
 ) -> None:
     _assert_trusted_git(git_path, git_identity)
     command = [
@@ -426,13 +427,19 @@ def _run_preflight(
     result = run_contained(
         command,
         cwd=root,
-        deadline_monotonic=time.monotonic() + 15,
+        deadline_monotonic=deadline_monotonic or (time.monotonic() + 15),
         check=False,
         pass_fds=(deployment_lock_fd,),
     )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()[:2048]
         raise WrapperError(detail or "Lab runtime preflight failed")
+    if result.stdout:
+        sys.stdout.write(result.stdout)
+        sys.stdout.flush()
+    if result.stderr:
+        sys.stderr.write(result.stderr)
+        sys.stderr.flush()
     _assert_trusted_git(git_path, git_identity)
 
 
@@ -443,6 +450,7 @@ def _run_prepared_sentinel_preflight(
     root: Path,
     daemon_command: str,
     immutable_generation: bool = False,
+    deadline_monotonic: float | None = None,
 ) -> None:
     command = [
         str(python),
@@ -460,7 +468,7 @@ def _run_prepared_sentinel_preflight(
     result = run_contained(
         command,
         cwd=root,
-        deadline_monotonic=time.monotonic() + 15,
+        deadline_monotonic=deadline_monotonic or (time.monotonic() + 15),
         check=False,
     )
     if result.returncode != 0:
@@ -468,7 +476,12 @@ def _run_prepared_sentinel_preflight(
         raise WrapperError(detail or "Lab runtime prepared sentinel preflight failed")
 
 
-def _immutable_generation_main(args: argparse.Namespace, daemon_argv: list[str]) -> int:
+def _immutable_generation_main(
+    args: argparse.Namespace,
+    daemon_argv: list[str],
+    *,
+    startup_deadline: float,
+) -> int:
     code_root = _canonical_absolute(args.expected_code_root, label="immutable code root")
     _require_owned_directory(code_root, label="immutable code root")
     generation = code_root.parent
@@ -489,6 +502,7 @@ def _immutable_generation_main(args: argparse.Namespace, daemon_argv: list[str])
         root=code_root,
         daemon_command=daemon_argv[1],
         immutable_generation=True,
+        deadline_monotonic=startup_deadline,
     )
     lock_path, lock_fd = _acquire_immutable_generation(code_root, args.deployment_lock_path)
     trusted_git, trusted_git_identity = _require_trusted_git(args.trusted_git_path)
@@ -508,6 +522,7 @@ def _immutable_generation_main(args: argparse.Namespace, daemon_argv: list[str])
         handoff_label=handoff_label,
         daemon_command=daemon_argv[1],
         immutable_generation=True,
+        deadline_monotonic=startup_deadline,
     )
     release_module = _load_release_authority(code_root / "src" / "rquant" / "release_generation.py")
     marker = release_module.ReleaseGenerationAuthority(
@@ -542,6 +557,8 @@ def _immutable_generation_main(args: argparse.Namespace, daemon_argv: list[str])
             str(lock_fd),
             "--expected-launcher",
             str(launcher),
+            "--startup-deadline-monotonic",
+            str(startup_deadline),
             "--provisional-handoff-label",
             handoff_label,
             "--",
@@ -601,6 +618,7 @@ def _selected_release_runtime(
 
 
 def main(argv: list[str] | None = None) -> int:
+    startup_deadline = time.monotonic() + 60
     parser = argparse.ArgumentParser()
     parser.add_argument("--expected-checkout-root", required=True)
     parser.add_argument("--expected-code-root")
@@ -617,7 +635,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.expected_code_root is not None:
             if args.expected_commit is None:
                 raise WrapperError("immutable generation requires an exact commit")
-            return _immutable_generation_main(args, daemon_argv)
+            return _immutable_generation_main(
+                args,
+                daemon_argv,
+                startup_deadline=startup_deadline,
+            )
         root, venv, python, runtime_identities = _require_runtime_root(args.expected_checkout_root)
         trusted_git, trusted_git_identity = _require_trusted_git(args.trusted_git_path)
         for variable in _PYTHON_INJECTION_VARIABLES:
@@ -647,6 +669,7 @@ def main(argv: list[str] | None = None) -> int:
             preflight=preflight,
             root=root,
             daemon_command=daemon_argv[1],
+            deadline_monotonic=startup_deadline,
         )
         deployment_lock_path, generation_lock_fd = _acquire_deployment_generation(
             root,
@@ -669,6 +692,7 @@ def main(argv: list[str] | None = None) -> int:
             deployment_lock_fd=generation_lock_fd,
             handoff_label=handoff_label,
             daemon_command=daemon_argv[1],
+            deadline_monotonic=startup_deadline,
         )
         try:
             release_module = _load_release_authority(release_authority_path)
@@ -732,6 +756,7 @@ def main(argv: list[str] | None = None) -> int:
             deployment_lock_fd=generation_lock_fd,
             handoff_label=handoff_label,
             daemon_command=daemon_argv[1],
+            deadline_monotonic=startup_deadline,
         )
         final_root, final_venv, final_python, final_runtime_identities = _require_runtime_root(
             args.expected_checkout_root
@@ -775,6 +800,7 @@ def main(argv: list[str] | None = None) -> int:
             deployment_lock_fd=generation_lock_fd,
             handoff_label=handoff_label,
             daemon_command=daemon_argv[1],
+            deadline_monotonic=startup_deadline,
         )
         rebound_executable, rebound_executable_identity = _validate_daemon_argv(
             root,
@@ -853,6 +879,8 @@ def main(argv: list[str] | None = None) -> int:
                 str(generation_lock_fd),
                 "--expected-launcher",
                 str(selected_launcher),
+                "--startup-deadline-monotonic",
+                str(startup_deadline),
                 *(
                     ["--provisional-handoff-label", handoff_label]
                     if handoff_label is not None

@@ -97,7 +97,20 @@ def test_list_jobs_keyset_pagination_is_stable_bounded_and_has_no_n_plus_one(
     selects = [
         statement for statement in reader.statements if statement.startswith(("SELECT", "WITH"))
     ]
-    assert len(selects) == 3 * 8
+    assert len(selects) == 12 * 8
+    for table in (
+        "lab_job",
+        "lab_shard",
+        "lab_event",
+        "lab_lease",
+        "lab_artifact",
+        "lab_command",
+        "lab_worker_report",
+        "lab_artifact_commit",
+        "lab_job_result_artifact",
+        "lab_scheduler_state",
+    ):
+        assert sum(statement == f"SELECT * FROM {table}" for statement in selects) == 8
     assert reader.statements.count("BEGIN") == 8
     assert reader.statements.count("COMMIT") == 8
 
@@ -261,6 +274,60 @@ def test_list_jobs_keyword_rejects_corrupt_row_beyond_first_page_and_cursor(
             filters=filters,
             limit=1,
             cursor=first.next_cursor,
+        )
+
+
+@pytest.mark.parametrize(
+    ("filters", "corrupt_index"),
+    (
+        (LabJobListFilters(statuses=(JobStatus.QUEUED,)), 0),
+        (LabJobListFilters(job_types=(ResearchJobType.PARAMETER_SEARCH,)), 0),
+        (LabJobListFilters(resource_classes=(ResourceClass.STANDARD,)), 0),
+        (LabJobListFilters(created_from=NOW + timedelta(seconds=1)), 0),
+        (LabJobListFilters(created_before=NOW + timedelta(seconds=1)), 1),
+        (LabJobListFilters(keyword="strategy-001"), 0),
+    ),
+)
+def test_list_jobs_validates_hidden_job_before_every_filter_family(
+    tmp_path: Path,
+    filters: LabJobListFilters,
+    corrupt_index: int,
+) -> None:
+    store, job_ids = _seed_jobs(tmp_path, 2)
+    with sqlite3.connect(store.path) as connection:
+        _register_unprivileged_job_functions(connection)
+        connection.execute("PRAGMA ignore_check_constraints = ON")
+        if filters.statuses:
+            connection.execute(
+                "UPDATE lab_job SET status = 'cancelled' WHERE job_id = ?",
+                (str(job_ids[corrupt_index]),),
+            )
+        connection.execute(
+            "UPDATE lab_job SET spec_json = ? WHERE job_id = ?",
+            (
+                '{"parameters":{"strategy_name":"hidden","strategy_name":7}}',
+                str(job_ids[corrupt_index]),
+            ),
+        )
+
+    with pytest.raises(InvalidStoredJobError, match="stored lab job"):
+        LabJobReader(store.path).list_jobs(filters=filters, limit=1)
+
+
+def test_list_jobs_validates_hidden_shard_evidence_before_job_filtering(tmp_path: Path) -> None:
+    store, _lease_value, _job_id = _setup(tmp_path)
+    with sqlite3.connect(store.path) as connection:
+        _register_unprivileged_job_functions(connection)
+        connection.execute("PRAGMA ignore_check_constraints = ON")
+        connection.execute(
+            "UPDATE lab_shard SET failure_json = ?",
+            ('{"reason":"first","reason":"second"}',),
+        )
+
+    with pytest.raises(InvalidStoredJobError, match="shard|duplicate"):
+        LabJobReader(store.path).list_jobs(
+            filters=LabJobListFilters(statuses=(JobStatus.QUEUED,)),
+            limit=1,
         )
 
 

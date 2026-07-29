@@ -14,12 +14,14 @@ from types import SimpleNamespace
 
 import pytest
 
+import rquant.lab_launchd_install as install_module
 from rquant.lab_launchd_install import (
     LAB_LAUNCHD_LABELS,
     LabLaunchdInstaller,
     LabLaunchdInstallError,
 )
 from rquant.release_generation import ReleaseGenerationAuthority, marker_path_for_lock
+from rquant.strict_json import canonical_json_bytes
 
 ROOT = Path(__file__).resolve().parents[2]
 TRUSTED_GIT = Path("/usr/bin/git")
@@ -152,10 +154,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, str]:
             "inode": observed.st_ino,
         }
     registration = lock.with_name(f"{lock.stem}.lab-install.json")
-    registration.write_text(
-        json.dumps(registered, sort_keys=True, separators=(",", ":")) + "\n",
-        encoding="utf-8",
-    )
+    registration.write_bytes(canonical_json_bytes(registered, trailing_newline=True))
     registration.chmod(0o600)
     return repo, lock, launch_agents, commit
 
@@ -437,6 +436,74 @@ def test_foreign_destination_after_quarantine_is_never_overwritten(
     assert lock.with_name(f"{lock.stem}.lab-install-transaction.json").exists()
 
 
+def test_foreign_backup_winning_exact_quarantine_race_is_never_overwritten(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, lock, launch_agents, _commit = _fixture(tmp_path)
+    LabLaunchdInstaller(
+        checkout_root=repo,
+        deployment_lock_path=lock,
+        launch_agents_dir=launch_agents,
+        trusted_git_path=TRUSTED_GIT,
+        runner=_Runner(),
+    ).install(activate=False)
+    name = f"{LAB_LAUNCHD_LABELS[0]}.plist"
+    destination = launch_agents / name
+    original = (destination.read_bytes(), destination.stat().st_ino)
+    original_payload = LabLaunchdInstaller._plist_payload
+    real_rename = install_module.rename_noreplace_at
+    injected_backup: Path | None = None
+
+    def changed_payload(
+        self: LabLaunchdInstaller,
+        marker: object,
+        code_root: Path,
+        label: str,
+    ) -> bytes:
+        return original_payload(self, marker, code_root, label) + b"\n"
+
+    def inject_rename(
+        source_dir_fd: int,
+        source_name: str,
+        destination_dir_fd: int,
+        destination_name: str,
+    ) -> None:
+        nonlocal injected_backup
+        if source_name == name and destination_name.endswith(".rollback"):
+            descriptor = os.open(
+                destination_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=destination_dir_fd,
+            )
+            os.write(descriptor, b"foreign-backup")
+            os.close(descriptor)
+            injected_backup = launch_agents / destination_name
+        real_rename(
+            source_dir_fd,
+            source_name,
+            destination_dir_fd,
+            destination_name,
+        )
+
+    monkeypatch.setattr(LabLaunchdInstaller, "_plist_payload", changed_payload)
+    monkeypatch.setattr(install_module, "rename_noreplace_at", inject_rename)
+
+    with pytest.raises(LabLaunchdInstallError, match="backup (appeared|changed)"):
+        LabLaunchdInstaller(
+            checkout_root=repo,
+            deployment_lock_path=lock,
+            launch_agents_dir=launch_agents,
+            trusted_git_path=TRUSTED_GIT,
+            runner=_Runner(),
+        ).install(activate=False)
+
+    assert (destination.read_bytes(), destination.stat().st_ino) == original
+    assert injected_backup is not None
+    assert injected_backup.read_bytes() == b"foreign-backup"
+
+
 def test_forged_quarantine_backup_blocks_recovery_and_preserves_evidence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -585,6 +652,72 @@ def test_uninstall_refuses_modified_plist_and_removes_exact_installation(tmp_pat
     installer.uninstall(deactivate=True)
 
     assert not list(launch_agents.glob("*.plist"))
+
+    before = {
+        path: (
+            path.read_bytes() if path.is_file() else None,
+            path.stat().st_ino,
+            path.stat().st_mtime_ns,
+        )
+        for path in lock.parent.iterdir()
+    }
+    installer.uninstall(deactivate=True)
+    after = {
+        path: (
+            path.read_bytes() if path.is_file() else None,
+            path.stat().st_ino,
+            path.stat().st_mtime_ns,
+        )
+        for path in lock.parent.iterdir()
+    }
+    assert after == before
+
+
+def test_clean_uninstall_refuses_foreign_plist_after_prior_removal(tmp_path: Path) -> None:
+    repo, lock, launch_agents, _commit = _fixture(tmp_path)
+    installer = LabLaunchdInstaller(
+        checkout_root=repo,
+        deployment_lock_path=lock,
+        launch_agents_dir=launch_agents,
+        trusted_git_path=TRUSTED_GIT,
+        runner=_Runner(),
+    )
+    installer.install(activate=False)
+    installer.uninstall(deactivate=True)
+    foreign = launch_agents / f"{LAB_LAUNCHD_LABELS[1]}.plist"
+    foreign.write_bytes(b"foreign")
+    foreign.chmod(0o600)
+    before = (foreign.read_bytes(), foreign.stat().st_ino)
+
+    with pytest.raises(LabLaunchdInstallError, match="foreign|authority|installation"):
+        installer.uninstall(deactivate=True)
+
+    assert (foreign.read_bytes(), foreign.stat().st_ino) == before
+
+
+def test_installation_authorities_use_utf8_canonical_paths_and_reject_escaped_form(
+    tmp_path: Path,
+) -> None:
+    unicode_root = tmp_path / "研究环境"
+    repo, lock, launch_agents, _commit = _fixture(unicode_root)
+    installer = LabLaunchdInstaller(
+        checkout_root=repo,
+        deployment_lock_path=lock,
+        launch_agents_dir=launch_agents,
+        trusted_git_path=TRUSTED_GIT,
+        runner=_Runner(),
+    )
+    installer.install(activate=False)
+    local_state = lock.with_name(f"{lock.stem}.lab-local-install.json")
+    payload = local_state.read_bytes()
+
+    assert "研究环境".encode() in payload
+    escaped = payload.replace("研究环境".encode(), b"\\u7814\\u7a76\\u73af\\u5883")
+    assert escaped != payload
+    local_state.write_bytes(escaped)
+
+    with pytest.raises(LabLaunchdInstallError, match="invalid|canonical|authority"):
+        installer.install(activate=False)
 
 
 def test_uninstall_bootout_failure_preserves_files_states_and_loaded_labels(

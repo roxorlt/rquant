@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import re
 import stat
@@ -74,7 +73,7 @@ from rquant.strategy_job_adapters import (
     StrategyJobAdapterRegistry,
     default_strategy_job_adapter_registry,
 )
-from rquant.strict_json import strict_model_validate_canonical_json
+from rquant.strict_json import canonical_json_bytes, strict_model_validate_canonical_json
 
 
 class LabFinalizationError(RuntimeError):
@@ -1489,13 +1488,7 @@ class LabFinalizer:
     @staticmethod
     def _report(metrics: LabFinalizerMetrics) -> str:
         def canonical_json(value: object) -> str:
-            return json.dumps(
-                value,
-                ensure_ascii=True,
-                sort_keys=True,
-                separators=(",", ":"),
-                allow_nan=False,
-            )
+            return canonical_json_bytes(value).decode("utf-8")
 
         summary = canonical_json(
             {
@@ -2295,15 +2288,7 @@ class LabFinalizer:
             finalizer_code_sha=runtime_code_sha,
         )
         metrics_payload = metrics.model_dump(mode="json")
-        metrics_bytes = len(
-            json.dumps(
-                metrics_payload,
-                ensure_ascii=True,
-                sort_keys=True,
-                separators=(",", ":"),
-                allow_nan=False,
-            ).encode("ascii")
-        )
+        metrics_bytes = len(canonical_json_bytes(metrics_payload))
         self._require_within_limit(
             actual=metrics_bytes,
             maximum=self.job_limits.max_final_metrics_bytes,

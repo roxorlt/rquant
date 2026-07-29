@@ -8,7 +8,6 @@ import errno
 import fcntl
 import hashlib
 import io
-import json
 import math
 import os
 import re
@@ -42,6 +41,9 @@ from rquant.strict_json import (
     StrictJsonError,
     strict_json_loads,
     strict_model_validate_canonical_json,
+)
+from rquant.strict_json import (
+    canonical_json_bytes as encode_canonical_json_bytes,
 )
 
 _HASH_PATTERN = r"^[0-9a-f]{64}$"
@@ -373,13 +375,7 @@ def _canonical_value(value: object) -> object:
 def canonical_json_bytes(value: object) -> bytes:
     """Encode supported values to stable, lossless canonical JSON bytes."""
 
-    return json.dumps(
-        _canonical_value(value),
-        ensure_ascii=True,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8")
+    return encode_canonical_json_bytes(_canonical_value(value))
 
 
 def _sha256(payload: bytes) -> str:
@@ -601,13 +597,7 @@ class LabJobArtifactManifest(LabArtifactModel):
         return self
 
     def canonical_json_bytes(self) -> bytes:
-        return json.dumps(
-            self.model_dump(mode="json"),
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode("utf-8")
+        return canonical_json_bytes(self.model_dump(mode="json"))
 
     @property
     def manifest_hash(self) -> str:
@@ -770,13 +760,7 @@ class LabArtifactSealIntent(LabArtifactModel):
         return self
 
     def canonical_json_bytes(self) -> bytes:
-        return json.dumps(
-            self.model_dump(mode="json"),
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode("utf-8")
+        return canonical_json_bytes(self.model_dump(mode="json"))
 
 
 class LabSealedJobArtifact(LabArtifactModel):
@@ -908,13 +892,7 @@ class LabCandidateNamespaceGuardIntent(LabArtifactModel):
         return self
 
     def canonical_json_bytes(self) -> bytes:
-        return json.dumps(
-            self.model_dump(mode="json"),
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode("utf-8")
+        return canonical_json_bytes(self.model_dump(mode="json"))
 
 
 class LabArtifactRecoveryRecord(LabArtifactModel):
@@ -1022,13 +1000,7 @@ class _LabLegacyAuthorityEventPayload(LabArtifactModel):
         return self
 
     def canonical_json_bytes(self) -> bytes:
-        return json.dumps(
-            self.model_dump(mode="json"),
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode("utf-8")
+        return canonical_json_bytes(self.model_dump(mode="json"))
 
 
 class LabLegacyAuthorityEvent(_LabLegacyAuthorityEventPayload):
@@ -1089,13 +1061,7 @@ class LabLegacyAuthorityHead(LabArtifactModel):
         return self
 
     def canonical_json_bytes(self) -> bytes:
-        return json.dumps(
-            self.model_dump(mode="json"),
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode("utf-8")
+        return canonical_json_bytes(self.model_dump(mode="json"))
 
 
 class _FileObservation(LabArtifactModel):

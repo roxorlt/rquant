@@ -397,18 +397,18 @@ def test_research_manifest_readonly_git_preserves_index_and_disables_optional_lo
     )
     index = repo / ".git" / "index"
     before = (index.read_bytes(), index.stat())
-    original_run = subprocess.run
+    original_run_contained = module.run_contained
     environments: list[dict[str, str]] = []
 
-    def capture_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+    def capture_run_contained(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
         command = args[0]
         if isinstance(command, list) and command and command[0] == "/usr/bin/git":
             environment = kwargs.get("env")
             assert isinstance(environment, dict)
             environments.append(environment)
-        return original_run(*args, **kwargs)
+        return original_run_contained(*args, **kwargs)
 
-    monkeypatch.setattr(module.subprocess, "run", capture_run)
+    monkeypatch.setattr(module, "run_contained", capture_run_contained)
 
     assert module.detect_verified_code_commit(repo, trusted_git_path=Path("/usr/bin/git"))
     after = index.stat()

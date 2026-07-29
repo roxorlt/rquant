@@ -6,12 +6,15 @@ import os
 import re
 import stat
 import subprocess
+import time
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, Field, computed_field, model_validator
+
+from rquant.contained_subprocess import run_contained
 
 _IGNORED_NATIVE_CODE_SUFFIXES = frozenset({".so", ".dylib", ".pyd"})
 _IGNORED_SOURCE_CODE_SUFFIXES = frozenset({".py", ".pyw"})
@@ -93,15 +96,15 @@ def _run_trusted_git(
     *,
     cwd: Path,
     text: bool = True,
+    deadline_monotonic: float | None = None,
 ) -> subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes]:
     if bind_trusted_git_executable(binding.path) != binding:
         raise ValueError("trusted Git executable identity changed")
-    result = subprocess.run(
+    result = run_contained(
         [str(binding.path), *arguments],
         cwd=cwd,
-        capture_output=True,
         text=text,
-        timeout=3,
+        deadline_monotonic=deadline_monotonic or (time.monotonic() + 3),
         check=False,
         env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"},
     )
@@ -263,6 +266,7 @@ def detect_code_commit(
     repo_root: Path | None = None,
     *,
     trusted_git_path: Path | None = None,
+    deadline_monotonic: float | None = None,
 ) -> str | None:
     """优先读取部署注入值；本地开发时回退到 git HEAD。"""
     injected = os.getenv("RQUANT_CODE_COMMIT", "").strip()
@@ -275,6 +279,7 @@ def detect_code_commit(
             git,
             ["rev-parse", "HEAD"],
             cwd=cwd,
+            deadline_monotonic=deadline_monotonic,
         )
     except (OSError, subprocess.SubprocessError, ValueError):
         return None
@@ -286,6 +291,7 @@ def detect_code_commit(
             git,
             ["status", "--porcelain", "--untracked-files=normal"],
             cwd=cwd,
+            deadline_monotonic=deadline_monotonic,
         )
     except (OSError, subprocess.SubprocessError, ValueError):
         return f"{commit}-dirty"
@@ -298,6 +304,7 @@ def detect_verified_code_commit(
     repo_root: Path | None = None,
     *,
     trusted_git_path: Path | None = None,
+    deadline_monotonic: float | None = None,
 ) -> str | None:
     """Resolve a formal-run commit from the real clean Git checkout."""
     cwd = repo_root or Path(__file__).resolve().parents[2]
@@ -307,17 +314,20 @@ def detect_verified_code_commit(
             git,
             ["rev-parse", "HEAD"],
             cwd=cwd,
+            deadline_monotonic=deadline_monotonic,
         )
         checkout = _run_trusted_git(
             git,
             ["rev-parse", "--show-toplevel"],
             cwd=cwd,
+            deadline_monotonic=deadline_monotonic,
         )
         status = _run_trusted_git(
             git,
             ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
             cwd=cwd,
             text=False,
+            deadline_monotonic=deadline_monotonic,
         )
         ignored_source_artifacts = _run_trusted_git(
             git,
@@ -332,6 +342,7 @@ def detect_verified_code_commit(
             ],
             cwd=cwd,
             text=False,
+            deadline_monotonic=deadline_monotonic,
         )
     except (OSError, subprocess.SubprocessError, ValueError):
         return None

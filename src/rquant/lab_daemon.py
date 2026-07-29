@@ -5,7 +5,6 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import importlib.util
-import json
 import os
 import re
 import stat
@@ -34,6 +33,7 @@ def _load_strict_json() -> tuple[
     Callable[..., object],
     Callable[..., object],
     Callable[..., bytes],
+    Callable[..., bytes],
 ]:
     path = Path(__file__).resolve().parents[2] / "scripts" / "strict_json.py"
     spec = importlib.util.spec_from_file_location("_rquant_lab_strict_json", path)
@@ -47,6 +47,7 @@ def _load_strict_json() -> tuple[
         module.strict_canonical_json_loads,
         module.strict_model_validate_canonical_json,
         module.canonical_model_json_bytes,
+        module.canonical_json_bytes,
     )
 
 
@@ -56,6 +57,7 @@ def _load_strict_json() -> tuple[
     strict_canonical_json_loads,
     strict_model_validate_canonical_json,
     canonical_model_json_bytes,
+    canonical_json_bytes,
 ) = _load_strict_json()
 
 _CODE_SHA = re.compile(r"^[0-9a-f]{40}$")
@@ -364,7 +366,7 @@ def _write_runtime_prepared_sentinel(
             0o600,
             dir_fd=root_fd,
         )
-        encoded = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        encoded = canonical_json_bytes(payload, trailing_newline=True)
         offset = 0
         while offset < len(encoded):
             written = os.write(descriptor, encoded[offset:])

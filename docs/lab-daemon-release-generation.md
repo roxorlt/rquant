@@ -41,9 +41,11 @@ rename/replacement 或声明路径与物理路径漂移都会失败关闭。
 ```
 
 daemon 持共享锁；`scripts/deploy-production.sh` 另持稳定的 sibling handoff lock。macOS 正式
-发布会在交易保护窗口外记录当时 loaded 的三个 Lab label，逐个 `bootout`，有界等待 shared lock
-前先持久化严格 typed 的 prepared deployment intent；释放后再取得 generation 独占锁并原子接管该
-intent，deployer 不重新 fetch 或重算 plan。事务成功或已回滚后，部署器只 `bootstrap` 原先 loaded 的 label，
+发布会在交易保护窗口外、A 仍 loaded 且持有共享 generation lock 时，先构建并完整验证 B 的不可变
+代码/环境候选与三份精确 generation-bound plist。只有 B 候选、preflight、change plan 和 typed
+prepared deployment intent 都已持久化并重读验证后，才记录 loaded labels、逐个 `bootout` A，
+有界等待 shared lock 释放，再取得 generation 独占锁并原子接管 intent；deployer 不重新 fetch 或
+重算 plan。B 的任一预备失败都不会触碰 A。事务成功或已回滚后，部署器只 `bootstrap` 原先 loaded 的 label，
 并验证 launchd health 与 shared lock 已重新取得；每个 `launchctl print` 的超时取 command timeout
 与当前整体/readiness 剩余预算的较小值，预算耗尽立即失败。任一步超时都返回失败，不会无限等待。dry-run
 仅以共享锁核对并输出 handoff 计划，不停止 daemon。`launchctl` 始终由当前用户执行，sudoers
@@ -113,7 +115,9 @@ ancestor 在验证后发生 rename/replacement 时，创建与登记都会失败
 
 发布环境 GC 只在同一 generation 独占锁内运行。它通过统一引用收集器保留 selector、marker、commit、
 active/prepared/initialization intent、local/registered installation、daemon readiness、全部 partial/
-recovery/completed handoff 与 supersede 祖先所引用的当前、上一代和候选代际；未完成 installation
+recovery/completed handoff 与 supersede 祖先，以及所有严格命名、canonical、非 symlink 的 completed
+deployment intent archive 所引用的当前、上一代和候选代际；未知 archive 文件名或任一损坏 archive
+会在删除前失败关闭。未完成 installation
 transaction、损坏记录或缺失引用祖先会在删除前失败关闭。GC 只删除超过宽限期、
 严格位于 generation root、无 symlink/hardlink 且不再被引用的完成或失败目录。只读树先受控解冻
 再按 descriptor 删除。每次扫描记录到 `rQuant.generation-gc.jsonl`，并在构建前验证 generation
@@ -137,14 +141,21 @@ P1.5b 已实现并用临时目录/fake launchctl 验证 `rquant lab-launchd-inst
 installation state 精确授权的文件身份；随后停止登记为 loaded 的 label、有界确认 daemon 共享锁释放，
 才取得 generation 独占锁并验证 current marker/selector/manifest。每次安装或卸载先 fsync 一份
 identity-bound transaction journal，再用同文件系统 rename 保存原 inode；plist、local state、registered
-state 和原 loaded label 在任一边界失败后都按 journal 精确恢复。首次安装遇到任何未登记的同名文件
+state 和原 loaded label 在任一边界失败后都按 journal 精确恢复。authority/backup/temp 的发布与恢复
+使用 descriptor-bound 原子 no-clobber rename，竞态产生的 foreign occupant 永不被覆盖。首次安装遇到任何未登记的同名文件
 都会失败关闭且保持其 bytes/inode 不变；幂等复跑不替换相同 inode。卸载只有在全部精确 managed
-label 确认 unload 后才移除文件和两份状态，任一 bootout 失败则完整恢复。
+label 确认 unload 后才移除文件和两份状态，任一 bootout 失败则完整恢复；两份可信安装状态、三份
+plist 和三个 label 均已不存在时，重复卸载是严格只读的成功 no-op，任何 partial/foreign 状态仍拒绝。
 常规 A→B installed 发布无需再次人工运行 installer：handoff 在目标 daemon bootstrap 前使用同一
 identity-bound journal 将三份 plist 及 local/registered state 原子推进到 B；失败则先停止 B、恢复 A
 文件身份与 loaded 集合，再恢复 A authority。旧 generation 保留到 B 的 commit 与 readiness 完成。
 P1.5b **没有**向 `~/Library/LaunchAgents` 写文件，也没有执行真实 `launchctl bootstrap/kickstart`；
 这些实际安装、健康观察和回滚演练只在 P1.5d 人工基础设施窗口进行。
+
+所有持久 generation、deployment、installation、handoff、runtime 和 Strategy Lab protocol JSON
+使用同一 canonical serializer：UTF-8 原字符、排序键、紧凑分隔符、禁止 NaN、无额外换行。reader
+先拒绝任意层重复键，再比较 exact canonical bytes；旧的 ASCII 转义、pretty print、键序或额外空白
+不会被偶然接受，必须经过显式迁移。
 
 隔离 worktree 可继续复用链接 `.venv` 运行测试，但正式 daemon 会在读取
 配置或创建运行时目录前拒绝这种 runtime。

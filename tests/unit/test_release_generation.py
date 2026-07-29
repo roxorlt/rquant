@@ -3066,6 +3066,102 @@ def test_generation_gc_retains_authority_references_and_removes_only_old_orphans
     os.close(lock_fd)
 
 
+def test_generation_gc_retains_generation_referenced_only_by_completed_intent_archive(
+    tmp_path: Path,
+) -> None:
+    repo, lock_path, commit, python = _generation(tmp_path)
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    authority = _authority(
+        repo,
+        lock_path,
+        lock_fd,
+        python,
+        gc_grace_seconds=0,
+        minimum_free_bytes=0,
+    )
+    _publish_initialized(authority, commit=commit)
+    deployment = authority.begin_deployment_intent(
+        previous_sha=commit,
+        target_sha=commit,
+        target_ref=commit,
+        changed_files=(),
+        restart_services=(),
+        active_services=(),
+        active_timers=(),
+    )
+    _advance_deployment_intent(authority, deployment, target_stage="completed")
+    active = intent_path_for_lock(lock_path)
+    archive = active.with_name(f"{active.stem}.{deployment.operation_id}.completed.json")
+    active.replace(archive)
+    operation_id = deployment.operation_id
+    archived_generation = hashlib.sha256(f"{operation_id}:{commit}".encode()).hexdigest()
+    candidate = environment_root_for_lock(lock_path) / archived_generation
+    candidate.mkdir(mode=0o700)
+    payload = candidate / "payload"
+    payload.write_text("archive-only", encoding="utf-8")
+    payload.chmod(0o400)
+    candidate.chmod(0o500)
+    os.utime(candidate, (time.time() - 200, time.time() - 200), follow_symlinks=False)
+
+    metrics = authority.garbage_collect_environments(reason="completed-archive")
+
+    assert archive.is_file()
+    assert archived_generation in metrics.retained_generation_ids
+    assert candidate.is_dir()
+    os.close(lock_fd)
+
+
+@pytest.mark.parametrize("archive_kind", ["corrupt", "foreign-name", "symlink"])
+def test_generation_gc_fails_closed_on_unsafe_completed_intent_archive(
+    tmp_path: Path,
+    archive_kind: str,
+) -> None:
+    repo, lock_path, commit, python = _generation(tmp_path)
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    authority = _authority(
+        repo,
+        lock_path,
+        lock_fd,
+        python,
+        gc_grace_seconds=0,
+        minimum_free_bytes=0,
+    )
+    _publish_initialized(authority, commit=commit)
+    operation_id, archive = _archive_completed_deployment(
+        authority,
+        lock_path,
+        commit=commit,
+    )
+    if archive_kind == "corrupt":
+        archive.write_text("{not-json\n", encoding="utf-8")
+    elif archive_kind == "foreign-name":
+        archive.rename(
+            archive.with_name(f"{intent_path_for_lock(lock_path).stem}.foreign.completed.json")
+        )
+    else:
+        archived = archive.read_bytes()
+        archive.unlink()
+        external = tmp_path / "external-intent.json"
+        external.write_bytes(archived)
+        external.chmod(0o600)
+        archive.symlink_to(external)
+
+    orphan = environment_root_for_lock(lock_path) / ("9" * 64)
+    orphan.mkdir(mode=0o700)
+    payload = orphan / "payload"
+    payload.write_text(operation_id, encoding="utf-8")
+    payload.chmod(0o400)
+    orphan.chmod(0o500)
+
+    with pytest.raises(ReleaseGenerationError, match="intent|archive|unsafe|JSON"):
+        authority.garbage_collect_environments(reason="unsafe-archive")
+
+    assert orphan.is_dir()
+    os.close(lock_fd)
+
+
 @pytest.mark.parametrize("authority_kind", ["install-transaction", "corrupt-install"])
 def test_generation_gc_fails_closed_on_unresolved_installation_authority(
     tmp_path: Path,

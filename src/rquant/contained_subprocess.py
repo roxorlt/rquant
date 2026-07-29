@@ -7,11 +7,14 @@ the exact immutable generation copy before importing the rest of :mod:`rquant`.
 from __future__ import annotations
 
 import ctypes
+import errno
 import os
+import secrets
 import signal
 import struct
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
@@ -38,14 +41,68 @@ class ProcessIdentity:
 class _ProcessObservation:
     identity: ProcessIdentity
     parent_pid: int
+    containment_token: bool = False
 
 
 Clock = Callable[[], float]
 Sleep = Callable[[float], None]
 Inventory = Callable[[float], dict[int, _ProcessObservation]]
 
+_CONTAINMENT_ENVIRONMENT_KEY = "RQUANT_CONTAINMENT_TOKEN"
+_MAX_PROCESS_ARGUMENT_BYTES = 4 * 1024 * 1024
 
-def _darwin_process_inventory(deadline: float) -> dict[int, _ProcessObservation]:
+
+def _darwin_process_has_token(pid: int, token: str, *, deadline: float) -> bool:
+    if time.monotonic() >= deadline:
+        raise TimeoutError("process environment inventory timed out")
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.sysctl.argtypes = [
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.c_uint,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+    ]
+    libc.sysctl.restype = ctypes.c_int
+    mib = (ctypes.c_int * 3)(1, 49, pid)  # CTL_KERN, KERN_PROCARGS2, pid
+    size = ctypes.c_size_t()
+    if libc.sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0:
+        error = ctypes.get_errno()
+        if error in {errno.ESRCH, errno.EPERM, errno.EACCES, errno.EIO, errno.EINVAL}:
+            return False
+        raise OSError(error, "sysctl KERN_PROCARGS2 size")
+    if size.value <= 0 or size.value > _MAX_PROCESS_ARGUMENT_BYTES:
+        return False
+    buffer = ctypes.create_string_buffer(size.value)
+    if libc.sysctl(mib, 3, buffer, ctypes.byref(size), None, 0) != 0:
+        error = ctypes.get_errno()
+        if error in {errno.ESRCH, errno.EPERM, errno.EACCES, errno.EIO, errno.EINVAL}:
+            return False
+        raise OSError(error, "sysctl KERN_PROCARGS2 payload")
+    expected = f"{_CONTAINMENT_ENVIRONMENT_KEY}={token}".encode()
+    return expected in buffer.raw[: size.value].split(b"\0")
+
+
+def _linux_process_has_token(pid: int, token: str, *, deadline: float) -> bool:
+    if time.monotonic() >= deadline:
+        raise TimeoutError("process environment inventory timed out")
+    expected = f"{_CONTAINMENT_ENVIRONMENT_KEY}={token}".encode()
+    try:
+        payload = (Path("/proc") / str(pid) / "environ").read_bytes()
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        return False
+    if len(payload) > _MAX_PROCESS_ARGUMENT_BYTES:
+        raise ContainedProcessError("process environment exceeds containment budget")
+    return expected in payload.split(b"\0")
+
+
+def _darwin_process_inventory(
+    deadline: float,
+    *,
+    containment_token: str | None = None,
+    started_at_or_after: tuple[int, int] | None = None,
+) -> dict[int, _ProcessObservation]:
     try:
         libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
         libproc.proc_listallpids.argtypes = [ctypes.c_void_p, ctypes.c_int]
@@ -71,22 +128,37 @@ def _darwin_process_inventory(deadline: float) -> dict[int, _ProcessObservation]
             size = libproc.proc_pidinfo(pid, 3, 0, buffer, len(buffer))
             if size < 136:
                 continue
-            _flags, _status, _xstatus, observed_pid, parent = struct.unpack_from(
-                "=IIIII", buffer.raw
+            _flags, _status, _xstatus, observed_pid, parent, effective_uid = struct.unpack_from(
+                "=IIIIII", buffer.raw
             )
             start_seconds, start_microseconds = struct.unpack_from("=QQ", buffer.raw, 120)
-            if observed_pid != pid or start_seconds <= 0:
+            if observed_pid != pid or start_seconds <= 0 or effective_uid != os.getuid():
                 continue
             result[pid] = _ProcessObservation(
                 identity=ProcessIdentity(pid, (start_seconds, start_microseconds)),
                 parent_pid=parent,
+                containment_token=(
+                    containment_token is not None
+                    and (
+                        started_at_or_after is None
+                        or (start_seconds, start_microseconds) >= started_at_or_after
+                    )
+                    and _darwin_process_has_token(pid, containment_token, deadline=deadline)
+                ),
             )
         return result
+    except TimeoutError:
+        raise
     except (OSError, ValueError) as exc:
         raise ContainedProcessError("process inventory failed") from exc
 
 
-def _linux_process_inventory(deadline: float) -> dict[int, _ProcessObservation]:
+def _linux_process_inventory(
+    deadline: float,
+    *,
+    containment_token: str | None = None,
+    started_at_or_after: tuple[int, int] | None = None,
+) -> dict[int, _ProcessObservation]:
     result: dict[int, _ProcessObservation] = {}
     try:
         for entry in Path("/proc").iterdir():
@@ -100,22 +172,43 @@ def _linux_process_inventory(deadline: float) -> dict[int, _ProcessObservation]:
             if close < 0 or len(fields) < 20:
                 continue
             pid = int(entry.name)
+            identity = ProcessIdentity(pid, (int(fields[19]), 0))
             result[pid] = _ProcessObservation(
-                identity=ProcessIdentity(pid, (int(fields[19]), 0)),
+                identity=identity,
                 parent_pid=int(fields[1]),
+                containment_token=(
+                    containment_token is not None
+                    and (started_at_or_after is None or identity.started >= started_at_or_after)
+                    and _linux_process_has_token(pid, containment_token, deadline=deadline)
+                ),
             )
+    except TimeoutError:
+        raise
     except (OSError, ValueError) as exc:
         raise ContainedProcessError("process inventory failed") from exc
     return result
 
 
-def process_inventory(deadline: float) -> dict[int, _ProcessObservation]:
+def process_inventory(
+    deadline: float,
+    *,
+    containment_token: str | None = None,
+    started_at_or_after: tuple[int, int] | None = None,
+) -> dict[int, _ProcessObservation]:
     if time.monotonic() >= deadline:
         raise TimeoutError("process inventory deadline expired")
     if sys.platform == "darwin":
-        return _darwin_process_inventory(deadline)
+        return _darwin_process_inventory(
+            deadline,
+            containment_token=containment_token,
+            started_at_or_after=started_at_or_after,
+        )
     if sys.platform.startswith("linux"):
-        return _linux_process_inventory(deadline)
+        return _linux_process_inventory(
+            deadline,
+            containment_token=containment_token,
+            started_at_or_after=started_at_or_after,
+        )
     raise ContainedProcessError("process inventory is unsupported on this platform")
 
 
@@ -129,6 +222,12 @@ def _discover_descendants(
         parents.setdefault(observation.parent_pid, set()).add(observation.identity.pid)
     pending = [root_pid, *known]
     descendants = dict(known)
+    for observation in inventory.values():
+        if not observation.containment_token:
+            continue
+        prior = descendants.get(observation.identity.pid)
+        if prior is None or prior == observation.identity:
+            descendants[observation.identity.pid] = observation.identity
     visited: set[int] = set()
     while pending:
         parent = pending.pop()
@@ -266,16 +365,44 @@ def run_contained(
     execution_deadline = deadline_monotonic - cleanup_reserve
     if execution_deadline <= clock():
         raise subprocess.TimeoutExpired(list(args), 0)
+    containment_token = secrets.token_hex(32)
+    process_environment = dict(os.environ if env is None else env)
+    process_environment[_CONTAINMENT_ENVIRONMENT_KEY] = containment_token
+    gate_read, gate_write = os.pipe()
+    helper_command = [
+        sys.executable,
+        "-I",
+        "-S",
+        str(Path(__file__).resolve(strict=True)),
+        "--contained-child",
+        str(gate_read),
+        "--",
+        *args,
+    ]
     process = subprocess.Popen(
-        list(args),
+        helper_command,
         cwd=cwd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=text,
         start_new_session=True,
-        pass_fds=pass_fds,
-        env=None if env is None else dict(env),
+        pass_fds=(*pass_fds, gate_read),
+        env=process_environment,
     )
+    os.close(gate_read)
+
+    root_started: tuple[int, int] | None = None
+
+    def observe(deadline: float) -> dict[int, _ProcessObservation]:
+        if inventory_provider is process_inventory:
+            return process_inventory(
+                deadline,
+                containment_token=containment_token,
+                started_at_or_after=root_started,
+            )
+        return inventory_provider(deadline)
+
+    initial_inventory: Mapping[int, _ProcessObservation] | None = None
     previous_handlers: dict[int, object] = {}
 
     def forward_signal(signum: int, _frame: object) -> None:
@@ -293,19 +420,81 @@ def run_contained(
 
     caught_signal: _ContainedSignal | None = None
     known: dict[int, ProcessIdentity] = {}
+    known_lock = threading.Lock()
+    tracker_stop = threading.Event()
+    tracker_thread: threading.Thread | None = None
+    tracker_errors: list[BaseException] = []
+    tracker_last_inventory: Mapping[int, _ProcessObservation] | None = None
     root_identity: ProcessIdentity | None = None
     root_exit_observed_at: float | None = None
     last_inventory: Mapping[int, _ProcessObservation] | None = None
     stdout = stderr = ""
+
+    def stop_tracker() -> None:
+        nonlocal tracker_thread
+        tracker_stop.set()
+        if tracker_thread is not None:
+            tracker_thread.join(timeout=max(0.0, min(0.2, deadline_monotonic - clock())))
+            if tracker_thread.is_alive():
+                raise ContainedProcessError("process containment tracker did not stop")
+            tracker_thread = None
+
+    def track_process_tree() -> None:
+        nonlocal tracker_last_inventory
+        try:
+            while not tracker_stop.is_set():
+                tracker_deadline = min(execution_deadline, time.monotonic() + 0.05)
+                try:
+                    inventory = process_inventory(tracker_deadline)
+                except TimeoutError:
+                    if time.monotonic() >= execution_deadline:
+                        return
+                    continue
+                with known_lock:
+                    known.update(_discover_descendants(process.pid, inventory, known))
+                    tracked = tuple(known.values())
+                    tracker_last_inventory = inventory
+                if process.poll() is not None:
+                    for identity in tracked:
+                        _signal_identity(identity, signal.SIGSTOP, inventory)
+                tracker_stop.wait(0.001)
+        except BaseException as exc:
+            tracker_errors.append(exc)
+
     try:
+        initial_inventory = (
+            process_inventory(execution_deadline)
+            if inventory_provider is process_inventory
+            else observe(execution_deadline)
+        )
+        last_inventory = initial_inventory
+        observed_root = initial_inventory.get(process.pid)
+        if observed_root is not None:
+            root_identity = observed_root.identity
+            root_started = root_identity.started
+        known.update(_discover_descendants(process.pid, initial_inventory, known))
+        if inventory_provider is process_inventory:
+            tracker_thread = threading.Thread(
+                target=track_process_tree,
+                name=f"rquant-containment-{process.pid}",
+                daemon=True,
+            )
+            tracker_thread.start()
+        os.write(gate_write, b"1")
+        os.close(gate_write)
+        gate_write = -1
         while True:
+            if tracker_errors:
+                raise ContainedProcessError(
+                    "process containment tracker failed"
+                ) from tracker_errors[0]
             if cancellation_check is not None and cancellation_check():
                 raise ContainedProcessError("contained process was cancelled")
             remaining = execution_deadline - clock()
             if remaining <= 0:
                 raise subprocess.TimeoutExpired(list(args), 0)
             try:
-                inventory = inventory_provider(execution_deadline)
+                inventory = observe(execution_deadline)
             except (ContainedProcessError, TimeoutError):
                 if clock() >= execution_deadline:
                     raise subprocess.TimeoutExpired(list(args), 0) from None
@@ -316,7 +505,8 @@ def run_contained(
                 if root_identity is not None and observed_root.identity != root_identity:
                     raise ContainedProcessError("subprocess PID identity changed while running")
                 root_identity = observed_root.identity
-            known.update(_discover_descendants(process.pid, inventory, known))
+            with known_lock:
+                known.update(_discover_descendants(process.pid, inventory, known))
             if process.poll() is not None:
                 alive_descendants = {
                     pid: identity
@@ -337,12 +527,15 @@ def run_contained(
             except subprocess.TimeoutExpired:
                 continue
     except subprocess.TimeoutExpired:
+        stop_tracker()
+        if tracker_last_inventory is not None:
+            last_inventory = tracker_last_inventory
         _cleanup_process_tree(
             process,
             known,
             root_identity=root_identity,
             deadline=deadline_monotonic,
-            inventory_provider=inventory_provider,
+            inventory_provider=observe,
             clock=clock,
             sleep=sleep,
             initial_inventory=last_inventory,
@@ -350,29 +543,39 @@ def run_contained(
         raise
     except _ContainedSignal as exc:
         caught_signal = exc
+        stop_tracker()
+        if tracker_last_inventory is not None:
+            last_inventory = tracker_last_inventory
         _cleanup_process_tree(
             process,
             known,
             root_identity=root_identity,
             deadline=deadline_monotonic,
-            inventory_provider=inventory_provider,
+            inventory_provider=observe,
             clock=clock,
             sleep=sleep,
             initial_inventory=last_inventory,
         )
     except BaseException:
+        stop_tracker()
+        if tracker_last_inventory is not None:
+            last_inventory = tracker_last_inventory
         _cleanup_process_tree(
             process,
             known,
             root_identity=root_identity,
             deadline=deadline_monotonic,
-            inventory_provider=inventory_provider,
+            inventory_provider=observe,
             clock=clock,
             sleep=sleep,
             initial_inventory=last_inventory,
         )
         raise
     finally:
+        if gate_write >= 0:
+            os.close(gate_write)
+        if tracker_thread is not None:
+            stop_tracker()
         for signum, previous in previous_handlers.items():
             signal.signal(signum, previous)
 
@@ -387,7 +590,7 @@ def run_contained(
     remaining = deadline_monotonic - clock()
     if remaining <= 0:
         raise subprocess.TimeoutExpired(list(args), 0)
-    inventory = inventory_provider(deadline_monotonic)
+    inventory = observe(deadline_monotonic)
     known.update(_discover_descendants(process.pid, inventory, known))
     alive = {
         pid: identity
@@ -400,7 +603,7 @@ def run_contained(
             known,
             root_identity=root_identity,
             deadline=deadline_monotonic,
-            inventory_provider=inventory_provider,
+            inventory_provider=observe,
             clock=clock,
             sleep=sleep,
         )
@@ -414,3 +617,22 @@ def run_contained(
             stderr=stderr,
         )
     return completed
+
+
+def _contained_child_main(arguments: list[str]) -> int:
+    if len(arguments) < 3 or arguments[1] != "--":
+        return 127
+    gate_fd = int(arguments[0])
+    command = arguments[2:]
+    if not command:
+        return 127
+    signal_byte = os.read(gate_fd, 1)
+    os.close(gate_fd)
+    if signal_byte != b"1":
+        return 127
+    os.execvpe(command[0], command, os.environ)
+    return 127
+
+
+if __name__ == "__main__" and len(sys.argv) >= 2 and sys.argv[1] == "--contained-child":
+    raise SystemExit(_contained_child_main(sys.argv[2:]))

@@ -5,7 +5,6 @@ from __future__ import annotations
 import base64
 import errno
 import hashlib
-import json
 import os
 import re
 import signal
@@ -62,6 +61,7 @@ from rquant.strategy_job_adapters import (
     default_strategy_job_adapter_registry,
 )
 from rquant.strict_json import (
+    canonical_json_bytes,
     strict_canonical_json_loads,
     strict_model_validate_canonical_json,
 )
@@ -107,6 +107,10 @@ def _utc(value: datetime) -> datetime:
 
 def _sha256_bytes(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
+
+
+def _canonical_json(value: object) -> str:
+    return canonical_json_bytes(value).decode("utf-8")
 
 
 def _file_sha256(path: Path) -> str:
@@ -201,12 +205,8 @@ class LabShardResultManifest(LabWorkerModel):
         return self
 
     def canonical_json(self) -> str:
-        return json.dumps(
+        return _canonical_json(
             self.model_dump(mode="json", exclude_none=True),
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
         )
 
     @property
@@ -220,12 +220,8 @@ class LabWorkerFailure(LabWorkerModel):
     message: str = Field(min_length=1)
 
     def canonical_json(self) -> str:
-        return json.dumps(
+        return _canonical_json(
             self.model_dump(mode="json"),
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
         )
 
 
@@ -350,7 +346,7 @@ class LabGarbageOwner(LabWorkerModel):
             raise ValueError("garbage owner source inode conflicts with inventory")
         object.__setattr__(self, "source_device", source.device)
         object.__setattr__(self, "source_inode", source.inode)
-        canonical = json.dumps(
+        canonical = _canonical_json(
             {
                 "inventory": [entry.model_dump(mode="json") for entry in self.inventory],
                 "original_relative_path": self.original_relative_path,
@@ -361,10 +357,6 @@ class LabGarbageOwner(LabWorkerModel):
                 "source_device": source.device,
                 "source_inode": source.inode,
             },
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
         )
         content_hash = _sha256_bytes(canonical.encode("utf-8"))
         garbage_id = uuid5(NAMESPACE_URL, f"rquant:lab-garbage:{content_hash}")
@@ -377,12 +369,8 @@ class LabGarbageOwner(LabWorkerModel):
         return self
 
     def canonical_json(self) -> str:
-        return json.dumps(
+        return _canonical_json(
             self.model_dump(mode="json"),
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
         )
 
 
@@ -418,12 +406,8 @@ class LabGarbagePreparedIntent(LabWorkerModel):
         }
         if self.created_at is not None:
             identity["created_at"] = self.model_dump(mode="json")["created_at"]
-        canonical = json.dumps(
+        canonical = _canonical_json(
             identity,
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
         )
         intent_hash = _sha256_bytes(canonical.encode("utf-8"))
         if self.intent_hash and self.intent_hash != intent_hash:
@@ -432,12 +416,8 @@ class LabGarbagePreparedIntent(LabWorkerModel):
         return self
 
     def canonical_json(self) -> str:
-        return json.dumps(
+        return _canonical_json(
             self.model_dump(mode="json", exclude_none=True),
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
         )
 
 
@@ -496,12 +476,8 @@ class LabGarbageOrphanMetadata(LabWorkerModel):
                     "expected_nlink": self.expected_nlink,
                 }
             )
-        canonical = json.dumps(
+        canonical = _canonical_json(
             canonical_payload,
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
         )
         metadata_hash = _sha256_bytes(canonical.encode("utf-8"))
         if self.metadata_hash and self.metadata_hash != metadata_hash:
@@ -510,12 +486,8 @@ class LabGarbageOrphanMetadata(LabWorkerModel):
         return self
 
     def canonical_json(self) -> str:
-        return json.dumps(
+        return _canonical_json(
             self.model_dump(mode="json", exclude_none=True),
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
         )
 
 
@@ -525,12 +497,8 @@ class LabGarbageLedger(LabWorkerModel):
     owner: LabGarbageOwner
 
     def canonical_json(self) -> str:
-        return json.dumps(
+        return _canonical_json(
             self.model_dump(mode="json"),
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
         )
 
 
@@ -554,12 +522,8 @@ class LabQuarantineMigrationComplete(LabWorkerModel):
 
     @model_validator(mode="after")
     def validate_identity(self) -> LabQuarantineMigrationComplete:
-        canonical = json.dumps(
+        canonical = _canonical_json(
             self.model_dump(mode="json", exclude={"content_hash"}),
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
         )
         expected = _sha256_bytes(canonical.encode("utf-8"))
         if self.content_hash and self.content_hash != expected:
@@ -568,12 +532,8 @@ class LabQuarantineMigrationComplete(LabWorkerModel):
         return self
 
     def canonical_json(self) -> str:
-        return json.dumps(
+        return _canonical_json(
             self.model_dump(mode="json"),
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
         )
 
 
@@ -587,13 +547,9 @@ class LabQuarantineQueueEntry(LabWorkerModel):
     @model_validator(mode="after")
     def validate_identity(self) -> LabQuarantineQueueEntry:
         expected = _sha256_bytes(
-            json.dumps(
+            canonical_json_bytes(
                 self.model_dump(mode="json", exclude={"content_hash"}),
-                ensure_ascii=True,
-                sort_keys=True,
-                separators=(",", ":"),
-                allow_nan=False,
-            ).encode("utf-8")
+            )
         )
         if self.content_hash and self.content_hash != expected:
             raise ValueError("quarantine queue entry hash conflicts")
@@ -601,12 +557,8 @@ class LabQuarantineQueueEntry(LabWorkerModel):
         return self
 
     def canonical_json(self) -> str:
-        return json.dumps(
+        return _canonical_json(
             self.model_dump(mode="json"),
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
         )
 
 
@@ -618,13 +570,9 @@ class LabQuarantineQueueSequence(LabWorkerModel):
     @model_validator(mode="after")
     def validate_identity(self) -> LabQuarantineQueueSequence:
         expected = _sha256_bytes(
-            json.dumps(
+            canonical_json_bytes(
                 self.model_dump(mode="json", exclude={"content_hash"}),
-                ensure_ascii=True,
-                sort_keys=True,
-                separators=(",", ":"),
-                allow_nan=False,
-            ).encode("utf-8")
+            )
         )
         if self.content_hash and self.content_hash != expected:
             raise ValueError("quarantine queue sequence hash conflicts")
@@ -632,12 +580,8 @@ class LabQuarantineQueueSequence(LabWorkerModel):
         return self
 
     def canonical_json(self) -> str:
-        return json.dumps(
+        return _canonical_json(
             self.model_dump(mode="json"),
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
         )
 
 
@@ -649,13 +593,9 @@ class LabQuarantineQueueCursor(LabWorkerModel):
     @model_validator(mode="after")
     def validate_identity(self) -> LabQuarantineQueueCursor:
         expected = _sha256_bytes(
-            json.dumps(
+            canonical_json_bytes(
                 self.model_dump(mode="json", exclude={"content_hash"}),
-                ensure_ascii=True,
-                sort_keys=True,
-                separators=(",", ":"),
-                allow_nan=False,
-            ).encode("utf-8")
+            )
         )
         if self.content_hash and self.content_hash != expected:
             raise ValueError("quarantine queue cursor hash conflicts")
@@ -663,12 +603,8 @@ class LabQuarantineQueueCursor(LabWorkerModel):
         return self
 
     def canonical_json(self) -> str:
-        return json.dumps(
+        return _canonical_json(
             self.model_dump(mode="json"),
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
         )
 
 
@@ -731,13 +667,9 @@ class LabQuarantineQueueConflict(LabWorkerModel):
         if self.pending.location != "pending" or self.archived.location != "archive":
             raise ValueError("queue conflict observations are mislabelled")
         expected = _sha256_bytes(
-            json.dumps(
+            canonical_json_bytes(
                 self.model_dump(mode="json", exclude={"content_hash"}),
-                ensure_ascii=True,
-                sort_keys=True,
-                separators=(",", ":"),
-                allow_nan=False,
-            ).encode("utf-8")
+            )
         )
         if self.content_hash and self.content_hash != expected:
             raise ValueError("queue conflict hash conflicts")
@@ -745,12 +677,8 @@ class LabQuarantineQueueConflict(LabWorkerModel):
         return self
 
     def canonical_json(self) -> str:
-        return json.dumps(
+        return _canonical_json(
             self.model_dump(mode="json"),
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
         )
 
 
@@ -765,13 +693,9 @@ class LabQuarantineQueueRepairIntent(LabWorkerModel):
     @model_validator(mode="after")
     def validate_identity(self) -> LabQuarantineQueueRepairIntent:
         expected = _sha256_bytes(
-            json.dumps(
+            canonical_json_bytes(
                 self.model_dump(mode="json", exclude={"content_hash"}),
-                ensure_ascii=True,
-                sort_keys=True,
-                separators=(",", ":"),
-                allow_nan=False,
-            ).encode("utf-8")
+            )
         )
         if self.content_hash and self.content_hash != expected:
             raise ValueError("queue repair intent hash conflicts")
@@ -779,12 +703,8 @@ class LabQuarantineQueueRepairIntent(LabWorkerModel):
         return self
 
     def canonical_json(self) -> str:
-        return json.dumps(
+        return _canonical_json(
             self.model_dump(mode="json"),
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
         )
 
 
@@ -802,13 +722,9 @@ class LabQuarantineQueueRepairResult(LabWorkerModel):
         if self.new_sequence <= self.sequence:
             raise ValueError("queue repair must publish a later sequence")
         expected = _sha256_bytes(
-            json.dumps(
+            canonical_json_bytes(
                 self.model_dump(mode="json", exclude={"content_hash"}),
-                ensure_ascii=True,
-                sort_keys=True,
-                separators=(",", ":"),
-                allow_nan=False,
-            ).encode("utf-8")
+            )
         )
         if self.content_hash and self.content_hash != expected:
             raise ValueError("queue repair result hash conflicts")
@@ -816,12 +732,8 @@ class LabQuarantineQueueRepairResult(LabWorkerModel):
         return self
 
     def canonical_json(self) -> str:
-        return json.dumps(
+        return _canonical_json(
             self.model_dump(mode="json"),
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
         )
 
 
@@ -848,25 +760,17 @@ class LabQuarantineQueueMigrationIndexEntry(LabWorkerModel):
     @model_validator(mode="after")
     def validate_identity(self) -> LabQuarantineQueueMigrationIndexEntry:
         chain_hash = _sha256_bytes(
-            json.dumps(
+            canonical_json_bytes(
                 self.model_dump(mode="json", exclude={"chain_hash", "content_hash"}),
-                ensure_ascii=True,
-                sort_keys=True,
-                separators=(",", ":"),
-                allow_nan=False,
-            ).encode("utf-8")
+            )
         )
         if self.chain_hash and self.chain_hash != chain_hash:
             raise ValueError("quarantine migration index chain hash conflicts")
         object.__setattr__(self, "chain_hash", chain_hash)
         expected = _sha256_bytes(
-            json.dumps(
+            canonical_json_bytes(
                 self.model_dump(mode="json", exclude={"content_hash"}),
-                ensure_ascii=True,
-                sort_keys=True,
-                separators=(",", ":"),
-                allow_nan=False,
-            ).encode("utf-8")
+            )
         )
         if self.content_hash and self.content_hash != expected:
             raise ValueError("quarantine migration index hash conflicts")
@@ -874,12 +778,8 @@ class LabQuarantineQueueMigrationIndexEntry(LabWorkerModel):
         return self
 
     def canonical_json(self) -> str:
-        return json.dumps(
+        return _canonical_json(
             self.model_dump(mode="json"),
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
         )
 
 
@@ -909,12 +809,8 @@ class LabQuarantineQueueMigrationCycle(LabWorkerModel):
         if self.total_entries == 0 and self.index_hash != _QUEUE_MIGRATION_CHAIN_GENESIS:
             raise ValueError("empty quarantine migration cycle has a non-genesis index hash")
         identity = self.model_dump(mode="json", exclude={"cycle_id", "content_hash"})
-        canonical = json.dumps(
+        canonical = _canonical_json(
             identity,
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
         )
         content_hash = _sha256_bytes(canonical.encode("utf-8"))
         cycle_id = uuid5(NAMESPACE_URL, f"rquant:lab-quarantine-migration:{content_hash}")
@@ -927,12 +823,8 @@ class LabQuarantineQueueMigrationCycle(LabWorkerModel):
         return self
 
     def canonical_json(self) -> str:
-        return json.dumps(
+        return _canonical_json(
             self.model_dump(mode="json"),
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
         )
 
 
@@ -949,13 +841,9 @@ class LabQuarantineQueueMigrationCursor(LabWorkerModel):
     @model_validator(mode="after")
     def validate_identity(self) -> LabQuarantineQueueMigrationCursor:
         expected = _sha256_bytes(
-            json.dumps(
+            canonical_json_bytes(
                 self.model_dump(mode="json", exclude={"content_hash"}),
-                ensure_ascii=True,
-                sort_keys=True,
-                separators=(",", ":"),
-                allow_nan=False,
-            ).encode("utf-8")
+            )
         )
         if self.content_hash and self.content_hash != expected:
             raise ValueError("quarantine migration cursor hash conflicts")
@@ -963,12 +851,8 @@ class LabQuarantineQueueMigrationCursor(LabWorkerModel):
         return self
 
     def canonical_json(self) -> str:
-        return json.dumps(
+        return _canonical_json(
             self.model_dump(mode="json"),
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
         )
 
 
@@ -988,13 +872,9 @@ class LabQuarantineQueueMigrationComplete(LabWorkerModel):
         if namespaces != ("active", "cold_health", "authority"):
             raise ValueError("quarantine migration completion directories are incomplete")
         expected = _sha256_bytes(
-            json.dumps(
+            canonical_json_bytes(
                 self.model_dump(mode="json", exclude={"content_hash"}),
-                ensure_ascii=True,
-                sort_keys=True,
-                separators=(",", ":"),
-                allow_nan=False,
-            ).encode("utf-8")
+            )
         )
         if self.content_hash and self.content_hash != expected:
             raise ValueError("quarantine queue migration marker hash conflicts")
@@ -1002,12 +882,8 @@ class LabQuarantineQueueMigrationComplete(LabWorkerModel):
         return self
 
     def canonical_json(self) -> str:
-        return json.dumps(
+        return _canonical_json(
             self.model_dump(mode="json"),
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
         )
 
 
@@ -1046,12 +922,8 @@ class LabReclaimLedger(LabWorkerModel):
         return self
 
     def canonical_json(self) -> str:
-        return json.dumps(
+        return _canonical_json(
             self.model_dump(mode="json"),
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
         )
 
 
@@ -4934,22 +4806,14 @@ class LabArtifactReclaimer:
                     key: value for key, value in payload.items() if key != "content_hash"
                 }
                 expected_hash = _sha256_bytes(
-                    json.dumps(
+                    canonical_json_bytes(
                         without_hash,
-                        ensure_ascii=True,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                        allow_nan=False,
-                    ).encode("utf-8")
+                    )
                 )
                 if payload["content_hash"] != expected_hash:
                     raise ValueError("legacy marker hash conflicts")
-                canonical = json.dumps(
+                canonical = _canonical_json(
                     payload,
-                    ensure_ascii=True,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                    allow_nan=False,
                 )
             except Exception as exc:
                 raise LabArtifactConflictError(

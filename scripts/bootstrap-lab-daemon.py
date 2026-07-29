@@ -10,11 +10,26 @@ import os
 import stat
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
 
 sys.dont_write_bytecode = True
+
+
+def _load_contained_runner() -> object:
+    path = Path(__file__).resolve().parents[1] / "src" / "rquant" / "contained_subprocess.py"
+    spec = importlib.util.spec_from_file_location("_rquant_lab_bootstrap_containment", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("contained subprocess implementation cannot be loaded")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module.run_contained
+
+
+run_contained = _load_contained_runner()
 
 
 class BootstrapError(RuntimeError):
@@ -103,6 +118,7 @@ def _run_preflight(
     provisional_handoff_label: str | None,
     daemon_command: str,
     immutable_generation: bool = False,
+    deadline_monotonic: float,
 ) -> None:
     command = [
         sys.executable,
@@ -128,11 +144,11 @@ def _run_preflight(
         command.extend(["--provisional-handoff-label", provisional_handoff_label])
     if immutable_generation:
         command.append("--immutable-generation")
-    result = subprocess.run(
+    result = run_contained(
         command,
         cwd=root,
         check=False,
-        timeout=15,
+        deadline_monotonic=deadline_monotonic,
         pass_fds=(lock_fd,),
     )
     if result.returncode != 0:
@@ -159,9 +175,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--deployment-lock-path", required=True)
     parser.add_argument("--deployment-lock-fd", required=True, type=int)
     parser.add_argument("--expected-launcher", required=True)
+    parser.add_argument("--startup-deadline-monotonic", type=float)
     parser.add_argument("--provisional-handoff-label")
     parser.add_argument("daemon_argv", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
+    startup_deadline = args.startup_deadline_monotonic or (time.monotonic() + 15)
     try:
         daemon_argv = list(args.daemon_argv)
         if daemon_argv and daemon_argv[0] == "--":
@@ -219,6 +237,7 @@ def main(argv: list[str] | None = None) -> int:
             provisional_handoff_label=args.provisional_handoff_label,
             daemon_command=daemon_argv[0],
             immutable_generation=immutable_generation,
+            deadline_monotonic=startup_deadline,
         )
         try:
             _load_release_authority(

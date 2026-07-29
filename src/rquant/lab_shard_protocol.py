@@ -37,6 +37,7 @@ from rquant.lab_result_digest import (
     CURRENT_RESULT_MANIFEST_SCHEMA_VERSION,
 )
 from rquant.strict_json import (
+    canonical_json_bytes,
     canonical_model_json_bytes,
     strict_json_loads,
     strict_model_validate_canonical_json,
@@ -170,13 +171,7 @@ def _canonical_json_object(raw: str, *, field: str) -> str:
         raise ValueError(f"invalid {field}: {exc}") from exc
     if not isinstance(value, dict):
         raise ValueError(f"{field} must encode a JSON object")
-    return json.dumps(
-        value,
-        ensure_ascii=True,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    )
+    return canonical_json_bytes(value).decode("utf-8")
 
 
 def _sha256_text(value: str) -> str:
@@ -184,14 +179,7 @@ def _sha256_text(value: str) -> str:
 
 
 def _canonical_hash(payload: dict[str, object]) -> str:
-    canonical = json.dumps(
-        payload,
-        ensure_ascii=True,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    )
-    return _sha256_text(canonical)
+    return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
 
 
 class LabShardDefinition(LabShardProtocolModel):
@@ -240,12 +228,7 @@ class LabShardDefinition(LabShardProtocolModel):
         }
         if self.work_plan is not None:
             shard_identity["work_plan"] = self.work_plan.model_dump(mode="json")
-        shard_name = json.dumps(
-            shard_identity,
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
+        shard_name = canonical_json_bytes(shard_identity).decode("utf-8")
         shard_id = uuid5(NAMESPACE_URL, f"rquant:lab-shard:{shard_name}")
         if self.shard_id.int and self.shard_id != shard_id:
             raise ValueError("shard_id does not match deterministic shard definition")
