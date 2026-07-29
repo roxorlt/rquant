@@ -36,19 +36,116 @@ class _ContainedSignal(BaseException):
 class _ContainedSignalLatch:
     def __init__(self) -> None:
         self.first_signum: int | None = None
-        self._raised = False
-        self._deferred = False
 
-    def defer(self) -> None:
-        self._deferred = True
+    def checkpoint(self) -> None:
+        if self.first_signum is not None:
+            raise _ContainedSignal(self.first_signum)
 
     def handle(self, signum: int, _frame: object) -> None:
         if self.first_signum is None:
             self.first_signum = signum
-        if self._deferred or self._raised:
-            return
-        self._raised = True
-        raise _ContainedSignal(self.first_signum)
+
+
+def _install_signal_latch(
+    latch: _ContainedSignalLatch,
+) -> tuple[dict[int, object], frozenset[int]]:
+    candidates = {signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)}
+    active = frozenset(
+        signum for signum, previous in candidates.items() if previous is not signal.SIG_IGN
+    )
+    if not active:
+        return {}, frozenset()
+    if not hasattr(signal, "pthread_sigmask"):
+        raise ContainedProcessError("atomic signal arbitration is unavailable")
+
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, active)
+    installed: dict[int, object] = {}
+    try:
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            if signum not in active:
+                continue
+            signal.signal(signum, latch.handle)
+            installed[signum] = candidates[signum]
+    except BaseException as primary_exception:
+        rollback_errors: list[BaseException] = []
+        for signum, previous in installed.items():
+            try:
+                signal.signal(signum, previous)
+            except BaseException as exc:
+                rollback_errors.append(exc)
+        installed.clear()
+        if rollback_errors:
+            rollback_group = BaseExceptionGroup(
+                "signal latch installation rollback failures",
+                rollback_errors,
+            )
+            primary_exception.cleanup_error_group = rollback_group  # type: ignore[attr-defined]
+            primary_exception.add_note("signal latch installation rollback also failed")
+            if isinstance(primary_exception, ValueError):
+                raise ContainedProcessError(
+                    "signal latch installation could not be rolled back"
+                ) from rollback_group
+        if not isinstance(primary_exception, ValueError):
+            raise
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+    return installed, frozenset(installed)
+
+
+def _restore_signal_handlers_atomically(
+    previous_handlers: Mapping[int, object],
+    active_signals: frozenset[int],
+    latch: _ContainedSignalLatch,
+) -> list[BaseException]:
+    if not previous_handlers:
+        return []
+
+    errors: list[BaseException] = []
+    try:
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, active_signals)
+    except BaseException as exc:
+        return [exc]
+
+    try:
+        for signum, previous in previous_handlers.items():
+            try:
+                signal.signal(signum, previous)
+            except BaseException as exc:
+                errors.append(exc)
+
+        # Signals delivered while the handlers were being restored are pending because
+        # the whole set is blocked.  Setting a pending signal to SIG_IGN discards that
+        # one kernel delivery; restoring its prior handler immediately afterwards lets
+        # us replay only the first latched signal once all cleanup has finished.
+        for _attempt in range(8):
+            try:
+                pending = signal.sigpending()
+            except BaseException as exc:
+                errors.append(exc)
+                break
+            drainable = [
+                signum
+                for signum in (signal.SIGINT, signal.SIGTERM)
+                if signum in active_signals and signum not in previous_mask and signum in pending
+            ]
+            if not drainable:
+                break
+            for signum in drainable:
+                latch.handle(signum, None)
+                previous = previous_handlers[signum]
+                try:
+                    signal.signal(signum, signal.SIG_IGN)
+                    signal.signal(signum, previous)
+                except BaseException as exc:
+                    errors.append(exc)
+        else:
+            errors.append(ContainedProcessError("signal arbitration did not quiesce"))
+    finally:
+        try:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+        except BaseException as exc:
+            errors.append(exc)
+    return errors
 
 
 @dataclass(frozen=True, order=True)
@@ -1087,19 +1184,8 @@ def run_contained(
         return inventory_provider(deadline)
 
     initial_inventory: Mapping[int, _ProcessObservation] | None = None
-    previous_handlers: dict[int, object] = {}
-
     signal_latch = _ContainedSignalLatch()
-
-    for signum in (signal.SIGINT, signal.SIGTERM):
-        previous = signal.getsignal(signum)
-        if previous is signal.SIG_IGN:
-            continue
-        try:
-            signal.signal(signum, signal_latch.handle)
-        except ValueError:
-            break
-        previous_handlers[signum] = previous
+    previous_handlers, active_signals = _install_signal_latch(signal_latch)
 
     body_completed = False
     known: dict[int, ProcessIdentity] = {}
@@ -1148,6 +1234,7 @@ def run_contained(
             tracker_errors.append(exc)
 
     try:
+        signal_latch.checkpoint()
         initial_inventory = observe(execution_deadline)
         last_inventory = initial_inventory
         observed_root = initial_inventory.get(process.pid)
@@ -1173,12 +1260,14 @@ def run_contained(
         os.close(gate_write)
         gate_write = -1
         while True:
+            signal_latch.checkpoint()
             if tracker_errors:
                 raise ContainedProcessError(
                     "process containment tracker failed"
                 ) from tracker_errors[0]
             if cancellation_check is not None and cancellation_check():
                 raise ContainedProcessError("contained process was cancelled")
+            signal_latch.checkpoint()
             _merge_kernel_identities(
                 known,
                 kernel_tracker,
@@ -1230,6 +1319,7 @@ def run_contained(
                     root_pid=process.pid,
                     deadline=deadline_monotonic,
                 )
+                signal_latch.checkpoint()
                 break
             except subprocess.TimeoutExpired:
                 continue
@@ -1292,7 +1382,6 @@ def run_contained(
             cleanup_errors.append(exc)
         raise
     finally:
-        signal_latch.defer()
         primary_exception = sys.exception()
         if gate_write >= 0:
             try:
@@ -1308,11 +1397,13 @@ def run_contained(
             kernel_tracker.close()
         except BaseException as exc:
             cleanup_errors.append(exc)
-        for signum, previous in previous_handlers.items():
-            try:
-                signal.signal(signum, previous)
-            except BaseException as exc:
-                cleanup_errors.append(exc)
+        cleanup_errors.extend(
+            _restore_signal_handlers_atomically(
+                previous_handlers,
+                active_signals,
+                signal_latch,
+            )
+        )
         if not body_completed or cleanup_errors:
             _close_file_descriptors(darwin_pipe_anchor_fds)
         cleanup_group: BaseExceptionGroup | None = None
