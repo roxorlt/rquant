@@ -157,6 +157,11 @@ Darwin 只运行可信、声明不后台化的短命令，并使用启动闸门�
 P1.5b **没有**向 `~/Library/LaunchAgents` 写文件，也没有执行真实 `launchctl bootstrap/kickstart`；
 这些实际安装、健康观察和回滚演练只在 P1.5d 人工基础设施窗口进行。
 
+scheduler、worker 和 finalizer 发布 readiness 前，会从各自已持有的 daemon authority lock 复制一个
+同源 lease。readiness heartbeat 线程确认退出后才释放该 lease；若 heartbeat I/O 卡住，关闭会失败，
+但不会因外层上下文展开而提前释放唯一运行权。发布子进程若同时发生执行失败与 cleanup 失败，调用方
+继续收到原始执行异常，并可从其 `cleanup_error_group` 检查完整收尾错误。
+
 所有持久 generation、deployment、installation、handoff、runtime 和 Strategy Lab protocol JSON
 使用同一 canonical serializer：UTF-8 原字符、排序键、紧凑分隔符、禁止 NaN。authority 文件末尾
 恰好一个 LF，单记录 spool/model 文件无尾随换行，JSONL 每条记录一个 LF；reader 先拒绝任意层重复键，

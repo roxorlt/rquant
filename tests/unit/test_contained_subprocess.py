@@ -343,6 +343,23 @@ def test_kernel_tracker_close_failure_restores_signal_handlers(tmp_path: Path) -
     assert {signum: signal.getsignal(signum) for signum in before} == before
 
 
+def test_execution_timeout_remains_primary_when_tracker_close_fails(tmp_path: Path) -> None:
+    tracker = _CloseFailingKernelTracker()
+
+    with pytest.raises(subprocess.TimeoutExpired) as caught:
+        contained.run_contained(
+            [sys.executable, "-c", "import time; time.sleep(5)"],
+            cwd=tmp_path,
+            deadline_monotonic=time.monotonic() + 0.5,
+            kernel_tracker_factory=lambda: tracker,
+            may_spawn_background_descendants=False,
+        )
+
+    cleanup_group = getattr(caught.value, "cleanup_error_group", None)
+    assert isinstance(cleanup_group, BaseExceptionGroup)
+    assert any("close boom" in str(error) for error in cleanup_group.exceptions)
+
+
 def test_nested_run_restores_outer_then_original_signal_handlers(tmp_path: Path) -> None:
     before = {signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)}
     cancellation_checks = 0
@@ -445,7 +462,7 @@ def test_blocked_user_tracker_does_not_prevent_root_reap(
     monkeypatch.setattr(contained, "process_inventory", blocking_inventory)
     monkeypatch.setattr(contained.subprocess, "Popen", capturing_popen)
     try:
-        with pytest.raises(contained.ContainedProcessError, match="tracker did not stop"):
+        with pytest.raises(subprocess.TimeoutExpired) as caught:
             contained.run_contained(
                 [sys.executable, "-c", "import time; time.sleep(10)"],
                 cwd=tmp_path,
@@ -453,6 +470,9 @@ def test_blocked_user_tracker_does_not_prevent_root_reap(
                 inventory_provider=blocking_inventory,
                 may_spawn_background_descendants=False,
             )
+        cleanup_group = getattr(caught.value, "cleanup_error_group", None)
+        assert isinstance(cleanup_group, BaseExceptionGroup)
+        assert any("tracker did not stop" in str(error) for error in cleanup_group.exceptions)
         assert tracker_entered.is_set()
         assert spawned and spawned[0].returncode is not None
     finally:

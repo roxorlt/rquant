@@ -2980,6 +2980,7 @@ def _lab_daemon_readiness_context(
     label: str,
     code_sha: str,
     runtime_guard: object,
+    daemon_lock: object,
 ) -> AbstractContextManager[object]:
     generation_binding = _lab_deployment_generation_binding(args)
     if not generation_binding:
@@ -2994,17 +2995,26 @@ def _lab_daemon_readiness_context(
     verify = getattr(runtime_guard, "verify", None)
     if not callable(verify):
         raise RuntimeError("Lab runtime guard cannot publish readiness")
-    return LabDaemonReadinessPublisher(
-        deployment_lock_path=Path(str(generation_binding["deployment_lock_path"])),
-        deployment_lock_fd=int(generation_binding["deployment_generation_fd"]),
-        label=label,
-        operation_id=operation_id,
-        environment_generation_id=environment_generation,
-        code_sha=code_sha,
-        heartbeat_interval_seconds=2,
-        readiness_root=settings.lab_readiness_dir_resolved,
-        mutation_guard=verify,
-    )
+    duplicate_lease = getattr(daemon_lock, "duplicate_authority_lease", None)
+    if not callable(duplicate_lease):
+        raise RuntimeError("Lab daemon lock cannot provide a readiness authority lease")
+    lease_fd = int(duplicate_lease())
+    try:
+        return LabDaemonReadinessPublisher(
+            deployment_lock_path=Path(str(generation_binding["deployment_lock_path"])),
+            deployment_lock_fd=int(generation_binding["deployment_generation_fd"]),
+            daemon_authority_lease_fd=lease_fd,
+            label=label,
+            operation_id=operation_id,
+            environment_generation_id=environment_generation,
+            code_sha=code_sha,
+            heartbeat_interval_seconds=2,
+            readiness_root=settings.lab_readiness_dir_resolved,
+            mutation_guard=verify,
+        )
+    except BaseException:
+        os.close(lease_fd)
+        raise
 
 
 def _lab_runtime_layout() -> tuple[dict[str, Path], dict[str, Path], dict[Path, Path]]:
@@ -3150,12 +3160,6 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
         code_sha,
         allow_uninitialized_database=True,
     )
-    readiness = _lab_daemon_readiness_context(
-        args,
-        label="com.roxor.rquant-lab-scheduler",
-        code_sha=code_sha,
-        runtime_guard=runtime_guard,
-    )
     from rquant.config import settings
     from rquant.lab_artifact_protocol import LabArtifactCommitSpool
     from rquant.lab_artifacts import LabJobArtifactStore
@@ -3216,7 +3220,7 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
         settings.lab_daemon_lock_dir_resolved,
         "scheduler",
         mutation_guard=runtime_guard.verify,
-    ):
+    ) as daemon_lock:
         sqlite_authority = prepare_lab_runtime_sqlite_authority(
             settings.lab_runtime_dir_resolved,
             label="lab jobs SQLite",
@@ -3282,6 +3286,13 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
                 ),
                 runtime_guard=runtime_guard.verify,
             )
+            readiness = _lab_daemon_readiness_context(
+                args,
+                label="com.roxor.rquant-lab-scheduler",
+                code_sha=code_sha,
+                runtime_guard=runtime_guard,
+                daemon_lock=daemon_lock,
+            )
             with readiness:
                 if args.once:
                     try:
@@ -3332,12 +3343,6 @@ def cmd_lab_worker(args: argparse.Namespace) -> int:
         **generation_binding,
     )
     _verify_prepared_lab_runtime(Path(args.expected_checkout_root), code_sha)
-    readiness = _lab_daemon_readiness_context(
-        args,
-        label="com.roxor.rquant-lab-worker",
-        code_sha=code_sha,
-        runtime_guard=runtime_guard,
-    )
     from rquant.config import settings
     from rquant.lab_daemon import (
         LabDaemonConfigurationError,
@@ -3379,7 +3384,7 @@ def cmd_lab_worker(args: argparse.Namespace) -> int:
         settings.lab_daemon_lock_dir_resolved,
         "worker",
         mutation_guard=runtime_guard.verify,
-    ):
+    ) as daemon_lock:
         worker = LabWorker(
             worker_id=worker_id,
             claim_spool=LabClaimSpool(
@@ -3400,6 +3405,13 @@ def cmd_lab_worker(args: argparse.Namespace) -> int:
             poll_interval_ms=settings.lab_worker_poll_interval_ms,
             receipt_timeout_seconds=settings.lab_worker_receipt_timeout_seconds,
             verified_code_sha_provider=runtime_guard.verify,
+        )
+        readiness = _lab_daemon_readiness_context(
+            args,
+            label="com.roxor.rquant-lab-worker",
+            code_sha=code_sha,
+            runtime_guard=runtime_guard,
+            daemon_lock=daemon_lock,
         )
         with readiness:
             if args.once:
@@ -3448,12 +3460,6 @@ def cmd_lab_finalizer(args: argparse.Namespace) -> int:
         **generation_binding,
     )
     _verify_prepared_lab_runtime(Path(args.expected_checkout_root), code_sha)
-    readiness = _lab_daemon_readiness_context(
-        args,
-        label="com.roxor.rquant-lab-finalizer",
-        code_sha=code_sha,
-        runtime_guard=runtime_guard,
-    )
     from rquant.config import settings
     from rquant.lab_artifact_protocol import LabArtifactCommitSpool
     from rquant.lab_artifacts import LabJobArtifactStore
@@ -3509,7 +3515,7 @@ def cmd_lab_finalizer(args: argparse.Namespace) -> int:
         settings.lab_daemon_lock_dir_resolved,
         "finalizer",
         mutation_guard=runtime_guard.verify,
-    ):
+    ) as daemon_lock:
         sqlite_authority = prepare_private_sqlite_path(
             settings.lab_jobs_path_resolved,
             label="lab jobs SQLite",
@@ -3549,6 +3555,13 @@ def cmd_lab_finalizer(args: argparse.Namespace) -> int:
                 failure_cooldown_seconds=(settings.lab_finalizer_failure_cooldown_seconds),
                 failure_cooldown_max_seconds=(settings.lab_finalizer_failure_cooldown_max_seconds),
                 runtime_guard=runtime_guard.verify,
+            )
+            readiness = _lab_daemon_readiness_context(
+                args,
+                label="com.roxor.rquant-lab-finalizer",
+                code_sha=code_sha,
+                runtime_guard=runtime_guard,
+                daemon_lock=daemon_lock,
             )
             with readiness:
                 if args.once:

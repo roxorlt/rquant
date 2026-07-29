@@ -83,13 +83,15 @@
   Darwin kqueue/XNU 进程身份或 Linux subreaper/pidfd tracker。Linux 可收容声明会产生后代的命令；
   Darwin 因内核不提供可靠的 fork-child 跟踪，调用方声明可能后台化时会在 `Popen` 前失败关闭，
   其余可信且声明不后台化的发布命令仍使用进程身份、管道证据和进程组做生命周期清理。cleanup
-  独立执行 kill/reap、tracker 关闭与信号处理器恢复并汇总异常，不再把概率扫描描述成安全沙箱。
+  独立执行 kill/reap、tracker 关闭与信号处理器恢复并汇总异常；执行本身失败时保留原始异常，
+  将 cleanup 错误作为结构化证据附着，不再把概率扫描描述成安全沙箱。
   launchd 安装 transaction authority 使用 inode/hash CAS 和可恢复 update-backup；plist 校验与读取
   改为 `openat(O_NOFOLLOW)` 后在同一 descriptor 上读/hash/fstat，并复核活动路径 inode。
   Lab SQLite 升级到 schema v6，以 mutation epoch 和 trigger 让 `list_jobs`/finalization candidate 在账本
   未变化时只做一次分块完整关系图校验、任一受控写入后自动失效。daemon startup 将原始 absolute
   deadline 贯穿 wrapper/bootstrap/CLI 首次 runtime binding/generation authority，后续长驻 guard 使用
-  独立短验证预算；readiness 关闭若线程仍存活会保留句柄并失败关闭。generation GC 严格解析并核对完整 local/
+  独立短验证预算；readiness 持有 daemon authority 的独立 lease，关闭时若线程仍存活会同时保留线程
+  句柄和唯一运行权并失败关闭。generation GC 严格解析并核对完整 local/
   registered installation authority 与实际 plist bindings。同步修正文档中 canonical JSON 的精确换行合约。
 
 - **Strategy Lab P1.5b 第四轮生产边界收口**：所有阻塞/变异子进程统一使用带继承 token、启动闸门、

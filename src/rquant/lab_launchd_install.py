@@ -388,8 +388,14 @@ class LabLaunchdInstaller:
         provisional_handoff_operation_id: str | None = None,
     ) -> tuple[object, Path]:
         trusted_git = bind_trusted_git_executable(self.trusted_git_path)
+        marker_path = self.lock_path.with_name(f"{self.lock_path.stem}.complete.json")
+        marker_bytes, _marker_identity = _read_bound_regular_file(
+            marker_path,
+            label="release generation marker",
+            require_private=True,
+        )
         marker_payload = strict_canonical_json_loads(
-            self.lock_path.with_name(f"{self.lock_path.stem}.complete.json").read_bytes(),
+            marker_bytes,
             trailing_newline=True,
         )
         if not isinstance(marker_payload, dict) or not isinstance(

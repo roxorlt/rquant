@@ -6,6 +6,7 @@ import os
 import shutil
 import sqlite3
 import stat
+import subprocess
 import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -121,6 +122,55 @@ def test_readiness_close_fails_closed_without_forgetting_live_thread(tmp_path: P
             publisher._thread.join(timeout=2)
         publisher.close()
         os.close(lock_fd)
+
+
+def test_readiness_live_thread_keeps_daemon_authority_lease(tmp_path: Path) -> None:
+    authority = tmp_path / "authority"
+    authority.mkdir(mode=0o700)
+    deployment_lock_path = authority / "rquant.lock"
+    deployment_lock_fd = os.open(deployment_lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    lock_root = tmp_path / "runtime" / "locks"
+    lock_root.parent.mkdir(mode=0o700)
+    first = LabDaemonLock(lock_root, "worker")
+    second = LabDaemonLock(lock_root, "worker")
+    entered = threading.Event()
+    release = threading.Event()
+    first.acquire()
+    publisher = LabDaemonReadinessPublisher(
+        deployment_lock_path=deployment_lock_path,
+        deployment_lock_fd=deployment_lock_fd,
+        daemon_authority_lease_fd=first.duplicate_authority_lease(),
+        label="com.roxor.rquant-lab-worker",
+        operation_id="a" * 32,
+        environment_generation_id="b" * 64,
+        code_sha="c" * 40,
+        heartbeat_interval_seconds=0.1,
+    )
+    publisher.start()
+
+    def blocked_publish() -> object:
+        entered.set()
+        release.wait(timeout=5)
+        return object()
+
+    publisher.publish_once = blocked_publish  # type: ignore[method-assign]
+    try:
+        assert entered.wait(timeout=1)
+        with pytest.raises(RuntimeError, match="readiness.*did not stop"):
+            publisher.close()
+        first.release()
+        with pytest.raises(LabDaemonConfigurationError, match="already running"):
+            second.acquire()
+    finally:
+        release.set()
+        if publisher._thread is not None:
+            publisher._thread.join(timeout=2)
+        publisher.close()
+        first.release()
+        os.close(deployment_lock_fd)
+
+    second.acquire()
+    second.release()
 
 
 def test_daemon_readiness_rejects_invalid_generation_before_namespace_creation(
@@ -1890,6 +1940,59 @@ def test_runtime_binding_rejects_symlinked_venv_before_git_probe(
     monkeypatch.setattr("rquant.lab_daemon.subprocess.run", reject_probe)
     with pytest.raises(LabDaemonConfigurationError, match="physical virtualenv"):
         require_lab_runtime_binding(expected)
+
+
+def test_runtime_binding_reuses_one_deadline_across_git_probes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.lab_daemon as daemon_module
+    import rquant.research_manifest as manifest_module
+
+    expected = tmp_path / "expected"
+    expected.mkdir()
+    deadline = 11.0
+    now = 10.0
+    launched: list[tuple[str, ...]] = []
+
+    monkeypatch.setattr(
+        daemon_module,
+        "_require_physical_checkout_virtualenv",
+        lambda root: (root, root / ".venv"),
+    )
+    monkeypatch.setattr(daemon_module.time, "monotonic", lambda: now)
+    monkeypatch.setattr(
+        manifest_module,
+        "bind_trusted_git_executable",
+        lambda path: SimpleNamespace(path=path),
+    )
+
+    def probe(
+        _binding: object,
+        arguments: list[str],
+        *,
+        cwd: Path,
+        text: bool = True,
+        deadline_monotonic: float | None = None,
+    ) -> object:
+        del cwd, text
+        nonlocal now
+        assert deadline_monotonic == deadline
+        if now >= deadline:
+            raise subprocess.TimeoutExpired(arguments, 0)
+        launched.append(tuple(arguments))
+        now = deadline
+        return SimpleNamespace(returncode=0, stdout=str(expected) + "\n")
+
+    monkeypatch.setattr(manifest_module, "_run_trusted_git", probe)
+
+    with pytest.raises(LabDaemonConfigurationError, match="Git probe failed"):
+        daemon_module.require_lab_runtime_binding(
+            expected,
+            startup_deadline_monotonic=deadline,
+        )
+
+    assert launched == [("rev-parse", "--show-toplevel")]
 
 
 @pytest.mark.parametrize("drift", ["head", "tracked", "ignored_native"])

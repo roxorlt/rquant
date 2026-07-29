@@ -117,6 +117,52 @@ def test_read_existing_rejects_same_content_inode_swap_during_read(
     assert replaced
 
 
+def test_active_generation_rejects_same_content_marker_swap_during_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    authority = tmp_path / "authority"
+    authority.mkdir(mode=0o700)
+    lock = authority / "rquant.lock"
+    lock.write_bytes(b"")
+    lock.chmod(0o600)
+    marker = authority / "rquant.complete.json"
+    replacement = authority / "replacement.json"
+    payload = b'{"commit":"' + b"a" * 40 + b'"}\n'
+    marker.write_bytes(payload)
+    replacement.write_bytes(payload)
+    marker.chmod(0o600)
+    replacement.chmod(0o600)
+    replaced = False
+    original_read_bytes = Path.read_bytes
+    original_os_read = install_module.os.read
+
+    def racing_path_read(candidate: Path) -> bytes:
+        nonlocal replaced
+        if candidate == marker and not replaced:
+            replaced = True
+            os.replace(replacement, marker)
+        return original_read_bytes(candidate)
+
+    def racing_os_read(descriptor: int, size: int) -> bytes:
+        nonlocal replaced
+        if not replaced:
+            replaced = True
+            os.replace(replacement, marker)
+        return original_os_read(descriptor, size)
+
+    monkeypatch.setattr(Path, "read_bytes", racing_path_read)
+    monkeypatch.setattr(install_module.os, "read", racing_os_read)
+    installer = object.__new__(LabLaunchdInstaller)
+    installer.trusted_git_path = TRUSTED_GIT
+    installer.lock_path = lock
+
+    with pytest.raises(LabLaunchdInstallError, match="changed"):
+        installer._active_generation(-1)
+
+    assert replaced
+
+
 def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, str]:
     repo = tmp_path / "repo"
     (repo / "src" / "rquant").mkdir(parents=True)

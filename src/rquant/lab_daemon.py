@@ -1188,6 +1188,13 @@ def require_lab_runtime_binding(
     startup_deadline_monotonic: float | None = None,
 ) -> str:
     """Read and verify all live process identities before daemon I/O starts."""
+    binding_deadline = (
+        startup_deadline_monotonic
+        if startup_deadline_monotonic is not None
+        else time.monotonic() + 3
+    )
+    if not math.isfinite(binding_deadline) or time.monotonic() >= binding_deadline:
+        raise LabDaemonConfigurationError("Lab startup deadline is invalid or expired")
     expected_candidate = _canonical_absolute_path(
         expected_checkout_root,
         label="expected checkout root",
@@ -1206,7 +1213,7 @@ def require_lab_runtime_binding(
             deployment_generation=deployment_generation,
             deployment_lock_path=Path(deployment_lock_path),
             deployment_generation_fd=int(deployment_generation_fd),
-            startup_deadline_monotonic=startup_deadline_monotonic,
+            startup_deadline_monotonic=binding_deadline,
         )
     expected, _expected_venv = _require_physical_checkout_virtualenv(
         expected_checkout_root,
@@ -1238,11 +1245,13 @@ def require_lab_runtime_binding(
             trusted_git,
             ["rev-parse", "--show-toplevel"],
             cwd=expected,
+            deadline_monotonic=binding_deadline,
         )
         head_result = _run_trusted_git(
             trusted_git,
             ["rev-parse", "HEAD"],
             cwd=expected,
+            deadline_monotonic=binding_deadline,
         )
     except (OSError, subprocess.SubprocessError, ValueError) as exc:
         raise LabDaemonConfigurationError("lab runtime binding Git probe failed") from exc
@@ -1304,6 +1313,7 @@ def require_lab_runtime_binding(
         lambda: detect_verified_code_commit(
             expected,
             trusted_git_path=trusted_git.path,
+            deadline_monotonic=binding_deadline,
         )
     )
     if verified != git_head:
@@ -1918,6 +1928,7 @@ class LabDaemonReadinessPublisher:
         *,
         deployment_lock_path: Path,
         deployment_lock_fd: int,
+        daemon_authority_lease_fd: int | None = None,
         label: str,
         operation_id: str,
         environment_generation_id: str,
@@ -1959,7 +1970,12 @@ class LabDaemonReadinessPublisher:
         self.started_at = self.now_provider()
         self._stop = Event()
         self._thread: Thread | None = None
+        self._daemon_authority_lease_fd = -1
         self._verify_lock()
+        if daemon_authority_lease_fd is not None:
+            lease = os.fstat(daemon_authority_lease_fd)
+            _validate_private_regular_identity(lease, label="daemon authority lease")
+            self._daemon_authority_lease_fd = daemon_authority_lease_fd
 
     def _verify_lock(self) -> os.stat_result:
         try:
@@ -2162,14 +2178,24 @@ class LabDaemonReadinessPublisher:
         self._stop.set()
         thread = self._thread
         if thread is None:
+            if self._daemon_authority_lease_fd >= 0:
+                os.close(self._daemon_authority_lease_fd)
+                self._daemon_authority_lease_fd = -1
             return
         thread.join(timeout=max(1.0, self.heartbeat_interval_seconds * 2))
         if thread.is_alive():
             raise RuntimeError("daemon readiness publisher did not stop within its deadline")
         self._thread = None
+        if self._daemon_authority_lease_fd >= 0:
+            os.close(self._daemon_authority_lease_fd)
+            self._daemon_authority_lease_fd = -1
 
     def __enter__(self) -> LabDaemonReadinessPublisher:
-        self.start()
+        try:
+            self.start()
+        except BaseException:
+            self.close()
+            raise
         return self
 
     def __exit__(self, *_args: object) -> None:
@@ -2399,14 +2425,34 @@ class LabDaemonLock:
         parent_descriptor, self._parent_descriptor = self._parent_descriptor, -1
         try:
             if descriptor >= 0:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
-        finally:
-            if descriptor >= 0:
                 os.close(descriptor)
+        finally:
             if root_descriptor >= 0:
                 os.close(root_descriptor)
             if parent_descriptor >= 0:
                 os.close(parent_descriptor)
+
+    def duplicate_authority_lease(self) -> int:
+        if self._descriptor < 0 or self.authority_path is None:
+            raise RuntimeError("daemon lock is not acquired")
+        if self.mutation_guard is not None:
+            self.mutation_guard()
+        try:
+            opened = os.fstat(self._descriptor)
+            active = self.authority_path.lstat()
+            _validate_private_regular_identity(opened, label="daemon authority lock file")
+            if (opened.st_dev, opened.st_ino) != (active.st_dev, active.st_ino):
+                raise LabDaemonConfigurationError("daemon authority lock identity changed")
+            lease = os.dup(self._descriptor)
+            rebound = os.fstat(lease)
+            if (rebound.st_dev, rebound.st_ino) != (opened.st_dev, opened.st_ino):
+                os.close(lease)
+                raise LabDaemonConfigurationError("daemon authority lease identity changed")
+            return lease
+        except LabDaemonConfigurationError:
+            raise
+        except OSError as exc:
+            raise LabDaemonConfigurationError("daemon authority lease is unavailable") from exc
 
     def __enter__(self) -> LabDaemonLock:
         self.acquire()

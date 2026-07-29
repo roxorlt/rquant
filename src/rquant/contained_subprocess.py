@@ -1036,7 +1036,7 @@ def run_contained(
         if cancellation_check is not None and cancellation_check():
             raise ContainedProcessError("contained process was cancelled before startup")
         kernel_tracker.poll(deadline=deadline_monotonic)
-    except BaseException:
+    except BaseException as primary_exception:
         startup_cleanup_errors: list[BaseException] = []
         try:
             _terminate_blocked_root(process, deadline=deadline_monotonic)
@@ -1053,12 +1053,12 @@ def run_contained(
                 startup_cleanup_errors.append(exc)
         _close_file_descriptors(darwin_pipe_anchor_fds)
         if startup_cleanup_errors:
-            raise ContainedProcessError(
-                "contained subprocess startup cleanup failed"
-            ) from BaseExceptionGroup(
+            cleanup_group = BaseExceptionGroup(
                 "contained subprocess startup cleanup failures",
                 startup_cleanup_errors,
             )
+            primary_exception.cleanup_error_group = cleanup_group  # type: ignore[attr-defined]
+            primary_exception.add_note("contained subprocess startup cleanup also failed")
         raise
 
     def observe(deadline: float) -> dict[int, _ProcessObservation]:
@@ -1279,6 +1279,7 @@ def run_contained(
             cleanup_errors.append(exc)
         raise
     finally:
+        primary_exception = sys.exception()
         if gate_write >= 0:
             try:
                 os.close(gate_write)
@@ -1302,12 +1303,17 @@ def run_contained(
             _close_file_descriptors(darwin_pipe_anchor_fds)
         if cleanup_errors:
             details = "; ".join(str(error) or type(error).__name__ for error in cleanup_errors)
-            raise ContainedProcessError(
-                f"contained subprocess cleanup failed: {details}"
-            ) from BaseExceptionGroup(
+            cleanup_group = BaseExceptionGroup(
                 "contained subprocess cleanup failures",
                 cleanup_errors,
             )
+            if primary_exception is not None:
+                primary_exception.cleanup_error_group = cleanup_group  # type: ignore[attr-defined]
+                primary_exception.add_note(f"contained subprocess cleanup also failed: {details}")
+            else:
+                raise ContainedProcessError(
+                    f"contained subprocess cleanup failed: {details}"
+                ) from cleanup_group
 
     if caught_signal is not None:
         _close_file_descriptors(darwin_pipe_anchor_fds)
