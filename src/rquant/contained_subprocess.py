@@ -259,19 +259,30 @@ class _SignalHandlerInvocationTracker:
         return any(invocation.replay_error is error for invocation in self._invocations)
 
     @property
-    def first_replay_error(self) -> BaseException | None:
-        return next(
-            (
-                invocation.replay_error
-                for invocation in self._invocations
-                if invocation.replay_error is not None
-            ),
-            None,
+    def replay_errors(self) -> tuple[BaseException, ...]:
+        return tuple(
+            invocation.replay_error
+            for invocation in self._invocations
+            if invocation.replay_error is not None
         )
 
     @property
     def authority_transferred(self) -> bool:
         return bool(self._invocations and self._invocations[0].authority_transferred)
+
+
+def _consume_signal_handler_outcomes(
+    tracker: _SignalHandlerInvocationTracker,
+    protected_replay_error: BaseException | None,
+    cleanup_errors: list[BaseException],
+) -> BaseException | None:
+    replay_errors = tracker.replay_errors
+    if protected_replay_error is None and replay_errors and not tracker.authority_transferred:
+        protected_replay_error = replay_errors[0]
+    for replay_error in replay_errors:
+        if replay_error is not protected_replay_error:
+            _record_cleanup_error(cleanup_errors, replay_error)
+    return protected_replay_error
 
 
 def _restore_signal_handlers_collecting_errors(
@@ -400,13 +411,11 @@ class _SignalRestoration(list[BaseException]):
                             previous_handlers,
                             cleanup_errors,
                         )
-                    tracked_error = invocation_tracker.first_replay_error
-                    if (
-                        protected_replay_error is None
-                        and tracked_error is not None
-                        and not invocation_tracker.authority_transferred
-                    ):
-                        protected_replay_error = tracked_error
+                    protected_replay_error = _consume_signal_handler_outcomes(
+                        invocation_tracker,
+                        protected_replay_error,
+                        cleanup_errors,
+                    )
                     invocation_tracker = None
                     if not self._handlers_restored:
                         break
@@ -428,20 +437,13 @@ class _SignalRestoration(list[BaseException]):
                         and invocation_tracker.raised(exc)
                         and (self._released or exc is self._last_release_transition_exception)
                     )
-                    authority_transferred = (
-                        invocation_tracker is not None and invocation_tracker.authority_transferred
-                    )
-                    tracked_error = (
-                        invocation_tracker.first_replay_error
-                        if invocation_tracker is not None
-                        else None
-                    )
-                    if boundary_signal and authority_transferred:
-                        _record_cleanup_error(cleanup_errors, exc)
-                    elif boundary_signal and tracked_error is not None:
-                        protected_replay_error = tracked_error
-                        if exc is not tracked_error:
-                            _record_cleanup_error(cleanup_errors, exc)
+                    if boundary_signal:
+                        assert invocation_tracker is not None
+                        protected_replay_error = _consume_signal_handler_outcomes(
+                            invocation_tracker,
+                            protected_replay_error,
+                            cleanup_errors,
+                        )
                     elif primary_exception is None:
                         protected_replay_error = exc
                     else:
@@ -458,13 +460,11 @@ class _SignalRestoration(list[BaseException]):
                 previous_handlers,
                 cleanup_errors,
             )
-            tracked_error = invocation_tracker.first_replay_error
-            if (
-                protected_replay_error is None
-                and tracked_error is not None
-                and not invocation_tracker.authority_transferred
-            ):
-                protected_replay_error = tracked_error
+            protected_replay_error = _consume_signal_handler_outcomes(
+                invocation_tracker,
+                protected_replay_error,
+                cleanup_errors,
+            )
 
         if protected_replay_error is None:
             return

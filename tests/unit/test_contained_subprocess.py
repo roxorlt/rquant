@@ -2328,6 +2328,171 @@ os._exit(result)
     assert completed.returncode == 0, completed.stderr.decode(errors="replace")
 
 
+@pytest.mark.skipif(
+    not hasattr(signal, "pthread_sigmask"),
+    reason="atomic signal-mask arbitration requires pthread_sigmask",
+)
+@pytest.mark.parametrize("has_primary", (True, False), ids=("with-primary", "without-primary"))
+@pytest.mark.parametrize("signal_count", (2, 3), ids=("two-signals", "three-signals"))
+@pytest.mark.parametrize("later_mode", ("return", "raise"))
+def test_swallowed_nested_signal_outcomes_remain_cleanup_evidence(
+    has_primary: bool,
+    signal_count: int,
+    later_mode: str,
+) -> None:
+    program = """
+import functools
+import os
+import signal
+import sys
+
+from rquant import contained_subprocess as contained
+
+has_primary = sys.argv[1] == "1"
+signal_count = int(sys.argv[2])
+later_mode = sys.argv[3]
+managed = (signal.SIGINT, signal.SIGTERM)
+real_signal = contained.signal.signal
+real_sigmask = contained.signal.pthread_sigmask
+host_handlers = {signum: signal.getsignal(signum) for signum in managed}
+host_mask = real_sigmask(signal.SIG_BLOCK, set())
+starting_mask = host_mask.difference(managed)
+real_sigmask(signal.SIG_SETMASK, starting_mask)
+
+swallowed = []
+
+class ReturningFirstHandler:
+    def __init__(self):
+        self.calls = []
+
+    def handle(self, signum, _frame):
+        self.calls.append(signum)
+        for _index in range(signal_count - 1):
+            try:
+                os.kill(os.getpid(), signal.SIGINT)
+            except BaseException as exc:
+                swallowed.append(exc)
+
+first_handler = ReturningFirstHandler()
+later_calls = []
+later_errors = [
+    InterruptedError(f"exact later signal {index}")
+    for index in range(2, signal_count + 1)
+]
+
+def handle_later(mode, errors, calls, signum, _frame):
+    index = len(calls)
+    calls.append(signum)
+    if mode == "raise":
+        raise errors[index]
+
+later_handler = functools.partial(
+    handle_later,
+    later_mode,
+    later_errors,
+    later_calls,
+)
+real_signal(signal.SIGTERM, first_handler.handle)
+real_signal(signal.SIGINT, later_handler)
+latch = contained._ContainedSignalLatch()
+previous_handlers, active_signals = contained._install_signal_latch(latch)
+restoration = contained._restore_signal_handlers_atomically(
+    previous_handlers,
+    active_signals,
+    latch,
+)
+
+first_queued = False
+
+def queue_first_at_unmask(how, mask):
+    global first_queued
+    target = set(mask)
+    if how == signal.SIG_SETMASK and target == starting_mask and not first_queued:
+        first_queued = True
+        os.kill(os.getpid(), signal.SIGTERM)
+    return real_sigmask(how, target)
+
+contained.signal.pthread_sigmask = queue_first_at_unmask
+primary = RuntimeError("existing primary") if has_primary else None
+result = 90
+try:
+    cleanup_errors = list(restoration)
+    try:
+        if primary is None:
+            restoration.release_and_replay(
+                latch,
+                previous_handlers,
+                cleanup_errors,
+                primary_exception=None,
+                error_label="contained subprocess cleanup failures",
+            )
+        else:
+            try:
+                raise primary
+            finally:
+                restoration.release_and_replay(
+                    latch,
+                    previous_handlers,
+                    cleanup_errors,
+                    primary_exception=sys.exception(),
+                    error_label="contained subprocess cleanup failures",
+                )
+    except BaseException as exc:
+        cleanup_group = getattr(exc, "cleanup_error_group", None)
+        if later_mode == "raise":
+            identities_match = all(
+                observed is expected
+                for observed, expected in zip(swallowed, later_errors, strict=True)
+            )
+        else:
+            identities_match = all(
+                type(error) is InterruptedError
+                and str(error) == f"process runner interrupted by signal {signal.SIGINT}"
+                for error in swallowed
+            )
+        result = 0 if (
+            type(exc) is InterruptedError
+            and str(exc) == f"process runner interrupted by signal {signal.SIGTERM}"
+            and exc is not primary
+            and first_handler.calls == [signal.SIGTERM]
+            and later_calls == [signal.SIGINT] * (signal_count - 1)
+            and len(swallowed) == signal_count - 1
+            and identities_match
+            and isinstance(cleanup_group, BaseExceptionGroup)
+            and cleanup_group.exceptions == tuple(swallowed)
+            and real_sigmask(signal.SIG_BLOCK, set()) == starting_mask
+            and all(
+                signal.getsignal(signum) is previous_handlers[signum]
+                for signum in managed
+            )
+        ) else 91
+finally:
+    contained.signal.pthread_sigmask = real_sigmask
+    real_sigmask(signal.SIG_BLOCK, set(managed))
+    for signum, handler in host_handlers.items():
+        real_signal(signum, handler)
+    real_sigmask(signal.SIG_SETMASK, host_mask)
+
+os._exit(result)
+"""
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            program,
+            str(int(has_primary)),
+            str(signal_count),
+            later_mode,
+        ],
+        check=False,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert completed.returncode == 0, completed.stderr.decode(errors="replace")
+
+
 def test_latched_signal_transfers_authority_to_outer_latch() -> None:
     outer_latch = contained._ContainedSignalLatch()
 
