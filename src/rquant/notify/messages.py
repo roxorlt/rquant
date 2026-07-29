@@ -20,6 +20,7 @@ def build_message(scene: str, **kwargs) -> tuple[str, str]:
         "morning_pulse": _build_prerendered,
         "midday_report": _build_prerendered,
         "surge_watch": _build_prerendered,
+        "pulse_alert": _build_prerendered,
     }
     builder = builders.get(scene)
     if builder is None:

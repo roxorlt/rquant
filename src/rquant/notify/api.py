@@ -21,10 +21,11 @@ Scene = Literal[
     "morning_pulse",
     "midday_report",
     "surge_watch",
+    "pulse_alert",
 ]
 
-# 只推 admin（PushDeer）不推 PushPlus 的场景：爆量确认每分钟批次高频，只发刘彤
-_PUSHDEER_ONLY_SCENES: frozenset[str] = frozenset({"surge_watch"})
+# 只推 admin（PushDeer）不推 PushPlus 的场景：盘中高频/个人盯盘向，只发刘彤
+_PUSHDEER_ONLY_SCENES: frozenset[str] = frozenset({"surge_watch", "pulse_alert"})
 
 
 def _scene_enabled(scene: str) -> bool:
