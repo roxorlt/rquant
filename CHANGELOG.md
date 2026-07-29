@@ -86,7 +86,9 @@
   独立执行 kill/reap、tracker 关闭与信号处理器恢复并汇总异常；执行本身失败时保留原始异常，
   将 cleanup 错误作为结构化证据附着，不再把概率扫描描述成安全沙箱。signal arbiter 在任何 tracker、
   pipe 或 `Popen` 创建前安装，并把原 handler 恢复与最终解阻塞分成两阶段；若已有首信号，解阻塞
-  边界的后续信号只能作为次要证据。POSIX 阻塞窗口内同时 pending 的 SIGINT/SIGTERM 不承诺真实
+  边界的后续信号只能作为次要证据。authority 现在覆盖最终 inventory、必要后代回收、结果校验与
+  Darwin anchor/tracker/闸门关闭；mask 释放和首信号 replay 在同一仲裁操作内完成，不再留下
+  `release()` 返回后的覆盖窗口。POSIX 阻塞窗口内同时 pending 的 SIGINT/SIGTERM 不承诺真实
   到达顺序，确定性地按 SIGINT、SIGTERM 选取一个重放。
   launchd 安装 transaction authority 使用 inode/hash CAS 和可恢复 update-backup；plist 校验与读取
   改为 `openat(O_NOFOLLOW)` 后在同一 descriptor 上读/hash/fstat，并复核活动路径 inode。

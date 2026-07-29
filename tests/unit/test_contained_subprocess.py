@@ -539,7 +539,12 @@ def test_unlatched_restore_boundary_signal_propagates_original_handler(
             latch,
         )
         with pytest.raises(InterruptedError) as caught:
-            restoration.release()
+            restoration.release_and_replay(
+                latch,
+                previous_handlers,
+                [],
+                error_label="contained subprocess cleanup failures",
+            )
     finally:
         monkeypatch.setattr(contained.signal, "pthread_sigmask", real_sigmask)
         signal.pthread_sigmask(signal.SIG_SETMASK, before_mask)
@@ -670,6 +675,114 @@ def test_latched_first_signal_survives_helper_return_boundary_signal(
     cleanup_group = getattr(caught.value, "cleanup_error_group", None)
     assert isinstance(cleanup_group, BaseExceptionGroup)
     assert later in cleanup_group.exceptions
+
+
+@pytest.mark.skipif(
+    not hasattr(signal, "pthread_sigmask"),
+    reason="atomic signal-mask arbitration requires pthread_sigmask",
+)
+def test_first_callable_signal_survives_second_signal_after_release_returns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_signal = contained.signal.signal
+    watched = (signal.SIGINT, signal.SIGTERM)
+    before_handlers = {signum: signal.getsignal(signum) for signum in watched}
+    before_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+    latch = contained._ContainedSignalLatch()
+    first = KeyboardInterrupt()
+    second = InterruptedError("second signal at post-release boundary")
+    armed = False
+    injected = False
+
+    def first_handler(_signum: int, _frame: object) -> None:
+        raise first
+
+    def second_handler(_signum: int, _frame: object) -> None:
+        raise second
+
+    real_signal(signal.SIGTERM, first_handler)
+    real_signal(signal.SIGINT, second_handler)
+    previous_handlers, active_signals = contained._install_signal_latch(latch)
+    latch.handle(signal.SIGTERM, None)
+    restoration = contained._restore_signal_handlers_atomically(
+        previous_handlers,
+        active_signals,
+        latch,
+    )
+    monkeypatch.setattr(
+        contained,
+        "_restore_signal_handlers_atomically",
+        lambda *_args: restoration,
+    )
+    release_code = restoration.release.__func__.__code__
+    release_and_replay_code = restoration.release_and_replay.__func__.__code__
+
+    def trace_release_return(frame: object, event: str, _arg: object) -> object:
+        nonlocal armed, injected
+        code = getattr(frame, "f_code", None)
+        if code is release_code and event == "return":
+            armed = True
+        elif armed and code is release_and_replay_code and event == "line" and not injected:
+            injected = True
+            sys.settrace(None)
+            second_handler(signal.SIGINT, None)
+        return trace_release_return
+
+    try:
+        sys.settrace(trace_release_return)
+        with pytest.raises(KeyboardInterrupt) as caught:
+            contained._finish_signal_restoration(
+                previous_handlers,
+                active_signals,
+                latch,
+                [],
+                primary_exception=None,
+                error_label="contained subprocess cleanup failures",
+            )
+    finally:
+        sys.settrace(None)
+        signal.pthread_sigmask(signal.SIG_SETMASK, before_mask)
+        for signum, previous in before_handlers.items():
+            real_signal(signum, previous)
+
+    assert caught.value is first
+    assert injected
+    cleanup_group = getattr(caught.value, "cleanup_error_group", None)
+    assert isinstance(cleanup_group, BaseExceptionGroup)
+    assert second in cleanup_group.exceptions
+
+
+def test_latched_signal_replay_preserves_default_and_ignore_semantics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    signal_calls: list[tuple[int, object]] = []
+    kill_calls: list[tuple[int, int]] = []
+
+    monkeypatch.setattr(
+        contained.signal,
+        "signal",
+        lambda signum, handler: signal_calls.append((signum, handler)),
+    )
+    monkeypatch.setattr(
+        contained.os,
+        "kill",
+        lambda pid, signum: kill_calls.append((pid, signum)),
+    )
+
+    default_replay = contained._latched_signal_replay_error(
+        signal.SIGTERM,
+        {signal.SIGTERM: signal.SIG_DFL},
+    )
+    ignored_replay = contained._latched_signal_replay_error(
+        signal.SIGTERM,
+        {signal.SIGTERM: signal.SIG_IGN},
+    )
+
+    assert isinstance(default_replay, SystemExit)
+    assert default_replay.code == 128 + signal.SIGTERM
+    assert ignored_replay is None
+    assert signal_calls == [(signal.SIGTERM, signal.SIG_DFL)]
+    assert kill_calls == [(contained.os.getpid(), signal.SIGTERM)]
 
 
 def test_signal_after_communicate_returns_is_latched_before_cleanup(
@@ -1810,6 +1923,86 @@ def test_darwin_pipe_identity_remains_anchored_through_final_inventory(
     )
 
     assert result.returncode == 0
+    assert len(marker_fds) == 2
+    for fd in marker_fds:
+        with pytest.raises(OSError):
+            contained.os.fstat(fd)
+
+
+def test_final_inventory_signal_replays_after_darwin_anchor_fds_close(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    tracker = _FakeKernelTracker(identity=contained.ProcessIdentity(1, (1, 0)))
+    real_popen = contained.subprocess.Popen
+    real_signal = contained.signal.signal
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+    marker_fds: list[int] = []
+    communicated = False
+    injected = False
+    replayed = InterruptedError("final inventory signal replay")
+
+    def previous_handler(_signum: int, _frame: object) -> None:
+        for fd in marker_fds:
+            with pytest.raises(OSError):
+                contained.os.fstat(fd)
+        raise replayed
+
+    def marker_for_fd(_pid: int, fd: int) -> contained.DarwinPipeMarker:
+        contained.os.fstat(fd)
+        marker_fds.append(fd)
+        return (fd * 2 + 1, fd * 2 + 2)
+
+    def capturing_popen(*args: object, **kwargs: object) -> subprocess.Popen[str]:
+        process = real_popen(*args, **kwargs)
+        communicate = process.communicate
+
+        def communicate_then_mark(*args: object, **kwargs: object) -> tuple[str, str]:
+            nonlocal communicated
+            result = communicate(*args, **kwargs)
+            communicated = True
+            return result
+
+        process.communicate = communicate_then_mark  # type: ignore[method-assign]
+        return process
+
+    def inventory(_deadline: float) -> dict[int, contained._ProcessObservation]:
+        nonlocal injected
+        identity = tracker.registered_identity
+        if communicated and not injected:
+            injected = True
+            handler = signal.getsignal(signal.SIGTERM)
+            assert handler is not previous_handler
+            assert callable(handler)
+            handler(signal.SIGTERM, None)
+        if identity is None:
+            return {}
+        return {
+            identity.pid: contained._ProcessObservation(
+                identity=identity,
+                parent_pid=contained.os.getpid(),
+            )
+        }
+
+    real_signal(signal.SIGTERM, previous_handler)
+    monkeypatch.setattr(contained.sys, "platform", "darwin")
+    monkeypatch.setattr(contained, "_darwin_pipe_marker_for_fd", marker_for_fd)
+    monkeypatch.setattr(contained.subprocess, "Popen", capturing_popen)
+    try:
+        with pytest.raises(InterruptedError) as caught:
+            contained.run_contained(
+                [sys.executable, "-c", "pass"],
+                cwd=tmp_path,
+                deadline_monotonic=time.monotonic() + 2,
+                inventory_provider=inventory,
+                kernel_tracker_factory=_tracker_factory(tracker),
+                may_spawn_background_descendants=False,
+            )
+    finally:
+        real_signal(signal.SIGTERM, previous_sigterm)
+
+    assert caught.value is replayed
+    assert injected
     assert len(marker_fds) == 2
     for fd in marker_fds:
         with pytest.raises(OSError):

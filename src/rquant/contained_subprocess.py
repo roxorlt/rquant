@@ -63,6 +63,48 @@ class _SignalRestoration(list[BaseException]):
         self._released = True
         signal.pthread_sigmask(signal.SIG_SETMASK, self._previous_mask)
 
+    def release_and_replay(
+        self,
+        latch: _ContainedSignalLatch,
+        previous_handlers: Mapping[int, object],
+        cleanup_errors: list[BaseException],
+        *,
+        error_label: str,
+    ) -> None:
+        replay_error = (
+            _latched_signal_replay_error(latch.first_signum, previous_handlers)
+            if latch.first_signum is not None
+            else None
+        )
+        boundary_error: BaseException | None = None
+        try:
+            self.release()
+            if replay_error is None and latch.first_signum is not None:
+                replay_error = _latched_signal_replay_error(
+                    latch.first_signum,
+                    previous_handlers,
+                )
+            protected_replay_error = replay_error
+        except BaseException as exc:
+            if replay_error is None:
+                if cleanup_errors:
+                    cleanup_group = BaseExceptionGroup(error_label, cleanup_errors)
+                    exc.cleanup_error_group = cleanup_group  # type: ignore[attr-defined]
+                    exc.add_note("contained subprocess cleanup also failed")
+                raise
+            boundary_error = exc
+            protected_replay_error = replay_error
+
+        if protected_replay_error is None:
+            return
+        if boundary_error is not None and boundary_error is not protected_replay_error:
+            cleanup_errors.append(boundary_error)
+        if cleanup_errors:
+            cleanup_group = BaseExceptionGroup(error_label, cleanup_errors)
+            protected_replay_error.cleanup_error_group = cleanup_group  # type: ignore[attr-defined]
+            protected_replay_error.add_note("contained subprocess cleanup also failed")
+        raise protected_replay_error
+
 
 def _install_signal_latch(
     latch: _ContainedSignalLatch,
@@ -157,7 +199,7 @@ def _restore_signal_handlers_atomically(
 def _latched_signal_replay_error(
     signum: int,
     previous_handlers: Mapping[int, object],
-) -> BaseException:
+) -> BaseException | None:
     previous = previous_handlers[signum]
     if callable(previous):
         try:
@@ -165,6 +207,8 @@ def _latched_signal_replay_error(
         except BaseException as exc:
             return exc
         return InterruptedError(f"process runner interrupted by signal {signum}")
+    if previous is signal.SIG_IGN:
+        return None
     try:
         signal.signal(signum, signal.SIG_DFL)
         os.kill(os.getpid(), signum)
@@ -188,38 +232,16 @@ def _finish_signal_restoration(
         latch,
     )
     cleanup_errors.extend(restoration)
-    replay_error: BaseException | None = None
-    if latch.first_signum is not None:
-        replay_error = _latched_signal_replay_error(
-            latch.first_signum,
-            previous_handlers,
-        )
-
-    try:
-        restoration.release()
-    except BaseException as boundary_error:
-        if replay_error is None:
-            if cleanup_errors:
-                cleanup_group = BaseExceptionGroup(error_label, cleanup_errors)
-                boundary_error.cleanup_error_group = cleanup_group  # type: ignore[attr-defined]
-                boundary_error.add_note("contained subprocess cleanup also failed")
-            raise
-        cleanup_errors.append(boundary_error)
-
-    if replay_error is None and latch.first_signum is not None:
-        replay_error = _latched_signal_replay_error(
-            latch.first_signum,
-            previous_handlers,
-        )
+    restoration.release_and_replay(
+        latch,
+        previous_handlers,
+        cleanup_errors,
+        error_label=error_label,
+    )
 
     cleanup_group: BaseExceptionGroup | None = None
     if cleanup_errors:
         cleanup_group = BaseExceptionGroup(error_label, cleanup_errors)
-    if replay_error is not None:
-        if cleanup_group is not None:
-            replay_error.cleanup_error_group = cleanup_group  # type: ignore[attr-defined]
-            replay_error.add_note("contained subprocess cleanup also failed")
-        raise replay_error
     if cleanup_group is None:
         return
     details = "; ".join(str(error) or type(error).__name__ for error in cleanup_errors)
@@ -1271,7 +1293,6 @@ def run_contained(
         return inventory_provider(deadline)
 
     initial_inventory: Mapping[int, _ProcessObservation] | None = None
-    body_completed = False
     known: dict[int, ProcessIdentity] = {}
     known_lock = threading.Lock()
     tracker_stop = threading.Event()
@@ -1407,7 +1428,6 @@ def run_contained(
                 break
             except subprocess.TimeoutExpired:
                 continue
-        body_completed = True
     except subprocess.TimeoutExpired:
         tracker_stop.set()
         if tracker_last_inventory is not None:
@@ -1445,7 +1465,6 @@ def run_contained(
             )
         except BaseException as cleanup_exc:
             cleanup_errors.append(cleanup_exc)
-        body_completed = True
     except BaseException:
         tracker_stop.set()
         if tracker_last_inventory is not None:
@@ -1481,16 +1500,16 @@ def run_contained(
             kernel_tracker.close()
         except BaseException as exc:
             cleanup_errors.append(exc)
-        if not body_completed or cleanup_errors:
+        if primary_exception is not None:
             _close_file_descriptors(darwin_pipe_anchor_fds)
-        _finish_signal_restoration(
-            previous_handlers,
-            active_signals,
-            signal_latch,
-            cleanup_errors,
-            primary_exception=primary_exception,
-            error_label="contained subprocess cleanup failures",
-        )
+            _finish_signal_restoration(
+                previous_handlers,
+                active_signals,
+                signal_latch,
+                cleanup_errors,
+                primary_exception=primary_exception,
+                error_label="contained subprocess cleanup failures",
+            )
     try:
         remaining = deadline_monotonic - clock()
         if remaining <= 0:
@@ -1530,6 +1549,14 @@ def run_contained(
         return completed
     finally:
         _close_file_descriptors(darwin_pipe_anchor_fds)
+        _finish_signal_restoration(
+            previous_handlers,
+            active_signals,
+            signal_latch,
+            cleanup_errors,
+            primary_exception=sys.exception(),
+            error_label="contained subprocess cleanup failures",
+        )
 
 
 def _contained_child_main(arguments: list[str]) -> int:

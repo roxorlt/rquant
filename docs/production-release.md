@@ -323,6 +323,9 @@ parent graph 和每次运行的唯一 token 是补充证据。在
 SIGINT/SIGTERM/timeout/BaseException 时先停止生成源，再反复终止并复核原进程组、立即脱离的
 `setsid` 后代与 cleanup 期间新 fork；任一 tracker、inventory、PID identity 或已发现后代存活检查无法
 完成时失败关闭，不释放成功权威。连续信号由一次性 latch 合并，避免 cleanup 被嵌套信号异常打断。
+signal authority 会一直持有到最终 inventory、必要后代回收、returncode/结果校验以及 Darwin 管道
+anchor、tracker 和闸门资源全部关闭；原 handler 恢复、首信号 replay 与原 mask 恢复在同一个仲裁
+操作内完成，unmask 边界的后续 handler 异常只能作为首信号的次要 cleanup 证据。
 POSIX 标准 SIGINT/SIGTERM 在阻塞窗口内只形成 pending set：相同信号会合并，同时 pending 的不同
 标准信号不保留真实到达顺序。仲裁器优先保留进入阻塞窗口前已经 latch 的首信号；若只能观察到
 同时 pending 的集合，则采用确定性的 SIGINT、SIGTERM 顺序选取一个重放，其余仅作为已合并的后续
