@@ -21,9 +21,10 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import NoReturn, Protocol
 
 _SIGNAL_STATE_ATTEMPTS = 3
+_UNSAFE_SIGNAL_STATE_EXIT_CODE = 70
 
 
 class ContainedProcessError(RuntimeError):
@@ -77,17 +78,127 @@ def _attach_cleanup_error_group(
         primary_exception.add_note(note)
 
 
+def _terminate_unsafe_signal_state(
+    message: str,
+    errors: Sequence[BaseException],
+) -> NoReturn:
+    details = "; ".join(str(error) or type(error).__name__ for error in errors)
+    diagnostic = f"rquant: {message}"
+    if details:
+        diagnostic = f"{diagnostic}: {details}"
+    with suppress(OSError):
+        os.write(2, f"{diagnostic}\n".encode())
+    os._exit(_UNSAFE_SIGNAL_STATE_EXIT_CODE)
+
+
+def _ensure_signal_mask_bounded(
+    expected_mask: set[signal.Signals],
+    errors: list[BaseException],
+) -> bool:
+    mismatch: ContainedProcessError | None = None
+    for _attempt in range(_SIGNAL_STATE_ATTEMPTS):
+        try:
+            if signal.pthread_sigmask(signal.SIG_BLOCK, set()) == expected_mask:
+                return True
+        except BaseException as exc:
+            _record_cleanup_error(errors, exc)
+        try:
+            signal.pthread_sigmask(signal.SIG_SETMASK, expected_mask)
+        except BaseException as exc:
+            _record_cleanup_error(errors, exc)
+        try:
+            if signal.pthread_sigmask(signal.SIG_BLOCK, set()) == expected_mask:
+                return True
+        except BaseException as exc:
+            _record_cleanup_error(errors, exc)
+        if mismatch is None:
+            mismatch = ContainedProcessError("signal mask restoration could not be verified")
+            _record_cleanup_error(errors, mismatch)
+    return False
+
+
+def _restore_signal_mask_or_terminate(
+    blocked_mask: set[signal.Signals],
+    errors: list[BaseException],
+    *,
+    context: str,
+) -> None:
+    if _ensure_signal_mask_bounded(blocked_mask, errors):
+        return
+    _terminate_unsafe_signal_state(context, errors)
+
+
+def _release_signal_mask_once(
+    target_mask: set[signal.Signals],
+    blocked_mask: set[signal.Signals],
+    errors: list[BaseException],
+) -> BaseException | None:
+    try:
+        signal.pthread_sigmask(signal.SIG_SETMASK, target_mask)
+    except BaseException as exc:
+        _record_cleanup_error(errors, exc)
+        _restore_signal_mask_or_terminate(
+            blocked_mask,
+            errors,
+            context="signal release failed and the blocked mask could not be restored",
+        )
+        return exc
+    try:
+        observed_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+    except BaseException as exc:
+        _record_cleanup_error(errors, exc)
+        _restore_signal_mask_or_terminate(
+            blocked_mask,
+            errors,
+            context="signal release verification failed and blocking could not be restored",
+        )
+        return exc
+    if observed_mask == target_mask:
+        return None
+    error = ContainedProcessError("signal mask release could not be verified")
+    _record_cleanup_error(errors, error)
+    _restore_signal_mask_or_terminate(
+        blocked_mask,
+        errors,
+        context="signal release mismatch could not be returned to a blocked state",
+    )
+    return error
+
+
+def _release_signal_mask_bounded(
+    target_mask: set[signal.Signals],
+    blocked_mask: set[signal.Signals],
+    errors: list[BaseException],
+) -> bool:
+    for _attempt in range(_SIGNAL_STATE_ATTEMPTS):
+        if _release_signal_mask_once(target_mask, blocked_mask, errors) is None:
+            return True
+    return False
+
+
 class _SignalRestoration(list[BaseException]):
     def __init__(
         self,
         errors: Sequence[BaseException],
         *,
         previous_mask: set[signal.Signals] | None,
+        blocked_mask: set[signal.Signals] | None,
         handlers_restored: bool = True,
     ) -> None:
         super().__init__(errors)
         self._previous_mask = previous_mask
+        self._blocked_mask = blocked_mask
         self._handlers_restored = handlers_restored
+        self._released = False
+
+    def _fail_closed(self, errors: list[BaseException], *, context: str) -> None:
+        if self._blocked_mask is None:
+            _terminate_unsafe_signal_state(context, errors)
+        _restore_signal_mask_or_terminate(
+            self._blocked_mask,
+            errors,
+            context=context,
+        )
         self._released = False
 
     def release(self) -> None:
@@ -100,10 +211,25 @@ class _SignalRestoration(list[BaseException]):
         if self._previous_mask is None:
             self._released = True
             return
-        signal.pthread_sigmask(signal.SIG_SETMASK, self._previous_mask)
-        observed_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
-        if observed_mask != self._previous_mask:
-            raise ContainedProcessError("signal mask release could not be verified")
+        if self._blocked_mask is None:
+            _terminate_unsafe_signal_state(
+                "signal release has no verified blocked-mask checkpoint",
+                self,
+            )
+        release_errors: list[BaseException] = []
+        release_error = _release_signal_mask_once(
+            self._previous_mask,
+            self._blocked_mask,
+            release_errors,
+        )
+        if release_error is not None:
+            _attach_cleanup_error_group(
+                release_error,
+                release_errors,
+                error_label="signal mask release recovery failures",
+                note="signal mask release recovery also failed",
+            )
+            raise release_error
         self._released = True
 
     def release_and_replay(
@@ -113,6 +239,7 @@ class _SignalRestoration(list[BaseException]):
         cleanup_errors: list[BaseException],
         *,
         error_label: str,
+        primary_exception: BaseException | None = None,
     ) -> None:
         protected_replay_error = (
             _latched_signal_replay_error(latch.first_signum, previous_handlers)
@@ -136,12 +263,19 @@ class _SignalRestoration(list[BaseException]):
                 if exc is protected_replay_error and self._released:
                     raise
                 if protected_replay_error is None:
-                    protected_replay_error = exc
+                    if primary_exception is None:
+                        protected_replay_error = exc
+                    else:
+                        _record_cleanup_error(cleanup_errors, exc)
                 elif exc is not protected_replay_error:
                     _record_cleanup_error(cleanup_errors, exc)
 
         if protected_replay_error is None:
             return
+        self._fail_closed(
+            cleanup_errors,
+            context="terminal signal replay could not establish a blocked state",
+        )
         try:
             _attach_cleanup_error_group(
                 protected_replay_error,
@@ -204,8 +338,12 @@ def _set_signal_mask_bounded(
     how: int,
     mask: set[signal.Signals] | frozenset[int],
     errors: list[BaseException],
+    *,
+    initial_mask: set[signal.Signals] | None = None,
 ) -> set[signal.Signals] | None:
-    previous_mask = _read_signal_mask_bounded(errors)
+    previous_mask = initial_mask
+    if previous_mask is None:
+        previous_mask = _read_signal_mask_bounded(errors)
     if previous_mask is None:
         return None
     expected_mask = {*previous_mask, *mask} if how == signal.SIG_BLOCK else set(mask)
@@ -284,9 +422,9 @@ def _install_signal_latch(
         rollback_complete = _restore_signal_handlers_verified(touched, rollback_errors)
         if rollback_complete:
             release_errors: list[BaseException] = []
-            _set_signal_mask_bounded(
-                signal.SIG_SETMASK,
+            _release_signal_mask_bounded(
                 previous_mask,
+                {*previous_mask, *active},
                 release_errors,
             )
             for error in release_errors:
@@ -299,31 +437,35 @@ def _install_signal_latch(
         )
         raise
 
-    release_errors = []
-    if _set_signal_mask_bounded(signal.SIG_SETMASK, previous_mask, release_errors) is None:
+    blocked_mask = {*previous_mask, *active}
+    release_errors: list[BaseException] = []
+    if not _release_signal_mask_bounded(previous_mask, blocked_mask, release_errors):
         primary_exception = release_errors[0]
         rollback_errors: list[BaseException] = []
         for error in release_errors[1:]:
             _record_cleanup_error(rollback_errors, error)
-        reblock_errors: list[BaseException] = []
-        rollback_blocked = (
-            _set_signal_mask_bounded(signal.SIG_BLOCK, active, reblock_errors) is not None
-        )
-        for error in reblock_errors:
-            _record_cleanup_error(rollback_errors, error)
-        handlers_restored = rollback_blocked and _restore_signal_handlers_verified(
+        handlers_restored = _restore_signal_handlers_verified(
             installed,
             rollback_errors,
         )
         if handlers_restored:
             recovery_cleanup = [primary_exception, *rollback_errors]
-            recovery = _SignalRestoration((), previous_mask=previous_mask)
+            recovery = _SignalRestoration(
+                (),
+                previous_mask=previous_mask,
+                blocked_mask=blocked_mask,
+            )
             recovery.release_and_replay(
                 latch,
                 candidates,
                 recovery_cleanup,
                 error_label="signal latch installation release failures",
+                primary_exception=primary_exception,
             )
+            rollback_errors = []
+            for error in recovery_cleanup:
+                if error is not primary_exception:
+                    _record_cleanup_error(rollback_errors, error)
         _attach_cleanup_error_group(
             primary_exception,
             rollback_errors,
@@ -340,23 +482,61 @@ def _restore_signal_handlers_atomically(
     latch: _ContainedSignalLatch,
 ) -> _SignalRestoration:
     if not previous_handlers:
-        return _SignalRestoration((), previous_mask=None)
+        return _SignalRestoration((), previous_mask=None, blocked_mask=None)
 
     errors: list[BaseException] = []
-    previous_mask = _set_signal_mask_bounded(signal.SIG_BLOCK, active_signals, errors)
-    handlers_restored = True
+    previous_mask = _read_signal_mask_bounded(errors)
     if previous_mask is None:
-        current_mask = _set_signal_mask_bounded(signal.SIG_BLOCK, set(), errors)
-        if current_mask is not None:
-            blocked_mask = {*current_mask, *active_signals}
-            if _set_signal_mask_bounded(signal.SIG_SETMASK, blocked_mask, errors) is not None:
-                previous_mask = current_mask
+        fallback_snapshot: set[signal.Signals] | None = None
+        snapshot_trustworthy = True
+        verified_blocked_mask: set[signal.Signals] | None = None
+        for _attempt in range(_SIGNAL_STATE_ATTEMPTS):
+            try:
+                transition_mask = signal.pthread_sigmask(
+                    signal.SIG_BLOCK,
+                    active_signals,
+                )
+                if fallback_snapshot is None and snapshot_trustworthy:
+                    fallback_snapshot = transition_mask
+            except BaseException as exc:
+                snapshot_trustworthy = False
+                _record_cleanup_error(errors, exc)
+            try:
+                observed_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+            except BaseException as exc:
+                _record_cleanup_error(errors, exc)
+                continue
+            if set(active_signals) <= observed_mask:
+                verified_blocked_mask = observed_mask
+            if fallback_snapshot is not None and observed_mask == {
+                *fallback_snapshot,
+                *active_signals,
+            }:
+                previous_mask = fallback_snapshot
+                break
         if previous_mask is None:
-            return _SignalRestoration(
+            if verified_blocked_mask is not None:
+                return _SignalRestoration(
+                    errors,
+                    previous_mask=None,
+                    blocked_mask=verified_blocked_mask,
+                    handlers_restored=False,
+                )
+            _terminate_unsafe_signal_state(
+                "signal mask snapshot failed and blocking could not be verified",
                 errors,
-                previous_mask=None,
-                handlers_restored=False,
             )
+    blocked_mask = {*previous_mask, *active_signals}
+    if _set_signal_mask_bounded(
+        signal.SIG_BLOCK,
+        active_signals,
+        errors,
+        initial_mask=previous_mask,
+    ) is None and not _ensure_signal_mask_bounded(blocked_mask, errors):
+        _terminate_unsafe_signal_state(
+            "signal handlers cannot be restored because blocking is unverified",
+            errors,
+        )
 
     handlers_restored = _restore_signal_handlers_verified(previous_handlers, errors)
 
@@ -364,6 +544,7 @@ def _restore_signal_handlers_atomically(
         return _SignalRestoration(
             errors,
             previous_mask=previous_mask,
+            blocked_mask=blocked_mask,
             handlers_restored=False,
         )
 
@@ -407,6 +588,7 @@ def _restore_signal_handlers_atomically(
     return _SignalRestoration(
         errors,
         previous_mask=previous_mask,
+        blocked_mask=blocked_mask,
         handlers_restored=handlers_restored,
     )
 
@@ -471,6 +653,7 @@ def _finish_signal_restoration(
         previous_handlers,
         cleanup_errors,
         error_label=error_label,
+        primary_exception=primary_exception,
     )
 
     cleanup_group: BaseExceptionGroup | None = None

@@ -17,6 +17,31 @@ from rquant import contained_subprocess as contained
 
 _REAL_SIGNAL = signal.signal
 _REAL_PTHREAD_SIGMASK = getattr(signal, "pthread_sigmask", None)
+_MANAGED_TEST_SIGNALS = (signal.SIGINT, signal.SIGTERM)
+
+
+def _prepare_unblocked_signal_host() -> tuple[
+    dict[int, object],
+    set[signal.Signals],
+    set[signal.Signals],
+]:
+    assert _REAL_PTHREAD_SIGMASK is not None
+    host_handlers = {signum: signal.getsignal(signum) for signum in _MANAGED_TEST_SIGNALS}
+    host_mask = _REAL_PTHREAD_SIGMASK(signal.SIG_BLOCK, set())
+    starting_mask = host_mask.difference(_MANAGED_TEST_SIGNALS)
+    _REAL_PTHREAD_SIGMASK(signal.SIG_SETMASK, starting_mask)
+    return host_handlers, host_mask, starting_mask
+
+
+def _restore_signal_host(
+    host_handlers: dict[int, object],
+    host_mask: set[signal.Signals],
+) -> None:
+    assert _REAL_PTHREAD_SIGMASK is not None
+    _REAL_PTHREAD_SIGMASK(signal.SIG_BLOCK, set(_MANAGED_TEST_SIGNALS))
+    for signum, previous in host_handlers.items():
+        _REAL_SIGNAL(signum, previous)  # type: ignore[arg-type]
+    _REAL_PTHREAD_SIGMASK(signal.SIG_SETMASK, host_mask)
 
 
 @pytest.fixture(autouse=True)
@@ -370,7 +395,7 @@ def test_signal_latch_release_failure_rolls_back_handlers_while_blocked(
 
     def fail_release_verification(how: int, mask: object) -> set[signal.Signals]:
         nonlocal awaiting_release_verification, verification_failures
-        if how == signal.SIG_SETMASK:
+        if how == signal.SIG_SETMASK and set(mask) == before_mask:  # type: ignore[arg-type]
             result = real_sigmask(how, mask)  # type: ignore[arg-type]
             if verification_failures < contained._SIGNAL_STATE_ATTEMPTS:
                 awaiting_release_verification = True
@@ -1293,7 +1318,11 @@ def test_failed_signal_mask_release_remains_retryable(
     before_mask = real_sigmask(signal.SIG_BLOCK, set())
     managed = {signal.SIGTERM}
     real_sigmask(signal.SIG_BLOCK, managed)
-    restoration = contained._SignalRestoration((), previous_mask=before_mask)
+    restoration = contained._SignalRestoration(
+        (),
+        previous_mask=before_mask,
+        blocked_mask={*before_mask, *managed},
+    )
     failure = OSError("first unmask boom")
     first = KeyboardInterrupt()
     latch = contained._ContainedSignalLatch()
@@ -1349,7 +1378,11 @@ def test_signal_mask_release_commits_only_after_verification(
     before_mask = real_sigmask(signal.SIG_BLOCK, set())
     managed = {signal.SIGTERM}
     real_sigmask(signal.SIG_BLOCK, managed)
-    restoration = contained._SignalRestoration((), previous_mask=before_mask)
+    restoration = contained._SignalRestoration(
+        (),
+        previous_mask=before_mask,
+        blocked_mask={*before_mask, *managed},
+    )
     setmask_calls = 0
 
     def ignore_setmask(how: int, mask: object) -> set[signal.Signals]:
@@ -1386,16 +1419,21 @@ def test_first_signal_survives_persistent_unmask_failure_without_committing_rele
     latch.handle(signal.SIGTERM, None)
     first = KeyboardInterrupt()
     failures: list[OSError] = []
-    restoration = contained._SignalRestoration((), previous_mask=before_mask)
+    restoration = contained._SignalRestoration(
+        (),
+        previous_mask=before_mask,
+        blocked_mask={*before_mask, *managed},
+    )
 
     def previous_handler(_signum: int, _frame: object) -> None:
         raise first
 
-    def fail_unmask(how: int, _mask: object) -> set[signal.Signals]:
-        assert how == signal.SIG_SETMASK
-        failure = OSError(f"persistent unmask boom {len(failures) + 1}")
-        failures.append(failure)
-        raise failure
+    def fail_unmask(how: int, mask: object) -> set[signal.Signals]:
+        if how == signal.SIG_SETMASK and set(mask) == before_mask:  # type: ignore[arg-type]
+            failure = OSError(f"persistent unmask boom {len(failures) + 1}")
+            failures.append(failure)
+            raise failure
+        return real_sigmask(how, mask)  # type: ignore[arg-type]
 
     monkeypatch.setattr(contained.signal, "pthread_sigmask", fail_unmask)
     try:
@@ -1416,6 +1454,325 @@ def test_first_signal_survives_persistent_unmask_failure_without_committing_rele
         assert len(failures) == contained._SIGNAL_STATE_ATTEMPTS
     finally:
         real_sigmask(signal.SIG_SETMASK, before_mask)
+
+
+@pytest.mark.skipif(
+    not hasattr(signal, "pthread_sigmask"),
+    reason="atomic signal-mask arbitration requires pthread_sigmask",
+)
+def test_first_signal_survives_terminal_replay_boundary_after_guard_exhaustion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_signal = contained.signal.signal
+    real_sigmask = contained.signal.pthread_sigmask
+    host_handlers, host_mask, _starting_mask = _prepare_unblocked_signal_host()
+    latch = contained._ContainedSignalLatch()
+    first = KeyboardInterrupt()
+    second = InterruptedError("second signal at terminal replay boundary")
+    attachment_injections = 0
+    terminal_occurrences = 0
+    terminal_masks: list[set[signal.Signals]] = []
+
+    def first_handler(_signum: int, _frame: object) -> None:
+        raise first
+
+    def second_handler(_signum: int, _frame: object) -> None:
+        raise second
+
+    real_signal(signal.SIGTERM, first_handler)
+    real_signal(signal.SIGINT, second_handler)
+    previous_handlers, active_signals = contained._install_signal_latch(latch)
+    latch.handle(signal.SIGTERM, None)
+    restoration = contained._restore_signal_handlers_atomically(
+        previous_handlers,
+        active_signals,
+        latch,
+    )
+    source_lines, first_line = inspect.getsourcelines(restoration.release_and_replay.__func__)
+    replay_raise_lines = [
+        first_line + offset
+        for offset, source_line in enumerate(source_lines)
+        if source_line.strip() == "raise protected_replay_error"
+    ]
+    terminal_line = replay_raise_lines[-1]
+    release_and_replay_code = restoration.release_and_replay.__func__.__code__
+    real_attach_cleanup = contained._attach_cleanup_error_group
+
+    def fail_guarded_attachments(*args: object, **kwargs: object) -> None:
+        nonlocal attachment_injections
+        real_attach_cleanup(*args, **kwargs)  # type: ignore[arg-type]
+        if attachment_injections < contained._SIGNAL_STATE_ATTEMPTS:
+            attachment_injections += 1
+            second_handler(signal.SIGINT, None)
+
+    def inject_at_terminal_raise(frame: object, event: str, _arg: object) -> object:
+        nonlocal terminal_occurrences
+        if (
+            getattr(frame, "f_code", None) is release_and_replay_code
+            and event == "line"
+            and getattr(frame, "f_lineno", None) == terminal_line
+        ):
+            terminal_occurrences += 1
+            observed = real_sigmask(signal.SIG_BLOCK, set())
+            terminal_masks.append(observed)
+            if not set(active_signals) <= observed:
+                second_handler(signal.SIGINT, None)
+        return inject_at_terminal_raise
+
+    monkeypatch.setattr(
+        contained,
+        "_attach_cleanup_error_group",
+        fail_guarded_attachments,
+    )
+    try:
+        sys.settrace(inject_at_terminal_raise)
+        with pytest.raises(BaseException) as caught:
+            restoration.release_and_replay(
+                latch,
+                previous_handlers,
+                [OSError("existing cleanup evidence")],
+                error_label="contained subprocess cleanup failures",
+            )
+    finally:
+        sys.settrace(None)
+        _restore_signal_host(host_handlers, host_mask)
+
+    assert caught.value is first
+    assert attachment_injections == contained._SIGNAL_STATE_ATTEMPTS
+    assert terminal_occurrences == 1
+    assert set(active_signals) <= terminal_masks[0]
+    cleanup_group = getattr(caught.value, "cleanup_error_group", None)
+    assert isinstance(cleanup_group, BaseExceptionGroup)
+    assert sum(error is second for error in cleanup_group.exceptions) == 1
+
+
+@pytest.mark.skipif(
+    not hasattr(signal, "pthread_sigmask"),
+    reason="atomic signal-mask arbitration requires pthread_sigmask",
+)
+def test_unmask_exception_after_mutation_restores_blocked_state_before_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_sigmask = contained.signal.pthread_sigmask
+    host_handlers, host_mask, starting_mask = _prepare_unblocked_signal_host()
+    latch = contained._ContainedSignalLatch()
+    attempt_masks: list[set[signal.Signals]] = []
+    failures: list[OSError] = []
+
+    previous_handlers, active_signals = contained._install_signal_latch(latch)
+    restoration = contained._restore_signal_handlers_atomically(
+        previous_handlers,
+        active_signals,
+        latch,
+    )
+
+    def mutate_then_fail_unmask(how: int, mask: object) -> set[signal.Signals]:
+        target = set(mask)  # type: ignore[arg-type]
+        if how == signal.SIG_SETMASK and target == starting_mask:
+            attempt_masks.append(real_sigmask(signal.SIG_BLOCK, set()))
+            real_sigmask(how, target)
+            failure = OSError(f"unmask mutation boom {len(failures) + 1}")
+            failures.append(failure)
+            raise failure
+        return real_sigmask(how, target)
+
+    monkeypatch.setattr(contained.signal, "pthread_sigmask", mutate_then_fail_unmask)
+    try:
+        with pytest.raises(OSError) as caught:
+            restoration.release_and_replay(
+                latch,
+                previous_handlers,
+                [],
+                error_label="contained subprocess cleanup failures",
+            )
+        observed_mask = real_sigmask(signal.SIG_BLOCK, set())
+    finally:
+        _restore_signal_host(host_handlers, host_mask)
+
+    assert caught.value is failures[0]
+    assert len(attempt_masks) == contained._SIGNAL_STATE_ATTEMPTS
+    assert all(set(active_signals) <= mask for mask in attempt_masks)
+    assert set(active_signals) <= observed_mask
+    assert not restoration._released
+
+
+@pytest.mark.skipif(
+    not hasattr(signal, "pthread_sigmask"),
+    reason="atomic signal-mask arbitration requires pthread_sigmask",
+)
+def test_installation_terminates_when_latch_is_unblocked_and_cannot_be_recovered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_sigmask = contained.signal.pthread_sigmask
+    host_handlers, host_mask, starting_mask = _prepare_unblocked_signal_host()
+    active = set(_MANAGED_TEST_SIGNALS)
+    release_verification_failures = 0
+    awaiting_release_verification = False
+    reblock_failures: list[OSError] = []
+    termination_states: list[tuple[set[signal.Signals], dict[int, object]]] = []
+
+    class UnsafeSignalState(BaseException):
+        pass
+
+    def fail_release_and_reblock(how: int, mask: object) -> set[signal.Signals]:
+        nonlocal awaiting_release_verification, release_verification_failures
+        target = set(mask)  # type: ignore[arg-type]
+        if how == signal.SIG_SETMASK and target == starting_mask:
+            result = real_sigmask(how, target)
+            awaiting_release_verification = True
+            return result
+        if how == signal.SIG_BLOCK and not target and awaiting_release_verification:
+            awaiting_release_verification = False
+            release_verification_failures += 1
+            raise OSError("release verification boom")
+        if release_verification_failures and (
+            (how == signal.SIG_BLOCK and active <= target)
+            or (how == signal.SIG_SETMASK and active <= target)
+        ):
+            failure = OSError(f"reblock boom {len(reblock_failures) + 1}")
+            reblock_failures.append(failure)
+            raise failure
+        return real_sigmask(how, target)
+
+    def terminate_unsafe_state(*_args: object, **_kwargs: object) -> None:
+        termination_states.append(
+            (
+                real_sigmask(signal.SIG_BLOCK, set()),
+                {signum: signal.getsignal(signum) for signum in _MANAGED_TEST_SIGNALS},
+            )
+        )
+        raise UnsafeSignalState()
+
+    monkeypatch.setattr(contained.signal, "pthread_sigmask", fail_release_and_reblock)
+    monkeypatch.setattr(
+        contained,
+        "_terminate_unsafe_signal_state",
+        terminate_unsafe_state,
+        raising=False,
+    )
+    try:
+        with pytest.raises(UnsafeSignalState):
+            contained._install_signal_latch(contained._ContainedSignalLatch())
+    finally:
+        _restore_signal_host(host_handlers, host_mask)
+
+    assert release_verification_failures >= 1
+    assert len(reblock_failures) == contained._SIGNAL_STATE_ATTEMPTS
+    assert len(termination_states) == 1
+    unsafe_mask, unsafe_handlers = termination_states[0]
+    assert not active <= unsafe_mask
+    assert all(
+        isinstance(getattr(handler, "__self__", None), contained._ContainedSignalLatch)
+        for handler in unsafe_handlers.values()
+    )
+
+
+@pytest.mark.skipif(
+    not hasattr(signal, "pthread_sigmask"),
+    reason="atomic signal-mask arbitration requires pthread_sigmask",
+)
+def test_restoration_fallback_preserves_pretransition_mask_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_sigmask = contained.signal.pthread_sigmask
+    host_handlers, host_mask, starting_mask = _prepare_unblocked_signal_host()
+    latch = contained._ContainedSignalLatch()
+    verification_failures = 0
+    awaiting_verification = False
+
+    previous_handlers, active_signals = contained._install_signal_latch(latch)
+
+    def exhaust_block_verification(how: int, mask: object) -> set[signal.Signals]:
+        nonlocal awaiting_verification, verification_failures
+        target = set(mask)  # type: ignore[arg-type]
+        if (
+            how == signal.SIG_BLOCK
+            and target
+            and verification_failures < contained._SIGNAL_STATE_ATTEMPTS
+        ):
+            result = real_sigmask(how, target)
+            awaiting_verification = True
+            return result
+        if how == signal.SIG_BLOCK and not target and awaiting_verification:
+            awaiting_verification = False
+            verification_failures += 1
+            raise OSError(f"block verification boom {verification_failures}")
+        return real_sigmask(how, target)
+
+    monkeypatch.setattr(contained.signal, "pthread_sigmask", exhaust_block_verification)
+    try:
+        restoration = contained._restore_signal_handlers_atomically(
+            previous_handlers,
+            active_signals,
+            latch,
+        )
+    finally:
+        _restore_signal_host(host_handlers, host_mask)
+
+    assert verification_failures == contained._SIGNAL_STATE_ATTEMPTS
+    assert restoration._previous_mask == starting_mask
+
+
+@pytest.mark.skipif(
+    not hasattr(signal, "pthread_sigmask"),
+    reason="atomic signal-mask arbitration requires pthread_sigmask",
+)
+def test_transient_release_failure_is_cleanup_evidence_for_existing_primary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_sigmask = contained.signal.pthread_sigmask
+    host_handlers, host_mask, starting_mask = _prepare_unblocked_signal_host()
+    latch = contained._ContainedSignalLatch()
+    primary = RuntimeError("existing primary")
+    release_failure = OSError("transient release boom")
+    release_attempts = 0
+
+    previous_handlers, active_signals = contained._install_signal_latch(latch)
+    restoration = contained._restore_signal_handlers_atomically(
+        previous_handlers,
+        active_signals,
+        latch,
+    )
+
+    def fail_first_release(how: int, mask: object) -> set[signal.Signals]:
+        nonlocal release_attempts
+        target = set(mask)  # type: ignore[arg-type]
+        if how == signal.SIG_SETMASK and target == starting_mask:
+            release_attempts += 1
+            if release_attempts == 1:
+                raise release_failure
+        return real_sigmask(how, target)
+
+    monkeypatch.setattr(
+        contained,
+        "_restore_signal_handlers_atomically",
+        lambda *_args: restoration,
+    )
+    monkeypatch.setattr(contained.signal, "pthread_sigmask", fail_first_release)
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            try:
+                raise primary
+            finally:
+                contained._finish_signal_restoration(
+                    previous_handlers,
+                    active_signals,
+                    latch,
+                    [],
+                    primary_exception=sys.exception(),
+                    error_label="contained subprocess cleanup failures",
+                )
+        observed_mask = real_sigmask(signal.SIG_BLOCK, set())
+    finally:
+        _restore_signal_host(host_handlers, host_mask)
+
+    assert caught.value is primary
+    assert release_attempts == 2
+    assert restoration._released
+    assert observed_mask == starting_mask
+    cleanup_group = getattr(caught.value, "cleanup_error_group", None)
+    assert isinstance(cleanup_group, BaseExceptionGroup)
+    assert cleanup_group.exceptions == (release_failure,)
 
 
 def test_latched_signal_replay_preserves_default_and_ignore_semantics(
