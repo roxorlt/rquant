@@ -1,0 +1,48 @@
+# ✍️ 沙盒策略参数（规格 §7 / §10 参数总表）
+#
+# 这里**只放策略参数**：阈值、窗口长度、时间窗。
+#
+# 以下东西永远不进本文件，它们属于回测底座（`engine/` 与 backtest engine），
+# 放进参数文件就等于默许它们被当成可调参数去优化收益：
+#   - 成交价假设、排队与撮合模拟
+#   - 手续费、印花税、过户费、滑点
+#   - 涨跌停 / 停牌 / 临停的可成交判定
+#   - 仓位与资金约束、容量限制
+#
+# 规格 §7 的原话：任何一次「收益提升」的实验，必须先由审计角色检查——
+# 是不是因为成交规则被放松了？
+#
+# 值全部抄自规格 §10 参数总表。打 ⚠️ 的项待标定，改动请在 experiment_log.csv
+# 记一行，写清 changed_var 与 expectation。
+
+# ── §10.1 筛选与 VP ────────────────────────────────────────────────
+vp:
+  composite_window: 60      # 复合 VP 窗口（交易日）
+  anchor_lookback: 15       # 锚点搜索范围（交易日）
+  anchor_pct_min: 7.0       # 锚点涨幅门槛，百分数口径（7.0 = 7%）
+  anchor_vol_ratio: 2.0     # 锚点量能倍数
+  anchor_avg_window: 20     # 量能基准窗口（avg20_amount）
+  avp_distance_max: 0.15    # 距锚点 POC 最大偏离，比例口径
+  bin_ratio: 0.002          # ⚠️ P1 标定：bin 宽度 = max(0.01, round(price × 该值, 2))
+  va_pct: 0.70              # 固定，不调；VPEngineConfig 有硬校验拒绝其他取值
+  hvn_threshold: 0.60       # ⚠️ P1 标定：HVN 占最大 bin 的比例
+  lvn_threshold: 0.30       # ⚠️ P1 标定：LVN 占相邻 HVN 的比例
+  lvn_min_width: 3          # ⚠️ P1 标定：LVN 最小宽度（bin 数）
+  vol_alloc_algo: uniform   # 算法 U；U/W 对照实验做完前不得切换
+
+# ── §10.2 买卖与仓位（策略侧阈值；资金约束由底座执行） ──────────────
+entry:
+  window_start: "13:30"
+  window_end: "14:30"
+  poc_buffer: 0.008         # ⚠️ P2 标定
+  shrink_ratio: 0.6         # ⚠️ P2 标定
+  add_position_time: "14:45"
+
+# ── §10.3 订阅分级 ────────────────────────────────────────────────
+subscription:
+  l1_max: 300               # ⚠️ P3 标定
+  l2_max: 30                # ⚠️ P3 标定
+  l1_to_l2_band: 0.015      # ⚠️ P3 标定
+  l2_to_l1_band: 0.025      # ⚠️ P3 标定（滞回，必须大于 l1_to_l2_band）
+  l2_downgrade_minutes: 30  # ⚠️ P3 标定
+  l2_cooldown_minutes: 15   # ⚠️ P3 标定
