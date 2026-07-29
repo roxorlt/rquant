@@ -11,6 +11,11 @@
   研究沙盒与实验协议）与交互式可视化页；P0 双闸门当日通过——K1 信号频次年化
   61,713 条（门槛 100），封单因子（封成比五分位）训练/验证双集单调（T+1 开盘溢价
   Q5−Q1 = +4.36pp / +2.83pp），溢价集中在隔夜、次日日内反向。
+- **价量分布自适应分桶入口**：`calculate_volume_profile{,_outcome}` 新增 `bin_ratio`
+  参数、`VolumeProfileRuleConfig` 新增 `bin_ratio` 字段，显式给值时按
+  `max(0.01, round(ref_price × bin_ratio, 2))` 分桶（VP 规格 §3.3.1 口径，新引擎将传
+  0.002）；默认 `None` 时完全沿用既有 `bin_pct=0.005` 口径，生产行为不变。
+
 - **iTick 平台知识库与证伪测试**：`docs/vendor/itick/` 收录官方文档 76 页全量抓取、
   外部尽调评估（EVALUATION.md）与 `tools/bar_consistency.py`；云端 crontab 自动
   采集→比对→PushDeer 推送。Day1 实测：量比 1.000（成交量完整）、A 股实为 3 秒
@@ -52,6 +57,14 @@
   `0.25.4` 更新到 `0.26.0`。
 
 ### Fixed
+
+- **价值区算法缺陷 G20（`_value_area`）**：旧实现按成交量降序取 top-N 再取 min/max，
+  被选中的 bin 不要求连续，双峰分布（箱体上下沿各一峰）下会把中间低成交区一并圈进
+  价值区，VA 被系统性拉宽。改为标准 Market Profile 算法——从 POC 出发逐 bin 向成交量
+  更大的一侧连续扩展至 70%，某侧到边界后只向另一侧扩；POC 并列时取离参考价最近的 bin，
+  与 VA 共用同一裁决，保证 `value_area_low ≤ poc_price ≤ value_area_high`。
+  云端 50 只真实样本（2026-07-28，lookback 90）：VA 宽度中位数收窄 26.9%，49 只变窄
+  1 只持平，POC 50 只全部未变。依赖 `volume_profile` 风控计划的历史实验需重跑。
 
 - **30 分钟脉搏 Push 手机端字段堆叠**：正文改为“市场温度 / 新晋涨停 / 题材热度 /
   放量异动”四个 Markdown 分节，市场计数拆成两行，股票与题材逐项展示；标题摘要、槽位
