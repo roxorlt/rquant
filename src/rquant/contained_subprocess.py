@@ -369,6 +369,7 @@ class _SignalRestoration(list[BaseException]):
             else None
         )
         invocation_tracker: _SignalHandlerInvocationTracker | None = None
+        release_attempts = _SIGNAL_STATE_ATTEMPTS
         candidate_tracker = _SignalHandlerInvocationTracker(previous_handlers)
         if candidate_tracker.handlers and self._handlers_restored:
             self._fail_closed(
@@ -385,8 +386,11 @@ class _SignalRestoration(list[BaseException]):
                     previous_handlers,
                     cleanup_errors,
                 )
-                return
-        for _attempt in range(_SIGNAL_STATE_ATTEMPTS):
+                if protected_replay_error is not None:
+                    release_attempts = 0
+                else:
+                    return
+        for _attempt in range(release_attempts):
             try:
                 if not self._released:
                     self.release()
