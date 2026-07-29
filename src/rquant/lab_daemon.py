@@ -2425,6 +2425,8 @@ class LabDaemonLock:
         parent_descriptor, self._parent_descriptor = self._parent_descriptor, -1
         try:
             if descriptor >= 0:
+                # A readiness lease is a dup of this open-file description; LOCK_UN here
+                # would release singleton authority before its heartbeat thread exits.
                 os.close(descriptor)
         finally:
             if root_descriptor >= 0:

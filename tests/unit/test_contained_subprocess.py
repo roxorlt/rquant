@@ -360,6 +360,35 @@ def test_execution_timeout_remains_primary_when_tracker_close_fails(tmp_path: Pa
     assert any("close boom" in str(error) for error in cleanup_group.exceptions)
 
 
+def test_primary_exception_object_is_preserved_when_cleanup_also_fails(tmp_path: Path) -> None:
+    tracker = _CloseFailingKernelTracker()
+    primary = RuntimeError("primary execution failure")
+    real_inventory = contained.process_inventory
+    calls = 0
+
+    def failing_inventory(deadline: float) -> dict[int, contained._ProcessObservation]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise primary
+        return real_inventory(deadline)
+
+    with pytest.raises(RuntimeError) as caught:
+        contained.run_contained(
+            [sys.executable, "-c", "pass"],
+            cwd=tmp_path,
+            deadline_monotonic=time.monotonic() + 2,
+            inventory_provider=failing_inventory,
+            kernel_tracker_factory=lambda: tracker,
+            may_spawn_background_descendants=False,
+        )
+
+    assert caught.value is primary
+    cleanup_group = getattr(caught.value, "cleanup_error_group", None)
+    assert isinstance(cleanup_group, BaseExceptionGroup)
+    assert any("close boom" in str(error) for error in cleanup_group.exceptions)
+
+
 def test_nested_run_restores_outer_then_original_signal_handlers(tmp_path: Path) -> None:
     before = {signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)}
     cancellation_checks = 0
