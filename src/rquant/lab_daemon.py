@@ -1571,6 +1571,10 @@ class LabSqliteAuthority:
     def _identity(observed: os.stat_result) -> tuple[int, int]:
         return observed.st_dev, observed.st_ino
 
+    @property
+    def database_generation(self) -> tuple[int, int]:
+        return self._identity(self._database_identity)
+
     def assert_current(self) -> None:
         if self._parent_descriptor < 0 or self._database_descriptor < 0:
             raise LabDaemonConfigurationError(f"{self.label} authority is closed")

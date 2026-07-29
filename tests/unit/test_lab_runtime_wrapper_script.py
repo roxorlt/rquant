@@ -29,6 +29,31 @@ STRICT_JSON = ROOT / "scripts" / "strict_json.py"
 _ORIGINAL_OS_WALK = os.walk
 
 
+@pytest.mark.parametrize("script", (WRAPPER, BOOTSTRAP))
+def test_daemon_release_authority_inherits_original_startup_deadline(script: Path) -> None:
+    tree = ast.parse(script.read_text(encoding="utf-8"), filename=str(script))
+    constructors = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "ReleaseGenerationAuthority"
+    ]
+
+    assert constructors
+    for constructor in constructors:
+        deadlines = {
+            keyword.arg: keyword.value
+            for keyword in constructor.keywords
+            if keyword.arg is not None
+        }
+        assert "overall_deadline_monotonic" in deadlines
+        assert isinstance(deadlines["overall_deadline_monotonic"], ast.Name)
+        assert deadlines["overall_deadline_monotonic"].id in {
+            "startup_deadline",
+        }
+
+
 def _complete_deployment_intent(
     authority: ReleaseGenerationAuthority,
     *,
@@ -192,8 +217,10 @@ def _runtime_checkout(
     checkout = tmp_path / "checkout"
     scripts = checkout / "scripts"
     package = checkout / "src" / "rquant"
+    launchd = checkout / "deploy" / "launchd"
     scripts.mkdir(parents=True)
     package.mkdir(parents=True)
+    launchd.mkdir(parents=True)
     shutil.copy2(WRAPPER, scripts / WRAPPER.name)
     shutil.copy2(PREFLIGHT, scripts / PREFLIGHT.name)
     shutil.copy2(BOOTSTRAP, scripts / BOOTSTRAP.name)
@@ -201,6 +228,12 @@ def _runtime_checkout(
     shutil.copy2(RELEASE_AUTHORITY, package / RELEASE_AUTHORITY.name)
     shutil.copy2(CANONICAL_STRICT_JSON, package / CANONICAL_STRICT_JSON.name)
     shutil.copy2(CONTAINED_SUBPROCESS, package / CONTAINED_SUBPROCESS.name)
+    for label in (
+        "com.roxor.rquant-lab-scheduler",
+        "com.roxor.rquant-lab-worker",
+        "com.roxor.rquant-lab-finalizer",
+    ):
+        (launchd / f"{label}.plist").write_text(f"{label}\n", encoding="utf-8")
     subprocess.run(["git", "init", "-q"], cwd=checkout, check=True)
     (checkout / ".gitignore").write_text(
         "/.env\n/.venv\n__pycache__/\n*.pyc\n*.pyo\n*.so\n*.dylib\n*.pyd\n",
@@ -312,12 +345,41 @@ def _write_lab_installation(
     labels: tuple[str, ...],
 ) -> dict[str, object]:
     path = lock_path.with_name(f"{lock_path.stem}.lab-install.json")
+    commit = subprocess.run(
+        [str(TRUSTED_GIT), "rev-parse", "HEAD"],
+        cwd=checkout,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    runtime_root = checkout / "data" / "lab-runtime"
+    runtime_observed = runtime_root.stat()
+    sentinel = json.loads((runtime_root / ".prepared.json").read_text(encoding="utf-8"))
+    plists: dict[str, dict[str, object]] = {}
+    for label in labels:
+        plist = checkout / "deploy" / "launchd" / f"{label}.plist"
+        observed = plist.stat()
+        plists[label] = {
+            "path": str(plist),
+            "sha256": hashlib.sha256(plist.read_bytes()).hexdigest(),
+            "device": observed.st_dev,
+            "inode": observed.st_ino,
+        }
     payload = {
         "schema_version": 2,
         "checkout_root": str(checkout),
         "labels": list(labels),
-        "plists": {label: {} for label in labels},
-        "readiness_root": str(checkout / "data" / "lab-runtime" / "readiness"),
+        "plists": plists,
+        "runtime_root": str(runtime_root),
+        "readiness_root": str(runtime_root / "readiness"),
+        "registered_by_commit": commit,
+        "prepared_authority": {
+            "runtime_authority_id": sentinel["runtime_authority_id"],
+            "runtime_root": str(runtime_root),
+            "runtime_device": runtime_observed.st_dev,
+            "runtime_inode": runtime_observed.st_ino,
+        },
+        "installed_at": "2026-07-28T00:00:00+00:00",
     }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     path.write_bytes(canonical + b"\n")

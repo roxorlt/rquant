@@ -241,6 +241,190 @@ class LabInstallationIdentity:
 
 
 @dataclass(frozen=True)
+class LabRuntimePreparedIdentity:
+    runtime_authority_id: str
+    runtime_root: str
+    runtime_device: int
+    runtime_inode: int
+
+    @classmethod
+    def from_payload(cls, payload: object) -> LabRuntimePreparedIdentity:
+        expected = {
+            "runtime_authority_id",
+            "runtime_root",
+            "runtime_device",
+            "runtime_inode",
+        }
+        if (
+            type(payload) is not dict
+            or set(payload) != expected
+            or type(payload["runtime_authority_id"]) is not str
+            or re.fullmatch(r"[0-9a-f]{32}", payload["runtime_authority_id"]) is None
+            or type(payload["runtime_root"]) is not str
+            or type(payload["runtime_device"]) is not int
+            or type(payload["runtime_inode"]) is not int
+        ):
+            raise ReleaseGenerationError("registered Lab prepared authority is invalid")
+        return cls(**payload)
+
+
+def _lab_installation_plists(
+    payload: object,
+    *,
+    expected_names: tuple[str, ...],
+    label: str,
+) -> tuple[tuple[str, LabInstallationIdentity], ...]:
+    if type(payload) is not dict or set(payload) != set(expected_names):
+        raise ReleaseGenerationError(f"{label} plist bindings are invalid")
+    return tuple(
+        (name, LabInstallationIdentity.from_payload(payload[name])) for name in expected_names
+    )
+
+
+@dataclass(frozen=True)
+class LabRegisteredInstallationAuthority:
+    checkout_root: str
+    labels: tuple[str, ...]
+    plists: tuple[tuple[str, LabInstallationIdentity], ...]
+    runtime_root: str
+    readiness_root: str
+    registered_by_commit: str
+    prepared_authority: LabRuntimePreparedIdentity
+    installed_at: str
+    environment_generation_id: str
+    handoff_operation_id: str
+
+    @classmethod
+    def from_payload(cls, payload: object) -> LabRegisteredInstallationAuthority:
+        base_fields = {
+            "schema_version",
+            "checkout_root",
+            "labels",
+            "plists",
+            "runtime_root",
+            "readiness_root",
+            "registered_by_commit",
+            "prepared_authority",
+            "installed_at",
+        }
+        installed_fields = {"environment_generation_id", "handoff_operation_id"}
+        if type(payload) is not dict or set(payload) not in (
+            base_fields,
+            base_fields | installed_fields,
+        ):
+            raise ReleaseGenerationError("registered Lab installation authority is invalid")
+        labels = payload.get("labels")
+        installed = installed_fields <= set(payload)
+        try:
+            installed_at = datetime.fromisoformat(payload["installed_at"])
+        except (TypeError, ValueError):
+            installed_at = None
+        if (
+            type(payload["schema_version"]) is not int
+            or payload["schema_version"] != 2
+            or type(payload["checkout_root"]) is not str
+            or type(labels) is not list
+            or tuple(labels) != LAB_LAUNCHD_HANDOFF_LABELS
+            or any(type(value) is not str for value in labels)
+            or type(payload["runtime_root"]) is not str
+            or type(payload["readiness_root"]) is not str
+            or type(payload["registered_by_commit"]) is not str
+            or re.fullmatch(r"[0-9a-f]{40}", payload["registered_by_commit"]) is None
+            or type(payload["installed_at"]) is not str
+            or installed_at is None
+            or installed_at.tzinfo is None
+            or installed_at.utcoffset() is None
+        ):
+            raise ReleaseGenerationError("registered Lab installation authority is invalid")
+        generation_id = payload.get("environment_generation_id", "")
+        handoff_id = payload.get("handoff_operation_id", "")
+        if installed and (
+            type(generation_id) is not str
+            or GENERATION_ID_PATTERN.fullmatch(generation_id) is None
+            or type(handoff_id) is not str
+            or (handoff_id != "" and re.fullmatch(r"[0-9a-f]{32}", handoff_id) is None)
+        ):
+            raise ReleaseGenerationError("registered Lab installation authority is invalid")
+        return cls(
+            checkout_root=payload["checkout_root"],
+            labels=tuple(labels),
+            plists=_lab_installation_plists(
+                payload["plists"],
+                expected_names=LAB_LAUNCHD_HANDOFF_LABELS,
+                label="registered Lab installation",
+            ),
+            runtime_root=payload["runtime_root"],
+            readiness_root=payload["readiness_root"],
+            registered_by_commit=payload["registered_by_commit"],
+            prepared_authority=LabRuntimePreparedIdentity.from_payload(
+                payload["prepared_authority"]
+            ),
+            installed_at=payload["installed_at"],
+            environment_generation_id=generation_id,
+            handoff_operation_id=handoff_id,
+        )
+
+    @property
+    def is_installed(self) -> bool:
+        return bool(self.environment_generation_id)
+
+    def plist_map(self) -> dict[str, LabInstallationIdentity]:
+        return dict(self.plists)
+
+
+@dataclass(frozen=True)
+class LabLocalInstallationAuthority:
+    code_sha: str
+    environment_generation_id: str
+    handoff_operation_id: str
+    launch_agents_dir: str
+    plists: tuple[tuple[str, LabInstallationIdentity], ...]
+
+    @classmethod
+    def from_payload(cls, payload: object) -> LabLocalInstallationAuthority:
+        expected = {
+            "schema_version",
+            "code_sha",
+            "environment_generation_id",
+            "handoff_operation_id",
+            "launch_agents_dir",
+            "plists",
+        }
+        if (
+            type(payload) is not dict
+            or set(payload) != expected
+            or type(payload["schema_version"]) is not int
+            or payload["schema_version"] != 2
+            or type(payload["code_sha"]) is not str
+            or re.fullmatch(r"[0-9a-f]{40}", payload["code_sha"]) is None
+            or type(payload["environment_generation_id"]) is not str
+            or GENERATION_ID_PATTERN.fullmatch(payload["environment_generation_id"]) is None
+            or type(payload["handoff_operation_id"]) is not str
+            or (
+                payload["handoff_operation_id"] != ""
+                and re.fullmatch(r"[0-9a-f]{32}", payload["handoff_operation_id"]) is None
+            )
+            or type(payload["launch_agents_dir"]) is not str
+        ):
+            raise ReleaseGenerationError("local Lab installation authority is invalid")
+        names = tuple(f"{label}.plist" for label in LAB_LAUNCHD_HANDOFF_LABELS)
+        return cls(
+            code_sha=payload["code_sha"],
+            environment_generation_id=payload["environment_generation_id"],
+            handoff_operation_id=payload["handoff_operation_id"],
+            launch_agents_dir=payload["launch_agents_dir"],
+            plists=_lab_installation_plists(
+                payload["plists"],
+                expected_names=names,
+                label="local Lab installation",
+            ),
+        )
+
+    def plist_map(self) -> dict[str, LabInstallationIdentity]:
+        return dict(self.plists)
+
+
+@dataclass(frozen=True)
 class LabHandoffRecord:
     schema_version: int
     operation_id: str
@@ -2775,6 +2959,150 @@ class ReleaseGenerationAuthority:
         finally:
             os.close(root_fd)
 
+    def _verify_installation_file_binding(
+        self,
+        binding: LabInstallationIdentity,
+        *,
+        expected_path: Path,
+        private: bool,
+    ) -> None:
+        self._checkpoint()
+        path = _canonical(expected_path, label="Lab installation plist")
+        if binding.path != str(path):
+            raise ReleaseGenerationError("Lab installation plist binding path changed")
+        try:
+            if path.resolve(strict=True) != path:
+                raise ReleaseGenerationError("Lab installation plist path is not physical")
+            parent_fd = os.open(
+                path.parent,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            )
+        except OSError as exc:
+            raise ReleaseGenerationError("Lab installation plist is unavailable") from exc
+        descriptor = -1
+        try:
+            descriptor = os.open(
+                path.name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_fd,
+            )
+            before = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_uid != os.getuid()
+                or before.st_nlink != 1
+                or (private and stat.S_IMODE(before.st_mode) != 0o600)
+            ):
+                raise ReleaseGenerationError("Lab installation plist identity is unsafe")
+            digest = hashlib.sha256()
+            total = 0
+            while True:
+                self._checkpoint()
+                chunk = os.read(descriptor, min(64 * 1024, 1024 * 1024 + 1 - total))
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > 1024 * 1024:
+                    raise ReleaseGenerationError("Lab installation plist is too large")
+                digest.update(chunk)
+            after = os.fstat(descriptor)
+            active = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+            expected_identity = (binding.device, binding.inode)
+            if (
+                (before.st_dev, before.st_ino) != expected_identity
+                or (after.st_dev, after.st_ino) != expected_identity
+                or (active.st_dev, active.st_ino) != expected_identity
+                or digest.hexdigest() != binding.sha256
+            ):
+                raise ReleaseGenerationError("Lab installation plist binding changed")
+        except OSError as exc:
+            raise ReleaseGenerationError("Lab installation plist binding is unavailable") from exc
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            os.close(parent_fd)
+        self._checkpoint()
+
+    def _validate_lab_installation_authorities(
+        self,
+        *,
+        local_payload: dict[str, Any] | None,
+        registered_payload: dict[str, Any] | None,
+    ) -> tuple[LabLocalInstallationAuthority | None, LabRegisteredInstallationAuthority | None]:
+        local = (
+            None
+            if local_payload is None
+            else LabLocalInstallationAuthority.from_payload(local_payload)
+        )
+        registered = (
+            None
+            if registered_payload is None
+            else LabRegisteredInstallationAuthority.from_payload(registered_payload)
+        )
+        if local is not None and registered is None:
+            raise ReleaseGenerationError("registered Lab installation authority is missing")
+        if registered is None:
+            return local, None
+        checkout_root = _canonical(
+            Path(registered.checkout_root),
+            label="Lab installation checkout",
+        )
+        if checkout_root != self.repo or checkout_root.resolve(strict=True) != checkout_root:
+            raise ReleaseGenerationError("registered Lab installation checkout binding changed")
+        runtime_root = _canonical(Path(registered.runtime_root), label="Lab runtime root")
+        readiness_root = _canonical(Path(registered.readiness_root), label="Lab readiness root")
+        runtime_fd, runtime_identity = _private_lock_root(runtime_root)
+        os.close(runtime_fd)
+        readiness_fd, _readiness_identity = _private_lock_root(readiness_root)
+        os.close(readiness_fd)
+        prepared = registered.prepared_authority
+        if (
+            readiness_root.parent != runtime_root
+            or prepared.runtime_root != str(runtime_root)
+            or (prepared.runtime_device, prepared.runtime_inode)
+            != (runtime_identity.device, runtime_identity.inode)
+        ):
+            raise ReleaseGenerationError("registered Lab runtime authority binding changed")
+        registered_plists = registered.plist_map()
+        if local is None:
+            if registered.is_installed:
+                raise ReleaseGenerationError("local Lab installation authority is missing")
+            for label in LAB_LAUNCHD_HANDOFF_LABELS:
+                self._verify_installation_file_binding(
+                    registered_plists[label],
+                    expected_path=checkout_root / "deploy" / "launchd" / f"{label}.plist",
+                    private=False,
+                )
+            return None, registered
+        if (
+            not registered.is_installed
+            or local.code_sha != registered.registered_by_commit
+            or local.environment_generation_id != registered.environment_generation_id
+            or local.handoff_operation_id != registered.handoff_operation_id
+        ):
+            raise ReleaseGenerationError(
+                "local and registered Lab installation authorities diverged"
+            )
+        launch_agents = _canonical(
+            Path(local.launch_agents_dir),
+            label="Lab launch agents directory",
+        )
+        launch_fd, _launch_identity = _private_lock_root(launch_agents)
+        os.close(launch_fd)
+        local_plists = local.plist_map()
+        for label in LAB_LAUNCHD_HANDOFF_LABELS:
+            local_binding = local_plists[f"{label}.plist"]
+            if local_binding != registered_plists[label]:
+                raise ReleaseGenerationError(
+                    "local and registered Lab installation plist bindings diverged"
+                )
+            self._verify_installation_file_binding(
+                local_binding,
+                expected_path=launch_agents / f"{label}.plist",
+                private=True,
+            )
+        return local, registered
+
     def _retained_environment_ids(self, environment_fd: int) -> set[str]:
         """Collect every generation named by a durable release/Lab authority."""
 
@@ -2924,47 +3252,20 @@ class ReleaseGenerationAuthority:
             registered_install_path,
             maximum_bytes=MAX_INTENT_BYTES,
         )
-        if local_install is not None:
-            required_local = {
-                "schema_version",
-                "code_sha",
-                "environment_generation_id",
-                "handoff_operation_id",
-                "launch_agents_dir",
-                "plists",
-            }
-            if (
-                set(local_install) != required_local
-                or local_install.get("schema_version") != 2
-                or not isinstance(local_install.get("plists"), dict)
-                or type(local_install.get("handoff_operation_id")) is not str
-            ):
-                raise ReleaseGenerationError("local Lab installation authority is invalid")
+        local_authority, registered_authority = self._validate_lab_installation_authorities(
+            local_payload=local_install,
+            registered_payload=registered_install,
+        )
+        if local_authority is not None:
             references.add(
-                local_install["environment_generation_id"],
+                local_authority.environment_generation_id,
                 source="local Lab installation",
             )
-        if registered_install is not None:
-            if (
-                registered_install.get("schema_version") != 2
-                or registered_install.get("labels") != list(LAB_LAUNCHD_HANDOFF_LABELS)
-                or not isinstance(registered_install.get("plists"), dict)
-                or set(registered_install["plists"]) != set(LAB_LAUNCHD_HANDOFF_LABELS)
-            ):
-                raise ReleaseGenerationError("registered Lab installation authority is invalid")
-            registered_generation = registered_install.get("environment_generation_id")
-            if registered_generation is not None:
-                references.add(
-                    registered_generation,
-                    source="registered Lab installation",
-                )
-        if local_install is not None and registered_install is None:
-            raise ReleaseGenerationError("registered Lab installation authority is missing")
-        if local_install is not None and (
-            registered_install.get("environment_generation_id")
-            != local_install["environment_generation_id"]
-        ):
-            raise ReleaseGenerationError("Lab installation generation authorities diverged")
+        if registered_authority is not None and registered_authority.is_installed:
+            references.add(
+                registered_authority.environment_generation_id,
+                source="registered Lab installation",
+            )
 
         install_transaction_path = self.lock_path.with_name(
             f"{self.lock_path.stem}.lab-install-transaction.json"
@@ -2978,11 +3279,11 @@ class ReleaseGenerationAuthority:
                 "unfinished Lab installation transaction blocks generation GC"
             )
 
-        if registered_install is not None:
-            readiness_value = registered_install.get("readiness_root")
-            if type(readiness_value) is not str:
-                raise ReleaseGenerationError("registered Lab readiness root is invalid")
-            readiness_root = _canonical(Path(readiness_value), label="Lab readiness root")
+        if registered_authority is not None:
+            readiness_root = _canonical(
+                Path(registered_authority.readiness_root),
+                label="Lab readiness root",
+            )
             readiness_fd, readiness_identity = _private_lock_root(readiness_root)
             try:
                 for label in LAB_LAUNCHD_HANDOFF_LABELS:
@@ -3660,8 +3961,10 @@ class ReleaseGenerationAuthority:
         provisional_handoff_label: str | None = None,
         provisional_installation_operation_id: str | None = None,
     ) -> ReleaseGenerationMarker:
+        self._checkpoint()
         self._assert_lock()
         published = self._read_marker()
+        self._checkpoint()
         if published.schema_version != MARKER_SCHEMA_VERSION:
             raise ReleaseGenerationError("release generation marker schema is unsupported")
         if published.commit != expected_commit:
@@ -3692,6 +3995,7 @@ class ReleaseGenerationAuthority:
             except ReleaseGenerationError as exc:
                 raise ReleaseGenerationError("release generation commit record is missing") from exc
         manifest, _manifest_identity = self._read_environment_manifest(selector)
+        self._checkpoint()
         current = self._facts(
             expected_commit=expected_commit,
             selector=selector,

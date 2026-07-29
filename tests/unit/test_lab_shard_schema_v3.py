@@ -77,7 +77,24 @@ def _create_real_v2_fixture(path: Path) -> tuple[str, str]:
     return job_id, shard_id
 
 
-def test_initialize_creates_v5_result_and_telemetry_columns(tmp_path: Path) -> None:
+def _assert_v6_epoch_authority(connection: sqlite3.Connection) -> int:
+    epoch_row = connection.execute(
+        "SELECT singleton, mutation_epoch FROM lab_ledger_epoch"
+    ).fetchone()
+    assert epoch_row is not None
+    assert int(epoch_row[0]) == 1
+    assert int(epoch_row[1]) >= 0
+    epoch_triggers = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'trg_lab_epoch_%'"
+        )
+    }
+    assert epoch_triggers == set(lab_jobs._LEDGER_EPOCH_TRIGGER_SQL)
+    return int(epoch_row[1])
+
+
+def test_initialize_creates_v6_result_telemetry_and_epoch_authority(tmp_path: Path) -> None:
     store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
     store.initialize()
 
@@ -92,10 +109,13 @@ def test_initialize_creates_v5_result_and_telemetry_columns(tmp_path: Path) -> N
         report_columns = {
             str(row[1]) for row in connection.execute("PRAGMA table_info(lab_worker_report)")
         }
+        epoch = _assert_v6_epoch_authority(connection)
 
-    assert version == 5
+    assert version == LabJobStore.SCHEMA_VERSION == 6
+    assert epoch == 0
     assert "lab_worker_report" in tables
     assert "lab_scheduler_state" in tables
+    assert "lab_ledger_epoch" in tables
     assert "result_contract_version" in job_columns
     assert "result_state" in job_columns
     assert {
@@ -389,7 +409,8 @@ def test_initialize_migrates_real_v2_shard_and_backfills_readable_identity(
     assert shard.result_manifest_hash is None
 
     with sqlite3.connect(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        _assert_v6_epoch_authority(connection)
         assert connection.execute("SELECT COUNT(*) FROM lab_command").fetchone()[0] == 2
 
 
@@ -839,7 +860,8 @@ def test_initialize_migrates_v3_additively_without_inventing_legacy_telemetry(
 
     with sqlite3.connect(path) as connection:
         connection.row_factory = sqlite3.Row
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        _assert_v6_epoch_authority(connection)
         migrated_job = connection.execute(
             "SELECT * FROM lab_job WHERE job_id = ?", (job_id,)
         ).fetchone()

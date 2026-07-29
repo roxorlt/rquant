@@ -249,6 +249,7 @@ def main(argv: list[str] | None = None) -> int:
                 lock_fd=args.deployment_lock_fd,
                 python_path=Path(sys.executable),
                 git_path=_canonical(args.trusted_git_path, label="trusted Git path"),
+                overall_deadline_monotonic=startup_deadline,
             ).verify(
                 expected_commit=args.expected_commit,
                 provisional_handoff_label=args.provisional_handoff_label,

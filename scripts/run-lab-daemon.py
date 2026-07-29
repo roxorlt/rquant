@@ -532,6 +532,7 @@ def _immutable_generation_main(
         lock_fd=lock_fd,
         python_path=python,
         git_path=trusted_git,
+        overall_deadline_monotonic=startup_deadline,
     ).verify(expected_commit=expected_commit, provisional_handoff_label=handoff_label)
     if Path(marker.venv_path) != generation or Path(marker.python_path) != python:
         raise WrapperError("selected immutable release generation changed")
@@ -702,6 +703,7 @@ def main(argv: list[str] | None = None) -> int:
                 lock_fd=generation_lock_fd,
                 python_path=python,
                 git_path=trusted_git,
+                overall_deadline_monotonic=startup_deadline,
             ).verify(
                 expected_commit=expected_commit,
                 provisional_handoff_label=handoff_label,
@@ -835,6 +837,7 @@ def main(argv: list[str] | None = None) -> int:
             lock_fd=generation_lock_fd,
             python_path=selected_python,
             git_path=trusted_git,
+            overall_deadline_monotonic=startup_deadline,
         ).verify(
             expected_commit=expected_commit,
             provisional_handoff_label=handoff_label,

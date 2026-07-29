@@ -137,7 +137,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, str]:
         "readiness_root": str(readiness_root),
         "registered_by_commit": commit,
         "prepared_authority": {
-            "runtime_authority_id": "a" * 64,
+            "runtime_authority_id": "a" * 32,
             "runtime_root": str(runtime_root),
             "runtime_device": runtime_root.stat().st_dev,
             "runtime_inode": runtime_root.stat().st_ino,
@@ -838,6 +838,140 @@ def test_interrupted_install_journal_restores_exact_authority_on_next_run(
     for label in LAB_LAUNCHD_LABELS:
         path = launch_agents / f"{label}.plist"
         assert registered["plists"][label]["inode"] == path.stat().st_ino
+
+
+def test_transaction_update_cas_never_overwrites_concurrent_successor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, lock, launch_agents, _commit = _fixture(tmp_path)
+    installer = LabLaunchdInstaller(
+        checkout_root=repo,
+        deployment_lock_path=lock,
+        launch_agents_dir=launch_agents,
+        trusted_git_path=TRUSTED_GIT,
+        runner=_Runner(),
+    )
+    transaction = installer._begin_transaction(action="install", previously_loaded=set())
+    journal = lock.with_name(f"{lock.stem}.lab-install-transaction.json")
+    concurrent = {**transaction, "stage": "committed"}
+    concurrent_bytes = canonical_json_bytes(concurrent, trailing_newline=True)
+    real_rename = install_module.rename_noreplace_at
+    injected = False
+
+    def race(
+        source_dir_fd: int,
+        source_name: str,
+        destination_dir_fd: int,
+        destination_name: str,
+    ) -> None:
+        nonlocal injected
+        if (
+            not injected
+            and source_name == journal.name
+            and destination_name.endswith(".update-backup")
+        ):
+            injected = True
+            os.unlink(source_name, dir_fd=source_dir_fd)
+            descriptor = os.open(
+                source_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=source_dir_fd,
+            )
+            os.write(descriptor, concurrent_bytes)
+            os.fsync(descriptor)
+            os.close(descriptor)
+        real_rename(source_dir_fd, source_name, destination_dir_fd, destination_name)
+
+    monkeypatch.setattr(install_module, "rename_noreplace_at", race)
+
+    with pytest.raises(LabLaunchdInstallError, match="changed|CAS"):
+        installer._save_transaction(transaction, stage="mutating")
+
+    assert journal.read_bytes() == concurrent_bytes
+
+
+def test_transaction_successor_accepts_one_time_replacement_arm() -> None:
+    original = {
+        "path": "/tmp/example",
+        "backup": ".example.rollback",
+        "existed": True,
+        "sha256": "a" * 64,
+        "device": 1,
+        "inode": 2,
+        "replacement_sha256": None,
+        "replacement_device": None,
+        "replacement_inode": None,
+    }
+    previous = {
+        "schema_version": 1,
+        "operation_id": "a" * 32,
+        "action": "install",
+        "stage": "mutating",
+        "checkout_root": "/tmp/repo",
+        "launch_agents_dir": "/tmp/agents",
+        "previously_loaded": [],
+        "files": [original],
+    }
+    current = {
+        **previous,
+        "files": [
+            {
+                **original,
+                "replacement_sha256": "b" * 64,
+                "replacement_device": 3,
+                "replacement_inode": 4,
+            }
+        ],
+    }
+
+    assert LabLaunchdInstaller._transaction_successor(previous, current)
+
+
+@pytest.mark.parametrize(
+    "fault_stage",
+    ("transaction-authority-quarantined", "transaction-authority-published"),
+)
+def test_transaction_authority_update_crash_is_reconciled(
+    tmp_path: Path,
+    fault_stage: str,
+) -> None:
+    repo, lock, launch_agents, _commit = _fixture(tmp_path)
+
+    class SimulatedCrash(BaseException):
+        pass
+
+    armed = False
+
+    def crash(stage: str) -> None:
+        nonlocal armed
+        if armed and stage == fault_stage:
+            raise SimulatedCrash
+
+    installer = LabLaunchdInstaller(
+        checkout_root=repo,
+        deployment_lock_path=lock,
+        launch_agents_dir=launch_agents,
+        trusted_git_path=TRUSTED_GIT,
+        runner=_Runner(),
+        mutation_hook=crash,
+    )
+    transaction = installer._begin_transaction(action="install", previously_loaded=set())
+    armed = True
+    with pytest.raises(SimulatedCrash):
+        installer._save_transaction(transaction, stage="mutating")
+
+    recovered = LabLaunchdInstaller(
+        checkout_root=repo,
+        deployment_lock_path=lock,
+        launch_agents_dir=launch_agents,
+        trusted_git_path=TRUSTED_GIT,
+        runner=_Runner(),
+    )._transaction()
+
+    assert recovered["operation_id"] == transaction["operation_id"]
+    assert not lock.with_name(f".{lock.stem}.lab-install-transaction.json.update-backup").exists()
 
 
 def test_installation_transaction_lock_serializes_installer_and_handoff(

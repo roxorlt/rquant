@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from rquant.release_generation import (
+    LAB_LAUNCHD_HANDOFF_LABELS,
     DeploymentIntent,
     EnvironmentSelector,
     LabHandoffRecord,
@@ -38,6 +39,7 @@ from rquant.release_generation import (
     prepared_intent_path_for_lock,
     validate_lab_handoff_supersede_chain,
 )
+from rquant.strict_json import canonical_json_bytes
 
 _ORIGINAL_OS_WALK = os.walk
 
@@ -187,6 +189,72 @@ def _write_lab_installation(repo: Path, lock_path: Path) -> dict[str, object]:
             inode=observed.st_ino,
         )
     )
+
+
+def _write_gc_lab_installation(
+    tmp_path: Path,
+    repo: Path,
+    lock_path: Path,
+    *,
+    code_sha: str,
+    generation_id: str,
+) -> tuple[Path, Path, dict[str, object], dict[str, object]]:
+    launch_agents = tmp_path / "LaunchAgents"
+    launch_agents.mkdir(mode=0o700)
+    runtime_root = tmp_path / "lab-runtime"
+    readiness_root = runtime_root / "readiness"
+    readiness_root.mkdir(parents=True, mode=0o700)
+    runtime_root.chmod(0o700)
+    readiness_root.chmod(0o700)
+    runtime_stat = runtime_root.stat()
+    installed_bindings: dict[str, dict[str, object]] = {}
+    for label in LAB_LAUNCHD_HANDOFF_LABELS:
+        path = launch_agents / f"{label}.plist"
+        path.write_text(f"{label}:{generation_id}\n", encoding="utf-8")
+        path.chmod(0o600)
+        observed = path.stat()
+        installed_bindings[label] = {
+            "path": str(path),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "device": observed.st_dev,
+            "inode": observed.st_ino,
+        }
+    handoff_operation_id = "7" * 32
+    registered: dict[str, object] = {
+        "schema_version": 2,
+        "checkout_root": str(repo),
+        "labels": list(LAB_LAUNCHD_HANDOFF_LABELS),
+        "plists": installed_bindings,
+        "runtime_root": str(runtime_root),
+        "readiness_root": str(readiness_root),
+        "registered_by_commit": code_sha,
+        "prepared_authority": {
+            "runtime_authority_id": "6" * 32,
+            "runtime_root": str(runtime_root),
+            "runtime_device": runtime_stat.st_dev,
+            "runtime_inode": runtime_stat.st_ino,
+        },
+        "installed_at": "2026-07-29T00:00:00+00:00",
+        "environment_generation_id": generation_id,
+        "handoff_operation_id": handoff_operation_id,
+    }
+    local: dict[str, object] = {
+        "schema_version": 2,
+        "code_sha": code_sha,
+        "environment_generation_id": generation_id,
+        "handoff_operation_id": handoff_operation_id,
+        "launch_agents_dir": str(launch_agents),
+        "plists": {
+            f"{label}.plist": installed_bindings[label] for label in LAB_LAUNCHD_HANDOFF_LABELS
+        },
+    }
+    registered_path = lock_path.with_name(f"{lock_path.stem}.lab-install.json")
+    registered_path.write_bytes(canonical_json_bytes(registered, trailing_newline=True))
+    registered_path.chmod(0o600)
+    local_path = lock_path.with_name(f"{lock_path.stem}.lab-local-install.json")
+    local_path.write_bytes(canonical_json_bytes(local, trailing_newline=True))
+    local_path.chmod(0o600)
+    return local_path, registered_path, local, registered
 
 
 def _deployment_intent_payload() -> dict[str, object]:
@@ -2133,6 +2201,24 @@ def test_generation_authority_recovery_cannot_extend_expired_global_deadline(
     os.close(lock_fd)
 
 
+def test_generation_verify_cannot_refresh_expired_startup_deadline(tmp_path: Path) -> None:
+    repo, lock_path, commit, python = _generation(tmp_path)
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(lock_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    authority = ReleaseGenerationAuthority(
+        repo=repo,
+        lock_path=lock_path,
+        lock_fd=lock_fd,
+        python_path=python,
+        git_path=TRUSTED_GIT,
+        overall_deadline_monotonic=time.monotonic() - 0.001,
+    )
+
+    with pytest.raises(ReleaseGenerationError, match="timed out"):
+        authority.verify(expected_commit=commit)
+    os.close(lock_fd)
+
+
 def test_environment_generation_is_immutable_and_content_bound(tmp_path: Path) -> None:
     repo, lock_path, commit, python = _generation(tmp_path)
     lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
@@ -3195,6 +3281,96 @@ def test_generation_gc_fails_closed_on_unresolved_installation_authority(
         authority.garbage_collect_environments(reason="blocked-authority")
 
     assert orphan.exists()
+    os.close(lock_fd)
+
+
+def test_generation_gc_retains_fully_bound_installed_generation(tmp_path: Path) -> None:
+    repo, lock_path, commit, python = _generation(tmp_path)
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    authority = _authority(
+        repo,
+        lock_path,
+        lock_fd,
+        python,
+        gc_grace_seconds=0,
+        minimum_free_bytes=0,
+    )
+    _publish_initialized(authority, commit=commit)
+    installed_generation = "9" * 64
+    candidate = environment_root_for_lock(lock_path) / installed_generation
+    candidate.mkdir(mode=0o700)
+    (candidate / "payload").write_text("installed", encoding="utf-8")
+    candidate.chmod(0o500)
+    os.utime(candidate, (time.time() - 300, time.time() - 300), follow_symlinks=False)
+    _write_gc_lab_installation(
+        tmp_path,
+        repo,
+        lock_path,
+        code_sha=commit,
+        generation_id=installed_generation,
+    )
+
+    metrics = authority.garbage_collect_environments(reason="installed-generation")
+
+    assert candidate.is_dir()
+    assert installed_generation in metrics.retained_generation_ids
+    os.close(lock_fd)
+
+
+@pytest.mark.parametrize(
+    ("corruption", "expected"),
+    [
+        ("missing-field", "registered Lab installation authority"),
+        ("wrong-type", "registered Lab installation authority"),
+        ("plist-binding", "plist.*binding|installation.*binding"),
+        ("local-divergence", "authorit.*diverged|installation.*diverged"),
+    ],
+)
+def test_generation_gc_rejects_incomplete_or_divergent_typed_installation_authority(
+    tmp_path: Path,
+    corruption: str,
+    expected: str,
+) -> None:
+    repo, lock_path, commit, python = _generation(tmp_path)
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    authority = _authority(
+        repo,
+        lock_path,
+        lock_fd,
+        python,
+        gc_grace_seconds=0,
+        minimum_free_bytes=0,
+    )
+    _publish_initialized(authority, commit=commit)
+    generation_id = "9" * 64
+    local_path, registered_path, local, registered = _write_gc_lab_installation(
+        tmp_path,
+        repo,
+        lock_path,
+        code_sha=commit,
+        generation_id=generation_id,
+    )
+    if corruption == "missing-field":
+        registered.pop("prepared_authority")
+        target_path, target = registered_path, registered
+    elif corruption == "wrong-type":
+        registered["registered_by_commit"] = 42
+        target_path, target = registered_path, registered
+    elif corruption == "plist-binding":
+        label = LAB_LAUNCHD_HANDOFF_LABELS[0]
+        registered["plists"][label]["sha256"] = "0" * 64
+        target_path, target = registered_path, registered
+    else:
+        local["code_sha"] = "0" * 40
+        target_path, target = local_path, local
+    target_path.write_bytes(canonical_json_bytes(target, trailing_newline=True))
+    target_path.chmod(0o600)
+
+    with pytest.raises(ReleaseGenerationError, match=expected):
+        authority.garbage_collect_environments(reason=f"invalid-{corruption}")
+
     os.close(lock_fd)
 
 

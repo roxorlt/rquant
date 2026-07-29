@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from base64 import urlsafe_b64decode, urlsafe_b64encode
 from datetime import timedelta
@@ -97,7 +98,8 @@ def test_list_jobs_keyset_pagination_is_stable_bounded_and_has_no_n_plus_one(
     selects = [
         statement for statement in reader.statements if statement.startswith(("SELECT", "WITH"))
     ]
-    assert len(selects) == 12 * 8
+    assert reader.graph_validation_runs == 1
+    assert reader.graph_validation_peak_batch <= 64
     for table in (
         "lab_job",
         "lab_shard",
@@ -110,9 +112,75 @@ def test_list_jobs_keyset_pagination_is_stable_bounded_and_has_no_n_plus_one(
         "lab_job_result_artifact",
         "lab_scheduler_state",
     ):
-        assert sum(statement == f"SELECT * FROM {table}" for statement in selects) == 8
+        assert sum(statement == f"SELECT * FROM {table}" for statement in selects) == 1
     assert reader.statements.count("BEGIN") == 8
     assert reader.statements.count("COMMIT") == 8
+
+
+def test_graph_validation_cache_is_invalidated_by_ledger_epoch(tmp_path: Path) -> None:
+    store, job_ids = _seed_jobs(tmp_path, 2)
+    reader = LabJobReader(store.path)
+
+    assert reader.list_jobs(limit=1).items
+    assert reader.list_jobs(limit=1).items
+    assert reader.graph_validation_runs == 1
+
+    with sqlite3.connect(store.path) as connection:
+        _register_unprivileged_job_functions(connection)
+        connection.execute("PRAGMA ignore_check_constraints = ON")
+        connection.execute(
+            "UPDATE lab_job SET spec_json = ? WHERE job_id = ?",
+            (
+                '{"parameters":{"strategy_name":"first","strategy_name":7}}',
+                str(job_ids[0]),
+            ),
+        )
+
+    with pytest.raises(InvalidStoredJobError, match="stored lab job"):
+        reader.list_jobs(limit=1)
+    assert reader.graph_validation_runs == 2
+
+
+def test_graph_validation_cache_is_invalidated_by_database_file_generation(
+    tmp_path: Path,
+) -> None:
+    store, job_ids = _seed_jobs(tmp_path, 2)
+    reader = LabJobReader(store.path)
+
+    assert reader.list_jobs(limit=1).items
+    assert reader.graph_validation_runs == 1
+    with sqlite3.connect(store.path) as connection:
+        epoch = int(
+            connection.execute(
+                "SELECT mutation_epoch FROM lab_ledger_epoch WHERE singleton = 1"
+            ).fetchone()[0]
+        )
+
+    replacement = store.path.with_suffix(".replacement.sqlite3")
+    with sqlite3.connect(store.path) as source, sqlite3.connect(replacement) as target:
+        source.backup(target)
+    with sqlite3.connect(replacement) as connection:
+        connection.execute("PRAGMA journal_mode = DELETE")
+        _register_unprivileged_job_functions(connection)
+        connection.execute("PRAGMA ignore_check_constraints = ON")
+        connection.execute(
+            "UPDATE lab_job SET spec_json = ? WHERE job_id = ?",
+            (
+                '{"parameters":{"strategy_name":"first","strategy_name":7}}',
+                str(job_ids[0]),
+            ),
+        )
+        connection.execute(
+            "UPDATE lab_ledger_epoch SET mutation_epoch = ? WHERE singleton = 1",
+            (epoch,),
+        )
+    for suffix in ("-wal", "-shm"):
+        Path(f"{store.path}{suffix}").unlink(missing_ok=True)
+    os.replace(replacement, store.path)
+
+    with pytest.raises(InvalidStoredJobError, match="stored lab job"):
+        reader.list_jobs(limit=1)
+    assert reader.graph_validation_runs == 2
 
 
 def test_list_jobs_immutable_cursor_survives_updates_and_live_insert(
@@ -487,3 +555,29 @@ def test_list_finalization_candidates_is_typed_readonly_and_bounded(tmp_path: Pa
     reader.execute_for_test("SELECT 1")
     with pytest.raises(Exception, match="readonly|read-only|query_only"):
         reader.execute_for_test("DELETE FROM lab_job")
+
+
+@pytest.mark.parametrize("reader_method", ("list_jobs", "list_finalization_candidates"))
+def test_reader_pages_reject_ready_job_with_incomplete_result_graph(
+    tmp_path: Path,
+    reader_method: str,
+) -> None:
+    scenario = _ready_scenario(tmp_path, hold_days=(1,))
+    with sqlite3.connect(scenario.store.path) as connection:
+        _register_unprivileged_job_functions(connection)
+        trigger_row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
+            "AND name = 'trg_lab_complete_result_shard_no_update'"
+        ).fetchone()
+        assert trigger_row is not None and trigger_row[0] is not None
+        connection.execute("DROP TRIGGER trg_lab_complete_result_shard_no_update")
+        connection.execute("PRAGMA ignore_check_constraints = ON")
+        connection.execute(
+            "UPDATE lab_shard SET status = 'queued' WHERE job_id = ?",
+            (str(scenario.job_id),),
+        )
+        connection.execute(str(trigger_row[0]))
+
+    reader = LabJobReader(scenario.store.path)
+    with pytest.raises(InvalidStoredJobError, match="ready|succeeded|shard"):
+        getattr(reader, reader_method)(limit=1)

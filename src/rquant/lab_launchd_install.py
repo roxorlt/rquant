@@ -18,7 +18,10 @@ from pathlib import Path
 from rquant.contained_subprocess import run_contained
 from rquant.private_fs import rename_noreplace_at
 from rquant.release_generation import (
+    LabLocalInstallationAuthority,
+    LabRegisteredInstallationAuthority,
     ReleaseGenerationAuthority,
+    ReleaseGenerationError,
     generation_code_root,
 )
 from rquant.research_manifest import bind_trusted_git_executable
@@ -474,7 +477,13 @@ class LabLaunchdInstaller:
             return
         raise LabLaunchdInstallError("replacement is not bound to installation transaction")
 
-    def _write_state(self, payload: dict[str, object], *, path: Path | None = None) -> None:
+    def _write_state(
+        self,
+        payload: dict[str, object],
+        *,
+        path: Path | None = None,
+        expected_binding: dict[str, object] | None = None,
+    ) -> None:
         state_path = self._state_path if path is None else path
         if state_path != self._transaction_path:
             raise LabLaunchdInstallError("unmanaged authority update is forbidden")
@@ -502,6 +511,12 @@ class LabLaunchdInstaller:
                 active_binding = self._file_binding_at(root_fd, state_path.name)
             except FileNotFoundError:
                 active_binding = None
+            if expected_binding is None and active_binding is not None:
+                raise LabLaunchdInstallError(
+                    "Lab installation transaction appeared during creation"
+                )
+            if expected_binding is not None and active_binding != expected_binding:
+                raise LabLaunchdInstallError("Lab installation transaction CAS changed")
             if active_binding is not None:
                 try:
                     rename_noreplace_at(root_fd, state_path.name, root_fd, backup)
@@ -510,6 +525,17 @@ class LabLaunchdInstaller:
                         "Lab installation transaction update backup already exists"
                     ) from exc
                 os.fsync(root_fd)
+                quarantined = self._file_binding_at(root_fd, backup)
+                if quarantined != expected_binding:
+                    try:
+                        rename_noreplace_at(root_fd, backup, root_fd, state_path.name)
+                    except FileExistsError as exc:
+                        raise LabLaunchdInstallError(
+                            "Lab installation transaction CAS recovery was blocked"
+                        ) from exc
+                    os.fsync(root_fd)
+                    raise LabLaunchdInstallError("Lab installation transaction CAS changed")
+                self._mutation_hook("transaction-authority-quarantined")
             try:
                 rename_noreplace_at(root_fd, temporary, root_fd, state_path.name)
             except FileExistsError as exc:
@@ -523,6 +549,7 @@ class LabLaunchdInstaller:
                 temporary_stat.st_ino,
             ):
                 raise LabLaunchdInstallError("Lab installation transaction publish changed")
+            self._mutation_hook("transaction-authority-published")
             with suppress(FileNotFoundError):
                 os.unlink(backup, dir_fd=root_fd)
             os.fsync(root_fd)
@@ -555,12 +582,35 @@ class LabLaunchdInstaller:
             return False
         previous_files = previous.get("files")
         current_files = current.get("files")
-        return (
-            isinstance(previous_files, list)
-            and isinstance(current_files, list)
-            and current_files[: len(previous_files)] == previous_files
-            and stages[str(current_stage)] >= stages[str(previous_stage)]
-        )
+        if (
+            not isinstance(previous_files, list)
+            or not isinstance(current_files, list)
+            or len(current_files) < len(previous_files)
+            or stages[str(current_stage)] < stages[str(previous_stage)]
+        ):
+            return False
+        immutable = {"path", "backup", "existed", "sha256", "device", "inode"}
+        replacement = {
+            "replacement_sha256",
+            "replacement_device",
+            "replacement_inode",
+        }
+        for prior, successor in zip(
+            previous_files,
+            current_files[: len(previous_files)],
+            strict=True,
+        ):
+            if not isinstance(prior, dict) or not isinstance(successor, dict):
+                return False
+            if any(prior.get(key) != successor.get(key) for key in immutable):
+                return False
+            previous_replacement = tuple(prior.get(key) for key in replacement)
+            current_replacement = tuple(successor.get(key) for key in replacement)
+            if any(value is not None for value in previous_replacement) and (
+                previous_replacement != current_replacement
+            ):
+                return False
+        return True
 
     def _recover_transaction_authority_update(self) -> None:
         backup_name = f".{self._transaction_path.name}.update-backup"
@@ -781,6 +831,20 @@ class LabLaunchdInstaller:
         *,
         label: str,
     ) -> dict[str, object]:
+        payload, _binding = LabLaunchdInstaller._read_authority_record_at(
+            root_fd,
+            name,
+            label=label,
+        )
+        return payload
+
+    @staticmethod
+    def _read_authority_record_at(
+        root_fd: int,
+        name: str,
+        *,
+        label: str,
+    ) -> tuple[dict[str, object], dict[str, object]]:
         descriptor = os.open(
             name,
             os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
@@ -813,13 +877,18 @@ class LabLaunchdInstaller:
                 rebound.st_mtime_ns,
             ) or (opened.st_dev, opened.st_ino) != (final.st_dev, final.st_ino):
                 raise LabLaunchdInstallError(f"{label} changed while read")
+            encoded = b"".join(chunks)
             payload = strict_canonical_json_loads(
-                b"".join(chunks),
+                encoded,
                 trailing_newline=True,
             )
             if not isinstance(payload, dict):
                 raise LabLaunchdInstallError(f"{label} is invalid")
-            return payload
+            return payload, {
+                "sha256": hashlib.sha256(encoded).hexdigest(),
+                "device": opened.st_dev,
+                "inode": opened.st_ino,
+            }
         except (OSError, StrictJsonError) as exc:
             if isinstance(exc, LabLaunchdInstallError):
                 raise
@@ -829,10 +898,22 @@ class LabLaunchdInstaller:
 
     def _transaction(self) -> dict[str, object]:
         self._recover_transaction_authority_update()
-        payload = self._read_authority_payload(
-            self._transaction_path,
-            label="Lab installation transaction",
+        root_fd = os.open(
+            self.lock_path.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
         )
+        try:
+            payload, _binding = self._read_authority_record_at(
+                root_fd,
+                self._transaction_path.name,
+                label="Lab installation transaction",
+            )
+        finally:
+            os.close(root_fd)
+        self._validate_transaction(payload)
+        return payload
+
+    def _validate_transaction(self, payload: dict[str, object]) -> None:
         if (
             not isinstance(payload, dict)
             or set(payload)
@@ -903,7 +984,6 @@ class LabLaunchdInstaller:
             ):
                 raise LabLaunchdInstallError("Lab installation replacement identity is invalid")
             self._validated_managed_path(Path(item["path"]))
-        return payload
 
     def _validated_managed_path(self, path: Path) -> Path:
         allowed = {
@@ -936,7 +1016,28 @@ class LabLaunchdInstaller:
     def _save_transaction(self, payload: dict[str, object], *, stage: str) -> None:
         self._remaining()
         updated = {**payload, "stage": stage}
-        self._write_state(updated, path=self._transaction_path)
+        self._recover_transaction_authority_update()
+        root_fd = os.open(
+            self.lock_path.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            current, binding = self._read_authority_record_at(
+                root_fd,
+                self._transaction_path.name,
+                label="Lab installation transaction",
+            )
+        finally:
+            os.close(root_fd)
+        self._validate_transaction(current)
+        self._validate_transaction(updated)
+        if current != updated and not self._transaction_successor(current, updated):
+            raise LabLaunchdInstallError("Lab installation transaction CAS changed")
+        self._write_state(
+            updated,
+            path=self._transaction_path,
+            expected_binding=binding,
+        )
         payload.clear()
         payload.update(updated)
 
@@ -1207,8 +1308,10 @@ class LabLaunchdInstaller:
             self._state_path,
             label="Lab launchd installation state",
         )
-        if not isinstance(payload, dict) or payload.get("schema_version") != _STATE_SCHEMA_VERSION:
-            raise LabLaunchdInstallError("Lab launchd installation state is invalid")
+        try:
+            LabLocalInstallationAuthority.from_payload(payload)
+        except ReleaseGenerationError as exc:
+            raise LabLaunchdInstallError("Lab launchd installation state is invalid") from exc
         return payload
 
     def _registered_state(self) -> dict[str, object]:
@@ -1216,14 +1319,13 @@ class LabLaunchdInstaller:
             self._registered_state_path,
             label="registered Lab installation authority",
         )
-        if (
-            not isinstance(payload, dict)
-            or payload.get("schema_version") != 2
-            or payload.get("checkout_root") != str(self.checkout_root)
-            or payload.get("labels") != list(LAB_LAUNCHD_LABELS)
-            or not isinstance(payload.get("plists"), dict)
-            or set(payload["plists"]) != set(LAB_LAUNCHD_LABELS)
-        ):
+        try:
+            authority = LabRegisteredInstallationAuthority.from_payload(payload)
+        except ReleaseGenerationError as exc:
+            raise LabLaunchdInstallError(
+                "registered Lab installation authority is invalid"
+            ) from exc
+        if authority.checkout_root != str(self.checkout_root):
             raise LabLaunchdInstallError("registered Lab installation authority is invalid")
         return payload
 

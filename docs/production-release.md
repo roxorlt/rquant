@@ -313,14 +313,23 @@ label 独立匹配 launchctl PID 和新 marker，并在稳定窗口内由同一 
 `RQUANT_DEPLOY_COMMAND_TIMEOUT_SECONDS` 限制单次 Git/uv/preflight/launchctl 子命令，
 `RQUANT_DEPLOY_OVERALL_TIMEOUT_SECONDS` 限制整个发布、handoff、失败恢复和锁重取；所有路径继承
 同一个绝对 deadline，预算耗尽后不再执行恢复副作用，只保留可继续的持久 authority。阻塞命令统一
-由有界进程树收容器运行；root 在实际命令启动前通过闸门完成 PID identity 取证，后代继承每次运行
-唯一 token，tracker 从闸门释放前持续按 parent graph、token 与 PID start identity 扫描。在
+由有界进程树收容器运行；root 在实际命令启动前通过闸门完成 PID identity 和内核 tracker 注册。
+Darwin 使用 `EVFILT_PROC/NOTE_FORK/NOTE_EXIT`、XNU `PROC_PIDUNIQIDENTIFIERINFO` 的进程/出生父
+唯一 ID，以及继承的 stdout/stderr 管道 identity；管道 identity 让中间父进程已经退出并发生 reparent
+的后代仍可被同用户进程清单识别。macOS 自 10.5 起不支持 `NOTE_TRACK/NOTE_CHILD`，所以这里是针对
+rQuant 可信发布命令的生命周期收容，不是允许执行对抗代码的安全沙箱：主动关闭全部继承管道、移除
+token 再脱离的程序不在证明范围。Linux 使用 child subreaper、`/proc` start identity 与可用的 pidfd。
+parent graph 和每次运行的唯一 token 是补充证据。在
 SIGINT/SIGTERM/timeout/BaseException 时先停止生成源，再反复终止并复核原进程组、立即脱离的
-`setsid` 后代与 cleanup 期间新 fork；平台无法证明收容时失败关闭，不释放成功权威。
+`setsid` 后代与 cleanup 期间新 fork；任一 tracker、inventory、PID identity 或已发现后代存活检查无法
+完成时失败关闭，不释放成功权威。连续信号由一次性 latch 合并，避免 cleanup 被嵌套信号异常打断；
+Darwin tracker 在线程退出后才关闭 kqueue，Linux subreaper 恢复失败也会作为发布失败上报。
 
-所有持久 release/deployment/installation/handoff/runtime/protocol JSON 共用同一 exact canonical
-UTF-8 合约：`ensure_ascii=false`、排序键、紧凑分隔符、禁止 NaN、无尾随换行。reader 同时拒绝重复键
-和任何非规范 bytes；旧 ASCII 转义或 pretty JSON 不会被静默接受，需显式迁移。
+所有持久 release/deployment/installation/handoff/runtime/protocol JSON 共用同一 canonical UTF-8
+编码：`ensure_ascii=false`、排序键、紧凑分隔符、禁止 NaN。release、deployment、installation、
+handoff 和 runtime authority 文件的字节合约是末尾恰好一个 LF；单记录 Strategy Lab spool/model 文件
+无尾随换行，JSONL 则每条记录一个 LF。reader 按各自文件类型比较 exact bytes，同时拒绝任意层重复键；
+旧 ASCII 转义、pretty JSON 或错误换行不会被静默接受，需显式迁移。
 
 以下非秘钥部署控制项可以放在 repo `.env`：`RQUANT_DEPLOY_UV`、单命令/整体 timeout、
 generation GC 宽限期/最小剩余磁盘、`RQUANT_RELEASE_PROFILE`、`RQUANT_LAB_LIFECYCLE_MODE` 与

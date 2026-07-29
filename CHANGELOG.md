@@ -79,6 +79,17 @@
 
 ### Fixed
 
+- **Strategy Lab P1.5b 进程、安装与账本权威加固**：有界 subprocess 现在在启动闸门打开前注册
+  Darwin kqueue 与 XNU 进程/出生父唯一 ID，或 Linux subreaper/pidfd tracker。Darwin 还用继承的
+  stdout/stderr 管道 identity 在中间父进程已退出后识别重挂后代；确定性故障注入覆盖该断链窗口，
+  kqueue tracker 先 join 再关闭，连续信号只触发一次 cleanup，Linux subreaper 恢复失败会显式失败且
+  释放进程级锁。该能力用于可信发布命令的生命周期收容，不宣称是抵御主动关闭证据句柄的安全沙箱。launchd 安装 transaction authority
+  使用 inode/hash CAS 和可恢复 update-backup，immutable 原文件身份与 mutable phase evidence 分离。
+  Lab SQLite 升级到 schema v6，以 mutation epoch 和 trigger 让 `list_jobs`/finalization candidate 在账本
+  未变化时只做一次分块完整关系图校验、任一受控写入后自动失效。daemon startup 将原始 absolute
+  deadline 贯穿 wrapper/bootstrap/generation authority；generation GC 严格解析并核对完整 local/
+  registered installation authority 与实际 plist bindings。同步修正文档中 canonical JSON 的精确换行合约。
+
 - **Strategy Lab P1.5b 第四轮生产边界收口**：所有阻塞/变异子进程统一使用带继承 token、启动闸门、
   PID 代际和持续后代扫描的有界收容器，立即 `setsid` 并退出的根进程也不能遗留写入者。macOS A→B
   发布会在 A 仍运行时先构建并验证 B 的不可变代码、环境和三份 generation-bound plist，之后才允许

@@ -153,9 +153,18 @@ P1.5b **没有**向 `~/Library/LaunchAgents` 写文件，也没有执行真实 `
 这些实际安装、健康观察和回滚演练只在 P1.5d 人工基础设施窗口进行。
 
 所有持久 generation、deployment、installation、handoff、runtime 和 Strategy Lab protocol JSON
-使用同一 canonical serializer：UTF-8 原字符、排序键、紧凑分隔符、禁止 NaN、无额外换行。reader
-先拒绝任意层重复键，再比较 exact canonical bytes；旧的 ASCII 转义、pretty print、键序或额外空白
-不会被偶然接受，必须经过显式迁移。
+使用同一 canonical serializer：UTF-8 原字符、排序键、紧凑分隔符、禁止 NaN。authority 文件末尾
+恰好一个 LF，单记录 spool/model 文件无尾随换行，JSONL 每条记录一个 LF；reader 先拒绝任意层重复键，
+再按文件类型比较 exact canonical bytes。旧的 ASCII 转义、pretty print、键序或错误换行不会被偶然
+接受，必须经过显式迁移。
+
+generation GC 在删除候选前严格解析 local/registered installation typed authority，核对 checkout、私有
+runtime/readiness 目录、代码 SHA、generation/handoff id，以及三份 plist 的真实 path、inode、hash 与
+权限。本地和注册记录任一缺失、类型错误或 binding 分叉都会阻断 GC；未完成安装事务同样阻断删除。
+
+发布子进程收容的边界是 rQuant 自己调用的可信 Git、uv、Python、plutil 与 launchctl 命令。Darwin
+通过 kqueue fork/exit 边、XNU process unique identity、出生父 identity 和继承管道 identity 追踪可观测
+后代；它不是执行不可信代码的安全沙箱，也不声称能约束主动关闭全部继承证据后再脱离的对抗程序。
 
 隔离 worktree 可继续复用链接 `.venv` 运行测试，但正式 daemon 会在读取
 配置或创建运行时目录前拒绝这种 runtime。

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
 import sqlite3
 from base64 import urlsafe_b64decode, urlsafe_b64encode
@@ -81,6 +82,7 @@ if TYPE_CHECKING:
 
 class LabSqliteIdentityAuthority(Protocol):
     path: Path
+    database_generation: tuple[int, int]
 
     def assert_current(self) -> None: ...
 
@@ -130,8 +132,9 @@ _APPLICATION_ID = 0x52514A42
 _LEGACY_SCHEMA_VERSION = 1
 _V2_SCHEMA_VERSION = 2
 _V3_SCHEMA_VERSION = 3
-_PREVIOUS_SCHEMA_VERSION = 4
-_SCHEMA_VERSION = 5
+_V4_SCHEMA_VERSION = 4
+_PREVIOUS_SCHEMA_VERSION = 5
+_SCHEMA_VERSION = 6
 RESULT_CONTRACT_VERSION = "p1.4a-telemetry-v1"
 COMPLETE_RESULT_CONTRACT_VERSION = "p1.4b-complete-result-v1"
 _SUBMIT_AUTH_FUNCTION = "rquant_lab_submit_authorized"
@@ -576,8 +579,6 @@ class _LabJobStoreConnection(sqlite3.Connection):
         exc: BaseException | None,
         traceback: TracebackType | None,
     ) -> Literal[False]:
-        if self.identity_authority is None:
-            return super().__exit__(exc_type, exc, traceback)
         try:
             if exc_type is None:
                 self.commit()
@@ -606,6 +607,7 @@ class _LabJobReaderCursor(sqlite3.Cursor):
 
 class _LabJobReaderConnection(sqlite3.Connection):
     identity_authority: LabSqliteIdentityAuthority | None = None
+    database_generation: tuple[int, int] | None = None
     _identity_failed: bool = False
 
     def _assert_identity_current(self) -> None:
@@ -2445,7 +2447,11 @@ def _validate_v5_key_and_foreign_key_constraints(
         )
 
 
-def _validate_v5_schema(connection: sqlite3.Connection) -> None:
+def _validate_v5_schema(
+    connection: sqlite3.Connection,
+    *,
+    allow_epoch_triggers: bool = False,
+) -> None:
     _validate_v4_schema(connection)
     _validate_v5_table_sql(
         connection,
@@ -2574,7 +2580,10 @@ def _validate_v5_schema(connection: sqlite3.Connection) -> None:
             "SELECT name FROM sqlite_master WHERE type = 'trigger'"
         ).fetchall()
     }
-    expected_triggers = frozenset(_V5_EXPECTED_TRIGGER_SQL)
+    expected_trigger_sql = dict(_V5_EXPECTED_TRIGGER_SQL)
+    if allow_epoch_triggers:
+        expected_trigger_sql.update(_LEDGER_EPOCH_TRIGGER_SQL)
+    expected_triggers = frozenset(expected_trigger_sql)
     missing_triggers = sorted(expected_triggers - existing_triggers)
     unexpected_triggers = sorted(existing_triggers - expected_triggers)
     if missing_triggers or unexpected_triggers:
@@ -2586,7 +2595,7 @@ def _validate_v5_schema(connection: sqlite3.Connection) -> None:
         raise LabDatabaseIdentityError(
             f"lab jobs SQLite v5 trigger set is invalid: {'; '.join(details)}"
         )
-    for name, expected_sql in _V5_EXPECTED_TRIGGER_SQL.items():
+    for name, expected_sql in expected_trigger_sql.items():
         row = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?",
             (name,),
@@ -2596,6 +2605,30 @@ def _validate_v5_schema(connection: sqlite3.Connection) -> None:
             raise LabDatabaseIdentityError(
                 f"lab jobs SQLite v5 trigger {name} has invalid structure"
             )
+
+
+def _validate_v6_schema(connection: sqlite3.Connection) -> None:
+    _validate_v5_schema(connection, allow_epoch_triggers=True)
+    _validate_v5_table_sql(
+        connection,
+        table="lab_ledger_epoch",
+        expected=_LEDGER_EPOCH_TABLE_STATEMENT,
+    )
+    columns = {
+        str(row[1]): row
+        for row in connection.execute("PRAGMA table_info(lab_ledger_epoch)").fetchall()
+    }
+    if set(columns) != {"singleton", "mutation_epoch"}:
+        raise LabDatabaseIdentityError("lab jobs SQLite v6 epoch table has invalid columns")
+    rows = connection.execute("SELECT singleton, mutation_epoch FROM lab_ledger_epoch").fetchall()
+    if (
+        len(rows) != 1
+        or type(rows[0][0]) is not int
+        or rows[0][0] != 1
+        or type(rows[0][1]) is not int
+        or rows[0][1] < 0
+    ):
+        raise LabDatabaseIdentityError("lab jobs SQLite v6 epoch authority is invalid")
 
 
 def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
@@ -3167,36 +3200,52 @@ class LabJobReader:
         self.path = Path(path)
         self.busy_timeout_ms = busy_timeout_ms
         self.identity_authority = identity_authority
+        self._validated_graph_generation: tuple[int, int, int] | None = None
+        self.graph_validation_runs = 0
+        self.graph_validation_peak_batch = 0
         if identity_authority is not None and identity_authority.path != self.path:
             raise ValueError("SQLite identity authority path mismatch")
 
     def _connect(self) -> sqlite3.Connection:
         def open_readonly(path: Path) -> sqlite3.Connection:
-            uri = f"file:{quote(str(path if self.identity_authority else path.resolve()))}?mode=ro"
-            if self.identity_authority is not None:
-                return sqlite3.connect(
-                    uri,
-                    uri=True,
-                    timeout=self.busy_timeout_ms / 1_000,
-                    isolation_level=None,
-                    factory=_LabJobReaderConnection,
-                )
-            return sqlite3.connect(
+            authority = self.identity_authority
+            database_path = path if authority else path.resolve()
+            before: os.stat_result | None = None
+            if authority is None:
+                try:
+                    before = database_path.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    raise sqlite3.OperationalError("unable to open database file") from None
+            uri = f"file:{quote(str(database_path))}?mode=ro"
+            connection = sqlite3.connect(
                 uri,
                 uri=True,
                 timeout=self.busy_timeout_ms / 1_000,
                 isolation_level=None,
+                factory=_LabJobReaderConnection,
             )
+            if authority is not None:
+                connection.database_generation = authority.database_generation
+            else:
+                assert before is not None
+                after = database_path.stat(follow_symlinks=False)
+                if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+                    connection.close()
+                    raise LabDatabaseIdentityError(
+                        "lab jobs SQLite file generation changed while opening"
+                    )
+                connection.database_generation = (before.st_dev, before.st_ino)
+            return connection
 
         connection = (
             self.identity_authority.open_verified_connection(open_readonly)
             if self.identity_authority is not None
             else open_readonly(self.path)
         )
+        if not isinstance(connection, _LabJobReaderConnection):
+            connection.close()
+            raise TypeError("lab SQLite authority returned an incompatible reader connection")
         if self.identity_authority is not None:
-            if not isinstance(connection, _LabJobReaderConnection):
-                connection.close()
-                raise TypeError("lab SQLite authority returned an incompatible reader connection")
             connection.identity_authority = self.identity_authority
         connection.create_function(
             _SHARD_ROW_VALID_FUNCTION,
@@ -3219,7 +3268,7 @@ class LabJobReader:
                 connection,
                 allow_unclaimed_empty=False,
             )
-            _validate_v5_schema(connection)
+            _validate_v6_schema(connection)
         except BaseException:
             connection.close()
             raise
@@ -4021,40 +4070,114 @@ class LabJobReader:
             raise ValueError("job list filters exceed the SQL parameter budget")
         return clauses, parameters
 
-    @classmethod
-    def _validate_authoritative_graph(cls, connection: sqlite3.Connection) -> None:
+    def _stream_validated_rows(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        table: str,
+        validator: Callable[[sqlite3.Row], object],
+    ) -> None:
+        cursor = connection.execute(f"SELECT * FROM {table}")
+        while True:
+            rows = cursor.fetchmany(64)
+            if not rows:
+                return
+            self.graph_validation_peak_batch = max(
+                self.graph_validation_peak_batch,
+                len(rows),
+            )
+            for row in rows:
+                validator(row)
+
+    def _validate_authoritative_graph(self, connection: sqlite3.Connection) -> None:
         """Validate every persistent reader authority before applying visibility filters."""
 
+        epoch_row = connection.execute(
+            "SELECT mutation_epoch FROM lab_ledger_epoch WHERE singleton = 1"
+        ).fetchone()
+        if epoch_row is None:
+            raise InvalidStoredJobError("Lab job graph mutation epoch is missing")
+        epoch = _strict_sqlite_int(
+            epoch_row["mutation_epoch"],
+            field="lab_ledger_epoch.mutation_epoch",
+            minimum=0,
+        )
+        if not isinstance(connection, _LabJobReaderConnection):
+            raise InvalidStoredJobError("Lab job graph database generation is unavailable")
+        database_generation = connection.database_generation
+        if database_generation is None:
+            raise InvalidStoredJobError("Lab job graph database generation is unavailable")
+        graph_generation = (*database_generation, epoch)
+        if self._validated_graph_generation == graph_generation:
+            return
+        self.graph_validation_runs += 1
         foreign_key_error = connection.execute("PRAGMA foreign_key_check").fetchone()
         if foreign_key_error is not None:
             raise InvalidStoredJobError("Lab job graph contains a foreign-key violation")
         validators: tuple[tuple[str, Callable[[sqlite3.Row], object]], ...] = (
-            ("lab_job", cls._job_from_row),
-            ("lab_shard", cls._shard_from_row),
-            ("lab_event", cls._event_from_row),
-            ("lab_lease", cls._lease_from_row),
-            ("lab_artifact", cls._artifact_from_row),
+            ("lab_shard", self._shard_from_row),
+            ("lab_event", self._event_from_row),
+            ("lab_lease", self._lease_from_row),
+            ("lab_artifact", self._artifact_from_row),
             ("lab_command", _command_record_from_row),
             ("lab_worker_report", _worker_report_record_from_row),
             ("lab_artifact_commit", _artifact_commit_record_from_row),
             ("lab_job_result_artifact", _result_artifact_evidence_from_row),
         )
+        job_cursor = connection.execute("SELECT * FROM lab_job")
+        while True:
+            rows = job_cursor.fetchmany(64)
+            if not rows:
+                break
+            self.graph_validation_peak_batch = max(
+                self.graph_validation_peak_batch,
+                len(rows),
+            )
+            for row in rows:
+                job = self._job_from_row(row)
+                self._validate_complete_result_graph(connection, job)
         for table, validator in validators:
-            for row in connection.execute(f"SELECT * FROM {table}").fetchall():
-                validator(row)
+            self._stream_validated_rows(
+                connection,
+                table=table,
+                validator=validator,
+            )
 
-        for row in connection.execute("SELECT * FROM lab_scheduler_state").fetchall():
-            try:
-                if str(row["state_key"]) != "claim_job_cursor":
-                    raise ValueError("state key is unsupported")
-                _load_time(str(row["claim_cursor_created_at"]))
-                _canonical_uuid_text(
-                    row["claim_cursor_job_id"],
-                    field="lab_scheduler_state.claim_cursor_job_id",
-                )
-                _load_time(str(row["updated_at"]))
-            except Exception as exc:
-                raise InvalidStoredJobError("invalid stored scheduler state") from exc
+        cursor = connection.execute("SELECT * FROM lab_scheduler_state")
+        while True:
+            batch = cursor.fetchmany(64)
+            if not batch:
+                break
+            self.graph_validation_peak_batch = max(
+                self.graph_validation_peak_batch,
+                len(batch),
+            )
+            for row in batch:
+                try:
+                    if str(row["state_key"]) != "claim_job_cursor":
+                        raise ValueError("state key is unsupported")
+                    _load_time(str(row["claim_cursor_created_at"]))
+                    _canonical_uuid_text(
+                        row["claim_cursor_job_id"],
+                        field="lab_scheduler_state.claim_cursor_job_id",
+                    )
+                    _load_time(str(row["updated_at"]))
+                except Exception as exc:
+                    raise InvalidStoredJobError("invalid stored scheduler state") from exc
+        final_epoch_row = connection.execute(
+            "SELECT mutation_epoch FROM lab_ledger_epoch WHERE singleton = 1"
+        ).fetchone()
+        if (
+            final_epoch_row is None
+            or _strict_sqlite_int(
+                final_epoch_row["mutation_epoch"],
+                field="lab_ledger_epoch.mutation_epoch",
+                minimum=0,
+            )
+            != epoch
+        ):
+            raise InvalidStoredJobError("Lab job graph changed during validation")
+        self._validated_graph_generation = graph_generation
 
     @classmethod
     def _summary_from_row(cls, row: sqlite3.Row) -> LabJobSummary:
@@ -4186,6 +4309,7 @@ class LabJobReader:
             clauses.append("(j.updated_at < ? OR (j.updated_at = ? AND j.job_id < ?))")
             parameters.extend((cursor_time, cursor_time, str(cursor_id)))
         with self._read_snapshot(label="finalization candidate list") as connection:
+            self._validate_authoritative_graph(connection)
             total_row = connection.execute(
                 f"SELECT COUNT(*) AS total_count FROM lab_job AS j{total_where}",
                 (COMPLETE_RESULT_CONTRACT_VERSION,),
@@ -5058,7 +5182,7 @@ class LabJobStore:
                     connection,
                     allow_unclaimed_empty=False,
                 )
-                _validate_v5_schema(connection)
+                _validate_v6_schema(connection)
             connection.execute("PRAGMA foreign_keys = ON")
             connection.execute("PRAGMA synchronous = FULL")
         except BaseException:
@@ -5079,7 +5203,7 @@ class LabJobStore:
                 connection,
                 allow_unclaimed_empty=False,
             )
-            _validate_v5_schema(connection)
+            _validate_v6_schema(connection)
             yield connection
             if self.mutation_guard is not None:
                 self.mutation_guard()
@@ -5103,6 +5227,7 @@ class LabJobStore:
                         _LEGACY_SCHEMA_VERSION,
                         _V2_SCHEMA_VERSION,
                         _V3_SCHEMA_VERSION,
+                        _V4_SCHEMA_VERSION,
                         _PREVIOUS_SCHEMA_VERSION,
                         _SCHEMA_VERSION,
                     }
@@ -5117,6 +5242,7 @@ class LabJobStore:
                         _LEGACY_SCHEMA_VERSION,
                         _V2_SCHEMA_VERSION,
                         _V3_SCHEMA_VERSION,
+                        _V4_SCHEMA_VERSION,
                         _PREVIOUS_SCHEMA_VERSION,
                         _SCHEMA_VERSION,
                     }
@@ -5153,12 +5279,14 @@ class LabJobStore:
                     )
                 _migrate_v3_to_v4(connection)
                 _migrate_v4_to_v5(connection)
-            elif starting_version == _PREVIOUS_SCHEMA_VERSION:
+            elif starting_version == _V4_SCHEMA_VERSION:
                 _migrate_v4_to_v5(connection)
+            elif starting_version == _PREVIOUS_SCHEMA_VERSION:
+                _validate_v5_schema(connection)
             for statement in _SCHEMA_STATEMENTS:
                 connection.execute(statement)
             _normalize_legacy_terminal_shards(connection)
-            _validate_v5_schema(connection)
+            _validate_v6_schema(connection)
             connection.execute(f"PRAGMA user_version = {self.SCHEMA_VERSION}")
             if self.mutation_guard is not None:
                 self.mutation_guard()
@@ -5745,7 +5873,7 @@ class LabJobStore:
         try:
             connection.execute("BEGIN IMMEDIATE")
             _validate_database_identity(connection, allow_unclaimed_empty=False)
-            _validate_v5_schema(connection)
+            _validate_v6_schema(connection)
             self._validate_lease(connection, lease, now=current)
             existed_before_apply = (
                 connection.execute(
@@ -10055,7 +10183,7 @@ _V4_SCHEMA_STATEMENTS = tuple(
     _V4_STATUS_INDEX_STATEMENT,
 )
 
-_SCHEMA_STATEMENTS = tuple(
+_V5_SCHEMA_STATEMENTS = tuple(
     _V5_JOB_TABLE_STATEMENT if statement == _V4_JOB_TABLE_STATEMENT else statement
     for statement in _V4_SCHEMA_STATEMENTS
 ) + (
@@ -10078,4 +10206,48 @@ _SCHEMA_STATEMENTS = tuple(
     _V5_ARTIFACT_COMMIT_NO_DELETE_TRIGGER,
     _V5_JOB_EXISTING_KEY_NO_INSERT_TRIGGER,
     _V5_JOB_ID_IMMUTABLE_TRIGGER,
+)
+
+_LEDGER_EPOCH_TABLE_STATEMENT = """
+CREATE TABLE IF NOT EXISTS lab_ledger_epoch (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    mutation_epoch INTEGER NOT NULL
+        CHECK (typeof(mutation_epoch) = 'integer' AND mutation_epoch >= 0)
+)
+"""
+_LEDGER_EPOCH_TABLES = (
+    "lab_job",
+    "lab_command",
+    "lab_shard",
+    "lab_event",
+    "lab_lease",
+    "lab_artifact",
+    "lab_worker_report",
+    "lab_scheduler_state",
+    "lab_artifact_commit",
+    "lab_job_result_artifact",
+)
+
+
+def _ledger_epoch_trigger_statement(table: str, action: str) -> str:
+    return f"""
+CREATE TRIGGER IF NOT EXISTS trg_lab_epoch_{table}_{action.lower()}
+AFTER {action} ON {table}
+BEGIN
+    UPDATE lab_ledger_epoch
+    SET mutation_epoch = mutation_epoch + 1
+    WHERE singleton = 1;
+END
+"""
+
+
+_LEDGER_EPOCH_TRIGGER_SQL = {
+    f"trg_lab_epoch_{table}_{action.lower()}": _ledger_epoch_trigger_statement(table, action)
+    for table in _LEDGER_EPOCH_TABLES
+    for action in ("INSERT", "UPDATE", "DELETE")
+}
+_SCHEMA_STATEMENTS = _V5_SCHEMA_STATEMENTS + (
+    _LEDGER_EPOCH_TABLE_STATEMENT,
+    "INSERT OR IGNORE INTO lab_ledger_epoch (singleton, mutation_epoch) VALUES (1, 0)",
+    *_LEDGER_EPOCH_TRIGGER_SQL.values(),
 )

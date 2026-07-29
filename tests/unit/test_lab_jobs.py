@@ -715,6 +715,17 @@ def test_connection_authority_is_exact_and_cleared_after_exception(tmp_path: Pat
         connection.rollback()
 
 
+def test_store_connection_context_closes_without_identity_authority(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    connection = store._connect()
+
+    with connection:
+        assert connection.execute("SELECT 1").fetchone()[0] == 1
+
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        connection.execute("SELECT 1")
+
+
 @pytest.mark.parametrize("boundary", ["commit", "rollback"])
 def test_connection_authority_expires_on_explicit_transaction_boundary(
     tmp_path: Path,
@@ -1036,7 +1047,7 @@ def _create_609c599_v1_fixture(
     return rows
 
 
-def test_initialize_creates_v5_schema_and_required_pragmas(
+def test_initialize_creates_v6_schema_and_required_pragmas(
     tmp_path: Path,
 ) -> None:
     store = _store(tmp_path)
@@ -1063,9 +1074,10 @@ def test_initialize_creates_v5_schema_and_required_pragmas(
         "lab_artifact",
         "lab_artifact_commit",
         "lab_job_result_artifact",
+        "lab_ledger_epoch",
     } <= tables
     assert application_id == LabJobStore.APPLICATION_ID
-    assert user_version == 5
+    assert user_version == 6
     assert str(journal_mode).lower() == "wal"
     assert synchronous == 2
     assert ") STRICT" not in schema_sql
@@ -1219,7 +1231,7 @@ def test_v5_schema_rejects_unexpected_persistent_trigger(tmp_path: Path) -> None
         store.connection_pragmas()
 
 
-def test_v5_schema_identity_ignores_connection_local_temp_trigger(tmp_path: Path) -> None:
+def test_v6_schema_identity_ignores_connection_local_temp_trigger(tmp_path: Path) -> None:
     store = _store(tmp_path)
     with sqlite3.connect(store.path) as connection:
         connection.execute(
@@ -1234,7 +1246,7 @@ def test_v5_schema_identity_ignores_connection_local_temp_trigger(tmp_path: Path
         assert connection.execute(
             "SELECT name FROM sqlite_temp_master WHERE type = 'trigger'"
         ).fetchall() == [("trg_lab_temp_review_probe",)]
-        lab_jobs._validate_v5_schema(connection)
+        lab_jobs._validate_v6_schema(connection)
 
 
 def test_v5_schema_rejects_missing_persistent_trigger(tmp_path: Path) -> None:
@@ -1971,7 +1983,7 @@ def test_initialize_migrates_609c599_v1_fixture_and_preserves_commands(
         migrated_schema = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'lab_command'"
         ).fetchone()[0]
-    assert user_version == 5
+    assert user_version == 6
     assert "receipt_job_version" in columns
     assert migrated == (
         (
@@ -2107,7 +2119,7 @@ def test_v4_migration_preserves_legacy_contract_without_faking_sealed_result(
     assert migrated.requires_complete_result is False
     assert LabJobReader(path).get_result_artifact(job_id) is None
     with sqlite3.connect(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
 
 
 def test_reader_is_readonly_does_not_create_missing_database(tmp_path: Path) -> None:
