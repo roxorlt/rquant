@@ -92,6 +92,12 @@ class VolumeProfileRuleConfig(BaseModel):
     support_buffer_pct: float = Field(default=0.003, ge=0, lt=0.05)
     resistance_buffer_pct: float = Field(default=0.002, ge=0, lt=0.05)
     trailing_stop_pct: float = Field(default=0.02, gt=0, lt=0.2)
+    bin_ratio: float | None = Field(
+        default=None,
+        ge=0,
+        lt=0.1,
+        description="自适应分桶相对宽度；None/0 表示沿用历史 bin_pct 口径，不改变现有行为",
+    )
 
 
 def _as_date(value: object) -> date:
@@ -191,22 +197,67 @@ def _floor_price(value: float) -> float:
     return float(Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_FLOOR))
 
 
+def _resolve_bin_size(
+    reference_price: float,
+    *,
+    bin_pct: float,
+    bin_ratio: float | None,
+) -> float:
+    """价格分桶宽度：bin_ratio 显式给值时走 VP 规格口径，否则保持历史 bin_pct 口径。"""
+    if bin_ratio:
+        return max(0.01, round(reference_price * bin_ratio, 2))
+    return max(round(reference_price * bin_pct, 4), 0.01)
+
+
+def _poc_index(
+    prices: list[float],
+    weights: list[float],
+    reference_price: float | None,
+) -> int:
+    """成交量最大的 bin；并列时取离参考价最近的那个，仍并列取低价侧，保证可复现。"""
+    peak = max(weights)
+    tied = [index for index, weight in enumerate(weights) if weight == peak]
+    if len(tied) == 1:
+        return tied[0]
+    anchor = reference_price if reference_price is not None else prices[tied[0]]
+    return min(tied, key=lambda index: (abs(prices[index] - anchor), prices[index]))
+
+
 def _value_area(
     bins: pd.DataFrame,
     *,
     weight_column: str,
     ratio: float = 0.70,
+    reference_price: float | None = None,
 ) -> tuple[float, float]:
-    ranked = bins.sort_values(weight_column, ascending=False).reset_index(drop=True)
-    threshold = bins[weight_column].sum() * ratio
-    selected: list[float] = []
-    weight_sum = 0.0
-    for _, row in ranked.iterrows():
-        selected.append(float(row["price_bin"]))
-        weight_sum += float(row[weight_column])
-        if weight_sum >= threshold:
-            break
-    return min(selected), max(selected)
+    """标准 Market Profile 价值区：从 POC 逐 bin 向成交量更大的一侧连续扩展至 ratio。
+
+    价值区必须是连续区间：旧实现按成交量降序取 top-N 再取 min/max，双峰分布下会把
+    两个峰之间的低成交区一并圈进来，系统性拉宽 VA（VP 规格 §3.3.4 缺陷 G20）。
+    """
+    ordered = bins.sort_values("price_bin")
+    prices = [float(value) for value in ordered["price_bin"]]
+    weights = [float(value) for value in ordered[weight_column]]
+    if not prices:
+        msg = "value area requires at least one price bin"
+        raise ValueError(msg)
+
+    poc = _poc_index(prices, weights, reference_price)
+    threshold = sum(weights) * ratio
+    low = high = poc
+    covered = weights[poc]
+    last = len(prices) - 1
+    while covered < threshold and (low > 0 or high < last):
+        upper = weights[high + 1] if high < last else None
+        lower = weights[low - 1] if low > 0 else None
+        # 两侧成交量并列时固定向上扩，避免结果依赖遍历顺序
+        if lower is None or (upper is not None and upper >= lower):
+            high += 1
+            covered += weights[high]
+        else:
+            low -= 1
+            covered += weights[low]
+    return prices[low], prices[high]
 
 
 def calculate_volume_profile_outcome(
@@ -217,6 +268,7 @@ def calculate_volume_profile_outcome(
     lookback_days: int,
     freq: str = "1min",
     bin_pct: float = 0.005,
+    bin_ratio: float | None = None,
 ) -> VolumeProfileCalculation:
     """计算参考日前 N 个交易日的价量分布，并保留失败诊断。"""
     dates = _lookback_dates(store, reference_date, lookback_days)
@@ -270,7 +322,7 @@ def calculate_volume_profile_outcome(
         )
     payload["qfq_price"] = payload["raw_trade_price"] * payload["basis_ratio"]
     payload["comparable_volume"] = vol / payload["basis_ratio"]
-    bin_size = max(round(ref_price * bin_pct, 4), 0.01)
+    bin_size = _resolve_bin_size(ref_price, bin_pct=bin_pct, bin_ratio=bin_ratio)
     payload["price_bin"] = (
         (payload["qfq_price"] / bin_size).round() * bin_size
     ).round(2)
@@ -281,6 +333,7 @@ def calculate_volume_profile_outcome(
             comparable_volume=("comparable_volume", "sum"),
         )
         .sort_values("price_bin")
+        .reset_index(drop=True)
     )
     if bins.empty:
         return VolumeProfileCalculation(status="no_data", reason="empty_price_bins")
@@ -297,10 +350,14 @@ def calculate_volume_profile_outcome(
         (payload["qfq_price"] * payload["comparable_volume"]).sum()
     ) / total_vol
 
-    poc_row = bins.sort_values("comparable_volume", ascending=False).iloc[0]
+    # POC 与价值区共用同一套并列裁决，保证 value_low ≤ poc_price ≤ value_high 恒成立
+    bin_prices = [float(value) for value in bins["price_bin"]]
+    bin_weights = [float(value) for value in bins["comparable_volume"]]
+    poc_price = bin_prices[_poc_index(bin_prices, bin_weights, ref_price)]
     value_low, value_high = _value_area(
         bins,
         weight_column="comparable_volume",
+        reference_price=ref_price,
     )
     top5_volume = float(
         bins.sort_values("comparable_volume", ascending=False)
@@ -329,7 +386,7 @@ def calculate_volume_profile_outcome(
             total_vol=total_vol,
             total_amount=total_amount,
             vwap=adjusted_vwap,
-            poc_price=float(poc_row["price_bin"]),
+            poc_price=poc_price,
             value_area_low=value_low,
             value_area_high=value_high,
             concentration_top5_pct=top5_volume / total_vol * 100,
@@ -349,6 +406,7 @@ def calculate_volume_profile(
     lookback_days: int,
     freq: str = "1min",
     bin_pct: float = 0.005,
+    bin_ratio: float | None = None,
 ) -> VolumeProfile | None:
     """兼容接口：仅返回 profile，不把诊断字符串混入策略输入。"""
     return calculate_volume_profile_outcome(
@@ -358,6 +416,7 @@ def calculate_volume_profile(
         lookback_days=lookback_days,
         freq=freq,
         bin_pct=bin_pct,
+        bin_ratio=bin_ratio,
     ).profile
 
 
