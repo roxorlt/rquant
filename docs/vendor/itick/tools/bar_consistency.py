@@ -177,7 +177,9 @@ def report(data_dir: Path, date: str) -> None:
         disc = [e for e in evs if e["kind"] in ("disconnected", "reconnect")]
         print(f"## 断线事件：{len([e for e in evs if e['kind'] == 'disconnected'])} 次\n")
         for e in disc:
-            print(f"- {datetime.fromtimestamp(e['ts'], CST):%H:%M:%S} {e['kind']}: {e['detail']}")
+            when = datetime.fromtimestamp(e["ts"], CST)
+            planned = "（计划内 15:12 停录）" if when.strftime("%H:%M") >= "15:11" else ""
+            print(f"- {when:%H:%M:%S} {e['kind']}: {e['detail']}{planned}")
         print()
 
     # 逐标的：聚合 + tushare 对比（#6）
@@ -188,22 +190,28 @@ def report(data_dir: Path, date: str) -> None:
         adapter = None
         print(f"> ⚠️ tushare 适配器不可用（{exc}），跳过官方分钟线比对\n")
 
+    summary: list[str] = []
     for code, g in ticks.groupby("code"):
         g = _diff_if_cumulative(g)
         cum = g.attrs["cumulative"]
-        print(f"## {code}（tick.v 判定：{'当日累计量→已差分' if cum else '单笔量'}）\n")
+        gap = g["t"].diff().dropna()
+        med_gap = float(gap.median())
+        feed_kind = "真·逐笔流" if med_gap < 1.0 else f"~{med_gap:.0f} 秒级快照聚合流（非逐笔）"
+        print(f"## {code}（tick.v 判定：{'当日累计量→已差分' if cum else '单笔量'} | 推送间隔中位 {med_gap:.1f}s → {feed_kind}）\n")
         bars = _aggregate(g, "1min")
         print(f"聚合 1min bar {len(bars)} 根，首根 {bars.index[0]:%H:%M}，末根 {bars.index[-1]:%H:%M}")
-        print(f"聚合当日总量 {bars['vol'].sum():,.0f}（单位待人工核对：手 vs 股）\n")
+        print(f"聚合当日总量 {bars['vol'].sum():,.0f}\n")
 
         if adapter is None:
             continue
         sym, region = code.split(".")
         ts_code = f"{sym}.{'SH' if region == 'SH' else 'SZ' if region == 'SZ' else region}"
-        day = date.replace("-", "")
         try:
-            ref = adapter.stk_mins(ts_code, freq="1min",
-                                   start_date=f"{day} 09:00:00", end_date=f"{day} 15:30:00")
+            ref = adapter.stk_mins(
+                ts_code, "1min",
+                datetime.strptime(f"{date} 09:00:00", "%Y-%m-%d %H:%M:%S"),
+                datetime.strptime(f"{date} 15:30:00", "%Y-%m-%d %H:%M:%S"),
+            )
             if ref is None or ref.empty:
                 # 当日盘后早时段 stk_mins 可能未出数,退到 rt_min_daily(当日全序列,收盘即有)
                 ref = adapter.rt_min_daily([ts_code], freq="1min")
@@ -223,16 +231,32 @@ def report(data_dir: Path, date: str) -> None:
             continue
         ohlc_exact = ((joined["open"] == joined["open_ts"]) & (joined["close"] == joined["close_ts"])).mean()
         vr = (joined["vol"] / joined["vol_ts"].replace(0, pd.NA)).dropna()
+        unit_note = ""
+        if 0.005 <= vr.median() <= 0.02:  # tushare vol 单位是股,iTick 疑似手 → 差 100 倍
+            vr = vr * 100
+            unit_note = "（iTick v 判定为「手」,已 ×100 归一）"
         print(f"| 指标 | 值 |\n|---|---|")
         print(f"| 可对齐分钟数 | {len(joined)} |")
         print(f"| open/close 完全一致比例 | {ohlc_exact:.1%} |")
-        print(f"| 量比 vol_itick/vol_tushare 中位 | {vr.median():.3f} |")
+        print(f"| 量比中位{unit_note} | {vr.median():.3f} |")
         print(f"| 量比 P5–P95 | {vr.quantile(.05):.3f} – {vr.quantile(.95):.3f} |")
-        verdict = ("全量推送" if 0.98 <= vr.median() <= 1.02 and vr.std() < 0.05
-                   else "采样推送（比值稳定可校准）" if vr.std() < 0.05
-                   else "❌ 不稳定，footprint/聚合不可用")
+        rel_spread = float(vr.quantile(.95) - vr.quantile(.05))
+        verdict = ("✅ 成交量完整（可用于聚合/footprint）" if 0.98 <= vr.median() <= 1.02 and rel_spread < 0.1
+                   else "🟡 采样但比值稳定（可校准使用）" if rel_spread < 0.1
+                   else "❌ 量比不稳定，聚合/footprint 不可用")
         print(f"| **完整性判定** | **{verdict}** |\n")
+        summary.append(f"- **{code}** 量比中位 {vr.median():.3f}{unit_note} → {verdict}")
 
+    print("## 一句话结论\n")
+    p99 = lat.quantile(.99)
+    lat_verdict = ("秒级延迟——对 3 秒级封单监控勉强可用,对更快的执行不可用" if p99 > 1000
+                   else "毫秒级,符合宣传")
+    print(f"- **延迟** P50 {lat.quantile(.5)/1000:.1f}s / P99 {p99/1000:.1f}s → {lat_verdict}")
+    for line in summary:
+        print(line)
+    if not summary:
+        print("- ⚠️ 量比对未完成（参照数据缺失），需人工重跑 report")
+    print()
     print("> 边界归属：若整体错位 1 根，把 _aggregate 的 label/closed 换成 left 重跑即可确认 iTick 的 bar 时间戳约定。")
 
 
