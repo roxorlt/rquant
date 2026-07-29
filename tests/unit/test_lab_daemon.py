@@ -32,11 +32,19 @@ from rquant.lab_daemon import (
     require_unique_runtime_paths,
 )
 from rquant.lab_jobs import LabJobReader, LabJobStore
+from rquant.strict_json import canonical_model_json_bytes
 
 
 def _write_private(path: Path, payload: str) -> None:
     path.write_text(payload, encoding="ascii")
     path.chmod(0o600)
+
+
+def _write_private_json(path: Path, payload: object) -> None:
+    _write_private(
+        path,
+        json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+    )
 
 
 def test_daemon_readiness_is_generation_bound_and_monotonic(tmp_path: Path) -> None:
@@ -144,6 +152,7 @@ def test_authority_keyring_loads_active_and_rotated_keys(tmp_path: Path) -> None
                 },
             },
             sort_keys=True,
+            separators=(",", ":"),
         )
         + "\n",
     )
@@ -178,6 +187,31 @@ def test_authority_keyring_rejects_duplicate_json_keys(tmp_path: Path) -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"schema_version": 1, "keys": {"active": "' + "61" * 32 + '"}}\n',
+        '{"schema_version":1,"keys":{"active":"' + "61" * 32 + '"}}\n',
+        '{"keys":{"active":"' + "61" * 32 + '"},"schema_version":1}',
+    ],
+)
+def test_authority_keyring_rejects_noncanonical_json(
+    tmp_path: Path,
+    payload: str,
+) -> None:
+    active = tmp_path / "active.key"
+    ring = tmp_path / "keyring.json"
+    _write_private(active, "61" * 32 + "\n")
+    _write_private(ring, payload)
+
+    with pytest.raises(LabDaemonConfigurationError, match="valid JSON"):
+        LabAuthorityKeyring.load(
+            active_key_id="active",
+            active_key_path=active,
+            verification_keyring_path=ring,
+        )
+
+
 @pytest.mark.parametrize("mode", [0o644, 0o640, 0o606])
 def test_authority_keyring_rejects_non_private_key_files(
     tmp_path: Path,
@@ -186,7 +220,10 @@ def test_authority_keyring_rejects_non_private_key_files(
     key = tmp_path / "active.key"
     ring = tmp_path / "keyring.json"
     _write_private(key, "61" * 32 + "\n")
-    _write_private(ring, '{"schema_version":1,"keys":{"active":"' + "61" * 32 + '"}}\n')
+    _write_private_json(
+        ring,
+        {"schema_version": 1, "keys": {"active": "61" * 32}},
+    )
     key.chmod(mode)
 
     with pytest.raises(LabDaemonConfigurationError, match="private"):
@@ -200,7 +237,10 @@ def test_authority_keyring_rejects_non_private_key_files(
 def test_authority_keyring_rejects_missing_or_symlinked_key(tmp_path: Path) -> None:
     missing = tmp_path / "missing.key"
     ring = tmp_path / "keyring.json"
-    _write_private(ring, '{"schema_version":1,"keys":{"active":"' + "61" * 32 + '"}}\n')
+    _write_private_json(
+        ring,
+        {"schema_version": 1, "keys": {"active": "61" * 32}},
+    )
 
     with pytest.raises(LabDaemonConfigurationError, match="key file"):
         LabAuthorityKeyring.load(
@@ -216,7 +256,10 @@ def test_authority_keyring_rejects_public_ring_and_non_ascii_active_key(
     key = tmp_path / "active.key"
     ring = tmp_path / "keyring.json"
     _write_private(key, "61" * 32 + "\n")
-    _write_private(ring, '{"schema_version":1,"keys":{"active":"' + "61" * 32 + '"}}\n')
+    _write_private_json(
+        ring,
+        {"schema_version": 1, "keys": {"active": "61" * 32}},
+    )
     ring.chmod(0o644)
     with pytest.raises(LabDaemonConfigurationError, match="private"):
         LabAuthorityKeyring.load(
@@ -251,7 +294,10 @@ def test_authority_keyring_rejects_wrong_active_key_and_weak_secret(tmp_path: Pa
     key = tmp_path / "active.key"
     ring = tmp_path / "keyring.json"
     _write_private(key, "61" * 31 + "\n")
-    _write_private(ring, '{"schema_version":1,"keys":{"active":"' + "62" * 32 + '"}}\n')
+    _write_private_json(
+        ring,
+        {"schema_version": 1, "keys": {"active": "62" * 32}},
+    )
 
     with pytest.raises(LabDaemonConfigurationError, match="32 bytes"):
         LabAuthorityKeyring.load(
@@ -275,7 +321,10 @@ def test_authority_keyring_rejects_hardlinked_key_without_reading_it(tmp_path: P
     ring = tmp_path / "keyring.json"
     _write_private(victim, "61" * 32 + "\n")
     key.hardlink_to(victim)
-    _write_private(ring, '{"schema_version":1,"keys":{"active":"' + "61" * 32 + '"}}\n')
+    _write_private_json(
+        ring,
+        {"schema_version": 1, "keys": {"active": "61" * 32}},
+    )
 
     with pytest.raises(LabDaemonConfigurationError, match="hardlink"):
         LabAuthorityKeyring.load(
@@ -294,7 +343,10 @@ def test_authority_keyring_rejects_active_path_replacement_during_read(
     active = tmp_path / "active.key"
     ring = tmp_path / "keyring.json"
     _write_private(active, "61" * 32 + "\n")
-    _write_private(ring, '{"schema_version":1,"keys":{"active":"' + "61" * 32 + '"}}\n')
+    _write_private_json(
+        ring,
+        {"schema_version": 1, "keys": {"active": "61" * 32}},
+    )
     target = active if replacement_target == "active" else ring
     target_identity = target.stat()
     displaced = tmp_path / f"original-{target.name}"
@@ -1234,8 +1286,7 @@ def test_first_sqlite_registration_rejects_sentinel_runtime_identity_before_data
     sentinel = lab_daemon.lab_runtime_prepared_path(runtime)
     payload = json.loads(sentinel.read_text(encoding="utf-8"))
     payload["runtime_inode"] += 1
-    sentinel.write_text(json.dumps(payload), encoding="utf-8")
-    sentinel.chmod(0o600)
+    _write_private_json(sentinel, payload)
     original_open = os.open
     database_opened = False
 
@@ -1593,9 +1644,7 @@ def test_lab_runtime_prepared_sentinel_rejects_tampering_and_legacy_split(
     payload = json.loads(sentinel.read_text(encoding="utf-8"))
     authority_id = payload["runtime_authority_id"]
     payload["runtime_authority_id"] = "invalid"
-    sentinel.chmod(0o600)
-    sentinel.write_text(json.dumps(payload), encoding="utf-8")
-    sentinel.chmod(0o600)
+    _write_private_json(sentinel, payload)
 
     with pytest.raises(lab_daemon.LabDaemonConfigurationError, match="prepared sentinel"):
         lab_daemon.verify_lab_runtime_prepared(
@@ -1608,8 +1657,7 @@ def test_lab_runtime_prepared_sentinel_rejects_tampering_and_legacy_split(
         )
 
     payload["runtime_authority_id"] = authority_id
-    sentinel.write_text(json.dumps(payload), encoding="utf-8")
-    sentinel.chmod(0o600)
+    _write_private_json(sentinel, payload)
     legacy_database.write_bytes(b"split")
     legacy_database.chmod(0o600)
     with pytest.raises(lab_daemon.LabDaemonConfigurationError, match="legacy.*still exists"):
@@ -2460,10 +2508,7 @@ def test_finalizer_state_load_rejects_concurrent_creation_after_missing_observat
         original_assert(descriptor, expected)
         checks += 1
         if checks == 2:
-            store.path.write_text(
-                LabFinalizerDaemonState(cycle=99).model_dump_json(),
-                encoding="utf-8",
-            )
+            store.path.write_bytes(canonical_model_json_bytes(LabFinalizerDaemonState(cycle=99)))
             store.path.chmod(0o600)
 
     monkeypatch.setattr(store, "_assert_root_current", create_after_missing)
@@ -2480,7 +2525,7 @@ def test_finalizer_state_save_does_not_overwrite_concurrent_absent_state_creatio
 ) -> None:
     state_dir = _private_state_dir(tmp_path)
     store = LabFinalizerStateStore(state_dir)
-    concurrent = LabFinalizerDaemonState(cycle=99).model_dump_json().encode("utf-8")
+    concurrent = canonical_model_json_bytes(LabFinalizerDaemonState(cycle=99))
     original_assert = store._assert_root_current
     checks = 0
 
@@ -2528,7 +2573,7 @@ def test_finalizer_state_existing_concurrent_replacement_is_not_overwritten(
 ) -> None:
     store = LabFinalizerStateStore(_private_state_dir(tmp_path))
     store.save(LabFinalizerDaemonState(cycle=1))
-    concurrent = LabFinalizerDaemonState(cycle=99).model_dump_json().encode("utf-8")
+    concurrent = canonical_model_json_bytes(LabFinalizerDaemonState(cycle=99))
 
     def replace_before_exchange(root_descriptor: int) -> None:
         replacement_name = ".concurrent-state.tmp"
@@ -2565,7 +2610,7 @@ def test_finalizer_state_recovery_does_not_overwrite_concurrent_legal_update(
     state_dir = _private_state_dir(tmp_path)
     store = LabFinalizerStateStore(state_dir)
     store.save(LabFinalizerDaemonState(cycle=1))
-    concurrent = LabFinalizerDaemonState(cycle=99).model_dump_json().encode("utf-8")
+    concurrent = canonical_model_json_bytes(LabFinalizerDaemonState(cycle=99))
     real_replace = os.replace
     injected = False
 

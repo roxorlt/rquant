@@ -449,17 +449,21 @@ def test_lab_runtime_preflight_readonly_git_disables_optional_locks(
     namespace = runpy.run_path(str(SCRIPT))
     git_path, git_identity = namespace["_trusted_git"](str(TRUSTED_GIT))
     observed_environments: list[dict[str, str]] = []
-    original_run = subprocess.run
+    original_run = namespace["_git_command"].__globals__["run_contained"]
 
     def capture_git_environment(
-        *args: object, **kwargs: object
+        command: list[str], **kwargs: object
     ) -> subprocess.CompletedProcess[str]:
         environment = kwargs.get("env")
         assert isinstance(environment, dict)
         observed_environments.append(environment)
-        return original_run(*args, **kwargs)
+        return original_run(command, **kwargs)
 
-    monkeypatch.setattr(subprocess, "run", capture_git_environment)
+    monkeypatch.setitem(
+        namespace["_git_command"].__globals__,
+        "run_contained",
+        capture_git_environment,
+    )
 
     namespace["_git_command"](
         checkout,

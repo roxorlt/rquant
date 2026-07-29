@@ -24,7 +24,10 @@ from uuid import UUID, uuid4
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from rquant.research_run_spec import ResearchRunSpec
-from rquant.strict_json import strict_model_validate_json
+from rquant.strict_json import (
+    canonical_model_json_bytes,
+    strict_model_validate_canonical_json,
+)
 
 _LabSpoolFileType = Literal[
     "regular",
@@ -1269,11 +1272,10 @@ class LabCommandSpool:
             container / "evidence.json",
             container,
         )
-        evidence = strict_model_validate_json(_LabOwnedEntryIsolationEvidence, payload)
-        if evidence.canonical_json_bytes() != payload:
-            raise InvalidCommandEnvelopeError(
-                f"owned isolation evidence is not canonical: {container.name}"
-            )
+        evidence = strict_model_validate_canonical_json(
+            _LabOwnedEntryIsolationEvidence,
+            payload,
+        )
         if str(evidence.isolation_id) != match["isolation_id"]:
             raise InvalidCommandEnvelopeError(
                 f"owned isolation evidence id mismatch: {container.name}"
@@ -1820,7 +1822,7 @@ class LabCommandSpool:
         envelope: LabCommandEnvelope,
     ) -> LabSpoolEntry | LabAcknowledgedCommand:
         validated = LabCommandEnvelope.model_validate(envelope)
-        payload = validated.model_dump_json().encode("utf-8")
+        payload = canonical_model_json_bytes(validated)
         with self._exclusive_lock():
             ack_path = self.ack_dir / f"{validated.request_id}.json"
             pending_path = self._pending_for_request_locked(validated.request_id)
@@ -1869,7 +1871,7 @@ class LabCommandSpool:
                 file_identity=identity,
             ) from exc
         try:
-            envelope = strict_model_validate_json(LabCommandEnvelope, payload)
+            envelope = strict_model_validate_canonical_json(LabCommandEnvelope, payload)
         except Exception as exc:
             raise InvalidCommandEnvelopeError(
                 f"invalid command envelope {candidate.name}: {exc}",
@@ -1979,7 +1981,7 @@ class LabCommandSpool:
             if current.envelope != entry.envelope:
                 raise InvalidCommandEnvelopeError("pending command changed before ack")
             target = self.ack_dir / f"{receipt.request_id}.json"
-            payload = receipt.model_dump_json().encode("utf-8")
+            payload = canonical_model_json_bytes(receipt)
             created = self._publish_no_clobber(target, payload)
             if not created and self.load_receipt(target) != receipt:
                 raise RequestContentConflictError(
@@ -1992,7 +1994,7 @@ class LabCommandSpool:
         candidate, payload, _file_stat = self._read_regular_child(Path(path), self.ack_dir)
         filename_request_id = self._ack_request_id(candidate.name)
         try:
-            receipt = strict_model_validate_json(LabCommandReceipt, payload)
+            receipt = strict_model_validate_canonical_json(LabCommandReceipt, payload)
         except Exception as exc:
             raise InvalidCommandEnvelopeError(
                 f"invalid command receipt {candidate.name}: {exc}"
@@ -2087,7 +2089,7 @@ class LabCommandSpool:
                 )
                 try:
                     _sequence, filename_request_id = self._pending_name_parts(normalized.name)
-                    envelope = strict_model_validate_json(LabCommandEnvelope, payload)
+                    envelope = strict_model_validate_canonical_json(LabCommandEnvelope, payload)
                 except (InvalidCommandEnvelopeError, ValueError):
                     envelope = None
                     filename_request_id = None
@@ -2117,7 +2119,7 @@ class LabCommandSpool:
             original_name=name,
             reason=reason,
         )
-        payload = artifact.model_dump_json().encode("utf-8")
+        payload = canonical_model_json_bytes(artifact)
         if not self._publish_no_clobber(target, payload):
             _candidate, existing, _file_stat = self._read_regular_child(
                 target,

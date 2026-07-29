@@ -54,6 +54,7 @@ from rquant.research_run_spec import (
     ResearchRunSpec,
     ResourceClass,
 )
+from rquant.strict_json import canonical_json_bytes, canonical_model_json_bytes
 
 NOW = datetime(2026, 7, 24, 1, 0, tzinfo=UTC)
 OLD_V1_SPEC_JSON = (
@@ -2486,10 +2487,6 @@ def test_reader_and_exactly_once_replay_accept_real_legacy_v1_ledger(
         reason="submitted",
         job_version=0,
     )
-    command_payload = envelope.model_dump(mode="json")
-    command = command_payload["command"]
-    assert isinstance(command, dict)
-    command["spec"] = json.loads(OLD_V1_SPEC_JSON)
     timestamp = NOW.isoformat(timespec="microseconds")
     deadline = spec.deadline.isoformat(timespec="microseconds")
     with sqlite3.connect(store.path) as connection:
@@ -2537,10 +2534,10 @@ def test_reader_and_exactly_once_replay_accept_real_legacy_v1_ledger(
                 OLD_V1_COMMAND_HASH,
                 "submit",
                 str(job_id),
-                json.dumps(command_payload, separators=(",", ":")),
+                canonical_model_json_bytes(envelope).decode("utf-8"),
                 "applied",
                 "submitted",
-                receipt.model_dump_json(),
+                canonical_model_json_bytes(receipt).decode("utf-8"),
                 0,
                 timestamp,
                 timestamp,
@@ -2718,7 +2715,7 @@ def test_reader_and_replay_fail_closed_on_receipt_job_version_tamper(
             payload["job_version"] = replacement
             connection.execute(
                 "UPDATE lab_command SET receipt_json = ? WHERE request_id = ?",
-                (json.dumps(payload), str(envelope.request_id)),
+                (canonical_json_bytes(payload).decode("utf-8"), str(envelope.request_id)),
             )
 
     with pytest.raises(InvalidStoredJobError, match="job version mismatch"):
@@ -3609,7 +3606,7 @@ def test_reader_and_replay_share_full_receipt_consistency_validation(
         payload[field] = replacement
         connection.execute(
             "UPDATE lab_command SET receipt_json = ? WHERE request_id = ?",
-            (json.dumps(payload), str(envelope.request_id)),
+            (canonical_json_bytes(payload).decode("utf-8"), str(envelope.request_id)),
         )
 
     with pytest.raises(InvalidStoredJobError):

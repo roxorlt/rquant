@@ -28,7 +28,10 @@ from rquant.lab_job_protocol import (
     _LabOwnedIsolationRecord,
 )
 from rquant.research_run_spec import DatasetSnapshotIdentity
-from rquant.strict_json import strict_model_validate_json
+from rquant.strict_json import (
+    canonical_model_json_bytes,
+    strict_model_validate_canonical_json,
+)
 
 _HASH_PATTERN = r"^[0-9a-f]{64}$"
 _CODE_SHA_PATTERN = r"^[0-9a-f]{40}$"
@@ -468,9 +471,7 @@ class LabArtifactCommitSpool(LabCommandSpool):
                 self._scan_cursor_path,
                 self.root,
             )
-            cursor = strict_model_validate_json(LabArtifactCommitScanCursor, payload)
-            if cursor.model_dump_json().encode("utf-8") != payload:
-                raise ValueError("artifact scan cursor JSON is not canonical")
+            cursor = strict_model_validate_canonical_json(LabArtifactCommitScanCursor, payload)
             return cursor
         except (InvalidCommandEnvelopeError, ValueError) as exc:
             with suppress(OSError, InvalidCommandEnvelopeError):
@@ -531,7 +532,7 @@ class LabArtifactCommitSpool(LabCommandSpool):
                     0o600,
                     dir_fd=root_descriptor,
                 )
-                payload = cursor.model_dump_json().encode("utf-8")
+                payload = canonical_model_json_bytes(cursor)
                 offset = 0
                 while offset < len(payload):
                     offset += os.write(temporary_descriptor, payload[offset:])
@@ -637,11 +638,7 @@ class LabArtifactCommitSpool(LabCommandSpool):
             self.quarantine_dir,
             allowed_link_counts=allowed_link_counts,
         )
-        evidence = strict_model_validate_json(LabArtifactConflictEvidence, payload)
-        if evidence.model_dump_json().encode("utf-8") != payload:
-            raise InvalidCommandEnvelopeError(
-                f"artifact conflict evidence is not canonical: {path.name}"
-            )
+        evidence = strict_model_validate_canonical_json(LabArtifactConflictEvidence, payload)
         return evidence, payload, file_stat
 
     def _load_conflict_target_locked(
@@ -807,7 +804,7 @@ class LabArtifactCommitSpool(LabCommandSpool):
     ) -> None:
         self._recover_conflict_evidence_locked()
         target = self._conflict_evidence_path(evidence)
-        payload = evidence.model_dump_json().encode("utf-8")
+        payload = canonical_model_json_bytes(evidence)
         if self._managed_entry_exists(target, target.parent):
             try:
                 existing, existing_payload, _file_stat = self._load_conflict_target_locked(target)
@@ -1023,7 +1020,7 @@ class LabArtifactCommitSpool(LabCommandSpool):
                     payload_path,
                     self.quarantine_dir,
                 )
-                envelope = strict_model_validate_json(LabArtifactCommitEnvelope, payload)
+                envelope = strict_model_validate_canonical_json(LabArtifactCommitEnvelope, payload)
             except (InvalidCommandEnvelopeError, ValueError):
                 continue
             if (str(envelope.request_id), envelope.content_hash) != (
@@ -1039,7 +1036,9 @@ class LabArtifactCommitSpool(LabCommandSpool):
                         metadata_path,
                         self.quarantine_dir,
                     )
-                    record = strict_model_validate_json(LabQuarantinedArtifactCommit, metadata)
+                    record = strict_model_validate_canonical_json(
+                        LabQuarantinedArtifactCommit, metadata
+                    )
                     if (
                         record.path == payload_path
                         and hashlib.sha256(record.reason.encode("utf-8")).hexdigest()[:16]
@@ -1072,7 +1071,9 @@ class LabArtifactCommitSpool(LabCommandSpool):
                     metadata_path,
                     self.quarantine_dir,
                 )
-                record = strict_model_validate_json(LabQuarantinedArtifactCommit, metadata)
+                record = strict_model_validate_canonical_json(
+                    LabQuarantinedArtifactCommit, metadata
+                )
             except (InvalidCommandEnvelopeError, ValueError):
                 continue
             if (
@@ -1183,7 +1184,7 @@ class LabArtifactCommitSpool(LabCommandSpool):
         envelope: LabArtifactCommitEnvelope,
     ) -> LabArtifactCommitSpoolEntry | LabAcknowledgedArtifactCommit:
         validated = LabArtifactCommitEnvelope.model_validate(envelope)
-        payload = validated.model_dump_json().encode("utf-8")
+        payload = canonical_model_json_bytes(validated)
         with self._exclusive_lock():
             ack_path = self.ack_dir / f"{validated.request_id}.json"
             pending_path = self._pending_for_request_locked(validated.request_id)
@@ -1234,7 +1235,7 @@ class LabArtifactCommitSpool(LabCommandSpool):
         )
         try:
             _sequence, filename_request_id = self._pending_name_parts(candidate.name)
-            envelope = strict_model_validate_json(LabArtifactCommitEnvelope, payload)
+            envelope = strict_model_validate_canonical_json(LabArtifactCommitEnvelope, payload)
         except Exception as exc:
             raise InvalidCommandEnvelopeError(
                 f"invalid artifact commit envelope {candidate.name}: {exc}",
@@ -1314,7 +1315,7 @@ class LabArtifactCommitSpool(LabCommandSpool):
             target = self.ack_dir / f"{receipt.request_id}.json"
             created = self._publish_no_clobber(
                 target,
-                receipt.model_dump_json().encode("utf-8"),
+                canonical_model_json_bytes(receipt),
             )
             if not created and self.load_receipt(target) != receipt:
                 raise RequestContentConflictError(
@@ -1327,7 +1328,7 @@ class LabArtifactCommitSpool(LabCommandSpool):
         candidate, payload, _file_stat = self._read_regular_child(Path(path), self.ack_dir)
         filename_request_id = self._ack_request_id(candidate.name)
         try:
-            receipt = strict_model_validate_json(LabArtifactCommitReceipt, payload)
+            receipt = strict_model_validate_canonical_json(LabArtifactCommitReceipt, payload)
         except Exception as exc:
             raise InvalidCommandEnvelopeError(
                 f"invalid artifact commit receipt {candidate.name}: {exc}"

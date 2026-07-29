@@ -8,28 +8,26 @@ services outside the protected market window, run preflight checks, and roll bac
 from __future__ import annotations
 
 import argparse
-import ctypes
 import fcntl
 import json
 import math
 import os
 import re
 import shlex
-import signal
 import stat
-import struct
 import subprocess
 import sys
 import time as monotonic_time
 import tomllib
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, time
 from pathlib import Path
 from typing import Protocol
 from zoneinfo import ZoneInfo
 
+from rquant.contained_subprocess import run_contained
 from rquant.release_generation import (
     ALL_LONG_RUNNING_SERVICES as _ALL_LONG_RUNNING_SERVICES,
 )
@@ -67,11 +65,6 @@ class ProtectedWindowError(PolicyError):
 
 class DeployError(RuntimeError):
     """The rollout failed after repository mutation began."""
-
-
-class _ProcessGroupSignal(BaseException):
-    def __init__(self, signum: int) -> None:
-        self.signum = signum
 
 
 class Runner(Protocol):
@@ -122,107 +115,6 @@ class GenerationFinalizer(Protocol):
     ) -> object: ...
 
 
-def _descendant_processes(root_pid: int, *, timeout_seconds: float) -> set[int]:
-    if timeout_seconds <= 0:
-        raise TimeoutError("process containment deadline expired")
-    deadline = monotonic_time.monotonic() + timeout_seconds
-    children: dict[int, set[int]] = {}
-    if sys.platform == "darwin":
-        try:
-            libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
-            libproc.proc_listallpids.argtypes = [ctypes.c_void_p, ctypes.c_int]
-            libproc.proc_listallpids.restype = ctypes.c_int
-            libproc.proc_pidinfo.argtypes = [
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.c_uint64,
-                ctypes.c_void_p,
-                ctypes.c_int,
-            ]
-            libproc.proc_pidinfo.restype = ctypes.c_int
-            capacity = max(256, libproc.proc_listallpids(None, 0) * 2)
-            pids = (ctypes.c_int * capacity)()
-            count = libproc.proc_listallpids(pids, ctypes.sizeof(pids))
-            if count < 0:
-                raise OSError(ctypes.get_errno(), "proc_listallpids")
-            for pid in pids[:count]:
-                if monotonic_time.monotonic() >= deadline:
-                    raise TimeoutError("process descendant inventory timed out")
-                buffer = ctypes.create_string_buffer(256)
-                size = libproc.proc_pidinfo(pid, 3, 0, buffer, len(buffer))
-                if size < 16:
-                    continue
-                _flags, _status, _xstatus, observed_pid, parent = struct.unpack_from(
-                    "=IIIII", buffer.raw
-                )
-                if observed_pid == pid:
-                    children.setdefault(parent, set()).add(pid)
-        except (OSError, ValueError) as exc:
-            raise RuntimeError("process descendant inventory failed") from exc
-    elif sys.platform.startswith("linux"):
-        try:
-            for entry in Path("/proc").iterdir():
-                if monotonic_time.monotonic() >= deadline:
-                    raise TimeoutError("process descendant inventory timed out")
-                if not entry.name.isdigit():
-                    continue
-                stat_fields = (entry / "stat").read_text(encoding="ascii").split()
-                if len(stat_fields) > 3:
-                    children.setdefault(int(stat_fields[3]), set()).add(int(entry.name))
-        except OSError as exc:
-            raise RuntimeError("process descendant inventory failed") from exc
-    else:
-        raise RuntimeError("process descendant inventory is unsupported on this platform")
-    descendants: set[int] = set()
-    pending = list(children.get(root_pid, ()))
-    while pending:
-        pid = pending.pop()
-        if pid in descendants:
-            continue
-        descendants.add(pid)
-        pending.extend(children.get(pid, ()))
-    return descendants
-
-
-def _terminate_process_tree(
-    process: subprocess.Popen[str],
-    descendants: set[int],
-    *,
-    deadline: float,
-) -> None:
-    remaining = deadline - monotonic_time.monotonic()
-    if remaining > 0:
-        descendants.update(_descendant_processes(process.pid, timeout_seconds=min(0.5, remaining)))
-    for pid in sorted(descendants, reverse=True):
-        with suppress(ProcessLookupError):
-            os.kill(pid, signal.SIGKILL)
-    with suppress(ProcessLookupError):
-        os.killpg(process.pid, signal.SIGKILL)
-    remaining = deadline - monotonic_time.monotonic()
-    if remaining <= 0:
-        raise RuntimeError("process containment deadline expired before reap")
-    try:
-        process.communicate(timeout=remaining)
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError("process group could not be reaped") from exc
-    while descendants:
-        alive: set[int] = set()
-        for pid in descendants:
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                continue
-            except PermissionError as exc:
-                raise RuntimeError("process descendant containment is unverifiable") from exc
-            alive.add(pid)
-        if not alive:
-            return
-        if monotonic_time.monotonic() >= deadline:
-            raise RuntimeError("detached process descendants survived cleanup")
-        descendants = alive
-        monotonic_time.sleep(min(0.01, deadline - monotonic_time.monotonic()))
-
-
 def _run_process_group(
     args: list[str],
     *,
@@ -232,79 +124,14 @@ def _run_process_group(
     pass_fds: tuple[int, ...] = (),
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    process = subprocess.Popen(
+    return run_contained(
         args,
         cwd=cwd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
+        deadline_monotonic=monotonic_time.monotonic() + timeout_seconds,
+        check=check,
         pass_fds=pass_fds,
         env=env,
     )
-    previous_handlers: dict[int, object] = {}
-
-    def forward_signal(signum: int, _frame: object) -> None:
-        raise _ProcessGroupSignal(signum)
-
-    for signum in (signal.SIGINT, signal.SIGTERM):
-        previous = signal.getsignal(signum)
-        if previous is signal.SIG_IGN:
-            continue
-        try:
-            signal.signal(signum, forward_signal)
-        except ValueError:
-            break
-        previous_handlers[signum] = previous
-    caught_signal: _ProcessGroupSignal | None = None
-    hard_deadline = monotonic_time.monotonic() + timeout_seconds
-    cleanup_reserve = min(0.25, max(0.02, timeout_seconds * 0.25))
-    execution_deadline = hard_deadline - cleanup_reserve
-    descendants: set[int] = set()
-    try:
-        while True:
-            remaining = execution_deadline - monotonic_time.monotonic()
-            if remaining <= 0:
-                raise subprocess.TimeoutExpired(args, timeout_seconds)
-            descendants.update(
-                _descendant_processes(process.pid, timeout_seconds=min(0.2, remaining))
-            )
-            try:
-                stdout, stderr = process.communicate(timeout=min(0.05, remaining))
-                break
-            except subprocess.TimeoutExpired:
-                if monotonic_time.monotonic() >= execution_deadline:
-                    raise
-    except subprocess.TimeoutExpired:
-        _terminate_process_tree(process, descendants, deadline=hard_deadline)
-        raise
-    except _ProcessGroupSignal as exc:
-        caught_signal = exc
-        _terminate_process_tree(process, descendants, deadline=hard_deadline)
-        stdout = stderr = ""
-    except BaseException:
-        _terminate_process_tree(process, descendants, deadline=hard_deadline)
-        raise
-    finally:
-        for signum, previous in previous_handlers.items():
-            signal.signal(signum, previous)
-    if caught_signal is not None:
-        previous = previous_handlers[caught_signal.signum]
-        if callable(previous):
-            previous(caught_signal.signum, None)
-            raise InterruptedError(f"process runner interrupted by signal {caught_signal.signum}")
-        signal.signal(caught_signal.signum, signal.SIG_DFL)
-        os.kill(os.getpid(), caught_signal.signum)
-        raise SystemExit(128 + caught_signal.signum)
-    completed = subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
-    if check and completed.returncode != 0:
-        raise subprocess.CalledProcessError(
-            completed.returncode,
-            args,
-            output=stdout,
-            stderr=stderr,
-        )
-    return completed
 
 
 class SubprocessRunner:
@@ -341,6 +168,7 @@ class SubprocessRunner:
             trusted_git_path=self._trusted_git_path,
             command_timeout_seconds=self._command_timeout_seconds,
             overall_timeout_seconds=self._overall_timeout_seconds,
+            overall_deadline_monotonic=self._deadline,
         )
 
     @property
@@ -396,10 +224,15 @@ class IsolatedGenerationFinalizer:
         self._config = config
 
     def for_recovery(self, overall_deadline_monotonic: float) -> IsolatedGenerationFinalizer:
+        current = self._config.overall_deadline_monotonic
         return IsolatedGenerationFinalizer(
             replace(
                 self._config,
-                overall_deadline_monotonic=overall_deadline_monotonic,
+                overall_deadline_monotonic=(
+                    overall_deadline_monotonic
+                    if current is None
+                    else min(current, overall_deadline_monotonic)
+                ),
             )
         )
 

@@ -24,6 +24,7 @@ BOOTSTRAP = ROOT / "scripts" / "bootstrap-lab-daemon.py"
 TRUSTED_GIT = Path("/usr/bin/git")
 RELEASE_AUTHORITY = ROOT / "src" / "rquant" / "release_generation.py"
 CANONICAL_STRICT_JSON = ROOT / "src" / "rquant" / "strict_json.py"
+CONTAINED_SUBPROCESS = ROOT / "src" / "rquant" / "contained_subprocess.py"
 STRICT_JSON = ROOT / "scripts" / "strict_json.py"
 _ORIGINAL_OS_WALK = os.walk
 
@@ -149,31 +150,29 @@ def _prepare_fake_lab_runtime(checkout: Path, *, data_dir: Path | None = None) -
     database_observed = database.stat()
     root_observed = runtime.stat()
     sentinel = runtime / ".prepared.json"
+    sentinel_payload = {
+        "schema_version": 2,
+        "checkout_root": str(checkout),
+        "runtime_root": str(runtime),
+        "runtime_device": root_observed.st_dev,
+        "runtime_inode": root_observed.st_ino,
+        "runtime_authority_id": "a" * 32,
+        "prepared_by_commit": "0" * 40,
+        "managed_directories": directory_bindings,
+        "managed_files": {
+            "lab jobs SQLite": {
+                "path": str(database),
+                "device": database_observed.st_dev,
+                "inode": database_observed.st_ino,
+                "mode": 0o600,
+                "exists": True,
+            }
+        },
+        "migration_sources": {},
+        "prepared_at": "2026-07-28T00:00:00+00:00",
+    }
     sentinel.write_text(
-        json.dumps(
-            {
-                "schema_version": 2,
-                "checkout_root": str(checkout),
-                "runtime_root": str(runtime),
-                "runtime_device": root_observed.st_dev,
-                "runtime_inode": root_observed.st_ino,
-                "runtime_authority_id": "a" * 32,
-                "prepared_by_commit": "0" * 40,
-                "managed_directories": directory_bindings,
-                "managed_files": {
-                    "lab jobs SQLite": {
-                        "path": str(database),
-                        "device": database_observed.st_dev,
-                        "inode": database_observed.st_ino,
-                        "mode": 0o600,
-                        "exists": True,
-                    }
-                },
-                "migration_sources": {},
-                "prepared_at": "2026-07-28T00:00:00+00:00",
-            },
-            sort_keys=True,
-        ),
+        json.dumps(sentinel_payload, sort_keys=True, separators=(",", ":")) + "\n",
         encoding="utf-8",
     )
     sentinel.chmod(0o600)
@@ -201,6 +200,7 @@ def _runtime_checkout(
     shutil.copy2(STRICT_JSON, scripts / STRICT_JSON.name)
     shutil.copy2(RELEASE_AUTHORITY, package / RELEASE_AUTHORITY.name)
     shutil.copy2(CANONICAL_STRICT_JSON, package / CANONICAL_STRICT_JSON.name)
+    shutil.copy2(CONTAINED_SUBPROCESS, package / CONTAINED_SUBPROCESS.name)
     subprocess.run(["git", "init", "-q"], cwd=checkout, check=True)
     (checkout / ".gitignore").write_text(
         "/.env\n/.venv\n__pycache__/\n*.pyc\n*.pyo\n*.so\n*.dylib\n*.pyd\n",
@@ -316,14 +316,16 @@ def _write_lab_installation(
         "schema_version": 2,
         "checkout_root": str(checkout),
         "labels": list(labels),
+        "plists": {label: {} for label in labels},
+        "readiness_root": str(checkout / "data" / "lab-runtime" / "readiness"),
     }
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    path.write_bytes(encoded)
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    path.write_bytes(canonical + b"\n")
     path.chmod(0o600)
     observed = path.stat()
     return {
         "path": str(path),
-        "sha256": hashlib.sha256(encoded).hexdigest(),
+        "sha256": hashlib.sha256(canonical).hexdigest(),
         "device": observed.st_dev,
         "inode": observed.st_ino,
     }
@@ -942,16 +944,15 @@ def test_lab_runtime_wrapper_rejects_executable_inode_replacement_during_preflig
     original_bytes = executable.read_bytes()
     displaced = checkout / ".venv" / "bin" / "rquant.displaced"
     exec_calls: list[tuple[object, ...]] = []
-    original_run = subprocess.run
+    original_run = namespace["main"].__globals__["run_contained"]
     replaced = False
 
     def replace_during_preflight(
-        *args: object,
+        command: list[str],
         **kwargs: object,
     ) -> subprocess.CompletedProcess[str]:
         nonlocal replaced
-        result = original_run(*args, **kwargs)
-        command = args[0]
+        result = original_run(command, **kwargs)
         if not replaced and any(Path(str(value)).name == PREFLIGHT.name for value in command):
             executable.rename(displaced)
             executable.write_bytes(original_bytes)
@@ -959,7 +960,11 @@ def test_lab_runtime_wrapper_rejects_executable_inode_replacement_during_preflig
             replaced = True
         return result
 
-    monkeypatch.setattr(subprocess, "run", replace_during_preflight)
+    monkeypatch.setitem(
+        namespace["main"].__globals__,
+        "run_contained",
+        replace_during_preflight,
+    )
     monkeypatch.setattr(os, "execv", lambda *args: exec_calls.append(args))
     monkeypatch.setattr(sys, "executable", str(checkout / ".venv" / "bin" / "python"))
     monkeypatch.chdir(checkout)
@@ -1001,19 +1006,24 @@ def test_lab_runtime_wrapper_rechecks_tracked_cleanliness_after_preflight(
     namespace["main"].__globals__["__file__"] = str(checkout / "scripts" / WRAPPER.name)
     tracked = checkout / "src" / "rquant" / "__init__.py"
     exec_calls: list[tuple[object, ...]] = []
-    original_run = subprocess.run
+    original_run = namespace["main"].__globals__["run_contained"]
     dirtied = False
 
-    def dirty_after_preflight(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+    def dirty_after_preflight(
+        command: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
         nonlocal dirtied
-        result = original_run(*args, **kwargs)
-        command = args[0]
+        result = original_run(command, **kwargs)
         if not dirtied and any(Path(str(value)).name == PREFLIGHT.name for value in command):
             tracked.write_text("UNTRUSTED = True\n", encoding="utf-8")
             dirtied = True
         return result
 
-    monkeypatch.setattr(subprocess, "run", dirty_after_preflight)
+    monkeypatch.setitem(
+        namespace["main"].__globals__,
+        "run_contained",
+        dirty_after_preflight,
+    )
     monkeypatch.setattr(os, "execv", lambda *args: exec_calls.append(args))
     monkeypatch.setattr(sys, "executable", str(checkout / ".venv" / "bin" / "python"))
     monkeypatch.chdir(checkout)
@@ -1055,23 +1065,26 @@ def test_lab_runtime_wrapper_rechecks_complete_checkout_after_second_preflight(
     namespace["main"].__globals__["__file__"] = str(checkout / "scripts" / WRAPPER.name)
     tracked = checkout / "src" / "rquant" / "__init__.py"
     exec_calls: list[tuple[object, ...]] = []
-    original_run = subprocess.run
+    original_run = namespace["main"].__globals__["run_contained"]
     preflight_calls = 0
 
     def dirty_after_second_preflight(
-        *args: object,
+        command: list[str],
         **kwargs: object,
     ) -> subprocess.CompletedProcess[str]:
         nonlocal preflight_calls
-        result = original_run(*args, **kwargs)
-        command = args[0]
+        result = original_run(command, **kwargs)
         if any(Path(str(value)).name == PREFLIGHT.name for value in command):
             preflight_calls += 1
             if preflight_calls == 2:
                 tracked.write_text("UNTRUSTED_AFTER_SECOND = True\n", encoding="utf-8")
         return result
 
-    monkeypatch.setattr(subprocess, "run", dirty_after_second_preflight)
+    monkeypatch.setitem(
+        namespace["main"].__globals__,
+        "run_contained",
+        dirty_after_second_preflight,
+    )
     monkeypatch.setattr(os, "execv", lambda *args: exec_calls.append(args))
     monkeypatch.setattr(sys, "executable", str(checkout / ".venv" / "bin" / "python"))
     monkeypatch.chdir(checkout)
@@ -1175,18 +1188,17 @@ def test_lab_runtime_wrapper_readonly_git_preserves_index_and_disables_optional_
     git_path, git_identity = namespace["_require_trusted_git"](TRUSTED_GIT)
     index = checkout / ".git" / "index"
     before = (index.read_bytes(), index.stat())
-    original_run = subprocess.run
+    original_run = namespace["_git_commit"].__globals__["run_contained"]
     environments: list[dict[str, str]] = []
 
-    def capture_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
-        command = args[0]
+    def capture_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         if isinstance(command, list) and command and command[0] == str(TRUSTED_GIT):
             environment = kwargs.get("env")
             assert isinstance(environment, dict)
             environments.append(environment)
-        return original_run(*args, **kwargs)
+        return original_run(command, **kwargs)
 
-    monkeypatch.setattr(subprocess, "run", capture_run)
+    monkeypatch.setitem(namespace["_git_commit"].__globals__, "run_contained", capture_run)
 
     assert namespace["_git_commit"](
         checkout,

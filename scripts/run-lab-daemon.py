@@ -10,6 +10,8 @@ import os
 import stat
 import subprocess
 import sys
+import time
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,6 +37,20 @@ _PYTHON_INJECTION_VARIABLES = (
 
 class WrapperError(RuntimeError):
     pass
+
+
+def _load_contained_runner() -> Callable[..., subprocess.CompletedProcess[object]]:
+    path = Path(__file__).resolve().parents[1] / "src" / "rquant" / "contained_subprocess.py"
+    spec = importlib.util.spec_from_file_location("_rquant_wrapper_contained_process", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("contained subprocess authority cannot be loaded")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module.run_contained
+
+
+run_contained = _load_contained_runner()
 
 
 @dataclass(frozen=True)
@@ -351,13 +367,12 @@ def _acquire_immutable_generation(code_root: Path, raw_path: str) -> tuple[Path,
 def _git_commit(root: Path, *, git_path: Path, git_identity: _PathIdentity) -> str:
     _assert_trusted_git(git_path, git_identity)
     try:
-        result = subprocess.run(
+        result = run_contained(
             [str(git_path), "rev-parse", "--verify", "HEAD^{commit}"],
             cwd=root,
+            deadline_monotonic=time.monotonic() + 5,
             check=True,
-            capture_output=True,
             text=True,
-            timeout=5,
             env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"},
         )
     except (OSError, subprocess.SubprocessError) as exc:
@@ -408,15 +423,16 @@ def _run_preflight(
         command.extend(["--provisional-handoff-label", handoff_label])
     if immutable_generation:
         command.append("--immutable-generation")
-    result = subprocess.run(
+    result = run_contained(
         command,
         cwd=root,
+        deadline_monotonic=time.monotonic() + 15,
         check=False,
-        timeout=15,
         pass_fds=(deployment_lock_fd,),
     )
     if result.returncode != 0:
-        raise WrapperError("Lab runtime preflight failed")
+        detail = (result.stderr or result.stdout or "").strip()[:2048]
+        raise WrapperError(detail or "Lab runtime preflight failed")
     _assert_trusted_git(git_path, git_identity)
 
 
@@ -441,14 +457,15 @@ def _run_prepared_sentinel_preflight(
     ]
     if immutable_generation:
         command.append("--immutable-generation")
-    result = subprocess.run(
+    result = run_contained(
         command,
         cwd=root,
+        deadline_monotonic=time.monotonic() + 15,
         check=False,
-        timeout=15,
     )
     if result.returncode != 0:
-        raise WrapperError("Lab runtime prepared sentinel preflight failed")
+        detail = (result.stderr or result.stdout or "").strip()[:2048]
+        raise WrapperError(detail or "Lab runtime prepared sentinel preflight failed")
 
 
 def _immutable_generation_main(args: argparse.Namespace, daemon_argv: list[str]) -> int:

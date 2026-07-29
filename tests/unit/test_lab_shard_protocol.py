@@ -39,6 +39,7 @@ from rquant.lab_shard_protocol import (
     LabWorkerReport,
     LabWorkerStopped,
 )
+from rquant.strict_json import canonical_model_json_bytes
 
 NOW = datetime(2026, 7, 24, 2, 0, tzinfo=UTC)
 PLAN_HASH = "1" * 64
@@ -913,7 +914,7 @@ def test_legacy_revoked_delivery_receipt_remains_a_compatible_fence(
         reason="legacy scheduler revoke",
     )
     path = spool.ack_dir / f"{claim.claim_token}.json"
-    path.write_text(legacy.model_dump_json(), encoding="utf-8")
+    path.write_bytes(canonical_model_json_bytes(legacy))
     payload = path.read_bytes()
 
     replay = LabClaimSpool(root).publish(claim)
@@ -1086,7 +1087,7 @@ def test_execution_admission_rejects_conflicting_marker_content(tmp_path: Path) 
         delivery_content_hash=consumed.receipt.content_hash,
     )
     replacement = admitted.path.with_suffix(".replacement")
-    replacement.write_text(conflicting.model_dump_json(), encoding="utf-8")
+    replacement.write_bytes(canonical_model_json_bytes(conflicting))
     os.replace(replacement, admitted.path)
 
     with pytest.raises(RequestContentConflictError):

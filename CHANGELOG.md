@@ -89,6 +89,16 @@
   deadline 限制。Lab SQLite 中 spec、shard payload、failure、checkpoint、command、receipt 与 event
   等持久 JSON 全部拒绝顶层和嵌套重复键，并要求 canonical bytes/hash，损坏内容不能进入列表或详情。
 
+- **Strategy Lab generation 发布一致性收口**：macOS installed handoff 现在把三份 plist 作为
+  generation-bound 事务内容，在启动目标 daemon 前从目标不可变代码代际重新物化，并将 local/
+  registered installation state 一并推进；任一 plist、state、bootstrap、marker 或 readiness 边界失败
+  都按 identity-bound journal 精确恢复上一代。Git、uv、ABI、plutil、launchctl 与 deploy bootstrap
+  统一使用有界进程树收容器，SIGINT/SIGTERM/timeout/BaseException 会持续追踪并终止 setsid 后代，
+  recovery 继承原绝对 deadline。所有持久 authority/protocol JSON 统一执行重复键拒绝和 exact
+  canonical bytes 合约；SQLite keyword/count/page 在筛选前严格验证 spec。generation GC 统一收集
+  selector、marker、commit、intent、installation、readiness、handoff/supersede 与 prepared/rollback
+  引用，遇到未完成安装事务或损坏引用时在删除前失败关闭。
+
 - **Lab daemon 第十四轮 handoff authority 收敛**：daemon 与 bootstrap 现共用同一份
   handoff record、action edge、supersede chain 和 intent rebound history 校验；provisional
   recovery 必须逐跳证明 physical operation 链与 intent 的 A→B→C rebound 完全一致，并读取核对

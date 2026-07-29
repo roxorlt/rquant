@@ -61,6 +61,10 @@ from rquant.strategy_job_adapters import (
     StrategyJobAdapterRegistry,
     default_strategy_job_adapter_registry,
 )
+from rquant.strict_json import (
+    strict_canonical_json_loads,
+    strict_model_validate_canonical_json,
+)
 
 LAB_WORKER_MAX_SHARDS_PER_TICK = 1
 _HASH_PATTERN = r"^[0-9a-f]{64}$"
@@ -1807,7 +1811,7 @@ class LabWorker:
                 1,
             ):
                 raise LabArtifactConflictError("sealed result manifest changed while validating")
-            manifest = LabShardResultManifest.model_validate_json(raw)
+            manifest = strict_model_validate_canonical_json(LabShardResultManifest, raw)
         except LabArtifactConflictError:
             raise
         except Exception as exc:
@@ -2889,7 +2893,7 @@ class LabArtifactReclaimer:
                 after.st_nlink,
             ) != (before.st_dev, before.st_ino, before.st_size, 1):
                 raise LabArtifactConflictError("reclaim ledger changed while validating")
-            ledger = LabReclaimLedger.model_validate_json(raw)
+            ledger = strict_model_validate_canonical_json(LabReclaimLedger, raw)
         except LabArtifactConflictError:
             raise
         except Exception as exc:
@@ -3216,7 +3220,7 @@ class LabArtifactReclaimer:
             raise LabArtifactConflictError("quarantine queue entry name is invalid")
         raw = self._read_recovery_metadata(path, label="quarantine queue entry")
         try:
-            entry = LabQuarantineQueueEntry.model_validate_json(raw)
+            entry = strict_model_validate_canonical_json(LabQuarantineQueueEntry, raw)
         except Exception as exc:
             raise LabArtifactConflictError(f"invalid quarantine queue entry: {exc}") from exc
         if entry.sequence != int(match.group("sequence")) or raw != entry.canonical_json():
@@ -3226,7 +3230,7 @@ class LabArtifactReclaimer:
     def _load_recovery_queue_marker(self, path: Path) -> LabQuarantineQueueEntry:
         raw = self._read_recovery_metadata(path, label="quarantine queue marker")
         try:
-            entry = LabQuarantineQueueEntry.model_validate_json(raw)
+            entry = strict_model_validate_canonical_json(LabQuarantineQueueEntry, raw)
         except Exception as exc:
             raise LabArtifactConflictError(f"invalid quarantine queue marker: {exc}") from exc
         expected_name = f"{entry.phase}-{entry.intent.owner.garbage_id.hex}.json"
@@ -3302,7 +3306,7 @@ class LabArtifactReclaimer:
     def _load_recovery_queue_conflict(self, path: Path) -> LabQuarantineQueueConflict:
         raw = self._read_recovery_metadata(path, label="quarantine queue conflict")
         try:
-            conflict = LabQuarantineQueueConflict.model_validate_json(raw)
+            conflict = strict_model_validate_canonical_json(LabQuarantineQueueConflict, raw)
         except Exception as exc:
             raise LabArtifactConflictError(f"invalid quarantine queue conflict: {exc}") from exc
         if path != self._recovery_queue_conflict_path(conflict.sequence):
@@ -3375,7 +3379,7 @@ class LabArtifactReclaimer:
     ) -> LabQuarantineQueueRepairIntent:
         raw = self._read_recovery_metadata(path, label="quarantine queue repair intent")
         try:
-            intent = LabQuarantineQueueRepairIntent.model_validate_json(raw)
+            intent = strict_model_validate_canonical_json(LabQuarantineQueueRepairIntent, raw)
         except Exception as exc:
             raise LabArtifactConflictError(f"invalid queue repair intent: {exc}") from exc
         if path != self._recovery_queue_repair_intent_path(intent.sequence):
@@ -3390,7 +3394,7 @@ class LabArtifactReclaimer:
     ) -> LabQuarantineQueueRepairResult:
         raw = self._read_recovery_metadata(path, label="quarantine queue repair result")
         try:
-            result = LabQuarantineQueueRepairResult.model_validate_json(raw)
+            result = strict_model_validate_canonical_json(LabQuarantineQueueRepairResult, raw)
         except Exception as exc:
             raise LabArtifactConflictError(f"invalid queue repair result: {exc}") from exc
         if path != self._recovery_queue_repair_result_path(result.sequence):
@@ -3407,7 +3411,7 @@ class LabArtifactReclaimer:
             label="quarantine queue sequence",
         )
         try:
-            state = LabQuarantineQueueSequence.model_validate_json(raw)
+            state = strict_model_validate_canonical_json(LabQuarantineQueueSequence, raw)
         except Exception as exc:
             raise LabArtifactConflictError(f"invalid quarantine queue sequence: {exc}") from exc
         if raw != state.canonical_json():
@@ -3422,7 +3426,7 @@ class LabArtifactReclaimer:
             label="quarantine queue cursor",
         )
         try:
-            cursor = LabQuarantineQueueCursor.model_validate_json(raw)
+            cursor = strict_model_validate_canonical_json(LabQuarantineQueueCursor, raw)
         except Exception as exc:
             raise LabArtifactConflictError(f"invalid quarantine queue cursor: {exc}") from exc
         if raw != cursor.canonical_json():
@@ -3767,7 +3771,7 @@ class LabArtifactReclaimer:
             os.close(descriptor)
         try:
             raw = b"".join(chunks).decode("utf-8")
-            intent = LabGarbagePreparedIntent.model_validate_json(raw)
+            intent = strict_model_validate_canonical_json(LabGarbagePreparedIntent, raw)
         except Exception as exc:
             raise LabArtifactConflictError(f"invalid prepared intent: {exc}") from exc
         if raw != intent.canonical_json():
@@ -4031,7 +4035,7 @@ class LabArtifactReclaimer:
             os.close(descriptor)
         try:
             raw = b"".join(chunks).decode("utf-8")
-            metadata = LabGarbageOrphanMetadata.model_validate_json(raw)
+            metadata = strict_model_validate_canonical_json(LabGarbageOrphanMetadata, raw)
         except Exception as exc:
             raise LabArtifactConflictError(f"invalid garbage orphan metadata: {exc}") from exc
         if raw != metadata.canonical_json():
@@ -4411,7 +4415,7 @@ class LabArtifactReclaimer:
             raise LabArtifactConflictError("garbage ledger name is invalid")
         try:
             raw = path.read_text(encoding="utf-8")
-            ledger = LabGarbageLedger.model_validate_json(raw)
+            ledger = strict_model_validate_canonical_json(LabGarbageLedger, raw)
         except Exception as exc:
             raise LabArtifactConflictError(f"invalid garbage ledger: {exc}") from exc
         after = self._regular_file_identity(path, label="garbage ledger")
@@ -4500,7 +4504,7 @@ class LabArtifactReclaimer:
         identity = self._regular_file_identity(marker, label="garbage owner marker")
         try:
             raw = marker.read_text(encoding="utf-8")
-            owner = LabGarbageOwner.model_validate_json(raw)
+            owner = strict_model_validate_canonical_json(LabGarbageOwner, raw)
         except Exception as exc:
             raise LabArtifactConflictError(f"invalid garbage owner marker: {exc}") from exc
         after = self._regular_file_identity(marker, label="garbage owner marker")
@@ -4907,7 +4911,7 @@ class LabArtifactReclaimer:
                 path,
                 label="legacy quarantine migration marker",
             )
-            payload = json.loads(raw)
+            payload = strict_canonical_json_loads(raw)
             marker = LabQuarantineMigrationComplete.model_validate(payload)
             canonical = marker.canonical_json()
         except Exception:
@@ -4971,7 +4975,7 @@ class LabArtifactReclaimer:
             label="quarantine queue migration marker",
         )
         try:
-            marker = LabQuarantineQueueMigrationComplete.model_validate_json(raw)
+            marker = strict_model_validate_canonical_json(LabQuarantineQueueMigrationComplete, raw)
         except Exception as exc:
             raise LabArtifactConflictError(
                 f"invalid quarantine queue migration marker: {exc}"
@@ -5153,7 +5157,7 @@ class LabArtifactReclaimer:
     ) -> LabQuarantineQueueMigrationCycle:
         raw = self._read_recovery_metadata(path, label="quarantine migration cycle")
         try:
-            cycle = LabQuarantineQueueMigrationCycle.model_validate_json(raw)
+            cycle = strict_model_validate_canonical_json(LabQuarantineQueueMigrationCycle, raw)
         except Exception as exc:
             raise LabArtifactConflictError(f"invalid quarantine migration cycle: {exc}") from exc
         if raw != cycle.canonical_json():
@@ -5180,7 +5184,7 @@ class LabArtifactReclaimer:
             label="quarantine migration cursor",
         )
         try:
-            cursor = LabQuarantineQueueMigrationCursor.model_validate_json(raw)
+            cursor = strict_model_validate_canonical_json(LabQuarantineQueueMigrationCursor, raw)
         except Exception as exc:
             raise LabArtifactConflictError(f"invalid quarantine migration cursor: {exc}") from exc
         if (
@@ -5233,7 +5237,7 @@ class LabArtifactReclaimer:
         path = self._migration_index_path(cycle, index)
         raw = self._read_recovery_metadata(path, label="quarantine migration index entry")
         try:
-            entry = LabQuarantineQueueMigrationIndexEntry.model_validate_json(raw)
+            entry = strict_model_validate_canonical_json(LabQuarantineQueueMigrationIndexEntry, raw)
         except Exception as exc:
             raise LabArtifactConflictError(
                 f"invalid quarantine migration index entry: {exc}"

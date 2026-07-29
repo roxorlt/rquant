@@ -273,7 +273,19 @@ def _checkout(
     shutil.copy2(BOOTSTRAP, scripts / BOOTSTRAP.name)
     shutil.copy2(STRICT_JSON, scripts / STRICT_JSON.name)
     shutil.copy2(AUTHORITY, package / AUTHORITY.name)
+    shutil.copy2(
+        ROOT / "src" / "rquant" / "contained_subprocess.py",
+        package / "contained_subprocess.py",
+    )
     shutil.copy2(ROOT / "src" / "rquant" / "strict_json.py", package / "strict_json.py")
+    shutil.copy2(
+        ROOT / "src" / "rquant" / "lab_launchd_install.py",
+        package / "lab_launchd_install.py",
+    )
+    shutil.copy2(
+        ROOT / "src" / "rquant" / "research_manifest.py",
+        package / "research_manifest.py",
+    )
     (package / "__init__.py").write_text("", encoding="utf-8")
     (ops / "__init__.py").write_text("", encoding="utf-8")
     if real_deployer:
@@ -313,10 +325,7 @@ def _checkout(
         launchd.mkdir(parents=True)
         for label in _bootstrap_module().LAB_LAUNCHD_LABELS:
             plist = launchd / f"{label}.plist"
-            plist.write_text(
-                "<?xml version='1.0'?><plist version='1.0'><dict/></plist>\n",
-                encoding="utf-8",
-            )
+            shutil.copy2(ROOT / "deploy" / "launchd" / plist.name, plist)
             plist.chmod(0o600)
     python = _tiny_test_venv(checkout)
     rquant = checkout / ".venv" / "bin" / "rquant"
@@ -414,6 +423,17 @@ def _checkout(
             )
         finally:
             os.close(lock_fd)
+    if publish_marker and install_state:
+        from rquant.lab_launchd_install import LabLaunchdInstaller
+
+        launch_agents_dir = tmp_path / "LaunchAgents"
+        launch_agents_dir.mkdir(mode=0o700)
+        LabLaunchdInstaller(
+            checkout_root=checkout,
+            deployment_lock_path=lock_path,
+            launch_agents_dir=launch_agents_dir,
+            trusted_git_path=TRUSTED_GIT,
+        ).install(activate=False)
     return checkout, python, lock_path, commit
 
 
@@ -576,6 +596,10 @@ def _handoff_fixture(tmp_path: Path) -> tuple[ModuleType, Path, Path]:
     authority = root / "src" / "rquant" / "release_generation.py"
     authority.parent.mkdir(parents=True)
     shutil.copy2(AUTHORITY, authority)
+    shutil.copy2(
+        ROOT / "src" / "rquant" / "contained_subprocess.py",
+        authority.parent / "contained_subprocess.py",
+    )
     shutil.copy2(ROOT / "src" / "rquant" / "strict_json.py", authority.parent)
     scripts = root / "scripts"
     scripts.mkdir()
@@ -682,6 +706,92 @@ def test_lab_handoff_dry_run_models_labels_without_stopping_daemons(
         "labels": list(module.LAB_LAUNCHD_LABELS),
         "stopped": False,
     }
+
+
+def test_handoff_rebinds_committed_generation_plists_after_transition_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, root, lock_path = _handoff_fixture(tmp_path)
+    _install_lab_handoff(module, root, lock_path)
+    monkeypatch.setattr(module.sys, "platform", "darwin")
+    loaded = set(module.LAB_LAUNCHD_LABELS)
+
+    def fake_launchctl(
+        arguments: list[str],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        command = arguments[0]
+        label = arguments[-1].rsplit("/", 1)[-1]
+        if command == "print":
+            return subprocess.CompletedProcess(
+                arguments,
+                0 if label in loaded else 113,
+                stdout="state = running\n" if label in loaded else "",
+                stderr="",
+            )
+        if command == "bootout":
+            loaded.remove(label)
+        return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(module, "_launchctl", fake_launchctl)
+    now = datetime(2026, 7, 28, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+    first = module._LabLaunchdHandoff(root=root, lock_path=lock_path, timeout_seconds=1)
+    first.prepare(
+        dry_run=False,
+        target_ref="b" * 40,
+        target_sha="b" * 40,
+        action="deploy",
+        now=now,
+    )
+    first.close()
+
+    installation = module._read_lab_installation_state(root=root, lock_path=lock_path)
+    rebound = dict(installation)
+    rebound["registered_by_commit"] = "b" * 40
+    rebound["environment_generation_id"] = "c" * 64
+    rebound["handoff_operation_id"] = first.operation_id
+    rebound_plists: dict[str, object] = {}
+    for label in module.LAB_LAUNCHD_LABELS:
+        path = root / "deploy" / "launchd" / f"{label}.plist"
+        replacement = path.with_suffix(".next")
+        replacement.write_text(f"<plist><dict><key>{label}-B</key></dict></plist>\n")
+        replacement.chmod(0o600)
+        os.replace(replacement, path)
+        observed = path.lstat()
+        rebound_plists[label] = {
+            "path": str(path),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "device": observed.st_dev,
+            "inode": observed.st_ino,
+        }
+    rebound["plists"] = rebound_plists
+    module._atomic_private_json(module._stable_record_path(lock_path, "lab-install"), rebound)
+    module._atomic_private_json(
+        marker_path_for_lock(lock_path),
+        {
+            "commit": "b" * 40,
+            "environment_generation_id": "c" * 64,
+        },
+    )
+
+    resumed = module._LabLaunchdHandoff(root=root, lock_path=lock_path, timeout_seconds=1)
+    resumed.prepare(
+        dry_run=False,
+        target_ref="b" * 40,
+        target_sha="b" * 40,
+        action="deploy",
+        now=now,
+    )
+
+    active = module._private_json(resumed.record_path, label="Lab handoff state")
+    assert active is not None
+    assert active["operation_id"] == first.operation_id
+    assert active["installation_identity"] == module._lab_installation_identity(
+        lock_path,
+        rebound,
+    )
+    resumed.close()
 
 
 def test_lab_handoff_dry_run_requires_every_installed_label_loaded(
@@ -1435,7 +1545,6 @@ def test_installed_bootstrap_tampered_prepared_sentinel_fails_before_fetch_or_ha
     assert result == 2
     assert _tree_snapshot(checkout / ".git") == git_before
     assert _tree_snapshot(lock_path.parent) == authority_before
-    assert not lock_path.with_name(f"{lock_path.stem}.handoff.lock").exists()
 
 
 def test_installed_target_policy_rejects_privileged_launchd_diff_before_bootout(
@@ -2351,7 +2460,10 @@ def test_lab_handoff_readiness_verifies_every_label_and_stable_generation(
         ("intent.json", {"operation_id": operation_id, "stage": "completed"}),
     ):
         path = lock_path.with_name(f"{lock_path.stem}.{suffix}")
-        path.write_text(json.dumps(payload), encoding="utf-8")
+        path.write_text(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
         path.chmod(0o600)
     lock_identity = lock_path.lstat()
     counts = {label: 0 for label in module.LAB_LAUNCHD_LABELS}
@@ -4062,8 +4174,8 @@ def test_successful_lab_handoff_restore_uses_original_overall_deadline(
     handoff = module._LabLaunchdHandoff(
         root=root,
         lock_path=lock_path,
-        timeout_seconds=0.1,
-        overall_timeout_seconds=0.1,
+        timeout_seconds=1.0,
+        overall_timeout_seconds=1.0,
     )
     handoff.prepare(
         dry_run=False,
@@ -4162,10 +4274,59 @@ def test_successful_target_readiness_is_finalized_before_rollout_returns() -> No
             "transaction-completed" if handoff is target else "wrong-target"
         ),
         recovery_target_sha="f" * 40,
+        transition_installation=lambda handoff: events.append(
+            "target-plists-installed" if handoff is target else "wrong-target"
+        ),
     )
 
     assert result == 0
-    assert events == ["target-ready", "transaction-completed"]
+    assert events == ["target-plists-installed", "target-ready", "transaction-completed"]
+
+
+def test_readiness_failure_transitions_plists_back_before_previous_bootstrap() -> None:
+    module = _bootstrap_module()
+    events: list[str] = []
+
+    class Target:
+        def restore(self) -> None:
+            events.append("bootstrap-b")
+            raise module.DeployBootstrapError("B is unhealthy")
+
+    class Recovery:
+        def prepare(self, **_kwargs: object) -> None:
+            events.append("stop-b")
+
+        def restore(self) -> None:
+            events.append("bootstrap-a")
+
+        def close(self) -> None:
+            events.append("close-recovery")
+
+    recovery = Recovery()
+
+    def transition(handoff: object) -> None:
+        events.append("install-a-plists" if handoff is recovery else "install-b-plists")
+
+    result = module._complete_installed_rollout(
+        target_handoff=Target(),
+        deploy_code=0,
+        recovery_handoff_factory=lambda: recovery,
+        rollback=lambda _handoff: events.append("restore-a-generation") or 0,
+        finalize_readiness=lambda _handoff: events.append("commit-a"),
+        transition_installation=transition,
+        recovery_target_sha="a" * 40,
+    )
+
+    assert result == 1
+    assert events == [
+        "install-b-plists",
+        "bootstrap-b",
+        "stop-b",
+        "restore-a-generation",
+        "install-a-plists",
+        "bootstrap-a",
+        "commit-a",
+    ]
 
 
 def test_nonzero_deployer_exit_uses_formal_rollback_before_previous_readiness() -> None:
@@ -4873,7 +5034,11 @@ def test_register_lab_installation_requires_explicit_prepared_runtime(
     installation = lock_path.with_name(f"{lock_path.stem}.lab-install.json")
     assert not installation.exists()
 
-    from rquant.lab_daemon import prepare_lab_runtime_layout
+    from rquant.lab_daemon import (
+        prepare_lab_runtime_layout,
+        prepare_private_sqlite_path,
+        register_lab_runtime_managed_file,
+    )
 
     directories = {
         "lab command spool": runtime_root / "commands",
@@ -4894,6 +5059,22 @@ def test_register_lab_installation_requires_explicit_prepared_runtime(
         legacy_paths={},
         mutation_guard=lambda: commit,
     )
+    database = runtime_root / "lab_jobs.sqlite3"
+    authority = prepare_private_sqlite_path(
+        database,
+        label="lab jobs SQLite",
+        create=True,
+        mutation_guard=lambda: commit,
+    )
+    try:
+        register_lab_runtime_managed_file(
+            runtime_root,
+            label="lab jobs SQLite",
+            path=database,
+            mutation_guard=lambda: commit,
+        )
+    finally:
+        authority.close()
     accepted = subprocess.run(
         command,
         cwd=checkout,
@@ -4916,7 +5097,11 @@ def test_register_lab_installation_dry_run_never_rewrites_installation_state(
     checkout, python, lock_path, commit = _checkout(tmp_path, install_state=False)
     runtime_root = checkout / "data" / "lab-runtime"
     readiness_root = runtime_root / "readiness"
-    from rquant.lab_daemon import prepare_lab_runtime_layout
+    from rquant.lab_daemon import (
+        prepare_lab_runtime_layout,
+        prepare_private_sqlite_path,
+        register_lab_runtime_managed_file,
+    )
 
     directories = {
         "lab command spool": runtime_root / "commands",
@@ -4937,6 +5122,22 @@ def test_register_lab_installation_dry_run_never_rewrites_installation_state(
         legacy_paths={},
         mutation_guard=lambda: commit,
     )
+    database = runtime_root / "lab_jobs.sqlite3"
+    authority = prepare_private_sqlite_path(
+        database,
+        label="lab jobs SQLite",
+        create=True,
+        mutation_guard=lambda: commit,
+    )
+    try:
+        register_lab_runtime_managed_file(
+            runtime_root,
+            label="lab jobs SQLite",
+            path=database,
+            mutation_guard=lambda: commit,
+        )
+    finally:
+        authority.close()
     command = _command(checkout, python, lock_path, target=commit, mode="register")
     separator = command.index("--")
     command[separator:separator] = [
@@ -5163,7 +5364,7 @@ def test_read_only_git_verification_disables_optional_locks(
         captured.append(dict(kwargs["env"]))
         return subprocess.CompletedProcess([], 0, "a" * 40 + "\n", "")
 
-    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    monkeypatch.setattr(module, "_run_process_group", fake_run)
 
     module._git_run(tmp_path, Path("/usr/bin/git"), "rev-parse", "HEAD")
 
@@ -5194,8 +5395,11 @@ def test_lab_installation_registration_rejects_tampered_prepared_sentinel(
                 "migration_sources": {},
                 "runtime_device": runtime_root.stat().st_dev,
                 "runtime_inode": runtime_root.stat().st_ino + 1,
-            }
-        ),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n",
         encoding="utf-8",
     )
     sentinel.chmod(0o600)

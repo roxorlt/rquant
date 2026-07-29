@@ -98,6 +98,7 @@ from rquant.strategy_job_adapters import (
     build_adapter_execution_contract,
     default_strategy_job_adapter_registry,
 )
+from rquant.strict_json import canonical_model_json_bytes
 
 from .test_lab_jobs import _create_v4_job_fixture
 from .test_lab_worker import (
@@ -641,10 +642,10 @@ def _insert_duplicate_accepted_success(path: Path, snapshot: LabFinalizationSnap
                 str(report.job_id),
                 str(report.shard_id),
                 report.body.report_type,
-                report.model_dump_json(),
+                canonical_model_json_bytes(report).decode("utf-8"),
                 receipt.status,
                 receipt.reason,
-                receipt.model_dump_json(),
+                canonical_model_json_bytes(receipt).decode("utf-8"),
                 report.claim_generation,
                 report.scheduler_fencing_token,
                 original.received_at.isoformat(timespec="microseconds"),

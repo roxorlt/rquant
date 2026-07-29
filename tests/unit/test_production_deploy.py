@@ -1614,17 +1614,11 @@ def test_failed_preflight_rolls_back_code_and_dependencies(tmp_path: Path) -> No
     assert '"status": "rolled_back"' in audit
 
 
-def test_failed_target_uses_fresh_runner_budget_for_rollback(tmp_path: Path) -> None:
-    recovery_runner = FakeRunner(_base_responses())
-
-    class ExpiringRunner(SequenceRunner):
-        def for_recovery(self) -> FakeRunner:
-            return recovery_runner
-
-    runner = ExpiringRunner(
+def test_failed_target_recovery_reuses_original_runner_deadline(tmp_path: Path) -> None:
+    runner = SequenceRunner(
         _base_responses(),
         command=("rquant", "preflight"),
-        sequence=[(1, "target failed")],
+        sequence=[(1, "target failed"), (0, "old ready"), (0, "old ready")],
     )
     authority = FakeGenerationAuthority()
 
@@ -1636,8 +1630,7 @@ def test_failed_target_uses_fresh_runner_budget_for_rollback(tmp_path: Path) -> 
             generation_finalizer=FakeGenerationFinalizer(),
         )
 
-    assert ("git", "reset", "--hard", _sha("a")) not in runner.calls
-    assert ("git", "reset", "--hard", _sha("a")) in recovery_runner.calls
+    assert ("git", "reset", "--hard", _sha("a")) in runner.calls
 
 
 def test_failed_merge_attempt_still_restores_previous_head(tmp_path: Path) -> None:
@@ -1816,7 +1809,7 @@ def test_process_runner_timeout_contains_detached_grandchild(tmp_path: Path) -> 
     assert not marker.exists()
 
 
-def test_subprocess_runner_recovery_budget_is_independent(tmp_path: Path) -> None:
+def test_subprocess_runner_recovery_inherits_expired_global_deadline(tmp_path: Path) -> None:
     runner = SubprocessRunner(
         tmp_path,
         command_timeout_seconds=0.1,
@@ -1825,12 +1818,11 @@ def test_subprocess_runner_recovery_budget_is_independent(tmp_path: Path) -> Non
     time.sleep(0.12)
 
     recovery = runner.for_recovery()
-    completed = recovery.run([sys.executable, "-c", "print('recovered')"])
+    with pytest.raises(DeployError, match="overall timeout"):
+        recovery.run([sys.executable, "-c", "print('recovered')"])
 
-    assert completed.stdout.strip() == "recovered"
 
-
-def test_isolated_finalizer_recovery_uses_fresh_recovery_deadline(tmp_path: Path) -> None:
+def test_isolated_finalizer_recovery_cannot_extend_original_deadline(tmp_path: Path) -> None:
     baseline = _config(tmp_path)
     original = production_deploy.IsolatedGenerationFinalizer(
         DeployConfig(
@@ -1845,7 +1837,7 @@ def test_isolated_finalizer_recovery_uses_fresh_recovery_deadline(tmp_path: Path
     )
     recovered = original.for_recovery(time.monotonic() + 30)
 
-    assert recovered._config.overall_deadline_monotonic > time.monotonic()
+    assert recovered._config.overall_deadline_monotonic < time.monotonic()
 
 
 def test_subprocess_runner_uses_inherited_end_to_end_deadline(tmp_path: Path) -> None:

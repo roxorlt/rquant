@@ -74,6 +74,7 @@ from rquant.strategy_job_adapters import (
     StrategyJobAdapterRegistry,
     default_strategy_job_adapter_registry,
 )
+from rquant.strict_json import strict_model_validate_canonical_json
 
 
 class LabFinalizationError(RuntimeError):
@@ -1065,7 +1066,9 @@ class LabSealedShardBundleReader:
                     "accepted shard manifest parsing peak exceeds configured memory limit"
                 )
             try:
-                manifest = LabShardResultManifest.model_validate_json(manifest_bytes)
+                manifest = strict_model_validate_canonical_json(
+                    LabShardResultManifest, manifest_bytes
+                )
             except Exception as exc:
                 raise LabFinalizationIntegrityError("accepted shard manifest is invalid") from exc
             if manifest_bytes != manifest.canonical_json().encode("utf-8"):

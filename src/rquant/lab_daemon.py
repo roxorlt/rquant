@@ -28,17 +28,35 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from rquant.lab_artifact_protocol import LabFinalizerAuthorityKey
 
 
-def _load_strict_json() -> tuple[type[ValueError], Callable[[str | bytes | bytearray], object]]:
+def _load_strict_json() -> tuple[
+    type[ValueError],
+    Callable[[str | bytes | bytearray], object],
+    Callable[..., object],
+    Callable[..., object],
+    Callable[..., bytes],
+]:
     path = Path(__file__).resolve().parents[2] / "scripts" / "strict_json.py"
     spec = importlib.util.spec_from_file_location("_rquant_lab_strict_json", path)
     if spec is None or spec.loader is None:
         raise RuntimeError("strict JSON authority cannot be loaded")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.StrictJsonError, module.strict_json_loads
+    return (
+        module.StrictJsonError,
+        module.strict_json_loads,
+        module.strict_canonical_json_loads,
+        module.strict_model_validate_canonical_json,
+        module.canonical_model_json_bytes,
+    )
 
 
-StrictJsonError, strict_json_loads = _load_strict_json()
+(
+    StrictJsonError,
+    strict_json_loads,
+    strict_canonical_json_loads,
+    strict_model_validate_canonical_json,
+    canonical_model_json_bytes,
+) = _load_strict_json()
 
 _CODE_SHA = re.compile(r"^[0-9a-f]{40}$")
 _KEY_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -522,7 +540,7 @@ def _read_runtime_prepared_sentinel_record(
             after.st_nlink,
         ):
             raise LabDaemonConfigurationError("lab runtime prepared sentinel identity changed")
-        payload = strict_json_loads(b"".join(chunks))
+        payload = strict_canonical_json_loads(b"".join(chunks), trailing_newline=True)
         if not isinstance(payload, dict):
             raise LabDaemonConfigurationError("lab runtime prepared sentinel is malformed")
         return payload, (opened.st_dev, opened.st_ino), root_identity
@@ -1831,7 +1849,10 @@ class LabAuthorityKeyring:
             label="authority verification keyring",
         )
         try:
-            document = strict_json_loads(ring_payload)
+            document = strict_canonical_json_loads(
+                ring_payload,
+                trailing_newline=True,
+            )
         except (UnicodeDecodeError, StrictJsonError) as exc:
             raise LabDaemonConfigurationError("authority keyring is not valid JSON") from exc
         if not isinstance(document, dict) or document.get("schema_version") != 1:
@@ -2003,7 +2024,7 @@ class LabDaemonReadinessPublisher:
             generation_lock_device=lock.st_dev,
             generation_lock_inode=lock.st_ino,
         )
-        payload = (heartbeat.model_dump_json() + "\n").encode("utf-8")
+        payload = canonical_model_json_bytes(heartbeat) + b"\n"
         root_fd, root_stat = self._root_fd(create=True)
         temporary = f".{self.label}.{os.getpid()}.{uuid4().hex}.tmp"
         descriptor = -1
@@ -2094,7 +2115,9 @@ class LabDaemonReadinessPublisher:
                 root_stat.st_ino,
             ):
                 raise LabDaemonConfigurationError("readiness root identity changed")
-            return LabDaemonReadiness.model_validate(strict_json_loads(payload))
+            return strict_model_validate_canonical_json(
+                LabDaemonReadiness, payload, trailing_newline=True
+            )
         except (OSError, ValueError) as exc:
             raise LabDaemonConfigurationError("readiness heartbeat is invalid") from exc
         finally:
@@ -2618,7 +2641,7 @@ class LabFinalizerStateStore:
             ) or len(payload) != final.st_size:
                 raise LabDaemonConfigurationError("lab finalizer state changed during read")
             try:
-                state = LabFinalizerDaemonState.model_validate(strict_json_loads(payload))
+                state = strict_model_validate_canonical_json(LabFinalizerDaemonState, payload)
             except (ValueError, TypeError) as exc:
                 raise LabDaemonConfigurationError("lab finalizer state is corrupt") from exc
             if len(state.failures) > self._MAX_FAILURES:
@@ -2673,7 +2696,7 @@ class LabFinalizerStateStore:
         state = LabFinalizerDaemonState.model_validate(state.model_dump())
         if len(state.failures) > self._MAX_FAILURES:
             raise LabDaemonConfigurationError("lab finalizer state has too many failures")
-        payload = state.model_dump_json().encode("utf-8")
+        payload = canonical_model_json_bytes(state)
         if len(payload) > self._MAX_BYTES:
             raise LabDaemonConfigurationError("lab finalizer state file is too large")
         root_descriptor, root_identity = self._open_root()

@@ -276,13 +276,17 @@ Linux profile 保持既有 systemd service/timer 计划；macOS profile 不运�
 worker、finalizer，而不按文件后缀猜测“这次改动大概无关”。交接在交易保护窗口外确认三个 label
 均已 loaded，各执行一次 bootout，部署完成后各 bootstrap 一次，不用重启循环掩盖故障。
 
-`deploy/launchd/*.plist` 属于受控基础设施，不进入普通代码发布：change plan 会像 systemd、nginx、
-sudoers 一样 fail closed，并要求独立人工验收/安装。plist 安装或更新后，必须重新运行
+`deploy/launchd/*.plist` 属于受控基础设施，不进入普通代码发布：模板内容变化会像 systemd、nginx、
+sudoers 一样 fail closed，并要求独立人工验收/安装。模板不变的普通 A→B 代码发布仍必须把 plist
+中的 Python、code root、launcher 与 commit 从 A 原子重绑到 B；handoff 在 bootstrap B 前使用安装
+事务 journal 重新物化三份 generation-bound plist，并同步 local/registered installation state，失败
+则精确恢复 A 的文件 inode、状态和 loaded 集合，不要求人工再次调用 installer。基础设施模板安装或
+更新后，必须重新运行
 `--register-lab-installation` 持久化新的文件 hash 与 inode；对完全相同的安装重复登记保持原文件
 inode/bytes 不变，避免使既有 completed proof 失效。若已经存在 deployment handoff authority，plist、
 runtime root 或 installation identity 的变更会要求单独受控迁移，不允许普通 re-registration 覆盖；
-尚未产生 deployment handoff 的首次安装基线可归档旧 descriptor 后更新。普通发布既不会偷偷替换
-plist，也不会在 checkout 后才因旧 installation state 失败。Linux profile 的 systemd 规则保持不变。
+尚未产生 deployment handoff 的首次安装基线可归档旧 descriptor 后更新。Linux profile 的 systemd
+规则保持不变。
 
 交接本身也有独立的 `0600` 持久事务记录：在第一次 bootout 前 fsync operation id、已解析验证的
 exact target/ref、action、release profile、lifecycle、installation identity、原 loaded label、
@@ -300,9 +304,10 @@ label 独立匹配 launchctl PID 和新 marker，并在稳定窗口内由同一 
 代际错误、重启抖动或 shared lock 未保持都会自动停止 target daemon、以独立恢复预算回滚到 intent
 记录的 previous generation，再恢复并验收旧 daemon；completed 证明只在最终稳定验收后发布。
 `RQUANT_DEPLOY_COMMAND_TIMEOUT_SECONDS` 限制单次 Git/uv/preflight/launchctl 子命令，
-`RQUANT_DEPLOY_OVERALL_TIMEOUT_SECONDS` 限制整个发布和 handoff；任何超时都会进入同一持久恢复与
-daemon restore 路径。恢复创建新的有界 deadline；超时命令在独立进程组运行并终止整组，不能遗留
-uv 子进程或无限期留下停止状态。
+`RQUANT_DEPLOY_OVERALL_TIMEOUT_SECONDS` 限制整个发布、handoff、失败恢复和锁重取；所有路径继承
+同一个绝对 deadline，预算耗尽后不再执行恢复副作用，只保留可继续的持久 authority。阻塞命令统一
+由有界进程树收容器运行，持续追踪 PID identity，并在 SIGINT/SIGTERM/timeout/BaseException 时停止
+生成源、终止原进程组及 setsid 后代、复核无存活身份后才释放生命周期锁。
 
 以下非秘钥部署控制项可以放在 repo `.env`：`RQUANT_DEPLOY_UV`、单命令/整体 timeout、
 generation GC 宽限期/最小剩余磁盘、`RQUANT_RELEASE_PROFILE`、`RQUANT_LAB_LIFECYCLE_MODE` 与

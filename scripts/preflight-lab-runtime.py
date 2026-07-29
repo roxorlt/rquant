@@ -10,6 +10,7 @@ import re
 import stat
 import subprocess
 import sys
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -51,6 +52,7 @@ class PreflightError(RuntimeError):
 def _load_strict_json() -> tuple[
     type[ValueError],
     Callable[[str | bytes | bytearray], object],
+    Callable[..., object],
 ]:
     path = Path(__file__).resolve().with_name("strict_json.py")
     spec = importlib.util.spec_from_file_location("_rquant_preflight_strict_json", path)
@@ -58,10 +60,28 @@ def _load_strict_json() -> tuple[
         raise RuntimeError("strict JSON authority cannot be loaded")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.StrictJsonError, module.strict_json_loads
+    return (
+        module.StrictJsonError,
+        module.strict_json_loads,
+        module.strict_canonical_json_loads,
+    )
 
 
-StrictJsonError, strict_json_loads = _load_strict_json()
+StrictJsonError, strict_json_loads, strict_canonical_json_loads = _load_strict_json()
+
+
+def _load_contained_runner() -> Callable[..., subprocess.CompletedProcess[object]]:
+    path = Path(__file__).resolve().parents[1] / "src" / "rquant" / "contained_subprocess.py"
+    spec = importlib.util.spec_from_file_location("_rquant_preflight_contained_process", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("contained subprocess authority cannot be loaded")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module.run_contained
+
+
+run_contained = _load_contained_runner()
 
 
 @dataclass(frozen=True)
@@ -131,13 +151,12 @@ def _git_command(
 ) -> subprocess.CompletedProcess[str]:
     _assert_trusted_git(git_path, git_identity)
     try:
-        result = subprocess.run(
+        result = run_contained(
             [str(git_path), *arguments],
             cwd=checkout,
+            deadline_monotonic=time.monotonic() + GIT_TIMEOUT_SECONDS,
             check=False,
-            capture_output=True,
             text=True,
-            timeout=GIT_TIMEOUT_SECONDS,
             env={
                 **os.environ,
                 "GIT_OPTIONAL_LOCKS": "0",
@@ -499,7 +518,7 @@ def _verify_prepared_lab_runtime(
     )
     assert encoded is not None
     try:
-        payload = strict_json_loads(encoded.decode("utf-8"))
+        payload = strict_canonical_json_loads(encoded.decode("utf-8"), trailing_newline=True)
     except (UnicodeError, StrictJsonError) as exc:
         raise PreflightError("Lab runtime prepared sentinel is malformed") from exc
     authority_id = payload.get("runtime_authority_id") if isinstance(payload, dict) else None

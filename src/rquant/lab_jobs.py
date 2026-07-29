@@ -67,7 +67,12 @@ from rquant.research_run_spec import (
     ResearchRunSpec,
     ResourceClass,
 )
-from rquant.strict_json import strict_json_loads, strict_model_validate_json
+from rquant.strict_json import (
+    canonical_model_json_bytes,
+    strict_json_loads,
+    strict_model_validate_canonical_json,
+    strict_model_validate_json,
+)
 
 if TYPE_CHECKING:
     from rquant.lab_artifacts import LabVerifiedSealedBinding
@@ -1459,6 +1464,7 @@ def _canonical_uuid_text(value: object, *, field: str) -> UUID:
 
 
 _SHARD_ROW_VALID_FUNCTION = "rquant_lab_shard_row_valid"
+_STRATEGY_NAME_FUNCTION = "rquant_lab_strategy_name"
 _SHARD_HASH_RE = re.compile(r"[0-9a-f]{64}")
 _SHARD_PLAN_NAME_RE = re.compile(r"[a-z][a-z0-9_]*")
 
@@ -1500,6 +1506,13 @@ def _canonical_stored_json_object(value: str, *, field: str) -> str:
     if value != canonical:
         raise ValueError(f"{field} JSON is not canonical")
     return canonical
+
+
+def _sqlite_strategy_name(spec_json: object) -> str:
+    if type(spec_json) is not str:
+        raise ValueError("stored strategy spec must be text")
+    spec = strict_model_validate_canonical_json(ResearchRunSpec, spec_json)
+    return spec.parameters.strategy_name
 
 
 def _sqlite_shard_row_valid(
@@ -1775,8 +1788,14 @@ def _command_record_from_row(
             row["request_id"],
             field="lab_command.request_id",
         )
-        envelope = strict_model_validate_json(LabCommandEnvelope, str(row["command_json"]))
-        receipt = strict_model_validate_json(LabCommandReceipt, str(row["receipt_json"]))
+        envelope = strict_model_validate_canonical_json(
+            LabCommandEnvelope,
+            str(row["command_json"]),
+        )
+        receipt = strict_model_validate_canonical_json(
+            LabCommandReceipt,
+            str(row["receipt_json"]),
+        )
         content_hash = str(row["content_hash"])
         command_type = str(row["command_type"])
         job_id = _canonical_uuid_text(row["job_id"], field="lab_command.job_id")
@@ -1803,10 +1822,6 @@ def _command_record_from_row(
             raise ValueError("receipt reason mismatch")
         if receipt.job_version != receipt_job_version:
             raise ValueError("receipt job version mismatch")
-        if envelope.model_dump_json() != str(row["command_json"]):
-            raise ValueError("command JSON is not canonical")
-        if receipt.model_dump_json() != str(row["receipt_json"]):
-            raise ValueError("command receipt JSON is not canonical")
         return LabCommandRecord(
             request_id=request_id,
             content_hash=content_hash,
@@ -1823,6 +1838,8 @@ def _command_record_from_row(
 
 
 def _receipt_job_version_from_json(payload: str) -> int | None:
+    """Read a legacy receipt only while the v1 migration rewrites canonical bytes."""
+
     return strict_model_validate_json(LabCommandReceipt, payload).job_version
 
 
@@ -1833,8 +1850,14 @@ def _worker_report_record_from_row(
 ) -> LabWorkerReportRecord:
     stored_id = str(row["report_id"])
     try:
-        report = strict_model_validate_json(LabWorkerReport, str(row["report_json"]))
-        receipt = strict_model_validate_json(LabReportReceipt, str(row["receipt_json"]))
+        report = strict_model_validate_canonical_json(
+            LabWorkerReport,
+            str(row["report_json"]),
+        )
+        receipt = strict_model_validate_canonical_json(
+            LabReportReceipt,
+            str(row["receipt_json"]),
+        )
         report_id = _canonical_uuid_text(
             row["report_id"],
             field="lab_worker_report.report_id",
@@ -1876,10 +1899,6 @@ def _worker_report_record_from_row(
             raise ValueError("receipt status mismatch")
         if receipt.reason != str(row["reason"]):
             raise ValueError("receipt reason mismatch")
-        if report.canonical_json() != str(row["report_json"]):
-            raise ValueError("worker report JSON is not canonical")
-        if receipt.model_dump_json() != str(row["receipt_json"]):
-            raise ValueError("worker report receipt JSON is not canonical")
         return LabWorkerReportRecord(
             report=report,
             receipt=receipt,
@@ -1895,13 +1914,7 @@ def _worker_report_record_from_row(
 
 
 def _canonical_model_json(model: BaseModel) -> str:
-    return json.dumps(
-        model.model_dump(mode="json"),
-        ensure_ascii=True,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    )
+    return canonical_model_json_bytes(model).decode("utf-8")
 
 
 def _artifact_commit_record_from_row(
@@ -1915,11 +1928,11 @@ def _artifact_commit_record_from_row(
             row["request_id"],
             field="lab_artifact_commit.request_id",
         )
-        envelope = strict_model_validate_json(
+        envelope = strict_model_validate_canonical_json(
             LabArtifactCommitEnvelope,
             str(row["commit_json"]),
         )
-        receipt = strict_model_validate_json(
+        receipt = strict_model_validate_canonical_json(
             LabArtifactCommitReceipt,
             str(row["receipt_json"]),
         )
@@ -1943,10 +1956,6 @@ def _artifact_commit_record_from_row(
         )
         if receipt.job_version != version:
             raise ValueError("artifact commit receipt version mismatch")
-        if _canonical_model_json(envelope) != str(row["commit_json"]):
-            raise ValueError("artifact commit JSON is not canonical")
-        if _canonical_model_json(receipt) != str(row["receipt_json"]):
-            raise ValueError("artifact commit receipt JSON is not canonical")
         return LabArtifactCommitRecord(
             envelope=envelope,
             receipt=receipt,
@@ -1967,7 +1976,7 @@ def _result_artifact_evidence_from_row(
     from rquant.lab_artifacts import LabArtifactIndexEvidence
 
     try:
-        evidence = strict_model_validate_json(
+        evidence = strict_model_validate_canonical_json(
             LabArtifactIndexEvidence,
             str(row["evidence_json"]),
         )
@@ -2623,14 +2632,43 @@ def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
         """
     )
     rows = connection.execute(
-        "SELECT request_id, receipt_json FROM lab_command ORDER BY request_id"
+        """
+        SELECT request_id, command_json, receipt_json
+        FROM lab_command ORDER BY request_id
+        """
     ).fetchall()
     for row in rows:
+        envelope = strict_model_validate_json(
+            LabCommandEnvelope,
+            str(row["command_json"]),
+        )
+        receipt = strict_model_validate_json(
+            LabCommandReceipt,
+            str(row["receipt_json"]),
+        )
         job_version = _receipt_job_version_from_json(str(row["receipt_json"]))
         connection.execute(
-            "UPDATE lab_command SET receipt_job_version = ? WHERE request_id = ?",
-            (job_version, str(row["request_id"])),
+            """
+            UPDATE lab_command
+            SET command_json = ?, receipt_json = ?, receipt_job_version = ?
+            WHERE request_id = ?
+            """,
+            (
+                _canonical_model_json(envelope),
+                _canonical_model_json(receipt),
+                job_version,
+                str(row["request_id"]),
+            ),
         )
+    if connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'lab_job'"
+    ).fetchone():
+        for row in connection.execute("SELECT job_id, spec_json FROM lab_job").fetchall():
+            spec = strict_model_validate_json(ResearchRunSpec, str(row["spec_json"]))
+            connection.execute(
+                "UPDATE lab_job SET spec_json = ? WHERE job_id = ?",
+                (_canonical_model_json(spec), str(row["job_id"])),
+            )
     for row in connection.execute("SELECT * FROM lab_command ORDER BY request_id").fetchall():
         _command_record_from_row(row)
 
@@ -3182,6 +3220,12 @@ class LabJobReader:
             _sqlite_shard_row_valid,
             deterministic=True,
         )
+        connection.create_function(
+            _STRATEGY_NAME_FUNCTION,
+            1,
+            _sqlite_strategy_name,
+            deterministic=True,
+        )
         connection.row_factory = sqlite3.Row
         connection.execute(f"PRAGMA busy_timeout = {self.busy_timeout_ms}")
         connection.execute("PRAGMA foreign_keys = ON")
@@ -3232,13 +3276,14 @@ class LabJobReader:
     @staticmethod
     def _job_from_row(row: sqlite3.Row) -> LabJobRecord:
         try:
-            spec = strict_model_validate_json(ResearchRunSpec, str(row["spec_json"]))
+            spec = strict_model_validate_canonical_json(
+                ResearchRunSpec,
+                str(row["spec_json"]),
+            )
             stored_hash = str(row["spec_hash"])
             stored_job_type = ResearchJobType(str(row["job_type"]))
             stored_resource = ResourceClass(str(row["resource_class"]))
             stored_deadline = _load_time(str(row["deadline"]))
-            if spec.model_dump_json(round_trip=True) != str(row["spec_json"]):
-                raise ValueError("spec JSON is not canonical")
             if spec.spec_hash != stored_hash:
                 raise ValueError("spec hash mismatch")
             if spec.job_type is not stored_job_type:
@@ -3832,7 +3877,7 @@ class LabJobReader:
         try:
             padding = "=" * (-len(cursor) % 4)
             payload = urlsafe_b64decode(f"{cursor}{padding}".encode("ascii"))
-            value = strict_model_validate_json(_LabJobListCursor, payload)
+            value = strict_model_validate_canonical_json(_LabJobListCursor, payload)
             canonical = (
                 urlsafe_b64encode(_canonical_model_json(value).encode("ascii"))
                 .decode("ascii")
@@ -3956,6 +4001,8 @@ class LabJobReader:
     @staticmethod
     def _job_filters_sql(
         filters: LabJobListFilters,
+        *,
+        include_keyword: bool = True,
     ) -> tuple[list[str], list[object]]:
         clauses: list[str] = []
         parameters: list[object] = []
@@ -3973,7 +4020,7 @@ class LabJobReader:
         if filters.created_before is not None:
             clauses.append("j.created_at < ?")
             parameters.append(_dump_time(filters.created_before))
-        if filters.keyword is not None:
+        if include_keyword and filters.keyword is not None:
             escaped = (
                 filters.keyword.casefold()
                 .replace("\\", "\\\\")
@@ -3981,7 +4028,7 @@ class LabJobReader:
                 .replace("_", "\\_")
             )
             clauses.append(
-                "(LOWER(json_extract(j.spec_json, '$.parameters.strategy_name')) "
+                f"(LOWER({_STRATEGY_NAME_FUNCTION}(j.spec_json)) "
                 "LIKE ? ESCAPE '\\' OR LOWER(j.job_id) LIKE ? ESCAPE '\\' "
                 "OR LOWER(j.spec_hash) LIKE ? ESCAPE '\\')"
             )
@@ -3989,6 +4036,17 @@ class LabJobReader:
         if len(parameters) > LAB_JOB_LIST_FILTER_SQL_PARAMETER_MAX:
             raise ValueError("job list filters exceed the SQL parameter budget")
         return clauses, parameters
+
+    @staticmethod
+    def _validate_list_specs(rows: list[sqlite3.Row]) -> None:
+        for row in rows:
+            try:
+                spec_json = str(row["spec_json"])
+                strict_model_validate_canonical_json(ResearchRunSpec, spec_json)
+            except Exception as exc:
+                raise InvalidStoredJobError(
+                    f"invalid stored lab job {row['job_id']}: {exc}"
+                ) from exc
 
     @classmethod
     def _summary_from_row(cls, row: sqlite3.Row) -> LabJobSummary:
@@ -4002,7 +4060,7 @@ class LabJobReader:
             raise InvalidStoredJobError("job summary result index conflicts with result state")
         if has_result_index:
             try:
-                evidence = strict_model_validate_json(
+                evidence = strict_model_validate_canonical_json(
                     LabArtifactIndexEvidence,
                     str(row["result_evidence_json"]),
                 )
@@ -4065,6 +4123,18 @@ class LabJobReader:
             raise ValueError("job list query exceeds the SQL parameter budget")
         page_where = f" WHERE {' AND '.join(page_clauses)}" if page_clauses else ""
         with self._read_snapshot(label="job list") as connection:
+            validation_clauses, validation_parameters = self._job_filters_sql(
+                selected_filters,
+                include_keyword=False,
+            )
+            validation_where = (
+                f" WHERE {' AND '.join(validation_clauses)}" if validation_clauses else ""
+            )
+            validation_rows = connection.execute(
+                f"SELECT j.job_id, j.spec_json FROM lab_job AS j{validation_where}",
+                validation_parameters,
+            ).fetchall()
+            self._validate_list_specs(validation_rows)
             total_row = connection.execute(
                 f"SELECT COUNT(*) AS total_count FROM lab_job AS j{total_where}",
                 parameters,
@@ -6510,10 +6580,10 @@ class LabJobStore:
                 envelope.content_hash,
                 envelope.command.command_type,
                 str(envelope.command.job_id),
-                envelope.model_dump_json(),
+                _canonical_model_json(envelope),
                 receipt.status,
                 receipt.reason,
-                receipt.model_dump_json(),
+                _canonical_model_json(receipt),
                 receipt.job_version,
                 _dump_time(now),
                 _dump_time(now),
@@ -6667,7 +6737,7 @@ class LabJobStore:
                     existing_row["version"], field="lab_job.version", minimum=0
                 ),
             )
-        spec_json = command.spec.model_dump_json(round_trip=True)
+        spec_json = _canonical_model_json(command.spec)
         with _write_authorization(connection).authorize_submit(
             command.job_id,
             spec_json,
@@ -8125,10 +8195,10 @@ class LabJobStore:
                 str(report.job_id),
                 str(report.shard_id),
                 report.body.report_type,
-                report.canonical_json(),
+                _canonical_model_json(report),
                 receipt.status,
                 receipt.reason,
-                receipt.model_dump_json(),
+                _canonical_model_json(receipt),
                 report.claim_generation,
                 report.scheduler_fencing_token,
                 _dump_time(now),

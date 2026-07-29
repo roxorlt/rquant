@@ -26,7 +26,7 @@ from rquant.lab_shard_protocol import LabShardFailed
 from rquant.research_run_spec import ResearchJobType
 
 from .test_lab_finalizer import _ready_scenario
-from .test_lab_jobs import NOW, _lease, _spec, _submit
+from .test_lab_jobs import NOW, _lease, _register_unprivileged_job_functions, _spec, _submit
 from .test_lab_shard_control_plane import _claim, _report, _setup
 
 
@@ -97,7 +97,7 @@ def test_list_jobs_keyset_pagination_is_stable_bounded_and_has_no_n_plus_one(
     selects = [
         statement for statement in reader.statements if statement.startswith(("SELECT", "WITH"))
     ]
-    assert len(selects) == 2 * 8
+    assert len(selects) == 3 * 8
     assert reader.statements.count("BEGIN") == 8
     assert reader.statements.count("COMMIT") == 8
 
@@ -209,6 +209,59 @@ def test_list_jobs_combines_status_type_resource_date_and_keyword_filters(
         reader.list_jobs(limit=10, cursor="not-an-opaque-cursor")
     with pytest.raises(ValueError, match="limit"):
         reader.list_jobs(limit=101)
+
+
+@pytest.mark.parametrize(
+    "corrupt_spec",
+    (
+        '{"parameters":{"strategy_name":"excluded","strategy_name":"needle"}}',
+        '{ "parameters":{"strategy_name":"needle"}}',
+        '{"parameters":{"strategy_name":7}}',
+    ),
+)
+def test_list_jobs_keyword_fails_closed_before_filtering_corrupt_specs(
+    tmp_path: Path,
+    corrupt_spec: str,
+) -> None:
+    store, job_ids = _seed_jobs(tmp_path, 2)
+    with sqlite3.connect(store.path) as connection:
+        _register_unprivileged_job_functions(connection)
+        connection.execute("PRAGMA ignore_check_constraints = ON")
+        connection.execute(
+            "UPDATE lab_job SET spec_json = ? WHERE job_id = ?",
+            (corrupt_spec, str(job_ids[0])),
+        )
+
+    reader = LabJobReader(store.path)
+    with pytest.raises(InvalidStoredJobError, match="stored lab job"):
+        reader.list_jobs(filters=LabJobListFilters(keyword="needle"), limit=1)
+
+
+def test_list_jobs_keyword_rejects_corrupt_row_beyond_first_page_and_cursor(
+    tmp_path: Path,
+) -> None:
+    store, job_ids = _seed_jobs(tmp_path, 4)
+    reader = LabJobReader(store.path)
+    filters = LabJobListFilters(keyword="strategy")
+    first = reader.list_jobs(filters=filters, limit=1)
+    assert first.next_cursor is not None
+    valid = reader.get_job(job_ids[0])
+    assert valid is not None
+    noncanonical = json.dumps(valid.spec.model_dump(mode="json"), indent=2, default=str)
+    with sqlite3.connect(store.path) as connection:
+        _register_unprivileged_job_functions(connection)
+        connection.execute("PRAGMA ignore_check_constraints = ON")
+        connection.execute(
+            "UPDATE lab_job SET spec_json = ? WHERE job_id = ?",
+            (noncanonical, str(job_ids[0])),
+        )
+
+    with pytest.raises(InvalidStoredJobError, match="stored lab job"):
+        reader.list_jobs(
+            filters=filters,
+            limit=1,
+            cursor=first.next_cursor,
+        )
 
 
 def test_job_list_filters_canonicalize_enum_tuples_and_bound_sql_parameters() -> None:

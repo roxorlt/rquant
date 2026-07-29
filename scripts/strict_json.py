@@ -14,3 +14,7 @@ _SPEC.loader.exec_module(_MODULE)
 
 StrictJsonError = _MODULE.StrictJsonError
 strict_json_loads = _MODULE.strict_json_loads
+canonical_json_bytes = _MODULE.canonical_json_bytes
+strict_canonical_json_loads = _MODULE.strict_canonical_json_loads
+strict_model_validate_canonical_json = _MODULE.strict_model_validate_canonical_json
+canonical_model_json_bytes = _MODULE.canonical_model_json_bytes

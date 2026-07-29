@@ -1252,7 +1252,7 @@ def test_load_and_quarantine_reject_external_symlink_and_mismatched_basename(
     spool = LabCommandSpool(tmp_path / "commands")
     envelope = _submit_envelope()
     victim = tmp_path / "victim.json"
-    victim.write_text(envelope.model_dump_json(), encoding="utf-8")
+    victim.write_bytes(lab_job_protocol.canonical_model_json_bytes(envelope))
     symlink = spool.pending_dir / f"{envelope.request_id}.json"
     symlink.symlink_to(victim)
 
@@ -1265,7 +1265,7 @@ def test_load_and_quarantine_reject_external_symlink_and_mismatched_basename(
     assert symlink.is_symlink()
 
     mismatched = spool.pending_dir / f"{uuid4()}.json"
-    mismatched.write_text(envelope.model_dump_json(), encoding="utf-8")
+    mismatched.write_bytes(lab_job_protocol.canonical_model_json_bytes(envelope))
     with pytest.raises(InvalidCommandEnvelopeError, match="request_id"):
         spool.load(mismatched)
     with pytest.raises(InvalidCommandEnvelopeError, match="request_id"):
@@ -1300,7 +1300,7 @@ def test_ack_and_quarantine_do_not_unlink_replacement_file(tmp_path: Path) -> No
     )
     entry.path.unlink()
     replacement = _submit_envelope(request_id=envelope.request_id)
-    entry.path.write_text(replacement.model_dump_json(), encoding="utf-8")
+    entry.path.write_bytes(lab_job_protocol.canonical_model_json_bytes(replacement))
 
     with pytest.raises(InvalidCommandEnvelopeError, match="replaced"):
         spool.ack(entry, receipt)
@@ -1377,7 +1377,7 @@ def test_command_spool_rejects_duplicate_keys_in_pending_and_ack(tmp_path: Path)
     with pytest.raises(InvalidCommandEnvelopeError, match="duplicate JSON key"):
         spool.load(pending.path)
 
-    pending.path.write_bytes(envelope.model_dump_json().encode("utf-8"))
+    pending.path.write_bytes(lab_job_protocol.canonical_model_json_bytes(envelope))
     receipt = LabCommandReceipt(
         request_id=envelope.request_id,
         content_hash=envelope.content_hash,

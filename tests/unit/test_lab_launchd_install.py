@@ -10,6 +10,7 @@ import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -391,6 +392,145 @@ def test_installer_failure_restores_exact_plist_and_state_inodes(
     assert {path: (path.read_bytes(), path.stat().st_ino) for path in managed} == before
 
 
+def test_foreign_destination_after_quarantine_is_never_overwritten(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, lock, launch_agents, _commit = _fixture(tmp_path)
+    LabLaunchdInstaller(
+        checkout_root=repo,
+        deployment_lock_path=lock,
+        launch_agents_dir=launch_agents,
+        trusted_git_path=TRUSTED_GIT,
+        runner=_Runner(),
+    ).install(activate=False)
+    name = f"{LAB_LAUNCHD_LABELS[0]}.plist"
+    destination = launch_agents / name
+    original_payload = LabLaunchdInstaller._plist_payload
+
+    def changed_payload(
+        self: LabLaunchdInstaller,
+        marker: object,
+        code_root: Path,
+        label: str,
+    ) -> bytes:
+        return original_payload(self, marker, code_root, label) + b"\n"
+
+    def inject(stage: str) -> None:
+        if stage == f"after-quarantine:{name}":
+            destination.write_bytes(b"foreign-after-quarantine")
+            destination.chmod(0o600)
+
+    monkeypatch.setattr(LabLaunchdInstaller, "_plist_payload", changed_payload)
+    with pytest.raises(LabLaunchdInstallError, match="foreign|appeared"):
+        LabLaunchdInstaller(
+            checkout_root=repo,
+            deployment_lock_path=lock,
+            launch_agents_dir=launch_agents,
+            trusted_git_path=TRUSTED_GIT,
+            runner=_Runner(),
+            mutation_hook=inject,
+        ).install(activate=False)
+
+    assert destination.read_bytes() == b"foreign-after-quarantine"
+    assert list(launch_agents.glob(f".{name}.*.rollback"))
+    assert lock.with_name(f"{lock.stem}.lab-install-transaction.json").exists()
+
+
+def test_forged_quarantine_backup_blocks_recovery_and_preserves_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, lock, launch_agents, _commit = _fixture(tmp_path)
+    LabLaunchdInstaller(
+        checkout_root=repo,
+        deployment_lock_path=lock,
+        launch_agents_dir=launch_agents,
+        trusted_git_path=TRUSTED_GIT,
+        runner=_Runner(),
+    ).install(activate=False)
+    name = f"{LAB_LAUNCHD_LABELS[0]}.plist"
+    original_payload = LabLaunchdInstaller._plist_payload
+
+    class SimulatedCrash(BaseException):
+        pass
+
+    def changed_payload(
+        self: LabLaunchdInstaller,
+        marker: object,
+        code_root: Path,
+        label: str,
+    ) -> bytes:
+        return original_payload(self, marker, code_root, label) + b"\n"
+
+    def forge(stage: str) -> None:
+        if stage == f"after-quarantine:{name}":
+            backup = next(launch_agents.glob(f".{name}.*.rollback"))
+            backup.write_bytes(b"forged-backup")
+            backup.chmod(0o600)
+            raise SimulatedCrash
+
+    monkeypatch.setattr(LabLaunchdInstaller, "_plist_payload", changed_payload)
+    installer = LabLaunchdInstaller(
+        checkout_root=repo,
+        deployment_lock_path=lock,
+        launch_agents_dir=launch_agents,
+        trusted_git_path=TRUSTED_GIT,
+        runner=_Runner(),
+        mutation_hook=forge,
+    )
+    with pytest.raises(LabLaunchdInstallError, match="backup changed"):
+        installer.install(activate=False)
+
+    backup = next(launch_agents.glob(f".{name}.*.rollback"))
+    assert backup.read_bytes() == b"forged-backup"
+    assert not (launch_agents / name).exists()
+    assert lock.with_name(f"{lock.stem}.lab-install-transaction.json").exists()
+
+
+def test_foreign_destination_after_replacement_arm_is_not_replaced(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, lock, launch_agents, _commit = _fixture(tmp_path)
+    LabLaunchdInstaller(
+        checkout_root=repo,
+        deployment_lock_path=lock,
+        launch_agents_dir=launch_agents,
+        trusted_git_path=TRUSTED_GIT,
+        runner=_Runner(),
+    ).install(activate=False)
+    name = f"{LAB_LAUNCHD_LABELS[0]}.plist"
+    destination = launch_agents / name
+    original_payload = LabLaunchdInstaller._plist_payload
+
+    def changed_payload(
+        self: LabLaunchdInstaller,
+        marker: object,
+        code_root: Path,
+        label: str,
+    ) -> bytes:
+        return original_payload(self, marker, code_root, label) + b"\n"
+
+    def inject(stage: str) -> None:
+        if stage == f"replacement-armed:{name}":
+            destination.write_bytes(b"foreign-after-arm")
+            destination.chmod(0o600)
+
+    monkeypatch.setattr(LabLaunchdInstaller, "_plist_payload", changed_payload)
+    with pytest.raises(LabLaunchdInstallError, match="foreign|appeared"):
+        LabLaunchdInstaller(
+            checkout_root=repo,
+            deployment_lock_path=lock,
+            launch_agents_dir=launch_agents,
+            trusted_git_path=TRUSTED_GIT,
+            runner=_Runner(),
+            mutation_hook=inject,
+        ).install(activate=False)
+
+    assert destination.read_bytes() == b"foreign-after-arm"
+
+
 def test_installer_activation_failure_restores_previously_loaded_labels(tmp_path: Path) -> None:
     repo, lock, launch_agents, _commit = _fixture(tmp_path)
     LabLaunchdInstaller(
@@ -660,3 +800,71 @@ def test_rerun_stops_daemons_before_waiting_for_generation_exclusive_lock(
     first_bootout = next(i for i, call in enumerate(runner.calls) if call[1:2] == ("bootout",))
     assert first_bootout >= 0
     assert loaded == set(LAB_LAUNCHD_LABELS)
+
+
+def test_installed_generation_plists_converge_a_to_b_rollback_then_b(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, lock, launch_agents, _commit = _fixture(tmp_path)
+    first_runner = _Runner()
+    installer = LabLaunchdInstaller(
+        checkout_root=repo,
+        deployment_lock_path=lock,
+        launch_agents_dir=launch_agents,
+        trusted_git_path=TRUSTED_GIT,
+        runner=first_runner,
+    )
+    installed_a = installer.install(activate=True)
+    a_payloads = {path.name: path.read_bytes() for path in launch_agents.glob("*.plist")}
+
+    generation_b = tmp_path / "generation-b"
+    code_b = generation_b / "release"
+    (code_b / "deploy" / "launchd").mkdir(parents=True)
+    for label in LAB_LAUNCHD_LABELS:
+        shutil.copy2(
+            ROOT / "deploy" / "launchd" / f"{label}.plist",
+            code_b / "deploy" / "launchd" / f"{label}.plist",
+        )
+    marker_b = SimpleNamespace(
+        commit="b" * 40,
+        environment_generation_id="c" * 64,
+        venv_path=str(generation_b),
+    )
+    monkeypatch.setattr(
+        LabLaunchdInstaller,
+        "_active_generation",
+        lambda *_args, **_kwargs: (marker_b, code_b),
+    )
+    failing_runner = _Runner(fail_on="kickstart")
+    failing_runner.loaded = set(LAB_LAUNCHD_LABELS)
+    with pytest.raises(LabLaunchdInstallError, match="launchctl"):
+        LabLaunchdInstaller(
+            checkout_root=repo,
+            deployment_lock_path=lock,
+            launch_agents_dir=launch_agents,
+            trusted_git_path=TRUSTED_GIT,
+            runner=failing_runner,
+        ).install(activate=True)
+
+    assert {path.name: path.read_bytes() for path in launch_agents.glob("*.plist")} == a_payloads
+
+    healthy_runner = _Runner()
+    healthy_runner.loaded = set(LAB_LAUNCHD_LABELS)
+    installed_b = LabLaunchdInstaller(
+        checkout_root=repo,
+        deployment_lock_path=lock,
+        launch_agents_dir=launch_agents,
+        trusted_git_path=TRUSTED_GIT,
+        runner=healthy_runner,
+    ).install(activate=True)
+
+    assert installed_a.environment_generation_id != installed_b.environment_generation_id
+    assert installed_b == type(installed_b)(
+        code_sha="b" * 40,
+        environment_generation_id="c" * 64,
+        launch_agents_dir=launch_agents,
+    )
+    for path in launch_agents.glob("*.plist"):
+        assert str(generation_b) in path.read_text(encoding="utf-8")
+    assert healthy_runner.loaded == set(LAB_LAUNCHD_LABELS)

@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import ast
-import ctypes
 import fcntl
 import hashlib
 import importlib.util
@@ -14,9 +13,7 @@ import math
 import os
 import re
 import secrets
-import signal
 import stat
-import struct
 import subprocess
 import sys
 import time
@@ -42,22 +39,39 @@ class DeployDeferredError(DeployBootstrapError):
     exit_code = 75
 
 
-class _ProcessGroupSignal(BaseException):
-    def __init__(self, signum: int) -> None:
-        self.signum = signum
-
-
-def _load_strict_json() -> tuple[type[ValueError], Callable[[str | bytes | bytearray], object]]:
+def _load_strict_json() -> tuple[
+    type[ValueError],
+    Callable[[str | bytes | bytearray], object],
+    Callable[..., object],
+]:
     path = Path(__file__).resolve().with_name("strict_json.py")
     spec = importlib.util.spec_from_file_location("_rquant_bootstrap_strict_json", path)
     if spec is None or spec.loader is None:
         raise RuntimeError("strict JSON authority cannot be loaded")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.StrictJsonError, module.strict_json_loads
+    return (
+        module.StrictJsonError,
+        module.strict_json_loads,
+        module.strict_canonical_json_loads,
+    )
 
 
-StrictJsonError, strict_json_loads = _load_strict_json()
+StrictJsonError, strict_json_loads, strict_canonical_json_loads = _load_strict_json()
+
+
+def _load_contained_runner() -> Callable[..., subprocess.CompletedProcess[object]]:
+    path = Path(__file__).resolve().parents[1] / "src" / "rquant" / "contained_subprocess.py"
+    spec = importlib.util.spec_from_file_location("_rquant_bootstrap_contained_process", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("contained subprocess authority cannot be loaded")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module.run_contained
+
+
+run_contained = _load_contained_runner()
 
 
 TARGET_PATTERN = re.compile(r"(?:v\d+\.\d+\.\d+|[0-9a-f]{40})")
@@ -587,180 +601,21 @@ def _launchctl(
         raise DeployBootstrapError("Lab launchd handoff command failed") from exc
 
 
-def _descendant_processes(root_pid: int, *, timeout_seconds: float) -> set[int]:
-    if timeout_seconds <= 0:
-        raise TimeoutError("process containment deadline expired")
-    deadline = time.monotonic() + timeout_seconds
-    children: dict[int, set[int]] = {}
-    if sys.platform == "darwin":
-        try:
-            libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
-            libproc.proc_listallpids.argtypes = [ctypes.c_void_p, ctypes.c_int]
-            libproc.proc_listallpids.restype = ctypes.c_int
-            libproc.proc_pidinfo.argtypes = [
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.c_uint64,
-                ctypes.c_void_p,
-                ctypes.c_int,
-            ]
-            libproc.proc_pidinfo.restype = ctypes.c_int
-            capacity = max(256, libproc.proc_listallpids(None, 0) * 2)
-            pids = (ctypes.c_int * capacity)()
-            count = libproc.proc_listallpids(pids, ctypes.sizeof(pids))
-            if count < 0:
-                raise OSError(ctypes.get_errno(), "proc_listallpids")
-            for pid in pids[:count]:
-                if time.monotonic() >= deadline:
-                    raise TimeoutError("process descendant inventory timed out")
-                buffer = ctypes.create_string_buffer(256)
-                size = libproc.proc_pidinfo(pid, 3, 0, buffer, len(buffer))
-                if size < 16:
-                    continue
-                _flags, _status, _xstatus, observed_pid, parent = struct.unpack_from(
-                    "=IIIII", buffer.raw
-                )
-                if observed_pid == pid:
-                    children.setdefault(parent, set()).add(pid)
-        except (OSError, ValueError) as exc:
-            raise DeployBootstrapError("process descendant inventory failed") from exc
-    elif sys.platform.startswith("linux"):
-        try:
-            for entry in Path("/proc").iterdir():
-                if time.monotonic() >= deadline:
-                    raise TimeoutError("process descendant inventory timed out")
-                if not entry.name.isdigit():
-                    continue
-                stat_fields = (entry / "stat").read_text(encoding="ascii").split()
-                if len(stat_fields) > 3:
-                    children.setdefault(int(stat_fields[3]), set()).add(int(entry.name))
-        except OSError as exc:
-            raise DeployBootstrapError("process descendant inventory failed") from exc
-    else:
-        raise DeployBootstrapError("process descendant inventory is unsupported on this platform")
-    descendants: set[int] = set()
-    pending = list(children.get(root_pid, ()))
-    while pending:
-        pid = pending.pop()
-        if pid in descendants:
-            continue
-        descendants.add(pid)
-        pending.extend(children.get(pid, ()))
-    return descendants
-
-
-def _terminate_process_tree(
-    process: subprocess.Popen[str],
-    descendants: set[int],
-    *,
-    deadline: float,
-) -> None:
-    remaining = deadline - time.monotonic()
-    if remaining > 0:
-        descendants.update(_descendant_processes(process.pid, timeout_seconds=min(0.5, remaining)))
-    for pid in sorted(descendants, reverse=True):
-        with suppress(ProcessLookupError):
-            os.kill(pid, signal.SIGKILL)
-    with suppress(ProcessLookupError):
-        os.killpg(process.pid, signal.SIGKILL)
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        raise DeployBootstrapError("process containment deadline expired before reap")
-    try:
-        process.communicate(timeout=remaining)
-    except subprocess.TimeoutExpired as exc:
-        raise DeployBootstrapError("process group could not be reaped") from exc
-    while descendants:
-        alive: set[int] = set()
-        for pid in descendants:
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                continue
-            except PermissionError as exc:
-                raise DeployBootstrapError(
-                    "process descendant containment is unverifiable"
-                ) from exc
-            alive.add(pid)
-        if not alive:
-            return
-        if time.monotonic() >= deadline:
-            raise DeployBootstrapError("detached process descendants survived cleanup")
-        descendants = alive
-        time.sleep(min(0.01, deadline - time.monotonic()))
-
-
 def _run_process_group(
     arguments: list[str],
     *,
     cwd: Path,
     timeout_seconds: float,
     env: dict[str, str] | None = None,
+    text: bool = True,
 ) -> subprocess.CompletedProcess[str]:
-    process = subprocess.Popen(
+    return run_contained(
         arguments,
         cwd=cwd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
+        deadline_monotonic=time.monotonic() + timeout_seconds,
         env=env,
+        text=text,
     )
-    previous_handlers: dict[int, object] = {}
-
-    def forward_signal(signum: int, _frame: object) -> None:
-        raise _ProcessGroupSignal(signum)
-
-    for signum in (signal.SIGINT, signal.SIGTERM):
-        previous = signal.getsignal(signum)
-        if previous is signal.SIG_IGN:
-            continue
-        try:
-            signal.signal(signum, forward_signal)
-        except ValueError:
-            break
-        previous_handlers[signum] = previous
-    hard_deadline = time.monotonic() + timeout_seconds
-    cleanup_reserve = min(0.25, max(0.02, timeout_seconds * 0.25))
-    execution_deadline = hard_deadline - cleanup_reserve
-    descendants: set[int] = set()
-    caught_signal: _ProcessGroupSignal | None = None
-    try:
-        while True:
-            remaining = execution_deadline - time.monotonic()
-            if remaining <= 0:
-                raise subprocess.TimeoutExpired(arguments, timeout_seconds)
-            descendants.update(
-                _descendant_processes(process.pid, timeout_seconds=min(0.2, remaining))
-            )
-            try:
-                stdout, stderr = process.communicate(timeout=min(0.05, remaining))
-                break
-            except subprocess.TimeoutExpired:
-                if time.monotonic() >= execution_deadline:
-                    raise
-    except subprocess.TimeoutExpired:
-        _terminate_process_tree(process, descendants, deadline=hard_deadline)
-        raise
-    except _ProcessGroupSignal as exc:
-        caught_signal = exc
-        _terminate_process_tree(process, descendants, deadline=hard_deadline)
-        stdout = stderr = ""
-    except BaseException:
-        _terminate_process_tree(process, descendants, deadline=hard_deadline)
-        raise
-    finally:
-        for signum, previous in previous_handlers.items():
-            signal.signal(signum, previous)
-    if caught_signal is not None:
-        previous = previous_handlers[caught_signal.signum]
-        if callable(previous):
-            previous(caught_signal.signum, None)
-            raise InterruptedError(f"process runner interrupted by signal {caught_signal.signum}")
-        signal.signal(caught_signal.signum, signal.SIG_DFL)
-        os.kill(os.getpid(), caught_signal.signum)
-        raise SystemExit(128 + caught_signal.signum)
-    return subprocess.CompletedProcess(arguments, process.returncode, stdout, stderr)
 
 
 def _generation_lock_is_held(root: Path, lock_path: Path) -> bool:
@@ -790,7 +645,7 @@ def _private_json(
         )
         if payload is None:
             return None
-        parsed = strict_json_loads(payload)
+        parsed = strict_canonical_json_loads(payload, trailing_newline=True)
     except StrictJsonError as exc:
         raise DeployBootstrapError(str(exc)) from exc
     if not isinstance(parsed, dict):
@@ -1023,13 +878,38 @@ def _write_lab_installation_state(
             "schema_version",
             "checkout_root",
             "labels",
-            "plists",
             "runtime_root",
             "readiness_root",
             "prepared_authority",
         }
-        if all(existing.get(field) == payload.get(field) for field in binding_fields):
-            return existing
+        marker = _private_json(
+            _stable_record_path(lock_path, "complete"),
+            label="release generation marker",
+            missing_ok=True,
+        )
+        templates_match_generation = (
+            marker is not None
+            and marker.get("commit") == expected_commit
+            and type(marker.get("venv_path")) is str
+        )
+        if templates_match_generation:
+            immutable_code_root = Path(str(marker["venv_path"])) / "release"
+            for label in LAB_LAUNCHD_LABELS:
+                source = root / "deploy" / "launchd" / f"{label}.plist"
+                immutable = immutable_code_root / "deploy" / "launchd" / f"{label}.plist"
+                try:
+                    if source.read_bytes() != immutable.read_bytes():
+                        templates_match_generation = False
+                        break
+                except OSError:
+                    templates_match_generation = False
+                    break
+        if (
+            all(existing.get(field) == payload.get(field) for field in binding_fields)
+            and existing.get("registered_by_commit") == expected_commit
+            and templates_match_generation
+        ):
+            return _read_lab_installation_state(root=root, lock_path=lock_path)
         if publish:
             handoff_path = _stable_record_path(lock_path, "lab-handoff")
             if handoff_path.exists() or handoff_path.is_symlink():
@@ -2380,6 +2260,16 @@ class _LabLaunchdHandoff:
         )
         _atomic_private_json(self.record_path, payload)
 
+    def adopt_installation_authority(self, installation: dict[str, object]) -> None:
+        if not self.enabled or not self.operation_id or set(self.stopped) != set(self.loaded):
+            raise DeployBootstrapError(
+                "Lab installation generation transition requires a stopped handoff"
+            )
+        identity = _lab_installation_identity(self.lock_path, installation)
+        self.installation = installation
+        self.installation_identity = identity
+        self._record("stopped")
+
     def _load_incomplete_record(self) -> bool:
         if not self.record_path.exists():
             return False
@@ -2391,6 +2281,50 @@ class _LabLaunchdHandoff:
         operation_value = payload.get("operation_id")
         if type(operation_value) is not str:
             raise DeployBootstrapError("Lab launchd handoff operation is invalid")
+        authority_module = _load_release_authority(
+            self.root / "src" / "rquant" / "release_generation.py"
+        )
+        try:
+            record = authority_module.LabHandoffRecord.from_payload(
+                payload,
+                completed=False,
+            )
+        except authority_module.ReleaseGenerationError as exc:
+            raise DeployBootstrapError("Lab handoff record is malformed") from exc
+        assert self.installation is not None and self.installation_identity is not None
+        if asdict(record.installation_identity) != self.installation_identity:
+            marker = _private_json(
+                self.lock_path.with_name(f"{self.lock_path.stem}.complete.json"),
+                label="release generation marker",
+            )
+            if (
+                self.installation.get("handoff_operation_id") != record.operation_id
+                or self.installation.get("registered_by_commit") != record.target_sha
+                or self.installation.get("environment_generation_id")
+                != marker.get("environment_generation_id")
+                or marker.get("commit") != record.target_sha
+                or record.stage != "stopped"
+                or set(record.stopped_labels) != set(record.labels)
+                or record.restarted_labels
+            ):
+                raise DeployBootstrapError("Lab handoff installation transition is unattributed")
+            rebound = dict(payload)
+            rebound["installation_identity"] = self.installation_identity
+            try:
+                record = authority_module.LabHandoffRecord.from_payload(
+                    rebound,
+                    completed=False,
+                )
+            except authority_module.ReleaseGenerationError as exc:
+                raise DeployBootstrapError(
+                    "Lab handoff installation transition cannot be rebound"
+                ) from exc
+            _atomic_private_json(
+                _operation_handoff_path(self.lock_path, record.operation_id),
+                rebound,
+            )
+            _atomic_private_json(self.record_path, rebound)
+            payload = rebound
         record = _validate_handoff_record_shape(
             root=self.root,
             lock_path=self.lock_path,
@@ -2860,8 +2794,11 @@ def _complete_installed_rollout(
     rollback: Callable[[object], int],
     finalize_readiness: Callable[[object], None],
     recovery_target_sha: str,
+    transition_installation: Callable[[object], None] | None = None,
     now: datetime | None = None,
 ) -> int:
+    transition = transition_installation or (lambda _handoff: None)
+
     def restore_previous() -> None:
         recovery_handoff = recovery_handoff_factory()
         try:
@@ -2877,6 +2814,7 @@ def _complete_installed_rollout(
                 raise DeployBootstrapError(
                     "previous generation rollback did not complete successfully"
                 )
+            transition(recovery_handoff)
             recovery_handoff.restore()
             finalize_readiness(recovery_handoff)
         except Exception:
@@ -2894,6 +2832,7 @@ def _complete_installed_rollout(
             )
         return deploy_code
     try:
+        transition(target_handoff)
         target_handoff.restore()
         finalize_readiness(target_handoff)
     except DeployBootstrapError as readiness_error:
@@ -2912,6 +2851,59 @@ def _complete_installed_rollout(
     return deploy_code
 
 
+def _transition_installed_lab_generation(
+    *,
+    root: Path,
+    lock_path: Path,
+    git_path: Path,
+    handoff: _LabLaunchdHandoff,
+) -> None:
+    if not handoff.enabled or handoff.installation is None:
+        return
+    local_install = _private_json(
+        _stable_record_path(lock_path, "lab-local-install"),
+        label="local Lab launchd installation state",
+    )
+    if (
+        local_install is None
+        or local_install.get("schema_version") != 2
+        or type(local_install.get("launch_agents_dir")) is not str
+        or not isinstance(local_install.get("plists"), dict)
+        or set(local_install["plists"]) != {f"{label}.plist" for label in LAB_LAUNCHD_LABELS}
+    ):
+        raise DeployBootstrapError("local Lab installation authority is incomplete")
+    launch_agents_dir = Path(local_install["launch_agents_dir"])
+    if not launch_agents_dir.is_absolute() or launch_agents_dir != Path(
+        os.path.abspath(launch_agents_dir)
+    ):
+        raise DeployBootstrapError("local Lab installation root is invalid")
+    try:
+        from rquant.lab_launchd_install import LabLaunchdInstaller
+
+        remaining = max(0.001, handoff.deadline - time.monotonic())
+        installer_overall = min(600.0, remaining)
+        LabLaunchdInstaller(
+            checkout_root=root,
+            deployment_lock_path=lock_path,
+            launch_agents_dir=launch_agents_dir,
+            trusted_git_path=git_path,
+            command_timeout_seconds=min(handoff.timeout_seconds, installer_overall),
+            overall_timeout_seconds=installer_overall,
+            overall_deadline_monotonic=handoff.deadline,
+        ).install(
+            activate=False,
+            inherited_installation_lock_fd=handoff.lock_fd,
+            provisional_handoff_label=handoff.loaded[0],
+            handoff_operation_id=handoff.operation_id,
+        )
+        installation = _read_lab_installation_state(root=root, lock_path=lock_path)
+        handoff.adopt_installation_authority(installation)
+    except DeployBootstrapError:
+        raise
+    except Exception as exc:
+        raise DeployBootstrapError(f"Lab generation plist transition failed: {exc}") from exc
+
+
 def _git_run(
     repo: Path,
     git_path: Path,
@@ -2927,15 +2919,21 @@ def _git_run(
             raise DeployBootstrapError("deployment overall timeout expired")
         timeout_seconds = min(timeout_seconds, remaining)
     try:
-        return subprocess.run(
+        result = _run_process_group(
             [str(git_path), *arguments],
             cwd=repo,
-            check=check,
-            capture_output=True,
+            timeout_seconds=timeout_seconds,
             text=text,
-            timeout=timeout_seconds,
             env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"},
         )
+        if check and result.returncode != 0:
+            raise subprocess.CalledProcessError(
+                result.returncode,
+                result.args,
+                output=result.stdout,
+                stderr=result.stderr,
+            )
+        return result
     except (OSError, subprocess.SubprocessError) as exc:
         raise DeployBootstrapError("deployment checkout cannot be verified") from exc
 
@@ -3401,7 +3399,7 @@ def _verify_generation_runtime(
             raise DeployBootstrapError("deployment overall timeout expired")
         timeout_seconds = min(timeout_seconds, remaining)
     try:
-        result = subprocess.run(
+        result = run_contained(
             [
                 str(python_path),
                 "-I",
@@ -3414,10 +3412,10 @@ def _verify_generation_runtime(
                     "(sysconfig.get_config_var('SOABI') or '')}, sort_keys=True))"
                 ),
             ],
+            cwd=root,
+            deadline_monotonic=time.monotonic() + timeout_seconds,
             check=True,
-            capture_output=True,
             text=True,
-            timeout=timeout_seconds,
         )
         facts = strict_json_loads(result.stdout)
         version = str(facts["version"])
@@ -4376,6 +4374,7 @@ def main(argv: list[str] | None = None) -> int:
                     lock_path=lock_path,
                     timeout_seconds=LAUNCHD_HANDOFF_TIMEOUT_SECONDS,
                     overall_timeout_seconds=args.overall_timeout_seconds,
+                    overall_deadline_monotonic=target_handoff.deadline,
                     release_profile=args.release_profile,
                     lifecycle_mode=args.lab_lifecycle_mode,
                     supersedes_operation_id=target_handoff.operation_id,
@@ -4387,10 +4386,18 @@ def main(argv: list[str] | None = None) -> int:
                 nonlocal lock_fd
                 if not rollback_target or not isinstance(recovery_handoff, _LabLaunchdHandoff):
                     raise DeployBootstrapError("Lab readiness rollback is not bound")
+                remaining = recovery_handoff.deadline - time.monotonic()
+                if remaining <= 0:
+                    raise DeployBootstrapError(
+                        "deployment overall timeout expired before Lab rollback"
+                    )
                 lock_fd = _acquire_lock(
                     root,
                     lock_path,
-                    timeout_seconds=LAUNCHD_HANDOFF_TIMEOUT_SECONDS,
+                    timeout_seconds=min(
+                        LAUNCHD_HANDOFF_TIMEOUT_SECONDS,
+                        remaining,
+                    ),
                 )
                 recovery_values = _replace_deployment_target(
                     deploy_argv,
@@ -4427,12 +4434,23 @@ def main(argv: list[str] | None = None) -> int:
                     overall_deadline_monotonic=active_handoff.deadline,
                 )
 
+            def transition_installation(active_handoff: object) -> None:
+                if not isinstance(active_handoff, _LabLaunchdHandoff):
+                    raise DeployBootstrapError("Lab installation transition is not bound")
+                _transition_installed_lab_generation(
+                    root=root,
+                    lock_path=lock_path,
+                    git_path=git_path,
+                    handoff=active_handoff,
+                )
+
             return _complete_installed_rollout(
                 target_handoff=target_handoff,
                 deploy_code=deploy_code,
                 recovery_handoff_factory=recovery_handoff_factory,
                 rollback=rollback_after_readiness,
                 finalize_readiness=finalize_readiness,
+                transition_installation=transition_installation,
                 recovery_target_sha=rollback_target,
             )
         return finish(deploy_code)

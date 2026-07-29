@@ -174,15 +174,15 @@ def _write_lab_installation(repo: Path, lock_path: Path) -> dict[str, object]:
         "checkout_root": str(repo),
         "labels": ["fixture"],
     }
-    path.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    encoded = canonical + b"\n"
+    path.write_bytes(encoded)
     path.chmod(0o600)
     observed = path.stat()
     return asdict(
         LabInstallationIdentity(
             path=str(path),
-            sha256=hashlib.sha256(
-                json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-            ).hexdigest(),
+            sha256=hashlib.sha256(canonical).hexdigest(),
             device=observed.st_dev,
             inode=observed.st_ino,
         )
@@ -1076,7 +1076,7 @@ def test_release_generation_readonly_git_preserves_index_and_disables_optional_l
     repo, _lock_path, commit, _python = _generation(tmp_path)
     index = repo / ".git" / "index"
     before = (index.read_bytes(), index.stat())
-    original_run = subprocess.run
+    original_run = module.run_contained
     environments: list[dict[str, str]] = []
 
     def capture_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
@@ -1087,7 +1087,7 @@ def test_release_generation_readonly_git_preserves_index_and_disables_optional_l
             environments.append(environment)
         return original_run(*args, **kwargs)
 
-    monkeypatch.setattr(module.subprocess, "run", capture_run)
+    monkeypatch.setattr(module, "run_contained", capture_run)
 
     assert module._git_output(repo, TRUSTED_GIT, "rev-parse", "HEAD") == commit
     module._assert_tracked_clean(repo, TRUSTED_GIT)
@@ -1106,17 +1106,19 @@ def test_release_generation_blocking_probes_refresh_shared_deadline(
 
     repo, _lock_path, commit, python = _generation(tmp_path)
     destination = tmp_path / "release-code"
-    original_run = subprocess.run
+    original_run = module.run_contained
     observed_timeouts: list[float] = []
-    granted = iter((0.09, 0.08, 0.07, 0.06, 0.05, 0.04))
+    granted_timeouts: list[float] = []
+    granted = iter((0.9, 0.8, 0.7, 0.6, 0.5, 0.4))
 
     def remaining(cap: float) -> float:
         value = next(granted)
         assert value <= cap
+        granted_timeouts.append(value)
         return value
 
     def capture_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[object]:
-        observed_timeouts.append(float(kwargs["timeout"]))
+        observed_timeouts.append(float(kwargs["deadline_monotonic"]) - time.monotonic())
         command = args[0]
         if isinstance(command, list) and command and command[0] == str(python):
             return subprocess.CompletedProcess(
@@ -1127,7 +1129,7 @@ def test_release_generation_blocking_probes_refresh_shared_deadline(
             )
         return original_run(*args, **kwargs)
 
-    monkeypatch.setattr(module.subprocess, "run", capture_run)
+    monkeypatch.setattr(module, "run_contained", capture_run)
 
     assert (
         module._git_output(
@@ -1152,7 +1154,11 @@ def test_release_generation_blocking_probes_refresh_shared_deadline(
 
     assert version.startswith(f"{sys.version_info.major}.{sys.version_info.minor}.")
     assert abi != ":"
-    assert observed_timeouts == [0.09, 0.08, 0.07, 0.06, 0.05, 0.04]
+    assert len(observed_timeouts) == len(granted_timeouts) == 6
+    assert all(
+        0 < observed <= granted_value
+        for observed, granted_value in zip(observed_timeouts, granted_timeouts, strict=True)
+    )
 
 
 def test_release_generation_marker_handles_short_writes(
@@ -1292,7 +1298,10 @@ def test_prepared_deployment_intent_is_adopted_without_replanning(tmp_path: Path
         operation_id="6" * 32,
     )
     prepared_path = prepared_intent_path_for_lock(lock_path)
-    prepared_path.write_text(json.dumps(asdict(prepared)), encoding="utf-8")
+    prepared_path.write_text(
+        json.dumps(asdict(prepared), sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
     prepared_path.chmod(0o600)
 
     adopted = authority.adopt_prepared_deployment_intent(
@@ -1819,10 +1828,16 @@ def test_deployment_marker_requires_completed_launchd_handoff(
         "stage": "restarting",
         "updated_at": "2026-07-28T00:00:00+00:00",
     }
-    handoff_path.write_text(json.dumps(payload), encoding="utf-8")
+    handoff_path.write_text(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
     handoff_path.chmod(0o600)
     active_handoff_path = lock_path.with_name(f"{lock_path.stem}.lab-handoff.json")
-    active_handoff_path.write_text(json.dumps(payload), encoding="utf-8")
+    active_handoff_path.write_text(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
     active_handoff_path.chmod(0o600)
 
     with pytest.raises(ReleaseGenerationError, match="transaction.*completed|handoff.*completed"):
@@ -1841,7 +1856,10 @@ def test_deployment_marker_requires_completed_launchd_handoff(
         f"{lock_path.stem}.lab-handoff.{handoff_operation}.completed.json"
     )
     for path in (handoff_path, completed_path, active_handoff_path):
-        path.write_text(json.dumps(payload), encoding="utf-8")
+        path.write_text(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
         path.chmod(0o600)
     authority.update_deployment_intent(
         operation_id=intent.operation_id,
@@ -1863,8 +1881,11 @@ def test_deployment_marker_requires_completed_launchd_handoff(
                 "generation_operation_id": intent.operation_id,
                 "environment_generation_id": published.environment_generation_id,
                 "code_sha": published.commit,
-            }
-        ),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n",
         encoding="utf-8",
     )
     active_handoff_path.chmod(0o600)
@@ -1974,7 +1995,10 @@ def test_provisional_handoff_validates_completed_ancestor_proof(
         lock_path.with_name(f"{lock_path.stem}.lab-handoff.json"): recovery_payload,
     }
     for path, payload in records.items():
-        path.write_text(json.dumps(payload), encoding="utf-8")
+        path.write_text(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
         path.chmod(0o600)
 
     if tamper_ancestor_proof:
@@ -2084,7 +2108,9 @@ def test_generation_environment_build_timeout_kills_uv_process_group(
     os.close(lock_fd)
 
 
-def test_generation_authority_recovery_rebinds_environment_deadline(tmp_path: Path) -> None:
+def test_generation_authority_recovery_cannot_extend_expired_global_deadline(
+    tmp_path: Path,
+) -> None:
     repo, lock_path, _commit, python = _generation(tmp_path)
     lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
     fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -2101,7 +2127,9 @@ def test_generation_authority_recovery_rebinds_environment_deadline(tmp_path: Pa
 
     recovered = authority.for_recovery(time.monotonic() + 30)
 
-    assert recovered.overall_deadline_monotonic > time.monotonic()
+    assert recovered.overall_deadline_monotonic < time.monotonic()
+    with pytest.raises(ReleaseGenerationError, match="timed out"):
+        recovered.garbage_collect_environments(reason="expired-recovery")
     os.close(lock_fd)
 
 
@@ -2141,6 +2169,10 @@ def test_generation_code_authority_survives_checkout_removal(tmp_path: Path) -> 
     shutil.copy2(
         Path(__file__).resolve().parents[2] / "src" / "rquant" / "strict_json.py",
         repo / "src" / "rquant" / "strict_json.py",
+    )
+    shutil.copy2(
+        Path(__file__).resolve().parents[2] / "src" / "rquant" / "contained_subprocess.py",
+        repo / "src" / "rquant" / "contained_subprocess.py",
     )
     subprocess.run([str(TRUSTED_GIT), "add", "."], cwd=repo, check=True)
     subprocess.run(
@@ -2573,8 +2605,11 @@ def test_generation_gc_cancellation_brackets_orphan_manifest_read(
                 "generation_id": orphan,
                 "environment_path": str(candidate),
                 "entries": [{"path": "."}],
-            }
-        ),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n",
         encoding="utf-8",
     )
     manifest.chmod(0o600)
@@ -2946,7 +2981,35 @@ def test_generation_gc_retains_authority_references_and_removes_only_old_orphans
         restart_services=(),
         active_services=(),
         active_timers=(),
+        handoff_operation_id="8" * 32,
+        handoff_labels=("scheduler", "worker", "finalizer"),
     )
+    partial = _partial_handoff_record(
+        operation_id=intent.handoff_operation_id,
+        action="deploy",
+        target_sha=intent.target_sha,
+        supersedes_operation_id="",
+        installation=LabInstallationIdentity(
+            path=str(lock_path.with_name("fixture-install.json")),
+            sha256="9" * 64,
+            device=1,
+            inode=2,
+        ),
+        stage="planned",
+    )
+    partial_path = lock_path.with_name(f"{lock_path.stem}.lab-handoff.{partial.operation_id}.json")
+    partial_payload = asdict(partial)
+    for completion_field in (
+        "generation_operation_id",
+        "environment_generation_id",
+        "code_sha",
+    ):
+        partial_payload.pop(completion_field)
+    partial_path.write_text(
+        json.dumps(partial_payload, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    partial_path.chmod(0o600)
     referenced = {
         hashlib.sha256(f"{intent.operation_id}:{sha}".encode()).hexdigest()
         for sha in (intent.previous_sha, intent.target_sha)
@@ -2972,8 +3035,11 @@ def test_generation_gc_retains_authority_references_and_removes_only_old_orphans
                     "generation_id": generation_id,
                     "environment_path": str(root / generation_id),
                     "entries": [{"path": "."}],
-                }
-            ),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n",
             encoding="utf-8",
         )
         manifest.chmod(0o600)
@@ -2997,6 +3063,42 @@ def test_generation_gc_retains_authority_references_and_removes_only_old_orphans
     audit = lock_path.with_name(f"{lock_path.stem}.generation-gc.jsonl")
     assert audit.stat().st_mode & 0o777 == 0o600
     assert '"reason":"unit-test"' in audit.read_text(encoding="utf-8")
+    os.close(lock_fd)
+
+
+@pytest.mark.parametrize("authority_kind", ["install-transaction", "corrupt-install"])
+def test_generation_gc_fails_closed_on_unresolved_installation_authority(
+    tmp_path: Path,
+    authority_kind: str,
+) -> None:
+    repo, lock_path, commit, python = _generation(tmp_path)
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    authority = _authority(
+        repo,
+        lock_path,
+        lock_fd,
+        python,
+        gc_grace_seconds=0,
+        minimum_free_bytes=0,
+    )
+    _publish_initialized(authority, commit=commit)
+    orphan = environment_root_for_lock(lock_path) / ("9" * 64)
+    orphan.mkdir(mode=0o700)
+    (orphan / "payload").write_text("retain", encoding="utf-8")
+    orphan.chmod(0o500)
+    if authority_kind == "install-transaction":
+        control = lock_path.with_name(f"{lock_path.stem}.lab-install-transaction.json")
+        control.write_text("{}\n", encoding="utf-8")
+    else:
+        control = lock_path.with_name(f"{lock_path.stem}.lab-install.json")
+        control.write_text('{"schema_version":2}\n', encoding="utf-8")
+    control.chmod(0o600)
+
+    with pytest.raises(ReleaseGenerationError, match="installation|registered"):
+        authority.garbage_collect_environments(reason="blocked-authority")
+
+    assert orphan.exists()
     os.close(lock_fd)
 
 
@@ -3087,8 +3189,11 @@ def test_generation_gc_uses_exact_previous_id_not_newer_orphan_mtime(tmp_path: P
                 "generation_id": orphan,
                 "environment_path": str(candidate),
                 "entries": [{"path": "."}],
-            }
-        ),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n",
         encoding="utf-8",
     )
     orphan_manifest.chmod(0o600)

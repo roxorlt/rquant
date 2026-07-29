@@ -38,6 +38,11 @@ from rquant.canonical_json_stream import (
     PandasJsonColumnAccessor,
 )
 from rquant.research_run_spec import DatasetSnapshotIdentity, ResearchRunSpec
+from rquant.strict_json import (
+    StrictJsonError,
+    strict_json_loads,
+    strict_model_validate_canonical_json,
+)
 
 _HASH_PATTERN = r"^[0-9a-f]{64}$"
 _CODE_SHA_PATTERN = r"^[0-9a-f]{40}$"
@@ -1885,8 +1890,8 @@ def _frame_dtype_identities(frame: pd.DataFrame) -> tuple[LabPandasDtypeIdentity
 
 def _rebuild_canonical_dtype_token(token: str) -> object:
     try:
-        value = json.loads(token)
-    except json.JSONDecodeError as exc:
+        value = strict_json_loads(token)
+    except StrictJsonError as exc:
         raise LabArtifactIntegrityError("pandas dtype metadata is not canonical JSON") from exc
     if canonical_json_bytes(value).decode("ascii") != token:
         raise LabArtifactIntegrityError("pandas dtype metadata is not canonical JSON")
@@ -2083,14 +2088,8 @@ def _table_content_hash(frame: pd.DataFrame) -> str:
 
 def _parse_canonical_json(payload: bytes, *, label: str) -> object:
     try:
-        text = payload.decode("utf-8")
-        parsed = json.loads(
-            text,
-            parse_constant=lambda value: (_ for _ in ()).throw(
-                ValueError(f"invalid numeric constant: {value}")
-            ),
-        )
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        parsed = strict_json_loads(payload)
+    except StrictJsonError as exc:
         raise LabArtifactIntegrityError(f"{label} is not valid canonical JSON") from exc
     try:
         expected = canonical_json_bytes(parsed)
@@ -3071,8 +3070,9 @@ class LabJobArtifactStore:
             observed = _FileObservation.from_stat(os.fstat(temporary_descriptor))
             if observed.mode != stat.S_IFREG or observed.nlink != 1:
                 raise LabArtifactIntegrityError("namespace guard temp is unsafe")
-            rebuilt = LabCandidateNamespaceGuardIntent.model_validate_json(
-                _read_descriptor(temporary_descriptor)
+            rebuilt = strict_model_validate_canonical_json(
+                LabCandidateNamespaceGuardIntent,
+                _read_descriptor(temporary_descriptor),
             )
             if rebuilt != intent or _read_descriptor(temporary_descriptor) != payload:
                 raise LabArtifactIntegrityError("namespace guard temp is not canonical")
@@ -3119,7 +3119,9 @@ class LabJobArtifactStore:
                 raise LabArtifactIntegrityError("namespace guard intent is unsafe")
             payload = _read_descriptor(descriptor)
             try:
-                intent = LabCandidateNamespaceGuardIntent.model_validate_json(payload)
+                intent = strict_model_validate_canonical_json(
+                    LabCandidateNamespaceGuardIntent, payload
+                )
             except Exception as exc:
                 raise LabArtifactIntegrityError("namespace guard intent is invalid") from exc
             if payload != intent.canonical_json_bytes() or name != self._guard_intent_name(intent):
@@ -4145,7 +4147,9 @@ class LabJobArtifactStore:
             finally:
                 os.close(manifest_descriptor)
             try:
-                manifest = LabJobArtifactManifest.model_validate_json(manifest_bytes)
+                manifest = strict_model_validate_canonical_json(
+                    LabJobArtifactManifest, manifest_bytes
+                )
             except Exception as exc:
                 raise LabArtifactIntegrityError(f"invalid job artifact manifest: {exc}") from exc
             if manifest_bytes != manifest.canonical_json_bytes():
@@ -4649,7 +4653,7 @@ class LabJobArtifactStore:
                 raise LabArtifactIntegrityError("job artifact seal intent identity changed")
             payload = _read_descriptor(file_descriptor)
             try:
-                intent = LabArtifactSealIntent.model_validate_json(payload)
+                intent = strict_model_validate_canonical_json(LabArtifactSealIntent, payload)
             except Exception:
                 return "torn"
             if payload != intent.canonical_json_bytes() or intent.job_id != job_id:
@@ -4844,8 +4848,8 @@ class LabJobArtifactStore:
                     )
                     temporary_payload = _read_descriptor(descriptor)
                     try:
-                        temporary_intent = LabArtifactSealIntent.model_validate_json(
-                            temporary_payload
+                        temporary_intent = strict_model_validate_canonical_json(
+                            LabArtifactSealIntent, temporary_payload
                         )
                     except Exception as exc:
                         raise LabArtifactIntegrityError(
@@ -4895,7 +4899,7 @@ class LabJobArtifactStore:
             identity = _FileObservation.from_stat(os.fstat(descriptor))
             payload = _read_descriptor(descriptor)
             try:
-                intent = LabArtifactSealIntent.model_validate_json(payload)
+                intent = strict_model_validate_canonical_json(LabArtifactSealIntent, payload)
             except Exception as exc:
                 raise LabArtifactIntegrityError(f"invalid job artifact seal intent: {exc}") from exc
             if payload != intent.canonical_json_bytes() or intent.job_id != job_id:
@@ -5094,7 +5098,7 @@ class LabJobArtifactStore:
     def _bound_manifest(bound: _BoundArtifactBundle) -> LabJobArtifactManifest:
         payload = _read_descriptor(bound.files["manifest.json"].descriptor)
         try:
-            manifest = LabJobArtifactManifest.model_validate_json(payload)
+            manifest = strict_model_validate_canonical_json(LabJobArtifactManifest, payload)
         except Exception as exc:
             raise LabArtifactIntegrityError("bound candidate manifest is invalid") from exc
         if payload != manifest.canonical_json_bytes():
@@ -7222,7 +7226,7 @@ class LegacyArtifactIndex:
             )
         payload = _read_descriptor(descriptor)
         try:
-            head = LabLegacyAuthorityHead.model_validate_json(payload)
+            head = strict_model_validate_canonical_json(LabLegacyAuthorityHead, payload)
         except Exception as exc:
             raise LabArtifactIntegrityError("legacy authority generation head is invalid") from exc
         if payload != head.canonical_json_bytes():
@@ -7390,7 +7394,9 @@ class LegacyArtifactIndex:
                 )
             )
             try:
-                rebuilt = LabLegacyAuthorityHead.model_validate_json(_read_descriptor(descriptor))
+                rebuilt = strict_model_validate_canonical_json(
+                    LabLegacyAuthorityHead, _read_descriptor(descriptor)
+                )
             except Exception as exc:
                 raise LabArtifactIntegrityError(
                     "legacy authority head candidate is invalid"
@@ -7485,7 +7491,7 @@ class LegacyArtifactIndex:
                 )
             payload = _read_descriptor(descriptor)
             try:
-                head = LabLegacyAuthorityHead.model_validate_json(payload)
+                head = strict_model_validate_canonical_json(LabLegacyAuthorityHead, payload)
             except Exception as exc:
                 raise LabArtifactIntegrityError("legacy single authority head is invalid") from exc
             if (
@@ -8378,7 +8384,7 @@ class LegacyArtifactIndex:
         previous_hash = _LEGACY_GENESIS_HASH
         for raw_line in payload.splitlines():
             try:
-                event = LabLegacyAuthorityEvent.model_validate_json(raw_line)
+                event = strict_model_validate_canonical_json(LabLegacyAuthorityEvent, raw_line)
             except Exception as exc:
                 raise LabArtifactIntegrityError("legacy authority ledger is invalid") from exc
             if raw_line != event.canonical_json_bytes():

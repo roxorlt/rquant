@@ -17,9 +17,9 @@ import os
 import re
 import secrets
 import shutil
-import signal
 import stat
 import subprocess
+import sys
 import tarfile
 import time
 import tomllib
@@ -31,17 +31,42 @@ from pathlib import Path
 from typing import Any
 
 
-def _load_strict_json() -> tuple[type[ValueError], Callable[[str | bytes | bytearray], Any]]:
+def _load_strict_json() -> tuple[
+    type[ValueError],
+    Callable[[str | bytes | bytearray], Any],
+    Callable[..., Any],
+]:
     path = Path(__file__).resolve().parents[2] / "scripts" / "strict_json.py"
     spec = importlib.util.spec_from_file_location("_rquant_strict_json", path)
     if spec is None or spec.loader is None:
         raise RuntimeError("strict JSON authority cannot be loaded")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.StrictJsonError, module.strict_json_loads
+    return (
+        module.StrictJsonError,
+        module.strict_json_loads,
+        module.strict_canonical_json_loads,
+    )
 
 
-StrictJsonError, strict_json_loads = _load_strict_json()
+StrictJsonError, strict_json_loads, strict_canonical_json_loads = _load_strict_json()
+
+
+def _load_contained_runner() -> tuple[
+    Callable[..., subprocess.CompletedProcess[Any]],
+    type[RuntimeError],
+]:
+    path = Path(__file__).resolve().with_name("contained_subprocess.py")
+    spec = importlib.util.spec_from_file_location("_rquant_contained_subprocess", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("contained subprocess authority cannot be loaded")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module.run_contained, module.ContainedProcessError
+
+
+run_contained, ContainedProcessError = _load_contained_runner()
 
 MARKER_SCHEMA_VERSION = 1
 INTENT_SCHEMA_VERSION = 1
@@ -382,6 +407,24 @@ class GenerationGcMetrics:
     free_bytes_after: int
     required_free_bytes: int
     retained_generation_ids: tuple[str, ...]
+
+
+@dataclass
+class GenerationReferenceCollector:
+    values: set[str]
+    sources: dict[str, set[str]]
+
+    @classmethod
+    def create(cls) -> GenerationReferenceCollector:
+        return cls(values=set(), sources={})
+
+    def add(self, value: object, *, source: str, optional: bool = False) -> None:
+        if value in {None, ""} and optional:
+            return
+        if type(value) is not str or GENERATION_ID_PATTERN.fullmatch(value) is None:
+            raise ReleaseGenerationError(f"{source} generation reference is invalid")
+        self.values.add(value)
+        self.sources.setdefault(value, set()).add(source)
 
 
 @dataclass(frozen=True)
@@ -1090,16 +1133,16 @@ def validate_lab_handoff_supersede_chain(
     )
     if tuple(item.operation_id for item in reversed(physical_chain)) != history_chain:
         raise ReleaseGenerationError("Lab handoff supersede chain does not match rebound history")
+    validate_lab_handoff_record_authority(
+        record=record,
+        intent=intent,
+        installation_identity=installation_identity,
+        checkout_root=checkout_root,
+        expected_labels=expected_labels,
+    )
     current = record
     seen = {record.operation_id}
     for ancestor in ancestors:
-        validate_lab_handoff_record_authority(
-            record=current,
-            intent=intent,
-            installation_identity=installation_identity,
-            checkout_root=checkout_root,
-            expected_labels=expected_labels,
-        )
         if (
             current.action == "deploy"
             or current.supersedes_operation_id != ancestor.operation_id
@@ -1110,15 +1153,15 @@ def validate_lab_handoff_supersede_chain(
             action=current.action,
             superseded_action=ancestor.action,
         )
+        validate_lab_handoff_record_authority(
+            record=ancestor,
+            intent=intent,
+            installation_identity=ancestor.installation_identity,
+            checkout_root=checkout_root,
+            expected_labels=expected_labels,
+        )
         seen.add(ancestor.operation_id)
         current = ancestor
-    validate_lab_handoff_record_authority(
-        record=current,
-        intent=intent,
-        installation_identity=installation_identity,
-        checkout_root=checkout_root,
-        expected_labels=expected_labels,
-    )
     if current.action != "deploy" or current.supersedes_operation_id:
         raise ReleaseGenerationError("Lab handoff supersede chain has no deploy root")
     if current.operation_id != intent.initial_handoff_operation_id:
@@ -1391,6 +1434,30 @@ def _blocking_timeout(
     return timeout
 
 
+def _contained_run(
+    arguments: list[str],
+    *,
+    cwd: Path,
+    cap_seconds: float,
+    timeout_provider: Callable[[float], float] | None,
+    check: bool = True,
+    text: bool = True,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[Any]:
+    timeout = _blocking_timeout(cap_seconds, timeout_provider)
+    try:
+        return run_contained(
+            arguments,
+            cwd=cwd,
+            deadline_monotonic=time.monotonic() + timeout,
+            check=check,
+            text=text,
+            env=env,
+        )
+    except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+        raise ReleaseGenerationError("release generation command failed") from exc
+
+
 def _git_output(
     repo: Path,
     git_path: Path,
@@ -1398,13 +1465,13 @@ def _git_output(
     timeout_provider: Callable[[float], float] | None = None,
 ) -> str:
     try:
-        result = subprocess.run(
+        result = _contained_run(
             [str(git_path), *arguments],
             cwd=repo,
             check=True,
-            capture_output=True,
             text=True,
-            timeout=_blocking_timeout(10, timeout_provider),
+            cap_seconds=10,
+            timeout_provider=timeout_provider,
             env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"},
         )
     except (OSError, subprocess.SubprocessError) as exc:
@@ -1419,22 +1486,22 @@ def _assert_tracked_clean(
     timeout_provider: Callable[[float], float] | None = None,
 ) -> None:
     try:
-        status = subprocess.run(
+        status = _contained_run(
             [str(git_path), "status", "--porcelain=v1", "--untracked-files=no"],
             cwd=repo,
             check=True,
-            capture_output=True,
             text=True,
-            timeout=_blocking_timeout(10, timeout_provider),
+            cap_seconds=10,
+            timeout_provider=timeout_provider,
             env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"},
         )
-        diff = subprocess.run(
+        diff = _contained_run(
             [str(git_path), "diff", "--quiet", "HEAD", "--"],
             cwd=repo,
             check=False,
-            capture_output=True,
             text=True,
-            timeout=_blocking_timeout(10, timeout_provider),
+            cap_seconds=10,
+            timeout_provider=timeout_provider,
             env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"},
         )
     except (OSError, subprocess.SubprocessError) as exc:
@@ -1515,12 +1582,13 @@ def _materialize_release_code(
         raise ReleaseGenerationError("release code payload is incomplete")
     checkpoint()
     try:
-        result = subprocess.run(
+        result = _contained_run(
             [str(git_path), "archive", "--format=tar", expected_commit, "--", *members],
             cwd=repo,
             check=True,
-            capture_output=True,
-            timeout=_blocking_timeout(30, timeout_provider),
+            text=False,
+            cap_seconds=30,
+            timeout_provider=timeout_provider,
             env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"},
         )
     except (OSError, subprocess.SubprocessError) as exc:
@@ -1581,12 +1649,13 @@ def _python_facts(
         "'soabi': sysconfig.get_config_var('SOABI') or ''}, sort_keys=True))"
     )
     try:
-        result = subprocess.run(
+        result = _contained_run(
             [str(python_path), "-I", "-S", "-c", program],
+            cwd=python_path.parent,
             check=True,
-            capture_output=True,
             text=True,
-            timeout=_blocking_timeout(10, timeout_provider),
+            cap_seconds=10,
+            timeout_provider=timeout_provider,
         )
         payload = strict_json_loads(result.stdout)
         version = str(payload["version"])
@@ -1622,7 +1691,7 @@ def _venv_system_interpreter(
     timeout_provider: Callable[[float], float] | None = None,
 ) -> tuple[Path, PathIdentity, str]:
     try:
-        result = subprocess.run(
+        result = _contained_run(
             [
                 str(python_path),
                 "-I",
@@ -1630,10 +1699,11 @@ def _venv_system_interpreter(
                 "-c",
                 "import sys; print(sys._base_executable)",
             ],
+            cwd=python_path.parent,
             check=True,
-            capture_output=True,
             text=True,
-            timeout=_blocking_timeout(10, timeout_provider),
+            cap_seconds=10,
+            timeout_provider=timeout_provider,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise ReleaseGenerationError("deployment system Python cannot be discovered") from exc
@@ -1737,7 +1807,10 @@ def _read_private_json(
             raise ReleaseGenerationError(f"private deployment record {name} identity changed")
         if checkpoint is not None:
             checkpoint()
-        payload = strict_json_loads(b"".join(chunks))
+        payload = strict_canonical_json_loads(
+            b"".join(chunks),
+            trailing_newline=True,
+        )
         if checkpoint is not None:
             checkpoint()
         if not isinstance(payload, dict):
@@ -2433,7 +2506,10 @@ class ReleaseGenerationAuthority:
             environment_builder=self._environment_builder,
             immutable_code_root=self.immutable_code_root,
             command_timeout_seconds=self.command_timeout_seconds,
-            overall_deadline_monotonic=overall_deadline_monotonic,
+            overall_deadline_monotonic=min(
+                self.overall_deadline_monotonic,
+                overall_deadline_monotonic,
+            ),
             cancellation_check=self._cancellation_check,
         )
 
@@ -2482,53 +2558,37 @@ class ReleaseGenerationAuthority:
             if remaining <= 0:
                 raise ReleaseGenerationError("immutable release environment build timed out")
             try:
-                process = subprocess.Popen(
+                result = run_contained(
                     command,
                     cwd=self.repo,
+                    deadline_monotonic=min(
+                        time.monotonic() + self.command_timeout_seconds,
+                        self.overall_deadline_monotonic,
+                    ),
                     env=environment,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    start_new_session=True,
+                    cancellation_check=self._cancellation_check,
                 )
-                command_deadline = min(
-                    time.monotonic() + self.command_timeout_seconds,
-                    self.overall_deadline_monotonic,
-                )
-                while True:
-                    try:
-                        self._checkpoint()
-                    except ReleaseGenerationError:
-                        self._kill_environment_process_group(process)
-                        raise
-                    poll_remaining = command_deadline - time.monotonic()
-                    if poll_remaining <= 0:
-                        self._kill_environment_process_group(process)
-                        raise ReleaseGenerationError(
-                            "immutable release environment build timed out"
-                        )
-                    try:
-                        stdout, stderr = process.communicate(timeout=min(0.1, poll_remaining))
-                        break
-                    except subprocess.TimeoutExpired:
-                        continue
-                result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
             except ReleaseGenerationError:
                 raise
+            except subprocess.TimeoutExpired as exc:
+                raise ReleaseGenerationError(
+                    "immutable release environment build timed out"
+                ) from exc
             except (OSError, subprocess.SubprocessError) as exc:
                 raise ReleaseGenerationError("immutable release environment build failed") from exc
+            except ContainedProcessError as exc:
+                if self._cancellation_check():
+                    raise ReleaseGenerationError(
+                        "immutable release environment build was cancelled"
+                    ) from exc
+                raise ReleaseGenerationError(
+                    "immutable release environment build timed out or escaped containment"
+                ) from exc
             if result.returncode != 0:
                 diagnostic = (result.stderr or result.stdout or "no command output").strip()
                 raise ReleaseGenerationError(
                     f"immutable release environment build failed: {diagnostic[:1000]}"
                 )
-
-    @staticmethod
-    def _kill_environment_process_group(process: subprocess.Popen[str]) -> None:
-        with suppress(ProcessLookupError):
-            os.killpg(process.pid, signal.SIGKILL)
-        with suppress(OSError, subprocess.SubprocessError):
-            process.communicate(timeout=5)
 
     def _assert_lock(self) -> None:
         try:
@@ -2701,9 +2761,12 @@ class ReleaseGenerationAuthority:
             os.close(root_fd)
 
     def _retained_environment_ids(self, environment_fd: int) -> set[str]:
+        """Collect every generation named by a durable release/Lab authority."""
+
         del environment_fd
         self._checkpoint()
-        retained: set[str] = set()
+        references = GenerationReferenceCollector.create()
+        deployment_intents: list[DeploymentIntent] = []
         selector_payload = self._optional_private_payload(
             self.environment_selector_path,
             maximum_bytes=MAX_MARKER_BYTES,
@@ -2711,10 +2774,11 @@ class ReleaseGenerationAuthority:
         if selector_payload is not None:
             self._checkpoint()
             selector = EnvironmentSelector.from_payload(selector_payload)
-            retained.update(
-                value
-                for value in (selector.generation_id, selector.previous_generation_id)
-                if value
+            references.add(selector.generation_id, source="environment selector current")
+            references.add(
+                selector.previous_generation_id,
+                source="environment selector previous",
+                optional=True,
             )
         marker_payload = self._optional_private_payload(
             self.marker_path,
@@ -2723,13 +2787,14 @@ class ReleaseGenerationAuthority:
         if marker_payload is not None:
             self._checkpoint()
             marker = ReleaseGenerationMarker.from_payload(marker_payload)
-            retained.update(
-                value
-                for value in (
-                    marker.environment_generation_id,
-                    marker.previous_generation_id,
-                )
-                if value
+            references.add(
+                marker.environment_generation_id,
+                source="release marker current",
+            )
+            references.add(
+                marker.previous_generation_id,
+                source="release marker previous",
+                optional=True,
             )
         commit_payload = self._optional_private_payload(
             self.commit_path,
@@ -2738,28 +2803,253 @@ class ReleaseGenerationAuthority:
         if commit_payload is not None:
             self._checkpoint()
             commit_record = ReleaseGenerationCommit.from_payload(commit_payload)
-            retained.update(
-                value
-                for value in (
-                    commit_record.environment_generation_id,
-                    commit_record.previous_generation_id,
-                )
-                if value
+            references.add(
+                commit_record.environment_generation_id,
+                source="release commit current",
             )
-        for path in (self.intent_path, self.initialization_path):
+            references.add(
+                commit_record.previous_generation_id,
+                source="release commit previous",
+                optional=True,
+            )
+        for path in (
+            self.intent_path,
+            self.prepared_intent_path,
+            self.initialization_path,
+        ):
             payload = self._optional_private_payload(path, maximum_bytes=MAX_INTENT_BYTES)
             if payload is None:
                 continue
             self._checkpoint()
             intent = DeploymentIntent.from_payload(payload)
-            if intent.previous_generation_id:
-                retained.add(intent.previous_generation_id)
-            retained.update(
-                _environment_generation_id(operation_id=intent.operation_id, commit=commit)
-                for commit in (intent.previous_sha, intent.target_sha)
+            if path in {self.intent_path, self.prepared_intent_path}:
+                deployment_intents.append(intent)
+            references.add(
+                intent.previous_generation_id,
+                source=f"{path.name} previous",
+                optional=True,
             )
+            references.add(
+                _environment_generation_id(
+                    operation_id=intent.operation_id,
+                    commit=intent.previous_sha,
+                ),
+                source=f"{path.name} derived previous",
+            )
+            references.add(
+                _environment_generation_id(
+                    operation_id=intent.operation_id,
+                    commit=intent.target_sha,
+                ),
+                source=f"{path.name} derived target",
+            )
+
+        local_install_path = self.lock_path.with_name(
+            f"{self.lock_path.stem}.lab-local-install.json"
+        )
+        registered_install_path = self.lock_path.with_name(
+            f"{self.lock_path.stem}.lab-install.json"
+        )
+        local_install = self._optional_private_payload(
+            local_install_path,
+            maximum_bytes=MAX_INTENT_BYTES,
+        )
+        registered_install = self._optional_private_payload(
+            registered_install_path,
+            maximum_bytes=MAX_INTENT_BYTES,
+        )
+        if local_install is not None:
+            required_local = {
+                "schema_version",
+                "code_sha",
+                "environment_generation_id",
+                "handoff_operation_id",
+                "launch_agents_dir",
+                "plists",
+            }
+            if (
+                set(local_install) != required_local
+                or local_install.get("schema_version") != 2
+                or not isinstance(local_install.get("plists"), dict)
+                or type(local_install.get("handoff_operation_id")) is not str
+            ):
+                raise ReleaseGenerationError("local Lab installation authority is invalid")
+            references.add(
+                local_install["environment_generation_id"],
+                source="local Lab installation",
+            )
+        if registered_install is not None:
+            if (
+                registered_install.get("schema_version") != 2
+                or registered_install.get("labels") != list(LAB_LAUNCHD_HANDOFF_LABELS)
+                or not isinstance(registered_install.get("plists"), dict)
+                or set(registered_install["plists"]) != set(LAB_LAUNCHD_HANDOFF_LABELS)
+            ):
+                raise ReleaseGenerationError("registered Lab installation authority is invalid")
+            registered_generation = registered_install.get("environment_generation_id")
+            if registered_generation is not None:
+                references.add(
+                    registered_generation,
+                    source="registered Lab installation",
+                )
+        if local_install is not None and registered_install is None:
+            raise ReleaseGenerationError("registered Lab installation authority is missing")
+        if local_install is not None and (
+            registered_install.get("environment_generation_id")
+            != local_install["environment_generation_id"]
+        ):
+            raise ReleaseGenerationError("Lab installation generation authorities diverged")
+
+        install_transaction_path = self.lock_path.with_name(
+            f"{self.lock_path.stem}.lab-install-transaction.json"
+        )
+        install_transaction = self._optional_private_payload(
+            install_transaction_path,
+            maximum_bytes=MAX_INTENT_BYTES,
+        )
+        if install_transaction is not None:
+            raise ReleaseGenerationError(
+                "unfinished Lab installation transaction blocks generation GC"
+            )
+
+        if registered_install is not None:
+            readiness_value = registered_install.get("readiness_root")
+            if type(readiness_value) is not str:
+                raise ReleaseGenerationError("registered Lab readiness root is invalid")
+            readiness_root = _canonical(Path(readiness_value), label="Lab readiness root")
+            readiness_fd, readiness_identity = _private_lock_root(readiness_root)
+            try:
+                for label in LAB_LAUNCHD_HANDOFF_LABELS:
+                    self._checkpoint()
+                    try:
+                        heartbeat, _heartbeat_identity = _read_private_json(
+                            root_fd=readiness_fd,
+                            root_path=readiness_root,
+                            name=f"{label}.json",
+                            maximum_bytes=MAX_MARKER_BYTES,
+                            checkpoint=self._checkpoint,
+                        )
+                    except ReleaseGenerationRecordMissingError:
+                        continue
+                    expected_heartbeat_fields = {
+                        "label",
+                        "pid",
+                        "operation_id",
+                        "environment_generation_id",
+                        "code_sha",
+                        "started_at",
+                        "heartbeat_at",
+                        "heartbeat_monotonic",
+                        "generation_lock_device",
+                        "generation_lock_inode",
+                    }
+                    if (
+                        set(heartbeat) != expected_heartbeat_fields
+                        or heartbeat.get("label") != label
+                        or type(heartbeat.get("pid")) is not int
+                    ):
+                        raise ReleaseGenerationError("Lab readiness authority is invalid")
+                    references.add(
+                        heartbeat.get("environment_generation_id"),
+                        source=f"Lab readiness {label}",
+                    )
+                active_readiness = _identity(
+                    readiness_root,
+                    label="Lab readiness root",
+                    directory=True,
+                )
+                if _object_key(active_readiness) != _object_key(readiness_identity):
+                    raise ReleaseGenerationError("Lab readiness root changed during GC")
+            finally:
+                os.close(readiness_fd)
+
+        operation_pattern = re.compile(
+            rf"{re.escape(self.lock_path.stem)}\.lab-handoff\.([0-9a-f]{{32}})\.json"
+        )
+        completed_pattern = re.compile(
+            rf"{re.escape(self.lock_path.stem)}\.lab-handoff\.([0-9a-f]{{32}})"
+            rf"\.completed\.json"
+        )
+        bootout_pattern = re.compile(
+            rf"{re.escape(self.lock_path.stem)}\.lab-handoff\.([0-9a-f]{{32}})"
+            rf"\.[0-9a-f]{{16}}\.bootout\.json"
+        )
+        active_name = f"{self.lock_path.stem}.lab-handoff.json"
+        handoff_records: dict[str, LabHandoffRecord] = {}
+        bootout_operations: set[str] = set()
+        for entry in sorted(self.lock_path.parent.iterdir()):
+            self._checkpoint()
+            operation_match = operation_pattern.fullmatch(entry.name)
+            completed_match = completed_pattern.fullmatch(entry.name)
+            bootout_match = bootout_pattern.fullmatch(entry.name)
+            if entry.name != active_name and operation_match is None and completed_match is None:
+                if bootout_match is not None:
+                    evidence = self._optional_private_payload(
+                        entry,
+                        maximum_bytes=MAX_MARKER_BYTES,
+                    )
+                    expected_evidence_fields = {
+                        "schema_version",
+                        "operation_id",
+                        "label",
+                        "domain",
+                        "action",
+                    }
+                    if (
+                        evidence is None
+                        or set(evidence) != expected_evidence_fields
+                        or evidence.get("schema_version") != 1
+                        or evidence.get("operation_id") != bootout_match.group(1)
+                        or evidence.get("label") not in LAB_LAUNCHD_HANDOFF_LABELS
+                        or evidence.get("action") != "bootout"
+                        or type(evidence.get("domain")) is not str
+                    ):
+                        raise ReleaseGenerationError("Lab bootout evidence is invalid")
+                    bootout_operations.add(bootout_match.group(1))
+                continue
+            payload = self._optional_private_payload(entry, maximum_bytes=MAX_INTENT_BYTES)
+            if payload is None:
+                raise ReleaseGenerationError("Lab handoff authority disappeared during GC")
+            completed = payload.get("stage") == "completed"
+            record = LabHandoffRecord.from_payload(payload, completed=completed)
+            existing = handoff_records.get(record.operation_id)
+            if existing is not None and existing != record:
+                raise ReleaseGenerationError("Lab handoff authority records are inconsistent")
+            handoff_records[record.operation_id] = record
+            if completed:
+                references.add(
+                    record.environment_generation_id,
+                    source=f"Lab handoff {record.operation_id}",
+                )
+            else:
+                matching_intents = [
+                    intent
+                    for intent in deployment_intents
+                    if record.operation_id
+                    in {
+                        intent.initial_handoff_operation_id,
+                        *(
+                            event["handoff_operation_id"]
+                            for event in intent.stage_history
+                            if event["stage"] == "handoff_rebound"
+                        ),
+                    }
+                    and record.target_sha in {intent.previous_sha, intent.target_sha}
+                ]
+                if len(matching_intents) != 1:
+                    raise ReleaseGenerationError(
+                        "partial Lab handoff has no unique deployment intent authority"
+                    )
+        for record in handoff_records.values():
+            if (
+                record.supersedes_operation_id
+                and record.supersedes_operation_id not in handoff_records
+            ):
+                raise ReleaseGenerationError("Lab handoff supersede ancestor is missing")
+        if not bootout_operations.issubset(handoff_records):
+            raise ReleaseGenerationError("Lab bootout evidence operation is missing")
         self._checkpoint()
-        return retained
+        return references.values
 
     def _append_generation_gc_audit(self, payload: dict[str, Any]) -> None:
         root_fd, root_identity = _private_lock_root(self.lock_path.parent)
@@ -2953,7 +3243,9 @@ class ReleaseGenerationAuthority:
             if PathIdentity.capture(opened) != PathIdentity.capture(active):
                 raise ReleaseGenerationError("release generation marker identity changed")
             self._assert_root(root_fd, root_identity)
-            return ReleaseGenerationMarker.from_payload(strict_json_loads(payload))
+            return ReleaseGenerationMarker.from_payload(
+                strict_canonical_json_loads(payload, trailing_newline=True)
+            )
         except FileNotFoundError as exc:
             raise ReleaseGenerationError("release generation marker is missing") from exc
         except (OSError, StrictJsonError) as exc:
@@ -3153,6 +3445,7 @@ class ReleaseGenerationAuthority:
         marker: ReleaseGenerationMarker,
         selector: EnvironmentSelector,
         provisional_label: str | None,
+        provisional_installation_operation_id: str | None,
     ) -> None:
         if not transaction.handoff_operation_id:
             return
@@ -3165,6 +3458,9 @@ class ReleaseGenerationAuthority:
                 name=install_name,
                 maximum_bytes=MAX_INTENT_BYTES,
             )
+            installation_checkout_root = installation_payload.get("checkout_root")
+            if type(installation_checkout_root) is not str:
+                raise ReleaseGenerationError("Lab installation checkout authority is invalid")
             installation = LabInstallationIdentity(
                 path=str(self.lock_path.with_name(install_name)),
                 sha256=hashlib.sha256(
@@ -3263,7 +3559,7 @@ class ReleaseGenerationAuthority:
             ancestors=tuple(ancestors),
             intent=transaction,
             installation_identity=installation,
-            checkout_root=str(self.repo),
+            checkout_root=installation_checkout_root,
             expected_labels=transaction.handoff_labels,
             completed_proofs=tuple(completed_proofs),
         )
@@ -3288,6 +3584,13 @@ class ReleaseGenerationAuthority:
             provisional_label in record.restarted_labels and record.stage == "restarting"
         ):
             return
+        if (
+            provisional_installation_operation_id == record.operation_id
+            and record.stage == "stopped"
+            and record.stopped_labels == record.labels
+            and not record.restarted_labels
+        ):
+            return
         raise ReleaseGenerationError("deployment handoff is not completed")
 
     def verify(
@@ -3295,6 +3598,7 @@ class ReleaseGenerationAuthority:
         *,
         expected_commit: str,
         provisional_handoff_label: str | None = None,
+        provisional_installation_operation_id: str | None = None,
     ) -> ReleaseGenerationMarker:
         self._assert_lock()
         published = self._read_marker()
@@ -3319,6 +3623,7 @@ class ReleaseGenerationAuthority:
             marker=published,
             selector=selector,
             provisional_label=provisional_handoff_label,
+            provisional_installation_operation_id=provisional_installation_operation_id,
         )
         committed: ReleaseGenerationCommit | None = None
         if not provisional:

@@ -1189,7 +1189,7 @@ def test_commit_conflict_restart_recovers_and_prunes_owned_incomplete_bundles(
     for index, conflict in enumerate(conflicts):
         evidence = LabArtifactConflictEvidence.from_conflict(conflict, reason=reason)
         temporary = spool._conflict_temporary_path(evidence)
-        temporary.write_bytes(evidence.model_dump_json().encode("utf-8"))
+        temporary.write_bytes(artifact_protocol.canonical_model_json_bytes(evidence))
         os.utime(temporary, ns=(index + 1, index + 1), follow_symlinks=False)
 
     restarted = LabArtifactCommitSpool(
@@ -1619,7 +1619,7 @@ def test_commit_conflict_retention_bounds_legacy_partial_files_without_touching_
     payload_only = spool.quarantine_dir / (
         f"{request_id}.{payload_only_conflict.content_hash}.{reason_hash}.conflict.bad"
     )
-    payload_only.write_bytes(payload_only_conflict.model_dump_json().encode("utf-8"))
+    payload_only.write_bytes(artifact_protocol.canonical_model_json_bytes(payload_only_conflict))
 
     metadata_only_conflict = LabArtifactCommitEnvelope(
         request_id=request_id,
@@ -1630,12 +1630,12 @@ def test_commit_conflict_retention_bounds_legacy_partial_files_without_touching_
     )
     metadata_only = Path(f"{missing_payload}.json")
     metadata_only.write_bytes(
-        LabQuarantinedArtifactCommit(
-            path=missing_payload,
-            reason=reason,
+        artifact_protocol.canonical_model_json_bytes(
+            LabQuarantinedArtifactCommit(
+                path=missing_payload,
+                reason=reason,
+            )
         )
-        .model_dump_json()
-        .encode("utf-8")
     )
     outside = tmp_path / "outside-conflict-evidence"
     outside.write_text("keep", encoding="utf-8")
@@ -1683,7 +1683,7 @@ def test_artifact_commit_spool_rejects_duplicate_keys_in_pending_and_ack(
     with pytest.raises(InvalidCommandEnvelopeError, match="duplicate JSON key"):
         spool.load(pending.path)
 
-    pending.path.write_bytes(envelope.model_dump_json().encode("utf-8"))
+    pending.path.write_bytes(artifact_protocol.canonical_model_json_bytes(envelope))
     receipt = LabArtifactCommitReceipt(
         request_id=envelope.request_id,
         content_hash=envelope.content_hash,

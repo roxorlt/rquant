@@ -111,8 +111,10 @@ Lab runtime prepared sentinel 绑定长期稳定的 runtime-root device/inode。
 ancestor 在验证后发生 rename/replacement 时，创建与登记都会失败关闭，replacement namespace 不会
 收到数据库写入。
 
-发布环境 GC 只在同一 generation 独占锁内运行。它保留当前 selector、marker、commit、active
-intent 的 resume/rollback 目标，以及按私有 manifest 判定的紧邻上一代；只删除超过宽限期、
+发布环境 GC 只在同一 generation 独占锁内运行。它通过统一引用收集器保留 selector、marker、commit、
+active/prepared/initialization intent、local/registered installation、daemon readiness、全部 partial/
+recovery/completed handoff 与 supersede 祖先所引用的当前、上一代和候选代际；未完成 installation
+transaction、损坏记录或缺失引用祖先会在删除前失败关闭。GC 只删除超过宽限期、
 严格位于 generation root、无 symlink/hardlink 且不再被引用的完成或失败目录。只读树先受控解冻
 再按 descriptor 删除。每次扫描记录到 `rQuant.generation-gc.jsonl`，并在构建前验证 generation
 预算与 `RQUANT_RELEASE_GENERATION_MIN_FREE_BYTES`；不足时不创建 staging。uv 子进程以短轮询检查
@@ -138,6 +140,9 @@ identity-bound transaction journal，再用同文件系统 rename 保存原 inod
 state 和原 loaded label 在任一边界失败后都按 journal 精确恢复。首次安装遇到任何未登记的同名文件
 都会失败关闭且保持其 bytes/inode 不变；幂等复跑不替换相同 inode。卸载只有在全部精确 managed
 label 确认 unload 后才移除文件和两份状态，任一 bootout 失败则完整恢复。
+常规 A→B installed 发布无需再次人工运行 installer：handoff 在目标 daemon bootstrap 前使用同一
+identity-bound journal 将三份 plist 及 local/registered state 原子推进到 B；失败则先停止 B、恢复 A
+文件身份与 loaded 集合，再恢复 A authority。旧 generation 保留到 B 的 commit 与 readiness 完成。
 P1.5b **没有**向 `~/Library/LaunchAgents` 写文件，也没有执行真实 `launchctl bootstrap/kickstart`；
 这些实际安装、健康观察和回滚演练只在 P1.5d 人工基础设施窗口进行。
 
