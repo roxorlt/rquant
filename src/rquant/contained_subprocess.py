@@ -197,13 +197,31 @@ def _release_signal_mask_bounded(
     return False
 
 
+def _returning_signal_replay_error(signum: int) -> InterruptedError:
+    return InterruptedError(f"process runner interrupted by signal {signum}")
+
+
+def _is_nested_signal_latch_handler(handler: object) -> bool:
+    return (
+        isinstance(getattr(handler, "__self__", None), _ContainedSignalLatch)
+        and getattr(handler, "__func__", None) is _ContainedSignalLatch.handle
+    )
+
+
+@dataclass
+class _SignalHandlerInvocation:
+    signum: int
+    replay_error: BaseException | None = None
+    authority_transferred: bool = False
+
+
 class _SignalHandlerInvocationTracker:
     def __init__(
         self,
         previous_handlers: Mapping[int, object],
     ) -> None:
         self._previous_handlers = previous_handlers
-        self._exceptions: list[BaseException] = []
+        self._invocations: list[_SignalHandlerInvocation] = []
         trampoline = self._invoke
         self.handlers = {
             signum: trampoline for signum, handler in previous_handlers.items() if callable(handler)
@@ -212,18 +230,48 @@ class _SignalHandlerInvocationTracker:
     def _invoke(self, signum: int, frame: object) -> None:
         handler = self._previous_handlers[signum]
         assert callable(handler)
+        authority_transferred = _is_nested_signal_latch_handler(handler) and not self._invocations
+        invocation_index = len(self._invocations)
+        invocation = _SignalHandlerInvocation(
+            signum,
+            replay_error=(
+                None if authority_transferred else _returning_signal_replay_error(signum)
+            ),
+            authority_transferred=authority_transferred,
+        )
+        self._invocations.append(invocation)
         try:
             handler(signum, frame)
         except BaseException as exc:
-            _record_cleanup_error(self._exceptions, exc)
+            raised_by_later_invocation = any(
+                later.replay_error is exc for later in self._invocations[invocation_index + 1 :]
+            )
+            if not raised_by_later_invocation:
+                invocation.replay_error = exc
+                invocation.authority_transferred = False
             raise
+        if invocation.authority_transferred:
+            return
+        assert invocation.replay_error is not None
+        raise invocation.replay_error
 
     def raised(self, error: BaseException) -> bool:
-        return any(exception is error for exception in self._exceptions)
+        return any(invocation.replay_error is error for invocation in self._invocations)
 
     @property
-    def first_exception(self) -> BaseException | None:
-        return self._exceptions[0] if self._exceptions else None
+    def first_replay_error(self) -> BaseException | None:
+        return next(
+            (
+                invocation.replay_error
+                for invocation in self._invocations
+                if invocation.replay_error is not None
+            ),
+            None,
+        )
+
+    @property
+    def authority_transferred(self) -> bool:
+        return bool(self._invocations and self._invocations[0].authority_transferred)
 
 
 def _restore_signal_handlers_collecting_errors(
@@ -315,24 +363,23 @@ class _SignalRestoration(list[BaseException]):
             else None
         )
         invocation_tracker: _SignalHandlerInvocationTracker | None = None
-        if protected_replay_error is None and primary_exception is not None:
-            candidate_tracker = _SignalHandlerInvocationTracker(previous_handlers)
-            if candidate_tracker.handlers:
-                self._fail_closed(
+        candidate_tracker = _SignalHandlerInvocationTracker(previous_handlers)
+        if candidate_tracker.handlers and self._handlers_restored:
+            self._fail_closed(
+                cleanup_errors,
+                context="signal handler tracking could not establish a blocked state",
+            )
+            if _restore_signal_handlers_collecting_errors(
+                candidate_tracker.handlers,
+                cleanup_errors,
+            ):
+                invocation_tracker = candidate_tracker
+            else:
+                self._handlers_restored = _restore_signal_handlers_collecting_errors(
+                    previous_handlers,
                     cleanup_errors,
-                    context="signal handler tracking could not establish a blocked state",
                 )
-                if _restore_signal_handlers_collecting_errors(
-                    candidate_tracker.handlers,
-                    cleanup_errors,
-                ):
-                    invocation_tracker = candidate_tracker
-                else:
-                    self._handlers_restored = _restore_signal_handlers_collecting_errors(
-                        previous_handlers,
-                        cleanup_errors,
-                    )
-                    return
+                return
         for _attempt in range(_SIGNAL_STATE_ATTEMPTS):
             try:
                 if not self._released:
@@ -353,8 +400,12 @@ class _SignalRestoration(list[BaseException]):
                             previous_handlers,
                             cleanup_errors,
                         )
-                    tracked_error = invocation_tracker.first_exception
-                    if protected_replay_error is None and tracked_error is not None:
+                    tracked_error = invocation_tracker.first_replay_error
+                    if (
+                        protected_replay_error is None
+                        and tracked_error is not None
+                        and not invocation_tracker.authority_transferred
+                    ):
                         protected_replay_error = tracked_error
                     invocation_tracker = None
                     if not self._handlers_restored:
@@ -377,7 +428,21 @@ class _SignalRestoration(list[BaseException]):
                         and invocation_tracker.raised(exc)
                         and (self._released or exc is self._last_release_transition_exception)
                     )
-                    if primary_exception is None or boundary_signal:
+                    authority_transferred = (
+                        invocation_tracker is not None and invocation_tracker.authority_transferred
+                    )
+                    tracked_error = (
+                        invocation_tracker.first_replay_error
+                        if invocation_tracker is not None
+                        else None
+                    )
+                    if boundary_signal and authority_transferred:
+                        _record_cleanup_error(cleanup_errors, exc)
+                    elif boundary_signal and tracked_error is not None:
+                        protected_replay_error = tracked_error
+                        if exc is not tracked_error:
+                            _record_cleanup_error(cleanup_errors, exc)
+                    elif primary_exception is None:
                         protected_replay_error = exc
                     else:
                         _record_cleanup_error(cleanup_errors, exc)
@@ -393,8 +458,12 @@ class _SignalRestoration(list[BaseException]):
                 previous_handlers,
                 cleanup_errors,
             )
-            tracked_error = invocation_tracker.first_exception
-            if protected_replay_error is None and tracked_error is not None:
+            tracked_error = invocation_tracker.first_replay_error
+            if (
+                protected_replay_error is None
+                and tracked_error is not None
+                and not invocation_tracker.authority_transferred
+            ):
                 protected_replay_error = tracked_error
 
         if protected_replay_error is None:
@@ -730,7 +799,9 @@ def _latched_signal_replay_error(
             previous(signum, None)
         except BaseException as exc:
             return exc
-        return InterruptedError(f"process runner interrupted by signal {signum}")
+        if _is_nested_signal_latch_handler(previous):
+            return None
+        return _returning_signal_replay_error(signum)
     if previous is signal.SIG_IGN:
         return None
     try:
