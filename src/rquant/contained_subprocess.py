@@ -338,34 +338,27 @@ class _SignalRestoration(list[BaseException]):
                 if not self._released:
                     self.release()
                 if invocation_tracker is not None:
-                    tracked_error = invocation_tracker.first_exception
-                    self._fail_closed(
-                        cleanup_errors,
-                        context="tracked signal handlers could not be restored safely",
-                    )
+                    # Remove forwarding trampolines only after the verified unmask so
+                    # handler exceptions remain attributable through the handoff.
                     self._handlers_restored = _restore_signal_handlers_collecting_errors(
                         previous_handlers,
                         cleanup_errors,
                     )
+                    if not self._handlers_restored:
+                        self._fail_closed(
+                            cleanup_errors,
+                            context=("signal handler handoff could not return to a blocked state"),
+                        )
+                        self._handlers_restored = _restore_signal_handlers_collecting_errors(
+                            previous_handlers,
+                            cleanup_errors,
+                        )
+                    tracked_error = invocation_tracker.first_exception
                     if protected_replay_error is None and tracked_error is not None:
                         protected_replay_error = tracked_error
                     invocation_tracker = None
                     if not self._handlers_restored:
                         break
-                    try:
-                        self.release()
-                    except BaseException as exc:
-                        _record_cleanup_error(cleanup_errors, exc)
-                        self._fail_closed(
-                            cleanup_errors,
-                            context=(
-                                "exact signal handler handoff could not return to a blocked state"
-                            ),
-                        )
-                        _terminate_unsafe_signal_state(
-                            "exact signal handler handoff has ambiguous provenance",
-                            cleanup_errors,
-                        )
                 if protected_replay_error is None:
                     return
                 _attach_cleanup_error_group(

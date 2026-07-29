@@ -449,7 +449,16 @@ def test_signal_latch_release_failure_rolls_back_handlers_while_blocked(
         installing_latch = isinstance(
             getattr(handler, "__self__", None), contained._ContainedSignalLatch
         )
-        if not installing_latch and verification_failures == contained._SIGNAL_STATE_ATTEMPTS:
+        current_handler = signal.getsignal(signum)
+        removing_tracker = isinstance(
+            getattr(current_handler, "__self__", None),
+            contained._SignalHandlerInvocationTracker,
+        )
+        if (
+            not installing_latch
+            and not removing_tracker
+            and verification_failures == contained._SIGNAL_STATE_ATTEMPTS
+        ):
             observed_mask = real_sigmask(signal.SIG_BLOCK, set())
             rollback_masks.append(observed_mask)
             assert active <= observed_mask
@@ -1807,7 +1816,7 @@ def test_transient_release_failure_is_cleanup_evidence_for_existing_primary(
         _restore_signal_host(host_handlers, host_mask)
 
     assert caught.value is primary
-    assert release_attempts == 3
+    assert release_attempts == 2
     assert restoration._released
     assert observed_mask == starting_mask
     cleanup_group = getattr(caught.value, "cleanup_error_group", None)
@@ -1884,7 +1893,7 @@ def test_unlatched_signal_during_unmask_displaces_existing_primary(
     assert caught.value is first_signal
     assert latch.first_signum is None
     assert transition_masks == [starting_mask]
-    assert release_attempts == 3
+    assert release_attempts == 2
     assert restoration._released
     assert observed_mask == starting_mask
     assert not hasattr(caught.value, "cleanup_error_group")
@@ -1954,7 +1963,7 @@ def test_builtin_handler_exception_during_unmask_displaces_existing_primary(
         _restore_signal_host(host_handlers, host_mask)
 
     assert caught.value is boundary_errors[0]
-    assert release_attempts == 3
+    assert release_attempts == 2
     assert restoration._released
     assert observed_mask == starting_mask
     assert observed_handlers == previous_handlers
@@ -2029,13 +2038,119 @@ def test_same_code_mask_failure_remains_cleanup_for_existing_primary(
         _restore_signal_host(host_handlers, host_mask)
 
     assert caught.value is primary
-    assert release_attempts == 3
+    assert release_attempts == 2
     assert restoration._released
     assert observed_mask == starting_mask
     assert observed_handlers == previous_handlers
     cleanup_group = getattr(caught.value, "cleanup_error_group", None)
     assert isinstance(cleanup_group, BaseExceptionGroup)
     assert cleanup_group.exceptions == (mask_failure,)
+
+
+@pytest.mark.skipif(
+    not hasattr(signal, "pthread_sigmask"),
+    reason="atomic signal-mask arbitration requires pthread_sigmask",
+)
+def test_first_real_signal_survives_second_signal_during_final_handoff() -> None:
+    program = """
+import os
+import signal
+import sys
+
+from rquant import contained_subprocess as contained
+
+managed = (signal.SIGINT, signal.SIGTERM)
+real_signal = contained.signal.signal
+real_sigmask = contained.signal.pthread_sigmask
+host_handlers = {signum: signal.getsignal(signum) for signum in managed}
+host_mask = real_sigmask(signal.SIG_BLOCK, set())
+starting_mask = host_mask.difference(managed)
+real_sigmask(signal.SIG_SETMASK, starting_mask)
+
+primary = RuntimeError("existing primary")
+first = KeyboardInterrupt("first queued signal")
+second = InterruptedError("second queued signal at exact handoff")
+first_queued = False
+second_queued = False
+
+def previous_handler(signum, _frame):
+    if signum == signal.SIGTERM:
+        raise first
+    raise second
+
+for signum in managed:
+    real_signal(signum, previous_handler)
+latch = contained._ContainedSignalLatch()
+previous_handlers, active_signals = contained._install_signal_latch(latch)
+restoration = contained._restore_signal_handlers_atomically(
+    previous_handlers,
+    active_signals,
+    latch,
+)
+
+def queue_signals_at_handoffs(how, mask):
+    global first_queued
+    target = set(mask)
+    if how == signal.SIG_SETMASK and target == starting_mask:
+        current = signal.getsignal(signal.SIGTERM)
+        if not first_queued and current is not previous_handler:
+            first_queued = True
+            os.kill(os.getpid(), signal.SIGTERM)
+    return real_sigmask(how, target)
+
+def queue_second_during_original_restore(signum, handler):
+    global second_queued
+    if first_queued and not second_queued and handler is previous_handler:
+        second_queued = True
+        os.kill(os.getpid(), signal.SIGINT)
+    return real_signal(signum, handler)
+
+contained.signal.pthread_sigmask = queue_signals_at_handoffs
+contained.signal.signal = queue_second_during_original_restore
+result = 90
+try:
+    cleanup_errors = list(restoration)
+    try:
+        try:
+            raise primary
+        finally:
+            restoration.release_and_replay(
+                latch,
+                previous_handlers,
+                cleanup_errors,
+                primary_exception=sys.exception(),
+                error_label="contained subprocess cleanup failures",
+            )
+    except BaseException as exc:
+        cleanup_group = getattr(exc, "cleanup_error_group", None)
+        result = 0 if (
+            exc is first
+            and first_queued
+            and second_queued
+            and isinstance(cleanup_group, BaseExceptionGroup)
+            and second in cleanup_group.exceptions
+            and real_sigmask(signal.SIG_BLOCK, set()) == starting_mask
+            and all(signal.getsignal(signum) is previous_handler for signum in managed)
+        ) else 91
+finally:
+    contained.signal.pthread_sigmask = real_sigmask
+    contained.signal.signal = real_signal
+    real_sigmask(signal.SIG_BLOCK, set(managed))
+    for signum, handler in host_handlers.items():
+        real_signal(signum, handler)
+    real_sigmask(signal.SIG_SETMASK, host_mask)
+
+os._exit(result)
+"""
+
+    completed = subprocess.run(
+        [sys.executable, "-c", program],
+        check=False,
+        capture_output=True,
+        timeout=5,
+    )
+
+    assert completed.returncode == 0, completed.stderr.decode(errors="replace")
 
 
 def test_latched_signal_replay_preserves_default_and_ignore_semantics(
