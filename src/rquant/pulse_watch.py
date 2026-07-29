@@ -9,13 +9,16 @@ import 本模块，避免环。
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from datetime import date, datetime
 from datetime import time as dt_time
 from pathlib import Path
 
+import pandas as pd
 from loguru import logger
 from pydantic import BaseModel
 
+from rquant.panorama_data import compute_market_pulse
 from rquant.surge_watch import grid_index
 
 PULSE_FILE_PREFIX = "pulse-"
@@ -180,3 +183,61 @@ def read_pulse_points(path: Path) -> list[PulsePoint]:
         except Exception:
             continue
     return out
+
+
+class PulseSession:
+    """surge-watch 主循环的脉搏挂钩：算脉搏 → 落历史 → 异动检测 → 推送/落 alerts。
+
+    on_snapshot 内部吞异常只 log——脉搏是旁路，绝不拖垮爆量主循环。
+    """
+
+    def __init__(
+        self,
+        live_dir: Path,
+        day: date,
+        *,
+        config: PulseConfig | None = None,
+        notify_fn: Callable[..., None] | None = None,
+        dry_run: bool = False,
+    ) -> None:
+        self.live_dir = live_dir
+        self.day = day
+        self.dry_run = dry_run
+        self.notify_fn = notify_fn
+        self.watcher = PulseAnomalyWatcher(config)
+        seeded = self.watcher.seed(read_pulse_points(pulse_path(live_dir, day)))
+        if seeded:
+            logger.info(f"pulse 滑窗 seed {seeded} 分钟（重启续算当日历史）")
+
+    def on_snapshot(self, snapshot: pd.DataFrame, now: datetime) -> list[PulseAlert]:
+        try:
+            return self._on_snapshot(snapshot, now)
+        except Exception as e:
+            logger.warning(f"pulse 挂钩异常（不影响主循环）: {type(e).__name__}: {e}")
+            return []
+
+    def _on_snapshot(self, snapshot: pd.DataFrame, now: datetime) -> list[PulseAlert]:
+        pulse = compute_market_pulse(snapshot)
+        if pulse.total_count == 0:
+            return []
+        point = PulsePoint(
+            t=now.strftime("%H:%M"),
+            limit_up=pulse.limit_up_count, limit_down=pulse.limit_down_count,
+            broken=pulse.broken_count, up=pulse.up_count, down=pulse.down_count,
+            up_ratio_pct=pulse.up_ratio_pct, total=pulse.total_count,
+        )
+        append_jsonl(pulse_path(self.live_dir, self.day), point.model_dump())
+        alerts = self.watcher.observe(point, now)
+        for a in alerts:
+            append_jsonl(alerts_path(self.live_dir, self.day), a.model_dump())
+            title = f"脉搏异动 {a.t} {a.kind_label}"
+            ratio_txt = f"{point.up_ratio_pct:.0f}%" if point.up_ratio_pct is not None else "—"
+            body = (
+                f"{a.message}｜当前 涨停 {point.limit_up} / 跌停 {point.limit_down}"
+                f" / 炸板 {point.broken} / 上涨占比 {ratio_txt}"
+            )
+            if self.dry_run or self.notify_fn is None:
+                print(f"\n===== [DRY-RUN] {title} =====\n{body}\n")
+            else:
+                self.notify_fn("pulse_alert", title=title, body=body)
+        return alerts

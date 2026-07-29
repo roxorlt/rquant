@@ -6,6 +6,7 @@ from datetime import date, datetime, timedelta, timezone
 from datetime import time as dt_time
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 from rquant.pulse_watch import (
@@ -13,6 +14,7 @@ from rquant.pulse_watch import (
     PulseAnomalyWatcher,
     PulseConfig,
     PulsePoint,
+    PulseSession,
     alerts_path,
     append_jsonl,
     pulse_path,
@@ -128,3 +130,65 @@ class TestJsonlIO:
 
     def test_read_missing_file_empty(self, tmp_path: Path) -> None:
         assert read_pulse_points(tmp_path / "nope.jsonl") == []
+
+
+def _pulse_snap(limit_up: int, *, broken: int = 0, total: int = 100) -> pd.DataFrame:
+    """构造能让 compute_market_pulse 得出指定涨停/炸板数的最小快照。"""
+    rows = []
+    for i in range(total):
+        pre = 10.0
+        cap = 11.0
+        if i < limit_up:
+            price, high = 11.0, 11.0          # 涨停
+        elif i < limit_up + broken:
+            price, high = 10.5, 11.0          # 触板回落 = 炸板
+        else:
+            price, high = 10.2, 10.3          # 普通上涨
+        rows.append({
+            "ts_code": f"30{i:04d}.SZ", "price": price, "high": high,
+            "pre_close": pre, "limit_up_price": cap, "limit_down_price": 9.0,
+        })
+    return pd.DataFrame(rows)
+
+
+class TestPulseSession:
+    def test_records_points_and_pushes_alert(self, tmp_path: Path) -> None:
+        calls: list[tuple] = []
+        day = date(2026, 7, 29)
+        s = PulseSession(tmp_path, day, notify_fn=lambda scene, **kw: calls.append((scene, kw)))
+        for i in range(11):  # 09:30..09:40 平稳
+            s.on_snapshot(_pulse_snap(20), _now(f"09:{30 + i:02d}"))
+        alerts = s.on_snapshot(_pulse_snap(26), _now("09:41"))  # 涨停 20→26
+        assert len(alerts) == 1
+        assert pulse_path(tmp_path, day).read_text(encoding="utf-8").count("\n") == 12
+        assert alerts_path(tmp_path, day).exists()
+        assert calls and calls[0][0] == "pulse_alert"
+        assert "脉搏异动 09:41 涨停潮" == calls[0][1]["title"]
+        assert "当前 涨停 26" in calls[0][1]["body"]
+
+    def test_dry_run_prints_instead_of_notify(self, tmp_path: Path, capsys) -> None:
+        calls: list[tuple] = []
+        s = PulseSession(tmp_path, date(2026, 7, 29), dry_run=True,
+                         notify_fn=lambda scene, **kw: calls.append((scene, kw)))
+        for i in range(11):
+            s.on_snapshot(_pulse_snap(20), _now(f"09:{30 + i:02d}"))
+        s.on_snapshot(_pulse_snap(26), _now("09:41"))
+        assert calls == []
+        assert "DRY-RUN" in capsys.readouterr().out
+
+    def test_seed_from_existing_file(self, tmp_path: Path) -> None:
+        day = date(2026, 7, 29)
+        s1 = PulseSession(tmp_path, day, notify_fn=lambda *a, **k: None)
+        for i in range(11):
+            s1.on_snapshot(_pulse_snap(20), _now(f"09:{30 + i:02d}"))
+        s1.on_snapshot(_pulse_snap(26), _now("09:41"))
+        # 重启：新 session 从文件 seed，冷却生效不重复推
+        calls: list[tuple] = []
+        s2 = PulseSession(tmp_path, day, notify_fn=lambda scene, **kw: calls.append(scene))
+        assert s2.on_snapshot(_pulse_snap(27), _now("09:42")) == []
+        assert calls == []
+
+    def test_empty_snapshot_skipped(self, tmp_path: Path) -> None:
+        s = PulseSession(tmp_path, date(2026, 7, 29), notify_fn=lambda *a, **k: None)
+        assert s.on_snapshot(pd.DataFrame(), _now("09:31")) == []
+        assert not pulse_path(tmp_path, date(2026, 7, 29)).exists()
