@@ -82,13 +82,16 @@ def _terminate_unsafe_signal_state(
     message: str,
     errors: Sequence[BaseException],
 ) -> NoReturn:
-    details = "; ".join(str(error) or type(error).__name__ for error in errors)
-    diagnostic = f"rquant: {message}"
-    if details:
-        diagnostic = f"{diagnostic}: {details}"
-    with suppress(OSError):
+    try:
+        details = "; ".join(str(error) or type(error).__name__ for error in errors)
+        diagnostic = f"rquant: {message}"
+        if details:
+            diagnostic = f"{diagnostic}: {details}"
         os.write(2, f"{diagnostic}\n".encode())
-    os._exit(_UNSAFE_SIGNAL_STATE_EXIT_CODE)
+    except BaseException:
+        pass
+    finally:
+        os._exit(_UNSAFE_SIGNAL_STATE_EXIT_CODE)
 
 
 def _ensure_signal_mask_bounded(
@@ -194,30 +197,47 @@ def _release_signal_mask_bounded(
     return False
 
 
-def _exception_originated_from_signal_handler(
-    error: BaseException,
+class _SignalHandlerInvocationTracker:
+    def __init__(
+        self,
+        previous_handlers: Mapping[int, object],
+    ) -> None:
+        self._previous_handlers = previous_handlers
+        self._exceptions: list[BaseException] = []
+        trampoline = self._invoke
+        self.handlers = {
+            signum: trampoline for signum, handler in previous_handlers.items() if callable(handler)
+        }
+
+    def _invoke(self, signum: int, frame: object) -> None:
+        handler = self._previous_handlers[signum]
+        assert callable(handler)
+        try:
+            handler(signum, frame)
+        except BaseException as exc:
+            _record_cleanup_error(self._exceptions, exc)
+            raise
+
+    def raised(self, error: BaseException) -> bool:
+        return any(exception is error for exception in self._exceptions)
+
+    @property
+    def first_exception(self) -> BaseException | None:
+        return self._exceptions[0] if self._exceptions else None
+
+
+def _restore_signal_handlers_collecting_errors(
     previous_handlers: Mapping[int, object],
+    cleanup_errors: list[BaseException],
 ) -> bool:
-    handler_codes: set[object] = set()
-    for handler in previous_handlers.values():
-        if not callable(handler):
-            continue
-        candidates = (
-            handler,
-            getattr(handler, "__func__", None),
-            vars(type(handler)).get("__call__"),
-            getattr(handler, "func", None),
-        )
-        for candidate in candidates:
-            code = getattr(candidate, "__code__", None)
-            if code is not None:
-                handler_codes.add(code)
-    traceback = error.__traceback__
-    while traceback is not None:
-        if traceback.tb_frame.f_code in handler_codes:
-            return True
-        traceback = traceback.tb_next
-    return False
+    restoration_errors: list[BaseException] = []
+    restored = _restore_signal_handlers_verified(
+        previous_handlers,
+        restoration_errors,
+    )
+    for error in restoration_errors:
+        _record_cleanup_error(cleanup_errors, error)
+    return restored
 
 
 class _SignalRestoration(list[BaseException]):
@@ -294,10 +314,58 @@ class _SignalRestoration(list[BaseException]):
             if latch.first_signum is not None
             else None
         )
+        invocation_tracker: _SignalHandlerInvocationTracker | None = None
+        if protected_replay_error is None and primary_exception is not None:
+            candidate_tracker = _SignalHandlerInvocationTracker(previous_handlers)
+            if candidate_tracker.handlers:
+                self._fail_closed(
+                    cleanup_errors,
+                    context="signal handler tracking could not establish a blocked state",
+                )
+                if _restore_signal_handlers_collecting_errors(
+                    candidate_tracker.handlers,
+                    cleanup_errors,
+                ):
+                    invocation_tracker = candidate_tracker
+                else:
+                    self._handlers_restored = _restore_signal_handlers_collecting_errors(
+                        previous_handlers,
+                        cleanup_errors,
+                    )
+                    return
         for _attempt in range(_SIGNAL_STATE_ATTEMPTS):
             try:
                 if not self._released:
                     self.release()
+                if invocation_tracker is not None:
+                    tracked_error = invocation_tracker.first_exception
+                    self._fail_closed(
+                        cleanup_errors,
+                        context="tracked signal handlers could not be restored safely",
+                    )
+                    self._handlers_restored = _restore_signal_handlers_collecting_errors(
+                        previous_handlers,
+                        cleanup_errors,
+                    )
+                    if protected_replay_error is None and tracked_error is not None:
+                        protected_replay_error = tracked_error
+                    invocation_tracker = None
+                    if not self._handlers_restored:
+                        break
+                    try:
+                        self.release()
+                    except BaseException as exc:
+                        _record_cleanup_error(cleanup_errors, exc)
+                        self._fail_closed(
+                            cleanup_errors,
+                            context=(
+                                "exact signal handler handoff could not return to a blocked state"
+                            ),
+                        )
+                        _terminate_unsafe_signal_state(
+                            "exact signal handler handoff has ambiguous provenance",
+                            cleanup_errors,
+                        )
                 if protected_replay_error is None:
                     return
                 _attach_cleanup_error_group(
@@ -312,11 +380,9 @@ class _SignalRestoration(list[BaseException]):
                     raise
                 if protected_replay_error is None:
                     boundary_signal = (
-                        exc is self._last_release_transition_exception
-                        and _exception_originated_from_signal_handler(
-                            exc,
-                            previous_handlers,
-                        )
+                        invocation_tracker is not None
+                        and invocation_tracker.raised(exc)
+                        and (self._released or exc is self._last_release_transition_exception)
                     )
                     if primary_exception is None or boundary_signal:
                         protected_replay_error = exc
@@ -324,6 +390,19 @@ class _SignalRestoration(list[BaseException]):
                         _record_cleanup_error(cleanup_errors, exc)
                 elif exc is not protected_replay_error:
                     _record_cleanup_error(cleanup_errors, exc)
+
+        if invocation_tracker is not None:
+            self._fail_closed(
+                cleanup_errors,
+                context="signal handler tracking could not finish in a blocked state",
+            )
+            self._handlers_restored = _restore_signal_handlers_collecting_errors(
+                previous_handlers,
+                cleanup_errors,
+            )
+            tracked_error = invocation_tracker.first_exception
+            if protected_replay_error is None and tracked_error is not None:
+                protected_replay_error = tracked_error
 
         if protected_replay_error is None:
             return
