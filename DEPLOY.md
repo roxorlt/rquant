@@ -5,6 +5,37 @@
 
 ---
 
+## 2026-07-30 · v0.28.0 · 全景页爆量图表与脉搏异动
+
+**状态**：PR #142 经 Python 3.11/3.12 CI 全绿后 squash merge（期间与 #143/#144 合并
+解冲突，仅版本号一处，保留 0.28.0）；annotated tag `v0.28.0` 精确指向
+`3b9656056452e12393fbb4f86e4cb23c793a725b`。15:12 在交易保护窗口外通过
+`scripts/deploy-production.sh --target v0.28.0` 从 `v0.27.1`
+（`f7c3105e3043d873185674460a6a4358a2599956`，含 #138-#144 的 main 快进）发布，
+部署器返回 `deployed`；无 schema、systemd、nginx 或密钥变更。
+
+**内容**：① 爆量记录 tab 行选择联动个股图表，分时/5日图橙色虚线标注每日首次爆量
+确认时刻；② 脉搏历史由 surge-watch 每分钟落 `surge_live/pulse-*.jsonl`（新模块
+`pulse_watch.py`），📈 浮层改四张分面小图；③ 四类脉搏异动（涨停潮/炸板潮/跌停潮/
+涨跌占比突变，10 分钟滑窗 + 30 分钟冷却）触发页面提示条 + PushDeer `pulse_alert`
+场景（仅 PushDeer）；④ surge-watch 启动落 `runtime_config.json`，爆量记录页脚动态
+显示检测口径；⑤ 分时/5日量柱按分钟涨跌 tick-rule 近似红绿上色。
+
+**配置变更**：部署后云端 `.env` 追加 `RQUANT_SURGE_BOARDS=all`（爆量检测范围
+从创业+科创扩至全市场，次日 09:25 surge-watch 启动生效）。排查结论：东百集团
+600693.SH 等主板肉眼爆量此前不进台账的根因即检测范围默认仅 gem/star。
+
+**验证**：合并树全量单测 2424 passed（8 条为 backup/replica 本地环境性 pre-existing
+失败）；Playwright e2e 10 项 checklist 全过（含点行出图见标记与量柱色）；部署后
+五个长驻服务重启均 active，28080 网关健康 200、未登录 302 跳转正常，服务日志无异常。
+
+**回滚**：纯代码 + 单行 .env 变更，无数据写入。回滚命令
+`bash scripts/deploy-production.sh --target v0.27.1`（自动回滚基线
+`f7c3105e3043d873185674460a6a4358a2599956`）；如需同时撤销检测范围全开，删除云端
+`.env` 中 `RQUANT_SURGE_BOARDS=all` 一行即可（次日生效）。
+
+---
+
 ## 2026-07-27 · v0.27.1 · 完整历史迁云与爆量事件分钟线解耦
 
 **状态**：PR #137 经 Python 3.11/3.12 CI 全绿后 squash merge；annotated tag
