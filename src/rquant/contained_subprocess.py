@@ -57,6 +57,33 @@ def _record_cleanup_error(
         errors.append(error)
 
 
+def _collect_cleanup_error(
+    cleanup_errors: list[BaseException],
+    error: BaseException,
+    *,
+    primary_exception: BaseException,
+    seen: set[int],
+) -> None:
+    if error is primary_exception or id(error) in seen:
+        return
+    seen.add(id(error))
+    if isinstance(error, BaseExceptionGroup):
+        try:
+            nested_errors = tuple(error.exceptions)
+        except BaseException:
+            cleanup_errors.append(error)
+            return
+        for nested_error in nested_errors:
+            _collect_cleanup_error(
+                cleanup_errors,
+                nested_error,
+                primary_exception=primary_exception,
+                seen=seen,
+            )
+        return
+    cleanup_errors.append(error)
+
+
 def _merge_cleanup_error_group(
     primary_exception: BaseException,
     errors: Sequence[BaseException],
@@ -64,19 +91,25 @@ def _merge_cleanup_error_group(
     error_label: str,
 ) -> bool:
     cleanup_errors: list[BaseException] = []
+    seen: set[int] = set()
     try:
         existing_group = getattr(primary_exception, "cleanup_error_group", None)
     except BaseException:
         existing_group = None
-    if isinstance(existing_group, BaseExceptionGroup):
-        for error in existing_group.exceptions:
-            if error is not primary_exception:
-                _record_cleanup_error(cleanup_errors, error)
-    elif isinstance(existing_group, BaseException) and existing_group is not primary_exception:
-        _record_cleanup_error(cleanup_errors, existing_group)
+    if isinstance(existing_group, BaseException):
+        _collect_cleanup_error(
+            cleanup_errors,
+            existing_group,
+            primary_exception=primary_exception,
+            seen=seen,
+        )
     for error in errors:
-        if error is not primary_exception:
-            _record_cleanup_error(cleanup_errors, error)
+        _collect_cleanup_error(
+            cleanup_errors,
+            error,
+            primary_exception=primary_exception,
+            seen=seen,
+        )
     if not cleanup_errors:
         return False
     with suppress(BaseException):
@@ -988,6 +1021,52 @@ def _close_file_descriptors(
     return not descriptors
 
 
+def _acquire_pending_file_descriptor(
+    acquire: Callable[[], int],
+    pending: list[int],
+) -> tuple[int, BaseException | None]:
+    descriptor = -1
+    try:
+        descriptor = acquire()
+        pending.append(descriptor)
+    except BaseException as exc:
+        if descriptor < 0:
+            raise
+        if descriptor not in pending:
+            pending.append(descriptor)
+        return descriptor, exc
+    return descriptor, None
+
+
+def _close_file_descriptor_inventories(
+    inventories: Sequence[list[int]],
+    cleanup_errors: list[BaseException],
+) -> bool:
+    descriptors: list[int] = []
+    for inventory in inventories:
+        for descriptor in inventory:
+            if descriptor not in descriptors:
+                descriptors.append(descriptor)
+    closed = _close_file_descriptors(descriptors, cleanup_errors)
+    unresolved = set(descriptors)
+    for inventory in inventories:
+        inventory[:] = [descriptor for descriptor in inventory if descriptor in unresolved]
+    return closed
+
+
+def _acquire_resource_guarded(
+    acquire: Callable[[], object],
+) -> tuple[object, bool, BaseException | None]:
+    resource: object | None = None
+    try:
+        resource = acquire()
+        return resource, True, None
+    except BaseException as exc:
+        if resource is None:
+            raise
+        return resource, True, exc
+
+
 def _close_resource_bounded(
     resource: object,
     cleanup_errors: list[BaseException],
@@ -1229,8 +1308,6 @@ def _process_observation(pid: int) -> _ProcessObservation | None:
 
 class _DarwinKqueueProcessTracker:
     def __init__(self) -> None:
-        self._queue = select.kqueue()
-        self._owns_queue = True
         self._known: dict[int, ProcessIdentity] = {}
         self._lock = threading.Lock()
         self._condition = threading.Condition(self._lock)
@@ -1242,6 +1319,9 @@ class _DarwinKqueueProcessTracker:
         self._deadline = 0.0
         self._registered: set[int] = set()
         self._poll_generation = 0
+        self._queue, self._owns_queue, self._construction_error = _acquire_resource_guarded(
+            select.kqueue
+        )
 
     def _register_process(self, identity: ProcessIdentity) -> bool:
         if identity.pid in self._registered:
@@ -1270,6 +1350,8 @@ class _DarwinKqueueProcessTracker:
         return True
 
     def register_root(self, pid: int, *, deadline: float) -> ProcessIdentity:
+        if self._construction_error is not None:
+            raise self._construction_error
         if time.monotonic() >= deadline:
             raise TimeoutError("kernel tracker registration deadline expired")
         before = _darwin_process_observation(pid)
@@ -1377,6 +1459,7 @@ class _LinuxSubreaperProcessTracker:
     def __init__(self) -> None:
         self._known: dict[int, ProcessIdentity] = {}
         self._pidfds: dict[int, int] = {}
+        self._pending_pidfds: list[int] = []
         self._root_pid: int | None = None
         self._root_started: tuple[int, int] | None = None
         self._previous_subreaper = 0
@@ -1404,8 +1487,39 @@ class _LinuxSubreaperProcessTracker:
             raise ContainedProcessError("kernel tracker observed PID identity reuse")
         self._known[identity.pid] = identity
         if identity.pid not in self._pidfds and hasattr(os, "pidfd_open"):
-            with suppress(ProcessLookupError):
-                self._pidfds[identity.pid] = os.pidfd_open(identity.pid, 0)
+            descriptor = -1
+            try:
+                descriptor, acquisition_error = _acquire_pending_file_descriptor(
+                    lambda: os.pidfd_open(identity.pid, 0),
+                    self._pending_pidfds,
+                )
+                if acquisition_error is not None:
+                    raise acquisition_error
+                self._pidfds[identity.pid] = descriptor
+                self._pending_pidfds.remove(descriptor)
+            except BaseException as primary_exception:
+                if descriptor >= 0:
+                    cleanup_errors: list[BaseException] = []
+                    pending_close = [descriptor]
+                    if _close_file_descriptors(pending_close, cleanup_errors):
+                        self._pending_pidfds[:] = [
+                            owned for owned in self._pending_pidfds if owned != descriptor
+                        ]
+                        try:
+                            for pid, owned in tuple(self._pidfds.items()):
+                                if owned == descriptor:
+                                    self._pidfds.pop(pid, None)
+                        except BaseException as exc:
+                            _record_cleanup_error(cleanup_errors, exc)
+                    _attach_cleanup_error_group(
+                        primary_exception,
+                        cleanup_errors,
+                        error_label="pidfd binding cleanup failures",
+                        note="pidfd binding cleanup also failed",
+                    )
+                if isinstance(primary_exception, ProcessLookupError):
+                    return
+                raise
 
     def register_root(self, pid: int, *, deadline: float) -> ProcessIdentity:
         self._enable_subreaper(deadline)
@@ -1450,9 +1564,17 @@ class _LinuxSubreaperProcessTracker:
 
     def close(self) -> None:
         cleanup_errors: list[BaseException] = []
-        remaining_descriptors = list(self._pidfds.values())
+        remaining_descriptors: list[int] = []
+        for descriptor in (*self._pending_pidfds, *self._pidfds.values()):
+            if descriptor not in remaining_descriptors:
+                remaining_descriptors.append(descriptor)
         _close_file_descriptors(remaining_descriptors, cleanup_errors)
         unresolved_descriptors = set(remaining_descriptors)
+        self._pending_pidfds[:] = [
+            descriptor
+            for descriptor in self._pending_pidfds
+            if descriptor in unresolved_descriptors
+        ]
         for pid, descriptor in tuple(self._pidfds.items()):
             if descriptor not in unresolved_descriptors:
                 self._pidfds.pop(pid, None)
@@ -1969,6 +2091,13 @@ def run_contained(
     process: subprocess.Popen[str] | None = None
     darwin_pipe_markers: frozenset[DarwinPipeMarker] = empty_ownership
     darwin_pipe_anchor_fds: list[int] = []
+    darwin_pending_anchor_fds: list[int] = []
+
+    def close_darwin_pipe_anchors(cleanup_errors: list[BaseException]) -> bool:
+        return _close_file_descriptor_inventories(
+            (darwin_pending_anchor_fds, darwin_pipe_anchor_fds),
+            cleanup_errors,
+        )
 
     try:
         previous_handlers, active_signals = _install_signal_latch(signal_latch)
@@ -2003,8 +2132,14 @@ def run_contained(
             if process.stdout is None or process.stderr is None:
                 raise ContainedProcessError("Darwin containment pipes are unavailable")
             for stream in (process.stdout, process.stderr):
-                anchor = os.dup(stream.fileno())
+                anchor, acquisition_error = _acquire_pending_file_descriptor(
+                    lambda stream=stream: os.dup(stream.fileno()),
+                    darwin_pending_anchor_fds,
+                )
+                if acquisition_error is not None:
+                    raise acquisition_error
                 darwin_pipe_anchor_fds.append(anchor)
+                darwin_pending_anchor_fds.remove(anchor)
                 os.set_inheritable(anchor, False)
             darwin_pipe_markers = frozenset(
                 {_darwin_pipe_marker_for_fd(os.getpid(), fd) for fd in darwin_pipe_anchor_fds}
@@ -2038,10 +2173,7 @@ def run_contained(
                 kernel_tracker.close()
             except BaseException as exc:
                 startup_cleanup_errors.append(exc)
-        anchors_closed = _close_file_descriptors(
-            darwin_pipe_anchor_fds,
-            startup_cleanup_errors,
-        )
+        anchors_closed = close_darwin_pipe_anchors(startup_cleanup_errors)
         _finish_signal_restoration(
             previous_handlers,
             active_signals,
@@ -2275,10 +2407,7 @@ def run_contained(
         except BaseException as exc:
             cleanup_errors.append(exc)
         if primary_exception is not None:
-            anchors_closed = _close_file_descriptors(
-                darwin_pipe_anchor_fds,
-                cleanup_errors,
-            )
+            anchors_closed = close_darwin_pipe_anchors(cleanup_errors)
             _finish_signal_restoration(
                 previous_handlers,
                 active_signals,
@@ -2326,10 +2455,7 @@ def run_contained(
             )
         return completed
     finally:
-        anchors_closed = _close_file_descriptors(
-            darwin_pipe_anchor_fds,
-            cleanup_errors,
-        )
+        anchors_closed = close_darwin_pipe_anchors(cleanup_errors)
         _finish_signal_restoration(
             previous_handlers,
             active_signals,
