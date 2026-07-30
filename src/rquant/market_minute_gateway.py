@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from typing import Annotated
 
@@ -24,6 +24,7 @@ from rquant.runtime_contracts import (
     canonical_sha256,
     normalize_aware_utc,
 )
+from rquant.source_quota_store import SourceQuotaStore
 
 CommitSha = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{40}$")]
 
@@ -48,6 +49,8 @@ class MarketMinuteGatewayConfig(RuntimeContractModel):
     dataset_id: str = Field(default="market_minute", min_length=1)
     producer_version: str = Field(min_length=1)
     producer_commit: CommitSha
+    quota_units_per_window: int | None = Field(default=None, gt=0)
+    quota_cost_per_request: int = Field(default=1, gt=0)
 
 
 class MarketMinuteCapture(RuntimeContractModel):
@@ -64,10 +67,52 @@ class MarketMinuteGateway:
         spool: LiveBatchSpool,
         fetcher: Callable[[], pd.DataFrame],
         config: MarketMinuteGatewayConfig,
+        quota_store: SourceQuotaStore | None = None,
     ) -> None:
         self.spool = spool
         self._fetcher = fetcher
         self.config = config
+        self._quota_store = quota_store
+        if config.quota_units_per_window is not None and quota_store is None:
+            raise ValueError("quota_store is required when quota governance is enabled")
+
+    def _fetch_with_quota(self, received: datetime) -> pd.DataFrame:
+        if self._quota_store is None or self.config.quota_units_per_window is None:
+            return self._fetcher()
+        window_start = received.replace(second=0, microsecond=0)
+        window_reset = window_start + timedelta(minutes=1)
+        window_id = window_start.strftime("%Y%m%dT%H%M")
+        self._quota_store.declare_window(
+            source=self.config.source,
+            window_id=window_id,
+            starts_at=window_start,
+            resets_at=window_reset,
+            total_units=self.config.quota_units_per_window,
+        )
+        request_id = canonical_sha256(
+            {
+                "source": self.config.source,
+                "received_at": received,
+                "producer": self.config.producer_version,
+            }
+        )
+        lease = self._quota_store.acquire(
+            source=self.config.source,
+            owner=f"market-minute:{request_id}",
+            units=self.config.quota_cost_per_request,
+            now=received,
+            expires_at=min(received + timedelta(seconds=10), window_reset),
+        )
+        try:
+            return self._fetcher()
+        finally:
+            self._quota_store.consume(
+                lease.lease_id,
+                usage_id=request_id,
+                units=self.config.quota_cost_per_request,
+                now=received,
+            )
+            self._quota_store.release(lease.lease_id, now=received)
 
     @staticmethod
     def _empty_frame() -> pd.DataFrame:
@@ -146,7 +191,7 @@ class MarketMinuteGateway:
         quality = BatchQualityStatus.PUBLISHED
         degraded_reasons: tuple[str, ...] = ()
         try:
-            frame = self.normalize_frame(self._fetcher())
+            frame = self.normalize_frame(self._fetch_with_quota(received))
         except MarketMinuteValidationError:
             raise
         except Exception as exc:

@@ -13,6 +13,7 @@ from rquant.market_minute_gateway import (
     MarketMinuteGatewayConfig,
     MarketMinuteValidationError,
 )
+from rquant.source_quota_store import SourceQuotaStore
 
 RECEIVED = datetime(2026, 7, 31, 1, 31, 5, tzinfo=UTC)
 
@@ -34,14 +35,22 @@ def _frame(*, minute: str = "2026-07-31 09:31:00", close: float = 10.1) -> pd.Da
     )
 
 
-def _gateway(tmp_path: Path, fetcher: object) -> MarketMinuteGateway:
+def _gateway(
+    tmp_path: Path,
+    fetcher: object,
+    *,
+    quota_store: SourceQuotaStore | None = None,
+    quota_units_per_window: int | None = None,
+) -> MarketMinuteGateway:
     return MarketMinuteGateway(
         spool=LiveBatchSpool(tmp_path / "live"),
         fetcher=fetcher,
         config=MarketMinuteGatewayConfig(
             producer_version="market-minute-v1",
             producer_commit="a" * 40,
+            quota_units_per_window=quota_units_per_window,
         ),
+        quota_store=quota_store,
     )
 
 
@@ -119,3 +128,37 @@ def test_gateway_rejects_structurally_invalid_source_frame_without_publishing(
     with pytest.raises(MarketMinuteValidationError, match="missing columns"):
         gateway.capture_once(received_at=RECEIVED)
     assert gateway.spool.current(LiveChannel.MARKET_MINUTE) is None
+
+
+def test_gateway_accounts_for_each_source_call_and_fails_stale_when_quota_exhausts(
+    tmp_path: Path,
+) -> None:
+    calls = 0
+
+    def fetch() -> pd.DataFrame:
+        nonlocal calls
+        calls += 1
+        return _frame()
+
+    quota = SourceQuotaStore(tmp_path / "quota.sqlite3")
+    gateway = _gateway(
+        tmp_path,
+        fetch,
+        quota_store=quota,
+        quota_units_per_window=2,
+    )
+
+    gateway.capture_once(received_at=RECEIVED)
+    gateway.capture_once(received_at=RECEIVED + timedelta(seconds=5))
+    exhausted = gateway.capture_once(received_at=RECEIVED + timedelta(seconds=10))
+
+    assert calls == 2
+    assert quota.remaining("tushare.rt_min", now=RECEIVED + timedelta(seconds=11)) == 0
+    assert exhausted.pointer.quality_status is BatchQualityStatus.STALE
+    latest = gateway.spool.list_after(
+        LiveChannel.MARKET_MINUTE,
+        sequence=exhausted.pointer.sequence - 1,
+    )[0]
+    assert latest.envelope.degraded_reasons == (
+        "source_error:SourceQuotaExhaustedError",
+    )
