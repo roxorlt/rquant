@@ -171,6 +171,74 @@ def _tracker_factory(
     return lambda: tracker
 
 
+def test_cleanup_error_group_merges_nested_and_sequential_evidence() -> None:
+    primary = RuntimeError("primary")
+    nested_first = OSError("nested first")
+    duplicate = ValueError("duplicate")
+    outer = LookupError("outer")
+    later = InterruptedError("later")
+    primary.cleanup_error_group = BaseExceptionGroup(  # type: ignore[attr-defined]
+        "nested cleanup",
+        [nested_first, duplicate],
+    )
+    primary.add_note("nested cleanup note")
+
+    contained._attach_cleanup_error_group(
+        primary,
+        [duplicate, outer],
+        error_label="outer cleanup",
+        note="outer cleanup note",
+    )
+    contained._attach_cleanup_error_group(
+        primary,
+        [outer, later, nested_first],
+        error_label="later cleanup",
+        note="later cleanup note",
+    )
+
+    cleanup_group = getattr(primary, "cleanup_error_group", None)
+    assert isinstance(cleanup_group, BaseExceptionGroup)
+    assert cleanup_group.exceptions == (nested_first, duplicate, outer, later)
+    assert tuple(getattr(primary, "__notes__", ())) == (
+        "nested cleanup note",
+        "outer cleanup note",
+        "later cleanup note",
+    )
+
+
+@pytest.mark.parametrize("replay_ready", (True, False), ids=("released", "blocked"))
+def test_finish_signal_restoration_merges_existing_cleanup_evidence(
+    replay_ready: bool,
+) -> None:
+    primary = RuntimeError("primary")
+    original_primary = primary
+    nested = OSError("nested cleanup")
+    duplicate = ValueError("duplicate cleanup")
+    later = LookupError("later cleanup")
+    contained._attach_cleanup_error_group(
+        primary,
+        [nested, duplicate],
+        error_label="nested cleanup",
+        note="nested cleanup note",
+    )
+
+    contained._finish_signal_restoration(
+        {},
+        frozenset(),
+        contained._ContainedSignalLatch(),
+        [duplicate, later],
+        primary_exception=primary,
+        error_label="outer cleanup",
+        replay_ready=replay_ready,
+    )
+
+    cleanup_group = getattr(primary, "cleanup_error_group", None)
+    assert isinstance(cleanup_group, BaseExceptionGroup)
+    assert cleanup_group.exceptions == (nested, duplicate, later)
+    assert "nested cleanup note" in getattr(primary, "__notes__", ())
+    assert primary is original_primary
+
+
 def test_cleanup_repeatedly_discovers_fork_during_containment(
     monkeypatch,
 ) -> None:
@@ -3908,6 +3976,79 @@ def test_darwin_pipe_identity_remains_anchored_through_final_inventory(
     for fd in marker_fds:
         with pytest.raises(OSError):
             contained.os.fstat(fd)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin pipe anchor contract")
+def test_darwin_anchor_dup_is_owned_before_inheritable_update(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    tracker = _FakeKernelTracker(identity=contained.ProcessIdentity(1, (1, 0)))
+    real_dup = contained.os.dup
+    real_set_inheritable = contained.os.set_inheritable
+    real_close_descriptors = contained._close_file_descriptors
+    duplicated: list[int] = []
+    cleanup_inventories: list[
+        tuple[tuple[int, ...], tuple[int, ...], bool, tuple[BaseException, ...]]
+    ] = []
+    failure = OSError("anchor inheritable update failed")
+
+    def capture_real_dup(fd: int) -> int:
+        duplicate = real_dup(fd)
+        duplicated.append(duplicate)
+        return duplicate
+
+    def fail_anchor_inheritable(fd: int, inheritable: bool) -> None:
+        if duplicated and fd == duplicated[-1]:
+            contained.os.fstat(fd)
+            raise failure
+        real_set_inheritable(fd, inheritable)
+
+    def capture_cleanup_inventory(
+        descriptors: list[int],
+        cleanup_errors: list[BaseException],
+    ) -> bool:
+        before = tuple(descriptors)
+        closed = real_close_descriptors(descriptors, cleanup_errors)
+        cleanup_inventories.append((before, tuple(descriptors), closed, tuple(cleanup_errors)))
+        return closed
+
+    monkeypatch.setattr(contained.os, "dup", capture_real_dup)
+    monkeypatch.setattr(contained.os, "set_inheritable", fail_anchor_inheritable)
+    monkeypatch.setattr(
+        contained,
+        "_close_file_descriptors",
+        capture_cleanup_inventory,
+    )
+    try:
+        with pytest.raises(OSError) as caught:
+            contained.run_contained(
+                [sys.executable, "-c", "pass"],
+                cwd=tmp_path,
+                deadline_monotonic=time.monotonic() + 2,
+                inventory_provider=lambda _deadline: {},
+                kernel_tracker_factory=_tracker_factory(tracker),
+                may_spawn_background_descendants=False,
+            )
+        assert duplicated
+        anchor = duplicated[0]
+        with pytest.raises(OSError) as closed:
+            contained.os.fstat(anchor)
+        assert closed.value.errno == contained.errno.EBADF
+    finally:
+        for descriptor in duplicated:
+            try:
+                contained.os.fstat(descriptor)
+            except OSError as exc:
+                if exc.errno == contained.errno.EBADF:
+                    continue
+                raise
+            contained.os.close(descriptor)
+
+    assert caught.value is failure
+    assert cleanup_inventories == [((anchor,), (), True, ())]
+    assert getattr(caught.value, "cleanup_error_group", None) is None
+    assert tracker.closed
 
 
 def test_anchor_close_failure_retains_descriptor_inventory(

@@ -57,6 +57,30 @@ def _record_cleanup_error(
         errors.append(error)
 
 
+def _merge_cleanup_error_group(
+    primary_exception: BaseException,
+    errors: Sequence[BaseException],
+    *,
+    error_label: str,
+) -> bool:
+    cleanup_errors: list[BaseException] = []
+    existing_group = getattr(primary_exception, "cleanup_error_group", None)
+    if isinstance(existing_group, BaseExceptionGroup):
+        for error in existing_group.exceptions:
+            if error is not primary_exception:
+                _record_cleanup_error(cleanup_errors, error)
+    for error in errors:
+        if error is not primary_exception:
+            _record_cleanup_error(cleanup_errors, error)
+    if not cleanup_errors:
+        return False
+    primary_exception.cleanup_error_group = BaseExceptionGroup(  # type: ignore[attr-defined]
+        error_label,
+        cleanup_errors,
+    )
+    return True
+
+
 def _attach_cleanup_error_group(
     primary_exception: BaseException,
     errors: Sequence[BaseException],
@@ -64,16 +88,12 @@ def _attach_cleanup_error_group(
     error_label: str,
     note: str,
 ) -> None:
-    cleanup_errors: list[BaseException] = []
-    for error in errors:
-        if error is not primary_exception:
-            _record_cleanup_error(cleanup_errors, error)
-    if not cleanup_errors:
+    if not _merge_cleanup_error_group(
+        primary_exception,
+        errors,
+        error_label=error_label,
+    ):
         return
-    primary_exception.cleanup_error_group = BaseExceptionGroup(  # type: ignore[attr-defined]
-        error_label,
-        cleanup_errors,
-    )
     if note not in getattr(primary_exception, "__notes__", ()):
         primary_exception.add_note(note)
 
@@ -592,11 +612,12 @@ def _install_signal_latch(
     if previous_mask is None:
         primary_exception = mask_errors[0]
         if len(mask_errors) > 1:
-            primary_exception.cleanup_error_group = BaseExceptionGroup(  # type: ignore[attr-defined]
-                "signal latch installation mask failures",
+            _attach_cleanup_error_group(
+                primary_exception,
                 mask_errors[1:],
+                error_label="signal latch installation mask failures",
+                note="signal latch installation mask retries also failed",
             )
-            primary_exception.add_note("signal latch installation mask retries also failed")
         raise primary_exception
 
     installed: dict[int, object] = {}
@@ -831,15 +852,19 @@ def _finish_signal_restoration(
         cleanup_group = BaseExceptionGroup(error_label, cleanup_errors)
         if latch.first_signum is not None:
             deferred_signal = _ContainedSignal(latch.first_signum)
-            deferred_signal.cleanup_error_group = cleanup_group  # type: ignore[attr-defined]
-            deferred_signal.add_note(
-                "contained subprocess signal replay deferred until anchors are closed"
+            _attach_cleanup_error_group(
+                deferred_signal,
+                cleanup_errors,
+                error_label=error_label,
+                note="contained subprocess signal replay deferred until anchors are closed",
             )
             raise deferred_signal
         if primary_exception is not None:
-            primary_exception.cleanup_error_group = cleanup_group  # type: ignore[attr-defined]
-            primary_exception.add_note(
-                "contained subprocess cleanup failed closed with managed signals blocked"
+            _attach_cleanup_error_group(
+                primary_exception,
+                cleanup_errors,
+                error_label=error_label,
+                note="contained subprocess cleanup failed closed with managed signals blocked",
             )
             return
         raise ContainedProcessError(
@@ -853,16 +878,18 @@ def _finish_signal_restoration(
         primary_exception=primary_exception,
     )
 
-    cleanup_group: BaseExceptionGroup | None = None
-    if cleanup_errors:
-        cleanup_group = BaseExceptionGroup(error_label, cleanup_errors)
-    if cleanup_group is None:
+    if not cleanup_errors:
         return
     details = "; ".join(str(error) or type(error).__name__ for error in cleanup_errors)
     if primary_exception is not None:
-        primary_exception.cleanup_error_group = cleanup_group  # type: ignore[attr-defined]
-        primary_exception.add_note(f"contained subprocess cleanup also failed: {details}")
+        _attach_cleanup_error_group(
+            primary_exception,
+            cleanup_errors,
+            error_label=error_label,
+            note=f"contained subprocess cleanup also failed: {details}",
+        )
         return
+    cleanup_group = BaseExceptionGroup(error_label, cleanup_errors)
     raise ContainedProcessError(
         f"contained subprocess cleanup failed: {details}"
     ) from cleanup_group
@@ -1887,8 +1914,8 @@ def run_contained(
                 raise ContainedProcessError("Darwin containment pipes are unavailable")
             for stream in (process.stdout, process.stderr):
                 anchor = os.dup(stream.fileno())
-                os.set_inheritable(anchor, False)
                 darwin_pipe_anchor_fds.append(anchor)
+                os.set_inheritable(anchor, False)
             darwin_pipe_markers = frozenset(
                 {_darwin_pipe_marker_for_fd(os.getpid(), fd) for fd in darwin_pipe_anchor_fds}
             )
