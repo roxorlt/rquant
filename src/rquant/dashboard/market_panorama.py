@@ -254,6 +254,11 @@ def cached_surge_marks(ts_code: str, dates_key: str) -> pd.DataFrame:
     return load_surge_marks(ts_code, dates)
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_runtime_config() -> dict | None:
+    return load_surge_runtime_config()
+
+
 # ── 数据整形 helpers ──────────────────────────────────────────────────────────
 
 
@@ -763,18 +768,52 @@ def _surge_log_display(df: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-def render_surge_log() -> None:
-    """当日爆量台账：每标的取最早识别时刻，纯只读 events jsonl（缓存 30s 跟盘中增长）。"""
+_BOARD_LABELS = {"main": "主板", "gem": "创业", "star": "科创", "bj": "北交"}
+
+
+def _surge_caption(n_rows: int) -> str:
+    """页脚口径：优先 runtime_config 动态展示，缺失退回写死文案。"""
+    cfg = cached_runtime_config()
+    if cfg:
+        boards = "/".join(_BOARD_LABELS.get(b, str(b)) for b in cfg.get("boards", []))
+        return (
+            f"检测范围：{boards or '—'}"
+            f" · 口径 v4：累计放量 {cfg.get('k_cum', '—')}-{cfg.get('ratio_cap', '—')}×"
+            " + 当前分钟上涨 + 外盘占优（tick-rule 近似）"
+            " · 每标的取当日最早识别时刻"
+            f" · 观察提示非买入信号 · 共 {n_rows} 条"
+        )
+    return (
+        "口径 v4：累计放量 + 当前分钟上涨 + 外盘占优（tick-rule 近似）"
+        " · 每标的取当日最早识别时刻"
+        f" · 观察提示非买入信号 · 共 {n_rows} 条"
+    )
+
+
+def render_surge_log(snapshot: pd.DataFrame) -> None:
+    """当日爆量台账：行选择联动下方个股图表（分时/5日带首次触发标记）。"""
     today = datetime.now(CST).date()
     df = cached_surge_log(today.isoformat())
     if df.empty:
         st.info("今日暂无爆量记录（surge-watch 尚未识别到，或未到盘中）")
         return
-    st.dataframe(_surge_log_display(df), hide_index=True, width="stretch", height=520)
-    st.caption(
-        "口径 v4：累计放量 + 当前分钟上涨 + 外盘占优（tick-rule 近似）"
-        " · 每标的取当日最早识别时刻"
-        f" · 观察提示非买入信号 · 共 {len(df)} 条"
+    event = st.dataframe(
+        _surge_log_display(df),
+        key="surge_tbl",
+        on_select="rerun",
+        selection_mode="single-row",
+        hide_index=True,
+        width="stretch",
+        height=300,
+    )
+    st.caption(_surge_caption(len(df)))
+    idx = _first_selected_row(event)
+    if idx is None or idx >= len(df):
+        st.info("点选记录查看个股图表（分时/5日图标注首次爆量触发时刻）")
+        return
+    row = df.iloc[idx]
+    render_stock_chart(
+        str(row["ts_code"]), str(row.get("name", "")), snapshot, key_prefix="surge"
     )
 
 
@@ -824,7 +863,7 @@ def render_body() -> None:
             render_stock_chart(ts_code, stock_name, snapshot)
 
     with tab_surge:
-        render_surge_log()
+        render_surge_log(snapshot)
 
 
 render_body()
