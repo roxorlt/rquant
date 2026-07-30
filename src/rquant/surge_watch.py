@@ -228,8 +228,28 @@ class SurgeConfirmed(BaseModel):
     return_1m_pct: float | None = None
     outer_inner_ratio_approx: float | None = None
     price_source: str = "snapshot"
+    push_count_5d: int = Field(default=1, ge=1)
     # confirmed（可买、推送）| unbuyable（距涨停≤门 / 已封板，只落 events 不推送）
     status: str = "confirmed"
+
+
+class SurgePushHistory(BaseModel):
+    """近五个交易日的逐票推送日期；历史只计数，今日记录同时恢复去重。"""
+
+    as_of: date
+    window_dates: tuple[date, ...] = ()
+    push_dates_by_code: dict[str, frozenset[date]] = Field(default_factory=dict)
+
+    @property
+    def pushed_today(self) -> set[str]:
+        return {
+            code
+            for code, push_dates in self.push_dates_by_code.items()
+            if self.as_of in push_dates
+        }
+
+    def count(self, ts_code: str) -> int:
+        return len(self.push_dates_by_code.get(ts_code, frozenset()))
 
 
 class TickResult(BaseModel):
@@ -887,6 +907,7 @@ class SurgeWatcher:
         minute_fetcher: Callable[[str, date], pd.DataFrame] | None = None,
         today_cum_fetcher: Callable[[str, date], pd.DataFrame] | None = None,
         theme_map: dict[str, str] | None = None,
+        push_history: SurgePushHistory | None = None,
     ) -> None:
         self.baseline = baseline
         self.config = config or SurgeConfig()
@@ -898,7 +919,13 @@ class SurgeWatcher:
         self._today_cum_fetcher = today_cum_fetcher
         self.theme_map = theme_map if theme_map is not None else baseline.theme
 
-        self.pushed_today: set[str] = set()
+        self.pushed_today: set[str] = push_history.pushed_today if push_history else set()
+        self._push_dates_5d: dict[str, set[date]] = {
+            code: set(push_dates)
+            for code, push_dates in (
+                push_history.push_dates_by_code.items() if push_history else ()
+            )
+        }
         self.confirm_cache: dict[str, ThreeDayBaseline] = {}
         # 今日累计精确序列缓存；价格方向未覆盖当前格时允许下一分钟刷新。
         self.today_cum_series: dict[str, np.ndarray] = {}
@@ -1133,6 +1160,9 @@ class SurgeWatcher:
         # 往往就是这批秒板票。room 未知（缺涨停价）→ 按可买（confirmed）放行（fail-open）。
         if room is not None and room <= self.config.max_room_to_limit_pct:
             confirmed.status = "unbuyable"
+        push_dates = self._push_dates_5d.setdefault(code, set())
+        push_dates.add(now.date())
+        confirmed.push_count_5d = len(push_dates)
         self.pushed_today.add(code)  # 每票每日仅推一次（入待推送即定，含 unbuyable）
         self._pending_push.append(confirmed)
 
@@ -1220,6 +1250,7 @@ def build_surge_messages(
             f"- 累计比：{n}日 {c.rel_cum:.1f}×"
             f" ｜ 累计额：{_fmt_amount(c.cum_amount)}"
         )
+        lines.append(f"- 近5日推送次数：{c.push_count_5d}")
 
         # 增量段仅在增量门开启时展示（v3 默认关，纯累计口径不看单分钟）。
         if config.k_delta_confirm > 0:
@@ -1295,6 +1326,53 @@ def append_events(path: Path, confirmed: list[SurgeConfirmed]) -> None:
         logger.warning(f"surge events 落盘失败: {path.name} {type(e).__name__}: {e}")
 
 
+def load_recent_push_history(
+    live_dir: Path,
+    as_of: date,
+    trading_days: tuple[date, ...] | list[date],
+) -> SurgePushHistory:
+    """从精确交易日窗口的 events JSONL 恢复逐票出现日期；坏行 fail-soft。"""
+    window_dates = tuple(sorted({day for day in trading_days if day <= as_of})[-5:])
+    if as_of not in window_dates:
+        window_dates = tuple(sorted({*window_dates, as_of})[-5:])
+
+    push_dates_by_code: dict[str, set[date]] = {}
+    invalid_lines = 0
+    for trading_day in window_dates:
+        path = live_dir / f"events-{trading_day.isoformat()}.jsonl"
+        if not path.is_file():
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError as e:
+            logger.warning(
+                f"surge 推送历史读取失败 {path.name}: {type(e).__name__}: {e}"
+            )
+            continue
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+                raw_code = record["ts_code"]
+                if not isinstance(raw_code, str) or not raw_code.strip():
+                    raise ValueError("invalid ts_code")
+                code = raw_code.strip()
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                invalid_lines += 1
+                continue
+            push_dates_by_code.setdefault(code, set()).add(trading_day)
+    if invalid_lines:
+        logger.warning(f"surge 推送历史跳过坏行 {invalid_lines} 条")
+    return SurgePushHistory(
+        as_of=as_of,
+        window_dates=window_dates,
+        push_dates_by_code={
+            code: frozenset(push_dates) for code, push_dates in push_dates_by_code.items()
+        },
+    )
+
+
 # ── 默认取数器（run 用；tick 单测注入 fake，不碰网络） ──────────────────────────
 
 
@@ -1338,6 +1416,7 @@ def run_surge_watch(
     today_cum_fetcher: Callable[[str, date], pd.DataFrame] | None = None,
     notify_fn: Callable[..., None] | None = None,
     is_trading_day_fn: Callable[[date], bool] | None = None,
+    recent_trading_days_fn: Callable[[date], tuple[date, ...] | list[date]] | None = None,
     baseline: SurgeBaseline | None = None,
     max_ticks: int | None = None,
 ) -> int:
@@ -1361,6 +1440,15 @@ def run_surge_watch(
     baseline = baseline or preload_baseline()
     notify_fn = notify_fn or _default_notify
     live_dir = (base_dir or default_live_dir())
+    trading_days_loader = recent_trading_days_fn or _load_recent_trading_days
+    try:
+        recent_trading_days = trading_days_loader(day)
+    except Exception as e:
+        logger.warning(
+            f"近5交易日窗口加载失败，退化为仅今日: {type(e).__name__}: {e}"
+        )
+        recent_trading_days = (day,)
+    push_history = load_recent_push_history(live_dir, day, recent_trading_days)
 
     # 默认全市场快照 = tushare rt_min + 累加器（token 认证不吃 IP 反爬，2026-07-07 换源）。
     # 累加器 seed：上一份 snapshot_full.parquet 若为当日则续算（重启只丢 tick 间隙）。
@@ -1388,6 +1476,7 @@ def run_surge_watch(
     watcher = SurgeWatcher(
         baseline, config=config,
         minute_fetcher=minute_fetcher, today_cum_fetcher=today_cum_fetcher,
+        push_history=push_history,
     )
     events_path = live_dir / f"events-{day.isoformat()}.jsonl"
 
@@ -1398,7 +1487,9 @@ def run_surge_watch(
     logger.info(
         f"surge-watch 启动 day={day} 检测板块={config.boards} "
         f"k_rough={config.k_rough} k_cum={config.k_cum} ratio_cap={config.ratio_cap} "
-        f"skip_first_minutes={config.skip_first_minutes} dry_run={dry_run}"
+        f"skip_first_minutes={config.skip_first_minutes} dry_run={dry_run} "
+        f"history_days={len(push_history.window_dates)} "
+        f"pushed_today={len(push_history.pushed_today)}"
     )
     try:
         while True:
@@ -1574,6 +1665,21 @@ def _load_is_trading_day(day: date) -> bool:
     from rquant.monitor import is_trading_day
 
     return is_trading_day(day)
+
+
+def _load_recent_trading_days(day: date) -> tuple[date, ...]:
+    """从只读副本取截至今日最近五个 SSE 交易日；盘中不写主库。"""
+    from rquant.storage.duckdb import open_readonly_store
+
+    store = open_readonly_store(required_tables=("trade_calendar",))
+    try:
+        rows = store.list_trade_calendar("SSE", day - timedelta(days=31), day)
+    finally:
+        store.close()
+    open_days = tuple(row.cal_date for row in rows if row.is_open and row.cal_date <= day)
+    if day not in open_days:
+        raise ValueError(f"trade_calendar 未把 {day} 标记为交易日")
+    return open_days[-5:]
 
 
 def _default_notify(scene: str, **kwargs) -> None:
