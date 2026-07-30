@@ -285,7 +285,7 @@ def _collect_cleanup_error(
         ):
             node_limit = None
             work_limit = None
-            if frame is frames[0] and preserve_root_evidence:
+            if frame is frames[0]:
                 remaining_siblings = len(frame.nested_errors) - frame.next_index + 1
                 node_limit = (_CLEANUP_GROUP_NODE_BUDGET - (node_count - 1)) // remaining_siblings
                 work_limit = (_CLEANUP_GROUP_WORK_BUDGET - (work_count - 2)) // remaining_siblings
@@ -1666,6 +1666,7 @@ class _DarwinKqueueProcessTracker:
         return before.identity
 
     def _track(self) -> None:
+        _require_no_execution_hooks()
         try:
             queue = self._queue
             if queue is None:
@@ -1673,6 +1674,7 @@ class _DarwinKqueueProcessTracker:
             while not self._stop.is_set():
                 if time.monotonic() >= self._deadline:
                     raise TimeoutError("kernel tracker deadline expired")
+                _require_no_execution_hooks()
                 events = queue.control(None, 256, 0.01)  # type: ignore[attr-defined]
                 fork_observed = False
                 for event in events:
@@ -1836,6 +1838,7 @@ class _LinuxSubreaperProcessTracker:
         return observed.identity
 
     def poll(self, *, deadline: float) -> dict[int, ProcessIdentity]:
+        _require_no_execution_hooks()
         if self._root_pid is None or self._root_started is None:
             raise ContainedProcessError("kernel root is not registered")
         inventory = _linux_process_inventory(deadline)

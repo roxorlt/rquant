@@ -430,6 +430,214 @@ def test_darwin_registration_rejects_hooks_before_initialized_queue_side_effects
         _restore_execution_hooks_for_test(original_trace, original_profile)
 
 
+@pytest.mark.parametrize("has_descendant", (False, True), ids=("root-only", "descendant"))
+@pytest.mark.parametrize("hook_kind", ("trace", "profile", "both"))
+def test_linux_poll_rejects_hooks_before_inventory_and_state_changes(
+    monkeypatch: pytest.MonkeyPatch,
+    has_descendant: bool,
+    hook_kind: str,
+) -> None:
+    original_trace = sys.gettrace()
+    original_profile = sys.getprofile()
+    tracker = contained._LinuxSubreaperProcessTracker()
+    root = contained.ProcessIdentity(101, (1, 0))
+    descendant = contained.ProcessIdentity(102, (2, 0))
+    tracker._root_pid = root.pid
+    tracker._root_started = root.started
+    tracker._known[root.pid] = root
+    if has_descendant:
+        tracker._known[descendant.pid] = descendant
+    tracker._pidfds = {root.pid: 9001}
+    tracker._pending_pidfds = [9002]
+    tracker._previous_subreaper = 1
+    tracker._owns_subreaper_lock = True
+    tracker._subreaper_changed = True
+    expected_state = (
+        dict(tracker._known),
+        dict(tracker._pidfds),
+        list(tracker._pending_pidfds),
+        tracker._root_pid,
+        tracker._root_started,
+        tracker._previous_subreaper,
+        tracker._owns_subreaper_lock,
+        tracker._subreaper_changed,
+    )
+    inventory_calls = 0
+
+    def inventory(_deadline: float) -> dict[int, contained._ProcessObservation]:
+        nonlocal inventory_calls
+        inventory_calls += 1
+        raise AssertionError("inventory must not run")
+
+    def trace_hook(_frame: object, _event: str, _arg: object) -> object:
+        return trace_hook
+
+    def profile_hook(_frame: object, _event: str, _arg: object) -> None:
+        return None
+
+    monkeypatch.setattr(contained, "_linux_process_inventory", inventory)
+    try:
+        sys.settrace(trace_hook if hook_kind in {"trace", "both"} else None)
+        sys.setprofile(profile_hook if hook_kind in {"profile", "both"} else None)
+
+        with pytest.raises(
+            contained.ContainedProcessError,
+            match="contained acquisition does not support active execution hooks",
+        ):
+            tracker.poll(deadline=time.monotonic() + 1)
+
+        assert inventory_calls == 0
+        assert (
+            dict(tracker._known),
+            dict(tracker._pidfds),
+            list(tracker._pending_pidfds),
+            tracker._root_pid,
+            tracker._root_started,
+            tracker._previous_subreaper,
+            tracker._owns_subreaper_lock,
+            tracker._subreaper_changed,
+        ) == expected_state
+        assert sys.gettrace() is (trace_hook if hook_kind in {"trace", "both"} else None)
+        assert sys.getprofile() is (profile_hook if hook_kind in {"profile", "both"} else None)
+    finally:
+        _restore_execution_hooks_for_test(original_trace, original_profile)
+
+
+def test_linux_poll_without_hooks_still_inventories_and_binds_descendants(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_trace = sys.gettrace()
+    original_profile = sys.getprofile()
+    tracker = contained._LinuxSubreaperProcessTracker()
+    root = contained.ProcessIdentity(101, (1, 0))
+    descendant = contained.ProcessIdentity(102, (2, 0))
+    tracker._root_pid = root.pid
+    tracker._root_started = root.started
+    tracker._known[root.pid] = root
+    inventory_calls = 0
+    bound: list[contained.ProcessIdentity] = []
+
+    def inventory(_deadline: float) -> dict[int, contained._ProcessObservation]:
+        nonlocal inventory_calls
+        inventory_calls += 1
+        return {
+            root.pid: contained._ProcessObservation(identity=root, parent_pid=1),
+            descendant.pid: contained._ProcessObservation(
+                identity=descendant,
+                parent_pid=root.pid,
+            ),
+        }
+
+    def bind(identity: contained.ProcessIdentity) -> None:
+        bound.append(identity)
+        tracker._known[identity.pid] = identity
+
+    monkeypatch.setattr(contained, "_linux_process_inventory", inventory)
+    monkeypatch.setattr(tracker, "_bind_pid", bind)
+    try:
+        _clear_execution_hooks()
+        result = tracker.poll(deadline=time.monotonic() + 1)
+
+        assert inventory_calls == 1
+        assert bound == [descendant]
+        assert result == {root.pid: root, descendant.pid: descendant}
+    finally:
+        _restore_execution_hooks_for_test(original_trace, original_profile)
+
+
+@pytest.mark.parametrize("hook_kind", ("trace", "profile", "both"))
+def test_darwin_track_direct_call_rejects_hooks_before_state_changes(
+    hook_kind: str,
+) -> None:
+    original_trace = sys.gettrace()
+    original_profile = sys.getprofile()
+    tracker = contained._DarwinKqueueProcessTracker()
+    identity = contained.ProcessIdentity(101, (1, 0))
+    control_calls = 0
+
+    class Queue:
+        def control(self, *_args: object) -> list[object]:
+            nonlocal control_calls
+            control_calls += 1
+            raise AssertionError("kernel control must not run")
+
+    def trace_hook(_frame: object, _event: str, _arg: object) -> object:
+        return trace_hook
+
+    def profile_hook(_frame: object, _event: str, _arg: object) -> None:
+        return None
+
+    tracker._queue = Queue()
+    tracker._owns_queue = True
+    tracker._root_pid = identity.pid
+    tracker._root_started = identity.started
+    tracker._known[identity.pid] = identity
+    tracker._registered.add(identity.pid)
+    tracker._deadline = time.monotonic() + 1
+    try:
+        sys.settrace(trace_hook if hook_kind in {"trace", "both"} else None)
+        sys.setprofile(profile_hook if hook_kind in {"profile", "both"} else None)
+
+        with pytest.raises(
+            contained.ContainedProcessError,
+            match="contained acquisition does not support active execution hooks",
+        ):
+            tracker._track()
+
+        assert control_calls == 0
+        assert tracker._poll_generation == 0
+        assert tracker._error is None
+        assert tracker._known == {identity.pid: identity}
+        assert tracker._registered == {identity.pid}
+        assert not tracker._stop.is_set()
+        assert sys.gettrace() is (trace_hook if hook_kind in {"trace", "both"} else None)
+        assert sys.getprofile() is (profile_hook if hook_kind in {"profile", "both"} else None)
+    finally:
+        _restore_execution_hooks_for_test(original_trace, original_profile)
+
+
+def test_darwin_track_stops_before_next_control_when_hook_activates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tracker = contained._DarwinKqueueProcessTracker()
+    activation_error = contained.ContainedProcessError(
+        "contained acquisition does not support active execution hooks"
+    )
+    gate_calls = 0
+    control_calls = 0
+
+    class Queue:
+        def control(self, *_args: object) -> list[object]:
+            nonlocal control_calls
+            control_calls += 1
+            if control_calls > 1:
+                raise AssertionError("hook gate was not rechecked")
+            return []
+
+    def gate() -> None:
+        nonlocal gate_calls
+        gate_calls += 1
+        if gate_calls == 3:
+            raise activation_error
+
+    tracker._queue = Queue()
+    tracker._owns_queue = True
+    tracker._deadline = time.monotonic() + 1
+    monkeypatch.setattr(contained, "_require_no_execution_hooks", gate)
+
+    tracker._track()
+
+    assert gate_calls == 3
+    assert control_calls == 1
+    assert tracker._poll_generation == 1
+    assert tracker._error is activation_error
+    with pytest.raises(
+        contained.ContainedProcessError, match="kernel process tracking failed"
+    ) as caught:
+        tracker.poll(deadline=time.monotonic() + 1)
+    assert caught.value.__cause__ is activation_error
+
+
 @pytest.mark.skipif(sys.platform != "darwin", reason="Darwin kqueue hook contract")
 def test_kqueue_acquisition_accepts_no_execution_hooks_and_rejects_both(
     monkeypatch: pytest.MonkeyPatch,
@@ -901,6 +1109,52 @@ def test_cleanup_budget_reserves_each_fresh_marker_root_sibling() -> None:
         [later],
         error_label="fresh marker cleanup",
         note="fresh marker cleanup note",
+    )
+
+    cleanup_group = getattr(primary, "cleanup_error_group", None)
+    assert isinstance(cleanup_group, BaseExceptionGroup)
+    assert cleanup_group.exceptions == (*expanding, legal_leaf, after, later)
+
+
+@pytest.mark.parametrize("source", ("existing", "new"))
+def test_cleanup_budget_isolates_fresh_marker_root_siblings_for_all_sources(
+    source: str,
+) -> None:
+    class FreshMarkerCleanupGroup(BaseExceptionGroup):
+        marker = 0
+
+        @property
+        def exceptions(self) -> tuple[BaseException, ...]:
+            type(self).marker += 1
+            return (
+                FreshMarkerCleanupGroup(
+                    f"fresh marker {type(self).marker}",
+                    [OSError("hidden")],
+                ),
+            )
+
+    primary = RuntimeError("primary")
+    expanding = tuple(
+        FreshMarkerCleanupGroup(f"root {index}", [OSError("hidden")]) for index in range(4)
+    )
+    legal_leaf = LookupError("legal nested cleanup")
+    legal_group = BaseExceptionGroup("legal cleanup", [legal_leaf])
+    after = ValueError("after cleanup")
+    later = InterruptedError("later cleanup")
+    root = BaseExceptionGroup(
+        "root cleanup",
+        [*expanding, legal_group, after],
+    )
+    errors: list[BaseException] = [root, later]
+    if source == "existing":
+        primary.cleanup_error_group = root  # type: ignore[attr-defined]
+        errors = [later]
+
+    contained._attach_cleanup_error_group(
+        primary,
+        errors,
+        error_label="root sibling cleanup",
+        note="root sibling cleanup note",
     )
 
     cleanup_group = getattr(primary, "cleanup_error_group", None)
