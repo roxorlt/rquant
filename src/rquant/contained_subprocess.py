@@ -25,9 +25,9 @@ from typing import NoReturn, Protocol
 
 _SIGNAL_STATE_ATTEMPTS = 3
 _UNSAFE_SIGNAL_STATE_EXIT_CODE = 70
-_CLEANUP_GROUP_NODE_BUDGET = 4096
-_CLEANUP_GROUP_FRAME_BUDGET = 2048
-_CLEANUP_GROUP_WORK_BUDGET = 8192
+_CLEANUP_GROUP_NODE_BUDGET = max(16384, 8 * sys.getrecursionlimit())
+_CLEANUP_GROUP_FRAME_BUDGET = max(4096, 4 * sys.getrecursionlimit())
+_CLEANUP_GROUP_WORK_BUDGET = max(65536, 32 * sys.getrecursionlimit())
 
 
 class ContainedProcessError(RuntimeError):
@@ -86,12 +86,25 @@ def _format_cleanup_error_details(errors: Sequence[BaseException]) -> str:
 
 
 @dataclass
+class _CleanupBudgetScope:
+    group: BaseExceptionGroup
+    output_start: int
+    completion_start: int
+    frame_start: int
+    node_start: int
+    work_start: int
+    node_limit: int
+    work_limit: int
+
+
+@dataclass
 class _CleanupGroupFrame:
     group: BaseExceptionGroup
     nested_errors: tuple[BaseException, ...]
     next_index: int
     output_start: int
     completion_start: int
+    scope: _CleanupBudgetScope
 
 
 def _collect_cleanup_error(
@@ -116,24 +129,48 @@ def _collect_cleanup_error(
     node_count = 1
     work_count = 0
     budget_exhausted = False
-    descent_locked = False
 
-    def inspect_group(group: BaseExceptionGroup) -> tuple[BaseException, ...] | None:
+    def make_scope(
+        group: BaseExceptionGroup,
+        *,
+        independent: bool,
+        node_start: int,
+        work_start: int,
+    ) -> _CleanupBudgetScope:
+        divisor = 2 if independent else 1
+        return _CleanupBudgetScope(
+            group=group,
+            output_start=len(output),
+            completion_start=len(completion_log),
+            frame_start=len(frames),
+            node_start=node_start,
+            work_start=work_start,
+            node_limit=max(1, _CLEANUP_GROUP_NODE_BUDGET // divisor),
+            work_limit=max(1, _CLEANUP_GROUP_WORK_BUDGET // divisor),
+        )
+
+    def inspect_group(
+        group: BaseExceptionGroup,
+        scope: _CleanupBudgetScope,
+    ) -> tuple[BaseException, ...] | None:
         nonlocal budget_exhausted, work_count
         work_count += 1
-        if work_count > _CLEANUP_GROUP_WORK_BUDGET:
+        if (
+            work_count > _CLEANUP_GROUP_WORK_BUDGET
+            or work_count - scope.work_start > scope.work_limit
+        ):
             budget_exhausted = True
             return None
         try:
             nested = group.exceptions
             if not isinstance(nested, tuple):
                 return None
-            if len(nested) > _CLEANUP_GROUP_NODE_BUDGET - node_count:
-                budget_exhausted = True
-                return None
             for item in nested:
                 work_count += 1
-                if work_count > _CLEANUP_GROUP_WORK_BUDGET:
+                if (
+                    work_count > _CLEANUP_GROUP_WORK_BUDGET
+                    or work_count - scope.work_start > scope.work_limit
+                ):
                     budget_exhausted = True
                     return None
                 if not isinstance(item, BaseException):
@@ -142,61 +179,41 @@ def _collect_cleanup_error(
             return None
         return nested
 
-    root_nested = inspect_group(error)
-    if budget_exhausted:
+    root_scope = _CleanupBudgetScope(
+        group=error,
+        output_start=0,
+        completion_start=0,
+        frame_start=0,
+        node_start=0,
+        work_start=0,
+        node_limit=_CLEANUP_GROUP_NODE_BUDGET,
+        work_limit=_CLEANUP_GROUP_WORK_BUDGET,
+    )
+    root_nested = inspect_group(error, root_scope)
+    if budget_exhausted or root_nested is None:
         cleanup_errors.append(error)
         seen.add(id(error))
         return
-    if root_nested is None:
-        cleanup_errors.append(error)
-        seen.add(id(error))
-        return
-    frames = [_CleanupGroupFrame(error, root_nested, 0, 0, 0)]
+
+    frames = [_CleanupGroupFrame(error, root_nested, 0, 0, 0, root_scope)]
     active_groups[id(error)] = 0
 
-    def preserve_budget_subtree(pending_group: BaseExceptionGroup | None = None) -> None:
-        nonlocal budget_exhausted, completed_groups, descent_locked, emitted
-        branch_start = 0
-        for index in range(1, len(frames)):
-            if len(frames[index - 1].nested_errors) > 1:
-                branch_start = index
-                break
-        else:
-            if pending_group is not None and frames and len(frames[-1].nested_errors) > 1:
-                branch_start = len(frames)
-
-        if branch_start == len(frames):
-            assert pending_group is not None
-            opaque_group = pending_group
-            output_start = len(output)
-            completion_start = len(completion_log)
-        else:
-            branch_frame = frames[branch_start]
-            opaque_group = branch_frame.group
-            output_start = branch_frame.output_start
-            completion_start = branch_frame.completion_start
-            for aborted in frames[branch_start:]:
-                active_groups.pop(id(aborted.group), None)
-            del frames[branch_start:]
-
-        del output[output_start:]
+    def preserve_budget_scope(scope: _CleanupBudgetScope) -> None:
+        nonlocal budget_exhausted, completed_groups, emitted
+        for aborted in frames[scope.frame_start :]:
+            active_groups.pop(id(aborted.group), None)
+        del frames[scope.frame_start :]
+        del output[scope.output_start :]
         emitted = {id(item) for item in output}
-        del completion_log[completion_start:]
+        del completion_log[scope.completion_start :]
         completed_groups = set(completion_log)
-        opaque_id = id(opaque_group)
-        if opaque_group is not primary_exception and opaque_id not in seen:
-            output.append(opaque_group)
+        opaque_id = id(scope.group)
+        if scope.group is not primary_exception and opaque_id not in seen:
+            output.append(scope.group)
             emitted.add(opaque_id)
         budget_exhausted = False
-        descent_locked = True
 
     while frames:
-        if not descent_locked:
-            work_count += 1
-            if work_count > _CLEANUP_GROUP_WORK_BUDGET:
-                budget_exhausted = True
-                preserve_budget_subtree()
-                continue
         frame = frames[-1]
         if frame.next_index >= len(frame.nested_errors):
             group_id = id(frame.group)
@@ -208,14 +225,26 @@ def _collect_cleanup_error(
 
         current = frame.nested_errors[frame.next_index]
         frame.next_index += 1
-        if not descent_locked:
-            node_count += 1
-            if node_count > _CLEANUP_GROUP_NODE_BUDGET:
-                budget_exhausted = True
-                preserve_budget_subtree(
-                    current if isinstance(current, BaseExceptionGroup) else None
-                )
-                continue
+        node_count += 1
+        work_count += 1
+        scope = frame.scope
+        if isinstance(current, BaseExceptionGroup) and len(frame.nested_errors) > 1:
+            scope = make_scope(
+                current,
+                independent=True,
+                node_start=node_count - 1,
+                work_start=work_count - 1,
+            )
+        if (
+            node_count > _CLEANUP_GROUP_NODE_BUDGET
+            or node_count - scope.node_start > scope.node_limit
+            or work_count > _CLEANUP_GROUP_WORK_BUDGET
+            or work_count - scope.work_start > scope.work_limit
+        ):
+            budget_exhausted = True
+            preserve_budget_scope(scope)
+            continue
+
         current_id = id(current)
         if current is primary_exception or current_id in seen:
             continue
@@ -239,21 +268,34 @@ def _collect_cleanup_error(
             output.append(current)
             emitted.add(current_id)
             continue
-        if descent_locked:
-            output.append(current)
-            emitted.add(current_id)
-            continue
-        nested_errors = inspect_group(current)
+
+        work_before_inspection = work_count
+        node_before_inspection = node_count - 1
+        nested_errors = inspect_group(current, scope)
         if budget_exhausted:
-            preserve_budget_subtree(current)
+            preserve_budget_scope(scope)
             continue
         if nested_errors is None:
             output.append(current)
             emitted.add(current_id)
             continue
-        if len(frames) >= _CLEANUP_GROUP_FRAME_BUDGET:
+        if scope is frame.scope and len(nested_errors) > 1:
+            scope = make_scope(
+                current,
+                independent=False,
+                node_start=node_before_inspection,
+                work_start=work_before_inspection,
+            )
+            if (
+                node_count - scope.node_start > scope.node_limit
+                or work_count - scope.work_start > scope.work_limit
+            ):
+                budget_exhausted = True
+                preserve_budget_scope(scope)
+                continue
+        if len(frames) - scope.frame_start >= _CLEANUP_GROUP_FRAME_BUDGET:
             budget_exhausted = True
-            preserve_budget_subtree(current)
+            preserve_budget_scope(scope)
             continue
         active_groups[current_id] = len(frames)
         frames.append(
@@ -263,6 +305,7 @@ def _collect_cleanup_error(
                 0,
                 len(output),
                 len(completion_log),
+                scope,
             )
         )
 
@@ -338,6 +381,23 @@ class _ExecutionHooks:
     profile: object
 
 
+_ExecutionHookState = tuple[
+    str,
+    Callable[[object], object],
+    Callable[[], object],
+    object,
+]
+
+
+@dataclass
+class _ExecutionHookRestorationState:
+    hook_orders: tuple[tuple[_ExecutionHookState, ...], ...]
+    restored: dict[str, bool]
+    recorded_errors: list[BaseException]
+    fallback_errors: list[BaseException | None]
+    fallback_count: int = 0
+
+
 def _restore_execution_hook_bounded(
     setter: Callable[[object], object],
     getter: Callable[[], object],
@@ -346,59 +406,123 @@ def _restore_execution_hook_bounded(
     *,
     label: str,
 ) -> bool:
+    _ = errors, label
+    if getter() is expected:
+        return True
+    setter(expected)
+    return getter() is expected
+
+
+def _capture_execution_hook_error(
+    state: _ExecutionHookRestorationState,
+    error: BaseException,
+) -> None:
     try:
-        if getter() is expected:
-            return True
-    except BaseException as exc:
-        _record_cleanup_error(errors, exc)
-    try:
-        setter(expected)
-    except BaseException as exc:
-        _record_cleanup_error(errors, exc)
-    try:
-        return getter() is expected
-    except BaseException as exc:
-        _record_cleanup_error(errors, exc)
-        return False
+        _record_cleanup_error(state.recorded_errors, error)
+    except BaseException as recording_error:
+        state.fallback_errors[state.fallback_count] = recording_error
+        state.fallback_errors[state.fallback_count + 1] = error
+        state.fallback_count += 2
+    else:
+        state.fallback_errors[state.fallback_count] = error
+        state.fallback_count += 1
 
 
 def _restore_execution_hooks(
+    state: _ExecutionHookRestorationState,
+    attempt: int,
+) -> None:
+    ordered_states = state.hook_orders[attempt]
+    for label, setter, getter, expected in ordered_states:
+        try:
+            state.restored[label] = _restore_execution_hook_bounded(
+                setter,
+                getter,
+                expected,
+                state.recorded_errors,
+                label=label,
+            )
+        except BaseException as exc:
+            state.restored[label] = False
+            try:
+                _capture_execution_hook_error(state, exc)
+            except BaseException as capture_error:
+                state.fallback_errors[state.fallback_count] = capture_error
+                state.fallback_errors[state.fallback_count + 1] = exc
+                state.fallback_count += 2
+    for label, _setter, getter, expected in state.hook_orders[0]:
+        try:
+            state.restored[label] = getter() is expected
+        except BaseException as exc:
+            state.restored[label] = False
+            try:
+                _capture_execution_hook_error(state, exc)
+            except BaseException as capture_error:
+                state.fallback_errors[state.fallback_count] = capture_error
+                state.fallback_errors[state.fallback_count + 1] = exc
+                state.fallback_count += 2
+
+
+def _restore_execution_hooks_bounded(
     hooks: _ExecutionHooks,
     errors: list[BaseException],
 ) -> None:
-    hook_states = (
+    hook_states: tuple[_ExecutionHookState, ...] = (
         ("profile", sys.setprofile, sys.getprofile, hooks.profile),
         ("trace", sys.settrace, sys.gettrace, hooks.trace),
     )
-    restored = {"profile": False, "trace": False}
+    state = _ExecutionHookRestorationState(
+        hook_orders=(hook_states, (hook_states[1], hook_states[0]), hook_states),
+        restored={"profile": False, "trace": False},
+        recorded_errors=[],
+        fallback_errors=[None] * 64,
+    )
+    mismatch_errors = (
+        ContainedProcessError("profile execution hook restoration could not be verified"),
+        ContainedProcessError("trace execution hook restoration could not be verified"),
+    )
     for attempt in range(_SIGNAL_STATE_ATTEMPTS):
-        ordered_states = hook_states if attempt % 2 == 0 else tuple(reversed(hook_states))
-        for label, setter, getter, expected in ordered_states:
+        try:
+            _restore_execution_hooks(state, attempt)
+        except BaseException as exc:
+            state.restored["profile"] = False
+            state.restored["trace"] = False
             try:
-                restored[label] = _restore_execution_hook_bounded(
-                    setter,
-                    getter,
-                    expected,
-                    errors,
-                    label=label,
-                )
-            except BaseException as exc:
-                restored[label] = False
-                _record_cleanup_error(errors, exc)
+                _capture_execution_hook_error(state, exc)
+            except BaseException as capture_error:
+                state.fallback_errors[state.fallback_count] = capture_error
+                state.fallback_errors[state.fallback_count + 1] = exc
+                state.fallback_count += 2
         for label, _setter, getter, expected in hook_states:
             try:
-                restored[label] = getter() is expected
+                state.restored[label] = getter() is expected
             except BaseException as exc:
-                restored[label] = False
-                _record_cleanup_error(errors, exc)
-        if restored["profile"] and restored["trace"]:
-            return
-    for label in ("profile", "trace"):
-        if not restored[label]:
-            _record_cleanup_error(
-                errors,
-                ContainedProcessError(f"{label} execution hook restoration could not be verified"),
-            )
+                state.restored[label] = False
+                try:
+                    _capture_execution_hook_error(state, exc)
+                except BaseException as capture_error:
+                    state.fallback_errors[state.fallback_count] = capture_error
+                    state.fallback_errors[state.fallback_count + 1] = exc
+                    state.fallback_count += 2
+        if state.restored["profile"] and state.restored["trace"]:
+            break
+    if not state.restored["profile"]:
+        state.fallback_errors[state.fallback_count] = mismatch_errors[0]
+        state.fallback_count += 1
+    if not state.restored["trace"]:
+        state.fallback_errors[state.fallback_count] = mismatch_errors[1]
+        state.fallback_count += 1
+
+    merged_errors = [*errors]
+    for candidate in state.fallback_errors[: state.fallback_count]:
+        duplicate = False
+        for existing in merged_errors:
+            if existing is candidate:
+                duplicate = True
+                break
+        if not duplicate:
+            merged_errors = [*merged_errors, candidate]
+    errors[:] = merged_errors
 
 
 def _suspend_execution_hooks() -> _ExecutionHooks:
@@ -413,7 +537,7 @@ def _suspend_execution_hooks() -> _ExecutionHooks:
     except BaseException as primary_exception:
         restoration_errors: list[BaseException] = []
         try:
-            _restore_execution_hooks(hooks, restoration_errors)
+            _restore_execution_hooks_bounded(hooks, restoration_errors)
         except BaseException as exc:
             _record_cleanup_error(restoration_errors, exc)
         _attach_cleanup_error_group(
@@ -434,7 +558,7 @@ def _finish_execution_hook_restoration(
 ) -> None:
     restoration_errors: list[BaseException] = []
     try:
-        _restore_execution_hooks(hooks, restoration_errors)
+        _restore_execution_hooks_bounded(hooks, restoration_errors)
     except BaseException as exc:
         _record_cleanup_error(restoration_errors, exc)
     if primary_exception is not None:

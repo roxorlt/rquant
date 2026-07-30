@@ -210,6 +210,20 @@ def _restore_execution_hooks_for_test(trace_hook: object, profile_hook: object) 
     sys.setprofile(profile_hook)
 
 
+class _CountingQueue:
+    def __init__(self, descriptor: int, close: Callable[[], None]) -> None:
+        self._descriptor = descriptor
+        self._close = close
+        self.close_count = 0
+
+    def fileno(self) -> int:
+        return self._descriptor
+
+    def close(self) -> None:
+        self.close_count += 1
+        self._close()
+
+
 def _open_file_descriptors() -> set[int]:
     return {int(entry) for entry in os.listdir("/dev/fd") if entry.isdigit()}
 
@@ -392,6 +406,292 @@ def test_real_profile_callback_failure_preserves_other_hook_and_cleanup() -> Non
         _close_test_fd_if_open(acquired_fd)
         _close_test_fd_if_open(read_fd)
         _close_test_fd_if_open(write_fd)
+        _restore_execution_hooks_for_test(original_trace, original_profile)
+
+
+@pytest.mark.skipif(not hasattr(select, "kqueue"), reason="real kqueue hook restoration contract")
+def test_hook_error_recording_boundary_retries_both_real_hooks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_trace = sys.gettrace()
+    original_profile = sys.getprofile()
+    queue = select.kqueue()
+    queue_fd = queue.fileno()
+    tracker = contained._DarwinKqueueProcessTracker()
+    getter_failure = OSError("profile getter boundary failed")
+    recording_failure = RuntimeError("hook error recording boundary failed")
+    getter_failed = False
+    recording_failed = False
+
+    counting_queue = _CountingQueue(queue_fd, queue.close)
+
+    def trace_hook(frame: object, event: str, _arg: object) -> object:
+        nonlocal recording_failed
+        if (
+            getter_failed
+            and not recording_failed
+            and event == "call"
+            and getattr(frame, "f_code", None) is contained._record_cleanup_error.__code__
+        ):
+            recording_failed = True
+            raise recording_failure
+        return trace_hook
+
+    def profile_hook(frame: object, event: str, arg: object) -> None:
+        nonlocal getter_failed
+        if (
+            not getter_failed
+            and event == "c_call"
+            and arg is sys.getprofile
+            and getattr(frame, "f_code", None) is contained._restore_execution_hooks.__code__
+        ):
+            getter_failed = True
+            raise getter_failure
+
+    monkeypatch.setattr(contained.select, "kqueue", lambda: counting_queue)
+    try:
+        sys.settrace(trace_hook)
+        sys.setprofile(profile_hook)
+
+        with pytest.raises(RuntimeError) as caught:
+            tracker._initialize_queue()
+
+        assert caught.value is recording_failure
+        assert getter_failed
+        assert recording_failed
+        assert sys.gettrace() is trace_hook
+        assert sys.getprofile() is profile_hook
+
+        tracker.close()
+        assert counting_queue.close_count == 1
+        with pytest.raises(OSError) as closed:
+            os.fstat(queue_fd)
+        assert closed.value.errno == errno.EBADF
+    finally:
+        _clear_execution_hooks()
+        with contained.suppress(BaseException):
+            tracker.close()
+        _close_test_fd_if_open(queue_fd)
+        _restore_execution_hooks_for_test(original_trace, original_profile)
+
+
+@pytest.mark.skipif(not hasattr(select, "kqueue"), reason="real kqueue hook restoration contract")
+def test_hook_driver_return_boundary_gets_another_bounded_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_trace = sys.gettrace()
+    original_profile = sys.getprofile()
+    queue = select.kqueue()
+    queue_fd = queue.fileno()
+    tracker = contained._DarwinKqueueProcessTracker()
+    boundary_failure = RuntimeError("hook driver return boundary failed")
+    failed = False
+
+    counting_queue = _CountingQueue(queue_fd, queue.close)
+
+    def trace_hook(_frame: object, _event: str, _arg: object) -> object:
+        return trace_hook
+
+    def profile_hook(frame: object, event: str, _arg: object) -> None:
+        nonlocal failed
+        if (
+            not failed
+            and event == "return"
+            and getattr(frame, "f_code", None) is contained._restore_execution_hooks.__code__
+        ):
+            failed = True
+            raise boundary_failure
+
+    monkeypatch.setattr(contained.select, "kqueue", lambda: counting_queue)
+    try:
+        sys.settrace(trace_hook)
+        sys.setprofile(profile_hook)
+
+        with pytest.raises(RuntimeError) as caught:
+            tracker._initialize_queue()
+
+        assert caught.value is boundary_failure
+        assert failed
+        assert sys.gettrace() is trace_hook
+        assert sys.getprofile() is profile_hook
+
+        tracker.close()
+        assert counting_queue.close_count == 1
+        with pytest.raises(OSError) as closed:
+            os.fstat(queue_fd)
+        assert closed.value.errno == errno.EBADF
+    finally:
+        _clear_execution_hooks()
+        with contained.suppress(BaseException):
+            tracker.close()
+        _close_test_fd_if_open(queue_fd)
+        _restore_execution_hooks_for_test(original_trace, original_profile)
+
+
+@pytest.mark.skipif(not hasattr(select, "kqueue"), reason="real kqueue hook restoration contract")
+@pytest.mark.parametrize("profile_event", ("c_call", "c_return"))
+def test_hook_final_validation_boundary_gets_another_bounded_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+    profile_event: str,
+) -> None:
+    original_trace = sys.gettrace()
+    original_profile = sys.getprofile()
+    queue = select.kqueue()
+    queue_fd = queue.fileno()
+    tracker = contained._DarwinKqueueProcessTracker()
+    boundary_failure = RuntimeError("hook final validation boundary failed")
+    failed = False
+
+    counting_queue = _CountingQueue(queue_fd, queue.close)
+
+    def trace_hook(_frame: object, _event: str, _arg: object) -> object:
+        return trace_hook
+
+    def profile_hook(frame: object, event: str, arg: object) -> None:
+        nonlocal failed
+        if (
+            not failed
+            and event == profile_event
+            and arg is sys.getprofile
+            and getattr(frame, "f_code", None)
+            is contained._restore_execution_hooks_bounded.__code__
+        ):
+            failed = True
+            raise boundary_failure
+
+    monkeypatch.setattr(contained.select, "kqueue", lambda: counting_queue)
+    try:
+        sys.settrace(trace_hook)
+        sys.setprofile(profile_hook)
+
+        with pytest.raises(RuntimeError) as caught:
+            tracker._initialize_queue()
+
+        assert caught.value is boundary_failure
+        assert failed
+        assert sys.gettrace() is trace_hook
+        assert sys.getprofile() is profile_hook
+
+        tracker.close()
+        assert counting_queue.close_count == 1
+        with pytest.raises(OSError) as closed:
+            os.fstat(queue_fd)
+        assert closed.value.errno == errno.EBADF
+    finally:
+        _clear_execution_hooks()
+        with contained.suppress(BaseException):
+            tracker.close()
+        _close_test_fd_if_open(queue_fd)
+        _restore_execution_hooks_for_test(original_trace, original_profile)
+
+
+@pytest.mark.skipif(not hasattr(select, "kqueue"), reason="real kqueue hook restoration contract")
+@pytest.mark.parametrize("trace_event", ("call", "return", "opcode"))
+def test_hook_error_capture_boundaries_preserve_both_exact_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    trace_event: str,
+) -> None:
+    original_trace = sys.gettrace()
+    original_profile = sys.getprofile()
+    queue = select.kqueue()
+    queue_fd = queue.fileno()
+    tracker = contained._DarwinKqueueProcessTracker()
+    getter_failure = OSError(f"profile getter before trace {trace_event}")
+    trace_failure = RuntimeError(f"trace {trace_event} capture boundary failed")
+    getter_failed = False
+    trace_failed = False
+    monitoring_tool_id: int | None = None
+
+    counting_queue = _CountingQueue(queue_fd, queue.close)
+
+    def trace_hook(frame: object, event: str, _arg: object) -> object:
+        nonlocal trace_failed
+        if (
+            getter_failed
+            and getattr(frame, "f_code", None) is contained._restore_execution_hook_bounded.__code__
+            and frame.f_locals.get("label") == "trace"  # type: ignore[attr-defined]
+            and not trace_failed
+            and event == trace_event
+        ):
+            trace_failed = True
+            raise trace_failure
+        return trace_hook
+
+    def instruction_hook(code: object, _offset: int) -> None:
+        nonlocal trace_failed
+        if (
+            not trace_failed
+            and code is contained._restore_execution_hook_bounded.__code__
+            and sys._getframe(1).f_locals.get("label") == "trace"
+        ):
+            trace_failed = True
+            raise trace_failure
+
+    def profile_hook(frame: object, event: str, arg: object) -> None:
+        nonlocal getter_failed
+        if (
+            not getter_failed
+            and event == "c_call"
+            and arg is sys.getprofile
+            and getattr(frame, "f_code", None) is contained._restore_execution_hooks.__code__
+        ):
+            getter_failed = True
+            raise getter_failure
+
+    monkeypatch.setattr(contained.select, "kqueue", lambda: counting_queue)
+    try:
+        if trace_event == "opcode":
+            monitoring_tool_id = sys.monitoring.OPTIMIZER_ID
+            sys.monitoring.use_tool_id(monitoring_tool_id, "rquant hook restoration test")
+            sys.monitoring.register_callback(
+                monitoring_tool_id,
+                sys.monitoring.events.INSTRUCTION,
+                instruction_hook,
+            )
+            sys.monitoring.set_local_events(
+                monitoring_tool_id,
+                contained._restore_execution_hook_bounded.__code__,
+                sys.monitoring.events.INSTRUCTION,
+            )
+        sys.settrace(trace_hook)
+        sys.setprofile(profile_hook)
+
+        with pytest.raises((OSError, RuntimeError)) as caught:
+            tracker._initialize_queue()
+
+        cleanup_group = getattr(caught.value, "cleanup_error_group", None)
+        observed = (caught.value,)
+        if isinstance(cleanup_group, BaseExceptionGroup):
+            observed = (*observed, *cleanup_group.exceptions)
+        assert any(error is getter_failure for error in observed)
+        assert any(error is trace_failure for error in observed)
+        assert getter_failed
+        assert trace_failed
+        assert sys.gettrace() is trace_hook
+        assert sys.getprofile() is profile_hook
+
+        tracker.close()
+        assert counting_queue.close_count == 1
+        with pytest.raises(OSError) as closed:
+            os.fstat(queue_fd)
+        assert closed.value.errno == errno.EBADF
+    finally:
+        _clear_execution_hooks()
+        if monitoring_tool_id is not None:
+            sys.monitoring.set_local_events(
+                monitoring_tool_id,
+                contained._restore_execution_hook_bounded.__code__,
+                0,
+            )
+            sys.monitoring.register_callback(
+                monitoring_tool_id,
+                sys.monitoring.events.INSTRUCTION,
+                None,
+            )
+            sys.monitoring.free_tool_id(monitoring_tool_id)
+        with contained.suppress(BaseException):
+            tracker.close()
+        _close_test_fd_if_open(queue_fd)
         _restore_execution_hooks_for_test(original_trace, original_profile)
 
 
@@ -716,6 +1016,97 @@ assert group.exceptions == (before, expanding, after, later)
     )
 
     assert completed.returncode == 0, (completed.stdout, completed.stderr)
+
+
+def test_cleanup_budget_resumes_with_legal_sibling_groups(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ExpandingCleanupGroup(BaseExceptionGroup):
+        @property
+        def exceptions(self) -> tuple[BaseException, ...]:
+            return (ExpandingCleanupGroup("fresh cleanup", [OSError("hidden")]),)
+
+    monkeypatch.setattr(contained, "_CLEANUP_GROUP_NODE_BUDGET", 20)
+    monkeypatch.setattr(contained, "_CLEANUP_GROUP_FRAME_BUDGET", 20)
+    monkeypatch.setattr(contained, "_CLEANUP_GROUP_WORK_BUDGET", 80)
+    primary = RuntimeError("primary")
+    before = OSError("before cleanup")
+    expanding = ExpandingCleanupGroup("expanding cleanup", [OSError("hidden")])
+    after = LookupError("after cleanup")
+    legal_leaf = ValueError("legal nested cleanup")
+    legal_group = BaseExceptionGroup("legal cleanup", [legal_leaf])
+    tail = InterruptedError("tail cleanup")
+    independent = ArithmeticError("independent cleanup")
+    primary.cleanup_error_group = BaseExceptionGroup(  # type: ignore[attr-defined]
+        "outer cleanup",
+        [before, expanding, after, legal_group, tail],
+    )
+
+    contained._attach_cleanup_error_group(
+        primary,
+        [independent],
+        error_label="bounded cleanup",
+        note="bounded cleanup note",
+    )
+
+    cleanup_group = getattr(primary, "cleanup_error_group", None)
+    assert isinstance(cleanup_group, BaseExceptionGroup)
+    assert cleanup_group.exceptions == (
+        before,
+        expanding,
+        after,
+        legal_leaf,
+        tail,
+        independent,
+    )
+
+
+def test_cleanup_budget_rolls_back_explicit_branch_inside_single_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(contained, "_CLEANUP_GROUP_NODE_BUDGET", 100)
+    monkeypatch.setattr(contained, "_CLEANUP_GROUP_FRAME_BUDGET", 100)
+    monkeypatch.setattr(contained, "_CLEANUP_GROUP_WORK_BUDGET", 8)
+    primary = RuntimeError("primary")
+    before = OSError("branch before")
+    middle = LookupError("branch middle")
+    after = ValueError("branch after")
+    branch = BaseExceptionGroup("branch cleanup", [before, middle, after])
+    wrapper = BaseExceptionGroup("single wrapper", [branch])
+    independent = InterruptedError("independent cleanup")
+    primary.cleanup_error_group = wrapper  # type: ignore[attr-defined]
+
+    contained._attach_cleanup_error_group(
+        primary,
+        [independent],
+        error_label="bounded cleanup",
+        note="bounded cleanup note",
+    )
+
+    cleanup_group = getattr(primary, "cleanup_error_group", None)
+    assert isinstance(cleanup_group, BaseExceptionGroup)
+    assert cleanup_group.exceptions == (branch, independent)
+
+
+def test_cleanup_group_default_budget_flattens_three_recursion_limits() -> None:
+    primary = RuntimeError("primary")
+    leaf = OSError("deep legal cleanup")
+    later = ValueError("later cleanup")
+    nested: BaseException = leaf
+    for depth in range(3 * sys.getrecursionlimit()):
+        nested = BaseExceptionGroup(f"deep legal cleanup {depth}", [nested])
+    primary.cleanup_error_group = nested  # type: ignore[attr-defined]
+
+    contained._attach_cleanup_error_group(
+        primary,
+        [later],
+        error_label="deep legal cleanup",
+        note="deep legal cleanup note",
+    )
+
+    cleanup_group = getattr(primary, "cleanup_error_group", None)
+    assert isinstance(cleanup_group, BaseExceptionGroup)
+    assert cleanup_group.exceptions == (leaf, later)
 
 
 @pytest.mark.parametrize("budget_kind", ("node", "frame", "work"))
