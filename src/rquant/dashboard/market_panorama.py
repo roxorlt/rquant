@@ -259,6 +259,16 @@ def cached_runtime_config() -> dict | None:
     return load_surge_runtime_config()
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def cached_pulse_history(day_key: str) -> pd.DataFrame:
+    return load_pulse_history()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def cached_pulse_alerts(day_key: str) -> pd.DataFrame:
+    return load_pulse_alerts()
+
+
 # ── 数据整形 helpers ──────────────────────────────────────────────────────────
 
 
@@ -402,6 +412,51 @@ def _snapshot_status_line(as_of: str, snap_route: str, status: dict) -> str:
     return line
 
 
+_PULSE_FACETS: list[tuple[str, str, str]] = [
+    ("limit_up", "涨停", _UP_COLOR),
+    ("broken", "炸板", "#f97316"),
+    ("limit_down", "跌停", _DOWN_COLOR),
+    ("up_ratio_pct", "上涨占比%", "#2563eb"),
+]
+
+
+def _pulse_facet_chart(hist: pd.DataFrame) -> alt.VConcatChart:
+    """四指标分面小图：独立 y 轴且不从 0 起，x 轴共享、约 6 个稀疏刻度。"""
+    ticks = hist["t"].tolist()[:: max(1, len(hist) // 6)]
+    x = alt.X("t:O", title=None, axis=alt.Axis(values=ticks, labelAngle=0))
+    rows = [
+        alt.Chart(hist).mark_line(color=color).encode(
+            x=x,
+            y=alt.Y(f"{col}:Q", title=title, scale=alt.Scale(zero=False)),
+            tooltip=["t", alt.Tooltip(f"{col}:Q", title=title)],
+        ).properties(height=64)
+        for col, title, color in _PULSE_FACETS
+    ]
+    return alt.vconcat(*rows).resolve_scale(x="shared", y="independent")
+
+
+def _render_pulse_alert_line(now: datetime) -> None:
+    """最近 30 分钟内的异动：常驻 warning + 新异动一次性 toast（会话内去重）。"""
+    alerts = cached_pulse_alerts(now.date().isoformat())
+    if alerts.empty:
+        return
+    latest = alerts.iloc[-1]
+    try:
+        hh, mm = str(latest["t"]).split(":")
+        alert_dt = now.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
+    except ValueError:
+        return
+    if not (timedelta(0) <= now - alert_dt <= timedelta(minutes=30)):
+        return
+    extra = f"（今日共 {len(alerts)} 次异动）" if len(alerts) > 1 else ""
+    st.warning(f"⚡ {latest['t']} {latest['kind_label']}：{latest['message']}{extra}")
+    seen: set[str] = st.session_state.setdefault("seen_pulse_alerts", set())
+    key = f"{latest['t']}-{latest['kind']}"
+    if key not in seen:
+        seen.add(key)
+        st.toast(f"⚡ {latest['t']} {latest['kind_label']}：{latest['message']}")
+
+
 def render_pulse(snapshot: pd.DataFrame, as_of: str, snap_route: str, status: dict) -> None:
     pulse = compute_market_pulse(snapshot)
     if pulse.total_count == 0:
@@ -420,21 +475,27 @@ def render_pulse(snapshot: pd.DataFrame, as_of: str, snap_route: str, status: di
     c4.metric("上涨占比", f"{pulse.up_ratio_pct:.1f}%")
     c5.metric("涨/跌家数", f"{pulse.up_count} / {pulse.down_count}")
     st.caption(_snapshot_status_line(as_of, snap_route, status))
+    _render_pulse_alert_line(datetime.now(CST))
     with c6, st.popover("📈", width="stretch"):
         st.caption(f"快照 {as_of} · 有效样本 {pulse.total_count} 只（停牌除外）")
-        if not spark.empty and spark["time"].nunique() >= 2:
+        hist = cached_pulse_history(datetime.now(CST).date().isoformat())
+        if len(hist) >= 2:
+            st.altair_chart(_pulse_facet_chart(hist), width="stretch")
+            st.caption("数据来源：服务端全天历史（surge-watch 每分钟落盘）")
+        elif not spark.empty and spark["time"].nunique() >= 2:
             chart = (
                 alt.Chart(spark)
                 .mark_line(point=True)
                 .encode(
                     x=alt.X("time:O", title=None),
-                    y=alt.Y("家数:Q", title=None),
+                    y=alt.Y("家数:Q", title=None, scale=alt.Scale(zero=False)),
                     color=alt.Color("指标:N", legend=alt.Legend(orient="top", title=None)),
                     tooltip=["time", "指标", "家数"],
                 )
                 .properties(height=160)
             )
             st.altair_chart(chart, width="stretch")
+            st.caption("数据来源：本会话累积（服务端历史不可用，本地兜底）")
         else:
             st.caption("脉搏曲线累积中（需 ≥2 分钟样本）")
 
