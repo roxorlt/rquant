@@ -6,6 +6,8 @@
 
 ### Changed
 
+- 分时/5日量柱按分钟涨跌近似上色（tick-rule，红涨绿跌，页脚注明近似口径）
+- fake 模式覆盖爆量台账/脉搏历史/异动/口径配置（e2e 可测）
 - **爆量事件分钟线完全迁云**：云端 `research-ingest` 的当日分钟采集集合改为“盘前
   Pool 1/2 watchlist ∪ 当日 surge-watch 事件”，`confirmed` 与 `unbuyable` 都纳入，
   重复事件按代码去重；事件 JSON、代码或状态非法时在任何网络请求和研究湖发布前
@@ -14,6 +16,10 @@
 
 ### Added
 
+- 爆量记录 tab 行选择联动个股图表，分时/5日图橙色虚线标注每日首次爆量确认时刻（悬停显示时间与倍数）
+- 脉搏历史服务端化：surge-watch 每分钟落 `surge_live/pulse-*.jsonl`，📈 浮层改四张分面小图（涨停/炸板/跌停/上涨占比，独立 y 轴）
+- 脉搏异动检测（涨停潮/炸板潮/跌停潮/涨跌占比突变，10 分钟滑窗 + 30 分钟冷却）：页面提示条 + PushDeer `pulse_alert` 场景推送
+- surge-watch 启动落 `runtime_config.json`，爆量记录页脚动态显示检测范围与口径
 - **脉搏与午间报告迁云**：新增 `rquant-morning-pulse`、`rquant-midday-report`
   systemd service/timer。云端复用同机 Panorama 快照与只读副本，在工作日
   10:00/10:30/11:00/11:30 发送30分钟脉搏、12:00 发送午间战报；timer 不做跨日
