@@ -25,6 +25,7 @@ from rquant.surge_watch import (
     SurgeBaseline,
     SurgeConfig,
     SurgeConfirmed,
+    SurgePushHistory,
     SurgeWatcher,
     _detection_domain,
     _is_lunch,
@@ -38,6 +39,7 @@ from rquant.surge_watch import (
     grid_index,
     linear_progress_curve,
     load_progress_curve,
+    load_recent_push_history,
     load_theme_map,
     run_simulate,
     run_surge_watch,
@@ -427,6 +429,52 @@ class TestU5DedupSilentFold:
         r2 = w.tick(snap, datetime(2026, 7, 6, 10, 1, tzinfo=CST))
         assert r2.confirmed == []                    # 每票每日仅推一次
 
+    def test_previous_trading_day_push_does_not_block_today(self) -> None:
+        w0, bars = self._watcher()
+        day = date(2026, 7, 6)
+        history = SurgePushHistory(
+            as_of=day,
+            window_dates=(date(2026, 6, 30), date(2026, 7, 1), date(2026, 7, 2),
+                          date(2026, 7, 3), day),
+            push_dates_by_code={"300001.SZ": frozenset({date(2026, 7, 3)})},
+        )
+        w = SurgeWatcher(
+            w0.baseline,
+            config=SurgeConfig(),
+            minute_fetcher=lambda c, dd: bars,
+            push_history=history,
+        )
+
+        result = w.tick(
+            self._snap_at(30, bars),
+            datetime(2026, 7, 6, 10, 0, tzinfo=CST),
+        )
+
+        assert result.confirmed[0].ts_code == "300001.SZ"
+        assert result.confirmed[0].push_count_5d == 2
+
+    def test_same_day_history_blocks_duplicate_after_restart(self) -> None:
+        w0, bars = self._watcher()
+        day = date(2026, 7, 6)
+        history = SurgePushHistory(
+            as_of=day,
+            window_dates=(day,),
+            push_dates_by_code={"300001.SZ": frozenset({day})},
+        )
+        w = SurgeWatcher(
+            w0.baseline,
+            config=SurgeConfig(),
+            minute_fetcher=lambda c, dd: bars,
+            push_history=history,
+        )
+
+        result = w.tick(
+            self._snap_at(30, bars),
+            datetime(2026, 7, 6, 10, 0, tzinfo=CST),
+        )
+
+        assert result.confirmed == []
+
     def test_silent_window_collects_then_flushes(self) -> None:
         # 默认 silent_until=09:31 已无静默窗，用显式 09:35 测「窗内收集、窗后 flush」机制
         bars = self._bars()
@@ -585,6 +633,44 @@ class TestU8Persist:
         assert rec["ts_code"] == "300001.SZ" and rec["theme"] == "人形机器人"
         assert rec["rel_cum"] == 2.5
 
+    def test_load_history_uses_exact_five_trading_days(self, tmp_path: Path) -> None:
+        days = (
+            date(2026, 7, 7),
+            date(2026, 7, 8),
+            date(2026, 7, 9),
+            date(2026, 7, 10),
+            date(2026, 7, 13),
+        )
+        (tmp_path / "events-2026-07-06.jsonl").write_text(
+            '{"ts_code":"300001.SZ"}\n', encoding="utf-8"
+        )
+        (tmp_path / "events-2026-07-07.jsonl").write_text(
+            '{"ts_code":"300001.SZ"}\n', encoding="utf-8"
+        )
+        (tmp_path / "events-2026-07-10.jsonl").write_text(
+            '{"ts_code":"300001.SZ"}\n'
+            '{"ts_code":"300001.SZ"}\n'
+            '{"ts_code":"688001.SH"}\n',
+            encoding="utf-8",
+        )
+        (tmp_path / "events-2026-07-11.jsonl").write_text(
+            '{"ts_code":"300001.SZ"}\n', encoding="utf-8"
+        )
+        (tmp_path / "events-2026-07-13.jsonl").write_text(
+            'not-json\n{"ts_code":null}\n{"ts_code":"300002.SZ"}\n', encoding="utf-8"
+        )
+
+        history = load_recent_push_history(tmp_path, date(2026, 7, 13), days)
+
+        assert history.window_dates == days
+        assert history.push_dates_by_code["300001.SZ"] == frozenset(
+            {date(2026, 7, 7), date(2026, 7, 10)}
+        )
+        assert history.push_dates_by_code["688001.SH"] == frozenset({date(2026, 7, 10)})
+        assert "300002.SZ" in history.pushed_today
+        assert "None" not in history.push_dates_by_code
+        assert history.count("300001.SZ") == 2
+
     def test_series_parquet_roundtrip(self, tmp_path: Path) -> None:
         cum = {"300001.SZ": np.full(CURVE_POINTS, np.nan)}
         cum["300001.SZ"][0] = 100.0
@@ -695,6 +781,7 @@ class TestU10Push:
             "**题材**：人形机器人\n"
             "- 涨幅：+8.3% ｜ 距涨停：4.5%\n"
             "- 累计比：4日 2.7× ｜ 累计额：1.20亿\n"
+            "- 近5日推送次数：1\n"
             "- 方向：1分钟 +0.46% ｜ 外/内≈2.34×"
         )
         assert expected_block in body
@@ -715,6 +802,21 @@ class TestU10Push:
         assert "9:31起判" in body                     # skip=0 → 9:31 起判（首个可确认格）
         assert "增量门" not in body                   # v2 增量门 v3 默认关，报文不出现
         assert "观察提示，非买入信号" in body          # 定位尾注
+
+    def test_message_shows_five_trading_day_push_count(self) -> None:
+        confirmed = SurgeConfirmed(
+            ts_code="300001.SZ",
+            name="机器人A",
+            push_count_5d=3,
+        )
+
+        _, body = build_surge_messages(
+            [confirmed],
+            datetime(2026, 7, 13, 10, 5, tzinfo=CST),
+            SurgeConfig(),
+        )[0]
+
+        assert "近5日推送次数：3" in body
 
     def test_dry_run_no_push(self, tmp_path: Path, capsys) -> None:
         d = date(2026, 7, 6)
