@@ -1758,3 +1758,36 @@ class TestU20RtMinDailyConfirm:
         w.tick(snap, datetime(2026, 7, 6, 10, 0, tzinfo=CST))
         w.tick(snap, datetime(2026, 7, 6, 10, 1, tzinfo=CST))
         assert calls == ["300001.SZ"]                      # 仅一次 rt_min_daily
+
+
+class TestPulseWiring:
+    def test_run_surge_watch_writes_pulse_and_runtime_config(self, tmp_path: Path) -> None:
+        from rquant.surge_watch import RUNTIME_CONFIG_NAME, SurgeBaseline, linear_progress_curve
+
+        day = date(2026, 7, 29)
+        clock = iter([
+            datetime(2026, 7, 29, 9, 31, tzinfo=CST),
+            datetime(2026, 7, 29, 9, 32, tzinfo=CST),
+            datetime(2026, 7, 29, 9, 33, tzinfo=CST),
+            datetime(2026, 7, 29, 9, 34, tzinfo=CST),
+        ])
+        snap = pd.DataFrame([{
+            "ts_code": "300001.SZ", "name": "T1", "price": 10.5, "high": 10.6,
+            "pre_close": 10.0, "pct_chg": 5.0, "volume": 1e6, "amount": 1e7,
+            "limit_up_price": 12.0, "limit_down_price": 8.0,
+        }])
+        snap.attrs["route"] = "test"
+        run_surge_watch(
+            dry_run=True, force_session=True, max_ticks=2, base_dir=tmp_path,
+            now_fn=lambda: next(clock), sleep_fn=lambda s: None,
+            snapshot_fetcher=lambda: snap.copy(),
+            minute_fetcher=lambda code, d: pd.DataFrame(),
+            is_trading_day_fn=lambda d: True,
+            baseline=SurgeBaseline(avg_amount_20d={}, theme={}, curve=linear_progress_curve()),
+        )
+        assert (tmp_path / RUNTIME_CONFIG_NAME).exists()
+        cfg = json.loads((tmp_path / RUNTIME_CONFIG_NAME).read_text(encoding="utf-8"))
+        assert cfg["boards"] == ["gem", "star"] and cfg["ratio_cap"] == 8.0
+        pulse_file = tmp_path / f"pulse-{day.isoformat()}.jsonl"
+        assert pulse_file.exists()
+        assert pulse_file.read_text(encoding="utf-8").count("\n") == 2

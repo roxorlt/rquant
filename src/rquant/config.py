@@ -59,6 +59,7 @@ class Settings(BaseSettings):
     notify_morning_pulse: bool = True
     notify_midday_report: bool = True
     notify_surge_watch: bool = True
+    notify_pulse_alert: bool = True
 
     pool2_max_age_days: int = 6
 

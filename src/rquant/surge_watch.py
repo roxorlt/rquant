@@ -1313,6 +1313,31 @@ def atomic_write_parquet(df: pd.DataFrame, path: Path) -> None:
         logger.warning(f"surge 落盘失败（不影响主循环）: {path.name} {type(e).__name__}: {e}")
 
 
+RUNTIME_CONFIG_NAME = "runtime_config.json"
+
+
+def write_runtime_config(live_dir: Path, config: SurgeConfig, day: date) -> None:
+    """启动时落生效口径（原子写），供全景页动态展示检测范围。失败只 log。"""
+    payload = {
+        "day": day.isoformat(),
+        "boards": list(config.boards),
+        "k_rough": config.k_rough,
+        "k_cum": config.k_cum,
+        "ratio_cap": config.ratio_cap,
+        "skip_first_minutes": config.skip_first_minutes,
+        "tushare_rate_per_min": config.tushare_rate_per_min,
+        "require_price_strength": config.require_price_strength,
+        "max_room_to_limit_pct": config.max_room_to_limit_pct,
+    }
+    try:
+        live_dir.mkdir(parents=True, exist_ok=True)
+        tmp = live_dir / (RUNTIME_CONFIG_NAME + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, live_dir / RUNTIME_CONFIG_NAME)
+    except Exception as e:
+        logger.warning(f"runtime_config 落盘失败（不影响主循环）: {type(e).__name__}: {e}")
+
+
 def append_events(path: Path, confirmed: list[SurgeConfirmed]) -> None:
     """确认事件 append 到当日 jsonl（每行一只票的完整判定字段）。"""
     if not confirmed:
@@ -1480,6 +1505,11 @@ def run_surge_watch(
     )
     events_path = live_dir / f"events-{day.isoformat()}.jsonl"
 
+    from rquant.pulse_watch import PulseSession  # 函数级导入：pulse_watch 顶层引本模块，避免环
+
+    write_runtime_config(live_dir, config, day)
+    pulse_session = PulseSession(live_dir, day, notify_fn=notify_fn, dry_run=dry_run)
+
     miss_streak = 0
     degraded_alerted = False
     ticks = 0
@@ -1525,6 +1555,8 @@ def run_surge_watch(
             miss_streak = 0
             # 全市场快照每分钟原子落盘（共享 feed：云端/Mac 全景页 poller 读它，与主循环同拍）
             atomic_write_parquet(full, live_dir / SNAPSHOT_FULL_NAME)
+            if now.time() >= OPEN_TIME:  # 集合竞价快照不喂脉搏（09:25-09:30 无成交分钟含义）
+                pulse_session.on_snapshot(full, now)
             # 检测层收窄到 config.boards（行为与旧「只拉创业/科创」一致）
             detection = _detection_domain(full, config.boards)
             result = watcher.tick(detection, now)

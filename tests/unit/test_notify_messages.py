@@ -231,6 +231,17 @@ class TestHeartbeat:
         assert "Pool 2 自动踢出 2 只" in body
 
 
+class TestPulseAlert:
+    def test_pulse_alert_prerendered_passthrough(self) -> None:
+        from rquant.notify.messages import build_message
+
+        title, body = build_message(
+            "pulse_alert", title="脉搏异动 14:32 炸板潮", body="炸板 10 分钟 2 → 6（+4）"
+        )
+        assert title == "脉搏异动 14:32 炸板潮"
+        assert body == "炸板 10 分钟 2 → 6（+4）"
+
+
 class TestRouterErrors:
     def test_unknown_scene_raises(self) -> None:
         from rquant.notify.messages import build_message

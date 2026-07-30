@@ -24,7 +24,7 @@ last-known-good slot——渲染永不等取数。fragment run_every=60 只做�
 from __future__ import annotations
 
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import altair as alt
 import pandas as pd
@@ -45,7 +45,13 @@ from rquant.panorama_data import (
     load_kpl_concept_members,
     load_liquidity_baseline,
     load_pool_flags,
+    load_pulse_alerts,
+    load_pulse_history,
     load_surge_log,
+    load_surge_marks,
+    load_surge_runtime_config,
+    surge_mark_positions,
+    volume_directions,
 )
 from rquant.panorama_poller import SourcePoller
 
@@ -241,6 +247,28 @@ def cached_surge_log(day_key: str) -> pd.DataFrame:
     return load_surge_log()
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def cached_surge_marks(ts_code: str, dates_key: str) -> pd.DataFrame:
+    """图表标记（键 = 票 + 交易日集合字符串；日集合来自 trend 实际数据）。"""
+    dates = [date.fromisoformat(s) for s in dates_key.split(",") if s]
+    return load_surge_marks(ts_code, dates)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_runtime_config() -> dict | None:
+    return load_surge_runtime_config()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def cached_pulse_history(day_key: str) -> pd.DataFrame:
+    return load_pulse_history()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def cached_pulse_alerts(day_key: str) -> pd.DataFrame:
+    return load_pulse_alerts()
+
+
 # ── 数据整形 helpers ──────────────────────────────────────────────────────────
 
 
@@ -384,6 +412,51 @@ def _snapshot_status_line(as_of: str, snap_route: str, status: dict) -> str:
     return line
 
 
+_PULSE_FACETS: list[tuple[str, str, str]] = [
+    ("limit_up", "涨停", _UP_COLOR),
+    ("broken", "炸板", "#f97316"),
+    ("limit_down", "跌停", _DOWN_COLOR),
+    ("up_ratio_pct", "上涨占比%", "#2563eb"),
+]
+
+
+def _pulse_facet_chart(hist: pd.DataFrame) -> alt.VConcatChart:
+    """四指标分面小图：独立 y 轴且不从 0 起，x 轴共享、约 6 个稀疏刻度。"""
+    ticks = hist["t"].tolist()[:: max(1, len(hist) // 6)]
+    x = alt.X("t:O", title=None, axis=alt.Axis(values=ticks, labelAngle=0))
+    rows = [
+        alt.Chart(hist).mark_line(color=color).encode(
+            x=x,
+            y=alt.Y(f"{col}:Q", title=title, scale=alt.Scale(zero=False)),
+            tooltip=["t", alt.Tooltip(f"{col}:Q", title=title)],
+        ).properties(height=64)
+        for col, title, color in _PULSE_FACETS
+    ]
+    return alt.vconcat(*rows).resolve_scale(x="shared", y="independent")
+
+
+def _render_pulse_alert_line(now: datetime) -> None:
+    """最近 30 分钟内的异动：常驻 warning + 新异动一次性 toast（会话内去重）。"""
+    alerts = cached_pulse_alerts(now.date().isoformat())
+    if alerts.empty:
+        return
+    latest = alerts.iloc[-1]
+    try:
+        hh, mm = str(latest["t"]).split(":")
+        alert_dt = now.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
+    except ValueError:
+        return
+    if not (timedelta(0) <= now - alert_dt <= timedelta(minutes=30)):
+        return
+    extra = f"（今日共 {len(alerts)} 次异动）" if len(alerts) > 1 else ""
+    st.warning(f"⚡ {latest['t']} {latest['kind_label']}：{latest['message']}{extra}")
+    seen: set[str] = st.session_state.setdefault("seen_pulse_alerts", set())
+    key = f"{latest['t']}-{latest['kind']}"
+    if key not in seen:
+        seen.add(key)
+        st.toast(f"⚡ {latest['t']} {latest['kind_label']}：{latest['message']}")
+
+
 def render_pulse(snapshot: pd.DataFrame, as_of: str, snap_route: str, status: dict) -> None:
     pulse = compute_market_pulse(snapshot)
     if pulse.total_count == 0:
@@ -402,21 +475,27 @@ def render_pulse(snapshot: pd.DataFrame, as_of: str, snap_route: str, status: di
     c4.metric("上涨占比", f"{pulse.up_ratio_pct:.1f}%")
     c5.metric("涨/跌家数", f"{pulse.up_count} / {pulse.down_count}")
     st.caption(_snapshot_status_line(as_of, snap_route, status))
+    _render_pulse_alert_line(datetime.now(CST))
     with c6, st.popover("📈", width="stretch"):
         st.caption(f"快照 {as_of} · 有效样本 {pulse.total_count} 只（停牌除外）")
-        if not spark.empty and spark["time"].nunique() >= 2:
+        hist = cached_pulse_history(datetime.now(CST).date().isoformat())
+        if len(hist) >= 2:
+            st.altair_chart(_pulse_facet_chart(hist), width="stretch")
+            st.caption("数据来源：服务端全天历史（surge-watch 每分钟落盘）")
+        elif not spark.empty and spark["time"].nunique() >= 2:
             chart = (
                 alt.Chart(spark)
                 .mark_line(point=True)
                 .encode(
                     x=alt.X("time:O", title=None),
-                    y=alt.Y("家数:Q", title=None),
+                    y=alt.Y("家数:Q", title=None, scale=alt.Scale(zero=False)),
                     color=alt.Color("指标:N", legend=alt.Legend(orient="top", title=None)),
                     tooltip=["time", "指标", "家数"],
                 )
                 .properties(height=160)
             )
             st.altair_chart(chart, width="stretch")
+            st.caption("数据来源：本会话累积（服务端历史不可用，本地兜底）")
         else:
             st.caption("脉搏曲线累积中（需 ≥2 分钟样本）")
 
@@ -548,13 +627,17 @@ def _trend_axis(trend: pd.DataFrame) -> tuple[list[int], str, list[int]]:
     return values, label_expr, domain
 
 
-def _trend_chart(trend: pd.DataFrame) -> alt.VConcatChart:
-    """分时/5日：价格线 + 均价虚线（有则画）+ 底部量柱，x 轴共享。
+def _trend_chart(trend: pd.DataFrame, marks: pd.DataFrame | None = None) -> alt.VConcatChart:
+    """分时/5日：价格线 + 均价虚线（有则画）+ 底部量柱（按分钟涨跌近似 tick-rule 红涨绿跌上色），
+    x 轴共享。marks 非空时叠加爆量标记竖线 + 标记点（每日首次确认时刻，悬停显示时间与倍数）。
 
     x 轴用 bar 序号 idx（quantitative）而非真实时间 dt——非交易时段（午休/隔夜）
     不占轴距，线天然连续无空档；轴刻度经 labelExpr 映射回时间/日期，tooltip 保留真实 dt。
     """
     trend = trend.reset_index(drop=True).assign(idx=lambda d: range(len(d)))
+    trend["vol_color"] = volume_directions(trend["price"]).map(
+        {"up": _UP_COLOR, "down": _DOWN_COLOR, "flat": "#94a3b8"}
+    )
     has_avg = trend["avg_price"].notna().any()
     values, label_expr, domain = _trend_axis(trend)
     # 定域到全天(单日)或数据范围(多日):盘中数据不足整天时线停在当前、右边留空
@@ -580,6 +663,22 @@ def _trend_chart(trend: pd.DataFrame) -> alt.VConcatChart:
             .encode(x=x_price, y=alt.Y("avg_price:Q"))
         )
         layers.append(avg_line)
+    mark_pos = (
+        surge_mark_positions(trend, marks)
+        if marks is not None and not marks.empty else pd.DataFrame()
+    )
+    if not mark_pos.empty:
+        mark_tip = [alt.Tooltip("label:N", title="爆量")]
+        layers.append(
+            alt.Chart(mark_pos).mark_rule(
+                color="#f97316", strokeDash=[6, 4], size=2
+            ).encode(x=alt.X("idx:Q", scale=x_scale), tooltip=mark_tip)
+        )
+        layers.append(
+            alt.Chart(mark_pos).mark_point(
+                color="#f97316", filled=True, size=80
+            ).encode(x=alt.X("idx:Q", scale=x_scale), y="price:Q", tooltip=mark_tip)
+        )
     price = alt.layer(*layers).properties(height=220)
     x_vol = alt.X(
         "idx:Q",
@@ -589,10 +688,11 @@ def _trend_chart(trend: pd.DataFrame) -> alt.VConcatChart:
     )
     vol = (
         alt.Chart(trend)
-        .mark_bar(color="#94a3b8")
+        .mark_bar()
         .encode(
             x=x_vol,
             y=alt.Y("volume:Q", title=None),
+            color=alt.Color("vol_color:N", scale=None),
             tooltip=[dt_tip, alt.Tooltip("volume:Q", title="量")],
         )
         .properties(height=70)
@@ -659,14 +759,14 @@ def _kline_chart(kline: pd.DataFrame) -> alt.VConcatChart:
 
 
 def render_stock_chart(
-    ts_code: str | None, name: str | None, snapshot: pd.DataFrame
+    ts_code: str | None, name: str | None, snapshot: pd.DataFrame, *, key_prefix: str = "pano"
 ) -> None:
     st.markdown(f"**个股图表 · {name or '—'}**")
     period = st.segmented_control(
         "周期",
         ["分时", "5日", "日K"],
         default="分时",
-        key="chart_period",
+        key=f"chart_period_{key_prefix}",
         label_visibility="collapsed",
     ) or "分时"
 
@@ -680,8 +780,14 @@ def render_stock_chart(
         if trend.empty:
             st.info(f"{period}数据暂不可用")
             return
-        st.altair_chart(_trend_chart(trend), width="stretch")
-        st.caption(f"数据路由：{ROUTE_LABELS.get(route, route)}")
+        days = sorted(pd.to_datetime(trend["dt"]).dt.date.unique())
+        marks = cached_surge_marks(ts_code, ",".join(d.isoformat() for d in days))
+        st.altair_chart(_trend_chart(trend, marks), width="stretch")
+        st.caption(
+            f"数据路由：{ROUTE_LABELS.get(route, route)}"
+            " · 量柱色=分钟涨跌近似（tick-rule），非真实内外盘"
+            " · 橙线=首次爆量确认"
+        )
     else:
         kline = _append_intraday_bar(cached_kline(ts_code), snapshot, ts_code)
         if kline.empty:
@@ -724,18 +830,52 @@ def _surge_log_display(df: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-def render_surge_log() -> None:
-    """当日爆量台账：每标的取最早识别时刻，纯只读 events jsonl（缓存 30s 跟盘中增长）。"""
+_BOARD_LABELS = {"main": "主板", "gem": "创业", "star": "科创", "bj": "北交"}
+
+
+def _surge_caption(n_rows: int) -> str:
+    """页脚口径：优先 runtime_config 动态展示，缺失退回写死文案。"""
+    cfg = cached_runtime_config()
+    if cfg:
+        boards = "/".join(_BOARD_LABELS.get(b, str(b)) for b in cfg.get("boards", []))
+        return (
+            f"检测范围：{boards or '—'}"
+            f" · 口径 v4：累计放量 {cfg.get('k_cum', '—')}-{cfg.get('ratio_cap', '—')}×"
+            " + 当前分钟上涨 + 外盘占优（tick-rule 近似）"
+            " · 每标的取当日最早识别时刻"
+            f" · 观察提示非买入信号 · 共 {n_rows} 条"
+        )
+    return (
+        "口径 v4：累计放量 + 当前分钟上涨 + 外盘占优（tick-rule 近似）"
+        " · 每标的取当日最早识别时刻"
+        f" · 观察提示非买入信号 · 共 {n_rows} 条"
+    )
+
+
+def render_surge_log(snapshot: pd.DataFrame) -> None:
+    """当日爆量台账：行选择联动下方个股图表（分时/5日带首次触发标记）。"""
     today = datetime.now(CST).date()
     df = cached_surge_log(today.isoformat())
     if df.empty:
         st.info("今日暂无爆量记录（surge-watch 尚未识别到，或未到盘中）")
         return
-    st.dataframe(_surge_log_display(df), hide_index=True, width="stretch", height=520)
-    st.caption(
-        "口径 v4：累计放量 + 当前分钟上涨 + 外盘占优（tick-rule 近似）"
-        " · 每标的取当日最早识别时刻"
-        f" · 观察提示非买入信号 · 共 {len(df)} 条"
+    event = st.dataframe(
+        _surge_log_display(df),
+        key="surge_tbl",
+        on_select="rerun",
+        selection_mode="single-row",
+        hide_index=True,
+        width="stretch",
+        height=300,
+    )
+    st.caption(_surge_caption(len(df)))
+    idx = _first_selected_row(event)
+    if idx is None or idx >= len(df):
+        st.info("点选记录查看个股图表（分时/5日图标注首次爆量触发时刻）")
+        return
+    row = df.iloc[idx]
+    render_stock_chart(
+        str(row["ts_code"]), str(row.get("name", "")), snapshot, key_prefix="surge"
     )
 
 
@@ -785,7 +925,7 @@ def render_body() -> None:
             render_stock_chart(ts_code, stock_name, snapshot)
 
     with tab_surge:
-        render_surge_log()
+        render_surge_log(snapshot)
 
 
 render_body()
