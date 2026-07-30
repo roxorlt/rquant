@@ -24,7 +24,7 @@ last-known-good slot——渲染永不等取数。fragment run_every=60 只做�
 from __future__ import annotations
 
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import altair as alt
 import pandas as pd
@@ -45,7 +45,13 @@ from rquant.panorama_data import (
     load_kpl_concept_members,
     load_liquidity_baseline,
     load_pool_flags,
+    load_pulse_alerts,
+    load_pulse_history,
     load_surge_log,
+    load_surge_marks,
+    load_surge_runtime_config,
+    surge_mark_positions,
+    volume_directions,
 )
 from rquant.panorama_poller import SourcePoller
 
@@ -239,6 +245,13 @@ def cached_kline(ts_code: str) -> pd.DataFrame:
 def cached_surge_log(day_key: str) -> pd.DataFrame:
     """当日爆量台账（键含当日字符串跨日自动失效；ttl 30s 让盘中增长的 jsonl 被读到）。"""
     return load_surge_log()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def cached_surge_marks(ts_code: str, dates_key: str) -> pd.DataFrame:
+    """图表标记（键 = 票 + 交易日集合字符串；日集合来自 trend 实际数据）。"""
+    dates = [date.fromisoformat(s) for s in dates_key.split(",") if s]
+    return load_surge_marks(ts_code, dates)
 
 
 # ── 数据整形 helpers ──────────────────────────────────────────────────────────
@@ -548,13 +561,16 @@ def _trend_axis(trend: pd.DataFrame) -> tuple[list[int], str, list[int]]:
     return values, label_expr, domain
 
 
-def _trend_chart(trend: pd.DataFrame) -> alt.VConcatChart:
+def _trend_chart(trend: pd.DataFrame, marks: pd.DataFrame | None = None) -> alt.VConcatChart:
     """分时/5日：价格线 + 均价虚线（有则画）+ 底部量柱，x 轴共享。
 
     x 轴用 bar 序号 idx（quantitative）而非真实时间 dt——非交易时段（午休/隔夜）
     不占轴距，线天然连续无空档；轴刻度经 labelExpr 映射回时间/日期，tooltip 保留真实 dt。
     """
     trend = trend.reset_index(drop=True).assign(idx=lambda d: range(len(d)))
+    trend["vol_color"] = volume_directions(trend["price"]).map(
+        {"up": _UP_COLOR, "down": _DOWN_COLOR, "flat": "#94a3b8"}
+    )
     has_avg = trend["avg_price"].notna().any()
     values, label_expr, domain = _trend_axis(trend)
     # 定域到全天(单日)或数据范围(多日):盘中数据不足整天时线停在当前、右边留空
@@ -580,6 +596,22 @@ def _trend_chart(trend: pd.DataFrame) -> alt.VConcatChart:
             .encode(x=x_price, y=alt.Y("avg_price:Q"))
         )
         layers.append(avg_line)
+    mark_pos = (
+        surge_mark_positions(trend, marks)
+        if marks is not None and not marks.empty else pd.DataFrame()
+    )
+    if not mark_pos.empty:
+        mark_tip = [alt.Tooltip("label:N", title="爆量")]
+        layers.append(
+            alt.Chart(mark_pos).mark_rule(
+                color="#f97316", strokeDash=[6, 4], size=2
+            ).encode(x=alt.X("idx:Q", scale=x_scale), tooltip=mark_tip)
+        )
+        layers.append(
+            alt.Chart(mark_pos).mark_point(
+                color="#f97316", filled=True, size=80
+            ).encode(x=alt.X("idx:Q", scale=x_scale), y="price:Q", tooltip=mark_tip)
+        )
     price = alt.layer(*layers).properties(height=220)
     x_vol = alt.X(
         "idx:Q",
@@ -589,10 +621,11 @@ def _trend_chart(trend: pd.DataFrame) -> alt.VConcatChart:
     )
     vol = (
         alt.Chart(trend)
-        .mark_bar(color="#94a3b8")
+        .mark_bar()
         .encode(
             x=x_vol,
             y=alt.Y("volume:Q", title=None),
+            color=alt.Color("vol_color:N", scale=None),
             tooltip=[dt_tip, alt.Tooltip("volume:Q", title="量")],
         )
         .properties(height=70)
@@ -659,14 +692,14 @@ def _kline_chart(kline: pd.DataFrame) -> alt.VConcatChart:
 
 
 def render_stock_chart(
-    ts_code: str | None, name: str | None, snapshot: pd.DataFrame
+    ts_code: str | None, name: str | None, snapshot: pd.DataFrame, *, key_prefix: str = "pano"
 ) -> None:
     st.markdown(f"**个股图表 · {name or '—'}**")
     period = st.segmented_control(
         "周期",
         ["分时", "5日", "日K"],
         default="分时",
-        key="chart_period",
+        key=f"chart_period_{key_prefix}",
         label_visibility="collapsed",
     ) or "分时"
 
@@ -680,8 +713,14 @@ def render_stock_chart(
         if trend.empty:
             st.info(f"{period}数据暂不可用")
             return
-        st.altair_chart(_trend_chart(trend), width="stretch")
-        st.caption(f"数据路由：{ROUTE_LABELS.get(route, route)}")
+        days = sorted(pd.to_datetime(trend["dt"]).dt.date.unique())
+        marks = cached_surge_marks(ts_code, ",".join(d.isoformat() for d in days))
+        st.altair_chart(_trend_chart(trend, marks), width="stretch")
+        st.caption(
+            f"数据路由：{ROUTE_LABELS.get(route, route)}"
+            " · 量柱色=分钟涨跌近似（tick-rule），非真实内外盘"
+            " · 橙线=首次爆量确认"
+        )
     else:
         kline = _append_intraday_bar(cached_kline(ts_code), snapshot, ts_code)
         if kline.empty:
