@@ -2277,11 +2277,32 @@ def test_job_zip_export_accepts_only_job_id_and_returns_request_scoped_hash_rece
     assert first.sha256 == repeated.sha256
     assert first.sha256 == hashlib.sha256(first.path.read_bytes()).hexdigest()
     assert first.path.read_bytes() == repeated.path.read_bytes()
+    forged = first.model_copy(update={"sha256": "0" * 64})
+    with pytest.raises(LabArtifactIntegrityError, match="receipt"):
+        facade.discard(forged)
+    assert first.path.exists()
+
+    facade.discard(first)
+
+    assert not first.path.exists()
+    assert first.path.parent.is_dir()
+    first_tombstones = tuple(first.path.parent.glob("*.discarded"))
+    assert len(first_tombstones) == 1
+    assert first_tombstones[0].stat().st_size == 0
+    assert repeated.path.exists()
+    facade.discard(repeated)
+    job_root = export_root / scenario.job_id.hex
+    assert job_root.is_dir()
+    retired_files = tuple(path for path in job_root.rglob("*") if path.is_file())
+    assert len(retired_files) == 2
+    assert sum(path.stat().st_size for path in retired_files) == 0
     with pytest.raises(TypeError, match="destination"):
         facade.export(  # type: ignore[call-arg]
             scenario.job_id,
             destination=tmp_path / "caller-selected.zip",
         )
+    with pytest.raises(TypeError, match="receipt"):
+        facade.discard(first.path)  # type: ignore[arg-type]
 
 
 def test_job_zip_export_requires_authoritative_succeeded_sealed_result(
@@ -2310,6 +2331,90 @@ def test_job_zip_export_requires_authoritative_succeeded_sealed_result(
         facade.export(uuid4())
 
     assert tuple(export_root.rglob("*.zip")) == ()
+
+
+def test_job_zip_discard_reclaims_only_the_verified_inode_after_path_replacement(
+    tmp_path: Path,
+) -> None:
+    from rquant.lab_artifact_export import LabJobZipExportFacade
+    from rquant.lab_jobs import LabJobReader
+    from tests.unit.test_lab_finalizer import _ready_scenario
+
+    scenario_root = tmp_path / "scenario"
+    scenario_root.mkdir(mode=0o700)
+    scenario = _ready_scenario(scenario_root, hold_days=(1,))
+    assert scenario.finalizer().finalize(scenario.job_id).status == "published"
+    assert scenario.scheduler.run_once().artifact_commits_accepted == 1
+    facade = LabJobZipExportFacade(
+        reader=LabJobReader(scenario.store.path),
+        artifact_store=scenario.artifact_store,
+        export_root=tmp_path / "private-exports",
+    )
+    receipt = facade.export(scenario.job_id)
+    replacement_names: list[str] = []
+
+    displaced_names: list[str] = []
+
+    def replace_before_truncate(directory_descriptor: int, name: str) -> None:
+        displaced = f"{name}.original"
+        os.rename(
+            name,
+            displaced,
+            src_dir_fd=directory_descriptor,
+            dst_dir_fd=directory_descriptor,
+        )
+        descriptor = os.open(
+            name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=directory_descriptor,
+        )
+        try:
+            os.write(descriptor, b"replacement")
+        finally:
+            os.close(descriptor)
+        replacement_names.append(name)
+        displaced_names.append(displaced)
+
+    facade._before_discard_truncate = replace_before_truncate  # type: ignore[method-assign]
+
+    facade.discard(receipt)
+
+    request_root = receipt.path.parent
+    assert replacement_names
+    assert (request_root / replacement_names[0]).read_bytes() == b"replacement"
+    assert displaced_names
+    assert (request_root / displaced_names[0]).stat().st_size == 0
+    assert not receipt.path.exists()
+
+
+def test_job_zip_export_record_budget_bounds_online_tombstones(tmp_path: Path) -> None:
+    from rquant.lab_artifact_export import (
+        LabJobZipExportCapacityError,
+        LabJobZipExportFacade,
+    )
+    from rquant.lab_jobs import LabJobReader
+    from tests.unit.test_lab_finalizer import _ready_scenario
+
+    scenario_root = tmp_path / "scenario"
+    scenario_root.mkdir(mode=0o700)
+    scenario = _ready_scenario(scenario_root, hold_days=(1,))
+    assert scenario.finalizer().finalize(scenario.job_id).status == "published"
+    assert scenario.scheduler.run_once().artifact_commits_accepted == 1
+    facade = LabJobZipExportFacade(
+        reader=LabJobReader(scenario.store.path),
+        artifact_store=scenario.artifact_store,
+        export_root=tmp_path / "private-exports",
+        max_export_records=1,
+    )
+    receipt = facade.export(scenario.job_id)
+    facade.discard(receipt)
+
+    with pytest.raises(LabJobZipExportCapacityError, match="budget is exhausted"):
+        facade.export(scenario.job_id)
+
+    assert receipt.path.parent.is_dir()
+    assert sum(path.stat().st_size for path in receipt.path.parent.iterdir()) == 0
 
 
 def test_job_zip_export_rejects_symlink_or_replaced_export_root(tmp_path: Path) -> None:

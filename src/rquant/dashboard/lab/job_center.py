@@ -271,3 +271,6 @@ class StrategyLabJobCenterController:
 
     def export_zip(self, job_id: UUID) -> LabJobZipExportReceipt:
         return self._zip_exports.export(job_id)
+
+    def discard_zip(self, receipt: LabJobZipExportReceipt) -> None:
+        self._zip_exports.discard(receipt)

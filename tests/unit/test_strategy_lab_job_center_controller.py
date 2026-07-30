@@ -185,6 +185,7 @@ class _PreviewSpy:
 class _ExportSpy:
     def __init__(self) -> None:
         self.calls: list[UUID] = []
+        self.discarded: list[LabJobZipExportReceipt] = []
 
     def export(self, job_id: UUID) -> LabJobZipExportReceipt:
         self.calls.append(job_id)
@@ -195,6 +196,9 @@ class _ExportSpy:
             byte_size=10,
             sha256="5" * 64,
         )
+
+    def discard(self, receipt: LabJobZipExportReceipt) -> None:
+        self.discarded.append(receipt)
 
 
 def _controller() -> tuple[Any, _ReaderSpy, _CommandFacadeSpy, _PreviewSpy, _ExportSpy]:
@@ -427,6 +431,7 @@ def test_preview_and_export_accept_only_job_identity_and_bounded_table_name() ->
 
     preview_result = controller.preview_artifact(JOB_ID, table_name="trades")
     export_result = controller.export_zip(JOB_ID)
+    controller.discard_zip(export_result)
 
     assert isinstance(preview_result, ArtifactPreview)
     assert isinstance(export_result, LabJobZipExportReceipt)
@@ -441,7 +446,9 @@ def test_preview_and_export_accept_only_job_identity_and_bounded_table_name() ->
         )
     ]
     assert exports.calls == [JOB_ID]
+    assert exports.discarded == [export_result]
     assert tuple(signature(controller.export_zip).parameters) == ("job_id",)
+    assert tuple(signature(controller.discard_zip).parameters) == ("receipt",)
     assert tuple(signature(controller.preview_artifact).parameters) == (
         "job_id",
         "table_name",
