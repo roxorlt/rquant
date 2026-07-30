@@ -2,6 +2,7 @@
 
 The module is deliberately standard-library only so the deployment bootstrap can load
 the exact immutable generation copy before importing the rest of :mod:`rquant`.
+Contained acquisitions require inactive ``sys.settrace`` and ``sys.setprofile`` hooks.
 """
 
 from __future__ import annotations
@@ -134,7 +135,12 @@ def _collect_cleanup_error(
     frames: list[_CleanupGroupFrame] = []
 
     def make_scope(
-        group: BaseExceptionGroup, *, node_start: int, work_start: int
+        group: BaseExceptionGroup,
+        *,
+        node_start: int,
+        work_start: int,
+        node_limit: int | None = None,
+        work_limit: int | None = None,
     ) -> _CleanupBudgetScope:
         return _CleanupBudgetScope(
             group=group,
@@ -143,8 +149,14 @@ def _collect_cleanup_error(
             frame_start=len(frames),
             node_start=node_start,
             work_start=work_start,
-            node_limit=max(1, _CLEANUP_GROUP_NODE_BUDGET // 4),
-            work_limit=max(1, _CLEANUP_GROUP_WORK_BUDGET // 4),
+            node_limit=max(
+                1,
+                _CLEANUP_GROUP_NODE_BUDGET // 4 if node_limit is None else node_limit,
+            ),
+            work_limit=max(
+                1,
+                _CLEANUP_GROUP_WORK_BUDGET // 4 if work_limit is None else work_limit,
+            ),
             signatures={},
         )
 
@@ -263,10 +275,18 @@ def _collect_cleanup_error(
         if isinstance(current, BaseExceptionGroup) and (
             (frame is frames[0] and preserve_root_evidence) or len(frame.nested_errors) > 1
         ):
+            node_limit = None
+            work_limit = None
+            if frame is frames[0] and preserve_root_evidence:
+                remaining_siblings = len(frame.nested_errors) - frame.next_index + 1
+                node_limit = (_CLEANUP_GROUP_NODE_BUDGET - (node_count - 1)) // remaining_siblings
+                work_limit = (_CLEANUP_GROUP_WORK_BUDGET - (work_count - 2)) // remaining_siblings
             scope = make_scope(
                 current,
                 node_start=node_count - 1,
                 work_start=work_count - 2,
+                node_limit=node_limit,
+                work_limit=work_limit,
             )
 
         current_id = id(current)
@@ -420,283 +440,9 @@ def _attach_cleanup_error_group(
         pass
 
 
-@dataclass(frozen=True)
-class _ExecutionHooks:
-    trace: object
-    profile: object
-
-
-_ExecutionHookState = tuple[
-    str,
-    Callable[[object], object],
-    Callable[[], object],
-    object,
-]
-
-
-@dataclass
-class _ExecutionHookEvidenceLog:
-    slots: list[BaseException | None]
-    shadow: list[BaseException]
-    count: int = 0
-
-    def contains(self, error: BaseException) -> bool:
-        return any(existing is error for existing in self.slots[: self.count])
-
-    def force(self, error: BaseException) -> None:
-        if self.contains(error):
-            return
-        if self.count >= len(self.slots):
-            return
-        self.slots[self.count] = error
-        self.count += 1
-
-    def record(self, error: BaseException) -> None:
-        if self.contains(error) or self.count >= len(self.slots):
-            return
-        slot = self.count
-        self.slots[slot] = error
-        try:
-            _record_cleanup_error(self.shadow, error)
-        except BaseException as recording_error:
-            self.slots[slot] = recording_error
-            self.count += 1
-            self.force(error)
-        else:
-            self.count += 1
-
-    def values(self) -> tuple[BaseException, ...]:
-        return tuple(
-            error for error in self.slots[: self.count] if isinstance(error, BaseException)
-        )
-
-
-class _ExecutionHookHandoff(BaseException):
-    pass
-
-
-@dataclass
-class _ExecutionHookRestorationState:
-    hooks: _ExecutionHooks
-    primary_exception: BaseException | None
-    error_label: str
-    hook_orders: tuple[tuple[_ExecutionHookState, ...], ...]
-    restored: dict[str, bool]
-    evidence: _ExecutionHookEvidenceLog
-    handoff: _ExecutionHookHandoff
-    attempt: int = 0
-
-    def authority(self) -> BaseException | None:
-        if self.primary_exception is not None:
-            return self.primary_exception
-        evidence = self.evidence.values()
-        return evidence[0] if evidence else None
-
-
-def _restore_execution_hook_bounded(
-    setter: Callable[[object], object],
-    getter: Callable[[], object],
-    expected: object,
-    errors: list[BaseException],
-    *,
-    label: str,
-) -> bool:
-    _ = errors, label
-    if getter() is expected:
-        return True
-    setter(expected)
-    return getter() is expected
-
-
-def _capture_execution_hook_error(
-    state: _ExecutionHookRestorationState,
-    error: BaseException,
-) -> None:
-    try:
-        state.evidence.record(error)
-    except BaseException as capture_error:
-        state.evidence.force(capture_error)
-        state.evidence.force(error)
-
-
-def _restore_execution_hooks(
-    state: _ExecutionHookRestorationState,
-    attempt: int,
-) -> None:
-    ordered_states = state.hook_orders[attempt]
-    for label, setter, getter, expected in ordered_states:
-        try:
-            state.restored[label] = _restore_execution_hook_bounded(
-                setter,
-                getter,
-                expected,
-                state.evidence.shadow,
-                label=label,
-            )
-        except BaseException as exc:
-            state.restored[label] = False
-            _capture_execution_hook_error(state, exc)
-    for label, _setter, getter, expected in state.hook_orders[0]:
-        try:
-            state.restored[label] = getter() is expected
-        except BaseException as exc:
-            state.restored[label] = False
-            _capture_execution_hook_error(state, exc)
-
-
-def _restore_execution_hooks_bounded(
-    state: _ExecutionHookRestorationState,
-    attempt: int,
-) -> None:
-    _restore_execution_hooks(state, attempt)
-    for label, _setter, getter, expected in state.hook_orders[0]:
-        try:
-            state.restored[label] = getter() is expected
-        except BaseException as exc:
-            state.restored[label] = False
-            _capture_execution_hook_error(state, exc)
-
-
-def _new_execution_hook_restoration_state(
-    hooks: _ExecutionHooks,
-    *,
-    primary_exception: BaseException | None,
-    error_label: str,
-) -> _ExecutionHookRestorationState:
-    hook_states: tuple[_ExecutionHookState, ...] = (
-        ("profile", sys.setprofile, sys.getprofile, hooks.profile),
-        ("trace", sys.settrace, sys.gettrace, hooks.trace),
-    )
-    return _ExecutionHookRestorationState(
-        hooks=hooks,
-        primary_exception=primary_exception,
-        error_label=error_label,
-        hook_orders=(hook_states, (hook_states[1], hook_states[0]), hook_states),
-        restored={"profile": False, "trace": False},
-        evidence=_ExecutionHookEvidenceLog([None] * 128, []),
-        handoff=_ExecutionHookHandoff(),
-    )
-
-
-def _attach_execution_hook_evidence(state: _ExecutionHookRestorationState) -> None:
-    authority = state.authority()
-    if authority is None:
-        return
-    evidence = tuple(error for error in state.evidence.values() if error is not authority)
-    _attach_cleanup_error_group(
-        authority,
-        evidence,
-        error_label=state.error_label,
-        note="execution hook restoration also failed",
-    )
-
-
-def _execution_hook_handoff_attempt(state: _ExecutionHookRestorationState) -> object:
-    _restore_execution_hooks_bounded(state, state.attempt)
-    if not state.restored["profile"] or not state.restored["trace"]:
-        return _EXECUTION_HOOK_RETRY
-    authority = state.authority()
-    if authority is None:
-        return _EXECUTION_HOOK_DONE
-    _attach_execution_hook_evidence(state)
-    raise state.handoff
-
-
-_EXECUTION_HOOK_RETRY = object()
-_EXECUTION_HOOK_DONE = object()
-
-
-def _verify_execution_hooks_for_handoff(state: _ExecutionHookRestorationState) -> None:
-    for label, _setter, getter, expected in state.hook_orders[0]:
-        try:
-            state.restored[label] = getter() is expected
-        except BaseException as exc:
-            state.restored[label] = False
-            _capture_execution_hook_error(state, exc)
-
-
-def _finish_failed_execution_hook_handoff(
-    state: _ExecutionHookRestorationState,
-) -> NoReturn:
-    _verify_execution_hooks_for_handoff(state)
-    for label in ("profile", "trace"):
-        if not state.restored[label]:
-            _capture_execution_hook_error(
-                state,
-                ContainedProcessError(f"{label} execution hook restoration could not be verified"),
-            )
-    authority = state.authority()
-    assert authority is not None
-    for _attempt in range(_SIGNAL_STATE_ATTEMPTS):
-        try:
-            _attach_execution_hook_evidence(state)
-            break
-        except BaseException as exc:
-            _capture_execution_hook_error(state, exc)
-    raise authority
-
-
-def _suspend_execution_hooks() -> _ExecutionHooks:
-    hooks = _ExecutionHooks(sys.gettrace(), sys.getprofile())
-    try:
-        sys.settrace(None)
-        if sys.gettrace() is not None:
-            raise ContainedProcessError("trace execution hook suspension could not be verified")
-        sys.setprofile(None)
-        if sys.getprofile() is not None:
-            raise ContainedProcessError("profile execution hook suspension could not be verified")
-    except BaseException as primary_exception:
-        _finish_execution_hook_restoration(
-            hooks,
-            primary_exception=primary_exception,
-            error_label="execution hook suspension recovery failures",
-        )
-    return hooks
-
-
-def _finish_execution_hook_restoration(
-    hooks: _ExecutionHooks,
-    *,
-    primary_exception: BaseException | None,
-    error_label: str,
-    _state: _ExecutionHookRestorationState | None = None,
-) -> None:
-    if _state is not None:
-        result = _execution_hook_handoff_attempt(_state)
-        if result is _EXECUTION_HOOK_RETRY:
-            return
-        if result is _EXECUTION_HOOK_DONE:
-            return
-        raise AssertionError("unreachable execution hook handoff result")
-
-    state = _new_execution_hook_restoration_state(
-        hooks,
-        primary_exception=primary_exception,
-        error_label=error_label,
-    )
-    for attempt in range(_SIGNAL_STATE_ATTEMPTS):
-        state.attempt = attempt
-        try:
-            _finish_execution_hook_restoration(
-                hooks,
-                primary_exception=primary_exception,
-                error_label=error_label,
-                _state=state,
-            )
-        except BaseException as exc:
-            if exc is state.handoff:
-                authority = state.authority()
-                assert authority is not None
-                raise authority from None
-            _capture_execution_hook_error(state, exc)
-            state.restored["profile"] = False
-            state.restored["trace"] = False
-            continue
-        if state.restored["profile"] and state.restored["trace"]:
-            authority = state.authority()
-            if authority is None:
-                return
-    _finish_failed_execution_hook_handoff(state)
+def _require_no_execution_hooks() -> None:
+    if sys.gettrace() is not None or sys.getprofile() is not None:
+        raise ContainedProcessError("contained acquisition does not support active execution hooks")
 
 
 def _terminate_unsafe_signal_state(
@@ -1847,24 +1593,11 @@ class _DarwinKqueueProcessTracker:
             raise self._construction_error
         if self._queue is not None:
             return
-        hooks = _suspend_execution_hooks()
-        queue: object | None = None
-        acquisition_error: BaseException | None = None
+        _require_no_execution_hooks()
         try:
             queue = select.kqueue()
             self._queue = queue
             self._owns_queue = True
-        except BaseException as exc:
-            if queue is not None:
-                self._queue = queue
-                self._owns_queue = True
-            acquisition_error = exc
-        try:
-            _finish_execution_hook_restoration(
-                hooks,
-                primary_exception=acquisition_error,
-                error_label="kqueue acquisition hook restoration failures",
-            )
         except BaseException as exc:
             self._construction_error = exc
             raise
@@ -2033,27 +1766,23 @@ class _LinuxSubreaperProcessTracker:
             self._subreaper_changed = True
 
     def _bind_pid(self, identity: ProcessIdentity) -> None:
+        needs_pidfd = identity.pid not in self._pidfds and hasattr(os, "pidfd_open")
+        if needs_pidfd:
+            _require_no_execution_hooks()
         prior = self._known.get(identity.pid)
         if prior is not None and prior != identity:
             raise ContainedProcessError("kernel tracker observed PID identity reuse")
         self._known[identity.pid] = identity
-        if identity.pid not in self._pidfds and hasattr(os, "pidfd_open"):
+        if needs_pidfd:
             descriptor = -1
             try:
-                hooks = _suspend_execution_hooks()
-                acquisition_error: BaseException | None = None
                 try:
                     descriptor = os.pidfd_open(identity.pid, 0)
                     self._pending_pidfds.append(descriptor)
-                except BaseException as exc:
+                except BaseException:
                     if descriptor >= 0 and descriptor not in self._pending_pidfds:
                         self._pending_pidfds.append(descriptor)
-                    acquisition_error = exc
-                _finish_execution_hook_restoration(
-                    hooks,
-                    primary_exception=acquisition_error,
-                    error_label="pidfd acquisition hook restoration failures",
-                )
+                    raise
                 self._pidfds[identity.pid] = descriptor
                 self._pending_pidfds.remove(descriptor)
             except BaseException as primary_exception:
@@ -2633,8 +2362,10 @@ def run_contained(
     prove containment after a descendant reparents and discards inherited evidence.
     Passing ``False`` is therefore a caller guarantee that the command does not
     intentionally daemonize; it is not a stronger Darwin kernel guarantee.
+    Active trace or profile hooks are rejected before containment acquires resources.
     """
 
+    _require_no_execution_hooks()
     remaining = deadline_monotonic - clock()
     if remaining <= 0:
         raise subprocess.TimeoutExpired(list(args), 0)
@@ -2668,9 +2399,11 @@ def run_contained(
         containment_token = secrets.token_hex(32)
         process_environment = dict(os.environ if env is None else env)
         process_environment[_CONTAINMENT_ENVIRONMENT_KEY] = containment_token
+        _require_no_execution_hooks()
         kernel_tracker = kernel_tracker_factory()
         if isinstance(kernel_tracker, _DarwinKqueueProcessTracker):
             kernel_tracker._initialize_queue()
+        _require_no_execution_hooks()
         gate_read, gate_write = os.pipe()
         helper_command = [
             sys.executable,
@@ -2682,6 +2415,7 @@ def run_contained(
             "--",
             *args,
         ]
+        _require_no_execution_hooks()
         process = subprocess.Popen(
             helper_command,
             cwd=cwd,
@@ -2700,20 +2434,14 @@ def run_contained(
             for stream in (process.stdout, process.stderr):
                 anchor = -1
                 try:
-                    hooks = _suspend_execution_hooks()
-                    acquisition_error: BaseException | None = None
+                    _require_no_execution_hooks()
                     try:
                         anchor = os.dup(stream.fileno())
                         darwin_pending_anchor_fds.append(anchor)
-                    except BaseException as exc:
+                    except BaseException:
                         if anchor >= 0 and anchor not in darwin_pending_anchor_fds:
                             darwin_pending_anchor_fds.append(anchor)
-                        acquisition_error = exc
-                    _finish_execution_hook_restoration(
-                        hooks,
-                        primary_exception=acquisition_error,
-                        error_label="anchor acquisition hook restoration failures",
-                    )
+                        raise
                     darwin_pipe_anchor_fds.append(anchor)
                     darwin_pending_anchor_fds.remove(anchor)
                     os.set_inheritable(anchor, False)

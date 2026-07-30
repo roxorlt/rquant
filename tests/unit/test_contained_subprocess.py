@@ -1,11 +1,7 @@
 from __future__ import annotations
 
-import dis
-import errno
-import fcntl
 import inspect
 import os
-import select
 import shutil
 import signal
 import subprocess
@@ -114,90 +110,6 @@ class _NextContainedLineFault:
         return self.trace
 
 
-class _ContainedReturnFault:
-    def __init__(self, names: set[str], error: BaseException) -> None:
-        self._names = names
-        self._error = error
-        self.triggered = False
-
-    def trace(self, frame: object, event: str, _arg: object) -> object:
-        code = getattr(frame, "f_code", None)
-        if (
-            not self.triggered
-            and event == "return"
-            and getattr(code, "co_filename", None) == contained.__file__
-            and getattr(code, "co_name", None) in self._names
-        ):
-            self.triggered = True
-            raise self._error
-        return self.trace
-
-
-class _ContainedCReturnFault:
-    def __init__(self, target: object, error: BaseException) -> None:
-        self._target = target
-        self._error = error
-        self.triggered = False
-
-    def profile(self, frame: object, event: str, arg: object) -> None:
-        if (
-            not self.triggered
-            and event == "c_return"
-            and arg is self._target
-            and getattr(getattr(frame, "f_code", None), "co_filename", None) == contained.__file__
-        ):
-            self.triggered = True
-            raise self._error
-
-
-class _ContainedPostCallOpcodeFault:
-    def __init__(self, code: object, variable: str, error: BaseException) -> None:
-        instructions = tuple(dis.get_instructions(code))
-        self._code = code
-        self._offset = next(
-            current.offset
-            for previous, current in zip(instructions, instructions[1:], strict=False)
-            if previous.opname == "CALL"
-            and current.opname == "STORE_FAST"
-            and current.argval == variable
-        )
-        self._error = error
-        self.triggered = False
-
-    def trace(self, frame: object, event: str, _arg: object) -> object:
-        if getattr(frame, "f_code", None) is self._code:
-            if event == "call":
-                frame.f_trace_opcodes = True  # type: ignore[attr-defined]
-            elif event == "opcode" and getattr(frame, "f_lasti", None) == self._offset:
-                self.triggered = True
-                raise self._error
-        return self.trace
-
-
-def _install_acquisition_fault(
-    kind: str,
-    *,
-    c_target: object,
-    code: object,
-    variable: str,
-    error: BaseException,
-) -> tuple[object, object]:
-    if kind == "c_return":
-        fault = _ContainedCReturnFault(c_target, error)
-        hook = fault.profile
-        sys.setprofile(hook)
-        return fault, hook
-    fault = _ContainedPostCallOpcodeFault(code, variable, error)
-    hook = fault.trace
-    sys.settrace(hook)
-    return fault, hook
-
-
-def _assert_acquisition_hook_restored(kind: str, hook: object) -> None:
-    observed = sys.getprofile() if kind == "c_return" else sys.gettrace()
-    assert observed is hook
-
-
 def _clear_execution_hooks() -> None:
     sys.settrace(None)
     sys.setprofile(None)
@@ -230,15 +142,20 @@ def _open_file_descriptors() -> set[int]:
 
 @pytest.mark.parametrize(
     ("use_trace", "use_profile"),
-    ((False, False), (True, False), (False, True), (True, True)),
-    ids=("none", "trace", "profile", "both"),
+    ((True, False), (False, True), (True, True)),
+    ids=("trace", "profile", "both"),
 )
-def test_execution_hook_round_trip_restores_real_hook_identity(
+def test_active_execution_hooks_fail_before_contained_acquisition(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
     use_trace: bool,
     use_profile: bool,
 ) -> None:
     original_trace = sys.gettrace()
     original_profile = sys.getprofile()
+    calls = {"signal_latch": 0, "tracker": 0, "pipe": 0, "popen": 0}
+    before_fds = _open_file_descriptors()
+    real_install_signal_latch = contained._install_signal_latch
 
     def trace_hook(_frame: object, _event: str, _arg: object) -> object:
         return trace_hook
@@ -246,30 +163,62 @@ def test_execution_hook_round_trip_restores_real_hook_identity(
     def profile_hook(_frame: object, _event: str, _arg: object) -> None:
         return None
 
-    expected_trace = trace_hook if use_trace else None
-    expected_profile = profile_hook if use_profile else None
+    def install_signal_latch(
+        latch: contained._ContainedSignalLatch,
+    ) -> tuple[dict[int, object], frozenset[int]]:
+        calls["signal_latch"] += 1
+        return real_install_signal_latch(latch)
+
+    def create_tracker() -> contained._KernelProcessTracker:
+        calls["tracker"] += 1
+        raise AssertionError("tracker acquisition must not run")
+
+    def create_pipe() -> tuple[int, int]:
+        calls["pipe"] += 1
+        raise AssertionError("pipe acquisition must not run")
+
+    def create_process(*_args: object, **_kwargs: object) -> object:
+        calls["popen"] += 1
+        raise AssertionError("process acquisition must not run")
+
+    monkeypatch.setattr(contained, "_install_signal_latch", install_signal_latch)
+    monkeypatch.setattr(contained.os, "pipe", create_pipe)
+    monkeypatch.setattr(contained.subprocess, "Popen", create_process)
     try:
-        sys.settrace(expected_trace)
-        sys.setprofile(expected_profile)
+        sys.settrace(trace_hook if use_trace else None)
+        sys.setprofile(profile_hook if use_profile else None)
 
-        outer_hooks = contained._suspend_execution_hooks()
-        assert sys.gettrace() is None
-        assert sys.getprofile() is None
-        contained._finish_execution_hook_restoration(
-            outer_hooks,
-            primary_exception=None,
-            error_label="test hook restoration failures",
-        )
+        with pytest.raises(
+            contained.ContainedProcessError,
+            match="contained acquisition does not support active execution hooks",
+        ):
+            contained.run_contained(
+                [sys.executable, "-c", "pass"],
+                cwd=tmp_path,
+                deadline_monotonic=time.monotonic() + 1,
+                kernel_tracker_factory=create_tracker,
+                may_spawn_background_descendants=False,
+            )
 
-        assert sys.gettrace() is expected_trace
-        assert sys.getprofile() is expected_profile
+        assert sys.gettrace() is (trace_hook if use_trace else None)
+        assert sys.getprofile() is (profile_hook if use_profile else None)
+        assert calls == {"signal_latch": 0, "tracker": 0, "pipe": 0, "popen": 0}
+        assert _open_file_descriptors() == before_fds
+        assert not tuple(tmp_path.glob("*.building"))
     finally:
         _restore_execution_hooks_for_test(original_trace, original_profile)
 
 
-def test_nested_execution_hook_round_trip_restores_outer_real_hooks() -> None:
+@pytest.mark.parametrize("hook_kind", ("trace", "profile"))
+def test_active_execution_hook_blocks_pidfd_before_open(
+    monkeypatch: pytest.MonkeyPatch,
+    hook_kind: str,
+) -> None:
     original_trace = sys.gettrace()
     original_profile = sys.getprofile()
+    tracker = contained._LinuxSubreaperProcessTracker()
+    calls = 0
+    before_fds = _open_file_descriptors()
 
     def trace_hook(_frame: object, _event: str, _arg: object) -> object:
         return trace_hook
@@ -277,744 +226,82 @@ def test_nested_execution_hook_round_trip_restores_outer_real_hooks() -> None:
     def profile_hook(_frame: object, _event: str, _arg: object) -> None:
         return None
 
+    def open_pidfd(_pid: int, _flags: int) -> int:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("pidfd acquisition must not run")
+
+    monkeypatch.setattr(contained.os, "pidfd_open", open_pidfd, raising=False)
     try:
-        sys.settrace(trace_hook)
-        sys.setprofile(profile_hook)
+        sys.settrace(trace_hook if hook_kind == "trace" else None)
+        sys.setprofile(profile_hook if hook_kind == "profile" else None)
 
-        outer_hooks = contained._suspend_execution_hooks()
-        inner_hooks = contained._suspend_execution_hooks()
-        contained._finish_execution_hook_restoration(
-            inner_hooks,
-            primary_exception=None,
-            error_label="inner test hook restoration failures",
-        )
-        assert sys.gettrace() is None
-        assert sys.getprofile() is None
+        with pytest.raises(
+            contained.ContainedProcessError,
+            match="contained acquisition does not support active execution hooks",
+        ):
+            tracker._bind_pid(contained.ProcessIdentity(101, (1, 0)))
 
-        contained._finish_execution_hook_restoration(
-            outer_hooks,
-            primary_exception=None,
-            error_label="outer test hook restoration failures",
-        )
-        assert sys.gettrace() is trace_hook
-        assert sys.getprofile() is profile_hook
+        assert calls == 0
+        assert sys.gettrace() is (trace_hook if hook_kind == "trace" else None)
+        assert sys.getprofile() is (profile_hook if hook_kind == "profile" else None)
+        assert tracker._pidfds == {}
+        assert tracker._pending_pidfds == []
+        assert _open_file_descriptors() == before_fds
     finally:
         _restore_execution_hooks_for_test(original_trace, original_profile)
 
 
-@pytest.mark.skipif(not hasattr(select, "kqueue"), reason="real kqueue hook restoration contract")
-def test_real_profile_callback_failure_does_not_skip_trace_restoration(
+@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin kqueue hook contract")
+def test_kqueue_acquisition_accepts_no_execution_hooks_and_rejects_both(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     original_trace = sys.gettrace()
     original_profile = sys.getprofile()
-    tracker = contained._DarwinKqueueProcessTracker()
-    queue = select.kqueue()
-    queue_fd = queue.fileno()
-    callback_failure = RuntimeError("profile callback interrupted trace restoration")
-    triggered = False
+    acquired: list[object] = []
+
+    class Queue:
+        def close(self) -> None:
+            return None
+
+    def acquire_queue() -> object:
+        queue = Queue()
+        acquired.append(queue)
+        return queue
 
     def trace_hook(_frame: object, _event: str, _arg: object) -> object:
         return trace_hook
 
-    def profile_hook(frame: object, event: str, _arg: object) -> None:
-        nonlocal triggered
-        if (
-            not triggered
-            and event == "call"
-            and getattr(frame, "f_code", None) is contained._restore_execution_hook_bounded.__code__
-            and getattr(frame, "f_locals", {}).get("label") == "trace"
-        ):
-            triggered = True
-            raise callback_failure
+    def profile_hook(_frame: object, _event: str, _arg: object) -> None:
+        return None
 
-    monkeypatch.setattr(contained.select, "kqueue", lambda: queue)
+    monkeypatch.setattr(contained.select, "kqueue", acquire_queue)
+    first = contained._DarwinKqueueProcessTracker()
+    blocked = contained._DarwinKqueueProcessTracker()
     try:
+        _clear_execution_hooks()
+        first._initialize_queue()
+        assert acquired == [first._queue]
+
         sys.settrace(trace_hook)
         sys.setprofile(profile_hook)
+        with pytest.raises(
+            contained.ContainedProcessError,
+            match="contained acquisition does not support active execution hooks",
+        ):
+            blocked._initialize_queue()
 
-        with pytest.raises(RuntimeError) as caught:
-            tracker._initialize_queue()
-
-        assert caught.value is callback_failure
-        assert triggered
+        assert acquired == [first._queue]
         assert sys.gettrace() is trace_hook
         assert sys.getprofile() is profile_hook
-        _clear_execution_hooks()
-        tracker.close()
-        with pytest.raises(OSError) as closed:
-            os.fstat(queue_fd)
-        assert closed.value.errno == errno.EBADF
+        assert blocked._queue is None
+        assert not blocked._owns_queue
     finally:
         _clear_execution_hooks()
         with contained.suppress(BaseException):
-            tracker.close()
-        _close_test_fd_if_open(queue_fd)
-        _restore_execution_hooks_for_test(original_trace, original_profile)
-
-
-def test_real_profile_callback_failure_preserves_other_hook_and_cleanup() -> None:
-    original_trace = sys.gettrace()
-    original_profile = sys.getprofile()
-    read_fd, write_fd = os.pipe()
-    acquired_fd = -1
-    primary = RuntimeError("existing acquisition primary")
-    callback_failure = RuntimeError("profile callback persistently rejected verification")
-    armed = False
-
-    def trace_hook(_frame: object, _event: str, _arg: object) -> object:
-        return trace_hook
-
-    def profile_hook(frame: object, event: str, arg: object) -> None:
-        if (
-            armed
-            and event == "c_call"
-            and arg is sys.gettrace
-            and getattr(getattr(frame, "f_code", None), "co_filename", None) == contained.__file__
-        ):
-            raise callback_failure
-
-    try:
-        sys.settrace(trace_hook)
-        sys.setprofile(profile_hook)
-        hooks = contained._suspend_execution_hooks()
-        armed = True
-        acquired_fd = os.dup(read_fd)
-
-        with pytest.raises(RuntimeError) as caught:
-            try:
-                contained._finish_execution_hook_restoration(
-                    hooks,
-                    primary_exception=primary,
-                    error_label="test acquisition hook restoration failures",
-                )
-            finally:
-                os.close(acquired_fd)
-
-        assert caught.value is primary
-        assert sys.gettrace() is trace_hook
-        assert sys.getprofile() is None
-        cleanup_group = getattr(caught.value, "cleanup_error_group", None)
-        assert isinstance(cleanup_group, BaseExceptionGroup)
-        assert cleanup_group.exceptions[0] is callback_failure
-        assert any("profile execution hook" in str(error) for error in cleanup_group.exceptions[1:])
-        with pytest.raises(OSError) as closed:
-            os.fstat(acquired_fd)
-        assert closed.value.errno == errno.EBADF
-    finally:
-        _clear_execution_hooks()
-        _close_test_fd_if_open(acquired_fd)
-        _close_test_fd_if_open(read_fd)
-        _close_test_fd_if_open(write_fd)
-        _restore_execution_hooks_for_test(original_trace, original_profile)
-
-
-@pytest.mark.skipif(not hasattr(select, "kqueue"), reason="real kqueue hook restoration contract")
-def test_hook_error_recording_boundary_retries_both_real_hooks(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    original_trace = sys.gettrace()
-    original_profile = sys.getprofile()
-    queue = select.kqueue()
-    queue_fd = queue.fileno()
-    tracker = contained._DarwinKqueueProcessTracker()
-    getter_failure = OSError("profile getter boundary failed")
-    recording_failure = RuntimeError("hook error recording boundary failed")
-    getter_failed = False
-    recording_failed = False
-
-    counting_queue = _CountingQueue(queue_fd, queue.close)
-
-    def trace_hook(frame: object, event: str, _arg: object) -> object:
-        nonlocal recording_failed
-        if (
-            getter_failed
-            and not recording_failed
-            and event == "call"
-            and getattr(frame, "f_code", None) is contained._record_cleanup_error.__code__
-        ):
-            recording_failed = True
-            raise recording_failure
-        return trace_hook
-
-    def profile_hook(frame: object, event: str, arg: object) -> None:
-        nonlocal getter_failed
-        if (
-            not getter_failed
-            and event == "c_call"
-            and arg is sys.getprofile
-            and getattr(frame, "f_code", None) is contained._restore_execution_hooks.__code__
-        ):
-            getter_failed = True
-            raise getter_failure
-
-    monkeypatch.setattr(contained.select, "kqueue", lambda: counting_queue)
-    try:
-        sys.settrace(trace_hook)
-        sys.setprofile(profile_hook)
-
-        with pytest.raises(RuntimeError) as caught:
-            tracker._initialize_queue()
-
-        assert caught.value is recording_failure
-        assert getter_failed
-        assert recording_failed
-        assert sys.gettrace() is trace_hook
-        assert sys.getprofile() is profile_hook
-
-        tracker.close()
-        assert counting_queue.close_count == 1
-        with pytest.raises(OSError) as closed:
-            os.fstat(queue_fd)
-        assert closed.value.errno == errno.EBADF
-    finally:
-        _clear_execution_hooks()
+            first.close()
         with contained.suppress(BaseException):
-            tracker.close()
-        _close_test_fd_if_open(queue_fd)
-        _restore_execution_hooks_for_test(original_trace, original_profile)
-
-
-@pytest.mark.skipif(not hasattr(select, "kqueue"), reason="real kqueue hook restoration contract")
-def test_hook_driver_return_boundary_gets_another_bounded_attempt(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    original_trace = sys.gettrace()
-    original_profile = sys.getprofile()
-    queue = select.kqueue()
-    queue_fd = queue.fileno()
-    tracker = contained._DarwinKqueueProcessTracker()
-    boundary_failure = RuntimeError("hook driver return boundary failed")
-    failed = False
-
-    counting_queue = _CountingQueue(queue_fd, queue.close)
-
-    def trace_hook(_frame: object, _event: str, _arg: object) -> object:
-        return trace_hook
-
-    def profile_hook(frame: object, event: str, _arg: object) -> None:
-        nonlocal failed
-        if (
-            not failed
-            and event == "return"
-            and getattr(frame, "f_code", None) is contained._restore_execution_hooks.__code__
-        ):
-            failed = True
-            raise boundary_failure
-
-    monkeypatch.setattr(contained.select, "kqueue", lambda: counting_queue)
-    try:
-        sys.settrace(trace_hook)
-        sys.setprofile(profile_hook)
-
-        with pytest.raises(RuntimeError) as caught:
-            tracker._initialize_queue()
-
-        assert caught.value is boundary_failure
-        assert failed
-        assert sys.gettrace() is trace_hook
-        assert sys.getprofile() is profile_hook
-
-        tracker.close()
-        assert counting_queue.close_count == 1
-        with pytest.raises(OSError) as closed:
-            os.fstat(queue_fd)
-        assert closed.value.errno == errno.EBADF
-    finally:
-        _clear_execution_hooks()
-        with contained.suppress(BaseException):
-            tracker.close()
-        _close_test_fd_if_open(queue_fd)
-        _restore_execution_hooks_for_test(original_trace, original_profile)
-
-
-@pytest.mark.skipif(not hasattr(select, "kqueue"), reason="real kqueue hook restoration contract")
-@pytest.mark.parametrize("profile_event", ("c_call", "c_return"))
-def test_hook_final_validation_boundary_gets_another_bounded_attempt(
-    monkeypatch: pytest.MonkeyPatch,
-    profile_event: str,
-) -> None:
-    original_trace = sys.gettrace()
-    original_profile = sys.getprofile()
-    queue = select.kqueue()
-    queue_fd = queue.fileno()
-    tracker = contained._DarwinKqueueProcessTracker()
-    boundary_failure = RuntimeError("hook final validation boundary failed")
-    failed = False
-
-    counting_queue = _CountingQueue(queue_fd, queue.close)
-
-    def trace_hook(_frame: object, _event: str, _arg: object) -> object:
-        return trace_hook
-
-    def profile_hook(frame: object, event: str, arg: object) -> None:
-        nonlocal failed
-        if (
-            not failed
-            and event == profile_event
-            and arg is sys.getprofile
-            and getattr(frame, "f_code", None)
-            is contained._restore_execution_hooks_bounded.__code__
-        ):
-            failed = True
-            raise boundary_failure
-
-    monkeypatch.setattr(contained.select, "kqueue", lambda: counting_queue)
-    try:
-        sys.settrace(trace_hook)
-        sys.setprofile(profile_hook)
-
-        with pytest.raises(RuntimeError) as caught:
-            tracker._initialize_queue()
-
-        assert caught.value is boundary_failure
-        assert failed
-        assert sys.gettrace() is trace_hook
-        assert sys.getprofile() is profile_hook
-
-        tracker.close()
-        assert counting_queue.close_count == 1
-        with pytest.raises(OSError) as closed:
-            os.fstat(queue_fd)
-        assert closed.value.errno == errno.EBADF
-    finally:
-        _clear_execution_hooks()
-        with contained.suppress(BaseException):
-            tracker.close()
-        _close_test_fd_if_open(queue_fd)
-        _restore_execution_hooks_for_test(original_trace, original_profile)
-
-
-@pytest.mark.skipif(not hasattr(select, "kqueue"), reason="real kqueue hook restoration contract")
-@pytest.mark.parametrize("trace_event", ("call", "return", "opcode"))
-def test_hook_error_capture_boundaries_preserve_both_exact_errors(
-    monkeypatch: pytest.MonkeyPatch,
-    trace_event: str,
-) -> None:
-    original_trace = sys.gettrace()
-    original_profile = sys.getprofile()
-    queue = select.kqueue()
-    queue_fd = queue.fileno()
-    tracker = contained._DarwinKqueueProcessTracker()
-    getter_failure = OSError(f"profile getter before trace {trace_event}")
-    trace_failure = RuntimeError(f"trace {trace_event} capture boundary failed")
-    getter_failed = False
-    trace_failed = False
-    monitoring_tool_id: int | None = None
-
-    counting_queue = _CountingQueue(queue_fd, queue.close)
-
-    def trace_hook(frame: object, event: str, _arg: object) -> object:
-        nonlocal trace_failed
-        if (
-            getter_failed
-            and getattr(frame, "f_code", None) is contained._restore_execution_hook_bounded.__code__
-            and frame.f_locals.get("label") == "trace"  # type: ignore[attr-defined]
-            and not trace_failed
-            and event == trace_event
-        ):
-            trace_failed = True
-            raise trace_failure
-        return trace_hook
-
-    def instruction_hook(code: object, _offset: int) -> None:
-        nonlocal trace_failed
-        if (
-            not trace_failed
-            and code is contained._restore_execution_hook_bounded.__code__
-            and sys._getframe(1).f_locals.get("label") == "trace"
-        ):
-            trace_failed = True
-            raise trace_failure
-
-    def profile_hook(frame: object, event: str, arg: object) -> None:
-        nonlocal getter_failed
-        if (
-            not getter_failed
-            and event == "c_call"
-            and arg is sys.getprofile
-            and getattr(frame, "f_code", None) is contained._restore_execution_hooks.__code__
-        ):
-            getter_failed = True
-            raise getter_failure
-
-    monkeypatch.setattr(contained.select, "kqueue", lambda: counting_queue)
-    try:
-        if trace_event == "opcode":
-            monitoring_tool_id = sys.monitoring.OPTIMIZER_ID
-            sys.monitoring.use_tool_id(monitoring_tool_id, "rquant hook restoration test")
-            sys.monitoring.register_callback(
-                monitoring_tool_id,
-                sys.monitoring.events.INSTRUCTION,
-                instruction_hook,
-            )
-            sys.monitoring.set_local_events(
-                monitoring_tool_id,
-                contained._restore_execution_hook_bounded.__code__,
-                sys.monitoring.events.INSTRUCTION,
-            )
-        sys.settrace(trace_hook)
-        sys.setprofile(profile_hook)
-
-        with pytest.raises((OSError, RuntimeError)) as caught:
-            tracker._initialize_queue()
-
-        cleanup_group = getattr(caught.value, "cleanup_error_group", None)
-        observed = (caught.value,)
-        if isinstance(cleanup_group, BaseExceptionGroup):
-            observed = (*observed, *cleanup_group.exceptions)
-        assert any(error is getter_failure for error in observed)
-        assert any(error is trace_failure for error in observed)
-        assert getter_failed
-        assert trace_failed
-        assert sys.gettrace() is trace_hook
-        assert sys.getprofile() is profile_hook
-
-        tracker.close()
-        assert counting_queue.close_count == 1
-        with pytest.raises(OSError) as closed:
-            os.fstat(queue_fd)
-        assert closed.value.errno == errno.EBADF
-    finally:
-        _clear_execution_hooks()
-        if monitoring_tool_id is not None:
-            sys.monitoring.set_local_events(
-                monitoring_tool_id,
-                contained._restore_execution_hook_bounded.__code__,
-                0,
-            )
-            sys.monitoring.register_callback(
-                monitoring_tool_id,
-                sys.monitoring.events.INSTRUCTION,
-                None,
-            )
-            sys.monitoring.free_tool_id(monitoring_tool_id)
-        with contained.suppress(BaseException):
-            tracker.close()
-        _close_test_fd_if_open(queue_fd)
-        _restore_execution_hooks_for_test(original_trace, original_profile)
-
-
-@pytest.mark.skipif(
-    not hasattr(select, "kqueue") or not hasattr(signal, "SIGUSR1"),
-    reason="real kqueue and asynchronous signal hook restoration contract",
-)
-def test_real_signal_during_hook_restoration_keeps_both_hook_identities(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    original_trace = sys.gettrace()
-    original_profile = sys.getprofile()
-    previous_handler = signal.getsignal(signal.SIGUSR1)
-    tracker = contained._DarwinKqueueProcessTracker()
-    queue = select.kqueue()
-    queue_fd = queue.fileno()
-    signal_failure = InterruptedError("signal interrupted hook restoration")
-    sent = False
-
-    def trace_hook(_frame: object, _event: str, _arg: object) -> object:
-        return trace_hook
-
-    def signal_handler(_signum: int, _frame: object) -> None:
-        raise signal_failure
-
-    def profile_hook(frame: object, event: str, _arg: object) -> None:
-        nonlocal sent
-        if (
-            not sent
-            and event == "call"
-            and getattr(frame, "f_code", None) is contained._restore_execution_hook_bounded.__code__
-            and getattr(frame, "f_locals", {}).get("label") == "trace"
-        ):
-            sent = True
-            os.kill(os.getpid(), signal.SIGUSR1)
-
-    monkeypatch.setattr(contained.select, "kqueue", lambda: queue)
-    signal.signal(signal.SIGUSR1, signal_handler)
-    try:
-        sys.settrace(trace_hook)
-        sys.setprofile(profile_hook)
-
-        with pytest.raises(InterruptedError) as caught:
-            tracker._initialize_queue()
-
-        assert caught.value is signal_failure
-        assert sent
-        assert sys.gettrace() is trace_hook
-        assert sys.getprofile() is profile_hook
-        _clear_execution_hooks()
-        tracker.close()
-        with pytest.raises(OSError) as closed:
-            os.fstat(queue_fd)
-        assert closed.value.errno == errno.EBADF
-    finally:
-        _clear_execution_hooks()
-        signal.signal(signal.SIGUSR1, previous_handler)
-        with contained.suppress(BaseException):
-            tracker.close()
-        _close_test_fd_if_open(queue_fd)
-        _restore_execution_hooks_for_test(original_trace, original_profile)
-
-
-@pytest.mark.skipif(not hasattr(select, "kqueue"), reason="real kqueue hook handoff contract")
-def test_hook_bounded_return_boundary_retries_through_primary_handoff() -> None:
-    original_trace = sys.gettrace()
-    original_profile = sys.getprofile()
-    queue = select.kqueue()
-    queue_fd = queue.fileno()
-    tracker = contained._DarwinKqueueProcessTracker()
-    counting_queue = _CountingQueue(queue_fd, queue.close)
-    tracker._queue = counting_queue
-    tracker._owns_queue = True
-    boundary_failure = RuntimeError("bounded restoration return failed")
-    failed = False
-
-    def trace_hook(_frame: object, _event: str, _arg: object) -> object:
-        return trace_hook
-
-    def profile_hook(frame: object, event: str, _arg: object) -> None:
-        nonlocal failed
-        if (
-            not failed
-            and event == "return"
-            and getattr(frame, "f_code", None)
-            is contained._restore_execution_hooks_bounded.__code__
-        ):
-            failed = True
-            raise boundary_failure
-
-    try:
-        sys.settrace(trace_hook)
-        sys.setprofile(profile_hook)
-        hooks = contained._suspend_execution_hooks()
-
-        with pytest.raises(RuntimeError) as caught:
-            try:
-                contained._finish_execution_hook_restoration(
-                    hooks,
-                    primary_exception=None,
-                    error_label="bounded return handoff failures",
-                )
-            finally:
-                tracker.close()
-
-        assert caught.value is boundary_failure
-        assert failed
-        assert sys.gettrace() is trace_hook
-        assert sys.getprofile() is profile_hook
-        assert counting_queue.close_count == 1
-        with pytest.raises(OSError) as closed:
-            os.fstat(queue_fd)
-        assert closed.value.errno == errno.EBADF
-    finally:
-        _clear_execution_hooks()
-        with contained.suppress(BaseException):
-            tracker.close()
-        _close_test_fd_if_open(queue_fd)
-        _restore_execution_hooks_for_test(original_trace, original_profile)
-
-
-@pytest.mark.skipif(not hasattr(select, "kqueue"), reason="real kqueue hook handoff contract")
-@pytest.mark.parametrize(
-    "boundary_name",
-    ("_record_cleanup_error", "_attach_cleanup_error_group"),
-    ids=("record", "attach"),
-)
-def test_hook_cleanup_boundary_cannot_replace_existing_primary(
-    boundary_name: str,
-) -> None:
-    original_trace = sys.gettrace()
-    original_profile = sys.getprofile()
-    queue = select.kqueue()
-    queue_fd = queue.fileno()
-    tracker = contained._DarwinKqueueProcessTracker()
-    counting_queue = _CountingQueue(queue_fd, queue.close)
-    tracker._queue = counting_queue
-    tracker._owns_queue = True
-    primary = RuntimeError(f"existing primary before {boundary_name}")
-    restoration_failure = OSError(f"restoration failed before {boundary_name}")
-    boundary_failure = LookupError(f"{boundary_name} callback failed")
-    restoration_failed = False
-    boundary_failed = False
-    boundary_code = getattr(contained, boundary_name).__code__
-
-    def trace_hook(frame: object, event: str, _arg: object) -> object:
-        nonlocal boundary_failed
-        if (
-            restoration_failed
-            and not boundary_failed
-            and event == "call"
-            and getattr(frame, "f_code", None) is boundary_code
-        ):
-            boundary_failed = True
-            raise boundary_failure
-        return trace_hook
-
-    def profile_hook(frame: object, event: str, _arg: object) -> None:
-        nonlocal restoration_failed
-        if (
-            not restoration_failed
-            and event == "return"
-            and getattr(frame, "f_code", None)
-            is contained._restore_execution_hooks_bounded.__code__
-        ):
-            restoration_failed = True
-            raise restoration_failure
-
-    try:
-        sys.settrace(trace_hook)
-        sys.setprofile(profile_hook)
-        hooks = contained._suspend_execution_hooks()
-
-        with pytest.raises(RuntimeError) as caught:
-            try:
-                contained._finish_execution_hook_restoration(
-                    hooks,
-                    primary_exception=primary,
-                    error_label="protected cleanup handoff failures",
-                )
-            finally:
-                tracker.close()
-
-        assert caught.value is primary
-        assert restoration_failed
-        assert boundary_failed
-        assert sys.gettrace() is trace_hook
-        assert sys.getprofile() is profile_hook
-        cleanup_group = getattr(primary, "cleanup_error_group", None)
-        assert isinstance(cleanup_group, BaseExceptionGroup)
-        expected_cleanup = (
-            (boundary_failure, restoration_failure)
-            if boundary_name == "_record_cleanup_error"
-            else (restoration_failure, boundary_failure)
-        )
-        assert cleanup_group.exceptions == expected_cleanup
-        assert counting_queue.close_count == 1
-        with pytest.raises(OSError) as closed:
-            os.fstat(queue_fd)
-        assert closed.value.errno == errno.EBADF
-    finally:
-        _clear_execution_hooks()
-        with contained.suppress(BaseException):
-            tracker.close()
-        _close_test_fd_if_open(queue_fd)
-        _restore_execution_hooks_for_test(original_trace, original_profile)
-
-
-@pytest.mark.skipif(not hasattr(select, "kqueue"), reason="real kqueue hook handoff contract")
-def test_primary_raise_boundary_retries_without_losing_exact_primary() -> None:
-    original_trace = sys.gettrace()
-    original_profile = sys.getprofile()
-    queue = select.kqueue()
-    queue_fd = queue.fileno()
-    tracker = contained._DarwinKqueueProcessTracker()
-    counting_queue = _CountingQueue(queue_fd, queue.close)
-    tracker._queue = counting_queue
-    tracker._owns_queue = True
-    primary = RuntimeError("existing primary before raise handoff")
-    handoff_failure = InterruptedError("primary raise callback failed")
-    failed = False
-
-    def trace_hook(_frame: object, _event: str, _arg: object) -> object:
-        return trace_hook
-
-    def profile_hook(frame: object, event: str, _arg: object) -> None:
-        nonlocal failed
-        if (
-            not failed
-            and event == "return"
-            and getattr(frame, "f_code", None)
-            is contained._finish_execution_hook_restoration.__code__
-        ):
-            failed = True
-            raise handoff_failure
-
-    try:
-        sys.settrace(trace_hook)
-        sys.setprofile(profile_hook)
-        hooks = contained._suspend_execution_hooks()
-
-        with pytest.raises(RuntimeError) as caught:
-            try:
-                contained._finish_execution_hook_restoration(
-                    hooks,
-                    primary_exception=primary,
-                    error_label="primary raise handoff failures",
-                )
-            finally:
-                tracker.close()
-
-        assert caught.value is primary
-        assert failed
-        assert sys.gettrace() is trace_hook
-        assert sys.getprofile() is profile_hook
-        cleanup_group = getattr(primary, "cleanup_error_group", None)
-        assert isinstance(cleanup_group, BaseExceptionGroup)
-        assert cleanup_group.exceptions == (handoff_failure,)
-        assert counting_queue.close_count == 1
-    finally:
-        _clear_execution_hooks()
-        with contained.suppress(BaseException):
-            tracker.close()
-        _close_test_fd_if_open(queue_fd)
-        _restore_execution_hooks_for_test(original_trace, original_profile)
-
-
-@pytest.mark.skipif(not hasattr(select, "kqueue"), reason="real kqueue hook handoff contract")
-def test_persistent_primary_raise_callback_fails_bounded_and_preserves_other_hook() -> None:
-    original_trace = sys.gettrace()
-    original_profile = sys.getprofile()
-    queue = select.kqueue()
-    queue_fd = queue.fileno()
-    tracker = contained._DarwinKqueueProcessTracker()
-    counting_queue = _CountingQueue(queue_fd, queue.close)
-    tracker._queue = counting_queue
-    tracker._owns_queue = True
-    primary = RuntimeError("existing primary before persistent raise handoff")
-    handoff_failures: list[InterruptedError] = []
-
-    def trace_hook(_frame: object, _event: str, _arg: object) -> object:
-        return trace_hook
-
-    def profile_hook(frame: object, event: str, _arg: object) -> None:
-        if (
-            event == "return"
-            and getattr(frame, "f_code", None)
-            is contained._finish_execution_hook_restoration.__code__
-        ):
-            failure = InterruptedError(
-                f"persistent primary raise callback {len(handoff_failures) + 1}"
-            )
-            handoff_failures.append(failure)
-            raise failure
-
-    try:
-        sys.settrace(trace_hook)
-        sys.setprofile(profile_hook)
-        hooks = contained._suspend_execution_hooks()
-
-        with pytest.raises(RuntimeError) as caught:
-            try:
-                contained._finish_execution_hook_restoration(
-                    hooks,
-                    primary_exception=primary,
-                    error_label="persistent primary raise handoff failures",
-                )
-            finally:
-                tracker.close()
-
-        assert caught.value is primary
-        assert len(handoff_failures) == contained._SIGNAL_STATE_ATTEMPTS
-        assert sys.gettrace() is trace_hook
-        assert sys.getprofile() is None
-        cleanup_group = getattr(primary, "cleanup_error_group", None)
-        assert isinstance(cleanup_group, BaseExceptionGroup)
-        assert cleanup_group.exceptions[: len(handoff_failures)] == tuple(handoff_failures)
-        assert counting_queue.close_count == 1
-    finally:
-        _clear_execution_hooks()
-        with contained.suppress(BaseException):
-            tracker.close()
-        _close_test_fd_if_open(queue_fd)
+            blocked.close()
         _restore_execution_hooks_for_test(original_trace, original_profile)
 
 
@@ -1404,6 +691,45 @@ def test_cleanup_default_budget_preserves_each_exhausted_branch_and_later_eviden
     assert cleanup_group.exceptions == (*expanding, legal_leaf, after, later)
 
 
+def test_cleanup_budget_reserves_each_fresh_marker_root_sibling() -> None:
+    class FreshMarkerCleanupGroup(BaseExceptionGroup):
+        marker = 0
+
+        @property
+        def exceptions(self) -> tuple[BaseException, ...]:
+            type(self).marker += 1
+            return (
+                FreshMarkerCleanupGroup(
+                    f"fresh marker {type(self).marker}",
+                    [OSError("hidden")],
+                ),
+            )
+
+    primary = RuntimeError("primary")
+    expanding = tuple(
+        FreshMarkerCleanupGroup(f"root {index}", [OSError("hidden")]) for index in range(4)
+    )
+    legal_leaf = LookupError("legal nested cleanup")
+    legal_group = BaseExceptionGroup("legal cleanup", [legal_leaf])
+    after = ValueError("after cleanup")
+    later = InterruptedError("later cleanup")
+    primary.cleanup_error_group = BaseExceptionGroup(  # type: ignore[attr-defined]
+        "outer cleanup",
+        [*expanding, legal_group, after],
+    )
+
+    contained._attach_cleanup_error_group(
+        primary,
+        [later],
+        error_label="fresh marker cleanup",
+        note="fresh marker cleanup note",
+    )
+
+    cleanup_group = getattr(primary, "cleanup_error_group", None)
+    assert isinstance(cleanup_group, BaseExceptionGroup)
+    assert cleanup_group.exceptions == (*expanding, legal_leaf, after, later)
+
+
 @pytest.mark.parametrize(
     "width_offset",
     (-1, 0, 1),
@@ -1439,7 +765,15 @@ def test_cleanup_root_width_boundary_preserves_all_direct_leaves(
     assert cleanup_group.exceptions == (*leaves, later)
 
 
-def test_cleanup_many_cyclic_siblings_is_linear_and_preserves_exact_evidence() -> None:
+@pytest.mark.parametrize(
+    ("cycle_count", "alarm_seconds"),
+    ((8000, 0.75), (16000, 1.5)),
+    ids=("8000", "16000"),
+)
+def test_cleanup_many_cyclic_siblings_is_linear_and_preserves_exact_evidence(
+    cycle_count: int,
+    alarm_seconds: float,
+) -> None:
     source_root = Path(__file__).parents[2] / "src"
     environment = dict(os.environ)
     environment["PYTHONPATH"] = os.pathsep.join(
@@ -1456,12 +790,12 @@ class CyclicCleanupGroup(BaseExceptionGroup):
 
 cycles = tuple(
     CyclicCleanupGroup(f'cycle {index}', [OSError('hidden')])
-    for index in range(8000)
+    for index in range(CYCLE_COUNT)
 )
 later = ValueError('later cleanup')
 primary = RuntimeError('primary')
 primary.cleanup_error_group = BaseExceptionGroup('cycles', list(cycles))
-signal.setitimer(signal.ITIMER_REAL, 0.75)
+signal.setitimer(signal.ITIMER_REAL, ALARM_SECONDS)
 contained._attach_cleanup_error_group(
     primary,
     [later],
@@ -1472,7 +806,7 @@ signal.setitimer(signal.ITIMER_REAL, 0)
 group = primary.cleanup_error_group
 assert type(group) is BaseExceptionGroup
 assert group.exceptions == (*cycles, later)
-"""
+""".replace("CYCLE_COUNT", str(cycle_count)).replace("ALARM_SECONDS", str(alarm_seconds))
 
     completed = subprocess.run(
         [sys.executable, "-c", probe],
@@ -2162,83 +1496,6 @@ def test_linux_pidfd_partial_insertion_retains_failed_close_for_retry(
         monkeypatch.setattr(contained.os, "close", real_close)
         _close_test_fd_if_open(read_fd)
         real_close(write_fd)
-
-
-def test_linux_pidfd_has_no_return_event_before_pending_registration(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    tracker = contained._LinuxSubreaperProcessTracker()
-    read_fd, write_fd = contained.os.pipe()
-    fault = _ContainedReturnFault(
-        {"<lambda>"},
-        RuntimeError("pidfd acquisition callback return failed"),
-    )
-
-    def open_pidfd(_pid: int, _flags: int) -> int:
-        return read_fd
-
-    monkeypatch.setattr(contained.os, "pidfd_open", open_pidfd, raising=False)
-    try:
-        sys.settrace(fault.trace)
-        tracker._bind_pid(contained.ProcessIdentity(101, (1, 0)))
-        sys.settrace(None)
-
-        assert not fault.triggered
-        assert tracker._pidfds == {101: read_fd}
-        assert tracker._pending_pidfds == []
-        tracker.close()
-        with pytest.raises(OSError) as closed:
-            contained.os.fstat(read_fd)
-        assert closed.value.errno == contained.errno.EBADF
-    finally:
-        sys.settrace(None)
-        with contained.suppress(BaseException):
-            tracker.close()
-        _close_test_fd_if_open(read_fd)
-        contained.os.close(write_fd)
-
-
-@pytest.mark.parametrize("hook_kind", ("c_return", "opcode"))
-def test_linux_pidfd_registration_is_atomic_to_execution_hooks(
-    monkeypatch: pytest.MonkeyPatch,
-    hook_kind: str,
-) -> None:
-    tracker = contained._LinuxSubreaperProcessTracker()
-    read_fd, write_fd = contained.os.pipe()
-    before = _open_file_descriptors()
-    boundary_failure = RuntimeError(f"pidfd {hook_kind} boundary failed")
-    pidfd_open: object = fcntl.fcntl
-    if hook_kind == "opcode":
-
-        def duplicate_pidfd(pid: int, _flags: int) -> int:
-            return contained.os.dup(pid)
-
-        pidfd_open = duplicate_pidfd
-    monkeypatch.setattr(contained.os, "pidfd_open", pidfd_open, raising=False)
-    fault, hook = _install_acquisition_fault(
-        hook_kind,
-        c_target=fcntl.fcntl,
-        code=tracker._bind_pid.__func__.__code__,
-        variable="descriptor",
-        error=boundary_failure,
-    )
-    try:
-        tracker._bind_pid(contained.ProcessIdentity(read_fd, (1, 0)))
-
-        assert not fault.triggered  # type: ignore[attr-defined]
-        _assert_acquisition_hook_restored(hook_kind, hook)
-        assert len(tracker._pidfds) == 1
-        assert tracker._pending_pidfds == []
-        tracker.close()
-        assert _open_file_descriptors() == before
-    finally:
-        _clear_execution_hooks()
-        with contained.suppress(BaseException):
-            tracker.close()
-        for descriptor in _open_file_descriptors() - before:
-            _close_test_fd_if_open(descriptor)
-        _close_test_fd_if_open(read_fd)
-        _close_test_fd_if_open(write_fd)
 
 
 def test_signal_latch_records_first_signal_without_raising_from_handler() -> None:
@@ -5774,285 +5031,6 @@ class _BlockingClosedKqueue:
         self.closed_while_active = self.in_control.is_set()
 
 
-@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin kqueue ownership contract")
-@pytest.mark.parametrize("hook_kind", ("c_return", "opcode"))
-def test_darwin_kqueue_registration_is_atomic_to_execution_hooks(
-    monkeypatch: pytest.MonkeyPatch,
-    hook_kind: str,
-) -> None:
-    tracker = contained._DarwinKqueueProcessTracker()
-    queue = contained.select.kqueue()
-    queue_fd = queue.fileno()
-    available_queues = [queue]
-    acquire_queue = available_queues.pop
-    monkeypatch.setattr(contained.select, "kqueue", acquire_queue)
-    before = _open_file_descriptors()
-    boundary_failure = RuntimeError(f"kqueue {hook_kind} boundary failed")
-    fault, hook = _install_acquisition_fault(
-        hook_kind,
-        c_target=acquire_queue,
-        code=tracker._initialize_queue.__func__.__code__,
-        variable="queue",
-        error=boundary_failure,
-    )
-    try:
-        tracker._initialize_queue()
-
-        assert not fault.triggered  # type: ignore[attr-defined]
-        _assert_acquisition_hook_restored(hook_kind, hook)
-        assert tracker._owns_queue
-        tracker.close()
-        with pytest.raises(OSError) as closed:
-            contained.os.fstat(queue_fd)
-        assert closed.value.errno == contained.errno.EBADF
-    finally:
-        _clear_execution_hooks()
-        with contained.suppress(BaseException):
-            tracker.close()
-        for unclaimed in available_queues:
-            unclaimed.close()
-        _close_test_fd_if_open(queue_fd)
-        for descriptor in _open_file_descriptors() - before:
-            _close_test_fd_if_open(descriptor)
-
-
-@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin kqueue ownership contract")
-def test_execution_hook_disable_failure_precedes_kqueue_acquisition(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    tracker = contained._DarwinKqueueProcessTracker()
-    trace_hook = object()
-    profile_hook = object()
-    hooks = {"trace": trace_hook, "profile": profile_hook}
-    disable_failure = RuntimeError("trace disable failed after mutation")
-    acquisitions = 0
-
-    def settrace(hook: object) -> None:
-        hooks["trace"] = hook
-        if hook is None:
-            raise disable_failure
-
-    def setprofile(hook: object) -> None:
-        hooks["profile"] = hook
-
-    def acquire_queue() -> object:
-        nonlocal acquisitions
-        acquisitions += 1
-        return object()
-
-    monkeypatch.setattr(contained.sys, "gettrace", lambda: hooks["trace"])
-    monkeypatch.setattr(contained.sys, "getprofile", lambda: hooks["profile"])
-    monkeypatch.setattr(contained.sys, "settrace", settrace)
-    monkeypatch.setattr(contained.sys, "setprofile", setprofile)
-    monkeypatch.setattr(contained.select, "kqueue", acquire_queue)
-
-    with pytest.raises(RuntimeError) as caught:
-        tracker._initialize_queue()
-
-    assert caught.value is disable_failure
-    assert acquisitions == 0
-    assert hooks == {"trace": trace_hook, "profile": profile_hook}
-    assert not tracker._owns_queue
-
-
-@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin kqueue ownership contract")
-def test_kqueue_hook_restore_failure_retains_registered_queue(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    tracker = contained._DarwinKqueueProcessTracker()
-    read_fd, write_fd = contained.os.pipe()
-    real_close = contained.os.close
-    trace_hook = object()
-    profile_hook = object()
-    hooks = {"trace": trace_hook, "profile": profile_hook}
-    restore_failure = RuntimeError("profile restore failed")
-    restore_attempts = 0
-
-    class Queue:
-        def fileno(self) -> int:
-            return read_fd
-
-        def close(self) -> None:
-            real_close(read_fd)
-
-    def settrace(hook: object) -> None:
-        hooks["trace"] = hook
-
-    def setprofile(hook: object) -> None:
-        nonlocal restore_attempts
-        if hook is profile_hook:
-            restore_attempts += 1
-            raise restore_failure
-        hooks["profile"] = hook
-
-    monkeypatch.setattr(contained.sys, "gettrace", lambda: hooks["trace"])
-    monkeypatch.setattr(contained.sys, "getprofile", lambda: hooks["profile"])
-    monkeypatch.setattr(contained.sys, "settrace", settrace)
-    monkeypatch.setattr(contained.sys, "setprofile", setprofile)
-    monkeypatch.setattr(contained.select, "kqueue", Queue)
-    try:
-        with pytest.raises(RuntimeError) as caught:
-            tracker._initialize_queue()
-
-        assert caught.value is restore_failure
-        assert restore_attempts == contained._SIGNAL_STATE_ATTEMPTS
-        assert hooks["trace"] is trace_hook
-        assert hooks["profile"] is None
-        assert tracker._owns_queue
-        assert tracker._queue is not None
-
-        tracker.close()
-        with pytest.raises(OSError) as closed:
-            contained.os.fstat(read_fd)
-        assert closed.value.errno == contained.errno.EBADF
-    finally:
-        with contained.suppress(BaseException):
-            tracker.close()
-        _close_test_fd_if_open(read_fd)
-        real_close(write_fd)
-
-
-@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin kqueue ownership contract")
-def test_hook_restore_failure_cannot_displace_kqueue_acquisition_failure(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    tracker = contained._DarwinKqueueProcessTracker()
-    trace_hook = object()
-    profile_hook = object()
-    hooks = {"trace": trace_hook, "profile": profile_hook}
-    acquisition_failure = OSError("kqueue acquisition failed")
-    restore_failure = RuntimeError("trace restore failed")
-
-    def settrace(hook: object) -> None:
-        if hook is trace_hook:
-            raise restore_failure
-        hooks["trace"] = hook
-
-    def setprofile(hook: object) -> None:
-        hooks["profile"] = hook
-
-    def fail_acquisition() -> object:
-        raise acquisition_failure
-
-    monkeypatch.setattr(contained.sys, "gettrace", lambda: hooks["trace"])
-    monkeypatch.setattr(contained.sys, "getprofile", lambda: hooks["profile"])
-    monkeypatch.setattr(contained.sys, "settrace", settrace)
-    monkeypatch.setattr(contained.sys, "setprofile", setprofile)
-    monkeypatch.setattr(contained.select, "kqueue", fail_acquisition)
-
-    with pytest.raises(OSError) as caught:
-        tracker._initialize_queue()
-
-    assert caught.value is acquisition_failure
-    cleanup_group = getattr(caught.value, "cleanup_error_group", None)
-    assert isinstance(cleanup_group, BaseExceptionGroup)
-    assert restore_failure in cleanup_group.exceptions
-
-
-@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin kqueue ownership contract")
-def test_darwin_kqueue_return_exception_keeps_tracker_shell_owned(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    read_fd, write_fd = contained.os.pipe()
-    real_close = contained.os.close
-    boundary_failure = RuntimeError("kqueue acquisition return failed")
-    fault = _ContainedReturnFault(
-        {"_initialize_queue"},
-        boundary_failure,
-    )
-
-    class Queue:
-        def fileno(self) -> int:
-            return read_fd
-
-        def close(self) -> None:
-            real_close(read_fd)
-
-    queue = Queue()
-    monkeypatch.setattr(contained.select, "kqueue", lambda: queue)
-    tracker = contained._DarwinKqueueProcessTracker()
-    try:
-        sys.settrace(fault.trace)
-        with pytest.raises(RuntimeError) as caught:
-            tracker._initialize_queue()
-        sys.settrace(None)
-
-        assert fault.triggered
-        assert caught.value is boundary_failure
-
-        tracker.close()
-        assert not tracker._owns_queue
-        with pytest.raises(OSError) as closed:
-            contained.os.fstat(read_fd)
-        assert closed.value.errno == contained.errno.EBADF
-    finally:
-        sys.settrace(None)
-        with contained.suppress(BaseException):
-            tracker.close()
-        _close_test_fd_if_open(read_fd)
-        real_close(write_fd)
-
-
-@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin kqueue ownership contract")
-def test_darwin_kqueue_post_acquisition_exception_retains_close_ownership(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    read_fd, write_fd = contained.os.pipe()
-    real_close = contained.os.close
-    boundary_failure = RuntimeError("kqueue post-acquisition boundary failed")
-    close_failure = OSError(contained.errno.EIO, "kqueue rollback close failed")
-    fault = _ContainedReturnFault({"_initialize_queue"}, boundary_failure)
-
-    class RetryingQueue:
-        def __init__(self) -> None:
-            self.close_fails = True
-            self.close_attempts = 0
-
-        def fileno(self) -> int:
-            return read_fd
-
-        def close(self) -> None:
-            self.close_attempts += 1
-            if self.close_fails:
-                raise close_failure
-            real_close(read_fd)
-
-    queue = RetryingQueue()
-
-    monkeypatch.setattr(contained.select, "kqueue", lambda: queue)
-    tracker = contained._DarwinKqueueProcessTracker()
-    try:
-        sys.settrace(fault.trace)
-        with pytest.raises(RuntimeError) as caught:
-            tracker._initialize_queue()
-        sys.settrace(None)
-
-        assert caught.value is boundary_failure
-
-        with pytest.raises(contained.ContainedProcessError) as close_caught:
-            tracker.close()
-        assert queue.close_attempts == contained._SIGNAL_STATE_ATTEMPTS
-        assert tracker._owns_queue
-        cleanup_group = getattr(close_caught.value, "cleanup_error_group", None)
-        assert isinstance(cleanup_group, BaseExceptionGroup)
-        assert cleanup_group.exceptions[0] is close_failure
-        assert "remains open" in str(cleanup_group.exceptions[-1])
-
-        queue.close_fails = False
-        tracker.close()
-        assert not tracker._owns_queue
-        with pytest.raises(OSError) as closed:
-            contained.os.fstat(read_fd)
-        assert closed.value.errno == contained.errno.EBADF
-    finally:
-        sys.settrace(None)
-        queue.close_fails = False
-        with contained.suppress(BaseException):
-            tracker.close()
-        _close_test_fd_if_open(read_fd)
-        real_close(write_fd)
-
-
 @pytest.mark.skipif(sys.platform != "darwin", reason="Darwin kqueue shutdown contract")
 def test_darwin_tracker_close_joins_before_closing_live_kqueue() -> None:
     tracker = contained._DarwinKqueueProcessTracker()
@@ -6291,187 +5269,6 @@ def test_darwin_anchor_dup_is_owned_before_inheritable_update(
     assert cleanup_inventories == [((anchor,), (), True, ())]
     assert getattr(caught.value, "cleanup_error_group", None) is None
     assert tracker.closed
-
-
-@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin pipe anchor contract")
-def test_darwin_anchor_has_no_return_event_before_pending_registration(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    tracker = _FakeKernelTracker(identity=contained.ProcessIdentity(1, (1, 0)))
-    real_dup = contained.os.dup
-    duplicated: list[int] = []
-    fault = _ContainedReturnFault(
-        {"<lambda>"},
-        RuntimeError("anchor acquisition callback return failed"),
-    )
-
-    def duplicate_anchor(descriptor: int) -> int:
-        anchor = real_dup(descriptor)
-        duplicated.append(anchor)
-        return anchor
-
-    def live_inventory(_deadline: float) -> dict[int, contained._ProcessObservation]:
-        identity = tracker.registered_identity
-        if identity is None:
-            return {}
-        observation = contained._process_observation(identity.pid)
-        if observation is None:
-            return {}
-        return {
-            identity.pid: contained._ProcessObservation(
-                identity=identity,
-                parent_pid=observation.parent_pid,
-            )
-        }
-
-    monkeypatch.setattr(contained.os, "dup", duplicate_anchor)
-    try:
-        sys.settrace(fault.trace)
-        result = contained.run_contained(
-            [sys.executable, "-c", "import time; time.sleep(0.2)"],
-            cwd=tmp_path,
-            deadline_monotonic=time.monotonic() + 2,
-            inventory_provider=live_inventory,
-            kernel_tracker_factory=_tracker_factory(tracker),
-            may_spawn_background_descendants=False,
-        )
-        sys.settrace(None)
-
-        assert not fault.triggered
-        assert result.returncode == 0
-        assert len(duplicated) == 2
-        for descriptor in duplicated:
-            with pytest.raises(OSError) as closed:
-                contained.os.fstat(descriptor)
-            assert closed.value.errno == contained.errno.EBADF
-    finally:
-        sys.settrace(None)
-        for descriptor in duplicated:
-            _close_test_fd_if_open(descriptor)
-
-
-@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin pipe anchor contract")
-@pytest.mark.parametrize("hook_kind", ("c_return", "opcode"))
-def test_darwin_anchor_registration_is_atomic_to_execution_hooks(
-    tmp_path: Path,
-    hook_kind: str,
-) -> None:
-    tracker = _FakeKernelTracker(identity=contained.ProcessIdentity(1, (1, 0)))
-    before = _open_file_descriptors()
-    boundary_failure = RuntimeError(f"anchor {hook_kind} boundary failed")
-    fault, hook = _install_acquisition_fault(
-        hook_kind,
-        c_target=contained.os.dup,
-        code=contained.run_contained.__code__,
-        variable="anchor",
-        error=boundary_failure,
-    )
-
-    def live_inventory(_deadline: float) -> dict[int, contained._ProcessObservation]:
-        identity = tracker.registered_identity
-        if identity is None:
-            return {}
-        observation = contained._process_observation(identity.pid)
-        if observation is None:
-            return {}
-        return {
-            identity.pid: contained._ProcessObservation(
-                identity=identity,
-                parent_pid=observation.parent_pid,
-            )
-        }
-
-    try:
-        result = contained.run_contained(
-            [sys.executable, "-c", "import time; time.sleep(0.2)"],
-            cwd=tmp_path,
-            deadline_monotonic=time.monotonic() + 2,
-            inventory_provider=live_inventory,
-            kernel_tracker_factory=_tracker_factory(tracker),
-            may_spawn_background_descendants=False,
-        )
-
-        assert not fault.triggered  # type: ignore[attr-defined]
-        _assert_acquisition_hook_restored(hook_kind, hook)
-        assert result.returncode == 0
-        assert _open_file_descriptors() == before
-    finally:
-        _clear_execution_hooks()
-        for descriptor in _open_file_descriptors() - before:
-            _close_test_fd_if_open(descriptor)
-
-
-@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin pipe anchor contract")
-@pytest.mark.parametrize("close_fails", (False, True), ids=("closed", "retained"))
-def test_darwin_anchor_post_dup_trace_preserves_pending_ownership(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    close_fails: bool,
-) -> None:
-    tracker = _FakeKernelTracker(identity=contained.ProcessIdentity(1, (1, 0)))
-    real_dup = contained.os.dup
-    real_close = contained.os.close
-    real_finish = contained._finish_signal_restoration
-    boundary_failure = RuntimeError("anchor post-dup boundary failed")
-    close_failure = OSError(contained.errno.EIO, "anchor pending close failed")
-    duplicated: list[int] = []
-    replay_states: list[bool] = []
-    close_attempts = 0
-    fault = _NextContainedLineFault(boundary_failure)
-
-    def acquire_anchor(descriptor: int) -> int:
-        anchor = real_dup(descriptor)
-        duplicated.append(anchor)
-        fault.arm()
-        return anchor
-
-    def close_anchor(descriptor: int) -> None:
-        nonlocal close_attempts
-        if close_fails and descriptor in duplicated:
-            close_attempts += 1
-            raise close_failure
-        real_close(descriptor)
-
-    def capture_replay_state(*args: object, **kwargs: object) -> None:
-        replay_states.append(bool(kwargs.get("replay_ready", True)))
-        real_finish(*args, **kwargs)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(contained.os, "dup", acquire_anchor)
-    monkeypatch.setattr(contained.os, "close", close_anchor)
-    monkeypatch.setattr(contained, "_finish_signal_restoration", capture_replay_state)
-    try:
-        sys.settrace(fault.trace)
-        with pytest.raises(RuntimeError) as caught:
-            contained.run_contained(
-                [sys.executable, "-c", "pass"],
-                cwd=tmp_path,
-                deadline_monotonic=time.monotonic() + 2,
-                inventory_provider=lambda _deadline: {},
-                kernel_tracker_factory=_tracker_factory(tracker),
-                may_spawn_background_descendants=False,
-            )
-        sys.settrace(None)
-
-        assert caught.value is boundary_failure
-        assert len(duplicated) == 1
-        if close_fails:
-            assert close_attempts >= contained._SIGNAL_STATE_ATTEMPTS
-            assert replay_states == [False]
-            contained.os.fstat(duplicated[0])
-            cleanup_group = getattr(caught.value, "cleanup_error_group", None)
-            assert isinstance(cleanup_group, BaseExceptionGroup)
-            assert close_failure in cleanup_group.exceptions
-        else:
-            assert replay_states == [True]
-            with pytest.raises(OSError) as closed:
-                contained.os.fstat(duplicated[0])
-            assert closed.value.errno == contained.errno.EBADF
-    finally:
-        sys.settrace(None)
-        monkeypatch.setattr(contained.os, "close", real_close)
-        for descriptor in duplicated:
-            _close_test_fd_if_open(descriptor)
 
 
 def test_anchor_close_failure_retains_descriptor_inventory(
