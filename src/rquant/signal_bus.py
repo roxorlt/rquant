@@ -8,10 +8,11 @@ import sqlite3
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Self
 
-from pydantic import Field, StringConstraints
+from pydantic import Field, StringConstraints, model_validator
 
 from rquant.delivery_contracts import (
     DeliveryChannel,
@@ -22,7 +23,11 @@ from rquant.delivery_contracts import (
     RouterDisposition,
     RouterReceipt,
 )
-from rquant.runtime_contracts import AwareUtcDatetime, RuntimeContractModel
+from rquant.runtime_contracts import (
+    AwareUtcDatetime,
+    RuntimeContractModel,
+    canonical_sha256,
+)
 from rquant.signal_contracts import SignalEnvelope
 
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
@@ -30,6 +35,115 @@ Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 
 class SignalBusLeaseError(RuntimeError):
     """A stale or unrelated worker attempted to finish a delivery lease."""
+
+
+class SignalRouteConflictError(RuntimeError):
+    """An immutable source identity or route receipt was changed."""
+
+
+class SignalRouteSequenceError(RuntimeError):
+    """A source sequence or high watermark regressed, skipped, or disappeared."""
+
+
+class RouteReceiptDisposition(StrEnum):
+    ROUTED = "routed"
+    NO_TARGET = "no_target"
+    EXPIRED = "expired"
+
+
+class RouteDecisionKind(StrEnum):
+    ROUTE = "route"
+    NO_TARGET = "no_target"
+
+
+class RouteSourceDescriptor(RuntimeContractModel):
+    source_id: str = Field(min_length=1)
+    generation_id: Sha256
+    strategy_spec_fingerprint: Sha256
+    first_sequence: int = Field(ge=1)
+    high_watermark: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def validate_watermark(self) -> Self:
+        if self.high_watermark < self.first_sequence - 1:
+            raise ValueError("high_watermark cannot precede the source start")
+        return self
+
+
+class SignalRouteCursor(RuntimeContractModel):
+    source_id: str = Field(min_length=1)
+    generation_id: Sha256 | None = None
+    strategy_spec_fingerprint: Sha256 | None = None
+    routing_policy_fingerprint: Sha256 | None = None
+    first_sequence: int = Field(default=1, ge=1)
+    observed_high_watermark: int = Field(default=0, ge=0)
+    last_sequence: int = Field(ge=0)
+    last_signal_id: Sha256 | None = None
+    updated_at: AwareUtcDatetime | None = None
+
+
+class SignalRouteReceipt(RuntimeContractModel):
+    source_id: str = Field(min_length=1)
+    source_sequence: int = Field(ge=1)
+    signal_id: Sha256
+    decision_fingerprint: Sha256
+    disposition: RouteReceiptDisposition
+    reason_code: str | None = Field(default=None, min_length=1)
+    target_manifest_hash: Sha256
+    targets: tuple[DeliveryTarget, ...]
+    target_count: int = Field(ge=0)
+    routed_at: AwareUtcDatetime
+
+    @model_validator(mode="after")
+    def validate_targets(self) -> Self:
+        if self.target_count != len(self.targets):
+            raise ValueError("target_count does not match targets")
+        if self.disposition is RouteReceiptDisposition.NO_TARGET:
+            if self.targets or self.reason_code is None:
+                raise ValueError("no-target receipts require a reason and no targets")
+        elif not self.targets or self.reason_code is not None:
+            raise ValueError("routed receipts require targets and forbid a reason")
+        return self
+
+
+class SignalRouteCommitResult(RuntimeContractModel):
+    receipt: SignalRouteReceipt
+    duplicate: bool
+
+
+class _RouteSourceBindingRequest(RuntimeContractModel):
+    descriptor: RouteSourceDescriptor
+    routing_policy_fingerprint: Sha256
+    observed_at: AwareUtcDatetime
+
+
+class _SourceRouteCommitRequest(RuntimeContractModel):
+    descriptor: RouteSourceDescriptor
+    routing_policy_fingerprint: Sha256
+    source_sequence: int = Field(ge=1)
+    signal: SignalEnvelope
+    decision_kind: RouteDecisionKind
+    decision_fingerprint: Sha256
+    reason_code: str | None = Field(default=None, min_length=1)
+    targets: tuple[DeliveryTarget, ...]
+    routed_at: AwareUtcDatetime
+
+    @model_validator(mode="after")
+    def validate_decision(self) -> Self:
+        if self.decision_kind is RouteDecisionKind.ROUTE:
+            if not self.targets or self.reason_code is not None:
+                raise ValueError("ROUTE requires targets and forbids reason_code")
+        elif self.targets or self.reason_code is None:
+            raise ValueError("NO_TARGET requires reason_code and forbids targets")
+        expected = routing_decision_fingerprint(
+            routing_policy_fingerprint=self.routing_policy_fingerprint,
+            decision_kind=self.decision_kind,
+            targets=self.targets,
+            reason_code=self.reason_code,
+        )
+        if self.decision_fingerprint != expected:
+            raise ValueError("decision_fingerprint does not match routing decision")
+        return self
 
 
 class QuarantinedSignal(RuntimeContractModel):
@@ -76,6 +190,42 @@ def _signal_payload(signal: SignalEnvelope) -> str:
 
 def _payload_hash(payload: str) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def canonical_delivery_targets(
+    targets: Iterable[DeliveryTarget],
+) -> tuple[DeliveryTarget, ...]:
+    validated = tuple(DeliveryTarget.model_validate(target) for target in targets)
+    unique = {(target.recipient_id, target.channel.value): target for target in validated}
+    return tuple(unique[key] for key in sorted(unique))
+
+
+def _target_manifest_payload(targets: tuple[DeliveryTarget, ...]) -> str:
+    return json.dumps(
+        [target.model_dump(mode="json") for target in targets],
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def routing_decision_fingerprint(
+    *,
+    routing_policy_fingerprint: str,
+    decision_kind: RouteDecisionKind,
+    targets: Iterable[DeliveryTarget],
+    reason_code: str | None,
+) -> str:
+    canonical_targets = canonical_delivery_targets(targets)
+    return canonical_sha256(
+        {
+            "contract": "routing-decision/v1",
+            "routing_policy_fingerprint": routing_policy_fingerprint,
+            "decision_kind": decision_kind,
+            "reason_code": reason_code,
+            "targets": canonical_targets,
+        }
+    )
 
 
 def _retry_policy_fingerprint(
@@ -232,6 +382,35 @@ class SignalBusStore:
                     metadata_key TEXT PRIMARY KEY,
                     metadata_value TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS signal_route_source (
+                    source_id TEXT PRIMARY KEY,
+                    generation_id TEXT NOT NULL,
+                    strategy_spec_fingerprint TEXT NOT NULL,
+                    routing_policy_fingerprint TEXT NOT NULL,
+                    first_sequence INTEGER NOT NULL CHECK(first_sequence >= 1),
+                    observed_high_watermark INTEGER NOT NULL CHECK(observed_high_watermark >= 0),
+                    last_sequence INTEGER NOT NULL CHECK(last_sequence >= 0),
+                    last_signal_id TEXT,
+                    registered_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS signal_route_receipt (
+                    source_id TEXT NOT NULL REFERENCES signal_route_source(source_id),
+                    source_sequence INTEGER NOT NULL CHECK(source_sequence >= 1),
+                    signal_id TEXT NOT NULL UNIQUE REFERENCES signal_envelope(signal_id),
+                    decision_fingerprint TEXT NOT NULL,
+                    disposition TEXT NOT NULL,
+                    reason_code TEXT,
+                    target_manifest_hash TEXT NOT NULL,
+                    target_manifest_json TEXT NOT NULL,
+                    routed_at TEXT NOT NULL,
+                    PRIMARY KEY(source_id, source_sequence)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_signal_route_receipt_source
+                ON signal_route_receipt(source_id, source_sequence);
                 """
             )
             connection.execute(
@@ -263,65 +442,88 @@ class SignalBusStore:
         received_at: datetime | None = None,
     ) -> RouterReceipt:
         received = _normalize_time(received_at or datetime.now(UTC))
+        with self._write_transaction() as connection:
+            receipt, changed = self._ingest_in_transaction(
+                connection,
+                signal,
+                received_at=received,
+            )
+            if changed:
+                self._before_commit(connection)
+            return receipt
+
+    def _ingest_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        signal: SignalEnvelope,
+        *,
+        received_at: datetime,
+    ) -> tuple[RouterReceipt, bool]:
         signal_id = signal.signal_id
         if signal_id is None:
             raise ValueError("signal_id must be materialized before ingest")
         payload = _signal_payload(signal)
         content_hash = _payload_hash(payload)
 
-        with self._write_transaction() as connection:
-            existing = connection.execute(
-                """
-                SELECT global_sequence, payload_hash, payload_json
-                FROM signal_envelope
-                WHERE signal_id = ?
-                """,
-                (signal_id,),
-            ).fetchone()
-            if existing is not None:
-                if existing["payload_hash"] == content_hash and existing["payload_json"] == payload:
-                    return RouterReceipt(
+        existing = connection.execute(
+            """
+            SELECT global_sequence, payload_hash, payload_json
+            FROM signal_envelope
+            WHERE signal_id = ?
+            """,
+            (signal_id,),
+        ).fetchone()
+        if existing is not None:
+            if existing["payload_hash"] == content_hash and existing["payload_json"] == payload:
+                return (
+                    RouterReceipt(
                         signal_id=signal_id,
                         disposition=RouterDisposition.DUPLICATE,
                         global_sequence=existing["global_sequence"],
-                        received_at=received,
-                    )
-                reason = "signal_id already exists with different canonical payload"
-                connection.execute(
-                    """
-                    INSERT OR IGNORE INTO signal_quarantine(
-                        signal_id, payload_hash, payload_json, received_at, reason
-                    ) VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (signal_id, content_hash, payload, _encode_time(received), reason),
+                        received_at=received_at,
+                    ),
+                    False,
                 )
-                self._before_commit(connection)
-                return RouterReceipt(
+            reason = "signal_id already exists with different canonical payload"
+            before_changes = connection.total_changes
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO signal_quarantine(
+                    signal_id, payload_hash, payload_json, received_at, reason
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (signal_id, content_hash, payload, _encode_time(received_at), reason),
+            )
+            return (
+                RouterReceipt(
                     signal_id=signal_id,
                     disposition=RouterDisposition.QUARANTINED,
                     reason=reason,
-                    received_at=received,
-                )
-
-            # Reject a forged new identity. Existing ids are handled above so their
-            # conflicting evidence can still be retained in quarantine.
-            SignalEnvelope.model_validate(signal.model_dump(mode="python"))
-            cursor = connection.execute(
-                """
-                INSERT INTO signal_envelope(
-                    signal_id, payload_hash, payload_json, received_at
-                ) VALUES (?, ?, ?, ?)
-                """,
-                (signal_id, content_hash, payload, _encode_time(received)),
+                    received_at=received_at,
+                ),
+                connection.total_changes > before_changes,
             )
-            sequence = int(cursor.lastrowid)
-            self._before_commit(connection)
-            return RouterReceipt(
+
+        # Existing ids are handled above so conflicting evidence can be retained.
+        SignalEnvelope.model_validate(signal.model_dump(mode="python"))
+        cursor = connection.execute(
+            """
+            INSERT INTO signal_envelope(
+                signal_id, payload_hash, payload_json, received_at
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (signal_id, content_hash, payload, _encode_time(received_at)),
+        )
+        sequence = int(cursor.lastrowid)
+        return (
+            RouterReceipt(
                 signal_id=signal_id,
                 disposition=RouterDisposition.ACCEPTED,
                 global_sequence=sequence,
-                received_at=received,
-            )
+                received_at=received_at,
+            ),
+            True,
+        )
 
     def signal(self, identifier: int | str) -> SignalEnvelope | None:
         payload = self.signal_payload(identifier)
@@ -383,91 +585,431 @@ class SignalBusStore:
         now: datetime,
     ) -> tuple[OutboxRecord, ...]:
         routed_at = _normalize_time(now)
-        unique_targets = sorted(
-            {(target.recipient_id, target.channel): target for target in targets}.values(),
-            key=lambda target: (target.recipient_id, target.channel.value),
-        )
+        unique_targets = canonical_delivery_targets(targets)
         if not unique_targets:
             return ()
 
         with self._write_transaction() as connection:
-            signal_row = connection.execute(
+            frozen = connection.execute(
                 """
-                SELECT global_sequence, payload_json
-                FROM signal_envelope
+                SELECT target_manifest_json FROM signal_route_receipt
                 WHERE signal_id = ?
                 """,
                 (signal_id,),
             ).fetchone()
-            if signal_row is None:
-                raise KeyError(f"signal {signal_id!r} does not exist")
-            signal = SignalEnvelope.model_validate_json(signal_row["payload_json"])
-            if routed_at < signal.available_at:
-                raise ValueError("signal cannot be routed before available_at")
-            expired = routed_at >= signal.expires_at
-            changed = False
-            for target in unique_targets:
-                outbox_id = target.delivery_key(signal_id)
-                existing = connection.execute(
-                    "SELECT status FROM delivery_outbox WHERE outbox_id = ?",
-                    (outbox_id,),
-                ).fetchone()
-                if existing is not None:
-                    if expired and existing["status"] in {
-                        OutboxStatus.PENDING.value,
-                        OutboxStatus.RETRY.value,
-                    }:
-                        connection.execute(
-                            """
-                            UPDATE delivery_outbox
-                            SET status = ?, next_attempt_at = NULL,
-                                last_error = ?, updated_at = ?
-                            WHERE outbox_id = ?
-                            """,
-                            (
-                                OutboxStatus.EXPIRED.value,
-                                "signal expired before routing",
-                                _encode_time(routed_at),
-                                outbox_id,
-                            ),
-                        )
-                        changed = True
-                    continue
-
-                created_at = signal.available_at if expired else routed_at
-                connection.execute(
-                    """
-                    INSERT INTO delivery_outbox(
-                        outbox_id, signal_id, global_sequence, recipient_id, channel,
-                        status, expires_at, attempt_count, next_attempt_at,
-                        lease_owner, lease_started_at, lease_until, last_error,
-                        created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, NULL, NULL, ?, ?, ?)
-                    """,
-                    (
-                        outbox_id,
-                        signal_id,
-                        signal_row["global_sequence"],
-                        target.recipient_id,
-                        target.channel.value,
-                        (OutboxStatus.EXPIRED.value if expired else OutboxStatus.PENDING.value),
-                        _encode_time(signal.expires_at),
-                        "signal expired before routing" if expired else None,
-                        _encode_time(created_at),
-                        _encode_time(routed_at),
-                    ),
+            if frozen is not None:
+                frozen_targets = canonical_delivery_targets(
+                    DeliveryTarget.model_validate(item)
+                    for item in json.loads(frozen["target_manifest_json"])
                 )
-                changed = True
-            if changed:
-                self._before_commit(connection)
-            rows = self._select_outbox_rows(
+                if frozen_targets != unique_targets:
+                    raise SignalRouteConflictError(
+                        "targets conflict with the frozen target manifest"
+                    )
+            rows, changed = self._route_in_transaction(
                 connection,
                 signal_id=signal_id,
-                target_keys={
-                    (target.recipient_id, target.channel.value) for target in unique_targets
-                },
+                targets=unique_targets,
+                routed_at=routed_at,
             )
+            if changed:
+                self._before_commit(connection)
             return tuple(self._outbox_from_row(row) for row in rows)
+
+    def _route_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        signal_id: str,
+        targets: tuple[DeliveryTarget, ...],
+        routed_at: datetime,
+    ) -> tuple[list[sqlite3.Row], bool]:
+        signal_row = connection.execute(
+            """
+            SELECT global_sequence, payload_json
+            FROM signal_envelope
+            WHERE signal_id = ?
+            """,
+            (signal_id,),
+        ).fetchone()
+        if signal_row is None:
+            raise KeyError(f"signal {signal_id!r} does not exist")
+        signal = SignalEnvelope.model_validate_json(signal_row["payload_json"])
+        if routed_at < signal.available_at:
+            raise ValueError("signal cannot be routed before available_at")
+        expired = routed_at >= signal.expires_at
+        changed = False
+        for target in targets:
+            outbox_id = target.delivery_key(signal_id)
+            existing = connection.execute(
+                "SELECT status FROM delivery_outbox WHERE outbox_id = ?",
+                (outbox_id,),
+            ).fetchone()
+            if existing is not None:
+                if expired and existing["status"] in {
+                    OutboxStatus.PENDING.value,
+                    OutboxStatus.RETRY.value,
+                }:
+                    connection.execute(
+                        """
+                        UPDATE delivery_outbox
+                        SET status = ?, next_attempt_at = NULL,
+                            last_error = ?, updated_at = ?
+                        WHERE outbox_id = ?
+                        """,
+                        (
+                            OutboxStatus.EXPIRED.value,
+                            "signal expired before routing",
+                            _encode_time(routed_at),
+                            outbox_id,
+                        ),
+                    )
+                    changed = True
+                continue
+
+            created_at = signal.available_at if expired else routed_at
+            connection.execute(
+                """
+                INSERT INTO delivery_outbox(
+                    outbox_id, signal_id, global_sequence, recipient_id, channel,
+                    status, expires_at, attempt_count, next_attempt_at,
+                    lease_owner, lease_started_at, lease_until, last_error,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, NULL, NULL, ?, ?, ?)
+                """,
+                (
+                    outbox_id,
+                    signal_id,
+                    signal_row["global_sequence"],
+                    target.recipient_id,
+                    target.channel.value,
+                    (OutboxStatus.EXPIRED.value if expired else OutboxStatus.PENDING.value),
+                    _encode_time(signal.expires_at),
+                    "signal expired before routing" if expired else None,
+                    _encode_time(created_at),
+                    _encode_time(routed_at),
+                ),
+            )
+            changed = True
+        rows = self._select_outbox_rows(
+            connection,
+            signal_id=signal_id,
+            target_keys={(target.recipient_id, target.channel.value) for target in targets},
+        )
+        return rows, changed
+
+    def bind_route_source(
+        self,
+        descriptor: RouteSourceDescriptor,
+        *,
+        routing_policy_fingerprint: str,
+        observed_at: datetime,
+    ) -> SignalRouteCursor:
+        request = _RouteSourceBindingRequest(
+            descriptor=descriptor,
+            routing_policy_fingerprint=routing_policy_fingerprint,
+            observed_at=observed_at,
+        )
+        with self._write_transaction() as connection:
+            row = self._bind_route_source_in_transaction(connection, request)
+            return self._route_cursor_from_row(row)
+
+    def _bind_route_source_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        request: _RouteSourceBindingRequest,
+    ) -> sqlite3.Row:
+        descriptor = request.descriptor
+        row = connection.execute(
+            "SELECT * FROM signal_route_source WHERE source_id = ?",
+            (descriptor.source_id,),
+        ).fetchone()
+        now_text = _encode_time(request.observed_at)
+        if row is None:
+            connection.execute(
+                """
+                INSERT INTO signal_route_source(
+                    source_id, generation_id, strategy_spec_fingerprint,
+                    routing_policy_fingerprint, first_sequence,
+                    observed_high_watermark, last_sequence, last_signal_id,
+                    registered_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                """,
+                (
+                    descriptor.source_id,
+                    descriptor.generation_id,
+                    descriptor.strategy_spec_fingerprint,
+                    request.routing_policy_fingerprint,
+                    descriptor.first_sequence,
+                    descriptor.high_watermark,
+                    descriptor.first_sequence - 1,
+                    now_text,
+                    now_text,
+                ),
+            )
+        else:
+            immutable_fields = (
+                ("generation_id", descriptor.generation_id, "generation"),
+                (
+                    "strategy_spec_fingerprint",
+                    descriptor.strategy_spec_fingerprint,
+                    "strategy spec",
+                ),
+                (
+                    "routing_policy_fingerprint",
+                    request.routing_policy_fingerprint,
+                    "routing policy",
+                ),
+                ("first_sequence", descriptor.first_sequence, "first sequence"),
+            )
+            for column, expected, label in immutable_fields:
+                if row[column] != expected:
+                    raise SignalRouteConflictError(
+                        f"source {descriptor.source_id!r} {label} changed"
+                    )
+            observed_high = int(row["observed_high_watermark"])
+            last_sequence = int(row["last_sequence"])
+            if descriptor.high_watermark < observed_high:
+                raise SignalRouteSequenceError(
+                    f"source high watermark regressed from {observed_high} "
+                    f"to {descriptor.high_watermark}"
+                )
+            if descriptor.high_watermark < last_sequence:
+                raise SignalRouteSequenceError(
+                    "source high watermark is behind the committed cursor"
+                )
+            connection.execute(
+                """
+                UPDATE signal_route_source
+                SET observed_high_watermark = ?, updated_at = ?
+                WHERE source_id = ?
+                """,
+                (descriptor.high_watermark, now_text, descriptor.source_id),
+            )
+        bound = connection.execute(
+            "SELECT * FROM signal_route_source WHERE source_id = ?",
+            (descriptor.source_id,),
+        ).fetchone()
+        assert bound is not None
+        return bound
+
+    def route_cursor(self, source_id: str) -> SignalRouteCursor:
+        normalized = source_id.strip()
+        if not normalized:
+            raise ValueError("source_id must not be empty")
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM signal_route_source WHERE source_id = ?",
+                (normalized,),
+            ).fetchone()
+        if row is None:
+            return SignalRouteCursor(source_id=normalized, last_sequence=0)
+        return self._route_cursor_from_row(row)
+
+    def route_receipts(
+        self,
+        source_id: str | None = None,
+    ) -> tuple[SignalRouteReceipt, ...]:
+        with self._connect() as connection:
+            if source_id is None:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM signal_route_receipt
+                    ORDER BY source_id, source_sequence
+                    """
+                ).fetchall()
+            else:
+                normalized = source_id.strip()
+                if not normalized:
+                    raise ValueError("source_id must not be empty")
+                rows = connection.execute(
+                    """
+                    SELECT * FROM signal_route_receipt
+                    WHERE source_id = ? ORDER BY source_sequence
+                    """,
+                    (normalized,),
+                ).fetchall()
+        return tuple(self._route_receipt_from_row(row) for row in rows)
+
+    def commit_source_route(
+        self,
+        *,
+        descriptor: RouteSourceDescriptor,
+        routing_policy_fingerprint: str,
+        source_sequence: int,
+        signal: SignalEnvelope,
+        decision_kind: RouteDecisionKind,
+        decision_fingerprint: str,
+        reason_code: str | None,
+        targets: Iterable[DeliveryTarget],
+        routed_at: datetime,
+    ) -> SignalRouteCommitResult:
+        request = _SourceRouteCommitRequest(
+            descriptor=descriptor,
+            routing_policy_fingerprint=routing_policy_fingerprint,
+            source_sequence=source_sequence,
+            signal=signal,
+            decision_kind=decision_kind,
+            decision_fingerprint=decision_fingerprint,
+            reason_code=reason_code,
+            targets=canonical_delivery_targets(targets),
+            routed_at=routed_at,
+        )
+        manifest_json = _target_manifest_payload(request.targets)
+        manifest_hash = _payload_hash(manifest_json)
+        signal_id = request.signal.signal_id
+        if signal_id is None:
+            raise ValueError("signal_id must be materialized before routing")
+
+        with self._write_transaction() as connection:
+            source_row = self._bind_route_source_in_transaction(
+                connection,
+                _RouteSourceBindingRequest(
+                    descriptor=request.descriptor,
+                    routing_policy_fingerprint=request.routing_policy_fingerprint,
+                    observed_at=request.routed_at,
+                ),
+            )
+            existing = connection.execute(
+                """
+                SELECT * FROM signal_route_receipt
+                WHERE source_id = ? AND source_sequence = ?
+                """,
+                (request.descriptor.source_id, request.source_sequence),
+            ).fetchone()
+            if existing is not None:
+                stored = self._route_receipt_from_row(existing)
+                if (
+                    stored.signal_id != signal_id
+                    or stored.decision_fingerprint != request.decision_fingerprint
+                    or stored.target_manifest_hash != manifest_hash
+                    or stored.reason_code != request.reason_code
+                ):
+                    raise SignalRouteConflictError(
+                        "source sequence was already routed with a different decision"
+                    )
+                ingest_receipt, _changed = self._ingest_in_transaction(
+                    connection,
+                    request.signal,
+                    received_at=request.routed_at,
+                )
+                if ingest_receipt.disposition is RouterDisposition.QUARANTINED:
+                    raise SignalRouteConflictError(
+                        "source sequence signal payload conflicts with the stored signal"
+                    )
+                return SignalRouteCommitResult(receipt=stored, duplicate=True)
+
+            other_source = connection.execute(
+                "SELECT source_id, source_sequence FROM signal_route_receipt WHERE signal_id = ?",
+                (signal_id,),
+            ).fetchone()
+            if other_source is not None:
+                raise SignalRouteConflictError(
+                    "signal identity is already owned by another source receipt"
+                )
+            current_sequence = int(source_row["last_sequence"])
+            expected_sequence = current_sequence + 1
+            if request.source_sequence != expected_sequence:
+                raise SignalRouteSequenceError(
+                    f"expected runner sequence {expected_sequence}, got {request.source_sequence}"
+                )
+            if request.source_sequence > request.descriptor.high_watermark:
+                raise SignalRouteSequenceError(
+                    "source sequence exceeds the declared high watermark"
+                )
+            if request.signal.available_at > request.routed_at:
+                raise ValueError("future signal cannot be committed to the route ledger")
+
+            existing_targets = {
+                (row["recipient_id"], row["channel"])
+                for row in connection.execute(
+                    """
+                    SELECT recipient_id, channel FROM delivery_outbox
+                    WHERE signal_id = ?
+                    """,
+                    (signal_id,),
+                ).fetchall()
+            }
+            desired_targets = {
+                (target.recipient_id, target.channel.value) for target in request.targets
+            }
+            if existing_targets and existing_targets != desired_targets:
+                raise SignalRouteConflictError(
+                    "existing outbox targets conflict with the frozen target manifest"
+                )
+            if request.decision_kind is RouteDecisionKind.NO_TARGET and existing_targets:
+                raise SignalRouteConflictError(
+                    "no-target decision conflicts with existing outbox targets"
+                )
+
+            ingest_receipt, _changed = self._ingest_in_transaction(
+                connection,
+                request.signal,
+                received_at=request.routed_at,
+            )
+            if ingest_receipt.disposition is RouterDisposition.QUARANTINED:
+                raise SignalRouteConflictError("signal payload was quarantined")
+
+            if request.decision_kind is RouteDecisionKind.NO_TARGET:
+                disposition = RouteReceiptDisposition.NO_TARGET
+            else:
+                self._route_in_transaction(
+                    connection,
+                    signal_id=signal_id,
+                    targets=request.targets,
+                    routed_at=request.routed_at,
+                )
+                disposition = (
+                    RouteReceiptDisposition.EXPIRED
+                    if request.routed_at >= request.signal.expires_at
+                    else RouteReceiptDisposition.ROUTED
+                )
+            connection.execute(
+                """
+                INSERT INTO signal_route_receipt(
+                    source_id, source_sequence, signal_id, decision_fingerprint,
+                    disposition, reason_code, target_manifest_hash,
+                    target_manifest_json, routed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    request.descriptor.source_id,
+                    request.source_sequence,
+                    signal_id,
+                    request.decision_fingerprint,
+                    disposition.value,
+                    request.reason_code,
+                    manifest_hash,
+                    manifest_json,
+                    _encode_time(request.routed_at),
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE signal_route_source
+                SET last_sequence = ?, last_signal_id = ?, updated_at = ?
+                WHERE source_id = ?
+                """,
+                (
+                    request.source_sequence,
+                    signal_id,
+                    _encode_time(request.routed_at),
+                    request.descriptor.source_id,
+                ),
+            )
+            self._before_commit(connection)
+            receipt_row = connection.execute(
+                """
+                SELECT * FROM signal_route_receipt
+                WHERE source_id = ? AND source_sequence = ?
+                """,
+                (request.descriptor.source_id, request.source_sequence),
+            ).fetchone()
+            assert receipt_row is not None
+            return SignalRouteCommitResult(
+                receipt=self._route_receipt_from_row(receipt_row),
+                duplicate=False,
+            )
 
     def claim_due(
         self,
@@ -1063,6 +1605,41 @@ class SignalBusStore:
             observed_at=_require_time(row["observed_at"]),
             reason=row["reason"],
             provider_receipt=row["provider_receipt"],
+        )
+
+    @staticmethod
+    def _route_cursor_from_row(row: sqlite3.Row) -> SignalRouteCursor:
+        return SignalRouteCursor(
+            source_id=row["source_id"],
+            generation_id=row["generation_id"],
+            strategy_spec_fingerprint=row["strategy_spec_fingerprint"],
+            routing_policy_fingerprint=row["routing_policy_fingerprint"],
+            first_sequence=row["first_sequence"],
+            observed_high_watermark=row["observed_high_watermark"],
+            last_sequence=row["last_sequence"],
+            last_signal_id=row["last_signal_id"],
+            updated_at=_decode_time(row["updated_at"]),
+        )
+
+    @staticmethod
+    def _route_receipt_from_row(row: sqlite3.Row) -> SignalRouteReceipt:
+        raw_targets = json.loads(row["target_manifest_json"])
+        if not isinstance(raw_targets, list):
+            raise ValueError("stored target manifest must be a list")
+        targets = tuple(DeliveryTarget.model_validate(item) for item in raw_targets)
+        if _payload_hash(_target_manifest_payload(targets)) != row["target_manifest_hash"]:
+            raise ValueError("stored target manifest hash does not match its payload")
+        return SignalRouteReceipt(
+            source_id=row["source_id"],
+            source_sequence=row["source_sequence"],
+            signal_id=row["signal_id"],
+            decision_fingerprint=row["decision_fingerprint"],
+            disposition=RouteReceiptDisposition(row["disposition"]),
+            reason_code=row["reason_code"],
+            target_manifest_hash=row["target_manifest_hash"],
+            targets=targets,
+            target_count=len(targets),
+            routed_at=_require_time(row["routed_at"]),
         )
 
 
