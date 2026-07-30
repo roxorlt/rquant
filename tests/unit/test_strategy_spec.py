@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from datetime import UTC, date, datetime
+from decimal import Decimal
+
 import pytest
 from pydantic import ValidationError
 
@@ -166,13 +169,21 @@ def test_strategy_fingerprints_are_stable_for_semantic_ordering() -> None:
 
 
 def test_strategy_spec_round_trips_through_json_without_thawing_parameters() -> None:
-    spec = _spec()
+    spec = _spec(
+        parameters={
+            "threshold": Decimal("1.40"),
+            "training_date": date(2026, 7, 30),
+            "visible_at": datetime(2026, 7, 31, 1, 31, tzinfo=UTC),
+        }
+    )
 
     restored = StrategySpec.model_validate_json(spec.model_dump_json())
 
     assert restored == spec
+    assert restored.parameters["threshold"] == Decimal("1.40")
+    assert restored.parameters["training_date"] == date(2026, 7, 30)
     with pytest.raises(TypeError):
-        spec.parameters["top_n"] = 4
+        spec.parameters["threshold"] = Decimal("2")
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])

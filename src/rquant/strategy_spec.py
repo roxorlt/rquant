@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from enum import StrEnum
+from datetime import UTC, date, datetime
+from decimal import Decimal
+from enum import Enum, StrEnum
 from types import MappingProxyType
 
 from pydantic import Field, field_serializer, field_validator, model_validator
@@ -34,6 +36,15 @@ class StateTransition(RuntimeContractModel):
 
 def _freeze_parameter(value: object) -> object:
     if isinstance(value, Mapping):
+        if set(value) == {"$decimal"}:
+            return Decimal(str(value["$decimal"]))
+        if set(value) == {"$datetime"}:
+            parsed = datetime.fromisoformat(str(value["$datetime"]))
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                raise ValueError("tagged strategy datetime must be timezone-aware")
+            return parsed.astimezone(UTC)
+        if set(value) == {"$date"}:
+            return date.fromisoformat(str(value["$date"]))
         if any(not isinstance(key, str) for key in value):
             raise TypeError("strategy parameter mappings require string keys")
         return MappingProxyType(
@@ -47,11 +58,21 @@ def _freeze_parameter(value: object) -> object:
     return value
 
 
-def _thaw_parameter(value: object) -> object:
+def _serialize_parameter(value: object) -> object:
     if isinstance(value, Mapping):
-        return {key: _thaw_parameter(item) for key, item in value.items()}
+        return {key: _serialize_parameter(item) for key, item in value.items()}
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        return [_thaw_parameter(item) for item in value]
+        return [_serialize_parameter(item) for item in value]
+    if isinstance(value, Decimal):
+        return {"$decimal": format(value.normalize(), "f")}
+    if isinstance(value, datetime):
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("strategy datetime parameters must be timezone-aware")
+        return {"$datetime": value.astimezone(UTC).isoformat(timespec="microseconds")}
+    if isinstance(value, date):
+        return {"$date": value.isoformat()}
+    if isinstance(value, Enum):
+        return value.value
     return value
 
 
@@ -91,10 +112,10 @@ class StrategySpec(RuntimeContractModel):
 
     @field_serializer("parameters")
     def serialize_parameters(self, value: Mapping[str, object]) -> dict[str, object]:
-        thawed = _thaw_parameter(value)
-        if not isinstance(thawed, dict):
+        serialized = _serialize_parameter(value)
+        if not isinstance(serialized, dict):
             raise TypeError("parameters must serialize as a mapping")
-        return thawed
+        return serialized
 
     @field_validator("allowed_actions")
     @classmethod
