@@ -139,8 +139,8 @@ def _collect_cleanup_error(
         *,
         node_start: int,
         work_start: int,
-        node_limit: int | None = None,
-        work_limit: int | None = None,
+        node_limit: int,
+        work_limit: int,
     ) -> _CleanupBudgetScope:
         return _CleanupBudgetScope(
             group=group,
@@ -149,15 +149,23 @@ def _collect_cleanup_error(
             frame_start=len(frames),
             node_start=node_start,
             work_start=work_start,
-            node_limit=max(
-                1,
-                _CLEANUP_GROUP_NODE_BUDGET // 4 if node_limit is None else node_limit,
-            ),
-            work_limit=max(
-                1,
-                _CLEANUP_GROUP_WORK_BUDGET // 4 if work_limit is None else work_limit,
-            ),
+            node_limit=max(1, node_limit),
+            work_limit=max(1, work_limit),
             signatures={},
+        )
+
+    def sibling_limits(
+        parent_scope: _CleanupBudgetScope,
+        *,
+        node_start: int,
+        work_start: int,
+        remaining_siblings: int,
+    ) -> tuple[int, int]:
+        node_remaining = parent_scope.node_limit - (node_start - parent_scope.node_start)
+        work_remaining = parent_scope.work_limit - (work_start - parent_scope.work_start)
+        return (
+            node_remaining // remaining_siblings,
+            work_remaining // remaining_siblings,
         )
 
     def inspect_group(group: BaseExceptionGroup) -> tuple[BaseException, ...] | None:
@@ -283,12 +291,13 @@ def _collect_cleanup_error(
         if isinstance(current, BaseExceptionGroup) and (
             (frame is frames[0] and preserve_root_evidence) or len(frame.nested_errors) > 1
         ):
-            node_limit = None
-            work_limit = None
-            if frame is frames[0]:
-                remaining_siblings = len(frame.nested_errors) - frame.next_index + 1
-                node_limit = (_CLEANUP_GROUP_NODE_BUDGET - (node_count - 1)) // remaining_siblings
-                work_limit = (_CLEANUP_GROUP_WORK_BUDGET - (work_count - 2)) // remaining_siblings
+            remaining_siblings = len(frame.nested_errors) - frame.next_index + 1
+            node_limit, work_limit = sibling_limits(
+                frame.scope,
+                node_start=node_count - 1,
+                work_start=work_count - 2,
+                remaining_siblings=remaining_siblings,
+            )
             scope = make_scope(
                 current,
                 node_start=node_count - 1,
@@ -358,10 +367,19 @@ def _collect_cleanup_error(
             emitted.add(current_id)
             continue
         if scope is frame.scope and len(nested_errors) > 1:
+            remaining_siblings = len(frame.nested_errors) - frame.next_index + 1
+            node_limit, work_limit = sibling_limits(
+                frame.scope,
+                node_start=node_count - 1,
+                work_start=work_count - 3,
+                remaining_siblings=remaining_siblings,
+            )
             scope = make_scope(
                 current,
                 node_start=node_count - 1,
                 work_start=work_count - 3,
+                node_limit=node_limit,
+                work_limit=work_limit,
             )
         if repeated_expansion(scope, current, nested_errors):
             preserve_scope(scope)
@@ -1681,10 +1699,14 @@ class _DarwinKqueueProcessTracker:
             if queue is None:
                 raise ContainedProcessError("kernel process tracker queue is not initialized")
             while not self._stop.is_set():
+                with self._condition:
+                    if self._error is not None:
+                        return
                 if time.monotonic() >= self._deadline:
                     raise TimeoutError("kernel tracker deadline expired")
                 _require_no_execution_hooks()
                 events = queue.control(None, 256, 0.01)  # type: ignore[attr-defined]
+                _require_no_execution_hooks()
                 fork_observed = False
                 for event in events:
                     if event.fflags & select.KQ_NOTE_TRACKERR:
@@ -1719,7 +1741,8 @@ class _DarwinKqueueProcessTracker:
             if self._stop.is_set() and isinstance(exc, OSError) and exc.errno == errno.EBADF:
                 return
             with self._condition:
-                self._error = exc
+                if self._error is None:
+                    self._error = exc
                 self._condition.notify_all()
 
     def poll(self, *, deadline: float) -> dict[int, ProcessIdentity]:

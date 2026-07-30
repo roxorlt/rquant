@@ -710,7 +710,7 @@ def test_darwin_track_stops_before_next_control_when_hook_activates(
     def gate() -> None:
         nonlocal gate_calls
         gate_calls += 1
-        if gate_calls == 3:
+        if gate_calls == 4:
             raise activation_error
 
     tracker._queue = Queue()
@@ -720,7 +720,7 @@ def test_darwin_track_stops_before_next_control_when_hook_activates(
 
     tracker._track()
 
-    assert gate_calls == 3
+    assert gate_calls == 4
     assert control_calls == 1
     assert tracker._poll_generation == 1
     assert tracker._error is activation_error
@@ -729,6 +729,127 @@ def test_darwin_track_stops_before_next_control_when_hook_activates(
     ) as caught:
         tracker.poll(deadline=time.monotonic() + 1)
     assert caught.value.__cause__ is activation_error
+
+
+@pytest.mark.parametrize("error_timing", ("before", "during"))
+def test_darwin_track_preserves_first_error_across_later_control_failure(
+    error_timing: str,
+) -> None:
+    tracker = contained._DarwinKqueueProcessTracker()
+    first_error = RuntimeError("first tracker error")
+    later_error = OSError("later queue failure")
+    control_calls = 0
+
+    class Queue:
+        def control(self, *_args: object) -> list[object]:
+            nonlocal control_calls
+            control_calls += 1
+            if error_timing == "during":
+                with tracker._condition:
+                    tracker._error = first_error
+                    tracker._condition.notify_all()
+            raise later_error
+
+    tracker._queue = Queue()
+    tracker._owns_queue = True
+    tracker._deadline = time.monotonic() + 1
+    if error_timing == "before":
+        tracker._error = first_error
+
+    tracker._track()
+
+    assert control_calls == (0 if error_timing == "before" else 1)
+    assert tracker._error is first_error
+    with pytest.raises(
+        contained.ContainedProcessError,
+        match="kernel process tracking failed",
+    ) as caught:
+        tracker.poll(deadline=time.monotonic() + 1)
+    assert caught.value.__cause__ is first_error
+
+
+@pytest.mark.parametrize("hook_kind", ("none", "trace", "profile", "both"))
+def test_darwin_track_rechecks_hooks_immediately_after_control(
+    monkeypatch: pytest.MonkeyPatch,
+    hook_kind: str,
+) -> None:
+    original_trace = sys.gettrace()
+    original_profile = sys.getprofile()
+    tracker = contained._DarwinKqueueProcessTracker()
+    root = contained.ProcessIdentity(101, (1, 0))
+    control_calls = 0
+    inventory_calls = 0
+
+    class Event:
+        fflags = 16
+
+    class Queue:
+        def control(self, *_args: object) -> list[object]:
+            nonlocal control_calls
+            control_calls += 1
+            sys.settrace(trace_hook if hook_kind in {"trace", "both"} else None)
+            sys.setprofile(profile_hook if hook_kind in {"profile", "both"} else None)
+            tracker._stop.set()
+            return [Event()]
+
+    def trace_hook(_frame: object, _event: str, _arg: object) -> object:
+        return trace_hook
+
+    def profile_hook(_frame: object, _event: str, _arg: object) -> None:
+        return None
+
+    def inventory(
+        _deadline: float,
+        *,
+        started_at_or_after: tuple[int, int],
+    ) -> dict[int, contained._ProcessObservation]:
+        nonlocal inventory_calls
+        inventory_calls += 1
+        assert started_at_or_after == root.started
+        return {
+            root.pid: contained._ProcessObservation(identity=root, parent_pid=1),
+        }
+
+    tracker._queue = Queue()
+    tracker._owns_queue = True
+    tracker._root_pid = root.pid
+    tracker._root_started = root.started
+    tracker._known[root.pid] = root
+    tracker._registered.add(root.pid)
+    tracker._deadline = time.monotonic() + 1
+    monkeypatch.setattr(contained.select, "KQ_NOTE_FORK", Event.fflags)
+    monkeypatch.setattr(contained.select, "KQ_NOTE_TRACKERR", 32)
+    monkeypatch.setattr(contained, "_darwin_process_inventory", inventory)
+    expected_known = dict(tracker._known)
+    expected_registered = set(tracker._registered)
+    try:
+        _clear_execution_hooks()
+
+        tracker._track()
+
+        assert control_calls == 1
+        assert tracker._known == expected_known
+        assert tracker._registered == expected_registered
+        if hook_kind == "none":
+            assert inventory_calls == 1
+            assert tracker._poll_generation == 1
+            assert tracker._error is None
+        else:
+            assert inventory_calls == 0
+            assert tracker._poll_generation == 0
+            hook_error = tracker._error
+            assert isinstance(hook_error, contained.ContainedProcessError)
+            assert str(hook_error) == (
+                "contained acquisition does not support active execution hooks"
+            )
+            with pytest.raises(
+                contained.ContainedProcessError,
+                match="kernel process tracking failed",
+            ) as caught:
+                tracker.poll(deadline=time.monotonic() + 1)
+            assert caught.value.__cause__ is hook_error
+    finally:
+        _restore_execution_hooks_for_test(original_trace, original_profile)
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="Darwin kqueue hook contract")
@@ -1248,6 +1369,53 @@ def test_cleanup_budget_isolates_fresh_marker_root_siblings_for_all_sources(
         errors,
         error_label="root sibling cleanup",
         note="root sibling cleanup note",
+    )
+
+    cleanup_group = getattr(primary, "cleanup_error_group", None)
+    assert isinstance(cleanup_group, BaseExceptionGroup)
+    assert cleanup_group.exceptions == (*expanding, legal_leaf, after, later)
+
+
+@pytest.mark.parametrize("source", ("existing", "new"))
+def test_cleanup_budget_isolates_nested_fresh_marker_siblings_for_all_sources(
+    source: str,
+) -> None:
+    class FreshMarkerCleanupGroup(BaseExceptionGroup):
+        marker = 0
+
+        @property
+        def exceptions(self) -> tuple[BaseException, ...]:
+            type(self).marker += 1
+            return (
+                FreshMarkerCleanupGroup(
+                    f"fresh marker {type(self).marker}",
+                    [OSError("hidden")],
+                ),
+            )
+
+    primary = RuntimeError("primary")
+    expanding = tuple(
+        FreshMarkerCleanupGroup(f"nested root {index}", [OSError("hidden")]) for index in range(4)
+    )
+    legal_leaf = LookupError("legal nested cleanup")
+    legal_group = BaseExceptionGroup("legal cleanup", [legal_leaf])
+    after = ValueError("after cleanup")
+    later = InterruptedError("later cleanup")
+    branch = BaseExceptionGroup(
+        "branch cleanup",
+        [*expanding, legal_group, after],
+    )
+    wrapper = BaseExceptionGroup("wrapper cleanup", [branch])
+    errors: list[BaseException] = [wrapper, later]
+    if source == "existing":
+        primary.cleanup_error_group = wrapper  # type: ignore[attr-defined]
+        errors = [later]
+
+    contained._attach_cleanup_error_group(
+        primary,
+        errors,
+        error_label="nested sibling cleanup",
+        note="nested sibling cleanup note",
     )
 
     cleanup_group = getattr(primary, "cleanup_error_group", None)
