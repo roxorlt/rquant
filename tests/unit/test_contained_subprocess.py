@@ -526,35 +526,52 @@ def test_darwin_register_root_rechecks_hooks_after_registration_handoffs(
         _restore_execution_hooks_for_test(original_trace, original_profile)
 
 
-@pytest.mark.parametrize("hook_kind", ("trace", "profile", "both"))
-def test_darwin_register_root_rolls_back_constructor_hook_failure_for_retry(
-    monkeypatch: pytest.MonkeyPatch,
-    hook_kind: str,
+def _assert_darwin_tracker_pristine(
+    tracker: contained._DarwinKqueueProcessTracker,
 ) -> None:
-    original_trace = sys.gettrace()
-    original_profile = sys.getprofile()
+    assert tracker._known == {}
+    assert tracker._registered == set()
+    assert tracker._root_pid is None
+    assert tracker._root_started is None
+    assert tracker._thread is None
+    assert tracker._error is None
+    assert tracker._poll_generation == 0
+    assert tracker._deadline == 0.0
+    assert not tracker._stop.is_set()
+    assert tracker._queue is None
+    assert not tracker._owns_queue
+    assert tracker._construction_error is None
+    assert not getattr(tracker, "_queue_tainted", False)
+
+
+def test_darwin_register_root_rejects_non_pristine_tracker_without_side_effects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     tracker = contained._DarwinKqueueProcessTracker()
-    unrelated = contained.ProcessIdentity(77, (7, 0))
-    identities = [contained.ProcessIdentity(101, (1, 0))]
-    controls = 0
-    constructors = 0
+    old_identity = contained.ProcessIdentity(77, (7, 0))
+    new_identity = contained.ProcessIdentity(101, (1, 0))
+    first_error = RuntimeError("first tracker error")
+    calls = {"observe": 0, "control": 0, "construct": 0, "join": 0, "close": 0}
 
     class Queue:
-        def control(self, changes: object, *_args: object) -> list[object]:
-            nonlocal controls
-            assert changes is not None
-            controls += 1
+        def control(self, *_args: object) -> list[object]:
+            calls["control"] += 1
             return []
 
         def close(self) -> None:
-            return None
+            calls["close"] += 1
 
-    class Thread:
+    class OldThread:
+        def join(self, *, timeout: float) -> None:
+            assert timeout >= 0
+            calls["join"] += 1
+
+        def is_alive(self) -> bool:
+            return True
+
+    class NewThread:
         def __init__(self, **_kwargs: object) -> None:
-            nonlocal constructors
-            constructors += 1
-            if constructors == 1:
-                activate_hooks()
+            calls["construct"] += 1
 
         def start(self) -> None:
             return None
@@ -566,214 +583,382 @@ def test_darwin_register_root_rolls_back_constructor_hook_failure_for_retry(
             return False
 
     def observe(_pid: int) -> contained._ProcessObservation:
-        return contained._ProcessObservation(identity=identities[0], parent_pid=1)
+        calls["observe"] += 1
+        return contained._ProcessObservation(identity=new_identity, parent_pid=1)
 
-    def trace_hook(_frame: object, _event: str, _arg: object) -> object:
-        return trace_hook
-
-    def profile_hook(_frame: object, _event: str, _arg: object) -> None:
-        return None
-
-    def activate_hooks() -> None:
-        sys.settrace(trace_hook if hook_kind in {"trace", "both"} else None)
-        sys.setprofile(profile_hook if hook_kind in {"profile", "both"} else None)
-
-    tracker._queue = Queue()
+    queue = Queue()
+    old_thread = OldThread()
+    tracker._queue = queue
     tracker._owns_queue = True
-    tracker._known[unrelated.pid] = unrelated
-    tracker._registered.add(unrelated.pid)
+    tracker._known[old_identity.pid] = old_identity
+    tracker._registered.add(old_identity.pid)
+    tracker._root_pid = old_identity.pid
+    tracker._root_started = old_identity.started
+    tracker._thread = old_thread  # type: ignore[assignment]
+    tracker._error = first_error
+    tracker._poll_generation = 9
     tracker._deadline = 0.25
-    tracker._poll_generation = 5
     monkeypatch.setattr(contained, "_darwin_process_observation", observe)
-    monkeypatch.setattr(contained.select, "kqueue", Queue)
-    monkeypatch.setattr(contained.select, "kevent", lambda *_args, **_kwargs: object())
-    monkeypatch.setattr(contained.select, "KQ_FILTER_PROC", 1)
-    monkeypatch.setattr(contained.select, "KQ_EV_ADD", 2)
-    monkeypatch.setattr(contained.select, "KQ_EV_ENABLE", 4)
-    monkeypatch.setattr(contained.select, "KQ_EV_CLEAR", 8)
-    monkeypatch.setattr(contained.select, "KQ_NOTE_FORK", 16)
-    monkeypatch.setattr(contained.select, "KQ_NOTE_EXIT", 32)
-    monkeypatch.setattr(contained.threading, "Thread", Thread)
-    try:
-        _clear_execution_hooks()
-        with pytest.raises(
-            contained.ContainedProcessError,
-            match="contained acquisition does not support active execution hooks",
-        ):
-            tracker.register_root(identities[0].pid, deadline=time.monotonic() + 1)
+    monkeypatch.setattr(contained.threading, "Thread", NewThread)
 
-        assert tracker._known == {unrelated.pid: unrelated}
-        assert tracker._registered == {unrelated.pid}
-        assert tracker._root_pid is None
-        assert tracker._root_started is None
-        assert tracker._thread is None
-        assert tracker._error is None
-        assert tracker._poll_generation == 5
-        assert tracker._deadline == 0.25
-        assert not tracker._stop.is_set()
-        assert controls == 1
+    with pytest.raises(contained.ContainedProcessError, match="not pristine"):
+        tracker.register_root(new_identity.pid, deadline=time.monotonic() + 1)
 
-        _clear_execution_hooks()
-        identities[0] = contained.ProcessIdentity(101, (2, 0))
-        assert (
-            tracker.register_root(identities[0].pid, deadline=time.monotonic() + 1) == identities[0]
-        )
-        assert controls == 2
-    finally:
-        _clear_execution_hooks()
-        tracker.close()
-        _restore_execution_hooks_for_test(original_trace, original_profile)
-
-    assert tracker._known == {}
-    assert tracker._registered == set()
-    assert tracker._root_pid is None
-    assert tracker._root_started is None
-    assert tracker._thread is None
-    assert tracker._error is None
-    assert tracker._poll_generation == 0
-    assert tracker._deadline == 0.0
+    assert calls == {"observe": 0, "control": 0, "construct": 0, "join": 0, "close": 0}
+    assert tracker._queue is queue
+    assert tracker._thread is old_thread
+    assert tracker._known == {old_identity.pid: old_identity}
+    assert tracker._registered == {old_identity.pid}
+    assert tracker._root_pid == old_identity.pid
+    assert tracker._error is first_error
+    assert tracker._poll_generation == 9
     assert not tracker._stop.is_set()
-    assert tracker._queue is None
-    assert not tracker._owns_queue
 
 
-@pytest.mark.parametrize("hook_kind", ("trace", "profile", "both"))
-@pytest.mark.parametrize("join_succeeds", (True, False), ids=("joined", "join-failed"))
-def test_darwin_register_root_rolls_back_started_thread_or_retains_ownership(
+def test_darwin_register_root_serializes_concurrent_callers(
     monkeypatch: pytest.MonkeyPatch,
-    hook_kind: str,
-    join_succeeds: bool,
 ) -> None:
-    original_trace = sys.gettrace()
-    original_profile = sys.getprofile()
     tracker = contained._DarwinKqueueProcessTracker()
-    unrelated = contained.ProcessIdentity(77, (7, 0))
-    identities = [contained.ProcessIdentity(101, (1, 0))]
-    first_error = RuntimeError("first tracker error")
-    controls = 0
-    threads: list[Thread] = []
+    real_thread = threading.Thread
+    caller_barrier = threading.Barrier(3)
+    first_acquire = threading.Event()
+    second_acquire = threading.Event()
+    release_acquire = threading.Event()
+    result_lock = threading.Lock()
+    queues: list[Queue] = []
+    results: list[contained.ProcessIdentity] = []
+    errors: list[BaseException] = []
 
     class Queue:
+        def __init__(self) -> None:
+            self.controls = 0
+            self.closes = 0
+
         def control(self, changes: object, *_args: object) -> list[object]:
-            nonlocal controls
             assert changes is not None
-            controls += 1
+            self.controls += 1
             return []
 
         def close(self) -> None:
+            self.closes += 1
+
+    class RegistrationThread:
+        def __init__(self, **_kwargs: object) -> None:
             return None
+
+        def start(self) -> None:
+            return None
+
+        def join(self, *, timeout: float) -> None:
+            assert timeout >= 0
+
+        def is_alive(self) -> bool:
+            return False
+
+    def acquire_queue() -> Queue:
+        queue = Queue()
+        queues.append(queue)
+        if len(queues) == 1:
+            first_acquire.set()
+            assert release_acquire.wait(timeout=1)
+        else:
+            second_acquire.set()
+        return queue
+
+    def observe(pid: int) -> contained._ProcessObservation:
+        return contained._ProcessObservation(
+            identity=contained.ProcessIdentity(pid, (pid, 0)),
+            parent_pid=1,
+        )
+
+    def register(pid: int) -> None:
+        caller_barrier.wait(timeout=1)
+        try:
+            result = tracker.register_root(pid, deadline=time.monotonic() + 2)
+        except BaseException as exc:
+            with result_lock:
+                errors.append(exc)
+        else:
+            with result_lock:
+                results.append(result)
+
+    monkeypatch.setattr(contained.select, "kqueue", acquire_queue)
+    monkeypatch.setattr(contained.select, "kevent", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(contained, "_darwin_process_observation", observe)
+    monkeypatch.setattr(contained.threading, "Thread", RegistrationThread)
+    callers = [real_thread(target=register, args=(pid,)) for pid in (101, 102)]
+    for caller in callers:
+        caller.start()
+    caller_barrier.wait(timeout=1)
+    assert first_acquire.wait(timeout=1)
+    second_acquire.wait(timeout=0.1)
+    release_acquire.set()
+    for caller in callers:
+        caller.join(timeout=2)
+        assert not caller.is_alive()
+
+    assert len(results) == 1
+    assert len(errors) == 1
+    assert isinstance(errors[0], contained.ContainedProcessError)
+    assert "not pristine" in str(errors[0])
+    assert len(queues) == 1
+    assert queues[0].controls == 1
+    tracker.close()
+    assert queues[0].closes == 1
+    _assert_darwin_tracker_pristine(tracker)
+
+
+@pytest.mark.parametrize("failure_boundary", ("constructor", "start"))
+def test_darwin_register_root_discards_tainted_preinitialized_queue_for_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_boundary: str,
+) -> None:
+    tracker = contained._DarwinKqueueProcessTracker()
+    identity = contained.ProcessIdentity(101, (1, 0))
+    startup_error = RuntimeError(f"{failure_boundary} failed")
+    queues: list[Queue] = []
+    constructor_calls = 0
+
+    class Queue:
+        def __init__(self) -> None:
+            self.controls = 0
+            self.closes = 0
+
+        def control(self, changes: object, *_args: object) -> list[object]:
+            assert changes is not None
+            self.controls += 1
+            return []
+
+        def close(self) -> None:
+            self.closes += 1
+
+    class Thread:
+        def __init__(self, **_kwargs: object) -> None:
+            nonlocal constructor_calls
+            constructor_calls += 1
+            self.attempt = constructor_calls
+            if failure_boundary == "constructor" and self.attempt == 1:
+                raise startup_error
+
+        def start(self) -> None:
+            if failure_boundary == "start" and self.attempt == 1:
+                raise startup_error
+
+        def join(self, *, timeout: float) -> None:
+            assert timeout >= 0
+
+        def is_alive(self) -> bool:
+            return False
+
+    def acquire_queue() -> Queue:
+        queue = Queue()
+        queues.append(queue)
+        return queue
+
+    def observe(_pid: int) -> contained._ProcessObservation:
+        return contained._ProcessObservation(identity=identity, parent_pid=1)
+
+    monkeypatch.setattr(contained.select, "kqueue", acquire_queue)
+    monkeypatch.setattr(contained.select, "kevent", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(contained, "_darwin_process_observation", observe)
+    monkeypatch.setattr(contained.threading, "Thread", Thread)
+    tracker._initialize_queue()
+    assert len(queues) == 1
+
+    with pytest.raises(RuntimeError) as caught:
+        tracker.register_root(identity.pid, deadline=time.monotonic() + 1)
+
+    assert caught.value is startup_error
+    assert queues[0].controls == 1
+    assert queues[0].closes == 1
+    _assert_darwin_tracker_pristine(tracker)
+
+    assert tracker.register_root(identity.pid, deadline=time.monotonic() + 1) == identity
+    assert len(queues) == 2
+    assert queues[1].controls == 1
+    tracker.close()
+    assert queues[1].closes == 1
+    _assert_darwin_tracker_pristine(tracker)
+
+
+def test_darwin_register_root_retains_live_failed_start_and_first_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tracker = contained._DarwinKqueueProcessTracker()
+    identity = contained.ProcessIdentity(101, (1, 0))
+    startup_error = RuntimeError("thread start failed")
+    first_error = LookupError("first tracker error")
+
+    class Queue:
+        def __init__(self) -> None:
+            self.controls = 0
+            self.closes = 0
+
+        def control(self, changes: object, *_args: object) -> list[object]:
+            assert changes is not None
+            self.controls += 1
+            return []
+
+        def close(self) -> None:
+            self.closes += 1
 
     class Thread:
         def __init__(self, **_kwargs: object) -> None:
             self.alive = False
-            self.allow_join = join_succeeds
-            threads.append(self)
+            self.allow_stop = False
 
         def start(self) -> None:
-            if len(threads) != 1:
-                return
             self.alive = True
             with tracker._condition:
                 tracker._error = first_error
                 tracker._poll_generation = 12279
                 tracker._condition.notify_all()
-            activate_hooks()
+            raise startup_error
 
         def join(self, *, timeout: float) -> None:
             assert timeout >= 0
-            if self.allow_join:
+            if self.allow_stop:
                 self.alive = False
 
         def is_alive(self) -> bool:
             return self.alive
 
-    def observe(_pid: int) -> contained._ProcessObservation:
-        return contained._ProcessObservation(identity=identities[0], parent_pid=1)
-
-    def trace_hook(_frame: object, _event: str, _arg: object) -> object:
-        return trace_hook
-
-    def profile_hook(_frame: object, _event: str, _arg: object) -> None:
-        return None
-
-    def activate_hooks() -> None:
-        sys.settrace(trace_hook if hook_kind in {"trace", "both"} else None)
-        sys.setprofile(profile_hook if hook_kind in {"profile", "both"} else None)
-
-    tracker._queue = Queue()
+    queue = Queue()
+    tracker._queue = queue
     tracker._owns_queue = True
-    tracker._known[unrelated.pid] = unrelated
-    tracker._registered.add(unrelated.pid)
-    tracker._deadline = 0.25
-    tracker._poll_generation = 5
-    monkeypatch.setattr(contained, "_darwin_process_observation", observe)
-    monkeypatch.setattr(contained.select, "kqueue", Queue)
     monkeypatch.setattr(contained.select, "kevent", lambda *_args, **_kwargs: object())
-    monkeypatch.setattr(contained.select, "KQ_FILTER_PROC", 1)
-    monkeypatch.setattr(contained.select, "KQ_EV_ADD", 2)
-    monkeypatch.setattr(contained.select, "KQ_EV_ENABLE", 4)
-    monkeypatch.setattr(contained.select, "KQ_EV_CLEAR", 8)
-    monkeypatch.setattr(contained.select, "KQ_NOTE_FORK", 16)
-    monkeypatch.setattr(contained.select, "KQ_NOTE_EXIT", 32)
+    monkeypatch.setattr(
+        contained,
+        "_darwin_process_observation",
+        lambda _pid: contained._ProcessObservation(identity=identity, parent_pid=1),
+    )
     monkeypatch.setattr(contained.threading, "Thread", Thread)
-    try:
-        _clear_execution_hooks()
-        with pytest.raises(
-            contained.ContainedProcessError,
-            match="contained acquisition does not support active execution hooks",
-        ) as caught:
-            tracker.register_root(identities[0].pid, deadline=time.monotonic() + 1)
 
-        if join_succeeds:
-            assert tracker._known == {unrelated.pid: unrelated}
-            assert tracker._registered == {unrelated.pid}
-            assert tracker._root_pid is None
-            assert tracker._root_started is None
-            assert tracker._thread is None
-            assert tracker._error is None
-            assert tracker._poll_generation == 5
-            assert tracker._deadline == 0.25
-            assert not tracker._stop.is_set()
-        else:
-            assert tracker._thread is threads[0]
-            assert tracker._root_pid == identities[0].pid
-            assert tracker._known[identities[0].pid] == identities[0]
-            assert identities[0].pid in tracker._registered
-            assert tracker._error is first_error
-            assert tracker._poll_generation == 12279
-            assert tracker._stop.is_set()
-            cleanup_group = getattr(caught.value, "cleanup_error_group", None)
-            assert isinstance(cleanup_group, BaseExceptionGroup)
+    with pytest.raises(RuntimeError) as caught:
+        tracker.register_root(identity.pid, deadline=time.monotonic() + 1)
 
-        _clear_execution_hooks()
-        if not join_succeeds:
-            threads[0].allow_join = True
-            tracker.close()
-            tracker._queue = Queue()
-            tracker._owns_queue = True
-        identities[0] = contained.ProcessIdentity(101, (2, 0))
-        assert (
-            tracker.register_root(identities[0].pid, deadline=time.monotonic() + 1) == identities[0]
-        )
-        assert controls == 2
-    finally:
-        _clear_execution_hooks()
-        if tracker._thread is not None and threads:
-            threads[-1].allow_join = True
+    assert caught.value is startup_error
+    cleanup_group = getattr(caught.value, "cleanup_error_group", None)
+    assert isinstance(cleanup_group, BaseExceptionGroup)
+    thread = tracker._thread
+    assert isinstance(thread, Thread)
+    assert tracker._error is first_error
+    assert tracker._poll_generation == 12279
+    assert tracker._queue is queue
+    assert tracker._owns_queue
+    assert queue.closes == 0
+    with pytest.raises(contained.ContainedProcessError, match="not pristine"):
+        tracker.register_root(identity.pid, deadline=time.monotonic() + 1)
+    assert queue.controls == 1
+
+    thread.allow_stop = True
+    tracker.close()
+    assert queue.closes == 1
+    _assert_darwin_tracker_pristine(tracker)
+
+
+def test_darwin_close_reports_join_error_after_safe_queue_cleanup() -> None:
+    tracker = contained._DarwinKqueueProcessTracker()
+    identity = contained.ProcessIdentity(101, (1, 0))
+    join_error = RuntimeError("join failed")
+
+    class Queue:
+        closes = 0
+
+        def close(self) -> None:
+            self.closes += 1
+
+    class Thread:
+        def join(self, *, timeout: float) -> None:
+            assert timeout >= 0
+            raise join_error
+
+        def is_alive(self) -> bool:
+            return False
+
+    queue = Queue()
+    tracker._queue = queue
+    tracker._owns_queue = True
+    tracker._thread = Thread()  # type: ignore[assignment]
+    tracker._root_pid = identity.pid
+    tracker._root_started = identity.started
+    tracker._known[identity.pid] = identity
+    tracker._registered.add(identity.pid)
+    tracker._deadline = time.monotonic() + 1
+
+    with pytest.raises(contained.ContainedProcessError) as caught:
         tracker.close()
-        _restore_execution_hooks_for_test(original_trace, original_profile)
 
-    assert tracker._known == {}
-    assert tracker._registered == set()
-    assert tracker._root_pid is None
-    assert tracker._root_started is None
-    assert tracker._thread is None
-    assert tracker._error is None
-    assert tracker._poll_generation == 0
-    assert tracker._deadline == 0.0
-    assert not tracker._stop.is_set()
-    assert tracker._queue is None
-    assert not tracker._owns_queue
+    cleanup_group = getattr(caught.value, "cleanup_error_group", None)
+    assert isinstance(cleanup_group, BaseExceptionGroup)
+    assert join_error in cleanup_group.exceptions
+    assert queue.closes == 1
+    _assert_darwin_tracker_pristine(tracker)
+    tracker.close()
+    _assert_darwin_tracker_pristine(tracker)
+
+
+@pytest.mark.parametrize("stop_state", ("alive", "unverifiable"))
+def test_darwin_close_retains_owner_until_thread_stop_is_verified(
+    stop_state: str,
+) -> None:
+    tracker = contained._DarwinKqueueProcessTracker()
+    identity = contained.ProcessIdentity(101, (1, 0))
+    first_error = LookupError("first tracker error")
+    verification_error = RuntimeError("is_alive failed")
+
+    class Queue:
+        closes = 0
+
+        def close(self) -> None:
+            self.closes += 1
+
+    class Thread:
+        stopped = False
+
+        def join(self, *, timeout: float) -> None:
+            assert timeout >= 0
+
+        def is_alive(self) -> bool:
+            if self.stopped:
+                return False
+            if stop_state == "unverifiable":
+                raise verification_error
+            return True
+
+    queue = Queue()
+    thread = Thread()
+    tracker._queue = queue
+    tracker._owns_queue = True
+    tracker._thread = thread  # type: ignore[assignment]
+    tracker._root_pid = identity.pid
+    tracker._root_started = identity.started
+    tracker._known[identity.pid] = identity
+    tracker._registered.add(identity.pid)
+    tracker._error = first_error
+    tracker._poll_generation = 7
+    tracker._deadline = time.monotonic() + 1
+
+    with pytest.raises(contained.ContainedProcessError) as caught:
+        tracker.close()
+
+    cleanup_group = getattr(caught.value, "cleanup_error_group", None)
+    assert isinstance(cleanup_group, BaseExceptionGroup)
+    if stop_state == "unverifiable":
+        assert verification_error in cleanup_group.exceptions
+    assert any("remains open" in str(error) for error in cleanup_group.exceptions)
+    assert tracker._thread is thread
+    assert tracker._queue is queue
+    assert tracker._owns_queue
+    assert tracker._error is first_error
+    assert tracker._poll_generation == 7
+    assert tracker._stop.is_set()
+    assert queue.closes == 0
+
+    thread.stopped = True
+    tracker.close()
+    assert queue.closes == 1
+    _assert_darwin_tracker_pristine(tracker)
 
 
 @pytest.mark.parametrize("has_descendant", (False, True), ids=("root-only", "descendant"))
