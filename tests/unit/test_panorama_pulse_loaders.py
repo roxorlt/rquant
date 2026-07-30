@@ -6,6 +6,7 @@ import json
 from datetime import date
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 from rquant.panorama_data import (
@@ -14,6 +15,8 @@ from rquant.panorama_data import (
     load_surge_log,
     load_surge_marks,
     load_surge_runtime_config,
+    surge_mark_positions,
+    volume_directions,
 )
 
 
@@ -110,3 +113,45 @@ class TestFakeMode:
         assert len(log) == 3 and "600001.SH" in set(log["ts_code"])
         marks = load_surge_marks("600001.SH", [date.today()])
         assert len(marks) == 1
+
+
+def _trend(day: str, times: list[str], prices: list[float]) -> pd.DataFrame:
+    return pd.DataFrame({
+        "dt": pd.to_datetime([f"{day} {t}" for t in times]),
+        "price": prices,
+        "avg_price": [float("nan")] * len(times),
+        "volume": [100.0] * len(times),
+    })
+
+
+class TestSurgeMarkPositions:
+    def test_exact_minute_hit(self) -> None:
+        trend = _trend("2026-07-29", ["09:46", "09:47", "09:48"], [10.0, 10.5, 10.6])
+        marks = pd.DataFrame([{"date": date(2026, 7, 29), "confirmed_at": "09:47",
+                               "rel_cum": 3.2}])
+        pos = surge_mark_positions(trend, marks)
+        assert len(pos) == 1
+        assert pos.iloc[0]["idx"] == 1 and pos.iloc[0]["price"] == pytest.approx(10.5)
+        assert pos.iloc[0]["label"] == "09:47 首次爆量确认 · 3.2×"
+
+    def test_missing_minute_falls_back_to_prior_bar(self) -> None:
+        trend = _trend("2026-07-29", ["09:46", "09:49"], [10.0, 10.6])
+        marks = pd.DataFrame([{"date": date(2026, 7, 29), "confirmed_at": "09:47",
+                               "rel_cum": float("nan")}])
+        pos = surge_mark_positions(trend, marks)
+        assert pos.iloc[0]["idx"] == 0
+        assert pos.iloc[0]["label"] == "09:47 首次爆量确认"  # rel_cum 缺失不带倍数
+
+    def test_day_absent_skipped_and_empty_inputs(self) -> None:
+        trend = _trend("2026-07-29", ["09:46"], [10.0])
+        marks = pd.DataFrame([{"date": date(2026, 7, 28), "confirmed_at": "09:47",
+                               "rel_cum": 2.0}])
+        assert surge_mark_positions(trend, marks).empty
+        assert surge_mark_positions(trend, pd.DataFrame()).empty
+        assert surge_mark_positions(pd.DataFrame(), marks).empty
+
+
+class TestVolumeDirections:
+    def test_directions(self) -> None:
+        prices = pd.Series([10.0, 10.2, 10.2, 10.1])
+        assert list(volume_directions(prices)) == ["flat", "up", "flat", "down"]

@@ -1090,6 +1090,45 @@ def fetch_intraday_trend(ts_code: str, ndays: int = 1) -> pd.DataFrame:
     return _with_route(pd.DataFrame(), "none")
 
 
+def surge_mark_positions(trend: pd.DataFrame, marks: pd.DataFrame) -> pd.DataFrame:
+    """爆量标记时刻 → trend 行位置（列 idx/price/label），供图层画竖线+标记点。
+
+    精确分钟缺失（数据缺根）回退同日 ≤ 时刻的最近一根；当日无数据跳过该标记。
+    """
+    cols = ["idx", "price", "label"]
+    if trend is None or trend.empty or marks is None or marks.empty:
+        return pd.DataFrame(columns=cols)
+    dt = pd.to_datetime(trend["dt"]).reset_index(drop=True)
+    prices = pd.to_numeric(trend["price"], errors="coerce").reset_index(drop=True)
+    rows: list[dict] = []
+    for m in marks.itertuples():
+        try:
+            hh, mm = str(m.confirmed_at).split(":")
+            target = pd.Timestamp(m.date).replace(hour=int(hh), minute=int(mm))
+        except (ValueError, AttributeError, TypeError):
+            continue
+        same_day = dt.dt.normalize() == target.normalize()
+        candidates = dt[same_day & (dt <= target)]
+        if candidates.empty:
+            continue
+        idx = int(candidates.index[-1])
+        label = f"{m.confirmed_at} 首次爆量确认"
+        rel = getattr(m, "rel_cum", None)
+        if rel is not None and not pd.isna(rel):
+            label += f" · {float(rel):.1f}×"
+        rows.append({"idx": idx, "price": float(prices.iloc[idx]), "label": label})
+    return pd.DataFrame(rows, columns=cols)
+
+
+def volume_directions(prices: pd.Series) -> pd.Series:
+    """每分钟方向（tick-rule 近似）：收涨 up / 收跌 down / 平或首根 flat。"""
+    diff = pd.to_numeric(prices, errors="coerce").diff()
+    out = pd.Series("flat", index=prices.index, dtype="object")
+    out[diff > 0] = "up"
+    out[diff < 0] = "down"
+    return out
+
+
 def load_daily_kline(
     ts_code: str, n: int = 120, store: DuckDBStore | None = None
 ) -> pd.DataFrame:
