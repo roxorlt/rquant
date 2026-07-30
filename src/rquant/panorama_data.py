@@ -114,6 +114,8 @@ ROUTE_LABELS: dict[str, str] = {
     "ths": "同花顺",
     "sina": "新浪",
     "cloud_feed": "云端feed",
+    "drop_stale": "重启恢复·陈旧",
+    "cloud_feed_stale": "收盘快照·陈旧",
     "none": "不可用",
 }
 

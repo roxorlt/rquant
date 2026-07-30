@@ -243,8 +243,9 @@ def cached_kline(ts_code: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=30, show_spinner=False)
 def cached_surge_log(day_key: str) -> pd.DataFrame:
-    """当日爆量台账（键含当日字符串跨日自动失效；ttl 30s 让盘中增长的 jsonl 被读到）。"""
-    return load_surge_log()
+    """指定日期爆量台账（键为该日 ISO 字符串，切换日期/跨日自动失效；ttl 30s 让盘中增长
+    的当日 jsonl 被读到）。"""
+    return load_surge_log(date.fromisoformat(day_key))
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -853,11 +854,19 @@ def _surge_caption(n_rows: int) -> str:
 
 
 def render_surge_log(snapshot: pd.DataFrame) -> None:
-    """当日爆量台账：行选择联动下方个股图表（分时/5日带首次触发标记）。"""
+    """爆量台账：默认今日，可回看历史日期；行选择联动下方个股图表（分时/5日带首次触发标记）。"""
     today = datetime.now(CST).date()
-    df = cached_surge_log(today.isoformat())
+    sel = st.date_input(
+        "爆量日期", value=today, max_value=today, key="surge_day", format="YYYY-MM-DD"
+    )
+    if sel is None:  # 被清空 → 回退今日
+        sel = today
+    df = cached_surge_log(sel.isoformat())
     if df.empty:
-        st.info("今日暂无爆量记录（surge-watch 尚未识别到，或未到盘中）")
+        if sel == today:
+            st.info("今日暂无爆量记录（surge-watch 尚未识别到，或未到盘中）")
+        else:
+            st.info(f"{sel.isoformat()} 无爆量记录")
         return
     event = st.dataframe(
         _surge_log_display(df),
@@ -868,7 +877,10 @@ def render_surge_log(snapshot: pd.DataFrame) -> None:
         width="stretch",
         height=300,
     )
-    st.caption(_surge_caption(len(df)))
+    caption = _surge_caption(len(df))
+    if sel != today:
+        caption += " · 历史日期：个股图表为最新行情，触发标记仅当该日落在图表日期范围内时显示"
+    st.caption(caption)
     idx = _first_selected_row(event)
     if idx is None or idx >= len(df):
         st.info("点选记录查看个股图表（分时/5日图标注首次爆量触发时刻）")

@@ -188,6 +188,34 @@ def _http_cloud_feed(url: str) -> tuple[pd.DataFrame, str] | None:
         return None
 
 
+def _stale_local_feed() -> tuple[pd.DataFrame, float] | None:
+    """冷启动兜底专用：复用云端 feed 本地文件分支的读取逻辑，但**不设 120s 新鲜度门槛**
+    ——调用方（``_restore_from_stale_feed``）自行按返回的 age 判断陈旧程度用于 UI 提示，
+    而非直接拒绝。只对本地文件形态生效（env 以 ``/`` 或 ``file://`` 开头）；HTTP 变体
+    不做陈旧兜底（超出本次范围）。env 未配置本地路径 / 文件缺失 / 空 / 出错 → None。
+    """
+    url = os.environ.get("RQUANT_CLOUD_FEED_URL", "").strip()
+    if not url.startswith(("/", "file://")):
+        return None
+    path = Path(url[len("file://"):] if url.startswith("file://") else url)
+    try:
+        if not path.exists():
+            return None
+        # clamp 负数：跨机器时钟偏差下 mtime 可能超前本机时钟，负 age 会让
+        # mono - age > mono、age_seconds 显示负数，陈旧横幅漏触发（与
+        # _restore_from_drop 的 age 处理保持一致）
+        age = max(0.0, time.time() - path.stat().st_mtime)
+        df = pd.read_parquet(path)
+        if df is None or df.empty:
+            return None
+        if "limit_up_price" not in df.columns:
+            df = add_limit_prices(df)
+        return df, age
+    except Exception as e:
+        logger.warning(f"冷启动兜底：陈旧 feed 读取失败: {type(e).__name__}: {e}")
+        return None
+
+
 @dataclass
 class _SourceState:
     """单源 slot + 熔断状态（slot 由 SourcePoller._lock 保护）。"""
@@ -352,6 +380,63 @@ class SourcePoller:
             if allow_sina:
                 self._sina.mark_failure(error, mono)
         logger.warning(f"poller 快照拉取失败: {error}")
+
+        # 冷启动兜底：本进程从未成功过（slot 恒空），UI 会永远卡在「等 as_of」的
+        # st.rerun 死循环——哪怕带 ⚠️ 陈旧提示的旧数据也好过白屏。仅这一次触发；
+        # 一旦恢复成功 state.df 非空，后续轮次回到正常 last-known-good 语义。
+        # state.df 只在 poll 线程内读写（_lock 只保护跨线程的 UI 读），此处无锁读安全。
+        if state.df.empty:
+            self._cold_start_fallback(state, mono)
+
+    def _cold_start_fallback(self, state: _SourceState, mono: float) -> None:
+        """从磁盘恢复陈旧快照（不刷新 drop，不影响熔断计数）：先试本进程自己落盘的
+        drop，再试云端 feed 本地文件；两者皆无 → 原样保持空，交由下轮重试。
+        整体 try/except 兜底：任何解析/IO 异常都绝不能打断轮询主循环。
+        """
+        try:
+            restored = self._restore_from_drop()
+            if restored is None:
+                restored = self._restore_from_stale_feed()
+            if restored is None:
+                return
+            df, route, age, wall = restored
+            with self._lock:
+                state.mark_success(df, route, mono - age, wall)
+            logger.info(f"冷启动兜底：恢复陈旧快照 route={route} age={age:.0f}s")
+        except Exception as e:
+            logger.warning(f"冷启动兜底失败（不影响轮询）: {type(e).__name__}: {e}")
+
+    def _restore_from_drop(self) -> tuple[pd.DataFrame, str, float, str] | None:
+        """兜底档 1——本进程自己的落盘 drop（``read_live_frame`` + ``read_live_meta``）。
+
+        ``written_at`` 是墙钟 ISO 秒（``datetime.now(CST).isoformat()`` 写入，带
+        tzinfo），``age = now(CST) - written_at``；``as_of_iso`` 转 ``HH:MM:SS`` 作为
+        恢复数据的展示墙钟。meta 缺失/字段缺失/解析失败 → 跳过（不让脏 meta 拖垮轮询）。
+        """
+        df = read_live_frame(self._drop_dir, SNAPSHOT_KEY)
+        if df is None or df.empty:
+            return None
+        meta = read_live_meta(self._drop_dir).get(SNAPSHOT_KEY)
+        if not meta:
+            return None
+        try:
+            written_at = datetime.fromisoformat(meta["written_at"])
+            as_of_dt = datetime.fromisoformat(meta["as_of_iso"])
+            age = max(0.0, (datetime.now(CST) - written_at).total_seconds())
+            wall = as_of_dt.strftime("%H:%M:%S")
+        except (KeyError, ValueError, TypeError) as e:
+            logger.warning(f"冷启动兜底：drop meta 解析失败，跳过: {type(e).__name__}: {e}")
+            return None
+        return df, "drop_stale", age, wall
+
+    def _restore_from_stale_feed(self) -> tuple[pd.DataFrame, str, float, str] | None:
+        """兜底档 2——drop 也没有时，退到云端 feed 本地文件（不设 120s 新鲜度门槛）。"""
+        result = _stale_local_feed()
+        if result is None:
+            return None
+        df, age = result
+        wall = (datetime.now(CST) - timedelta(seconds=age)).strftime("%H:%M:%S")
+        return df, "cloud_feed_stale", age, wall
 
     def _poll_flow(self, sector_type: str) -> None:
         state = self._states[sector_type]

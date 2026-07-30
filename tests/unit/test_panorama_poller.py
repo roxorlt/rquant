@@ -6,10 +6,11 @@ daemon 线程 + threading.Event 同步（wait 带超时，无长 sleep）。
 
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -24,6 +25,8 @@ from rquant.panorama_poller import (
     read_live_frame,
     read_live_meta,
 )
+
+_CST = timezone(timedelta(hours=8))
 
 
 @pytest.fixture(autouse=True)
@@ -415,3 +418,164 @@ class TestLocalCloudFeed:
         poller._poll_snapshot()
         _, _, route = poller.snapshot()
         assert route == "cloud_feed" and spy["n"] == 0
+
+
+class TestColdStartFallback:
+    """冷启动兜底（2026-07-06 后续事故）：重启后三级路由全败、slot 恒空 → UI 永远白屏。
+
+    仅本进程从未成功过（state.df.empty）才触发一次；drop 优先，drop 没有才退到
+    云端 feed 本地文件（不设 120s 新鲜度门槛）；一旦已有 last-known-good 数据则
+    绝不覆盖；两个来源都没有也绝不抛异常。
+    """
+
+    def _failing_snapshot(self, allow: bool) -> pd.DataFrame:
+        raise ConnectionError("RST by risk-control")
+
+    def test_restores_from_drop_when_empty(self, tmp_path: Path) -> None:
+        drop = tmp_path / "live"
+        drop.mkdir(parents=True)
+        pd.DataFrame({"ts_code": ["600001.SH"], "price": [10.0]}).to_parquet(
+            drop / "snapshot.parquet", index=False
+        )
+        written_at = (datetime.now(_CST) - timedelta(hours=2)).isoformat(timespec="seconds")
+        meta = {
+            SNAPSHOT_KEY: {
+                "as_of_iso": written_at,
+                "route": "em_direct",
+                "written_at": written_at,
+            }
+        }
+        (drop / "live_meta.json").write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+
+        poller = SourcePoller(
+            now=FakeClock(),
+            snapshot_fetcher=self._failing_snapshot,
+            flow_fetcher=lambda s: _flow_df(),
+            cloud_feed_fetcher=lambda: None,
+            drop_dir=drop,
+        )
+        poller.poll_once()
+
+        df, as_of, route = poller.snapshot()
+        assert not df.empty
+        assert route == "drop_stale"
+        assert as_of != ""
+        status = poller.status()[SNAPSHOT_KEY]
+        assert status["age_seconds"] is not None
+        assert status["age_seconds"] > 3600  # 约 7200s（written_at 2h 前）
+
+    def test_falls_back_to_stale_cloud_feed_when_drop_missing(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        feed = tmp_path / "snapshot_full.parquet"
+        pd.DataFrame(
+            {"ts_code": ["300001.SZ"], "name": ["创业甲"], "price": [10.0], "pre_close": [9.0]}
+        ).to_parquet(feed, index=False)
+        old = time.time() - 400  # 远超 120s 新鲜度门槛，普通第 0 路由会拒收
+        os.utime(feed, (old, old))
+        monkeypatch.setenv("RQUANT_CLOUD_FEED_URL", str(feed))
+
+        empty_drop = tmp_path / "empty_live"
+        poller = SourcePoller(
+            now=FakeClock(),
+            snapshot_fetcher=self._failing_snapshot,
+            flow_fetcher=lambda s: _flow_df(),
+            drop_dir=empty_drop,
+        )
+        poller.poll_once()
+
+        df, as_of, route = poller.snapshot()
+        assert not df.empty
+        assert route == "cloud_feed_stale"
+        assert as_of != ""
+        assert poller.status()[SNAPSHOT_KEY]["age_seconds"] > 120
+
+    def test_stale_feed_clamps_future_mtime_to_zero_age(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """跨机器时钟偏差：feed mtime 超前本机时钟时 age 不应为负——负值会让
+        mono - age > mono、age_seconds 显示负数，陈旧横幅漏触发。"""
+        feed = tmp_path / "snapshot_full.parquet"
+        pd.DataFrame(
+            {"ts_code": ["300001.SZ"], "name": ["创业甲"], "price": [10.0], "pre_close": [9.0]}
+        ).to_parquet(feed, index=False)
+        future = time.time() + 3600  # mtime 超前本机时钟 1 小时
+        os.utime(feed, (future, future))
+        monkeypatch.setenv("RQUANT_CLOUD_FEED_URL", str(feed))
+
+        empty_drop = tmp_path / "empty_live"
+        poller = SourcePoller(
+            now=FakeClock(),
+            snapshot_fetcher=self._failing_snapshot,
+            flow_fetcher=lambda s: _flow_df(),
+            cloud_feed_fetcher=lambda: None,  # 绕过第 0 路由（未来 mtime 会被误判「新鲜」）
+            drop_dir=empty_drop,
+        )
+        poller.poll_once()
+
+        df, as_of, route = poller.snapshot()
+        assert not df.empty
+        assert route == "cloud_feed_stale"
+        assert poller.status()[SNAPSHOT_KEY]["age_seconds"] >= 0
+
+    def test_does_not_overwrite_existing_last_known_good(self, tmp_path: Path) -> None:
+        drop = tmp_path / "live"
+        drop.mkdir(parents=True)
+        # 预埋一份「别的」陈旧数据：若守卫失效错误触发，会被这份数据覆盖，测试即可抓到
+        pd.DataFrame({"ts_code": ["999999.SH"], "price": [1.0]}).to_parquet(
+            drop / "snapshot.parquet", index=False
+        )
+        stale_written = (datetime.now(_CST) - timedelta(hours=3)).isoformat(timespec="seconds")
+        meta = {
+            SNAPSHOT_KEY: {
+                "as_of_iso": stale_written,
+                "route": "em_direct",
+                "written_at": stale_written,
+            }
+        }
+        (drop / "live_meta.json").write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+
+        clock = FakeClock()
+        calls = {"n": 0}
+
+        def snap_fetch(allow: bool) -> pd.DataFrame:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return _snap_df("em_direct")
+            raise ConnectionError("RST by risk-control")
+
+        poller = SourcePoller(
+            now=clock,
+            snapshot_fetcher=snap_fetch,
+            flow_fetcher=lambda s: _flow_df(),
+            cloud_feed_fetcher=lambda: None,
+            drop_dir=drop,
+        )
+        poller.poll_once()  # 首轮成功
+        df1, as_of1, route1 = poller.snapshot()
+        assert not df1.empty and route1 == "em_direct"
+
+        clock.advance(60)
+        poller.poll_once()  # 第二轮失败，但 slot 已非空 → 不应触发兜底覆盖
+        df2, as_of2, route2 = poller.snapshot()
+        assert df2.equals(df1)
+        assert route2 == "em_direct"
+        assert as_of2 == as_of1
+        assert poller.status()[SNAPSHOT_KEY]["consec_fail"] == 1
+
+    def test_no_source_available_stays_empty_no_exception(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        monkeypatch.delenv("RQUANT_CLOUD_FEED_URL", raising=False)
+        empty_drop = tmp_path / "empty_live"
+        poller = SourcePoller(
+            now=FakeClock(),
+            snapshot_fetcher=self._failing_snapshot,
+            flow_fetcher=lambda s: _flow_df(),
+            cloud_feed_fetcher=lambda: None,
+            drop_dir=empty_drop,
+        )
+        poller.poll_once()  # 不抛异常
+
+        df, as_of, route = poller.snapshot()
+        assert df.empty and as_of == "" and route == "none"
