@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import dis
+import errno
 import fcntl
 import inspect
 import os
+import select
 import shutil
 import signal
 import subprocess
@@ -201,8 +203,256 @@ def _clear_execution_hooks() -> None:
     sys.setprofile(None)
 
 
+def _restore_execution_hooks_for_test(trace_hook: object, profile_hook: object) -> None:
+    sys.settrace(None)
+    sys.setprofile(None)
+    sys.settrace(trace_hook)
+    sys.setprofile(profile_hook)
+
+
 def _open_file_descriptors() -> set[int]:
     return {int(entry) for entry in os.listdir("/dev/fd") if entry.isdigit()}
+
+
+@pytest.mark.parametrize(
+    ("use_trace", "use_profile"),
+    ((False, False), (True, False), (False, True), (True, True)),
+    ids=("none", "trace", "profile", "both"),
+)
+def test_execution_hook_round_trip_restores_real_hook_identity(
+    use_trace: bool,
+    use_profile: bool,
+) -> None:
+    original_trace = sys.gettrace()
+    original_profile = sys.getprofile()
+
+    def trace_hook(_frame: object, _event: str, _arg: object) -> object:
+        return trace_hook
+
+    def profile_hook(_frame: object, _event: str, _arg: object) -> None:
+        return None
+
+    expected_trace = trace_hook if use_trace else None
+    expected_profile = profile_hook if use_profile else None
+    try:
+        sys.settrace(expected_trace)
+        sys.setprofile(expected_profile)
+
+        outer_hooks = contained._suspend_execution_hooks()
+        assert sys.gettrace() is None
+        assert sys.getprofile() is None
+        contained._finish_execution_hook_restoration(
+            outer_hooks,
+            primary_exception=None,
+            error_label="test hook restoration failures",
+        )
+
+        assert sys.gettrace() is expected_trace
+        assert sys.getprofile() is expected_profile
+    finally:
+        _restore_execution_hooks_for_test(original_trace, original_profile)
+
+
+def test_nested_execution_hook_round_trip_restores_outer_real_hooks() -> None:
+    original_trace = sys.gettrace()
+    original_profile = sys.getprofile()
+
+    def trace_hook(_frame: object, _event: str, _arg: object) -> object:
+        return trace_hook
+
+    def profile_hook(_frame: object, _event: str, _arg: object) -> None:
+        return None
+
+    try:
+        sys.settrace(trace_hook)
+        sys.setprofile(profile_hook)
+
+        outer_hooks = contained._suspend_execution_hooks()
+        inner_hooks = contained._suspend_execution_hooks()
+        contained._finish_execution_hook_restoration(
+            inner_hooks,
+            primary_exception=None,
+            error_label="inner test hook restoration failures",
+        )
+        assert sys.gettrace() is None
+        assert sys.getprofile() is None
+
+        contained._finish_execution_hook_restoration(
+            outer_hooks,
+            primary_exception=None,
+            error_label="outer test hook restoration failures",
+        )
+        assert sys.gettrace() is trace_hook
+        assert sys.getprofile() is profile_hook
+    finally:
+        _restore_execution_hooks_for_test(original_trace, original_profile)
+
+
+@pytest.mark.skipif(not hasattr(select, "kqueue"), reason="real kqueue hook restoration contract")
+def test_real_profile_callback_failure_does_not_skip_trace_restoration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_trace = sys.gettrace()
+    original_profile = sys.getprofile()
+    tracker = contained._DarwinKqueueProcessTracker()
+    queue = select.kqueue()
+    queue_fd = queue.fileno()
+    callback_failure = RuntimeError("profile callback interrupted trace restoration")
+    triggered = False
+
+    def trace_hook(_frame: object, _event: str, _arg: object) -> object:
+        return trace_hook
+
+    def profile_hook(frame: object, event: str, _arg: object) -> None:
+        nonlocal triggered
+        if (
+            not triggered
+            and event == "call"
+            and getattr(frame, "f_code", None) is contained._restore_execution_hook_bounded.__code__
+            and getattr(frame, "f_locals", {}).get("label") == "trace"
+        ):
+            triggered = True
+            raise callback_failure
+
+    monkeypatch.setattr(contained.select, "kqueue", lambda: queue)
+    try:
+        sys.settrace(trace_hook)
+        sys.setprofile(profile_hook)
+
+        with pytest.raises(RuntimeError) as caught:
+            tracker._initialize_queue()
+
+        assert caught.value is callback_failure
+        assert triggered
+        assert sys.gettrace() is trace_hook
+        assert sys.getprofile() is profile_hook
+        _clear_execution_hooks()
+        tracker.close()
+        with pytest.raises(OSError) as closed:
+            os.fstat(queue_fd)
+        assert closed.value.errno == errno.EBADF
+    finally:
+        _clear_execution_hooks()
+        with contained.suppress(BaseException):
+            tracker.close()
+        _close_test_fd_if_open(queue_fd)
+        _restore_execution_hooks_for_test(original_trace, original_profile)
+
+
+def test_real_profile_callback_failure_preserves_other_hook_and_cleanup() -> None:
+    original_trace = sys.gettrace()
+    original_profile = sys.getprofile()
+    read_fd, write_fd = os.pipe()
+    acquired_fd = -1
+    primary = RuntimeError("existing acquisition primary")
+    callback_failure = RuntimeError("profile callback persistently rejected verification")
+    armed = False
+
+    def trace_hook(_frame: object, _event: str, _arg: object) -> object:
+        return trace_hook
+
+    def profile_hook(frame: object, event: str, arg: object) -> None:
+        if (
+            armed
+            and event == "c_call"
+            and arg is sys.gettrace
+            and getattr(getattr(frame, "f_code", None), "co_filename", None) == contained.__file__
+        ):
+            raise callback_failure
+
+    try:
+        sys.settrace(trace_hook)
+        sys.setprofile(profile_hook)
+        hooks = contained._suspend_execution_hooks()
+        armed = True
+        acquired_fd = os.dup(read_fd)
+
+        with pytest.raises(RuntimeError) as caught:
+            try:
+                contained._finish_execution_hook_restoration(
+                    hooks,
+                    primary_exception=primary,
+                    error_label="test acquisition hook restoration failures",
+                )
+            finally:
+                os.close(acquired_fd)
+
+        assert caught.value is primary
+        assert sys.gettrace() is trace_hook
+        assert sys.getprofile() is None
+        cleanup_group = getattr(caught.value, "cleanup_error_group", None)
+        assert isinstance(cleanup_group, BaseExceptionGroup)
+        assert cleanup_group.exceptions[0] is callback_failure
+        assert any("profile execution hook" in str(error) for error in cleanup_group.exceptions[1:])
+        with pytest.raises(OSError) as closed:
+            os.fstat(acquired_fd)
+        assert closed.value.errno == errno.EBADF
+    finally:
+        _clear_execution_hooks()
+        _close_test_fd_if_open(acquired_fd)
+        _close_test_fd_if_open(read_fd)
+        _close_test_fd_if_open(write_fd)
+        _restore_execution_hooks_for_test(original_trace, original_profile)
+
+
+@pytest.mark.skipif(
+    not hasattr(select, "kqueue") or not hasattr(signal, "SIGUSR1"),
+    reason="real kqueue and asynchronous signal hook restoration contract",
+)
+def test_real_signal_during_hook_restoration_keeps_both_hook_identities(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_trace = sys.gettrace()
+    original_profile = sys.getprofile()
+    previous_handler = signal.getsignal(signal.SIGUSR1)
+    tracker = contained._DarwinKqueueProcessTracker()
+    queue = select.kqueue()
+    queue_fd = queue.fileno()
+    signal_failure = InterruptedError("signal interrupted hook restoration")
+    sent = False
+
+    def trace_hook(_frame: object, _event: str, _arg: object) -> object:
+        return trace_hook
+
+    def signal_handler(_signum: int, _frame: object) -> None:
+        raise signal_failure
+
+    def profile_hook(frame: object, event: str, _arg: object) -> None:
+        nonlocal sent
+        if (
+            not sent
+            and event == "call"
+            and getattr(frame, "f_code", None) is contained._restore_execution_hook_bounded.__code__
+            and getattr(frame, "f_locals", {}).get("label") == "trace"
+        ):
+            sent = True
+            os.kill(os.getpid(), signal.SIGUSR1)
+
+    monkeypatch.setattr(contained.select, "kqueue", lambda: queue)
+    signal.signal(signal.SIGUSR1, signal_handler)
+    try:
+        sys.settrace(trace_hook)
+        sys.setprofile(profile_hook)
+
+        with pytest.raises(InterruptedError) as caught:
+            tracker._initialize_queue()
+
+        assert caught.value is signal_failure
+        assert sent
+        assert sys.gettrace() is trace_hook
+        assert sys.getprofile() is profile_hook
+        _clear_execution_hooks()
+        tracker.close()
+        with pytest.raises(OSError) as closed:
+            os.fstat(queue_fd)
+        assert closed.value.errno == errno.EBADF
+    finally:
+        _clear_execution_hooks()
+        signal.signal(signal.SIGUSR1, previous_handler)
+        with contained.suppress(BaseException):
+            tracker.close()
+        _close_test_fd_if_open(queue_fd)
+        _restore_execution_hooks_for_test(original_trace, original_profile)
 
 
 def test_descendant_discovery_uses_immutable_birth_parent_identity_after_reparent() -> None:
@@ -415,6 +665,119 @@ def test_cleanup_error_group_iteratively_flattens_beyond_recursion_limit() -> No
     cleanup_group = getattr(primary, "cleanup_error_group", None)
     assert isinstance(cleanup_group, BaseExceptionGroup)
     assert cleanup_group.exceptions == (leaf, later)
+
+
+def test_cleanup_error_group_bounds_fresh_subgroup_expansion() -> None:
+    source_root = Path(__file__).parents[2] / "src"
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = os.pathsep.join(
+        filter(None, (str(source_root), environment.get("PYTHONPATH", "")))
+    )
+    probe = """
+import os
+import signal
+from rquant import contained_subprocess as contained
+
+class ExpandingCleanupGroup(BaseExceptionGroup):
+    @property
+    def exceptions(self):
+        return (ExpandingCleanupGroup('fresh cleanup', [OSError('hidden')]),)
+
+signal.signal(signal.SIGALRM, lambda _signum, _frame: os._exit(91))
+signal.setitimer(signal.ITIMER_REAL, 0.5)
+primary = RuntimeError('primary')
+before = OSError('before cleanup')
+expanding = ExpandingCleanupGroup('expanding cleanup', [OSError('hidden')])
+after = LookupError('after cleanup')
+later = ValueError('later cleanup')
+primary.cleanup_error_group = BaseExceptionGroup(
+    'outer cleanup',
+    [before, expanding, after],
+)
+contained._attach_cleanup_error_group(
+    primary,
+    [later],
+    error_label='bounded cleanup',
+    note='bounded cleanup note',
+)
+signal.setitimer(signal.ITIMER_REAL, 0)
+group = primary.cleanup_error_group
+assert type(group) is BaseExceptionGroup
+assert group.exceptions == (before, expanding, after, later)
+"""
+
+    completed = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        timeout=2,
+        env=environment,
+        check=False,
+    )
+
+    assert completed.returncode == 0, (completed.stdout, completed.stderr)
+
+
+@pytest.mark.parametrize("budget_kind", ("node", "frame", "work"))
+def test_cleanup_error_group_budgets_have_exact_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+    budget_kind: str,
+) -> None:
+    def nested_group(depth: int, leaf: BaseException) -> BaseException:
+        nested = leaf
+        for index in range(depth):
+            nested = BaseExceptionGroup(f"nested cleanup {index}", [nested])
+        return nested
+
+    monkeypatch.setattr(contained, "_CLEANUP_GROUP_NODE_BUDGET", 100)
+    monkeypatch.setattr(contained, "_CLEANUP_GROUP_FRAME_BUDGET", 100)
+    monkeypatch.setattr(contained, "_CLEANUP_GROUP_WORK_BUDGET", 100)
+    boundary_primary = RuntimeError("boundary primary")
+    boundary_leaves = (OSError("boundary leaf"),)
+    over_leaves = (OSError("hidden over-budget leaf"),)
+    if budget_kind == "node":
+        monkeypatch.setattr(contained, "_CLEANUP_GROUP_NODE_BUDGET", 4)
+        boundary_leaves = tuple(OSError(f"boundary leaf {index}") for index in range(3))
+        over_leaves = tuple(OSError(f"over-budget leaf {index}") for index in range(4))
+        boundary_group = BaseExceptionGroup("boundary cleanup", list(boundary_leaves))
+        over_group = BaseExceptionGroup("over-budget cleanup", list(over_leaves))
+    elif budget_kind == "frame":
+        monkeypatch.setattr(contained, "_CLEANUP_GROUP_FRAME_BUDGET", 3)
+        boundary_group = nested_group(3, boundary_leaves[0])
+        over_group = nested_group(4, over_leaves[0])
+    else:
+        monkeypatch.setattr(contained, "_CLEANUP_GROUP_WORK_BUDGET", 4)
+        boundary_group = BaseExceptionGroup("boundary cleanup", list(boundary_leaves))
+        over_leaves = (over_leaves[0], LookupError("second over-budget leaf"))
+        over_group = BaseExceptionGroup("over-budget cleanup", list(over_leaves))
+    boundary_later = ValueError("boundary later")
+
+    contained._attach_cleanup_error_group(
+        boundary_primary,
+        [boundary_group, boundary_later],
+        error_label="boundary cleanup",
+        note="boundary cleanup note",
+    )
+
+    boundary_cleanup = getattr(boundary_primary, "cleanup_error_group", None)
+    assert isinstance(boundary_cleanup, BaseExceptionGroup)
+    assert boundary_cleanup.exceptions == (*boundary_leaves, boundary_later)
+
+    over_primary = RuntimeError("over-budget primary")
+    before = InterruptedError("before over-budget cleanup")
+    after = LookupError("after over-budget cleanup")
+    over_primary.cleanup_error_group = before  # type: ignore[attr-defined]
+
+    contained._attach_cleanup_error_group(
+        over_primary,
+        [over_group, after],
+        error_label="over-budget cleanup",
+        note="over-budget cleanup note",
+    )
+
+    over_cleanup = getattr(over_primary, "cleanup_error_group", None)
+    assert isinstance(over_cleanup, BaseExceptionGroup)
+    assert over_cleanup.exceptions == (before, over_group, after)
 
 
 def test_cleanup_error_group_preserves_malformed_subgroup_as_opaque() -> None:
