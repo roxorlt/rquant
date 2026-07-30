@@ -309,6 +309,31 @@ class LabArtifactModel(BaseModel):
         return type(self).model_validate(payload)
 
 
+class LabBoundZipDestination(LabArtifactModel):
+    directory_path: Path
+    directory_descriptor: int = Field(ge=0)
+    directory_device: int = Field(ge=0)
+    directory_inode: int = Field(ge=1)
+    file_name: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_destination(self) -> LabBoundZipDestination:
+        normalized = Path(os.path.abspath(os.fspath(self.directory_path)))
+        if self.directory_path != normalized:
+            raise ValueError("bound ZIP directory path must be absolute and normalized")
+        if (
+            PurePosixPath(self.file_name).name != self.file_name
+            or "\\" in self.file_name
+            or self.file_name in {"", ".", ".."}
+        ):
+            raise ValueError("bound ZIP file name is unsafe")
+        return self
+
+    @property
+    def path(self) -> Path:
+        return self.directory_path / self.file_name
+
+
 def _canonical_decimal(value: Decimal) -> str:
     if not value.is_finite():
         raise ValueError("canonical numeric values must be finite")
@@ -6467,12 +6492,83 @@ class LabJobArtifactStore:
     def _after_zip_final_checks(_destination: Path) -> None:
         """Fault-injection boundary before a published ZIP path returns."""
 
+    def _open_bound_zip_destination(
+        self,
+        destination: LabBoundZipDestination,
+    ) -> tuple[int, _FileObservation]:
+        descriptor = -1
+        path_descriptor = -1
+        try:
+            descriptor = os.dup(destination.directory_descriptor)
+            raw = os.fstat(descriptor)
+            observed = _FileObservation.from_stat(raw)
+            if (
+                (observed.device, observed.inode)
+                != (destination.directory_device, destination.directory_inode)
+                or observed.mode != stat.S_IFDIR
+                or stat.S_IMODE(raw.st_mode) != 0o700
+                or raw.st_uid != os.getuid()
+            ):
+                raise LabArtifactIntegrityError(
+                    "bound ZIP destination directory identity is unsafe or changed"
+                )
+            try:
+                path_descriptor = _secure_open_directory(
+                    destination.directory_path,
+                    create=False,
+                )
+            except LabArtifactPathError as exc:
+                raise LabArtifactIntegrityError(
+                    "bound ZIP destination path identity changed"
+                ) from exc
+            at_path = _FileObservation.from_stat(os.fstat(path_descriptor))
+            if not self._same_directory_identity(at_path, observed):
+                raise LabArtifactIntegrityError("bound ZIP destination path identity changed")
+            result = descriptor
+            descriptor = -1
+            return result, observed
+        finally:
+            for opened_descriptor in (path_descriptor, descriptor):
+                if opened_descriptor >= 0:
+                    with suppress(OSError):
+                        os.close(opened_descriptor)
+
     @_artifact_public_operation()
     def export_deterministic_zip(
         self,
         sealed_path: Path,
         evidence: LabArtifactIndexEvidence,
         destination: Path,
+    ) -> Path:
+        return self._export_deterministic_zip(
+            sealed_path,
+            evidence,
+            destination,
+            bound_destination=None,
+        )
+
+    @_artifact_public_operation()
+    def export_deterministic_zip_bound(
+        self,
+        sealed_path: Path,
+        evidence: LabArtifactIndexEvidence,
+        destination: LabBoundZipDestination,
+    ) -> Path:
+        validated = LabBoundZipDestination.model_validate(destination)
+        return self._export_deterministic_zip(
+            sealed_path,
+            evidence,
+            validated.path,
+            bound_destination=validated,
+        )
+
+    def _export_deterministic_zip(
+        self,
+        sealed_path: Path,
+        evidence: LabArtifactIndexEvidence,
+        destination: Path,
+        *,
+        bound_destination: LabBoundZipDestination | None,
     ) -> Path:
         """Export stable bytes for this Python/ZIP runtime, not a cross-platform guarantee."""
 
@@ -6530,11 +6626,16 @@ class LabJobArtifactStore:
                 expected_hashes = self._expected_bound_hashes(manifest)
                 self._assert_bound_paths(bound)
                 self._assert_managed_roots()
-                _ensure_private_directory(destination.parent, manage_existing=False)
-                destination_parent = _secure_open_directory(destination.parent, create=True)
-                destination_parent_identity = _FileObservation.from_stat(
-                    os.fstat(destination_parent)
-                )
+                if bound_destination is None:
+                    _ensure_private_directory(destination.parent, manage_existing=False)
+                    destination_parent = _secure_open_directory(destination.parent, create=True)
+                    destination_parent_identity = _FileObservation.from_stat(
+                        os.fstat(destination_parent)
+                    )
+                else:
+                    destination_parent, destination_parent_identity = (
+                        self._open_bound_zip_destination(bound_destination)
+                    )
                 temporary_descriptor = os.open(
                     temporary_name,
                     os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),

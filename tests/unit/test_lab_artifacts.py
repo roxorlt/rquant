@@ -2199,6 +2199,44 @@ def test_zip_export_is_byte_identical_and_requires_matching_index_evidence(tmp_p
         )
 
 
+def test_bound_zip_destination_matches_existing_path_export(tmp_path: Path) -> None:
+    from rquant.lab_artifacts import LabBoundZipDestination
+
+    store = LabJobArtifactStore(tmp_path / "artifacts")
+    sealed = store.seal_candidate(_prepare(store))
+    evidence = _evidence(sealed)
+    path_export = store.export_deterministic_zip(
+        sealed.path,
+        evidence,
+        tmp_path / "path-export.zip",
+    )
+    bound_parent = tmp_path / "bound-export"
+    bound_parent.mkdir(mode=0o700)
+    descriptor = os.open(
+        bound_parent,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        observed = os.fstat(descriptor)
+        bound_export = store.export_deterministic_zip_bound(
+            sealed.path,
+            evidence,
+            LabBoundZipDestination(
+                directory_path=bound_parent,
+                directory_descriptor=descriptor,
+                directory_device=observed.st_dev,
+                directory_inode=observed.st_ino,
+                file_name="result.zip",
+            ),
+        )
+    finally:
+        os.close(descriptor)
+
+    assert bound_export == bound_parent / "result.zip"
+    assert bound_export.read_bytes() == path_export.read_bytes()
+    assert stat.S_IMODE(bound_export.stat().st_mode) == 0o600
+
+
 def test_job_zip_export_accepts_only_job_id_and_returns_request_scoped_hash_receipts(
     tmp_path: Path,
 ) -> None:
@@ -2311,6 +2349,51 @@ def test_job_zip_export_rejects_symlink_or_replaced_export_root(tmp_path: Path) 
         facade.export(scenario.job_id)
 
     assert tuple(export_root.iterdir()) == ()
+
+
+def test_job_zip_export_root_swap_after_bound_open_never_writes_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.lab_artifact_export import LabJobZipExportFacade
+    from rquant.lab_artifacts import LabArtifactIntegrityError
+    from rquant.lab_jobs import LabJobReader
+    from tests.unit.test_lab_finalizer import _ready_scenario
+
+    scenario_root = tmp_path / "scenario"
+    scenario_root.mkdir(mode=0o700)
+    scenario = _ready_scenario(scenario_root, hold_days=(1,))
+    assert scenario.finalizer().finalize(scenario.job_id).status == "published"
+    assert scenario.scheduler.run_once().artifact_commits_accepted == 1
+    export_root = tmp_path / "private-exports"
+    displaced_root = tmp_path / "bound-private-exports"
+    facade = LabJobZipExportFacade(
+        reader=LabJobReader(scenario.store.path),
+        artifact_store=scenario.artifact_store,
+        export_root=export_root,
+    )
+    original_open = facade._open_bound_export_root
+    swapped = False
+
+    def swap_after_bound_open() -> int:
+        nonlocal swapped
+        descriptor = original_open()
+        if not swapped:
+            export_root.rename(displaced_root)
+            export_root.mkdir(mode=0o700)
+            swapped = True
+        return descriptor
+
+    monkeypatch.setattr(facade, "_open_bound_export_root", swap_after_bound_open)
+
+    with pytest.raises(LabArtifactIntegrityError, match="identity changed"):
+        facade.export(scenario.job_id)
+
+    assert swapped is True
+    assert tuple(export_root.iterdir()) == ()
+    for controlled_path in displaced_root.rglob("*"):
+        assert not controlled_path.is_symlink()
+        assert controlled_path.relative_to(displaced_root).parts[0] == scenario.job_id.hex
 
 
 def test_zip_export_interleaves_large_file_reads_and_archive_writes(

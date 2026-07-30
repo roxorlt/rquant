@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from rquant.lab_artifacts import (
     LabArtifactIntegrityError,
+    LabBoundZipDestination,
     LabJobArtifactStore,
     _ensure_private_directory,
     _secure_absolute_path,
@@ -102,11 +103,42 @@ class LabJobZipExportFacade:
         return descriptor
 
     @classmethod
-    def _open_private_child(cls, parent_descriptor: int, name: str, *, label: str) -> int:
+    def _open_private_child(
+        cls,
+        parent_descriptor: int,
+        name: str,
+        *,
+        label: str,
+        create: bool = False,
+    ) -> int:
         flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        if create:
+            with suppress(FileExistsError):
+                os.mkdir(name, mode=0o700, dir_fd=parent_descriptor)
+                os.fsync(parent_descriptor)
+        before = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
         descriptor = os.open(name, flags, dir_fd=parent_descriptor)
         try:
-            cls._validate_private_directory(descriptor, label=label)
+            opened = cls._validate_private_directory(descriptor, label=label)
+            at_path = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+            if (
+                before.st_dev,
+                before.st_ino,
+                stat.S_IFMT(before.st_mode),
+            ) != (
+                opened.st_dev,
+                opened.st_ino,
+                stat.S_IFDIR,
+            ) or (
+                at_path.st_dev,
+                at_path.st_ino,
+                stat.S_IFMT(at_path.st_mode),
+            ) != (
+                opened.st_dev,
+                opened.st_ino,
+                stat.S_IFDIR,
+            ):
+                raise LabArtifactIntegrityError(f"{label} path identity changed")
         except BaseException:
             os.close(descriptor)
             raise
@@ -187,19 +219,46 @@ class LabJobZipExportFacade:
             raise LabJobZipExportUnavailableError(
                 "ZIP export requires a succeeded job with sealed result evidence"
             )
-        root_descriptor = self._open_bound_export_root()
-        os.close(root_descriptor)
         request_id = uuid4()
         destination = self.export_root / request.job_id.hex / request_id.hex / "result.zip"
-        published = self.artifact_store.export_deterministic_zip(
-            authority.evidence.sealed_path,
-            authority.evidence,
-            destination,
-        )
-        if published != destination:
-            raise LabArtifactIntegrityError("artifact store returned an unexpected export path")
-        return self._build_receipt(
-            request_id=request_id,
-            job_id=request.job_id,
-            path=published,
-        )
+        descriptors: list[int] = []
+        try:
+            root_descriptor = self._open_bound_export_root()
+            descriptors.append(root_descriptor)
+            job_descriptor = self._open_private_child(
+                root_descriptor,
+                request.job_id.hex,
+                label="job export directory",
+                create=True,
+            )
+            descriptors.append(job_descriptor)
+            request_descriptor = self._open_private_child(
+                job_descriptor,
+                request_id.hex,
+                label="request export directory",
+                create=True,
+            )
+            descriptors.append(request_descriptor)
+            request_directory = os.fstat(request_descriptor)
+            published = self.artifact_store.export_deterministic_zip_bound(
+                authority.evidence.sealed_path,
+                authority.evidence,
+                LabBoundZipDestination(
+                    directory_path=destination.parent,
+                    directory_descriptor=request_descriptor,
+                    directory_device=request_directory.st_dev,
+                    directory_inode=request_directory.st_ino,
+                    file_name=destination.name,
+                ),
+            )
+            if published != destination:
+                raise LabArtifactIntegrityError("artifact store returned an unexpected export path")
+            return self._build_receipt(
+                request_id=request_id,
+                job_id=request.job_id,
+                path=published,
+            )
+        finally:
+            for descriptor in reversed(descriptors):
+                with suppress(OSError):
+                    os.close(descriptor)
