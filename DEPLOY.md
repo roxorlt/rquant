@@ -5,6 +5,38 @@
 
 ---
 
+## 2026-07-30 · v0.28.1 · 全景页冷启动兜底与爆量历史回看
+
+**状态**：PR #148 经 CI 全绿后 squash merge；annotated tag `v0.28.1` 指向
+`a637bb62b9efe8c2b9c915466ec086e6f0ba912a`。19:49 通过
+`scripts/deploy-production.sh --target v0.28.1` 从 v0.28.0 快进发布，部署器返回
+`deployed`，五个长驻服务重启后 active。无 schema、systemd、nginx 或密钥变更。
+
+**背景（当日事故排查）**：v0.28.0 收盘后部署重启暴露既有冷启动缺口——poller
+内存快照被清、收盘后 surge feed 停更超 120s、东财/新浪对云端 IP 间歇性拒绝，
+页面卡在等首拉全空（连爆量记录 tab 都被 rerun 等待挡住）。本版修复：所有活路由
+失败且 slot 为空时，从自家 `panorama_live` drop（优先，含原始 as_of）或陈旧 surge
+feed 恢复最后一份快照，`age_seconds` 按数据真实时间回算，⚠️ 陈旧标注如实触发。
+
+**新增**：爆量记录 tab 日期选择器（默认今天，可回看云端留存的历史 events，当前约
+15 天）。
+
+**部署插曲**：当晚 19:00-19:30 三次部署被 preflight 正确拦下并自动回滚（只读副本
+陈旧超 12 分钟阈值——副本同步 timer 每日 17:30 后停到次日 09:00，叠加 461 日历史
+回补批任务持写锁）。确认副本同步脚本与活跃写者本就并行安全（盘中 monitor 持锁时
+每 5 分钟照常同步）后，手动跑 `scripts/sync-readonly-replica.sh` 刷新副本，preflight
+通过后发布成功。回补批任务全程未受影响。
+
+**验证**：Playwright 带网关 cookie 实测——页面出数（快照路由新浪、数据 0 秒前）、
+爆量记录 tab 日期选择器渲染正常（当日 54 条记录）、console 0 errors。冷启动兜底
+路径本次未触发（新浪路由恰好可用），由 26 条 poller 单测覆盖，待下次全路由失败时
+实战验证。runtime_config 动态口径页脚将于次日 09:25 surge-watch 首启后生效。
+
+**回滚**：`bash scripts/deploy-production.sh --target v0.28.0`（自动回滚基线
+`3b9656056452e12393fbb4f86e4cb23c793a725b`）。
+
+---
+
 ## 2026-07-30 · v0.28.0 · 全景页爆量图表与脉搏异动
 
 **状态**：PR #142 经 Python 3.11/3.12 CI 全绿后 squash merge（期间与 #143/#144 合并
