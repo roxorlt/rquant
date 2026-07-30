@@ -755,6 +755,269 @@ def test_real_signal_during_hook_restoration_keeps_both_hook_identities(
         _restore_execution_hooks_for_test(original_trace, original_profile)
 
 
+@pytest.mark.skipif(not hasattr(select, "kqueue"), reason="real kqueue hook handoff contract")
+def test_hook_bounded_return_boundary_retries_through_primary_handoff() -> None:
+    original_trace = sys.gettrace()
+    original_profile = sys.getprofile()
+    queue = select.kqueue()
+    queue_fd = queue.fileno()
+    tracker = contained._DarwinKqueueProcessTracker()
+    counting_queue = _CountingQueue(queue_fd, queue.close)
+    tracker._queue = counting_queue
+    tracker._owns_queue = True
+    boundary_failure = RuntimeError("bounded restoration return failed")
+    failed = False
+
+    def trace_hook(_frame: object, _event: str, _arg: object) -> object:
+        return trace_hook
+
+    def profile_hook(frame: object, event: str, _arg: object) -> None:
+        nonlocal failed
+        if (
+            not failed
+            and event == "return"
+            and getattr(frame, "f_code", None)
+            is contained._restore_execution_hooks_bounded.__code__
+        ):
+            failed = True
+            raise boundary_failure
+
+    try:
+        sys.settrace(trace_hook)
+        sys.setprofile(profile_hook)
+        hooks = contained._suspend_execution_hooks()
+
+        with pytest.raises(RuntimeError) as caught:
+            try:
+                contained._finish_execution_hook_restoration(
+                    hooks,
+                    primary_exception=None,
+                    error_label="bounded return handoff failures",
+                )
+            finally:
+                tracker.close()
+
+        assert caught.value is boundary_failure
+        assert failed
+        assert sys.gettrace() is trace_hook
+        assert sys.getprofile() is profile_hook
+        assert counting_queue.close_count == 1
+        with pytest.raises(OSError) as closed:
+            os.fstat(queue_fd)
+        assert closed.value.errno == errno.EBADF
+    finally:
+        _clear_execution_hooks()
+        with contained.suppress(BaseException):
+            tracker.close()
+        _close_test_fd_if_open(queue_fd)
+        _restore_execution_hooks_for_test(original_trace, original_profile)
+
+
+@pytest.mark.skipif(not hasattr(select, "kqueue"), reason="real kqueue hook handoff contract")
+@pytest.mark.parametrize(
+    "boundary_name",
+    ("_record_cleanup_error", "_attach_cleanup_error_group"),
+    ids=("record", "attach"),
+)
+def test_hook_cleanup_boundary_cannot_replace_existing_primary(
+    boundary_name: str,
+) -> None:
+    original_trace = sys.gettrace()
+    original_profile = sys.getprofile()
+    queue = select.kqueue()
+    queue_fd = queue.fileno()
+    tracker = contained._DarwinKqueueProcessTracker()
+    counting_queue = _CountingQueue(queue_fd, queue.close)
+    tracker._queue = counting_queue
+    tracker._owns_queue = True
+    primary = RuntimeError(f"existing primary before {boundary_name}")
+    restoration_failure = OSError(f"restoration failed before {boundary_name}")
+    boundary_failure = LookupError(f"{boundary_name} callback failed")
+    restoration_failed = False
+    boundary_failed = False
+    boundary_code = getattr(contained, boundary_name).__code__
+
+    def trace_hook(frame: object, event: str, _arg: object) -> object:
+        nonlocal boundary_failed
+        if (
+            restoration_failed
+            and not boundary_failed
+            and event == "call"
+            and getattr(frame, "f_code", None) is boundary_code
+        ):
+            boundary_failed = True
+            raise boundary_failure
+        return trace_hook
+
+    def profile_hook(frame: object, event: str, _arg: object) -> None:
+        nonlocal restoration_failed
+        if (
+            not restoration_failed
+            and event == "return"
+            and getattr(frame, "f_code", None)
+            is contained._restore_execution_hooks_bounded.__code__
+        ):
+            restoration_failed = True
+            raise restoration_failure
+
+    try:
+        sys.settrace(trace_hook)
+        sys.setprofile(profile_hook)
+        hooks = contained._suspend_execution_hooks()
+
+        with pytest.raises(RuntimeError) as caught:
+            try:
+                contained._finish_execution_hook_restoration(
+                    hooks,
+                    primary_exception=primary,
+                    error_label="protected cleanup handoff failures",
+                )
+            finally:
+                tracker.close()
+
+        assert caught.value is primary
+        assert restoration_failed
+        assert boundary_failed
+        assert sys.gettrace() is trace_hook
+        assert sys.getprofile() is profile_hook
+        cleanup_group = getattr(primary, "cleanup_error_group", None)
+        assert isinstance(cleanup_group, BaseExceptionGroup)
+        expected_cleanup = (
+            (boundary_failure, restoration_failure)
+            if boundary_name == "_record_cleanup_error"
+            else (restoration_failure, boundary_failure)
+        )
+        assert cleanup_group.exceptions == expected_cleanup
+        assert counting_queue.close_count == 1
+        with pytest.raises(OSError) as closed:
+            os.fstat(queue_fd)
+        assert closed.value.errno == errno.EBADF
+    finally:
+        _clear_execution_hooks()
+        with contained.suppress(BaseException):
+            tracker.close()
+        _close_test_fd_if_open(queue_fd)
+        _restore_execution_hooks_for_test(original_trace, original_profile)
+
+
+@pytest.mark.skipif(not hasattr(select, "kqueue"), reason="real kqueue hook handoff contract")
+def test_primary_raise_boundary_retries_without_losing_exact_primary() -> None:
+    original_trace = sys.gettrace()
+    original_profile = sys.getprofile()
+    queue = select.kqueue()
+    queue_fd = queue.fileno()
+    tracker = contained._DarwinKqueueProcessTracker()
+    counting_queue = _CountingQueue(queue_fd, queue.close)
+    tracker._queue = counting_queue
+    tracker._owns_queue = True
+    primary = RuntimeError("existing primary before raise handoff")
+    handoff_failure = InterruptedError("primary raise callback failed")
+    failed = False
+
+    def trace_hook(_frame: object, _event: str, _arg: object) -> object:
+        return trace_hook
+
+    def profile_hook(frame: object, event: str, _arg: object) -> None:
+        nonlocal failed
+        if (
+            not failed
+            and event == "return"
+            and getattr(frame, "f_code", None)
+            is contained._finish_execution_hook_restoration.__code__
+        ):
+            failed = True
+            raise handoff_failure
+
+    try:
+        sys.settrace(trace_hook)
+        sys.setprofile(profile_hook)
+        hooks = contained._suspend_execution_hooks()
+
+        with pytest.raises(RuntimeError) as caught:
+            try:
+                contained._finish_execution_hook_restoration(
+                    hooks,
+                    primary_exception=primary,
+                    error_label="primary raise handoff failures",
+                )
+            finally:
+                tracker.close()
+
+        assert caught.value is primary
+        assert failed
+        assert sys.gettrace() is trace_hook
+        assert sys.getprofile() is profile_hook
+        cleanup_group = getattr(primary, "cleanup_error_group", None)
+        assert isinstance(cleanup_group, BaseExceptionGroup)
+        assert cleanup_group.exceptions == (handoff_failure,)
+        assert counting_queue.close_count == 1
+    finally:
+        _clear_execution_hooks()
+        with contained.suppress(BaseException):
+            tracker.close()
+        _close_test_fd_if_open(queue_fd)
+        _restore_execution_hooks_for_test(original_trace, original_profile)
+
+
+@pytest.mark.skipif(not hasattr(select, "kqueue"), reason="real kqueue hook handoff contract")
+def test_persistent_primary_raise_callback_fails_bounded_and_preserves_other_hook() -> None:
+    original_trace = sys.gettrace()
+    original_profile = sys.getprofile()
+    queue = select.kqueue()
+    queue_fd = queue.fileno()
+    tracker = contained._DarwinKqueueProcessTracker()
+    counting_queue = _CountingQueue(queue_fd, queue.close)
+    tracker._queue = counting_queue
+    tracker._owns_queue = True
+    primary = RuntimeError("existing primary before persistent raise handoff")
+    handoff_failures: list[InterruptedError] = []
+
+    def trace_hook(_frame: object, _event: str, _arg: object) -> object:
+        return trace_hook
+
+    def profile_hook(frame: object, event: str, _arg: object) -> None:
+        if (
+            event == "return"
+            and getattr(frame, "f_code", None)
+            is contained._finish_execution_hook_restoration.__code__
+        ):
+            failure = InterruptedError(
+                f"persistent primary raise callback {len(handoff_failures) + 1}"
+            )
+            handoff_failures.append(failure)
+            raise failure
+
+    try:
+        sys.settrace(trace_hook)
+        sys.setprofile(profile_hook)
+        hooks = contained._suspend_execution_hooks()
+
+        with pytest.raises(RuntimeError) as caught:
+            try:
+                contained._finish_execution_hook_restoration(
+                    hooks,
+                    primary_exception=primary,
+                    error_label="persistent primary raise handoff failures",
+                )
+            finally:
+                tracker.close()
+
+        assert caught.value is primary
+        assert len(handoff_failures) == contained._SIGNAL_STATE_ATTEMPTS
+        assert sys.gettrace() is trace_hook
+        assert sys.getprofile() is None
+        cleanup_group = getattr(primary, "cleanup_error_group", None)
+        assert isinstance(cleanup_group, BaseExceptionGroup)
+        assert cleanup_group.exceptions[: len(handoff_failures)] == tuple(handoff_failures)
+        assert counting_queue.close_count == 1
+    finally:
+        _clear_execution_hooks()
+        with contained.suppress(BaseException):
+            tracker.close()
+        _close_test_fd_if_open(queue_fd)
+        _restore_execution_hooks_for_test(original_trace, original_profile)
+
+
 def test_descendant_discovery_uses_immutable_birth_parent_identity_after_reparent() -> None:
     root = contained.ProcessIdentity(100, (1, 0), kernel_unique_id=1000)
     reparented_child = contained.ProcessIdentity(101, (2, 0), kernel_unique_id=1001)
@@ -1107,6 +1370,120 @@ def test_cleanup_group_default_budget_flattens_three_recursion_limits() -> None:
     cleanup_group = getattr(primary, "cleanup_error_group", None)
     assert isinstance(cleanup_group, BaseExceptionGroup)
     assert cleanup_group.exceptions == (leaf, later)
+
+
+def test_cleanup_default_budget_preserves_each_exhausted_branch_and_later_evidence() -> None:
+    class ExpandingCleanupGroup(BaseExceptionGroup):
+        @property
+        def exceptions(self) -> tuple[BaseException, ...]:
+            return (ExpandingCleanupGroup("fresh cleanup", [OSError("hidden")]),)
+
+    primary = RuntimeError("primary")
+    expanding = tuple(
+        ExpandingCleanupGroup(f"expanding cleanup {index}", [OSError("hidden")])
+        for index in range(4)
+    )
+    legal_leaf = LookupError("legal nested cleanup")
+    legal_group = BaseExceptionGroup("legal cleanup", [legal_leaf])
+    after = ValueError("after cleanup")
+    later = InterruptedError("later cleanup")
+    primary.cleanup_error_group = BaseExceptionGroup(  # type: ignore[attr-defined]
+        "outer cleanup",
+        [*expanding, legal_group, after],
+    )
+
+    contained._attach_cleanup_error_group(
+        primary,
+        [later],
+        error_label="default bounded cleanup",
+        note="default bounded cleanup note",
+    )
+
+    cleanup_group = getattr(primary, "cleanup_error_group", None)
+    assert isinstance(cleanup_group, BaseExceptionGroup)
+    assert cleanup_group.exceptions == (*expanding, legal_leaf, after, later)
+
+
+@pytest.mark.parametrize(
+    "width_offset",
+    (-1, 0, 1),
+    ids=("budget-minus-one", "budget", "budget-plus-one"),
+)
+def test_cleanup_root_width_boundary_preserves_all_direct_leaves(
+    monkeypatch: pytest.MonkeyPatch,
+    width_offset: int,
+) -> None:
+    node_budget = 8
+    monkeypatch.setattr(contained, "_CLEANUP_GROUP_NODE_BUDGET", node_budget)
+    monkeypatch.setattr(contained, "_CLEANUP_GROUP_FRAME_BUDGET", 20)
+    monkeypatch.setattr(contained, "_CLEANUP_GROUP_WORK_BUDGET", 1000)
+    primary = RuntimeError("primary")
+    leaves = tuple(
+        OSError(f"wide root leaf {index}") for index in range(node_budget + width_offset)
+    )
+    later = ValueError("wide root later cleanup")
+    primary.cleanup_error_group = BaseExceptionGroup(  # type: ignore[attr-defined]
+        "wide root cleanup",
+        list(leaves),
+    )
+
+    contained._attach_cleanup_error_group(
+        primary,
+        [later],
+        error_label="wide root cleanup",
+        note="wide root cleanup note",
+    )
+
+    cleanup_group = getattr(primary, "cleanup_error_group", None)
+    assert isinstance(cleanup_group, BaseExceptionGroup)
+    assert cleanup_group.exceptions == (*leaves, later)
+
+
+def test_cleanup_many_cyclic_siblings_is_linear_and_preserves_exact_evidence() -> None:
+    source_root = Path(__file__).parents[2] / "src"
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = os.pathsep.join(
+        filter(None, (str(source_root), environment.get("PYTHONPATH", "")))
+    )
+    probe = """
+import signal
+from rquant import contained_subprocess as contained
+
+class CyclicCleanupGroup(BaseExceptionGroup):
+    @property
+    def exceptions(self):
+        return (self,)
+
+cycles = tuple(
+    CyclicCleanupGroup(f'cycle {index}', [OSError('hidden')])
+    for index in range(8000)
+)
+later = ValueError('later cleanup')
+primary = RuntimeError('primary')
+primary.cleanup_error_group = BaseExceptionGroup('cycles', list(cycles))
+signal.setitimer(signal.ITIMER_REAL, 0.75)
+contained._attach_cleanup_error_group(
+    primary,
+    [later],
+    error_label='linear cleanup',
+    note='linear cleanup note',
+)
+signal.setitimer(signal.ITIMER_REAL, 0)
+group = primary.cleanup_error_group
+assert type(group) is BaseExceptionGroup
+assert group.exceptions == (*cycles, later)
+"""
+
+    completed = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        timeout=3,
+        env=environment,
+        check=False,
+    )
+
+    assert completed.returncode == 0, (completed.stdout, completed.stderr)
 
 
 @pytest.mark.parametrize("budget_kind", ("node", "frame", "work"))
