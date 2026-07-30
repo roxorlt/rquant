@@ -42,7 +42,7 @@ _LEVEL_LABELS = {
 
 
 def _build_prerendered(*, title: str, body: str) -> tuple[str, str]:
-    """F/G/H. 盘中脉搏 / 午间战报 / 爆量确认：报文已在上游渲染好，此处直通。"""
+    """F/G/H/I. 盘中脉搏 / 午间战报 / 爆量确认 / 脉搏异动：报文已在上游渲染好，此处直通。"""
     return title, body
 
 

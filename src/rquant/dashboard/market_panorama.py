@@ -628,7 +628,8 @@ def _trend_axis(trend: pd.DataFrame) -> tuple[list[int], str, list[int]]:
 
 
 def _trend_chart(trend: pd.DataFrame, marks: pd.DataFrame | None = None) -> alt.VConcatChart:
-    """分时/5日：价格线 + 均价虚线（有则画）+ 底部量柱，x 轴共享。
+    """分时/5日：价格线 + 均价虚线（有则画）+ 底部量柱（按分钟涨跌近似 tick-rule 红涨绿跌上色），
+    x 轴共享。marks 非空时叠加爆量标记竖线 + 标记点（每日首次确认时刻，悬停显示时间与倍数）。
 
     x 轴用 bar 序号 idx（quantitative）而非真实时间 dt——非交易时段（午休/隔夜）
     不占轴距，线天然连续无空档；轴刻度经 labelExpr 映射回时间/日期，tooltip 保留真实 dt。

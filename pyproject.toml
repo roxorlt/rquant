@@ -1,6 +1,6 @@
 [project]
 name = "rquant"
-version = "0.27.1"
+version = "0.28.0"
 description = "个人自用 A 股量化选股与盯盘平台：条件筛选 + 实时监控 + 告警通知"
 readme = "README.md"
 authors = [
