@@ -93,6 +93,7 @@ def test_strategy_lab_page_uses_all_typed_job_inputs_and_read_only_legacy_histor
         "AuctionGapRunInput",
         "GrowthBoardSurgeRunInput",
         "list_strategy_lab_runs",
+        "estimate_submission",
     ):
         assert symbol in source
     for forbidden in (
@@ -105,6 +106,7 @@ def test_strategy_lab_page_uses_all_typed_job_inputs_and_read_only_legacy_histor
     ):
         assert forbidden not in source
     assert "controller.discard_zip(receipt)" in source
+    assert source.count('"更新时长预估"') == 1
 
 
 def test_strategy_lab_page_keeps_mutable_job_queries_uncached() -> None:

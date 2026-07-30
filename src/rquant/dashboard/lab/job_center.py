@@ -13,6 +13,12 @@ from rquant.lab_artifact_export import (
     LabJobZipExportReceipt,
 )
 from rquant.lab_artifact_preview import ArtifactPreview, ArtifactPreviewReader
+from rquant.lab_eta import (
+    LabEtaEstimate,
+    LabEtaInput,
+    LabEtaRemainingShard,
+    estimate_lab_eta,
+)
 from rquant.lab_job_center import (
     AuctionGapRunInput,
     CommandSubmissionResult,
@@ -20,6 +26,7 @@ from rquant.lab_job_center import (
     LabCommandSubmissionFacade,
     NShapeComparisonRunInput,
     NShapeOptimizationRunInput,
+    ResearchJobSubmission,
     ResearchRunInput,
     build_research_job_submission,
 )
@@ -35,7 +42,10 @@ from rquant.research_run_spec import (
     ExecutionCostSpec,
     ResourceClass,
 )
-from rquant.strategy_job_adapters import build_adapter_execution_contract
+from rquant.strategy_job_adapters import (
+    build_adapter_execution_contract,
+    default_strategy_job_adapter_registry,
+)
 
 LAB_UI_JOB_PAGE_SIZES: Final[frozenset[int]] = frozenset({20, 25})
 LAB_UI_SHARD_LIMIT: Final = 64
@@ -118,6 +128,63 @@ class StrategyLabJobCenterController:
         self._preview_reader = preview_reader
         self._zip_exports = zip_exports
 
+    @staticmethod
+    def _build_submission(
+        run_input: ResearchRunInput,
+        *,
+        context: StrategyLabSubmissionContext,
+        job_id: UUID,
+    ) -> ResearchJobSubmission:
+        adapter_id = _adapter_id(run_input)
+        feature_contract = build_adapter_execution_contract(
+            adapter_id,
+            _ADAPTER_VERSION,
+            context.code_sha,
+        )
+        return build_research_job_submission(
+            run_input,
+            gate_decision=context.gate_decision,
+            code_sha=context.code_sha,
+            dataset_snapshot=context.dataset_snapshot,
+            feature_contract=feature_contract,
+            execution_costs=context.execution_costs,
+            random_seed=context.random_seed,
+            resource_class=context.resource_class,
+            deadline=context.deadline,
+            job_id=job_id,
+            max_attempts=context.max_attempts,
+        )
+
+    def estimate_submission(
+        self,
+        run_input: ResearchRunInput,
+        *,
+        context: StrategyLabSubmissionContext,
+        as_of: datetime,
+    ) -> LabEtaEstimate:
+        """Estimate the canonical plan without publishing a command."""
+        selected_context = StrategyLabSubmissionContext.model_validate(context)
+        submission = self._build_submission(
+            run_input,
+            context=selected_context,
+            job_id=UUID(int=0),
+        )
+        definitions = default_strategy_job_adapter_registry().plan(submission.spec)
+        return estimate_lab_eta(
+            LabEtaInput(
+                job_id=UUID(int=0),
+                status="queued",
+                as_of=as_of,
+                remaining=tuple(
+                    LabEtaRemainingShard(
+                        shard_id=definition.shard_id,
+                        work_plan=definition.work_plan,
+                    )
+                    for definition in definitions
+                ),
+            )
+        )
+
     def submit(
         self,
         run_input: ResearchRunInput,
@@ -128,24 +195,10 @@ class StrategyLabJobCenterController:
     ) -> CommandSubmissionResult:
         selected_context = StrategyLabSubmissionContext.model_validate(context)
         selected_job_id = job_id or _fresh_job_id(interaction_key)
-        adapter_id = _adapter_id(run_input)
-        feature_contract = build_adapter_execution_contract(
-            adapter_id,
-            _ADAPTER_VERSION,
-            selected_context.code_sha,
-        )
-        submission = build_research_job_submission(
+        submission = self._build_submission(
             run_input,
-            gate_decision=selected_context.gate_decision,
-            code_sha=selected_context.code_sha,
-            dataset_snapshot=selected_context.dataset_snapshot,
-            feature_contract=feature_contract,
-            execution_costs=selected_context.execution_costs,
-            random_seed=selected_context.random_seed,
-            resource_class=selected_context.resource_class,
-            deadline=selected_context.deadline,
+            context=selected_context,
             job_id=selected_job_id,
-            max_attempts=selected_context.max_attempts,
         )
         return self._commands.submit_create(
             submission.command,

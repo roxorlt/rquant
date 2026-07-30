@@ -323,6 +323,24 @@ def test_submit_is_exactly_once_and_defaults_to_a_fresh_job_id(tmp_path: Path) -
     assert len(spool.pending()) == 1
 
 
+def test_submission_estimate_uses_the_same_plan_without_publishing_a_command() -> None:
+    controller, _, commands, _, _ = _controller()
+
+    estimate = controller.estimate_submission(
+        RUN_INPUTS[0][0],
+        context=_context(),
+        as_of=NOW,
+    )
+
+    assert estimate.estimator == "static"
+    assert estimate.remaining_shards == 2
+    assert estimate.remaining_duration is not None
+    assert estimate.remaining_duration.low_ms == 45_000
+    assert estimate.remaining_duration.center_ms == 60_000
+    assert estimate.remaining_duration.high_ms == 90_000
+    assert commands.calls == []
+
+
 @pytest.mark.parametrize("page_size", [20, 25])
 def test_list_jobs_allows_only_ui_page_sizes(page_size: int) -> None:
     controller, reader, _, _, _ = _controller()

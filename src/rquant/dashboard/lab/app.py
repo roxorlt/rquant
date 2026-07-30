@@ -581,6 +581,55 @@ def _submit_run(
     _render_submission_result(result)
 
 
+def _form_actions(
+    submit_label: str,
+    *,
+    disabled: bool,
+) -> tuple[bool, bool]:
+    estimate_column, submit_column = st.columns([1, 2])
+    estimate_requested = estimate_column.form_submit_button(
+        "更新时长预估",
+        width="stretch",
+        disabled=disabled,
+    )
+    submitted = submit_column.form_submit_button(
+        submit_label,
+        type="primary",
+        width="stretch",
+        disabled=disabled,
+    )
+    return estimate_requested, submitted
+
+
+def _render_submission_estimate(
+    controller: StrategyLabJobCenterController,
+    run_input: ResearchRunInput,
+    *,
+    ui: _ResearchUiSettings,
+    request: ResearchGateRequest,
+    decision: ResearchGateDecision,
+) -> None:
+    try:
+        estimate = controller.estimate_submission(
+            run_input,
+            context=_submission_context(ui, request, decision),
+            as_of=datetime.now(UTC),
+        )
+    except Exception as exc:
+        st.warning(f"无法估算：{type(exc).__name__}: {exc}")
+        return
+    duration = estimate.remaining_duration
+    if duration is None:
+        st.info(f"计划分为 {estimate.remaining_shards} 个分片，当前无法估算时长")
+        return
+    st.info(
+        f"启动前预估：{estimate.remaining_shards} 个分片，约 "
+        f"{_format_seconds(duration.center_ms)}；保守区间 "
+        f"{_format_seconds(duration.low_ms)} 至 {_format_seconds(duration.high_ms)}。"
+        "运行 3 个分片后会按实际吞吐更新。"
+    )
+
+
 def _default_calendar_range(max_hold_days: int) -> tuple[date, date] | None:
     calendar = _trading_calendar()
     if not calendar:
@@ -688,10 +737,8 @@ def _render_n_shape_compare(
             end,
             ui.code_sha,
         )
-        submitted = st.form_submit_button(
+        estimate_requested, submitted = _form_actions(
             "提交收益对比",
-            type="primary",
-            width="stretch",
             disabled=(
                 not hold_days
                 or not selected_entries
@@ -702,7 +749,7 @@ def _render_n_shape_compare(
             ),
         )
     _render_gate(decision)
-    if submitted:
+    if estimate_requested or submitted:
         run_input = NShapeComparisonRunInput(
             start_date=start,
             end_date=end,
@@ -714,14 +761,23 @@ def _render_n_shape_compare(
                 factor_score_threshold=Decimal(str(threshold)),
             ),
         )
-        _submit_run(
-            controller,
-            run_input,
-            ui=ui,
-            request=request,
-            decision=decision,
-            form_key="n-shape-compare",
-        )
+        if estimate_requested:
+            _render_submission_estimate(
+                controller,
+                run_input,
+                ui=ui,
+                request=request,
+                decision=decision,
+            )
+        if submitted:
+            _submit_run(
+                controller,
+                run_input,
+                ui=ui,
+                request=request,
+                decision=decision,
+                form_key="n-shape-compare",
+            )
 
 
 def _render_n_shape_optimize(
@@ -824,10 +880,8 @@ def _render_n_shape_optimize(
             end,
             ui.code_sha,
         )
-        submitted = st.form_submit_button(
+        estimate_requested, submitted = _form_actions(
             "提交自动优化",
-            type="primary",
-            width="stretch",
             disabled=(
                 not hold_days
                 or not top_n
@@ -840,7 +894,7 @@ def _render_n_shape_optimize(
             ),
         )
     _render_gate(decision)
-    if submitted:
+    if estimate_requested or submitted:
         run_input = NShapeOptimizationRunInput(
             start_date=start,
             end_date=end,
@@ -856,14 +910,23 @@ def _render_n_shape_optimize(
                 walk_forward_folds=folds,
             ),
         )
-        _submit_run(
-            controller,
-            run_input,
-            ui=ui,
-            request=request,
-            decision=decision,
-            form_key="n-shape-optimize",
-        )
+        if estimate_requested:
+            _render_submission_estimate(
+                controller,
+                run_input,
+                ui=ui,
+                request=request,
+                decision=decision,
+            )
+        if submitted:
+            _submit_run(
+                controller,
+                run_input,
+                ui=ui,
+                request=request,
+                decision=decision,
+                form_key="n-shape-optimize",
+            )
 
 
 def _render_auction_gap(
@@ -943,10 +1006,8 @@ def _render_auction_gap(
             end,
             ui.code_sha,
         )
-        submitted = st.form_submit_button(
+        estimate_requested, submitted = _form_actions(
             "提交集合竞价回测",
-            type="primary",
-            width="stretch",
             disabled=(
                 start > end
                 or min_ratio > max_ratio
@@ -955,7 +1016,7 @@ def _render_auction_gap(
             ),
         )
     _render_gate(decision)
-    if submitted:
+    if estimate_requested or submitted:
         run_input = AuctionGapRunInput(
             start_date=start,
             end_date=end,
@@ -967,14 +1028,23 @@ def _render_auction_gap(
                 st_filter=st_filter,
             ),
         )
-        _submit_run(
-            controller,
-            run_input,
-            ui=ui,
-            request=request,
-            decision=decision,
-            form_key="auction-gap",
-        )
+        if estimate_requested:
+            _render_submission_estimate(
+                controller,
+                run_input,
+                ui=ui,
+                request=request,
+                decision=decision,
+            )
+        if submitted:
+            _submit_run(
+                controller,
+                run_input,
+                ui=ui,
+                request=request,
+                decision=decision,
+                form_key="auction-gap",
+            )
 
 
 def _render_growth_board(
@@ -1080,10 +1150,8 @@ def _render_growth_board(
             end,
             ui.code_sha,
         )
-        submitted = st.form_submit_button(
+        estimate_requested, submitted = _form_actions(
             "提交放量策略回测",
-            type="primary",
-            width="stretch",
             disabled=(
                 not selected_variants
                 or start > end
@@ -1093,7 +1161,7 @@ def _render_growth_board(
             ),
         )
     _render_gate(decision)
-    if submitted:
+    if estimate_requested or submitted:
         run_input = GrowthBoardSurgeRunInput(
             start_date=start,
             end_date=end,
@@ -1108,14 +1176,23 @@ def _render_growth_board(
                 require_vwap_strength=require_vwap,
             ),
         )
-        _submit_run(
-            controller,
-            run_input,
-            ui=ui,
-            request=request,
-            decision=decision,
-            form_key="growth-board-surge",
-        )
+        if estimate_requested:
+            _render_submission_estimate(
+                controller,
+                run_input,
+                ui=ui,
+                request=request,
+                decision=decision,
+            )
+        if submitted:
+            _submit_run(
+                controller,
+                run_input,
+                ui=ui,
+                request=request,
+                decision=decision,
+                form_key="growth-board-surge",
+            )
 
 
 def _format_seconds(milliseconds: float) -> str:

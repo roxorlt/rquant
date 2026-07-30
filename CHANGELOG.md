@@ -35,6 +35,13 @@
   scheduler 写入。新增 descriptor-bound `ArtifactPreviewReader`，仅对 succeeded+sealed+indexed
   result 提供有大小、行列上限的 report/metrics/Parquet 预览，并校验路径、inode、文件身份和 hash。
 
+- **Strategy Lab 持久任务中心页面**：Streamlit 现按侧栏一次只渲染一个工作区，四类策略参数均在
+  `st.form` 中构造 typed job spec；页面不再直接运行 replay、优化器、线程池或后台子进程。任务中心
+  提供持久列表、进度、动态 ETA、暂停/恢复/取消/重试、原参数重跑、结果预览与确定性 ZIP 导出，
+  浏览器关闭或切换页面不影响 scheduler/worker/finalizer。每个表单还可在提交前复用 canonical
+  adapter 分片计划显示冷启动时长区间；ZIP 下载后仅通过验证过的文件描述符回收内容，不在线按
+  可替换路径删除，并以有界零字节审计记录等待离线维护。旧版同步执行和 session-only 结果路径已退役。
+
 - **Strategy Lab 独立完整结果 finalizer 核心**：新增单次 readonly SQLite transaction 的
   强类型 `LabFinalizationSnapshot`，原子校验 RUNNING/ready/complete contract、全部成功
   shard 及每片唯一 accepted success report/receipt。finalizer 按 scheduler 已接受的 exact
