@@ -431,9 +431,11 @@ def test_darwin_registration_rejects_hooks_before_initialized_queue_side_effects
 
 
 @pytest.mark.parametrize("hook_kind", ("trace", "profile", "both"))
-def test_darwin_register_root_rechecks_hooks_after_registration_control(
+@pytest.mark.parametrize("activation_boundary", ("control", "observation"))
+def test_darwin_register_root_rechecks_hooks_after_registration_handoffs(
     monkeypatch: pytest.MonkeyPatch,
     hook_kind: str,
+    activation_boundary: str,
 ) -> None:
     original_trace = sys.gettrace()
     original_profile = sys.getprofile()
@@ -448,8 +450,8 @@ def test_darwin_register_root_rechecks_hooks_after_registration_control(
             assert changes is not None
             calls["control"] += 1
             observations_at_control = calls["observe"]
-            sys.settrace(trace_hook if hook_kind in {"trace", "both"} else None)
-            sys.setprofile(profile_hook if hook_kind in {"profile", "both"} else None)
+            if activation_boundary == "control":
+                activate_hooks()
             return []
 
         def close(self) -> None:
@@ -470,6 +472,8 @@ def test_darwin_register_root_rechecks_hooks_after_registration_control(
 
     def observe(_pid: int) -> contained._ProcessObservation:
         calls["observe"] += 1
+        if activation_boundary == "observation" and calls["observe"] == 3:
+            activate_hooks()
         return contained._ProcessObservation(identity=identity, parent_pid=1)
 
     def trace_hook(_frame: object, _event: str, _arg: object) -> object:
@@ -477,6 +481,10 @@ def test_darwin_register_root_rechecks_hooks_after_registration_control(
 
     def profile_hook(_frame: object, _event: str, _arg: object) -> None:
         return None
+
+    def activate_hooks() -> None:
+        sys.settrace(trace_hook if hook_kind in {"trace", "both"} else None)
+        sys.setprofile(profile_hook if hook_kind in {"profile", "both"} else None)
 
     tracker._queue = Queue()
     tracker._owns_queue = True
@@ -498,7 +506,13 @@ def test_darwin_register_root_rechecks_hooks_after_registration_control(
         ):
             tracker.register_root(identity.pid, deadline=time.monotonic() + 1)
 
-        assert calls == {"observe": 2, "control": 1, "thread": 0, "start": 0}
+        expected_observations = 2 if activation_boundary == "control" else 3
+        assert calls == {
+            "observe": expected_observations,
+            "control": 1,
+            "thread": 0,
+            "start": 0,
+        }
         assert observations_at_control == 2
         assert tracker._registered == set()
         assert tracker._known == {}
@@ -851,9 +865,11 @@ def test_darwin_track_preserves_first_error_across_later_control_failure(
 
 
 @pytest.mark.parametrize("hook_kind", ("none", "trace", "profile", "both"))
-def test_darwin_track_rechecks_hooks_immediately_after_control(
+@pytest.mark.parametrize("activation_boundary", ("control", "inventory"))
+def test_darwin_track_rechecks_hooks_after_kernel_handoffs(
     monkeypatch: pytest.MonkeyPatch,
     hook_kind: str,
+    activation_boundary: str,
 ) -> None:
     original_trace = sys.gettrace()
     original_profile = sys.getprofile()
@@ -861,6 +877,7 @@ def test_darwin_track_rechecks_hooks_immediately_after_control(
     root = contained.ProcessIdentity(101, (1, 0))
     control_calls = 0
     inventory_calls = 0
+    discover_calls = 0
 
     class Event:
         fflags = 16
@@ -869,8 +886,8 @@ def test_darwin_track_rechecks_hooks_immediately_after_control(
         def control(self, *_args: object) -> list[object]:
             nonlocal control_calls
             control_calls += 1
-            sys.settrace(trace_hook if hook_kind in {"trace", "both"} else None)
-            sys.setprofile(profile_hook if hook_kind in {"profile", "both"} else None)
+            if activation_boundary == "control":
+                activate_hooks()
             tracker._stop.set()
             return [Event()]
 
@@ -880,6 +897,10 @@ def test_darwin_track_rechecks_hooks_immediately_after_control(
     def profile_hook(_frame: object, _event: str, _arg: object) -> None:
         return None
 
+    def activate_hooks() -> None:
+        sys.settrace(trace_hook if hook_kind in {"trace", "both"} else None)
+        sys.setprofile(profile_hook if hook_kind in {"profile", "both"} else None)
+
     def inventory(
         _deadline: float,
         *,
@@ -888,9 +909,20 @@ def test_darwin_track_rechecks_hooks_immediately_after_control(
         nonlocal inventory_calls
         inventory_calls += 1
         assert started_at_or_after == root.started
+        if activation_boundary == "inventory":
+            activate_hooks()
         return {
             root.pid: contained._ProcessObservation(identity=root, parent_pid=1),
         }
+
+    def discover(
+        _root_pid: int,
+        _inventory: dict[int, contained._ProcessObservation],
+        _known: dict[int, contained.ProcessIdentity],
+    ) -> dict[int, contained.ProcessIdentity]:
+        nonlocal discover_calls
+        discover_calls += 1
+        return {}
 
     tracker._queue = Queue()
     tracker._owns_queue = True
@@ -902,6 +934,7 @@ def test_darwin_track_rechecks_hooks_immediately_after_control(
     monkeypatch.setattr(contained.select, "KQ_NOTE_FORK", Event.fflags)
     monkeypatch.setattr(contained.select, "KQ_NOTE_TRACKERR", 32)
     monkeypatch.setattr(contained, "_darwin_process_inventory", inventory)
+    monkeypatch.setattr(contained, "_discover_descendants", discover)
     expected_known = dict(tracker._known)
     expected_registered = set(tracker._registered)
     try:
@@ -914,10 +947,13 @@ def test_darwin_track_rechecks_hooks_immediately_after_control(
         assert tracker._registered == expected_registered
         if hook_kind == "none":
             assert inventory_calls == 1
+            assert discover_calls == 1
             assert tracker._poll_generation == 1
             assert tracker._error is None
         else:
-            assert inventory_calls == 0
+            expected_inventory_calls = 0 if activation_boundary == "control" else 1
+            assert inventory_calls == expected_inventory_calls
+            assert discover_calls == 0
             assert tracker._poll_generation == 0
             hook_error = tracker._error
             assert isinstance(hook_error, contained.ContainedProcessError)

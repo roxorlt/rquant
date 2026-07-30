@@ -22,13 +22,14 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import NoReturn, Protocol
+from typing import NoReturn, Protocol, TypeVar
 
 _SIGNAL_STATE_ATTEMPTS = 3
 _UNSAFE_SIGNAL_STATE_EXIT_CODE = 70
 _CLEANUP_GROUP_NODE_BUDGET = max(16384, 8 * sys.getrecursionlimit())
 _CLEANUP_GROUP_FRAME_BUDGET = max(4096, 4 * sys.getrecursionlimit())
 _CLEANUP_GROUP_WORK_BUDGET = max(65536, 32 * sys.getrecursionlimit())
+_T = TypeVar("_T")
 
 
 class ContainedProcessError(RuntimeError):
@@ -469,6 +470,18 @@ def _attach_cleanup_error_group(
 def _require_no_execution_hooks() -> None:
     if sys.gettrace() is not None or sys.getprofile() is not None:
         raise ContainedProcessError("contained acquisition does not support active execution hooks")
+
+
+def _call_with_execution_hook_guard(
+    operation: Callable[..., _T],
+    /,
+    *args: object,
+    **kwargs: object,
+) -> _T:
+    _require_no_execution_hooks()
+    result = operation(*args, **kwargs)
+    _require_no_execution_hooks()
+    return result
 
 
 def _terminate_unsafe_signal_state(
@@ -1622,22 +1635,27 @@ class _DarwinKqueueProcessTracker:
             return
         try:
             queue = select.kqueue()
-            self._queue = queue
-            self._owns_queue = True
         except BaseException as exc:
             self._construction_error = exc
             raise
+        self._queue = queue
+        self._owns_queue = True
+        _require_no_execution_hooks()
 
     def _register_process(self, identity: ProcessIdentity) -> bool:
         _require_no_execution_hooks()
         if identity.pid in self._registered:
             return True
-        before = _darwin_process_observation(identity.pid)
+        before = _call_with_execution_hook_guard(
+            _darwin_process_observation,
+            identity.pid,
+        )
         if before is None:
             return False
         if before.identity != identity:
             raise ContainedProcessError("kernel child registration identity changed")
-        event = select.kevent(
+        event = _call_with_execution_hook_guard(
+            select.kevent,
             identity.pid,
             filter=select.KQ_FILTER_PROC,
             flags=select.KQ_EV_ADD | select.KQ_EV_ENABLE | select.KQ_EV_CLEAR,
@@ -1647,13 +1665,20 @@ class _DarwinKqueueProcessTracker:
         if queue is None:
             raise ContainedProcessError("kernel process tracker queue is not initialized")
         try:
-            queue.control([event], 0, 0)  # type: ignore[attr-defined]
+            _call_with_execution_hook_guard(
+                queue.control,  # type: ignore[attr-defined]
+                [event],
+                0,
+                0,
+            )
         except OSError as exc:
             if exc.errno == errno.ESRCH:
                 return False
             raise ContainedProcessError("kernel child registration failed") from exc
-        _require_no_execution_hooks()
-        after = _darwin_process_observation(identity.pid)
+        after = _call_with_execution_hook_guard(
+            _darwin_process_observation,
+            identity.pid,
+        )
         if after is not None and after.identity != identity:
             raise ContainedProcessError("kernel child identity changed during registration")
         self._registered.add(identity.pid)
@@ -1664,7 +1689,7 @@ class _DarwinKqueueProcessTracker:
         self._initialize_queue()
         if time.monotonic() >= deadline:
             raise TimeoutError("kernel tracker registration deadline expired")
-        before = _darwin_process_observation(pid)
+        before = _call_with_execution_hook_guard(_darwin_process_observation, pid)
         if before is None:
             raise ContainedProcessError("kernel root registration failed")
         # Darwin exposes NOTE_TRACK constants through Python but rejects that
@@ -1672,16 +1697,50 @@ class _DarwinKqueueProcessTracker:
         # every discovered child is registered before it becomes trusted.
         if not self._register_process(before.identity):
             raise ContainedProcessError("kernel root registration failed")
-        self._root_pid = pid
-        self._root_started = before.identity.started
-        self._known[pid] = before.identity
-        self._deadline = deadline
-        self._thread = threading.Thread(
+        thread = _call_with_execution_hook_guard(
+            threading.Thread,
             target=self._track,
             name=f"rquant-kqueue-{pid}",
             daemon=True,
         )
-        self._thread.start()
+        self._root_pid = pid
+        self._root_started = before.identity.started
+        self._known[pid] = before.identity
+        self._deadline = deadline
+        self._thread = thread
+        try:
+            _call_with_execution_hook_guard(thread.start)
+        except BaseException as primary_exception:
+            self._stop.set()
+            cleanup_errors: list[BaseException] = []
+            try:
+                alive = thread.is_alive()
+                if alive:
+                    thread.join(timeout=max(0.0, deadline - time.monotonic()))
+                    alive = thread.is_alive()
+            except BaseException as exc:
+                alive = True
+                _record_cleanup_error(cleanup_errors, exc)
+            if alive:
+                _record_cleanup_error(
+                    cleanup_errors,
+                    ContainedProcessError("kernel process tracker did not stop"),
+                )
+            else:
+                self._thread = None
+                self._root_pid = None
+                self._root_started = None
+                self._known.pop(pid, None)
+                self._registered.discard(pid)
+                self._deadline = 0.0
+                self._stop.clear()
+            _attach_cleanup_error_group(
+                primary_exception,
+                cleanup_errors,
+                error_label="kernel process tracker startup cleanup failures",
+                note="kernel process tracker startup cleanup also failed",
+            )
+            raise
         return before.identity
 
     def _track(self) -> None:
@@ -1705,9 +1764,12 @@ class _DarwinKqueueProcessTracker:
                         return
                 if time.monotonic() >= self._deadline:
                     raise TimeoutError("kernel tracker deadline expired")
-                _require_no_execution_hooks()
-                events = queue.control(None, 256, 0.01)  # type: ignore[attr-defined]
-                _require_no_execution_hooks()
+                events = _call_with_execution_hook_guard(
+                    queue.control,  # type: ignore[attr-defined]
+                    None,
+                    256,
+                    0.01,
+                )
                 fork_observed = False
                 for event in events:
                     if event.fflags & select.KQ_NOTE_TRACKERR:
@@ -1716,7 +1778,8 @@ class _DarwinKqueueProcessTracker:
                 if fork_observed:
                     if self._root_pid is None or self._root_started is None:
                         raise ContainedProcessError("kernel root is not registered")
-                    inventory = _darwin_process_inventory(
+                    inventory = _call_with_execution_hook_guard(
+                        _darwin_process_inventory,
                         self._deadline,
                         started_at_or_after=self._root_started,
                     )
