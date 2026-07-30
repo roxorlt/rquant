@@ -1666,7 +1666,16 @@ class _DarwinKqueueProcessTracker:
         return before.identity
 
     def _track(self) -> None:
-        _require_no_execution_hooks()
+        try:
+            _require_no_execution_hooks()
+        except BaseException as exc:
+            if threading.current_thread() is not self._thread:
+                raise
+            with self._condition:
+                if self._error is None:
+                    self._error = exc
+                self._condition.notify_all()
+            return
         try:
             queue = self._queue
             if queue is None:

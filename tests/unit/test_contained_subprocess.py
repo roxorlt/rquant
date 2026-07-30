@@ -596,6 +596,99 @@ def test_darwin_track_direct_call_rejects_hooks_before_state_changes(
         _restore_execution_hooks_for_test(original_trace, original_profile)
 
 
+@pytest.mark.parametrize("hook_kind", ("trace", "profile", "both"))
+def test_darwin_register_root_reports_startup_thread_hooks(
+    monkeypatch: pytest.MonkeyPatch,
+    hook_kind: str,
+) -> None:
+    original_thread_trace = threading.gettrace()
+    original_thread_profile = threading.getprofile()
+    original_excepthook = threading.excepthook
+    tracker = contained._DarwinKqueueProcessTracker()
+    identity = contained.ProcessIdentity(101, (1, 0))
+    registration_controls = 0
+    poll_controls = 0
+    close_calls = 0
+    uncaught: list[BaseException] = []
+
+    class Queue:
+        def control(
+            self,
+            changes: object,
+            _max_events: int,
+            _timeout: float,
+        ) -> list[object]:
+            nonlocal registration_controls, poll_controls
+            if changes is None:
+                poll_controls += 1
+            else:
+                registration_controls += 1
+            return []
+
+        def close(self) -> None:
+            nonlocal close_calls
+            close_calls += 1
+
+    def observe(_pid: int) -> contained._ProcessObservation:
+        return contained._ProcessObservation(identity=identity, parent_pid=1)
+
+    def trace_hook(_frame: object, _event: str, _arg: object) -> object:
+        return trace_hook
+
+    def profile_hook(_frame: object, _event: str, _arg: object) -> None:
+        return None
+
+    def capture_uncaught(args: threading.ExceptHookArgs) -> None:
+        uncaught.append(args.exc_value)
+
+    tracker._queue = Queue()
+    tracker._owns_queue = True
+    monkeypatch.setattr(contained, "_darwin_process_observation", observe)
+    monkeypatch.setattr(contained.select, "kevent", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(contained.select, "KQ_FILTER_PROC", 1)
+    monkeypatch.setattr(contained.select, "KQ_EV_ADD", 2)
+    monkeypatch.setattr(contained.select, "KQ_EV_ENABLE", 4)
+    monkeypatch.setattr(contained.select, "KQ_EV_CLEAR", 8)
+    monkeypatch.setattr(contained.select, "KQ_NOTE_FORK", 16)
+    monkeypatch.setattr(contained.select, "KQ_NOTE_EXIT", 32)
+    try:
+        threading.excepthook = capture_uncaught
+        threading.settrace(trace_hook if hook_kind in {"trace", "both"} else None)
+        threading.setprofile(profile_hook if hook_kind in {"profile", "both"} else None)
+
+        assert tracker.register_root(identity.pid, deadline=time.monotonic() + 1) == identity
+        thread = tracker._thread
+        assert thread is not None
+        thread.join(timeout=1)
+        assert not thread.is_alive()
+
+        assert registration_controls == 1
+        assert poll_controls == 0
+        assert tracker._poll_generation == 0
+        startup_error = tracker._error
+        assert isinstance(startup_error, contained.ContainedProcessError)
+        assert str(startup_error) == (
+            "contained acquisition does not support active execution hooks"
+        )
+        assert uncaught == []
+
+        started = time.monotonic()
+        with pytest.raises(
+            contained.ContainedProcessError,
+            match="kernel process tracking failed",
+        ) as caught:
+            tracker.poll(deadline=time.monotonic() + 0.5)
+        assert time.monotonic() - started < 0.1
+        assert caught.value.__cause__ is startup_error
+    finally:
+        tracker.close()
+        threading.settrace(original_thread_trace)
+        threading.setprofile(original_thread_profile)
+        threading.excepthook = original_excepthook
+
+    assert close_calls == 1
+
+
 def test_darwin_track_stops_before_next_control_when_hook_activates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
