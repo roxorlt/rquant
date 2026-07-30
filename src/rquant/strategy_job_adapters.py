@@ -1006,18 +1006,29 @@ class StrategyJobAdapterRegistry:
         ):
             raise ValueError("aggregation shard table schemas do not match")
 
-        tables = tuple(
-            LabShardTable(
-                name=name,
-                frame=_concat_shard_frames(
-                    _normalize_legacy_sparse_empty_frames(
-                        adapter_id=adapter.adapter_id,
-                        table_name=name,
-                        frames=tuple(result.tables[index].frame for result in ordered),
-                    )
-                ),
+        recompute_summary = adapter.adapter_id in {
+            AuctionGapAdapter.adapter_id,
+            GrowthBoardSurgeAdapter.adapter_id,
+        }
+        aggregated_frames = {
+            name: _concat_shard_frames(
+                _normalize_legacy_sparse_empty_frames(
+                    adapter_id=adapter.adapter_id,
+                    table_name=name,
+                    frames=tuple(result.tables[index].frame for result in ordered),
+                )
             )
             for index, name in enumerate(expected_table_names)
+            if not (recompute_summary and name == "summary")
+        }
+        if recompute_summary:
+            aggregated_frames["summary"] = _recompute_derived_summary(
+                adapter_id=adapter.adapter_id,
+                spec=validated,
+                aggregated_frames=aggregated_frames,
+            )
+        tables = tuple(
+            LabShardTable(name=name, frame=aggregated_frames[name]) for name in expected_table_names
         )
         if adapter.adapter_id == NShapeOptimizeAdapter.adapter_id:
             tables = tuple(
@@ -1031,6 +1042,39 @@ class StrategyJobAdapterRegistry:
             adapter_version=adapter.adapter_version,
             tables=tables,
         )
+
+
+def _recompute_derived_summary(
+    *,
+    adapter_id: str,
+    spec: ResearchRunSpec,
+    aggregated_frames: dict[str, pd.DataFrame],
+) -> pd.DataFrame:
+    if adapter_id == AuctionGapAdapter.adapter_id:
+        return auction_gap_metric_rows(
+            aggregated_frames["candidates"],
+            aggregated_frames["trades"],
+        )
+    if adapter_id == GrowthBoardSurgeAdapter.adapter_id:
+        parameters = GrowthBoardSurgeParameters.model_validate(
+            _parse_parameters(spec, GrowthBoardSurgeParameters)
+        )
+        trades = aggregated_frames["trades"]
+        if not trades.empty and "variant" not in trades.columns:
+            raise ValueError("aggregated growth trades are missing variant identity")
+        summaries: list[pd.DataFrame] = []
+        for variant in parameters.variants:
+            variant_trades = (
+                trades.loc[trades["variant"] == variant] if "variant" in trades.columns else trades
+            )
+            summary = growth_board_metric_rows(
+                variant_trades,
+                strategy_name=variant,
+            )
+            summary.insert(0, "variant", variant)
+            summaries.append(summary)
+        return pd.concat(summaries, ignore_index=True)
+    raise ValueError(f"adapter does not define a derived summary: {adapter_id}")
 
 
 def _normalize_legacy_sparse_empty_frames(

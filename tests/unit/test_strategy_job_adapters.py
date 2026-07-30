@@ -1140,6 +1140,40 @@ def test_auction_and_growth_adapters_emit_deterministic_empty_summaries(
     pd.testing.assert_frame_equal(growth_summary, expected_growth)
     assert growth_summary.iloc[0]["variant"] == "no_vwap"
 
+    auction_spec = _auction_spec()
+    auction_results = tuple(
+        registry.execute_shard(registry.validate_claim(_claim(auction_spec, index)), object())
+        for index in range(len(registry.plan(auction_spec)))
+    )
+    aggregated_auction = registry.aggregate_results(auction_spec, auction_results)
+    pd.testing.assert_frame_equal(
+        _result_table(aggregated_auction, "summary"),
+        auction_gap_metric_rows(pd.DataFrame(), pd.DataFrame()),
+    )
+
+    growth_spec = _growth_spec(variants=("cum_only", "no_vwap"))
+    growth_variants = next(
+        parameter.value
+        for parameter in growth_spec.parameters.arguments
+        if parameter.name == "variants"
+    )
+    growth_results = tuple(
+        registry.execute_shard(registry.validate_claim(_claim(growth_spec, index)), object())
+        for index in range(len(registry.plan(growth_spec)))
+    )
+    aggregated_growth = registry.aggregate_results(growth_spec, growth_results)
+    expected_empty_growth: list[pd.DataFrame] = []
+    for variant in growth_variants:
+        summary = growth_board_metric_rows(pd.DataFrame(), strategy_name=variant)
+        summary.insert(0, "variant", variant)
+        expected_empty_growth.append(summary)
+    pd.testing.assert_frame_equal(
+        _result_table(aggregated_growth, "summary"),
+        pd.concat(expected_empty_growth, ignore_index=True),
+    )
+    reversed_growth = registry.aggregate_results(growth_spec, tuple(reversed(growth_results)))
+    assert aggregated_growth.result_hash == reversed_growth.result_hash
+
 
 def test_nshape_optimize_multi_hold_aggregate_matches_legacy_global_result(
     tmp_path: Path,
@@ -1198,6 +1232,7 @@ def test_auction_cross_bucket_aggregate_matches_legacy_fixture(tmp_path: Path) -
     )
     from rquant.storage.duckdb import DuckDBStore
     from rquant.strategy_job_adapters import default_strategy_job_adapter_registry
+    from rquant.strategy_replay_metrics import auction_gap_metric_rows
     from tests.unit.test_auction_gap_minute_replay import _seed_base
 
     spec = _spec(
@@ -1226,6 +1261,10 @@ def test_auction_cross_bucket_aggregate_matches_legacy_fixture(tmp_path: Path) -
 
     pd.testing.assert_frame_equal(_result_table(actual, "candidates"), candidates)
     pd.testing.assert_frame_equal(_result_table(actual, "trades"), expected)
+    pd.testing.assert_frame_equal(
+        _result_table(actual, "summary"),
+        auction_gap_metric_rows(candidates, expected),
+    )
     assert actual.result_hash == ordered.result_hash
     with pytest.raises(ValueError, match="complete shard plan"):
         registry.aggregate_results(spec, results[:-1])
@@ -1240,6 +1279,7 @@ def test_growth_cross_bucket_aggregate_matches_legacy_fixture(tmp_path: Path) ->
     )
     from rquant.storage.duckdb import DuckDBStore
     from rquant.strategy_job_adapters import default_strategy_job_adapter_registry
+    from rquant.strategy_replay_metrics import growth_board_metric_rows
     from tests.unit.test_growth_board_surge_strategy import (
         _seed_base_market,
         _seed_volume_surge_minutes,
@@ -1247,12 +1287,15 @@ def test_growth_cross_bucket_aggregate_matches_legacy_fixture(tmp_path: Path) ->
 
     spec = _spec(
         "growth_board_surge",
-        _parameter("variants", "text_list", ("full",)),
+        _parameter("variants", "text_list", ("no_vwap", "full")),
         _parameter("max_hold_days", "integer", 1),
         _parameter("lookback_days", "integer", 2),
         _parameter("min_hist_days", "integer", 2),
         start_date=date(2026, 6, 5),
         end_date=date(2026, 6, 25),
+    )
+    typed_variants = next(
+        parameter.value for parameter in spec.parameters.arguments if parameter.name == "variants"
     )
     registry = default_strategy_job_adapter_registry()
     with DuckDBStore(tmp_path / "aggregate-growth.duckdb") as store:
@@ -1275,8 +1318,20 @@ def test_growth_cross_bucket_aggregate_matches_legacy_fixture(tmp_path: Path) ->
         )
         actual = registry.aggregate_results(spec, tuple(reversed(results)))
 
-    aggregated = _result_table(actual, "trades").drop(columns="variant")
-    pd.testing.assert_frame_equal(aggregated, expected)
+    aggregated_trades = _result_table(actual, "trades")
+    full_trades = aggregated_trades.loc[aggregated_trades["variant"] == "full"].drop(
+        columns="variant"
+    )
+    pd.testing.assert_frame_equal(full_trades.reset_index(drop=True), expected)
+    expected_summaries: list[pd.DataFrame] = []
+    for variant in typed_variants:
+        variant_trades = aggregated_trades.loc[aggregated_trades["variant"] == variant]
+        summary = growth_board_metric_rows(variant_trades, strategy_name=variant)
+        summary.insert(0, "variant", variant)
+        expected_summaries.append(summary)
+    expected_summary = pd.concat(expected_summaries, ignore_index=True)
+    pd.testing.assert_frame_equal(_result_table(actual, "summary"), expected_summary)
+    assert _result_table(actual, "summary")["variant"].tolist() == list(typed_variants)
 
 
 def test_scheduler_registry_plans_unplanned_submissions_after_restart(tmp_path) -> None:
