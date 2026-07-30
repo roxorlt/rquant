@@ -1464,7 +1464,8 @@ def run_surge_watch(
             miss_streak = 0
             # 全市场快照每分钟原子落盘（共享 feed：云端/Mac 全景页 poller 读它，与主循环同拍）
             atomic_write_parquet(full, live_dir / SNAPSHOT_FULL_NAME)
-            pulse_session.on_snapshot(full, now)
+            if now.time() >= OPEN_TIME:  # 集合竞价快照不喂脉搏（09:25-09:30 无成交分钟含义）
+                pulse_session.on_snapshot(full, now)
             # 检测层收窄到 config.boards（行为与旧「只拉创业/科创」一致）
             detection = _detection_domain(full, config.boards)
             result = watcher.tick(detection, now)

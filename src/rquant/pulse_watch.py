@@ -169,10 +169,16 @@ def append_jsonl(path: Path, obj: dict) -> None:
 
 
 def read_pulse_points(path: Path) -> list[PulsePoint]:
+    """读 pulse jsonl；坏行/缺文件/损坏文件（非 UTF-8、目录遮蔽等）全部降级空列表，绝不抛异常。"""
     if not path.exists():
         return []
     out: list[PulsePoint] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    try:
+        text = path.read_text(encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"pulse 历史文件读取失败（降级空历史）: {path.name} {type(e).__name__}: {e}")
+        return out
+    for line in text.splitlines():
         line = line.strip()
         if not line:
             continue
@@ -205,7 +211,11 @@ class PulseSession:
         self.dry_run = dry_run
         self.notify_fn = notify_fn
         self.watcher = PulseAnomalyWatcher(config)
-        seeded = self.watcher.seed(read_pulse_points(pulse_path(live_dir, day)))
+        try:
+            seeded = self.watcher.seed(read_pulse_points(pulse_path(live_dir, day)))
+        except Exception as e:
+            logger.warning(f"pulse seed 失败（从空滑窗开始，不阻塞启动）: {type(e).__name__}: {e}")
+            seeded = 0
         if seeded:
             logger.info(f"pulse 滑窗 seed {seeded} 分钟（重启续算当日历史）")
 

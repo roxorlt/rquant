@@ -84,6 +84,13 @@ class TestWatcherRules:
         assert [a.kind for a in alerts] == ["ratio_jump"]
         assert "48% → 64%" in alerts[0].message
 
+    def test_ratio_jump_downward_triggers(self) -> None:
+        w = PulseAnomalyWatcher()
+        _feed_flat(w, 0, 11, up_ratio=48.0)
+        alerts = w.observe(_pt("09:41", up_ratio=30.0), _now("09:41"))  # -18pct≥15
+        assert [a.kind for a in alerts] == ["ratio_jump"]
+        assert "48% → 30%" in alerts[0].message
+
     def test_same_minute_duplicate_ignored(self) -> None:
         w = PulseAnomalyWatcher()
         _feed_flat(w, 0, 11)
@@ -130,6 +137,20 @@ class TestJsonlIO:
 
     def test_read_missing_file_empty(self, tmp_path: Path) -> None:
         assert read_pulse_points(tmp_path / "nope.jsonl") == []
+
+    def test_read_corrupt_bytes_returns_empty_without_raising(self, tmp_path: Path) -> None:
+        p = pulse_path(tmp_path, date(2026, 7, 29))
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"\xff\xfe garbage")  # 非 UTF-8 → decode 会抛，read_pulse_points 须吞掉
+        assert read_pulse_points(p) == []
+
+    def test_session_construction_survives_corrupt_pulse_file(self, tmp_path: Path) -> None:
+        day = date(2026, 7, 29)
+        p = pulse_path(tmp_path, day)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"\xff\xfe garbage")
+        s = PulseSession(tmp_path, day, notify_fn=lambda *a, **k: None)
+        assert s.watcher._points == []  # seed 降级为空滑窗，未抛异常
 
 
 def _pulse_snap(limit_up: int, *, broken: int = 0, total: int = 100) -> pd.DataFrame:
