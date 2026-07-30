@@ -1652,6 +1652,7 @@ class _DarwinKqueueProcessTracker:
             if exc.errno == errno.ESRCH:
                 return False
             raise ContainedProcessError("kernel child registration failed") from exc
+        _require_no_execution_hooks()
         after = _darwin_process_observation(identity.pid)
         if after is not None and after.identity != identity:
             raise ContainedProcessError("kernel child identity changed during registration")

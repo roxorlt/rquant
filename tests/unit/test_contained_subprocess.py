@@ -430,6 +430,88 @@ def test_darwin_registration_rejects_hooks_before_initialized_queue_side_effects
         _restore_execution_hooks_for_test(original_trace, original_profile)
 
 
+@pytest.mark.parametrize("hook_kind", ("trace", "profile", "both"))
+def test_darwin_register_root_rechecks_hooks_after_registration_control(
+    monkeypatch: pytest.MonkeyPatch,
+    hook_kind: str,
+) -> None:
+    original_trace = sys.gettrace()
+    original_profile = sys.getprofile()
+    tracker = contained._DarwinKqueueProcessTracker()
+    identity = contained.ProcessIdentity(101, (1, 0))
+    calls = {"observe": 0, "control": 0, "thread": 0, "start": 0}
+    observations_at_control = -1
+
+    class Queue:
+        def control(self, changes: object, *_args: object) -> list[object]:
+            nonlocal observations_at_control
+            assert changes is not None
+            calls["control"] += 1
+            observations_at_control = calls["observe"]
+            sys.settrace(trace_hook if hook_kind in {"trace", "both"} else None)
+            sys.setprofile(profile_hook if hook_kind in {"profile", "both"} else None)
+            return []
+
+        def close(self) -> None:
+            return None
+
+    class Thread:
+        def __init__(self, **_kwargs: object) -> None:
+            calls["thread"] += 1
+
+        def start(self) -> None:
+            calls["start"] += 1
+
+        def join(self, *, timeout: float) -> None:
+            assert timeout >= 0
+
+        def is_alive(self) -> bool:
+            return False
+
+    def observe(_pid: int) -> contained._ProcessObservation:
+        calls["observe"] += 1
+        return contained._ProcessObservation(identity=identity, parent_pid=1)
+
+    def trace_hook(_frame: object, _event: str, _arg: object) -> object:
+        return trace_hook
+
+    def profile_hook(_frame: object, _event: str, _arg: object) -> None:
+        return None
+
+    tracker._queue = Queue()
+    tracker._owns_queue = True
+    monkeypatch.setattr(contained, "_darwin_process_observation", observe)
+    monkeypatch.setattr(contained.select, "kevent", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(contained.select, "KQ_FILTER_PROC", 1)
+    monkeypatch.setattr(contained.select, "KQ_EV_ADD", 2)
+    monkeypatch.setattr(contained.select, "KQ_EV_ENABLE", 4)
+    monkeypatch.setattr(contained.select, "KQ_EV_CLEAR", 8)
+    monkeypatch.setattr(contained.select, "KQ_NOTE_FORK", 16)
+    monkeypatch.setattr(contained.select, "KQ_NOTE_EXIT", 32)
+    monkeypatch.setattr(contained.threading, "Thread", Thread)
+    try:
+        _clear_execution_hooks()
+
+        with pytest.raises(
+            contained.ContainedProcessError,
+            match="contained acquisition does not support active execution hooks",
+        ):
+            tracker.register_root(identity.pid, deadline=time.monotonic() + 1)
+
+        assert calls == {"observe": 2, "control": 1, "thread": 0, "start": 0}
+        assert observations_at_control == 2
+        assert tracker._registered == set()
+        assert tracker._known == {}
+        assert tracker._root_pid is None
+        assert tracker._root_started is None
+        assert tracker._thread is None
+        assert sys.gettrace() is (trace_hook if hook_kind in {"trace", "both"} else None)
+        assert sys.getprofile() is (profile_hook if hook_kind in {"profile", "both"} else None)
+    finally:
+        tracker.close()
+        _restore_execution_hooks_for_test(original_trace, original_profile)
+
+
 @pytest.mark.parametrize("has_descendant", (False, True), ids=("root-only", "descendant"))
 @pytest.mark.parametrize("hook_kind", ("trace", "profile", "both"))
 def test_linux_poll_rejects_hooks_before_inventory_and_state_changes(
