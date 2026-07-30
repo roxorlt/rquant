@@ -201,7 +201,10 @@ def _stale_local_feed() -> tuple[pd.DataFrame, float] | None:
     try:
         if not path.exists():
             return None
-        age = time.time() - path.stat().st_mtime
+        # clamp 负数：跨机器时钟偏差下 mtime 可能超前本机时钟，负 age 会让
+        # mono - age > mono、age_seconds 显示负数，陈旧横幅漏触发（与
+        # _restore_from_drop 的 age 处理保持一致）
+        age = max(0.0, time.time() - path.stat().st_mtime)
         df = pd.read_parquet(path)
         if df is None or df.empty:
             return None
@@ -381,6 +384,7 @@ class SourcePoller:
         # 冷启动兜底：本进程从未成功过（slot 恒空），UI 会永远卡在「等 as_of」的
         # st.rerun 死循环——哪怕带 ⚠️ 陈旧提示的旧数据也好过白屏。仅这一次触发；
         # 一旦恢复成功 state.df 非空，后续轮次回到正常 last-known-good 语义。
+        # state.df 只在 poll 线程内读写（_lock 只保护跨线程的 UI 读），此处无锁读安全。
         if state.df.empty:
             self._cold_start_fallback(state, mono)
 

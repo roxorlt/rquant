@@ -490,6 +490,34 @@ class TestColdStartFallback:
         assert as_of != ""
         assert poller.status()[SNAPSHOT_KEY]["age_seconds"] > 120
 
+    def test_stale_feed_clamps_future_mtime_to_zero_age(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """跨机器时钟偏差：feed mtime 超前本机时钟时 age 不应为负——负值会让
+        mono - age > mono、age_seconds 显示负数，陈旧横幅漏触发。"""
+        feed = tmp_path / "snapshot_full.parquet"
+        pd.DataFrame(
+            {"ts_code": ["300001.SZ"], "name": ["创业甲"], "price": [10.0], "pre_close": [9.0]}
+        ).to_parquet(feed, index=False)
+        future = time.time() + 3600  # mtime 超前本机时钟 1 小时
+        os.utime(feed, (future, future))
+        monkeypatch.setenv("RQUANT_CLOUD_FEED_URL", str(feed))
+
+        empty_drop = tmp_path / "empty_live"
+        poller = SourcePoller(
+            now=FakeClock(),
+            snapshot_fetcher=self._failing_snapshot,
+            flow_fetcher=lambda s: _flow_df(),
+            cloud_feed_fetcher=lambda: None,  # 绕过第 0 路由（未来 mtime 会被误判「新鲜」）
+            drop_dir=empty_drop,
+        )
+        poller.poll_once()
+
+        df, as_of, route = poller.snapshot()
+        assert not df.empty
+        assert route == "cloud_feed_stale"
+        assert poller.status()[SNAPSHOT_KEY]["age_seconds"] >= 0
+
     def test_does_not_overwrite_existing_last_known_good(self, tmp_path: Path) -> None:
         drop = tmp_path / "live"
         drop.mkdir(parents=True)
