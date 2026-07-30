@@ -243,6 +243,14 @@ def _collect_cleanup_error(
         cleanup_errors.append(error)
         seen.add(id(error))
         return
+    root_width = len(root_nested)
+    if (
+        1 + root_width > _CLEANUP_GROUP_NODE_BUDGET
+        or 1 + 2 * root_width > _CLEANUP_GROUP_WORK_BUDGET
+    ):
+        cleanup_errors.append(error)
+        seen.add(id(error))
+        return
 
     frames.append(_CleanupGroupFrame(error, root_nested, 0, 0, 0, root_scope))
     active_groups[id(error)] = 0
@@ -1589,11 +1597,11 @@ class _DarwinKqueueProcessTracker:
         self._construction_error: BaseException | None = None
 
     def _initialize_queue(self) -> None:
+        _require_no_execution_hooks()
         if self._construction_error is not None:
             raise self._construction_error
         if self._queue is not None:
             return
-        _require_no_execution_hooks()
         try:
             queue = select.kqueue()
             self._queue = queue
@@ -1603,6 +1611,7 @@ class _DarwinKqueueProcessTracker:
             raise
 
     def _register_process(self, identity: ProcessIdentity) -> bool:
+        _require_no_execution_hooks()
         if identity.pid in self._registered:
             return True
         before = _darwin_process_observation(identity.pid)
@@ -1632,6 +1641,7 @@ class _DarwinKqueueProcessTracker:
         return True
 
     def register_root(self, pid: int, *, deadline: float) -> ProcessIdentity:
+        _require_no_execution_hooks()
         self._initialize_queue()
         if time.monotonic() >= deadline:
             raise TimeoutError("kernel tracker registration deadline expired")
@@ -1751,6 +1761,7 @@ class _LinuxSubreaperProcessTracker:
         self._subreaper_changed = False
 
     def _enable_subreaper(self, deadline: float) -> None:
+        _require_no_execution_hooks()
         remaining = deadline - time.monotonic()
         if remaining <= 0 or not _LINUX_SUBREAPER_LOCK.acquire(timeout=remaining):
             raise TimeoutError("subreaper registration deadline expired")
@@ -1766,9 +1777,8 @@ class _LinuxSubreaperProcessTracker:
             self._subreaper_changed = True
 
     def _bind_pid(self, identity: ProcessIdentity) -> None:
+        _require_no_execution_hooks()
         needs_pidfd = identity.pid not in self._pidfds and hasattr(os, "pidfd_open")
-        if needs_pidfd:
-            _require_no_execution_hooks()
         prior = self._known.get(identity.pid)
         if prior is not None and prior != identity:
             raise ContainedProcessError("kernel tracker observed PID identity reuse")
@@ -1815,6 +1825,7 @@ class _LinuxSubreaperProcessTracker:
                 raise
 
     def register_root(self, pid: int, *, deadline: float) -> ProcessIdentity:
+        _require_no_execution_hooks()
         self._enable_subreaper(deadline)
         observed = _linux_process_observation(pid)
         if observed is None:

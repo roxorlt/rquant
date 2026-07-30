@@ -252,6 +252,184 @@ def test_active_execution_hook_blocks_pidfd_before_open(
         _restore_execution_hooks_for_test(original_trace, original_profile)
 
 
+@pytest.mark.parametrize(
+    ("use_trace", "use_profile"),
+    ((True, False), (False, True), (True, True)),
+    ids=("trace", "profile", "both"),
+)
+def test_linux_register_root_rejects_hooks_before_tracker_state_changes(
+    monkeypatch: pytest.MonkeyPatch,
+    use_trace: bool,
+    use_profile: bool,
+) -> None:
+    original_trace = sys.gettrace()
+    original_profile = sys.getprofile()
+    tracker = contained._LinuxSubreaperProcessTracker()
+    identity = contained.ProcessIdentity(101, (1, 0))
+    calls = {"subreaper": 0, "observe": 0, "pidfd": 0}
+
+    def trace_hook(_frame: object, _event: str, _arg: object) -> object:
+        return trace_hook
+
+    def profile_hook(_frame: object, _event: str, _arg: object) -> None:
+        return None
+
+    def enable_subreaper(_deadline: float) -> None:
+        calls["subreaper"] += 1
+
+    def observe(_pid: int) -> contained._ProcessObservation:
+        calls["observe"] += 1
+        return contained._ProcessObservation(identity=identity, parent_pid=1)
+
+    def open_pidfd(_pid: int, _flags: int) -> int:
+        calls["pidfd"] += 1
+        raise AssertionError("pidfd acquisition must not run")
+
+    monkeypatch.setattr(tracker, "_enable_subreaper", enable_subreaper)
+    monkeypatch.setattr(contained, "_linux_process_observation", observe)
+    monkeypatch.setattr(contained.os, "pidfd_open", open_pidfd, raising=False)
+    try:
+        sys.settrace(trace_hook if use_trace else None)
+        sys.setprofile(profile_hook if use_profile else None)
+
+        with pytest.raises(
+            contained.ContainedProcessError,
+            match="contained acquisition does not support active execution hooks",
+        ):
+            tracker.register_root(identity.pid, deadline=time.monotonic() + 1)
+
+        assert calls == {"subreaper": 0, "observe": 0, "pidfd": 0}
+        assert tracker._root_pid is None
+        assert tracker._root_started is None
+        assert tracker._known == {}
+        assert tracker._pidfds == {}
+        assert tracker._pending_pidfds == []
+        assert not tracker._owns_subreaper_lock
+        assert not tracker._subreaper_changed
+        assert tracker._previous_subreaper == 0
+        assert sys.gettrace() is (trace_hook if use_trace else None)
+        assert sys.getprofile() is (profile_hook if use_profile else None)
+    finally:
+        _restore_execution_hooks_for_test(original_trace, original_profile)
+
+
+@pytest.mark.parametrize("hook_kind", ("trace", "profile"))
+def test_linux_enable_subreaper_rejects_hooks_before_lock_and_prctl(
+    monkeypatch: pytest.MonkeyPatch,
+    hook_kind: str,
+) -> None:
+    original_trace = sys.gettrace()
+    original_profile = sys.getprofile()
+    tracker = contained._LinuxSubreaperProcessTracker()
+    calls = {"lock": 0, "cdll": 0, "prctl": 0}
+
+    class Lock:
+        def acquire(self, *, timeout: float) -> bool:
+            assert timeout > 0
+            calls["lock"] += 1
+            return True
+
+    class Libc:
+        def prctl(self, *_args: object) -> int:
+            calls["prctl"] += 1
+            return 1
+
+    def load_libc(*_args: object, **_kwargs: object) -> Libc:
+        calls["cdll"] += 1
+        return Libc()
+
+    def trace_hook(_frame: object, _event: str, _arg: object) -> object:
+        return trace_hook
+
+    def profile_hook(_frame: object, _event: str, _arg: object) -> None:
+        return None
+
+    monkeypatch.setattr(contained, "_LINUX_SUBREAPER_LOCK", Lock())
+    monkeypatch.setattr(contained.ctypes, "CDLL", load_libc)
+    try:
+        sys.settrace(trace_hook if hook_kind == "trace" else None)
+        sys.setprofile(profile_hook if hook_kind == "profile" else None)
+
+        with pytest.raises(
+            contained.ContainedProcessError,
+            match="contained acquisition does not support active execution hooks",
+        ):
+            tracker._enable_subreaper(time.monotonic() + 1)
+
+        assert calls == {"lock": 0, "cdll": 0, "prctl": 0}
+        assert not tracker._owns_subreaper_lock
+        assert not tracker._subreaper_changed
+        assert tracker._previous_subreaper == 0
+        assert sys.gettrace() is (trace_hook if hook_kind == "trace" else None)
+        assert sys.getprofile() is (profile_hook if hook_kind == "profile" else None)
+    finally:
+        _restore_execution_hooks_for_test(original_trace, original_profile)
+
+
+@pytest.mark.parametrize("entrypoint", ("initialize", "register-process", "register-root"))
+@pytest.mark.parametrize("hook_kind", ("trace", "profile", "both"))
+def test_darwin_registration_rejects_hooks_before_initialized_queue_side_effects(
+    monkeypatch: pytest.MonkeyPatch,
+    entrypoint: str,
+    hook_kind: str,
+) -> None:
+    original_trace = sys.gettrace()
+    original_profile = sys.getprofile()
+    tracker = contained._DarwinKqueueProcessTracker()
+    identity = contained.ProcessIdentity(101, (1, 0))
+    calls = {"initialize": 0, "observe": 0, "control": 0}
+
+    class Queue:
+        def control(self, *_args: object) -> list[object]:
+            calls["control"] += 1
+            return []
+
+    def initialize() -> None:
+        calls["initialize"] += 1
+        raise AssertionError("initialized queue must not be consulted")
+
+    def observe(_pid: int) -> contained._ProcessObservation:
+        calls["observe"] += 1
+        return contained._ProcessObservation(identity=identity, parent_pid=1)
+
+    def trace_hook(_frame: object, _event: str, _arg: object) -> object:
+        return trace_hook
+
+    def profile_hook(_frame: object, _event: str, _arg: object) -> None:
+        return None
+
+    tracker._queue = Queue()
+    tracker._owns_queue = True
+    monkeypatch.setattr(contained, "_darwin_process_observation", observe)
+    if entrypoint == "register-root":
+        monkeypatch.setattr(tracker, "_initialize_queue", initialize)
+    try:
+        sys.settrace(trace_hook if hook_kind in {"trace", "both"} else None)
+        sys.setprofile(profile_hook if hook_kind in {"profile", "both"} else None)
+
+        with pytest.raises(
+            contained.ContainedProcessError,
+            match="contained acquisition does not support active execution hooks",
+        ):
+            if entrypoint == "initialize":
+                tracker._initialize_queue()
+            elif entrypoint == "register-process":
+                tracker._register_process(identity)
+            else:
+                tracker.register_root(identity.pid, deadline=time.monotonic() + 1)
+
+        assert calls == {"initialize": 0, "observe": 0, "control": 0}
+        assert tracker._registered == set()
+        assert tracker._known == {}
+        assert tracker._root_pid is None
+        assert tracker._root_started is None
+        assert tracker._thread is None
+        assert sys.gettrace() is (trace_hook if hook_kind in {"trace", "both"} else None)
+        assert sys.getprofile() is (profile_hook if hook_kind in {"profile", "both"} else None)
+    finally:
+        _restore_execution_hooks_for_test(original_trace, original_profile)
+
+
 @pytest.mark.skipif(sys.platform != "darwin", reason="Darwin kqueue hook contract")
 def test_kqueue_acquisition_accepts_no_execution_hooks_and_rejects_both(
     monkeypatch: pytest.MonkeyPatch,
@@ -735,7 +913,7 @@ def test_cleanup_budget_reserves_each_fresh_marker_root_sibling() -> None:
     (-1, 0, 1),
     ids=("budget-minus-one", "budget", "budget-plus-one"),
 )
-def test_cleanup_root_width_boundary_preserves_all_direct_leaves(
+def test_cleanup_root_width_boundary_is_hard(
     monkeypatch: pytest.MonkeyPatch,
     width_offset: int,
 ) -> None:
@@ -748,10 +926,11 @@ def test_cleanup_root_width_boundary_preserves_all_direct_leaves(
         OSError(f"wide root leaf {index}") for index in range(node_budget + width_offset)
     )
     later = ValueError("wide root later cleanup")
-    primary.cleanup_error_group = BaseExceptionGroup(  # type: ignore[attr-defined]
+    root = BaseExceptionGroup(
         "wide root cleanup",
         list(leaves),
     )
+    primary.cleanup_error_group = root  # type: ignore[attr-defined]
 
     contained._attach_cleanup_error_group(
         primary,
@@ -762,7 +941,54 @@ def test_cleanup_root_width_boundary_preserves_all_direct_leaves(
 
     cleanup_group = getattr(primary, "cleanup_error_group", None)
     assert isinstance(cleanup_group, BaseExceptionGroup)
-    assert cleanup_group.exceptions == (*leaves, later)
+    expected = (*leaves, later) if width_offset == -1 else (root, later)
+    assert cleanup_group.exceptions == expected
+
+
+@pytest.mark.parametrize("width", (100, 10000))
+def test_cleanup_extremely_wide_root_is_opaque_and_bounded(width: int) -> None:
+    source_root = Path(__file__).parents[2] / "src"
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = os.pathsep.join(
+        filter(None, (str(source_root), environment.get("PYTHONPATH", "")))
+    )
+    probe = """
+import signal
+from rquant import contained_subprocess as contained
+
+contained._CLEANUP_GROUP_NODE_BUDGET = 8
+contained._CLEANUP_GROUP_FRAME_BUDGET = 20
+contained._CLEANUP_GROUP_WORK_BUDGET = 20
+primary = RuntimeError('primary')
+root = BaseExceptionGroup(
+    'extremely wide cleanup',
+    [OSError(f'leaf {index}') for index in range(ROOT_WIDTH)],
+)
+later = ValueError('later cleanup')
+primary.cleanup_error_group = root
+signal.setitimer(signal.ITIMER_REAL, 0.5)
+contained._attach_cleanup_error_group(
+    primary,
+    [later],
+    error_label='extremely wide cleanup',
+    note='extremely wide cleanup note',
+)
+signal.setitimer(signal.ITIMER_REAL, 0)
+group = primary.cleanup_error_group
+assert isinstance(group, BaseExceptionGroup)
+assert group.exceptions == (root, later)
+""".replace("ROOT_WIDTH", str(width))
+
+    completed = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        timeout=3,
+        env=environment,
+        check=False,
+    )
+
+    assert completed.returncode == 0, (completed.stdout, completed.stderr)
 
 
 @pytest.mark.parametrize(
