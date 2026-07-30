@@ -115,6 +115,24 @@ class TestFakeMode:
         assert len(marks) == 1
 
 
+class TestSurgeLogHistoricalDay:
+    """爆量记录历史日期回看（UI 新增日期选择器所依赖的 loader 契约）：不同日期各读各的
+    ``events-<day>.jsonl``，互不串台。"""
+
+    def test_reads_own_day_file_per_day(self, tmp_path: Path) -> None:
+        d1, d2 = date(2026, 7, 28), date(2026, 7, 29)
+        _write_lines(tmp_path / f"events-{d1.isoformat()}.jsonl", [
+            {"ts_code": "600001.SH", "confirmed_at": "09:31", "rel_cum": 3.0},
+        ])
+        _write_lines(tmp_path / f"events-{d2.isoformat()}.jsonl", [
+            {"ts_code": "300002.SZ", "confirmed_at": "10:00", "rel_cum": 4.0},
+        ])
+        df1 = load_surge_log(d1, live_dir=tmp_path)
+        df2 = load_surge_log(d2, live_dir=tmp_path)
+        assert list(df1["ts_code"]) == ["600001.SH"]
+        assert list(df2["ts_code"]) == ["300002.SZ"]
+
+
 def _trend(day: str, times: list[str], prices: list[float]) -> pd.DataFrame:
     return pd.DataFrame({
         "dt": pd.to_datetime([f"{day} {t}" for t in times]),
