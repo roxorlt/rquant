@@ -126,6 +126,8 @@ class ServingGenerationManifest(RuntimeContractModel):
                 raise ValueError(
                     f"watermark {watermark.dataset_id} generation does not match source_generations"
                 )
+            if self.built_at < watermark.published_at:
+                raise ValueError("built_at cannot precede watermark published_at")
 
         expected_id = canonical_sha256(self.identity_payload())
         if self.generation_id and self.generation_id != expected_id:

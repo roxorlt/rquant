@@ -145,6 +145,20 @@ def test_manifest_rejects_duplicate_or_mismatched_dataset_generations() -> None:
         _manifest(row_counts={"market_minute": 240})
 
 
+def test_manifest_cannot_be_built_before_source_watermarks_are_published() -> None:
+    published_later = BUILT_AT + timedelta(seconds=1)
+
+    with pytest.raises(ValidationError, match="built_at cannot precede watermark"):
+        _manifest(
+            watermarks=(
+                _watermark("market_minute", "minute-generation").model_copy(
+                    update={"published_at": published_later}
+                ),
+                _watermark("strategy_signal", "signal-generation"),
+            )
+        )
+
+
 def test_manifest_round_trips_without_exposing_mutable_mappings() -> None:
     manifest = _manifest()
 
