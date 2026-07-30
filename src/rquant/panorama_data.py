@@ -1143,6 +1143,37 @@ _SURGE_LOG_COLUMNS = [
     "confirmed_at", "ts_code", "name", "theme", "pct_chg",
     "cum_amount", "rel_cum", "room_to_limit_pct", "status",
 ]
+_PULSE_LOG_COLUMNS = ["t", "limit_up", "limit_down", "broken", "up", "down",
+                      "up_ratio_pct", "total"]
+_PULSE_ALERT_COLUMNS = ["t", "kind", "kind_label", "before", "after",
+                        "window_minutes", "message"]
+_RUNTIME_CONFIG_NAME = "runtime_config.json"
+
+
+def _surge_live_dir(live_dir: Path | None) -> Path:
+    if live_dir is not None:
+        return live_dir
+    from rquant.config import settings
+
+    return settings.data_dir / _SURGE_LIVE_DIR_NAME
+
+
+def _read_jsonl_records(path: Path, required_key: str) -> list[dict]:
+    """逐行读 jsonl，跳过坏行/缺关键字段的行；文件缺失 → 空。"""
+    if not path.exists():
+        return []
+    records: list[dict] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(obj, dict) and obj.get(required_key):
+            records.append(obj)
+    return records
 
 
 def load_surge_log(day: date | None = None, *, live_dir: Path | None = None) -> pd.DataFrame:
@@ -1153,27 +1184,12 @@ def load_surge_log(day: date | None = None, *, live_dir: Path | None = None) -> 
     非 dict / 缺 ts_code）逐行跳过，不让单条脏数据拖垮整表。confirmed_at 为定长
     ``HH:MM``，字典序即时间序，故排序后按 ts_code 保留首行即当日最早识别时刻。
     """
+    if _fake_enabled():
+        return _fake_surge_log()
     if day is None:
         day = datetime.now(_CST).date()
-    if live_dir is None:
-        from rquant.config import settings
-
-        live_dir = settings.data_dir / _SURGE_LIVE_DIR_NAME
-    path = live_dir / f"events-{day.isoformat()}.jsonl"
-    if not path.exists():
-        return pd.DataFrame(columns=_SURGE_LOG_COLUMNS)
-
-    records: list[dict] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except (json.JSONDecodeError, ValueError):
-            continue
-        if isinstance(obj, dict) and obj.get("ts_code"):
-            records.append(obj)
+    path = _surge_live_dir(live_dir) / f"events-{day.isoformat()}.jsonl"
+    records = _read_jsonl_records(path, "ts_code")
     if not records:
         return pd.DataFrame(columns=_SURGE_LOG_COLUMNS)
 
@@ -1186,6 +1202,81 @@ def load_surge_log(day: date | None = None, *, live_dir: Path | None = None) -> 
         .drop_duplicates(subset="ts_code", keep="first")
         .reset_index(drop=True)
     )
+
+
+def load_pulse_history(
+    day: date | None = None, *, live_dir: Path | None = None
+) -> pd.DataFrame:
+    """当日脉搏分钟历史（surge-watch 落盘）。缺失/坏行降级，列契约恒定。"""
+    if _fake_enabled():
+        return _fake_pulse_history()
+    if day is None:
+        day = datetime.now(_CST).date()
+    path = _surge_live_dir(live_dir) / f"pulse-{day.isoformat()}.jsonl"
+    records = _read_jsonl_records(path, "t")
+    if not records:
+        return pd.DataFrame(columns=_PULSE_LOG_COLUMNS)
+    df = pd.DataFrame(records)
+    for col in _PULSE_LOG_COLUMNS:
+        if col not in df.columns:
+            df[col] = float("nan")
+    return df[_PULSE_LOG_COLUMNS]
+
+
+def load_pulse_alerts(
+    day: date | None = None, *, live_dir: Path | None = None
+) -> pd.DataFrame:
+    """当日脉搏异动事件（surge-watch 落盘），按文件顺序（即时间序）。"""
+    if _fake_enabled():
+        return _fake_pulse_alerts()
+    if day is None:
+        day = datetime.now(_CST).date()
+    path = _surge_live_dir(live_dir) / f"pulse_alerts-{day.isoformat()}.jsonl"
+    records = _read_jsonl_records(path, "t")
+    if not records:
+        return pd.DataFrame(columns=_PULSE_ALERT_COLUMNS)
+    df = pd.DataFrame(records)
+    for col in _PULSE_ALERT_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+    return df[_PULSE_ALERT_COLUMNS]
+
+
+def load_surge_runtime_config(*, live_dir: Path | None = None) -> dict | None:
+    """surge-watch 当前生效口径（启动时原子写）。缺失/损坏 → None。"""
+    if _fake_enabled():
+        return {"boards": ["main", "gem", "star", "bj"], "k_rough": 1.2,
+                "k_cum": 2.5, "ratio_cap": 8.0, "tushare_rate_per_min": 2}
+    path = _surge_live_dir(live_dir) / _RUNTIME_CONFIG_NAME
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8"))
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
+
+
+def load_surge_marks(
+    ts_code: str, dates: list[date], *, live_dir: Path | None = None
+) -> pd.DataFrame:
+    """指定交易日集合内该票每天最早爆量确认（图表标记源）。
+
+    逐日复用 load_surge_log（每票保留最早行的语义一致）；某日文件缺失自然跳过。
+    """
+    rows: list[dict] = []
+    for d in dates:
+        df = load_surge_log(d, live_dir=live_dir)
+        if df.empty or "ts_code" not in df.columns:
+            continue
+        sub = df[df["ts_code"].astype(str) == ts_code]
+        if sub.empty:
+            continue
+        r = sub.iloc[0]
+        rows.append({
+            "date": d,
+            "confirmed_at": str(r.get("confirmed_at", "")),
+            "rel_cum": pd.to_numeric(pd.Series([r.get("rel_cum")]), errors="coerce").iloc[0],
+        })
+    return pd.DataFrame(rows, columns=["date", "confirmed_at", "rel_cum"])
 
 
 # ── A4 Fake 模式确定性 fixture（RQUANT_PANORAMA_FAKE=1，e2e 可测性） ────────────
@@ -1358,3 +1449,46 @@ def _fake_daily_kline(ts_code: str, n: int = 120) -> pd.DataFrame:
     for w in (5, 10, 20):
         df[f"ma{w}"] = df["close"].rolling(window=w, min_periods=w).mean()
     return df
+
+
+def _fake_surge_log() -> pd.DataFrame:
+    """3 条确定性爆量台账：与 _FAKE_CODES 网格对齐（600001 涨停、600003 炸板）。"""
+    rows = [
+        {"confirmed_at": "09:47", "ts_code": "600001.SH", "name": "假票600001",
+         "theme": "人形机器人", "price": 11.0, "pct_chg": 10.0, "rel_cum": 3.2,
+         "cum_amount": 5.2e8, "room_to_limit_pct": 0.0, "status": "unbuyable"},
+        {"confirmed_at": "10:12", "ts_code": "600003.SH", "name": "假票600003",
+         "theme": "人形机器人", "price": 10.4, "pct_chg": 4.0, "rel_cum": 5.1,
+         "cum_amount": 3.1e8, "room_to_limit_pct": 5.8, "status": "confirmed"},
+        {"confirmed_at": "13:05", "ts_code": "600010.SH", "name": "假票600010",
+         "theme": "算力", "price": 12.6, "pct_chg": 6.3, "rel_cum": 2.7,
+         "cum_amount": 2.4e8, "room_to_limit_pct": 3.5, "status": "confirmed"},
+    ]
+    return pd.DataFrame(rows)
+
+
+def _fake_pulse_history() -> pd.DataFrame:
+    """09:30 起 120 分钟确定性脉搏序列（涨停缓升、炸板阶梯、占比爬升）。"""
+    rows: list[dict] = []
+    minute = 9 * 60 + 30
+    for i in range(120):
+        rows.append({
+            "t": f"{minute // 60:02d}:{minute % 60:02d}",
+            "limit_up": 20 + i // 6, "limit_down": 3 + i // 40, "broken": 2 + i // 15,
+            "up": 2600 + i * 5, "down": 2400 - i * 5,
+            "up_ratio_pct": round(48 + i * 0.1, 2), "total": 5400,
+        })
+        minute += 1
+        if minute == 11 * 60 + 31:
+            minute = 13 * 60 + 1
+    return pd.DataFrame(rows, columns=_PULSE_LOG_COLUMNS)
+
+
+def _fake_pulse_alerts() -> pd.DataFrame:
+    """1 条炸板潮；t 取当前时间 − 5 分钟（唯一非硬编码字段，保证提示条恒可见）。"""
+    t = (datetime.now(_CST) - timedelta(minutes=5)).strftime("%H:%M")
+    return pd.DataFrame([{
+        "t": t, "kind": "broken_surge", "kind_label": "炸板潮",
+        "before": 2.0, "after": 6.0, "window_minutes": 10,
+        "message": "炸板 10 分钟 2 → 6（+4）",
+    }], columns=_PULSE_ALERT_COLUMNS)
