@@ -58,14 +58,37 @@ def _record_cleanup_error(
 
 
 def _format_cleanup_error_details(errors: Sequence[BaseException]) -> str:
-    details: list[str] = []
-    for error in errors:
+    try:
+        details: list[str] = []
+        for error in errors:
+            try:
+                detail = str(error)
+                if not detail:
+                    detail = type(error).__name__
+            except BaseException:
+                try:
+                    detail = type(error).__name__
+                except BaseException:
+                    detail = "cleanup error"
+            try:
+                details.append(detail)
+            except BaseException:
+                return "cleanup error"
         try:
-            detail = str(error)
+            return "; ".join(details)
         except BaseException:
-            detail = ""
-        details.append(detail or type(error).__name__)
-    return "; ".join(details)
+            return "cleanup error"
+    except BaseException:
+        return "cleanup error"
+
+
+@dataclass
+class _CleanupGroupFrame:
+    group: BaseExceptionGroup
+    nested_errors: tuple[BaseException, ...]
+    next_index: int
+    output_start: int
+    completion_start: int
 
 
 def _collect_cleanup_error(
@@ -75,36 +98,90 @@ def _collect_cleanup_error(
     primary_exception: BaseException,
     seen: set[int],
 ) -> None:
-    active_groups: set[int] = set()
-    worklist: list[tuple[BaseException, bool]] = [(error, False)]
-    while worklist:
-        current, exiting = worklist.pop()
-        current_id = id(current)
-        if exiting:
-            active_groups.discard(current_id)
-            seen.add(current_id)
+    if error is primary_exception or id(error) in seen:
+        return
+    if not isinstance(error, BaseExceptionGroup):
+        cleanup_errors.append(error)
+        seen.add(id(error))
+        return
+
+    output: list[BaseException] = []
+    emitted: set[int] = set()
+    completed_groups: set[int] = set()
+    completion_log: list[int] = []
+    active_groups: dict[int, int] = {}
+
+    def inspect_group(group: BaseExceptionGroup) -> tuple[BaseException, ...] | None:
+        try:
+            nested = tuple(group.exceptions)
+            if not all(isinstance(item, BaseException) for item in nested):
+                return None
+            return nested
+        except BaseException:
+            return None
+
+    root_nested = inspect_group(error)
+    if root_nested is None:
+        cleanup_errors.append(error)
+        seen.add(id(error))
+        return
+    frames = [_CleanupGroupFrame(error, root_nested, 0, 0, 0)]
+    active_groups[id(error)] = 0
+
+    while frames:
+        frame = frames[-1]
+        if frame.next_index >= len(frame.nested_errors):
+            group_id = id(frame.group)
+            active_groups.pop(group_id, None)
+            completed_groups.add(group_id)
+            completion_log.append(group_id)
+            frames.pop()
             continue
+
+        current = frame.nested_errors[frame.next_index]
+        frame.next_index += 1
+        current_id = id(current)
         if current is primary_exception or current_id in seen:
             continue
-        if current_id in active_groups:
-            cleanup_errors.append(current)
-            seen.add(current_id)
+        cycle_start = active_groups.get(current_id)
+        if cycle_start is not None:
+            cycle_frame = frames[cycle_start]
+            del output[cycle_frame.output_start :]
+            emitted = {id(item) for item in output}
+            del completion_log[cycle_frame.completion_start :]
+            completed_groups = set(completion_log)
+            for aborted in frames[cycle_start:]:
+                active_groups.pop(id(aborted.group), None)
+            del frames[cycle_start:]
+            if current_id not in emitted and current_id not in seen:
+                output.append(cycle_frame.group)
+                emitted.add(current_id)
+            continue
+        if current_id in emitted or current_id in completed_groups:
             continue
         if not isinstance(current, BaseExceptionGroup):
-            cleanup_errors.append(current)
-            seen.add(current_id)
+            output.append(current)
+            emitted.add(current_id)
             continue
-        try:
-            nested_errors = tuple(current.exceptions)
-            if not all(isinstance(nested, BaseException) for nested in nested_errors):
-                raise TypeError("cleanup group contains non-exception evidence")
-        except BaseException:
-            cleanup_errors.append(current)
-            seen.add(current_id)
+        nested_errors = inspect_group(current)
+        if nested_errors is None:
+            output.append(current)
+            emitted.add(current_id)
             continue
-        active_groups.add(current_id)
-        worklist.append((current, True))
-        worklist.extend((nested, False) for nested in reversed(nested_errors))
+        active_groups[current_id] = len(frames)
+        frames.append(
+            _CleanupGroupFrame(
+                current,
+                nested_errors,
+                0,
+                len(output),
+                len(completion_log),
+            )
+        )
+
+    cleanup_errors.extend(output)
+    seen.update(emitted)
+    seen.update(completed_groups)
 
 
 def _merge_cleanup_error_group(
@@ -166,6 +243,113 @@ def _attach_cleanup_error_group(
             primary_exception.add_note(note)
     except BaseException:
         pass
+
+
+@dataclass(frozen=True)
+class _ExecutionHooks:
+    trace: object
+    profile: object
+
+
+def _restore_execution_hook_bounded(
+    setter: Callable[[object], object],
+    getter: Callable[[], object],
+    expected: object,
+    errors: list[BaseException],
+    *,
+    label: str,
+) -> None:
+    for _attempt in range(_SIGNAL_STATE_ATTEMPTS):
+        try:
+            setter(expected)
+        except BaseException as exc:
+            _record_cleanup_error(errors, exc)
+        try:
+            if getter() is expected:
+                return
+        except BaseException as exc:
+            _record_cleanup_error(errors, exc)
+            continue
+        _record_cleanup_error(
+            errors,
+            ContainedProcessError(f"{label} execution hook restoration could not be verified"),
+        )
+
+
+def _restore_execution_hooks(
+    hooks: _ExecutionHooks,
+    errors: list[BaseException],
+) -> None:
+    _restore_execution_hook_bounded(
+        sys.setprofile,
+        sys.getprofile,
+        hooks.profile,
+        errors,
+        label="profile",
+    )
+    _restore_execution_hook_bounded(
+        sys.settrace,
+        sys.gettrace,
+        hooks.trace,
+        errors,
+        label="trace",
+    )
+
+
+def _suspend_execution_hooks() -> _ExecutionHooks:
+    hooks = _ExecutionHooks(sys.gettrace(), sys.getprofile())
+    try:
+        sys.settrace(None)
+        if sys.gettrace() is not None:
+            raise ContainedProcessError("trace execution hook suspension could not be verified")
+        sys.setprofile(None)
+        if sys.getprofile() is not None:
+            raise ContainedProcessError("profile execution hook suspension could not be verified")
+    except BaseException as primary_exception:
+        restoration_errors: list[BaseException] = []
+        try:
+            _restore_execution_hooks(hooks, restoration_errors)
+        except BaseException as exc:
+            _record_cleanup_error(restoration_errors, exc)
+        _attach_cleanup_error_group(
+            primary_exception,
+            restoration_errors,
+            error_label="execution hook suspension recovery failures",
+            note="execution hook suspension recovery also failed",
+        )
+        raise
+    return hooks
+
+
+def _finish_execution_hook_restoration(
+    hooks: _ExecutionHooks,
+    *,
+    primary_exception: BaseException | None,
+    error_label: str,
+) -> None:
+    restoration_errors: list[BaseException] = []
+    try:
+        _restore_execution_hooks(hooks, restoration_errors)
+    except BaseException as exc:
+        _record_cleanup_error(restoration_errors, exc)
+    if primary_exception is not None:
+        _attach_cleanup_error_group(
+            primary_exception,
+            restoration_errors,
+            error_label=error_label,
+            note="execution hook restoration also failed",
+        )
+        raise primary_exception
+    if not restoration_errors:
+        return
+    restoration_primary = restoration_errors[0]
+    _attach_cleanup_error_group(
+        restoration_primary,
+        restoration_errors[1:],
+        error_label=error_label,
+        note="execution hook restoration retries also failed",
+    )
+    raise restoration_primary
 
 
 def _terminate_unsafe_signal_state(
@@ -1316,7 +1500,9 @@ class _DarwinKqueueProcessTracker:
             raise self._construction_error
         if self._queue is not None:
             return
+        hooks = _suspend_execution_hooks()
         queue: object | None = None
+        acquisition_error: BaseException | None = None
         try:
             queue = select.kqueue()
             self._queue = queue
@@ -1325,6 +1511,14 @@ class _DarwinKqueueProcessTracker:
             if queue is not None:
                 self._queue = queue
                 self._owns_queue = True
+            acquisition_error = exc
+        try:
+            _finish_execution_hook_restoration(
+                hooks,
+                primary_exception=acquisition_error,
+                error_label="kqueue acquisition hook restoration failures",
+            )
+        except BaseException as exc:
             self._construction_error = exc
             raise
 
@@ -1499,8 +1693,20 @@ class _LinuxSubreaperProcessTracker:
         if identity.pid not in self._pidfds and hasattr(os, "pidfd_open"):
             descriptor = -1
             try:
-                descriptor = os.pidfd_open(identity.pid, 0)
-                self._pending_pidfds.append(descriptor)
+                hooks = _suspend_execution_hooks()
+                acquisition_error: BaseException | None = None
+                try:
+                    descriptor = os.pidfd_open(identity.pid, 0)
+                    self._pending_pidfds.append(descriptor)
+                except BaseException as exc:
+                    if descriptor >= 0 and descriptor not in self._pending_pidfds:
+                        self._pending_pidfds.append(descriptor)
+                    acquisition_error = exc
+                _finish_execution_hook_restoration(
+                    hooks,
+                    primary_exception=acquisition_error,
+                    error_label="pidfd acquisition hook restoration failures",
+                )
                 self._pidfds[identity.pid] = descriptor
                 self._pending_pidfds.remove(descriptor)
             except BaseException as primary_exception:
@@ -2147,8 +2353,20 @@ def run_contained(
             for stream in (process.stdout, process.stderr):
                 anchor = -1
                 try:
-                    anchor = os.dup(stream.fileno())
-                    darwin_pending_anchor_fds.append(anchor)
+                    hooks = _suspend_execution_hooks()
+                    acquisition_error: BaseException | None = None
+                    try:
+                        anchor = os.dup(stream.fileno())
+                        darwin_pending_anchor_fds.append(anchor)
+                    except BaseException as exc:
+                        if anchor >= 0 and anchor not in darwin_pending_anchor_fds:
+                            darwin_pending_anchor_fds.append(anchor)
+                        acquisition_error = exc
+                    _finish_execution_hook_restoration(
+                        hooks,
+                        primary_exception=acquisition_error,
+                        error_label="anchor acquisition hook restoration failures",
+                    )
                     darwin_pipe_anchor_fds.append(anchor)
                     darwin_pending_anchor_fds.remove(anchor)
                     os.set_inheritable(anchor, False)

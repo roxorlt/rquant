@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import dis
+import fcntl
 import inspect
 import os
 import shutil
@@ -127,6 +129,80 @@ class _ContainedReturnFault:
             self.triggered = True
             raise self._error
         return self.trace
+
+
+class _ContainedCReturnFault:
+    def __init__(self, target: object, error: BaseException) -> None:
+        self._target = target
+        self._error = error
+        self.triggered = False
+
+    def profile(self, frame: object, event: str, arg: object) -> None:
+        if (
+            not self.triggered
+            and event == "c_return"
+            and arg is self._target
+            and getattr(getattr(frame, "f_code", None), "co_filename", None) == contained.__file__
+        ):
+            self.triggered = True
+            raise self._error
+
+
+class _ContainedPostCallOpcodeFault:
+    def __init__(self, code: object, variable: str, error: BaseException) -> None:
+        instructions = tuple(dis.get_instructions(code))
+        self._code = code
+        self._offset = next(
+            current.offset
+            for previous, current in zip(instructions, instructions[1:], strict=False)
+            if previous.opname == "CALL"
+            and current.opname == "STORE_FAST"
+            and current.argval == variable
+        )
+        self._error = error
+        self.triggered = False
+
+    def trace(self, frame: object, event: str, _arg: object) -> object:
+        if getattr(frame, "f_code", None) is self._code:
+            if event == "call":
+                frame.f_trace_opcodes = True  # type: ignore[attr-defined]
+            elif event == "opcode" and getattr(frame, "f_lasti", None) == self._offset:
+                self.triggered = True
+                raise self._error
+        return self.trace
+
+
+def _install_acquisition_fault(
+    kind: str,
+    *,
+    c_target: object,
+    code: object,
+    variable: str,
+    error: BaseException,
+) -> tuple[object, object]:
+    if kind == "c_return":
+        fault = _ContainedCReturnFault(c_target, error)
+        hook = fault.profile
+        sys.setprofile(hook)
+        return fault, hook
+    fault = _ContainedPostCallOpcodeFault(code, variable, error)
+    hook = fault.trace
+    sys.settrace(hook)
+    return fault, hook
+
+
+def _assert_acquisition_hook_restored(kind: str, hook: object) -> None:
+    observed = sys.getprofile() if kind == "c_return" else sys.gettrace()
+    assert observed is hook
+
+
+def _clear_execution_hooks() -> None:
+    sys.settrace(None)
+    sys.setprofile(None)
+
+
+def _open_file_descriptors() -> set[int]:
+    return {int(entry) for entry in os.listdir("/dev/fd") if entry.isdigit()}
 
 
 def test_descendant_discovery_uses_immutable_birth_parent_identity_after_reparent() -> None:
@@ -387,6 +463,84 @@ def test_cleanup_error_group_preserves_cycle_as_opaque() -> None:
     assert cleanup_group.exceptions == (cycle, later)
 
 
+def test_cleanup_error_group_rolls_back_leaf_before_self_cycle() -> None:
+    class MixedCyclicCleanupGroup(BaseExceptionGroup):
+        leaf: BaseException
+
+        @property
+        def exceptions(self) -> tuple[BaseException, ...]:
+            return (self.leaf, self)
+
+    primary = RuntimeError("primary")
+    leaf = OSError("rolled back leaf")
+    cycle = MixedCyclicCleanupGroup("mixed cyclic cleanup", [leaf])
+    cycle.leaf = leaf
+    later = ValueError("later cleanup")
+    primary.cleanup_error_group = cycle  # type: ignore[attr-defined]
+
+    contained._attach_cleanup_error_group(
+        primary,
+        [later],
+        error_label="merged cleanup",
+        note="merged cleanup note",
+    )
+
+    cleanup_group = getattr(primary, "cleanup_error_group", None)
+    assert isinstance(cleanup_group, BaseExceptionGroup)
+    assert cleanup_group.exceptions == (cycle, later)
+
+
+def test_cleanup_error_group_rolls_back_indirect_cycle() -> None:
+    class LinkedCleanupGroup(BaseExceptionGroup):
+        linked: tuple[BaseException, ...]
+
+        @property
+        def exceptions(self) -> tuple[BaseException, ...]:
+            return self.linked
+
+    primary = RuntimeError("primary")
+    first_leaf = OSError("rolled back first leaf")
+    second_leaf = LookupError("rolled back second leaf")
+    first = LinkedCleanupGroup("first cyclic cleanup", [first_leaf])
+    second = LinkedCleanupGroup("second cyclic cleanup", [second_leaf])
+    first.linked = (first_leaf, second)
+    second.linked = (second_leaf, first)
+    later = ValueError("later cleanup")
+    primary.cleanup_error_group = first  # type: ignore[attr-defined]
+
+    contained._attach_cleanup_error_group(
+        primary,
+        [later],
+        error_label="merged cleanup",
+        note="merged cleanup note",
+    )
+
+    cleanup_group = getattr(primary, "cleanup_error_group", None)
+    assert isinstance(cleanup_group, BaseExceptionGroup)
+    assert cleanup_group.exceptions == (first, later)
+
+
+def test_cleanup_error_group_flattens_distinct_nested_groups() -> None:
+    primary = RuntimeError("primary")
+    first = OSError("first cleanup")
+    second = LookupError("second cleanup")
+    later = ValueError("later cleanup")
+    nested = BaseExceptionGroup("nested cleanup", [second])
+    outer = BaseExceptionGroup("outer cleanup", [first, nested])
+    primary.cleanup_error_group = outer  # type: ignore[attr-defined]
+
+    contained._attach_cleanup_error_group(
+        primary,
+        [later],
+        error_label="merged cleanup",
+        note="merged cleanup note",
+    )
+
+    cleanup_group = getattr(primary, "cleanup_error_group", None)
+    assert isinstance(cleanup_group, BaseExceptionGroup)
+    assert cleanup_group.exceptions == (first, second, later)
+
+
 def test_hostile_cleanup_formatting_cannot_displace_primary() -> None:
     class HostileCleanupError(Exception):
         def __str__(self) -> str:
@@ -394,6 +548,39 @@ def test_hostile_cleanup_formatting_cannot_displace_primary() -> None:
 
         def __format__(self, _format_spec: str) -> str:
             raise UnicodeError("hostile cleanup format")
+
+    primary = RuntimeError("primary")
+    cleanup = HostileCleanupError()
+
+    with pytest.raises(RuntimeError) as caught:
+        try:
+            raise primary
+        finally:
+            contained._finish_signal_restoration(
+                {},
+                frozenset(),
+                contained._ContainedSignalLatch(),
+                [cleanup],
+                primary_exception=primary,
+                error_label="contained subprocess cleanup failures",
+            )
+
+    assert caught.value is primary
+    cleanup_group = getattr(primary, "cleanup_error_group", None)
+    assert isinstance(cleanup_group, BaseExceptionGroup)
+    assert cleanup_group.exceptions == (cleanup,)
+
+
+def test_hostile_cleanup_type_name_formatting_cannot_displace_primary() -> None:
+    class HostileErrorType(type):
+        def __getattribute__(cls, name: str) -> object:
+            if name == "__name__":
+                raise UnicodeError("hostile cleanup type name")
+            return super().__getattribute__(name)
+
+    class HostileCleanupError(Exception, metaclass=HostileErrorType):
+        def __str__(self) -> str:
+            raise RuntimeError("hostile cleanup string")
 
     primary = RuntimeError("primary")
     cleanup = HostileCleanupError()
@@ -878,6 +1065,49 @@ def test_linux_pidfd_has_no_return_event_before_pending_registration(
             tracker.close()
         _close_test_fd_if_open(read_fd)
         contained.os.close(write_fd)
+
+
+@pytest.mark.parametrize("hook_kind", ("c_return", "opcode"))
+def test_linux_pidfd_registration_is_atomic_to_execution_hooks(
+    monkeypatch: pytest.MonkeyPatch,
+    hook_kind: str,
+) -> None:
+    tracker = contained._LinuxSubreaperProcessTracker()
+    read_fd, write_fd = contained.os.pipe()
+    before = _open_file_descriptors()
+    boundary_failure = RuntimeError(f"pidfd {hook_kind} boundary failed")
+    pidfd_open: object = fcntl.fcntl
+    if hook_kind == "opcode":
+
+        def duplicate_pidfd(pid: int, _flags: int) -> int:
+            return contained.os.dup(pid)
+
+        pidfd_open = duplicate_pidfd
+    monkeypatch.setattr(contained.os, "pidfd_open", pidfd_open, raising=False)
+    fault, hook = _install_acquisition_fault(
+        hook_kind,
+        c_target=fcntl.fcntl,
+        code=tracker._bind_pid.__func__.__code__,
+        variable="descriptor",
+        error=boundary_failure,
+    )
+    try:
+        tracker._bind_pid(contained.ProcessIdentity(read_fd, (1, 0)))
+
+        assert not fault.triggered  # type: ignore[attr-defined]
+        _assert_acquisition_hook_restored(hook_kind, hook)
+        assert len(tracker._pidfds) == 1
+        assert tracker._pending_pidfds == []
+        tracker.close()
+        assert _open_file_descriptors() == before
+    finally:
+        _clear_execution_hooks()
+        with contained.suppress(BaseException):
+            tracker.close()
+        for descriptor in _open_file_descriptors() - before:
+            _close_test_fd_if_open(descriptor)
+        _close_test_fd_if_open(read_fd)
+        _close_test_fd_if_open(write_fd)
 
 
 def test_signal_latch_records_first_signal_without_raising_from_handler() -> None:
@@ -4414,6 +4644,181 @@ class _BlockingClosedKqueue:
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="Darwin kqueue ownership contract")
+@pytest.mark.parametrize("hook_kind", ("c_return", "opcode"))
+def test_darwin_kqueue_registration_is_atomic_to_execution_hooks(
+    monkeypatch: pytest.MonkeyPatch,
+    hook_kind: str,
+) -> None:
+    tracker = contained._DarwinKqueueProcessTracker()
+    queue = contained.select.kqueue()
+    queue_fd = queue.fileno()
+    available_queues = [queue]
+    acquire_queue = available_queues.pop
+    monkeypatch.setattr(contained.select, "kqueue", acquire_queue)
+    before = _open_file_descriptors()
+    boundary_failure = RuntimeError(f"kqueue {hook_kind} boundary failed")
+    fault, hook = _install_acquisition_fault(
+        hook_kind,
+        c_target=acquire_queue,
+        code=tracker._initialize_queue.__func__.__code__,
+        variable="queue",
+        error=boundary_failure,
+    )
+    try:
+        tracker._initialize_queue()
+
+        assert not fault.triggered  # type: ignore[attr-defined]
+        _assert_acquisition_hook_restored(hook_kind, hook)
+        assert tracker._owns_queue
+        tracker.close()
+        with pytest.raises(OSError) as closed:
+            contained.os.fstat(queue_fd)
+        assert closed.value.errno == contained.errno.EBADF
+    finally:
+        _clear_execution_hooks()
+        with contained.suppress(BaseException):
+            tracker.close()
+        for unclaimed in available_queues:
+            unclaimed.close()
+        _close_test_fd_if_open(queue_fd)
+        for descriptor in _open_file_descriptors() - before:
+            _close_test_fd_if_open(descriptor)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin kqueue ownership contract")
+def test_execution_hook_disable_failure_precedes_kqueue_acquisition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tracker = contained._DarwinKqueueProcessTracker()
+    trace_hook = object()
+    profile_hook = object()
+    hooks = {"trace": trace_hook, "profile": profile_hook}
+    disable_failure = RuntimeError("trace disable failed after mutation")
+    acquisitions = 0
+
+    def settrace(hook: object) -> None:
+        hooks["trace"] = hook
+        if hook is None:
+            raise disable_failure
+
+    def setprofile(hook: object) -> None:
+        hooks["profile"] = hook
+
+    def acquire_queue() -> object:
+        nonlocal acquisitions
+        acquisitions += 1
+        return object()
+
+    monkeypatch.setattr(contained.sys, "gettrace", lambda: hooks["trace"])
+    monkeypatch.setattr(contained.sys, "getprofile", lambda: hooks["profile"])
+    monkeypatch.setattr(contained.sys, "settrace", settrace)
+    monkeypatch.setattr(contained.sys, "setprofile", setprofile)
+    monkeypatch.setattr(contained.select, "kqueue", acquire_queue)
+
+    with pytest.raises(RuntimeError) as caught:
+        tracker._initialize_queue()
+
+    assert caught.value is disable_failure
+    assert acquisitions == 0
+    assert hooks == {"trace": trace_hook, "profile": profile_hook}
+    assert not tracker._owns_queue
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin kqueue ownership contract")
+def test_kqueue_hook_restore_failure_retains_registered_queue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tracker = contained._DarwinKqueueProcessTracker()
+    read_fd, write_fd = contained.os.pipe()
+    real_close = contained.os.close
+    trace_hook = object()
+    profile_hook = object()
+    hooks = {"trace": trace_hook, "profile": profile_hook}
+    restore_failure = RuntimeError("profile restore failed")
+    restore_attempts = 0
+
+    class Queue:
+        def fileno(self) -> int:
+            return read_fd
+
+        def close(self) -> None:
+            real_close(read_fd)
+
+    def settrace(hook: object) -> None:
+        hooks["trace"] = hook
+
+    def setprofile(hook: object) -> None:
+        nonlocal restore_attempts
+        if hook is profile_hook:
+            restore_attempts += 1
+            raise restore_failure
+        hooks["profile"] = hook
+
+    monkeypatch.setattr(contained.sys, "gettrace", lambda: hooks["trace"])
+    monkeypatch.setattr(contained.sys, "getprofile", lambda: hooks["profile"])
+    monkeypatch.setattr(contained.sys, "settrace", settrace)
+    monkeypatch.setattr(contained.sys, "setprofile", setprofile)
+    monkeypatch.setattr(contained.select, "kqueue", Queue)
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            tracker._initialize_queue()
+
+        assert caught.value is restore_failure
+        assert restore_attempts == contained._SIGNAL_STATE_ATTEMPTS
+        assert hooks["trace"] is trace_hook
+        assert hooks["profile"] is None
+        assert tracker._owns_queue
+        assert tracker._queue is not None
+
+        tracker.close()
+        with pytest.raises(OSError) as closed:
+            contained.os.fstat(read_fd)
+        assert closed.value.errno == contained.errno.EBADF
+    finally:
+        with contained.suppress(BaseException):
+            tracker.close()
+        _close_test_fd_if_open(read_fd)
+        real_close(write_fd)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin kqueue ownership contract")
+def test_hook_restore_failure_cannot_displace_kqueue_acquisition_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tracker = contained._DarwinKqueueProcessTracker()
+    trace_hook = object()
+    profile_hook = object()
+    hooks = {"trace": trace_hook, "profile": profile_hook}
+    acquisition_failure = OSError("kqueue acquisition failed")
+    restore_failure = RuntimeError("trace restore failed")
+
+    def settrace(hook: object) -> None:
+        if hook is trace_hook:
+            raise restore_failure
+        hooks["trace"] = hook
+
+    def setprofile(hook: object) -> None:
+        hooks["profile"] = hook
+
+    def fail_acquisition() -> object:
+        raise acquisition_failure
+
+    monkeypatch.setattr(contained.sys, "gettrace", lambda: hooks["trace"])
+    monkeypatch.setattr(contained.sys, "getprofile", lambda: hooks["profile"])
+    monkeypatch.setattr(contained.sys, "settrace", settrace)
+    monkeypatch.setattr(contained.sys, "setprofile", setprofile)
+    monkeypatch.setattr(contained.select, "kqueue", fail_acquisition)
+
+    with pytest.raises(OSError) as caught:
+        tracker._initialize_queue()
+
+    assert caught.value is acquisition_failure
+    cleanup_group = getattr(caught.value, "cleanup_error_group", None)
+    assert isinstance(cleanup_group, BaseExceptionGroup)
+    assert restore_failure in cleanup_group.exceptions
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin kqueue ownership contract")
 def test_darwin_kqueue_return_exception_keeps_tracker_shell_owned(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4465,7 +4870,7 @@ def test_darwin_kqueue_post_acquisition_exception_retains_close_ownership(
     real_close = contained.os.close
     boundary_failure = RuntimeError("kqueue post-acquisition boundary failed")
     close_failure = OSError(contained.errno.EIO, "kqueue rollback close failed")
-    fault = _NextContainedLineFault(boundary_failure)
+    fault = _ContainedReturnFault({"_initialize_queue"}, boundary_failure)
 
     class RetryingQueue:
         def __init__(self) -> None:
@@ -4483,11 +4888,7 @@ def test_darwin_kqueue_post_acquisition_exception_retains_close_ownership(
 
     queue = RetryingQueue()
 
-    def acquire_queue() -> RetryingQueue:
-        fault.arm()
-        return queue
-
-    monkeypatch.setattr(contained.select, "kqueue", acquire_queue)
+    monkeypatch.setattr(contained.select, "kqueue", lambda: queue)
     tracker = contained._DarwinKqueueProcessTracker()
     try:
         sys.settrace(fault.trace)
@@ -4816,6 +5217,57 @@ def test_darwin_anchor_has_no_return_event_before_pending_registration(
     finally:
         sys.settrace(None)
         for descriptor in duplicated:
+            _close_test_fd_if_open(descriptor)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin pipe anchor contract")
+@pytest.mark.parametrize("hook_kind", ("c_return", "opcode"))
+def test_darwin_anchor_registration_is_atomic_to_execution_hooks(
+    tmp_path: Path,
+    hook_kind: str,
+) -> None:
+    tracker = _FakeKernelTracker(identity=contained.ProcessIdentity(1, (1, 0)))
+    before = _open_file_descriptors()
+    boundary_failure = RuntimeError(f"anchor {hook_kind} boundary failed")
+    fault, hook = _install_acquisition_fault(
+        hook_kind,
+        c_target=contained.os.dup,
+        code=contained.run_contained.__code__,
+        variable="anchor",
+        error=boundary_failure,
+    )
+
+    def live_inventory(_deadline: float) -> dict[int, contained._ProcessObservation]:
+        identity = tracker.registered_identity
+        if identity is None:
+            return {}
+        observation = contained._process_observation(identity.pid)
+        if observation is None:
+            return {}
+        return {
+            identity.pid: contained._ProcessObservation(
+                identity=identity,
+                parent_pid=observation.parent_pid,
+            )
+        }
+
+    try:
+        result = contained.run_contained(
+            [sys.executable, "-c", "import time; time.sleep(0.2)"],
+            cwd=tmp_path,
+            deadline_monotonic=time.monotonic() + 2,
+            inventory_provider=live_inventory,
+            kernel_tracker_factory=_tracker_factory(tracker),
+            may_spawn_background_descendants=False,
+        )
+
+        assert not fault.triggered  # type: ignore[attr-defined]
+        _assert_acquisition_hook_restored(hook_kind, hook)
+        assert result.returncode == 0
+        assert _open_file_descriptors() == before
+    finally:
+        _clear_execution_hooks()
+        for descriptor in _open_file_descriptors() - before:
             _close_test_fd_if_open(descriptor)
 
 
