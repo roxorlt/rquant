@@ -609,6 +609,30 @@ class LabCommandSubmissionFacade:
             )
         return self._publish(envelope)
 
+    def submit_rerun(
+        self,
+        source_job_id: UUID,
+        *,
+        new_job_id: UUID,
+        max_attempts: int,
+        interaction_key: str | None = None,
+    ) -> CommandSubmissionResult:
+        source = self.reader.get_job(source_job_id)
+        if source is None:
+            return CommandSubmissionConflict(
+                request_id=self._request_id(interaction_key),
+                job_id=new_job_id,
+                reason="job_not_found",
+            )
+        return self.submit_create(
+            SubmitJobCommand(
+                job_id=new_job_id,
+                spec=source.spec,
+                max_attempts=max_attempts,
+            ),
+            interaction_key=interaction_key,
+        )
+
     def _submit_control(
         self,
         command: LabCommand,

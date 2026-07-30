@@ -28,6 +28,10 @@ from rquant.research_run_spec import (
     ResearchRunSpec,
 )
 from rquant.strategy_execution_costs import apply_round_trip_execution_costs
+from rquant.strategy_replay_metrics import (
+    auction_gap_metric_rows,
+    growth_board_metric_rows,
+)
 
 DATE_BUCKET_DAYS = 20
 ADAPTER_VERSION = "1"
@@ -667,11 +671,13 @@ class AuctionGapAdapter:
             trades,
             validated.spec.execution_costs,
         )
+        summary = auction_gap_metric_rows(candidates, trades)
         return LabShardExecutionResult.from_validated(
             validated,
             tables=(
                 LabShardTable(name="candidates", frame=candidates),
                 LabShardTable(name="trades", frame=trades),
+                LabShardTable(name="summary", frame=summary),
             ),
         )
 
@@ -763,9 +769,17 @@ class GrowthBoardSurgeAdapter:
         if not trades.empty:
             trades = trades.copy()
             trades.insert(0, "variant", validated.shard.variant)
+        summary = growth_board_metric_rows(
+            trades,
+            strategy_name=validated.shard.variant,
+        )
+        summary.insert(0, "variant", validated.shard.variant)
         return LabShardExecutionResult.from_validated(
             validated,
-            tables=(LabShardTable(name="trades", frame=trades),),
+            tables=(
+                LabShardTable(name="trades", frame=trades),
+                LabShardTable(name="summary", frame=summary),
+            ),
         )
 
 

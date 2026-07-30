@@ -5,13 +5,24 @@ import os
 import sqlite3
 from base64 import urlsafe_b64decode, urlsafe_b64encode
 from datetime import timedelta
+from inspect import signature
 from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
 from pydantic import ValidationError
 
-from rquant.lab_job_protocol import CancelJobCommand, LabCommandEnvelope
+from rquant.lab_job_center import (
+    CommandSubmissionConflict,
+    CommandSubmissionReceipt,
+    LabCommandSubmissionFacade,
+)
+from rquant.lab_job_protocol import (
+    CancelJobCommand,
+    LabCommandEnvelope,
+    LabCommandSpool,
+    SubmitJobCommand,
+)
 from rquant.lab_jobs import (
     LAB_JOB_LIST_FILTER_SQL_PARAMETER_MAX,
     LAB_JOB_LIST_QUERY_PARAMETER_MAX,
@@ -73,6 +84,169 @@ def _seed_jobs(tmp_path: Path, count: int) -> tuple[LabJobStore, tuple[UUID, ...
         assert receipt.status == "applied"
         job_ids.append(job_id)
     return store, tuple(job_ids)
+
+
+def test_rerun_submits_new_identity_with_authoritative_spec_exactly_once(
+    tmp_path: Path,
+) -> None:
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+    lease = _lease(store)
+    source_id = UUID(int=101)
+    source_spec = _spec()
+    source_receipt = store.apply_command(
+        _submit(job_id=source_id, spec=source_spec),
+        lease=lease,
+        now=NOW,
+    )
+    assert source_receipt.status == "applied"
+    spool = LabCommandSpool(tmp_path / "commands")
+    facade = LabCommandSubmissionFacade(reader=LabJobReader(store.path), spool=spool)
+    new_job_id = UUID(int=102)
+
+    first = facade.submit_rerun(
+        source_id,
+        new_job_id=new_job_id,
+        max_attempts=3,
+        interaction_key="rerun-101",
+    )
+    repeated = facade.submit_rerun(
+        source_id,
+        new_job_id=new_job_id,
+        max_attempts=3,
+        interaction_key="rerun-101",
+    )
+
+    assert isinstance(first, CommandSubmissionReceipt)
+    assert repeated == first
+    assert "spec" not in signature(facade.submit_rerun).parameters
+    assert len(spool.pending()) == 1
+    command = spool.pending()[0].envelope.command
+    assert isinstance(command, SubmitJobCommand)
+    assert command.job_id == new_job_id
+    assert command.spec == source_spec
+    assert command.max_attempts == 3
+    source = LabJobReader(store.path).get_job(source_id)
+    assert source is not None
+    assert source.job_id == source_id
+    assert source.spec == source_spec
+    assert source.version == 0
+
+
+def test_rerun_rejects_missing_same_or_existing_job_identity(tmp_path: Path) -> None:
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+    lease = _lease(store)
+    source_id = UUID(int=201)
+    existing_id = UUID(int=202)
+    assert (
+        store.apply_command(_submit(job_id=source_id, spec=_spec()), lease=lease, now=NOW).status
+        == "applied"
+    )
+    assert (
+        store.apply_command(
+            _submit(job_id=existing_id, spec=_spec()),
+            lease=lease,
+            now=NOW + timedelta(seconds=1),
+        ).status
+        == "applied"
+    )
+    facade = LabCommandSubmissionFacade(
+        reader=LabJobReader(store.path),
+        spool=LabCommandSpool(tmp_path / "commands"),
+    )
+
+    missing = facade.submit_rerun(
+        UUID(int=999),
+        new_job_id=UUID(int=203),
+        max_attempts=1,
+        interaction_key="rerun-missing",
+    )
+    same = facade.submit_rerun(
+        source_id,
+        new_job_id=source_id,
+        max_attempts=1,
+        interaction_key="rerun-same",
+    )
+    existing = facade.submit_rerun(
+        source_id,
+        new_job_id=existing_id,
+        max_attempts=1,
+        interaction_key="rerun-existing",
+    )
+
+    assert isinstance(missing, CommandSubmissionConflict)
+    assert missing.reason == "job_not_found"
+    assert isinstance(same, CommandSubmissionConflict)
+    assert same.reason == "job_id_exists"
+    assert isinstance(existing, CommandSubmissionConflict)
+    assert existing.reason == "job_id_exists"
+    assert facade.spool.pending() == ()
+
+
+def test_rerun_stable_interaction_key_rejects_content_conflict(tmp_path: Path) -> None:
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+    source_id = UUID(int=301)
+    assert (
+        store.apply_command(
+            _submit(job_id=source_id, spec=_spec()), lease=_lease(store), now=NOW
+        ).status
+        == "applied"
+    )
+    facade = LabCommandSubmissionFacade(
+        reader=LabJobReader(store.path),
+        spool=LabCommandSpool(tmp_path / "commands"),
+    )
+
+    first = facade.submit_rerun(
+        source_id,
+        new_job_id=UUID(int=302),
+        max_attempts=2,
+        interaction_key="rerun-conflict",
+    )
+    conflict = facade.submit_rerun(
+        source_id,
+        new_job_id=UUID(int=302),
+        max_attempts=3,
+        interaction_key="rerun-conflict",
+    )
+
+    assert isinstance(first, CommandSubmissionReceipt)
+    assert isinstance(conflict, CommandSubmissionConflict)
+    assert conflict.request_id == first.request_id
+    assert conflict.reason == "interaction_content_conflict"
+    assert len(facade.spool.pending()) == 1
+
+
+@pytest.mark.parametrize("max_attempts", [0, True, "2"])
+def test_rerun_rejects_malformed_attempt_bounds(
+    tmp_path: Path,
+    max_attempts: object,
+) -> None:
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+    source_id = UUID(int=401)
+    assert (
+        store.apply_command(
+            _submit(job_id=source_id, spec=_spec()), lease=_lease(store), now=NOW
+        ).status
+        == "applied"
+    )
+    facade = LabCommandSubmissionFacade(
+        reader=LabJobReader(store.path),
+        spool=LabCommandSpool(tmp_path / "commands"),
+    )
+
+    with pytest.raises(ValidationError, match="max_attempts"):
+        facade.submit_rerun(
+            source_id,
+            new_job_id=UUID(int=402),
+            max_attempts=max_attempts,  # type: ignore[arg-type]
+            interaction_key="rerun-bounds",
+        )
+
+    assert facade.spool.pending() == ()
 
 
 def test_list_jobs_keyset_pagination_is_stable_bounded_and_has_no_n_plus_one(

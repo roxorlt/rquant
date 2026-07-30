@@ -2199,6 +2199,120 @@ def test_zip_export_is_byte_identical_and_requires_matching_index_evidence(tmp_p
         )
 
 
+def test_job_zip_export_accepts_only_job_id_and_returns_request_scoped_hash_receipts(
+    tmp_path: Path,
+) -> None:
+    from rquant.lab_artifact_export import LabJobZipExportFacade
+    from rquant.lab_jobs import LabJobReader
+    from tests.unit.test_lab_finalizer import _ready_scenario
+
+    scenario_root = tmp_path / "scenario"
+    scenario_root.mkdir(mode=0o700)
+    scenario = _ready_scenario(scenario_root, hold_days=(1,))
+    assert scenario.finalizer().finalize(scenario.job_id).status == "published"
+    assert scenario.scheduler.run_once().artifact_commits_accepted == 1
+    export_root = tmp_path / "private-exports"
+    facade = LabJobZipExportFacade(
+        reader=LabJobReader(scenario.store.path),
+        artifact_store=scenario.artifact_store,
+        export_root=export_root,
+    )
+
+    first = facade.export(scenario.job_id)
+    repeated = facade.export(scenario.job_id)
+
+    assert first.job_id == repeated.job_id == scenario.job_id
+    assert first.request_id != repeated.request_id
+    assert first.path != repeated.path
+    assert first.path.relative_to(export_root) == Path(
+        scenario.job_id.hex,
+        first.request_id.hex,
+        "result.zip",
+    )
+    assert repeated.path.relative_to(export_root) == Path(
+        scenario.job_id.hex,
+        repeated.request_id.hex,
+        "result.zip",
+    )
+    assert first.byte_size == first.path.stat().st_size
+    assert repeated.byte_size == repeated.path.stat().st_size
+    assert first.sha256 == repeated.sha256
+    assert first.sha256 == hashlib.sha256(first.path.read_bytes()).hexdigest()
+    assert first.path.read_bytes() == repeated.path.read_bytes()
+    with pytest.raises(TypeError, match="destination"):
+        facade.export(  # type: ignore[call-arg]
+            scenario.job_id,
+            destination=tmp_path / "caller-selected.zip",
+        )
+
+
+def test_job_zip_export_requires_authoritative_succeeded_sealed_result(
+    tmp_path: Path,
+) -> None:
+    from rquant.lab_artifact_export import (
+        LabJobZipExportFacade,
+        LabJobZipExportUnavailableError,
+    )
+    from rquant.lab_jobs import LabJobReader
+    from tests.unit.test_lab_finalizer import _ready_scenario
+
+    scenario_root = tmp_path / "scenario"
+    scenario_root.mkdir(mode=0o700)
+    scenario = _ready_scenario(scenario_root, hold_days=(1,))
+    export_root = tmp_path / "private-exports"
+    facade = LabJobZipExportFacade(
+        reader=LabJobReader(scenario.store.path),
+        artifact_store=scenario.artifact_store,
+        export_root=export_root,
+    )
+
+    with pytest.raises(LabJobZipExportUnavailableError, match="succeeded.*sealed"):
+        facade.export(scenario.job_id)
+    with pytest.raises(LabJobZipExportUnavailableError, match="succeeded.*sealed"):
+        facade.export(uuid4())
+
+    assert tuple(export_root.rglob("*.zip")) == ()
+
+
+def test_job_zip_export_rejects_symlink_or_replaced_export_root(tmp_path: Path) -> None:
+    from rquant.lab_artifact_export import LabJobZipExportFacade
+    from rquant.lab_artifacts import LabArtifactIntegrityError, LabArtifactPathError
+    from rquant.lab_jobs import LabJobReader
+    from tests.unit.test_lab_finalizer import _ready_scenario
+
+    scenario_root = tmp_path / "scenario"
+    scenario_root.mkdir(mode=0o700)
+    scenario = _ready_scenario(scenario_root, hold_days=(1,))
+    assert scenario.finalizer().finalize(scenario.job_id).status == "published"
+    assert scenario.scheduler.run_once().artifact_commits_accepted == 1
+    external = tmp_path / "external"
+    external.mkdir(mode=0o700)
+    symlink_root = tmp_path / "symlink-exports"
+    symlink_root.symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(LabArtifactPathError, match="unsafe"):
+        LabJobZipExportFacade(
+            reader=LabJobReader(scenario.store.path),
+            artifact_store=scenario.artifact_store,
+            export_root=symlink_root,
+        )
+
+    export_root = tmp_path / "private-exports"
+    facade = LabJobZipExportFacade(
+        reader=LabJobReader(scenario.store.path),
+        artifact_store=scenario.artifact_store,
+        export_root=export_root,
+    )
+    displaced = tmp_path / "displaced-exports"
+    export_root.rename(displaced)
+    export_root.mkdir(mode=0o700)
+
+    with pytest.raises(LabArtifactIntegrityError, match="export root identity changed"):
+        facade.export(scenario.job_id)
+
+    assert tuple(export_root.iterdir()) == ()
+
+
 def test_zip_export_interleaves_large_file_reads_and_archive_writes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

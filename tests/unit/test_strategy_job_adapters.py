@@ -988,6 +988,7 @@ def test_auction_gap_adapter_matches_legacy_fixture(tmp_path) -> None:
     )
     from rquant.storage.duckdb import DuckDBStore
     from rquant.strategy_job_adapters import default_strategy_job_adapter_registry
+    from rquant.strategy_replay_metrics import auction_gap_metric_rows
     from tests.unit.test_auction_gap_minute_replay import _seed_base
 
     spec = _spec(
@@ -1019,7 +1020,15 @@ def test_auction_gap_adapter_matches_legacy_fixture(tmp_path) -> None:
 
     pd.testing.assert_frame_equal(_result_table(actual, "candidates"), candidates)
     pd.testing.assert_frame_equal(_result_table(actual, "trades"), expected)
+    pd.testing.assert_frame_equal(
+        _result_table(actual, "summary"),
+        auction_gap_metric_rows(candidates, expected),
+    )
     costly_trades = _result_table(costly, "trades")
+    pd.testing.assert_frame_equal(
+        _result_table(costly, "summary"),
+        auction_gap_metric_rows(candidates, costly_trades),
+    )
     assert costly_trades["gross_ret_pct"].tolist() == expected["ret_pct"].tolist()
     assert not costly_trades["ret_pct"].equals(expected["ret_pct"])
 
@@ -1031,6 +1040,7 @@ def test_growth_board_adapter_matches_legacy_fixture(tmp_path) -> None:
     )
     from rquant.storage.duckdb import DuckDBStore
     from rquant.strategy_job_adapters import default_strategy_job_adapter_registry
+    from rquant.strategy_replay_metrics import growth_board_metric_rows
     from tests.unit.test_growth_board_surge_strategy import (
         _seed_base_market,
         _seed_volume_surge_minutes,
@@ -1074,9 +1084,61 @@ def test_growth_board_adapter_matches_legacy_fixture(tmp_path) -> None:
 
     adapter_trades = _result_table(actual, "trades").drop(columns="variant")
     pd.testing.assert_frame_equal(adapter_trades, expected)
+    expected_summary = growth_board_metric_rows(
+        _result_table(actual, "trades"),
+        strategy_name="full",
+    )
+    expected_summary.insert(0, "variant", "full")
+    pd.testing.assert_frame_equal(_result_table(actual, "summary"), expected_summary)
     costly_trades = _result_table(costly, "trades")
+    costly_summary = growth_board_metric_rows(costly_trades, strategy_name="full")
+    costly_summary.insert(0, "variant", "full")
+    pd.testing.assert_frame_equal(_result_table(costly, "summary"), costly_summary)
     assert costly_trades["gross_ret_pct"].tolist() == expected["ret_pct"].tolist()
     assert not costly_trades["ret_pct"].equals(expected["ret_pct"])
+
+
+def test_auction_and_growth_adapters_emit_deterministic_empty_summaries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.auction_gap_strategy as auction_strategy
+    import rquant.growth_board_surge_strategy as growth_strategy
+    from rquant.strategy_job_adapters import default_strategy_job_adapter_registry
+    from rquant.strategy_replay_metrics import (
+        auction_gap_metric_rows,
+        growth_board_metric_rows,
+    )
+
+    def empty_frame(*_args: object, **_kwargs: object) -> pd.DataFrame:
+        return pd.DataFrame()
+
+    monkeypatch.setattr(auction_strategy, "run_auction_gap_replay", empty_frame)
+    monkeypatch.setattr(auction_strategy, "run_auction_gap_minute_replay", empty_frame)
+    monkeypatch.setattr(growth_strategy, "run_growth_board_surge_replay", empty_frame)
+    registry = default_strategy_job_adapter_registry()
+
+    auction_result = registry.execute_shard(
+        registry.validate_claim(_claim(_auction_spec())),
+        object(),
+    )
+    growth_result = registry.execute_shard(
+        registry.validate_claim(_claim(_growth_spec(variants=("no_vwap",)))),
+        object(),
+    )
+    auction_summary = _result_table(auction_result, "summary")
+    growth_summary = _result_table(growth_result, "summary")
+    expected_growth = growth_board_metric_rows(
+        pd.DataFrame(),
+        strategy_name="no_vwap",
+    )
+    expected_growth.insert(0, "variant", "no_vwap")
+
+    pd.testing.assert_frame_equal(
+        auction_summary,
+        auction_gap_metric_rows(pd.DataFrame(), pd.DataFrame()),
+    )
+    pd.testing.assert_frame_equal(growth_summary, expected_growth)
+    assert growth_summary.iloc[0]["variant"] == "no_vwap"
 
 
 def test_nshape_optimize_multi_hold_aggregate_matches_legacy_global_result(
