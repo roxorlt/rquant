@@ -5,11 +5,12 @@
 
 模块分工：
 
-- `config`   参数总表（规格 §10.1），引擎内不写死魔数
-- `profile`  分桶、算法 U 均摊、POC/价值区快照（§3.3.1–§3.3.3）
-- `session`  盘中 Session VP 增量累加器（§3.3.5）
-- `anchored` 锚点选取与 Anchored VP（§3.3.5）
-- `lvn`      HVN / LVN 检测（§3.3.3）
+- `config`    参数总表（规格 §10.1），引擎内不写死魔数
+- `profile`   分桶、算法 U 均摊、POC/价值区快照（§3.3.1–§3.3.3）
+- `session`   盘中 Session VP 增量累加器（§3.3.5）
+- `anchored`  锚点选取与 Anchored VP（§3.3.5）
+- `composite` 60 交易日滚动复合 VP（§3.3.5 / §8.2 增量滚动、§2.3 除权重置）
+- `lvn`       HVN / LVN 检测（§3.3.3）
 """
 
 from __future__ import annotations
@@ -20,6 +21,13 @@ from rquant.vp.engine.anchored import (
     anchored_profile_from_minutes,
     resolve_anchor_date,
     select_anchor_date,
+)
+from rquant.vp.engine.composite import (
+    COMPOSITE_STATE_VERSION,
+    CompositeSnapshot,
+    CompositeVP,
+    CompositeVPState,
+    DayHistogram,
 )
 from rquant.vp.engine.config import VA_PCT_SPEC, VPEngineConfig
 from rquant.vp.engine.lvn import (
@@ -42,14 +50,21 @@ from rquant.vp.engine.profile import (
 )
 from rquant.vp.engine.session import MinuteBar, SessionVP
 
-ENGINE_VERSION = "0.1.0"
+ENGINE_VERSION = "0.2.0"
 """引擎版本。`sandbox/experiment_log.csv` 的 `engine_version` 列写这个值——
-规格 §7 要求引擎变更后重跑历史实验，没有版本号就无从判断哪些结果需要重跑。"""
+规格 §7 要求引擎变更后重跑历史实验，没有版本号就无从判断哪些结果需要重跑。
+
+0.2.0：新增 Composite VP（60 日增量滚动）。纯新增，不改既有算法路径。"""
 
 __all__ = [
+    "COMPOSITE_STATE_VERSION",
     "ENGINE_VERSION",
     "VA_PCT_SPEC",
+    "CompositeSnapshot",
+    "CompositeVP",
+    "CompositeVPState",
     "DailyBar",
+    "DayHistogram",
     "HighVolumeNode",
     "LowVolumeNode",
     "MinuteBar",

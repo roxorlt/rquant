@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from decimal import ROUND_FLOOR, Decimal
+from types import MappingProxyType
 from typing import Self
 
 import pandas as pd
@@ -239,6 +240,28 @@ class ProfileAccumulator:
     @property
     def total_volume(self) -> float:
         return sum(self._counts.values())
+
+    @property
+    def total_amount(self) -> float:
+        return self._total_amount
+
+    @property
+    def price_low(self) -> float | None:
+        return self._price_low
+
+    @property
+    def price_high(self) -> float | None:
+        return self._price_high
+
+    @property
+    def counts(self) -> Mapping[int, float]:
+        """稀疏桶计数的只读视图。
+
+        Composite VP 要把「单日的桶计数」原样取出来存成滚动窗口的最小单元，
+        取出来的必须是这条累加路径算出的那一份——自己再写一遍 U 均摊循环，
+        增量结果与重建结果就再也对不上了。
+        """
+        return MappingProxyType(self._counts)
 
     def add(
         self,
