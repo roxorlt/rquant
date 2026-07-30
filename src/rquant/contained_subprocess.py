@@ -64,20 +64,26 @@ def _merge_cleanup_error_group(
     error_label: str,
 ) -> bool:
     cleanup_errors: list[BaseException] = []
-    existing_group = getattr(primary_exception, "cleanup_error_group", None)
+    try:
+        existing_group = getattr(primary_exception, "cleanup_error_group", None)
+    except BaseException:
+        existing_group = None
     if isinstance(existing_group, BaseExceptionGroup):
         for error in existing_group.exceptions:
             if error is not primary_exception:
                 _record_cleanup_error(cleanup_errors, error)
+    elif isinstance(existing_group, BaseException) and existing_group is not primary_exception:
+        _record_cleanup_error(cleanup_errors, existing_group)
     for error in errors:
         if error is not primary_exception:
             _record_cleanup_error(cleanup_errors, error)
     if not cleanup_errors:
         return False
-    primary_exception.cleanup_error_group = BaseExceptionGroup(  # type: ignore[attr-defined]
-        error_label,
-        cleanup_errors,
-    )
+    with suppress(BaseException):
+        primary_exception.cleanup_error_group = BaseExceptionGroup(  # type: ignore[attr-defined]
+            error_label,
+            cleanup_errors,
+        )
     return True
 
 
@@ -88,14 +94,22 @@ def _attach_cleanup_error_group(
     error_label: str,
     note: str,
 ) -> None:
-    if not _merge_cleanup_error_group(
-        primary_exception,
-        errors,
-        error_label=error_label,
-    ):
+    try:
+        has_cleanup_errors = _merge_cleanup_error_group(
+            primary_exception,
+            errors,
+            error_label=error_label,
+        )
+    except BaseException:
+        has_cleanup_errors = True
+    if not has_cleanup_errors:
         return
-    if note not in getattr(primary_exception, "__notes__", ()):
-        primary_exception.add_note(note)
+    try:
+        notes = getattr(primary_exception, "__notes__", ())
+        if note not in notes:
+            primary_exception.add_note(note)
+    except BaseException:
+        pass
 
 
 def _terminate_unsafe_signal_state(
@@ -689,7 +703,7 @@ def _install_signal_latch(
             note="signal latch installation release also failed",
         )
         raise primary_exception
-    return installed, frozenset(installed)
+    return installed, active
 
 
 def _restore_signal_handlers_atomically(
@@ -974,6 +988,54 @@ def _close_file_descriptors(
     return not descriptors
 
 
+def _close_resource_bounded(
+    resource: object,
+    cleanup_errors: list[BaseException],
+) -> bool:
+    descriptor: int | None = None
+    try:
+        descriptor = resource.fileno()  # type: ignore[attr-defined]
+    except (AttributeError, ValueError):
+        pass
+    except OSError as exc:
+        if exc.errno == errno.EBADF:
+            return True
+        _record_cleanup_error(cleanup_errors, exc)
+    except BaseException as exc:
+        _record_cleanup_error(cleanup_errors, exc)
+    for _attempt in range(_SIGNAL_STATE_ATTEMPTS):
+        try:
+            resource.close()  # type: ignore[attr-defined]
+        except BaseException as exc:
+            _record_cleanup_error(cleanup_errors, exc)
+        else:
+            if descriptor is None:
+                return True
+        if descriptor is not None and _file_descriptor_is_closed(descriptor, cleanup_errors):
+            return True
+    return False
+
+
+def _raise_tracker_cleanup_error(
+    message: str,
+    cleanup_errors: Sequence[BaseException],
+) -> NoReturn:
+    details: list[str] = []
+    for error in cleanup_errors:
+        try:
+            details.append(str(error) or type(error).__name__)
+        except BaseException:
+            details.append(type(error).__name__)
+    primary = ContainedProcessError(f"{message}: {'; '.join(details)}")
+    _attach_cleanup_error_group(
+        primary,
+        cleanup_errors,
+        error_label="kernel process tracker cleanup failures",
+        note="kernel process tracker cleanup also failed",
+    )
+    raise primary
+
+
 def _cleanup_reserve_seconds(remaining: float) -> float:
     fraction = 0.75 if remaining <= 0.25 else 0.5
     return min(1.0, max(0.1, remaining * fraction))
@@ -1168,6 +1230,7 @@ def _process_observation(pid: int) -> _ProcessObservation | None:
 class _DarwinKqueueProcessTracker:
     def __init__(self) -> None:
         self._queue = select.kqueue()
+        self._owns_queue = True
         self._known: dict[int, ProcessIdentity] = {}
         self._lock = threading.Lock()
         self._condition = threading.Condition(self._lock)
@@ -1271,9 +1334,6 @@ class _DarwinKqueueProcessTracker:
             with self._condition:
                 self._error = exc
                 self._condition.notify_all()
-        finally:
-            with suppress(OSError):
-                self._queue.close()
 
     def poll(self, *, deadline: float) -> dict[int, ProcessIdentity]:
         with self._condition:
@@ -1294,9 +1354,20 @@ class _DarwinKqueueProcessTracker:
             if self._thread.is_alive():
                 raise ContainedProcessError("kernel process tracker did not stop")
             self._thread = None
-        else:
-            with suppress(OSError):
-                self._queue.close()
+        cleanup_errors: list[BaseException] = []
+        if self._owns_queue:
+            if _close_resource_bounded(self._queue, cleanup_errors):
+                self._owns_queue = False
+            else:
+                _record_cleanup_error(
+                    cleanup_errors,
+                    ContainedProcessError("kernel process tracker queue remains open"),
+                )
+        if cleanup_errors:
+            _raise_tracker_cleanup_error(
+                "kernel process tracker queue cleanup failed",
+                cleanup_errors,
+            )
 
 
 class _LinuxSubreaperProcessTracker:
@@ -1378,10 +1449,18 @@ class _LinuxSubreaperProcessTracker:
         return dict(self._known)
 
     def close(self) -> None:
-        for descriptor in self._pidfds.values():
-            with suppress(OSError):
-                os.close(descriptor)
-        self._pidfds.clear()
+        cleanup_errors: list[BaseException] = []
+        remaining_descriptors = list(self._pidfds.values())
+        _close_file_descriptors(remaining_descriptors, cleanup_errors)
+        unresolved_descriptors = set(remaining_descriptors)
+        for pid, descriptor in tuple(self._pidfds.items()):
+            if descriptor not in unresolved_descriptors:
+                self._pidfds.pop(pid, None)
+        if unresolved_descriptors:
+            _record_cleanup_error(
+                cleanup_errors,
+                ContainedProcessError("kernel process tracker descriptors remain open"),
+            )
         restore_failed = False
         if self._owns_subreaper_lock:
             try:
@@ -1402,7 +1481,15 @@ class _LinuxSubreaperProcessTracker:
                 self._owns_subreaper_lock = False
                 _LINUX_SUBREAPER_LOCK.release()
         if restore_failed:
-            raise ContainedProcessError("could not restore child subreaper state")
+            _record_cleanup_error(
+                cleanup_errors,
+                ContainedProcessError("could not restore child subreaper state"),
+            )
+        if cleanup_errors:
+            _raise_tracker_cleanup_error(
+                "kernel process tracker cleanup failed",
+                cleanup_errors,
+            )
 
 
 def _create_kernel_tracker() -> _KernelProcessTracker:
@@ -1874,14 +1961,17 @@ def run_contained(
             "Darwin cannot prove containment for background-capable commands; startup refused"
         )
     signal_latch = _ContainedSignalLatch()
-    previous_handlers, active_signals = _install_signal_latch(signal_latch)
+    empty_ownership = frozenset()
+    previous_handlers: dict[int, object] = {}
+    active_signals: frozenset[int] = empty_ownership
     kernel_tracker: _KernelProcessTracker | None = None
     gate_read = gate_write = -1
     process: subprocess.Popen[str] | None = None
-    darwin_pipe_markers: frozenset[DarwinPipeMarker] = frozenset()
+    darwin_pipe_markers: frozenset[DarwinPipeMarker] = empty_ownership
     darwin_pipe_anchor_fds: list[int] = []
 
     try:
+        previous_handlers, active_signals = _install_signal_latch(signal_latch)
         containment_token = secrets.token_hex(32)
         process_environment = dict(os.environ if env is None else env)
         process_environment[_CONTAINMENT_ENVIRONMENT_KEY] = containment_token

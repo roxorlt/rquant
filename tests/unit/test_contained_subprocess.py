@@ -81,6 +81,16 @@ def _observation(pid: int, parent: int, started: int) -> contained._ProcessObser
     )
 
 
+def _close_test_fd_if_open(descriptor: int) -> None:
+    try:
+        contained.os.fstat(descriptor)
+    except OSError as exc:
+        if exc.errno != contained.errno.EBADF:
+            raise
+    else:
+        contained.os.close(descriptor)
+
+
 def test_descendant_discovery_uses_immutable_birth_parent_identity_after_reparent() -> None:
     root = contained.ProcessIdentity(100, (1, 0), kernel_unique_id=1000)
     reparented_child = contained.ProcessIdentity(101, (2, 0), kernel_unique_id=1001)
@@ -204,6 +214,103 @@ def test_cleanup_error_group_merges_nested_and_sequential_evidence() -> None:
         "outer cleanup note",
         "later cleanup note",
     )
+
+
+def test_cleanup_error_group_preserves_plain_exception_evidence() -> None:
+    primary = RuntimeError("primary")
+    prior = OSError("plain prior cleanup")
+    later = ValueError("later cleanup")
+    primary.cleanup_error_group = prior  # type: ignore[attr-defined]
+
+    contained._attach_cleanup_error_group(
+        primary,
+        [later, later],
+        error_label="merged cleanup",
+        note="merged cleanup note",
+    )
+
+    cleanup_group = getattr(primary, "cleanup_error_group", None)
+    assert isinstance(cleanup_group, BaseExceptionGroup)
+    assert cleanup_group.exceptions == (prior, later)
+
+
+def test_cleanup_attachment_cannot_displace_read_only_primary() -> None:
+    prior = OSError("read-only prior cleanup")
+
+    class ReadOnlyCleanupError(RuntimeError):
+        @property
+        def cleanup_error_group(self) -> BaseException:
+            return prior
+
+    primary = ReadOnlyCleanupError("primary")
+    later = ValueError("later cleanup")
+
+    with pytest.raises(ReadOnlyCleanupError) as caught:
+        try:
+            raise primary
+        finally:
+            contained._attach_cleanup_error_group(
+                primary,
+                [later],
+                error_label="read-only cleanup",
+                note="cleanup evidence could not be assigned",
+            )
+
+    assert caught.value is primary
+    assert "cleanup evidence could not be assigned" in getattr(primary, "__notes__", ())
+
+
+@pytest.mark.parametrize("malformed_value", (object(), "not an exception"))
+def test_cleanup_attachment_ignores_malformed_existing_attribute(
+    malformed_value: object,
+) -> None:
+    primary = RuntimeError("primary")
+    later = OSError("later cleanup")
+    primary.cleanup_error_group = malformed_value  # type: ignore[attr-defined]
+
+    contained._attach_cleanup_error_group(
+        primary,
+        [later],
+        error_label="replacement cleanup",
+        note="replacement cleanup note",
+    )
+
+    cleanup_group = getattr(primary, "cleanup_error_group", None)
+    assert isinstance(cleanup_group, BaseExceptionGroup)
+    assert cleanup_group.exceptions == (later,)
+
+
+def test_hostile_cleanup_attributes_and_notes_cannot_displace_primary() -> None:
+    class HostileCleanupError(RuntimeError):
+        @property
+        def cleanup_error_group(self) -> object:
+            raise LookupError("hostile cleanup getter")
+
+        @cleanup_error_group.setter
+        def cleanup_error_group(self, _value: object) -> None:
+            raise OSError("hostile cleanup setter")
+
+        @property
+        def __notes__(self) -> object:
+            raise RuntimeError("hostile notes getter")
+
+        def add_note(self, _note: str) -> None:
+            raise UnicodeError("hostile add_note")
+
+    primary = HostileCleanupError("primary")
+
+    with pytest.raises(HostileCleanupError) as caught:
+        try:
+            raise primary
+        finally:
+            contained._attach_cleanup_error_group(
+                primary,
+                [OSError("cleanup")],
+                error_label="hostile cleanup",
+                note="hostile cleanup note",
+            )
+
+    assert caught.value is primary
 
 
 @pytest.mark.parametrize("replay_ready", (True, False), ids=("released", "blocked"))
@@ -433,6 +540,50 @@ def test_linux_subreaper_restore_failure_releases_process_wide_lock(monkeypatch)
     assert not tracker._owns_subreaper_lock
 
 
+@pytest.mark.parametrize("persistent", (False, True), ids=("retry", "persistent"))
+def test_linux_tracker_verified_pidfd_close_retains_unresolved_inventory(
+    monkeypatch: pytest.MonkeyPatch,
+    persistent: bool,
+) -> None:
+    tracker = contained._LinuxSubreaperProcessTracker()
+    read_fd, write_fd = contained.os.pipe()
+    tracker._pidfds[101] = read_fd
+    real_close = contained.os.close
+    failures: list[OSError] = []
+
+    def fail_owned_descriptor(descriptor: int) -> None:
+        if descriptor == read_fd and (persistent or not failures):
+            failure = OSError(contained.errno.EIO, f"pidfd close failure {len(failures) + 1}")
+            failures.append(failure)
+            raise failure
+        real_close(descriptor)
+
+    monkeypatch.setattr(contained.os, "close", fail_owned_descriptor)
+    try:
+        with pytest.raises(contained.ContainedProcessError) as caught:
+            tracker.close()
+        cleanup_group = getattr(caught.value, "cleanup_error_group", None)
+        assert isinstance(cleanup_group, BaseExceptionGroup)
+        assert cleanup_group.exceptions[: len(failures)] == tuple(failures)
+        if persistent:
+            assert len(failures) == contained._SIGNAL_STATE_ATTEMPTS
+            assert tracker._pidfds == {101: read_fd}
+            contained.os.fstat(read_fd)
+            assert "remain open" in str(cleanup_group.exceptions[-1])
+        else:
+            assert len(failures) == 1
+            assert tracker._pidfds == {}
+            with pytest.raises(OSError) as closed:
+                contained.os.fstat(read_fd)
+            assert closed.value.errno == contained.errno.EBADF
+    finally:
+        monkeypatch.setattr(contained.os, "close", real_close)
+        if tracker._pidfds:
+            tracker.close()
+        _close_test_fd_if_open(read_fd)
+        real_close(write_fd)
+
+
 def test_signal_latch_records_first_signal_without_raising_from_handler() -> None:
     latch = contained._ContainedSignalLatch()
 
@@ -440,6 +591,49 @@ def test_signal_latch_records_first_signal_without_raising_from_handler() -> Non
     latch.handle(signal.SIGINT, None)
 
     assert latch.first_signum == signal.SIGTERM
+
+
+@pytest.mark.skipif(
+    not hasattr(signal, "pthread_sigmask"),
+    reason="atomic signal-mask arbitration requires pthread_sigmask",
+)
+def test_post_install_handoff_failure_restores_signal_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    host_handlers, host_mask, starting_mask = _prepare_unblocked_signal_host()
+    fault_observed_latch = False
+    failure = OSError("post-install ownership handoff failed")
+
+    def fail_after_install(_length: int) -> str:
+        nonlocal fault_observed_latch
+        fault_observed_latch = all(
+            isinstance(
+                getattr(signal.getsignal(signum), "__self__", None),
+                contained._ContainedSignalLatch,
+            )
+            for signum in _MANAGED_TEST_SIGNALS
+        )
+        raise failure
+
+    monkeypatch.setattr(contained.secrets, "token_hex", fail_after_install)
+    try:
+        with pytest.raises(OSError) as caught:
+            contained.run_contained(
+                [sys.executable, "-c", "pass"],
+                cwd=tmp_path,
+                deadline_monotonic=time.monotonic() + 2,
+                may_spawn_background_descendants=False,
+            )
+        observed_handlers = {signum: signal.getsignal(signum) for signum in _MANAGED_TEST_SIGNALS}
+        observed_mask = _REAL_PTHREAD_SIGMASK(signal.SIG_BLOCK, set())
+    finally:
+        _restore_signal_host(host_handlers, host_mask)
+
+    assert caught.value is failure
+    assert fault_observed_latch
+    assert observed_handlers == host_handlers
+    assert observed_mask == starting_mask
 
 
 @pytest.mark.parametrize(
@@ -3411,6 +3605,61 @@ def test_execution_timeout_remains_primary_when_tracker_close_fails(tmp_path: Pa
     assert any("close boom" in str(error) for error in cleanup_group.exceptions)
 
 
+def test_execution_timeout_retains_structured_pidfd_close_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner = contained._LinuxSubreaperProcessTracker()
+    read_fd, write_fd = contained.os.pipe()
+    owner._pidfds[101] = read_fd
+    real_close = contained.os.close
+    failures: list[OSError] = []
+
+    class OwnedFdTracker(_CloseFailingKernelTracker):
+        def close(self) -> None:
+            owner.close()
+
+    def fail_owned_descriptor(descriptor: int) -> None:
+        if descriptor == read_fd:
+            failure = OSError(
+                contained.errno.EIO,
+                f"persistent outer pidfd close failure {len(failures) + 1}",
+            )
+            failures.append(failure)
+            raise failure
+        real_close(descriptor)
+
+    monkeypatch.setattr(contained.os, "close", fail_owned_descriptor)
+    try:
+        with pytest.raises(subprocess.TimeoutExpired) as caught:
+            contained.run_contained(
+                [sys.executable, "-c", "import time; time.sleep(5)"],
+                cwd=tmp_path,
+                deadline_monotonic=time.monotonic() + 0.5,
+                kernel_tracker_factory=OwnedFdTracker,
+                may_spawn_background_descendants=False,
+            )
+        cleanup_group = getattr(caught.value, "cleanup_error_group", None)
+        assert isinstance(cleanup_group, BaseExceptionGroup)
+        tracker_error = next(
+            error
+            for error in cleanup_group.exceptions
+            if isinstance(error, contained.ContainedProcessError) and "tracker" in str(error)
+        )
+        tracker_cleanup = getattr(tracker_error, "cleanup_error_group", None)
+        assert isinstance(tracker_cleanup, BaseExceptionGroup)
+        assert tracker_cleanup.exceptions[: len(failures)] == tuple(failures)
+        assert len(failures) == contained._SIGNAL_STATE_ATTEMPTS
+        assert owner._pidfds == {101: read_fd}
+        contained.os.fstat(read_fd)
+    finally:
+        monkeypatch.setattr(contained.os, "close", real_close)
+        if owner._pidfds:
+            owner.close()
+        _close_test_fd_if_open(read_fd)
+        real_close(write_fd)
+
+
 def test_primary_exception_object_is_preserved_when_cleanup_also_fails(tmp_path: Path) -> None:
     tracker = _CloseFailingKernelTracker()
     primary = RuntimeError("primary execution failure")
@@ -3882,6 +4131,55 @@ def test_darwin_tracker_close_joins_before_closing_live_kqueue() -> None:
     assert tracker._thread is None
     assert tracker._error is None
     assert not queue.closed_while_active
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin kqueue shutdown contract")
+def test_darwin_tracker_retains_queue_after_persistent_close_failure() -> None:
+    tracker = contained._DarwinKqueueProcessTracker()
+    tracker._queue.close()
+    read_fd, write_fd = contained.os.pipe()
+    real_close = contained.os.close
+
+    class PersistentCloseQueue:
+        def __init__(self) -> None:
+            self.persistent = True
+            self.failures: list[OSError] = []
+
+        def fileno(self) -> int:
+            return read_fd
+
+        def close(self) -> None:
+            if self.persistent:
+                failure = OSError(
+                    contained.errno.EIO,
+                    f"kqueue close failure {len(self.failures) + 1}",
+                )
+                self.failures.append(failure)
+                raise failure
+            real_close(read_fd)
+
+    queue = PersistentCloseQueue()
+    tracker._queue = queue  # type: ignore[assignment]
+    try:
+        with pytest.raises(contained.ContainedProcessError) as caught:
+            tracker.close()
+        cleanup_group = getattr(caught.value, "cleanup_error_group", None)
+        assert isinstance(cleanup_group, BaseExceptionGroup)
+        assert cleanup_group.exceptions[: len(queue.failures)] == tuple(queue.failures)
+        assert len(queue.failures) == contained._SIGNAL_STATE_ATTEMPTS
+        assert tracker._owns_queue
+        contained.os.fstat(read_fd)
+
+        queue.persistent = False
+        tracker.close()
+        assert not tracker._owns_queue
+        with pytest.raises(OSError) as closed:
+            contained.os.fstat(read_fd)
+        assert closed.value.errno == contained.errno.EBADF
+    finally:
+        queue.persistent = False
+        _close_test_fd_if_open(read_fd)
+        real_close(write_fd)
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="Darwin kqueue tracking contract")
