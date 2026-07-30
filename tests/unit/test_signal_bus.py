@@ -390,6 +390,89 @@ def test_completion_verifies_lease_owner_and_attempt_number(
     assert store.outbox_record(outbox_id).status is OutboxStatus.LEASED  # type: ignore[union-attr]
 
 
+def test_completion_at_exact_lease_deadline_is_rejected_deterministically(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path / "signal-bus.sqlite3")
+    _, outbox_id = _ingest_and_route(store)
+    leased = store.claim_due(
+        "worker-a",
+        now=NOW,
+        lease_for=timedelta(seconds=2),
+        limit=1,
+    )[0]
+
+    with pytest.raises(SignalBusLeaseError, match="expired"):
+        store.complete_success(
+            outbox_id,
+            worker_id="worker-a",
+            attempt_no=leased.attempt_count,
+            completed_at=NOW + timedelta(seconds=2),
+            provider_receipt="pushdeer:late",
+        )
+
+    assert store.recover_expired_leases(now=NOW + timedelta(seconds=2))[0].status is (
+        OutboxStatus.DEAD_LETTER
+    )
+
+
+def test_release_unattempted_lease_requeues_without_consuming_attempt(tmp_path: Path) -> None:
+    store = _store(tmp_path / "signal-bus.sqlite3")
+    _, outbox_id = _ingest_and_route(store)
+    leased = store.claim_due(
+        "worker-a",
+        now=NOW,
+        lease_for=timedelta(seconds=2),
+        limit=1,
+    )[0]
+
+    released = store.release_unattempted(
+        outbox_id,
+        worker_id="worker-a",
+        attempt_no=leased.attempt_count,
+        released_at=NOW + timedelta(seconds=2),
+        reason="batch lease elapsed before provider call",
+    )
+
+    assert released.status is OutboxStatus.RETRY
+    assert released.attempt_count == 0
+    assert released.next_attempt_at == NOW + timedelta(seconds=2)
+    assert store.attempts(outbox_id) == ()
+    reclaimed = store.claim_due(
+        "worker-b",
+        now=NOW + timedelta(seconds=2),
+        lease_for=timedelta(seconds=2),
+        limit=1,
+    )[0]
+    assert reclaimed.attempt_count == 1
+
+
+def test_unknown_delivery_evidence_survives_lease_recovery(tmp_path: Path) -> None:
+    store = _store(tmp_path / "signal-bus.sqlite3")
+    _, outbox_id = _ingest_and_route(store)
+    leased = store.claim_due(
+        "worker-a",
+        now=NOW,
+        lease_for=timedelta(seconds=2),
+        limit=1,
+    )[0]
+
+    evidence = store.record_unknown_delivery(
+        outbox_id,
+        worker_id="worker-a",
+        attempt_no=leased.attempt_count,
+        observed_at=NOW + timedelta(seconds=1),
+        reason="TimeoutError: response missing after send",
+        provider_receipt=None,
+    )
+    recovered = store.recover_expired_leases(now=NOW + timedelta(seconds=2))[0]
+
+    assert evidence.reason == "TimeoutError: response missing after send"
+    assert store.unknown_deliveries(outbox_id) == (evidence,)
+    assert recovered.status is OutboxStatus.DEAD_LETTER
+    assert "response missing after send" in (recovered.last_error or "")
+
+
 def test_recover_expired_leases_dead_letters_unknown_live_outcomes_and_expires_stale(
     tmp_path: Path,
 ) -> None:

@@ -40,6 +40,15 @@ class QuarantinedSignal(RuntimeContractModel):
     reason: str = Field(min_length=1)
 
 
+class UnknownDeliveryEvidence(RuntimeContractModel):
+    outbox_id: Sha256
+    attempt_no: int = Field(ge=1)
+    worker_id: str = Field(min_length=1)
+    observed_at: AwareUtcDatetime
+    reason: str = Field(min_length=1)
+    provider_receipt: str | None = Field(default=None, min_length=1)
+
+
 def _normalize_time(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("datetime must be timezone-aware")
@@ -76,9 +85,7 @@ def _retry_policy_fingerprint(
 ) -> str:
     payload = {
         "max_attempts": max_attempts,
-        "retry_base_delay_microseconds": int(
-            retry_base_delay / timedelta(microseconds=1)
-        ),
+        "retry_base_delay_microseconds": int(retry_base_delay / timedelta(microseconds=1)),
         "retry_max_delay_microseconds": int(retry_max_delay / timedelta(microseconds=1)),
         "schema_version": 1,
     }
@@ -202,6 +209,16 @@ class SignalBusStore:
                     success INTEGER NOT NULL CHECK(success IN (0, 1)),
                     provider_receipt TEXT,
                     error TEXT,
+                    PRIMARY KEY(outbox_id, attempt_no)
+                );
+
+                CREATE TABLE IF NOT EXISTS delivery_unknown (
+                    outbox_id TEXT NOT NULL REFERENCES delivery_outbox(outbox_id),
+                    attempt_no INTEGER NOT NULL CHECK(attempt_no >= 1),
+                    worker_id TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    provider_receipt TEXT,
                     PRIMARY KEY(outbox_id, attempt_no)
                 );
 
@@ -684,8 +701,178 @@ class SignalBusStore:
         lease_until = _require_time(row["lease_until"])
         if completed_at < started_at:
             raise SignalBusLeaseError("completion precedes lease start")
-        if completed_at > lease_until:
+        if completed_at >= lease_until:
             raise SignalBusLeaseError("delivery lease has expired")
+
+    def release_unattempted(
+        self,
+        outbox_id: str,
+        *,
+        worker_id: str,
+        attempt_no: int,
+        released_at: datetime,
+        reason: str,
+    ) -> OutboxRecord:
+        """Release a lease only when the provider was provably never called."""
+
+        reason = reason.strip()
+        if not reason:
+            raise ValueError("reason must not be empty")
+        released = _normalize_time(released_at)
+        with self._write_transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM delivery_outbox WHERE outbox_id = ?",
+                (outbox_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"outbox {outbox_id!r} does not exist")
+            if row["status"] != OutboxStatus.LEASED.value:
+                raise SignalBusLeaseError("outbox does not have an active lease")
+            if row["lease_owner"] != worker_id:
+                raise SignalBusLeaseError("lease owner does not match worker")
+            if row["attempt_count"] != attempt_no:
+                raise SignalBusLeaseError("attempt number does not match active lease")
+            started_at = _require_time(row["lease_started_at"])
+            if released < started_at:
+                raise SignalBusLeaseError("release precedes lease start")
+            expires_at = _require_time(row["expires_at"])
+            expired = released >= expires_at
+            status = OutboxStatus.EXPIRED if expired else OutboxStatus.RETRY
+            connection.execute(
+                """
+                UPDATE delivery_outbox
+                SET status = ?, attempt_count = attempt_count - 1,
+                    next_attempt_at = ?, lease_owner = NULL,
+                    lease_started_at = NULL, lease_until = NULL,
+                    last_error = ?, updated_at = ?
+                WHERE outbox_id = ?
+                """,
+                (
+                    status.value,
+                    None if expired else _encode_time(released),
+                    f"not attempted: {reason}",
+                    _encode_time(released),
+                    outbox_id,
+                ),
+            )
+            self._before_commit(connection)
+            updated = connection.execute(
+                "SELECT * FROM delivery_outbox WHERE outbox_id = ?",
+                (outbox_id,),
+            ).fetchone()
+            assert updated is not None
+            return self._outbox_from_row(updated)
+
+    def record_unknown_delivery(
+        self,
+        outbox_id: str,
+        *,
+        worker_id: str,
+        attempt_no: int,
+        observed_at: datetime,
+        reason: str,
+        provider_receipt: str | None,
+    ) -> UnknownDeliveryEvidence:
+        """Persist evidence when a provider outcome or its write-back is uncertain."""
+
+        reason = reason.strip()
+        receipt = provider_receipt.strip() if provider_receipt is not None else None
+        if not reason:
+            raise ValueError("reason must not be empty")
+        if provider_receipt is not None and not receipt:
+            raise ValueError("provider_receipt must not be empty when present")
+        observed = _normalize_time(observed_at)
+        evidence = UnknownDeliveryEvidence(
+            outbox_id=outbox_id,
+            attempt_no=attempt_no,
+            worker_id=worker_id,
+            observed_at=observed,
+            reason=reason,
+            provider_receipt=receipt,
+        )
+        with self._write_transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM delivery_outbox WHERE outbox_id = ?",
+                (outbox_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"outbox {outbox_id!r} does not exist")
+            if row["status"] != OutboxStatus.LEASED.value:
+                raise SignalBusLeaseError("outbox does not have an active lease")
+            if row["lease_owner"] != worker_id:
+                raise SignalBusLeaseError("lease owner does not match worker")
+            if row["attempt_count"] != attempt_no:
+                raise SignalBusLeaseError("attempt number does not match active lease")
+            started_at = _require_time(row["lease_started_at"])
+            if observed < started_at:
+                raise SignalBusLeaseError("unknown outcome precedes lease start")
+            existing = connection.execute(
+                """
+                SELECT * FROM delivery_unknown
+                WHERE outbox_id = ? AND attempt_no = ?
+                """,
+                (outbox_id, attempt_no),
+            ).fetchone()
+            if existing is not None:
+                restored = self._unknown_from_row(existing)
+                if restored != evidence:
+                    raise SignalBusLeaseError("unknown delivery evidence is immutable")
+                return restored
+            connection.execute(
+                """
+                INSERT INTO delivery_unknown(
+                    outbox_id, attempt_no, worker_id, observed_at,
+                    reason, provider_receipt
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    outbox_id,
+                    attempt_no,
+                    worker_id,
+                    _encode_time(observed),
+                    reason,
+                    receipt,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE delivery_outbox
+                SET last_error = ?, updated_at = ?
+                WHERE outbox_id = ?
+                """,
+                (
+                    f"delivery outcome unknown: {reason}",
+                    _encode_time(observed),
+                    outbox_id,
+                ),
+            )
+            self._before_commit(connection)
+            return evidence
+
+    def unknown_deliveries(
+        self,
+        outbox_id: str | None = None,
+    ) -> tuple[UnknownDeliveryEvidence, ...]:
+        connection = self._connect()
+        try:
+            if outbox_id is None:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM delivery_unknown
+                    ORDER BY observed_at, outbox_id, attempt_no
+                    """
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM delivery_unknown
+                    WHERE outbox_id = ? ORDER BY attempt_no
+                    """,
+                    (outbox_id,),
+                ).fetchall()
+            return tuple(self._unknown_from_row(row) for row in rows)
+        finally:
+            connection.close()
 
     def recover_expired_leases(self, *, now: datetime) -> tuple[OutboxRecord, ...]:
         recovered_at = _normalize_time(now)
@@ -711,6 +898,10 @@ class SignalBusStore:
                     status = OutboxStatus.DEAD_LETTER
                     next_attempt_at = None
                     last_error = "delivery outcome unknown after lease expiry"
+                if row["last_error"] and str(row["last_error"]).startswith(
+                    "delivery outcome unknown:"
+                ):
+                    last_error = f"{last_error}: {row['last_error']}"
                 connection.execute(
                     """
                     UPDATE delivery_outbox
@@ -861,6 +1052,17 @@ class SignalBusStore:
             success=bool(row["success"]),
             provider_receipt=row["provider_receipt"],
             error=row["error"],
+        )
+
+    @staticmethod
+    def _unknown_from_row(row: sqlite3.Row) -> UnknownDeliveryEvidence:
+        return UnknownDeliveryEvidence(
+            outbox_id=row["outbox_id"],
+            attempt_no=row["attempt_no"],
+            worker_id=row["worker_id"],
+            observed_at=_require_time(row["observed_at"]),
+            reason=row["reason"],
+            provider_receipt=row["provider_receipt"],
         )
 
 
