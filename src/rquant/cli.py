@@ -11,14 +11,16 @@ import socket
 import subprocess
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from datetime import time as dtime
+from functools import partial
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import FrameType, TracebackType
+from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
 from loguru import logger
@@ -34,6 +36,9 @@ from rquant.backfill_state import (
 )
 from rquant.logging import setup_logging
 from rquant.storage.duckdb import DuckDBStore, open_readonly_store
+
+if TYPE_CHECKING:
+    from rquant.lab_daemon import LabRuntimeGuard, VerifiedLabRuntimeIdentity
 
 # 重试配置
 _RETRY_COUNT = 3
@@ -2980,6 +2985,7 @@ def _lab_daemon_readiness_context(
     label: str,
     code_sha: str,
     runtime_guard: object,
+    runtime_identity: object,
     daemon_lock: object,
 ) -> AbstractContextManager[object]:
     generation_binding = _lab_deployment_generation_binding(args)
@@ -2992,9 +2998,10 @@ def _lab_daemon_readiness_context(
     from rquant.config import settings
     from rquant.lab_daemon import LabDaemonReadinessPublisher
 
-    verify = getattr(runtime_guard, "verify", None)
-    if not callable(verify):
+    verify_identity = getattr(runtime_guard, "verify_identity", None)
+    if not callable(verify_identity):
         raise RuntimeError("Lab runtime guard cannot publish readiness")
+    mutation_guard = partial(verify_identity, runtime_identity)
     duplicate_lease = getattr(daemon_lock, "duplicate_authority_lease", None)
     if not callable(duplicate_lease):
         raise RuntimeError("Lab daemon lock cannot provide a readiness authority lease")
@@ -3010,7 +3017,7 @@ def _lab_daemon_readiness_context(
             code_sha=code_sha,
             heartbeat_interval_seconds=2,
             readiness_root=settings.lab_readiness_dir_resolved,
-            mutation_guard=verify,
+            mutation_guard=mutation_guard,
         )
     except BaseException:
         os.close(lease_fd)
@@ -3046,6 +3053,43 @@ def _lab_runtime_layout() -> tuple[dict[str, Path], dict[str, Path], dict[Path, 
     return directories, files, legacy
 
 
+def _establish_lab_runtime_identity(
+    args: argparse.Namespace,
+) -> tuple[
+    str,
+    LabRuntimeGuard,
+    VerifiedLabRuntimeIdentity,
+    Callable[[], str],
+]:
+    from rquant.lab_daemon import LabRuntimeGuard, require_lab_runtime_binding
+
+    checkout_root = Path(args.expected_checkout_root)
+    trusted_git_path = Path(args.trusted_git_path)
+    generation_binding = _lab_deployment_generation_binding(args)
+    deadline_binding = _lab_startup_deadline_binding(args)
+    if generation_binding:
+        code_sha = str(generation_binding["deployment_generation"])
+        runtime_guard = LabRuntimeGuard(
+            checkout_root,
+            code_sha,
+            trusted_git_path,
+            **generation_binding,
+        )
+        runtime_identity = runtime_guard.verify_runtime_identity(
+            **deadline_binding,
+        )
+    else:
+        code_sha = require_lab_runtime_binding(
+            checkout_root,
+            trusted_git_path,
+            **deadline_binding,
+        )
+        runtime_guard = LabRuntimeGuard(checkout_root, code_sha, trusted_git_path)
+        runtime_identity = runtime_guard.capture_verified_identity(code_sha)
+    identity_guard = partial(runtime_guard.verify_identity, runtime_identity)
+    return code_sha, runtime_guard, runtime_identity, identity_guard
+
+
 def _verify_prepared_lab_runtime(
     checkout_root: Path,
     code_sha: str,
@@ -3072,25 +3116,10 @@ def _verify_prepared_lab_runtime(
 def cmd_lab_runtime_prepare(args: argparse.Namespace) -> int:
     """Create/migrate the dedicated private Lab runtime namespace once."""
     from rquant.config import settings
-    from rquant.lab_daemon import (
-        LabRuntimeGuard,
-        prepare_lab_runtime_layout,
-        require_lab_runtime_binding,
-    )
+    from rquant.lab_daemon import prepare_lab_runtime_layout
 
-    trusted_git_path = Path(args.trusted_git_path)
-    generation_binding = _lab_deployment_generation_binding(args)
-    code_sha = require_lab_runtime_binding(
-        Path(args.expected_checkout_root),
-        trusted_git_path,
-        **_lab_startup_deadline_binding(args),
-        **generation_binding,
-    )
-    runtime_guard = LabRuntimeGuard(
-        Path(args.expected_checkout_root),
-        code_sha,
-        trusted_git_path,
-        **generation_binding,
+    code_sha, _runtime_guard, _runtime_identity, runtime_identity_guard = (
+        _establish_lab_runtime_identity(args)
     )
     directories, files, legacy = _lab_runtime_layout()
     prepare_lab_runtime_layout(
@@ -3099,7 +3128,7 @@ def cmd_lab_runtime_prepare(args: argparse.Namespace) -> int:
         managed_directories=directories,
         managed_files=files,
         legacy_paths=legacy,
-        mutation_guard=runtime_guard.verify,
+        mutation_guard=runtime_identity_guard,
     )
     logger.info(f"Lab runtime 已就绪: {settings.lab_runtime_dir_resolved}")
     return 0
@@ -3139,21 +3168,9 @@ def cmd_lab_launchd_uninstall(args: argparse.Namespace) -> int:
 
 def cmd_lab_scheduler(args: argparse.Namespace) -> int:
     """Run the durable Strategy Lab control-plane scheduler."""
-    from rquant.lab_daemon import LabRuntimeGuard, require_lab_runtime_binding
-
     trusted_git_path = Path(args.trusted_git_path)
-    generation_binding = _lab_deployment_generation_binding(args)
-    code_sha = require_lab_runtime_binding(
-        Path(args.expected_checkout_root),
-        trusted_git_path,
-        **_lab_startup_deadline_binding(args),
-        **generation_binding,
-    )
-    runtime_guard = LabRuntimeGuard(
-        Path(args.expected_checkout_root),
-        code_sha,
-        trusted_git_path,
-        **generation_binding,
+    code_sha, runtime_guard, runtime_identity, runtime_identity_guard = (
+        _establish_lab_runtime_identity(args)
     )
     _verify_prepared_lab_runtime(
         Path(args.expected_checkout_root),
@@ -3201,7 +3218,7 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
         ("lab artifact commit spool", settings.lab_artifact_commit_dir_resolved),
         ("lab daemon lock root", settings.lab_daemon_lock_dir_resolved),
     ):
-        ensure_private_directory(path, label=label, mutation_guard=runtime_guard.verify)
+        ensure_private_directory(path, label=label, mutation_guard=runtime_identity_guard)
     runtime_paths = {
         "lab command spool": settings.lab_job_command_dir_resolved,
         "lab claim spool": settings.lab_job_claim_dir_resolved,
@@ -3219,47 +3236,47 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
     with LabDaemonLock(
         settings.lab_daemon_lock_dir_resolved,
         "scheduler",
-        mutation_guard=runtime_guard.verify,
+        mutation_guard=runtime_identity_guard,
     ) as daemon_lock:
         sqlite_authority = prepare_lab_runtime_sqlite_authority(
             settings.lab_runtime_dir_resolved,
             label="lab jobs SQLite",
             path=settings.lab_jobs_path_resolved,
-            mutation_guard=runtime_guard.verify,
+            mutation_guard=runtime_identity_guard,
         )
         _verify_prepared_lab_runtime(Path(args.expected_checkout_root), code_sha)
         artifact_store = None
         try:
             artifact_store = LabJobArtifactStore(
                 settings.lab_final_artifact_dir_resolved,
-                mutation_guard=runtime_guard.verify,
+                mutation_guard=runtime_identity_guard,
             )
             store = LabJobStore(
                 settings.lab_jobs_path_resolved,
                 busy_timeout_ms=settings.lab_jobs_busy_timeout_ms,
                 identity_authority=sqlite_authority,
-                mutation_guard=runtime_guard.verify,
+                mutation_guard=runtime_identity_guard,
             )
             store.initialize()
             report_spool = LabReportSpool(
                 settings.lab_job_report_dir_resolved,
-                mutation_guard=runtime_guard.verify,
+                mutation_guard=runtime_identity_guard,
             )
             artifact_reclaimer = LabArtifactReclaimer(
                 artifact_root=settings.lab_worker_artifact_dir_resolved,
                 report_spool=report_spool,
-                mutation_guard=runtime_guard.verify,
+                mutation_guard=runtime_identity_guard,
             )
             claim_spool = LabClaimSpool(
                 settings.lab_job_claim_dir_resolved,
                 claim_advance_hook=artifact_reclaimer.reclaim,
-                mutation_guard=runtime_guard.verify,
+                mutation_guard=runtime_identity_guard,
             )
             scheduler = LabScheduler(
                 store=store,
                 spool=LabCommandSpool(
                     settings.lab_job_command_dir_resolved,
-                    mutation_guard=runtime_guard.verify,
+                    mutation_guard=runtime_identity_guard,
                 ),
                 owner_id=f"{socket.gethostname()}:{os.getpid()}:{code_sha[:12]}",
                 lease_seconds=settings.lab_scheduler_lease_seconds,
@@ -3277,20 +3294,21 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
                 max_claim_authority_per_tick=(settings.lab_scheduler_max_claim_authority_per_tick),
                 artifact_commit_spool=LabArtifactCommitSpool(
                     settings.lab_artifact_commit_dir_resolved,
-                    mutation_guard=runtime_guard.verify,
+                    mutation_guard=runtime_identity_guard,
                 ),
                 artifact_store=artifact_store,
                 finalizer_authority_key_provider=keyring.verification_key,
                 max_artifact_commits_per_tick=(
                     settings.lab_scheduler_max_artifact_commits_per_tick
                 ),
-                runtime_guard=runtime_guard.verify,
+                runtime_guard=runtime_identity_guard,
             )
             readiness = _lab_daemon_readiness_context(
                 args,
                 label="com.roxor.rquant-lab-scheduler",
                 code_sha=code_sha,
                 runtime_guard=runtime_guard,
+                runtime_identity=runtime_identity,
                 daemon_lock=daemon_lock,
             )
             with readiness:
@@ -3326,21 +3344,9 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
 
 def cmd_lab_worker(args: argparse.Namespace) -> int:
     """Run a fenced Strategy Lab shard worker."""
-    from rquant.lab_daemon import LabRuntimeGuard, require_lab_runtime_binding
-
     trusted_git_path = Path(args.trusted_git_path)
-    generation_binding = _lab_deployment_generation_binding(args)
-    code_sha = require_lab_runtime_binding(
-        Path(args.expected_checkout_root),
-        trusted_git_path,
-        **_lab_startup_deadline_binding(args),
-        **generation_binding,
-    )
-    runtime_guard = LabRuntimeGuard(
-        Path(args.expected_checkout_root),
-        code_sha,
-        trusted_git_path,
-        **generation_binding,
+    code_sha, runtime_guard, runtime_identity, runtime_identity_guard = (
+        _establish_lab_runtime_identity(args)
     )
     _verify_prepared_lab_runtime(Path(args.expected_checkout_root), code_sha)
     from rquant.config import settings
@@ -3371,7 +3377,7 @@ def cmd_lab_worker(args: argparse.Namespace) -> int:
         ("lab worker artifact root", settings.lab_worker_artifact_dir_resolved),
         ("lab daemon lock root", settings.lab_daemon_lock_dir_resolved),
     ):
-        ensure_private_directory(path, label=label, mutation_guard=runtime_guard.verify)
+        ensure_private_directory(path, label=label, mutation_guard=runtime_identity_guard)
     require_unique_runtime_paths(
         {
             "lab claim spool": settings.lab_job_claim_dir_resolved,
@@ -3383,17 +3389,17 @@ def cmd_lab_worker(args: argparse.Namespace) -> int:
     with LabDaemonLock(
         settings.lab_daemon_lock_dir_resolved,
         "worker",
-        mutation_guard=runtime_guard.verify,
+        mutation_guard=runtime_identity_guard,
     ) as daemon_lock:
         worker = LabWorker(
             worker_id=worker_id,
             claim_spool=LabClaimSpool(
                 settings.lab_job_claim_dir_resolved,
-                mutation_guard=runtime_guard.verify,
+                mutation_guard=runtime_identity_guard,
             ),
             report_spool=LabReportSpool(
                 settings.lab_job_report_dir_resolved,
-                mutation_guard=runtime_guard.verify,
+                mutation_guard=runtime_identity_guard,
             ),
             artifact_root=settings.lab_worker_artifact_dir_resolved,
             adapter_registry=default_strategy_job_adapter_registry(),
@@ -3404,13 +3410,14 @@ def cmd_lab_worker(args: argparse.Namespace) -> int:
             lease_extension_seconds=settings.lab_worker_lease_extension_seconds,
             poll_interval_ms=settings.lab_worker_poll_interval_ms,
             receipt_timeout_seconds=settings.lab_worker_receipt_timeout_seconds,
-            verified_code_sha_provider=runtime_guard.verify,
+            verified_code_sha_provider=runtime_identity_guard,
         )
         readiness = _lab_daemon_readiness_context(
             args,
             label="com.roxor.rquant-lab-worker",
             code_sha=code_sha,
             runtime_guard=runtime_guard,
+            runtime_identity=runtime_identity,
             daemon_lock=daemon_lock,
         )
         with readiness:
@@ -3443,21 +3450,9 @@ def cmd_lab_worker(args: argparse.Namespace) -> int:
 
 def cmd_lab_finalizer(args: argparse.Namespace) -> int:
     """Finalize ready Strategy Lab jobs without writable SQLite access."""
-    from rquant.lab_daemon import LabRuntimeGuard, require_lab_runtime_binding
-
     trusted_git_path = Path(args.trusted_git_path)
-    generation_binding = _lab_deployment_generation_binding(args)
-    code_sha = require_lab_runtime_binding(
-        Path(args.expected_checkout_root),
-        trusted_git_path,
-        **_lab_startup_deadline_binding(args),
-        **generation_binding,
-    )
-    runtime_guard = LabRuntimeGuard(
-        Path(args.expected_checkout_root),
-        code_sha,
-        trusted_git_path,
-        **generation_binding,
+    code_sha, runtime_guard, runtime_identity, runtime_identity_guard = (
+        _establish_lab_runtime_identity(args)
     )
     _verify_prepared_lab_runtime(Path(args.expected_checkout_root), code_sha)
     from rquant.config import settings
@@ -3498,7 +3493,7 @@ def cmd_lab_finalizer(args: argparse.Namespace) -> int:
         ("lab daemon lock root", settings.lab_daemon_lock_dir_resolved),
         ("lab finalizer state root", settings.lab_finalizer_state_dir_resolved),
     ):
-        ensure_private_directory(path, label=label, mutation_guard=runtime_guard.verify)
+        ensure_private_directory(path, label=label, mutation_guard=runtime_identity_guard)
     runtime_paths = {
         "lab worker artifact root": settings.lab_worker_artifact_dir_resolved,
         "lab final artifact root": settings.lab_final_artifact_dir_resolved,
@@ -3514,19 +3509,19 @@ def cmd_lab_finalizer(args: argparse.Namespace) -> int:
     with LabDaemonLock(
         settings.lab_daemon_lock_dir_resolved,
         "finalizer",
-        mutation_guard=runtime_guard.verify,
+        mutation_guard=runtime_identity_guard,
     ) as daemon_lock:
         sqlite_authority = prepare_private_sqlite_path(
             settings.lab_jobs_path_resolved,
             label="lab jobs SQLite",
             create=False,
-            mutation_guard=runtime_guard.verify,
+            mutation_guard=runtime_identity_guard,
         )
         artifact_store = None
         try:
             artifact_store = LabJobArtifactStore(
                 settings.lab_final_artifact_dir_resolved,
-                mutation_guard=runtime_guard.verify,
+                mutation_guard=runtime_identity_guard,
             )
             reader = LabJobReader(
                 settings.lab_jobs_path_resolved,
@@ -3539,9 +3534,9 @@ def cmd_lab_finalizer(args: argparse.Namespace) -> int:
                 artifact_store=artifact_store,
                 commit_spool=LabArtifactCommitSpool(
                     settings.lab_artifact_commit_dir_resolved,
-                    mutation_guard=runtime_guard.verify,
+                    mutation_guard=runtime_identity_guard,
                 ),
-                verified_code_sha_provider=runtime_guard.verify,
+                verified_code_sha_provider=runtime_identity_guard,
                 finalizer_authority_key_provider=keyring.signing_key,
                 finalizer_authority_verification_key_provider=keyring.verification_key,
                 adapter_registry=default_strategy_job_adapter_registry(),
@@ -3554,13 +3549,14 @@ def cmd_lab_finalizer(args: argparse.Namespace) -> int:
                 poll_interval_ms=settings.lab_finalizer_poll_interval_ms,
                 failure_cooldown_seconds=(settings.lab_finalizer_failure_cooldown_seconds),
                 failure_cooldown_max_seconds=(settings.lab_finalizer_failure_cooldown_max_seconds),
-                runtime_guard=runtime_guard.verify,
+                runtime_guard=runtime_identity_guard,
             )
             readiness = _lab_daemon_readiness_context(
                 args,
                 label="com.roxor.rquant-lab-finalizer",
                 code_sha=code_sha,
                 runtime_guard=runtime_guard,
+                runtime_identity=runtime_identity,
                 daemon_lock=daemon_lock,
             )
             with readiness:

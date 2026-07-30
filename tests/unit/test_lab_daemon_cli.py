@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import os
 import signal
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -119,7 +121,7 @@ def test_cli_readiness_context_releases_lease_when_heartbeat_thread_start_fails(
 
     class RuntimeGuard:
         @staticmethod
-        def verify() -> str:
+        def verify_identity(_identity: object) -> str:
             return "c" * 40
 
     class DaemonLock:
@@ -157,6 +159,7 @@ def test_cli_readiness_context_releases_lease_when_heartbeat_thread_start_fails(
             label=label,
             code_sha="c" * 40,
             runtime_guard=RuntimeGuard(),
+            runtime_identity=object(),
             daemon_lock=DaemonLock(),
         )
         with pytest.raises(OSError) as caught, context:
@@ -168,6 +171,120 @@ def test_cli_readiness_context_releases_lease_when_heartbeat_thread_start_fails(
     finally:
         os.close(daemon_fd)
         os.close(deployment_fd)
+
+
+def test_cli_readiness_heartbeat_uses_verified_identity_without_full_verify(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.cli import _lab_daemon_readiness_context
+    from rquant.config import settings
+    from rquant.lab_daemon import LabDaemonReadinessPublisher, LabRuntimeGuard
+
+    checkout = tmp_path / "checkout"
+    (checkout / "src" / "rquant").mkdir(parents=True)
+    (checkout / "src" / "rquant" / "__init__.py").write_text("", encoding="utf-8")
+    (checkout / "pyproject.toml").write_text("[project]\nname='fixture'\n", encoding="utf-8")
+    (checkout / "uv.lock").write_text("version = 1\n", encoding="utf-8")
+    full_verify_threads: list[threading.Thread] = []
+
+    def full_verify(_root: Path) -> str:
+        full_verify_threads.append(threading.current_thread())
+        if threading.current_thread() is not threading.main_thread():
+            raise ValueError("signal only works in main thread")
+        return "c" * 40
+
+    runtime_guard = LabRuntimeGuard(checkout, "c" * 40, verifier=full_verify)
+    identity = runtime_guard.verify_runtime_identity()
+    deployment_lock = tmp_path / "deployment.lock"
+    deployment_fd = os.open(deployment_lock, os.O_RDWR | os.O_CREAT, 0o600)
+    daemon_authority = tmp_path / "daemon.lock"
+    daemon_fd = os.open(daemon_authority, os.O_RDWR | os.O_CREAT, 0o600)
+
+    class DaemonLock:
+        @staticmethod
+        def duplicate_authority_lease() -> int:
+            return os.dup(daemon_fd)
+
+    monkeypatch.setattr(settings, "lab_readiness_dir", tmp_path / "readiness")
+    args = argparse.Namespace(
+        deployment_generation=GENERATION,
+        deployment_lock_path=deployment_lock,
+        deployment_generation_fd=deployment_fd,
+        deployment_operation_id="a" * 32,
+        deployment_environment_generation="b" * 64,
+    )
+    try:
+        context = _lab_daemon_readiness_context(
+            args,
+            label="com.roxor.rquant-lab-worker",
+            code_sha="c" * 40,
+            runtime_guard=runtime_guard,
+            runtime_identity=identity,
+            daemon_lock=DaemonLock(),
+        )
+        assert isinstance(context, LabDaemonReadinessPublisher)
+        context.heartbeat_interval_seconds = 0.02
+        with context:
+            first = LabDaemonReadinessPublisher.read(
+                deployment_lock_path=deployment_lock,
+                label="com.roxor.rquant-lab-worker",
+                readiness_root=tmp_path / "readiness",
+            )
+            deadline = time.monotonic() + 1
+            observed = first
+            while observed.heartbeat_monotonic == first.heartbeat_monotonic:
+                assert time.monotonic() < deadline
+                time.sleep(0.01)
+                observed = LabDaemonReadinessPublisher.read(
+                    deployment_lock_path=deployment_lock,
+                    label="com.roxor.rquant-lab-worker",
+                    readiness_root=tmp_path / "readiness",
+                )
+            assert context._thread is not None
+            assert context._thread.is_alive()
+            assert not context._stop.is_set()
+        assert full_verify_threads == [threading.main_thread()]
+    finally:
+        os.close(daemon_fd)
+        os.close(deployment_fd)
+
+
+def test_cli_establishes_one_full_proof_for_repeated_mutation_guards(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant import lab_daemon
+    from rquant.cli import _establish_lab_runtime_identity
+
+    checkout = tmp_path / "checkout"
+    (checkout / "src" / "rquant").mkdir(parents=True)
+    (checkout / "src" / "rquant" / "__init__.py").write_text("", encoding="utf-8")
+    (checkout / "pyproject.toml").write_text("[project]\nname='fixture'\n", encoding="utf-8")
+    (checkout / "uv.lock").write_text("version = 1\n", encoding="utf-8")
+    full_verify_calls = 0
+
+    def full_verify(_root: Path, _git: Path, **_kwargs: object) -> str:
+        nonlocal full_verify_calls
+        full_verify_calls += 1
+        return "d" * 40
+
+    monkeypatch.setattr(lab_daemon, "require_lab_runtime_binding", full_verify)
+    code_sha, runtime_guard, identity, mutation_guard = _establish_lab_runtime_identity(
+        argparse.Namespace(
+            expected_checkout_root=checkout,
+            trusted_git_path=Path(TRUSTED_GIT),
+            startup_deadline_monotonic=STARTUP_DEADLINE,
+        )
+    )
+
+    assert code_sha == "d" * 40
+    assert identity.code_sha == code_sha
+    for _ in range(100):
+        assert mutation_guard() == code_sha
+    assert full_verify_calls == 1
+    assert mutation_guard.func.__self__ is runtime_guard
+    assert mutation_guard.args == (identity,)
 
 
 def test_scheduler_rejects_missing_authority_configuration_before_sqlite(

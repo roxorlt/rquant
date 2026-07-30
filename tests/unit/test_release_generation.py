@@ -816,6 +816,168 @@ def test_release_generation_marker_binds_checkout_lock_python_and_venv(
     os.close(lock_fd)
 
 
+def test_runtime_identity_guard_full_verifies_once_then_uses_constant_authorities(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.release_generation as release_module
+    from rquant import lab_daemon
+    from rquant.lab_daemon import LabRuntimeGuard
+
+    repo, lock_path, commit, python = _generation(tmp_path)
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    authority = _authority(repo, lock_path, lock_fd, python)
+    marker = _publish_initialized(authority, commit=commit)
+    checkout_root = generation_code_root(Path(marker.venv_path))
+    calls = {"manifest": 0, "python_facts": 0}
+    original_manifest_verify = release_module._verify_environment_manifest
+    original_python_facts = release_module._python_facts
+
+    def count_manifest(*args: object, **kwargs: object) -> None:
+        calls["manifest"] += 1
+        original_manifest_verify(*args, **kwargs)
+
+    def count_python_facts(*args: object, **kwargs: object) -> tuple[str, str]:
+        calls["python_facts"] += 1
+        return original_python_facts(*args, **kwargs)
+
+    monkeypatch.setattr(release_module, "_verify_environment_manifest", count_manifest)
+    monkeypatch.setattr(release_module, "_python_facts", count_python_facts)
+    guard = LabRuntimeGuard(
+        checkout_root,
+        commit,
+        verifier=lambda _root: authority.verify(expected_commit=commit).commit,
+        deployment_generation=commit,
+        deployment_lock_path=lock_path,
+        deployment_generation_fd=lock_fd,
+    )
+    try:
+        identity = guard.verify_runtime_identity()
+        assert calls == {"manifest": 1, "python_facts": 1}
+        assert identity.code_sha == commit
+        assert identity.checkout_root.path == checkout_root
+        assert identity.generation_root is not None
+        assert identity.generation_root.path == Path(marker.venv_path)
+        assert identity.selector is not None
+        assert identity.selector.path == environment_selector_path_for_lock(lock_path)
+        assert identity.manifest is not None
+        assert identity.manifest.path == environment_manifest_path_for_lock(
+            lock_path,
+            marker.environment_generation_id,
+        )
+        assert identity.marker is not None
+        assert identity.marker.path == marker_path_for_lock(lock_path)
+        assert identity.python_path == Path(marker.python_path)
+        assert identity.venv_path == Path(marker.venv_path)
+        assert identity.package_root == checkout_root / "src" / "rquant"
+
+        def forbidden_full_path(*_args: object, **_kwargs: object) -> object:
+            pytest.fail("fast runtime identity guard entered the full verification path")
+
+        monkeypatch.setattr(LabRuntimeGuard, "verify", forbidden_full_path)
+        monkeypatch.setattr(lab_daemon, "require_lab_runtime_binding", forbidden_full_path)
+        monkeypatch.setattr(release_module, "run_contained", forbidden_full_path)
+        monkeypatch.setattr(
+            release_module,
+            "_verify_environment_manifest",
+            forbidden_full_path,
+        )
+        monkeypatch.setattr(release_module, "_python_facts", forbidden_full_path)
+
+        for _ in range(100):
+            assert guard.verify_identity(identity) == commit
+
+        assert calls == {"manifest": 1, "python_facts": 1}
+    finally:
+        os.close(lock_fd)
+
+
+def test_runtime_identity_guard_rejects_authority_and_seal_drift(
+    tmp_path: Path,
+) -> None:
+    from dataclasses import replace
+
+    from rquant.lab_daemon import LabDaemonConfigurationError, LabRuntimeGuard
+
+    repo, lock_path, commit, python = _generation(tmp_path)
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    authority = _authority(repo, lock_path, lock_fd, python)
+    marker = _publish_initialized(authority, commit=commit)
+    checkout_root = generation_code_root(Path(marker.venv_path))
+    generation_root = Path(marker.venv_path)
+    selector_path = environment_selector_path_for_lock(lock_path)
+    manifest_path = environment_manifest_path_for_lock(
+        lock_path,
+        marker.environment_generation_id,
+    )
+    marker_path = marker_path_for_lock(lock_path)
+    guard = LabRuntimeGuard(
+        checkout_root,
+        commit,
+        verifier=lambda _root: commit,
+        deployment_generation=commit,
+        deployment_lock_path=lock_path,
+        deployment_generation_fd=lock_fd,
+    )
+
+    def assert_file_drift(path: Path) -> None:
+        nonlocal identity
+        original = path.read_bytes()
+        path.chmod(0o600)
+        path.write_bytes(original + b" ")
+        path.chmod(0o600)
+        with pytest.raises(LabDaemonConfigurationError, match="runtime authority"):
+            guard.verify_identity(identity)
+        path.write_bytes(original)
+        path.chmod(0o600)
+        identity = guard.capture_verified_identity(commit)
+
+    try:
+        identity = guard.capture_verified_identity(commit)
+        with pytest.raises(LabDaemonConfigurationError, match="identity binding"):
+            guard.verify_identity(replace(identity, code_sha="f" * 40))
+        for authority_path in (selector_path, manifest_path, marker_path):
+            assert_file_drift(authority_path)
+
+        generation_root.chmod(0o700)
+        with pytest.raises(LabDaemonConfigurationError, match="runtime authority"):
+            guard.verify_identity(identity)
+        generation_root.chmod(0o500)
+        identity = guard.capture_verified_identity(commit)
+
+        package_root = checkout_root / "src" / "rquant"
+        package_root.chmod(0o700)
+        with pytest.raises(LabDaemonConfigurationError, match="runtime authority"):
+            guard.verify_identity(identity)
+        package_root.chmod(0o500)
+        identity = guard.capture_verified_identity(commit)
+
+        runtime_python = Path(marker.python_path)
+        assert runtime_python.is_file() and not runtime_python.is_symlink()
+        runtime_python.chmod(0o700)
+        with pytest.raises(LabDaemonConfigurationError, match="runtime authority"):
+            guard.verify_identity(identity)
+        runtime_python.chmod(0o500)
+        identity = guard.capture_verified_identity(commit)
+
+        displaced = generation_root.with_name(f"{generation_root.name}.displaced")
+        generation_root.chmod(0o700)
+        generation_root.rename(displaced)
+        generation_root.mkdir(mode=0o500)
+        try:
+            with pytest.raises(LabDaemonConfigurationError, match="runtime authority"):
+                guard.verify_identity(identity)
+        finally:
+            generation_root.chmod(0o700)
+            generation_root.rmdir()
+            displaced.rename(generation_root)
+            generation_root.chmod(0o500)
+    finally:
+        os.close(lock_fd)
+
+
 def test_real_minimal_uv_venv_is_accepted_for_initialization_and_deployment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

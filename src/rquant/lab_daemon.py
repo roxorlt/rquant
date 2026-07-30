@@ -1411,8 +1411,173 @@ def _require_immutable_lab_runtime_binding(
 
 
 @dataclass(frozen=True)
+class RuntimeAuthorityIdentity:
+    """Immutable filesystem identity retained from one complete runtime proof."""
+
+    path: Path
+    device: int
+    inode: int
+    mode: int
+    owner: int
+    links: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+    stable_metadata: bool = True
+
+    @classmethod
+    def capture(
+        cls,
+        path: Path,
+        *,
+        label: str,
+        stable_metadata: bool = True,
+    ) -> RuntimeAuthorityIdentity:
+        candidate = _canonical_absolute_path(path, label=label)
+        try:
+            observed = candidate.lstat()
+        except OSError as exc:
+            raise LabDaemonConfigurationError(f"{label} identity is unavailable") from exc
+        return cls(
+            path=candidate,
+            device=observed.st_dev,
+            inode=observed.st_ino,
+            mode=observed.st_mode,
+            owner=observed.st_uid,
+            links=observed.st_nlink,
+            size=observed.st_size,
+            mtime_ns=observed.st_mtime_ns,
+            ctime_ns=observed.st_ctime_ns,
+            stable_metadata=stable_metadata,
+        )
+
+    def verify(self) -> None:
+        try:
+            observed = self.path.lstat()
+        except OSError as exc:
+            raise LabDaemonConfigurationError(
+                "verified runtime authority identity changed"
+            ) from exc
+        current_object = (
+            observed.st_dev,
+            observed.st_ino,
+            observed.st_mode,
+            observed.st_uid,
+        )
+        expected_object = (
+            self.device,
+            self.inode,
+            self.mode,
+            self.owner,
+        )
+        current_metadata = (
+            observed.st_nlink,
+            observed.st_size,
+            observed.st_mtime_ns,
+            observed.st_ctime_ns,
+        )
+        expected_metadata = (
+            self.links,
+            self.size,
+            self.mtime_ns,
+            self.ctime_ns,
+        )
+        if current_object != expected_object or (
+            self.stable_metadata and current_metadata != expected_metadata
+        ):
+            raise LabDaemonConfigurationError("verified runtime authority identity changed")
+
+
+@dataclass(frozen=True)
+class VerifiedLabRuntimeIdentity:
+    """Typed startup proof used by constant-work daemon mutation fences."""
+
+    code_sha: str
+    checkout_path: Path
+    checkout_root: RuntimeAuthorityIdentity | None
+    generation_root: RuntimeAuthorityIdentity | None
+    authority_root: RuntimeAuthorityIdentity | None
+    environment_root: RuntimeAuthorityIdentity | None
+    deployment_lock: RuntimeAuthorityIdentity | None
+    selector: RuntimeAuthorityIdentity | None
+    manifest: RuntimeAuthorityIdentity | None
+    marker: RuntimeAuthorityIdentity | None
+    venv: RuntimeAuthorityIdentity | None
+    python: RuntimeAuthorityIdentity | None
+    python_target: RuntimeAuthorityIdentity | None
+    package: RuntimeAuthorityIdentity | None
+    package_file: RuntimeAuthorityIdentity | None
+    site_packages: RuntimeAuthorityIdentity | None
+    uv_lock: RuntimeAuthorityIdentity | None
+    pyproject: RuntimeAuthorityIdentity | None
+    pyvenv_cfg: RuntimeAuthorityIdentity | None
+    environment_generation_id: str | None
+    venv_path: Path
+    python_path: Path
+    package_root: Path
+    process_bound: bool
+    process_prefix: Path
+    process_executable: Path
+    process_package_file: Path | None
+    working_directory: Path
+
+    def authorities(self) -> tuple[RuntimeAuthorityIdentity, ...]:
+        return tuple(
+            identity
+            for identity in (
+                self.checkout_root,
+                self.generation_root,
+                self.authority_root,
+                self.environment_root,
+                self.deployment_lock,
+                self.selector,
+                self.manifest,
+                self.marker,
+                self.venv,
+                self.python,
+                self.python_target,
+                self.package,
+                self.package_file,
+                self.site_packages,
+                self.uv_lock,
+                self.pyproject,
+                self.pyvenv_cfg,
+            )
+            if identity is not None
+        )
+
+
+def _capture_optional_runtime_identity(
+    path: Path,
+    *,
+    label: str,
+) -> RuntimeAuthorityIdentity | None:
+    if not os.path.lexists(path):
+        return None
+    return RuntimeAuthorityIdentity.capture(path, label=label)
+
+
+def _require_runtime_mode(
+    identity: RuntimeAuthorityIdentity,
+    *,
+    label: str,
+    mode: int,
+    directory: bool,
+) -> None:
+    type_matches = stat.S_ISDIR(identity.mode) if directory else stat.S_ISREG(identity.mode)
+    if (
+        not type_matches
+        or stat.S_ISLNK(identity.mode)
+        or identity.owner != os.getuid()
+        or (not directory and identity.links != 1)
+        or stat.S_IMODE(identity.mode) != mode
+    ):
+        raise LabDaemonConfigurationError(f"{label} seal is invalid")
+
+
+@dataclass(frozen=True)
 class LabRuntimeGuard:
-    """Re-run the complete checkout binding and pin it to the startup commit."""
+    """Bind one full startup proof to cheap immutable-authority checks."""
 
     expected_checkout_root: Path
     startup_sha: str
@@ -1445,7 +1610,7 @@ class LabRuntimeGuard:
         ):
             raise LabDaemonConfigurationError("deployment generation guard is incomplete")
 
-    def verify(self) -> str:
+    def verify(self, *, startup_deadline_monotonic: float | None = None) -> str:
         try:
             if self.deployment_generation is not None:
                 _verify_deployment_generation(
@@ -1467,7 +1632,11 @@ class LabRuntimeGuard:
                 observed = require_lab_runtime_binding(
                     self.expected_checkout_root,
                     self.trusted_git_path,
-                    startup_deadline_monotonic=time.monotonic() + 3,
+                    startup_deadline_monotonic=(
+                        startup_deadline_monotonic
+                        if startup_deadline_monotonic is not None
+                        else time.monotonic() + 3
+                    ),
                     **binding,
                 )
         except LabDaemonConfigurationError:
@@ -1487,6 +1656,324 @@ class LabRuntimeGuard:
                 lock_fd=int(self.deployment_generation_fd),
             )
         return current
+
+    def verify_runtime_identity(
+        self,
+        *,
+        startup_deadline_monotonic: float | None = None,
+    ) -> VerifiedLabRuntimeIdentity:
+        verified = self.verify(startup_deadline_monotonic=startup_deadline_monotonic)
+        return self.capture_verified_identity(verified)
+
+    def capture_verified_identity(self, verified_code_sha: str) -> VerifiedLabRuntimeIdentity:
+        current = require_clean_code_sha(lambda: verified_code_sha)
+        if current != self.startup_sha:
+            raise LabDaemonConfigurationError("verified runtime identity SHA drift")
+        checkout = self.expected_checkout_root
+        checkout_identity = _capture_optional_runtime_identity(
+            checkout,
+            label="verified runtime checkout",
+        )
+        uv_lock = _capture_optional_runtime_identity(
+            checkout / "uv.lock",
+            label="verified runtime uv.lock",
+        )
+        pyproject = _capture_optional_runtime_identity(
+            checkout / "pyproject.toml",
+            label="verified runtime pyproject.toml",
+        )
+        expected_package_root = checkout / "src" / "rquant"
+        package = _capture_optional_runtime_identity(
+            expected_package_root,
+            label="verified runtime package root",
+        )
+        package_file_path = expected_package_root / "__init__.py"
+        package_file = _capture_optional_runtime_identity(
+            package_file_path,
+            label="verified runtime package file",
+        )
+        generation_root = None
+        authority_root = None
+        environment_root = None
+        deployment_lock = None
+        selector_identity = None
+        manifest_identity = None
+        marker_identity = None
+        venv_identity = None
+        python_identity = None
+        python_target_identity = None
+        site_packages_identity = None
+        pyvenv_cfg = None
+        environment_generation_id = None
+        venv_path = Path(sys.prefix)
+        python_path = Path(sys.executable)
+        package_root = expected_package_root
+
+        if self.deployment_generation is not None:
+            from rquant.release_generation import (
+                EnvironmentSelector,
+                ReleaseGenerationError,
+                ReleaseGenerationMarker,
+                environment_manifest_path_for_lock,
+                environment_root_for_lock,
+                environment_selector_path_for_lock,
+                generation_code_root,
+                marker_path_for_lock,
+            )
+
+            lock_path = Path(self.deployment_lock_path)
+            _verify_deployment_generation(
+                expected_checkout_root=checkout,
+                expected_generation=self.deployment_generation,
+                lock_path=lock_path,
+                lock_fd=int(self.deployment_generation_fd),
+            )
+            try:
+                selector_path = environment_selector_path_for_lock(lock_path)
+                selector_payload = strict_canonical_json_loads(
+                    _read_private_file(
+                        selector_path,
+                        label="release environment selector",
+                        max_bytes=32 * 1024,
+                    ),
+                    trailing_newline=True,
+                )
+                selector = EnvironmentSelector.from_payload(selector_payload)
+                marker_path = marker_path_for_lock(lock_path)
+                marker_payload = strict_canonical_json_loads(
+                    _read_private_file(
+                        marker_path,
+                        label="release generation marker",
+                        max_bytes=32 * 1024,
+                    ),
+                    trailing_newline=True,
+                )
+                marker = ReleaseGenerationMarker.from_payload(marker_payload)
+            except (LabDaemonConfigurationError, ReleaseGenerationError, StrictJsonError) as exc:
+                raise LabDaemonConfigurationError(
+                    "verified runtime authority records are invalid"
+                ) from exc
+            venv_path = _canonical_absolute_path(
+                Path(selector.environment_path),
+                label="verified runtime generation",
+            )
+            environment_root_path = environment_root_for_lock(lock_path)
+            if (
+                selector.commit != current
+                or marker.commit != current
+                or marker.environment_generation_id != selector.generation_id
+                or marker.environment_manifest_sha256 != selector.manifest_sha256
+                or Path(marker.venv_path) != venv_path
+                or venv_path.parent != environment_root_path
+                or venv_path.name != selector.generation_id
+                or generation_code_root(venv_path) != checkout
+            ):
+                raise LabDaemonConfigurationError("verified runtime generation binding changed")
+            manifest_path = environment_manifest_path_for_lock(
+                lock_path,
+                selector.generation_id,
+            )
+            if selector.manifest_name != manifest_path.name:
+                raise LabDaemonConfigurationError("verified runtime manifest binding changed")
+            python_path = _canonical_absolute_path(
+                Path(marker.python_path),
+                label="verified runtime Python",
+            )
+            site_packages_path = _canonical_absolute_path(
+                Path(marker.site_packages_path),
+                label="verified runtime site-packages",
+            )
+            package_root = checkout / "src" / "rquant"
+            deployment_lock = RuntimeAuthorityIdentity.capture(
+                lock_path,
+                label="verified deployment lock",
+            )
+            authority_root = RuntimeAuthorityIdentity.capture(
+                lock_path.parent,
+                label="verified deployment authority root",
+                stable_metadata=False,
+            )
+            environment_root = RuntimeAuthorityIdentity.capture(
+                environment_root_path,
+                label="verified environment authority root",
+                stable_metadata=False,
+            )
+            selector_identity = RuntimeAuthorityIdentity.capture(
+                selector_path,
+                label="verified environment selector",
+            )
+            manifest_identity = RuntimeAuthorityIdentity.capture(
+                manifest_path,
+                label="verified environment manifest",
+            )
+            marker_identity = RuntimeAuthorityIdentity.capture(
+                marker_path,
+                label="verified release marker",
+            )
+            generation_root = RuntimeAuthorityIdentity.capture(
+                venv_path,
+                label="verified runtime generation",
+            )
+            venv_identity = generation_root
+            python_identity = RuntimeAuthorityIdentity.capture(
+                python_path,
+                label="verified runtime Python",
+            )
+            python_target_identity = RuntimeAuthorityIdentity.capture(
+                python_path.resolve(strict=True),
+                label="verified runtime Python target",
+            )
+            site_packages_identity = RuntimeAuthorityIdentity.capture(
+                site_packages_path,
+                label="verified runtime site-packages",
+            )
+            pyvenv_cfg = RuntimeAuthorityIdentity.capture(
+                venv_path / "pyvenv.cfg",
+                label="verified runtime pyvenv.cfg",
+            )
+            checkout_identity = RuntimeAuthorityIdentity.capture(
+                checkout,
+                label="verified runtime checkout",
+            )
+            package = RuntimeAuthorityIdentity.capture(
+                package_root,
+                label="verified runtime package root",
+            )
+            package_file = RuntimeAuthorityIdentity.capture(
+                package_root / "__init__.py",
+                label="verified runtime package file",
+            )
+            uv_lock = RuntimeAuthorityIdentity.capture(
+                checkout / "uv.lock",
+                label="verified runtime uv.lock",
+            )
+            pyproject = RuntimeAuthorityIdentity.capture(
+                checkout / "pyproject.toml",
+                label="verified runtime pyproject.toml",
+            )
+            for identity, label, mode in (
+                (deployment_lock, "deployment lock", 0o600),
+                (selector_identity, "environment selector", 0o600),
+                (manifest_identity, "environment manifest", 0o600),
+                (marker_identity, "release marker", 0o600),
+            ):
+                _require_runtime_mode(identity, label=label, mode=mode, directory=False)
+            for identity, label, mode in (
+                (authority_root, "deployment authority root", 0o700),
+                (environment_root, "environment authority root", 0o700),
+                (generation_root, "runtime generation", 0o500),
+                (checkout_identity, "runtime checkout", 0o500),
+                (package, "runtime package root", 0o500),
+                (site_packages_identity, "runtime site-packages", 0o500),
+            ):
+                _require_runtime_mode(identity, label=label, mode=mode, directory=True)
+            environment_generation_id = selector.generation_id
+            _verify_deployment_generation(
+                expected_checkout_root=checkout,
+                expected_generation=self.deployment_generation,
+                lock_path=lock_path,
+                lock_fd=int(self.deployment_generation_fd),
+            )
+        else:
+            venv_identity = _capture_optional_runtime_identity(
+                venv_path,
+                label="verified runtime virtualenv",
+            )
+            python_identity = _capture_optional_runtime_identity(
+                python_path,
+                label="verified runtime Python",
+            )
+            if python_identity is not None:
+                python_target_identity = _capture_optional_runtime_identity(
+                    python_path.resolve(strict=True),
+                    label="verified runtime Python target",
+                )
+
+        process_bound = self.verifier is None
+        process_package_file = None
+        working_directory = Path.cwd()
+        if process_bound:
+            import rquant
+
+            module_file = getattr(rquant, "__file__", None)
+            if not isinstance(module_file, str) or not module_file:
+                raise LabDaemonConfigurationError("verified runtime package file is unavailable")
+            process_package_file = Path(module_file).resolve(strict=True)
+            working_directory = Path.cwd().resolve(strict=True)
+        return VerifiedLabRuntimeIdentity(
+            code_sha=current,
+            checkout_path=checkout,
+            checkout_root=checkout_identity,
+            generation_root=generation_root,
+            authority_root=authority_root,
+            environment_root=environment_root,
+            deployment_lock=deployment_lock,
+            selector=selector_identity,
+            manifest=manifest_identity,
+            marker=marker_identity,
+            venv=venv_identity,
+            python=python_identity,
+            python_target=python_target_identity,
+            package=package,
+            package_file=package_file,
+            site_packages=site_packages_identity,
+            uv_lock=uv_lock,
+            pyproject=pyproject,
+            pyvenv_cfg=pyvenv_cfg,
+            environment_generation_id=environment_generation_id,
+            venv_path=venv_path,
+            python_path=python_path,
+            package_root=package_root,
+            process_bound=process_bound,
+            process_prefix=Path(sys.prefix),
+            process_executable=Path(sys.executable),
+            process_package_file=process_package_file,
+            working_directory=working_directory,
+        )
+
+    def verify_identity(self, identity: VerifiedLabRuntimeIdentity) -> str:
+        if (
+            type(identity) is not VerifiedLabRuntimeIdentity
+            or identity.code_sha != self.startup_sha
+            or identity.checkout_path != self.expected_checkout_root
+            or identity.process_prefix != Path(sys.prefix)
+            or identity.process_executable != Path(sys.executable)
+        ):
+            raise LabDaemonConfigurationError("verified runtime identity binding changed")
+        if self.deployment_generation is not None:
+            if (
+                identity.environment_generation_id is None
+                or identity.code_sha != self.deployment_generation
+                or identity.deployment_lock is None
+            ):
+                raise LabDaemonConfigurationError("verified runtime generation binding changed")
+            _verify_deployment_generation(
+                expected_checkout_root=self.expected_checkout_root,
+                expected_generation=self.deployment_generation,
+                lock_path=Path(self.deployment_lock_path),
+                lock_fd=int(self.deployment_generation_fd),
+            )
+        for authority in identity.authorities():
+            authority.verify()
+        if identity.process_bound:
+            import rquant
+
+            module_file = getattr(rquant, "__file__", None)
+            if not isinstance(module_file, str) or not module_file:
+                raise LabDaemonConfigurationError("verified runtime package identity changed")
+            try:
+                current_package_file = Path(module_file).resolve(strict=True)
+                current_working_directory = Path.cwd().resolve(strict=True)
+            except OSError as exc:
+                raise LabDaemonConfigurationError(
+                    "verified runtime process identity changed"
+                ) from exc
+            if (
+                current_package_file != identity.process_package_file
+                or current_working_directory != identity.working_directory
+            ):
+                raise LabDaemonConfigurationError("verified runtime process identity changed")
+        return identity.code_sha
 
 
 def _read_private_file(path: Path, *, label: str, max_bytes: int = 16_384) -> bytes:
