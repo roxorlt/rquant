@@ -1610,10 +1610,15 @@ def _process_observation(pid: int) -> _ProcessObservation | None:
     return None
 
 
+def _require_tracker_registration_deadline(deadline: float) -> None:
+    if time.monotonic() >= deadline:
+        raise TimeoutError("kernel tracker registration deadline expired")
+
+
 class _DarwinKqueueProcessTracker:
     def __init__(self) -> None:
         self._known: dict[int, ProcessIdentity] = {}
-        self._lifecycle_lock = threading.RLock()
+        self._lifecycle_lock = threading.Lock()
         self._lock = threading.Lock()
         self._condition = threading.Condition(self._lock)
         self._stop = threading.Event()
@@ -1627,32 +1632,44 @@ class _DarwinKqueueProcessTracker:
         self._queue: object | None = None
         self._owns_queue = False
         self._queue_tainted = False
+        self._cleanup_pending = False
         self._construction_error: BaseException | None = None
 
     def _initialize_queue(self) -> None:
         with self._lifecycle_lock:
-            _require_no_execution_hooks()
-            if self._construction_error is not None:
-                raise self._construction_error
-            if self._queue is not None:
-                return
-            try:
-                queue = select.kqueue()
-            except BaseException as exc:
-                self._construction_error = exc
-                raise
-            self._queue = queue
-            self._owns_queue = True
-            _require_no_execution_hooks()
+            self._initialize_queue_locked()
 
-    def _register_process(self, identity: ProcessIdentity) -> bool:
+    def _initialize_queue_locked(self, *, deadline: float | None = None) -> None:
         _require_no_execution_hooks()
+        if deadline is not None:
+            _require_tracker_registration_deadline(deadline)
+        if self._cleanup_pending:
+            raise ContainedProcessError("kernel process tracker cleanup is pending")
+        if self._construction_error is not None:
+            raise self._construction_error
+        if self._queue is not None:
+            return
+        try:
+            queue = select.kqueue()
+        except BaseException as exc:
+            self._construction_error = exc
+            raise
+        self._queue = queue
+        self._owns_queue = True
+        _require_no_execution_hooks()
+        if deadline is not None:
+            _require_tracker_registration_deadline(deadline)
+
+    def _register_process(self, identity: ProcessIdentity, *, deadline: float) -> bool:
+        _require_no_execution_hooks()
+        _require_tracker_registration_deadline(deadline)
         if identity.pid in self._registered and self._known.get(identity.pid) == identity:
             return True
         before = _call_with_execution_hook_guard(
             _darwin_process_observation,
             identity.pid,
         )
+        _require_tracker_registration_deadline(deadline)
         if before is None:
             return False
         if before.identity != identity:
@@ -1664,9 +1681,11 @@ class _DarwinKqueueProcessTracker:
             flags=select.KQ_EV_ADD | select.KQ_EV_ENABLE | select.KQ_EV_CLEAR,
             fflags=select.KQ_NOTE_FORK | select.KQ_NOTE_EXIT,
         )
+        _require_tracker_registration_deadline(deadline)
         queue = self._queue
         if queue is None:
             raise ContainedProcessError("kernel process tracker queue is not initialized")
+        _require_tracker_registration_deadline(deadline)
         self._queue_tainted = True
         try:
             _call_with_execution_hook_guard(
@@ -1676,13 +1695,16 @@ class _DarwinKqueueProcessTracker:
                 0,
             )
         except OSError as exc:
+            _require_tracker_registration_deadline(deadline)
             if exc.errno == errno.ESRCH:
                 return False
             raise ContainedProcessError("kernel child registration failed") from exc
+        _require_tracker_registration_deadline(deadline)
         after = _call_with_execution_hook_guard(
             _darwin_process_observation,
             identity.pid,
         )
+        _require_tracker_registration_deadline(deadline)
         if after is not None and after.identity != identity:
             raise ContainedProcessError("kernel child identity changed during registration")
         self._registered.add(identity.pid)
@@ -1704,6 +1726,7 @@ class _DarwinKqueueProcessTracker:
             and not self._stop.is_set()
             and self._construction_error is None
             and not self._queue_tainted
+            and not self._cleanup_pending
             and queue_is_pristine
         )
 
@@ -1720,6 +1743,7 @@ class _DarwinKqueueProcessTracker:
             self._queue = None
             self._owns_queue = False
             self._queue_tainted = False
+            self._cleanup_pending = False
             self._construction_error = None
             self._stop.clear()
             self._condition.notify_all()
@@ -1730,6 +1754,8 @@ class _DarwinKqueueProcessTracker:
         *,
         deadline: float,
     ) -> bool:
+        if self._thread is not None or self._owns_queue or self._queue is not None:
+            self._cleanup_pending = True
         thread_stopped = True
         stop_unverifiable = False
         thread = self._thread
@@ -1786,33 +1812,37 @@ class _DarwinKqueueProcessTracker:
             raise TimeoutError("kernel tracker registration deadline expired")
         try:
             _require_no_execution_hooks()
-            if time.monotonic() >= deadline:
-                raise TimeoutError("kernel tracker registration deadline expired")
+            _require_tracker_registration_deadline(deadline)
             if not self._is_pristine():
                 raise ContainedProcessError("kernel process tracker is not pristine")
             try:
-                self._initialize_queue()
+                self._initialize_queue_locked(deadline=deadline)
                 before = _call_with_execution_hook_guard(_darwin_process_observation, pid)
+                _require_tracker_registration_deadline(deadline)
                 if before is None:
                     raise ContainedProcessError("kernel root registration failed")
                 # Darwin exposes NOTE_TRACK constants through Python but rejects that
                 # FreeBSD extension with ENOTSUP. NOTE_FORK is the supported kernel edge;
                 # every discovered child is registered before it becomes trusted.
-                if not self._register_process(before.identity):
+                if not self._register_process(before.identity, deadline=deadline):
                     raise ContainedProcessError("kernel root registration failed")
+                _require_tracker_registration_deadline(deadline)
                 thread = _call_with_execution_hook_guard(
                     threading.Thread,
                     target=self._track,
                     name=f"rquant-kqueue-{pid}",
                     daemon=True,
                 )
+                _require_tracker_registration_deadline(deadline)
                 with self._condition:
                     self._root_pid = pid
                     self._root_started = before.identity.started
                     self._known[pid] = before.identity
                     self._deadline = deadline
                     self._thread = thread
+                _require_tracker_registration_deadline(deadline)
                 _call_with_execution_hook_guard(thread.start)
+                _require_tracker_registration_deadline(deadline)
             except BaseException as primary_exception:
                 cleanup_errors: list[BaseException] = []
                 self._shutdown_locked(cleanup_errors, deadline=deadline)
@@ -1881,7 +1911,7 @@ class _DarwinKqueueProcessTracker:
                                 raise ContainedProcessError(
                                     "kernel tracker observed PID identity reuse"
                                 )
-                            self._register_process(identity)
+                            self._register_process(identity, deadline=self._deadline)
                             self._known[pid] = identity
                     self._poll_generation += 1
                     self._condition.notify_all()
@@ -1894,19 +1924,42 @@ class _DarwinKqueueProcessTracker:
                 self._condition.notify_all()
 
     def poll(self, *, deadline: float) -> dict[int, ProcessIdentity]:
+        try:
+            _require_no_execution_hooks()
+        except BaseException:
+            with self._condition:
+                first_error = self._error
+            if first_error is not None:
+                raise ContainedProcessError("kernel process tracking failed") from first_error
+            raise
         with self._condition:
+            self._require_poll_hooks_locked()
             observed_generation = self._poll_generation
             while self._error is None and self._poll_generation == observed_generation:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError("kernel process tracker poll timed out")
                 self._condition.wait(timeout=remaining)
+                self._require_poll_hooks_locked()
+            self._require_poll_hooks_locked()
             if self._error is not None:
                 raise ContainedProcessError("kernel process tracking failed") from self._error
-            return dict(self._known)
+            known = dict(self._known)
+            self._require_poll_hooks_locked()
+            return known
+
+    def _require_poll_hooks_locked(self) -> None:
+        try:
+            _require_no_execution_hooks()
+        except BaseException:
+            if self._error is not None:
+                raise ContainedProcessError("kernel process tracking failed") from self._error
+            raise
 
     def close(self) -> None:
-        with self._lifecycle_lock:
+        if not self._lifecycle_lock.acquire(blocking=False):
+            raise ContainedProcessError("kernel process tracker cleanup lifecycle is busy")
+        try:
             cleanup_errors: list[BaseException] = []
             self._shutdown_locked(
                 cleanup_errors,
@@ -1917,6 +1970,8 @@ class _DarwinKqueueProcessTracker:
                     "kernel process tracker cleanup failed",
                     cleanup_errors,
                 )
+        finally:
+            self._lifecycle_lock.release()
 
 
 class _LinuxSubreaperProcessTracker:
