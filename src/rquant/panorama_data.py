@@ -1122,6 +1122,8 @@ def surge_mark_positions(trend: pd.DataFrame, marks: pd.DataFrame) -> pd.DataFra
 
 def volume_directions(prices: pd.Series) -> pd.Series:
     """每分钟方向（tick-rule 近似）：收涨 up / 收跌 down / 平或首根 flat。"""
+    if prices is None or prices.empty:
+        return pd.Series(dtype="object")
     diff = pd.to_numeric(prices, errors="coerce").diff()
     out = pd.Series("flat", index=prices.index, dtype="object")
     out[diff > 0] = "up"

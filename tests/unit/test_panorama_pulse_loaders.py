@@ -150,8 +150,29 @@ class TestSurgeMarkPositions:
         assert surge_mark_positions(trend, pd.DataFrame()).empty
         assert surge_mark_positions(pd.DataFrame(), marks).empty
 
+    def test_multiple_marks_same_day(self) -> None:
+        trend = _trend("2026-07-29", ["09:45", "09:47", "10:15"], [10.0, 10.5, 11.0])
+        marks = pd.DataFrame([
+            {"date": date(2026, 7, 29), "confirmed_at": "09:47", "rel_cum": 3.2},
+            {"date": date(2026, 7, 29), "confirmed_at": "10:15", "rel_cum": 4.5},
+        ])
+        pos = surge_mark_positions(trend, marks)
+        assert len(pos) == 2
+        assert pos.iloc[0]["idx"] == 1 and pos.iloc[0]["price"] == pytest.approx(10.5)
+        assert pos.iloc[1]["idx"] == 2 and pos.iloc[1]["price"] == pytest.approx(11.0)
+        assert "3.2×" in pos.iloc[0]["label"]
+        assert "4.5×" in pos.iloc[1]["label"]
+
 
 class TestVolumeDirections:
     def test_directions(self) -> None:
         prices = pd.Series([10.0, 10.2, 10.2, 10.1])
         assert list(volume_directions(prices)) == ["flat", "up", "flat", "down"]
+
+    def test_none_input_returns_empty(self) -> None:
+        result = volume_directions(None)
+        assert result.empty and result.dtype == "object"
+
+    def test_empty_series_returns_empty(self) -> None:
+        result = volume_directions(pd.Series(dtype="float64"))
+        assert result.empty and result.dtype == "object"
