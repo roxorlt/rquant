@@ -1212,7 +1212,8 @@ def _run_worker_child(
         f"{helper_name}(*__import__('sys').argv[1:])"
     )
     environment = os.environ.copy()
-    environment["PYTHONPATH"] = str(Path(__file__).parents[2])
+    repo_root = Path(__file__).parents[2]
+    environment["PYTHONPATH"] = os.pathsep.join((str(repo_root / "src"), str(repo_root)))
     process = subprocess.Popen(
         [sys.executable, "-c", source, str(root), *arguments],
         cwd=Path(__file__).parents[2],
@@ -5463,7 +5464,8 @@ def test_report_publish_uses_cross_process_evidence_lock(tmp_path: Path) -> None
         "_publish_report_child(*__import__('sys').argv[1:])"
     )
     environment = os.environ.copy()
-    environment["PYTHONPATH"] = str(Path(__file__).parents[2])
+    repo_root = Path(__file__).parents[2]
+    environment["PYTHONPATH"] = os.pathsep.join((str(repo_root / "src"), str(repo_root)))
 
     with reports.evidence_lock():
         process = subprocess.Popen(
