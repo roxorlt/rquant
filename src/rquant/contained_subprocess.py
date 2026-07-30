@@ -57,6 +57,17 @@ def _record_cleanup_error(
         errors.append(error)
 
 
+def _format_cleanup_error_details(errors: Sequence[BaseException]) -> str:
+    details: list[str] = []
+    for error in errors:
+        try:
+            detail = str(error)
+        except BaseException:
+            detail = ""
+        details.append(detail or type(error).__name__)
+    return "; ".join(details)
+
+
 def _collect_cleanup_error(
     cleanup_errors: list[BaseException],
     error: BaseException,
@@ -64,24 +75,36 @@ def _collect_cleanup_error(
     primary_exception: BaseException,
     seen: set[int],
 ) -> None:
-    if error is primary_exception or id(error) in seen:
-        return
-    seen.add(id(error))
-    if isinstance(error, BaseExceptionGroup):
+    active_groups: set[int] = set()
+    worklist: list[tuple[BaseException, bool]] = [(error, False)]
+    while worklist:
+        current, exiting = worklist.pop()
+        current_id = id(current)
+        if exiting:
+            active_groups.discard(current_id)
+            seen.add(current_id)
+            continue
+        if current is primary_exception or current_id in seen:
+            continue
+        if current_id in active_groups:
+            cleanup_errors.append(current)
+            seen.add(current_id)
+            continue
+        if not isinstance(current, BaseExceptionGroup):
+            cleanup_errors.append(current)
+            seen.add(current_id)
+            continue
         try:
-            nested_errors = tuple(error.exceptions)
+            nested_errors = tuple(current.exceptions)
+            if not all(isinstance(nested, BaseException) for nested in nested_errors):
+                raise TypeError("cleanup group contains non-exception evidence")
         except BaseException:
-            cleanup_errors.append(error)
-            return
-        for nested_error in nested_errors:
-            _collect_cleanup_error(
-                cleanup_errors,
-                nested_error,
-                primary_exception=primary_exception,
-                seen=seen,
-            )
-        return
-    cleanup_errors.append(error)
+            cleanup_errors.append(current)
+            seen.add(current_id)
+            continue
+        active_groups.add(current_id)
+        worklist.append((current, True))
+        worklist.extend((nested, False) for nested in reversed(nested_errors))
 
 
 def _merge_cleanup_error_group(
@@ -150,7 +173,7 @@ def _terminate_unsafe_signal_state(
     errors: Sequence[BaseException],
 ) -> NoReturn:
     try:
-        details = "; ".join(str(error) or type(error).__name__ for error in errors)
+        details = _format_cleanup_error_details(errors)
         diagnostic = f"rquant: {message}"
         if details:
             diagnostic = f"{diagnostic}: {details}"
@@ -927,7 +950,7 @@ def _finish_signal_restoration(
 
     if not cleanup_errors:
         return
-    details = "; ".join(str(error) or type(error).__name__ for error in cleanup_errors)
+    details = _format_cleanup_error_details(cleanup_errors)
     if primary_exception is not None:
         _attach_cleanup_error_group(
             primary_exception,
@@ -1021,23 +1044,6 @@ def _close_file_descriptors(
     return not descriptors
 
 
-def _acquire_pending_file_descriptor(
-    acquire: Callable[[], int],
-    pending: list[int],
-) -> tuple[int, BaseException | None]:
-    descriptor = -1
-    try:
-        descriptor = acquire()
-        pending.append(descriptor)
-    except BaseException as exc:
-        if descriptor < 0:
-            raise
-        if descriptor not in pending:
-            pending.append(descriptor)
-        return descriptor, exc
-    return descriptor, None
-
-
 def _close_file_descriptor_inventories(
     inventories: Sequence[list[int]],
     cleanup_errors: list[BaseException],
@@ -1052,19 +1058,6 @@ def _close_file_descriptor_inventories(
     for inventory in inventories:
         inventory[:] = [descriptor for descriptor in inventory if descriptor in unresolved]
     return closed
-
-
-def _acquire_resource_guarded(
-    acquire: Callable[[], object],
-) -> tuple[object, bool, BaseException | None]:
-    resource: object | None = None
-    try:
-        resource = acquire()
-        return resource, True, None
-    except BaseException as exc:
-        if resource is None:
-            raise
-        return resource, True, exc
 
 
 def _close_resource_bounded(
@@ -1099,13 +1092,8 @@ def _raise_tracker_cleanup_error(
     message: str,
     cleanup_errors: Sequence[BaseException],
 ) -> NoReturn:
-    details: list[str] = []
-    for error in cleanup_errors:
-        try:
-            details.append(str(error) or type(error).__name__)
-        except BaseException:
-            details.append(type(error).__name__)
-    primary = ContainedProcessError(f"{message}: {'; '.join(details)}")
+    details = _format_cleanup_error_details(cleanup_errors)
+    primary = ContainedProcessError(f"{message}: {details}")
     _attach_cleanup_error_group(
         primary,
         cleanup_errors,
@@ -1319,9 +1307,26 @@ class _DarwinKqueueProcessTracker:
         self._deadline = 0.0
         self._registered: set[int] = set()
         self._poll_generation = 0
-        self._queue, self._owns_queue, self._construction_error = _acquire_resource_guarded(
-            select.kqueue
-        )
+        self._queue: object | None = None
+        self._owns_queue = False
+        self._construction_error: BaseException | None = None
+
+    def _initialize_queue(self) -> None:
+        if self._construction_error is not None:
+            raise self._construction_error
+        if self._queue is not None:
+            return
+        queue: object | None = None
+        try:
+            queue = select.kqueue()
+            self._queue = queue
+            self._owns_queue = True
+        except BaseException as exc:
+            if queue is not None:
+                self._queue = queue
+                self._owns_queue = True
+            self._construction_error = exc
+            raise
 
     def _register_process(self, identity: ProcessIdentity) -> bool:
         if identity.pid in self._registered:
@@ -1337,8 +1342,11 @@ class _DarwinKqueueProcessTracker:
             flags=select.KQ_EV_ADD | select.KQ_EV_ENABLE | select.KQ_EV_CLEAR,
             fflags=select.KQ_NOTE_FORK | select.KQ_NOTE_EXIT,
         )
+        queue = self._queue
+        if queue is None:
+            raise ContainedProcessError("kernel process tracker queue is not initialized")
         try:
-            self._queue.control([event], 0, 0)
+            queue.control([event], 0, 0)  # type: ignore[attr-defined]
         except OSError as exc:
             if exc.errno == errno.ESRCH:
                 return False
@@ -1350,8 +1358,7 @@ class _DarwinKqueueProcessTracker:
         return True
 
     def register_root(self, pid: int, *, deadline: float) -> ProcessIdentity:
-        if self._construction_error is not None:
-            raise self._construction_error
+        self._initialize_queue()
         if time.monotonic() >= deadline:
             raise TimeoutError("kernel tracker registration deadline expired")
         before = _darwin_process_observation(pid)
@@ -1376,10 +1383,13 @@ class _DarwinKqueueProcessTracker:
 
     def _track(self) -> None:
         try:
+            queue = self._queue
+            if queue is None:
+                raise ContainedProcessError("kernel process tracker queue is not initialized")
             while not self._stop.is_set():
                 if time.monotonic() >= self._deadline:
                     raise TimeoutError("kernel tracker deadline expired")
-                events = self._queue.control(None, 256, 0.01)
+                events = queue.control(None, 256, 0.01)  # type: ignore[attr-defined]
                 fork_observed = False
                 for event in events:
                     if event.fflags & select.KQ_NOTE_TRACKERR:
@@ -1437,7 +1447,7 @@ class _DarwinKqueueProcessTracker:
                 raise ContainedProcessError("kernel process tracker did not stop")
             self._thread = None
         cleanup_errors: list[BaseException] = []
-        if self._owns_queue:
+        if self._owns_queue and self._queue is not None:
             if _close_resource_bounded(self._queue, cleanup_errors):
                 self._owns_queue = False
             else:
@@ -1489,16 +1499,17 @@ class _LinuxSubreaperProcessTracker:
         if identity.pid not in self._pidfds and hasattr(os, "pidfd_open"):
             descriptor = -1
             try:
-                descriptor, acquisition_error = _acquire_pending_file_descriptor(
-                    lambda: os.pidfd_open(identity.pid, 0),
-                    self._pending_pidfds,
-                )
-                if acquisition_error is not None:
-                    raise acquisition_error
+                descriptor = os.pidfd_open(identity.pid, 0)
+                self._pending_pidfds.append(descriptor)
                 self._pidfds[identity.pid] = descriptor
                 self._pending_pidfds.remove(descriptor)
             except BaseException as primary_exception:
                 if descriptor >= 0:
+                    if (
+                        descriptor not in self._pending_pidfds
+                        and descriptor not in self._pidfds.values()
+                    ):
+                        self._pending_pidfds.append(descriptor)
                     cleanup_errors: list[BaseException] = []
                     pending_close = [descriptor]
                     if _close_file_descriptors(pending_close, cleanup_errors):
@@ -2105,6 +2116,8 @@ def run_contained(
         process_environment = dict(os.environ if env is None else env)
         process_environment[_CONTAINMENT_ENVIRONMENT_KEY] = containment_token
         kernel_tracker = kernel_tracker_factory()
+        if isinstance(kernel_tracker, _DarwinKqueueProcessTracker):
+            kernel_tracker._initialize_queue()
         gate_read, gate_write = os.pipe()
         helper_command = [
             sys.executable,
@@ -2132,15 +2145,21 @@ def run_contained(
             if process.stdout is None or process.stderr is None:
                 raise ContainedProcessError("Darwin containment pipes are unavailable")
             for stream in (process.stdout, process.stderr):
-                anchor, acquisition_error = _acquire_pending_file_descriptor(
-                    lambda stream=stream: os.dup(stream.fileno()),
-                    darwin_pending_anchor_fds,
-                )
-                if acquisition_error is not None:
-                    raise acquisition_error
-                darwin_pipe_anchor_fds.append(anchor)
-                darwin_pending_anchor_fds.remove(anchor)
-                os.set_inheritable(anchor, False)
+                anchor = -1
+                try:
+                    anchor = os.dup(stream.fileno())
+                    darwin_pending_anchor_fds.append(anchor)
+                    darwin_pipe_anchor_fds.append(anchor)
+                    darwin_pending_anchor_fds.remove(anchor)
+                    os.set_inheritable(anchor, False)
+                except BaseException:
+                    if (
+                        anchor >= 0
+                        and anchor not in darwin_pending_anchor_fds
+                        and anchor not in darwin_pipe_anchor_fds
+                    ):
+                        darwin_pending_anchor_fds.append(anchor)
+                    raise
             darwin_pipe_markers = frozenset(
                 {_darwin_pipe_marker_for_fd(os.getpid(), fd) for fd in darwin_pipe_anchor_fds}
             )
