@@ -6,7 +6,6 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Barrier
-from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
@@ -19,9 +18,11 @@ from rquant.signal_router_runtime import (
     RouteSourceDescriptor,
     RoutingConfigurationUnavailableError,
     RoutingDecision,
+    RunnerSignalBatch,
     SignalRouteConflictError,
     SignalRouteCursorStore,
     SignalRouteSequenceError,
+    SourceSnapshot,
     StrategyRunnerSignalSource,
     route_runner_signals,
 )
@@ -76,11 +77,15 @@ class FakeRunner:
             ),
         )
 
-    def descriptor(self) -> RouteSourceDescriptor:
-        return self._descriptor
-
-    def signals_after(self, *, sequence: int) -> tuple[RunnerSignalRecord, ...]:
-        return tuple(record for record in self.records if record.sequence > sequence)
+    def read_batch(self, *, after_sequence: int, limit: int) -> RunnerSignalBatch:
+        return RunnerSignalBatch(
+            snapshot=SourceSnapshot(descriptor=self._descriptor),
+            after_sequence=after_sequence,
+            limit=limit,
+            records=tuple(record for record in self.records if record.sequence > after_sequence)[
+                :limit
+            ],
+        )
 
 
 def _bus(path: Path) -> SignalBusStore:
@@ -145,6 +150,8 @@ def test_route_commits_source_receipt_cursor_signal_and_outbox_in_bus(
 
     assert summary.model_dump() | {"routed_at": NOW} == {
         "source_id": "n-shape-v1",
+        "source_generation_id": GENERATION,
+        "source_high_watermark": 1,
         "started_after_sequence": 0,
         "last_sequence": 1,
         "routed_count": 1,
@@ -222,35 +229,39 @@ def test_concurrent_exact_retry_is_idempotent_without_duplicate_target(
     assert len(bus.outbox_records(signal_id=signal.signal_id)) == 1
 
 
-def test_strategy_runner_adapter_exposes_persisted_generation_and_live_watermark() -> None:
+def test_strategy_runner_adapter_exposes_one_persisted_snapshot(tmp_path: Path) -> None:
     records = (RunnerSignalRecord(sequence=1, signal=_signal()),)
+    path = tmp_path / "runner.sqlite3"
+    _write_runner_source(path, signal=records[0].signal)
 
     class Store:
-        source_generation_id = GENERATION
-        spec = SimpleNamespace(spec_fingerprint=SPEC)
-
         @staticmethod
-        def signal_high_watermark() -> int:
-            return 1
-
-        @staticmethod
-        def signals_after(*, sequence: int) -> tuple[RunnerSignalRecord, ...]:
-            return tuple(record for record in records if record.sequence > sequence)
+        def _connect() -> sqlite3.Connection:
+            connection = sqlite3.connect(path, isolation_level=None)
+            connection.row_factory = sqlite3.Row
+            return connection
 
     source = StrategyRunnerSignalSource(source_id="n-shape-v1", store=Store())
 
-    assert source.descriptor() == RouteSourceDescriptor(
-        source_id="n-shape-v1",
-        generation_id=GENERATION,
-        strategy_spec_fingerprint=SPEC,
-        first_sequence=1,
-        high_watermark=1,
+    assert source.read_batch(after_sequence=0, limit=10) == RunnerSignalBatch(
+        snapshot=SourceSnapshot(
+            descriptor=RouteSourceDescriptor(
+                source_id="n-shape-v1",
+                generation_id=GENERATION,
+                strategy_spec_fingerprint=SPEC,
+                first_sequence=1,
+                high_watermark=1,
+            )
+        ),
+        after_sequence=0,
+        limit=10,
+        records=records,
     )
-    assert source.signals_after(sequence=0) == records
 
 
 def _write_runner_source(path: Path, *, signal: SignalEnvelope | None = None) -> None:
     with sqlite3.connect(path) as connection:
+        connection.execute("PRAGMA journal_mode = WAL")
         connection.executescript(
             """
             CREATE TABLE runner_metadata (
@@ -309,18 +320,123 @@ def test_readonly_runner_source_reads_exact_identity_without_writing(tmp_path: P
         expected_evaluator_contract_fingerprint="2" * 64,
     )
 
-    assert source.descriptor() == RouteSourceDescriptor(
-        source_id="n-shape-v1",
-        generation_id=GENERATION,
-        strategy_spec_fingerprint=SPEC,
-        first_sequence=1,
-        high_watermark=1,
-    )
-    assert source.signals_after(sequence=0) == (
-        RunnerSignalRecord(sequence=1, signal=signal),
+    assert source.read_batch(after_sequence=0, limit=10) == RunnerSignalBatch(
+        snapshot=SourceSnapshot(
+            descriptor=RouteSourceDescriptor(
+                source_id="n-shape-v1",
+                generation_id=GENERATION,
+                strategy_spec_fingerprint=SPEC,
+                first_sequence=1,
+                high_watermark=1,
+            )
+        ),
+        after_sequence=0,
+        limit=10,
+        records=(RunnerSignalRecord(sequence=1, signal=signal),),
     )
     after = (path.stat().st_size, path.stat().st_mtime_ns, tuple(tmp_path.iterdir()))
     assert after == before
+
+
+def test_readonly_runner_batch_uses_one_snapshot_during_concurrent_append(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "runner.sqlite3"
+    first = _signal("a")
+    second = _signal("2")
+    _write_runner_source(path, signal=first)
+    source = ReadonlyStrategyRunnerSignalSource(
+        source_id="n-shape-v1",
+        path=path,
+        expected_strategy_spec_fingerprint=SPEC,
+        expected_evaluator_contract_fingerprint="2" * 64,
+    )
+    real_connect = source._connect
+    watermark_read = Barrier(2)
+    append_committed = Barrier(2)
+
+    class _ConnectionProxy:
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            self.connection = connection
+
+        def __enter__(self) -> _ConnectionProxy:
+            self.connection.__enter__()
+            return self
+
+        def __exit__(self, *args: object) -> object:
+            return self.connection.__exit__(*args)
+
+        def execute(self, sql: str, parameters: object = ()) -> object:
+            result = self.connection.execute(sql, parameters)  # type: ignore[arg-type]
+            if "max(sequence)" in sql:
+                watermark_read.wait()
+                append_committed.wait()
+            return result
+
+    monkeypatch.setattr(source, "_connect", lambda: _ConnectionProxy(real_connect()))
+
+    def append() -> None:
+        watermark_read.wait()
+        with sqlite3.connect(path) as connection:
+            connection.execute(
+                """
+                INSERT INTO runner_signal(signal_id, feature_sequence, payload_json)
+                VALUES (?, 0, ?)
+                """,
+                (
+                    second.signal_id,
+                    json.dumps(second.model_dump(mode="json"), sort_keys=True),
+                ),
+            )
+        append_committed.wait()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        writer = executor.submit(append)
+        batch = source.read_batch(after_sequence=0, limit=10)
+        writer.result()
+
+    assert batch.snapshot.descriptor.high_watermark == 1
+    assert tuple(record.sequence for record in batch.records) == (1,)
+
+
+def test_readonly_runner_batch_decodes_only_limit_rows_from_large_backlog(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "runner.sqlite3"
+    signal = _signal()
+    _write_runner_source(path)
+    payload = json.dumps(signal.model_dump(mode="json"), sort_keys=True)
+    with sqlite3.connect(path) as connection:
+        connection.executemany(
+            """
+            INSERT INTO runner_signal(signal_id, feature_sequence, payload_json)
+            VALUES (?, 0, ?)
+            """,
+            ((f"signal-{index}", payload) for index in range(10_000)),
+        )
+    source = ReadonlyStrategyRunnerSignalSource(
+        source_id="n-shape-v1",
+        path=path,
+        expected_strategy_spec_fingerprint=SPEC,
+        expected_evaluator_contract_fingerprint="2" * 64,
+    )
+    real_loads = json.loads
+    decoded = 0
+
+    def counting_loads(value: str) -> object:
+        nonlocal decoded
+        decoded += 1
+        return real_loads(value)
+
+    monkeypatch.setattr("rquant.signal_router_runtime.json.loads", counting_loads)
+
+    batch = source.read_batch(after_sequence=0, limit=7)
+
+    assert len(batch.records) == 7
+    assert batch.snapshot.descriptor.high_watermark == 10_000
+    assert decoded == 7
 
 
 def test_readonly_runner_source_fails_closed_for_missing_symlink_or_identity_drift(
@@ -497,6 +613,50 @@ def test_sequence_gap_fails_closed_without_advancing_cursor(tmp_path: Path) -> N
         _run(runner=runner, bus=bus, cursors=_cursors(tmp_path))
 
     assert bus.route_cursor("n-shape-v1").last_sequence == 0
+
+
+@pytest.mark.parametrize(
+    ("returned_after_sequence", "returned_limit"),
+    [(1, 10), (0, 11)],
+)
+def test_source_batch_must_match_the_exact_router_request(
+    tmp_path: Path,
+    returned_after_sequence: int,
+    returned_limit: int,
+) -> None:
+    class MismatchedSource:
+        @staticmethod
+        def read_batch(
+            *,
+            after_sequence: int,
+            limit: int,
+        ) -> RunnerSignalBatch:
+            del after_sequence, limit
+            return RunnerSignalBatch(
+                snapshot=SourceSnapshot(
+                    descriptor=RouteSourceDescriptor(
+                        source_id="n-shape-v1",
+                        generation_id=GENERATION,
+                        strategy_spec_fingerprint=SPEC,
+                        first_sequence=1,
+                        high_watermark=0,
+                    )
+                ),
+                after_sequence=returned_after_sequence,
+                limit=returned_limit,
+                records=(),
+            )
+
+    with pytest.raises(SignalRouteConflictError, match="batch request"):
+        route_runner_signals(
+            source_id="n-shape-v1",
+            source=MismatchedSource(),
+            bus=_bus(tmp_path / "bus.sqlite3"),
+            cursors=_cursors(tmp_path),
+            routed_at=NOW,
+            target_resolver=lambda _signal: _route_decision(),
+            limit=10,
+        )
 
 
 def test_no_target_is_explicitly_persisted_and_counted(tmp_path: Path) -> None:

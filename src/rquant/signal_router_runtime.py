@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Annotated, Protocol, Self
 from urllib.parse import quote
 
-from pydantic import Field, StringConstraints, field_validator, model_validator
+from pydantic import Field, StrictInt, StringConstraints, field_validator, model_validator
 
 from rquant.delivery_contracts import DeliveryTarget
 from rquant.runtime_contracts import AwareUtcDatetime, RuntimeContractModel
@@ -102,10 +102,25 @@ class RoutingDecision(RuntimeContractModel):
         )
 
 
-class RunnerSignalSource(Protocol):
-    def descriptor(self) -> RouteSourceDescriptor: ...
+class SourceSnapshot(RuntimeContractModel):
+    descriptor: RouteSourceDescriptor
 
-    def signals_after(self, *, sequence: int) -> tuple[RunnerSignalRecord, ...]: ...
+
+class RunnerSignalBatch(RuntimeContractModel):
+    snapshot: SourceSnapshot
+    after_sequence: StrictInt = Field(ge=0)
+    limit: StrictInt = Field(ge=0)
+    records: tuple[RunnerSignalRecord, ...]
+
+    @model_validator(mode="after")
+    def validate_bounds(self) -> Self:
+        if len(self.records) > self.limit:
+            raise ValueError("runner signal batch exceeds its requested limit")
+        return self
+
+
+class RunnerSignalSource(Protocol):
+    def read_batch(self, *, after_sequence: int, limit: int) -> RunnerSignalBatch: ...
 
 
 class StrategyRunnerSignalSource:
@@ -118,17 +133,36 @@ class StrategyRunnerSignalSource:
         self.source_id = normalized
         self.store = store
 
-    def descriptor(self) -> RouteSourceDescriptor:
-        return RouteSourceDescriptor(
+    def read_batch(self, *, after_sequence: int, limit: int) -> RunnerSignalBatch:
+        _validate_batch_request(after_sequence=after_sequence, limit=limit)
+        connect = getattr(self.store, "_connect", None)
+        if not callable(connect):
+            raise TypeError("strategy runner store does not expose a transactional connection")
+        try:
+            with connect() as connection:
+                connection.execute("BEGIN")
+                identity = _query_source_snapshot(connection)
+                records = _query_signal_records(
+                    connection,
+                    after_sequence=after_sequence,
+                    high_watermark=identity.high_watermark,
+                    limit=limit,
+                )
+        except sqlite3.Error as exc:
+            raise ValueError("runner signals are unavailable") from exc
+        descriptor = RouteSourceDescriptor(
             source_id=self.source_id,
-            generation_id=self.store.source_generation_id,
-            strategy_spec_fingerprint=self.store.spec.spec_fingerprint,
+            generation_id=identity.generation_id,
+            strategy_spec_fingerprint=identity.strategy_spec_fingerprint,
             first_sequence=1,
-            high_watermark=self.store.signal_high_watermark(),
+            high_watermark=identity.high_watermark,
         )
-
-    def signals_after(self, *, sequence: int) -> tuple[RunnerSignalRecord, ...]:
-        return self.store.signals_after(sequence=sequence)
+        return RunnerSignalBatch(
+            snapshot=SourceSnapshot(descriptor=descriptor),
+            after_sequence=after_sequence,
+            limit=limit,
+            records=records,
+        )
 
 
 class ReadonlyStrategyRunnerSignalSource:
@@ -152,16 +186,16 @@ class ReadonlyStrategyRunnerSignalSource:
             ("strategy spec", expected_strategy_spec_fingerprint),
             ("evaluator contract", expected_evaluator_contract_fingerprint),
         ):
-            if not isinstance(value, str) or len(value) != 64 or any(
-                character not in "0123456789abcdef" for character in value
+            if (
+                not isinstance(value, str)
+                or len(value) != 64
+                or any(character not in "0123456789abcdef" for character in value)
             ):
                 raise ValueError(f"expected {label} fingerprint must be SHA-256")
         self.source_id = normalized_source_id
         self.path = self._require_safe_path(path)
         self.expected_strategy_spec_fingerprint = expected_strategy_spec_fingerprint
-        self.expected_evaluator_contract_fingerprint = (
-            expected_evaluator_contract_fingerprint
-        )
+        self.expected_evaluator_contract_fingerprint = expected_evaluator_contract_fingerprint
         self.busy_timeout_ms = busy_timeout_ms
         observed = self.path.stat(follow_symlinks=False)
         self._file_identity = (observed.st_dev, observed.st_ino)
@@ -242,52 +276,109 @@ class ReadonlyStrategyRunnerSignalSource:
             ("source generation", generation_id),
             ("strategy spec", spec_fingerprint),
         ):
-            if len(value) != 64 or any(
-                character not in "0123456789abcdef" for character in value
-            ):
+            if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
                 raise ValueError(f"runner {label} is not a SHA-256 digest")
         return generation_id, spec_fingerprint, evaluator_fingerprint
 
-    def descriptor(self) -> RouteSourceDescriptor:
-        generation_id, spec_fingerprint, _evaluator = self._read_identity()
+    def read_batch(self, *, after_sequence: int, limit: int) -> RunnerSignalBatch:
+        _validate_batch_request(after_sequence=after_sequence, limit=limit)
         try:
             with self._connect() as connection:
-                row = connection.execute(
-                    "SELECT max(sequence) AS value FROM runner_signal"
-                ).fetchone()
-        except sqlite3.Error as exc:
-            raise ValueError("runner signal watermark is unavailable") from exc
-        high_watermark = 0 if row is None or row["value"] is None else int(row["value"])
-        return RouteSourceDescriptor(
-            source_id=self.source_id,
-            generation_id=generation_id,
-            strategy_spec_fingerprint=spec_fingerprint,
-            first_sequence=1,
-            high_watermark=high_watermark,
-        )
-
-    def signals_after(self, *, sequence: int) -> tuple[RunnerSignalRecord, ...]:
-        if sequence < 0:
-            raise ValueError("signal sequence must be nonnegative")
-        self._read_identity()
-        try:
-            with self._connect() as connection:
-                rows = connection.execute(
-                    """
-                    SELECT sequence, payload_json FROM runner_signal
-                    WHERE sequence > ? ORDER BY sequence
-                    """,
-                    (sequence,),
-                ).fetchall()
+                connection.execute("BEGIN")
+                identity = _query_source_snapshot(connection)
+                self._validate_identity(identity)
+                records = _query_signal_records(
+                    connection,
+                    after_sequence=after_sequence,
+                    high_watermark=identity.high_watermark,
+                    limit=limit,
+                )
         except sqlite3.Error as exc:
             raise ValueError("runner signals are unavailable") from exc
-        return tuple(
-            RunnerSignalRecord(
-                sequence=int(row["sequence"]),
-                signal=json.loads(str(row["payload_json"])),
-            )
-            for row in rows
+        return RunnerSignalBatch(
+            snapshot=SourceSnapshot(
+                descriptor=RouteSourceDescriptor(
+                    source_id=self.source_id,
+                    generation_id=identity.generation_id,
+                    strategy_spec_fingerprint=identity.strategy_spec_fingerprint,
+                    first_sequence=1,
+                    high_watermark=identity.high_watermark,
+                )
+            ),
+            after_sequence=after_sequence,
+            limit=limit,
+            records=records,
         )
+
+    def _validate_identity(self, identity: _SourceIdentitySnapshot) -> None:
+        if identity.strategy_spec_fingerprint != self.expected_strategy_spec_fingerprint:
+            raise ValueError("runner source strategy spec identity does not match")
+        if identity.evaluator_contract_fingerprint != self.expected_evaluator_contract_fingerprint:
+            raise ValueError("runner source evaluator contract identity does not match")
+
+
+class _SourceIdentitySnapshot(RuntimeContractModel):
+    generation_id: Sha256
+    strategy_spec_fingerprint: Sha256
+    evaluator_contract_fingerprint: Sha256
+    high_watermark: StrictInt = Field(ge=0)
+
+
+def _validate_batch_request(*, after_sequence: int, limit: int) -> None:
+    if isinstance(after_sequence, bool) or not isinstance(after_sequence, int):
+        raise ValueError("signal sequence must be an integer")
+    if after_sequence < 0:
+        raise ValueError("signal sequence must be nonnegative")
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        raise ValueError("signal batch limit must be an integer")
+    if limit < 0:
+        raise ValueError("signal batch limit must be nonnegative")
+
+
+def _query_source_snapshot(connection: sqlite3.Connection) -> _SourceIdentitySnapshot:
+    row = connection.execute(
+        """
+        SELECT metadata.strategy_spec_fingerprint,
+               metadata.evaluator_contract_fingerprint,
+               source.source_generation_id,
+               (SELECT max(sequence) FROM runner_signal) AS high_watermark
+        FROM runner_metadata AS metadata
+        CROSS JOIN runner_source_identity AS source
+        WHERE metadata.singleton = 1 AND source.singleton = 1
+        """
+    ).fetchone()
+    if row is None:
+        raise ValueError("runner source identity is unavailable")
+    return _SourceIdentitySnapshot(
+        generation_id=str(row["source_generation_id"]),
+        strategy_spec_fingerprint=str(row["strategy_spec_fingerprint"]),
+        evaluator_contract_fingerprint=str(row["evaluator_contract_fingerprint"]),
+        high_watermark=(0 if row["high_watermark"] is None else int(row["high_watermark"])),
+    )
+
+
+def _query_signal_records(
+    connection: sqlite3.Connection,
+    *,
+    after_sequence: int,
+    high_watermark: int,
+    limit: int,
+) -> tuple[RunnerSignalRecord, ...]:
+    rows = connection.execute(
+        """
+        SELECT sequence, payload_json FROM runner_signal
+        WHERE sequence > ? AND sequence <= ?
+        ORDER BY sequence LIMIT ?
+        """,
+        (after_sequence, high_watermark, limit),
+    ).fetchall()
+    return tuple(
+        RunnerSignalRecord(
+            sequence=int(row["sequence"]),
+            signal=json.loads(str(row["payload_json"])),
+        )
+        for row in rows
+    )
 
 
 TargetResolver = Callable[[SignalEnvelope], RoutingDecision]
@@ -295,6 +386,8 @@ TargetResolver = Callable[[SignalEnvelope], RoutingDecision]
 
 class SignalRouteSummary(RuntimeContractModel):
     source_id: str = Field(min_length=1)
+    source_generation_id: Sha256
+    source_high_watermark: int = Field(ge=0)
     started_after_sequence: int = Field(ge=0)
     last_sequence: int = Field(ge=0)
     routed_count: int = Field(ge=0)
@@ -369,25 +462,30 @@ def route_runner_signals(
         routed_at=routed_at,
         limit=limit,
     )
-    descriptor = RouteSourceDescriptor.model_validate(source.descriptor())
+    cursors.bind(bus)
+    observed_cursor = bus.route_cursor(request.source_id)
+    batch = RunnerSignalBatch.model_validate(
+        source.read_batch(
+            after_sequence=observed_cursor.last_sequence,
+            limit=request.limit,
+        )
+    )
+    if batch.after_sequence != observed_cursor.last_sequence or batch.limit != request.limit:
+        raise SignalRouteConflictError(
+            "source batch request does not match the router cursor and limit"
+        )
+    descriptor = batch.snapshot.descriptor
     if descriptor.source_id != request.source_id:
         raise SignalRouteConflictError(
             "requested source_id does not match the frozen source descriptor"
         )
-    cursors.bind(bus)
     cursor = bus.bind_route_source(
         descriptor,
         routing_policy_fingerprint=cursors.routing_policy_fingerprint,
         observed_at=request.routed_at,
     )
-    started_after = cursor.last_sequence
-    raw_records = source.signals_after(sequence=started_after)
-    records = tuple(
-        record
-        if isinstance(record, RunnerSignalRecord)
-        else RunnerSignalRecord.model_validate(record)
-        for record in raw_records
-    )
+    started_after = observed_cursor.last_sequence
+    records = batch.records
     expected = started_after + 1
     for record in records:
         if record.sequence != expected:
@@ -397,8 +495,12 @@ def route_runner_signals(
         expected += 1
     if records and records[-1].sequence > descriptor.high_watermark:
         raise SignalRouteSequenceError("source returned records above its declared high watermark")
-    if descriptor.high_watermark > started_after and (
-        not records or records[-1].sequence < descriptor.high_watermark
+    if descriptor.high_watermark > started_after and not records:
+        raise SignalRouteSequenceError("source tail is missing below the declared high watermark")
+    if (
+        records
+        and len(records) < request.limit
+        and records[-1].sequence < descriptor.high_watermark
     ):
         raise SignalRouteSequenceError("source tail is missing below the declared high watermark")
 
@@ -409,7 +511,7 @@ def route_runner_signals(
     expired_count = 0
     deferred_count = 0
 
-    for record in records[: request.limit]:
+    for record in records:
         signal = record.signal
         if signal.available_at > request.routed_at:
             deferred_count = 1
@@ -444,6 +546,8 @@ def route_runner_signals(
 
     return SignalRouteSummary(
         source_id=request.source_id,
+        source_generation_id=descriptor.generation_id,
+        source_high_watermark=descriptor.high_watermark,
         started_after_sequence=started_after,
         last_sequence=cursor.last_sequence,
         routed_count=routed_count,
@@ -461,6 +565,7 @@ __all__ = [
     "RoutingConfigurationUnavailableError",
     "RoutingDecision",
     "RoutingDecisionAction",
+    "RunnerSignalBatch",
     "RunnerSignalSource",
     "ReadonlyStrategyRunnerSignalSource",
     "SignalRouteConflictError",
@@ -468,6 +573,7 @@ __all__ = [
     "SignalRouteCursorStore",
     "SignalRouteSequenceError",
     "SignalRouteSummary",
+    "SourceSnapshot",
     "StrategyRunnerSignalSource",
     "TargetResolver",
     "route_runner_signals",

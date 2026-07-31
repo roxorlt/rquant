@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -423,6 +425,7 @@ def test_builtin_registry_registers_dependency_free_concrete_builders(tmp_path: 
     assert registry.registered_kinds == (
         RuntimeServiceKind.MARKET_MINUTE_SOURCE,
         RuntimeServiceKind.FEATURE_LIVE,
+        RuntimeServiceKind.SIGNAL_ROUTER,
         RuntimeServiceKind.PAPER_CONSUMER,
     )
     assert callable(registry.build(_manifest(tmp_path)))
@@ -431,6 +434,30 @@ def test_builtin_registry_registers_dependency_free_concrete_builders(tmp_path: 
     )
     with pytest.raises(KeyError, match="not registered"):
         registry.build(unsupported)
+
+
+def test_default_registry_does_not_import_serving_or_production_storage_modules() -> None:
+    src_root = Path(__file__).resolve().parents[2] / "src"
+    script = "\n".join(
+        (
+            "import sys",
+            f"sys.path.insert(0, {str(src_root)!r})",
+            "from rquant.runtime_service_builtin import build_builtin_registry",
+            "build_builtin_registry()",
+            "forbidden = ('duckdb', 'rquant.storage.duckdb', 'rquant.monitor', 'rquant.config')",
+            "unexpected = tuple(name for name in forbidden if name in sys.modules)",
+            "if unexpected: raise SystemExit(f'unexpected imports: {unexpected!r}')",
+        )
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_builtin_registry_registers_all_explicitly_bound_services() -> None:
@@ -450,13 +477,24 @@ def test_builtin_registry_registers_all_explicitly_bound_services() -> None:
     assert registry.registered_kinds == tuple(RuntimeServiceKind)
 
 
-def test_builtin_registry_rejects_partial_router_dependencies() -> None:
+@pytest.mark.parametrize(
+    ("source_loader", "target_resolver"),
+    [
+        (lambda _source_id: object(), None),
+        (None, lambda _signal: object()),
+    ],
+)
+def test_builtin_registry_rejects_partial_router_dependencies(
+    source_loader: object,
+    target_resolver: object,
+) -> None:
     with pytest.raises(ValueError, match="router dependencies"):
         build_builtin_registry(
             adapter_factory=_Adapter,
             universe_loader=lambda: ["600000.SH"],
             clock=lambda: NOW,
-            signal_source_loader=lambda _source_id: object(),  # type: ignore[arg-type]
+            signal_source_loader=source_loader,  # type: ignore[arg-type]
+            target_resolver=target_resolver,  # type: ignore[arg-type]
         )
 
 

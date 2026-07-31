@@ -245,7 +245,6 @@ def build_builtin_registry(
 ) -> RuntimeServiceRegistry:
     from rquant.runtime_builder_feature import feature_live_builder
     from rquant.runtime_builder_paper import paper_broker_builder, paper_consumer_builder
-    from rquant.runtime_builder_serving import serving_publisher_builder
     from rquant.runtime_builder_signal import notifier_builder, signal_router_builder
     from rquant.runtime_builder_strategy import strategy_live_builder
 
@@ -275,15 +274,14 @@ def build_builtin_registry(
                 clock=resolved_clock,
             ),
         )
-    if signal_source_loader is not None and target_resolver is not None:
-        registry.register(
-            RuntimeServiceKind.SIGNAL_ROUTER,
-            signal_router_builder(
-                source_loader=signal_source_loader,
-                target_resolver=target_resolver,
-                clock=resolved_clock,
-            ),
-        )
+    registry.register(
+        RuntimeServiceKind.SIGNAL_ROUTER,
+        signal_router_builder(
+            source_loader=signal_source_loader,
+            target_resolver=target_resolver,
+            clock=resolved_clock,
+        ),
+    )
     if provider_loader is not None:
         registry.register(
             RuntimeServiceKind.NOTIFIER,
@@ -306,6 +304,8 @@ def build_builtin_registry(
             ),
         )
     if serving_snapshot_loader is not None:
+        from rquant.runtime_builder_serving import serving_publisher_builder
+
         registry.register(
             RuntimeServiceKind.SERVING_PUBLISHER,
             serving_publisher_builder(
