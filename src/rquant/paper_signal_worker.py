@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from collections.abc import Callable, Mapping
 from datetime import date, datetime, timedelta
 from enum import StrEnum
@@ -179,13 +180,30 @@ class PaperSignalQueueStore:
         )
         connection.row_factory = sqlite3.Row
         connection.execute(f"PRAGMA busy_timeout = {self.busy_timeout_ms}")
-        connection.execute("PRAGMA journal_mode = WAL")
         connection.execute("PRAGMA synchronous = FULL")
         return connection
+
+    def _enable_wal(self, connection: sqlite3.Connection) -> None:
+        deadline = time.monotonic() + self.busy_timeout_ms / 1_000
+        while True:
+            try:
+                mode = str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+                if mode != "wal":
+                    mode = str(
+                        connection.execute("PRAGMA journal_mode = WAL").fetchone()[0]
+                    ).lower()
+                if mode != "wal":
+                    raise RuntimeError("paper signal queue requires WAL mode")
+                return
+            except sqlite3.OperationalError as error:
+                if "locked" not in str(error).lower() or time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.01)
 
     def _initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
+            self._enable_wal(connection)
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS paper_signal_metadata (
