@@ -232,6 +232,86 @@ def canonical_feature_payload(frame: pd.DataFrame, *, schema_version: int) -> by
     ).encode("utf-8")
 
 
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON object key: {key}")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value: str) -> object:
+    raise ValueError(f"non-finite JSON constant is forbidden: {value}")
+
+
+def _canonical_json_bytes(value: object) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _validate_supplied_feature_payload(
+    feature_payload: bytes | str,
+    *,
+    envelope: FeatureBatchEnvelope,
+    canonical_frame_payload: bytes,
+) -> tuple[bytes, str]:
+    if isinstance(feature_payload, str):
+        try:
+            supplied = feature_payload.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise StrategyBatchConflictError("supplied feature payload is not valid UTF-8") from exc
+    elif isinstance(feature_payload, bytes):
+        supplied = feature_payload
+    else:
+        raise StrategyBatchConflictError("supplied feature payload must be bytes or str")
+    try:
+        text = supplied.decode("utf-8")
+        decoded = json.loads(
+            text,
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except UnicodeDecodeError as exc:
+        raise StrategyBatchConflictError("supplied feature payload is not valid UTF-8") from exc
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise StrategyBatchConflictError(f"invalid supplied feature payload: {exc}") from exc
+    if not isinstance(decoded, dict):
+        raise StrategyBatchConflictError("supplied feature payload must be a JSON object")
+    try:
+        canonical_supplied = _canonical_json_bytes(decoded)
+    except (TypeError, ValueError) as exc:
+        raise StrategyBatchConflictError(
+            f"supplied feature payload contains an invalid JSON value: {exc}"
+        ) from exc
+    if supplied != canonical_supplied:
+        raise StrategyBatchConflictError("supplied feature payload must use canonical JSON bytes")
+    schema_version = decoded.get("schema_version")
+    if type(schema_version) is not int or schema_version != envelope.schema_version:
+        raise StrategyBatchConflictError(
+            "supplied feature payload schema_version does not match envelope"
+        )
+    supplied_rows = decoded.get("rows")
+    if not isinstance(supplied_rows, list):
+        raise StrategyBatchConflictError("supplied feature payload requires a rows list")
+    expected_rows = json.loads(canonical_frame_payload)["rows"]
+    if _canonical_json_bytes(supplied_rows) != _canonical_json_bytes(expected_rows):
+        raise StrategyBatchConflictError(
+            "supplied feature payload rows do not exactly match the DataFrame"
+        )
+    payload_hash = hashlib.sha256(supplied).hexdigest()
+    if payload_hash != envelope.content_hash:
+        raise StrategyBatchConflictError(
+            "supplied feature payload hash does not match envelope content_hash"
+        )
+    return supplied, payload_hash
+
+
 def _validate_sha256(value: str, *, label: str) -> str:
     if not isinstance(value, str) or SHA256_PATTERN.fullmatch(value) is None:
         raise ValueError(f"{label} must be a lowercase SHA-256 hex digest")
@@ -396,20 +476,17 @@ class StrategyRunnerStore:
             normalized,
             schema_version=envelope.schema_version,
         )
-        if feature_payload is not None:
-            supplied_payload = (
-                feature_payload.encode("utf-8")
-                if isinstance(feature_payload, str)
-                else feature_payload
-            )
-            if supplied_payload != canonical_payload:
+        if feature_payload is None:
+            feature_payload_hash = hashlib.sha256(canonical_payload).hexdigest()
+            if feature_payload_hash != envelope.content_hash:
                 raise StrategyBatchConflictError(
-                    "supplied feature payload does not match the canonical DataFrame payload"
+                    "feature payload hash does not match envelope content_hash"
                 )
-        feature_payload_hash = hashlib.sha256(canonical_payload).hexdigest()
-        if feature_payload_hash != envelope.content_hash:
-            raise StrategyBatchConflictError(
-                "feature payload hash does not match envelope content_hash"
+        else:
+            _, feature_payload_hash = _validate_supplied_feature_payload(
+                feature_payload,
+                envelope=envelope,
+                canonical_frame_payload=canonical_payload,
             )
 
         with self._connect() as connection:
@@ -655,6 +732,8 @@ class StrategyRunnerStore:
         envelope: FeatureBatchEnvelope,
         frame: pd.DataFrame,
     ) -> None:
+        if frame.empty and envelope.row_count == 0:
+            return
         incompatible_required = sorted(
             requirement.name
             for requirement in self.spec.required_features

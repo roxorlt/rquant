@@ -5,7 +5,7 @@ import json
 import multiprocessing
 import os
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from threading import Event, Lock
 
@@ -20,7 +20,22 @@ from rquant.feature_contracts import (
     FeatureRequirement,
     RequirementLevel,
 )
+from rquant.runtime_candidate_universe import (
+    CandidateUniverseAuthority,
+    RuntimeCandidateUniverseConfig,
+    RuntimeCandidateUniverseLoader,
+)
 from rquant.signal_contracts import SignalAction
+from rquant.strategy_candidate_feature_join import (
+    StrategyCandidateFeatureBatch,
+    join_strategy_candidate_features,
+)
+from rquant.strategy_candidate_snapshot import (
+    StrategyCandidatePriceBasis,
+    StrategyCandidateRecord,
+    StrategyCandidateSnapshot,
+    StrategyCandidateSnapshotSpool,
+)
 from rquant.strategy_runner import (
     StrategyBatchConflictError,
     StrategyDecision,
@@ -41,13 +56,15 @@ def _spec(
     *,
     producer_commit: str = "c" * 40,
     optional_features: tuple[FeatureRequirement, ...] = (),
+    required_features: tuple[FeatureRequirement, ...] | None = None,
 ) -> StrategySpec:
     return StrategySpec(
         strategy_id="growth-board-surge-v1",
         version=1,
         feature_contract_id="intraday-pit",
         min_feature_contract_version=1,
-        required_features=(
+        required_features=required_features
+        or (
             FeatureRequirement(
                 name="rel_same_minute",
                 level=RequirementLevel.REQUIRED,
@@ -154,6 +171,103 @@ def _store(
         path,
         spec=spec or _spec(),
         evaluator_contract_fingerprint=evaluator_contract_fingerprint,
+    )
+
+
+def _joined_feature_batch(
+    tmp_path: Path,
+    *,
+    empty_requested_authority: bool = False,
+) -> StrategyCandidateFeatureBatch:
+    trade_date = date(2026, 7, 31)
+    decision_at = datetime(2026, 7, 30, 9, 0, tzinfo=UTC)
+    requested_rows = (
+        ()
+        if empty_requested_authority
+        else (
+            StrategyCandidateRecord(
+                strategy_id="growth-board-surge-v1",
+                strategy_version="1",
+                candidate_id="300001.SZ",
+                variant="default",
+                decision_at=decision_at,
+                available_at=decision_at + timedelta(minutes=1),
+                effective_trade_date=trade_date,
+                reference_trade_date=date(2026, 7, 30),
+                price_basis=StrategyCandidatePriceBasis.QFQ_PIT,
+                static_features={"candidate_score": 0.91},
+                reference_snapshot_ids={"daily": "1" * 64},
+            ),
+        )
+    )
+    requested_root = (tmp_path / "requested-candidates").resolve()
+    requested_snapshot = StrategyCandidateSnapshot.build(
+        sequence=0,
+        trade_date=trade_date,
+        captured_at=NOW,
+        producer_commit="b" * 40,
+        rows=requested_rows,
+    )
+    StrategyCandidateSnapshotSpool(requested_root).publish(requested_snapshot)
+    authorities = [
+        CandidateUniverseAuthority(
+            strategy_id="growth-board-surge-v1",
+            strategy_version="1",
+            snapshot_root=requested_root,
+            required=True,
+            max_age_seconds=60,
+        )
+    ]
+    if empty_requested_authority:
+        other_root = (tmp_path / "other-candidates").resolve()
+        other_row = StrategyCandidateRecord(
+            strategy_id="other-strategy",
+            strategy_version="1",
+            candidate_id="300001.SZ",
+            variant="default",
+            decision_at=decision_at,
+            available_at=decision_at + timedelta(minutes=1),
+            effective_trade_date=trade_date,
+            reference_trade_date=date(2026, 7, 30),
+            price_basis=StrategyCandidatePriceBasis.QFQ_PIT,
+            static_features={"other_score": 0.8},
+            reference_snapshot_ids={"daily": "2" * 64},
+        )
+        StrategyCandidateSnapshotSpool(other_root).publish(
+            StrategyCandidateSnapshot.build(
+                sequence=0,
+                trade_date=trade_date,
+                captured_at=NOW,
+                producer_commit="b" * 40,
+                rows=(other_row,),
+            )
+        )
+        authorities.append(
+            CandidateUniverseAuthority(
+                strategy_id="other-strategy",
+                strategy_version="1",
+                snapshot_root=other_root,
+                required=True,
+                max_age_seconds=60,
+            )
+        )
+    universe = RuntimeCandidateUniverseLoader(
+        RuntimeCandidateUniverseConfig(
+            expected_commit="b" * 40,
+            authorities=tuple(authorities),
+        )
+    ).load(as_of=NOW, required_trade_date=trade_date)
+    common_frame = _frame()
+    common_envelope = _envelope(
+        content_hash=_payload_hash(common_frame),
+        row_count=1,
+    )
+    return join_strategy_candidate_features(
+        common_envelope,
+        common_frame,
+        universe,
+        "growth-board-surge-v1",
+        "1",
     )
 
 
@@ -285,6 +399,160 @@ def test_process_batch_accepts_exact_intraday_payload_bytes(tmp_path: Path) -> N
     )
 
     assert result.processed_candidates == 1
+
+
+def test_process_batch_accepts_real_joined_extended_payload(tmp_path: Path) -> None:
+    joined = _joined_feature_batch(tmp_path)
+    store = _store(tmp_path / "runner.sqlite3")
+
+    result = store.process_batch(
+        joined.envelope,
+        joined.frame,
+        feature_payload=joined.payload_bytes,
+        dataset_snapshot_id="d" * 64,
+        observed_at=NOW,
+        evaluator=_entry_decision,
+    )
+
+    assert result.processed_candidates == 1
+    assert store.last_batch_sequence() == 0
+
+    changed = json.loads(joined.payload_json)
+    changed["retry_metadata"] = "changed"
+    changed_payload = json.dumps(
+        changed,
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    changed_envelope = joined.envelope.model_copy(
+        update={"content_hash": hashlib.sha256(changed_payload).hexdigest()}
+    )
+    with pytest.raises(StrategyBatchConflictError, match="immutable batch"):
+        store.process_batch(
+            changed_envelope,
+            joined.frame,
+            feature_payload=changed_payload,
+            dataset_snapshot_id="d" * 64,
+            observed_at=NOW,
+            evaluator=lambda *_args: pytest.fail("conflicting retry must not evaluate"),
+        )
+
+
+def test_process_batch_rejects_extended_metadata_and_row_tampering(tmp_path: Path) -> None:
+    joined = _joined_feature_batch(tmp_path)
+    store = _store(tmp_path / "runner.sqlite3")
+    metadata = json.loads(joined.payload_json)
+    metadata["forged_metadata"] = True
+    metadata_payload = json.dumps(
+        metadata,
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+    with pytest.raises(StrategyBatchConflictError, match="hash"):
+        store.process_batch(
+            joined.envelope,
+            joined.frame,
+            feature_payload=metadata_payload,
+            dataset_snapshot_id="d" * 64,
+            observed_at=NOW,
+            evaluator=_entry_decision,
+        )
+
+    rows = json.loads(joined.payload_json)
+    rows["rows"][0]["rel_same_minute"] = 999.0
+    row_payload = json.dumps(
+        rows,
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    forged_envelope = joined.envelope.model_copy(
+        update={"content_hash": hashlib.sha256(row_payload).hexdigest()}
+    )
+    with pytest.raises(StrategyBatchConflictError, match="rows"):
+        store.process_batch(
+            forged_envelope,
+            joined.frame,
+            feature_payload=row_payload,
+            dataset_snapshot_id="d" * 64,
+            observed_at=NOW,
+            evaluator=_entry_decision,
+        )
+
+    assert store.last_batch_sequence() == -1
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        (b'{"schema_version":1,"rows":[],"rows":[]}', "duplicate"),
+        (b'{"schema_version":1,"rows":[NaN]}', "constant"),
+        (b"[]", "object"),
+        (b'{ "rows": [], "schema_version": 1 }', "canonical"),
+    ],
+)
+def test_process_batch_rejects_unsafe_supplied_json_payloads(
+    tmp_path: Path,
+    payload: bytes,
+    message: str,
+) -> None:
+    store = _store(tmp_path / f"runner-{message}.sqlite3")
+    empty = pd.DataFrame(columns=("ts_code", "rel_same_minute"))
+    envelope = _envelope(
+        row_count=0,
+        content_hash=hashlib.sha256(payload).hexdigest(),
+    )
+
+    with pytest.raises(StrategyBatchConflictError, match=message):
+        store.process_batch(
+            envelope,
+            empty,
+            feature_payload=payload,
+            dataset_snapshot_id="d" * 64,
+            observed_at=NOW,
+            evaluator=lambda *_args: None,
+        )
+
+
+def test_empty_joined_batch_advances_cursor_without_static_contract_fields(
+    tmp_path: Path,
+) -> None:
+    joined = _joined_feature_batch(tmp_path, empty_requested_authority=True)
+    required = (
+        FeatureRequirement(
+            name="rel_same_minute",
+            level=RequirementLevel.REQUIRED,
+            min_contract_version=1,
+        ),
+        FeatureRequirement(
+            name="candidate_score",
+            level=RequirementLevel.REQUIRED,
+            min_contract_version=1,
+        ),
+    )
+    store = _store(tmp_path / "runner.sqlite3", spec=_spec(required_features=required))
+
+    result = store.process_batch(
+        joined.envelope,
+        joined.frame,
+        feature_payload=joined.payload_bytes,
+        dataset_snapshot_id="d" * 64,
+        observed_at=NOW,
+        evaluator=lambda *_args: pytest.fail("empty batch must not evaluate candidates"),
+    )
+
+    assert joined.static_feature_names == ()
+    assert joined.envelope.row_count == len(joined.frame) == 0
+    assert result.processed_candidates == 0
+    assert result.skipped_candidates == 0
+    assert result.signals == ()
+    assert store.last_batch_sequence() == 0
 
 
 def test_batch_sequence_gap_and_conflicting_replay_fail_closed(tmp_path: Path) -> None:
