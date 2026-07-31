@@ -89,6 +89,7 @@ class BatchEnvelope(RuntimeContractModel):
 class ConsumerCursor(RuntimeContractModel):
     consumer_id: NonEmptyStr
     channel: LiveChannel
+    source_generation_id: Sha256Hex
     last_sequence: int = Field(ge=-1)
     last_batch_id: NonEmptyStr | None = None
     last_content_sha256: Sha256Hex | None = None
@@ -109,6 +110,7 @@ class ConsumerCursor(RuntimeContractModel):
 
 class CurrentPointer(RuntimeContractModel):
     channel: LiveChannel
+    source_generation_id: Sha256Hex
     batch_id: NonEmptyStr
     sequence: int = Field(ge=0)
     revision: int = Field(ge=1)
@@ -128,3 +130,10 @@ class CurrentPointer(RuntimeContractModel):
     @property
     def identity_sha256(self) -> str:
         return canonical_sha256(self.model_dump(mode="python"))
+
+
+class LiveSourceDescriptor(RuntimeContractModel):
+    channel: LiveChannel
+    generation_id: Sha256Hex
+    first_sequence: int = 0
+    high_watermark: int = Field(ge=-1)

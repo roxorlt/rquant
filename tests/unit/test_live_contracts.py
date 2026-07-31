@@ -85,9 +85,7 @@ def test_batch_envelope_rejects_invalid_time_and_revision_rules(
 
 
 def test_batch_envelope_accepts_revision_with_previous_batch() -> None:
-    batch = BatchEnvelope.model_validate(
-        _batch_payload(revision=2, revises_batch_id="batch-0")
-    )
+    batch = BatchEnvelope.model_validate(_batch_payload(revision=2, revises_batch_id="batch-0"))
 
     assert batch.revision == 2
     assert batch.revises_batch_id == "batch-0"
@@ -155,6 +153,7 @@ def test_consumer_cursor_requires_batch_and_hash_as_a_pair() -> None:
     base: dict[str, object] = {
         "consumer_id": "feature-live",
         "channel": LiveChannel.MARKET_MINUTE,
+        "source_generation_id": "b" * 64,
         "last_sequence": -1,
         "updated_at": datetime(2026, 7, 31, 2, tzinfo=UTC),
     }
@@ -189,6 +188,7 @@ def test_current_pointer_rejects_unpublished_status(
     with pytest.raises(ValidationError, match="cannot be current"):
         CurrentPointer(
             channel=LiveChannel.MARKET_MINUTE,
+            source_generation_id="b" * 64,
             batch_id="batch-1",
             sequence=1,
             revision=1,
@@ -201,6 +201,7 @@ def test_current_pointer_rejects_unpublished_status(
 def test_current_pointer_accepts_visible_quality_and_normalizes_time() -> None:
     pointer = CurrentPointer(
         channel=LiveChannel.MARKET_MINUTE,
+        source_generation_id="b" * 64,
         batch_id="batch-1",
         sequence=1,
         revision=1,

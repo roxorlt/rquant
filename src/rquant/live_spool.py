@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import json
 import os
+import secrets
 import stat
 import tempfile
 from collections.abc import Iterator
@@ -20,6 +21,7 @@ from rquant.live_contracts import (
     ConsumerCursor,
     CurrentPointer,
     LiveChannel,
+    LiveSourceDescriptor,
 )
 from rquant.runtime_contracts import canonical_sha256
 
@@ -43,12 +45,19 @@ class LiveBatchSpool:
         self.batch_root = self.root / "batches"
         self.current_root = self.root / "current"
         self.cursor_root = self.root / "cursors"
+        self.source_root = self.root / "sources"
         self._lock_path = self.root / ".spool.lock"
         self._thread_lock = RLock()
         self._ensure_private_directories()
 
     def _ensure_private_directories(self) -> None:
-        for path in (self.root, self.batch_root, self.current_root, self.cursor_root):
+        for path in (
+            self.root,
+            self.batch_root,
+            self.current_root,
+            self.cursor_root,
+            self.source_root,
+        ):
             path.mkdir(mode=0o700, parents=True, exist_ok=True)
             observed = path.lstat()
             if not stat.S_ISDIR(observed.st_mode) or observed.st_uid != os.getuid():
@@ -72,7 +81,9 @@ class LiveBatchSpool:
                 os.close(descriptor)
 
     @staticmethod
-    def _json_bytes(model: BatchEnvelope | ConsumerCursor | CurrentPointer) -> bytes:
+    def _json_bytes(
+        model: BatchEnvelope | ConsumerCursor | CurrentPointer | LiveSourceDescriptor,
+    ) -> bytes:
         return json.dumps(
             model.model_dump(mode="json"),
             ensure_ascii=True,
@@ -118,6 +129,52 @@ class LiveBatchSpool:
     def _current_path(self, channel: LiveChannel) -> Path:
         return self.current_root / f"{channel.value}.json"
 
+    def _source_path(self, channel: LiveChannel) -> Path:
+        return self.source_root / f"{channel.value}.json"
+
+    def _source_generation(self, channel: LiveChannel) -> str:
+        path = self._source_path(channel)
+        if not path.exists():
+            identity = LiveSourceDescriptor(
+                channel=channel,
+                generation_id=secrets.token_hex(32),
+                high_watermark=-1,
+            )
+            descriptor = -1
+            try:
+                descriptor = os.open(
+                    path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                )
+            except FileExistsError:
+                pass
+            else:
+                try:
+                    with os.fdopen(descriptor, "wb", closefd=True) as stream:
+                        descriptor = -1
+                        stream.write(self._json_bytes(identity))
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                finally:
+                    if descriptor >= 0:
+                        os.close(descriptor)
+                directory = os.open(
+                    path.parent,
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                )
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
+        try:
+            identity = LiveSourceDescriptor.model_validate_json(path.read_bytes())
+        except (OSError, ValueError) as exc:
+            raise LiveSpoolIntegrityError("live source identity is invalid") from exc
+        if identity.channel is not channel or identity.high_watermark != -1:
+            raise LiveSpoolIntegrityError("live source identity does not match channel")
+        return identity.generation_id
+
     def _cursor_path(self, consumer_id: str, channel: LiveChannel) -> Path:
         identity = canonical_sha256({"consumer_id": consumer_id, "channel": channel.value})
         return self.cursor_root / f"{identity}.json"
@@ -132,6 +189,7 @@ class LiveBatchSpool:
         }:
             raise LiveSpoolIntegrityError("batch quality cannot become current")
 
+        source_generation_id = self._source_generation(envelope.channel)
         with self._exclusive_lock():
             manifest_path = self._manifest_path(envelope.channel, envelope.sequence)
             payload_path = self._payload_path(envelope.channel, envelope.sequence)
@@ -154,6 +212,7 @@ class LiveBatchSpool:
             self._atomic_write(manifest_path, self._json_bytes(envelope))
             pointer = CurrentPointer(
                 channel=envelope.channel,
+                source_generation_id=source_generation_id,
                 batch_id=envelope.batch_id,
                 sequence=envelope.sequence,
                 revision=envelope.revision,
@@ -179,6 +238,7 @@ class LiveBatchSpool:
             raise LiveSpoolIntegrityError("immutable sequence already contains different content")
         return CurrentPointer(
             channel=stored.channel,
+            source_generation_id=self._source_generation(stored.channel),
             batch_id=stored.batch_id,
             sequence=stored.sequence,
             revision=stored.revision,
@@ -192,9 +252,20 @@ class LiveBatchSpool:
         if not path.exists():
             return None
         try:
-            return CurrentPointer.model_validate_json(path.read_bytes())
+            pointer = CurrentPointer.model_validate_json(path.read_bytes())
         except (OSError, ValueError) as exc:
             raise LiveSpoolIntegrityError("current pointer is invalid") from exc
+        if pointer.source_generation_id != self._source_generation(channel):
+            raise LiveSpoolIntegrityError("current pointer source generation changed")
+        return pointer
+
+    def source_descriptor(self, channel: LiveChannel) -> LiveSourceDescriptor:
+        current = self.current(channel)
+        return LiveSourceDescriptor(
+            channel=channel,
+            generation_id=self._source_generation(channel),
+            high_watermark=-1 if current is None else current.sequence,
+        )
 
     def list_after(self, channel: LiveChannel, *, sequence: int) -> tuple[LiveBatchRecord, ...]:
         records: list[LiveBatchRecord] = []
@@ -235,6 +306,8 @@ class LiveBatchSpool:
 
     def commit_cursor(self, cursor: ConsumerCursor) -> None:
         with self._exclusive_lock():
+            if cursor.source_generation_id != self._source_generation(cursor.channel):
+                raise LiveSpoolIntegrityError("consumer source generation changed")
             existing = self.load_cursor(cursor.consumer_id, cursor.channel)
             if existing is not None and cursor.last_sequence < existing.last_sequence:
                 raise LiveSpoolIntegrityError("consumer cursor cannot regress")
@@ -267,4 +340,6 @@ class LiveBatchSpool:
             raise LiveSpoolIntegrityError("consumer cursor is invalid") from exc
         if cursor.consumer_id != consumer_id or cursor.channel is not channel:
             raise LiveSpoolIntegrityError("consumer cursor identity mismatch")
+        if cursor.source_generation_id != self._source_generation(channel):
+            raise LiveSpoolIntegrityError("consumer source generation changed")
         return cursor

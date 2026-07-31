@@ -68,6 +68,40 @@ def test_publish_is_immutable_ordered_and_replay_idempotent(tmp_path: Path) -> N
     assert spool.read_payload(records[0]) == _payload(0)
 
 
+def test_channel_generation_is_stable_and_cursor_rejects_another_generation(
+    tmp_path: Path,
+) -> None:
+    first = LiveBatchSpool(tmp_path / "first")
+    reopened = LiveBatchSpool(tmp_path / "first")
+    rebuilt = LiveBatchSpool(tmp_path / "rebuilt")
+
+    assert reopened.source_descriptor(LiveChannel.MARKET_MINUTE) == first.source_descriptor(
+        LiveChannel.MARKET_MINUTE
+    )
+    assert (
+        rebuilt.source_descriptor(LiveChannel.MARKET_MINUTE).generation_id
+        != first.source_descriptor(LiveChannel.MARKET_MINUTE).generation_id
+    )
+
+    pointer = first.publish(_envelope(0), _payload(0))
+    descriptor = first.source_descriptor(LiveChannel.MARKET_MINUTE)
+    assert pointer.source_generation_id == descriptor.generation_id
+    assert descriptor.high_watermark == 0
+
+    with pytest.raises(LiveSpoolIntegrityError, match="generation"):
+        first.commit_cursor(
+            ConsumerCursor(
+                consumer_id="feature-worker",
+                channel=LiveChannel.MARKET_MINUTE,
+                source_generation_id="b" * 64,
+                last_sequence=0,
+                last_batch_id=pointer.batch_id,
+                last_content_sha256=pointer.content_sha256,
+                updated_at=NOW,
+            )
+        )
+
+
 def test_publish_rejects_sequence_gap_and_conflicting_replay(tmp_path: Path) -> None:
     spool = LiveBatchSpool(tmp_path / "live")
     spool.publish(_envelope(0), _payload(0))
@@ -122,6 +156,7 @@ def test_consumer_cursor_is_persisted_independently_and_cannot_regress(
     cursor = ConsumerCursor(
         consumer_id="strategy-growth",
         channel=LiveChannel.MARKET_MINUTE,
+        source_generation_id=spool.source_descriptor(LiveChannel.MARKET_MINUTE).generation_id,
         last_sequence=pointer.sequence,
         last_batch_id=pointer.batch_id,
         last_content_sha256=pointer.content_sha256,
