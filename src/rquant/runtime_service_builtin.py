@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
@@ -147,7 +148,11 @@ def market_minute_source_builder(
 def _default_adapter_factory() -> MarketMinuteAdapter:
     from rquant.adapter.tushare import TushareAdapter
 
-    return TushareAdapter()
+    token = os.environ.get("TUSHARE_TOKEN_MAIN", "").strip()
+    if not token:
+        raise RuntimeError("TUSHARE_TOKEN_MAIN capability is required")
+    backup_token = os.environ.get("TUSHARE_TOKEN_BACKUP", "").strip() or None
+    return TushareAdapter(token=token, backup_token=backup_token)
 
 
 def _default_universe_loader() -> tuple[str, ...]:

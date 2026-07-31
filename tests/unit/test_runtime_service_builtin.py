@@ -7,6 +7,7 @@ import pandas as pd
 import pytest
 from pydantic import ValidationError
 
+from rquant import runtime_service_builtin as builtin_module
 from rquant.live_contracts import LiveChannel
 from rquant.live_spool import LiveBatchSpool
 from rquant.market_minute_gateway import MarketMinuteGateway
@@ -256,3 +257,29 @@ def test_builtin_registry_rejects_partial_router_dependencies() -> None:
             clock=lambda: NOW,
             signal_source_loader=lambda _source_id: object(),  # type: ignore[arg-type]
         )
+
+
+def test_default_adapter_factory_uses_only_scoped_token_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    class Adapter:
+        def __init__(self, token: str, backup_token: str | None = None) -> None:
+            observed.update(token=token, backup_token=backup_token)
+
+    monkeypatch.setenv("TUSHARE_TOKEN_MAIN", "main-token")
+    monkeypatch.setenv("TUSHARE_TOKEN_BACKUP", "backup-token")
+    monkeypatch.setattr("rquant.adapter.tushare.TushareAdapter", Adapter)
+
+    assert isinstance(builtin_module._default_adapter_factory(), Adapter)
+    assert observed == {"token": "main-token", "backup_token": "backup-token"}
+
+
+def test_default_adapter_factory_requires_source_capability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("TUSHARE_TOKEN_MAIN", raising=False)
+
+    with pytest.raises(RuntimeError, match="TUSHARE_TOKEN_MAIN"):
+        builtin_module._default_adapter_factory()

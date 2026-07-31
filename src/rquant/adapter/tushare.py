@@ -12,19 +12,36 @@ import pandas as pd
 import tushare as ts
 from loguru import logger
 
-from rquant.config import settings
 from rquant.trade_calendar import normalize_trade_calendar
 
 # 分页取数 / 多指数循环时相邻请求间隔（对齐 dataset_backfill._API_SLEEP）
 _PAGE_SLEEP = 0.35
 
 
+class _LazySettingsProxy:
+    def __getattr__(self, name: str) -> object:
+        from rquant.config import settings as configured_settings
+
+        return getattr(configured_settings, name)
+
+
+settings = _LazySettingsProxy()
+
+
 class TushareAdapter:
     """Tushare Pro 封装。主 token 失败时自动切备用 token 重试一次。"""
 
-    def __init__(self, token: str | None = None) -> None:
+    def __init__(
+        self,
+        token: str | None = None,
+        backup_token: str | None = None,
+    ) -> None:
         self._primary_token = token or settings.tushare_token_main
-        self._backup_token = settings.tushare_token_backup
+        self._backup_token = (
+            backup_token
+            if backup_token is not None
+            else settings.tushare_token_backup
+        )
         self._pro = ts.pro_api(self._primary_token)
         self._using_backup = False
 
