@@ -70,6 +70,7 @@ class RuntimeStepResult(RuntimeContractModel):
     processed_count: int = Field(default=0, ge=0)
     backlog_count: int = Field(default=0, ge=0)
     source_generations: Mapping[str, Sha256] = Field(default_factory=dict)
+    degraded_reasons: tuple[str, ...] = ()
 
     @field_validator("source_generations")
     @classmethod
@@ -81,6 +82,15 @@ class RuntimeStepResult(RuntimeContractModel):
     @field_serializer("source_generations")
     def serialize_source_generations(self, value: Mapping[str, str]) -> dict[str, str]:
         return dict(value)
+
+    @field_validator("degraded_reasons")
+    @classmethod
+    def validate_degraded_reasons(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if any(not reason for reason in value):
+            raise ValueError("degraded reasons cannot be empty")
+        if len(value) != len(set(value)):
+            raise ValueError("degraded reasons must be unique")
+        return tuple(sorted(value))
 
 
 class RuntimeServiceHeartbeat(RuntimeContractModel):
@@ -101,6 +111,7 @@ class RuntimeServiceHeartbeat(RuntimeContractModel):
     total_failures: int = Field(default=0, ge=0)
     total_successes: int = Field(default=0, ge=0)
     source_generations: Mapping[str, Sha256] = Field(default_factory=dict)
+    degraded_reasons: tuple[str, ...] = ()
     last_error: str | None = None
     stop_reason: str | None = None
 
@@ -114,6 +125,15 @@ class RuntimeServiceHeartbeat(RuntimeContractModel):
     @field_serializer("source_generations")
     def serialize_source_generations(self, value: Mapping[str, str]) -> dict[str, str]:
         return dict(value)
+
+    @field_validator("degraded_reasons")
+    @classmethod
+    def validate_degraded_reasons(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if any(not reason for reason in value):
+            raise ValueError("degraded reasons cannot be empty")
+        if len(value) != len(set(value)):
+            raise ValueError("degraded reasons must be unique")
+        return tuple(sorted(value))
 
     @model_validator(mode="after")
     def validate_status(self) -> Self:
@@ -275,7 +295,11 @@ class RuntimeServiceControl:
         return self._publish(
             self._validated_update(
                 current,
-                status=RuntimeServiceStatus.RUNNING,
+                status=(
+                    RuntimeServiceStatus.DEGRADED
+                    if result.degraded_reasons
+                    else RuntimeServiceStatus.RUNNING
+                ),
                 heartbeat_at=now,
                 last_success_at=now,
                 input_sequence=result.input_sequence,
@@ -285,6 +309,7 @@ class RuntimeServiceControl:
                 consecutive_failures=0,
                 total_successes=current.total_successes + 1,
                 source_generations=result.source_generations,
+                degraded_reasons=result.degraded_reasons,
                 last_error=None,
             )
         )
@@ -298,6 +323,7 @@ class RuntimeServiceControl:
                 heartbeat_at=normalize_aware_utc(self._clock()),
                 consecutive_failures=current.consecutive_failures + 1,
                 total_failures=current.total_failures + 1,
+                degraded_reasons=(),
                 last_error=_error_text(error),
             )
         )

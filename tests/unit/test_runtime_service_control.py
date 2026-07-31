@@ -72,6 +72,33 @@ def test_success_and_failure_heartbeats_preserve_monotonic_watermarks(tmp_path: 
     control.stop(reason="test complete")
 
 
+def test_successful_degraded_step_keeps_watermarks_and_health_reason(tmp_path: Path) -> None:
+    control = RuntimeServiceControl(tmp_path, spec=_spec(), clock=lambda: NOW)
+    control.start()
+
+    degraded = control.record_success(
+        RuntimeStepResult(
+            input_sequence=3,
+            output_sequence=4,
+            processed_count=1,
+            degraded_reasons=("source_stale:TimeoutError",),
+        )
+    )
+    recovered = control.record_success(
+        RuntimeStepResult(input_sequence=4, output_sequence=5, processed_count=1)
+    )
+
+    assert degraded.status is RuntimeServiceStatus.DEGRADED
+    assert degraded.degraded_reasons == ("source_stale:TimeoutError",)
+    assert degraded.input_sequence == 3
+    assert degraded.output_sequence == 4
+    assert degraded.total_successes == 1
+    assert degraded.total_failures == 0
+    assert recovered.status is RuntimeServiceStatus.RUNNING
+    assert recovered.degraded_reasons == ()
+    control.stop(reason="test complete")
+
+
 def test_loop_isolates_ordinary_step_failure_and_recovers(tmp_path: Path) -> None:
     ticks = iter(
         (
