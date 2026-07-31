@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import json
 import os
+import secrets
 import stat
 import tempfile
 from collections.abc import Iterator
@@ -15,6 +16,7 @@ from pathlib import Path
 from threading import RLock
 from typing import Annotated
 
+import pandas as pd
 from pydantic import Field, StringConstraints, model_validator
 
 from rquant.feature_contracts import FeatureBatchEnvelope
@@ -28,6 +30,7 @@ class FeatureSpoolIntegrityError(RuntimeError):
 
 
 class FeatureCurrentPointer(RuntimeContractModel):
+    source_generation_id: Sha256
     batch_id: str = Field(min_length=1)
     sequence: int = Field(ge=0)
     content_hash: Sha256
@@ -36,6 +39,7 @@ class FeatureCurrentPointer(RuntimeContractModel):
 
 class FeatureConsumerCursor(RuntimeContractModel):
     consumer_id: str = Field(min_length=1)
+    source_generation_id: Sha256
     last_sequence: int = Field(ge=-1)
     last_batch_id: str | None = Field(default=None, min_length=1)
     last_content_hash: Sha256 | None = None
@@ -61,6 +65,31 @@ class FeatureBatchRecord:
     payload_path: Path
 
 
+@dataclass(frozen=True)
+class StoredFeatureResult:
+    envelope: FeatureBatchEnvelope
+    payload_json: str
+
+    @property
+    def frame(self) -> pd.DataFrame:
+        payload = json.loads(self.payload_json)
+        frame = pd.DataFrame(payload["rows"])
+        if "feature_time" in frame:
+            frame["feature_time"] = pd.to_datetime(frame["feature_time"], utc=True)
+        return frame
+
+
+class FeatureSourceDescriptor(RuntimeContractModel):
+    source_id: str = "feature-spool/global-sequence/v1"
+    generation_id: Sha256
+    first_sequence: int = 0
+    high_watermark: int = Field(ge=-1)
+
+
+class _FeatureSourceIdentity(RuntimeContractModel):
+    generation_id: Sha256
+
+
 class FeatureBatchSpool:
     """Single feature publisher with independent durable consumer cursors."""
 
@@ -69,9 +98,11 @@ class FeatureBatchSpool:
         self.batch_root = self.root / "batches"
         self.cursor_root = self.root / "cursors"
         self.current_path = self.root / "current.json"
+        self._identity_path = self.root / "source-identity.json"
         self._lock_path = self.root / ".feature-spool.lock"
         self._thread_lock = RLock()
         self._ensure_private_directories()
+        self._source_identity = self._initialize_source_identity()
 
     def _ensure_private_directories(self) -> None:
         for path in (self.root, self.batch_root, self.cursor_root):
@@ -138,6 +169,19 @@ class FeatureBatchSpool:
         identity = canonical_sha256({"consumer_id": consumer_id, "spool": "feature/v1"})
         return self.cursor_root / f"{identity}.json"
 
+    def _initialize_source_identity(self) -> _FeatureSourceIdentity:
+        with self._exclusive_lock():
+            if self._identity_path.exists():
+                try:
+                    return _FeatureSourceIdentity.model_validate_json(
+                        self._identity_path.read_bytes()
+                    )
+                except (OSError, ValueError) as exc:
+                    raise FeatureSpoolIntegrityError("feature source identity is invalid") from exc
+            identity = _FeatureSourceIdentity(generation_id=secrets.token_hex(32))
+            self._atomic_write(self._identity_path, self._model_bytes(identity))
+            return identity
+
     @staticmethod
     def _validate_payload(envelope: FeatureBatchEnvelope, payload: bytes) -> None:
         if hashlib.sha256(payload).hexdigest() != envelope.content_hash:
@@ -179,7 +223,18 @@ class FeatureBatchSpool:
                     raise FeatureSpoolIntegrityError(
                         "immutable feature sequence already contains different content"
                     )
-                return self._pointer(existing)
+                pointer = self._pointer(existing)
+                if self.current() is None:
+                    sequences = sorted(
+                        FeatureBatchEnvelope.model_validate_json(path.read_bytes()).sequence
+                        for path in self.batch_root.glob("*.json")
+                    )
+                    if sequences != list(range(envelope.sequence + 1)):
+                        raise FeatureSpoolIntegrityError(
+                            "cannot recover current from a non-contiguous latest batch"
+                        )
+                    self._atomic_write(self.current_path, self._model_bytes(pointer))
+                return pointer
 
             current = self.current()
             expected = 0 if current is None else current.sequence + 1
@@ -193,9 +248,9 @@ class FeatureBatchSpool:
             self._atomic_write(self.current_path, self._model_bytes(pointer))
             return pointer
 
-    @staticmethod
-    def _pointer(envelope: FeatureBatchEnvelope) -> FeatureCurrentPointer:
+    def _pointer(self, envelope: FeatureBatchEnvelope) -> FeatureCurrentPointer:
         return FeatureCurrentPointer(
+            source_generation_id=self._source_identity.generation_id,
             batch_id=envelope.batch_id,
             sequence=envelope.sequence,
             content_hash=envelope.content_hash,
@@ -206,20 +261,51 @@ class FeatureBatchSpool:
         if not self.current_path.exists():
             return None
         try:
-            return FeatureCurrentPointer.model_validate_json(self.current_path.read_bytes())
+            pointer = FeatureCurrentPointer.model_validate_json(self.current_path.read_bytes())
         except (OSError, ValueError) as exc:
             raise FeatureSpoolIntegrityError("feature current pointer is invalid") from exc
+        if pointer.source_generation_id != self._source_identity.generation_id:
+            raise FeatureSpoolIntegrityError("feature current pointer generation changed")
+        return pointer
 
-    def list_after(self, *, sequence: int) -> tuple[FeatureBatchRecord, ...]:
+    def source_descriptor(self) -> FeatureSourceDescriptor:
+        current = self.current()
+        return FeatureSourceDescriptor(
+            generation_id=self._source_identity.generation_id,
+            high_watermark=-1 if current is None else current.sequence,
+        )
+
+    def list_after(
+        self,
+        *,
+        sequence: int,
+        through_sequence: int | None = None,
+        limit: int | None = None,
+    ) -> tuple[FeatureBatchRecord, ...]:
         if sequence < -1:
             raise ValueError("sequence cannot be less than -1")
+        if through_sequence is not None and through_sequence < sequence:
+            raise ValueError("through_sequence cannot precede sequence")
+        if limit is not None and limit < 1:
+            raise ValueError("limit must be positive")
+        current = self.current()
+        if current is None:
+            if any(self.batch_root.glob("*.json")):
+                raise FeatureSpoolIntegrityError("feature current pointer is missing")
+            return ()
+        through = current.sequence if through_sequence is None else through_sequence
+        if through > current.sequence:
+            raise FeatureSpoolIntegrityError(
+                "requested high watermark exceeds feature source high watermark"
+            )
+        read_through = through if limit is None else min(through, sequence + limit)
         records: list[FeatureBatchRecord] = []
         for path in sorted(self.batch_root.glob("*.json")):
             try:
                 envelope = FeatureBatchEnvelope.model_validate_json(path.read_bytes())
             except (OSError, ValueError) as exc:
                 raise FeatureSpoolIntegrityError(f"invalid feature manifest: {path.name}") from exc
-            if envelope.sequence > sequence:
+            if sequence < envelope.sequence <= read_through:
                 records.append(
                     FeatureBatchRecord(
                         envelope=envelope,
@@ -227,14 +313,9 @@ class FeatureBatchSpool:
                         payload_path=self._payload_path(envelope.sequence),
                     )
                 )
-        current = self.current()
-        if current is None:
-            if records:
-                raise FeatureSpoolIntegrityError("feature current pointer is missing")
-            return ()
-        if sequence >= current.sequence:
+        if sequence >= read_through:
             return tuple(records)
-        expected = list(range(max(sequence + 1, 0), current.sequence + 1))
+        expected = list(range(max(sequence + 1, 0), read_through + 1))
         observed = [record.envelope.sequence for record in records]
         if observed != expected:
             raise FeatureSpoolIntegrityError(
@@ -250,8 +331,18 @@ class FeatureBatchSpool:
         self._validate_payload(record.envelope, payload)
         return payload
 
+    def read_result(self, record: FeatureBatchRecord) -> StoredFeatureResult:
+        payload = self.read_payload(record)
+        try:
+            payload_json = payload.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise FeatureSpoolIntegrityError("feature payload is not UTF-8") from exc
+        return StoredFeatureResult(envelope=record.envelope, payload_json=payload_json)
+
     def commit_cursor(self, cursor: FeatureConsumerCursor) -> None:
         with self._exclusive_lock():
+            if cursor.source_generation_id != self._source_identity.generation_id:
+                raise FeatureSpoolIntegrityError("feature consumer source generation changed")
             existing = self.load_cursor(cursor.consumer_id)
             if existing is not None and cursor.last_sequence < existing.last_sequence:
                 raise FeatureSpoolIntegrityError("feature consumer cursor cannot regress")
@@ -283,6 +374,8 @@ class FeatureBatchSpool:
             raise FeatureSpoolIntegrityError("feature consumer cursor is invalid") from exc
         if cursor.consumer_id != consumer_id:
             raise FeatureSpoolIntegrityError("feature consumer identity mismatch")
+        if cursor.source_generation_id != self._source_identity.generation_id:
+            raise FeatureSpoolIntegrityError("feature consumer source generation changed")
         return cursor
 
 
@@ -292,4 +385,6 @@ __all__ = [
     "FeatureConsumerCursor",
     "FeatureCurrentPointer",
     "FeatureSpoolIntegrityError",
+    "FeatureSourceDescriptor",
+    "StoredFeatureResult",
 ]
