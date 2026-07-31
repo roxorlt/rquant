@@ -247,6 +247,8 @@ class StrategyCandidateSnapshotSpool:
         self.current_path = self.root / "current.json"
         self._lock_path = self.root / ".publish.lock"
         self._thread_lock = RLock()
+        self._generation_states: dict[str, tuple[int, ...]] = {}
+        self._generation_snapshots: dict[str, StrategyCandidateSnapshot] = {}
 
     def publish(self, snapshot: StrategyCandidateSnapshot) -> StrategyCandidateSnapshot:
         if not isinstance(snapshot, StrategyCandidateSnapshot):
@@ -538,6 +540,7 @@ class StrategyCandidateSnapshotSpool:
 
     def _read_all_generations(self, generations_fd: int) -> dict[int, StrategyCandidateSnapshot]:
         generations: dict[int, StrategyCandidateSnapshot] = {}
+        observed_names: set[str] = set()
         try:
             with os.scandir(generations_fd) as entries:
                 for index, entry in enumerate(entries, start=1):
@@ -550,7 +553,37 @@ class StrategyCandidateSnapshotSpool:
                         raise StrategyCandidateSnapshotIntegrityError(
                             "strategy candidate generations contain an unexpected entry"
                         )
-                    snapshot = self._read_snapshot(generations_fd, entry.name)
+                    observed = entry.stat(follow_symlinks=False)
+                    if stat.S_ISLNK(observed.st_mode):
+                        raise StrategyCandidateSnapshotIntegrityError(
+                            "generation cannot be a symlink"
+                        )
+                    self._validate_private_file(observed, label="generation")
+                    state = self._cache_state(observed)
+                    cached_state = self._generation_states.get(entry.name)
+                    if cached_state is None:
+                        snapshot = self._read_snapshot(generations_fd, entry.name)
+                        active = os.stat(
+                            entry.name,
+                            dir_fd=generations_fd,
+                            follow_symlinks=False,
+                        )
+                        if self._cache_state(active) != state:
+                            raise StrategyCandidateSnapshotIntegrityError(
+                                "generation changed while populating cache"
+                            )
+                    else:
+                        if cached_state != state:
+                            raise StrategyCandidateSnapshotIntegrityError(
+                                "immutable generation changed after validation"
+                            )
+                        self._validate_cached_generation(
+                            generations_fd,
+                            entry.name,
+                            expected_state=state,
+                        )
+                        snapshot = self._generation_snapshots[entry.name]
+                    observed_names.add(entry.name)
                     if snapshot.content_sha256 != match.group(1):
                         raise StrategyCandidateSnapshotIntegrityError(
                             "generation filename does not match content_sha256"
@@ -560,15 +593,67 @@ class StrategyCandidateSnapshotSpool:
                             "duplicate generation sequence conflict"
                         )
                     generations[snapshot.sequence] = snapshot
+                    self._generation_states[entry.name] = state
+                    self._generation_snapshots[entry.name] = snapshot
         except OSError as exc:
             raise StrategyCandidateSnapshotIntegrityError(
                 "strategy candidate generations are unreadable"
             ) from exc
+        if set(self._generation_states) - observed_names:
+            raise StrategyCandidateSnapshotIntegrityError(
+                "generation sequence is missing a previously validated entry"
+            )
         if generations and sorted(generations) != list(range(max(generations) + 1)):
             raise StrategyCandidateSnapshotIntegrityError(
                 "generation sequence has a missing or conflicting entry"
             )
         return generations
+
+    @staticmethod
+    def _cache_state(observed: os.stat_result) -> tuple[int, ...]:
+        return (
+            observed.st_dev,
+            observed.st_ino,
+            observed.st_mode,
+            observed.st_uid,
+            observed.st_nlink,
+            observed.st_size,
+            observed.st_mtime_ns,
+            observed.st_ctime_ns,
+        )
+
+    @classmethod
+    def _validate_cached_generation(
+        cls,
+        parent_fd: int,
+        name: str,
+        *,
+        expected_state: tuple[int, ...],
+    ) -> None:
+        descriptor = -1
+        try:
+            descriptor = os.open(
+                name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_fd,
+            )
+            opened = os.fstat(descriptor)
+            active = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            cls._validate_private_file(opened, label="generation")
+            if (
+                cls._cache_state(opened) != expected_state
+                or cls._cache_state(active) != expected_state
+            ):
+                raise StrategyCandidateSnapshotIntegrityError(
+                    "immutable generation changed after validation"
+                )
+        except OSError as exc:
+            raise StrategyCandidateSnapshotIntegrityError(
+                "cached generation is missing or unsafe"
+            ) from exc
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
 
     def _validate_current_pointer(
         self,

@@ -286,6 +286,75 @@ def test_new_reader_lifecycle_does_not_write(tmp_path: Path) -> None:
     assert _tree_state(root) == before
 
 
+def test_repeated_reads_cache_validated_immutable_generations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = (tmp_path / "spool").resolve()
+    writer = StrategyCandidateSnapshotSpool(root)
+    writer.publish(_snapshot(sequence=0))
+    reader = StrategyCandidateSnapshotSpool(root)
+    original = reader._read_snapshot
+    read_names: list[str] = []
+
+    def counting_read(parent_fd: int, name: str) -> StrategyCandidateSnapshot:
+        read_names.append(name)
+        return original(parent_fd, name)
+
+    monkeypatch.setattr(reader, "_read_snapshot", counting_read)
+    reader.read_as_of(CAPTURED_AT + timedelta(minutes=1))
+    reader.read_as_of(CAPTURED_AT + timedelta(minutes=1))
+
+    assert len(read_names) == 1
+
+    writer.publish(
+        _snapshot(
+            sequence=1,
+            captured_at=CAPTURED_AT + timedelta(minutes=2),
+            rows=(
+                _row(
+                    variant="pool2",
+                    decision_at=CAPTURED_AT + timedelta(minutes=1),
+                    available_at=CAPTURED_AT + timedelta(minutes=1),
+                ),
+            ),
+        )
+    )
+    reader.read_as_of(CAPTURED_AT + timedelta(minutes=3))
+
+    assert len(read_names) == 2
+
+
+@pytest.mark.parametrize("mutation", ["delete", "content", "mode", "inode"])
+def test_cached_generation_mutation_fails_closed(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    root = (tmp_path / mutation).resolve()
+    writer = StrategyCandidateSnapshotSpool(root)
+    snapshot = _snapshot()
+    writer.publish(snapshot)
+    reader = StrategyCandidateSnapshotSpool(root)
+    assert reader.read_as_of(CAPTURED_AT + timedelta(minutes=1)) == snapshot
+    generation = root / "generations" / f"{snapshot.content_sha256}.json"
+
+    if mutation == "delete":
+        generation.unlink()
+    elif mutation == "content":
+        generation.write_bytes(generation.read_bytes() + b" ")
+        os.chmod(generation, 0o600)
+    elif mutation == "mode":
+        generation.chmod(0o640)
+    else:
+        payload = generation.read_bytes()
+        generation.unlink()
+        generation.write_bytes(payload)
+        generation.chmod(0o600)
+
+    with pytest.raises(StrategyCandidateSnapshotIntegrityError):
+        reader.read_as_of(CAPTURED_AT + timedelta(minutes=1))
+
+
 @pytest.mark.parametrize("target", ["generation", "pointer"])
 def test_content_and_pointer_tampering_fail_closed(tmp_path: Path, target: str) -> None:
     spool = StrategyCandidateSnapshotSpool((tmp_path / "spool").resolve())
