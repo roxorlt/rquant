@@ -48,6 +48,7 @@ class MarketMinuteSourceSettings(RuntimeContractModel):
     quota_path: Path
     quota_units_per_window: StrictInt = Field(gt=0)
     quota_cost_per_request: StrictInt = Field(default=1, gt=0)
+    max_codes_per_source_call: StrictInt = Field(default=300, gt=0, le=300)
     producer_version: str = Field(min_length=1)
     source: str = Field(default="tushare.rt_min", min_length=1)
     dataset_id: str = Field(default="market_minute", min_length=1)
@@ -94,9 +95,29 @@ def market_minute_source_builder(
         adapter = adapter_factory()
         spool = LiveBatchSpool(settings.spool_root)
         quota_store = SourceQuotaStore(settings.quota_path)
+
+        def fetch_current_universe() -> pd.DataFrame:
+            call_count = (
+                len(universe) + settings.max_codes_per_source_call - 1
+            ) // settings.max_codes_per_source_call
+            if call_count > settings.quota_cost_per_request:
+                raise RuntimeError(
+                    "market-minute source call budget is below the current universe"
+                )
+            frames: list[pd.DataFrame] = []
+            for start in range(0, len(universe), settings.max_codes_per_source_call):
+                batch = universe[start : start + settings.max_codes_per_source_call]
+                frame = adapter.rt_min(list(batch), freq="1min")
+                if not isinstance(frame, pd.DataFrame):
+                    raise TypeError("market-minute adapter must return a DataFrame")
+                frames.append(frame)
+            if len(frames) == 1:
+                return frames[0]
+            return pd.concat(frames, ignore_index=True)
+
         gateway = MarketMinuteGateway(
             spool=spool,
-            fetcher=lambda: adapter.rt_min(list(universe), freq="1min"),
+            fetcher=fetch_current_universe,
             config=MarketMinuteGatewayConfig(
                 source=settings.source,
                 dataset_id=settings.dataset_id,
@@ -108,7 +129,14 @@ def market_minute_source_builder(
             quota_store=quota_store,
         )
 
+        first_step = True
+
         def step() -> RuntimeStepResult:
+            nonlocal first_step, universe
+            if first_step:
+                first_step = False
+            else:
+                universe = _load_universe(universe_loader)
             return capture_market_minute_step(gateway, received_at=clock())
 
         return step

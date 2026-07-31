@@ -7,6 +7,9 @@ import pandas as pd
 import pytest
 from pydantic import ValidationError
 
+from rquant.live_contracts import LiveChannel
+from rquant.live_spool import LiveBatchSpool
+from rquant.market_minute_gateway import MarketMinuteGateway
 from rquant.runtime_service_builtin import (
     build_builtin_registry,
     market_minute_source_builder,
@@ -35,6 +38,29 @@ class _Adapter:
                     "vol": 1_000.0,
                     "amount": 10_100.0,
                 }
+            ]
+        )
+
+
+class _UniverseAdapter:
+    def __init__(self) -> None:
+        self.calls: list[tuple[tuple[str, ...], str]] = []
+
+    def rt_min(self, codes: list[str], freq: str = "1min") -> pd.DataFrame:
+        self.calls.append((tuple(codes), freq))
+        return pd.DataFrame(
+            [
+                {
+                    "ts_code": code,
+                    "trade_time": "2026-07-31 09:40:00",
+                    "open": 10.0,
+                    "high": 10.2,
+                    "low": 9.9,
+                    "close": 10.1,
+                    "vol": 1_000.0,
+                    "amount": 10_100.0,
+                }
+                for code in codes
             ]
         )
 
@@ -71,6 +97,81 @@ def test_source_builder_uses_one_sorted_universe_and_shared_quota(tmp_path: Path
     assert result.processed_count == 1
     assert result.output_sequence == 0
     assert (tmp_path / "quota.sqlite3").is_file()
+
+
+def test_source_builder_reloads_universe_between_steps(tmp_path: Path) -> None:
+    adapter = _UniverseAdapter()
+    universes = iter(
+        [
+            ["600000.SH"],
+            ["600001.SH", "600000.SH"],
+            ["600002.SH"],
+        ]
+    )
+    builder = market_minute_source_builder(
+        adapter_factory=lambda: adapter,
+        universe_loader=lambda: next(universes),
+        clock=lambda: NOW,
+    )
+
+    step = builder(_manifest(tmp_path))
+    step()
+    step()
+
+    assert adapter.calls == [
+        (("600000.SH",), "1min"),
+        (("600000.SH", "600001.SH"), "1min"),
+    ]
+
+
+def test_source_builder_chunks_large_universe_with_one_atomic_output(
+    tmp_path: Path,
+) -> None:
+    adapter = _UniverseAdapter()
+    codes = [f"{index:06d}.SH" for index in range(305)]
+    manifest = _manifest(tmp_path).model_copy(
+        update={
+            "settings": {
+                **_manifest(tmp_path).model_dump(mode="json")["settings"],
+                "quota_cost_per_request": 2,
+                "max_codes_per_source_call": 300,
+            }
+        }
+    )
+    step = market_minute_source_builder(
+        adapter_factory=lambda: adapter,
+        universe_loader=lambda: codes,
+        clock=lambda: NOW,
+    )(manifest)
+
+    result = step()
+
+    assert [len(call[0]) for call in adapter.calls] == [300, 5]
+    assert result.processed_count == 1
+    assert result.output_sequence == 0
+    spool = LiveBatchSpool(tmp_path / "live")
+    record = spool.list_after(LiveChannel.MARKET_MINUTE, sequence=-1)[0]
+    assert len(MarketMinuteGateway.decode_payload(spool.read_payload(record))) == 305
+
+
+def test_source_builder_fails_closed_before_partial_fetch_when_call_budget_is_too_low(
+    tmp_path: Path,
+) -> None:
+    adapter = _UniverseAdapter()
+    codes = [f"{index:06d}.SH" for index in range(301)]
+    step = market_minute_source_builder(
+        adapter_factory=lambda: adapter,
+        universe_loader=lambda: codes,
+        clock=lambda: NOW,
+    )(_manifest(tmp_path))
+
+    result = step()
+
+    assert adapter.calls == []
+    assert result.processed_count == 1
+    assert result.degraded_reasons == (
+        "market_minute:stale:source_error:RuntimeError",
+    )
 
 
 def test_source_builder_rejects_empty_universe_wrong_kind_or_relative_path(
