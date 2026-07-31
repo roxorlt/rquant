@@ -532,3 +532,106 @@ class ServingPublisher:
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
+
+
+class ServingReader:
+    """Read one verified serving generation without mutating its filesystem."""
+
+    def __init__(self, root: str | Path) -> None:
+        self.root = Path(root)
+        if self.root.is_symlink():
+            raise ServingIntegrityError("serving root cannot be a symlink")
+        if not self.root.is_dir():
+            raise ServingIntegrityError("serving root is missing or is not a directory")
+        self.generations_root = self.root / "generations"
+        self.current_path = self.root / "current.json"
+
+    def current_pointer(self) -> ServingCurrentPointer:
+        """Return the current selector after validating its file identity."""
+
+        return self._read_pointer_file(self.current_path)
+
+    def current_manifest(self) -> ServingGenerationManifest:
+        """Return the manifest cryptographically bound to the current selector."""
+
+        return self._read_manifest_for_pointer(self.current_pointer())
+
+    def open_current_readonly(self) -> duckdb.DuckDBPyConnection:
+        """Verify and open the current DuckDB generation in read-only mode."""
+
+        manifest = self.current_manifest()
+        database_path = self._database_path(manifest.generation_id)
+        content_sha256, identity = ServingPublisher._hash_regular_file(
+            database_path,
+            label="database",
+        )
+        if content_sha256 != manifest.content_sha256:
+            raise ServingIntegrityError("database content hash does not match manifest")
+
+        try:
+            connection = duckdb.connect(str(database_path), read_only=True)
+        except (duckdb.Error, OSError) as exc:
+            raise ServingIntegrityError("current database is not queryable") from exc
+        try:
+            current_sha256, current_identity = ServingPublisher._hash_regular_file(
+                database_path,
+                label="database",
+            )
+            if current_identity != identity or current_sha256 != content_sha256:
+                raise ServingIntegrityError("database identity changed while opening")
+            ServingPublisher._verify_open_connection(self, connection, manifest.row_counts)
+        except Exception:
+            connection.close()
+            raise
+        return connection
+
+    def _database_path(self, generation_id: str) -> Path:
+        if not _SHA256.fullmatch(generation_id):
+            raise ServingIntegrityError("generation id is not a SHA-256 digest")
+        if self.generations_root.is_symlink() or not self.generations_root.is_dir():
+            raise ServingIntegrityError("generations root is missing or unsafe")
+        generation_path = self.generations_root / generation_id
+        if generation_path.is_symlink() or not generation_path.is_dir():
+            raise ServingIntegrityError("current generation directory is missing or unsafe")
+        database_path = generation_path / "serving.duckdb"
+        if not database_path.exists():
+            raise ServingIntegrityError("current database is missing")
+        return database_path
+
+    def _read_manifest_for_pointer(
+        self,
+        pointer: ServingCurrentPointer,
+    ) -> ServingGenerationManifest:
+        generation_path = self.generations_root / pointer.generation_id
+        if generation_path.is_symlink() or not generation_path.is_dir():
+            raise ServingIntegrityError("current generation directory is missing or unsafe")
+        manifest = self._read_manifest_file(generation_path / "manifest.json")
+        if manifest.generation_id != pointer.generation_id:
+            raise ServingIntegrityError("manifest generation id does not match current pointer")
+        if canonical_sha256(manifest) != pointer.manifest_sha256:
+            raise ServingIntegrityError("manifest hash does not match current pointer")
+        return manifest
+
+    @staticmethod
+    def _read_pointer_file(path: Path) -> ServingCurrentPointer:
+        try:
+            payload = ServingPublisher._read_regular_file(path, label="current pointer")
+            return ServingCurrentPointer.model_validate_json(payload)
+        except ServingIntegrityError:
+            raise
+        except Exception as exc:
+            raise ServingIntegrityError("current pointer is invalid") from exc
+
+    @staticmethod
+    def _read_manifest_file(path: Path) -> ServingGenerationManifest:
+        try:
+            payload = ServingPublisher._read_regular_file(path, label="manifest")
+            return ServingGenerationManifest.model_validate_json(payload)
+        except ServingIntegrityError:
+            raise
+        except Exception as exc:
+            raise ServingIntegrityError("manifest is invalid") from exc
+
+    @staticmethod
+    def _quote_identifier(identifier: str) -> str:
+        return ServingPublisher._quote_identifier(identifier)
