@@ -24,7 +24,7 @@ from rquant.signal_bus import (
     routing_decision_fingerprint,
 )
 from rquant.signal_contracts import SignalEnvelope
-from rquant.strategy_runner import RunnerSignalRecord
+from rquant.strategy_runner import RunnerSignalRecord, StrategyRunnerStore
 
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 
@@ -101,6 +101,29 @@ class RunnerSignalSource(Protocol):
     def descriptor(self) -> RouteSourceDescriptor: ...
 
     def signals_after(self, *, sequence: int) -> tuple[RunnerSignalRecord, ...]: ...
+
+
+class StrategyRunnerSignalSource:
+    """Expose one durable strategy runner spool through the routing source contract."""
+
+    def __init__(self, *, source_id: str, store: StrategyRunnerStore) -> None:
+        normalized = source_id.strip()
+        if not normalized:
+            raise ValueError("source_id must not be empty")
+        self.source_id = normalized
+        self.store = store
+
+    def descriptor(self) -> RouteSourceDescriptor:
+        return RouteSourceDescriptor(
+            source_id=self.source_id,
+            generation_id=self.store.source_generation_id,
+            strategy_spec_fingerprint=self.store.spec.spec_fingerprint,
+            first_sequence=1,
+            high_watermark=self.store.signal_high_watermark(),
+        )
+
+    def signals_after(self, *, sequence: int) -> tuple[RunnerSignalRecord, ...]:
+        return self.store.signals_after(sequence=sequence)
 
 
 TargetResolver = Callable[[SignalEnvelope], RoutingDecision]
@@ -275,6 +298,7 @@ __all__ = [
     "SignalRouteCursorStore",
     "SignalRouteSequenceError",
     "SignalRouteSummary",
+    "StrategyRunnerSignalSource",
     "TargetResolver",
     "route_runner_signals",
 ]

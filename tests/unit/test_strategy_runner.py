@@ -740,3 +740,19 @@ def test_runner_database_is_bound_to_evaluator_contract(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="evaluator contract"):
         _store(path, evaluator_contract_fingerprint="f" * 64)
+
+
+def test_runner_source_generation_survives_reopen_but_changes_on_rebuild(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "runner.sqlite3"
+    first = _store(path)
+    generation = first.source_generation_id
+
+    assert _store(path).source_generation_id == generation
+    assert first.signal_high_watermark() == 0
+
+    path.unlink()
+    rebuilt = _store(path)
+
+    assert rebuilt.source_generation_id != generation

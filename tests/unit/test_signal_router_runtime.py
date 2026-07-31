@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Barrier
+from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
@@ -19,6 +20,7 @@ from rquant.signal_router_runtime import (
     SignalRouteConflictError,
     SignalRouteCursorStore,
     SignalRouteSequenceError,
+    StrategyRunnerSignalSource,
     route_runner_signals,
 )
 from rquant.strategy_runner import RunnerSignalRecord
@@ -216,6 +218,33 @@ def test_concurrent_exact_retry_is_idempotent_without_duplicate_target(
     assert sum(summary.duplicate_count for summary in summaries) == 1
     assert len(bus.route_receipts("n-shape-v1")) == 1
     assert len(bus.outbox_records(signal_id=signal.signal_id)) == 1
+
+
+def test_strategy_runner_adapter_exposes_persisted_generation_and_live_watermark() -> None:
+    records = (RunnerSignalRecord(sequence=1, signal=_signal()),)
+
+    class Store:
+        source_generation_id = GENERATION
+        spec = SimpleNamespace(spec_fingerprint=SPEC)
+
+        @staticmethod
+        def signal_high_watermark() -> int:
+            return 1
+
+        @staticmethod
+        def signals_after(*, sequence: int) -> tuple[RunnerSignalRecord, ...]:
+            return tuple(record for record in records if record.sequence > sequence)
+
+    source = StrategyRunnerSignalSource(source_id="n-shape-v1", store=Store())
+
+    assert source.descriptor() == RouteSourceDescriptor(
+        source_id="n-shape-v1",
+        generation_id=GENERATION,
+        strategy_spec_fingerprint=SPEC,
+        first_sequence=1,
+        high_watermark=1,
+    )
+    assert source.signals_after(sequence=0) == records
 
 
 def test_concurrent_target_manifest_drift_conflicts_instead_of_forming_union(

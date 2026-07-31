@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import re
+import secrets
 import sqlite3
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timedelta
@@ -311,10 +312,34 @@ class StrategyRunnerStore:
                     observed_at TEXT NOT NULL,
                     result_json TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS runner_source_identity (
+                    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                    source_generation_id TEXT NOT NULL
+                );
                 """
             )
             connection.execute("BEGIN IMMEDIATE")
             try:
+                source_row = connection.execute(
+                    """
+                    SELECT source_generation_id
+                    FROM runner_source_identity WHERE singleton = 1
+                    """
+                ).fetchone()
+                source_generation_id = (
+                    secrets.token_hex(32)
+                    if source_row is None
+                    else str(source_row["source_generation_id"])
+                )
+                if source_row is None:
+                    connection.execute(
+                        """
+                        INSERT INTO runner_source_identity(singleton, source_generation_id)
+                        VALUES (1, ?)
+                        """,
+                        (source_generation_id,),
+                    )
+                _validate_sha256(source_generation_id, label="source_generation_id")
                 existing = connection.execute(
                     """
                     SELECT strategy_spec_fingerprint, evaluator_contract_fingerprint
@@ -343,6 +368,7 @@ class StrategyRunnerStore:
                 ):
                     raise ValueError("evaluator contract does not match persisted runner identity")
                 connection.commit()
+                self.source_generation_id = source_generation_id
             except BaseException:
                 connection.rollback()
                 raise
@@ -765,6 +791,11 @@ class StrategyRunnerStore:
                 "SELECT max(feature_sequence) AS value FROM processed_batch"
             ).fetchone()
         return -1 if row is None or row["value"] is None else int(row["value"])
+
+    def signal_high_watermark(self) -> int:
+        with self._connect() as connection:
+            row = connection.execute("SELECT max(sequence) AS value FROM runner_signal").fetchone()
+        return 0 if row is None or row["value"] is None else int(row["value"])
 
     def _state_from_row(self, row: sqlite3.Row) -> StrategyCandidateState:
         return StrategyCandidateState(
