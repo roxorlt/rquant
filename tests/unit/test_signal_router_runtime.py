@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
@@ -14,6 +15,7 @@ from rquant.delivery_contracts import DeliveryChannel, DeliveryTarget, OutboxSta
 from rquant.signal_bus import SignalBusStore
 from rquant.signal_contracts import SignalAction, SignalEnvelope
 from rquant.signal_router_runtime import (
+    ReadonlyStrategyRunnerSignalSource,
     RouteSourceDescriptor,
     RoutingConfigurationUnavailableError,
     RoutingDecision,
@@ -245,6 +247,121 @@ def test_strategy_runner_adapter_exposes_persisted_generation_and_live_watermark
         high_watermark=1,
     )
     assert source.signals_after(sequence=0) == records
+
+
+def _write_runner_source(path: Path, *, signal: SignalEnvelope | None = None) -> None:
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE runner_metadata (
+                singleton INTEGER PRIMARY KEY,
+                strategy_spec_fingerprint TEXT NOT NULL,
+                strategy_spec_json TEXT NOT NULL,
+                evaluator_contract_fingerprint TEXT NOT NULL
+            );
+            CREATE TABLE runner_source_identity (
+                singleton INTEGER PRIMARY KEY,
+                source_generation_id TEXT NOT NULL
+            );
+            CREATE TABLE runner_signal (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                signal_id TEXT NOT NULL UNIQUE,
+                feature_sequence INTEGER NOT NULL,
+                payload_json TEXT NOT NULL
+            );
+            """
+        )
+        connection.execute(
+            "INSERT INTO runner_metadata VALUES (1, ?, '{}', ?)",
+            (SPEC, "2" * 64),
+        )
+        connection.execute(
+            "INSERT INTO runner_source_identity VALUES (1, ?)",
+            (GENERATION,),
+        )
+        if signal is not None:
+            connection.execute(
+                """
+                INSERT INTO runner_signal(signal_id, feature_sequence, payload_json)
+                VALUES (?, 0, ?)
+                """,
+                (
+                    signal.signal_id,
+                    json.dumps(
+                        signal.model_dump(mode="json"),
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                ),
+            )
+
+
+def test_readonly_runner_source_reads_exact_identity_without_writing(tmp_path: Path) -> None:
+    path = tmp_path / "runner.sqlite3"
+    signal = _signal()
+    _write_runner_source(path, signal=signal)
+    before = (path.stat().st_size, path.stat().st_mtime_ns, tuple(tmp_path.iterdir()))
+
+    source = ReadonlyStrategyRunnerSignalSource(
+        source_id="n-shape-v1",
+        path=path,
+        expected_strategy_spec_fingerprint=SPEC,
+        expected_evaluator_contract_fingerprint="2" * 64,
+    )
+
+    assert source.descriptor() == RouteSourceDescriptor(
+        source_id="n-shape-v1",
+        generation_id=GENERATION,
+        strategy_spec_fingerprint=SPEC,
+        first_sequence=1,
+        high_watermark=1,
+    )
+    assert source.signals_after(sequence=0) == (
+        RunnerSignalRecord(sequence=1, signal=signal),
+    )
+    after = (path.stat().st_size, path.stat().st_mtime_ns, tuple(tmp_path.iterdir()))
+    assert after == before
+
+
+def test_readonly_runner_source_fails_closed_for_missing_symlink_or_identity_drift(
+    tmp_path: Path,
+) -> None:
+    missing = tmp_path / "missing.sqlite3"
+    with pytest.raises(ValueError, match="unavailable"):
+        ReadonlyStrategyRunnerSignalSource(
+            source_id="n-shape-v1",
+            path=missing,
+            expected_strategy_spec_fingerprint=SPEC,
+            expected_evaluator_contract_fingerprint="2" * 64,
+        )
+    assert not missing.exists()
+
+    path = tmp_path / "runner.sqlite3"
+    _write_runner_source(path)
+    linked = tmp_path / "linked.sqlite3"
+    linked.symlink_to(path)
+    with pytest.raises(ValueError, match="symlink"):
+        ReadonlyStrategyRunnerSignalSource(
+            source_id="n-shape-v1",
+            path=linked,
+            expected_strategy_spec_fingerprint=SPEC,
+            expected_evaluator_contract_fingerprint="2" * 64,
+        )
+
+    with pytest.raises(ValueError, match="strategy spec"):
+        ReadonlyStrategyRunnerSignalSource(
+            source_id="n-shape-v1",
+            path=path,
+            expected_strategy_spec_fingerprint="3" * 64,
+            expected_evaluator_contract_fingerprint="2" * 64,
+        )
+    with pytest.raises(ValueError, match="evaluator contract"):
+        ReadonlyStrategyRunnerSignalSource(
+            source_id="n-shape-v1",
+            path=path,
+            expected_strategy_spec_fingerprint=SPEC,
+            expected_evaluator_contract_fingerprint="4" * 64,
+        )
 
 
 def test_concurrent_target_manifest_drift_conflicts_instead_of_forming_union(
