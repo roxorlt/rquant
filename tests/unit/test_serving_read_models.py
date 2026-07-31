@@ -5,6 +5,11 @@ from decimal import Decimal
 
 from rquant.delivery_contracts import DeliveryChannel, DeliveryTarget, OutboxRecord, OutboxStatus
 from rquant.paper_contracts import PaperAccountSnapshot, PaperHolding
+from rquant.runtime_service_control import (
+    RuntimeServiceHealth,
+    RuntimeServicePlane,
+    RuntimeServiceStatus,
+)
 from rquant.serving_contracts import FreshnessStatus, ServingDatasetWatermark
 from rquant.serving_publisher import ServingPublisher
 from rquant.serving_read_models import (
@@ -89,6 +94,15 @@ def test_builds_deterministic_page_tables_and_publishes_readonly_generation(tmp_
         routes=(route,),
         deliveries=(delivery,),
         paper_accounts=(_account(),),
+        runtime_services=(
+            RuntimeServiceHealth(
+                service_id="feature-live",
+                plane=RuntimeServicePlane.LIVE,
+                status=RuntimeServiceStatus.MISSING,
+                stale=True,
+                observed_at=NOW,
+            ),
+        ),
     )
 
     tables = build_serving_read_models(source)
@@ -97,6 +111,7 @@ def test_builds_deterministic_page_tables_and_publishes_readonly_generation(tmp_
     assert tables["serving_status"].iloc[0]["signal_count"] == 1
     assert tables["signals"].iloc[0]["candidate_id"] == "600000.SH"
     assert tables["paper_holdings"].iloc[0]["frozen_quantity"] == 1_000
+    assert tables["runtime_services"].iloc[0]["service_id"] == "feature-live"
     publisher = ServingPublisher(
         tmp_path / "serving",
         producer_commit="1" * 40,

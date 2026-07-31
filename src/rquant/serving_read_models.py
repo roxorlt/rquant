@@ -15,6 +15,7 @@ from rquant.lab_eta import LabEtaEstimate
 from rquant.lab_jobs import LabJobSummary
 from rquant.paper_contracts import PaperAccountSnapshot
 from rquant.runtime_contracts import AwareUtcDatetime, RuntimeContractModel
+from rquant.runtime_service_control import RuntimeServiceHealth
 from rquant.serving_publisher import ServingTableSpec
 from rquant.signal_bus import SignalRouteReceipt
 from rquant.signal_contracts import SignalEnvelope
@@ -42,6 +43,7 @@ class ServingReadModelInput(RuntimeContractModel):
     routes: tuple[SignalRouteReceipt, ...] = ()
     deliveries: tuple[OutboxRecord, ...] = ()
     paper_accounts: tuple[PaperAccountSnapshot, ...] = ()
+    runtime_services: tuple[RuntimeServiceHealth, ...] = ()
     lab_jobs: tuple[ServingLabJobRecord, ...] = ()
     promotions: tuple[PromotionDecision, ...] = ()
 
@@ -65,6 +67,10 @@ class ServingReadModelInput(RuntimeContractModel):
             "paper account_id",
         )
         self._require_unique(
+            (record.service_id for record in self.runtime_services),
+            "runtime service_id",
+        )
+        self._require_unique(
             (str(record.summary.job_id) for record in self.lab_jobs),
             "job_id",
         )
@@ -77,6 +83,7 @@ class ServingReadModelInput(RuntimeContractModel):
         times.extend(record.routed_at for record in self.routes)
         times.extend(record.updated_at for record in self.deliveries)
         times.extend(record.as_of_time for record in self.paper_accounts)
+        times.extend(record.observed_at for record in self.runtime_services)
         times.extend(record.summary.updated_at for record in self.lab_jobs)
         times.extend(record.eta.as_of for record in self.lab_jobs if record.eta is not None)
         times.extend(record.decided_at for record in self.promotions)
@@ -109,6 +116,7 @@ SERVING_TABLE_SPECS: Mapping[str, ServingTableSpec] = MappingProxyType(
         "paper_accounts": ServingTableSpec(sort_keys=("account_id",)),
         "paper_holdings": ServingTableSpec(sort_keys=("account_id", "ts_code")),
         "promotions": ServingTableSpec(sort_keys=("decision_id",)),
+        "runtime_services": ServingTableSpec(sort_keys=("service_id",)),
         "serving_status": ServingTableSpec(sort_keys=("snapshot_key",)),
         "signal_routes": ServingTableSpec(sort_keys=("source_id", "source_sequence")),
         "signals": ServingTableSpec(sort_keys=("global_sequence",)),
@@ -360,6 +368,53 @@ def build_serving_read_models(
             "decided_at",
         ),
     )
+    runtime_services = _frame(
+        [
+            {
+                "service_id": record.service_id,
+                "plane": record.plane.value,
+                "status": record.status.value,
+                "stale": record.stale,
+                "observed_at": record.observed_at,
+                "heartbeat_at": (
+                    record.heartbeat.heartbeat_at if record.heartbeat is not None else None
+                ),
+                "input_sequence": (
+                    record.heartbeat.input_sequence if record.heartbeat is not None else -1
+                ),
+                "output_sequence": (
+                    record.heartbeat.output_sequence if record.heartbeat is not None else -1
+                ),
+                "backlog_count": (
+                    record.heartbeat.backlog_count if record.heartbeat is not None else 0
+                ),
+                "consecutive_failures": (
+                    record.heartbeat.consecutive_failures if record.heartbeat is not None else 0
+                ),
+                "last_error": (
+                    record.heartbeat.last_error if record.heartbeat is not None else None
+                ),
+                "spec_fingerprint": (
+                    record.heartbeat.spec_fingerprint if record.heartbeat is not None else None
+                ),
+            }
+            for record in source.runtime_services
+        ],
+        (
+            "service_id",
+            "plane",
+            "status",
+            "stale",
+            "observed_at",
+            "heartbeat_at",
+            "input_sequence",
+            "output_sequence",
+            "backlog_count",
+            "consecutive_failures",
+            "last_error",
+            "spec_fingerprint",
+        ),
+    )
     status = _frame(
         [
             {
@@ -369,6 +424,7 @@ def build_serving_read_models(
                 "route_count": len(source.routes),
                 "delivery_count": len(source.deliveries),
                 "paper_account_count": len(source.paper_accounts),
+                "runtime_service_count": len(source.runtime_services),
                 "lab_job_count": len(source.lab_jobs),
                 "promotion_count": len(source.promotions),
             }
@@ -380,6 +436,7 @@ def build_serving_read_models(
             "route_count",
             "delivery_count",
             "paper_account_count",
+            "runtime_service_count",
             "lab_job_count",
             "promotion_count",
         ),
@@ -391,6 +448,7 @@ def build_serving_read_models(
             "paper_accounts": accounts,
             "paper_holdings": holdings,
             "promotions": promotions,
+            "runtime_services": runtime_services,
             "serving_status": status,
             "signal_routes": routes,
             "signals": signals,
