@@ -581,17 +581,37 @@ class TushareAdapter:
         不切备用 token：备用 token 未必开通同一付费权限，失败应直接暴露。
         """
         trade_date_str = trade_date.strftime("%Y%m%d")
-        fields = "ts_code,trade_date,vol,price,amount,turnover_rate,volume_ratio"
+        fields = (
+            "ts_code,trade_date,vol,price,amount,pre_close,"
+            "turnover_rate,volume_ratio"
+        )
         logger.info(f"Tushare stk_auction 请求：date={trade_date_str}")
 
         try:
-            df = self._pro.stk_auction(trade_date=trade_date_str, fields=fields)
+            df = self._pro.stk_auction(
+                trade_date=trade_date_str,
+                fields=fields,
+                ts_type="STK",
+            )
         except Exception as e:
             raise RuntimeError(f"Tushare stk_auction 调用失败：{e}") from e
 
         if df is None or df.empty:
             logger.warning(f"Tushare stk_auction 返回空：date={trade_date_str}")
-            return pd.DataFrame()
+            return pd.DataFrame(
+                columns=[
+                    "ts_code",
+                    "trade_date",
+                    "vol",
+                    "price",
+                    "amount",
+                    "pre_close",
+                    "turnover_rate",
+                    "volume_ratio",
+                    "auction_type",
+                    "source",
+                ]
+            )
 
         required = [
             "ts_code",
@@ -599,6 +619,7 @@ class TushareAdapter:
             "vol",
             "price",
             "amount",
+            "pre_close",
             "turnover_rate",
             "volume_ratio",
         ]

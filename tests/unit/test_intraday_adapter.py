@@ -48,10 +48,17 @@ class _FakePro:
             },
         ])
 
-    def stk_auction(self, *, trade_date: str, fields: str) -> pd.DataFrame:
+    def stk_auction(
+        self,
+        *,
+        trade_date: str,
+        fields: str,
+        ts_type: str,
+    ) -> pd.DataFrame:
         self.calls.append({
             "trade_date": trade_date,
             "fields": fields,
+            "ts_type": ts_type,
         })
         return pd.DataFrame([
             {
@@ -59,6 +66,7 @@ class _FakePro:
                 "trade_date": "20250218",
                 "vol": 28355900.0,
                 "price": 9.81,
+                "pre_close": 9.27,
                 "amount": 278113479.0,
                 "turnover_rate": 0.1,
                 "volume_ratio": 3.2,
@@ -68,6 +76,7 @@ class _FakePro:
                 "trade_date": "20250218",
                 "vol": 1200000.0,
                 "price": 11.23,
+                "pre_close": 10.91,
                 "amount": 13476000.0,
                 "turnover_rate": 0.03,
                 "volume_ratio": 1.1,
@@ -399,7 +408,11 @@ def test_stk_auction_normalizes_tushare_rows(monkeypatch) -> None:
 
     assert fake.calls[-1] == {
         "trade_date": "20250218",
-        "fields": "ts_code,trade_date,vol,price,amount,turnover_rate,volume_ratio",
+        "fields": (
+            "ts_code,trade_date,vol,price,amount,pre_close,"
+            "turnover_rate,volume_ratio"
+        ),
+        "ts_type": "STK",
     }
     assert df["ts_code"].tolist() == ["000001.SZ", "600000.SH"]
     assert df["trade_date"].tolist() == [
@@ -409,6 +422,7 @@ def test_stk_auction_normalizes_tushare_rows(monkeypatch) -> None:
     assert df["auction_type"].tolist() == ["open_realtime", "open_realtime"]
     assert df["source"].tolist() == ["tushare", "tushare"]
     assert df.iloc[0]["price"] == 11.23
+    assert df.iloc[0]["pre_close"] == 10.91
 
 
 def test_stk_auction_rejects_missing_required_columns(monkeypatch) -> None:
@@ -418,11 +432,52 @@ def test_stk_auction_rejects_missing_required_columns(monkeypatch) -> None:
     from rquant.adapter.tushare import TushareAdapter
 
     class _BadPro:
-        def stk_auction(self, *, trade_date: str, fields: str) -> pd.DataFrame:
-            return pd.DataFrame([{"ts_code": "600000.SH"}])
+        def stk_auction(
+            self,
+            *,
+            trade_date: str,
+            fields: str,
+            ts_type: str,
+        ) -> pd.DataFrame:
+            return pd.DataFrame([
+                {
+                    "ts_code": "600000.SH",
+                    "trade_date": "20250218",
+                    "vol": 1_000.0,
+                    "price": 10.0,
+                    "amount": 10_000.0,
+                    "turnover_rate": 0.1,
+                    "volume_ratio": 1.2,
+                }
+            ])
 
     monkeypatch.setattr(tushare_module.ts, "pro_api", lambda token: _BadPro())
     adapter = TushareAdapter(token="x" * 32)
 
-    with pytest.raises(RuntimeError, match="stk_auction 返回缺字段"):
+    with pytest.raises(RuntimeError, match="pre_close"):
         adapter.stk_auction(date(2025, 2, 18))
+
+
+def test_stk_auction_does_not_switch_to_backup_token(monkeypatch) -> None:
+    import pytest
+
+    from rquant.adapter import tushare as tushare_module
+    from rquant.adapter.tushare import TushareAdapter
+
+    class _FailingPro:
+        def stk_auction(self, **_kwargs) -> pd.DataFrame:
+            raise PermissionError("paid permission missing")
+
+    tokens: list[str] = []
+
+    def fake_pro_api(token: str) -> _FailingPro:
+        tokens.append(token)
+        return _FailingPro()
+
+    monkeypatch.setattr(tushare_module.ts, "pro_api", fake_pro_api)
+    adapter = TushareAdapter(token="primary", backup_token="backup")
+
+    with pytest.raises(RuntimeError, match="stk_auction 调用失败"):
+        adapter.stk_auction(date(2025, 2, 18))
+
+    assert tokens == ["primary"]
