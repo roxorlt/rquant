@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import fcntl
 import json
+import multiprocessing as mp
 import os
 import stat
 from datetime import UTC, date, datetime, timedelta, timezone
 from pathlib import Path
+from queue import Empty
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
 
+import rquant.strategy_candidate_snapshot as snapshot_module
 from rquant.runtime_contracts import RuntimeContractModel, canonical_sha256
 from rquant.strategy_candidate_snapshot import (
     StrategyCandidatePriceBasis,
@@ -98,6 +103,88 @@ def _tree_state(root: Path) -> tuple[tuple[str, int, int, bytes], ...]:
         )
         for path in sorted(root.rglob("*"))
     )
+
+
+def _publish_records_worker(
+    root: str,
+    *,
+    variant: str,
+    captured_at: datetime,
+    results: Any,
+    block_before_create: bool = False,
+    entered_create: Any = None,
+    release_create: Any = None,
+    verify_lock_contended: Any = None,
+) -> None:
+    try:
+        if verify_lock_contended is not None:
+            descriptor = os.open(Path(root) / ".publish.lock", os.O_RDONLY)
+            try:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    verify_lock_contended.set()
+                else:
+                    raise AssertionError("publish lock was not held by the competing process")
+            finally:
+                os.close(descriptor)
+
+        if block_before_create:
+            original_create = StrategyCandidateSnapshotSpool._atomic_create_generation
+
+            def blocked_create(
+                cls: type[StrategyCandidateSnapshotSpool],
+                root_fd: int,
+                generations_fd: int,
+                target_name: str,
+                payload: bytes,
+            ) -> None:
+                entered_create.set()
+                if not release_create.wait(timeout=10):
+                    raise TimeoutError("generation creation was not released")
+                original_create(root_fd, generations_fd, target_name, payload)
+
+            StrategyCandidateSnapshotSpool._atomic_create_generation = classmethod(  # type: ignore[method-assign]
+                blocked_create
+            )
+
+        result = StrategyCandidateSnapshotSpool(Path(root)).publish_records(
+            trade_date=TRADE_DATE,
+            captured_at=captured_at,
+            producer_commit=COMMIT_A,
+            rows=(_row(variant=variant),),
+        )
+        results.put(
+            {
+                "error": None,
+                "published": result.published,
+                "snapshot": result.snapshot.model_dump(mode="json"),
+            }
+        )
+    except BaseException as exc:
+        results.put(
+            {
+                "error": f"{type(exc).__name__}:{exc}",
+                "published": None,
+                "snapshot": None,
+            }
+        )
+
+
+def _collect_process_results(processes: list[mp.Process], results: Any) -> list[dict[str, Any]]:
+    for process in processes:
+        process.join(timeout=15)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=2)
+            pytest.fail("candidate publish worker timed out")
+    try:
+        observed = [results.get(timeout=2) for _ in processes]
+    except Empty:
+        pytest.fail("candidate publish worker did not report a result")
+    assert [process.exitcode for process in processes] == [0] * len(processes)
+    assert [item["error"] for item in observed] == [None] * len(processes)
+    return observed
 
 
 def _write_legacy_v1_authority(
@@ -561,6 +648,359 @@ def test_publish_is_atomic_private_immutable_and_idempotent(tmp_path: Path) -> N
     assert stat.S_IMODE(first_generation.stat().st_mode) == 0o600
     assert stat.S_IMODE(spool.current_path.stat().st_mode) == 0o600
     assert list(spool.generations_root.glob("*.json")) == [first_generation]
+
+
+def test_publish_records_returns_frozen_result_and_suppresses_same_semantics(
+    tmp_path: Path,
+) -> None:
+    spool = StrategyCandidateSnapshotSpool((tmp_path / "spool").resolve())
+
+    first = spool.publish_records(
+        trade_date=TRADE_DATE,
+        captured_at=CAPTURED_AT,
+        producer_commit=COMMIT_A,
+        rows=(_row(),),
+    )
+    duplicate = spool.publish_records(
+        trade_date=TRADE_DATE,
+        captured_at=CAPTURED_AT + timedelta(seconds=1),
+        producer_commit=COMMIT_A,
+        rows=(_row(),),
+    )
+
+    assert isinstance(first, snapshot_module.StrategyCandidatePublishResult)
+    assert first.published is True
+    assert duplicate.published is False
+    assert duplicate.snapshot == first.snapshot
+    assert duplicate.snapshot.captured_at == CAPTURED_AT
+    assert first.snapshot.sequence == 0
+    assert first.snapshot.schema_version == 2
+    assert first.snapshot.content_sha256 == strategy_candidate_snapshot_content_sha256(
+        schema_version=2,
+        sequence=0,
+        trade_date=TRADE_DATE,
+        captured_at=CAPTURED_AT,
+        producer_commit=COMMIT_A,
+        rows=(_row(),),
+    )
+    assert StrategyCandidateSnapshotPointer.model_validate_json(
+        spool.current_path.read_bytes()
+    ) == StrategyCandidateSnapshotPointer.from_snapshot(first.snapshot)
+    assert len(list(spool.generations_root.glob("*.json"))) == 1
+    with pytest.raises(ValidationError, match="frozen"):
+        first.published = False  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        "not-records",
+        {"candidate_id": "000001.SZ"},
+        True,
+        [_row().model_dump(mode="python")],
+        iter((_row(),)),
+    ],
+    ids=["str", "bare-dict", "bool", "dict-item", "iterator"],
+)
+def test_publish_records_requires_a_sequence_of_typed_records(
+    tmp_path: Path,
+    rows: object,
+) -> None:
+    root = (tmp_path / "spool").resolve()
+    spool = StrategyCandidateSnapshotSpool(root)
+
+    with pytest.raises(TypeError, match=r"Sequence\[StrategyCandidateRecord\]"):
+        spool.publish_records(
+            trade_date=TRADE_DATE,
+            captured_at=CAPTURED_AT,
+            producer_commit=COMMIT_A,
+            rows=rows,  # type: ignore[arg-type]
+        )
+
+    assert not root.exists()
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"producer_commit": "bad"},
+        {"trade_date": object()},
+        {"captured_at": AVAILABLE_AT - timedelta(seconds=1)},
+        {"rows": (_row(effective_trade_date=TRADE_DATE + timedelta(days=1)),)},
+    ],
+    ids=["commit", "trade-date", "captured-at", "snapshot-constraint"],
+)
+def test_publish_records_rejects_invalid_request_without_creating_authority(
+    tmp_path: Path,
+    changes: dict[str, object],
+) -> None:
+    root = (tmp_path / "spool").resolve()
+    spool = StrategyCandidateSnapshotSpool(root)
+    arguments: dict[str, object] = {
+        "trade_date": TRADE_DATE,
+        "captured_at": CAPTURED_AT,
+        "producer_commit": COMMIT_A,
+        "rows": (_row(),),
+    }
+    arguments.update(changes)
+
+    with pytest.raises((TypeError, ValueError, ValidationError)):
+        spool.publish_records(**arguments)  # type: ignore[arg-type]
+
+    assert not root.exists()
+
+
+@pytest.mark.parametrize(
+    ("producer_commit", "trade_date", "rows"),
+    [
+        ("b" * 40, TRADE_DATE, (_row(),)),
+        (COMMIT_A, TRADE_DATE, (_row(variant="pool2"),)),
+        (COMMIT_A, TRADE_DATE, (_row(static_features={"score": 0.9}),)),
+        (
+            COMMIT_A,
+            TRADE_DATE,
+            (_row(decision_at=DECISION_AT - timedelta(minutes=1)),),
+        ),
+        (
+            COMMIT_A,
+            TRADE_DATE,
+            (_row(reference_snapshot_ids={"daily_state": "3" * 64}),),
+        ),
+        (
+            COMMIT_A,
+            TRADE_DATE + timedelta(days=1),
+            (_row(effective_trade_date=TRADE_DATE + timedelta(days=1)),),
+        ),
+    ],
+    ids=["commit", "business", "static", "pit", "lineage", "trade-date"],
+)
+def test_publish_records_publishes_every_semantic_change(
+    tmp_path: Path,
+    producer_commit: str,
+    trade_date: date,
+    rows: tuple[StrategyCandidateRecord, ...],
+) -> None:
+    spool = StrategyCandidateSnapshotSpool((tmp_path / "spool").resolve())
+    initial = spool.publish_records(
+        trade_date=TRADE_DATE,
+        captured_at=CAPTURED_AT,
+        producer_commit=COMMIT_A,
+        rows=(_row(),),
+    )
+
+    changed = spool.publish_records(
+        trade_date=trade_date,
+        captured_at=CAPTURED_AT + timedelta(minutes=1),
+        producer_commit=producer_commit,
+        rows=rows,
+    )
+
+    assert initial.published is True
+    assert changed.published is True
+    assert changed.snapshot.sequence == 1
+    assert changed.snapshot.content_sha256 != initial.snapshot.content_sha256
+    assert StrategyCandidateSnapshotPointer.model_validate_json(
+        spool.current_path.read_bytes()
+    ) == StrategyCandidateSnapshotPointer.from_snapshot(changed.snapshot)
+    assert spool.read_as_of(CAPTURED_AT + timedelta(minutes=2)) == changed.snapshot
+    assert len(list(spool.generations_root.glob("*.json"))) == 2
+
+
+@pytest.mark.parametrize("variant", ["pool1", "pool2"], ids=["duplicate", "changed"])
+def test_publish_records_rejects_backwards_capture_before_semantic_suppression(
+    tmp_path: Path,
+    variant: str,
+) -> None:
+    spool = StrategyCandidateSnapshotSpool((tmp_path / "spool").resolve())
+    current = spool.publish_records(
+        trade_date=TRADE_DATE,
+        captured_at=CAPTURED_AT + timedelta(minutes=5),
+        producer_commit=COMMIT_A,
+        rows=(_row(),),
+    )
+    before = _tree_state(spool.root)
+
+    with pytest.raises(StrategyCandidateSnapshotIntegrityError, match="backwards"):
+        spool.publish_records(
+            trade_date=TRADE_DATE,
+            captured_at=CAPTURED_AT + timedelta(minutes=4),
+            producer_commit=COMMIT_A,
+            rows=(_row(variant=variant),),
+        )
+
+    assert _tree_state(spool.root) == before
+    assert spool.read_as_of(CAPTURED_AT + timedelta(minutes=6)) == current.snapshot
+
+
+@pytest.mark.parametrize("preinitialized", [False, True], ids=["cold", "initialized"])
+def test_concurrent_identical_publish_records_creates_one_generation(
+    tmp_path: Path,
+    preinitialized: bool,
+) -> None:
+    root = (tmp_path / "spool").resolve()
+    spool = StrategyCandidateSnapshotSpool(root)
+    if preinitialized:
+        baseline = spool.publish_records(
+            trade_date=TRADE_DATE,
+            captured_at=CAPTURED_AT - timedelta(minutes=1),
+            producer_commit=COMMIT_A,
+            rows=(_row(variant="baseline"),),
+        )
+        assert baseline.snapshot.sequence == 0
+
+    ctx = mp.get_context("spawn")
+    results = ctx.Queue()
+    entered_create = ctx.Event()
+    release_create = ctx.Event()
+    lock_contended = ctx.Event()
+    first = ctx.Process(
+        target=_publish_records_worker,
+        kwargs={
+            "root": str(root),
+            "variant": "pool1",
+            "captured_at": CAPTURED_AT,
+            "results": results,
+            "block_before_create": True,
+            "entered_create": entered_create,
+            "release_create": release_create,
+        },
+    )
+    second = ctx.Process(
+        target=_publish_records_worker,
+        kwargs={
+            "root": str(root),
+            "variant": "pool1",
+            "captured_at": CAPTURED_AT + timedelta(seconds=1),
+            "results": results,
+            "verify_lock_contended": lock_contended,
+        },
+    )
+
+    first.start()
+    assert entered_create.wait(timeout=10), "first publisher did not reach generation creation"
+    second.start()
+    try:
+        assert lock_contended.wait(timeout=10), "second publisher did not contend on publish lock"
+    finally:
+        release_create.set()
+    observed = _collect_process_results([first, second], results)
+    snapshots = [StrategyCandidateSnapshot.model_validate(item["snapshot"]) for item in observed]
+
+    assert sorted(item["published"] for item in observed) == [False, True]
+    assert len({snapshot.content_sha256 for snapshot in snapshots}) == 1
+    assert {snapshot.sequence for snapshot in snapshots} == {int(preinitialized)}
+    assert {snapshot.captured_at for snapshot in snapshots} == {CAPTURED_AT}
+    assert len(list(spool.generations_root.glob("*.json"))) == 1 + int(preinitialized)
+    assert spool.read_as_of(CAPTURED_AT + timedelta(seconds=2)) == snapshots[0]
+
+
+def test_concurrent_different_publish_records_allocate_consecutive_sequences(
+    tmp_path: Path,
+) -> None:
+    root = (tmp_path / "spool").resolve()
+    spool = StrategyCandidateSnapshotSpool(root)
+    ctx = mp.get_context("spawn")
+    results = ctx.Queue()
+    entered_create = ctx.Event()
+    release_create = ctx.Event()
+    lock_contended = ctx.Event()
+    first = ctx.Process(
+        target=_publish_records_worker,
+        kwargs={
+            "root": str(root),
+            "variant": "pool1",
+            "captured_at": CAPTURED_AT,
+            "results": results,
+            "block_before_create": True,
+            "entered_create": entered_create,
+            "release_create": release_create,
+        },
+    )
+    second = ctx.Process(
+        target=_publish_records_worker,
+        kwargs={
+            "root": str(root),
+            "variant": "pool2",
+            "captured_at": CAPTURED_AT + timedelta(seconds=1),
+            "results": results,
+            "verify_lock_contended": lock_contended,
+        },
+    )
+
+    first.start()
+    assert entered_create.wait(timeout=10), "first publisher did not reach generation creation"
+    second.start()
+    try:
+        assert lock_contended.wait(timeout=10), "second publisher did not contend on publish lock"
+    finally:
+        release_create.set()
+    observed = _collect_process_results([first, second], results)
+    snapshots = [StrategyCandidateSnapshot.model_validate(item["snapshot"]) for item in observed]
+
+    assert [item["published"] for item in observed] == [True, True]
+    assert sorted(snapshot.sequence for snapshot in snapshots) == [0, 1]
+    assert len({snapshot.content_sha256 for snapshot in snapshots}) == 2
+    assert len(list(spool.generations_root.glob("*.json"))) == 2
+    current = spool.read_as_of(CAPTURED_AT + timedelta(seconds=2))
+    assert current is not None
+    assert current.sequence == 1
+    assert current.rows[0].variant == "pool2"
+
+
+@pytest.mark.parametrize("preinitialized", [False, True], ids=["cold", "initialized"])
+def test_publish_records_recovers_generation_linked_before_pointer_switch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    preinitialized: bool,
+) -> None:
+    spool = StrategyCandidateSnapshotSpool((tmp_path / "spool").resolve())
+    variant = "pool1"
+    captured_at = CAPTURED_AT
+    if preinitialized:
+        baseline = spool.publish_records(
+            trade_date=TRADE_DATE,
+            captured_at=CAPTURED_AT - timedelta(minutes=1),
+            producer_commit=COMMIT_A,
+            rows=(_row(variant="baseline"),),
+        )
+        assert baseline.snapshot.sequence == 0
+        variant = "pool2"
+
+    original_replace = StrategyCandidateSnapshotSpool._atomic_replace_pointer
+
+    def fail_pointer_switch(cls: type[StrategyCandidateSnapshotSpool], *args: object) -> None:
+        raise RuntimeError("simulated pointer interruption")
+
+    monkeypatch.setattr(
+        StrategyCandidateSnapshotSpool,
+        "_atomic_replace_pointer",
+        classmethod(fail_pointer_switch),
+    )
+    with pytest.raises(RuntimeError, match="pointer interruption"):
+        spool.publish_records(
+            trade_date=TRADE_DATE,
+            captured_at=captured_at,
+            producer_commit=COMMIT_A,
+            rows=(_row(variant=variant),),
+        )
+    monkeypatch.setattr(
+        StrategyCandidateSnapshotSpool,
+        "_atomic_replace_pointer",
+        original_replace,
+    )
+
+    recovered = spool.publish_records(
+        trade_date=TRADE_DATE,
+        captured_at=captured_at + timedelta(seconds=1),
+        producer_commit=COMMIT_A,
+        rows=(_row(variant=variant),),
+    )
+
+    assert recovered.published is True
+    assert recovered.snapshot.sequence == int(preinitialized)
+    assert recovered.snapshot.captured_at == captured_at
+    assert len(list(spool.generations_root.glob("*.json"))) == 1 + int(preinitialized)
+    assert spool.read_as_of(captured_at + timedelta(seconds=2)) == recovered.snapshot
 
 
 def test_constructor_and_failed_read_do_not_create_or_modify_authority(tmp_path: Path) -> None:

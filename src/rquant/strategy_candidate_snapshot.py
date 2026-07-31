@@ -355,6 +355,11 @@ class StrategyCandidateSnapshot(RuntimeContractModel):
         )
 
 
+class StrategyCandidatePublishResult(RuntimeContractModel):
+    snapshot: StrategyCandidateSnapshot
+    published: bool
+
+
 class StrategyCandidateSnapshotPointer(RuntimeContractModel):
     generation_sha256: Sha256
     sequence: int = Field(ge=0)
@@ -422,42 +427,142 @@ class StrategyCandidateSnapshotSpool:
                 if self._finish_interrupted_publish(root_fd, generations, snapshot):
                     return snapshot
                 raise
-            existing = generations.get(snapshot.sequence)
-            if existing is not None:
-                if existing != snapshot:
-                    raise StrategyCandidateSnapshotIntegrityError(
-                        "immutable sequence already contains different content"
+            return self._publish_locked(root_fd, generations_fd, generations, snapshot)
+
+    def publish_records(
+        self,
+        *,
+        trade_date: date,
+        captured_at: datetime,
+        producer_commit: str,
+        rows: Sequence[StrategyCandidateRecord],
+    ) -> StrategyCandidatePublishResult:
+        if (
+            not isinstance(rows, Sequence)
+            or isinstance(rows, (str, bytes, bytearray))
+            or any(not isinstance(row, StrategyCandidateRecord) for row in rows)
+        ):
+            raise TypeError("rows must be a Sequence[StrategyCandidateRecord]")
+        validated_request = StrategyCandidateSnapshot.build(
+            sequence=0,
+            trade_date=trade_date,
+            captured_at=captured_at,
+            producer_commit=producer_commit,
+            rows=rows,
+        )
+        canonical_rows = validated_request.rows
+        normalized_captured_at = validated_request.captured_at
+        validated_trade_date = validated_request.trade_date
+        validated_producer_commit = validated_request.producer_commit
+        self._initialize_for_publish()
+        with self._locked(exclusive=True) as (root_fd, generations_fd):
+            self._cleanup_stale_temporaries(root_fd)
+            generations = self._read_all_generations(generations_fd)
+            try:
+                self._validate_current_pointer(root_fd, generations)
+            except StrategyCandidateSnapshotIntegrityError:
+                interrupted = None if not generations else generations[max(generations)]
+                if (
+                    interrupted is not None
+                    and normalized_captured_at >= interrupted.captured_at
+                    and self._same_semantics(
+                        interrupted,
+                        trade_date=validated_trade_date,
+                        producer_commit=validated_producer_commit,
+                        rows=canonical_rows,
                     )
-                return existing
-            if len(generations) >= _MAX_GENERATIONS:
-                raise StrategyCandidateSnapshotIntegrityError(
-                    "strategy candidate generation count exceeds limit"
-                )
-            expected_sequence = 0 if not generations else max(generations) + 1
-            if snapshot.sequence != expected_sequence:
-                raise StrategyCandidateSnapshotIntegrityError(
-                    f"next sequence must be {expected_sequence}, got {snapshot.sequence}"
-                )
-            if generations and snapshot.captured_at < generations[max(generations)].captured_at:
+                    and self._finish_interrupted_publish(root_fd, generations, interrupted)
+                ):
+                    return StrategyCandidatePublishResult(
+                        snapshot=interrupted,
+                        published=True,
+                    )
+                raise
+            current = None if not generations else generations[max(generations)]
+            if current is not None and normalized_captured_at < current.captured_at:
                 raise StrategyCandidateSnapshotIntegrityError(
                     "captured_at cannot move backwards across sequences"
                 )
-            generation_name = self._generation_name(snapshot.content_sha256)
-            if self._entry_exists(generations_fd, generation_name):
-                raise StrategyCandidateSnapshotIntegrityError(
-                    "generation hash already exists with conflicting sequence authority"
-                )
-            self._atomic_create_generation(
+            if current is not None and self._same_semantics(
+                current,
+                trade_date=validated_trade_date,
+                producer_commit=validated_producer_commit,
+                rows=canonical_rows,
+            ):
+                return StrategyCandidatePublishResult(snapshot=current, published=False)
+            snapshot = StrategyCandidateSnapshot.build(
+                sequence=0 if current is None else current.sequence + 1,
+                trade_date=validated_trade_date,
+                captured_at=normalized_captured_at,
+                producer_commit=validated_producer_commit,
+                rows=canonical_rows,
+            )
+            published = self._publish_locked(
                 root_fd,
                 generations_fd,
-                generation_name,
-                self._model_bytes(snapshot),
+                generations,
+                snapshot,
             )
-            self._atomic_replace_pointer(
-                root_fd,
-                self._model_bytes(StrategyCandidateSnapshotPointer.from_snapshot(snapshot)),
+            return StrategyCandidatePublishResult(snapshot=published, published=True)
+
+    @staticmethod
+    def _same_semantics(
+        snapshot: StrategyCandidateSnapshot,
+        *,
+        trade_date: date,
+        producer_commit: str,
+        rows: tuple[StrategyCandidateRecord, ...],
+    ) -> bool:
+        return (
+            snapshot.schema_version == 2
+            and snapshot.trade_date == trade_date
+            and snapshot.producer_commit == producer_commit
+            and snapshot.rows == rows
+        )
+
+    def _publish_locked(
+        self,
+        root_fd: int,
+        generations_fd: int,
+        generations: Mapping[int, StrategyCandidateSnapshot],
+        snapshot: StrategyCandidateSnapshot,
+    ) -> StrategyCandidateSnapshot:
+        existing = generations.get(snapshot.sequence)
+        if existing is not None:
+            if existing != snapshot:
+                raise StrategyCandidateSnapshotIntegrityError(
+                    "immutable sequence already contains different content"
+                )
+            return existing
+        if len(generations) >= _MAX_GENERATIONS:
+            raise StrategyCandidateSnapshotIntegrityError(
+                "strategy candidate generation count exceeds limit"
             )
-            return snapshot
+        expected_sequence = 0 if not generations else max(generations) + 1
+        if snapshot.sequence != expected_sequence:
+            raise StrategyCandidateSnapshotIntegrityError(
+                f"next sequence must be {expected_sequence}, got {snapshot.sequence}"
+            )
+        if generations and snapshot.captured_at < generations[max(generations)].captured_at:
+            raise StrategyCandidateSnapshotIntegrityError(
+                "captured_at cannot move backwards across sequences"
+            )
+        generation_name = self._generation_name(snapshot.content_sha256)
+        if self._entry_exists(generations_fd, generation_name):
+            raise StrategyCandidateSnapshotIntegrityError(
+                "generation hash already exists with conflicting sequence authority"
+            )
+        self._atomic_create_generation(
+            root_fd,
+            generations_fd,
+            generation_name,
+            self._model_bytes(snapshot),
+        )
+        self._atomic_replace_pointer(
+            root_fd,
+            self._model_bytes(StrategyCandidateSnapshotPointer.from_snapshot(snapshot)),
+        )
+        return snapshot
 
     def read_as_of(self, as_of: datetime) -> StrategyCandidateSnapshot | None:
         normalized_as_of = normalize_aware_utc(as_of)
