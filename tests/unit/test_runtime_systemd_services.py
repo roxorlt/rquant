@@ -11,8 +11,9 @@ ROOT = Path(__file__).resolve().parents[2]
 SYSTEMD = ROOT / "deploy" / "systemd"
 PLANES = ("live", "serving", "research")
 RUNTIME_ROOT = "/home/lighthouse/rquant/data/runtime"
+CURRENT_ROOT = f"{RUNTIME_ROOT}/current"
 CONTROL_ROOT = f"{RUNTIME_ROOT}/control"
-ENVIRONMENT_FILE = f"{RUNTIME_ROOT}/runtime.env"
+ENVIRONMENT_FILE = f"{CURRENT_ROOT}/runtime.env"
 EXPECTED_EXECUTABLE = "/home/lighthouse/rquant/.venv/bin/python"
 EXPECTED_MODULE = "rquant.runtime_service_main"
 
@@ -43,7 +44,7 @@ def test_runtime_template_has_fixed_identity_entrypoint_and_manifest(
     assert service["Group"] == "lighthouse"
     assert service["WorkingDirectory"] == "/home/lighthouse/rquant"
     expected_environment_file = (
-        f"{RUNTIME_ROOT}/secrets/%i.env" if plane == "live" else ENVIRONMENT_FILE
+        f"{CURRENT_ROOT}/secrets/%i.env" if plane == "live" else ENVIRONMENT_FILE
     )
     assert service["EnvironmentFile"] == expected_environment_file
     assert service["Environment"] == "RQUANT_DISABLE_DOTENV=1"
@@ -52,7 +53,7 @@ def test_runtime_template_has_fixed_identity_entrypoint_and_manifest(
     command = service["ExecStart"]
     assert command.startswith(f"{EXPECTED_EXECUTABLE} -m {EXPECTED_MODULE} ")
     assert (
-        f"--manifest {RUNTIME_ROOT}/manifests/%i.json" in command
+        f"--manifest {CURRENT_ROOT}/manifests/%i.json" in command
     )
     assert f"--control-root {CONTROL_ROOT}" in command
     assert "--expected-commit ${RQUANT_RUNTIME_COMMIT}" in command
@@ -113,7 +114,7 @@ def test_only_live_instances_may_load_one_scoped_secret_file() -> None:
     serving = _load("serving")["Service"]
     research = _load("research")["Service"]
 
-    assert live["EnvironmentFile"] == f"{RUNTIME_ROOT}/secrets/%i.env"
+    assert live["EnvironmentFile"] == f"{CURRENT_ROOT}/secrets/%i.env"
     assert serving["EnvironmentFile"] == ENVIRONMENT_FILE
     assert research["EnvironmentFile"] == ENVIRONMENT_FILE
 

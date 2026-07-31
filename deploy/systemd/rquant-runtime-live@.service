@@ -12,9 +12,9 @@ User=lighthouse
 Group=lighthouse
 WorkingDirectory=/home/lighthouse/rquant
 Environment=RQUANT_DISABLE_DOTENV=1
-EnvironmentFile=/home/lighthouse/rquant/data/runtime/secrets/%i.env
+EnvironmentFile=/home/lighthouse/rquant/data/runtime/current/secrets/%i.env
 Slice=rquant-live.slice
-ExecStart=/home/lighthouse/rquant/.venv/bin/python -m rquant.runtime_service_main --manifest /home/lighthouse/rquant/data/runtime/manifests/%i.json --control-root /home/lighthouse/rquant/data/runtime/control --expected-commit ${RQUANT_RUNTIME_COMMIT}
+ExecStart=/home/lighthouse/rquant/.venv/bin/python -m rquant.runtime_service_main --manifest /home/lighthouse/rquant/data/runtime/current/manifests/%i.json --control-root /home/lighthouse/rquant/data/runtime/control --expected-commit ${RQUANT_RUNTIME_COMMIT}
 
 Restart=on-failure
 RestartSec=10s
