@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -25,6 +25,8 @@ from rquant.strategy_candidate_snapshot import (
     StrategyCandidateRecord,
     StrategyCandidateSnapshot,
     StrategyCandidateSnapshotSpool,
+    candidate_occurrence_id,
+    strategy_candidate_snapshot_content_sha256,
 )
 
 COMMIT = "a" * 40
@@ -41,7 +43,9 @@ def _row(
     strategy_version: str = "v1",
     decision_at: datetime | None = None,
     available_at: datetime | None = None,
+    effective_trade_date: date = TRADE_DATE,
     variant: str = "default",
+    static_features: dict[str, object] | None = None,
 ) -> StrategyCandidateRecord:
     resolved_decision_at = decision_at or AS_OF - timedelta(minutes=5)
     return StrategyCandidateRecord(
@@ -51,9 +55,10 @@ def _row(
         variant=variant,
         decision_at=resolved_decision_at,
         available_at=available_at or resolved_decision_at + timedelta(minutes=1),
+        effective_trade_date=effective_trade_date,
         reference_trade_date=resolved_decision_at.date() - timedelta(days=1),
         price_basis=StrategyCandidatePriceBasis.QFQ_PIT,
-        static_features={"score": 0.8},
+        static_features=static_features or {"score": 0.8},
         reference_snapshot_ids={"daily": REFERENCE_HASH},
     )
 
@@ -79,6 +84,7 @@ def _publish(
                 code,
                 strategy_id=strategy_id,
                 strategy_version=strategy_version,
+                effective_trade_date=trade_date,
                 decision_at=datetime.combine(
                     trade_date,
                     resolved_captured_at.timetz(),
@@ -227,6 +233,317 @@ def test_load_unions_codes_and_preserves_all_authority_evidence(tmp_path: Path) 
     assert result.content_fingerprint == canonical_sha256(
         result.model_dump(mode="python", exclude={"content_fingerprint"})
     )
+
+
+def test_load_accepts_prior_day_decision_and_preserves_immutable_pit_features(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "next-session"
+    features = {"score": 0.91, "levels": {"support": [10.1, 10.2]}}
+    cst = timezone(timedelta(hours=8))
+    decision_at = datetime(2026, 7, 30, 17, 0, tzinfo=cst)
+    available_at = datetime(2026, 7, 30, 17, 1, tzinfo=cst)
+    captured_at = datetime(2026, 7, 30, 17, 2, tzinfo=cst)
+    next_open = datetime(2026, 7, 31, 9, 30, tzinfo=cst)
+    row = _row(
+        "000001.SZ",
+        decision_at=decision_at,
+        available_at=available_at,
+        effective_trade_date=TRADE_DATE,
+        static_features=features,
+    )
+    snapshot = _publish(root, captured_at=captured_at, rows=(row,))
+    features["score"] = 0.01
+    features["levels"]["support"].append(99.0)  # type: ignore[index, union-attr]
+
+    result = _loader(_authority(root, max_age_seconds=24 * 60 * 60)).load(
+        as_of=next_open,
+        required_trade_date=TRADE_DATE,
+    )
+    hit = result.code_evidence[0].hits[0]
+
+    assert snapshot.captured_at == datetime(2026, 7, 30, 9, 2, tzinfo=UTC)
+    assert result.as_of == AS_OF
+    assert hit.decision_at.date() == TRADE_DATE - timedelta(days=1)
+    assert hit.effective_trade_date == TRADE_DATE
+    assert hit.occurrence_id == row.occurrence_id
+    assert hit.static_features == {
+        "levels": {"support": (10.1, 10.2)},
+        "score": 0.91,
+    }
+    assert dict(hit.reference_snapshot_ids) == {"daily": REFERENCE_HASH}
+    with pytest.raises(TypeError):
+        hit.static_features["score"] = 0.5  # type: ignore[index]
+    with pytest.raises(TypeError):
+        hit.static_features["levels"]["support"] = ()  # type: ignore[index]
+    with pytest.raises(TypeError):
+        hit.reference_snapshot_ids["daily"] = "2" * 64  # type: ignore[index]
+
+
+@pytest.mark.parametrize("field", ["effective_trade_date", "occurrence_id"])
+def test_result_rejects_rehashed_occurrence_identity_tampering(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    root = tmp_path / field
+    _publish(root)
+    result = _loader(_authority(root)).load(
+        as_of=AS_OF,
+        required_trade_date=TRADE_DATE,
+    )
+    payload = result.model_dump(mode="python")
+    hit = payload["code_evidence"][0]["hits"][0]
+    if field == "effective_trade_date":
+        hit[field] = TRADE_DATE + timedelta(days=1)
+        hit["occurrence_id"] = candidate_occurrence_id(
+            strategy_id=hit["strategy_id"],
+            strategy_version=hit["strategy_version"],
+            candidate_id=hit["candidate_id"],
+            variant=hit["variant"],
+            effective_trade_date=hit[field],
+        )
+    else:
+        hit[field] = "f" * 64
+    payload["content_fingerprint"] = canonical_sha256(
+        {key: value for key, value in payload.items() if key != "content_fingerprint"}
+    )
+
+    with pytest.raises(ValidationError, match="effective|occurrence"):
+        RuntimeCandidateUniverseResult.model_validate(payload)
+
+
+def test_result_generation_hash_binds_static_features(tmp_path: Path) -> None:
+    root = tmp_path / "features"
+    _publish(root)
+    result = _loader(_authority(root)).load(
+        as_of=AS_OF,
+        required_trade_date=TRADE_DATE,
+    )
+    payload = result.model_dump(mode="python")
+    payload["code_evidence"][0]["hits"][0]["static_features"]["score"] = 0.99
+    payload["content_fingerprint"] = canonical_sha256(
+        {key: value for key, value in payload.items() if key != "content_fingerprint"}
+    )
+
+    with pytest.raises(ValidationError, match="generation"):
+        RuntimeCandidateUniverseResult.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("reference_trade_date", TRADE_DATE - timedelta(days=2)),
+        ("price_basis", StrategyCandidatePriceBasis.RAW),
+        ("reference_snapshot_ids", {"daily": "2" * 64}),
+    ],
+)
+def test_result_generation_hash_binds_remaining_row_contract(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    root = tmp_path / field
+    _publish(root)
+    result = _loader(_authority(root)).load(
+        as_of=AS_OF,
+        required_trade_date=TRADE_DATE,
+    )
+    payload = result.model_dump(mode="python")
+    payload["code_evidence"][0]["hits"][0][field] = value
+    payload["content_fingerprint"] = canonical_sha256(
+        {key: item for key, item in payload.items() if key != "content_fingerprint"}
+    )
+
+    with pytest.raises(ValidationError, match="generation"):
+        RuntimeCandidateUniverseResult.model_validate(payload)
+
+
+def test_result_reconstructs_legacy_v1_generation_hash() -> None:
+    row = _row("000001.SZ")
+    captured_at = AS_OF - timedelta(minutes=2)
+    generation_sha256 = strategy_candidate_snapshot_content_sha256(
+        schema_version=1,
+        sequence=0,
+        trade_date=TRADE_DATE,
+        captured_at=captured_at,
+        producer_commit=COMMIT,
+        rows=(row,),
+    )
+    authority = CandidateUniverseAuthorityEvidence(
+        strategy_id=row.strategy_id,
+        strategy_version=row.strategy_version,
+        schema_version=1,
+        generation_sha256=generation_sha256,
+        sequence=0,
+        row_count=1,
+        captured_at=captured_at,
+        codes=(row.candidate_id,),
+    )
+    hit = CandidateUniverseHitEvidence(
+        schema_version=1,
+        strategy_id=row.strategy_id,
+        strategy_version=row.strategy_version,
+        generation_sha256=generation_sha256,
+        candidate_id=row.candidate_id,
+        variant=row.variant,
+        decision_at=row.decision_at,
+        available_at=row.available_at,
+        effective_trade_date=row.effective_trade_date,
+        occurrence_id=row.occurrence_id,
+        static_features=row.static_features,
+        reference_trade_date=row.reference_trade_date,
+        price_basis=row.price_basis,
+        reference_snapshot_ids=row.reference_snapshot_ids,
+    )
+    result = RuntimeCandidateUniverseResult.build(
+        as_of=AS_OF,
+        required_trade_date=TRADE_DATE,
+        expected_commit=COMMIT,
+        codes=(row.candidate_id,),
+        authorities=(authority,),
+        degraded_optional_authorities=(),
+        code_evidence=(CandidateUniverseCodeEvidence(code=row.candidate_id, hits=(hit,)),),
+    )
+
+    payload = result.model_dump(mode="python")
+    payload["code_evidence"][0]["hits"][0]["static_features"]["score"] = 999
+    payload["content_fingerprint"] = canonical_sha256(
+        {key: value for key, value in payload.items() if key != "content_fingerprint"}
+    )
+    with pytest.raises(ValidationError, match="generation"):
+        RuntimeCandidateUniverseResult.model_validate(payload)
+
+
+def test_candidate_hit_dates_use_asia_shanghai_calendar_day(tmp_path: Path) -> None:
+    root = tmp_path / "shanghai-date"
+    _publish(root)
+    hit = (
+        _loader(_authority(root))
+        .load(
+            as_of=AS_OF,
+            required_trade_date=TRADE_DATE,
+        )
+        .code_evidence[0]
+        .hits[0]
+    )
+    shanghai_midnight = datetime(
+        2026,
+        7,
+        31,
+        0,
+        30,
+        tzinfo=timezone(timedelta(hours=8)),
+    )
+    payload = hit.model_dump(mode="python")
+    payload["decision_at"] = shanghai_midnight
+    payload["available_at"] = shanghai_midnight
+    payload["effective_trade_date"] = date(2026, 7, 30)
+    payload["reference_trade_date"] = date(2026, 7, 30)
+    payload["occurrence_id"] = candidate_occurrence_id(
+        strategy_id=payload["strategy_id"],
+        strategy_version=payload["strategy_version"],
+        candidate_id=payload["candidate_id"],
+        variant=payload["variant"],
+        effective_trade_date=payload["effective_trade_date"],
+    )
+    with pytest.raises(ValidationError, match="effective_trade_date"):
+        CandidateUniverseHitEvidence.model_validate(payload)
+
+    payload["effective_trade_date"] = TRADE_DATE
+    payload["reference_trade_date"] = TRADE_DATE
+    payload["occurrence_id"] = candidate_occurrence_id(
+        strategy_id=payload["strategy_id"],
+        strategy_version=payload["strategy_version"],
+        candidate_id=payload["candidate_id"],
+        variant=payload["variant"],
+        effective_trade_date=payload["effective_trade_date"],
+    )
+    assert CandidateUniverseHitEvidence.model_validate(payload).effective_trade_date == TRADE_DATE
+
+
+def test_candidate_hit_date_semantics_follow_snapshot_schema() -> None:
+    decision_at = datetime(2026, 7, 31, 16, 30, tzinfo=UTC)
+    effective_trade_date = date(2026, 7, 31)
+    occurrence_id = candidate_occurrence_id(
+        strategy_id="n_shape",
+        strategy_version="v1",
+        candidate_id="000001.SZ",
+        variant="default",
+        effective_trade_date=effective_trade_date,
+    )
+    payload = {
+        "schema_version": 1,
+        "strategy_id": "n_shape",
+        "strategy_version": "v1",
+        "generation_sha256": "2" * 64,
+        "candidate_id": "000001.SZ",
+        "variant": "default",
+        "decision_at": decision_at,
+        "available_at": decision_at + timedelta(minutes=1),
+        "effective_trade_date": effective_trade_date,
+        "occurrence_id": occurrence_id,
+        "static_features": {"score": 0.8},
+        "reference_trade_date": effective_trade_date,
+        "price_basis": StrategyCandidatePriceBasis.QFQ_PIT,
+        "reference_snapshot_ids": {"daily": REFERENCE_HASH},
+    }
+
+    legacy = CandidateUniverseHitEvidence.model_validate(payload)
+    assert legacy.schema_version == 1
+
+    payload["schema_version"] = 2
+    with pytest.raises(ValidationError, match="effective_trade_date"):
+        CandidateUniverseHitEvidence.model_validate(payload)
+
+
+def test_v1_hit_requires_same_utc_decision_date_while_v2_allows_prior_day() -> None:
+    decision_at = datetime(2026, 7, 30, 9, 0, tzinfo=UTC)
+    effective_trade_date = TRADE_DATE
+    payload = {
+        "schema_version": 1,
+        "strategy_id": "n_shape",
+        "strategy_version": "v1",
+        "generation_sha256": "2" * 64,
+        "candidate_id": "000001.SZ",
+        "variant": "default",
+        "decision_at": decision_at,
+        "available_at": decision_at + timedelta(minutes=1),
+        "effective_trade_date": effective_trade_date,
+        "occurrence_id": candidate_occurrence_id(
+            strategy_id="n_shape",
+            strategy_version="v1",
+            candidate_id="000001.SZ",
+            variant="default",
+            effective_trade_date=effective_trade_date,
+        ),
+        "static_features": {"score": 0.8},
+        "reference_trade_date": date(2026, 7, 30),
+        "price_basis": StrategyCandidatePriceBasis.QFQ_PIT,
+        "reference_snapshot_ids": {"daily": REFERENCE_HASH},
+    }
+
+    with pytest.raises(ValidationError, match="decision"):
+        CandidateUniverseHitEvidence.model_validate(payload)
+
+    payload["schema_version"] = 2
+    assert CandidateUniverseHitEvidence.model_validate(payload).effective_trade_date == TRADE_DATE
+
+
+def test_result_requires_hit_and_authority_schema_to_match(tmp_path: Path) -> None:
+    root = tmp_path / "schema-mismatch"
+    _publish(root)
+    result = _loader(_authority(root)).load(
+        as_of=AS_OF,
+        required_trade_date=TRADE_DATE,
+    )
+    payload = result.model_dump(mode="python")
+    payload["code_evidence"][0]["hits"][0]["schema_version"] = 1
+    payload["content_fingerprint"] = canonical_sha256(
+        {key: value for key, value in payload.items() if key != "content_fingerprint"}
+    )
+
+    with pytest.raises(ValidationError, match="schema"):
+        RuntimeCandidateUniverseResult.model_validate(payload)
 
 
 def test_optional_missing_is_degraded_but_required_missing_fails(tmp_path: Path) -> None:

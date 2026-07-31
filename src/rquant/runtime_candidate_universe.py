@@ -5,11 +5,21 @@ from __future__ import annotations
 import os
 import re
 from collections import defaultdict
+from collections.abc import Mapping
 from datetime import date, datetime
 from pathlib import Path
+from types import MappingProxyType
 from typing import Annotated, Literal
 
-from pydantic import Field, StrictInt, StringConstraints, field_validator, model_validator
+from pydantic import (
+    Field,
+    JsonValue,
+    StrictInt,
+    StringConstraints,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
 from rquant.runtime_contracts import (
     AwareUtcDatetime,
@@ -18,9 +28,17 @@ from rquant.runtime_contracts import (
     normalize_aware_utc,
 )
 from rquant.strategy_candidate_snapshot import (
+    StrategyCandidatePriceBasis,
+    StrategyCandidateRecord,
     StrategyCandidateSnapshot,
     StrategyCandidateSnapshotIntegrityError,
     StrategyCandidateSnapshotSpool,
+    candidate_occurrence_id,
+    canonicalize_candidate_static_features,
+    serialize_candidate_static_features,
+    strategy_candidate_decision_trade_date,
+    strategy_candidate_snapshot_content_sha256,
+    thaw_candidate_static_features,
 )
 
 CommitSha = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{40}$")]
@@ -74,6 +92,7 @@ class RuntimeCandidateUniverseConfig(RuntimeContractModel):
 class CandidateUniverseAuthorityEvidence(RuntimeContractModel):
     strategy_id: str = Field(min_length=1)
     strategy_version: str = Field(min_length=1)
+    schema_version: Literal[1, 2]
     generation_sha256: Sha256
     sequence: int = Field(ge=0)
     row_count: int = Field(ge=0)
@@ -90,6 +109,7 @@ class CandidateUniverseAuthorityEvidence(RuntimeContractModel):
 
 
 class CandidateUniverseHitEvidence(RuntimeContractModel):
+    schema_version: Literal[1, 2]
     strategy_id: str = Field(min_length=1)
     strategy_version: str = Field(min_length=1)
     generation_sha256: Sha256
@@ -97,11 +117,75 @@ class CandidateUniverseHitEvidence(RuntimeContractModel):
     variant: str = Field(min_length=1)
     decision_at: AwareUtcDatetime
     available_at: AwareUtcDatetime
+    effective_trade_date: date
+    occurrence_id: Sha256
+    static_features: Mapping[str, JsonValue]
+    reference_trade_date: date
+    price_basis: StrategyCandidatePriceBasis
+    reference_snapshot_ids: Mapping[str, Sha256]
+
+    @field_validator("static_features", mode="before")
+    @classmethod
+    def thaw_static_features_for_validation(cls, value: object) -> JsonValue:
+        return thaw_candidate_static_features(value)
+
+    @field_validator("static_features")
+    @classmethod
+    def freeze_static_features(cls, value: object) -> Mapping[str, JsonValue]:
+        return canonicalize_candidate_static_features(value)
+
+    @field_serializer("static_features")
+    def serialize_static_features(
+        self,
+        value: Mapping[str, JsonValue],
+    ) -> dict[str, JsonValue]:
+        return serialize_candidate_static_features(value)
+
+    @field_validator("reference_snapshot_ids", mode="before")
+    @classmethod
+    def thaw_reference_snapshot_ids(cls, value: object) -> object:
+        return dict(value) if isinstance(value, Mapping) else value
+
+    @field_validator("reference_snapshot_ids")
+    @classmethod
+    def freeze_reference_snapshot_ids(
+        cls,
+        value: Mapping[str, str],
+    ) -> Mapping[str, str]:
+        if any(not isinstance(key, str) or not key for key in value):
+            raise ValueError("reference_snapshot_ids keys must be non-empty strings")
+        return MappingProxyType(dict(sorted(value.items())))
+
+    @field_serializer("reference_snapshot_ids")
+    def serialize_reference_snapshot_ids(
+        self,
+        value: Mapping[str, str],
+    ) -> dict[str, str]:
+        return dict(value)
 
     @model_validator(mode="after")
     def validate_pit_order(self) -> CandidateUniverseHitEvidence:
         if self.available_at < self.decision_at:
             raise ValueError("candidate hit available_at cannot precede decision_at")
+        decision_trade_date = strategy_candidate_decision_trade_date(
+            self.decision_at,
+            legacy_utc_date_semantics=self.schema_version == 1,
+        )
+        if self.schema_version == 1 and self.effective_trade_date != decision_trade_date:
+            raise ValueError("schema v1 decision date must equal effective_trade_date")
+        if self.schema_version == 2 and self.effective_trade_date < decision_trade_date:
+            raise ValueError("candidate hit effective_trade_date precedes decision date")
+        if self.reference_trade_date > decision_trade_date:
+            raise ValueError("candidate hit reference_trade_date is a future reference")
+        expected_occurrence = candidate_occurrence_id(
+            strategy_id=self.strategy_id,
+            strategy_version=self.strategy_version,
+            candidate_id=self.candidate_id,
+            variant=self.variant,
+            effective_trade_date=self.effective_trade_date,
+        )
+        if self.occurrence_id != expected_occurrence:
+            raise ValueError("candidate hit occurrence_id does not bind semantic identity")
         return self
 
 
@@ -123,6 +207,8 @@ class CandidateUniverseCodeEvidence(RuntimeContractModel):
                     hit.strategy_version,
                     hit.candidate_id,
                     hit.variant,
+                    hit.effective_trade_date,
+                    hit.occurrence_id,
                 ),
             )
         )
@@ -133,6 +219,8 @@ class CandidateUniverseCodeEvidence(RuntimeContractModel):
                 hit.generation_sha256,
                 hit.candidate_id,
                 hit.variant,
+                hit.effective_trade_date,
+                hit.occurrence_id,
             )
             for hit in canonical
         ]
@@ -192,12 +280,16 @@ class RuntimeCandidateUniverseResult(RuntimeContractModel):
             for hit in code_item.hits:
                 if not (hit.decision_at <= hit.available_at <= self.as_of):
                     raise ValueError("candidate hit evidence violates PIT visibility")
-                if hit.decision_at.date() != self.required_trade_date:
-                    raise ValueError("candidate hit decision date does not match result trade date")
+                if hit.effective_trade_date != self.required_trade_date:
+                    raise ValueError(
+                        "candidate hit effective trade date does not match result trade date"
+                    )
                 key = (hit.strategy_id, hit.strategy_version)
                 authority = authority_by_key.get(key)
                 if authority is None:
                     raise ValueError("candidate hit has no successful authority evidence")
+                if hit.schema_version != authority.schema_version:
+                    raise ValueError("candidate hit schema does not match its authority")
                 if hit.generation_sha256 != authority.generation_sha256:
                     raise ValueError("candidate hit generation does not match its authority")
                 if hit.available_at > authority.captured_at:
@@ -211,6 +303,35 @@ class RuntimeCandidateUniverseResult(RuntimeContractModel):
                 raise ValueError("authority row_count does not match candidate hits")
             if tuple(sorted(hit.candidate_id for hit in hits)) != authority.codes:
                 raise ValueError("authority codes do not match candidate hits")
+            rows = tuple(
+                StrategyCandidateRecord(
+                    strategy_id=hit.strategy_id,
+                    strategy_version=hit.strategy_version,
+                    candidate_id=hit.candidate_id,
+                    variant=hit.variant,
+                    decision_at=hit.decision_at,
+                    available_at=hit.available_at,
+                    effective_trade_date=hit.effective_trade_date,
+                    reference_trade_date=hit.reference_trade_date,
+                    price_basis=hit.price_basis,
+                    static_features=hit.static_features,
+                    reference_snapshot_ids=hit.reference_snapshot_ids,
+                    legacy_utc_date_semantics=authority.schema_version == 1,
+                )
+                for hit in hits
+            )
+            reconstructed_generation = strategy_candidate_snapshot_content_sha256(
+                schema_version=authority.schema_version,
+                sequence=authority.sequence,
+                trade_date=self.required_trade_date,
+                captured_at=authority.captured_at,
+                producer_commit=self.expected_commit,
+                rows=rows,
+            )
+            if reconstructed_generation != authority.generation_sha256:
+                raise ValueError(
+                    "candidate authority generation does not bind reconstructed snapshot"
+                )
         expected = canonical_sha256(self.model_dump(mode="python", exclude={"content_fingerprint"}))
         if self.content_fingerprint != expected:
             raise ValueError("content_fingerprint does not bind the candidate universe")
@@ -280,6 +401,7 @@ class RuntimeCandidateUniverseLoader:
                 codes.append(code)
                 hits_by_code[code].append(
                     CandidateUniverseHitEvidence(
+                        schema_version=snapshot.schema_version,
                         strategy_id=authority.strategy_id,
                         strategy_version=authority.strategy_version,
                         generation_sha256=snapshot.content_sha256,
@@ -287,12 +409,19 @@ class RuntimeCandidateUniverseLoader:
                         variant=row.variant,
                         decision_at=row.decision_at,
                         available_at=row.available_at,
+                        effective_trade_date=row.effective_trade_date,
+                        occurrence_id=row.occurrence_id,
+                        static_features=row.static_features,
+                        reference_trade_date=row.reference_trade_date,
+                        price_basis=row.price_basis,
+                        reference_snapshot_ids=row.reference_snapshot_ids,
                     )
                 )
             authority_evidence.append(
                 CandidateUniverseAuthorityEvidence(
                     strategy_id=authority.strategy_id,
                     strategy_version=authority.strategy_version,
+                    schema_version=snapshot.schema_version,
                     generation_sha256=snapshot.content_sha256,
                     sequence=snapshot.sequence,
                     row_count=len(snapshot.rows),
@@ -390,6 +519,11 @@ class RuntimeCandidateUniverseLoader:
                 raise self._error(authority, "candidate row authority identity mismatch")
             if row.available_at > as_of:
                 raise self._error(authority, "candidate row is not yet available")
+            if row.effective_trade_date != required_trade_date:
+                raise self._error(
+                    authority,
+                    "candidate row effective trade date does not match required trade date",
+                )
             if not _TS_CODE_PATTERN.fullmatch(row.candidate_id):
                 raise self._error(authority, f"invalid A-share candidate code: {row.candidate_id}")
 

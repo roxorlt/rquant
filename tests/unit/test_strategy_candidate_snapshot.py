@@ -17,6 +17,7 @@ from rquant.strategy_candidate_snapshot import (
     StrategyCandidateSnapshotIntegrityError,
     StrategyCandidateSnapshotPointer,
     StrategyCandidateSnapshotSpool,
+    strategy_candidate_snapshot_content_sha256,
 )
 
 COMMIT_A = "a" * 40
@@ -34,6 +35,7 @@ def _row(
     variant: str = "pool1",
     decision_at: datetime = DECISION_AT,
     available_at: datetime = AVAILABLE_AT,
+    effective_trade_date: date = TRADE_DATE,
     reference_trade_date: date = date(2026, 7, 30),
     price_basis: StrategyCandidatePriceBasis = StrategyCandidatePriceBasis.QFQ_PIT,
     static_features: dict[str, object] | None = None,
@@ -46,6 +48,7 @@ def _row(
         variant=variant,
         decision_at=decision_at,
         available_at=available_at,
+        effective_trade_date=effective_trade_date,
         reference_trade_date=reference_trade_date,
         price_basis=price_basis,
         static_features=static_features
@@ -65,10 +68,11 @@ def _snapshot(
     captured_at: datetime = CAPTURED_AT,
     rows: tuple[StrategyCandidateRecord, ...] | None = None,
     producer_commit: str = COMMIT_A,
+    trade_date: date = TRADE_DATE,
 ) -> StrategyCandidateSnapshot:
     return StrategyCandidateSnapshot.build(
         sequence=sequence,
-        trade_date=TRADE_DATE,
+        trade_date=trade_date,
         captured_at=captured_at,
         producer_commit=producer_commit,
         rows=rows or (_row(),),
@@ -96,10 +100,284 @@ def _tree_state(root: Path) -> tuple[tuple[str, int, int, bytes], ...]:
     )
 
 
+def _write_legacy_v1_authority(
+    root: Path,
+    *,
+    tamper_variant: bool = False,
+) -> tuple[StrategyCandidateSnapshotSpool, str]:
+    snapshot = _snapshot()
+    hash_identity = snapshot.model_dump(mode="python", exclude={"content_sha256"})
+    hash_identity.pop("schema_version", None)
+    for row in hash_identity["rows"]:
+        row.pop("effective_trade_date")
+    generation_sha256 = canonical_sha256(hash_identity)
+
+    payload = snapshot.model_dump(mode="json")
+    payload.pop("schema_version", None)
+    for row in payload["rows"]:
+        row.pop("effective_trade_date")
+    payload["content_sha256"] = generation_sha256
+    if tamper_variant:
+        payload["rows"][0]["variant"] = "forged"
+
+    generations = root / "generations"
+    generations.mkdir(parents=True, mode=0o700)
+    root.chmod(0o700)
+    generations.chmod(0o700)
+    lock = root / ".publish.lock"
+    lock.touch(mode=0o600)
+    lock.chmod(0o600)
+    generation = generations / f"{generation_sha256}.json"
+    generation.write_bytes(
+        json.dumps(
+            payload,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    )
+    generation.chmod(0o600)
+    pointer = {
+        "captured_at": payload["captured_at"],
+        "generation_sha256": generation_sha256,
+        "producer_commit": payload["producer_commit"],
+        "sequence": payload["sequence"],
+        "trade_date": payload["trade_date"],
+    }
+    current = root / "current.json"
+    current.write_bytes(
+        json.dumps(pointer, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode(
+            "utf-8"
+        )
+    )
+    current.chmod(0o600)
+    return StrategyCandidateSnapshotSpool(root.resolve()), generation_sha256
+
+
+def _write_legacy_v1_midnight_boundary_authority(
+    root: Path,
+) -> tuple[StrategyCandidateSnapshotSpool, str, bytes, bytes]:
+    decision_at = datetime(2026, 7, 31, 16, 30, tzinfo=UTC)
+    available_at = decision_at + timedelta(minutes=1)
+    captured_at = decision_at + timedelta(minutes=2)
+    trade_date = date(2026, 7, 31)
+    row_identity = {
+        "strategy_id": "n_shape",
+        "strategy_version": "b-v1",
+        "candidate_id": "000001.SZ",
+        "variant": "pool1",
+        "decision_at": decision_at,
+        "available_at": available_at,
+        "reference_trade_date": trade_date,
+        "price_basis": StrategyCandidatePriceBasis.QFQ_PIT,
+        "static_features": {"score": 0.8},
+        "reference_snapshot_ids": {"daily_state": HASH_A},
+    }
+    identity = {
+        "sequence": 0,
+        "trade_date": trade_date,
+        "captured_at": captured_at,
+        "producer_commit": COMMIT_A,
+        "rows": (row_identity,),
+    }
+    generation_sha256 = canonical_sha256(identity)
+    payload = {
+        "captured_at": "2026-07-31T16:32:00Z",
+        "content_sha256": generation_sha256,
+        "producer_commit": COMMIT_A,
+        "rows": [
+            {
+                "available_at": "2026-07-31T16:31:00Z",
+                "candidate_id": "000001.SZ",
+                "decision_at": "2026-07-31T16:30:00Z",
+                "price_basis": "qfq_pit",
+                "reference_snapshot_ids": {"daily_state": HASH_A},
+                "reference_trade_date": "2026-07-31",
+                "static_features": {"score": 0.8},
+                "strategy_id": "n_shape",
+                "strategy_version": "b-v1",
+                "variant": "pool1",
+            }
+        ],
+        "sequence": 0,
+        "trade_date": "2026-07-31",
+    }
+    generation_bytes = json.dumps(
+        payload,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    pointer = {
+        "captured_at": payload["captured_at"],
+        "generation_sha256": generation_sha256,
+        "producer_commit": COMMIT_A,
+        "sequence": 0,
+        "trade_date": payload["trade_date"],
+    }
+    pointer_bytes = json.dumps(
+        pointer,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+    generations = root / "generations"
+    generations.mkdir(parents=True, mode=0o700)
+    root.chmod(0o700)
+    generations.chmod(0o700)
+    lock = root / ".publish.lock"
+    lock.touch(mode=0o600)
+    lock.chmod(0o600)
+    generation = generations / f"{generation_sha256}.json"
+    generation.write_bytes(generation_bytes)
+    generation.chmod(0o600)
+    current = root / "current.json"
+    current.write_bytes(pointer_bytes)
+    current.chmod(0o600)
+    return (
+        StrategyCandidateSnapshotSpool(root.resolve()),
+        generation_sha256,
+        generation_bytes,
+        pointer_bytes,
+    )
+
+
 def test_all_cross_layer_contracts_inherit_runtime_contract_model() -> None:
     assert issubclass(StrategyCandidateRecord, RuntimeContractModel)
     assert issubclass(StrategyCandidateSnapshot, RuntimeContractModel)
     assert issubclass(StrategyCandidateSnapshotPointer, RuntimeContractModel)
+
+
+def test_legacy_v1_generation_reads_and_can_advance_to_v2(tmp_path: Path) -> None:
+    spool, legacy_hash = _write_legacy_v1_authority(tmp_path / "legacy")
+
+    legacy = spool.read_as_of(CAPTURED_AT + timedelta(minutes=1))
+
+    assert legacy is not None
+    assert legacy.schema_version == 1
+    assert legacy.content_sha256 == legacy_hash
+    assert legacy.rows[0].effective_trade_date == legacy.trade_date
+
+    current = _snapshot(
+        sequence=1,
+        captured_at=CAPTURED_AT + timedelta(minutes=2),
+        rows=(
+            _row(
+                variant="pool2",
+                decision_at=CAPTURED_AT + timedelta(minutes=1),
+                available_at=CAPTURED_AT + timedelta(minutes=1),
+            ),
+        ),
+    )
+    spool.publish(current)
+
+    assert current.schema_version == 2
+    assert spool.read_as_of(CAPTURED_AT + timedelta(minutes=3)) == current
+
+
+def test_legacy_v1_generation_tampering_still_fails_closed(tmp_path: Path) -> None:
+    spool, _ = _write_legacy_v1_authority(
+        tmp_path / "legacy-tampered",
+        tamper_variant=True,
+    )
+
+    with pytest.raises(StrategyCandidateSnapshotIntegrityError):
+        spool.read_as_of(CAPTURED_AT + timedelta(minutes=1))
+
+
+def test_legacy_v1_generation_must_keep_original_canonical_bytes(tmp_path: Path) -> None:
+    spool, generation_sha256 = _write_legacy_v1_authority(tmp_path / "legacy-noncanonical")
+    generation = spool.generations_root / f"{generation_sha256}.json"
+    payload = json.loads(generation.read_bytes())
+    generation.write_text(json.dumps(payload, indent=2, sort_keys=True))
+    generation.chmod(0o600)
+
+    with pytest.raises(StrategyCandidateSnapshotIntegrityError, match="canonical"):
+        spool.read_as_of(CAPTURED_AT + timedelta(minutes=1))
+
+
+def test_legacy_v1_uses_utc_date_semantics_across_shanghai_midnight(tmp_path: Path) -> None:
+    spool, generation_sha256, generation_bytes, pointer_bytes = (
+        _write_legacy_v1_midnight_boundary_authority(tmp_path / "legacy-midnight")
+    )
+
+    snapshot = spool.read_as_of(datetime(2026, 7, 31, 16, 33, tzinfo=UTC))
+
+    assert snapshot is not None
+    assert snapshot.schema_version == 1
+    assert snapshot.trade_date == date(2026, 7, 31)
+    assert snapshot.rows[0].effective_trade_date == date(2026, 7, 31)
+    assert snapshot.content_sha256 == generation_sha256
+    assert (spool.generations_root / f"{generation_sha256}.json").read_bytes() == generation_bytes
+    assert spool.current_path.read_bytes() == pointer_bytes
+
+    with pytest.raises(ValidationError, match="effective_trade_date"):
+        _row(
+            decision_at=datetime(2026, 7, 31, 16, 30, tzinfo=UTC),
+            available_at=datetime(2026, 7, 31, 16, 31, tzinfo=UTC),
+            effective_trade_date=date(2026, 7, 31),
+            reference_trade_date=date(2026, 7, 31),
+        )
+
+
+def test_v2_rejects_legacy_date_marker_and_marker_is_never_serialized() -> None:
+    payload = _row().model_dump(mode="python")
+    payload["legacy_utc_date_semantics"] = True
+    legacy_row = StrategyCandidateRecord.model_validate(payload)
+
+    assert "legacy_utc_date_semantics" not in legacy_row.model_dump(mode="json")
+    with pytest.raises(ValidationError, match="legacy"):
+        StrategyCandidateSnapshot.build(
+            sequence=0,
+            trade_date=TRADE_DATE,
+            captured_at=CAPTURED_AT,
+            producer_commit=COMMIT_A,
+            rows=(legacy_row,),
+        )
+
+
+def test_v1_requires_same_utc_decision_date_while_v2_allows_prior_day() -> None:
+    decision_at = datetime(2026, 7, 30, 9, 0, tzinfo=UTC)
+    v2_row = _row(
+        decision_at=decision_at,
+        available_at=decision_at + timedelta(minutes=1),
+        effective_trade_date=TRADE_DATE,
+        reference_trade_date=date(2026, 7, 30),
+    )
+    legacy_payload = v2_row.model_dump(mode="python")
+    legacy_payload["legacy_utc_date_semantics"] = True
+    v1_row = StrategyCandidateRecord.model_validate(legacy_payload)
+    captured_at = decision_at + timedelta(minutes=2)
+    v1_hash = strategy_candidate_snapshot_content_sha256(
+        schema_version=1,
+        sequence=0,
+        trade_date=TRADE_DATE,
+        captured_at=captured_at,
+        producer_commit=COMMIT_A,
+        rows=(v1_row,),
+    )
+
+    with pytest.raises(ValidationError, match="decision"):
+        StrategyCandidateSnapshot(
+            schema_version=1,
+            sequence=0,
+            trade_date=TRADE_DATE,
+            captured_at=captured_at,
+            producer_commit=COMMIT_A,
+            rows=(v1_row,),
+            content_sha256=v1_hash,
+        )
+
+    v2 = StrategyCandidateSnapshot.build(
+        sequence=0,
+        trade_date=TRADE_DATE,
+        captured_at=captured_at,
+        producer_commit=COMMIT_A,
+        rows=(v2_row,),
+    )
+    assert v2.rows[0].decision_at.date() == date(2026, 7, 30)
+    assert v2.trade_date == TRADE_DATE
 
 
 def test_candidate_normalizes_utc_and_deep_freezes_canonical_mappings() -> None:
@@ -129,12 +407,56 @@ def test_candidate_normalizes_utc_and_deep_freezes_canonical_mappings() -> None:
         row.static_features["z"][0]["inside"] = (99,)  # type: ignore[index]
 
 
+def test_candidate_occurrence_id_is_canonical_and_changes_by_effective_trade_date() -> None:
+    row = _row()
+    next_day = _row(effective_trade_date=TRADE_DATE + timedelta(days=1))
+
+    assert row.occurrence_id == canonical_sha256(
+        {
+            "strategy_id": "n_shape",
+            "strategy_version": "b-v1",
+            "candidate_id": "000001.SZ",
+            "variant": "pool1",
+            "effective_trade_date": TRADE_DATE,
+        }
+    )
+    assert next_day.occurrence_id != row.occurrence_id
+
+
+def test_candidate_dates_use_asia_shanghai_calendar_day() -> None:
+    shanghai_midnight = datetime(
+        2026,
+        7,
+        31,
+        0,
+        30,
+        tzinfo=timezone(timedelta(hours=8)),
+    )
+
+    with pytest.raises(ValidationError, match="effective_trade_date"):
+        _row(
+            decision_at=shanghai_midnight,
+            available_at=shanghai_midnight,
+            effective_trade_date=date(2026, 7, 30),
+            reference_trade_date=date(2026, 7, 30),
+        )
+
+    accepted = _row(
+        decision_at=shanghai_midnight,
+        available_at=shanghai_midnight,
+        effective_trade_date=date(2026, 7, 31),
+        reference_trade_date=date(2026, 7, 31),
+    )
+    assert accepted.effective_trade_date == date(2026, 7, 31)
+
+
 @pytest.mark.parametrize(
     ("changes", "message"),
     [
         ({"decision_at": DECISION_AT.replace(tzinfo=None)}, "timezone-aware"),
         ({"available_at": AVAILABLE_AT.replace(tzinfo=None)}, "timezone-aware"),
         ({"available_at": DECISION_AT - timedelta(seconds=1)}, "available_at"),
+        ({"effective_trade_date": TRADE_DATE - timedelta(days=1)}, "effective_trade_date"),
         ({"reference_trade_date": date(2026, 8, 1)}, "future"),
         ({"reference_snapshot_ids": {"daily_state": "BAD"}}, "reference_snapshot_ids"),
     ],
@@ -168,6 +490,29 @@ def test_snapshot_rejects_duplicate_candidates_and_future_rows() -> None:
         _snapshot(rows=(future,))
 
 
+def test_prior_day_decision_can_publish_for_next_effective_trade_date() -> None:
+    decision_at = datetime(2026, 7, 30, 9, 0, tzinfo=UTC)
+    row = _row(
+        decision_at=decision_at,
+        available_at=decision_at + timedelta(minutes=1),
+        effective_trade_date=TRADE_DATE,
+    )
+
+    snapshot = _snapshot(
+        captured_at=decision_at + timedelta(minutes=2),
+        rows=(row,),
+    )
+
+    assert snapshot.trade_date == TRADE_DATE
+    assert snapshot.rows[0].decision_at.date() == TRADE_DATE - timedelta(days=1)
+    assert snapshot.rows[0].effective_trade_date == TRADE_DATE
+
+
+def test_snapshot_rejects_row_for_another_effective_trade_date() -> None:
+    with pytest.raises(ValidationError, match="effective_trade_date"):
+        _snapshot(rows=(_row(effective_trade_date=TRADE_DATE + timedelta(days=1)),))
+
+
 @pytest.mark.parametrize(
     "change",
     [
@@ -177,6 +522,10 @@ def test_snapshot_rejects_duplicate_candidates_and_future_rows() -> None:
         {"rows": (_row(variant="pool2"),)},
         {"rows": (_row(static_features={"score": 0.9}),)},
         {"rows": (_row(reference_snapshot_ids={"daily_state": HASH_B}),)},
+        {
+            "trade_date": TRADE_DATE + timedelta(days=1),
+            "rows": (_row(effective_trade_date=TRADE_DATE + timedelta(days=1)),),
+        },
     ],
 )
 def test_snapshot_hash_binds_every_content_dimension(change: dict[str, object]) -> None:

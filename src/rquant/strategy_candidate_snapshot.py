@@ -14,8 +14,9 @@ from enum import StrEnum
 from pathlib import Path
 from threading import RLock
 from types import MappingProxyType
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from pydantic import (
     Field,
@@ -42,6 +43,7 @@ _PRIVATE_FILE_MODE = 0o600
 _MAX_GENERATIONS = 4_096
 _MAX_AUTHORITY_BYTES = 16 * 1024 * 1024
 _DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+_ASIA_SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
 class StrategyCandidateSnapshotIntegrityError(RuntimeError):
@@ -51,6 +53,21 @@ class StrategyCandidateSnapshotIntegrityError(RuntimeError):
 class StrategyCandidatePriceBasis(StrEnum):
     RAW = "raw"
     QFQ_PIT = "qfq_pit"
+
+
+def asia_shanghai_trade_date(value: datetime) -> date:
+    return normalize_aware_utc(value).astimezone(_ASIA_SHANGHAI).date()
+
+
+def strategy_candidate_decision_trade_date(
+    value: datetime,
+    *,
+    legacy_utc_date_semantics: bool,
+) -> date:
+    normalized = normalize_aware_utc(value)
+    if legacy_utc_date_semantics:
+        return normalized.date()
+    return asia_shanghai_trade_date(normalized)
 
 
 def _freeze_json(value: JsonValue) -> JsonValue:
@@ -71,6 +88,107 @@ def _thaw_json(value: object) -> JsonValue:
     return value  # type: ignore[return-value]
 
 
+def canonicalize_candidate_static_features(value: object) -> Mapping[str, JsonValue]:
+    thawed = _thaw_json(value)
+    if not isinstance(thawed, dict):
+        raise ValueError("static_features must be a JSON object")
+    if any(not isinstance(key, str) or not key for key in thawed):
+        raise ValueError("static_features keys must be non-empty strings")
+    detached = json.loads(
+        json.dumps(thawed, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
+    )
+    return MappingProxyType({key: _freeze_json(item) for key, item in sorted(detached.items())})
+
+
+def serialize_candidate_static_features(
+    value: Mapping[str, JsonValue],
+) -> dict[str, JsonValue]:
+    return {key: _thaw_json(item) for key, item in value.items()}
+
+
+def thaw_candidate_static_features(value: object) -> JsonValue:
+    return _thaw_json(value)
+
+
+def candidate_occurrence_id(
+    *,
+    strategy_id: str,
+    strategy_version: str,
+    candidate_id: str,
+    variant: str,
+    effective_trade_date: date,
+) -> str:
+    return canonical_sha256(
+        {
+            "strategy_id": strategy_id,
+            "strategy_version": strategy_version,
+            "candidate_id": candidate_id,
+            "variant": variant,
+            "effective_trade_date": effective_trade_date,
+        }
+    )
+
+
+def _snapshot_content_identity(
+    *,
+    schema_version: Literal[1, 2],
+    sequence: int,
+    trade_date: date,
+    captured_at: datetime,
+    producer_commit: str,
+    rows: Sequence[StrategyCandidateRecord],
+) -> dict[str, object]:
+    if schema_version == 1:
+        canonical_rows = tuple(
+            sorted(
+                rows,
+                key=lambda row: (row.strategy_id, row.strategy_version, row.candidate_id),
+            )
+        )
+        row_payloads: list[dict[str, object]] = []
+        for row in canonical_rows:
+            payload = row.model_dump(mode="python")
+            payload.pop("effective_trade_date")
+            row_payloads.append(payload)
+        return {
+            "sequence": sequence,
+            "trade_date": trade_date,
+            "captured_at": normalize_aware_utc(captured_at),
+            "producer_commit": producer_commit,
+            "rows": tuple(row_payloads),
+        }
+    canonical_rows = tuple(sorted(rows, key=lambda row: row.identity))
+    return {
+        "schema_version": schema_version,
+        "sequence": sequence,
+        "trade_date": trade_date,
+        "captured_at": normalize_aware_utc(captured_at),
+        "producer_commit": producer_commit,
+        "rows": canonical_rows,
+    }
+
+
+def strategy_candidate_snapshot_content_sha256(
+    *,
+    schema_version: Literal[1, 2],
+    sequence: int,
+    trade_date: date,
+    captured_at: datetime,
+    producer_commit: str,
+    rows: Sequence[StrategyCandidateRecord],
+) -> str:
+    return canonical_sha256(
+        _snapshot_content_identity(
+            schema_version=schema_version,
+            sequence=sequence,
+            trade_date=trade_date,
+            captured_at=captured_at,
+            producer_commit=producer_commit,
+            rows=rows,
+        )
+    )
+
+
 class StrategyCandidateRecord(RuntimeContractModel):
     strategy_id: str = Field(min_length=1)
     strategy_version: str = Field(min_length=1)
@@ -78,28 +196,25 @@ class StrategyCandidateRecord(RuntimeContractModel):
     variant: str = Field(min_length=1)
     decision_at: AwareUtcDatetime
     available_at: AwareUtcDatetime
+    effective_trade_date: date
     reference_trade_date: date
     price_basis: StrategyCandidatePriceBasis
     static_features: Mapping[str, JsonValue]
     reference_snapshot_ids: Mapping[str, Sha256]
+    legacy_utc_date_semantics: bool = Field(default=False, exclude=True, repr=False)
 
     @field_validator("static_features", mode="before")
     @classmethod
     def thaw_static_features_for_validation(cls, value: object) -> JsonValue:
-        return _thaw_json(value)
+        return thaw_candidate_static_features(value)
 
     @field_validator("static_features")
     @classmethod
     def freeze_static_features(
         cls,
-        value: Mapping[str, JsonValue],
+        value: object,
     ) -> Mapping[str, JsonValue]:
-        if any(not isinstance(key, str) or not key for key in value):
-            raise ValueError("static_features keys must be non-empty strings")
-        detached = json.loads(
-            json.dumps(value, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
-        )
-        return MappingProxyType({key: _freeze_json(item) for key, item in sorted(detached.items())})
+        return canonicalize_candidate_static_features(value)
 
     @field_validator("reference_snapshot_ids")
     @classmethod
@@ -116,7 +231,7 @@ class StrategyCandidateRecord(RuntimeContractModel):
         self,
         value: Mapping[str, JsonValue],
     ) -> dict[str, JsonValue]:
-        return {key: _thaw_json(item) for key, item in value.items()}
+        return serialize_candidate_static_features(value)
 
     @field_serializer("reference_snapshot_ids")
     def serialize_reference_snapshot_ids(
@@ -129,20 +244,38 @@ class StrategyCandidateRecord(RuntimeContractModel):
     def validate_point_in_time(self) -> StrategyCandidateRecord:
         if self.available_at < self.decision_at:
             raise ValueError("available_at must be at or after decision_at")
-        if self.reference_trade_date > self.decision_at.date():
+        decision_trade_date = strategy_candidate_decision_trade_date(
+            self.decision_at,
+            legacy_utc_date_semantics=self.legacy_utc_date_semantics,
+        )
+        if self.effective_trade_date < decision_trade_date:
+            raise ValueError("effective_trade_date cannot precede decision_at date")
+        if self.reference_trade_date > decision_trade_date:
             raise ValueError("reference_trade_date cannot be a future reference")
         return self
 
     @property
-    def identity(self) -> tuple[str, str, str]:
+    def identity(self) -> tuple[str, str, str, date]:
         return (
             self.strategy_id,
             self.strategy_version,
             self.candidate_id,
+            self.effective_trade_date,
+        )
+
+    @property
+    def occurrence_id(self) -> str:
+        return candidate_occurrence_id(
+            strategy_id=self.strategy_id,
+            strategy_version=self.strategy_version,
+            candidate_id=self.candidate_id,
+            variant=self.variant,
+            effective_trade_date=self.effective_trade_date,
         )
 
 
 class StrategyCandidateSnapshot(RuntimeContractModel):
+    schema_version: Literal[1, 2]
     sequence: int = Field(ge=0)
     trade_date: date
     captured_at: AwareUtcDatetime
@@ -160,17 +293,38 @@ class StrategyCandidateSnapshot(RuntimeContractModel):
 
     @model_validator(mode="after")
     def validate_snapshot(self) -> StrategyCandidateSnapshot:
+        if self.schema_version == 1 and any(not row.legacy_utc_date_semantics for row in self.rows):
+            raise ValueError("schema v1 rows require legacy UTC date semantics")
+        if self.schema_version == 2 and any(row.legacy_utc_date_semantics for row in self.rows):
+            raise ValueError("schema v2 rows reject legacy UTC date semantics")
+        if self.schema_version == 1:
+            for row in self.rows:
+                decision_trade_date = strategy_candidate_decision_trade_date(
+                    row.decision_at,
+                    legacy_utc_date_semantics=True,
+                )
+                if not (decision_trade_date == row.effective_trade_date == self.trade_date):
+                    raise ValueError(
+                        "schema v1 decision date must equal effective and snapshot trade date"
+                    )
         identities = [row.identity for row in self.rows]
         if len(identities) != len(set(identities)):
             raise ValueError("snapshot contains a duplicate candidate")
         for row in self.rows:
-            if row.decision_at.date() != self.trade_date:
-                raise ValueError("candidate decision_at must belong to snapshot trade_date")
+            if row.effective_trade_date != self.trade_date:
+                raise ValueError("candidate effective_trade_date must match snapshot trade_date")
             if row.reference_trade_date > self.trade_date:
                 raise ValueError("candidate contains a future trade-date reference")
             if row.available_at > self.captured_at:
                 raise ValueError("candidate available_at cannot exceed captured_at")
-        expected = canonical_sha256(self.model_dump(mode="python", exclude={"content_sha256"}))
+        expected = strategy_candidate_snapshot_content_sha256(
+            schema_version=self.schema_version,
+            sequence=self.sequence,
+            trade_date=self.trade_date,
+            captured_at=self.captured_at,
+            producer_commit=self.producer_commit,
+            rows=self.rows,
+        )
         if self.content_sha256 != expected:
             raise ValueError("content_sha256 does not bind canonical snapshot content")
         return self
@@ -187,13 +341,14 @@ class StrategyCandidateSnapshot(RuntimeContractModel):
     ) -> StrategyCandidateSnapshot:
         normalized_captured_at = normalize_aware_utc(captured_at)
         canonical_rows = tuple(sorted(rows, key=lambda row: row.identity))
-        identity = {
-            "sequence": sequence,
-            "trade_date": trade_date,
-            "captured_at": normalized_captured_at,
-            "producer_commit": producer_commit,
-            "rows": canonical_rows,
-        }
+        identity = _snapshot_content_identity(
+            schema_version=2,
+            sequence=sequence,
+            trade_date=trade_date,
+            captured_at=normalized_captured_at,
+            producer_commit=producer_commit,
+            rows=canonical_rows,
+        )
         return cls(
             **identity,
             content_sha256=canonical_sha256(identity),
@@ -253,6 +408,10 @@ class StrategyCandidateSnapshotSpool:
     def publish(self, snapshot: StrategyCandidateSnapshot) -> StrategyCandidateSnapshot:
         if not isinstance(snapshot, StrategyCandidateSnapshot):
             raise TypeError("snapshot must be a StrategyCandidateSnapshot")
+        if snapshot.schema_version != 2:
+            raise StrategyCandidateSnapshotIntegrityError(
+                "only schema v2 snapshots may be published"
+            )
         self._initialize_for_publish()
         with self._locked(exclusive=True) as (root_fd, generations_fd):
             self._cleanup_stale_temporaries(root_fd)
@@ -716,16 +875,39 @@ class StrategyCandidateSnapshotSpool:
     def _read_snapshot(self, parent_fd: int, name: str) -> StrategyCandidateSnapshot:
         payload = self._read_regular_file(parent_fd, name, label="generation")
         try:
-            snapshot = StrategyCandidateSnapshot.model_validate_json(payload)
-        except ValueError as exc:
+            raw = json.loads(payload)
+            if not isinstance(raw, dict):
+                raise ValueError("snapshot generation must be a JSON object")
+            if "schema_version" not in raw:
+                rows = raw.get("rows")
+                if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+                    raise ValueError("legacy snapshot rows are invalid")
+                if any("effective_trade_date" in row for row in rows):
+                    raise ValueError("legacy snapshot cannot contain effective_trade_date")
+                trade_date = raw.get("trade_date")
+                raw["schema_version"] = 1
+                for row in rows:
+                    row["effective_trade_date"] = trade_date
+                    row["legacy_utc_date_semantics"] = True
+            snapshot = StrategyCandidateSnapshot.model_validate(raw)
+        except (TypeError, ValueError) as exc:
             raise StrategyCandidateSnapshotIntegrityError(
                 "strategy candidate generation is invalid"
             ) from exc
-        if self._model_bytes(snapshot) != payload:
+        if self._snapshot_bytes(snapshot) != payload:
             raise StrategyCandidateSnapshotIntegrityError(
                 "strategy candidate generation is not canonical JSON"
             )
         return snapshot
+
+    @classmethod
+    def _snapshot_bytes(cls, snapshot: StrategyCandidateSnapshot) -> bytes:
+        payload = snapshot.model_dump(mode="json")
+        if snapshot.schema_version == 1:
+            payload.pop("schema_version")
+            for row in payload["rows"]:
+                row.pop("effective_trade_date")
+        return cls._canonical_json_bytes(payload)
 
     def _read_pointer(self, root_fd: int) -> StrategyCandidateSnapshotPointer:
         payload = self._read_regular_file(root_fd, "current.json", label="current pointer")
@@ -739,8 +921,12 @@ class StrategyCandidateSnapshotSpool:
 
     @staticmethod
     def _model_bytes(model: RuntimeContractModel) -> bytes:
+        return StrategyCandidateSnapshotSpool._canonical_json_bytes(model.model_dump(mode="json"))
+
+    @staticmethod
+    def _canonical_json_bytes(value: object) -> bytes:
         payload = json.dumps(
-            model.model_dump(mode="json"),
+            value,
             ensure_ascii=True,
             allow_nan=False,
             separators=(",", ":"),

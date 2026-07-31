@@ -116,6 +116,7 @@ def _publish_candidate_authority(
             variant="shadow",
             decision_at=datetime(2026, 7, 31, 1, 30, tzinfo=UTC),
             available_at=datetime(2026, 7, 31, 1, 31, tzinfo=UTC),
+            effective_trade_date=NOW.date(),
             reference_trade_date=NOW.date(),
             price_basis=StrategyCandidatePriceBasis.QFQ_PIT,
             static_features={"score": 0.8},
