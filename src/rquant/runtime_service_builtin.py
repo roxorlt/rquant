@@ -125,14 +125,26 @@ def build_builtin_registry(
     universe_loader: Callable[[], Iterable[str]] | None = None,
     clock: Callable[[], datetime] | None = None,
 ) -> RuntimeServiceRegistry:
+    from rquant.runtime_builder_feature import feature_live_builder
+    from rquant.runtime_builder_paper import paper_consumer_builder
+
+    resolved_clock = clock or (lambda: datetime.now(UTC))
     registry = RuntimeServiceRegistry()
     registry.register(
         RuntimeServiceKind.MARKET_MINUTE_SOURCE,
         market_minute_source_builder(
             adapter_factory=adapter_factory or _default_adapter_factory,
             universe_loader=universe_loader or _default_universe_loader,
-            clock=clock or (lambda: datetime.now(UTC)),
+            clock=resolved_clock,
         ),
+    )
+    registry.register(
+        RuntimeServiceKind.FEATURE_LIVE,
+        feature_live_builder(clock=resolved_clock),
+    )
+    registry.register(
+        RuntimeServiceKind.PAPER_CONSUMER,
+        paper_consumer_builder(clock=resolved_clock),
     )
     return registry
 

@@ -158,6 +158,7 @@ def test_duplicate_or_missing_builder_fails_before_service_start(tmp_path: Path)
         RuntimeServiceKind.MARKET_MINUTE_SOURCE,
         lambda _manifest: lambda: RuntimeStepResult(),
     )
+    assert registry.registered_kinds == (RuntimeServiceKind.MARKET_MINUTE_SOURCE,)
     with pytest.raises(ValueError, match="already registered"):
         registry.register(
             RuntimeServiceKind.MARKET_MINUTE_SOURCE,

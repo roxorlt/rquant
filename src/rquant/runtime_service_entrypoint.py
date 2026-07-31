@@ -123,6 +123,10 @@ class RuntimeServiceRegistry:
             raise ValueError(f"runtime service builder already registered: {kind.value}")
         self._builders[kind] = builder
 
+    @property
+    def registered_kinds(self) -> tuple[RuntimeServiceKind, ...]:
+        return tuple(self._builders)
+
     def build(self, manifest: RuntimeServiceManifest) -> RuntimeServiceStep:
         try:
             builder = self._builders[manifest.service_kind]

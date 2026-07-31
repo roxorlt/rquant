@@ -110,16 +110,21 @@ def test_source_builder_rejects_empty_universe_wrong_kind_or_relative_path(
         )(relative)
 
 
-def test_builtin_registry_registers_only_concrete_source_builder(tmp_path: Path) -> None:
+def test_builtin_registry_registers_dependency_free_concrete_builders(tmp_path: Path) -> None:
     registry = build_builtin_registry(
         adapter_factory=_Adapter,
         universe_loader=lambda: ["600000.SH"],
         clock=lambda: NOW,
     )
 
+    assert registry.registered_kinds == (
+        RuntimeServiceKind.MARKET_MINUTE_SOURCE,
+        RuntimeServiceKind.FEATURE_LIVE,
+        RuntimeServiceKind.PAPER_CONSUMER,
+    )
     assert callable(registry.build(_manifest(tmp_path)))
     unsupported = RuntimeServiceManifest.model_validate(
-        {**_manifest(tmp_path).model_dump(mode="json"), "service_kind": "feature_live"}
+        {**_manifest(tmp_path).model_dump(mode="json"), "service_kind": "strategy_live"}
     )
     with pytest.raises(KeyError, match="not registered"):
         registry.build(unsupported)
