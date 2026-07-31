@@ -207,6 +207,17 @@ def test_inventory_rejects_source_beneath_symlinked_parent(tmp_path: Path) -> No
         build_recovery_manifest(plan=_plan(), sources=tuple(sources), captured_at=CAPTURED_AT)
 
 
+def test_manifest_store_rejects_symlinked_parent(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path)
+    real_parent = tmp_path / "real-manifest-parent"
+    real_parent.mkdir()
+    linked_parent = tmp_path / "linked-manifest-parent"
+    linked_parent.symlink_to(real_parent, target_is_directory=True)
+
+    with pytest.raises(RecoveryManifestError, match="symlink component"):
+        append_recovery_manifest(linked_parent / "manifests", manifest)
+
+
 def test_manifest_store_is_content_addressed_and_append_only(tmp_path: Path) -> None:
     manifest = _manifest(tmp_path)
     store = tmp_path / "manifest-store"

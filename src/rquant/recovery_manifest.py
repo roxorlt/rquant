@@ -421,6 +421,7 @@ def _serialized_bytes(model: RuntimeContractModel) -> bytes:
 
 
 def _append_bytes(directory: Path, object_name: str, content: bytes) -> Path:
+    _reject_symlink_components(directory, subject="append-only store")
     directory.mkdir(parents=True, exist_ok=True)
     if directory.is_symlink():
         raise RecoveryManifestError(f"append-only directory is a symlink: {directory}")
