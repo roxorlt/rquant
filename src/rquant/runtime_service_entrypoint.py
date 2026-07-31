@@ -133,12 +133,41 @@ class RuntimeServiceRegistry:
         return builder(manifest)
 
 
-def _reject_symlink_components(path: Path) -> None:
-    current = Path(path.anchor)
-    for part in path.parts[1:]:
-        current /= part
-        if current.is_symlink():
-            raise ValueError(f"runtime service manifest path contains symlink: {current}")
+def _read_owned_manifest(path: Path) -> bytes:
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    directory_descriptor = -1
+    manifest_descriptor = -1
+    try:
+        directory_descriptor = os.open(path.anchor, directory_flags | no_follow)
+        for component in path.parts[1:-1]:
+            child_descriptor = os.open(
+                component,
+                directory_flags | no_follow,
+                dir_fd=directory_descriptor,
+            )
+            os.close(directory_descriptor)
+            directory_descriptor = child_descriptor
+        manifest_descriptor = os.open(
+            path.name,
+            os.O_RDONLY | no_follow,
+            dir_fd=directory_descriptor,
+        )
+        observed = os.fstat(manifest_descriptor)
+        if not stat.S_ISREG(observed.st_mode) or observed.st_uid != os.getuid():
+            raise ValueError("runtime service manifest must be an owned regular file")
+        if stat.S_IMODE(observed.st_mode) != 0o600:
+            raise ValueError("runtime service manifest must have mode 0600")
+        with os.fdopen(manifest_descriptor, "rb", closefd=True) as stream:
+            manifest_descriptor = -1
+            return stream.read()
+    except OSError as exc:
+        raise ValueError("runtime service manifest is unavailable or contains a symlink") from exc
+    finally:
+        if manifest_descriptor >= 0:
+            os.close(manifest_descriptor)
+        if directory_descriptor >= 0:
+            os.close(directory_descriptor)
 
 
 def load_runtime_service_manifest(
@@ -149,18 +178,13 @@ def load_runtime_service_manifest(
     if re.fullmatch(r"[0-9a-f]{40}", expected_commit) is None:
         raise ValueError("expected commit must be a full lowercase Git SHA")
     manifest_path = Path(os.path.abspath(path))
-    _reject_symlink_components(manifest_path)
     try:
-        observed = manifest_path.lstat()
-    except OSError as exc:
-        raise ValueError("runtime service manifest is unavailable") from exc
-    if not stat.S_ISREG(observed.st_mode) or observed.st_uid != os.getuid():
-        raise ValueError("runtime service manifest must be an owned regular file")
-    if stat.S_IMODE(observed.st_mode) != 0o600:
-        raise ValueError("runtime service manifest must have mode 0600")
-    try:
-        manifest = RuntimeServiceManifest.model_validate_json(manifest_path.read_bytes())
-    except (OSError, ValueError) as exc:
+        manifest = RuntimeServiceManifest.model_validate_json(
+            _read_owned_manifest(manifest_path)
+        )
+    except ValueError as exc:
+        if str(exc).startswith("runtime service manifest"):
+            raise
         raise ValueError("invalid runtime service manifest") from exc
     if manifest.producer_commit != expected_commit:
         raise ValueError("runtime service manifest commit does not match running code")

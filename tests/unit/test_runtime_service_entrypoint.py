@@ -91,6 +91,33 @@ def test_manifest_loader_rejects_symlink_public_mode_and_commit_drift(tmp_path: 
     with pytest.raises(ValueError, match="symlink"):
         load_runtime_service_manifest(linked, expected_commit=COMMIT)
 
+    parent_link = tmp_path / "linked-parent"
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    nested = real_parent / "service.json"
+    nested.write_text(_manifest().model_dump_json())
+    nested.chmod(0o600)
+    parent_link.symlink_to(real_parent, target_is_directory=True)
+    with pytest.raises(ValueError, match="symlink"):
+        load_runtime_service_manifest(parent_link / nested.name, expected_commit=COMMIT)
+
+
+def test_manifest_loader_reads_from_one_secure_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "service.json"
+    path.write_text(_manifest().model_dump_json())
+    path.chmod(0o600)
+
+    def fail_path_read(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("path was checked or reopened after secure open")
+
+    monkeypatch.setattr(Path, "lstat", fail_path_read)
+    monkeypatch.setattr(Path, "read_bytes", fail_path_read)
+
+    assert load_runtime_service_manifest(path, expected_commit=COMMIT) == _manifest()
+
 
 def test_registered_service_runs_once_with_durable_heartbeat(tmp_path: Path) -> None:
     registry = RuntimeServiceRegistry()
