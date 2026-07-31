@@ -118,8 +118,6 @@ class ServingGenerationManifest(RuntimeContractModel):
         source_ids = set(self.source_generations)
         if watermark_ids != source_ids:
             raise ValueError("each source generation must have exactly one watermark")
-        if set(self.row_counts) != source_ids:
-            raise ValueError("row_counts must exactly cover source_generations")
         for watermark in self.watermarks:
             expected_generation = self.source_generations[watermark.dataset_id]
             if watermark.generation_id != expected_generation:

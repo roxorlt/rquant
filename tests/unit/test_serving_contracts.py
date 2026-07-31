@@ -141,8 +141,8 @@ def test_manifest_rejects_duplicate_or_mismatched_dataset_generations() -> None:
         )
     with pytest.raises(ValidationError):
         _manifest(row_counts={"market_minute": -1, "strategy_signal": 3})
-    with pytest.raises(ValidationError, match="row_counts"):
-        _manifest(row_counts={"market_minute": 240})
+    output_tables = _manifest(row_counts={"signals": 240, "paper_holdings": 3})
+    assert output_tables.row_counts == {"paper_holdings": 3, "signals": 240}
 
 
 def test_manifest_cannot_be_built_before_source_watermarks_are_published() -> None:
