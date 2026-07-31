@@ -175,13 +175,24 @@ def _degrade_result(
     *,
     reasons: tuple[str, ...],
 ) -> FeatureComputationResult:
-    reason = f"source_degraded:{','.join(reasons)}"
+    source_reason = f"source_degraded:{','.join(reasons)}"
+
+    def merge_reason(existing: str | None) -> str:
+        parts = [] if existing is None else existing.split(";")
+        if source_reason not in parts:
+            parts.append(source_reason)
+        return ";".join(parts)
+
     statuses = tuple(
         FeatureFieldStatus(
             name=status.name,
-            status=FeatureAvailability.DEGRADED,
+            status=(
+                FeatureAvailability.DEGRADED
+                if status.status is FeatureAvailability.AVAILABLE
+                else status.status
+            ),
             available_at=status.available_at,
-            reason=reason,
+            reason=merge_reason(status.reason),
         )
         for status in result.envelope.field_statuses
     )

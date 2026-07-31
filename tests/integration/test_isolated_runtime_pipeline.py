@@ -109,12 +109,12 @@ def _spec() -> StrategySpec:
         strategy_id="isolated-e2e",
         version=1,
         feature_contract_id="intraday-pit",
-        min_feature_contract_version=2,
+        min_feature_contract_version=3,
         required_features=(
             FeatureRequirement(
                 name="rel_same_minute",
                 level=RequirementLevel.REQUIRED,
-                min_contract_version=2,
+                min_contract_version=3,
             ),
         ),
         optional_features=(),

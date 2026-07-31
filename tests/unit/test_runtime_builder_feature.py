@@ -13,12 +13,21 @@ from rquant.feature_spool import FeatureBatchSpool
 from rquant.live_contracts import LiveChannel
 from rquant.live_spool import LiveBatchSpool
 from rquant.market_minute_gateway import MarketMinuteGateway, MarketMinuteGatewayConfig
-from rquant.runtime_builder_feature import feature_live_builder
+from rquant.runtime_builder_feature import FeatureRuntimeConfig, feature_live_builder
 from rquant.runtime_service_control import RuntimeServicePlane
 from rquant.runtime_service_entrypoint import RuntimeServiceKind, RuntimeServiceManifest
 
 NOW = datetime(2026, 7, 31, 1, 40, tzinfo=UTC)
 COMMIT = "a" * 40
+
+
+def test_feature_runtime_config_defaults_to_contract_v3() -> None:
+    config = FeatureRuntimeConfig()
+
+    assert config.contract_version == 3
+    assert config.schema_version == 2
+    with pytest.raises(ValidationError):
+        FeatureRuntimeConfig(contract_version=2)
 
 
 def _minute_frame(*, trade_time: str, amount: float = 20_000.0) -> pd.DataFrame:
@@ -86,7 +95,7 @@ def _manifest(
                 "lookback_sessions": 2,
                 "opening_acceleration_block_minutes": 3,
                 "contract_id": "intraday-pit",
-                "contract_version": 2,
+                "contract_version": 3,
                 "schema_version": 2,
             },
         },
@@ -113,9 +122,7 @@ def test_builder_runs_persistent_feature_batch_with_manifest_bound_config(
     snapshot_path = tmp_path / "history.parquet"
     snapshot_id = _write_snapshot(snapshot_path)
 
-    step = feature_live_builder(clock=lambda: NOW)(
-        _manifest(tmp_path, snapshot_id=snapshot_id)
-    )
+    step = feature_live_builder(clock=lambda: NOW)(_manifest(tmp_path, snapshot_id=snapshot_id))
     snapshot_path.unlink()
     result = step()
 
@@ -177,8 +184,7 @@ def test_builder_maps_limit_backlog_and_stale_source_to_runtime_degradation(
         )[0]
     )
     assert all(
-        status.status is FeatureAvailability.STALE
-        for status in stored.envelope.field_statuses
+        status.status is FeatureAvailability.STALE for status in stored.envelope.field_statuses
     )
 
 

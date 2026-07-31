@@ -53,12 +53,12 @@ def _spec(*, strategy_id: str = "n-shape-live", version: int = 3) -> StrategySpe
         strategy_id=strategy_id,
         version=version,
         feature_contract_id="intraday-pit",
-        min_feature_contract_version=2,
+        min_feature_contract_version=3,
         required_features=(
             FeatureRequirement(
                 name="rel_same_minute",
                 level=RequirementLevel.REQUIRED,
-                min_contract_version=2,
+                min_contract_version=3,
             ),
         ),
         optional_features=(),
@@ -148,7 +148,7 @@ def _publish(spool: FeatureBatchSpool, *, sequence: int, value: float = 2.0) -> 
             schema_version=2,
             batch_id=f"feature-{sequence}",
             contract_id="intraday-pit",
-            contract_version=2,
+            contract_version=3,
             input_batch_ids=(f"minute-{sequence}", "history-snapshot"),
             sequence=sequence,
             event_time=available_at,

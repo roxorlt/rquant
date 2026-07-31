@@ -38,6 +38,19 @@ INPUT_COLUMNS = (
 FEATURE_COLUMNS = (
     "ts_code",
     "feature_time",
+    "latest_open",
+    "latest_high",
+    "latest_low",
+    "latest_close",
+    "minute_volume",
+    "cumulative_volume",
+    "session_open",
+    "session_high",
+    "session_low",
+    "opening_bar_open",
+    "opening_bar_high",
+    "opening_bar_low",
+    "opening_bar_close",
     "minute_amount",
     "cumulative_amount",
     "hist_same_minute_amount_median",
@@ -73,7 +86,7 @@ class IntradayFeatureConfig(RuntimeContractModel):
     opening_acceleration_block_minutes: int = Field(default=3, ge=0, le=30)
     bar_timestamp_semantics: Literal["bar_end"] = "bar_end"
     contract_id: str = Field(default="intraday-pit", min_length=1)
-    contract_version: int = Field(default=2, ge=2)
+    contract_version: Literal[3] = 3
     schema_version: int = Field(default=2, ge=2)
     producer_commit: CommitSha
 
@@ -108,6 +121,8 @@ class FeatureComputationResult(RuntimeContractModel):
 def _as_shanghai_timestamp(value: object, *, field_name: str) -> pd.Timestamp:
     try:
         timestamp = pd.Timestamp(value)
+        if pd.isna(timestamp):
+            raise ValueError("timestamp cannot be NaT")
         if timestamp.tzinfo is None:
             return timestamp.tz_localize(
                 SHANGHAI,
@@ -119,7 +134,12 @@ def _as_shanghai_timestamp(value: object, *, field_name: str) -> pd.Timestamp:
         raise IntradayFeatureValidationError(f"invalid {field_name}") from exc
 
 
-def _normalize_frame(frame: pd.DataFrame, *, label: str) -> pd.DataFrame:
+def _normalize_frame(
+    frame: pd.DataFrame,
+    *,
+    label: str,
+    visible_through: datetime | None = None,
+) -> pd.DataFrame:
     if not isinstance(frame, pd.DataFrame):
         raise IntradayFeatureValidationError(f"{label} must be a DataFrame")
     missing = sorted(set(INPUT_COLUMNS) - set(frame.columns))
@@ -135,9 +155,6 @@ def _normalize_frame(frame: pd.DataFrame, *, label: str) -> pd.DataFrame:
         normalized["_clock_minute"] = pd.Series(dtype="int64")
         return normalized
 
-    normalized["ts_code"] = normalized["ts_code"].astype("string").str.strip()
-    if normalized["ts_code"].isna().any() or (normalized["ts_code"] == "").any():
-        raise IntradayFeatureValidationError(f"{label} ts_code cannot be empty")
     try:
         local_times = [
             _as_shanghai_timestamp(value, field_name=f"{label}.trade_time")
@@ -145,11 +162,35 @@ def _normalize_frame(frame: pd.DataFrame, *, label: str) -> pd.DataFrame:
         ]
         normalized["_local_time"] = pd.DatetimeIndex(local_times)
         normalized["_utc_time"] = normalized["_local_time"].dt.tz_convert(UTC)
-        available_times = [
-            _as_shanghai_timestamp(value, field_name=f"{label}.available_at")
-            for value in normalized["available_at"]
-        ]
-        normalized["_available_utc"] = pd.DatetimeIndex(available_times).tz_convert(UTC)
+    except (TypeError, ValueError) as exc:
+        raise IntradayFeatureValidationError(f"invalid {label} value") from exc
+
+    if visible_through is not None:
+        normalized = normalized[normalized["_utc_time"] <= pd.Timestamp(visible_through)].copy()
+        if normalized.empty:
+            normalized["_available_utc"] = pd.Series(dtype="datetime64[ns, UTC]")
+            normalized["_trade_date"] = pd.Series(dtype="object")
+            normalized["_clock_minute"] = pd.Series(dtype="int64")
+            return normalized
+
+    if (
+        (normalized["_local_time"].dt.second != 0) | (normalized["_local_time"].dt.microsecond != 0)
+    ).any():
+        raise IntradayFeatureValidationError(f"{label} trade_time must be whole-minute bars")
+    clock_minute = normalized["_local_time"].dt.hour * 60 + normalized["_local_time"].dt.minute
+    in_continuous_session = clock_minute.between(
+        9 * 60 + 30,
+        11 * 60 + 30,
+    ) | clock_minute.between(13 * 60, 15 * 60)
+    if not in_continuous_session.all():
+        raise IntradayFeatureValidationError(
+            f"{label} trade_time must be within a continuous auction session"
+        )
+
+    normalized["ts_code"] = normalized["ts_code"].astype("string").str.strip()
+    if normalized["ts_code"].isna().any() or (normalized["ts_code"] == "").any():
+        raise IntradayFeatureValidationError(f"{label} ts_code cannot be empty")
+    try:
         for column in INPUT_COLUMNS[3:]:
             normalized[column] = pd.to_numeric(
                 normalized[column],
@@ -163,19 +204,41 @@ def _normalize_frame(frame: pd.DataFrame, *, label: str) -> pd.DataFrame:
         raise IntradayFeatureValidationError(f"{label} numeric values must be finite")
     if (normalized[["vol", "amount"]] < 0).any().any():
         raise IntradayFeatureValidationError(f"{label} vol and amount cannot be negative")
-    if (normalized["_available_utc"] < normalized["_utc_time"]).any():
-        raise IntradayFeatureValidationError(
-            f"{label} available_at cannot precede bar-end trade_time"
-        )
+    if (normalized[["open", "high", "low", "close"]] <= 0).any().any():
+        raise IntradayFeatureValidationError(f"{label} OHLC prices must be strictly positive")
+    required_high = normalized[["open", "close", "low"]].max(axis=1)
+    required_low = normalized[["open", "close", "high"]].min(axis=1)
+    if ((normalized["high"] < required_high) | (normalized["low"] > required_low)).any():
+        raise IntradayFeatureValidationError(f"{label} contains invalid OHLC geometry")
     if normalized.duplicated(subset=["ts_code", "_utc_time"]).any():
         raise IntradayFeatureValidationError(
             f"{label} contains duplicate ts_code and trade_time rows"
         )
+    natural_minute = normalized["_local_time"].dt.floor("min")
+    if (
+        normalized.assign(_natural_minute=natural_minute)
+        .duplicated(subset=["ts_code", "_natural_minute"])
+        .any()
+    ):
+        raise IntradayFeatureValidationError(
+            f"{label} contains multiple bars for one ts_code natural minute"
+        )
+
+    try:
+        available_times = [
+            _as_shanghai_timestamp(value, field_name=f"{label}.available_at")
+            for value in normalized["available_at"]
+        ]
+        normalized["_available_utc"] = pd.DatetimeIndex(available_times).tz_convert(UTC)
+    except (TypeError, ValueError) as exc:
+        raise IntradayFeatureValidationError(f"invalid {label} value") from exc
+    if (normalized["_available_utc"] < normalized["_utc_time"]).any():
+        raise IntradayFeatureValidationError(
+            f"{label} available_at cannot precede bar-end trade_time"
+        )
 
     normalized["_trade_date"] = normalized["_local_time"].dt.date
-    normalized["_clock_minute"] = (
-        normalized["_local_time"].dt.hour * 60 + normalized["_local_time"].dt.minute
-    )
+    normalized["_clock_minute"] = clock_minute.loc[normalized.index]
     return normalized.sort_values(
         ["ts_code", "_utc_time"],
         kind="stable",
@@ -277,6 +340,8 @@ def _compute_code_row(
 ) -> tuple[dict[str, object], dict[str, str | None]]:
     rows = current[current["ts_code"] == ts_code].sort_values("_utc_time", kind="stable")
     latest = rows.iloc[-1]
+    opening_rows = rows[rows["_clock_minute"] == OPENING_START_MINUTE]
+    opening = None if opening_rows.empty else opening_rows.iloc[0]
     feature_minute = int(latest["_clock_minute"])
     minute_amount = float(latest["amount"])
     cumulative_amount = float(rows["amount"].sum())
@@ -343,6 +408,19 @@ def _compute_code_row(
     row: dict[str, object] = {
         "ts_code": ts_code,
         "feature_time": latest["_utc_time"].isoformat(),
+        "latest_open": float(latest["open"]),
+        "latest_high": float(latest["high"]),
+        "latest_low": float(latest["low"]),
+        "latest_close": float(latest["close"]),
+        "minute_volume": float(latest["vol"]),
+        "cumulative_volume": cumulative_volume,
+        "session_open": None if opening is None else float(opening["open"]),
+        "session_high": float(rows["high"].max()),
+        "session_low": float(rows["low"].min()),
+        "opening_bar_open": None if opening is None else float(opening["open"]),
+        "opening_bar_high": None if opening is None else float(opening["high"]),
+        "opening_bar_low": None if opening is None else float(opening["low"]),
+        "opening_bar_close": None if opening is None else float(opening["close"]),
         "minute_amount": minute_amount,
         "cumulative_amount": cumulative_amount,
         "hist_same_minute_amount_median": same_median,
@@ -362,6 +440,19 @@ def _compute_code_row(
         "same_clock_sessions": int(same_clock["_trade_date"].nunique()),
     }
     reasons: dict[str, str | None] = {
+        "latest_open": None,
+        "latest_high": None,
+        "latest_low": None,
+        "latest_close": None,
+        "minute_volume": None,
+        "cumulative_volume": None,
+        "session_open": None if opening is not None else "missing_opening_bar",
+        "session_high": None,
+        "session_low": None,
+        "opening_bar_open": None if opening is not None else "missing_opening_bar",
+        "opening_bar_high": None if opening is not None else "missing_opening_bar",
+        "opening_bar_low": None if opening is not None else "missing_opening_bar",
+        "opening_bar_close": None if opening is not None else "missing_opening_bar",
         "minute_amount": None,
         "cumulative_amount": None,
         "hist_same_minute_amount_median": (
@@ -445,17 +536,19 @@ def _semantic_compute(
         raise IntradayFeatureValidationError("input_available_at cannot be after decision_time")
     available_at = decision_utc
 
-    current = _normalize_frame(current_minutes, label="current_minutes")
+    current = _normalize_frame(
+        current_minutes,
+        label="current_minutes",
+        visible_through=decision_utc,
+    )
     historical = _normalize_frame(historical_minutes, label="historical_minutes")
     decision_date = decision_local.date()
-    if (current["_trade_date"] > decision_date).any():
-        raise IntradayFeatureValidationError("current_minutes contains rows after decision date")
-    current_day = current[current["_trade_date"] == decision_date]
-    if (current_day["_utc_time"] > decision_utc).any():
+    if (current["_trade_date"] < decision_date).any():
         raise IntradayFeatureValidationError(
-            "current_minutes contains an unclosed bar after decision_time"
+            "current_minutes contains rows before decision trade date"
         )
-    if (current_day["_available_utc"] > decision_utc).any():
+    closed_current_day = current[current["_trade_date"] == decision_date]
+    if (closed_current_day["_available_utc"] > decision_utc).any():
         raise IntradayFeatureValidationError(
             "current_minutes contains a bar not available at decision_time"
         )
@@ -467,13 +560,13 @@ def _semantic_compute(
         raise IntradayFeatureValidationError(
             "historical_minutes contains data not available at decision_time"
         )
-    if (current["_available_utc"] > input_available_utc).any() or (
+    if (closed_current_day["_available_utc"] > input_available_utc).any() or (
         historical["_available_utc"] > input_available_utc
     ).any():
         raise IntradayFeatureValidationError(
             "input_available_at precedes a constituent row availability"
         )
-    visible = current_day
+    visible = closed_current_day
     if visible.empty:
         raise IntradayFeatureValidationError("current_minutes has no rows visible at decision_time")
 

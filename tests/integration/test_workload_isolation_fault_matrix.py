@@ -159,12 +159,12 @@ def _strategy_spec() -> StrategySpec:
         strategy_id="fault-matrix",
         version=1,
         feature_contract_id="intraday-pit",
-        min_feature_contract_version=2,
+        min_feature_contract_version=3,
         required_features=(
             FeatureRequirement(
                 name="rel_same_minute",
                 level=RequirementLevel.REQUIRED,
-                min_contract_version=2,
+                min_contract_version=3,
             ),
         ),
         optional_features=(),
