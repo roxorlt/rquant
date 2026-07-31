@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -30,7 +31,6 @@ from rquant.source_quota_store import SourceQuotaStore
 from rquant.strategy_candidate_snapshot import (
     StrategyCandidatePriceBasis,
     StrategyCandidateRecord,
-    StrategyCandidateSnapshot,
     StrategyCandidateSnapshotSpool,
 )
 
@@ -124,14 +124,14 @@ def _publish_candidate_authority(
         )
         for code in codes
     )
-    StrategyCandidateSnapshotSpool(root.resolve()).publish(
-        StrategyCandidateSnapshot.build(
-            sequence=0,
-            trade_date=NOW.date(),
-            captured_at=datetime(2026, 7, 31, 1, 32, tzinfo=UTC),
-            producer_commit=COMMIT,
-            rows=rows,
-        )
+    StrategyCandidateSnapshotSpool(root.resolve()).publish_strategy_records(
+        strategy_id=strategy_id,
+        strategy_version=strategy_version,
+        source_snapshot_ids={"candidate_input": hashlib.sha256(str(root).encode()).hexdigest()},
+        trade_date=NOW.date(),
+        captured_at=datetime(2026, 7, 31, 1, 32, tzinfo=UTC),
+        producer_commit=COMMIT,
+        rows=rows,
     )
     return CandidateUniverseAuthority(
         strategy_id=strategy_id,

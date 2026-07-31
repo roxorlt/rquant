@@ -16,6 +16,7 @@ from pydantic import ValidationError
 import rquant.strategy_candidate_snapshot as snapshot_module
 from rquant.runtime_contracts import RuntimeContractModel, canonical_sha256
 from rquant.strategy_candidate_snapshot import (
+    StrategyCandidateAuthorityBinding,
     StrategyCandidatePriceBasis,
     StrategyCandidateRecord,
     StrategyCandidateSnapshot,
@@ -85,8 +86,12 @@ def _snapshot(
 
 
 def _canonical_bytes(model: RuntimeContractModel) -> bytes:
+    payload = model.model_dump(mode="json")
+    if isinstance(model, StrategyCandidateSnapshot) and model.schema_version in {1, 2}:
+        payload.pop("authority_binding")
+        payload.pop("source_snapshot_ids")
     return json.dumps(
-        model.model_dump(mode="json"),
+        payload,
         ensure_ascii=True,
         separators=(",", ":"),
         sort_keys=True,
@@ -171,6 +176,91 @@ def _publish_records_worker(
         )
 
 
+def _publish_strategy_records_worker(
+    root: str,
+    *,
+    strategy_id: str,
+    captured_at: datetime,
+    results: Any,
+    block_stage: str | None = None,
+    entered_stage: Any = None,
+    release_stage: Any = None,
+    verify_lock_contended: Any = None,
+) -> None:
+    try:
+        if verify_lock_contended is not None:
+            descriptor = os.open(Path(root) / ".publish.lock", os.O_RDONLY)
+            try:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    verify_lock_contended.set()
+                else:
+                    raise AssertionError("publish lock was not held by the competing process")
+            finally:
+                os.close(descriptor)
+
+        if block_stage == "authority":
+            original_authority = StrategyCandidateSnapshotSpool._atomic_create_authority_binding
+
+            def blocked_authority(
+                cls: type[StrategyCandidateSnapshotSpool],
+                root_fd: int,
+                payload: bytes,
+            ) -> None:
+                entered_stage.set()
+                if not release_stage.wait(timeout=10):
+                    raise TimeoutError("authority creation was not released")
+                original_authority(root_fd, payload)
+
+            StrategyCandidateSnapshotSpool._atomic_create_authority_binding = classmethod(  # type: ignore[method-assign]
+                blocked_authority
+            )
+        elif block_stage == "generation":
+            original_generation = StrategyCandidateSnapshotSpool._atomic_create_generation
+
+            def blocked_generation(
+                cls: type[StrategyCandidateSnapshotSpool],
+                root_fd: int,
+                generations_fd: int,
+                target_name: str,
+                payload: bytes,
+            ) -> None:
+                entered_stage.set()
+                if not release_stage.wait(timeout=10):
+                    raise TimeoutError("generation creation was not released")
+                original_generation(root_fd, generations_fd, target_name, payload)
+
+            StrategyCandidateSnapshotSpool._atomic_create_generation = classmethod(  # type: ignore[method-assign]
+                blocked_generation
+            )
+
+        result = StrategyCandidateSnapshotSpool(Path(root)).publish_strategy_records(
+            strategy_id=strategy_id,
+            strategy_version="1",
+            source_snapshot_ids={"candidate_input": HASH_A},
+            trade_date=TRADE_DATE,
+            captured_at=captured_at,
+            producer_commit=COMMIT_A,
+            rows=(),
+        )
+        results.put(
+            {
+                "error": None,
+                "published": result.published,
+                "snapshot": result.snapshot.model_dump(mode="json"),
+            }
+        )
+    except BaseException as exc:
+        results.put(
+            {
+                "error": f"{type(exc).__name__}:{exc}",
+                "published": None,
+                "snapshot": None,
+            }
+        )
+
+
 def _collect_process_results(processes: list[mp.Process], results: Any) -> list[dict[str, Any]]:
     for process in processes:
         process.join(timeout=15)
@@ -195,12 +285,16 @@ def _write_legacy_v1_authority(
     snapshot = _snapshot()
     hash_identity = snapshot.model_dump(mode="python", exclude={"content_sha256"})
     hash_identity.pop("schema_version", None)
+    hash_identity.pop("authority_binding", None)
+    hash_identity.pop("source_snapshot_ids", None)
     for row in hash_identity["rows"]:
         row.pop("effective_trade_date")
     generation_sha256 = canonical_sha256(hash_identity)
 
     payload = snapshot.model_dump(mode="json")
     payload.pop("schema_version", None)
+    payload.pop("authority_binding", None)
+    payload.pop("source_snapshot_ids", None)
     for row in payload["rows"]:
         row.pop("effective_trade_date")
     payload["content_sha256"] = generation_sha256
@@ -691,6 +785,125 @@ def test_publish_records_returns_frozen_result_and_suppresses_same_semantics(
         first.published = False  # type: ignore[misc]
 
 
+def test_publish_strategy_records_persists_and_enforces_root_identity(tmp_path: Path) -> None:
+    root = (tmp_path / "spool").resolve()
+    spool = StrategyCandidateSnapshotSpool(root)
+
+    result = spool.publish_strategy_records(
+        strategy_id="n_shape",
+        strategy_version="b-v1",
+        source_snapshot_ids={"candidate_input": "3" * 64},
+        trade_date=TRADE_DATE,
+        captured_at=CAPTURED_AT,
+        producer_commit=COMMIT_A,
+        rows=(_row(),),
+    )
+    binding = spool.read_authority_binding()
+    before = _tree_state(root)
+
+    assert result.published is True
+    assert binding == StrategyCandidateAuthorityBinding.create(
+        strategy_id="n_shape",
+        strategy_version="b-v1",
+    )
+    assert binding.content_sha256 == canonical_sha256(
+        binding.model_dump(mode="python", exclude={"content_sha256"})
+    )
+    assert stat.S_IMODE((root / "authority.json").stat().st_mode) == 0o600
+    with pytest.raises(StrategyCandidateSnapshotIntegrityError, match="identity|bound"):
+        spool.publish_strategy_records(
+            strategy_id="growth_board_surge",
+            strategy_version="b-v1",
+            source_snapshot_ids={"candidate_input": "3" * 64},
+            trade_date=TRADE_DATE,
+            captured_at=CAPTURED_AT + timedelta(seconds=1),
+            producer_commit=COMMIT_A,
+            rows=(),
+        )
+    assert _tree_state(root) == before
+
+
+def test_publish_strategy_records_refuses_to_claim_legacy_generations(tmp_path: Path) -> None:
+    spool = StrategyCandidateSnapshotSpool((tmp_path / "spool").resolve())
+    spool.publish_records(
+        trade_date=TRADE_DATE,
+        captured_at=CAPTURED_AT,
+        producer_commit=COMMIT_A,
+        rows=(_row(),),
+    )
+    before = _tree_state(spool.root)
+
+    with pytest.raises(StrategyCandidateSnapshotIntegrityError, match="legacy|unbound"):
+        spool.publish_strategy_records(
+            strategy_id="n_shape",
+            strategy_version="b-v1",
+            source_snapshot_ids={"candidate_input": "3" * 64},
+            trade_date=TRADE_DATE,
+            captured_at=CAPTURED_AT + timedelta(seconds=1),
+            producer_commit=COMMIT_A,
+            rows=(_row(),),
+        )
+
+    assert _tree_state(spool.root) == before
+
+
+def test_bound_generation_blocks_generic_publish_after_binding_is_deleted(
+    tmp_path: Path,
+) -> None:
+    spool = StrategyCandidateSnapshotSpool((tmp_path / "spool").resolve())
+    first = spool.publish_strategy_records(
+        strategy_id="n_shape",
+        strategy_version="b-v1",
+        source_snapshot_ids={"candidate_input": "3" * 64},
+        trade_date=TRADE_DATE,
+        captured_at=CAPTURED_AT,
+        producer_commit=COMMIT_A,
+        rows=(_row(),),
+    )
+    spool.authority_path.unlink()
+    before = _tree_state(spool.root)
+
+    with pytest.raises(StrategyCandidateSnapshotIntegrityError, match="bound|schema v3"):
+        spool.publish_records(
+            trade_date=TRADE_DATE,
+            captured_at=CAPTURED_AT + timedelta(seconds=1),
+            producer_commit=COMMIT_A,
+            rows=(_row(variant="pool2"),),
+        )
+
+    assert first.snapshot.schema_version == 3
+    assert first.snapshot.authority_binding is not None
+    assert first.snapshot.authority_binding.strategy_id == "n_shape"
+    assert dict(first.snapshot.source_snapshot_ids) == {"candidate_input": "3" * 64}
+    assert _tree_state(spool.root) == before
+
+
+@pytest.mark.parametrize(
+    ("strategy_id", "strategy_version"),
+    [("", "1"), ("n_shape", ""), ("bad/name", "1")],
+)
+def test_publish_strategy_records_rejects_invalid_identity_without_creating_authority(
+    tmp_path: Path,
+    strategy_id: str,
+    strategy_version: str,
+) -> None:
+    root = (tmp_path / "spool").resolve()
+    spool = StrategyCandidateSnapshotSpool(root)
+
+    with pytest.raises((TypeError, ValueError, ValidationError)):
+        spool.publish_strategy_records(
+            strategy_id=strategy_id,
+            strategy_version=strategy_version,
+            source_snapshot_ids={"candidate_input": "3" * 64},
+            trade_date=TRADE_DATE,
+            captured_at=CAPTURED_AT,
+            producer_commit=COMMIT_A,
+            rows=(_row(),),
+        )
+
+    assert not root.exists()
+
+
 @pytest.mark.parametrize(
     "rows",
     [
@@ -945,6 +1158,217 @@ def test_concurrent_different_publish_records_allocate_consecutive_sequences(
     assert current is not None
     assert current.sequence == 1
     assert current.rows[0].variant == "pool2"
+
+
+def test_concurrent_identical_strategy_publish_creates_one_bound_generation(
+    tmp_path: Path,
+) -> None:
+    root = (tmp_path / "spool").resolve()
+    ctx = mp.get_context("spawn")
+    results = ctx.Queue()
+    entered_stage = ctx.Event()
+    release_stage = ctx.Event()
+    lock_contended = ctx.Event()
+    first = ctx.Process(
+        target=_publish_strategy_records_worker,
+        kwargs={
+            "root": str(root),
+            "strategy_id": "n_shape",
+            "captured_at": CAPTURED_AT,
+            "results": results,
+            "block_stage": "generation",
+            "entered_stage": entered_stage,
+            "release_stage": release_stage,
+        },
+    )
+    second = ctx.Process(
+        target=_publish_strategy_records_worker,
+        kwargs={
+            "root": str(root),
+            "strategy_id": "n_shape",
+            "captured_at": CAPTURED_AT + timedelta(seconds=1),
+            "results": results,
+            "verify_lock_contended": lock_contended,
+        },
+    )
+
+    first.start()
+    assert entered_stage.wait(timeout=10), "first publisher did not reach generation creation"
+    second.start()
+    try:
+        assert lock_contended.wait(timeout=10), "second publisher did not contend on publish lock"
+    finally:
+        release_stage.set()
+    observed = _collect_process_results([first, second], results)
+    snapshots = [StrategyCandidateSnapshot.model_validate(item["snapshot"]) for item in observed]
+
+    assert sorted(item["published"] for item in observed) == [False, True]
+    assert len({snapshot.content_sha256 for snapshot in snapshots}) == 1
+    assert {snapshot.schema_version for snapshot in snapshots} == {3}
+    assert len(list((root / "generations").glob("*.json"))) == 1
+    assert (
+        StrategyCandidateSnapshotSpool(root).read_strategy_as_of(
+            CAPTURED_AT + timedelta(seconds=2),
+            strategy_id="n_shape",
+            strategy_version="1",
+        )
+        == snapshots[0]
+    )
+
+
+def test_concurrent_different_strategies_cannot_both_bind_empty_root(tmp_path: Path) -> None:
+    root = (tmp_path / "spool").resolve()
+    ctx = mp.get_context("spawn")
+    results = ctx.Queue()
+    entered_stage = ctx.Event()
+    release_stage = ctx.Event()
+    lock_contended = ctx.Event()
+    first = ctx.Process(
+        target=_publish_strategy_records_worker,
+        kwargs={
+            "root": str(root),
+            "strategy_id": "n_shape",
+            "captured_at": CAPTURED_AT,
+            "results": results,
+            "block_stage": "authority",
+            "entered_stage": entered_stage,
+            "release_stage": release_stage,
+        },
+    )
+    second = ctx.Process(
+        target=_publish_strategy_records_worker,
+        kwargs={
+            "root": str(root),
+            "strategy_id": "auction_gap",
+            "captured_at": CAPTURED_AT + timedelta(seconds=1),
+            "results": results,
+            "verify_lock_contended": lock_contended,
+        },
+    )
+
+    first.start()
+    assert entered_stage.wait(timeout=10), "first publisher did not reach authority creation"
+    second.start()
+    try:
+        assert lock_contended.wait(timeout=10), "second publisher did not contend on publish lock"
+    finally:
+        release_stage.set()
+    for process in (first, second):
+        process.join(timeout=15)
+        assert process.exitcode == 0
+    observed = [results.get(timeout=2), results.get(timeout=2)]
+
+    assert sum(item["error"] is None for item in observed) == 1
+    assert any("different identity" in str(item["error"]) for item in observed)
+    binding = StrategyCandidateSnapshotSpool(root).read_authority_binding()
+    assert binding.strategy_id == "n_shape"
+    assert len(list((root / "generations").glob("*.json"))) == 1
+
+
+def test_strategy_publish_retries_after_binding_created_before_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spool = StrategyCandidateSnapshotSpool((tmp_path / "spool").resolve())
+    original_create = StrategyCandidateSnapshotSpool._atomic_create_generation
+
+    def fail_generation(cls: type[StrategyCandidateSnapshotSpool], *args: object) -> None:
+        raise RuntimeError("simulated generation interruption")
+
+    monkeypatch.setattr(
+        StrategyCandidateSnapshotSpool,
+        "_atomic_create_generation",
+        classmethod(fail_generation),
+    )
+    with pytest.raises(RuntimeError, match="generation interruption"):
+        spool.publish_strategy_records(
+            strategy_id="n_shape",
+            strategy_version="1",
+            source_snapshot_ids={"candidate_input": HASH_A},
+            trade_date=TRADE_DATE,
+            captured_at=CAPTURED_AT,
+            producer_commit=COMMIT_A,
+            rows=(),
+        )
+    assert spool.read_authority_binding().strategy_id == "n_shape"
+    assert list(spool.generations_root.glob("*.json")) == []
+    monkeypatch.setattr(
+        StrategyCandidateSnapshotSpool,
+        "_atomic_create_generation",
+        original_create,
+    )
+
+    recovered = spool.publish_strategy_records(
+        strategy_id="n_shape",
+        strategy_version="1",
+        source_snapshot_ids={"candidate_input": HASH_A},
+        trade_date=TRADE_DATE,
+        captured_at=CAPTURED_AT + timedelta(seconds=1),
+        producer_commit=COMMIT_A,
+        rows=(),
+    )
+
+    assert recovered.published is True
+    assert recovered.snapshot.sequence == 0
+    assert recovered.snapshot.schema_version == 3
+    assert recovered.snapshot.source_snapshot_ids == {"candidate_input": HASH_A}
+
+
+def test_strategy_publish_recovers_generation_before_pointer_without_lineage_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spool = StrategyCandidateSnapshotSpool((tmp_path / "spool").resolve())
+    original_replace = StrategyCandidateSnapshotSpool._atomic_replace_pointer
+
+    def fail_pointer(cls: type[StrategyCandidateSnapshotSpool], *args: object) -> None:
+        raise RuntimeError("simulated pointer interruption")
+
+    monkeypatch.setattr(
+        StrategyCandidateSnapshotSpool,
+        "_atomic_replace_pointer",
+        classmethod(fail_pointer),
+    )
+    with pytest.raises(RuntimeError, match="pointer interruption"):
+        spool.publish_strategy_records(
+            strategy_id="n_shape",
+            strategy_version="1",
+            source_snapshot_ids={"candidate_input": HASH_A},
+            trade_date=TRADE_DATE,
+            captured_at=CAPTURED_AT,
+            producer_commit=COMMIT_A,
+            rows=(),
+        )
+    monkeypatch.setattr(
+        StrategyCandidateSnapshotSpool,
+        "_atomic_replace_pointer",
+        original_replace,
+    )
+
+    recovered = spool.publish_strategy_records(
+        strategy_id="n_shape",
+        strategy_version="1",
+        source_snapshot_ids={"candidate_input": HASH_A},
+        trade_date=TRADE_DATE,
+        captured_at=CAPTURED_AT + timedelta(seconds=1),
+        producer_commit=COMMIT_A,
+        rows=(),
+    )
+
+    assert recovered.published is True
+    assert recovered.snapshot.sequence == 0
+    assert recovered.snapshot.captured_at == CAPTURED_AT
+    assert recovered.snapshot.authority_binding == spool.read_authority_binding()
+    assert recovered.snapshot.source_snapshot_ids == {"candidate_input": HASH_A}
+    assert len(list(spool.generations_root.glob("*.json"))) == 1
+    assert (
+        spool.read_strategy_as_of(
+            CAPTURED_AT + timedelta(seconds=2),
+            strategy_id="n_shape",
+            strategy_version="1",
+        )
+        == recovered.snapshot
+    )
 
 
 @pytest.mark.parametrize("preinitialized", [False, True], ids=["cold", "initialized"])
@@ -1389,6 +1813,11 @@ def test_pointer_hash_is_bound_to_generation_snapshot() -> None:
 
     assert pointer.generation_sha256 == snapshot.content_sha256
     assert (
-        canonical_sha256(snapshot.model_dump(mode="python", exclude={"content_sha256"}))
+        canonical_sha256(
+            snapshot.model_dump(
+                mode="python",
+                exclude={"authority_binding", "content_sha256", "source_snapshot_ids"},
+            )
+        )
         == snapshot.content_sha256
     )

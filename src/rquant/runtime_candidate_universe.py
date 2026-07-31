@@ -28,6 +28,7 @@ from rquant.runtime_contracts import (
     normalize_aware_utc,
 )
 from rquant.strategy_candidate_snapshot import (
+    StrategyCandidateAuthorityBinding,
     StrategyCandidatePriceBasis,
     StrategyCandidateRecord,
     StrategyCandidateSnapshot,
@@ -92,12 +93,31 @@ class RuntimeCandidateUniverseConfig(RuntimeContractModel):
 class CandidateUniverseAuthorityEvidence(RuntimeContractModel):
     strategy_id: str = Field(min_length=1)
     strategy_version: str = Field(min_length=1)
-    schema_version: Literal[1, 2]
+    schema_version: Literal[1, 2, 3]
     generation_sha256: Sha256
+    authority_binding_sha256: Sha256 | None = None
+    source_snapshot_ids: Mapping[str, Sha256] = Field(default_factory=dict)
     sequence: int = Field(ge=0)
     row_count: int = Field(ge=0)
     captured_at: AwareUtcDatetime
     codes: tuple[str, ...]
+
+    @field_validator("source_snapshot_ids")
+    @classmethod
+    def freeze_source_snapshot_ids(
+        cls,
+        value: Mapping[str, str],
+    ) -> Mapping[str, str]:
+        if any(not isinstance(key, str) or not key for key in value):
+            raise ValueError("source_snapshot_ids keys must be non-empty strings")
+        return MappingProxyType(dict(sorted(value.items())))
+
+    @field_serializer("source_snapshot_ids")
+    def serialize_source_snapshot_ids(
+        self,
+        value: Mapping[str, str],
+    ) -> dict[str, str]:
+        return dict(value)
 
     @model_validator(mode="after")
     def validate_codes(self) -> CandidateUniverseAuthorityEvidence:
@@ -105,11 +125,16 @@ class CandidateUniverseAuthorityEvidence(RuntimeContractModel):
             raise ValueError("authority evidence codes must be sorted and unique")
         if self.row_count != len(self.codes):
             raise ValueError("authority row_count must equal its unique candidate codes")
+        if self.schema_version == 3:
+            if self.authority_binding_sha256 is None or not self.source_snapshot_ids:
+                raise ValueError("schema v3 authority evidence is incomplete")
+        elif self.authority_binding_sha256 is not None or self.source_snapshot_ids:
+            raise ValueError("legacy authority evidence cannot contain schema v3 fields")
         return self
 
 
 class CandidateUniverseHitEvidence(RuntimeContractModel):
-    schema_version: Literal[1, 2]
+    schema_version: Literal[1, 2, 3]
     strategy_id: str = Field(min_length=1)
     strategy_version: str = Field(min_length=1)
     generation_sha256: Sha256
@@ -173,7 +198,7 @@ class CandidateUniverseHitEvidence(RuntimeContractModel):
         )
         if self.schema_version == 1 and self.effective_trade_date != decision_trade_date:
             raise ValueError("schema v1 decision date must equal effective_trade_date")
-        if self.schema_version == 2 and self.effective_trade_date < decision_trade_date:
+        if self.schema_version in {2, 3} and self.effective_trade_date < decision_trade_date:
             raise ValueError("candidate hit effective_trade_date precedes decision date")
         if self.reference_trade_date > decision_trade_date:
             raise ValueError("candidate hit reference_trade_date is a future reference")
@@ -322,6 +347,14 @@ class RuntimeCandidateUniverseResult(RuntimeContractModel):
                 )
                 for hit in hits
             )
+            authority_binding = None
+            if authority.schema_version == 3:
+                authority_binding = StrategyCandidateAuthorityBinding.create(
+                    strategy_id=authority.strategy_id,
+                    strategy_version=authority.strategy_version,
+                )
+                if authority_binding.content_sha256 != authority.authority_binding_sha256:
+                    raise ValueError("candidate authority binding hash does not match identity")
             reconstructed_generation = strategy_candidate_snapshot_content_sha256(
                 schema_version=authority.schema_version,
                 sequence=authority.sequence,
@@ -329,6 +362,8 @@ class RuntimeCandidateUniverseResult(RuntimeContractModel):
                 captured_at=authority.captured_at,
                 producer_commit=self.expected_commit,
                 rows=rows,
+                authority_binding=authority_binding,
+                source_snapshot_ids=authority.source_snapshot_ids,
             )
             if reconstructed_generation != authority.generation_sha256:
                 raise ValueError(
@@ -425,6 +460,12 @@ class RuntimeCandidateUniverseLoader:
                     strategy_version=authority.strategy_version,
                     schema_version=snapshot.schema_version,
                     generation_sha256=snapshot.content_sha256,
+                    authority_binding_sha256=(
+                        None
+                        if snapshot.authority_binding is None
+                        else snapshot.authority_binding.content_sha256
+                    ),
+                    source_snapshot_ids=snapshot.source_snapshot_ids,
                     sequence=snapshot.sequence,
                     row_count=len(snapshot.rows),
                     captured_at=snapshot.captured_at,
@@ -474,7 +515,11 @@ class RuntimeCandidateUniverseLoader:
             raise self._error(authority, "snapshot root is unreadable") from exc
 
         try:
-            snapshot = spool.read_as_of(as_of)
+            snapshot = spool.read_strategy_as_of(
+                as_of,
+                strategy_id=authority.strategy_id,
+                strategy_version=authority.strategy_version,
+            )
         except (StrategyCandidateSnapshotIntegrityError, OSError, ValueError) as exc:
             raise self._error(authority, f"snapshot authority is damaged: {exc}") from exc
         if snapshot is None:

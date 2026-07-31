@@ -20,7 +20,7 @@ from rquant.runtime_candidate_universe import (
     RuntimeCandidateUniverseLoader,
     RuntimeCandidateUniverseResult,
 )
-from rquant.runtime_contracts import RuntimeContractModel
+from rquant.runtime_contracts import RuntimeContractModel, canonical_sha256
 from rquant.strategy_candidate_feature_join import (
     StrategyCandidateFeatureBatch,
     StrategyCandidateFeatureJoinError,
@@ -135,8 +135,19 @@ def _publish(
     sequence: int = 0,
     captured_at: datetime | None = None,
 ) -> StrategyCandidateSnapshot:
-    snapshot = StrategyCandidateSnapshot.build(
-        sequence=sequence,
+    result = StrategyCandidateSnapshotSpool(root.resolve()).publish_strategy_records(
+        strategy_id=strategy_id,
+        strategy_version=strategy_version,
+        source_snapshot_ids={
+            "candidate_input": canonical_sha256(
+                {
+                    "strategy_id": strategy_id,
+                    "strategy_version": strategy_version,
+                    "sequence": sequence,
+                    "captured_at": captured_at or AVAILABLE_AT - timedelta(seconds=1),
+                }
+            )
+        },
         trade_date=TRADE_DATE,
         captured_at=captured_at or AVAILABLE_AT - timedelta(seconds=1),
         producer_commit=COMMIT,
@@ -145,8 +156,7 @@ def _publish(
     assert all(
         (row.strategy_id, row.strategy_version) == (strategy_id, strategy_version) for row in rows
     )
-    StrategyCandidateSnapshotSpool(root.resolve()).publish(snapshot)
-    return snapshot
+    return result.snapshot
 
 
 def _universe(
@@ -238,7 +248,7 @@ def test_cross_layer_output_is_frozen_and_selects_only_requested_strategy(
     assert result.candidate_authority.model_dump(mode="json") == {
         "strategy_id": "n_shape",
         "strategy_version": "1",
-        "schema_version": 2,
+        "schema_version": 3,
         "generation_sha256": snapshots[("n_shape", "1")].content_sha256,
         "captured_at": snapshots[("n_shape", "1")].captured_at.isoformat().replace("+00:00", "Z"),
     }
@@ -258,7 +268,7 @@ def test_cross_layer_output_is_frozen_and_selects_only_requested_strategy(
             "candidate_effective_trade_date": "2026-07-31",
             "candidate_generation_sha256": snapshots[("n_shape", "1")].content_sha256,
             "candidate_occurrence_id": n_row.occurrence_id,
-            "candidate_snapshot_schema_version": 2,
+            "candidate_snapshot_schema_version": 3,
             "candidate_variant": "default",
             "n_score": 0.91,
             "rel_same_minute": 3.0,

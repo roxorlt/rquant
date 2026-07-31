@@ -34,7 +34,6 @@ from rquant.strategy_candidate_feature_join import (
 from rquant.strategy_candidate_snapshot import (
     StrategyCandidatePriceBasis,
     StrategyCandidateRecord,
-    StrategyCandidateSnapshot,
     StrategyCandidateSnapshotSpool,
 )
 from rquant.strategy_runner import (
@@ -209,14 +208,17 @@ def _joined_feature_batch(
     requested_root = (
         tmp_path / f"requested-candidates-{trade_date.isoformat()}-{sequence}"
     ).resolve()
-    requested_snapshot = StrategyCandidateSnapshot.build(
-        sequence=0,
+    StrategyCandidateSnapshotSpool(requested_root).publish_strategy_records(
+        strategy_id="growth-board-surge-v1",
+        strategy_version="1",
+        source_snapshot_ids={
+            "candidate_input": hashlib.sha256(str(requested_root).encode()).hexdigest()
+        },
         trade_date=trade_date,
         captured_at=available_at,
         producer_commit="b" * 40,
         rows=requested_rows,
     )
-    StrategyCandidateSnapshotSpool(requested_root).publish(requested_snapshot)
     authorities = [
         CandidateUniverseAuthority(
             strategy_id="growth-board-surge-v1",
@@ -241,14 +243,16 @@ def _joined_feature_batch(
             static_features={"other_score": 0.8},
             reference_snapshot_ids={"daily": "2" * 64},
         )
-        StrategyCandidateSnapshotSpool(other_root).publish(
-            StrategyCandidateSnapshot.build(
-                sequence=0,
-                trade_date=trade_date,
-                captured_at=available_at,
-                producer_commit="b" * 40,
-                rows=(other_row,),
-            )
+        StrategyCandidateSnapshotSpool(other_root).publish_strategy_records(
+            strategy_id="other-strategy",
+            strategy_version="1",
+            source_snapshot_ids={
+                "candidate_input": hashlib.sha256(str(other_root).encode()).hexdigest()
+            },
+            trade_date=trade_date,
+            captured_at=available_at,
+            producer_commit="b" * 40,
+            rows=(other_row,),
         )
         authorities.append(
             CandidateUniverseAuthority(
@@ -470,7 +474,7 @@ def test_joined_signal_binds_candidate_occurrence_evidence(tmp_path: Path) -> No
         "candidate_effective_trade_date": "2026-07-31",
         "candidate_generation_sha256": row["candidate_generation_sha256"],
         "candidate_occurrence_id": row["candidate_occurrence_id"],
-        "candidate_snapshot_schema_version": 2,
+        "candidate_snapshot_schema_version": 3,
         "candidate_variant": "default",
         "evaluator_contract_fingerprint": EVALUATOR_FINGERPRINT,
         "event": "entry_ready",
@@ -573,7 +577,7 @@ def test_candidate_metadata_columns_are_all_present_or_all_absent(tmp_path: Path
         ("candidate_effective_trade_date", "2026-7-31", "ISO date"),
         ("candidate_variant", "", "non-empty"),
         ("candidate_generation_sha256", "not-a-sha", "SHA-256"),
-        ("candidate_snapshot_schema_version", 3, "must be 1 or 2"),
+        ("candidate_snapshot_schema_version", 4, "must be 1, 2 or 3"),
     ),
 )
 def test_joined_candidate_metadata_values_are_strictly_validated(

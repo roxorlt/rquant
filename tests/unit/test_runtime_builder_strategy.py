@@ -28,7 +28,6 @@ from rquant.signal_contracts import SignalAction
 from rquant.strategy_candidate_snapshot import (
     StrategyCandidatePriceBasis,
     StrategyCandidateRecord,
-    StrategyCandidateSnapshot,
     StrategyCandidateSnapshotSpool,
 )
 from rquant.strategy_runner import (
@@ -174,28 +173,28 @@ def _publish_candidates(
     producer_commit: str = COMMIT,
 ) -> None:
     decision_at = NOW - timedelta(days=1)
-    StrategyCandidateSnapshotSpool(root.resolve()).publish(
-        StrategyCandidateSnapshot.build(
-            sequence=0,
-            trade_date=date(2026, 7, 31),
-            captured_at=NOW,
-            producer_commit=producer_commit,
-            rows=(
-                StrategyCandidateRecord(
-                    strategy_id="n-shape-live",
-                    strategy_version="3",
-                    candidate_id="600000.SH",
-                    variant="default",
-                    decision_at=decision_at,
-                    available_at=decision_at + timedelta(minutes=1),
-                    effective_trade_date=date(2026, 7, 31),
-                    reference_trade_date=date(2026, 7, 30),
-                    price_basis=StrategyCandidatePriceBasis.QFQ_PIT,
-                    static_features={"candidate_score": 0.9},
-                    reference_snapshot_ids={"daily": "d" * 64},
-                ),
+    StrategyCandidateSnapshotSpool(root.resolve()).publish_strategy_records(
+        strategy_id="n-shape-live",
+        strategy_version="3",
+        source_snapshot_ids={"candidate_input": "e" * 64},
+        trade_date=date(2026, 7, 31),
+        captured_at=NOW,
+        producer_commit=producer_commit,
+        rows=(
+            StrategyCandidateRecord(
+                strategy_id="n-shape-live",
+                strategy_version="3",
+                candidate_id="600000.SH",
+                variant="default",
+                decision_at=decision_at,
+                available_at=decision_at + timedelta(minutes=1),
+                effective_trade_date=date(2026, 7, 31),
+                reference_trade_date=date(2026, 7, 30),
+                price_basis=StrategyCandidatePriceBasis.QFQ_PIT,
+                static_features={"candidate_score": 0.9},
+                reference_snapshot_ids={"daily": "d" * 64},
             ),
-        )
+        ),
     )
 
 

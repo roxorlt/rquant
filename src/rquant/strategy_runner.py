@@ -218,7 +218,7 @@ class StrategyCandidateState(RuntimeContractModel):
     candidate_effective_trade_date: date | None = None
     candidate_variant: str | None = Field(default=None, min_length=1)
     candidate_generation_sha256: Sha256 | None = None
-    candidate_snapshot_schema_version: Literal[1, 2] | None = None
+    candidate_snapshot_schema_version: Literal[1, 2, 3] | None = None
     state: StrategyLifecycleState
     last_feature_sequence: int = Field(ge=-1)
     last_feature_batch_id: str | None = None
@@ -1457,8 +1457,8 @@ class StrategyRunnerStore:
         if not isinstance(variant, str) or not variant.strip():
             raise ValueError("candidate_variant must be a non-empty string")
         schema_version = values["candidate_snapshot_schema_version"]
-        if type(schema_version) is not int or schema_version not in {1, 2}:
-            raise ValueError("candidate_snapshot_schema_version must be 1 or 2")
+        if type(schema_version) is not int or schema_version not in {1, 2, 3}:
+            raise ValueError("candidate_snapshot_schema_version must be 1, 2 or 3")
         expected_occurrence = candidate_occurrence_id(
             strategy_id=self.spec.strategy_id,
             strategy_version=str(self.spec.version),

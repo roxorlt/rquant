@@ -29,7 +29,6 @@ from rquant.strategy_candidate_feature_join import (
 from rquant.strategy_candidate_snapshot import (
     StrategyCandidatePriceBasis,
     StrategyCandidateRecord,
-    StrategyCandidateSnapshot,
     StrategyCandidateSnapshotSpool,
     asia_shanghai_trade_date,
 )
@@ -182,14 +181,14 @@ def _candidate_loader(
         )
     )
     root = (tmp_path / root_name).resolve()
-    StrategyCandidateSnapshotSpool(root).publish(
-        StrategyCandidateSnapshot.build(
-            sequence=0,
-            trade_date=trade_date,
-            captured_at=captured,
-            producer_commit=snapshot_commit,
-            rows=rows,
-        )
+    StrategyCandidateSnapshotSpool(root).publish_strategy_records(
+        strategy_id=_spec().strategy_id,
+        strategy_version=str(_spec().version),
+        source_snapshot_ids={"candidate_input": "e" * 64},
+        trade_date=trade_date,
+        captured_at=captured,
+        producer_commit=snapshot_commit,
+        rows=rows,
     )
     return RuntimeCandidateUniverseLoader(
         RuntimeCandidateUniverseConfig(
@@ -282,28 +281,28 @@ def test_crash_after_runner_commit_replays_without_duplicate_signal(
 
 def _publish_next_candidate_generation(root: Path) -> None:
     decision_at = NOW - timedelta(days=1)
-    StrategyCandidateSnapshotSpool(root.resolve()).publish(
-        StrategyCandidateSnapshot.build(
-            sequence=1,
-            trade_date=date(2026, 7, 31),
-            captured_at=NOW,
-            producer_commit=COMMIT,
-            rows=(
-                StrategyCandidateRecord(
-                    strategy_id=_spec().strategy_id,
-                    strategy_version=str(_spec().version),
-                    candidate_id="600000.SH",
-                    variant="default",
-                    decision_at=decision_at,
-                    available_at=decision_at + timedelta(minutes=1),
-                    effective_trade_date=date(2026, 7, 31),
-                    reference_trade_date=date(2026, 7, 30),
-                    price_basis=StrategyCandidatePriceBasis.QFQ_PIT,
-                    static_features={"candidate_score": 0.99},
-                    reference_snapshot_ids={"daily": "d" * 64},
-                ),
+    StrategyCandidateSnapshotSpool(root.resolve()).publish_strategy_records(
+        strategy_id=_spec().strategy_id,
+        strategy_version=str(_spec().version),
+        source_snapshot_ids={"candidate_input": "f" * 64},
+        trade_date=date(2026, 7, 31),
+        captured_at=NOW,
+        producer_commit=COMMIT,
+        rows=(
+            StrategyCandidateRecord(
+                strategy_id=_spec().strategy_id,
+                strategy_version=str(_spec().version),
+                candidate_id="600000.SH",
+                variant="default",
+                decision_at=decision_at,
+                available_at=decision_at + timedelta(minutes=1),
+                effective_trade_date=date(2026, 7, 31),
+                reference_trade_date=date(2026, 7, 30),
+                price_basis=StrategyCandidatePriceBasis.QFQ_PIT,
+                static_features={"candidate_score": 0.99},
+                reference_snapshot_ids={"daily": "d" * 64},
             ),
-        )
+        ),
     )
 
 

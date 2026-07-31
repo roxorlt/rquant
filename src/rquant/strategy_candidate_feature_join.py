@@ -59,7 +59,7 @@ class StrategyCandidateFeatureAuthority(RuntimeContractModel):
 
     strategy_id: str = Field(min_length=1)
     strategy_version: str = Field(min_length=1)
-    schema_version: Literal[1, 2]
+    schema_version: Literal[1, 2, 3]
     generation_sha256: Sha256
     captured_at: AwareUtcDatetime
 

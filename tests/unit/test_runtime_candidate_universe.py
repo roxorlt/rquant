@@ -94,15 +94,25 @@ def _publish(
             for code in codes
         )
     )
-    snapshot = StrategyCandidateSnapshot.build(
-        sequence=sequence,
+    result = StrategyCandidateSnapshotSpool(root.resolve()).publish_strategy_records(
+        strategy_id=strategy_id,
+        strategy_version=strategy_version,
+        source_snapshot_ids={
+            "candidate_input": canonical_sha256(
+                {
+                    "sequence": sequence,
+                    "trade_date": trade_date,
+                    "captured_at": resolved_captured_at,
+                    "rows": resolved_rows,
+                }
+            )
+        },
         trade_date=trade_date,
         captured_at=resolved_captured_at,
         producer_commit=producer_commit,
         rows=resolved_rows,
     )
-    StrategyCandidateSnapshotSpool(root.resolve()).publish(snapshot)
-    return snapshot
+    return result.snapshot
 
 
 def _authority(
@@ -161,6 +171,22 @@ def test_cross_layer_models_are_frozen_runtime_contracts(tmp_path: Path) -> None
     authority = _authority(tmp_path / "n")
     with pytest.raises(ValidationError):
         authority.required = False  # type: ignore[misc]
+
+
+def test_schema_v3_authority_evidence_rejects_empty_source_snapshot_name() -> None:
+    with pytest.raises(ValidationError, match="non-empty"):
+        CandidateUniverseAuthorityEvidence(
+            strategy_id="n_shape",
+            strategy_version="v1",
+            schema_version=3,
+            generation_sha256="2" * 64,
+            authority_binding_sha256="3" * 64,
+            source_snapshot_ids={"": "4" * 64},
+            sequence=0,
+            row_count=0,
+            captured_at=AS_OF,
+            codes=(),
+        )
 
 
 @pytest.mark.parametrize(
@@ -233,6 +259,30 @@ def test_load_unions_codes_and_preserves_all_authority_evidence(tmp_path: Path) 
     assert result.content_fingerprint == canonical_sha256(
         result.model_dump(mode="python", exclude={"content_fingerprint"})
     )
+
+
+def test_runtime_loader_rejects_bound_empty_authority_under_wrong_strategy(
+    tmp_path: Path,
+) -> None:
+    root = (tmp_path / "bound-empty").resolve()
+    StrategyCandidateSnapshotSpool(root).publish_strategy_records(
+        strategy_id="n_shape",
+        strategy_version="v1",
+        source_snapshot_ids={"candidate_input": "3" * 64},
+        trade_date=TRADE_DATE,
+        captured_at=AS_OF - timedelta(minutes=2),
+        producer_commit=COMMIT,
+        rows=(),
+    )
+
+    with pytest.raises(RuntimeCandidateUniverseIntegrityError, match="identity|bound"):
+        _loader(
+            _authority(
+                root,
+                strategy_id="growth_board_surge",
+                strategy_version="v1",
+            )
+        ).load(as_of=AS_OF, required_trade_date=TRADE_DATE)
 
 
 def test_load_accepts_prior_day_decision_and_preserves_immutable_pit_features(
@@ -660,9 +710,12 @@ def test_snapshot_contract_mismatches_fail_closed(
     if case == "commit":
         _publish(root, producer_commit=OTHER_COMMIT)
     elif case == "identity":
-        _publish(
+        _publish(root)
+        authority = _authority(
             root,
-            rows=(_row("000001.SZ", strategy_id="wrong", strategy_version="v1"),),
+            strategy_id="wrong",
+            strategy_version="v1",
+            max_age_seconds=600,
         )
     elif case == "trade_date":
         prior = TRADE_DATE - timedelta(days=1)

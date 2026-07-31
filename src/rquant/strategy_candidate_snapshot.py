@@ -131,12 +131,14 @@ def candidate_occurrence_id(
 
 def _snapshot_content_identity(
     *,
-    schema_version: Literal[1, 2],
+    schema_version: Literal[1, 2, 3],
     sequence: int,
     trade_date: date,
     captured_at: datetime,
     producer_commit: str,
     rows: Sequence[StrategyCandidateRecord],
+    authority_binding: StrategyCandidateAuthorityBinding | None = None,
+    source_snapshot_ids: Mapping[str, str] | None = None,
 ) -> dict[str, object]:
     if schema_version == 1:
         canonical_rows = tuple(
@@ -158,7 +160,7 @@ def _snapshot_content_identity(
             "rows": tuple(row_payloads),
         }
     canonical_rows = tuple(sorted(rows, key=lambda row: row.identity))
-    return {
+    identity: dict[str, object] = {
         "schema_version": schema_version,
         "sequence": sequence,
         "trade_date": trade_date,
@@ -166,16 +168,22 @@ def _snapshot_content_identity(
         "producer_commit": producer_commit,
         "rows": canonical_rows,
     }
+    if schema_version == 3:
+        identity["authority_binding"] = authority_binding
+        identity["source_snapshot_ids"] = dict(sorted((source_snapshot_ids or {}).items()))
+    return identity
 
 
 def strategy_candidate_snapshot_content_sha256(
     *,
-    schema_version: Literal[1, 2],
+    schema_version: Literal[1, 2, 3],
     sequence: int,
     trade_date: date,
     captured_at: datetime,
     producer_commit: str,
     rows: Sequence[StrategyCandidateRecord],
+    authority_binding: StrategyCandidateAuthorityBinding | None = None,
+    source_snapshot_ids: Mapping[str, str] | None = None,
 ) -> str:
     return canonical_sha256(
         _snapshot_content_identity(
@@ -185,6 +193,8 @@ def strategy_candidate_snapshot_content_sha256(
             captured_at=captured_at,
             producer_commit=producer_commit,
             rows=rows,
+            authority_binding=authority_binding,
+            source_snapshot_ids=source_snapshot_ids,
         )
     )
 
@@ -274,14 +284,61 @@ class StrategyCandidateRecord(RuntimeContractModel):
         )
 
 
+class StrategyCandidateAuthorityBinding(RuntimeContractModel):
+    schema_version: Literal[1]
+    strategy_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+    strategy_version: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
+    content_sha256: Sha256
+
+    @model_validator(mode="after")
+    def validate_content_hash(self) -> StrategyCandidateAuthorityBinding:
+        expected = canonical_sha256(self.model_dump(mode="python", exclude={"content_sha256"}))
+        if self.content_sha256 != expected:
+            raise ValueError("authority binding content_sha256 does not bind its identity")
+        return self
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        strategy_id: str,
+        strategy_version: str,
+    ) -> StrategyCandidateAuthorityBinding:
+        identity = {
+            "schema_version": 1,
+            "strategy_id": strategy_id,
+            "strategy_version": strategy_version,
+        }
+        return cls(**identity, content_sha256=canonical_sha256(identity))
+
+
 class StrategyCandidateSnapshot(RuntimeContractModel):
-    schema_version: Literal[1, 2]
+    schema_version: Literal[1, 2, 3]
     sequence: int = Field(ge=0)
     trade_date: date
     captured_at: AwareUtcDatetime
     producer_commit: CommitSha
+    authority_binding: StrategyCandidateAuthorityBinding | None = None
+    source_snapshot_ids: Mapping[str, Sha256] = Field(default_factory=dict)
     rows: tuple[StrategyCandidateRecord, ...]
     content_sha256: Sha256
+
+    @field_validator("source_snapshot_ids")
+    @classmethod
+    def freeze_source_snapshot_ids(
+        cls,
+        value: Mapping[str, str],
+    ) -> Mapping[str, str]:
+        if any(not isinstance(key, str) or not key for key in value):
+            raise ValueError("source_snapshot_ids keys must be non-empty strings")
+        return MappingProxyType(dict(sorted(value.items())))
+
+    @field_serializer("source_snapshot_ids")
+    def serialize_source_snapshot_ids(
+        self,
+        value: Mapping[str, str],
+    ) -> dict[str, str]:
+        return dict(value)
 
     @field_validator("rows")
     @classmethod
@@ -295,8 +352,10 @@ class StrategyCandidateSnapshot(RuntimeContractModel):
     def validate_snapshot(self) -> StrategyCandidateSnapshot:
         if self.schema_version == 1 and any(not row.legacy_utc_date_semantics for row in self.rows):
             raise ValueError("schema v1 rows require legacy UTC date semantics")
-        if self.schema_version == 2 and any(row.legacy_utc_date_semantics for row in self.rows):
-            raise ValueError("schema v2 rows reject legacy UTC date semantics")
+        if self.schema_version in {2, 3} and any(
+            row.legacy_utc_date_semantics for row in self.rows
+        ):
+            raise ValueError("schema v2/v3 rows reject legacy UTC date semantics")
         if self.schema_version == 1:
             for row in self.rows:
                 decision_trade_date = strategy_candidate_decision_trade_date(
@@ -307,6 +366,19 @@ class StrategyCandidateSnapshot(RuntimeContractModel):
                     raise ValueError(
                         "schema v1 decision date must equal effective and snapshot trade date"
                     )
+        if self.schema_version == 3:
+            if self.authority_binding is None or not self.source_snapshot_ids:
+                raise ValueError("schema v3 requires authority_binding and source_snapshot_ids")
+            expected_identity = (
+                self.authority_binding.strategy_id,
+                self.authority_binding.strategy_version,
+            )
+            if any(
+                (row.strategy_id, row.strategy_version) != expected_identity for row in self.rows
+            ):
+                raise ValueError("schema v3 row identity does not match authority binding")
+        elif self.authority_binding is not None or self.source_snapshot_ids:
+            raise ValueError("schema v1/v2 cannot contain schema v3 authority evidence")
         identities = [row.identity for row in self.rows]
         if len(identities) != len(set(identities)):
             raise ValueError("snapshot contains a duplicate candidate")
@@ -324,6 +396,8 @@ class StrategyCandidateSnapshot(RuntimeContractModel):
             captured_at=self.captured_at,
             producer_commit=self.producer_commit,
             rows=self.rows,
+            authority_binding=self.authority_binding,
+            source_snapshot_ids=self.source_snapshot_ids,
         )
         if self.content_sha256 != expected:
             raise ValueError("content_sha256 does not bind canonical snapshot content")
@@ -347,6 +421,35 @@ class StrategyCandidateSnapshot(RuntimeContractModel):
             trade_date=trade_date,
             captured_at=normalized_captured_at,
             producer_commit=producer_commit,
+            rows=canonical_rows,
+        )
+        return cls(
+            **identity,
+            content_sha256=canonical_sha256(identity),
+        )
+
+    @classmethod
+    def build_strategy(
+        cls,
+        *,
+        sequence: int,
+        trade_date: date,
+        captured_at: datetime,
+        producer_commit: str,
+        authority_binding: StrategyCandidateAuthorityBinding,
+        source_snapshot_ids: Mapping[str, str],
+        rows: Sequence[StrategyCandidateRecord],
+    ) -> StrategyCandidateSnapshot:
+        normalized_captured_at = normalize_aware_utc(captured_at)
+        canonical_rows = tuple(sorted(rows, key=lambda row: row.identity))
+        identity = _snapshot_content_identity(
+            schema_version=3,
+            sequence=sequence,
+            trade_date=trade_date,
+            captured_at=normalized_captured_at,
+            producer_commit=producer_commit,
+            authority_binding=authority_binding,
+            source_snapshot_ids=source_snapshot_ids,
             rows=canonical_rows,
         )
         return cls(
@@ -404,6 +507,7 @@ class StrategyCandidateSnapshotSpool:
         os.close(descriptor)
         self.root = candidate
         self.generations_root = self.root / "generations"
+        self.authority_path = self.root / "authority.json"
         self.current_path = self.root / "current.json"
         self._lock_path = self.root / ".publish.lock"
         self._thread_lock = RLock()
@@ -420,7 +524,15 @@ class StrategyCandidateSnapshotSpool:
         self._initialize_for_publish()
         with self._locked(exclusive=True) as (root_fd, generations_fd):
             self._cleanup_stale_temporaries(root_fd)
+            if self._entry_exists(root_fd, "authority.json"):
+                raise StrategyCandidateSnapshotIntegrityError(
+                    "bound authority requires strategy-aware publication"
+                )
             generations = self._read_all_generations(generations_fd)
+            if any(snapshot.schema_version == 3 for snapshot in generations.values()):
+                raise StrategyCandidateSnapshotIntegrityError(
+                    "schema v3 bound generations require strategy-aware publication"
+                )
             try:
                 self._validate_current_pointer(root_fd, generations)
             except StrategyCandidateSnapshotIntegrityError:
@@ -437,40 +549,93 @@ class StrategyCandidateSnapshotSpool:
         producer_commit: str,
         rows: Sequence[StrategyCandidateRecord],
     ) -> StrategyCandidatePublishResult:
+        validated_request = self._validate_publish_request(
+            trade_date=trade_date,
+            captured_at=captured_at,
+            producer_commit=producer_commit,
+            rows=rows,
+        )
+        return self._publish_records_request(
+            validated_request,
+            authority_binding=None,
+        )
+
+    def publish_strategy_records(
+        self,
+        *,
+        strategy_id: str,
+        strategy_version: str,
+        source_snapshot_ids: Mapping[str, str],
+        trade_date: date,
+        captured_at: datetime,
+        producer_commit: str,
+        rows: Sequence[StrategyCandidateRecord],
+    ) -> StrategyCandidatePublishResult:
+        authority_binding = StrategyCandidateAuthorityBinding.create(
+            strategy_id=strategy_id,
+            strategy_version=strategy_version,
+        )
+        if not isinstance(source_snapshot_ids, Mapping):
+            raise TypeError("source_snapshot_ids must be a mapping")
+        validated_request = StrategyCandidateSnapshot.build_strategy(
+            sequence=0,
+            trade_date=trade_date,
+            captured_at=captured_at,
+            producer_commit=producer_commit,
+            authority_binding=authority_binding,
+            source_snapshot_ids=source_snapshot_ids,
+            rows=rows,
+        )
+        return self._publish_records_request(
+            validated_request,
+            authority_binding=authority_binding,
+        )
+
+    @staticmethod
+    def _validate_publish_request(
+        *,
+        trade_date: date,
+        captured_at: datetime,
+        producer_commit: str,
+        rows: Sequence[StrategyCandidateRecord],
+    ) -> StrategyCandidateSnapshot:
         if (
             not isinstance(rows, Sequence)
             or isinstance(rows, (str, bytes, bytearray))
             or any(not isinstance(row, StrategyCandidateRecord) for row in rows)
         ):
             raise TypeError("rows must be a Sequence[StrategyCandidateRecord]")
-        validated_request = StrategyCandidateSnapshot.build(
+        return StrategyCandidateSnapshot.build(
             sequence=0,
             trade_date=trade_date,
             captured_at=captured_at,
             producer_commit=producer_commit,
             rows=rows,
         )
-        canonical_rows = validated_request.rows
-        normalized_captured_at = validated_request.captured_at
-        validated_trade_date = validated_request.trade_date
-        validated_producer_commit = validated_request.producer_commit
+
+    def _publish_records_request(
+        self,
+        validated_request: StrategyCandidateSnapshot,
+        *,
+        authority_binding: StrategyCandidateAuthorityBinding | None,
+    ) -> StrategyCandidatePublishResult:
         self._initialize_for_publish()
         with self._locked(exclusive=True) as (root_fd, generations_fd):
             self._cleanup_stale_temporaries(root_fd)
             generations = self._read_all_generations(generations_fd)
+            binding_exists = self._validate_authority_binding(
+                root_fd,
+                generations,
+                expected=authority_binding,
+            )
             try:
                 self._validate_current_pointer(root_fd, generations)
             except StrategyCandidateSnapshotIntegrityError:
                 interrupted = None if not generations else generations[max(generations)]
                 if (
                     interrupted is not None
-                    and normalized_captured_at >= interrupted.captured_at
-                    and self._same_semantics(
-                        interrupted,
-                        trade_date=validated_trade_date,
-                        producer_commit=validated_producer_commit,
-                        rows=canonical_rows,
-                    )
+                    and validated_request.captured_at >= interrupted.captured_at
+                    and self._same_semantics(interrupted, validated_request)
                     and self._finish_interrupted_publish(root_fd, generations, interrupted)
                 ):
                     return StrategyCandidatePublishResult(
@@ -478,24 +643,21 @@ class StrategyCandidateSnapshotSpool:
                         published=True,
                     )
                 raise
+            if authority_binding is not None and not binding_exists:
+                self._atomic_create_authority_binding(
+                    root_fd,
+                    self._model_bytes(authority_binding),
+                )
             current = None if not generations else generations[max(generations)]
-            if current is not None and normalized_captured_at < current.captured_at:
+            if current is not None and validated_request.captured_at < current.captured_at:
                 raise StrategyCandidateSnapshotIntegrityError(
                     "captured_at cannot move backwards across sequences"
                 )
-            if current is not None and self._same_semantics(
-                current,
-                trade_date=validated_trade_date,
-                producer_commit=validated_producer_commit,
-                rows=canonical_rows,
-            ):
+            if current is not None and self._same_semantics(current, validated_request):
                 return StrategyCandidatePublishResult(snapshot=current, published=False)
-            snapshot = StrategyCandidateSnapshot.build(
+            snapshot = self._resequence_snapshot(
+                validated_request,
                 sequence=0 if current is None else current.sequence + 1,
-                trade_date=validated_trade_date,
-                captured_at=normalized_captured_at,
-                producer_commit=validated_producer_commit,
-                rows=canonical_rows,
             )
             published = self._publish_locked(
                 root_fd,
@@ -505,19 +667,106 @@ class StrategyCandidateSnapshotSpool:
             )
             return StrategyCandidatePublishResult(snapshot=published, published=True)
 
+    def read_authority_binding(self) -> StrategyCandidateAuthorityBinding:
+        with self._locked(exclusive=False) as (root_fd, _generations_fd):
+            return self._read_authority_binding(root_fd)
+
+    def read_strategy_as_of(
+        self,
+        as_of: datetime,
+        *,
+        strategy_id: str,
+        strategy_version: str,
+    ) -> StrategyCandidateSnapshot | None:
+        normalized_as_of = normalize_aware_utc(as_of)
+        expected = StrategyCandidateAuthorityBinding.create(
+            strategy_id=strategy_id,
+            strategy_version=strategy_version,
+        )
+        with self._locked(exclusive=False) as (root_fd, generations_fd):
+            generations = self._read_all_generations(generations_fd)
+            self._validate_authority_binding(
+                root_fd,
+                generations,
+                expected=expected,
+            )
+            self._validate_current_pointer(root_fd, generations)
+            return self._visible_snapshot(generations, normalized_as_of)
+
+    def _validate_authority_binding(
+        self,
+        root_fd: int,
+        generations: Mapping[int, StrategyCandidateSnapshot],
+        *,
+        expected: StrategyCandidateAuthorityBinding | None,
+    ) -> bool:
+        exists = self._entry_exists(root_fd, "authority.json")
+        if expected is None:
+            if exists or any(snapshot.schema_version == 3 for snapshot in generations.values()):
+                raise StrategyCandidateSnapshotIntegrityError(
+                    "bound authority requires strategy-aware publication"
+                )
+            return False
+        if not exists:
+            if generations:
+                raise StrategyCandidateSnapshotIntegrityError(
+                    "unbound legacy generations cannot be claimed by a strategy"
+                )
+            return False
+        observed = self._read_authority_binding(root_fd)
+        if observed != expected:
+            raise StrategyCandidateSnapshotIntegrityError(
+                "strategy candidate authority is bound to a different identity"
+            )
+        if any(
+            snapshot.schema_version != 3 or snapshot.authority_binding != expected
+            for snapshot in generations.values()
+        ):
+            raise StrategyCandidateSnapshotIntegrityError(
+                "bound authority generations do not match root identity"
+            )
+        return True
+
     @staticmethod
     def _same_semantics(
         snapshot: StrategyCandidateSnapshot,
-        *,
-        trade_date: date,
-        producer_commit: str,
-        rows: tuple[StrategyCandidateRecord, ...],
+        request: StrategyCandidateSnapshot,
     ) -> bool:
         return (
-            snapshot.schema_version == 2
-            and snapshot.trade_date == trade_date
-            and snapshot.producer_commit == producer_commit
-            and snapshot.rows == rows
+            snapshot.schema_version == request.schema_version
+            and snapshot.trade_date == request.trade_date
+            and snapshot.producer_commit == request.producer_commit
+            and snapshot.authority_binding == request.authority_binding
+            and snapshot.source_snapshot_ids == request.source_snapshot_ids
+            and snapshot.rows == request.rows
+        )
+
+    @staticmethod
+    def _resequence_snapshot(
+        request: StrategyCandidateSnapshot,
+        *,
+        sequence: int,
+    ) -> StrategyCandidateSnapshot:
+        if request.schema_version == 3:
+            if request.authority_binding is None:
+                raise StrategyCandidateSnapshotIntegrityError(
+                    "schema v3 authority binding is missing"
+                )
+            return StrategyCandidateSnapshot.build_strategy(
+                sequence=sequence,
+                trade_date=request.trade_date,
+                captured_at=request.captured_at,
+                producer_commit=request.producer_commit,
+                authority_binding=request.authority_binding,
+                source_snapshot_ids=request.source_snapshot_ids,
+                rows=request.rows,
+            )
+        return StrategyCandidateSnapshot.build(
+            sequence=sequence,
+            trade_date=request.trade_date,
+            captured_at=request.captured_at,
+            producer_commit=request.producer_commit,
+            rows=request.rows,
         )
 
     def _publish_locked(
@@ -556,7 +805,7 @@ class StrategyCandidateSnapshotSpool:
             root_fd,
             generations_fd,
             generation_name,
-            self._model_bytes(snapshot),
+            self._snapshot_bytes(snapshot),
         )
         self._atomic_replace_pointer(
             root_fd,
@@ -569,13 +818,20 @@ class StrategyCandidateSnapshotSpool:
         with self._locked(exclusive=False) as (root_fd, generations_fd):
             generations = self._read_all_generations(generations_fd)
             self._validate_current_pointer(root_fd, generations)
-            visible = [
-                snapshot
-                for snapshot in generations.values()
-                if snapshot.captured_at <= normalized_as_of
-                and all(row.available_at <= normalized_as_of for row in snapshot.rows)
-            ]
-            return None if not visible else max(visible, key=lambda item: item.sequence)
+            return self._visible_snapshot(generations, normalized_as_of)
+
+    @staticmethod
+    def _visible_snapshot(
+        generations: Mapping[int, StrategyCandidateSnapshot],
+        as_of: datetime,
+    ) -> StrategyCandidateSnapshot | None:
+        visible = [
+            snapshot
+            for snapshot in generations.values()
+            if snapshot.captured_at <= as_of
+            and all(row.available_at <= as_of for row in snapshot.rows)
+        ]
+        return None if not visible else max(visible, key=lambda item: item.sequence)
 
     @staticmethod
     def _same_file(left: os.stat_result, right: os.stat_result) -> bool:
@@ -1008,6 +1264,9 @@ class StrategyCandidateSnapshotSpool:
     @classmethod
     def _snapshot_bytes(cls, snapshot: StrategyCandidateSnapshot) -> bytes:
         payload = snapshot.model_dump(mode="json")
+        if snapshot.schema_version in {1, 2}:
+            payload.pop("authority_binding")
+            payload.pop("source_snapshot_ids")
         if snapshot.schema_version == 1:
             payload.pop("schema_version")
             for row in payload["rows"]:
@@ -1023,6 +1282,23 @@ class StrategyCandidateSnapshotSpool:
         if self._model_bytes(pointer) != payload:
             raise StrategyCandidateSnapshotIntegrityError("current pointer is not canonical JSON")
         return pointer
+
+    def _read_authority_binding(
+        self,
+        root_fd: int,
+    ) -> StrategyCandidateAuthorityBinding:
+        payload = self._read_regular_file(
+            root_fd,
+            "authority.json",
+            label="authority binding",
+        )
+        try:
+            binding = StrategyCandidateAuthorityBinding.model_validate_json(payload)
+        except ValueError as exc:
+            raise StrategyCandidateSnapshotIntegrityError("authority binding is invalid") from exc
+        if self._model_bytes(binding) != payload:
+            raise StrategyCandidateSnapshotIntegrityError("authority binding is not canonical JSON")
+        return binding
 
     @staticmethod
     def _model_bytes(model: RuntimeContractModel) -> bytes:
@@ -1139,6 +1415,29 @@ class StrategyCandidateSnapshotSpool:
             os.fsync(root_fd)
 
     @classmethod
+    def _atomic_create_authority_binding(cls, root_fd: int, payload: bytes) -> None:
+        temporary_name = f".authority.{uuid4().hex}.tmp"
+        try:
+            cls._write_temporary(root_fd, temporary_name, payload)
+            try:
+                os.link(
+                    temporary_name,
+                    "authority.json",
+                    src_dir_fd=root_fd,
+                    dst_dir_fd=root_fd,
+                    follow_symlinks=False,
+                )
+            except FileExistsError as exc:
+                raise StrategyCandidateSnapshotIntegrityError(
+                    "strategy candidate authority binding already exists"
+                ) from exc
+            os.fsync(root_fd)
+        finally:
+            with suppress(FileNotFoundError):
+                os.unlink(temporary_name, dir_fd=root_fd)
+            os.fsync(root_fd)
+
+    @classmethod
     def _atomic_replace_pointer(cls, root_fd: int, payload: bytes) -> None:
         temporary_name = f".current.{uuid4().hex}.tmp"
         try:
@@ -1156,7 +1455,7 @@ class StrategyCandidateSnapshotSpool:
 
     @classmethod
     def _cleanup_stale_temporaries(cls, root_fd: int) -> None:
-        pattern = re.compile(r"^\.(?:candidate-generation|current)\.[0-9a-f]{32}\.tmp$")
+        pattern = re.compile(r"^\.(?:authority|candidate-generation|current)\.[0-9a-f]{32}\.tmp$")
         with os.scandir(root_fd) as entries:
             for entry in entries:
                 if pattern.fullmatch(entry.name) is None:
