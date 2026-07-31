@@ -75,6 +75,9 @@ header[data-testid="stHeader"] {display: none;}
   .rq-head h1 {font-size:1.32rem;}
   [data-testid="stHorizontalBlock"] {flex-wrap:wrap; gap:0.45rem !important;}
   [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] {
+    min-width:100% !important; flex:1 1 100% !important;
+  }
+  .st-key-runtime_metrics [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] {
     min-width:calc(50% - 0.45rem) !important; flex:1 1 calc(50% - 0.45rem) !important;
   }
   [data-testid="stDataFrame"] {overflow-x:auto;}
@@ -114,7 +117,7 @@ def _show_table(rows: list[dict[str, object]], *, empty: str) -> None:
     st.dataframe(
         rows,
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
         height=_table_height(len(rows)),
     )
 
@@ -276,11 +279,12 @@ def _render_snapshot(snapshot: RuntimeConsoleSnapshot) -> None:
 
     running_jobs = sum(item.status == "running" for item in snapshot.lab_jobs)
     failed_deliveries = sum(item.status == "failed" for item in snapshot.deliveries)
-    metrics = st.columns(4)
-    metrics[0].metric("Generation 年龄", f"{snapshot.age_seconds or 0} 秒")
-    metrics[1].metric("近期信号", len(snapshot.signals))
-    metrics[2].metric("推送失败", failed_deliveries)
-    metrics[3].metric("运行中 Lab", running_jobs)
+    with st.container(key="runtime_metrics"):
+        metrics = st.columns(4)
+        metrics[0].metric("Generation 年龄", f"{snapshot.age_seconds or 0} 秒")
+        metrics[1].metric("近期信号", len(snapshot.signals))
+        metrics[2].metric("推送失败", failed_deliveries)
+        metrics[3].metric("运行中 Lab", running_jobs)
 
     _render_services(snapshot)
     left, right = st.columns(2)
