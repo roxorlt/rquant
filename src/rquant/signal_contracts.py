@@ -78,6 +78,11 @@ class SignalEnvelope(RuntimeContractModel):
             raise ValueError("reason_codes must be unique")
         return tuple(sorted(values))
 
+    @field_validator("evidence", mode="before")
+    @classmethod
+    def thaw_evidence_for_revalidation(cls, value: object) -> object:
+        return _thaw_json(value)
+
     @field_validator("evidence")
     @classmethod
     def freeze_evidence(cls, value: Mapping[str, JsonValue]) -> Mapping[str, JsonValue]:

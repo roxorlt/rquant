@@ -218,7 +218,12 @@ def route_runner_signals(
     )
     started_after = cursor.last_sequence
     raw_records = source.signals_after(sequence=started_after)
-    records = tuple(RunnerSignalRecord.model_validate(record) for record in raw_records)
+    records = tuple(
+        record
+        if isinstance(record, RunnerSignalRecord)
+        else RunnerSignalRecord.model_validate(record)
+        for record in raw_records
+    )
     expected = started_after + 1
     for record in records:
         if record.sequence != expected:

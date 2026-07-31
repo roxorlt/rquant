@@ -120,6 +120,16 @@ def test_signal_identity_treats_reason_codes_as_a_set_and_deep_freezes_evidence(
     assert restored == left
 
 
+def test_signal_can_cross_a_revalidating_contract_boundary_after_deep_freeze() -> None:
+    signal = SignalEnvelope(**_signal_kwargs())
+
+    revalidated = SignalEnvelope.model_validate(signal)
+
+    assert revalidated == signal
+    with pytest.raises(TypeError):
+        revalidated.evidence["levels"]["resistance"] = 11.0  # type: ignore[index]
+
+
 @pytest.mark.parametrize(
     ("event_offset", "available_offset", "expires_offset"),
     [

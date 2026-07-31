@@ -151,7 +151,9 @@ def build_serving_read_models(
                 "available_at": record.signal.available_at,
                 "expires_at": record.signal.expires_at,
                 "reason_codes_json": _json(record.signal.reason_codes),
-                "evidence_json": _json(dict(record.signal.evidence)),
+                "evidence_json": _json(
+                    record.signal.model_dump(mode="json")["evidence"]
+                ),
                 "dataset_snapshot_id": record.signal.dataset_snapshot_id,
                 "feature_snapshot_id": record.signal.feature_snapshot_id,
             }

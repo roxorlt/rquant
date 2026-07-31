@@ -37,7 +37,10 @@ def _signal() -> SignalEnvelope:
         candidate_id="600000.SH",
         action=SignalAction.B_INTENT,
         reason_codes=("strong_support",),
-        evidence={"score": 0.8},
+        evidence={
+            "score": 0.8,
+            "runner_transition": {"from_state": "idle", "to_state": "armed"},
+        },
         expires_at=NOW + timedelta(minutes=5),
         producer_commit="d" * 40,
     )
