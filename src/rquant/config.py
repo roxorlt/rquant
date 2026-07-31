@@ -601,4 +601,9 @@ class Settings(BaseSettings):
         return derive_gate_token(self.panorama_cookie_secret)
 
 
-settings = Settings()  # type: ignore[call-arg]
+def _default_settings_env_file() -> str | None:
+    disabled = os.getenv("RQUANT_DISABLE_DOTENV", "").strip().lower()
+    return None if disabled in {"1", "true", "yes", "on"} else ".env"
+
+
+settings = Settings(_env_file=_default_settings_env_file())  # type: ignore[call-arg]

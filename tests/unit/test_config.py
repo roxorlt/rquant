@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from rquant.config import Settings, settings
+from rquant.config import Settings, _default_settings_env_file, settings
 
 
 def _settings_values(tmp_path: Path) -> dict[str, object]:
@@ -19,6 +19,19 @@ def _settings_values(tmp_path: Path) -> dict[str, object]:
         "parquet_dir": tmp_path / "data" / "parquet",
         "log_dir": tmp_path / "logs",
     }
+
+
+def test_runtime_can_disable_implicit_project_dotenv(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("RQUANT_DISABLE_DOTENV", raising=False)
+    assert _default_settings_env_file() == ".env"
+
+    monkeypatch.setenv("RQUANT_DISABLE_DOTENV", "1")
+    assert _default_settings_env_file() is None
+
+    monkeypatch.setenv("RQUANT_DISABLE_DOTENV", "true")
+    assert _default_settings_env_file() is None
 
 
 class TestSettings:
