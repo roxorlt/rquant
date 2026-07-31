@@ -6,7 +6,7 @@ import re
 from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 import pandas as pd
 from pydantic import Field, StrictInt, field_validator
@@ -24,6 +24,17 @@ from rquant.runtime_service_entrypoint import (
     RuntimeServiceStep,
 )
 from rquant.source_quota_store import SourceQuotaStore
+
+if TYPE_CHECKING:
+    from rquant.paper_signal_worker import QuoteResolver
+    from rquant.runtime_builder_paper import TradeDateResolver
+    from rquant.runtime_builder_serving import ServingSnapshotLoader
+    from rquant.runtime_builder_signal import (
+        ProviderLoader,
+        SignalSourceLoader,
+    )
+    from rquant.runtime_builder_strategy import StrategyEvaluatorLoader
+    from rquant.signal_router_runtime import TargetResolver
 
 _TS_CODE_PATTERN = re.compile(r"^[0-9]{6}\.(?:BJ|SH|SZ)$")
 
@@ -124,11 +135,25 @@ def build_builtin_registry(
     adapter_factory: Callable[[], MarketMinuteAdapter] | None = None,
     universe_loader: Callable[[], Iterable[str]] | None = None,
     clock: Callable[[], datetime] | None = None,
+    evaluator_loader: StrategyEvaluatorLoader | None = None,
+    signal_source_loader: SignalSourceLoader | None = None,
+    target_resolver: TargetResolver | None = None,
+    provider_loader: ProviderLoader | None = None,
+    paper_quote_resolver: QuoteResolver | None = None,
+    trade_date_resolver: TradeDateResolver | None = None,
+    serving_snapshot_loader: ServingSnapshotLoader | None = None,
 ) -> RuntimeServiceRegistry:
     from rquant.runtime_builder_feature import feature_live_builder
-    from rquant.runtime_builder_paper import paper_consumer_builder
+    from rquant.runtime_builder_paper import paper_broker_builder, paper_consumer_builder
+    from rquant.runtime_builder_serving import serving_publisher_builder
+    from rquant.runtime_builder_signal import notifier_builder, signal_router_builder
+    from rquant.runtime_builder_strategy import strategy_live_builder
 
     resolved_clock = clock or (lambda: datetime.now(UTC))
+    if (signal_source_loader is None) != (target_resolver is None):
+        raise ValueError("signal router dependencies must be provided together")
+    if (paper_quote_resolver is None) != (trade_date_resolver is None):
+        raise ValueError("paper broker dependencies must be provided together")
     registry = RuntimeServiceRegistry()
     registry.register(
         RuntimeServiceKind.MARKET_MINUTE_SOURCE,
@@ -142,10 +167,52 @@ def build_builtin_registry(
         RuntimeServiceKind.FEATURE_LIVE,
         feature_live_builder(clock=resolved_clock),
     )
+    if evaluator_loader is not None:
+        registry.register(
+            RuntimeServiceKind.STRATEGY_LIVE,
+            strategy_live_builder(
+                evaluator_loader=evaluator_loader,
+                clock=resolved_clock,
+            ),
+        )
+    if signal_source_loader is not None and target_resolver is not None:
+        registry.register(
+            RuntimeServiceKind.SIGNAL_ROUTER,
+            signal_router_builder(
+                source_loader=signal_source_loader,
+                target_resolver=target_resolver,
+                clock=resolved_clock,
+            ),
+        )
+    if provider_loader is not None:
+        registry.register(
+            RuntimeServiceKind.NOTIFIER,
+            notifier_builder(
+                provider_loader=provider_loader,
+                clock=resolved_clock,
+            ),
+        )
     registry.register(
         RuntimeServiceKind.PAPER_CONSUMER,
         paper_consumer_builder(clock=resolved_clock),
     )
+    if paper_quote_resolver is not None and trade_date_resolver is not None:
+        registry.register(
+            RuntimeServiceKind.PAPER_BROKER,
+            paper_broker_builder(
+                clock=resolved_clock,
+                quote_resolver=paper_quote_resolver,
+                trade_date_resolver=trade_date_resolver,
+            ),
+        )
+    if serving_snapshot_loader is not None:
+        registry.register(
+            RuntimeServiceKind.SERVING_PUBLISHER,
+            serving_publisher_builder(
+                snapshot_loader=serving_snapshot_loader,
+                clock=resolved_clock,
+            ),
+        )
     return registry
 
 

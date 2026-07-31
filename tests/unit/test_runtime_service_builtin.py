@@ -128,3 +128,30 @@ def test_builtin_registry_registers_dependency_free_concrete_builders(tmp_path: 
     )
     with pytest.raises(KeyError, match="not registered"):
         registry.build(unsupported)
+
+
+def test_builtin_registry_registers_all_explicitly_bound_services() -> None:
+    registry = build_builtin_registry(
+        adapter_factory=_Adapter,
+        universe_loader=lambda: ["600000.SH"],
+        clock=lambda: NOW,
+        evaluator_loader=lambda *_args: object(),  # type: ignore[arg-type]
+        signal_source_loader=lambda _source_id: object(),  # type: ignore[arg-type]
+        target_resolver=lambda _signal: object(),  # type: ignore[arg-type]
+        provider_loader=lambda: {},
+        paper_quote_resolver=lambda *_args: object(),  # type: ignore[arg-type]
+        trade_date_resolver=lambda _now: NOW.date(),
+        serving_snapshot_loader=lambda _now: object(),  # type: ignore[arg-type]
+    )
+
+    assert registry.registered_kinds == tuple(RuntimeServiceKind)
+
+
+def test_builtin_registry_rejects_partial_router_dependencies() -> None:
+    with pytest.raises(ValueError, match="router dependencies"):
+        build_builtin_registry(
+            adapter_factory=_Adapter,
+            universe_loader=lambda: ["600000.SH"],
+            clock=lambda: NOW,
+            signal_source_loader=lambda _source_id: object(),  # type: ignore[arg-type]
+        )
