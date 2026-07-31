@@ -13,7 +13,11 @@ from rquant.delivery_contracts import (
     OutboxStatus,
     RouterDisposition,
 )
-from rquant.signal_bus import SignalBusLeaseError, SignalBusStore
+from rquant.signal_bus import (
+    SignalBusLeaseError,
+    SignalBusSourceSequenceError,
+    SignalBusStore,
+)
 from rquant.signal_contracts import SignalAction, SignalEnvelope
 
 NOW = datetime(2026, 7, 31, 1, 30, tzinfo=UTC)
@@ -128,6 +132,110 @@ def test_signal_round_trips_frozen_canonical_json_by_id_and_sequence(
     assert payload == reopened.signal_payload(signal.signal_id)
     with pytest.raises(TypeError):
         reopened.signal(signal.signal_id).evidence["new"] = 1  # type: ignore[index]
+
+
+def test_source_generation_is_stable_across_reopen_and_changes_after_rebuild(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "signal-bus.sqlite3"
+    first = _store(path).source_descriptor()
+    reopened = _store(path).source_descriptor()
+
+    assert reopened == first
+    assert first.first_global_sequence == 1
+    assert first.high_watermark == 0
+
+    path.unlink()
+    rebuilt = _store(path).source_descriptor()
+
+    assert rebuilt.generation_id != first.generation_id
+    assert rebuilt.first_global_sequence == 1
+    assert rebuilt.high_watermark == 0
+
+
+def test_bounded_global_sequence_read_is_ordered_frozen_and_read_only(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path / "signal-bus.sqlite3")
+    first = _signal("a")
+    second = _signal("e")
+    store.ingest(first, received_at=NOW)
+    frozen = store.source_descriptor()
+    store.ingest(second, received_at=NOW + timedelta(seconds=1))
+
+    records = store.signals_after_global_sequence(
+        after_sequence=0,
+        through_sequence=frozen.high_watermark,
+        observed_at=NOW + timedelta(seconds=2),
+        limit=10,
+    )
+
+    assert [record.global_sequence for record in records] == [1]
+    assert records[0].signal == first
+    assert records[0].signal_id == first.signal_id
+    assert records[0].payload_hash == records[0].canonical_payload_hash
+    assert store.source_descriptor().high_watermark == 2
+    assert (
+        store.signals_after_global_sequence(
+            after_sequence=0,
+            through_sequence=frozen.high_watermark,
+            observed_at=NOW + timedelta(seconds=2),
+            limit=10,
+        )
+        == records
+    )
+
+
+def test_future_signal_blocks_later_sequences_until_it_is_visible(tmp_path: Path) -> None:
+    store = _store(tmp_path / "signal-bus.sqlite3")
+    future = _signal("a", available_at=NOW + timedelta(minutes=2))
+    later = _signal("e", available_at=NOW)
+    store.ingest(future, received_at=NOW)
+    store.ingest(later, received_at=NOW)
+    watermark = store.source_descriptor().high_watermark
+
+    assert (
+        store.signals_after_global_sequence(
+            after_sequence=0,
+            through_sequence=watermark,
+            observed_at=NOW,
+            limit=10,
+        )
+        == ()
+    )
+    visible = store.signals_after_global_sequence(
+        after_sequence=0,
+        through_sequence=watermark,
+        observed_at=NOW + timedelta(minutes=2),
+        limit=10,
+    )
+    assert [record.signal_id for record in visible] == [future.signal_id, later.signal_id]
+
+
+def test_bounded_read_rejects_sequence_gap_or_high_watermark_beyond_source(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "signal-bus.sqlite3"
+    store = _store(path)
+    store.ingest(_signal("a"), received_at=NOW)
+    store.ingest(_signal("e"), received_at=NOW)
+    with sqlite3.connect(path) as connection:
+        connection.execute("DELETE FROM signal_envelope WHERE global_sequence = 1")
+
+    with pytest.raises(SignalBusSourceSequenceError, match="gap|truncated"):
+        store.signals_after_global_sequence(
+            after_sequence=0,
+            through_sequence=2,
+            observed_at=NOW,
+            limit=10,
+        )
+    with pytest.raises(SignalBusSourceSequenceError, match="high watermark"):
+        store.signals_after_global_sequence(
+            after_sequence=2,
+            through_sequence=3,
+            observed_at=NOW,
+            limit=10,
+        )
 
 
 def test_route_deduplicates_targets_and_persists_across_reopen(tmp_path: Path) -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import secrets
 import sqlite3
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
@@ -45,6 +46,10 @@ class SignalRouteSequenceError(RuntimeError):
     """A source sequence or high watermark regressed, skipped, or disappeared."""
 
 
+class SignalBusSourceSequenceError(RuntimeError):
+    """The append-only global signal sequence was truncated or requested unsafely."""
+
+
 class RouteReceiptDisposition(StrEnum):
     ROUTED = "routed"
     NO_TARGET = "no_target"
@@ -68,6 +73,42 @@ class RouteSourceDescriptor(RuntimeContractModel):
         if self.high_watermark < self.first_sequence - 1:
             raise ValueError("high_watermark cannot precede the source start")
         return self
+
+
+class SignalBusSourceDescriptor(RuntimeContractModel):
+    source_id: str = Field(default="signal-bus/global-sequence/v1", min_length=1)
+    generation_id: Sha256
+    first_global_sequence: int = Field(default=1, ge=1)
+    high_watermark: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def validate_bounds(self) -> Self:
+        if self.high_watermark < self.first_global_sequence - 1:
+            raise ValueError("high_watermark cannot precede the source start")
+        return self
+
+
+class SignalBusSignalRecord(RuntimeContractModel):
+    global_sequence: int = Field(ge=1)
+    signal_id: Sha256
+    payload_hash: Sha256
+    payload_json: str = Field(min_length=1)
+    signal: SignalEnvelope
+    received_at: AwareUtcDatetime
+
+    @model_validator(mode="after")
+    def validate_identity(self) -> Self:
+        if self.signal.signal_id != self.signal_id:
+            raise ValueError("signal_id does not match signal payload")
+        if _signal_payload(self.signal) != self.payload_json:
+            raise ValueError("payload_json is not the canonical signal payload")
+        if self.payload_hash != self.canonical_payload_hash:
+            raise ValueError("payload_hash does not match payload_json")
+        return self
+
+    @property
+    def canonical_payload_hash(self) -> str:
+        return _payload_hash(self.payload_json)
 
 
 class SignalRouteCursor(RuntimeContractModel):
@@ -292,6 +333,22 @@ class SignalBusStore:
             raise
         return connection
 
+    def _connect_readonly(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(
+            f"file:{self.path}?mode=ro",
+            uri=True,
+            timeout=self.busy_timeout_ms / 1_000,
+            isolation_level=None,
+        )
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.execute(f"PRAGMA busy_timeout = {self.busy_timeout_ms}")
+            connection.execute("PRAGMA query_only = ON")
+        except BaseException:
+            connection.close()
+            raise
+        return connection
+
     @contextmanager
     def _write_transaction(self) -> Iterator[sqlite3.Connection]:
         connection = self._connect()
@@ -420,6 +477,23 @@ class SignalBusStore:
                 """,
                 (self.retry_policy_fingerprint,),
             )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO signal_bus_metadata(metadata_key, metadata_value)
+                VALUES ('source_generation_id', ?)
+                """,
+                (secrets.token_hex(32),),
+            )
+            observed_max = connection.execute(
+                "SELECT COALESCE(MAX(global_sequence), 0) AS value FROM signal_envelope"
+            ).fetchone()
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO signal_bus_metadata(metadata_key, metadata_value)
+                VALUES ('signal_high_watermark', ?)
+                """,
+                (str(int(observed_max["value"])),),
+            )
             observed = connection.execute(
                 """
                 SELECT metadata_value
@@ -515,6 +589,15 @@ class SignalBusStore:
             (signal_id, content_hash, payload, _encode_time(received_at)),
         )
         sequence = int(cursor.lastrowid)
+        connection.execute(
+            """
+            UPDATE signal_bus_metadata
+            SET metadata_value = ?
+            WHERE metadata_key = 'signal_high_watermark'
+              AND CAST(metadata_value AS INTEGER) < ?
+            """,
+            (str(sequence), sequence),
+        )
         return (
             RouterReceipt(
                 signal_id=signal_id,
@@ -524,6 +607,116 @@ class SignalBusStore:
             ),
             True,
         )
+
+    def source_descriptor(self) -> SignalBusSourceDescriptor:
+        connection = self._connect_readonly()
+        try:
+            rows = connection.execute(
+                """
+                SELECT metadata_key, metadata_value
+                FROM signal_bus_metadata
+                WHERE metadata_key IN ('source_generation_id', 'signal_high_watermark')
+                """
+            ).fetchall()
+        finally:
+            connection.close()
+        metadata = {str(row["metadata_key"]): str(row["metadata_value"]) for row in rows}
+        generation_id = metadata.get("source_generation_id")
+        high_watermark = metadata.get("signal_high_watermark")
+        if generation_id is None or high_watermark is None:
+            raise RuntimeError("signal bus source metadata is incomplete")
+        return SignalBusSourceDescriptor(
+            generation_id=generation_id,
+            high_watermark=int(high_watermark),
+        )
+
+    def signals_after_global_sequence(
+        self,
+        *,
+        after_sequence: int,
+        through_sequence: int,
+        observed_at: datetime,
+        limit: int,
+    ) -> tuple[SignalBusSignalRecord, ...]:
+        if (
+            not isinstance(after_sequence, int)
+            or isinstance(after_sequence, bool)
+            or after_sequence < 0
+        ):
+            raise ValueError("after_sequence must be a non-negative integer")
+        if (
+            not isinstance(through_sequence, int)
+            or isinstance(through_sequence, bool)
+            or through_sequence < after_sequence
+        ):
+            raise ValueError("through_sequence must be an integer at least after_sequence")
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise ValueError("limit must be a positive integer")
+        visible_at = _normalize_time(observed_at)
+
+        connection = self._connect_readonly()
+        try:
+            connection.execute("BEGIN")
+            watermark_row = connection.execute(
+                """
+                SELECT metadata_value
+                FROM signal_bus_metadata
+                WHERE metadata_key = 'signal_high_watermark'
+                """
+            ).fetchone()
+            if watermark_row is None:
+                raise RuntimeError("signal bus high watermark is missing")
+            current_high_watermark = int(watermark_row["metadata_value"])
+            if through_sequence > current_high_watermark:
+                raise SignalBusSourceSequenceError(
+                    "requested high watermark exceeds the signal bus high watermark"
+                )
+            rows = connection.execute(
+                """
+                SELECT global_sequence, signal_id, payload_hash, payload_json, received_at
+                FROM signal_envelope
+                WHERE global_sequence > ? AND global_sequence <= ?
+                ORDER BY global_sequence
+                LIMIT ?
+                """,
+                (after_sequence, through_sequence, limit),
+            ).fetchall()
+            connection.execute("COMMIT")
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
+        if through_sequence > after_sequence and not rows:
+            raise SignalBusSourceSequenceError(
+                "signal sequence is truncated before the requested high watermark"
+            )
+        records: list[SignalBusSignalRecord] = []
+        expected_sequence = after_sequence + 1
+        for row in rows:
+            sequence = int(row["global_sequence"])
+            if sequence != expected_sequence:
+                raise SignalBusSourceSequenceError(
+                    f"signal sequence gap: expected {expected_sequence}, observed {sequence}"
+                )
+            expected_sequence += 1
+            signal = SignalEnvelope.model_validate_json(row["payload_json"])
+            received_at = _require_time(row["received_at"])
+            if signal.available_at > visible_at or received_at > visible_at:
+                break
+            records.append(
+                SignalBusSignalRecord(
+                    global_sequence=sequence,
+                    signal_id=row["signal_id"],
+                    payload_hash=row["payload_hash"],
+                    payload_json=row["payload_json"],
+                    signal=signal.model_dump(mode="json"),
+                    received_at=received_at,
+                )
+            )
+        return tuple(records)
 
     def signal(self, identifier: int | str) -> SignalEnvelope | None:
         payload = self.signal_payload(identifier)
