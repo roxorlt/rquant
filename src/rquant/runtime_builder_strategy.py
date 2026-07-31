@@ -13,6 +13,11 @@ from pathlib import Path
 from pydantic import Field, StrictInt, field_validator
 
 from rquant.feature_spool import FeatureBatchSpool
+from rquant.runtime_candidate_universe import (
+    CandidateUniverseAuthority,
+    RuntimeCandidateUniverseConfig,
+    RuntimeCandidateUniverseLoader,
+)
 from rquant.runtime_contracts import RuntimeContractModel
 from rquant.runtime_service_control import RuntimeServicePlane, RuntimeStepResult
 from rquant.runtime_service_entrypoint import (
@@ -27,12 +32,16 @@ from rquant.strategy_spec import StrategySpec
 from rquant.strict_json import strict_model_validate_json
 
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+_PRIVATE_FILE_MODE = 0o600
 
 
 class StrategyLiveRuntimeSettings(RuntimeContractModel):
     feature_spool_root: Path
     runner_state_path: Path
     strategy_spec_path: Path
+    candidate_snapshot_root: Path
+    candidate_max_age_seconds: StrictInt = Field(gt=0)
     strategy_id: str = Field(min_length=1)
     strategy_version: StrictInt = Field(ge=1)
     batch_limit: StrictInt = Field(default=128, ge=1)
@@ -46,6 +55,15 @@ class StrategyLiveRuntimeSettings(RuntimeContractModel):
     def require_absolute_path(cls, value: Path) -> Path:
         if not value.is_absolute():
             raise ValueError("strategy runtime data paths must be absolute")
+        return value
+
+    @field_validator("candidate_snapshot_root")
+    @classmethod
+    def require_normalized_candidate_root(cls, value: Path) -> Path:
+        if not value.is_absolute():
+            raise ValueError("candidate snapshot root must be absolute")
+        if value != Path(os.path.abspath(value)):
+            raise ValueError("candidate snapshot root must be normalized without traversal")
         return value
 
 
@@ -76,22 +94,105 @@ class StrategyEvaluatorBinding:
 StrategyEvaluatorLoader = Callable[[str, int], StrategyEvaluatorBinding]
 
 
+def _same_file_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    return (
+        left.st_dev,
+        left.st_ino,
+        left.st_mode,
+        left.st_uid,
+        left.st_nlink,
+    ) == (
+        right.st_dev,
+        right.st_ino,
+        right.st_mode,
+        right.st_uid,
+        right.st_nlink,
+    )
+
+
+def _same_file_version(left: os.stat_result, right: os.stat_result) -> bool:
+    return _same_file_identity(left, right) and (
+        left.st_size,
+        left.st_mtime_ns,
+        left.st_ctime_ns,
+    ) == (
+        right.st_size,
+        right.st_mtime_ns,
+        right.st_ctime_ns,
+    )
+
+
 def _read_frozen_strategy_spec(path: Path) -> StrategySpec:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = -1
+    if not path.is_absolute() or path != Path(os.path.abspath(path)):
+        raise ValueError("strategy spec path is unsafe")
+    parent_descriptor = -1
+    child_descriptor = -1
+    file_descriptor = -1
     try:
-        descriptor = os.open(path, flags)
-        observed = os.fstat(descriptor)
-        if not stat.S_ISREG(observed.st_mode):
+        parent_descriptor = os.open(path.anchor, _DIRECTORY_FLAGS)
+        for component in path.parts[1:-1]:
+            before = os.stat(
+                component,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            if stat.S_ISLNK(before.st_mode):
+                raise ValueError("strategy spec path contains a symlink")
+            child_descriptor = os.open(
+                component,
+                _DIRECTORY_FLAGS,
+                dir_fd=parent_descriptor,
+            )
+            opened = os.fstat(child_descriptor)
+            active = os.stat(
+                component,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            if not stat.S_ISDIR(opened.st_mode):
+                raise ValueError("strategy spec parent is unsafe")
+            if not _same_file_identity(before, opened) or not _same_file_identity(opened, active):
+                raise ValueError("strategy spec parent identity changed")
+            os.close(parent_descriptor)
+            parent_descriptor = child_descriptor
+            child_descriptor = -1
+
+        name = path.name
+        before = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if stat.S_ISLNK(before.st_mode):
+            raise ValueError("strategy spec cannot be a symlink")
+        file_descriptor = os.open(
+            name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_descriptor,
+        )
+        opened = os.fstat(file_descriptor)
+        active = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if not _same_file_identity(before, opened) or not _same_file_identity(opened, active):
+            raise ValueError("strategy spec identity changed")
+        if not stat.S_ISREG(opened.st_mode):
             raise ValueError("strategy spec must be a regular file")
-        with os.fdopen(descriptor, "rb", closefd=True) as stream:
-            descriptor = -1
+        if opened.st_uid != os.getuid():
+            raise ValueError("strategy spec must be owned by the current uid")
+        if opened.st_nlink != 1:
+            raise ValueError("strategy spec hardlink count must be one")
+        if stat.S_IMODE(opened.st_mode) != _PRIVATE_FILE_MODE:
+            raise ValueError("strategy spec permissions must be 0600")
+        with os.fdopen(file_descriptor, "rb", closefd=False) as stream:
             payload = stream.read()
+        after = os.fstat(file_descriptor)
+        current = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if not _same_file_version(opened, after) or not _same_file_version(after, current):
+            raise ValueError("strategy spec identity changed while being read")
     except OSError as exc:
-        raise ValueError("strategy spec is unavailable or contains a symlink") from exc
+        raise ValueError("strategy spec is unavailable or contains an unsafe symlink") from exc
     finally:
-        if descriptor >= 0:
-            os.close(descriptor)
+        if file_descriptor >= 0:
+            os.close(file_descriptor)
+        if child_descriptor >= 0:
+            os.close(child_descriptor)
+        if parent_descriptor >= 0:
+            os.close(parent_descriptor)
     try:
         return strict_model_validate_json(StrategySpec, payload)
     except ValueError as exc:
@@ -113,10 +214,7 @@ def strategy_live_builder(
 
         settings = StrategyLiveRuntimeSettings.model_validate(dict(manifest.settings))
         spec = _read_frozen_strategy_spec(settings.strategy_spec_path)
-        if (
-            spec.strategy_id != settings.strategy_id
-            or spec.version != settings.strategy_version
-        ):
+        if spec.strategy_id != settings.strategy_id or spec.version != settings.strategy_version:
             raise ValueError("strategy spec identity does not match runtime settings")
         if spec.producer_commit != manifest.producer_commit:
             raise ValueError("strategy spec producer commit does not match runtime manifest")
@@ -131,6 +229,20 @@ def strategy_live_builder(
             raise ValueError("evaluator identity does not match runtime settings")
 
         feature_spool = FeatureBatchSpool(settings.feature_spool_root)
+        candidate_universe_loader = RuntimeCandidateUniverseLoader(
+            RuntimeCandidateUniverseConfig(
+                expected_commit=manifest.producer_commit,
+                authorities=(
+                    CandidateUniverseAuthority(
+                        strategy_id=spec.strategy_id,
+                        strategy_version=str(spec.version),
+                        snapshot_root=settings.candidate_snapshot_root,
+                        required=True,
+                        max_age_seconds=settings.candidate_max_age_seconds,
+                    ),
+                ),
+            )
+        )
         runner = StrategyRunnerStore(
             settings.runner_state_path,
             spec=spec,
@@ -140,6 +252,7 @@ def strategy_live_builder(
         def step() -> RuntimeStepResult:
             summary = run_strategy_live_batch(
                 feature_spool=feature_spool,
+                candidate_universe_loader=candidate_universe_loader,
                 runner=runner,
                 evaluator=binding.evaluator,
                 observed_at=clock(),

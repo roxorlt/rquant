@@ -696,12 +696,31 @@ def test_required_future_generation_is_not_visible(tmp_path: Path) -> None:
         _loader(_authority(root)).load(as_of=AS_OF, required_trade_date=TRADE_DATE)
 
 
-def test_empty_universe_fails_closed(tmp_path: Path) -> None:
+def test_successful_required_authority_may_publish_empty_universe(tmp_path: Path) -> None:
     root = tmp_path / "empty"
     _publish(root, rows=())
 
+    result = _loader(_authority(root)).load(
+        as_of=AS_OF,
+        required_trade_date=TRADE_DATE,
+    )
+
+    assert result.codes == ()
+    assert result.code_evidence == ()
+    assert len(result.authorities) == 1
+    assert result.authorities[0].row_count == 0
+
+
+def test_empty_universe_without_any_successful_authority_fails_closed(tmp_path: Path) -> None:
+    missing = _authority(
+        tmp_path / "missing",
+        strategy_id="optional",
+        strategy_version="v1",
+        required=False,
+    )
+
     with pytest.raises(RuntimeCandidateUniverseIntegrityError, match="empty"):
-        _loader(_authority(root)).load(as_of=AS_OF, required_trade_date=TRADE_DATE)
+        _loader(missing).load(as_of=AS_OF, required_trade_date=TRADE_DATE)
 
 
 def test_symlink_authority_fails_closed(tmp_path: Path) -> None:

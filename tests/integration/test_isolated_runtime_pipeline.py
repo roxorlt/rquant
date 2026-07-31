@@ -25,6 +25,11 @@ from rquant.paper_signal_worker import (
     PaperSignalQueueStore,
     run_paper_signal_batch,
 )
+from rquant.runtime_candidate_universe import (
+    CandidateUniverseAuthority,
+    RuntimeCandidateUniverseConfig,
+    RuntimeCandidateUniverseLoader,
+)
 from rquant.serving_contracts import FreshnessStatus, ServingDatasetWatermark
 from rquant.serving_publisher import ServingPublisher, ServingReader
 from rquant.serving_read_models import (
@@ -40,6 +45,12 @@ from rquant.signal_router_runtime import (
     SignalRouteCursorStore,
     StrategyRunnerSignalSource,
     route_runner_signals,
+)
+from rquant.strategy_candidate_snapshot import (
+    StrategyCandidatePriceBasis,
+    StrategyCandidateRecord,
+    StrategyCandidateSnapshot,
+    StrategyCandidateSnapshotSpool,
 )
 from rquant.strategy_live_service import run_strategy_live_batch
 from rquant.strategy_runner import StrategyCandidateState, StrategyDecision, StrategyRunnerStore
@@ -164,6 +175,48 @@ def _paper_policy() -> PaperSignalPolicy:
     )
 
 
+def _candidate_loader(tmp_path: Path) -> RuntimeCandidateUniverseLoader:
+    root = (tmp_path / "candidate-snapshots").resolve()
+    decision_at = OBSERVED - timedelta(days=1)
+    StrategyCandidateSnapshotSpool(root).publish(
+        StrategyCandidateSnapshot.build(
+            sequence=0,
+            trade_date=TRADE_DATE,
+            captured_at=OBSERVED,
+            producer_commit="3" * 40,
+            rows=(
+                StrategyCandidateRecord(
+                    strategy_id=_spec().strategy_id,
+                    strategy_version=str(_spec().version),
+                    candidate_id="600000.SH",
+                    variant="default",
+                    decision_at=decision_at,
+                    available_at=decision_at + timedelta(minutes=1),
+                    effective_trade_date=TRADE_DATE,
+                    reference_trade_date=date(2026, 7, 30),
+                    price_basis=StrategyCandidatePriceBasis.QFQ_PIT,
+                    static_features={"candidate_score": 0.95},
+                    reference_snapshot_ids={"daily": "8" * 64},
+                ),
+            ),
+        )
+    )
+    return RuntimeCandidateUniverseLoader(
+        RuntimeCandidateUniverseConfig(
+            expected_commit="3" * 40,
+            authorities=(
+                CandidateUniverseAuthority(
+                    strategy_id=_spec().strategy_id,
+                    strategy_version=str(_spec().version),
+                    snapshot_root=root,
+                    required=True,
+                    max_age_seconds=300,
+                ),
+            ),
+        )
+    )
+
+
 def test_pipeline_is_end_to_end_and_exact_replay_is_idempotent(tmp_path: Path) -> None:
     live_spool = LiveBatchSpool(tmp_path / "live")
     gateway = MarketMinuteGateway(
@@ -185,7 +238,7 @@ def test_pipeline_is_end_to_end_and_exact_replay_is_idempotent(tmp_path: Path) -
         config=IntradayFeatureConfig(
             lookback_sessions=2,
             opening_acceleration_block_minutes=3,
-            producer_commit="2" * 40,
+            producer_commit="3" * 40,
         ),
         observed_at=OBSERVED,
         limit=10,
@@ -200,6 +253,7 @@ def test_pipeline_is_end_to_end_and_exact_replay_is_idempotent(tmp_path: Path) -
     )
     strategy_summary = run_strategy_live_batch(
         feature_spool=feature_spool,
+        candidate_universe_loader=_candidate_loader(tmp_path),
         runner=runner,
         evaluator=_evaluate,
         observed_at=OBSERVED,
@@ -335,68 +389,82 @@ def test_pipeline_is_end_to_end_and_exact_replay_is_idempotent(tmp_path: Path) -
         assert connection.execute("SELECT status FROM deliveries").fetchone() == (
             OutboxStatus.SUCCEEDED.value,
         )
-        assert connection.execute("SELECT quantity FROM paper_holdings").fetchone() == (
-            1_000,
-        )
+        assert connection.execute("SELECT quantity FROM paper_holdings").fetchone() == (1_000,)
     assert serving_manifest.row_counts["paper_accounts"] == 1
 
-    assert run_feature_live_batch(
-        raw_spool=live_spool,
-        feature_spool=feature_spool,
-        historical_minutes=_history(),
-        historical_snapshot_id="history-20260730",
-        config=IntradayFeatureConfig(
-            lookback_sessions=2,
-            opening_acceleration_block_minutes=3,
-            producer_commit="2" * 40,
-        ),
-        observed_at=EXECUTION_TIME,
-        limit=10,
-    ).processed_count == 0
-    assert run_strategy_live_batch(
-        feature_spool=feature_spool,
-        runner=StrategyRunnerStore(
-            runner_path,
-            spec=_spec(),
-            evaluator_contract_fingerprint="4" * 64,
-        ),
-        evaluator=_evaluate,
-        observed_at=EXECUTION_TIME,
-        limit=10,
-    ).processed_count == 0
-    assert route_runner_signals(
-        source_id=source_id,
-        source=StrategyRunnerSignalSource(source_id=source_id, store=runner),
-        bus=bus,
-        cursors=SignalRouteCursorStore(
-            tmp_path / "router-compat.sqlite3",
-            routing_policy_fingerprint=POLICY_FINGERPRINT,
-        ),
-        routed_at=EXECUTION_TIME,
-        target_resolver=lambda _signal: RoutingDecision.no_target(
-            routing_policy_fingerprint=POLICY_FINGERPRINT,
-            reason_code="must_not_re_evaluate",
-        ),
-        limit=10,
-    ).routed_count == 0
-    assert run_notification_batch(
-        bus,
-        {DeliveryChannel.PUSHDEER: provider},
-        worker_id="notifier-e2e-replay",
-        now=EXECUTION_TIME,
-        lease_for=timedelta(seconds=30),
-        limit=10,
-        clock=lambda: EXECUTION_TIME,
-    ).claimed_count == 0
-    assert consume_signal_bus_to_paper(
-        bus,
-        PaperSignalQueueStore(
-            paper_queue_path,
-            policy=_paper_policy(),
-        ),
-        PaperSignalConsumerStateStore(paper_state_path),
-        observed_at=EXECUTION_TIME,
-        limit=10,
-    ).delegated_count == 0
+    assert (
+        run_feature_live_batch(
+            raw_spool=live_spool,
+            feature_spool=feature_spool,
+            historical_minutes=_history(),
+            historical_snapshot_id="history-20260730",
+            config=IntradayFeatureConfig(
+                lookback_sessions=2,
+                opening_acceleration_block_minutes=3,
+                producer_commit="3" * 40,
+            ),
+            observed_at=EXECUTION_TIME,
+            limit=10,
+        ).processed_count
+        == 0
+    )
+    assert (
+        run_strategy_live_batch(
+            feature_spool=feature_spool,
+            candidate_universe_loader=_candidate_loader(tmp_path),
+            runner=StrategyRunnerStore(
+                runner_path,
+                spec=_spec(),
+                evaluator_contract_fingerprint="4" * 64,
+            ),
+            evaluator=_evaluate,
+            observed_at=EXECUTION_TIME,
+            limit=10,
+        ).processed_count
+        == 0
+    )
+    assert (
+        route_runner_signals(
+            source_id=source_id,
+            source=StrategyRunnerSignalSource(source_id=source_id, store=runner),
+            bus=bus,
+            cursors=SignalRouteCursorStore(
+                tmp_path / "router-compat.sqlite3",
+                routing_policy_fingerprint=POLICY_FINGERPRINT,
+            ),
+            routed_at=EXECUTION_TIME,
+            target_resolver=lambda _signal: RoutingDecision.no_target(
+                routing_policy_fingerprint=POLICY_FINGERPRINT,
+                reason_code="must_not_re_evaluate",
+            ),
+            limit=10,
+        ).routed_count
+        == 0
+    )
+    assert (
+        run_notification_batch(
+            bus,
+            {DeliveryChannel.PUSHDEER: provider},
+            worker_id="notifier-e2e-replay",
+            now=EXECUTION_TIME,
+            lease_for=timedelta(seconds=30),
+            limit=10,
+            clock=lambda: EXECUTION_TIME,
+        ).claimed_count
+        == 0
+    )
+    assert (
+        consume_signal_bus_to_paper(
+            bus,
+            PaperSignalQueueStore(
+                paper_queue_path,
+                policy=_paper_policy(),
+            ),
+            PaperSignalConsumerStateStore(paper_state_path),
+            observed_at=EXECUTION_TIME,
+            limit=10,
+        ).delegated_count
+        == 0
+    )
     assert len(provider.calls) == 1
     assert len(broker.fills()) == 1

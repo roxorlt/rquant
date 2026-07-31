@@ -8,12 +8,19 @@ from datetime import datetime
 from pydantic import Field
 
 from rquant.feature_spool import FeatureBatchSpool, FeatureConsumerCursor
+from rquant.runtime_candidate_universe import RuntimeCandidateUniverseLoader
 from rquant.runtime_contracts import (
     AwareUtcDatetime,
     RuntimeContractModel,
     normalize_aware_utc,
 )
-from rquant.strategy_runner import StrategyEvaluator, StrategyRunnerStore
+from rquant.strategy_candidate_feature_join import join_strategy_candidate_features
+from rquant.strategy_candidate_snapshot import asia_shanghai_trade_date
+from rquant.strategy_runner import (
+    StrategyEvaluator,
+    StrategyRunnerStore,
+    StrategySourceBatchReceipt,
+)
 
 
 class StrategyLiveBatchSummary(RuntimeContractModel):
@@ -37,6 +44,7 @@ StrategyLiveFaultHook = Callable[[str], None]
 def run_strategy_live_batch(
     *,
     feature_spool: FeatureBatchSpool,
+    candidate_universe_loader: RuntimeCandidateUniverseLoader,
     runner: StrategyRunnerStore,
     evaluator: StrategyEvaluator,
     observed_at: datetime,
@@ -67,20 +75,43 @@ def run_strategy_live_batch(
         envelope = record.envelope
         if envelope.available_at > observed:
             break
-        stored = feature_spool.read_result(record)
-        frame = stored.frame
-        if frame.empty:
-            required_columns = ["ts_code", *(item.name for item in envelope.field_statuses)]
-            frame = frame.reindex(columns=tuple(dict.fromkeys(required_columns)))
-        was_processed = runner.last_batch_sequence() >= envelope.sequence
-        result = runner.process_batch(
-            envelope,
-            frame,
-            feature_payload=stored.payload_json,
-            dataset_snapshot_id=envelope.input_fingerprint,
-            observed_at=observed,
-            evaluator=evaluator,
+        source_receipt = StrategySourceBatchReceipt(
+            source_generation_id=descriptor.generation_id,
+            source_sequence=envelope.sequence,
+            source_batch_id=envelope.batch_id,
+            source_content_hash=envelope.content_hash,
         )
+        result = runner.replay_source_batch(
+            source_receipt,
+            observed_at=observed,
+        )
+        was_processed = result is not None
+        if result is None:
+            stored = feature_spool.read_result(record)
+            frame = stored.frame
+            if frame.empty:
+                required_columns = ["ts_code", *(item.name for item in envelope.field_statuses)]
+                frame = frame.reindex(columns=tuple(dict.fromkeys(required_columns)))
+            universe = candidate_universe_loader.load(
+                as_of=envelope.available_at,
+                required_trade_date=asia_shanghai_trade_date(envelope.event_time),
+            )
+            joined = join_strategy_candidate_features(
+                envelope,
+                frame,
+                universe,
+                runner.spec.strategy_id,
+                str(runner.spec.version),
+            )
+            result = runner.process_batch(
+                joined.envelope,
+                joined.frame,
+                feature_payload=joined.payload_bytes,
+                source_receipt=source_receipt,
+                dataset_snapshot_id=joined.envelope.input_fingerprint,
+                observed_at=observed,
+                evaluator=evaluator,
+            )
         if fault_hook is not None:
             fault_hook("after_runner_commit")
         feature_spool.commit_cursor(

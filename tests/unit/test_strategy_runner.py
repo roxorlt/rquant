@@ -4,6 +4,7 @@ import hashlib
 import json
 import multiprocessing
 import os
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -40,6 +41,7 @@ from rquant.strategy_runner import (
     StrategyBatchConflictError,
     StrategyDecision,
     StrategyRunnerStore,
+    StrategySourceBatchReceipt,
 )
 from rquant.strategy_spec import (
     StateTransition,
@@ -178,9 +180,13 @@ def _joined_feature_batch(
     tmp_path: Path,
     *,
     empty_requested_authority: bool = False,
+    trade_date: date = date(2026, 7, 31),
+    sequence: int = 0,
+    available_at: datetime = NOW,
+    candidate_id: str = "300001.SZ",
+    variant: str = "default",
 ) -> StrategyCandidateFeatureBatch:
-    trade_date = date(2026, 7, 31)
-    decision_at = datetime(2026, 7, 30, 9, 0, tzinfo=UTC)
+    decision_at = available_at - timedelta(days=1)
     requested_rows = (
         ()
         if empty_requested_authority
@@ -188,8 +194,8 @@ def _joined_feature_batch(
             StrategyCandidateRecord(
                 strategy_id="growth-board-surge-v1",
                 strategy_version="1",
-                candidate_id="300001.SZ",
-                variant="default",
+                candidate_id=candidate_id,
+                variant=variant,
                 decision_at=decision_at,
                 available_at=decision_at + timedelta(minutes=1),
                 effective_trade_date=trade_date,
@@ -200,11 +206,13 @@ def _joined_feature_batch(
             ),
         )
     )
-    requested_root = (tmp_path / "requested-candidates").resolve()
+    requested_root = (
+        tmp_path / f"requested-candidates-{trade_date.isoformat()}-{sequence}"
+    ).resolve()
     requested_snapshot = StrategyCandidateSnapshot.build(
         sequence=0,
         trade_date=trade_date,
-        captured_at=NOW,
+        captured_at=available_at,
         producer_commit="b" * 40,
         rows=requested_rows,
     )
@@ -223,7 +231,7 @@ def _joined_feature_batch(
         other_row = StrategyCandidateRecord(
             strategy_id="other-strategy",
             strategy_version="1",
-            candidate_id="300001.SZ",
+            candidate_id=candidate_id,
             variant="default",
             decision_at=decision_at,
             available_at=decision_at + timedelta(minutes=1),
@@ -237,7 +245,7 @@ def _joined_feature_batch(
             StrategyCandidateSnapshot.build(
                 sequence=0,
                 trade_date=trade_date,
-                captured_at=NOW,
+                captured_at=available_at,
                 producer_commit="b" * 40,
                 rows=(other_row,),
             )
@@ -256,9 +264,12 @@ def _joined_feature_batch(
             expected_commit="b" * 40,
             authorities=tuple(authorities),
         )
-    ).load(as_of=NOW, required_trade_date=trade_date)
-    common_frame = _frame()
+    ).load(as_of=available_at, required_trade_date=trade_date)
+    common_frame = pd.DataFrame({"ts_code": [candidate_id], "rel_same_minute": [2.0]})
     common_envelope = _envelope(
+        sequence=sequence,
+        available_at=available_at - timedelta(minutes=sequence),
+        event_time=available_at,
         content_hash=_payload_hash(common_frame),
         row_count=1,
     )
@@ -440,6 +451,668 @@ def test_process_batch_accepts_real_joined_extended_payload(tmp_path: Path) -> N
         )
 
 
+def test_joined_signal_binds_candidate_occurrence_evidence(tmp_path: Path) -> None:
+    joined = _joined_feature_batch(tmp_path)
+    store = _store(tmp_path / "runner.sqlite3")
+
+    result = store.process_batch(
+        joined.envelope,
+        joined.frame,
+        feature_payload=joined.payload_bytes,
+        dataset_snapshot_id=joined.envelope.input_fingerprint,
+        observed_at=NOW,
+        evaluator=_entry_decision,
+    )
+
+    row = joined.frame.iloc[0]
+    assert result.signals[0].signal.candidate_id == "300001.SZ"
+    assert result.signals[0].signal.evidence["runner_transition"] == {
+        "candidate_effective_trade_date": "2026-07-31",
+        "candidate_generation_sha256": row["candidate_generation_sha256"],
+        "candidate_occurrence_id": row["candidate_occurrence_id"],
+        "candidate_snapshot_schema_version": 2,
+        "candidate_variant": "default",
+        "evaluator_contract_fingerprint": EVALUATOR_FINGERPRINT,
+        "event": "entry_ready",
+        "feature_batch_id": joined.envelope.batch_id,
+        "feature_sequence": 0,
+        "from_state": "idle",
+        "to_state": "armed",
+    }
+
+
+def test_same_stock_new_trade_date_starts_from_initial_occurrence_state(
+    tmp_path: Path,
+) -> None:
+    first = _joined_feature_batch(tmp_path, sequence=0)
+    second_at = NOW + timedelta(days=1)
+    second = _joined_feature_batch(
+        tmp_path,
+        trade_date=date(2026, 8, 1),
+        sequence=1,
+        available_at=second_at,
+    )
+    store = _store(tmp_path / "runner.sqlite3")
+    seen_states: list[StrategyLifecycleState] = []
+
+    for batch, observed_at in ((first, NOW), (second, second_at)):
+        store.process_batch(
+            batch.envelope,
+            batch.frame,
+            feature_payload=batch.payload_bytes,
+            dataset_snapshot_id=batch.envelope.input_fingerprint,
+            observed_at=observed_at,
+            evaluator=lambda spec, state, features: (
+                seen_states.append(state.state) or _entry_decision(spec, state, features)
+            ),
+        )
+
+    first_occurrence = str(first.frame.iloc[0]["candidate_occurrence_id"])
+    second_occurrence = str(second.frame.iloc[0]["candidate_occurrence_id"])
+    assert seen_states == [StrategyLifecycleState.IDLE, StrategyLifecycleState.IDLE]
+    assert first_occurrence != second_occurrence
+    assert store.candidate_occurrence_state(first_occurrence).state is StrategyLifecycleState.ARMED
+    assert store.candidate_occurrence_state(second_occurrence).state is StrategyLifecycleState.ARMED
+    with pytest.raises(ValueError, match="ambiguous"):
+        store.candidate_state("300001.SZ")
+
+
+def test_same_occurrence_metadata_drift_fails_without_committing_batch(
+    tmp_path: Path,
+) -> None:
+    first = _joined_feature_batch(tmp_path, sequence=0)
+    second_at = NOW + timedelta(minutes=1)
+    changed_generation = _joined_feature_batch(
+        tmp_path,
+        sequence=1,
+        available_at=second_at,
+    )
+    store = _store(tmp_path / "runner.sqlite3")
+    store.process_batch(
+        first.envelope,
+        first.frame,
+        feature_payload=first.payload_bytes,
+        dataset_snapshot_id=first.envelope.input_fingerprint,
+        observed_at=NOW,
+        evaluator=_entry_decision,
+    )
+
+    with pytest.raises(StrategyBatchConflictError, match="metadata drift"):
+        store.process_batch(
+            changed_generation.envelope,
+            changed_generation.frame,
+            feature_payload=changed_generation.payload_bytes,
+            dataset_snapshot_id=changed_generation.envelope.input_fingerprint,
+            observed_at=second_at,
+            evaluator=lambda *_args: pytest.fail("metadata drift must fail before evaluation"),
+        )
+
+    assert store.last_batch_sequence() == 0
+
+
+def test_candidate_metadata_columns_are_all_present_or_all_absent(tmp_path: Path) -> None:
+    joined = _joined_feature_batch(tmp_path)
+    partial = joined.frame.drop(columns=["candidate_variant"])
+    payload = strategy_runner.canonical_feature_payload(partial, schema_version=1)
+    envelope = _envelope(content_hash=hashlib.sha256(payload).hexdigest())
+
+    with pytest.raises(ValueError, match="all present or all absent"):
+        _store(tmp_path / "runner.sqlite3").process_batch(
+            envelope,
+            partial,
+            dataset_snapshot_id="d" * 64,
+            observed_at=NOW,
+            evaluator=lambda *_args: None,
+        )
+
+
+@pytest.mark.parametrize(
+    ("column", "value", "message"),
+    (
+        ("candidate_occurrence_id", "0" * 64, "does not bind"),
+        ("candidate_effective_trade_date", "2026-7-31", "ISO date"),
+        ("candidate_variant", "", "non-empty"),
+        ("candidate_generation_sha256", "not-a-sha", "SHA-256"),
+        ("candidate_snapshot_schema_version", 3, "must be 1 or 2"),
+    ),
+)
+def test_joined_candidate_metadata_values_are_strictly_validated(
+    tmp_path: Path,
+    column: str,
+    value: object,
+    message: str,
+) -> None:
+    joined = _joined_feature_batch(tmp_path)
+    invalid = joined.frame.copy(deep=True)
+    invalid.loc[0, column] = value
+    payload = strategy_runner.canonical_feature_payload(invalid, schema_version=1)
+
+    with pytest.raises(ValueError, match=message):
+        _store(tmp_path / "runner.sqlite3").process_batch(
+            _envelope(content_hash=hashlib.sha256(payload).hexdigest()),
+            invalid,
+            dataset_snapshot_id="d" * 64,
+            observed_at=NOW,
+            evaluator=lambda *_args: None,
+        )
+
+
+def _create_legacy_candidate_state_table(path: Path, *, populated: bool) -> None:
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE candidate_state (
+                candidate_id TEXT PRIMARY KEY,
+                state TEXT NOT NULL,
+                last_feature_sequence INTEGER NOT NULL,
+                last_feature_batch_id TEXT,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        if populated:
+            connection.execute(
+                """
+                INSERT INTO candidate_state VALUES (?, ?, ?, ?, ?)
+                """,
+                ("300001.SZ", "armed", 7, "legacy-7", NOW.isoformat()),
+            )
+
+
+def _candidate_state_columns(path: Path) -> tuple[tuple[object, ...], ...]:
+    with sqlite3.connect(path) as connection:
+        return tuple(connection.execute("PRAGMA table_info(candidate_state)").fetchall())
+
+
+def _create_persisted_runner_identity(
+    path: Path,
+    *,
+    spec_fingerprint: str,
+    evaluator_fingerprint: str,
+) -> None:
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE runner_metadata (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                strategy_spec_fingerprint TEXT NOT NULL,
+                strategy_spec_json TEXT NOT NULL,
+                evaluator_contract_fingerprint TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO runner_metadata VALUES (1, ?, ?, ?)",
+            (spec_fingerprint, _spec().model_dump_json(), evaluator_fingerprint),
+        )
+
+
+def _create_custom_runner_metadata(
+    path: Path,
+    *,
+    singleton_column: str = "singleton INTEGER PRIMARY KEY CHECK(singleton = 1)",
+    spec_json_column: str = "strategy_spec_json TEXT NOT NULL",
+    input_mode_column: str = (
+        "candidate_input_mode TEXT CHECK(candidate_input_mode IN ('flat', 'occurrence'))"
+    ),
+    row_count: int = 1,
+) -> None:
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            f"""
+            CREATE TABLE runner_metadata (
+                {singleton_column},
+                strategy_spec_fingerprint TEXT NOT NULL,
+                {spec_json_column},
+                evaluator_contract_fingerprint TEXT NOT NULL,
+                {input_mode_column}
+            )
+            """
+        )
+        connection.executemany(
+            "INSERT INTO runner_metadata VALUES (1, ?, ?, ?, NULL)",
+            [
+                (
+                    _spec().spec_fingerprint,
+                    _spec().model_dump_json(),
+                    EVALUATOR_FINGERPRINT,
+                )
+                for _ in range(row_count)
+            ],
+        )
+
+
+def _create_processed_batch_table(
+    path: Path,
+    *,
+    receipt_sequence_type: str | None = None,
+    feature_batch_unique: bool = True,
+    source_index_sql: str | None = None,
+) -> None:
+    receipt_columns = ""
+    if receipt_sequence_type is not None:
+        receipt_columns = f"""
+            , source_generation_id TEXT
+            , source_sequence {receipt_sequence_type}
+            , source_batch_id TEXT
+            , source_content_hash TEXT
+        """
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            f"""
+            CREATE TABLE processed_batch (
+                feature_sequence INTEGER PRIMARY KEY,
+                feature_batch_id TEXT NOT NULL {"UNIQUE" if feature_batch_unique else ""},
+                envelope_fingerprint TEXT NOT NULL,
+                feature_payload_hash TEXT NOT NULL,
+                dataset_snapshot_id TEXT NOT NULL,
+                event_time TEXT NOT NULL,
+                available_at TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                result_json TEXT NOT NULL
+                {receipt_columns}
+            )
+            """
+        )
+        if source_index_sql is not None:
+            connection.execute(source_index_sql)
+
+
+@pytest.mark.parametrize("mismatch", ["spec", "evaluator"])
+def test_persisted_identity_mismatch_does_not_upgrade_legacy_candidate_schema(
+    tmp_path: Path,
+    mismatch: str,
+) -> None:
+    path = tmp_path / f"runner-{mismatch}.sqlite3"
+    _create_legacy_candidate_state_table(path, populated=False)
+    _create_persisted_runner_identity(
+        path,
+        spec_fingerprint=("f" * 64 if mismatch == "spec" else _spec().spec_fingerprint),
+        evaluator_fingerprint=("f" * 64 if mismatch == "evaluator" else EVALUATOR_FINGERPRINT),
+    )
+    before = _candidate_state_columns(path)
+
+    with pytest.raises(ValueError, match="strategy spec|evaluator contract"):
+        _store(path)
+
+    assert _candidate_state_columns(path) == before
+
+
+@pytest.mark.parametrize(
+    ("case", "kwargs"),
+    (
+        (
+            "missing_pk",
+            {"singleton_column": "singleton INTEGER CHECK(singleton = 1)"},
+        ),
+        (
+            "missing_singleton_check",
+            {"singleton_column": "singleton INTEGER PRIMARY KEY"},
+        ),
+        (
+            "missing_not_null",
+            {"spec_json_column": "strategy_spec_json TEXT"},
+        ),
+        (
+            "wrong_mode_type",
+            {
+                "input_mode_column": (
+                    "candidate_input_mode INTEGER "
+                    "CHECK(candidate_input_mode IN ('flat', 'occurrence'))"
+                )
+            },
+        ),
+        (
+            "permissive_mode_check",
+            {
+                "input_mode_column": (
+                    "candidate_input_mode TEXT "
+                    "CHECK(candidate_input_mode IN ('flat', 'occurrence', 'unsafe'))"
+                )
+            },
+        ),
+    ),
+)
+def test_runner_metadata_rejects_malformed_schema(
+    tmp_path: Path,
+    case: str,
+    kwargs: dict[str, object],
+) -> None:
+    path = tmp_path / f"runner-{case}.sqlite3"
+    _create_custom_runner_metadata(path, **kwargs)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="runner_metadata schema"):
+        _store(path)
+
+
+def test_runner_metadata_rejects_duplicate_singleton_rows(tmp_path: Path) -> None:
+    path = tmp_path / "runner.sqlite3"
+    _create_custom_runner_metadata(
+        path,
+        singleton_column="singleton INTEGER CHECK(singleton = 1)",
+        row_count=2,
+    )
+
+    with pytest.raises(ValueError, match="runner_metadata schema|singleton"):
+        _store(path)
+
+
+def test_initialization_failure_rolls_back_candidate_schema_upgrade(tmp_path: Path) -> None:
+    path = tmp_path / "runner.sqlite3"
+    _create_legacy_candidate_state_table(path, populated=False)
+    _create_persisted_runner_identity(
+        path,
+        spec_fingerprint=_spec().spec_fingerprint,
+        evaluator_fingerprint=EVALUATOR_FINGERPRINT,
+    )
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE runner_source_identity (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                source_generation_id TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute("INSERT INTO runner_source_identity VALUES (1, 'invalid')")
+    before = _candidate_state_columns(path)
+
+    with pytest.raises(ValueError, match="source_generation_id"):
+        _store(path)
+
+    assert _candidate_state_columns(path) == before
+
+
+def test_failure_after_candidate_schema_migration_rolls_back_upgrade(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "runner.sqlite3"
+    _create_legacy_candidate_state_table(path, populated=False)
+    before = _candidate_state_columns(path)
+
+    def fail_after_candidate_migration(_connection: sqlite3.Connection) -> None:
+        raise RuntimeError("failure after candidate migration")
+
+    monkeypatch.setattr(
+        StrategyRunnerStore,
+        "_ensure_processed_batch_schema",
+        staticmethod(fail_after_candidate_migration),
+    )
+
+    with pytest.raises(RuntimeError, match="failure after candidate migration"):
+        _store(path)
+
+    assert _candidate_state_columns(path) == before
+
+
+@pytest.mark.parametrize(
+    ("occurrence_column", "candidate_column"),
+    (
+        ("occurrence_id INTEGER NOT NULL PRIMARY KEY", "candidate_id TEXT NOT NULL"),
+        ("occurrence_id TEXT NOT NULL PRIMARY KEY", "candidate_id TEXT"),
+        ("occurrence_id TEXT NOT NULL", "candidate_id TEXT NOT NULL"),
+    ),
+)
+def test_candidate_state_schema_rejects_matching_names_with_broken_constraints(
+    tmp_path: Path,
+    occurrence_column: str,
+    candidate_column: str,
+) -> None:
+    path = tmp_path / "runner.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            f"""
+            CREATE TABLE candidate_state (
+                {occurrence_column},
+                {candidate_column},
+                candidate_effective_trade_date TEXT,
+                candidate_variant TEXT,
+                candidate_generation_sha256 TEXT,
+                candidate_snapshot_schema_version INTEGER,
+                state TEXT NOT NULL,
+                last_feature_sequence INTEGER NOT NULL,
+                last_feature_batch_id TEXT,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+
+    with pytest.raises(ValueError, match="candidate_state schema"):
+        _store(path)
+
+
+def test_empty_legacy_candidate_state_table_upgrades_atomically(tmp_path: Path) -> None:
+    path = tmp_path / "runner.sqlite3"
+    _create_legacy_candidate_state_table(path, populated=False)
+
+    store = _store(path)
+
+    with sqlite3.connect(path) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(candidate_state)")}
+    assert {
+        "occurrence_id",
+        "candidate_id",
+        "candidate_effective_trade_date",
+        "candidate_variant",
+        "candidate_generation_sha256",
+        "candidate_snapshot_schema_version",
+    } <= columns
+    assert store.candidate_state("300001.SZ") is None
+
+
+def test_nonempty_legacy_candidate_state_table_fails_closed(tmp_path: Path) -> None:
+    path = tmp_path / "runner.sqlite3"
+    _create_legacy_candidate_state_table(path, populated=True)
+
+    with pytest.raises(ValueError, match="non-empty legacy candidate_state"):
+        _store(path)
+
+
+def test_legacy_processed_batch_schema_upgrades_with_nullable_source_receipt(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "runner.sqlite3"
+    _create_processed_batch_table(path)
+
+    _store(path)
+
+    with sqlite3.connect(path) as connection:
+        schema = {
+            row[1]: (row[2], row[3], row[5])
+            for row in connection.execute("PRAGMA table_info(processed_batch)")
+        }
+    assert schema["source_generation_id"] == ("TEXT", 0, 0)
+    assert schema["source_sequence"] == ("INTEGER", 0, 0)
+    assert schema["source_batch_id"] == ("TEXT", 0, 0)
+    assert schema["source_content_hash"] == ("TEXT", 0, 0)
+    with sqlite3.connect(path) as connection:
+        indexes = {
+            row[1]: (row[2], row[4])
+            for row in connection.execute("PRAGMA index_list(processed_batch)")
+        }
+        source_index_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+            ("processed_batch_source_sequence_uq",),
+        ).fetchone()[0]
+    assert indexes["processed_batch_source_sequence_uq"] == (1, 1)
+    assert source_index_sql is not None
+    assert "WHERE source_sequence IS NOT NULL" in source_index_sql
+
+
+def test_processed_batch_rejects_source_receipt_with_wrong_column_type(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "runner.sqlite3"
+    _create_processed_batch_table(path, receipt_sequence_type="TEXT")
+
+    with pytest.raises(ValueError, match="processed_batch source receipt schema"):
+        _store(path)
+
+
+def test_processed_batch_rejects_missing_feature_batch_unique_constraint(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "runner.sqlite3"
+    _create_processed_batch_table(path, feature_batch_unique=False)
+
+    with pytest.raises(ValueError, match="feature_batch_id.*UNIQUE"):
+        _store(path)
+
+
+@pytest.mark.parametrize(
+    "source_index_sql",
+    (
+        "CREATE INDEX processed_batch_source_sequence_uq ON processed_batch(source_sequence)",
+        "CREATE UNIQUE INDEX processed_batch_source_sequence_uq "
+        "ON processed_batch(source_sequence, source_batch_id) "
+        "WHERE source_sequence IS NOT NULL",
+        "CREATE UNIQUE INDEX processed_batch_source_sequence_uq "
+        "ON processed_batch(source_sequence) WHERE source_sequence >= 0",
+    ),
+)
+def test_processed_batch_rejects_wrong_named_source_receipt_index(
+    tmp_path: Path,
+    source_index_sql: str,
+) -> None:
+    path = tmp_path / "runner.sqlite3"
+    _create_processed_batch_table(
+        path,
+        receipt_sequence_type="INTEGER",
+        source_index_sql=source_index_sql,
+    )
+
+    with pytest.raises(ValueError, match="processed_batch source sequence index"):
+        _store(path)
+
+
+def test_feature_batch_id_cannot_be_reused_across_sequences(tmp_path: Path) -> None:
+    store = _store(tmp_path / "runner.sqlite3")
+    store.process_batch(
+        _envelope(batch_id="shared-feature-batch"),
+        _frame(),
+        dataset_snapshot_id="d" * 64,
+        observed_at=NOW,
+        evaluator=lambda *_args: None,
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="feature_batch_id"):
+        store.process_batch(
+            _envelope(sequence=1, batch_id="shared-feature-batch"),
+            _frame(),
+            dataset_snapshot_id="d" * 64,
+            observed_at=NOW + timedelta(minutes=1),
+            evaluator=lambda *_args: None,
+        )
+
+    assert store.last_batch_sequence() == 0
+
+
+def test_runner_source_identity_rejects_duplicate_singleton_rows(tmp_path: Path) -> None:
+    path = tmp_path / "runner.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE runner_source_identity (
+                singleton INTEGER,
+                source_generation_id TEXT NOT NULL
+            )
+            """
+        )
+        connection.executemany(
+            "INSERT INTO runner_source_identity VALUES (1, ?)",
+            [("a" * 64,), ("b" * 64,)],
+        )
+
+    with pytest.raises(ValueError, match="runner_source_identity schema|singleton"):
+        _store(path)
+
+
+def test_runner_signal_rejects_missing_signal_id_unique_constraint(tmp_path: Path) -> None:
+    path = tmp_path / "runner.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE runner_signal (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                signal_id TEXT NOT NULL,
+                feature_sequence INTEGER NOT NULL,
+                payload_json TEXT NOT NULL
+            )
+            """
+        )
+
+    with pytest.raises(ValueError, match="runner_signal.*UNIQUE"):
+        _store(path)
+
+
+@pytest.mark.parametrize(
+    ("case", "sequence_column", "feature_sequence_column"),
+    (
+        (
+            "missing_autoincrement",
+            "sequence INTEGER PRIMARY KEY",
+            "feature_sequence INTEGER NOT NULL",
+        ),
+        (
+            "extra_check",
+            "sequence INTEGER PRIMARY KEY AUTOINCREMENT",
+            "feature_sequence INTEGER NOT NULL CHECK(feature_sequence < 10)",
+        ),
+    ),
+)
+def test_runner_signal_rejects_noncanonical_table_ddl(
+    tmp_path: Path,
+    case: str,
+    sequence_column: str,
+    feature_sequence_column: str,
+) -> None:
+    path = tmp_path / f"runner-{case}.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            f"""
+            CREATE TABLE runner_signal (
+                {sequence_column},
+                signal_id TEXT NOT NULL UNIQUE,
+                {feature_sequence_column},
+                payload_json TEXT NOT NULL
+            )
+            """
+        )
+
+    with pytest.raises(ValueError, match="runner_signal canonical DDL"):
+        _store(path)
+
+
+def test_runner_signal_accepts_canonical_legacy_table_and_preserves_rows(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "runner.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE runner_signal (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                signal_id TEXT NOT NULL UNIQUE,
+                feature_sequence INTEGER NOT NULL,
+                payload_json TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO runner_signal VALUES (?, ?, ?, ?)",
+            (7, "legacy-signal", 3, '{"legacy":true}'),
+        )
+
+    _store(path)
+
+    with sqlite3.connect(path) as connection:
+        row = connection.execute(
+            "SELECT sequence, signal_id, feature_sequence, payload_json FROM runner_signal"
+        ).fetchone()
+    assert row == (7, "legacy-signal", 3, '{"legacy":true}')
+
+
 def test_process_batch_rejects_extended_metadata_and_row_tampering(tmp_path: Path) -> None:
     joined = _joined_feature_batch(tmp_path)
     store = _store(tmp_path / "runner.sqlite3")
@@ -553,6 +1226,114 @@ def test_empty_joined_batch_advances_cursor_without_static_contract_fields(
     assert result.skipped_candidates == 0
     assert result.signals == ()
     assert store.last_batch_sequence() == 0
+
+
+@pytest.mark.parametrize("first_mode", ["flat", "occurrence"])
+def test_candidate_input_mode_cannot_switch_after_reopen(
+    tmp_path: Path,
+    first_mode: str,
+) -> None:
+    path = tmp_path / "runner.sqlite3"
+    first = _store(path)
+    if first_mode == "flat":
+        first.process_batch(
+            _envelope(),
+            _frame(),
+            dataset_snapshot_id="d" * 64,
+            observed_at=NOW,
+            evaluator=lambda *_args: None,
+        )
+        second_envelope = _joined_feature_batch(
+            tmp_path,
+            sequence=1,
+            available_at=NOW + timedelta(minutes=1),
+        )
+        second_frame = second_envelope.frame
+        second_payload = second_envelope.payload_bytes
+        envelope = second_envelope.envelope
+    else:
+        joined = _joined_feature_batch(tmp_path)
+        first.process_batch(
+            joined.envelope,
+            joined.frame,
+            feature_payload=joined.payload_bytes,
+            dataset_snapshot_id=joined.envelope.input_fingerprint,
+            observed_at=NOW,
+            evaluator=lambda *_args: None,
+        )
+        second_frame = _frame()
+        envelope = _envelope(sequence=1)
+        second_payload = None
+
+    with pytest.raises(StrategyBatchConflictError, match="candidate input mode"):
+        _store(path).process_batch(
+            envelope,
+            second_frame,
+            feature_payload=second_payload,
+            dataset_snapshot_id="d" * 64,
+            observed_at=NOW + timedelta(minutes=1),
+            evaluator=lambda *_args: pytest.fail("mode switch must fail before evaluation"),
+        )
+
+    assert _store(path).last_batch_sequence() == 0
+
+
+def test_zero_row_joined_batch_locks_occurrence_input_mode(tmp_path: Path) -> None:
+    path = tmp_path / "runner.sqlite3"
+    joined = _joined_feature_batch(tmp_path, empty_requested_authority=True)
+    _store(path).process_batch(
+        joined.envelope,
+        joined.frame,
+        feature_payload=joined.payload_bytes,
+        dataset_snapshot_id=joined.envelope.input_fingerprint,
+        observed_at=NOW,
+        evaluator=lambda *_args: pytest.fail("empty joined batch must not evaluate"),
+    )
+
+    with pytest.raises(StrategyBatchConflictError, match="candidate input mode"):
+        _store(path).process_batch(
+            _envelope(sequence=1),
+            _frame(),
+            dataset_snapshot_id="d" * 64,
+            observed_at=NOW + timedelta(minutes=1),
+            evaluator=lambda *_args: None,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    (
+        ("source_generation_id", "f" * 64),
+        ("source_batch_id", "replacement-source-batch"),
+        ("source_content_hash", "f" * 64),
+    ),
+)
+def test_source_batch_replay_requires_all_exact_source_evidence(
+    tmp_path: Path,
+    field: str,
+    replacement: str,
+) -> None:
+    store = _store(tmp_path / "runner.sqlite3")
+    envelope = _envelope()
+    receipt = StrategySourceBatchReceipt(
+        source_generation_id="a" * 64,
+        source_sequence=envelope.sequence,
+        source_batch_id="common-feature-0",
+        source_content_hash=envelope.content_hash,
+    )
+    expected = store.process_batch(
+        envelope,
+        _frame(),
+        source_receipt=receipt,
+        dataset_snapshot_id="d" * 64,
+        observed_at=NOW,
+        evaluator=lambda *_args: None,
+    )
+
+    assert store.replay_source_batch(receipt, observed_at=NOW) == expected
+    changed = receipt.model_copy(update={field: replacement})
+    with pytest.raises(StrategyBatchConflictError, match="source batch receipt"):
+        store.replay_source_batch(changed, observed_at=NOW)
 
 
 def test_batch_sequence_gap_and_conflicting_replay_fail_closed(tmp_path: Path) -> None:

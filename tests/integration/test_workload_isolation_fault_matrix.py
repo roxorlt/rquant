@@ -33,6 +33,11 @@ from rquant.intraday_feature_engine import (
 from rquant.lab_job_protocol import LabCommandEnvelope, ResumeJobCommand
 from rquant.lab_jobs import JobStatus, LabJobReader
 from rquant.notification_worker import NotificationDelivery, run_notification_batch
+from rquant.runtime_candidate_universe import (
+    CandidateUniverseAuthority,
+    RuntimeCandidateUniverseConfig,
+    RuntimeCandidateUniverseLoader,
+)
 from rquant.serving_contracts import FreshnessStatus, ServingDatasetWatermark
 from rquant.serving_publisher import (
     ServingPublisher,
@@ -46,6 +51,12 @@ from rquant.serving_read_models import (
 )
 from rquant.signal_bus import SignalBusStore
 from rquant.signal_contracts import SignalAction, SignalEnvelope
+from rquant.strategy_candidate_snapshot import (
+    StrategyCandidatePriceBasis,
+    StrategyCandidateRecord,
+    StrategyCandidateSnapshot,
+    StrategyCandidateSnapshotSpool,
+)
 from rquant.strategy_live_service import run_strategy_live_batch
 from rquant.strategy_runner import (
     StrategyCandidateState,
@@ -168,7 +179,7 @@ def _strategy_spec() -> StrategySpec:
         parameters={"min_ratio": 1.4},
         allowed_actions=(SignalAction.B_INTENT.value,),
         run_mode=StrategyRunMode.SHADOW,
-        producer_commit="c" * 40,
+        producer_commit=PRODUCER_COMMIT,
     )
 
 
@@ -217,11 +228,54 @@ def _runner(path: Path) -> StrategyRunnerStore:
     )
 
 
+def _candidate_loader(root: Path) -> RuntimeCandidateUniverseLoader:
+    snapshot_root = (root / "candidate-snapshots").resolve()
+    decision_at = DECISION_UTC - timedelta(days=1)
+    StrategyCandidateSnapshotSpool(snapshot_root).publish(
+        StrategyCandidateSnapshot.build(
+            sequence=0,
+            trade_date=DECISION_LOCAL.date(),
+            captured_at=DECISION_UTC,
+            producer_commit=PRODUCER_COMMIT,
+            rows=(
+                StrategyCandidateRecord(
+                    strategy_id=_strategy_spec().strategy_id,
+                    strategy_version=str(_strategy_spec().version),
+                    candidate_id="600000.SH",
+                    variant="fault-matrix",
+                    decision_at=decision_at,
+                    available_at=decision_at + timedelta(minutes=1),
+                    effective_trade_date=DECISION_LOCAL.date(),
+                    reference_trade_date=(DECISION_LOCAL - timedelta(days=1)).date(),
+                    price_basis=StrategyCandidatePriceBasis.QFQ_PIT,
+                    static_features={"candidate_score": 0.9},
+                    reference_snapshot_ids={"daily": "9" * 64},
+                ),
+            ),
+        )
+    )
+    return RuntimeCandidateUniverseLoader(
+        RuntimeCandidateUniverseConfig(
+            expected_commit=PRODUCER_COMMIT,
+            authorities=(
+                CandidateUniverseAuthority(
+                    strategy_id=_strategy_spec().strategy_id,
+                    strategy_version=str(_strategy_spec().version),
+                    snapshot_root=snapshot_root,
+                    required=True,
+                    max_age_seconds=60,
+                ),
+            ),
+        )
+    )
+
+
 def _run_one_strategy_signal(root: Path, *, replay: bool = False) -> StrategyRunnerStore:
     spool = _publish_feature(root, replay=replay)
     runner = _runner(root / "runner.sqlite3")
     summary = run_strategy_live_batch(
         feature_spool=spool,
+        candidate_universe_loader=_candidate_loader(root),
         runner=runner,
         evaluator=_evaluate,
         observed_at=DECISION_UTC,
@@ -361,12 +415,17 @@ def test_notification_pause_keeps_signals_and_skips_expired_on_resume(
             now=DECISION_UTC,
         )[0].outbox_id
 
-    assert len(bus.signals_after_global_sequence(
-        after_sequence=0,
-        through_sequence=2,
-        observed_at=DECISION_UTC,
-        limit=10,
-    )) == 2
+    assert (
+        len(
+            bus.signals_after_global_sequence(
+                after_sequence=0,
+                through_sequence=2,
+                observed_at=DECISION_UTC,
+                limit=10,
+            )
+        )
+        == 2
+    )
     assert {record.status for record in bus.outbox_records()} == {OutboxStatus.PENDING}
 
     resumed_at = DECISION_UTC + timedelta(seconds=10)
@@ -445,6 +504,7 @@ def test_runner_restart_replays_committed_batch_without_duplicate_signal(
     with pytest.raises(RuntimeError, match="runner termination"):
         run_strategy_live_batch(
             feature_spool=spool,
+            candidate_universe_loader=_candidate_loader(tmp_path),
             runner=runner,
             evaluator=_evaluate,
             observed_at=DECISION_UTC,
@@ -456,6 +516,7 @@ def test_runner_restart_replays_committed_batch_without_duplicate_signal(
     assert len(committed) == 1
     recovered = run_strategy_live_batch(
         feature_spool=spool,
+        candidate_universe_loader=_candidate_loader(tmp_path),
         runner=_runner(runner_path),
         evaluator=lambda *_args: pytest.fail("committed replay must not evaluate again"),
         observed_at=DECISION_UTC + timedelta(seconds=1),
@@ -484,11 +545,15 @@ def _replay_event_sequence(root: Path) -> tuple[str, ...]:
         observed_at=DECISION_UTC,
         limit=10,
     )[0]
-    feature = FeatureBatchSpool(root / "features").list_after(
-        sequence=-1,
-        through_sequence=0,
-        limit=1,
-    )[0].envelope
+    feature = (
+        FeatureBatchSpool(root / "features")
+        .list_after(
+            sequence=-1,
+            through_sequence=0,
+            limit=1,
+        )[0]
+        .envelope
+    )
     events = (
         {"kind": "feature", "payload": feature.model_dump(mode="json")},
         {"kind": "runner", "payload": runner_record.model_dump(mode="json")},

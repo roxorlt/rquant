@@ -245,14 +245,16 @@ class RuntimeCandidateUniverseResult(RuntimeContractModel):
     as_of: AwareUtcDatetime
     required_trade_date: date
     expected_commit: CommitSha
-    codes: tuple[str, ...] = Field(min_length=1)
+    codes: tuple[str, ...]
     authorities: tuple[CandidateUniverseAuthorityEvidence, ...]
     degraded_optional_authorities: tuple[CandidateUniverseDegradedAuthority, ...]
-    code_evidence: tuple[CandidateUniverseCodeEvidence, ...] = Field(min_length=1)
+    code_evidence: tuple[CandidateUniverseCodeEvidence, ...]
     content_fingerprint: Sha256
 
     @model_validator(mode="after")
     def validate_result(self) -> RuntimeCandidateUniverseResult:
+        if not self.authorities:
+            raise ValueError("candidate universe requires a successful authority")
         if self.codes != tuple(sorted(set(self.codes))):
             raise ValueError("candidate universe codes must be sorted and unique")
         evidence_codes = tuple(item.code for item in self.code_evidence)
@@ -431,7 +433,7 @@ class RuntimeCandidateUniverseLoader:
             )
 
         codes = tuple(sorted(hits_by_code))
-        if not codes:
+        if not authority_evidence:
             raise RuntimeCandidateUniverseIntegrityError("candidate universe is empty")
         code_evidence = tuple(
             CandidateUniverseCodeEvidence(

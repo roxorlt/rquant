@@ -9,10 +9,10 @@ import re
 import secrets
 import sqlite3
 from collections.abc import Callable, Mapping, Sequence
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
-from typing import Annotated
+from typing import Annotated, Literal
 
 import pandas as pd
 from pydantic import (
@@ -37,14 +37,101 @@ from rquant.runtime_contracts import (
     normalize_aware_utc,
 )
 from rquant.signal_contracts import SignalAction, SignalEnvelope
+from rquant.strategy_candidate_snapshot import candidate_occurrence_id
 from rquant.strategy_spec import StrategyLifecycleState, StrategySpec
 
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_CANDIDATE_METADATA_COLUMNS = (
+    "candidate_occurrence_id",
+    "candidate_effective_trade_date",
+    "candidate_variant",
+    "candidate_generation_sha256",
+    "candidate_snapshot_schema_version",
+)
+_CANDIDATE_STATE_SCHEMA = (
+    (0, "occurrence_id", "TEXT", 1, 1),
+    (1, "candidate_id", "TEXT", 1, 0),
+    (2, "candidate_effective_trade_date", "TEXT", 0, 0),
+    (3, "candidate_variant", "TEXT", 0, 0),
+    (4, "candidate_generation_sha256", "TEXT", 0, 0),
+    (5, "candidate_snapshot_schema_version", "INTEGER", 0, 0),
+    (6, "state", "TEXT", 1, 0),
+    (7, "last_feature_sequence", "INTEGER", 1, 0),
+    (8, "last_feature_batch_id", "TEXT", 0, 0),
+    (9, "updated_at", "TEXT", 1, 0),
+)
+_LEGACY_CANDIDATE_STATE_SCHEMA = (
+    (0, "candidate_id", "TEXT", 0, 1),
+    (1, "state", "TEXT", 1, 0),
+    (2, "last_feature_sequence", "INTEGER", 1, 0),
+    (3, "last_feature_batch_id", "TEXT", 0, 0),
+    (4, "updated_at", "TEXT", 1, 0),
+)
+_PROCESSED_BATCH_BASE_SCHEMA = {
+    "feature_sequence": ("INTEGER", 0, 1),
+    "feature_batch_id": ("TEXT", 1, 0),
+    "envelope_fingerprint": ("TEXT", 1, 0),
+    "feature_payload_hash": ("TEXT", 1, 0),
+    "dataset_snapshot_id": ("TEXT", 1, 0),
+    "event_time": ("TEXT", 1, 0),
+    "available_at": ("TEXT", 1, 0),
+    "observed_at": ("TEXT", 1, 0),
+    "result_json": ("TEXT", 1, 0),
+}
+_PROCESSED_BATCH_RECEIPT_SCHEMA = {
+    "source_generation_id": ("TEXT", 0, 0),
+    "source_sequence": ("INTEGER", 0, 0),
+    "source_batch_id": ("TEXT", 0, 0),
+    "source_content_hash": ("TEXT", 0, 0),
+}
+_RUNNER_METADATA_LEGACY_SCHEMA = (
+    (0, "singleton", "INTEGER", 0, 1),
+    (1, "strategy_spec_fingerprint", "TEXT", 1, 0),
+    (2, "strategy_spec_json", "TEXT", 1, 0),
+    (3, "evaluator_contract_fingerprint", "TEXT", 1, 0),
+)
+_RUNNER_METADATA_SCHEMA = (
+    *_RUNNER_METADATA_LEGACY_SCHEMA,
+    (4, "candidate_input_mode", "TEXT", 0, 0),
+)
+_RUNNER_SOURCE_IDENTITY_SCHEMA = (
+    (0, "singleton", "INTEGER", 0, 1),
+    (1, "source_generation_id", "TEXT", 1, 0),
+)
+_RUNNER_SIGNAL_SCHEMA = (
+    (0, "sequence", "INTEGER", 0, 1),
+    (1, "signal_id", "TEXT", 1, 0),
+    (2, "feature_sequence", "INTEGER", 1, 0),
+    (3, "payload_json", "TEXT", 1, 0),
+)
+_RUNNER_SIGNAL_TABLE_SQL = (
+    "createtablerunner_signal("
+    "sequenceintegerprimarykeyautoincrement,"
+    "signal_idtextnotnullunique,"
+    "feature_sequenceintegernotnull,"
+    "payload_jsontextnotnull)"
+)
+_SINGLETON_CHECK_SQL = "check(singleton=1)"
+_CANDIDATE_INPUT_MODE_CHECK_SQL = "check(candidate_input_modein('flat','occurrence'))"
+_SOURCE_SEQUENCE_INDEX_NAME = "processed_batch_source_sequence_uq"
+_SOURCE_SEQUENCE_INDEX_SQL = (
+    "createuniqueindexprocessed_batch_source_sequence_uq"
+    "onprocessed_batch(source_sequence)wheresource_sequenceisnotnull"
+)
 
 
 class StrategyBatchConflictError(RuntimeError):
     """A runner input sequence was missing or reused with different evidence."""
+
+
+class StrategySourceBatchReceipt(RuntimeContractModel):
+    """Exact durable evidence for one common feature-spool source batch."""
+
+    source_generation_id: Sha256
+    source_sequence: int = Field(ge=0)
+    source_batch_id: str = Field(min_length=1)
+    source_content_hash: Sha256
 
 
 def _freeze_json(value: object) -> object:
@@ -127,10 +214,51 @@ class StrategyDecision(RuntimeContractModel):
 class StrategyCandidateState(RuntimeContractModel):
     strategy_spec_fingerprint: Sha256
     candidate_id: str = Field(min_length=1)
+    candidate_occurrence_id: Sha256 | None = None
+    candidate_effective_trade_date: date | None = None
+    candidate_variant: str | None = Field(default=None, min_length=1)
+    candidate_generation_sha256: Sha256 | None = None
+    candidate_snapshot_schema_version: Literal[1, 2] | None = None
     state: StrategyLifecycleState
     last_feature_sequence: int = Field(ge=-1)
     last_feature_batch_id: str | None = None
     updated_at: AwareUtcDatetime
+
+    @model_validator(mode="after")
+    def validate_candidate_metadata(self) -> StrategyCandidateState:
+        values = (
+            self.candidate_occurrence_id,
+            self.candidate_effective_trade_date,
+            self.candidate_variant,
+            self.candidate_generation_sha256,
+            self.candidate_snapshot_schema_version,
+        )
+        if any(value is None for value in values) and any(value is not None for value in values):
+            raise ValueError("candidate occurrence metadata must be all present or all absent")
+        return self
+
+    @property
+    def state_key(self) -> str:
+        return self.candidate_occurrence_id or self.candidate_id
+
+    @property
+    def runner_transition_metadata(self) -> dict[str, JsonValue]:
+        if self.candidate_occurrence_id is None:
+            return {}
+        if (
+            self.candidate_effective_trade_date is None
+            or self.candidate_variant is None
+            or self.candidate_generation_sha256 is None
+            or self.candidate_snapshot_schema_version is None
+        ):
+            raise RuntimeError("validated candidate occurrence metadata is incomplete")
+        return {
+            "candidate_occurrence_id": self.candidate_occurrence_id,
+            "candidate_effective_trade_date": self.candidate_effective_trade_date.isoformat(),
+            "candidate_variant": self.candidate_variant,
+            "candidate_generation_sha256": self.candidate_generation_sha256,
+            "candidate_snapshot_schema_version": self.candidate_snapshot_schema_version,
+        }
 
 
 class RunnerSignalRecord(RuntimeContractModel):
@@ -360,27 +488,70 @@ class StrategyRunnerStore:
     def _initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
-            connection.executescript(
-                """
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                self._audit_runner_metadata_schema(connection)
+                self._audit_runner_source_identity_schema(connection)
+                self._audit_runner_signal_schema(connection)
+                existing = self._read_persisted_runner_identity(connection)
+                if existing is not None:
+                    if existing["strategy_spec_fingerprint"] != self.spec.spec_fingerprint:
+                        raise ValueError("strategy spec does not match persisted runner identity")
+                    if (
+                        existing["evaluator_contract_fingerprint"]
+                        != self.evaluator_contract_fingerprint
+                    ):
+                        raise ValueError(
+                            "evaluator contract does not match persisted runner identity"
+                        )
+                source_generation_id = self._read_persisted_source_identity(connection)
+                if source_generation_id is None:
+                    source_generation_id = secrets.token_hex(32)
+                _validate_sha256(source_generation_id, label="source_generation_id")
+
+                self._ensure_runner_metadata_schema(connection)
+                self._ensure_candidate_state_schema(connection)
+                self._ensure_processed_batch_schema(connection)
+                connection.execute(
+                    """
                 CREATE TABLE IF NOT EXISTS runner_metadata (
                     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
                     strategy_spec_fingerprint TEXT NOT NULL,
                     strategy_spec_json TEXT NOT NULL,
-                    evaluator_contract_fingerprint TEXT NOT NULL
-                );
+                    evaluator_contract_fingerprint TEXT NOT NULL,
+                    candidate_input_mode TEXT
+                        CHECK(candidate_input_mode IN ('flat', 'occurrence'))
+                )
+                """
+                )
+                connection.execute(
+                    """
                 CREATE TABLE IF NOT EXISTS candidate_state (
-                    candidate_id TEXT PRIMARY KEY,
+                    occurrence_id TEXT NOT NULL PRIMARY KEY,
+                    candidate_id TEXT NOT NULL,
+                    candidate_effective_trade_date TEXT,
+                    candidate_variant TEXT,
+                    candidate_generation_sha256 TEXT,
+                    candidate_snapshot_schema_version INTEGER,
                     state TEXT NOT NULL,
                     last_feature_sequence INTEGER NOT NULL,
                     last_feature_batch_id TEXT,
                     updated_at TEXT NOT NULL
-                );
+                )
+                """
+                )
+                connection.execute(
+                    """
                 CREATE TABLE IF NOT EXISTS runner_signal (
                     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                     signal_id TEXT NOT NULL UNIQUE,
                     feature_sequence INTEGER NOT NULL,
                     payload_json TEXT NOT NULL
-                );
+                )
+                """
+                )
+                connection.execute(
+                    """
                 CREATE TABLE IF NOT EXISTS processed_batch (
                     feature_sequence INTEGER PRIMARY KEY,
                     feature_batch_id TEXT NOT NULL UNIQUE,
@@ -390,28 +561,40 @@ class StrategyRunnerStore:
                     event_time TEXT NOT NULL,
                     available_at TEXT NOT NULL,
                     observed_at TEXT NOT NULL,
+                    source_generation_id TEXT,
+                    source_sequence INTEGER,
+                    source_batch_id TEXT,
+                    source_content_hash TEXT,
                     result_json TEXT NOT NULL
-                );
+                )
+                """
+                )
+                connection.execute(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS processed_batch_source_sequence_uq
+                    ON processed_batch(source_sequence)
+                    WHERE source_sequence IS NOT NULL
+                    """
+                )
+                connection.execute(
+                    """
                 CREATE TABLE IF NOT EXISTS runner_source_identity (
                     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
                     source_generation_id TEXT NOT NULL
-                );
-                """
-            )
-            connection.execute("BEGIN IMMEDIATE")
-            try:
-                source_row = connection.execute(
-                    """
-                    SELECT source_generation_id
-                    FROM runner_source_identity WHERE singleton = 1
-                    """
-                ).fetchone()
-                source_generation_id = (
-                    secrets.token_hex(32)
-                    if source_row is None
-                    else str(source_row["source_generation_id"])
                 )
-                if source_row is None:
+                """
+                )
+                if self._audit_runner_metadata_schema(connection) != "current":
+                    raise ValueError("runner_metadata schema did not upgrade to current")
+                self._audit_runner_source_identity_schema(connection)
+                self._audit_runner_signal_schema(connection)
+                if self._processed_batch_schema_state(connection) != "current":
+                    raise ValueError("processed_batch source receipt schema is incomplete")
+                self._audit_processed_batch_constraints(
+                    connection,
+                    require_source_index=True,
+                )
+                if self._read_persisted_source_identity(connection) is None:
                     connection.execute(
                         """
                         INSERT INTO runner_source_identity(singleton, source_generation_id)
@@ -419,13 +602,6 @@ class StrategyRunnerStore:
                         """,
                         (source_generation_id,),
                     )
-                _validate_sha256(source_generation_id, label="source_generation_id")
-                existing = connection.execute(
-                    """
-                    SELECT strategy_spec_fingerprint, evaluator_contract_fingerprint
-                    FROM runner_metadata WHERE singleton = 1
-                    """
-                ).fetchone()
                 if existing is None:
                     connection.execute(
                         """
@@ -440,18 +616,341 @@ class StrategyRunnerStore:
                             self.evaluator_contract_fingerprint,
                         ),
                     )
-                elif existing["strategy_spec_fingerprint"] != self.spec.spec_fingerprint:
-                    raise ValueError("strategy spec does not match persisted runner identity")
-                elif (
-                    existing["evaluator_contract_fingerprint"]
-                    != self.evaluator_contract_fingerprint
-                ):
-                    raise ValueError("evaluator contract does not match persisted runner identity")
                 connection.commit()
                 self.source_generation_id = source_generation_id
             except BaseException:
                 connection.rollback()
                 raise
+
+    @staticmethod
+    def _table_exists(connection: sqlite3.Connection, name: str) -> bool:
+        return (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (name,),
+            ).fetchone()
+            is not None
+        )
+
+    @staticmethod
+    def _table_schema(
+        connection: sqlite3.Connection,
+        name: str,
+    ) -> tuple[tuple[int, str, str, int, int], ...]:
+        return tuple(
+            (
+                int(row["cid"]),
+                str(row["name"]),
+                str(row["type"]).upper(),
+                int(row["notnull"]),
+                int(row["pk"]),
+            )
+            for row in connection.execute(f"PRAGMA table_info({name})").fetchall()
+        )
+
+    @staticmethod
+    def _canonical_schema_sql(sql: str) -> str:
+        canonical = re.sub(r"\s+", "", sql).lower()
+        for token in ('"', "`", "[", "]"):
+            canonical = canonical.replace(token, "")
+        return canonical.replace("ifnotexists", "").removesuffix(";")
+
+    @classmethod
+    def _schema_sql(
+        cls,
+        connection: sqlite3.Connection,
+        *,
+        object_type: str,
+        name: str,
+    ) -> str:
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = ? AND name = ?",
+            (object_type, name),
+        ).fetchone()
+        if row is None or row["sql"] is None:
+            raise ValueError(f"{name} schema SQL is unavailable")
+        return cls._canonical_schema_sql(str(row["sql"]))
+
+    @classmethod
+    def _audit_singleton_rows(
+        cls,
+        connection: sqlite3.Connection,
+        table: str,
+    ) -> None:
+        rows = connection.execute(
+            f"SELECT singleton, count(*) AS n FROM {table} GROUP BY singleton"
+        ).fetchall()
+        if len(rows) > 1 or any(row["singleton"] != 1 or int(row["n"]) != 1 for row in rows):
+            raise ValueError(f"{table} contains invalid or duplicate singleton rows")
+
+    @classmethod
+    def _audit_runner_metadata_schema(
+        cls,
+        connection: sqlite3.Connection,
+    ) -> Literal["legacy", "current"] | None:
+        if not cls._table_exists(connection, "runner_metadata"):
+            return None
+        schema = cls._table_schema(connection, "runner_metadata")
+        if schema == _RUNNER_METADATA_LEGACY_SCHEMA:
+            state: Literal["legacy", "current"] = "legacy"
+            expected_checks = (_SINGLETON_CHECK_SQL,)
+        elif schema == _RUNNER_METADATA_SCHEMA:
+            state = "current"
+            expected_checks = (
+                _SINGLETON_CHECK_SQL,
+                _CANDIDATE_INPUT_MODE_CHECK_SQL,
+            )
+        else:
+            raise ValueError("runner_metadata schema is unsupported")
+        sql = cls._schema_sql(
+            connection,
+            object_type="table",
+            name="runner_metadata",
+        )
+        if sql.count("check(") != len(expected_checks) or any(
+            check not in sql for check in expected_checks
+        ):
+            raise ValueError("runner_metadata schema CHECK constraints are unsupported")
+        cls._audit_singleton_rows(connection, "runner_metadata")
+        return state
+
+    @classmethod
+    def _audit_runner_source_identity_schema(
+        cls,
+        connection: sqlite3.Connection,
+    ) -> None:
+        if not cls._table_exists(connection, "runner_source_identity"):
+            return
+        if cls._table_schema(connection, "runner_source_identity") != (
+            _RUNNER_SOURCE_IDENTITY_SCHEMA
+        ):
+            raise ValueError("runner_source_identity schema is unsupported")
+        sql = cls._schema_sql(
+            connection,
+            object_type="table",
+            name="runner_source_identity",
+        )
+        if sql.count("check(") != 1 or _SINGLETON_CHECK_SQL not in sql:
+            raise ValueError("runner_source_identity schema CHECK is unsupported")
+        cls._audit_singleton_rows(connection, "runner_source_identity")
+
+    @classmethod
+    def _unique_constraint_columns(
+        cls,
+        connection: sqlite3.Connection,
+        table: str,
+    ) -> set[tuple[str, ...]]:
+        constraints: set[tuple[str, ...]] = set()
+        for row in connection.execute(f"PRAGMA index_list({table})").fetchall():
+            if int(row["unique"]) != 1 or str(row["origin"]) != "u" or int(row["partial"]):
+                continue
+            index_name = str(row["name"]).replace("'", "''")
+            columns = tuple(
+                str(item["name"])
+                for item in connection.execute(f"PRAGMA index_info('{index_name}')").fetchall()
+            )
+            constraints.add(columns)
+        return constraints
+
+    @classmethod
+    def _audit_runner_signal_schema(cls, connection: sqlite3.Connection) -> None:
+        if not cls._table_exists(connection, "runner_signal"):
+            return
+        if cls._table_schema(connection, "runner_signal") != _RUNNER_SIGNAL_SCHEMA:
+            raise ValueError("runner_signal schema is unsupported")
+        if ("signal_id",) not in cls._unique_constraint_columns(connection, "runner_signal"):
+            raise ValueError("runner_signal requires a signal_id UNIQUE constraint")
+        sql = cls._schema_sql(
+            connection,
+            object_type="table",
+            name="runner_signal",
+        )
+        if sql != _RUNNER_SIGNAL_TABLE_SQL:
+            raise ValueError("runner_signal canonical DDL is unsupported")
+
+    @classmethod
+    def _read_persisted_runner_identity(
+        cls,
+        connection: sqlite3.Connection,
+    ) -> sqlite3.Row | None:
+        if not cls._table_exists(connection, "runner_metadata"):
+            return None
+        return connection.execute(
+            """
+            SELECT strategy_spec_fingerprint, evaluator_contract_fingerprint
+            FROM runner_metadata WHERE singleton = 1
+            """
+        ).fetchone()
+
+    @classmethod
+    def _read_persisted_source_identity(
+        cls,
+        connection: sqlite3.Connection,
+    ) -> str | None:
+        if not cls._table_exists(connection, "runner_source_identity"):
+            return None
+        row = connection.execute(
+            """
+            SELECT source_generation_id
+            FROM runner_source_identity WHERE singleton = 1
+            """
+        ).fetchone()
+        return None if row is None else str(row["source_generation_id"])
+
+    @staticmethod
+    def _ensure_candidate_state_schema(connection: sqlite3.Connection) -> None:
+        if not StrategyRunnerStore._table_exists(connection, "candidate_state"):
+            return
+        schema = tuple(
+            (
+                int(row["cid"]),
+                str(row["name"]),
+                str(row["type"]).upper(),
+                int(row["notnull"]),
+                int(row["pk"]),
+            )
+            for row in connection.execute("PRAGMA table_info(candidate_state)").fetchall()
+        )
+        if schema == _CANDIDATE_STATE_SCHEMA:
+            return
+        if schema != _LEGACY_CANDIDATE_STATE_SCHEMA:
+            raise ValueError("candidate_state schema is unsupported")
+        row_count = int(connection.execute("SELECT count(*) FROM candidate_state").fetchone()[0])
+        if row_count:
+            raise ValueError("non-empty legacy candidate_state cannot be mapped to occurrences")
+        connection.execute("ALTER TABLE candidate_state RENAME TO candidate_state_legacy")
+        connection.execute(
+            """
+            CREATE TABLE candidate_state (
+                occurrence_id TEXT NOT NULL PRIMARY KEY,
+                candidate_id TEXT NOT NULL,
+                candidate_effective_trade_date TEXT,
+                candidate_variant TEXT,
+                candidate_generation_sha256 TEXT,
+                candidate_snapshot_schema_version INTEGER,
+                state TEXT NOT NULL,
+                last_feature_sequence INTEGER NOT NULL,
+                last_feature_batch_id TEXT,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute("DROP TABLE candidate_state_legacy")
+
+    @classmethod
+    def _ensure_runner_metadata_schema(cls, connection: sqlite3.Connection) -> None:
+        state = cls._audit_runner_metadata_schema(connection)
+        if state is None or state == "current":
+            return
+        connection.execute(
+            """
+            ALTER TABLE runner_metadata ADD COLUMN candidate_input_mode TEXT
+            CHECK(candidate_input_mode IN ('flat', 'occurrence'))
+            """
+        )
+        if cls._audit_runner_metadata_schema(connection) != "current":
+            raise ValueError("runner_metadata schema migration is incomplete")
+
+    @classmethod
+    def _processed_batch_schema_state(
+        cls,
+        connection: sqlite3.Connection,
+    ) -> Literal["legacy", "current"] | None:
+        if not cls._table_exists(connection, "processed_batch"):
+            return None
+        schema = {
+            str(row["name"]): (
+                str(row["type"]).upper(),
+                int(row["notnull"]),
+                int(row["pk"]),
+            )
+            for row in connection.execute("PRAGMA table_info(processed_batch)").fetchall()
+        }
+        if not all(
+            schema.get(name) == expected for name, expected in _PROCESSED_BATCH_BASE_SCHEMA.items()
+        ):
+            raise ValueError("processed_batch base schema is unsupported")
+        receipt_columns = {
+            "source_generation_id": "TEXT",
+            "source_sequence": "INTEGER",
+            "source_batch_id": "TEXT",
+            "source_content_hash": "TEXT",
+        }
+        allowed_columns = set(_PROCESSED_BATCH_BASE_SCHEMA) | set(receipt_columns)
+        if set(schema) - allowed_columns:
+            raise ValueError("processed_batch schema contains unsupported columns")
+        existing_receipt = set(schema) & set(receipt_columns)
+        if existing_receipt and existing_receipt != set(receipt_columns):
+            raise ValueError("processed_batch source receipt schema is incomplete")
+        if existing_receipt:
+            if any(
+                schema[name] != expected
+                for name, expected in _PROCESSED_BATCH_RECEIPT_SCHEMA.items()
+            ):
+                raise ValueError("processed_batch source receipt schema is unsupported")
+            return "current"
+        return "legacy"
+
+    @classmethod
+    def _audit_processed_batch_constraints(
+        cls,
+        connection: sqlite3.Connection,
+        *,
+        require_source_index: bool,
+    ) -> None:
+        if ("feature_batch_id",) not in cls._unique_constraint_columns(
+            connection,
+            "processed_batch",
+        ):
+            raise ValueError("processed_batch requires a feature_batch_id UNIQUE constraint")
+        indexes = {
+            str(row["name"]): row
+            for row in connection.execute("PRAGMA index_list(processed_batch)").fetchall()
+        }
+        source_index = indexes.get(_SOURCE_SEQUENCE_INDEX_NAME)
+        if source_index is None:
+            if require_source_index:
+                raise ValueError("processed_batch source sequence index is missing")
+            return
+        index_name = _SOURCE_SEQUENCE_INDEX_NAME.replace("'", "''")
+        columns = tuple(
+            str(row["name"])
+            for row in connection.execute(f"PRAGMA index_info('{index_name}')").fetchall()
+        )
+        sql = cls._schema_sql(
+            connection,
+            object_type="index",
+            name=_SOURCE_SEQUENCE_INDEX_NAME,
+        )
+        if (
+            int(source_index["unique"]) != 1
+            or int(source_index["partial"]) != 1
+            or columns != ("source_sequence",)
+            or sql != _SOURCE_SEQUENCE_INDEX_SQL
+        ):
+            raise ValueError("processed_batch source sequence index is unsupported")
+
+    @classmethod
+    def _ensure_processed_batch_schema(cls, connection: sqlite3.Connection) -> None:
+        state = cls._processed_batch_schema_state(connection)
+        if state is None:
+            return
+        cls._audit_processed_batch_constraints(
+            connection,
+            require_source_index=False,
+        )
+        if state == "current":
+            return
+        receipt_columns = {
+            "source_generation_id": "TEXT",
+            "source_sequence": "INTEGER",
+            "source_batch_id": "TEXT",
+            "source_content_hash": "TEXT",
+        }
+        for name, column_type in receipt_columns.items():
+            connection.execute(f"ALTER TABLE processed_batch ADD COLUMN {name} {column_type}")
+        if cls._processed_batch_schema_state(connection) != "current":
+            raise ValueError("processed_batch source receipt schema migration is incomplete")
 
     def process_batch(
         self,
@@ -459,11 +958,17 @@ class StrategyRunnerStore:
         frame: pd.DataFrame,
         *,
         feature_payload: bytes | str | None = None,
+        source_receipt: StrategySourceBatchReceipt | None = None,
         dataset_snapshot_id: Sha256,
         observed_at: datetime,
         evaluator: StrategyEvaluator,
     ) -> StrategyBatchResult:
         observed_at = normalize_aware_utc(observed_at)
+        if source_receipt is not None:
+            if not isinstance(source_receipt, StrategySourceBatchReceipt):
+                raise TypeError("source_receipt must be a StrategySourceBatchReceipt")
+            if source_receipt.source_sequence != envelope.sequence:
+                raise ValueError("source receipt sequence must match feature envelope sequence")
         dataset_snapshot_id = _validate_sha256(
             dataset_snapshot_id,
             label="dataset_snapshot_id",
@@ -471,6 +976,10 @@ class StrategyRunnerStore:
         self._validate_batch(envelope, frame, observed_at=observed_at)
         envelope_fingerprint = canonical_sha256(envelope)
         normalized = self._normalize_frame(frame)
+        self._validate_candidate_metadata_columns(normalized)
+        candidate_input_mode = (
+            "occurrence" if "candidate_occurrence_id" in normalized.columns else "flat"
+        )
         self._validate_feature_structure(envelope, normalized)
         canonical_payload = canonical_feature_payload(
             normalized,
@@ -492,6 +1001,7 @@ class StrategyRunnerStore:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
+                self._lock_candidate_input_mode(connection, candidate_input_mode)
                 existing = connection.execute(
                     "SELECT * FROM processed_batch WHERE feature_sequence = ?",
                     (envelope.sequence,),
@@ -502,6 +1012,7 @@ class StrategyRunnerStore:
                         or existing["envelope_fingerprint"] != envelope_fingerprint
                         or existing["feature_payload_hash"] != feature_payload_hash
                         or existing["dataset_snapshot_id"] != dataset_snapshot_id
+                        or not self._source_receipt_matches(existing, source_receipt)
                         or observed_at < datetime.fromisoformat(existing["observed_at"])
                     ):
                         raise StrategyBatchConflictError(
@@ -541,7 +1052,12 @@ class StrategyRunnerStore:
                 skipped = 0
                 for row in normalized.to_dict(orient="records"):
                     candidate_id = str(row["ts_code"])
-                    state = self._candidate_state(connection, candidate_id, observed_at)
+                    state = self._candidate_state(
+                        connection,
+                        candidate_id,
+                        row,
+                        observed_at,
+                    )
                     features = self._candidate_features(envelope, row)
                     if features is None:
                         skipped += 1
@@ -591,6 +1107,7 @@ class StrategyRunnerStore:
                                     "decision evidence cannot override runner_transition"
                                 )
                             evidence["runner_transition"] = {
+                                **state.runner_transition_metadata,
                                 "event": decision.event,
                                 "from_state": state.state.value,
                                 "to_state": next_state.value,
@@ -656,8 +1173,10 @@ class StrategyRunnerStore:
                     INSERT INTO processed_batch(
                         feature_sequence, feature_batch_id, envelope_fingerprint,
                         feature_payload_hash, dataset_snapshot_id, event_time,
-                        available_at, observed_at, result_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        available_at, observed_at, source_generation_id,
+                        source_sequence, source_batch_id, source_content_hash,
+                        result_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         envelope.sequence,
@@ -668,6 +1187,10 @@ class StrategyRunnerStore:
                         envelope.event_time.isoformat(),
                         envelope.available_at.isoformat(),
                         observed_at.isoformat(),
+                        None if source_receipt is None else source_receipt.source_generation_id,
+                        None if source_receipt is None else source_receipt.source_sequence,
+                        None if source_receipt is None else source_receipt.source_batch_id,
+                        None if source_receipt is None else source_receipt.source_content_hash,
                         _json_payload(result),
                     ),
                 )
@@ -677,6 +1200,75 @@ class StrategyRunnerStore:
                 if connection.in_transaction:
                     connection.rollback()
                 raise
+
+    @staticmethod
+    def _lock_candidate_input_mode(
+        connection: sqlite3.Connection,
+        candidate_input_mode: str,
+    ) -> None:
+        row = connection.execute(
+            "SELECT candidate_input_mode FROM runner_metadata WHERE singleton = 1"
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("runner identity is missing")
+        persisted = row["candidate_input_mode"]
+        if persisted is None:
+            connection.execute(
+                "UPDATE runner_metadata SET candidate_input_mode = ? WHERE singleton = 1",
+                (candidate_input_mode,),
+            )
+            return
+        if persisted != candidate_input_mode:
+            raise StrategyBatchConflictError(
+                f"candidate input mode is locked to {persisted}, got {candidate_input_mode}"
+            )
+
+    @staticmethod
+    def _source_receipt_matches(
+        row: sqlite3.Row,
+        receipt: StrategySourceBatchReceipt | None,
+    ) -> bool:
+        persisted = (
+            row["source_generation_id"],
+            row["source_sequence"],
+            row["source_batch_id"],
+            row["source_content_hash"],
+        )
+        expected = (
+            (None, None, None, None)
+            if receipt is None
+            else (
+                receipt.source_generation_id,
+                receipt.source_sequence,
+                receipt.source_batch_id,
+                receipt.source_content_hash,
+            )
+        )
+        return persisted == expected
+
+    def replay_source_batch(
+        self,
+        receipt: StrategySourceBatchReceipt,
+        *,
+        observed_at: datetime,
+    ) -> StrategyBatchResult | None:
+        if not isinstance(receipt, StrategySourceBatchReceipt):
+            raise TypeError("receipt must be a StrategySourceBatchReceipt")
+        observed = normalize_aware_utc(observed_at)
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM processed_batch WHERE feature_sequence = ?",
+                (receipt.source_sequence,),
+            ).fetchone()
+        if row is None:
+            return None
+        if not self._source_receipt_matches(row, receipt):
+            raise StrategyBatchConflictError(
+                "source batch receipt conflicts with persisted source evidence"
+            )
+        if observed < datetime.fromisoformat(row["observed_at"]):
+            raise StrategyBatchConflictError("source batch replay observed_at moved backwards")
+        return StrategyBatchResult.model_validate_json(row["result_json"])
 
     def _validate_batch(
         self,
@@ -699,6 +1291,14 @@ class StrategyRunnerStore:
     @staticmethod
     def _normalize_frame(frame: pd.DataFrame) -> pd.DataFrame:
         return _normalize_feature_frame(frame)
+
+    @staticmethod
+    def _validate_candidate_metadata_columns(frame: pd.DataFrame) -> None:
+        present = tuple(column in frame.columns for column in _CANDIDATE_METADATA_COLUMNS)
+        if any(present) and not all(present):
+            raise ValueError(
+                "candidate occurrence metadata columns must be all present or all absent"
+            )
 
     @staticmethod
     def _has_scalar_value(value: object) -> bool:
@@ -795,21 +1395,86 @@ class StrategyRunnerStore:
         self,
         connection: sqlite3.Connection,
         candidate_id: str,
+        candidate_row: Mapping[str, object],
         observed_at: datetime,
     ) -> StrategyCandidateState:
+        metadata = self._candidate_metadata(candidate_id, candidate_row)
+        occurrence_id = str(metadata.get("candidate_occurrence_id") or candidate_id)
         row = connection.execute(
-            "SELECT * FROM candidate_state WHERE candidate_id = ?",
-            (candidate_id,),
+            "SELECT * FROM candidate_state WHERE occurrence_id = ?",
+            (occurrence_id,),
         ).fetchone()
         if row is None:
             return StrategyCandidateState(
                 strategy_spec_fingerprint=self.spec.spec_fingerprint,
                 candidate_id=candidate_id,
+                **metadata,
                 state=self.spec.initial_state,
                 last_feature_sequence=-1,
                 updated_at=observed_at,
             )
-        return self._state_from_row(row)
+        state = self._state_from_row(row)
+        expected = {
+            "candidate_id": candidate_id,
+            **{column: metadata.get(column) for column in _CANDIDATE_METADATA_COLUMNS},
+        }
+        actual = {
+            "candidate_id": state.candidate_id,
+            **{column: getattr(state, column) for column in _CANDIDATE_METADATA_COLUMNS},
+        }
+        if actual != expected:
+            raise StrategyBatchConflictError(
+                "candidate occurrence metadata drift conflicts with persisted state"
+            )
+        return state
+
+    def _candidate_metadata(
+        self,
+        candidate_id: str,
+        row: Mapping[str, object],
+    ) -> dict[str, object]:
+        if "candidate_occurrence_id" not in row:
+            return {}
+        values = {column: row[column] for column in _CANDIDATE_METADATA_COLUMNS}
+        if any(value is None or value is pd.NA for value in values.values()):
+            raise ValueError("candidate occurrence metadata values cannot be null")
+        occurrence_id = values["candidate_occurrence_id"]
+        generation = values["candidate_generation_sha256"]
+        if not isinstance(occurrence_id, str) or SHA256_PATTERN.fullmatch(occurrence_id) is None:
+            raise ValueError("candidate_occurrence_id must be a lowercase SHA-256 digest")
+        if not isinstance(generation, str) or SHA256_PATTERN.fullmatch(generation) is None:
+            raise ValueError("candidate_generation_sha256 must be a lowercase SHA-256 digest")
+        effective_raw = values["candidate_effective_trade_date"]
+        if not isinstance(effective_raw, str):
+            raise ValueError("candidate_effective_trade_date must be an ISO date string")
+        try:
+            effective_trade_date = date.fromisoformat(effective_raw)
+        except ValueError as exc:
+            raise ValueError("candidate_effective_trade_date must be an ISO date string") from exc
+        if effective_trade_date.isoformat() != effective_raw:
+            raise ValueError("candidate_effective_trade_date must be a canonical ISO date")
+        variant = values["candidate_variant"]
+        if not isinstance(variant, str) or not variant.strip():
+            raise ValueError("candidate_variant must be a non-empty string")
+        schema_version = values["candidate_snapshot_schema_version"]
+        if type(schema_version) is not int or schema_version not in {1, 2}:
+            raise ValueError("candidate_snapshot_schema_version must be 1 or 2")
+        expected_occurrence = candidate_occurrence_id(
+            strategy_id=self.spec.strategy_id,
+            strategy_version=str(self.spec.version),
+            candidate_id=candidate_id,
+            variant=variant,
+            effective_trade_date=effective_trade_date,
+        )
+        if occurrence_id != expected_occurrence:
+            raise ValueError("candidate_occurrence_id does not bind candidate metadata")
+        return {
+            "candidate_occurrence_id": occurrence_id,
+            "candidate_effective_trade_date": effective_trade_date,
+            "candidate_variant": variant,
+            "candidate_generation_sha256": generation,
+            "candidate_snapshot_schema_version": schema_version,
+        }
 
     def _write_state(
         self,
@@ -819,17 +1484,33 @@ class StrategyRunnerStore:
         connection.execute(
             """
             INSERT INTO candidate_state(
-                candidate_id, state, last_feature_sequence,
+                occurrence_id, candidate_id, candidate_effective_trade_date,
+                candidate_variant, candidate_generation_sha256,
+                candidate_snapshot_schema_version, state, last_feature_sequence,
                 last_feature_batch_id, updated_at
-            ) VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(candidate_id) DO UPDATE SET
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(occurrence_id) DO UPDATE SET
+                candidate_id = excluded.candidate_id,
+                candidate_effective_trade_date = excluded.candidate_effective_trade_date,
+                candidate_variant = excluded.candidate_variant,
+                candidate_generation_sha256 = excluded.candidate_generation_sha256,
+                candidate_snapshot_schema_version = excluded.candidate_snapshot_schema_version,
                 state = excluded.state,
                 last_feature_sequence = excluded.last_feature_sequence,
                 last_feature_batch_id = excluded.last_feature_batch_id,
                 updated_at = excluded.updated_at
             """,
             (
+                state.state_key,
                 state.candidate_id,
+                (
+                    None
+                    if state.candidate_effective_trade_date is None
+                    else state.candidate_effective_trade_date.isoformat()
+                ),
+                state.candidate_variant,
+                state.candidate_generation_sha256,
+                state.candidate_snapshot_schema_version,
                 state.state.value,
                 state.last_feature_sequence,
                 state.last_feature_batch_id,
@@ -839,9 +1520,24 @@ class StrategyRunnerStore:
 
     def candidate_state(self, candidate_id: str) -> StrategyCandidateState | None:
         with self._connect() as connection:
-            row = connection.execute(
+            rows = connection.execute(
                 "SELECT * FROM candidate_state WHERE candidate_id = ?",
                 (candidate_id,),
+            ).fetchall()
+        if len(rows) > 1:
+            raise ValueError(f"candidate_id {candidate_id!r} is ambiguous across occurrences")
+        return None if not rows else self._state_from_row(rows[0])
+
+    def candidate_occurrence_state(
+        self,
+        occurrence_id: str,
+    ) -> StrategyCandidateState | None:
+        if not isinstance(occurrence_id, str) or not occurrence_id:
+            raise ValueError("occurrence_id cannot be empty")
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM candidate_state WHERE occurrence_id = ?",
+                (occurrence_id,),
             ).fetchone()
         return None if row is None else self._state_from_row(row)
 
@@ -880,6 +1576,17 @@ class StrategyRunnerStore:
         return StrategyCandidateState(
             strategy_spec_fingerprint=self.spec.spec_fingerprint,
             candidate_id=row["candidate_id"],
+            candidate_occurrence_id=(
+                row["occurrence_id"] if row["candidate_effective_trade_date"] is not None else None
+            ),
+            candidate_effective_trade_date=(
+                None
+                if row["candidate_effective_trade_date"] is None
+                else date.fromisoformat(row["candidate_effective_trade_date"])
+            ),
+            candidate_variant=row["candidate_variant"],
+            candidate_generation_sha256=row["candidate_generation_sha256"],
+            candidate_snapshot_schema_version=row["candidate_snapshot_schema_version"],
             state=StrategyLifecycleState(row["state"]),
             last_feature_sequence=row["last_feature_sequence"],
             last_feature_batch_id=row["last_feature_batch_id"],
@@ -895,5 +1602,6 @@ __all__ = [
     "StrategyDecision",
     "StrategyEvaluator",
     "StrategyRunnerStore",
+    "StrategySourceBatchReceipt",
     "canonical_feature_payload",
 ]
