@@ -234,6 +234,37 @@ def test_latest_stale_or_candidate_missing_batch_never_falls_back(
         )
 
 
+def test_current_visible_quote_does_not_scan_historical_manifests(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spool = LiveBatchSpool(tmp_path / "raw-spool")
+    for sequence in range(50):
+        _publish(
+            spool,
+            sequence=sequence,
+            available_at=T0931 + timedelta(seconds=sequence),
+            rows=[_minute_row(close=10.0 + sequence / 100)],
+        )
+    resolver = _resolver(tmp_path, spool)
+
+    from rquant import runtime_paper_quote as quote_module
+
+    original = quote_module._read_regular_file_no_symlinks
+    reads: list[Path] = []
+
+    def record_read(path: Path) -> bytes:
+        reads.append(path)
+        return original(path)
+
+    monkeypatch.setattr(quote_module, "_read_regular_file_no_symlinks", record_read)
+
+    quote = resolver(_signal(), T0931 + timedelta(seconds=60))
+
+    manifests = [path for path in reads if path.suffix == ".json" and "batches" in path.parts]
+    assert quote.context.executable_price == Decimal("10.49")
+    assert len(manifests) == 1
+
 def test_buy_uses_frozen_sse_next_open_day_and_sell_has_no_acquisition_date(
     tmp_path: Path,
 ) -> None:

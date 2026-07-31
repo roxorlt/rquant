@@ -307,8 +307,8 @@ class PaperPitQuoteResolver:
         if pointer.channel is not LiveChannel.MARKET_MINUTE:
             raise PaperQuoteIntegrityError("market-minute current pointer channel mismatch")
 
-        visible: list[BatchEnvelope] = []
-        for sequence in range(pointer.sequence + 1):
+        selected: BatchEnvelope | None = None
+        for sequence in range(pointer.sequence, -1, -1):
             manifest_path = (
                 root
                 / "batches"
@@ -331,24 +331,21 @@ class PaperPitQuoteResolver:
                 raise PaperQuoteIntegrityError(
                     f"market-minute manifest sequence mismatch at {sequence}"
                 )
+            if sequence == pointer.sequence and (
+                envelope.batch_id != pointer.batch_id
+                or envelope.revision != pointer.revision
+                or envelope.content_sha256 != pointer.content_sha256
+                or envelope.quality_status is not pointer.quality_status
+            ):
+                raise PaperQuoteIntegrityError(
+                    "market-minute current pointer does not match current manifest"
+                )
             if envelope.available_at <= observed_at:
-                visible.append(envelope)
-        if not visible:
+                selected = envelope
+                break
+        if selected is None:
             raise PaperQuoteUnavailableError(
                 f"no market-minute batch is available at {observed_at.isoformat()}"
-            )
-        selected = max(
-            visible,
-            key=lambda item: (item.sequence, item.event_time_end, item.batch_id),
-        )
-        if selected.sequence == pointer.sequence and (
-            selected.batch_id != pointer.batch_id
-            or selected.revision != pointer.revision
-            or selected.content_sha256 != pointer.content_sha256
-            or selected.quality_status is not pointer.quality_status
-        ):
-            raise PaperQuoteIntegrityError(
-                "market-minute current pointer does not match current manifest"
             )
         payload_path = (
             root
