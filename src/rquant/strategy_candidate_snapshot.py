@@ -346,6 +346,10 @@ class StrategyCandidateSnapshotSpool:
             descriptor = os.open(path.anchor, _DIRECTORY_FLAGS)
             for component in path.parts[1:]:
                 before = os.stat(component, dir_fd=descriptor, follow_symlinks=False)
+                if stat.S_ISLNK(before.st_mode):
+                    raise StrategyCandidateSnapshotIntegrityError(
+                        "strategy candidate snapshot path contains a symlink"
+                    )
                 child = os.open(component, _DIRECTORY_FLAGS, dir_fd=descriptor)
                 opened = os.fstat(child)
                 active = os.stat(component, dir_fd=descriptor, follow_symlinks=False)
