@@ -82,6 +82,15 @@ else
     POST_HEAD=$(git rev-parse HEAD)
 fi
 
+step "runtime credential 基础设施校准"
+if [[ ${DRY_RUN} -eq 1 ]]; then
+    echo "  [dry-run] /bin/bash '${PROJECT_DIR}/scripts/install-runtime-credential-infra.sh'"
+elif ! /bin/bash "${PROJECT_DIR}/scripts/install-runtime-credential-infra.sh"; then
+    err "runtime credential 基础设施安装或校验失败"
+    exit 1
+fi
+ok "credential sealer 与 sudoers 已校准"
+
 if [[ "${PRE_HEAD}" == "${POST_HEAD}" ]]; then
     ok "已最新（${PRE_HEAD:0:7}），跳过部署。"
     exit 0

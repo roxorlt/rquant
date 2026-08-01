@@ -107,8 +107,16 @@ def _binding(*, strategy_id: str = "n-shape-live", version: int = 3) -> Strategy
 
 
 def _write_spec(path: Path, spec: StrategySpec | None = None) -> None:
-    path.write_text((spec or _spec()).model_dump_json(), encoding="utf-8")
+    path.write_bytes(_spec_payload(spec or _spec()))
     path.chmod(0o600)
+
+
+def _spec_payload(spec: StrategySpec) -> bytes:
+    return spec.model_dump_json().encode("utf-8")
+
+
+def _spec_sha256(spec: StrategySpec) -> str:
+    return hashlib.sha256(_spec_payload(spec)).hexdigest()
 
 
 def _manifest(
@@ -117,22 +125,27 @@ def _manifest(
     batch_limit: int = 10,
     plane: RuntimeServicePlane = RuntimeServicePlane.LIVE,
     kind: RuntimeServiceKind = RuntimeServiceKind.STRATEGY_LIVE,
+    producer_commit: str = COMMIT,
+    strategy_id: str = "n-shape-live",
+    strategy_version: int = 3,
+    strategy_spec_sha256: str | None = None,
 ) -> RuntimeServiceManifest:
     return RuntimeServiceManifest(
-        service_id="strategy.n-shape-live.v3",
+        service_id=f"strategy.{strategy_id}.v{strategy_version}",
         service_kind=kind,
         plane=plane,
         interval_seconds=1,
         stale_after_seconds=10,
-        producer_commit=COMMIT,
+        producer_commit=producer_commit,
         settings={
             "feature_spool_root": str(tmp_path / "features"),
             "runner_state_path": str(tmp_path / "runner.sqlite3"),
             "strategy_spec_path": str(tmp_path / "strategy.json"),
+            "strategy_spec_sha256": strategy_spec_sha256 or _spec_sha256(_spec()),
             "candidate_snapshot_root": str(tmp_path / "candidates"),
             "candidate_max_age_seconds": 60,
-            "strategy_id": "n-shape-live",
-            "strategy_version": 3,
+            "strategy_id": strategy_id,
+            "strategy_version": strategy_version,
             "batch_limit": batch_limit,
         },
     )
@@ -242,6 +255,102 @@ def test_strategy_builder_maps_sequences_generation_backlog_and_replay(
     assert replay.backlog_count == 0
 
 
+@pytest.mark.parametrize(
+    ("strategy_id", "strategy_version"),
+    [
+        ("n_shape", 1),
+        ("growth_board_surge", 1),
+        ("auction_gap", 1),
+    ],
+)
+def test_strategy_builder_default_binds_each_builtin_at_manifest_commit(
+    tmp_path: Path,
+    strategy_id: str,
+    strategy_version: int,
+) -> None:
+    from rquant.strategy_evaluators import BuiltinStrategyEvaluatorRegistry
+
+    producer_commit = "c" * 40
+    builtin_registry = BuiltinStrategyEvaluatorRegistry(producer_commit=producer_commit)
+    _write_spec(
+        tmp_path / "strategy.json",
+        builtin_registry.load_spec(strategy_id, strategy_version),
+    )
+    manifest = _manifest(
+        tmp_path,
+        producer_commit=producer_commit,
+        strategy_id=strategy_id,
+        strategy_version=strategy_version,
+        strategy_spec_sha256=_spec_sha256(
+            builtin_registry.load_spec(strategy_id, strategy_version)
+        ),
+    )
+
+    step = strategy_live_builder(clock=lambda: NOW)(manifest)
+
+    assert callable(step)
+
+
+def test_strategy_builder_default_fails_closed_for_unknown_builtin_identity(
+    tmp_path: Path,
+) -> None:
+    unknown_spec = _spec(strategy_id="unknown", version=1)
+    _write_spec(tmp_path / "strategy.json", unknown_spec)
+    manifest = _manifest(
+        tmp_path,
+        strategy_id="unknown",
+        strategy_version=1,
+        strategy_spec_sha256=_spec_sha256(unknown_spec),
+    )
+
+    with pytest.raises(KeyError, match="unknown built-in strategy"):
+        strategy_live_builder(clock=lambda: NOW)(manifest)
+
+
+def test_strategy_builder_default_rejects_builtin_spec_mismatch(tmp_path: Path) -> None:
+    from rquant.strategy_evaluators import BuiltinStrategyEvaluatorRegistry
+
+    builtin_registry = BuiltinStrategyEvaluatorRegistry(producer_commit=COMMIT)
+    spec = builtin_registry.load_spec("n_shape", 1)
+    changed_spec = spec.model_copy(
+        update={
+            "parameters": {
+                **spec.parameters,
+                "carry_low_ratio": 0.99,
+            }
+        }
+    )
+    _write_spec(tmp_path / "strategy.json", changed_spec)
+    manifest = _manifest(
+        tmp_path,
+        strategy_id="n_shape",
+        strategy_version=1,
+        strategy_spec_sha256=_spec_sha256(changed_spec),
+    )
+
+    with pytest.raises(ValueError, match="built-in strategy spec"):
+        strategy_live_builder(clock=lambda: NOW)(manifest)
+
+
+def test_strategy_builder_injected_loader_overrides_builtin_allowlist(
+    tmp_path: Path,
+) -> None:
+    _write_spec(tmp_path / "strategy.json")
+    calls: list[tuple[str, int]] = []
+
+    def custom_loader(strategy_id: str, strategy_version: int) -> StrategyEvaluatorBinding:
+        calls.append((strategy_id, strategy_version))
+        return _binding(strategy_id=strategy_id, version=strategy_version)
+
+    step = strategy_live_builder(
+        evaluator_loader=custom_loader,
+        clock=lambda: NOW,
+    )(_manifest(tmp_path))
+
+    assert callable(step)
+    assert calls == [("n-shape-live", 3)]
+
+
 def test_strategy_builder_defers_future_feature_and_reports_exact_backlog(
     tmp_path: Path,
 ) -> None:
@@ -287,13 +396,21 @@ def test_strategy_builder_requires_absolute_runtime_paths(
         )(manifest)
 
 
-def test_strategy_builder_requires_normalized_candidate_root_and_positive_age(
+@pytest.mark.parametrize(
+    "field",
+    (
+        "feature_spool_root",
+        "runner_state_path",
+        "strategy_spec_path",
+        "candidate_snapshot_root",
+    ),
+)
+def test_strategy_builder_requires_normalized_runtime_paths(
     tmp_path: Path,
+    field: str,
 ) -> None:
     payload = _manifest(tmp_path).model_dump(mode="json")
-    payload["settings"]["candidate_snapshot_root"] = os.path.join(
-        str(tmp_path), "nested", "..", "candidates"
-    )
+    payload["settings"][field] = os.path.join(str(tmp_path), "nested", "..", "value")
     traversal = RuntimeServiceManifest.model_validate(payload)
     with pytest.raises(ValidationError, match="normalized"):
         strategy_live_builder(
@@ -301,6 +418,8 @@ def test_strategy_builder_requires_normalized_candidate_root_and_positive_age(
             clock=lambda: NOW,
         )(traversal)
 
+
+def test_strategy_builder_requires_positive_candidate_age(tmp_path: Path) -> None:
     payload = _manifest(tmp_path).model_dump(mode="json")
     payload["settings"]["candidate_max_age_seconds"] = 0
     invalid_age = RuntimeServiceManifest.model_validate(payload)
@@ -382,11 +501,24 @@ def test_strategy_builder_freezes_and_validates_spec_and_evaluator_identity(
 
     wrong_commit = _spec().model_copy(update={"producer_commit": "c" * 40})
     _write_spec(spec_path, wrong_commit)
+    payload = manifest.model_dump(mode="json")
+    payload["settings"]["strategy_spec_sha256"] = _spec_sha256(wrong_commit)
     with pytest.raises(ValueError, match="producer commit"):
+        strategy_live_builder(clock=lambda: NOW)(RuntimeServiceManifest.model_validate(payload))
+
+
+def test_strategy_builder_rejects_spec_content_outside_manifest_identity(
+    tmp_path: Path,
+) -> None:
+    spec_path = tmp_path / "strategy.json"
+    changed = _spec().model_copy(update={"parameters": {"threshold": 9.9}})
+    _write_spec(spec_path, changed)
+
+    with pytest.raises(ValueError, match="SHA-256|frozen"):
         strategy_live_builder(
             evaluator_loader=lambda *_args: _binding(),
             clock=lambda: NOW,
-        )(manifest)
+        )(_manifest(tmp_path))
 
 
 def test_strategy_builder_rejects_strategy_spec_through_symlinked_parent(

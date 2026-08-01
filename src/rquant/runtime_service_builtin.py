@@ -273,14 +273,13 @@ def build_builtin_registry(
         RuntimeServiceKind.FEATURE_LIVE,
         feature_live_builder(clock=resolved_clock),
     )
-    if evaluator_loader is not None:
-        registry.register(
-            RuntimeServiceKind.STRATEGY_LIVE,
-            strategy_live_builder(
-                evaluator_loader=evaluator_loader,
-                clock=resolved_clock,
-            ),
-        )
+    registry.register(
+        RuntimeServiceKind.STRATEGY_LIVE,
+        strategy_live_builder(
+            evaluator_loader=evaluator_loader,
+            clock=resolved_clock,
+        ),
+    )
     registry.register(
         RuntimeServiceKind.SIGNAL_ROUTER,
         signal_router_builder(

@@ -18,6 +18,14 @@ from rquant.runtime_service_entrypoint import (
 COMMIT = "a" * 40
 
 
+@pytest.fixture(autouse=True)
+def isolated_root_credential_sealer(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "rquant.runtime_deployment_bundle._seal_runtime_credentials",
+        lambda _credentials: None,
+    )
+
+
 def _manifest(
     root: Path,
     *,
@@ -38,6 +46,18 @@ def _manifest(
             "strategy_version": 1,
             "candidate_input_path": str(root.parent / "inputs" / "n-shape.json"),
             "snapshot_root": str(root / "live" / "candidates" / instance),
+        }
+    elif kind is RuntimeServiceKind.STRATEGY_LIVE:
+        settings = {
+            "feature_spool_root": str(root / "live" / "features"),
+            "runner_state_path": str(root / "live" / "strategies" / instance / "runner.sqlite3"),
+            "strategy_spec_path": str(root.parent / "specs" / "n-shape.json"),
+            "strategy_spec_sha256": "9" * 64,
+            "candidate_snapshot_root": str(root / "live" / "candidates" / "source"),
+            "candidate_max_age_seconds": 120,
+            "strategy_id": "n_shape",
+            "strategy_version": 1,
+            "batch_limit": 128,
         }
     elif kind is RuntimeServiceKind.NOTIFIER:
         settings = {"signal_bus_path": str(root / "live" / "signal.sqlite")}
@@ -130,7 +150,7 @@ def test_candidate_bundle_owns_only_snapshot_output_and_receives_no_secrets(
     assert receipt.unit_mapping[manifest.service_id] == (
         f"rquant-runtime-candidate@{instance}.service"
     )
-    assert not (root / "current" / "secrets" / f"{instance}.env").exists()
+    assert not (root / "current" / "credentials").exists()
     assert Path(manifest.settings["snapshot_root"]).is_dir()
     assert (root / "control" / "candidates" / instance).is_dir()
 
@@ -281,7 +301,9 @@ def test_installs_canonical_generation_with_systemd_instance_mapping(
     generation = current.resolve(strict=True)
     assert generation.parent == root / "generations"
     assert _mode(generation) == 0o700
-    assert (generation / "runtime.env").read_text() == (f"RQUANT_RUNTIME_COMMIT={COMMIT}\n")
+    assert (generation / "runtime.env").read_text() == (
+        f"RQUANT_RUNTIME_COMMIT={COMMIT}\nRQUANT_RUNTIME_GENERATION={receipt.generation_hash}\n"
+    )
     assert _mode(generation / "runtime.env") == 0o600
 
     for manifest in manifests:
@@ -297,21 +319,106 @@ def test_installs_canonical_generation_with_systemd_instance_mapping(
             sort_keys=True,
         ).encode("utf-8")
 
-        env_path = generation / "secrets" / f"{instance}.env"
-        if (
-            manifest.plane is RuntimeServicePlane.LIVE
-            and manifest.service_kind is not RuntimeServiceKind.CANDIDATE_PUBLISHER
-        ):
-            assert _mode(env_path) == 0o600
-            assert env_path.read_text().splitlines()[0] == (f"RQUANT_RUNTIME_COMMIT={COMMIT}")
-        else:
-            assert not env_path.exists()
-
     manifest_payload = b"".join(
         path.read_bytes() for path in sorted((generation / "manifests").iterdir())
     )
     for secret in (b"main-token", b"pushdeer-key", b"pushplus-token"):
         assert secret not in manifest_payload
+        assert all(
+            secret not in path.read_bytes() for path in generation.rglob("*") if path.is_file()
+        )
+    assert not (generation / "secrets").exists()
+    assert not (generation / "credentials").exists()
+
+
+def test_seals_generation_bound_credentials_outside_runtime_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "runtime"
+    manifests, capabilities = _bundle_inputs(root)
+    captured: dict[str, bytes] = {}
+    monkeypatch.setattr(
+        "rquant.runtime_deployment_bundle._seal_runtime_credentials",
+        lambda credentials: captured.update(credentials),
+    )
+
+    receipt = install_runtime_deployment_bundle(
+        root,
+        producer_commit=COMMIT,
+        manifests=manifests,
+        capability_env=capabilities,
+    )
+
+    expected_service_ids = {
+        manifest.service_id
+        for manifest in manifests
+        if manifest.plane is RuntimeServicePlane.LIVE
+        and manifest.service_kind
+        not in {
+            RuntimeServiceKind.CANDIDATE_PUBLISHER,
+            RuntimeServiceKind.STRATEGY_LIVE,
+        }
+    }
+    assert set(captured) == {
+        receipt.instance_mapping[service_id] for service_id in expected_service_ids
+    }
+    for payload in captured.values():
+        decoded = json.loads(payload)
+        assert decoded["bundle_generation"] == receipt.generation_hash
+        assert isinstance(decoded["capabilities"], dict)
+    generation = (root / "current").resolve(strict=True)
+    assert all(
+        secret not in path.read_bytes()
+        for secret in (b"main-token", b"pushdeer-key", b"pushplus-token")
+        for path in generation.rglob("*")
+        if path.is_file()
+    )
+
+
+def test_installer_creates_required_systemd_plane_and_control_directories(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "runtime"
+    manifest = _manifest(
+        root,
+        service_id="minute/source:primary",
+        kind=RuntimeServiceKind.MARKET_MINUTE_SOURCE,
+        plane=RuntimeServicePlane.LIVE,
+    )
+
+    install_runtime_deployment_bundle(
+        root,
+        producer_commit=COMMIT,
+        manifests=(manifest,),
+        capability_env={manifest.service_id: {"TUSHARE_TOKEN_MAIN": "secret"}},
+    )
+
+    assert (root / "live").is_dir()
+    assert (root / "control").is_dir()
+
+
+def test_credential_sealer_failure_prevents_runtime_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "runtime"
+    manifests, capabilities = _bundle_inputs(root)
+
+    def fail(_credentials: object) -> None:
+        raise RuntimeError("root sealer unavailable")
+
+    monkeypatch.setattr("rquant.runtime_deployment_bundle._seal_runtime_credentials", fail)
+
+    with pytest.raises(RuntimeError, match="root sealer"):
+        install_runtime_deployment_bundle(
+            root,
+            producer_commit=COMMIT,
+            manifests=manifests,
+            capability_env=capabilities,
+        )
+
+    assert not (root / "current").exists()
 
 
 @pytest.mark.parametrize("suffix", ("", "nested", "sibling"))
@@ -343,6 +450,122 @@ def test_candidate_bundle_requires_its_exclusive_instance_output_root(
     )
 
     with pytest.raises(ValueError, match="exclusive|instance"):
+        install_runtime_deployment_bundle(
+            root,
+            producer_commit=COMMIT,
+            manifests=(manifest,),
+            capability_env={manifest.service_id: {}},
+        )
+
+
+def test_strategy_bundle_uses_dedicated_unit_and_exclusive_state_root(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "runtime"
+    manifest = _manifest(
+        root,
+        service_id="strategy-n-shape",
+        kind=RuntimeServiceKind.STRATEGY_LIVE,
+        plane=RuntimeServicePlane.LIVE,
+    )
+
+    receipt = install_runtime_deployment_bundle(
+        root,
+        producer_commit=COMMIT,
+        manifests=(manifest,),
+        capability_env={manifest.service_id: {}},
+    )
+
+    instance = receipt.instance_mapping[manifest.service_id]
+    state_path = root / "live" / "strategies" / instance / "runner.sqlite3"
+    assert Path(manifest.settings["runner_state_path"]) == state_path
+    assert state_path.parent.is_dir()
+    assert (root / "control" / "strategies" / instance).is_dir()
+    assert receipt.unit_mapping[manifest.service_id] == (
+        f"rquant-runtime-strategy@{instance}.service"
+    )
+    assert not (root / "current" / "credentials").exists()
+
+
+def test_rejects_legacy_plaintext_secret_generation(tmp_path: Path) -> None:
+    root = tmp_path / "runtime"
+    legacy = root / "generations" / ("f" * 64) / "secrets"
+    legacy.mkdir(parents=True)
+    (legacy / "svc.env").write_text("TUSHARE_TOKEN_MAIN=plaintext\n")
+    manifests, capabilities = _bundle_inputs(root)
+
+    with pytest.raises(ValueError, match="legacy plaintext"):
+        install_runtime_deployment_bundle(
+            root,
+            producer_commit=COMMIT,
+            manifests=manifests,
+            capability_env=capabilities,
+        )
+
+
+@pytest.mark.parametrize("mutation", ("shared-root", "nested", "sibling"))
+def test_strategy_bundle_rejects_nonexclusive_state_root(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    root = tmp_path / "runtime"
+    manifest = _manifest(
+        root,
+        service_id="strategy-n-shape",
+        kind=RuntimeServiceKind.STRATEGY_LIVE,
+        plane=RuntimeServicePlane.LIVE,
+    )
+    expected = Path(manifest.settings["runner_state_path"])
+    if mutation == "shared-root":
+        unsafe = root / "live" / "strategies" / "runner.sqlite3"
+    elif mutation == "nested":
+        unsafe = expected.parent / "nested" / "runner.sqlite3"
+    else:
+        unsafe = expected.parent.parent / ("svc-" + "f" * 64) / "runner.sqlite3"
+    manifest = manifest.model_copy(
+        update={
+            "settings": {
+                **manifest.model_dump(mode="json")["settings"],
+                "runner_state_path": str(unsafe),
+            }
+        }
+    )
+
+    with pytest.raises(ValueError, match="exclusive|instance"):
+        install_runtime_deployment_bundle(
+            root,
+            producer_commit=COMMIT,
+            manifests=(manifest,),
+            capability_env={manifest.service_id: {}},
+        )
+
+
+@pytest.mark.parametrize(
+    "setting_name",
+    ("feature_spool_root", "strategy_spec_path", "candidate_snapshot_root"),
+)
+def test_strategy_bundle_rejects_readonly_input_inside_its_writable_root(
+    tmp_path: Path,
+    setting_name: str,
+) -> None:
+    root = tmp_path / "runtime"
+    manifest = _manifest(
+        root,
+        service_id="strategy-n-shape",
+        kind=RuntimeServiceKind.STRATEGY_LIVE,
+        plane=RuntimeServicePlane.LIVE,
+    )
+    own_root = Path(manifest.settings["runner_state_path"]).parent
+    manifest = manifest.model_copy(
+        update={
+            "settings": {
+                **manifest.model_dump(mode="json")["settings"],
+                setting_name: str(own_root / "forbidden"),
+            }
+        }
+    )
+
+    with pytest.raises(ValueError, match="read-only|writable|strategy"):
         install_runtime_deployment_bundle(
             root,
             producer_commit=COMMIT,

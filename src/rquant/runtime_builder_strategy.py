@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import stat
@@ -40,6 +41,7 @@ class StrategyLiveRuntimeSettings(RuntimeContractModel):
     feature_spool_root: Path
     runner_state_path: Path
     strategy_spec_path: Path
+    strategy_spec_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     candidate_snapshot_root: Path
     candidate_max_age_seconds: StrictInt = Field(gt=0)
     strategy_id: str = Field(min_length=1)
@@ -53,8 +55,8 @@ class StrategyLiveRuntimeSettings(RuntimeContractModel):
     )
     @classmethod
     def require_absolute_path(cls, value: Path) -> Path:
-        if not value.is_absolute():
-            raise ValueError("strategy runtime data paths must be absolute")
+        if not value.is_absolute() or value != Path(os.path.abspath(value)):
+            raise ValueError("strategy runtime data paths must be absolute and normalized")
         return value
 
     @field_validator("candidate_snapshot_root")
@@ -94,6 +96,20 @@ class StrategyEvaluatorBinding:
 StrategyEvaluatorLoader = Callable[[str, int], StrategyEvaluatorBinding]
 
 
+def _load_builtin_evaluator(
+    *,
+    spec: StrategySpec,
+    producer_commit: str,
+) -> StrategyEvaluatorBinding:
+    from rquant.strategy_evaluators import BuiltinStrategyEvaluatorRegistry
+
+    registry = BuiltinStrategyEvaluatorRegistry(producer_commit=producer_commit)
+    definition = registry.load_definition(spec.strategy_id, spec.version)
+    if definition.spec != spec:
+        raise ValueError("frozen strategy spec does not match built-in strategy spec")
+    return registry.load_binding(spec.strategy_id, spec.version)
+
+
 def _same_file_identity(left: os.stat_result, right: os.stat_result) -> bool:
     return (
         left.st_dev,
@@ -122,7 +138,7 @@ def _same_file_version(left: os.stat_result, right: os.stat_result) -> bool:
     )
 
 
-def _read_frozen_strategy_spec(path: Path) -> StrategySpec:
+def _read_frozen_strategy_spec(path: Path, *, expected_sha256: str) -> StrategySpec:
     if not path.is_absolute() or path != Path(os.path.abspath(path)):
         raise ValueError("strategy spec path is unsafe")
     parent_descriptor = -1
@@ -193,6 +209,8 @@ def _read_frozen_strategy_spec(path: Path) -> StrategySpec:
             os.close(child_descriptor)
         if parent_descriptor >= 0:
             os.close(parent_descriptor)
+    if hashlib.sha256(payload).hexdigest() != expected_sha256:
+        raise ValueError("strategy spec content does not match frozen SHA-256")
     try:
         return strict_model_validate_json(StrategySpec, payload)
     except ValueError as exc:
@@ -201,8 +219,8 @@ def _read_frozen_strategy_spec(path: Path) -> StrategySpec:
 
 def strategy_live_builder(
     *,
-    evaluator_loader: StrategyEvaluatorLoader,
     clock: Callable[[], datetime],
+    evaluator_loader: StrategyEvaluatorLoader | None = None,
 ) -> RuntimeServiceBuilder:
     """Build one stateful strategy step without dynamic imports or production I/O."""
 
@@ -213,13 +231,22 @@ def strategy_live_builder(
             raise ValueError("strategy-live service must run on the live plane")
 
         settings = StrategyLiveRuntimeSettings.model_validate(dict(manifest.settings))
-        spec = _read_frozen_strategy_spec(settings.strategy_spec_path)
+        spec = _read_frozen_strategy_spec(
+            settings.strategy_spec_path,
+            expected_sha256=settings.strategy_spec_sha256,
+        )
         if spec.strategy_id != settings.strategy_id or spec.version != settings.strategy_version:
             raise ValueError("strategy spec identity does not match runtime settings")
         if spec.producer_commit != manifest.producer_commit:
             raise ValueError("strategy spec producer commit does not match runtime manifest")
 
-        binding = evaluator_loader(settings.strategy_id, settings.strategy_version)
+        if evaluator_loader is None:
+            binding = _load_builtin_evaluator(
+                spec=spec,
+                producer_commit=manifest.producer_commit,
+            )
+        else:
+            binding = evaluator_loader(settings.strategy_id, settings.strategy_version)
         if not isinstance(binding, StrategyEvaluatorBinding):
             raise TypeError("evaluator loader must return StrategyEvaluatorBinding")
         if (

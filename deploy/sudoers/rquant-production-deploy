@@ -19,4 +19,7 @@ Cmnd_Alias RQUANT_TIMER_TRANSITION = \
     /usr/bin/systemctl stop rquant-surge-watch.timer, \
     /usr/bin/systemctl start rquant-surge-watch.timer
 
-lighthouse ALL=(root) NOPASSWD: RQUANT_SERVICE_RESTART, RQUANT_TIMER_TRANSITION
+Cmnd_Alias RQUANT_RUNTIME_CREDENTIAL_SEAL = \
+    /usr/local/libexec/rquant-runtime-credential-sealer ""
+
+lighthouse ALL=(root) NOPASSWD: RQUANT_SERVICE_RESTART, RQUANT_TIMER_TRANSITION, RQUANT_RUNTIME_CREDENTIAL_SEAL

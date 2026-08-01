@@ -10,11 +10,12 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 SYSTEMD = ROOT / "deploy" / "systemd"
 PLANES = ("live", "serving", "research")
-TEMPLATES = (*PLANES, "candidate")
+TEMPLATES = (*PLANES, "candidate", "strategy")
 RUNTIME_ROOT = "/home/lighthouse/rquant/data/runtime"
 CURRENT_ROOT = f"{RUNTIME_ROOT}/current"
 CONTROL_ROOT = f"{RUNTIME_ROOT}/control"
 ENVIRONMENT_FILE = f"{CURRENT_ROOT}/runtime.env"
+CREDENTIAL_FILE = "/etc/credstore.encrypted/rquant-runtime/instances/%i/current.cred"
 EXPECTED_EXECUTABLE = "/home/lighthouse/rquant/.venv/bin/python"
 EXPECTED_MODULE = "rquant.runtime_service_main"
 
@@ -44,22 +45,27 @@ def test_runtime_template_has_fixed_identity_entrypoint_and_manifest(
     assert service["User"] == "lighthouse"
     assert service["Group"] == "lighthouse"
     assert service["WorkingDirectory"] == "/home/lighthouse/rquant"
-    expected_environment_file = (
-        f"{CURRENT_ROOT}/secrets/%i.env" if plane == "live" else ENVIRONMENT_FILE
-    )
-    assert service["EnvironmentFile"] == expected_environment_file
+    assert service["EnvironmentFile"] == ENVIRONMENT_FILE
     assert service["Environment"] == "RQUANT_DISABLE_DOTENV=1"
-    expected_plane = "live" if plane == "candidate" else plane
+    expected_plane = "live" if plane in {"candidate", "strategy"} else plane
     assert service["Slice"] == f"rquant-{expected_plane}.slice"
 
     command = service["ExecStart"]
     assert command.startswith(f"{EXPECTED_EXECUTABLE} -m {EXPECTED_MODULE} ")
     assert f"--manifest {CURRENT_ROOT}/manifests/%i.json" in command
-    expected_control = f"{CONTROL_ROOT}/candidates/%i" if plane == "candidate" else CONTROL_ROOT
+    expected_control = {
+        "candidate": f"{CONTROL_ROOT}/candidates/%i",
+        "strategy": f"{CONTROL_ROOT}/strategies/%i",
+    }.get(plane, CONTROL_ROOT)
     assert f"--control-root {expected_control}" in command
     assert "--expected-commit ${RQUANT_RUNTIME_COMMIT}" in command
-    if plane == "candidate":
-        assert "--expected-kind candidate_publisher" in command
+    assert "--expected-generation ${RQUANT_RUNTIME_GENERATION}" in command
+    expected_kind = {
+        "candidate": "candidate_publisher",
+        "strategy": "strategy_live",
+    }.get(plane)
+    if expected_kind is not None:
+        assert f"--expected-kind {expected_kind}" in command
 
 
 @pytest.mark.parametrize("plane", TEMPLATES)
@@ -93,8 +99,10 @@ def test_runtime_template_is_hardened_without_shell_or_manifest_secrets(
     inaccessible = set(service["InaccessiblePaths"].split())
     assert inaccessible == {
         "/home/lighthouse/rquant/.env",
-        f"{CURRENT_ROOT}/secrets",
+        f"-{CURRENT_ROOT}/secrets",
+        f"-{CURRENT_ROOT}/credentials",
     }
+    assert service["ProtectProc"] == "invisible"
     assert service["ProtectKernelTunables"] == "true"
     assert service["ProtectKernelModules"] == "true"
     assert service["ProtectControlGroups"] == "true"
@@ -116,16 +124,22 @@ def test_runtime_template_is_hardened_without_shell_or_manifest_secrets(
         assert secret_name not in raw
 
 
-def test_only_capability_live_instances_may_load_one_scoped_secret_file() -> None:
+def test_only_capability_live_instances_load_one_encrypted_systemd_credential() -> None:
     live = _load("live")["Service"]
     candidate = _load("candidate")["Service"]
+    strategy = _load("strategy")["Service"]
     serving = _load("serving")["Service"]
     research = _load("research")["Service"]
 
-    assert live["EnvironmentFile"] == f"{CURRENT_ROOT}/secrets/%i.env"
+    assert live["EnvironmentFile"] == ENVIRONMENT_FILE
+    assert live["LoadCredentialEncrypted"] == f"capabilities.json:{CREDENTIAL_FILE}"
     assert candidate["EnvironmentFile"] == ENVIRONMENT_FILE
+    assert strategy["EnvironmentFile"] == ENVIRONMENT_FILE
     assert serving["EnvironmentFile"] == ENVIRONMENT_FILE
     assert research["EnvironmentFile"] == ENVIRONMENT_FILE
+    for service in (candidate, strategy, serving, research):
+        assert "LoadCredential" not in service
+        assert "LoadCredentialEncrypted" not in service
 
 
 def test_runtime_templates_only_write_their_plane_and_shared_control_root() -> None:
@@ -149,14 +163,23 @@ def test_runtime_templates_only_write_their_plane_and_shared_control_root() -> N
     }
     assert f"{RUNTIME_ROOT}/live" not in candidate_writable
 
+    strategy_writable = set(_load("strategy")["Service"]["ReadWritePaths"].split())
+    assert strategy_writable == {
+        f"{CONTROL_ROOT}/strategies/%i",
+        f"{RUNTIME_ROOT}/live/strategies/%i",
+    }
+    assert f"{RUNTIME_ROOT}/live" not in strategy_writable
+
 
 def test_generic_live_instances_cannot_modify_candidate_authority() -> None:
     live = _load("live")["Service"]
-    readonly = set(live["ReadOnlyPaths"].split())
+    readonly = {path.lstrip("-") for path in live["ReadOnlyPaths"].split()}
 
     assert readonly == {
         f"{CONTROL_ROOT}/candidates",
+        f"{CONTROL_ROOT}/strategies",
         f"{RUNTIME_ROOT}/live/candidates",
+        f"{RUNTIME_ROOT}/live/strategies",
     }
     assert set(_load("candidate")["Service"]["ReadWritePaths"].split()) == {
         f"{CONTROL_ROOT}/candidates/%i",
@@ -168,11 +191,44 @@ def test_generic_live_instances_cannot_modify_candidate_authority() -> None:
 def test_non_candidate_instances_cannot_modify_candidate_heartbeats(
     plane: str,
 ) -> None:
-    readonly = set(_load(plane)["Service"]["ReadOnlyPaths"].split())
+    readonly = {path.lstrip("-") for path in _load(plane)["Service"]["ReadOnlyPaths"].split()}
     assert f"{CONTROL_ROOT}/candidates" in readonly
+
+
+@pytest.mark.parametrize("plane", PLANES)
+def test_non_strategy_instances_cannot_modify_strategy_state_or_heartbeats(
+    plane: str,
+) -> None:
+    readonly = {path.lstrip("-") for path in _load(plane)["Service"]["ReadOnlyPaths"].split()}
+    assert f"{CONTROL_ROOT}/strategies" in readonly
+    if plane == "live":
+        assert f"{RUNTIME_ROOT}/live/strategies" in readonly
 
 
 @pytest.mark.parametrize("plane", TEMPLATES)
 def test_runtime_templates_are_install_only_not_auto_enabled(plane: str) -> None:
     parser = _load(plane)
     assert "Install" not in parser
+
+
+@pytest.mark.parametrize("plane", TEMPLATES)
+def test_optional_runtime_masks_do_not_block_unit_start(plane: str) -> None:
+    service = _load(plane)["Service"]
+    assert all(path.startswith("-") for path in service["InaccessiblePaths"].split()[1:])
+    for path in service.get("ReadOnlyPaths", "").split():
+        if path.endswith(("/candidates", "/strategies")):
+            assert path.startswith("-")
+
+
+def test_manual_infrastructure_deployer_installs_root_owned_credential_sealer() -> None:
+    deployer = (ROOT / "scripts" / "install-runtime-credential-infra.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "deploy/libexec/rquant-runtime-credential-sealer" in deployer
+    assert 'HELPER_DIR="${PREFIX}/usr/local/libexec"' in deployer
+    assert 'HELPER_TARGET="${HELPER_DIR}/rquant-runtime-credential-sealer"' in deployer
+    assert "/usr/bin/install -o root -g root" in deployer
+    assert "-m 0755" in deployer
+    assert "VISUDO_BIN" in deployer
+    assert "install_file 0440" in deployer

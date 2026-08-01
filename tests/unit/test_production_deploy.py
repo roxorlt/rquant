@@ -1674,6 +1674,7 @@ def test_sudoers_allows_only_exact_managed_timer_transitions() -> None:
     assert "launchctl" not in "\n".join(
         line for line in source.splitlines() if not line.lstrip().startswith("#")
     )
+    assert '/usr/local/libexec/rquant-runtime-credential-sealer ""' in source
 
 
 def test_cli_does_not_allow_overriding_production_executables() -> None:

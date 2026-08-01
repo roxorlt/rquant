@@ -123,6 +123,35 @@ def test_manifest_loader_reads_from_one_secure_descriptor(
     assert load_runtime_service_manifest(path, expected_commit=COMMIT) == _manifest()
 
 
+def test_manifest_loader_binds_current_pointer_to_expected_generation(
+    tmp_path: Path,
+) -> None:
+    generation_hash = "b" * 64
+    manifest_dir = tmp_path / "generations" / generation_hash / "manifests"
+    manifest_dir.mkdir(parents=True)
+    path = manifest_dir / "service.json"
+    path.write_text(_manifest().model_dump_json())
+    path.chmod(0o600)
+    current = tmp_path / "current"
+    current.symlink_to(Path("generations") / generation_hash, target_is_directory=True)
+
+    assert (
+        load_runtime_service_manifest(
+            current / "manifests" / "service.json",
+            expected_commit=COMMIT,
+            expected_generation=generation_hash,
+        )
+        == _manifest()
+    )
+
+    with pytest.raises(ValueError, match="generation|instance"):
+        load_runtime_service_manifest(
+            current / "manifests" / "service.json",
+            expected_commit=COMMIT,
+            expected_generation="c" * 64,
+        )
+
+
 def test_registered_service_runs_once_with_durable_heartbeat(tmp_path: Path) -> None:
     registry = RuntimeServiceRegistry()
     calls: list[str] = []

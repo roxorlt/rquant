@@ -429,15 +429,11 @@ def test_builtin_registry_registers_dependency_free_concrete_builders(tmp_path: 
         RuntimeServiceKind.MARKET_MINUTE_SOURCE,
         RuntimeServiceKind.CANDIDATE_PUBLISHER,
         RuntimeServiceKind.FEATURE_LIVE,
+        RuntimeServiceKind.STRATEGY_LIVE,
         RuntimeServiceKind.SIGNAL_ROUTER,
         RuntimeServiceKind.PAPER_CONSUMER,
     )
     assert callable(registry.build(_manifest(tmp_path)))
-    unsupported = RuntimeServiceManifest.model_validate(
-        {**_manifest(tmp_path).model_dump(mode="json"), "service_kind": "strategy_live"}
-    )
-    with pytest.raises(KeyError, match="not registered"):
-        registry.build(unsupported)
 
 
 def test_builtin_registry_passes_injected_candidate_loader_to_default_builder(
@@ -491,7 +487,7 @@ def test_builtin_registry_passes_injected_candidate_loader_to_default_builder(
     assert calls == [(tmp_path / "input.json", "n_shape", COMMIT)]
 
 
-def test_default_registry_does_not_import_serving_or_production_storage_modules() -> None:
+def test_default_registry_does_not_import_optional_evaluators_or_production_storage() -> None:
     src_root = Path(__file__).resolve().parents[2] / "src"
     script = "\n".join(
         (
@@ -499,7 +495,8 @@ def test_default_registry_does_not_import_serving_or_production_storage_modules(
             f"sys.path.insert(0, {str(src_root)!r})",
             "from rquant.runtime_service_builtin import build_builtin_registry",
             "build_builtin_registry()",
-            "forbidden = ('duckdb', 'rquant.storage.duckdb', 'rquant.monitor', 'rquant.config')",
+            "forbidden = ('duckdb', 'rquant.storage.duckdb', 'rquant.monitor', "
+            "'rquant.config', 'rquant.strategy_evaluators')",
             "unexpected = tuple(name for name in forbidden if name in sys.modules)",
             "if unexpected: raise SystemExit(f'unexpected imports: {unexpected!r}')",
         )
@@ -530,6 +527,34 @@ def test_builtin_registry_registers_all_explicitly_bound_services() -> None:
     )
 
     assert registry.registered_kinds == tuple(RuntimeServiceKind)
+
+
+def test_builtin_registry_preserves_injected_strategy_evaluator_loader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    def injected_loader(*_args: object) -> object:
+        return object()
+
+    def recording_builder(*, evaluator_loader: object, clock: object) -> object:
+        observed.update(evaluator_loader=evaluator_loader, clock=clock)
+        return lambda _manifest: lambda: None
+
+    monkeypatch.setattr(
+        "rquant.runtime_builder_strategy.strategy_live_builder",
+        recording_builder,
+    )
+
+    registry = build_builtin_registry(
+        adapter_factory=_Adapter,
+        universe_loader=lambda: ["600000.SH"],
+        clock=lambda: NOW,
+        evaluator_loader=injected_loader,  # type: ignore[arg-type]
+    )
+
+    assert RuntimeServiceKind.STRATEGY_LIVE in registry.registered_kinds
+    assert observed["evaluator_loader"] is injected_loader
 
 
 @pytest.mark.parametrize(

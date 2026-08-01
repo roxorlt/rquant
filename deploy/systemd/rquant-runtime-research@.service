@@ -12,7 +12,7 @@ WorkingDirectory=/home/lighthouse/rquant
 EnvironmentFile=/home/lighthouse/rquant/data/runtime/current/runtime.env
 Environment=RQUANT_DISABLE_DOTENV=1
 Slice=rquant-research.slice
-ExecStart=/home/lighthouse/rquant/.venv/bin/python -m rquant.runtime_service_main --manifest /home/lighthouse/rquant/data/runtime/current/manifests/%i.json --control-root /home/lighthouse/rquant/data/runtime/control --expected-commit ${RQUANT_RUNTIME_COMMIT}
+ExecStart=/home/lighthouse/rquant/.venv/bin/python -m rquant.runtime_service_main --manifest /home/lighthouse/rquant/data/runtime/current/manifests/%i.json --control-root /home/lighthouse/rquant/data/runtime/control --expected-commit ${RQUANT_RUNTIME_COMMIT} --expected-generation ${RQUANT_RUNTIME_GENERATION}
 
 Restart=on-failure
 RestartSec=30s
@@ -25,7 +25,8 @@ PrivateTmp=true
 PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=read-only
-InaccessiblePaths=/home/lighthouse/rquant/.env /home/lighthouse/rquant/data/runtime/current/secrets
+InaccessiblePaths=/home/lighthouse/rquant/.env -/home/lighthouse/rquant/data/runtime/current/secrets -/home/lighthouse/rquant/data/runtime/current/credentials
+ProtectProc=invisible
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
@@ -36,7 +37,7 @@ CapabilityBoundingSet=
 AmbientCapabilities=
 UMask=0077
 ReadWritePaths=/home/lighthouse/rquant/data/runtime/control /home/lighthouse/rquant/data/runtime/research
-ReadOnlyPaths=/home/lighthouse/rquant/data/runtime/control/candidates
+ReadOnlyPaths=-/home/lighthouse/rquant/data/runtime/control/candidates -/home/lighthouse/rquant/data/runtime/control/strategies
 
 StandardOutput=journal
 StandardError=journal

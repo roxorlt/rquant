@@ -27,6 +27,7 @@ from rquant.runtime_service_control import (
 )
 
 CommitSha = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{40}$")]
+_GENERATION_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _SECRET_KEY_PARTS = frozenset(
     {"api_key", "credential", "password", "private_key", "secret", "token"}
 )
@@ -175,14 +176,61 @@ def _read_owned_manifest(path: Path) -> bytes:
             os.close(directory_descriptor)
 
 
+def _resolve_runtime_current_pointer(
+    path: Path,
+    *,
+    expected_generation: str | None,
+) -> Path:
+    try:
+        index = path.parts[1:-1].index("current") + 1
+    except ValueError:
+        if expected_generation is not None:
+            raise ValueError(
+                "runtime service manifest must use the current generation pointer"
+            ) from None
+        return path
+    current = Path(path.anchor, *path.parts[1 : index + 1])
+    try:
+        observed = current.lstat()
+    except FileNotFoundError:
+        if expected_generation is not None:
+            raise ValueError("runtime service manifest current pointer is unavailable") from None
+        return path
+    if not stat.S_ISLNK(observed.st_mode):
+        if expected_generation is not None:
+            raise ValueError("runtime service manifest current pointer must be a symlink")
+        return path
+    target = Path(os.readlink(current))
+    if (
+        target.is_absolute()
+        or len(target.parts) != 2
+        or target.parts[0] != "generations"
+        or _GENERATION_PATTERN.fullmatch(target.parts[1]) is None
+    ):
+        raise ValueError("runtime service manifest current pointer is invalid")
+    if expected_generation is not None and target.parts[1] != expected_generation:
+        raise ValueError("runtime service manifest generation does not match runtime environment")
+    remainder = Path(*path.parts[index + 1 :])
+    return current.parent / target / remainder
+
+
 def load_runtime_service_manifest(
     path: Path,
     *,
     expected_commit: str,
+    expected_generation: str | None = None,
 ) -> RuntimeServiceManifest:
     if re.fullmatch(r"[0-9a-f]{40}", expected_commit) is None:
         raise ValueError("expected commit must be a full lowercase Git SHA")
-    manifest_path = Path(os.path.abspath(path))
+    if (
+        expected_generation is not None
+        and re.fullmatch(r"[0-9a-f]{64}", expected_generation) is None
+    ):
+        raise ValueError("expected generation must be a full lowercase SHA-256")
+    manifest_path = _resolve_runtime_current_pointer(
+        Path(os.path.abspath(path)),
+        expected_generation=expected_generation,
+    )
     try:
         manifest = RuntimeServiceManifest.model_validate_json(_read_owned_manifest(manifest_path))
     except ValueError as exc:

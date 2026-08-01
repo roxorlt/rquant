@@ -1,5 +1,5 @@
 [Unit]
-Description=rQuant isolated candidate publisher (%i)
+Description=rQuant isolated live strategy runner (%i)
 After=network-online.target
 Wants=network-online.target
 OnFailure=rquant-alert@%n.service
@@ -14,7 +14,7 @@ WorkingDirectory=/home/lighthouse/rquant
 Environment=RQUANT_DISABLE_DOTENV=1
 EnvironmentFile=/home/lighthouse/rquant/data/runtime/current/runtime.env
 Slice=rquant-live.slice
-ExecStart=/home/lighthouse/rquant/.venv/bin/python -m rquant.runtime_service_main --manifest /home/lighthouse/rquant/data/runtime/current/manifests/%i.json --control-root /home/lighthouse/rquant/data/runtime/control/candidates/%i --expected-commit ${RQUANT_RUNTIME_COMMIT} --expected-generation ${RQUANT_RUNTIME_GENERATION} --expected-kind candidate_publisher
+ExecStart=/home/lighthouse/rquant/.venv/bin/python -m rquant.runtime_service_main --manifest /home/lighthouse/rquant/data/runtime/current/manifests/%i.json --control-root /home/lighthouse/rquant/data/runtime/control/strategies/%i --expected-commit ${RQUANT_RUNTIME_COMMIT} --expected-generation ${RQUANT_RUNTIME_GENERATION} --expected-kind strategy_live
 
 Restart=on-failure
 RestartSec=10s
@@ -38,7 +38,7 @@ LockPersonality=true
 CapabilityBoundingSet=
 AmbientCapabilities=
 UMask=0077
-ReadWritePaths=/home/lighthouse/rquant/data/runtime/control/candidates/%i /home/lighthouse/rquant/data/runtime/live/candidates/%i
+ReadWritePaths=/home/lighthouse/rquant/data/runtime/control/strategies/%i /home/lighthouse/rquant/data/runtime/live/strategies/%i
 
 StandardOutput=journal
 StandardError=journal
