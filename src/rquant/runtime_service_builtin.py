@@ -37,6 +37,7 @@ from rquant.source_quota_store import SourceQuotaStore
 
 if TYPE_CHECKING:
     from rquant.paper_signal_worker import QuoteResolver
+    from rquant.runtime_builder_candidate import CandidateInputLoader
     from rquant.runtime_builder_paper import TradeDateResolver
     from rquant.runtime_builder_serving import ServingSnapshotLoader
     from rquant.runtime_builder_signal import (
@@ -242,7 +243,9 @@ def build_builtin_registry(
     paper_quote_resolver: QuoteResolver | None = None,
     trade_date_resolver: TradeDateResolver | None = None,
     serving_snapshot_loader: ServingSnapshotLoader | None = None,
+    candidate_input_loader: CandidateInputLoader | None = None,
 ) -> RuntimeServiceRegistry:
+    from rquant.runtime_builder_candidate import candidate_publisher_builder
     from rquant.runtime_builder_feature import feature_live_builder
     from rquant.runtime_builder_paper import paper_broker_builder, paper_consumer_builder
     from rquant.runtime_builder_signal import notifier_builder, signal_router_builder
@@ -261,6 +264,10 @@ def build_builtin_registry(
             universe_loader=universe_loader,
             clock=resolved_clock,
         ),
+    )
+    registry.register(
+        RuntimeServiceKind.CANDIDATE_PUBLISHER,
+        candidate_publisher_builder(candidate_input_loader=candidate_input_loader),
     )
     registry.register(
         RuntimeServiceKind.FEATURE_LIVE,

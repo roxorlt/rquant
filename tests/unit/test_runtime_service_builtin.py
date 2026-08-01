@@ -12,7 +12,7 @@ import pytest
 from pydantic import ValidationError
 
 from rquant import runtime_service_builtin as builtin_module
-from rquant.live_contracts import LiveChannel
+from rquant.live_contracts import BatchQualityStatus, LiveChannel
 from rquant.live_spool import LiveBatchSpool
 from rquant.market_minute_gateway import MarketMinuteGateway
 from rquant.runtime_candidate_universe import CandidateUniverseAuthority
@@ -28,6 +28,8 @@ from rquant.runtime_service_entrypoint import (
     load_runtime_service_manifest,
 )
 from rquant.source_quota_store import SourceQuotaStore
+from rquant.strategy_candidate_producers import PublishedCandidateInputAuthority
+from rquant.strategy_candidate_publish_service import NShapeCandidateBatch
 from rquant.strategy_candidate_snapshot import (
     StrategyCandidatePriceBasis,
     StrategyCandidateRecord,
@@ -425,6 +427,7 @@ def test_builtin_registry_registers_dependency_free_concrete_builders(tmp_path: 
 
     assert registry.registered_kinds == (
         RuntimeServiceKind.MARKET_MINUTE_SOURCE,
+        RuntimeServiceKind.CANDIDATE_PUBLISHER,
         RuntimeServiceKind.FEATURE_LIVE,
         RuntimeServiceKind.SIGNAL_ROUTER,
         RuntimeServiceKind.PAPER_CONSUMER,
@@ -435,6 +438,57 @@ def test_builtin_registry_registers_dependency_free_concrete_builders(tmp_path: 
     )
     with pytest.raises(KeyError, match="not registered"):
         registry.build(unsupported)
+
+
+def test_builtin_registry_passes_injected_candidate_loader_to_default_builder(
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[Path, str, str]] = []
+    batch = NShapeCandidateBatch(
+        authority=PublishedCandidateInputAuthority(
+            trade_date=NOW.date(),
+            captured_at=NOW,
+            quality_status=BatchQualityStatus.PUBLISHED,
+            authority_snapshot_id="f" * 64,
+            producer_commit=COMMIT,
+        ),
+        facts=(),
+    )
+
+    def loader(
+        path: Path,
+        *,
+        strategy_id: str,
+        expected_commit: str,
+    ) -> NShapeCandidateBatch:
+        calls.append((path, strategy_id, expected_commit))
+        return batch
+
+    manifest = RuntimeServiceManifest(
+        service_id="candidate.n-shape.v1",
+        service_kind=RuntimeServiceKind.CANDIDATE_PUBLISHER,
+        plane=RuntimeServicePlane.LIVE,
+        interval_seconds=30,
+        stale_after_seconds=90,
+        producer_commit=COMMIT,
+        settings={
+            "strategy_id": "n_shape",
+            "strategy_version": 1,
+            "candidate_input_path": str(tmp_path / "input.json"),
+            "snapshot_root": str(tmp_path / "live" / "candidate"),
+        },
+    )
+    registry = build_builtin_registry(
+        adapter_factory=_Adapter,
+        universe_loader=lambda: ["600000.SH"],
+        clock=lambda: NOW,
+        candidate_input_loader=loader,
+    )
+
+    result = registry.build(manifest)()
+
+    assert result.source_generations["candidate_input"] == "f" * 64
+    assert calls == [(tmp_path / "input.json", "n_shape", COMMIT)]
 
 
 def test_default_registry_does_not_import_serving_or_production_storage_modules() -> None:

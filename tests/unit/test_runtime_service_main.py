@@ -29,6 +29,7 @@ def test_parser_requires_absolute_private_runtime_paths(tmp_path: Path) -> None:
     assert args.manifest == manifest
     assert args.control_root == control
     assert args.expected_commit == COMMIT
+    assert args.expected_kind is None
     assert args.once is True
 
     with pytest.raises(SystemExit):
@@ -53,6 +54,50 @@ def test_parser_requires_absolute_private_runtime_paths(tmp_path: Path) -> None:
                 COMMIT,
             ]
         )
+
+
+def test_run_rejects_manifest_kind_outside_unit_allowlist(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest_path = tmp_path / "source.json"
+    control_root = tmp_path / "control"
+    manifest = RuntimeServiceManifest(
+        service_id="source.market-minute",
+        service_kind=RuntimeServiceKind.MARKET_MINUTE_SOURCE,
+        plane="live",
+        interval_seconds=15,
+        stale_after_seconds=45,
+        producer_commit=COMMIT,
+        settings={"spool_root": str(tmp_path / "spool")},
+    )
+    manifest_path.write_text(manifest.model_dump_json())
+    manifest_path.chmod(0o600)
+    called = False
+
+    def fail_run(*_args: object, **_kwargs: object) -> object:
+        nonlocal called
+        called = True
+        return object()
+
+    monkeypatch.setattr("rquant.runtime_service_main.run_runtime_service_manifest", fail_run)
+    args = build_parser().parse_args(
+        [
+            "--manifest",
+            str(manifest_path),
+            "--control-root",
+            str(control_root),
+            "--expected-commit",
+            COMMIT,
+            "--expected-kind",
+            "candidate_publisher",
+            "--once",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="kind.*unit|unit.*kind"):
+        run(args)
+    assert called is False
 
 
 def test_run_loads_exact_manifest_and_limits_once_mode(

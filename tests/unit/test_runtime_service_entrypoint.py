@@ -38,6 +38,10 @@ def _manifest() -> RuntimeServiceManifest:
     )
 
 
+def test_candidate_publisher_is_an_allow_listed_runtime_service_kind() -> None:
+    assert RuntimeServiceKind("candidate_publisher") is RuntimeServiceKind.CANDIDATE_PUBLISHER
+
+
 def test_manifest_is_frozen_typed_and_fingerprinted() -> None:
     first = _manifest()
     second = RuntimeServiceManifest.model_validate(first.model_dump(mode="json"))

@@ -26,10 +26,18 @@ def _manifest(
     plane: RuntimeServicePlane,
     interval_seconds: float = 1,
 ) -> RuntimeServiceManifest:
+    instance = "svc-" + hashlib.sha256(service_id.encode("utf-8")).hexdigest()
     if kind is RuntimeServiceKind.MARKET_MINUTE_SOURCE:
         settings: dict[str, object] = {
             "spool_root": str(root / "live" / "market-minute"),
             "quota_path": str(root / "live" / "quota.sqlite"),
+        }
+    elif kind is RuntimeServiceKind.CANDIDATE_PUBLISHER:
+        settings = {
+            "strategy_id": "n_shape",
+            "strategy_version": 1,
+            "candidate_input_path": str(root.parent / "inputs" / "n-shape.json"),
+            "snapshot_root": str(root / "live" / "candidates" / instance),
         }
     elif kind is RuntimeServiceKind.NOTIFIER:
         settings = {"signal_bus_path": str(root / "live" / "signal.sqlite")}
@@ -63,6 +71,12 @@ def _bundle_inputs(
         ),
         _manifest(
             root,
+            service_id="candidate-n-shape",
+            kind=RuntimeServiceKind.CANDIDATE_PUBLISHER,
+            plane=RuntimeServicePlane.LIVE,
+        ),
+        _manifest(
+            root,
             service_id="notifier-admin",
             kind=RuntimeServiceKind.NOTIFIER,
             plane=RuntimeServicePlane.LIVE,
@@ -79,6 +93,7 @@ def _bundle_inputs(
             "TUSHARE_TOKEN_MAIN": "main-token",
             "TUSHARE_TOKEN_BACKUP": "backup-token",
         },
+        "candidate-n-shape": {},
         "notifier-admin": {
             "PUSHDEER_KEYS": "pushdeer-key",
             "PUSHPLUS_TOKENS": "pushplus-token",
@@ -88,6 +103,141 @@ def _bundle_inputs(
         "serving-publisher": {},
     }
     return manifests, capabilities
+
+
+def test_candidate_bundle_owns_only_snapshot_output_and_receives_no_secrets(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "runtime"
+    manifest = _manifest(
+        root,
+        service_id="candidate-n-shape",
+        kind=RuntimeServiceKind.CANDIDATE_PUBLISHER,
+        plane=RuntimeServicePlane.LIVE,
+    )
+
+    receipt = install_runtime_deployment_bundle(
+        root,
+        producer_commit=COMMIT,
+        manifests=(manifest,),
+        capability_env={manifest.service_id: {}},
+    )
+
+    assert Path(manifest.settings["candidate_input_path"]).is_relative_to(tmp_path / "inputs")
+    instance = receipt.instance_mapping[manifest.service_id]
+    assert Path(manifest.settings["snapshot_root"]) == root / "live" / "candidates" / instance
+    assert instance.startswith("svc-")
+    assert receipt.unit_mapping[manifest.service_id] == (
+        f"rquant-runtime-candidate@{instance}.service"
+    )
+    assert not (root / "current" / "secrets" / f"{instance}.env").exists()
+    assert Path(manifest.settings["snapshot_root"]).is_dir()
+    assert (root / "control" / "candidates" / instance).is_dir()
+
+    overprivileged = {manifest.service_id: {"TUSHARE_TOKEN_MAIN": "forbidden"}}
+    with pytest.raises(ValueError, match="unknown capability"):
+        install_runtime_deployment_bundle(
+            tmp_path / "other-runtime",
+            producer_commit=COMMIT,
+            manifests=(
+                manifest.model_copy(
+                    update={
+                        "settings": {
+                            **manifest.model_dump(mode="json")["settings"],
+                            "snapshot_root": str(
+                                tmp_path / "other-runtime" / "live" / "candidates" / instance
+                            ),
+                        }
+                    }
+                ),
+            ),
+            capability_env=overprivileged,
+        )
+
+
+def test_candidate_bundle_rejects_snapshot_output_outside_live_plane(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "runtime"
+    manifest = _manifest(
+        root,
+        service_id="candidate-n-shape",
+        kind=RuntimeServiceKind.CANDIDATE_PUBLISHER,
+        plane=RuntimeServicePlane.LIVE,
+    ).model_copy(
+        update={
+            "settings": {
+                "strategy_id": "n_shape",
+                "strategy_version": 1,
+                "candidate_input_path": str(tmp_path / "input.json"),
+                "snapshot_root": str(root / "serving" / "candidates"),
+            }
+        }
+    )
+
+    with pytest.raises(ValueError, match="owned by the live plane"):
+        install_runtime_deployment_bundle(
+            root,
+            producer_commit=COMMIT,
+            manifests=(manifest,),
+            capability_env={manifest.service_id: {}},
+        )
+
+
+@pytest.mark.parametrize(
+    "candidate_input_path",
+    (
+        "inside-live",
+        "inside-control",
+        "relative",
+        "traversal",
+    ),
+)
+def test_candidate_bundle_rejects_unsafe_readonly_input_path(
+    tmp_path: Path,
+    candidate_input_path: str,
+) -> None:
+    root = tmp_path / "runtime"
+    if candidate_input_path == "inside-live":
+        input_path = root / "live" / "inputs" / "n-shape.json"
+        message = "read-only|writable|live"
+    elif candidate_input_path == "inside-control":
+        input_path = root / "control" / "inputs" / "n-shape.json"
+        message = "read-only|writable|control"
+    elif candidate_input_path == "relative":
+        input_path = Path("inputs/n-shape.json")
+        message = "absolute|normalized"
+    else:
+        input_path = tmp_path / "inputs" / ".." / "inputs" / "n-shape.json"
+        message = "absolute|normalized"
+    manifest = _manifest(
+        root,
+        service_id="candidate-n-shape",
+        kind=RuntimeServiceKind.CANDIDATE_PUBLISHER,
+        plane=RuntimeServicePlane.LIVE,
+    ).model_copy(
+        update={
+            "settings": {
+                "strategy_id": "n_shape",
+                "strategy_version": 1,
+                "candidate_input_path": str(input_path),
+                "snapshot_root": str(
+                    root
+                    / "live"
+                    / "candidates"
+                    / ("svc-" + hashlib.sha256(b"candidate-n-shape").hexdigest())
+                ),
+            }
+        }
+    )
+
+    with pytest.raises(ValueError, match=message):
+        install_runtime_deployment_bundle(
+            root,
+            producer_commit=COMMIT,
+            manifests=(manifest,),
+            capability_env={manifest.service_id: {}},
+        )
 
 
 def _mode(path: Path) -> int:
@@ -114,15 +264,24 @@ def test_installs_canonical_generation_with_systemd_instance_mapping(
         + hashlib.sha256(manifest.service_id.encode("utf-8")).hexdigest()
         for manifest in manifests
     }
+    assert receipt.unit_mapping == {
+        manifest.service_id: (
+            f"rquant-runtime-candidate@{receipt.instance_mapping[manifest.service_id]}.service"
+            if manifest.service_kind is RuntimeServiceKind.CANDIDATE_PUBLISHER
+            else (
+                f"rquant-runtime-{manifest.plane.value}@"
+                f"{receipt.instance_mapping[manifest.service_id]}.service"
+            )
+        )
+        for manifest in manifests
+    }
     current = root / "current"
     assert current.is_symlink()
     assert os.readlink(current) == f"generations/{receipt.generation_hash}"
     generation = current.resolve(strict=True)
     assert generation.parent == root / "generations"
     assert _mode(generation) == 0o700
-    assert (generation / "runtime.env").read_text() == (
-        f"RQUANT_RUNTIME_COMMIT={COMMIT}\n"
-    )
+    assert (generation / "runtime.env").read_text() == (f"RQUANT_RUNTIME_COMMIT={COMMIT}\n")
     assert _mode(generation / "runtime.env") == 0o600
 
     for manifest in manifests:
@@ -139,11 +298,12 @@ def test_installs_canonical_generation_with_systemd_instance_mapping(
         ).encode("utf-8")
 
         env_path = generation / "secrets" / f"{instance}.env"
-        if manifest.plane is RuntimeServicePlane.LIVE:
+        if (
+            manifest.plane is RuntimeServicePlane.LIVE
+            and manifest.service_kind is not RuntimeServiceKind.CANDIDATE_PUBLISHER
+        ):
             assert _mode(env_path) == 0o600
-            assert env_path.read_text().splitlines()[0] == (
-                f"RQUANT_RUNTIME_COMMIT={COMMIT}"
-            )
+            assert env_path.read_text().splitlines()[0] == (f"RQUANT_RUNTIME_COMMIT={COMMIT}")
         else:
             assert not env_path.exists()
 
@@ -152,6 +312,43 @@ def test_installs_canonical_generation_with_systemd_instance_mapping(
     )
     for secret in (b"main-token", b"pushdeer-key", b"pushplus-token"):
         assert secret not in manifest_payload
+
+
+@pytest.mark.parametrize("suffix", ("", "nested", "sibling"))
+def test_candidate_bundle_requires_its_exclusive_instance_output_root(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    root = tmp_path / "runtime"
+    manifest = _manifest(
+        root,
+        service_id="candidate-n-shape",
+        kind=RuntimeServiceKind.CANDIDATE_PUBLISHER,
+        plane=RuntimeServicePlane.LIVE,
+    )
+    expected = Path(manifest.settings["snapshot_root"])
+    if suffix == "":
+        unsafe = root / "live" / "candidates"
+    elif suffix == "nested":
+        unsafe = expected / "nested"
+    else:
+        unsafe = expected.parent / ("svc-" + "f" * 64)
+    manifest = manifest.model_copy(
+        update={
+            "settings": {
+                **manifest.model_dump(mode="json")["settings"],
+                "snapshot_root": str(unsafe),
+            }
+        }
+    )
+
+    with pytest.raises(ValueError, match="exclusive|instance"):
+        install_runtime_deployment_bundle(
+            root,
+            producer_commit=COMMIT,
+            manifests=(manifest,),
+            capability_env={manifest.service_id: {}},
+        )
 
 
 def test_same_inputs_are_deterministic_regardless_of_manifest_order(tmp_path: Path) -> None:
@@ -202,9 +399,7 @@ def test_rejects_invalid_or_overprivileged_bundle(
     elif mutation == "duplicate":
         candidate.append(candidate[0])
     elif mutation == "wrong_plane":
-        candidate[0] = candidate[0].model_copy(
-            update={"plane": RuntimeServicePlane.SERVING}
-        )
+        candidate[0] = candidate[0].model_copy(update={"plane": RuntimeServicePlane.SERVING})
     elif mutation == "unknown_env":
         capabilities["minute/source:primary"]["AWS_SECRET_ACCESS_KEY"] = "nope"
     elif mutation == "serving_env":
@@ -212,9 +407,7 @@ def test_rejects_invalid_or_overprivileged_bundle(
     elif mutation == "missing_mapping":
         capabilities.pop("notifier-admin")
     elif mutation == "secret_in_manifest":
-        candidate[0] = candidate[0].model_copy(
-            update={"settings": {"label": "main-token"}}
-        )
+        candidate[0] = candidate[0].model_copy(update={"settings": {"label": "main-token"}})
     elif mutation == "wrong_path_owner":
         candidate[0] = candidate[0].model_copy(
             update={

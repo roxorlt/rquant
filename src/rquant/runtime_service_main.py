@@ -11,6 +11,7 @@ from threading import Event
 from types import FrameType
 
 from rquant.runtime_service_entrypoint import (
+    RuntimeServiceKind,
     RuntimeServiceRegistry,
     load_runtime_service_manifest,
     run_runtime_service_manifest,
@@ -26,9 +27,7 @@ def _absolute_path(value: str) -> Path:
 
 def _commit_sha(value: str) -> str:
     if re.fullmatch(r"[0-9a-f]{40}", value) is None:
-        raise argparse.ArgumentTypeError(
-            "expected commit must be a full lowercase Git SHA"
-        )
+        raise argparse.ArgumentTypeError("expected commit must be a full lowercase Git SHA")
     return value
 
 
@@ -44,6 +43,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--control-root", required=True, type=_absolute_path)
     parser.add_argument("--expected-commit", required=True, type=_commit_sha)
     parser.add_argument(
+        "--expected-kind",
+        type=RuntimeServiceKind,
+        choices=tuple(RuntimeServiceKind),
+        help="Reject manifests not admitted by this systemd unit template",
+    )
+    parser.add_argument(
         "--once",
         action="store_true",
         help="Run one service step and stop; intended for validation only",
@@ -56,6 +61,8 @@ def run(args: argparse.Namespace) -> int:
         args.manifest,
         expected_commit=args.expected_commit,
     )
+    if args.expected_kind is not None and manifest.service_kind is not args.expected_kind:
+        raise ValueError("runtime manifest kind is not admitted by this systemd unit")
     stop_event = Event()
 
     def request_stop(_signum: int, _frame: FrameType | None) -> None:

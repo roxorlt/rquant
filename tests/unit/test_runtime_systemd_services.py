@@ -10,6 +10,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 SYSTEMD = ROOT / "deploy" / "systemd"
 PLANES = ("live", "serving", "research")
+TEMPLATES = (*PLANES, "candidate")
 RUNTIME_ROOT = "/home/lighthouse/rquant/data/runtime"
 CURRENT_ROOT = f"{RUNTIME_ROOT}/current"
 CONTROL_ROOT = f"{RUNTIME_ROOT}/control"
@@ -30,7 +31,7 @@ def _load(plane: str) -> configparser.ConfigParser:
     return parser
 
 
-@pytest.mark.parametrize("plane", PLANES)
+@pytest.mark.parametrize("plane", TEMPLATES)
 def test_runtime_template_has_fixed_identity_entrypoint_and_manifest(
     plane: str,
 ) -> None:
@@ -48,18 +49,20 @@ def test_runtime_template_has_fixed_identity_entrypoint_and_manifest(
     )
     assert service["EnvironmentFile"] == expected_environment_file
     assert service["Environment"] == "RQUANT_DISABLE_DOTENV=1"
-    assert service["Slice"] == f"rquant-{plane}.slice"
+    expected_plane = "live" if plane == "candidate" else plane
+    assert service["Slice"] == f"rquant-{expected_plane}.slice"
 
     command = service["ExecStart"]
     assert command.startswith(f"{EXPECTED_EXECUTABLE} -m {EXPECTED_MODULE} ")
-    assert (
-        f"--manifest {CURRENT_ROOT}/manifests/%i.json" in command
-    )
-    assert f"--control-root {CONTROL_ROOT}" in command
+    assert f"--manifest {CURRENT_ROOT}/manifests/%i.json" in command
+    expected_control = f"{CONTROL_ROOT}/candidates/%i" if plane == "candidate" else CONTROL_ROOT
+    assert f"--control-root {expected_control}" in command
     assert "--expected-commit ${RQUANT_RUNTIME_COMMIT}" in command
+    if plane == "candidate":
+        assert "--expected-kind candidate_publisher" in command
 
 
-@pytest.mark.parametrize("plane", PLANES)
+@pytest.mark.parametrize("plane", TEMPLATES)
 def test_runtime_template_has_bounded_restart_and_shutdown(plane: str) -> None:
     parser = _load(plane)
     unit = parser["Unit"]
@@ -74,7 +77,7 @@ def test_runtime_template_has_bounded_restart_and_shutdown(plane: str) -> None:
     assert service["SuccessExitStatus"] == "0"
 
 
-@pytest.mark.parametrize("plane", PLANES)
+@pytest.mark.parametrize("plane", TEMPLATES)
 def test_runtime_template_is_hardened_without_shell_or_manifest_secrets(
     plane: str,
 ) -> None:
@@ -87,7 +90,11 @@ def test_runtime_template_is_hardened_without_shell_or_manifest_secrets(
     assert service["PrivateDevices"] == "true"
     assert service["ProtectSystem"] == "strict"
     assert service["ProtectHome"] == "read-only"
-    assert service["InaccessiblePaths"] == "/home/lighthouse/rquant/.env"
+    inaccessible = set(service["InaccessiblePaths"].split())
+    assert inaccessible == {
+        "/home/lighthouse/rquant/.env",
+        f"{CURRENT_ROOT}/secrets",
+    }
     assert service["ProtectKernelTunables"] == "true"
     assert service["ProtectKernelModules"] == "true"
     assert service["ProtectControlGroups"] == "true"
@@ -109,20 +116,20 @@ def test_runtime_template_is_hardened_without_shell_or_manifest_secrets(
         assert secret_name not in raw
 
 
-def test_only_live_instances_may_load_one_scoped_secret_file() -> None:
+def test_only_capability_live_instances_may_load_one_scoped_secret_file() -> None:
     live = _load("live")["Service"]
+    candidate = _load("candidate")["Service"]
     serving = _load("serving")["Service"]
     research = _load("research")["Service"]
 
     assert live["EnvironmentFile"] == f"{CURRENT_ROOT}/secrets/%i.env"
+    assert candidate["EnvironmentFile"] == ENVIRONMENT_FILE
     assert serving["EnvironmentFile"] == ENVIRONMENT_FILE
     assert research["EnvironmentFile"] == ENVIRONMENT_FILE
 
 
 def test_runtime_templates_only_write_their_plane_and_shared_control_root() -> None:
-    expected = {
-        plane: {CONTROL_ROOT, f"{RUNTIME_ROOT}/{plane}"} for plane in PLANES
-    }
+    expected = {plane: {CONTROL_ROOT, f"{RUNTIME_ROOT}/{plane}"} for plane in PLANES}
 
     for plane in PLANES:
         parser = _load(plane)
@@ -131,14 +138,41 @@ def test_runtime_templates_only_write_their_plane_and_shared_control_root() -> N
         assert f"{RUNTIME_ROOT}/rquant.duckdb" not in writable
         assert "/home/lighthouse/rquant/data/rquant.duckdb" not in writable
 
-    research_writable = set(
-        _load("research")["Service"]["ReadWritePaths"].split()
-    )
+    research_writable = set(_load("research")["Service"]["ReadWritePaths"].split())
     assert f"{RUNTIME_ROOT}/live" not in research_writable
     assert f"{RUNTIME_ROOT}/serving" not in research_writable
 
+    candidate_writable = set(_load("candidate")["Service"]["ReadWritePaths"].split())
+    assert candidate_writable == {
+        f"{CONTROL_ROOT}/candidates/%i",
+        f"{RUNTIME_ROOT}/live/candidates/%i",
+    }
+    assert f"{RUNTIME_ROOT}/live" not in candidate_writable
+
+
+def test_generic_live_instances_cannot_modify_candidate_authority() -> None:
+    live = _load("live")["Service"]
+    readonly = set(live["ReadOnlyPaths"].split())
+
+    assert readonly == {
+        f"{CONTROL_ROOT}/candidates",
+        f"{RUNTIME_ROOT}/live/candidates",
+    }
+    assert set(_load("candidate")["Service"]["ReadWritePaths"].split()) == {
+        f"{CONTROL_ROOT}/candidates/%i",
+        f"{RUNTIME_ROOT}/live/candidates/%i",
+    }
+
 
 @pytest.mark.parametrize("plane", PLANES)
+def test_non_candidate_instances_cannot_modify_candidate_heartbeats(
+    plane: str,
+) -> None:
+    readonly = set(_load(plane)["Service"]["ReadOnlyPaths"].split())
+    assert f"{CONTROL_ROOT}/candidates" in readonly
+
+
+@pytest.mark.parametrize("plane", TEMPLATES)
 def test_runtime_templates_are_install_only_not_auto_enabled(plane: str) -> None:
     parser = _load(plane)
     assert "Install" not in parser

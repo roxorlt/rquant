@@ -15,7 +15,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Annotated
 
-from pydantic import StringConstraints, field_serializer, field_validator
+from pydantic import StringConstraints, field_serializer, field_validator, model_validator
 
 from rquant.runtime_contracts import RuntimeContractModel, canonical_sha256
 from rquant.runtime_service_control import RuntimeServicePlane
@@ -30,12 +30,19 @@ InstanceName = Annotated[
     str,
     StringConstraints(pattern=r"^svc-[0-9a-f]{64}$"),
 ]
+SystemdUnitName = Annotated[
+    str,
+    StringConstraints(
+        pattern=r"^rquant-runtime-(?:live|serving|research|candidate)@svc-[0-9a-f]{64}\.service$"
+    ),
+]
 
 _COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 _GENERATION_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _LIVE_KINDS = frozenset(
     {
         RuntimeServiceKind.MARKET_MINUTE_SOURCE,
+        RuntimeServiceKind.CANDIDATE_PUBLISHER,
         RuntimeServiceKind.FEATURE_LIVE,
         RuntimeServiceKind.STRATEGY_LIVE,
         RuntimeServiceKind.SIGNAL_ROUTER,
@@ -71,6 +78,7 @@ _SECRET_CAPABILITY_KEYS = frozenset(
 )
 _WRITABLE_PATH_SETTINGS = {
     RuntimeServiceKind.MARKET_MINUTE_SOURCE: ("spool_root", "quota_path"),
+    RuntimeServiceKind.CANDIDATE_PUBLISHER: ("snapshot_root",),
     RuntimeServiceKind.FEATURE_LIVE: ("raw_spool_root", "feature_spool_root"),
     RuntimeServiceKind.STRATEGY_LIVE: (
         "feature_spool_root",
@@ -92,6 +100,9 @@ _WRITABLE_PATH_SETTINGS = {
     ),
     RuntimeServiceKind.SERVING_PUBLISHER: ("serving_root",),
 }
+_READONLY_PATH_SETTINGS = {
+    RuntimeServiceKind.CANDIDATE_PUBLISHER: ("candidate_input_path",),
+}
 
 
 class RuntimeDeploymentReceipt(RuntimeContractModel):
@@ -99,6 +110,7 @@ class RuntimeDeploymentReceipt(RuntimeContractModel):
     producer_commit: CommitSha
     generation_hash: GenerationHash
     instance_mapping: Mapping[str, InstanceName]
+    unit_mapping: Mapping[str, SystemdUnitName]
 
     @field_validator("instance_mapping")
     @classmethod
@@ -111,10 +123,36 @@ class RuntimeDeploymentReceipt(RuntimeContractModel):
     def serialize_instance_mapping(self, value: Mapping[str, str]) -> dict[str, str]:
         return dict(value)
 
+    @field_validator("unit_mapping")
+    @classmethod
+    def freeze_unit_mapping(cls, value: Mapping[str, str]) -> Mapping[str, str]:
+        if len(value) != len(set(value.values())):
+            raise ValueError("runtime systemd unit names must be unique")
+        return MappingProxyType(dict(sorted(value.items())))
+
+    @field_serializer("unit_mapping")
+    def serialize_unit_mapping(self, value: Mapping[str, str]) -> dict[str, str]:
+        return dict(value)
+
+    @model_validator(mode="after")
+    def validate_mapping_keys(self) -> RuntimeDeploymentReceipt:
+        if set(self.instance_mapping) != set(self.unit_mapping):
+            raise ValueError("runtime instance and unit mappings must have identical service ids")
+        return self
+
 
 def _instance_name(service_id: str) -> str:
     digest = hashlib.sha256(service_id.encode("utf-8")).hexdigest()
     return f"svc-{digest}"
+
+
+def _systemd_unit_name(manifest: RuntimeServiceManifest, instance: str) -> str:
+    template = (
+        "candidate"
+        if manifest.service_kind is RuntimeServiceKind.CANDIDATE_PUBLISHER
+        else manifest.plane.value
+    )
+    return f"rquant-runtime-{template}@{instance}.service"
 
 
 def _canonical_manifest(manifest: RuntimeServiceManifest) -> tuple[RuntimeServiceManifest, bytes]:
@@ -164,6 +202,22 @@ def _ensure_owned_directory(path: Path) -> None:
     path.chmod(0o700)
 
 
+def _ensure_owned_descendant(root: Path, path: Path) -> None:
+    relative = path.relative_to(root)
+    current = root
+    for component in relative.parts:
+        current /= component
+        current.mkdir(mode=0o700, exist_ok=True)
+        observed = current.lstat()
+        if (
+            not stat.S_ISDIR(observed.st_mode)
+            or stat.S_ISLNK(observed.st_mode)
+            or observed.st_uid != os.getuid()
+        ):
+            raise ValueError(f"runtime deployment directory is not safely owned: {current}")
+        current.chmod(0o700)
+
+
 def _require_owned_plane_path(
     value: object,
     *,
@@ -191,8 +245,43 @@ def _require_owned_plane_path(
         except FileNotFoundError:
             break
         if stat.S_ISLNK(observed.st_mode):
+            raise ValueError(f"runtime path setting {setting_name} contains a symlink: {current}")
+
+
+def _require_external_readonly_path(
+    value: object,
+    *,
+    runtime_root: Path,
+    plane: RuntimeServicePlane,
+    setting_name: str,
+) -> None:
+    if not isinstance(value, str):
+        raise ValueError(f"runtime path setting {setting_name} must be a string")
+    candidate = Path(value)
+    if not candidate.is_absolute() or candidate != Path(os.path.abspath(candidate)):
+        raise ValueError(f"runtime path setting {setting_name} must be absolute and normalized")
+    writable_roots = {
+        plane.value: runtime_root / plane.value,
+        "control": runtime_root / "control",
+    }
+    for root_name, writable_root in writable_roots.items():
+        try:
+            candidate.relative_to(writable_root)
+        except ValueError:
+            pass
+        else:
             raise ValueError(
-                f"runtime path setting {setting_name} contains a symlink: {current}"
+                f"read-only runtime path setting {setting_name} must not be inside "
+                f"the {root_name} writable owner root"
+            )
+        try:
+            writable_root.relative_to(candidate)
+        except ValueError:
+            pass
+        else:
+            raise ValueError(
+                f"read-only runtime path setting {setting_name} must not contain "
+                f"the {root_name} writable owner root"
             )
 
 
@@ -220,6 +309,26 @@ def _validate_manifest_authority(
             plane=manifest.plane,
             setting_name=setting_name,
         )
+    for setting_name in _READONLY_PATH_SETTINGS.get(manifest.service_kind, ()):
+        if setting_name not in manifest.settings:
+            continue
+        _require_external_readonly_path(
+            manifest.settings[setting_name],
+            runtime_root=runtime_root,
+            plane=manifest.plane,
+            setting_name=setting_name,
+        )
+    if manifest.service_kind is RuntimeServiceKind.CANDIDATE_PUBLISHER:
+        expected_root = (
+            runtime_root
+            / RuntimeServicePlane.LIVE.value
+            / "candidates"
+            / _instance_name(manifest.service_id)
+        )
+        if Path(str(manifest.settings.get("snapshot_root", ""))) != expected_root:
+            raise ValueError(
+                "candidate snapshot_root must equal its exclusive systemd instance root"
+            )
 
 
 def _validate_capability_value(name: str, value: object) -> str:
@@ -271,15 +380,16 @@ def _reject_plaintext_secrets(
             if name in _SECRET_CAPABILITY_KEYS
         )
         if any(value.encode("utf-8") in payload for value in secret_values):
-            raise ValueError(
-                f"runtime manifest {service_id} contains a plaintext capability value"
-            )
+            raise ValueError(f"runtime manifest {service_id} contains a plaintext capability value")
         parsed = json.loads(payload)
         settings = parsed.get("settings", {})
         encoded_settings = json.dumps(settings, ensure_ascii=True, sort_keys=True).upper()
-        if any(name in encoded_settings for name in _CAPABILITY_KEYS.get(
-            RuntimeServiceKind(parsed["service_kind"]), frozenset()
-        )):
+        if any(
+            name in encoded_settings
+            for name in _CAPABILITY_KEYS.get(
+                RuntimeServiceKind(parsed["service_kind"]), frozenset()
+            )
+        ):
             raise ValueError(
                 f"runtime manifest {service_id} contains a capability environment name"
             )
@@ -293,8 +403,7 @@ def _quote_environment_value(value: str) -> str:
 def _environment_payload(producer_commit: str, values: Mapping[str, str]) -> bytes:
     lines = [f"RQUANT_RUNTIME_COMMIT={producer_commit}"]
     lines.extend(
-        f"{name}={_quote_environment_value(value)}"
-        for name, value in sorted(values.items())
+        f"{name}={_quote_environment_value(value)}" for name, value in sorted(values.items())
     )
     return ("\n".join(lines) + "\n").encode("utf-8")
 
@@ -335,9 +444,7 @@ def _validate_existing_generation(
     ):
         raise ValueError("existing runtime generation is not a safely owned directory")
     actual_files = {
-        path.relative_to(generation).as_posix()
-        for path in generation.rglob("*")
-        if path.is_file()
+        path.relative_to(generation).as_posix() for path in generation.rglob("*") if path.is_file()
     }
     if actual_files != set(expected_files):
         raise ValueError("existing runtime generation contents do not match bundle")
@@ -423,7 +530,13 @@ def install_runtime_deployment_bundle(
     _reject_plaintext_secrets(payload_by_service, capabilities)
 
     instance_mapping = {
-        manifest.service_id: _instance_name(manifest.service_id)
+        manifest.service_id: _instance_name(manifest.service_id) for manifest in validated_manifests
+    }
+    unit_mapping = {
+        manifest.service_id: _systemd_unit_name(
+            manifest,
+            instance_mapping[manifest.service_id],
+        )
         for manifest in validated_manifests
     }
     files: dict[str, bytes] = {
@@ -432,7 +545,10 @@ def install_runtime_deployment_bundle(
     for manifest in validated_manifests:
         instance = instance_mapping[manifest.service_id]
         files[f"manifests/{instance}.json"] = payload_by_service[manifest.service_id]
-        if manifest.plane is RuntimeServicePlane.LIVE:
+        if (
+            manifest.plane is RuntimeServicePlane.LIVE
+            and manifest.service_kind is not RuntimeServiceKind.CANDIDATE_PUBLISHER
+        ):
             files[f"secrets/{instance}.env"] = _environment_payload(
                 producer_commit,
                 capabilities[manifest.service_id],
@@ -445,10 +561,17 @@ def install_runtime_deployment_bundle(
                 for relative, payload in sorted(files.items())
             },
             "instance_mapping": instance_mapping,
+            "unit_mapping": unit_mapping,
         }
     )
 
     _ensure_owned_directory(root)
+    for manifest in validated_manifests:
+        if manifest.service_kind is not RuntimeServiceKind.CANDIDATE_PUBLISHER:
+            continue
+        instance = instance_mapping[manifest.service_id]
+        _ensure_owned_descendant(root, Path(str(manifest.settings["snapshot_root"])))
+        _ensure_owned_descendant(root, root / "control" / "candidates" / instance)
     generations = root / "generations"
     _ensure_owned_directory(generations)
     target = generations / generation_hash
@@ -490,6 +613,7 @@ def install_runtime_deployment_bundle(
         producer_commit=producer_commit,
         generation_hash=generation_hash,
         instance_mapping=instance_mapping,
+        unit_mapping=unit_mapping,
     )
 
 

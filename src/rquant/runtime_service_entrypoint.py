@@ -58,6 +58,7 @@ def _thaw_setting(value: object) -> object:
 
 class RuntimeServiceKind(StrEnum):
     MARKET_MINUTE_SOURCE = "market_minute_source"
+    CANDIDATE_PUBLISHER = "candidate_publisher"
     FEATURE_LIVE = "feature_live"
     STRATEGY_LIVE = "strategy_live"
     SIGNAL_ROUTER = "signal_router"
@@ -183,9 +184,7 @@ def load_runtime_service_manifest(
         raise ValueError("expected commit must be a full lowercase Git SHA")
     manifest_path = Path(os.path.abspath(path))
     try:
-        manifest = RuntimeServiceManifest.model_validate_json(
-            _read_owned_manifest(manifest_path)
-        )
+        manifest = RuntimeServiceManifest.model_validate_json(_read_owned_manifest(manifest_path))
     except ValueError as exc:
         if str(exc).startswith("runtime service manifest"):
             raise
