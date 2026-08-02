@@ -21,6 +21,7 @@ from rquant.runtime_notification_providers import (
     ExistingClientNotificationTransport,
     NotificationTransportResult,
     RecipientNotificationCapabilities,
+    build_environment_notification_provider_loader,
     build_notification_provider_loader,
     format_signal_notification,
 )
@@ -178,9 +179,7 @@ def test_missing_recipient_is_confirmed_failure_without_transport_call() -> None
         ConfirmedDeliveryFailureError,
         match="recipient is not allowed for pushdeer",
     ) as captured:
-        providers[DeliveryChannel.PUSHDEER].deliver(
-            _delivery(recipient_id="unknown")
-        )
+        providers[DeliveryChannel.PUSHDEER].deliver(_delivery(recipient_id="unknown"))
 
     assert transport.calls == []
     assert "PDU_admin_secret" not in str(captured.value)
@@ -235,16 +234,12 @@ def test_provider_loader_only_returns_channels_with_capabilities() -> None:
 
 def test_capability_repr_and_validation_never_expose_secrets() -> None:
     secret = "PDU_highly_sensitive"
-    capabilities = RecipientNotificationCapabilities(
-        {DeliveryChannel.PUSHDEER: {"admin": secret}}
-    )
+    capabilities = RecipientNotificationCapabilities({DeliveryChannel.PUSHDEER: {"admin": secret}})
 
     assert secret not in repr(capabilities)
     assert capabilities.channels == (DeliveryChannel.PUSHDEER,)
     with pytest.raises(ValueError, match="credential must be nonempty") as captured:
-        RecipientNotificationCapabilities(
-            {DeliveryChannel.PUSHDEER: {"admin": " "}}
-        )
+        RecipientNotificationCapabilities({DeliveryChannel.PUSHDEER: {"admin": " "}})
     assert secret not in str(captured.value)
 
 
@@ -317,12 +312,129 @@ def test_existing_pushplus_client_receives_only_the_selected_token() -> None:
         transport,
     )[DeliveryChannel.PUSHPLUS]
 
-    provider.deliver(
-        _delivery(recipient_id="analyst", channel=DeliveryChannel.PUSHPLUS)
-    )
+    provider.deliver(_delivery(recipient_id="analyst", channel=DeliveryChannel.PUSHPLUS))
 
     assert len(created) == 1
     assert created[0].keys == ["analyst_token"]
+
+
+def test_runtime_requires_one_device_recipient_per_pushdeer_key() -> None:
+    transport = RecordingTransport(NotificationTransportResult.accepted())
+    loader = build_environment_notification_provider_loader(
+        environment={
+            "PUSHDEER_KEYS": "first-key,second-key",
+            "PUSHDEER_RECIPIENT_IDS": "admin",
+            "PUSHPLUS_TOKENS": "plus-token",
+            "PUSHPLUS_RECIPIENT_IDS": "collaborator",
+            "PUSHDEER_ENDPOINT": "https://pushdeer.invalid/send",
+            "PUSHPLUS_ENDPOINT": "https://pushplus.invalid/send",
+        },
+        transport=transport,
+    )
+
+    with pytest.raises(ValueError, match="one-to-one|device"):
+        loader()
+
+
+def test_environment_loader_keeps_legacy_one_recipient_per_key_mapping() -> None:
+    transport = RecordingTransport(NotificationTransportResult.accepted())
+    loader = build_environment_notification_provider_loader(
+        environment={
+            "PUSHDEER_KEYS": "first-key,second-key",
+            "PUSHDEER_RECIPIENT_IDS": "admin.iphone,admin.mac",
+        },
+        transport=transport,
+    )
+
+    providers = loader()
+    providers[DeliveryChannel.PUSHDEER].deliver(_delivery(recipient_id="admin.mac"))
+
+    assert transport.calls[0]["credential"] == "second-key"
+
+
+def test_missing_recipient_ids_exposes_deterministic_migration_preflight() -> None:
+    transport = RecordingTransport(NotificationTransportResult.accepted())
+    loader = build_environment_notification_provider_loader(
+        environment={"PUSHDEER_KEYS": "first-key,second-key"},
+        transport=transport,
+    )
+
+    providers = loader()
+
+    assert providers.recipient_preflight.status == "migration_required"  # type: ignore[attr-defined]
+    assert providers.recipient_preflight.inferred_channels == (  # type: ignore[attr-defined]
+        DeliveryChannel.PUSHDEER,
+    )
+    assert providers.recipient_aliases == {  # type: ignore[attr-defined]
+        DeliveryChannel.PUSHDEER: {
+            "admin": ("admin.device-01", "admin.device-02"),
+        }
+    }
+    providers[DeliveryChannel.PUSHDEER].deliver(_delivery(recipient_id="admin.device-02"))
+    assert transport.calls[0]["credential"] == "second-key"
+
+
+@pytest.mark.parametrize(
+    "environment",
+    (
+        {
+            "PUSHDEER_KEYS": "first,second",
+            "PUSHDEER_RECIPIENT_IDS": "admin,observer,extra",
+        },
+        {
+            "PUSHDEER_KEYS": "first",
+            "PUSHDEER_ENDPOINT": "http://pushdeer.invalid/send",
+        },
+    ),
+)
+def test_environment_loader_rejects_ambiguous_or_insecure_delivery_config(
+    environment: dict[str, str],
+) -> None:
+    loader = build_environment_notification_provider_loader(environment=environment)
+
+    with pytest.raises(ValueError, match="recipient|HTTPS"):
+        loader()
+
+
+def test_explicit_transport_can_exercise_http_endpoint_without_enabling_production_http() -> None:
+    transport = RecordingTransport(NotificationTransportResult.accepted())
+    loader = build_environment_notification_provider_loader(
+        environment={
+            "PUSHDEER_KEYS": "test-key",
+            "PUSHDEER_ENDPOINT": "http://127.0.0.1:9999/send",
+        },
+        transport=transport,
+    )
+
+    providers = loader()
+    providers[DeliveryChannel.PUSHDEER].deliver(_delivery())
+
+    assert transport.calls[0]["endpoint"] == "http://127.0.0.1:9999/send"
+
+
+def test_real_transport_rejects_http_even_when_client_factory_is_custom() -> None:
+    transport = ExistingClientNotificationTransport(
+        pushdeer_client_factory=lambda keys, endpoint: FakePushDeerClient(
+            keys,
+            endpoint,
+            result=[(True, None)],
+        )
+    )
+    provider = build_notification_provider_loader(
+        capability_loader=lambda: {DeliveryChannel.PUSHDEER: {"admin": "test-key"}},
+        endpoints={DeliveryChannel.PUSHDEER: "http://pushdeer.invalid/send"},
+        transport=transport,
+    )()[DeliveryChannel.PUSHDEER]
+
+    with pytest.raises(UnknownDeliveryOutcomeError):
+        provider.deliver(_delivery())
+
+
+def test_environment_loader_fails_before_claim_when_no_channel_is_configured() -> None:
+    loader = build_environment_notification_provider_loader(environment={})
+
+    with pytest.raises(RuntimeError, match="notification capability"):
+        loader()
 
 
 def test_wrong_channel_is_rejected_before_transport() -> None:

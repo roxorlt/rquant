@@ -127,6 +127,55 @@ def test_buy_fills_atomically_and_accounts_for_minimum_commission(
     assert snapshot.nav == Decimal("100195.00")
 
 
+def test_account_authority_revision_is_persistent_and_not_driven_by_wall_clock(
+    tmp_path: Path,
+    cost_policy: BrokerCostPolicy,
+) -> None:
+    path = tmp_path / "paper.sqlite3"
+    store = _store(path, cost_policy)
+
+    initial = store.account_authority_snapshot(
+        as_of=BUY_TIME,
+        market_prices={},
+        producer_commit=PRODUCER_COMMIT,
+    )
+    unchanged = store.account_authority_snapshot(
+        as_of=BUY_TIME + timedelta(seconds=5),
+        market_prices={},
+        producer_commit=PRODUCER_COMMIT,
+    )
+    store.submit_intent(
+        _intent(),
+        decision_time=BUY_TIME + timedelta(seconds=10),
+        trade_date=BUY_DATE,
+        quote=_quote("10.00"),
+    )
+    changed = store.account_authority_snapshot(
+        as_of=BUY_TIME + timedelta(seconds=10),
+        market_prices={"600000.SH": Decimal("10.00")},
+        producer_commit=PRODUCER_COMMIT,
+    )
+    reopened = _store(path, cost_policy).account_authority_snapshot(
+        as_of=BUY_TIME + timedelta(seconds=15),
+        market_prices={"600000.SH": Decimal("10.00")},
+        producer_commit=PRODUCER_COMMIT,
+    )
+    upgraded = _store(path, cost_policy).account_authority_snapshot(
+        as_of=BUY_TIME + timedelta(seconds=20),
+        market_prices={"600000.SH": Decimal("10.00")},
+        producer_commit="d" * 40,
+    )
+
+    assert initial.revision == 1
+    assert unchanged == initial
+    assert changed.revision == 2
+    assert changed.snapshot.holdings[0].quantity == 1_000
+    assert reopened == changed
+    assert upgraded.revision == 3
+    assert upgraded.snapshot.holdings == changed.snapshot.holdings
+    assert upgraded.producer_commit == "d" * 40
+
+
 def test_retry_after_process_reopen_is_idempotent(
     tmp_path: Path, cost_policy: BrokerCostPolicy
 ) -> None:

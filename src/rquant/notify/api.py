@@ -25,6 +25,17 @@ Scene = Literal[
 
 # 只推 admin（PushDeer）不推 PushPlus 的场景：爆量确认每分钟批次高频，只发刘彤
 _PUSHDEER_ONLY_SCENES: frozenset[str] = frozenset({"surge_watch"})
+_NORMALIZED_ERROR_CODES: frozenset[str] = frozenset(
+    {"provider_rejected", "transport_error", "invalid_response"}
+)
+
+
+def _normalized_error_code(success: bool, error: str | None) -> str | None:
+    if success:
+        return None
+    if error in _NORMALIZED_ERROR_CODES:
+        return error
+    return "delivery_failed"
 
 
 def _scene_enabled(scene: str) -> bool:
@@ -75,11 +86,22 @@ def notify(scene: Scene, **kwargs) -> None:
     )
     try:
         results = pushdeer.push(title, body)
-        for key, (success, err) in zip(settings.pushdeer_key_list, results, strict=False):
+        for recipient_id, (success, err) in zip(
+            settings.pushdeer_recipient_id_list,
+            results,
+            strict=False,
+        ):
             delivered = delivered or success
-            _log_notification(scene, "pushdeer", key[:8], success, err, title)
-    except Exception as e:
-        logger.error(f"通知 [{scene}] PushDeer 推送失败: {e}")
+            _log_notification(
+                scene,
+                "pushdeer",
+                recipient_id,
+                success,
+                _normalized_error_code(success, err),
+                title,
+            )
+    except Exception:
+        logger.error(f"通知 [{scene}] PushDeer 推送失败: transport_error")
 
     if scene in _PUSHDEER_ONLY_SCENES:
         return  # 只 admin，跳过 PushPlus
@@ -90,11 +112,22 @@ def notify(scene: Scene, **kwargs) -> None:
     )
     try:
         results = pushplus.push(title, body)
-        for token, (success, err) in zip(settings.pushplus_token_list, results, strict=False):
+        for recipient_id, (success, err) in zip(
+            settings.pushplus_recipient_id_list,
+            results,
+            strict=False,
+        ):
             delivered = delivered or success
-            _log_notification(scene, "pushplus", token[:8], success, err, title)
-    except Exception as e:
-        logger.error(f"通知 [{scene}] PushPlus 推送失败: {e}")
+            _log_notification(
+                scene,
+                "pushplus",
+                recipient_id,
+                success,
+                _normalized_error_code(success, err),
+                title,
+            )
+    except Exception:
+        logger.error(f"通知 [{scene}] PushPlus 推送失败: transport_error")
 
     if gate is not None and lease is not None:
         try:

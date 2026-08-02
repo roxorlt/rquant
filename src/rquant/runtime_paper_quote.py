@@ -6,16 +6,16 @@ import hashlib
 import json
 import os
 import stat
-from datetime import date, datetime
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from io import BytesIO
 from pathlib import Path
-from typing import Annotated, Self
+from typing import Annotated, Literal, Self
 from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
-from pydantic import StringConstraints, field_validator, model_validator
+from pydantic import Field, StrictInt, StringConstraints, field_validator, model_validator
 
 from rquant.live_contracts import (
     BatchEnvelope,
@@ -25,15 +25,15 @@ from rquant.live_contracts import (
 )
 from rquant.market_minute_gateway import MarketMinuteGateway, MarketMinuteValidationError
 from rquant.paper_broker import BrokerExecutionContext
+from rquant.paper_execution_constraints import PaperExecutionConstraintAuthority
 from rquant.paper_signal_worker import PaperQuoteSnapshot
 from rquant.runtime_contracts import RuntimeContractModel, normalize_aware_utc
 from rquant.signal_contracts import SignalAction, SignalEnvelope
 
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+CommitSha = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{40}$")]
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
-_DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(
-    os, "O_NOFOLLOW", 0
-)
+_DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
 _FILE_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
 
 
@@ -65,8 +65,18 @@ class PaperQuoteResolverConfig(RuntimeContractModel):
     raw_spool_root: Path
     trade_calendar_path: Path
     trade_calendar_sha256: Sha256
+    execution_constraint_root: Path
+    expected_producer_commit: CommitSha
+    timestamp_semantics: Literal["bar_end", "provider_snapshot"] = "provider_snapshot"
+    quote_max_age_seconds: StrictInt = Field(default=90, gt=0, le=300)
+    max_finalize_scan_batches: StrictInt = Field(default=32, gt=0, le=120)
+    max_visible_scan_batches: StrictInt = Field(default=120, gt=0, le=1_000)
 
-    @field_validator("raw_spool_root", "trade_calendar_path")
+    @field_validator(
+        "raw_spool_root",
+        "trade_calendar_path",
+        "execution_constraint_root",
+    )
     @classmethod
     def require_absolute_normal_path(cls, value: Path) -> Path:
         if not value.is_absolute():
@@ -108,9 +118,7 @@ def _open_directory_no_symlinks(path: Path) -> int:
                     f"paper quote directory is unavailable: {traversed}"
                 ) from exc
             if stat.S_ISLNK(before.st_mode):
-                raise PaperQuoteIntegrityError(
-                    f"paper quote path contains a symlink: {traversed}"
-                )
+                raise PaperQuoteIntegrityError(f"paper quote path contains a symlink: {traversed}")
             if not stat.S_ISDIR(before.st_mode):
                 raise PaperQuoteIntegrityError(
                     f"paper quote path component is not a directory: {traversed}"
@@ -179,6 +187,20 @@ def _strict_bool(value: object) -> bool:
     raise PaperTradeCalendarError("SSE calendar is_open values must be booleans")
 
 
+def _next_trading_minute(value: datetime) -> datetime | None:
+    local = normalize_aware_utc(value).astimezone(_SHANGHAI)
+    if local.second != 0 or local.microsecond != 0:
+        raise PaperQuoteIntegrityError("market-minute timestamp is not minute-aligned")
+    clock = local.time().replace(tzinfo=None)
+    if time(9, 30) <= clock < time(11, 30):
+        return (local + timedelta(minutes=1)).astimezone(local.tzinfo)
+    if clock == time(11, 30):
+        return local.replace(hour=13, minute=0)
+    if time(13, 0) <= clock < time(15, 0):
+        return (local + timedelta(minutes=1)).astimezone(local.tzinfo)
+    return None
+
+
 def _calendar_frame(path: Path, content: bytes) -> pd.DataFrame:
     try:
         if path.suffix.lower() == ".parquet":
@@ -232,6 +254,10 @@ class PaperPitQuoteResolver:
             config.trade_calendar_path,
             config.trade_calendar_sha256,
         )
+        self._execution_constraints = PaperExecutionConstraintAuthority(
+            root=config.execution_constraint_root,
+            expected_producer_commit=config.expected_producer_commit,
+        )
 
     def __call__(
         self,
@@ -240,6 +266,20 @@ class PaperPitQuoteResolver:
     ) -> PaperQuoteSnapshot:
         return self.resolve(signal, observed_at=observed_at)
 
+    def trade_date_at(self, observed_at: datetime) -> date:
+        observed = normalize_aware_utc(observed_at)
+        local_date = observed.astimezone(_SHANGHAI).date()
+        if local_date not in self._sse_open_dates:
+            raise PaperTradeCalendarError(f"{local_date.isoformat()} is not an SSE open day")
+        return local_date
+
+    def constraint_generation_at(self, observed_at: datetime) -> str:
+        """Return the immutable constraint generation visible at the PIT cutoff."""
+
+        return self._execution_constraints.load(
+            observed_at=normalize_aware_utc(observed_at)
+        ).content_hash
+
     def resolve(
         self,
         signal: SignalEnvelope,
@@ -247,46 +287,153 @@ class PaperPitQuoteResolver:
         observed_at: datetime,
     ) -> PaperQuoteSnapshot:
         observed = normalize_aware_utc(observed_at)
+        observed_session = self._require_trade_session(observed)
         envelope, payload = self._latest_visible_batch(observed)
         if envelope.quality_status is BatchQualityStatus.STALE:
-            raise PaperQuoteStaleError(
-                f"market-minute sequence {envelope.sequence} is STALE"
-            )
+            raise PaperQuoteStaleError(f"market-minute sequence {envelope.sequence} is STALE")
         if envelope.quality_status is not BatchQualityStatus.PUBLISHED:
             raise PaperQuoteUnavailableError(
                 "latest visible market-minute batch is not published: "
                 f"{envelope.quality_status.value}"
             )
-        frame = self._validated_frame(envelope, payload)
-        visible = frame.loc[
-            (frame["ts_code"] == signal.candidate_id)
-            & (frame["trade_time"] <= observed)
-        ]
-        if visible.empty:
-            raise PaperQuoteCandidateMissingError(
-                f"{signal.candidate_id} has no visible minute in market-minute "
-                f"sequence {envelope.sequence}"
+        row = self._latest_candidate_row(
+            envelope,
+            payload,
+            candidate_id=signal.candidate_id,
+            observed_at=observed,
+        )
+        quote_available_at = envelope.available_at
+        if self.config.timestamp_semantics == "provider_snapshot":
+            row, finalized_envelope = self._finalized_provider_snapshot(
+                candidate_id=signal.candidate_id,
+                advancing_envelope=envelope,
+                advancing_row=row,
+                observed_at=observed,
             )
-        row = visible.sort_values("trade_time", kind="stable").iloc[-1]
+            producer_commit = finalized_envelope.producer_commit
+        else:
+            producer_commit = envelope.producer_commit
         event_time = row["trade_time"].to_pydatetime()
-        if event_time > envelope.available_at:
+        if event_time > quote_available_at:
             raise PaperQuoteIntegrityError(
                 "market-minute row event time exceeds evidence batch available_at"
+            )
+        event_session = self._require_trade_session(event_time)
+        if event_session != observed_session:
+            raise PaperTradeCalendarError(
+                "paper quote cannot cross a trade date or continuous session"
+            )
+        age = observed - event_time
+        if age < timedelta(0):
+            raise PaperQuoteIntegrityError("paper quote event time is in the future")
+        if age > timedelta(seconds=self.config.quote_max_age_seconds):
+            raise PaperQuoteStaleError(
+                f"paper quote age exceeds {self.config.quote_max_age_seconds} seconds"
             )
         acquisition_date = (
             self._next_sse_open_day(event_time.astimezone(_SHANGHAI).date())
             if signal.action is SignalAction.B_INTENT
             else None
         )
+        constraint = self._execution_constraints.resolve(
+            ts_code=signal.candidate_id,
+            trade_date=observed_session[0],
+            observed_at=observed,
+            action=signal.action,
+        )
+        quote_available_at = max(quote_available_at, constraint.available_at)
         return PaperQuoteSnapshot(
             ts_code=signal.candidate_id,
             event_time=event_time,
-            available_at=envelope.available_at,
+            available_at=quote_available_at,
             context=BrokerExecutionContext(
                 executable_price=Decimal(str(row["close"])),
                 acquisition_available_date=acquisition_date,
+                suspended=constraint.suspended,
+                limit_locked=constraint.limit_locked,
+                risk_rejected=constraint.risk_rejected,
             ),
-            producer_commit=envelope.producer_commit,
+            producer_commit=producer_commit,
+            constraint_snapshot_id=constraint.constraint_content_hash,
+            constraint_batch_id=constraint.batch_content_hash,
+            constraint_authority_sha256=constraint.authority_file_sha256,
+            constraint_source_snapshot_ids=constraint.source_snapshot_ids,
+        )
+
+    def _require_trade_session(self, observed_at: datetime) -> tuple[date, str]:
+        local = normalize_aware_utc(observed_at).astimezone(_SHANGHAI)
+        if local.date() not in self._sse_open_dates:
+            raise PaperTradeCalendarError(f"{local.date().isoformat()} is not an SSE open day")
+        clock = local.time().replace(tzinfo=None)
+        if time(9, 30) <= clock <= time(11, 30):
+            return local.date(), "morning"
+        if time(13, 0) <= clock <= time(15, 0):
+            return local.date(), "afternoon"
+        raise PaperTradeCalendarError("observation time is outside an SSE trading session")
+
+    def _latest_candidate_row(
+        self,
+        envelope: BatchEnvelope,
+        payload: bytes,
+        *,
+        candidate_id: str,
+        observed_at: datetime,
+    ) -> pd.Series:
+        frame = self._validated_frame(envelope, payload)
+        visible = frame.loc[
+            (frame["ts_code"] == candidate_id) & (frame["trade_time"] <= observed_at)
+        ]
+        if visible.empty:
+            raise PaperQuoteCandidateMissingError(
+                f"{candidate_id} has no visible minute in market-minute "
+                f"sequence {envelope.sequence}"
+            )
+        return visible.sort_values("trade_time", kind="stable").iloc[-1]
+
+    def _finalized_provider_snapshot(
+        self,
+        *,
+        candidate_id: str,
+        advancing_envelope: BatchEnvelope,
+        advancing_row: pd.Series,
+        observed_at: datetime,
+    ) -> tuple[pd.Series, BatchEnvelope]:
+        advancing_time = advancing_row["trade_time"].to_pydatetime()
+        lower_bound = max(
+            -1,
+            advancing_envelope.sequence - self.config.max_finalize_scan_batches - 1,
+        )
+        for sequence in range(advancing_envelope.sequence - 1, lower_bound, -1):
+            envelope, payload = self._load_batch(sequence)
+            if envelope.available_at > observed_at:
+                continue
+            if envelope.quality_status is BatchQualityStatus.STALE:
+                raise PaperQuoteStaleError(f"market-minute sequence {envelope.sequence} is STALE")
+            if envelope.quality_status is not BatchQualityStatus.PUBLISHED:
+                raise PaperQuoteUnavailableError(
+                    "provider snapshot finalization crossed an unpublished batch"
+                )
+            try:
+                row = self._latest_candidate_row(
+                    envelope,
+                    payload,
+                    candidate_id=candidate_id,
+                    observed_at=observed_at,
+                )
+            except PaperQuoteCandidateMissingError:
+                continue
+            event_time = row["trade_time"].to_pydatetime()
+            if event_time < advancing_time:
+                expected_advance = _next_trading_minute(event_time)
+                if expected_advance == advancing_time.astimezone(_SHANGHAI):
+                    return row, envelope
+                continue
+            if event_time > advancing_time:
+                raise PaperQuoteIntegrityError(
+                    "provider snapshot timestamp regressed across sequences"
+                )
+        raise PaperQuoteUnavailableError(
+            "provider snapshot timestamp did not advance within the bounded finalize scan"
         )
 
     def _latest_visible_batch(self, observed_at: datetime) -> tuple[BatchEnvelope, bytes]:
@@ -308,29 +455,9 @@ class PaperPitQuoteResolver:
             raise PaperQuoteIntegrityError("market-minute current pointer channel mismatch")
 
         selected: BatchEnvelope | None = None
-        for sequence in range(pointer.sequence, -1, -1):
-            manifest_path = (
-                root
-                / "batches"
-                / LiveChannel.MARKET_MINUTE.value
-                / f"{sequence:020d}.json"
-            )
-            try:
-                envelope = BatchEnvelope.model_validate_json(
-                    _read_regular_file_no_symlinks(manifest_path)
-                )
-            except ValueError as exc:
-                raise PaperQuoteIntegrityError(
-                    f"market-minute manifest {sequence} is invalid"
-                ) from exc
-            if envelope.channel is not LiveChannel.MARKET_MINUTE:
-                raise PaperQuoteIntegrityError(
-                    f"market-minute manifest {sequence} channel mismatch"
-                )
-            if envelope.sequence != sequence:
-                raise PaperQuoteIntegrityError(
-                    f"market-minute manifest sequence mismatch at {sequence}"
-                )
+        lower_bound = max(-1, pointer.sequence - self.config.max_visible_scan_batches)
+        for sequence in range(pointer.sequence, lower_bound, -1):
+            envelope, _payload = self._load_batch(sequence, load_payload=False)
             if sequence == pointer.sequence and (
                 envelope.batch_id != pointer.batch_id
                 or envelope.revision != pointer.revision
@@ -345,25 +472,55 @@ class PaperPitQuoteResolver:
                 break
         if selected is None:
             raise PaperQuoteUnavailableError(
-                f"no market-minute batch is available at {observed_at.isoformat()}"
+                "no market-minute batch is available within the bounded visible scan at "
+                f"{observed_at.isoformat()}"
             )
+        return selected, self._load_payload(selected)
+
+    def _load_batch(
+        self,
+        sequence: int,
+        *,
+        load_payload: bool = True,
+    ) -> tuple[BatchEnvelope, bytes]:
+        root = self.config.raw_spool_root
+        manifest_path = root / "batches" / LiveChannel.MARKET_MINUTE.value / f"{sequence:020d}.json"
+        try:
+            envelope = BatchEnvelope.model_validate_json(
+                _read_regular_file_no_symlinks(manifest_path)
+            )
+        except ValueError as exc:
+            raise PaperQuoteIntegrityError(f"market-minute manifest {sequence} is invalid") from exc
+        if envelope.channel is not LiveChannel.MARKET_MINUTE:
+            raise PaperQuoteIntegrityError(f"market-minute manifest {sequence} channel mismatch")
+        if envelope.producer_commit != self.config.expected_producer_commit:
+            raise PaperQuoteIntegrityError(
+                f"market-minute manifest {sequence} producer commit mismatch"
+            )
+        if envelope.sequence != sequence:
+            raise PaperQuoteIntegrityError(
+                f"market-minute manifest sequence mismatch at {sequence}"
+            )
+        if not load_payload:
+            return envelope, b""
+        return envelope, self._load_payload(envelope)
+
+    def _load_payload(self, envelope: BatchEnvelope) -> bytes:
         payload_path = (
-            root
+            self.config.raw_spool_root
             / "batches"
             / LiveChannel.MARKET_MINUTE.value
-            / f"{selected.sequence:020d}.payload"
+            / f"{envelope.sequence:020d}.payload"
         )
         payload = _read_regular_file_no_symlinks(payload_path)
-        if hashlib.sha256(payload).hexdigest() != selected.content_sha256:
+        if hashlib.sha256(payload).hexdigest() != envelope.content_sha256:
             raise PaperQuoteIntegrityError("market-minute payload content hash mismatch")
-        return selected, payload
+        return payload
 
     @staticmethod
     def _validated_frame(envelope: BatchEnvelope, payload: bytes) -> pd.DataFrame:
         try:
-            frame = MarketMinuteGateway.normalize_frame(
-                MarketMinuteGateway.decode_payload(payload)
-            )
+            frame = MarketMinuteGateway.normalize_frame(MarketMinuteGateway.decode_payload(payload))
         except (MarketMinuteValidationError, OSError, TypeError, ValueError) as exc:
             raise PaperQuoteIntegrityError("market-minute payload cannot be decoded") from exc
         if len(frame) != envelope.row_count:
@@ -371,10 +528,7 @@ class PaperPitQuoteResolver:
         if not frame.empty:
             event_start = frame["trade_time"].min().to_pydatetime()
             event_end = frame["trade_time"].max().to_pydatetime()
-            if (
-                event_start != envelope.event_time_start
-                or event_end != envelope.event_time_end
-            ):
+            if event_start != envelope.event_time_start or event_end != envelope.event_time_end:
                 raise PaperQuoteIntegrityError("market-minute payload event range mismatch")
         return frame
 

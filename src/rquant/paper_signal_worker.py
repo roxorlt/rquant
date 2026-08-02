@@ -76,6 +76,14 @@ class PaperSignalPolicy(RuntimeContractModel):
 
     @property
     def fingerprint(self) -> str:
+        return self.semantic_fingerprint
+
+    @property
+    def semantic_fingerprint(self) -> str:
+        return canonical_sha256(self.model_dump(mode="json", exclude={"producer_commit"}))
+
+    @property
+    def provenance_fingerprint(self) -> str:
         return canonical_sha256(self.model_dump(mode="json"))
 
 
@@ -86,11 +94,48 @@ class PaperQuoteSnapshot(RuntimeContractModel):
     available_at: AwareUtcDatetime
     context: BrokerExecutionContext
     producer_commit: CommitSha
+    constraint_snapshot_id: Sha256 | None = None
+    constraint_batch_id: Sha256 | None = None
+    constraint_authority_sha256: Sha256 | None = None
+    constraint_source_snapshot_ids: Mapping[str, Sha256] = Field(default_factory=dict)
+
+    @field_validator("constraint_source_snapshot_ids")
+    @classmethod
+    def freeze_constraint_source_snapshot_ids(
+        cls,
+        value: Mapping[str, str],
+    ) -> Mapping[str, str]:
+        if any(not key for key in value):
+            raise ValueError("constraint source snapshot ids cannot have empty keys")
+        return MappingProxyType(dict(sorted(value.items())))
+
+    @field_serializer("constraint_source_snapshot_ids")
+    def serialize_constraint_source_snapshot_ids(
+        self,
+        value: Mapping[str, str],
+    ) -> dict[str, str]:
+        return dict(value)
 
     @model_validator(mode="after")
     def validate_quote(self) -> Self:
         if self.event_time > self.available_at:
             raise ValueError("quote event_time cannot exceed available_at")
+        authority_bound = (
+            self.constraint_snapshot_id,
+            self.constraint_batch_id,
+            self.constraint_authority_sha256,
+        )
+        if any(value is not None for value in authority_bound) != all(
+            value is not None for value in authority_bound
+        ):
+            raise ValueError("constraint authority evidence must be configured together")
+        if not all(value is not None for value in authority_bound):
+            if self.constraint_source_snapshot_ids:
+                raise ValueError(
+                    "constraint source snapshots require constraint authority evidence"
+                )
+        elif not self.constraint_source_snapshot_ids:
+            raise ValueError("constraint authority evidence requires source snapshots")
         expected = canonical_sha256(self.model_dump(mode="python", exclude={"snapshot_id"}))
         if self.snapshot_id is None:
             object.__setattr__(self, "snapshot_id", expected)
@@ -225,12 +270,23 @@ class PaperSignalQueueStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_paper_signal_due
                 ON paper_signal_queue(status, due_at, signal_id);
+                CREATE TABLE IF NOT EXISTS paper_signal_prepare_history (
+                    signal_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL CHECK(revision >= 1),
+                    quote_json TEXT NOT NULL,
+                    intent_json TEXT NOT NULL,
+                    replaced_at TEXT NOT NULL,
+                    PRIMARY KEY(signal_id, revision)
+                );
                 """
             )
             connection.execute("BEGIN IMMEDIATE")
             try:
                 row = connection.execute(
-                    "SELECT policy_fingerprint FROM paper_signal_metadata WHERE singleton = 1"
+                    """
+                    SELECT policy_fingerprint, policy_json
+                    FROM paper_signal_metadata WHERE singleton = 1
+                    """
                 ).fetchone()
                 if row is None:
                     connection.execute(
@@ -241,8 +297,31 @@ class PaperSignalQueueStore:
                         """,
                         (self.policy.fingerprint, _json(self.policy)),
                     )
-                elif row["policy_fingerprint"] != self.policy.fingerprint:
-                    raise ValueError("paper signal policy does not match persisted queue policy")
+                else:
+                    try:
+                        persisted_policy = PaperSignalPolicy.model_validate_json(row["policy_json"])
+                    except (ValueError, TypeError) as exc:
+                        raise ValueError(
+                            "paper signal policy does not match persisted queue policy"
+                        ) from exc
+                    stored_fingerprint = str(row["policy_fingerprint"])
+                    semantics_match = (
+                        persisted_policy.semantic_fingerprint == self.policy.semantic_fingerprint
+                    )
+                    is_current = stored_fingerprint == self.policy.semantic_fingerprint
+                    is_legacy = stored_fingerprint == persisted_policy.provenance_fingerprint
+                    if not semantics_match or not (is_current or is_legacy):
+                        raise ValueError(
+                            "paper signal policy does not match persisted queue policy"
+                        )
+                    if is_legacy:
+                        connection.execute(
+                            """
+                            UPDATE paper_signal_metadata SET policy_fingerprint = ?
+                            WHERE singleton = 1
+                            """,
+                            (self.policy.semantic_fingerprint,),
+                        )
                 connection.commit()
             except BaseException:
                 if connection.in_transaction:
@@ -467,6 +546,99 @@ class PaperSignalQueueStore:
         assert result is not None
         return result
 
+    def refresh_prepared(
+        self,
+        signal_id: str,
+        *,
+        quote: PaperQuoteSnapshot,
+        prepared_at: datetime,
+    ) -> PaperSignalQueueRecord:
+        """Replace an unsubmitted prepared quote while retaining prior audit evidence."""
+
+        prepared = normalize_aware_utc(prepared_at)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._required_row(connection, signal_id)
+                record = self._record_from_row(row)
+                if (
+                    record.status is not PaperSignalQueueStatus.PREPARED
+                    or record.quote is None
+                    or record.intent is None
+                ):
+                    raise ValueError("paper signal must be prepared before quote refresh")
+                if prepared >= record.signal.expires_at:
+                    raise ValueError("paper signal expired before quote refresh")
+                if quote.ts_code != record.signal.candidate_id:
+                    raise ValueError("quote ts_code does not match signal candidate")
+                if quote.available_at > prepared:
+                    raise ValueError("quote is not available at paper decision time")
+                if quote == record.quote:
+                    connection.rollback()
+                    return record
+                action = record.signal.action
+                quantity = self.policy.action_quantities[action]
+                side = PaperSide.BUY if action is SignalAction.B_INTENT else PaperSide.SELL
+                intent = PaperOrderIntent(
+                    signal_id=record.signal.signal_id,
+                    account_id=self.policy.account_id,
+                    ts_code=record.signal.candidate_id,
+                    side=side,
+                    order_type=PaperOrderType.MARKET,
+                    quantity=quantity,
+                    event_time=record.signal.event_time,
+                    available_at=record.signal.available_at,
+                    expires_at=record.signal.expires_at,
+                    earliest_execution_at=record.due_at,
+                    price_snapshot_id=quote.snapshot_id,
+                    producer_commit=self.policy.producer_commit,
+                )
+                revision = int(
+                    connection.execute(
+                        """
+                        SELECT COALESCE(MAX(revision), 0) + 1
+                        FROM paper_signal_prepare_history WHERE signal_id = ?
+                        """,
+                        (signal_id,),
+                    ).fetchone()[0]
+                )
+                connection.execute(
+                    """
+                    INSERT INTO paper_signal_prepare_history(
+                        signal_id, revision, quote_json, intent_json, replaced_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        signal_id,
+                        revision,
+                        _json(record.quote),
+                        _json(record.intent),
+                        prepared.isoformat(),
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE paper_signal_queue
+                    SET quote_json = ?, intent_json = ?, last_error = NULL, updated_at = ?
+                    WHERE signal_id = ? AND status = ?
+                    """,
+                    (
+                        _json(quote),
+                        _json(intent),
+                        prepared.isoformat(),
+                        signal_id,
+                        PaperSignalQueueStatus.PREPARED.value,
+                    ),
+                )
+                connection.commit()
+            except BaseException:
+                if connection.in_transaction:
+                    connection.rollback()
+                raise
+        result = self.record(signal_id)
+        assert result is not None
+        return result
+
     def record_error(
         self,
         signal_id: str,
@@ -561,6 +733,24 @@ def run_paper_signal_batch(
             if record.status is PaperSignalQueueStatus.PENDING:
                 quote = quote_resolver(record.signal, observed)
                 prepared = queue.prepare(
+                    record.signal.signal_id,
+                    quote=quote,
+                    prepared_at=observed,
+                )
+            elif record.status is PaperSignalQueueStatus.PREPARED:
+                if record.intent is None:
+                    raise RuntimeError("prepared paper signal lacks immutable intent")
+                existing_order = broker.order_for_intent(record.intent.intent_id)
+                if existing_order is not None:
+                    queue.complete(
+                        record.signal.signal_id,
+                        order=existing_order,
+                        completed_at=observed,
+                    )
+                    completed += 1
+                    continue
+                quote = quote_resolver(record.signal, observed)
+                prepared = queue.refresh_prepared(
                     record.signal.signal_id,
                     quote=quote,
                     prepared_at=observed,

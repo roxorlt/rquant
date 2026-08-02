@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Self
+from typing import Annotated, Protocol, Self
 
 from pydantic import Field, StringConstraints, model_validator
 
@@ -27,7 +27,6 @@ from rquant.signal_bus import (
     SignalBusSignalRecord,
     SignalBusSourceDescriptor,
     SignalBusSourceSequenceError,
-    SignalBusStore,
 )
 
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
@@ -35,6 +34,19 @@ Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 
 class PaperSignalConsumerSourceError(RuntimeError):
     """The signal bus source no longer matches the persisted consumer history."""
+
+
+class PaperSignalSource(Protocol):
+    def source_descriptor(self) -> SignalBusSourceDescriptor: ...
+
+    def signals_after_global_sequence(
+        self,
+        *,
+        after_sequence: int,
+        through_sequence: int,
+        observed_at: datetime,
+        limit: int,
+    ) -> tuple[SignalBusSignalRecord, ...]: ...
 
 
 class PaperSignalReceiptStatus(StrEnum):
@@ -484,7 +496,7 @@ class PaperSignalConsumerStateStore:
 
 
 def consume_signal_bus_to_paper(
-    bus: SignalBusStore,
+    bus: PaperSignalSource,
     queue: PaperSignalQueueStore,
     state: PaperSignalConsumerStateStore,
     *,

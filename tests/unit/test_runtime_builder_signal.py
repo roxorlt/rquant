@@ -12,8 +12,13 @@ import pytest
 from pydantic import ValidationError
 
 from rquant.delivery_contracts import DeliveryChannel, DeliveryTarget, OutboxStatus
+from rquant.notification_state import NotificationReplicationError, NotificationStateStore
 from rquant.notification_worker import NotificationDelivery
 from rquant.runtime_builder_signal import notifier_builder, signal_router_builder
+from rquant.runtime_notification_providers import (
+    NotificationTransportResult,
+    build_environment_notification_provider_loader,
+)
 from rquant.runtime_service_builtin import build_builtin_registry
 from rquant.runtime_service_control import RuntimeServicePlane
 from rquant.runtime_service_entrypoint import (
@@ -21,14 +26,22 @@ from rquant.runtime_service_entrypoint import (
     RuntimeServiceManifest,
     load_runtime_service_manifest,
 )
+from rquant.runtime_serving_authority import (
+    ServingSourceAuthorityIntegrityError,
+    ServingSourceAuthorityReader,
+)
+from rquant.runtime_serving_snapshot import SIGNALS_DATASET_ID
 from rquant.signal_bus import SignalBusStore
 from rquant.signal_contracts import SignalAction, SignalEnvelope
+from rquant.signal_route_spool import SignalRouteSpool, publish_signal_bus_prefix
 from rquant.signal_router_runtime import (
     RouteSourceDescriptor,
     RoutingDecision,
     RunnerSignalBatch,
     SignalRouteConflictError,
+    SignalRouteCursorStore,
     SourceSnapshot,
+    route_runner_signals,
 )
 from rquant.strategy_runner import RunnerSignalRecord, StrategyRunnerStore
 from rquant.strategy_spec import (
@@ -99,12 +112,31 @@ class _Provider:
         return f"receipt:{delivery.record.outbox_id}"
 
 
+class _RecordingTransport:
+    def __init__(self) -> None:
+        self.calls: list[tuple[DeliveryChannel, str]] = []
+
+    def send(
+        self,
+        *,
+        channel: DeliveryChannel,
+        endpoint: str,
+        credential: str,
+        title: str,
+        body: str,
+    ) -> NotificationTransportResult:
+        del endpoint, title, body
+        self.calls.append((channel, credential))
+        return NotificationTransportResult.accepted()
+
+
 def _router_manifest(
     tmp_path: Path,
     **setting_overrides: object,
 ) -> RuntimeServiceManifest:
     settings: dict[str, object] = {
         "signal_bus_path": str(tmp_path / "signal-bus.sqlite3"),
+        "signal_spool_root": str(tmp_path / "signal-spool"),
         "source_id": "n-shape-v1",
         "routing_policy_fingerprint": POLICY,
         "batch_limit": 1,
@@ -220,7 +252,8 @@ def _notifier_manifest(
     **setting_overrides: object,
 ) -> RuntimeServiceManifest:
     settings: dict[str, object] = {
-        "signal_bus_path": str(tmp_path / "signal-bus.sqlite3"),
+        "signal_spool_root": str(tmp_path / "signal-spool"),
+        "notification_state_path": str(tmp_path / "notification-state.sqlite3"),
         "worker_id": "notifier-1",
         "batch_limit": 10,
         "lease_seconds": 30,
@@ -249,20 +282,46 @@ def _route_target(_signal: SignalEnvelope) -> RoutingDecision:
     )
 
 
-def _seed_outbox(path: Path) -> SignalBusStore:
-    store = SignalBusStore(path)
-    signal = _signal()
-    store.ingest(signal, received_at=NOW)
-    store.route(
-        signal.signal_id,
-        (
-            DeliveryTarget(
-                recipient_id="admin",
-                channel=DeliveryChannel.PUSHDEER,
+def _seed_outbox(
+    tmp_path: Path,
+    *,
+    signal_count: int = 1,
+    recipient_id: str = "admin",
+) -> NotificationStateStore:
+    bus = SignalBusStore(tmp_path / "signal-bus.sqlite3")
+    records = tuple(
+        RunnerSignalRecord(
+            sequence=index,
+            signal=_signal(hex(index + 13)[2:]),
+        )
+        for index in range(1, signal_count + 1)
+    )
+    route_runner_signals(
+        source_id="n-shape-v1",
+        source=_Source(records),
+        bus=bus,
+        cursors=SignalRouteCursorStore(
+            tmp_path / "route-cursor.sqlite3",
+            routing_policy_fingerprint=POLICY,
+        ),
+        routed_at=NOW,
+        target_resolver=lambda _signal: RoutingDecision.route(
+            routing_policy_fingerprint=POLICY,
+            targets=(
+                DeliveryTarget(
+                    recipient_id=recipient_id,
+                    channel=DeliveryChannel.PUSHDEER,
+                ),
             ),
         ),
-        now=NOW,
+        limit=signal_count,
     )
+    publish_signal_bus_prefix(
+        bus=bus,
+        spool=SignalRouteSpool(tmp_path / "signal-spool"),
+        limit=10,
+    )
+    store = NotificationStateStore(tmp_path / "notification-state.sqlite3")
     return store
 
 
@@ -287,8 +346,135 @@ def test_signal_router_maps_committed_cursor_and_remaining_backlog(tmp_path: Pat
     assert result.output_sequence == 1
     assert result.processed_count == 1
     assert result.backlog_count == 1
-    assert result.source_generations == {"n-shape-v1": GENERATION}
+    assert result.source_generations["n-shape-v1"] == GENERATION
+    assert len(result.source_generations["signal_route_spool"]) == 64
     assert result.degraded_reasons == ()
+
+
+def test_single_signal_router_routes_multiple_strategy_sources_with_one_bus_writer(
+    tmp_path: Path,
+) -> None:
+    signals = {
+        "n-shape-v1": _signal("4"),
+        "growth-board-v1": _signal("5"),
+    }
+
+    class NamedSource:
+        def __init__(self, source_id: str) -> None:
+            self.source_id = source_id
+
+        def read_batch(self, *, after_sequence: int, limit: int) -> RunnerSignalBatch:
+            records = (
+                (RunnerSignalRecord(sequence=1, signal=signals[self.source_id]),)
+                if after_sequence == 0 and limit > 0
+                else ()
+            )
+            return RunnerSignalBatch(
+                snapshot=SourceSnapshot(
+                    descriptor=RouteSourceDescriptor(
+                        source_id=self.source_id,
+                        generation_id=hashlib.sha256(self.source_id.encode()).hexdigest(),
+                        strategy_spec_fingerprint=SPEC,
+                        first_sequence=1,
+                        high_watermark=1,
+                    )
+                ),
+                after_sequence=after_sequence,
+                limit=limit,
+                records=records,
+            )
+
+    manifest = _router_manifest(
+        tmp_path,
+        source_id=None,
+        sources=[
+            {"source_id": "n-shape-v1"},
+            {"source_id": "growth-board-v1"},
+        ],
+        batch_limit=2,
+    )
+    step = signal_router_builder(
+        source_loader=lambda source_id: NamedSource(source_id),
+        target_resolver=_route_target,
+        clock=lambda: NOW,
+    )(manifest)
+
+    result = step()
+
+    bus = SignalBusStore(tmp_path / "signal-bus.sqlite3")
+    assert result.input_sequence == 2
+    assert result.output_sequence == 2
+    assert result.processed_count == 2
+    assert result.backlog_count == 0
+    assert len(bus.route_receipts("n-shape-v1")) == 1
+    assert len(bus.route_receipts("growth-board-v1")) == 1
+
+
+def test_multi_source_router_uses_one_cutoff_and_does_not_starve_later_sources(
+    tmp_path: Path,
+) -> None:
+    source_records = {
+        "n-shape-v1": (
+            RunnerSignalRecord(sequence=1, signal=_signal("6")),
+            RunnerSignalRecord(sequence=2, signal=_signal("7")),
+        ),
+        "growth-board-v1": (RunnerSignalRecord(sequence=1, signal=_signal("8")),),
+    }
+
+    class NamedSource:
+        def __init__(self, source_id: str) -> None:
+            self.source_id = source_id
+
+        def read_batch(self, *, after_sequence: int, limit: int) -> RunnerSignalBatch:
+            records = tuple(
+                record
+                for record in source_records[self.source_id]
+                if record.sequence > after_sequence
+            )[:limit]
+            return RunnerSignalBatch(
+                snapshot=SourceSnapshot(
+                    descriptor=RouteSourceDescriptor(
+                        source_id=self.source_id,
+                        generation_id=hashlib.sha256(self.source_id.encode()).hexdigest(),
+                        strategy_spec_fingerprint=SPEC,
+                        first_sequence=1,
+                        high_watermark=len(source_records[self.source_id]),
+                    )
+                ),
+                after_sequence=after_sequence,
+                limit=limit,
+                records=records,
+            )
+
+    observed_times = iter((NOW, NOW + timedelta(seconds=1), NOW + timedelta(seconds=2)))
+    step = signal_router_builder(
+        source_loader=lambda source_id: NamedSource(source_id),
+        target_resolver=_route_target,
+        clock=lambda: next(observed_times),
+    )(
+        _router_manifest(
+            tmp_path,
+            source_id=None,
+            sources=[
+                {"source_id": "n-shape-v1"},
+                {"source_id": "growth-board-v1"},
+            ],
+            batch_limit=1,
+        )
+    )
+
+    first = step()
+    second = step()
+
+    bus = SignalBusStore(tmp_path / "signal-bus.sqlite3")
+    n_shape = bus.route_receipts("n-shape-v1")
+    growth = bus.route_receipts("growth-board-v1")
+    assert first.processed_count == 1
+    assert second.processed_count == 1
+    assert len(n_shape) == 1
+    assert len(growth) == 1
+    assert n_shape[0].routed_at == NOW
+    assert growth[0].routed_at == NOW + timedelta(seconds=1)
 
 
 def test_signal_router_default_manifest_authorities_route_from_real_runner_store(
@@ -301,9 +487,8 @@ def test_signal_router_default_manifest_authorities_route_from_real_runner_store
 
     assert result.input_sequence == 1
     assert result.output_sequence == 1
-    assert result.source_generations == {
-        "n-shape-v1": store.source_generation_id,
-    }
+    assert result.source_generations["n-shape-v1"] == store.source_generation_id
+    assert len(result.source_generations["signal_route_spool"]) == 64
     outbox = SignalBusStore(tmp_path / "signal-bus.sqlite3").outbox_records()
     assert len(outbox) == 1
     assert outbox[0].target == DeliveryTarget(
@@ -447,8 +632,7 @@ def test_signal_router_paused_rejects_a_mismatched_source_batch_without_effects(
 
 
 def test_notifier_loads_providers_outside_manifest_and_maps_backlog(tmp_path: Path) -> None:
-    bus = _seed_outbox(tmp_path / "signal-bus.sqlite3")
-    generation = bus.source_descriptor().generation_id
+    state = _seed_outbox(tmp_path)
     provider = _Provider()
     loader_calls: list[bool] = []
     step = notifier_builder(
@@ -464,18 +648,196 @@ def test_notifier_loads_providers_outside_manifest_and_maps_backlog(tmp_path: Pa
     assert loader_calls == [True]
     assert len(provider.deliveries) == 1
     assert result.input_sequence == 1
-    assert result.output_sequence == -1
+    assert result.output_sequence == 1
     assert result.processed_count == 1
     assert result.backlog_count == 0
-    assert result.source_generations == {"signal_bus": generation}
+    assert len(result.source_generations["signal_route_spool"]) == 64
     assert result.degraded_reasons == ()
-    assert bus.outbox_records()[0].status is OutboxStatus.SUCCEEDED
+    assert state.outbox_records()[0].status is OutboxStatus.SUCCEEDED
+
+
+def test_notifier_default_loader_uses_scoped_environment_before_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _seed_outbox(tmp_path)
+    observed: dict[str, object] = {}
+
+    def default_loader(**kwargs: object) -> Callable[[], dict[DeliveryChannel, _Provider]]:
+        observed.update(kwargs)
+        return lambda: {DeliveryChannel.PUSHDEER: _Provider()}
+
+    monkeypatch.setattr(
+        "rquant.runtime_notification_providers.build_environment_notification_provider_loader",
+        default_loader,
+    )
+    step = notifier_builder(clock=lambda: NOW)(_notifier_manifest(tmp_path))
+
+    result = step()
+
+    assert result.processed_count == 1
+    assert state.outbox_records()[0].status is OutboxStatus.SUCCEEDED
+    assert observed == {
+        "pushdeer_recipient_id": "admin",
+        "pushplus_recipient_id": "admin",
+        "environment": None,
+    }
+
+
+def test_notifier_migrates_legacy_admin_outbox_to_frozen_device_recipients_once(
+    tmp_path: Path,
+) -> None:
+    state = _seed_outbox(tmp_path)
+    transport = _RecordingTransport()
+    provider_loader = build_environment_notification_provider_loader(
+        environment={
+            "PUSHDEER_KEYS": "iphone-key,mac-key",
+            "PUSHDEER_RECIPIENT_IDS": "admin.iphone,admin.mac",
+        },
+        transport=transport,
+    )
+    step = notifier_builder(
+        provider_loader=provider_loader,
+        clock=lambda: NOW,
+    )(_notifier_manifest(tmp_path))
+
+    first = step()
+    second = step()
+    records = state.outbox_records()
+    migrations = state.recipient_migration_audits()
+
+    assert first.processed_count == 2
+    assert second.processed_count == 0
+    assert transport.calls == [
+        (DeliveryChannel.PUSHDEER, "iphone-key"),
+        (DeliveryChannel.PUSHDEER, "mac-key"),
+    ]
+    assert tuple(record.target.recipient_id for record in records) == (
+        "admin.iphone",
+        "admin.mac",
+    )
+    assert all(record.status is OutboxStatus.SUCCEEDED for record in records)
+    assert len(migrations) == 1
+    assert migrations[0].outcome == "migrated"
+    assert migrations[0].target_recipient_ids == ("admin.iphone", "admin.mac")
+
+
+def test_notifier_preserves_succeeded_legacy_admin_without_device_redelivery(
+    tmp_path: Path,
+) -> None:
+    state = _seed_outbox(tmp_path)
+    notifier_builder(
+        provider_loader=lambda: {DeliveryChannel.PUSHDEER: _Provider()},
+        clock=lambda: NOW,
+    )(_notifier_manifest(tmp_path))()
+    assert state.outbox_records()[0].status is OutboxStatus.SUCCEEDED
+
+    transport = _RecordingTransport()
+    provider_loader = build_environment_notification_provider_loader(
+        environment={
+            "PUSHDEER_KEYS": "iphone-key,mac-key",
+            "PUSHDEER_RECIPIENT_IDS": "admin.iphone,admin.mac",
+        },
+        transport=transport,
+    )
+    step = notifier_builder(
+        provider_loader=provider_loader,
+        clock=lambda: NOW + timedelta(seconds=1),
+    )(_notifier_manifest(tmp_path))
+
+    result = step()
+
+    assert result.processed_count == 0
+    assert transport.calls == []
+    assert state.outbox_records()[0].target.recipient_id == "admin"
+    assert state.outbox_records()[0].status is OutboxStatus.SUCCEEDED
+    assert state.recipient_migration_audits()[0].outcome == "preserved_succeeded"
+
+
+def test_notifier_unknown_active_recipient_fails_before_claim(tmp_path: Path) -> None:
+    state = _seed_outbox(tmp_path, recipient_id="unknown-user")
+    transport = _RecordingTransport()
+    provider_loader = build_environment_notification_provider_loader(
+        environment={
+            "PUSHDEER_KEYS": "iphone-key,mac-key",
+            "PUSHDEER_RECIPIENT_IDS": "admin.iphone,admin.mac",
+        },
+        transport=transport,
+    )
+    step = notifier_builder(
+        provider_loader=provider_loader,
+        clock=lambda: NOW,
+    )(_notifier_manifest(tmp_path))
+
+    with pytest.raises(NotificationReplicationError, match="recipient is unknown"):
+        step()
+
+    record = state.outbox_records()[0]
+    assert record.target.recipient_id == "unknown-user"
+    assert record.status is OutboxStatus.PENDING
+    assert record.attempt_count == 0
+    assert state.recipient_migration_audits() == ()
+    assert transport.calls == []
+
+
+def test_notifier_rejects_changes_to_frozen_recipient_alias(tmp_path: Path) -> None:
+    _seed_outbox(tmp_path)
+    first_transport = _RecordingTransport()
+    first_step = notifier_builder(
+        provider_loader=build_environment_notification_provider_loader(
+            environment={
+                "PUSHDEER_KEYS": "iphone-key,mac-key",
+                "PUSHDEER_RECIPIENT_IDS": "admin.iphone,admin.mac",
+            },
+            transport=first_transport,
+        ),
+        clock=lambda: NOW,
+    )(_notifier_manifest(tmp_path))
+    first_step()
+
+    changed_transport = _RecordingTransport()
+    changed_step = notifier_builder(
+        provider_loader=build_environment_notification_provider_loader(
+            environment={
+                "PUSHDEER_KEYS": "phone-key,mac-key",
+                "PUSHDEER_RECIPIENT_IDS": "admin.phone,admin.mac",
+            },
+            transport=changed_transport,
+        ),
+        clock=lambda: NOW + timedelta(seconds=1),
+    )(_notifier_manifest(tmp_path))
+
+    with pytest.raises(NotificationReplicationError, match="frozen migration"):
+        changed_step()
+    assert changed_transport.calls == []
+
+
+def test_notifier_missing_default_capabilities_never_claims_outbox(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in (
+        "PUSHDEER_KEYS",
+        "PUSHPLUS_TOKENS",
+        "PUSHDEER_ENDPOINT",
+        "PUSHPLUS_ENDPOINT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    state = _seed_outbox(tmp_path)
+    step = notifier_builder(clock=lambda: NOW)(_notifier_manifest(tmp_path))
+
+    with pytest.raises(RuntimeError, match="notification capability"):
+        step()
+
+    record = state.outbox_records()[0]
+    assert record.status is OutboxStatus.PENDING
+    assert record.attempt_count == 0
 
 
 def test_notifier_pause_or_provider_loader_failure_never_claims_outbox(
     tmp_path: Path,
 ) -> None:
-    bus = _seed_outbox(tmp_path / "signal-bus.sqlite3")
+    state = _seed_outbox(tmp_path)
     loader_calls: list[bool] = []
     paused = notifier_builder(
         provider_loader=lambda: (loader_calls.append(True), {})[1],
@@ -487,7 +849,7 @@ def test_notifier_pause_or_provider_loader_failure_never_claims_outbox(
     assert loader_calls == []
     assert paused_result.backlog_count == 1
     assert paused_result.degraded_reasons == ("notifier:paused",)
-    assert bus.outbox_records()[0].status is OutboxStatus.PENDING
+    assert state.outbox_records() == ()
 
     def fail_loader() -> dict[DeliveryChannel, _Provider]:
         raise RuntimeError("secret store unavailable")
@@ -499,9 +861,310 @@ def test_notifier_pause_or_provider_loader_failure_never_claims_outbox(
     with pytest.raises(RuntimeError, match="secret store unavailable"):
         active()
 
-    record = bus.outbox_records()[0]
+    record = state.outbox_records()[0]
     assert record.status is OutboxStatus.PENDING
     assert record.attempt_count == 0
+
+
+def test_notifier_publishes_owned_signal_delivery_authority_after_writeback(
+    tmp_path: Path,
+) -> None:
+    state = _seed_outbox(tmp_path)
+    authority_root = (tmp_path / "serving-signals").resolve()
+    step = notifier_builder(
+        provider_loader=lambda: {DeliveryChannel.PUSHDEER: _Provider()},
+        clock=lambda: NOW,
+    )(
+        _notifier_manifest(
+            tmp_path,
+            serving_authority_root=str(authority_root),
+            serving_history_limit=10,
+        )
+    )
+
+    result = step()
+    published = ServingSourceAuthorityReader(
+        root=authority_root,
+        expected_producer_commit=COMMIT,
+        expected_dataset_id=SIGNALS_DATASET_ID,
+        expected_payload_kind="signal_delivery",
+    )(NOW)
+
+    assert result.source_generations["signals_serving_authority"] == published.generation_id
+    assert published.dataset_id == SIGNALS_DATASET_ID
+    assert published.sequence > 0
+    assert published.status.value == "fresh"
+    assert len(published.payload.signals) == 1
+    assert len(published.payload.routes) == 1
+    assert published.payload.deliveries[0].status is OutboxStatus.SUCCEEDED
+    assert state.replication_cursor().last_global_sequence == 1
+
+
+def test_notifier_takes_over_signals_authority_from_exact_previous_commit(
+    tmp_path: Path,
+) -> None:
+    state = _seed_outbox(tmp_path)
+    authority_root = (tmp_path / "serving-signals").resolve()
+    old_step = notifier_builder(
+        provider_loader=lambda: {DeliveryChannel.PUSHDEER: _Provider()},
+        clock=lambda: NOW,
+    )(
+        _notifier_manifest(
+            tmp_path,
+            serving_authority_root=str(authority_root),
+        )
+    )
+    old_step()
+    old_result = ServingSourceAuthorityReader(
+        root=authority_root,
+        expected_producer_commit=COMMIT,
+        expected_dataset_id=SIGNALS_DATASET_ID,
+        expected_payload_kind="signal_delivery",
+    )(NOW)
+
+    next_commit = "9" * 40
+    next_manifest = _notifier_manifest(
+        tmp_path,
+        paused=True,
+        serving_authority_root=str(authority_root),
+        serving_previous_producer_commit=COMMIT,
+    ).model_copy(update={"producer_commit": next_commit})
+    next_clock = NOW + timedelta(seconds=1)
+    next_step = notifier_builder(
+        provider_loader=lambda: {},
+        clock=lambda: next_clock,
+    )(next_manifest)
+
+    first = next_step()
+    second = next_step()
+    next_result = ServingSourceAuthorityReader(
+        root=authority_root,
+        expected_producer_commit=next_commit,
+        expected_dataset_id=SIGNALS_DATASET_ID,
+        expected_payload_kind="signal_delivery",
+    )(next_clock)
+    handoffs = state.serving_authority_handoffs()
+
+    assert next_result.payload == old_result.payload
+    assert next_result.status is old_result.status
+    assert next_result.reason == old_result.reason
+    assert next_result.sequence == old_result.sequence + 1
+    assert next_result.generation_id != old_result.generation_id
+    assert first.source_generations["signals_serving_authority"] == next_result.generation_id
+    assert second.source_generations["signals_serving_authority"] == next_result.generation_id
+    assert len(handoffs) == 1
+    assert handoffs[0].previous_producer_commit == COMMIT
+    assert handoffs[0].next_producer_commit == next_commit
+    assert handoffs[0].previous_generation_id == old_result.generation_id
+    assert handoffs[0].previous_sequence == old_result.sequence
+    assert handoffs[0].next_sequence == next_result.sequence
+
+
+def test_notifier_rejects_authority_takeover_from_unlisted_commit(tmp_path: Path) -> None:
+    _seed_outbox(tmp_path)
+    authority_root = (tmp_path / "serving-signals").resolve()
+    notifier_builder(
+        provider_loader=lambda: {DeliveryChannel.PUSHDEER: _Provider()},
+        clock=lambda: NOW,
+    )(
+        _notifier_manifest(
+            tmp_path,
+            serving_authority_root=str(authority_root),
+        )
+    )()
+
+    next_manifest = _notifier_manifest(
+        tmp_path,
+        paused=True,
+        serving_authority_root=str(authority_root),
+        serving_previous_producer_commit="8" * 40,
+    ).model_copy(update={"producer_commit": "9" * 40})
+    next_step = notifier_builder(
+        provider_loader=lambda: {},
+        clock=lambda: NOW + timedelta(seconds=1),
+    )(next_manifest)
+
+    with pytest.raises(ServingSourceAuthorityIntegrityError, match="producer_commit"):
+        next_step()
+
+
+def test_notifier_paused_publishes_current_state_without_advancing_cursor(
+    tmp_path: Path,
+) -> None:
+    state = _seed_outbox(tmp_path)
+    authority_root = (tmp_path / "serving-signals").resolve()
+    provider_calls: list[bool] = []
+    step = notifier_builder(
+        provider_loader=lambda: (provider_calls.append(True), {})[1],
+        clock=lambda: NOW,
+    )(
+        _notifier_manifest(
+            tmp_path,
+            paused=True,
+            serving_authority_root=str(authority_root),
+        )
+    )
+
+    result = step()
+    published = ServingSourceAuthorityReader(
+        root=authority_root,
+        expected_producer_commit=COMMIT,
+        expected_dataset_id=SIGNALS_DATASET_ID,
+        expected_payload_kind="signal_delivery",
+    )(NOW)
+
+    assert provider_calls == []
+    assert state.replication_cursor().last_global_sequence == 0
+    assert published.sequence == 0
+    assert published.payload.signals == ()
+    assert result.degraded_reasons == ("notifier:paused",)
+
+
+def test_notifier_marks_truncated_serving_history_degraded(tmp_path: Path) -> None:
+    _seed_outbox(tmp_path, signal_count=2)
+    authority_root = (tmp_path / "serving-signals").resolve()
+    step = notifier_builder(
+        provider_loader=lambda: {DeliveryChannel.PUSHDEER: _Provider()},
+        clock=lambda: NOW,
+    )(
+        _notifier_manifest(
+            tmp_path,
+            serving_authority_root=str(authority_root),
+            serving_history_limit=1,
+        )
+    )
+
+    result = step()
+    published = ServingSourceAuthorityReader(
+        root=authority_root,
+        expected_producer_commit=COMMIT,
+        expected_dataset_id=SIGNALS_DATASET_ID,
+        expected_payload_kind="signal_delivery",
+    )(NOW)
+
+    assert published.status.value == "degraded"
+    assert published.reason == "history_limit_truncated:1"
+    assert len(published.payload.signals) == 1
+    assert "notifier:serving_history_truncated:1" in result.degraded_reasons
+
+
+def test_notifier_authority_publish_failure_fails_the_step(tmp_path: Path) -> None:
+    _seed_outbox(tmp_path)
+    authority_root = (tmp_path / "serving-signals").resolve()
+    authority_root.write_text("not a directory")
+    step = notifier_builder(
+        provider_loader=lambda: {DeliveryChannel.PUSHDEER: _Provider()},
+        clock=lambda: NOW,
+    )(
+        _notifier_manifest(
+            tmp_path,
+            serving_authority_root=str(authority_root),
+        )
+    )
+
+    with pytest.raises(ServingSourceAuthorityIntegrityError):
+        step()
+
+
+def test_notifier_does_not_consume_routes_beyond_observed_at(tmp_path: Path) -> None:
+    rollback_time = NOW - timedelta(seconds=1)
+    signal = SignalEnvelope.model_validate(
+        {
+            **_signal().model_dump(mode="python", exclude={"signal_id"}),
+            "event_time": rollback_time - timedelta(seconds=2),
+            "available_at": rollback_time - timedelta(seconds=1),
+        }
+    )
+    bus = SignalBusStore(tmp_path / "signal-bus.sqlite3")
+    route_runner_signals(
+        source_id="n-shape-v1",
+        source=_Source((RunnerSignalRecord(sequence=1, signal=signal),)),
+        bus=bus,
+        cursors=SignalRouteCursorStore(
+            tmp_path / "route-cursor.sqlite3",
+            routing_policy_fingerprint=POLICY,
+        ),
+        routed_at=rollback_time,
+        target_resolver=_route_target,
+        limit=10,
+    )
+    with sqlite3.connect(bus.path) as connection:
+        connection.execute(
+            "UPDATE signal_route_receipt SET routed_at = ? WHERE source_sequence = 1",
+            (NOW.isoformat(timespec="microseconds").replace("+00:00", "Z"),),
+        )
+    publish_signal_bus_prefix(
+        bus=bus,
+        spool=SignalRouteSpool(tmp_path / "signal-spool"),
+        limit=10,
+    )
+    state = NotificationStateStore(tmp_path / "notification-state.sqlite3")
+    step = notifier_builder(
+        provider_loader=lambda: {},
+        clock=lambda: rollback_time,
+    )(_notifier_manifest(tmp_path))
+
+    result = step()
+
+    assert state.replication_cursor().last_global_sequence == 0
+    assert state.outbox_records() == ()
+    assert result.input_sequence == 1
+    assert result.output_sequence == 0
+    assert result.backlog_count == 1
+
+
+def test_notifier_serving_authority_preserves_complete_no_target_receipt(
+    tmp_path: Path,
+) -> None:
+    signal = _signal()
+    bus = SignalBusStore(tmp_path / "signal-bus.sqlite3")
+    route_runner_signals(
+        source_id="n-shape-v1",
+        source=_Source((RunnerSignalRecord(sequence=1, signal=signal),)),
+        bus=bus,
+        cursors=SignalRouteCursorStore(
+            tmp_path / "route-cursor.sqlite3",
+            routing_policy_fingerprint=POLICY,
+        ),
+        routed_at=NOW,
+        target_resolver=lambda _signal: RoutingDecision.no_target(
+            routing_policy_fingerprint=POLICY,
+            reason_code="recipient-opted-out",
+        ),
+        limit=10,
+    )
+    spool = SignalRouteSpool(tmp_path / "signal-spool")
+    publish_signal_bus_prefix(bus=bus, spool=spool, limit=10)
+    original = bus.routed_signals_after_global_sequence(
+        after_sequence=0,
+        through_sequence=1,
+        limit=10,
+    )[0].receipt
+    authority_root = (tmp_path / "serving-signals").resolve()
+    step = notifier_builder(
+        provider_loader=lambda: {},
+        clock=lambda: NOW,
+    )(
+        _notifier_manifest(
+            tmp_path,
+            serving_authority_root=str(authority_root),
+        )
+    )
+
+    result = step()
+    published = ServingSourceAuthorityReader(
+        root=authority_root,
+        expected_producer_commit=COMMIT,
+        expected_dataset_id=SIGNALS_DATASET_ID,
+        expected_payload_kind="signal_delivery",
+    )(NOW)
+
+    assert result.output_sequence == 1
+    assert published.payload.routes == (original,)
+    assert published.payload.routes[0].reason_code == "recipient-opted-out"
+    assert published.payload.routes[0].decision_fingerprint == original.decision_fingerprint
+    assert published.payload.routes[0].targets == ()
+    assert published.payload.deliveries == ()
 
 
 @pytest.mark.parametrize(
@@ -510,7 +1173,19 @@ def test_notifier_pause_or_provider_loader_failure_never_claims_outbox(
         ("router", _router_manifest, {"signal_bus_path": "relative.sqlite3"}, "absolute"),
         ("router", _router_manifest, {"batch_limit": True}, "integer"),
         ("router", _router_manifest, {"batch_limit": 1_001}, "less than or equal"),
-        ("notifier", _notifier_manifest, {"signal_bus_path": "relative.sqlite3"}, "absolute"),
+        ("notifier", _notifier_manifest, {"signal_spool_root": "relative"}, "absolute"),
+        (
+            "notifier",
+            _notifier_manifest,
+            {"serving_authority_root": "relative"},
+            "absolute",
+        ),
+        (
+            "notifier",
+            _notifier_manifest,
+            {"serving_history_limit": 0},
+            "greater than or equal",
+        ),
         ("notifier", _notifier_manifest, {"batch_limit": 0}, "greater than or equal"),
         ("notifier", _notifier_manifest, {"import_path": "evil.module:provider"}, "extra"),
     ],

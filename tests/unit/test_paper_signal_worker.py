@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -24,7 +25,11 @@ TRADE_DATE = date(2026, 7, 31)
 NEXT_TRADE_DATE = date(2026, 8, 3)
 
 
-def _policy(*, buy_quantity: int = 1_000) -> PaperSignalPolicy:
+def _policy(
+    *,
+    buy_quantity: int = 1_000,
+    producer_commit: str = "a" * 40,
+) -> PaperSignalPolicy:
     return PaperSignalPolicy(
         account_id=ACCOUNT_ID,
         execution_lag=timedelta(minutes=1),
@@ -33,7 +38,7 @@ def _policy(*, buy_quantity: int = 1_000) -> PaperSignalPolicy:
             SignalAction.REDUCE: 500,
             SignalAction.S_INTENT: 1_000,
         },
-        producer_commit="a" * 40,
+        producer_commit=producer_commit,
     )
 
 
@@ -137,6 +142,110 @@ def test_watch_signal_is_explicitly_ignored_and_policy_is_bound(tmp_path: Path) 
         PaperSignalQueueStore(path, policy=_policy(buy_quantity=2_000))
 
 
+def test_queue_and_broker_restart_across_commit_preserves_execution_provenance(
+    tmp_path: Path,
+) -> None:
+    queue_path = tmp_path / "queue.sqlite3"
+    broker_path = tmp_path / "broker.sqlite3"
+    old_commit = "a" * 40
+    new_commit = "9" * 40
+    old_queue = PaperSignalQueueStore(
+        queue_path,
+        policy=_policy(producer_commit=old_commit),
+    )
+    broker = _broker(broker_path)
+    old_signal = _signal(seed="1")
+    old_queue.ingest(old_signal, received_at=old_signal.available_at)
+    old_result = run_paper_signal_batch(
+        old_queue,
+        broker,
+        now=EXECUTION_TIME,
+        trade_date=TRADE_DATE,
+        quote_resolver=lambda *_args: _quote(),
+        limit=10,
+    )
+
+    new_queue = PaperSignalQueueStore(
+        queue_path,
+        policy=_policy(producer_commit=new_commit),
+    )
+    reopened_broker = _broker(broker_path)
+    new_signal = _signal(
+        seed="2",
+        event_time=SIGNAL_TIME + timedelta(minutes=2),
+    )
+    new_queue.ingest(new_signal, received_at=new_signal.available_at)
+    new_execution_time = EXECUTION_TIME + timedelta(minutes=2)
+    new_result = run_paper_signal_batch(
+        new_queue,
+        reopened_broker,
+        now=new_execution_time,
+        trade_date=TRADE_DATE,
+        quote_resolver=lambda *_args: PaperQuoteSnapshot(
+            ts_code="600000.SH",
+            event_time=new_execution_time,
+            available_at=new_execution_time,
+            context=BrokerExecutionContext(
+                executable_price=Decimal("10.50"),
+                acquisition_available_date=NEXT_TRADE_DATE,
+            ),
+            producer_commit=new_commit,
+        ),
+        limit=10,
+    )
+
+    old_record = new_queue.record(old_signal.signal_id)
+    new_record = new_queue.record(new_signal.signal_id)
+    assert old_result.completed_count == 1
+    assert new_result.completed_count == 1
+    assert old_record is not None and old_record.intent is not None
+    assert new_record is not None and new_record.intent is not None
+    assert old_record.intent.producer_commit == old_commit
+    assert new_record.intent.producer_commit == new_commit
+    assert len(reopened_broker.fills()) == 2
+    with sqlite3.connect(broker_path) as connection:
+        fill_commits = connection.execute(
+            """
+            SELECT json_extract(i.payload_json, '$.producer_commit')
+            FROM paper_fill AS f
+            JOIN paper_order AS o ON o.order_id = f.order_id
+            JOIN paper_intent AS i ON i.intent_id = o.intent_id
+            ORDER BY f.executed_at, f.fill_id
+            """
+        ).fetchall()
+    assert fill_commits == [(old_commit,), (new_commit,)]
+
+
+def test_legacy_commit_bound_policy_fingerprint_migrates_without_losing_guard(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "queue.sqlite3"
+    old_policy = _policy(producer_commit="a" * 40)
+    PaperSignalQueueStore(path, policy=old_policy)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            UPDATE paper_signal_metadata SET policy_fingerprint = ?
+            WHERE singleton = 1
+            """,
+            (old_policy.provenance_fingerprint,),
+        )
+
+    new_policy = _policy(producer_commit="9" * 40)
+    PaperSignalQueueStore(path, policy=new_policy)
+    with sqlite3.connect(path) as connection:
+        migrated = connection.execute(
+            """
+            SELECT policy_fingerprint FROM paper_signal_metadata
+            WHERE singleton = 1
+            """
+        ).fetchone()
+
+    assert migrated == (new_policy.semantic_fingerprint,)
+    with pytest.raises(ValueError, match="paper signal policy"):
+        PaperSignalQueueStore(path, policy=_policy(buy_quantity=2_000))
+
+
 def test_quote_failure_keeps_signal_pending_for_bounded_retry(tmp_path: Path) -> None:
     queue = PaperSignalQueueStore(tmp_path / "queue.sqlite3", policy=_policy())
     broker = _broker(tmp_path / "broker.sqlite3")
@@ -197,6 +306,41 @@ def test_crash_after_broker_fill_reuses_prepared_intent_without_double_fill(
 
     assert second.completed_count == 1
     assert len(broker.fills()) == 1
+
+
+def test_crash_after_prepare_before_broker_refreshes_quote_before_execution(
+    tmp_path: Path,
+) -> None:
+    queue = PaperSignalQueueStore(tmp_path / "queue.sqlite3", policy=_policy())
+    broker = _broker(tmp_path / "broker.sqlite3")
+    signal = _signal()
+    queue.ingest(signal, received_at=signal.available_at)
+    old = queue.prepare(
+        signal.signal_id,
+        quote=_quote(price="10.00"),
+        prepared_at=EXECUTION_TIME,
+    )
+    resumed_at = EXECUTION_TIME + timedelta(seconds=30)
+    resolver_calls: list[datetime] = []
+
+    summary = run_paper_signal_batch(
+        queue,
+        broker,
+        now=resumed_at,
+        trade_date=TRADE_DATE,
+        quote_resolver=lambda _signal, observed_at: (
+            resolver_calls.append(observed_at),
+            _quote(price="11.00", available_at=resumed_at),
+        )[1],
+        limit=10,
+    )
+
+    record = queue.record(signal.signal_id)
+    assert summary.completed_count == 1
+    assert resolver_calls == [resumed_at]
+    assert record is not None and record.quote is not None and record.intent is not None
+    assert record.quote.snapshot_id != old.quote.snapshot_id  # type: ignore[union-attr]
+    assert broker.fills()[0].price == Decimal("11.0000")
 
 
 def test_same_day_sell_is_recorded_as_t_plus_one_rejection(tmp_path: Path) -> None:

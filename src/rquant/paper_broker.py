@@ -84,6 +84,20 @@ class PaperBrokerReconciliation(RuntimeContractModel):
     realized_pnl: Decimal = Field(allow_inf_nan=False)
 
 
+class PaperAccountAuthoritySnapshot(RuntimeContractModel):
+    revision: int = Field(ge=1)
+    state_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    producer_commit: str = Field(pattern=r"^[0-9a-f]{40}$")
+    snapshot: PaperAccountSnapshot
+
+    @model_validator(mode="after")
+    def validate_state_fingerprint(self) -> PaperAccountAuthoritySnapshot:
+        expected = _account_state_fingerprint(self.snapshot)
+        if self.state_fingerprint != expected:
+            raise ValueError("paper account state_fingerprint does not match snapshot")
+        return self
+
+
 def _money(value: Decimal) -> str:
     if not value.is_finite():
         raise ValueError("money must be finite")
@@ -106,6 +120,15 @@ def _intent_payload(intent: PaperOrderIntent) -> str:
         ensure_ascii=True,
         separators=(",", ":"),
         sort_keys=True,
+    )
+
+
+def _account_state_fingerprint(snapshot: PaperAccountSnapshot) -> str:
+    return canonical_sha256(
+        snapshot.model_dump(
+            mode="python",
+            exclude={"snapshot_id", "as_of_time"},
+        )
     )
 
 
@@ -218,6 +241,13 @@ class PaperBrokerStore:
                     quantity INTEGER NOT NULL CHECK(quantity > 0 AND quantity % 100 = 0),
                     unit_cost TEXT NOT NULL CHECK(typeof(unit_cost) = 'text'),
                     PRIMARY KEY(fill_id, lot_id)
+                );
+                CREATE TABLE IF NOT EXISTS paper_account_authority (
+                    account_id TEXT PRIMARY KEY REFERENCES broker_account(account_id),
+                    revision INTEGER NOT NULL CHECK(revision >= 1),
+                    state_fingerprint TEXT NOT NULL,
+                    producer_commit TEXT NOT NULL,
+                    snapshot_json TEXT NOT NULL
                 );
                 """
             )
@@ -775,6 +805,103 @@ class PaperBrokerStore:
             unrealized_pnl=unrealized,
             nav=cash + holdings_value,
         )
+
+    def latest_execution_prices(
+        self,
+        *,
+        as_of: AwareUtcDatetime,
+    ) -> Mapping[str, Decimal]:
+        """Return the latest known execution price per symbol at the PIT cutoff."""
+
+        cutoff = _utc_iso(as_of)
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT o.ts_code, f.price
+                FROM paper_fill AS f
+                JOIN paper_order AS o ON o.order_id = f.order_id
+                WHERE o.account_id = ? AND f.executed_at <= ?
+                ORDER BY f.executed_at DESC, f.sequence DESC, f.fill_id DESC
+                """,
+                (self.account_id, cutoff),
+            ).fetchall()
+        prices: dict[str, Decimal] = {}
+        for row in rows:
+            prices.setdefault(str(row["ts_code"]), Decimal(row["price"]))
+        return prices
+
+    def account_authority_snapshot(
+        self,
+        *,
+        as_of: AwareUtcDatetime,
+        market_prices: Mapping[str, Decimal],
+        producer_commit: str,
+    ) -> PaperAccountAuthoritySnapshot:
+        candidate = self.account_snapshot(as_of=as_of, market_prices=market_prices)
+        state_fingerprint = _account_state_fingerprint(candidate)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    """
+                    SELECT revision, state_fingerprint, producer_commit, snapshot_json
+                    FROM paper_account_authority WHERE account_id = ?
+                    """,
+                    (self.account_id,),
+                ).fetchone()
+                if row is not None:
+                    persisted = PaperAccountAuthoritySnapshot(
+                        revision=row["revision"],
+                        state_fingerprint=row["state_fingerprint"],
+                        producer_commit=row["producer_commit"],
+                        snapshot=PaperAccountSnapshot.model_validate_json(row["snapshot_json"]),
+                    )
+                    if (
+                        persisted.state_fingerprint == state_fingerprint
+                        and persisted.producer_commit == producer_commit
+                    ):
+                        connection.rollback()
+                        return persisted
+                    revision = persisted.revision + 1
+                else:
+                    revision = 1
+                state = PaperAccountAuthoritySnapshot(
+                    revision=revision,
+                    state_fingerprint=state_fingerprint,
+                    producer_commit=producer_commit,
+                    snapshot=candidate,
+                )
+                connection.execute(
+                    """
+                    INSERT INTO paper_account_authority(
+                        account_id, revision, state_fingerprint,
+                        producer_commit, snapshot_json
+                    ) VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(account_id) DO UPDATE SET
+                        revision = excluded.revision,
+                        state_fingerprint = excluded.state_fingerprint,
+                        producer_commit = excluded.producer_commit,
+                        snapshot_json = excluded.snapshot_json
+                    """,
+                    (
+                        self.account_id,
+                        state.revision,
+                        state.state_fingerprint,
+                        state.producer_commit,
+                        json.dumps(
+                            state.snapshot.model_dump(mode="json"),
+                            ensure_ascii=True,
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        ),
+                    ),
+                )
+                connection.commit()
+                return state
+            except BaseException:
+                if connection.in_transaction:
+                    connection.rollback()
+                raise
 
     def reconcile(self) -> PaperBrokerReconciliation:
         errors: list[str] = []
