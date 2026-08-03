@@ -630,26 +630,86 @@ class TestU7Rendering:
         assert "题材热度" not in body
         assert "旧题材" not in body
 
-    def test_digest_five_sections(self) -> None:
+    def test_digest_groups_theme_ladders_and_candidates_for_mobile(self) -> None:
         view = DigestView(
             day=datetime(2026, 7, 6).date(), limit_up_count=47, broken_count=6,
             limit_down_count=2, up_count=2871, down_count=2130, broken_ratio_pct=11.3,
             slot_limit_up_series=[("10:00", 20), ("10:30", 30), ("11:00", 40), ("11:30", 47)],
             prev_day_limit_up=52,
-            ladder=[LadderStock(ts_code="600001.SH", name="样本01", boards=3, theme="人形机器人")],
+            theme_ladders=[
+                mb.ThemeLadderSummary(
+                    theme="人形机器人",
+                    limit_up_count=3,
+                    amount=234_000_000.0,
+                    slot_series=[1, 1, 2, 3],
+                    rungs=[
+                        mb.ThemeLadderRung(
+                            boards=3,
+                            stocks=[
+                                LadderStock(
+                                    ts_code="600001.SH",
+                                    name="样本01",
+                                    boards=3,
+                                    theme="人形机器人",
+                                )
+                            ],
+                        ),
+                        mb.ThemeLadderRung(boards=2, stocks=[]),
+                        mb.ThemeLadderRung(
+                            boards=1,
+                            stocks=[
+                                LadderStock(
+                                    ts_code="600002.SH",
+                                    name="样本02",
+                                    boards=1,
+                                    theme="人形机器人",
+                                )
+                            ],
+                        ),
+                    ],
+                )
+            ],
             candidates=[CandidateStock(ts_code="300001.SZ", name="创A", theme="存储",
                                        vol_ratio=2.1, pct_chg=8.0, room_to_limit_pct=5.0)],
             positions=[PositionCheck(ts_code="600001.SH", name="样本01", pnl_pct=7.3,
                                      dist_stop_pct=12.8, board_note="人形 +2%")],
         )
         _, body = render_digest(view)
-        headers = ("① 情绪温度", "② 连板梯队", "③ 最强题材",
-                   "④ 下午候选观察池", "⑤ 持仓午间体检")
+        headers = ("① 情绪温度", "② 最强题材·连板梯队 Top5",
+                   "③ 下午候选观察池", "④ 持仓风险")
         for header in headers:
             assert header in body
         assert "炸板率 11.3%" in body
-        assert "3板：样本01(人形机器人)" in body
         assert "昨日终值：涨停 52 家" in body
+        assert "1. 人形机器人 ｜ 涨停 3 ｜ 半日额 2.3亿" in body
+        assert "上午：1 / 1 / 2 / 3" in body
+        assert "- 3板（1）：样本01" in body
+        assert "- 2板（0）：暂无" in body
+        assert "- 首板（1）：样本02" in body
+        assert "## ② 连板梯队" not in body
+        assert "## ③ 最强题材" not in body
+        assert "| 300001.SZ | 创A |" not in body
+        candidate_block = (
+            "- 创A（300001.SZ）\n  题材：存储 ｜ 半日量比：2.10\n"
+            "  涨幅：+8.0% ｜ 距涨停：5.0%"
+        )
+        assert candidate_block in body
+        assert "## ⑤ 持仓午间体检" not in body
+
+    def test_digest_empty_theme_and_candidate_sections_are_explicit(self) -> None:
+        view = DigestView(
+            day=datetime(2026, 7, 6).date(),
+            limit_up_count=0,
+            broken_count=0,
+            limit_down_count=0,
+            up_count=1,
+            down_count=1,
+        )
+
+        _, body = render_digest(view)
+
+        assert "## ② 最强题材·连板梯队 Top5\n- 暂无" in body
+        assert "## ③ 下午候选观察池（创业/科创 半日量能预筛）\n- 暂无" in body
 
 
 # ── U8 守卫 ─────────────────────────────────────────────────────────────────────

@@ -219,6 +219,7 @@ class DigestView(BaseModel):
     broken_ratio_pct: float | None = None
     slot_limit_up_series: list[tuple[str, int | None]] = []  # (hhmm, 涨停数)
     prev_day_limit_up: int | None = None
+    theme_ladders: list[ThemeLadderSummary] = []
     ladder: list[LadderStock] = []
     top_themes: list[ThemeRank] = []
     candidates: list[CandidateStock] = []
@@ -1157,8 +1158,26 @@ def render_pulse(view: PulseView) -> tuple[str, str]:
     return title, "\n".join(lines)
 
 
+def _digest_theme_ladder_lines(rank: int, summary: ThemeLadderSummary) -> list[str]:
+    """将一个题材的完整连续梯队渲染为午间战报的手机分块。"""
+    series = " / ".join(str(count) if count is not None else "—" for count in summary.slot_series)
+    meta = (
+        f"{rank}. {summary.theme} ｜ 涨停 {summary.limit_up_count} ｜ "
+        f"半日额 {summary.amount / 1e8:.1f}亿"
+    )
+    lines = [
+        meta,
+        f"   上午：{series or '—'}",
+    ]
+    for rung in summary.rungs:
+        label = "首板" if rung.boards == 1 else f"{rung.boards}板"
+        names = "、".join(stock.name or stock.ts_code for stock in rung.stocks) or "暂无"
+        lines.append(f"   - {label}（{len(rung.stocks)}）：{names}")
+    return lines
+
+
 def render_digest(view: DigestView) -> tuple[str, str]:
-    """午间战报（digest，五节）。返回 (title, body)。"""
+    """午间战报（digest，四节）。返回 (title, body)。"""
     mmdd = view.day.strftime("%m-%d")
     if view.degraded:
         title = f"午间战报 {mmdd} 快照不可用"
@@ -1184,52 +1203,35 @@ def render_digest(view: DigestView) -> tuple[str, str]:
         lines.append(f"昨日终值：涨停 {view.prev_day_limit_up} 家（T-1）")
     lines.append("")
 
-    # ② 连板梯队
-    lines.append("## ② 连板梯队")
-    if view.ladder:
-        by_height: dict[int, list[LadderStock]] = {}
-        for s in view.ladder:
-            by_height.setdefault(s.boards, []).append(s)
-        for height in sorted(by_height, reverse=True):
-            label = "首板" if height == 1 else f"{height}板"
-            names = " ".join(
-                f"{s.name}({s.theme})" if s.theme else s.name for s in by_height[height]
-            )
-            lines.append(f"- {label}：{names}")
+    # ② 最强题材·连板梯队 Top5
+    lines.append("## ② 最强题材·连板梯队 Top5")
+    if view.theme_ladders:
+        for rank, summary in enumerate(view.theme_ladders, start=1):
+            lines.extend(_digest_theme_ladder_lines(rank, summary))
+            lines.append("")
+        lines.pop()
     else:
-        lines.append("- （无涨停）")
+        lines.append("- 暂无")
     lines.append("")
 
-    # ③ 最强题材 Top5
-    lines.append("## ③ 最强题材 Top5")
-    if view.top_themes:
-        for i, t in enumerate(view.top_themes, 1):
-            series = "/".join(str(c) if c is not None else "-" for c in t.slot_series)
-            lines.append(
-                f"{i}. {t.theme} 涨停{t.limit_up_count} 半日额{t.amount / 1e8:.1f}亿"
-                f"（上午 {series}）"
-            )
-    else:
-        lines.append("- （无）")
-    lines.append("")
-
-    # ④ 下午候选观察池
-    lines.append("## ④ 下午候选观察池（创业/科创 半日量能预筛）")
+    # ③ 下午候选观察池
+    lines.append("## ③ 下午候选观察池（创业/科创 半日量能预筛）")
     if view.candidates:
-        lines.append("| 代码 | 名称 | 题材 | 半日量比 | 涨幅 | 距涨停 |")
-        lines.append("|---|---|---|---|---|---|")
         for c in view.candidates:
-            lines.append(
-                f"| {c.ts_code} | {c.name} | {c.theme or '—'} | "
-                f"{c.vol_ratio} | {c.pct_chg:+.1f}% | {c.room_to_limit_pct:.1f}% |"
-            )
+            lines.extend([
+                f"- {c.name}（{c.ts_code}）",
+                f"  题材：{c.theme or '—'} ｜ 半日量比：{c.vol_ratio:.2f}",
+                f"  涨幅：{c.pct_chg:+.1f}% ｜ 距涨停：{c.room_to_limit_pct:.1f}%",
+                "",
+            ])
+        lines.pop()
     else:
-        lines.append("- （无候选）")
+        lines.append("- 暂无")
     lines.append("")
 
-    # ⑤ 持仓午间体检（空仓整节省略）
+    # ④ 持仓风险（空仓整节省略）
     if view.positions:
-        lines.append("## ⑤ 持仓午间体检")
+        lines.append("## ④ 持仓风险")
         lines.append("| 代码 | 名称 | 浮盈 | 距止损 | 板块 |")
         lines.append("|---|---|---|---|---|")
         for p in view.positions:
