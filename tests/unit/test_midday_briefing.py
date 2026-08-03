@@ -22,6 +22,7 @@ from rquant.midday_briefing import (
     check_positions,
     compute_board_ladder,
     compute_pulse_view,
+    compute_theme_ladder_summaries,
     render_digest,
     render_pulse,
     resolve_slot,
@@ -177,6 +178,65 @@ class TestU4BoardLadder:
         ladder = {s.ts_code: s.boards for s in compute_board_ladder(snapshot, prev_limit, {})}
         assert ladder == {"600001.SH": 3, "600002.SH": 2, "600003.SH": 1}
         assert "600004.SH" not in ladder  # 未涨停不入梯队
+
+
+class TestThemeLadderSummaries:
+    def test_theme_ladder_multi_membership_keeps_continuous_rungs(self) -> None:
+        snapshot = mk_snapshot([
+            {"ts_code": "600001.SH", "name": "共用龙头", "price": 11.0, "pre_close": 10.0,
+             "pct_chg": 10, "volume": 1e6, "amount": 30.0, "limit_up_price": 11.0},
+            {"ts_code": "600002.SH", "name": "题材A首板", "price": 11.0, "pre_close": 10.0,
+             "pct_chg": 10, "volume": 1e6, "amount": 20.0, "limit_up_price": 11.0},
+            {"ts_code": "600003.SH", "name": "题材B二板", "price": 11.0, "pre_close": 10.0,
+             "pct_chg": 10, "volume": 1e6, "amount": 20.0, "limit_up_price": 11.0},
+        ])
+        prev_limit = pd.DataFrame([
+            {"ts_code": "600001.SH", "limit_times": 2},
+            {"ts_code": "600003.SH", "limit_times": 1},
+        ])
+        kpl_members = pd.DataFrame([
+            {"board_name": "题材B", "con_code": "600001.SH"},
+            {"board_name": "题材A", "con_code": "600001.SH"},
+            {"board_name": "题材A", "con_code": "600001.SH"},  # 重复成员不可重复计数
+            {"board_name": "题材A", "con_code": "600002.SH"},
+            {"board_name": "题材B", "con_code": "600003.SH"},
+        ])
+
+        summaries = compute_theme_ladder_summaries(
+            snapshot, prev_limit, kpl_members, {}, top_n=5
+        )
+
+        assert [summary.theme for summary in summaries] == ["题材A", "题材B"]
+        assert [(r.boards, [s.name for s in r.stocks]) for r in summaries[0].rungs] == [
+            (3, ["共用龙头"]),
+            (2, []),
+            (1, ["题材A首板"]),
+        ]
+        assert [(r.boards, [s.name for s in r.stocks]) for r in summaries[1].rungs] == [
+            (3, ["共用龙头"]),
+            (2, ["题材B二板"]),
+            (1, []),
+        ]
+
+    def test_theme_ladder_stable_sorts_equal_counts_and_amounts_by_name(self) -> None:
+        snapshot = mk_snapshot([
+            {"ts_code": "600001.SH", "name": "甲", "price": 11.0, "pre_close": 10.0,
+             "pct_chg": 10, "volume": 1e6, "amount": 50.0, "limit_up_price": 11.0},
+            {"ts_code": "600002.SH", "name": "乙", "price": 11.0, "pre_close": 10.0,
+             "pct_chg": 10, "volume": 1e6, "amount": 50.0, "limit_up_price": 11.0},
+        ])
+        kpl_members = pd.DataFrame([
+            {"board_name": "题材B", "con_code": "600001.SH"},
+            {"board_name": "题材A", "con_code": "600002.SH"},
+        ])
+
+        summaries = compute_theme_ladder_summaries(
+            snapshot, pd.DataFrame(), kpl_members, {}, top_n=5
+        )
+
+        assert [summary.theme for summary in summaries] == ["题材A", "题材B"]
+        assert [summary.limit_up_count for summary in summaries] == [1, 1]
+        assert [summary.amount for summary in summaries] == [50.0, 50.0]
 
 
 # ── U5 候选池 ───────────────────────────────────────────────────────────────────

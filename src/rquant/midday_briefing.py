@@ -164,6 +164,20 @@ class LadderStock(BaseModel):
     theme: str = ""
 
 
+class ThemeLadderRung(BaseModel):
+    boards: int
+    stocks: list[LadderStock] = []
+
+
+class ThemeLadderSummary(BaseModel):
+    theme: str
+    limit_up_count: int
+    amount: float
+    rungs: list[ThemeLadderRung] = []
+    slot_series: list[int | None] = []
+    rank_change: int | None = None
+
+
 class ThemeRank(BaseModel):
     theme: str
     limit_up_count: int
@@ -715,6 +729,110 @@ def compute_board_ladder(
             )
         )
     return sorted(out, key=lambda s: (-s.boards, s.ts_code))
+
+
+def compute_theme_ladder_summaries(
+    snapshot: pd.DataFrame,
+    prev_limit: pd.DataFrame,
+    kpl_members: pd.DataFrame,
+    slot_snapshots: dict[str, pd.DataFrame],
+    *,
+    top_n: int = _THEME_TOP_N,
+) -> list[ThemeLadderSummary]:
+    """按开盘啦真实多对多题材关系计算连续涨停梯队。"""
+    required_columns = {"board_name", "con_code"}
+    if kpl_members.empty or not required_columns.issubset(kpl_members.columns):
+        return []
+    if snapshot.empty or "ts_code" not in snapshot.columns:
+        return []
+
+    members = kpl_members[["board_name", "con_code"]].dropna().drop_duplicates().copy()
+    if members.empty:
+        return []
+    members["board_name"] = members["board_name"].astype(str)
+    members["con_code"] = members["con_code"].astype(str)
+
+    joined = members.merge(snapshot, left_on="con_code", right_on="ts_code", how="inner")
+    if joined.empty:
+        return []
+    joined["_amount"] = pd.to_numeric(joined.get("amount"), errors="coerce").fillna(0.0)
+    limit_codes = _limit_up_codes(snapshot)
+    joined["_is_limit_up"] = joined["ts_code"].astype(str).isin(limit_codes)
+    current = joined[joined["_is_limit_up"]].copy()
+    if current.empty:
+        return []
+
+    previous_boards = _previous_limit_boards(prev_limit)
+    current["_boards"] = (
+        current["ts_code"].astype(str).map(previous_boards).fillna(0).astype(int) + 1
+    )
+    amount_by_theme = joined.groupby("board_name")["_amount"].sum().to_dict()
+    slot_counts = {
+        _slot_tag(hhmm): _theme_limit_up_counts(frame, members)
+        for hhmm in PULSE_SLOTS
+        if (frame := slot_snapshots.get(_slot_tag(hhmm))) is not None
+    }
+
+    summaries: list[ThemeLadderSummary] = []
+    for theme, group in current.groupby("board_name", sort=False):
+        stocks_by_height: dict[int, list[LadderStock]] = {}
+        for _, row in group.iterrows():
+            boards = int(row["_boards"])
+            stocks_by_height.setdefault(boards, []).append(
+                LadderStock(
+                    ts_code=str(row["ts_code"]),
+                    name=str(row.get("name", "")),
+                    boards=boards,
+                    theme=str(theme),
+                )
+            )
+        highest_board = max(stocks_by_height)
+        rungs = [
+            ThemeLadderRung(
+                boards=boards,
+                stocks=sorted(stocks_by_height.get(boards, []), key=lambda stock: stock.ts_code),
+            )
+            for boards in range(highest_board, 0, -1)
+        ]
+        summaries.append(
+            ThemeLadderSummary(
+                theme=str(theme),
+                limit_up_count=len(group),
+                amount=float(amount_by_theme.get(theme, 0.0)),
+                rungs=rungs,
+                slot_series=[
+                    slot_counts[_slot_tag(hhmm)].get(str(theme), 0)
+                    if _slot_tag(hhmm) in slot_counts
+                    else None
+                    for hhmm in PULSE_SLOTS
+                ],
+            )
+        )
+    return sorted(
+        summaries,
+        key=lambda summary: (-summary.limit_up_count, -summary.amount, summary.theme),
+    )[:top_n]
+
+
+def _previous_limit_boards(prev_limit: pd.DataFrame) -> dict[str, int]:
+    if prev_limit.empty or not {"ts_code", "limit_times"}.issubset(prev_limit.columns):
+        return {}
+    return {
+        str(row["ts_code"]): int(row["limit_times"])
+        for _, row in prev_limit.iterrows()
+        if pd.notna(row["limit_times"])
+    }
+
+
+def _theme_limit_up_counts(snapshot: pd.DataFrame, members: pd.DataFrame) -> dict[str, int]:
+    limit_codes = _limit_up_codes(snapshot)
+    if not limit_codes or "ts_code" not in snapshot.columns:
+        return {}
+    current = snapshot[snapshot["ts_code"].astype(str).isin(limit_codes)]
+    joined = members.merge(current, left_on="con_code", right_on="ts_code", how="inner")
+    if joined.empty:
+        return {}
+    return joined.groupby("board_name")["ts_code"].count().astype(int).to_dict()
 
 
 def compute_top_themes(
