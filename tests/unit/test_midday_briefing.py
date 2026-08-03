@@ -181,6 +181,15 @@ class TestU4BoardLadder:
 
 
 class TestThemeLadderSummaries:
+    def test_theme_ladder_missing_snapshot_amount_fails_soft(self) -> None:
+        snapshot = mk_snapshot([
+            {"ts_code": "600001.SH", "name": "样本", "price": 11.0, "pre_close": 10.0,
+             "pct_chg": 10, "volume": 1e6, "amount": 50.0, "limit_up_price": 11.0},
+        ]).drop(columns="amount")
+        kpl_members = pd.DataFrame([{"board_name": "题材A", "con_code": "600001.SH"}])
+
+        assert compute_theme_ladder_summaries(snapshot, pd.DataFrame(), kpl_members, {}) == []
+
     def test_theme_ladder_multi_membership_keeps_continuous_rungs(self) -> None:
         snapshot = mk_snapshot([
             {"ts_code": "600001.SH", "name": "共用龙头", "price": 11.0, "pre_close": 10.0,
@@ -237,6 +246,40 @@ class TestThemeLadderSummaries:
         assert [summary.theme for summary in summaries] == ["题材A", "题材B"]
         assert [summary.limit_up_count for summary in summaries] == [1, 1]
         assert [summary.amount for summary in summaries] == [50.0, 50.0]
+
+    def test_theme_ladder_invalid_previous_board_counts_fall_back_to_first_board(self) -> None:
+        codes = [f"60000{i}.SH" for i in range(1, 9)]
+        snapshot = mk_snapshot([
+            {"ts_code": code, "name": code, "price": 11.0, "pre_close": 10.0,
+             "pct_chg": 10, "volume": 1e6, "amount": 10.0, "limit_up_price": 11.0}
+            for code in codes
+        ])
+        prev_limit = pd.DataFrame([
+            {"ts_code": codes[0], "limit_times": -1},
+            {"ts_code": codes[1], "limit_times": float("inf")},
+            {"ts_code": codes[2], "limit_times": "2.0"},
+            {"ts_code": codes[3], "limit_times": 2.0},
+            {"ts_code": codes[4], "limit_times": 99},
+            {"ts_code": codes[5], "limit_times": float("nan")},
+            {"ts_code": codes[6], "limit_times": "2.5"},
+            {"ts_code": codes[7], "limit_times": "非整数"},
+        ])
+        kpl_members = pd.DataFrame([
+            {"board_name": "题材A", "con_code": code} for code in codes
+        ])
+
+        summaries = compute_theme_ladder_summaries(snapshot, prev_limit, kpl_members, {})
+
+        stocks = {
+            stock.ts_code: stock.boards
+            for rung in summaries[0].rungs
+            for stock in rung.stocks
+        }
+        assert stocks[codes[2]] == 3
+        assert stocks[codes[3]] == 3
+        invalid_codes = (codes[0], codes[1], codes[4], codes[5], codes[6], codes[7])
+        assert {stocks[code] for code in invalid_codes} == {1}
+        assert [rung.boards for rung in summaries[0].rungs] == [3, 2, 1]
 
 
 # ── U5 候选池 ───────────────────────────────────────────────────────────────────

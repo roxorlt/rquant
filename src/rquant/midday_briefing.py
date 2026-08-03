@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import time
 from datetime import date, datetime, timedelta, timezone
+from math import isfinite
 from pathlib import Path
 
 import pandas as pd
@@ -70,6 +71,7 @@ _CANDIDATE_TOP_N = 20
 _PULSE_ANOMALY_TOP_N = 5
 _THEME_TOP_N = 5
 _NEW_LIMIT_UP_MAX = 8
+_MAX_THEME_LADDER_BOARDS = 20
 
 _KPL_SYSTEM = "开盘啦题材"
 _SYSTEM_FLOW_TYPE: dict[str, str | None] = {
@@ -743,7 +745,7 @@ def compute_theme_ladder_summaries(
     required_columns = {"board_name", "con_code"}
     if kpl_members.empty or not required_columns.issubset(kpl_members.columns):
         return []
-    if snapshot.empty or "ts_code" not in snapshot.columns:
+    if snapshot.empty or not {"ts_code", "amount"}.issubset(snapshot.columns):
         return []
 
     members = kpl_members[["board_name", "con_code"]].dropna().drop_duplicates().copy()
@@ -817,11 +819,19 @@ def compute_theme_ladder_summaries(
 def _previous_limit_boards(prev_limit: pd.DataFrame) -> dict[str, int]:
     if prev_limit.empty or not {"ts_code", "limit_times"}.issubset(prev_limit.columns):
         return {}
-    return {
-        str(row["ts_code"]): int(row["limit_times"])
-        for _, row in prev_limit.iterrows()
-        if pd.notna(row["limit_times"])
-    }
+    limit_times = pd.to_numeric(prev_limit["limit_times"], errors="coerce")
+    boards: dict[str, int] = {}
+    for ts_code, raw_limit_times in zip(prev_limit["ts_code"], limit_times, strict=False):
+        if pd.isna(raw_limit_times):
+            continue
+        value = float(raw_limit_times)
+        if not isfinite(value) or not value.is_integer():
+            continue
+        previous = int(value)
+        if not 1 <= previous < _MAX_THEME_LADDER_BOARDS:
+            continue
+        boards[str(ts_code)] = previous
+    return boards
 
 
 def _theme_limit_up_counts(snapshot: pd.DataFrame, members: pd.DataFrame) -> dict[str, int]:
