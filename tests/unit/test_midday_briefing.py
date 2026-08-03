@@ -796,6 +796,17 @@ class TestReadonlyStoreOrchestration:
             {"board_code": "KPL001", "board_name": "AI硬件", "con_code": "600001.SH"},
         ])
 
+    @staticmethod
+    def _board_members() -> pd.DataFrame:
+        return pd.DataFrame([
+            {
+                "board_code": "BK001",
+                "board_name": "电子",
+                "idx_type": "行业板块",
+                "con_code": "600001.SH",
+            },
+        ])
+
     def test_morning_pulse_reuses_one_readonly_store_for_theme_inputs(
         self, tmp_path, monkeypatch
     ) -> None:
@@ -900,6 +911,7 @@ class TestReadonlyStoreOrchestration:
             base_dir: Path | None = None,
             now: datetime | None = None,
             *,
+            members: pd.DataFrame | None = None,
             kpl_members: pd.DataFrame | None = None,
         ) -> tuple[pd.DataFrame, pd.DataFrame, str]:
             captured_kpl.append(kpl_members)
@@ -909,6 +921,8 @@ class TestReadonlyStoreOrchestration:
             patch.object(mb, "is_trading_day", return_value=True),
             patch.object(mb, "fetch_slot_frames", side_effect=fetch_with_kpl),
             patch.object(mb, "_open_ro_store", return_value=store) as open_store,
+            patch.object(mb, "load_board_members", return_value=pd.DataFrame()),
+            patch.object(mb, "industry_fallback_members", return_value=pd.DataFrame()),
             patch.object(
                 mb, "load_kpl_concept_members", return_value=self._members()
             ) as members,
@@ -939,6 +953,7 @@ class TestReadonlyStoreOrchestration:
         with (
             patch.object(mb, "is_trading_day", return_value=True),
             patch.object(mb, "_open_ro_store", wraps=mb._open_ro_store) as open_store,
+            patch.object(mb, "load_board_members", wraps=mb.load_board_members) as board_members,
             patch.object(
                 mb, "load_kpl_concept_members", wraps=mb.load_kpl_concept_members
             ) as members,
@@ -949,6 +964,7 @@ class TestReadonlyStoreOrchestration:
 
         assert rc == 0
         assert open_store.call_count == 1
+        assert board_members.call_args.args == (None,)
         assert members.call_args.args == (None,)
         assert prev_limit.call_args.args == (None,)
         assert avg20.call_args.args == (None,)
@@ -993,16 +1009,85 @@ class TestReadonlyStoreOrchestration:
                 "_shared_frames",
                 return_value=(self._snapshot(), {}, "test"),
             ),
-            patch.object(mb, "_load_members", return_value=pd.DataFrame()),
+            patch.object(mb, "_load_members") as board_loader,
             patch.object(mb, "load_kpl_concept_members") as load_members,
         ):
             snapshot, _, route = mb.fetch_slot_frames(
-                tmp_path, now=self.NOW, kpl_members=members
+                tmp_path,
+                now=self.NOW,
+                kpl_members=members,
+                members=pd.DataFrame(),
             )
 
         assert not snapshot.empty
         assert route == "test"
+        board_loader.assert_not_called()
         load_members.assert_not_called()
+
+    def test_full_digest_entry_shares_one_store_with_board_members(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.delenv("RQUANT_PANORAMA_FAKE", raising=False)
+        store = MagicMock()
+        raw = self._snapshot().drop(columns=["limit_up_price", "limit_down_price"])
+        raw.attrs["route"] = "test"
+        with (
+            patch.object(mb, "is_trading_day", return_value=True),
+            patch.object(mb, "open_readonly_store", return_value=store) as open_store,
+            patch.object(
+                mb, "load_board_members", return_value=self._board_members()
+            ) as board_members,
+            patch.object(mb, "industry_fallback_members") as fallback_members,
+            patch.object(
+                mb, "load_kpl_concept_members", return_value=self._members()
+            ) as kpl_members,
+            patch.object(mb, "load_prev_limit_list", return_value=pd.DataFrame()) as prev_limit,
+            patch.object(mb, "load_avg_amount_20d", return_value=pd.DataFrame()) as avg20,
+            patch.object(mb, "load_active_positions", return_value=pd.DataFrame()) as positions,
+            patch.object(mb, "fetch_market_snapshot", return_value=raw),
+            patch.object(mb, "fetch_sector_fund_flow", return_value=pd.DataFrame()),
+        ):
+            rc = mb.run_midday_report(
+                now=self.NOW.replace(hour=12), base_dir=tmp_path, dry_run=True
+            )
+
+        assert rc == 0
+        open_store.assert_called_once_with()
+        assert board_members.call_args.args == (store,)
+        fallback_members.assert_not_called()
+        assert kpl_members.call_args.args == (store,)
+        assert prev_limit.call_args.args == (store,)
+        assert avg20.call_args.args == (store,)
+        assert positions.call_args.args == (store,)
+        store.close.assert_called_once_with()
+
+    def test_full_pulse_entry_does_not_reopen_when_readonly_open_fails(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.delenv("RQUANT_PANORAMA_FAKE", raising=False)
+        raw = self._snapshot().drop(columns=["limit_up_price", "limit_down_price"])
+        raw.attrs["route"] = "test"
+        with (
+            patch.object(mb, "is_trading_day", return_value=True),
+            patch.object(
+                mb, "open_readonly_store", side_effect=OSError("replica unavailable")
+            ) as open_store,
+            patch.object(mb, "load_board_members") as board_members,
+            patch.object(mb, "load_kpl_concept_members") as kpl_members,
+            patch.object(mb, "load_prev_limit_list") as prev_limit,
+            patch.object(mb, "load_avg_amount_20d") as avg20,
+            patch.object(mb, "fetch_market_snapshot", return_value=raw),
+            patch.object(mb, "fetch_sector_fund_flow", return_value=pd.DataFrame()),
+            patch.object(mb, "notify"),
+        ):
+            rc = run_morning_pulse(slot="10:00", now=self.NOW, base_dir=tmp_path)
+
+        assert rc == 0
+        open_store.assert_called_once_with()
+        board_members.assert_not_called()
+        kpl_members.assert_not_called()
+        prev_limit.assert_not_called()
+        avg20.assert_not_called()
 
 
 # ── 共享 drop（全机单一取数者：poller 落盘，midday 优先读） ─────────────────────

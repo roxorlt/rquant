@@ -371,12 +371,20 @@ def _upsert_report_section(base: Path | None, day: date, header: str, content: s
 # ── 快照 + 板块聚合获取（① 共享 drop → ② 自拉+重试 → ③ 降级） ─────────────────
 
 
-def _load_members() -> pd.DataFrame:
+def _load_members(store: DuckDBStore | None = None) -> pd.DataFrame:
     """东财成分：dc_board_member 优先，空则降级 stock_basic.industry 粗分。"""
-    members = load_board_members()
+    try:
+        members = load_board_members(store)
+    except Exception as e:
+        logger.warning(f"东财板块成分读取失败: {type(e).__name__}: {e}")
+        members = pd.DataFrame()
     if not members.empty:
         return members
-    return industry_fallback_members()
+    try:
+        return industry_fallback_members(store)
+    except Exception as e:
+        logger.warning(f"行业板块成分兜底失败: {type(e).__name__}: {e}")
+        return pd.DataFrame()
 
 
 def _meta_age_seconds(entry: dict, now: datetime) -> float | None:
@@ -446,6 +454,7 @@ def fetch_slot_frames(
     base_dir: Path | None = None,
     now: datetime | None = None,
     *,
+    members: pd.DataFrame | None = None,
     kpl_members: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, str]:
     """获取当前时刻快照（含涨停价）+ 三体系板块聚合，返回 (snapshot, boards, route)。
@@ -454,8 +463,8 @@ def fetch_slot_frames(
     ① 全景 poller 共享 drop（≤300s 新鲜，route 标注「共享:{原route}」）；
     ② 自拉三级路由（drop 陈旧/缺失时），总失败 sleep 60s 重试一次；
     ③ 仍失败 → 返回空快照 + 空 boards（调用方降级短讯）。
-    boards 含各体系 build_board_overview 输出 + system 列。调用方传入 ``kpl_members`` 时
-    直接复用，避免通知编排层为同一批题材成员重复读取只读副本。
+    boards 含各体系 build_board_overview 输出 + system 列。调用方传入 ``members`` /
+    ``kpl_members`` 时直接复用，避免通知编排层为同一批成分重复读取只读副本。
     """
     now = now or _now_cst()
     shared = _shared_frames(base_dir, now)
@@ -468,7 +477,8 @@ def fetch_slot_frames(
     if snapshot.empty:
         return pd.DataFrame(), pd.DataFrame(), route
 
-    members = _load_members()
+    if members is None:
+        members = _load_members()
     if kpl_members is None:
         kpl_members = load_kpl_concept_members()
     frames: list[pd.DataFrame] = []
@@ -1291,8 +1301,10 @@ def run_morning_pulse(
         logger.info(f"脉搏 {hhmm} 当日已推送，跳过（--force 覆盖）")
         return 0
 
-    kpl_members, prev_limit, avg20, _ = _load_notification_inputs(include_positions=False)
-    snapshot, boards, route = fetch_slot_frames(base_dir, now=now, kpl_members=kpl_members)
+    members, kpl_members, prev_limit, avg20, _ = _load_notification_inputs(include_positions=False)
+    snapshot, boards, route = fetch_slot_frames(
+        base_dir, now=now, members=members, kpl_members=kpl_members
+    )
     if snapshot.empty:
         logger.warning(f"脉搏 {hhmm} 快照三路全失败，降级短讯（不落 snapshot parquet）")
         view = PulseView(slot_hhmm=hhmm, has_prev=False, limit_up_count=0, broken_count=0,
@@ -1351,8 +1363,12 @@ def run_midday_report(
         logger.info("午间战报当日已推送，跳过（--force 覆盖）")
         return 0
 
-    kpl_members, prev_limit, avg20, positions = _load_notification_inputs(include_positions=True)
-    snapshot, boards, route = fetch_slot_frames(base_dir, now=now, kpl_members=kpl_members)
+    members, kpl_members, prev_limit, avg20, positions = _load_notification_inputs(
+        include_positions=True
+    )
+    snapshot, boards, route = fetch_slot_frames(
+        base_dir, now=now, members=members, kpl_members=kpl_members
+    )
     if snapshot.empty:
         logger.warning("午间战报快照三路全失败，降级短讯")
         view = DigestView(day=day, limit_up_count=0, broken_count=0, limit_down_count=0,
@@ -1456,12 +1472,19 @@ def _open_ro_store() -> DuckDBStore | None:
 
 def _load_notification_inputs(
     *, include_positions: bool
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """在快照网络读取前取齐通知依赖，并在同一短生命周期内关闭只读连接。"""
     store = _open_ro_store()
     if store is None and not _fake_enabled():
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        return (
+            pd.DataFrame(),
+            pd.DataFrame(),
+            pd.DataFrame(),
+            pd.DataFrame(),
+            pd.DataFrame(),
+        )
     try:
+        members = _load_ro_frame("东财板块成分", _load_members, store)
         kpl_members = _load_ro_frame("开盘啦题材成分", load_kpl_concept_members, store)
         prev_limit = _load_ro_frame("涨停榜", load_prev_limit_list, store)
         avg20 = _load_ro_frame("20 日均额", load_avg_amount_20d, store)
@@ -1470,7 +1493,7 @@ def _load_notification_inputs(
             if include_positions
             else pd.DataFrame()
         )
-        return kpl_members, prev_limit, avg20, positions
+        return members, kpl_members, prev_limit, avg20, positions
     finally:
         if store is not None:
             store.close()

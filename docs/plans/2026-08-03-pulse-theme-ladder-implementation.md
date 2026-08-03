@@ -233,10 +233,11 @@ T-1 涨停榜。
 在 `run_morning_pulse()` / `run_midday_report()` 网络获取快照前调用既有 `_open_ro_store()`
 一次；在同一个短生命周期 `try/finally` 中依次调用
 `load_kpl_concept_members(store)`、`load_prev_limit_list(store)`、`load_avg_amount_20d(store)`
-（午间再取持仓），随后立即关闭 store，不能跨网络取数持锁。把原始 KPL 成员传给
-`fetch_slot_frames(kpl_members=...)` 及相应 view，避免内部二次读取；非 fake 的 store 为
-`None` 时用空 DataFrame 且不可回退到无参数 loader。fake 模式例外：显式以 `None` 调用
-各 fake-aware loader，以保留离线 fixture。任一 loader 异常均独立降级为空表。
+（午间再取持仓），并在同一 store 读取东财板块成员；东财空时用该 store 查询行业兜底。随后
+立即关闭 store，不能跨网络取数持锁。把原始东财/KPL 成员传给
+`fetch_slot_frames(members=..., kpl_members=...)`，KPL 也传给相应 view，避免内部二次读取；
+非 fake 的 store 为 `None` 时用空 DataFrame 且不可回退到无参数 loader。fake 模式例外：显式
+以 `None` 调用各 fake-aware loader，以保留离线 fixture。任一 loader 异常均独立降级为空表。
 
 `_build_digest_view()` 只消费编排层已读取的原始成员、昨日涨停榜、均额与持仓，并将成员表
 传给统一摘要计算。所有 DB 访问继续只经 `open_readonly_store()` / `_open_ro_store()`；不新增
