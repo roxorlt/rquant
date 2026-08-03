@@ -681,16 +681,20 @@ class TestU7Rendering:
             assert header in body
         assert "炸板率 11.3%" in body
         assert "昨日终值：涨停 52 家" in body
-        assert "1. 人形机器人 ｜ 涨停 3 ｜ 半日额 2.3亿" in body
-        assert "上午：1 / 1 / 2 / 3" in body
-        assert "- 3板（1）：样本01" in body
-        assert "- 2板（0）：暂无" in body
-        assert "- 首板（1）：样本02" in body
+        theme_block = (
+            "1. 人形机器人 ｜ 涨停 3 ｜ 半日额 2.3亿  \n"
+            "   上午：1 / 1 / 2 / 3  \n"
+            "   - 3板（1）：样本01  \n"
+            "   - 2板（0）：暂无  \n"
+            "   - 首板（1）：样本02"
+        )
+        assert theme_block in body
         assert "## ② 连板梯队" not in body
         assert "## ③ 最强题材" not in body
         assert "| 300001.SZ | 创A |" not in body
         candidate_block = (
-            "- 创A（300001.SZ）\n  题材：存储 ｜ 半日量比：2.10\n"
+            "- 创A（300001.SZ）  \n"
+            "  题材：存储 ｜ 半日量比：2.10  \n"
             "  涨幅：+8.0% ｜ 距涨停：5.0%"
         )
         assert candidate_block in body

@@ -1173,7 +1173,7 @@ def _digest_theme_ladder_lines(rank: int, summary: ThemeLadderSummary) -> list[s
         label = "首板" if rung.boards == 1 else f"{rung.boards}板"
         names = "、".join(stock.name or stock.ts_code for stock in rung.stocks) or "暂无"
         lines.append(f"   - {label}（{len(rung.stocks)}）：{names}")
-    return lines
+    return [f"{line}  " for line in lines[:-1]] + lines[-1:]
 
 
 def render_digest(view: DigestView) -> tuple[str, str]:
@@ -1219,8 +1219,8 @@ def render_digest(view: DigestView) -> tuple[str, str]:
     if view.candidates:
         for c in view.candidates:
             lines.extend([
-                f"- {c.name}（{c.ts_code}）",
-                f"  题材：{c.theme or '—'} ｜ 半日量比：{c.vol_ratio:.2f}",
+                f"- {c.name}（{c.ts_code}）  ",
+                f"  题材：{c.theme or '—'} ｜ 半日量比：{c.vol_ratio:.2f}  ",
                 f"  涨幅：{c.pct_chg:+.1f}% ｜ 距涨停：{c.room_to_limit_pct:.1f}%",
                 "",
             ])
