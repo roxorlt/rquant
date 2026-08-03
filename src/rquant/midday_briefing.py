@@ -27,6 +27,7 @@ import time
 from datetime import date, datetime, timedelta, timezone
 from math import isfinite
 from pathlib import Path
+from typing import Literal
 
 import pandas as pd
 from loguru import logger
@@ -153,6 +154,7 @@ class PulseView(BaseModel):
     limit_up_delta: int | None = None
     broken_delta: int | None = None
     new_limit_ups: list[NewLimitUp] = []
+    theme_ladders: list[ThemeLadderSummary] = []
     theme_heat: list[ThemeHeat] = []
     new_anomalies: list[VolAnomaly] = []
     degraded: bool = False  # 快照三路全失败 → 降级短讯
@@ -178,6 +180,7 @@ class ThemeLadderSummary(BaseModel):
     rungs: list[ThemeLadderRung] = []
     slot_series: list[int | None] = []
     rank_change: int | None = None
+    rank_state: Literal["hidden", "new", "changed"] = "hidden"
 
 
 class ThemeRank(BaseModel):
@@ -618,8 +621,15 @@ def compute_pulse_view(
     prev_boards: pd.DataFrame | None,
     theme_map: dict[str, str],
     avg20: pd.DataFrame,
+    *,
+    kpl_members: pd.DataFrame | None = None,
+    prev_limit: pd.DataFrame | None = None,
 ) -> PulseView:
-    """组装 pulse 视图：绝对计数 + 对上一槽位 Δ（首槽无前项则 Δ 省略）。"""
+    """组装 pulse 视图：绝对计数 + 对上一槽位 Δ（首槽无前项则 Δ 省略）。
+
+    ``kpl_members`` 和 ``prev_limit`` 以关键字接收，保留既有调用方的参数位置；
+    缺少题材成员或 T-1 涨停榜时，题材梯队分别省略或按首板计算。
+    """
     pulse = compute_market_pulse(snapshot)
     has_prev = prev_snapshot is not None and not prev_snapshot.empty
     view = PulseView(
@@ -632,7 +642,14 @@ def compute_pulse_view(
         down_count=pulse.down_count,
     )
 
-    view.theme_heat = _theme_heat(boards, prev_boards if has_prev else None)
+    if kpl_members is not None:
+        view.theme_ladders = _compute_pulse_theme_ladders(
+            slot_hhmm,
+            snapshot,
+            prev_snapshot if has_prev else None,
+            kpl_members,
+            prev_limit if prev_limit is not None else pd.DataFrame(),
+        )
 
     curr_lu = _limit_up_codes(snapshot)
     curr_anom = compute_volume_anomalies(snapshot, avg20)
@@ -650,6 +667,49 @@ def compute_pulse_view(
     else:
         view.new_anomalies = curr_anom[:_PULSE_ANOMALY_TOP_N]
     return view
+
+
+def _compute_pulse_theme_ladders(
+    slot_hhmm: str,
+    snapshot: pd.DataFrame,
+    prev_snapshot: pd.DataFrame | None,
+    kpl_members: pd.DataFrame,
+    prev_limit: pd.DataFrame,
+) -> list[ThemeLadderSummary]:
+    """用统一题材梯队计算脉搏 Top5，并比较上一个脉搏的同口径排名。"""
+    slot_tag = _slot_tag(slot_hhmm)
+    slot_snapshots = {slot_tag: snapshot}
+    has_prev = prev_snapshot is not None and not prev_snapshot.empty
+    if has_prev:
+        previous_tag = _prev_pulse_tag(slot_tag)
+        if previous_tag is not None:
+            slot_snapshots[previous_tag] = prev_snapshot
+
+    current = compute_theme_ladder_summaries(
+        snapshot, prev_limit, kpl_members, slot_snapshots
+    )
+    if not has_prev:
+        return current
+
+    previous = compute_theme_ladder_summaries(
+        prev_snapshot, prev_limit, kpl_members, slot_snapshots
+    )
+    previous_ranks = {summary.theme: rank for rank, summary in enumerate(previous, start=1)}
+    ranked: list[ThemeLadderSummary] = []
+    for rank, summary in enumerate(current, start=1):
+        previous_rank = previous_ranks.get(summary.theme)
+        if previous_rank is None:
+            ranked.append(summary.model_copy(update={"rank_state": "new"}))
+        else:
+            ranked.append(
+                summary.model_copy(
+                    update={
+                        "rank_change": previous_rank - rank,
+                        "rank_state": "changed",
+                    }
+                )
+            )
+    return ranked
 
 
 def _build_new_limit_ups(
@@ -1021,6 +1081,41 @@ def _body_delta(value: int | None) -> str:
     return f"（{value:+d}）" if value is not None else ""
 
 
+def _pulse_theme_ladder_lines(
+    rank: int, summary: ThemeLadderSummary
+) -> list[str] | None:
+    """将连续题材梯队压缩为三行脉搏摘要，最高档最多展示两个标的。"""
+    highest = next((rung for rung in summary.rungs if rung.stocks), None)
+    if highest is None:
+        return None
+    names = [stock.name or stock.ts_code for stock in highest.stocks]
+    leader_names = "、".join(names[:2])
+    if len(names) > 2:
+        leader_names += f"等{len(names)}只"
+    rank_text = ""
+    if summary.rank_state == "new":
+        rank_text = "新晋"
+    elif summary.rank_state == "changed" and summary.rank_change is not None:
+        if summary.rank_change > 0:
+            rank_text = f"↑{summary.rank_change}"
+        elif summary.rank_change < 0:
+            rank_text = f"↓{-summary.rank_change}"
+        else:
+            rank_text = "持平"
+    title = f"{rank}. {summary.theme}"
+    if rank_text:
+        title += f" {rank_text}"
+    rung_counts = " ｜ ".join(
+        f"{'首板' if rung.boards == 1 else f'{rung.boards}板'} {len(rung.stocks)}"
+        for rung in summary.rungs
+    )
+    return [
+        title,
+        f"   涨停 {summary.limit_up_count} ｜ 最高 {highest.boards}板：{leader_names}",
+        f"   梯队：{rung_counts}",
+    ]
+
+
 def render_pulse(view: PulseView) -> tuple[str, str]:
     """30 分钟脉搏报文（短，手机一屏）。返回 (title, body)。"""
     hhmm = view.slot_hhmm
@@ -1047,12 +1142,12 @@ def render_pulse(view: PulseView) -> tuple[str, str]:
             f"- {n.name} ｜ {n.theme}" if n.theme else f"- {n.name}"
             for n in view.new_limit_ups
         )
-    if view.theme_heat:
-        lines.extend(["", "## 题材热度"])
-        lines.extend(
-            f"- {t.theme}：{t.limit_up_count}板{_body_delta(t.delta)}"
-            for t in view.theme_heat
-        )
+    theme_lines: list[str] = []
+    for rank, summary in enumerate(view.theme_ladders, start=1):
+        if summary_lines := _pulse_theme_ladder_lines(rank, summary):
+            theme_lines.extend(summary_lines)
+    if theme_lines:
+        lines.extend(["", "## 题材梯队 Top5", *theme_lines])
     if view.new_anomalies:
         heading = "放量异动新增" if view.has_prev else "放量异动"
         lines.extend(["", f"## {heading}"])

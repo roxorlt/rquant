@@ -282,6 +282,166 @@ class TestThemeLadderSummaries:
         assert [rung.boards for rung in summaries[0].rungs] == [3, 2, 1]
 
 
+class TestPulseThemeLeaders:
+    @staticmethod
+    def _snapshot_for_theme_counts(
+        counts: dict[str, int], *, start_code: int = 600001
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        rows: list[dict[str, object]] = []
+        members: list[dict[str, str]] = []
+        for theme, count in counts.items():
+            for index in range(count):
+                code = f"{len(rows) + start_code:06d}.SH"
+                rows.append({
+                    "ts_code": code,
+                    "name": f"{theme}{index + 1}",
+                    "price": 11.0,
+                    "pre_close": 10.0,
+                    "pct_chg": 10,
+                    "volume": 1e6,
+                    "amount": 10.0,
+                    "limit_up_price": 11.0,
+                })
+                members.append({"board_name": theme, "con_code": code})
+        return mk_snapshot(rows), pd.DataFrame(members)
+
+    def test_pulse_theme_rank_change_uses_same_ladder_compute(self) -> None:
+        previous, previous_members = self._snapshot_for_theme_counts(
+            {"题材B": 5, "题材C": 4, "题材A": 3, "题材D": 2, "题材E": 1}
+        )
+        current, current_members = self._snapshot_for_theme_counts(
+            {"题材A": 6, "题材C": 5, "题材B": 4, "题材F": 3, "题材G": 2},
+            start_code=600101,
+        )
+        members = pd.concat([previous_members, current_members]).drop_duplicates()
+
+        view = compute_pulse_view(
+            "10:30",
+            current,
+            pd.DataFrame(),
+            previous,
+            pd.DataFrame(),
+            {},
+            pd.DataFrame(),
+            kpl_members=members,
+            prev_limit=pd.DataFrame(),
+        )
+
+        assert [summary.theme for summary in view.theme_ladders] == [
+            "题材A", "题材C", "题材B", "题材F", "题材G"
+        ]
+        assert [summary.rank_change for summary in view.theme_ladders] == [2, 0, -2, None, None]
+        assert [summary.rank_state for summary in view.theme_ladders] == [
+            "changed", "changed", "changed", "new", "new"
+        ]
+
+    def test_pulse_first_slot_hides_theme_rank_change(self) -> None:
+        snapshot, members = self._snapshot_for_theme_counts({"题材A": 1})
+
+        view = compute_pulse_view(
+            "10:00",
+            snapshot,
+            pd.DataFrame(),
+            None,
+            None,
+            {},
+            pd.DataFrame(),
+            kpl_members=members,
+            prev_limit=pd.DataFrame(),
+        )
+
+        assert view.theme_ladders[0].rank_change is None
+        assert view.theme_ladders[0].rank_state == "hidden"
+        _, body = render_pulse(view)
+        theme_section = body.split("## 题材", maxsplit=1)[1]
+        assert "↑" not in theme_section
+        assert "↓" not in theme_section
+        assert "持平" not in theme_section
+        assert "新晋" not in theme_section
+
+    def test_pulse_theme_highest_board_mobile_limit(self) -> None:
+        leaders = [
+            LadderStock(ts_code=f"60000{index}.SH", name=name, boards=3, theme="题材A")
+            for index, name in enumerate(("甲", "乙", "丙"), 1)
+        ]
+        first_board = [
+            LadderStock(ts_code=f"6001{index:02d}.SH", name=f"首板{index}", boards=1, theme="题材A")
+            for index in range(1, 8)
+        ]
+        view = PulseView(
+            slot_hhmm="10:30",
+            has_prev=True,
+            limit_up_count=10,
+            broken_count=0,
+            limit_down_count=0,
+            up_count=3,
+            down_count=0,
+            theme_ladders=[
+                mb.ThemeLadderSummary(
+                    theme="题材A",
+                    limit_up_count=10,
+                    amount=100.0,
+                    rungs=[
+                        mb.ThemeLadderRung(boards=3, stocks=leaders),
+                        mb.ThemeLadderRung(boards=2, stocks=[]),
+                        mb.ThemeLadderRung(boards=1, stocks=first_board),
+                    ],
+                    rank_change=2,
+                    rank_state="changed",
+                )
+            ],
+        )
+
+        _, body = render_pulse(view)
+
+        assert "## 题材梯队 Top5" in body
+        assert "1. 题材A ↑2" in body
+        assert "   涨停 10 ｜ 最高 3板：甲、乙等3只" in body
+        assert "   梯队：3板 3 ｜ 2板 0 ｜ 首板 7" in body
+        assert "丙" not in body
+
+    def test_pulse_theme_rank_labels_render_all_visible_states(self) -> None:
+        def summary(
+            theme: str, rank_change: int | None, rank_state: str
+        ) -> mb.ThemeLadderSummary:
+            return mb.ThemeLadderSummary(
+                theme=theme,
+                limit_up_count=1,
+                amount=10.0,
+                rungs=[
+                    mb.ThemeLadderRung(
+                        boards=1,
+                        stocks=[LadderStock(ts_code="600001.SH", name="甲", boards=1)],
+                    )
+                ],
+                rank_change=rank_change,
+                rank_state=rank_state,
+            )
+
+        view = PulseView(
+            slot_hhmm="10:30",
+            has_prev=True,
+            limit_up_count=4,
+            broken_count=0,
+            limit_down_count=0,
+            up_count=4,
+            down_count=0,
+            theme_ladders=[
+                summary("上升", 2, "changed"),
+                summary("下降", -2, "changed"),
+                summary("持平", 0, "changed"),
+                summary("新晋", None, "new"),
+            ],
+        )
+
+        _, body = render_pulse(view)
+
+        assert "1. 上升 ↑2" in body
+        assert "2. 下降 ↓2" in body
+        assert "3. 持平 持平" in body
+        assert "4. 新晋 新晋" in body
+
+
 # ── U5 候选池 ───────────────────────────────────────────────────────────────────
 
 
@@ -388,8 +548,18 @@ class TestU7Rendering:
                     theme="银发经济",
                 )
             ],
-            theme_heat=[
-                ThemeHeat(theme="AI硬件", limit_up_count=10, delta=3)
+            theme_ladders=[
+                mb.ThemeLadderSummary(
+                    theme="AI硬件",
+                    limit_up_count=10,
+                    amount=100.0,
+                    rungs=[
+                        mb.ThemeLadderRung(
+                            boards=1,
+                            stocks=[LadderStock(ts_code="600001.SH", name="甲", boards=1)],
+                        )
+                    ],
+                )
             ],
             new_anomalies=[
                 mb.VolAnomaly(
@@ -408,8 +578,10 @@ class TestU7Rendering:
             "- 上涨：5022 ｜ 下跌：434\n\n"
             "## 新晋涨停\n"
             "- 京投发展 ｜ 银发经济\n\n"
-            "## 题材热度\n"
-            "- AI硬件：10板（+3）\n\n"
+            "## 题材梯队 Top5\n"
+            "1. AI硬件\n"
+            "   涨停 10 ｜ 最高 1板：甲\n"
+            "   梯队：首板 1\n\n"
             "## 放量异动新增\n"
             "- 上海凯宝：量比 1.26"
         )
@@ -421,12 +593,42 @@ class TestU7Rendering:
             slot_hhmm="10:30", has_prev=True, limit_up_count=47, broken_count=6,
             limit_down_count=2, up_count=2871, down_count=2130,
             limit_up_delta=9, broken_delta=2,
-            theme_heat=[ThemeHeat(theme="人形机器人", limit_up_count=5, delta=2)],
+            theme_ladders=[
+                mb.ThemeLadderSummary(
+                    theme="人形机器人",
+                    limit_up_count=5,
+                    amount=50.0,
+                    rungs=[
+                        mb.ThemeLadderRung(
+                            boards=1,
+                            stocks=[LadderStock(ts_code="600001.SH", name="甲", boards=1)],
+                        )
+                    ],
+                )
+            ],
         )
         title, body = render_pulse(view)
         assert "涨停47(+9)" in title
         assert "- 上涨：2871 ｜ 下跌：2130" in body
-        assert "- 人形机器人：5板（+2）" in body
+        assert "1. 人形机器人" in body
+        assert "   涨停 5 ｜ 最高 1板：甲" in body
+
+    def test_pulse_legacy_theme_heat_is_not_rendered(self) -> None:
+        view = PulseView(
+            slot_hhmm="10:30",
+            has_prev=True,
+            limit_up_count=5,
+            broken_count=0,
+            limit_down_count=0,
+            up_count=5,
+            down_count=0,
+            theme_heat=[ThemeHeat(theme="旧题材", limit_up_count=5, delta=2)],
+        )
+
+        _, body = render_pulse(view)
+
+        assert "题材热度" not in body
+        assert "旧题材" not in body
 
     def test_digest_five_sections(self) -> None:
         view = DigestView(
