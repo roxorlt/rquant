@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable
 from datetime import date, datetime, timedelta, timezone
 from math import isfinite
 from pathlib import Path
@@ -1304,9 +1305,31 @@ def run_morning_pulse(
     prev_snapshot = _read_frame(_frame_path(mdir, "snapshot", prev_tag)) if prev_tag else None
     prev_boards = _read_frame(_frame_path(mdir, "boards", prev_tag)) if prev_tag else None
 
-    theme_map = theme_map_from_kpl(load_kpl_concept_members())
-    avg20 = load_avg_amount_20d()
-    view = compute_pulse_view(hhmm, snapshot, boards, prev_snapshot, prev_boards, theme_map, avg20)
+    kpl_members = pd.DataFrame()
+    prev_limit = pd.DataFrame()
+    avg20 = pd.DataFrame()
+    store = _open_ro_store()
+    try:
+        if store is not None:
+            kpl_members = _load_ro_frame("开盘啦题材成分", load_kpl_concept_members, store)
+            prev_limit = _load_ro_frame("涨停榜", load_prev_limit_list, store)
+            avg20 = _load_ro_frame("20 日均额", load_avg_amount_20d, store)
+    finally:
+        if store is not None:
+            store.close()
+
+    theme_map = theme_map_from_kpl(kpl_members)
+    view = compute_pulse_view(
+        hhmm,
+        snapshot,
+        boards,
+        prev_snapshot,
+        prev_boards,
+        theme_map,
+        avg20,
+        kpl_members=kpl_members,
+        prev_limit=prev_limit,
+    )
     view.route = route
     title, body = render_pulse(view)
     _finish(mdir, meta, tag, route, "脉搏", day, title, body, base_dir, dry_run)
@@ -1362,16 +1385,21 @@ def _build_digest_view(
 ) -> DigestView:
     """从当前快照 + 落盘的各槽位帧 + 只读副本组装五节战报视图。"""
     pulse = compute_market_pulse(snapshot)
-    theme_map = theme_map_from_kpl(load_kpl_concept_members())
-
+    kpl_members = pd.DataFrame()
+    prev_limit = pd.DataFrame()
+    avg20 = pd.DataFrame()
+    positions = pd.DataFrame()
     store = _open_ro_store()
     try:
-        prev_limit = load_prev_limit_list(store)
-        avg20 = load_avg_amount_20d(store)
-        positions = load_active_positions(store)
+        if store is not None:
+            kpl_members = _load_ro_frame("开盘啦题材成分", load_kpl_concept_members, store)
+            prev_limit = _load_ro_frame("涨停榜", load_prev_limit_list, store)
+            avg20 = _load_ro_frame("20 日均额", load_avg_amount_20d, store)
+            positions = _load_ro_frame("持仓", load_active_positions, store)
     finally:
         if store is not None:
             store.close()
+    theme_map = theme_map_from_kpl(kpl_members)
 
     slot_frames = {
         _slot_tag(hhmm): _read_frame(_frame_path(mdir, "snapshot", _slot_tag(hhmm)))
@@ -1404,6 +1432,9 @@ def _build_digest_view(
         broken_ratio_pct=broken_ratio,
         slot_limit_up_series=slot_series,
         prev_day_limit_up=prev_day_lu,
+        theme_ladders=compute_theme_ladder_summaries(
+            snapshot, prev_limit, kpl_members, slot_frames, top_n=_THEME_TOP_N
+        ),
         ladder=compute_board_ladder(snapshot, prev_limit, theme_map),
         top_themes=compute_top_themes(boards, board_frames),
         candidates=build_candidate_pool(snapshot, avg20, theme_map),
@@ -1420,6 +1451,19 @@ def _open_ro_store() -> DuckDBStore | None:
     except Exception as e:
         logger.warning(f"只读副本打开失败，digest 降级空 T-1 数据: {type(e).__name__}: {e}")
         return None
+
+
+def _load_ro_frame(
+    label: str,
+    loader: Callable[[DuckDBStore], pd.DataFrame],
+    store: DuckDBStore,
+) -> pd.DataFrame:
+    """在既有只读连接上读取一张通知依赖表，失败时独立降级为空表。"""
+    try:
+        return loader(store)
+    except Exception as e:
+        logger.warning(f"{label}只读查询失败，通知降级为空数据: {type(e).__name__}: {e}")
+        return pd.DataFrame()
 
 
 def _finish(

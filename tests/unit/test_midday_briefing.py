@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
@@ -774,6 +774,144 @@ class TestU9Notify:
         assert captured["scene"] == "morning_pulse"
         assert captured["title"].startswith("脉搏 10:00")
         assert "涨停" in captured["body"]
+
+
+# ── 只读副本编排：一条通知只开一个受控连接 ─────────────────────────────────────
+
+
+class TestReadonlyStoreOrchestration:
+    NOW = datetime(2026, 7, 6, 10, 0, tzinfo=mb.CST)
+
+    @staticmethod
+    def _snapshot() -> pd.DataFrame:
+        return mk_snapshot([
+            {"ts_code": "600001.SH", "name": "题材龙头", "price": 11.0,
+             "pre_close": 10.0, "pct_chg": 10.0, "volume": 1e6,
+             "amount": 1e7, "limit_up_price": 11.0},
+        ])
+
+    @staticmethod
+    def _members() -> pd.DataFrame:
+        return pd.DataFrame([
+            {"board_name": "AI硬件", "con_code": "600001.SH"},
+        ])
+
+    def test_morning_pulse_reuses_one_readonly_store_for_theme_inputs(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.delenv("RQUANT_PANORAMA_FAKE", raising=False)
+        store = MagicMock()
+        captured: dict[str, str] = {}
+        with (
+            patch.object(mb, "is_trading_day", return_value=True),
+            patch.object(
+                mb,
+                "fetch_slot_frames",
+                return_value=(self._snapshot(), pd.DataFrame(), "test"),
+            ),
+            patch.object(mb, "_open_ro_store", return_value=store) as open_store,
+            patch.object(
+                mb, "load_kpl_concept_members", return_value=self._members()
+            ) as members,
+            patch.object(mb, "load_prev_limit_list", return_value=pd.DataFrame()) as prev_limit,
+            patch.object(mb, "load_avg_amount_20d", return_value=pd.DataFrame()) as avg20,
+            patch.object(
+                mb, "notify", side_effect=lambda scene, **kwargs: captured.update(kwargs)
+            ),
+        ):
+            rc = run_morning_pulse(slot="10:00", now=self.NOW, base_dir=tmp_path)
+
+        assert rc == 0
+        open_store.assert_called_once_with()
+        assert members.call_args.args == (store,)
+        assert prev_limit.call_args.args == (store,)
+        assert avg20.call_args.args == (store,)
+        store.close.assert_called_once_with()
+        assert "## 题材梯队 Top5" in captured["body"]
+        assert "AI硬件" in captured["body"]
+
+    def test_morning_pulse_readonly_open_failure_is_soft_without_reopen(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.delenv("RQUANT_PANORAMA_FAKE", raising=False)
+        captured: dict[str, str] = {}
+        with (
+            patch.object(mb, "is_trading_day", return_value=True),
+            patch.object(
+                mb,
+                "fetch_slot_frames",
+                return_value=(self._snapshot(), pd.DataFrame(), "test"),
+            ),
+            patch.object(mb, "_open_ro_store", return_value=None) as open_store,
+            patch.object(mb, "load_kpl_concept_members") as members,
+            patch.object(mb, "load_prev_limit_list") as prev_limit,
+            patch.object(mb, "load_avg_amount_20d") as avg20,
+            patch.object(
+                mb, "notify", side_effect=lambda scene, **kwargs: captured.update(kwargs)
+            ),
+        ):
+            rc = run_morning_pulse(slot="10:00", now=self.NOW, base_dir=tmp_path)
+
+        assert rc == 0
+        open_store.assert_called_once_with()
+        members.assert_not_called()
+        prev_limit.assert_not_called()
+        avg20.assert_not_called()
+        assert captured["title"].startswith("脉搏 10:00")
+        assert "题材梯队 Top5" not in captured["body"]
+
+    def test_morning_pulse_one_readonly_loader_failure_keeps_other_inputs(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.delenv("RQUANT_PANORAMA_FAKE", raising=False)
+        store = MagicMock()
+        with (
+            patch.object(mb, "is_trading_day", return_value=True),
+            patch.object(
+                mb,
+                "fetch_slot_frames",
+                return_value=(self._snapshot(), pd.DataFrame(), "test"),
+            ),
+            patch.object(mb, "_open_ro_store", return_value=store),
+            patch.object(
+                mb,
+                "load_kpl_concept_members",
+                side_effect=RuntimeError("KPL unavailable"),
+            ),
+            patch.object(mb, "load_prev_limit_list", return_value=pd.DataFrame()) as prev_limit,
+            patch.object(mb, "load_avg_amount_20d", return_value=pd.DataFrame()) as avg20,
+            patch.object(mb, "notify"),
+        ):
+            rc = run_morning_pulse(slot="10:00", now=self.NOW, base_dir=tmp_path)
+
+        assert rc == 0
+        assert prev_limit.call_args.args == (store,)
+        assert avg20.call_args.args == (store,)
+        store.close.assert_called_once_with()
+
+    def test_digest_reuses_store_and_builds_theme_ladders(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.delenv("RQUANT_PANORAMA_FAKE", raising=False)
+        store = MagicMock()
+        with (
+            patch.object(mb, "_open_ro_store", return_value=store) as open_store,
+            patch.object(
+                mb, "load_kpl_concept_members", return_value=self._members()
+            ) as members,
+            patch.object(mb, "load_prev_limit_list", return_value=pd.DataFrame()) as prev_limit,
+            patch.object(mb, "load_avg_amount_20d", return_value=pd.DataFrame()) as avg20,
+            patch.object(mb, "load_active_positions", return_value=pd.DataFrame()) as positions,
+        ):
+            view = mb._build_digest_view(
+                self.NOW.date(), self._snapshot(), pd.DataFrame(), tmp_path
+            )
+
+        open_store.assert_called_once_with()
+        assert members.call_args.args == (store,)
+        assert prev_limit.call_args.args == (store,)
+        assert avg20.call_args.args == (store,)
+        assert positions.call_args.args == (store,)
+        store.close.assert_called_once_with()
+        assert [summary.theme for summary in view.theme_ladders] == ["AI硬件"]
 
 
 # ── 共享 drop（全机单一取数者：poller 落盘，midday 优先读） ─────────────────────
