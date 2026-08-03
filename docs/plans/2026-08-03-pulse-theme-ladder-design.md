@@ -91,10 +91,11 @@ Top5”合为同一个按题材展示的连续梯队；将 30 分钟脉搏的题
 ## DuckDB 与降级边界
 
 任何数据库读取仍只能经 `open_readonly_store()`，不得新增裸 `duckdb.connect()`、默认
-`DuckDBStore()` 或写库路径。`run_morning_pulse()` 在一次可用的只读 store 生命周期内
-复用 `load_prev_limit_list(store)` 与 `load_avg_amount_20d(store)`；同一 store 也传给
-`load_kpl_concept_members(store)`，避免为这次通知额外开主库连接。读取后必须关闭该
-store。
+`DuckDBStore()` 或写库路径。`run_morning_pulse()` / `run_midday_report()` 在网络快照读取前
+用一次短生命周期的只读 store 复用 `load_prev_limit_list(store)`、
+`load_avg_amount_20d(store)`、`load_kpl_concept_members(store)`（午间再读持仓），读取后立即
+关闭，不能持锁跨越网络调用；原始 KPL 成员传入 `fetch_slot_frames()` 和后续视图，避免同次
+通知重复查询。fake 模式传 `None` 给各 fake-aware loader 以保留离线演示数据。
 
 打开只读 store 或任一查询失败时均 fail-soft：记录 warning，返回空 T-1 表/空均额/空
 成员；脉搏仍正常发送市场温度和可得的内容。没有 T-1 涨停榜时当前涨停按首板；没有

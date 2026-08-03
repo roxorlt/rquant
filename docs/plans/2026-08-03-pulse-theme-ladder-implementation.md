@@ -230,15 +230,17 @@ T-1 涨停榜。
 
 **Step 3: 用一次 readonly store 提供脉搏所需依赖**
 
-在 `run_morning_pulse()` 成功取得快照后调用既有 `_open_ro_store()` 一次；在同一个
-`try/finally` 中依次调用 `load_kpl_concept_members(store)`、`load_prev_limit_list(store)`、
-`load_avg_amount_20d(store)`，无论任一步失败或 store 为 `None` 都传相应空 DataFrame，最后
-只关闭成功打开的 store。把这些 DataFrame 传给新的 `compute_pulse_view()`；不可回退到
-无参数 loader，以免重新开连接。
+在 `run_morning_pulse()` / `run_midday_report()` 网络获取快照前调用既有 `_open_ro_store()`
+一次；在同一个短生命周期 `try/finally` 中依次调用
+`load_kpl_concept_members(store)`、`load_prev_limit_list(store)`、`load_avg_amount_20d(store)`
+（午间再取持仓），随后立即关闭 store，不能跨网络取数持锁。把原始 KPL 成员传给
+`fetch_slot_frames(kpl_members=...)` 及相应 view，避免内部二次读取；非 fake 的 store 为
+`None` 时用空 DataFrame 且不可回退到无参数 loader。fake 模式例外：显式以 `None` 调用
+各 fake-aware loader，以保留离线 fixture。任一 loader 异常均独立降级为空表。
 
-在 `_build_digest_view()` 同样把 `load_kpl_concept_members(store)` 纳入已有一次 store 的
-生命周期，并将该原始成员表传给统一摘要计算。所有 DB 访问继续只经
-`open_readonly_store()` / `_open_ro_store()`；不新增直连主库、写操作或连接重试循环。
+`_build_digest_view()` 只消费编排层已读取的原始成员、昨日涨停榜、均额与持仓，并将成员表
+传给统一摘要计算。所有 DB 访问继续只经 `open_readonly_store()` / `_open_ro_store()`；不新增
+直连主库、写操作或连接重试循环。
 
 **Step 4: 运行连接、编排和完整模块测试，确认变绿**
 

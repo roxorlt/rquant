@@ -443,7 +443,10 @@ def _self_fetch_with_retry() -> tuple[pd.DataFrame, dict[str, pd.DataFrame], str
 
 
 def fetch_slot_frames(
-    base_dir: Path | None = None, now: datetime | None = None
+    base_dir: Path | None = None,
+    now: datetime | None = None,
+    *,
+    kpl_members: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, str]:
     """获取当前时刻快照（含涨停价）+ 三体系板块聚合，返回 (snapshot, boards, route)。
 
@@ -451,7 +454,8 @@ def fetch_slot_frames(
     ① 全景 poller 共享 drop（≤300s 新鲜，route 标注「共享:{原route}」）；
     ② 自拉三级路由（drop 陈旧/缺失时），总失败 sleep 60s 重试一次；
     ③ 仍失败 → 返回空快照 + 空 boards（调用方降级短讯）。
-    boards 含各体系 build_board_overview 输出 + system 列。
+    boards 含各体系 build_board_overview 输出 + system 列。调用方传入 ``kpl_members`` 时
+    直接复用，避免通知编排层为同一批题材成员重复读取只读副本。
     """
     now = now or _now_cst()
     shared = _shared_frames(base_dir, now)
@@ -465,7 +469,8 @@ def fetch_slot_frames(
         return pd.DataFrame(), pd.DataFrame(), route
 
     members = _load_members()
-    kpl_members = load_kpl_concept_members()
+    if kpl_members is None:
+        kpl_members = load_kpl_concept_members()
     frames: list[pd.DataFrame] = []
     for system in BOARD_SYSTEMS:
         flow_type = _SYSTEM_FLOW_TYPE.get(system)
@@ -1286,7 +1291,8 @@ def run_morning_pulse(
         logger.info(f"脉搏 {hhmm} 当日已推送，跳过（--force 覆盖）")
         return 0
 
-    snapshot, boards, route = fetch_slot_frames(base_dir, now=now)
+    kpl_members, prev_limit, avg20, _ = _load_notification_inputs(include_positions=False)
+    snapshot, boards, route = fetch_slot_frames(base_dir, now=now, kpl_members=kpl_members)
     if snapshot.empty:
         logger.warning(f"脉搏 {hhmm} 快照三路全失败，降级短讯（不落 snapshot parquet）")
         view = PulseView(slot_hhmm=hhmm, has_prev=False, limit_up_count=0, broken_count=0,
@@ -1304,19 +1310,6 @@ def run_morning_pulse(
     prev_tag = _prev_pulse_tag(tag)
     prev_snapshot = _read_frame(_frame_path(mdir, "snapshot", prev_tag)) if prev_tag else None
     prev_boards = _read_frame(_frame_path(mdir, "boards", prev_tag)) if prev_tag else None
-
-    kpl_members = pd.DataFrame()
-    prev_limit = pd.DataFrame()
-    avg20 = pd.DataFrame()
-    store = _open_ro_store()
-    try:
-        if store is not None:
-            kpl_members = _load_ro_frame("开盘啦题材成分", load_kpl_concept_members, store)
-            prev_limit = _load_ro_frame("涨停榜", load_prev_limit_list, store)
-            avg20 = _load_ro_frame("20 日均额", load_avg_amount_20d, store)
-    finally:
-        if store is not None:
-            store.close()
 
     theme_map = theme_map_from_kpl(kpl_members)
     view = compute_pulse_view(
@@ -1358,7 +1351,8 @@ def run_midday_report(
         logger.info("午间战报当日已推送，跳过（--force 覆盖）")
         return 0
 
-    snapshot, boards, route = fetch_slot_frames(base_dir, now=now)
+    kpl_members, prev_limit, avg20, positions = _load_notification_inputs(include_positions=True)
+    snapshot, boards, route = fetch_slot_frames(base_dir, now=now, kpl_members=kpl_members)
     if snapshot.empty:
         logger.warning("午间战报快照三路全失败，降级短讯")
         view = DigestView(day=day, limit_up_count=0, broken_count=0, limit_down_count=0,
@@ -1373,7 +1367,16 @@ def run_midday_report(
     meta[tag] = SlotMeta(fetched_at=now.isoformat(timespec="seconds"), route=route, pushed=False)
     _write_meta(mdir, meta)
 
-    view = _build_digest_view(day, snapshot, boards, mdir)
+    view = _build_digest_view(
+        day,
+        snapshot,
+        boards,
+        mdir,
+        kpl_members=kpl_members,
+        prev_limit=prev_limit,
+        avg20=avg20,
+        positions=positions,
+    )
     view.route = route
     title, body = render_digest(view)
     _finish(mdir, meta, tag, route, "午间战报", day, title, body, base_dir, dry_run)
@@ -1381,24 +1384,22 @@ def run_midday_report(
 
 
 def _build_digest_view(
-    day: date, snapshot: pd.DataFrame, boards: pd.DataFrame, mdir: Path
+    day: date,
+    snapshot: pd.DataFrame,
+    boards: pd.DataFrame,
+    mdir: Path,
+    *,
+    kpl_members: pd.DataFrame | None = None,
+    prev_limit: pd.DataFrame | None = None,
+    avg20: pd.DataFrame | None = None,
+    positions: pd.DataFrame | None = None,
 ) -> DigestView:
     """从当前快照 + 落盘的各槽位帧 + 只读副本组装五节战报视图。"""
     pulse = compute_market_pulse(snapshot)
-    kpl_members = pd.DataFrame()
-    prev_limit = pd.DataFrame()
-    avg20 = pd.DataFrame()
-    positions = pd.DataFrame()
-    store = _open_ro_store()
-    try:
-        if store is not None:
-            kpl_members = _load_ro_frame("开盘啦题材成分", load_kpl_concept_members, store)
-            prev_limit = _load_ro_frame("涨停榜", load_prev_limit_list, store)
-            avg20 = _load_ro_frame("20 日均额", load_avg_amount_20d, store)
-            positions = _load_ro_frame("持仓", load_active_positions, store)
-    finally:
-        if store is not None:
-            store.close()
+    kpl_members = kpl_members if kpl_members is not None else pd.DataFrame()
+    prev_limit = prev_limit if prev_limit is not None else pd.DataFrame()
+    avg20 = avg20 if avg20 is not None else pd.DataFrame()
+    positions = positions if positions is not None else pd.DataFrame()
     theme_map = theme_map_from_kpl(kpl_members)
 
     slot_frames = {
@@ -1453,10 +1454,32 @@ def _open_ro_store() -> DuckDBStore | None:
         return None
 
 
+def _load_notification_inputs(
+    *, include_positions: bool
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """在快照网络读取前取齐通知依赖，并在同一短生命周期内关闭只读连接。"""
+    store = _open_ro_store()
+    if store is None and not _fake_enabled():
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    try:
+        kpl_members = _load_ro_frame("开盘啦题材成分", load_kpl_concept_members, store)
+        prev_limit = _load_ro_frame("涨停榜", load_prev_limit_list, store)
+        avg20 = _load_ro_frame("20 日均额", load_avg_amount_20d, store)
+        positions = (
+            _load_ro_frame("持仓", load_active_positions, store)
+            if include_positions
+            else pd.DataFrame()
+        )
+        return kpl_members, prev_limit, avg20, positions
+    finally:
+        if store is not None:
+            store.close()
+
+
 def _load_ro_frame(
     label: str,
-    loader: Callable[[DuckDBStore], pd.DataFrame],
-    store: DuckDBStore,
+    loader: Callable[[DuckDBStore | None], pd.DataFrame],
+    store: DuckDBStore | None,
 ) -> pd.DataFrame:
     """在既有只读连接上读取一张通知依赖表，失败时独立降级为空表。"""
     try:

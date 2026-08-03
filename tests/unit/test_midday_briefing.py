@@ -793,7 +793,7 @@ class TestReadonlyStoreOrchestration:
     @staticmethod
     def _members() -> pd.DataFrame:
         return pd.DataFrame([
-            {"board_name": "AI硬件", "con_code": "600001.SH"},
+            {"board_code": "KPL001", "board_name": "AI硬件", "con_code": "600001.SH"},
         ])
 
     def test_morning_pulse_reuses_one_readonly_store_for_theme_inputs(
@@ -808,7 +808,7 @@ class TestReadonlyStoreOrchestration:
                 mb,
                 "fetch_slot_frames",
                 return_value=(self._snapshot(), pd.DataFrame(), "test"),
-            ),
+            ) as fetch,
             patch.object(mb, "_open_ro_store", return_value=store) as open_store,
             patch.object(
                 mb, "load_kpl_concept_members", return_value=self._members()
@@ -827,6 +827,8 @@ class TestReadonlyStoreOrchestration:
         assert prev_limit.call_args.args == (store,)
         assert avg20.call_args.args == (store,)
         store.close.assert_called_once_with()
+        assert members.call_count == 1
+        assert "kpl_members" in fetch.call_args.kwargs
         assert "## 题材梯队 Top5" in captured["body"]
         assert "AI硬件" in captured["body"]
 
@@ -892,7 +894,20 @@ class TestReadonlyStoreOrchestration:
     def test_digest_reuses_store_and_builds_theme_ladders(self, tmp_path, monkeypatch) -> None:
         monkeypatch.delenv("RQUANT_PANORAMA_FAKE", raising=False)
         store = MagicMock()
+        captured_kpl: list[pd.DataFrame | None] = []
+
+        def fetch_with_kpl(
+            base_dir: Path | None = None,
+            now: datetime | None = None,
+            *,
+            kpl_members: pd.DataFrame | None = None,
+        ) -> tuple[pd.DataFrame, pd.DataFrame, str]:
+            captured_kpl.append(kpl_members)
+            return self._snapshot(), pd.DataFrame(), "test"
+
         with (
+            patch.object(mb, "is_trading_day", return_value=True),
+            patch.object(mb, "fetch_slot_frames", side_effect=fetch_with_kpl),
             patch.object(mb, "_open_ro_store", return_value=store) as open_store,
             patch.object(
                 mb, "load_kpl_concept_members", return_value=self._members()
@@ -900,18 +915,94 @@ class TestReadonlyStoreOrchestration:
             patch.object(mb, "load_prev_limit_list", return_value=pd.DataFrame()) as prev_limit,
             patch.object(mb, "load_avg_amount_20d", return_value=pd.DataFrame()) as avg20,
             patch.object(mb, "load_active_positions", return_value=pd.DataFrame()) as positions,
+            patch.object(mb, "notify"),
         ):
-            view = mb._build_digest_view(
-                self.NOW.date(), self._snapshot(), pd.DataFrame(), tmp_path
+            rc = mb.run_midday_report(
+                now=self.NOW.replace(hour=12), base_dir=tmp_path, dry_run=True
             )
 
+        assert rc == 0
         open_store.assert_called_once_with()
         assert members.call_args.args == (store,)
         assert prev_limit.call_args.args == (store,)
         assert avg20.call_args.args == (store,)
         assert positions.call_args.args == (store,)
         store.close.assert_called_once_with()
-        assert [summary.theme for summary in view.theme_ladders] == ["AI硬件"]
+        assert len(captured_kpl) == 1
+        assert captured_kpl[0] is not None
+        assert captured_kpl[0].equals(self._members())
+
+    def test_fake_pulse_dry_run_keeps_theme_ladder_data(
+        self, tmp_path, monkeypatch, capsys
+    ) -> None:
+        monkeypatch.setenv("RQUANT_PANORAMA_FAKE", "1")
+        with (
+            patch.object(mb, "is_trading_day", return_value=True),
+            patch.object(mb, "_open_ro_store", wraps=mb._open_ro_store) as open_store,
+            patch.object(
+                mb, "load_kpl_concept_members", wraps=mb.load_kpl_concept_members
+            ) as members,
+            patch.object(mb, "load_prev_limit_list", wraps=mb.load_prev_limit_list) as prev_limit,
+            patch.object(mb, "load_avg_amount_20d", wraps=mb.load_avg_amount_20d) as avg20,
+        ):
+            rc = run_morning_pulse(slot="10:00", now=self.NOW, base_dir=tmp_path, dry_run=True)
+
+        assert rc == 0
+        assert open_store.call_count == 1
+        assert members.call_args.args == (None,)
+        assert prev_limit.call_args.args == (None,)
+        assert avg20.call_args.args == (None,)
+        assert "## 题材梯队 Top5" in capsys.readouterr().out
+
+    def test_fake_digest_dry_run_keeps_required_readonly_data(
+        self, tmp_path, monkeypatch, capsys
+    ) -> None:
+        monkeypatch.setenv("RQUANT_PANORAMA_FAKE", "1")
+        with (
+            patch.object(mb, "is_trading_day", return_value=True),
+            patch.object(mb, "_open_ro_store", wraps=mb._open_ro_store) as open_store,
+            patch.object(
+                mb, "load_kpl_concept_members", wraps=mb.load_kpl_concept_members
+            ) as members,
+            patch.object(mb, "load_prev_limit_list", wraps=mb.load_prev_limit_list) as prev_limit,
+            patch.object(mb, "load_avg_amount_20d", wraps=mb.load_avg_amount_20d) as avg20,
+            patch.object(mb, "load_active_positions", wraps=mb.load_active_positions) as positions,
+        ):
+            rc = mb.run_midday_report(
+                now=self.NOW.replace(hour=12), base_dir=tmp_path, dry_run=True
+            )
+
+        assert rc == 0
+        assert open_store.call_count == 1
+        assert members.call_args.args == (None,)
+        assert prev_limit.call_args.args == (None,)
+        assert avg20.call_args.args == (None,)
+        assert positions.call_args.args == (None,)
+        body = capsys.readouterr().out
+        assert "## ② 最强题材·连板梯队 Top5" in body
+        assert "昨日终值：涨停" in body
+
+    def test_fetch_slot_frames_uses_injected_kpl_members_without_second_read(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        monkeypatch.delenv("RQUANT_PANORAMA_FAKE", raising=False)
+        members = self._members()
+        with (
+            patch.object(
+                mb,
+                "_shared_frames",
+                return_value=(self._snapshot(), {}, "test"),
+            ),
+            patch.object(mb, "_load_members", return_value=pd.DataFrame()),
+            patch.object(mb, "load_kpl_concept_members") as load_members,
+        ):
+            snapshot, _, route = mb.fetch_slot_frames(
+                tmp_path, now=self.NOW, kpl_members=members
+            )
+
+        assert not snapshot.empty
+        assert route == "test"
+        load_members.assert_not_called()
 
 
 # ── 共享 drop（全机单一取数者：poller 落盘，midday 优先读） ─────────────────────
