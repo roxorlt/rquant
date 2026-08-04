@@ -5,6 +5,28 @@
 
 ---
 
+## 2026-08-04 · v0.27.2 · 爆量近五日推送次数收尾记录
+
+**状态**：PR #143 的 CI run `30512484263`（Python 3.11/3.12）双绿后 squash merge；
+merge SHA 为 `1ec9bac2fa86c9fab3625be980923e8831f7804b`，annotated tag `v0.27.2`
+精确指向该 SHA。**本版本未单独部署**：受控发布自动化执行前，生产已经快进至
+`v0.28.1`，其 HEAD `a637bb62b9efe8c2b9c915466ec086e6f0ba912a` 包含该 merge 的功能；
+此处仅记录后继版本中的生产收尾验收，不将其表述为 v0.27.2 部署成功。
+
+**生产只读验收**：生产 HEAD `a637bb6` 包含目标 SHA，tracked worktree clean；
+`rquant-surge-watch` 当日正常退出。由于截至 8 月 4 日的近五交易日没有足够跨日样本，
+按时间倒序回推 2 个交易日至窗口 `2026-07-27..2026-07-31`：`300673.SZ` 在 7 月
+29 日和 30 日出现，近五日计数为 2，但不进入 7 月 31 日的 `pushed_today`；7 月 31 日
+最新真实记录 `300063.SZ` 经离线正文渲染包含“近5日推送次数：1”。验收只调用纯历史
+加载与渲染路径，`rquant.notify` 未加载，未发送 Push。
+
+**变更边界**：无 schema、systemd、生产数据、nginx 或密钥变更。
+
+**回滚**：只可对 PR #143 创建 revert PR，合并后打新的 SemVer tag 并向前发布；禁止
+直接回退生产 tag 或将本收尾记录当作已完成的独立部署。
+
+---
+
 ## 2026-07-30 · v0.28.1 · 全景页冷启动兜底与爆量历史回看
 
 **状态**：PR #148 经 CI 全绿后 squash merge；annotated tag `v0.28.1` 指向
@@ -170,6 +192,49 @@ manifest。范围为 2026-04-01 至 2026-07-09，资格记录 22,879 条；basel
 **回滚**：本版本没有 schema 或业务数据写入。若发现 Growth snapshot 语义异常，创建
 revert PR、合并后打更高 SemVer tag 并向前发布；禁止生产机直接回退旧 tag 或修改已发布
 binding。紧急情况下只停止新的 Stage 1 研究任务，不停止 monitor、daily 和数据采集链路。
+
+---
+
+## 2026-07-23 · v0.26.4 · 成长板 Stage 1 规划内存止损
+
+**补录说明**：本条补录 PR #128 已核验的历史发布与生产审计事实，不是新的部署或重复执行部署。
+
+**状态**：PR #127 经 Python 3.11/3.12 CI 全绿后 squash merge；annotated tag
+`v0.26.4` 精确指向 `b68c37619a90a049b2170866a3e5e86f710857d7`。04:12 在交易保护
+窗口外通过受控发布器从 `v0.26.3` 部署，未修改 schema 或生产业务数据。
+
+**修复内容**：
+
+- 成长板开盘结构分类按目标日稳定分批，资格解析与覆盖核对复用同一份结构事实，不再重复
+  执行全范围分类。
+- `backfill-plan` 的独立 DuckDB 连接默认限制为 2048 MB、2 线程，并使用命令级临时
+  spill 目录；异常退出后自动清理。
+- 前一交易日 MA5/10/20/60 完整时，候选解析只读取当日收盘；仅为缺少任一均线的代码
+  回退读取 60 个交易日日线。混合样本测试锁定 fallback 不扫描完整均线代码。
+
+**验证**：
+
+- 本地全量 2,306 项测试全部通过；受限沙箱内先通过 2,299 项，另外 7 项端口绑定与
+  `ps` 权限测试在放宽对应本机权限后通过。Ruff 与差异检查通过。
+- GitHub Actions `test (3.11)`、`test (3.12)` 分别用时 6 分 44 秒、6 分 34 秒并通过。
+- 修复前成长板 planner 单进程约 5.9 GiB 后被内核 OOM。生产只读隔离基准运行
+  43 分 32 秒、峰值 1,901,112 KiB，未新增 OOM；随后按用户指令以 SIGTERM 终止，
+  未输出最终 planner JSON，也未写入生产 manifest。该结果只证明内存止损有效，不代表
+  Stage 1 或完整耗时验收通过。
+- 部署后版本为 `v0.26.4` 且 HEAD 精确匹配 tag；preflight `ok=5 warn=0 fail=0 skip=0`，
+  28 个 systemd unit 验证通过。主库与只读副本代际差为 0 分钟；日线最新
+  `2026-07-22`、分钟最新 `2026-07-22 14:59`。Dashboard、NL Screen、Panorama 正常
+  running；monitor/surge-watch 在盘前保持 inactive，六个关键 timers 全部 active。
+- 按“不要再启动远端长任务”的明确要求，本次未手工启动备份或 planner；backup 与
+  replica-sync timer 的下一次计划触发均为 2026-07-23 09:00。
+
+**剩余门禁**：需要在另行允许的资源窗口完成新快速路径下的 growth `backfill-plan`，并以
+新 manifest 依次通过 repair、snapshot、data audit 和 formal replay，取得
+`comparable` 结果。完成前不得宣称成长板 Stage 1 已验收。
+
+**回滚**：本版本无 schema 和业务数据变更。部署失败由受控发布器自动回滚；成功发布后的
+回退必须对 `b68c376` 创建 revert PR、合并为新的 main 提交、打新 SemVer tag 后向前发布，
+禁止在生产机使用 `git reset` 或直接覆盖 DuckDB。
 
 ---
 
