@@ -96,7 +96,7 @@ store = DuckDBStore(settings.duckdb_path, read_only=True)   # 直连主库，盘
 - **让用户试用时必须明确说明**：运行命令、Python 环境、版本号
 - **输出本地路径用完整绝对路径**，不用 `~` 或相对路径
 - **人工核验数据按时间倒序取**：从最新日期往旧找第一个满足测试条件的样本，找不到再往前推，并说明推了多少天
-- **systemd unit 改动（`deploy/systemd/*.{service,timer}`）部署前必须 cloud 端验证**：mac 没装 systemd，OnCalendar 等语法本地测不出。改动后**先让用户在云端跑 `systemd-analyze calendar '<spec>' --iterations 5`** 确认 parse 通过且 Iteration 间隔符合预期（如步进 2min 不是 2sec），**通过再 push**。已知坑：
+- **systemd unit 改动（`deploy/systemd/*.{service,timer}`）必须在 push 或合并前完成 cloud 端验证**：mac 没装 systemd，OnCalendar 等语法本地测不出。Codex 必须在取得用户单独明确的高风险授权后自行 SSH 到 cloud 端运行 `systemd-analyze calendar '<spec>' --iterations 5`，确认 parse 通过且 Iteration 间隔符合预期（如步进 2min 不是 2sec），并向用户报告结果；验证通过前不得 push 或合并该 systemd 改动。已知坑：
   - `HH:MM..HH:MM/N` 中 `/N` 是步进**秒**，不是分钟
   - 跨小时分钟范围 `09:30..11:30/2` 整段被 `Invalid argument` 拒收
   - minute 字段 `*/N` 通配步进**不接受**，但 `0/N` 显式起点接受
@@ -110,17 +110,36 @@ store = DuckDBStore(settings.duckdb_path, read_only=True)   # 直连主库，盘
 - **简化版 GitHub Flow**：只有 main + feature 分支，不搞 develop/release
 - 托管到 GitHub private 或 Gitea 自建，方便服务器 `git pull`
 
+### 受管任务生命周期（强制）
+
+用户只参与需求、方案取舍、用户可见行为的业务验收、高风险变更的明确授权，以及无法恢复的业务工作是否放弃的决定；不需要操作 Git、worktree、测试、PR、CI、合并、tag、部署、回滚、验证或清理。
+
+Codex 必须负责从隔离开发到交付关闭的完整生命周期。所有改变仓库内容的新任务均须遵守
+[`docs/engineering/task-lifecycle.md`](docs/engineering/task-lifecycle.md)；该文件是任务状态、租约、
+PR 证据、发布分类、回收门禁、交付回执与存量保护的唯一详细规范。本文件或其他流程规则与其
+冲突时，以该文件为准。
+
+每个改变仓库内容的任务都必须有 PR（可为 draft）及 lifecycle evidence。开始时先执行新鲜的
+`git fetch --prune`，从新鲜的 `origin/main` 创建隔离分支和 worktree；本地 `main` 只用于受保护的
+集成、发布或只读检查，dirty、diverged 或归属不明时，所有合并、tag、部署与回收必须阻塞，直到有
+clean/reconciled 证据；必须先诊断，禁止盲目 `pull`、`reset`、覆盖或清理。
+改变用户可见行为的任务须在用户业务验收后才能就绪或合并；纯技术、文档与流程任务通过技术门禁后
+可自动推进。任务只有安全回收完成且 PR 终态回执发布后才算关闭；dirty、未知、证据不完整或 PR 后
+新增工作的任务必须隔离（`quarantined`）并保留。合并、tag、部署与回收必须由单一 owner 持集成锁串行执行。
+
+本轮及本策略合并前已存在的分支与 worktree 均为 legacy：不得因本策略删除、重命名、移动、
+重置或迁移；后续仅可经独立审计并满足生命周期规范的证据门禁后处理。
+
 ### 分支命名规范
 
 ```
-feat/weekN-xxx       # MVP 周迭代，如 feat/week1-data-ingestion
-feat/xxx             # MVP 后的新功能，如 feat/multi-factor-scoring
-fix/xxx              # bug 修复
-refactor/xxx         # 重构
-docs/xxx             # 文档
-chore/xxx            # 配置/工具链
-deploy/xxx           # 部署脚本/配置
+cdx/YYYYMMDD-<kind>-<topic>  # Codex，例如 cdx/20260804-fix-duckdb-lock
+cc/YYYYMMDD-<kind>-<topic>   # Claude Code，例如 cc/20260804-feat-vp-engine
 ```
+
+`<kind>` 只能是 `feat`、`fix`、`docs`、`refactor`、`test`、`chore` 或 `deploy`；Codex 或 Claude
+可控制的 worktree 必须位于 `.worktrees/`，目录名只用字母、数字和连字符。不得在本地 `main`
+开发功能。历史非规范名称均为 legacy，不重命名。
 
 ### Commit 规范（Conventional Commits）
 
@@ -148,15 +167,20 @@ chore: init pyproject.toml with uv
 - **v1.x.y** = 可用后的迭代
 - 主版本（2.0.0）保留给架构重大变更
 
-### 合 main 的硬规则
+### 受管集成与发布门禁
 
-每次合 main 前必须：
+**合并前**必须完成：本地实际运行与核心路径验证（不是只看代码）、适用测试、
+`CHANGELOG.md` 的 `[Unreleased]` 更新，以及相关 `README.md` 或文档更新。改变用户可见行为的任务还须
+完成用户业务验收，才可合入 main。
 
-1. ✅ 本地实际运行，核心路径能跑通（**不是只看代码**）
-2. ✅ 更新 `CHANGELOG.md` 的 `[Unreleased]` section
-3. ✅ 测试通过（有 test 的话）
-4. ✅ 打 tag：`git tag -a v0.X.0 -m "Week N: xxx"`
-5. ✅ 关键变更同步到 `README.md` 或相关 docs
+**合并后**按 PR lifecycle record 中的发布分类执行：发布类任务（影响产品行为、runtime、打包产物或生产
+部署结果）必须创建指向已在 `origin/main` 的 squash merge commit 的 annotated SemVer tag，并以精确 tag
+完成受控部署与健康检查。非发布类任务是不影响产品行为、runtime、打包产物或生产部署结果的任务；包括
+实际符合条件的文档、流程、test、refactor 或 chore 变更。非发布类任务必须在 PR lifecycle record 中记录
+tag、部署与健康检查均为 N/A 及具体理由。
+
+**关闭前**必须在适用的合并后门禁完成后，按生命周期规范安全回收并向 PR 发布终态交付回执；未完成前任务
+不得视为结束。
 
 ### Changelog
 

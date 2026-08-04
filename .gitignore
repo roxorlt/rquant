@@ -109,6 +109,7 @@ secrets/
 
 # Claude Code
 .mcp.json
+.claude/worktrees/
 
 # Git worktrees (本地隔离开发分支)
 .worktrees/
