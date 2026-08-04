@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -1187,6 +1188,7 @@ _SURGE_LOG_COLUMNS = [
     "cum_amount", "rel_cum", "room_to_limit_pct", "status",
 ]
 _SURGE_HISTORY_COLUMNS = ["trade_date", *_SURGE_LOG_COLUMNS]
+_SURGE_EVENT_FILENAME_RE = re.compile(r"events-([0-9]{4}-[0-9]{2}-[0-9]{2})\.jsonl")
 _PULSE_LOG_COLUMNS = ["t", "limit_up", "limit_down", "broken", "up", "down",
                       "up_ratio_pct", "total"]
 _PULSE_ALERT_COLUMNS = ["t", "kind", "kind_label", "before", "after",
@@ -1267,9 +1269,11 @@ def search_surge_history(query: str, *, live_dir: Path | None = None) -> pd.Data
     for path in event_paths:
         if not path.is_file():
             continue
-        filename_date = path.name.removeprefix("events-").removesuffix(".jsonl")
+        filename_match = _SURGE_EVENT_FILENAME_RE.fullmatch(path.name)
+        if filename_match is None:
+            continue
         try:
-            trade_date = date.fromisoformat(filename_date)
+            trade_date = date.fromisoformat(filename_match.group(1))
         except ValueError:
             continue
         try:

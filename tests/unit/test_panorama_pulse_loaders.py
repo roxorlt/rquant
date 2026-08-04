@@ -170,22 +170,33 @@ class TestSurgeHistorySearch:
         _write_lines(tmp_path / "events-2026-07-28.jsonl.bak", [
             {"ts_code": "600003.SH", "name": "Alpha Backup", "confirmed_at": "09:33"},
         ])
+        _write_lines(tmp_path / "events-20260729.jsonl", [
+            {"ts_code": "600004.SH", "name": "Alpha Compact", "confirmed_at": "09:34"},
+        ])
+        _write_lines(tmp_path / "events-2026-W31-3.jsonl", [
+            {"ts_code": "600005.SH", "name": "Alpha Week", "confirmed_at": "09:35"},
+        ])
         (tmp_path / "events-2026-07-27.jsonl").write_text("{bad json}\n", encoding="utf-8")
 
         df = search_surge_history("  alpha  ", live_dir=tmp_path)
         assert list(df["ts_code"]) == ["600001.SH"]
 
-    def test_empty_query_and_empty_directory_return_stable_empty_columns(
+    def test_empty_query_no_match_and_empty_directory_return_stable_empty_columns(
         self, tmp_path: Path
     ) -> None:
         empty_query = search_surge_history("   ", live_dir=tmp_path)
         empty_directory = search_surge_history("688255", live_dir=tmp_path)
+        _write_lines(tmp_path / "events-2026-07-29.jsonl", [
+            {"ts_code": "600001.SH", "name": "芯片先锋", "confirmed_at": "09:31"},
+        ])
+        no_match = search_surge_history("不存在", live_dir=tmp_path)
         expected = [
             "trade_date", "confirmed_at", "ts_code", "name", "theme", "pct_chg",
             "cum_amount", "rel_cum", "room_to_limit_pct", "status",
         ]
         assert empty_query.empty and list(empty_query.columns) == expected
         assert empty_directory.empty and list(empty_directory.columns) == expected
+        assert no_match.empty and list(no_match.columns) == expected
 
 
 def _trend(day: str, times: list[str], prices: list[float]) -> pd.DataFrame:
