@@ -3,21 +3,26 @@
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import pandas as pd
 import pytest
 
+import rquant.panorama_data as panorama_data
 from rquant.panorama_data import (
+    load_historical_intraday_trend,
     load_pulse_alerts,
     load_pulse_history,
+    load_surge_event_marks,
     load_surge_log,
     load_surge_marks,
     load_surge_runtime_config,
+    search_surge_history,
     surge_mark_positions,
     volume_directions,
 )
+from rquant.storage.duckdb import DuckDBStore
 
 
 def _write_lines(path: Path, rows: list[dict]) -> None:
@@ -100,6 +105,138 @@ class TestSurgeMarks:
         assert df.empty and list(df.columns) == ["date", "confirmed_at", "rel_cum"]
 
 
+class TestSurgeEventMarks:
+    def test_reads_all_valid_events_for_one_code_in_stable_time_order(self, tmp_path: Path) -> None:
+        _write_lines(tmp_path / f"events-{DAY.isoformat()}.jsonl", [
+            {"ts_code": "688255.SH", "confirmed_at": "10:31", "rel_cum": "4.0"},
+            {"ts_code": "688255.SH", "confirmed_at": "09:47", "rel_cum": 3.2},
+            {"ts_code": "688255.SH", "confirmed_at": "09:47", "rel_cum": 3.3},
+            {"ts_code": "688255.SH", "confirmed_at": "10:45"},
+            {"ts_code": "688255.SH", "confirmed_at": "not-a-time", "rel_cum": 9.0},
+            {"ts_code": "688255.SH", "confirmed_at": "9:05", "rel_cum": 9.0},
+            {"ts_code": "688255.SH", "confirmed_at": "12:99", "rel_cum": 9.0},
+            {"ts_code": "688255.SH", "confirmed_at": "24:00", "rel_cum": 9.0},
+            {"ts_code": "300409.SZ", "confirmed_at": "09:40", "rel_cum": 2.8},
+            {"ts_code": "688255.SH", "rel_cum": 5.0},
+        ])
+        with (tmp_path / f"events-{DAY.isoformat()}.jsonl").open("a", encoding="utf-8") as f:
+            f.write("{bad json}\n")
+
+        df = load_surge_event_marks("688255.SH", DAY, live_dir=tmp_path)
+
+        assert list(df.columns) == ["date", "confirmed_at", "rel_cum"]
+        assert list(df["date"]) == [DAY, DAY, DAY, DAY]
+        assert list(df["confirmed_at"]) == ["09:47", "09:47", "10:31", "10:45"]
+        assert list(df["rel_cum"].iloc[:3]) == pytest.approx([3.2, 3.3, 4.0])
+        assert pd.isna(df.iloc[-1]["rel_cum"])
+
+    def test_empty_file_and_no_match_have_stable_columns(self, tmp_path: Path) -> None:
+        empty = load_surge_event_marks("688255.SH", DAY, live_dir=tmp_path)
+        _write_lines(tmp_path / f"events-{DAY.isoformat()}.jsonl", [
+            {"ts_code": "300409.SZ", "confirmed_at": "09:40", "rel_cum": 2.8},
+        ])
+        no_match = load_surge_event_marks("688255.SH", DAY, live_dir=tmp_path)
+        assert empty.empty and list(empty.columns) == ["date", "confirmed_at", "rel_cum"]
+        assert no_match.empty and list(no_match.columns) == ["date", "confirmed_at", "rel_cum"]
+
+    def test_file_exists_oserror_returns_stable_empty_with_warning(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        warnings: list[str] = []
+
+        def fail_exists(_: Path) -> bool:
+            raise OSError("filesystem unavailable")
+
+        monkeypatch.setattr(Path, "exists", fail_exists)
+        monkeypatch.setattr(
+            panorama_data.logger, "warning", lambda message: warnings.append(str(message))
+        )
+
+        df = load_surge_event_marks("688255.SH", DAY, live_dir=tmp_path)
+
+        assert df.empty and list(df.columns) == ["date", "confirmed_at", "rel_cum"]
+        assert any(
+            "OSError" in message and f"events-{DAY}.jsonl" in message for message in warnings
+        )
+
+    def test_unicode_decode_error_returns_stable_empty_with_warning(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / f"events-{DAY.isoformat()}.jsonl"
+        path.write_bytes(b"\xff")
+        warnings: list[str] = []
+        monkeypatch.setattr(
+            panorama_data.logger, "warning", lambda message: warnings.append(str(message))
+        )
+
+        df = load_surge_event_marks("688255.SH", DAY, live_dir=tmp_path)
+
+        assert df.empty and list(df.columns) == ["date", "confirmed_at", "rel_cum"]
+        assert any(
+            "UnicodeDecodeError" in message and path.name in message for message in warnings
+        )
+
+
+class TestHistoricalIntradayTrend:
+    def test_reads_authoritative_minute_bars_and_calculates_cumulative_vwap(
+        self, tmp_path: Path
+    ) -> None:
+        store = DuckDBStore(tmp_path / "trend.duckdb")
+        try:
+            store.upsert_minute_bars(pd.DataFrame([
+                {
+                    "ts_code": "688255.SH", "trade_time": datetime(2026, 7, 29, 9, 31),
+                    "freq": "1min", "open": 10.0, "high": 10.1, "low": 9.9,
+                    "close": 10.0, "vol": 100.0, "amount": 1_000.0, "source": "tushare_rt",
+                },
+                {
+                    "ts_code": "688255.SH", "trade_time": datetime(2026, 7, 29, 9, 31),
+                    "freq": "1min", "open": 11.0, "high": 11.1, "low": 10.9,
+                    "close": 11.0, "vol": 200.0, "amount": 2_200.0, "source": "tushare",
+                },
+                {
+                    "ts_code": "688255.SH", "trade_time": datetime(2026, 7, 29, 9, 30),
+                    "freq": "1min", "open": 10.0, "high": 10.1, "low": 9.9,
+                    "close": 10.0, "vol": 100.0, "amount": 1_000.0, "source": "tushare",
+                },
+                {
+                    "ts_code": "688255.SH", "trade_time": datetime(2026, 7, 30, 9, 30),
+                    "freq": "1min", "open": 12.0, "high": 12.1, "low": 11.9,
+                    "close": 12.0, "vol": 100.0, "amount": 1_200.0, "source": "tushare",
+                },
+            ]))
+
+            trend = load_historical_intraday_trend("688255.SH", DAY, store=store)
+            assert not store.query_minute_bars(
+                "688255.SH", datetime(2026, 7, 29), datetime(2026, 7, 29, 23, 59, 59)
+            ).empty
+        finally:
+            store.close()
+
+        assert list(trend.columns) == ["dt", "price", "avg_price", "volume"]
+        assert list(trend["dt"]) == [
+            pd.Timestamp("2026-07-29 09:30"), pd.Timestamp("2026-07-29 09:31"),
+        ]
+        assert list(trend["price"]) == pytest.approx([10.0, 11.0])
+        assert list(trend["volume"]) == pytest.approx([100.0, 200.0])
+        assert list(trend["avg_price"]) == pytest.approx([10.0, 10.6666666667])
+
+    def test_empty_day_returns_stable_empty_columns(self, tmp_path: Path) -> None:
+        with DuckDBStore(tmp_path / "empty-trend.duckdb") as store:
+            trend = load_historical_intraday_trend("688255.SH", DAY, store=store)
+        assert trend.empty and list(trend.columns) == ["dt", "price", "avg_price", "volume"]
+
+    def test_open_failure_returns_stable_empty_columns(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def boom(*args, **kwargs):
+            raise OSError("readonly replica unavailable")
+
+        monkeypatch.setattr(panorama_data, "open_readonly_store", boom)
+        trend = load_historical_intraday_trend("688255.SH", DAY)
+        assert trend.empty and list(trend.columns) == ["dt", "price", "avg_price", "volume"]
+
+
 class TestFakeMode:
     def test_fake_covers_all_new_loaders(self, monkeypatch) -> None:
         monkeypatch.setenv("RQUANT_PANORAMA_FAKE", "1")
@@ -113,6 +250,9 @@ class TestFakeMode:
         assert len(log) == 3 and "600001.SH" in set(log["ts_code"])
         marks = load_surge_marks("600001.SH", [date.today()])
         assert len(marks) == 1
+        trend = load_historical_intraday_trend("600001.SH", date(2026, 7, 29))
+        assert list(trend.columns) == ["dt", "price", "avg_price", "volume"]
+        assert len(trend) == 240 and set(trend["dt"].dt.date) == {date(2026, 7, 29)}
 
 
 class TestSurgeLogHistoricalDay:
@@ -133,6 +273,116 @@ class TestSurgeLogHistoricalDay:
         assert list(df2["ts_code"]) == ["300002.SZ"]
 
 
+class TestSurgeHistorySearch:
+    def test_searches_code_and_name_across_days_in_reverse_chronological_order(
+        self, tmp_path: Path
+    ) -> None:
+        d1, d2, d3 = date(2026, 7, 27), date(2026, 7, 28), date(2026, 7, 29)
+        _write_lines(tmp_path / f"events-{d1.isoformat()}.jsonl", [
+            {"ts_code": "688255.SH", "name": "芯片先锋", "confirmed_at": "10:31"},
+            {"ts_code": "688255.SH", "name": "芯片先锋", "confirmed_at": "09:47"},
+        ])
+        _write_lines(tmp_path / f"events-{d2.isoformat()}.jsonl", [
+            {"ts_code": "688255.SH", "name": "芯片先锋", "confirmed_at": "10:00"},
+            {"ts_code": "300409.SZ", "name": "算力股份", "confirmed_at": "09:40"},
+        ])
+        _write_lines(tmp_path / f"events-{d3.isoformat()}.jsonl", [
+            {"ts_code": "688255.SH", "name": "芯片先锋", "confirmed_at": "09:35"},
+            {"ts_code": "688999.SH", "name": "芯片龙头", "confirmed_at": "10:30"},
+        ])
+
+        by_code = search_surge_history("  688255  ", live_dir=tmp_path)
+        assert list(by_code["trade_date"]) == [d3, d2, d1]
+        assert list(by_code["confirmed_at"]) == ["09:35", "10:00", "09:47"]
+
+        by_name = search_surge_history("芯片", live_dir=tmp_path)
+        assert list(by_name["ts_code"]) == ["688999.SH", "688255.SH", "688255.SH", "688255.SH"]
+        assert list(by_name["confirmed_at"]) == ["10:30", "09:35", "10:00", "09:47"]
+
+    def test_preserves_price_through_history_normalization(self, tmp_path: Path) -> None:
+        _write_lines(tmp_path / "events-2026-07-29.jsonl", [{
+            "ts_code": "688255.SH",
+            "name": "芯片先锋",
+            "confirmed_at": "09:31",
+            "price": 12.34,
+        }])
+
+        df = search_surge_history("688255", live_dir=tmp_path)
+
+        assert list(df.columns) == [
+            "trade_date", "confirmed_at", "ts_code", "name", "theme", "price", "pct_chg",
+            "cum_amount", "rel_cum", "room_to_limit_pct", "status",
+        ]
+        assert df.iloc[0]["price"] == pytest.approx(12.34)
+
+    def test_casefolds_query_and_skips_bad_event_filenames_and_records(
+        self, tmp_path: Path
+    ) -> None:
+        _write_lines(tmp_path / "events-2026-07-29.jsonl", [
+            {"ts_code": "600001.SH", "name": "Alpha Tech", "confirmed_at": "09:31"},
+        ])
+        _write_lines(tmp_path / "events-not-a-date.jsonl", [
+            {"ts_code": "600002.SH", "name": "Alpha Invalid", "confirmed_at": "09:32"},
+        ])
+        _write_lines(tmp_path / "events-2026-07-28.jsonl.bak", [
+            {"ts_code": "600003.SH", "name": "Alpha Backup", "confirmed_at": "09:33"},
+        ])
+        _write_lines(tmp_path / "events-20260729.jsonl", [
+            {"ts_code": "600004.SH", "name": "Alpha Compact", "confirmed_at": "09:34"},
+        ])
+        _write_lines(tmp_path / "events-2026-W31-3.jsonl", [
+            {"ts_code": "600005.SH", "name": "Alpha Week", "confirmed_at": "09:35"},
+        ])
+        (tmp_path / "events-2026-07-27.jsonl").write_text("{bad json}\n", encoding="utf-8")
+
+        df = search_surge_history("  alpha  ", live_dir=tmp_path)
+        assert list(df["ts_code"]) == ["600001.SH"]
+
+    def test_empty_query_no_match_and_empty_directory_return_stable_empty_columns(
+        self, tmp_path: Path
+    ) -> None:
+        empty_query = search_surge_history("   ", live_dir=tmp_path)
+        empty_directory = search_surge_history("688255", live_dir=tmp_path)
+        _write_lines(tmp_path / "events-2026-07-29.jsonl", [
+            {"ts_code": "600001.SH", "name": "芯片先锋", "confirmed_at": "09:31"},
+        ])
+        no_match = search_surge_history("不存在", live_dir=tmp_path)
+        expected = [
+            "trade_date", "confirmed_at", "ts_code", "name", "theme", "price", "pct_chg",
+            "cum_amount", "rel_cum", "room_to_limit_pct", "status",
+        ]
+        assert empty_query.empty and list(empty_query.columns) == expected
+        assert empty_directory.empty and list(empty_directory.columns) == expected
+        assert no_match.empty and list(no_match.columns) == expected
+
+    @pytest.mark.parametrize("yield_path", [False, True], ids=["before-first", "after-first"])
+    def test_scan_oserror_returns_stable_empty_columns(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, yield_path: bool
+    ) -> None:
+        valid_path = tmp_path / "events-2026-07-29.jsonl"
+        _write_lines(valid_path, [
+            {"ts_code": "600001.SH", "name": "芯片先锋", "confirmed_at": "09:31"},
+        ])
+
+        def flaky_glob(_: Path, pattern: str):
+            assert pattern == "events-*.jsonl"
+
+            def paths():
+                if yield_path:
+                    yield valid_path
+                raise OSError("directory scan failed")
+
+            return paths()
+
+        monkeypatch.setattr(Path, "glob", flaky_glob)
+        df = search_surge_history("芯片", live_dir=tmp_path)
+        expected = [
+            "trade_date", "confirmed_at", "ts_code", "name", "theme", "price", "pct_chg",
+            "cum_amount", "rel_cum", "room_to_limit_pct", "status",
+        ]
+        assert df.empty and list(df.columns) == expected
+
+
 def _trend(day: str, times: list[str], prices: list[float]) -> pd.DataFrame:
     return pd.DataFrame({
         "dt": pd.to_datetime([f"{day} {t}" for t in times]),
@@ -143,6 +393,38 @@ def _trend(day: str, times: list[str], prices: list[float]) -> pd.DataFrame:
 
 
 class TestSurgeMarkPositions:
+    def test_marks_every_same_day_event_with_neutral_labels(self, tmp_path: Path) -> None:
+        _write_lines(tmp_path / f"events-{DAY.isoformat()}.jsonl", [
+            {"ts_code": "688255.SH", "confirmed_at": "09:47", "rel_cum": 3.2},
+            {"ts_code": "688255.SH", "confirmed_at": "10:15", "rel_cum": 4.5},
+        ])
+        marks = load_surge_event_marks("688255.SH", DAY, live_dir=tmp_path)
+        trend = _trend("2026-07-29", ["09:47", "10:15"], [10.5, 11.0])
+
+        positions = surge_mark_positions(trend, marks)
+
+        assert len(positions) == 2
+        assert list(positions["label"]) == [
+            "09:47 爆量确认 · 3.2×", "10:15 爆量确认 · 4.5×",
+        ]
+
+    def test_groups_same_minute_events_without_losing_ordered_rel_cum_values(self) -> None:
+        trend = _trend("2026-07-29", ["09:47", "10:15"], [10.5, 11.0])
+        marks = pd.DataFrame([
+            {"date": DAY, "confirmed_at": "09:47", "rel_cum": 3.2},
+            {"date": DAY, "confirmed_at": "09:47", "rel_cum": 3.3},
+            {"date": DAY, "confirmed_at": "10:15", "rel_cum": 4.5},
+        ])
+
+        positions = surge_mark_positions(trend, marks)
+
+        assert len(positions) == 2
+        assert positions.iloc[0]["idx"] == 0
+        assert positions.iloc[0]["trigger_count"] == 2
+        assert positions.iloc[0]["rel_cum_values"] == "3.2× / 3.3×"
+        assert positions.iloc[0]["label"] == "09:47 爆量确认 2次 · 3.2× / 3.3×"
+        assert positions.iloc[1]["label"] == "10:15 爆量确认 · 4.5×"
+
     def test_exact_minute_hit(self) -> None:
         trend = _trend("2026-07-29", ["09:46", "09:47", "09:48"], [10.0, 10.5, 10.6])
         marks = pd.DataFrame([{"date": date(2026, 7, 29), "confirmed_at": "09:47",
@@ -150,7 +432,7 @@ class TestSurgeMarkPositions:
         pos = surge_mark_positions(trend, marks)
         assert len(pos) == 1
         assert pos.iloc[0]["idx"] == 1 and pos.iloc[0]["price"] == pytest.approx(10.5)
-        assert pos.iloc[0]["label"] == "09:47 首次爆量确认 · 3.2×"
+        assert pos.iloc[0]["label"] == "09:47 爆量确认 · 3.2×"
 
     def test_missing_minute_falls_back_to_prior_bar(self) -> None:
         trend = _trend("2026-07-29", ["09:46", "09:49"], [10.0, 10.6])
@@ -158,7 +440,7 @@ class TestSurgeMarkPositions:
                                "rel_cum": float("nan")}])
         pos = surge_mark_positions(trend, marks)
         assert pos.iloc[0]["idx"] == 0
-        assert pos.iloc[0]["label"] == "09:47 首次爆量确认"  # rel_cum 缺失不带倍数
+        assert pos.iloc[0]["label"] == "09:47 爆量确认"  # rel_cum 缺失不带倍数
 
     def test_day_absent_skipped_and_empty_inputs(self) -> None:
         trend = _trend("2026-07-29", ["09:46"], [10.0])

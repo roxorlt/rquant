@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -1092,33 +1093,108 @@ def fetch_intraday_trend(ts_code: str, ndays: int = 1) -> pd.DataFrame:
     return _with_route(pd.DataFrame(), "none")
 
 
-def surge_mark_positions(trend: pd.DataFrame, marks: pd.DataFrame) -> pd.DataFrame:
-    """爆量标记时刻 → trend 行位置（列 idx/price/label），供图层画竖线+标记点。
+_HISTORICAL_TREND_COLUMNS = ["dt", "price", "avg_price", "volume"]
 
-    精确分钟缺失（数据缺根）回退同日 ≤ 时刻的最近一根；当日无数据跳过该标记。
+
+def _empty_historical_intraday_trend() -> pd.DataFrame:
+    return pd.DataFrame(columns=_HISTORICAL_TREND_COLUMNS)
+
+
+def load_historical_intraday_trend(
+    ts_code: str, day: date, store: DuckDBStore | None = None
+) -> pd.DataFrame:
+    """读取指定交易日的本地 1 分钟线，并计算日内累计成交均价。
+
+    历史回看只读 DuckDB 副本；分钟源的优先级和去重由
+    ``DuckDBStore.query_minute_bars`` 统一保证。无数据或副本不可用时返回稳定空表。
     """
-    cols = ["idx", "price", "label"]
+    if _fake_enabled():
+        trend = _fake_intraday_trend(ts_code, ndays=1).copy()
+        trend["dt"] = _session_minute_stamps(pd.Timestamp(day))
+        return trend[_HISTORICAL_TREND_COLUMNS]
+
+    owns = store is None
+    try:
+        store = store or open_readonly_store(required_tables=("minute_bar",))
+    except Exception as exc:
+        logger.warning(f"历史分时只读库打开失败: {type(exc).__name__}: {exc}")
+        return _empty_historical_intraday_trend()
+
+    start = datetime.combine(day, datetime.min.time())
+    end = datetime.combine(day, datetime.max.time())
+    try:
+        raw = store.query_minute_bars(ts_code, start, end, freq="1min")
+    except Exception as exc:
+        logger.warning(f"历史分时查询失败: {ts_code} {type(exc).__name__}: {exc}")
+        return _empty_historical_intraday_trend()
+    finally:
+        if owns:
+            store.close()
+
+    if raw.empty:
+        return _empty_historical_intraday_trend()
+    trend = pd.DataFrame({
+        "dt": pd.to_datetime(raw.get("trade_time"), errors="coerce"),
+        "price": pd.to_numeric(raw.get("close"), errors="coerce"),
+        "volume": pd.to_numeric(raw.get("vol"), errors="coerce"),
+        "amount": pd.to_numeric(raw.get("amount"), errors="coerce"),
+    }).dropna(subset=["dt"])
+    if trend.empty:
+        return _empty_historical_intraday_trend()
+    trend = trend.sort_values("dt", kind="stable").reset_index(drop=True)
+    cumulative_volume = trend["volume"].cumsum()
+    trend["avg_price"] = trend["amount"].cumsum() / cumulative_volume.where(cumulative_volume > 0)
+    return trend[_HISTORICAL_TREND_COLUMNS]
+
+
+def surge_mark_positions(trend: pd.DataFrame, marks: pd.DataFrame) -> pd.DataFrame:
+    """爆量标记时刻 → trend 行位置，供图层画竖线+标记点。
+
+    同一真实分钟的多次触发聚为一个点并保留原始倍数顺序。精确分钟缺失（数据缺根）
+    回退同日 ≤ 时刻的最近一根；当日无数据跳过该标记。
+    """
+    cols = ["idx", "price", "label", "trigger_count", "rel_cum_values"]
     if trend is None or trend.empty or marks is None or marks.empty:
         return pd.DataFrame(columns=cols)
     dt = pd.to_datetime(trend["dt"]).reset_index(drop=True)
     prices = pd.to_numeric(trend["price"], errors="coerce").reset_index(drop=True)
-    rows: list[dict] = []
+    grouped: dict[tuple[pd.Timestamp, str], list[object]] = {}
     for m in marks.itertuples():
         try:
-            hh, mm = str(m.confirmed_at).split(":")
+            confirmed_at = str(m.confirmed_at)
+            hh, mm = confirmed_at.split(":")
             target = pd.Timestamp(m.date).replace(hour=int(hh), minute=int(mm))
         except (ValueError, AttributeError, TypeError):
             continue
+        grouped.setdefault((target.normalize(), confirmed_at), []).append(m)
+
+    rows: list[dict[str, object]] = []
+    for (mark_day, confirmed_at), minute_marks in grouped.items():
+        hh, mm = confirmed_at.split(":")
+        target = mark_day.replace(hour=int(hh), minute=int(mm))
         same_day = dt.dt.normalize() == target.normalize()
         candidates = dt[same_day & (dt <= target)]
         if candidates.empty:
             continue
         idx = int(candidates.index[-1])
-        label = f"{m.confirmed_at} 首次爆量确认"
-        rel = getattr(m, "rel_cum", None)
-        if rel is not None and not pd.isna(rel):
-            label += f" · {float(rel):.1f}×"
-        rows.append({"idx": idx, "price": float(prices.iloc[idx]), "label": label})
+        rel_values = []
+        for mark in minute_marks:
+            rel = getattr(mark, "rel_cum", None)
+            rel_values.append("—" if rel is None or pd.isna(rel) else f"{float(rel):.1f}×")
+        rel_cum_values = " / ".join(rel_values)
+        trigger_count = len(minute_marks)
+        label = f"{confirmed_at} 爆量确认"
+        if trigger_count > 1:
+            label += f" {trigger_count}次 · {rel_cum_values}"
+        elif rel_cum_values != "—":
+            label += f" · {rel_cum_values}"
+        rows.append({
+            "idx": idx,
+            "price": float(prices.iloc[idx]),
+            "label": label,
+            "trigger_count": trigger_count,
+            "rel_cum_values": rel_cum_values,
+        })
     return pd.DataFrame(rows, columns=cols)
 
 
@@ -1183,9 +1259,13 @@ def load_daily_kline(
 # surge_watch（后者会拉进 tushare/state.derive 等重依赖）。
 _SURGE_LIVE_DIR_NAME = "surge_live"
 _SURGE_LOG_COLUMNS = [
-    "confirmed_at", "ts_code", "name", "theme", "pct_chg",
+    "confirmed_at", "ts_code", "name", "theme", "price", "pct_chg",
     "cum_amount", "rel_cum", "room_to_limit_pct", "status",
 ]
+_SURGE_HISTORY_COLUMNS = ["trade_date", *_SURGE_LOG_COLUMNS]
+_SURGE_EVENT_MARK_COLUMNS = ["date", "confirmed_at", "rel_cum"]
+_SURGE_EVENT_FILENAME_RE = re.compile(r"events-([0-9]{4}-[0-9]{2}-[0-9]{2})\.jsonl")
+_SURGE_CONFIRMED_AT_RE = re.compile(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]")
 _PULSE_LOG_COLUMNS = ["t", "limit_up", "limit_down", "broken", "up", "down",
                       "up_ratio_pct", "total"]
 _PULSE_ALERT_COLUMNS = ["t", "kind", "kind_label", "before", "after",
@@ -1203,10 +1283,17 @@ def _surge_live_dir(live_dir: Path | None) -> Path:
 
 def _read_jsonl_records(path: Path, required_key: str) -> list[dict]:
     """逐行读 jsonl，跳过坏行/缺关键字段的行；文件缺失 → 空。"""
-    if not path.exists():
+    try:
+        if not path.exists():
+            return []
+        content = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        logger.warning(
+            f"JSONL 文件读取失败，已降级为空: {path}: {type(exc).__name__}: {exc}"
+        )
         return []
     records: list[dict] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in content.splitlines():
         line = line.strip()
         if not line:
             continue
@@ -1243,6 +1330,65 @@ def load_surge_log(day: date | None = None, *, live_dir: Path | None = None) -> 
     return (
         df.sort_values("confirmed_at", kind="stable")
         .drop_duplicates(subset="ts_code", keep="first")
+        .reset_index(drop=True)
+    )
+
+
+def search_surge_history(query: str, *, live_dir: Path | None = None) -> pd.DataFrame:
+    """按代码或名称跨日搜索爆量记录，每标的每天保留首次确认。
+
+    只读取命名严格为 ``events-YYYY-MM-DD.jsonl`` 的文件；坏文件、坏行及非法日期
+    文件名均跳过。空查询返回稳定空表，避免调用方无意扫描全部历史台账。
+    """
+    normalized_query = query.strip().casefold()
+    if not normalized_query:
+        return pd.DataFrame(columns=_SURGE_HISTORY_COLUMNS)
+
+    try:
+        event_paths = list(_surge_live_dir(live_dir).glob("events-*.jsonl"))
+    except OSError:
+        return pd.DataFrame(columns=_SURGE_HISTORY_COLUMNS)
+
+    rows: list[pd.DataFrame] = []
+    for path in event_paths:
+        if not path.is_file():
+            continue
+        filename_match = _SURGE_EVENT_FILENAME_RE.fullmatch(path.name)
+        if filename_match is None:
+            continue
+        try:
+            trade_date = date.fromisoformat(filename_match.group(1))
+        except ValueError:
+            continue
+        try:
+            daily = load_surge_log(trade_date, live_dir=live_dir)
+        except Exception as exc:
+            logger.warning(f"读取爆量历史文件失败，已跳过 {path.name}: {type(exc).__name__}")
+            continue
+        if daily.empty:
+            continue
+        daily = daily.copy()
+        for col in _SURGE_LOG_COLUMNS:
+            if col not in daily.columns:
+                daily[col] = None
+        matches = (
+            daily["ts_code"].fillna("").astype(str).str.casefold().str.contains(
+                normalized_query, regex=False
+            )
+            | daily["name"].fillna("").astype(str).str.casefold().str.contains(
+                normalized_query, regex=False
+            )
+        )
+        if matches.any():
+            matched = daily.loc[matches, _SURGE_LOG_COLUMNS].copy()
+            matched.insert(0, "trade_date", trade_date)
+            rows.append(matched)
+
+    if not rows:
+        return pd.DataFrame(columns=_SURGE_HISTORY_COLUMNS)
+    return (
+        pd.concat(rows, ignore_index=True)[_SURGE_HISTORY_COLUMNS]
+        .sort_values(["trade_date", "confirmed_at"], ascending=[False, False], kind="stable")
         .reset_index(drop=True)
     )
 
@@ -1320,6 +1466,37 @@ def load_surge_marks(
             "rel_cum": pd.to_numeric(pd.Series([r.get("rel_cum")]), errors="coerce").iloc[0],
         })
     return pd.DataFrame(rows, columns=["date", "confirmed_at", "rel_cum"])
+
+
+def load_surge_event_marks(
+    ts_code: str, day: date, *, live_dir: Path | None = None
+) -> pd.DataFrame:
+    """读取某日某标的全部爆量触发，用于历史分时图逐次标记。
+
+    与 ``load_surge_log`` 的每票首次确认台账语义不同，此处保留同一时点的重复事件，
+    并按确认时间稳定排序，以保留原始 JSONL 的相对顺序。
+    """
+    path = _surge_live_dir(live_dir) / f"events-{day.isoformat()}.jsonl"
+    records = _read_jsonl_records(path, "ts_code")
+    rows: list[dict[str, object]] = []
+    for record in records:
+        if str(record.get("ts_code")) != ts_code:
+            continue
+        confirmed_at = str(record.get("confirmed_at") or "")
+        if _SURGE_CONFIRMED_AT_RE.fullmatch(confirmed_at) is None:
+            continue
+        rows.append({
+            "date": day,
+            "confirmed_at": confirmed_at,
+            "rel_cum": pd.to_numeric(pd.Series([record.get("rel_cum")]), errors="coerce").iloc[0],
+        })
+    if not rows:
+        return pd.DataFrame(columns=_SURGE_EVENT_MARK_COLUMNS)
+    return (
+        pd.DataFrame(rows, columns=_SURGE_EVENT_MARK_COLUMNS)
+        .sort_values("confirmed_at", kind="stable")
+        .reset_index(drop=True)
+    )
 
 
 # ── A4 Fake 模式确定性 fixture（RQUANT_PANORAMA_FAKE=1，e2e 可测性） ────────────
