@@ -244,10 +244,12 @@ tag、部署与健康检查均为 N/A 及具体理由。
 用户已授权 Codex 代管日常 PR merge、tag 和腾讯云代码部署。自动化必须走固定安全链路，
 不是任意生产权限：
 
-1. PR 仅在 mergeable 且 Python 3.11/3.12 CI 全绿后 squash merge；随后创建 annotated
-   SemVer tag，tag 必须指向合并后的 `origin/main` commit。
+1. PR 仅在 mergeable 且 Python 3.11/3.12 CI 全绿后 squash merge。只有发布类任务才创建
+   annotated SemVer tag，且 tag 必须指向合并后的精确 `origin/main` commit；非发布类任务必须在
+   PR lifecycle record 中记录 tag、部署与健康检查均为 N/A 及具体理由，不升级版本、不部署。
 2. 腾讯云日常发布只允许通过
-   `bash scripts/deploy-production.sh --target <exact-tag-or-full-sha>`；禁止盲拉 main。
+   `bash scripts/deploy-production.sh --target <exact-tag>`；禁止盲拉 main。部署器即使技术上接受完整 SHA，
+   也仅限受控诊断或既有兼容场景，不得替代普通发布的精确 tag 门禁。
 3. Codex 可直接 SSH 做只读诊断和调用上述部署器，不再要求用户粘贴普通部署命令。
 4. 部署器只接受干净 tracked worktree、main 内精确 target 和快进更新；使用部署锁、
    `uv sync --frozen`、双 preflight、JSONL 审计及失败自动回滚。
