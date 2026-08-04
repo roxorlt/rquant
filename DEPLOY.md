@@ -5,6 +5,27 @@
 
 ---
 
+## 2026-08-04 · v0.28.3 · 爆量历史搜索与触发日趋势标记
+
+**状态**：PR #151 经 Python 3.11/3.12 CI 全绿后 squash merge；annotated tag
+`v0.28.3` 精确指向 `e4e303b0a4c05d2a4deefbee502718053672fe6f`。受控发布器从
+`a637bb62b9efe8c2b9c915466ec086e6f0ba912a` 快进发布，结果为 `deployed`；无 schema、
+systemd、nginx 或密钥变更。
+
+**部署内容**：爆量记录支持跨交易日按标的搜索全部触发记录；从当天记录可打开当日附近的
+趋势图，并在图上标记每一次触发时点。发布前修复 2026-08-04 监控池实际 15 只标的的
+production `minute_bar` 缺口，并刷新只读副本。
+
+**发布与验收**：修复后 preflight 为 `ok=5 warn=0 fail=0 skip=0`；生产健康端点返回
+HTTP 200。真实旧历史样本如缺少 `minute_bar`，趋势图会如实显示“暂不可用”；生产真实历史
+趋势尚未完成全量数据验收，不将该部分表述为已全绿。
+
+**回滚基线**：`a637bb62b9efe8c2b9c915466ec086e6f0ba912a`。如需执行受控代码回滚，使用
+`bash scripts/deploy-production.sh --target a637bb62b9efe8c2b9c915466ec086e6f0ba912a`；
+不得盲目拉取 main 或直接覆盖生产数据。
+
+---
+
 ## 2026-08-04 · v0.27.2 · 爆量近五日推送次数收尾记录
 
 **状态**：PR #143 的 CI run `30512484263`（Python 3.11/3.12）双绿后 squash merge；
