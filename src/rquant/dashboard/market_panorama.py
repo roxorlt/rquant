@@ -691,7 +691,11 @@ def _trend_chart(trend: pd.DataFrame, marks: pd.DataFrame | None = None) -> alt.
         if marks is not None and not marks.empty else pd.DataFrame()
     )
     if not mark_pos.empty:
-        mark_tip = [alt.Tooltip("label:N", title="爆量")]
+        mark_tip = [
+            alt.Tooltip("label:N", title="爆量"),
+            alt.Tooltip("trigger_count:Q", title="次数"),
+            alt.Tooltip("rel_cum_values:N", title="累计倍数"),
+        ]
         layers.append(
             alt.Chart(mark_pos).mark_rule(
                 color="#f97316", strokeDash=[6, 4], size=2

@@ -139,6 +139,43 @@ class TestSurgeEventMarks:
         assert empty.empty and list(empty.columns) == ["date", "confirmed_at", "rel_cum"]
         assert no_match.empty and list(no_match.columns) == ["date", "confirmed_at", "rel_cum"]
 
+    def test_file_exists_oserror_returns_stable_empty_with_warning(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        warnings: list[str] = []
+
+        def fail_exists(_: Path) -> bool:
+            raise OSError("filesystem unavailable")
+
+        monkeypatch.setattr(Path, "exists", fail_exists)
+        monkeypatch.setattr(
+            panorama_data.logger, "warning", lambda message: warnings.append(str(message))
+        )
+
+        df = load_surge_event_marks("688255.SH", DAY, live_dir=tmp_path)
+
+        assert df.empty and list(df.columns) == ["date", "confirmed_at", "rel_cum"]
+        assert any(
+            "OSError" in message and f"events-{DAY}.jsonl" in message for message in warnings
+        )
+
+    def test_unicode_decode_error_returns_stable_empty_with_warning(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / f"events-{DAY.isoformat()}.jsonl"
+        path.write_bytes(b"\xff")
+        warnings: list[str] = []
+        monkeypatch.setattr(
+            panorama_data.logger, "warning", lambda message: warnings.append(str(message))
+        )
+
+        df = load_surge_event_marks("688255.SH", DAY, live_dir=tmp_path)
+
+        assert df.empty and list(df.columns) == ["date", "confirmed_at", "rel_cum"]
+        assert any(
+            "UnicodeDecodeError" in message and path.name in message for message in warnings
+        )
+
 
 class TestHistoricalIntradayTrend:
     def test_reads_authoritative_minute_bars_and_calculates_cumulative_vwap(
@@ -262,6 +299,22 @@ class TestSurgeHistorySearch:
         assert list(by_name["ts_code"]) == ["688999.SH", "688255.SH", "688255.SH", "688255.SH"]
         assert list(by_name["confirmed_at"]) == ["10:30", "09:35", "10:00", "09:47"]
 
+    def test_preserves_price_through_history_normalization(self, tmp_path: Path) -> None:
+        _write_lines(tmp_path / "events-2026-07-29.jsonl", [{
+            "ts_code": "688255.SH",
+            "name": "芯片先锋",
+            "confirmed_at": "09:31",
+            "price": 12.34,
+        }])
+
+        df = search_surge_history("688255", live_dir=tmp_path)
+
+        assert list(df.columns) == [
+            "trade_date", "confirmed_at", "ts_code", "name", "theme", "price", "pct_chg",
+            "cum_amount", "rel_cum", "room_to_limit_pct", "status",
+        ]
+        assert df.iloc[0]["price"] == pytest.approx(12.34)
+
     def test_casefolds_query_and_skips_bad_event_filenames_and_records(
         self, tmp_path: Path
     ) -> None:
@@ -295,7 +348,7 @@ class TestSurgeHistorySearch:
         ])
         no_match = search_surge_history("不存在", live_dir=tmp_path)
         expected = [
-            "trade_date", "confirmed_at", "ts_code", "name", "theme", "pct_chg",
+            "trade_date", "confirmed_at", "ts_code", "name", "theme", "price", "pct_chg",
             "cum_amount", "rel_cum", "room_to_limit_pct", "status",
         ]
         assert empty_query.empty and list(empty_query.columns) == expected
@@ -324,7 +377,7 @@ class TestSurgeHistorySearch:
         monkeypatch.setattr(Path, "glob", flaky_glob)
         df = search_surge_history("芯片", live_dir=tmp_path)
         expected = [
-            "trade_date", "confirmed_at", "ts_code", "name", "theme", "pct_chg",
+            "trade_date", "confirmed_at", "ts_code", "name", "theme", "price", "pct_chg",
             "cum_amount", "rel_cum", "room_to_limit_pct", "status",
         ]
         assert df.empty and list(df.columns) == expected
@@ -354,6 +407,23 @@ class TestSurgeMarkPositions:
         assert list(positions["label"]) == [
             "09:47 爆量确认 · 3.2×", "10:15 爆量确认 · 4.5×",
         ]
+
+    def test_groups_same_minute_events_without_losing_ordered_rel_cum_values(self) -> None:
+        trend = _trend("2026-07-29", ["09:47", "10:15"], [10.5, 11.0])
+        marks = pd.DataFrame([
+            {"date": DAY, "confirmed_at": "09:47", "rel_cum": 3.2},
+            {"date": DAY, "confirmed_at": "09:47", "rel_cum": 3.3},
+            {"date": DAY, "confirmed_at": "10:15", "rel_cum": 4.5},
+        ])
+
+        positions = surge_mark_positions(trend, marks)
+
+        assert len(positions) == 2
+        assert positions.iloc[0]["idx"] == 0
+        assert positions.iloc[0]["trigger_count"] == 2
+        assert positions.iloc[0]["rel_cum_values"] == "3.2× / 3.3×"
+        assert positions.iloc[0]["label"] == "09:47 爆量确认 2次 · 3.2× / 3.3×"
+        assert positions.iloc[1]["label"] == "10:15 爆量确认 · 4.5×"
 
     def test_exact_minute_hit(self) -> None:
         trend = _trend("2026-07-29", ["09:46", "09:47", "09:48"], [10.0, 10.5, 10.6])

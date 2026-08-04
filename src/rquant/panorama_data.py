@@ -1148,32 +1148,53 @@ def load_historical_intraday_trend(
 
 
 def surge_mark_positions(trend: pd.DataFrame, marks: pd.DataFrame) -> pd.DataFrame:
-    """爆量标记时刻 → trend 行位置（列 idx/price/label），供图层画竖线+标记点。
+    """爆量标记时刻 → trend 行位置，供图层画竖线+标记点。
 
-    精确分钟缺失（数据缺根）回退同日 ≤ 时刻的最近一根；当日无数据跳过该标记。
+    同一真实分钟的多次触发聚为一个点并保留原始倍数顺序。精确分钟缺失（数据缺根）
+    回退同日 ≤ 时刻的最近一根；当日无数据跳过该标记。
     """
-    cols = ["idx", "price", "label"]
+    cols = ["idx", "price", "label", "trigger_count", "rel_cum_values"]
     if trend is None or trend.empty or marks is None or marks.empty:
         return pd.DataFrame(columns=cols)
     dt = pd.to_datetime(trend["dt"]).reset_index(drop=True)
     prices = pd.to_numeric(trend["price"], errors="coerce").reset_index(drop=True)
-    rows: list[dict] = []
+    grouped: dict[tuple[pd.Timestamp, str], list[object]] = {}
     for m in marks.itertuples():
         try:
-            hh, mm = str(m.confirmed_at).split(":")
+            confirmed_at = str(m.confirmed_at)
+            hh, mm = confirmed_at.split(":")
             target = pd.Timestamp(m.date).replace(hour=int(hh), minute=int(mm))
         except (ValueError, AttributeError, TypeError):
             continue
+        grouped.setdefault((target.normalize(), confirmed_at), []).append(m)
+
+    rows: list[dict[str, object]] = []
+    for (mark_day, confirmed_at), minute_marks in grouped.items():
+        hh, mm = confirmed_at.split(":")
+        target = mark_day.replace(hour=int(hh), minute=int(mm))
         same_day = dt.dt.normalize() == target.normalize()
         candidates = dt[same_day & (dt <= target)]
         if candidates.empty:
             continue
         idx = int(candidates.index[-1])
-        label = f"{m.confirmed_at} 爆量确认"
-        rel = getattr(m, "rel_cum", None)
-        if rel is not None and not pd.isna(rel):
-            label += f" · {float(rel):.1f}×"
-        rows.append({"idx": idx, "price": float(prices.iloc[idx]), "label": label})
+        rel_values = []
+        for mark in minute_marks:
+            rel = getattr(mark, "rel_cum", None)
+            rel_values.append("—" if rel is None or pd.isna(rel) else f"{float(rel):.1f}×")
+        rel_cum_values = " / ".join(rel_values)
+        trigger_count = len(minute_marks)
+        label = f"{confirmed_at} 爆量确认"
+        if trigger_count > 1:
+            label += f" {trigger_count}次 · {rel_cum_values}"
+        elif rel_cum_values != "—":
+            label += f" · {rel_cum_values}"
+        rows.append({
+            "idx": idx,
+            "price": float(prices.iloc[idx]),
+            "label": label,
+            "trigger_count": trigger_count,
+            "rel_cum_values": rel_cum_values,
+        })
     return pd.DataFrame(rows, columns=cols)
 
 
@@ -1238,7 +1259,7 @@ def load_daily_kline(
 # surge_watch（后者会拉进 tushare/state.derive 等重依赖）。
 _SURGE_LIVE_DIR_NAME = "surge_live"
 _SURGE_LOG_COLUMNS = [
-    "confirmed_at", "ts_code", "name", "theme", "pct_chg",
+    "confirmed_at", "ts_code", "name", "theme", "price", "pct_chg",
     "cum_amount", "rel_cum", "room_to_limit_pct", "status",
 ]
 _SURGE_HISTORY_COLUMNS = ["trade_date", *_SURGE_LOG_COLUMNS]
@@ -1262,10 +1283,17 @@ def _surge_live_dir(live_dir: Path | None) -> Path:
 
 def _read_jsonl_records(path: Path, required_key: str) -> list[dict]:
     """逐行读 jsonl，跳过坏行/缺关键字段的行；文件缺失 → 空。"""
-    if not path.exists():
+    try:
+        if not path.exists():
+            return []
+        content = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        logger.warning(
+            f"JSONL 文件读取失败，已降级为空: {path}: {type(exc).__name__}: {exc}"
+        )
         return []
     records: list[dict] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in content.splitlines():
         line = line.strip()
         if not line:
             continue

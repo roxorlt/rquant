@@ -37,6 +37,7 @@ def test_surge_history_display_inserts_normalized_trade_date() -> None:
 
     assert list(display.columns)[0] == "日期"
     assert list(display["日期"]) == ["2026-07-29", "2026-07-28"]
+    assert list(display["推送价"]) == [12.34, 12.34]
     assert "trade_date" not in display.columns
 
 
@@ -121,6 +122,27 @@ def test_historical_surge_detail_loads_day_trend_and_all_event_marks(
     assert ("trend", ("688255.SH", "2026-07-29")) in calls
     assert ("marks", ("688255.SH", "2026-07-29")) in calls
     assert any(kind == "chart" for kind, _ in calls)
+
+
+def test_trend_chart_tooltip_exposes_repeated_mark_count_and_values() -> None:
+    day = date(2026, 7, 29)
+    trend = pd.DataFrame({
+        "dt": pd.to_datetime(["2026-07-29 09:47"]),
+        "price": [10.5],
+        "avg_price": [10.5],
+        "volume": [100.0],
+    })
+    marks = pd.DataFrame([
+        {"date": day, "confirmed_at": "09:47", "rel_cum": 3.2},
+        {"date": day, "confirmed_at": "09:47", "rel_cum": 3.3},
+    ])
+
+    spec = panorama._trend_chart(trend, marks).to_dict()
+    tooltip = spec["vconcat"][0]["layer"][2]["encoding"]["tooltip"]
+
+    assert [item["field"] for item in tooltip] == [
+        "label", "trigger_count", "rel_cum_values",
+    ]
 
 
 def test_historical_surge_detail_explains_unavailable_minute_data(
