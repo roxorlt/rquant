@@ -15,6 +15,7 @@ from rquant.panorama_data import (
     load_surge_log,
     load_surge_marks,
     load_surge_runtime_config,
+    search_surge_history,
     surge_mark_positions,
     volume_directions,
 )
@@ -131,6 +132,60 @@ class TestSurgeLogHistoricalDay:
         df2 = load_surge_log(d2, live_dir=tmp_path)
         assert list(df1["ts_code"]) == ["600001.SH"]
         assert list(df2["ts_code"]) == ["300002.SZ"]
+
+
+class TestSurgeHistorySearch:
+    def test_searches_code_and_name_across_days_in_reverse_chronological_order(
+        self, tmp_path: Path
+    ) -> None:
+        d1, d2, d3 = date(2026, 7, 27), date(2026, 7, 28), date(2026, 7, 29)
+        _write_lines(tmp_path / f"events-{d1.isoformat()}.jsonl", [
+            {"ts_code": "688255.SH", "name": "芯片先锋", "confirmed_at": "10:31"},
+            {"ts_code": "688255.SH", "name": "芯片先锋", "confirmed_at": "09:47"},
+        ])
+        _write_lines(tmp_path / f"events-{d2.isoformat()}.jsonl", [
+            {"ts_code": "688255.SH", "name": "芯片先锋", "confirmed_at": "10:00"},
+            {"ts_code": "300409.SZ", "name": "算力股份", "confirmed_at": "09:40"},
+        ])
+        _write_lines(tmp_path / f"events-{d3.isoformat()}.jsonl", [
+            {"ts_code": "688255.SH", "name": "芯片先锋", "confirmed_at": "09:35"},
+        ])
+
+        by_code = search_surge_history("  688255  ", live_dir=tmp_path)
+        assert list(by_code["trade_date"]) == [d3, d2, d1]
+        assert list(by_code["confirmed_at"]) == ["09:35", "10:00", "09:47"]
+
+        by_name = search_surge_history("芯片", live_dir=tmp_path)
+        assert list(by_name["ts_code"]) == ["688255.SH", "688255.SH", "688255.SH"]
+
+    def test_casefolds_query_and_skips_bad_event_filenames_and_records(
+        self, tmp_path: Path
+    ) -> None:
+        _write_lines(tmp_path / "events-2026-07-29.jsonl", [
+            {"ts_code": "600001.SH", "name": "Alpha Tech", "confirmed_at": "09:31"},
+        ])
+        _write_lines(tmp_path / "events-not-a-date.jsonl", [
+            {"ts_code": "600002.SH", "name": "Alpha Invalid", "confirmed_at": "09:32"},
+        ])
+        _write_lines(tmp_path / "events-2026-07-28.jsonl.bak", [
+            {"ts_code": "600003.SH", "name": "Alpha Backup", "confirmed_at": "09:33"},
+        ])
+        (tmp_path / "events-2026-07-27.jsonl").write_text("{bad json}\n", encoding="utf-8")
+
+        df = search_surge_history("  alpha  ", live_dir=tmp_path)
+        assert list(df["ts_code"]) == ["600001.SH"]
+
+    def test_empty_query_and_empty_directory_return_stable_empty_columns(
+        self, tmp_path: Path
+    ) -> None:
+        empty_query = search_surge_history("   ", live_dir=tmp_path)
+        empty_directory = search_surge_history("688255", live_dir=tmp_path)
+        expected = [
+            "trade_date", "confirmed_at", "ts_code", "name", "theme", "pct_chg",
+            "cum_amount", "rel_cum", "room_to_limit_pct", "status",
+        ]
+        assert empty_query.empty and list(empty_query.columns) == expected
+        assert empty_directory.empty and list(empty_directory.columns) == expected
 
 
 def _trend(day: str, times: list[str], prices: list[float]) -> pd.DataFrame:

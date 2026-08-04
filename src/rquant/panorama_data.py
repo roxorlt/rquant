@@ -1186,6 +1186,7 @@ _SURGE_LOG_COLUMNS = [
     "confirmed_at", "ts_code", "name", "theme", "pct_chg",
     "cum_amount", "rel_cum", "room_to_limit_pct", "status",
 ]
+_SURGE_HISTORY_COLUMNS = ["trade_date", *_SURGE_LOG_COLUMNS]
 _PULSE_LOG_COLUMNS = ["t", "limit_up", "limit_down", "broken", "up", "down",
                       "up_ratio_pct", "total"]
 _PULSE_ALERT_COLUMNS = ["t", "kind", "kind_label", "before", "after",
@@ -1243,6 +1244,63 @@ def load_surge_log(day: date | None = None, *, live_dir: Path | None = None) -> 
     return (
         df.sort_values("confirmed_at", kind="stable")
         .drop_duplicates(subset="ts_code", keep="first")
+        .reset_index(drop=True)
+    )
+
+
+def search_surge_history(query: str, *, live_dir: Path | None = None) -> pd.DataFrame:
+    """按代码或名称跨日搜索爆量记录，每标的每天保留首次确认。
+
+    只读取命名严格为 ``events-YYYY-MM-DD.jsonl`` 的文件；坏文件、坏行及非法日期
+    文件名均跳过。空查询返回稳定空表，避免调用方无意扫描全部历史台账。
+    """
+    normalized_query = query.strip().casefold()
+    if not normalized_query:
+        return pd.DataFrame(columns=_SURGE_HISTORY_COLUMNS)
+
+    try:
+        event_paths = _surge_live_dir(live_dir).glob("events-*.jsonl")
+    except OSError:
+        return pd.DataFrame(columns=_SURGE_HISTORY_COLUMNS)
+
+    rows: list[pd.DataFrame] = []
+    for path in event_paths:
+        if not path.is_file():
+            continue
+        filename_date = path.name.removeprefix("events-").removesuffix(".jsonl")
+        try:
+            trade_date = date.fromisoformat(filename_date)
+        except ValueError:
+            continue
+        try:
+            daily = load_surge_log(trade_date, live_dir=live_dir)
+        except Exception as exc:
+            logger.warning(f"读取爆量历史文件失败，已跳过 {path.name}: {type(exc).__name__}")
+            continue
+        if daily.empty:
+            continue
+        daily = daily.copy()
+        for col in _SURGE_LOG_COLUMNS:
+            if col not in daily.columns:
+                daily[col] = None
+        matches = (
+            daily["ts_code"].fillna("").astype(str).str.casefold().str.contains(
+                normalized_query, regex=False
+            )
+            | daily["name"].fillna("").astype(str).str.casefold().str.contains(
+                normalized_query, regex=False
+            )
+        )
+        if matches.any():
+            matched = daily.loc[matches, _SURGE_LOG_COLUMNS].copy()
+            matched.insert(0, "trade_date", trade_date)
+            rows.append(matched)
+
+    if not rows:
+        return pd.DataFrame(columns=_SURGE_HISTORY_COLUMNS)
+    return (
+        pd.concat(rows, ignore_index=True)[_SURGE_HISTORY_COLUMNS]
+        .sort_values(["trade_date", "confirmed_at"], ascending=[False, False], kind="stable")
         .reset_index(drop=True)
     )
 
