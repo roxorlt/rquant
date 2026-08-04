@@ -42,14 +42,17 @@ from rquant.panorama_data import (
     industry_fallback_members,
     load_board_members,
     load_daily_kline,
+    load_historical_intraday_trend,
     load_kpl_concept_members,
     load_liquidity_baseline,
     load_pool_flags,
     load_pulse_alerts,
     load_pulse_history,
+    load_surge_event_marks,
     load_surge_log,
     load_surge_marks,
     load_surge_runtime_config,
+    search_surge_history,
     surge_mark_positions,
     volume_directions,
 )
@@ -246,6 +249,24 @@ def cached_surge_log(day_key: str) -> pd.DataFrame:
     """指定日期爆量台账（键为该日 ISO 字符串，切换日期/跨日自动失效；ttl 30s 让盘中增长
     的当日 jsonl 被读到）。"""
     return load_surge_log(date.fromisoformat(day_key))
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def cached_surge_history(query: str) -> pd.DataFrame:
+    """跨日爆量检索（键=去首尾空白后的代码或名称查询）。"""
+    return search_surge_history(query.strip())
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def cached_historical_intraday_trend(ts_code: str, day_key: str) -> pd.DataFrame:
+    """指定交易日完整分钟线（只读副本，避免历史回看触发实时网络取数）。"""
+    return load_historical_intraday_trend(ts_code, date.fromisoformat(day_key))
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def cached_surge_event_marks(ts_code: str, day_key: str) -> pd.DataFrame:
+    """指定交易日的全部爆量确认点，而非台账的每日首次确认。"""
+    return load_surge_event_marks(ts_code, date.fromisoformat(day_key))
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -787,7 +808,7 @@ def render_stock_chart(
         st.caption(
             f"数据路由：{ROUTE_LABELS.get(route, route)}"
             " · 量柱色=分钟涨跌近似（tick-rule），非真实内外盘"
-            " · 橙线=首次爆量确认"
+            " · 橙线=爆量确认"
         )
     else:
         kline = _append_intraday_bar(cached_kline(ts_code), snapshot, ts_code)
@@ -831,6 +852,18 @@ def _surge_log_display(df: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+def _surge_history_display(df: pd.DataFrame) -> pd.DataFrame:
+    """跨日台账展示：日期单列格式化，余列严格复用日台账口径。"""
+    dates = (
+        pd.to_datetime(df.get("trade_date"), errors="coerce")
+        .dt.strftime("%Y-%m-%d")
+        .fillna("")
+    )
+    display = _surge_log_display(df.drop(columns=["trade_date"], errors="ignore"))
+    display.insert(0, "日期", dates.reset_index(drop=True))
+    return display
+
+
 _BOARD_LABELS = {"main": "主板", "gem": "创业", "star": "科创", "bj": "北交"}
 
 
@@ -853,9 +886,66 @@ def _surge_caption(n_rows: int) -> str:
     )
 
 
+def render_historical_surge_detail(ts_code: str, name: str, day: date) -> None:
+    """指定爆量日复盘：完整分钟趋势与该标的当天每个确认时刻。"""
+    day_key = day.isoformat()
+    st.markdown(f"**{ts_code} {name or '—'} · {day_key}**")
+    trend = cached_historical_intraday_trend(ts_code, day_key)
+    if trend.empty:
+        st.info(f"{day_key} 该日分钟数据未入库/暂不可用（只读副本 minute_bar 缺该日记录）")
+        return
+    marks = cached_surge_event_marks(ts_code, day_key)
+    st.altair_chart(_trend_chart(trend, marks), width="stretch")
+    st.caption("数据来源：只读副本 · 量柱色=分钟涨跌近似（tick-rule） · 橙线=爆量确认")
+
+
+def _render_surge_table(df: pd.DataFrame, *, table_key: str, historical: bool) -> int | None:
+    display = _surge_history_display(df) if historical else _surge_log_display(df)
+    event = st.dataframe(
+        display,
+        key=table_key,
+        on_select="rerun",
+        selection_mode="single-row",
+        hide_index=True,
+        width="stretch",
+        height=300,
+    )
+    return _first_selected_row(event)
+
+
 def render_surge_log(snapshot: pd.DataFrame) -> None:
-    """爆量台账：默认今日，可回看历史日期；行选择联动下方个股图表（分时/5日带首次触发标记）。"""
+    """爆量台账：空搜索按日查看；搜索时跨日检索，并可复盘任一爆量日。"""
     today = datetime.now(CST).date()
+    query = st.text_input(
+        "搜索标的",
+        placeholder="输入股票代码或名称，跨天检索全部爆量记录",
+        key="surge_search",
+    )
+    normalized_query = query.strip()
+    if normalized_query:
+        df = cached_surge_history(normalized_query)
+        st.caption(f"跨日检索 · 命中 {len(df)} 条（每标的每日保留首次确认）")
+        if df.empty:
+            st.info(f"未找到“{normalized_query}”的爆量记录")
+            return
+        idx = _render_surge_table(
+            df,
+            table_key=f"surge_history_tbl_{normalized_query.casefold()}",
+            historical=True,
+        )
+        if idx is None or idx >= len(df):
+            st.info("点选记录查看对应交易日的完整分钟趋势与全部爆量确认点")
+            return
+        row = df.iloc[idx]
+        selected_day = pd.to_datetime(row["trade_date"], errors="coerce")
+        if pd.isna(selected_day):
+            st.info("该记录日期无效，暂不能加载历史趋势")
+            return
+        render_historical_surge_detail(
+            str(row["ts_code"]), str(row.get("name", "")), selected_day.date()
+        )
+        return
+
     sel = st.date_input(
         "爆量日期", value=today, max_value=today, key="surge_day", format="YYYY-MM-DD"
     )
@@ -868,27 +958,14 @@ def render_surge_log(snapshot: pd.DataFrame) -> None:
         else:
             st.info(f"{sel.isoformat()} 无爆量记录")
         return
-    event = st.dataframe(
-        _surge_log_display(df),
-        key="surge_tbl",
-        on_select="rerun",
-        selection_mode="single-row",
-        hide_index=True,
-        width="stretch",
-        height=300,
-    )
+    idx = _render_surge_table(df, table_key=f"surge_tbl_{sel.isoformat()}", historical=False)
     caption = _surge_caption(len(df))
-    if sel != today:
-        caption += " · 历史日期：个股图表为最新行情，触发标记仅当该日落在图表日期范围内时显示"
     st.caption(caption)
-    idx = _first_selected_row(event)
     if idx is None or idx >= len(df):
-        st.info("点选记录查看个股图表（分时/5日图标注首次爆量触发时刻）")
+        st.info("点选记录查看对应交易日的完整分钟趋势与全部爆量确认点")
         return
     row = df.iloc[idx]
-    render_stock_chart(
-        str(row["ts_code"]), str(row.get("name", "")), snapshot, key_prefix="surge"
-    )
+    render_historical_surge_detail(str(row["ts_code"]), str(row.get("name", "")), sel)
 
 
 # ── 页面主体 ──────────────────────────────────────────────────────────────────
