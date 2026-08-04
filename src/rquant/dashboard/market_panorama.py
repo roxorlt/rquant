@@ -1017,4 +1017,5 @@ def render_body() -> None:
         render_surge_log(snapshot)
 
 
-render_body()
+if __name__ == "__main__":
+    render_body()
