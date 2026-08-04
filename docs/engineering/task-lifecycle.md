@@ -16,9 +16,12 @@ Codex 必须负责一个任务从创建到关闭的完整生命周期，包括�
 
 ## 工具落地前的人工协议
 
-在自动生命周期工具落地前，本节的人工协议是受管任务的唯一事实来源。每个会改变仓库内容的
-受管任务都必须有一个 GitHub PR（可先为 draft）。PR 正文或专用 lifecycle comment 必须随状态
-更新并记录：任务状态、仓库、PR、分支、head SHA、base SHA、worktree、owner thread/tool。
+在自动生命周期工具落地前，本节的人工协议是受管任务的唯一事实来源。当前受管的 private
+GitHub origin 中，每个会改变仓库内容的受管任务都必须有一个 GitHub PR（可先为 draft）。PR
+正文或专用 lifecycle comment 必须随状态更新并记录：任务状态、仓库、PR、分支、head SHA、
+base SHA、worktree、owner thread/tool。未来若迁移到 Gitea，必须先为该 remote 明确定义并验证
+等价的、可保留的不可变 review/merge evidence adapter，才可启用受管合并与回收；在 adapter
+就绪前，相关任务必须 `blocked` 或 `quarantined`，不得以提交祖先推测或其他猜测替代证据。
 跨会话任务或在创建正式 PR 前被 `blocked` 的任务，Codex 必须在安全且技术可行时于结束会话前
 推送分支并创建或更新 draft PR，保留上述记录。
 
@@ -67,9 +70,11 @@ Conventional Commits，例如 `feat:` 或 `fix:`；分支前缀只用于标明�
 
 Codex 或 Claude 可控制位置的新 worktree 必须创建在 `.worktrees/` 下，且目录名只使用字母、
 数字和连字符，例如 `.worktrees/cdx-20260804-fix-duckdb-lock`；目录名不得包含斜杠。外部
-harness 控制的位置和既有 legacy worktree 不受此位置规则约束，但仍受本规范的状态、保护和审计
-要求约束。历史分支、历史 worktree 和既有非规范命名均视为 legacy，不要求重命名，也不得仅因
-不符合新命名而删除。
+harness 控制的位置和既有 legacy worktree 不受此位置规则约束，但仍受本规范的状态、保护、
+审计与回收门禁约束。外部 harness worktree 只能在全部回收门禁通过、任务 ownership 可证明，
+且使用 harness/tool 支持的非强制 remove 或 close 操作时才可安全回收；不得手工删除其目录。若
+不具备受支持的移除机制或无法证明 ownership，任务必须 `quarantined`，不得进入 `closed`。历史
+分支、历史 worktree 和既有非规范命名均视为 legacy，不要求重命名，也不得仅因不符合新命名而删除。
 
 ## 切换范围
 
@@ -125,6 +130,11 @@ worktree 是正被本地或生产常驻服务使用的 checkout；deploy worktre
 checkout。保护标记或人工注册表必须可追溯地记录对象路径、类型、owner、用途和最后核验时间；
 没有该证据时按受保护对象处理。
 
+本策略阶段不定义也不授权对 dirty、diverged 或归属不明的本地 `main` 进行破坏性 reconciliation。
+这类状态必须由单独、可审计的 remediation task 处理，先保留并归属所有提交与本地文件，再形成
+clean/reconciled 证据。在此之前，合并、tag、部署与回收一律阻塞；禁止盲目 `pull`、`reset`、
+`clean`、覆盖或删除来取得表面 clean 状态。
+
 ## 合并、发布与回收门禁
 
 PR 必须使用受管分支，并在可合并、所需 CI 全绿后 squash merge。由于 squash 会改变提交祖先
@@ -137,8 +147,9 @@ HEAD 必须等于 `head.sha`，并且在新鲜 `git fetch` 后 `merge_commit_sha
 `closed`；不需要生产部署的任务在记录「部署不适用（N/A）」及其理由后，可从 `merged` 直接
 进入 `closed`：
 
-1. 已记录完整不可变 PR 证据元组，且其对应当前任务；GitHub 自动删除远端 head branch 后，保留的
-   PR 元数据仍是充分证据，不要求另有删除事件记录。
+1. 已记录完整不可变 PR 证据元组，且其对应当前任务；当前 GitHub origin 自动删除远端 head branch
+   后，保留的 PR 元数据仍是充分证据，不要求另有删除事件记录。Gitea remote 未先具备本文件要求的
+   evidence adapter 时，不得进入此门禁或关闭。
 2. 任务分支在 PR 后没有新的提交；本地引用与已核验的 `head.sha` 一致。
 3. 任务 worktree 不存在 tracked 或 untracked 改动，除非它们属于该任务开始前已声明的可丢弃
    allowlist；每个任务的 allowlist 只可包含可重复生成的产物，并须在移除前记录且完成相应处理。
@@ -152,8 +163,9 @@ PR/head/merge evidence 和计划清理成功发布为 PR 的 provisional receipt
 在该步骤成功前不得开始清理。随后才从受保护的集成上下文中执行清理。清理后 Codex 必须成功将
 final receipt 发布到 PR，再原子更新任务 JSON；只有 final receipt 发布成功后才可将状态设为
 `closed` 并释放租约。清理时，Codex 在持有集成锁时回收该任务的远端功能分支、以正常方式移除该任务
-worktree（不得使用 force）。随后必须重新核验精确的本地 branch、其 HEAD 与已移除 worktree 的
-身份：仅当它们仍与已核验的受管任务完全匹配时，才明确允许执行
+worktree（不得使用 force）。外部 harness worktree 必须改用其受支持的非强制 remove 或 close 操作，
+绝不手工删除目录；若该操作不可用或 ownership 无法证明，立即停止并设为 `quarantined`。随后必须
+重新核验精确的本地 branch、其 HEAD 与已移除 worktree 的身份：仅当它们仍与已核验的受管任务完全匹配时，才明确允许执行
 `git branch -D <exact-verified-branch>`。`-D` 绝不得用于 legacy 或未知分支。任何部分清理失败或
 final receipt 发布失败都必须立即停止：保留所有尚未移除的 artifacts，在本地任务 JSON 记录已经
 完成及失败的清理结果并设为 `quarantined`，随后重试 PR final/quarantine receipt；不得声称已移除
@@ -199,8 +211,9 @@ PR number/URL、`merged_at` 与 `merge_commit_sha` 标记为 N/A 并写明原因
 - 远端分支、本地分支和 worktree 的清理结果，或进入 `quarantined` 的具体原因；
 - 记录时间戳。
 
-回执是关闭判定的一部分，不得在缺少回执时将任务标记为 `closed`。GitHub 自动删除 head branch
-的情形，回执中的完整 PR 证据元组即为身份依据。
+回执是关闭判定的一部分，不得在缺少回执时将任务标记为 `closed`。当前 GitHub origin 自动删除
+head branch 的情形，回执中的完整 PR 证据元组即为身份依据；未来 Gitea 必须使用已定义的 evidence
+adapter，不得以 ancestry 猜测代替。
 
 ## 异常与存量保护
 

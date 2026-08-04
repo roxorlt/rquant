@@ -108,7 +108,9 @@ store = DuckDBStore(settings.duckdb_path, read_only=True)   # 直连主库，盘
 
 - **main 永远可运行可部署**：任何时刻 checkout main 都能跑起来
 - **简化版 GitHub Flow**：只有 main + feature 分支，不搞 develop/release
-- 托管到 GitHub private 或 Gitea 自建，方便服务器 `git pull`
+- 当前受管 origin 是 private GitHub，方便服务器 `git pull`；未来 Gitea remote 必须先具备
+  `docs/engineering/task-lifecycle.md` 定义的等价不可变 review/merge evidence adapter，才可受管合并
+  与回收；否则任务必须阻塞或隔离，不得以 ancestry 猜测替代证据
 
 ### 受管任务生命周期（强制）
 
@@ -122,7 +124,8 @@ PR 证据、发布分类、回收门禁、交付回执与存量保护的唯一�
 每个改变仓库内容的任务都必须有 PR（可为 draft）及 lifecycle evidence。开始时先执行新鲜的
 `git fetch --prune`，从新鲜的 `origin/main` 创建隔离分支和 worktree；本地 `main` 只用于受保护的
 集成、发布或只读检查，dirty、diverged 或归属不明时，所有合并、tag、部署与回收必须阻塞，直到有
-clean/reconciled 证据；必须先诊断，禁止盲目 `pull`、`reset`、覆盖或清理。
+clean/reconciled 证据；本策略不授权 destructive reconciliation，必须由独立的可审计 remediation task
+保留并归属提交和本地文件后处理；禁止盲目 `pull`、`reset`、`clean`、覆盖或删除。
 改变用户可见行为的任务须在用户业务验收后才能就绪或合并；纯技术、文档与流程任务通过技术门禁后
 可自动推进。任务只有安全回收完成且 PR 终态回执发布后才算关闭；dirty、未知、证据不完整或 PR 后
 新增工作的任务必须隔离（`quarantined`）并保留。合并、tag、部署与回收必须由单一 owner 持集成锁串行执行。
@@ -138,8 +141,10 @@ cc/YYYYMMDD-<kind>-<topic>   # Claude Code，例如 cc/20260804-feat-vp-engine
 ```
 
 `<kind>` 只能是 `feat`、`fix`、`docs`、`refactor`、`test`、`chore` 或 `deploy`；Codex 或 Claude
-可控制的 worktree 必须位于 `.worktrees/`，目录名只用字母、数字和连字符。不得在本地 `main`
-开发功能。历史非规范名称均为 legacy，不重命名。
+可控制的 worktree 必须位于 `.worktrees/`，目录名只用字母、数字和连字符。外部 harness worktree
+虽不受位置规则约束，仍须通过全部生命周期门禁，并只能以 harness/tool 支持的非强制 remove 或 close
+操作回收；不能证明 ownership 或没有受支持的操作时必须 `quarantined`，不得手工删目录或关闭。不得
+在本地 `main` 开发功能。历史非规范名称均为 legacy，不重命名。
 
 ### Commit 规范（Conventional Commits）
 
