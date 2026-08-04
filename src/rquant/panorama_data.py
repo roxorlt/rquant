@@ -1169,7 +1169,7 @@ def surge_mark_positions(trend: pd.DataFrame, marks: pd.DataFrame) -> pd.DataFra
         if candidates.empty:
             continue
         idx = int(candidates.index[-1])
-        label = f"{m.confirmed_at} 首次爆量确认"
+        label = f"{m.confirmed_at} 爆量确认"
         rel = getattr(m, "rel_cum", None)
         if rel is not None and not pd.isna(rel):
             label += f" · {float(rel):.1f}×"

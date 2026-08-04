@@ -340,6 +340,21 @@ def _trend(day: str, times: list[str], prices: list[float]) -> pd.DataFrame:
 
 
 class TestSurgeMarkPositions:
+    def test_marks_every_same_day_event_with_neutral_labels(self, tmp_path: Path) -> None:
+        _write_lines(tmp_path / f"events-{DAY.isoformat()}.jsonl", [
+            {"ts_code": "688255.SH", "confirmed_at": "09:47", "rel_cum": 3.2},
+            {"ts_code": "688255.SH", "confirmed_at": "10:15", "rel_cum": 4.5},
+        ])
+        marks = load_surge_event_marks("688255.SH", DAY, live_dir=tmp_path)
+        trend = _trend("2026-07-29", ["09:47", "10:15"], [10.5, 11.0])
+
+        positions = surge_mark_positions(trend, marks)
+
+        assert len(positions) == 2
+        assert list(positions["label"]) == [
+            "09:47 爆量确认 · 3.2×", "10:15 爆量确认 · 4.5×",
+        ]
+
     def test_exact_minute_hit(self) -> None:
         trend = _trend("2026-07-29", ["09:46", "09:47", "09:48"], [10.0, 10.5, 10.6])
         marks = pd.DataFrame([{"date": date(2026, 7, 29), "confirmed_at": "09:47",
@@ -347,7 +362,7 @@ class TestSurgeMarkPositions:
         pos = surge_mark_positions(trend, marks)
         assert len(pos) == 1
         assert pos.iloc[0]["idx"] == 1 and pos.iloc[0]["price"] == pytest.approx(10.5)
-        assert pos.iloc[0]["label"] == "09:47 首次爆量确认 · 3.2×"
+        assert pos.iloc[0]["label"] == "09:47 爆量确认 · 3.2×"
 
     def test_missing_minute_falls_back_to_prior_bar(self) -> None:
         trend = _trend("2026-07-29", ["09:46", "09:49"], [10.0, 10.6])
@@ -355,7 +370,7 @@ class TestSurgeMarkPositions:
                                "rel_cum": float("nan")}])
         pos = surge_mark_positions(trend, marks)
         assert pos.iloc[0]["idx"] == 0
-        assert pos.iloc[0]["label"] == "09:47 首次爆量确认"  # rel_cum 缺失不带倍数
+        assert pos.iloc[0]["label"] == "09:47 爆量确认"  # rel_cum 缺失不带倍数
 
     def test_day_absent_skipped_and_empty_inputs(self) -> None:
         trend = _trend("2026-07-29", ["09:46"], [10.0])
