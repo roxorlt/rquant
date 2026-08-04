@@ -57,9 +57,33 @@ def test_cached_surge_history_strips_query_before_loading(
     )
     panorama.cached_surge_history.clear()
 
-    panorama.cached_surge_history("  芯片  ")
+    try:
+        panorama.cached_surge_history("  芯片  ")
+    finally:
+        panorama.cached_surge_history.clear()
 
     assert calls == ["芯片"]
+
+
+def test_surge_history_table_key_tracks_query_and_ordered_result_identity() -> None:
+    rows = pd.DataFrame([
+        _surge_row(trade_date="2026-07-29", confirmed_at="10:15"),
+        _surge_row(trade_date="2026-07-28", confirmed_at="09:45"),
+    ])
+    duplicate = rows.copy()
+    inserted = pd.concat(
+        [pd.DataFrame([_surge_row(trade_date="2026-07-30", confirmed_at="09:31")]), rows],
+        ignore_index=True,
+    )
+    reordered = rows.iloc[::-1].reset_index(drop=True)
+
+    original_key = panorama._surge_history_table_key("  芯片  ", rows)
+
+    assert original_key == panorama._surge_history_table_key("芯片", duplicate)
+    assert original_key != panorama._surge_history_table_key("半导体", rows)
+    assert original_key != panorama._surge_history_table_key("芯片", inserted)
+    assert original_key != panorama._surge_history_table_key("芯片", reordered)
+    assert "芯片" not in panorama._surge_history_table_key("芯片" * 80, rows)
 
 
 def test_historical_surge_detail_loads_day_trend_and_all_event_marks(

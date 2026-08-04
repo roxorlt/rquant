@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import time
 from datetime import date, datetime, timedelta, timezone
+from hashlib import sha256
 
 import altair as alt
 import pandas as pd
@@ -864,6 +865,18 @@ def _surge_history_display(df: pd.DataFrame) -> pd.DataFrame:
     return display
 
 
+def _surge_history_table_key(query: str, df: pd.DataFrame) -> str:
+    """跨日结果表的选择态键：查询与有序结果集变化时均重置。"""
+    normalized_query = query.strip().casefold()
+    query_digest = sha256(normalized_query.encode("utf-8")).hexdigest()[:12]
+    identity_columns = ["trade_date", "ts_code", "confirmed_at"]
+    identity_rows = []
+    for row in df.reindex(columns=identity_columns).itertuples(index=False, name=None):
+        identity_rows.append("\x1f".join("" if pd.isna(value) else str(value) for value in row))
+    result_digest = sha256("\x1e".join(identity_rows).encode("utf-8")).hexdigest()[:16]
+    return f"surge_history_tbl_{query_digest}_{result_digest}"
+
+
 _BOARD_LABELS = {"main": "主板", "gem": "创业", "star": "科创", "bj": "北交"}
 
 
@@ -930,7 +943,7 @@ def render_surge_log(snapshot: pd.DataFrame) -> None:
             return
         idx = _render_surge_table(
             df,
-            table_key=f"surge_history_tbl_{normalized_query.casefold()}",
+            table_key=_surge_history_table_key(normalized_query, df),
             historical=True,
         )
         if idx is None or idx >= len(df):
