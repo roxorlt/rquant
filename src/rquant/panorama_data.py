@@ -1261,7 +1261,7 @@ def search_surge_history(query: str, *, live_dir: Path | None = None) -> pd.Data
         return pd.DataFrame(columns=_SURGE_HISTORY_COLUMNS)
 
     try:
-        event_paths = _surge_live_dir(live_dir).glob("events-*.jsonl")
+        event_paths = list(_surge_live_dir(live_dir).glob("events-*.jsonl"))
     except OSError:
         return pd.DataFrame(columns=_SURGE_HISTORY_COLUMNS)
 

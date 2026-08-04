@@ -149,6 +149,7 @@ class TestSurgeHistorySearch:
         ])
         _write_lines(tmp_path / f"events-{d3.isoformat()}.jsonl", [
             {"ts_code": "688255.SH", "name": "芯片先锋", "confirmed_at": "09:35"},
+            {"ts_code": "688999.SH", "name": "芯片龙头", "confirmed_at": "10:30"},
         ])
 
         by_code = search_surge_history("  688255  ", live_dir=tmp_path)
@@ -156,7 +157,8 @@ class TestSurgeHistorySearch:
         assert list(by_code["confirmed_at"]) == ["09:35", "10:00", "09:47"]
 
         by_name = search_surge_history("芯片", live_dir=tmp_path)
-        assert list(by_name["ts_code"]) == ["688255.SH", "688255.SH", "688255.SH"]
+        assert list(by_name["ts_code"]) == ["688999.SH", "688255.SH", "688255.SH", "688255.SH"]
+        assert list(by_name["confirmed_at"]) == ["10:30", "09:35", "10:00", "09:47"]
 
     def test_casefolds_query_and_skips_bad_event_filenames_and_records(
         self, tmp_path: Path
@@ -197,6 +199,33 @@ class TestSurgeHistorySearch:
         assert empty_query.empty and list(empty_query.columns) == expected
         assert empty_directory.empty and list(empty_directory.columns) == expected
         assert no_match.empty and list(no_match.columns) == expected
+
+    @pytest.mark.parametrize("yield_path", [False, True], ids=["before-first", "after-first"])
+    def test_scan_oserror_returns_stable_empty_columns(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, yield_path: bool
+    ) -> None:
+        valid_path = tmp_path / "events-2026-07-29.jsonl"
+        _write_lines(valid_path, [
+            {"ts_code": "600001.SH", "name": "芯片先锋", "confirmed_at": "09:31"},
+        ])
+
+        def flaky_glob(_: Path, pattern: str):
+            assert pattern == "events-*.jsonl"
+
+            def paths():
+                if yield_path:
+                    yield valid_path
+                raise OSError("directory scan failed")
+
+            return paths()
+
+        monkeypatch.setattr(Path, "glob", flaky_glob)
+        df = search_surge_history("芯片", live_dir=tmp_path)
+        expected = [
+            "trade_date", "confirmed_at", "ts_code", "name", "theme", "pct_chg",
+            "cum_amount", "rel_cum", "room_to_limit_pct", "status",
+        ]
+        assert df.empty and list(df.columns) == expected
 
 
 def _trend(day: str, times: list[str], prices: list[float]) -> pd.DataFrame:
