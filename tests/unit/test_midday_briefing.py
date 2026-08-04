@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
@@ -22,6 +22,7 @@ from rquant.midday_briefing import (
     check_positions,
     compute_board_ladder,
     compute_pulse_view,
+    compute_theme_ladder_summaries,
     render_digest,
     render_pulse,
     resolve_slot,
@@ -179,6 +180,268 @@ class TestU4BoardLadder:
         assert "600004.SH" not in ladder  # 未涨停不入梯队
 
 
+class TestThemeLadderSummaries:
+    def test_theme_ladder_missing_snapshot_amount_fails_soft(self) -> None:
+        snapshot = mk_snapshot([
+            {"ts_code": "600001.SH", "name": "样本", "price": 11.0, "pre_close": 10.0,
+             "pct_chg": 10, "volume": 1e6, "amount": 50.0, "limit_up_price": 11.0},
+        ]).drop(columns="amount")
+        kpl_members = pd.DataFrame([{"board_name": "题材A", "con_code": "600001.SH"}])
+
+        assert compute_theme_ladder_summaries(snapshot, pd.DataFrame(), kpl_members, {}) == []
+
+    def test_theme_ladder_multi_membership_keeps_continuous_rungs(self) -> None:
+        snapshot = mk_snapshot([
+            {"ts_code": "600001.SH", "name": "共用龙头", "price": 11.0, "pre_close": 10.0,
+             "pct_chg": 10, "volume": 1e6, "amount": 30.0, "limit_up_price": 11.0},
+            {"ts_code": "600002.SH", "name": "题材A首板", "price": 11.0, "pre_close": 10.0,
+             "pct_chg": 10, "volume": 1e6, "amount": 20.0, "limit_up_price": 11.0},
+            {"ts_code": "600003.SH", "name": "题材B二板", "price": 11.0, "pre_close": 10.0,
+             "pct_chg": 10, "volume": 1e6, "amount": 20.0, "limit_up_price": 11.0},
+        ])
+        prev_limit = pd.DataFrame([
+            {"ts_code": "600001.SH", "limit_times": 2},
+            {"ts_code": "600003.SH", "limit_times": 1},
+        ])
+        kpl_members = pd.DataFrame([
+            {"board_name": "题材B", "con_code": "600001.SH"},
+            {"board_name": "题材A", "con_code": "600001.SH"},
+            {"board_name": "题材A", "con_code": "600001.SH"},  # 重复成员不可重复计数
+            {"board_name": "题材A", "con_code": "600002.SH"},
+            {"board_name": "题材B", "con_code": "600003.SH"},
+        ])
+
+        summaries = compute_theme_ladder_summaries(
+            snapshot, prev_limit, kpl_members, {}, top_n=5
+        )
+
+        assert [summary.theme for summary in summaries] == ["题材A", "题材B"]
+        assert [(r.boards, [s.name for s in r.stocks]) for r in summaries[0].rungs] == [
+            (3, ["共用龙头"]),
+            (2, []),
+            (1, ["题材A首板"]),
+        ]
+        assert [(r.boards, [s.name for s in r.stocks]) for r in summaries[1].rungs] == [
+            (3, ["共用龙头"]),
+            (2, ["题材B二板"]),
+            (1, []),
+        ]
+
+    def test_theme_ladder_stable_sorts_equal_counts_and_amounts_by_name(self) -> None:
+        snapshot = mk_snapshot([
+            {"ts_code": "600001.SH", "name": "甲", "price": 11.0, "pre_close": 10.0,
+             "pct_chg": 10, "volume": 1e6, "amount": 50.0, "limit_up_price": 11.0},
+            {"ts_code": "600002.SH", "name": "乙", "price": 11.0, "pre_close": 10.0,
+             "pct_chg": 10, "volume": 1e6, "amount": 50.0, "limit_up_price": 11.0},
+        ])
+        kpl_members = pd.DataFrame([
+            {"board_name": "题材B", "con_code": "600001.SH"},
+            {"board_name": "题材A", "con_code": "600002.SH"},
+        ])
+
+        summaries = compute_theme_ladder_summaries(
+            snapshot, pd.DataFrame(), kpl_members, {}, top_n=5
+        )
+
+        assert [summary.theme for summary in summaries] == ["题材A", "题材B"]
+        assert [summary.limit_up_count for summary in summaries] == [1, 1]
+        assert [summary.amount for summary in summaries] == [50.0, 50.0]
+
+    def test_theme_ladder_invalid_previous_board_counts_fall_back_to_first_board(self) -> None:
+        codes = [f"60000{i}.SH" for i in range(1, 9)]
+        snapshot = mk_snapshot([
+            {"ts_code": code, "name": code, "price": 11.0, "pre_close": 10.0,
+             "pct_chg": 10, "volume": 1e6, "amount": 10.0, "limit_up_price": 11.0}
+            for code in codes
+        ])
+        prev_limit = pd.DataFrame([
+            {"ts_code": codes[0], "limit_times": -1},
+            {"ts_code": codes[1], "limit_times": float("inf")},
+            {"ts_code": codes[2], "limit_times": "2.0"},
+            {"ts_code": codes[3], "limit_times": 2.0},
+            {"ts_code": codes[4], "limit_times": 99},
+            {"ts_code": codes[5], "limit_times": float("nan")},
+            {"ts_code": codes[6], "limit_times": "2.5"},
+            {"ts_code": codes[7], "limit_times": "非整数"},
+        ])
+        kpl_members = pd.DataFrame([
+            {"board_name": "题材A", "con_code": code} for code in codes
+        ])
+
+        summaries = compute_theme_ladder_summaries(snapshot, prev_limit, kpl_members, {})
+
+        stocks = {
+            stock.ts_code: stock.boards
+            for rung in summaries[0].rungs
+            for stock in rung.stocks
+        }
+        assert stocks[codes[2]] == 3
+        assert stocks[codes[3]] == 3
+        invalid_codes = (codes[0], codes[1], codes[4], codes[5], codes[6], codes[7])
+        assert {stocks[code] for code in invalid_codes} == {1}
+        assert [rung.boards for rung in summaries[0].rungs] == [3, 2, 1]
+
+
+class TestPulseThemeLeaders:
+    @staticmethod
+    def _snapshot_for_theme_counts(
+        counts: dict[str, int], *, start_code: int = 600001
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        rows: list[dict[str, object]] = []
+        members: list[dict[str, str]] = []
+        for theme, count in counts.items():
+            for index in range(count):
+                code = f"{len(rows) + start_code:06d}.SH"
+                rows.append({
+                    "ts_code": code,
+                    "name": f"{theme}{index + 1}",
+                    "price": 11.0,
+                    "pre_close": 10.0,
+                    "pct_chg": 10,
+                    "volume": 1e6,
+                    "amount": 10.0,
+                    "limit_up_price": 11.0,
+                })
+                members.append({"board_name": theme, "con_code": code})
+        return mk_snapshot(rows), pd.DataFrame(members)
+
+    def test_pulse_theme_rank_change_uses_same_ladder_compute(self) -> None:
+        previous, previous_members = self._snapshot_for_theme_counts(
+            {"题材B": 5, "题材C": 4, "题材A": 3, "题材D": 2, "题材E": 1}
+        )
+        current, current_members = self._snapshot_for_theme_counts(
+            {"题材A": 6, "题材C": 5, "题材B": 4, "题材F": 3, "题材G": 2},
+            start_code=600101,
+        )
+        members = pd.concat([previous_members, current_members]).drop_duplicates()
+
+        view = compute_pulse_view(
+            "10:30",
+            current,
+            pd.DataFrame(),
+            previous,
+            pd.DataFrame(),
+            {},
+            pd.DataFrame(),
+            kpl_members=members,
+            prev_limit=pd.DataFrame(),
+        )
+
+        assert [summary.theme for summary in view.theme_ladders] == [
+            "题材A", "题材C", "题材B", "题材F", "题材G"
+        ]
+        assert [summary.rank_change for summary in view.theme_ladders] == [2, 0, -2, None, None]
+        assert [summary.rank_state for summary in view.theme_ladders] == [
+            "changed", "changed", "changed", "new", "new"
+        ]
+
+    def test_pulse_first_slot_hides_theme_rank_change(self) -> None:
+        snapshot, members = self._snapshot_for_theme_counts({"题材A": 1})
+
+        view = compute_pulse_view(
+            "10:00",
+            snapshot,
+            pd.DataFrame(),
+            None,
+            None,
+            {},
+            pd.DataFrame(),
+            kpl_members=members,
+            prev_limit=pd.DataFrame(),
+        )
+
+        assert view.theme_ladders[0].rank_change is None
+        assert view.theme_ladders[0].rank_state == "hidden"
+        _, body = render_pulse(view)
+        theme_section = body.split("## 题材", maxsplit=1)[1]
+        assert "↑" not in theme_section
+        assert "↓" not in theme_section
+        assert "持平" not in theme_section
+        assert "新晋" not in theme_section
+
+    def test_pulse_theme_highest_board_mobile_limit(self) -> None:
+        leaders = [
+            LadderStock(ts_code=f"60000{index}.SH", name=name, boards=3, theme="题材A")
+            for index, name in enumerate(("甲", "乙", "丙"), 1)
+        ]
+        first_board = [
+            LadderStock(ts_code=f"6001{index:02d}.SH", name=f"首板{index}", boards=1, theme="题材A")
+            for index in range(1, 8)
+        ]
+        view = PulseView(
+            slot_hhmm="10:30",
+            has_prev=True,
+            limit_up_count=10,
+            broken_count=0,
+            limit_down_count=0,
+            up_count=3,
+            down_count=0,
+            theme_ladders=[
+                mb.ThemeLadderSummary(
+                    theme="题材A",
+                    limit_up_count=10,
+                    amount=100.0,
+                    rungs=[
+                        mb.ThemeLadderRung(boards=3, stocks=leaders),
+                        mb.ThemeLadderRung(boards=2, stocks=[]),
+                        mb.ThemeLadderRung(boards=1, stocks=first_board),
+                    ],
+                    rank_change=2,
+                    rank_state="changed",
+                )
+            ],
+        )
+
+        _, body = render_pulse(view)
+
+        assert "## 题材梯队 Top5" in body
+        assert "1. 题材A ↑2" in body
+        assert "   涨停 10 ｜ 最高 3板：甲、乙等3只" in body
+        assert "   梯队：3板 3 ｜ 2板 0 ｜ 首板 7" in body
+        assert "丙" not in body
+
+    def test_pulse_theme_rank_labels_render_all_visible_states(self) -> None:
+        def summary(
+            theme: str, rank_change: int | None, rank_state: str
+        ) -> mb.ThemeLadderSummary:
+            return mb.ThemeLadderSummary(
+                theme=theme,
+                limit_up_count=1,
+                amount=10.0,
+                rungs=[
+                    mb.ThemeLadderRung(
+                        boards=1,
+                        stocks=[LadderStock(ts_code="600001.SH", name="甲", boards=1)],
+                    )
+                ],
+                rank_change=rank_change,
+                rank_state=rank_state,
+            )
+
+        view = PulseView(
+            slot_hhmm="10:30",
+            has_prev=True,
+            limit_up_count=4,
+            broken_count=0,
+            limit_down_count=0,
+            up_count=4,
+            down_count=0,
+            theme_ladders=[
+                summary("上升", 2, "changed"),
+                summary("下降", -2, "changed"),
+                summary("持平", 0, "changed"),
+                summary("新晋", None, "new"),
+            ],
+        )
+
+        _, body = render_pulse(view)
+
+        assert "1. 上升 ↑2" in body
+        assert "2. 下降 ↓2" in body
+        assert "3. 持平 持平" in body
+        assert "4. 新晋 新晋" in body
+
+
 # ── U5 候选池 ───────────────────────────────────────────────────────────────────
 
 
@@ -285,8 +548,18 @@ class TestU7Rendering:
                     theme="银发经济",
                 )
             ],
-            theme_heat=[
-                ThemeHeat(theme="AI硬件", limit_up_count=10, delta=3)
+            theme_ladders=[
+                mb.ThemeLadderSummary(
+                    theme="AI硬件",
+                    limit_up_count=10,
+                    amount=100.0,
+                    rungs=[
+                        mb.ThemeLadderRung(
+                            boards=1,
+                            stocks=[LadderStock(ts_code="600001.SH", name="甲", boards=1)],
+                        )
+                    ],
+                )
             ],
             new_anomalies=[
                 mb.VolAnomaly(
@@ -305,8 +578,10 @@ class TestU7Rendering:
             "- 上涨：5022 ｜ 下跌：434\n\n"
             "## 新晋涨停\n"
             "- 京投发展 ｜ 银发经济\n\n"
-            "## 题材热度\n"
-            "- AI硬件：10板（+3）\n\n"
+            "## 题材梯队 Top5\n"
+            "1. AI硬件\n"
+            "   涨停 10 ｜ 最高 1板：甲\n"
+            "   梯队：首板 1\n\n"
             "## 放量异动新增\n"
             "- 上海凯宝：量比 1.26"
         )
@@ -318,33 +593,127 @@ class TestU7Rendering:
             slot_hhmm="10:30", has_prev=True, limit_up_count=47, broken_count=6,
             limit_down_count=2, up_count=2871, down_count=2130,
             limit_up_delta=9, broken_delta=2,
-            theme_heat=[ThemeHeat(theme="人形机器人", limit_up_count=5, delta=2)],
+            theme_ladders=[
+                mb.ThemeLadderSummary(
+                    theme="人形机器人",
+                    limit_up_count=5,
+                    amount=50.0,
+                    rungs=[
+                        mb.ThemeLadderRung(
+                            boards=1,
+                            stocks=[LadderStock(ts_code="600001.SH", name="甲", boards=1)],
+                        )
+                    ],
+                )
+            ],
         )
         title, body = render_pulse(view)
         assert "涨停47(+9)" in title
         assert "- 上涨：2871 ｜ 下跌：2130" in body
-        assert "- 人形机器人：5板（+2）" in body
+        assert "1. 人形机器人" in body
+        assert "   涨停 5 ｜ 最高 1板：甲" in body
 
-    def test_digest_five_sections(self) -> None:
+    def test_pulse_legacy_theme_heat_is_not_rendered(self) -> None:
+        view = PulseView(
+            slot_hhmm="10:30",
+            has_prev=True,
+            limit_up_count=5,
+            broken_count=0,
+            limit_down_count=0,
+            up_count=5,
+            down_count=0,
+            theme_heat=[ThemeHeat(theme="旧题材", limit_up_count=5, delta=2)],
+        )
+
+        _, body = render_pulse(view)
+
+        assert "题材热度" not in body
+        assert "旧题材" not in body
+
+    def test_digest_groups_theme_ladders_and_candidates_for_mobile(self) -> None:
         view = DigestView(
             day=datetime(2026, 7, 6).date(), limit_up_count=47, broken_count=6,
             limit_down_count=2, up_count=2871, down_count=2130, broken_ratio_pct=11.3,
             slot_limit_up_series=[("10:00", 20), ("10:30", 30), ("11:00", 40), ("11:30", 47)],
             prev_day_limit_up=52,
-            ladder=[LadderStock(ts_code="600001.SH", name="样本01", boards=3, theme="人形机器人")],
+            theme_ladders=[
+                mb.ThemeLadderSummary(
+                    theme="人形机器人",
+                    limit_up_count=3,
+                    amount=234_000_000.0,
+                    slot_series=[1, 1, 2, 3],
+                    rungs=[
+                        mb.ThemeLadderRung(
+                            boards=3,
+                            stocks=[
+                                LadderStock(
+                                    ts_code="600001.SH",
+                                    name="样本01",
+                                    boards=3,
+                                    theme="人形机器人",
+                                )
+                            ],
+                        ),
+                        mb.ThemeLadderRung(boards=2, stocks=[]),
+                        mb.ThemeLadderRung(
+                            boards=1,
+                            stocks=[
+                                LadderStock(
+                                    ts_code="600002.SH",
+                                    name="样本02",
+                                    boards=1,
+                                    theme="人形机器人",
+                                )
+                            ],
+                        ),
+                    ],
+                )
+            ],
             candidates=[CandidateStock(ts_code="300001.SZ", name="创A", theme="存储",
                                        vol_ratio=2.1, pct_chg=8.0, room_to_limit_pct=5.0)],
             positions=[PositionCheck(ts_code="600001.SH", name="样本01", pnl_pct=7.3,
                                      dist_stop_pct=12.8, board_note="人形 +2%")],
         )
         _, body = render_digest(view)
-        headers = ("① 情绪温度", "② 连板梯队", "③ 最强题材",
-                   "④ 下午候选观察池", "⑤ 持仓午间体检")
+        headers = ("① 情绪温度", "② 最强题材·连板梯队 Top5",
+                   "③ 下午候选观察池", "④ 持仓风险")
         for header in headers:
             assert header in body
         assert "炸板率 11.3%" in body
-        assert "3板：样本01(人形机器人)" in body
         assert "昨日终值：涨停 52 家" in body
+        theme_block = (
+            "1. 人形机器人 ｜ 涨停 3 ｜ 半日额 2.3亿  \n"
+            "   上午：1 / 1 / 2 / 3  \n"
+            "   - 3板（1）：样本01  \n"
+            "   - 2板（0）：暂无  \n"
+            "   - 首板（1）：样本02"
+        )
+        assert theme_block in body
+        assert "## ② 连板梯队" not in body
+        assert "## ③ 最强题材" not in body
+        assert "| 300001.SZ | 创A |" not in body
+        candidate_block = (
+            "- 创A（300001.SZ）  \n"
+            "  题材：存储 ｜ 半日量比：2.10  \n"
+            "  涨幅：+8.0% ｜ 距涨停：5.0%"
+        )
+        assert candidate_block in body
+        assert "## ⑤ 持仓午间体检" not in body
+
+    def test_digest_empty_theme_and_candidate_sections_are_explicit(self) -> None:
+        view = DigestView(
+            day=datetime(2026, 7, 6).date(),
+            limit_up_count=0,
+            broken_count=0,
+            limit_down_count=0,
+            up_count=1,
+            down_count=1,
+        )
+
+        _, body = render_digest(view)
+
+        assert "## ② 最强题材·连板梯队 Top5\n- 暂无" in body
+        assert "## ③ 下午候选观察池（创业/科创 半日量能预筛）\n- 暂无" in body
 
 
 # ── U8 守卫 ─────────────────────────────────────────────────────────────────────
@@ -405,6 +774,320 @@ class TestU9Notify:
         assert captured["scene"] == "morning_pulse"
         assert captured["title"].startswith("脉搏 10:00")
         assert "涨停" in captured["body"]
+
+
+# ── 只读副本编排：一条通知只开一个受控连接 ─────────────────────────────────────
+
+
+class TestReadonlyStoreOrchestration:
+    NOW = datetime(2026, 7, 6, 10, 0, tzinfo=mb.CST)
+
+    @staticmethod
+    def _snapshot() -> pd.DataFrame:
+        return mk_snapshot([
+            {"ts_code": "600001.SH", "name": "题材龙头", "price": 11.0,
+             "pre_close": 10.0, "pct_chg": 10.0, "volume": 1e6,
+             "amount": 1e7, "limit_up_price": 11.0},
+        ])
+
+    @staticmethod
+    def _members() -> pd.DataFrame:
+        return pd.DataFrame([
+            {"board_code": "KPL001", "board_name": "AI硬件", "con_code": "600001.SH"},
+        ])
+
+    @staticmethod
+    def _board_members() -> pd.DataFrame:
+        return pd.DataFrame([
+            {
+                "board_code": "BK001",
+                "board_name": "电子",
+                "idx_type": "行业板块",
+                "con_code": "600001.SH",
+            },
+        ])
+
+    def test_morning_pulse_reuses_one_readonly_store_for_theme_inputs(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.delenv("RQUANT_PANORAMA_FAKE", raising=False)
+        store = MagicMock()
+        captured: dict[str, str] = {}
+        with (
+            patch.object(mb, "is_trading_day", return_value=True),
+            patch.object(
+                mb,
+                "fetch_slot_frames",
+                return_value=(self._snapshot(), pd.DataFrame(), "test"),
+            ) as fetch,
+            patch.object(mb, "_open_ro_store", return_value=store) as open_store,
+            patch.object(
+                mb, "load_kpl_concept_members", return_value=self._members()
+            ) as members,
+            patch.object(mb, "load_prev_limit_list", return_value=pd.DataFrame()) as prev_limit,
+            patch.object(mb, "load_avg_amount_20d", return_value=pd.DataFrame()) as avg20,
+            patch.object(
+                mb, "notify", side_effect=lambda scene, **kwargs: captured.update(kwargs)
+            ),
+        ):
+            rc = run_morning_pulse(slot="10:00", now=self.NOW, base_dir=tmp_path)
+
+        assert rc == 0
+        open_store.assert_called_once_with()
+        assert members.call_args.args == (store,)
+        assert prev_limit.call_args.args == (store,)
+        assert avg20.call_args.args == (store,)
+        store.close.assert_called_once_with()
+        assert members.call_count == 1
+        assert "kpl_members" in fetch.call_args.kwargs
+        assert "## 题材梯队 Top5" in captured["body"]
+        assert "AI硬件" in captured["body"]
+
+    def test_morning_pulse_readonly_open_failure_is_soft_without_reopen(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.delenv("RQUANT_PANORAMA_FAKE", raising=False)
+        captured: dict[str, str] = {}
+        with (
+            patch.object(mb, "is_trading_day", return_value=True),
+            patch.object(
+                mb,
+                "fetch_slot_frames",
+                return_value=(self._snapshot(), pd.DataFrame(), "test"),
+            ),
+            patch.object(mb, "_open_ro_store", return_value=None) as open_store,
+            patch.object(mb, "load_kpl_concept_members") as members,
+            patch.object(mb, "load_prev_limit_list") as prev_limit,
+            patch.object(mb, "load_avg_amount_20d") as avg20,
+            patch.object(
+                mb, "notify", side_effect=lambda scene, **kwargs: captured.update(kwargs)
+            ),
+        ):
+            rc = run_morning_pulse(slot="10:00", now=self.NOW, base_dir=tmp_path)
+
+        assert rc == 0
+        open_store.assert_called_once_with()
+        members.assert_not_called()
+        prev_limit.assert_not_called()
+        avg20.assert_not_called()
+        assert captured["title"].startswith("脉搏 10:00")
+        assert "题材梯队 Top5" not in captured["body"]
+
+    def test_morning_pulse_one_readonly_loader_failure_keeps_other_inputs(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.delenv("RQUANT_PANORAMA_FAKE", raising=False)
+        store = MagicMock()
+        with (
+            patch.object(mb, "is_trading_day", return_value=True),
+            patch.object(
+                mb,
+                "fetch_slot_frames",
+                return_value=(self._snapshot(), pd.DataFrame(), "test"),
+            ),
+            patch.object(mb, "_open_ro_store", return_value=store),
+            patch.object(
+                mb,
+                "load_kpl_concept_members",
+                side_effect=RuntimeError("KPL unavailable"),
+            ),
+            patch.object(mb, "load_prev_limit_list", return_value=pd.DataFrame()) as prev_limit,
+            patch.object(mb, "load_avg_amount_20d", return_value=pd.DataFrame()) as avg20,
+            patch.object(mb, "notify"),
+        ):
+            rc = run_morning_pulse(slot="10:00", now=self.NOW, base_dir=tmp_path)
+
+        assert rc == 0
+        assert prev_limit.call_args.args == (store,)
+        assert avg20.call_args.args == (store,)
+        store.close.assert_called_once_with()
+
+    def test_digest_reuses_store_and_builds_theme_ladders(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.delenv("RQUANT_PANORAMA_FAKE", raising=False)
+        store = MagicMock()
+        captured_kpl: list[pd.DataFrame | None] = []
+
+        def fetch_with_kpl(
+            base_dir: Path | None = None,
+            now: datetime | None = None,
+            *,
+            members: pd.DataFrame | None = None,
+            kpl_members: pd.DataFrame | None = None,
+        ) -> tuple[pd.DataFrame, pd.DataFrame, str]:
+            captured_kpl.append(kpl_members)
+            return self._snapshot(), pd.DataFrame(), "test"
+
+        with (
+            patch.object(mb, "is_trading_day", return_value=True),
+            patch.object(mb, "fetch_slot_frames", side_effect=fetch_with_kpl),
+            patch.object(mb, "_open_ro_store", return_value=store) as open_store,
+            patch.object(mb, "load_board_members", return_value=pd.DataFrame()),
+            patch.object(mb, "industry_fallback_members", return_value=pd.DataFrame()),
+            patch.object(
+                mb, "load_kpl_concept_members", return_value=self._members()
+            ) as members,
+            patch.object(mb, "load_prev_limit_list", return_value=pd.DataFrame()) as prev_limit,
+            patch.object(mb, "load_avg_amount_20d", return_value=pd.DataFrame()) as avg20,
+            patch.object(mb, "load_active_positions", return_value=pd.DataFrame()) as positions,
+            patch.object(mb, "notify"),
+        ):
+            rc = mb.run_midday_report(
+                now=self.NOW.replace(hour=12), base_dir=tmp_path, dry_run=True
+            )
+
+        assert rc == 0
+        open_store.assert_called_once_with()
+        assert members.call_args.args == (store,)
+        assert prev_limit.call_args.args == (store,)
+        assert avg20.call_args.args == (store,)
+        assert positions.call_args.args == (store,)
+        store.close.assert_called_once_with()
+        assert len(captured_kpl) == 1
+        assert captured_kpl[0] is not None
+        assert captured_kpl[0].equals(self._members())
+
+    def test_fake_pulse_dry_run_keeps_theme_ladder_data(
+        self, tmp_path, monkeypatch, capsys
+    ) -> None:
+        monkeypatch.setenv("RQUANT_PANORAMA_FAKE", "1")
+        with (
+            patch.object(mb, "is_trading_day", return_value=True),
+            patch.object(mb, "_open_ro_store", wraps=mb._open_ro_store) as open_store,
+            patch.object(mb, "load_board_members", wraps=mb.load_board_members) as board_members,
+            patch.object(
+                mb, "load_kpl_concept_members", wraps=mb.load_kpl_concept_members
+            ) as members,
+            patch.object(mb, "load_prev_limit_list", wraps=mb.load_prev_limit_list) as prev_limit,
+            patch.object(mb, "load_avg_amount_20d", wraps=mb.load_avg_amount_20d) as avg20,
+        ):
+            rc = run_morning_pulse(slot="10:00", now=self.NOW, base_dir=tmp_path, dry_run=True)
+
+        assert rc == 0
+        assert open_store.call_count == 1
+        assert board_members.call_args.args == (None,)
+        assert members.call_args.args == (None,)
+        assert prev_limit.call_args.args == (None,)
+        assert avg20.call_args.args == (None,)
+        assert "## 题材梯队 Top5" in capsys.readouterr().out
+
+    def test_fake_digest_dry_run_keeps_required_readonly_data(
+        self, tmp_path, monkeypatch, capsys
+    ) -> None:
+        monkeypatch.setenv("RQUANT_PANORAMA_FAKE", "1")
+        with (
+            patch.object(mb, "is_trading_day", return_value=True),
+            patch.object(mb, "_open_ro_store", wraps=mb._open_ro_store) as open_store,
+            patch.object(
+                mb, "load_kpl_concept_members", wraps=mb.load_kpl_concept_members
+            ) as members,
+            patch.object(mb, "load_prev_limit_list", wraps=mb.load_prev_limit_list) as prev_limit,
+            patch.object(mb, "load_avg_amount_20d", wraps=mb.load_avg_amount_20d) as avg20,
+            patch.object(mb, "load_active_positions", wraps=mb.load_active_positions) as positions,
+        ):
+            rc = mb.run_midday_report(
+                now=self.NOW.replace(hour=12), base_dir=tmp_path, dry_run=True
+            )
+
+        assert rc == 0
+        assert open_store.call_count == 1
+        assert members.call_args.args == (None,)
+        assert prev_limit.call_args.args == (None,)
+        assert avg20.call_args.args == (None,)
+        assert positions.call_args.args == (None,)
+        body = capsys.readouterr().out
+        assert "## ② 最强题材·连板梯队 Top5" in body
+        assert "昨日终值：涨停" in body
+
+    def test_fetch_slot_frames_uses_injected_kpl_members_without_second_read(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        monkeypatch.delenv("RQUANT_PANORAMA_FAKE", raising=False)
+        members = self._members()
+        with (
+            patch.object(
+                mb,
+                "_shared_frames",
+                return_value=(self._snapshot(), {}, "test"),
+            ),
+            patch.object(mb, "_load_members") as board_loader,
+            patch.object(mb, "load_kpl_concept_members") as load_members,
+        ):
+            snapshot, _, route = mb.fetch_slot_frames(
+                tmp_path,
+                now=self.NOW,
+                kpl_members=members,
+                members=pd.DataFrame(),
+            )
+
+        assert not snapshot.empty
+        assert route == "test"
+        board_loader.assert_not_called()
+        load_members.assert_not_called()
+
+    def test_full_digest_entry_shares_one_store_with_board_members(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.delenv("RQUANT_PANORAMA_FAKE", raising=False)
+        store = MagicMock()
+        raw = self._snapshot().drop(columns=["limit_up_price", "limit_down_price"])
+        raw.attrs["route"] = "test"
+        with (
+            patch.object(mb, "is_trading_day", return_value=True),
+            patch.object(mb, "open_readonly_store", return_value=store) as open_store,
+            patch.object(
+                mb, "load_board_members", return_value=self._board_members()
+            ) as board_members,
+            patch.object(mb, "industry_fallback_members") as fallback_members,
+            patch.object(
+                mb, "load_kpl_concept_members", return_value=self._members()
+            ) as kpl_members,
+            patch.object(mb, "load_prev_limit_list", return_value=pd.DataFrame()) as prev_limit,
+            patch.object(mb, "load_avg_amount_20d", return_value=pd.DataFrame()) as avg20,
+            patch.object(mb, "load_active_positions", return_value=pd.DataFrame()) as positions,
+            patch.object(mb, "fetch_market_snapshot", return_value=raw),
+            patch.object(mb, "fetch_sector_fund_flow", return_value=pd.DataFrame()),
+        ):
+            rc = mb.run_midday_report(
+                now=self.NOW.replace(hour=12), base_dir=tmp_path, dry_run=True
+            )
+
+        assert rc == 0
+        open_store.assert_called_once_with()
+        assert board_members.call_args.args == (store,)
+        fallback_members.assert_not_called()
+        assert kpl_members.call_args.args == (store,)
+        assert prev_limit.call_args.args == (store,)
+        assert avg20.call_args.args == (store,)
+        assert positions.call_args.args == (store,)
+        store.close.assert_called_once_with()
+
+    def test_full_pulse_entry_does_not_reopen_when_readonly_open_fails(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.delenv("RQUANT_PANORAMA_FAKE", raising=False)
+        raw = self._snapshot().drop(columns=["limit_up_price", "limit_down_price"])
+        raw.attrs["route"] = "test"
+        with (
+            patch.object(mb, "is_trading_day", return_value=True),
+            patch.object(
+                mb, "open_readonly_store", side_effect=OSError("replica unavailable")
+            ) as open_store,
+            patch.object(mb, "load_board_members") as board_members,
+            patch.object(mb, "load_kpl_concept_members") as kpl_members,
+            patch.object(mb, "load_prev_limit_list") as prev_limit,
+            patch.object(mb, "load_avg_amount_20d") as avg20,
+            patch.object(mb, "fetch_market_snapshot", return_value=raw),
+            patch.object(mb, "fetch_sector_fund_flow", return_value=pd.DataFrame()),
+            patch.object(mb, "notify"),
+        ):
+            rc = run_morning_pulse(slot="10:00", now=self.NOW, base_dir=tmp_path)
+
+        assert rc == 0
+        open_store.assert_called_once_with()
+        board_members.assert_not_called()
+        kpl_members.assert_not_called()
+        prev_limit.assert_not_called()
+        avg20.assert_not_called()
 
 
 # ── 共享 drop（全机单一取数者：poller 落盘，midday 优先读） ─────────────────────

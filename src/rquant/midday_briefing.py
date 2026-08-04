@@ -24,8 +24,11 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable
 from datetime import date, datetime, timedelta, timezone
+from math import isfinite
 from pathlib import Path
+from typing import Literal
 
 import pandas as pd
 from loguru import logger
@@ -70,6 +73,7 @@ _CANDIDATE_TOP_N = 20
 _PULSE_ANOMALY_TOP_N = 5
 _THEME_TOP_N = 5
 _NEW_LIMIT_UP_MAX = 8
+_MAX_THEME_LADDER_BOARDS = 20
 
 _KPL_SYSTEM = "开盘啦题材"
 _SYSTEM_FLOW_TYPE: dict[str, str | None] = {
@@ -151,6 +155,7 @@ class PulseView(BaseModel):
     limit_up_delta: int | None = None
     broken_delta: int | None = None
     new_limit_ups: list[NewLimitUp] = []
+    theme_ladders: list[ThemeLadderSummary] = []
     theme_heat: list[ThemeHeat] = []
     new_anomalies: list[VolAnomaly] = []
     degraded: bool = False  # 快照三路全失败 → 降级短讯
@@ -162,6 +167,21 @@ class LadderStock(BaseModel):
     name: str
     boards: int  # 连板高度（今日现算）
     theme: str = ""
+
+
+class ThemeLadderRung(BaseModel):
+    boards: int
+    stocks: list[LadderStock] = []
+
+
+class ThemeLadderSummary(BaseModel):
+    theme: str
+    limit_up_count: int
+    amount: float
+    rungs: list[ThemeLadderRung] = []
+    slot_series: list[int | None] = []
+    rank_change: int | None = None
+    rank_state: Literal["hidden", "new", "changed"] = "hidden"
 
 
 class ThemeRank(BaseModel):
@@ -200,6 +220,7 @@ class DigestView(BaseModel):
     broken_ratio_pct: float | None = None
     slot_limit_up_series: list[tuple[str, int | None]] = []  # (hhmm, 涨停数)
     prev_day_limit_up: int | None = None
+    theme_ladders: list[ThemeLadderSummary] = []
     ladder: list[LadderStock] = []
     top_themes: list[ThemeRank] = []
     candidates: list[CandidateStock] = []
@@ -350,12 +371,20 @@ def _upsert_report_section(base: Path | None, day: date, header: str, content: s
 # ── 快照 + 板块聚合获取（① 共享 drop → ② 自拉+重试 → ③ 降级） ─────────────────
 
 
-def _load_members() -> pd.DataFrame:
+def _load_members(store: DuckDBStore | None = None) -> pd.DataFrame:
     """东财成分：dc_board_member 优先，空则降级 stock_basic.industry 粗分。"""
-    members = load_board_members()
+    try:
+        members = load_board_members(store)
+    except Exception as e:
+        logger.warning(f"东财板块成分读取失败: {type(e).__name__}: {e}")
+        members = pd.DataFrame()
     if not members.empty:
         return members
-    return industry_fallback_members()
+    try:
+        return industry_fallback_members(store)
+    except Exception as e:
+        logger.warning(f"行业板块成分兜底失败: {type(e).__name__}: {e}")
+        return pd.DataFrame()
 
 
 def _meta_age_seconds(entry: dict, now: datetime) -> float | None:
@@ -422,7 +451,11 @@ def _self_fetch_with_retry() -> tuple[pd.DataFrame, dict[str, pd.DataFrame], str
 
 
 def fetch_slot_frames(
-    base_dir: Path | None = None, now: datetime | None = None
+    base_dir: Path | None = None,
+    now: datetime | None = None,
+    *,
+    members: pd.DataFrame | None = None,
+    kpl_members: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, str]:
     """获取当前时刻快照（含涨停价）+ 三体系板块聚合，返回 (snapshot, boards, route)。
 
@@ -430,7 +463,8 @@ def fetch_slot_frames(
     ① 全景 poller 共享 drop（≤300s 新鲜，route 标注「共享:{原route}」）；
     ② 自拉三级路由（drop 陈旧/缺失时），总失败 sleep 60s 重试一次；
     ③ 仍失败 → 返回空快照 + 空 boards（调用方降级短讯）。
-    boards 含各体系 build_board_overview 输出 + system 列。
+    boards 含各体系 build_board_overview 输出 + system 列。调用方传入 ``members`` /
+    ``kpl_members`` 时直接复用，避免通知编排层为同一批成分重复读取只读副本。
     """
     now = now or _now_cst()
     shared = _shared_frames(base_dir, now)
@@ -443,8 +477,10 @@ def fetch_slot_frames(
     if snapshot.empty:
         return pd.DataFrame(), pd.DataFrame(), route
 
-    members = _load_members()
-    kpl_members = load_kpl_concept_members()
+    if members is None:
+        members = _load_members()
+    if kpl_members is None:
+        kpl_members = load_kpl_concept_members()
     frames: list[pd.DataFrame] = []
     for system in BOARD_SYSTEMS:
         flow_type = _SYSTEM_FLOW_TYPE.get(system)
@@ -602,8 +638,15 @@ def compute_pulse_view(
     prev_boards: pd.DataFrame | None,
     theme_map: dict[str, str],
     avg20: pd.DataFrame,
+    *,
+    kpl_members: pd.DataFrame | None = None,
+    prev_limit: pd.DataFrame | None = None,
 ) -> PulseView:
-    """组装 pulse 视图：绝对计数 + 对上一槽位 Δ（首槽无前项则 Δ 省略）。"""
+    """组装 pulse 视图：绝对计数 + 对上一槽位 Δ（首槽无前项则 Δ 省略）。
+
+    ``kpl_members`` 和 ``prev_limit`` 以关键字接收，保留既有调用方的参数位置；
+    缺少题材成员或 T-1 涨停榜时，题材梯队分别省略或按首板计算。
+    """
     pulse = compute_market_pulse(snapshot)
     has_prev = prev_snapshot is not None and not prev_snapshot.empty
     view = PulseView(
@@ -616,7 +659,14 @@ def compute_pulse_view(
         down_count=pulse.down_count,
     )
 
-    view.theme_heat = _theme_heat(boards, prev_boards if has_prev else None)
+    if kpl_members is not None:
+        view.theme_ladders = _compute_pulse_theme_ladders(
+            slot_hhmm,
+            snapshot,
+            prev_snapshot if has_prev else None,
+            kpl_members,
+            prev_limit if prev_limit is not None else pd.DataFrame(),
+        )
 
     curr_lu = _limit_up_codes(snapshot)
     curr_anom = compute_volume_anomalies(snapshot, avg20)
@@ -634,6 +684,49 @@ def compute_pulse_view(
     else:
         view.new_anomalies = curr_anom[:_PULSE_ANOMALY_TOP_N]
     return view
+
+
+def _compute_pulse_theme_ladders(
+    slot_hhmm: str,
+    snapshot: pd.DataFrame,
+    prev_snapshot: pd.DataFrame | None,
+    kpl_members: pd.DataFrame,
+    prev_limit: pd.DataFrame,
+) -> list[ThemeLadderSummary]:
+    """用统一题材梯队计算脉搏 Top5，并比较上一个脉搏的同口径排名。"""
+    slot_tag = _slot_tag(slot_hhmm)
+    slot_snapshots = {slot_tag: snapshot}
+    has_prev = prev_snapshot is not None and not prev_snapshot.empty
+    if has_prev:
+        previous_tag = _prev_pulse_tag(slot_tag)
+        if previous_tag is not None:
+            slot_snapshots[previous_tag] = prev_snapshot
+
+    current = compute_theme_ladder_summaries(
+        snapshot, prev_limit, kpl_members, slot_snapshots
+    )
+    if not has_prev:
+        return current
+
+    previous = compute_theme_ladder_summaries(
+        prev_snapshot, prev_limit, kpl_members, slot_snapshots
+    )
+    previous_ranks = {summary.theme: rank for rank, summary in enumerate(previous, start=1)}
+    ranked: list[ThemeLadderSummary] = []
+    for rank, summary in enumerate(current, start=1):
+        previous_rank = previous_ranks.get(summary.theme)
+        if previous_rank is None:
+            ranked.append(summary.model_copy(update={"rank_state": "new"}))
+        else:
+            ranked.append(
+                summary.model_copy(
+                    update={
+                        "rank_change": previous_rank - rank,
+                        "rank_state": "changed",
+                    }
+                )
+            )
+    return ranked
 
 
 def _build_new_limit_ups(
@@ -715,6 +808,118 @@ def compute_board_ladder(
             )
         )
     return sorted(out, key=lambda s: (-s.boards, s.ts_code))
+
+
+def compute_theme_ladder_summaries(
+    snapshot: pd.DataFrame,
+    prev_limit: pd.DataFrame,
+    kpl_members: pd.DataFrame,
+    slot_snapshots: dict[str, pd.DataFrame],
+    *,
+    top_n: int = _THEME_TOP_N,
+) -> list[ThemeLadderSummary]:
+    """按开盘啦真实多对多题材关系计算连续涨停梯队。"""
+    required_columns = {"board_name", "con_code"}
+    if kpl_members.empty or not required_columns.issubset(kpl_members.columns):
+        return []
+    if snapshot.empty or not {"ts_code", "amount"}.issubset(snapshot.columns):
+        return []
+
+    members = kpl_members[["board_name", "con_code"]].dropna().drop_duplicates().copy()
+    if members.empty:
+        return []
+    members["board_name"] = members["board_name"].astype(str)
+    members["con_code"] = members["con_code"].astype(str)
+
+    joined = members.merge(snapshot, left_on="con_code", right_on="ts_code", how="inner")
+    if joined.empty:
+        return []
+    joined["_amount"] = pd.to_numeric(joined.get("amount"), errors="coerce").fillna(0.0)
+    limit_codes = _limit_up_codes(snapshot)
+    joined["_is_limit_up"] = joined["ts_code"].astype(str).isin(limit_codes)
+    current = joined[joined["_is_limit_up"]].copy()
+    if current.empty:
+        return []
+
+    previous_boards = _previous_limit_boards(prev_limit)
+    current["_boards"] = (
+        current["ts_code"].astype(str).map(previous_boards).fillna(0).astype(int) + 1
+    )
+    amount_by_theme = joined.groupby("board_name")["_amount"].sum().to_dict()
+    slot_counts = {
+        _slot_tag(hhmm): _theme_limit_up_counts(frame, members)
+        for hhmm in PULSE_SLOTS
+        if (frame := slot_snapshots.get(_slot_tag(hhmm))) is not None
+    }
+
+    summaries: list[ThemeLadderSummary] = []
+    for theme, group in current.groupby("board_name", sort=False):
+        stocks_by_height: dict[int, list[LadderStock]] = {}
+        for _, row in group.iterrows():
+            boards = int(row["_boards"])
+            stocks_by_height.setdefault(boards, []).append(
+                LadderStock(
+                    ts_code=str(row["ts_code"]),
+                    name=str(row.get("name", "")),
+                    boards=boards,
+                    theme=str(theme),
+                )
+            )
+        highest_board = max(stocks_by_height)
+        rungs = [
+            ThemeLadderRung(
+                boards=boards,
+                stocks=sorted(stocks_by_height.get(boards, []), key=lambda stock: stock.ts_code),
+            )
+            for boards in range(highest_board, 0, -1)
+        ]
+        summaries.append(
+            ThemeLadderSummary(
+                theme=str(theme),
+                limit_up_count=len(group),
+                amount=float(amount_by_theme.get(theme, 0.0)),
+                rungs=rungs,
+                slot_series=[
+                    slot_counts[_slot_tag(hhmm)].get(str(theme), 0)
+                    if _slot_tag(hhmm) in slot_counts
+                    else None
+                    for hhmm in PULSE_SLOTS
+                ],
+            )
+        )
+    return sorted(
+        summaries,
+        key=lambda summary: (-summary.limit_up_count, -summary.amount, summary.theme),
+    )[:top_n]
+
+
+def _previous_limit_boards(prev_limit: pd.DataFrame) -> dict[str, int]:
+    if prev_limit.empty or not {"ts_code", "limit_times"}.issubset(prev_limit.columns):
+        return {}
+    limit_times = pd.to_numeric(prev_limit["limit_times"], errors="coerce")
+    boards: dict[str, int] = {}
+    for ts_code, raw_limit_times in zip(prev_limit["ts_code"], limit_times, strict=False):
+        if pd.isna(raw_limit_times):
+            continue
+        value = float(raw_limit_times)
+        if not isfinite(value) or not value.is_integer():
+            continue
+        previous = int(value)
+        if not 1 <= previous < _MAX_THEME_LADDER_BOARDS:
+            continue
+        boards[str(ts_code)] = previous
+    return boards
+
+
+def _theme_limit_up_counts(snapshot: pd.DataFrame, members: pd.DataFrame) -> dict[str, int]:
+    limit_codes = _limit_up_codes(snapshot)
+    if not limit_codes or "ts_code" not in snapshot.columns:
+        return {}
+    current = snapshot[snapshot["ts_code"].astype(str).isin(limit_codes)]
+    joined = members.merge(current, left_on="con_code", right_on="ts_code", how="inner")
+    if joined.empty:
+        return {}
+    return joined.groupby("board_name")["ts_code"].count().astype(int).to_dict()
 
 
 def compute_top_themes(
@@ -893,6 +1098,41 @@ def _body_delta(value: int | None) -> str:
     return f"（{value:+d}）" if value is not None else ""
 
 
+def _pulse_theme_ladder_lines(
+    rank: int, summary: ThemeLadderSummary
+) -> list[str] | None:
+    """将连续题材梯队压缩为三行脉搏摘要，最高档最多展示两个标的。"""
+    highest = next((rung for rung in summary.rungs if rung.stocks), None)
+    if highest is None:
+        return None
+    names = [stock.name or stock.ts_code for stock in highest.stocks]
+    leader_names = "、".join(names[:2])
+    if len(names) > 2:
+        leader_names += f"等{len(names)}只"
+    rank_text = ""
+    if summary.rank_state == "new":
+        rank_text = "新晋"
+    elif summary.rank_state == "changed" and summary.rank_change is not None:
+        if summary.rank_change > 0:
+            rank_text = f"↑{summary.rank_change}"
+        elif summary.rank_change < 0:
+            rank_text = f"↓{-summary.rank_change}"
+        else:
+            rank_text = "持平"
+    title = f"{rank}. {summary.theme}"
+    if rank_text:
+        title += f" {rank_text}"
+    rung_counts = " ｜ ".join(
+        f"{'首板' if rung.boards == 1 else f'{rung.boards}板'} {len(rung.stocks)}"
+        for rung in summary.rungs
+    )
+    return [
+        title,
+        f"   涨停 {summary.limit_up_count} ｜ 最高 {highest.boards}板：{leader_names}",
+        f"   梯队：{rung_counts}",
+    ]
+
+
 def render_pulse(view: PulseView) -> tuple[str, str]:
     """30 分钟脉搏报文（短，手机一屏）。返回 (title, body)。"""
     hhmm = view.slot_hhmm
@@ -919,12 +1159,12 @@ def render_pulse(view: PulseView) -> tuple[str, str]:
             f"- {n.name} ｜ {n.theme}" if n.theme else f"- {n.name}"
             for n in view.new_limit_ups
         )
-    if view.theme_heat:
-        lines.extend(["", "## 题材热度"])
-        lines.extend(
-            f"- {t.theme}：{t.limit_up_count}板{_body_delta(t.delta)}"
-            for t in view.theme_heat
-        )
+    theme_lines: list[str] = []
+    for rank, summary in enumerate(view.theme_ladders, start=1):
+        if summary_lines := _pulse_theme_ladder_lines(rank, summary):
+            theme_lines.extend(summary_lines)
+    if theme_lines:
+        lines.extend(["", "## 题材梯队 Top5", *theme_lines])
     if view.new_anomalies:
         heading = "放量异动新增" if view.has_prev else "放量异动"
         lines.extend(["", f"## {heading}"])
@@ -934,8 +1174,26 @@ def render_pulse(view: PulseView) -> tuple[str, str]:
     return title, "\n".join(lines)
 
 
+def _digest_theme_ladder_lines(rank: int, summary: ThemeLadderSummary) -> list[str]:
+    """将一个题材的完整连续梯队渲染为午间战报的手机分块。"""
+    series = " / ".join(str(count) if count is not None else "—" for count in summary.slot_series)
+    meta = (
+        f"{rank}. {summary.theme} ｜ 涨停 {summary.limit_up_count} ｜ "
+        f"半日额 {summary.amount / 1e8:.1f}亿"
+    )
+    lines = [
+        meta,
+        f"   上午：{series or '—'}",
+    ]
+    for rung in summary.rungs:
+        label = "首板" if rung.boards == 1 else f"{rung.boards}板"
+        names = "、".join(stock.name or stock.ts_code for stock in rung.stocks) or "暂无"
+        lines.append(f"   - {label}（{len(rung.stocks)}）：{names}")
+    return [f"{line}  " for line in lines[:-1]] + lines[-1:]
+
+
 def render_digest(view: DigestView) -> tuple[str, str]:
-    """午间战报（digest，五节）。返回 (title, body)。"""
+    """午间战报（digest，四节）。返回 (title, body)。"""
     mmdd = view.day.strftime("%m-%d")
     if view.degraded:
         title = f"午间战报 {mmdd} 快照不可用"
@@ -961,52 +1219,35 @@ def render_digest(view: DigestView) -> tuple[str, str]:
         lines.append(f"昨日终值：涨停 {view.prev_day_limit_up} 家（T-1）")
     lines.append("")
 
-    # ② 连板梯队
-    lines.append("## ② 连板梯队")
-    if view.ladder:
-        by_height: dict[int, list[LadderStock]] = {}
-        for s in view.ladder:
-            by_height.setdefault(s.boards, []).append(s)
-        for height in sorted(by_height, reverse=True):
-            label = "首板" if height == 1 else f"{height}板"
-            names = " ".join(
-                f"{s.name}({s.theme})" if s.theme else s.name for s in by_height[height]
-            )
-            lines.append(f"- {label}：{names}")
+    # ② 最强题材·连板梯队 Top5
+    lines.append("## ② 最强题材·连板梯队 Top5")
+    if view.theme_ladders:
+        for rank, summary in enumerate(view.theme_ladders, start=1):
+            lines.extend(_digest_theme_ladder_lines(rank, summary))
+            lines.append("")
+        lines.pop()
     else:
-        lines.append("- （无涨停）")
+        lines.append("- 暂无")
     lines.append("")
 
-    # ③ 最强题材 Top5
-    lines.append("## ③ 最强题材 Top5")
-    if view.top_themes:
-        for i, t in enumerate(view.top_themes, 1):
-            series = "/".join(str(c) if c is not None else "-" for c in t.slot_series)
-            lines.append(
-                f"{i}. {t.theme} 涨停{t.limit_up_count} 半日额{t.amount / 1e8:.1f}亿"
-                f"（上午 {series}）"
-            )
-    else:
-        lines.append("- （无）")
-    lines.append("")
-
-    # ④ 下午候选观察池
-    lines.append("## ④ 下午候选观察池（创业/科创 半日量能预筛）")
+    # ③ 下午候选观察池
+    lines.append("## ③ 下午候选观察池（创业/科创 半日量能预筛）")
     if view.candidates:
-        lines.append("| 代码 | 名称 | 题材 | 半日量比 | 涨幅 | 距涨停 |")
-        lines.append("|---|---|---|---|---|---|")
         for c in view.candidates:
-            lines.append(
-                f"| {c.ts_code} | {c.name} | {c.theme or '—'} | "
-                f"{c.vol_ratio} | {c.pct_chg:+.1f}% | {c.room_to_limit_pct:.1f}% |"
-            )
+            lines.extend([
+                f"- {c.name}（{c.ts_code}）  ",
+                f"  题材：{c.theme or '—'} ｜ 半日量比：{c.vol_ratio:.2f}  ",
+                f"  涨幅：{c.pct_chg:+.1f}% ｜ 距涨停：{c.room_to_limit_pct:.1f}%",
+                "",
+            ])
+        lines.pop()
     else:
-        lines.append("- （无候选）")
+        lines.append("- 暂无")
     lines.append("")
 
-    # ⑤ 持仓午间体检（空仓整节省略）
+    # ④ 持仓风险（空仓整节省略）
     if view.positions:
-        lines.append("## ⑤ 持仓午间体检")
+        lines.append("## ④ 持仓风险")
         lines.append("| 代码 | 名称 | 浮盈 | 距止损 | 板块 |")
         lines.append("|---|---|---|---|---|")
         for p in view.positions:
@@ -1060,7 +1301,10 @@ def run_morning_pulse(
         logger.info(f"脉搏 {hhmm} 当日已推送，跳过（--force 覆盖）")
         return 0
 
-    snapshot, boards, route = fetch_slot_frames(base_dir, now=now)
+    members, kpl_members, prev_limit, avg20, _ = _load_notification_inputs(include_positions=False)
+    snapshot, boards, route = fetch_slot_frames(
+        base_dir, now=now, members=members, kpl_members=kpl_members
+    )
     if snapshot.empty:
         logger.warning(f"脉搏 {hhmm} 快照三路全失败，降级短讯（不落 snapshot parquet）")
         view = PulseView(slot_hhmm=hhmm, has_prev=False, limit_up_count=0, broken_count=0,
@@ -1079,9 +1323,18 @@ def run_morning_pulse(
     prev_snapshot = _read_frame(_frame_path(mdir, "snapshot", prev_tag)) if prev_tag else None
     prev_boards = _read_frame(_frame_path(mdir, "boards", prev_tag)) if prev_tag else None
 
-    theme_map = theme_map_from_kpl(load_kpl_concept_members())
-    avg20 = load_avg_amount_20d()
-    view = compute_pulse_view(hhmm, snapshot, boards, prev_snapshot, prev_boards, theme_map, avg20)
+    theme_map = theme_map_from_kpl(kpl_members)
+    view = compute_pulse_view(
+        hhmm,
+        snapshot,
+        boards,
+        prev_snapshot,
+        prev_boards,
+        theme_map,
+        avg20,
+        kpl_members=kpl_members,
+        prev_limit=prev_limit,
+    )
     view.route = route
     title, body = render_pulse(view)
     _finish(mdir, meta, tag, route, "脉搏", day, title, body, base_dir, dry_run)
@@ -1110,7 +1363,12 @@ def run_midday_report(
         logger.info("午间战报当日已推送，跳过（--force 覆盖）")
         return 0
 
-    snapshot, boards, route = fetch_slot_frames(base_dir, now=now)
+    members, kpl_members, prev_limit, avg20, positions = _load_notification_inputs(
+        include_positions=True
+    )
+    snapshot, boards, route = fetch_slot_frames(
+        base_dir, now=now, members=members, kpl_members=kpl_members
+    )
     if snapshot.empty:
         logger.warning("午间战报快照三路全失败，降级短讯")
         view = DigestView(day=day, limit_up_count=0, broken_count=0, limit_down_count=0,
@@ -1125,7 +1383,16 @@ def run_midday_report(
     meta[tag] = SlotMeta(fetched_at=now.isoformat(timespec="seconds"), route=route, pushed=False)
     _write_meta(mdir, meta)
 
-    view = _build_digest_view(day, snapshot, boards, mdir)
+    view = _build_digest_view(
+        day,
+        snapshot,
+        boards,
+        mdir,
+        kpl_members=kpl_members,
+        prev_limit=prev_limit,
+        avg20=avg20,
+        positions=positions,
+    )
     view.route = route
     title, body = render_digest(view)
     _finish(mdir, meta, tag, route, "午间战报", day, title, body, base_dir, dry_run)
@@ -1133,20 +1400,23 @@ def run_midday_report(
 
 
 def _build_digest_view(
-    day: date, snapshot: pd.DataFrame, boards: pd.DataFrame, mdir: Path
+    day: date,
+    snapshot: pd.DataFrame,
+    boards: pd.DataFrame,
+    mdir: Path,
+    *,
+    kpl_members: pd.DataFrame | None = None,
+    prev_limit: pd.DataFrame | None = None,
+    avg20: pd.DataFrame | None = None,
+    positions: pd.DataFrame | None = None,
 ) -> DigestView:
     """从当前快照 + 落盘的各槽位帧 + 只读副本组装五节战报视图。"""
     pulse = compute_market_pulse(snapshot)
-    theme_map = theme_map_from_kpl(load_kpl_concept_members())
-
-    store = _open_ro_store()
-    try:
-        prev_limit = load_prev_limit_list(store)
-        avg20 = load_avg_amount_20d(store)
-        positions = load_active_positions(store)
-    finally:
-        if store is not None:
-            store.close()
+    kpl_members = kpl_members if kpl_members is not None else pd.DataFrame()
+    prev_limit = prev_limit if prev_limit is not None else pd.DataFrame()
+    avg20 = avg20 if avg20 is not None else pd.DataFrame()
+    positions = positions if positions is not None else pd.DataFrame()
+    theme_map = theme_map_from_kpl(kpl_members)
 
     slot_frames = {
         _slot_tag(hhmm): _read_frame(_frame_path(mdir, "snapshot", _slot_tag(hhmm)))
@@ -1179,6 +1449,9 @@ def _build_digest_view(
         broken_ratio_pct=broken_ratio,
         slot_limit_up_series=slot_series,
         prev_day_limit_up=prev_day_lu,
+        theme_ladders=compute_theme_ladder_summaries(
+            snapshot, prev_limit, kpl_members, slot_frames, top_n=_THEME_TOP_N
+        ),
         ladder=compute_board_ladder(snapshot, prev_limit, theme_map),
         top_themes=compute_top_themes(boards, board_frames),
         candidates=build_candidate_pool(snapshot, avg20, theme_map),
@@ -1195,6 +1468,48 @@ def _open_ro_store() -> DuckDBStore | None:
     except Exception as e:
         logger.warning(f"只读副本打开失败，digest 降级空 T-1 数据: {type(e).__name__}: {e}")
         return None
+
+
+def _load_notification_inputs(
+    *, include_positions: bool
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """在快照网络读取前取齐通知依赖，并在同一短生命周期内关闭只读连接。"""
+    store = _open_ro_store()
+    if store is None and not _fake_enabled():
+        return (
+            pd.DataFrame(),
+            pd.DataFrame(),
+            pd.DataFrame(),
+            pd.DataFrame(),
+            pd.DataFrame(),
+        )
+    try:
+        members = _load_ro_frame("东财板块成分", _load_members, store)
+        kpl_members = _load_ro_frame("开盘啦题材成分", load_kpl_concept_members, store)
+        prev_limit = _load_ro_frame("涨停榜", load_prev_limit_list, store)
+        avg20 = _load_ro_frame("20 日均额", load_avg_amount_20d, store)
+        positions = (
+            _load_ro_frame("持仓", load_active_positions, store)
+            if include_positions
+            else pd.DataFrame()
+        )
+        return members, kpl_members, prev_limit, avg20, positions
+    finally:
+        if store is not None:
+            store.close()
+
+
+def _load_ro_frame(
+    label: str,
+    loader: Callable[[DuckDBStore | None], pd.DataFrame],
+    store: DuckDBStore | None,
+) -> pd.DataFrame:
+    """在既有只读连接上读取一张通知依赖表，失败时独立降级为空表。"""
+    try:
+        return loader(store)
+    except Exception as e:
+        logger.warning(f"{label}只读查询失败，通知降级为空数据: {type(e).__name__}: {e}")
+        return pd.DataFrame()
 
 
 def _finish(
