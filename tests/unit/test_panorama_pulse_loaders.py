@@ -112,6 +112,10 @@ class TestSurgeEventMarks:
             {"ts_code": "688255.SH", "confirmed_at": "09:47", "rel_cum": 3.2},
             {"ts_code": "688255.SH", "confirmed_at": "09:47", "rel_cum": 3.3},
             {"ts_code": "688255.SH", "confirmed_at": "10:45"},
+            {"ts_code": "688255.SH", "confirmed_at": "not-a-time", "rel_cum": 9.0},
+            {"ts_code": "688255.SH", "confirmed_at": "9:05", "rel_cum": 9.0},
+            {"ts_code": "688255.SH", "confirmed_at": "12:99", "rel_cum": 9.0},
+            {"ts_code": "688255.SH", "confirmed_at": "24:00", "rel_cum": 9.0},
             {"ts_code": "300409.SZ", "confirmed_at": "09:40", "rel_cum": 2.8},
             {"ts_code": "688255.SH", "rel_cum": 5.0},
         ])
@@ -166,6 +170,9 @@ class TestHistoricalIntradayTrend:
             ]))
 
             trend = load_historical_intraday_trend("688255.SH", DAY, store=store)
+            assert not store.query_minute_bars(
+                "688255.SH", datetime(2026, 7, 29), datetime(2026, 7, 29, 23, 59, 59)
+            ).empty
         finally:
             store.close()
 

@@ -1244,6 +1244,7 @@ _SURGE_LOG_COLUMNS = [
 _SURGE_HISTORY_COLUMNS = ["trade_date", *_SURGE_LOG_COLUMNS]
 _SURGE_EVENT_MARK_COLUMNS = ["date", "confirmed_at", "rel_cum"]
 _SURGE_EVENT_FILENAME_RE = re.compile(r"events-([0-9]{4}-[0-9]{2}-[0-9]{2})\.jsonl")
+_SURGE_CONFIRMED_AT_RE = re.compile(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]")
 _PULSE_LOG_COLUMNS = ["t", "limit_up", "limit_down", "broken", "up", "down",
                       "up_ratio_pct", "total"]
 _PULSE_ALERT_COLUMNS = ["t", "kind", "kind_label", "before", "after",
@@ -1453,12 +1454,12 @@ def load_surge_event_marks(
     for record in records:
         if str(record.get("ts_code")) != ts_code:
             continue
-        confirmed_at = record.get("confirmed_at")
-        if confirmed_at is None or not str(confirmed_at).strip():
+        confirmed_at = str(record.get("confirmed_at") or "")
+        if _SURGE_CONFIRMED_AT_RE.fullmatch(confirmed_at) is None:
             continue
         rows.append({
             "date": day,
-            "confirmed_at": str(confirmed_at),
+            "confirmed_at": confirmed_at,
             "rel_cum": pd.to_numeric(pd.Series([record.get("rel_cum")]), errors="coerce").iloc[0],
         })
     if not rows:
