@@ -1093,6 +1093,60 @@ def fetch_intraday_trend(ts_code: str, ndays: int = 1) -> pd.DataFrame:
     return _with_route(pd.DataFrame(), "none")
 
 
+_HISTORICAL_TREND_COLUMNS = ["dt", "price", "avg_price", "volume"]
+
+
+def _empty_historical_intraday_trend() -> pd.DataFrame:
+    return pd.DataFrame(columns=_HISTORICAL_TREND_COLUMNS)
+
+
+def load_historical_intraday_trend(
+    ts_code: str, day: date, store: DuckDBStore | None = None
+) -> pd.DataFrame:
+    """读取指定交易日的本地 1 分钟线，并计算日内累计成交均价。
+
+    历史回看只读 DuckDB 副本；分钟源的优先级和去重由
+    ``DuckDBStore.query_minute_bars`` 统一保证。无数据或副本不可用时返回稳定空表。
+    """
+    if _fake_enabled():
+        trend = _fake_intraday_trend(ts_code, ndays=1).copy()
+        trend["dt"] = _session_minute_stamps(pd.Timestamp(day))
+        return trend[_HISTORICAL_TREND_COLUMNS]
+
+    owns = store is None
+    try:
+        store = store or open_readonly_store(required_tables=("minute_bar",))
+    except Exception as exc:
+        logger.warning(f"历史分时只读库打开失败: {type(exc).__name__}: {exc}")
+        return _empty_historical_intraday_trend()
+
+    start = datetime.combine(day, datetime.min.time())
+    end = datetime.combine(day, datetime.max.time())
+    try:
+        raw = store.query_minute_bars(ts_code, start, end, freq="1min")
+    except Exception as exc:
+        logger.warning(f"历史分时查询失败: {ts_code} {type(exc).__name__}: {exc}")
+        return _empty_historical_intraday_trend()
+    finally:
+        if owns:
+            store.close()
+
+    if raw.empty:
+        return _empty_historical_intraday_trend()
+    trend = pd.DataFrame({
+        "dt": pd.to_datetime(raw.get("trade_time"), errors="coerce"),
+        "price": pd.to_numeric(raw.get("close"), errors="coerce"),
+        "volume": pd.to_numeric(raw.get("vol"), errors="coerce"),
+        "amount": pd.to_numeric(raw.get("amount"), errors="coerce"),
+    }).dropna(subset=["dt"])
+    if trend.empty:
+        return _empty_historical_intraday_trend()
+    trend = trend.sort_values("dt", kind="stable").reset_index(drop=True)
+    cumulative_volume = trend["volume"].cumsum()
+    trend["avg_price"] = trend["amount"].cumsum() / cumulative_volume.where(cumulative_volume > 0)
+    return trend[_HISTORICAL_TREND_COLUMNS]
+
+
 def surge_mark_positions(trend: pd.DataFrame, marks: pd.DataFrame) -> pd.DataFrame:
     """爆量标记时刻 → trend 行位置（列 idx/price/label），供图层画竖线+标记点。
 
@@ -1188,6 +1242,7 @@ _SURGE_LOG_COLUMNS = [
     "cum_amount", "rel_cum", "room_to_limit_pct", "status",
 ]
 _SURGE_HISTORY_COLUMNS = ["trade_date", *_SURGE_LOG_COLUMNS]
+_SURGE_EVENT_MARK_COLUMNS = ["date", "confirmed_at", "rel_cum"]
 _SURGE_EVENT_FILENAME_RE = re.compile(r"events-([0-9]{4}-[0-9]{2}-[0-9]{2})\.jsonl")
 _PULSE_LOG_COLUMNS = ["t", "limit_up", "limit_down", "broken", "up", "down",
                       "up_ratio_pct", "total"]
@@ -1382,6 +1437,37 @@ def load_surge_marks(
             "rel_cum": pd.to_numeric(pd.Series([r.get("rel_cum")]), errors="coerce").iloc[0],
         })
     return pd.DataFrame(rows, columns=["date", "confirmed_at", "rel_cum"])
+
+
+def load_surge_event_marks(
+    ts_code: str, day: date, *, live_dir: Path | None = None
+) -> pd.DataFrame:
+    """读取某日某标的全部爆量触发，用于历史分时图逐次标记。
+
+    与 ``load_surge_log`` 的每票首次确认台账语义不同，此处保留同一时点的重复事件，
+    并按确认时间稳定排序，以保留原始 JSONL 的相对顺序。
+    """
+    path = _surge_live_dir(live_dir) / f"events-{day.isoformat()}.jsonl"
+    records = _read_jsonl_records(path, "ts_code")
+    rows: list[dict[str, object]] = []
+    for record in records:
+        if str(record.get("ts_code")) != ts_code:
+            continue
+        confirmed_at = record.get("confirmed_at")
+        if confirmed_at is None or not str(confirmed_at).strip():
+            continue
+        rows.append({
+            "date": day,
+            "confirmed_at": str(confirmed_at),
+            "rel_cum": pd.to_numeric(pd.Series([record.get("rel_cum")]), errors="coerce").iloc[0],
+        })
+    if not rows:
+        return pd.DataFrame(columns=_SURGE_EVENT_MARK_COLUMNS)
+    return (
+        pd.DataFrame(rows, columns=_SURGE_EVENT_MARK_COLUMNS)
+        .sort_values("confirmed_at", kind="stable")
+        .reset_index(drop=True)
+    )
 
 
 # ── A4 Fake 模式确定性 fixture（RQUANT_PANORAMA_FAKE=1，e2e 可测性） ────────────
