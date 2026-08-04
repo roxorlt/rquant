@@ -52,8 +52,8 @@ draft PR；否则下一位负责该任务的会话必须在首次安全机会完
 准备进入 `closed` 时，Codex 必须先将含不可变证据与计划清理的 provisional receipt 成功发布到
 该 PR，并原子更新任务 JSON；清理完成后再将终态交付回执发布到 PR，且只有发布成功后才可将
 状态设为 `closed`；并在对用户的交接消息中回显同一回执摘要。任务进入 `quarantined` 且已有
-draft PR 时，必须立即将隔离终态回执发布到该 draft PR。人工收集证据、作出清理决定和写入回执
-均不得绕过后文门禁。
+draft PR 时，必须立即尝试将隔离终态回执发布到该 draft PR；若 PR 发布失败，适用后文规定的本地
+隔离回执与原子状态转换顺序。人工收集证据、作出清理决定和写入回执均不得绕过后文门禁。
 
 ## 命名与隔离
 
@@ -164,12 +164,20 @@ PR/head/merge evidence 和计划清理成功发布为 PR 的 provisional receipt
 final receipt 发布到 PR，再原子更新任务 JSON；只有 final receipt 发布成功后才可将状态设为
 `closed` 并释放租约。清理时，Codex 在持有集成锁时回收该任务的远端功能分支、以正常方式移除该任务
 worktree（不得使用 force）。外部 harness worktree 必须改用其受支持的非强制 remove 或 close 操作，
-绝不手工删除目录；若该操作不可用或 ownership 无法证明，立即停止并设为 `quarantined`。随后必须
+绝不手工删除目录；若该操作不可用或 ownership 无法证明，立即停止并按后文隔离回执顺序进入
+`quarantined`。随后必须
 重新核验精确的本地 branch、其 HEAD 与已移除 worktree 的身份：仅当它们仍与已核验的受管任务完全匹配时，才明确允许执行
 `git branch -D <exact-verified-branch>`。`-D` 绝不得用于 legacy 或未知分支。任何部分清理失败或
-final receipt 发布失败都必须立即停止：保留所有尚未移除的 artifacts，在本地任务 JSON 记录已经
-完成及失败的清理结果并设为 `quarantined`，随后重试 PR final/quarantine receipt；不得声称已移除
-的 artifacts 被保留、不得以破坏性方式重建它们，也不得设为 `closed`。
+final receipt 发布失败都必须依次执行：
+
+1. 立即停止并保留所有尚未移除的 artifacts。
+2. 在任务 JSON 中形成并原子持久化本地 quarantine receipt，记录已完成和失败的清理结果以及 PR
+   发布失败。
+3. 将状态 `quarantined` 作为该本地记录的一部分原子写入，使终态本地回执先于或与隔离状态同时存在。
+4. 之后重试向 PR 发布 quarantine/final receipt；PR 发布失败不得阻塞这项安全状态转换，但任务不得
+   `closed`。
+
+不得声称已移除的 artifacts 被保留，也不得以破坏性方式重建它们。
 
 当前尚未提供自动回收工具或脚本。工具落地前，Codex 必须人工收集上述证据、作出回收或
 `quarantined` 决定并记录交付回执；人工执行不豁免任何门禁。
@@ -201,7 +209,9 @@ final receipt 发布失败都必须立即停止：保留所有尚未移除的 ar
 `{repository, PR number/URL, base=main, head.sha, draft=true}`，并明确 `merged_at` 与
 `merge_commit_sha` 不可用的原因。若安全或技术条件使 draft PR 暂不可建，本地隔离回执可将
 PR number/URL、`merged_at` 与 `merge_commit_sha` 标记为 N/A 并写明原因；它只能维持
-`quarantined`，不能关闭或清理，且必须在 draft PR 可建立后转入 PR。回执至少记录：
+`quarantined`，不能关闭或清理，且必须在 draft PR 可建立后转入 PR。部分清理或 PR 回执发布失败时，
+原子持久化到任务 JSON、并同时写入 `quarantined` 状态的本地 quarantine receipt 满足此处的终态
+回执要求；之后仍必须重试发布到 PR。回执至少记录：
 
 - 任务标识、分支和 worktree 路径；
 - `closed` 的完整不可变 PR 证据元组 `{repository, PR number/URL, base=main, merged_at, head.sha, merge_commit_sha}`，或上述 `quarantined` draft 身份／本地 N/A 记录与不可用原因；

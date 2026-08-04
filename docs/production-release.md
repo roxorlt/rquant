@@ -70,10 +70,11 @@ cloud 端验证与健康检查，并把证据写入 lifecycle record 和终态�
 
 若部署、健康检查或清理前证据失败，Codex 不得开始清理，必须保留当前任务全部 artifacts；部署器
 在其适用范围内按既有设计回滚，任务保持 `merged` 或进入 `quarantined`，不得声明 `closed`。若
-发生部分清理或 final receipt 发布失败，Codex 必须立即停止，保留所有尚未移除的 artifacts，并在
-本地 lifecycle record 标为 `quarantined`、记录已完成和失败的清理结果，随后重试 PR 的 final/
-quarantine receipt；不得声称已移除的 artifacts 被保留或以破坏性方式重建它们，且不得标为
-`closed`。此流程仅适用于当前受管任务，**不授权处理任何既有 legacy 分支或 worktree**。
+发生部分清理或 final receipt 发布失败，Codex 必须先立即停止并保留所有尚未移除的 artifacts；随后
+在任务 JSON 原子持久化本地 quarantine receipt，记录已完成和失败的清理结果以及 PR 发布失败，并将
+状态 `quarantined` 作为同一记录的一部分原子写入。之后才重试向 PR 发布 final/quarantine receipt；
+PR 发布失败不得阻塞该安全状态转换，但任务不得 `closed`。不得声称已移除的 artifacts 被保留或以
+破坏性方式重建它们。此流程仅适用于当前受管任务，**不授权处理任何既有 legacy 分支或 worktree**。
 
 ## 自动拒绝
 
