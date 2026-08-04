@@ -46,8 +46,9 @@ Codex 必须在安全且技术可行时推送并创建或更新 draft PR，将�
 draft PR；否则下一位负责该任务的会话必须在首次安全机会完成迁入。`quarantined` 在耐久 PR 技术
 可用前不得清理。
 
-准备进入 `closed` 时，Codex 必须在清理完成后将终态交付回执发布到该 PR，且只有发布成功后才可
-将状态设为 `closed`；并在对用户的交接消息中回显同一回执摘要。任务进入 `quarantined` 且已有
+准备进入 `closed` 时，Codex 必须先将含不可变证据与计划清理的 provisional receipt 成功发布到
+该 PR，并原子更新任务 JSON；清理完成后再将终态交付回执发布到 PR，且只有发布成功后才可将
+状态设为 `closed`；并在对用户的交接消息中回显同一回执摘要。任务进入 `quarantined` 且已有
 draft PR 时，必须立即将隔离终态回执发布到该 draft PR。人工收集证据、作出清理决定和写入回执
 均不得绕过后文门禁。
 
@@ -146,14 +147,17 @@ HEAD 必须等于 `head.sha`，并且在新鲜 `git fetch` 后 `merge_commit_sha
 5. 发布分类的 tag、部署与健康检查要求已满足，或已记录适用的 N/A 理由。
 6. 目标不是任何受保护 checkout 或引用，且没有其他保护标记。
 
-准备进入 `closed` 时必须按以下顺序执行：先准备不可变 PR 与清理证据，并写入 provisional receipt；
-再从受保护的集成上下文中执行清理；清理后 Codex 必须成功将 final receipt 发布到 PR 并原子更新
-任务 JSON，只有最终回执成功发布后才可将状态设为 `closed` 并释放租约。清理时，Codex 在持有集成锁
-时回收该任务的远端功能分支、以正常方式移除该任务
+准备进入 `closed` 时必须按以下顺序执行：先准备不可变 PR 与清理证据，将 immutable
+PR/head/merge evidence 和计划清理成功发布为 PR 的 provisional receipt，并原子更新任务 JSON；
+在该步骤成功前不得开始清理。随后才从受保护的集成上下文中执行清理。清理后 Codex 必须成功将
+final receipt 发布到 PR，再原子更新任务 JSON；只有 final receipt 发布成功后才可将状态设为
+`closed` 并释放租约。清理时，Codex 在持有集成锁时回收该任务的远端功能分支、以正常方式移除该任务
 worktree（不得使用 force）。随后必须重新核验精确的本地 branch、其 HEAD 与已移除 worktree 的
 身份：仅当它们仍与已核验的受管任务完全匹配时，才明确允许执行
-`git branch -D <exact-verified-branch>`。`-D` 绝不得用于 legacy 或未知分支。任何部分清理失败
-都必须立即发布/更新 `quarantined` 回执与任务 JSON，不得设为 `closed`。
+`git branch -D <exact-verified-branch>`。`-D` 绝不得用于 legacy 或未知分支。任何部分清理失败或
+final receipt 发布失败都必须立即停止：保留所有尚未移除的 artifacts，在本地任务 JSON 记录已经
+完成及失败的清理结果并设为 `quarantined`，随后重试 PR final/quarantine receipt；不得声称已移除
+的 artifacts 被保留、不得以破坏性方式重建它们，也不得设为 `closed`。
 
 当前尚未提供自动回收工具或脚本。工具落地前，Codex 必须人工收集上述证据、作出回收或
 `quarantined` 决定并记录交付回执；人工执行不豁免任何门禁。
