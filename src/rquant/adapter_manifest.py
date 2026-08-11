@@ -37,6 +37,8 @@ REPLAY_CLAIM_NAMESPACE = "rquant-source-replay-claim/v1"
 BROKER_OUTBOX_NAMESPACE = "rquant-source-broker-outbox/v1"
 LAB_CLAIM_FINALIZER_ROOT_NAMESPACE = "rquant-lab-claim-finalizer-root/v1"
 LAB_CLAIM_FINALIZER_NAMESPACE = "rquant-lab-claim-finalizer/v1"
+RUNTIME_CODE_ROOT_NAMESPACE = "rquant-runtime-code-root/v1"
+RUNTIME_CODE_ATTESTATION_NAMESPACE = "rquant-runtime-code-attestation/v1"
 _ED25519_SIGNATURE_BYTES = 64
 _VERIFY_ONLY_KEYRING_CACHE_SIZE = 512
 
@@ -51,6 +53,8 @@ KeyPurpose = Literal[
     "broker_outbox",
     "lab_claim_finalizer_root",
     "lab_claim_finalizer",
+    "rquant_runtime_code_root",
+    "rquant_runtime_code_signer",
 ]
 RotationState = Literal["active", "previous"]
 NetworkMode = Literal["none", "provider"]
@@ -66,6 +70,8 @@ _PURPOSE_NAMESPACES: Mapping[KeyPurpose, frozenset[str]] = {
     "broker_outbox": frozenset({BROKER_OUTBOX_NAMESPACE}),
     "lab_claim_finalizer_root": frozenset({LAB_CLAIM_FINALIZER_ROOT_NAMESPACE}),
     "lab_claim_finalizer": frozenset({LAB_CLAIM_FINALIZER_NAMESPACE}),
+    "rquant_runtime_code_root": frozenset({RUNTIME_CODE_ROOT_NAMESPACE}),
+    "rquant_runtime_code_signer": frozenset({RUNTIME_CODE_ATTESTATION_NAMESPACE}),
 }
 
 
