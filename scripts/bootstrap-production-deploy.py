@@ -131,6 +131,10 @@ DEPLOY_CONTROL_PREFIXES = (
     "RQUANT_RELEASE_",
     "LAB_TRUSTED_GIT_",
 )
+DAILY_RECEIPT_AUTHORITY_PREFIXES = (
+    "RQUANT_DAILY_RECEIPT_",
+    "RQ_DAILY_SHADOW_RECEIPT_",
+)
 
 
 def _canonical(raw: str, *, label: str) -> Path:
@@ -261,12 +265,20 @@ def _read_deploy_controls(path: Path) -> dict[str, str]:
         if line.startswith("export "):
             line = line[7:].lstrip()
         if "=" not in line:
+            if line.startswith(DAILY_RECEIPT_AUTHORITY_PREFIXES):
+                raise DeployBootstrapError(
+                    "Daily receipt authority cannot be configured through .env"
+                )
             if line.startswith(DEPLOY_CONTROL_PREFIXES):
                 raise DeployBootstrapError(
                     f"deployment dotenv control requires '=' on line {line_number}"
                 )
             continue
         key, raw_value = line.split("=", 1)
+        if key.strip().startswith(DAILY_RECEIPT_AUTHORITY_PREFIXES):
+            raise DeployBootstrapError(
+                "Daily receipt authority cannot be configured through .env"
+            )
         if key != key.strip() or re.fullmatch(r"[A-Z][A-Z0-9_]*", key) is None:
             if key.strip().startswith(DEPLOY_CONTROL_PREFIXES):
                 raise DeployBootstrapError(
@@ -3934,7 +3946,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise DeployBootstrapError("finalizer target must be a full commit SHA")
             target_sha = target_ref
         else:
-            if not (args.initialize_generation or args.register_lab_installation):
+            if not dry_run and not (args.initialize_generation or args.register_lab_installation):
                 _fetch_generation_target(
                     root,
                     git_path,
@@ -4037,7 +4049,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             if dry_run and (args.initialize_generation or args.recover_generation):
                 raise DeployBootstrapError("generation initialization/recovery cannot be a dry-run")
-            if not (args.initialize_generation or args.register_lab_installation):
+            if installed_handoff:
                 handoff = _LabLaunchdHandoff(
                     root=root,
                     lock_path=lock_path,
@@ -4095,18 +4107,24 @@ def main(argv: list[str] | None = None) -> int:
                     prepare_intent=prepare_intent,
                     prepare_target=prepare_target,
                 )
-            lock_fd = _acquire_lock(
-                root,
-                lock_path,
-                shared=dry_run,
-                create=not (dry_run and args.register_lab_installation),
-                timeout_seconds=(
-                    LAUNCHD_HANDOFF_TIMEOUT_SECONDS
-                    if handoff is not None and handoff.stopped
-                    else 0
-                ),
-                deadline_monotonic=overall_deadline_monotonic,
+            lock_missing_preview = (
+                dry_run
+                and not args.register_lab_installation
+                and not lock_path.exists()
             )
+            if not lock_missing_preview:
+                lock_fd = _acquire_lock(
+                    root,
+                    lock_path,
+                    shared=dry_run,
+                    create=not dry_run,
+                    timeout_seconds=(
+                        LAUNCHD_HANDOFF_TIMEOUT_SECONDS
+                        if handoff is not None and handoff.stopped
+                        else 0
+                    ),
+                    deadline_monotonic=overall_deadline_monotonic,
+                )
         authority_path = root / "src" / "rquant" / "release_generation.py"
         generation_mode = (
             args.initialize_generation or args.register_lab_installation or args.recover_generation
@@ -4337,19 +4355,24 @@ def main(argv: list[str] | None = None) -> int:
         authority_module = _load_release_authority(authority_path)
         generation_error_type = authority_module.ReleaseGenerationError
         missing_record_type = authority_module.ReleaseGenerationRecordMissingError
-        authority = authority_module.ReleaseGenerationAuthority(
-            repo=root,
-            lock_path=lock_path,
-            lock_fd=lock_fd,
-            python_path=python_path,
-            git_path=git_path,
-            writable=args.recover_generation or args.finalize_generation,
-            uv_path=uv_path,
-            command_timeout_seconds=args.command_timeout_seconds,
-            overall_deadline_monotonic=overall_deadline_monotonic,
+        authority = (
+            None
+            if lock_fd < 0
+            else authority_module.ReleaseGenerationAuthority(
+                repo=root,
+                lock_path=lock_path,
+                lock_fd=lock_fd,
+                python_path=python_path,
+                git_path=git_path,
+                writable=args.recover_generation or args.finalize_generation,
+                uv_path=uv_path,
+                command_timeout_seconds=args.command_timeout_seconds,
+                overall_deadline_monotonic=overall_deadline_monotonic,
+            )
         )
 
         if args.finalize_generation:
+            assert authority is not None
             if TARGET_PATTERN.fullmatch(target) is None or target.startswith("v"):
                 raise DeployBootstrapError("finalizer target must be a full commit SHA")
             intent = authority.read_deployment_intent()
@@ -4400,6 +4423,7 @@ def main(argv: list[str] | None = None) -> int:
             return finish(0)
 
         if args.recover_generation:
+            assert authority is not None
             intent = authority.read_deployment_intent()
             action = str(args.recovery_action)
             expected_target = intent.previous_sha if action == "rollback" else intent.target_sha
@@ -4414,7 +4438,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise DeployBootstrapError(
                     "recovery checkout is outside recorded deployment intent"
                 )
-        else:
+        elif authority is not None:
             authority.verify(expected_commit=commit)
 
         src = root / "src"
@@ -4450,39 +4474,37 @@ def main(argv: list[str] | None = None) -> int:
                             active_handoff.prepared_intent_operation_id,
                         ]
                     )
-            return int(
-                deploy_main(
-                    [
-                        *arguments,
-                        "--repo",
-                        str(root),
-                        "--deployment-lock-path",
-                        str(lock_path),
-                        "--deployment-lock-fd",
-                        str(lock_fd),
-                        "--startup-generation",
-                        startup_generation,
-                        "--trusted-git-path",
-                        str(git_path),
-                        "--python-path",
-                        str(python_path),
-                        "--uv-path",
-                        str(uv_path),
-                        "--release-profile",
-                        args.release_profile,
-                        "--platform-name",
-                        args.host_platform,
-                        "--lab-lifecycle-mode",
-                        args.lab_lifecycle_mode,
-                        "--command-timeout-seconds",
-                        str(args.command_timeout_seconds),
-                        "--overall-timeout-seconds",
-                        str(args.overall_timeout_seconds),
-                        "--overall-deadline-monotonic",
-                        str(overall_deadline),
-                    ]
-                )
+            arguments.extend(
+                [
+                    "--repo",
+                    str(root),
+                    "--deployment-lock-path",
+                    str(lock_path),
+                    "--startup-generation",
+                    startup_generation,
+                    "--trusted-git-path",
+                    str(git_path),
+                    "--python-path",
+                    str(python_path),
+                    "--uv-path",
+                    str(uv_path),
+                    "--release-profile",
+                    args.release_profile,
+                    "--platform-name",
+                    args.host_platform,
+                    "--lab-lifecycle-mode",
+                    args.lab_lifecycle_mode,
+                    "--command-timeout-seconds",
+                    str(args.command_timeout_seconds),
+                    "--overall-timeout-seconds",
+                    str(args.overall_timeout_seconds),
+                    "--overall-deadline-monotonic",
+                    str(overall_deadline),
+                ]
             )
+            if lock_fd >= 0:
+                arguments.extend(["--deployment-lock-fd", str(lock_fd)])
+            return int(deploy_main(arguments))
 
         deploy_code = invoke_deployer(
             deploy_argv,

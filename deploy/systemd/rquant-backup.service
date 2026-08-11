@@ -6,10 +6,12 @@ OnFailure=rquant-alert@%n.service
 
 [Service]
 Type=oneshot
+Slice=rquant-maintenance.slice
+TasksMax=64
 User=lighthouse
 Group=lighthouse
 WorkingDirectory=/home/lighthouse/rquant
-ExecStart=/home/lighthouse/rquant/scripts/backup-snapshot.sh
+ExecStart=/usr/local/libexec/rquant-workload-arbiter maintenance -- /home/lighthouse/rquant/scripts/backup-snapshot.sh
 
 TimeoutStartSec=10min
 StandardOutput=journal

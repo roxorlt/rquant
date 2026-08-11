@@ -1,0 +1,10 @@
+[Unit]
+Description=Trigger rQuant midday market report
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 12:00:00
+AccuracySec=1s
+Unit=rquant-midday-report.service
+
+[Install]
+WantedBy=timers.target

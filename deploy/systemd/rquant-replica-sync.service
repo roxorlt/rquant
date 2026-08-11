@@ -7,10 +7,12 @@ OnFailure=rquant-alert@%n.service
 
 [Service]
 Type=oneshot
+Slice=rquant-maintenance.slice
+TasksMax=64
 User=lighthouse
 Group=lighthouse
 WorkingDirectory=/home/lighthouse/rquant
-ExecStart=/home/lighthouse/rquant/scripts/sync-readonly-replica.sh
+ExecStart=/usr/local/libexec/rquant-workload-arbiter maintenance -- /home/lighthouse/rquant/scripts/sync-readonly-replica.sh
 
 TimeoutStartSec=120
 StandardOutput=journal

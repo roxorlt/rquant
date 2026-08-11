@@ -497,15 +497,56 @@ Streamlit 只创建 job spec 和读取状态。浏览器卡死、刷新、切 ta
 
 ### 14.1 systemd slices
 
-建议建立三个资源组：
+建立一个父预算和四个资源 plane。dash slice 名由 systemd 解析为
+`/rquant.slice/rquant-live.slice` 等层级；运行时审计以 `systemctl show ... ControlGroup` 为准，
+不硬编码 cgroup 路径：
 
 | Slice | 成员 | 优先级 |
 |---|---|---|
 | `rquant-live.slice` | source、feature-live、strategies、signal-router、notifier | 最高 |
 | `rquant-serving.slice` | dashboard、panorama、serving publisher | 中等 |
 | `rquant-research.slice` | ingest、repair、backfill、replay、optimizer | 最低 |
+| `rquant-maintenance.slice` | backup、replica-sync | 最低，按并发峰值求和 |
 
-使用 `CPUWeight`、`IOWeight`、`MemoryHigh`、`MemoryMax`、`Nice` 限制研究任务。具体数值必须先以当前服务器实测基线校准，不直接拍脑袋写死。
+当前最低准入基线是实测 2 CPU / 7.51 GiB 可见内存的 8 GiB 标称主机。生产证据为 monitor
+current 2415 MiB、peak 2814 MiB，backup peak 1303 MiB。父级与 live 的
+`MemoryLow=3072M` 使祖先保护可兑现；父级/live/serving 只设
+`MemoryHigh=6144M/3840M/512M`，maintenance 在证据完成前不设 `MemoryHigh` 或 hard cap，只保留
+低 CPU/IO 权重。research 独立保持
+`MemoryMax=768M` 与精确 `CPUQuota=100%`，在 2 CPU 主机上最多占用一个核。
+
+正常 research 运行态的静态上界为 live 3840 + serving 512 + research 768 + OS/其他
+`system.slice` 1280 = 6400 MiB。maintenance 没有可信 aggregate 峰值，不能再宣称其运行态总量
+低于 7680 MiB；backup 与 replica 可并发，文件缓存也不能用 512 MiB service cap 强杀。二者与
+research 通过固定 root-owned flock wrapper 做全生命周期跨 plane 排他：maintenance pending
+阻止新 research，可抢占已运行 research，并有有界等待；同 plane 仍允许并发，timer calendar 不变。
+wrapper 路径不可由 `.env` 覆盖，安装时配套发布 root-owned SHA-256；registry 使用
+PID + process starttime + boot ID 防止 PID 复用误杀，并在 intent lock 内回收 crash 遗留项。
+
+research-ingest 不在 research plane 内执行 replica refresh。systemd 使用
+`Requires=rquant-replica-sync.service` + `After=` 在同一启动事务中编排独立 maintenance oneshot，
+同名 timer job 由 systemd 合并；required job 失败或后续 generation readiness 不通过都阻止 ingest。
+
+云端候选采样器 append-only 保存至少 24 小时 canonical hash-chain 原始样本。严格 schema 要求
+每个 sample 带 Linux boot ID、wall timestamp 与 `CLOCK_BOOTTIME` 纳秒值。同 boot 连续段内双时钟
+必须严格递增，5 分钟 cadence 允许的单次 timer jitter 上限为 450 秒；完整 24 小时窗口至少有
+289 个端点样本。重启前后的段可共存于 raw 链，但不能合并凑窗口。摘要还要求 backup/replica
+非零成功 runs、样本数、成功持续时长、raw SHA-256、OS/system.slice peak、最小 MemAvailable 和
+完整同 boot 窗口。strict gate 重放整条链、重新汇总并逐字段对比声明摘要，伪 raw、稀疏两点窗口
+或仅重写自声明 SHA fail closed。证据完整但尚未发布经评审 maintenance 阈值时，静态/health 仍为
+pending calibration，strict gate 与 research admission 继续阻塞，避免瞬时观测自动变成生产阈值。
+
+静态 fixture 只证明声明和 aggregate arithmetic。原始腾讯云必须运行固定路径的
+`scripts/verify-workload-isolation.sh`，由真实 `systemd-analyze verify/calendar`、loaded service
+实例枚举、resolved `Slice/ControlGroup`、`memory.low` 和 research `cpu.max` fail-closed 验收；
+macOS 结果不能替代该 gate。
+
+旧 runtime template 的 accept migration 使用固定持久 journal，并从 startup recovery 到 journal
+cleanup 全程持有 root:root `0600` 的固定 flock；并发调用可预测地报 busy。所有 mutation 前先保存
+unit 文件与可恢复状态矩阵；phase/state 只通过同目录 temp、fsync file、rename、fsync directory
+发布，phase 保留 last-good 冗余。`ERR/TERM/INT/HUP` 共用 rollback，SIGKILL/断电后的下一次启动先
+恢复 journal 再 preview/accept。phase 撕裂时从 last-good 恢复，冗余也损坏则执行 fail-safe rollback；
+unit/state journal 缺失字段或损坏时仍拒绝继续，不猜测生产 unit 状态。
 
 ### 14.2 资源准入
 
@@ -518,6 +559,41 @@ scheduler 在领取任务前检查：
 - 任务能否在 deadline 前完成；不能则只领取更小 shard。
 
 研究任务不是简单地“盘中全部禁止”。满足只读、低资源、无数据源冲突和可抢占四个条件时，可以运行。
+
+Strategy Lab worker 的资源准入位于 claim 可见之后、claim consume 和
+`LabClaimSpool.execution_admission` 之前。资源不足只返回 `deferred`，claim 继续留在 pending；
+它不会打开研究数据、执行 adapter、写结果或发布失败终态。达到 `retry_at` 后重新读取实时资源
+快照；期间若 scheduler 撤销或替换 claim，原 claim 不会复活。资源准入与执行 exactly-once
+围栏是两个独立协议，前者不能写后者的 admission marker。
+
+每个 shard 的请求由冻结的 `ResearchRunSpec.resource_class` 和
+`LabShardWorkPlan(work_units, static_duration_ms)` 确定性派生。估算公式为：
+
+```text
+memory = min(memory_cap,
+             memory_base
+             + ceil(work_units / work_step) * memory_per_work_step
+             + ceil(static_duration_ms / duration_step) * memory_per_duration_step)
+disk   = min(disk_cap,
+             disk_base
+             + ceil(work_units / work_step) * disk_per_work_step
+             + ceil(static_duration_ms / duration_step) * disk_per_duration_step)
+```
+
+当前版本的固定映射如下；这些值是准入上界，不是实际用量预测，后续只能通过版本化变更和实测
+校准调整：
+
+| class | memory base/cap | memory +work/+duration | disk base/cap | disk +work/+duration | step(work/time) | preemptible |
+|---|---:|---:|---:|---:|---:|---|
+| interactive | 256 MiB / 1.5 GiB | 64 / 32 MiB | 128 MiB / 4 GiB | 32 / 64 MiB | 500 / 15 min | yes |
+| standard | 512 MiB / 4 GiB | 64 / 64 MiB | 256 MiB / 16 GiB | 64 / 256 MiB | 1,000 / 60 min | yes |
+| heavy | 1 GiB / 8 GiB | 128 / 128 MiB | 512 MiB / 64 GiB | 256 MiB / 1 GiB | 5,000 / 6 h | no |
+
+现有 adapter 只读取不可变本地 snapshot，因此 `expected_quota_units=0`、`source=None`。
+未来若某个研究 adapter 需要调用行情源，必须新增版本化请求映射并由显式 quota lease provider
+提供 `SourceQuotaLease`，不能暗中改变现有回放口径。兼容模式可以不注入资源 provider；一旦
+以 isolated research runtime 启动，snapshot 和 policy provider 缺失或读取失败都必须 fail closed，
+且 claim 保持可重试。
 
 ### 14.3 当前服务器的现实边界
 
@@ -646,6 +722,50 @@ scheduler 在领取任务前检查：
 - 策略 runner 先以 shadow 模式读取新特征，与旧 monitor 输出逐事件比对。
 - 上线 signal-router 与持久通知 outbox。
 - 一致性达标后，移除策略进程里的直接 notify。
+
+#### Legacy Shadow 生产导出契约
+
+旧 `monitor`、旧 `surge-watch` 与 isolated runner 只向
+`data/legacy-shadow/{monitor,surge,isolated-runners}` 发布不可变比较证据，不得写 serving、
+shadow report authority 或 DuckDB 主库。新批次只能在交易日 15:00–15:05（Asia/Shanghai）
+发布；`captured_at` 和 completion `produced_at` 保留真实 UTC 时刻，`as_of`/`complete_through`
+绑定 15:00 session close。窗口外只能验收并恢复窗口内已经完整落盘的 `.staging-*` 或已
+rename 未 seal 批次，不能重新采集或生成证据。production wrapper 不接收调用方时间；真实
+wall clock、Linux boot id 与 monotonic clock 由内部 production factory 读取。窗口内 staging
+携带签名 recovery marker，绑定上述时钟、batch digest、source/date/commit/version；
+`legacy-shadow-recover` 只有 openat 验证和 promote 能力，没有原始 rows/events 输入。
+
+recovery namespace 只能走 root helper 的双阶段协议：`capture-recovery` 在真正开始物化时读取
+`CLOCK_REALTIME`、`CLOCK_BOOTTIME` 和 `/proc/sys/kernel/random/boot_id` 并签发 capture token；
+`sign-recovery` 在所有 payload 已 fsync 后重新读取同一组可信时钟，核对 token、canonical draft、
+交易日与受保护 SSE calendar，再注入真实 `produced_at` 并签 marker。开始或完成任一时刻不在
+15:00–15:05 都拒绝签发；generic signer 禁止 recovery namespace，调用方提交的时间字段也拒绝。
+`rquant-shadow-report-signer --validate-key-material` 必须同时验私钥 manifest 与 root-owned 0600、
+content-addressed recovery calendar。该 helper 属于 deploy 基础设施，安装后仍需单独 cloud preflight；
+本阶段不通过修改 systemd unit 绕过这道 gate。
+
+`surge-watch` 的 completion 还要求 09:30 至 15:00 成功 snapshot 覆盖：记录首末成功、活跃
+交易时段最大间隔、连续 miss、route 与全市场覆盖。空 DataFrame、`None`、provider 异常、非
+`tushare_rt` route、未知代码或低于 stock-basic universe 的 98%/4000 只保守门槛都记为采集失败；
+proof 至少包含一条非空全市场成功响应。缺开盘或收盘覆盖、超过一个连续 miss、超过 125 秒
+活跃间隔、收盘仍有未恢复 miss 都只产生 degraded。`monitor` 使用 DuckDB `fetchmany` 游标分页
+写入有界独立 spool，退出 DuckDB context 后才签名和发布，禁止全表 `fetchdf` 物化。
+
+isolated fan-in 从同一份 production profile 精确解析 `n_shape` 与 `growth_board_surge` 两份
+`STRATEGY_LIVE` manifest，不信任 router 的重复配置。导出 marker/manifest 与 consumer settings
+同时绑定 producer manifest fingerprint、commit、service/instance/version、strategy
+registration/spec、evaluator 和 executable；runner version 可以且应独立于 Shadow report service
+version。任一字段不一致都视为 unavailable/degraded，不进入策略 mismatch 统计。
+
+该目录的部署前提固定为**同机本地 POSIX 文件系统**：building、staging 和 session 必须位于
+同一 mount，依赖 parent `dir_fd`、`O_NOFOLLOW`、regular-file `fstat`、目录项复核、`fsync`
+和同文件系统原子 `renameat`。Linux production 对 mount type fail closed，只允许明确列出的
+本地文件系统；NFS、SMB、FUSE、overlay 和 unknown mount 一律拒绝。macOS 仅允许显式
+`test-only-local-posix` 测试依赖，该 override 不能进入 production factory。部署 preflight 必须把
+`legacy-shadow-filesystem/v1` 视为硬契约。文件 mode 只用于减少误操作，0444 不是安全边界；
+不可变性来自签名 marker、digest、受保护 owner/目录和完整 openat/fstat/fsync/renameat 链。reader
+只接受完整且签名验收通过、receipt/commit/date 全部绑定的 batch；缺失、迟到、部分、篡改或
+外部绑定失败统一 degraded，不进入 mismatch 统计。
 
 ### Phase 4：独立模拟盘和 serving
 

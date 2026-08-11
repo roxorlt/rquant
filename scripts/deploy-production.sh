@@ -33,6 +33,45 @@ if [[ -n "${RQUANT_RELEASE_PROFILE:-}" && "${RQUANT_RELEASE_PROFILE}" != "${RELE
     exit 2
 fi
 
+RUNTIME_PROFILE_ARGS=()
+RUNTIME_PRODUCTION_INPUTS="${RQUANT_RUNTIME_PRODUCTION_INPUTS:-}"
+RUNTIME_PROFILE_OUTPUT_DIR="${RQUANT_RUNTIME_PROFILE_OUTPUT_DIR:-}"
+RUNTIME_ROOT="${RQUANT_RUNTIME_ROOT:-}"
+LINUX_PRODUCTION_RUNTIME_ROOT="/home/lighthouse/rquant/data/runtime"
+if [[ "${HOST_PLATFORM}" == "linux" ]] && {
+    [[ -z "${RUNTIME_PRODUCTION_INPUTS}" ]] ||
+        [[ -z "${RUNTIME_PROFILE_OUTPUT_DIR}" ]] ||
+        [[ -z "${RUNTIME_ROOT}" ]]
+}; then
+    printf 'Linux production requires runtime production inputs, profile output directory, and runtime root\n' >&2
+    exit 2
+fi
+if [[ "${HOST_PLATFORM}" == "linux" && "${RUNTIME_ROOT}" != "${LINUX_PRODUCTION_RUNTIME_ROOT}" ]]; then
+    printf 'Linux production runtime root must be exactly %s\n' "${LINUX_PRODUCTION_RUNTIME_ROOT}" >&2
+    exit 2
+fi
+if [[ -n "${RUNTIME_PRODUCTION_INPUTS}" || -n "${RUNTIME_PROFILE_OUTPUT_DIR}" || -n "${RUNTIME_ROOT}" ]]; then
+    if [[ -z "${RUNTIME_PRODUCTION_INPUTS}" || -z "${RUNTIME_PROFILE_OUTPUT_DIR}" || -z "${RUNTIME_ROOT}" ]]; then
+        printf 'runtime production inputs, profile output directory, and root must be configured together\n' >&2
+        exit 2
+    fi
+    RUNTIME_PROFILE_ARGS+=(
+        --runtime-production-inputs "${RUNTIME_PRODUCTION_INPUTS}"
+        --runtime-profile-output-dir "${RUNTIME_PROFILE_OUTPUT_DIR}"
+        --runtime-root "${RUNTIME_ROOT}"
+    )
+fi
+if [[ "${HOST_PLATFORM}" == "linux" ]]; then
+    if [[ ! -x /usr/bin/ssh-keygen || -L /usr/bin/ssh-keygen ]]; then
+        printf 'Required trusted binary is unavailable: /usr/bin/ssh-keygen\n' >&2
+        exit 2
+    fi
+    if [[ ! -x /usr/bin/rpm ]] || ! /usr/bin/rpm -q openssh-clients >/dev/null 2>&1; then
+        printf 'Required production package is unavailable: openssh-clients\n' >&2
+        exit 2
+    fi
+fi
+
 BOOTSTRAP_ARGS=(
     --expected-checkout-root "${PROJECT_DIR}"
     --deployment-lock-path "${DEPLOY_LOCK}"
@@ -58,4 +97,5 @@ fi
 
 exec "${PYTHON_BIN}" -I -S "${PROJECT_DIR}/scripts/bootstrap-production-deploy.py" \
     "${BOOTSTRAP_ARGS[@]}" \
-    "$@"
+    "$@" \
+    "${RUNTIME_PROFILE_ARGS[@]}"

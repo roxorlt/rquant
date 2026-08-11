@@ -14,9 +14,17 @@
 4. 腾讯云执行：
 
    ```bash
-   cd /home/lighthouse/rquant
+   ROOT=/home/lighthouse/rquant
+   cd "${ROOT}"
+   export RQUANT_RUNTIME_PRODUCTION_INPUTS="${ROOT}/data/runtime-production-inputs.json"
+   export RQUANT_RUNTIME_PROFILE_OUTPUT_DIR="${ROOT}/data/runtime-profiles"
+   export RQUANT_RUNTIME_ROOT="${ROOT}/data/runtime"
    bash scripts/deploy-production.sh --target v0.13.2
    ```
+
+   这三个绝对路径必须由受控部署环境预置并保持稳定；Linux 缺任一项即在 bootstrap 前失败关闭。
+   操作人员不传 Job Center 的 SQLite、command spool、artifact、Definition/Experiment/Catalog 路径，
+   也不传 profile id 或 generation hash。
 
 5. 纯标准库 bootstrap 在创建或取得 generation/handoff lock 前先只读核对 installation state 及其
    绑定的 prepared runtime sentinel。macOS installed 发布还会先只读解析已有 handoff record 并
@@ -34,7 +42,11 @@
    `GIT_OPTIONAL_LOCKS=0`。部署器依次执行：tracked 工作区检查、target/main 归属与快进检查、
    diff 风险分类、接管 bootstrap 已验证的 prepared intent（不再 fetch、重算 diff 或重建 plan）、
    快照实际 active 的受影响服务及 timer、使旧 marker 失效、暂停原先 active 的相关 timer、
-   `git merge --ff-only <exact-sha>`、用物理绑定的 uv 执行 frozen sync、第一次 preflight、按 intent 的精确集合
+   `git merge --ff-only <exact-sha>`、用物理绑定的 uv 执行 frozen sync、发布并 rollout 精确 SHA 的
+   production deployment profile。随后部署器调用 `rquant lab-runtime-prepare`：它从当前 profile 与
+   install receipt 重读并逐项核对 code SHA、profile id、generation hash、runtime root 以及
+   Lab Jobs/Definition/Experiment/Dataset/Catalog 四类 authority 路径，原子发布并安装
+   `research/job-center-authority.json`。这一步完成后才运行第一次 preflight、按 intent 的精确集合
    重启服务、第二次 preflight、恢复原先 active 的 timer。最后由 target checkout 的隔离 stdlib
    bootstrap 重新加载 target authority。它在 operation id + commit 唯一命名的 staging 目录中
    直接构建 owner-only 不可变环境，把 console script 中精确指向 staging/source interpreter 的
@@ -159,12 +171,23 @@ bash scripts/deploy-production.sh \
 ```bash
 ROOT=/Users/roxor/brain/30-projects/rQuant
 LOCK=/Users/roxor/brain/30-projects/.rquant-deploy/rQuant.lock
+export RQUANT_RUNTIME_ROOT="${ROOT}/data/runtime"
+export LAB_RUNTIME_DIR="${RQUANT_RUNTIME_ROOT}/research"
+export LAB_JOBS_PATH="${LAB_RUNTIME_DIR}/lab_jobs.sqlite3"
+export LAB_JOB_COMMAND_DIR="${LAB_RUNTIME_DIR}/commands"
+export LAB_FINAL_ARTIFACT_DIR="${LAB_RUNTIME_DIR}/final-artifacts"
 "${ROOT}/.venv/bin/python" -I -S "${ROOT}/scripts/run-lab-daemon.py" \
   --expected-checkout-root "${ROOT}" \
   --trusted-git-path /usr/bin/git \
   --deployment-lock-path "${LOCK}" \
   -- "${ROOT}/.venv/bin/rquant" lab-runtime-prepare
 ```
+
+`RQUANT_RUNTIME_ROOT` 是已经由 `runtime-deployment-profile --apply` 安装 current profile/receipt 的
+受控根。wrapper 只从该环境绑定 `--runtime-deployment-root`；CLI 再从 current profile 解析
+Definition Registry、Experiment Registry、Lab Jobs、command spool、final artifact、dataset 与
+catalog authority，调用方不能覆盖。profile 缺失、过期、SHA/代际不匹配时零 Job/SQLite 写入；
+candidate 发布或 current 安装失败会保留/恢复原 current，不留下可加载的半安装文件。
 
 准备命令最后以原子 `0600` 的 `lab-runtime/.prepared.json` 固化稳定 runtime authority id、
 checkout 路径、runtime 根身份、全部托管目录/文件和每个 legacy 迁移来源；执行时的 release
@@ -279,6 +302,11 @@ Python 链必须最终绑定 marker 中已校验的 system interpreter，其他�
 
 发布脚本按宿主显式选择 `linux-production` 或 `macos-lab`，profile 与平台不匹配时拒绝运行。
 Linux profile 保持既有 systemd service/timer 计划；macOS profile 不运行任何 `systemctl`。
+每次精确 SHA 变化都会先安装同 SHA 的 deployment profile，再重新发布同 SHA/profile generation
+绑定的 Job Center current manifest；旧 SHA manifest 不能被新 scheduler 自动加载。prepare 失败时
+部署事务在任何 target scheduler/daemon restart 前进入 rollback，previous checkout 会按 previous
+profile 重新发布 previous manifest。若 previous manifest 已存在，失败恢复保持其原 bytes；首次安装
+失败则 current 仍不存在，只有不可加载的 candidate 会被清理。
 由于 Lab runtime guard 绑定精确 checkout SHA，macOS 上任何 commit 迁移都必须交接 scheduler、
 worker、finalizer，而不按文件后缀猜测“这次改动大概无关”。交接在交易保护窗口外确认三个 label
 均已 loaded，各执行一次 bootout，部署完成后各 bootstrap 一次，不用重启循环掩盖故障。
@@ -380,7 +408,9 @@ macOS 还使用同一稳定私有根中的 `rquant.lab-install.json`、活动
    rollback。两者都必须走 `scripts/deploy-production.sh`，不能手工 reset 后补 marker。
 4. 成功标准是 intent=`completed`，commit record 精确绑定 marker、intent 和 selected environment
    manifest，marker commit/schema 与最终 checkout 一致，两次 preflight 通过，intent 中 active
-   services 健康且 active timers 已恢复。任一项缺失都仍是未完成事务。
+   services 健康且 active timers 已恢复。Daily receipt signer 以
+   `rquant-daily-receipt-signer.socket` 的 `active/waiting` 为健康信号；root signer service 在首次
+   请求前 `inactive/dead` 是正常的 socket-activation 状态。任一项缺失都仍是未完成事务。
 
 ## 旧脚本边界
 

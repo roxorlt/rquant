@@ -5,6 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+Slice=rquant-serving.slice
 User=lighthouse
 Group=lighthouse
 WorkingDirectory=/home/lighthouse/rquant
