@@ -1,0 +1,12 @@
+[Unit]
+Description=rQuant Serving Workload Plane
+
+[Slice]
+CPUAccounting=true
+CPUWeight=500
+IOAccounting=true
+IOWeight=500
+MemoryAccounting=true
+MemoryHigh=512M
+TasksAccounting=true
+TasksMax=256

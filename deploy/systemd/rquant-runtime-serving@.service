@@ -1,0 +1,43 @@
+[Unit]
+Description=rQuant isolated serving runtime (%i)
+OnFailure=rquant-alert@%n.service
+StartLimitIntervalSec=900s
+StartLimitBurst=4
+
+[Service]
+Type=simple
+User=lighthouse
+Group=lighthouse
+WorkingDirectory=/home/lighthouse/rquant
+EnvironmentFile=/home/lighthouse/rquant/data/runtime/current/runtime.env
+Environment=APP_ENV=prod RQUANT_DISABLE_DOTENV=1
+Slice=rquant-serving.slice
+ExecStart=/home/lighthouse/rquant/.venv/bin/python -m rquant.runtime_service_main --manifest /home/lighthouse/rquant/data/runtime/current/manifests/%i.json --control-root /home/lighthouse/rquant/data/runtime/control/serving-publishers/%i --expected-commit ${RQUANT_RUNTIME_COMMIT} --expected-generation ${RQUANT_RUNTIME_GENERATION} --expected-kind serving_publisher
+
+Restart=on-failure
+RestartSec=20s
+TimeoutStartSec=120s
+TimeoutStopSec=60s
+SuccessExitStatus=0
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+InaccessiblePaths=/home/lighthouse/rquant/.env -/home/lighthouse/rquant/data/runtime/current/secrets -/home/lighthouse/rquant/data/runtime/current/credentials
+ProtectProc=invisible
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+ReadWritePaths=/home/lighthouse/rquant/data/runtime/control/serving-publishers/%i /home/lighthouse/rquant/data/runtime/serving
+ReadOnlyPaths=-/home/lighthouse/rquant/data/runtime/control -/home/lighthouse/rquant/data/runtime/live/notifications -/home/lighthouse/rquant/data/runtime/live/paper-brokers -/home/lighthouse/rquant/data/runtime/live/signal-bus -/home/lighthouse/rquant/data/runtime/research
+
+StandardOutput=journal
+StandardError=journal
