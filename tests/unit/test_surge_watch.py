@@ -23,6 +23,7 @@ from rquant.surge_watch import (
     SNAPSHOT_FULL_NAME,
     CumulativeTracker,
     SurgeBaseline,
+    SurgeCollectionTracker,
     SurgeConfig,
     SurgeConfirmed,
     SurgePushHistory,
@@ -30,6 +31,7 @@ from rquant.surge_watch import (
     _detection_domain,
     _is_lunch,
     _minute_delta,
+    _publish_legacy_shadow_exports,
     _rough_candidates,
     append_events,
     atomic_write_parquet,
@@ -604,7 +606,7 @@ class TestU7Guards:
             baseline=mk_baseline({}),
             base_dir=tmp_path,
             is_trading_day_fn=lambda d: True,
-            snapshot_fetcher=lambda: mk_snap([]),   # 恒 miss
+            snapshot_fetcher=lambda: None,   # provider 恒失败
             minute_fetcher=lambda c, d: pd.DataFrame(),
             notify_fn=lambda scene, **k: notifies.append((scene, k)),
             now_fn=now_fn,
@@ -616,6 +618,328 @@ class TestU7Guards:
         # streak 5/6/7 的退避 = 60/120/300（前 4 次 miss 每次 60）
         assert sleeps[:4] == [60, 60, 60, 60]
         assert sleeps[4:7] == [60, 120, 300]
+
+
+def test_surge_close_exports_legacy_and_profile_fan_in(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trade_date = date(2026, 8, 3)
+    data_dir = (tmp_path / "data").resolve()
+    events_path = tmp_path / "surge-live" / "events-2026-08-03.jsonl"
+    events_path.parent.mkdir()
+    events_path.write_text(
+        '{"confirmed_at":"14:59","status":"confirmed","ts_code":"300001.SZ"}\n',
+        encoding="utf-8",
+    )
+    proof = SurgeCollectionTracker(
+        trade_date=trade_date,
+        started_at=datetime(2026, 8, 3, 9, 25, tzinfo=CST),
+        market_universe=frozenset({"300001.SZ", "600001.SH"}),
+        minimum_market_coverage_count=2,
+    )
+    full_market = mk_snap(
+        [
+            {"ts_code": "300001.SZ", "price": 10, "pre_close": 10},
+            {"ts_code": "600001.SH", "price": 10, "pre_close": 10},
+        ]
+    )
+    full_market.attrs["route"] = "tushare_rt"
+    proof.observe_snapshot(datetime(2026, 8, 3, 9, 30, tzinfo=CST), full_market)
+    proof.observe_snapshot(datetime(2026, 8, 3, 14, 59, tzinfo=CST), full_market)
+    proof.maximum_active_gap_seconds = 60
+    complete = proof.complete_proof()
+    assert complete is not None
+    observed: list[tuple[str, object]] = []
+    monkeypatch.setattr(
+        "rquant.legacy_shadow_export.publish_legacy_surge_production_export",
+        lambda **kwargs: observed.append(("surge", kwargs)) or data_dir / "surge",
+    )
+    monkeypatch.setattr(
+        "rquant.legacy_shadow_export.fan_in_production_isolated_runner_exports",
+        lambda **kwargs: observed.append(("isolated", kwargs)) or {},
+    )
+
+    _publish_legacy_shadow_exports(
+        trade_date=trade_date,
+        events_path=events_path,
+        collection_proof=complete,
+    )
+
+    assert [kind for kind, _kwargs in observed] == ["surge", "isolated"]
+    assert "exported_at" not in observed[0][1]
+    assert observed[0][1]["collection_proof"] == complete
+
+
+def test_surge_collection_proof_marks_a_recovered_provider_miss() -> None:
+    trade_date = date(2026, 8, 3)
+    tracker = SurgeCollectionTracker(
+        trade_date=trade_date,
+        started_at=datetime(2026, 8, 3, 9, 25, tzinfo=CST),
+        market_universe=frozenset({"300001.SZ"}),
+        minimum_market_coverage_count=1,
+    )
+    full_market = mk_snap(
+        [{"ts_code": "300001.SZ", "price": 10, "pre_close": 10}]
+    )
+    full_market.attrs["route"] = "tushare_rt"
+    tracker.observe_snapshot(datetime(2026, 8, 3, 9, 30, tzinfo=CST), full_market)
+    tracker.observe_failure(
+        datetime(2026, 8, 3, 9, 31, tzinfo=CST),
+        route="tushare_rt",
+    )
+    tracker.observe_snapshot(datetime(2026, 8, 3, 9, 32, tzinfo=CST), full_market)
+    tracker.observe_snapshot(datetime(2026, 8, 3, 14, 59, tzinfo=CST), full_market)
+    tracker.maximum_active_gap_seconds = 120
+
+    proof = tracker.complete_proof()
+
+    assert proof is not None
+    assert proof.failed_snapshots == 1
+    assert proof.source_health == "recovered"
+
+
+def test_surge_runner_exports_only_after_a_continuous_natural_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[dict[str, object]] = []
+    started = datetime(2026, 8, 3, 9, 25, tzinfo=CST)
+    clock = {"t": started}
+    codes = ["300001.SZ", "600001.SH"]
+    full_market = mk_snap(
+        [
+            {"ts_code": code, "price": 10, "pre_close": 10}
+            for code in codes
+        ]
+    )
+    full_market.attrs["route"] = "tushare_rt"
+    monkeypatch.setattr("rquant.surge_watch._MIN_FULL_MARKET_COVERAGE_COUNT", 1)
+    monkeypatch.setattr(
+        "rquant.surge_watch._publish_legacy_shadow_exports",
+        lambda **kwargs: observed.append(kwargs) or (tmp_path / "surge", {}),
+    )
+
+    run_surge_watch(
+        baseline=mk_baseline({}, code_universe=codes),
+        base_dir=tmp_path / "natural-close",
+        is_trading_day_fn=lambda _day: True,
+        snapshot_fetcher=lambda: full_market,
+        minute_fetcher=lambda _code, _day: pd.DataFrame(),
+        notify_fn=lambda *_args, **_kwargs: None,
+        now_fn=lambda: clock["t"],
+        sleep_fn=lambda seconds: clock.__setitem__(
+            "t", clock["t"] + timedelta(seconds=seconds)
+        ),
+    )
+    run_surge_watch(
+        baseline=mk_baseline({}),
+        base_dir=tmp_path / "forced-stop",
+        force_session=True,
+        max_ticks=0,
+        is_trading_day_fn=lambda _day: True,
+        snapshot_fetcher=lambda: mk_snap([]),
+        minute_fetcher=lambda _code, _day: pd.DataFrame(),
+        notify_fn=lambda *_args, **_kwargs: None,
+        now_fn=lambda: datetime(2026, 8, 3, 15, 2, tzinfo=CST),
+        sleep_fn=lambda _seconds: None,
+    )
+
+    assert len(observed) == 1
+    assert observed[0]["trade_date"] == started.date()
+    assert observed[0]["events_path"] == (
+        tmp_path / "natural-close" / "events-2026-08-03.jsonl"
+    )
+    assert observed[0]["collection_proof"].nonempty_successful_snapshots > 0
+    assert observed[0]["collection_proof"].minimum_market_coverage_bps == 10_000
+
+
+def test_surge_all_day_empty_snapshots_degrade_without_completion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[dict[str, object]] = []
+    clock = {"t": datetime(2026, 8, 3, 9, 25, tzinfo=CST)}
+    monkeypatch.setattr(
+        "rquant.surge_watch._publish_legacy_shadow_exports",
+        lambda **kwargs: observed.append(kwargs) or (tmp_path / "surge", {}),
+    )
+    monkeypatch.setattr("rquant.surge_watch._MIN_FULL_MARKET_COVERAGE_COUNT", 1)
+    empty = mk_snap([])
+    empty.attrs["route"] = "tushare_rt"
+
+    run_surge_watch(
+        baseline=mk_baseline({}, code_universe=["300001.SZ"]),
+        base_dir=tmp_path / "all-empty",
+        is_trading_day_fn=lambda _day: True,
+        snapshot_fetcher=lambda: empty,
+        minute_fetcher=lambda _code, _day: pd.DataFrame(),
+        notify_fn=lambda *_args, **_kwargs: None,
+        now_fn=lambda: clock["t"],
+        sleep_fn=lambda seconds: clock.__setitem__(
+            "t", clock["t"] + timedelta(seconds=seconds)
+        ),
+    )
+
+    assert observed == []
+
+
+def test_surge_partial_market_coverage_degrades_without_completion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[dict[str, object]] = []
+    clock = {"t": datetime(2026, 8, 3, 9, 25, tzinfo=CST)}
+    monkeypatch.setattr(
+        "rquant.surge_watch._publish_legacy_shadow_exports",
+        lambda **kwargs: observed.append(kwargs) or (tmp_path / "surge", {}),
+    )
+    monkeypatch.setattr("rquant.surge_watch._MIN_FULL_MARKET_COVERAGE_COUNT", 1)
+    partial = mk_snap(
+        [{"ts_code": "300001.SZ", "price": 10, "pre_close": 10}]
+    )
+    partial.attrs["route"] = "tushare_rt"
+
+    run_surge_watch(
+        baseline=mk_baseline(
+            {},
+            code_universe=["300001.SZ", "600001.SH"],
+        ),
+        base_dir=tmp_path / "partial",
+        is_trading_day_fn=lambda _day: True,
+        snapshot_fetcher=lambda: partial,
+        minute_fetcher=lambda _code, _day: pd.DataFrame(),
+        notify_fn=lambda *_args, **_kwargs: None,
+        now_fn=lambda: clock["t"],
+        sleep_fn=lambda seconds: clock.__setitem__(
+            "t", clock["t"] + timedelta(seconds=seconds)
+        ),
+    )
+
+    assert observed == []
+
+
+@pytest.mark.parametrize(
+    "started",
+    (
+        datetime(2026, 8, 3, 15, 2, tzinfo=CST),
+        datetime(2026, 8, 3, 14, 59, tzinfo=CST),
+    ),
+    ids=("after-close-start", "late-restart"),
+)
+def test_surge_runner_late_process_cannot_mint_close_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    started: datetime,
+) -> None:
+    observed: list[dict[str, object]] = []
+    close = datetime(2026, 8, 3, 15, 2, tzinfo=CST)
+    times = iter((started, started, close, close))
+    monkeypatch.setattr(
+        "rquant.surge_watch._publish_legacy_shadow_exports",
+        lambda **kwargs: observed.append(kwargs) or (tmp_path / "surge", {}),
+    )
+
+    run_surge_watch(
+        baseline=mk_baseline({}),
+        base_dir=tmp_path / "late",
+        is_trading_day_fn=lambda _day: True,
+        snapshot_fetcher=lambda: mk_snap([]),
+        minute_fetcher=lambda _code, _day: pd.DataFrame(),
+        notify_fn=lambda *_args, **_kwargs: None,
+        now_fn=lambda: next(times),
+        sleep_fn=lambda _seconds: None,
+    )
+
+    assert observed == []
+
+
+@pytest.mark.parametrize("failure", (KeyboardInterrupt(), RuntimeError("source failed")))
+def test_surge_runner_interrupted_or_failed_process_cannot_export(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: BaseException,
+) -> None:
+    observed: list[dict[str, object]] = []
+    started = datetime(2026, 8, 3, 9, 25, tzinfo=CST)
+    monkeypatch.setattr(
+        "rquant.surge_watch._publish_legacy_shadow_exports",
+        lambda **kwargs: observed.append(kwargs) or (tmp_path / "surge", {}),
+    )
+
+    def fail() -> pd.DataFrame:
+        raise failure
+
+    arguments = {
+        "baseline": mk_baseline({}),
+        "base_dir": tmp_path / type(failure).__name__,
+        "is_trading_day_fn": lambda _day: True,
+        "snapshot_fetcher": fail,
+        "minute_fetcher": lambda _code, _day: pd.DataFrame(),
+        "notify_fn": lambda *_args, **_kwargs: None,
+        "now_fn": lambda: started,
+        "sleep_fn": lambda _seconds: None,
+        "max_ticks": 1,
+    }
+    assert run_surge_watch(**arguments) == 0
+
+    assert observed == []
+
+
+def test_surge_all_day_provider_failure_has_no_completion_proof(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[dict[str, object]] = []
+    clock = {"t": datetime(2026, 8, 3, 9, 25, tzinfo=CST)}
+    monkeypatch.setattr(
+        "rquant.surge_watch._publish_legacy_shadow_exports",
+        lambda **kwargs: observed.append(kwargs) or (tmp_path / "surge", {}),
+    )
+    run_surge_watch(
+        baseline=mk_baseline({}),
+        base_dir=tmp_path / "all-fail",
+        is_trading_day_fn=lambda _day: True,
+        snapshot_fetcher=lambda: None,
+        minute_fetcher=lambda _code, _day: pd.DataFrame(),
+        notify_fn=lambda *_args, **_kwargs: None,
+        now_fn=lambda: clock["t"],
+        sleep_fn=lambda seconds: clock.__setitem__(
+            "t", clock["t"] + timedelta(seconds=seconds)
+        ),
+    )
+    assert observed == []
+
+
+def test_surge_two_minute_provider_gap_degrades_even_after_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[dict[str, object]] = []
+    clock = {"t": datetime(2026, 8, 3, 9, 25, tzinfo=CST)}
+    monkeypatch.setattr(
+        "rquant.surge_watch._publish_legacy_shadow_exports",
+        lambda **kwargs: observed.append(kwargs) or (tmp_path / "surge", {}),
+    )
+
+    def snapshot() -> pd.DataFrame | None:
+        if clock["t"].time() in {dt_time(10, 0), dt_time(10, 1)}:
+            return None
+        return mk_snap([])
+
+    run_surge_watch(
+        baseline=mk_baseline({}),
+        base_dir=tmp_path / "gap",
+        is_trading_day_fn=lambda _day: True,
+        snapshot_fetcher=snapshot,
+        minute_fetcher=lambda _code, _day: pd.DataFrame(),
+        notify_fn=lambda *_args, **_kwargs: None,
+        now_fn=lambda: clock["t"],
+        sleep_fn=lambda seconds: clock.__setitem__(
+            "t", clock["t"] + timedelta(seconds=seconds)
+        ),
+    )
+    assert observed == []
 
 
 # ── U8 落盘 ─────────────────────────────────────────────────────────────────────

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from datetime import UTC, date, datetime
+from pathlib import Path
 
+import duckdb
 import pandas as pd
 
 from rquant.security_status import SHANGHAI, SecurityStatusDaily
@@ -90,6 +92,29 @@ def test_format_tushare_catalog_display_decodes_json_fields() -> None:
     assert display.iloc[0]["路径"] == "股票数据 > 行情数据 > 实时分钟"
     assert display.iloc[0]["能力"] == "intraday_realtime"
     assert display.iloc[0]["权限"] == "正式权限"
+
+
+def test_tushare_metadata_state_distinguishes_missing_corrupt_and_empty(
+    tmp_path: Path,
+) -> None:
+    from rquant.dashboard.strategy_lab_data import (
+        TushareMetadataState,
+        load_tushare_interface_catalog_state,
+    )
+
+    missing = load_tushare_interface_catalog_state(tmp_path / "missing.duckdb")
+    corrupt_path = tmp_path / "corrupt.duckdb"
+    corrupt_path.write_bytes(b"not a duckdb catalog")
+    corrupt = load_tushare_interface_catalog_state(corrupt_path)
+    empty_path = tmp_path / "empty.duckdb"
+    connection = duckdb.connect(str(empty_path))
+    connection.close()
+    empty = load_tushare_interface_catalog_state(empty_path)
+
+    assert missing.state is TushareMetadataState.MISSING
+    assert corrupt.state is TushareMetadataState.CORRUPT
+    assert empty.state is TushareMetadataState.EMPTY
+    assert missing.frame.empty and corrupt.frame.empty and empty.frame.empty
 
 
 def test_format_tushare_catalog_display_shows_quote_and_points_gap() -> None:

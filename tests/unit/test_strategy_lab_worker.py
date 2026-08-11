@@ -269,6 +269,23 @@ class TestCancelBackgroundRun:
 
 
 class TestExecuteSpec:
+    def test_rejects_relative_immutable_snapshot_before_builder(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from rquant.dashboard import strategy_lab_worker as worker
+
+        monkeypatch.setitem(worker._SPEC_BUILDERS, "n_shape_optimize", lambda _params: _fake_run())
+        with pytest.raises(PermissionError, match="absolute"):
+            worker.execute_spec(
+                {
+                    "run_type": "n_shape_optimize",
+                    "run_id": "relative-snapshot",
+                    "research_snapshot": "relative/research.duckdb",
+                    "params": {},
+                },
+                base_dir=tmp_path,
+            )
+
     def test_formal_gate_runs_before_builder(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -292,6 +309,7 @@ class TestExecuteSpec:
                 {
                     "run_type": "n_shape_optimize",
                     "run_id": "run-gate-blocked",
+                    "research_snapshot": str(tmp_path / "research-immutable.duckdb"),
                     "params": {"research_gate": {"mode": "formal"}},
                 },
                 base_dir=tmp_path,
@@ -316,12 +334,19 @@ class TestExecuteSpec:
         spec = {
             "run_type": "n_shape_optimize",
             "run_id": "run-ok",
+            "research_snapshot": str(tmp_path / "research-immutable.duckdb"),
             "params": {"start_date": "2026-06-01", "end_date": "2026-06-20"},
         }
         run_id = worker.execute_spec(spec, base_dir=tmp_path)
 
         assert run_id == "run-ok"
-        assert calls == [{"start_date": "2026-06-01", "end_date": "2026-06-20"}]
+        assert calls == [
+            {
+                "start_date": "2026-06-01",
+                "end_date": "2026-06-20",
+                "_legacy_research_snapshot": str(tmp_path / "research-immutable.duckdb"),
+            }
+        ]
         status = worker.read_run_status("run-ok", base_dir=tmp_path)
         assert status is not None
         assert status.state == "done"
@@ -339,7 +364,12 @@ class TestExecuteSpec:
             raise RuntimeError("计算炸了")
 
         monkeypatch.setitem(worker._SPEC_BUILDERS, "n_shape_optimize", broken_builder)
-        spec = {"run_type": "n_shape_optimize", "run_id": "run-bad", "params": {}}
+        spec = {
+            "run_type": "n_shape_optimize",
+            "run_id": "run-bad",
+            "research_snapshot": str(tmp_path / "research-immutable.duckdb"),
+            "params": {},
+        }
         with pytest.raises(RuntimeError, match="计算炸了"):
             worker.execute_spec(spec, base_dir=tmp_path)
 
@@ -372,6 +402,7 @@ class TestExecuteSpec:
             "run_type": "n_shape_optimize",
             "run_id": "run-specdir",
             "base_dir": str(tmp_path),
+            "research_snapshot": str(tmp_path / "research-immutable.duckdb"),
             "params": {},
         }
         worker.execute_spec(spec)
@@ -436,6 +467,84 @@ class TestLabRunCli:
         assert args.command == "lab-run"
         assert args.spec == "/tmp/spec.json"
 
+    def test_parser_accepts_explicit_immutable_snapshot_for_legacy_lab_run(self) -> None:
+        from rquant.cli import build_parser
+
+        args = build_parser().parse_args(
+            [
+                "lab-run",
+                "--spec",
+                "/tmp/spec.json",
+                "--research-snapshot",
+                "/tmp/research-immutable.duckdb",
+            ]
+        )
+        assert args.research_snapshot == Path("/tmp/research-immutable.duckdb")
+
+    def test_cmd_lab_run_rejects_missing_immutable_snapshot(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import argparse
+
+        from rquant.cli import cmd_lab_run
+        from rquant.dashboard import strategy_lab_worker as worker
+
+        monkeypatch.setitem(worker._SPEC_BUILDERS, "n_shape_optimize", lambda _params: _fake_run())
+        spec_path = tmp_path / "spec.json"
+        spec_path.write_text(
+            json.dumps(
+                {
+                    "run_type": "n_shape_optimize",
+                    "run_id": "run-cli-no-snapshot",
+                    "base_dir": str(tmp_path),
+                    "params": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        code = cmd_lab_run(argparse.Namespace(spec=str(spec_path), research_snapshot=None))
+
+        assert code == 1
+        status = worker.read_run_status("run-cli-no-snapshot", base_dir=tmp_path)
+        assert status is not None
+        assert status.state == "error"
+        assert "immutable research snapshot" in (status.error or "")
+
+    def test_cmd_lab_run_rejects_snapshot_mismatch_with_spec(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import argparse
+
+        from rquant.cli import cmd_lab_run
+        from rquant.dashboard import strategy_lab_worker as worker
+
+        monkeypatch.setitem(worker._SPEC_BUILDERS, "n_shape_optimize", lambda _params: _fake_run())
+        spec_snapshot = tmp_path / "snapshot-a.duckdb"
+        argument_snapshot = tmp_path / "snapshot-b.duckdb"
+        spec_path = tmp_path / "spec.json"
+        spec_path.write_text(
+            json.dumps(
+                {
+                    "run_type": "n_shape_optimize",
+                    "run_id": "run-cli-mismatch",
+                    "base_dir": str(tmp_path),
+                    "research_snapshot": str(spec_snapshot),
+                    "params": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        code = cmd_lab_run(
+            argparse.Namespace(spec=str(spec_path), research_snapshot=argument_snapshot)
+        )
+
+        assert code == 1
+        status = worker.read_run_status("run-cli-mismatch", base_dir=tmp_path)
+        assert status is not None
+        assert "mismatch" in (status.error or "")
+
     def test_cmd_lab_run_success(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -447,6 +556,8 @@ class TestLabRunCli:
         monkeypatch.setitem(
             worker._SPEC_BUILDERS, "n_shape_optimize", lambda params: _fake_run()
         )
+        snapshot = tmp_path / "research-immutable.duckdb"
+        snapshot.touch()
         spec_path = tmp_path / "spec.json"
         spec_path.write_text(
             json.dumps({
@@ -457,7 +568,9 @@ class TestLabRunCli:
             }),
             encoding="utf-8",
         )
-        code = cmd_lab_run(argparse.Namespace(spec=str(spec_path)))
+        code = cmd_lab_run(
+            argparse.Namespace(spec=str(spec_path), research_snapshot=snapshot)
+        )
         assert code == 0
         status = worker.read_run_status("run-cli-ok", base_dir=tmp_path)
         assert status is not None
@@ -475,6 +588,8 @@ class TestLabRunCli:
             raise RuntimeError("boom")
 
         monkeypatch.setitem(worker._SPEC_BUILDERS, "n_shape_optimize", broken_builder)
+        snapshot = tmp_path / "research-immutable.duckdb"
+        snapshot.touch()
         spec_path = tmp_path / "spec.json"
         spec_path.write_text(
             json.dumps({
@@ -485,7 +600,9 @@ class TestLabRunCli:
             }),
             encoding="utf-8",
         )
-        code = cmd_lab_run(argparse.Namespace(spec=str(spec_path)))
+        code = cmd_lab_run(
+            argparse.Namespace(spec=str(spec_path), research_snapshot=snapshot)
+        )
         assert code == 1
         status = worker.read_run_status("run-cli-bad", base_dir=tmp_path)
         assert status is not None

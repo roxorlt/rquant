@@ -1,0 +1,422 @@
+from __future__ import annotations
+
+from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
+
+import pytest
+
+from rquant.daily_pipeline_ledger import (
+    DailyPipelineLedger,
+    DailyPipelineMode,
+    DailyPipelineStorageProfile,
+    DailyRunState,
+    StageResult,
+)
+
+NOW = datetime(2026, 8, 3, 9, 0, tzinfo=UTC)
+TRADE_DATE = date(2026, 8, 3)
+SHA = "a" * 64
+COMMIT = "b" * 40
+
+
+class RecordingAdapter:
+    def __init__(
+        self,
+        stage_id: str,
+        calls: list[str],
+        *,
+        ready: bool = True,
+        crash_once: bool = False,
+        estimated_memory_mb: int | None = None,
+        estimated_io_bytes: int | None = None,
+    ) -> None:
+        self.stage_id = stage_id
+        self._calls = calls
+        self._ready = ready
+        self._crash_once = crash_once
+        self._estimated_memory_mb = estimated_memory_mb
+        self._estimated_io_bytes = estimated_io_bytes
+
+    def health(self, _context):
+        from rquant.daily_pipeline_orchestrator import DailyStageHealth
+
+        return DailyStageHealth(
+            ready=self._ready,
+            detail="ready" if self._ready else "busy",
+            estimated_memory_mb=self._estimated_memory_mb,
+            estimated_io_bytes=self._estimated_io_bytes,
+        )
+
+    def run(self, context):
+        self._calls.append(context.attempt.stage_id)
+        if self._crash_once:
+            self._crash_once = False
+            raise SystemExit("simulated process exit")
+        return StageResult(
+            content_hash=("a" * 64),
+            evidence_hash=("b" * 64),
+        )
+
+
+class StaticSourceResolver:
+    """Fixture-only current source authority for legacy in-process stage tests."""
+
+    def resolve(self, run):
+        from rquant.daily_pipeline_orchestrator import DailySourceIdentity
+
+        return DailySourceIdentity(
+            source_generation_id=run.spec.source_generation_id,
+            source_content_hash=run.spec.source_content_hash,
+        )
+
+
+def _definition():
+    from rquant.daily_pipeline_orchestrator import (
+        DailyPipelineDefinition,
+        DailyStageBudget,
+        DailyStageRuntimeSpec,
+    )
+
+    return DailyPipelineDefinition(
+        stages=(
+            DailyStageRuntimeSpec(
+                stage_id="raw_capture",
+                budget=DailyStageBudget(max_wall_seconds=30),
+            ),
+            DailyStageRuntimeSpec(
+                stage_id="validate_candidate",
+                depends_on=("raw_capture",),
+                budget=DailyStageBudget(max_wall_seconds=30),
+            ),
+            DailyStageRuntimeSpec(
+                stage_id="canonical_publish",
+                depends_on=("validate_candidate",),
+                budget=DailyStageBudget(max_wall_seconds=30),
+            ),
+            DailyStageRuntimeSpec(
+                stage_id="screen",
+                depends_on=("canonical_publish",),
+                budget=DailyStageBudget(max_wall_seconds=30),
+            ),
+            DailyStageRuntimeSpec(
+                stage_id="pool",
+                depends_on=("screen",),
+                budget=DailyStageBudget(max_wall_seconds=30),
+            ),
+            DailyStageRuntimeSpec(
+                stage_id="summary",
+                depends_on=("screen", "pool"),
+                budget=DailyStageBudget(max_wall_seconds=30),
+            ),
+        )
+    )
+
+
+def _orchestrator(tmp_path: Path, adapters: tuple[RecordingAdapter, ...]):
+    from rquant.daily_pipeline_orchestrator import DailyPipelineOrchestrator
+
+    profile = DailyPipelineStorageProfile.create(
+        root=tmp_path.resolve(),
+        mode=DailyPipelineMode.SHADOW,
+        profile_hash="d" * 64,
+    )
+    ledger = DailyPipelineLedger(
+        storage_profile=profile,
+        service_owner="daily-shadow",
+    )
+    return DailyPipelineOrchestrator(
+        ledger=ledger,
+        service_owner="daily-shadow",
+        definition=_definition(),
+        adapters=adapters,
+        source_resolver=StaticSourceResolver(),
+        clock=lambda: NOW,
+        execution_mode="test_fixture",
+    )
+
+
+def _create_run(orchestrator):
+    return orchestrator.create_run(
+        mode=DailyPipelineMode.SHADOW,
+        trade_date=TRADE_DATE,
+        source_generation_id=SHA,
+        source_content_hash="c" * 64,
+        command_manifest_hash="e" * 64,
+        code_commit=COMMIT,
+        profile_hash="d" * 64,
+        now=NOW,
+    )
+
+
+def test_daily_definition_has_the_isolated_a_to_d_stage_order() -> None:
+    definition = _definition()
+
+    assert definition.stage_ids == (
+        "raw_capture",
+        "validate_candidate",
+        "canonical_publish",
+        "screen",
+        "pool",
+        "summary",
+    )
+    assert definition.runtime_spec("summary").depends_on == ("screen", "pool")
+    assert (
+        definition.to_run_spec(
+            mode=DailyPipelineMode.SHADOW,
+            trade_date=TRADE_DATE,
+            source_generation_id=SHA,
+            source_content_hash="c" * 64,
+            command_manifest_hash="e" * 64,
+            code_commit=COMMIT,
+            profile_hash="d" * 64,
+        )
+        .stages[-1]
+        .stage_id
+        == "summary"
+    )
+
+
+def test_advance_runs_one_ready_stage_then_binds_dependency_receipts(tmp_path: Path) -> None:
+    calls: list[str] = []
+    adapters = tuple(RecordingAdapter(stage.stage_id, calls) for stage in _definition().stages)
+    orchestrator = _orchestrator(tmp_path, adapters)
+    run = _create_run(orchestrator)
+
+    first = orchestrator.advance(run.run_id, now=NOW)
+    assert first.stage_id == "raw_capture"
+    assert calls == ["raw_capture"]
+
+    second = orchestrator.advance(run.run_id, now=NOW + timedelta(seconds=1))
+    assert second.stage_id == "validate_candidate"
+    assert second.dependency_receipt_ids == (first.receipt_id,)
+
+
+def test_unhealthy_stage_is_recorded_as_retryable_without_calling_adapter(tmp_path: Path) -> None:
+    calls: list[str] = []
+    adapters = tuple(
+        RecordingAdapter(stage.stage_id, calls, ready=stage.stage_id != "raw_capture")
+        for stage in _definition().stages
+    )
+    orchestrator = _orchestrator(tmp_path, adapters)
+    run = _create_run(orchestrator)
+
+    outcome = orchestrator.advance(run.run_id, now=NOW)
+
+    assert outcome.stage_id == "raw_capture"
+    assert outcome.disposition == "retry_wait"
+    assert calls == []
+    assert orchestrator.status(run.run_id).next_stage_id is None
+
+
+def test_stage_budget_rejects_unhealthy_resource_estimate_without_side_effects(
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+    adapters = tuple(
+        RecordingAdapter(
+            stage.stage_id,
+            calls,
+            estimated_memory_mb=513 if stage.stage_id == "raw_capture" else None,
+        )
+        for stage in _definition().stages
+    )
+    orchestrator = _orchestrator(tmp_path, adapters)
+    run = _create_run(orchestrator)
+
+    outcome = orchestrator.advance(run.run_id, now=NOW)
+
+    assert outcome is not None
+    assert outcome.disposition == "failed"
+    assert outcome.failure_code == "resource_budget_exceeded"
+    assert calls == []
+
+
+def test_crash_restart_recovers_without_reexecuting_a_prepared_stage(tmp_path: Path) -> None:
+    calls: list[str] = []
+    adapters = tuple(RecordingAdapter(stage.stage_id, calls) for stage in _definition().stages)
+    orchestrator = _orchestrator(tmp_path, adapters)
+    run = _create_run(orchestrator)
+    ledger = orchestrator.ledger
+    lease = ledger.acquire_writer(
+        owner="daily-shadow",
+        now=NOW,
+        lease_for=timedelta(seconds=1),
+    )
+    attempt = ledger.claim_next(lease, now=NOW)
+    assert attempt is not None
+    prepared = ledger.prepare_success(
+        lease,
+        attempt,
+        StageResult(content_hash="e" * 64, evidence_hash="f" * 64),
+        now=NOW,
+    )
+    assert prepared.stage_id == "raw_capture"
+
+    recovery = orchestrator.recover(now=NOW + timedelta(seconds=2))
+
+    assert recovery.finalized_receipt_ids == (prepared.receipt_id,)
+    assert calls == []
+    second = orchestrator.advance(run.run_id, now=NOW + timedelta(seconds=3))
+    assert second.stage_id == "validate_candidate"
+    assert calls == ["validate_candidate"]
+
+
+def test_duplicate_advance_is_exactly_once_and_completes_the_dag(tmp_path: Path) -> None:
+    calls: list[str] = []
+    adapters = tuple(RecordingAdapter(stage.stage_id, calls) for stage in _definition().stages)
+    orchestrator = _orchestrator(tmp_path, adapters)
+    run = _create_run(orchestrator)
+
+    while orchestrator.advance(run.run_id, now=NOW) is not None:
+        pass
+    duplicate = orchestrator.advance(run.run_id, now=NOW)
+
+    assert duplicate is None
+    assert calls == list(_definition().stage_ids)
+    assert orchestrator.status(run.run_id).state is DailyRunState.SUCCEEDED
+
+
+def test_input_revision_cannot_continue_an_old_run(tmp_path: Path) -> None:
+    calls: list[str] = []
+    adapters = tuple(RecordingAdapter(stage.stage_id, calls) for stage in _definition().stages)
+    orchestrator = _orchestrator(tmp_path, adapters)
+    first = _create_run(orchestrator)
+    second = orchestrator.create_run(
+        mode=DailyPipelineMode.SHADOW,
+        trade_date=TRADE_DATE,
+        source_generation_id="e" * 64,
+        source_content_hash="f" * 64,
+        command_manifest_hash="e" * 64,
+        code_commit=COMMIT,
+        profile_hash="d" * 64,
+        now=NOW,
+    )
+
+    assert first.run_id != second.run_id
+
+    class RevisedSourceResolver:
+        def resolve(self, run):
+            from rquant.daily_pipeline_orchestrator import DailySourceIdentity
+
+            if run.run_id == first.run_id:
+                return DailySourceIdentity(
+                    source_generation_id="e" * 64,
+                    source_content_hash="f" * 64,
+                )
+            return StaticSourceResolver().resolve(run)
+
+    object.__setattr__(orchestrator, "_source_resolver", RevisedSourceResolver())
+    with pytest.raises(ValueError, match="source identity"):
+        orchestrator.advance(first.run_id, now=NOW)
+
+
+def test_cancelled_run_cannot_continue(tmp_path: Path) -> None:
+    calls: list[str] = []
+    adapters = tuple(RecordingAdapter(stage.stage_id, calls) for stage in _definition().stages)
+    orchestrator = _orchestrator(tmp_path, adapters)
+    run = _create_run(orchestrator)
+
+    cancelled = orchestrator.cancel(run.run_id, reason="newer_source_revision", now=NOW)
+
+    assert cancelled.state is DailyRunState.CANCELLED
+    assert orchestrator.advance(run.run_id, now=NOW) is None
+    assert calls == []
+
+
+def test_expired_run_deadline_is_not_claimed(tmp_path: Path) -> None:
+    calls: list[str] = []
+    adapters = tuple(RecordingAdapter(stage.stage_id, calls) for stage in _definition().stages)
+    orchestrator = _orchestrator(tmp_path, adapters)
+    run = orchestrator.create_run(
+        mode=DailyPipelineMode.SHADOW,
+        trade_date=TRADE_DATE,
+        source_generation_id=SHA,
+        source_content_hash="c" * 64,
+        command_manifest_hash="e" * 64,
+        code_commit=COMMIT,
+        profile_hash="d" * 64,
+        deadline_at=NOW,
+        now=NOW,
+    )
+
+    assert orchestrator.advance(run.run_id, now=NOW) is None
+    assert orchestrator.status(run.run_id).state is DailyRunState.FAILED
+    assert calls == []
+
+
+def test_advance_claims_only_the_explicit_requested_run(
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+    adapters = tuple(RecordingAdapter(stage.stage_id, calls) for stage in _definition().stages)
+    orchestrator = _orchestrator(tmp_path, adapters)
+    first = _create_run(orchestrator)
+    second = orchestrator.create_run(
+        mode=DailyPipelineMode.SHADOW,
+        trade_date=TRADE_DATE,
+        source_generation_id="e" * 64,
+        source_content_hash="f" * 64,
+        command_manifest_hash="e" * 64,
+        code_commit=COMMIT,
+        profile_hash="d" * 64,
+        now=NOW + timedelta(seconds=1),
+    )
+
+    outcome = orchestrator.advance(second.run_id, now=NOW + timedelta(seconds=2))
+    assert outcome is not None
+    assert outcome.run_id == second.run_id
+    assert orchestrator.ledger.stage(first.run_id, "raw_capture").attempts == 0
+    assert orchestrator.ledger.stage(first.run_id, "raw_capture").state.value == "pending"
+
+    outcome = orchestrator.advance(first.run_id, now=NOW + timedelta(seconds=3))
+
+    assert outcome is not None
+    assert outcome.stage_id == "raw_capture"
+    assert calls == ["raw_capture", "raw_capture"]
+
+
+def test_create_run_rejects_source_identity_that_is_not_current(tmp_path: Path) -> None:
+    from rquant.daily_pipeline_orchestrator import DailyPipelineOrchestrator
+
+    calls: list[str] = []
+    adapters = tuple(RecordingAdapter(stage.stage_id, calls) for stage in _definition().stages)
+
+    class RevisedSourceResolver:
+        def resolve(self, _run):
+            from rquant.daily_pipeline_orchestrator import DailySourceIdentity
+
+            return DailySourceIdentity(
+                source_generation_id="e" * 64,
+                source_content_hash="f" * 64,
+            )
+
+    profile = DailyPipelineStorageProfile.create(
+        root=tmp_path.resolve(),
+        mode=DailyPipelineMode.SHADOW,
+        profile_hash="d" * 64,
+    )
+    ledger = DailyPipelineLedger(
+        storage_profile=profile,
+        service_owner="daily-shadow",
+    )
+    orchestrator = DailyPipelineOrchestrator(
+        ledger=ledger,
+        service_owner="daily-shadow",
+        definition=_definition(),
+        adapters=adapters,
+        source_resolver=RevisedSourceResolver(),
+        clock=lambda: NOW,
+        execution_mode="test_fixture",
+    )
+
+    with pytest.raises(ValueError, match="source identity"):
+        orchestrator.create_run(
+            mode=DailyPipelineMode.SHADOW,
+            trade_date=TRADE_DATE,
+            source_generation_id=SHA,
+            source_content_hash="c" * 64,
+            command_manifest_hash="e" * 64,
+            code_commit=COMMIT,
+            profile_hash="d" * 64,
+            now=NOW,
+        )
