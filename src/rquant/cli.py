@@ -6213,10 +6213,168 @@ def _add_formal_runtime_bootstrap_arguments(parser: argparse.ArgumentParser) -> 
     parser.add_argument("--runtime-code-authority-gid", type=int, required=True)
 
 
+def cmd_runtime_code(args: argparse.Namespace) -> int:
+    """Run explicit offline packaging and privileged immutable-generation operations."""
+
+    from rquant.runtime_code_operations import (
+        RUNTIME_CODE_EXIT_INVALID,
+        RUNTIME_CODE_EXIT_OK,
+        RuntimeCodeMigrationRequest,
+        RuntimeCodeOperationError,
+        RuntimeCodePackageCeremonyRequest,
+        RuntimeCodeRotateCeremonyRequest,
+        compose_runtime_code_generation_operator,
+        load_runtime_code_bootstrap_configuration,
+        load_runtime_code_operation_request,
+        offline_contract_signer,
+        stable_runtime_code_error_payload,
+    )
+
+    def emit(payload: object) -> None:
+        if args.format == "json":
+            _print_json(payload)
+            return
+        if isinstance(payload, dict):
+            status = payload.get("status", "unknown")
+            action = payload.get("action", args.action)
+            print(f"runtime-code {action}: {status}")
+            result = payload.get("result")
+            if isinstance(result, dict):
+                for key in (
+                    "generation_id",
+                    "promotion_sequence",
+                    "previous_generation_id",
+                    "write_performed",
+                    "external_promotion_required",
+                ):
+                    if key in result:
+                        print(f"{key}: {result[key]}")
+            message = payload.get("message")
+            if isinstance(message, str):
+                print(message, file=sys.stderr)
+
+    try:
+        trusted_base = Path(args.runtime_code_trusted_base)
+        configuration = load_runtime_code_bootstrap_configuration(
+            Path(args.runtime_code_config),
+            trusted_base=trusted_base,
+            expected_uid=int(args.runtime_code_authority_uid),
+            expected_gid=int(args.runtime_code_authority_gid),
+        )
+        operator = compose_runtime_code_generation_operator(
+            configuration,
+            offline=args.action in {"package", "rotate"},
+        )
+        if args.action == "inspect":
+            result = operator.inspect()
+        else:
+            request_path = Path(args.request)
+            request_model = {
+                "package": RuntimeCodePackageCeremonyRequest,
+                "install": RuntimeCodeMigrationRequest,
+                "rotate": RuntimeCodeRotateCeremonyRequest,
+                "dry-run": RuntimeCodeMigrationRequest,
+            }[args.action]
+            request = load_runtime_code_operation_request(
+                request_path,
+                request_model,
+                trusted_base=trusted_base,
+                expected_uid=int(args.runtime_code_authority_uid),
+                expected_gid=int(args.runtime_code_authority_gid),
+            )
+            if isinstance(request, RuntimeCodePackageCeremonyRequest):
+                runtime_records = tuple(
+                    record
+                    for record in configuration.runtime_keys
+                    if record.key_id == request.runtime_key_id
+                )
+                if len(runtime_records) != 1:
+                    raise RuntimeCodeOperationError("runtime code package signer is not pinned")
+                runtime_signer = offline_contract_signer(
+                    private_key_path=request.runtime_private_key_path,
+                    public_record=runtime_records[0],
+                    expected_uid=int(args.runtime_code_authority_uid),
+                    expected_gid=int(args.runtime_code_authority_gid),
+                )
+                promotion_signer = offline_contract_signer(
+                    private_key_path=request.promotion_private_key_path,
+                    public_record=configuration.promotion_key,
+                    expected_uid=int(args.runtime_code_authority_uid),
+                    expected_gid=int(args.runtime_code_authority_gid),
+                )
+                result = operator.package(
+                    request.package,
+                    runtime_signer=runtime_signer,
+                    promotion_signer=promotion_signer,
+                )
+            elif isinstance(request, RuntimeCodeRotateCeremonyRequest):
+                promotion_signer = offline_contract_signer(
+                    private_key_path=request.promotion_private_key_path,
+                    public_record=configuration.promotion_key,
+                    expected_uid=int(args.runtime_code_authority_uid),
+                    expected_gid=int(args.runtime_code_authority_gid),
+                )
+                result = operator.rotate(request.rotation, promotion_signer=promotion_signer)
+            elif isinstance(request, RuntimeCodeMigrationRequest):
+                if request.expected_configuration_path != Path(args.runtime_code_config):
+                    raise RuntimeCodeOperationError(
+                        "runtime code migration configuration path does not match CLI"
+                    )
+                if request.expected_trusted_base != trusted_base:
+                    raise RuntimeCodeOperationError(
+                        "runtime code migration trusted base does not match CLI"
+                    )
+                if request.expected_authority_uid != int(
+                    args.runtime_code_authority_uid
+                ) or request.expected_authority_gid != int(args.runtime_code_authority_gid):
+                    raise RuntimeCodeOperationError(
+                        "runtime code migration authority identity does not match CLI"
+                    )
+                result = (
+                    operator.dry_run(request)
+                    if args.action == "dry-run"
+                    else operator.install(request)
+                )
+            else:
+                raise RuntimeCodeOperationError("runtime code operation request type is invalid")
+        emit(
+            {
+                "action": args.action,
+                "exit_code": RUNTIME_CODE_EXIT_OK,
+                "result": result.model_dump(mode="json"),
+                "status": "ok",
+            }
+        )
+        return RUNTIME_CODE_EXIT_OK
+    except RuntimeCodeOperationError as exc:
+        emit(stable_runtime_code_error_payload(args.action, exc))
+        return exc.exit_code
+    except (OSError, TypeError, ValueError) as exc:
+        error = RuntimeCodeOperationError(
+            "runtime code operation is unavailable",
+            exit_code=RUNTIME_CODE_EXIT_INVALID,
+        )
+        error.__cause__ = exc
+        emit(stable_runtime_code_error_payload(args.action, error))
+        return error.exit_code
+
+
 def build_parser() -> argparse.ArgumentParser:
     """构建 CLI 参数解析器。"""
     parser = _RQuantArgumentParser(prog="rquant", description="rQuant 量化选股平台")
     sub = parser.add_subparsers(dest="command")
+
+    runtime_code_p = sub.add_parser(
+        "runtime-code",
+        help="package, verify, and atomically install formal runtime generations",
+    )
+    runtime_code_sub = runtime_code_p.add_subparsers(dest="action", required=True)
+    for action in ("package", "install", "rotate", "inspect", "dry-run"):
+        runtime_code_action = runtime_code_sub.add_parser(action)
+        _add_formal_runtime_bootstrap_arguments(runtime_code_action)
+        runtime_code_action.add_argument("--format", choices=("json", "text"), default="text")
+        if action != "inspect":
+            runtime_code_action.add_argument("--request", type=Path, required=True)
 
     serve_p = sub.add_parser("serve", help="启动 APScheduler 常驻进程")
     serve_p.add_argument("--hour", type=int, default=17, help="每日触发小时 (默认 17)")
@@ -8431,6 +8589,7 @@ def main() -> int:
         "lab-claim-finalizer-runtime": cmd_lab_claim_finalizer_runtime,
         "lab-claim-finalizer-rollout": cmd_lab_claim_finalizer_rollout,
         "lab-finalizer": cmd_lab_finalizer,
+        "runtime-code": cmd_runtime_code,
         "panorama-auth-serve": cmd_panorama_auth_serve,
         "panorama-user-add": cmd_panorama_user_add,
         "panorama-user-remove": cmd_panorama_user_remove,
@@ -8476,6 +8635,7 @@ def main() -> int:
         "lab-scheduler",
         "lab-worker",
         "lab-finalizer",
+        "runtime-code",
         "panorama-auth-serve",
         "panorama-user-add",
         "panorama-user-remove",
