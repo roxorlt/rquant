@@ -3,12 +3,23 @@
 from __future__ import annotations
 
 import os
+import re
+import stat
 import subprocess
+import time
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, Field, computed_field, model_validator
+
+from rquant.contained_subprocess import run_contained
+
+_IGNORED_NATIVE_CODE_SUFFIXES = frozenset({".so", ".dylib", ".pyd"})
+_IGNORED_SOURCE_CODE_SUFFIXES = frozenset({".py", ".pyw"})
+_IGNORED_LEGACY_BYTECODE_SUFFIXES = frozenset({".pyc", ".pyo"})
+_DEFAULT_TRUSTED_GIT_PATH = Path("/usr/bin/git")
 
 ResearchStatus = Literal[
     "exploratory",
@@ -23,6 +34,86 @@ RESEARCH_STATUS_LABELS: dict[ResearchStatus, str] = {
     "paper_candidate": "模拟候选",
     "monitor_approved": "监控通过",
 }
+
+
+@dataclass(frozen=True)
+class TrustedGitExecutable:
+    path: Path
+    device: int
+    inode: int
+    mode: int
+    owner: int
+    links: int
+
+
+def bind_trusted_git_executable(path: Path | None = None) -> TrustedGitExecutable:
+    raw = path or Path(os.environ.get("RQUANT_TRUSTED_GIT_PATH", str(_DEFAULT_TRUSTED_GIT_PATH)))
+    candidate = Path(raw)
+    if not candidate.is_absolute() or candidate != Path(os.path.abspath(candidate)):
+        raise ValueError("trusted Git path must be absolute and canonical")
+    try:
+        if candidate.resolve(strict=True) != candidate:
+            raise ValueError("trusted Git path must be physical")
+        for parent in candidate.parents:
+            parent_stat = parent.lstat()
+            if (
+                not stat.S_ISDIR(parent_stat.st_mode)
+                or stat.S_ISLNK(parent_stat.st_mode)
+                or parent_stat.st_uid != 0
+                or parent_stat.st_mode & 0o022
+            ):
+                raise ValueError("trusted Git parent path is unsafe")
+        observed = candidate.lstat()
+        descriptor = os.open(candidate, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            opened = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError as exc:
+        raise ValueError("trusted Git executable is unavailable") from exc
+    if (
+        not stat.S_ISREG(observed.st_mode)
+        or observed.st_uid != 0
+        or observed.st_mode & 0o022
+        or not observed.st_mode & stat.S_IXUSR
+        or (observed.st_dev, observed.st_ino, observed.st_mode, observed.st_uid)
+        != (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_uid)
+    ):
+        raise ValueError("trusted Git executable is unsafe")
+    return TrustedGitExecutable(
+        path=candidate,
+        device=observed.st_dev,
+        inode=observed.st_ino,
+        mode=observed.st_mode,
+        owner=observed.st_uid,
+        links=observed.st_nlink,
+    )
+
+
+def _run_trusted_git(
+    binding: TrustedGitExecutable,
+    arguments: list[str],
+    *,
+    cwd: Path,
+    text: bool = True,
+    deadline_monotonic: float | None = None,
+) -> subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes]:
+    if bind_trusted_git_executable(binding.path) != binding:
+        raise ValueError("trusted Git executable identity changed")
+    result = run_contained(
+        [str(binding.path), *arguments],
+        cwd=cwd,
+        text=text,
+        deadline_monotonic=(
+            deadline_monotonic if deadline_monotonic is not None else time.monotonic() + 3
+        ),
+        check=False,
+        env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"},
+        may_spawn_background_descendants=False,
+    )
+    if bind_trusted_git_executable(binding.path) != binding:
+        raise ValueError("trusted Git executable identity changed")
+    return result
 
 
 class ResearchNotice(BaseModel):
@@ -174,72 +265,124 @@ class ResearchManifest(BaseModel):
         return self
 
 
-def detect_code_commit(repo_root: Path | None = None) -> str | None:
+def detect_code_commit(
+    repo_root: Path | None = None,
+    *,
+    trusted_git_path: Path | None = None,
+    deadline_monotonic: float | None = None,
+) -> str | None:
     """优先读取部署注入值；本地开发时回退到 git HEAD。"""
     injected = os.getenv("RQUANT_CODE_COMMIT", "").strip()
     if injected:
         return injected
     cwd = repo_root or Path(__file__).resolve().parents[2]
     try:
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
+        git = bind_trusted_git_executable(trusted_git_path)
+        result = _run_trusted_git(
+            git,
+            ["rev-parse", "HEAD"],
             cwd=cwd,
-            capture_output=True,
-            text=True,
-            timeout=3,
-            check=False,
+            deadline_monotonic=deadline_monotonic,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError, ValueError):
         return None
     commit = result.stdout.strip()
     if result.returncode != 0 or not commit:
         return None
     try:
-        status = subprocess.run(
-            ["git", "status", "--porcelain", "--untracked-files=normal"],
+        status = _run_trusted_git(
+            git,
+            ["status", "--porcelain", "--untracked-files=normal"],
             cwd=cwd,
-            capture_output=True,
-            text=True,
-            timeout=3,
-            check=False,
+            deadline_monotonic=deadline_monotonic,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError, ValueError):
         return f"{commit}-dirty"
     if status.returncode != 0 or status.stdout.strip():
         return f"{commit}-dirty"
     return commit
 
 
-def detect_verified_code_commit(repo_root: Path | None = None) -> str | None:
+def detect_verified_code_commit(
+    repo_root: Path | None = None,
+    *,
+    trusted_git_path: Path | None = None,
+    deadline_monotonic: float | None = None,
+) -> str | None:
     """Resolve a formal-run commit from the real clean Git checkout."""
     cwd = repo_root or Path(__file__).resolve().parents[2]
     try:
-        head = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
+        git = bind_trusted_git_executable(trusted_git_path)
+        head = _run_trusted_git(
+            git,
+            ["rev-parse", "HEAD"],
             cwd=cwd,
-            capture_output=True,
-            text=True,
-            timeout=3,
-            check=False,
+            deadline_monotonic=deadline_monotonic,
         )
-        status = subprocess.run(
-            ["git", "status", "--porcelain", "--untracked-files=normal"],
+        checkout = _run_trusted_git(
+            git,
+            ["rev-parse", "--show-toplevel"],
             cwd=cwd,
-            capture_output=True,
-            text=True,
-            timeout=3,
-            check=False,
+            deadline_monotonic=deadline_monotonic,
         )
-    except (OSError, subprocess.SubprocessError):
+        status = _run_trusted_git(
+            git,
+            ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            cwd=cwd,
+            text=False,
+            deadline_monotonic=deadline_monotonic,
+        )
+        ignored_source_artifacts = _run_trusted_git(
+            git,
+            [
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "-z",
+                "--",
+                ":(top)src/rquant",
+            ],
+            cwd=cwd,
+            text=False,
+            deadline_monotonic=deadline_monotonic,
+        )
+    except (OSError, subprocess.SubprocessError, ValueError):
         return None
     commit = head.stdout.strip()
-    if head.returncode != 0 or not commit or status.returncode != 0:
+    if (
+        head.returncode != 0
+        or re.fullmatch(r"[0-9a-f]{40}", commit) is None
+        or checkout.returncode != 0
+        or status.returncode != 0
+        or ignored_source_artifacts.returncode != 0
+    ):
         return None
     injected = os.getenv("RQUANT_CODE_COMMIT", "").strip()
     if injected and injected != commit:
         return None
-    if status.stdout.strip():
+    checkout_root = Path(checkout.stdout.strip())
+    if not checkout_root.is_absolute():
+        return None
+    if status.stdout:
         return f"{commit}-dirty"
+    for raw_path in ignored_source_artifacts.stdout.split(b"\0"):
+        if not raw_path:
+            continue
+        artifact = Path(os.fsdecode(raw_path))
+        try:
+            artifact_identity = (checkout_root / artifact).lstat()
+        except OSError:
+            return f"{commit}-dirty"
+        if stat.S_ISLNK(artifact_identity.st_mode):
+            return f"{commit}-dirty"
+        suffix = artifact.suffix.lower()
+        if (
+            suffix in _IGNORED_NATIVE_CODE_SUFFIXES
+            or suffix in _IGNORED_SOURCE_CODE_SUFFIXES
+            or suffix in _IGNORED_LEGACY_BYTECODE_SUFFIXES
+        ):
+            return f"{commit}-dirty"
     return commit
 
 

@@ -5804,8 +5804,11 @@ def cmd_lab_finalizer(args: argparse.Namespace) -> int:
                         signal.signal(signum, handler)
                 return 0
         finally:
-            if artifact_store is not None:
-                artifact_store.close()
+            try:
+                if artifact_store is not None:
+                    artifact_store.close()
+            finally:
+                sqlite_authority.close()
 
 
 def cmd_lab_claim_finalizer(args: argparse.Namespace) -> int:

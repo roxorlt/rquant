@@ -450,8 +450,14 @@ def test_worker_rejects_unlisted_identity_before_constructing_worker(
         )
 
 
-def test_finalizer_once_uses_readonly_reader_and_commit_spool(
+@pytest.mark.parametrize(
+    ("outcome", "expected_result"),
+    (("success", 0), ("failed", 1), ("exception", None)),
+)
+def test_finalizer_once_closes_authority_after_success_failure_or_exception(
     monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+    expected_result: int | None,
 ) -> None:
     from rquant import (
         lab_artifact_protocol,
@@ -508,7 +514,9 @@ def test_finalizer_once_uses_readonly_reader_and_commit_spool(
 
         def run_once(self) -> SimpleNamespace:
             calls.append("run_once")
-            return SimpleNamespace(failed=0, model_dump_json=lambda: "{}")
+            if outcome == "exception":
+                raise RuntimeError("finalizer exception")
+            return SimpleNamespace(failed=outcome == "failed", model_dump_json=lambda: "{}")
 
     class FakeLock:
         def __init__(self, _path: Path, name: str, *, mutation_guard: object) -> None:
@@ -560,16 +568,18 @@ def test_finalizer_once_uses_readonly_reader_and_commit_spool(
     )
     monkeypatch.setattr("rquant.cli.setup_logging", lambda: None)
 
-    result = cmd_lab_finalizer(
-        argparse.Namespace(
-            once=True,
-            expected_checkout_root=EXPECTED_ROOT,
-            trusted_git_path=TRUSTED_GIT,
-            startup_deadline_monotonic=STARTUP_DEADLINE,
-        )
+    args = argparse.Namespace(
+        once=True,
+        expected_checkout_root=EXPECTED_ROOT,
+        trusted_git_path=TRUSTED_GIT,
+        startup_deadline_monotonic=STARTUP_DEADLINE,
     )
 
-    assert result == 0
+    if expected_result is None:
+        with pytest.raises(RuntimeError, match="finalizer exception"):
+            cmd_lab_finalizer(args)
+    else:
+        assert cmd_lab_finalizer(args) == expected_result
     assert "reader:lab_jobs.sqlite3:5000" in calls
     assert "sqlite:lab_jobs.sqlite3:lab jobs SQLite:False" in calls
     assert "spool:artifact-commits" in calls

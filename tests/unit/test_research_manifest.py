@@ -5,6 +5,7 @@ from __future__ import annotations
 import subprocess
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
@@ -322,6 +323,86 @@ def test_detect_verified_code_commit_rejects_injected_identity_drift(
     assert detect_verified_code_commit(repo) == f"{head}-dirty"
 
 
+def test_detect_verified_code_commit_uses_trusted_git_contract_for_ignored_native(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant import research_manifest as manifest_module
+
+    checkout = tmp_path / "checkout"
+    artifact = checkout / "src" / "rquant" / "runtime.so"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(b"native")
+    trusted_git_path = Path("/trusted/git")
+    binding = SimpleNamespace(path=trusted_git_path)
+    code_sha = "a" * 40
+    calls: list[tuple[tuple[str, ...], bool, float | None]] = []
+
+    monkeypatch.setattr(
+        manifest_module,
+        "bind_trusted_git_executable",
+        lambda path: binding,
+    )
+
+    def probe(
+        received_binding: object,
+        arguments: list[str],
+        *,
+        cwd: Path,
+        text: bool = True,
+        deadline_monotonic: float | None = None,
+    ) -> SimpleNamespace:
+        assert received_binding is binding
+        assert cwd == checkout
+        calls.append((tuple(arguments), text, deadline_monotonic))
+        if arguments == ["rev-parse", "HEAD"]:
+            return SimpleNamespace(returncode=0, stdout=f"{code_sha}\n")
+        if arguments == ["rev-parse", "--show-toplevel"]:
+            return SimpleNamespace(returncode=0, stdout=f"{checkout}\n")
+        if arguments == ["status", "--porcelain=v1", "-z", "--untracked-files=all"]:
+            return SimpleNamespace(returncode=0, stdout=b"")
+        if arguments == [
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "-z",
+            "--",
+            ":(top)src/rquant",
+        ]:
+            return SimpleNamespace(returncode=0, stdout=b"src/rquant/runtime.so\0")
+        raise AssertionError(f"unexpected trusted Git probe: {arguments}")
+
+    monkeypatch.setattr(manifest_module, "_run_trusted_git", probe)
+
+    assert (
+        manifest_module.detect_verified_code_commit(
+            checkout,
+            trusted_git_path=trusted_git_path,
+            deadline_monotonic=42.0,
+        )
+        == f"{code_sha}-dirty"
+    )
+    assert calls == [
+        (("rev-parse", "HEAD"), True, 42.0),
+        (("rev-parse", "--show-toplevel"), True, 42.0),
+        (("status", "--porcelain=v1", "-z", "--untracked-files=all"), False, 42.0),
+        (
+            (
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "-z",
+                "--",
+                ":(top)src/rquant",
+            ),
+            False,
+            42.0,
+        ),
+    ]
+
+
 def test_manifest_rejects_covered_count_above_denominator() -> None:
     from rquant.research_manifest import ResearchManifest
 
@@ -338,9 +419,7 @@ def test_current_notices_cover_all_untrusted_strategy_families() -> None:
     from rquant.research_manifest import CURRENT_RESEARCH_NOTICES
 
     covered = {
-        run_type
-        for notice in CURRENT_RESEARCH_NOTICES
-        for run_type in notice.affected_run_types
+        run_type for notice in CURRENT_RESEARCH_NOTICES for run_type in notice.affected_run_types
     }
 
     assert {
