@@ -1,0 +1,456 @@
+#!/usr/bin/python3
+"""Root-owned Daily receipt key-material administration.  This is NOT a signer.
+
+Receipt signing lives exclusively behind the socket-activated root authority
+(``rquant-daily-receipt-signer.socket`` -> ``rquant.daily_receipt_socket_authority``),
+which pins the peer identity with ``SO_PEERCRED`` and binds a replay nonce to every
+signature.  This helper deliberately has no receipt-signing operation and is not a
+sudoers capability: it only validates the private key manifest and exports the
+public trusted keyring during a manual, operator-run infrastructure install.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+KEYS_FILE = Path("/etc/rquant/daily-receipt-keys.json")
+PUBLIC_KEYS_FILE = Path("/etc/rquant/daily-receipt-trusted-keys.json")
+MAX_REQUEST_BYTES = 2 * 1024 * 1024
+MAX_KEY_FILE_BYTES = 64 * 1024
+GENESIS_MANIFEST_HASH = "0" * 64
+KEY_ID = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
+SHA256 = re.compile(r"^[0-9a-f]{64}$")
+SIGNATURE = re.compile(r"^[A-Za-z0-9+/]{86}==$")
+KEY_MATERIAL_OPERATIONS = ("validate-key-material", "export-public-keyring")
+
+
+class DailyReceiptSignerError(ValueError):
+    """Unsafe key material or malformed Daily key-material administration request."""
+
+
+def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise DailyReceiptSignerError("duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def _canonical_bytes(value: object) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _openssl() -> str:
+    for candidate in ("/opt/homebrew/bin/openssl", "/usr/bin/openssl"):
+        if Path(candidate).is_file():
+            return candidate
+    raise DailyReceiptSignerError("openssl is unavailable")
+
+
+def _run_openssl(
+    arguments: list[str],
+    *,
+    input_data: bytes = b"",
+) -> subprocess.CompletedProcess[bytes]:
+    try:
+        return subprocess.run(
+            [_openssl(), *arguments],
+            input=input_data,
+            capture_output=True,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise DailyReceiptSignerError("openssl operation failed") from exc
+
+
+def _secure_file(path: Path, *, mode: int, label: str) -> bytes:
+    descriptor = -1
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        opened = os.fstat(descriptor)
+        named = os.stat(path, follow_symlinks=False)
+        expected_owner = 0 if os.geteuid() == 0 else os.geteuid()
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)
+            or opened.st_uid != expected_owner
+            or stat.S_IMODE(opened.st_mode) != mode
+            or not 0 < opened.st_size <= MAX_KEY_FILE_BYTES
+        ):
+            raise DailyReceiptSignerError(f"{label} is unsafe")
+        payload = os.read(descriptor, MAX_KEY_FILE_BYTES + 1)
+        after = os.fstat(descriptor)
+        if len(payload) != opened.st_size or (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_size,
+            opened.st_mtime_ns,
+        ) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+            raise DailyReceiptSignerError(f"{label} changed while reading")
+        return payload
+    except OSError as exc:
+        raise DailyReceiptSignerError(f"{label} is unavailable") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _validate_public_key(value: object, *, label: str) -> str:
+    if not isinstance(value, str) or not value or len(value) > 8192:
+        raise DailyReceiptSignerError(f"{label} is invalid")
+    result = _run_openssl(
+        ["pkey", "-pubin", "-pubcheck", "-text_pub", "-noout"],
+        input_data=value.encode("utf-8"),
+    )
+    if result.returncode != 0 or b"ED25519" not in result.stdout.upper():
+        raise DailyReceiptSignerError(f"{label} is not Ed25519")
+    return value
+
+
+def _public_key_from_private(path: Path) -> str:
+    _secure_file(path, mode=0o600, label="Daily private key")
+    result = _run_openssl(["pkey", "-in", str(path), "-pubout"])
+    if result.returncode != 0 or not result.stdout:
+        raise DailyReceiptSignerError("Daily private key is unusable")
+    return _validate_public_key(
+        result.stdout.decode("utf-8"),
+        label="Daily active public key",
+    )
+
+
+def _sign(private_key: Path, payload: bytes) -> str:
+    with tempfile.TemporaryDirectory(prefix="rquant-daily-receipt-sign-") as raw_root:
+        payload_path = Path(raw_root) / "payload.bin"
+        payload_path.write_bytes(payload)
+        payload_path.chmod(0o600)
+        result = _run_openssl(
+            ["pkeyutl", "-sign", "-rawin", "-inkey", str(private_key), "-in", str(payload_path)]
+        )
+    if result.returncode != 0 or len(result.stdout) != 64:
+        raise DailyReceiptSignerError("Daily Ed25519 signing failed")
+    return base64.b64encode(result.stdout).decode("ascii")
+
+
+def _verify(public_key: str, payload: bytes, signature: object) -> bool:
+    if not isinstance(signature, str) or SIGNATURE.fullmatch(signature) is None:
+        return False
+    try:
+        signature_bytes = base64.b64decode(signature, validate=True)
+    except ValueError:
+        return False
+    if len(signature_bytes) != 64:
+        return False
+    try:
+        with tempfile.TemporaryDirectory(prefix="rquant-daily-receipt-verify-") as raw_root:
+            root = Path(raw_root)
+            public_key_path = root / "public.pem"
+            payload_path = root / "payload.bin"
+            signature_path = root / "signature.bin"
+            public_key_path.write_text(public_key, encoding="utf-8")
+            payload_path.write_bytes(payload)
+            signature_path.write_bytes(signature_bytes)
+            for path in (public_key_path, payload_path, signature_path):
+                path.chmod(0o600)
+            result = _run_openssl(
+                [
+                    "pkeyutl",
+                    "-verify",
+                    "-pubin",
+                    "-inkey",
+                    str(public_key_path),
+                    "-sigfile",
+                    str(signature_path),
+                    "-rawin",
+                    "-in",
+                    str(payload_path),
+                ]
+            )
+    except (OSError, DailyReceiptSignerError):
+        return False
+    return result.returncode == 0
+
+
+def _load_keys(path: Path) -> tuple[int, str, str, Path, str, dict[str, str]]:
+    try:
+        payload = _secure_file(path, mode=0o600, label="Daily key manifest")
+        document = json.loads(payload, object_pairs_hook=_unique_object)
+    except (TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise DailyReceiptSignerError("Daily key manifest is invalid") from exc
+    if _canonical_bytes(document) != payload:
+        raise DailyReceiptSignerError("Daily key manifest is not canonical")
+    expected = {
+        "schema_version",
+        "generation",
+        "previous_manifest_hash",
+        "active_key_id",
+        "active_private_key_path",
+        "previous_public_keys",
+    }
+    if (
+        not isinstance(document, dict)
+        or set(document) != expected
+        or document.get("schema_version") != 2
+        or type(document.get("generation")) is not int
+        or document["generation"] < 1
+        or not isinstance(document.get("previous_manifest_hash"), str)
+        or SHA256.fullmatch(document["previous_manifest_hash"]) is None
+        or not isinstance(document.get("active_key_id"), str)
+        or KEY_ID.fullmatch(document["active_key_id"]) is None
+        or not isinstance(document.get("active_private_key_path"), str)
+        or not isinstance(document.get("previous_public_keys"), dict)
+    ):
+        raise DailyReceiptSignerError("Daily key manifest shape is invalid")
+    generation = document["generation"]
+    previous_manifest_hash = document["previous_manifest_hash"]
+    private_key = Path(document["active_private_key_path"])
+    if not private_key.is_absolute() or private_key != Path(os.path.abspath(private_key)):
+        raise DailyReceiptSignerError("Daily private key path is invalid")
+    active_key_id = document["active_key_id"]
+    raw_previous = document["previous_public_keys"]
+    if generation == 1 and (
+        previous_manifest_hash != GENESIS_MANIFEST_HASH or raw_previous
+    ):
+        raise DailyReceiptSignerError("Daily key manifest genesis binding is invalid")
+    if generation > 1 and (
+        previous_manifest_hash == GENESIS_MANIFEST_HASH or not raw_previous
+    ):
+        raise DailyReceiptSignerError("Daily key manifest rotation binding is invalid")
+    previous: dict[str, str] = {}
+    for key_id, public_key in raw_previous.items():
+        if (
+            not isinstance(key_id, str)
+            or KEY_ID.fullmatch(key_id) is None
+            or key_id == active_key_id
+        ):
+            raise DailyReceiptSignerError("Daily previous key id is invalid")
+        previous[key_id] = _validate_public_key(public_key, label="Daily previous public key")
+    active_public_key = _public_key_from_private(private_key)
+    return (
+        generation,
+        previous_manifest_hash,
+        active_key_id,
+        private_key,
+        active_public_key,
+        dict(sorted(previous.items())),
+    )
+
+
+def _public_keyring_document(
+    keys_path: Path,
+) -> dict[str, object]:
+    (
+        generation,
+        previous_manifest_hash,
+        active_key_id,
+        private_key,
+        active_public_key,
+        previous,
+    ) = _load_keys(keys_path)
+    body: dict[str, object] = {
+        "schema_version": 2,
+        "generation": generation,
+        "previous_manifest_hash": previous_manifest_hash,
+        "active_key_id": active_key_id,
+        "active_public_key": active_public_key,
+        "previous_public_keys": previous,
+    }
+    manifest_hash = hashlib.sha256(_canonical_bytes(body)).hexdigest()
+    return {
+        **body,
+        "manifest_hash": manifest_hash,
+        "signature": _sign(private_key, manifest_hash.encode("ascii")),
+    }
+
+
+def _decode_public_keyring(payload: bytes) -> dict[str, object]:
+    try:
+        document = json.loads(payload, object_pairs_hook=_unique_object)
+    except (TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise DailyReceiptSignerError("Daily public keyring is invalid JSON") from exc
+    if _canonical_bytes(document) != payload:
+        raise DailyReceiptSignerError("Daily public keyring is not canonical")
+    expected = {
+        "schema_version",
+        "generation",
+        "previous_manifest_hash",
+        "active_key_id",
+        "active_public_key",
+        "previous_public_keys",
+        "manifest_hash",
+        "signature",
+    }
+    if (
+        not isinstance(document, dict)
+        or set(document) != expected
+        or document.get("schema_version") != 2
+        or type(document.get("generation")) is not int
+        or document["generation"] < 1
+        or not isinstance(document.get("previous_manifest_hash"), str)
+        or SHA256.fullmatch(document["previous_manifest_hash"]) is None
+        or not isinstance(document.get("active_key_id"), str)
+        or KEY_ID.fullmatch(document["active_key_id"]) is None
+        or not isinstance(document.get("previous_public_keys"), dict)
+        or not isinstance(document.get("manifest_hash"), str)
+        or SHA256.fullmatch(document["manifest_hash"]) is None
+    ):
+        raise DailyReceiptSignerError("Daily public keyring shape is invalid")
+    active_key_id = document["active_key_id"]
+    active_public_key = _validate_public_key(
+        document.get("active_public_key"),
+        label="Daily active public key",
+    )
+    previous_public_keys: dict[str, str] = {}
+    for key_id, public_key in document["previous_public_keys"].items():
+        if (
+            not isinstance(key_id, str)
+            or KEY_ID.fullmatch(key_id) is None
+            or key_id == active_key_id
+        ):
+            raise DailyReceiptSignerError("Daily previous public key id is invalid")
+        previous_public_keys[key_id] = _validate_public_key(
+            public_key,
+            label="Daily previous public key",
+        )
+    generation = document["generation"]
+    previous_manifest_hash = document["previous_manifest_hash"]
+    if generation == 1 and (
+        previous_manifest_hash != GENESIS_MANIFEST_HASH or previous_public_keys
+    ):
+        raise DailyReceiptSignerError("Daily public keyring genesis binding is invalid")
+    if generation > 1 and (
+        previous_manifest_hash == GENESIS_MANIFEST_HASH or not previous_public_keys
+    ):
+        raise DailyReceiptSignerError("Daily public keyring rotation binding is invalid")
+    body = {
+        key: document[key]
+        for key in expected
+        if key not in {"manifest_hash", "signature"}
+    }
+    expected_hash = hashlib.sha256(_canonical_bytes(body)).hexdigest()
+    if document["manifest_hash"] != expected_hash:
+        raise DailyReceiptSignerError("Daily public keyring manifest hash is invalid")
+    if not _verify(active_public_key, expected_hash.encode("ascii"), document["signature"]):
+        raise DailyReceiptSignerError("Daily public keyring manifest signature is invalid")
+    return {
+        **document,
+        "previous_public_keys": dict(sorted(previous_public_keys.items())),
+    }
+
+
+def _load_public_keyring(path: Path) -> dict[str, object]:
+    return _decode_public_keyring(
+        _secure_file(path, mode=0o444, label="Daily public keyring")
+    )
+
+
+def _public_keyring_bytes(
+    keys_path: Path,
+    *,
+    current_keyring_path: Path | None = None,
+) -> bytes:
+    candidate = _decode_public_keyring(_canonical_bytes(_public_keyring_document(keys_path)))
+    if current_keyring_path is None or not current_keyring_path.exists():
+        if candidate["generation"] != 1:
+            raise DailyReceiptSignerError(
+                "Daily public keyring initial generation must be one"
+            )
+        return _canonical_bytes(candidate)
+    current = _load_public_keyring(current_keyring_path)
+    if candidate["manifest_hash"] == current["manifest_hash"]:
+        return _canonical_bytes(candidate)
+    if candidate["generation"] != current["generation"] + 1:
+        raise DailyReceiptSignerError(
+            "Daily public keyring generation did not advance exactly once"
+        )
+    if candidate["previous_manifest_hash"] != current["manifest_hash"]:
+        raise DailyReceiptSignerError(
+            "Daily public keyring previous manifest hash is invalid"
+        )
+    if candidate["active_key_id"] == current["active_key_id"]:
+        raise DailyReceiptSignerError(
+            "Daily public keyring rotation did not change the active key"
+        )
+    current_keys = {
+        current["active_key_id"]: current["active_public_key"],
+        **current["previous_public_keys"],
+    }
+    if candidate["previous_public_keys"] != dict(sorted(current_keys.items())):
+        raise DailyReceiptSignerError(
+            "Daily public keyring rotation dropped or changed historical keys"
+        )
+    return _canonical_bytes(candidate)
+
+
+def _export_public_keyring(
+    keys_path: Path,
+    *,
+    current_keyring_path: Path | None = None,
+) -> None:
+    sys.stdout.buffer.write(
+        _public_keyring_bytes(keys_path, current_keyring_path=current_keyring_path)
+    )
+
+
+def _stdin_operation(keys_path: Path) -> str:
+    payload = sys.stdin.buffer.read(MAX_REQUEST_BYTES + 1)
+    if not payload or len(payload) > MAX_REQUEST_BYTES:
+        raise DailyReceiptSignerError("Daily helper request size is invalid")
+    try:
+        request = json.loads(payload, object_pairs_hook=_unique_object)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise DailyReceiptSignerError("Daily helper request is invalid JSON") from exc
+    if _canonical_bytes(request) != payload:
+        raise DailyReceiptSignerError("Daily helper request is not canonical")
+    if not isinstance(request, dict):
+        raise DailyReceiptSignerError("Daily helper request shape is invalid")
+    operation = request.get("operation")
+    if operation == "validate-key-material" and request == {
+        "schema_version": 1,
+        "operation": "validate-key-material",
+    }:
+        _load_keys(keys_path)
+        return operation
+    if operation == "export-public-keyring" and request == {
+        "schema_version": 1,
+        "operation": "export-public-keyring",
+    }:
+        _export_public_keyring(keys_path, current_keyring_path=PUBLIC_KEYS_FILE)
+        return operation
+    if operation == "sign":
+        raise DailyReceiptSignerError(
+            "Daily receipt signing is only available through the root socket authority"
+        )
+    raise DailyReceiptSignerError("Daily helper operation is not allowed")
+
+
+def main(arguments: list[str]) -> int:
+    if arguments:
+        raise DailyReceiptSignerError("Daily key-material arguments are not allowed")
+    _stdin_operation(KEYS_FILE)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except DailyReceiptSignerError as exc:
+        print(f"Daily receipt key-material admin rejected request: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc

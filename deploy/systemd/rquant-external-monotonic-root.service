@@ -1,0 +1,48 @@
+[Unit]
+Description=rQuant external monotonic root authority
+Before=rquant-resource-authority.service
+
+[Service]
+Type=simple
+Slice=system.slice
+User=rquant-external-root
+Group=rquant-root-client
+WorkingDirectory=/usr/local/libexec/rquant-authority-runtime/current
+EnvironmentFile=/etc/rquant/external-root.env
+ExecStart=/usr/local/libexec/rquant-authority-runtime/current/venv/bin/rquant external-monotonic-root-serve --config /etc/rquant/external-monotonic-root.json
+Restart=on-failure
+RestartSec=2s
+TimeoutStartSec=30s
+TimeoutStopSec=15s
+RuntimeDirectory=rquant-external-root
+RuntimeDirectoryMode=0750
+StateDirectory=rquant-external-root
+StateDirectoryMode=0700
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectProc=invisible
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+Environment=PYTHONDONTWRITEBYTECODE=1
+ReadOnlyPaths=/usr/local/libexec/rquant-authority-runtime /etc/rquant/external-root.env /etc/rquant/external-monotonic-root.json /etc/rquant/keys/external-root/root.private.pem /etc/rquant/keys/external-root/root.public.pem
+ReadWritePaths=/run/rquant-external-root /var/lib/rquant-external-root
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+
+# Cloud gate before installation: systemd-analyze verify rquant-external-monotonic-root.service

@@ -1,0 +1,43 @@
+[Unit]
+Description=rQuant PageControl loopback authority
+After=network-online.target
+Wants=network-online.target
+OnFailure=rquant-alert@%n.service
+
+[Service]
+Type=simple
+Slice=rquant-serving.slice
+User=lighthouse
+Group=lighthouse
+WorkingDirectory=/home/lighthouse/rquant
+Environment="APP_ENV=prod" "RQUANT_DISABLE_DOTENV=1" "RQUANT_PAGE_CONTROL_HOST=127.0.0.1" "RQUANT_PAGE_CONTROL_PORT=8767"
+EnvironmentFile=/home/lighthouse/rquant/data/runtime/current/runtime.env
+ExecStart=/home/lighthouse/rquant/.venv/bin/python -m rquant.page_control_service
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=30s
+TimeoutStopSec=30s
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectProc=invisible
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+ReadWritePaths=/home/lighthouse/rquant/data/runtime/control /home/lighthouse/rquant/data/runtime/serving /home/lighthouse/rquant/logs
+InaccessiblePaths=/home/lighthouse/rquant/.env -/home/lighthouse/rquant/data/runtime/current/secrets -/home/lighthouse/rquant/data/runtime/current/credentials
+
+# Cloud gate before install: systemd-analyze verify rquant-page-control.service
+# No timer applies; it is a long-running loopback service.
+
+StandardOutput=journal
+StandardError=journal

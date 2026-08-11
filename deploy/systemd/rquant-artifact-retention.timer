@@ -1,0 +1,11 @@
+[Unit]
+Description=Run rQuant artifact retention and GC every five minutes
+
+[Timer]
+# Cloud deployment gate: systemd-analyze calendar '*-*-* *:0/5' --iterations 5
+OnCalendar=*-*-* *:0/5
+Persistent=true
+Unit=rquant-artifact-retention.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,43 @@
+[Unit]
+Description=rQuant Daily receipt signer authority
+Requires=rquant-daily-receipt-signer.socket
+After=rquant-daily-receipt-signer.socket
+
+[Service]
+Type=simple
+Slice=system.slice
+CPUWeight=100
+IOWeight=100
+MemoryHigh=128M
+MemoryMax=256M
+TasksMax=32
+User=root
+Group=root
+ExecStart=/usr/bin/python3 -I -S /usr/local/libexec/rquant-daily-receipt-authority/current/authority.pyz
+Restart=on-failure
+RestartSec=2s
+TimeoutStartSec=30s
+TimeoutStopSec=15s
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectProc=invisible
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+ReadOnlyPaths=/usr/local/libexec/rquant-daily-receipt-authority /etc/rquant/daily-receipt-keys.json /etc/rquant/daily-receipt-trusted-keys.json
+ReadWritePaths=/var/lib/rquant/daily-receipt-signer
+
+StandardOutput=journal
+StandardError=journal
+
+# Cloud deployment gate: systemd-analyze verify rquant-daily-receipt-signer.service
