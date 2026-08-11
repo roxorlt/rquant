@@ -19,6 +19,7 @@ import pyarrow.parquet as pq
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from rquant.canonical_json_stream import CANONICAL_JSON_STREAM_SCRATCH_BYTES
+from rquant.formal_runtime import FormalRuntimeCodeAuthority
 from rquant.lab_artifact_protocol import (
     LabAcknowledgedArtifactCommit,
     LabArtifactCommit,
@@ -65,6 +66,7 @@ from rquant.lab_result_digest import (
 )
 from rquant.lab_shard_protocol import LabShardSucceeded
 from rquant.lab_worker import LabShardResultManifest, canonical_shard_frame_digest
+from rquant.runtime_code_generation import RuntimeCodeGenerationCapability
 from rquant.strategy_job_adapters import (
     LabJobExecutionResult,
     LabShardExecutionResult,
@@ -1407,6 +1409,45 @@ class LabFinalizer:
                 finalizer_authority_verification_key_provider
             )
         self.adapter_registry = adapter_registry or default_strategy_job_adapter_registry()
+
+    @classmethod
+    def for_formal_runtime(
+        cls,
+        *,
+        runtime_capability: RuntimeCodeGenerationCapability,
+        reader: LabJobReader,
+        shard_artifact_root: Path,
+        artifact_store: LabJobArtifactStore,
+        commit_spool: LabArtifactCommitSpool,
+        finalizer_authority_key_provider: LabFinalizerAuthoritySigningKeyProvider,
+        finalizer_authority_verification_key_provider: (
+            LabFinalizerAuthorityVerificationKeyProvider | None
+        ) = None,
+        adapter_registry: StrategyJobAdapterRegistry | None = None,
+        bundle_limits: LabShardBundleLimits | None = None,
+        job_limits: LabFinalizerJobLimits | None = None,
+        result_digest_policy: LabResultDigestPolicy | None = None,
+    ) -> LabFinalizer:
+        """Compose a formal finalizer only from immutable-generation evidence."""
+
+        authority = FormalRuntimeCodeAuthority(runtime_capability)
+        finalizer = cls(
+            reader=reader,
+            shard_artifact_root=shard_artifact_root,
+            artifact_store=artifact_store,
+            commit_spool=commit_spool,
+            verified_code_sha_provider=authority.require_code_sha,
+            finalizer_authority_key_provider=finalizer_authority_key_provider,
+            finalizer_authority_verification_key_provider=(
+                finalizer_authority_verification_key_provider
+            ),
+            adapter_registry=adapter_registry,
+            bundle_limits=bundle_limits,
+            job_limits=job_limits,
+            result_digest_policy=result_digest_policy,
+        )
+        finalizer._formal_runtime_authority = authority
+        return finalizer
 
     def _verified_runtime_code_sha(self, *, expected_sha: str | None = None) -> str:
         try:

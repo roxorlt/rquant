@@ -11,6 +11,7 @@ import pytest
 from tests.runtime_code_support import contract_key_pair
 
 NOW = datetime(2026, 8, 12, 6, tzinfo=UTC)
+INTERPRETER_BYTES = b"TEST-INTERPRETER\n"
 
 
 def _package(
@@ -58,6 +59,11 @@ def _package(
     bundle = build_runtime_code_bundle(
         (
             RuntimeCodeBundleEntry(
+                path="release/bin/python",
+                mode=0o555,
+                content=INTERPRETER_BYTES,
+            ),
+            RuntimeCodeBundleEntry(
                 path="release/bin/rquant",
                 mode=0o555,
                 content=b"#!/usr/bin/python3\n",
@@ -85,8 +91,8 @@ def _package(
             launcher_path="release/bin/rquant",
             working_directory="release",
             import_roots=("release/src",),
-            interpreter_path="/usr/bin/python3",
-            interpreter_sha256="1" * 64,
+            interpreter_path="release/bin/python",
+            interpreter_sha256=hashlib.sha256(INTERPRETER_BYTES).hexdigest(),
             python_abi="test-abi",
         ),
         audience="formal-lab",
@@ -152,6 +158,7 @@ def _package(
             witness_rollback_domain_id=receipt.rollback_domain_id,
         ),
         verify_receipt=lambda **_kwargs: None,
+        require_current_receipt=lambda **_kwargs: None,
     )
     return authorities, root_keyring, runtime_keyring, trust, package_root, paths, receipt
 
@@ -359,3 +366,274 @@ def test_installer_crash_before_pointer_preserves_current_and_recovers(tmp_path:
     assert not any(
         path.name.endswith(".staging") for path in (runtime_root / "generations").iterdir()
     )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "unlisted",
+        "symlink",
+        "hardlink",
+        "fifo",
+        "socket",
+        "device-metadata",
+        "escape-parent",
+        "escape-empty-segment",
+        "escape-dot-segment",
+        "case-collision",
+    ),
+)
+def test_p0_05_release_tree_rejects_symlink_hardlink_device_fifo_socket_escape_and_collisions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    import stat
+
+    from pydantic import ValidationError
+
+    from rquant.runtime_code_attestation import (
+        RuntimeCodeBundleEntry,
+        RuntimeCodeFile,
+        build_runtime_code_bundle,
+    )
+    from rquant.runtime_code_generation import (
+        RuntimeCodeGenerationError,
+        require_attested_runtime_generation,
+    )
+    from tests.runtime_code_e2e_support import build_test_package, install_test_package
+
+    def _load_generation(
+        trusted_base: Path,
+        runtime_root: Path,
+        package: object,
+    ) -> object:
+        return require_attested_runtime_generation(
+            runtime_root=runtime_root,
+            trusted_base=trusted_base,
+            root_keyring=package.root_keyring,  # type: ignore[attr-defined]
+            runtime_keyring=package.runtime_keyring,  # type: ignore[attr-defined]
+            promotion_trust=package.promotion_trust,  # type: ignore[attr-defined]
+            expected_uid=os.getuid(),
+            expected_gid=os.getgid(),
+            expected_audience="formal-lab",
+            expected_installation_id="installation-a",
+            expected_target_platform="test-platform",
+            now=NOW,
+        )
+
+    invalid_paths = {
+        "escape-parent": "../escape.py",
+        "escape-empty-segment": "release//bad.py",
+        "escape-dot-segment": "release/./bad.py",
+    }
+    if mutation in invalid_paths:
+        with pytest.raises(ValidationError):
+            RuntimeCodeFile(
+                path=invalid_paths[mutation],
+                mode=0o444,
+                size=1,
+                sha256="a" * 64,
+            )
+        return
+    if mutation == "case-collision":
+        with pytest.raises(ValueError, match="duplicate|collision"):
+            build_runtime_code_bundle(
+                (
+                    RuntimeCodeBundleEntry(path="release/A.py", mode=0o444, content=b"a"),
+                    RuntimeCodeBundleEntry(path="release/a.py", mode=0o444, content=b"b"),
+                )
+            )
+        return
+
+    package = build_test_package(tmp_path / "package")
+    trusted_base, runtime_root, _installer = install_test_package(tmp_path, package)
+    generation = runtime_root / "generations" / package.receipt.generation_id
+    app = generation / "release/src/rquant/app.py"
+    app.parent.chmod(0o755)
+    if mutation == "unlisted":
+        extra = app.with_name("sitecustomize.py")
+        extra.write_bytes(b"INJECTED = True\n")
+        extra.chmod(0o444)
+    elif mutation == "symlink":
+        app.unlink()
+        app.symlink_to("elsewhere.py")
+    elif mutation == "hardlink":
+        external = tmp_path / "external.py"
+        external.write_bytes(b"VALUE = 1\n")
+        external.chmod(0o444)
+        app.unlink()
+        os.link(external, app)
+    elif mutation == "fifo":
+        app.unlink()
+        os.mkfifo(app, 0o444)
+    elif mutation == "socket":
+        import socket
+        import uuid
+
+        app.unlink()
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as endpoint:
+            short_socket = Path("/tmp") / f"rq-{uuid.uuid4().hex}.sock"
+            endpoint.bind(os.fspath(short_socket))
+            os.replace(short_socket, app)
+            with pytest.raises(RuntimeCodeGenerationError):
+                _load_generation(trusted_base, runtime_root, package)
+        return
+    elif mutation == "device-metadata":
+        original = Path.lstat
+
+        def device_lstat(path: Path) -> os.stat_result:
+            observed = original(path)
+            if path == app:
+                values = list(observed)
+                values[0] = stat.S_IFCHR | 0o444
+                return os.stat_result(values)
+            return observed
+
+        with monkeypatch.context() as context:
+            context.setattr(Path, "lstat", device_lstat)
+            with pytest.raises(RuntimeCodeGenerationError):
+                _load_generation(trusted_base, runtime_root, package)
+        return
+    with pytest.raises(RuntimeCodeGenerationError):
+        _load_generation(trusted_base, runtime_root, package)
+
+
+def test_p0_06_rename_or_replace_during_collection_verification_and_extraction_fails_closed(
+    tmp_path: Path,
+) -> None:
+    from rquant.runtime_code_generation import (
+        RuntimeCodeCollectFile,
+        RuntimeCodeGenerationError,
+        RuntimeCodeGenerationInstaller,
+        collect_runtime_code_bundle,
+    )
+    from tests.runtime_code_e2e_support import build_test_package
+
+    checkout = tmp_path / "checkout"
+    source = checkout / "src/rquant/app.py"
+    source.parent.mkdir(parents=True, mode=0o700)
+    source.write_bytes(b"VALUE = 1\n")
+    source.chmod(0o644)
+    replacement = checkout / "replacement.py"
+    replacement.write_bytes(b"VALUE = 2\n")
+    replacement.chmod(0o644)
+
+    def replace_collected(stage: str) -> None:
+        if stage == "collector:after-open:src/rquant/app.py":
+            os.replace(replacement, source)
+
+    with pytest.raises(RuntimeCodeGenerationError, match="changed"):
+        collect_runtime_code_bundle(
+            checkout,
+            (
+                RuntimeCodeCollectFile(
+                    source_path="src/rquant/app.py",
+                    bundle_path="release/src/rquant/app.py",
+                    mode=0o444,
+                ),
+            ),
+            expected_uid=os.getuid(),
+            expected_gid=os.getgid(),
+            fault_hook=replace_collected,
+        )
+
+    package = build_test_package(tmp_path / "package")
+    trusted_base = tmp_path / "trusted"
+    trusted_base.mkdir(mode=0o700)
+    runtime_root = trusted_base / "runtime-code"
+    runtime_root.mkdir(mode=0o700)
+
+    def replace_package(stage: str) -> None:
+        if stage == "installer:package-leased":
+            changed = package.paths["runtime-code.bundle"].with_name("changed.bundle")
+            changed.write_bytes(b"X" * len(package.bundle_bytes))
+            changed.chmod(0o444)
+            os.replace(changed, package.paths["runtime-code.bundle"])
+
+    replacing_installer = RuntimeCodeGenerationInstaller(
+        runtime_root=runtime_root,
+        trusted_base=trusted_base,
+        root_keyring=package.root_keyring,
+        runtime_keyring=package.runtime_keyring,
+        promotion_trust=package.promotion_trust,
+        expected_uid=os.getuid(),
+        expected_gid=os.getgid(),
+        fault_hook=replace_package,
+    )
+    with pytest.raises(RuntimeCodeGenerationError):
+        replacing_installer.install(package.request())
+    assert not (runtime_root / "current").exists()
+
+    package = build_test_package(tmp_path / "extract-package")
+
+    def replace_extracted(stage: str) -> None:
+        if stage == "installer:after-extract:release/bin/python":
+            staging = next((runtime_root / "generations").glob(".*.staging"))
+            target = staging / "release/bin/python"
+            changed = target.with_name("changed")
+            changed.write_bytes(b"X" * len(INTERPRETER_BYTES))
+            changed.chmod(0o555)
+            os.replace(changed, target)
+
+    extracting_installer = RuntimeCodeGenerationInstaller(
+        runtime_root=runtime_root,
+        trusted_base=trusted_base,
+        root_keyring=package.root_keyring,
+        runtime_keyring=package.runtime_keyring,
+        promotion_trust=package.promotion_trust,
+        expected_uid=os.getuid(),
+        expected_gid=os.getgid(),
+        fault_hook=replace_extracted,
+    )
+    with pytest.raises(RuntimeCodeGenerationError):
+        extracting_installer.install(package.request())
+    assert not (runtime_root / "current").exists()
+
+
+def test_p0_08_writable_or_symlinked_ancestor_and_code_object_fails(
+    tmp_path: Path,
+) -> None:
+    from rquant.runtime_code_generation import RuntimeCodeGenerationError
+    from tests.runtime_code_e2e_support import (
+        build_test_package,
+        install_test_package,
+        open_test_capability,
+    )
+
+    package = build_test_package(tmp_path / "writable-package")
+    trusted_base, runtime_root, _installer = install_test_package(tmp_path / "writable", package)
+    trusted_base.chmod(0o777)
+    with pytest.raises(RuntimeCodeGenerationError):
+        open_test_capability(
+            trusted_base=trusted_base,
+            runtime_root=runtime_root,
+            package=package,
+        )
+
+    package = build_test_package(tmp_path / "symlink-package")
+    trusted_base, runtime_root, _installer = install_test_package(tmp_path / "symlink", package)
+    generation = runtime_root / "generations" / package.receipt.generation_id
+    release = generation / "release"
+    moved = generation / "release-real"
+    generation.chmod(0o755)
+    release.chmod(0o755)
+    release.rename(moved)
+    release.symlink_to(moved)
+    with pytest.raises(RuntimeCodeGenerationError):
+        open_test_capability(
+            trusted_base=trusted_base,
+            runtime_root=runtime_root,
+            package=package,
+        )
+
+    package = build_test_package(tmp_path / "object-package")
+    trusted_base, runtime_root, _installer = install_test_package(tmp_path / "object", package)
+    app = runtime_root / "generations" / package.receipt.generation_id / "release/src/rquant/app.py"
+    app.chmod(0o644)
+    with pytest.raises(RuntimeCodeGenerationError):
+        open_test_capability(
+            trusted_base=trusted_base,
+            runtime_root=runtime_root,
+            package=package,
+        )

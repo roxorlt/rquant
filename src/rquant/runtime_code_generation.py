@@ -142,6 +142,62 @@ class LoadedRuntimeCodeGeneration(RuntimeContractModel):
     attestation: RuntimeCodeAttestation
     promotion_receipt: RuntimeCodePromotionReceipt
     evidence: CodeTrustEvidence
+    material_uid: int = Field(strict=True, ge=0)
+    material_gid: int = Field(strict=True, ge=0)
+
+
+class RuntimeCodeGenerationCapability:
+    """Process-local lease proving one verified generation remains selected."""
+
+    def __init__(
+        self,
+        *,
+        loaded: LoadedRuntimeCodeGeneration,
+        pointer_lease: SecureRegularFileLease,
+        artifact_leases: tuple[SecureRegularFileLease, ...],
+        reverify: Callable[[], LoadedRuntimeCodeGeneration],
+        audit_events: tuple[str, ...],
+    ) -> None:
+        self.loaded = loaded
+        self._pointer_lease = pointer_lease
+        self._artifact_leases = artifact_leases
+        self._reverify = reverify
+        self.audit_events = audit_events
+        self._closed = False
+
+    @property
+    def evidence(self) -> CodeTrustEvidence:
+        return self.loaded.evidence
+
+    @property
+    def release_root(self) -> Path:
+        return self.loaded.release_root
+
+    def require_live(self) -> None:
+        if self._closed:
+            raise RuntimeCodeGenerationError("runtime code capability is closed")
+        expected_pointer = f"{self.evidence.generation_id}\n".encode("ascii")
+        if self._pointer_lease.read_all(max_bytes=_POINTER_BYTES) != expected_pointer:
+            raise RuntimeCodeGenerationError("runtime generation selection changed")
+        for lease in self._artifact_leases:
+            lease.require_unchanged()
+        if self._reverify().evidence != self.evidence:
+            raise RuntimeCodeGenerationError("runtime generation evidence changed")
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for lease in reversed(self._artifact_leases):
+            lease.close()
+        self._pointer_lease.close()
+
+    def __enter__(self) -> RuntimeCodeGenerationCapability:
+        self.require_live()
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
 
 
 def collect_runtime_code_bundle(
@@ -330,6 +386,7 @@ def _read_package(
     *,
     expected_uid: int,
     expected_gid: int,
+    fault_hook: FaultHook | None = None,
 ) -> tuple[bytes, bytes, bytes, bytes]:
     paths = (
         (request.bundle_path, _MAX_BUNDLE_BYTES),
@@ -353,6 +410,8 @@ def _read_package(
                     )
                 )
             )
+        if fault_hook is not None:
+            fault_hook("installer:package-leased")
         return tuple(
             lease.read_all(max_bytes=maximum)
             for lease, (_path, maximum) in zip(leases, paths, strict=True)
@@ -387,6 +446,7 @@ class RuntimeCodeGenerationInstaller:
                 request,
                 expected_uid=self._expected_uid,
                 expected_gid=self._expected_gid,
+                fault_hook=self._fault_hook,
             )
             verified = require_runtime_code_attestation(
                 attestation_bytes=attestation_bytes,
@@ -424,6 +484,7 @@ class RuntimeCodeGenerationInstaller:
                     expected_installation_id=request.expected_installation_id,
                     expected_target_platform=request.expected_target_platform,
                     now=request.now,
+                    require_current_promotion=False,
                 )
             if current is not None and candidate.generation_id == current.evidence.generation_id:
                 expected_previous = candidate.previous_receipt_sha256
@@ -445,6 +506,7 @@ class RuntimeCodeGenerationInstaller:
                 minimum_promotion_sequence=minimum_sequence,
                 expected_previous_receipt_sha256=expected_previous,
             )
+            self._promotion_trust.require_current_receipt(receipt=receipt)
             evidence = _evidence(verified, receipt, attestation_bytes)
             if current is not None and receipt.generation_id == current.evidence.generation_id:
                 return RuntimeCodeInstallReceipt(
@@ -555,6 +617,8 @@ class RuntimeCodeGenerationInstaller:
                 target = staging.joinpath(*PurePosixPath(entry.path).parts)
                 target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
                 _write_new_file(target, entry.content, entry.mode)
+                if self._fault_hook is not None:
+                    self._fault_hook(f"installer:after-extract:{entry.path}")
             for name, payload in authority_payloads.items():
                 _write_new_file(staging / name, payload, 0o444)
             _write_new_file(staging / "generation-manifest.json", manifest_bytes, 0o444)
@@ -562,6 +626,15 @@ class RuntimeCodeGenerationInstaller:
                 for child in child_directories:
                     os.chmod(Path(directory) / child, 0o555, follow_symlinks=False)
                 _fsync_directory(Path(directory))
+            _require_published_generation(
+                staging,
+                trusted_base=self._trusted_base,
+                manifest=manifest,
+                manifest_bytes=manifest_bytes,
+                expected_payloads=expected_payloads,
+                expected_uid=self._expected_uid,
+                expected_gid=self._expected_gid,
+            )
             _fsync_directory(staging)
             os.replace(staging, final)
             os.chmod(final, 0o555, follow_symlinks=False)
@@ -681,6 +754,7 @@ def require_attested_runtime_generation(
     expected_installation_id: str,
     expected_target_platform: str,
     now: datetime,
+    require_current_promotion: bool = True,
 ) -> LoadedRuntimeCodeGeneration:
     """Load and independently verify the currently selected immutable generation."""
 
@@ -784,6 +858,8 @@ def require_attested_runtime_generation(
             minimum_promotion_sequence=candidate.promotion_sequence,
             expected_previous_receipt_sha256=candidate.previous_receipt_sha256,
         )
+        if require_current_promotion:
+            promotion_trust.require_current_receipt(receipt=receipt)
         if receipt.generation_id != generation_id:
             raise RuntimeCodeGenerationError("runtime generation receipt does not match pointer")
         return LoadedRuntimeCodeGeneration(
@@ -793,6 +869,8 @@ def require_attested_runtime_generation(
             attestation=verified.attestation,
             promotion_receipt=receipt,
             evidence=_evidence(verified, receipt, attestation_bytes),
+            material_uid=expected_uid,
+            material_gid=expected_gid,
         )
     except RuntimeCodeGenerationError:
         raise
@@ -807,13 +885,119 @@ def require_attested_runtime_generation(
         raise RuntimeCodeGenerationError(f"runtime code generation is invalid: {exc}") from exc
 
 
+def open_attested_runtime_generation(
+    *,
+    runtime_root: Path,
+    trusted_base: Path,
+    root_keyring: VerifyOnlyEd25519Keyring,
+    runtime_keyring: VerifyOnlyEd25519Keyring,
+    promotion_trust: RuntimeCodePromotionTrust,
+    expected_uid: int,
+    expected_gid: int,
+    expected_audience: str,
+    expected_installation_id: str,
+    expected_target_platform: str,
+    now: datetime,
+    fault_hook: FaultHook | None = None,
+) -> RuntimeCodeGenerationCapability:
+    """Verify a formal generation and retain its selected filesystem identities."""
+
+    def reverify() -> LoadedRuntimeCodeGeneration:
+        return require_attested_runtime_generation(
+            runtime_root=runtime_root,
+            trusted_base=trusted_base,
+            root_keyring=root_keyring,
+            runtime_keyring=runtime_keyring,
+            promotion_trust=promotion_trust,
+            expected_uid=expected_uid,
+            expected_gid=expected_gid,
+            expected_audience=expected_audience,
+            expected_installation_id=expected_installation_id,
+            expected_target_platform=expected_target_platform,
+            now=now,
+        )
+
+    loaded = reverify()
+    pointer_lease: SecureRegularFileLease | None = None
+    artifact_leases: list[SecureRegularFileLease] = []
+    try:
+        pointer_lease = open_secure_regular_file_lease(
+            runtime_root / "current",
+            trusted_root=trusted_base,
+            expected_uid=expected_uid,
+            expected_gid=expected_gid,
+            allowed_modes=frozenset({0o400, 0o440, 0o444}),
+            max_bytes=_POINTER_BYTES,
+        )
+        expected_pointer = f"{loaded.evidence.generation_id}\n".encode("ascii")
+        if pointer_lease.read_all(max_bytes=_POINTER_BYTES) != expected_pointer:
+            raise RuntimeCodeGenerationError("runtime generation changed while opening")
+        manifest_bytes = canonical_model_json_bytes(loaded.manifest)
+        generation_files = [
+            ("generation-manifest.json", 0o444, manifest_bytes),
+        ]
+        for artifact in loaded.manifest.artifacts:
+            generation_files.append(
+                (
+                    artifact.path,
+                    artifact.mode,
+                    _read_generation_file(
+                        loaded.generation_root.joinpath(*PurePosixPath(artifact.path).parts),
+                        trusted_base=trusted_base,
+                        expected_uid=expected_uid,
+                        expected_gid=expected_gid,
+                        max_bytes=max(1, artifact.size + 1),
+                        modes=frozenset({artifact.mode}),
+                    ),
+                )
+            )
+        for path, mode, expected_payload in generation_files:
+            lease = open_secure_regular_file_lease(
+                loaded.generation_root.joinpath(*PurePosixPath(path).parts),
+                trusted_root=trusted_base,
+                expected_uid=expected_uid,
+                expected_gid=expected_gid,
+                allowed_modes=frozenset({mode}),
+                max_bytes=max(1, len(expected_payload) + 1),
+                min_bytes=0,
+            )
+            artifact_leases.append(lease)
+            if lease.read_all(max_bytes=max(1, len(expected_payload) + 1)) != expected_payload:
+                raise RuntimeCodeGenerationError("runtime generation changed while leasing")
+        if fault_hook is not None:
+            fault_hook("capability:after-verify")
+        capability = RuntimeCodeGenerationCapability(
+            loaded=loaded,
+            pointer_lease=pointer_lease,
+            artifact_leases=tuple(artifact_leases),
+            reverify=reverify,
+            audit_events=(
+                "pointer-verified",
+                "attestation-verified",
+                "promotion-current-verified",
+                "generation-verified",
+                "execution-binding-pending",
+            ),
+        )
+        capability.require_live()
+        return capability
+    except Exception:
+        for lease in reversed(artifact_leases):
+            lease.close()
+        if pointer_lease is not None:
+            pointer_lease.close()
+        raise
+
+
 __all__ = [
     "LoadedRuntimeCodeGeneration",
     "RuntimeCodeCollectFile",
     "RuntimeCodeGenerationError",
+    "RuntimeCodeGenerationCapability",
     "RuntimeCodeGenerationInstaller",
     "RuntimeCodeInstallReceipt",
     "RuntimeCodeInstallRequest",
     "collect_runtime_code_bundle",
+    "open_attested_runtime_generation",
     "require_attested_runtime_generation",
 ]

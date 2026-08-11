@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import tarfile
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
 from typing import Final, Literal, Protocol, Self
@@ -56,21 +57,6 @@ def _canonical_relative_path(value: str) -> str:
         raise ValueError("runtime code path must be a canonical relative POSIX path")
     if any(part.casefold() == ".git" for part in path.parts):
         raise ValueError("runtime code paths cannot contain Git metadata")
-    return value
-
-
-def _canonical_absolute_path(value: str) -> str:
-    if not isinstance(value, str) or not value or value != value.strip():
-        raise ValueError("runtime interpreter path must be canonical")
-    try:
-        value.encode("ascii")
-    except UnicodeEncodeError as exc:
-        raise ValueError("runtime interpreter path must be ASCII") from exc
-    if "\\" in value or "//" in value or not value.startswith("/"):
-        raise ValueError("runtime interpreter path must be absolute POSIX")
-    path = PurePosixPath(value)
-    if str(path) != value or any(part in {".", ".."} for part in path.parts):
-        raise ValueError("runtime interpreter path must be canonical")
     return value
 
 
@@ -175,7 +161,7 @@ class RuntimeCodeExecutionSpec(RuntimeContractModel):
     def validate_interpreter_path(cls, value: object) -> object:
         if not isinstance(value, str):
             raise ValueError("interpreter path must be text")
-        return _canonical_absolute_path(value)
+        return _canonical_relative_path(value)
 
     @model_validator(mode="after")
     def validate_execution_environment(self) -> Self:
@@ -253,6 +239,13 @@ class RuntimeCodeAttestation(RuntimeContractModel):
         launcher = by_path.get(self.execution_spec.launcher_path)
         if launcher is None or launcher.mode != 0o555:
             raise ValueError("runtime launcher must be an attested executable")
+        interpreter = by_path.get(self.execution_spec.interpreter_path)
+        if (
+            interpreter is None
+            or interpreter.mode != 0o555
+            or interpreter.sha256 != self.execution_spec.interpreter_sha256
+        ):
+            raise ValueError("runtime interpreter must be an attested executable")
         if not any(
             file.path == root or file.path.startswith(root + "/")
             for root in self.execution_spec.import_roots
@@ -390,6 +383,64 @@ class RuntimeCodePromotionTrust(Protocol):
         signing_bytes: bytes,
         signature: str,
     ) -> None: ...
+
+    def require_current_receipt(self, *, receipt: RuntimeCodePromotionReceipt) -> None: ...
+
+
+class RuntimeCodePromotionTrustBoundary:
+    """Require a pinned signed receipt to equal the external root's current value."""
+
+    def __init__(
+        self,
+        *,
+        trust: RuntimeCodePromotionTrust,
+        current_reader: Callable[[str, str], bytes | None],
+    ) -> None:
+        self._trust = trust
+        self._current_reader = current_reader
+
+    @property
+    def config(self) -> RuntimeCodePromotionConfig:
+        return self._trust.config
+
+    def verify_receipt(
+        self,
+        *,
+        identity: ExternalMonotonicRootReceiptIdentity,
+        signing_bytes: bytes,
+        signature: str,
+    ) -> None:
+        self._trust.verify_receipt(
+            identity=identity,
+            signing_bytes=signing_bytes,
+            signature=signature,
+        )
+
+    def require_current_receipt(self, *, receipt: RuntimeCodePromotionReceipt) -> None:
+        try:
+            current_bytes = self._current_reader(
+                receipt.installation_id,
+                receipt.target_platform,
+            )
+            if current_bytes is None:
+                raise RuntimeCodeTrustError("runtime code promotion root has no current receipt")
+            current = strict_model_validate_canonical_json(
+                RuntimeCodePromotionReceipt,
+                current_bytes,
+            )
+            if current != receipt or canonical_model_json_bytes(current) != current_bytes:
+                raise RuntimeCodeTrustError("runtime code promotion receipt is stale")
+            self.verify_receipt(
+                identity=current.external_identity,
+                signing_bytes=current.signing_bytes(),
+                signature=current.signature,
+            )
+        except RuntimeCodeTrustError:
+            raise
+        except (AttributeError, StrictJsonError, ValidationError, ValueError) as exc:
+            raise RuntimeCodeTrustError(
+                "runtime code current promotion receipt is invalid"
+            ) from exc
 
 
 def _content_root_sha256(files: tuple[RuntimeCodeFile, ...]) -> str:
@@ -766,6 +817,7 @@ __all__ = [
     "RuntimeCodeGenerationArtifact",
     "RuntimeCodeGenerationManifest",
     "RuntimeCodePromotionReceipt",
+    "RuntimeCodePromotionTrustBoundary",
     "RuntimeCodeTrustCertificate",
     "RuntimeCodeTrustError",
     "VerifiedRuntimeCodeAttestation",

@@ -15,6 +15,7 @@ from typing import Literal
 from pydantic import BaseModel, Field, computed_field, model_validator
 
 from rquant.contained_subprocess import run_contained
+from rquant.runtime_code_attestation import CodeTrustEvidence
 
 _IGNORED_NATIVE_CODE_SUFFIXES = frozenset({".so", ".dylib", ".pyd"})
 _IGNORED_SOURCE_CODE_SUFFIXES = frozenset({".py", ".pyw"})
@@ -347,10 +348,11 @@ CURRENT_RESEARCH_NOTICES: tuple[ResearchNotice, ...] = (
 class ResearchManifest(BaseModel):
     """一条研究结果可复现、可晋级所需的最小证据。"""
 
-    schema_version: Literal[1, 2] = 1
+    schema_version: Literal[1, 2, 3] = 1
     research_status: ResearchStatus = "exploratory"
     status_reason: str = Field(min_length=1)
     code_commit: str | None = None
+    code_trust_evidence: CodeTrustEvidence | None = None
     dataset_snapshot_id: str | None = None
     dataset_binding_hash: str | None = Field(
         default=None,
@@ -382,8 +384,10 @@ class ResearchManifest(BaseModel):
     @property
     def missing_evidence(self) -> list[str]:
         missing: list[str] = []
-        if not self.code_commit:
+        if self.schema_version < 3 and not self.code_commit:
             missing.append("code_commit")
+        if self.schema_version >= 3 and self.code_trust_evidence is None:
+            missing.append("code_trust_evidence")
         if not self.dataset_snapshot_id:
             missing.append("dataset_snapshot_id")
         if self.schema_version >= 2 and not self.dataset_binding_hash:
@@ -436,6 +440,12 @@ class ResearchManifest(BaseModel):
             raise ValueError(f"{self.research_status} 缺少证据: {missing}")
         if self.research_status != "exploratory" and str(self.code_commit).endswith("-dirty"):
             raise ValueError(f"{self.research_status} 不能使用脏工作树代码")
+        if self.code_trust_evidence is not None:
+            if self.schema_version < 3:
+                raise ValueError("code_trust_evidence requires research manifest schema 3")
+            if self.code_commit not in {None, self.code_trust_evidence.provenance_commit}:
+                raise ValueError("code_commit conflicts with signed code trust evidence")
+            self.code_commit = self.code_trust_evidence.provenance_commit
         if (
             self.research_status in {"paper_candidate", "monitor_approved"}
             and not self.validation_method
@@ -454,6 +464,27 @@ class ResearchManifest(BaseModel):
         ):
             raise ValueError("monitor_approved 至少需要 30 笔前瞻成交")
         return self
+
+
+def require_formal_research_manifest(
+    manifest: ResearchManifest,
+    *,
+    capability: object,
+) -> ResearchManifest:
+    """Bind a formal research record to one live immutable generation."""
+
+    from rquant.runtime_code_generation import RuntimeCodeGenerationCapability
+
+    if not isinstance(capability, RuntimeCodeGenerationCapability):
+        raise ValueError("formal research requires an attested generation capability")
+    capability.require_live()
+    if (
+        manifest.schema_version != 3
+        or manifest.research_status == "exploratory"
+        or manifest.code_trust_evidence != capability.evidence
+    ):
+        raise ValueError("formal research manifest code evidence is invalid")
+    return manifest
 
 
 def detect_code_commit(

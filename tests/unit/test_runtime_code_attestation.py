@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import os
 import tarfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -13,6 +14,7 @@ from pydantic import ValidationError
 from tests.runtime_code_support import contract_key_pair
 
 NOW = datetime(2026, 8, 12, 4, tzinfo=UTC)
+INTERPRETER_BYTES = b"TEST-INTERPRETER\n"
 
 
 def _authorities(tmp_path: Path) -> tuple[object, ...]:
@@ -43,6 +45,11 @@ def _bundle() -> object:
 
     return build_runtime_code_bundle(
         (
+            RuntimeCodeBundleEntry(
+                path="release/bin/python",
+                mode=0o555,
+                content=INTERPRETER_BYTES,
+            ),
             RuntimeCodeBundleEntry(
                 path="release/bin/rquant",
                 mode=0o555,
@@ -81,8 +88,8 @@ def _signed_attestation(tmp_path: Path) -> tuple[object, ...]:
         launcher_path="release/bin/rquant",
         working_directory="release",
         import_roots=("release/src",),
-        interpreter_path="/usr/bin/python3",
-        interpreter_sha256="a" * 64,
+        interpreter_path="release/bin/python",
+        interpreter_sha256=hashlib.sha256(INTERPRETER_BYTES).hexdigest(),
         python_abi="cpython-313-darwin-arm64",
     )
     attestation = sign_runtime_code_attestation(
@@ -159,6 +166,47 @@ def test_bundle_is_deterministic_and_rejects_noncanonical_file_tables() -> None:
             special.getvalue(),
             expected_files=first.files,
             expected_content_root_sha256=first.content_root_sha256,
+        )
+
+
+def test_execution_spec_requires_attested_generation_local_interpreter(
+    tmp_path: Path,
+) -> None:
+    from rquant.runtime_code_attestation import (
+        RuntimeCodeExecutionSpec,
+        sign_runtime_code_attestation,
+    )
+
+    _root, _record, _keys, runtime_signer, _runtime_record, _runtime_keys = _authorities(tmp_path)
+    bundle = _bundle()
+    with pytest.raises(ValidationError):
+        RuntimeCodeExecutionSpec(
+            launcher_path="release/bin/rquant",
+            working_directory="release",
+            import_roots=("release/src",),
+            interpreter_path="/usr/bin/python3",
+            interpreter_sha256="a" * 64,
+            python_abi="cpython-313-darwin-arm64",
+        )
+    execution = RuntimeCodeExecutionSpec(
+        launcher_path="release/bin/rquant",
+        working_directory="release",
+        import_roots=("release/src",),
+        interpreter_path="release/bin/python",
+        interpreter_sha256="a" * 64,
+        python_abi="cpython-313-darwin-arm64",
+    )
+    with pytest.raises(ValueError, match="interpreter"):
+        sign_runtime_code_attestation(
+            signer=runtime_signer,
+            bundle=bundle,
+            execution_spec=execution,
+            audience="rquant-formal-runtime",
+            installation_id="lab-installation-a",
+            target_platform="macos-arm64-cpython-313",
+            provenance_commit="b" * 40,
+            not_before=NOW - timedelta(minutes=1),
+            expires_at=NOW + timedelta(hours=1),
         )
 
 
@@ -337,4 +385,252 @@ def test_generation_manifest_and_code_evidence_are_strict() -> None:
                 **manifest.model_dump(),
                 "artifacts": (artifact, artifact),
             }
+        )
+
+
+def test_p0_03_attestation_bundle_mismatch_fails_before_target(tmp_path: Path) -> None:
+    from rquant.runtime_code_attestation import (
+        RuntimeCodeTrustError,
+        require_runtime_code_attestation,
+    )
+    from tests.runtime_code_e2e_support import build_test_package
+
+    first = build_test_package(tmp_path / "first", source=b"VALUE = 'A'\n")
+    second = build_test_package(
+        tmp_path / "second",
+        source=b"VALUE = 'B'\n",
+        authorities=first.authorities,
+    )
+    assert len(first.bundle_bytes) == len(second.bundle_bytes)
+    target_started = False
+    with pytest.raises(RuntimeCodeTrustError):
+        require_runtime_code_attestation(
+            attestation_bytes=first.attestation_bytes,
+            certificate_bytes=first.certificate_bytes,
+            bundle_bytes=second.bundle_bytes,
+            root_keyring=first.root_keyring,
+            runtime_keyring=first.runtime_keyring,
+            expected_audience="formal-lab",
+            expected_installation_id="installation-a",
+            expected_target_platform="test-platform",
+            now=NOW,
+        )
+    assert not target_started
+
+
+def test_p0_04_any_attestation_table_root_or_manifest_tamper_fails(
+    tmp_path: Path,
+) -> None:
+    from rquant.runtime_code_attestation import (
+        RuntimeCodeAttestation,
+        RuntimeCodeTrustError,
+        require_runtime_code_attestation,
+    )
+    from rquant.runtime_code_generation import (
+        RuntimeCodeGenerationError,
+        require_attested_runtime_generation,
+    )
+    from rquant.strict_json import (
+        canonical_json_bytes,
+        canonical_model_json_bytes,
+        strict_model_validate_canonical_json,
+    )
+    from tests.runtime_code_e2e_support import build_test_package, install_test_package
+
+    package = build_test_package(tmp_path / "package")
+    attestation = strict_model_validate_canonical_json(
+        RuntimeCodeAttestation,
+        package.attestation_bytes,
+    )
+    changed_bundle = bytearray(package.bundle_bytes)
+    changed_bundle[700] ^= 1
+    changed_table = {
+        **attestation.model_dump(mode="json"),
+        "files": [file.model_dump(mode="json") for file in reversed(attestation.files)],
+    }
+    changed_root = attestation.model_copy(update={"content_root_sha256": "f" * 64})
+    for bundle_bytes, attestation_bytes in (
+        (bytes(changed_bundle), package.attestation_bytes),
+        (package.bundle_bytes, canonical_json_bytes(changed_table)),
+        (package.bundle_bytes, canonical_model_json_bytes(changed_root)),
+    ):
+        with pytest.raises(RuntimeCodeTrustError):
+            require_runtime_code_attestation(
+                attestation_bytes=attestation_bytes,
+                certificate_bytes=package.certificate_bytes,
+                bundle_bytes=bundle_bytes,
+                root_keyring=package.root_keyring,
+                runtime_keyring=package.runtime_keyring,
+                expected_audience="formal-lab",
+                expected_installation_id="installation-a",
+                expected_target_platform="test-platform",
+                now=NOW,
+            )
+
+    trusted_base, runtime_root, _installer = install_test_package(tmp_path, package)
+    manifest_path = (
+        runtime_root / "generations" / package.receipt.generation_id / "generation-manifest.json"
+    )
+    manifest_bytes = bytearray(manifest_path.read_bytes())
+    manifest_bytes[-2] ^= 1
+    manifest_path.chmod(0o644)
+    manifest_path.write_bytes(manifest_bytes)
+    manifest_path.chmod(0o444)
+    with pytest.raises(RuntimeCodeGenerationError):
+        require_attested_runtime_generation(
+            runtime_root=runtime_root,
+            trusted_base=trusted_base,
+            root_keyring=package.root_keyring,
+            runtime_keyring=package.runtime_keyring,
+            promotion_trust=package.promotion_trust,
+            expected_uid=os.getuid(),
+            expected_gid=os.getgid(),
+            expected_audience="formal-lab",
+            expected_installation_id="installation-a",
+            expected_target_platform="test-platform",
+            now=NOW,
+        )
+
+
+def test_p0_09_stale_foreign_unpinned_and_lower_sequence_receipts_fail(
+    tmp_path: Path,
+) -> None:
+    from rquant.adapter_manifest import VerifyOnlyEd25519Keyring
+    from rquant.runtime_code_attestation import (
+        RUNTIME_CODE_ATTESTATION_NAMESPACE,
+        RuntimeCodeExecutionSpec,
+        RuntimeCodeTrustError,
+        require_runtime_code_attestation,
+        sign_runtime_code_attestation,
+        sign_runtime_code_trust_certificate,
+    )
+    from rquant.runtime_code_generation import (
+        RuntimeCodeGenerationError,
+        require_attested_runtime_generation,
+    )
+    from rquant.strict_json import canonical_model_json_bytes
+    from tests.runtime_code_e2e_support import (
+        NOW as E2E_NOW,
+    )
+    from tests.runtime_code_e2e_support import (
+        build_test_package,
+        install_test_package,
+    )
+
+    first = build_test_package(tmp_path / "first", source=b"VALUE = 1\n")
+    trusted_base, runtime_root, installer = install_test_package(tmp_path, first)
+    second = build_test_package(
+        tmp_path / "second",
+        sequence=2,
+        previous_receipt_sha256=first.receipt.receipt_hash,
+        source=b"VALUE = 2\n",
+        authorities=first.authorities,
+        promotion_state=first.promotion_state,
+    )
+    with pytest.raises(RuntimeCodeGenerationError, match="stale|invalid"):
+        require_attested_runtime_generation(
+            runtime_root=runtime_root,
+            trusted_base=trusted_base,
+            root_keyring=first.root_keyring,
+            runtime_keyring=first.runtime_keyring,
+            promotion_trust=first.promotion_trust,
+            expected_uid=os.getuid(),
+            expected_gid=os.getgid(),
+            expected_audience="formal-lab",
+            expected_installation_id="installation-a",
+            expected_target_platform="test-platform",
+            now=E2E_NOW,
+        )
+    installer.install(second.request())
+    lower = build_test_package(
+        tmp_path / "lower",
+        sequence=1,
+        previous_receipt_sha256=second.receipt.receipt_hash,
+        source=b"VALUE = 1\n",
+        authorities=first.authorities,
+        promotion_state=first.promotion_state,
+    )
+    with pytest.raises(RuntimeCodeGenerationError, match="rollback"):
+        installer.install(lower.request())
+    rollback = build_test_package(
+        tmp_path / "rollback",
+        sequence=3,
+        previous_receipt_sha256=second.receipt.receipt_hash,
+        source=b"VALUE = 1\n",
+        authorities=first.authorities,
+        promotion_state=first.promotion_state,
+    )
+    assert installer.install(rollback.request()).generation_id == rollback.receipt.generation_id
+
+    root_signer, _rr, root_keys, _old_signer, old_record, _old_keys, *_rest = first.authorities
+    new_signer, new_record, _new_keys = contract_key_pair(
+        tmp_path / "rotation",
+        key_id="runtime-v2",
+        issuer=old_record.issuer,
+        key_purpose="rquant_runtime_code_signer",
+        namespace=RUNTIME_CODE_ATTESTATION_NAMESPACE,
+        rotation="active",
+    )
+    rotated_keys = VerifyOnlyEd25519Keyring(
+        records=(old_record, new_record),
+        issuer_allowlist={"rquant_runtime_code_signer": frozenset({old_record.issuer})},
+        rotation_allowlist={
+            (old_record.issuer, "rquant_runtime_code_signer"): frozenset(
+                {old_record.key_id, new_record.key_id}
+            )
+        },
+    )
+    bundle = _bundle()
+    certificate = sign_runtime_code_trust_certificate(
+        root_signer=root_signer,
+        runtime_signer=new_signer,
+        audience="rquant-formal-runtime",
+        installation_id="lab-installation-a",
+        target_platform="macos-arm64-cpython-313",
+        not_before=NOW - timedelta(minutes=1),
+        expires_at=NOW + timedelta(days=1),
+    )
+    rotated = sign_runtime_code_attestation(
+        signer=new_signer,
+        bundle=bundle,
+        execution_spec=RuntimeCodeExecutionSpec(
+            launcher_path="release/bin/rquant",
+            working_directory="release",
+            import_roots=("release/src",),
+            interpreter_path="release/bin/python",
+            interpreter_sha256=hashlib.sha256(INTERPRETER_BYTES).hexdigest(),
+            python_abi="cpython-313-darwin-arm64",
+        ),
+        audience="rquant-formal-runtime",
+        installation_id="lab-installation-a",
+        target_platform="macos-arm64-cpython-313",
+        provenance_commit="b" * 40,
+        not_before=NOW - timedelta(minutes=1),
+        expires_at=NOW + timedelta(hours=1),
+    )
+    assert (
+        require_runtime_code_attestation(
+            attestation_bytes=canonical_model_json_bytes(rotated),
+            certificate_bytes=canonical_model_json_bytes(certificate),
+            bundle_bytes=bundle.bundle_bytes,
+            root_keyring=root_keys,
+            runtime_keyring=rotated_keys,
+            expected_audience="rquant-formal-runtime",
+            expected_installation_id="lab-installation-a",
+            expected_target_platform="macos-arm64-cpython-313",
+            now=NOW,
+        ).attestation.key_id
+        == "runtime-v2"
+    )
+    with pytest.raises(RuntimeCodeTrustError):
+        require_runtime_code_attestation(
+            attestation_bytes=canonical_model_json_bytes(rotated),
+            certificate_bytes=canonical_model_json_bytes(certificate),
+            bundle_bytes=bundle.bundle_bytes,
+            root_keyring=root_keys,
+            runtime_keyring=first.runtime_keyring,
+            expected_audience="rquant-formal-runtime",
+            expected_installation_id="lab-installation-a",
+            expected_target_platform="macos-arm64-cpython-313",
+            now=NOW,
         )

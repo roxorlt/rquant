@@ -34,6 +34,7 @@ from rquant.job_center_authority import (
 )
 from rquant.lab_artifact_protocol import LabFinalizerAuthorityKey
 from rquant.lab_jobs import LabIntegrityDegradedError
+from rquant.runtime_code_attestation import CodeTrustEvidence
 
 if TYPE_CHECKING:
     from rquant.lab_job_center import ExperimentLifecycleCoordinator
@@ -1266,7 +1267,7 @@ def _verify_deployment_generation(
         raise LabDaemonConfigurationError("deployment generation lock identity changed")
 
 
-def require_lab_runtime_binding(
+def require_legacy_checkout_runtime_binding(
     expected_checkout_root: Path,
     trusted_git_path: Path = Path("/usr/bin/git"),
     *,
@@ -1275,7 +1276,7 @@ def require_lab_runtime_binding(
     deployment_generation_fd: int | None = None,
     startup_deadline_monotonic: float | None = None,
 ) -> str:
-    """Read and verify all live process identities before daemon I/O starts."""
+    """Developer-only checkout binding retained for exploratory migration."""
     binding_deadline = (
         startup_deadline_monotonic
         if startup_deadline_monotonic is not None
@@ -1421,6 +1422,24 @@ def require_lab_runtime_binding(
             lock_fd=int(deployment_generation_fd),
         )
     return verified
+
+
+def require_lab_runtime_binding(
+    capability: object,
+) -> CodeTrustEvidence:
+    """Accept only a verified immutable-generation capability for formal Lab."""
+
+    from rquant.runtime_code_generation import RuntimeCodeGenerationCapability
+
+    if not isinstance(capability, RuntimeCodeGenerationCapability):
+        raise LabDaemonConfigurationError(
+            "formal Lab runtime requires an attested generation capability"
+        )
+    try:
+        capability.require_live()
+    except Exception as exc:
+        raise LabDaemonConfigurationError("formal Lab runtime capability is invalid") from exc
+    return capability.evidence
 
 
 def _require_immutable_lab_runtime_binding(
@@ -1664,8 +1683,33 @@ def _require_runtime_mode(
 
 
 @dataclass(frozen=True)
+class AttestedLabRuntimeGuard:
+    """Recheck one formal generation and expose signed descriptive provenance."""
+
+    capability: object
+    startup_evidence: CodeTrustEvidence
+
+    def verify_evidence(self) -> CodeTrustEvidence:
+        observed = require_lab_runtime_binding(self.capability)
+        if observed != self.startup_evidence:
+            raise LabDaemonConfigurationError("formal Lab runtime evidence drifted")
+        return observed
+
+    def verify(self, *, startup_deadline_monotonic: float | None = None) -> str:
+        if startup_deadline_monotonic is not None and (
+            not math.isfinite(startup_deadline_monotonic)
+            or time.monotonic() >= startup_deadline_monotonic
+        ):
+            raise LabDaemonConfigurationError("formal Lab startup deadline expired")
+        return self.verify_evidence().provenance_commit
+
+    def __call__(self) -> str:
+        return self.verify_evidence().provenance_commit
+
+
+@dataclass(frozen=True)
 class LabRuntimeGuard:
-    """Bind one full startup proof to cheap immutable-authority checks."""
+    """Developer-only checkout guard retained for exploratory migration."""
 
     expected_checkout_root: Path
     startup_sha: str
@@ -1717,7 +1761,7 @@ class LabRuntimeGuard:
                         "deployment_lock_path": self.deployment_lock_path,
                         "deployment_generation_fd": self.deployment_generation_fd,
                     }
-                observed = require_lab_runtime_binding(
+                observed = require_legacy_checkout_runtime_binding(
                     self.expected_checkout_root,
                     self.trusted_git_path,
                     startup_deadline_monotonic=(
