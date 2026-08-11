@@ -5160,10 +5160,14 @@ class TestLabWorkerCli:
         args = build_parser().parse_args(
             [
                 "lab-runtime-prepare",
-                "--expected-checkout-root",
-                _LAB_EXPECTED_ROOT,
-                "--trusted-git-path",
-                _LAB_TRUSTED_GIT,
+                "--runtime-code-config",
+                "/etc/rquant/runtime-code-bootstrap.json",
+                "--runtime-code-trusted-base",
+                "/etc/rquant",
+                "--runtime-code-authority-uid",
+                "0",
+                "--runtime-code-authority-gid",
+                "0",
                 "--runtime-deployment-root",
                 "/private/tmp/rquant-production-runtime",
                 *_LAB_DAEMON_GENERATION_ARGUMENTS,
@@ -5172,6 +5176,9 @@ class TestLabWorkerCli:
 
         assert args.command == "lab-runtime-prepare"
         assert args.runtime_deployment_root == Path("/private/tmp/rquant-production-runtime")
+        assert args.runtime_code_config == Path("/etc/rquant/runtime-code-bootstrap.json")
+        assert not hasattr(args, "expected_checkout_root")
+        assert not hasattr(args, "trusted_git_path")
         assert not hasattr(args, "definition_registry_root")
 
     def test_runtime_prepare_installs_current_job_center_authority(
@@ -5192,6 +5199,7 @@ class TestLabWorkerCli:
         from rquant.runtime_service_entrypoint import RuntimeServiceKind
 
         runtime_root = tmp_path / "runtime"
+        release_root = tmp_path / "generation" / "release"
         calls: list[str] = []
 
         class FakeSqliteAuthority:
@@ -5221,15 +5229,22 @@ class TestLabWorkerCli:
             "_establish_lab_runtime_identity",
             lambda _args: (
                 "1" * 40,
-                object(),
+                SimpleNamespace(
+                    capability=SimpleNamespace(release_root=release_root),
+                ),
                 object(),
                 lambda: "1" * 40,
             ),
         )
+
+        def prepare_layout(*_args: object, **kwargs: object) -> None:
+            assert kwargs["checkout_root"] == release_root
+            calls.append("layout")
+
         monkeypatch.setattr(
             lab_daemon,
             "prepare_lab_runtime_layout",
-            lambda *_args, **_kwargs: calls.append("layout"),
+            prepare_layout,
         )
         monkeypatch.setattr(
             lab_daemon,
@@ -5300,10 +5315,13 @@ class TestLabWorkerCli:
 
         result = cmd_lab_runtime_prepare(
             argparse.Namespace(
-                expected_checkout_root=tmp_path / "checkout",
-                trusted_git_path=Path(_LAB_TRUSTED_GIT),
+                runtime_code_config=Path("/etc/rquant/runtime-code-bootstrap.json"),
+                runtime_code_trusted_base=Path("/etc/rquant"),
+                runtime_code_authority_uid=0,
+                runtime_code_authority_gid=0,
                 runtime_deployment_root=deployment_root,
                 expected_code_sha=None,
+                startup_deadline_monotonic=_LAB_STARTUP_DEADLINE,
             )
         )
 

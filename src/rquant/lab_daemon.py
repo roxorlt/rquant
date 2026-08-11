@@ -1706,6 +1706,11 @@ class AttestedLabRuntimeGuard:
     def __call__(self) -> str:
         return self.verify_evidence().provenance_commit
 
+    def verify_identity(self, identity: object) -> str:
+        if not isinstance(identity, CodeTrustEvidence) or identity != self.startup_evidence:
+            raise LabDaemonConfigurationError("formal Lab runtime identity is invalid")
+        return self.verify_evidence().provenance_commit
+
 
 @dataclass(frozen=True)
 class LabRuntimeGuard:

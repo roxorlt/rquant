@@ -95,6 +95,13 @@ class FormalRuntimeSession:
             raise FormalRuntimeError("formal runtime generation validation failed") from exc
         return self.plan.evidence
 
+    def require_interpreter_descriptor(self) -> int:
+        self.require_live()
+        try:
+            return self._interpreter_lease.fileno()
+        except AuthorityPathSecurityError as exc:
+            raise FormalRuntimeError("formal runtime generation validation failed") from exc
+
     def close(self) -> None:
         if self._closed:
             return
@@ -220,18 +227,34 @@ def bind_formal_runtime(
         raise
 
 
+def _exec_verified_descriptor(
+    descriptor: int,
+    argv: tuple[str, ...],
+    environment: Mapping[str, str],
+) -> object:
+    fexecve = getattr(os, "fexecve", None)
+    if not callable(fexecve):
+        raise FormalRuntimeError("formal descriptor execution is unavailable on this platform")
+    return fexecve(descriptor, argv, dict(environment))
+
+
 def exec_formal_runtime(
     session: FormalRuntimeSession,
     *,
-    executor: Callable[[str, tuple[str, ...], Mapping[str, str]], object] = os.execve,
+    executor: Callable[[int, tuple[str, ...], Mapping[str, str]], object] = (
+        _exec_verified_descriptor
+    ),
 ) -> object:
-    """Recheck all retained identities, then replace the process with target code."""
+    """Consume the session and execute only its retained interpreter descriptor."""
 
-    session.require_live()
-    plan = session.plan
-    os.chdir(plan.working_directory)
-    session.require_live()
-    return executor(str(plan.interpreter), plan.argv, plan.environment)
+    try:
+        session.require_live()
+        plan = session.plan
+        os.chdir(plan.working_directory)
+        descriptor = session.require_interpreter_descriptor()
+        return executor(descriptor, plan.argv, plan.environment)
+    finally:
+        session.close()
 
 
 __all__ = [
@@ -240,6 +263,7 @@ __all__ = [
     "FormalRuntimeLaunchPlan",
     "FormalRuntimeCodeAuthority",
     "FormalRuntimeSession",
+    "_exec_verified_descriptor",
     "bind_formal_runtime",
     "exec_formal_runtime",
 ]

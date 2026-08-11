@@ -122,6 +122,12 @@ class SecureRegularFileLease:
         self.require_unchanged()
         return b"".join(chunks)
 
+    def fileno(self) -> int:
+        """Return the retained descriptor only while its named identity is unchanged."""
+
+        self.require_unchanged()
+        return self._descriptor
+
     def close(self) -> None:
         if self._closed:
             return

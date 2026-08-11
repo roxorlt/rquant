@@ -17,11 +17,13 @@ from rquant.cli import (
     build_parser,
     cmd_lab_finalizer,
     cmd_lab_integrity_audit,
+    cmd_lab_runtime_prepare,
     cmd_lab_scheduler,
     cmd_lab_worker,
 )
 from rquant.lab_daemon import LabDaemonConfigurationError
 from rquant.lab_jobs import LabJobStore
+from rquant.runtime_code_attestation import CodeTrustEvidence
 from tests.highwater_ed25519_support import export_public_keyring, write_private_manifest
 
 EXPECTED_ROOT = "/tmp/rquant-expected"
@@ -32,9 +34,38 @@ STARTUP_DEADLINE = 9_999_999_999.0
 
 @pytest.fixture(autouse=True)
 def _prepared_lab_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
-    from rquant import lab_daemon
+    from rquant import formal_runtime_composition, lab_daemon
+
+    capability = SimpleNamespace(close=lambda: None)
+    evidence = CodeTrustEvidence(
+        generation_id="1" * 64,
+        attestation_sha256="2" * 64,
+        content_root_sha256="3" * 64,
+        promotion_sequence=1,
+        provenance_commit=GENERATION,
+    )
 
     monkeypatch.setattr(lab_daemon, "verify_lab_runtime_prepared", lambda *_a, **_k: {})
+    monkeypatch.setattr(
+        formal_runtime_composition,
+        "open_formal_runtime_capability",
+        lambda **_kwargs: capability,
+    )
+    monkeypatch.setattr(
+        lab_daemon,
+        "require_lab_runtime_binding",
+        lambda value: evidence if value is capability else pytest.fail("wrong capability"),
+    )
+
+
+def _formal_runtime_args() -> dict[str, object]:
+    return {
+        "runtime_code_config": Path("/etc/rquant/runtime-code-bootstrap.json"),
+        "runtime_code_trusted_base": Path("/etc/rquant"),
+        "runtime_code_authority_uid": 0,
+        "runtime_code_authority_gid": 0,
+        "startup_deadline_monotonic": STARTUP_DEADLINE,
+    }
 
 
 class _FakeSqliteAuthority:
@@ -51,10 +82,14 @@ def test_parser_registers_finalizer_and_keeps_legacy_lab_run() -> None:
     finalizer = build_parser().parse_args(
         [
             "lab-finalizer",
-            "--expected-checkout-root",
-            EXPECTED_ROOT,
-            "--trusted-git-path",
-            TRUSTED_GIT,
+            "--runtime-code-config",
+            "/etc/rquant/runtime-code-bootstrap.json",
+            "--runtime-code-trusted-base",
+            "/etc/rquant",
+            "--runtime-code-authority-uid",
+            "0",
+            "--runtime-code-authority-gid",
+            "0",
             "--deployment-generation",
             GENERATION,
             "--deployment-lock-path",
@@ -174,6 +209,220 @@ def test_parser_registers_generation_bound_launchd_install_lifecycle() -> None:
     assert install.no_activate is True
     assert uninstall.command == "lab-launchd-uninstall"
     assert uninstall.no_deactivate is True
+
+
+@pytest.mark.parametrize(
+    ("command", "extra"),
+    (
+        ("lab-scheduler", ("--runtime-deployment-root", "/tmp/runtime-deployment")),
+        ("lab-worker", ()),
+        ("lab-finalizer", ()),
+        ("lab-claim-finalizer", ()),
+        ("lab-runtime-prepare", ("--runtime-deployment-root", "/tmp/runtime-deployment")),
+    ),
+)
+def test_formal_lab_cli_accepts_only_generation_bootstrap_not_legacy_checkout(
+    command: str,
+    extra: tuple[str, ...],
+) -> None:
+    parser = build_parser()
+    common = [
+        command,
+        "--runtime-code-config",
+        "/etc/rquant/runtime-code-bootstrap.json",
+        "--runtime-code-trusted-base",
+        "/etc/rquant",
+        "--runtime-code-authority-uid",
+        "0",
+        "--runtime-code-authority-gid",
+        "0",
+        "--deployment-generation",
+        "1" * 40,
+        "--deployment-lock-path",
+        "/run/rquant/deployment.lock",
+        "--deployment-generation-fd",
+        "17",
+        "--startup-deadline-monotonic",
+        str(time.monotonic() + 60),
+        *extra,
+    ]
+    parsed = parser.parse_args(common)
+    assert parsed.runtime_code_config == Path("/etc/rquant/runtime-code-bootstrap.json")
+    assert not hasattr(parsed, "expected_checkout_root")
+    assert not hasattr(parsed, "trusted_git_path")
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                *common,
+                "--expected-checkout-root",
+                EXPECTED_ROOT,
+                "--trusted-git-path",
+                TRUSTED_GIT,
+            ]
+        )
+
+
+def test_runtime_prepare_rejects_missing_formal_bootstrap_configuration(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(LabDaemonConfigurationError, match="--runtime-code-config"):
+        cmd_lab_runtime_prepare(
+            argparse.Namespace(
+                runtime_deployment_root=tmp_path / "deployment",
+                startup_deadline_monotonic=time.monotonic() + 60,
+            )
+        )
+
+
+def test_real_worker_entry_composes_attested_generation_before_worker_construction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant import formal_runtime_composition, lab_daemon, lab_worker
+    from rquant.config import settings
+    from rquant.runtime_code_attestation import CodeTrustEvidence
+
+    evidence = CodeTrustEvidence(
+        generation_id="1" * 64,
+        attestation_sha256="2" * 64,
+        content_root_sha256="3" * 64,
+        promotion_sequence=4,
+        provenance_commit="5" * 40,
+    )
+    capability = object()
+    opened: list[dict[str, object]] = []
+
+    def open_capability(**values: object) -> object:
+        opened.append(values)
+        return capability
+
+    monkeypatch.setattr(
+        formal_runtime_composition,
+        "open_formal_runtime_capability",
+        open_capability,
+    )
+    monkeypatch.setattr(
+        lab_daemon,
+        "require_lab_runtime_binding",
+        lambda value: evidence if value is capability else pytest.fail("wrong capability"),
+    )
+    monkeypatch.setattr(settings, "lab_worker_id", "worker-a")
+    monkeypatch.setattr(settings, "lab_scheduler_worker_ids", "worker-b")
+    monkeypatch.setattr(
+        lab_worker,
+        "LabWorker",
+        lambda **_kwargs: pytest.fail("worker constructed before allowlist validation"),
+    )
+    args = build_parser().parse_args(
+        [
+            "lab-worker",
+            "--runtime-code-config",
+            "/etc/rquant/runtime-code-bootstrap.json",
+            "--runtime-code-trusted-base",
+            "/etc/rquant",
+            "--runtime-code-authority-uid",
+            "0",
+            "--runtime-code-authority-gid",
+            "0",
+            "--deployment-generation",
+            "5" * 40,
+            "--deployment-lock-path",
+            "/run/rquant/deployment.lock",
+            "--deployment-generation-fd",
+            "17",
+            "--startup-deadline-monotonic",
+            str(time.monotonic() + 60),
+            "--worker-id",
+            "worker-a",
+            "--once",
+        ]
+    )
+
+    with pytest.raises(LabDaemonConfigurationError, match="allowlist"):
+        cmd_lab_worker(args)
+    assert opened == [
+        {
+            "configuration_path": Path("/etc/rquant/runtime-code-bootstrap.json"),
+            "trusted_base": Path("/etc/rquant"),
+            "expected_authority_uid": 0,
+            "expected_authority_gid": 0,
+            "startup_deadline_monotonic": args.startup_deadline_monotonic,
+        }
+    ]
+
+
+def test_real_runtime_prepare_entry_uses_daemon_formal_composition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant import formal_runtime_composition, lab_daemon, runtime_deployment_profile
+
+    evidence = CodeTrustEvidence(
+        generation_id="1" * 64,
+        attestation_sha256="2" * 64,
+        content_root_sha256="3" * 64,
+        promotion_sequence=4,
+        provenance_commit="5" * 40,
+    )
+    capability = SimpleNamespace(
+        close=lambda: None,
+        release_root=tmp_path / "generation" / "release",
+    )
+    opened: list[dict[str, object]] = []
+
+    def open_capability(**values: object) -> object:
+        opened.append(values)
+        return capability
+
+    monkeypatch.setattr(
+        formal_runtime_composition,
+        "open_formal_runtime_capability",
+        open_capability,
+    )
+    monkeypatch.setattr(
+        lab_daemon,
+        "require_lab_runtime_binding",
+        lambda value: evidence if value is capability else pytest.fail("wrong capability"),
+    )
+    monkeypatch.setattr(
+        runtime_deployment_profile,
+        "load_current_runtime_deployment_profile",
+        lambda _root: (_ for _ in ()).throw(RuntimeError("after formal composition")),
+    )
+    args = build_parser().parse_args(
+        [
+            "lab-runtime-prepare",
+            "--runtime-code-config",
+            "/etc/rquant/runtime-code-bootstrap.json",
+            "--runtime-code-trusted-base",
+            "/etc/rquant",
+            "--runtime-code-authority-uid",
+            "0",
+            "--runtime-code-authority-gid",
+            "0",
+            "--runtime-deployment-root",
+            str(tmp_path / "deployment"),
+            "--deployment-generation",
+            "5" * 40,
+            "--deployment-lock-path",
+            "/run/rquant/deployment.lock",
+            "--deployment-generation-fd",
+            "17",
+            "--startup-deadline-monotonic",
+            str(time.monotonic() + 60),
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="after formal composition"):
+        cmd_lab_runtime_prepare(args)
+    assert opened == [
+        {
+            "configuration_path": Path("/etc/rquant/runtime-code-bootstrap.json"),
+            "trusted_base": Path("/etc/rquant"),
+            "expected_authority_uid": 0,
+            "expected_authority_gid": 0,
+            "startup_deadline_monotonic": args.startup_deadline_monotonic,
+        }
+    ]
 
 
 @pytest.mark.parametrize(
@@ -332,40 +581,43 @@ def test_cli_readiness_heartbeat_uses_verified_identity_without_full_verify(
 
 
 def test_cli_establishes_one_full_proof_for_repeated_mutation_guards(
-    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from rquant import lab_daemon
+    from rquant import formal_runtime_composition, lab_daemon
     from rquant.cli import _establish_lab_runtime_identity
 
-    checkout = tmp_path / "checkout"
-    (checkout / "src" / "rquant").mkdir(parents=True)
-    (checkout / "src" / "rquant" / "__init__.py").write_text("", encoding="utf-8")
-    (checkout / "pyproject.toml").write_text("[project]\nname='fixture'\n", encoding="utf-8")
-    (checkout / "uv.lock").write_text("version = 1\n", encoding="utf-8")
+    capability = SimpleNamespace(close=lambda: None)
+    evidence = CodeTrustEvidence(
+        generation_id="1" * 64,
+        attestation_sha256="2" * 64,
+        content_root_sha256="3" * 64,
+        promotion_sequence=1,
+        provenance_commit="d" * 40,
+    )
     full_verify_calls = 0
 
-    def full_verify(_root: Path, _git: Path, **_kwargs: object) -> str:
+    def full_verify(value: object) -> CodeTrustEvidence:
         nonlocal full_verify_calls
+        assert value is capability
         full_verify_calls += 1
-        return "d" * 40
+        return evidence
 
+    monkeypatch.setattr(
+        formal_runtime_composition,
+        "open_formal_runtime_capability",
+        lambda **_kwargs: capability,
+    )
     monkeypatch.setattr(lab_daemon, "require_lab_runtime_binding", full_verify)
     code_sha, runtime_guard, identity, mutation_guard = _establish_lab_runtime_identity(
-        argparse.Namespace(
-            expected_checkout_root=checkout,
-            trusted_git_path=Path(TRUSTED_GIT),
-            startup_deadline_monotonic=STARTUP_DEADLINE,
-        )
+        argparse.Namespace(**_formal_runtime_args())
     )
 
     assert code_sha == "d" * 40
-    assert identity.code_sha == code_sha
+    assert identity == evidence
     for _ in range(100):
         assert mutation_guard() == code_sha
-    assert full_verify_calls == 1
-    assert mutation_guard.func.__self__ is runtime_guard
-    assert mutation_guard.args == (identity,)
+    assert full_verify_calls == 102
+    assert mutation_guard is runtime_guard
 
 
 def test_scheduler_rejects_missing_authority_configuration_before_sqlite(
@@ -374,11 +626,6 @@ def test_scheduler_rejects_missing_authority_configuration_before_sqlite(
     from rquant import job_center_authority, lab_daemon, lab_jobs
     from rquant.config import settings
 
-    monkeypatch.setattr(
-        lab_daemon,
-        "require_lab_runtime_binding",
-        lambda _root, _git, **_kwargs: "1" * 40,
-    )
     monkeypatch.setattr(
         lab_daemon,
         "load_lab_job_center_authority_manifest",
@@ -411,10 +658,8 @@ def test_scheduler_rejects_missing_authority_configuration_before_sqlite(
         cmd_lab_scheduler(
             argparse.Namespace(
                 once=True,
-                expected_checkout_root=EXPECTED_ROOT,
-                trusted_git_path=TRUSTED_GIT,
                 runtime_deployment_root="/tmp/rquant-production-runtime",
-                startup_deadline_monotonic=STARTUP_DEADLINE,
+                **_formal_runtime_args(),
             )
         )
 
@@ -422,16 +667,11 @@ def test_scheduler_rejects_missing_authority_configuration_before_sqlite(
 def test_worker_rejects_unlisted_identity_before_constructing_worker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from rquant import lab_daemon, lab_worker
+    from rquant import lab_worker
     from rquant.config import settings
 
     monkeypatch.setattr(settings, "lab_worker_id", "worker-a")
     monkeypatch.setattr(settings, "lab_scheduler_worker_ids", "worker-b")
-    monkeypatch.setattr(
-        lab_daemon,
-        "require_lab_runtime_binding",
-        lambda _root, _git, **_kwargs: "1" * 40,
-    )
     monkeypatch.setattr(
         lab_worker,
         "LabWorker",
@@ -443,9 +683,7 @@ def test_worker_rejects_unlisted_identity_before_constructing_worker(
             argparse.Namespace(
                 worker_id="worker-a",
                 once=True,
-                expected_checkout_root=EXPECTED_ROOT,
-                trusted_git_path=TRUSTED_GIT,
-                startup_deadline_monotonic=STARTUP_DEADLINE,
+                **_formal_runtime_args(),
             )
         )
 
@@ -537,11 +775,6 @@ def test_finalizer_once_closes_authority_after_success_failure_or_exception(
     monkeypatch.setattr(lab_daemon, "LabDaemonLock", FakeLock)
     monkeypatch.setattr(
         lab_daemon,
-        "require_lab_runtime_binding",
-        lambda _root, _git, **_kwargs: "1" * 40,
-    )
-    monkeypatch.setattr(
-        lab_daemon,
         "prepare_private_sqlite_path",
         lambda path, *, label, create, mutation_guard: (
             calls.append(f"sqlite:{path.name}:{label}:{create}")
@@ -570,9 +803,7 @@ def test_finalizer_once_closes_authority_after_success_failure_or_exception(
 
     args = argparse.Namespace(
         once=True,
-        expected_checkout_root=EXPECTED_ROOT,
-        trusted_git_path=TRUSTED_GIT,
-        startup_deadline_monotonic=STARTUP_DEADLINE,
+        **_formal_runtime_args(),
     )
 
     if expected_result is None:
@@ -587,46 +818,32 @@ def test_finalizer_once_closes_authority_after_success_failure_or_exception(
     assert calls[-4:] == ["run_once", "store_close", "sqlite_close", "unlock"]
 
 
-def test_finalizer_requires_prepared_runtime_before_state_or_sqlite_access(
+def test_finalizer_requires_formal_runtime_before_state_or_sqlite_access(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from rquant import lab_daemon
-    from rquant.config import settings
+    from rquant import formal_runtime_composition, lab_daemon
+    from rquant.formal_runtime_composition import FormalRuntimeCompositionError
 
     monkeypatch.setattr(
-        lab_daemon,
-        "require_lab_runtime_binding",
-        lambda _root, _git, **_kwargs: "1" * 40,
-    )
-    monkeypatch.setattr(
-        lab_daemon,
-        "verify_lab_runtime_prepared",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            LabDaemonConfigurationError("prepared sentinel missing")
+        formal_runtime_composition,
+        "open_formal_runtime_capability",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            FormalRuntimeCompositionError("invalid immutable generation")
         ),
     )
     monkeypatch.setattr(
         lab_daemon,
         "ensure_private_directory",
         lambda *_args, **_kwargs: pytest.fail(
-            "finalizer touched state before prepared sentinel validation"
+            "finalizer touched state before formal runtime validation"
         ),
     )
-    monkeypatch.setattr(settings, "lab_finalizer_authority_key_id", "active")
-    monkeypatch.setattr(settings, "lab_finalizer_authority_key_path", Path("/tmp/key"))
-    monkeypatch.setattr(
-        settings,
-        "lab_finalizer_authority_keyring_path",
-        Path("/tmp/keyring"),
-    )
 
-    with pytest.raises(LabDaemonConfigurationError, match="prepared sentinel"):
+    with pytest.raises(LabDaemonConfigurationError, match="bootstrap"):
         cmd_lab_finalizer(
             argparse.Namespace(
                 once=True,
-                expected_checkout_root=EXPECTED_ROOT,
-                trusted_git_path=TRUSTED_GIT,
-                startup_deadline_monotonic=STARTUP_DEADLINE,
+                **_formal_runtime_args(),
             )
         )
 
@@ -716,11 +933,6 @@ def test_finalizer_forever_installs_both_stop_signals(
     monkeypatch.setattr(lab_daemon, "LabDaemonLock", FakeLock)
     monkeypatch.setattr(
         lab_daemon,
-        "require_lab_runtime_binding",
-        lambda _root, _git, **_kwargs: "1" * 40,
-    )
-    monkeypatch.setattr(
-        lab_daemon,
         "prepare_private_sqlite_path",
         lambda path, *, label, create, mutation_guard: _FakeSqliteAuthority(path, calls),
     )
@@ -748,9 +960,7 @@ def test_finalizer_forever_installs_both_stop_signals(
     result = cmd_lab_finalizer(
         argparse.Namespace(
             once=False,
-            expected_checkout_root=EXPECTED_ROOT,
-            trusted_git_path=TRUSTED_GIT,
-            startup_deadline_monotonic=STARTUP_DEADLINE,
+            **_formal_runtime_args(),
         )
     )
 

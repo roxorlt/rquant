@@ -5,21 +5,18 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
-import shutil
-import subprocess
-import tempfile
 import threading
 from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from functools import lru_cache
-from pathlib import Path
 from types import MappingProxyType
 from typing import Literal, Protocol, Self
 
 from pydantic import BaseModel, Field, model_validator
 
+from rquant.ed25519_verify import ed25519_public_key_der, verify_ed25519_signature
 from rquant.runtime_contracts import (
     AwareUtcDatetime,
     RuntimeContractModel,
@@ -103,14 +100,6 @@ def _domain_payload(*, key_purpose: KeyPurpose, namespace: str, payload: bytes) 
     )
 
 
-def _openssl_binary() -> str:
-    candidates = ("/opt/homebrew/bin/openssl", "/usr/bin/openssl", shutil.which("openssl"))
-    for candidate in candidates:
-        if candidate and Path(candidate).is_file():
-            return candidate
-    raise ValueError("openssl is required for Ed25519 contract verification")
-
-
 def _valid_signature(signature: str) -> bool:
     try:
         return len(base64.b64decode(signature, validate=True)) == _ED25519_SIGNATURE_BYTES
@@ -125,83 +114,26 @@ def _valid_fingerprint(value: str) -> bool:
 @lru_cache(maxsize=256)
 def _validate_public_key(public_key: bytes) -> None:
     try:
-        completed = subprocess.run(
-            (
-                _openssl_binary(),
-                "pkey",
-                "-pubin",
-                "-pubcheck",
-                "-text_pub",
-                "-noout",
-            ),
-            input=public_key,
-            check=False,
-            capture_output=True,
-            timeout=5,
-        )
-    except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+        ed25519_public_key_der(public_key)
+    except ValueError as exc:
         raise ValueError("public key is not a usable Ed25519 key") from exc
-    if completed.returncode != 0 or b"ED25519" not in completed.stdout.upper():
-        raise ValueError("public key is not Ed25519")
 
 
 @lru_cache(maxsize=256)
 def ed25519_public_key_fingerprint(public_key: bytes) -> str:
     _validate_public_key(public_key)
-    try:
-        completed = subprocess.run(
-            (_openssl_binary(), "pkey", "-pubin", "-outform", "DER"),
-            input=public_key,
-            check=False,
-            capture_output=True,
-            timeout=5,
-        )
-    except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
-        raise ValueError("public key fingerprint cannot be derived") from exc
-    if completed.returncode != 0 or not completed.stdout:
-        raise ValueError("public key fingerprint cannot be derived")
-    return hashlib.sha256(completed.stdout).hexdigest()
+    return hashlib.sha256(ed25519_public_key_der(public_key)).hexdigest()
 
 
 def _verify_signature(*, public_key: bytes, payload: bytes, signature: str) -> bool:
     if not _valid_signature(signature):
         return False
     decoded = base64.b64decode(signature, validate=True)
-    try:
-        with tempfile.TemporaryDirectory(prefix="rquant-source-auth-") as directory_name:
-            root = Path(directory_name)
-            root.chmod(0o700)
-            public_path = root / "public.pem"
-            payload_path = root / "payload.bin"
-            signature_path = root / "signature.bin"
-            public_path.write_bytes(public_key)
-            payload_path.write_bytes(payload)
-            signature_path.write_bytes(decoded)
-            for path in (public_path, payload_path, signature_path):
-                path.chmod(0o600)
-            completed = subprocess.run(
-                (
-                    _openssl_binary(),
-                    "pkeyutl",
-                    "-verify",
-                    "-pubin",
-                    "-inkey",
-                    str(public_path),
-                    "-sigfile",
-                    str(signature_path),
-                    "-rawin",
-                    "-in",
-                    str(payload_path),
-                ),
-                check=False,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=5,
-            )
-    except (OSError, subprocess.TimeoutExpired, ValueError):
-        return False
-    return completed.returncode == 0
+    return verify_ed25519_signature(
+        public_key_pem=public_key,
+        message=payload,
+        signature=decoded,
+    )
 
 
 class Ed25519SigningClient(Protocol):

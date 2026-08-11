@@ -2106,11 +2106,11 @@ def test_runtime_binding_rejects_symlinked_checkout_virtualenv(tmp_path: Path) -
         )
 
 
-def test_runtime_binding_rejects_symlinked_venv_before_git_probe(
+def test_legacy_runtime_binding_rejects_symlinked_venv_before_git_probe(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from rquant.lab_daemon import require_lab_runtime_binding
+    from rquant.lab_daemon import require_legacy_checkout_runtime_binding
 
     expected = tmp_path / "expected"
     shared_venv = tmp_path / "shared-venv"
@@ -2123,10 +2123,10 @@ def test_runtime_binding_rejects_symlinked_venv_before_git_probe(
 
     monkeypatch.setattr("rquant.lab_daemon.subprocess.run", reject_probe)
     with pytest.raises(LabDaemonConfigurationError, match="physical virtualenv"):
-        require_lab_runtime_binding(expected)
+        require_legacy_checkout_runtime_binding(expected)
 
 
-def test_runtime_binding_reuses_one_deadline_across_git_probes(
+def test_legacy_runtime_binding_reuses_one_deadline_across_git_probes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2171,7 +2171,7 @@ def test_runtime_binding_reuses_one_deadline_across_git_probes(
     monkeypatch.setattr(manifest_module, "_run_trusted_git", probe)
 
     with pytest.raises(LabDaemonConfigurationError, match="Git probe failed"):
-        daemon_module.require_lab_runtime_binding(
+        daemon_module.require_legacy_checkout_runtime_binding(
             expected,
             startup_deadline_monotonic=deadline,
         )

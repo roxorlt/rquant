@@ -46,8 +46,9 @@ if TYPE_CHECKING:
         DailyPipelineDevelopmentTestReportAuthority,
         DailyPipelineReportAuthorityCapability,
     )
-    from rquant.lab_daemon import LabRuntimeGuard, VerifiedLabRuntimeIdentity
+    from rquant.lab_daemon import AttestedLabRuntimeGuard
     from rquant.lab_worker import LabResourceAuthorityManifest
+    from rquant.runtime_code_attestation import CodeTrustEvidence
     from rquant.runtime_deployment_bundle import RuntimeDeploymentReceipt
     from rquant.runtime_deployment_profile import LabHighWaterRuntimeProfile
     from rquant.runtime_resource_admission import (
@@ -4808,36 +4809,59 @@ def _establish_lab_runtime_identity(
     args: argparse.Namespace,
 ) -> tuple[
     str,
-    LabRuntimeGuard,
-    VerifiedLabRuntimeIdentity,
+    AttestedLabRuntimeGuard,
+    CodeTrustEvidence,
     Callable[[], str],
 ]:
-    from rquant.lab_daemon import LabRuntimeGuard, require_lab_runtime_binding
+    from rquant.formal_runtime_composition import (
+        FormalRuntimeCompositionError,
+        open_formal_runtime_capability,
+    )
+    from rquant.lab_daemon import (
+        AttestedLabRuntimeGuard,
+        LabDaemonConfigurationError,
+        require_lab_runtime_binding,
+    )
 
-    checkout_root = Path(args.expected_checkout_root)
-    trusted_git_path = Path(args.trusted_git_path)
-    generation_binding = _lab_deployment_generation_binding(args)
+    required_bootstrap_options = (
+        ("runtime_code_config", "--runtime-code-config"),
+        ("runtime_code_trusted_base", "--runtime-code-trusted-base"),
+        ("runtime_code_authority_uid", "--runtime-code-authority-uid"),
+        ("runtime_code_authority_gid", "--runtime-code-authority-gid"),
+    )
+    missing = tuple(
+        option
+        for attribute, option in required_bootstrap_options
+        if getattr(args, attribute, None) is None
+    )
+    if missing:
+        raise LabDaemonConfigurationError(
+            "formal Lab runtime bootstrap requires " + ", ".join(missing)
+        )
     deadline_binding = _lab_startup_deadline_binding(args)
-    if generation_binding:
-        code_sha = str(generation_binding["deployment_generation"])
-        runtime_guard = LabRuntimeGuard(
-            checkout_root,
-            code_sha,
-            trusted_git_path,
-            **generation_binding,
+    try:
+        capability = open_formal_runtime_capability(
+            configuration_path=Path(str(args.runtime_code_config)),
+            trusted_base=Path(str(args.runtime_code_trusted_base)),
+            expected_authority_uid=int(args.runtime_code_authority_uid),
+            expected_authority_gid=int(args.runtime_code_authority_gid),
+            startup_deadline_monotonic=deadline_binding["startup_deadline_monotonic"],
         )
-        runtime_identity = runtime_guard.verify_runtime_identity(
-            **deadline_binding,
+    except FormalRuntimeCompositionError as exc:
+        raise LabDaemonConfigurationError("formal Lab runtime bootstrap failed") from exc
+    runtime_identity = require_lab_runtime_binding(capability)
+    runtime_guard = AttestedLabRuntimeGuard(
+        capability=capability,
+        startup_evidence=runtime_identity,
+    )
+    code_sha = runtime_guard.verify(**deadline_binding)
+    deployment_generation = getattr(args, "deployment_generation", None)
+    if deployment_generation is not None and deployment_generation != code_sha:
+        capability.close()
+        raise LabDaemonConfigurationError(
+            "formal Lab deployment generation does not match signed provenance"
         )
-    else:
-        code_sha = require_lab_runtime_binding(
-            checkout_root,
-            trusted_git_path,
-            **deadline_binding,
-        )
-        runtime_guard = LabRuntimeGuard(checkout_root, code_sha, trusted_git_path)
-        runtime_identity = runtime_guard.capture_verified_identity(code_sha)
-    identity_guard = partial(runtime_guard.verify_identity, runtime_identity)
+    identity_guard = runtime_guard
     return code_sha, runtime_guard, runtime_identity, identity_guard
 
 
@@ -4875,12 +4899,13 @@ def cmd_lab_runtime_prepare(args: argparse.Namespace) -> int:
         resolve_current_job_center_authority_binding,
     )
     from rquant.lab_daemon import (
+        LabDaemonConfigurationError,
         prepare_lab_runtime_layout,
         prepare_lab_runtime_sqlite_authority,
     )
     from rquant.lab_jobs import LabJobStore
 
-    code_sha, _runtime_guard, _runtime_identity, runtime_identity_guard = (
+    code_sha, runtime_guard, _runtime_identity, runtime_identity_guard = (
         _establish_lab_runtime_identity(args)
     )
     expected_code_sha = getattr(args, "expected_code_sha", None)
@@ -4918,9 +4943,14 @@ def cmd_lab_runtime_prepare(args: argparse.Namespace) -> int:
         final_artifact_root=settings.lab_final_artifact_dir_resolved,
     )
     directories, files, legacy = _lab_runtime_layout()
+    release_root = getattr(runtime_guard.capability, "release_root", None)
+    if not isinstance(release_root, Path):
+        raise LabDaemonConfigurationError(
+            "formal Lab runtime capability has no immutable release root"
+        )
     prepare_lab_runtime_layout(
         settings.lab_runtime_dir_resolved,
-        checkout_root=Path(args.expected_checkout_root),
+        checkout_root=release_root,
         managed_directories=directories,
         managed_files=files,
         legacy_paths=legacy,
@@ -4995,14 +5025,8 @@ def cmd_lab_launchd_uninstall(args: argparse.Namespace) -> int:
 
 def cmd_lab_scheduler(args: argparse.Namespace) -> int:
     """Run the durable Strategy Lab control-plane scheduler."""
-    trusted_git_path = Path(args.trusted_git_path)
     code_sha, runtime_guard, runtime_identity, runtime_identity_guard = (
         _establish_lab_runtime_identity(args)
-    )
-    _verify_prepared_lab_runtime(
-        Path(args.expected_checkout_root),
-        code_sha,
-        allow_uninitialized_database=True,
     )
     from rquant.config import settings
     from rquant.job_center_authority import resolve_current_job_center_authority_binding
@@ -5064,8 +5088,6 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
             create=False,
         ).emit_permit(holder=holder)
 
-    if settings.lab_trusted_git_path != trusted_git_path:
-        raise LabDaemonConfigurationError("trusted Git CLI path does not match Settings")
     if (
         not settings.lab_finalizer_authority_key_id
         or settings.lab_finalizer_authority_key_path is None
@@ -5129,7 +5151,6 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
             path=settings.lab_jobs_path_resolved,
             mutation_guard=runtime_identity_guard,
         )
-        _verify_prepared_lab_runtime(Path(args.expected_checkout_root), code_sha)
         artifact_store = None
         try:
             artifact_store = LabJobArtifactStore(
@@ -5516,11 +5537,9 @@ def _build_lab_claim_publication_worker_verifier(
 
 def cmd_lab_worker(args: argparse.Namespace) -> int:
     """Run a fenced Strategy Lab shard worker."""
-    trusted_git_path = Path(args.trusted_git_path)
     code_sha, runtime_guard, runtime_identity, runtime_identity_guard = (
         _establish_lab_runtime_identity(args)
     )
-    _verify_prepared_lab_runtime(Path(args.expected_checkout_root), code_sha)
     from rquant.config import settings
     from rquant.lab_claim_finalizer_runtime import FinalizerRolloutPhase, FinalizerRolloutStore
     from rquant.lab_daemon import (
@@ -5538,8 +5557,6 @@ def cmd_lab_worker(args: argparse.Namespace) -> int:
     )
 
     setup_logging()
-    if settings.lab_trusted_git_path != trusted_git_path:
-        raise LabDaemonConfigurationError("trusted Git CLI path does not match Settings")
     rollout = None
     if settings.lab_v2_claim_publication_enabled:
         rollout = FinalizerRolloutStore(
@@ -5672,11 +5689,9 @@ def cmd_lab_worker(args: argparse.Namespace) -> int:
 
 def cmd_lab_finalizer(args: argparse.Namespace) -> int:
     """Finalize ready Strategy Lab jobs without writable SQLite access."""
-    trusted_git_path = Path(args.trusted_git_path)
     code_sha, runtime_guard, runtime_identity, runtime_identity_guard = (
         _establish_lab_runtime_identity(args)
     )
-    _verify_prepared_lab_runtime(Path(args.expected_checkout_root), code_sha)
     from rquant.config import settings
     from rquant.lab_artifact_protocol import LabArtifactCommitSpool
     from rquant.lab_artifacts import LabJobArtifactStore
@@ -5695,8 +5710,6 @@ def cmd_lab_finalizer(args: argparse.Namespace) -> int:
     from rquant.strategy_job_adapters import default_strategy_job_adapter_registry
 
     setup_logging()
-    if settings.lab_trusted_git_path != trusted_git_path:
-        raise LabDaemonConfigurationError("trusted Git CLI path does not match Settings")
     if (
         not settings.lab_finalizer_authority_key_id
         or settings.lab_finalizer_authority_key_path is None
@@ -5827,13 +5840,9 @@ def cmd_lab_claim_finalizer(args: argparse.Namespace) -> int:
     if settings.lab_claim_finalizer_runtime_material_root is None:
         raise LabDaemonConfigurationError("claim finalizer runtime generation is missing")
 
-    trusted_git_path = Path(args.trusted_git_path)
     code_sha, runtime_guard, runtime_identity, runtime_identity_guard = (
         _establish_lab_runtime_identity(args)
     )
-    _verify_prepared_lab_runtime(Path(args.expected_checkout_root), code_sha)
-    if settings.lab_trusted_git_path != trusted_git_path:
-        raise LabDaemonConfigurationError("trusted Git CLI path does not match Settings")
     setup_logging()
     ensure_private_directory(
         settings.lab_job_claim_dir_resolved,
@@ -6195,6 +6204,13 @@ def cmd_panorama_user_list(args: argparse.Namespace) -> int:
         logger.info(f"  {name}")
     logger.info(f"共 {len(users)} 个用户")
     return 0
+
+
+def _add_formal_runtime_bootstrap_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--runtime-code-config", type=Path, required=True)
+    parser.add_argument("--runtime-code-trusted-base", type=Path, required=True)
+    parser.add_argument("--runtime-code-authority-uid", type=int, required=True)
+    parser.add_argument("--runtime-code-authority-gid", type=int, required=True)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -8102,8 +8118,7 @@ def build_parser() -> argparse.ArgumentParser:
         "lab-runtime-prepare",
         help="首次安装时创建并迁移私有 Lab runtime 根目录",
     )
-    lab_runtime_prepare_p.add_argument("--expected-checkout-root", required=True)
-    lab_runtime_prepare_p.add_argument("--trusted-git-path", required=True)
+    _add_formal_runtime_bootstrap_arguments(lab_runtime_prepare_p)
     lab_runtime_prepare_p.add_argument("--runtime-deployment-root", type=Path, required=True)
     lab_runtime_prepare_p.add_argument("--expected-code-sha", type=_parse_commit_sha)
     lab_runtime_prepare_p.add_argument("--deployment-generation")
@@ -8135,16 +8150,7 @@ def build_parser() -> argparse.ArgumentParser:
         "lab-scheduler",
         help="运行 Strategy Lab 持久任务控制面",
     )
-    lab_scheduler_p.add_argument(
-        "--expected-checkout-root",
-        required=True,
-        help="launch contract 固定的绝对 checkout 根路径",
-    )
-    lab_scheduler_p.add_argument(
-        "--trusted-git-path",
-        required=True,
-        help="launch contract 固定的可信绝对 Git 可执行文件",
-    )
+    _add_formal_runtime_bootstrap_arguments(lab_scheduler_p)
     lab_scheduler_p.add_argument("--runtime-deployment-root", type=Path, required=True)
     lab_scheduler_p.add_argument("--deployment-generation", required=True)
     lab_scheduler_p.add_argument("--deployment-lock-path", required=True)
@@ -8167,16 +8173,7 @@ def build_parser() -> argparse.ArgumentParser:
         "lab-worker",
         help="运行 Strategy Lab 后台分片 worker",
     )
-    lab_worker_p.add_argument(
-        "--expected-checkout-root",
-        required=True,
-        help="launch contract 固定的绝对 checkout 根路径",
-    )
-    lab_worker_p.add_argument(
-        "--trusted-git-path",
-        required=True,
-        help="launch contract 固定的可信绝对 Git 可执行文件",
-    )
+    _add_formal_runtime_bootstrap_arguments(lab_worker_p)
     lab_worker_p.add_argument("--deployment-generation", required=True)
     lab_worker_p.add_argument("--deployment-lock-path", required=True)
     lab_worker_p.add_argument("--deployment-generation-fd", required=True, type=int)
@@ -8203,8 +8200,7 @@ def build_parser() -> argparse.ArgumentParser:
         "lab-claim-finalizer",
         help="运行 authority-owned V2 claim publication finalizer",
     )
-    lab_claim_finalizer_p.add_argument("--expected-checkout-root", required=True)
-    lab_claim_finalizer_p.add_argument("--trusted-git-path", required=True)
+    _add_formal_runtime_bootstrap_arguments(lab_claim_finalizer_p)
     lab_claim_finalizer_p.add_argument("--deployment-generation", required=True)
     lab_claim_finalizer_p.add_argument("--deployment-lock-path", required=True)
     lab_claim_finalizer_p.add_argument(
@@ -8295,16 +8291,7 @@ def build_parser() -> argparse.ArgumentParser:
         "lab-finalizer",
         help="只读聚合已完成分片并发布完整结果 commit",
     )
-    lab_finalizer_p.add_argument(
-        "--expected-checkout-root",
-        required=True,
-        help="launch contract 固定的绝对 checkout 根路径",
-    )
-    lab_finalizer_p.add_argument(
-        "--trusted-git-path",
-        required=True,
-        help="launch contract 固定的可信绝对 Git 可执行文件",
-    )
+    _add_formal_runtime_bootstrap_arguments(lab_finalizer_p)
     lab_finalizer_p.add_argument("--deployment-generation", required=True)
     lab_finalizer_p.add_argument("--deployment-lock-path", required=True)
     lab_finalizer_p.add_argument("--deployment-generation-fd", required=True, type=int)

@@ -83,6 +83,106 @@ def test_p0_07_post_verify_replacement_fails_before_target_process(
         session.close()
 
 
+def test_verified_interpreter_fd_cannot_be_hijacked_by_a_final_path_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.formal_runtime import bind_formal_runtime, exec_formal_runtime
+
+    package = build_test_package(tmp_path / "package")
+    trusted_base, runtime_root, _installer = install_test_package(tmp_path, package)
+    capability = open_test_capability(
+        trusted_base=trusted_base,
+        runtime_root=runtime_root,
+        package=package,
+    )
+    session = bind_formal_runtime(
+        capability,
+        daemon_argv=("lab-worker",),
+        environment_source={},
+        expected_python_abi="test-abi",
+    )
+    interpreter = session.plan.interpreter
+    original_identity = interpreter.stat().st_ino
+    captured_fd = -1
+    monkeypatch.setattr(os, "chdir", lambda _path: None)
+
+    def swap_then_execute(
+        descriptor: int,
+        _argv: tuple[str, ...],
+        _environment: object,
+    ) -> bytes:
+        nonlocal captured_fd
+        captured_fd = descriptor
+        interpreter.parent.parent.parent.chmod(0o755)
+        interpreter.parent.parent.chmod(0o755)
+        interpreter.parent.chmod(0o755)
+        replacement = interpreter.with_name("replacement-python")
+        replacement.write_bytes(b"HIJACKED\n")
+        replacement.chmod(0o555)
+        os.replace(replacement, interpreter)
+        assert interpreter.stat().st_ino != original_identity
+        assert os.fstat(descriptor).st_ino == original_identity
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        return os.read(descriptor, 4096)
+
+    assert exec_formal_runtime(session, executor=swap_then_execute) == b"RQUANT-TEST-INTERPRETER\n"
+    with pytest.raises(OSError):
+        os.fstat(captured_fd)
+
+
+def test_verified_interpreter_fd_is_closed_when_executor_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.formal_runtime import bind_formal_runtime, exec_formal_runtime
+    from rquant.runtime_code_generation import RuntimeCodeGenerationError
+
+    package = build_test_package(tmp_path / "package")
+    trusted_base, runtime_root, _installer = install_test_package(tmp_path, package)
+    capability = open_test_capability(
+        trusted_base=trusted_base,
+        runtime_root=runtime_root,
+        package=package,
+    )
+    session = bind_formal_runtime(
+        capability,
+        daemon_argv=("lab-finalizer",),
+        environment_source={},
+        expected_python_abi="test-abi",
+    )
+    captured_fd = -1
+    monkeypatch.setattr(os, "chdir", lambda _path: None)
+
+    def fail(descriptor: int, _argv: tuple[str, ...], _environment: object) -> None:
+        nonlocal captured_fd
+        captured_fd = descriptor
+        raise RuntimeError("exec failed")
+
+    with pytest.raises(RuntimeError, match="exec failed"):
+        exec_formal_runtime(session, executor=fail)
+    with pytest.raises(OSError):
+        os.fstat(captured_fd)
+    with pytest.raises(RuntimeCodeGenerationError, match="closed"):
+        capability.require_live()
+
+
+@pytest.mark.skipif(not hasattr(os, "fexecve"), reason="Linux fexecve exact gate")
+def test_linux_default_executor_uses_the_supplied_descriptor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.formal_runtime import _exec_verified_descriptor
+
+    calls: list[tuple[int, tuple[str, ...], dict[str, str]]] = []
+
+    def capture(descriptor: int, argv: tuple[str, ...], environment: dict[str, str]) -> None:
+        calls.append((descriptor, argv, environment))
+
+    monkeypatch.setattr(os, "fexecve", capture)
+    _exec_verified_descriptor(17, ("python", "-I", "-S", "launcher"), {"SAFE": "1"})
+    assert calls == [(17, ("python", "-I", "-S", "launcher"), {"SAFE": "1"})]
+
+
 def test_formal_runtime_does_not_wrap_unexpected_liveness_errors(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
