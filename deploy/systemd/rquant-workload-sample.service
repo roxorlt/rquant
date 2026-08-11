@@ -1,0 +1,23 @@
+[Unit]
+Description=rQuant append-only workload high-water sampler
+
+[Service]
+Type=oneshot
+Slice=rquant-serving.slice
+User=lighthouse
+Group=lighthouse
+WorkingDirectory=/home/lighthouse/rquant
+StateDirectory=rquant/workload-isolation
+StateDirectoryMode=0750
+ExecStart=/home/lighthouse/rquant/scripts/collect-workload-sample.py
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectControlGroups=true
+ReadWritePaths=/var/lib/rquant/workload-isolation
+StandardOutput=journal
+StandardError=journal
+
+# Candidate-only collector; it is never enabled automatically.
+# Cloud deployment gate: systemd-analyze verify rquant-workload-sample.service

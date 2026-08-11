@@ -1,0 +1,11 @@
+[Unit]
+Description=rQuant candidate workload evidence sampling window
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=5min
+AccuracySec=30s
+Unit=rquant-workload-sample.service
+
+# Candidate-only timer; it must be started explicitly.
+# Cloud deployment gate: systemd-analyze verify rquant-workload-sample.timer

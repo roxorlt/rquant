@@ -1,0 +1,12 @@
+[Unit]
+Description=Run rQuant Shadow daily fan-in orchestrator after daily close (%i)
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 17:15:00
+Persistent=true
+Unit=rquant-runtime-daily-orchestrator@%i.service
+
+[Install]
+WantedBy=timers.target
+
+# Cloud deployment gate: systemd-analyze calendar 'Mon..Fri *-*-* 17:15:00' --iterations 5

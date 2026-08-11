@@ -1,0 +1,476 @@
+#!/usr/bin/python3
+"""Hold cross-plane flock contracts for an entire child-process lifecycle."""
+
+from __future__ import annotations
+
+import argparse
+import ctypes
+import fcntl
+import json
+import os
+import signal
+import stat
+import subprocess
+import sys
+import time
+from collections.abc import Callable
+from contextlib import suppress
+from pathlib import Path
+from typing import Literal
+
+Plane = Literal["research", "maintenance"]
+RESEARCH_REJECTED = 75
+MAINTENANCE_TIMEOUT = 74
+_LOCK_ROOT = Path("/run/rquant-workload-isolation")
+_LOCK_NAMES = (
+    "intent.lock",
+    "research-transition.lock",
+    "research-active.lock",
+    "maintenance-active.lock",
+)
+_ADMISSION_COMMAND = (
+    "/home/lighthouse/rquant/.venv/bin/python",
+    "-m",
+    "rquant.workload_isolation",
+    "research-admission",
+)
+_BOOT_ID = Path("/proc/sys/kernel/random/boot_id")
+
+
+class ArbiterError(RuntimeError):
+    pass
+
+
+def _linux_parent_death_signal() -> Callable[[], None] | None:
+    if not sys.platform.startswith("linux"):
+        return None
+    parent_pid = os.getpid()
+
+    def configure() -> None:
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.prctl(1, signal.SIGKILL) != 0:
+            os._exit(70)
+        if os.getppid() != parent_pid:
+            os.kill(os.getpid(), signal.SIGKILL)
+
+    return configure
+
+
+def _prepare_root(test_root: Path | None) -> tuple[Path, bool]:
+    if test_root is not None:
+        root = test_root / "run/rquant-workload-isolation"
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "research-pids").mkdir(exist_ok=True)
+        (root / "process-identities").mkdir(exist_ok=True)
+        boot_id = root / "boot_id"
+        if not boot_id.exists():
+            boot_id.write_text("test-boot-id\n", encoding="ascii")
+        for name in _LOCK_NAMES:
+            (root / name).touch(exist_ok=True)
+        return root, True
+
+    root = _LOCK_ROOT
+    try:
+        metadata = root.lstat()
+    except OSError as exc:
+        raise ArbiterError(f"fixed workload lock root is unavailable: {exc}") from exc
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_mode & stat.S_IWOTH
+    ):
+        raise ArbiterError("workload lock root must be a root-owned non-world-writable directory")
+    registry = root / "research-pids"
+    try:
+        registry_metadata = registry.lstat()
+    except OSError as exc:
+        raise ArbiterError(f"research registry is unavailable: {exc}") from exc
+    if not stat.S_ISDIR(registry_metadata.st_mode) or registry_metadata.st_uid != 0:
+        raise ArbiterError("research registry must be a root-owned directory")
+    return root, False
+
+
+def _open_lock(root: Path, name: str, *, test_mode: bool) -> int:
+    path = root / name
+    flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise ArbiterError(f"cannot open fixed workload lock {path}: {exc}") from exc
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        os.close(descriptor)
+        raise ArbiterError(f"workload lock is not a single-link regular file: {path}")
+    if not test_mode and metadata.st_uid != 0:
+        os.close(descriptor)
+        raise ArbiterError(f"workload lock is not root-owned: {path}")
+    return descriptor
+
+
+def _lock(descriptor: int, operation: int, *, timeout: float | None = None) -> bool:
+    if timeout is None:
+        try:
+            fcntl.flock(descriptor, operation | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        return True
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            fcntl.flock(descriptor, operation | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(0.02, remaining))
+
+
+def _pid_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _process_identity(
+    root: Path,
+    pid: int,
+    *,
+    test_mode: bool,
+) -> tuple[str, str] | None:
+    if test_mode:
+        if not _pid_exists(pid):
+            return None
+        try:
+            payload = json.loads(
+                (root / "process-identities" / str(pid)).read_text(encoding="ascii")
+            )
+            boot_id = str(payload["boot_id"])
+            starttime = str(payload["starttime_ticks"])
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if int(payload.get("pid", -1)) != pid or not boot_id or not starttime:
+            return None
+        return boot_id, starttime
+
+    try:
+        boot_id = _BOOT_ID.read_text(encoding="ascii").strip()
+        stat_line = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+    except OSError:
+        return None
+    command_end = stat_line.rfind(")")
+    if command_end < 0:
+        return None
+    fields = stat_line[command_end + 2 :].split()
+    if len(fields) <= 19 or not boot_id:
+        return None
+    return boot_id, fields[19]
+
+
+def _create_test_process_identity(root: Path) -> Path:
+    path = root / "process-identities" / str(os.getpid())
+    try:
+        boot_id = (root / "boot_id").read_text(encoding="ascii").strip()
+        payload = {
+            "pid": os.getpid(),
+            "boot_id": boot_id,
+            "starttime_ticks": str(time.monotonic_ns()),
+        }
+        path.write_text(json.dumps(payload, sort_keys=True), encoding="ascii")
+    except OSError as exc:
+        raise ArbiterError(f"cannot create test process identity: {exc}") from exc
+    return path
+
+
+def _load_registry(path: Path) -> dict[str, object] | None:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            return None
+        with os.fdopen(descriptor, "r", encoding="ascii") as stream:
+            descriptor = -1
+            payload = json.load(stream)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    finally:
+        if "descriptor" in locals() and descriptor >= 0:
+            os.close(descriptor)
+    return payload if isinstance(payload, dict) else None
+
+
+def _verified_research_pid(root: Path, path: Path, *, test_mode: bool) -> int | None:
+    if not path.name.isdigit():
+        return None
+    payload = _load_registry(path)
+    if payload is None:
+        return None
+    try:
+        pid = int(payload["pid"])
+        boot_id = str(payload["boot_id"])
+        starttime = str(payload["starttime_ticks"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if (
+        payload.get("schema_version") != 1
+        or pid <= 1
+        or str(pid) != path.name
+        or payload.get("plane") != "research"
+    ):
+        return None
+    if _process_identity(root, pid, test_mode=test_mode) != (boot_id, starttime):
+        return None
+    if test_mode:
+        return pid
+    try:
+        command = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        owner = Path(f"/proc/{pid}").stat().st_uid
+    except OSError:
+        return None
+    if owner != os.geteuid():
+        return None
+    decoded = tuple(part.decode("utf-8", "replace") for part in command if part)
+    if not any(part == "/usr/local/libexec/rquant-workload-arbiter" for part in decoded):
+        return None
+    if "research" not in decoded:
+        return None
+    return pid
+
+
+def _reap_registry_entry(root: Path, path: Path, *, test_mode: bool) -> None:
+    payload = _load_registry(path)
+    pid = -1
+    if payload is not None:
+        with suppress(TypeError, ValueError):
+            pid = int(payload.get("pid", -1))
+    with suppress(FileNotFoundError):
+        path.unlink()
+    if test_mode and pid > 1 and not _pid_exists(pid):
+        with suppress(FileNotFoundError):
+            (root / "process-identities" / str(pid)).unlink()
+
+
+def _register_research(root: Path, *, test_mode: bool) -> Path:
+    path = root / "research-pids" / str(os.getpid())
+    identity = _process_identity(root, os.getpid(), test_mode=test_mode)
+    if identity is None:
+        raise ArbiterError("cannot prove research wrapper process identity")
+    if path.exists():
+        if _verified_research_pid(root, path, test_mode=test_mode) is not None:
+            raise ArbiterError("duplicate live research lifecycle registry")
+        _reap_registry_entry(root, path, test_mode=test_mode)
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(path, flags, 0o600)
+        boot_id, starttime = identity
+        payload = json.dumps(
+            {
+                "schema_version": 1,
+                "pid": os.getpid(),
+                "plane": "research",
+                "boot_id": boot_id,
+                "starttime_ticks": starttime,
+            },
+            sort_keys=True,
+        ).encode("ascii")
+        os.write(descriptor, payload)
+        os.fsync(descriptor)
+        os.close(descriptor)
+    except OSError as exc:
+        raise ArbiterError(f"cannot register research lifecycle: {exc}") from exc
+    return path
+
+
+def _preempt_research(root: Path, *, test_mode: bool) -> None:
+    try:
+        entries = tuple((root / "research-pids").iterdir())
+    except OSError as exc:
+        raise ArbiterError(f"cannot enumerate research lifecycles: {exc}") from exc
+    for entry in entries:
+        pid = _verified_research_pid(root, entry, test_mode=test_mode)
+        if pid is None:
+            _reap_registry_entry(root, entry, test_mode=test_mode)
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            continue
+        except PermissionError as exc:
+            raise ArbiterError(f"cannot preempt research wrapper pid={pid}: {exc}") from exc
+
+
+def _run_child(command: list[str], *, plane: Plane, preempt_grace: float) -> int:
+    environment = os.environ.copy()
+    environment["RQUANT_WORKLOAD_ARBITER_HELD"] = plane
+    child: subprocess.Popen[bytes] | None = None
+    interrupted = False
+    interrupted_at = 0.0
+
+    def forward(signum: int, _frame: object) -> None:
+        nonlocal interrupted, interrupted_at
+        interrupted = True
+        if interrupted_at == 0.0:
+            interrupted_at = time.monotonic()
+        if child is not None and child.poll() is None:
+            with suppress(ProcessLookupError):
+                os.killpg(child.pid, signum)
+
+    previous = {
+        signum: signal.signal(signum, forward)
+        for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+    }
+    try:
+        child = subprocess.Popen(
+            command,
+            env=environment,
+            start_new_session=True,
+            preexec_fn=_linux_parent_death_signal(),
+        )
+        while child.poll() is None:
+            if interrupted and time.monotonic() - interrupted_at >= preempt_grace:
+                with suppress(ProcessLookupError):
+                    os.killpg(child.pid, signal.SIGKILL)
+            time.sleep(0.02)
+        return RESEARCH_REJECTED if interrupted and plane == "research" else int(child.returncode)
+    except OSError as exc:
+        raise ArbiterError(f"cannot execute workload child: {exc}") from exc
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+
+
+def _run_research(
+    root: Path,
+    command: list[str],
+    *,
+    test_mode: bool,
+    skip_admission: bool,
+    preempt_grace: float,
+) -> int:
+    transition = _open_lock(root, "research-transition.lock", test_mode=test_mode)
+    intent = _open_lock(root, "intent.lock", test_mode=test_mode)
+    maintenance = _open_lock(root, "maintenance-active.lock", test_mode=test_mode)
+    research = _open_lock(root, "research-active.lock", test_mode=test_mode)
+    registry: Path | None = None
+    try:
+        if not _lock(transition, fcntl.LOCK_EX, timeout=1.0):
+            return RESEARCH_REJECTED
+        if not _lock(intent, fcntl.LOCK_SH):
+            return RESEARCH_REJECTED
+        if not _lock(maintenance, fcntl.LOCK_EX):
+            return RESEARCH_REJECTED
+        if not _lock(research, fcntl.LOCK_SH):
+            raise ArbiterError("research lifecycle lock transition failed")
+        registry = _register_research(root, test_mode=test_mode)
+        fcntl.flock(maintenance, fcntl.LOCK_UN)
+        fcntl.flock(intent, fcntl.LOCK_UN)
+        fcntl.flock(transition, fcntl.LOCK_UN)
+
+        if not skip_admission:
+            admission_status = _run_child(
+                list(_ADMISSION_COMMAND),
+                plane="research",
+                preempt_grace=preempt_grace,
+            )
+            if admission_status != 0:
+                return RESEARCH_REJECTED
+        return _run_child(command, plane="research", preempt_grace=preempt_grace)
+    finally:
+        if registry is not None:
+            with suppress(FileNotFoundError):
+                registry.unlink()
+        os.close(research)
+        os.close(maintenance)
+        os.close(intent)
+        os.close(transition)
+
+
+def _run_maintenance(
+    root: Path,
+    command: list[str],
+    *,
+    test_mode: bool,
+    timeout: float,
+    preempt_grace: float,
+) -> int:
+    intent = _open_lock(root, "intent.lock", test_mode=test_mode)
+    research = _open_lock(root, "research-active.lock", test_mode=test_mode)
+    maintenance = _open_lock(root, "maintenance-active.lock", test_mode=test_mode)
+    try:
+        if not _lock(intent, fcntl.LOCK_EX, timeout=timeout):
+            return MAINTENANCE_TIMEOUT
+        _preempt_research(root, test_mode=test_mode)
+        if not _lock(research, fcntl.LOCK_EX, timeout=timeout):
+            return MAINTENANCE_TIMEOUT
+        if not _lock(maintenance, fcntl.LOCK_SH, timeout=timeout):
+            raise ArbiterError("maintenance lifecycle lock transition failed")
+        fcntl.flock(research, fcntl.LOCK_UN)
+        fcntl.flock(intent, fcntl.LOCK_UN)
+        return _run_child(command, plane="maintenance", preempt_grace=preempt_grace)
+    finally:
+        os.close(maintenance)
+        os.close(research)
+        os.close(intent)
+
+
+def main() -> int:
+    try:
+        separator = sys.argv.index("--")
+    except ValueError:
+        separator = len(sys.argv)
+    wrapper_arguments = sys.argv[1:separator]
+    command = sys.argv[separator + 1 :]
+    parser = argparse.ArgumentParser()
+    parser.add_argument("plane", choices=("research", "maintenance"))
+    parser.add_argument("--timeout-seconds", type=float, default=90.0)
+    parser.add_argument("--preempt-grace-seconds", type=float, default=5.0)
+    parser.add_argument("--test-root", type=Path)
+    parser.add_argument("--test-skip-admission", action="store_true")
+    args = parser.parse_args(wrapper_arguments)
+    if not command:
+        parser.error("a child command is required after --")
+    if args.timeout_seconds <= 0 or args.preempt_grace_seconds <= 0:
+        parser.error("timeouts must be positive")
+    if args.test_skip_admission and (args.test_root is None or args.plane != "research"):
+        parser.error("--test-skip-admission is limited to test-root research")
+    try:
+        root, test_mode = _prepare_root(args.test_root)
+        test_identity = _create_test_process_identity(root) if test_mode else None
+        try:
+            if args.plane == "research":
+                return _run_research(
+                    root,
+                    command,
+                    test_mode=test_mode,
+                    skip_admission=args.test_skip_admission,
+                    preempt_grace=args.preempt_grace_seconds,
+                )
+            return _run_maintenance(
+                root,
+                command,
+                test_mode=test_mode,
+                timeout=args.timeout_seconds,
+                preempt_grace=args.preempt_grace_seconds,
+            )
+        finally:
+            if test_identity is not None:
+                with suppress(FileNotFoundError):
+                    test_identity.unlink()
+    except ArbiterError as exc:
+        print(f"workload arbiter failed: {exc}", file=sys.stderr)
+        return 70
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

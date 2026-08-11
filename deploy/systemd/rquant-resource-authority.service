@@ -1,0 +1,50 @@
+[Unit]
+Description=rQuant resource journal authority
+Requires=rquant-external-monotonic-root.service
+After=rquant-external-monotonic-root.service
+
+[Service]
+Type=simple
+Slice=system.slice
+User=rquant-resource-authority
+Group=rquant-resource-client
+SupplementaryGroups=rquant-root-client
+WorkingDirectory=/usr/local/libexec/rquant-authority-runtime/current
+EnvironmentFile=/etc/rquant/resource-authority.env
+ExecStart=/usr/local/libexec/rquant-authority-runtime/current/venv/bin/rquant resource-authority-serve --config /etc/rquant/resource-authority.json
+Restart=on-failure
+RestartSec=2s
+TimeoutStartSec=30s
+TimeoutStopSec=15s
+RuntimeDirectory=rquant-resource-authority
+RuntimeDirectoryMode=0750
+StateDirectory=rquant-resource-authority
+StateDirectoryMode=0700
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectProc=invisible
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+Environment=PYTHONDONTWRITEBYTECODE=1
+ReadOnlyPaths=/usr/local/libexec/rquant-authority-runtime /etc/rquant/resource-authority.env /etc/rquant/resource-authority.json /etc/rquant/keys/resource-authority/operation.private.pem /etc/rquant/keys/resource-authority/operation.public.pem /etc/rquant/keys/external-root/root.public.pem
+ReadWritePaths=/run/rquant-resource-authority /var/lib/rquant-resource-authority
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+
+# Cloud gate before installation: systemd-analyze verify rquant-resource-authority.service
