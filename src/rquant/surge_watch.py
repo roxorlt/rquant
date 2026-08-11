@@ -46,7 +46,7 @@ import time as _time_module
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta, timezone
 from datetime import time as dt_time
 from pathlib import Path
 
@@ -55,6 +55,8 @@ import pandas as pd
 from loguru import logger
 from pydantic import BaseModel, Field
 
+from rquant.legacy_shadow_export import LegacySurgeCollectionProof
+from rquant.runtime_contracts import canonical_sha256
 from rquant.state.derive import _classify_board, _detect_st
 
 CST = timezone(timedelta(hours=8))  # A 股墙钟（Asia/Shanghai）
@@ -72,6 +74,7 @@ assert len(_GRID_MINUTES) == CURVE_POINTS  # noqa: S101 - 模块加载期自证�
 
 # 会话时刻边界
 OPEN_TIME = dt_time(9, 30)
+COLLECTION_PROOF_START = dt_time(9, 25)
 MORNING_END = dt_time(11, 30)
 AFTERNOON_START = dt_time(13, 0)
 CLOSE_TIME = dt_time(15, 0)
@@ -88,6 +91,166 @@ _DEFAULT_SURGE_BOARDS = ("gem", "star")
 LIVE_DIR_NAME = "surge_live"
 
 SNAPSHOT_FULL_NAME = "snapshot_full.parquet"
+_MIN_FULL_MARKET_COVERAGE_COUNT = 4_000
+_MIN_MARKET_COVERAGE_BPS = 9_800
+
+
+def _active_session_offset_seconds(observed: datetime) -> int | None:
+    local_time = observed.time()
+    if OPEN_TIME <= local_time <= MORNING_END:
+        return int(
+            (
+                datetime.combine(observed.date(), local_time)
+                - datetime.combine(observed.date(), OPEN_TIME)
+            ).total_seconds()
+        )
+    if AFTERNOON_START <= local_time <= CLOSE_TIME:
+        morning_seconds = int(
+            (
+                datetime.combine(observed.date(), MORNING_END)
+                - datetime.combine(observed.date(), OPEN_TIME)
+            ).total_seconds()
+        )
+        return morning_seconds + int(
+            (
+                datetime.combine(observed.date(), local_time)
+                - datetime.combine(observed.date(), AFTERNOON_START)
+            ).total_seconds()
+        )
+    return None
+
+
+@dataclass
+class SurgeCollectionTracker:
+    trade_date: date
+    started_at: datetime
+    market_universe: frozenset[str]
+    minimum_market_coverage_count: int
+    first_success_at: datetime | None = None
+    last_success_at: datetime | None = None
+    successful_snapshots: int = 0
+    empty_successful_snapshots: int = 0
+    failed_snapshots: int = 0
+    maximum_active_gap_seconds: int = 0
+    maximum_consecutive_misses: int = 0
+    ending_consecutive_misses: int = 0
+    source_routes: set[str] = field(default_factory=set)
+    observed_minimum_market_coverage_count: int | None = None
+    _last_success_offset: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.minimum_market_coverage_count < 1:
+            raise ValueError("surge market universe contract is invalid")
+
+    @property
+    def market_universe_id(self) -> str:
+        return canonical_sha256(
+            {
+                "contract": "legacy-surge-market-universe/v1",
+                "source": "stock-basic-all-a-share",
+                "codes": tuple(sorted(self.market_universe)),
+            }
+        )
+
+    def observe_snapshot(
+        self,
+        observed_at: datetime,
+        snapshot: pd.DataFrame | None,
+    ) -> bool:
+        route = (
+            str(snapshot.attrs.get("route", "none"))
+            if snapshot is not None
+            else "none"
+        )
+        if snapshot is None or snapshot.empty or "ts_code" not in snapshot.columns:
+            self.observe_failure(observed_at, route=route)
+            return False
+        observed_codes = frozenset(snapshot["ts_code"].astype(str))
+        coverage_count = len(observed_codes & self.market_universe)
+        required_ratio_count = (
+            len(self.market_universe) * _MIN_MARKET_COVERAGE_BPS + 9_999
+        ) // 10_000
+        required_count = max(
+            self.minimum_market_coverage_count,
+            required_ratio_count,
+        )
+        if (
+            route != "tushare_rt"
+            or observed_codes - self.market_universe
+            or coverage_count < required_count
+        ):
+            self.observe_failure(observed_at, route=route)
+            return False
+        offset = _active_session_offset_seconds(observed_at)
+        if offset is None or observed_at.date() != self.trade_date:
+            return True
+        if self.first_success_at is None:
+            self.first_success_at = observed_at
+        if self._last_success_offset is not None:
+            self.maximum_active_gap_seconds = max(
+                self.maximum_active_gap_seconds,
+                offset - self._last_success_offset,
+            )
+        self._last_success_offset = offset
+        self.last_success_at = observed_at
+        self.successful_snapshots += 1
+        self.ending_consecutive_misses = 0
+        self.source_routes.add(route)
+        self.observed_minimum_market_coverage_count = (
+            coverage_count
+            if self.observed_minimum_market_coverage_count is None
+            else min(self.observed_minimum_market_coverage_count, coverage_count)
+        )
+        return True
+
+    def observe_failure(self, observed_at: datetime, *, route: str) -> None:
+        if (
+            _active_session_offset_seconds(observed_at) is None
+            or observed_at.date() != self.trade_date
+        ):
+            return
+        self.failed_snapshots += 1
+        self.ending_consecutive_misses += 1
+        self.maximum_consecutive_misses = max(
+            self.maximum_consecutive_misses,
+            self.ending_consecutive_misses,
+        )
+
+    def complete_proof(self) -> LegacySurgeCollectionProof | None:
+        if (
+            self.first_success_at is None
+            or self.last_success_at is None
+            or self.observed_minimum_market_coverage_count is None
+        ):
+            return None
+        try:
+            return LegacySurgeCollectionProof.create(
+                trade_date=self.trade_date,
+                started_at=self.started_at.astimezone(UTC),
+                first_success_at=self.first_success_at.astimezone(UTC),
+                last_success_at=self.last_success_at.astimezone(UTC),
+                successful_snapshots=self.successful_snapshots,
+                nonempty_successful_snapshots=self.successful_snapshots,
+                empty_successful_snapshots=0,
+                failed_snapshots=self.failed_snapshots,
+                maximum_active_gap_seconds=self.maximum_active_gap_seconds,
+                maximum_consecutive_misses=self.maximum_consecutive_misses,
+                ending_consecutive_misses=self.ending_consecutive_misses,
+                source_routes=tuple(sorted(self.source_routes)),
+                market_universe_id=self.market_universe_id,
+                market_universe_expected_count=len(self.market_universe),
+                minimum_market_coverage_count=(
+                    self.observed_minimum_market_coverage_count
+                ),
+                minimum_market_coverage_bps=(
+                    self.observed_minimum_market_coverage_count
+                    * 10_000
+                    // len(self.market_universe)
+                ),
+                source_health=("recovered" if self.failed_snapshots else "healthy"),
+            )
+        except ValueError:
+            return None
 
 
 def _boards_env() -> tuple[str, ...]:
@@ -1428,6 +1591,51 @@ def _backoff_next(streak: int) -> float:
     return ladder[min(streak - 1, len(ladder) - 1)] if streak >= 1 else 60.0
 
 
+def _publish_legacy_shadow_exports(
+    *,
+    trade_date: date,
+    events_path: Path,
+    collection_proof: LegacySurgeCollectionProof,
+) -> tuple[Path, dict[str, Path]]:
+    """Publish closed old surge evidence and read-only isolated runner fan-in."""
+
+    from rquant.config import settings
+    from rquant.legacy_shadow_export import (
+        fan_in_production_isolated_runner_exports,
+        publish_legacy_surge_production_export,
+    )
+
+    surge_export = publish_legacy_surge_production_export(
+        data_dir=settings.data_dir,
+        trade_date=trade_date,
+        events_path=events_path,
+        collection_proof=collection_proof,
+    )
+    isolated_exports = dict(
+        fan_in_production_isolated_runner_exports(
+            data_dir=settings.data_dir,
+            trade_date=trade_date,
+        )
+    )
+    return surge_export, isolated_exports
+
+
+def _recover_legacy_shadow_exports(trade_date: date) -> None:
+    from rquant.config import settings
+    from rquant.legacy_shadow_export import recover_production_legacy_shadow_exports
+
+    recover_production_legacy_shadow_exports(
+        data_dir=settings.data_dir,
+        trade_date=trade_date,
+        source="surge",
+    )
+    recover_production_legacy_shadow_exports(
+        data_dir=settings.data_dir,
+        trade_date=trade_date,
+        source="isolated-runners",
+    )
+
+
 def run_surge_watch(
     *,
     dry_run: bool = False,
@@ -1456,10 +1664,17 @@ def run_surge_watch(
     60/120/300。``force_session`` 忽略时段守卫（盘后验收）；``max_ticks`` 限定循环次数。
     """
     config = config or SurgeConfig()
-    day = now_fn().date()
+    started_at = now_fn()
+    day = started_at.date()
     trading_check = is_trading_day_fn or _load_is_trading_day
     if not force_session and not trading_check(day):
         logger.info(f"{day} 非交易日，surge-watch 退出")
+        return 0
+    if not force_session and started_at.time() >= EXIT_TIME:
+        try:
+            _recover_legacy_shadow_exports(day)
+        except Exception:
+            logger.warning("legacy shadow surge recovery unavailable; shadow will degrade")
         return 0
 
     baseline = baseline or preload_baseline()
@@ -1513,6 +1728,13 @@ def run_surge_watch(
     miss_streak = 0
     degraded_alerted = False
     ticks = 0
+    collection_tracker = SurgeCollectionTracker(
+        trade_date=day,
+        started_at=started_at,
+        market_universe=frozenset(baseline.code_universe),
+        minimum_market_coverage_count=_MIN_FULL_MARKET_COVERAGE_COUNT,
+    )
+    natural_close = False
 
     logger.info(
         f"surge-watch 启动 day={day} 检测板块={config.boards} "
@@ -1527,13 +1749,21 @@ def run_surge_watch(
             if max_ticks is not None and ticks >= max_ticks:
                 break
             if not force_session and now.time() >= EXIT_TIME:
+                natural_close = True
                 break
             if not force_session and _is_lunch(now.time()):
                 sleep_fn(30.0)
                 continue
 
-            full = snapshot_fetcher()
+            try:
+                full = snapshot_fetcher()
+            except Exception as exc:
+                logger.warning(
+                    f"surge 快照 provider 失败（{type(exc).__name__}: {exc}）"
+                )
+                full = None
             route = full.attrs.get("route", "none") if full is not None else "none"
+            collection_tracker.observe_snapshot(now, full)
             if full is None or full.empty:
                 miss_streak += 1
                 logger.warning(f"surge 快照 miss（连续 {miss_streak}），route={route}")
@@ -1553,6 +1783,7 @@ def run_surge_watch(
                 continue
 
             miss_streak = 0
+            assert full is not None
             # 全市场快照每分钟原子落盘（共享 feed：云端/Mac 全景页 poller 读它，与主循环同拍）
             atomic_write_parquet(full, live_dir / SNAPSHOT_FULL_NAME)
             if now.time() >= OPEN_TIME:  # 集合竞价快照不喂脉搏（09:25-09:30 无成交分钟含义）
@@ -1578,6 +1809,22 @@ def run_surge_watch(
     series = watcher.dump_series()
     if not series.empty:
         atomic_write_parquet(series, live_dir / f"{day.isoformat()}-series.parquet")
+    collection_proof = collection_tracker.complete_proof() if natural_close else None
+    if collection_proof is not None:
+        try:
+            surge_export, isolated_exports = _publish_legacy_shadow_exports(
+                trade_date=day,
+                events_path=events_path,
+                collection_proof=collection_proof,
+            )
+            logger.info(
+                f"legacy shadow surge export: {surge_export}; "
+                f"isolated strategies={sorted(isolated_exports)}"
+            )
+        except Exception:
+            logger.exception("legacy shadow close exports unavailable; shadow will degrade")
+    elif natural_close:
+        logger.warning("surge collection coverage incomplete; legacy shadow will degrade")
     logger.info(f"surge-watch 退出 day={day} 累计推送票数={len(watcher.pushed_today)}")
     return 0
 

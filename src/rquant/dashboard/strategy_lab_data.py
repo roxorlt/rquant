@@ -4,14 +4,25 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import date, time, timedelta
+from enum import StrEnum
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import duckdb
 import pandas as pd
 from pydantic import BaseModel, Field
+
+from rquant.config import settings
+from rquant.metadata_catalog import ImmutableDuckDBMetadataCatalog
+from rquant.strategy_replay_metrics import (
+    auction_gap_metric_rows as auction_gap_metric_rows,
+)
+from rquant.strategy_replay_metrics import (
+    growth_board_metric_rows as growth_board_metric_rows,
+)
 
 TUSHARE_STAGE_LABELS: dict[str, str] = {
     "stage_0_integrated": "0 已接入",
@@ -76,6 +87,20 @@ class GrowthBoardAblationSpec(BaseModel):
     require_vwap_strength: bool = True
     use_same_minute_surge: bool = True
     use_accel_surge: bool = True
+
+
+class TushareMetadataState(StrEnum):
+    MISSING = "missing"
+    CORRUPT = "corrupt"
+    EMPTY = "empty"
+    READY = "ready"
+
+
+@dataclass(frozen=True)
+class TushareMetadataResult:
+    state: TushareMetadataState
+    detail: str
+    frame: pd.DataFrame
 
 
 def query_growth_board_candidates(
@@ -610,8 +635,8 @@ def _latest_account_points(conn: duckdb.DuckDBPyConnection) -> float | None:
 def load_tushare_purchase_goods(db_path: Path) -> pd.DataFrame:
     if not db_path.exists():
         return pd.DataFrame()
-    conn = duckdb.connect(str(db_path), read_only=True)
-    try:
+    with _open_tushare_metadata_catalog(db_path) as catalog:
+        conn = catalog.connection
         if not _table_exists(conn, "tushare_purchase_goods"):
             return pd.DataFrame()
         return conn.execute(
@@ -622,15 +647,13 @@ def load_tushare_purchase_goods(db_path: Path) -> pd.DataFrame:
             ORDER BY good_type, good_id
             """
         ).fetchdf()
-    finally:
-        conn.close()
 
 
 def load_tushare_activity_packages(db_path: Path) -> pd.DataFrame:
     if not db_path.exists():
         return pd.DataFrame()
-    conn = duckdb.connect(str(db_path), read_only=True)
-    try:
+    with _open_tushare_metadata_catalog(db_path) as catalog:
+        conn = catalog.connection
         if not _table_exists(conn, "tushare_activity_packages"):
             return pd.DataFrame()
         return conn.execute(
@@ -640,16 +663,16 @@ def load_tushare_activity_packages(db_path: Path) -> pd.DataFrame:
             ORDER BY package_id
             """
         ).fetchdf()
-    finally:
-        conn.close()
 
 
 def load_tushare_interface_catalog(db_path: Path) -> pd.DataFrame:
     if not db_path.exists():
         return pd.DataFrame()
-    conn = duckdb.connect(str(db_path), read_only=True)
-    try:
-        catalog = conn.execute(
+    with _open_tushare_metadata_catalog(db_path) as metadata:
+        conn = metadata.connection
+        if not _table_exists(conn, "tushare_interface_catalog"):
+            return pd.DataFrame()
+        catalog_frame = conn.execute(
             """
             SELECT doc_id, title, api_name, priority, integration_status,
                    integration_stage, update_cadence, target_table_hint,
@@ -661,8 +684,8 @@ def load_tushare_interface_catalog(db_path: Path) -> pd.DataFrame:
             ORDER BY integration_stage, priority, doc_id
             """
         ).fetchdf()
-        if catalog.empty:
-            return catalog
+        if catalog_frame.empty:
+            return catalog_frame
         goods = (
             conn.execute(
                 """
@@ -675,12 +698,84 @@ def load_tushare_interface_catalog(db_path: Path) -> pd.DataFrame:
             else pd.DataFrame()
         )
         return _enrich_catalog_with_purchase_data(
-            catalog,
+            catalog_frame,
             goods,
             current_points=_latest_account_points(conn),
         )
-    finally:
-        conn.close()
+
+
+def _load_tushare_metadata_state(
+    db_path: Path,
+    loader: Callable[[Path], pd.DataFrame],
+    *,
+    label: str,
+) -> TushareMetadataResult:
+    if not db_path.exists():
+        return TushareMetadataResult(
+            state=TushareMetadataState.MISSING,
+            detail=f"{label}元数据目录不存在",
+            frame=pd.DataFrame(),
+        )
+    try:
+        frame = loader(db_path)
+    except (duckdb.Error, OSError, RuntimeError, ValueError) as exc:
+        return TushareMetadataResult(
+            state=TushareMetadataState.CORRUPT,
+            detail=f"{label}元数据损坏或不可验证：{type(exc).__name__}: {exc}",
+            frame=pd.DataFrame(),
+        )
+    if frame.empty:
+        return TushareMetadataResult(
+            state=TushareMetadataState.EMPTY,
+            detail=f"{label}元数据可读，但当前没有记录",
+            frame=frame,
+        )
+    return TushareMetadataResult(
+        state=TushareMetadataState.READY,
+        detail=f"{label}元数据可用，共 {len(frame)} 条",
+        frame=frame,
+    )
+
+
+def load_tushare_interface_catalog_state(db_path: Path) -> TushareMetadataResult:
+    return _load_tushare_metadata_state(
+        db_path,
+        load_tushare_interface_catalog,
+        label="Tushare 接口",
+    )
+
+
+def load_tushare_purchase_goods_state(db_path: Path) -> TushareMetadataResult:
+    return _load_tushare_metadata_state(
+        db_path,
+        load_tushare_purchase_goods,
+        label="Tushare 权限商品",
+    )
+
+
+def load_tushare_activity_packages_state(db_path: Path) -> TushareMetadataResult:
+    return _load_tushare_metadata_state(
+        db_path,
+        load_tushare_activity_packages,
+        label="Tushare 套餐",
+    )
+
+
+def _open_tushare_metadata_catalog(db_path: Path) -> ImmutableDuckDBMetadataCatalog:
+    forbidden = tuple(
+        path
+        for path in (
+            settings.duckdb_path,
+            settings.duckdb_readonly_path,
+            settings.research_db_path_resolved,
+            settings.research_readonly_db_path_resolved,
+        )
+        if path is not None
+    )
+    return ImmutableDuckDBMetadataCatalog.open(
+        db_path.resolve(strict=False),
+        forbidden_paths=forbidden,
+    )
 
 
 def _format_price(value: object) -> str:

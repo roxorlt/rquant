@@ -10,7 +10,7 @@ st.cache_data 控制）：
   只作最后兜底；``allow_sina=False`` 可跳过该级，熔断由 SourcePoller 管）
 - S2 板块资金流：三级路由 东财直连 → 东财·SOCKS 云端出口 → 同花顺即时兜底
   （办公网出口 IP 被东财拉黑、同花顺云端 403，两者互补，见 fetch_sector_fund_flow）
-- L  本地只读副本（dc_board / dc_board_member / kpl_concept_member /
+- L  独立 serving generation（dc_board / dc_board_member / kpl_concept_member /
   screen_result / pool2_watch）：300s
 
 东财全部请求（clist 快照/资金流 + trends2 分时）走 ``_em_session()``：每次全新
@@ -18,7 +18,8 @@ Session + trust_env=False + 桌面 UA/Referer + Connection:close。2026-07-06 �
 事故：东财风控钉住长驻进程的连接状态（同进程连续 RST、新进程三路秒通），必须
 强制每次新 TCP/TLS 且不吸系统代理环境。
 
-DuckDB 只走 ``open_readonly_store()``（副本优先），本模块绝不写主库。
+本模块只读 ``ServingReader`` 的不可变 generation，缺表或损坏时返回空态，
+绝不连接或回退生产主库。
 """
 
 from __future__ import annotations
@@ -26,9 +27,11 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Protocol
 
 import numpy as np
 import pandas as pd
@@ -38,13 +41,153 @@ from pydantic import BaseModel
 if TYPE_CHECKING:
     import requests
 
+from rquant.dashboard.runtime_console_data import (
+    ServingFrameResult,
+    ServingFrameState,
+    query_acquired_serving_frame,
+    require_serving_projections,
+)
 from rquant.limit_up_pool import to_ts_code
+from rquant.serving_publisher import ServingReader
 from rquant.state.derive import _classify_board, _detect_st, _limit_pct, _round_half_up
 from rquant.storage.duckdb import DuckDBStore, open_readonly_store
 
 _CST = timezone(timedelta(hours=8))  # A 股墙钟（当日 events 文件按此取「今日」）
 
 PRICE_TOL = 0.01
+
+
+class _ReadableStore(Protocol):
+    _conn: Any
+
+    def close(self) -> None: ...
+
+    def query_pool2_active(self) -> pd.DataFrame: ...
+
+    def serving_health(self) -> ServingFrameResult | None: ...
+
+
+class _ServingStore:
+    def __init__(self, required_projections: tuple[str, ...] = ()) -> None:
+        root = os.environ.get("RQUANT_SERVING_ROOT", "data/serving")
+        self._lease = ServingReader(root).acquire_generation()
+        self._conn = self._lease.connection
+        self.generation_id = self._lease.manifest.generation_id
+        self._query_results: list[ServingFrameResult] = []
+        self._pending_projections: list[str] = []
+        try:
+            self.require_projections(required_projections)
+        except Exception:
+            self._lease.close()
+            raise
+
+    def close(self) -> None:
+        self._lease.close()
+
+    def query_pool2_active(self) -> pd.DataFrame:
+        return self.query_frame(
+            "SELECT * FROM pool2_watch WHERE status = 'active' ORDER BY entry_date",
+            max_rows=2_000,
+            max_result_bytes=512 * 1024,
+        )
+
+    def require_projections(self, names: tuple[str, ...]) -> None:
+        require_serving_projections(self._conn, names)
+        for name in names:
+            if name not in self._pending_projections:
+                self._pending_projections.append(name)
+
+    def serving_health(self) -> ServingFrameResult | None:
+        if not self._query_results:
+            return None
+        severity = {
+            ServingFrameState.READY: 0,
+            ServingFrameState.STALE: 1,
+            ServingFrameState.DEGRADED: 2,
+            ServingFrameState.UNAVAILABLE: 3,
+        }
+        return max(self._query_results, key=lambda item: severity[item.state])
+
+    def query_frame(
+        self,
+        sql: str,
+        parameters: tuple[object, ...] | list[object] = (),
+        *,
+        max_rows: int,
+        max_result_bytes: int,
+    ) -> pd.DataFrame:
+        required_projections = tuple(self._pending_projections)
+        self._pending_projections.clear()
+        result = query_acquired_serving_frame(
+            self._lease,
+            sql,
+            parameters,
+            max_rows=max_rows,
+            max_result_bytes=max_result_bytes,
+            max_query_seconds=2.0,
+            required_projections=required_projections,
+        )
+        self._query_results.append(result)
+        if result.state is ServingFrameState.UNAVAILABLE:
+            raise RuntimeError(result.detail)
+        frame = result.dataframe()
+        assert isinstance(frame, pd.DataFrame)
+        return frame
+
+
+def _open_serving_store(required_projections: tuple[str, ...] = ()) -> _ReadableStore:
+    return _ServingStore(required_projections)
+
+
+@contextmanager
+def open_panorama_serving_generation() -> Iterator[_ReadableStore]:
+    """Lease one immutable serving generation for a complete page render."""
+
+    store = _ServingStore()
+    try:
+        yield store
+    finally:
+        store.close()
+
+
+def _require_projection(store: _ReadableStore, table_name: str) -> None:
+    if isinstance(store, _ServingStore):
+        store.require_projections((table_name,))
+
+
+def _bind_serving_generation(frame: pd.DataFrame, store: _ReadableStore) -> pd.DataFrame:
+    generation_id = getattr(store, "generation_id", None)
+    if generation_id is not None:
+        frame.attrs["serving_generation_id"] = generation_id
+    return frame
+
+
+def _read_frame(
+    store: _ReadableStore,
+    sql: str,
+    parameters: tuple[object, ...] | list[object] = (),
+    *,
+    max_rows: int,
+    max_result_bytes: int,
+) -> pd.DataFrame:
+    if isinstance(store, _ServingStore):
+        return store.query_frame(
+            sql,
+            parameters,
+            max_rows=max_rows,
+            max_result_bytes=max_result_bytes,
+        )
+    # Explicitly injected stores are retained for isolated legacy fixtures only.
+    connection = store._conn
+    return connection.execute(sql, parameters).fetchdf()
+
+
+def _serving_unavailable(error: Exception, columns: list[str] | None = None) -> pd.DataFrame:
+    frame = pd.DataFrame(columns=columns)
+    frame.attrs["serving_state"] = "unavailable"
+    frame.attrs["serving_detail"] = f"{type(error).__name__}: {error}"
+    return frame
+
 
 # sina 快照中文列 → 标准列。缺可选列时补 NaN，缺必需列时整轮返回空。
 _SPOT_COLUMN_MAP: dict[str, str] = {
@@ -80,8 +223,15 @@ _DEFAULT_SOCKS_PROXY = "socks5h://127.0.0.1:1086"
 _EM_SPOT_FS = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048"
 _EM_SPOT_FIELDS = "f12,f14,f2,f17,f15,f16,f18,f3,f5,f6"
 _EM_SPOT_FIELD_MAP: dict[str, str] = {
-    "f14": "name", "f2": "price", "f17": "open", "f15": "high", "f16": "low",
-    "f18": "pre_close", "f3": "pct_chg", "f5": "volume", "f6": "amount",
+    "f14": "name",
+    "f2": "price",
+    "f17": "open",
+    "f15": "high",
+    "f16": "low",
+    "f18": "pre_close",
+    "f3": "pct_chg",
+    "f5": "volume",
+    "f6": "amount",
 }
 _EM_SPOT_PAGE_SIZE = 1000  # 先请求 1000，服务端可能钳制单页行数，按 total 累积翻页
 _EM_SPOT_MAX_PAGES = 80  # 全市场 ~5700 只，即便被钳到 100/页也 60 页内取完
@@ -107,8 +257,7 @@ BOARD_SYSTEMS = ("东财行业", "东财概念", "开盘啦题材")
 _SYSTEM_IDX_TYPE: dict[str, str] = {"东财行业": "行业板块", "东财概念": "概念板块"}
 _KPL_SYSTEM = "开盘啦题材"
 
-# fetch_market_snapshot / fetch_sector_fund_flow / fetch_intraday_trend 的
-# df.attrs["route"] 取值 → UI 展示名
+# Legacy fetchers and immutable serving loaders expose their route through attrs.
 ROUTE_LABELS: dict[str, str] = {
     "em_direct": "东财直连",
     "em_socks": "东财·云端出口",
@@ -117,6 +266,7 @@ ROUTE_LABELS: dict[str, str] = {
     "cloud_feed": "云端feed",
     "drop_stale": "重启恢复·陈旧",
     "cloud_feed_stale": "收盘快照·陈旧",
+    "serving": "Serving 快照",
     "none": "不可用",
 }
 
@@ -204,8 +354,14 @@ def _em_spot_fetch_rows(proxies: dict[str, str] | None, timeout: float) -> list[
     with _em_session() as session:
         for pn in range(1, _EM_SPOT_MAX_PAGES + 1):
             params = {
-                "pn": pn, "pz": _EM_SPOT_PAGE_SIZE, "po": 1, "np": 1,
-                "fltt": 2, "invt": 2, "fid": "f6", "fs": _EM_SPOT_FS,
+                "pn": pn,
+                "pz": _EM_SPOT_PAGE_SIZE,
+                "po": 1,
+                "np": 1,
+                "fltt": 2,
+                "invt": 2,
+                "fid": "f6",
+                "fs": _EM_SPOT_FS,
                 "fields": _EM_SPOT_FIELDS,
             }
             resp = session.get(_EM_CLIST_URL, params=params, timeout=timeout, proxies=proxies)
@@ -366,9 +522,7 @@ def compute_market_pulse(snapshot: pd.DataFrame, price_tol: float = PRICE_TOL) -
 # ── S2 板块资金流（三级路由：东财直连 → 东财·SOCKS 出口 → 同花顺兜底） ─────────
 
 
-def _em_fetch_rows(
-    sector_type: str, proxies: dict[str, str] | None, timeout: float
-) -> list[dict]:
+def _em_fetch_rows(sector_type: str, proxies: dict[str, str] | None, timeout: float) -> list[dict]:
     """东财 push2 clist 分页拉取，返回 diff 行列表（fid=f62 主力净流入降序）。"""
     fs = _EM_FS.get(sector_type)
     if fs is None:
@@ -377,8 +531,15 @@ def _em_fetch_rows(
     with _em_session() as session:
         for pn in range(1, _EM_MAX_PAGES + 1):
             params = {
-                "pn": pn, "pz": _EM_PAGE_SIZE, "po": 1, "np": 1,
-                "fltt": 2, "invt": 2, "fid": "f62", "fs": fs, "fields": _EM_FIELDS,
+                "pn": pn,
+                "pz": _EM_PAGE_SIZE,
+                "po": 1,
+                "np": 1,
+                "fltt": 2,
+                "invt": 2,
+                "fid": "f62",
+                "fs": fs,
+                "fields": _EM_FIELDS,
             }
             resp = session.get(_EM_CLIST_URL, params=params, timeout=timeout, proxies=proxies)
             resp.raise_for_status()
@@ -504,7 +665,7 @@ def fetch_sector_fund_flow(sector_type: str = "行业资金流") -> pd.DataFrame
 # ── L2 东财板块成分（dc_board / dc_board_member，只读副本） ────────────────────
 
 
-def load_board_members(store: DuckDBStore | None = None) -> pd.DataFrame:
+def load_board_members(store: _ReadableStore | None = None) -> pd.DataFrame:
     """读板块成分映射（行业板块 + 概念板块，地域板块噪音大不取）。
 
     返回列：board_code, board_name, idx_type, con_code。
@@ -514,53 +675,64 @@ def load_board_members(store: DuckDBStore | None = None) -> pd.DataFrame:
         return _fake_board_members()
     owns = store is None
     try:
-        store = store or open_readonly_store(required_tables=("dc_board", "dc_board_member"))
+        store = store or _open_serving_store(("dc_board", "dc_board_member"))
     except Exception as e:
         logger.warning(f"板块成分只读库打开失败: {type(e).__name__}: {e}")
-        return pd.DataFrame()
+        return _serving_unavailable(e)
     try:
-        return store._conn.execute(
+        _require_projection(store, "dc_board")
+        _require_projection(store, "dc_board_member")
+        frame = _read_frame(
+            store,
             """
             SELECT m.board_code, b.name AS board_name, b.idx_type, m.con_code
             FROM dc_board_member m
             JOIN dc_board b ON m.board_code = b.ts_code
             WHERE b.idx_type IN ('行业板块', '概念板块')
-            """
-        ).fetchdf()
+            """,
+            max_rows=50_000,
+            max_result_bytes=5 * 1024 * 1024,
+        )
+        return _bind_serving_generation(frame, store)
     except Exception as e:
         logger.warning(f"板块成分查询失败: {type(e).__name__}: {e}")
-        return pd.DataFrame()
+        return _serving_unavailable(e)
     finally:
         if owns:
             store.close()
 
 
-def industry_fallback_members(store: DuckDBStore | None = None) -> pd.DataFrame:
+def industry_fallback_members(store: _ReadableStore | None = None) -> pd.DataFrame:
     """stock_basic.industry 粗分兜底（dc 成分表不可用时），列结构对齐 load_board_members。"""
     owns = store is None
     try:
-        store = store or open_readonly_store(required_tables=("stock_basic",))
+        store = store or _open_serving_store(("stock_basic",))
     except Exception as e:
         logger.warning(f"行业兜底只读库打开失败: {type(e).__name__}: {e}")
-        return pd.DataFrame()
+        return _serving_unavailable(e)
     try:
-        return store._conn.execute(
+        _require_projection(store, "stock_basic")
+        frame = _read_frame(
+            store,
             """
             SELECT industry AS board_code, industry AS board_name,
                    '行业板块' AS idx_type, ts_code AS con_code
             FROM stock_basic
             WHERE industry IS NOT NULL AND industry != ''
-            """
-        ).fetchdf()
+            """,
+            max_rows=8_000,
+            max_result_bytes=1024 * 1024,
+        )
+        return _bind_serving_generation(frame, store)
     except Exception as e:
         logger.warning(f"行业兜底查询失败: {type(e).__name__}: {e}")
-        return pd.DataFrame()
+        return _serving_unavailable(e)
     finally:
         if owns:
             store.close()
 
 
-def load_kpl_concept_members(store: DuckDBStore | None = None) -> pd.DataFrame:
+def load_kpl_concept_members(store: _ReadableStore | None = None) -> pd.DataFrame:
     """读开盘啦题材成分（kpl_concept_member 快照，打板语境粒度）。
 
     返回列：board_code, board_name, con_code（与 load_board_members 对齐，
@@ -571,17 +743,22 @@ def load_kpl_concept_members(store: DuckDBStore | None = None) -> pd.DataFrame:
         return _fake_kpl_members()
     owns = store is None
     try:
-        store = store or open_readonly_store(required_tables=("kpl_concept_member",))
+        store = store or _open_serving_store(("kpl_concept_member",))
     except Exception as e:
         logger.warning(f"开盘啦题材成分只读库打开失败: {type(e).__name__}: {e}")
-        return pd.DataFrame()
+        return _serving_unavailable(e)
     try:
-        return store._conn.execute(
-            "SELECT board_code, board_name, con_code FROM kpl_concept_member"
-        ).fetchdf()
+        _require_projection(store, "kpl_concept_member")
+        frame = _read_frame(
+            store,
+            "SELECT board_code, board_name, con_code FROM kpl_concept_member",
+            max_rows=50_000,
+            max_result_bytes=5 * 1024 * 1024,
+        )
+        return _bind_serving_generation(frame, store)
     except Exception as e:
         logger.warning(f"开盘啦题材成分查询失败: {type(e).__name__}: {e}")
-        return pd.DataFrame()
+        return _serving_unavailable(e)
     finally:
         if owns:
             store.close()
@@ -703,19 +880,25 @@ def aggregate_board_limit_ups(
     agg = agg[agg["limit_up_count"] > 0].copy()
     if agg.empty:
         return pd.DataFrame()
-    agg["limit_up_ratio_pct"] = (
-        agg["limit_up_count"] / agg["stock_count"] * 100
-    ).round(1)
-    return agg.sort_values(
-        ["limit_up_count", "limit_up_ratio_pct"], ascending=False
-    ).reset_index(drop=True)
+    agg["limit_up_ratio_pct"] = (agg["limit_up_count"] / agg["stock_count"] * 100).round(1)
+    return agg.sort_values(["limit_up_count", "limit_up_ratio_pct"], ascending=False).reset_index(
+        drop=True
+    )
 
 
 # 合并总表输出列（顺序 pinned，UI/测试按此契约取列）
 _OVERVIEW_COLUMNS = [
-    "board_code", "board_name", "amount", "main_net_amount", "main_net_rate",
-    "pct_chg_median", "limit_up_count", "broken_count", "stock_count",
-    "limit_up_ratio_pct", "leading_stock",
+    "board_code",
+    "board_name",
+    "amount",
+    "main_net_amount",
+    "main_net_rate",
+    "pct_chg_median",
+    "limit_up_count",
+    "broken_count",
+    "stock_count",
+    "limit_up_ratio_pct",
+    "leading_stock",
 ]
 _OVERVIEW_FLOW_COLUMNS = ["main_net_amount", "main_net_rate", "leading_stock"]
 
@@ -802,7 +985,7 @@ def _join_board_flow(agg: pd.DataFrame, flow: pd.DataFrame, is_kpl: bool) -> pd.
     return agg
 
 
-def load_pool_flags(store: DuckDBStore | None = None) -> dict[str, str]:
+def load_pool_flags(store: _ReadableStore | None = None) -> dict[str, str]:
     """池内标记：{ts_code: 'pool1:预设名' / 'pool2' / 两者拼接}。
 
     pool1 = screen_result 最新 trade_date 的入选票；pool2 = pool2_watch active。
@@ -812,18 +995,23 @@ def load_pool_flags(store: DuckDBStore | None = None) -> dict[str, str]:
         return _fake_pool_flags()
     owns = store is None
     try:
-        store = store or open_readonly_store(required_tables=("screen_result", "pool2_watch"))
+        store = store or _open_serving_store(("screen_result", "pool2_watch"))
     except Exception as e:
         logger.warning(f"池内标记只读库打开失败: {type(e).__name__}: {e}")
         return {}
     flags: dict[str, list[str]] = {}
     try:
-        pool1 = store._conn.execute(
+        _require_projection(store, "screen_result")
+        _require_projection(store, "pool2_watch")
+        pool1 = _read_frame(
+            store,
             """
             SELECT ts_code, preset_name FROM screen_result
             WHERE trade_date = (SELECT MAX(trade_date) FROM screen_result)
-            """
-        ).fetchdf()
+            """,
+            max_rows=20_000,
+            max_result_bytes=2 * 1024 * 1024,
+        )
         for _, row in pool1.iterrows():
             flags.setdefault(str(row["ts_code"]), []).append(f"pool1:{row['preset_name']}")
         pool2 = store.query_pool2_active()
@@ -873,15 +1061,22 @@ def board_constituents(
     df["pools"] = df["ts_code"].map(flags).fillna("")
     df = add_strength_score(df, liquidity)
     cols = [
-        "ts_code", "name", "price", "pct_chg", "amount",
-        "strength", "turnover_pct", "rel_volume_5d",
-        "is_limit_up", "pools",
+        "ts_code",
+        "name",
+        "price",
+        "pct_chg",
+        "amount",
+        "strength",
+        "turnover_pct",
+        "rel_volume_5d",
+        "is_limit_up",
+        "pools",
     ]
     cols = [c for c in cols if c in df.columns]
     return df[cols].sort_values("strength", ascending=False).reset_index(drop=True)
 
 
-def load_liquidity_baseline(store: DuckDBStore | None = None) -> pd.DataFrame:
+def load_liquidity_baseline(store: _ReadableStore | None = None) -> pd.DataFrame:
     """流通市值 + 5 日均成交额基准（板块内强度分的分母）。
 
     circ_mv 取 daily_basic 最新交易日（单位万元）；avg_amount_5d 取 daily_bar
@@ -892,42 +1087,124 @@ def load_liquidity_baseline(store: DuckDBStore | None = None) -> pd.DataFrame:
         return _fake_liquidity_baseline()
     owns = store is None
     try:
-        store = store or open_readonly_store(required_tables=("daily_basic", "daily_bar"))
+        store = store or _open_serving_store(("market_liquidity",))
     except Exception as e:
         logger.warning(f"流动性基准只读库打开失败: {type(e).__name__}: {e}")
-        return pd.DataFrame()
+        return _serving_unavailable(e)
     try:
-        return store._conn.execute(
+        _require_projection(store, "market_liquidity")
+        frame = _read_frame(
+            store,
             """
-            WITH latest AS (
-              SELECT ts_code, circ_mv FROM daily_basic
-              WHERE trade_date = (SELECT MAX(trade_date) FROM daily_basic)
-            ),
-            recent AS (
-              SELECT ts_code, AVG(amount) * 1000 AS avg_amount_5d
-              FROM (
-                SELECT ts_code, amount,
-                       ROW_NUMBER() OVER (
-                         PARTITION BY ts_code ORDER BY trade_date DESC
-                       ) AS rn
-                FROM daily_bar
-              ) WHERE rn <= 5 GROUP BY ts_code
-            )
-            SELECT latest.ts_code, latest.circ_mv, recent.avg_amount_5d
-            FROM latest LEFT JOIN recent USING (ts_code)
-            """
-        ).fetchdf()
+            SELECT ts_code, circ_mv, avg_amount_5d
+            FROM market_liquidity
+            ORDER BY ts_code
+            """,
+            max_rows=8_000,
+            max_result_bytes=1024 * 1024,
+        )
+        return _bind_serving_generation(frame, store)
     except Exception as e:
         logger.warning(f"流动性基准查询失败: {type(e).__name__}: {e}")
-        return pd.DataFrame()
+        return _serving_unavailable(e)
     finally:
         if owns:
             store.close()
 
 
-def add_strength_score(
-    df: pd.DataFrame, liquidity: pd.DataFrame | None = None
+def load_market_snapshot_projection(store: _ReadableStore | None = None) -> pd.DataFrame:
+    """Read the latest bounded market snapshot from one serving generation."""
+
+    owns = store is None
+    try:
+        store = store or _open_serving_store(("market_snapshot",))
+    except Exception as error:
+        logger.warning(f"市场快照 serving 打开失败: {type(error).__name__}: {error}")
+        return _serving_unavailable(error)
+    try:
+        _require_projection(store, "market_snapshot")
+        frame = _read_frame(
+            store,
+            """
+            SELECT as_of, ts_code, name, price, open, high, low, pre_close,
+                   pct_chg, volume, amount
+            FROM market_snapshot
+            WHERE as_of = (SELECT MAX(as_of) FROM market_snapshot)
+            ORDER BY ts_code
+            LIMIT 8000
+            """,
+            max_rows=8_000,
+            max_result_bytes=3 * 1024 * 1024,
+        )
+        as_of = frame["as_of"].iloc[0] if not frame.empty else None
+        frame = frame.drop(columns=["as_of"])
+        frame.attrs["as_of"] = as_of
+        frame.attrs["route"] = "serving"
+        return _bind_serving_generation(frame, store)
+    except Exception as error:
+        logger.warning(f"市场快照 serving 查询失败: {type(error).__name__}: {error}")
+        return _serving_unavailable(error)
+    finally:
+        if owns:
+            store.close()
+
+
+def load_market_overview_projection(
+    system: str | None = None,
+    store: _ReadableStore | None = None,
 ) -> pd.DataFrame:
+    """Read the latest bounded board overview from one serving generation."""
+
+    owns = store is None
+    try:
+        store = store or _open_serving_store(("market_overview",))
+    except Exception as error:
+        logger.warning(f"市场总览 serving 打开失败: {type(error).__name__}: {error}")
+        return _serving_unavailable(error)
+    try:
+        _require_projection(store, "market_overview")
+        if system is None:
+            frame = _read_frame(
+                store,
+                """
+                SELECT *
+                FROM market_overview
+                WHERE as_of = (SELECT MAX(as_of) FROM market_overview)
+                ORDER BY system, amount DESC, board_code
+                LIMIT 3000
+                """,
+                max_rows=3_000,
+                max_result_bytes=1024 * 1024,
+            )
+        else:
+            frame = _read_frame(
+                store,
+                """
+                SELECT *
+                FROM market_overview
+                WHERE as_of = (SELECT MAX(as_of) FROM market_overview)
+                  AND system = ?
+                ORDER BY amount DESC, board_code
+                LIMIT 3000
+                """,
+                [system],
+                max_rows=3_000,
+                max_result_bytes=1024 * 1024,
+            )
+        as_of = frame["as_of"].iloc[0] if not frame.empty else None
+        frame = frame.drop(columns=["as_of"])
+        frame.attrs["as_of"] = as_of
+        frame.attrs["route"] = "serving"
+        return _bind_serving_generation(frame, store)
+    except Exception as error:
+        logger.warning(f"市场总览 serving 查询失败: {type(error).__name__}: {error}")
+        return _serving_unavailable(error)
+    finally:
+        if owns:
+            store.close()
+
+
+def add_strength_score(df: pd.DataFrame, liquidity: pd.DataFrame | None = None) -> pd.DataFrame:
     """板块内强度分（0-100）：中和市值/体量后的「谁真正强」。
 
     四个分量在板块内做百分位排名后取均值（排名法抗极值）：
@@ -951,13 +1228,12 @@ def add_strength_score(
         out["_limit_progress"] = (out["price"] - out["pre_close"]) / denom.where(denom > 0)
 
     parts = [
-        c for c in ("pct_chg", "turnover_pct", "rel_volume_5d", "_limit_progress")
+        c
+        for c in ("pct_chg", "turnover_pct", "rel_volume_5d", "_limit_progress")
         if c in out.columns
     ]
     if parts:
-        ranks = pd.concat(
-            [out[c].rank(pct=True, na_option="keep") for c in parts], axis=1
-        )
+        ranks = pd.concat([out[c].rank(pct=True, na_option="keep") for c in parts], axis=1)
         out["strength"] = (ranks.mean(axis=1, skipna=True) * 100).round(1)
     else:
         out["strength"] = float("nan")
@@ -978,9 +1254,7 @@ def _trends_secid(ts_code: str) -> str:
     return f"{market}.{code}"
 
 
-def _trends_get(
-    secid: str, ndays: int, proxies: dict[str, str] | None, timeout: float
-) -> dict:
+def _trends_get(secid: str, ndays: int, proxies: dict[str, str] | None, timeout: float) -> dict:
     """东财 push2his trends2 单次请求（加固 Session），返回原始 JSON dict。"""
     params = {
         "secid": secid,
@@ -1209,8 +1483,61 @@ def volume_directions(prices: pd.Series) -> pd.Series:
     return out
 
 
+def load_intraday_kline_projection(
+    ts_code: str,
+    ndays: int = 1,
+    store: _ReadableStore | None = None,
+) -> pd.DataFrame:
+    """Read at most five recent trading days of minute bars from one serving lease."""
+
+    columns = ["dt", "price", "avg_price", "volume"]
+    if type(ndays) is not int or not 1 <= ndays <= 5:
+        return _serving_unavailable(
+            ValueError("intraday kline window must be an integer between 1 and 5"),
+            columns,
+        )
+    owns = store is None
+    try:
+        store = store or _open_serving_store(("intraday_kline",))
+    except Exception as error:
+        logger.warning(f"分时 serving 打开失败: {type(error).__name__}: {error}")
+        return _serving_unavailable(error, columns)
+    try:
+        _require_projection(store, "intraday_kline")
+        frame = _read_frame(
+            store,
+            """
+            WITH recent_days AS (
+                SELECT DISTINCT CAST(trade_time AS DATE) AS trade_date
+                FROM intraday_kline
+                WHERE ts_code = ?
+                ORDER BY trade_date DESC
+                LIMIT ?
+            )
+            SELECT trade_time AS dt, close AS price,
+                   CAST(NULL AS DOUBLE) AS avg_price, vol AS volume
+            FROM intraday_kline
+            WHERE ts_code = ?
+              AND CAST(trade_time AS DATE) IN (SELECT trade_date FROM recent_days)
+            ORDER BY trade_time
+            LIMIT 2000
+            """,
+            [ts_code, ndays, ts_code],
+            max_rows=2_000,
+            max_result_bytes=512 * 1024,
+        )
+        frame.attrs["route"] = "serving"
+        return _bind_serving_generation(frame, store)
+    except Exception as error:
+        logger.warning(f"分时 serving 查询失败: {ts_code} {type(error).__name__}: {error}")
+        return _serving_unavailable(error, columns)
+    finally:
+        if owns:
+            store.close()
+
+
 def load_daily_kline(
-    ts_code: str, n: int = 120, store: DuckDBStore | None = None
+    ts_code: str, n: int = 120, store: _ReadableStore | None = None
 ) -> pd.DataFrame:
     """日 K（只读副本 daily_bar 最近 n 根，就地滚动 MA）。
 
@@ -1218,17 +1545,24 @@ def load_daily_kline(
     （MA 在取回的 n 根窗口内滚动，不足窗口为 NaN——首 4 根无 ma5，以此类推）。
     副本缺表 / 撞锁 / 无数据 → 空 DataFrame。
     """
+    if type(n) is not int or not 1 <= n <= 240:
+        return _serving_unavailable(
+            ValueError("daily kline window must be an integer between 1 and 240"),
+            ["trade_date", "open", "high", "low", "close", "volume", "ma5", "ma10", "ma20"],
+        )
     if _fake_enabled():
         return _fake_daily_kline(ts_code, n)
 
     owns = store is None
     try:
-        store = store or open_readonly_store(required_tables=("daily_bar",))
+        store = store or _open_serving_store(("daily_bar",))
     except Exception as e:
         logger.warning(f"日K 只读库打开失败: {type(e).__name__}: {e}")
-        return pd.DataFrame()
+        return _serving_unavailable(e)
     try:
-        df = store._conn.execute(
+        _require_projection(store, "daily_bar")
+        df = _read_frame(
+            store,
             """
             SELECT trade_date, open, high, low, close, vol AS volume
             FROM daily_bar
@@ -1237,13 +1571,16 @@ def load_daily_kline(
             LIMIT ?
             """,
             [ts_code, n],
-        ).fetchdf()
+            max_rows=n,
+            max_result_bytes=256 * 1024,
+        )
     except Exception as e:
         logger.warning(f"日K 查询失败: {ts_code} {type(e).__name__}: {e}")
-        return pd.DataFrame()
+        return _serving_unavailable(e)
     finally:
         if owns:
             store.close()
+    df = _bind_serving_generation(df, store)
     if df.empty:
         return df
     df = df.sort_values("trade_date").reset_index(drop=True)
@@ -1259,8 +1596,16 @@ def load_daily_kline(
 # surge_watch（后者会拉进 tushare/state.derive 等重依赖）。
 _SURGE_LIVE_DIR_NAME = "surge_live"
 _SURGE_LOG_COLUMNS = [
-    "confirmed_at", "ts_code", "name", "theme", "price", "pct_chg",
-    "cum_amount", "rel_cum", "room_to_limit_pct", "status",
+    "confirmed_at",
+    "ts_code",
+    "name",
+    "theme",
+    "price",
+    "pct_chg",
+    "cum_amount",
+    "rel_cum",
+    "room_to_limit_pct",
+    "status",
 ]
 _SURGE_HISTORY_COLUMNS = ["trade_date", *_SURGE_LOG_COLUMNS]
 _SURGE_EVENT_MARK_COLUMNS = ["date", "confirmed_at", "rel_cum"]
@@ -1306,7 +1651,12 @@ def _read_jsonl_records(path: Path, required_key: str) -> list[dict]:
     return records
 
 
-def load_surge_log(day: date | None = None, *, live_dir: Path | None = None) -> pd.DataFrame:
+def load_surge_log(
+    day: date | None = None,
+    *,
+    store: _ReadableStore | None = None,
+    live_dir: Path | None = None,
+) -> pd.DataFrame:
     """读当日 surge-watch events jsonl，**每标的只保留 confirmed_at 最早的一行**，按时间升序。
 
     默认读 ``settings.data_dir/surge_live/events-{day}.jsonl``（day 缺省今日 CST）；
@@ -1318,6 +1668,39 @@ def load_surge_log(day: date | None = None, *, live_dir: Path | None = None) -> 
         return _fake_surge_log()
     if day is None:
         day = datetime.now(_CST).date()
+    if live_dir is None:
+        owns = store is None
+        try:
+            store = store or _open_serving_store(("surge_event",))
+        except Exception as error:
+            logger.warning(f"爆量台账 serving 打开失败: {type(error).__name__}: {error}")
+            return _serving_unavailable(error, _SURGE_LOG_COLUMNS)
+        try:
+            _require_projection(store, "surge_event")
+            frame = _read_frame(
+                store,
+                """
+                SELECT confirmed_at, ts_code, name, theme, price, pct_chg,
+                       cum_amount, rel_cum, room_to_limit_pct, status
+                FROM surge_event
+                WHERE trade_date = ?
+                QUALIFY ROW_NUMBER() OVER (
+                    PARTITION BY ts_code ORDER BY confirmed_at
+                ) = 1
+                ORDER BY confirmed_at, ts_code
+                LIMIT 10000
+                """,
+                [day],
+                max_rows=10_000,
+                max_result_bytes=2 * 1024 * 1024,
+            )
+            return _bind_serving_generation(frame, store)
+        except Exception as error:
+            logger.warning(f"爆量台账 serving 查询失败: {type(error).__name__}: {error}")
+            return _serving_unavailable(error, _SURGE_LOG_COLUMNS)
+        finally:
+            if owns:
+                store.close()
     path = _surge_live_dir(live_dir) / f"events-{day.isoformat()}.jsonl"
     records = _read_jsonl_records(path, "ts_code")
     if not records:
@@ -1575,17 +1958,41 @@ def _fake_sector_fund_flow(sector_type: str = "行业资金流") -> pd.DataFrame
     """资金流：board_code（BK 码）可精确 join 成分板块（BK0001/BK0002），route=em_direct。"""
     if sector_type == "概念资金流":
         rows = [
-            {"board_code": "BK0002", "board_name": "AI算力", "pct_chg": 5.20,
-             "main_net_amount": 8.80e8, "main_net_rate": 6.10, "leading_stock": "样本10"},
-            {"board_code": "BK0301", "board_name": "云计算", "pct_chg": 2.10,
-             "main_net_amount": 3.20e8, "main_net_rate": 3.30, "leading_stock": "某云股"},
+            {
+                "board_code": "BK0002",
+                "board_name": "AI算力",
+                "pct_chg": 5.20,
+                "main_net_amount": 8.80e8,
+                "main_net_rate": 6.10,
+                "leading_stock": "样本10",
+            },
+            {
+                "board_code": "BK0301",
+                "board_name": "云计算",
+                "pct_chg": 2.10,
+                "main_net_amount": 3.20e8,
+                "main_net_rate": 3.30,
+                "leading_stock": "某云股",
+            },
         ]
     else:
         rows = [
-            {"board_code": "BK0001", "board_name": "半导体", "pct_chg": 4.30,
-             "main_net_amount": 1.23e9, "main_net_rate": 7.20, "leading_stock": "样本01"},
-            {"board_code": "BK0201", "board_name": "银行", "pct_chg": -0.80,
-             "main_net_amount": -5.60e8, "main_net_rate": -2.10, "leading_stock": "某行"},
+            {
+                "board_code": "BK0001",
+                "board_name": "半导体",
+                "pct_chg": 4.30,
+                "main_net_amount": 1.23e9,
+                "main_net_rate": 7.20,
+                "leading_stock": "样本01",
+            },
+            {
+                "board_code": "BK0201",
+                "board_name": "银行",
+                "pct_chg": -0.80,
+                "main_net_amount": -5.60e8,
+                "main_net_rate": -2.10,
+                "leading_stock": "某行",
+            },
         ]
     df = pd.DataFrame(rows)[
         ["board_code", "board_name", "pct_chg", "main_net_amount", "main_net_rate", "leading_stock"]
@@ -1633,9 +2040,7 @@ def _fake_intraday_trend(ts_code: str, ndays: int = 1) -> pd.DataFrame:
     per_day = 240
     count = per_day * ndays
     days = pd.bdate_range(end="2026-07-06", periods=ndays)
-    dt = pd.DatetimeIndex(
-        np.concatenate([_session_minute_stamps(day).to_numpy() for day in days])
-    )
+    dt = pd.DatetimeIndex(np.concatenate([_session_minute_stamps(day).to_numpy() for day in days]))
     x = np.arange(count)
     price = np.round(20.0 + 2.0 * np.sin(x / 30.0) + x * 0.001, 2)
     avg_price = np.round(pd.Series(price).expanding().mean().to_numpy(), 2)

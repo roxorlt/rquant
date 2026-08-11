@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 from collections import Counter
 from dataclasses import dataclass
@@ -20,8 +21,14 @@ from pathlib import Path
 from loguru import logger
 
 from rquant.config import settings
+from rquant.daily_receipt_socket_authority import probe_daily_receipt_authority_identity
 from rquant.storage.duckdb import DuckDBStore, open_readonly_store
-
+from rquant.workload_isolation import (
+    WorkloadCheck,
+    check_workload_capacity_baseline,
+    check_workload_high_water_evidence,
+    check_workload_runtime,
+)
 
 # ---------- systemd 状态 ----------
 
@@ -36,6 +43,24 @@ class ServiceSnapshot:
     exit_today: datetime | None  # 今天的 ExecMainExit（不是今天的就 None）
     exit_status: int | None      # 今天的 ExecMainStatus（数字）
     duration_sec: int | None     # exit - start 秒数（如有）
+
+
+@dataclass(frozen=True)
+class DailyAuthorityIdentitySnapshot:
+    """Authenticated identity returned by the fixed root signer socket."""
+
+    status: str
+    source_sha256: str | None
+    key_id: str | None
+    detail: str
+
+
+@dataclass(frozen=True)
+class WorkloadIsolationSnapshot:
+    """Read-only workload slice and capacity status for operational health output."""
+
+    status: str
+    detail: str
 
 
 def _parse_systemd_ts(value: str) -> datetime | None:
@@ -96,6 +121,64 @@ def get_service_snapshot(unit: str, today: date | None = None) -> ServiceSnapsho
         exit_status=status,
         duration_sec=duration,
     )
+
+
+def get_daily_receipt_authority_identity() -> DailyAuthorityIdentitySnapshot:
+    """Read the running signer identity through the shared authenticated probe."""
+
+    if not shutil.which("systemctl"):
+        return DailyAuthorityIdentitySnapshot(
+            status="skip",
+            source_sha256=None,
+            key_id=None,
+            detail="无 systemctl（mac 本地 dev）",
+        )
+    try:
+        identity = probe_daily_receipt_authority_identity(
+            timeout_seconds=2.0,
+            max_attempts=1,
+        )
+    except Exception as exc:
+        return DailyAuthorityIdentitySnapshot(
+            status="fail",
+            source_sha256=None,
+            key_id=None,
+            detail=f"identity probe 失败: {type(exc).__name__}: {str(exc)[:160]}",
+        )
+    return DailyAuthorityIdentitySnapshot(
+        status="ok",
+        source_sha256=identity.source_sha256,
+        key_id=identity.key_id,
+        detail=f"running_sha={identity.source_sha256} key={identity.key_id}",
+    )
+
+
+def get_workload_isolation_snapshot() -> WorkloadIsolationSnapshot:
+    """Summarize the cloud-only read-only cgroup and capacity acceptance checks."""
+
+    checks = []
+    for name, probe in (
+        ("workload_runtime", check_workload_runtime),
+        ("workload_capacity", check_workload_capacity_baseline),
+        ("workload_high_water", check_workload_high_water_evidence),
+    ):
+        try:
+            checks.append(probe())
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            checks.append(
+                WorkloadCheck(name, "fail", f"{type(exc).__name__}: {str(exc)[:160]}")
+            )
+    statuses = {check.status for check in checks}
+    if "fail" in statuses:
+        status = "fail"
+    elif "warn" in statuses or "skip" in statuses:
+        status = "warn"
+    else:
+        status = "ok"
+    detail = "; ".join(
+        f"{check.status}: {check.summary}" for check in checks
+    )
+    return WorkloadIsolationSnapshot(status=status, detail=detail)
 
 
 # ---------- watchdog 日志解析 ----------
@@ -178,6 +261,8 @@ def build_daily_report(
     daily: ServiceSnapshot,
     watchdog_counts: dict[str, int],
     business: dict[str, int],
+    authority_identity: DailyAuthorityIdentitySnapshot | None = None,
+    workload_isolation: WorkloadIsolationSnapshot | None = None,
 ) -> tuple[str, str]:
     """拼报文：(subject, body)。subject 短，body 多行细节。"""
     weekday_zh = "一二三四五六日"[today.weekday()]
@@ -223,7 +308,8 @@ def build_daily_report(
                 )
         elif monitor.start_today and not monitor.exit_today:
             lines.append(
-                f"⏳ monitor: {_fmt_time(monitor.start_today)} 启动后仍 {monitor.active_state}（未退）"
+                f"⏳ monitor: {_fmt_time(monitor.start_today)} 启动后仍 "
+                f"{monitor.active_state}（未退）"
             )
         elif not monitor.start_today:
             lines.append("❌ monitor: 今天未触发（timer 09:25 应触发，需排查）")
@@ -247,7 +333,7 @@ def build_daily_report(
             lines.append("❌ watchdog: 交易时段 0 次触发（timer 应每 2min 触发）")
         else:
             lines.append(
-                f"ℹ️ watchdog: 交易时段 0 次触发"
+                "ℹ️ watchdog: 交易时段 0 次触发"
                 + (f"（盘外 {oow_n} 次自检退）" if oow_n else "（非交易日不打扰）")
             )
     elif alert_n == 0:
@@ -275,10 +361,19 @@ def build_daily_report(
         # 15:30 报告时 daily 17:00 还没跑——正常
         lines.append("⏰ daily: 17:00 还未触发")
 
+    # The receipt authority is independent of the daily pipeline process; keep
+    # its authenticated process identity visible in the same health report.
+    if authority_identity is not None and authority_identity.status != "skip":
+        icon = "✅" if authority_identity.status == "ok" else "❌"
+        lines.append(f"{icon} daily-authority: {authority_identity.detail}")
+    if workload_isolation is not None and workload_isolation.status != "skip":
+        icon = "✅" if workload_isolation.status == "ok" else "⚠️"
+        if workload_isolation.status == "fail":
+            icon = "❌"
+        lines.append(f"{icon} workload-isolation: {workload_isolation.detail}")
+
     # === 业务数据 ===
     pl = business.get("price_level_events", 0)
-    pool1 = business.get("screen_n-shape-pool1", 0)
-    pool2 = business.get("screen_n-shape-pool2", 0)
     if is_trading_day_flag:
         lines.append(
             f"📈 业务: price_level 触发 {pl} 条 · "
@@ -337,6 +432,8 @@ def generate_and_send_daily_report(
 
     monitor_snap = get_service_snapshot("rquant-monitor.service", today)
     daily_snap = get_service_snapshot("rquant-daily.service", today)
+    authority_identity = get_daily_receipt_authority_identity()
+    workload_isolation = get_workload_isolation_snapshot()
     watchdog_counts = read_watchdog_log(settings.log_dir, today)
 
     # 5/13 复盘 Bug A：daily-report 不写 db（count_today_business_data 是纯 SELECT）。
@@ -348,6 +445,8 @@ def generate_and_send_daily_report(
 
     subject, body = build_daily_report(
         today, trading_day, monitor_snap, daily_snap, watchdog_counts, business,
+        authority_identity=authority_identity,
+        workload_isolation=workload_isolation,
     )
 
     # PR2-E：把今日"推送失败已落盘"的告警带进日报，避免告警黑洞
