@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 from datetime import date
@@ -167,8 +168,7 @@ def test_verified_interpreter_fd_is_closed_when_executor_raises(
         capability.require_live()
 
 
-@pytest.mark.skipif(not hasattr(os, "fexecve"), reason="Linux fexecve exact gate")
-def test_linux_default_executor_uses_the_supplied_descriptor(
+def test_default_executor_uses_execve_descriptor_when_supported(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from rquant.formal_runtime import _exec_verified_descriptor
@@ -178,9 +178,73 @@ def test_linux_default_executor_uses_the_supplied_descriptor(
     def capture(descriptor: int, argv: tuple[str, ...], environment: dict[str, str]) -> None:
         calls.append((descriptor, argv, environment))
 
-    monkeypatch.setattr(os, "fexecve", capture)
+    monkeypatch.setattr(os, "execve", capture)
+    monkeypatch.setattr(os, "supports_fd", frozenset({capture}))
     _exec_verified_descriptor(17, ("python", "-I", "-S", "launcher"), {"SAFE": "1"})
     assert calls == [(17, ("python", "-I", "-S", "launcher"), {"SAFE": "1"})]
+
+
+@pytest.mark.skipif(
+    os.execve in os.supports_fd,
+    reason="platform supports descriptor-based os.execve",
+)
+def test_default_executor_fails_closed_without_fd_exec_support() -> None:
+    from rquant.formal_runtime import FormalRuntimeError, _exec_verified_descriptor
+
+    with pytest.raises(
+        FormalRuntimeError,
+        match="^formal descriptor execution is unavailable on this platform$",
+    ):
+        _exec_verified_descriptor(17, ("python", "-I", "-S", "launcher"), {"SAFE": "1"})
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux FD exec exact gate")
+def test_linux_default_executor_executes_verified_descriptor_after_path_swap(
+    tmp_path: Path,
+) -> None:
+    from rquant.formal_runtime import _exec_verified_descriptor
+
+    assert os.execve in os.supports_fd
+    candidate = tmp_path / "verified-sh"
+    shutil.copyfile(Path("/bin/sh").resolve(strict=True), candidate)
+    candidate.chmod(0o555)
+    descriptor = os.open(candidate, os.O_RDONLY)
+    verified_identity = os.fstat(descriptor)
+    replacement = tmp_path / "replacement-sh"
+    replacement.write_text("#!/bin/sh\nprintf 'HIJACKED\\n'\nexit 91\n", encoding="ascii")
+    replacement.chmod(0o555)
+    os.replace(replacement, candidate)
+    assert candidate.stat().st_ino != verified_identity.st_ino
+
+    read_fd, write_fd = os.pipe()
+    child = os.fork()
+    if child == 0:  # pragma: no cover - asserted through parent output/status
+        try:
+            os.close(read_fd)
+            os.dup2(write_fd, 1)
+            os.close(write_fd)
+            _exec_verified_descriptor(
+                descriptor,
+                (str(candidate), "-c", "printf 'VERIFIED-FD\\n'; exit 23"),
+                {"PATH": "/usr/bin:/bin"},
+            )
+        except BaseException as exc:
+            os.write(1, f"EXEC-ERROR:{type(exc).__name__}:{exc}\n".encode("ascii"))
+            os._exit(127)
+    os.close(write_fd)
+    os.close(descriptor)
+    output = b""
+    try:
+        while chunk := os.read(read_fd, 4096):
+            output += chunk
+    finally:
+        os.close(read_fd)
+    waited, status = os.waitpid(child, 0)
+
+    assert waited == child
+    assert os.WIFEXITED(status)
+    assert os.WEXITSTATUS(status) == 23
+    assert output == b"VERIFIED-FD\n"
 
 
 def test_formal_runtime_does_not_wrap_unexpected_liveness_errors(

@@ -232,10 +232,10 @@ def _exec_verified_descriptor(
     argv: tuple[str, ...],
     environment: Mapping[str, str],
 ) -> object:
-    fexecve = getattr(os, "fexecve", None)
-    if not callable(fexecve):
+    execve = os.execve
+    if execve not in os.supports_fd:
         raise FormalRuntimeError("formal descriptor execution is unavailable on this platform")
-    return fexecve(descriptor, argv, dict(environment))
+    return execve(descriptor, argv, dict(environment))
 
 
 def exec_formal_runtime(
