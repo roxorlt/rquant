@@ -16,11 +16,13 @@ from rquant.dashboard.runtime_console_data import (
     ConsoleLimits,
     ConsoleLoadState,
     load_runtime_console,
+    query_acquired_serving_frame,
 )
 from rquant.serving_contracts import FreshnessStatus, ServingDatasetWatermark
 from rquant.serving_publisher import (
     ServingIntegrityError,
     ServingPublisher,
+    ServingReader,
     ServingTableSpec,
 )
 
@@ -70,6 +72,9 @@ class _FakeReader:
 
     def open_current_readonly(self) -> nullcontext[_FakeConnection]:
         return nullcontext(self.connection)
+
+    def acquire_generation(self) -> nullcontext[SimpleNamespace]:
+        return nullcontext(SimpleNamespace(manifest=self.manifest, connection=self.connection))
 
 
 @pytest.fixture(autouse=True)
@@ -265,6 +270,38 @@ def test_query_failure_keeps_generation_identity_but_degrades(
     assert snapshot.signals == ()
 
 
+def test_loader_uses_one_atomic_generation_lease(monkeypatch: pytest.MonkeyPatch) -> None:
+    class AtomicLease:
+        manifest = _FakeReader.manifest
+        connection = _FakeReader.connection
+
+        def __enter__(self) -> AtomicLease:
+            return self
+
+        def __exit__(self, *_error: object) -> None:
+            return None
+
+    class AtomicOnlyReader:
+        def __init__(self, root: object) -> None:
+            self.root = root
+
+        def current_manifest(self) -> object:
+            raise AssertionError("manifest must come from the acquired generation")
+
+        def open_current_readonly(self) -> object:
+            raise AssertionError("connection must come from the acquired generation")
+
+        def acquire_generation(self) -> AtomicLease:
+            return AtomicLease()
+
+    monkeypatch.setattr("rquant.dashboard.runtime_console_data.ServingReader", AtomicOnlyReader)
+
+    snapshot = load_runtime_console("/serving", now=_NOW)
+
+    assert snapshot.state is ConsoleLoadState.READY
+    assert snapshot.generation_id == _GENERATION
+
+
 def test_old_or_upstream_stale_generation_is_reported_as_stale(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -446,3 +483,47 @@ def test_real_verified_reader_queries_without_mutating_serving_generation(tmp_pa
         path: (item.st_mode, item.st_mtime_ns, item.st_ctime_ns, item.st_size)
         for path, item in before.items()
     }
+
+
+def test_acquired_query_keeps_one_generation_when_current_pointer_advances(tmp_path: Path) -> None:
+    root = tmp_path / "serving"
+    publisher = ServingPublisher(
+        root,
+        producer_commit=_COMMIT,
+        table_specs={"page_data": ServingTableSpec(sort_keys=("id",))},
+    )
+
+    def publish(value: str, generation: str, built_at: datetime) -> None:
+        publisher.publish(
+            {"page_data": pd.DataFrame({"id": [1], "value": [value]})},
+            watermarks=(
+                ServingDatasetWatermark(
+                    dataset_id="page-data",
+                    generation_id=generation,
+                    event_time=built_at,
+                    published_at=built_at,
+                    sequence=1,
+                    status=FreshnessStatus.FRESH,
+                ),
+            ),
+            source_generations={"page-data": generation},
+            built_at=built_at,
+        )
+
+    publish("old", "source-old", _NOW - timedelta(seconds=2))
+    with ServingReader(root).acquire_generation() as acquired:
+        first = query_acquired_serving_frame(
+            acquired,
+            "SELECT value FROM page_data",
+            now=_NOW,
+        )
+        publish("new", "source-new", _NOW - timedelta(seconds=1))
+        second = query_acquired_serving_frame(
+            acquired,
+            "SELECT value FROM page_data",
+            now=_NOW,
+        )
+
+    assert first.generation_id == second.generation_id
+    assert first.rows == (("old",),)
+    assert second.rows == (("old",),)

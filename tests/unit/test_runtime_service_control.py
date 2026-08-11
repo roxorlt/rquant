@@ -72,6 +72,28 @@ def test_success_and_failure_heartbeats_preserve_monotonic_watermarks(tmp_path: 
     control.stop(reason="test complete")
 
 
+def test_step_latency_window_is_bounded_and_persists_nearest_rank_p95(
+    tmp_path: Path,
+) -> None:
+    control = RuntimeServiceControl(tmp_path, spec=_spec(), clock=lambda: NOW)
+    control.start()
+
+    for duration in range(1, 26):
+        heartbeat = control.record_success(
+            RuntimeStepResult(),
+            duration_seconds=float(duration),
+        )
+
+    assert heartbeat.last_step_duration_seconds == 25.0
+    assert heartbeat.recent_step_durations_seconds == tuple(
+        float(duration) for duration in range(6, 26)
+    )
+    assert heartbeat.p95_step_duration_seconds == 24.0
+    persisted = RuntimeServiceControl.read_heartbeat(tmp_path, _spec())
+    assert persisted == heartbeat
+    control.stop(reason="test complete")
+
+
 def test_successful_degraded_step_keeps_watermarks_and_health_reason(tmp_path: Path) -> None:
     control = RuntimeServiceControl(tmp_path, spec=_spec(), clock=lambda: NOW)
     control.start()
@@ -127,6 +149,31 @@ def test_loop_isolates_ordinary_step_failure_and_recovers(tmp_path: Path) -> Non
     assert final.total_failures == 1
     assert final.total_successes == 1
     assert final.input_sequence == 1
+
+
+def test_loop_measures_success_and_failure_step_latency(tmp_path: Path) -> None:
+    ticks = iter((RuntimeError("temporary"), RuntimeStepResult()))
+    monotonic_ticks = iter((10.0, 10.1, 20.0, 20.4))
+    control = RuntimeServiceControl(tmp_path, spec=_spec(), clock=lambda: NOW)
+
+    def step() -> RuntimeStepResult:
+        outcome = next(ticks)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    final = run_service_loop(
+        control,
+        step=step,
+        stop_event=Event(),
+        interval_seconds=0,
+        max_iterations=2,
+        monotonic_clock=lambda: next(monotonic_ticks),
+    )
+
+    assert final.recent_step_durations_seconds == pytest.approx((0.1, 0.4))
+    assert final.last_step_duration_seconds == pytest.approx(0.4)
+    assert final.p95_step_duration_seconds == pytest.approx(0.4)
 
 
 def test_health_reader_marks_stale_without_writing_service_state(tmp_path: Path) -> None:

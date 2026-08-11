@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import hashlib
+import os
 from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import UUID
 
+import pandas as pd
 import pytest
 
 from rquant.lab_jobs import LabJobReader, LabJobStore
@@ -11,6 +15,7 @@ from rquant.lab_jobs_serving_authority import (
     LabJobsServingAuthorityIntegrityError,
     LabJobsServingAuthorityPublisher,
     LabJobsServingSourceReader,
+    _read_verified_parquet,
 )
 from rquant.runtime_serving_authority import (
     ServingSourceAuthorityPublisher,
@@ -18,6 +23,7 @@ from rquant.runtime_serving_authority import (
 )
 from rquant.runtime_serving_snapshot import LAB_JOBS_DATASET_ID, LabJobsPayload
 from rquant.serving_contracts import FreshnessStatus
+from rquant.serving_read_models import ServingProjectionPayload
 
 from .test_lab_jobs import NOW, _lease, _spec, _submit
 
@@ -51,6 +57,56 @@ def _seed_jobs(store: LabJobStore, count: int) -> None:
             now=NOW + timedelta(seconds=index),
         )
         assert result.status == "applied"
+
+
+def test_verified_parquet_ignores_atime_only_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle = tmp_path / "bundle"
+    tables = bundle / "tables"
+    tables.mkdir(parents=True)
+    path = tables / "summary.parquet"
+    expected = pd.DataFrame([{"value": 7}])
+    expected.to_parquet(path, index=False)
+    payload = path.read_bytes()
+    physical = path.stat()
+    real_fstat = os.fstat
+    calls = 0
+
+    def atime_changing_fstat(descriptor: int) -> os.stat_result | SimpleNamespace:
+        nonlocal calls
+        observed = real_fstat(descriptor)
+        calls += 1
+        if calls != 2:
+            return observed
+        return SimpleNamespace(
+            st_mode=observed.st_mode,
+            st_ino=observed.st_ino,
+            st_dev=observed.st_dev,
+            st_nlink=observed.st_nlink,
+            st_uid=observed.st_uid,
+            st_gid=observed.st_gid,
+            st_size=observed.st_size,
+            st_atime_ns=observed.st_atime_ns + 1,
+            st_mtime_ns=observed.st_mtime_ns,
+            st_ctime_ns=observed.st_ctime_ns,
+        )
+
+    monkeypatch.setattr(
+        "rquant.lab_jobs_serving_authority.os.fstat",
+        atime_changing_fstat,
+    )
+
+    actual = _read_verified_parquet(
+        bundle,
+        relative_path="tables/summary.parquet",
+        expected_size=len(payload),
+        expected_sha256=hashlib.sha256(payload).hexdigest(),
+        expected_identity=(physical.st_dev, physical.st_ino),
+    )
+
+    pd.testing.assert_frame_equal(actual, expected)
 
 
 def test_empty_database_publishes_fresh_idempotent_authority_without_writing_sqlite(
@@ -147,6 +203,90 @@ def test_reader_rejects_eta_as_of_after_observed_at(
         match="ETA contains future evidence",
     ):
         LabJobsServingSourceReader(reader=reader)(OBSERVED_AT)
+
+
+def test_reader_publishes_only_stable_trusted_strategy_projections(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    _seed_jobs(store, 1)
+    projection = ServingProjectionPayload(
+        table_name="strategy_summary",
+        available_at=OBSERVED_AT,
+        rows=(
+            {
+                "run_id": "run-1",
+                "computed_at": OBSERVED_AT.isoformat(),
+                "start_date": "2026-04-01",
+                "end_date": "2026-07-14",
+                "max_hold_days": 1,
+                "entry_mode": "first_break",
+                "profile_variant": "baseline",
+                "candidates": 1,
+                "trades": 1,
+                "trigger_rate_pct": 100.0,
+                "mean_ret_pct": 2.0,
+                "median_ret_pct": 2.0,
+                "win_rate_pct": 100.0,
+                "best_ret_pct": 2.0,
+                "worst_ret_pct": 2.0,
+                "gap_stop_rate_pct": 0.0,
+            },
+        ),
+    )
+    calls: list[tuple[tuple[UUID, ...], object]] = []
+
+    def trusted_projection_reader(summaries, observed_at):  # type: ignore[no-untyped-def]
+        calls.append((tuple(summary.job_id for summary in summaries), observed_at))
+        return (projection,)
+
+    source = LabJobsServingSourceReader(
+        reader=LabJobReader(store.path),
+        strategy_projection_reader=trusted_projection_reader,
+    )
+
+    result = source(OBSERVED_AT)
+
+    assert isinstance(result.payload, LabJobsPayload)
+    assert result.payload.projections == (projection,)
+    assert calls == [
+        ((UUID(int=1),), OBSERVED_AT),
+        ((UUID(int=1),), OBSERVED_AT),
+    ]
+
+
+def test_reader_rejects_projection_authority_that_changes_during_snapshot(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    _seed_jobs(store, 1)
+    calls = 0
+
+    def unstable_projection_reader(_summaries, observed_at):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        calls += 1
+        return (
+            (
+                ServingProjectionPayload(
+                    table_name="strategy_summary",
+                    available_at=observed_at,
+                    rows=(),
+                ),
+            )
+            if calls == 1
+            else ()
+        )
+
+    source = LabJobsServingSourceReader(
+        reader=LabJobReader(store.path),
+        strategy_projection_reader=unstable_projection_reader,
+    )
+
+    with pytest.raises(
+        LabJobsServingAuthorityIntegrityError,
+        match="strategy projection authority changed",
+    ):
+        source(OBSERVED_AT)
 
 
 @pytest.mark.parametrize("max_jobs", [0, 101])

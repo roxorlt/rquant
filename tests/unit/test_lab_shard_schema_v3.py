@@ -90,11 +90,13 @@ def _assert_v6_epoch_authority(connection: sqlite3.Connection) -> int:
             "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'trg_lab_epoch_%'"
         )
     }
-    assert epoch_triggers == set(lab_jobs._LEDGER_EPOCH_TRIGGER_SQL)
+    assert epoch_triggers == (
+        set(lab_jobs._LEDGER_EPOCH_TRIGGER_SQL) | set(lab_jobs._V8_LEDGER_EPOCH_TRIGGER_SQL)
+    )
     return int(epoch_row[1])
 
 
-def test_initialize_creates_v6_result_telemetry_and_epoch_authority(tmp_path: Path) -> None:
+def test_initialize_creates_final_v12_result_telemetry_and_epoch_authority(tmp_path: Path) -> None:
     store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
     store.initialize()
 
@@ -111,7 +113,7 @@ def test_initialize_creates_v6_result_telemetry_and_epoch_authority(tmp_path: Pa
         }
         epoch = _assert_v6_epoch_authority(connection)
 
-    assert version == LabJobStore.SCHEMA_VERSION == 6
+    assert version == LabJobStore.SCHEMA_VERSION
     assert epoch == 0
     assert "lab_worker_report" in tables
     assert "lab_scheduler_state" in tables
@@ -124,6 +126,7 @@ def test_initialize_creates_v6_result_telemetry_and_epoch_authority(tmp_path: Pa
         "adapter_version",
         "payload_json",
         "payload_hash",
+        "payload_protocol_version",
         "claim_token",
         "claim_generation",
         "claimed_at",
@@ -148,6 +151,335 @@ def test_initialize_creates_v6_result_telemetry_and_epoch_authority(tmp_path: Pa
         "claim_generation",
         "scheduler_fencing_token",
     } <= report_columns
+
+
+def test_initialize_creates_exact_final_v12_publication_schema_identity(tmp_path: Path) -> None:
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == LabJobStore.SCHEMA_VERSION
+        publication_tables = {
+            str(row[0]): str(row[1])
+            for row in connection.execute(
+                "SELECT name, sql FROM sqlite_schema "
+                "WHERE type = 'table' AND name IN "
+                "('lab_claim_publication', 'lab_claim_publication_audit')"
+            )
+        }
+        publication_triggers = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_schema WHERE type = 'trigger' "
+                "AND (name LIKE 'trg_lab_claim_publication_%' "
+                "OR name LIKE 'trg_lab_epoch_lab_claim_publication%')"
+            )
+        }
+
+    assert set(publication_tables) == {
+        "lab_claim_publication",
+        "lab_claim_publication_audit",
+    }
+    assert publication_triggers == set(lab_jobs._V8_PUBLICATION_TRIGGER_SQL)
+    assert lab_jobs._sql_ddl_equivalent(
+        lab_jobs._CLAIM_PUBLICATION_TABLE_STATEMENT,
+        publication_tables["lab_claim_publication"],
+    )
+    assert lab_jobs._sql_ddl_equivalent(
+        lab_jobs._CLAIM_PUBLICATION_AUDIT_TABLE_STATEMENT,
+        publication_tables["lab_claim_publication_audit"],
+    )
+    assert "source_stage_authority_bytes" in publication_tables["lab_claim_publication"]
+    assert "source_stage_db_path" not in publication_tables["lab_claim_publication"]
+
+
+def test_initialize_migrates_v8_recovery_indexes_to_v12_idempotently(tmp_path: Path) -> None:
+    path = tmp_path / "lab_jobs.sqlite3"
+    with sqlite3.connect(path) as connection:
+        for statement in lab_jobs._V8_SCHEMA_STATEMENTS:
+            connection.execute(statement)
+        connection.execute(f"PRAGMA application_id = {LabJobStore.APPLICATION_ID}")
+        connection.execute("PRAGMA user_version = 8")
+
+    store = LabJobStore(path)
+    store.initialize()
+    store.initialize()
+
+    expected_indexes = {
+        "ix_lab_shard_active_claims": """
+            CREATE INDEX IF NOT EXISTS ix_lab_shard_active_claims
+            ON lab_shard(
+                status, scheduler_fencing_token, lease_expires_at,
+                job_id, shard_index, shard_id
+            )
+            WHERE status = 'running'
+        """,
+        "ix_lab_shard_stale_recovery": """
+            CREATE INDEX IF NOT EXISTS ix_lab_shard_stale_recovery
+            ON lab_shard(
+                status, payload_protocol_version, job_id, shard_index, shard_id, lease_expires_at
+            )
+            WHERE status = 'running' AND payload_protocol_version = 1
+        """,
+        "ix_lab_shard_v2_reconciliation": """
+            CREATE INDEX IF NOT EXISTS ix_lab_shard_v2_reconciliation
+            ON lab_shard(job_id, shard_id, lease_expires_at)
+            WHERE status = 'running' AND payload_protocol_version = 2
+        """,
+        "ix_lab_shard_exhausted_queued_v1_recovery": """
+            CREATE INDEX IF NOT EXISTS ix_lab_shard_exhausted_queued_v1_recovery
+            ON lab_shard(status, payload_protocol_version, job_id, shard_index, shard_id)
+            WHERE payload_protocol_version = 1
+              AND status = 'queued'
+              AND attempt_count >= max_attempts
+        """,
+        "ix_lab_shard_exhausted_checkpointed_v1_recovery": """
+            CREATE INDEX IF NOT EXISTS ix_lab_shard_exhausted_checkpointed_v1_recovery
+            ON lab_shard(status, payload_protocol_version, job_id, shard_index, shard_id)
+            WHERE payload_protocol_version = 1
+              AND status = 'checkpointed'
+              AND attempt_count >= max_attempts
+        """,
+        "ix_lab_job_idle_control_recovery": """
+            CREATE INDEX IF NOT EXISTS ix_lab_job_idle_control_recovery
+            ON lab_job(status, created_at, job_id)
+            WHERE status = 'running'
+              AND control_intent IN ('pause_requested', 'cancel_requested')
+        """,
+        "ix_lab_shard_idle_control_eligibility": """
+            CREATE INDEX IF NOT EXISTS ix_lab_shard_idle_control_eligibility
+            ON lab_shard(job_id, status)
+        """,
+    }
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == LabJobStore.SCHEMA_VERSION
+        recovery_cursor_sql = connection.execute(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'lab_recovery_cursor'"
+        ).fetchone()
+        actual_indexes = {
+            str(row[0]): str(row[1])
+            for row in connection.execute(
+                "SELECT name, sql FROM sqlite_schema WHERE type = 'index' "
+                "AND name IN ('ix_lab_shard_active_claims', 'ix_lab_shard_stale_recovery', "
+                "'ix_lab_shard_v2_reconciliation', "
+                "'ix_lab_shard_exhausted_queued_v1_recovery', "
+                "'ix_lab_shard_exhausted_checkpointed_v1_recovery', "
+                "'ix_lab_job_idle_control_recovery', "
+                "'ix_lab_shard_idle_control_eligibility')"
+            )
+        }
+
+    assert set(actual_indexes) == set(expected_indexes)
+    assert recovery_cursor_sql is not None
+    assert lab_jobs._sql_ddl_equivalent(
+        lab_jobs._RECOVERY_CURSOR_TABLE_STATEMENT,
+        str(recovery_cursor_sql[0]),
+    )
+    for name, expected in expected_indexes.items():
+        assert lab_jobs._sql_ddl_equivalent(expected, actual_indexes[name])
+
+
+def test_initialize_migrates_v10_bounded_recovery_schema_to_v12_idempotently(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "lab_jobs.sqlite3"
+    store = LabJobStore(path)
+    store.initialize()
+
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP INDEX ix_lab_shard_exhausted_queued_v1_recovery")
+        connection.execute("DROP INDEX ix_lab_shard_exhausted_checkpointed_v1_recovery")
+        connection.execute("DROP INDEX ix_lab_job_idle_control_recovery")
+        connection.execute("DROP INDEX ix_lab_shard_idle_control_eligibility")
+        connection.execute("DROP TABLE lab_recovery_cursor")
+        connection.execute("PRAGMA user_version = 10")
+
+    store.initialize()
+    store.initialize()
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == LabJobStore.SCHEMA_VERSION
+        assert {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_schema WHERE type = 'index' "
+                "AND name IN ('ix_lab_shard_exhausted_queued_v1_recovery', "
+                "'ix_lab_shard_exhausted_checkpointed_v1_recovery', "
+                "'ix_lab_job_idle_control_recovery', "
+                "'ix_lab_shard_idle_control_eligibility')"
+            )
+        } == {
+            "ix_lab_shard_exhausted_queued_v1_recovery",
+            "ix_lab_shard_exhausted_checkpointed_v1_recovery",
+            "ix_lab_job_idle_control_recovery",
+            "ix_lab_shard_idle_control_eligibility",
+        }
+        assert connection.execute(
+            "SELECT name FROM sqlite_schema WHERE type = 'table' AND name = 'lab_recovery_cursor'"
+        ).fetchone() == ("lab_recovery_cursor",)
+
+
+def test_initialize_migrates_v11_idle_control_index_to_v12_idempotently(tmp_path: Path) -> None:
+    path = tmp_path / "lab_jobs.sqlite3"
+    store = LabJobStore(path)
+    store.initialize()
+
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP INDEX ix_lab_shard_idle_control_eligibility")
+        connection.execute("DROP INDEX ix_lab_job_idle_control_recovery")
+        connection.execute(lab_jobs._V11_IDLE_CONTROL_RECOVERY_INDEX_STATEMENT)
+        connection.execute("PRAGMA user_version = 11")
+
+    store.initialize()
+    store.initialize()
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == LabJobStore.SCHEMA_VERSION
+        idle_index = connection.execute(
+            "SELECT sql FROM sqlite_schema WHERE type = 'index' "
+            "AND name = 'ix_lab_job_idle_control_recovery'"
+        ).fetchone()
+        shard_index = connection.execute(
+            "SELECT sql FROM sqlite_schema WHERE type = 'index' "
+            "AND name = 'ix_lab_shard_idle_control_eligibility'"
+        ).fetchone()
+
+    assert idle_index is not None
+    assert lab_jobs._sql_ddl_equivalent(
+        lab_jobs._V12_IDLE_CONTROL_RECOVERY_INDEX_STATEMENT,
+        str(idle_index[0]),
+    )
+    assert shard_index is not None
+    assert lab_jobs._sql_ddl_equivalent(
+        lab_jobs._V12_IDLE_CONTROL_SHARD_INDEX_STATEMENT,
+        str(shard_index[0]),
+    )
+
+
+def test_v9_to_v10_backfill_rejects_unknown_payload_protocol_atomically(tmp_path: Path) -> None:
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+    lease = _lease(store)
+    job = _submit_job(store, lease)
+    shard = store.plan_job(
+        job.job_id,
+        (
+            LabShardDefinition.from_payload(
+                shard_index=0,
+                adapter_id="n-shape-replay",
+                adapter_version="v1",
+                plan_hash="a" * 64,
+                payload_json='{"hold_days":1}',
+            ),
+        ),
+        lease=lease,
+        now=NOW + timedelta(seconds=1),
+    )[0]
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("DROP INDEX ix_lab_shard_exhausted_queued_v1_recovery")
+        connection.execute("DROP INDEX ix_lab_shard_exhausted_checkpointed_v1_recovery")
+        connection.execute("DROP INDEX ix_lab_job_idle_control_recovery")
+        connection.execute("DROP INDEX ix_lab_shard_idle_control_eligibility")
+        connection.execute("DROP TABLE lab_recovery_cursor")
+        connection.execute("DROP TRIGGER trg_lab_shard_payload_protocol_insert")
+        connection.execute("DROP TRIGGER trg_lab_shard_payload_protocol_update")
+        connection.execute("DROP INDEX ix_lab_shard_v2_reconciliation")
+        connection.execute("DROP INDEX ix_lab_shard_stale_recovery")
+        connection.execute("DROP INDEX ix_lab_shard_preclaim_candidate")
+        connection.execute("ALTER TABLE lab_shard DROP COLUMN payload_protocol_version")
+        connection.execute(lab_jobs._STALE_RECOVERY_INDEX_STATEMENT)
+        connection.execute("PRAGMA user_version = 9")
+        connection.execute("PRAGMA ignore_check_constraints = ON")
+        connection.execute(
+            "UPDATE lab_shard SET payload_json = ? WHERE job_id = ? AND shard_id = ?",
+            ('{"schema_version":3}', str(job.job_id), str(shard.shard_id)),
+        )
+
+    with pytest.raises(LabDatabaseIdentityError, match="payload protocol backfill failed"):
+        LabJobStore(store.path).initialize()
+
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(lab_shard)")}
+        assert "payload_protocol_version" not in columns
+
+
+def test_v9_to_v10_backfill_rejects_oversize_payload_before_parse_and_can_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+    lease = _lease(store)
+    job = _submit_job(store, lease)
+    definition = LabShardDefinition.from_payload(
+        shard_index=0,
+        adapter_id="n-shape-replay",
+        adapter_version="v1",
+        plan_hash="a" * 64,
+        payload_json='{"hold_days":1}',
+    )
+    shard = store.plan_job(
+        job.job_id,
+        (definition,),
+        lease=lease,
+        now=NOW + timedelta(seconds=1),
+    )[0]
+    original_payload = definition.payload_json
+    original_hash = definition.payload_hash
+    oversize = '{"payload":"' + ("x" * 1_048_576) + '"}'
+    parsed = 0
+    original_loads = lab_jobs.strict_json_loads
+
+    def counted_loads(*args: object, **kwargs: object) -> object:
+        nonlocal parsed
+        parsed += 1
+        return original_loads(*args, **kwargs)
+
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("DROP INDEX ix_lab_shard_exhausted_queued_v1_recovery")
+        connection.execute("DROP INDEX ix_lab_shard_exhausted_checkpointed_v1_recovery")
+        connection.execute("DROP INDEX ix_lab_job_idle_control_recovery")
+        connection.execute("DROP INDEX ix_lab_shard_idle_control_eligibility")
+        connection.execute("DROP TABLE lab_recovery_cursor")
+        connection.execute("DROP TRIGGER trg_lab_shard_payload_protocol_insert")
+        connection.execute("DROP TRIGGER trg_lab_shard_payload_protocol_update")
+        connection.execute("DROP INDEX ix_lab_shard_v2_reconciliation")
+        connection.execute("DROP INDEX ix_lab_shard_stale_recovery")
+        connection.execute("DROP INDEX ix_lab_shard_preclaim_candidate")
+        connection.execute("ALTER TABLE lab_shard DROP COLUMN payload_protocol_version")
+        connection.execute(lab_jobs._STALE_RECOVERY_INDEX_STATEMENT)
+        connection.execute("PRAGMA user_version = 9")
+        connection.execute("PRAGMA ignore_check_constraints = ON")
+        connection.execute(
+            "UPDATE lab_shard SET payload_json = ? WHERE job_id = ? AND shard_id = ?",
+            (oversize, str(job.job_id), str(shard.shard_id)),
+        )
+
+    monkeypatch.setattr(lab_jobs, "strict_json_loads", counted_loads)
+    with pytest.raises(LabDatabaseIdentityError, match="payload protocol backfill failed") as error:
+        LabJobStore(store.path).initialize()
+    assert parsed == 0
+    assert oversize not in str(error.value)
+    assert "payload protocol backfill failed" in str(error.value)
+
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(lab_shard)")}
+        assert "payload_protocol_version" not in columns
+        connection.execute(
+            "UPDATE lab_shard SET payload_json = ?, payload_hash = ? "
+            "WHERE job_id = ? AND shard_id = ?",
+            (original_payload, original_hash, str(job.job_id), str(shard.shard_id)),
+        )
+
+    LabJobStore(store.path).initialize()
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == LabJobStore.SCHEMA_VERSION
+        assert connection.execute(
+            "SELECT payload_protocol_version FROM lab_shard WHERE job_id = ? AND shard_id = ?",
+            (str(job.job_id), str(shard.shard_id)),
+        ).fetchone() == (1,)
 
 
 @pytest.mark.parametrize(
@@ -409,7 +741,7 @@ def test_initialize_migrates_real_v2_shard_and_backfills_readable_identity(
     assert shard.result_manifest_hash is None
 
     with sqlite3.connect(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == LabJobStore.SCHEMA_VERSION
         _assert_v6_epoch_authority(connection)
         assert connection.execute("SELECT COUNT(*) FROM lab_command").fetchone()[0] == 2
 
@@ -860,7 +1192,7 @@ def test_initialize_migrates_v3_additively_without_inventing_legacy_telemetry(
 
     with sqlite3.connect(path) as connection:
         connection.row_factory = sqlite3.Row
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == LabJobStore.SCHEMA_VERSION
         _assert_v6_epoch_authority(connection)
         migrated_job = connection.execute(
             "SELECT * FROM lab_job WHERE job_id = ?", (job_id,)

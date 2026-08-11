@@ -49,11 +49,11 @@ def test_step_publishes_source_watermark_and_deduplicates_unchanged_capture(
     first = capture_market_minute_step(gateway, received_at=NOW)
     retry = capture_market_minute_step(gateway, received_at=NOW)
 
-    descriptor = gateway.spool.source_descriptor(LiveChannel.MARKET_MINUTE)
+    minute_descriptor = gateway.spool.source_descriptor(LiveChannel.MARKET_MINUTE)
     assert first.processed_count == 1
     assert retry.processed_count == 0
     assert first.output_sequence == retry.output_sequence == 0
-    assert first.source_generations == {"market_minute": descriptor.generation_id}
+    assert first.source_generations == {"market_minute": minute_descriptor.generation_id}
     assert first.degraded_reasons == ()
 
 
@@ -68,3 +68,9 @@ def test_step_persists_source_failure_as_stale_degraded_watermark(tmp_path: Path
     assert result.processed_count == 1
     assert result.output_sequence == 0
     assert result.degraded_reasons == ("market_minute:stale:source_error:TimeoutError",)
+
+
+def test_market_minute_source_does_not_own_watchlist_quote_capture() -> None:
+    source = Path(__file__).resolve().parents[2] / "src/rquant/market_minute_source_service.py"
+
+    assert "watchlist_quote" not in source.read_text(encoding="utf-8")

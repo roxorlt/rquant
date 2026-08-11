@@ -24,9 +24,17 @@ from rquant.panorama_data import (
 from rquant.storage.duckdb import DuckDBStore
 
 _OVERVIEW_COLUMNS = [
-    "board_code", "board_name", "amount", "main_net_amount", "main_net_rate",
-    "pct_chg_median", "limit_up_count", "broken_count", "stock_count",
-    "limit_up_ratio_pct", "leading_stock",
+    "board_code",
+    "board_name",
+    "amount",
+    "main_net_amount",
+    "main_net_rate",
+    "pct_chg_median",
+    "limit_up_count",
+    "broken_count",
+    "stock_count",
+    "limit_up_ratio_pct",
+    "leading_stock",
 ]
 
 
@@ -47,7 +55,7 @@ def _snapshot() -> pd.DataFrame:
         ("600002.SH", 10.50, 11.00, 1e8),  # 炸板（触 11 回落）
         ("600003.SH", 11.00, 11.00, 3e8),  # 涨停
         ("600004.SH", 10.20, 10.30, 4e8),  # 普通上涨
-        ("600005.SH", None, None, 0.0),    # 停牌：不计涨停/炸板，pct_chg NaN
+        ("600005.SH", None, None, 0.0),  # 停牌：不计涨停/炸板，pct_chg NaN
     ]
     df = pd.DataFrame(rows, columns=["ts_code", "price", "high", "amount"])
     df["pre_close"] = 10.0
@@ -65,8 +73,12 @@ def _dc_members() -> pd.DataFrame:
             "board_name": ["半导体"] * 3 + ["白酒"] * 2 + ["AI"],
             "idx_type": ["行业板块"] * 5 + ["概念板块"],
             "con_code": [
-                "600001.SH", "600002.SH", "600003.SH",
-                "600004.SH", "600005.SH", "600001.SH",
+                "600001.SH",
+                "600002.SH",
+                "600003.SH",
+                "600004.SH",
+                "600005.SH",
+                "600001.SH",
             ],
         }
     )
@@ -108,7 +120,7 @@ class TestBuildBoardOverviewU1:
         assert bk1["amount"] == pytest.approx(6e8)
         assert bk1["stock_count"] == 3
         assert bk1["limit_up_count"] == 2  # 600001 / 600003
-        assert bk1["broken_count"] == 1    # 600002
+        assert bk1["broken_count"] == 1  # 600002
         assert bk1["limit_up_ratio_pct"] == pytest.approx(66.7)
         # 净流入来自资金流精确 join（BK0001 + '.DC'）
         assert bk1["main_net_amount"] == pytest.approx(5e8)
@@ -408,7 +420,15 @@ class TestLoadDailyKlineU6:
         kl = load_daily_kline("600001.SH", store=store)
         assert len(kl) == 120
         assert list(kl.columns) == [
-            "trade_date", "open", "high", "low", "close", "volume", "ma5", "ma10", "ma20",
+            "trade_date",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "ma5",
+            "ma10",
+            "ma20",
         ]
         # MA 就地滚动：首 4 根 ma5 为 NaN，第 5 根起有值
         assert kl["ma5"].iloc[:4].isna().all()
@@ -422,13 +442,20 @@ class TestLoadDailyKlineU6:
         self._seed(store, 150)
         assert load_daily_kline("999999.SZ", store=store).empty
 
+    def test_rejects_unbounded_history_window(self, store: DuckDBStore) -> None:
+        self._seed(store, 150)
+
+        result = load_daily_kline("600001.SH", n=241, store=store)
+
+        assert result.empty
+        assert result.attrs["serving_state"] == "unavailable"
+        assert "between 1 and 240" in result.attrs["serving_detail"]
+
     def test_store_open_failure_returns_empty(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        import duckdb
+        def boom() -> DuckDBStore:
+            raise RuntimeError("serving unavailable")
 
-        def boom(**kwargs: object) -> DuckDBStore:
-            raise duckdb.IOException("locked")
-
-        monkeypatch.setattr(panorama_data, "open_readonly_store", boom)
+        monkeypatch.setattr(panorama_data, "_open_serving_store", boom)
         assert load_daily_kline("600001.SH").empty
 
 
@@ -446,16 +473,32 @@ class TestFakeModeU7:
 
         snap = panorama_data.fetch_market_snapshot()
         assert set(
-            ["ts_code", "name", "price", "open", "high", "low", "pre_close",
-             "pct_chg", "volume", "amount"]
+            [
+                "ts_code",
+                "name",
+                "price",
+                "open",
+                "high",
+                "low",
+                "pre_close",
+                "pct_chg",
+                "volume",
+                "amount",
+            ]
         ).issubset(snap.columns)
         assert len(snap) >= 30
 
         flow = panorama_data.fetch_sector_fund_flow("行业资金流")
         assert not flow.empty
         assert set(
-            ["board_code", "board_name", "pct_chg", "main_net_amount",
-             "main_net_rate", "leading_stock"]
+            [
+                "board_code",
+                "board_name",
+                "pct_chg",
+                "main_net_amount",
+                "main_net_rate",
+                "leading_stock",
+            ]
         ).issubset(flow.columns)
         assert flow.attrs["route"] == "em_direct"
 
@@ -481,8 +524,9 @@ class TestFakeModeU7:
         assert len(trend5) == 1200
 
         kline = panorama_data.load_daily_kline("600001.SH")
-        assert set(["trade_date", "open", "high", "low", "close", "volume",
-                    "ma5", "ma10", "ma20"]).issubset(kline.columns)
+        assert set(
+            ["trade_date", "open", "high", "low", "close", "volume", "ma5", "ma10", "ma20"]
+        ).issubset(kline.columns)
         assert len(kline) == 120
 
     def test_fake_kline_mixed_candles(self, monkeypatch: pytest.MonkeyPatch) -> None:

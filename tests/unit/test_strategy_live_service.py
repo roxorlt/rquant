@@ -21,7 +21,10 @@ from rquant.runtime_candidate_universe import (
     RuntimeCandidateUniverseIntegrityError,
     RuntimeCandidateUniverseLoader,
 )
+from rquant.runtime_market_session import MarketCalendarAuthority
+from rquant.runtime_shadow_validation import HmacCompletionAttestationAuthority
 from rquant.signal_contracts import SignalAction
+from rquant.signal_router_runtime import SignalRouteBacklogError
 from rquant.strategy_candidate_feature_join import (
     StrategyCandidateFeatureJoinError,
     join_strategy_candidate_features,
@@ -31,9 +34,14 @@ from rquant.strategy_candidate_snapshot import (
     StrategyCandidateRecord,
     StrategyCandidateSnapshotSpool,
     asia_shanghai_trade_date,
+    strategy_candidate_schema_fingerprint,
 )
-from rquant.strategy_live_service import run_strategy_live_batch
+from rquant.strategy_live_service import (
+    StrategyCompletionAttestationConfig,
+    run_strategy_live_batch,
+)
 from rquant.strategy_runner import (
+    RunnerSignalRouteDrainEvidence,
     StrategyBatchConflictError,
     StrategyCandidateState,
     StrategyDecision,
@@ -49,6 +57,94 @@ from rquant.strategy_spec import (
 
 NOW = datetime(2026, 7, 31, 1, 40, 2, tzinfo=UTC)
 COMMIT = "a" * 40
+DEFINITION_FINGERPRINT = hashlib.sha256(b"n-shape-live:definition:v1").hexdigest()
+EXECUTABLE_FINGERPRINT = "b" * 64
+STATIC_FEATURE_SCHEMA = {
+    "candidate_score": {"dtype": "number", "semantic": "candidate ranking score"}
+}
+CANDIDATE_SCHEMA_FINGERPRINT = strategy_candidate_schema_fingerprint(
+    strategy_id="n-shape-live",
+    strategy_version="1",
+    static_feature_schema=STATIC_FEATURE_SCHEMA,
+)
+SESSION_CLOSE = datetime(2026, 7, 31, 7, 0, tzinfo=UTC)
+SOURCE_ID = "strategy.n-shape-live.v1"
+ATTESTATION_AUTHORITY = HmacCompletionAttestationAuthority(
+    key_id="strategy-live-test-key-v1",
+    secret=b"strategy-live-test-completion-attestation-key",
+)
+
+
+def _completion_attestation() -> StrategyCompletionAttestationConfig:
+    return StrategyCompletionAttestationConfig(
+        signer=ATTESTATION_AUTHORITY,
+        strategy_registration_fingerprint=DEFINITION_FINGERPRINT,
+        executable_fingerprint=EXECUTABLE_FINGERPRINT,
+        candidate_schema_fingerprint=CANDIDATE_SCHEMA_FINGERPRINT,
+        feature_registration_fingerprint="1" * 64,
+        feature_contract_fingerprint="2" * 64,
+        producer_manifest_fingerprint="3" * 64,
+    )
+
+
+class _RouteAuthority:
+    def __init__(self, *, drained: bool = True) -> None:
+        self.drained = drained
+        self.requests: list[tuple[str, str, str, date, int, int, datetime]] = []
+
+    def read_drain_evidence(
+        self,
+        *,
+        source_id: str,
+        runner_generation_id: str,
+        strategy_spec_fingerprint: str,
+        trade_date: date,
+        segment_start_sequence: int,
+        routed_through_sequence: int,
+        observed_at: datetime,
+    ) -> RunnerSignalRouteDrainEvidence:
+        self.requests.append(
+            (
+                source_id,
+                runner_generation_id,
+                strategy_spec_fingerprint,
+                trade_date,
+                segment_start_sequence,
+                routed_through_sequence,
+                observed_at,
+            )
+        )
+        if not self.drained:
+            raise SignalRouteBacklogError("router backlog")
+        return RunnerSignalRouteDrainEvidence(
+            source_id=source_id,
+            runner_generation_id=runner_generation_id,
+            strategy_spec_fingerprint=strategy_spec_fingerprint,
+            signal_authority_generation_id="a" * 64,
+            routing_policy_fingerprint="9" * 64,
+            trade_date=trade_date,
+            segment_start_sequence=segment_start_sequence,
+            segment_record_count=routed_through_sequence - segment_start_sequence,
+            segment_raw_bytes=max(routed_through_sequence - segment_start_sequence, 0),
+            segment_chain_hash="7" * 64,
+            observed_high_watermark=routed_through_sequence,
+            routed_through_sequence=routed_through_sequence,
+            last_sequence=routed_through_sequence,
+            route_receipts_sha256="b" * 64,
+            observed_at=observed_at,
+        )
+
+
+def _calendar(*, open_dates: tuple[date, ...] = (date(2026, 7, 31),)) -> MarketCalendarAuthority:
+    return MarketCalendarAuthority.create(
+        schema_version=1,
+        exchange="SSE",
+        producer_commit="c" * 40,
+        coverage_start=date(2026, 7, 1),
+        coverage_end=date(2026, 8, 31),
+        open_dates=open_dates,
+        generated_at=datetime(2026, 7, 1, tzinfo=UTC),
+    )
 
 
 def _spec() -> StrategySpec:
@@ -131,19 +227,39 @@ def _publish(
         sequence=sequence,
         event_time=available_at,
         available_at=available_at,
+        decision_cutoff=available_at,
+        actual_delay_seconds=0.0,
         row_count=len(frame),
         content_hash=hashlib.sha256(payload).hexdigest(),
         field_statuses=(
             FeatureFieldStatus(
                 name="rel_same_minute",
                 status=status,
+                source_event_time=available_at,
                 available_at=available_at,
+                decision_cutoff=available_at,
+                actual_delay_seconds=0.0,
                 reason=None if status is FeatureAvailability.AVAILABLE else "source_empty",
             ),
         ),
         producer_commit=producer_commit,
     )
     spool.publish(envelope, payload)
+
+
+def _seal_feature_session(spool: FeatureBatchSpool) -> None:
+    record = spool.list_after(sequence=-1)[-1]
+    spool.publish_session_close_marker(
+        trade_date=date(2026, 7, 31),
+        session_close_at=SESSION_CLOSE,
+        produced_at=SESSION_CLOSE + timedelta(seconds=1),
+        calendar_generation_id=_calendar().content_sha256,
+        complete_through=SESSION_CLOSE,
+        upstream_source_generation_id="f" * 64,
+        upstream_final_sequence=record.envelope.sequence,
+        upstream_final_batch_id=f"raw-{record.envelope.sequence}",
+        upstream_final_content_hash="e" * 64,
+    )
 
 
 def _candidate_loader(
@@ -184,6 +300,10 @@ def _candidate_loader(
     StrategyCandidateSnapshotSpool(root).publish_strategy_records(
         strategy_id=_spec().strategy_id,
         strategy_version=str(_spec().version),
+        definition_fingerprint=DEFINITION_FINGERPRINT,
+        executable_fingerprint=EXECUTABLE_FINGERPRINT,
+        candidate_schema_fingerprint=CANDIDATE_SCHEMA_FINGERPRINT,
+        static_feature_schema=STATIC_FEATURE_SCHEMA,
         source_snapshot_ids={"candidate_input": "e" * 64},
         trade_date=trade_date,
         captured_at=captured,
@@ -200,6 +320,11 @@ def _candidate_loader(
                     snapshot_root=root,
                     required=True,
                     max_age_seconds=max_age_seconds,
+                    definition_fingerprint=DEFINITION_FINGERPRINT,
+                    executable_fingerprint=EXECUTABLE_FINGERPRINT,
+                    candidate_schema_fingerprint=CANDIDATE_SCHEMA_FINGERPRINT,
+                    static_feature_names=("candidate_score",),
+                    static_feature_schema=STATIC_FEATURE_SCHEMA,
                 ),
             ),
         )
@@ -223,10 +348,134 @@ def test_service_processes_visible_feature_once_and_emits_runner_signal(tmp_path
     assert summary.processed_count == 1
     assert summary.signal_count == 1
     assert summary.last_feature_sequence == 0
+
+
+def test_service_publishes_close_receipt_only_after_sse_close_and_route_drain(
+    tmp_path: Path,
+) -> None:
+    features = FeatureBatchSpool(tmp_path / "features")
+    _publish(features, available_at=SESSION_CLOSE)
+    _seal_feature_session(features)
+    runner = _runner(tmp_path / "runner.sqlite3")
+    route_authority = _RouteAuthority()
+
+    summary = run_strategy_live_batch(
+        feature_spool=features,
+        candidate_universe_loader=_candidate_loader(
+            tmp_path,
+            available_at=SESSION_CLOSE,
+        ),
+        runner=runner,
+        evaluator=_evaluator,
+        observed_at=SESSION_CLOSE + timedelta(seconds=3),
+        limit=10,
+        calendar=_calendar(),
+        route_authority=route_authority,
+        completion_source_id=SOURCE_ID,
+        producer_service_id="strategy-live",
+        producer_instance_id="n-shape-live-primary",
+        producer_version="0.27.0",
+        completion_attestation=_completion_attestation(),
+    )
+
+    receipt = runner.session_close_receipt(date(2026, 7, 31))
+    assert summary.completion_receipt_id == receipt.receipt_id
+    assert receipt.calendar_generation_id == _calendar().content_sha256
+    assert receipt.producer_commit == COMMIT
+    assert route_authority.requests == [
+        (
+            SOURCE_ID,
+            runner.source_generation_id,
+            runner.spec.spec_fingerprint,
+            date(2026, 7, 31),
+            0,
+            1,
+            SESSION_CLOSE + timedelta(seconds=3),
+        )
+    ]
+
+
+def test_service_does_not_self_declare_completion_without_feature_close_marker(
+    tmp_path: Path,
+) -> None:
+    features = FeatureBatchSpool(tmp_path / "features")
+    _publish(features, available_at=SESSION_CLOSE)
+    runner = _runner(tmp_path / "runner.sqlite3")
+    route_authority = _RouteAuthority()
+
+    summary = run_strategy_live_batch(
+        feature_spool=features,
+        candidate_universe_loader=_candidate_loader(
+            tmp_path,
+            available_at=SESSION_CLOSE,
+        ),
+        runner=runner,
+        evaluator=_evaluator,
+        observed_at=SESSION_CLOSE + timedelta(seconds=3),
+        limit=10,
+        calendar=_calendar(),
+        route_authority=route_authority,
+        completion_source_id=SOURCE_ID,
+        producer_service_id="strategy-live",
+        producer_instance_id="n-shape-live-primary",
+        producer_version="0.27.0",
+        completion_attestation=_completion_attestation(),
+    )
+
+    assert summary.completion_receipt_id is None
+    assert route_authority.requests == []
+    assert runner.session_close_receipt(date(2026, 7, 31)) is None
+
+
+@pytest.mark.parametrize(
+    ("observed_at", "open_dates", "drained"),
+    [
+        (SESSION_CLOSE - timedelta(minutes=1), (date(2026, 7, 31),), True),
+        (SESSION_CLOSE + timedelta(seconds=3), (date(2026, 7, 31),), False),
+        (SESSION_CLOSE + timedelta(days=1), (date(2026, 7, 31),), True),
+    ],
+)
+def test_service_does_not_publish_for_1459_backlog_or_closed_day(
+    tmp_path: Path,
+    observed_at: datetime,
+    open_dates: tuple[date, ...],
+    drained: bool,
+) -> None:
+    features = FeatureBatchSpool(tmp_path / "features")
+    feature_time = min(observed_at, SESSION_CLOSE)
+    _publish(features, available_at=feature_time)
+    runner = _runner(tmp_path / "runner.sqlite3")
+    route_authority = _RouteAuthority(drained=drained)
+
+    summary = run_strategy_live_batch(
+        feature_spool=features,
+        candidate_universe_loader=_candidate_loader(
+            tmp_path,
+            available_at=feature_time,
+        ),
+        runner=runner,
+        evaluator=_evaluator,
+        observed_at=observed_at,
+        limit=10,
+        calendar=_calendar(open_dates=open_dates),
+        route_authority=route_authority,
+        completion_source_id=SOURCE_ID,
+        producer_service_id="strategy-live",
+        producer_instance_id="n-shape-live-primary",
+        producer_version="0.27.0",
+        completion_attestation=_completion_attestation(),
+    )
+
+    assert summary.completion_receipt_id is None
+    assert runner.session_close_receipt(date(2026, 7, 31)) is None
     assert runner.signal_high_watermark() == 1
     assert runner.candidate_state("600000.SH").state is StrategyLifecycleState.ARMED  # type: ignore[union-attr]
     stored = features.read_result(features.list_after(sequence=-1, limit=1)[0])
-    universe = _candidate_loader(tmp_path, root_name="expected-candidates").load(
+    universe = _candidate_loader(
+        tmp_path,
+        available_at=stored.envelope.available_at,
+        root_name="expected-candidates",
+    ).load(
         as_of=stored.envelope.available_at,
         required_trade_date=asia_shanghai_trade_date(stored.envelope.event_time),
     )
@@ -240,6 +489,42 @@ def test_service_processes_visible_feature_once_and_emits_runner_signal(tmp_path
     assert runner.signals_after(sequence=0)[0].signal.dataset_snapshot_id == (
         joined.envelope.input_fingerprint
     )
+
+
+def test_service_rejects_calendar_not_visible_at_completion_cutoff(
+    tmp_path: Path,
+) -> None:
+    features = FeatureBatchSpool(tmp_path / "features")
+    _publish(features, available_at=SESSION_CLOSE)
+    calendar = MarketCalendarAuthority.create(
+        schema_version=1,
+        exchange="SSE",
+        producer_commit="c" * 40,
+        coverage_start=date(2026, 7, 1),
+        coverage_end=date(2026, 8, 31),
+        open_dates=(date(2026, 7, 31),),
+        generated_at=SESSION_CLOSE + timedelta(minutes=1),
+    )
+
+    with pytest.raises(ValueError, match="calendar.*after|generated"):
+        run_strategy_live_batch(
+            feature_spool=features,
+            candidate_universe_loader=_candidate_loader(
+                tmp_path,
+                available_at=SESSION_CLOSE,
+            ),
+            runner=_runner(tmp_path / "runner.sqlite3"),
+            evaluator=_evaluator,
+            observed_at=SESSION_CLOSE + timedelta(seconds=3),
+            limit=10,
+            calendar=calendar,
+            route_authority=_RouteAuthority(),
+            completion_source_id=SOURCE_ID,
+            producer_service_id="strategy-live",
+            producer_instance_id="n-shape-live-primary",
+            producer_version="0.27.0",
+            completion_attestation=_completion_attestation(),
+        )
 
 
 def test_crash_after_runner_commit_replays_without_duplicate_signal(
@@ -284,6 +569,10 @@ def _publish_next_candidate_generation(root: Path) -> None:
     StrategyCandidateSnapshotSpool(root.resolve()).publish_strategy_records(
         strategy_id=_spec().strategy_id,
         strategy_version=str(_spec().version),
+        definition_fingerprint=DEFINITION_FINGERPRINT,
+        executable_fingerprint=EXECUTABLE_FINGERPRINT,
+        candidate_schema_fingerprint=CANDIDATE_SCHEMA_FINGERPRINT,
+        static_feature_schema=STATIC_FEATURE_SCHEMA,
         source_snapshot_ids={"candidate_input": "f" * 64},
         trade_date=date(2026, 7, 31),
         captured_at=NOW,

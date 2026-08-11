@@ -38,22 +38,25 @@ WRAPPER_ARGUMENTS = [
 
 
 @pytest.mark.parametrize(
-    ("name", "label", "command"),
+    ("name", "label", "command", "extra_environment"),
     [
         (
             "com.roxor.rquant-lab-scheduler.plist",
             "com.roxor.rquant-lab-scheduler",
             "lab-scheduler",
+            {"APP_ENV": "prod", "RQUANT_DISABLE_DOTENV": "1"},
         ),
         (
             "com.roxor.rquant-lab-worker.plist",
             "com.roxor.rquant-lab-worker",
             "lab-worker",
+            {},
         ),
         (
             "com.roxor.rquant-lab-finalizer.plist",
             "com.roxor.rquant-lab-finalizer",
             "lab-finalizer",
+            {},
         ),
     ],
 )
@@ -61,6 +64,7 @@ def test_lab_launchd_plists_are_private_bounded_daemons(
     name: str,
     label: str,
     command: str,
+    extra_environment: dict[str, str],
 ) -> None:
     path = LAUNCHD_DIR / name
     with path.open("rb") as stream:
@@ -87,6 +91,7 @@ def test_lab_launchd_plists_are_private_bounded_daemons(
         "PYTHONDONTWRITEBYTECODE": "1",
         "RQUANT_RELEASE_HANDOFF_MANAGED": "1",
         "RQUANT_TRUSTED_GIT_PATH": "__RQUANT_TRUSTED_GIT__",
+        **extra_environment,
     }
     serialized = path.read_text(encoding="utf-8")
     assert "SECRET" not in serialized

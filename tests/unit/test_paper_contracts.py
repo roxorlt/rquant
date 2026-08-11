@@ -161,6 +161,7 @@ def test_fill_identity_notional_and_cost_rules_are_deterministic() -> None:
     order = _order()
     fill = PaperFill(
         order_id=order.order_id,
+        execution_id="9" * 64,
         sequence=1,
         quantity=400,
         price=Decimal("10.25"),

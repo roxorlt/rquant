@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import signal
 import subprocess
@@ -19,6 +20,7 @@ from rquant.contained_subprocess import ContainedProcessError
 from rquant.ops.production_deploy import (
     ALL_LONG_RUNNING_SERVICES,
     LAB_LAUNCHD_HANDOFF_LABELS,
+    LINUX_PRODUCTION_RUNTIME_ROOT,
     DeployConfig,
     DeployError,
     PolicyError,
@@ -57,11 +59,55 @@ class FakeRunner:
         key = self._normalize(args)
         self.executed_calls.append(executed)
         self.calls.append(key)
-        returncode, stdout = self.responses.get(executed, self.responses.get(key, (0, "")))
+        response = self.responses.get(executed, self.responses.get(key))
+        if response is None:
+            response = self._runtime_profile_response(key)
+        returncode, stdout = response or (0, "")
         result = subprocess.CompletedProcess(args, returncode, stdout=stdout, stderr="")
         if check and returncode != 0:
             raise subprocess.CalledProcessError(returncode, args, output=stdout, stderr="")
         return result
+
+    @staticmethod
+    def _runtime_profile_response(command: tuple[str, ...]) -> tuple[int, str] | None:
+        if command[:2] == ("rquant", "runtime-production-profile"):
+            output_dir = Path(command[command.index("--output-dir") + 1])
+            target_sha = command[command.index("--expected-commit") + 1]
+            profile_id = "c" * 64
+            return (
+                0,
+                json.dumps(
+                    {
+                        "producer_commit": target_sha,
+                        "profile_id": profile_id,
+                        "profile_path": str(output_dir / f"{profile_id}.json"),
+                        "runtime_root": str(output_dir.parent / "runtime"),
+                        "status": "published" if "--apply" in command else "dry_run",
+                    }
+                ),
+            )
+        if command[:2] == ("rquant", "runtime-production-prerequisites"):
+            return (0, json.dumps({"profile_id": "c" * 64}))
+        if command[:2] == ("rquant", "runtime-deployment-profile"):
+            profile_id = Path(command[command.index("--profile") + 1]).stem
+            if "--apply" not in command:
+                return (0, json.dumps({"profile_id": profile_id}))
+            return (
+                0,
+                json.dumps(
+                    {
+                        "producer_commit": command[command.index("--expected-commit") + 1],
+                        "generation_hash": "d" * 64,
+                        "deployment_profile_id": profile_id,
+                        "previous_generation_hash": "e" * 64,
+                    }
+                ),
+            )
+        if command[:2] == ("rquant", "runtime-deployment-rollout"):
+            return (0, json.dumps({"status": "succeeded"}))
+        if command[:2] == ("rquant", "runtime-deployment-rollback"):
+            return (0, json.dumps({"status": "rolled_back"}))
+        return None
 
 
 class FailingServiceHealthRunner(FakeRunner):
@@ -137,6 +183,39 @@ class SequenceRunner(FakeRunner):
         if check and returncode != 0:
             raise subprocess.CalledProcessError(returncode, args, output=stdout, stderr="")
         return result
+
+
+class FailingFirstJobAuthorityRunner(FakeRunner):
+    def __init__(self, responses: dict[tuple[str, ...], tuple[int, str]]) -> None:
+        super().__init__(responses)
+        self._prepare_calls = 0
+
+    def run(self, args: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
+        if tuple(args[:2]) != ("rquant", "lab-runtime-prepare"):
+            return super().run(args, check=check)
+        executed = tuple(args)
+        self.executed_calls.append(executed)
+        self.calls.append(executed)
+        self._prepare_calls += 1
+        returncode = 1 if self._prepare_calls == 1 else 0
+        result = subprocess.CompletedProcess(args, returncode, stdout="", stderr="")
+        if check and returncode != 0:
+            raise subprocess.CalledProcessError(returncode, args, output="", stderr="")
+        return result
+
+
+class RuntimeRollbackRunner(SequenceRunner):
+    def run(self, args: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
+        if tuple(args[:2]) == ("rquant", "runtime-deployment-rollback"):
+            self.calls.append(tuple(args))
+            self.executed_calls.append(tuple(args))
+            return subprocess.CompletedProcess(
+                args,
+                0,
+                stdout=json.dumps({"status": "rolled_back"}),
+                stderr="",
+            )
+        return super().run(args, check=check)
 
 
 class FakeGenerationAuthority:
@@ -328,6 +407,9 @@ def _config(tmp_path: Path, *, target: str = "v0.13.2", dry_run: bool = False) -
         uv_bin="uv",
         rquant_bin="rquant",
         audit_path=tmp_path / "deployments.jsonl",
+        runtime_production_inputs=(LINUX_PRODUCTION_RUNTIME_ROOT.parent / "runtime-inputs.json"),
+        runtime_profile_output_dir=(LINUX_PRODUCTION_RUNTIME_ROOT.parent / "runtime-profiles"),
+        runtime_root=LINUX_PRODUCTION_RUNTIME_ROOT,
     )
 
 
@@ -401,6 +483,10 @@ def test_change_plan_restarts_all_for_shared_runtime_or_unknown_source() -> None
     assert unknown.restart_services == ALL_LONG_RUNNING_SERVICES
 
 
+def test_page_control_is_a_managed_long_running_production_service() -> None:
+    assert "rquant-page-control.service" in ALL_LONG_RUNNING_SERVICES
+
+
 def test_lab_daemon_change_uses_launchd_only_for_macos_release_profile() -> None:
     macos = build_change_plan(
         ["src/rquant/lab_daemon.py"],
@@ -433,6 +519,48 @@ def test_release_profile_platform_mismatch_fails_closed(
         validate_release_profile(release_profile, platform_name)
 
 
+def test_linux_production_deploy_requires_runtime_profile_before_any_command(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner(_base_responses())
+    baseline = _config(tmp_path, dry_run=True)
+    config = DeployConfig(
+        **{
+            **baseline.__dict__,
+            "release_profile": "linux-production",
+            "platform_name": "linux",
+            "runtime_production_inputs": None,
+            "runtime_profile_output_dir": None,
+            "runtime_root": None,
+        }
+    )
+
+    with pytest.raises(PolicyError, match="production.*runtime profile|required"):
+        deploy(config, runner=runner)
+
+    assert runner.calls == []
+
+
+def test_linux_production_deploy_rejects_relocated_runtime_root_before_any_command(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner(_base_responses())
+    baseline = _config(tmp_path, dry_run=True)
+    config = DeployConfig(
+        **{
+            **baseline.__dict__,
+            "release_profile": "linux-production",
+            "platform_name": "linux",
+            "runtime_root": Path("/srv/rquant/data/runtime"),
+        }
+    )
+
+    with pytest.raises(PolicyError, match="Linux production runtime root"):
+        deploy(config, runner=runner)
+
+    assert runner.calls == []
+
+
 @pytest.mark.parametrize(
     ("when", "expected"),
     [
@@ -457,6 +585,48 @@ def test_dry_run_builds_exact_plan_without_mutating_repo(tmp_path: Path) -> None
     assert result.handoff_daemons == ()
     assert ("git", "merge", "--ff-only", _sha("b")) not in runner.calls
     assert ("uv", "sync", "--frozen") not in runner.calls
+
+
+def test_dry_run_does_not_create_missing_lock_parent(tmp_path: Path) -> None:
+    runner = FakeRunner(_base_responses())
+    lock_path = tmp_path / "absent-coordination" / "production.lock"
+    baseline = _config(tmp_path, dry_run=True)
+    config = DeployConfig(**{**baseline.__dict__, "lock_path": lock_path})
+
+    assert not lock_path.parent.exists()
+
+    result = deploy(config, runner=runner)
+
+    assert result.status == "dry_run"
+    assert not lock_path.parent.exists()
+
+
+def test_lock_free_dry_run_rejects_generation_change_during_preview(tmp_path: Path) -> None:
+    class ChangingGenerationRunner(FakeRunner):
+        head_reads = 0
+
+        def run(
+            self,
+            args: list[str],
+            *,
+            check: bool = True,
+        ) -> subprocess.CompletedProcess[str]:
+            if self._normalize(args) == ("git", "rev-parse", "HEAD"):
+                self.head_reads += 1
+                if self.head_reads > 1:
+                    self.calls.append(("git", "rev-parse", "HEAD"))
+                    return subprocess.CompletedProcess(args, 0, stdout=f"{_sha('c')}\n", stderr="")
+            return super().run(args, check=check)
+
+    runner = ChangingGenerationRunner(_base_responses())
+    lock_path = tmp_path / "absent-coordination" / "production.lock"
+    baseline = _config(tmp_path, dry_run=True)
+    config = DeployConfig(**{**baseline.__dict__, "lock_path": lock_path})
+
+    with pytest.raises(PolicyError, match="generation changed"):
+        deploy(config, runner=runner)
+
+    assert not lock_path.parent.exists()
 
 
 def test_all_deploy_git_commands_use_verified_absolute_git_path(tmp_path: Path) -> None:
@@ -689,9 +859,28 @@ def test_successful_deploy_uses_exact_sha_preflight_and_audit(tmp_path: Path) ->
 
     assert result.status == "deployed"
     assert result.handoff_daemons == ()
+    production_profile_calls = [
+        call
+        for call in runner.calls
+        if call[:2]
+        in {
+            ("rquant", "runtime-production-profile"),
+            ("rquant", "runtime-production-prerequisites"),
+        }
+    ]
+    assert production_profile_calls
+    assert all(
+        call[call.index("--runtime-mode") + 1] == "linux-production"
+        for call in production_profile_calls
+    )
     assert ("git", "merge", "--ff-only", _sha("b")) in runner.calls
     assert ("uv", "sync", "--frozen") in runner.calls
-    assert runner.calls.count(("rquant", "preflight")) == 2
+    assert (
+        runner.calls.count(
+            ("rquant", "preflight", "--runtime-root", str(LINUX_PRODUCTION_RUNTIME_ROOT))
+        )
+        == 2
+    )
     audit = (_config(tmp_path).audit_path).read_text(encoding="utf-8")
     assert '"status": "deployed"' in audit
     assert f'"target_sha": "{_sha("b")}"' in audit
@@ -701,6 +890,476 @@ def test_successful_deploy_uses_exact_sha_preflight_and_audit(tmp_path: Path) ->
         (_sha("b"), authority.intent.operation_id, "deploy", "publish"),
         (_sha("b"), authority.intent.operation_id, "deploy", "commit"),
     ]
+
+
+def test_successful_deploy_runs_bound_runtime_profile_preview_apply_and_rollout(
+    tmp_path: Path,
+) -> None:
+    inputs = tmp_path / "production-runtime-inputs.json"
+    profiles = tmp_path / "runtime-profiles"
+    runtime_root = tmp_path / "runtime"
+    profile_id = "c" * 64
+    generation = "d" * 64
+    profile_path = profiles / f"{profile_id}.json"
+    migration_authority = tmp_path / "schema-v1-migration-authority.json"
+    target_sha = _sha("b")
+    responses = _base_responses()
+    production_profile = (
+        "rquant",
+        "runtime-production-profile",
+        "--inputs",
+        str(inputs),
+        "--output-dir",
+        str(profiles),
+        "--expected-commit",
+        target_sha,
+    )
+    prerequisite_preview = (
+        "rquant",
+        "runtime-production-prerequisites",
+        "--inputs",
+        str(inputs),
+        "--expected-commit",
+        target_sha,
+    )
+    prerequisite_apply = (
+        *prerequisite_preview,
+        "--apply",
+        "--profile-id",
+        profile_id,
+    )
+    production_apply = (
+        *production_profile,
+        "--apply",
+        "--profile-id",
+        profile_id,
+    )
+    profile_preview = (
+        "rquant",
+        "runtime-deployment-profile",
+        "--profile",
+        str(profile_path),
+        "--runtime-root",
+        str(runtime_root),
+        "--expected-commit",
+        target_sha,
+    )
+    profile_apply = (
+        *profile_preview,
+        "--apply",
+        "--profile-id",
+        profile_id,
+        "--schema-v1-migration-authority",
+        str(migration_authority),
+    )
+    rollout = (
+        "rquant",
+        "runtime-deployment-rollout",
+        "--runtime-root",
+        str(runtime_root),
+        "--expected-commit",
+        target_sha,
+        "--profile-id",
+        profile_id,
+        "--generation-hash",
+        generation,
+    )
+    responses[production_profile] = (
+        0,
+        json.dumps(
+            {
+                "producer_commit": target_sha,
+                "profile_id": profile_id,
+                "profile_path": str(profile_path),
+                "runtime_root": str(runtime_root),
+                "status": "dry_run",
+            }
+        ),
+    )
+    responses[prerequisite_preview] = (0, json.dumps({"profile_id": profile_id}))
+    responses[prerequisite_apply] = (0, json.dumps({"profile_id": profile_id}))
+    responses[production_apply] = (
+        0,
+        json.dumps(
+            {
+                "producer_commit": target_sha,
+                "profile_id": profile_id,
+                "profile_path": str(profile_path),
+                "status": "published",
+            }
+        ),
+    )
+    responses[profile_preview] = (0, json.dumps({"profile_id": profile_id}))
+    responses[profile_apply] = (
+        0,
+        json.dumps(
+            {
+                "producer_commit": target_sha,
+                "generation_hash": generation,
+                "deployment_profile_id": profile_id,
+                "previous_generation_hash": None,
+            }
+        ),
+    )
+    responses[rollout] = (0, json.dumps({"status": "succeeded"}))
+    runner = FakeRunner(responses)
+    baseline = _config(tmp_path)
+    config = DeployConfig(
+        **{
+            **baseline.__dict__,
+            "runtime_production_inputs": inputs,
+            "runtime_profile_output_dir": profiles,
+            "runtime_root": runtime_root,
+            "release_profile": "macos-lab",
+            "platform_name": "darwin",
+            "runtime_schema_v1_migration_authority": migration_authority,
+        }
+    )
+
+    result = deploy(
+        config,
+        runner=runner,
+        generation_authority=FakeGenerationAuthority(),
+        generation_finalizer=FakeGenerationFinalizer(),
+    )
+
+    assert result.status == "deployed"
+    assert runner.calls.index(prerequisite_preview) < runner.calls.index(prerequisite_apply)
+    assert runner.calls.index(prerequisite_apply) < runner.calls.index(production_apply)
+    assert runner.calls.index(production_apply) < runner.calls.index(profile_preview)
+    assert runner.calls.index(profile_preview) < runner.calls.index(profile_apply)
+    assert "--schema-v1-migration-authority" not in profile_preview
+    assert runner.calls.index(profile_apply) < runner.calls.index(rollout)
+    prepare_calls = [
+        call
+        for call in runner.calls
+        if len(call) >= 2 and call[:2] == ("rquant", "lab-runtime-prepare")
+    ]
+    assert len(prepare_calls) == 1
+    assert "--runtime-deployment-root" in prepare_calls[0]
+    assert str(runtime_root) in prepare_calls[0]
+    first_preflight = runner.calls.index(
+        ("rquant", "preflight", "--runtime-root", str(runtime_root))
+    )
+    assert runner.calls.index(rollout) < runner.calls.index(prepare_calls[0]) < first_preflight
+    assert runner.calls.count(("rquant", "preflight", "--runtime-root", str(runtime_root))) == 2
+
+
+def test_runtime_profile_dry_run_calculates_without_publish_apply_or_rollout(
+    tmp_path: Path,
+) -> None:
+    inputs = tmp_path / "production-runtime-inputs.json"
+    profiles = tmp_path / "runtime-profiles"
+    runtime_root = tmp_path / "runtime"
+    profile_id = "c" * 64
+    profile_path = profiles / f"{profile_id}.json"
+    target_sha = _sha("b")
+    responses = _base_responses()
+    production_profile = (
+        "rquant",
+        "runtime-production-profile",
+        "--inputs",
+        str(inputs),
+        "--output-dir",
+        str(profiles),
+        "--expected-commit",
+        target_sha,
+    )
+    prerequisite_preview = (
+        "rquant",
+        "runtime-production-prerequisites",
+        "--inputs",
+        str(inputs),
+        "--expected-commit",
+        target_sha,
+    )
+    profile_preview = (
+        "rquant",
+        "runtime-deployment-profile",
+        "--profile",
+        str(profile_path),
+        "--runtime-root",
+        str(runtime_root),
+        "--expected-commit",
+        target_sha,
+    )
+    responses[production_profile] = (
+        0,
+        json.dumps(
+            {
+                "producer_commit": target_sha,
+                "profile_id": profile_id,
+                "profile_path": str(profile_path),
+                "runtime_root": str(runtime_root),
+                "status": "dry_run",
+            }
+        ),
+    )
+    responses[prerequisite_preview] = (0, json.dumps({"profile_id": profile_id}))
+    responses[profile_preview] = (0, json.dumps({"profile_id": profile_id}))
+    runner = FakeRunner(responses)
+    baseline = _config(tmp_path, dry_run=True)
+    config = DeployConfig(
+        **{
+            **baseline.__dict__,
+            "runtime_production_inputs": inputs,
+            "runtime_profile_output_dir": profiles,
+            "runtime_root": runtime_root,
+            "release_profile": "macos-lab",
+            "platform_name": "darwin",
+            "runtime_schema_v1_migration_authority": (
+                tmp_path / "schema-v1-migration-authority.json"
+            ),
+        }
+    )
+
+    result = deploy(config, runner=runner)
+
+    assert result.status == "dry_run"
+    assert production_profile in runner.calls
+    assert prerequisite_preview in runner.calls
+    assert profile_preview not in runner.calls
+    assert not any("--apply" in call for call in runner.calls)
+    assert not any(call[:2] == ("rquant", "runtime-deployment-rollout") for call in runner.calls)
+    assert not any("--schema-v1-migration-authority" in call for call in runner.calls)
+
+
+def test_runtime_profile_dry_run_leaves_filesystem_byte_identical(tmp_path: Path) -> None:
+    inputs = tmp_path / "production-runtime-inputs.json"
+    profiles = tmp_path / "runtime-profiles"
+    runtime_root = tmp_path / "runtime"
+    lock_path = tmp_path / "deploy.lock"
+    lock_path.write_bytes(b"stable-lock")
+    lock_path.chmod(0o600)
+    profile_id = "c" * 64
+    target_sha = _sha("b")
+    profile_path = profiles / f"{profile_id}.json"
+    responses = _base_responses()
+    responses[
+        (
+            "rquant",
+            "runtime-production-profile",
+            "--inputs",
+            str(inputs),
+            "--output-dir",
+            str(profiles),
+            "--expected-commit",
+            target_sha,
+        )
+    ] = (
+        0,
+        json.dumps(
+            {
+                "producer_commit": target_sha,
+                "profile_id": profile_id,
+                "profile_path": str(profile_path),
+                "runtime_root": str(runtime_root),
+                "status": "dry_run",
+            }
+        ),
+    )
+    responses[
+        (
+            "rquant",
+            "runtime-production-prerequisites",
+            "--inputs",
+            str(inputs),
+            "--expected-commit",
+            target_sha,
+        )
+    ] = (0, json.dumps({"profile_id": profile_id}))
+    responses[
+        (
+            "rquant",
+            "runtime-deployment-profile",
+            "--profile",
+            str(profile_path),
+            "--runtime-root",
+            str(runtime_root),
+            "--expected-commit",
+            target_sha,
+        )
+    ] = (0, json.dumps({"profile_id": profile_id}))
+    baseline = _config(tmp_path, dry_run=True)
+    config = DeployConfig(
+        **{
+            **baseline.__dict__,
+            "lock_path": lock_path,
+            "runtime_production_inputs": inputs,
+            "runtime_profile_output_dir": profiles,
+            "runtime_root": runtime_root,
+            "release_profile": "macos-lab",
+            "platform_name": "darwin",
+        }
+    )
+
+    def snapshot() -> dict[str, tuple[str, bytes]]:
+        return {
+            str(path.relative_to(tmp_path)): (
+                "dir" if path.is_dir() else "file",
+                b"" if path.is_dir() else path.read_bytes(),
+            )
+            for path in sorted(tmp_path.rglob("*"))
+        }
+
+    before = snapshot()
+    runner = FakeRunner(responses)
+    result = deploy(config, runner=runner)
+
+    assert result.status == "dry_run"
+    assert not any(call[:2] == ("git", "fetch") for call in runner.calls)
+    assert snapshot() == before
+
+
+def test_already_current_dry_run_profiles_target_without_writing(tmp_path: Path) -> None:
+    responses = _base_responses()
+    responses[("git", "rev-parse", "HEAD")] = (0, f"{_sha('b')}\n")
+    lock_path = tmp_path / "deploy.lock"
+    lock_path.write_bytes(b"stable-lock")
+    lock_path.chmod(0o600)
+    baseline = _config(tmp_path, dry_run=True)
+    config = DeployConfig(**{**baseline.__dict__, "lock_path": lock_path})
+    runner = FakeRunner(responses)
+
+    before = {
+        str(path.relative_to(tmp_path)): path.read_bytes()
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    }
+    result = deploy(config, runner=runner)
+    after = {
+        str(path.relative_to(tmp_path)): path.read_bytes()
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    }
+
+    assert result.status == "already_current"
+    assert any(call[:2] == ("rquant", "runtime-production-profile") for call in runner.calls)
+    assert after == before
+
+
+def test_failed_profile_bound_preflight_restores_runtime_before_code_rollback(
+    tmp_path: Path,
+) -> None:
+    inputs = tmp_path / "production-runtime-inputs.json"
+    profiles = tmp_path / "runtime-profiles"
+    runtime_root = tmp_path / "runtime"
+    profile_id = "c" * 64
+    generation = "d" * 64
+    previous_generation = "e" * 64
+    profile_path = profiles / f"{profile_id}.json"
+    target_sha = _sha("b")
+    responses = _base_responses()
+    production_profile = (
+        "rquant",
+        "runtime-production-profile",
+        "--inputs",
+        str(inputs),
+        "--output-dir",
+        str(profiles),
+        "--expected-commit",
+        target_sha,
+    )
+    prerequisite_preview = (
+        "rquant",
+        "runtime-production-prerequisites",
+        "--inputs",
+        str(inputs),
+        "--expected-commit",
+        target_sha,
+    )
+    profile_preview = (
+        "rquant",
+        "runtime-deployment-profile",
+        "--profile",
+        str(profile_path),
+        "--runtime-root",
+        str(runtime_root),
+        "--expected-commit",
+        target_sha,
+    )
+    rollout = (
+        "rquant",
+        "runtime-deployment-rollout",
+        "--runtime-root",
+        str(runtime_root),
+        "--expected-commit",
+        target_sha,
+        "--profile-id",
+        profile_id,
+        "--generation-hash",
+        generation,
+        "--previous-generation-hash",
+        previous_generation,
+    )
+    responses.update(
+        {
+            production_profile: (
+                0,
+                json.dumps(
+                    {
+                        "producer_commit": target_sha,
+                        "profile_id": profile_id,
+                        "profile_path": str(profile_path),
+                        "runtime_root": str(runtime_root),
+                        "status": "dry_run",
+                    }
+                ),
+            ),
+            prerequisite_preview: (0, json.dumps({"profile_id": profile_id})),
+            (*prerequisite_preview, "--apply", "--profile-id", profile_id): (
+                0,
+                json.dumps({"profile_id": profile_id}),
+            ),
+            profile_preview: (0, json.dumps({"profile_id": profile_id})),
+            (*profile_preview, "--apply", "--profile-id", profile_id): (
+                0,
+                json.dumps(
+                    {
+                        "producer_commit": target_sha,
+                        "generation_hash": generation,
+                        "deployment_profile_id": profile_id,
+                        "previous_generation_hash": previous_generation,
+                    }
+                ),
+            ),
+            rollout: (0, json.dumps({"status": "succeeded"})),
+            ("rquant", "preflight", "--runtime-root", str(runtime_root)): (0, ""),
+        }
+    )
+    preflight = ("rquant", "preflight", "--runtime-root", str(runtime_root))
+    runner = RuntimeRollbackRunner(
+        responses,
+        command=preflight,
+        sequence=[(1, "profile recovery preflight failed")],
+    )
+    baseline = _config(tmp_path)
+    config = DeployConfig(
+        **{
+            **baseline.__dict__,
+            "runtime_production_inputs": inputs,
+            "runtime_profile_output_dir": profiles,
+            "runtime_root": runtime_root,
+            "release_profile": "macos-lab",
+            "platform_name": "darwin",
+        }
+    )
+
+    with pytest.raises(DeployError, match="rolled back"):
+        deploy(
+            config,
+            runner=runner,
+            generation_authority=FakeGenerationAuthority(),
+            generation_finalizer=FakeGenerationFinalizer(),
+        )
+
+    runtime_rollback_index = next(
+        index
+        for index, command in enumerate(runner.calls)
+        if command[:2] == ("rquant", "runtime-deployment-rollback")
+    )
+    code_rollback_index = runner.calls.index(("git", "reset", "--hard", _sha("a")))
+    assert runtime_rollback_index < code_rollback_index
 
 
 def test_macos_lab_profile_never_invokes_systemctl(tmp_path: Path) -> None:
@@ -1012,9 +1671,14 @@ def test_interrupted_deployment_phase_leaves_generation_unpublished(
     command: tuple[str, ...],
     occurrence: int,
 ) -> None:
+    resolved_command = (
+        (*command, "--runtime-root", str(LINUX_PRODUCTION_RUNTIME_ROOT))
+        if command == ("rquant", "preflight")
+        else command
+    )
     runner = CrashAfterRunner(
         _base_responses(),
-        command=command,
+        command=resolved_command,
         occurrence=occurrence,
     )
     authority = FakeGenerationAuthority()
@@ -1501,7 +2165,12 @@ def test_recovery_after_partial_service_restart_completes_services_before_marker
         "rquant-surge-watch.service",
     )
     assert second_restart in runner.calls
-    assert runner.calls.count(("rquant", "preflight")) == 2
+    assert (
+        runner.calls.count(
+            ("rquant", "preflight", "--runtime-root", str(LINUX_PRODUCTION_RUNTIME_ROOT))
+        )
+        == 2
+    )
     for timer in ("rquant-monitor.timer", "rquant-surge-watch.timer"):
         assert ("sudo", "-n", "systemctl", "stop", timer) in runner.calls
         assert ("sudo", "-n", "systemctl", "start", timer) in runner.calls
@@ -1587,7 +2256,12 @@ def test_failed_preflight_rolls_back_code_and_dependencies(tmp_path: Path) -> No
     responses = _base_responses()
     runner = SequenceRunner(
         responses,
-        command=("rquant", "preflight"),
+        command=(
+            "rquant",
+            "preflight",
+            "--runtime-root",
+            str(LINUX_PRODUCTION_RUNTIME_ROOT),
+        ),
         sequence=[(1, "target failed"), (0, "old ready"), (0, "old ready")],
     )
     authority = FakeGenerationAuthority()
@@ -1605,7 +2279,12 @@ def test_failed_preflight_rolls_back_code_and_dependencies(tmp_path: Path) -> No
     reset_index = runner.calls.index(("git", "reset", "--hard", _sha("a")))
     assert reset_index > merge_index
     assert runner.calls.count(("uv", "sync", "--frozen")) == 2
-    assert runner.calls.count(("rquant", "preflight")) == 3
+    assert (
+        runner.calls.count(
+            ("rquant", "preflight", "--runtime-root", str(LINUX_PRODUCTION_RUNTIME_ROOT))
+        )
+        == 3
+    )
     assert authority.events[0:2] == [("intent", _sha("b")), ("invalidate", None)]
     assert finalizer.calls == [
         (_sha("a"), authority.intent.operation_id, "rollback", "publish"),
@@ -1614,12 +2293,51 @@ def test_failed_preflight_rolls_back_code_and_dependencies(tmp_path: Path) -> No
     assert all(call[0] != "git" for call in runner.executed_calls)
     audit = (_config(tmp_path).audit_path).read_text(encoding="utf-8")
     assert '"status": "rolled_back"' in audit
+    assert sum('"status": "rolled_back"' in line for line in audit.splitlines()) == 1
+
+
+def test_failed_job_authority_prepare_rolls_back_before_any_service_start(
+    tmp_path: Path,
+) -> None:
+    runner = FailingFirstJobAuthorityRunner(_base_responses())
+    authority = FakeGenerationAuthority()
+
+    with pytest.raises(DeployError, match="rolled back"):
+        deploy(
+            _config(tmp_path),
+            runner=runner,
+            generation_authority=authority,
+            generation_finalizer=FakeGenerationFinalizer(),
+        )
+
+    prepare_calls = [
+        call
+        for call in runner.calls
+        if len(call) >= 2 and call[:2] == ("rquant", "lab-runtime-prepare")
+    ]
+    assert len(prepare_calls) == 2
+    assert prepare_calls[0][prepare_calls[0].index("--expected-code-sha") + 1] == _sha("b")
+    assert prepare_calls[1][prepare_calls[1].index("--expected-code-sha") + 1] == _sha("a")
+    target_prepare_index = runner.calls.index(prepare_calls[0])
+    rollback_prepare_index = runner.calls.index(prepare_calls[1])
+    service_mutations = [
+        index
+        for index, call in enumerate(runner.calls)
+        if call[:4] == ("sudo", "-n", "systemctl", "restart")
+    ]
+    assert all(index > rollback_prepare_index for index in service_mutations)
+    assert target_prepare_index < runner.calls.index(("git", "reset", "--hard", _sha("a")))
 
 
 def test_failed_target_recovery_reuses_original_runner_deadline(tmp_path: Path) -> None:
     runner = SequenceRunner(
         _base_responses(),
-        command=("rquant", "preflight"),
+        command=(
+            "rquant",
+            "preflight",
+            "--runtime-root",
+            str(LINUX_PRODUCTION_RUNTIME_ROOT),
+        ),
         sequence=[(1, "target failed"), (0, "old ready"), (0, "old ready")],
     )
     authority = FakeGenerationAuthority()
@@ -1656,6 +2374,142 @@ def test_shell_entrypoint_uses_isolated_stdlib_bootstrap_before_project_import()
     assert '-- "$@"' not in source
     assert "-m rquant.ops.production_deploy" not in source
     assert "/../.rquant-deploy" not in source
+
+
+def test_shell_entrypoint_forwards_complete_runtime_profile_environment(
+    tmp_path: Path,
+) -> None:
+    fake_python = tmp_path / "python"
+    fake_python.write_text(
+        "#!/bin/sh\nprintf '%s\\n' \"$@\"\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o700)
+    inputs = tmp_path / "runtime-inputs.json"
+    profiles = tmp_path / "profiles"
+    runtime_root = tmp_path / "runtime"
+    environment = {
+        **os.environ,
+        "RQUANT_DEPLOY_PYTHON": str(fake_python),
+        "RQUANT_RUNTIME_PRODUCTION_INPUTS": str(inputs),
+        "RQUANT_RUNTIME_PROFILE_OUTPUT_DIR": str(profiles),
+        "RQUANT_RUNTIME_ROOT": str(runtime_root),
+    }
+
+    result = subprocess.run(
+        [str(ROOT / "scripts" / "deploy-production.sh"), "--target", "v0.99.0"],
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    arguments = result.stdout.splitlines()
+    assert arguments[-6:] == [
+        "--runtime-production-inputs",
+        str(inputs),
+        "--runtime-profile-output-dir",
+        str(profiles),
+        "--runtime-root",
+        str(runtime_root),
+    ]
+    assert "--runtime-schema-v1-migration-authority" not in arguments
+
+
+def test_shell_entrypoint_rejects_partial_runtime_profile_environment(
+    tmp_path: Path,
+) -> None:
+    fake_python = tmp_path / "python"
+    fake_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_python.chmod(0o700)
+    environment = {
+        **os.environ,
+        "RQUANT_DEPLOY_PYTHON": str(fake_python),
+        "RQUANT_RUNTIME_PRODUCTION_INPUTS": str(tmp_path / "runtime-inputs.json"),
+    }
+
+    result = subprocess.run(
+        [str(ROOT / "scripts" / "deploy-production.sh"), "--target", "v0.99.0"],
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "runtime production inputs, profile output directory, and root" in result.stderr
+
+
+def test_shell_entrypoint_rejects_linux_production_without_runtime_profile(
+    tmp_path: Path,
+) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_uname = fake_bin / "uname"
+    fake_uname.write_text("#!/bin/sh\nprintf 'Linux\\n'\n", encoding="utf-8")
+    fake_uname.chmod(0o700)
+    fake_python = tmp_path / "python"
+    fake_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_python.chmod(0o700)
+    environment = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "RQUANT_DEPLOY_PYTHON": str(fake_python),
+    }
+    for name in (
+        "RQUANT_RUNTIME_PRODUCTION_INPUTS",
+        "RQUANT_RUNTIME_PROFILE_OUTPUT_DIR",
+        "RQUANT_RUNTIME_ROOT",
+    ):
+        environment.pop(name, None)
+
+    result = subprocess.run(
+        [str(ROOT / "scripts" / "deploy-production.sh"), "--target", "v0.99.0"],
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "Linux production requires runtime production inputs" in result.stderr
+
+
+def test_shell_entrypoint_rejects_relocated_linux_production_runtime_root(
+    tmp_path: Path,
+) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_uname = fake_bin / "uname"
+    fake_uname.write_text("#!/bin/sh\nprintf 'Linux\\n'\n", encoding="utf-8")
+    fake_uname.chmod(0o700)
+    fake_python = tmp_path / "python"
+    fake_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_python.chmod(0o700)
+    environment = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "RQUANT_DEPLOY_PYTHON": str(fake_python),
+        "RQUANT_RUNTIME_PRODUCTION_INPUTS": str(tmp_path / "runtime-inputs.json"),
+        "RQUANT_RUNTIME_PROFILE_OUTPUT_DIR": str(tmp_path / "profiles"),
+        "RQUANT_RUNTIME_ROOT": "/srv/rquant/data/runtime",
+    }
+
+    result = subprocess.run(
+        [str(ROOT / "scripts" / "deploy-production.sh"), "--target", "v0.99.0"],
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "Linux production runtime root" in result.stderr
 
 
 def test_sudoers_allows_only_exact_managed_timer_transitions() -> None:
@@ -1982,6 +2836,8 @@ def test_real_git_repository_deploys_annotated_fast_forward_tag(
         audit_path=tmp_path / "audit.jsonl",
         lock_path=tmp_path / "deploy.lock",
         git_path=trusted_git,
+        release_profile="macos-lab",
+        platform_name="darwin",
     )
 
     result = deploy(config)

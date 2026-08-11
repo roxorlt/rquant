@@ -222,12 +222,7 @@ class TestUserScenario:
                 gt("HIGH[0]", "CLOSE[1]"),
             ],
         )
-        with (
-            patch("rquant.pipeline.PRESET_SCREENS", {"pit-name": preset}),
-            patch("rquant.pipeline._sync_pool2_watch"),
-            patch("rquant.pipeline._push_daily_summary"),
-            patch("rquant.monitor.check_exits"),
-        ):
+        with patch("rquant.pipeline.PRESET_SCREENS", {"pit-name": preset}):
             summary = run_daily_pipeline(
                 "2026-04-15",
                 store=store,

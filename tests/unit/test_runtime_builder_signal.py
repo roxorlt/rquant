@@ -5,16 +5,21 @@ import json
 import os
 import sqlite3
 from collections.abc import Callable
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
+import duckdb
 import pytest
 from pydantic import ValidationError
 
 from rquant.delivery_contracts import DeliveryChannel, DeliveryTarget, OutboxStatus
 from rquant.notification_state import NotificationReplicationError, NotificationStateStore
 from rquant.notification_worker import NotificationDelivery
-from rquant.runtime_builder_signal import notifier_builder, signal_router_builder
+from rquant.runtime_builder_signal import (
+    build_shadow_runner_sources,
+    notifier_builder,
+    signal_router_builder,
+)
 from rquant.runtime_notification_providers import (
     NotificationTransportResult,
     build_environment_notification_provider_loader,
@@ -31,10 +36,12 @@ from rquant.runtime_serving_authority import (
     ServingSourceAuthorityReader,
 )
 from rquant.runtime_serving_snapshot import SIGNALS_DATASET_ID
+from rquant.runtime_shadow_validation import ShadowStrategyBinding
 from rquant.signal_bus import SignalBusStore
 from rquant.signal_contracts import SignalAction, SignalEnvelope
 from rquant.signal_route_spool import SignalRouteSpool, publish_signal_bus_prefix
 from rquant.signal_router_runtime import (
+    ReadonlySignalRouteAuthority,
     RouteSourceDescriptor,
     RoutingDecision,
     RunnerSignalBatch,
@@ -57,6 +64,7 @@ POLICY = "b" * 64
 GENERATION = "c" * 64
 SPEC = "d" * 64
 EVALUATOR = "2" * 64
+REGISTRATION = "1" * 64
 
 
 def _signal(seed: str = "e") -> SignalEnvelope:
@@ -216,18 +224,33 @@ def _authoritative_router_manifest(
         with sqlite3.connect(store.path) as connection:
             connection.execute(
                 """
-                INSERT INTO runner_signal(signal_id, feature_sequence, payload_json)
-                VALUES (?, 0, ?)
-                """,
+                    INSERT INTO runner_signal(
+                        signal_id, feature_sequence, candidate_id, action,
+                        entry_signal_id, candidate_occurrence_id,
+                        event_time, available_at, expires_at, payload_json
+                    ) VALUES (?, 0, ?, ?, NULL, NULL, ?, ?, ?, ?)
+                    """,
                 (
                     signal.signal_id,
-                    json.dumps(signal.model_dump(mode="json"), sort_keys=True),
+                    signal.candidate_id,
+                    signal.action.value,
+                    signal.event_time.isoformat().replace("+00:00", "Z"),
+                    signal.available_at.isoformat().replace("+00:00", "Z"),
+                    signal.expires_at.isoformat().replace("+00:00", "Z"),
+                    json.dumps(
+                        signal.model_dump(mode="json"),
+                        ensure_ascii=True,
+                        allow_nan=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
                 ),
             )
     policy_path = tmp_path / "routing-policy.json"
     policy_fingerprint = _frozen_policy(policy_path)
     authority_settings: dict[str, object] = {
         "runner_state_path": str(store.path.resolve()),
+        "expected_strategy_registration_fingerprint": REGISTRATION,
         "expected_strategy_spec_fingerprint": store.spec.spec_fingerprint,
         "expected_evaluator_contract_fingerprint": EVALUATOR,
         "routing_policy_path": str(policy_path.resolve()),
@@ -280,6 +303,61 @@ def _route_target(_signal: SignalEnvelope) -> RoutingDecision:
             ),
         ),
     )
+
+
+def test_authoritative_router_persists_zero_signal_drain_authority(
+    tmp_path: Path,
+) -> None:
+    manifest, store = _authoritative_router_manifest(tmp_path)
+    step = signal_router_builder(clock=lambda: NOW)(manifest)
+
+    result = step()
+
+    assert result.input_sequence == 0
+    evidence = ReadonlySignalRouteAuthority(
+        path=Path(str(manifest.settings["signal_bus_path"])),
+        expected_routing_policy_fingerprint=str(manifest.settings["routing_policy_fingerprint"]),
+    ).read_drain_evidence(
+        source_id="n-shape-v1",
+        runner_generation_id=store.source_generation_id,
+        strategy_spec_fingerprint=store.spec.spec_fingerprint,
+        trade_date=date(2026, 7, 31),
+        segment_start_sequence=0,
+        routed_through_sequence=0,
+        observed_at=NOW,
+    )
+    assert evidence.routed_through_sequence == 0
+
+
+def test_signal_builder_constructs_real_shadow_source_from_manifest_authority(
+    tmp_path: Path,
+) -> None:
+    manifest, store = _authoritative_router_manifest(tmp_path)
+    binding = ShadowStrategyBinding(
+        strategy_id="n-shape",
+        strategy_version=1,
+        definition_fingerprint=REGISTRATION,
+        executable_fingerprint=EVALUATOR,
+    )
+
+    sources = build_shadow_runner_sources(
+        manifest=manifest,
+        bindings={"n-shape-v1": binding},
+    )
+
+    assert sources[0][0] == binding
+    batch = sources[0][1].read_batch(after_sequence=0, limit=1)
+    assert batch.snapshot.descriptor.generation_id == store.source_generation_id
+
+    with pytest.raises(ValueError, match="binding|source"):
+        build_shadow_runner_sources(manifest=manifest, bindings={})
+
+    forged = binding.model_copy(update={"definition_fingerprint": "3" * 64})
+    with pytest.raises(ValueError, match="definition identity"):
+        build_shadow_runner_sources(
+            manifest=manifest,
+            bindings={"n-shape-v1": forged},
+        )
 
 
 def _seed_outbox(
@@ -898,6 +976,59 @@ def test_notifier_publishes_owned_signal_delivery_authority_after_writeback(
     assert len(published.payload.routes) == 1
     assert published.payload.deliveries[0].status is OutboxStatus.SUCCEEDED
     assert state.replication_cursor().last_global_sequence == 1
+
+
+def test_notifier_builtin_refreshes_signal_page_projections_from_replica(
+    tmp_path: Path,
+) -> None:
+    _seed_outbox(tmp_path)
+    replica = (tmp_path / "rquant_ro.duckdb").resolve()
+    connection = duckdb.connect(str(replica))
+    try:
+        connection.execute(
+            """
+            CREATE TABLE screen_result (
+                trade_date DATE, preset_name VARCHAR, ts_code VARCHAR, name VARCHAR,
+                close DOUBLE, pct_chg DOUBLE, extra JSON, created_at TIMESTAMP
+            );
+            INSERT INTO screen_result VALUES
+              ('2026-07-31', 'n-shape-pool1', '600000.SH', 'PF', 10.6, 6, '{}',
+               '2026-07-31 10:05:00');
+            CREATE TABLE minute_bar (
+                ts_code VARCHAR, trade_time TIMESTAMP, freq VARCHAR, open DOUBLE,
+                high DOUBLE, low DOUBLE, close DOUBLE, vol DOUBLE, amount DOUBLE,
+                source VARCHAR, created_at TIMESTAMP
+            );
+            INSERT INTO minute_bar VALUES
+              ('600000.SH', '2026-07-31 09:30:00', '1min', 10, 10, 10, 10,
+               100, 1000, 'tushare', '2026-07-31 09:31:00');
+            """
+        )
+    finally:
+        connection.close()
+    authority_root = (tmp_path / "serving-signals").resolve()
+    step = notifier_builder(
+        provider_loader=lambda: {DeliveryChannel.PUSHDEER: _Provider()},
+        clock=lambda: NOW,
+    )(
+        _notifier_manifest(
+            tmp_path,
+            serving_authority_root=str(authority_root),
+            page_projection_database_path=str(replica),
+        )
+    )
+
+    step()
+    published = ServingSourceAuthorityReader(
+        root=authority_root,
+        expected_producer_commit=COMMIT,
+        expected_dataset_id=SIGNALS_DATASET_ID,
+        expected_payload_kind="signal_delivery",
+    )(NOW)
+
+    projections = {item.table_name: item for item in published.payload.projections}
+    assert projections["screen_bounds"].rows[0]["preset_name"] == "n-shape-pool1"
+    assert projections["minute_coverage"].rows[0]["source"] == "all"
 
 
 def test_notifier_takes_over_signals_authority_from_exact_previous_commit(

@@ -70,6 +70,7 @@ from rquant.lab_jobs import (
     LabArtifactCommitRecord,
     LabFinalizationShardEvidence,
     LabFinalizationSnapshot,
+    LabIntegrityDegradedError,
     LabJobReader,
     LabJobStore,
     LabResultState,
@@ -1001,6 +1002,68 @@ def test_finalizer_daemon_commit_is_consumed_and_seals_job(tmp_path: Path) -> No
     assert job is not None
     assert job.status is JobStatus.SUCCEEDED
     assert job.result_state is LabResultState.SEALED
+
+
+def test_finalizer_daemon_runs_bounded_incremental_audit_before_candidates(
+    tmp_path: Path,
+) -> None:
+    scenario = _ready_scenario(tmp_path, hold_days=(1,))
+
+    class _Auditor:
+        def __init__(self) -> None:
+            self.max_chain_entries: list[int] = []
+
+        def audit_incremental(self, *, max_chain_entries: int) -> object:
+            self.max_chain_entries.append(max_chain_entries)
+            return object()
+
+    auditor = _Auditor()
+    state_dir = tmp_path / "finalizer-state"
+    state_dir.mkdir(mode=0o700)
+    daemon = LabFinalizerDaemon(
+        reader=LabJobReader(scenario.store.path),
+        finalizer=scenario.finalizer(),
+        state_store=LabFinalizerStateStore(state_dir),
+        max_jobs_per_tick=4,
+        poll_interval_ms=10,
+        failure_cooldown_seconds=30,
+        failure_cooldown_max_seconds=300,
+        integrity_auditor=auditor,
+        max_integrity_chain_entries=9,
+    )
+
+    result = daemon.run_once()
+
+    assert result.published == 1
+    assert auditor.max_chain_entries == [9]
+
+
+def test_finalizer_daemon_fails_closed_when_incremental_audit_is_degraded(
+    tmp_path: Path,
+) -> None:
+    scenario = _ready_scenario(tmp_path, hold_days=(1,))
+
+    class _FailingAuditor:
+        def audit_incremental(self, *, max_chain_entries: int) -> object:
+            assert max_chain_entries == 10
+            raise InvalidStoredJobError("tampered chain tail")
+
+    state_dir = tmp_path / "finalizer-state"
+    state_dir.mkdir(mode=0o700)
+    daemon = LabFinalizerDaemon(
+        reader=LabJobReader(scenario.store.path),
+        finalizer=scenario.finalizer(),
+        state_store=LabFinalizerStateStore(state_dir),
+        max_jobs_per_tick=4,
+        poll_interval_ms=10,
+        failure_cooldown_seconds=30,
+        failure_cooldown_max_seconds=300,
+        integrity_auditor=_FailingAuditor(),
+        max_integrity_chain_entries=10,
+    )
+
+    with pytest.raises(LabIntegrityDegradedError, match="finalizer_pre_tick"):
+        daemon.run_once()
 
 
 def test_finalizer_recovers_accepted_legacy_uint64_bundle(

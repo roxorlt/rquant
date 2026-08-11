@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-import shutil
+import os
 import subprocess
 from pathlib import Path
 
@@ -18,17 +18,33 @@ def _project(tmp_path: Path) -> Path:
     (project / "data").mkdir()
     (project / ".venv").symlink_to((ROOT / ".venv").resolve(), target_is_directory=True)
     (project / "src").symlink_to(ROOT / "src", target_is_directory=True)
-    shutil.copy2(
-        ROOT / "scripts" / "sync-readonly-replica.sh",
-        project / "scripts" / "sync-readonly-replica.sh",
+    arbiter = project / "test-libexec/rquant-workload-arbiter"
+    arbiter.parent.mkdir()
+    arbiter.write_text(
+        """#!/usr/bin/env bash
+while [[ "${1:-}" != "--" ]]; do shift; done
+shift
+RQUANT_WORKLOAD_ARBITER_HELD=maintenance exec "$@"
+""",
+        encoding="utf-8",
     )
+    arbiter.chmod(0o755)
+    source = (ROOT / "scripts/sync-readonly-replica.sh").read_text(encoding="utf-8")
+    script = project / "scripts/sync-readonly-replica.sh"
+    script.write_text(
+        source.replace("/usr/local/libexec/rquant-workload-arbiter", str(arbiter)),
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
     return project
 
 
 def _run(project: Path) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
     return subprocess.run(
         [str(project / "scripts" / "sync-readonly-replica.sh")],
         cwd=project,
+        env=env,
         check=False,
         capture_output=True,
         text=True,

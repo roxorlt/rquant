@@ -97,6 +97,14 @@ def test_reader_builds_canonical_fresh_health_result_in_stable_order(tmp_path: P
     assert result.payload.live_backlog_age_seconds == 0.0
     assert result.payload.live_p95_latency_seconds == 0.25
     assert result.payload.live_healthy is True
+    assert result.payload.dashboard_summary_observed_at == NOW
+    assert result.payload.dashboard_summary_generation_id is not None
+    assert set(result.payload.dashboard_summary_source_receipts) == {"feature", "router"}
+    assert tuple(item.table_name for item in result.payload.projections) == ("dashboard_summary",)
+    dashboard = result.payload.projections[0].rows[0]
+    assert dashboard["snapshot_key"] == "current"
+    assert dashboard["host_name"]
+    assert dashboard["monitor_state"] == "unavailable"
 
     repeated = RuntimeHealthSourceReader(
         sources=(_source(feature_root, "feature"), _source(router_root, "router")),

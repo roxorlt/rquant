@@ -126,7 +126,7 @@ def _submit_envelope(
         request_id=request_id or uuid4(),
         command=SubmitJobCommand(
             job_id=job_id or uuid4(),
-            spec=spec or _spec(),
+            spec=spec or _spec().model_copy(update={"research_status": "exploratory"}),
             max_attempts=3,
         ),
     )
@@ -405,6 +405,16 @@ def test_spool_publish_load_ack_is_durable_and_typed(tmp_path: Path) -> None:
     assert acknowledged.path.parent == spool.ack_dir
     assert spool.pending() == ()
     assert spool.load_receipt(acknowledged.path) == receipt
+
+
+def test_spool_rejects_new_v2_comparable_before_pending_write(tmp_path: Path) -> None:
+    spool = LabCommandSpool(tmp_path / "commands")
+    formal_v2 = _spec().model_copy(update={"research_status": "comparable"})
+
+    with pytest.raises(InvalidCommandEnvelopeError, match="v2.*comparable"):
+        spool.publish(_submit_envelope(spec=formal_v2))
+
+    assert spool.pending() == ()
 
 
 def _replace_managed_spool_directory(path: Path, external: Path) -> Path:

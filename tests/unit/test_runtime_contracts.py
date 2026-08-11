@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta, timezone
+from uuid import UUID
 
 import pytest
 from pydantic import ValidationError
@@ -54,6 +55,17 @@ def test_canonical_sha256_is_stable_for_key_order_and_equivalent_timezones() -> 
 
     assert canonical_sha256(left) == canonical_sha256(right)
     assert len(canonical_sha256(left)) == 64
+
+
+def test_canonical_sha256_encodes_uuid_with_an_explicit_type_marker() -> None:
+    value = UUID("12345678-1234-5678-1234-567812345678")
+
+    assert canonical_sha256({"job_id": value}) == canonical_sha256(
+        {"job_id": UUID(str(value))}
+    )
+    assert canonical_sha256({"job_id": value}) != canonical_sha256(
+        {"job_id": str(value)}
+    )
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])

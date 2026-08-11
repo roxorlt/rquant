@@ -17,6 +17,7 @@ from rquant.feature_contracts import (
 from rquant.runtime_candidate_universe import (
     CandidateUniverseAuthority,
     RuntimeCandidateUniverseConfig,
+    RuntimeCandidateUniverseIntegrityError,
     RuntimeCandidateUniverseLoader,
     RuntimeCandidateUniverseResult,
 )
@@ -31,6 +32,7 @@ from rquant.strategy_candidate_snapshot import (
     StrategyCandidateRecord,
     StrategyCandidateSnapshot,
     StrategyCandidateSnapshotSpool,
+    strategy_candidate_schema_fingerprint,
 )
 from rquant.strategy_runner import canonical_feature_payload
 
@@ -40,6 +42,24 @@ SHANGHAI = timezone(timedelta(hours=8))
 EVENT_TIME = datetime(2026, 7, 31, 9, 31, tzinfo=SHANGHAI)
 AVAILABLE_AT = EVENT_TIME + timedelta(seconds=2)
 REFERENCE_HASH = "1" * 64
+DEFINITION_FINGERPRINT = "4" * 64
+EXECUTABLE_FINGERPRINT = "5" * 64
+
+
+def _static_feature_schema(*names: str) -> dict[str, dict[str, str]]:
+    return {
+        name: {
+            "dtype": (
+                "string"
+                if "basis" in name or name in {"pool", "candidate_occurrence_id"}
+                else "object"
+                if name in {"levels", "nested"}
+                else "number"
+            ),
+            "semantic": f"candidate static feature {name}",
+        }
+        for name in sorted(names)
+    }
 
 
 def _payload_hash(frame: pd.DataFrame, *, schema_version: int = 3) -> str:
@@ -75,18 +95,26 @@ def _common_envelope(
         sequence=31,
         event_time=event_time,
         available_at=available_at,
+        decision_cutoff=available_at,
+        actual_delay_seconds=(available_at - event_time).total_seconds(),
         row_count=len(frame),
         content_hash=content_hash or _payload_hash(frame),
         field_statuses=(
             FeatureFieldStatus(
                 name="rel_same_minute",
                 status=FeatureAvailability.AVAILABLE,
+                source_event_time=event_time,
                 available_at=normalized_available_at,
+                decision_cutoff=normalized_available_at,
+                actual_delay_seconds=(normalized_available_at - event_time).total_seconds(),
             ),
             FeatureFieldStatus(
                 name="vwap",
                 status=FeatureAvailability.AVAILABLE,
+                source_event_time=event_time,
                 available_at=normalized_available_at,
+                decision_cutoff=normalized_available_at,
+                actual_delay_seconds=(normalized_available_at - event_time).total_seconds(),
             ),
         ),
         producer_commit=COMMIT,
@@ -134,10 +162,23 @@ def _publish(
     rows: tuple[StrategyCandidateRecord, ...],
     sequence: int = 0,
     captured_at: datetime | None = None,
+    static_feature_schema: dict[str, dict[str, str]] | None = None,
 ) -> StrategyCandidateSnapshot:
+    schema = static_feature_schema or _static_feature_schema(
+        *(rows[0].static_features if rows else ("n_score",))
+    )
+    candidate_schema_fingerprint = strategy_candidate_schema_fingerprint(
+        strategy_id=strategy_id,
+        strategy_version=strategy_version,
+        static_feature_schema=schema,
+    )
     result = StrategyCandidateSnapshotSpool(root.resolve()).publish_strategy_records(
         strategy_id=strategy_id,
         strategy_version=strategy_version,
+        definition_fingerprint=DEFINITION_FINGERPRINT,
+        executable_fingerprint=EXECUTABLE_FINGERPRINT,
+        candidate_schema_fingerprint=candidate_schema_fingerprint,
+        static_feature_schema=schema,
         source_snapshot_ids={
             "candidate_input": canonical_sha256(
                 {
@@ -189,6 +230,23 @@ def _universe(
                 snapshot_root=root,
                 required=True,
                 max_age_seconds=86_400,
+                definition_fingerprint=DEFINITION_FINGERPRINT,
+                executable_fingerprint=EXECUTABLE_FINGERPRINT,
+                candidate_schema_fingerprint=(
+                    snapshot.authority_binding.candidate_schema_fingerprint
+                    if snapshot.authority_binding is not None
+                    else ""
+                ),
+                static_feature_names=(
+                    snapshot.authority_binding.static_feature_names
+                    if snapshot.authority_binding is not None
+                    else ()
+                ),
+                static_feature_schema=(
+                    snapshot.authority_binding.static_feature_schema
+                    if snapshot.authority_binding is not None
+                    else {}
+                ),
             )
         )
     result = RuntimeCandidateUniverseLoader(
@@ -250,6 +308,14 @@ def test_cross_layer_output_is_frozen_and_selects_only_requested_strategy(
         "strategy_version": "1",
         "schema_version": 3,
         "generation_sha256": snapshots[("n_shape", "1")].content_sha256,
+        "authority_binding_sha256": snapshots[("n_shape", "1")].authority_binding.content_sha256,
+        "definition_fingerprint": DEFINITION_FINGERPRINT,
+        "executable_fingerprint": EXECUTABLE_FINGERPRINT,
+        "candidate_schema_fingerprint": (
+            snapshots[("n_shape", "1")].authority_binding.candidate_schema_fingerprint
+        ),
+        "static_feature_names": ["n_score"],
+        "static_feature_schema": _static_feature_schema("n_score"),
         "captured_at": snapshots[("n_shape", "1")].captured_at.isoformat().replace("+00:00", "Z"),
     }
     assert result.static_feature_names == ("n_score",)
@@ -389,8 +455,6 @@ def test_revalidates_model_copy_common_envelope_before_join(tmp_path: Path) -> N
     ("first", "second", "message"),
     [
         ({"score": 0.8}, {"score": 0.8, "rank": 2}, "key set"),
-        ({"score": {"nested": 0.8}}, {"score": {"nested": 0.7}}, "scalar"),
-        ({"score": None}, {"score": None}, "null"),
         ({"score": 0.8}, {"score": 0.7}, "revalidation"),
         ({"vwap": 10.2}, {"vwap": 10.3}, "collides"),
         (
@@ -418,6 +482,16 @@ def test_rejects_unsafe_static_feature_shapes(
         strategy_version="1",
         static_features=second,
     )
+    if tuple(sorted(first)) != tuple(sorted(second)):
+        with pytest.raises(
+            (ValueError, ValidationError, RuntimeCandidateUniverseIntegrityError),
+            match="static feature (?:names|schema)|row static features",
+        ):
+            _universe(
+                tmp_path,
+                (("n_shape", "1", (first_row, second_row), 0, None),),
+            )
+        return
     universe, _ = _universe(
         tmp_path,
         (("n_shape", "1", (first_row, second_row), 0, None),),
@@ -582,6 +656,130 @@ def test_join_preserves_json_scalar_types_without_dataframe_coercion(tmp_path: P
     assert isinstance(payload_rows[0]["rank"], int)
 
 
+def test_join_round_trips_declared_object_static_feature(tmp_path: Path) -> None:
+    rows = tuple(
+        _candidate(
+            code,
+            strategy_id="n_shape",
+            strategy_version="1",
+            static_features={"nested": {"rank": rank, "tags": ["a", "b"]}},
+        )
+        for code, rank in (("000001.SZ", 1), ("000002.SZ", 2))
+    )
+    universe, _ = _universe(
+        tmp_path,
+        (("n_shape", "1", rows, 0, None),),
+    )
+
+    result = _join(_common_frame("000001.SZ", "000002.SZ"), universe)
+
+    assert result.frame.loc[0, "nested"] == {"rank": 1, "tags": ["a", "b"]}
+    assert result.frame.loc[1, "nested"] == {"rank": 2, "tags": ["a", "b"]}
+
+
+def test_pooled_static_feature_evidence_is_scoped_to_every_candidate(tmp_path: Path) -> None:
+    rows = tuple(
+        _candidate(
+            code,
+            strategy_id="n_shape",
+            strategy_version="1",
+            static_features={"rank": rank, "score": score},
+        )
+        for code, rank, score in (
+            ("000001.SZ", 1, 0.91),
+            ("000002.SZ", 2, 0.88),
+        )
+    )
+    universe, _ = _universe(
+        tmp_path,
+        (("n_shape", "1", rows, 0, None),),
+    )
+
+    result = _join(_common_frame("000001.SZ", "000002.SZ"), universe)
+
+    static_evidence = {
+        (status.candidate_id, status.name)
+        for status in result.envelope.field_statuses
+        if status.name in result.static_feature_names
+    }
+    assert static_evidence == {
+        ("000001.SZ", "rank"),
+        ("000001.SZ", "score"),
+        ("000002.SZ", "rank"),
+        ("000002.SZ", "score"),
+    }
+    assert result.candidate_authority.definition_fingerprint == DEFINITION_FINGERPRINT
+    assert result.candidate_authority.executable_fingerprint == EXECUTABLE_FINGERPRINT
+    assert result.candidate_authority.candidate_schema_fingerprint == (
+        strategy_candidate_schema_fingerprint(
+            strategy_id="n_shape",
+            strategy_version="1",
+            static_feature_schema=_static_feature_schema("rank", "score"),
+        )
+    )
+
+
+@pytest.mark.parametrize("tamper", ["missing", "wrong_candidate", "late"])
+def test_pooled_static_feature_evidence_tampering_fails_closed(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    rows = tuple(
+        _candidate(
+            code,
+            strategy_id="n_shape",
+            strategy_version="1",
+            static_features={"score": score},
+        )
+        for code, score in (("000001.SZ", 0.91), ("000002.SZ", 0.88))
+    )
+    universe, _ = _universe(
+        tmp_path,
+        (("n_shape", "1", rows, 0, None),),
+    )
+    result = _join(_common_frame("000001.SZ", "000002.SZ"), universe)
+    payload = result.model_dump(mode="json")
+    statuses = payload["envelope"]["field_statuses"]
+    target = next(
+        status
+        for status in statuses
+        if status["candidate_id"] == "000002.SZ" and status["name"] == "score"
+    )
+    if tamper == "missing":
+        statuses.remove(target)
+    elif tamper == "wrong_candidate":
+        target["candidate_id"] = "000003.SZ"
+    else:
+        target["available_at"] = (AVAILABLE_AT + timedelta(seconds=1)).isoformat()
+        target["actual_delay_seconds"] = 2.0
+
+    with pytest.raises(ValidationError, match="static feature|decision_cutoff|available_at"):
+        StrategyCandidateFeatureBatch.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["definition_fingerprint", "executable_fingerprint", "candidate_schema_fingerprint"],
+)
+def test_joined_authority_fingerprint_tampering_fails_closed(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    row = _candidate(
+        "000001.SZ",
+        strategy_id="n_shape",
+        strategy_version="1",
+        static_features={"score": 0.91},
+    )
+    universe, _ = _universe(tmp_path, (("n_shape", "1", (row,), 0, None),))
+    result = _join(_common_frame("000001.SZ"), universe)
+    payload = result.model_dump(mode="json")
+    payload["candidate_authority"][field] = "f" * 64
+
+    with pytest.raises(ValidationError, match="candidate authority"):
+        StrategyCandidateFeatureBatch.model_validate(payload)
+
+
 def test_empty_intersection_is_valid_canonical_and_uses_authority_capture_time(
     tmp_path: Path,
 ) -> None:
@@ -612,12 +810,50 @@ def test_empty_intersection_is_valid_canonical_and_uses_authority_capture_time(
         "ts_code",
         "vwap",
     )
-    assert result.envelope.field_status("n_score") == FeatureFieldStatus(
-        name="n_score",
-        status=FeatureAvailability.AVAILABLE,
-        available_at=captured_at,
-    )
+    assert result.envelope.field_status("n_score") is None
     assert hashlib.sha256(result.payload_bytes).hexdigest() == result.envelope.content_hash
+
+
+def test_empty_candidate_authority_preserves_complete_static_schema(tmp_path: Path) -> None:
+    universe, _ = _universe(
+        tmp_path,
+        (("n_shape", "1", (), 0, AVAILABLE_AT - timedelta(seconds=1)),),
+    )
+
+    result = _join(_common_frame("000001.SZ"), universe)
+
+    assert result.envelope.row_count == 0
+    assert result.static_feature_names == ("n_score",)
+    assert result.candidate_authority.static_feature_names == ("n_score",)
+    assert set(result.candidate_authority.static_feature_schema) == {"n_score"}
+    assert "n_score" in result.columns
+
+
+def test_output_rejects_static_name_subset_with_column_and_status_retained(
+    tmp_path: Path,
+) -> None:
+    row = _candidate(
+        "000001.SZ",
+        strategy_id="n_shape",
+        strategy_version="1",
+        static_features={"n_score": 0.91},
+    )
+    universe, _ = _universe(tmp_path, (("n_shape", "1", (row,), 0, None),))
+    result = _join(_common_frame("000001.SZ"), universe)
+    payload = result.model_dump(mode="json")
+    joined = json.loads(payload["payload_json"])
+    joined["static_feature_names"] = []
+    payload["static_feature_names"] = []
+    payload["payload_json"] = json.dumps(
+        joined,
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+    with pytest.raises(ValidationError, match="authority schema"):
+        StrategyCandidateFeatureBatch.model_validate(payload)
 
 
 def test_static_status_uses_authority_capture_for_nonempty_intersection(tmp_path: Path) -> None:
@@ -639,9 +875,13 @@ def test_static_status_uses_authority_capture_for_nonempty_intersection(tmp_path
 
     assert row.available_at < captured_at
     assert result.envelope.field_status("n_score") == FeatureFieldStatus(
+        candidate_id="000001.SZ",
         name="n_score",
         status=FeatureAvailability.AVAILABLE,
+        source_event_time=captured_at,
         available_at=captured_at,
+        decision_cutoff=AVAILABLE_AT,
+        actual_delay_seconds=0.0,
     )
 
 
@@ -798,7 +1038,10 @@ def test_output_model_rejects_static_status_time_tampering(
         for status in payload["envelope"]["field_statuses"]
     ]
 
-    with pytest.raises(ValidationError, match="static feature status"):
+    with pytest.raises(
+        ValidationError,
+        match="static feature status|source_event_time|actual_delay_seconds",
+    ):
         StrategyCandidateFeatureBatch.model_validate(payload)
 
 

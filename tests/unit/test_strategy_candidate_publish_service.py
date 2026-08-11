@@ -23,12 +23,29 @@ from rquant.strategy_candidate_snapshot import (
     StrategyCandidatePriceBasis,
     StrategyCandidateRecord,
     StrategyCandidateSnapshotSpool,
+    strategy_candidate_schema_fingerprint,
 )
 
 TRADE_DATE = date(2026, 7, 31)
 CAPTURED_AT = datetime(2026, 7, 31, 1, 28, tzinfo=UTC)
 COMMIT = "a" * 40
 AUTHORITY_ID = "1" * 64
+DEFINITION_FINGERPRINT = "2" * 64
+EXECUTABLE_FINGERPRINT = "3" * 64
+STATIC_FEATURE_SCHEMA = {"source": {"dtype": "string", "semantic": "candidate source strategy"}}
+
+
+def _exact_fingerprints(strategy_id: str) -> dict[str, object]:
+    return {
+        "definition_fingerprint": DEFINITION_FINGERPRINT,
+        "executable_fingerprint": EXECUTABLE_FINGERPRINT,
+        "candidate_schema_fingerprint": strategy_candidate_schema_fingerprint(
+            strategy_id=strategy_id,
+            strategy_version="1",
+            static_feature_schema=STATIC_FEATURE_SCHEMA,
+        ),
+        "static_feature_schema": STATIC_FEATURE_SCHEMA,
+    }
 
 
 def _authority(
@@ -109,6 +126,7 @@ def test_publish_candidate_batch_dispatches_typed_batch_and_publishes_summary(
         snapshot_root=root,
         expected_commit=COMMIT,
         batch=batch,
+        **_exact_fingerprints(strategy_id),
     )
 
     assert calls == [(batch.authority, batch.facts)]
@@ -120,10 +138,27 @@ def test_publish_candidate_batch_dispatches_typed_batch_and_publishes_summary(
     assert summary.candidate_count == 1
     assert summary.snapshot_sequence == 0
     assert summary.published is True
-    observed = StrategyCandidateSnapshotSpool(root).read_as_of(CAPTURED_AT)
+    observed = StrategyCandidateSnapshotSpool(root).read_strategy_as_of(
+        CAPTURED_AT,
+        strategy_id=strategy_id,
+        strategy_version="1",
+        definition_fingerprint=DEFINITION_FINGERPRINT,
+        executable_fingerprint=EXECUTABLE_FINGERPRINT,
+        candidate_schema_fingerprint=_exact_fingerprints(strategy_id)[
+            "candidate_schema_fingerprint"
+        ],
+        static_feature_schema=STATIC_FEATURE_SCHEMA,
+    )
     assert observed is not None
     assert observed.content_sha256 == summary.snapshot_content_sha256
     assert observed.rows == (_record(strategy_id),)
+    assert observed.authority_binding is not None
+    assert observed.authority_binding.definition_fingerprint == DEFINITION_FINGERPRINT
+    assert observed.authority_binding.executable_fingerprint == EXECUTABLE_FINGERPRINT
+    assert (
+        observed.authority_binding.candidate_schema_fingerprint
+        == (_exact_fingerprints(strategy_id)["candidate_schema_fingerprint"])
+    )
 
 
 def test_publish_candidate_batch_suppresses_an_identical_retry(tmp_path: Path) -> None:
@@ -134,11 +169,13 @@ def test_publish_candidate_batch_suppresses_an_identical_retry(tmp_path: Path) -
         snapshot_root=root,
         expected_commit=COMMIT,
         batch=batch,
+        **_exact_fingerprints("n_shape"),
     )
     duplicate = publish_candidate_batch(
         snapshot_root=root,
         expected_commit=COMMIT,
         batch=batch,
+        **_exact_fingerprints("n_shape"),
     )
 
     assert first.published is True
@@ -156,6 +193,7 @@ def test_publish_candidate_batch_rejects_reusing_another_strategy_root(
         snapshot_root=root,
         expected_commit=COMMIT,
         batch=NShapeCandidateBatch(authority=_authority(), facts=()),
+        **_exact_fingerprints("n_shape"),
     )
     before = tuple(path.read_bytes() for path in sorted(root.rglob("*.json")))
 
@@ -164,6 +202,7 @@ def test_publish_candidate_batch_rejects_reusing_another_strategy_root(
             snapshot_root=root,
             expected_commit=COMMIT,
             batch=GrowthBoardCandidateBatch(authority=_authority(), facts=()),
+            **_exact_fingerprints("growth_board_surge"),
         )
 
     assert first.strategy_id == "n_shape"
@@ -179,6 +218,7 @@ def test_empty_candidate_batch_publishes_new_generation_for_new_input_authority(
         snapshot_root=root,
         expected_commit=COMMIT,
         batch=NShapeCandidateBatch(authority=_authority(), facts=()),
+        **_exact_fingerprints("n_shape"),
     )
     changed = publish_candidate_batch(
         snapshot_root=root,
@@ -187,6 +227,7 @@ def test_empty_candidate_batch_publishes_new_generation_for_new_input_authority(
             authority=_authority(authority_snapshot_id="2" * 64),
             facts=(),
         ),
+        **_exact_fingerprints("n_shape"),
     )
 
     assert first.candidate_count == changed.candidate_count == 0
@@ -228,6 +269,7 @@ def test_publish_candidate_batch_fails_closed_before_creating_authority(
             snapshot_root=root,
             expected_commit=expected_commit,
             batch=batch,
+            **_exact_fingerprints("n_shape"),
         )
 
     assert not root.exists()
@@ -251,9 +293,29 @@ def test_publish_candidate_batch_rejects_commit_before_running_producer(
             snapshot_root=(tmp_path / "candidate").resolve(),
             expected_commit="b" * 40,
             batch=NShapeCandidateBatch(authority=_authority(), facts=()),
+            **_exact_fingerprints("n_shape"),
         )
 
     assert producer_called is False
+
+
+@pytest.mark.parametrize("missing", tuple(_exact_fingerprints("n_shape")))
+def test_publish_candidate_batch_requires_complete_exact_identity(
+    tmp_path: Path,
+    missing: str,
+) -> None:
+    identity = dict(_exact_fingerprints("n_shape"))
+    identity.pop(missing)
+
+    with pytest.raises(TypeError, match=missing):
+        publish_candidate_batch(
+            snapshot_root=(tmp_path / "candidate").resolve(),
+            expected_commit=COMMIT,
+            batch=NShapeCandidateBatch(authority=_authority(), facts=()),
+            **identity,
+        )
+
+    assert not (tmp_path / "candidate").exists()
 
 
 def test_candidate_batch_models_reject_cross_strategy_facts() -> None:

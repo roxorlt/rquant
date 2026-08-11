@@ -52,9 +52,28 @@ def test_data_audit_run_round_trip_and_latest_completed(tmp_path: Path) -> None:
 
         assert finalized.status == "completed"
         assert store.get_data_audit_run(begun.audit_run_id) == finalized
-        assert store.latest_completed_data_audit_run(
-            as_of_date=date(2026, 7, 14)
-        ) == finalized
+        assert store.latest_completed_data_audit_run(as_of_date=date(2026, 7, 14)) == finalized
+
+
+def test_data_audit_real_terminal_transition_invokes_artifact_outbox_hook(
+    tmp_path: Path,
+) -> None:
+    events: list[tuple[str, str, datetime]] = []
+    with DuckDBStore(
+        tmp_path / "audit-hook.duckdb",
+        artifact_terminal_hook=lambda owner_type, owner_id, observed_at: events.append(
+            (owner_type, owner_id, observed_at)
+        ),
+    ) as store:
+        begun = store.begin_data_audit_run(_run())
+        assert events == []
+        completed_at = OBSERVED_AT + timedelta(minutes=3)
+        store.finalize_data_audit_run(
+            begun.audit_run_id,
+            DataAuditRunFinalization(p0_count=0, completed_at=completed_at),
+        )
+
+    assert events == [("audit", begun.audit_run_id, completed_at)]
 
 
 def test_failed_audit_is_not_returned_as_completed(tmp_path: Path) -> None:
@@ -68,9 +87,7 @@ def test_failed_audit_is_not_returned_as_completed(tmp_path: Path) -> None:
 
         assert failed.status == "failed"
         assert failed.error_message == "source read failed"
-        assert store.latest_completed_data_audit_run(
-            as_of_date=date(2026, 7, 14)
-        ) is None
+        assert store.latest_completed_data_audit_run(as_of_date=date(2026, 7, 14)) is None
 
 
 def test_latest_audit_can_be_observed_after_the_covered_backtest_range(

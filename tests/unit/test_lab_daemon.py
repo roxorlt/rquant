@@ -28,6 +28,7 @@ from rquant.lab_daemon import (
     LabFinalizerStateStore,
     LabRuntimeGuard,
     ensure_private_directory,
+    load_lab_job_center_authority_manifest,
     prepare_private_sqlite_path,
     require_clean_code_sha,
     require_private_directory,
@@ -47,6 +48,34 @@ def _write_private_json(path: Path, payload: object) -> None:
         path,
         json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
     )
+
+
+def test_job_center_authority_manifest_is_private_exact_and_path_bound(
+    tmp_path: Path,
+) -> None:
+    from .test_job_center_authority import CODE_SHA, _publish_and_install
+
+    path, paths = _publish_and_install(tmp_path)
+
+    loaded = load_lab_job_center_authority_manifest(
+        path,
+        expected_code_sha=CODE_SHA,
+        expected_research_root=paths["runtime_root"],
+        expected_lab_jobs_path=paths["lab_jobs_path"],
+        expected_command_spool_path=paths["command_spool_path"],
+        expected_final_artifact_root=paths["final_artifact_root"],
+    )
+
+    assert loaded.code_sha == CODE_SHA
+    with pytest.raises(LabDaemonConfigurationError, match="manifest is invalid"):
+        load_lab_job_center_authority_manifest(
+            path,
+            expected_code_sha=CODE_SHA,
+            expected_research_root=paths["runtime_root"],
+            expected_lab_jobs_path=paths["runtime_root"] / "other.sqlite3",
+            expected_command_spool_path=paths["command_spool_path"],
+            expected_final_artifact_root=paths["final_artifact_root"],
+        )
 
 
 def test_daemon_readiness_is_generation_bound_and_monotonic(tmp_path: Path) -> None:

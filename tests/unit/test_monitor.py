@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pandas as pd
@@ -1251,6 +1252,156 @@ class TestIntradayQuoteSourceSwitch:
         from rquant.config import Settings
 
         assert Settings(intraday_quote_source="").intraday_quote_source == "tushare"
+
+
+def test_monitor_closing_rows_publish_to_shadow_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.monitor import _publish_legacy_shadow_export
+
+    trade_date = date(2026, 8, 3)
+    from rquant.legacy_shadow_export import LegacyMonitorCaptureSpool
+
+    spool = LegacyMonitorCaptureSpool(
+        path=(tmp_path / ".capture.jsonl").resolve(),
+        trade_date=trade_date,
+        records_count=1,
+        content_sha256="a" * 64,
+        content_bytes=10,
+    )
+    observed: list[object] = []
+    monkeypatch.setattr(
+        "rquant.legacy_shadow_export.publish_legacy_monitor_production_export",
+        lambda **kwargs: observed.append(kwargs) or tmp_path / "published",
+    )
+
+    _publish_legacy_shadow_export(
+        spool=spool,
+        trade_date=trade_date,
+    )
+
+    assert observed[0]["spool"] == spool
+    assert "exported_at" not in observed[0]
+
+
+def test_monitor_runner_invokes_shadow_export_after_the_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.monitor as monitor_module
+
+    trade_date = date.today()
+    item = monitor_module.WatchItem(
+        ts_code="600001.SH",
+        pool="pool2",
+        limit_up_date=trade_date,
+        body_upper=10.5,
+        body_lower=9.5,
+        body=1.0,
+        level_40=10.1,
+        level_30=10.0,
+        level_20=9.9,
+        stop_strong=9.5,
+        stop_weak=9.3,
+        name="test",
+        entry_date=trade_date,
+    )
+    published: list[dict[str, object]] = []
+    store_open = False
+
+    class _Store:
+        def __enter__(self) -> _Store:
+            nonlocal store_open
+            store_open = True
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            nonlocal store_open
+            store_open = False
+            return None
+
+        def iter_monitor_events(
+            self,
+            observed_date: str,
+            *,
+            batch_size: int,
+        ):
+            assert observed_date == trade_date.isoformat()
+            assert batch_size == 1_000
+            yield {
+                "trade_date": trade_date,
+                "ts_code": "600001.SH",
+                "level": "attack_strong_carry",
+                "trigger_price": 10.1,
+                "trigger_time": datetime.combine(trade_date, datetime.min.time()),
+            }
+
+        def query_monitor_events(self, *_args: object, **_kwargs: object) -> pd.DataFrame:
+            raise AssertionError("monitor close export must not use fetchdf")
+
+    monkeypatch.setattr(monitor_module, "DuckDBStore", _Store)
+    monkeypatch.setattr(monitor_module, "is_trading_day", lambda _day: True)
+    monkeypatch.setattr(monitor_module, "build_watchlist", lambda _store: [item])
+    monkeypatch.setattr(monitor_module, "IntradayMinuteQuoteProvider", lambda **_kwargs: object())
+    monkeypatch.setattr(monitor_module, "_publish_research_watchlist", lambda *_args: None)
+    monkeypatch.setattr(monitor_module, "_wait_for_market_open", lambda: None)
+    phases = iter(("morning", "closed"))
+    monkeypatch.setattr(monitor_module, "_market_phase", lambda: next(phases))
+    monkeypatch.setattr(monitor_module, "check_exits", lambda _store, _day: 0)
+    spool = SimpleNamespace(records_count=1)
+    monkeypatch.setattr(
+        monitor_module,
+        "_prepare_legacy_shadow_spool",
+        lambda **_kwargs: (
+            spool
+            if store_open
+            else (_ for _ in ()).throw(AssertionError("spool prepared after DuckDB close"))
+        ),
+    )
+    monkeypatch.setattr(
+        monitor_module,
+        "_publish_legacy_shadow_export",
+        lambda **kwargs: (
+            (_ for _ in ()).throw(AssertionError("publisher ran while DuckDB was open"))
+            if store_open
+            else published.append(kwargs) or Path("/tmp/monitor-export")
+        ),
+    )
+    monkeypatch.setattr("rquant.notify.notify", lambda *_args, **_kwargs: None)
+
+    assert monitor_module.run_monitor(interval=5) == 0
+    assert len(published) == 1
+    assert published[0]["spool"] is spool
+    assert published[0]["trade_date"] == trade_date
+
+
+def test_monitor_event_cursor_pages_without_dataframe_materialization(
+    store: DuckDBStore,
+) -> None:
+    trade_date = date(2026, 8, 3)
+    store.upsert_monitor_event(
+        pd.DataFrame(
+            [
+                {
+                    "trade_date": trade_date,
+                    "ts_code": code,
+                    "level": "attack_strong_carry",
+                    "trigger_price": 10.1,
+                    "level_price": 10.0,
+                    "trigger_time": datetime(2026, 8, 3, 14, 57 + index),
+                    "trigger_type": "strong_carry",
+                    "pool": "pool2",
+                    "body_upper": 10.5,
+                    "body_lower": 9.5,
+                }
+                for index, code in enumerate(("600001.SH", "600002.SH"))
+            ]
+        )
+    )
+
+    rows = tuple(store.iter_monitor_events(trade_date.isoformat(), batch_size=1))
+
+    assert [row["ts_code"] for row in rows] == ["600001.SH", "600002.SH"]
 
 
 class TestCheckExitsSingleStockIsolation:

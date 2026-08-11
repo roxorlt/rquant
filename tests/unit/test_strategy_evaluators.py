@@ -2,18 +2,23 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import UTC, datetime
+from pathlib import Path
 from types import MappingProxyType
 
 import pytest
 
+import rquant.strategy_evaluators as strategy_evaluators_module
+from rquant.definition_registry import ImmutableDefinitionRegistry
+from rquant.feature_contracts import FeatureContract, FeatureDefinition
 from rquant.runtime_contracts import canonical_sha256
 from rquant.signal_contracts import SignalAction
 from rquant.strategy_evaluators import (
     BuiltinStrategyEvaluatorRegistry,
     StaticFeatureSemantic,
+    project_execution_lifecycle_features,
 )
 from rquant.strategy_runner import StrategyCandidateState, StrategyDecision
-from rquant.strategy_spec import StrategyLifecycleState
+from rquant.strategy_spec import StrategyLifecycleState, StrategySpec
 
 COMMIT = "a" * 40
 NOW = datetime(2026, 7, 31, 1, 30, tzinfo=UTC)
@@ -51,6 +56,23 @@ def _evaluate(
         _state(registry, strategy_id, state),
         features,
     )
+
+
+def _replacement_runtime_dispatcher(
+    _spec: StrategySpec,
+    _state: StrategyCandidateState,
+    _features: dict[str, object],
+) -> StrategyDecision | None:
+    return None
+
+
+def _replacement_session_geometry(
+    *,
+    session_low: float,
+    latest_close: float,
+    session_high: float,
+) -> None:
+    del session_low, latest_close, session_high
 
 
 def _n_features(**changes: object) -> dict[str, object]:
@@ -135,6 +157,30 @@ def test_registry_exposes_complete_immutable_allow_list_and_specs(
     with pytest.raises(AttributeError, match="immutable"):
         registry._definitions = MappingProxyType({})
 
+    lifecycle_features = {
+        "entry_fill_status",
+        "exit_execution_status",
+        "position_closed",
+        "holding_trading_sessions",
+        "position_sellable",
+        "entry_price_raw",
+        "structure_stop_price_raw",
+        "eligible_high_price_raw",
+        "remaining_position_fraction",
+    }
+    lifecycle_transitions = {
+        ("armed", "entry_filled", "holding"),
+        ("armed", "entry_rejected", "terminal"),
+        ("holding", "take_profit_partial", "holding"),
+        ("holding", "exit", "holding"),
+        ("holding", "exit_filled", "terminal"),
+    }
+    lifecycle_actions = (
+        SignalAction.WATCH.value,
+        SignalAction.B_INTENT.value,
+        SignalAction.REDUCE.value,
+        SignalAction.S_INTENT.value,
+    )
     expected = {
         "n_shape": {
             "required": {
@@ -155,8 +201,9 @@ def test_registry_exposes_complete_immutable_allow_list_and_specs(
                 "amount_accel_10m",
                 "tick_rule_buy_sell_ratio_proxy",
                 "historical_sessions",
-            },
-            "actions": (SignalAction.WATCH.value, SignalAction.B_INTENT.value),
+            }
+            | lifecycle_features,
+            "actions": lifecycle_actions,
             "parameters": {
                 "carry_low_ratio": 1.0,
                 "break_high_ratio": 1.0,
@@ -169,7 +216,8 @@ def test_registry_exposes_complete_immutable_allow_list_and_specs(
                 ("idle", "entry_ready", "armed"),
                 ("watching", "entry_ready", "armed"),
                 ("watching", "support_broken", "terminal"),
-            },
+            }
+            | lifecycle_transitions,
         },
         "growth_board_surge": {
             "required": {
@@ -193,8 +241,9 @@ def test_registry_exposes_complete_immutable_allow_list_and_specs(
                 "tick_rule_buy_sell_ratio_proxy",
                 "minute_volume",
                 "cumulative_volume",
-            },
-            "actions": (SignalAction.WATCH.value, SignalAction.B_INTENT.value),
+            }
+            | lifecycle_features,
+            "actions": lifecycle_actions,
             "parameters": {
                 "min_rel_cumulative": 1.4,
                 "min_rel_same_minute": 2.0,
@@ -209,7 +258,8 @@ def test_registry_exposes_complete_immutable_allow_list_and_specs(
                 ("idle", "volume_building", "watching"),
                 ("idle", "entry_ready", "armed"),
                 ("watching", "entry_ready", "armed"),
-            },
+            }
+            | lifecycle_transitions,
         },
         "auction_gap": {
             "required": {
@@ -229,8 +279,9 @@ def test_registry_exposes_complete_immutable_allow_list_and_specs(
                 "amount_accel_5m",
                 "amount_accel_10m",
                 "tick_rule_buy_sell_ratio_proxy",
-            },
-            "actions": (SignalAction.WATCH.value,),
+            }
+            | lifecycle_features,
+            "actions": lifecycle_actions,
             "parameters": {
                 "auction_ratio_min": 0.15,
                 "auction_ratio_max": 5.0,
@@ -239,7 +290,11 @@ def test_registry_exposes_complete_immutable_allow_list_and_specs(
                 "min_hold_auction_price_ratio": 1.0,
                 "expires_seconds": 120,
             },
-            "transitions": {("idle", "observer_match", "watching")},
+            "transitions": {
+                ("idle", "observer_match", "watching"),
+                ("watching", "entry_ready", "armed"),
+            }
+            | lifecycle_transitions,
         },
     }
 
@@ -268,7 +323,7 @@ def test_registry_loaders_fail_closed_and_binding_matches_definition(
     assert registry.load_spec("n_shape", 1) is definition.spec
     assert binding.strategy_id == "n_shape"
     assert binding.strategy_version == 1
-    assert binding.contract_fingerprint == definition.contract_fingerprint
+    assert binding.contract_fingerprint == definition.executable_fingerprint
     assert binding.evaluator is definition.evaluator
     with pytest.raises(KeyError, match="unknown built-in strategy"):
         registry.load_definition("n_shape", 2)
@@ -280,6 +335,210 @@ def test_registry_loaders_fail_closed_and_binding_matches_definition(
         BuiltinStrategyEvaluatorRegistry(producer_commit="short")
     with pytest.raises(TypeError, match="string"):
         BuiltinStrategyEvaluatorRegistry(producer_commit=1)  # type: ignore[arg-type]
+
+
+def test_all_builtin_specs_round_trip_through_trusted_definition_registry(
+    tmp_path: Path,
+    registry: BuiltinStrategyEvaluatorRegistry,
+) -> None:
+    execution_registry = registry.trusted_executable_registry()
+    definition_store = ImmutableDefinitionRegistry(
+        tmp_path / "definitions",
+        execution_registry=execution_registry,
+    )
+    feature_names = sorted(
+        {
+            requirement.name
+            for definition in registry.definitions.values()
+            for requirement in (
+                *definition.spec.required_features,
+                *definition.spec.optional_features,
+            )
+        }
+    )
+    parent = None
+    for version in (1, 2, 3):
+        contract = FeatureContract(
+            contract_id="intraday-pit",
+            version=version,
+            features=tuple(
+                FeatureDefinition(
+                    name=name,
+                    dtype="object",
+                    source_datasets=("market_minute",),
+                    lookback=90,
+                    pit_rule="available_at <= decision_time",
+                    price_basis="raw",
+                    availability_contract={
+                        "source_available_at_basis": "max_source_available_at",
+                        "max_delay_seconds": 60,
+                        "missing_policy": "mark_unavailable",
+                        "late_policy": "mark_stale",
+                        "decision_visibility_gate": "available_at_lte_decision_time",
+                    },
+                )
+                for name in feature_names
+            ),
+            producer_commit=COMMIT,
+        )
+        parent = definition_store.register_feature_contract(
+            contract,
+            registered_at=NOW,
+            available_at=NOW,
+            producer_commit=COMMIT,
+            expected_fingerprint=contract.contract_fingerprint,
+            parent_fingerprint=None if parent is None else parent.fingerprint,
+            supersedes=None if parent is None else parent.version,
+            replacement_reason=None if parent is None else "contract evolution",
+        )
+    assert parent is not None
+
+    for definition in registry.definitions.values():
+        spec = definition.spec
+        transitions = {
+            (transition.from_state, transition.event, transition.to_state)
+            for transition in spec.transitions
+        }
+        assert (
+            StrategyLifecycleState.ARMED,
+            "entry_filled",
+            StrategyLifecycleState.HOLDING,
+        ) in transitions
+        assert any(
+            from_state is StrategyLifecycleState.HOLDING
+            and to_state is StrategyLifecycleState.TERMINAL
+            for from_state, _event, to_state in transitions
+        )
+        registered = definition_store.register_strategy_spec(
+            spec,
+            feature_contract_fingerprint=parent.fingerprint,
+            registered_at=NOW,
+            available_at=NOW,
+            producer_commit=COMMIT,
+            expected_fingerprint=spec.spec_fingerprint,
+        )
+
+        assert definition_store.read_strategy_spec(registered.fingerprint) == registered
+        assert registered.executable_fingerprint == definition.executable_fingerprint
+
+
+def test_lifecycle_features_bind_execution_projection_not_market_minute_compute(
+    registry: BuiltinStrategyEvaluatorRegistry,
+) -> None:
+    availability = {
+        "source_available_at_basis": "authoritative_source_available_at",
+        "max_delay_seconds": 1,
+        "missing_policy": "fail_closed",
+        "late_policy": "fail_closed",
+        "decision_visibility_gate": "available_at_lte_decision_time",
+    }
+    contract = FeatureContract(
+        contract_id="intraday-pit",
+        version=3,
+        features=(
+            FeatureDefinition(
+                name="latest_close",
+                dtype="float64",
+                source_datasets=("market_minute",),
+                lookback=0,
+                pit_rule="available_at <= decision_time",
+                price_basis="raw",
+                availability_contract=availability,
+            ),
+            FeatureDefinition(
+                name="entry_fill_status",
+                dtype="string",
+                source_datasets=("paper_execution_state",),
+                lookback=0,
+                pit_rule="available_at <= decision_time",
+                price_basis="raw",
+                availability_contract=availability,
+            ),
+        ),
+        producer_commit=COMMIT,
+    )
+    bindings = {
+        binding.feature_name: binding
+        for binding in registry.trusted_executable_registry().feature_bindings(contract)
+    }
+
+    assert (
+        bindings["entry_fill_status"].implementation_id
+        != bindings["latest_close"].implementation_id
+    )
+
+
+def test_execution_lifecycle_projection_validates_authoritative_state() -> None:
+    projected = project_execution_lifecycle_features(
+        {
+            "entry_fill_status": "filled",
+            "exit_execution_status": "pending",
+            "position_closed": False,
+            "holding_trading_sessions": 1,
+            "position_sellable": True,
+            "entry_price_raw": 10,
+            "structure_stop_price_raw": 9.7,
+            "eligible_high_price_raw": 11.2,
+            "remaining_position_fraction": 0.5,
+        }
+    )
+
+    assert projected == {
+        "eligible_high_price_raw": 11.2,
+        "entry_fill_status": "filled",
+        "entry_price_raw": 10.0,
+        "exit_execution_status": "pending",
+        "holding_trading_sessions": 1,
+        "position_closed": False,
+        "position_sellable": True,
+        "remaining_position_fraction": 0.5,
+        "structure_stop_price_raw": 9.7,
+    }
+    with pytest.raises(ValueError, match="unsupported execution lifecycle field"):
+        project_execution_lifecycle_features({"latest_close": 10.0})
+    with pytest.raises(ValueError, match="entry_fill_status"):
+        project_execution_lifecycle_features({"entry_fill_status": "unknown"})
+    with pytest.raises(ValueError, match="exit_execution_status"):
+        project_execution_lifecycle_features({"exit_execution_status": "unknown"})
+    with pytest.raises(ValueError, match="remaining_position_fraction"):
+        project_execution_lifecycle_features({"remaining_position_fraction": 1.1})
+
+
+def test_executable_fingerprint_binds_actual_runtime_dispatcher(
+    registry: BuiltinStrategyEvaluatorRegistry,
+) -> None:
+    definition = registry.load_definition("n_shape", 1)
+    replaced = replace(definition, evaluator=_replacement_runtime_dispatcher)
+
+    assert replaced.executable_fingerprint != definition.executable_fingerprint
+
+
+def test_executable_fingerprint_binds_referenced_helper_graph(
+    registry: BuiltinStrategyEvaluatorRegistry,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    definition = registry.load_definition("n_shape", 1)
+    original = definition.executable_fingerprint
+
+    monkeypatch.setattr(
+        strategy_evaluators_module,
+        "_validate_session_geometry",
+        _replacement_session_geometry,
+    )
+
+    assert definition.executable_fingerprint != original
+
+
+def test_executable_fingerprint_binds_referenced_global_constants(
+    registry: BuiltinStrategyEvaluatorRegistry,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    definition = registry.load_definition("n_shape", 1)
+    original = definition.executable_fingerprint
+
+    monkeypatch.setattr(strategy_evaluators_module, "_STOP_LOSS_BPS", 999)
+
+    assert definition.executable_fingerprint != original
 
 
 def test_definition_rejects_outer_identity_action_and_schema_drift(
@@ -335,6 +594,17 @@ def test_contract_fingerprint_is_stable_and_semantically_sensitive(
     )
     assert len(definition.contract_fingerprint) == 64
     assert definition.contract_fingerprint == canonical_sha256(definition.contract_payload())
+    assert definition.candidate_schema_fingerprint == canonical_sha256(
+        {
+            "contract": "strategy-candidate-static-schema/v1",
+            "strategy_id": definition.strategy_id,
+            "strategy_version": definition.strategy_version,
+            "static_feature_schema": {
+                name: semantic.contract_payload()
+                for name, semantic in sorted(definition.static_feature_schema.items())
+            },
+        }
+    )
 
     reordered_spec = definition.spec.model_copy(
         update={"allowed_actions": tuple(reversed(definition.spec.allowed_actions))}
@@ -391,12 +661,49 @@ def test_contract_fingerprint_is_stable_and_semantically_sensitive(
     assert all(
         changed.contract_fingerprint != definition.contract_fingerprint for changed in changes
     )
+    assert changes[-1].candidate_schema_fingerprint != definition.candidate_schema_fingerprint
     assert definition.static_feature_schema["large_net_vol_t1"].semantic == "t_minus_1_daily_proxy"
     with pytest.raises(TypeError):
         definition.static_feature_schema["new"] = StaticFeatureSemantic(
             dtype="number",
             semantic="invalid mutation",
         )
+
+
+def test_candidate_schema_fingerprint_delegates_to_snapshot_canonical_helper(
+    registry: BuiltinStrategyEvaluatorRegistry,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = "f" * 64
+    observed: dict[str, object] = {}
+
+    def canonical_helper(**kwargs: object) -> str:
+        observed.update(kwargs)
+        return expected
+
+    monkeypatch.setattr(
+        strategy_evaluators_module,
+        "strategy_candidate_schema_fingerprint",
+        canonical_helper,
+        raising=False,
+    )
+    definition = registry.load_definition("n_shape", 1)
+
+    assert definition.candidate_schema_fingerprint == expected
+    assert observed == {
+        "strategy_id": "n_shape",
+        "strategy_version": "1",
+        "static_feature_schema": {
+            name: semantic.contract_payload()
+            for name, semantic in definition.static_feature_schema.items()
+        },
+    }
+
+
+@pytest.mark.parametrize("dtype", ["float64", "boolean", "NUMBER", " number "])
+def test_static_feature_semantic_rejects_noncanonical_dtype(dtype: str) -> None:
+    with pytest.raises(ValueError, match="canonical static feature dtype"):
+        StaticFeatureSemantic(dtype=dtype, semantic="candidate score")
 
 
 def test_n_shape_positive_watch_entry_and_broken_support(
@@ -722,7 +1029,7 @@ def test_growth_accepts_both_allowed_boards_and_threshold_boundaries(
     assert decision.action is SignalAction.B_INTENT
 
 
-def test_auction_gap_observer_boundaries_and_never_buys(
+def test_auction_gap_observer_then_minute_confirmation_emits_buy_intent(
     registry: BuiltinStrategyEvaluatorRegistry,
 ) -> None:
     for ratio in (0.15, 5.0):
@@ -736,16 +1043,16 @@ def test_auction_gap_observer_boundaries_and_never_buys(
         assert decision.expected_to_state is StrategyLifecycleState.WATCHING
         assert decision.evidence["observer_only"] is True
 
-    assert (
-        _evaluate(
-            registry,
-            "auction_gap",
-            _auction_features(),
-            StrategyLifecycleState.WATCHING,
-        )
-        is None
+    confirmed = _evaluate(
+        registry,
+        "auction_gap",
+        _auction_features(),
+        StrategyLifecycleState.WATCHING,
     )
-    assert registry.load_spec("auction_gap", 1).allowed_actions == (SignalAction.WATCH.value,)
+    assert confirmed is not None
+    assert confirmed.action is SignalAction.B_INTENT
+    assert confirmed.expected_to_state is StrategyLifecycleState.ARMED
+    assert SignalAction.B_INTENT.value in registry.load_spec("auction_gap", 1).allowed_actions
 
 
 @pytest.mark.parametrize(
@@ -822,14 +1129,6 @@ def test_auction_session_high_cannot_exceed_authoritative_limit(
 
 
 @pytest.mark.parametrize(
-    "state",
-    [
-        StrategyLifecycleState.ARMED,
-        StrategyLifecycleState.HOLDING,
-        StrategyLifecycleState.TERMINAL,
-    ],
-)
-@pytest.mark.parametrize(
     ("strategy_id", "features"),
     [
         ("n_shape", _n_features()),
@@ -837,13 +1136,143 @@ def test_auction_session_high_cannot_exceed_authoritative_limit(
         ("auction_gap", _auction_features()),
     ],
 )
-def test_all_evaluators_ignore_non_entry_states_before_feature_validation(
+def test_all_evaluators_ignore_terminal_state_before_feature_validation(
     registry: BuiltinStrategyEvaluatorRegistry,
     strategy_id: str,
     features: dict[str, object],
-    state: StrategyLifecycleState,
 ) -> None:
-    assert _evaluate(registry, strategy_id, {**features, "latest_close": True}, state) is None
+    assert (
+        _evaluate(
+            registry,
+            strategy_id,
+            {**features, "latest_close": True},
+            StrategyLifecycleState.TERMINAL,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("strategy_id", ("n_shape", "growth_board_surge", "auction_gap"))
+def test_all_builtin_evaluators_confirm_fill_and_enforce_t_plus_one_exits(
+    registry: BuiltinStrategyEvaluatorRegistry,
+    strategy_id: str,
+) -> None:
+    filled = _evaluate(
+        registry,
+        strategy_id,
+        {"entry_fill_status": "filled"},
+        StrategyLifecycleState.ARMED,
+    )
+    assert filled is not None
+    assert filled.action is None
+    assert filled.expected_to_state is StrategyLifecycleState.HOLDING
+
+    same_day = {
+        "exit_execution_status": "none",
+        "position_closed": False,
+        "holding_trading_sessions": 0,
+        "position_sellable": False,
+        "latest_close": 9.6,
+        "entry_price_raw": 10.0,
+        "structure_stop_price_raw": 9.7,
+        "eligible_high_price_raw": 10.0,
+        "remaining_position_fraction": 1.0,
+    }
+    assert (
+        _evaluate(
+            registry,
+            strategy_id,
+            same_day,
+            StrategyLifecycleState.HOLDING,
+        )
+        is None
+    )
+
+    stop = _evaluate(
+        registry,
+        strategy_id,
+        {
+            **same_day,
+            "holding_trading_sessions": 1,
+            "position_sellable": True,
+        },
+        StrategyLifecycleState.HOLDING,
+    )
+    assert stop is not None
+    assert stop.action is SignalAction.S_INTENT
+    assert stop.expected_to_state is StrategyLifecycleState.HOLDING
+    assert stop.evidence["sell_tranche_fraction"] == 1.0
+
+    trailing = _evaluate(
+        registry,
+        strategy_id,
+        {
+            **same_day,
+            "holding_trading_sessions": 1,
+            "position_sellable": True,
+            "latest_close": 10.6,
+            "structure_stop_price_raw": 9.5,
+            "eligible_high_price_raw": 11.0,
+        },
+        StrategyLifecycleState.HOLDING,
+    )
+    assert trailing is not None
+    assert trailing.action is SignalAction.REDUCE
+    assert trailing.expected_to_state is StrategyLifecycleState.HOLDING
+    assert trailing.evidence["sell_tranche_fraction"] == 0.5
+
+    final_tranche = _evaluate(
+        registry,
+        strategy_id,
+        {
+            **trailing.evidence,
+            "remaining_position_fraction": 0.5,
+        },
+        StrategyLifecycleState.HOLDING,
+    )
+    assert final_tranche is not None
+    assert final_tranche.action is SignalAction.S_INTENT
+    assert final_tranche.expected_to_state is StrategyLifecycleState.HOLDING
+    assert final_tranche.evidence["sell_tranche_fraction"] == 1.0
+
+    pending = _evaluate(
+        registry,
+        strategy_id,
+        {**same_day, "exit_execution_status": "pending"},
+        StrategyLifecycleState.HOLDING,
+    )
+    assert pending is None
+
+    retryable = _evaluate(
+        registry,
+        strategy_id,
+        {
+            **same_day,
+            "holding_trading_sessions": 1,
+            "position_sellable": True,
+            "exit_execution_status": "retryable",
+        },
+        StrategyLifecycleState.HOLDING,
+    )
+    assert retryable is not None
+    assert retryable.action is SignalAction.S_INTENT
+    assert retryable.expected_to_state is StrategyLifecycleState.HOLDING
+
+    closed = _evaluate(
+        registry,
+        strategy_id,
+        {
+            **same_day,
+            "position_closed": True,
+            "remaining_position_fraction": 0.0,
+            "exit_execution_status": "filled",
+        },
+        StrategyLifecycleState.HOLDING,
+    )
+    assert closed is not None
+    assert closed.event == "exit_filled"
+    assert closed.action is None
+    assert closed.expected_to_state is StrategyLifecycleState.TERMINAL
 
 
 @pytest.mark.parametrize(

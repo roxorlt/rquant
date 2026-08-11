@@ -5,6 +5,7 @@ import fcntl
 import hashlib
 import json
 import os
+import plistlib
 import runpy
 import shutil
 import subprocess
@@ -59,6 +60,16 @@ def test_daemon_release_authority_inherits_original_startup_deadline(script: Pat
             "startup_deadline_monotonic",
             "authority_deadline",
         }
+
+
+def test_lab_daemon_bootstrap_rejects_daily_receipt_authority_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    namespace = runpy.run_path(str(BOOTSTRAP))
+    monkeypatch.setenv("RQ_DAILY_SHADOW_RECEIPT_SIGNER_COMMAND", '["/tmp/signer"]')
+
+    with pytest.raises(namespace["BootstrapError"], match="Daily receipt authority"):
+        namespace["_reject_daily_receipt_environment"]()
 
 
 def test_git_commit_rejects_expired_original_deadline_before_subprocess(
@@ -376,6 +387,87 @@ def _deployment_lock_path(checkout: Path) -> Path:
     return checkout.parent / ".rquant-deploy" / f"{checkout.name}.lock"
 
 
+def test_wrapper_binds_profile_root_and_checkout_arguments_from_controlled_context(
+    tmp_path: Path,
+) -> None:
+    namespace = runpy.run_path(str(WRAPPER))
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir()
+
+    bound = namespace["_bind_controlled_daemon_arguments"](
+        checkout,
+        TRUSTED_GIT,
+        [str(checkout / ".venv/bin/rquant"), "lab-runtime-prepare"],
+        environ={"RQUANT_RUNTIME_ROOT": str(runtime_root)},
+    )
+
+    assert bound[-6:] == [
+        "--expected-checkout-root",
+        str(checkout),
+        "--trusted-git-path",
+        str(TRUSTED_GIT),
+        "--runtime-deployment-root",
+        str(runtime_root),
+    ]
+
+
+def test_wrapper_rejects_missing_controlled_profile_root_before_daemon_start(
+    tmp_path: Path,
+) -> None:
+    namespace = runpy.run_path(str(WRAPPER))
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+
+    with pytest.raises(namespace["WrapperError"], match="RQUANT_RUNTIME_ROOT"):
+        namespace["_bind_controlled_daemon_arguments"](
+            checkout,
+            TRUSTED_GIT,
+            [str(checkout / ".venv/bin/rquant"), "lab-scheduler"],
+            environ={},
+        )
+
+
+def test_scheduler_launchd_pins_production_environment() -> None:
+    payload = plistlib.loads(
+        (ROOT / "deploy/launchd/com.roxor.rquant-lab-scheduler.plist").read_bytes()
+    )
+
+    assert payload["EnvironmentVariables"]["APP_ENV"] == "prod"
+    assert payload["EnvironmentVariables"]["RQUANT_DISABLE_DOTENV"] == "1"
+
+
+def test_scheduler_wrapper_rejects_environment_downgrade_without_echoing_payload() -> None:
+    namespace = runpy.run_path(str(WRAPPER))
+    attacker_helper = "/tmp/attacker-owned-highwater-helper"
+
+    with pytest.raises(namespace["WrapperError"]) as raised:
+        namespace["_production_daemon_environment"](
+            "lab-scheduler",
+            environ={
+                "APP_ENV": "dev",
+                "LAB_HIGHWATER_AUTHORITY_COMMAND_JSON": attacker_helper,
+                "LAB_HIGHWATER_STATE_ROOT": "/tmp/attacker-state",
+            },
+        )
+
+    assert "APP_ENV" in str(raised.value) or "LAB_HIGHWATER" in str(raised.value)
+    assert attacker_helper not in str(raised.value)
+
+
+def test_scheduler_wrapper_sets_fixed_production_environment() -> None:
+    namespace = runpy.run_path(str(WRAPPER))
+
+    environment = namespace["_production_daemon_environment"](
+        "lab-scheduler",
+        environ={"PATH": "/usr/bin:/bin"},
+    )
+
+    assert environment["APP_ENV"] == "prod"
+    assert environment["RQUANT_DISABLE_DOTENV"] == "1"
+
+
 def _write_lab_installation(
     checkout: Path,
     lock_path: Path,
@@ -515,6 +607,7 @@ def test_lab_runtime_wrapper_runs_preflight_before_daemon_exec(tmp_path: Path) -
     assert result.stdout.index("Lab runtime preflight") < result.stdout.index(
         "fake daemon executed"
     )
+    assert result.stdout.count("Lab runtime preflight:") == 1
     daemon_argv = json.loads(marker.read_text(encoding="utf-8"))
     assert daemon_argv[:2] == [
         "lab-worker",
@@ -1165,17 +1258,20 @@ def test_lab_runtime_wrapper_rechecks_complete_checkout_after_second_preflight(
     tracked = checkout / "src" / "rquant" / "__init__.py"
     exec_calls: list[tuple[object, ...]] = []
     original_run = namespace["main"].__globals__["run_contained"]
-    preflight_calls = 0
+    full_preflight_calls = 0
 
     def dirty_after_second_preflight(
         command: list[str],
         **kwargs: object,
     ) -> subprocess.CompletedProcess[str]:
-        nonlocal preflight_calls
+        nonlocal full_preflight_calls
         result = original_run(command, **kwargs)
-        if any(Path(str(value)).name == PREFLIGHT.name for value in command):
-            preflight_calls += 1
-            if preflight_calls == 2:
+        if (
+            any(Path(str(value)).name == PREFLIGHT.name for value in command)
+            and "--prepared-sentinel-only" not in command
+        ):
+            full_preflight_calls += 1
+            if full_preflight_calls == 1:
                 tracked.write_text("UNTRUSTED_AFTER_SECOND = True\n", encoding="utf-8")
         return result
 
@@ -1211,7 +1307,9 @@ def test_lab_runtime_wrapper_rechecks_complete_checkout_after_second_preflight(
         ]
     )
 
-    assert preflight_calls >= 2
+    # A release generation is fully preflighted once. Subsequent handoffs are
+    # bound to the verified identities/SHA and must reject this mutation.
+    assert full_preflight_calls == 1
     assert result == 1
     assert exec_calls == []
     assert not marker.exists()

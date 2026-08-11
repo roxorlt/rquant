@@ -18,11 +18,13 @@ from rquant.runtime_serving_snapshot import (
     LAB_JOBS_DATASET_ID,
     PAPER_ACCOUNTS_DATASET_ID,
     PROMOTIONS_DATASET_ID,
+    REFERENCE_SLOW_AUTHORITY_DATASET_ID,
     RUNTIME_HEALTH_DATASET_ID,
     SIGNALS_DATASET_ID,
     LabJobsPayload,
     PaperAccountsPayload,
     PromotionsPayload,
+    ReferenceSlowPayload,
     RuntimeHealthPayload,
     SignalDeliveryPayload,
     SourceReadResult,
@@ -52,13 +54,15 @@ def test_bundle_to_default_registry_publishes_readonly_serving_generation(
     tmp_path: Path,
 ) -> None:
     runtime_root = tmp_path / "runtime"
+    notifier_instance = "svc-" + hashlib.sha256(b"notifier.admin.shadow.v1").hexdigest()
+    paper_instance = "svc-" + hashlib.sha256(b"paper-broker.shadow-main.v1").hexdigest()
     authorities = {
         SIGNALS_DATASET_ID: (
-            runtime_root / "live" / "notifications" / "owner" / "serving-authority",
+            runtime_root / "live" / "notifications" / notifier_instance / "serving-authority",
             SignalDeliveryPayload(),
         ),
         PAPER_ACCOUNTS_DATASET_ID: (
-            runtime_root / "live" / "paper-brokers" / "owner" / "serving-authority",
+            runtime_root / "live" / "paper-brokers" / paper_instance / "serving-authority",
             PaperAccountsPayload(),
         ),
         RUNTIME_HEALTH_DATASET_ID: (
@@ -66,12 +70,22 @@ def test_bundle_to_default_registry_publishes_readonly_serving_generation(
             RuntimeHealthPayload(),
         ),
         LAB_JOBS_DATASET_ID: (
-            runtime_root / "research" / "authority-lab-jobs",
+            runtime_root / "research" / "serving-authorities" / "lab-jobs",
             LabJobsPayload(),
         ),
         PROMOTIONS_DATASET_ID: (
-            runtime_root / "research" / "authority-promotions",
+            runtime_root / "research" / "serving-authorities" / "promotions",
             PromotionsPayload(),
+        ),
+        REFERENCE_SLOW_AUTHORITY_DATASET_ID: (
+            runtime_root / "live" / "reference-slow" / "serving-authority",
+            ReferenceSlowPayload(
+                reference_generation_id="f" * 64,
+                revision=1,
+                price_basis="raw_session",
+                adjustment_basis="tushare_adj_factor",
+                available_at=NOW - timedelta(seconds=1),
+            ),
         ),
     }
     for dataset_id, (root, payload) in authorities.items():

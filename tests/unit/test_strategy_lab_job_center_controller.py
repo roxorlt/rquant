@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import ast
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -10,6 +10,14 @@ from uuid import UUID
 import pytest
 from pydantic import ValidationError
 
+from rquant.definition_registry import ImmutableDefinitionRegistry
+from rquant.experiment_registry import (
+    DateRange,
+    ExperimentRegistry,
+    ExperimentSpec,
+    FormalExperimentPlan,
+    HypothesisFamilyManifest,
+)
 from rquant.lab_artifact_export import LabJobZipExportReceipt
 from rquant.lab_artifact_preview import ArtifactPreview
 from rquant.lab_job_center import (
@@ -27,6 +35,12 @@ from rquant.research_run_spec import (
     ExecutionCostSpec,
     ResourceClass,
 )
+from rquant.runtime_contracts import canonical_sha256
+from rquant.runtime_definition_bootstrap import (
+    bootstrap_builtin_definitions,
+    plan_builtin_definitions,
+)
+from rquant.strategy_evaluators import BuiltinStrategyEvaluatorRegistry
 from rquant.strategy_job_adapters import (
     AuctionGapParameters,
     GrowthBoardSurgeParameters,
@@ -237,6 +251,24 @@ def _context(*, formal: bool = False) -> Any:
     )
 
 
+def _definition_registry(tmp_path: Path) -> ImmutableDefinitionRegistry:
+    root = tmp_path / "definitions"
+    plan = plan_builtin_definitions(producer_commit=CODE_SHA)
+    bootstrap_builtin_definitions(
+        root,
+        producer_commit=CODE_SHA,
+        registered_at=NOW - timedelta(days=2),
+        available_at=NOW - timedelta(days=1),
+        expected_plan_id=plan.plan_id,
+    )
+    return ImmutableDefinitionRegistry(
+        root,
+        execution_registry=BuiltinStrategyEvaluatorRegistry(
+            producer_commit=CODE_SHA
+        ).trusted_executable_registry(),
+    )
+
+
 @pytest.mark.parametrize(("run_input", "adapter_id"), RUN_INPUTS)
 def test_submit_maps_all_inputs_through_the_canonical_factory(
     run_input: Any,
@@ -264,6 +296,26 @@ def test_submit_maps_all_inputs_through_the_canonical_factory(
     )
     assert command.spec.parameters.start_date == run_input.start_date
     assert kwargs == {"interaction_key": "form-submit-1"}
+
+
+def test_page_controller_can_build_submission_without_writer_facades() -> None:
+    from rquant.dashboard.lab.job_center import StrategyLabJobCenterController
+
+    controller = StrategyLabJobCenterController(
+        reader=_ReaderSpy(),
+        preview_reader=_PreviewSpy(),
+    )
+
+    command = controller.build_submission_command(
+        RUN_INPUTS[0][0],
+        context=_context(),
+        job_id=JOB_ID,
+        as_of=NOW,
+    )
+
+    assert command.job_id == JOB_ID
+    assert command.command_type == "submit"
+    assert command.spec.parameters.strategy_name == "n_shape"
 
 
 def test_submission_context_is_strict_frozen_and_requires_formal_snapshot() -> None:
@@ -294,6 +346,145 @@ def test_submission_context_is_strict_frozen_and_requires_formal_snapshot() -> N
             deadline=datetime(2026, 8, 1, tzinfo=UTC),
             max_attempts=1,
         )
+
+
+def test_formal_submit_fails_closed_without_trusted_ownership_resolvers() -> None:
+    controller, _, commands, _, _ = _controller()
+
+    with pytest.raises(RuntimeError, match="Definition Registry|formal ownership"):
+        controller.submit(
+            RUN_INPUTS[0][0],
+            context=_context(formal=True),
+            interaction_key="formal-missing-trust",
+            job_id=JOB_ID,
+        )
+
+    assert commands.calls == []
+
+
+def test_formal_submit_resolves_v3_identity_and_atomically_registers_attempt(
+    tmp_path: Path,
+) -> None:
+    from rquant.dashboard.lab.job_center import (
+        RegistryBackedFormalExperimentResolver,
+        StrategyLabFormalExperimentBinding,
+        StrategyLabFormalResolutionRequest,
+        StrategyLabJobCenterController,
+    )
+    from rquant.lab_job_center import LabCommandSubmissionFacade
+    from rquant.lab_job_protocol import LabCommandSpool
+    from rquant.lab_jobs import LabJobReader, LabJobStore
+
+    definitions = _definition_registry(tmp_path)
+    experiments = ExperimentRegistry(
+        tmp_path / "experiments.sqlite3",
+        managed_trust_root=tmp_path,
+    )
+    requests: list[StrategyLabFormalResolutionRequest] = []
+    trusted_resolver = RegistryBackedFormalExperimentResolver(experiments)
+
+    def resolve_experiment(
+        registration: object,
+        request: StrategyLabFormalResolutionRequest,
+    ) -> StrategyLabFormalExperimentBinding:
+        requests.append(request)
+        experiment = ExperimentSpec(
+            strategy_spec_fingerprint=registration.spec.spec_fingerprint,  # type: ignore[attr-defined]
+            strategy_executable_fingerprint=registration.executable_fingerprint,  # type: ignore[attr-defined]
+            candidate_schema_fingerprint=registration.candidate_schema_fingerprint,  # type: ignore[attr-defined]
+            dataset_snapshot_id=request.dataset_snapshot.snapshot_id,
+            code_commit=request.code_sha,
+            parameter_fingerprint=canonical_sha256(request.parameters),
+            hypothesis_family="dashboard-formal",
+            metric_definition_fingerprint="9" * 64,
+            train_range=DateRange(
+                start_date=date(2025, 1, 1),
+                end_date=date(2025, 6, 30),
+            ),
+            validation_range=DateRange(
+                start_date=date(2025, 7, 1),
+                end_date=date(2025, 12, 31),
+            ),
+            frozen_outer_test_range=DateRange(
+                start_date=date(2026, 1, 1),
+                end_date=date(2026, 3, 31),
+            ),
+            cost_model_fingerprint=canonical_sha256(request.execution_costs),
+            execution_model_fingerprint=canonical_sha256(
+                {
+                    "contract": "lab-adapter-execution/v1",
+                    "adapter_id": request.adapter_id,
+                    "adapter_version": request.adapter_version,
+                    "feature_contract": request.feature_contract,
+                }
+            ),
+            seed=request.random_seed,
+        )
+        assert experiment.experiment_id is not None
+        manifest = HypothesisFamilyManifest(
+            hypothesis_family=experiment.hypothesis_family,
+            experiment_ids=(experiment.experiment_id,),
+            search_space_fingerprint="8" * 64,
+            metric_definition_fingerprint=experiment.metric_definition_fingerprint,
+            preregistered_at=NOW - timedelta(minutes=1),
+        )
+        experiments.register_formal_plan(
+            FormalExperimentPlan(
+                schema_version=2,
+                spec=experiment,
+                hypothesis_variant="baseline",
+                strategy_definition_fingerprint=registration.fingerprint,  # type: ignore[attr-defined]
+                definition_registration_record_hash=registration.record_hash,  # type: ignore[attr-defined]
+                preregistered_at=manifest.preregistered_at,
+            ),
+            family_manifest=manifest,
+        )
+        return trusted_resolver(registration, request)  # type: ignore[arg-type]
+
+    store = LabJobStore(tmp_path / "jobs.sqlite3")
+    store.initialize()
+    spool = LabCommandSpool(tmp_path / "commands")
+    reader = LabJobReader(store.path)
+    commands = LabCommandSubmissionFacade(
+        reader=reader,
+        spool=spool,
+        experiment_registry=experiments,
+        definition_registry=definitions,
+        clock=lambda: NOW,
+    )
+    controller = StrategyLabJobCenterController(
+        reader=reader,
+        commands=commands,
+        preview_reader=_PreviewSpy(),
+        zip_exports=_ExportSpy(),
+        definition_registry=definitions,
+        formal_experiment_resolver=resolve_experiment,
+        clock=lambda: NOW,
+    )
+
+    receipt = controller.submit(
+        RUN_INPUTS[0][0],
+        context=_context(formal=True),
+        interaction_key="dashboard-formal-v3",
+        job_id=JOB_ID,
+    )
+
+    assert isinstance(receipt, CommandSubmissionReceipt)
+    assert len(requests) == 1
+    envelope = spool.pending()[0].envelope
+    spec = envelope.command.spec
+    assert spec.schema_version == 3
+    assert spec.catalog_owner_eligible
+    assert spec.strategy_execution is not None
+    assert spec.experiment is not None
+    assert spec.strategy_execution.definition_registration_record_hash
+    assert experiments.get_attempt(spec.experiment.experiment_id).spec == spec.experiment.spec
+    assert experiments.list_pending_submissions(limit=10) == ()
+    assert not {
+        "strategy_spec_fingerprint",
+        "strategy_executable_fingerprint",
+        "candidate_schema_fingerprint",
+    }.intersection(argument.name for argument in spec.parameters.arguments)
 
 
 def test_submit_is_exactly_once_and_defaults_to_a_fresh_job_id(tmp_path: Path) -> None:

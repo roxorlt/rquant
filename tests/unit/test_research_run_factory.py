@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from datetime import UTC, date, datetime
 from decimal import Decimal
+from pathlib import Path
 from uuid import UUID
 
 import pytest
 
+from rquant.experiment_registry import DateRange, ExperimentSpec, FormalExperimentPlan
 from rquant.lab_job_center import (
     AuctionGapRunInput,
     GrowthBoardSurgeRunInput,
@@ -20,6 +22,7 @@ from rquant.research_run_spec import (
     FeatureContractIdentity,
     ResourceClass,
 )
+from rquant.runtime_contracts import canonical_sha256
 from rquant.strategy_job_adapters import (
     AuctionGapParameters,
     GrowthBoardSurgeParameters,
@@ -28,6 +31,8 @@ from rquant.strategy_job_adapters import (
     build_adapter_execution_contract,
     default_strategy_job_adapter_registry,
 )
+
+from .test_lab_job_center import _v3_strategy_registration
 
 
 def _gate(*, formal: bool, allowed: bool = True) -> ResearchGateDecision:
@@ -258,23 +263,96 @@ def test_factory_rejects_plan_that_exceeds_resource_work_budget() -> None:
     assert exc_info.value.code == "resource_budget"  # type: ignore[attr-defined]
 
 
-def test_factory_accepts_formal_only_with_exact_gate_snapshot_and_audit_evidence() -> None:
-    built = build_research_job_submission(
+def test_factory_accepts_formal_only_with_exact_trusted_ownership(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="trusted strategy registration"):
+        build_research_job_submission(
+            RUN_INPUTS[0],
+            gate_decision=_gate(formal=True),
+            code_sha="1" * 40,
+            dataset_snapshot=_snapshot(),
+            feature_contract=_contract(RUN_INPUTS[0]),
+            execution_costs=_costs(),
+            random_seed=11,
+            resource_class=ResourceClass.HEAVY,
+            deadline=datetime(2026, 8, 1, tzinfo=UTC),
+            job_id=UUID(int=11),
+        )
+
+    provisional = build_research_job_submission(
         RUN_INPUTS[0],
-        gate_decision=_gate(formal=True),
-        code_sha="f" * 40,
+        gate_decision=_gate(formal=False),
+        code_sha="1" * 40,
         dataset_snapshot=_snapshot(),
-        feature_contract=_contract(RUN_INPUTS[0], "f" * 40),
+        feature_contract=_contract(RUN_INPUTS[0]),
         execution_costs=_costs(),
         random_seed=11,
         resource_class=ResourceClass.HEAVY,
         deadline=datetime(2026, 8, 1, tzinfo=UTC),
         job_id=UUID(int=11),
     )
+    registration = _v3_strategy_registration(tmp_path)
+    experiment = ExperimentSpec(
+        strategy_spec_fingerprint=registration.spec.spec_fingerprint,
+        strategy_executable_fingerprint=registration.executable_fingerprint,
+        candidate_schema_fingerprint=registration.candidate_schema_fingerprint,
+        dataset_snapshot_id=_snapshot().snapshot_id,
+        code_commit="1" * 40,
+        parameter_fingerprint=canonical_sha256(provisional.spec.parameters),
+        hypothesis_family="factory-formal",
+        metric_definition_fingerprint="e" * 64,
+        train_range=DateRange(
+            start_date=date(2025, 1, 1),
+            end_date=date(2025, 6, 30),
+        ),
+        validation_range=DateRange(
+            start_date=date(2025, 7, 1),
+            end_date=date(2025, 12, 31),
+        ),
+        frozen_outer_test_range=DateRange(
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 3, 31),
+        ),
+        cost_model_fingerprint=canonical_sha256(_costs()),
+        execution_model_fingerprint=canonical_sha256(
+            {
+                "contract": "lab-adapter-execution/v1",
+                "adapter_id": "nshape-compare",
+                "adapter_version": "1",
+                "feature_contract": _contract(RUN_INPUTS[0]),
+            }
+        ),
+        seed=11,
+    )
+    plan = FormalExperimentPlan(
+        schema_version=2,
+        spec=experiment,
+        hypothesis_variant="baseline",
+        strategy_definition_fingerprint=registration.fingerprint,
+        definition_registration_record_hash=registration.record_hash,
+        preregistered_at=datetime(2026, 7, 1, tzinfo=UTC),
+    )
+    built = build_research_job_submission(
+        RUN_INPUTS[0],
+        gate_decision=_gate(formal=True),
+        code_sha="1" * 40,
+        dataset_snapshot=_snapshot(),
+        feature_contract=_contract(RUN_INPUTS[0]),
+        execution_costs=_costs(),
+        random_seed=11,
+        resource_class=ResourceClass.HEAVY,
+        deadline=datetime(2026, 8, 1, tzinfo=UTC),
+        job_id=UUID(int=11),
+        trusted_strategy_registration=registration,
+        formal_experiment_plan=plan,
+    )
 
+    assert built.spec.schema_version == 3
+    assert built.spec.catalog_owner_eligible
     assert built.spec.research_status == "comparable"
     assert built.spec.dataset_snapshot == _snapshot()
-    assert built.spec.code_sha == "f" * 40
+    assert built.spec.code_sha == "1" * 40
 
     with pytest.raises(ValueError, match="snapshot"):
         build_research_job_submission(

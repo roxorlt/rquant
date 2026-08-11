@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import sys
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
@@ -17,6 +18,11 @@ import pytest
 from pydantic import ValidationError
 
 import rquant.lab_jobs as lab_jobs
+from rquant.artifact_retention import ArtifactReferenceStore
+from rquant.job_center_authority import (
+    install_job_center_authority,
+    publish_job_center_authority_candidate,
+)
 from rquant.lab_artifact_protocol import (
     LabAcknowledgedArtifactCommit,
     LabArtifactCommit,
@@ -57,6 +63,7 @@ from rquant.lab_jobs import (
     ArtifactCommitDeadlineExpiredError,
     InvalidStoredJobError,
     JobStatus,
+    LabIntegrityDegradedError,
     LabJobReader,
     LabJobRecord,
     LabJobStore,
@@ -64,7 +71,7 @@ from rquant.lab_jobs import (
     SchedulerLeaseFencedError,
     SchedulerLeaseUnavailableError,
 )
-from rquant.lab_scheduler import LabScheduler, SchedulerTickResult
+from rquant.lab_scheduler import LabFullIntegrityAuditStateStore, LabScheduler, SchedulerTickResult
 from rquant.lab_shard_protocol import LabShardSucceeded, LabWorkerReport
 from rquant.research_run_spec import (
     DatasetSnapshotIdentity,
@@ -75,6 +82,7 @@ from rquant.research_run_spec import (
     ResearchRunSpec,
     ResourceClass,
 )
+from rquant.strict_json import canonical_model_json_bytes
 
 from .test_lab_shard_control_plane import PLAN_HASH, _definition
 
@@ -187,11 +195,7 @@ def _spec(
         random_seed=20260724,
         resource_class=ResourceClass.STANDARD,
         deadline=deadline or datetime(2026, 7, 25, 2, tzinfo=UTC),
-        research_status=(
-            "comparable"
-            if dataset_snapshot is not None and dataset_snapshot.audit_run_id is not None
-            else "exploratory"
-        ),
+        research_status="exploratory",
     )
 
 
@@ -226,6 +230,547 @@ def _scheduler(
         max_commands_per_tick=batch_size,
         clock=lambda: now,
     )
+
+
+def test_scheduler_tick_result_preclaim_blocked_defaults_to_zero() -> None:
+    result = SchedulerTickResult(
+        lease_acquired=False,
+        processed=0,
+        applied=0,
+        rejected=0,
+        quarantined=0,
+        recovered=0,
+    )
+
+    assert result.preclaim_blocked == 0
+
+
+def test_scheduler_runs_full_integrity_audit_on_persistent_due_cadence(tmp_path: Path) -> None:
+    store, spool = _components(tmp_path)
+    observed = tmp_path / "full-audit-pids.log"
+    audit_code = (
+        "import os\n"
+        "from pathlib import Path\n"
+        f"Path({str(observed)!r}).open('a').write(str(os.getpid()) + '\\n')\n"
+        f'print(\'{{"receipt_hash":"{"a" * 64}"}}\')'
+    )
+    command = (
+        sys.executable,
+        "-c",
+        audit_code,
+    )
+
+    class _Auditor:
+        def audit_incremental(self, *, max_chain_entries: int) -> object:
+            return object()
+
+    current = [NOW]
+    scheduler = LabScheduler(
+        store=store,
+        spool=spool,
+        owner_id="scheduler-a",
+        lease_seconds=60,
+        heartbeat_seconds=10,
+        poll_interval_ms=10,
+        max_commands_per_tick=1,
+        integrity_auditor=_Auditor(),
+        full_integrity_command=command,
+        full_integrity_state_store=LabFullIntegrityAuditStateStore(tmp_path / "audit-state.json"),
+        full_integrity_interval_seconds=60,
+        full_integrity_budget_seconds=1,
+        clock=lambda: current[0],
+    )
+
+    scheduler.run_once()
+    current[0] += timedelta(seconds=30)
+    scheduler.run_once()
+    current[0] += timedelta(seconds=31)
+    scheduler.run_once()
+
+    pids = observed.read_text(encoding="ascii").splitlines()
+    assert len(pids) == 2
+    assert all(pid != str(os.getpid()) for pid in pids)
+
+
+def test_scheduler_full_integrity_timeout_persists_degraded_health(tmp_path: Path) -> None:
+    store, spool = _components(tmp_path)
+
+    class _SlowAuditor:
+        def audit_incremental(self, *, max_chain_entries: int) -> object:
+            return object()
+
+    state_store = LabFullIntegrityAuditStateStore(tmp_path / "audit-state.json")
+    authority_fences: list[str] = []
+    timeout_code = f'import time\ntime.sleep(0.05)\nprint(\'{{"receipt_hash":"{"a" * 64}"}}\')'
+    scheduler = LabScheduler(
+        store=store,
+        spool=spool,
+        owner_id="scheduler-a",
+        lease_seconds=60,
+        heartbeat_seconds=10,
+        poll_interval_ms=10,
+        max_commands_per_tick=1,
+        integrity_auditor=_SlowAuditor(),
+        full_integrity_command=(
+            sys.executable,
+            "-c",
+            timeout_code,
+        ),
+        full_integrity_state_store=state_store,
+        full_integrity_interval_seconds=60,
+        full_integrity_budget_seconds=0.01,
+        full_integrity_degradation_reporter=authority_fences.append,
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(LabIntegrityDegradedError, match="resource budget"):
+        scheduler.run_once()
+    persisted = state_store.load()
+    assert persisted is not None
+    assert persisted.degraded_reason == "full ledger audit exceeded its resource budget"
+    assert authority_fences == ["full ledger audit exceeded its resource budget"]
+
+
+def test_scheduler_full_integrity_degraded_state_blocks_until_controlled_remediation(
+    tmp_path: Path,
+) -> None:
+    store, spool = _components(tmp_path)
+
+    class _IncrementalAuditor:
+        def audit_incremental(self, *, max_chain_entries: int) -> object:
+            return object()
+
+    state_store = LabFullIntegrityAuditStateStore(tmp_path / "audit-state.json")
+    slow_code = f'import time\ntime.sleep(0.5)\nprint(\'{{"receipt_hash":"{"b" * 64}"}}\')'
+    scheduler = LabScheduler(
+        store=store,
+        spool=spool,
+        owner_id="scheduler-a",
+        lease_seconds=60,
+        heartbeat_seconds=10,
+        poll_interval_ms=10,
+        max_commands_per_tick=1,
+        integrity_auditor=_IncrementalAuditor(),
+        full_integrity_command=(
+            sys.executable,
+            "-c",
+            slow_code,
+        ),
+        full_integrity_state_store=state_store,
+        full_integrity_interval_seconds=60,
+        full_integrity_budget_seconds=0.2,
+        full_integrity_remediation_authorizer=lambda: None,
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(LabIntegrityDegradedError, match="resource budget"):
+        scheduler.run_once()
+    with pytest.raises(LabIntegrityDegradedError, match="remains degraded"):
+        scheduler.run_once()
+    scheduler.full_integrity_command = (
+        sys.executable,
+        "-c",
+        'print(\'{"receipt_hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}\')',
+    )
+    scheduler.full_integrity_budget_seconds = 1
+    scheduler.remediate_full_integrity()
+
+    repaired = state_store.load()
+    assert repaired is not None
+    assert repaired.degraded_reason is None
+    assert repaired.receipt_hash == "b" * 64
+
+
+def test_scheduler_recovers_lifecycle_once_and_synchronizes_each_mutated_job(
+    tmp_path: Path,
+) -> None:
+    store, spool = _components(tmp_path)
+    envelope = _envelope()
+    spool.publish(envelope)
+
+    class _LifecycleSpy:
+        def __init__(self) -> None:
+            self.recoveries: list[datetime] = []
+            self.synchronized: list[tuple[UUID, datetime]] = []
+
+        def recover(self, *, observed_at: datetime) -> None:
+            self.recoveries.append(observed_at)
+
+        def synchronize(self, job_id: UUID, *, observed_at: datetime) -> None:
+            self.synchronized.append((job_id, observed_at))
+
+    lifecycle = _LifecycleSpy()
+    scheduler = LabScheduler(
+        store=store,
+        spool=spool,
+        owner_id="scheduler-a",
+        lease_seconds=60,
+        heartbeat_seconds=10,
+        poll_interval_ms=10,
+        lifecycle_synchronizer=lifecycle,
+        clock=lambda: NOW,
+    )
+
+    first = scheduler.run_once()
+    scheduler.run_once()
+
+    assert first.applied == 1
+    assert lifecycle.recoveries == [NOW]
+    assert lifecycle.synchronized == [(envelope.command.job_id, NOW)]
+
+
+def test_scheduler_runs_bounded_incremental_audit_before_and_after_mutations(
+    tmp_path: Path,
+) -> None:
+    store, spool = _components(tmp_path)
+    spool.publish(_envelope())
+
+    class _Auditor:
+        def __init__(self) -> None:
+            self.max_chain_entries: list[int] = []
+
+        def audit_incremental(self, *, max_chain_entries: int) -> object:
+            self.max_chain_entries.append(max_chain_entries)
+            return object()
+
+    auditor = _Auditor()
+    scheduler = LabScheduler(
+        store=store,
+        spool=spool,
+        owner_id="scheduler-a",
+        lease_seconds=60,
+        heartbeat_seconds=10,
+        poll_interval_ms=10,
+        integrity_auditor=auditor,
+        max_integrity_chain_entries=7,
+        clock=lambda: NOW,
+    )
+
+    result = scheduler.run_once()
+
+    assert result.applied == 1
+    assert auditor.max_chain_entries == [7, 7]
+
+
+def test_scheduler_default_incremental_auditor_validates_real_ledger_tail(
+    tmp_path: Path,
+) -> None:
+    store, spool = _components(tmp_path)
+    spool.publish(_envelope())
+    scheduler = _scheduler(store, spool)
+
+    result = scheduler.run_once()
+    receipt = LabJobReader(store.path).audit_incremental(max_chain_entries=8)
+
+    assert result.applied == 1
+    assert receipt.chain_generation > 0
+    assert receipt.mutation_epoch > 0
+
+
+def test_scheduler_fails_closed_when_incremental_audit_is_degraded(tmp_path: Path) -> None:
+    store, spool = _components(tmp_path)
+    envelope = _envelope()
+    spool.publish(envelope)
+
+    class _FailingAuditor:
+        def audit_incremental(self, *, max_chain_entries: int) -> object:
+            assert max_chain_entries == 8
+            raise InvalidStoredJobError("tampered chain tail")
+
+    scheduler = LabScheduler(
+        store=store,
+        spool=spool,
+        owner_id="scheduler-a",
+        lease_seconds=60,
+        heartbeat_seconds=10,
+        poll_interval_ms=10,
+        integrity_auditor=_FailingAuditor(),
+        max_integrity_chain_entries=8,
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(LabIntegrityDegradedError, match="scheduler_pre_tick"):
+        scheduler.run_once()
+
+    assert spool.pending()[0].envelope == envelope
+
+
+def test_scheduler_synchronizes_deadline_terminal_transition(tmp_path: Path) -> None:
+    store, spool = _components(tmp_path)
+    envelope = _envelope(spec=_spec(deadline=NOW))
+    spool.publish(envelope)
+
+    class _LifecycleSpy:
+        def __init__(self) -> None:
+            self.job_ids: list[UUID] = []
+
+        def recover(self, *, observed_at: datetime) -> None:
+            del observed_at
+
+        def synchronize(self, job_id: UUID, *, observed_at: datetime) -> None:
+            del observed_at
+            self.job_ids.append(job_id)
+
+    lifecycle = _LifecycleSpy()
+    scheduler = LabScheduler(
+        store=store,
+        spool=spool,
+        owner_id="scheduler-a",
+        lease_seconds=60,
+        heartbeat_seconds=10,
+        poll_interval_ms=10,
+        lifecycle_synchronizer=lifecycle,
+        clock=lambda: NOW,
+    )
+
+    result = scheduler.run_once()
+
+    assert result.deadlines_expired == 1
+    assert lifecycle.job_ids == [envelope.command.job_id, envelope.command.job_id]
+
+
+def test_scheduler_fails_closed_on_formal_job_without_lifecycle_authority(
+    tmp_path: Path,
+) -> None:
+    from .test_lab_job_center import _formal_v3_spec
+
+    store, spool = _components(tmp_path)
+    published = spool.publish(_envelope(spec=_formal_v3_spec()))
+    scheduler = _scheduler(store, spool)
+
+    with pytest.raises(RuntimeError, match="formal v3|lifecycle authority"):
+        scheduler.run_once()
+
+    assert published.path.exists()
+    assert LabJobReader(store.path).get_job(published.envelope.command.job_id) is None
+
+
+def test_scheduler_rejects_injected_v2_comparable_without_job_creation(
+    tmp_path: Path,
+) -> None:
+    from .test_lab_jobs import _formal_v2_spec
+
+    store, spool = _components(tmp_path)
+    envelope = _envelope(spec=_formal_v2_spec())
+    injected = spool.pending_dir / f"{1:020d}-{envelope.request_id}.json"
+    injected.write_bytes(canonical_model_json_bytes(envelope))
+    injected.chmod(0o600)
+
+    result = _scheduler(store, spool).run_once()
+    acknowledged = spool.find(envelope.request_id)
+
+    assert result.rejected == 1
+    assert result.applied == 0
+    assert spool.pending() == ()
+    assert LabJobReader(store.path).get_job(envelope.command.job_id) is None
+    assert isinstance(acknowledged, LabAcknowledgedCommand)
+    assert acknowledged.receipt.reason == "v2_formal_requires_exploratory_migration"
+
+
+def test_scheduler_quarantines_missing_formal_plan_before_any_authority_write(
+    tmp_path: Path,
+) -> None:
+    from rquant.experiment_registry import ExperimentRegistry
+
+    from .test_job_center_authority import CODE_SHA, _publish_and_install
+    from .test_lab_jobs import _formal_v3_spec
+
+    _manifest_path, paths = _publish_and_install(tmp_path)
+    store = LabJobStore(paths["lab_jobs_path"])
+    spool = LabCommandSpool(paths["command_spool_path"])
+    envelope = _envelope(spec=_formal_v3_spec())
+    spool.publish(envelope)
+
+    def build_scheduler(owner: str) -> LabScheduler:
+        return LabScheduler(
+            store=store,
+            spool=spool,
+            owner_id=owner,
+            lease_seconds=60,
+            heartbeat_seconds=10,
+            poll_interval_ms=10,
+            runtime_guard=lambda: CODE_SHA,
+            clock=lambda: NOW,
+        )
+
+    first = build_scheduler("scheduler-a")
+    result = first.run_once()
+    first.release()
+    restarted = build_scheduler("scheduler-b")
+    replay = restarted.run_once()
+
+    registry = ExperimentRegistry(
+        paths["experiment_registry_path"],
+        managed_trust_root=paths["runtime_root"],
+    )
+    assert result.quarantined == 1
+    assert result.processed == 0
+    assert replay.processed == 0
+    assert spool.pending() == ()
+    assert LabJobReader(store.path).get_job(envelope.command.job_id) is None
+    assert registry.list_submission_intents(limit=10) == ()
+
+
+def test_scheduler_quarantines_synthetic_v3_identity_before_any_authority_write(
+    tmp_path: Path,
+) -> None:
+    from .test_job_center_authority import (
+        CODE_SHA,
+        DEPLOYMENT_GENERATION_HASH,
+        DEPLOYMENT_PROFILE_ID,
+        _private_directory,
+    )
+    from .test_lab_job_center import _internally_coherent_formal_authorities
+
+    spec, registry, _definitions = _internally_coherent_formal_authorities(
+        tmp_path,
+        definition_fingerprint="f" * 64,
+        registration_record_hash="e" * 64,
+    )
+    runtime_root = tmp_path / "research"
+    jobs_path = runtime_root / "lab_jobs.sqlite3"
+    store = LabJobStore(jobs_path)
+    store.initialize()
+    jobs_path.chmod(0o600)
+    registry.path.chmod(0o600)
+    command_path = _private_directory(runtime_root / "commands")
+    artifact_path = _private_directory(runtime_root / "final-artifacts")
+    dataset_path = runtime_root / "research_ro.duckdb"
+    dataset_path.touch(mode=0o600)
+    retention_root = _private_directory(runtime_root / "artifact-retention")
+    references_path = retention_root / "references.sqlite3"
+    ArtifactReferenceStore(references_path, managed_trust_root=retention_root)
+    references_path.chmod(0o600)
+    from rquant.artifact_retention_catalog_authority import (
+        bootstrap_retention_catalog_authority,
+    )
+
+    catalog_authority = bootstrap_retention_catalog_authority(
+        state_root=retention_root,
+        reference_store_path=references_path,
+        producer_commit=CODE_SHA,
+    )
+    staging = _private_directory(tmp_path / "staging")
+    candidate = publish_job_center_authority_candidate(
+        staging / "candidate.json",
+        code_sha=CODE_SHA,
+        deployment_profile_id=DEPLOYMENT_PROFILE_ID,
+        deployment_generation_hash=DEPLOYMENT_GENERATION_HASH,
+        runtime_deployment_root=tmp_path,
+        runtime_root=runtime_root,
+        lab_jobs_path=jobs_path,
+        command_spool_path=command_path,
+        final_artifact_root=artifact_path,
+        definition_registry_root=tmp_path / "definitions",
+        experiment_registry_path=registry.path,
+        dataset_authority_path=dataset_path,
+        catalog_authority_root=catalog_authority.root,
+        catalog_authority_receipt_path=catalog_authority.current_receipt_path,
+    )
+    install_job_center_authority(
+        candidate,
+        target=runtime_root / "job-center-authority.json",
+        expected_code_sha=CODE_SHA,
+        expected_runtime_root=runtime_root,
+        expected_runtime_deployment_root=tmp_path,
+        expected_deployment_profile_id=DEPLOYMENT_PROFILE_ID,
+        expected_deployment_generation_hash=DEPLOYMENT_GENERATION_HASH,
+    )
+    spool = LabCommandSpool(command_path)
+    envelope = _envelope(spec=spec)
+    spool.publish(envelope)
+    scheduler = LabScheduler(
+        store=store,
+        spool=spool,
+        owner_id="scheduler-a",
+        lease_seconds=60,
+        heartbeat_seconds=10,
+        poll_interval_ms=10,
+        runtime_guard=lambda: CODE_SHA,
+        clock=lambda: NOW,
+    )
+
+    result = scheduler.run_once()
+
+    assert result.quarantined == 1
+    assert result.processed == 0
+    assert spool.pending() == ()
+    assert LabJobReader(store.path).get_job(envelope.command.job_id) is None
+    assert registry.list_submission_intents(limit=10) == ()
+    assert registry.list_family_attempts(spec.experiment.hypothesis_family) == ()
+
+
+def test_scheduler_auto_composes_lifecycle_from_private_authority_manifest(
+    tmp_path: Path,
+) -> None:
+    from .test_job_center_authority import CODE_SHA, _publish_and_install
+
+    _manifest_path, paths = _publish_and_install(tmp_path)
+    store = LabJobStore(paths["lab_jobs_path"])
+    spool = LabCommandSpool(paths["command_spool_path"])
+    artifacts = LabJobArtifactStore(paths["final_artifact_root"])
+
+    scheduler = LabScheduler(
+        store=store,
+        spool=spool,
+        owner_id="scheduler-a",
+        lease_seconds=60,
+        heartbeat_seconds=10,
+        poll_interval_ms=10,
+        artifact_commit_spool=LabArtifactCommitSpool(paths["runtime_root"] / "artifact-commits"),
+        artifact_store=artifacts,
+        finalizer_authority_key_provider=_authority_verification_key_provider,
+        runtime_guard=lambda: CODE_SHA,
+        clock=lambda: NOW,
+    )
+
+    assert scheduler.lifecycle_synchronizer is not None
+
+
+def test_production_scheduler_requires_installed_authority_before_start(
+    tmp_path: Path,
+) -> None:
+    store, spool = _components(tmp_path)
+
+    with pytest.raises(LabDaemonConfigurationError, match="authority manifest"):
+        LabScheduler(
+            store=store,
+            spool=spool,
+            owner_id="scheduler-a",
+            lease_seconds=60,
+            heartbeat_seconds=10,
+            poll_interval_ms=10,
+            runtime_guard=lambda: "1" * 40,
+            require_authority_manifest=True,
+            clock=lambda: NOW,
+        )
+
+
+def test_production_scheduler_reloads_authority_generation_before_tick(
+    tmp_path: Path,
+) -> None:
+    from .test_job_center_authority import CODE_SHA, _publish_and_install
+
+    _manifest_path, paths = _publish_and_install(tmp_path)
+    scheduler = LabScheduler(
+        store=LabJobStore(paths["lab_jobs_path"]),
+        spool=LabCommandSpool(paths["command_spool_path"]),
+        owner_id="scheduler-a",
+        lease_seconds=60,
+        heartbeat_seconds=10,
+        poll_interval_ms=10,
+        runtime_guard=lambda: CODE_SHA,
+        require_authority_manifest=True,
+        clock=lambda: NOW,
+    )
+    registry_path = paths["experiment_registry_path"]
+    replacement = registry_path.with_suffix(".replacement")
+    replacement.write_bytes(registry_path.read_bytes())
+    replacement.chmod(0o600)
+    os.replace(replacement, registry_path)
+
+    with pytest.raises(LabDaemonConfigurationError, match="authority manifest"):
+        scheduler.run_once()
 
 
 def test_scheduler_runtime_drift_between_ticks_leaves_command_unacknowledged(

@@ -4836,6 +4836,14 @@ def test_bootstrap_dotenv_and_prepared_sentinel_reads_use_openat_bound_descripto
         ("RQUANT_LAB_LIFECYCLE_MOD=installed\n", "unknown deployment dotenv key"),
         ("RQUANT_RELEASE_GENERATION_MIN_FREE_BYTE=1\n", "unknown deployment dotenv key"),
         ("LAB_TRUSTED_GIT_PAT=/usr/bin/git\n", "unknown deployment dotenv key"),
+        (
+            "RQUANT_DAILY_RECEIPT_ACTIVE_KEY_ID=daily-v1\n",
+            "Daily receipt authority cannot be configured",
+        ),
+        (
+            "RQ_DAILY_SHADOW_RECEIPT_SIGNER_COMMAND=/tmp/signer\n",
+            "Daily receipt authority cannot be configured",
+        ),
         ("RQUANT_DEPLOY_UV\n", "requires '='"),
         ("RQUANT_DEPLOY_UV='/opt/homebrew/bin/uv\n", "value is invalid"),
         (
@@ -4981,6 +4989,21 @@ def test_generation_docs_describe_rebuilt_venv_and_initialize_restart_contract()
     assert "不得改用 `--recover-generation`" in production_doc
 
 
+def test_production_runbook_uses_the_controlled_job_authority_prepare_chain() -> None:
+    production_doc = (ROOT / "docs" / "production-release.md").read_text(encoding="utf-8")
+
+    for control in (
+        "RQUANT_RUNTIME_PRODUCTION_INPUTS",
+        "RQUANT_RUNTIME_PROFILE_OUTPUT_DIR",
+        "RQUANT_RUNTIME_ROOT",
+    ):
+        assert f"export {control}=" in production_doc
+    assert '"${ROOT}/scripts/run-lab-daemon.py"' in production_doc
+    assert '-- "${ROOT}/.venv/bin/rquant" lab-runtime-prepare' in production_doc
+    assert "调用方不能覆盖" in production_doc
+    assert "任何 target scheduler/daemon restart 前进入 rollback" in production_doc
+
+
 def test_deploy_bootstrap_holds_exclusive_generation_before_project_import(
     tmp_path: Path,
 ) -> None:
@@ -5106,6 +5129,63 @@ def test_installed_already_current_dry_run_does_not_require_loaded_labels(
 
     assert result.returncode == 0
     assert '"status": "already_current"' in result.stdout
+
+
+def test_uninstalled_deploy_dry_run_leaves_git_and_authority_trees_byte_identical(
+    tmp_path: Path,
+) -> None:
+    checkout, python, lock_path, commit = _checkout(tmp_path)
+    command = _command(
+        checkout,
+        python,
+        lock_path,
+        target=commit,
+        lifecycle_mode="uninstalled",
+    )
+    command.append("--dry-run")
+    git_before = _tree_snapshot(checkout / ".git")
+    authority_before = _tree_snapshot(lock_path.parent)
+
+    result = subprocess.run(
+        command,
+        cwd=checkout,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=20,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert _tree_snapshot(checkout / ".git") == git_before
+    assert _tree_snapshot(lock_path.parent) == authority_before
+
+
+def test_uninstalled_deploy_dry_run_never_creates_missing_lock_parent(
+    tmp_path: Path,
+) -> None:
+    checkout, python, lock_path, commit = _checkout(tmp_path)
+    command = _command(
+        checkout,
+        python,
+        lock_path,
+        target=commit,
+        lifecycle_mode="uninstalled",
+    )
+    command.append("--dry-run")
+    missing_lock = tmp_path / "absent-coordination" / "production.lock"
+    command[command.index("--deployment-lock-path") + 1] = str(missing_lock)
+
+    result = subprocess.run(
+        command,
+        cwd=checkout,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=20,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not missing_lock.parent.exists()
 
 
 def test_initialize_generation_publishes_first_marker_without_importing_deployer(

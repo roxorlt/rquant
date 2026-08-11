@@ -137,6 +137,49 @@ def test_computes_only_closed_pit_bars_and_explicit_tick_rule_proxies() -> None:
     assert not {"outer_volume", "inner_volume", "outer_inner_ratio"} & set(result.frame.columns)
 
 
+def test_feature_availability_is_scoped_to_candidate_event_time() -> None:
+    decision = datetime(2026, 7, 31, 9, 31, 2, tzinfo=SHANGHAI)
+    current = pd.DataFrame(
+        [
+            _minute(
+                "600000.SH",
+                datetime(2026, 7, 31, 9, 30),
+                open_=10.0,
+                close=10.1,
+                vol=100.0,
+                amount=1_000.0,
+            ),
+            _minute(
+                "600001.SH",
+                datetime(2026, 7, 31, 9, 31),
+                open_=20.0,
+                close=20.1,
+                vol=100.0,
+                amount=2_000.0,
+            ),
+        ]
+    )
+    historical = pd.concat(
+        [_historical_minutes(), _historical_minutes(ts_code="600001.SH")],
+        ignore_index=True,
+    )
+
+    result = _compute(
+        current=current,
+        historical=historical,
+        decision_time=decision,
+        input_available_at=decision,
+    )
+
+    older = result.envelope.field_status("latest_close", candidate_id="600000.SH")
+    newer = result.envelope.field_status("latest_close", candidate_id="600001.SH")
+    assert older is not None and newer is not None
+    assert older.source_event_time == datetime(2026, 7, 31, 1, 30, tzinfo=UTC)
+    assert older.actual_delay_seconds == pytest.approx(62.0)
+    assert newer.source_event_time == datetime(2026, 7, 31, 1, 31, tzinfo=UTC)
+    assert newer.actual_delay_seconds == pytest.approx(2.0)
+
+
 def test_computes_price_and_volume_geometry_from_visible_minute_prefix() -> None:
     current = pd.DataFrame(
         [
@@ -588,7 +631,8 @@ def test_price_geometry_keeps_morning_prefix_across_lunch_break() -> None:
     assert row["opening_bar_close"] == pytest.approx(10.1)
 
 
-def test_missing_opening_bar_degrades_only_opening_geometry_for_mixed_codes() -> None:
+def test_missing_opening_bar_reports_candidate_scoped_unavailability_for_mixed_codes() -> None:
+    decision_time = datetime(2026, 7, 31, 9, 31, 2, tzinfo=SHANGHAI)
     current = pd.DataFrame(
         [
             _minute(
@@ -631,9 +675,38 @@ def test_missing_opening_bar_degrades_only_opening_geometry_for_mixed_codes() ->
     result = _compute(
         current=current,
         historical=historical,
-        decision_time=datetime(2026, 7, 31, 9, 31, 2, tzinfo=SHANGHAI),
+        decision_time=decision_time,
+    )
+    with_future = _compute(
+        current=pd.concat(
+            [
+                current,
+                pd.DataFrame(
+                    [
+                        _minute(
+                            "600001.SH",
+                            datetime(2026, 7, 31, 9, 32),
+                            open_=99.0,
+                            high=100.0,
+                            low=1.0,
+                            close=50.0,
+                            vol=999_999.0,
+                            amount=9_999_999.0,
+                        )
+                    ]
+                ),
+            ],
+            ignore_index=True,
+        ),
+        historical=historical,
+        decision_time=decision_time,
     )
     missing = result.frame.loc[lambda frame: frame["ts_code"] == "600001.SH"].iloc[0]
+
+    assert result.payload_bytes == with_future.payload_bytes
+    assert result.envelope == with_future.envelope
+    expected_event_time = datetime(2026, 7, 31, 1, 31, tzinfo=UTC)
+    expected_available_at = datetime(2026, 7, 31, 1, 31, 2, tzinfo=UTC)
 
     for name in (
         "session_open",
@@ -643,10 +716,23 @@ def test_missing_opening_bar_degrades_only_opening_geometry_for_mixed_codes() ->
         "opening_bar_close",
     ):
         assert pd.isna(missing[name])
-        status = result.envelope.field_status(name)
-        assert status is not None
-        assert status.status is FeatureAvailability.DEGRADED
-        assert status.reason == "partial_availability:missing_opening_bar"
+        assert result.envelope.field_status(name) is None
+        missing_status = result.envelope.field_status(name, candidate_id="600001.SH")
+        available_status = result.envelope.field_status(name, candidate_id="600000.SH")
+        assert missing_status is not None and available_status is not None
+        assert missing_status.status is FeatureAvailability.UNAVAILABLE
+        assert missing_status.reason == "missing_opening_bar"
+        assert available_status.status is FeatureAvailability.AVAILABLE
+        assert available_status.reason is None
+        for status, candidate_id in (
+            (missing_status, "600001.SH"),
+            (available_status, "600000.SH"),
+        ):
+            assert status.candidate_id == candidate_id
+            assert status.source_event_time == expected_event_time
+            assert status.available_at == expected_available_at
+            assert status.decision_cutoff == expected_available_at
+            assert status.actual_delay_seconds == pytest.approx(2.0)
     assert missing["latest_close"] == pytest.approx(20.4)
     assert missing["minute_volume"] == pytest.approx(200.0)
     assert missing["cumulative_volume"] == pytest.approx(200.0)

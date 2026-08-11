@@ -56,6 +56,28 @@ def test_manifest_is_frozen_typed_and_fingerprinted() -> None:
         )
 
 
+def test_manifest_defaults_to_v2_but_still_reads_legacy_v1() -> None:
+    current = RuntimeServiceManifest(
+        service_id="runtime.current",
+        service_kind=RuntimeServiceKind.MARKET_MINUTE_SOURCE,
+        plane=RuntimeServicePlane.LIVE,
+        interval_seconds=1,
+        stale_after_seconds=10,
+        producer_commit=COMMIT,
+        settings={},
+    )
+    legacy = RuntimeServiceManifest.model_validate(
+        {**current.model_dump(mode="json"), "schema_version": 1}
+    )
+
+    assert current.schema_version == 2
+    assert legacy.schema_version == 1
+    with pytest.raises(ValidationError, match="schema_version"):
+        RuntimeServiceManifest.model_validate(
+            {**current.model_dump(mode="json"), "schema_version": 3}
+        )
+
+
 def test_manifest_settings_are_deeply_frozen_and_forbid_secrets() -> None:
     manifest = RuntimeServiceManifest.model_validate(
         {
@@ -185,7 +207,36 @@ def test_registered_service_runs_once_with_durable_heartbeat(tmp_path: Path) -> 
     assert final.total_successes == 1
 
 
-def test_duplicate_or_missing_builder_fails_before_service_start(tmp_path: Path) -> None:
+def test_registered_service_closes_step_resources_after_stopping(tmp_path: Path) -> None:
+    registry = RuntimeServiceRegistry()
+    events: list[str] = []
+
+    class CloseableStep:
+        def __call__(self) -> RuntimeStepResult:
+            events.append("step")
+            return RuntimeStepResult()
+
+        def close(self) -> None:
+            events.append("close")
+
+    registry.register(
+        RuntimeServiceKind.MARKET_MINUTE_SOURCE,
+        lambda _manifest: CloseableStep(),
+    )
+
+    run_runtime_service_manifest(
+        _manifest(),
+        registry=registry,
+        control_root=tmp_path / "control",
+        stop_event=Event(),
+        max_iterations=1,
+        clock=lambda: NOW,
+    )
+
+    assert events == ["step", "close"]
+
+
+def test_duplicate_builder_fails_before_service_start() -> None:
     registry = RuntimeServiceRegistry()
     registry.register(
         RuntimeServiceKind.MARKET_MINUTE_SOURCE,
@@ -198,17 +249,55 @@ def test_duplicate_or_missing_builder_fails_before_service_start(tmp_path: Path)
             lambda _manifest: lambda: RuntimeStepResult(),
         )
 
-    empty = RuntimeServiceRegistry()
-    with pytest.raises(KeyError, match="builder"):
+
+def test_watchlist_source_is_rejected_by_a_partial_registry_before_service_start(
+    tmp_path: Path,
+) -> None:
+    registry = RuntimeServiceRegistry()
+    manifest = _manifest().model_copy(
+        update={"service_kind": RuntimeServiceKind.WATCHLIST_QUOTE_SOURCE}
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="runtime service configuration error.*watchlist_quote_source",
+    ):
         run_runtime_service_manifest(
-            _manifest(),
-            registry=empty,
+            manifest,
+            registry=registry,
             control_root=tmp_path / "control",
             stop_event=Event(),
             max_iterations=1,
             clock=lambda: NOW,
         )
     assert not (tmp_path / "control" / "heartbeats").exists()
+
+
+def test_watchlist_source_does_not_fall_back_to_an_old_registry_builder(tmp_path: Path) -> None:
+    registry = RuntimeServiceRegistry()
+    calls: list[str] = []
+    registry.register(
+        RuntimeServiceKind.MARKET_MINUTE_SOURCE,
+        lambda _manifest: lambda: calls.append("old-builder") or RuntimeStepResult(),
+    )
+    manifest = _manifest().model_copy(
+        update={"service_kind": RuntimeServiceKind.WATCHLIST_QUOTE_SOURCE}
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="runtime service configuration error.*watchlist_quote_source",
+    ):
+        run_runtime_service_manifest(
+            manifest,
+            registry=registry,
+            control_root=tmp_path / "control",
+            stop_event=Event(),
+            max_iterations=1,
+            clock=lambda: NOW,
+        )
+
+    assert calls == []
 
 
 def test_loader_rejects_manifest_content_not_json(tmp_path: Path) -> None:

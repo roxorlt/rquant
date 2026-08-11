@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from threading import Barrier
 
@@ -11,9 +11,14 @@ import pytest
 from pydantic import ValidationError
 
 from rquant.delivery_contracts import DeliveryChannel, DeliveryTarget, OutboxStatus
+from rquant.runtime_shadow_validation import (
+    ShadowSourceCompletionReceipt,
+    shadow_session_boundaries,
+)
 from rquant.signal_bus import SignalBusStore
 from rquant.signal_contracts import SignalAction, SignalEnvelope
 from rquant.signal_router_runtime import (
+    ReadonlySignalRouteAuthority,
     ReadonlyStrategyRunnerSignalSource,
     RouteSourceDescriptor,
     RoutingConfigurationUnavailableError,
@@ -26,7 +31,7 @@ from rquant.signal_router_runtime import (
     StrategyRunnerSignalSource,
     route_runner_signals,
 )
-from rquant.strategy_runner import RunnerSignalRecord
+from rquant.strategy_runner import RunnerSignalRecord, runner_signal_raw_input_id
 
 NOW = datetime(2026, 7, 31, 2, 30, tzinfo=UTC)
 POLICY = "e" * 64
@@ -259,7 +264,53 @@ def test_strategy_runner_adapter_exposes_one_persisted_snapshot(tmp_path: Path) 
     )
 
 
-def _write_runner_source(path: Path, *, signal: SignalEnvelope | None = None) -> None:
+def _runner_completion_receipt(
+    *,
+    records: tuple[RunnerSignalRecord, ...],
+    source_id: str = "n-shape-v1",
+) -> ShadowSourceCompletionReceipt:
+    trade_date = date(2026, 7, 31)
+    _session_open, session_close = shadow_session_boundaries(trade_date)
+    return ShadowSourceCompletionReceipt(
+        evidence_origin="production",
+        source="isolated",
+        source_id=source_id,
+        trade_date=trade_date,
+        session_close_at=session_close,
+        complete_through=session_close,
+        input_identity=runner_signal_raw_input_id(
+            source_id=source_id,
+            runner_generation_id=GENERATION,
+            strategy_spec_fingerprint=SPEC,
+            high_watermark=len(records),
+            records=records,
+        ),
+        produced_at=session_close + timedelta(seconds=5),
+        producer_commit="d" * 40,
+        producer_version="test-runner-v1",
+        producer_service_id="strategy-live",
+        producer_instance_id="n-shape-primary",
+        runner_generation_id=GENERATION,
+        signal_authority_generation_id="8" * 64,
+        calendar_generation_id="9" * 64,
+        last_sequence=0,
+        high_watermark=len(records),
+        route_receipts_id="7" * 64,
+        feature_source_generation_id="6" * 64,
+        feature_close_marker_id="5" * 64,
+        feature_segment_chain_hash="4" * 64,
+        segment_start_sequence=0,
+        segment_record_count=len(records),
+        segment_chain_hash="3" * 64,
+    )
+
+
+def _write_runner_source(
+    path: Path,
+    *,
+    signal: SignalEnvelope | None = None,
+    completion_receipt: ShadowSourceCompletionReceipt | None = None,
+) -> None:
     with sqlite3.connect(path) as connection:
         connection.execute("PRAGMA journal_mode = WAL")
         connection.executescript(
@@ -278,6 +329,13 @@ def _write_runner_source(path: Path, *, signal: SignalEnvelope | None = None) ->
                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                 signal_id TEXT NOT NULL UNIQUE,
                 feature_sequence INTEGER NOT NULL,
+                payload_json TEXT NOT NULL
+            );
+            CREATE TABLE runner_session_close_receipt (
+                trade_date TEXT PRIMARY KEY,
+                receipt_id TEXT NOT NULL UNIQUE,
+                source_id TEXT NOT NULL,
+                signal_high_watermark INTEGER NOT NULL,
                 payload_json TEXT NOT NULL
             );
             """
@@ -305,6 +363,101 @@ def _write_runner_source(path: Path, *, signal: SignalEnvelope | None = None) ->
                     ),
                 ),
             )
+        if completion_receipt is not None:
+            connection.execute(
+                """
+                INSERT INTO runner_session_close_receipt(
+                    trade_date, receipt_id, source_id,
+                    signal_high_watermark, payload_json
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    completion_receipt.trade_date.isoformat(),
+                    completion_receipt.receipt_id,
+                    completion_receipt.source_id,
+                    completion_receipt.high_watermark,
+                    json.dumps(
+                        completion_receipt.model_dump(mode="json"),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                ),
+            )
+        connection.commit()
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+
+def test_readonly_runner_source_requires_persisted_completion_and_freezes_prefix(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "runner.sqlite3"
+    first = _signal("a")
+    first_record = RunnerSignalRecord(sequence=1, signal=first)
+    receipt = _runner_completion_receipt(records=(first_record,))
+    _write_runner_source(path, signal=first, completion_receipt=receipt)
+    second = _signal("2")
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            INSERT INTO runner_signal(signal_id, feature_sequence, payload_json)
+            VALUES (?, 1, ?)
+            """,
+            (
+                second.signal_id,
+                json.dumps(second.model_dump(mode="json"), sort_keys=True),
+            ),
+        )
+    source = ReadonlyStrategyRunnerSignalSource(
+        source_id="n-shape-v1",
+        path=path,
+        expected_strategy_spec_fingerprint=SPEC,
+        expected_evaluator_contract_fingerprint="2" * 64,
+    )
+
+    assert source.read_completion_receipt(trade_date=date(2026, 7, 31)) == receipt
+    batch = source.read_completed_batch(
+        trade_date=date(2026, 7, 31),
+        after_sequence=0,
+        limit=10,
+    )
+    assert batch.snapshot.descriptor.high_watermark == 1
+    assert batch.records == (first_record,)
+
+
+def test_readonly_runner_source_rejects_missing_or_tampered_completion_receipt(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "runner.sqlite3"
+    signal = _signal()
+    record = RunnerSignalRecord(sequence=1, signal=signal)
+    _write_runner_source(path, signal=signal)
+    source = ReadonlyStrategyRunnerSignalSource(
+        source_id="n-shape-v1",
+        path=path,
+        expected_strategy_spec_fingerprint=SPEC,
+        expected_evaluator_contract_fingerprint="2" * 64,
+    )
+    with pytest.raises(ValueError, match="completion receipt"):
+        source.read_completion_receipt(trade_date=date(2026, 7, 31))
+
+    receipt = _runner_completion_receipt(records=(record,))
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            INSERT INTO runner_session_close_receipt VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                receipt.trade_date.isoformat(),
+                receipt.receipt_id,
+                receipt.source_id,
+                receipt.high_watermark,
+                json.dumps(receipt.model_dump(mode="json"), sort_keys=True),
+            ),
+        )
+        connection.execute("UPDATE runner_session_close_receipt SET source_id = 'tampered'")
+    with pytest.raises(ValueError, match="completion receipt"):
+        source.read_completion_receipt(trade_date=date(2026, 7, 31))
 
 
 def test_readonly_runner_source_reads_exact_identity_without_writing(tmp_path: Path) -> None:
@@ -407,7 +560,12 @@ def test_readonly_runner_batch_decodes_only_limit_rows_from_large_backlog(
     path = tmp_path / "runner.sqlite3"
     signal = _signal()
     _write_runner_source(path)
-    payload = json.dumps(signal.model_dump(mode="json"), sort_keys=True)
+    payload = json.dumps(
+        signal.model_dump(mode="json"),
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
     with sqlite3.connect(path) as connection:
         connection.executemany(
             """
@@ -437,6 +595,385 @@ def test_readonly_runner_batch_decodes_only_limit_rows_from_large_backlog(
     assert len(batch.records) == 7
     assert batch.snapshot.descriptor.high_watermark == 10_000
     assert decoded == 7
+
+
+def test_readonly_runner_source_rejects_oversized_utf8_row_before_json_parse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "runner.sqlite3"
+    signal = _signal()
+    _write_runner_source(path)
+    payload = json.dumps(
+        {
+            **signal.model_dump(mode="json"),
+            "evidence": {"note": "量" * 64},
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            INSERT INTO runner_signal(signal_id, feature_sequence, payload_json)
+            VALUES (?, 0, ?)
+            """,
+            (signal.signal_id, payload),
+        )
+    source = ReadonlyStrategyRunnerSignalSource(
+        source_id="n-shape-v1",
+        path=path,
+        expected_strategy_spec_fingerprint=SPEC,
+        expected_evaluator_contract_fingerprint="2" * 64,
+        max_record_bytes=len(payload.encode("utf-8")) - 1,
+    )
+    monkeypatch.setattr(
+        "rquant.signal_router_runtime.json.loads",
+        lambda _value: pytest.fail("oversized payload must be rejected before json.loads"),
+    )
+
+    with pytest.raises(ValueError, match="record.*byte budget|too large"):
+        source.read_batch(after_sequence=0, limit=1)
+
+
+def test_readonly_runner_source_rejects_total_batch_before_stream_decode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "runner.sqlite3"
+    signal = _signal()
+    _write_runner_source(path)
+    payload = json.dumps(signal.model_dump(mode="json"), separators=(",", ":"), sort_keys=True)
+    with sqlite3.connect(path) as connection:
+        connection.executemany(
+            """
+            INSERT INTO runner_signal(signal_id, feature_sequence, payload_json)
+            VALUES (?, 0, ?)
+            """,
+            ((f"signal-{index}", payload) for index in range(3)),
+        )
+    source = ReadonlyStrategyRunnerSignalSource(
+        source_id="n-shape-v1",
+        path=path,
+        expected_strategy_spec_fingerprint=SPEC,
+        expected_evaluator_contract_fingerprint="2" * 64,
+        max_raw_bytes=len(payload.encode("utf-8")) * 2,
+        max_record_bytes=len(payload.encode("utf-8")),
+    )
+    monkeypatch.setattr(
+        "rquant.signal_router_runtime.json.loads",
+        lambda _value: pytest.fail("over-budget batch must fail in SQL preflight"),
+    )
+
+    with pytest.raises(ValueError, match="batch.*byte budget|too large"):
+        source.read_batch(after_sequence=0, limit=3)
+
+
+def test_readonly_runner_source_rejects_deep_json_before_decode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "runner.sqlite3"
+    signal = _signal()
+    _write_runner_source(path)
+    nested: object = "leaf"
+    for _ in range(80):
+        nested = {"child": nested}
+    payload = json.dumps(
+        {**signal.model_dump(mode="json"), "evidence": {"nested": nested}},
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "INSERT INTO runner_signal(signal_id, feature_sequence, payload_json) VALUES (?, 0, ?)",
+            (signal.signal_id, payload),
+        )
+    source = ReadonlyStrategyRunnerSignalSource(
+        source_id="n-shape-v1",
+        path=path,
+        expected_strategy_spec_fingerprint=SPEC,
+        expected_evaluator_contract_fingerprint="2" * 64,
+    )
+    monkeypatch.setattr(
+        "rquant.signal_router_runtime.json.loads",
+        lambda _value: pytest.fail("deep payload must be rejected before json.loads"),
+    )
+
+    with pytest.raises(ValueError, match="depth"):
+        source.read_batch(after_sequence=0, limit=1)
+
+
+def test_readonly_runner_source_rejects_wide_json_before_decode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "runner.sqlite3"
+    signal = _signal()
+    _write_runner_source(path)
+    payload = json.dumps(
+        {
+            **signal.model_dump(mode="json"),
+            "evidence": {"wide": list(range(32))},
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "INSERT INTO runner_signal(signal_id, feature_sequence, payload_json) VALUES (?, 0, ?)",
+            (signal.signal_id, payload),
+        )
+    source = ReadonlyStrategyRunnerSignalSource(
+        source_id="n-shape-v1",
+        path=path,
+        expected_strategy_spec_fingerprint=SPEC,
+        expected_evaluator_contract_fingerprint="2" * 64,
+    )
+    monkeypatch.setattr("rquant.signal_router_runtime._MAX_JSON_NODES", 8)
+    monkeypatch.setattr(
+        "rquant.signal_router_runtime.json.loads",
+        lambda _value: pytest.fail("wide payload must be rejected before json.loads"),
+    )
+
+    with pytest.raises(ValueError, match="node|width"):
+        source.read_batch(after_sequence=0, limit=1)
+
+
+def test_readonly_runner_receipt_rejects_deep_json_before_decode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "runner.sqlite3"
+    signal = _signal()
+    receipt = _runner_completion_receipt(records=(RunnerSignalRecord(sequence=1, signal=signal),))
+    _write_runner_source(path, signal=signal, completion_receipt=receipt)
+    nested = "{}"
+    for _ in range(80):
+        nested = '{"child":' + nested + "}"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE runner_session_close_receipt SET payload_json = ?",
+            (nested,),
+        )
+    source = ReadonlyStrategyRunnerSignalSource(
+        source_id="n-shape-v1",
+        path=path,
+        expected_strategy_spec_fingerprint=SPEC,
+        expected_evaluator_contract_fingerprint="2" * 64,
+    )
+    monkeypatch.setattr(
+        "rquant.signal_router_runtime.json.loads",
+        lambda _value: pytest.fail("deep receipt must be rejected before json.loads"),
+    )
+
+    with pytest.raises(ValueError, match="depth"):
+        source.read_completion_receipt(trade_date=date(2026, 7, 31))
+
+
+def test_readonly_route_authority_binds_persisted_generation_and_receipt_prefix(
+    tmp_path: Path,
+) -> None:
+    signal = _signal()
+    runner = FakeRunner((RunnerSignalRecord(sequence=1, signal=signal),))
+    bus_path = tmp_path / "bus.sqlite3"
+    bus = _bus(bus_path)
+    _run(runner=runner, bus=bus, cursors=_cursors(tmp_path))
+
+    evidence = ReadonlySignalRouteAuthority(
+        path=bus_path,
+        expected_routing_policy_fingerprint=POLICY,
+    ).read_drain_evidence(
+        source_id="n-shape-v1",
+        runner_generation_id=GENERATION,
+        strategy_spec_fingerprint=SPEC,
+        trade_date=date(2026, 7, 31),
+        segment_start_sequence=0,
+        routed_through_sequence=1,
+        observed_at=NOW + timedelta(seconds=1),
+    )
+
+    assert evidence.source_id == "n-shape-v1"
+    assert evidence.runner_generation_id == GENERATION
+    assert evidence.routed_through_sequence == 1
+    assert evidence.last_sequence == 1
+    assert evidence.signal_authority_generation_id == bus.source_descriptor().generation_id
+    assert evidence.route_receipts_sha256 != "0" * 64
+
+
+def test_route_receipt_hash_binds_routing_policy(tmp_path: Path) -> None:
+    signal = _signal()
+    runner = FakeRunner((RunnerSignalRecord(sequence=1, signal=signal),))
+    bus_path = tmp_path / "bus.sqlite3"
+    bus = _bus(bus_path)
+    _run(runner=runner, bus=bus, cursors=_cursors(tmp_path))
+    first = ReadonlySignalRouteAuthority(
+        path=bus_path,
+        expected_routing_policy_fingerprint=POLICY,
+    ).read_drain_evidence(
+        source_id="n-shape-v1",
+        runner_generation_id=GENERATION,
+        strategy_spec_fingerprint=SPEC,
+        trade_date=date(2026, 7, 31),
+        segment_start_sequence=0,
+        routed_through_sequence=1,
+        observed_at=NOW + timedelta(seconds=1),
+    )
+    changed_policy = "8" * 64
+    with sqlite3.connect(bus_path) as connection:
+        connection.execute(
+            "UPDATE signal_route_source SET routing_policy_fingerprint = ? WHERE source_id = ?",
+            (changed_policy, "n-shape-v1"),
+        )
+    second = ReadonlySignalRouteAuthority(
+        path=bus_path,
+        expected_routing_policy_fingerprint=changed_policy,
+    ).read_drain_evidence(
+        source_id="n-shape-v1",
+        runner_generation_id=GENERATION,
+        strategy_spec_fingerprint=SPEC,
+        trade_date=date(2026, 7, 31),
+        segment_start_sequence=0,
+        routed_through_sequence=1,
+        observed_at=NOW + timedelta(seconds=1),
+    )
+
+    assert second.route_receipts_sha256 != first.route_receipts_sha256
+
+
+def test_route_authority_reads_only_current_session_segment_after_100k_history(
+    tmp_path: Path,
+) -> None:
+    signal = _signal()
+    runner = FakeRunner((RunnerSignalRecord(sequence=1, signal=signal),))
+    bus_path = tmp_path / "bus.sqlite3"
+    bus = _bus(bus_path)
+    _run(runner=runner, bus=bus, cursors=_cursors(tmp_path))
+    with sqlite3.connect(bus_path) as connection:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.execute(
+            """
+            WITH RECURSIVE counter(value) AS (
+                SELECT 2
+                UNION ALL SELECT value + 1 FROM counter WHERE value < 100001
+            )
+            INSERT INTO signal_route_receipt(
+                source_id, source_sequence, signal_id, decision_fingerprint,
+                disposition, reason_code, target_manifest_hash,
+                target_manifest_json, routed_at
+            )
+            SELECT 'n-shape-v1', value, printf('historical-%06d', value),
+                   ?, 'no_target', 'historical', ?, '[]', ?
+            FROM counter
+            """,
+            ("1" * 64, "2" * 64, NOW.isoformat().replace("+00:00", "Z")),
+        )
+        connection.execute(
+            """
+            UPDATE signal_route_source
+            SET observed_high_watermark = 100001, last_sequence = 100001
+            WHERE source_id = 'n-shape-v1'
+            """
+        )
+
+    evidence = ReadonlySignalRouteAuthority(
+        path=bus_path,
+        expected_routing_policy_fingerprint=POLICY,
+        max_session_records=1,
+        max_session_raw_bytes=4096,
+        max_receipt_bytes=4096,
+        deadline_seconds=1.0,
+    ).read_drain_evidence(
+        source_id="n-shape-v1",
+        runner_generation_id=GENERATION,
+        strategy_spec_fingerprint=SPEC,
+        trade_date=date(2026, 7, 31),
+        segment_start_sequence=100000,
+        routed_through_sequence=100001,
+        observed_at=NOW + timedelta(seconds=1),
+    )
+
+    assert evidence.segment_start_sequence == 100000
+    assert evidence.segment_record_count == 1
+    assert evidence.routed_through_sequence == 100001
+
+
+def test_readonly_route_authority_fails_closed_for_backlog_or_identity_drift(
+    tmp_path: Path,
+) -> None:
+    bus_path = tmp_path / "bus.sqlite3"
+    bus = _bus(bus_path)
+    bus.bind_route_source(
+        RouteSourceDescriptor(
+            source_id="n-shape-v1",
+            generation_id=GENERATION,
+            strategy_spec_fingerprint=SPEC,
+            first_sequence=1,
+            high_watermark=1,
+        ),
+        routing_policy_fingerprint=POLICY,
+        observed_at=NOW,
+    )
+    authority = ReadonlySignalRouteAuthority(
+        path=bus_path,
+        expected_routing_policy_fingerprint=POLICY,
+    )
+
+    with pytest.raises(ValueError, match="backlog|routed through"):
+        authority.read_drain_evidence(
+            source_id="n-shape-v1",
+            runner_generation_id=GENERATION,
+            strategy_spec_fingerprint=SPEC,
+            trade_date=date(2026, 7, 31),
+            segment_start_sequence=0,
+            routed_through_sequence=1,
+            observed_at=NOW,
+        )
+    with pytest.raises(ValueError, match="generation"):
+        authority.read_drain_evidence(
+            source_id="n-shape-v1",
+            runner_generation_id="0" * 64,
+            strategy_spec_fingerprint=SPEC,
+            trade_date=date(2026, 7, 31),
+            segment_start_sequence=0,
+            routed_through_sequence=0,
+            observed_at=NOW,
+        )
+
+
+def test_readonly_route_authority_rejects_connection_to_another_database(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bus_path = tmp_path / "bus.sqlite3"
+    other_path = tmp_path / "other.sqlite3"
+    _bus(bus_path)
+    _bus(other_path)
+    authority = ReadonlySignalRouteAuthority(
+        path=bus_path,
+        expected_routing_policy_fingerprint=POLICY,
+    )
+    original_connect = sqlite3.connect
+
+    def connect_other_database(*_args: object, **kwargs: object) -> sqlite3.Connection:
+        kwargs.pop("uri", None)
+        return original_connect(other_path, **kwargs)
+
+    monkeypatch.setattr("rquant.signal_router_runtime.sqlite3.connect", connect_other_database)
+
+    with pytest.raises(ValueError, match="resolved to another file"):
+        authority.read_drain_evidence(
+            source_id="n-shape-v1",
+            runner_generation_id=GENERATION,
+            strategy_spec_fingerprint=SPEC,
+            trade_date=date(2026, 7, 31),
+            segment_start_sequence=0,
+            routed_through_sequence=0,
+            observed_at=NOW,
+        )
 
 
 def test_readonly_runner_source_fails_closed_for_missing_symlink_or_identity_drift(

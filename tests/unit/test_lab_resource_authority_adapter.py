@@ -1,0 +1,1075 @@
+"""Closed-resource-authority adapter contracts for spawned Lab workers."""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import multiprocessing
+import os
+import socket
+import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from types import SimpleNamespace
+from uuid import UUID
+
+import pytest
+
+from rquant.lab_resource_authority_adapter import (
+    LAB_RESOURCE_AUTHORITY_REGISTRY_HASH,
+    LAB_RESOURCE_AUTHORITY_REGISTRY_ID,
+    LAB_RESOURCE_AUTHORITY_REGISTRY_VERSION,
+    RESOURCE_AUTHORITY_ADAPTER_MAX_WIRE_BYTES,
+    ExternalResourceJournalMonotonicRootAdapter,
+    ExternalResourceJournalRootConfig,
+    LabResourceAuthorityReservationAdapter,
+    ResourceAuthorityAdapterConfig,
+    ResourceAuthorityAdapterConfigurationError,
+    ResourceAuthorityAdapterIdentity,
+    ResourceAuthorityAdapterRemoteError,
+    ResourceAuthorityAdapterRequest,
+    ResourceAuthorityAdapterResponse,
+    ResourceAuthorityAdapterTransportError,
+    ResourceAuthorityJournalClient,
+    ResourceAuthorityJournalSocketServer,
+    ResourceJournalExternalRootReceipt,
+    _decode,
+    _encode,
+    _operation_id,
+    _secure_socket_path,
+    compose_production_resource_authority_socket_server,
+)
+from rquant.resource_admission import (
+    AdmissionPolicy,
+    AdmissionRequest,
+    ResourceReservationIdentity,
+    ResourceReservationLease,
+    ResourceSnapshot,
+    TradingSession,
+)
+from rquant.resource_journal_high_water import (
+    RESOURCE_JOURNAL_ANTI_ROLLBACK_RECEIPT_NAMESPACE,
+    RESOURCE_JOURNAL_HIGH_WATER_PURPOSE,
+    TRUSTED_RESOURCE_ROLE_PURPOSES,
+    ResourceJournalAntiRollbackReceipt,
+    ResourceJournalHighWaterCheckpoint,
+    TrustedRoleInventory,
+)
+from rquant.runtime_contracts import canonical_sha256
+from rquant.runtime_resource_admission import (
+    RESOURCE_OPERATION_KEY_PURPOSE,
+    ClosedResourceOperationKeyring,
+    ResourceOperationReceipt,
+    RuntimeResourceAdmissionError,
+    SQLiteResourceAdmissionAuthority,
+)
+from rquant.strict_json import (
+    canonical_json_bytes,
+    canonical_model_json_bytes,
+    strict_model_validate_canonical_json,
+)
+
+NOW = datetime(2026, 8, 9, 7, 0, tzinfo=UTC)
+
+
+class _Signer:
+    signature_algorithm = "ed25519"
+    issuer = "lab-resource-authority-test"
+    key_id = "lab-resource-authority-test-key"
+    key_purpose = RESOURCE_OPERATION_KEY_PURPOSE
+
+    def __init__(self) -> None:
+        self._secret = b"lab-resource-authority-adapter-test-secret" * 2
+        self.public_key_fingerprint = hashlib.sha256(self._secret).hexdigest()
+
+    def sign(self, *, namespace: str, payload: bytes) -> str:
+        return hmac.new(
+            self._secret,
+            namespace.encode("ascii") + b"\0" + payload,
+            hashlib.sha256,
+        ).hexdigest()
+
+    def verify(self, *, namespace: str, payload: bytes, signature: str) -> bool:
+        return hmac.compare_digest(
+            self.sign(namespace=namespace, payload=payload),
+            signature,
+        )
+
+
+def _inventory(signer: _Signer) -> TrustedRoleInventory:
+    fingerprints = {
+        purpose: frozenset({hashlib.sha256(f"lab-test:{purpose}".encode()).hexdigest()})
+        for purpose in TRUSTED_RESOURCE_ROLE_PURPOSES
+    }
+    fingerprints[RESOURCE_OPERATION_KEY_PURPOSE] = frozenset({signer.public_key_fingerprint})
+    fingerprints[RESOURCE_JOURNAL_HIGH_WATER_PURPOSE] = frozenset(
+        {hashlib.sha256(b"lab-resource-root-not-configured").hexdigest()}
+    )
+    return TrustedRoleInventory(role_fingerprints=fingerprints)
+
+
+def _policy() -> AdmissionPolicy:
+    return AdmissionPolicy(
+        allow_live_session=True,
+        max_live_shard_duration_ms=5_000,
+        max_snapshot_age_seconds=30,
+        max_live_backlog_age_seconds=30,
+        max_live_p95_latency_seconds=30,
+        min_available_memory_bytes=0,
+        min_available_disk_bytes=0,
+        max_io_pressure_pct=100,
+        max_cpu_load_pct=100,
+        max_expected_memory_bytes=8 * 1024**3,
+        max_expected_disk_bytes=8 * 1024**3,
+        max_expected_quota_units=0,
+        retry_delay_seconds=1,
+    )
+
+
+def _snapshot() -> ResourceSnapshot:
+    return ResourceSnapshot(
+        observed_at=NOW,
+        session=TradingSession.POST_MARKET,
+        live_backlog_age_seconds=0,
+        live_p95_latency_seconds=0,
+        available_memory_bytes=4 * 1024**3,
+        available_disk_bytes=16 * 1024**3,
+        io_pressure_pct=0,
+        cpu_load_pct=0,
+        source_quota_remaining=0,
+        live_healthy=True,
+    )
+
+
+def _identity() -> ResourceReservationIdentity:
+    return ResourceReservationIdentity(
+        job_id=UUID("00000000-0000-0000-0000-000000000001"),
+        run_id="a" * 64,
+        shard_id=UUID("00000000-0000-0000-0000-000000000002"),
+        attempt_id=UUID("00000000-0000-0000-0000-000000000003"),
+        claim_generation=1,
+        scheduler_fencing_token=1,
+        worker_id="lab-worker-test",
+    )
+
+
+class _RootVerifier(_Signer):
+    issuer = "resource-root-issuer"
+    key_id = "resource-root-key"
+    key_purpose = RESOURCE_JOURNAL_HIGH_WATER_PURPOSE
+
+
+def _external_root_config() -> ExternalResourceJournalRootConfig:
+    verifier = _RootVerifier()
+    return ExternalResourceJournalRootConfig(
+        transport="unix-socket-v1",
+        transport_manifest_hash="9" * 64,
+        root_authority_id="external-root-authority",
+        root_store_id="external-root-store",
+        root_issuer=verifier.issuer,
+        root_key_id=verifier.key_id,
+        root_public_key_fingerprint=verifier.public_key_fingerprint,
+        witness_rollback_domain_id="external-root-domain",
+        local_rollback_domain_id="resource-authority-domain",
+    )
+
+
+class _ExternalRootClient:
+    role = "resource_journal_monotonic_root"
+    authority_id = "external-root-authority"
+    store_id = "external-root-store"
+    transport = "unix-socket-v1"
+    manifest_hash = "9" * 64
+    rollback_domain_id = "external-root-domain"
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.last_request = None
+        self.response = None
+        self.response_factory = None
+
+    def invoke(self, *, request_json: str) -> str | None:
+        from rquant.external_monotonic_root import ExternalMonotonicRootRequest
+
+        self.last_request = strict_model_validate_canonical_json(
+            ExternalMonotonicRootRequest,
+            request_json,
+        )
+        self.calls += 1
+        if self.response_factory is not None:
+            return self.response_factory(self.last_request)
+        return self.response
+
+
+def _root_checkpoint() -> ResourceJournalHighWaterCheckpoint:
+    signer = _Signer()
+    zero_hash = "0" * 64
+    head = {
+        "authority_id": "resource-authority",
+        "lineage_id": "1" * 64,
+        "genesis_hash": "2" * 64,
+        "keyring_policy_hash": "3" * 64,
+        "sequence": 0,
+        "entry_hash": zero_hash,
+        "previous_head_hash": zero_hash,
+        "materialized_state_root": "4" * 64,
+        "issuer": signer.issuer,
+        "key_id": signer.key_id,
+        "key_purpose": signer.key_purpose,
+        "namespace": "rquant-resource-admission-journal-head/v1",
+        "signature_algorithm": signer.signature_algorithm,
+        "public_key_fingerprint": signer.public_key_fingerprint,
+        "signature": "signed-head",
+    }
+    return ResourceJournalHighWaterCheckpoint(
+        schema_version=1,
+        contract="rquant-resource-journal-high-water-checkpoint/v1",
+        journal_authority_id="resource-authority",
+        lineage_id="1" * 64,
+        sequence=0,
+        previous_head_hash=zero_hash,
+        head_hash=canonical_sha256(head),
+        materialized_state_root="4" * 64,
+        signed_head_json=canonical_json_bytes(head).decode("utf-8"),
+    )
+
+
+def _request(identity: ResourceReservationIdentity) -> AdmissionRequest:
+    return AdmissionRequest(
+        job_id=str(identity.job_id),
+        resource_class="standard",
+        expected_memory_bytes=1024,
+        expected_disk_bytes=1024,
+        expected_quota_units=0,
+        expected_duration_ms=1_000,
+        source=None,
+        preemptible=True,
+        read_only=True,
+        deadline=NOW + timedelta(minutes=10),
+    )
+
+
+class _Server:
+    def __init__(self, tmp_path: Path, *, filename: str = "resource.sqlite3") -> None:
+        tmp_path.chmod(0o700)
+        socket_parent = Path(__file__).resolve().parents[2] / ".s"
+        socket_parent.mkdir(parents=True, exist_ok=True)
+        socket_parent.chmod(0o700)
+        self.socket_root = Path(tempfile.mkdtemp(prefix="rqa-", dir=socket_parent))
+        self.socket_root.chmod(0o700)
+        self.signer = _Signer()
+        self.inventory = _inventory(self.signer)
+        self.authority = SQLiteResourceAdmissionAuthority(
+            tmp_path / filename,
+            authority_id="lab-resource-authority-test",
+            signer=self.signer,
+            keyring=ClosedResourceOperationKeyring(
+                verifiers=(self.signer,),
+                trusted_issuer=self.signer.issuer,
+                trusted_role_inventory=self.inventory,
+            ),
+            mode="test-standalone",
+            clock=lambda: NOW,
+        )
+        self.configuration = ResourceAuthorityAdapterConfig(
+            mode="test-standalone",
+            endpoint=self.socket_root / "resource.sock",
+            expected_uid=os.getuid(),
+            expected_gid=os.getgid(),
+            authority_id=self.authority.authority_id,
+            trusted_role_inventory_hash=self.inventory.policy_hash,
+            timeout_milliseconds=1_000,
+        )
+        self.server = ResourceAuthorityJournalSocketServer(
+            configuration=self.configuration,
+            authority=self.authority,
+            policy_provider=_policy,
+            snapshot_provider=_snapshot,
+        )
+        self.listener = self.server.bind()
+        self.listener.settimeout(0.05)
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+        self.thread.start()
+
+    def _serve(self) -> None:
+        while not self.stop.is_set():
+            try:
+                self.server.serve_once(self.listener)
+            except TimeoutError:
+                continue
+            except OSError:
+                if not self.stop.is_set():
+                    raise
+
+    def close(self) -> None:
+        self.stop.set()
+        self.listener.close()
+        self.thread.join(timeout=2)
+        self.configuration.endpoint.unlink(missing_ok=True)
+        self.socket_root.rmdir()
+
+
+def _spawn_policy_round_trip(configuration_json: str, result_path: str) -> None:
+    configuration = ResourceAuthorityAdapterConfig.model_validate_json(
+        configuration_json, strict=True
+    )
+    policy = ResourceAuthorityJournalClient(configuration).policy(operation_id="spawn-policy")
+    Path(result_path).write_bytes(_encode(policy))
+
+
+def _spawn_worker_release_after_restart(
+    configuration_json: str,
+    identity_json: str,
+    lease_json: str,
+    runtime_root: str,
+    result_path: str,
+) -> None:
+    from rquant.lab_shard_protocol import LabClaimSpool, LabReportSpool
+    from rquant.lab_worker import LabWorker, build_resource_journal_authority_manifest
+
+    configuration = ResourceAuthorityAdapterConfig.model_validate_json(
+        configuration_json, strict=True
+    )
+    identity = ResourceReservationIdentity.model_validate_json(identity_json, strict=True)
+    lease = ResourceReservationLease.model_validate_json(lease_json, strict=True)
+    root = Path(runtime_root)
+    worker = LabWorker(
+        worker_id=identity.worker_id,
+        claim_spool=LabClaimSpool(root / "claims"),
+        report_spool=LabReportSpool(root / "reports"),
+        artifact_root=root / "artifacts",
+        resource_authority_manifest=build_resource_journal_authority_manifest(configuration),
+        require_resource_admission=True,
+        verified_code_sha_provider=lambda: "1" * 40,
+    )
+    store = worker.resource_reservation_store
+    if not isinstance(store, LabResourceAuthorityReservationAdapter):
+        raise RuntimeError("worker did not construct the registered resource authority")
+    released = store.release(lease, identity=identity)
+    Path(result_path).write_bytes(canonical_json_bytes({"released": released}))
+
+
+def _client(server: _Server) -> ResourceAuthorityJournalClient:
+    return ResourceAuthorityJournalClient(server.configuration)
+
+
+def test_resource_socket_path_rejects_a_writable_ancestor(tmp_path: Path) -> None:
+    socket_parent = Path(__file__).resolve().parents[2] / ".s"
+    socket_parent.mkdir(parents=True, exist_ok=True)
+    socket_parent.chmod(0o700)
+    short_root = Path(tempfile.mkdtemp(prefix="s-", dir=socket_parent)).resolve()
+    unsafe = short_root / "u"
+    socket_root = unsafe / "r"
+    socket_root.mkdir(parents=True, mode=0o700)
+    unsafe.chmod(0o770)
+    endpoint = socket_root / "s"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        listener.bind(str(endpoint))
+        endpoint.chmod(0o600)
+        with pytest.raises(ResourceAuthorityAdapterTransportError, match="endpoint"):
+            _secure_socket_path(
+                endpoint,
+                expected_uid=os.getuid(),
+                expected_gid=os.getgid(),
+                expected_mode=0o600,
+            )
+    finally:
+        listener.close()
+        endpoint.unlink(missing_ok=True)
+        socket_root.rmdir()
+        unsafe.chmod(0o700)
+        unsafe.rmdir()
+        short_root.rmdir()
+
+
+def test_config_requires_an_explicit_external_root_for_production(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="anti-rollback root"):
+        ResourceAuthorityAdapterConfig(
+            mode="production",
+            endpoint=Path("/tmp/rqa.sock"),
+            expected_uid=os.getuid(),
+            expected_gid=os.getgid(),
+            authority_id="resource-authority",
+            trusted_role_inventory_hash="a" * 64,
+        )
+
+    standalone = ResourceAuthorityAdapterConfig(
+        mode="test-standalone",
+        endpoint=Path("/tmp/rqa.sock"),
+        expected_uid=os.getuid(),
+        expected_gid=os.getgid(),
+        authority_id="resource-authority",
+        trusted_role_inventory_hash="a" * 64,
+    )
+    assert standalone.non_production is True
+
+    root = _external_root_config()
+    production = ResourceAuthorityAdapterConfig(
+        mode="production",
+        endpoint=Path("/tmp/rqa.sock"),
+        expected_uid=os.getuid(),
+        expected_gid=os.getgid(),
+        expected_server_uid=os.getuid() + 1,
+        expected_server_gid=os.getgid() + 1,
+        allowed_peer_uid=os.getuid() + 2,
+        allowed_peer_gid=os.getgid() + 2,
+        socket_mode=0o660,
+        socket_directory_mode=0o750,
+        authority_id="resource-authority",
+        high_water_authority_id="resource-high-water-authority",
+        external_root_config=root,
+        trusted_role_inventory_hash="a" * 64,
+    )
+    assert production.external_root_config == root
+    assert production.expected_server_identity == (os.getuid() + 1, os.getgid() + 1)
+    assert production.allowed_peer_identity == (os.getuid() + 2, os.getgid() + 2)
+
+    with pytest.raises(ValueError, match="registered external root transport"):
+        ResourceAuthorityAdapterConfig(
+            mode="production",
+            endpoint=Path("/tmp/rqa.sock"),
+            expected_uid=os.getuid(),
+            expected_gid=os.getgid(),
+            authority_id="resource-authority",
+            high_water_authority_id="resource-high-water-authority",
+            external_root_config=ExternalResourceJournalRootConfig(
+                **{
+                    **root.model_dump(mode="python"),
+                    "transport": "nonproduction-inprocess-v1",
+                }
+            ),
+            trusted_role_inventory_hash="a" * 64,
+        )
+
+    with pytest.raises(ValueError, match="independent rollback domain"):
+        ExternalResourceJournalRootConfig.model_validate(
+            {
+                **root.model_dump(mode="python"),
+                "local_rollback_domain_id": "external-root-domain",
+            },
+            strict=True,
+        )
+
+
+def test_production_server_requires_callable_external_root_capability(tmp_path: Path) -> None:
+    root = _external_root_config()
+    config = ResourceAuthorityAdapterConfig(
+        mode="production",
+        endpoint=Path("/tmp/rqa.sock"),
+        expected_uid=os.getuid(),
+        expected_gid=os.getgid(),
+        authority_id="resource-authority",
+        high_water_authority_id="resource-high-water-authority",
+        external_root_config=root,
+        trusted_role_inventory_hash="a" * 64,
+    )
+    authority = SimpleNamespace(
+        authority_id="resource-authority",
+        mode="production",
+        trusted_role_inventory_hash="a" * 64,
+        high_water_authority=SimpleNamespace(
+            mode="production",
+            authority_id="resource-high-water-authority",
+            anti_rollback_root_authority_id=root.root_authority_id,
+            verifier_fingerprints=frozenset({root.root_public_key_fingerprint}),
+        ),
+    )
+    with pytest.raises(ResourceAuthorityAdapterConfigurationError, match="root client"):
+        ResourceAuthorityJournalSocketServer(
+            configuration=config,
+            authority=authority,
+            policy_provider=_policy,
+            snapshot_provider=_snapshot,
+        )
+
+    missing_capability = SimpleNamespace(
+        role=_ExternalRootClient.role,
+        authority_id=_ExternalRootClient.authority_id,
+        store_id=_ExternalRootClient.store_id,
+        transport=_ExternalRootClient.transport,
+        manifest_hash=_ExternalRootClient.manifest_hash,
+        rollback_domain_id=_ExternalRootClient.rollback_domain_id,
+    )
+    with pytest.raises(ResourceAuthorityAdapterConfigurationError, match="closed Unix peer"):
+        compose_production_resource_authority_socket_server(
+            configuration=config,
+            authority=authority,
+            policy_provider=_policy,
+            snapshot_provider=_snapshot,
+            external_root_client=missing_capability,
+            external_root_verifiers=(_RootVerifier(),),
+        )
+
+    structural_fake = _ExternalRootClient()
+    with pytest.raises(
+        ResourceAuthorityAdapterConfigurationError,
+        match="closed Unix peer client",
+    ):
+        compose_production_resource_authority_socket_server(
+            configuration=config,
+            authority=authority,
+            policy_provider=_policy,
+            snapshot_provider=_snapshot,
+            external_root_client=structural_fake,
+            external_root_verifiers=(_RootVerifier(),),
+        )
+
+    nonproduction = ExternalResourceJournalMonotonicRootAdapter.for_nonproduction_test(
+        config=root,
+        client=structural_fake,
+        root_verifiers=(_RootVerifier(),),
+    )
+    assert nonproduction.production_ready is False
+
+
+def test_resource_authority_probe_contract_is_canonical_and_closed() -> None:
+    adapter_identity = ResourceAuthorityAdapterIdentity(
+        mode="test-standalone",
+        authority_id="resource-authority",
+        trusted_role_inventory_hash="a" * 64,
+    )
+    request = ResourceAuthorityAdapterRequest(
+        operation="probe",
+        operation_id="probe-operation",
+    )
+    response = ResourceAuthorityAdapterResponse(
+        operation="probe",
+        identity=adapter_identity,
+        capabilities=("policy", "snapshot", "journal"),
+    )
+
+    assert (
+        _decode(
+            _encode(request),
+            model=ResourceAuthorityAdapterRequest,
+            label="probe request",
+        )
+        == request
+    )
+    assert (
+        _decode(
+            _encode(response),
+            model=ResourceAuthorityAdapterResponse,
+            label="probe response",
+        )
+        == response
+    )
+    with pytest.raises(ValueError, match="probe response"):
+        ResourceAuthorityAdapterResponse(
+            operation="probe",
+            identity=adapter_identity,
+            capabilities=("snapshot", "policy", "journal"),
+        )
+
+
+def test_external_resource_root_adapter_uses_generic_runtime_and_verifies_receipt() -> None:
+    config = _external_root_config()
+    client = _ExternalRootClient()
+    verifier = _RootVerifier()
+    root = ExternalResourceJournalMonotonicRootAdapter.for_nonproduction_test(
+        config=config,
+        client=client,
+        root_verifiers=(verifier,),
+    )
+    checkpoint = _root_checkpoint()
+    unsigned = ResourceJournalAntiRollbackReceipt(
+        schema_version=1,
+        contract="rquant-resource-journal-anti-rollback-receipt/v1",
+        root_authority_id=config.root_authority_id,
+        high_water_authority_id="resource-high-water-authority",
+        journal_authority_id="resource-authority",
+        operation_id="5" * 64,
+        previous_checkpoint_hash="0" * 64,
+        checkpoint=checkpoint,
+        issuer=verifier.issuer,
+        key_id=verifier.key_id,
+        key_purpose=verifier.key_purpose,
+        namespace=RESOURCE_JOURNAL_ANTI_ROLLBACK_RECEIPT_NAMESPACE,
+        signature_algorithm=verifier.signature_algorithm,
+        public_key_fingerprint=verifier.public_key_fingerprint,
+        signature="pending",
+    )
+    receipt = unsigned.model_copy(
+        update={
+            "signature": verifier.sign(
+                namespace=RESOURCE_JOURNAL_ANTI_ROLLBACK_RECEIPT_NAMESPACE,
+                payload=unsigned.signing_bytes(),
+            )
+        }
+    )
+
+    def signed_response(request: object) -> str:
+        assert request is not None
+        external_unsigned = ResourceJournalExternalRootReceipt(
+            schema_version=1,
+            contract="rquant-resource-journal-external-root-receipt/v1",
+            role=config.role,
+            root_authority_id=config.root_authority_id,
+            root_store_id=config.root_store_id,
+            journal_authority_id="resource-authority",
+            request_kind=request.kind,
+            request_hash=request.request_hash,
+            challenge_nonce=request.challenge_nonce,
+            receipt=receipt,
+            issuer=verifier.issuer,
+            key_id=verifier.key_id,
+            key_purpose=verifier.key_purpose,
+            namespace=RESOURCE_JOURNAL_ANTI_ROLLBACK_RECEIPT_NAMESPACE,
+            signature_algorithm=verifier.signature_algorithm,
+            public_key_fingerprint=verifier.public_key_fingerprint,
+            signature="pending",
+        )
+        external_receipt = external_unsigned.model_copy(
+            update={
+                "signature": verifier.sign(
+                    namespace=RESOURCE_JOURNAL_ANTI_ROLLBACK_RECEIPT_NAMESPACE,
+                    payload=external_unsigned.signing_bytes(),
+                )
+            }
+        )
+        return canonical_model_json_bytes(external_receipt).decode("utf-8")
+
+    client.response_factory = signed_response
+
+    assert (
+        root.pin(
+            operation_id="5" * 64,
+            high_water_authority_id="resource-high-water-authority",
+            journal_authority_id="resource-authority",
+            checkpoint=checkpoint,
+        )
+        == receipt
+    )
+    assert client.last_request is not None
+    assert client.last_request.kind == "pin"
+
+
+def test_server_refuses_to_replace_a_non_socket_endpoint(tmp_path: Path) -> None:
+    server = _Server(tmp_path)
+    endpoint = server.configuration.endpoint
+    socket_root = server.socket_root
+    server.close()
+    socket_root.mkdir(mode=0o700)
+    endpoint.write_text("not a socket", encoding="utf-8")
+    try:
+        with pytest.raises(ResourceAuthorityAdapterConfigurationError, match="cannot be safely"):
+            server.server.bind()
+    finally:
+        endpoint.unlink(missing_ok=True)
+        socket_root.rmdir()
+
+
+def test_server_refuses_a_symlinked_socket_parent(tmp_path: Path) -> None:
+    server = _Server(tmp_path)
+    socket_root = server.socket_root
+    server.close()
+    replacement = tmp_path / "untrusted-socket-parent"
+    replacement.mkdir(mode=0o700)
+    socket_root.symlink_to(replacement, target_is_directory=True)
+    try:
+        with pytest.raises(ResourceAuthorityAdapterConfigurationError, match="not private"):
+            server.server.bind()
+    finally:
+        socket_root.unlink(missing_ok=True)
+        replacement.rmdir()
+
+
+def test_real_spawn_child_uses_only_frozen_config_and_canonical_bytes(tmp_path: Path) -> None:
+    server = _Server(tmp_path)
+    try:
+        output = tmp_path / "spawn-policy.json"
+        context = multiprocessing.get_context("spawn")
+        process = context.Process(
+            target=_spawn_policy_round_trip,
+            args=(server.configuration.model_dump_json(), str(output)),
+        )
+        process.start()
+        process.join(timeout=10)
+        assert process.exitcode == 0
+        assert AdmissionPolicy.model_validate_json(output.read_bytes(), strict=True) == _policy()
+    finally:
+        server.close()
+
+
+def test_registry_v2_binding_is_closed_and_unknown_versions_fail_closed(tmp_path: Path) -> None:
+    server = _Server(tmp_path)
+    try:
+        from rquant.lab_worker import (
+            LabClosedRegistryBinding,
+            LabResourceAuthorityManifest,
+            _AuthorityWireRequest,
+            _resolve_authority,
+            build_resource_journal_authority_manifest,
+        )
+
+        manifest = build_resource_journal_authority_manifest(server.configuration)
+        assert manifest.registry.registry_id == LAB_RESOURCE_AUTHORITY_REGISTRY_ID
+        assert manifest.registry.registry_version == LAB_RESOURCE_AUTHORITY_REGISTRY_VERSION
+        assert manifest.registry.registry_hash == LAB_RESOURCE_AUTHORITY_REGISTRY_HASH
+        assert (
+            _resolve_authority(
+                _AuthorityWireRequest(operation="admission", manifest=manifest)
+            ).policy
+            == _policy()
+        )
+
+        unknown = LabResourceAuthorityManifest(
+            registry=LabClosedRegistryBinding(
+                registry_id="rquant.lab-authority.unknown",
+                registry_version=999,
+                registry_hash="b" * 64,
+                configuration_json="{}",
+            )
+        )
+        with pytest.raises(Exception, match="not registered"):
+            _resolve_authority(_AuthorityWireRequest(operation="policy", manifest=unknown))
+    finally:
+        server.close()
+
+
+def test_adapter_round_trip_response_loss_retry_restart_and_terminal_receipts(
+    tmp_path: Path,
+) -> None:
+    server = _Server(tmp_path)
+    identity = _identity()
+    request = _request(identity)
+    try:
+        adapter = LabResourceAuthorityReservationAdapter(server.configuration)
+        server.server.drop_next_response_after_effect_for_test("reserve")
+        with pytest.raises(ResourceAuthorityAdapterTransportError):
+            adapter.reserve(
+                identity=identity,
+                request=request,
+                policy=_policy(),
+                snapshot_provider=_snapshot,
+                lease_seconds=30,
+            )
+        admitted = adapter.reserve(
+            identity=identity,
+            request=request,
+            policy=_policy(),
+            snapshot_provider=_snapshot,
+            lease_seconds=30,
+        )
+        assert admitted.lease is not None
+        receipt = server.authority.lookup(
+            _operation_id(operation="reserve", identity=identity, prior=None)
+        ).receipt
+        assert isinstance(receipt, ResourceOperationReceipt)
+        renewed = adapter.recheck(
+            lease=admitted.lease,
+            identity=identity,
+            request=request,
+            policy=_policy(),
+            snapshot_provider=_snapshot,
+            lease_seconds=30,
+        )
+        assert renewed.lease is not None
+        assert adapter.release(renewed.lease, identity=identity) is True
+    finally:
+        server.close()
+
+    restarted = _Server(tmp_path)
+    try:
+        assert _client(restarted).lookup(operation_id=receipt.operation_id).receipt == receipt
+    finally:
+        restarted.close()
+
+
+def test_adapter_restart_recovers_latest_receipt_and_terminal_state(tmp_path: Path) -> None:
+    server = _Server(tmp_path)
+    identity = _identity()
+    request = _request(identity)
+    try:
+        first = LabResourceAuthorityReservationAdapter(server.configuration)
+        reserved = first.reserve(
+            identity=identity,
+            request=request,
+            policy=_policy(),
+            snapshot_provider=_snapshot,
+            lease_seconds=30,
+        )
+        assert reserved.lease is not None
+        server.server.drop_next_response_after_effect_for_test("recheck")
+        with pytest.raises(ResourceAuthorityAdapterTransportError):
+            first.recheck(
+                lease=reserved.lease,
+                identity=identity,
+                request=request,
+                policy=_policy(),
+                snapshot_provider=_snapshot,
+                lease_seconds=30,
+            )
+        latest_after_loss = _client(server).lookup_latest(
+            identity=identity,
+            lease_id=reserved.lease.lease_id,
+        )
+
+        restarted = LabResourceAuthorityReservationAdapter(server.configuration)
+        recovered = restarted.recheck(
+            lease=reserved.lease,
+            identity=identity,
+            request=request,
+            policy=_policy(),
+            snapshot_provider=_snapshot,
+            lease_seconds=30,
+        )
+        assert recovered.lease is not None
+        latest_after_retry = _client(server).lookup_latest(
+            identity=identity,
+            lease_id=reserved.lease.lease_id,
+        )
+        assert latest_after_retry.receipt == latest_after_loss.receipt
+        assert recovered.lease == latest_after_loss.lease
+
+        terminal = LabResourceAuthorityReservationAdapter(server.configuration)
+        server.server.drop_next_response_after_effect_for_test("release")
+        with pytest.raises(ResourceAuthorityAdapterTransportError):
+            terminal.release(reserved.lease, identity=identity)
+        after_terminal_restart = LabResourceAuthorityReservationAdapter(server.configuration)
+        assert after_terminal_restart.release(reserved.lease, identity=identity) is True
+        with pytest.raises(RuntimeResourceAdmissionError, match="terminal"):
+            after_terminal_restart.recheck(
+                lease=reserved.lease,
+                identity=identity,
+                request=request,
+                policy=_policy(),
+                snapshot_provider=_snapshot,
+                lease_seconds=30,
+            )
+    finally:
+        server.close()
+
+
+def test_worker_restart_constructs_adapter_that_recovers_authority_lease(
+    tmp_path: Path,
+) -> None:
+    from rquant.lab_shard_protocol import LabClaimSpool, LabReportSpool
+    from rquant.lab_worker import LabWorker, build_resource_journal_authority_manifest
+
+    server = _Server(tmp_path)
+    identity = _identity()
+    request = _request(identity)
+    manifest = build_resource_journal_authority_manifest(server.configuration)
+
+    def worker(name: str) -> LabWorker:
+        return LabWorker(
+            worker_id="lab-worker-test",
+            claim_spool=LabClaimSpool(tmp_path / f"{name}-claims"),
+            report_spool=LabReportSpool(tmp_path / f"{name}-reports"),
+            artifact_root=tmp_path / f"{name}-artifacts",
+            resource_authority_manifest=manifest,
+            require_resource_admission=True,
+            verified_code_sha_provider=lambda: "1" * 40,
+        )
+
+    try:
+        first_store = worker("first").resource_reservation_store
+        assert isinstance(first_store, LabResourceAuthorityReservationAdapter)
+        admitted = first_store.reserve(
+            identity=identity,
+            request=request,
+            policy=_policy(),
+            snapshot_provider=_snapshot,
+            lease_seconds=30,
+        )
+        assert admitted.lease is not None
+        server.server.drop_next_response_after_effect_for_test("recheck")
+        with pytest.raises(ResourceAuthorityAdapterTransportError):
+            first_store.recheck(
+                lease=admitted.lease,
+                identity=identity,
+                request=request,
+                policy=_policy(),
+                snapshot_provider=_snapshot,
+                lease_seconds=30,
+            )
+
+        restarted_store = worker("restarted").resource_reservation_store
+        assert isinstance(restarted_store, LabResourceAuthorityReservationAdapter)
+        assert restarted_store.release(admitted.lease, identity=identity) is True
+    finally:
+        server.close()
+
+
+def test_spawned_worker_restart_recovers_lost_recheck_and_releases(
+    tmp_path: Path,
+) -> None:
+    server = _Server(tmp_path)
+    identity = _identity()
+    request = _request(identity)
+    first = LabResourceAuthorityReservationAdapter(server.configuration)
+    try:
+        admitted = first.reserve(
+            identity=identity,
+            request=request,
+            policy=_policy(),
+            snapshot_provider=_snapshot,
+            lease_seconds=30,
+        )
+        assert admitted.lease is not None
+        server.server.drop_next_response_after_effect_for_test("recheck")
+        with pytest.raises(ResourceAuthorityAdapterTransportError):
+            first.recheck(
+                lease=admitted.lease,
+                identity=identity,
+                request=request,
+                policy=_policy(),
+                snapshot_provider=_snapshot,
+                lease_seconds=30,
+            )
+
+        runtime_root = tmp_path / "spawned-worker-restart"
+        runtime_root.mkdir(mode=0o700)
+        result_path = tmp_path / "spawned-worker-release.json"
+        process = multiprocessing.get_context("spawn").Process(
+            target=_spawn_worker_release_after_restart,
+            args=(
+                server.configuration.model_dump_json(),
+                identity.model_dump_json(),
+                admitted.lease.model_dump_json(),
+                str(runtime_root),
+                str(result_path),
+            ),
+        )
+        process.start()
+        process.join(timeout=10)
+
+        assert process.exitcode == 0
+        assert result_path.read_bytes() == b'{"released":true}'
+        latest = _client(server).lookup_latest(
+            identity=identity,
+            lease_id=admitted.lease.lease_id,
+        )
+        assert latest.released is True
+        assert latest.lease is None
+    finally:
+        server.close()
+
+
+def test_adapter_concurrent_double_release_is_idempotent(tmp_path: Path) -> None:
+    server = _Server(tmp_path)
+    identity = _identity()
+    request = _request(identity)
+    try:
+        admitted = LabResourceAuthorityReservationAdapter(server.configuration).reserve(
+            identity=identity,
+            request=request,
+            policy=_policy(),
+            snapshot_provider=_snapshot,
+            lease_seconds=30,
+        )
+        assert admitted.lease is not None
+
+        def release_from_restart() -> bool:
+            return LabResourceAuthorityReservationAdapter(server.configuration).release(
+                admitted.lease,
+                identity=identity,
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            outcomes = tuple(
+                future.result(timeout=5)
+                for future in (
+                    executor.submit(release_from_restart),
+                    executor.submit(release_from_restart),
+                )
+            )
+        assert outcomes == (True, True)
+    finally:
+        server.close()
+
+
+def test_stale_fence_donor_identity_and_concurrent_terminal_operations_fail_closed(
+    tmp_path: Path,
+) -> None:
+    server = _Server(tmp_path)
+    identity = _identity()
+    request = _request(identity)
+    try:
+        client = _client(server)
+        reserved = client.reserve(
+            operation_id="reserve-operation",
+            identity=identity,
+            request=request,
+            lease_seconds=30,
+        )
+        assert reserved.lease is not None
+        renewed = client.recheck(
+            operation_id="recheck-operation",
+            lease=reserved.lease,
+            identity=identity,
+            request=request,
+            lease_seconds=30,
+            prior_receipt=reserved.receipt,
+        )
+        assert renewed.lease is not None
+        with pytest.raises(ResourceAuthorityAdapterRemoteError):
+            client.release(
+                operation_id="stale-release-operation",
+                lease=renewed.lease,
+                identity=identity,
+                prior_receipt=reserved.receipt,
+            )
+
+        def terminal(operation_id: str) -> object:
+            try:
+                return client.release(
+                    operation_id=operation_id,
+                    lease=renewed.lease,
+                    identity=identity,
+                    prior_receipt=renewed.receipt,
+                )
+            except ResourceAuthorityAdapterRemoteError as exc:
+                return exc
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            outcomes = tuple(
+                future.result(timeout=5)
+                for future in (
+                    executor.submit(terminal, "release-a"),
+                    executor.submit(terminal, "release-b"),
+                )
+            )
+        assert sum(not isinstance(value, Exception) for value in outcomes) == 1
+        assert (
+            sum(isinstance(value, ResourceAuthorityAdapterRemoteError) for value in outcomes) == 1
+        )
+    finally:
+        server.close()
+
+
+def test_tamper_unknown_duplicate_nan_and_oversize_frames_fail_closed(tmp_path: Path) -> None:
+    server = _Server(tmp_path)
+    try:
+        wrong_identity = server.configuration.model_copy(update={"authority_id": "donor-authority"})
+        with pytest.raises(ResourceAuthorityAdapterTransportError, match="identity"):
+            ResourceAuthorityJournalClient(wrong_identity).policy(operation_id="tamper")
+
+        from rquant.lab_resource_authority_adapter import ResourceAuthorityAdapterRequest
+
+        with pytest.raises(ResourceAuthorityAdapterTransportError):
+            _decode(
+                b'{"message_type":"resource-authority-request","message_type":"x"}',
+                model=ResourceAuthorityAdapterRequest,
+                label="duplicate",
+            )
+        with pytest.raises(ResourceAuthorityAdapterTransportError):
+            _decode(
+                b'{"message_type":"resource-authority-request","operation":"policy",'
+                b'"operation_id":"x","schema_version":NaN}',
+                model=ResourceAuthorityAdapterRequest,
+                label="nan",
+            )
+        with pytest.raises(ResourceAuthorityAdapterTransportError):
+            _decode(
+                b"{" + b"x" * RESOURCE_AUTHORITY_ADAPTER_MAX_WIRE_BYTES,
+                model=ResourceAuthorityAdapterRequest,
+                label="oversize",
+            )
+    finally:
+        server.close()

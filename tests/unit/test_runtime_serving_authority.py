@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
@@ -112,6 +114,57 @@ def _write_pointer(root: Path, values: dict[str, object]) -> None:
     os.replace(temporary, root / "current.json")
 
 
+def _mutate_after_initial_pointer_read(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: Callable[[], None],
+) -> None:
+    original_read = authority_module._read_regular_file_at
+    mutated = False
+
+    def read_regular_file_at(
+        directory_fd: int,
+        name: str,
+        *,
+        max_bytes: int,
+        label: str,
+        missing_unavailable: bool,
+        optional: bool = False,
+    ) -> bytes | None:
+        nonlocal mutated
+        payload = original_read(
+            directory_fd,
+            name,
+            max_bytes=max_bytes,
+            label=label,
+            missing_unavailable=missing_unavailable,
+            optional=optional,
+        )
+        if name == "current.json" and not mutated:
+            mutated = True
+            mutation()
+        return payload
+
+    monkeypatch.setattr(authority_module, "_read_regular_file_at", read_regular_file_at)
+
+
+def _mutate_directory(
+    path: Path,
+    mutation: str,
+    *,
+    rename: Callable[[Path, Path], None] = os.rename,
+) -> Path:
+    if mutation == "mode":
+        os.chmod(path, 0o777)
+        return path
+    retired = path.with_name(f"retired-{path.name}")
+    rename(path, retired)
+    if mutation == "replacement":
+        path.mkdir()
+    else:
+        path.symlink_to(retired, target_is_directory=True)
+    return retired
+
+
 def _rebind_publication_pointer(
     pointer: ServingSourceAuthorityPointer,
     *,
@@ -170,6 +223,261 @@ def test_idempotent_publish_keeps_one_immutable_generation(tmp_path: Path) -> No
     assert (root / "generations" / f"{result.generation_id}.json").read_bytes() == generation_bytes
     assert (root / "current.json").read_bytes() == current_bytes
     assert len(tuple((root / "generations").glob("*.json"))) == 1
+
+
+@pytest.mark.parametrize("target", ("root", "generations"))
+@pytest.mark.parametrize("mutation", ("replacement", "symlink", "mode"))
+def test_publisher_fails_closed_when_authority_directory_changes_before_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target: str,
+    mutation: str,
+) -> None:
+    authority_parent = tmp_path / "trusted-parent"
+    authority_parent.mkdir()
+    root = authority_parent / "authority"
+    publisher = _publisher(
+        root,
+        clock=lambda: NOW + timedelta(seconds=10),
+    )
+    first = _result()
+    publisher.publish(first)
+    first_current = (root / "current.json").read_bytes()
+    original_replace = authority_module._replace_current_pointer
+    physical_root = root
+
+    def replace_current_pointer(
+        root_fd: int,
+        payload: bytes,
+        **kwargs: object,
+    ) -> None:
+        nonlocal physical_root
+        selected = root if target == "root" else root / "generations"
+        retired = _mutate_directory(selected, mutation)
+        if target == "root" and mutation != "mode":
+            physical_root = retired
+        original_replace(root_fd, payload, **kwargs)
+
+    monkeypatch.setattr(
+        authority_module,
+        "_replace_current_pointer",
+        replace_current_pointer,
+    )
+    second = _result(
+        sequence=8,
+        event_time=NOW + timedelta(seconds=8),
+        published_at=NOW + timedelta(seconds=9),
+    )
+
+    with pytest.raises(ServingSourceAuthorityIntegrityError, match="directory changed"):
+        publisher.publish(second)
+
+    assert (physical_root / "current.json").read_bytes() == first_current
+    assert not tuple(physical_root.glob(".current.*.tmp"))
+
+
+@pytest.mark.parametrize("target", ("root", "generations"))
+def test_publisher_fails_closed_when_authority_directory_swaps_after_current_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target: str,
+) -> None:
+    authority_parent = tmp_path / "trusted-parent"
+    authority_parent.mkdir()
+    root = authority_parent / "authority"
+    publisher = _publisher(
+        root,
+        clock=lambda: NOW + timedelta(seconds=10),
+    )
+    publisher.publish(_result())
+    original_rename = authority_module.os.rename
+    physical_root = root
+    mutated = False
+
+    def rename(
+        source: str,
+        destination: str,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        nonlocal mutated, physical_root
+        original_rename(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+        if destination != "current.json" or mutated:
+            return
+        mutated = True
+        selected = root if target == "root" else root / "generations"
+        retired = _mutate_directory(selected, "replacement", rename=original_rename)
+        if target == "root":
+            physical_root = retired
+
+    monkeypatch.setattr(authority_module.os, "rename", rename)
+    second = _result(
+        sequence=8,
+        event_time=NOW + timedelta(seconds=8),
+        published_at=NOW + timedelta(seconds=9),
+    )
+
+    with pytest.raises(ServingSourceAuthorityIntegrityError, match="directory changed"):
+        publisher.publish(second)
+
+    assert mutated is True
+    assert not tuple(physical_root.glob(".current.*.tmp"))
+
+
+@pytest.mark.parametrize("mutation", ("content", "inode"))
+def test_publisher_verifies_current_target_after_atomic_replace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    root = tmp_path / "authority"
+    publisher = _publisher(
+        root,
+        clock=lambda: NOW + timedelta(seconds=10),
+    )
+    publisher.publish(_result())
+    original_rename = authority_module.os.rename
+    mutated = False
+
+    def rename(
+        source: str,
+        destination: str,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        nonlocal mutated
+        original_rename(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+        if destination != "current.json" or mutated:
+            return
+        mutated = True
+        current = root / "current.json"
+        if mutation == "content":
+            current.write_bytes(b'{"content_hash":"tampered"}')
+            return
+        replacement = root / "same-current.json"
+        replacement.write_bytes(current.read_bytes())
+        os.chmod(replacement, 0o600)
+        os.replace(replacement, current)
+
+    monkeypatch.setattr(authority_module.os, "rename", rename)
+    second = _result(
+        sequence=8,
+        event_time=NOW + timedelta(seconds=8),
+        published_at=NOW + timedelta(seconds=9),
+    )
+
+    with pytest.raises(ServingSourceAuthorityIntegrityError, match="current pointer"):
+        publisher.publish(second)
+
+    assert mutated is True
+    assert not tuple(root.glob(".current.*.tmp"))
+
+
+def test_idempotent_publisher_revalidates_directory_chain_before_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    authority_parent = tmp_path / "trusted-parent"
+    authority_parent.mkdir()
+    root = authority_parent / "authority"
+    publisher = _publisher(root)
+    result = _result()
+    publisher.publish(result)
+    original_archive = authority_module._archive_publication
+
+    def archive_publication(
+        directory_fd: int,
+        *,
+        pointer: ServingSourceAuthorityPointer,
+        payload: bytes,
+        max_bytes: int,
+    ) -> str:
+        publication_id = original_archive(
+            directory_fd,
+            pointer=pointer,
+            payload=payload,
+            max_bytes=max_bytes,
+        )
+        _mutate_directory(root, "replacement")
+        return publication_id
+
+    monkeypatch.setattr(authority_module, "_archive_publication", archive_publication)
+
+    with pytest.raises(ServingSourceAuthorityIntegrityError, match="directory changed"):
+        publisher.publish(result)
+
+
+def test_publisher_allows_parent_create_delete_and_utime_during_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    authority_parent = tmp_path / "trusted-parent"
+    authority_parent.mkdir()
+    root = authority_parent / "authority"
+    publisher = _publisher(
+        root,
+        clock=lambda: NOW + timedelta(seconds=10),
+    )
+    publisher.publish(_result())
+    delete_target = authority_parent / "delete-me"
+    delete_target.write_text("old", encoding="utf-8")
+    original_publish_generation = authority_module._publish_immutable_generation
+
+    def publish_immutable_generation(
+        directory_fd: int,
+        *,
+        generation_id: str,
+        producer_commit: str,
+        commit_bound: bool,
+        payload: bytes,
+        max_bytes: int,
+    ) -> None:
+        original_publish_generation(
+            directory_fd,
+            generation_id=generation_id,
+            producer_commit=producer_commit,
+            commit_bound=commit_bound,
+            payload=payload,
+            max_bytes=max_bytes,
+        )
+        (authority_parent / "created-during-publish").write_text(
+            "new",
+            encoding="utf-8",
+        )
+        delete_target.unlink()
+        parent_stat = authority_parent.stat()
+        os.utime(
+            authority_parent,
+            ns=(parent_stat.st_atime_ns, parent_stat.st_mtime_ns - 1_000_000),
+        )
+
+    monkeypatch.setattr(
+        authority_module,
+        "_publish_immutable_generation",
+        publish_immutable_generation,
+    )
+    second = _result(
+        sequence=8,
+        event_time=NOW + timedelta(seconds=8),
+        published_at=NOW + timedelta(seconds=9),
+    )
+
+    pointer = publisher.publish(second)
+
+    assert pointer.generation_id == second.generation_id
+    assert _reader(root)(NOW + timedelta(seconds=10)) == second
 
 
 def test_document_and_pointer_are_strict_frozen_and_content_bound() -> None:
@@ -362,6 +670,163 @@ def test_reader_rejects_symlinks_anywhere_in_authority_chain(
 
     with pytest.raises(ServingSourceAuthorityIntegrityError, match="unsafe|symlink"):
         _reader(root)(NOW)
+
+
+def test_reader_accepts_unrelated_write_to_authority_parent_during_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    authority_parent = tmp_path / "trusted-parent"
+    authority_parent.mkdir()
+    root = authority_parent / "authority"
+    result = _result()
+    _publisher(root).publish(result)
+
+    _mutate_after_initial_pointer_read(
+        monkeypatch,
+        lambda: (authority_parent / "unrelated").write_text("probe", encoding="utf-8"),
+    )
+
+    assert _reader(root)(NOW) == result
+
+
+def test_reader_stays_stable_across_many_unrelated_authority_parent_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    authority_parent = tmp_path / "trusted-parent"
+    authority_parent.mkdir()
+    root = authority_parent / "authority"
+    result = _result()
+    _publisher(root).publish(result)
+    mutation_count = 0
+    original_read = authority_module._read_regular_file_at
+    current_read_count = 0
+
+    def read_regular_file_at(
+        directory_fd: int,
+        name: str,
+        *,
+        max_bytes: int,
+        label: str,
+        missing_unavailable: bool,
+        optional: bool = False,
+    ) -> bytes | None:
+        nonlocal current_read_count, mutation_count
+        payload = original_read(
+            directory_fd,
+            name,
+            max_bytes=max_bytes,
+            label=label,
+            missing_unavailable=missing_unavailable,
+            optional=optional,
+        )
+        if name == "current.json":
+            current_read_count += 1
+            if current_read_count % 2:
+                (authority_parent / f"unrelated-{mutation_count}").write_text(
+                    "probe",
+                    encoding="utf-8",
+                )
+                mutation_count += 1
+        return payload
+
+    monkeypatch.setattr(authority_module, "_read_regular_file_at", read_regular_file_at)
+
+    for _ in range(64):
+        assert _reader(root)(NOW) == result
+    assert mutation_count == 64
+
+
+@pytest.mark.parametrize("mutation", ("replacement", "symlink", "mode"))
+def test_reader_rejects_unsafe_ancestor_change_during_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    authority_parent = tmp_path / "trusted-parent"
+    authority_parent.mkdir()
+    root = authority_parent / "authority"
+    _publisher(root).publish(_result())
+
+    def mutate_ancestor() -> None:
+        if mutation == "mode":
+            os.chmod(authority_parent, 0o777)
+            return
+        retired_parent = tmp_path / "retired-parent"
+        authority_parent.rename(retired_parent)
+        if mutation == "replacement":
+            authority_parent.mkdir()
+            return
+        authority_parent.symlink_to(retired_parent, target_is_directory=True)
+
+    _mutate_after_initial_pointer_read(monkeypatch, mutate_ancestor)
+
+    with pytest.raises(ServingSourceAuthorityIntegrityError, match="directory changed"):
+        _reader(root)(NOW)
+
+
+def test_reader_rejects_authority_root_replacement_during_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    authority_parent = tmp_path / "trusted-parent"
+    authority_parent.mkdir()
+    root = authority_parent / "authority"
+    _publisher(root).publish(_result())
+
+    def replace_root() -> None:
+        retired_root = authority_parent / "retired-authority"
+        root.rename(retired_root)
+        root.mkdir()
+
+    _mutate_after_initial_pointer_read(monkeypatch, replace_root)
+
+    with pytest.raises(ServingSourceAuthorityIntegrityError, match="directory changed"):
+        _reader(root)(NOW)
+
+
+@pytest.mark.parametrize("field", ("st_uid", "st_gid"))
+def test_directory_verifier_rejects_ancestor_owner_identity_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+) -> None:
+    authority_parent = tmp_path / "trusted-parent"
+    authority_parent.mkdir()
+    root = authority_parent / "authority"
+    _publisher(root).publish(_result())
+    chain = authority_module._open_existing_directory_chain(root)
+    ancestor_fd = chain[-2][0]
+    original_fstat = authority_module.os.fstat
+
+    def fstat(file_descriptor: int) -> object:
+        observed = original_fstat(file_descriptor)
+        if file_descriptor != ancestor_fd:
+            return observed
+        values = {
+            "st_mode": observed.st_mode,
+            "st_ino": observed.st_ino,
+            "st_dev": observed.st_dev,
+            "st_nlink": observed.st_nlink,
+            "st_uid": observed.st_uid,
+            "st_gid": observed.st_gid,
+            "st_size": observed.st_size,
+            "st_mtime_ns": observed.st_mtime_ns,
+            "st_ctime_ns": observed.st_ctime_ns,
+        }
+        values[field] += 1
+        return SimpleNamespace(**values)
+
+    monkeypatch.setattr(authority_module.os, "fstat", fstat)
+    try:
+        with pytest.raises(
+            ServingSourceAuthorityIntegrityError,
+            match="authority directory changed while being read",
+        ):
+            authority_module._verify_directory_chain(chain)
+    finally:
+        authority_module._close_directory_chain(chain)
 
 
 @pytest.mark.parametrize("target", ["current", "generation"])

@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import multiprocessing as mp
+import sqlite3
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -23,7 +24,11 @@ from rquant.auction_match_gateway import (
 )
 from rquant.live_contracts import BatchQualityStatus, LiveChannel
 from rquant.live_spool import LiveBatchSpool
-from rquant.source_quota_store import SourceQuotaStore
+from rquant.source_quota_store import (
+    SourceQuotaAttemptOutcome,
+    SourceQuotaExhaustedError,
+    SourceQuotaStore,
+)
 
 TRADE_DATE = date(2026, 7, 31)
 RECEIVED = datetime(2026, 7, 31, 1, 26, 5, tzinfo=UTC)
@@ -64,6 +69,7 @@ def _gateway(
     min_coverage_ratio: float = 0.95,
     quota_store: SourceQuotaStore | None = None,
     quota_units_per_window: int | None = None,
+    dispatch_clock: Callable[[], datetime] = lambda: RECEIVED,
 ) -> AuctionMatchGateway:
     return AuctionMatchGateway(
         spool=LiveBatchSpool(tmp_path / "live"),
@@ -75,6 +81,7 @@ def _gateway(
             quota_units_per_window=quota_units_per_window,
         ),
         quota_store=quota_store,
+        dispatch_clock=(None if quota_units_per_window is None else dispatch_clock),
     )
 
 
@@ -105,6 +112,7 @@ def _concurrent_capture_worker(
                 quota_units_per_window=2,
             ),
             quota_store=SourceQuotaStore(Path(quota_path)),
+            dispatch_clock=lambda: RECEIVED,
         )
         barrier.wait(timeout=5)
         capture = gateway.capture_once(
@@ -175,6 +183,7 @@ def _delayed_lock_capture_worker(
                 quota_units_per_window=2,
             ),
             quota_store=SourceQuotaStore(Path(quota_path)),
+            dispatch_clock=lambda: RECEIVED + timedelta(seconds=5),
             entered_lock=entered_lock,
             release_lock=release_lock,
         )
@@ -626,7 +635,13 @@ def test_source_error_publishes_stale_empty_batch(tmp_path: Path) -> None:
     def fail(_: date) -> pd.DataFrame:
         raise TimeoutError("unavailable")
 
-    gateway = _gateway(tmp_path, fail)
+    quota = SourceQuotaStore(tmp_path / "quota.sqlite3")
+    gateway = _gateway(
+        tmp_path,
+        fail,
+        quota_store=quota,
+        quota_units_per_window=1,
+    )
     capture = gateway.capture_once(
         trade_date=TRADE_DATE,
         received_at=RECEIVED,
@@ -640,6 +655,9 @@ def test_source_error_publishes_stale_empty_batch(tmp_path: Path) -> None:
     record = _records(gateway)[0]
     assert record.envelope.degraded_reasons == ("source_error:TimeoutError",)
     assert gateway.decode_payload(gateway.spool.read_payload(record)).empty
+    (attempt,) = quota.list_attempts(source="tushare.stk_auction")
+    assert attempt.outcome is SourceQuotaAttemptOutcome.FAILURE
+    assert quota.remaining("tushare.stk_auction", now=RECEIVED) == 0
 
 
 def test_fetcher_validation_error_is_a_source_error_not_a_structural_error(
@@ -667,7 +685,6 @@ def test_duplicate_suppression_same_day_revision_and_next_day_reset(
     next_date = date(2026, 8, 3)
     frames = [
         _frame(*EXPECTED),
-        _frame(*EXPECTED),
         pd.DataFrame([_row("000001.SZ"), _row("600000.SH", price=10.3)]),
         pd.DataFrame(
             [
@@ -692,6 +709,7 @@ def test_duplicate_suppression_same_day_revision_and_next_day_reset(
         trade_date=TRADE_DATE,
         received_at=RECEIVED + timedelta(seconds=10),
         expected_codes=EXPECTED,
+        retry_ordinal=1,
     )
     following = gateway.capture_once(
         trade_date=next_date,
@@ -804,11 +822,13 @@ def test_quota_consumes_each_source_attempt_and_exhaustion_publishes_stale(
         trade_date=TRADE_DATE,
         received_at=RECEIVED + timedelta(seconds=5),
         expected_codes=EXPECTED,
+        retry_ordinal=1,
     )
     exhausted = gateway.capture_once(
         trade_date=TRADE_DATE,
         received_at=RECEIVED + timedelta(seconds=10),
         expected_codes=EXPECTED,
+        retry_ordinal=2,
     )
 
     assert calls == 2
@@ -846,6 +866,91 @@ def test_source_exception_still_consumes_acquired_quota(tmp_path: Path) -> None:
     assert quota.remaining("tushare.stk_auction", now=RECEIVED) == 0
 
 
+def test_transport_binding_failure_rolls_back_claim_before_provider_dispatch(
+    tmp_path: Path,
+) -> None:
+    quota_path = tmp_path / "quota.sqlite3"
+    quota = SourceQuotaStore(quota_path)
+    with sqlite3.connect(quota_path) as connection:
+        connection.execute(
+            """
+            CREATE TRIGGER fail_auction_transport_binding
+            BEFORE INSERT ON quota_transport_attempt
+            BEGIN
+                SELECT RAISE(ABORT, 'injected binding failure');
+            END
+            """
+        )
+    provider_calls = 0
+
+    def fetch(_: date) -> pd.DataFrame:
+        nonlocal provider_calls
+        provider_calls += 1
+        return _frame(*EXPECTED)
+
+    gateway = _gateway(
+        tmp_path,
+        fetch,
+        quota_store=quota,
+        quota_units_per_window=1,
+    )
+
+    capture = gateway.capture_once(
+        trade_date=TRADE_DATE,
+        received_at=RECEIVED,
+        expected_codes=EXPECTED,
+    )
+
+    assert provider_calls == 0
+    assert capture.pointer.quality_status is BatchQualityStatus.STALE
+    assert quota.list_attempts(source="tushare.stk_auction") == ()
+    with pytest.raises(SourceQuotaExhaustedError, match="no active window"):
+        quota.remaining("tushare.stk_auction", now=RECEIVED)
+
+
+def test_killed_provider_attempt_is_durable_and_restart_does_not_refetch(tmp_path: Path) -> None:
+    quota_path = tmp_path / "quota.sqlite3"
+    calls = 0
+
+    def kill(_: date) -> pd.DataFrame:
+        nonlocal calls
+        calls += 1
+        raise KeyboardInterrupt()
+
+    first = _gateway(
+        tmp_path,
+        kill,
+        quota_store=SourceQuotaStore(quota_path),
+        quota_units_per_window=1,
+    )
+    with pytest.raises(KeyboardInterrupt):
+        first.capture_once(
+            trade_date=TRADE_DATE,
+            received_at=RECEIVED,
+            expected_codes=EXPECTED,
+        )
+
+    restarted = _gateway(
+        tmp_path,
+        lambda _date: pytest.fail("durable unknown attempt must not refetch"),
+        quota_store=SourceQuotaStore(quota_path),
+        quota_units_per_window=1,
+    )
+    capture = restarted.capture_once(
+        trade_date=TRADE_DATE,
+        received_at=RECEIVED + timedelta(seconds=5),
+        expected_codes=EXPECTED,
+    )
+
+    assert calls == 1
+    assert capture.pointer.quality_status is BatchQualityStatus.STALE
+    quota = SourceQuotaStore(quota_path)
+    assert quota.remaining("tushare.stk_auction", now=RECEIVED) == 0
+    (attempt,) = quota.list_attempts(source="tushare.stk_auction")
+    assert attempt.dispatched_at is not None
+    assert attempt.outcome is SourceQuotaAttemptOutcome.UNKNOWN
+
+
 @pytest.mark.parametrize("first_quality", ["stale", "degraded"])
 def test_same_received_at_retries_nonpublished_quality_and_charges_each_fetch(
     tmp_path: Path,
@@ -879,6 +984,7 @@ def test_same_received_at_retries_nonpublished_quality_and_charges_each_fetch(
         trade_date=TRADE_DATE,
         received_at=RECEIVED,
         expected_codes=EXPECTED,
+        retry_ordinal=1,
     )
 
     assert first.pointer.quality_status in {

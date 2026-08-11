@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import sqlite3
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
+import rquant.schema_compatibility as schema_compatibility
 from rquant.runtime_contracts import RuntimeContractModel
 from rquant.schema_compatibility import (
     CompatibilityOutcome,
@@ -298,13 +300,21 @@ def test_dual_read_accepts_old_and_new_optional_shapes() -> None:
 def test_field_removal_is_forbidden_during_dual_read_and_explicit_at_retirement() -> None:
     old = _declaration(
         current_version=2,
-        fields=(*_base_fields(), _field("legacy_volume", required=False)),
+        fields=(
+            *_base_fields(),
+            _field("legacy_volume", required=False, deprecated_in=2),
+        ),
     )
     new = _declaration(
         current_version=3,
         fields=(
             *_base_fields(),
-            _field("legacy_volume", required=False, removed_in=3),
+            _field(
+                "legacy_volume",
+                required=False,
+                deprecated_in=2,
+                removed_in=3,
+            ),
         ),
     )
 
@@ -656,3 +666,617 @@ def test_contracts_round_trip_json_as_frozen_runtime_models() -> None:
     assert isinstance(restored, RuntimeContractModel)
     with pytest.raises(ValidationError):
         restored.deadline = restored.deadline + timedelta(hours=1)
+
+
+@pytest.mark.parametrize("invalid", [True, "2", 2**31])
+def test_schema_versions_are_strict_bounded_integers(invalid: object) -> None:
+    with pytest.raises(ValidationError):
+        SchemaField(
+            name="amount",
+            type_name="float64",
+            required=False,
+            introduced_in=invalid,
+        )
+
+
+def test_removed_field_requires_a_prior_deprecation_and_bounded_history() -> None:
+    with pytest.raises(ValidationError, match="deprecated"):
+        _field("legacy", required=False, introduced_in=1, removed_in=3)
+    with pytest.raises(ValidationError, match="removed"):
+        _field(
+            "legacy",
+            required=False,
+            introduced_in=1,
+            deprecated_in=2,
+            removed_in=3,
+            required_history=(
+                SchemaRequiredTransition(version=1, required=False),
+                SchemaRequiredTransition(version=3, required=False),
+            ),
+        )
+
+
+def test_dual_write_contract_rejects_shared_value_drift_and_binds_new_data() -> None:
+    old = _declaration(current_version=1, fields=_base_fields())
+    new = _declaration(
+        current_version=2,
+        fields=(*_base_fields(), _field("amount", required=False, introduced_in=2)),
+    )
+    validate = schema_compatibility.validate_dual_write_values
+
+    evidence = validate(
+        old_declaration=old,
+        new_declaration=new,
+        old_values={"ts_code": "000001.SZ", "close": 10.5},
+        new_values={"ts_code": "000001.SZ", "close": 10.5, "amount": 1_000_000.0},
+        generation_id="4" * 64,
+        observed_at=datetime(2026, 8, 2, 1, 1, tzinfo=UTC),
+    )
+
+    assert evidence.old_declaration_fingerprint == old.schema_fingerprint
+    assert evidence.new_declaration_fingerprint == new.schema_fingerprint
+    assert evidence.new_values_fingerprint != evidence.shared_values_fingerprint
+    with pytest.raises(ValueError, match="shared field close"):
+        validate(
+            old_declaration=old,
+            new_declaration=new,
+            old_values={"ts_code": "000001.SZ", "close": 10.5},
+            new_values={"ts_code": "000001.SZ", "close": 10.6, "amount": 1_000_000.0},
+            generation_id="4" * 64,
+            observed_at=datetime(2026, 8, 2, 1, 1, tzinfo=UTC),
+        )
+
+
+def _trusted_registry() -> object:
+    registry_type = schema_compatibility.ProductionConsumerRegistry
+    consumer_type = schema_compatibility.ProductionConsumerCapability
+    return registry_type(
+        registry_id="production-runtime-consumers",
+        consumers=(
+            consumer_type(
+                consumer_id="feature-reader",
+                service_id="rquant-runtime-feature@n-shape.service",
+                dataset_id="market-minute",
+                contract_fingerprint="2" * 64,
+                code_commit="a" * 40,
+                min_readable_schema_version=1,
+                max_readable_schema_version=2,
+                required_fields=("close", "ts_code"),
+            ),
+            consumer_type(
+                consumer_id="paper-reader",
+                service_id="rquant-runtime-paper-broker@n-shape.service",
+                dataset_id="market-minute",
+                contract_fingerprint="3" * 64,
+                code_commit="a" * 40,
+                min_readable_schema_version=1,
+                max_readable_schema_version=2,
+                required_fields=("close", "ts_code"),
+            ),
+        ),
+    )
+
+
+def _strict_rollout_plan(*, started_at: datetime) -> LiveSchemaRolloutPlan:
+    old = _declaration(current_version=1, fields=_base_fields())
+    new = _declaration(
+        current_version=2,
+        fields=(*_base_fields(), _field("amount", required=False, introduced_in=2)),
+    )
+    registry = _trusted_registry()
+    return LiveSchemaRolloutPlan(
+        dataset_id="market-minute",
+        old_declaration_fingerprint=old.schema_fingerprint,
+        new_declaration_fingerprint=new.schema_fingerprint,
+        producers=(SchemaParticipant(participant_id="gateway", contract_fingerprint="1" * 64),),
+        consumers=(
+            SchemaParticipant(participant_id="feature-reader", contract_fingerprint="2" * 64),
+            SchemaParticipant(participant_id="paper-reader", contract_fingerprint="3" * 64),
+        ),
+        production_consumer_registry_fingerprint=registry.registry_fingerprint,
+        serving_physical_schema_fingerprint="5" * 64,
+        target_generation_id="4" * 64,
+        target_schema_version=2,
+        consumer_ack_max_age_seconds=300,
+        started_at=started_at,
+        deadline=started_at + timedelta(hours=2),
+    )
+
+
+def _consumer_receipt(
+    *,
+    consumer_id: str,
+    service_id: str,
+    available_at: datetime,
+) -> object:
+    receipt_type = schema_compatibility.ConsumerCapabilityReceipt
+    return receipt_type(
+        consumer_id=consumer_id,
+        service_id=service_id,
+        code_commit="a" * 40,
+        dataset_id="market-minute",
+        min_readable_schema_version=1,
+        max_readable_schema_version=2,
+        required_fields=("close", "ts_code"),
+        serving_physical_schema_fingerprint="5" * 64,
+        observed_generation_id="4" * 64,
+        available_at=available_at,
+    )
+
+
+def test_rollout_state_machine_requires_trusted_fresh_consumer_capabilities(
+    tmp_path: Path,
+) -> None:
+    started_at = datetime(2026, 8, 2, 1, 0, tzinfo=UTC)
+    registry = _trusted_registry()
+    plan = _strict_rollout_plan(started_at=started_at)
+    store = SchemaRolloutStore(
+        tmp_path / "rollout.sqlite3",
+        production_consumer_registry=registry,
+    )
+    state = store.create_plan(plan, now=started_at, operation_id="create")
+    assert state.phase is RolloutPhase.PREPARE
+    assert state.authority_declaration_fingerprint == plan.old_declaration_fingerprint
+
+    with pytest.raises(ValueError, match="consecutive"):
+        store.advance(
+            plan_id=plan.plan_id,
+            expected_revision=state.revision,
+            target_phase=RolloutPhase.CUTOVER,
+            now=started_at + timedelta(seconds=1),
+            operation_id="skip-to-cutover",
+        )
+
+    state = store.acknowledge(
+        plan_id=plan.plan_id,
+        expected_revision=state.revision,
+        phase=RolloutPhase.PREPARE,
+        participant_id="gateway",
+        participant_fingerprint="1" * 64,
+        declaration_fingerprint=plan.new_declaration_fingerprint,
+        now=started_at + timedelta(seconds=2),
+        operation_id="producer-prepare",
+    )
+    state = store.advance(
+        plan_id=plan.plan_id,
+        expected_revision=state.revision,
+        target_phase=RolloutPhase.DUAL_WRITE,
+        now=started_at + timedelta(seconds=3),
+        operation_id="dual-write",
+    )
+    old = _declaration(current_version=1, fields=_base_fields())
+    new = _declaration(
+        current_version=2,
+        fields=(*_base_fields(), _field("amount", required=False, introduced_in=2)),
+    )
+    evidence = schema_compatibility.validate_dual_write_values(
+        old_declaration=old,
+        new_declaration=new,
+        old_values={"ts_code": "000001.SZ", "close": 10.5},
+        new_values={"ts_code": "000001.SZ", "close": 10.5, "amount": 1.0},
+        generation_id="4" * 64,
+        observed_at=started_at + timedelta(seconds=4),
+    )
+    state = store.record_dual_write_evidence(
+        plan_id=plan.plan_id,
+        expected_revision=state.revision,
+        evidence=evidence,
+        operation_id="dual-write-evidence",
+    )
+    state = store.advance(
+        plan_id=plan.plan_id,
+        expected_revision=state.revision,
+        target_phase=RolloutPhase.CONSUMER_ACK,
+        now=started_at + timedelta(seconds=5),
+        operation_id="consumer-ack-phase",
+    )
+    state = store.acknowledge_consumer(
+        plan_id=plan.plan_id,
+        expected_revision=state.revision,
+        receipt=_consumer_receipt(
+            consumer_id="feature-reader",
+            service_id="rquant-runtime-feature@n-shape.service",
+            available_at=started_at + timedelta(seconds=6),
+        ),
+        now=started_at + timedelta(seconds=6),
+        operation_id="feature-ack",
+    )
+    state = store.acknowledge_consumer(
+        plan_id=plan.plan_id,
+        expected_revision=state.revision,
+        receipt=_consumer_receipt(
+            consumer_id="paper-reader",
+            service_id="rquant-runtime-paper-broker@n-shape.service",
+            available_at=started_at + timedelta(seconds=7),
+        ),
+        now=started_at + timedelta(seconds=7),
+        operation_id="paper-ack",
+    )
+    with pytest.raises(ValueError, match="stale"):
+        store.advance(
+            plan_id=plan.plan_id,
+            expected_revision=state.revision,
+            target_phase=RolloutPhase.CUTOVER,
+            now=started_at + timedelta(seconds=400),
+            operation_id="stale-cutover",
+        )
+    state = store.advance(
+        plan_id=plan.plan_id,
+        expected_revision=state.revision,
+        target_phase=RolloutPhase.CUTOVER,
+        now=started_at + timedelta(seconds=8),
+        operation_id="cutover",
+    )
+
+    assert state.phase is RolloutPhase.CUTOVER
+    assert state.authority_declaration_fingerprint == plan.new_declaration_fingerprint
+    with pytest.raises(ValueError, match="producer acknowledgement"):
+        store.advance(
+            plan_id=plan.plan_id,
+            expected_revision=state.revision,
+            target_phase=RolloutPhase.RETIRE,
+            now=started_at + timedelta(seconds=9),
+            operation_id="premature-retire",
+        )
+    state = store.acknowledge(
+        plan_id=plan.plan_id,
+        expected_revision=state.revision,
+        phase=RolloutPhase.CUTOVER,
+        participant_id="gateway",
+        participant_fingerprint="1" * 64,
+        declaration_fingerprint=plan.new_declaration_fingerprint,
+        now=started_at + timedelta(seconds=10),
+        operation_id="producer-cutover",
+    )
+    state = store.advance(
+        plan_id=plan.plan_id,
+        expected_revision=state.revision,
+        target_phase=RolloutPhase.RETIRE,
+        now=started_at + timedelta(seconds=11),
+        operation_id="retire",
+    )
+    assert state.phase is RolloutPhase.RETIRE
+    with pytest.raises(ValueError, match="terminal"):
+        store.rollback(
+            plan_id=plan.plan_id,
+            expected_revision=state.revision,
+            reason="too late",
+            now=started_at + timedelta(seconds=12),
+            operation_id="rollback-retired",
+        )
+    events = store.receipts(plan.plan_id)
+    assert tuple(event.revision for event in events) == tuple(range(len(events)))
+    assert all(
+        event.previous_hash == events[index - 1].event_hash
+        for index, event in enumerate(events)
+        if index
+    )
+
+
+def test_rollout_retry_is_idempotent_but_conflicting_operation_fails(tmp_path: Path) -> None:
+    started_at = datetime(2026, 8, 2, 1, 0, tzinfo=UTC)
+    plan = _strict_rollout_plan(started_at=started_at)
+    store = SchemaRolloutStore(
+        tmp_path / "rollout.sqlite3",
+        production_consumer_registry=_trusted_registry(),
+    )
+    first = store.create_plan(plan, now=started_at, operation_id="same-create")
+    retried = store.create_plan(plan, now=started_at, operation_id="same-create")
+    assert retried == first
+    assert len(store.receipts(plan.plan_id)) == 1
+
+    with pytest.raises(ValueError, match="operation"):
+        store.create_plan(
+            plan,
+            now=started_at + timedelta(seconds=1),
+            operation_id="same-create",
+        )
+
+
+def test_rollout_hash_tamper_and_legacy_v1_registry_fail_closed(tmp_path: Path) -> None:
+    started_at = datetime(2026, 8, 2, 1, 0, tzinfo=UTC)
+    path = tmp_path / "rollout.sqlite3"
+    plan = _strict_rollout_plan(started_at=started_at)
+    store = SchemaRolloutStore(path, production_consumer_registry=_trusted_registry())
+    store.create_plan(plan, now=started_at, operation_id="create")
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP TRIGGER schema_rollout_event_no_update")
+        connection.execute(
+            "UPDATE schema_rollout_event SET event_hash = ? WHERE plan_id = ? AND revision = 0",
+            ("f" * 64, plan.plan_id),
+        )
+    with pytest.raises(RuntimeError, match="hash chain"):
+        store.get_state(plan.plan_id)
+
+    legacy = tmp_path / "legacy.sqlite3"
+    with sqlite3.connect(legacy) as connection:
+        connection.execute(
+            "CREATE TABLE schema_rollout (plan_id TEXT PRIMARY KEY, plan_json TEXT NOT NULL)"
+        )
+    with pytest.raises(RuntimeError, match="legacy v1"):
+        SchemaRolloutStore(legacy)
+
+
+def test_timeout_and_consumer_reject_roll_back_without_erasing_new_data(
+    tmp_path: Path,
+) -> None:
+    started_at = datetime(2026, 8, 2, 1, 0, tzinfo=UTC)
+    plan = _strict_rollout_plan(started_at=started_at)
+    store = SchemaRolloutStore(
+        tmp_path / "rollout.sqlite3",
+        production_consumer_registry=_trusted_registry(),
+    )
+    state = store.create_plan(plan, now=started_at, operation_id="create")
+    rolled_back = store.expire(
+        plan_id=plan.plan_id,
+        expected_revision=state.revision,
+        now=plan.deadline + timedelta(seconds=1),
+        operation_id="deadline-expired",
+    )
+
+    assert rolled_back.phase is RolloutPhase.ROLLBACK
+    assert rolled_back.authority_declaration_fingerprint == plan.old_declaration_fingerprint
+    assert rolled_back.new_data_preserved is True
+    assert any("deadline" in event.payload_json for event in store.receipts(plan.plan_id))
+
+
+def test_cutover_rejects_stale_or_untrusted_consumer_receipt(tmp_path: Path) -> None:
+    started_at = datetime(2026, 8, 2, 1, 0, tzinfo=UTC)
+    plan = _strict_rollout_plan(started_at=started_at)
+    store = SchemaRolloutStore(
+        tmp_path / "rollout.sqlite3",
+        production_consumer_registry=_trusted_registry(),
+    )
+    state = store.create_plan(plan, now=started_at, operation_id="create")
+
+    with pytest.raises(ValueError, match="trusted production consumer"):
+        store.acknowledge_consumer(
+            plan_id=plan.plan_id,
+            expected_revision=state.revision,
+            receipt=_consumer_receipt(
+                consumer_id="invented-reader",
+                service_id="invented.service",
+                available_at=started_at,
+            ),
+            now=started_at,
+            operation_id="invented-ack",
+        )
+
+
+def test_plan_cannot_replace_the_trusted_production_consumer_set(tmp_path: Path) -> None:
+    started_at = datetime(2026, 8, 2, 1, 0, tzinfo=UTC)
+    plan = _strict_rollout_plan(started_at=started_at)
+    forged = plan.model_copy(update={"consumers": plan.consumers[:1]})
+    store = SchemaRolloutStore(
+        tmp_path / "rollout.sqlite3",
+        production_consumer_registry=_trusted_registry(),
+    )
+
+    with pytest.raises(ValueError, match="trusted production registry"):
+        store.create_plan(forged, now=started_at, operation_id="forged-plan")
+
+
+def _enter_dual_write(
+    store: SchemaRolloutStore,
+    plan: LiveSchemaRolloutPlan,
+    *,
+    started_at: datetime,
+) -> object:
+    state = store.create_plan(plan, now=started_at, operation_id="create")
+    state = store.acknowledge(
+        plan_id=plan.plan_id,
+        expected_revision=state.revision,
+        phase=RolloutPhase.PREPARE,
+        participant_id="gateway",
+        participant_fingerprint="1" * 64,
+        declaration_fingerprint=plan.new_declaration_fingerprint,
+        now=started_at + timedelta(seconds=1),
+        operation_id="producer-prepare",
+    )
+    return store.advance(
+        plan_id=plan.plan_id,
+        expected_revision=state.revision,
+        target_phase=RolloutPhase.DUAL_WRITE,
+        now=started_at + timedelta(seconds=2),
+        operation_id="dual-write",
+    )
+
+
+def _dual_write_evidence(*, started_at: datetime) -> object:
+    return schema_compatibility.validate_dual_write_values(
+        old_declaration=_declaration(current_version=1, fields=_base_fields()),
+        new_declaration=_declaration(
+            current_version=2,
+            fields=(*_base_fields(), _field("amount", required=False, introduced_in=2)),
+        ),
+        old_values={"ts_code": "000001.SZ", "close": 10.5},
+        new_values={"ts_code": "000001.SZ", "close": 10.5, "amount": 1.0},
+        generation_id="4" * 64,
+        observed_at=started_at + timedelta(seconds=3),
+    )
+
+
+def test_dual_write_crash_rolls_back_evidence_and_revision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started_at = datetime(2026, 8, 2, 1, 0, tzinfo=UTC)
+    plan = _strict_rollout_plan(started_at=started_at)
+    store = SchemaRolloutStore(
+        tmp_path / "rollout.sqlite3",
+        production_consumer_registry=_trusted_registry(),
+    )
+    state = _enter_dual_write(store, plan, started_at=started_at)
+
+    def crash(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("simulated crash after evidence insert")
+
+    monkeypatch.setattr(store, "_append_mutation", crash)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        store.record_dual_write_evidence(
+            plan_id=plan.plan_id,
+            expected_revision=state.revision,
+            evidence=_dual_write_evidence(started_at=started_at),
+            operation_id="evidence-crash",
+        )
+
+    reopened = SchemaRolloutStore(
+        tmp_path / "rollout.sqlite3",
+        production_consumer_registry=_trusted_registry(),
+    )
+    assert reopened.get_state(plan.plan_id) == state
+    assert reopened.dual_write_evidence(plan.plan_id) == ()
+
+
+def test_dual_write_persists_both_canonical_shapes_and_replays_idempotently(
+    tmp_path: Path,
+) -> None:
+    started_at = datetime(2026, 8, 2, 1, 0, tzinfo=UTC)
+    plan = _strict_rollout_plan(started_at=started_at)
+    registry = _trusted_registry()
+    store = SchemaRolloutStore(
+        tmp_path / "rollout.sqlite3",
+        production_consumer_registry=registry,
+    )
+    state = _enter_dual_write(store, plan, started_at=started_at)
+    old = _declaration(current_version=1, fields=_base_fields())
+    new = _declaration(
+        current_version=2,
+        fields=(*_base_fields(), _field("amount", required=False, introduced_in=2)),
+    )
+
+    state = store.record_dual_write_values(
+        plan_id=plan.plan_id,
+        expected_revision=state.revision,
+        old_declaration=old,
+        new_declaration=new,
+        old_values={"ts_code": "000001.SZ", "close": 10.5},
+        new_values={"ts_code": "000001.SZ", "close": 10.5, "amount": 1.0},
+        generation_id="4" * 64,
+        observed_at=started_at + timedelta(seconds=3),
+        operation_id="batch:000001",
+    )
+    replay = store.record_dual_write_values(
+        plan_id=plan.plan_id,
+        expected_revision=state.revision,
+        old_declaration=old,
+        new_declaration=new,
+        old_values={"close": 10.5, "ts_code": "000001.SZ"},
+        new_values={"amount": 1.0, "close": 10.5, "ts_code": "000001.SZ"},
+        generation_id="4" * 64,
+        observed_at=started_at + timedelta(seconds=3),
+        operation_id="batch:000001",
+    )
+
+    records = store.dual_write_records(plan.plan_id)
+    assert replay == state
+    assert len(records) == 1
+    assert records[0].old_values == {"close": 10.5, "ts_code": "000001.SZ"}
+    assert records[0].new_values == {
+        "amount": 1.0,
+        "close": 10.5,
+        "ts_code": "000001.SZ",
+    }
+    assert records[0].evidence.generation_id == "4" * 64
+
+    reopened = SchemaRolloutStore(
+        tmp_path / "rollout.sqlite3",
+        production_consumer_registry=registry,
+    )
+    assert reopened.dual_write_records(plan.plan_id) == records
+
+
+def test_rollback_retains_new_field_evidence_and_consumer_reject_history(
+    tmp_path: Path,
+) -> None:
+    started_at = datetime(2026, 8, 2, 1, 0, tzinfo=UTC)
+    plan = _strict_rollout_plan(started_at=started_at)
+    store = SchemaRolloutStore(
+        tmp_path / "rollout.sqlite3",
+        production_consumer_registry=_trusted_registry(),
+    )
+    state = _enter_dual_write(store, plan, started_at=started_at)
+    evidence = _dual_write_evidence(started_at=started_at)
+    state = store.record_dual_write_evidence(
+        plan_id=plan.plan_id,
+        expected_revision=state.revision,
+        evidence=evidence,
+        operation_id="evidence",
+    )
+    state = store.advance(
+        plan_id=plan.plan_id,
+        expected_revision=state.revision,
+        target_phase=RolloutPhase.CONSUMER_ACK,
+        now=started_at + timedelta(seconds=4),
+        operation_id="consumer-ack",
+    )
+    state = store.reject_consumer(
+        plan_id=plan.plan_id,
+        expected_revision=state.revision,
+        consumer_id="feature-reader",
+        reason="cannot decode observed generation",
+        now=started_at + timedelta(seconds=5),
+        operation_id="consumer-reject",
+    )
+
+    assert state.phase is RolloutPhase.ROLLBACK
+    assert store.dual_write_evidence(plan.plan_id) == (evidence,)
+    assert any(
+        "consumer_reject" in receipt.payload_json for receipt in store.receipts(plan.plan_id)
+    )
+
+
+def test_deleting_bound_evidence_is_detected_even_if_sqlite_trigger_is_removed(
+    tmp_path: Path,
+) -> None:
+    started_at = datetime(2026, 8, 2, 1, 0, tzinfo=UTC)
+    plan = _strict_rollout_plan(started_at=started_at)
+    path = tmp_path / "rollout.sqlite3"
+    store = SchemaRolloutStore(
+        path,
+        production_consumer_registry=_trusted_registry(),
+    )
+    state = _enter_dual_write(store, plan, started_at=started_at)
+    state = store.record_dual_write_evidence(
+        plan_id=plan.plan_id,
+        expected_revision=state.revision,
+        evidence=_dual_write_evidence(started_at=started_at),
+        operation_id="evidence",
+    )
+    assert state.phase is RolloutPhase.DUAL_WRITE
+
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP TRIGGER schema_dual_write_evidence_no_delete")
+        connection.execute(
+            "DELETE FROM schema_dual_write_evidence WHERE plan_id = ?",
+            (plan.plan_id,),
+        )
+
+    with pytest.raises(RuntimeError, match="evidence.*hash chain"):
+        store.get_state(plan.plan_id)
+
+
+def test_strict_rollout_reopen_requires_the_same_trusted_registry(tmp_path: Path) -> None:
+    started_at = datetime(2026, 8, 2, 1, 0, tzinfo=UTC)
+    plan = _strict_rollout_plan(started_at=started_at)
+    path = tmp_path / "rollout.sqlite3"
+    store = SchemaRolloutStore(
+        path,
+        production_consumer_registry=_trusted_registry(),
+    )
+    store.create_plan(plan, now=started_at, operation_id="create")
+
+    without_registry = SchemaRolloutStore(path)
+    with pytest.raises(RuntimeError, match="trusted production consumer registry"):
+        without_registry.get_state(plan.plan_id)
+
+    registry_type = schema_compatibility.ProductionConsumerRegistry
+    wrong_registry = registry_type(
+        registry_id="different-production-registry",
+        consumers=_trusted_registry().consumers,
+    )
+    with pytest.raises(ValueError, match="trusted production registry"):
+        SchemaRolloutStore(
+            path,
+            production_consumer_registry=wrong_registry,
+        ).get_state(plan.plan_id)

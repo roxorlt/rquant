@@ -6,17 +6,21 @@ from decimal import Decimal, localcontext
 import pytest
 from pydantic import ValidationError
 
+from rquant.experiment_registry import DateRange, ExperimentSpec
 from rquant.research_run_spec import (
     DatasetSnapshotIdentity,
     ExecutionCostSpec,
     FeatureContractIdentity,
     ParameterKind,
+    ResearchExperimentIdentity,
     ResearchJobType,
     ResearchParameter,
     ResearchRunParameters,
     ResearchRunSpec,
     ResourceClass,
+    StrategyExecutionIdentity,
 )
+from rquant.runtime_contracts import canonical_sha256
 
 
 def _parameters(*arguments: ResearchParameter) -> ResearchRunParameters:
@@ -56,6 +60,63 @@ def _costs() -> ExecutionCostSpec:
         stamp_duty_bps=Decimal("5"),
         transfer_fee_bps=Decimal("0.1"),
         slippage_bps=Decimal("3"),
+    )
+
+
+def _strategy_execution_identity() -> StrategyExecutionIdentity:
+    return StrategyExecutionIdentity(
+        strategy_id="n_shape",
+        strategy_version=1,
+        adapter_id="nshape-compare",
+        adapter_version="1",
+        strategy_spec_fingerprint="2" * 64,
+        strategy_definition_fingerprint="3" * 64,
+        strategy_executable_fingerprint="4" * 64,
+        candidate_schema_fingerprint="5" * 64,
+        definition_registration_record_hash="6" * 64,
+        definition_registered_at=datetime(2026, 7, 20, tzinfo=UTC),
+        definition_available_at=datetime(2026, 7, 20, tzinfo=UTC),
+        producer_code_commit="1" * 40,
+    )
+
+
+def _experiment_identity() -> ResearchExperimentIdentity:
+    parameters = _parameters(
+        ResearchParameter(name="hold_days", kind=ParameterKind.INTEGER, value=3),
+        ResearchParameter(
+            name="vp_risk_only",
+            kind=ParameterKind.BOOLEAN,
+            value=True,
+        ),
+    )
+    execution_model = {
+        "contract": "lab-adapter-execution/v1",
+        "adapter_id": "nshape-compare",
+        "adapter_version": "1",
+        "feature_contract": _feature_contract(),
+    }
+    spec = ExperimentSpec(
+        strategy_spec_fingerprint="2" * 64,
+        strategy_executable_fingerprint="4" * 64,
+        candidate_schema_fingerprint="5" * 64,
+        dataset_snapshot_id="a" * 64,
+        code_commit="1" * 40,
+        parameter_fingerprint=canonical_sha256(parameters),
+        hypothesis_family="n-shape-hold-days",
+        metric_definition_fingerprint="8" * 64,
+        train_range=DateRange(start_date=date(2025, 1, 1), end_date=date(2025, 6, 30)),
+        validation_range=DateRange(start_date=date(2025, 7, 1), end_date=date(2025, 12, 31)),
+        frozen_outer_test_range=DateRange(start_date=date(2026, 1, 1), end_date=date(2026, 3, 31)),
+        cost_model_fingerprint=canonical_sha256(_costs()),
+        execution_model_fingerprint=canonical_sha256(execution_model),
+        seed=20260724,
+    )
+    assert spec.experiment_id is not None
+    return ResearchExperimentIdentity(
+        spec=spec,
+        experiment_id=spec.experiment_id,
+        hypothesis_family="n-shape-hold-days",
+        hypothesis_variant="hold-3",
     )
 
 
@@ -135,6 +196,70 @@ def test_valid_spec_freezes_reproducibility_inputs() -> None:
         spec.random_seed = 7  # type: ignore[misc]
 
 
+def test_v3_requires_first_class_strategy_and_experiment_identity() -> None:
+    values = _spec().model_dump(mode="python", round_trip=True)
+    values["schema_version"] = 3
+
+    with pytest.raises(ValidationError, match="strategy_execution"):
+        ResearchRunSpec.model_validate(values)
+
+    values["strategy_execution"] = _strategy_execution_identity()
+    with pytest.raises(ValidationError, match="experiment"):
+        ResearchRunSpec.model_validate(values)
+
+    values["experiment"] = _experiment_identity()
+    spec = ResearchRunSpec.model_validate(values)
+
+    assert spec.schema_version == 3
+    assert spec.strategy_execution == _strategy_execution_identity()
+    assert spec.experiment == _experiment_identity()
+    assert not spec.catalog_owner_eligible
+
+    current_experiment = ResearchExperimentIdentity.model_validate(
+        {
+            **_experiment_identity().model_dump(
+                mode="python",
+                exclude={"attempt_identity"},
+            ),
+            "schema_version": 2,
+            "formal_plan_id": "9" * 64,
+        }
+    )
+    values["experiment"] = current_experiment
+    current = ResearchRunSpec.model_validate(values)
+
+    assert current.catalog_owner_eligible
+
+
+def test_legacy_run_specs_are_never_catalog_owners() -> None:
+    assert not _spec().catalog_owner_eligible
+    assert not _v1_spec().catalog_owner_eligible
+
+
+def test_v3_strategy_execution_identity_must_match_run_and_code() -> None:
+    values = _spec().model_dump(mode="python", round_trip=True)
+    wrong_strategy = _strategy_execution_identity().model_dump(
+        mode="python", exclude={"identity_hash"}
+    )
+    wrong_strategy["strategy_id"] = "auction_gap"
+    values.update(
+        schema_version=3,
+        strategy_execution=wrong_strategy,
+        experiment=_experiment_identity(),
+    )
+
+    with pytest.raises(ValidationError, match="strategy_id"):
+        ResearchRunSpec.model_validate(values)
+
+    wrong_commit = _strategy_execution_identity().model_dump(
+        mode="python", exclude={"identity_hash"}
+    )
+    wrong_commit["producer_code_commit"] = "9" * 40
+    values["strategy_execution"] = wrong_commit
+    with pytest.raises(ValidationError, match="producer_code_commit"):
+        ResearchRunSpec.model_validate(values)
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
@@ -158,12 +283,12 @@ def test_spec_rejects_invalid_contract_values(
 
 @pytest.mark.parametrize(
     "schema_version",
-    [0, 3, True, False, 1.0, 2.0, Decimal("1"), Decimal("2"), "1", "2"],
+    [0, 4, True, False, 1.0, 2.0, Decimal("1"), Decimal("2"), "1", "2"],
 )
 def test_schema_version_requires_exact_supported_integer(schema_version: object) -> None:
     with pytest.raises(
         ValidationError,
-        match="schema_version must be integer 1 or 2",
+        match="schema_version must be integer 1, 2, or 3",
     ):
         _spec(schema_version=schema_version)
 
@@ -419,7 +544,7 @@ def test_model_construct_revalidation_rejects_noninteger_schema_version(
 
     with pytest.raises(
         ValidationError,
-        match="schema_version must be integer 1 or 2",
+        match="schema_version must be integer 1, 2, or 3",
     ):
         ResearchRunSpec.model_validate(unsafe)
 

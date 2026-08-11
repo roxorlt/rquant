@@ -6,7 +6,6 @@ import os
 import subprocess
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -53,13 +52,6 @@ fi
 """,
     )
     _write_executable(
-        project / "scripts" / "sync-readonly-replica.sh",
-        """#!/usr/bin/env bash
-printf 'sync\\n' >> "${RUNNER_CALLS}"
-exit "${RUNNER_SYNC_EXIT:-0}"
-""",
-    )
-    _write_executable(
         project / ".venv" / "bin" / "rquant",
         """#!/usr/bin/env bash
 printf '%s\\n' "$*" >> "${RUNNER_CALLS}"
@@ -93,7 +85,7 @@ printf 'sleep %s\\n' "${1:-}" >> "${RUNNER_CALLS}"
     return script, env, calls
 
 
-def test_runner_refreshes_replica_and_checks_readiness_before_ingest(
+def test_runner_only_checks_required_replica_readiness_before_ingest(
     tmp_path: Path,
 ) -> None:
     script, env, calls = _prepare_runner(tmp_path)
@@ -107,10 +99,19 @@ def test_runner_refreshes_replica_and_checks_readiness_before_ingest(
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert calls.read_text(encoding="utf-8").splitlines() == [
-        "sync",
         "research-ingest-readiness --date 2026-07-17",
         "research-ingest --date 2026-07-17 --scheduled",
     ]
+
+
+def test_runner_has_no_replica_sync_or_arbiter_path_override() -> None:
+    content = (ROOT / "scripts/run-research-ingest-daily.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "sync-readonly-replica.sh" not in content
+    assert "RQUANT_WORKLOAD_ARBITER" not in content
+    assert "--research-phase" not in content
 
 
 def test_runner_rejects_daily_that_did_not_finish_today(tmp_path: Path) -> None:
@@ -129,21 +130,10 @@ def test_runner_rejects_daily_that_did_not_finish_today(tmp_path: Path) -> None:
     assert "did not complete successfully today" in result.stderr
 
 
-def test_runner_normalizes_replica_or_readiness_failure_to_retryable_one(
+def test_runner_normalizes_readiness_failure_to_retryable_one(
     tmp_path: Path,
 ) -> None:
     script, env, calls = _prepare_runner(tmp_path)
-    env["RUNNER_SYNC_EXIT"] = "2"
-
-    sync_failure = subprocess.run(
-        [str(script)], capture_output=True, text=True, env=env
-    )
-
-    assert sync_failure.returncode == 1
-    assert calls.read_text(encoding="utf-8").splitlines() == ["sync"]
-
-    calls.unlink()
-    env["RUNNER_SYNC_EXIT"] = "0"
     env["RUNNER_READINESS_EXIT"] = "1"
     readiness_failure = subprocess.run(
         [str(script)], capture_output=True, text=True, env=env
@@ -151,7 +141,6 @@ def test_runner_normalizes_replica_or_readiness_failure_to_retryable_one(
 
     assert readiness_failure.returncode == 1
     assert calls.read_text(encoding="utf-8").splitlines() == [
-        "sync",
         "research-ingest-readiness --date 2026-07-17",
     ]
 

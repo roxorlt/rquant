@@ -13,12 +13,14 @@ from uuid import UUID, uuid4
 import pytest
 from pydantic import ValidationError
 
+import rquant.lab_shard_protocol as shard_protocol
 from rquant.lab_job_protocol import InvalidCommandEnvelopeError, RequestContentConflictError
 from rquant.lab_result_digest import (
     CURRENT_CONTENT_DIGEST_ALGORITHM,
     CURRENT_RESULT_MANIFEST_SCHEMA_VERSION,
 )
 from rquant.lab_shard_protocol import (
+    MAX_STRATEGY_SHARD_PAYLOAD_BYTES,
     LabAdmittedExecution,
     LabClaimDeliveryReceipt,
     LabClaimNotConsumedError,
@@ -38,6 +40,7 @@ from rquant.lab_shard_protocol import (
     LabShardWorkPlan,
     LabWorkerReport,
     LabWorkerStopped,
+    parse_strategy_shard_payload,
 )
 from rquant.strict_json import canonical_model_json_bytes
 
@@ -122,6 +125,97 @@ def test_definition_has_deterministic_identity_and_canonical_payload() -> None:
     assert first.shard_id == second.shard_id
     assert first.payload_hash == second.payload_hash
     assert _definition(index=1).shard_id != first.shard_id
+
+
+def test_shard_payload_rejects_oversize_utf8_before_json_parsing() -> None:
+    payload = '{"text":"' + ("x" * MAX_STRATEGY_SHARD_PAYLOAD_BYTES) + '"}'
+
+    with pytest.raises(ValueError, match="size_bytes=.*reason=payload_too_large"):
+        _definition(payload_json=payload)
+
+
+def test_public_payload_parser_enforces_utf8_bound_before_json_parsing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = {
+        "adapter_id": "adapter",
+        "adapter_version": "v1",
+        "network": "none",
+        "payload_json": '{"x":""}',
+        "schema_version": 1,
+    }
+    initial = json.dumps(base, separators=(",", ":"))
+    padding = MAX_STRATEGY_SHARD_PAYLOAD_BYTES - len(initial.encode("utf-8"))
+    exact = json.dumps(
+        base | {"payload_json": '{"x":"' + ("x" * padding) + '"}'},
+        separators=(",", ":"),
+    )
+    assert len(exact.encode("utf-8")) == MAX_STRATEGY_SHARD_PAYLOAD_BYTES
+    assert parse_strategy_shard_payload(exact.encode("utf-8")).schema_version == 1
+
+    calls = 0
+    decodes = 0
+    encodes = 0
+    length_checks = 0
+    original_loads = shard_protocol.strict_json_loads
+
+    class _ShortBytes(bytes):
+        def __len__(self) -> int:
+            nonlocal length_checks
+            length_checks += 1
+            return 0
+
+        def decode(self, *args: object, **kwargs: object) -> str:
+            nonlocal decodes
+            decodes += 1
+            return super().decode(*args, **kwargs)
+
+    class _ShortStr(str):
+        def __len__(self) -> int:
+            nonlocal length_checks
+            length_checks += 1
+            return 0
+
+        def encode(self, *args: object, **kwargs: object) -> bytes:
+            nonlocal encodes
+            encodes += 1
+            return super().encode(*args, **kwargs)
+
+    def counted_loads(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        return original_loads(*args, **kwargs)
+
+    monkeypatch.setattr(shard_protocol, "strict_json_loads", counted_loads)
+    with pytest.raises(ValueError, match="size_bytes=.*sha256=.*reason=payload_too_large"):
+        parse_strategy_shard_payload((exact + " ").encode("utf-8"))
+    assert calls == 0
+
+    with pytest.raises(ValueError, match="payload_type_invalid"):
+        parse_strategy_shard_payload(_ShortBytes((exact + " ").encode("utf-8")))
+    assert decodes == 0
+    assert length_checks == 0
+    assert calls == 0
+
+    with pytest.raises(ValueError, match="payload_type_invalid"):
+        parse_strategy_shard_payload(_ShortStr('{"schema_version":1}'))
+    assert encodes == 0
+    assert length_checks == 0
+    assert calls == 0
+
+    for non_contract_input in (
+        bytearray(b'{"schema_version":1}'),
+        memoryview(b'{"schema_version":1}'),
+    ):
+        with pytest.raises(ValueError, match="payload_type_invalid"):
+            parse_strategy_shard_payload(non_contract_input)  # type: ignore[arg-type]
+    assert calls == 0
+
+    bounded_invalid_utf8 = b"\xff"
+    with pytest.raises(ValueError, match="payload_utf8_invalid"):
+        parse_strategy_shard_payload(bounded_invalid_utf8)
+    assert decodes == 0
+    assert calls == 0
 
 
 def test_definition_roundtrips_typed_work_plan_and_legacy_definition_stays_optional() -> None:

@@ -23,6 +23,7 @@ from rquant.strategy_candidate_snapshot import (
     StrategyCandidateSnapshotIntegrityError,
     StrategyCandidateSnapshotPointer,
     StrategyCandidateSnapshotSpool,
+    strategy_candidate_schema_fingerprint,
     strategy_candidate_snapshot_content_sha256,
 )
 
@@ -33,6 +34,166 @@ TRADE_DATE = date(2026, 7, 31)
 DECISION_AT = datetime(2026, 7, 31, 1, 25, tzinfo=UTC)
 AVAILABLE_AT = datetime(2026, 7, 31, 1, 27, tzinfo=UTC)
 CAPTURED_AT = datetime(2026, 7, 31, 1, 28, tzinfo=UTC)
+DEFINITION_FINGERPRINT = "4" * 64
+EXECUTABLE_FINGERPRINT = "5" * 64
+STATIC_FEATURE_SCHEMA = {
+    "nested": {"dtype": "object", "semantic": "candidate source metadata"},
+    "pool": {"dtype": "string", "semantic": "candidate pool at publication"},
+    "t_close": {"dtype": "number", "semantic": "reference close in raw price basis"},
+}
+
+
+def _candidate_schema_fingerprint(
+    *,
+    strategy_id: str = "n_shape",
+    strategy_version: str = "1",
+    static_feature_schema: dict[str, dict[str, str]] = STATIC_FEATURE_SCHEMA,
+) -> str:
+    return strategy_candidate_schema_fingerprint(
+        strategy_id=strategy_id,
+        strategy_version=strategy_version,
+        static_feature_schema=static_feature_schema,
+    )
+
+
+CANDIDATE_SCHEMA_FINGERPRINT = _candidate_schema_fingerprint()
+
+
+@pytest.mark.parametrize("strategy_version", ("01", "0", "+1", "-1", "", " 1"))
+def test_candidate_schema_fingerprint_rejects_noncanonical_strategy_version(
+    strategy_version: str,
+) -> None:
+    with pytest.raises(ValueError, match="strategy_version.*canonical positive integer"):
+        strategy_candidate_schema_fingerprint(
+            strategy_id="n_shape",
+            strategy_version=strategy_version,
+            static_feature_schema={
+                "pool": {"dtype": "string", "semantic": "candidate pool"},
+            },
+        )
+
+
+def _build_strategy_snapshot_with_static_value(
+    *,
+    dtype: str,
+    value: object,
+) -> StrategyCandidateSnapshot:
+    schema = {"value": {"dtype": dtype, "semantic": "contract test value"}}
+    schema_fingerprint = strategy_candidate_schema_fingerprint(
+        strategy_id="n_shape",
+        strategy_version="1",
+        static_feature_schema=schema,
+    )
+    binding = StrategyCandidateAuthorityBinding.create(
+        strategy_id="n_shape",
+        strategy_version="1",
+        definition_fingerprint=DEFINITION_FINGERPRINT,
+        executable_fingerprint=EXECUTABLE_FINGERPRINT,
+        candidate_schema_fingerprint=schema_fingerprint,
+        static_feature_schema=schema,
+    )
+    row = _row().model_copy(update={"strategy_version": "1", "static_features": {"value": value}})
+    return StrategyCandidateSnapshot.build_strategy(
+        sequence=0,
+        trade_date=TRADE_DATE,
+        captured_at=CAPTURED_AT,
+        producer_commit=COMMIT_A,
+        authority_binding=binding,
+        source_snapshot_ids={"candidate_source": HASH_A},
+        rows=(row,),
+    )
+
+
+@pytest.mark.parametrize("dtype", ("float64", "json", "boolean", "NUMBER"))
+def test_candidate_schema_rejects_noncanonical_static_dtype(dtype: str) -> None:
+    with pytest.raises(ValueError, match="canonical static feature dtype"):
+        strategy_candidate_schema_fingerprint(
+            strategy_id="n_shape",
+            strategy_version="1",
+            static_feature_schema={
+                "value": {"dtype": dtype, "semantic": "contract test value"},
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    ("dtype", "value"),
+    (
+        ("number", True),
+        ("number", float("inf")),
+        ("integer", True),
+        ("integer", 1.5),
+        ("string", 1),
+        ("bool", 1),
+        ("object", []),
+        ("array", {}),
+        ("null", ""),
+    ),
+)
+def test_strategy_snapshot_rejects_static_value_outside_declared_dtype(
+    dtype: str,
+    value: object,
+) -> None:
+    with pytest.raises(ValueError, match="static feature.*dtype"):
+        _build_strategy_snapshot_with_static_value(dtype=dtype, value=value)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "value"),
+    (
+        ("number", 1.5),
+        ("number", 1),
+        ("integer", 1),
+        ("string", "pool1"),
+        ("bool", True),
+        ("object", {"level": 1}),
+        ("array", [1, "two"]),
+        ("null", None),
+    ),
+)
+def test_strategy_snapshot_accepts_exact_canonical_static_dtype(
+    dtype: str,
+    value: object,
+) -> None:
+    snapshot = _build_strategy_snapshot_with_static_value(dtype=dtype, value=value)
+
+    assert snapshot.rows[0].static_features["value"] is not None or dtype == "null"
+
+
+def test_legacy_publication_is_only_available_through_migration_namespace(
+    tmp_path: Path,
+) -> None:
+    spool = StrategyCandidateSnapshotSpool((tmp_path / "legacy-migration").resolve())
+
+    assert not hasattr(spool, "publish")
+    assert not hasattr(spool, "publish_records")
+    result = spool.publish_legacy_records_for_migration(
+        trade_date=TRADE_DATE,
+        captured_at=CAPTURED_AT,
+        producer_commit=COMMIT_A,
+        rows=(_row(),),
+    )
+
+    assert result.snapshot.schema_version == 2
+
+
+def _read_binding(
+    spool: StrategyCandidateSnapshotSpool,
+    *,
+    strategy_id: str = "n_shape",
+    strategy_version: str = "1",
+) -> StrategyCandidateAuthorityBinding:
+    return spool.read_authority_binding(
+        strategy_id=strategy_id,
+        strategy_version=strategy_version,
+        definition_fingerprint=DEFINITION_FINGERPRINT,
+        executable_fingerprint=EXECUTABLE_FINGERPRINT,
+        candidate_schema_fingerprint=_candidate_schema_fingerprint(
+            strategy_id=strategy_id,
+            strategy_version=strategy_version,
+        ),
+        static_feature_schema=STATIC_FEATURE_SCHEMA,
+    )
 
 
 def _row(
@@ -49,7 +210,7 @@ def _row(
 ) -> StrategyCandidateRecord:
     return StrategyCandidateRecord(
         strategy_id="n_shape",
-        strategy_version="b-v1",
+        strategy_version="1",
         candidate_id=candidate_id,
         variant=variant,
         decision_at=decision_at,
@@ -153,7 +314,7 @@ def _publish_records_worker(
                 blocked_create
             )
 
-        result = StrategyCandidateSnapshotSpool(Path(root)).publish_records(
+        result = StrategyCandidateSnapshotSpool(Path(root)).publish_legacy_records_for_migration(
             trade_date=TRADE_DATE,
             captured_at=captured_at,
             producer_commit=COMMIT_A,
@@ -238,6 +399,13 @@ def _publish_strategy_records_worker(
         result = StrategyCandidateSnapshotSpool(Path(root)).publish_strategy_records(
             strategy_id=strategy_id,
             strategy_version="1",
+            definition_fingerprint=DEFINITION_FINGERPRINT,
+            executable_fingerprint=EXECUTABLE_FINGERPRINT,
+            candidate_schema_fingerprint=_candidate_schema_fingerprint(
+                strategy_id=strategy_id,
+                strategy_version="1",
+            ),
+            static_feature_schema=STATIC_FEATURE_SCHEMA,
             source_snapshot_ids={"candidate_input": HASH_A},
             trade_date=TRADE_DATE,
             captured_at=captured_at,
@@ -344,7 +512,7 @@ def _write_legacy_v1_midnight_boundary_authority(
     trade_date = date(2026, 7, 31)
     row_identity = {
         "strategy_id": "n_shape",
-        "strategy_version": "b-v1",
+        "strategy_version": "1",
         "candidate_id": "000001.SZ",
         "variant": "pool1",
         "decision_at": decision_at,
@@ -376,7 +544,7 @@ def _write_legacy_v1_midnight_boundary_authority(
                 "reference_trade_date": "2026-07-31",
                 "static_features": {"score": 0.8},
                 "strategy_id": "n_shape",
-                "strategy_version": "b-v1",
+                "strategy_version": "1",
                 "variant": "pool1",
             }
         ],
@@ -433,7 +601,7 @@ def test_all_cross_layer_contracts_inherit_runtime_contract_model() -> None:
 def test_legacy_v1_generation_reads_and_can_advance_to_v2(tmp_path: Path) -> None:
     spool, legacy_hash = _write_legacy_v1_authority(tmp_path / "legacy")
 
-    legacy = spool.read_as_of(CAPTURED_AT + timedelta(minutes=1))
+    legacy = spool.read_legacy_for_migration(CAPTURED_AT + timedelta(minutes=1))
 
     assert legacy is not None
     assert legacy.schema_version == 1
@@ -451,10 +619,10 @@ def test_legacy_v1_generation_reads_and_can_advance_to_v2(tmp_path: Path) -> Non
             ),
         ),
     )
-    spool.publish(current)
+    spool.publish_legacy_for_migration(current)
 
     assert current.schema_version == 2
-    assert spool.read_as_of(CAPTURED_AT + timedelta(minutes=3)) == current
+    assert spool.read_legacy_for_migration(CAPTURED_AT + timedelta(minutes=3)) == current
 
 
 def test_legacy_v1_generation_tampering_still_fails_closed(tmp_path: Path) -> None:
@@ -464,7 +632,7 @@ def test_legacy_v1_generation_tampering_still_fails_closed(tmp_path: Path) -> No
     )
 
     with pytest.raises(StrategyCandidateSnapshotIntegrityError):
-        spool.read_as_of(CAPTURED_AT + timedelta(minutes=1))
+        spool.read_legacy_for_migration(CAPTURED_AT + timedelta(minutes=1))
 
 
 def test_legacy_v1_generation_must_keep_original_canonical_bytes(tmp_path: Path) -> None:
@@ -475,7 +643,7 @@ def test_legacy_v1_generation_must_keep_original_canonical_bytes(tmp_path: Path)
     generation.chmod(0o600)
 
     with pytest.raises(StrategyCandidateSnapshotIntegrityError, match="canonical"):
-        spool.read_as_of(CAPTURED_AT + timedelta(minutes=1))
+        spool.read_legacy_for_migration(CAPTURED_AT + timedelta(minutes=1))
 
 
 def test_legacy_v1_uses_utc_date_semantics_across_shanghai_midnight(tmp_path: Path) -> None:
@@ -483,7 +651,7 @@ def test_legacy_v1_uses_utc_date_semantics_across_shanghai_midnight(tmp_path: Pa
         _write_legacy_v1_midnight_boundary_authority(tmp_path / "legacy-midnight")
     )
 
-    snapshot = spool.read_as_of(datetime(2026, 7, 31, 16, 33, tzinfo=UTC))
+    snapshot = spool.read_legacy_for_migration(datetime(2026, 7, 31, 16, 33, tzinfo=UTC))
 
     assert snapshot is not None
     assert snapshot.schema_version == 1
@@ -595,7 +763,7 @@ def test_candidate_occurrence_id_is_canonical_and_changes_by_effective_trade_dat
     assert row.occurrence_id == canonical_sha256(
         {
             "strategy_id": "n_shape",
-            "strategy_version": "b-v1",
+            "strategy_version": "1",
             "candidate_id": "000001.SZ",
             "variant": "pool1",
             "effective_trade_date": TRADE_DATE,
@@ -729,10 +897,10 @@ def test_publish_is_atomic_private_immutable_and_idempotent(tmp_path: Path) -> N
     spool = StrategyCandidateSnapshotSpool(root.resolve())
     snapshot = _snapshot()
 
-    first = spool.publish(snapshot)
+    first = spool.publish_legacy_for_migration(snapshot)
     first_generation = spool.generations_root / f"{snapshot.content_sha256}.json"
     generation_bytes = first_generation.read_bytes()
-    second = spool.publish(snapshot)
+    second = spool.publish_legacy_for_migration(snapshot)
 
     assert first == snapshot
     assert second == snapshot
@@ -749,13 +917,13 @@ def test_publish_records_returns_frozen_result_and_suppresses_same_semantics(
 ) -> None:
     spool = StrategyCandidateSnapshotSpool((tmp_path / "spool").resolve())
 
-    first = spool.publish_records(
+    first = spool.publish_legacy_records_for_migration(
         trade_date=TRADE_DATE,
         captured_at=CAPTURED_AT,
         producer_commit=COMMIT_A,
         rows=(_row(),),
     )
-    duplicate = spool.publish_records(
+    duplicate = spool.publish_legacy_records_for_migration(
         trade_date=TRADE_DATE,
         captured_at=CAPTURED_AT + timedelta(seconds=1),
         producer_commit=COMMIT_A,
@@ -791,29 +959,54 @@ def test_publish_strategy_records_persists_and_enforces_root_identity(tmp_path: 
 
     result = spool.publish_strategy_records(
         strategy_id="n_shape",
-        strategy_version="b-v1",
+        strategy_version="1",
+        definition_fingerprint=DEFINITION_FINGERPRINT,
+        executable_fingerprint=EXECUTABLE_FINGERPRINT,
+        candidate_schema_fingerprint=CANDIDATE_SCHEMA_FINGERPRINT,
+        static_feature_schema=STATIC_FEATURE_SCHEMA,
         source_snapshot_ids={"candidate_input": "3" * 64},
         trade_date=TRADE_DATE,
         captured_at=CAPTURED_AT,
         producer_commit=COMMIT_A,
         rows=(_row(),),
     )
-    binding = spool.read_authority_binding()
+    binding = _read_binding(spool)
     before = _tree_state(root)
 
     assert result.published is True
     assert binding == StrategyCandidateAuthorityBinding.create(
         strategy_id="n_shape",
-        strategy_version="b-v1",
+        strategy_version="1",
+        definition_fingerprint=DEFINITION_FINGERPRINT,
+        executable_fingerprint=EXECUTABLE_FINGERPRINT,
+        candidate_schema_fingerprint=CANDIDATE_SCHEMA_FINGERPRINT,
+        static_feature_schema=STATIC_FEATURE_SCHEMA,
     )
     assert binding.content_sha256 == canonical_sha256(
         binding.model_dump(mode="python", exclude={"content_sha256"})
     )
+    assert set(json.loads((root / "authority.json").read_text())) == {
+        "schema_version",
+        "strategy_id",
+        "strategy_version",
+        "definition_fingerprint",
+        "executable_fingerprint",
+        "candidate_schema_fingerprint",
+        "static_feature_names",
+        "static_feature_schema",
+        "content_sha256",
+    }
     assert stat.S_IMODE((root / "authority.json").stat().st_mode) == 0o600
     with pytest.raises(StrategyCandidateSnapshotIntegrityError, match="identity|bound"):
         spool.publish_strategy_records(
             strategy_id="growth_board_surge",
-            strategy_version="b-v1",
+            strategy_version="1",
+            definition_fingerprint=DEFINITION_FINGERPRINT,
+            executable_fingerprint=EXECUTABLE_FINGERPRINT,
+            candidate_schema_fingerprint=_candidate_schema_fingerprint(
+                strategy_id="growth_board_surge"
+            ),
+            static_feature_schema=STATIC_FEATURE_SCHEMA,
             source_snapshot_ids={"candidate_input": "3" * 64},
             trade_date=TRADE_DATE,
             captured_at=CAPTURED_AT + timedelta(seconds=1),
@@ -823,9 +1016,150 @@ def test_publish_strategy_records_persists_and_enforces_root_identity(tmp_path: 
     assert _tree_state(root) == before
 
 
+def test_empty_strategy_authority_binds_complete_static_feature_schema(tmp_path: Path) -> None:
+    root = (tmp_path / "empty-schema-bound").resolve()
+    fingerprint = _candidate_schema_fingerprint()
+
+    result = StrategyCandidateSnapshotSpool(root).publish_strategy_records(
+        strategy_id="n_shape",
+        strategy_version="1",
+        definition_fingerprint=DEFINITION_FINGERPRINT,
+        executable_fingerprint=EXECUTABLE_FINGERPRINT,
+        candidate_schema_fingerprint=fingerprint,
+        static_feature_schema=STATIC_FEATURE_SCHEMA,
+        source_snapshot_ids={"candidate_input": "3" * 64},
+        trade_date=TRADE_DATE,
+        captured_at=CAPTURED_AT,
+        producer_commit=COMMIT_A,
+        rows=(),
+    )
+
+    binding = result.snapshot.authority_binding
+    assert binding is not None
+    assert binding.static_feature_names == tuple(sorted(STATIC_FEATURE_SCHEMA))
+    assert {
+        name: semantic.model_dump(mode="json")
+        for name, semantic in binding.static_feature_schema.items()
+    } == STATIC_FEATURE_SCHEMA
+    assert binding.candidate_schema_fingerprint == fingerprint
+
+
+def test_strategy_authority_rejects_schema_fingerprint_not_matching_semantics(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises((ValueError, ValidationError), match="candidate schema fingerprint"):
+        StrategyCandidateSnapshotSpool(
+            (tmp_path / "schema-fingerprint-mismatch").resolve()
+        ).publish_strategy_records(
+            strategy_id="n_shape",
+            strategy_version="1",
+            definition_fingerprint=DEFINITION_FINGERPRINT,
+            executable_fingerprint=EXECUTABLE_FINGERPRINT,
+            candidate_schema_fingerprint="f" * 64,
+            static_feature_schema=STATIC_FEATURE_SCHEMA,
+            source_snapshot_ids={"candidate_input": "3" * 64},
+            trade_date=TRADE_DATE,
+            captured_at=CAPTURED_AT,
+            producer_commit=COMMIT_A,
+            rows=(),
+        )
+
+
+def test_generic_read_rejects_strategy_bound_authority(tmp_path: Path) -> None:
+    spool = StrategyCandidateSnapshotSpool((tmp_path / "bound-generic-read").resolve())
+    fingerprint = _candidate_schema_fingerprint()
+    spool.publish_strategy_records(
+        strategy_id="n_shape",
+        strategy_version="1",
+        definition_fingerprint=DEFINITION_FINGERPRINT,
+        executable_fingerprint=EXECUTABLE_FINGERPRINT,
+        candidate_schema_fingerprint=fingerprint,
+        static_feature_schema=STATIC_FEATURE_SCHEMA,
+        source_snapshot_ids={"candidate_input": "3" * 64},
+        trade_date=TRADE_DATE,
+        captured_at=CAPTURED_AT,
+        producer_commit=COMMIT_A,
+        rows=(_row(),),
+    )
+
+    with pytest.raises(StrategyCandidateSnapshotIntegrityError, match="strategy-aware"):
+        spool.read_as_of(CAPTURED_AT + timedelta(seconds=1))
+
+
+def test_generic_read_rejects_legacy_authority_without_migration_mode(tmp_path: Path) -> None:
+    spool = StrategyCandidateSnapshotSpool((tmp_path / "legacy-generic-read").resolve())
+    spool.publish_legacy_records_for_migration(
+        trade_date=TRADE_DATE,
+        captured_at=CAPTURED_AT,
+        producer_commit=COMMIT_A,
+        rows=(_row(),),
+    )
+
+    with pytest.raises(StrategyCandidateSnapshotIntegrityError, match="migration|republication"):
+        spool.read_as_of(CAPTURED_AT + timedelta(seconds=1))
+
+
+def test_strategy_authority_v3_binds_definition_executable_and_candidate_schema(
+    tmp_path: Path,
+) -> None:
+    root = (tmp_path / "spool-v3").resolve()
+
+    result = StrategyCandidateSnapshotSpool(root).publish_strategy_records(
+        strategy_id="n_shape",
+        strategy_version="1",
+        definition_fingerprint=DEFINITION_FINGERPRINT,
+        executable_fingerprint=EXECUTABLE_FINGERPRINT,
+        candidate_schema_fingerprint=CANDIDATE_SCHEMA_FINGERPRINT,
+        static_feature_schema=STATIC_FEATURE_SCHEMA,
+        source_snapshot_ids={"candidate_input": "3" * 64},
+        trade_date=TRADE_DATE,
+        captured_at=CAPTURED_AT,
+        producer_commit=COMMIT_A,
+        rows=(_row(),),
+    )
+
+    binding = _read_binding(StrategyCandidateSnapshotSpool(root))
+    assert result.snapshot.authority_binding == binding
+    assert binding.schema_version == 3
+    assert binding.definition_fingerprint == DEFINITION_FINGERPRINT
+    assert binding.executable_fingerprint == EXECUTABLE_FINGERPRINT
+    assert binding.candidate_schema_fingerprint == CANDIDATE_SCHEMA_FINGERPRINT
+
+
+def test_strategy_aware_publish_rejects_legacy_unfingerprinted_binding(tmp_path: Path) -> None:
+    with pytest.raises((TypeError, ValueError, ValidationError), match="fingerprint|required"):
+        StrategyCandidateSnapshotSpool(
+            (tmp_path / "legacy-strategy-authority").resolve()
+        ).publish_strategy_records(
+            strategy_id="n_shape",
+            strategy_version="1",
+            source_snapshot_ids={"candidate_input": "3" * 64},
+            trade_date=TRADE_DATE,
+            captured_at=CAPTURED_AT,
+            producer_commit=COMMIT_A,
+            rows=(_row(),),
+        )
+
+
+def test_strategy_authority_rejects_partial_static_semantic_binding(tmp_path: Path) -> None:
+    with pytest.raises((TypeError, ValueError, ValidationError), match="together|fingerprint"):
+        StrategyCandidateSnapshotSpool(
+            (tmp_path / "partial-v2").resolve()
+        ).publish_strategy_records(
+            strategy_id="n_shape",
+            strategy_version="1",
+            definition_fingerprint="4" * 64,
+            source_snapshot_ids={"candidate_input": "3" * 64},
+            trade_date=TRADE_DATE,
+            captured_at=CAPTURED_AT,
+            producer_commit=COMMIT_A,
+            rows=(_row(),),
+        )
+
+
 def test_publish_strategy_records_refuses_to_claim_legacy_generations(tmp_path: Path) -> None:
     spool = StrategyCandidateSnapshotSpool((tmp_path / "spool").resolve())
-    spool.publish_records(
+    spool.publish_legacy_records_for_migration(
         trade_date=TRADE_DATE,
         captured_at=CAPTURED_AT,
         producer_commit=COMMIT_A,
@@ -836,7 +1170,11 @@ def test_publish_strategy_records_refuses_to_claim_legacy_generations(tmp_path: 
     with pytest.raises(StrategyCandidateSnapshotIntegrityError, match="legacy|unbound"):
         spool.publish_strategy_records(
             strategy_id="n_shape",
-            strategy_version="b-v1",
+            strategy_version="1",
+            definition_fingerprint=DEFINITION_FINGERPRINT,
+            executable_fingerprint=EXECUTABLE_FINGERPRINT,
+            candidate_schema_fingerprint=CANDIDATE_SCHEMA_FINGERPRINT,
+            static_feature_schema=STATIC_FEATURE_SCHEMA,
             source_snapshot_ids={"candidate_input": "3" * 64},
             trade_date=TRADE_DATE,
             captured_at=CAPTURED_AT + timedelta(seconds=1),
@@ -853,7 +1191,11 @@ def test_bound_generation_blocks_generic_publish_after_binding_is_deleted(
     spool = StrategyCandidateSnapshotSpool((tmp_path / "spool").resolve())
     first = spool.publish_strategy_records(
         strategy_id="n_shape",
-        strategy_version="b-v1",
+        strategy_version="1",
+        definition_fingerprint=DEFINITION_FINGERPRINT,
+        executable_fingerprint=EXECUTABLE_FINGERPRINT,
+        candidate_schema_fingerprint=CANDIDATE_SCHEMA_FINGERPRINT,
+        static_feature_schema=STATIC_FEATURE_SCHEMA,
         source_snapshot_ids={"candidate_input": "3" * 64},
         trade_date=TRADE_DATE,
         captured_at=CAPTURED_AT,
@@ -864,7 +1206,7 @@ def test_bound_generation_blocks_generic_publish_after_binding_is_deleted(
     before = _tree_state(spool.root)
 
     with pytest.raises(StrategyCandidateSnapshotIntegrityError, match="bound|schema v3"):
-        spool.publish_records(
+        spool.publish_legacy_records_for_migration(
             trade_date=TRADE_DATE,
             captured_at=CAPTURED_AT + timedelta(seconds=1),
             producer_commit=COMMIT_A,
@@ -923,7 +1265,7 @@ def test_publish_records_requires_a_sequence_of_typed_records(
     spool = StrategyCandidateSnapshotSpool(root)
 
     with pytest.raises(TypeError, match=r"Sequence\[StrategyCandidateRecord\]"):
-        spool.publish_records(
+        spool.publish_legacy_records_for_migration(
             trade_date=TRADE_DATE,
             captured_at=CAPTURED_AT,
             producer_commit=COMMIT_A,
@@ -958,7 +1300,7 @@ def test_publish_records_rejects_invalid_request_without_creating_authority(
     arguments.update(changes)
 
     with pytest.raises((TypeError, ValueError, ValidationError)):
-        spool.publish_records(**arguments)  # type: ignore[arg-type]
+        spool.publish_legacy_records_for_migration(**arguments)  # type: ignore[arg-type]
 
     assert not root.exists()
 
@@ -994,14 +1336,14 @@ def test_publish_records_publishes_every_semantic_change(
     rows: tuple[StrategyCandidateRecord, ...],
 ) -> None:
     spool = StrategyCandidateSnapshotSpool((tmp_path / "spool").resolve())
-    initial = spool.publish_records(
+    initial = spool.publish_legacy_records_for_migration(
         trade_date=TRADE_DATE,
         captured_at=CAPTURED_AT,
         producer_commit=COMMIT_A,
         rows=(_row(),),
     )
 
-    changed = spool.publish_records(
+    changed = spool.publish_legacy_records_for_migration(
         trade_date=trade_date,
         captured_at=CAPTURED_AT + timedelta(minutes=1),
         producer_commit=producer_commit,
@@ -1015,7 +1357,7 @@ def test_publish_records_publishes_every_semantic_change(
     assert StrategyCandidateSnapshotPointer.model_validate_json(
         spool.current_path.read_bytes()
     ) == StrategyCandidateSnapshotPointer.from_snapshot(changed.snapshot)
-    assert spool.read_as_of(CAPTURED_AT + timedelta(minutes=2)) == changed.snapshot
+    assert spool.read_legacy_for_migration(CAPTURED_AT + timedelta(minutes=2)) == changed.snapshot
     assert len(list(spool.generations_root.glob("*.json"))) == 2
 
 
@@ -1025,7 +1367,7 @@ def test_publish_records_rejects_backwards_capture_before_semantic_suppression(
     variant: str,
 ) -> None:
     spool = StrategyCandidateSnapshotSpool((tmp_path / "spool").resolve())
-    current = spool.publish_records(
+    current = spool.publish_legacy_records_for_migration(
         trade_date=TRADE_DATE,
         captured_at=CAPTURED_AT + timedelta(minutes=5),
         producer_commit=COMMIT_A,
@@ -1034,7 +1376,7 @@ def test_publish_records_rejects_backwards_capture_before_semantic_suppression(
     before = _tree_state(spool.root)
 
     with pytest.raises(StrategyCandidateSnapshotIntegrityError, match="backwards"):
-        spool.publish_records(
+        spool.publish_legacy_records_for_migration(
             trade_date=TRADE_DATE,
             captured_at=CAPTURED_AT + timedelta(minutes=4),
             producer_commit=COMMIT_A,
@@ -1042,7 +1384,7 @@ def test_publish_records_rejects_backwards_capture_before_semantic_suppression(
         )
 
     assert _tree_state(spool.root) == before
-    assert spool.read_as_of(CAPTURED_AT + timedelta(minutes=6)) == current.snapshot
+    assert spool.read_legacy_for_migration(CAPTURED_AT + timedelta(minutes=6)) == current.snapshot
 
 
 @pytest.mark.parametrize("preinitialized", [False, True], ids=["cold", "initialized"])
@@ -1053,7 +1395,7 @@ def test_concurrent_identical_publish_records_creates_one_generation(
     root = (tmp_path / "spool").resolve()
     spool = StrategyCandidateSnapshotSpool(root)
     if preinitialized:
-        baseline = spool.publish_records(
+        baseline = spool.publish_legacy_records_for_migration(
             trade_date=TRADE_DATE,
             captured_at=CAPTURED_AT - timedelta(minutes=1),
             producer_commit=COMMIT_A,
@@ -1104,7 +1446,7 @@ def test_concurrent_identical_publish_records_creates_one_generation(
     assert {snapshot.sequence for snapshot in snapshots} == {int(preinitialized)}
     assert {snapshot.captured_at for snapshot in snapshots} == {CAPTURED_AT}
     assert len(list(spool.generations_root.glob("*.json"))) == 1 + int(preinitialized)
-    assert spool.read_as_of(CAPTURED_AT + timedelta(seconds=2)) == snapshots[0]
+    assert spool.read_legacy_for_migration(CAPTURED_AT + timedelta(seconds=2)) == snapshots[0]
 
 
 def test_concurrent_different_publish_records_allocate_consecutive_sequences(
@@ -1154,7 +1496,7 @@ def test_concurrent_different_publish_records_allocate_consecutive_sequences(
     assert sorted(snapshot.sequence for snapshot in snapshots) == [0, 1]
     assert len({snapshot.content_sha256 for snapshot in snapshots}) == 2
     assert len(list(spool.generations_root.glob("*.json"))) == 2
-    current = spool.read_as_of(CAPTURED_AT + timedelta(seconds=2))
+    current = spool.read_legacy_for_migration(CAPTURED_AT + timedelta(seconds=2))
     assert current is not None
     assert current.sequence == 1
     assert current.rows[0].variant == "pool2"
@@ -1211,6 +1553,10 @@ def test_concurrent_identical_strategy_publish_creates_one_bound_generation(
             CAPTURED_AT + timedelta(seconds=2),
             strategy_id="n_shape",
             strategy_version="1",
+            definition_fingerprint=DEFINITION_FINGERPRINT,
+            executable_fingerprint=EXECUTABLE_FINGERPRINT,
+            candidate_schema_fingerprint=_candidate_schema_fingerprint(strategy_version="1"),
+            static_feature_schema=STATIC_FEATURE_SCHEMA,
         )
         == snapshots[0]
     )
@@ -1260,7 +1606,10 @@ def test_concurrent_different_strategies_cannot_both_bind_empty_root(tmp_path: P
 
     assert sum(item["error"] is None for item in observed) == 1
     assert any("different identity" in str(item["error"]) for item in observed)
-    binding = StrategyCandidateSnapshotSpool(root).read_authority_binding()
+    binding = _read_binding(
+        StrategyCandidateSnapshotSpool(root),
+        strategy_version="1",
+    )
     assert binding.strategy_id == "n_shape"
     assert len(list((root / "generations").glob("*.json"))) == 1
 
@@ -1284,13 +1633,17 @@ def test_strategy_publish_retries_after_binding_created_before_generation(
         spool.publish_strategy_records(
             strategy_id="n_shape",
             strategy_version="1",
+            definition_fingerprint=DEFINITION_FINGERPRINT,
+            executable_fingerprint=EXECUTABLE_FINGERPRINT,
+            candidate_schema_fingerprint=_candidate_schema_fingerprint(strategy_version="1"),
+            static_feature_schema=STATIC_FEATURE_SCHEMA,
             source_snapshot_ids={"candidate_input": HASH_A},
             trade_date=TRADE_DATE,
             captured_at=CAPTURED_AT,
             producer_commit=COMMIT_A,
             rows=(),
         )
-    assert spool.read_authority_binding().strategy_id == "n_shape"
+    assert _read_binding(spool, strategy_version="1").strategy_id == "n_shape"
     assert list(spool.generations_root.glob("*.json")) == []
     monkeypatch.setattr(
         StrategyCandidateSnapshotSpool,
@@ -1301,6 +1654,10 @@ def test_strategy_publish_retries_after_binding_created_before_generation(
     recovered = spool.publish_strategy_records(
         strategy_id="n_shape",
         strategy_version="1",
+        definition_fingerprint=DEFINITION_FINGERPRINT,
+        executable_fingerprint=EXECUTABLE_FINGERPRINT,
+        candidate_schema_fingerprint=_candidate_schema_fingerprint(strategy_version="1"),
+        static_feature_schema=STATIC_FEATURE_SCHEMA,
         source_snapshot_ids={"candidate_input": HASH_A},
         trade_date=TRADE_DATE,
         captured_at=CAPTURED_AT + timedelta(seconds=1),
@@ -1333,6 +1690,10 @@ def test_strategy_publish_recovers_generation_before_pointer_without_lineage_dri
         spool.publish_strategy_records(
             strategy_id="n_shape",
             strategy_version="1",
+            definition_fingerprint=DEFINITION_FINGERPRINT,
+            executable_fingerprint=EXECUTABLE_FINGERPRINT,
+            candidate_schema_fingerprint=_candidate_schema_fingerprint(strategy_version="1"),
+            static_feature_schema=STATIC_FEATURE_SCHEMA,
             source_snapshot_ids={"candidate_input": HASH_A},
             trade_date=TRADE_DATE,
             captured_at=CAPTURED_AT,
@@ -1348,6 +1709,10 @@ def test_strategy_publish_recovers_generation_before_pointer_without_lineage_dri
     recovered = spool.publish_strategy_records(
         strategy_id="n_shape",
         strategy_version="1",
+        definition_fingerprint=DEFINITION_FINGERPRINT,
+        executable_fingerprint=EXECUTABLE_FINGERPRINT,
+        candidate_schema_fingerprint=_candidate_schema_fingerprint(strategy_version="1"),
+        static_feature_schema=STATIC_FEATURE_SCHEMA,
         source_snapshot_ids={"candidate_input": HASH_A},
         trade_date=TRADE_DATE,
         captured_at=CAPTURED_AT + timedelta(seconds=1),
@@ -1358,7 +1723,7 @@ def test_strategy_publish_recovers_generation_before_pointer_without_lineage_dri
     assert recovered.published is True
     assert recovered.snapshot.sequence == 0
     assert recovered.snapshot.captured_at == CAPTURED_AT
-    assert recovered.snapshot.authority_binding == spool.read_authority_binding()
+    assert recovered.snapshot.authority_binding == _read_binding(spool, strategy_version="1")
     assert recovered.snapshot.source_snapshot_ids == {"candidate_input": HASH_A}
     assert len(list(spool.generations_root.glob("*.json"))) == 1
     assert (
@@ -1366,6 +1731,10 @@ def test_strategy_publish_recovers_generation_before_pointer_without_lineage_dri
             CAPTURED_AT + timedelta(seconds=2),
             strategy_id="n_shape",
             strategy_version="1",
+            definition_fingerprint=DEFINITION_FINGERPRINT,
+            executable_fingerprint=EXECUTABLE_FINGERPRINT,
+            candidate_schema_fingerprint=_candidate_schema_fingerprint(strategy_version="1"),
+            static_feature_schema=STATIC_FEATURE_SCHEMA,
         )
         == recovered.snapshot
     )
@@ -1381,7 +1750,7 @@ def test_publish_records_recovers_generation_linked_before_pointer_switch(
     variant = "pool1"
     captured_at = CAPTURED_AT
     if preinitialized:
-        baseline = spool.publish_records(
+        baseline = spool.publish_legacy_records_for_migration(
             trade_date=TRADE_DATE,
             captured_at=CAPTURED_AT - timedelta(minutes=1),
             producer_commit=COMMIT_A,
@@ -1401,7 +1770,7 @@ def test_publish_records_recovers_generation_linked_before_pointer_switch(
         classmethod(fail_pointer_switch),
     )
     with pytest.raises(RuntimeError, match="pointer interruption"):
-        spool.publish_records(
+        spool.publish_legacy_records_for_migration(
             trade_date=TRADE_DATE,
             captured_at=captured_at,
             producer_commit=COMMIT_A,
@@ -1413,7 +1782,7 @@ def test_publish_records_recovers_generation_linked_before_pointer_switch(
         original_replace,
     )
 
-    recovered = spool.publish_records(
+    recovered = spool.publish_legacy_records_for_migration(
         trade_date=TRADE_DATE,
         captured_at=captured_at + timedelta(seconds=1),
         producer_commit=COMMIT_A,
@@ -1424,7 +1793,7 @@ def test_publish_records_recovers_generation_linked_before_pointer_switch(
     assert recovered.snapshot.sequence == int(preinitialized)
     assert recovered.snapshot.captured_at == captured_at
     assert len(list(spool.generations_root.glob("*.json"))) == 1 + int(preinitialized)
-    assert spool.read_as_of(captured_at + timedelta(seconds=2)) == recovered.snapshot
+    assert spool.read_legacy_for_migration(captured_at + timedelta(seconds=2)) == recovered.snapshot
 
 
 def test_constructor_and_failed_read_do_not_create_or_modify_authority(tmp_path: Path) -> None:
@@ -1435,18 +1804,18 @@ def test_constructor_and_failed_read_do_not_create_or_modify_authority(tmp_path:
 
     assert _tree_state(tmp_path) == before
     with pytest.raises(StrategyCandidateSnapshotIntegrityError, match="missing"):
-        spool.read_as_of(CAPTURED_AT)
+        spool.read_legacy_for_migration(CAPTURED_AT)
     assert _tree_state(tmp_path) == before
 
 
 def test_publish_rejects_sequence_conflict_and_rollback(tmp_path: Path) -> None:
     spool = StrategyCandidateSnapshotSpool((tmp_path / "spool").resolve())
-    spool.publish(_snapshot(sequence=0))
+    spool.publish_legacy_for_migration(_snapshot(sequence=0))
 
     with pytest.raises(StrategyCandidateSnapshotIntegrityError, match="sequence"):
-        spool.publish(_snapshot(sequence=0, rows=(_row(variant="pool2"),)))
+        spool.publish_legacy_for_migration(_snapshot(sequence=0, rows=(_row(variant="pool2"),)))
     with pytest.raises(StrategyCandidateSnapshotIntegrityError, match="next sequence"):
-        spool.publish(_snapshot(sequence=2, rows=(_row(variant="pool2"),)))
+        spool.publish_legacy_for_migration(_snapshot(sequence=2, rows=(_row(variant="pool2"),)))
 
 
 def test_as_of_falls_back_from_future_current_to_latest_visible_generation(
@@ -1465,24 +1834,24 @@ def test_as_of_falls_back_from_future_current_to_latest_visible_generation(
             ),
         ),
     )
-    spool.publish(old)
-    spool.publish(future)
+    spool.publish_legacy_for_migration(old)
+    spool.publish_legacy_for_migration(future)
 
-    observed = spool.read_as_of(CAPTURED_AT + timedelta(minutes=1))
+    observed = spool.read_legacy_for_migration(CAPTURED_AT + timedelta(minutes=1))
 
     assert observed == old
     assert observed is not None
     assert observed.rows[0].variant == "pool1"
-    assert spool.read_as_of(CAPTURED_AT - timedelta(seconds=1)) is None
-    assert spool.read_as_of(CAPTURED_AT + timedelta(minutes=6)) == future
+    assert spool.read_legacy_for_migration(CAPTURED_AT - timedelta(seconds=1)) is None
+    assert spool.read_legacy_for_migration(CAPTURED_AT + timedelta(minutes=6)) == future
 
 
 def test_read_as_of_does_not_write_or_repair_any_file(tmp_path: Path) -> None:
     spool = StrategyCandidateSnapshotSpool((tmp_path / "spool").resolve())
-    spool.publish(_snapshot())
+    spool.publish_legacy_for_migration(_snapshot())
     before = _tree_state(spool.root)
 
-    assert spool.read_as_of(CAPTURED_AT + timedelta(minutes=1)) is not None
+    assert spool.read_legacy_for_migration(CAPTURED_AT + timedelta(minutes=1)) is not None
 
     assert _tree_state(spool.root) == before
 
@@ -1490,11 +1859,11 @@ def test_read_as_of_does_not_write_or_repair_any_file(tmp_path: Path) -> None:
 def test_new_reader_lifecycle_does_not_write(tmp_path: Path) -> None:
     root = (tmp_path / "spool").resolve()
     writer = StrategyCandidateSnapshotSpool(root)
-    writer.publish(_snapshot())
+    writer.publish_legacy_for_migration(_snapshot())
     before = _tree_state(root)
 
     reader = StrategyCandidateSnapshotSpool(root)
-    assert reader.read_as_of(CAPTURED_AT + timedelta(minutes=1)) is not None
+    assert reader.read_legacy_for_migration(CAPTURED_AT + timedelta(minutes=1)) is not None
 
     assert _tree_state(root) == before
 
@@ -1505,7 +1874,7 @@ def test_repeated_reads_cache_validated_immutable_generations(
 ) -> None:
     root = (tmp_path / "spool").resolve()
     writer = StrategyCandidateSnapshotSpool(root)
-    writer.publish(_snapshot(sequence=0))
+    writer.publish_legacy_for_migration(_snapshot(sequence=0))
     reader = StrategyCandidateSnapshotSpool(root)
     original = reader._read_snapshot
     read_names: list[str] = []
@@ -1515,12 +1884,12 @@ def test_repeated_reads_cache_validated_immutable_generations(
         return original(parent_fd, name)
 
     monkeypatch.setattr(reader, "_read_snapshot", counting_read)
-    reader.read_as_of(CAPTURED_AT + timedelta(minutes=1))
-    reader.read_as_of(CAPTURED_AT + timedelta(minutes=1))
+    reader.read_legacy_for_migration(CAPTURED_AT + timedelta(minutes=1))
+    reader.read_legacy_for_migration(CAPTURED_AT + timedelta(minutes=1))
 
     assert len(read_names) == 1
 
-    writer.publish(
+    writer.publish_legacy_for_migration(
         _snapshot(
             sequence=1,
             captured_at=CAPTURED_AT + timedelta(minutes=2),
@@ -1533,9 +1902,92 @@ def test_repeated_reads_cache_validated_immutable_generations(
             ),
         )
     )
-    reader.read_as_of(CAPTURED_AT + timedelta(minutes=3))
+    reader.read_legacy_for_migration(CAPTURED_AT + timedelta(minutes=3))
 
     assert len(read_names) == 2
+
+
+def test_as_of_uses_bounded_index_and_cache_for_4096_sparse_large_generations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = (tmp_path / "large-history").resolve()
+    spool = StrategyCandidateSnapshotSpool(root)
+    spool.publish_legacy_for_migration(_snapshot())
+    for generation in spool.generations_root.glob("*.json"):
+        generation.unlink()
+    spool.current_path.unlink()
+    index_path = root / "generation-index.json"
+    if index_path.exists():
+        index_path.unlink()
+
+    large_blob = "x" * (16 * 1024 * 1024 - 4096)
+    target = _snapshot(
+        sequence=4095,
+        rows=(_row(static_features={"blob": large_blob}),),
+    )
+    target_name = f"{target.content_sha256}.json"
+    target_payload = _canonical_bytes(target)
+    entries: list[dict[str, object]] = []
+    for sequence in range(4096):
+        generation_sha256 = (
+            target.content_sha256
+            if sequence == target.sequence
+            else canonical_sha256({"large-history-sequence": sequence})
+        )
+        name = f"{generation_sha256}.json"
+        path = spool.generations_root / name
+        if sequence == target.sequence:
+            path.write_bytes(target_payload)
+        else:
+            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                os.ftruncate(descriptor, 16 * 1024 * 1024)
+            finally:
+                os.close(descriptor)
+        path.chmod(0o600)
+        entries.append(
+            {
+                "sequence": sequence,
+                "generation_sha256": generation_sha256,
+                "schema_version": 2,
+                "trade_date": TRADE_DATE.isoformat(),
+                "captured_at": CAPTURED_AT.isoformat().replace("+00:00", "Z"),
+                "max_available_at": AVAILABLE_AT.isoformat().replace("+00:00", "Z"),
+                "producer_commit": COMMIT_A,
+                "authority_binding_sha256": None,
+                "size_bytes": path.stat().st_size,
+            }
+        )
+    index_path.write_bytes(
+        json.dumps(
+            {"schema_version": 1, "entries": entries},
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    )
+    index_path.chmod(0o600)
+    spool.current_path.write_bytes(
+        _canonical_bytes(StrategyCandidateSnapshotPointer.from_snapshot(target))
+    )
+    spool.current_path.chmod(0o600)
+
+    reader = StrategyCandidateSnapshotSpool(root)
+    original = reader._read_snapshot
+    read_names: list[str] = []
+
+    def counting_read(parent_fd: int, name: str) -> StrategyCandidateSnapshot:
+        read_names.append(name)
+        return original(parent_fd, name)
+
+    monkeypatch.setattr(reader, "_read_snapshot", counting_read)
+
+    assert reader.read_legacy_for_migration(CAPTURED_AT + timedelta(seconds=1)) == target
+    assert read_names == [target_name]
+    assert len(reader._generation_cache) <= 4
+    assert reader._generation_cache_bytes <= 32 * 1024 * 1024
 
 
 @pytest.mark.parametrize("mutation", ["delete", "content", "mode", "inode"])
@@ -1546,9 +1998,9 @@ def test_cached_generation_mutation_fails_closed(
     root = (tmp_path / mutation).resolve()
     writer = StrategyCandidateSnapshotSpool(root)
     snapshot = _snapshot()
-    writer.publish(snapshot)
+    writer.publish_legacy_for_migration(snapshot)
     reader = StrategyCandidateSnapshotSpool(root)
-    assert reader.read_as_of(CAPTURED_AT + timedelta(minutes=1)) == snapshot
+    assert reader.read_legacy_for_migration(CAPTURED_AT + timedelta(minutes=1)) == snapshot
     generation = root / "generations" / f"{snapshot.content_sha256}.json"
 
     if mutation == "delete":
@@ -1565,14 +2017,14 @@ def test_cached_generation_mutation_fails_closed(
         generation.chmod(0o600)
 
     with pytest.raises(StrategyCandidateSnapshotIntegrityError):
-        reader.read_as_of(CAPTURED_AT + timedelta(minutes=1))
+        reader.read_legacy_for_migration(CAPTURED_AT + timedelta(minutes=1))
 
 
 @pytest.mark.parametrize("target", ["generation", "pointer"])
 def test_content_and_pointer_tampering_fail_closed(tmp_path: Path, target: str) -> None:
     spool = StrategyCandidateSnapshotSpool((tmp_path / "spool").resolve())
     snapshot = _snapshot()
-    spool.publish(snapshot)
+    spool.publish_legacy_for_migration(snapshot)
     path = (
         spool.generations_root / f"{snapshot.content_sha256}.json"
         if target == "generation"
@@ -1587,26 +2039,26 @@ def test_content_and_pointer_tampering_fail_closed(tmp_path: Path, target: str) 
     os.chmod(path, 0o600)
 
     with pytest.raises(StrategyCandidateSnapshotIntegrityError):
-        spool.read_as_of(CAPTURED_AT + timedelta(minutes=1))
+        spool.read_legacy_for_migration(CAPTURED_AT + timedelta(minutes=1))
 
 
 def test_missing_current_generation_fails_closed(tmp_path: Path) -> None:
     spool = StrategyCandidateSnapshotSpool((tmp_path / "spool").resolve())
     snapshot = _snapshot()
-    spool.publish(snapshot)
+    spool.publish_legacy_for_migration(snapshot)
     (spool.generations_root / f"{snapshot.content_sha256}.json").unlink()
 
     with pytest.raises(StrategyCandidateSnapshotIntegrityError, match="missing"):
-        spool.read_as_of(CAPTURED_AT + timedelta(minutes=1))
+        spool.read_legacy_for_migration(CAPTURED_AT + timedelta(minutes=1))
 
 
 def test_missing_current_pointer_fails_closed(tmp_path: Path) -> None:
     spool = StrategyCandidateSnapshotSpool((tmp_path / "spool").resolve())
-    spool.publish(_snapshot())
+    spool.publish_legacy_for_migration(_snapshot())
     spool.current_path.unlink()
 
     with pytest.raises(StrategyCandidateSnapshotIntegrityError, match="pointer is missing"):
-        spool.read_as_of(CAPTURED_AT + timedelta(minutes=1))
+        spool.read_legacy_for_migration(CAPTURED_AT + timedelta(minutes=1))
 
 
 def test_persisted_sequence_gap_and_duplicate_fail_closed(tmp_path: Path) -> None:
@@ -1623,21 +2075,21 @@ def test_persisted_sequence_gap_and_duplicate_fail_closed(tmp_path: Path) -> Non
             ),
         ),
     )
-    gap_spool.publish(first)
-    gap_spool.publish(second)
+    gap_spool.publish_legacy_for_migration(first)
+    gap_spool.publish_legacy_for_migration(second)
     (gap_spool.generations_root / f"{first.content_sha256}.json").unlink()
     with pytest.raises(StrategyCandidateSnapshotIntegrityError, match="sequence"):
-        gap_spool.read_as_of(CAPTURED_AT + timedelta(minutes=3))
+        gap_spool.read_legacy_for_migration(CAPTURED_AT + timedelta(minutes=3))
 
     duplicate_spool = StrategyCandidateSnapshotSpool((tmp_path / "duplicate").resolve())
     original = _snapshot(sequence=0)
     conflicting = _snapshot(sequence=0, rows=(_row(variant="pool2"),))
-    duplicate_spool.publish(original)
+    duplicate_spool.publish_legacy_for_migration(original)
     conflict_path = duplicate_spool.generations_root / f"{conflicting.content_sha256}.json"
     conflict_path.write_bytes(_canonical_bytes(conflicting))
     os.chmod(conflict_path, 0o600)
     with pytest.raises(StrategyCandidateSnapshotIntegrityError, match="duplicate"):
-        duplicate_spool.read_as_of(CAPTURED_AT + timedelta(minutes=1))
+        duplicate_spool.read_legacy_for_migration(CAPTURED_AT + timedelta(minutes=1))
 
 
 def test_pointer_to_valid_old_generation_fails_closed(tmp_path: Path) -> None:
@@ -1654,22 +2106,22 @@ def test_pointer_to_valid_old_generation_fails_closed(tmp_path: Path) -> None:
             ),
         ),
     )
-    spool.publish(old)
-    spool.publish(latest)
+    spool.publish_legacy_for_migration(old)
+    spool.publish_legacy_for_migration(latest)
     spool.current_path.write_bytes(
         _canonical_bytes(StrategyCandidateSnapshotPointer.from_snapshot(old))
     )
     os.chmod(spool.current_path, 0o600)
 
     with pytest.raises(StrategyCandidateSnapshotIntegrityError, match="latest"):
-        spool.read_as_of(CAPTURED_AT + timedelta(minutes=3))
+        spool.read_legacy_for_migration(CAPTURED_AT + timedelta(minutes=3))
 
 
 def test_publish_recovers_owned_stale_temporary_without_poisoning_reads(
     tmp_path: Path,
 ) -> None:
     spool = StrategyCandidateSnapshotSpool((tmp_path / "spool").resolve())
-    spool.publish(_snapshot(sequence=0))
+    spool.publish_legacy_for_migration(_snapshot(sequence=0))
     stale = spool.root / f".candidate-generation.{'a' * 32}.tmp"
     first_generation = next(spool.generations_root.glob("*.json"))
     os.link(first_generation, stale)
@@ -1685,15 +2137,15 @@ def test_publish_recovers_owned_stale_temporary_without_poisoning_reads(
         ),
     )
 
-    spool.publish(second)
+    spool.publish_legacy_for_migration(second)
 
     assert not stale.exists()
-    assert spool.read_as_of(CAPTURED_AT + timedelta(minutes=3)) == second
+    assert spool.read_legacy_for_migration(CAPTURED_AT + timedelta(minutes=3)) == second
 
 
 def test_publish_finishes_generation_linked_before_pointer_switch(tmp_path: Path) -> None:
     spool = StrategyCandidateSnapshotSpool((tmp_path / "spool").resolve())
-    spool.publish(_snapshot(sequence=0))
+    spool.publish_legacy_for_migration(_snapshot(sequence=0))
     interrupted = _snapshot(
         sequence=1,
         captured_at=CAPTURED_AT + timedelta(minutes=2),
@@ -1709,8 +2161,8 @@ def test_publish_finishes_generation_linked_before_pointer_switch(tmp_path: Path
     generation.write_bytes(_canonical_bytes(interrupted))
     os.chmod(generation, 0o600)
 
-    assert spool.publish(interrupted) == interrupted
-    assert spool.read_as_of(CAPTURED_AT + timedelta(minutes=3)) == interrupted
+    assert spool.publish_legacy_for_migration(interrupted) == interrupted
+    assert spool.read_legacy_for_migration(CAPTURED_AT + timedelta(minutes=3)) == interrupted
 
 
 def test_authority_size_and_generation_count_are_bounded(
@@ -1720,14 +2172,14 @@ def test_authority_size_and_generation_count_are_bounded(
     import rquant.strategy_candidate_snapshot as snapshot_module
 
     size_spool = StrategyCandidateSnapshotSpool((tmp_path / "size").resolve())
-    size_spool.publish(_snapshot())
+    size_spool.publish_legacy_for_migration(_snapshot())
     monkeypatch.setattr(snapshot_module, "_MAX_AUTHORITY_BYTES", 32)
     with pytest.raises(StrategyCandidateSnapshotIntegrityError, match="size limit"):
-        size_spool.read_as_of(CAPTURED_AT + timedelta(minutes=1))
+        size_spool.read_legacy_for_migration(CAPTURED_AT + timedelta(minutes=1))
 
     monkeypatch.setattr(snapshot_module, "_MAX_AUTHORITY_BYTES", 16 * 1024 * 1024)
     count_spool = StrategyCandidateSnapshotSpool((tmp_path / "count").resolve())
-    count_spool.publish(_snapshot(sequence=0))
+    count_spool.publish_legacy_for_migration(_snapshot(sequence=0))
     second = _snapshot(
         sequence=1,
         captured_at=CAPTURED_AT + timedelta(minutes=2),
@@ -1741,8 +2193,8 @@ def test_authority_size_and_generation_count_are_bounded(
     )
     monkeypatch.setattr(snapshot_module, "_MAX_GENERATIONS", 1)
     with pytest.raises(StrategyCandidateSnapshotIntegrityError, match="count"):
-        count_spool.publish(second)
-    assert count_spool.read_as_of(CAPTURED_AT + timedelta(minutes=3)).sequence == 0
+        count_spool.publish_legacy_for_migration(second)
+    assert count_spool.read_legacy_for_migration(CAPTURED_AT + timedelta(minutes=3)).sequence == 0
 
 
 @pytest.mark.parametrize("target", ["root", "generation", "pointer"])
@@ -1758,7 +2210,7 @@ def test_symlink_paths_fail_closed(tmp_path: Path, target: str) -> None:
 
     spool = StrategyCandidateSnapshotSpool((tmp_path / "spool").resolve())
     snapshot = _snapshot()
-    spool.publish(snapshot)
+    spool.publish_legacy_for_migration(snapshot)
     external = tmp_path / "external.json"
     external.write_bytes(_canonical_bytes(snapshot))
     if target == "generation":
@@ -1769,7 +2221,7 @@ def test_symlink_paths_fail_closed(tmp_path: Path, target: str) -> None:
     path.symlink_to(external)
 
     with pytest.raises(StrategyCandidateSnapshotIntegrityError, match="symlink"):
-        spool.read_as_of(CAPTURED_AT + timedelta(minutes=1))
+        spool.read_legacy_for_migration(CAPTURED_AT + timedelta(minutes=1))
 
 
 def test_constructor_rejects_relative_and_parent_symlink_paths(tmp_path: Path) -> None:
@@ -1790,13 +2242,13 @@ def test_read_rejects_ancestor_and_generations_symlink_after_construction(
     parent = tmp_path / "authority"
     root = (parent / "spool").resolve()
     spool = StrategyCandidateSnapshotSpool(root)
-    spool.publish(_snapshot())
+    spool.publish_legacy_for_migration(_snapshot())
     moved_parent = tmp_path / "authority-real"
     parent.rename(moved_parent)
     parent.symlink_to(moved_parent, target_is_directory=True)
 
     with pytest.raises(StrategyCandidateSnapshotIntegrityError, match="symlink"):
-        spool.read_as_of(CAPTURED_AT + timedelta(minutes=1))
+        spool.read_legacy_for_migration(CAPTURED_AT + timedelta(minutes=1))
 
     parent.unlink()
     moved_parent.rename(parent)
@@ -1804,7 +2256,7 @@ def test_read_rejects_ancestor_and_generations_symlink_after_construction(
     spool.generations_root.rename(moved_generations)
     spool.generations_root.symlink_to(moved_generations, target_is_directory=True)
     with pytest.raises(StrategyCandidateSnapshotIntegrityError, match="directory"):
-        spool.read_as_of(CAPTURED_AT + timedelta(minutes=1))
+        spool.read_legacy_for_migration(CAPTURED_AT + timedelta(minutes=1))
 
 
 def test_pointer_hash_is_bound_to_generation_snapshot() -> None:

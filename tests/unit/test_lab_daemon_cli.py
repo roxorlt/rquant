@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import signal
+import sqlite3
+import sys
 import threading
 import time
 from pathlib import Path
@@ -10,8 +13,16 @@ from types import SimpleNamespace
 
 import pytest
 
-from rquant.cli import build_parser, cmd_lab_finalizer, cmd_lab_scheduler, cmd_lab_worker
+from rquant.cli import (
+    build_parser,
+    cmd_lab_finalizer,
+    cmd_lab_integrity_audit,
+    cmd_lab_scheduler,
+    cmd_lab_worker,
+)
 from rquant.lab_daemon import LabDaemonConfigurationError
+from rquant.lab_jobs import LabJobStore
+from tests.highwater_ed25519_support import export_public_keyring, write_private_manifest
 
 EXPECTED_ROOT = "/tmp/rquant-expected"
 TRUSTED_GIT = "/usr/bin/git"
@@ -64,6 +75,76 @@ def test_parser_registers_finalizer_and_keeps_legacy_lab_run() -> None:
     assert finalizer.command == "lab-finalizer"
     assert finalizer.once is True
     assert legacy.command == "lab-run"
+
+
+def test_lab_integrity_audit_cli_reports_healthy_and_degraded_ledger(tmp_path: Path) -> None:
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+    parser = build_parser()
+    healthy = parser.parse_args(["lab-integrity-audit", "--jobs-path", str(store.path)])
+
+    assert healthy.command == "lab-integrity-audit"
+    assert cmd_lab_integrity_audit(healthy) == 0
+
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("DROP TABLE lab_job_list_summary")
+    degraded = parser.parse_args(["lab-integrity-audit", "--jobs-path", str(store.path)])
+
+    assert cmd_lab_integrity_audit(degraded) == 2
+
+
+def test_lab_integrity_audit_cli_uses_external_highwater_and_emits_machine_receipt(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+    private_keyring, _public_key = write_private_manifest(
+        tmp_path / "authority-private-keys.json",
+        active_key_id="hw-v1",
+    )
+    trusted_keyring = export_public_keyring(
+        private_keyring,
+        tmp_path / "trusted-public-keys.json",
+    )
+    helper = (
+        Path(__file__).resolve().parents[2]
+        / "deploy"
+        / "libexec"
+        / "rquant-lab-highwater-authority"
+    )
+    args = build_parser().parse_args(
+        [
+            "lab-integrity-audit",
+            "--jobs-path",
+            str(store.path),
+            "--require-external-highwater",
+            "--highwater-command-json",
+            json.dumps(
+                [
+                    sys.executable,
+                    str(helper),
+                    "--state-root",
+                    str(tmp_path / "highwater-state"),
+                    "--keys-file",
+                    str(private_keyring),
+                ]
+            ),
+            "--highwater-stable-identity",
+            "lab-test-ledger",
+            "--highwater-code-identity",
+            "1" * 40,
+            "--highwater-profile-identity",
+            "2" * 64,
+            "--highwater-trusted-keyring",
+            str(trusted_keyring),
+            "--machine-receipt",
+        ]
+    )
+
+    assert cmd_lab_integrity_audit(args) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert len(payload["receipt_hash"]) == 64
 
 
 def test_parser_registers_generation_bound_launchd_install_lifecycle() -> None:
@@ -290,13 +371,32 @@ def test_cli_establishes_one_full_proof_for_repeated_mutation_guards(
 def test_scheduler_rejects_missing_authority_configuration_before_sqlite(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from rquant import lab_daemon, lab_jobs
+    from rquant import job_center_authority, lab_daemon, lab_jobs
     from rquant.config import settings
 
     monkeypatch.setattr(
         lab_daemon,
         "require_lab_runtime_binding",
         lambda _root, _git, **_kwargs: "1" * 40,
+    )
+    monkeypatch.setattr(
+        lab_daemon,
+        "load_lab_job_center_authority_manifest",
+        lambda *_args, **_kwargs: SimpleNamespace(),
+    )
+    runtime_root = settings.lab_runtime_dir_resolved
+    monkeypatch.setattr(
+        job_center_authority,
+        "resolve_current_job_center_authority_binding",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            runtime_root=runtime_root,
+            lab_jobs_path=settings.lab_jobs_path_resolved,
+            command_spool_path=settings.lab_job_command_dir_resolved,
+            final_artifact_root=settings.lab_final_artifact_dir_resolved,
+            runtime_deployment_root=Path("/tmp/rquant-production-runtime"),
+            deployment_profile_id="2" * 64,
+            deployment_generation_hash="3" * 64,
+        ),
     )
     monkeypatch.setattr(settings, "lab_finalizer_authority_key_id", "")
     monkeypatch.setattr(settings, "lab_finalizer_authority_key_path", None)
@@ -313,6 +413,7 @@ def test_scheduler_rejects_missing_authority_configuration_before_sqlite(
                 once=True,
                 expected_checkout_root=EXPECTED_ROOT,
                 trusted_git_path=TRUSTED_GIT,
+                runtime_deployment_root="/tmp/rquant-production-runtime",
                 startup_deadline_monotonic=STARTUP_DEADLINE,
             )
         )

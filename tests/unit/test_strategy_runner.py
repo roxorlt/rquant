@@ -17,15 +17,19 @@ import rquant.strategy_runner as strategy_runner
 from rquant.feature_contracts import (
     FeatureAvailability,
     FeatureBatchEnvelope,
+    FeatureContract,
+    FeatureDefinition,
     FeatureFieldStatus,
     FeatureRequirement,
     RequirementLevel,
 )
+from rquant.feature_spool import FeatureSessionCloseMarker
 from rquant.runtime_candidate_universe import (
     CandidateUniverseAuthority,
     RuntimeCandidateUniverseConfig,
     RuntimeCandidateUniverseLoader,
 )
+from rquant.runtime_shadow_validation import HmacCompletionAttestationAuthority
 from rquant.signal_contracts import SignalAction
 from rquant.strategy_candidate_feature_join import (
     StrategyCandidateFeatureBatch,
@@ -35,8 +39,10 @@ from rquant.strategy_candidate_snapshot import (
     StrategyCandidatePriceBasis,
     StrategyCandidateRecord,
     StrategyCandidateSnapshotSpool,
+    strategy_candidate_schema_fingerprint,
 )
 from rquant.strategy_runner import (
+    RunnerSignalRouteDrainEvidence,
     StrategyBatchConflictError,
     StrategyDecision,
     StrategyRunnerStore,
@@ -51,6 +57,21 @@ from rquant.strategy_spec import (
 
 NOW = datetime(2026, 7, 31, 1, 31, tzinfo=UTC)
 EVALUATOR_FINGERPRINT = "e" * 64
+DEFINITION_FINGERPRINT = "d" * 64
+EXECUTABLE_FINGERPRINT = "f" * 64
+STATIC_FEATURE_SCHEMA = {"candidate_score": {"dtype": "number", "semantic": "test_rank_score"}}
+CANDIDATE_SCHEMA_FINGERPRINT = strategy_candidate_schema_fingerprint(
+    strategy_id="growth-board-surge-v1",
+    strategy_version="1",
+    static_feature_schema=STATIC_FEATURE_SCHEMA,
+)
+SESSION_TRADE_DATE = date(2026, 7, 31)
+SESSION_CLOSE = datetime(2026, 7, 31, 7, 0, tzinfo=UTC)
+RUNNER_SOURCE_ID = "strategy.growth-board-surge-v1.v1"
+ATTESTATION_AUTHORITY = HmacCompletionAttestationAuthority(
+    key_id="runner-test-key-v1",
+    secret=b"runner-test-completion-attestation-key-v1",
+)
 
 
 def _spec(
@@ -107,6 +128,7 @@ def _envelope(
     row_count: int = 1,
 ) -> FeatureBatchEnvelope:
     batch_available_at = available_at + timedelta(minutes=sequence)
+    batch_event_time = event_time or NOW + timedelta(minutes=sequence)
     return FeatureBatchEnvelope(
         schema_version=1,
         batch_id=batch_id or f"feature-{sequence}",
@@ -114,8 +136,10 @@ def _envelope(
         contract_version=contract_version,
         input_batch_ids=(f"raw-{sequence}",),
         sequence=sequence,
-        event_time=event_time or NOW + timedelta(minutes=sequence),
+        event_time=batch_event_time,
         available_at=batch_available_at,
+        decision_cutoff=batch_available_at,
+        actual_delay_seconds=(batch_available_at - batch_event_time).total_seconds(),
         row_count=row_count,
         content_hash=content_hash or _payload_hash(_frame()),
         field_statuses=field_statuses
@@ -144,7 +168,10 @@ def _status(
     return FeatureFieldStatus(
         name=name,
         status=status,
+        source_event_time=available_at,
         available_at=available_at,
+        decision_cutoff=available_at,
+        actual_delay_seconds=0.0,
         reason=None if status is FeatureAvailability.AVAILABLE else f"{name} is {status.value}",
     )
 
@@ -172,6 +199,116 @@ def _store(
         path,
         spec=spec or _spec(),
         evaluator_contract_fingerprint=evaluator_contract_fingerprint,
+    )
+
+
+def _route_drain(
+    store: StrategyRunnerStore,
+    *,
+    routed_through_sequence: int,
+    observed_high_watermark: int | None = None,
+    last_sequence: int | None = None,
+    signal_authority_generation_id: str = "a" * 64,
+    route_receipts_sha256: str = "b" * 64,
+    routing_policy_fingerprint: str = "9" * 64,
+    segment_start_sequence: int = 0,
+    observed_at: datetime = SESSION_CLOSE + timedelta(seconds=2),
+) -> RunnerSignalRouteDrainEvidence:
+    return RunnerSignalRouteDrainEvidence(
+        source_id=RUNNER_SOURCE_ID,
+        runner_generation_id=store.source_generation_id,
+        strategy_spec_fingerprint=store.spec.spec_fingerprint,
+        signal_authority_generation_id=signal_authority_generation_id,
+        routing_policy_fingerprint=routing_policy_fingerprint,
+        trade_date=SESSION_TRADE_DATE,
+        segment_start_sequence=segment_start_sequence,
+        segment_record_count=routed_through_sequence - segment_start_sequence,
+        segment_raw_bytes=max(routed_through_sequence - segment_start_sequence, 0),
+        segment_chain_hash="7" * 64,
+        observed_high_watermark=(
+            routed_through_sequence if observed_high_watermark is None else observed_high_watermark
+        ),
+        routed_through_sequence=routed_through_sequence,
+        last_sequence=routed_through_sequence if last_sequence is None else last_sequence,
+        route_receipts_sha256=route_receipts_sha256,
+        observed_at=observed_at,
+    )
+
+
+def _feature_close_marker(
+    envelope: FeatureBatchEnvelope,
+    *,
+    final_sequence: int | None = None,
+) -> FeatureSessionCloseMarker:
+    selected_sequence = envelope.sequence if final_sequence is None else final_sequence
+    return FeatureSessionCloseMarker.create(
+        trade_date=SESSION_TRADE_DATE,
+        session_close_at=SESSION_CLOSE,
+        source_generation_id="7" * 64,
+        calendar_generation_id="8" * 64,
+        complete_through=SESSION_CLOSE,
+        upstream_source_generation_id="6" * 64,
+        upstream_final_sequence=selected_sequence,
+        upstream_final_batch_id=f"raw-{selected_sequence}",
+        upstream_final_content_hash="5" * 64,
+        first_sequence=0,
+        final_sequence=selected_sequence,
+        batch_count=selected_sequence + 1,
+        segment_chain_hash="4" * 64,
+        final_batch_id=(
+            envelope.batch_id if final_sequence is None else f"feature-{final_sequence}"
+        ),
+        final_content_hash=(envelope.content_hash if final_sequence is None else "3" * 64),
+        produced_at=SESSION_CLOSE + timedelta(seconds=1),
+    )
+
+
+def _process_session_close(store: StrategyRunnerStore) -> FeatureSessionCloseMarker:
+    envelope = _envelope(available_at=SESSION_CLOSE, event_time=SESSION_CLOSE)
+    store.process_batch(
+        envelope,
+        _frame(),
+        source_receipt=StrategySourceBatchReceipt(
+            source_generation_id="7" * 64,
+            source_sequence=envelope.sequence,
+            source_batch_id=envelope.batch_id,
+            source_content_hash=envelope.content_hash,
+        ),
+        dataset_snapshot_id="d" * 64,
+        observed_at=SESSION_CLOSE,
+        evaluator=_entry_decision,
+    )
+    return _feature_close_marker(envelope)
+
+
+def _publish_session_close(
+    store: StrategyRunnerStore,
+    *,
+    route_evidence: RunnerSignalRouteDrainEvidence | None = None,
+    produced_at: datetime = SESSION_CLOSE + timedelta(seconds=3),
+    producer_instance_id: str = "growth-board-surge-v1-primary",
+    feature_close_marker: FeatureSessionCloseMarker | None = None,
+    fault_hook: object | None = None,
+) -> object:
+    return store.publish_session_close_receipt(
+        trade_date=SESSION_TRADE_DATE,
+        session_close_at=SESSION_CLOSE,
+        source_id=RUNNER_SOURCE_ID,
+        calendar_generation_id="8" * 64,
+        producer_service_id="strategy-live",
+        producer_instance_id=producer_instance_id,
+        producer_version="0.27.0",
+        produced_at=produced_at,
+        feature_close_marker=feature_close_marker,
+        attestation_signer=ATTESTATION_AUTHORITY,
+        strategy_registration_fingerprint=DEFINITION_FINGERPRINT,
+        executable_fingerprint=EXECUTABLE_FINGERPRINT,
+        candidate_schema_fingerprint=CANDIDATE_SCHEMA_FINGERPRINT,
+        feature_registration_fingerprint="1" * 64,
+        feature_contract_fingerprint="2" * 64,
+        producer_manifest_fingerprint="3" * 64,
+        route_evidence=route_evidence or _route_drain(store, routed_through_sequence=1),
+        fault_hook=fault_hook,
     )
 
 
@@ -211,6 +348,10 @@ def _joined_feature_batch(
     StrategyCandidateSnapshotSpool(requested_root).publish_strategy_records(
         strategy_id="growth-board-surge-v1",
         strategy_version="1",
+        definition_fingerprint=DEFINITION_FINGERPRINT,
+        executable_fingerprint=EXECUTABLE_FINGERPRINT,
+        candidate_schema_fingerprint=CANDIDATE_SCHEMA_FINGERPRINT,
+        static_feature_schema=STATIC_FEATURE_SCHEMA,
         source_snapshot_ids={
             "candidate_input": hashlib.sha256(str(requested_root).encode()).hexdigest()
         },
@@ -226,10 +367,23 @@ def _joined_feature_batch(
             snapshot_root=requested_root,
             required=True,
             max_age_seconds=60,
+            definition_fingerprint=DEFINITION_FINGERPRINT,
+            executable_fingerprint=EXECUTABLE_FINGERPRINT,
+            candidate_schema_fingerprint=CANDIDATE_SCHEMA_FINGERPRINT,
+            static_feature_names=("candidate_score",),
+            static_feature_schema=STATIC_FEATURE_SCHEMA,
         )
     ]
     if empty_requested_authority:
         other_root = (tmp_path / "other-candidates").resolve()
+        other_static_feature_schema = {
+            "other_score": {"dtype": "number", "semantic": "test_other_score"}
+        }
+        other_schema_fingerprint = strategy_candidate_schema_fingerprint(
+            strategy_id="other-strategy",
+            strategy_version="1",
+            static_feature_schema=other_static_feature_schema,
+        )
         other_row = StrategyCandidateRecord(
             strategy_id="other-strategy",
             strategy_version="1",
@@ -246,6 +400,10 @@ def _joined_feature_batch(
         StrategyCandidateSnapshotSpool(other_root).publish_strategy_records(
             strategy_id="other-strategy",
             strategy_version="1",
+            definition_fingerprint=DEFINITION_FINGERPRINT,
+            executable_fingerprint=EXECUTABLE_FINGERPRINT,
+            candidate_schema_fingerprint=other_schema_fingerprint,
+            static_feature_schema=other_static_feature_schema,
             source_snapshot_ids={
                 "candidate_input": hashlib.sha256(str(other_root).encode()).hexdigest()
             },
@@ -261,6 +419,11 @@ def _joined_feature_batch(
                 snapshot_root=other_root,
                 required=True,
                 max_age_seconds=60,
+                definition_fingerprint=DEFINITION_FINGERPRINT,
+                executable_fingerprint=EXECUTABLE_FINGERPRINT,
+                candidate_schema_fingerprint=other_schema_fingerprint,
+                static_feature_names=("other_score",),
+                static_feature_schema=other_static_feature_schema,
             )
         )
     universe = RuntimeCandidateUniverseLoader(
@@ -352,6 +515,413 @@ def test_process_batch_persists_state_and_signal_atomically(tmp_path: Path) -> N
     }
     assert store.candidate_state("300001.SZ").state is StrategyLifecycleState.ARMED
     assert store.signals_after(sequence=0) == result.signals
+
+
+def test_session_close_receipt_is_content_addressed_and_idempotent_across_restart(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "runner.sqlite3"
+    store = _store(path)
+    marker = _process_session_close(store)
+
+    receipt = _publish_session_close(store, feature_close_marker=marker)
+    reopened = _store(path)
+    retried = _publish_session_close(reopened, feature_close_marker=marker)
+
+    assert retried == receipt
+    assert reopened.session_close_receipt(SESSION_TRADE_DATE) == receipt
+    assert receipt.evidence_origin == "production"
+    assert receipt.trade_date == SESSION_TRADE_DATE
+    assert receipt.session_close_at == SESSION_CLOSE
+    assert receipt.complete_through == SESSION_CLOSE
+    assert receipt.source_id == RUNNER_SOURCE_ID
+    assert receipt.producer_service_id == "strategy-live"
+    assert receipt.producer_instance_id == "growth-board-surge-v1-primary"
+    assert receipt.runner_generation_id == store.source_generation_id
+    assert receipt.signal_authority_generation_id == "a" * 64
+    assert receipt.calendar_generation_id == "8" * 64
+    assert receipt.last_sequence == 0
+    assert receipt.high_watermark == 1
+    assert receipt.route_receipts_id == "b" * 64
+    assert receipt.feature_close_marker_id == marker.marker_id
+    assert receipt.feature_source_generation_id == marker.source_generation_id
+    assert receipt.feature_segment_chain_hash == marker.segment_chain_hash
+    assert receipt.input_identity == store.runner_session_raw_input_id(
+        source_id=RUNNER_SOURCE_ID,
+        trade_date=SESSION_TRADE_DATE,
+    )
+
+
+def test_session_close_receipt_rejects_incomplete_session_and_route_backlog(
+    tmp_path: Path,
+) -> None:
+    early = _store(tmp_path / "early.sqlite3")
+    before_close = SESSION_CLOSE - timedelta(minutes=1)
+    early.process_batch(
+        _envelope(available_at=before_close, event_time=before_close),
+        _frame(),
+        dataset_snapshot_id="d" * 64,
+        observed_at=before_close,
+        evaluator=_entry_decision,
+    )
+
+    with pytest.raises(StrategyBatchConflictError, match="15:00|session close"):
+        _publish_session_close(
+            early,
+            feature_close_marker=_feature_close_marker(
+                _envelope(available_at=before_close, event_time=before_close)
+            ),
+            route_evidence=_route_drain(early, routed_through_sequence=1),
+        )
+
+    store = _store(tmp_path / "backlog.sqlite3")
+    marker = _process_session_close(store)
+    with pytest.raises(StrategyBatchConflictError, match="route.*backlog|routed through"):
+        _publish_session_close(
+            store,
+            feature_close_marker=marker,
+            route_evidence=_route_drain(
+                store,
+                routed_through_sequence=0,
+                observed_high_watermark=1,
+                last_sequence=0,
+            ),
+        )
+    assert store.session_close_receipt(SESSION_TRADE_DATE) is None
+
+
+def test_session_close_receipt_rejects_final_feature_event_after_exact_close(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path / "late-final.sqlite3")
+    late = SESSION_CLOSE + timedelta(seconds=1)
+    envelope = _envelope(available_at=late, event_time=late)
+    store.process_batch(
+        envelope,
+        _frame(),
+        source_receipt=StrategySourceBatchReceipt(
+            source_generation_id="7" * 64,
+            source_sequence=envelope.sequence,
+            source_batch_id=envelope.batch_id,
+            source_content_hash=envelope.content_hash,
+        ),
+        dataset_snapshot_id="d" * 64,
+        observed_at=late,
+        evaluator=_entry_decision,
+    )
+
+    with pytest.raises(StrategyBatchConflictError, match="15:00|exact close"):
+        _publish_session_close(
+            store,
+            feature_close_marker=_feature_close_marker(envelope),
+        )
+
+
+def test_session_close_receipt_rolls_back_crash_then_retries_and_rejects_conflict(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "runner.sqlite3"
+    store = _store(path)
+    marker = _process_session_close(store)
+
+    def crash(stage: str) -> None:
+        assert stage == "after_session_close_receipt_insert"
+        raise RuntimeError("simulated crash")
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        _publish_session_close(store, feature_close_marker=marker, fault_hook=crash)
+    assert _store(path).session_close_receipt(SESSION_TRADE_DATE) is None
+
+    receipt = _publish_session_close(_store(path), feature_close_marker=marker)
+    with pytest.raises(StrategyBatchConflictError, match="conflicting.*receipt"):
+        _publish_session_close(
+            _store(path),
+            producer_instance_id="replacement-instance",
+            feature_close_marker=marker,
+        )
+    assert _store(path).session_close_receipt(SESSION_TRADE_DATE) == receipt
+
+
+def test_session_close_receipt_blocks_late_same_session_batch_and_detects_tamper(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "runner.sqlite3"
+    store = _store(path)
+    marker = _process_session_close(store)
+    receipt = _publish_session_close(store, feature_close_marker=marker)
+
+    late_time = SESSION_CLOSE + timedelta(seconds=1)
+    with pytest.raises(StrategyBatchConflictError, match="closed session|late"):
+        store.process_batch(
+            _envelope(
+                sequence=1,
+                available_at=late_time - timedelta(minutes=1),
+                event_time=late_time,
+            ),
+            _frame(),
+            dataset_snapshot_id="d" * 64,
+            observed_at=late_time,
+            evaluator=lambda *_args: None,
+        )
+
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE runner_session_close_receipt SET receipt_id = ? WHERE trade_date = ?",
+            ("0" * 64, SESSION_TRADE_DATE.isoformat()),
+        )
+    with pytest.raises(ValueError, match="close receipt.*identity|receipt.*invalid"):
+        _store(path)
+    assert receipt.receipt_id != "0" * 64
+
+
+def test_session_close_receipt_requires_exact_feature_close_marker(tmp_path: Path) -> None:
+    store = _store(tmp_path / "runner.sqlite3")
+    marker = _process_session_close(store)
+
+    with pytest.raises((TypeError, ValueError, StrategyBatchConflictError), match="feature|marker"):
+        _publish_session_close(store)
+    with pytest.raises(StrategyBatchConflictError, match="feature|marker|sequence"):
+        _publish_session_close(
+            store,
+            feature_close_marker=_feature_close_marker(
+                _envelope(available_at=SESSION_CLOSE, event_time=SESSION_CLOSE),
+                final_sequence=1,
+            ),
+        )
+
+    assert _publish_session_close(store, feature_close_marker=marker).feature_close_marker_id == (
+        marker.marker_id
+    )
+
+
+def test_session_close_lost_return_retry_reuses_first_persisted_wall_clock(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "runner.sqlite3"
+    store = _store(path)
+    marker = _process_session_close(store)
+    first_produced_at = SESSION_CLOSE + timedelta(seconds=3)
+
+    def lose_return(stage: str) -> None:
+        if stage == "after_session_close_receipt_commit":
+            raise RuntimeError("lost return")
+
+    with pytest.raises(RuntimeError, match="lost return"):
+        _publish_session_close(
+            store,
+            feature_close_marker=marker,
+            produced_at=first_produced_at,
+            fault_hook=lose_return,
+        )
+
+    persisted = _store(path).session_close_receipt(SESSION_TRADE_DATE)
+    assert persisted is not None
+    retried = _publish_session_close(
+        _store(path),
+        feature_close_marker=marker,
+        produced_at=first_produced_at + timedelta(minutes=5),
+    )
+    assert retried == persisted
+    assert retried.produced_at == first_produced_at
+
+
+def test_session_close_retry_rejects_routing_policy_drift(tmp_path: Path) -> None:
+    store = _store(tmp_path / "runner.sqlite3")
+    marker = _process_session_close(store)
+    _publish_session_close(store, feature_close_marker=marker)
+
+    with pytest.raises(StrategyBatchConflictError, match="routing policy|completion attestation"):
+        _publish_session_close(
+            _store(store.path),
+            feature_close_marker=marker,
+            route_evidence=_route_drain(
+                store,
+                routed_through_sequence=1,
+                routing_policy_fingerprint="8" * 64,
+            ),
+        )
+
+
+def test_session_close_receipt_sql_preflights_blob_before_parse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "runner.sqlite3"
+    store = _store(path)
+    marker = _process_session_close(store)
+    _publish_session_close(store, feature_close_marker=marker)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE runner_session_close_receipt SET payload_json = ?",
+            ("x" * (64 * 1024 + 1),),
+        )
+    monkeypatch.setattr(
+        strategy_runner.ShadowSourceCompletionReceipt,
+        "model_validate_json",
+        lambda *_args, **_kwargs: pytest.fail(
+            "oversized receipt must fail SQL BLOB preflight before parsing"
+        ),
+    )
+
+    with pytest.raises(ValueError, match="byte budget"):
+        store.session_close_receipt(SESSION_TRADE_DATE)
+
+
+def test_session_close_receipt_preflight_and_payload_share_one_read_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "runner.sqlite3"
+    store = _store(path)
+    marker = _process_session_close(store)
+    expected = _publish_session_close(store, feature_close_marker=marker)
+    real_connect = store._connect
+    mutated = False
+
+    class ConnectionProxy:
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            self.connection = connection
+
+        def __enter__(self) -> ConnectionProxy:
+            self.connection.__enter__()
+            return self
+
+        def __exit__(self, *args: object) -> object:
+            return self.connection.__exit__(*args)
+
+        def execute(self, sql: str, parameters: object = ()) -> sqlite3.Cursor:
+            nonlocal mutated
+            cursor = self.connection.execute(sql, parameters)  # type: ignore[arg-type]
+            if "length(CAST(payload_json AS BLOB))" in sql and not mutated:
+                with sqlite3.connect(path, isolation_level=None) as writer:
+                    writer.execute("PRAGMA journal_mode = WAL")
+                    writer.execute(
+                        "UPDATE runner_session_close_receipt SET payload_json = ?",
+                        ("x" * (64 * 1024 + 1),),
+                    )
+                mutated = True
+            return cursor
+
+    monkeypatch.setattr(store, "_connect", lambda: ConnectionProxy(real_connect()))
+
+    assert store.session_close_receipt(SESSION_TRADE_DATE) == expected
+    with pytest.raises(ValueError, match="byte budget"):
+        store.session_close_receipt(SESSION_TRADE_DATE)
+
+
+def test_session_close_receipt_rejects_deep_json_before_parse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "runner.sqlite3"
+    store = _store(path)
+    marker = _process_session_close(store)
+    _publish_session_close(store, feature_close_marker=marker)
+    nested = "{}"
+    for _ in range(80):
+        nested = '{"child":' + nested + "}"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE runner_session_close_receipt SET payload_json = ?",
+            (nested,),
+        )
+    monkeypatch.setattr(
+        strategy_runner.ShadowSourceCompletionReceipt,
+        "model_validate_json",
+        lambda *_args, **_kwargs: pytest.fail(
+            "deep receipt must fail before Pydantic JSON parsing"
+        ),
+    )
+
+    with pytest.raises(ValueError, match="depth"):
+        store.session_close_receipt(SESSION_TRADE_DATE)
+
+
+def test_session_close_receipt_rejects_wide_json_before_parse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "runner.sqlite3"
+    store = _store(path)
+    marker = _process_session_close(store)
+    _publish_session_close(store, feature_close_marker=marker)
+    payload = json.dumps(
+        {"wide": list(range(32))},
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE runner_session_close_receipt SET payload_json = ?",
+            (payload,),
+        )
+    monkeypatch.setattr(strategy_runner, "_MAX_PROTOCOL_JSON_NODES", 8)
+    monkeypatch.setattr(
+        strategy_runner.json,
+        "loads",
+        lambda _value: pytest.fail("wide receipt must fail before json.loads"),
+    )
+
+    with pytest.raises(ValueError, match="node|width"):
+        store.session_close_receipt(SESSION_TRADE_DATE)
+
+
+def test_session_close_uses_incremental_session_segment_not_full_prefix_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path / "runner.sqlite3")
+    historical_payload = "{}"
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            """
+            WITH RECURSIVE counter(value) AS (
+                SELECT 1
+                UNION ALL SELECT value + 1 FROM counter WHERE value < 100000
+            )
+            INSERT INTO runner_signal(
+                sequence, signal_id, feature_sequence, candidate_id, action,
+                entry_signal_id, candidate_occurrence_id,
+                event_time, available_at, expires_at, payload_json
+            )
+            SELECT value, printf('historical-%06d', value), -1,
+                   '300001.SZ', 'b_intent', NULL, NULL,
+                   ?, ?, ?, ?
+            FROM counter
+            """,
+            (
+                NOW.isoformat().replace("+00:00", "Z"),
+                NOW.isoformat().replace("+00:00", "Z"),
+                (NOW + timedelta(minutes=5)).isoformat().replace("+00:00", "Z"),
+                historical_payload,
+            ),
+        )
+    marker = _process_session_close(store)
+
+    monkeypatch.setattr(
+        store,
+        "_runner_records_through",
+        lambda *_args, **_kwargs: pytest.fail("close must not rescan the cumulative prefix"),
+    )
+
+    receipt = _publish_session_close(
+        store,
+        feature_close_marker=marker,
+        route_evidence=_route_drain(
+            store,
+            routed_through_sequence=100_001,
+            segment_start_sequence=100_000,
+        ),
+    )
+    assert receipt.segment_record_count == 1
+    assert receipt.segment_start_sequence == 100_000
+    assert receipt.segment_chain_hash is not None
+    assert receipt.completion_attestation is not None
+    assert ATTESTATION_AUTHORITY.verify(receipt.completion_attestation)
+    assert receipt.completion_attestation.claims.strategy_registration_fingerprint == (
+        DEFINITION_FINGERPRINT
+    )
 
 
 def test_exact_batch_retry_is_idempotent_across_reopen(tmp_path: Path) -> None:
@@ -1091,6 +1661,24 @@ def test_runner_signal_rejects_noncanonical_table_ddl(
 def test_runner_signal_accepts_canonical_legacy_table_and_preserves_rows(
     tmp_path: Path,
 ) -> None:
+    source = _store(tmp_path / "source.sqlite3")
+    signal = (
+        source.process_batch(
+            _envelope(),
+            _frame(),
+            dataset_snapshot_id="d" * 64,
+            observed_at=NOW,
+            evaluator=_entry_decision,
+        )
+        .signals[0]
+        .signal
+    )
+    payload = json.dumps(
+        signal.model_dump(mode="json"),
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
     path = tmp_path / "runner.sqlite3"
     with sqlite3.connect(path) as connection:
         connection.execute(
@@ -1105,16 +1693,111 @@ def test_runner_signal_accepts_canonical_legacy_table_and_preserves_rows(
         )
         connection.execute(
             "INSERT INTO runner_signal VALUES (?, ?, ?, ?)",
-            (7, "legacy-signal", 3, '{"legacy":true}'),
+            (7, signal.signal_id, 3, payload),
         )
 
     _store(path)
 
     with sqlite3.connect(path) as connection:
         row = connection.execute(
-            "SELECT sequence, signal_id, feature_sequence, payload_json FROM runner_signal"
+            """
+            SELECT sequence, signal_id, feature_sequence, candidate_id, action,
+                   entry_signal_id, candidate_occurrence_id,
+                   event_time, available_at, expires_at, payload_json
+            FROM runner_signal
+            """
         ).fetchone()
-    assert row == (7, "legacy-signal", 3, '{"legacy":true}')
+    assert row == (
+        7,
+        signal.signal_id,
+        3,
+        signal.candidate_id,
+        signal.action.value,
+        None,
+        None,
+        signal.event_time.isoformat().replace("+00:00", "Z"),
+        signal.available_at.isoformat().replace("+00:00", "Z"),
+        signal.expires_at.isoformat().replace("+00:00", "Z"),
+        payload,
+    )
+
+
+def test_runner_signal_has_first_class_pit_columns_and_bounded_lookup_indexes(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "runner.sqlite3"
+    store = _store(path)
+    signal = (
+        store.process_batch(
+            _envelope(),
+            _frame(),
+            dataset_snapshot_id="d" * 64,
+            observed_at=NOW,
+            evaluator=_entry_decision,
+        )
+        .signals[0]
+        .signal
+    )
+
+    with sqlite3.connect(path) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(runner_signal)")}
+        entry_plan = " ".join(
+            str(row[3])
+            for row in connection.execute(
+                """
+                EXPLAIN QUERY PLAN
+                SELECT payload_json FROM runner_signal
+                WHERE candidate_id = ? AND candidate_occurrence_id IS ?
+                  AND action = 'b_intent'
+                ORDER BY sequence DESC LIMIT 1
+                """,
+                (signal.candidate_id, None),
+            )
+        )
+        exit_plan = " ".join(
+            str(row[3])
+            for row in connection.execute(
+                """
+                EXPLAIN QUERY PLAN
+                SELECT payload_json FROM runner_signal
+                WHERE candidate_id = ? AND candidate_occurrence_id IS ?
+                  AND entry_signal_id = ?
+                  AND action IN ('reduce', 's_intent')
+                  AND available_at <= ?
+                ORDER BY sequence
+                """,
+                (signal.candidate_id, None, signal.signal_id, NOW.isoformat()),
+            )
+        )
+
+    assert {
+        "candidate_id",
+        "action",
+        "entry_signal_id",
+        "candidate_occurrence_id",
+        "event_time",
+        "available_at",
+        "expires_at",
+    } <= columns
+    assert "runner_signal_entry_lookup_idx" in entry_plan
+    assert "runner_signal_exit_lookup_idx" in exit_plan
+
+
+def test_runner_signal_index_columns_must_match_canonical_payload(tmp_path: Path) -> None:
+    path = tmp_path / "runner.sqlite3"
+    store = _store(path)
+    store.process_batch(
+        _envelope(),
+        _frame(),
+        dataset_snapshot_id="d" * 64,
+        observed_at=NOW,
+        evaluator=_entry_decision,
+    )
+    with sqlite3.connect(path) as connection:
+        connection.execute("UPDATE runner_signal SET action = 'S_INTENT'")
+
+    with pytest.raises(ValueError, match="runner_signal.*payload|indexed|identity"):
+        _store(path)
 
 
 def test_process_batch_rejects_extended_metadata_and_row_tampering(tmp_path: Path) -> None:
@@ -1197,7 +1880,7 @@ def test_process_batch_rejects_unsafe_supplied_json_payloads(
         )
 
 
-def test_empty_joined_batch_advances_cursor_without_static_contract_fields(
+def test_empty_joined_batch_advances_cursor_with_authority_static_contract(
     tmp_path: Path,
 ) -> None:
     joined = _joined_feature_batch(tmp_path, empty_requested_authority=True)
@@ -1224,7 +1907,7 @@ def test_empty_joined_batch_advances_cursor_without_static_contract_fields(
         evaluator=lambda *_args: pytest.fail("empty batch must not evaluate candidates"),
     )
 
-    assert joined.static_feature_names == ()
+    assert joined.static_feature_names == ("candidate_score",)
     assert joined.envelope.row_count == len(joined.frame) == 0
     assert result.processed_candidates == 0
     assert result.skipped_candidates == 0
@@ -1458,6 +2141,59 @@ def test_runner_rejects_future_or_incompatible_feature_batches(tmp_path: Path) -
         )
 
 
+def test_runner_enforces_published_feature_max_delay(tmp_path: Path) -> None:
+    contract = FeatureContract(
+        contract_id="intraday-pit",
+        version=1,
+        features=(
+            FeatureDefinition(
+                name="rel_same_minute",
+                dtype="float64",
+                source_datasets=("market_minute",),
+                lookback=20,
+                pit_rule="available_at <= decision_time",
+                price_basis="raw",
+                availability_contract={
+                    "source_available_at_basis": "max_source_available_at",
+                    "max_delay_seconds": 1,
+                    "missing_policy": "fail_closed",
+                    "late_policy": "fail_closed",
+                    "decision_visibility_gate": "available_at_lte_decision_time",
+                },
+            ),
+        ),
+        producer_commit="c" * 40,
+    )
+    store = StrategyRunnerStore(
+        tmp_path / "runner.sqlite3",
+        spec=_spec(),
+        evaluator_contract_fingerprint=EVALUATOR_FINGERPRINT,
+        feature_contract=contract,
+    )
+
+    with pytest.raises(ValueError, match="max_delay|delay"):
+        store.process_batch(
+            _envelope(
+                event_time=NOW - timedelta(seconds=2),
+                available_at=NOW,
+                field_statuses=(
+                    FeatureFieldStatus(
+                        name="rel_same_minute",
+                        status=FeatureAvailability.AVAILABLE,
+                        source_event_time=NOW - timedelta(seconds=2),
+                        available_at=NOW,
+                        decision_cutoff=NOW,
+                        actual_delay_seconds=2.0,
+                    ),
+                ),
+            ),
+            _frame(),
+            dataset_snapshot_id="d" * 64,
+            observed_at=NOW,
+            evaluator=_entry_decision,
+        )
+
+
 def test_dataset_snapshot_id_is_validated_even_without_signal(tmp_path: Path) -> None:
     store = _store(tmp_path / "runner.sqlite3")
 
@@ -1491,6 +2227,74 @@ def test_required_feature_unavailable_skips_candidate_without_calling_evaluator(
     assert result.skipped_candidates == 1
     assert result.signals == ()
     assert store.candidate_state("300001.SZ").state is StrategyLifecycleState.IDLE
+
+
+def test_runner_applies_max_delay_to_each_candidate_feature_instance(
+    tmp_path: Path,
+) -> None:
+    frame = pd.DataFrame(
+        {
+            "ts_code": ["300001.SZ", "600000.SH"],
+            "rel_same_minute": [2.0, 2.0],
+        }
+    )
+    statuses = tuple(
+        FeatureFieldStatus(
+            candidate_id=candidate_id,
+            name="rel_same_minute",
+            status=FeatureAvailability.AVAILABLE,
+            source_event_time=source_event_time,
+            available_at=NOW,
+            decision_cutoff=NOW,
+            actual_delay_seconds=(NOW - source_event_time).total_seconds(),
+        )
+        for candidate_id, source_event_time in (
+            ("300001.SZ", NOW - timedelta(seconds=61)),
+            ("600000.SH", NOW),
+        )
+    )
+    envelope = _envelope(
+        content_hash=_payload_hash(frame),
+        field_statuses=statuses,
+        row_count=2,
+    )
+    contract = FeatureContract(
+        contract_id="intraday-pit",
+        version=1,
+        features=(
+            FeatureDefinition(
+                name="rel_same_minute",
+                dtype="float64",
+                source_datasets=("market_minute",),
+                lookback=20,
+                pit_rule="available_at <= decision_time",
+                price_basis="raw",
+                availability_contract={
+                    "source_available_at_basis": "per_candidate_source_available_at",
+                    "max_delay_seconds": 60,
+                    "missing_policy": "fail_closed",
+                    "late_policy": "fail_closed",
+                    "decision_visibility_gate": "available_at_lte_decision_time",
+                },
+            ),
+        ),
+        producer_commit="c" * 40,
+    )
+    store = StrategyRunnerStore(
+        tmp_path / "runner.sqlite3",
+        spec=_spec(),
+        evaluator_contract_fingerprint=EVALUATOR_FINGERPRINT,
+        feature_contract=contract,
+    )
+
+    with pytest.raises(ValueError, match="300001.SZ.*max_delay|max_delay.*300001.SZ"):
+        store.process_batch(
+            envelope,
+            frame,
+            dataset_snapshot_id="d" * 64,
+            observed_at=NOW,
+            evaluator=lambda *_args: None,
+        )
 
 
 def test_evaluator_only_sees_declared_currently_usable_features(tmp_path: Path) -> None:

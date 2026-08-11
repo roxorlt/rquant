@@ -21,11 +21,13 @@ from rquant.runtime_candidate_universe import (
 )
 from rquant.runtime_contracts import RuntimeContractModel, canonical_sha256
 from rquant.strategy_candidate_snapshot import (
+    StrategyCandidateAuthorityBinding,
     StrategyCandidatePriceBasis,
     StrategyCandidateRecord,
     StrategyCandidateSnapshot,
     StrategyCandidateSnapshotSpool,
     candidate_occurrence_id,
+    strategy_candidate_schema_fingerprint,
     strategy_candidate_snapshot_content_sha256,
 )
 
@@ -34,13 +36,39 @@ OTHER_COMMIT = "b" * 40
 TRADE_DATE = date(2026, 7, 31)
 AS_OF = datetime(2026, 7, 31, 1, 30, tzinfo=UTC)
 REFERENCE_HASH = "1" * 64
+DEFINITION_FINGERPRINT = "4" * 64
+EXECUTABLE_FINGERPRINT = "5" * 64
+
+
+def _static_feature_schema(*names: str) -> dict[str, dict[str, str]]:
+    return {
+        name: {
+            "dtype": (
+                "string"
+                if "basis" in name or name == "pool"
+                else "object"
+                if name in {"levels", "nested"}
+                else "number"
+            ),
+            "semantic": f"candidate static feature {name}",
+        }
+        for name in sorted(names)
+    }
+
+
+STATIC_FEATURE_SCHEMA = _static_feature_schema("score")
+CANDIDATE_SCHEMA_FINGERPRINT = strategy_candidate_schema_fingerprint(
+    strategy_id="n_shape",
+    strategy_version="1",
+    static_feature_schema=STATIC_FEATURE_SCHEMA,
+)
 
 
 def _row(
     code: str,
     *,
     strategy_id: str = "n_shape",
-    strategy_version: str = "v1",
+    strategy_version: str = "1",
     decision_at: datetime | None = None,
     available_at: datetime | None = None,
     effective_trade_date: date = TRADE_DATE,
@@ -67,13 +95,17 @@ def _publish(
     root: Path,
     *,
     strategy_id: str = "n_shape",
-    strategy_version: str = "v1",
+    strategy_version: str = "1",
     codes: tuple[str, ...] = ("000001.SZ",),
     sequence: int = 0,
     captured_at: datetime | None = None,
     producer_commit: str = COMMIT,
     trade_date: date = TRADE_DATE,
     rows: tuple[StrategyCandidateRecord, ...] | None = None,
+    definition_fingerprint: str = DEFINITION_FINGERPRINT,
+    executable_fingerprint: str = EXECUTABLE_FINGERPRINT,
+    candidate_schema_fingerprint: str | None = None,
+    static_feature_schema: dict[str, dict[str, str]] | None = None,
 ) -> StrategyCandidateSnapshot:
     resolved_captured_at = captured_at or AS_OF - timedelta(minutes=2)
     resolved_rows = (
@@ -94,9 +126,21 @@ def _publish(
             for code in codes
         )
     )
+    schema = static_feature_schema or _static_feature_schema(
+        *(resolved_rows[0].static_features if resolved_rows else ("score",))
+    )
+    fingerprint = candidate_schema_fingerprint or strategy_candidate_schema_fingerprint(
+        strategy_id=strategy_id,
+        strategy_version=strategy_version,
+        static_feature_schema=schema,
+    )
     result = StrategyCandidateSnapshotSpool(root.resolve()).publish_strategy_records(
         strategy_id=strategy_id,
         strategy_version=strategy_version,
+        definition_fingerprint=definition_fingerprint,
+        executable_fingerprint=executable_fingerprint,
+        candidate_schema_fingerprint=fingerprint,
+        static_feature_schema=schema,
         source_snapshot_ids={
             "candidate_input": canonical_sha256(
                 {
@@ -119,16 +163,32 @@ def _authority(
     root: Path,
     *,
     strategy_id: str = "n_shape",
-    strategy_version: str = "v1",
+    strategy_version: str = "1",
     required: bool = True,
     max_age_seconds: int = 600,
+    definition_fingerprint: str = DEFINITION_FINGERPRINT,
+    executable_fingerprint: str = EXECUTABLE_FINGERPRINT,
+    candidate_schema_fingerprint: str | None = None,
+    static_feature_names: tuple[str, ...] = ("score",),
+    static_feature_schema: dict[str, dict[str, str]] | None = None,
 ) -> CandidateUniverseAuthority:
+    schema = static_feature_schema or _static_feature_schema(*static_feature_names)
+    fingerprint = candidate_schema_fingerprint or strategy_candidate_schema_fingerprint(
+        strategy_id=strategy_id,
+        strategy_version=strategy_version,
+        static_feature_schema=schema,
+    )
     return CandidateUniverseAuthority(
         strategy_id=strategy_id,
         strategy_version=strategy_version,
         snapshot_root=root,
         required=required,
         max_age_seconds=max_age_seconds,
+        definition_fingerprint=definition_fingerprint,
+        executable_fingerprint=executable_fingerprint,
+        candidate_schema_fingerprint=fingerprint,
+        static_feature_names=static_feature_names,
+        static_feature_schema=schema,
     )
 
 
@@ -173,14 +233,109 @@ def test_cross_layer_models_are_frozen_runtime_contracts(tmp_path: Path) -> None
         authority.required = False  # type: ignore[misc]
 
 
+def test_runtime_strategy_authority_requires_exact_semantic_fingerprints(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValidationError, match="fingerprint|required"):
+        CandidateUniverseAuthority(
+            strategy_id="n_shape",
+            strategy_version="1",
+            snapshot_root=(tmp_path / "legacy").resolve(),
+            required=True,
+            max_age_seconds=60,
+        )
+
+    authority = CandidateUniverseAuthority(
+        strategy_id="n_shape",
+        strategy_version="1",
+        snapshot_root=(tmp_path / "bound").resolve(),
+        required=True,
+        max_age_seconds=60,
+        definition_fingerprint=DEFINITION_FINGERPRINT,
+        executable_fingerprint=EXECUTABLE_FINGERPRINT,
+        candidate_schema_fingerprint=CANDIDATE_SCHEMA_FINGERPRINT,
+        static_feature_names=("score",),
+        static_feature_schema=STATIC_FEATURE_SCHEMA,
+    )
+
+    assert authority.executable_fingerprint == EXECUTABLE_FINGERPRINT
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["definition_fingerprint", "executable_fingerprint", "candidate_schema_fingerprint"],
+)
+def test_runtime_loader_rejects_any_semantic_fingerprint_mismatch(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    root = (tmp_path / field).resolve()
+    _publish(root)
+    authority_payload = _authority(root).model_dump(mode="python")
+    authority_payload[field] = "f" * 64
+
+    with pytest.raises(
+        (ValidationError, RuntimeCandidateUniverseIntegrityError),
+        match="fingerprint|identity|schema",
+    ):
+        _loader(CandidateUniverseAuthority.model_validate(authority_payload)).load(
+            as_of=AS_OF,
+            required_trade_date=TRADE_DATE,
+        )
+
+
+def test_runtime_result_preserves_exact_strategy_semantic_fingerprints(
+    tmp_path: Path,
+) -> None:
+    root = (tmp_path / "exact-lineage").resolve()
+    snapshot = _publish(root, codes=("000001.SZ", "000002.SZ"))
+
+    result = _loader(_authority(root)).load(
+        as_of=AS_OF,
+        required_trade_date=TRADE_DATE,
+    )
+
+    evidence = result.authorities[0]
+    assert evidence.authority_binding_sha256 == snapshot.authority_binding.content_sha256
+    assert evidence.definition_fingerprint == DEFINITION_FINGERPRINT
+    assert evidence.executable_fingerprint == EXECUTABLE_FINGERPRINT
+    assert evidence.candidate_schema_fingerprint == CANDIDATE_SCHEMA_FINGERPRINT
+
+
+def test_legacy_runtime_authority_payload_requires_explicit_republish() -> None:
+    with pytest.raises(ValidationError, match="legacy|republish"):
+        CandidateUniverseAuthorityEvidence(
+            strategy_id="n_shape",
+            strategy_version="1",
+            schema_version=2,
+            generation_sha256="2" * 64,
+            authority_binding_sha256="3" * 64,
+            definition_fingerprint=DEFINITION_FINGERPRINT,
+            executable_fingerprint=EXECUTABLE_FINGERPRINT,
+            candidate_schema_fingerprint=CANDIDATE_SCHEMA_FINGERPRINT,
+            static_feature_names=("score",),
+            static_feature_schema=STATIC_FEATURE_SCHEMA,
+            source_snapshot_ids={"candidate_input": "7" * 64},
+            sequence=0,
+            row_count=0,
+            captured_at=AS_OF,
+            codes=(),
+        )
+
+
 def test_schema_v3_authority_evidence_rejects_empty_source_snapshot_name() -> None:
     with pytest.raises(ValidationError, match="non-empty"):
         CandidateUniverseAuthorityEvidence(
             strategy_id="n_shape",
-            strategy_version="v1",
+            strategy_version="1",
             schema_version=3,
             generation_sha256="2" * 64,
             authority_binding_sha256="3" * 64,
+            definition_fingerprint=DEFINITION_FINGERPRINT,
+            executable_fingerprint=EXECUTABLE_FINGERPRINT,
+            candidate_schema_fingerprint=CANDIDATE_SCHEMA_FINGERPRINT,
+            static_feature_names=("score",),
+            static_feature_schema=STATIC_FEATURE_SCHEMA,
             source_snapshot_ids={"": "4" * 64},
             sequence=0,
             row_count=0,
@@ -203,7 +358,7 @@ def test_authority_rejects_relative_and_non_normalized_roots(
     with pytest.raises(ValidationError, match=message):
         CandidateUniverseAuthority(
             strategy_id="n_shape",
-            strategy_version="v1",
+            strategy_version="1",
             snapshot_root=root,
             required=True,
             max_age_seconds=60,
@@ -228,7 +383,7 @@ def test_load_unions_codes_and_preserves_all_authority_evidence(tmp_path: Path) 
     growth_snapshot = _publish(
         growth_root,
         strategy_id="growth_board_surge",
-        strategy_version="v2",
+        strategy_version="2",
         codes=("000001.SZ", "300001.SZ"),
     )
     loader = _loader(
@@ -236,7 +391,7 @@ def test_load_unions_codes_and_preserves_all_authority_evidence(tmp_path: Path) 
         _authority(
             growth_root,
             strategy_id="growth_board_surge",
-            strategy_version="v2",
+            strategy_version="2",
         ),
     )
 
@@ -248,13 +403,13 @@ def test_load_unions_codes_and_preserves_all_authority_evidence(tmp_path: Path) 
         (item.strategy_id, item.strategy_version, item.generation_sha256, item.row_count)
         for item in result.authorities
     ) == (
-        ("growth_board_surge", "v2", growth_snapshot.content_sha256, 2),
-        ("n_shape", "v1", n_snapshot.content_sha256, 2),
+        ("growth_board_surge", "2", growth_snapshot.content_sha256, 2),
+        ("n_shape", "1", n_snapshot.content_sha256, 2),
     )
     repeated = next(item for item in result.code_evidence if item.code == "000001.SZ")
     assert tuple((hit.strategy_id, hit.strategy_version) for hit in repeated.hits) == (
-        ("growth_board_surge", "v2"),
-        ("n_shape", "v1"),
+        ("growth_board_surge", "2"),
+        ("n_shape", "1"),
     )
     assert result.content_fingerprint == canonical_sha256(
         result.model_dump(mode="python", exclude={"content_fingerprint"})
@@ -267,7 +422,11 @@ def test_runtime_loader_rejects_bound_empty_authority_under_wrong_strategy(
     root = (tmp_path / "bound-empty").resolve()
     StrategyCandidateSnapshotSpool(root).publish_strategy_records(
         strategy_id="n_shape",
-        strategy_version="v1",
+        strategy_version="1",
+        definition_fingerprint=DEFINITION_FINGERPRINT,
+        executable_fingerprint=EXECUTABLE_FINGERPRINT,
+        candidate_schema_fingerprint=CANDIDATE_SCHEMA_FINGERPRINT,
+        static_feature_schema=STATIC_FEATURE_SCHEMA,
         source_snapshot_ids={"candidate_input": "3" * 64},
         trade_date=TRADE_DATE,
         captured_at=AS_OF - timedelta(minutes=2),
@@ -280,9 +439,96 @@ def test_runtime_loader_rejects_bound_empty_authority_under_wrong_strategy(
             _authority(
                 root,
                 strategy_id="growth_board_surge",
-                strategy_version="v1",
+                strategy_version="1",
             )
         ).load(as_of=AS_OF, required_trade_date=TRADE_DATE)
+
+
+def test_runtime_loader_rejects_candidate_static_semantic_binding_mismatch(
+    tmp_path: Path,
+) -> None:
+    root = (tmp_path / "static-binding").resolve()
+    definition_fingerprint = "4" * 64
+    static_feature_schema = _static_feature_schema("candidate_price_basis")
+    candidate_schema_fingerprint = strategy_candidate_schema_fingerprint(
+        strategy_id="n_shape",
+        strategy_version="1",
+        static_feature_schema=static_feature_schema,
+    )
+    _publish(
+        root,
+        strategy_version="1",
+        rows=(
+            _row(
+                "000001.SZ",
+                strategy_version="1",
+                static_features={"candidate_price_basis": "raw_session"},
+            ),
+        ),
+        definition_fingerprint=definition_fingerprint,
+        candidate_schema_fingerprint=candidate_schema_fingerprint,
+        static_feature_schema=static_feature_schema,
+    )
+
+    authority = CandidateUniverseAuthority(
+        strategy_id="n_shape",
+        strategy_version="1",
+        snapshot_root=root,
+        required=True,
+        max_age_seconds=600,
+        definition_fingerprint="6" * 64,
+        executable_fingerprint=EXECUTABLE_FINGERPRINT,
+        candidate_schema_fingerprint=candidate_schema_fingerprint,
+        static_feature_names=("candidate_price_basis",),
+        static_feature_schema=static_feature_schema,
+    )
+    with pytest.raises(
+        RuntimeCandidateUniverseIntegrityError, match="identity|definition fingerprint"
+    ):
+        _loader(authority).load(as_of=AS_OF, required_trade_date=TRADE_DATE)
+
+
+def test_runtime_loader_rejects_candidate_static_feature_shape_mismatch(
+    tmp_path: Path,
+) -> None:
+    root = (tmp_path / "static-shape").resolve()
+    definition_fingerprint = "4" * 64
+    published_schema = _static_feature_schema("wrong")
+    candidate_schema_fingerprint = strategy_candidate_schema_fingerprint(
+        strategy_id="n_shape",
+        strategy_version="1",
+        static_feature_schema=published_schema,
+    )
+    _publish(
+        root,
+        strategy_version="1",
+        rows=(_row("000001.SZ", strategy_version="1", static_features={"wrong": 1}),),
+        definition_fingerprint=definition_fingerprint,
+        executable_fingerprint=EXECUTABLE_FINGERPRINT,
+        candidate_schema_fingerprint=candidate_schema_fingerprint,
+        static_feature_schema=published_schema,
+    )
+
+    authority = CandidateUniverseAuthority(
+        strategy_id="n_shape",
+        strategy_version="1",
+        snapshot_root=root,
+        required=True,
+        max_age_seconds=600,
+        definition_fingerprint=definition_fingerprint,
+        executable_fingerprint=EXECUTABLE_FINGERPRINT,
+        candidate_schema_fingerprint=strategy_candidate_schema_fingerprint(
+            strategy_id="n_shape",
+            strategy_version="1",
+            static_feature_schema=_static_feature_schema("candidate_price_basis"),
+        ),
+        static_feature_names=("candidate_price_basis",),
+        static_feature_schema=_static_feature_schema("candidate_price_basis"),
+    )
+    with pytest.raises(
+        RuntimeCandidateUniverseIntegrityError, match="identity|static feature schema"
+    ):
+        _loader(authority).load(as_of=AS_OF, required_trade_date=TRADE_DATE)
 
 
 def test_load_accepts_prior_day_decision_and_preserves_immutable_pit_features(
@@ -306,7 +552,13 @@ def test_load_accepts_prior_day_decision_and_preserves_immutable_pit_features(
     features["score"] = 0.01
     features["levels"]["support"].append(99.0)  # type: ignore[index, union-attr]
 
-    result = _loader(_authority(root, max_age_seconds=24 * 60 * 60)).load(
+    result = _loader(
+        _authority(
+            root,
+            max_age_seconds=24 * 60 * 60,
+            static_feature_names=("levels", "score"),
+        )
+    ).load(
         as_of=next_open,
         required_trade_date=TRADE_DATE,
     )
@@ -379,6 +631,65 @@ def test_result_generation_hash_binds_static_features(tmp_path: Path) -> None:
         RuntimeCandidateUniverseResult.model_validate(payload)
 
 
+def test_runtime_result_rejects_rehashed_static_value_with_wrong_declared_dtype(
+    tmp_path: Path,
+) -> None:
+    root = (tmp_path / "dtype-forgery").resolve()
+    _publish(root, strategy_version="1")
+    result = _loader(_authority(root, strategy_version="1")).load(
+        as_of=AS_OF,
+        required_trade_date=TRADE_DATE,
+    )
+    authority = result.authorities[0]
+    hit = result.code_evidence[0].hits[0]
+    forged_hit = hit.model_copy(update={"static_features": {"score": True}})
+    forged_row = StrategyCandidateRecord(
+        strategy_id=forged_hit.strategy_id,
+        strategy_version=forged_hit.strategy_version,
+        candidate_id=forged_hit.candidate_id,
+        variant=forged_hit.variant,
+        decision_at=forged_hit.decision_at,
+        available_at=forged_hit.available_at,
+        effective_trade_date=forged_hit.effective_trade_date,
+        reference_trade_date=forged_hit.reference_trade_date,
+        price_basis=forged_hit.price_basis,
+        static_features=forged_hit.static_features,
+        reference_snapshot_ids=forged_hit.reference_snapshot_ids,
+    )
+    binding = StrategyCandidateAuthorityBinding.create(
+        strategy_id=authority.strategy_id,
+        strategy_version=authority.strategy_version,
+        definition_fingerprint=authority.definition_fingerprint,
+        executable_fingerprint=authority.executable_fingerprint,
+        candidate_schema_fingerprint=authority.candidate_schema_fingerprint,
+        static_feature_schema=authority.static_feature_schema,
+    )
+    generation_sha256 = strategy_candidate_snapshot_content_sha256(
+        schema_version=3,
+        sequence=authority.sequence,
+        trade_date=result.required_trade_date,
+        captured_at=authority.captured_at,
+        producer_commit=result.expected_commit,
+        rows=(forged_row,),
+        authority_binding=binding,
+        source_snapshot_ids=authority.source_snapshot_ids,
+    )
+    forged_authority = authority.model_copy(update={"generation_sha256": generation_sha256})
+    forged_hit = forged_hit.model_copy(update={"generation_sha256": generation_sha256})
+    forged_code = result.code_evidence[0].model_copy(update={"hits": (forged_hit,)})
+
+    with pytest.raises(ValueError, match="static feature.*dtype"):
+        RuntimeCandidateUniverseResult.build(
+            as_of=result.as_of,
+            required_trade_date=result.required_trade_date,
+            expected_commit=result.expected_commit,
+            codes=result.codes,
+            authorities=(forged_authority,),
+            degraded_optional_authorities=(),
+            code_evidence=(forged_code,),
+        )
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -408,7 +719,7 @@ def test_result_generation_hash_binds_remaining_row_contract(
         RuntimeCandidateUniverseResult.model_validate(payload)
 
 
-def test_result_reconstructs_legacy_v1_generation_hash() -> None:
+def test_result_rejects_legacy_v1_generation_before_reconstruction() -> None:
     row = _row("000001.SZ")
     captured_at = AS_OF - timedelta(minutes=2)
     generation_sha256 = strategy_candidate_snapshot_content_sha256(
@@ -419,49 +730,25 @@ def test_result_reconstructs_legacy_v1_generation_hash() -> None:
         producer_commit=COMMIT,
         rows=(row,),
     )
-    authority = CandidateUniverseAuthorityEvidence(
-        strategy_id=row.strategy_id,
-        strategy_version=row.strategy_version,
-        schema_version=1,
-        generation_sha256=generation_sha256,
-        sequence=0,
-        row_count=1,
-        captured_at=captured_at,
-        codes=(row.candidate_id,),
-    )
-    hit = CandidateUniverseHitEvidence(
-        schema_version=1,
-        strategy_id=row.strategy_id,
-        strategy_version=row.strategy_version,
-        generation_sha256=generation_sha256,
-        candidate_id=row.candidate_id,
-        variant=row.variant,
-        decision_at=row.decision_at,
-        available_at=row.available_at,
-        effective_trade_date=row.effective_trade_date,
-        occurrence_id=row.occurrence_id,
-        static_features=row.static_features,
-        reference_trade_date=row.reference_trade_date,
-        price_basis=row.price_basis,
-        reference_snapshot_ids=row.reference_snapshot_ids,
-    )
-    result = RuntimeCandidateUniverseResult.build(
-        as_of=AS_OF,
-        required_trade_date=TRADE_DATE,
-        expected_commit=COMMIT,
-        codes=(row.candidate_id,),
-        authorities=(authority,),
-        degraded_optional_authorities=(),
-        code_evidence=(CandidateUniverseCodeEvidence(code=row.candidate_id, hits=(hit,)),),
-    )
 
-    payload = result.model_dump(mode="python")
-    payload["code_evidence"][0]["hits"][0]["static_features"]["score"] = 999
-    payload["content_fingerprint"] = canonical_sha256(
-        {key: value for key, value in payload.items() if key != "content_fingerprint"}
-    )
-    with pytest.raises(ValidationError, match="generation"):
-        RuntimeCandidateUniverseResult.model_validate(payload)
+    with pytest.raises(ValidationError, match="legacy|republish"):
+        CandidateUniverseAuthorityEvidence(
+            strategy_id=row.strategy_id,
+            strategy_version=row.strategy_version,
+            schema_version=1,
+            generation_sha256=generation_sha256,
+            authority_binding_sha256="3" * 64,
+            definition_fingerprint=DEFINITION_FINGERPRINT,
+            executable_fingerprint=EXECUTABLE_FINGERPRINT,
+            candidate_schema_fingerprint=CANDIDATE_SCHEMA_FINGERPRINT,
+            static_feature_names=("score",),
+            static_feature_schema=STATIC_FEATURE_SCHEMA,
+            source_snapshot_ids={"candidate_input": "7" * 64},
+            sequence=0,
+            row_count=1,
+            captured_at=captured_at,
+            codes=(row.candidate_id,),
+        )
 
 
 def test_candidate_hit_dates_use_asia_shanghai_calendar_day(tmp_path: Path) -> None:
@@ -511,12 +798,12 @@ def test_candidate_hit_dates_use_asia_shanghai_calendar_day(tmp_path: Path) -> N
     assert CandidateUniverseHitEvidence.model_validate(payload).effective_trade_date == TRADE_DATE
 
 
-def test_candidate_hit_date_semantics_follow_snapshot_schema() -> None:
+def test_candidate_hit_legacy_schema_requires_explicit_republish() -> None:
     decision_at = datetime(2026, 7, 31, 16, 30, tzinfo=UTC)
     effective_trade_date = date(2026, 7, 31)
     occurrence_id = candidate_occurrence_id(
         strategy_id="n_shape",
-        strategy_version="v1",
+        strategy_version="1",
         candidate_id="000001.SZ",
         variant="default",
         effective_trade_date=effective_trade_date,
@@ -524,7 +811,7 @@ def test_candidate_hit_date_semantics_follow_snapshot_schema() -> None:
     payload = {
         "schema_version": 1,
         "strategy_id": "n_shape",
-        "strategy_version": "v1",
+        "strategy_version": "1",
         "generation_sha256": "2" * 64,
         "candidate_id": "000001.SZ",
         "variant": "default",
@@ -538,21 +825,17 @@ def test_candidate_hit_date_semantics_follow_snapshot_schema() -> None:
         "reference_snapshot_ids": {"daily": REFERENCE_HASH},
     }
 
-    legacy = CandidateUniverseHitEvidence.model_validate(payload)
-    assert legacy.schema_version == 1
-
-    payload["schema_version"] = 2
-    with pytest.raises(ValidationError, match="effective_trade_date"):
+    with pytest.raises(ValidationError, match="legacy|republish"):
         CandidateUniverseHitEvidence.model_validate(payload)
 
 
-def test_v1_hit_requires_same_utc_decision_date_while_v2_allows_prior_day() -> None:
+def test_candidate_hit_v1_and_v2_are_both_rejected_as_legacy() -> None:
     decision_at = datetime(2026, 7, 30, 9, 0, tzinfo=UTC)
     effective_trade_date = TRADE_DATE
     payload = {
         "schema_version": 1,
         "strategy_id": "n_shape",
-        "strategy_version": "v1",
+        "strategy_version": "1",
         "generation_sha256": "2" * 64,
         "candidate_id": "000001.SZ",
         "variant": "default",
@@ -561,7 +844,7 @@ def test_v1_hit_requires_same_utc_decision_date_while_v2_allows_prior_day() -> N
         "effective_trade_date": effective_trade_date,
         "occurrence_id": candidate_occurrence_id(
             strategy_id="n_shape",
-            strategy_version="v1",
+            strategy_version="1",
             candidate_id="000001.SZ",
             variant="default",
             effective_trade_date=effective_trade_date,
@@ -572,11 +855,10 @@ def test_v1_hit_requires_same_utc_decision_date_while_v2_allows_prior_day() -> N
         "reference_snapshot_ids": {"daily": REFERENCE_HASH},
     }
 
-    with pytest.raises(ValidationError, match="decision"):
-        CandidateUniverseHitEvidence.model_validate(payload)
-
-    payload["schema_version"] = 2
-    assert CandidateUniverseHitEvidence.model_validate(payload).effective_trade_date == TRADE_DATE
+    for schema_version in (1, 2):
+        payload["schema_version"] = schema_version
+        with pytest.raises(ValidationError, match="legacy|republish"):
+            CandidateUniverseHitEvidence.model_validate(payload)
 
 
 def test_result_requires_hit_and_authority_schema_to_match(tmp_path: Path) -> None:
@@ -605,7 +887,7 @@ def test_optional_missing_is_degraded_but_required_missing_fails(tmp_path: Path)
         _authority(
             optional_root,
             strategy_id="auction_gap",
-            strategy_version="v3",
+            strategy_version="3",
             required=False,
         ),
     )
@@ -616,7 +898,7 @@ def test_optional_missing_is_degraded_but_required_missing_fails(tmp_path: Path)
     assert result.degraded_optional_authorities == (
         CandidateUniverseDegradedAuthority(
             strategy_id="auction_gap",
-            strategy_version="v3",
+            strategy_version="3",
             reason="missing",
         ),
     )
@@ -636,13 +918,13 @@ def test_optional_future_generation_is_degraded_as_not_visible(tmp_path: Path) -
     _publish(
         optional_root,
         strategy_id="auction_gap",
-        strategy_version="v3",
+        strategy_version="3",
         captured_at=AS_OF + timedelta(minutes=5),
         rows=(
             _row(
                 "600000.SH",
                 strategy_id="auction_gap",
-                strategy_version="v3",
+                strategy_version="3",
                 decision_at=AS_OF + timedelta(minutes=1),
                 available_at=AS_OF + timedelta(minutes=2),
             ),
@@ -654,7 +936,7 @@ def test_optional_future_generation_is_degraded_as_not_visible(tmp_path: Path) -
         _authority(
             optional_root,
             strategy_id="auction_gap",
-            strategy_version="v3",
+            strategy_version="3",
             required=False,
         ),
     ).load(as_of=AS_OF, required_trade_date=TRADE_DATE)
@@ -669,7 +951,7 @@ def test_optional_corruption_is_never_skipped(tmp_path: Path) -> None:
     damaged = _publish(
         damaged_root,
         strategy_id="auction_gap",
-        strategy_version="v3",
+        strategy_version="3",
     )
     generation = damaged_root / "generations" / f"{damaged.content_sha256}.json"
     payload = json.loads(generation.read_text())
@@ -681,7 +963,7 @@ def test_optional_corruption_is_never_skipped(tmp_path: Path) -> None:
         _authority(
             damaged_root,
             strategy_id="auction_gap",
-            strategy_version="v3",
+            strategy_version="3",
             required=False,
         ),
     )
@@ -714,7 +996,7 @@ def test_snapshot_contract_mismatches_fail_closed(
         authority = _authority(
             root,
             strategy_id="wrong",
-            strategy_version="v1",
+            strategy_version="1",
             max_age_seconds=600,
         )
     elif case == "trade_date":
@@ -768,7 +1050,7 @@ def test_empty_universe_without_any_successful_authority_fails_closed(tmp_path: 
     missing = _authority(
         tmp_path / "missing",
         strategy_id="optional",
-        strategy_version="v1",
+        strategy_version="1",
         required=False,
     )
 
@@ -801,7 +1083,7 @@ def test_optional_missing_below_symlink_ancestor_is_corruption(tmp_path: Path) -
         _authority(
             linked_parent / "missing",
             strategy_id="auction_gap",
-            strategy_version="v3",
+            strategy_version="3",
             required=False,
         ),
     )

@@ -1620,3 +1620,137 @@ def test_scheduler_terminalizes_deadline_at_claim_boundary(tmp_path: Path) -> No
     assert claims.pending() == ()
     assert job is not None and job.status is JobStatus.FAILED
     assert {shard.status for shard in reader.list_shards(job_id)} == {ShardStatus.FAILED}
+
+
+def test_shard_wire_result_round_trips_parquet_bytes_without_python_objects() -> None:
+    import pandas as pd
+
+    from rquant.strategy_job_adapters import (
+        LabShardExecutionResult,
+        LabShardExecutionWireResult,
+        LabShardTable,
+        default_strategy_job_adapter_registry,
+    )
+
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    validated = default_strategy_job_adapter_registry().validate_claim(claim)
+    result = LabShardExecutionResult.from_validated(
+        validated,
+        tables=(
+            LabShardTable(
+                name="trades",
+                frame=pd.DataFrame({"code": ["000001.SZ"], "ret_pct": [1.25], "hold_days": [1]}),
+            ),
+        ),
+    )
+
+    wire = LabShardExecutionWireResult.from_result(result)
+    restored = wire.to_result()
+
+    assert restored.model_dump(exclude={"tables"}) == result.model_dump(exclude={"tables"})
+    pd.testing.assert_frame_equal(restored.tables[0].frame, result.tables[0].frame)
+
+
+def test_shard_wire_result_rejects_tampered_parquet_hash() -> None:
+    import pandas as pd
+
+    from rquant.strategy_job_adapters import (
+        LabShardExecutionResult,
+        LabShardExecutionWireResult,
+        LabShardTable,
+        default_strategy_job_adapter_registry,
+    )
+
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    validated = default_strategy_job_adapter_registry().validate_claim(claim)
+    result = LabShardExecutionResult.from_validated(
+        validated,
+        tables=(LabShardTable(name="trades", frame=pd.DataFrame({"value": [1]})),),
+    )
+    wire = LabShardExecutionWireResult.from_result(result)
+    tampered = wire.model_copy(
+        update={"tables": (wire.tables[0].model_copy(update={"sha256": "f" * 64}),)}
+    )
+
+    with pytest.raises(ValueError, match="hash mismatch"):
+        tampered.to_result()
+
+
+def test_shard_wire_capacity_boundaries_fit_the_80_mib_receive_limit() -> None:
+    from rquant.strategy_job_adapters import (
+        MAX_AGGREGATE_PARQUET_BYTES,
+        MAX_PARQUET_BYTES_PER_TABLE,
+        MAX_RESULT_JSON_OVERHEAD_BYTES,
+        MAX_RESULT_WIRE_BYTES,
+        MAX_TABLES,
+        shard_wire_base64_size,
+        validate_shard_wire_capacity,
+    )
+
+    assert MAX_RESULT_WIRE_BYTES == 80 * 1024 * 1024
+    assert (
+        shard_wire_base64_size(MAX_AGGREGATE_PARQUET_BYTES)
+        + 4 * (MAX_TABLES - 1)
+        + MAX_RESULT_JSON_OVERHEAD_BYTES
+        <= MAX_RESULT_WIRE_BYTES
+    )
+    remainder = MAX_AGGREGATE_PARQUET_BYTES - MAX_PARQUET_BYTES_PER_TABLE
+    validate_shard_wire_capacity((MAX_PARQUET_BYTES_PER_TABLE, remainder))
+    validate_shard_wire_capacity((1,) * MAX_TABLES)
+
+    with pytest.raises(ValueError, match="at most"):
+        validate_shard_wire_capacity((1,) * (MAX_TABLES + 1))
+    with pytest.raises(ValueError, match="per-table"):
+        validate_shard_wire_capacity((MAX_PARQUET_BYTES_PER_TABLE + 1,))
+    with pytest.raises(ValueError, match="aggregate"):
+        validate_shard_wire_capacity(
+            (
+                MAX_PARQUET_BYTES_PER_TABLE,
+                remainder + 1,
+            )
+        )
+
+
+def test_shard_wire_rejects_too_many_tables_before_parquet_serialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.strategy_job_adapters import (
+        MAX_TABLES,
+        LabShardExecutionResult,
+        LabShardExecutionWireResult,
+        LabShardTable,
+        default_strategy_job_adapter_registry,
+    )
+
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    validated = default_strategy_job_adapter_registry().validate_claim(claim)
+    result = LabShardExecutionResult.from_validated(
+        validated,
+        tables=tuple(
+            LabShardTable(name=f"table_{index}", frame=pd.DataFrame({"value": [index]}))
+            for index in range(MAX_TABLES + 1)
+        ),
+    )
+    serialized = False
+
+    def unexpected_to_parquet(*_args: object, **_kwargs: object) -> None:
+        nonlocal serialized
+        serialized = True
+
+    monkeypatch.setattr(pd.DataFrame, "to_parquet", unexpected_to_parquet)
+
+    with pytest.raises(ValueError, match="at most"):
+        LabShardExecutionWireResult.from_result(result)
+    assert not serialized
+
+
+def test_shard_wire_model_rejects_noncanonical_base64_length() -> None:
+    from rquant.strategy_job_adapters import LabShardWireTable
+
+    with pytest.raises(ValidationError, match="base64 length"):
+        LabShardWireTable(
+            name="trades",
+            parquet_base64="YQ==",
+            byte_size=4,
+            sha256=hashlib.sha256(b"a").hexdigest(),
+        )

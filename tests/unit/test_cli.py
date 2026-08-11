@@ -8,7 +8,7 @@ import os
 import subprocess
 import sys
 import time
-from datetime import date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
@@ -18,6 +18,7 @@ import pytest
 from rquant.cli import build_parser
 from rquant.lab_daemon import ensure_private_directory as _real_ensure_private_directory
 from rquant.lab_daemon import verify_lab_runtime_prepared as _real_verify_lab_runtime_prepared
+from tests.highwater_ed25519_support import export_public_keyring, write_private_manifest
 
 _LAB_EXPECTED_ROOT = "/tmp/rquant-expected"
 _LAB_TRUSTED_GIT = "/usr/bin/git"
@@ -43,6 +44,24 @@ _LAB_DAEMON_GENERATION_ARGUMENTS = [
 ]
 
 
+def test_legacy_shadow_recovery_cli_is_recovery_only() -> None:
+    args = build_parser().parse_args(
+        [
+            "legacy-shadow-recover",
+            "--source",
+            "surge",
+            "--date",
+            "2026-08-03",
+        ]
+    )
+
+    assert args.command == "legacy-shadow-recover"
+    assert args.source == "surge"
+    assert args.date == "2026-08-03"
+    assert not hasattr(args, "events_path")
+    assert not hasattr(args, "exported_at")
+
+
 def test_lab_startup_deadline_binding_rejects_missing_or_expired_value() -> None:
     from rquant.cli import _lab_startup_deadline_binding
 
@@ -63,7 +82,330 @@ class _FakeLabSqliteAuthority:
         pass
 
 
+class _FixedCliResourceClock:
+    def __init__(self, value: datetime) -> None:
+        self.value = value
+
+    def __call__(self) -> datetime:
+        return self.value
+
+
+class _FixedCliSystemResourceProbe:
+    def available_memory_bytes(self) -> int:
+        return 16 * 1024**3
+
+    def available_disk_bytes(self, _path: Path) -> int:
+        return 100 * 1024**3
+
+    def cpu_load_pct(self) -> float:
+        return 10.0
+
+    def io_pressure_pct(self) -> float:
+        return 5.0
+
+
 class TestBuildParser:
+    @pytest.fixture(autouse=True)
+    def _fixed_absent_production_runtime(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from rquant import runtime_deployment_profile as deployment_module
+
+        parent = tmp_path / "fixed-production-parent"
+        parent.mkdir(mode=0o700)
+        monkeypatch.setattr(
+            deployment_module,
+            "LINUX_PRODUCTION_RUNTIME_ROOT",
+            parent / "runtime",
+        )
+
+    def test_production_daily_dag_has_no_free_profile_root(self) -> None:
+        with pytest.raises(SystemExit) as error:
+            build_parser().parse_args(
+                [
+                    "daily-dag",
+                    "--profile-root",
+                    "/tmp/attacker-controlled",
+                    "--trade-date",
+                    "2026-08-03",
+                    "--source-generation-id",
+                    "a" * 64,
+                    "--source-content-hash",
+                    "b" * 64,
+                    "--command-manifest-hash",
+                    "e" * 64,
+                    "--code-commit",
+                    "c" * 40,
+                    "--profile-hash",
+                    "d" * 64,
+                ]
+            )
+
+        assert error.value.code == 2
+
+    def test_daily_dag_dev_is_an_explicit_separate_entry(self, tmp_path: Path) -> None:
+        args = build_parser().parse_args(
+            [
+                "daily-dag-dev",
+                "--profile-root",
+                str(tmp_path.resolve()),
+                "--trade-date",
+                "2026-08-03",
+                "--source-generation-id",
+                "a" * 64,
+                "--source-content-hash",
+                "b" * 64,
+                "--command-manifest-hash",
+                "e" * 64,
+                "--code-commit",
+                "c" * 40,
+                "--profile-hash",
+                "d" * 64,
+            ]
+        )
+
+        assert args.command == "daily-dag-dev"
+        assert args.profile_root == tmp_path.resolve()
+
+    def test_daily_dag_dev_defaults_to_preview_shadow(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "daily-dag-dev",
+                "--profile-root",
+                "/tmp/daily-dag",
+                "--trade-date",
+                "2026-08-03",
+                "--source-generation-id",
+                "a" * 64,
+                "--source-content-hash",
+                "b" * 64,
+                "--command-manifest-hash",
+                "e" * 64,
+                "--code-commit",
+                "c" * 40,
+                "--profile-hash",
+                "d" * 64,
+            ]
+        )
+
+        assert args.command == "daily-dag-dev"
+        assert args.action == "preview"
+        assert not hasattr(args, "report_authority_command")
+
+    @pytest.mark.parametrize(
+        ("option", "value"),
+        [
+            ("--report-authority-command", "/tmp/runner-owned-helper"),
+            ("--report-authority-argument", "--keys-file=/tmp/runner-keys"),
+            ("--report-authority-state-root", "/tmp/runner-owned-state"),
+            ("--development-test-report-authority", "/tmp/test-capability"),
+        ],
+    )
+    def test_daily_dag_rejects_runner_owned_authority_injection(
+        self,
+        option: str,
+        value: str,
+    ) -> None:
+        with pytest.raises(SystemExit) as error:
+            build_parser().parse_args(
+                [
+                    "daily-dag-dev",
+                    "--profile-root",
+                    "/tmp/daily-dag",
+                    "--trade-date",
+                    "2026-08-03",
+                    "--source-generation-id",
+                    "a" * 64,
+                    "--source-content-hash",
+                    "b" * 64,
+                    "--command-manifest-hash",
+                    "e" * 64,
+                    "--code-commit",
+                    "c" * 40,
+                    "--profile-hash",
+                    "d" * 64,
+                    option,
+                    value,
+                ]
+            )
+
+        assert error.value.code == 2
+
+    def test_daily_dag_preview_is_readonly_and_emits_bound_plan(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from rquant.cli import cmd_daily_dag
+        from rquant.daily_pipeline_ledger import DailyPipelineMode, DailyPipelineStorageProfile
+
+        storage_profile = DailyPipelineStorageProfile.create(
+            root=tmp_path.resolve(),
+            mode=DailyPipelineMode.SHADOW,
+            profile_hash="d" * 64,
+        )
+        args = build_parser().parse_args(
+            [
+                "daily-dag-dev",
+                "--profile-root",
+                str(storage_profile.root),
+                "--trade-date",
+                "2026-08-03",
+                "--source-generation-id",
+                "a" * 64,
+                "--source-content-hash",
+                "b" * 64,
+                "--command-manifest-hash",
+                "e" * 64,
+                "--code-commit",
+                "c" * 40,
+                "--profile-hash",
+                "d" * 64,
+            ]
+        )
+
+        assert cmd_daily_dag(args) == 0
+        result = json.loads(capsys.readouterr().out)
+        assert result["action"] == "preview"
+        assert result["mode"] == "shadow"
+        assert len(result["plan_hash"]) == 64
+        assert result["run_id"].startswith("daily-")
+        assert storage_profile.state_path.exists() is False
+
+    def test_daily_dag_dev_is_disabled_by_production_profile(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from rquant import cli as cli_module
+        from rquant import config as config_module
+
+        monkeypatch.setattr(config_module.settings, "app_env", "prod")
+        development_root = tmp_path / "development"
+        args = build_parser().parse_args(
+            [
+                "daily-dag-dev",
+                "--profile-root",
+                str(development_root.resolve()),
+                "--trade-date",
+                "2026-08-03",
+                "--source-generation-id",
+                "a" * 64,
+                "--source-content-hash",
+                "b" * 64,
+                "--command-manifest-hash",
+                "e" * 64,
+                "--code-commit",
+                "c" * 40,
+                "--profile-hash",
+                "d" * 64,
+            ]
+        )
+
+        assert cli_module.cmd_daily_dag(args) == 2
+        assert development_root.exists() is False
+
+    def test_daily_dag_production_rejects_development_test_authority(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        from rquant.cli import cmd_daily_dag
+        from rquant.daily_pipeline_report_authority import (
+            DailyPipelineDevelopmentTestReportAuthority,
+        )
+
+        class _DevelopmentAuthority:
+            def compare_and_advance(self, _report: object) -> int:
+                return 1
+
+        args = build_parser().parse_args(
+            [
+                "daily-dag",
+                "--trade-date",
+                "2026-08-03",
+                "--source-generation-id",
+                "a" * 64,
+                "--source-content-hash",
+                "b" * 64,
+                "--command-manifest-hash",
+                "e" * 64,
+                "--code-commit",
+                "c" * 40,
+                "--profile-hash",
+                "d" * 64,
+            ]
+        )
+
+        assert (
+            cmd_daily_dag(
+                args,
+                development_test_report_authority=DailyPipelineDevelopmentTestReportAuthority(
+                    capability=_DevelopmentAuthority()
+                ),
+            )
+            == 2
+        )
+
+    def test_daily_dag_shadow_defaults_to_readonly_status(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "daily-dag-shadow",
+                "--report-root",
+                "/tmp/daily-shadow-reports",
+                "--expected-trade-date",
+                "2026-08-03",
+            ]
+        )
+
+        assert args.command == "daily-dag-shadow"
+        assert args.action == "status"
+        assert args.minimum_real_trading_days == 10
+        assert args.expected_trade_date == [date(2026, 8, 3)]
+
+    def test_daily_dag_shadow_status_does_not_create_a_report_directory(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from rquant.cli import cmd_daily_dag_shadow
+
+        report_root = tmp_path / "not-created-by-status"
+        monkeypatch.setenv("RQUANT_DAILY_SHADOW_SIGNING_KEY", "x" * 32)
+        args = build_parser().parse_args(
+            [
+                "daily-dag-shadow",
+                "--report-root",
+                str(report_root),
+                "--expected-trade-date",
+                "2026-07-20",
+                "--expected-trade-date",
+                "2026-07-21",
+                "--expected-trade-date",
+                "2026-07-22",
+                "--expected-trade-date",
+                "2026-07-23",
+                "--expected-trade-date",
+                "2026-07-24",
+                "--expected-trade-date",
+                "2026-07-27",
+                "--expected-trade-date",
+                "2026-07-28",
+                "--expected-trade-date",
+                "2026-07-29",
+                "--expected-trade-date",
+                "2026-07-30",
+                "--expected-trade-date",
+                "2026-07-31",
+            ]
+        )
+
+        assert cmd_daily_dag_shadow(args) == 0
+        assert report_root.exists() is False
+        assert json.loads(capsys.readouterr().out)["mode"] == "shadow_readonly"
+
     def test_serve_defaults(self) -> None:
         parser = build_parser()
         args = parser.parse_args(["serve"])
@@ -1502,7 +1844,7 @@ class TestTradeCalendarBootstrap:
         monkeypatch.setattr("rquant.trade_calendar.persist_verified_trade_calendar", fake_persist)
         monkeypatch.setattr(cli, "DuckDBStore", MagicMock(side_effect=_Store))
         monkeypatch.setattr(cli, "setup_logging", MagicMock())
-        monkeypatch.setattr(cli.logger, "info", info)
+        monkeypatch.setattr(cli, "logger", SimpleNamespace(info=info))
 
         result = cli.cmd_trade_calendar_bootstrap(
             SimpleNamespace(
@@ -1669,6 +2011,410 @@ class TestPreflightParser:
 
         assert args.command == "preflight"
         assert args.profile == "research"
+
+    def test_authority_daemon_commands_require_explicit_config_paths(self) -> None:
+        root = build_parser().parse_args(
+            [
+                "external-monotonic-root-serve",
+                "--config",
+                "/etc/rquant/external-monotonic-root.json",
+            ]
+        )
+        resource = build_parser().parse_args(
+            [
+                "resource-authority-serve",
+                "--config",
+                "/etc/rquant/resource-authority.json",
+                "--code-sha",
+                "1" * 40,
+            ]
+        )
+
+        assert root.config == Path("/etc/rquant/external-monotonic-root.json")
+        assert resource.config == Path("/etc/rquant/resource-authority.json")
+        assert resource.code_sha == "1" * 40
+
+    def test_authority_daemon_cli_rejects_unselected_production_manifests(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import rquant.resource_authority_service as authority_service
+        from rquant.cli import (
+            cmd_external_monotonic_root_serve,
+            cmd_resource_authority_serve,
+        )
+
+        def selected_environment(path: Path, **_: object) -> dict[str, str]:
+            if path == authority_service.EXTERNAL_ROOT_ENVIRONMENT_PATH:
+                return {
+                    "APP_ENV": "prod",
+                    "RQUANT_EXTERNAL_MONOTONIC_ROOT_SERVICE_CONFIG_PATH": (
+                        "/etc/rquant/selected-external-root.json"
+                    ),
+                }
+            return {
+                "APP_ENV": "prod",
+                "RQUANT_CODE_COMMIT": "1" * 40,
+                "RQUANT_LAB_LIVE_SLO_AUTHORITY_ROOT": "/var/lib/rquant-serving/runtime_health",
+                "RQUANT_LAB_RESOURCE_AUTHORITY_CONFIG_JSON": "{}",
+                "RQUANT_LAB_RESOURCE_POLICY_VERSION": "lab-resource-v1",
+                "RQUANT_LAB_TRADE_CALENDAR_PATH": "/var/lib/rquant-serving/calendar.json",
+                "RQUANT_RESOURCE_AUTHORITY_SERVICE_CONFIG_PATH": (
+                    "/etc/rquant/selected-resource-authority.json"
+                ),
+                "RQUANT_RESOURCE_AUTHORITY_STATE_DIR": "/var/lib/rquant-resource-authority",
+            }
+
+        monkeypatch.setattr(
+            authority_service,
+            "load_closed_authority_environment",
+            selected_environment,
+        )
+        with pytest.raises(RuntimeError, match="configured production manifest"):
+            cmd_external_monotonic_root_serve(
+                argparse.Namespace(config=Path("/etc/rquant/external-monotonic-root.json"))
+            )
+        with pytest.raises(RuntimeError, match="configured production identity"):
+            cmd_resource_authority_serve(
+                argparse.Namespace(
+                    config=Path("/etc/rquant/resource-authority.json"),
+                    code_sha="1" * 40,
+                )
+            )
+
+    def test_resource_authority_daemon_cli_uses_only_the_closed_environment(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import rquant.cli as cli
+        import rquant.lab_resource_authority_adapter as adapter_module
+        import rquant.resource_authority_service as authority_service
+        import rquant.runtime_resource_admission as admission_module
+
+        adapter = object()
+        configuration = SimpleNamespace(
+            service_configuration=SimpleNamespace(adapter_configuration=adapter)
+        )
+        environment = {
+            "APP_ENV": "prod",
+            "RQUANT_CODE_COMMIT": "1" * 40,
+            "RQUANT_LAB_LIVE_SLO_AUTHORITY_ROOT": ("/var/lib/rquant-serving/runtime_health"),
+            "RQUANT_LAB_RESOURCE_AUTHORITY_CONFIG_JSON": "{}",
+            "RQUANT_LAB_RESOURCE_POLICY_VERSION": "lab-resource-v1",
+            "RQUANT_LAB_TRADE_CALENDAR_PATH": ("/var/lib/rquant-serving/market-calendar.json"),
+            "RQUANT_RESOURCE_AUTHORITY_SERVICE_CONFIG_PATH": (
+                "/etc/rquant/resource-authority.json"
+            ),
+            "RQUANT_RESOURCE_AUTHORITY_STATE_DIR": ("/var/lib/rquant-resource-authority"),
+        }
+        snapshot_provider = object()
+        policy = object()
+        service = object()
+        captured: dict[str, object] = {}
+
+        monkeypatch.setattr(
+            authority_service,
+            "load_closed_authority_environment",
+            lambda *_args, **_kwargs: environment,
+        )
+        monkeypatch.setattr(
+            authority_service,
+            "load_resource_authority_daemon_configuration",
+            lambda *_args, **_kwargs: configuration,
+        )
+        monkeypatch.setattr(
+            adapter_module,
+            "parse_resource_authority_adapter_config",
+            lambda _payload: adapter,
+        )
+        monkeypatch.setattr(
+            cli,
+            "_build_lab_worker_resource_admission",
+            lambda **_kwargs: SimpleNamespace(
+                require_resource_admission=True,
+                resource_snapshot_provider=snapshot_provider,
+            ),
+        )
+        monkeypatch.setattr(
+            admission_module,
+            "admission_policy_for_version",
+            lambda version: captured.setdefault("policy_version", version) or policy,
+        )
+        monkeypatch.setattr(
+            authority_service,
+            "compose_resource_authority_daemon",
+            lambda **kwargs: captured.setdefault("composition", kwargs) or service,
+        )
+        monkeypatch.setattr(
+            cli,
+            "_serve_closed_unix_authority",
+            lambda selected, *, label: captured.update(service=selected, label=label) or 0,
+        )
+
+        assert (
+            cli.cmd_resource_authority_serve(
+                argparse.Namespace(
+                    config=Path("/etc/rquant/resource-authority.json"),
+                    code_sha="1" * 40,
+                )
+            )
+            == 0
+        )
+        assert captured["policy_version"] == "lab-resource-v1"
+        composition = captured["composition"]
+        assert isinstance(composition, dict)
+        assert composition["configuration"] is configuration
+        assert composition["snapshot_provider"] is snapshot_provider
+
+
+class TestRuntimeRecoveryParser:
+    def test_recovery_numeric_limits_do_not_materialize_argparse_choices(self) -> None:
+        parser = build_parser()
+        root_subparsers = next(
+            action for action in parser._actions if isinstance(action, argparse._SubParsersAction)
+        )
+        recovery_parser = root_subparsers.choices["runtime-recovery"]
+        recovery_subparsers = next(
+            action
+            for action in recovery_parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+        )
+        execute_parser = recovery_subparsers.choices["execute"]
+        numeric_actions = {
+            action.dest: action
+            for action in execute_parser._actions
+            if action.dest
+            in {
+                "deadline_seconds",
+                "lease_seconds",
+                "schedule_cycle_seconds",
+                "max_attempts",
+                "retry_delay_seconds",
+            }
+        }
+
+        assert set(numeric_actions) == {
+            "deadline_seconds",
+            "lease_seconds",
+            "schedule_cycle_seconds",
+            "max_attempts",
+            "retry_delay_seconds",
+        }
+        assert all(action.choices is None for action in numeric_actions.values())
+
+    def test_backup_execute_requires_exact_plan_and_private_credential(self) -> None:
+        plan_id = "a" * 64
+        args = build_parser().parse_args(
+            [
+                "runtime-recovery-backup",
+                "execute",
+                "--config",
+                "/tmp/recovery-backup.json",
+                "--credential-file",
+                "/tmp/recovery.key.json",
+                "--plan-id",
+                plan_id,
+            ]
+        )
+
+        assert args.command == "runtime-recovery-backup"
+        assert args.recovery_action == "execute"
+        assert args.plan_id == plan_id
+
+    def test_rehearsal_execute_has_bounded_deadline(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "runtime-recovery",
+                "execute",
+                "--publication-root",
+                "/tmp/recovery-backups",
+                "--state-path",
+                "/tmp/recovery-state/state.sqlite3",
+                "--receipt-root",
+                "/tmp/recovery-state/receipts",
+                "--restore-root",
+                "/tmp/recovery-restore",
+                "--credential-file",
+                "/tmp/recovery.key.json",
+                "--plan-id",
+                "b" * 64,
+                "--deadline-seconds",
+                "900",
+            ]
+        )
+
+        assert args.recovery_action == "execute"
+        assert args.deadline_seconds == 900
+        assert args.schedule_cycle_seconds is None
+
+    def test_rehearsal_request_id_is_stable_within_one_systemd_cycle(self) -> None:
+        from rquant.cli import _runtime_recovery_request_id
+
+        manifest_id = "c" * 64
+        first = datetime(2026, 8, 2, 3, 40, tzinfo=UTC)
+
+        assert _runtime_recovery_request_id(
+            manifest_id=manifest_id,
+            now=first,
+            schedule_cycle_seconds=604800,
+        ) == _runtime_recovery_request_id(
+            manifest_id=manifest_id,
+            now=first + timedelta(hours=1),
+            schedule_cycle_seconds=604800,
+        )
+        assert _runtime_recovery_request_id(
+            manifest_id=manifest_id,
+            now=first,
+            schedule_cycle_seconds=604800,
+        ) != _runtime_recovery_request_id(
+            manifest_id=manifest_id,
+            now=first + timedelta(days=8),
+            schedule_cycle_seconds=604800,
+        )
+
+    def test_backup_dry_run_and_execute_emit_structured_contracts(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from rquant.cli import cmd_runtime_recovery_backup
+        from rquant.runtime_recovery_backup import RecoveryBackupConfig
+        from rquant.strict_json import canonical_json_bytes
+        from tests.unit.test_runtime_recovery_backup import _config
+
+        config_payload = _config(tmp_path).model_dump(
+            mode="python",
+            exclude={"config_id"},
+        )
+        config_payload["signer_key_id"] = "production-recovery-v1"
+        config = RecoveryBackupConfig.model_validate(config_payload)
+        config_path = tmp_path / "backup-config.json"
+        config_path.write_bytes(canonical_json_bytes(config.model_dump(mode="json")))
+        credential = tmp_path / "credential.json"
+        credential.write_bytes(
+            canonical_json_bytes({"key_id": "production-recovery-v1", "secret_hex": "ab" * 32})
+        )
+        credential.chmod(0o600)
+
+        assert (
+            cmd_runtime_recovery_backup(
+                argparse.Namespace(
+                    recovery_action="dry-run",
+                    config=config_path,
+                    credential_file=credential,
+                )
+            )
+            == 0
+        )
+        preview = json.loads(capsys.readouterr().out)
+        assert preview["artifact_count"] == len(config.artifacts)
+        assert (
+            cmd_runtime_recovery_backup(
+                argparse.Namespace(
+                    recovery_action="execute",
+                    config=config_path,
+                    credential_file=credential,
+                    plan_id=preview["plan_id"],
+                )
+            )
+            == 0
+        )
+        receipt = json.loads(capsys.readouterr().out)
+        assert receipt["status"] == "succeeded"
+        assert receipt["artifact_count"] == len(config.artifacts)
+
+        from rquant.cli import cmd_runtime_recovery
+
+        recovery_args = argparse.Namespace(
+            recovery_action="dry-run",
+            publication_root=Path(config.publication_root),
+            state_path=tmp_path / "recovery-service" / "state.sqlite3",
+            receipt_root=tmp_path / "recovery-service" / "receipts",
+            restore_root=tmp_path / "rehearsal-restore",
+            credential_file=credential,
+            deadline_seconds=60,
+            schedule_cycle_seconds=None,
+            worker_id="cli-recovery-test",
+            max_attempts=1,
+            retry_delay_seconds=1,
+        )
+        assert cmd_runtime_recovery(recovery_args) == 0
+        recovery_preview = json.loads(capsys.readouterr().out)
+        recovery_args.recovery_action = "execute"
+        recovery_args.plan_id = recovery_preview["plan_id"]
+
+        assert cmd_runtime_recovery(recovery_args) == 0
+        recovery_result = json.loads(capsys.readouterr().out)
+        assert recovery_result["status"] == "succeeded"
+
+    def test_recovery_cli_uses_artifact_key_from_trusted_rotation_set(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from rquant.cli import cmd_runtime_recovery, cmd_runtime_recovery_backup
+        from rquant.runtime_recovery_backup import (
+            RecoveryBackupAuthenticator,
+            RecoveryBackupIntegrityError,
+            RecoveryBackupProducer,
+        )
+        from rquant.strict_json import canonical_json_bytes
+        from tests.unit.test_runtime_recovery_backup import _config
+
+        config = _config(tmp_path)
+        config_path = tmp_path / "backup-config.json"
+        config_path.write_bytes(canonical_json_bytes(config.model_dump(mode="json")))
+        old_credential = tmp_path / "old-credential.json"
+        old_credential.write_bytes(
+            canonical_json_bytes({"key_id": config.signer_key_id, "secret_hex": "ab" * 32})
+        )
+        old_credential.chmod(0o600)
+        active_credential = tmp_path / "active-credential.json"
+        active_credential.write_bytes(
+            canonical_json_bytes({"key_id": "production-recovery-v2", "secret_hex": "cd" * 32})
+        )
+        active_credential.chmod(0o600)
+        old_signer = RecoveryBackupAuthenticator.from_file(old_credential)
+        producer = RecoveryBackupProducer(config=config, signer=old_signer)
+        producer.execute(expected_plan_id=producer.preview().plan_id)
+        monkeypatch.setenv("RQUANT_RECOVERY_TRUSTED_CREDENTIAL_FILES", str(old_credential))
+
+        assert (
+            cmd_runtime_recovery_backup(
+                argparse.Namespace(
+                    recovery_action="status",
+                    config=config_path,
+                    credential_file=active_credential,
+                )
+            )
+            == 0
+        )
+        assert json.loads(capsys.readouterr().out)["status"] == "ready"
+        recovery_args = argparse.Namespace(
+            recovery_action="dry-run",
+            publication_root=Path(config.publication_root),
+            state_path=tmp_path / "recovery-service" / "state.sqlite3",
+            receipt_root=tmp_path / "recovery-service" / "receipts",
+            restore_root=tmp_path / "rehearsal-restore",
+            credential_file=active_credential,
+            deadline_seconds=60,
+            schedule_cycle_seconds=None,
+            worker_id="cli-rotation-test",
+            max_attempts=1,
+            retry_delay_seconds=1,
+        )
+        assert cmd_runtime_recovery(recovery_args) == 0
+        preview = json.loads(capsys.readouterr().out)
+        assert preview["status"] == "ready"
+        recovery_args.recovery_action = "execute"
+        recovery_args.plan_id = preview["plan_id"]
+        assert cmd_runtime_recovery(recovery_args) == 0
+        assert json.loads(capsys.readouterr().out)["status"] == "succeeded"
+
+        monkeypatch.delenv("RQUANT_RECOVERY_TRUSTED_CREDENTIAL_FILES")
+        with pytest.raises(RecoveryBackupIntegrityError, match="trusted|signature|key"):
+            cmd_runtime_recovery(recovery_args)
 
 
 class TestLimitUpPoolCommands:
@@ -3514,7 +4260,7 @@ class TestCmdNotifyTest:
 
 
 class TestMainErrorReporting:
-    def test_main_catches_run_daily_error_and_notifies(self, monkeypatch) -> None:
+    def test_main_catches_run_daily_error_as_typed_outbox(self, monkeypatch) -> None:
         from unittest.mock import patch
 
         from rquant.cli import main
@@ -3527,16 +4273,155 @@ class TestMainErrorReporting:
 
         with (
             patch("sys.argv", ["rquant", "run-daily", "--no-ingest"]),
+            patch("rquant.cli._record_daily_error_outbox", create=True) as mock_outbox,
             patch("rquant.notify.notify") as mock_notify,
         ):
             rc = main()
 
         assert rc == 1
-        mock_notify.assert_called_once()
-        call_kwargs = mock_notify.call_args.kwargs
-        assert mock_notify.call_args.args[0] == "error"
+        mock_outbox.assert_called_once()
+        call_kwargs = mock_outbox.call_args.kwargs
         assert call_kwargs["component"] == "cli:run-daily"
         assert isinstance(call_kwargs["exc"], ValueError)
+        assert call_kwargs["trade_date"] == date.today()
+        mock_notify.assert_not_called()
+
+    def test_serve_daily_job_error_uses_typed_outbox(self, monkeypatch) -> None:
+        from types import ModuleType
+        from unittest.mock import patch
+
+        from rquant import cli
+
+        class FakeScheduler:
+            job = None
+
+            def scheduled_job(self, *_args: object, **_kwargs: object):
+                def register(function):
+                    self.job = function
+                    return function
+
+                return register
+
+            def shutdown(self, *, wait: bool) -> None:
+                del wait
+
+            def start(self) -> None:
+                assert self.job is not None
+                self.job()
+
+        apscheduler = ModuleType("apscheduler")
+        schedulers = ModuleType("apscheduler.schedulers")
+        blocking = ModuleType("apscheduler.schedulers.blocking")
+        blocking.BlockingScheduler = FakeScheduler
+        monkeypatch.setitem(sys.modules, "apscheduler", apscheduler)
+        monkeypatch.setitem(sys.modules, "apscheduler.schedulers", schedulers)
+        monkeypatch.setitem(sys.modules, "apscheduler.schedulers.blocking", blocking)
+
+        def failed_ingest(_date: str) -> int:
+            raise ValueError("ingest failed")
+
+        monkeypatch.setattr("rquant.cli._ingest_with_retry", failed_ingest)
+        monkeypatch.setattr("rquant.cli.signal.signal", lambda *_args: None)
+
+        with (
+            patch("rquant.cli._record_daily_error_outbox") as mock_outbox,
+            patch("rquant.notify.notify") as mock_notify,
+        ):
+            assert cli.cmd_serve(SimpleNamespace(hour=17)) == 0
+
+        mock_outbox.assert_called_once()
+        assert mock_outbox.call_args.kwargs["component"] == "daily_job"
+        assert isinstance(mock_outbox.call_args.kwargs["exc"], ValueError)
+        mock_notify.assert_not_called()
+
+    def test_daily_error_outbox_persists_typed_signal_without_direct_notification(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from rquant import cli
+        from rquant.delivery_contracts import DeliveryChannel
+        from rquant.signal_bus import SignalBusStore
+
+        settings = SimpleNamespace(
+            data_dir=tmp_path,
+            notify_enabled=True,
+            notify_error=True,
+            pushdeer_recipient_id_list=["admin"],
+            pushplus_recipient_id_list=[],
+        )
+        monkeypatch.setattr("rquant.config.settings", settings)
+        monkeypatch.setenv("RQUANT_CODE_COMMIT", "a" * 40)
+
+        with patch("rquant.notify.notify") as mock_notify:
+            cli._record_daily_error_outbox(
+                component="daily_job",
+                exc=ValueError("upstream failed"),
+                trade_date=date(2026, 8, 3),
+            )
+
+        mock_notify.assert_not_called()
+        bus = SignalBusStore(tmp_path / "daily-close-signal-bus.sqlite3")
+        records = bus.outbox_records()
+        assert len(records) == 1
+        assert records[0].target.channel is DeliveryChannel.PUSHDEER
+        signal = bus.signal(records[0].signal_id)
+        assert signal.strategy_id == "daily-close-error"
+        assert signal.evidence["component"] == "daily_job"
+
+    def test_daily_notification_failure_only_records_health_without_recursing(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from rquant import cli
+
+        class FailingStore:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+        class FailingProducer:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def emit(self, *_args: object, **_kwargs: object) -> object:
+                raise RuntimeError("outbox unavailable")
+
+        settings = SimpleNamespace(
+            data_dir=tmp_path,
+            notify_enabled=True,
+            notify_error=True,
+            pushdeer_recipient_id_list=["admin"],
+            pushplus_recipient_id_list=[],
+        )
+        monkeypatch.setattr("rquant.config.settings", settings)
+        monkeypatch.setattr("rquant.signal_bus.SignalBusStore", FailingStore)
+        monkeypatch.setattr(
+            "rquant.daily_notification_producer.DailyNotificationProducer",
+            FailingProducer,
+        )
+
+        with (
+            patch("rquant.cli.logger.error") as mock_health,
+            patch("rquant.notify.notify") as mock_notify,
+        ):
+            cli._record_daily_error_outbox(
+                component="daily_job",
+                exc=ValueError("upstream failed"),
+                trade_date=date(2026, 8, 3),
+            )
+
+        mock_notify.assert_not_called()
+        assert any(
+            "daily_notification_health=degraded" in str(call.args[0])
+            for call in mock_health.call_args_list
+        )
 
     def test_main_does_not_wrap_serve(self, monkeypatch) -> None:
         """serve 内部已自处理异常，main 不再加 try/except。"""
@@ -3703,7 +4588,12 @@ class TestIngestRetryBusinessError:
 class TestLabSchedulerCli:
     @pytest.fixture(autouse=True)
     def configured_daemon_runtime(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from rquant import lab_artifact_protocol, lab_artifacts, lab_daemon
+        from rquant import (
+            job_center_authority,
+            lab_artifact_protocol,
+            lab_artifacts,
+            lab_daemon,
+        )
         from rquant.config import settings
 
         class FakeKeyring:
@@ -3750,6 +4640,11 @@ class TestLabSchedulerCli:
         monkeypatch.setattr(lab_daemon, "verify_lab_runtime_prepared", lambda *_a, **_k: {})
         monkeypatch.setattr(
             lab_daemon,
+            "load_lab_job_center_authority_manifest",
+            lambda *_a, **_k: SimpleNamespace(),
+        )
+        monkeypatch.setattr(
+            lab_daemon,
             "ensure_private_directory",
             lambda path, *, label, mutation_guard: path,
         )
@@ -3777,6 +4672,21 @@ class TestLabSchedulerCli:
             Path("/tmp/keyring"),
         )
         monkeypatch.setattr(settings, "lab_trusted_git_path", Path(_LAB_TRUSTED_GIT))
+        monkeypatch.setattr(
+            job_center_authority,
+            "resolve_current_job_center_authority_binding",
+            lambda *_args, **_kwargs: SimpleNamespace(
+                runtime_deployment_root=Path("/tmp/rquant-production-runtime"),
+                runtime_root=settings.lab_runtime_dir_resolved,
+                lab_jobs_path=settings.lab_jobs_path_resolved,
+                command_spool_path=settings.lab_job_command_dir_resolved,
+                final_artifact_root=settings.lab_final_artifact_dir_resolved,
+                deployment_profile_id="2" * 64,
+                deployment_generation_hash="3" * 64,
+                runtime_mode="local-test",
+                lab_highwater=None,
+            ),
+        )
 
     def test_parser_accepts_once_and_preserves_lab_run(self) -> None:
         scheduler = build_parser().parse_args(
@@ -3786,6 +4696,8 @@ class TestLabSchedulerCli:
                 _LAB_EXPECTED_ROOT,
                 "--trusted-git-path",
                 _LAB_TRUSTED_GIT,
+                "--runtime-deployment-root",
+                "/tmp/rquant-production-runtime",
                 *_LAB_DAEMON_GENERATION_ARGUMENTS,
                 "--once",
             ]
@@ -3805,6 +4717,8 @@ class TestLabSchedulerCli:
                 _LAB_EXPECTED_ROOT,
                 "--trusted-git-path",
                 _LAB_TRUSTED_GIT,
+                "--runtime-deployment-root",
+                "/tmp/rquant-production-runtime",
                 *_LAB_DAEMON_GENERATION_ARGUMENTS,
             ]
         )
@@ -3841,6 +4755,42 @@ class TestLabSchedulerCli:
                     once=True,
                     expected_checkout_root=_LAB_EXPECTED_ROOT,
                     trusted_git_path=_LAB_TRUSTED_GIT,
+                    runtime_deployment_root="/tmp/rquant-production-runtime",
+                    startup_deadline_monotonic=_LAB_STARTUP_DEADLINE,
+                )
+            )
+
+    def test_scheduler_requires_installed_current_authority_before_sqlite_prepare(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import argparse
+
+        from rquant import lab_daemon
+        from rquant.cli import cmd_lab_scheduler
+
+        monkeypatch.setattr(
+            lab_daemon,
+            "load_lab_job_center_authority_manifest",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                lab_daemon.LabDaemonConfigurationError("authority manifest missing")
+            ),
+        )
+        monkeypatch.setattr(
+            lab_daemon,
+            "prepare_lab_runtime_sqlite_authority",
+            lambda *_args, **_kwargs: pytest.fail(
+                "scheduler touched SQLite before authority validation"
+            ),
+        )
+
+        with pytest.raises(lab_daemon.LabDaemonConfigurationError, match="authority manifest"):
+            cmd_lab_scheduler(
+                argparse.Namespace(
+                    once=True,
+                    expected_checkout_root=_LAB_EXPECTED_ROOT,
+                    trusted_git_path=_LAB_TRUSTED_GIT,
+                    runtime_deployment_root="/tmp/rquant-production-runtime",
                     startup_deadline_monotonic=_LAB_STARTUP_DEADLINE,
                 )
             )
@@ -3848,10 +4798,12 @@ class TestLabSchedulerCli:
     def test_cmd_lab_scheduler_once_initializes_ticks_and_releases(
         self,
         monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
     ) -> None:
         import argparse
 
         from rquant import (
+            job_center_authority,
             lab_daemon,
             lab_job_protocol,
             lab_jobs,
@@ -3909,6 +4861,10 @@ class TestLabSchedulerCli:
                 assert kwargs["max_claims_per_tick"] == 16
                 assert kwargs["max_claim_authority_per_tick"] == 128
                 assert kwargs["max_artifact_commits_per_tick"] == 64
+                reader = kwargs["integrity_auditor"]
+                assert reader.highwater_observer is not None
+                assert "--machine-receipt" in kwargs["full_integrity_command"]
+                assert callable(kwargs["full_integrity_remediation_authorizer"])
 
             def run_once(self) -> SimpleNamespace:
                 calls.append("run_once")
@@ -3932,12 +4888,55 @@ class TestLabSchedulerCli:
         )
         monkeypatch.setattr(lab_daemon, "require_unique_runtime_paths", lambda _paths: None)
         monkeypatch.setattr("rquant.cli.setup_logging", lambda: None)
+        from rquant.config import settings
+
+        private_manifest, _public_key = write_private_manifest(
+            tmp_path / "lab-highwater-private-keys.json",
+            active_key_id="hw-v1",
+        )
+        credential = export_public_keyring(
+            private_manifest,
+            tmp_path / "lab-highwater-public-keys.json",
+        )
+        monkeypatch.setattr(settings, "lab_runtime_dir", tmp_path / "lab-runtime")
+        monkeypatch.setattr(settings, "lab_finalizer_state_dir", tmp_path / "lab-state")
+        monkeypatch.setattr(settings, "lab_highwater_authority_command_json", "")
+        monkeypatch.setattr(settings, "lab_highwater_stable_identity", "")
+        monkeypatch.setattr(settings, "lab_highwater_trusted_keyring_path", None)
+        profile = SimpleNamespace(
+            authority_command=(
+                "/usr/bin/sudo",
+                "-n",
+                "/usr/local/libexec/rquant-lab-highwater-authority",
+            ),
+            stable_identity="lab-test-production",
+            trusted_keyring_path=credential,
+            timeout_seconds=3.0,
+            allow_identity_rotation=False,
+            production_mode=True,
+        )
+        monkeypatch.setattr(
+            job_center_authority,
+            "resolve_current_job_center_authority_binding",
+            lambda *_args, **_kwargs: SimpleNamespace(
+                runtime_deployment_root=Path("/tmp/rquant-production-runtime"),
+                runtime_root=settings.lab_runtime_dir_resolved,
+                lab_jobs_path=settings.lab_jobs_path_resolved,
+                command_spool_path=settings.lab_job_command_dir_resolved,
+                final_artifact_root=settings.lab_final_artifact_dir_resolved,
+                deployment_profile_id="2" * 64,
+                deployment_generation_hash="3" * 64,
+                runtime_mode="linux-production",
+                lab_highwater=profile,
+            ),
+        )
 
         result = cmd_lab_scheduler(
             argparse.Namespace(
                 once=True,
                 expected_checkout_root=_LAB_EXPECTED_ROOT,
                 trusted_git_path=_LAB_TRUSTED_GIT,
+                runtime_deployment_root="/tmp/rquant-production-runtime",
                 startup_deadline_monotonic=_LAB_STARTUP_DEADLINE,
             )
         )
@@ -4015,6 +5014,7 @@ class TestLabSchedulerCli:
                 once=False,
                 expected_checkout_root=_LAB_EXPECTED_ROOT,
                 trusted_git_path=_LAB_TRUSTED_GIT,
+                runtime_deployment_root="/tmp/rquant-production-runtime",
                 startup_deadline_monotonic=_LAB_STARTUP_DEADLINE,
             )
         )
@@ -4025,9 +5025,14 @@ class TestLabSchedulerCli:
 
 class TestLabWorkerCli:
     @pytest.fixture(autouse=True)
-    def configured_daemon_runtime(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def configured_daemon_runtime(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
         from rquant import lab_daemon
         from rquant.config import settings
+        from rquant.runtime_market_session import MarketCalendarAuthority
 
         class FakeLock:
             def __init__(self, *_args: object, mutation_guard: object) -> None:
@@ -4055,6 +5060,35 @@ class TestLabWorkerCli:
         monkeypatch.setattr(settings, "lab_worker_id", "worker-a")
         monkeypatch.setattr(settings, "lab_scheduler_worker_ids", "worker-a")
         monkeypatch.setattr(settings, "lab_trusted_git_path", Path(_LAB_TRUSTED_GIT))
+        calendar_path = tmp_path / "market-calendar.json"
+        calendar = MarketCalendarAuthority.create(
+            schema_version=1,
+            exchange="SSE",
+            producer_commit="1" * 40,
+            coverage_start=date(2026, 1, 1),
+            coverage_end=date(2027, 1, 1),
+            open_dates=(),
+            generated_at=datetime(2025, 12, 31, tzinfo=UTC),
+        )
+        calendar_path.write_text(
+            json.dumps(calendar.model_dump(mode="json"), separators=(",", ":")),
+            encoding="utf-8",
+        )
+        calendar_path.chmod(0o600)
+        monkeypatch.setattr(
+            settings,
+            "rquant_lab_resource_policy_version",
+            "lab-resource-v1",
+        )
+        monkeypatch.setattr(
+            settings,
+            "rquant_lab_live_slo_authority_root",
+            tmp_path / "runtime-health-authority",
+        )
+        monkeypatch.setattr(settings, "rquant_lab_trade_calendar_path", calendar_path)
+        monkeypatch.delenv("RQUANT_LAB_RESOURCE_POLICY_VERSION", raising=False)
+        monkeypatch.delenv("RQUANT_LAB_LIVE_SLO_AUTHORITY_ROOT", raising=False)
+        monkeypatch.delenv("RQUANT_LAB_TRADE_CALENDAR_PATH", raising=False)
 
     def test_parser_accepts_worker_identity_and_once(self) -> None:
         args = build_parser().parse_args(
@@ -4074,6 +5108,53 @@ class TestLabWorkerCli:
         assert args.command == "lab-worker"
         assert args.worker_id == "worker-a"
         assert args.once is True
+        assert args.legacy_no_resource_admission is False
+
+    def test_parser_accepts_explicit_legacy_resource_admission_opt_out(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "lab-worker",
+                "--expected-checkout-root",
+                _LAB_EXPECTED_ROOT,
+                "--trusted-git-path",
+                _LAB_TRUSTED_GIT,
+                *_LAB_DAEMON_GENERATION_ARGUMENTS,
+                "--legacy-no-resource-admission",
+            ]
+        )
+
+        assert args.legacy_no_resource_admission is True
+
+    @pytest.mark.parametrize(
+        ("field", "value", "message"),
+        [
+            ("rquant_lab_resource_policy_version", "", "policy version"),
+            ("rquant_lab_live_slo_authority_root", None, "live SLO"),
+            ("rquant_lab_trade_calendar_path", None, "trade calendar"),
+        ],
+    )
+    def test_real_worker_cli_fails_closed_when_resource_authority_is_missing(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        field: str,
+        value: object,
+        message: str,
+    ) -> None:
+        from rquant.cli import cmd_lab_worker
+        from rquant.config import settings
+
+        monkeypatch.setattr(settings, field, value)
+
+        with pytest.raises(RuntimeError, match=message):
+            cmd_lab_worker(
+                argparse.Namespace(
+                    worker_id="worker-a",
+                    once=True,
+                    expected_checkout_root=_LAB_EXPECTED_ROOT,
+                    trusted_git_path=_LAB_TRUSTED_GIT,
+                    startup_deadline_monotonic=_LAB_STARTUP_DEADLINE,
+                )
+            )
 
     def test_parser_accepts_one_shot_lab_runtime_prepare(self) -> None:
         args = build_parser().parse_args(
@@ -4083,11 +5164,158 @@ class TestLabWorkerCli:
                 _LAB_EXPECTED_ROOT,
                 "--trusted-git-path",
                 _LAB_TRUSTED_GIT,
+                "--runtime-deployment-root",
+                "/private/tmp/rquant-production-runtime",
                 *_LAB_DAEMON_GENERATION_ARGUMENTS,
             ]
         )
 
         assert args.command == "lab-runtime-prepare"
+        assert args.runtime_deployment_root == Path("/private/tmp/rquant-production-runtime")
+        assert not hasattr(args, "definition_registry_root")
+
+    def test_runtime_prepare_installs_current_job_center_authority(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        from rquant import (
+            artifact_retention_catalog_authority,
+            cli,
+            job_center_authority,
+            lab_daemon,
+            lab_jobs,
+            runtime_deployment_profile,
+        )
+        from rquant.cli import cmd_lab_runtime_prepare
+        from rquant.config import settings
+        from rquant.runtime_service_entrypoint import RuntimeServiceKind
+
+        runtime_root = tmp_path / "runtime"
+        calls: list[str] = []
+
+        class FakeSqliteAuthority:
+            path = runtime_root / "lab_jobs.sqlite3"
+
+            def close(self) -> None:
+                calls.append("close")
+
+        class FakeStore:
+            def __init__(self, path: Path, **kwargs: object) -> None:
+                assert path == FakeSqliteAuthority.path
+                assert kwargs["identity_authority"].path == path
+
+            def initialize(self) -> None:
+                calls.append("initialize")
+
+        monkeypatch.setattr(settings, "lab_runtime_dir", runtime_root)
+        monkeypatch.setattr(settings, "lab_jobs_path", FakeSqliteAuthority.path)
+        monkeypatch.setattr(settings, "lab_job_command_dir", runtime_root / "commands")
+        monkeypatch.setattr(
+            settings,
+            "lab_final_artifact_dir",
+            runtime_root / "final-artifacts",
+        )
+        monkeypatch.setattr(
+            cli,
+            "_establish_lab_runtime_identity",
+            lambda _args: (
+                "1" * 40,
+                object(),
+                object(),
+                lambda: "1" * 40,
+            ),
+        )
+        monkeypatch.setattr(
+            lab_daemon,
+            "prepare_lab_runtime_layout",
+            lambda *_args, **_kwargs: calls.append("layout"),
+        )
+        monkeypatch.setattr(
+            lab_daemon,
+            "prepare_lab_runtime_sqlite_authority",
+            lambda *_args, **_kwargs: calls.append("sqlite") or FakeSqliteAuthority(),
+        )
+        monkeypatch.setattr(lab_jobs, "LabJobStore", FakeStore)
+        deployment_root = tmp_path / "production-runtime"
+        retention_state_root = deployment_root / "control" / "artifact-retention"
+        retention_reference_store = deployment_root / "research" / "artifact-catalog"
+        monkeypatch.setattr(
+            runtime_deployment_profile,
+            "load_current_runtime_deployment_profile",
+            lambda _root: SimpleNamespace(
+                producer_commit="1" * 40,
+                manifests=(
+                    SimpleNamespace(
+                        service_kind=RuntimeServiceKind.ARTIFACT_RETENTION,
+                        producer_commit="1" * 40,
+                        settings={
+                            "state_root": str(retention_state_root),
+                            "reference_store_path": str(retention_reference_store),
+                        },
+                    ),
+                ),
+            ),
+        )
+        monkeypatch.setattr(
+            artifact_retention_catalog_authority,
+            "initialize_retention_catalog_authority",
+            lambda **_kwargs: calls.append("retention"),
+        )
+        binding = SimpleNamespace(
+            runtime_deployment_root=deployment_root,
+            runtime_root=runtime_root,
+            lab_jobs_path=FakeSqliteAuthority.path,
+            command_spool_path=runtime_root / "commands",
+            final_artifact_root=runtime_root / "final-artifacts",
+            definition_registry_root=tmp_path / "definitions",
+            experiment_registry_path=runtime_root / "experiment_registry.sqlite3",
+            dataset_authority_path=runtime_root / "research_ro.duckdb",
+            catalog_authority_root=runtime_root / "artifact-catalog",
+            catalog_authority_receipt_path=(runtime_root / "artifact-catalog" / "current.json"),
+            deployment_profile_id="2" * 64,
+            deployment_generation_hash="3" * 64,
+        )
+        monkeypatch.setattr(
+            job_center_authority,
+            "resolve_current_job_center_authority_binding",
+            lambda *_args, **_kwargs: binding,
+        )
+
+        def publish(**kwargs: object) -> object:
+            calls.append("authority")
+            assert kwargs["code_sha"] == "1" * 40
+            assert kwargs["runtime_root"] == runtime_root
+            assert kwargs["lab_jobs_path"] == FakeSqliteAuthority.path
+            assert kwargs["deployment_profile_id"] == "2" * 64
+            assert kwargs["deployment_generation_hash"] == "3" * 64
+            assert callable(kwargs["current_code_sha"])
+            return object()
+
+        monkeypatch.setattr(
+            job_center_authority,
+            "publish_install_current_job_center_authority",
+            publish,
+        )
+
+        result = cmd_lab_runtime_prepare(
+            argparse.Namespace(
+                expected_checkout_root=tmp_path / "checkout",
+                trusted_git_path=Path(_LAB_TRUSTED_GIT),
+                runtime_deployment_root=deployment_root,
+                expected_code_sha=None,
+            )
+        )
+
+        assert result == 0
+        assert calls == [
+            "retention",
+            "layout",
+            "sqlite",
+            "initialize",
+            "close",
+            "authority",
+        ]
 
     def test_worker_requires_prepared_runtime_before_creating_spools(
         self,
@@ -4124,6 +5352,208 @@ class TestLabWorkerCli:
                 )
             )
 
+    def test_production_resource_manifest_requires_explicit_v2_configuration(self) -> None:
+        from rquant.cli import _build_lab_worker_resource_authority_manifest
+        from rquant.lab_daemon import LabDaemonConfigurationError
+        from rquant.lab_resource_authority_adapter import ResourceAuthorityAdapterConfig
+        from rquant.strict_json import canonical_model_json_bytes
+
+        settings = SimpleNamespace(
+            app_env="prod",
+            rquant_lab_resource_authority_config_json="",
+        )
+        admission = SimpleNamespace(require_resource_admission=True)
+
+        with pytest.raises(LabDaemonConfigurationError, match="explicit V2"):
+            _build_lab_worker_resource_authority_manifest(
+                settings=settings,
+                resource_admission=admission,
+            )
+
+        settings.rquant_lab_resource_authority_config_json = canonical_model_json_bytes(
+            ResourceAuthorityAdapterConfig(
+                mode="test-standalone",
+                endpoint=Path("/tmp/rqa.sock"),
+                expected_uid=1000,
+                expected_gid=1000,
+                authority_id="test-resource-authority",
+                trusted_role_inventory_hash="a" * 64,
+            )
+        ).decode("utf-8")
+        with pytest.raises(LabDaemonConfigurationError, match="production resource authority"):
+            _build_lab_worker_resource_authority_manifest(
+                settings=settings,
+                resource_admission=admission,
+            )
+
+    def test_production_resource_manifest_builds_only_closed_v2(self) -> None:
+        from rquant.cli import _build_lab_worker_resource_authority_manifest
+        from rquant.lab_resource_authority_adapter import (
+            LAB_RESOURCE_AUTHORITY_REGISTRY_ID,
+            ExternalResourceJournalRootConfig,
+            ResourceAuthorityAdapterConfig,
+        )
+        from rquant.strict_json import canonical_json_bytes
+
+        config = ResourceAuthorityAdapterConfig(
+            mode="production",
+            endpoint=Path("/run/rquant/resource-authority.sock"),
+            expected_uid=1000,
+            expected_gid=1000,
+            authority_id="resource-authority",
+            high_water_authority_id="resource-high-water-authority",
+            external_root_config=ExternalResourceJournalRootConfig(
+                transport="unix-socket-v1",
+                transport_manifest_hash="9" * 64,
+                root_authority_id="external-root-authority",
+                root_store_id="external-root-store",
+                root_issuer="resource-root-issuer",
+                root_key_id="resource-root-key",
+                root_public_key_fingerprint="e" * 64,
+                witness_rollback_domain_id="external-root-domain",
+                local_rollback_domain_id="resource-authority-domain",
+            ),
+            trusted_role_inventory_hash="a" * 64,
+        )
+        settings = SimpleNamespace(
+            app_env="prod",
+            rquant_lab_resource_authority_config_json=canonical_json_bytes(
+                config.model_dump(mode="json", round_trip=True)
+            ).decode("utf-8"),
+        )
+
+        manifest = _build_lab_worker_resource_authority_manifest(
+            settings=settings,
+            resource_admission=SimpleNamespace(require_resource_admission=True),
+        )
+
+        assert manifest is not None
+        assert manifest.registry.registry_id == LAB_RESOURCE_AUTHORITY_REGISTRY_ID
+
+    def test_cli_resource_bindings_run_real_bounded_spawn_probe(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        from rquant.cli import _build_lab_worker_resource_admission
+        from rquant.config import settings
+        from rquant.lab_shard_protocol import LabClaimSpool, LabReportSpool
+        from rquant.lab_worker import (
+            LabWorker,
+            build_builtin_resource_authority_manifest,
+        )
+        from rquant.runtime_contracts import canonical_sha256
+        from rquant.runtime_market_session import MarketCalendarAuthority
+        from rquant.runtime_service_control import (
+            RuntimeServiceHealth,
+            RuntimeServiceHeartbeat,
+            RuntimeServicePlane,
+            RuntimeServiceStatus,
+        )
+        from rquant.runtime_serving_authority import ServingSourceAuthorityPublisher
+        from rquant.runtime_serving_snapshot import RuntimeHealthPayload, SourceReadResult
+        from rquant.serving_contracts import FreshnessStatus
+
+        commit = "1" * 40
+        observed_at = datetime.now(UTC)
+        heartbeat = RuntimeServiceHeartbeat(
+            service_id="feature-live",
+            spec_fingerprint="b" * 64,
+            run_id="c" * 64,
+            generation=1,
+            status=RuntimeServiceStatus.RUNNING,
+            started_at=observed_at - timedelta(minutes=2),
+            heartbeat_at=observed_at - timedelta(seconds=1),
+            last_success_at=observed_at - timedelta(seconds=2),
+            recent_step_durations_seconds=(0.2,),
+            last_step_duration_seconds=0.2,
+            p95_step_duration_seconds=0.2,
+        )
+        payload = RuntimeHealthPayload(
+            runtime_services=(
+                RuntimeServiceHealth(
+                    service_id="feature-live",
+                    plane=RuntimeServicePlane.LIVE,
+                    status=RuntimeServiceStatus.RUNNING,
+                    stale=False,
+                    observed_at=observed_at - timedelta(seconds=1),
+                    heartbeat=heartbeat,
+                ),
+            )
+        )
+        source_values: dict[str, object] = {
+            "dataset_id": "runtime_health",
+            "sequence": 1,
+            "event_time": observed_at - timedelta(seconds=1),
+            "published_at": observed_at - timedelta(seconds=1),
+            "status": FreshnessStatus.FRESH,
+            "reason": None,
+            "payload": payload,
+        }
+        source_values["generation_id"] = canonical_sha256(source_values)
+        authority_root = tmp_path / "runtime-health-authority"
+        ServingSourceAuthorityPublisher(
+            root=authority_root,
+            producer_commit=commit,
+            dataset_id="runtime_health",
+            payload_kind="runtime_health",
+            clock=lambda: observed_at - timedelta(seconds=1),
+        ).publish(SourceReadResult.model_validate(source_values))
+        calendar = MarketCalendarAuthority.create(
+            schema_version=1,
+            exchange="SSE",
+            producer_commit=commit,
+            coverage_start=observed_at.date(),
+            coverage_end=observed_at.date(),
+            open_dates=(observed_at.date(),),
+            generated_at=observed_at - timedelta(days=1),
+        )
+        calendar_path = tmp_path / "market-calendar.json"
+        calendar_path.write_text(
+            json.dumps(calendar.model_dump(mode="json"), separators=(",", ":")),
+            encoding="utf-8",
+        )
+        calendar_path.chmod(0o600)
+        artifact_root = tmp_path / "artifacts"
+        artifact_root.mkdir()
+        monkeypatch.setattr(settings, "rquant_lab_live_slo_authority_root", authority_root)
+        monkeypatch.setattr(settings, "rquant_lab_trade_calendar_path", calendar_path)
+        monkeypatch.setattr(settings, "lab_worker_artifact_dir", artifact_root)
+
+        bindings = _build_lab_worker_resource_admission(
+            settings=settings,
+            code_sha=commit,
+            legacy_opt_out=False,
+        )
+        assert bindings.resource_snapshot_provider is not None
+        assert bindings.admission_policy_provider is not None
+        authority_manifest = build_builtin_resource_authority_manifest(
+            bindings.resource_snapshot_provider,
+            bindings.admission_policy_provider,
+        )
+        worker = LabWorker(
+            worker_id="worker-a",
+            claim_spool=LabClaimSpool(tmp_path / "claims"),
+            report_spool=LabReportSpool(tmp_path / "reports"),
+            artifact_root=artifact_root,
+            resource_authority_manifest=authority_manifest,
+            require_resource_admission=bindings.require_resource_admission,
+            resource_probe_timeout_seconds=3,
+            verified_code_sha_provider=lambda: commit,
+        )
+
+        snapshot = worker._bounded_resource_snapshot(timeout_seconds=3)
+
+        assert abs((snapshot.observed_at - observed_at).total_seconds()) < 3
+        assert snapshot.live_healthy is True
+        watermark = worker.snapshot_authority_watermark
+        if snapshot.live_slo_applicable:
+            assert snapshot.live_backlog_age_seconds == 2
+            assert watermark is not None
+            assert watermark.sequence == 1
+        else:
+            assert watermark is None
+
     @pytest.mark.parametrize(
         ("status", "expected_exit"),
         [
@@ -4157,9 +5587,20 @@ class TestLabWorkerCli:
         class FakeWorker:
             def __init__(self, **kwargs: object) -> None:
                 calls.append(f"worker:{kwargs['worker_id']}")
-                assert kwargs["exploratory_store_factory"] is not None
-                assert kwargs["metadata_store_factory"] is not None
                 assert kwargs["verified_code_sha_provider"] is not None
+                assert kwargs["require_resource_admission"] is True
+                assert kwargs["resource_authority_manifest"] is not None
+                assert kwargs["shard_runtime_manifest"] is not None
+                assert kwargs["claim_publication_verifier"] is None
+                assert kwargs["v2_claim_publication_enabled"] is False
+                forbidden = {
+                    "adapter_registry",
+                    "exploratory_store_factory",
+                    "metadata_store_factory",
+                    "resource_snapshot_provider",
+                    "admission_policy_provider",
+                }
+                assert forbidden.isdisjoint(kwargs)
 
             def run_once(self) -> SimpleNamespace:
                 calls.append("run_once")
@@ -4185,6 +5626,166 @@ class TestLabWorkerCli:
         assert "spool:reports" in calls
         assert calls[-2:] == ["worker:worker-a", "run_once"]
 
+    @pytest.mark.parametrize("material", (None, b"{}"))
+    def test_cmd_lab_worker_v2_requires_public_verifier_before_worker_construction(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        material: bytes | None,
+    ) -> None:
+        from rquant import lab_shard_protocol, lab_worker
+        from rquant.cli import cmd_lab_worker
+        from rquant.config import settings
+        from rquant.lab_daemon import LabDaemonConfigurationError
+
+        material_path = None if material is None else tmp_path / "invalid-verifier.json"
+        if material_path is not None:
+            material_path.write_bytes(material)
+        monkeypatch.setattr(settings, "lab_v2_claim_publication_enabled", True)
+        monkeypatch.setattr(settings, "lab_claim_publication_worker_verifier_path", material_path)
+        monkeypatch.setattr(lab_worker, "LabWorker", lambda **_kwargs: pytest.fail("worker built"))
+        monkeypatch.setattr(
+            lab_shard_protocol,
+            "LabClaimSpool",
+            lambda *_args, **_kwargs: object(),
+        )
+        monkeypatch.setattr("rquant.cli.setup_logging", lambda: None)
+
+        with pytest.raises(LabDaemonConfigurationError, match="public verifier material"):
+            cmd_lab_worker(
+                argparse.Namespace(
+                    worker_id="worker-a",
+                    once=True,
+                    expected_checkout_root=_LAB_EXPECTED_ROOT,
+                    trusted_git_path=_LAB_TRUSTED_GIT,
+                    startup_deadline_monotonic=_LAB_STARTUP_DEADLINE,
+                )
+            )
+
+    def test_cmd_lab_worker_v2_builds_verify_only_publication_gate(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        from rquant import lab_worker
+        from rquant.cli import cmd_lab_worker
+        from rquant.config import settings
+        from rquant.lab_claim_finalizer_trust import (
+            LabClaimFinalizerTrustCertificate,
+            LabClaimPublicationWorkerVerificationConfig,
+            sign_lab_claim_finalizer_trust_certificate,
+        )
+        from rquant.lab_claim_publication import LabClaimSpoolReceiptAuthorityV2
+        from rquant.lab_jobs import LabJobStore
+        from rquant.source_broker_v2_job_protocol import SourceBrokerV2AuthorityRef
+        from rquant.strict_json import canonical_model_json_bytes
+        from tests.unit.test_adapter_manifest import create_test_authorities
+
+        runtime = tmp_path / "runtime"
+        runtime.mkdir(mode=0o700)
+        for field, name in (
+            ("lab_runtime_dir", "runtime"),
+            ("lab_jobs_path", "lab_jobs.sqlite3"),
+            ("lab_job_claim_dir", "claims"),
+            ("lab_job_report_dir", "reports"),
+            ("lab_worker_artifact_dir", "worker-artifacts"),
+            ("lab_daemon_lock_dir", "locks"),
+        ):
+            monkeypatch.setattr(settings, field, runtime if name == "runtime" else runtime / name)
+        store = LabJobStore(settings.lab_jobs_path_resolved)
+        store.initialize()
+        authorities = create_test_authorities(tmp_path / "keys")
+        with store._connect() as connection:  # noqa: SLF001 - fixture binds the cert to this inode
+            binding = store._finalizer_authority_binding(connection, path=store.path)  # noqa: SLF001
+        certificate = sign_lab_claim_finalizer_trust_certificate(
+            root_signer=authorities.finalizer_trust_root,
+            certificate=LabClaimFinalizerTrustCertificate(
+                root_issuer=authorities.finalizer_trust_root.issuer,
+                root_key_id=authorities.finalizer_trust_root.key_id,
+                finalizer_issuer=authorities.finalizer_runtime.issuer,
+                finalizer_key_id=authorities.finalizer_runtime.key_id,
+                finalizer_public_key_fingerprint=(
+                    authorities.finalizer_runtime.public_key_fingerprint
+                ),
+                store_id=str(binding["store_id"]),
+                database_device=binding["database_generation"][0],
+                database_inode=binding["database_generation"][1],
+                schema_version_bound=int(binding["schema_version"]),
+                not_before=datetime(2020, 1, 1, tzinfo=UTC),
+                expires_at=datetime(2030, 1, 1, tzinfo=UTC),
+                signature="unsigned",
+            ),
+        )
+        records = authorities.records
+        root_records = tuple(
+            record for record in records if record.key_purpose == "lab_claim_finalizer_root"
+        )
+        finalizer_records = tuple(
+            record for record in records if record.key_purpose == "lab_claim_finalizer"
+        )
+        plan_records = tuple(
+            record for record in records if record.key_purpose == "source_use_plan_v2"
+        )
+        spool_authority = LabClaimSpoolReceiptAuthorityV2(
+            root_id="a" * 32,
+            publisher_authority=SourceBrokerV2AuthorityRef(
+                authority_id="source-stage",
+                key_id="publisher-v1",
+                purpose="publish-receipt",
+                schema_version=1,
+                generation=1,
+                fence_hash="b" * 64,
+            ),
+        )
+        material = LabClaimPublicationWorkerVerificationConfig(
+            audience="lab-worker",
+            trust_certificate=certificate,
+            root_public_keys=root_records,
+            finalizer_public_keys=finalizer_records,
+            source_plan_public_keys=plan_records,
+            spool_receipt_authority=spool_authority.model_dump(mode="json"),
+            current_claim_socket_path=str(runtime / "current-claim.sock"),
+            current_claim_socket_owner_uid=os.getuid(),
+            current_claim_socket_group_gid=os.getgid(),
+            current_claim_socket_mode=0o600,
+            current_claim_server_uid=os.getuid(),
+            current_claim_server_gid=os.getgid(),
+            current_claim_timeout_ms=1_000,
+        )
+        material_path = runtime / "claim-publication-verifier.json"
+        material_path.write_bytes(canonical_model_json_bytes(material))
+        material_path.chmod(0o600)
+        monkeypatch.setattr(settings, "lab_v2_claim_publication_enabled", True)
+        monkeypatch.setattr(settings, "lab_claim_publication_worker_verifier_path", material_path)
+        captured: dict[str, object] = {}
+
+        class FakeWorker:
+            def __init__(self, **kwargs: object) -> None:
+                captured.update(kwargs)
+
+            def run_once(self) -> SimpleNamespace:
+                return SimpleNamespace(status="idle", model_dump_json=lambda: "{}")
+
+        monkeypatch.setattr(lab_worker, "LabWorker", FakeWorker)
+        monkeypatch.setattr("rquant.cli.setup_logging", lambda: None)
+
+        assert (
+            cmd_lab_worker(
+                argparse.Namespace(
+                    worker_id="worker-a",
+                    once=True,
+                    expected_checkout_root=_LAB_EXPECTED_ROOT,
+                    trusted_git_path=_LAB_TRUSTED_GIT,
+                    startup_deadline_monotonic=_LAB_STARTUP_DEADLINE,
+                )
+            )
+            == 0
+        )
+        assert captured["v2_claim_publication_enabled"] is True
+        assert type(captured["claim_publication_verifier"]).__name__ == (
+            "LabClaimPublicationWorkerVerifier"
+        )
+
     def test_real_cli_worker_starts_across_a_to_b_with_one_runtime_authority(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -4195,6 +5796,7 @@ class TestLabWorkerCli:
         from rquant import lab_daemon, lab_shard_protocol, lab_worker
         from rquant.cli import _lab_runtime_layout, cmd_lab_worker
         from rquant.config import settings
+        from rquant.runtime_market_session import MarketCalendarAuthority
 
         current = {"sha": "a" * 40}
         data = tmp_path / "data"
@@ -4272,8 +5874,27 @@ class TestLabWorkerCli:
             startup_deadline_monotonic=_LAB_STARTUP_DEADLINE,
         )
 
+        def publish_calendar(commit: str) -> None:
+            calendar = MarketCalendarAuthority.create(
+                schema_version=1,
+                exchange="SSE",
+                producer_commit=commit,
+                coverage_start=date(2026, 1, 1),
+                coverage_end=date(2027, 1, 1),
+                open_dates=(),
+                generated_at=datetime(2025, 12, 31, tzinfo=UTC),
+            )
+            assert settings.rquant_lab_trade_calendar_path is not None
+            settings.rquant_lab_trade_calendar_path.write_text(
+                json.dumps(calendar.model_dump(mode="json"), separators=(",", ":")),
+                encoding="utf-8",
+            )
+            settings.rquant_lab_trade_calendar_path.chmod(0o600)
+
+        publish_calendar(current["sha"])
         assert cmd_lab_worker(args) == 0
         current["sha"] = "b" * 40
+        publish_calendar(current["sha"])
         assert cmd_lab_worker(args) == 0
 
         assert (
@@ -4338,3 +5959,541 @@ class TestLabWorkerCli:
 
         assert result == 0
         assert calls == ["run_forever", "request_stop", "request_stop"]
+
+
+class TestDailyDagDevAbsenceGuardRegression:
+    """daily-dag-dev 必须在生产 root 出现或路径被 symlink 污染时拒绝且零写入。"""
+
+    @staticmethod
+    def _dev_argv(profile_root: Path, *extra: str) -> list[str]:
+        return [
+            "daily-dag-dev",
+            "--profile-root",
+            str(profile_root),
+            "--trade-date",
+            "2026-08-03",
+            "--source-generation-id",
+            "a" * 64,
+            "--source-content-hash",
+            "b" * 64,
+            "--command-manifest-hash",
+            "e" * 64,
+            "--code-commit",
+            "c" * 40,
+            "--profile-hash",
+            "d" * 64,
+            *extra,
+        ]
+
+    @staticmethod
+    def _patch_runtime_root(monkeypatch: pytest.MonkeyPatch, root: Path) -> None:
+        from rquant import runtime_deployment_profile as deployment_module
+
+        monkeypatch.setattr(deployment_module, "LINUX_PRODUCTION_RUNTIME_ROOT", root)
+
+    def test_symlinked_ancestor_with_missing_target_rejects_and_leaves_dev_root_empty(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from rquant.cli import cmd_daily_dag
+
+        base = tmp_path.resolve()
+        missing_target = base / "real-parent"
+        parent = base / "fixed-production-parent"
+        parent.symlink_to(missing_target, target_is_directory=True)
+        self._patch_runtime_root(monkeypatch, parent / "runtime")
+        dev_root = base / "dev-root"
+        args = build_parser().parse_args(self._dev_argv(dev_root))
+
+        assert cmd_daily_dag(args) == 2
+        assert capsys.readouterr().out == ""
+        assert not dev_root.exists()
+        assert not missing_target.exists()
+
+    def test_absent_to_present_race_rejects_preview_and_leaves_dev_root_empty(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from rquant import cli as cli_module
+
+        base = tmp_path.resolve()
+        parent = base / "fixed-production-parent"
+        parent.mkdir(mode=0o700)
+        runtime_root = parent / "runtime"
+        self._patch_runtime_root(monkeypatch, runtime_root)
+        dev_root = base / "dev-root"
+
+        original_plan = cli_module._daily_dag_control_plan
+
+        def racing_plan(namespace: argparse.Namespace):
+            plan = original_plan(namespace)
+            runtime_root.mkdir(mode=0o700)
+            return plan
+
+        monkeypatch.setattr(cli_module, "_daily_dag_control_plan", racing_plan)
+        args = build_parser().parse_args(self._dev_argv(dev_root))
+
+        assert cli_module.cmd_daily_dag(args) == 2
+        assert capsys.readouterr().out == ""
+        assert not dev_root.exists()
+
+
+def test_lab_claim_finalizer_command_is_registered_and_requires_private_material(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant import config
+    from rquant.cli import build_parser, cmd_lab_claim_finalizer
+    from rquant.lab_daemon import LabDaemonConfigurationError
+
+    parser = build_parser()
+    parsed = parser.parse_args(
+        [
+            "lab-claim-finalizer",
+            "--expected-checkout-root",
+            "/tmp/checkout",
+            "--trusted-git-path",
+            "/usr/bin/git",
+            "--deployment-generation",
+            "generation-a",
+            "--deployment-lock-path",
+            "/tmp/deployment.lock",
+            "--deployment-generation-fd",
+            "9",
+            "--startup-deadline-monotonic",
+            "1",
+            "--once",
+        ]
+    )
+    assert parsed.command == "lab-claim-finalizer"
+    assert parsed.once is True
+
+    monkeypatch.setattr(config.settings, "lab_claim_finalizer_enabled", True, raising=False)
+    monkeypatch.setattr(
+        config.settings,
+        "lab_claim_finalizer_runtime_material_path",
+        None,
+        raising=False,
+    )
+    with pytest.raises(LabDaemonConfigurationError, match="private.*material|material.*missing"):
+        cmd_lab_claim_finalizer(parsed)
+
+
+def test_lab_claim_finalizer_command_runs_real_authority_finalizer_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    import argparse
+    from contextlib import nullcontext
+    from tempfile import mkdtemp
+    from threading import Event, Thread
+
+    from rquant import cli as cli_module
+    from rquant import config, lab_daemon, source_broker_v2_authority
+    from rquant.current_claim_authority import ExternalCurrentClaimRootConfig
+    from rquant.external_monotonic_root import UnixSocketExternalMonotonicRootManifest
+    from rquant.external_monotonic_root_service import (
+        EXTERNAL_ROOT_SERVICE_PROBE_NAMESPACE,
+        ExternalMonotonicRootUnixService,
+        ExternalRootServiceConfiguration,
+        OpenSslExternalMonotonicRootSigner,
+        PersistentExternalMonotonicRootBackend,
+    )
+    from rquant.lab_claim_finalizer_composition import (
+        LabClaimFinalizerRuntimeMaterial,
+        compose_production_lab_claim_finalizer_daemon,
+    )
+    from rquant.lab_claim_finalizer_daemon import LabClaimFinalizerDaemon
+    from rquant.lab_claim_publication import ClaimPublicationStatus
+    from rquant.lab_shard_protocol import LabShardClaimV2
+    from rquant.source_broker_v2_job_protocol import SourceBrokerV2AuthorityRef
+    from rquant.strict_json import canonical_model_json_bytes
+    from tests.unit.test_adapter_manifest import create_test_authorities
+    from tests.unit.test_lab_claim_publication import (
+        _finalizer_issuer,
+        _prepared_authority_finalizer,
+    )
+
+    runtime_root = (tmp_path / "lab-runtime").resolve()
+    runtime_root.mkdir(mode=0o700)
+    private_root = (tmp_path / "claim-finalizer-private").resolve()
+    private_root.mkdir(mode=0o700)
+    authorities = create_test_authorities(private_root / "keys")
+    prepared_at = datetime.now(UTC).replace(microsecond=0) - timedelta(seconds=10)
+    _seed, store, held = _prepared_authority_finalizer(
+        runtime_root,
+        authority_set=authorities,
+        now=prepared_at,
+    )
+
+    current_root_keys = private_root / "current-root-keys"
+    current_root_keys.mkdir(mode=0o700)
+    current_root_private = current_root_keys / "root.private.pem"
+    current_root_public = current_root_keys / "root.public.pem"
+    subprocess.run(
+        (
+            "openssl",
+            "genpkey",
+            "-algorithm",
+            "ED25519",
+            "-out",
+            str(current_root_private),
+        ),
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        (
+            "openssl",
+            "pkey",
+            "-in",
+            str(current_root_private),
+            "-pubout",
+            "-out",
+            str(current_root_public),
+        ),
+        check=True,
+        capture_output=True,
+    )
+    current_root_private.chmod(0o600)
+    current_root_public.chmod(0o600)
+    current_root_signer = OpenSslExternalMonotonicRootSigner(
+        private_key_path=current_root_private,
+        public_key_path=current_root_public,
+        issuer="claim-current-root",
+        key_id="claim-current-root-v1",
+        key_purpose="current-claim-monotonic-root",
+        allowed_namespaces=frozenset(
+            {
+                EXTERNAL_ROOT_SERVICE_PROBE_NAMESPACE,
+                "rquant-current-claim-anti-rollback-root/v1",
+            }
+        ),
+    )
+    socket_root = Path(mkdtemp(prefix="rqcf-")).resolve()
+    socket_root.chmod(0o700)
+    socket_path = socket_root / "root.sock"
+    manifest = UnixSocketExternalMonotonicRootManifest(
+        role="current_claim_monotonic_root",
+        authority_id="claim-current-root",
+        store_id="claim-current-root-store",
+        rollback_domain_id="claim-current-root-domain",
+        socket_path=socket_path,
+        socket_uid=os.getuid(),
+        socket_gid=os.getgid(),
+        socket_mode=0o600,
+        peer_uid=os.getuid(),
+        peer_gid=os.getgid(),
+        connect_timeout_ms=2_000,
+        max_response_bytes=1024 * 1024,
+    )
+    root_config = ExternalCurrentClaimRootConfig(
+        transport=manifest.transport,
+        transport_manifest_hash=manifest.manifest_hash,
+        root_authority_id=manifest.authority_id,
+        root_store_id=manifest.store_id,
+        root_issuer=current_root_signer.issuer,
+        root_key_id=current_root_signer.key_id,
+        root_public_key_fingerprint=current_root_signer.public_key_fingerprint,
+        witness_rollback_domain_id=manifest.rollback_domain_id,
+        local_rollback_domain_id="claim-finalizer-local-domain",
+    )
+    service = ExternalMonotonicRootUnixService(
+        configuration=ExternalRootServiceConfiguration(
+            socket_path=socket_path,
+            socket_uid=os.getuid(),
+            socket_gid=os.getgid(),
+            service_uid=os.getuid(),
+            service_gid=os.getgid(),
+            allowed_peer_uid=os.getuid(),
+            allowed_peer_gid=os.getgid(),
+            socket_mode=0o600,
+            socket_directory_mode=0o700,
+            role=manifest.role,
+            authority_id=manifest.authority_id,
+            store_id=manifest.store_id,
+            rollback_domain_id=manifest.rollback_domain_id,
+            transport_manifest_hash=manifest.manifest_hash,
+        ),
+        backend=PersistentExternalMonotonicRootBackend(
+            private_root / "current-root.sqlite3",
+            role=manifest.role,
+            authority_id=manifest.authority_id,
+            store_id=manifest.store_id,
+        ),
+        handler=source_broker_v2_authority._CurrentClaimRootRoleHandler(  # noqa: SLF001
+            current_root_signer
+        ),
+        probe_signer=current_root_signer,
+    )
+    stop = Event()
+    service_errors: list[BaseException] = []
+
+    def serve_current_root() -> None:
+        try:
+            service.serve_forever(stop=stop)
+        except BaseException as exc:
+            service_errors.append(exc)
+
+    service_thread = Thread(target=serve_current_root, name="test-claim-current-root")
+
+    def close_current_root() -> None:
+        stop.set()
+        service.wake()
+        if service_thread.ident is not None:
+            service_thread.join(timeout=5)
+        socket_path.unlink(missing_ok=True)
+        if socket_root.exists():
+            socket_root.rmdir()
+
+    request.addfinalizer(close_current_root)
+
+    issuer = _finalizer_issuer(store, authority_set=authorities)
+    root_secret_path = private_root / "finalizer-root.secret"
+    root_secret_path.write_bytes(b"test-lab-claim-finalizer-root-key-0001")
+    root_secret_path.chmod(0o600)
+    records = authorities.records
+    material = LabClaimFinalizerRuntimeMaterial(
+        audience="lab-claim-publication",
+        trust_certificate=issuer._trust_certificate,  # noqa: SLF001
+        root_public_keys=tuple(
+            record for record in records if record.key_purpose == "lab_claim_finalizer_root"
+        ),
+        finalizer_public_keys=tuple(
+            record for record in records if record.key_purpose == "lab_claim_finalizer"
+        ),
+        adapter_manifest_public_keys=tuple(
+            record for record in records if record.key_purpose == "adapter_manifest"
+        ),
+        scheduler_intent_public_keys=tuple(
+            record for record in records if record.key_purpose == "scheduler_intent_authorization"
+        ),
+        source_plan_public_keys=tuple(
+            record for record in records if record.key_purpose == "source_use_plan_v2"
+        ),
+        finalizer_runtime_private_key_path=(
+            private_root / "keys" / "finalizer-runtime-v1.private.pem"
+        ),
+        finalizer_root_secret_path=root_secret_path,
+        source_stage_path=runtime_root / "source-stage.sqlite3",
+        source_queue_path=runtime_root / "source-runner.sqlite3",
+        spool_receipt_publisher=SourceBrokerV2AuthorityRef(
+            authority_id="finalizer-authority",
+            key_id="finalizer-key-v2",
+            purpose="rquant-finalizer-receipt",
+            schema_version=2,
+            generation=7,
+            fence_hash="7" * 64,
+        ),
+        current_claim_state_path=private_root / "production-current-claim.sqlite3",
+        current_claim_authority_id="production-current-claim",
+        current_claim_plan_private_key_path=private_root / "keys" / "plan-v2.private.pem",
+        current_claim_external_root_manifest=manifest,
+        current_claim_external_root_config=root_config,
+        current_claim_external_root_public_key_path=current_root_public,
+    )
+    material_path = private_root / "runtime-material.json"
+    material_path.write_bytes(canonical_model_json_bytes(material))
+    material_path.chmod(0o600)
+
+    setting_values = config.settings.model_dump()
+    setting_values.update(
+        {
+            "data_dir": tmp_path / "data",
+            "duckdb_path": tmp_path / "duckdb" / "rquant.duckdb",
+            "duckdb_readonly_path": None,
+            "backfill_state_path": None,
+            "parquet_dir": tmp_path / "parquet",
+            "log_dir": tmp_path / "logs",
+            "lab_runtime_dir": runtime_root,
+            "lab_jobs_path": store.path,
+            "lab_job_command_dir": runtime_root / "commands",
+            "lab_job_claim_dir": runtime_root / "finalizer-claims",
+            "lab_job_report_dir": runtime_root / "reports",
+            "lab_worker_artifact_dir": runtime_root / "worker-artifacts",
+            "lab_final_artifact_dir": runtime_root / "final-artifacts",
+            "lab_artifact_commit_dir": runtime_root / "artifact-commits",
+            "lab_daemon_lock_dir": runtime_root / "locks",
+            "lab_finalizer_state_dir": runtime_root / "finalizer-state",
+            "lab_readiness_dir": runtime_root / "readiness",
+            "lab_finalizer_authority_key_path": None,
+            "lab_finalizer_authority_keyring_path": None,
+            "lab_claim_publication_worker_verifier_path": None,
+            "lab_highwater_trusted_keyring_path": None,
+            "lab_claim_finalizer_enabled": True,
+            "lab_claim_finalizer_runtime_material_path": material_path,
+            "lab_claim_finalizer_owner_id": "finalizer-replay",
+            "lab_claim_finalizer_lease_seconds": 60,
+            "lab_claim_finalizer_poll_interval_ms": 10,
+            "lab_claim_finalizer_max_publications_per_tick": 1,
+            "lab_claim_finalizer_failure_backoff_seconds": 1,
+            "lab_claim_finalizer_failure_backoff_max_seconds": 2,
+            "lab_jobs_busy_timeout_ms": 5_000,
+            "lab_trusted_git_path": Path("/usr/bin/git"),
+        }
+    )
+    test_settings = config.Settings.model_validate(setting_values)
+
+    class FakeLock:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def __enter__(self) -> FakeLock:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            pass
+
+    monkeypatch.setattr(config, "settings", test_settings)
+    monkeypatch.setattr(lab_daemon, "LabDaemonLock", FakeLock)
+    monkeypatch.setattr(
+        lab_daemon,
+        "ensure_private_directory",
+        lambda path, **_kwargs: path,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_establish_lab_runtime_identity",
+        lambda _args: ("1" * 40, object(), object(), lambda: nullcontext()),
+    )
+    monkeypatch.setattr(cli_module, "_verify_prepared_lab_runtime", lambda *_args: None)
+    monkeypatch.setattr(
+        cli_module,
+        "_lab_daemon_readiness_context",
+        lambda *_a, **_k: nullcontext(),
+    )
+    monkeypatch.setattr(cli_module, "setup_logging", lambda: None)
+
+    direct_daemon: LabClaimFinalizerDaemon | None = None
+    try:
+        service_thread.start()
+        assert service.ready.wait(timeout=5), repr(service_errors)
+        direct_daemon = compose_production_lab_claim_finalizer_daemon(
+            settings=test_settings,
+            mutation_guard=lambda: nullcontext(),
+        )
+        forbidden_slots = {"_provider", "_adapter", "_worker", "_runtime_client"}
+        assert forbidden_slots.isdisjoint(LabClaimFinalizerDaemon.__slots__)
+        daemon_capabilities = tuple(
+            getattr(direct_daemon, slot) for slot in LabClaimFinalizerDaemon.__slots__
+        )
+        assert all(capability is not current_root_signer for capability in daemon_capabilities)
+        assert all(
+            capability is not authorities.finalizer_trust_root for capability in daemon_capabilities
+        )
+        assert not isinstance(
+            direct_daemon._authority_issuer._runtime_signer,  # noqa: SLF001
+            OpenSslExternalMonotonicRootSigner,
+        )
+        assert (
+            direct_daemon._authority_issuer._runtime_signer.key_purpose  # noqa: SLF001
+            == "lab_claim_finalizer"
+        )
+        assert (
+            direct_daemon._authority_issuer._runtime_signer  # noqa: SLF001
+            is not authorities.finalizer_trust_root
+        )
+        preimage = LabShardClaimV2.model_validate_json(held.claim_preimage_bytes, strict=True)
+        direct_daemon._current_claim_authority.replace_current(preimage)  # noqa: SLF001
+        direct_daemon.close()
+        direct_daemon = None
+
+        result = cli_module.cmd_lab_claim_finalizer(
+            argparse.Namespace(
+                expected_checkout_root=tmp_path,
+                trusted_git_path="/usr/bin/git",
+                once=True,
+            )
+        )
+    finally:
+        if direct_daemon is not None:
+            direct_daemon.close()
+        close_current_root()
+
+    assert result == 0, repr(
+        store.list_claim_publication_finalizer_observations(held.identity.attempt_id)
+    )
+    record = store.get_claim_publication(held.identity.attempt_id)
+    assert record is not None and record.status is ClaimPublicationStatus.PUBLISHED
+    assert record.spool_receipt_bytes
+    store.validate_finalizer_published_attestation(
+        held.identity,
+        trust_verifier=issuer._trust_verifier,  # noqa: SLF001
+        now=datetime.now(UTC),
+    )
+    assert not service_thread.is_alive()
+    assert service_errors == []
+    assert not socket_path.exists()
+
+
+def test_claim_finalizer_production_composition_rejects_missing_private_and_certificate(
+    tmp_path: Path,
+) -> None:
+    from rquant.lab_claim_finalizer_composition import (
+        compose_production_lab_claim_finalizer_daemon,
+    )
+    from rquant.lab_daemon import LabDaemonConfigurationError
+
+    material = tmp_path / "claim-finalizer-private.json"
+    material.write_bytes(b"{}")
+    material.chmod(0o600)
+    settings = SimpleNamespace(lab_claim_finalizer_runtime_material_path=material)
+
+    with pytest.raises(LabDaemonConfigurationError, match="runtime material is invalid"):
+        compose_production_lab_claim_finalizer_daemon(settings=settings)
+
+    @pytest.mark.parametrize("action", ["apply", "recover", "retry"])
+    def test_absent_to_present_race_rejects_side_effect_actions(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        action: str,
+    ) -> None:
+        from rquant import cli as cli_module
+
+        base = tmp_path.resolve()
+        parent = base / "fixed-production-parent"
+        parent.mkdir(mode=0o700)
+        runtime_root = parent / "runtime"
+        self._patch_runtime_root(monkeypatch, runtime_root)
+        dev_root = base / "dev-root"
+        spool_root = base / "spool-root"
+        spool_root.mkdir(mode=0o700)
+
+        preview_args = build_parser().parse_args(self._dev_argv(dev_root))
+        assert cli_module.cmd_daily_dag(preview_args) == 0
+        preview = json.loads(capsys.readouterr().out)
+        assert not dev_root.exists()
+
+        original_plan = cli_module._daily_dag_control_plan
+
+        def racing_plan(namespace: argparse.Namespace):
+            plan = original_plan(namespace)
+            if not runtime_root.exists():
+                runtime_root.mkdir(mode=0o700)
+            return plan
+
+        monkeypatch.setattr(cli_module, "_daily_dag_control_plan", racing_plan)
+        args = build_parser().parse_args(
+            self._dev_argv(
+                dev_root,
+                "--action",
+                action,
+                "--apply",
+                "--run-id",
+                preview["run_id"],
+                "--plan-hash",
+                preview["plan_hash"],
+                "--source-spool-root",
+                str(spool_root),
+            )
+        )
+
+        assert cli_module.cmd_daily_dag(args) == 2
+        assert capsys.readouterr().out == ""
+        assert not dev_root.exists()

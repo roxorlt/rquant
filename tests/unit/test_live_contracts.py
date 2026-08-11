@@ -7,6 +7,7 @@ from pydantic import ValidationError
 
 from rquant.live_contracts import (
     BatchEnvelope,
+    BatchPointer,
     BatchQualityStatus,
     ConsumerCursor,
     CurrentPointer,
@@ -180,7 +181,12 @@ def test_consumer_cursor_requires_batch_and_hash_as_a_pair() -> None:
 
 @pytest.mark.parametrize(
     "quality_status",
-    [BatchQualityStatus.CANDIDATE, BatchQualityStatus.QUARANTINED],
+    [
+        BatchQualityStatus.CANDIDATE,
+        BatchQualityStatus.QUARANTINED,
+        BatchQualityStatus.DEGRADED,
+        BatchQualityStatus.STALE,
+    ],
 )
 def test_current_pointer_rejects_unpublished_status(
     quality_status: BatchQualityStatus,
@@ -198,8 +204,8 @@ def test_current_pointer_rejects_unpublished_status(
         )
 
 
-def test_current_pointer_accepts_visible_quality_and_normalizes_time() -> None:
-    pointer = CurrentPointer(
+def test_batch_pointer_accepts_recorded_noncurrent_quality_and_normalizes_time() -> None:
+    pointer = BatchPointer(
         channel=LiveChannel.MARKET_MINUTE,
         source_generation_id="b" * 64,
         batch_id="batch-1",

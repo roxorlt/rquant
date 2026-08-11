@@ -1,20 +1,23 @@
 from __future__ import annotations
 
+import ast
 import builtins
 import hashlib
 import inspect
 import json
+import multiprocessing
 import os
 import random
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
 import time
 import tracemalloc
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -51,6 +54,7 @@ from rquant.research_run_spec import DatasetSnapshotIdentity, ResearchRunSpec
 from rquant.strategy_job_adapters import (
     LabShardExecutionResult,
     LabShardTable,
+    StrategyShardPayload,
     ValidatedStrategyShard,
     default_strategy_job_adapter_registry,
 )
@@ -61,6 +65,29 @@ from tests.unit.test_strategy_job_adapters import (
 )
 
 NOW = datetime(2026, 7, 24, 0, 1, tzinfo=UTC)
+
+
+def test_stop_signal_wakes_an_active_waiter_immediately() -> None:
+    from rquant.lab_worker import LabStopSignal
+
+    stop = LabStopSignal()
+    waiting = threading.Event()
+    returned = threading.Event()
+
+    def wait_for_stop() -> None:
+        waiting.set()
+        stop.wait(5)
+        returned.set()
+
+    waiter = threading.Thread(target=wait_for_stop, daemon=True)
+    waiter.start()
+    assert waiting.wait(timeout=1)
+
+    stop.request()
+
+    assert returned.wait(timeout=0.2)
+    waiter.join(timeout=0.2)
+    assert not waiter.is_alive()
 
 
 def _legacy_canonical_shard_frame_digest(frame: pd.DataFrame) -> str:
@@ -851,8 +878,15 @@ class RecordingRegistry:
         self.delegate = default_strategy_job_adapter_registry()
         self.delay_seconds = delay_seconds
         self.failure = failure
-        self.executions = 0
+        self._executions = multiprocessing.get_context("spawn").Value("i", 0)
         self.stores: list[object] = []
+
+    @property
+    def executions(self) -> int:
+        counter_path = getattr(self, "_closed_execution_counter_path", None)
+        if isinstance(counter_path, Path) and counter_path.exists():
+            return int(counter_path.read_text(encoding="ascii"))
+        return self._executions.value
 
     def validate_claim(self, claim: LabShardClaim) -> ValidatedStrategyShard:
         return self.delegate.validate_claim(claim)
@@ -865,7 +899,11 @@ class RecordingRegistry:
         validated: ValidatedStrategyShard,
         store: object,
     ) -> LabShardExecutionResult:
-        self.executions += 1
+        with self._executions.get_lock():
+            self._executions.value += 1
+        counter_path = getattr(self, "_closed_execution_counter_path", None)
+        if isinstance(counter_path, Path):
+            _fixture_counter_increment(counter_path)
         self.stores.append(store)
         if self.delay_seconds:
             time.sleep(self.delay_seconds)
@@ -882,6 +920,1940 @@ class RecordingRegistry:
         )
 
 
+class ParentReduceTrap:
+    def __init__(self, *, reduce_marker: Path, execution_marker: Path) -> None:
+        self.reduce_marker = reduce_marker
+        self.execution_marker = execution_marker
+
+    def __reduce__(self) -> object:
+        self.reduce_marker.write_text("parent reduce invoked", encoding="ascii")
+        raise AssertionError("parent attempted to pickle an unregistered object")
+
+    def __call__(self, *_args: object, **_kwargs: object) -> object:
+        self.execution_marker.write_text("parent callback invoked", encoding="ascii")
+        raise AssertionError("unregistered parent callback was invoked")
+
+    def execute_shard(self, *_args: object, **_kwargs: object) -> object:
+        self.execution_marker.write_text("parent adapter invoked", encoding="ascii")
+        raise AssertionError("unregistered parent adapter was invoked")
+
+
+class MaliciousResultRegistry(RecordingRegistry):
+    def __init__(self, *, reduce_marker: Path) -> None:
+        super().__init__()
+        self.reduce_marker = reduce_marker
+
+
+class PlanBypassRecordingRegistry(RecordingRegistry):
+    def validate_claim(self, claim: LabShardClaim) -> ValidatedStrategyShard:
+        payload = StrategyShardPayload.model_validate_json(claim.definition.payload_json)
+        return ValidatedStrategyShard(
+            claim=claim,
+            spec=payload.spec,
+            shard=payload.shard,
+        )
+
+
+class HungLiveRegistry(RecordingRegistry):
+    def __init__(self, *, pid_path: Path) -> None:
+        super().__init__()
+        self.pid_path = pid_path
+        self._validated: ValidatedStrategyShard | None = None
+        self._blocked = multiprocessing.get_context("spawn").Event()
+
+    def validate_claim(self, claim: LabShardClaim) -> ValidatedStrategyShard:
+        payload = StrategyShardPayload.model_validate_json(claim.definition.payload_json)
+        self._validated = ValidatedStrategyShard(
+            claim=claim,
+            spec=payload.spec,
+            shard=payload.shard,
+        )
+        return self._validated
+
+    def execute_shard(
+        self,
+        validated: ValidatedStrategyShard,
+        store: object,
+    ) -> LabShardExecutionResult:
+        del validated, store
+        self.pid_path.write_text(str(os.getpid()), encoding="ascii")
+        self._blocked.wait()
+        raise AssertionError("hung registry was unexpectedly released")
+
+
+class SlowPidRegistry(HungLiveRegistry):
+    def __init__(self, *, pid_path: Path, delay_seconds: float) -> None:
+        super().__init__(pid_path=pid_path)
+        self.delay_seconds = delay_seconds
+
+    def execute_shard(
+        self,
+        validated: ValidatedStrategyShard,
+        store: object,
+    ) -> LabShardExecutionResult:
+        self.pid_path.write_text(str(os.getpid()), encoding="ascii")
+        time.sleep(self.delay_seconds)
+        return LabShardExecutionResult.from_validated(
+            validated,
+            tables=(
+                LabShardTable(
+                    name="trades",
+                    frame=pd.DataFrame([{"hold_days": 1, "ret_pct": 1.25}]),
+                ),
+            ),
+        )
+
+
+class BlockingRegistry(RecordingRegistry):
+    def __init__(self, *, executing: object, release: object) -> None:
+        super().__init__()
+        self.executing = executing
+        self.release = release
+
+    def execute_shard(
+        self,
+        validated: ValidatedStrategyShard,
+        store: object,
+    ) -> LabShardExecutionResult:
+        self.executing.set()
+        if not self.release.wait(2):
+            raise TimeoutError("blocking registry release timed out")
+        return super().execute_shard(validated, store)
+
+
+class DeadlineRegistry(RecordingRegistry):
+    def __init__(self, *, deadline_reached: object) -> None:
+        super().__init__()
+        self.deadline_reached = deadline_reached
+
+    def execute_shard(
+        self,
+        validated: ValidatedStrategyShard,
+        store: object,
+    ) -> LabShardExecutionResult:
+        result = super().execute_shard(validated, store)
+        self.deadline_reached.value = True
+        return result
+
+
+class SigtermIgnoringProcessTreeRegistry(HungLiveRegistry):
+    def __init__(
+        self,
+        *,
+        pid_path: Path,
+        grandchild_pid_path: Path,
+    ) -> None:
+        super().__init__(pid_path=pid_path)
+        self.grandchild_pid_path = grandchild_pid_path
+
+    def execute_shard(
+        self,
+        validated: ValidatedStrategyShard,
+        store: object,
+    ) -> LabShardExecutionResult:
+        del validated, store
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        grandchild_pid = os.fork()
+        if grandchild_pid == 0:
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            self.grandchild_pid_path.write_text(str(os.getpid()), encoding="ascii")
+            threading.Event().wait()
+        self.pid_path.write_text(str(os.getpid()), encoding="ascii")
+        threading.Event().wait()
+        raise AssertionError("process tree registry was unexpectedly released")
+
+
+def _standalone_sigterm_ignoring_process_tree(
+    pid_path: Path,
+    grandchild_pid_path: Path,
+) -> None:
+    os.setsid()
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    grandchild_pid = os.fork()
+    if grandchild_pid == 0:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        grandchild_pid_path.write_text(str(os.getpid()), encoding="ascii")
+        threading.Event().wait()
+    pid_path.write_text(str(os.getpid()), encoding="ascii")
+    threading.Event().wait()
+
+
+class TermExitingLeaderProcessTreeRegistry(HungLiveRegistry):
+    def __init__(
+        self,
+        *,
+        pid_path: Path,
+        grandchild_pid_path: Path,
+    ) -> None:
+        super().__init__(pid_path=pid_path)
+        self.grandchild_pid_path = grandchild_pid_path
+
+    def execute_shard(
+        self,
+        validated: ValidatedStrategyShard,
+        store: object,
+    ) -> LabShardExecutionResult:
+        del validated, store
+
+        def exit_on_term(_signum: int, _frame: object) -> None:
+            os._exit(0)
+
+        signal.signal(signal.SIGTERM, exit_on_term)
+        grandchild_pid = os.fork()
+        if grandchild_pid == 0:
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            self.grandchild_pid_path.write_text(str(os.getpid()), encoding="ascii")
+            threading.Event().wait()
+        self.pid_path.write_text(str(os.getpid()), encoding="ascii")
+        threading.Event().wait()
+        raise AssertionError("process tree registry was unexpectedly released")
+
+
+class SuccessfulProcessTreeRegistry(HungLiveRegistry):
+    def __init__(
+        self,
+        *,
+        pid_path: Path,
+        grandchild_pid_path: Path,
+    ) -> None:
+        super().__init__(pid_path=pid_path)
+        self.grandchild_pid_path = grandchild_pid_path
+
+    def execute_shard(
+        self,
+        validated: ValidatedStrategyShard,
+        store: object,
+    ) -> LabShardExecutionResult:
+        del store
+        grandchild_pid = os.fork()
+        if grandchild_pid == 0:
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            self.grandchild_pid_path.write_text(str(os.getpid()), encoding="ascii")
+            threading.Event().wait()
+        self.pid_path.write_text(str(os.getpid()), encoding="ascii")
+        return LabShardExecutionResult.from_validated(
+            validated,
+            tables=(
+                LabShardTable(
+                    name="trades",
+                    frame=pd.DataFrame([{"hold_days": 1, "ret_pct": 1.25}]),
+                ),
+            ),
+        )
+
+
+class SpawnMethodRegistry(SlowPidRegistry):
+    def execute_shard(
+        self,
+        validated: ValidatedStrategyShard,
+        store: object,
+    ) -> LabShardExecutionResult:
+        self.pid_path.write_text(multiprocessing.get_start_method(), encoding="ascii")
+        return LabShardExecutionResult.from_validated(
+            validated,
+            tables=(
+                LabShardTable(
+                    name="trades",
+                    frame=pd.DataFrame([{"hold_days": 1, "ret_pct": 1.25}]),
+                ),
+            ),
+        )
+
+
+class UnserializableRegistry(RecordingRegistry):
+    def __init__(self) -> None:
+        super().__init__()
+        self.unserializable = lambda: None
+
+
+class FailingWorkerRegistry(RecordingRegistry):
+    def execute_shard(
+        self,
+        validated: ValidatedStrategyShard,
+        store: object,
+    ) -> LabShardExecutionResult:
+        del validated, store
+        raise RuntimeError("worker exploded")
+
+
+class PermanentlyBlockingAfterFirstSnapshotProvider:
+    def __init__(
+        self,
+        *,
+        marker_path: Path,
+        snapshot: object,
+        block_after_calls: int = 1,
+    ) -> None:
+        self.marker_path = marker_path
+        self.snapshot = snapshot
+        self.block_after_calls = block_after_calls
+        self._blocked = multiprocessing.get_context("spawn").Event()
+
+    def __call__(self) -> object:
+        if not self.marker_path.exists():
+            self.marker_path.write_text("first", encoding="ascii")
+            return self.snapshot
+        self._blocked.wait()
+        raise AssertionError("blocked resource probe was unexpectedly released")
+
+
+def _ignore_term_forever(pid_path: Path, ready: object) -> None:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    pid_path.write_text(str(os.getpid()), encoding="ascii")
+    ready.set()
+    threading.Event().wait()
+
+
+class SpawnDescendantBlockingResourceSnapshotProvider:
+    def __init__(self, *, probe_pid_path: Path, descendant_pid_path: Path) -> None:
+        self.probe_pid_path = probe_pid_path
+        self.descendant_pid_path = descendant_pid_path
+
+    def __call__(self) -> object:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        context = multiprocessing.get_context("spawn")
+        ready = context.Event()
+        descendant = context.Process(
+            target=_ignore_term_forever,
+            args=(self.descendant_pid_path, ready),
+            daemon=False,
+        )
+        descendant.start()
+        self.probe_pid_path.write_text(str(os.getpid()), encoding="ascii")
+        if not ready.wait(2):
+            raise TimeoutError("resource probe descendant did not start")
+        threading.Event().wait()
+        raise AssertionError("blocked resource probe was unexpectedly released")
+
+
+class StaticResourceSnapshotProvider:
+    def __init__(self, snapshot: object) -> None:
+        self.snapshot = snapshot
+
+    def __call__(self) -> object:
+        return self.snapshot
+
+
+class ExportingResourceSnapshotProvider:
+    def __init__(self, snapshot: object, state: object) -> None:
+        self.snapshot = snapshot
+        self.state = state
+
+    def __call__(self) -> object:
+        return self.snapshot
+
+    def export_probe_state(self) -> object:
+        return self.state
+
+
+class RejectingProbeStateProvider:
+    def __init__(self, snapshot: object, state: object) -> None:
+        self.snapshot = snapshot
+        self.state = state
+
+    def spawn_probe_provider(self) -> ExportingResourceSnapshotProvider:
+        return ExportingResourceSnapshotProvider(self.snapshot, self.state)
+
+    def accept_probe_state(self, _state: object) -> bool:
+        return False
+
+    def __call__(self) -> object:
+        return self.snapshot
+
+
+class AdversarialSnapshotHooksProvider:
+    def __init__(
+        self,
+        *,
+        hook: Literal["spawn_probe_provider", "accept_probe_state"],
+        behavior: Literal["block", "exception", "recursive"],
+        snapshot: object,
+        entered_path: Path,
+        hook_pid_path: Path,
+        release_path: Path,
+        descendant_pid_path: Path | None = None,
+    ) -> None:
+        self.hook = hook
+        self.behavior = behavior
+        self.snapshot = snapshot
+        self.entered_path = entered_path
+        self.hook_pid_path = hook_pid_path
+        self.release_path = release_path
+        self.descendant_pid_path = descendant_pid_path
+
+    def _exercise_hook(self) -> None:
+        self.hook_pid_path.write_text(str(os.getpid()), encoding="ascii")
+        self.entered_path.write_text("entered", encoding="ascii")
+        if self.behavior == "exception":
+            raise RuntimeError(f"{self.hook} exploded")
+        descendant = None
+        if self.behavior == "recursive":
+            if self.descendant_pid_path is None:
+                raise AssertionError("recursive hook requires a descendant PID path")
+            context = multiprocessing.get_context("spawn")
+            ready = context.Event()
+            descendant = context.Process(
+                target=_ignore_term_forever,
+                args=(self.descendant_pid_path, ready),
+                daemon=False,
+            )
+            descendant.start()
+            if not ready.wait(2):
+                raise TimeoutError("snapshot hook descendant did not start")
+        deadline = time.monotonic() + 10
+        while not self.release_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if not self.release_path.exists():
+            raise TimeoutError("test snapshot hook was not cancelled")
+        if descendant is not None:
+            descendant.kill()
+            descendant.join(1)
+            descendant.close()
+
+    def spawn_probe_provider(self) -> ExportingResourceSnapshotProvider:
+        if self.hook == "spawn_probe_provider":
+            self._exercise_hook()
+        return ExportingResourceSnapshotProvider(self.snapshot, {"sequence": 1})
+
+    def accept_probe_state(self, _state: object) -> bool:
+        if self.hook == "accept_probe_state":
+            self._exercise_hook()
+        return True
+
+    def __call__(self) -> object:
+        return self.snapshot
+
+
+def test_rejected_resource_authority_state_cannot_admit_worker_execution(
+    tmp_path: Path,
+) -> None:
+    from rquant.lab_daemon import LabDaemonConfigurationError
+
+    claims = LabClaimSpool(tmp_path / "claims")
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims.publish(claim)
+    registry = RecordingRegistry()
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        registry=registry,
+        resource_snapshot_provider=RejectingProbeStateProvider(
+            _healthy_resource_snapshot(),
+            {"sequence": 1},
+        ),
+        admission_policy_provider=StaticAdmissionPolicyProvider(_permissive_admission_policy()),
+        require_resource_admission=True,
+    )
+
+    with pytest.raises(LabDaemonConfigurationError, match="authority state"):
+        worker.run_once()
+
+    assert registry.executions == 0
+    assert tuple(entry.claim for entry in claims.pending()) == (claim,)
+
+
+@pytest.mark.parametrize("hook", ("spawn_probe_provider", "accept_probe_state"))
+@pytest.mark.parametrize("termination", ("stop", "deadline-800ms"))
+def test_snapshot_hook_blocking_is_bounded_before_adapter_execution(
+    tmp_path: Path,
+    hook: Literal["spawn_probe_provider", "accept_probe_state"],
+    termination: str,
+) -> None:
+    from rquant.runtime_resource_admission import SQLiteResourceReservationStore
+
+    spec = _nshape_compare_spec(hold_days=(1,))
+    if termination == "deadline-800ms":
+        spec = spec.model_copy(update={"deadline": NOW + timedelta(milliseconds=800)})
+    claim = _claim(spec)
+    claims = LabClaimSpool(tmp_path / "claims")
+    registry = RecordingRegistry()
+    entered_path = tmp_path / f"{hook}-{termination}.entered"
+    hook_pid_path = tmp_path / f"{hook}-{termination}.pid"
+    release_path = tmp_path / f"{hook}-{termination}.release"
+    store = SQLiteResourceReservationStore(
+        tmp_path / f"{hook}-{termination}.sqlite3",
+        clock=lambda: NOW,
+    )
+    claims.publish(claim)
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        registry=registry,
+        resource_probe_timeout_seconds=3,
+        resource_snapshot_provider=AdversarialSnapshotHooksProvider(
+            hook=hook,
+            behavior="block",
+            snapshot=_healthy_resource_snapshot(),
+            entered_path=entered_path,
+            hook_pid_path=hook_pid_path,
+            release_path=release_path,
+        ),
+        admission_policy_provider=StaticAdmissionPolicyProvider(_permissive_admission_policy()),
+        resource_reservation_store=store,
+        require_resource_admission=True,
+    )
+    outcomes: list[object] = []
+    failures: list[BaseException] = []
+
+    def run_worker() -> None:
+        try:
+            outcomes.append(worker.run_once())
+        except BaseException as exc:
+            failures.append(exc)
+
+    started = time.monotonic()
+    runner = threading.Thread(target=run_worker)
+    runner.start()
+    try:
+        entered_deadline = time.monotonic() + 1.2
+        while not entered_path.exists() and time.monotonic() < entered_deadline:
+            time.sleep(0.01)
+        assert entered_path.exists()
+        assert int(hook_pid_path.read_text(encoding="ascii")) != os.getpid()
+        if termination == "stop":
+            worker.request_stop()
+        runner.join(timeout=1.6)
+        bounded = not runner.is_alive()
+        elapsed = time.monotonic() - started
+    finally:
+        release_path.write_text("release", encoding="ascii")
+        worker.request_stop()
+        runner.join(timeout=2)
+
+    assert bounded
+    assert elapsed < 1.6
+    assert failures == []
+    assert outcomes[0].status == "stopped"
+    assert registry.executions == 0
+    _assert_process_gone(int(hook_pid_path.read_text(encoding="ascii")))
+    assert store.active_leases() == ()
+
+
+@pytest.mark.parametrize("hook", ("spawn_probe_provider", "accept_probe_state"))
+def test_snapshot_hook_exception_fails_closed_before_adapter_execution(
+    tmp_path: Path,
+    hook: Literal["spawn_probe_provider", "accept_probe_state"],
+) -> None:
+    from rquant.runtime_resource_admission import SQLiteResourceReservationStore
+
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims = LabClaimSpool(tmp_path / "claims")
+    registry = RecordingRegistry()
+    store = SQLiteResourceReservationStore(
+        tmp_path / f"{hook}-exception.sqlite3",
+        clock=lambda: NOW,
+    )
+    claims.publish(claim)
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        registry=registry,
+        resource_probe_timeout_seconds=3,
+        resource_snapshot_provider=AdversarialSnapshotHooksProvider(
+            hook=hook,
+            behavior="exception",
+            snapshot=_healthy_resource_snapshot(),
+            entered_path=tmp_path / f"{hook}-exception.entered",
+            hook_pid_path=tmp_path / f"{hook}-exception.pid",
+            release_path=tmp_path / f"{hook}-exception.release",
+        ),
+        admission_policy_provider=StaticAdmissionPolicyProvider(_permissive_admission_policy()),
+        resource_reservation_store=store,
+        require_resource_admission=True,
+    )
+
+    with pytest.raises(LabDaemonConfigurationError):
+        worker.run_once()
+
+    assert registry.executions == 0
+    hook_pid = int((tmp_path / f"{hook}-exception.pid").read_text(encoding="ascii"))
+    assert hook_pid != os.getpid()
+    _assert_process_gone(hook_pid)
+    assert store.active_leases() == ()
+
+
+@pytest.mark.parametrize("hook", ("spawn_probe_provider", "accept_probe_state"))
+def test_snapshot_hook_recursive_child_ignoring_term_is_killed_and_reaped(
+    tmp_path: Path,
+    hook: Literal["spawn_probe_provider", "accept_probe_state"],
+) -> None:
+    from rquant.runtime_resource_admission import SQLiteResourceReservationStore
+
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims = LabClaimSpool(tmp_path / "claims")
+    registry = RecordingRegistry()
+    entered_path = tmp_path / f"{hook}-recursive.entered"
+    hook_pid_path = tmp_path / f"{hook}-recursive.pid"
+    descendant_pid_path = tmp_path / f"{hook}-recursive-descendant.pid"
+    release_path = tmp_path / f"{hook}-recursive.release"
+    store = SQLiteResourceReservationStore(
+        tmp_path / f"{hook}-recursive.sqlite3",
+        clock=lambda: NOW,
+    )
+    claims.publish(claim)
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        registry=registry,
+        resource_probe_timeout_seconds=3,
+        resource_snapshot_provider=AdversarialSnapshotHooksProvider(
+            hook=hook,
+            behavior="recursive",
+            snapshot=_healthy_resource_snapshot(),
+            entered_path=entered_path,
+            hook_pid_path=hook_pid_path,
+            release_path=release_path,
+            descendant_pid_path=descendant_pid_path,
+        ),
+        admission_policy_provider=StaticAdmissionPolicyProvider(_permissive_admission_policy()),
+        resource_reservation_store=store,
+        require_resource_admission=True,
+    )
+    outcomes: list[object] = []
+    failures: list[BaseException] = []
+
+    def run_worker() -> None:
+        try:
+            outcomes.append(worker.run_once())
+        except BaseException as exc:
+            failures.append(exc)
+
+    runner = threading.Thread(target=run_worker)
+    runner.start()
+    try:
+        entered_deadline = time.monotonic() + 3
+        while (
+            not entered_path.exists() or not descendant_pid_path.exists()
+        ) and time.monotonic() < entered_deadline:
+            time.sleep(0.01)
+        assert entered_path.exists()
+        assert descendant_pid_path.exists()
+        started = time.monotonic()
+        worker.request_stop()
+        runner.join(timeout=1.2)
+        bounded = not runner.is_alive()
+        elapsed = time.monotonic() - started
+    finally:
+        release_path.write_text("release", encoding="ascii")
+        worker.request_stop()
+        runner.join(timeout=2)
+
+    assert bounded
+    assert elapsed < 1.2
+    assert failures == []
+    assert outcomes[0].status == "stopped"
+    assert registry.executions == 0
+    hook_pid = int(hook_pid_path.read_text(encoding="ascii"))
+    descendant_pid = int(descendant_pid_path.read_text(encoding="ascii"))
+    assert hook_pid != os.getpid()
+    _assert_process_gone(hook_pid)
+    _assert_process_gone(descendant_pid)
+    assert store.active_leases() == ()
+
+
+@pytest.mark.parametrize(
+    "injection_point",
+    (
+        "resource_snapshot_provider",
+        "admission_policy_provider",
+        "source_quota_lease_provider",
+        "spawn_probe_provider",
+        "accept_probe_state",
+        "export_probe_state",
+    ),
+)
+def test_resource_authority_injection_points_have_no_parent_direct_invocation(
+    injection_point: str,
+) -> None:
+    from rquant.lab_worker import LabWorker
+
+    worker_node = next(
+        node
+        for node in ast.parse(inspect.getsource(LabWorker)).body
+        if isinstance(node, ast.ClassDef) and node.name == "LabWorker"
+    )
+    violations: list[str] = []
+    for method in worker_node.body:
+        if not isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for node in ast.walk(method):
+            if (
+                injection_point.endswith("_provider")
+                and isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "self"
+                and node.func.attr == injection_point
+            ):
+                violations.append(f"{method.name}:{node.lineno}")
+            if (
+                injection_point
+                in {"spawn_probe_provider", "accept_probe_state", "export_probe_state"}
+                and isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "getattr"
+                and any(
+                    isinstance(argument, ast.Constant) and argument.value == injection_point
+                    for argument in node.args
+                )
+            ):
+                violations.append(f"{method.name}:{node.lineno}")
+
+    assert violations == []
+
+
+def test_process_boundaries_use_bytes_transport_and_primitive_start_args() -> None:
+    import rquant.lab_worker as lab_worker
+
+    source = inspect.getsource(lab_worker)
+    tree = ast.parse(source)
+    object_transport_calls = [
+        f"{node.func.attr}:{node.lineno}"
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in {"send", "recv"}
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id in {"child_connection", "parent_connection"}
+    ]
+
+    assert object_transport_calls == []
+    assert "Pipe(" not in source
+    assert ".send(" not in source
+    assert ".recv(" not in source
+    lab_worker._assert_primitive_process_start(
+        lab_worker._authority_wire_child,
+        (b"{}", "/private/tmp/test.sock", b"key", 1024),
+    )
+    with pytest.raises(LabDaemonConfigurationError, match="target is not registered"):
+        lab_worker._assert_primitive_process_start(
+            lambda: None,
+            (b"{}", "/private/tmp/test.sock", b"key", 1024),
+        )
+    with pytest.raises(LabDaemonConfigurationError, match="primitive wire values"):
+        lab_worker._assert_primitive_process_start(
+            lab_worker._shard_wire_child,
+            (b"{}", "/private/tmp/test.sock", object(), 1024),
+        )
+
+
+def test_closed_registry_hash_mismatch_fails_before_process_start(tmp_path: Path) -> None:
+    import rquant.lab_worker as lab_worker
+
+    assert hasattr(lab_worker, "LabClosedRegistryBinding")
+    assert hasattr(lab_worker, "LabShardRuntimeManifest")
+    binding = lab_worker.LabClosedRegistryBinding(
+        registry_id="rquant.lab-shard.builtin",
+        registry_version=1,
+        registry_hash="f" * 64,
+        configuration_json="{}",
+    )
+    manifest = lab_worker.LabShardRuntimeManifest(registry=binding)
+    worker = _worker(tmp_path, shard_runtime_manifest=manifest)
+
+    with pytest.raises(LabDaemonConfigurationError, match="registry hash"):
+        worker.run_once()
+
+
+def test_parent_rejects_unregistered_adapter_registry_without_truthiness_call(
+    tmp_path: Path,
+) -> None:
+    from rquant.lab_worker import LabWorker
+
+    marker = tmp_path / "adapter-registry-bool.marker"
+
+    class UnregisteredRegistry:
+        def __bool__(self) -> bool:
+            marker.write_text("called", encoding="ascii")
+            raise AssertionError("unregistered adapter registry truthiness was invoked")
+
+    with pytest.raises(LabDaemonConfigurationError, match="adapter registry is not registered"):
+        LabWorker(
+            worker_id="worker-a",
+            claim_spool=LabClaimSpool(tmp_path / "claims"),
+            report_spool=LabReportSpool(tmp_path / "reports"),
+            artifact_root=tmp_path / "artifacts",
+            adapter_registry=UnregisteredRegistry(),
+        )
+
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        b"{",
+        b'{"message_type":"readiness", "ready":true}',
+        b'{"message_type":"unknown"}',
+        b"x" * (1024 * 1024 + 1),
+    ),
+)
+def test_wire_decoder_rejects_malformed_noncanonical_and_oversize_bytes(
+    payload: bytes,
+) -> None:
+    import rquant.lab_worker as lab_worker
+
+    assert hasattr(lab_worker, "_decode_wire_message")
+    assert hasattr(lab_worker, "_IsolationReadiness")
+    with pytest.raises((LabDaemonConfigurationError, ValueError)):
+        lab_worker._decode_wire_message(
+            payload,
+            model=lab_worker._IsolationReadiness,
+            max_bytes=1024 * 1024,
+            label="test wire message",
+        )
+
+
+@pytest.mark.parametrize("payload", (b"{", b"x" * 1025))
+def test_recv_wire_rejects_malformed_and_oversize_send_bytes(payload: bytes) -> None:
+    import rquant.lab_worker as lab_worker
+
+    receiver, sender = multiprocessing.Pipe(duplex=False)
+    try:
+        sender.send_bytes(payload)
+        with pytest.raises(LabDaemonConfigurationError, match="transport|malformed"):
+            lab_worker._recv_wire(
+                receiver,
+                model=lab_worker._IsolationReadiness,
+                max_bytes=1024,
+                label="adversarial wire",
+            )
+    finally:
+        receiver.close()
+        sender.close()
+
+
+def test_result_wire_outbound_gate_matches_parent_receive_limit_without_large_allocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.lab_worker as lab_worker
+    from rquant.strategy_job_adapters import MAX_RESULT_WIRE_BYTES
+
+    assert lab_worker._MAX_SHARD_RESULT_WIRE_BYTES == MAX_RESULT_WIRE_BYTES
+    lab_worker._validate_outbound_wire_size(
+        MAX_RESULT_WIRE_BYTES,
+        max_bytes=MAX_RESULT_WIRE_BYTES,
+        label="isolated shard outcome",
+    )
+    with pytest.raises(LabDaemonConfigurationError, match="outbound wire size limit"):
+        lab_worker._validate_outbound_wire_size(
+            MAX_RESULT_WIRE_BYTES + 1,
+            max_bytes=MAX_RESULT_WIRE_BYTES,
+            label="isolated shard outcome",
+        )
+
+    class RecordingConnection:
+        sent = False
+
+        def send_bytes(self, _payload: bytes) -> None:
+            self.sent = True
+
+    connection = RecordingConnection()
+    monkeypatch.setattr(lab_worker, "_encode_wire_message", lambda _value: b"12345")
+    with pytest.raises(LabDaemonConfigurationError, match="outbound wire size limit"):
+        lab_worker._send_wire(
+            connection,
+            lab_worker._IsolationStartAck(
+                accepted=True,
+                not_after_monotonic_microseconds=None,
+            ),
+            max_bytes=4,
+            label="test outbound",
+        )
+    assert not connection.sent
+
+
+class SequenceResourceSnapshotProvider:
+    def __init__(self, *snapshots: object) -> None:
+        if not snapshots:
+            raise ValueError("at least one resource snapshot is required")
+        self.snapshots = snapshots
+        self._calls = multiprocessing.get_context("spawn").Value("i", 0)
+
+    @property
+    def calls(self) -> int:
+        counter_path = getattr(self, "_closed_call_counter_path", None)
+        if isinstance(counter_path, Path) and counter_path.exists():
+            return int(counter_path.read_text(encoding="ascii"))
+        return self._calls.value
+
+    def __call__(self) -> object:
+        with self._calls.get_lock():
+            index = self._calls.value
+            self._calls.value += 1
+        return self.snapshots[min(index, len(self.snapshots) - 1)]
+
+
+class MutableResourceSnapshotProvider:
+    def __init__(self, *snapshots: object) -> None:
+        if not snapshots:
+            raise ValueError("at least one resource snapshot is required")
+        self.snapshots = snapshots
+        self._selected = multiprocessing.get_context("spawn").Value("i", 0)
+
+    def select(self, index: int) -> None:
+        if index < 0 or index >= len(self.snapshots):
+            raise ValueError("resource snapshot selection is out of range")
+        selection_path = getattr(self, "_closed_selection_path", None)
+        if isinstance(selection_path, Path):
+            selection_path.write_text(str(index), encoding="ascii")
+        with self._selected.get_lock():
+            self._selected.value = index
+
+    def __call__(self) -> object:
+        with self._selected.get_lock():
+            return self.snapshots[self._selected.value]
+
+
+class FileSelectedResourceSnapshotProvider:
+    def __init__(self, selection_path: Path, *snapshots: object) -> None:
+        if not snapshots:
+            raise ValueError("at least one resource snapshot is required")
+        self.selection_path = selection_path
+        self.snapshots = snapshots
+
+    def select(self, index: int) -> None:
+        if index < 0 or index >= len(self.snapshots):
+            raise ValueError("resource snapshot selection is out of range")
+        self.selection_path.write_text(str(index), encoding="ascii")
+
+    def __call__(self) -> object:
+        index = (
+            int(self.selection_path.read_text(encoding="ascii"))
+            if self.selection_path.exists()
+            else 0
+        )
+        return self.snapshots[index]
+
+
+class FailingResourceSnapshotProvider:
+    def __init__(self, message: str) -> None:
+        self.message = message
+
+    def __call__(self) -> object:
+        raise RuntimeError(self.message)
+
+
+class MutableUtcClock:
+    def __init__(self, value: datetime) -> None:
+        self._timestamp = multiprocessing.get_context("spawn").Value("d", value.timestamp())
+
+    def set(self, value: datetime) -> None:
+        with self._timestamp.get_lock():
+            self._timestamp.value = value.timestamp()
+
+    def __call__(self) -> datetime:
+        with self._timestamp.get_lock():
+            timestamp = self._timestamp.value
+        return datetime.fromtimestamp(timestamp, tz=UTC)
+
+
+class SlowStoreContext:
+    def __init__(self, *, delay_seconds: float) -> None:
+        self.delay_seconds = delay_seconds
+
+    def __enter__(self) -> object:
+        time.sleep(self.delay_seconds)
+        return object()
+
+    def __exit__(self, _exc_type: object, _exc: object, _traceback: object) -> None:
+        return None
+
+
+class SlowStoreFactory:
+    def __init__(self, *, delay_seconds: float) -> None:
+        self.delay_seconds = delay_seconds
+
+    def __call__(self) -> SlowStoreContext:
+        return SlowStoreContext(delay_seconds=self.delay_seconds)
+
+
+class FailingSessionInitializer:
+    def __call__(self) -> None:
+        raise PermissionError("setsid denied")
+
+
+class RecordingSessionInitializer:
+    def __init__(self, pid_path: Path) -> None:
+        self.pid_path = pid_path
+
+    def __call__(self) -> None:
+        os.setsid()
+        self.pid_path.write_text(str(os.getpid()), encoding="ascii")
+
+
+class BlockingRecordingSessionInitializer(RecordingSessionInitializer):
+    def __init__(self, pid_path: Path, release_path: Path) -> None:
+        super().__init__(pid_path)
+        self.release_path = release_path
+
+    def __call__(self) -> None:
+        super().__call__()
+        deadline = time.monotonic() + 5
+        while not self.release_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if not self.release_path.exists():
+            raise TimeoutError("test did not release isolated session readiness")
+
+
+class SequenceAdmissionPolicyProvider:
+    def __init__(self, *policies: object) -> None:
+        if not policies:
+            raise ValueError("at least one admission policy is required")
+        self.policies = policies
+        self._calls = multiprocessing.get_context("spawn").Value("i", 0)
+
+    @property
+    def calls(self) -> int:
+        counter_path = getattr(self, "_closed_call_counter_path", None)
+        if isinstance(counter_path, Path) and counter_path.exists():
+            return int(counter_path.read_text(encoding="ascii"))
+        return self._calls.value
+
+    def __call__(self, _spec: ResearchRunSpec) -> object:
+        with self._calls.get_lock():
+            index = self._calls.value
+            self._calls.value += 1
+        return self.policies[min(index, len(self.policies) - 1)]
+
+
+class StaticAdmissionPolicyProvider:
+    def __init__(self, policy: object) -> None:
+        self.policy = policy
+
+    def __call__(self, _spec: ResearchRunSpec) -> object:
+        return self.policy
+
+
+class SlowAdmissionPolicyProvider:
+    def __init__(
+        self,
+        policy: object,
+        *,
+        delay_seconds: float,
+        second_call_entered_path: Path,
+    ) -> None:
+        self.policy = policy
+        self.delay_seconds = delay_seconds
+        self.second_call_entered_path = second_call_entered_path
+
+
+class BlockingInitialAdmissionPolicyProvider:
+    def __init__(
+        self,
+        policy: object,
+        *,
+        entered_path: Path,
+        pid_path: Path,
+        release_path: Path,
+    ) -> None:
+        self.policy = policy
+        self.entered_path = entered_path
+        self.pid_path = pid_path
+        self.release_path = release_path
+
+    def __call__(self, _spec: ResearchRunSpec) -> object:
+        self.pid_path.write_text(str(os.getpid()), encoding="ascii")
+        self.entered_path.write_text("entered", encoding="ascii")
+        deadline = time.monotonic() + 10
+        while not self.release_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if not self.release_path.exists():
+            raise TimeoutError("test initial policy callback was not cancelled")
+        return self.policy
+
+
+class BlockingInitialSourceQuotaLeaseProvider:
+    def __init__(
+        self,
+        *,
+        entered_path: Path,
+        pid_path: Path,
+        release_path: Path,
+    ) -> None:
+        self.entered_path = entered_path
+        self.pid_path = pid_path
+        self.release_path = release_path
+
+    def __call__(self, request: object, _snapshot: object) -> object:
+        from rquant.resource_admission import AdmissionRequest, SourceQuotaLease
+
+        validated_request = AdmissionRequest.model_validate(request)
+        self.pid_path.write_text(str(os.getpid()), encoding="ascii")
+        self.entered_path.write_text("entered", encoding="ascii")
+        deadline = time.monotonic() + 10
+        while not self.release_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if not self.release_path.exists():
+            raise TimeoutError("test initial quota callback was not cancelled")
+        return SourceQuotaLease(
+            source=validated_request.source or "test-source",
+            owner=validated_request.job_id,
+            units=validated_request.expected_quota_units,
+            granted_at=NOW,
+            expires_at=NOW + timedelta(minutes=1),
+            quota_reset_at=NOW + timedelta(minutes=2),
+        )
+
+
+class SpawnDescendantBlockingAdmissionPolicyProvider:
+    def __init__(
+        self,
+        policy: object,
+        *,
+        authority_pid_path: Path,
+        descendant_pid_path: Path,
+        release_path: Path,
+    ) -> None:
+        self.policy = policy
+        self.authority_pid_path = authority_pid_path
+        self.descendant_pid_path = descendant_pid_path
+        self.release_path = release_path
+
+    def __call__(self, _spec: ResearchRunSpec) -> object:
+        context = multiprocessing.get_context("spawn")
+        ready = context.Event()
+        descendant = context.Process(
+            target=_ignore_term_forever,
+            args=(self.descendant_pid_path, ready),
+            daemon=False,
+        )
+        descendant.start()
+        self.authority_pid_path.write_text(str(os.getpid()), encoding="ascii")
+        if not ready.wait(2):
+            raise TimeoutError("authority callback descendant did not start")
+        deadline = time.monotonic() + 10
+        while not self.release_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if not self.release_path.exists():
+            raise TimeoutError("test recursive authority callback was not cancelled")
+        descendant.kill()
+        descendant.join(1)
+        descendant.close()
+        return self.policy
+
+
+class FailingInitialAdmissionPolicyProvider:
+    def __call__(self, _spec: ResearchRunSpec) -> object:
+        raise RuntimeError("initial policy exploded")
+
+
+class FailingInitialSourceQuotaLeaseProvider:
+    def __call__(self, _request: object, _snapshot: object) -> object:
+        raise RuntimeError("initial quota exploded")
+
+
+class BlockingSecondAdmissionPolicyProvider:
+    def __init__(
+        self,
+        policy: object,
+        *,
+        entered_path: Path,
+        release_path: Path,
+    ) -> None:
+        self.policy = policy
+        self.entered_path = entered_path
+        self.release_path = release_path
+        self._calls = multiprocessing.get_context("spawn").Value("i", 0)
+
+    def __call__(self, _spec: ResearchRunSpec) -> object:
+        with self._calls.get_lock():
+            self._calls.value += 1
+            call_number = self._calls.value
+        if call_number > 1:
+            self.entered_path.write_text("entered", encoding="ascii")
+            deadline = time.monotonic() + 10
+            while not self.release_path.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if not self.release_path.exists():
+                raise TimeoutError("test admission policy callback was not cancelled")
+        return self.policy
+
+
+class BlockingSecondSourceQuotaLeaseProvider:
+    def __init__(
+        self,
+        *,
+        entered_path: Path,
+        release_path: Path,
+        authority_pid_path: Path | None = None,
+    ) -> None:
+        self.entered_path = entered_path
+        self.release_path = release_path
+        self.authority_pid_path = authority_pid_path
+        self._calls = multiprocessing.get_context("spawn").Value("i", 0)
+
+    def __call__(self, request: object, _snapshot: object) -> object:
+        from rquant.resource_admission import AdmissionRequest, SourceQuotaLease
+
+        validated_request = AdmissionRequest.model_validate(request)
+        with self._calls.get_lock():
+            self._calls.value += 1
+            call_number = self._calls.value
+        if call_number > 1:
+            self.entered_path.write_text("entered", encoding="ascii")
+            deadline = time.monotonic() + 10
+            while not self.release_path.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if not self.release_path.exists():
+                raise TimeoutError("test source quota callback was not cancelled")
+        return SourceQuotaLease(
+            source=validated_request.source or "test-source",
+            owner=validated_request.job_id,
+            units=validated_request.expected_quota_units,
+            granted_at=NOW,
+            expires_at=NOW + timedelta(minutes=1),
+            quota_reset_at=NOW + timedelta(minutes=2),
+        )
+
+
+def _assert_process_gone(pid: int, *, timeout_seconds: float = 2.0) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.01)
+    pytest.fail(f"process remained alive after isolation cleanup: {pid}")
+
+
+def _kill_process_if_alive(pid: int) -> None:
+    with suppress(ProcessLookupError):
+        os.kill(pid, signal.SIGKILL)
+
+
+def _collect_base_exceptions(error: BaseException) -> list[BaseException]:
+    if isinstance(error, BaseExceptionGroup):
+        return [
+            nested for member in error.exceptions for nested in _collect_base_exceptions(member)
+        ]
+    return [error]
+
+
+def _cleanup_spawned_probe_processes(*, group_id: int | None, pids: tuple[int, ...]) -> None:
+    if group_id is not None:
+        with suppress(ProcessLookupError):
+            os.killpg(group_id, signal.SIGKILL)
+    for pid in pids:
+        _kill_process_if_alive(pid)
+    for child in multiprocessing.active_children():
+        if child.name == "lab-resource-probe":
+            with suppress(BaseException):
+                child.kill()
+            with suppress(BaseException):
+                child.join(1)
+
+
+def _short_live_claim() -> LabShardClaim:
+    return _short_claim_for_spec(_nshape_compare_spec(hold_days=(1,)))
+
+
+def _short_claim_for_spec(spec: ResearchRunSpec) -> LabShardClaim:
+    from rquant.lab_shard_protocol import LabShardDefinition
+
+    claim = _claim(spec)
+    work_plan = claim.definition.work_plan
+    assert work_plan is not None
+    definition = LabShardDefinition.from_payload(
+        shard_index=claim.definition.shard_index,
+        adapter_id=claim.definition.adapter_id,
+        adapter_version=claim.definition.adapter_version,
+        plan_hash=claim.definition.plan_hash,
+        payload_json=claim.definition.payload_json,
+        work_plan=work_plan.model_copy(update={"static_duration_ms": 50}),
+    )
+    return LabShardClaim.model_validate(
+        {
+            **claim.model_dump(mode="python"),
+            "definition": definition,
+        }
+    )
+
+
+def _fixture_counter_path(tmp_path: Path, owner: object, label: str) -> Path:
+    path = tmp_path / f".{label}-{id(owner):x}.count"
+    if not path.exists():
+        path.write_text("0", encoding="ascii")
+    return path
+
+
+def _fixture_counter_increment(path_value: object) -> int:
+    path = Path(str(path_value))
+    current = int(path.read_text(encoding="ascii")) if path.exists() else 0
+    current += 1
+    path.write_text(str(current), encoding="ascii")
+    return current
+
+
+def _fixture_model(value: object, model: type[object]) -> dict[str, object]:
+    validated = model.model_validate(value)
+    return validated.model_dump(mode="json", round_trip=True)
+
+
+def _snapshot_fixture_config(provider: object, tmp_path: Path) -> dict[str, object]:
+    from rquant.resource_admission import ResourceSnapshot
+
+    if type(provider) is StaticResourceSnapshotProvider:
+        return {
+            "kind": "static",
+            "snapshot": _fixture_model(provider.snapshot, ResourceSnapshot),
+        }
+    if type(provider) is SequenceResourceSnapshotProvider:
+        counter = _fixture_counter_path(tmp_path, provider, "snapshot")
+        provider._closed_call_counter_path = counter
+        return {
+            "kind": "sequence",
+            "counter_path": str(counter),
+            "snapshots": [
+                _fixture_model(snapshot, ResourceSnapshot) for snapshot in provider.snapshots
+            ],
+        }
+    if type(provider) is MutableResourceSnapshotProvider:
+        selection = tmp_path / f".snapshot-selection-{id(provider):x}"
+        with provider._selected.get_lock():
+            selection.write_text(str(provider._selected.value), encoding="ascii")
+        provider._closed_selection_path = selection
+        return {
+            "kind": "selected",
+            "selection_path": str(selection),
+            "snapshots": [
+                _fixture_model(snapshot, ResourceSnapshot) for snapshot in provider.snapshots
+            ],
+        }
+    if type(provider) is FileSelectedResourceSnapshotProvider:
+        return {
+            "kind": "selected",
+            "selection_path": str(provider.selection_path),
+            "snapshots": [
+                _fixture_model(snapshot, ResourceSnapshot) for snapshot in provider.snapshots
+            ],
+        }
+    if type(provider) is PermanentlyBlockingAfterFirstSnapshotProvider:
+        return {
+            "kind": "block-after-calls",
+            "block_after_calls": provider.block_after_calls,
+            "counter_path": str(provider.marker_path),
+            "snapshot": _fixture_model(provider.snapshot, ResourceSnapshot),
+        }
+    if type(provider) is SpawnDescendantBlockingResourceSnapshotProvider:
+        return {
+            "kind": "recursive-block",
+            "pid_path": str(provider.probe_pid_path),
+            "descendant_pid_path": str(provider.descendant_pid_path),
+        }
+    if type(provider) is FailingResourceSnapshotProvider:
+        return {
+            "kind": "failure",
+            "message": f"resource snapshot provider failed: {provider.message}",
+        }
+    if type(provider) is ExportingResourceSnapshotProvider:
+        return {
+            "kind": "exporting",
+            "snapshot": _fixture_model(provider.snapshot, ResourceSnapshot),
+            "state": provider.state,
+        }
+    if type(provider) is RejectingProbeStateProvider:
+        return {
+            "kind": "reject-state",
+            "snapshot": _fixture_model(provider.snapshot, ResourceSnapshot),
+            "state": provider.state,
+        }
+    if type(provider) is AdversarialSnapshotHooksProvider:
+        return {
+            "kind": "adversarial-hook",
+            "hook": provider.hook,
+            "behavior": provider.behavior,
+            "snapshot": _fixture_model(provider.snapshot, ResourceSnapshot),
+            "entered_path": str(provider.entered_path),
+            "pid_path": str(provider.hook_pid_path),
+            "release_path": str(provider.release_path),
+            "descendant_pid_path": (
+                None if provider.descendant_pid_path is None else str(provider.descendant_pid_path)
+            ),
+        }
+    return {"kind": "unregistered", "message": "snapshot provider is not spawn-serializable"}
+
+
+def _policy_fixture_config(provider: object, tmp_path: Path) -> dict[str, object]:
+    from rquant.resource_admission import AdmissionPolicy
+
+    if type(provider) is StaticAdmissionPolicyProvider:
+        return {
+            "kind": "static",
+            "policy": _fixture_model(provider.policy, AdmissionPolicy),
+        }
+    if type(provider) is SlowAdmissionPolicyProvider:
+        counter = _fixture_counter_path(tmp_path, provider, "policy")
+        return {
+            "kind": "slow",
+            "policy": _fixture_model(provider.policy, AdmissionPolicy),
+            "counter_path": str(counter),
+            "delay_seconds": provider.delay_seconds,
+            "second_call_entered_path": str(provider.second_call_entered_path),
+        }
+    if type(provider) is SequenceAdmissionPolicyProvider:
+        counter = _fixture_counter_path(tmp_path, provider, "policy")
+        provider._closed_call_counter_path = counter
+        return {
+            "kind": "sequence",
+            "counter_path": str(counter),
+            "policies": [_fixture_model(policy, AdmissionPolicy) for policy in provider.policies],
+        }
+    if type(provider) is BlockingInitialAdmissionPolicyProvider:
+        return {
+            "kind": "block",
+            "policy": _fixture_model(provider.policy, AdmissionPolicy),
+            "entered_path": str(provider.entered_path),
+            "pid_path": str(provider.pid_path),
+            "release_path": str(provider.release_path),
+        }
+    if type(provider) is SpawnDescendantBlockingAdmissionPolicyProvider:
+        return {
+            "kind": "recursive-block",
+            "policy": _fixture_model(provider.policy, AdmissionPolicy),
+            "pid_path": str(provider.authority_pid_path),
+            "descendant_pid_path": str(provider.descendant_pid_path),
+            "release_path": str(provider.release_path),
+        }
+    if type(provider) is FailingInitialAdmissionPolicyProvider:
+        return {
+            "kind": "failure",
+            "message": "admission policy provider failed: initial policy exploded",
+        }
+    if type(provider) is BlockingSecondAdmissionPolicyProvider:
+        counter = _fixture_counter_path(tmp_path, provider, "policy")
+        return {
+            "kind": "block-after-first",
+            "policy": _fixture_model(provider.policy, AdmissionPolicy),
+            "counter_path": str(counter),
+            "entered_path": str(provider.entered_path),
+            "release_path": str(provider.release_path),
+        }
+    return {"kind": "unregistered", "message": "policy provider is not spawn-serializable"}
+
+
+def _quota_fixture_config(provider: object | None, tmp_path: Path) -> dict[str, object]:
+    if provider is None:
+        return {"kind": "none"}
+    if type(provider) is BlockingInitialSourceQuotaLeaseProvider:
+        return {
+            "kind": "block",
+            "entered_path": str(provider.entered_path),
+            "pid_path": str(provider.pid_path),
+            "release_path": str(provider.release_path),
+        }
+    if type(provider) is FailingInitialSourceQuotaLeaseProvider:
+        return {
+            "kind": "failure",
+            "message": "source quota lease provider failed: initial quota exploded",
+        }
+    if type(provider) is BlockingSecondSourceQuotaLeaseProvider:
+        counter = _fixture_counter_path(tmp_path, provider, "quota")
+        configuration: dict[str, object] = {
+            "kind": "block-after-first",
+            "counter_path": str(counter),
+            "entered_path": str(provider.entered_path),
+            "release_path": str(provider.release_path),
+        }
+        if provider.authority_pid_path is not None:
+            configuration["pid_path"] = str(provider.authority_pid_path)
+        return configuration
+    return {"kind": "unregistered", "message": "quota provider is not spawn-serializable"}
+
+
+def _test_authority_manifest(
+    tmp_path: Path,
+    *,
+    snapshot_provider: object,
+    policy_provider: object,
+    quota_provider: object | None,
+):
+    from rquant.lab_worker import (
+        LabClosedRegistryBinding,
+        LabResourceAuthorityManifest,
+    )
+
+    configuration = {
+        "policy": _policy_fixture_config(policy_provider, tmp_path),
+        "quota": _quota_fixture_config(quota_provider, tmp_path),
+        "snapshot": _snapshot_fixture_config(snapshot_provider, tmp_path),
+    }
+    configuration_json = json.dumps(
+        configuration,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return LabResourceAuthorityManifest(
+        registry=LabClosedRegistryBinding(
+            registry_id="rquant.lab-authority.test-fixture",
+            registry_version=1,
+            registry_hash=hashlib.sha256(b"rquant:lab-authority:test-fixture:v1").hexdigest(),
+            configuration_json=configuration_json,
+        )
+    )
+
+
+def _wait_fixture_release(path_value: object, *, timeout_seconds: float = 10) -> None:
+    path = Path(str(path_value))
+    deadline = time.monotonic() + timeout_seconds
+    while not path.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    if not path.exists():
+        raise TimeoutError("test authority fixture was not released")
+
+
+def _spawn_fixture_descendant(path_value: object) -> int:
+    path = Path(str(path_value))
+    child_pid = os.fork()
+    if child_pid == 0:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        path.write_text(str(os.getpid()), encoding="ascii")
+        threading.Event().wait()
+        os._exit(1)
+    deadline = time.monotonic() + 2
+    while not path.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    if not path.exists():
+        raise TimeoutError("test authority descendant did not start")
+    return child_pid
+
+
+def evaluate_lab_authority_fixture(
+    configuration: object,
+    *,
+    operation: str,
+    spec: ResearchRunSpec | None,
+    admission_request: object | None,
+    snapshot: object | None,
+    authority_state: object | None,
+) -> dict[str, object]:
+    from rquant.lab_worker import (
+        LabSnapshotAuthorityState,
+        _AuthorityWireResult,
+    )
+    from rquant.resource_admission import (
+        AdmissionRequest,
+        ResourceSnapshot,
+        SourceQuotaLease,
+    )
+
+    assert isinstance(configuration, dict)
+    if operation == "admission":
+        policy_result = _AuthorityWireResult.model_validate(
+            evaluate_lab_authority_fixture(
+                configuration,
+                operation="policy",
+                spec=spec,
+                admission_request=admission_request,
+                snapshot=snapshot,
+                authority_state=authority_state,
+            )
+        )
+        snapshot_result = _AuthorityWireResult.model_validate(
+            evaluate_lab_authority_fixture(
+                configuration,
+                operation="snapshot",
+                spec=spec,
+                admission_request=admission_request,
+                snapshot=snapshot,
+                authority_state=authority_state,
+            )
+        )
+        quota_lease = None
+        if (
+            admission_request is not None
+            and AdmissionRequest.model_validate(admission_request).expected_quota_units > 0
+        ):
+            quota_result = _AuthorityWireResult.model_validate(
+                evaluate_lab_authority_fixture(
+                    configuration,
+                    operation="quota",
+                    spec=spec,
+                    admission_request=admission_request,
+                    snapshot=snapshot_result.snapshot,
+                    authority_state=snapshot_result.authority_state,
+                )
+            )
+            quota_lease = quota_result.quota_lease
+        return _AuthorityWireResult(
+            operation="admission",
+            policy=policy_result.policy,
+            snapshot=snapshot_result.snapshot,
+            quota_lease=quota_lease,
+            authority_state=snapshot_result.authority_state,
+        ).model_dump(mode="python")
+    del spec, snapshot, authority_state
+    component = configuration[operation]
+    assert isinstance(component, dict)
+    kind = component["kind"]
+    if kind == "unregistered":
+        raise LabDaemonConfigurationError(str(component["message"]))
+    if operation == "policy":
+        if kind in {"block", "recursive-block"}:
+            Path(str(component["pid_path"])).write_text(str(os.getpid()), encoding="ascii")
+            if "entered_path" in component:
+                Path(str(component["entered_path"])).write_text("entered", encoding="ascii")
+            if kind == "recursive-block":
+                _spawn_fixture_descendant(component["descendant_pid_path"])
+            _wait_fixture_release(component["release_path"])
+        elif kind == "block-after-first":
+            call = _fixture_counter_increment(component["counter_path"])
+            if call > 1:
+                Path(str(component["entered_path"])).write_text("entered", encoding="ascii")
+                _wait_fixture_release(component["release_path"])
+        elif kind == "failure":
+            raise RuntimeError(str(component["message"]))
+        if kind == "sequence":
+            call = _fixture_counter_increment(component["counter_path"])
+            policies = component["policies"]
+            assert isinstance(policies, list)
+            policy = policies[min(call - 1, len(policies) - 1)]
+        else:
+            policy = component["policy"]
+        return _AuthorityWireResult(operation="policy", policy=policy).model_dump(mode="python")
+    if operation == "snapshot":
+        if kind == "failure":
+            raise RuntimeError(str(component["message"]))
+        if kind == "recursive-block":
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            Path(str(component["pid_path"])).write_text(str(os.getpid()), encoding="ascii")
+            _spawn_fixture_descendant(component["descendant_pid_path"])
+            threading.Event().wait()
+        if kind == "block-after-first":
+            marker = Path(str(component["marker_path"]))
+            if marker.exists():
+                threading.Event().wait()
+            marker.write_text("first", encoding="ascii")
+        if kind == "block-after-calls" and _fixture_counter_increment(
+            component["counter_path"]
+        ) > int(component["block_after_calls"]):
+            threading.Event().wait()
+        if kind == "adversarial-hook":
+            Path(str(component["pid_path"])).write_text(str(os.getpid()), encoding="ascii")
+            Path(str(component["entered_path"])).write_text("entered", encoding="ascii")
+            if component["behavior"] == "exception":
+                raise RuntimeError(f"{component['hook']} exploded")
+            if component["behavior"] == "recursive":
+                _spawn_fixture_descendant(component["descendant_pid_path"])
+            _wait_fixture_release(component["release_path"])
+        if kind == "reject-state":
+            raise LabDaemonConfigurationError("resource snapshot authority state was not accepted")
+        if kind == "sequence":
+            call = _fixture_counter_increment(component["counter_path"])
+            snapshots = component["snapshots"]
+            assert isinstance(snapshots, list)
+            raw_snapshot = snapshots[min(call - 1, len(snapshots) - 1)]
+        elif kind == "selected":
+            selection_path = Path(str(component["selection_path"]))
+            index = (
+                int(selection_path.read_text(encoding="ascii")) if selection_path.exists() else 0
+            )
+            snapshots = component["snapshots"]
+            assert isinstance(snapshots, list)
+            raw_snapshot = snapshots[index]
+        else:
+            raw_snapshot = component["snapshot"]
+        state = None
+        if kind in {"exporting", "reject-state", "adversarial-hook"}:
+            raw_state = component.get("state", {"sequence": 1})
+            state = LabSnapshotAuthorityState(
+                state_kind="test-fixture",
+                state_json=json.dumps(
+                    raw_state,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ),
+            )
+        return _AuthorityWireResult(
+            operation="snapshot",
+            snapshot=ResourceSnapshot.model_validate(raw_snapshot),
+            authority_state=state,
+        ).model_dump(mode="python")
+    if kind == "none":
+        return _AuthorityWireResult(operation="quota").model_dump(mode="python")
+    if kind in {"block", "block-after-first"}:
+        should_block = True
+        if kind == "block-after-first":
+            should_block = _fixture_counter_increment(component["counter_path"]) > 1
+        if should_block:
+            if "pid_path" in component:
+                Path(str(component["pid_path"])).write_text(str(os.getpid()), encoding="ascii")
+            Path(str(component["entered_path"])).write_text("entered", encoding="ascii")
+            _wait_fixture_release(component["release_path"])
+    if kind == "failure":
+        raise RuntimeError(str(component["message"]))
+    request = AdmissionRequest.model_validate(admission_request)
+    lease = SourceQuotaLease(
+        source=request.source or "test-source",
+        owner=request.job_id,
+        units=request.expected_quota_units,
+        granted_at=NOW,
+        expires_at=NOW + timedelta(minutes=1),
+        quota_reset_at=NOW + timedelta(minutes=2),
+    )
+    return _AuthorityWireResult(operation="quota", quota_lease=lease).model_dump(mode="python")
+
+
+def _test_shard_manifest(
+    tmp_path: Path,
+    *,
+    registry: object,
+    exploratory_store_factory: object,
+    metadata_store_factory: object,
+    lake_root: Path | None,
+    isolation_session_initializer: object,
+    execution_session_factory: object,
+    research_store_opener: object,
+):
+    from rquant.lab_worker import LabClosedRegistryBinding, LabShardRuntimeManifest
+
+    counter = _fixture_counter_path(tmp_path, registry, "adapter")
+    if isinstance(registry, RecordingRegistry):
+        registry._closed_execution_counter_path = counter
+    adapter: dict[str, object]
+    if type(registry) is UnserializableRegistry:
+        adapter = {"kind": "unregistered", "message": "adapter is not spawn-serializable"}
+    elif type(registry) is ParentReduceTrap:
+        adapter = {"kind": "unregistered", "message": "adapter is not registered"}
+    elif type(registry) is MaliciousResultRegistry:
+        adapter = {"kind": "malicious-result", "path": str(registry.reduce_marker)}
+    elif type(registry) is FailingWorkerRegistry:
+        adapter = {"kind": "failure", "message": "worker exploded"}
+    elif type(registry) is SpawnMethodRegistry:
+        adapter = {"kind": "spawn-method", "path": str(registry.pid_path)}
+    elif type(registry) is SlowPidRegistry:
+        adapter = {
+            "kind": "slow",
+            "path": str(registry.pid_path),
+            "delay_seconds": registry.delay_seconds,
+        }
+    elif type(registry) is SigtermIgnoringProcessTreeRegistry:
+        adapter = {
+            "kind": "sigterm-tree",
+            "path": str(registry.pid_path),
+            "descendant_path": str(registry.grandchild_pid_path),
+        }
+    elif type(registry) is TermExitingLeaderProcessTreeRegistry:
+        adapter = {
+            "kind": "term-exit-tree",
+            "path": str(registry.pid_path),
+            "descendant_path": str(registry.grandchild_pid_path),
+        }
+    elif type(registry) is SuccessfulProcessTreeRegistry:
+        adapter = {
+            "kind": "successful-tree",
+            "path": str(registry.pid_path),
+            "descendant_path": str(registry.grandchild_pid_path),
+        }
+    elif type(registry) is HungLiveRegistry:
+        adapter = {"kind": "hung", "path": str(registry.pid_path)}
+    elif type(registry) is BlockingRegistry:
+        entered_path = tmp_path / f".adapter-entered-{id(registry):x}"
+        release_path = tmp_path / f".adapter-release-{id(registry):x}"
+        registry._closed_entered_path = entered_path
+        registry._closed_release_path = release_path
+        adapter = {
+            "kind": "blocking",
+            "entered_path": str(entered_path),
+            "release_path": str(release_path),
+        }
+    elif type(registry) is DeadlineRegistry:
+        marker_path = tmp_path / f".adapter-deadline-{id(registry):x}"
+        registry._closed_deadline_path = marker_path
+        adapter = {"kind": "deadline", "path": str(marker_path)}
+    elif isinstance(registry, RecordingRegistry):
+        adapter = {
+            "kind": "recording",
+            "delay_seconds": registry.delay_seconds,
+            "failure": (
+                None
+                if registry.failure is None
+                else {
+                    "error_type": type(registry.failure).__name__,
+                    "message": str(registry.failure),
+                }
+            ),
+        }
+    else:
+        adapter = {"kind": "unregistered", "message": "adapter is not spawn-serializable"}
+    session: dict[str, object] = {"kind": "default"}
+    if type(isolation_session_initializer) is RecordingSessionInitializer:
+        session = {"kind": "record", "pid_path": str(isolation_session_initializer.pid_path)}
+    elif type(isolation_session_initializer) is BlockingRecordingSessionInitializer:
+        session = {
+            "kind": "block",
+            "pid_path": str(isolation_session_initializer.pid_path),
+            "release_path": str(isolation_session_initializer.release_path),
+        }
+    elif type(isolation_session_initializer) is FailingSessionInitializer:
+        session = {"kind": "failure"}
+    store: dict[str, object] = {"kind": "default"}
+    if type(exploratory_store_factory) is SlowStoreFactory:
+        store = {"kind": "slow", "delay_seconds": exploratory_store_factory.delay_seconds}
+    formal: dict[str, object] | None = None
+    if metadata_store_factory is not None:
+        if (
+            type(metadata_store_factory) is MetadataStoreFactory
+            and type(metadata_store_factory.store) is _MetadataStore
+        ):
+            metadata = metadata_store_factory.store
+            formal = {
+                "binding_hash": metadata.binding.binding_hash,
+                "snapshot_strategy_name": metadata.snapshot.strategy_name,
+                "p0_count": metadata.audit.p0_count,
+            }
+        else:
+            formal = {"unregistered": True}
+    if type(execution_session_factory) is FakeExecutionSessionFactory:
+        opened_path = tmp_path / f".formal-session-opened-{id(execution_session_factory):x}"
+        execution_session_factory._closed_opened_path = opened_path
+        if formal is None:
+            formal = {}
+        formal["opened_path"] = str(opened_path)
+    if type(research_store_opener) is RecordingResearchStoreOpener:
+        request_path = tmp_path / f".formal-request-{id(research_store_opener):x}.json"
+        research_store_opener._closed_request_path = request_path
+        if formal is None:
+            formal = {}
+        formal["request_path"] = str(request_path)
+    configuration = {
+        "adapter": adapter,
+        "bypass_parent_validation": isinstance(
+            registry,
+            (PlanBypassRecordingRegistry, HungLiveRegistry),
+        ),
+        "counter_path": str(counter),
+        "formal": formal,
+        "lake_root": None if lake_root is None else str(lake_root),
+        "session": session,
+        "store": store,
+    }
+    configuration_json = json.dumps(
+        configuration,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return LabShardRuntimeManifest(
+        registry=LabClosedRegistryBinding(
+            registry_id="rquant.lab-shard.test-fixture",
+            registry_version=1,
+            registry_hash=hashlib.sha256(b"rquant:lab-shard:test-fixture:v1").hexdigest(),
+            configuration_json=configuration_json,
+        )
+    )
+
+
+def prepare_lab_shard_fixture(configuration: object) -> None:
+    assert isinstance(configuration, dict)
+    session = configuration["session"]
+    assert isinstance(session, dict)
+    kind = session["kind"]
+    if kind in {"record", "block"}:
+        Path(str(session["pid_path"])).write_text(str(os.getpid()), encoding="ascii")
+    if kind == "block":
+        _wait_fixture_release(session["release_path"], timeout_seconds=5)
+    if kind == "failure":
+        raise PermissionError("setsid denied")
+
+
+def execute_lab_shard_fixture(
+    configuration: object,
+    validated: ValidatedStrategyShard,
+    *,
+    runtime_code_sha: str,
+) -> LabShardExecutionResult:
+    assert isinstance(configuration, dict)
+    formal = configuration["formal"]
+    if formal is not None:
+        from rquant.research_gate import ResearchGateRequest
+
+        assert isinstance(formal, dict)
+        identity = validated.spec.dataset_snapshot
+        if identity is None or configuration["lake_root"] is None:
+            raise PermissionError("formal worker execution requires dataset snapshot and lake")
+        if formal.get("unregistered") is True:
+            raise LabDaemonConfigurationError("formal test store is not registered")
+        if formal.get("binding_hash") != identity.binding_hash:
+            raise PermissionError("formal dataset snapshot binding hash mismatch")
+        registry = default_strategy_job_adapter_registry()
+        strategy_name = registry.for_spec(validated.spec).snapshot_strategy_name
+        if formal.get("snapshot_strategy_name") != strategy_name or formal.get("p0_count") != 0:
+            raise PermissionError("formal research gate rejected fixture evidence")
+        gate_request = ResearchGateRequest(
+            mode="formal",
+            strategy_name=strategy_name,
+            start_date=validated.spec.parameters.start_date,
+            end_date=validated.spec.parameters.end_date,
+            audit_run_id=identity.audit_run_id,
+            dataset_snapshot_id=identity.snapshot_id,
+            dataset_binding_hash=identity.binding_hash,
+            code_commit=runtime_code_sha,
+        )
+        if "request_path" in formal:
+            Path(str(formal["request_path"])).write_text(
+                gate_request.model_dump_json(), encoding="utf-8"
+            )
+        if "opened_path" in formal:
+            Path(str(formal["opened_path"])).write_text("opened", encoding="ascii")
+    store = configuration["store"]
+    assert isinstance(store, dict)
+    if store["kind"] == "slow":
+        time.sleep(float(store["delay_seconds"]))
+    adapter = configuration["adapter"]
+    assert isinstance(adapter, dict)
+    kind = adapter["kind"]
+    if kind == "unregistered":
+        raise LabDaemonConfigurationError(str(adapter["message"]))
+    _fixture_counter_increment(configuration["counter_path"])
+    if kind == "failure":
+        raise RuntimeError(str(adapter["message"]))
+    if kind == "recording":
+        time.sleep(float(adapter["delay_seconds"]))
+        failure = adapter["failure"]
+        if isinstance(failure, dict):
+            raise RuntimeError(str(failure["message"]))
+    elif kind == "slow":
+        Path(str(adapter["path"])).write_text(str(os.getpid()), encoding="ascii")
+        time.sleep(float(adapter["delay_seconds"]))
+    elif kind == "spawn-method":
+        Path(str(adapter["path"])).write_text(multiprocessing.get_start_method(), encoding="ascii")
+    elif kind == "hung":
+        Path(str(adapter["path"])).write_text(str(os.getpid()), encoding="ascii")
+        threading.Event().wait()
+    elif kind == "blocking":
+        Path(str(adapter["entered_path"])).write_text("entered", encoding="ascii")
+        _wait_fixture_release(adapter["release_path"])
+    elif kind == "deadline":
+        Path(str(adapter["path"])).write_text("reached", encoding="ascii")
+    elif kind in {"sigterm-tree", "term-exit-tree", "successful-tree"}:
+        if kind == "sigterm-tree":
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        elif kind == "term-exit-tree":
+            signal.signal(signal.SIGTERM, lambda *_args: os._exit(0))
+        _spawn_fixture_descendant(adapter["descendant_path"])
+        Path(str(adapter["path"])).write_text(str(os.getpid()), encoding="ascii")
+        if kind != "successful-tree":
+            threading.Event().wait()
+    return LabShardExecutionResult.from_validated(
+        validated,
+        tables=(
+            LabShardTable(
+                name="trades",
+                frame=pd.DataFrame(
+                    [{"hold_days": getattr(validated.shard, "hold_days", 1), "ret_pct": 1.25}]
+                ),
+            ),
+        ),
+    )
+
+
 def _worker(
     tmp_path: Path,
     *,
@@ -889,7 +2861,11 @@ def _worker(
     registry: RecordingRegistry | None = None,
     claims: LabClaimSpool | None = None,
     reports: LabReportSpool | None = None,
+    claim_publication_verifier=None,
+    v2_claim_publication_enabled: bool = False,
     heartbeat_interval_seconds: float = 60.0,
+    resource_recheck_interval_seconds: float = 1.0,
+    resource_probe_timeout_seconds: float = 1.0,
     lease_extension_seconds: int = 30,
     quarantine_reconcile_interval_seconds: float = 300.0,
     receipt_timeout_seconds: float = 0.2,
@@ -898,30 +2874,4507 @@ def _worker(
     lake_root: Path | None = None,
     receipt_waiter=_accept_report,
     verified_code_sha_provider=lambda: "1" * 40,
+    resource_snapshot_provider=None,
+    admission_policy_provider=None,
+    source_quota_lease_provider=None,
+    resource_reservation_store=None,
+    require_resource_admission: bool = False,
     clock=lambda: NOW,
     monotonic_clock=time.monotonic,
+    isolation_monotonic_clock=time.monotonic,
+    isolation_session_initializer=None,
+    execution_session_factory=None,
+    research_store_opener=None,
+    shard_runtime_manifest=None,
+    resource_authority_manifest=None,
+    production_mode: bool = False,
 ):
     from rquant.lab_worker import LabWorker
 
+    chosen_registry = registry or RecordingRegistry()
+    closed_shard_manifest = shard_runtime_manifest or _test_shard_manifest(
+        tmp_path,
+        registry=chosen_registry,
+        exploratory_store_factory=exploratory_store_factory,
+        metadata_store_factory=metadata_store_factory,
+        lake_root=lake_root,
+        isolation_session_initializer=isolation_session_initializer,
+        execution_session_factory=execution_session_factory,
+        research_store_opener=research_store_opener,
+    )
+    closed_authority_manifest = resource_authority_manifest
+    if closed_authority_manifest is None and (
+        resource_snapshot_provider is not None or admission_policy_provider is not None
+    ):
+        if resource_snapshot_provider is None or admission_policy_provider is None:
+            raise LabDaemonConfigurationError(
+                "test resource authority providers must be configured together"
+            )
+        closed_authority_manifest = _test_authority_manifest(
+            tmp_path,
+            snapshot_provider=resource_snapshot_provider,
+            policy_provider=admission_policy_provider,
+            quota_provider=source_quota_lease_provider,
+        )
     return LabWorker(
         worker_id=worker_id,
         claim_spool=claims or LabClaimSpool(tmp_path / "claims"),
+        claim_publication_verifier=claim_publication_verifier,
+        v2_claim_publication_enabled=v2_claim_publication_enabled,
         report_spool=reports or LabReportSpool(tmp_path / "reports"),
         artifact_root=tmp_path / "artifacts",
-        adapter_registry=registry or RecordingRegistry(),
-        exploratory_store_factory=exploratory_store_factory,
-        metadata_store_factory=metadata_store_factory,
-        research_lake_root=lake_root,
+        adapter_registry=default_strategy_job_adapter_registry(),
         heartbeat_interval_seconds=heartbeat_interval_seconds,
+        resource_recheck_interval_seconds=resource_recheck_interval_seconds,
+        resource_probe_timeout_seconds=resource_probe_timeout_seconds,
         lease_extension_seconds=lease_extension_seconds,
         quarantine_reconcile_interval_seconds=quarantine_reconcile_interval_seconds,
         poll_interval_ms=5,
         receipt_timeout_seconds=receipt_timeout_seconds,
         receipt_waiter=receipt_waiter,
         verified_code_sha_provider=verified_code_sha_provider,
+        resource_authority_manifest=closed_authority_manifest,
+        resource_reservation_store=resource_reservation_store,
+        require_resource_admission=require_resource_admission,
         clock=clock,
         monotonic_clock=monotonic_clock,
+        isolation_monotonic_clock=isolation_monotonic_clock,
+        shard_runtime_manifest=closed_shard_manifest,
+        production_mode=production_mode,
     )
+
+
+def _healthy_resource_snapshot(*, observed_at: datetime = NOW, session: object = None):
+    from rquant.resource_admission import ResourceSnapshot, TradingSession
+
+    return ResourceSnapshot(
+        observed_at=observed_at,
+        session=TradingSession.POST_MARKET if session is None else session,
+        live_backlog_age_seconds=0,
+        live_p95_latency_seconds=0,
+        available_memory_bytes=16 * 1024**3,
+        available_disk_bytes=100 * 1024**3,
+        io_pressure_pct=0,
+        cpu_load_pct=0,
+        source_quota_remaining=0,
+        live_healthy=True,
+    )
+
+
+def _permissive_admission_policy(**overrides: object):
+    from rquant.resource_admission import AdmissionPolicy
+
+    payload: dict[str, object] = {
+        "allow_live_session": True,
+        "max_live_shard_duration_ms": 100,
+        "max_snapshot_age_seconds": 5,
+        "max_live_backlog_age_seconds": 10,
+        "max_live_p95_latency_seconds": 5,
+        "min_available_memory_bytes": 0,
+        "min_available_disk_bytes": 0,
+        "max_io_pressure_pct": 100,
+        "max_cpu_load_pct": 100,
+        "max_expected_memory_bytes": 8 * 1024**3,
+        "max_expected_disk_bytes": 50 * 1024**3,
+        "max_expected_quota_units": 0,
+        "retry_delay_seconds": 60,
+    }
+    payload.update(overrides)
+    if "max_snapshot_age_microseconds" in overrides:
+        payload.pop("max_snapshot_age_seconds", None)
+    if "max_live_backlog_age_microseconds" in overrides:
+        payload.pop("max_live_backlog_age_seconds", None)
+    if "max_live_p95_latency_microseconds" in overrides:
+        payload.pop("max_live_p95_latency_seconds", None)
+    return AdmissionPolicy(**payload)
+
+
+def test_worker_rejects_boolean_resource_lease_duration(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="lease_extension_seconds"):
+        _worker(tmp_path, lease_extension_seconds=True)
+
+
+@pytest.mark.parametrize("value", (0, 1, "false"))
+def test_worker_requires_canonical_resource_admission_flag(
+    tmp_path: Path,
+    value: object,
+) -> None:
+    with pytest.raises(ValueError, match="require_resource_admission"):
+        _worker(tmp_path, require_resource_admission=value)
+
+
+def test_worker_bounds_reservation_lock_wait_and_propagates_stop_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.runtime_resource_admission import SQLiteResourceReservationStore
+
+    spec = _nshape_compare_spec(hold_days=(1,))
+    claim = _short_claim_for_spec(spec)
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    claims.publish(claim)
+    store = SQLiteResourceReservationStore(
+        tmp_path / "resource-reservations.sqlite3",
+        clock=lambda: NOW,
+    )
+    original_reserve = store.reserve
+    original_recheck = store.recheck
+    observed: list[tuple[str, float, bool]] = []
+
+    def checked_reserve(**kwargs: object):
+        stop_requested = kwargs["stop_requested"]
+        timeout = kwargs["lock_wait_timeout_seconds"]
+        assert callable(stop_requested)
+        assert isinstance(timeout, float)
+        observed.append(("reserve", timeout, stop_requested()))
+        return original_reserve(**kwargs)
+
+    def checked_recheck(**kwargs: object):
+        stop_requested = kwargs["stop_requested"]
+        timeout = kwargs["lock_wait_timeout_seconds"]
+        assert callable(stop_requested)
+        assert isinstance(timeout, float)
+        observed.append(("recheck", timeout, stop_requested()))
+        return original_recheck(**kwargs)
+
+    monkeypatch.setattr(store, "reserve", checked_reserve)
+    monkeypatch.setattr(store, "recheck", checked_recheck)
+    worker = _worker(
+        tmp_path,
+        registry=SlowPidRegistry(
+            pid_path=tmp_path / "bounded-lock-wait-child.pid",
+            delay_seconds=0.12,
+        ),
+        claims=claims,
+        reports=reports,
+        resource_recheck_interval_seconds=0.02,
+        resource_snapshot_provider=StaticResourceSnapshotProvider(_healthy_resource_snapshot()),
+        admission_policy_provider=StaticAdmissionPolicyProvider(_permissive_admission_policy()),
+        resource_reservation_store=store,
+        require_resource_admission=True,
+    )
+
+    result = worker.run_once()
+
+    assert result.status == "succeeded"
+    assert {operation for operation, _timeout, _stopped in observed} == {"reserve", "recheck"}
+    assert all(0 < timeout <= 0.05 for _operation, timeout, _stopped in observed)
+    assert all(not stopped for _operation, _timeout, stopped in observed)
+
+
+def test_initial_resource_rejection_is_a_hard_gate_before_adapter_execution(
+    tmp_path: Path,
+) -> None:
+    from rquant.runtime_resource_admission import SQLiteResourceReservationStore
+
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    child_pid_path = tmp_path / "gated-child.pid"
+    registry = RecordingRegistry()
+    store = SQLiteResourceReservationStore(
+        tmp_path / "resource-reservations.sqlite3",
+        clock=lambda: NOW,
+    )
+    policy_provider = SequenceAdmissionPolicyProvider(
+        _permissive_admission_policy(),
+        _permissive_admission_policy(min_available_memory_bytes=32 * 1024**3),
+    )
+    claims.publish(claim)
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        reports=reports,
+        registry=registry,
+        resource_recheck_interval_seconds=0.01,
+        resource_snapshot_provider=StaticResourceSnapshotProvider(_healthy_resource_snapshot()),
+        admission_policy_provider=policy_provider,
+        resource_reservation_store=store,
+        require_resource_admission=True,
+        isolation_session_initializer=RecordingSessionInitializer(child_pid_path),
+    )
+
+    result = worker.run_once()
+
+    assert result.status == "stopped"
+    assert policy_provider.calls >= 2
+    assert registry.executions == 0
+    assert child_pid_path.exists()
+    _assert_process_gone(int(child_pid_path.read_text(encoding="ascii")))
+    assert store.active_leases() == ()
+
+
+def test_top_level_static_policy_provider_passes_adapter_ack_gate(
+    tmp_path: Path,
+) -> None:
+    from rquant.runtime_resource_admission import SQLiteResourceReservationStore
+
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims = LabClaimSpool(tmp_path / "claims")
+    registry = RecordingRegistry()
+    store = SQLiteResourceReservationStore(
+        tmp_path / "static-policy-reservations.sqlite3",
+        clock=lambda: NOW,
+    )
+    claims.publish(claim)
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        registry=registry,
+        resource_recheck_interval_seconds=0.01,
+        resource_snapshot_provider=StaticResourceSnapshotProvider(_healthy_resource_snapshot()),
+        admission_policy_provider=StaticAdmissionPolicyProvider(_permissive_admission_policy()),
+        resource_reservation_store=store,
+        require_resource_admission=True,
+    )
+
+    result = worker.run_once()
+
+    assert result.status == "succeeded"
+    assert registry.executions == 1
+    assert store.active_leases() == ()
+
+
+@pytest.mark.parametrize(
+    "provider_kind",
+    ("lambda", "local-function", "forged-frozen-version"),
+)
+def test_unspawnable_dynamic_policy_fails_closed_before_first_authority_evaluation(
+    tmp_path: Path,
+    provider_kind: str,
+) -> None:
+    from rquant.runtime_resource_admission import SQLiteResourceReservationStore
+
+    allow = _permissive_admission_policy()
+    deny = _permissive_admission_policy(min_available_memory_bytes=32 * 1024**3)
+    calls = [0]
+
+    def next_policy(_spec: ResearchRunSpec) -> object:
+        calls[0] += 1
+        return allow if calls[0] == 1 else deny
+
+    def lambda_policy_provider() -> object:
+        return lambda spec: next_policy(spec)
+
+    provider = lambda_policy_provider() if provider_kind == "lambda" else next_policy
+    if provider_kind == "forged-frozen-version":
+        provider.__dict__.update(
+            frozen_authority_version="f" * 64,
+            immutable_authority=True,
+        )
+
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims = LabClaimSpool(tmp_path / "claims")
+    registry = RecordingRegistry()
+    store = SQLiteResourceReservationStore(
+        tmp_path / f"unspawnable-policy-{provider_kind}.sqlite3",
+        clock=lambda: NOW,
+    )
+    claims.publish(claim)
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        registry=registry,
+        resource_recheck_interval_seconds=0.01,
+        resource_snapshot_provider=StaticResourceSnapshotProvider(_healthy_resource_snapshot()),
+        admission_policy_provider=provider,
+        resource_reservation_store=store,
+        require_resource_admission=True,
+    )
+
+    with pytest.raises(LabDaemonConfigurationError, match="spawn-serializable"):
+        worker.run_once()
+
+    assert calls == [0]
+    assert registry.executions == 0
+    assert store.active_leases() == ()
+    with worker._managed_authority_children_lock:
+        assert worker._managed_authority_children == {}
+    assert all(
+        child.name != "lab-resource-authority" for child in multiprocessing.active_children()
+    )
+
+
+@pytest.mark.parametrize("provider_kind", ("lambda", "local-function"))
+def test_unspawnable_dynamic_quota_fails_closed_before_first_authority_evaluation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    provider_kind: str,
+) -> None:
+    import rquant.lab_worker as lab_worker
+    from rquant.resource_admission import SourceQuotaLease
+    from rquant.runtime_resource_admission import SQLiteResourceReservationStore
+
+    original_derive = lab_worker.derive_lab_admission_request
+
+    def derive_positive_quota_request(**kwargs: object):
+        request = original_derive(**kwargs)
+        return request.model_copy(update={"expected_quota_units": 1, "source": "test-source"})
+
+    monkeypatch.setattr(
+        lab_worker,
+        "derive_lab_admission_request",
+        derive_positive_quota_request,
+    )
+    calls = [0]
+
+    def next_quota(request: object, _snapshot: object) -> object:
+        calls[0] += 1
+        if calls[0] > 1:
+            return None
+        return SourceQuotaLease(
+            source="test-source",
+            owner=request.job_id,
+            units=1,
+            granted_at=NOW,
+            expires_at=NOW + timedelta(minutes=1),
+            quota_reset_at=NOW + timedelta(minutes=2),
+        )
+
+    def lambda_quota_provider() -> object:
+        return lambda request, snapshot: next_quota(request, snapshot)
+
+    provider = lambda_quota_provider() if provider_kind == "lambda" else next_quota
+
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims = LabClaimSpool(tmp_path / "claims")
+    registry = RecordingRegistry()
+    store = SQLiteResourceReservationStore(
+        tmp_path / f"unspawnable-quota-{provider_kind}.sqlite3",
+        clock=lambda: NOW,
+    )
+    claims.publish(claim)
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        registry=registry,
+        resource_recheck_interval_seconds=0.01,
+        resource_snapshot_provider=StaticResourceSnapshotProvider(
+            _healthy_resource_snapshot().model_copy(update={"source_quota_remaining": 10})
+        ),
+        admission_policy_provider=StaticAdmissionPolicyProvider(
+            _permissive_admission_policy(max_expected_quota_units=1)
+        ),
+        source_quota_lease_provider=provider,
+        resource_reservation_store=store,
+        require_resource_admission=True,
+    )
+
+    with pytest.raises(LabDaemonConfigurationError, match="spawn-serializable"):
+        worker.run_once()
+
+    assert calls == [0]
+    assert registry.executions == 0
+    assert store.active_leases() == ()
+
+
+@pytest.mark.parametrize("slot", ("policy", "snapshot", "quota", "adapter"))
+@pytest.mark.parametrize("termination", ("deadline", "stop"))
+def test_parent_never_reduces_unregistered_authority_or_adapter_objects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    slot: str,
+    termination: str,
+) -> None:
+    import rquant.lab_worker as lab_worker
+    from rquant.runtime_resource_admission import SQLiteResourceReservationStore
+
+    original_derive = lab_worker.derive_lab_admission_request
+
+    def derive_request(**kwargs: object):
+        request = original_derive(**kwargs)
+        if slot != "quota":
+            return request
+        return request.model_copy(update={"expected_quota_units": 1, "source": "test-source"})
+
+    monkeypatch.setattr(lab_worker, "derive_lab_admission_request", derive_request)
+    reduce_marker = tmp_path / f"{slot}-{termination}.reduce"
+    execution_marker = tmp_path / f"{slot}-{termination}.execute"
+    trap = ParentReduceTrap(
+        reduce_marker=reduce_marker,
+        execution_marker=execution_marker,
+    )
+    spec = _nshape_compare_spec(hold_days=(1,)).model_copy(
+        update={"deadline": NOW + timedelta(milliseconds=800)}
+    )
+    claim = _claim(spec)
+    claims = LabClaimSpool(tmp_path / "claims")
+    registry = RecordingRegistry()
+    store = SQLiteResourceReservationStore(
+        tmp_path / f"{slot}-{termination}.sqlite3",
+        clock=lambda: NOW,
+    )
+    claims.publish(claim)
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        registry=trap if slot == "adapter" else registry,
+        resource_snapshot_provider=(
+            trap
+            if slot == "snapshot"
+            else StaticResourceSnapshotProvider(
+                _healthy_resource_snapshot().model_copy(update={"source_quota_remaining": 10})
+            )
+        ),
+        admission_policy_provider=(
+            trap
+            if slot == "policy"
+            else StaticAdmissionPolicyProvider(
+                _permissive_admission_policy(max_expected_quota_units=1)
+            )
+        ),
+        source_quota_lease_provider=trap if slot == "quota" else None,
+        resource_reservation_store=store,
+        require_resource_admission=True,
+    )
+    stopper: threading.Thread | None = None
+    if termination == "stop":
+        stopper = threading.Thread(
+            target=lambda: (time.sleep(0.02), worker.request_stop()),
+            name="lab-malicious-reduce-stop",
+        )
+        stopper.start()
+
+    started = time.monotonic()
+    try:
+        with suppress(LabDaemonConfigurationError):
+            worker.run_once()
+    finally:
+        if stopper is not None:
+            stopper.join(timeout=1)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.5
+    assert not reduce_marker.exists()
+    assert not execution_marker.exists()
+    assert registry.executions == 0
+    assert store.active_leases() == ()
+
+
+def test_child_result_with_blocking_reduce_is_never_pickled_and_remains_bounded(
+    tmp_path: Path,
+) -> None:
+    reduce_marker = tmp_path / "malicious-result.reduce"
+    registry = MaliciousResultRegistry(reduce_marker=reduce_marker)
+    spec = _nshape_compare_spec(hold_days=(1,)).model_copy(
+        update={"deadline": NOW + timedelta(milliseconds=800)}
+    )
+    claims = LabClaimSpool(tmp_path / "claims")
+    claims.publish(_claim(spec))
+    worker = _worker(tmp_path, claims=claims, registry=registry)
+
+    started = time.monotonic()
+    result = worker.run_once()
+    elapsed = time.monotonic() - started
+
+    assert result.status == "failed"
+    assert elapsed < 1.5
+    assert registry.executions == 1
+    assert not reduce_marker.exists()
+
+
+def test_first_policy_callback_stop_is_bounded_before_reservation(
+    tmp_path: Path,
+) -> None:
+    from rquant.runtime_resource_admission import SQLiteResourceReservationStore
+
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims = LabClaimSpool(tmp_path / "claims")
+    registry = RecordingRegistry()
+    entered_path = tmp_path / "first-policy.entered"
+    authority_pid_path = tmp_path / "first-policy.pid"
+    release_path = tmp_path / "first-policy.release"
+    store = SQLiteResourceReservationStore(
+        tmp_path / "first-policy-reservations.sqlite3",
+        clock=lambda: NOW,
+    )
+    claims.publish(claim)
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        registry=registry,
+        resource_probe_timeout_seconds=3,
+        resource_snapshot_provider=StaticResourceSnapshotProvider(_healthy_resource_snapshot()),
+        admission_policy_provider=BlockingInitialAdmissionPolicyProvider(
+            _permissive_admission_policy(),
+            entered_path=entered_path,
+            pid_path=authority_pid_path,
+            release_path=release_path,
+        ),
+        resource_reservation_store=store,
+        require_resource_admission=True,
+    )
+    outcomes: list[object] = []
+    failures: list[BaseException] = []
+
+    def run_worker() -> None:
+        try:
+            outcomes.append(worker.run_once())
+        except BaseException as exc:
+            failures.append(exc)
+
+    runner = threading.Thread(target=run_worker)
+    runner.start()
+    try:
+        entered_deadline = time.monotonic() + 2
+        while not entered_path.exists() and time.monotonic() < entered_deadline:
+            time.sleep(0.01)
+        assert entered_path.exists()
+        assert int(authority_pid_path.read_text(encoding="ascii")) != os.getpid()
+        started = time.monotonic()
+        worker.request_stop()
+        runner.join(timeout=1.1)
+        bounded = not runner.is_alive()
+        elapsed = time.monotonic() - started
+    finally:
+        release_path.write_text("release", encoding="ascii")
+        worker.request_stop()
+        runner.join(timeout=2)
+
+    assert bounded
+    assert elapsed < 1.1
+    assert failures == []
+    assert outcomes[0].status == "stopped"
+    assert registry.executions == 0
+    _assert_process_gone(int(authority_pid_path.read_text(encoding="ascii")))
+    assert store.active_leases() == ()
+
+
+def test_first_policy_callback_obeys_100ms_deadline_before_reservation(
+    tmp_path: Path,
+) -> None:
+    from rquant.runtime_resource_admission import SQLiteResourceReservationStore
+
+    spec = _nshape_compare_spec(hold_days=(1,)).model_copy(
+        update={"deadline": NOW + timedelta(milliseconds=100)}
+    )
+    claim = _claim(spec)
+    claims = LabClaimSpool(tmp_path / "claims")
+    registry = RecordingRegistry()
+    release_path = tmp_path / "deadline-policy.release"
+    store = SQLiteResourceReservationStore(
+        tmp_path / "deadline-policy-reservations.sqlite3",
+        clock=lambda: NOW,
+    )
+    claims.publish(claim)
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        registry=registry,
+        resource_probe_timeout_seconds=3,
+        resource_snapshot_provider=StaticResourceSnapshotProvider(_healthy_resource_snapshot()),
+        admission_policy_provider=BlockingInitialAdmissionPolicyProvider(
+            _permissive_admission_policy(),
+            entered_path=tmp_path / "deadline-policy.entered",
+            pid_path=tmp_path / "deadline-policy.pid",
+            release_path=release_path,
+        ),
+        resource_reservation_store=store,
+        require_resource_admission=True,
+    )
+    outcomes: list[object] = []
+    failures: list[BaseException] = []
+
+    def run_worker() -> None:
+        try:
+            outcomes.append(worker.run_once())
+        except BaseException as exc:
+            failures.append(exc)
+
+    started = time.monotonic()
+    runner = threading.Thread(target=run_worker)
+    runner.start()
+    runner.join(timeout=1.2)
+    bounded = not runner.is_alive()
+    elapsed = time.monotonic() - started
+    release_path.write_text("release", encoding="ascii")
+    worker.request_stop()
+    runner.join(timeout=2)
+
+    assert bounded
+    assert elapsed < 1.2
+    assert failures == []
+    assert outcomes[0].status == "stopped"
+    assert registry.executions == 0
+    assert store.active_leases() == ()
+
+
+def test_first_quota_callback_does_not_hold_sqlite_write_lock_and_stop_is_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.lab_worker as lab_worker
+    from rquant.runtime_resource_admission import SQLiteResourceReservationStore
+
+    original_derive = lab_worker.derive_lab_admission_request
+
+    def derive_positive_quota_request(**kwargs: object) -> object:
+        request = original_derive(**kwargs)
+        return request.model_copy(update={"expected_quota_units": 1, "source": "test-source"})
+
+    monkeypatch.setattr(
+        lab_worker,
+        "derive_lab_admission_request",
+        derive_positive_quota_request,
+    )
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims = LabClaimSpool(tmp_path / "claims")
+    registry = RecordingRegistry()
+    entered_path = tmp_path / "first-quota.entered"
+    authority_pid_path = tmp_path / "first-quota.pid"
+    release_path = tmp_path / "first-quota.release"
+    store = SQLiteResourceReservationStore(
+        tmp_path / "first-quota-reservations.sqlite3",
+        clock=lambda: NOW,
+    )
+    claims.publish(claim)
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        registry=registry,
+        resource_probe_timeout_seconds=3,
+        resource_snapshot_provider=StaticResourceSnapshotProvider(
+            _healthy_resource_snapshot().model_copy(update={"source_quota_remaining": 10})
+        ),
+        admission_policy_provider=StaticAdmissionPolicyProvider(
+            _permissive_admission_policy(max_expected_quota_units=1)
+        ),
+        source_quota_lease_provider=BlockingInitialSourceQuotaLeaseProvider(
+            entered_path=entered_path,
+            pid_path=authority_pid_path,
+            release_path=release_path,
+        ),
+        resource_reservation_store=store,
+        require_resource_admission=True,
+    )
+    outcomes: list[object] = []
+    failures: list[BaseException] = []
+
+    def run_worker() -> None:
+        try:
+            outcomes.append(worker.run_once())
+        except BaseException as exc:
+            failures.append(exc)
+
+    runner = threading.Thread(target=run_worker)
+    runner.start()
+    try:
+        entered_deadline = time.monotonic() + 3
+        while not entered_path.exists() and time.monotonic() < entered_deadline:
+            time.sleep(0.01)
+        assert entered_path.exists()
+        assert int(authority_pid_path.read_text(encoding="ascii")) != os.getpid()
+        with sqlite3.connect(store.path, timeout=0.1, isolation_level=None) as connection:
+            assert connection.execute("SELECT COUNT(*) FROM resource_reservation").fetchone() == (
+                0,
+            )
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "UPDATE resource_reservation_authority "
+                "SET last_clock_at = last_clock_at WHERE singleton = 1"
+            )
+            connection.execute("ROLLBACK")
+        started = time.monotonic()
+        worker.request_stop()
+        runner.join(timeout=1.1)
+        bounded = not runner.is_alive()
+        elapsed = time.monotonic() - started
+    finally:
+        release_path.write_text("release", encoding="ascii")
+        worker.request_stop()
+        runner.join(timeout=2)
+
+    assert bounded
+    assert elapsed < 1.1
+    assert failures == []
+    assert outcomes[0].status == "stopped"
+    assert registry.executions == 0
+    _assert_process_gone(int(authority_pid_path.read_text(encoding="ascii")))
+    assert store.active_leases() == ()
+
+
+def test_first_policy_callback_recursive_child_is_killed_and_reaped_on_stop(
+    tmp_path: Path,
+) -> None:
+    from rquant.runtime_resource_admission import SQLiteResourceReservationStore
+
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims = LabClaimSpool(tmp_path / "claims")
+    registry = RecordingRegistry()
+    authority_pid_path = tmp_path / "recursive-policy-authority.pid"
+    descendant_pid_path = tmp_path / "recursive-policy-descendant.pid"
+    release_path = tmp_path / "recursive-policy.release"
+    store = SQLiteResourceReservationStore(
+        tmp_path / "recursive-policy-reservations.sqlite3",
+        clock=lambda: NOW,
+    )
+    claims.publish(claim)
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        registry=registry,
+        resource_probe_timeout_seconds=3,
+        resource_snapshot_provider=StaticResourceSnapshotProvider(_healthy_resource_snapshot()),
+        admission_policy_provider=SpawnDescendantBlockingAdmissionPolicyProvider(
+            _permissive_admission_policy(),
+            authority_pid_path=authority_pid_path,
+            descendant_pid_path=descendant_pid_path,
+            release_path=release_path,
+        ),
+        resource_reservation_store=store,
+        require_resource_admission=True,
+    )
+    outcomes: list[object] = []
+    failures: list[BaseException] = []
+
+    def run_worker() -> None:
+        try:
+            outcomes.append(worker.run_once())
+        except BaseException as exc:
+            failures.append(exc)
+
+    runner = threading.Thread(target=run_worker)
+    runner.start()
+    try:
+        entered_deadline = time.monotonic() + 3
+        while (
+            not authority_pid_path.exists() or not descendant_pid_path.exists()
+        ) and time.monotonic() < entered_deadline:
+            time.sleep(0.01)
+        assert authority_pid_path.exists()
+        assert descendant_pid_path.exists()
+        started = time.monotonic()
+        worker.request_stop()
+        runner.join(timeout=1.2)
+        bounded = not runner.is_alive()
+        elapsed = time.monotonic() - started
+    finally:
+        release_path.write_text("release", encoding="ascii")
+        worker.request_stop()
+        runner.join(timeout=2)
+
+    assert bounded
+    assert elapsed < 1.2
+    assert failures == []
+    assert outcomes[0].status == "stopped"
+    assert registry.executions == 0
+    authority_pid = int(authority_pid_path.read_text(encoding="ascii"))
+    descendant_pid = int(descendant_pid_path.read_text(encoding="ascii"))
+    assert authority_pid != os.getpid()
+    _assert_process_gone(authority_pid)
+    _assert_process_gone(descendant_pid)
+    assert store.active_leases() == ()
+
+
+def test_first_policy_callback_exception_fails_closed_without_reservation(
+    tmp_path: Path,
+) -> None:
+    from rquant.runtime_resource_admission import SQLiteResourceReservationStore
+
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims = LabClaimSpool(tmp_path / "claims")
+    registry = RecordingRegistry()
+    store = SQLiteResourceReservationStore(
+        tmp_path / "failing-policy-reservations.sqlite3",
+        clock=lambda: NOW,
+    )
+    claims.publish(claim)
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        registry=registry,
+        resource_snapshot_provider=StaticResourceSnapshotProvider(_healthy_resource_snapshot()),
+        admission_policy_provider=FailingInitialAdmissionPolicyProvider(),
+        resource_reservation_store=store,
+        require_resource_admission=True,
+    )
+
+    with pytest.raises(LabDaemonConfigurationError, match="admission policy provider failed"):
+        worker.run_once()
+
+    assert registry.executions == 0
+    assert store.active_leases() == ()
+
+
+def test_first_quota_callback_exception_fails_closed_without_reservation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.lab_worker as lab_worker
+    from rquant.runtime_resource_admission import SQLiteResourceReservationStore
+
+    original_derive = lab_worker.derive_lab_admission_request
+
+    def derive_positive_quota_request(**kwargs: object) -> object:
+        request = original_derive(**kwargs)
+        return request.model_copy(update={"expected_quota_units": 1, "source": "test-source"})
+
+    monkeypatch.setattr(
+        lab_worker,
+        "derive_lab_admission_request",
+        derive_positive_quota_request,
+    )
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims = LabClaimSpool(tmp_path / "claims")
+    registry = RecordingRegistry()
+    store = SQLiteResourceReservationStore(
+        tmp_path / "failing-quota-reservations.sqlite3",
+        clock=lambda: NOW,
+    )
+    claims.publish(claim)
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        registry=registry,
+        resource_probe_timeout_seconds=3,
+        resource_snapshot_provider=StaticResourceSnapshotProvider(
+            _healthy_resource_snapshot().model_copy(update={"source_quota_remaining": 10})
+        ),
+        admission_policy_provider=StaticAdmissionPolicyProvider(
+            _permissive_admission_policy(max_expected_quota_units=1)
+        ),
+        source_quota_lease_provider=FailingInitialSourceQuotaLeaseProvider(),
+        resource_reservation_store=store,
+        require_resource_admission=True,
+    )
+
+    with pytest.raises(LabDaemonConfigurationError, match="source quota lease provider failed"):
+        worker.run_once()
+
+    assert registry.executions == 0
+    assert store.active_leases() == ()
+    with worker._managed_authority_children_lock:
+        assert worker._managed_authority_children == {}
+    assert all(
+        child.name != "lab-resource-authority" for child in multiprocessing.active_children()
+    )
+
+
+@pytest.mark.parametrize("termination", ("stop", "deadline"))
+def test_blocked_initial_policy_gate_is_bounded_and_never_executes_adapter(
+    tmp_path: Path,
+    termination: str,
+) -> None:
+    from rquant.runtime_resource_admission import SQLiteResourceReservationStore
+
+    spec = _nshape_compare_spec(hold_days=(1,))
+    if termination == "deadline":
+        spec = spec.model_copy(update={"deadline": NOW + timedelta(seconds=2)})
+    claim = _short_claim_for_spec(spec)
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    child_pid_path = tmp_path / f"blocked-policy-{termination}-child.pid"
+    callback_entered_path = tmp_path / f"blocked-policy-{termination}.entered"
+    callback_release_path = tmp_path / f"blocked-policy-{termination}.release"
+    registry = PlanBypassRecordingRegistry()
+    store = SQLiteResourceReservationStore(
+        tmp_path / f"resource-reservations-{termination}.sqlite3",
+        clock=lambda: NOW,
+    )
+    policy_provider = BlockingSecondAdmissionPolicyProvider(
+        _permissive_admission_policy(),
+        entered_path=callback_entered_path,
+        release_path=callback_release_path,
+    )
+    claims.publish(claim)
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        reports=reports,
+        registry=registry,
+        resource_recheck_interval_seconds=0.01,
+        resource_probe_timeout_seconds=3,
+        resource_snapshot_provider=StaticResourceSnapshotProvider(_healthy_resource_snapshot()),
+        admission_policy_provider=policy_provider,
+        resource_reservation_store=store,
+        require_resource_admission=True,
+        isolation_session_initializer=RecordingSessionInitializer(child_pid_path),
+    )
+    outcomes: list[object] = []
+    failures: list[BaseException] = []
+
+    def run_worker() -> None:
+        try:
+            outcomes.append(worker.run_once())
+        except BaseException as exc:
+            failures.append(exc)
+
+    runner = threading.Thread(target=run_worker)
+    runner.start()
+    try:
+        entered_deadline = time.monotonic() + 2
+        while not callback_entered_path.exists() and time.monotonic() < entered_deadline:
+            time.sleep(0.01)
+        assert callback_entered_path.exists()
+        started = time.monotonic()
+        if termination == "stop":
+            worker.request_stop()
+        runner.join(timeout=2.3)
+        bounded = not runner.is_alive()
+        elapsed = time.monotonic() - started
+    finally:
+        worker.request_stop()
+        callback_release_path.write_text("release", encoding="ascii")
+        runner.join(timeout=2)
+
+    assert bounded
+    assert elapsed < 2.3
+    assert failures == []
+    assert outcomes[0].status == "stopped"
+    assert registry.executions == 0
+    assert child_pid_path.exists()
+    _assert_process_gone(int(child_pid_path.read_text(encoding="ascii")))
+    assert store.active_leases() == ()
+
+
+def test_blocked_initial_quota_gate_stop_reaps_authority_child_and_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.lab_worker as lab_worker
+    from rquant.runtime_resource_admission import SQLiteResourceReservationStore
+
+    original_derive = lab_worker.derive_lab_admission_request
+
+    def derive_positive_quota_request(**kwargs: object):
+        request = original_derive(**kwargs)
+        return request.model_copy(update={"expected_quota_units": 1, "source": "test-source"})
+
+    monkeypatch.setattr(
+        lab_worker,
+        "derive_lab_admission_request",
+        derive_positive_quota_request,
+    )
+    spec = _nshape_compare_spec(hold_days=(1,))
+    claim = _short_claim_for_spec(spec)
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    child_pid_path = tmp_path / "blocked-quota-child.pid"
+    adapter_pid_path = tmp_path / "blocked-quota-adapter.pid"
+    callback_entered_path = tmp_path / "blocked-quota.entered"
+    callback_release_path = tmp_path / "blocked-quota.release"
+    authority_pid_path = tmp_path / "blocked-quota-authority.pid"
+    store = SQLiteResourceReservationStore(
+        tmp_path / "blocked-quota-reservations.sqlite3",
+        clock=lambda: NOW,
+    )
+    quota_provider = BlockingSecondSourceQuotaLeaseProvider(
+        entered_path=callback_entered_path,
+        release_path=callback_release_path,
+        authority_pid_path=authority_pid_path,
+    )
+    claims.publish(claim)
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        reports=reports,
+        registry=SlowPidRegistry(pid_path=adapter_pid_path, delay_seconds=1),
+        resource_recheck_interval_seconds=0.01,
+        resource_probe_timeout_seconds=3,
+        resource_snapshot_provider=StaticResourceSnapshotProvider(
+            _healthy_resource_snapshot().model_copy(update={"source_quota_remaining": 10})
+        ),
+        admission_policy_provider=StaticAdmissionPolicyProvider(
+            _permissive_admission_policy(max_expected_quota_units=1)
+        ),
+        source_quota_lease_provider=quota_provider,
+        resource_reservation_store=store,
+        require_resource_admission=True,
+        isolation_session_initializer=RecordingSessionInitializer(child_pid_path),
+    )
+    outcomes: list[object] = []
+    failures: list[BaseException] = []
+
+    def run_worker() -> None:
+        try:
+            outcomes.append(worker.run_once())
+        except BaseException as exc:
+            failures.append(exc)
+
+    runner = threading.Thread(target=run_worker)
+    runner.start()
+    try:
+        entered_deadline = time.monotonic() + 3
+        while not callback_entered_path.exists() and time.monotonic() < entered_deadline:
+            time.sleep(0.01)
+        assert callback_entered_path.exists()
+        started = time.monotonic()
+        worker.request_stop()
+        runner.join(timeout=1.1)
+        bounded = not runner.is_alive()
+        elapsed = time.monotonic() - started
+    finally:
+        worker.request_stop()
+        callback_release_path.write_text("release", encoding="ascii")
+        runner.join(timeout=2)
+
+    assert bounded
+    assert elapsed < 1.1
+    assert failures == []
+    assert outcomes[0].status == "stopped"
+    assert not adapter_pid_path.exists()
+    _assert_process_gone(int(child_pid_path.read_text(encoding="ascii")))
+    _assert_process_gone(int(authority_pid_path.read_text(encoding="ascii")))
+    assert store.active_leases() == ()
+    active_authority_children = tuple(
+        (child.name, child.pid, child.exitcode)
+        for child in multiprocessing.active_children()
+        if child.name == "lab-resource-authority"
+    )
+    assert active_authority_children == ()
+    with worker._managed_authority_children_lock:
+        assert worker._managed_authority_children == {}
+
+
+def test_stop_cancels_locked_recheck_and_reaps_child_before_releasing_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sqlite3
+
+    from rquant.runtime_resource_admission import SQLiteResourceReservationStore
+
+    spec = _nshape_compare_spec(hold_days=(1,))
+    claim = _short_claim_for_spec(spec)
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    child_pid_path = tmp_path / "locked-recheck-child.pid"
+    adapter_pid_path = tmp_path / "locked-recheck-adapter.pid"
+    child_release_path = tmp_path / "locked-recheck-child.release"
+    claims.publish(claim)
+    database_path = tmp_path / "resource-reservations.sqlite3"
+    store = SQLiteResourceReservationStore(database_path, clock=lambda: NOW)
+    original_recheck = store.recheck
+    recheck_entered = threading.Event()
+    recheck_finished = threading.Event()
+
+    def observed_recheck(**kwargs: object):
+        recheck_entered.set()
+        try:
+            return original_recheck(**kwargs)
+        finally:
+            recheck_finished.set()
+
+    monkeypatch.setattr(store, "recheck", observed_recheck)
+    worker = _worker(
+        tmp_path,
+        registry=SlowPidRegistry(pid_path=adapter_pid_path, delay_seconds=1),
+        claims=claims,
+        reports=reports,
+        resource_recheck_interval_seconds=0.2,
+        resource_snapshot_provider=StaticResourceSnapshotProvider(_healthy_resource_snapshot()),
+        admission_policy_provider=StaticAdmissionPolicyProvider(_permissive_admission_policy()),
+        resource_reservation_store=store,
+        require_resource_admission=True,
+        isolation_session_initializer=BlockingRecordingSessionInitializer(
+            child_pid_path,
+            child_release_path,
+        ),
+    )
+    outcomes: list[object] = []
+    failures: list[BaseException] = []
+
+    def run_worker() -> None:
+        try:
+            outcomes.append(worker.run_once())
+        except BaseException as exc:
+            failures.append(exc)
+
+    runner = threading.Thread(target=run_worker)
+    holder: sqlite3.Connection | None = None
+    runner.start()
+    try:
+        pid_deadline = time.monotonic() + 2
+        while not child_pid_path.exists() and time.monotonic() < pid_deadline:
+            time.sleep(0.01)
+        assert child_pid_path.exists()
+        holder = sqlite3.connect(database_path, isolation_level=None)
+        holder.execute("BEGIN IMMEDIATE")
+        child_release_path.write_text("release", encoding="ascii")
+        assert recheck_entered.wait(timeout=2)
+
+        time.sleep(0.01)
+        worker.request_stop()
+        assert recheck_finished.wait(timeout=1)
+        holder.rollback()
+        holder.close()
+        holder = None
+        runner.join(timeout=3)
+    finally:
+        worker.request_stop()
+        child_release_path.write_text("release", encoding="ascii")
+        if holder is not None:
+            holder.rollback()
+            holder.close()
+        runner.join(timeout=1)
+
+    assert not runner.is_alive()
+    assert failures == []
+    assert outcomes[0].status == "stopped"
+    assert not adapter_pid_path.exists()
+    _assert_process_gone(int(child_pid_path.read_text(encoding="ascii")))
+    assert store.active_leases() == ()
+
+
+def test_resource_admission_defers_without_consuming_or_executing_claim(
+    tmp_path: Path,
+) -> None:
+    from rquant.resource_admission import AdmissionPolicy, ResourceSnapshot, TradingSession
+
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    registry = RecordingRegistry()
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims.publish(claim)
+    snapshot = ResourceSnapshot(
+        observed_at=NOW,
+        session=TradingSession.MORNING,
+        live_backlog_age_seconds=0,
+        live_p95_latency_seconds=0,
+        available_memory_bytes=16 * 1024**3,
+        available_disk_bytes=100 * 1024**3,
+        io_pressure_pct=0,
+        cpu_load_pct=0,
+        source_quota_remaining=0,
+        live_healthy=True,
+    )
+    policy = AdmissionPolicy(
+        allow_live_session=False,
+        max_live_backlog_age_seconds=10,
+        max_live_p95_latency_seconds=5,
+        min_available_memory_bytes=512 * 1024**2,
+        min_available_disk_bytes=1024**3,
+        max_io_pressure_pct=80,
+        max_cpu_load_pct=80,
+        max_expected_memory_bytes=8 * 1024**3,
+        max_expected_disk_bytes=50 * 1024**3,
+        max_expected_quota_units=0,
+        retry_delay_seconds=60,
+    )
+
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        reports=reports,
+        registry=registry,
+        resource_snapshot_provider=StaticResourceSnapshotProvider(snapshot),
+        admission_policy_provider=StaticAdmissionPolicyProvider(policy),
+        require_resource_admission=True,
+    )
+
+    result = worker.run_once()
+
+    assert result.status == "deferred"
+    assert result.claim_token == claim.claim_token
+    assert result.admission_decision is not None
+    assert result.admission_decision.reason_codes == ("live_session_blocked",)
+    assert registry.executions == 0
+    assert reports.pending() == ()
+    assert tuple(entry.claim for entry in claims.pending()) == (claim,)
+    assert not (claims.admitted_dir / f"{claim.claim_token}.json").exists()
+
+
+def test_resource_reservation_exists_before_shard_spawn_and_releases_after_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from multiprocessing.process import BaseProcess
+
+    from rquant.runtime_resource_admission import SQLiteResourceReservationStore
+
+    claims = LabClaimSpool(tmp_path / "claims")
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims.publish(claim)
+    store = SQLiteResourceReservationStore(
+        tmp_path / "resource-reservations.sqlite3",
+        clock=lambda: NOW,
+    )
+    original_start = BaseProcess.start
+    observed_identity: list[object] = []
+
+    def assert_reserved_before_spawn(process: BaseProcess) -> None:
+        if process.name.startswith("lab-shard-"):
+            leases = store.active_leases()
+            assert len(leases) == 1
+            observed_identity.append(leases[0].identity)
+        original_start(process)
+
+    monkeypatch.setattr(BaseProcess, "start", assert_reserved_before_spawn)
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        resource_snapshot_provider=StaticResourceSnapshotProvider(_healthy_resource_snapshot()),
+        admission_policy_provider=StaticAdmissionPolicyProvider(_permissive_admission_policy()),
+        resource_reservation_store=store,
+        require_resource_admission=True,
+    )
+
+    result = worker.run_once()
+
+    assert result.status == "succeeded"
+    assert len(observed_identity) == 1
+    identity = observed_identity[0]
+    assert identity.job_id == claim.job_id
+    assert identity.run_id == claim.spec_hash
+    assert identity.shard_id == claim.shard_id
+    assert identity.attempt_id == claim.claim_token
+    assert identity.claim_generation == claim.claim_generation
+    assert identity.scheduler_fencing_token == claim.scheduler_fencing_token
+    assert identity.worker_id == claim.worker_id
+    assert store.active_leases() == ()
+
+
+def test_resource_reservation_releases_when_shard_spawn_fails(tmp_path: Path) -> None:
+    from rquant.lab_daemon import LabDaemonConfigurationError
+    from rquant.runtime_resource_admission import SQLiteResourceReservationStore
+
+    claims = LabClaimSpool(tmp_path / "claims")
+    claims.publish(_claim(_nshape_compare_spec(hold_days=(1,))))
+    store = SQLiteResourceReservationStore(
+        tmp_path / "resource-reservations.sqlite3",
+        clock=lambda: NOW,
+    )
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        registry=UnserializableRegistry(),
+        resource_snapshot_provider=StaticResourceSnapshotProvider(_healthy_resource_snapshot()),
+        admission_policy_provider=StaticAdmissionPolicyProvider(_permissive_admission_policy()),
+        resource_reservation_store=store,
+        require_resource_admission=True,
+    )
+
+    with pytest.raises(LabDaemonConfigurationError, match="spawn-serializable"):
+        worker.run_once()
+
+    assert store.active_leases() == ()
+
+
+def test_resource_admission_rejects_a_stale_snapshot_before_claim_consumption(
+    tmp_path: Path,
+) -> None:
+    claims = LabClaimSpool(tmp_path / "claims")
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims.publish(claim)
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        resource_snapshot_provider=StaticResourceSnapshotProvider(
+            _healthy_resource_snapshot(observed_at=NOW - timedelta(seconds=6))
+        ),
+        admission_policy_provider=StaticAdmissionPolicyProvider(
+            _permissive_admission_policy(max_snapshot_age_seconds=5)
+        ),
+        require_resource_admission=True,
+    )
+
+    with pytest.raises(LabDaemonConfigurationError, match="stale"):
+        worker.run_once()
+
+    assert tuple(entry.claim for entry in claims.pending()) == (claim,)
+
+
+def test_resource_admission_accepts_snapshot_at_exact_microsecond_age_limit(
+    tmp_path: Path,
+) -> None:
+    claims = LabClaimSpool(tmp_path / "claims")
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims.publish(claim)
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        resource_snapshot_provider=StaticResourceSnapshotProvider(
+            _healthy_resource_snapshot(observed_at=NOW - timedelta(microseconds=180))
+        ),
+        admission_policy_provider=StaticAdmissionPolicyProvider(
+            _permissive_admission_policy(max_snapshot_age_microseconds=180)
+        ),
+        require_resource_admission=True,
+    )
+
+    result = worker.run_once()
+
+    assert result.status == "succeeded"
+
+
+def test_resource_admission_rejects_a_future_snapshot_before_claim_consumption(
+    tmp_path: Path,
+) -> None:
+    claims = LabClaimSpool(tmp_path / "claims")
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims.publish(claim)
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        resource_snapshot_provider=StaticResourceSnapshotProvider(
+            _healthy_resource_snapshot(observed_at=NOW + timedelta(microseconds=1))
+        ),
+        admission_policy_provider=StaticAdmissionPolicyProvider(_permissive_admission_policy()),
+        require_resource_admission=True,
+    )
+
+    with pytest.raises(LabDaemonConfigurationError, match="future"):
+        worker.run_once()
+
+    assert tuple(entry.claim for entry in claims.pending()) == (claim,)
+
+
+@pytest.mark.parametrize(
+    ("runtime_observed_at", "message"),
+    (
+        (NOW - timedelta(seconds=6), "stale"),
+        (NOW + timedelta(microseconds=1), "future"),
+    ),
+)
+def test_resource_admission_rejects_invalid_snapshot_during_execution(
+    tmp_path: Path,
+    runtime_observed_at: datetime,
+    message: str,
+) -> None:
+    claims = LabClaimSpool(tmp_path / "claims")
+    child_pid_path = tmp_path / f"runtime-{message}-child.pid"
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims.publish(claim)
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        registry=SlowPidRegistry(pid_path=child_pid_path, delay_seconds=1),
+        resource_recheck_interval_seconds=0.01,
+        resource_snapshot_provider=SequenceResourceSnapshotProvider(
+            _healthy_resource_snapshot(observed_at=NOW),
+            _healthy_resource_snapshot(observed_at=runtime_observed_at),
+        ),
+        admission_policy_provider=StaticAdmissionPolicyProvider(
+            _permissive_admission_policy(max_snapshot_age_seconds=5)
+        ),
+        require_resource_admission=True,
+    )
+
+    with pytest.raises(LabDaemonConfigurationError, match=message):
+        worker.run_once()
+
+    if child_pid_path.exists():
+        _assert_process_gone(int(child_pid_path.read_text(encoding="ascii")))
+    assert not worker.sealed_bundle_path(claim).exists()
+
+
+def test_resource_admission_retries_same_pending_claim_exactly_once(tmp_path: Path) -> None:
+    from rquant.resource_admission import AdmissionPolicy, TradingSession
+
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    registry = RecordingRegistry()
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims.publish(claim)
+    clock = MutableUtcClock(NOW)
+    snapshot_provider = MutableResourceSnapshotProvider(
+        _healthy_resource_snapshot(observed_at=NOW, session=TradingSession.MORNING),
+        _healthy_resource_snapshot(
+            observed_at=NOW + timedelta(minutes=2),
+            session=TradingSession.POST_MARKET,
+        ),
+    )
+
+    policy = AdmissionPolicy(
+        allow_live_session=False,
+        max_live_backlog_age_seconds=10,
+        max_live_p95_latency_seconds=5,
+        min_available_memory_bytes=512 * 1024**2,
+        min_available_disk_bytes=1024**3,
+        max_io_pressure_pct=80,
+        max_cpu_load_pct=80,
+        max_expected_memory_bytes=8 * 1024**3,
+        max_expected_disk_bytes=50 * 1024**3,
+        max_expected_quota_units=0,
+        retry_delay_seconds=60,
+    )
+
+    def accept_at_observed(
+        report: LabWorkerReport,
+        _timeout_seconds: float,
+        _stop: object,
+    ) -> LabReportReceipt:
+        return LabReportReceipt.from_report(
+            report,
+            status="accepted",
+            reason=f"accepted:{report.body.report_type}",
+            accepted_at=clock(),
+        )
+
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        reports=reports,
+        registry=registry,
+        resource_snapshot_provider=snapshot_provider,
+        admission_policy_provider=StaticAdmissionPolicyProvider(policy),
+        require_resource_admission=True,
+        receipt_waiter=accept_at_observed,
+        clock=clock,
+    )
+
+    def assert_no_authority_child_accumulation() -> None:
+        with worker._managed_authority_children_lock:
+            assert worker._managed_authority_children == {}
+        assert all(
+            child.name != "lab-resource-authority" for child in multiprocessing.active_children()
+        )
+
+    assert worker.run_once().status == "deferred"
+    assert_no_authority_child_accumulation()
+    assert worker.run_once().status == "idle"
+    assert_no_authority_child_accumulation()
+    clock.set(NOW + timedelta(minutes=2))
+    snapshot_provider.select(1)
+    assert worker.run_once().status == "succeeded"
+    assert_no_authority_child_accumulation()
+    assert worker.run_once().status == "idle"
+    assert_no_authority_child_accumulation()
+    assert sum(isinstance(report.body, LabShardSucceeded) for report in _reports(reports)) == 1
+    assert worker.sealed_bundle_path(claim).is_dir()
+
+
+def test_revoked_resource_deferred_claim_never_executes(tmp_path: Path) -> None:
+    from rquant.resource_admission import AdmissionPolicy, ResourceSnapshot, TradingSession
+
+    claims = LabClaimSpool(tmp_path / "claims")
+    registry = RecordingRegistry()
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims.publish(claim)
+    policy = AdmissionPolicy(
+        allow_live_session=False,
+        max_live_backlog_age_seconds=10,
+        max_live_p95_latency_seconds=5,
+        min_available_memory_bytes=0,
+        min_available_disk_bytes=0,
+        max_io_pressure_pct=100,
+        max_cpu_load_pct=100,
+        max_expected_memory_bytes=8 * 1024**3,
+        max_expected_disk_bytes=50 * 1024**3,
+        max_expected_quota_units=0,
+        retry_delay_seconds=60,
+    )
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        registry=registry,
+        resource_snapshot_provider=StaticResourceSnapshotProvider(
+            ResourceSnapshot(
+                observed_at=NOW,
+                session=TradingSession.MORNING,
+                live_backlog_age_seconds=0,
+                live_p95_latency_seconds=0,
+                available_memory_bytes=16 * 1024**3,
+                available_disk_bytes=100 * 1024**3,
+                io_pressure_pct=0,
+                cpu_load_pct=0,
+                source_quota_remaining=0,
+                live_healthy=True,
+            )
+        ),
+        admission_policy_provider=StaticAdmissionPolicyProvider(policy),
+        require_resource_admission=True,
+    )
+
+    assert worker.run_once().status == "deferred"
+    claims.revoke(claim, reason="scheduler cancelled deferred claim")
+    assert worker.run_once().status == "idle"
+    assert registry.executions == 0
+
+
+def test_zero_quota_replay_does_not_call_source_lease_provider(tmp_path: Path) -> None:
+    from rquant.resource_admission import AdmissionPolicy, ResourceSnapshot, TradingSession
+
+    claims = LabClaimSpool(tmp_path / "claims")
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims.publish(claim)
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        resource_snapshot_provider=StaticResourceSnapshotProvider(
+            ResourceSnapshot(
+                observed_at=NOW,
+                session=TradingSession.POST_MARKET,
+                live_backlog_age_seconds=0,
+                live_p95_latency_seconds=0,
+                available_memory_bytes=16 * 1024**3,
+                available_disk_bytes=100 * 1024**3,
+                io_pressure_pct=0,
+                cpu_load_pct=0,
+                source_quota_remaining=0,
+                live_healthy=True,
+            )
+        ),
+        admission_policy_provider=StaticAdmissionPolicyProvider(
+            AdmissionPolicy(
+                allow_live_session=False,
+                max_live_backlog_age_seconds=10,
+                max_live_p95_latency_seconds=5,
+                min_available_memory_bytes=0,
+                min_available_disk_bytes=0,
+                max_io_pressure_pct=100,
+                max_cpu_load_pct=100,
+                max_expected_memory_bytes=8 * 1024**3,
+                max_expected_disk_bytes=50 * 1024**3,
+                max_expected_quota_units=0,
+                retry_delay_seconds=60,
+            )
+        ),
+        source_quota_lease_provider=lambda _request, _snapshot: pytest.fail(
+            "zero-quota replay must not acquire a source lease"
+        ),
+        require_resource_admission=True,
+    )
+
+    assert worker.run_once().status == "succeeded"
+
+
+def test_resource_admission_is_rechecked_during_execution_and_preempts_publish(
+    tmp_path: Path,
+) -> None:
+    from rquant.resource_admission import AdmissionPolicy, TradingSession
+
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    pid_path = tmp_path / "resource-preempted-child.pid"
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims.publish(claim)
+    snapshot_provider = SequenceResourceSnapshotProvider(
+        _healthy_resource_snapshot(session=TradingSession.MORNING),
+        _healthy_resource_snapshot(session=TradingSession.MORNING).model_copy(
+            update={"live_healthy": False}
+        ),
+    )
+
+    policy = AdmissionPolicy(
+        allow_live_session=True,
+        max_live_shard_duration_ms=10**9,
+        max_live_backlog_age_seconds=10,
+        max_live_p95_latency_seconds=5,
+        min_available_memory_bytes=0,
+        min_available_disk_bytes=0,
+        max_io_pressure_pct=100,
+        max_cpu_load_pct=100,
+        max_expected_memory_bytes=8 * 1024**3,
+        max_expected_disk_bytes=50 * 1024**3,
+        max_expected_quota_units=0,
+        retry_delay_seconds=60,
+    )
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        reports=reports,
+        registry=HungLiveRegistry(pid_path=pid_path),
+        heartbeat_interval_seconds=1,
+        resource_recheck_interval_seconds=0.01,
+        resource_snapshot_provider=snapshot_provider,
+        admission_policy_provider=StaticAdmissionPolicyProvider(policy),
+        require_resource_admission=True,
+    )
+
+    result = worker.run_once()
+
+    assert result.status == "stopped"
+    assert snapshot_provider.calls >= 2
+    assert isinstance(_reports(reports)[-1].body, LabWorkerStopped)
+    assert not worker.sealed_bundle_path(claim).exists()
+    assert not pid_path.exists()
+
+
+def test_resource_degradation_after_final_heartbeat_blocks_atomic_publish(
+    tmp_path: Path,
+) -> None:
+    from rquant.resource_admission import AdmissionPolicy, TradingSession
+
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims.publish(claim)
+    snapshot_provider = MutableResourceSnapshotProvider(
+        _healthy_resource_snapshot(session=TradingSession.MORNING),
+        _healthy_resource_snapshot(session=TradingSession.MORNING).model_copy(
+            update={"live_healthy": False}
+        ),
+    )
+
+    def degrade_after_final_fence(
+        report: LabWorkerReport,
+        _timeout_seconds: float,
+        _stop: object,
+    ) -> LabReportReceipt:
+        if isinstance(report.body, LabShardHeartbeat):
+            snapshot_provider.select(1)
+        return LabReportReceipt.from_report(
+            report,
+            status="accepted",
+            reason=f"accepted:{report.body.report_type}",
+            accepted_at=NOW,
+        )
+
+    policy = AdmissionPolicy(
+        allow_live_session=True,
+        max_live_shard_duration_ms=10**9,
+        max_live_backlog_age_seconds=10,
+        max_live_p95_latency_seconds=5,
+        min_available_memory_bytes=0,
+        min_available_disk_bytes=0,
+        max_io_pressure_pct=100,
+        max_cpu_load_pct=100,
+        max_expected_memory_bytes=8 * 1024**3,
+        max_expected_disk_bytes=50 * 1024**3,
+        max_expected_quota_units=0,
+        retry_delay_seconds=60,
+    )
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        reports=reports,
+        heartbeat_interval_seconds=10,
+        resource_recheck_interval_seconds=10,
+        resource_snapshot_provider=snapshot_provider,
+        admission_policy_provider=StaticAdmissionPolicyProvider(policy),
+        require_resource_admission=True,
+        receipt_waiter=degrade_after_final_fence,
+    )
+
+    result = worker.run_once()
+
+    assert result.status == "stopped"
+    assert isinstance(_reports(reports)[-1].body, LabWorkerStopped)
+    assert not worker.sealed_bundle_path(claim).exists()
+
+
+def test_live_hung_adapter_is_hard_preempted_without_leaking_child(
+    tmp_path: Path,
+) -> None:
+    from rquant.resource_admission import AdmissionPolicy, ResourceSnapshot, TradingSession
+
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    pid_path = tmp_path / "hung-child.pid"
+    claim = _short_live_claim()
+    claims.publish(claim)
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        reports=reports,
+        registry=HungLiveRegistry(pid_path=pid_path),
+        heartbeat_interval_seconds=1,
+        resource_recheck_interval_seconds=0.01,
+        resource_snapshot_provider=StaticResourceSnapshotProvider(
+            ResourceSnapshot(
+                observed_at=NOW,
+                session=TradingSession.MORNING,
+                live_backlog_age_seconds=0,
+                live_p95_latency_seconds=0,
+                available_memory_bytes=16 * 1024**3,
+                available_disk_bytes=100 * 1024**3,
+                io_pressure_pct=0,
+                cpu_load_pct=0,
+                source_quota_remaining=0,
+                live_healthy=True,
+            )
+        ),
+        admission_policy_provider=StaticAdmissionPolicyProvider(
+            AdmissionPolicy(
+                allow_live_session=True,
+                max_live_shard_duration_ms=600,
+                max_live_backlog_age_seconds=10,
+                max_live_p95_latency_seconds=5,
+                min_available_memory_bytes=0,
+                min_available_disk_bytes=0,
+                max_io_pressure_pct=100,
+                max_cpu_load_pct=100,
+                max_expected_memory_bytes=8 * 1024**3,
+                max_expected_disk_bytes=50 * 1024**3,
+                max_expected_quota_units=0,
+                retry_delay_seconds=60,
+            )
+        ),
+        require_resource_admission=True,
+    )
+
+    started = time.monotonic()
+    result = worker.run_once()
+    elapsed = time.monotonic() - started
+
+    assert result.status == "stopped"
+    assert elapsed < 2
+    assert pid_path.is_file()
+    child_pid = int(pid_path.read_text(encoding="ascii"))
+    with pytest.raises(ProcessLookupError):
+        os.kill(child_pid, 0)
+    terminal = _reports(reports)[-1].body
+    assert isinstance(terminal, LabWorkerStopped)
+    assert "hard live execution limit" in terminal.reason
+    assert not worker.sealed_bundle_path(claim).exists()
+    assert tuple((tmp_path / "artifacts").glob("**/.attempt-*")) == ()
+
+
+def test_post_market_preemptible_shard_crossing_into_live_is_hard_preempted(
+    tmp_path: Path,
+) -> None:
+    from rquant.resource_admission import AdmissionPolicy, TradingSession
+
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    pid_path = tmp_path / "cross-session-child.pid"
+    claim = _short_live_claim()
+    claims.publish(claim)
+    snapshot_provider = SequenceResourceSnapshotProvider(
+        _healthy_resource_snapshot(session=TradingSession.POST_MARKET),
+        _healthy_resource_snapshot(session=TradingSession.MORNING),
+    )
+
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        reports=reports,
+        registry=SlowPidRegistry(pid_path=pid_path, delay_seconds=1),
+        resource_recheck_interval_seconds=0.01,
+        resource_snapshot_provider=snapshot_provider,
+        admission_policy_provider=StaticAdmissionPolicyProvider(
+            AdmissionPolicy(
+                allow_live_session=True,
+                max_live_shard_duration_ms=100,
+                max_live_backlog_age_seconds=10,
+                max_live_p95_latency_seconds=5,
+                min_available_memory_bytes=0,
+                min_available_disk_bytes=0,
+                max_io_pressure_pct=100,
+                max_cpu_load_pct=100,
+                max_expected_memory_bytes=8 * 1024**3,
+                max_expected_disk_bytes=50 * 1024**3,
+                max_expected_quota_units=0,
+                retry_delay_seconds=60,
+            )
+        ),
+        require_resource_admission=True,
+    )
+
+    started = time.monotonic()
+    result = worker.run_once()
+    elapsed = time.monotonic() - started
+
+    assert result.status == "stopped"
+    assert elapsed < 1.5
+    child_pid = int(pid_path.read_text(encoding="ascii"))
+    assert child_pid != os.getpid()
+    _assert_process_gone(child_pid)
+    terminal = _reports(reports)[-1].body
+    assert isinstance(terminal, LabWorkerStopped)
+    assert "hard live execution limit" in terminal.reason
+    assert not worker.sealed_bundle_path(claim).exists()
+
+
+def test_child_result_received_after_monotonic_hard_deadline_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.lab_worker as lab_worker
+    from rquant.resource_admission import TradingSession
+
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    claim = _short_live_claim()
+    claims.publish(claim)
+    pid_path = tmp_path / "late-result-child.pid"
+    original_recv = lab_worker._recv_wire
+    outcome_received = threading.Event()
+
+    def delayed_recv(connection: object, **kwargs: object) -> object:
+        value = original_recv(connection, **kwargs)
+        if kwargs.get("model") is lab_worker._IsolatedExecutionWireOutcome:
+            outcome_received.set()
+        return value
+
+    def controlled_monotonic() -> float:
+        return time.monotonic() + (1.0 if outcome_received.is_set() else 0.0)
+
+    monkeypatch.setattr(lab_worker, "_recv_wire", delayed_recv)
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        reports=reports,
+        registry=SlowPidRegistry(pid_path=pid_path, delay_seconds=0),
+        resource_recheck_interval_seconds=0.01,
+        isolation_monotonic_clock=controlled_monotonic,
+    )
+    validated = worker._validate_closed_claim(claim)
+    control = worker._execute_shard_isolated(
+        claim,
+        validated,
+        runtime_code_sha="1" * 40,
+        hard_limit_seconds=1.0,
+        initial_session=TradingSession.MORNING,
+    )
+
+    assert control.stop_reason is not None
+    assert "hard live execution limit" in control.stop_reason
+    assert pid_path.exists()
+    _assert_process_gone(int(pid_path.read_text(encoding="ascii")))
+    assert not worker.sealed_bundle_path(claim).exists()
+
+
+def test_slow_authority_reservation_and_pre_ack_recheck_preserve_live_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.resource_admission import TradingSession
+    from rquant.runtime_resource_admission import SQLiteResourceReservationStore
+
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    adapter_pid_path = tmp_path / "post-ack-budget-adapter.pid"
+    second_recheck_path = tmp_path / "post-ack-budget-recheck.entered"
+    claim = _short_live_claim()
+    claims.publish(claim)
+    store = SQLiteResourceReservationStore(
+        tmp_path / "post-ack-budget.sqlite3",
+        clock=lambda: NOW,
+    )
+    original_reserve = store.reserve
+
+    def slow_reserve(**kwargs: object):
+        time.sleep(0.14)
+        return original_reserve(**kwargs)
+
+    monkeypatch.setattr(store, "reserve", slow_reserve)
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        reports=reports,
+        registry=SlowPidRegistry(pid_path=adapter_pid_path, delay_seconds=0.04),
+        resource_probe_timeout_seconds=1,
+        resource_snapshot_provider=StaticResourceSnapshotProvider(
+            _healthy_resource_snapshot(session=TradingSession.MORNING)
+        ),
+        admission_policy_provider=SlowAdmissionPolicyProvider(
+            _permissive_admission_policy(max_live_shard_duration_ms=300),
+            delay_seconds=0.14,
+            second_call_entered_path=second_recheck_path,
+        ),
+        resource_reservation_store=store,
+        require_resource_admission=True,
+    )
+    outcomes: list[object] = []
+    runner = threading.Thread(target=lambda: outcomes.append(worker.run_once()))
+
+    started = time.monotonic()
+    runner.start()
+    entered_deadline = time.monotonic() + 2
+    while not second_recheck_path.exists() and time.monotonic() < entered_deadline:
+        time.sleep(0.01)
+    assert second_recheck_path.exists()
+    assert not adapter_pid_path.exists()
+    runner.join(timeout=3)
+    elapsed = time.monotonic() - started
+
+    assert not runner.is_alive()
+    assert elapsed > 0.42
+    assert elapsed < 3
+    assert outcomes[0].status == "succeeded"
+    assert adapter_pid_path.exists()
+    _assert_process_gone(int(adapter_pid_path.read_text(encoding="ascii")))
+    assert store.active_leases() == ()
+    assert any(isinstance(entry.report.body, LabShardSucceeded) for entry in reports.pending())
+
+
+def test_resource_admission_shared_tick_deadline_does_not_start_second_authority_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.lab_worker import _ResourceAdmissionEvaluation
+    from rquant.resource_admission import TradingSession, evaluate_admission
+
+    spec = _nshape_compare_spec(hold_days=(1,))
+    claim = _short_claim_for_spec(spec)
+    clock_microseconds = [1_000_000]
+    authority_calls: list[int] = []
+    worker = _worker(
+        tmp_path,
+        resource_snapshot_provider=StaticResourceSnapshotProvider(
+            _healthy_resource_snapshot(session=TradingSession.MORNING)
+        ),
+        admission_policy_provider=StaticAdmissionPolicyProvider(
+            _permissive_admission_policy(max_live_shard_duration_ms=300)
+        ),
+        require_resource_admission=True,
+        monotonic_clock=lambda: clock_microseconds[0] / 1_000_000,
+    )
+
+    def delayed_authority(**kwargs: object):
+        authority_calls.append(int(kwargs["timeout_microseconds"]))
+        clock_microseconds[0] += 60_000
+        request = kwargs["request"]
+        assert request is not None
+        snapshot = _healthy_resource_snapshot(session=TradingSession.MORNING)
+        policy = _permissive_admission_policy(max_live_shard_duration_ms=300)
+        return _ResourceAdmissionEvaluation(
+            decision=evaluate_admission(request, snapshot, policy),
+            request=request,
+            snapshot=snapshot,
+            policy=policy,
+            quota_lease=None,
+        )
+
+    monkeypatch.setattr(worker, "_run_admission_authority", delayed_authority)
+    deadline_microseconds = clock_microseconds[0] + 50_000
+
+    with pytest.raises(TimeoutError, match="pre-publication admission deadline"):
+        worker._resource_admission_evaluation(
+            claim,
+            spec,
+            tick_deadline_microseconds=deadline_microseconds,
+        )
+
+    with pytest.raises(TimeoutError, match="pre-publication admission deadline"):
+        worker._resource_admission_evaluation(
+            claim,
+            spec,
+            tick_deadline_microseconds=deadline_microseconds,
+        )
+
+    assert authority_calls == [50_000]
+
+
+def test_receipt_phase_does_not_consume_prepublication_budget(
+    tmp_path: Path,
+) -> None:
+    from rquant.resource_admission import TradingSession
+
+    clock_microseconds = [1_000_000]
+    worker = _worker(
+        tmp_path,
+        resource_snapshot_provider=StaticResourceSnapshotProvider(
+            _healthy_resource_snapshot(session=TradingSession.MORNING)
+        ),
+        admission_policy_provider=StaticAdmissionPolicyProvider(
+            _permissive_admission_policy(max_live_shard_duration_ms=300)
+        ),
+        require_resource_admission=True,
+        monotonic_clock=lambda: clock_microseconds[0] / 1_000_000,
+    )
+    assert worker._receipt_wait_timeout_seconds() == pytest.approx(0.2)
+
+    clock_microseconds[0] += 1_000_000
+    assert worker._receipt_wait_timeout_seconds() == pytest.approx(0.2)
+
+
+def test_pre_ack_refresh_stop_is_bounded_and_discards_late_recheck(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.resource_admission import TradingSession
+    from rquant.runtime_resource_admission import SQLiteResourceReservationStore
+
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    claim = _short_live_claim()
+    claims.publish(claim)
+    store = SQLiteResourceReservationStore(
+        tmp_path / "pre-ack-cancel.sqlite3",
+        clock=lambda: NOW,
+    )
+    entered_recheck = threading.Event()
+    release_recheck = threading.Event()
+    original_recheck = store.recheck
+
+    def blocking_recheck(**kwargs: object):
+        entered_recheck.set()
+        assert release_recheck.wait(timeout=3)
+        return original_recheck(**kwargs)
+
+    monkeypatch.setattr(store, "recheck", blocking_recheck)
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        reports=reports,
+        registry=PlanBypassRecordingRegistry(),
+        resource_snapshot_provider=StaticResourceSnapshotProvider(
+            _healthy_resource_snapshot(session=TradingSession.MORNING)
+        ),
+        admission_policy_provider=StaticAdmissionPolicyProvider(
+            _permissive_admission_policy(max_live_shard_duration_ms=300)
+        ),
+        resource_reservation_store=store,
+        require_resource_admission=True,
+    )
+    outcomes: list[object] = []
+    runner = threading.Thread(target=lambda: outcomes.append(worker.run_once()))
+
+    runner.start()
+    try:
+        assert entered_recheck.wait(timeout=3)
+        worker.request_stop()
+        runner.join(timeout=0.5)
+        assert not runner.is_alive()
+    finally:
+        release_recheck.set()
+        runner.join(timeout=3)
+
+    assert outcomes[0].status == "stopped"
+    assert store.active_leases() == ()
+    assert reports.pending() != ()
+    assert not any(isinstance(entry.report.body, LabShardSucceeded) for entry in reports.pending())
+
+
+def test_delayed_ack_send_starts_full_live_budget_only_after_send_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.lab_worker as lab_worker
+    from rquant.resource_admission import TradingSession
+
+    claim = _short_live_claim()
+    adapter_pid_path = tmp_path / "delayed-ack-adapter.pid"
+    worker = _worker(
+        tmp_path,
+        registry=SlowPidRegistry(pid_path=adapter_pid_path, delay_seconds=0.02),
+    )
+    validated = worker._validate_closed_claim(claim)
+    original_send = lab_worker._send_wire
+
+    def delayed_send(connection: object, value: object) -> None:
+        if isinstance(value, lab_worker._IsolationStartAck):
+            time.sleep(0.55)
+        original_send(connection, value)
+
+    monkeypatch.setattr(lab_worker, "_send_wire", delayed_send)
+
+    started = time.monotonic()
+    control = worker._execute_shard_isolated(
+        claim,
+        validated,
+        runtime_code_sha="1" * 40,
+        hard_limit_seconds=0.5,
+        initial_session=TradingSession.MORNING,
+    )
+    elapsed = time.monotonic() - started
+
+    assert elapsed >= 0.55
+    assert control.stop_reason is None
+    assert control.resource_error is None
+    assert control.outcome is not None and control.outcome.result is not None
+    assert adapter_pid_path.exists()
+    _assert_process_gone(int(adapter_pid_path.read_text(encoding="ascii")))
+
+
+def test_failed_ack_send_never_executes_adapter_and_reaps_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.lab_worker as lab_worker
+    from rquant.resource_admission import TradingSession
+
+    claim = _short_live_claim()
+    adapter_pid_path = tmp_path / "failed-ack-adapter.pid"
+    worker = _worker(
+        tmp_path,
+        registry=SlowPidRegistry(pid_path=adapter_pid_path, delay_seconds=0),
+    )
+    validated = worker._validate_closed_claim(claim)
+    original_send = lab_worker._send_wire
+
+    def fail_ack_send(connection: object, value: object) -> None:
+        if isinstance(value, lab_worker._IsolationStartAck):
+            raise OSError("injected ACK send failure")
+        original_send(connection, value)
+
+    monkeypatch.setattr(lab_worker, "_send_wire", fail_ack_send)
+
+    control = worker._execute_shard_isolated(
+        claim,
+        validated,
+        runtime_code_sha="1" * 40,
+        hard_limit_seconds=0.1,
+        initial_session=TradingSession.MORNING,
+    )
+
+    assert control.resource_error is not None
+    assert "ACK send failure" in str(control.resource_error)
+    assert not adapter_pid_path.exists()
+    assert all(
+        not child.name.startswith("lab-shard-") for child in multiprocessing.active_children()
+    )
+
+
+def test_stop_and_start_ack_commit_share_one_atomic_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stop racing inside start commit observes ACK as committed, never half-started."""
+
+    import rquant.lab_worker as lab_worker
+    from rquant.resource_admission import TradingSession
+
+    claim = _short_live_claim()
+    adapter_pid_path = tmp_path / "atomic-start-gate-adapter.pid"
+    worker = _worker(
+        tmp_path,
+        registry=SlowPidRegistry(pid_path=adapter_pid_path, delay_seconds=0.2),
+    )
+    validated = worker._validate_closed_claim(claim)
+    inside_commit = threading.Event()
+    release_commit = threading.Event()
+    stop_returned = threading.Event()
+    ack_sent = threading.Event()
+    original_send = lab_worker._send_wire
+
+    def block_inside_commit() -> None:
+        inside_commit.set()
+        assert release_commit.wait(timeout=2)
+
+    def record_send(connection: object, value: object, **kwargs: object) -> None:
+        original_send(connection, value, **kwargs)
+        if isinstance(value, lab_worker._IsolationStartAck):
+            ack_sent.set()
+
+    monkeypatch.setattr(worker, "_during_isolation_start_commit_for_test", block_inside_commit)
+    monkeypatch.setattr(lab_worker, "_send_wire", record_send)
+    controls: list[object] = []
+    runner = threading.Thread(
+        target=lambda: controls.append(
+            worker._execute_shard_isolated(
+                claim,
+                validated,
+                runtime_code_sha="1" * 40,
+                hard_limit_seconds=1,
+                initial_session=TradingSession.CLOSED,
+            )
+        )
+    )
+    runner.start()
+    assert inside_commit.wait(timeout=2)
+
+    stopper = threading.Thread(
+        target=lambda: (worker.request_stop(), stop_returned.set()),
+    )
+    stopper.start()
+    assert not stop_returned.wait(timeout=0.05)
+    release_commit.set()
+    assert ack_sent.wait(timeout=2)
+    assert stop_returned.wait(timeout=2)
+    stopper.join(timeout=2)
+    runner.join(timeout=3)
+
+    assert not stopper.is_alive()
+    assert not runner.is_alive()
+    assert controls[0].stop_reason is not None
+    assert "stop requested" in controls[0].stop_reason
+    if adapter_pid_path.exists():
+        _assert_process_gone(int(adapter_pid_path.read_text(encoding="ascii")))
+
+
+def test_stop_before_start_commit_never_sends_ack_or_executes_adapter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.lab_worker as lab_worker
+    from rquant.resource_admission import TradingSession
+
+    claim = _short_live_claim()
+    adapter_pid_path = tmp_path / "pre-commit-stop-adapter.pid"
+    worker = _worker(
+        tmp_path,
+        registry=SlowPidRegistry(pid_path=adapter_pid_path, delay_seconds=0),
+    )
+    validated = worker._validate_closed_claim(claim)
+    before_commit = threading.Event()
+    release_commit = threading.Event()
+    ack_sent = threading.Event()
+    original_send = lab_worker._send_wire
+
+    def block_before_commit() -> None:
+        before_commit.set()
+        assert release_commit.wait(timeout=2)
+
+    def record_send(connection: object, value: object, **kwargs: object) -> None:
+        if isinstance(value, lab_worker._IsolationStartAck):
+            ack_sent.set()
+        original_send(connection, value, **kwargs)
+
+    monkeypatch.setattr(worker, "_before_isolation_start_commit_for_test", block_before_commit)
+    monkeypatch.setattr(lab_worker, "_send_wire", record_send)
+    controls: list[object] = []
+    runner = threading.Thread(
+        target=lambda: controls.append(
+            worker._execute_shard_isolated(
+                claim,
+                validated,
+                runtime_code_sha="1" * 40,
+                hard_limit_seconds=1,
+                initial_session=TradingSession.CLOSED,
+            )
+        )
+    )
+    runner.start()
+    assert before_commit.wait(timeout=2)
+    worker.request_stop()
+    release_commit.set()
+    runner.join(timeout=3)
+
+    assert not runner.is_alive()
+    assert controls[0].stop_reason == "worker stop requested before isolated shard start"
+    assert not ack_sent.is_set()
+    assert not adapter_pid_path.exists()
+
+
+def test_process_start_latency_does_not_consume_post_ack_execution_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from multiprocessing.process import BaseProcess
+
+    from rquant.resource_admission import TradingSession
+
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    claim = _short_live_claim()
+    claims.publish(claim)
+    execution_marker = tmp_path / "late-process-start-adapter.pid"
+    original_start = BaseProcess.start
+    start_returned = threading.Event()
+
+    def delayed_process_start(process: BaseProcess) -> None:
+        original_start(process)
+        start_returned.set()
+
+    def controlled_monotonic() -> float:
+        return time.monotonic() + (1.0 if start_returned.is_set() else 0.0)
+
+    monkeypatch.setattr(BaseProcess, "start", delayed_process_start)
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        reports=reports,
+        registry=HungLiveRegistry(pid_path=execution_marker),
+        resource_recheck_interval_seconds=0.01,
+        isolation_monotonic_clock=controlled_monotonic,
+    )
+
+    validated = worker._validate_closed_claim(claim)
+    control = worker._execute_shard_isolated(
+        claim,
+        validated,
+        runtime_code_sha="1" * 40,
+        hard_limit_seconds=1.0,
+        initial_session=TradingSession.MORNING,
+    )
+
+    assert control.stop_reason is not None
+    assert "hard live execution limit" in control.stop_reason
+    assert execution_marker.exists()
+    _assert_process_gone(int(execution_marker.read_text(encoding="ascii")))
+    assert not worker.sealed_bundle_path(claim).exists()
+
+
+def test_readiness_identity_verification_does_not_consume_post_ack_execution_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.resource_admission import TradingSession
+
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    claim = _short_live_claim()
+    claims.publish(claim)
+    execution_marker = tmp_path / "late-readiness-adapter.pid"
+    original_getpgid = os.getpgid
+    parent_pid = os.getpid()
+    verification_returned = threading.Event()
+
+    def delayed_parent_getpgid(pid: int) -> int:
+        group_id = original_getpgid(pid)
+        if os.getpid() == parent_pid:
+            verification_returned.set()
+        return group_id
+
+    def controlled_monotonic() -> float:
+        return time.monotonic() + (1.0 if verification_returned.is_set() else 0.0)
+
+    monkeypatch.setattr(os, "getpgid", delayed_parent_getpgid)
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        reports=reports,
+        registry=HungLiveRegistry(pid_path=execution_marker),
+        resource_recheck_interval_seconds=0.01,
+        isolation_monotonic_clock=controlled_monotonic,
+    )
+
+    validated = worker._validate_closed_claim(claim)
+    control = worker._execute_shard_isolated(
+        claim,
+        validated,
+        runtime_code_sha="1" * 40,
+        hard_limit_seconds=1.0,
+        initial_session=TradingSession.MORNING,
+    )
+
+    assert control.stop_reason is not None
+    assert "hard live execution limit" in control.stop_reason
+    assert execution_marker.exists()
+    _assert_process_gone(int(execution_marker.read_text(encoding="ascii")))
+    assert not worker.sealed_bundle_path(claim).exists()
+
+
+def test_child_rejects_ack_delivered_after_spec_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.lab_worker as lab_worker
+    from rquant.resource_admission import AdmissionPolicy, ResourceSnapshot, TradingSession
+
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    claim = _short_live_claim()
+    claims.publish(claim)
+    execution_marker = tmp_path / "late-ack-delivery-adapter.pid"
+    original_send = lab_worker._send_wire
+
+    def expire_ack_at_delivery(
+        connection: object,
+        value: object,
+        **kwargs: object,
+    ) -> None:
+        if (
+            isinstance(value, lab_worker._IsolationStartAck)
+            and value.execution_limit_microseconds is not None
+        ):
+            value = lab_worker._IsolationStartAck(
+                accepted=value.accepted,
+                not_after_monotonic_microseconds=(time.monotonic_ns() // 1_000 - 1_000_000),
+                execution_limit_microseconds=value.execution_limit_microseconds,
+            )
+        original_send(connection, value, **kwargs)
+
+    monkeypatch.setattr(lab_worker, "_send_wire", expire_ack_at_delivery)
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        reports=reports,
+        registry=HungLiveRegistry(pid_path=execution_marker),
+        resource_recheck_interval_seconds=0.01,
+        resource_snapshot_provider=StaticResourceSnapshotProvider(
+            ResourceSnapshot(
+                observed_at=NOW,
+                session=TradingSession.MORNING,
+                live_backlog_age_seconds=0,
+                live_p95_latency_seconds=0,
+                available_memory_bytes=16 * 1024**3,
+                available_disk_bytes=100 * 1024**3,
+                io_pressure_pct=0,
+                cpu_load_pct=0,
+                source_quota_remaining=0,
+                live_healthy=True,
+            )
+        ),
+        admission_policy_provider=StaticAdmissionPolicyProvider(
+            AdmissionPolicy(
+                allow_live_session=True,
+                max_live_shard_duration_ms=100,
+                max_live_backlog_age_seconds=10,
+                max_live_p95_latency_seconds=5,
+                min_available_memory_bytes=0,
+                min_available_disk_bytes=0,
+                max_io_pressure_pct=100,
+                max_cpu_load_pct=100,
+                max_expected_memory_bytes=8 * 1024**3,
+                max_expected_disk_bytes=50 * 1024**3,
+                max_expected_quota_units=0,
+                retry_delay_seconds=60,
+            )
+        ),
+        require_resource_admission=True,
+    )
+
+    with pytest.raises(LabDaemonConfigurationError, match="transport failed"):
+        worker.run_once()
+
+    assert not execution_marker.exists()
+    assert not worker.sealed_bundle_path(claim).exists()
+
+
+def test_hard_preemption_sigkills_entire_sigterm_ignoring_process_group(
+    tmp_path: Path,
+) -> None:
+    from rquant.resource_admission import AdmissionPolicy, ResourceSnapshot, TradingSession
+
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    child_pid_path = tmp_path / "sigkill-child.pid"
+    grandchild_pid_path = tmp_path / "sigkill-grandchild.pid"
+    claim = _short_live_claim()
+    claims.publish(claim)
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        reports=reports,
+        registry=SigtermIgnoringProcessTreeRegistry(
+            pid_path=child_pid_path,
+            grandchild_pid_path=grandchild_pid_path,
+        ),
+        resource_recheck_interval_seconds=0.01,
+        resource_snapshot_provider=StaticResourceSnapshotProvider(
+            ResourceSnapshot(
+                observed_at=NOW,
+                session=TradingSession.MORNING,
+                live_backlog_age_seconds=0,
+                live_p95_latency_seconds=0,
+                available_memory_bytes=16 * 1024**3,
+                available_disk_bytes=100 * 1024**3,
+                io_pressure_pct=0,
+                cpu_load_pct=0,
+                source_quota_remaining=0,
+                live_healthy=True,
+            )
+        ),
+        admission_policy_provider=StaticAdmissionPolicyProvider(
+            AdmissionPolicy(
+                allow_live_session=True,
+                max_live_shard_duration_ms=600,
+                max_live_backlog_age_seconds=10,
+                max_live_p95_latency_seconds=5,
+                min_available_memory_bytes=0,
+                min_available_disk_bytes=0,
+                max_io_pressure_pct=100,
+                max_cpu_load_pct=100,
+                max_expected_memory_bytes=8 * 1024**3,
+                max_expected_disk_bytes=50 * 1024**3,
+                max_expected_quota_units=0,
+                retry_delay_seconds=60,
+            )
+        ),
+        require_resource_admission=True,
+    )
+
+    result = worker.run_once()
+
+    assert result.status == "stopped"
+    assert child_pid_path.is_file()
+    assert grandchild_pid_path.is_file()
+    _assert_process_gone(int(child_pid_path.read_text(encoding="ascii")))
+    _assert_process_gone(int(grandchild_pid_path.read_text(encoding="ascii")))
+    assert not worker.sealed_bundle_path(claim).exists()
+
+
+def test_isolated_cleanup_bounds_sigterm_grace_and_reaps_ignoring_process_group(
+    tmp_path: Path,
+) -> None:
+    from rquant.lab_worker import LabWorker
+
+    child_pid_path = tmp_path / "bounded-cleanup-child.pid"
+    grandchild_pid_path = tmp_path / "bounded-cleanup-grandchild.pid"
+    process = multiprocessing.get_context("spawn").Process(
+        target=_standalone_sigterm_ignoring_process_tree,
+        args=(child_pid_path, grandchild_pid_path),
+        name="lab-shard-bounded-cleanup",
+        daemon=False,
+    )
+    process.start()
+    assert process.pid is not None
+    group_id = process.pid
+    deadline = time.monotonic() + 2
+    while (
+        not child_pid_path.is_file() or not grandchild_pid_path.is_file()
+    ) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert child_pid_path.is_file()
+    assert grandchild_pid_path.is_file()
+    grandchild_pid = int(grandchild_pid_path.read_text(encoding="ascii"))
+
+    try:
+        started = time.monotonic()
+        LabWorker._terminate_isolated_process(
+            process,
+            isolated_group_id=group_id,
+        )
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 0.2
+        assert process.exitcode == -signal.SIGKILL
+        _assert_process_gone(group_id)
+        _assert_process_gone(grandchild_pid)
+    finally:
+        with suppress(ProcessLookupError):
+            os.killpg(group_id, signal.SIGKILL)
+        _kill_process_if_alive(group_id)
+        _kill_process_if_alive(grandchild_pid)
+        with suppress(BaseException):
+            process.join(1)
+        with suppress(BaseException):
+            process.close()
+
+
+def test_heavy_shard_is_prestarted_but_never_acked_when_session_turns_live(
+    tmp_path: Path,
+) -> None:
+    from rquant.research_run_spec import ResourceClass
+    from rquant.resource_admission import AdmissionPolicy, TradingSession
+
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    child_pid_path = tmp_path / "heavy-cross-session-child.pid"
+    adapter_pid_path = tmp_path / "heavy-cross-session-adapter.pid"
+    spec = _nshape_compare_spec(hold_days=(1,)).model_copy(
+        update={"resource_class": ResourceClass.HEAVY}
+    )
+    claim = _short_claim_for_spec(spec)
+    claims.publish(claim)
+    snapshot_provider = SequenceResourceSnapshotProvider(
+        _healthy_resource_snapshot(session=TradingSession.POST_MARKET),
+        _healthy_resource_snapshot(session=TradingSession.MORNING),
+    )
+
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        reports=reports,
+        registry=SlowPidRegistry(pid_path=adapter_pid_path, delay_seconds=1),
+        resource_recheck_interval_seconds=0.01,
+        resource_snapshot_provider=snapshot_provider,
+        admission_policy_provider=StaticAdmissionPolicyProvider(
+            AdmissionPolicy(
+                allow_live_session=True,
+                max_live_shard_duration_ms=100,
+                max_live_backlog_age_seconds=10,
+                max_live_p95_latency_seconds=5,
+                min_available_memory_bytes=0,
+                min_available_disk_bytes=0,
+                max_io_pressure_pct=100,
+                max_cpu_load_pct=100,
+                max_expected_memory_bytes=8 * 1024**3,
+                max_expected_disk_bytes=50 * 1024**3,
+                max_expected_quota_units=0,
+                retry_delay_seconds=60,
+            )
+        ),
+        require_resource_admission=True,
+        isolation_session_initializer=RecordingSessionInitializer(child_pid_path),
+    )
+
+    started = time.monotonic()
+    result = worker.run_once()
+    elapsed = time.monotonic() - started
+
+    assert result.status == "stopped"
+    assert elapsed < 1.5
+    assert not adapter_pid_path.exists()
+    child_pid = int(child_pid_path.read_text(encoding="ascii"))
+    assert child_pid != os.getpid()
+    _assert_process_gone(child_pid)
+    assert not worker.sealed_bundle_path(claim).exists()
+
+
+def test_result_ready_before_scheduled_recheck_is_gated_before_serialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.resource_admission import AdmissionPolicy, TradingSession
+
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    pid_path = tmp_path / "pre-live-fast-result.pid"
+    prepared_marker = tmp_path / "result-was-serialized"
+    claim = _short_live_claim()
+    claims.publish(claim)
+    snapshot_provider = SequenceResourceSnapshotProvider(
+        _healthy_resource_snapshot(session=TradingSession.POST_MARKET),
+        _healthy_resource_snapshot(session=TradingSession.MORNING).model_copy(
+            update={"live_healthy": False}
+        ),
+    )
+
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        reports=reports,
+        registry=SlowPidRegistry(pid_path=pid_path, delay_seconds=0),
+        resource_recheck_interval_seconds=10,
+        resource_snapshot_provider=snapshot_provider,
+        admission_policy_provider=StaticAdmissionPolicyProvider(
+            AdmissionPolicy(
+                allow_live_session=True,
+                max_live_shard_duration_ms=100,
+                max_live_backlog_age_seconds=10,
+                max_live_p95_latency_seconds=5,
+                min_available_memory_bytes=0,
+                min_available_disk_bytes=0,
+                max_io_pressure_pct=100,
+                max_cpu_load_pct=100,
+                max_expected_memory_bytes=8 * 1024**3,
+                max_expected_disk_bytes=50 * 1024**3,
+                max_expected_quota_units=0,
+                retry_delay_seconds=60,
+            )
+        ),
+        require_resource_admission=True,
+    )
+    original_prepare = worker._prepare_result
+
+    def mark_prepare(*args: object, **kwargs: object):
+        prepared_marker.write_text("serialized", encoding="ascii")
+        return original_prepare(*args, **kwargs)
+
+    monkeypatch.setattr(worker, "_prepare_result", mark_prepare)
+
+    result = worker.run_once()
+
+    assert result.status == "stopped"
+    assert not prepared_marker.exists()
+    assert not worker.sealed_bundle_path(claim).exists()
+
+
+def test_resource_is_rechecked_after_result_receive_before_acceptance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.lab_worker as lab_worker
+    from rquant.resource_admission import AdmissionPolicy, TradingSession
+
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    claim = _short_live_claim()
+    claims.publish(claim)
+    prepared_marker = tmp_path / "post-receive-result-was-serialized"
+    snapshot_provider = FileSelectedResourceSnapshotProvider(
+        tmp_path / "post-receive-snapshot-selection",
+        _healthy_resource_snapshot(session=TradingSession.POST_MARKET),
+        _healthy_resource_snapshot(session=TradingSession.MORNING).model_copy(
+            update={"live_healthy": False}
+        ),
+    )
+    original_recv = lab_worker._recv_wire
+    outcome_received = threading.Event()
+
+    def degrade_after_outcome_receive(connection: object, **kwargs: object) -> object:
+        received = original_recv(connection, **kwargs)
+        if kwargs.get("model") is lab_worker._IsolatedExecutionWireOutcome:
+            outcome_received.set()
+        return received
+
+    monkeypatch.setattr(lab_worker, "_recv_wire", degrade_after_outcome_receive)
+
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        reports=reports,
+        registry=SlowPidRegistry(
+            pid_path=tmp_path / "post-receive-recheck.pid",
+            delay_seconds=0,
+        ),
+        resource_recheck_interval_seconds=10,
+        resource_snapshot_provider=snapshot_provider,
+        admission_policy_provider=StaticAdmissionPolicyProvider(
+            AdmissionPolicy(
+                allow_live_session=True,
+                max_live_shard_duration_ms=100,
+                max_live_backlog_age_seconds=10,
+                max_live_p95_latency_seconds=5,
+                min_available_memory_bytes=0,
+                min_available_disk_bytes=0,
+                max_io_pressure_pct=100,
+                max_cpu_load_pct=100,
+                max_expected_memory_bytes=8 * 1024**3,
+                max_expected_disk_bytes=50 * 1024**3,
+                max_expected_quota_units=0,
+                retry_delay_seconds=60,
+            )
+        ),
+        require_resource_admission=True,
+    )
+    original_evaluation = worker._resource_admission_evaluation
+
+    def degrade_before_post_receive_recheck(*args: object, **kwargs: object):
+        if outcome_received.is_set():
+            snapshot_provider.select(1)
+        return original_evaluation(*args, **kwargs)
+
+    monkeypatch.setattr(
+        worker,
+        "_resource_admission_evaluation",
+        degrade_before_post_receive_recheck,
+    )
+    original_prepare = worker._prepare_result
+
+    def mark_prepare(*args: object, **kwargs: object):
+        prepared_marker.write_text("serialized", encoding="ascii")
+        return original_prepare(*args, **kwargs)
+
+    monkeypatch.setattr(worker, "_prepare_result", mark_prepare)
+
+    result = worker.run_once()
+
+    assert result.status == "stopped"
+    assert snapshot_provider().live_healthy is False
+    assert not prepared_marker.exists()
+    assert not worker.sealed_bundle_path(claim).exists()
+
+
+def test_term_exited_group_leader_still_escalates_kill_to_descendant(
+    tmp_path: Path,
+) -> None:
+    from rquant.resource_admission import AdmissionPolicy, ResourceSnapshot, TradingSession
+
+    claims = LabClaimSpool(tmp_path / "claims")
+    child_pid_path = tmp_path / "term-exit-child.pid"
+    grandchild_pid_path = tmp_path / "term-ignore-grandchild.pid"
+    claim = _short_live_claim()
+    claims.publish(claim)
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        registry=TermExitingLeaderProcessTreeRegistry(
+            pid_path=child_pid_path,
+            grandchild_pid_path=grandchild_pid_path,
+        ),
+        resource_recheck_interval_seconds=0.01,
+        resource_snapshot_provider=StaticResourceSnapshotProvider(
+            ResourceSnapshot(
+                observed_at=NOW,
+                session=TradingSession.MORNING,
+                live_backlog_age_seconds=0,
+                live_p95_latency_seconds=0,
+                available_memory_bytes=16 * 1024**3,
+                available_disk_bytes=100 * 1024**3,
+                io_pressure_pct=0,
+                cpu_load_pct=0,
+                source_quota_remaining=0,
+                live_healthy=True,
+            )
+        ),
+        admission_policy_provider=StaticAdmissionPolicyProvider(
+            AdmissionPolicy(
+                allow_live_session=True,
+                max_live_shard_duration_ms=600,
+                max_live_backlog_age_seconds=10,
+                max_live_p95_latency_seconds=5,
+                min_available_memory_bytes=0,
+                min_available_disk_bytes=0,
+                max_io_pressure_pct=100,
+                max_cpu_load_pct=100,
+                max_expected_memory_bytes=8 * 1024**3,
+                max_expected_disk_bytes=50 * 1024**3,
+                max_expected_quota_units=0,
+                retry_delay_seconds=60,
+            )
+        ),
+        require_resource_admission=True,
+    )
+
+    grandchild_pid: int | None = None
+    try:
+        result = worker.run_once()
+        grandchild_pid = int(grandchild_pid_path.read_text(encoding="ascii"))
+
+        assert result.status == "stopped"
+        _assert_process_gone(grandchild_pid, timeout_seconds=0.5)
+    finally:
+        if grandchild_pid is not None:
+            _kill_process_if_alive(grandchild_pid)
+
+
+def test_successful_shard_cleans_up_descendants_before_publishing(
+    tmp_path: Path,
+) -> None:
+    claims = LabClaimSpool(tmp_path / "claims")
+    child_pid_path = tmp_path / "successful-child.pid"
+    grandchild_pid_path = tmp_path / "successful-grandchild.pid"
+    claim = _short_live_claim()
+    claims.publish(claim)
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        registry=SuccessfulProcessTreeRegistry(
+            pid_path=child_pid_path,
+            grandchild_pid_path=grandchild_pid_path,
+        ),
+    )
+
+    grandchild_pid: int | None = None
+    try:
+        result = worker.run_once()
+        grandchild_pid = int(grandchild_pid_path.read_text(encoding="ascii"))
+
+        assert result.status == "succeeded"
+        _assert_process_gone(int(child_pid_path.read_text(encoding="ascii")))
+        _assert_process_gone(grandchild_pid, timeout_seconds=0.5)
+    finally:
+        if grandchild_pid is not None:
+            _kill_process_if_alive(grandchild_pid)
+
+
+def test_isolated_shard_uses_spawn_and_cleans_its_process_group(tmp_path: Path) -> None:
+    claims = LabClaimSpool(tmp_path / "claims")
+    start_method_path = tmp_path / "start-method.txt"
+    claim = _short_live_claim()
+    claims.publish(claim)
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        registry=SpawnMethodRegistry(pid_path=start_method_path, delay_seconds=0),
+    )
+
+    result = worker.run_once()
+
+    assert result.status == "succeeded"
+    assert start_method_path.read_text(encoding="ascii") == "spawn"
+
+
+def test_unserializable_isolated_runtime_fails_closed_at_spawn_boundary(
+    tmp_path: Path,
+) -> None:
+    claims = LabClaimSpool(tmp_path / "claims")
+    claims.publish(_claim(_nshape_compare_spec(hold_days=(1,))))
+    worker = _worker(tmp_path, claims=claims, registry=UnserializableRegistry())
+
+    with pytest.raises(LabDaemonConfigurationError, match="spawn-serializable"):
+        worker.run_once()
+
+
+def test_blocked_resource_probe_cannot_delay_hard_deadline_cleanup(tmp_path: Path) -> None:
+    from rquant.resource_admission import TradingSession
+
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    child_pid_path = tmp_path / "blocked-probe-child.pid"
+    first_probe_marker = tmp_path / "first-probe.marker"
+    claim = _short_live_claim()
+    claims.publish(claim)
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        reports=reports,
+        registry=HungLiveRegistry(pid_path=child_pid_path),
+        resource_recheck_interval_seconds=0.01,
+        resource_probe_timeout_seconds=5,
+        resource_snapshot_provider=PermanentlyBlockingAfterFirstSnapshotProvider(
+            marker_path=first_probe_marker,
+            snapshot=_healthy_resource_snapshot(session=TradingSession.MORNING),
+            block_after_calls=2,
+        ),
+        admission_policy_provider=StaticAdmissionPolicyProvider(
+            _permissive_admission_policy(max_live_shard_duration_ms=100)
+        ),
+        require_resource_admission=True,
+    )
+
+    outcomes: list[object] = []
+    runner = threading.Thread(target=lambda: outcomes.append(worker.run_once()))
+    runner.start()
+    started_deadline = time.monotonic() + 3
+    while not child_pid_path.exists() and time.monotonic() < started_deadline:
+        time.sleep(0.01)
+    assert child_pid_path.exists()
+    live_started = time.monotonic()
+    runner.join(timeout=1)
+    elapsed = time.monotonic() - live_started
+
+    assert not runner.is_alive()
+    assert outcomes[0].status == "stopped"
+    assert elapsed < 0.6
+    _assert_process_gone(int(child_pid_path.read_text(encoding="ascii")))
+    assert all(child.name != "lab-resource-probe" for child in multiprocessing.active_children())
+
+
+def test_resource_probe_timeout_kills_spawned_descendant_process_group(tmp_path: Path) -> None:
+    probe_pid_path = tmp_path / "resource-probe.pid"
+    descendant_pid_path = tmp_path / "resource-probe-descendant.pid"
+    worker = _worker(
+        tmp_path,
+        resource_snapshot_provider=SpawnDescendantBlockingResourceSnapshotProvider(
+            probe_pid_path=probe_pid_path,
+            descendant_pid_path=descendant_pid_path,
+        ),
+        admission_policy_provider=StaticAdmissionPolicyProvider(_permissive_admission_policy()),
+        require_resource_admission=True,
+    )
+
+    try:
+        started = time.monotonic()
+        with pytest.raises(LabDaemonConfigurationError, match="timed out"):
+            worker._bounded_resource_snapshot(timeout_seconds=1.5)
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 2.2
+        assert probe_pid_path.is_file()
+        assert descendant_pid_path.is_file()
+        _assert_process_gone(int(probe_pid_path.read_text(encoding="ascii")))
+        _assert_process_gone(int(descendant_pid_path.read_text(encoding="ascii")))
+    finally:
+        for path in (probe_pid_path, descendant_pid_path):
+            if path.is_file():
+                _kill_process_if_alive(int(path.read_text(encoding="ascii")))
+
+
+def test_resource_probe_cleanup_reaps_child_when_initial_join_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from multiprocessing.process import BaseProcess
+
+    probe_pid_path = tmp_path / "join-failure-resource-probe.pid"
+    descendant_pid_path = tmp_path / "join-failure-resource-descendant.pid"
+    worker = _worker(
+        tmp_path,
+        resource_snapshot_provider=SpawnDescendantBlockingResourceSnapshotProvider(
+            probe_pid_path=probe_pid_path,
+            descendant_pid_path=descendant_pid_path,
+        ),
+        admission_policy_provider=StaticAdmissionPolicyProvider(_permissive_admission_policy()),
+        require_resource_admission=True,
+    )
+    original_join = BaseProcess.join
+    join_failed = False
+
+    def fail_first_nonblocking_join(
+        process: BaseProcess,
+        timeout: float | None = None,
+    ) -> None:
+        nonlocal join_failed
+        if process.name == "lab-resource-probe" and timeout == 0 and not join_failed:
+            join_failed = True
+            raise OSError("initial join denied")
+        original_join(process, timeout)
+
+    monkeypatch.setattr(BaseProcess, "join", fail_first_nonblocking_join)
+
+    try:
+        with pytest.raises(BaseExceptionGroup) as captured:
+            worker._bounded_resource_snapshot(timeout_seconds=1.5)
+
+        assert join_failed is True
+        errors: list[BaseException] = []
+
+        def collect(error: BaseException) -> None:
+            if isinstance(error, BaseExceptionGroup):
+                for nested in error.exceptions:
+                    collect(nested)
+                return
+            errors.append(error)
+
+        collect(captured.value)
+        assert any("initial join denied" in str(error) for error in errors)
+        assert probe_pid_path.is_file()
+        assert descendant_pid_path.is_file()
+        _assert_process_gone(int(probe_pid_path.read_text(encoding="ascii")))
+        _assert_process_gone(int(descendant_pid_path.read_text(encoding="ascii")))
+        assert all(
+            child.name != "lab-resource-probe" for child in multiprocessing.active_children()
+        )
+    finally:
+        for path in (probe_pid_path, descendant_pid_path):
+            if path.is_file():
+                _kill_process_if_alive(int(path.read_text(encoding="ascii")))
+
+
+def test_resource_probe_cleanup_retries_group_and_pid_kill_after_baseexceptions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from multiprocessing.process import BaseProcess
+
+    probe_pid_path = tmp_path / "kill-retry-resource-probe.pid"
+    descendant_pid_path = tmp_path / "kill-retry-resource-descendant.pid"
+    worker = _worker(
+        tmp_path,
+        resource_snapshot_provider=SpawnDescendantBlockingResourceSnapshotProvider(
+            probe_pid_path=probe_pid_path,
+            descendant_pid_path=descendant_pid_path,
+        ),
+        admission_policy_provider=StaticAdmissionPolicyProvider(_permissive_admission_policy()),
+        require_resource_admission=True,
+    )
+    original_killpg = os.killpg
+    original_process_kill = BaseProcess.kill
+    group_kill_attempts = 0
+    pid_kill_attempts = 0
+
+    def interrupt_first_group_kill(group_id: int, sig: int) -> None:
+        nonlocal group_kill_attempts
+        if sig == signal.SIGKILL:
+            group_kill_attempts += 1
+            if group_kill_attempts == 1:
+                raise KeyboardInterrupt("group kill interrupted")
+        original_killpg(group_id, sig)
+
+    def interrupt_first_pid_kill(process: BaseProcess) -> None:
+        nonlocal pid_kill_attempts
+        if process.name == "lab-resource-probe":
+            pid_kill_attempts += 1
+            if pid_kill_attempts == 1:
+                raise KeyboardInterrupt("pid kill interrupted")
+        original_process_kill(process)
+
+    monkeypatch.setattr(os, "killpg", interrupt_first_group_kill)
+    monkeypatch.setattr(BaseProcess, "kill", interrupt_first_pid_kill)
+
+    group_id: int | None = None
+    pids: tuple[int, ...] = ()
+    try:
+        with pytest.raises(BaseExceptionGroup) as captured:
+            worker._bounded_resource_snapshot(timeout_seconds=1.5)
+
+        assert probe_pid_path.is_file()
+        assert descendant_pid_path.is_file()
+        group_id = int(probe_pid_path.read_text(encoding="ascii"))
+        pids = (
+            group_id,
+            int(descendant_pid_path.read_text(encoding="ascii")),
+        )
+        assert group_kill_attempts >= 2
+        assert pid_kill_attempts >= 2
+        errors = _collect_base_exceptions(captured.value)
+        assert any("resource snapshot provider timed out" in str(error) for error in errors)
+        assert any("group kill interrupted" in str(error) for error in errors)
+        assert any("pid kill interrupted" in str(error) for error in errors)
+        for pid in pids:
+            _assert_process_gone(pid)
+        assert all(
+            child.name != "lab-resource-probe" for child in multiprocessing.active_children()
+        )
+    finally:
+        _cleanup_spawned_probe_processes(group_id=group_id, pids=pids)
+
+
+def test_isolated_shard_is_alive_baseexception_does_not_interrupt_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from multiprocessing.connection import Connection
+    from multiprocessing.process import BaseProcess
+
+    from rquant.resource_admission import TradingSession
+
+    claims = LabClaimSpool(tmp_path / "claims")
+    claim = _short_live_claim()
+    claims.publish(claim)
+    child_pid_path = tmp_path / "is-alive-baseexception-child.pid"
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        registry=HungLiveRegistry(pid_path=child_pid_path),
+    )
+    validated = worker._validate_closed_claim(claim)
+    original_connection_close = Connection.close
+    original_is_alive = BaseProcess.is_alive
+    parent_pid = os.getpid()
+    close_failed = False
+    is_alive_failed = False
+
+    def fail_first_parent_child_close(connection: Connection) -> None:
+        nonlocal close_failed
+        original_connection_close(connection)
+        if os.getpid() == parent_pid and not close_failed:
+            close_failed = True
+            raise KeyboardInterrupt("child connection cleanup interrupted")
+
+    def fail_first_is_alive(process: BaseProcess) -> bool:
+        nonlocal is_alive_failed
+        if (
+            process.name.startswith("lab-shard-")
+            and child_pid_path.is_file()
+            and not is_alive_failed
+        ):
+            is_alive_failed = True
+            raise BaseExceptionGroup(
+                "is_alive interrupted",
+                [KeyboardInterrupt("is_alive keyboard interrupt"), OSError("is_alive denied")],
+            )
+        return original_is_alive(process)
+
+    monkeypatch.setattr(Connection, "close", fail_first_parent_child_close)
+    monkeypatch.setattr(BaseProcess, "is_alive", fail_first_is_alive)
+
+    try:
+        with pytest.raises(BaseExceptionGroup) as captured:
+            worker._execute_shard_isolated(
+                claim,
+                validated,
+                runtime_code_sha="1" * 40,
+                hard_limit_seconds=1,
+                initial_session=TradingSession.CLOSED,
+            )
+
+        assert close_failed is True
+        assert is_alive_failed is True
+        errors = _collect_base_exceptions(captured.value)
+        assert any("child connection cleanup interrupted" in str(error) for error in errors)
+        assert any("is_alive keyboard interrupt" in str(error) for error in errors)
+        assert any("is_alive denied" in str(error) for error in errors)
+        if child_pid_path.is_file():
+            _assert_process_gone(int(child_pid_path.read_text(encoding="ascii")))
+        assert all(
+            not child.name.startswith("lab-shard-") for child in multiprocessing.active_children()
+        )
+    finally:
+        if child_pid_path.is_file():
+            _kill_process_if_alive(int(child_pid_path.read_text(encoding="ascii")))
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    (
+        "heartbeat_interval_seconds",
+        "resource_recheck_interval_seconds",
+        "resource_probe_timeout_seconds",
+        "receipt_timeout_seconds",
+        "quarantine_reconcile_interval_seconds",
+    ),
+)
+@pytest.mark.parametrize("value", (float("nan"), float("inf"), float("-inf")))
+def test_worker_rejects_non_finite_timing_inputs(
+    tmp_path: Path,
+    field_name: str,
+    value: float,
+) -> None:
+    with pytest.raises(ValueError, match="finite"):
+        _worker(tmp_path, **{field_name: value})
+
+
+def test_worker_canonicalizes_internal_monotonic_boundaries_to_integer_microseconds(
+    tmp_path: Path,
+) -> None:
+    worker = _worker(
+        tmp_path,
+        heartbeat_interval_seconds=0.00018000000000000004,
+        resource_recheck_interval_seconds=0.00018000000000000004,
+        resource_probe_timeout_seconds=0.00018000000000000004,
+        receipt_timeout_seconds=0.00018000000000000004,
+        quarantine_reconcile_interval_seconds=0.00018000000000000004,
+        monotonic_clock=lambda: 0.00018000000000000004,
+        isolation_monotonic_clock=lambda: 0.00018000000000000004,
+    )
+
+    assert worker.heartbeat_interval_microseconds == 180
+    assert worker.resource_recheck_interval_microseconds == 180
+    assert worker.resource_probe_timeout_microseconds == 180
+    assert worker.receipt_timeout_microseconds == 180
+    assert worker.quarantine_reconcile_interval_microseconds == 180
+    assert worker.monotonic_microseconds_clock() == 180
+    assert worker.isolation_monotonic_microseconds_clock() == 180
+
+
+@pytest.mark.parametrize("timeout_seconds", (float("nan"), float("inf"), float("-inf")))
+def test_bounded_resource_probe_rejects_non_finite_timeout_at_entry(
+    tmp_path: Path,
+    timeout_seconds: float,
+) -> None:
+    worker = _worker(
+        tmp_path,
+        resource_snapshot_provider=StaticResourceSnapshotProvider(_healthy_resource_snapshot()),
+        admission_policy_provider=StaticAdmissionPolicyProvider(_permissive_admission_policy()),
+        require_resource_admission=True,
+    )
+
+    with pytest.raises(ValueError, match="finite"):
+        worker._bounded_resource_snapshot(timeout_seconds=timeout_seconds)
+
+
+@pytest.mark.parametrize("hard_limit_seconds", (float("nan"), float("inf"), float("-inf")))
+def test_isolated_shard_rejects_non_finite_hard_limit_before_spawn(
+    tmp_path: Path,
+    hard_limit_seconds: float,
+) -> None:
+    from rquant.resource_admission import TradingSession
+
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    worker = _worker(tmp_path)
+    validated = worker._validate_closed_claim(claim)
+
+    with pytest.raises(ValueError, match="finite"):
+        worker._execute_shard_isolated(
+            claim,
+            validated,
+            runtime_code_sha="1" * 40,
+            hard_limit_seconds=hard_limit_seconds,
+            initial_session=TradingSession.MORNING,
+        )
+
+
+def test_fast_resource_probe_waits_for_parent_process_group_verification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.lab_worker as lab_worker
+
+    original_recv = lab_worker._recv_wire
+    readiness_received = threading.Event()
+    release_readiness = threading.Event()
+    child_observed: list[bool] = []
+
+    def delayed_readiness_recv(connection: object, **kwargs: object) -> object:
+        value = original_recv(connection, **kwargs)
+        if kwargs.get("model") is lab_worker._IsolationReadiness:
+            readiness_received.set()
+            if not release_readiness.wait(2):
+                raise TimeoutError("test did not release resource readiness")
+        return value
+
+    def verify_child_then_release() -> None:
+        if not readiness_received.wait(2):
+            return
+        child_observed.append(
+            any(child.name == "lab-resource-probe" for child in multiprocessing.active_children())
+        )
+        release_readiness.set()
+
+    monkeypatch.setattr(lab_worker, "_recv_wire", delayed_readiness_recv)
+    worker = _worker(
+        tmp_path,
+        resource_probe_timeout_seconds=1.5,
+        resource_snapshot_provider=StaticResourceSnapshotProvider(_healthy_resource_snapshot()),
+        admission_policy_provider=StaticAdmissionPolicyProvider(_permissive_admission_policy()),
+        require_resource_admission=True,
+    )
+    verifier = threading.Thread(target=verify_child_then_release)
+    verifier.start()
+
+    try:
+        snapshot = worker._bounded_resource_snapshot(timeout_seconds=1.5)
+    finally:
+        release_readiness.set()
+        verifier.join()
+
+    assert snapshot == _healthy_resource_snapshot()
+    assert child_observed == [True]
+    assert all(child.name != "lab-resource-probe" for child in multiprocessing.active_children())
+
+
+def test_deadline_crossed_while_store_opens_never_executes_adapter(tmp_path: Path) -> None:
+    from rquant.resource_admission import TradingSession
+
+    claims = LabClaimSpool(tmp_path / "claims")
+    execution_marker = tmp_path / "adapter-executed.marker"
+    claim = _short_live_claim()
+    claims.publish(claim)
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        registry=SlowPidRegistry(pid_path=execution_marker, delay_seconds=0),
+        exploratory_store_factory=SlowStoreFactory(delay_seconds=0.2),
+        resource_snapshot_provider=StaticResourceSnapshotProvider(
+            _healthy_resource_snapshot(session=TradingSession.MORNING)
+        ),
+        admission_policy_provider=StaticAdmissionPolicyProvider(
+            _permissive_admission_policy(max_live_shard_duration_ms=100)
+        ),
+        require_resource_admission=True,
+    )
+
+    result = worker.run_once()
+
+    assert result.status == "stopped"
+    assert not execution_marker.exists()
+
+
+def test_cleanup_failure_preserves_original_deadline_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.resource_admission import TradingSession
+
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    claim = _short_live_claim()
+    claims.publish(claim)
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        reports=reports,
+        registry=HungLiveRegistry(pid_path=tmp_path / "cleanup-failure-child.pid"),
+        resource_snapshot_provider=StaticResourceSnapshotProvider(
+            _healthy_resource_snapshot(session=TradingSession.MORNING)
+        ),
+        admission_policy_provider=StaticAdmissionPolicyProvider(
+            _permissive_admission_policy(max_live_shard_duration_ms=600)
+        ),
+        require_resource_admission=True,
+    )
+    original_terminate = worker._terminate_isolated_process
+
+    def terminate_then_fail(*args: object, **kwargs: object) -> None:
+        original_terminate(*args, **kwargs)
+        process = args[0]
+        if getattr(process, "name", "").startswith("lab-shard-"):
+            raise OSError("cleanup denied")
+
+    monkeypatch.setattr(worker, "_terminate_isolated_process", terminate_then_fail)
+
+    result = worker.run_once()
+
+    assert result.status == "failed"
+    failure = _reports(reports)[-1].body
+    assert isinstance(failure, LabShardFailed)
+    assert "hard live execution limit" in failure.failure_json
+    assert "cleanup denied" in failure.failure_json
+
+
+def test_cleanup_failure_preserves_original_worker_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims.publish(claim)
+
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        reports=reports,
+        registry=FailingWorkerRegistry(),
+    )
+    original_terminate = worker._terminate_isolated_process
+
+    def terminate_then_fail(*args: object, **kwargs: object) -> None:
+        original_terminate(*args, **kwargs)
+        process = args[0]
+        if getattr(process, "name", "").startswith("lab-shard-"):
+            raise OSError("cleanup denied")
+
+    monkeypatch.setattr(worker, "_terminate_isolated_process", terminate_then_fail)
+
+    result = worker.run_once()
+
+    assert result.status == "failed"
+    failure = _reports(reports)[-1].body
+    assert isinstance(failure, LabShardFailed)
+    assert "worker exploded" in failure.failure_json
+    assert "cleanup denied" in failure.failure_json
+
+
+def test_resource_probe_close_failure_preserves_original_provider_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from multiprocessing.process import BaseProcess
+
+    worker = _worker(
+        tmp_path,
+        resource_snapshot_provider=FailingResourceSnapshotProvider("probe exploded"),
+        admission_policy_provider=StaticAdmissionPolicyProvider(_permissive_admission_policy()),
+        require_resource_admission=True,
+    )
+    original_close = BaseProcess.close
+
+    def close_then_fail(process: BaseProcess) -> None:
+        original_close(process)
+        if process.name == "lab-resource-probe":
+            raise OSError("probe close denied")
+
+    monkeypatch.setattr(BaseProcess, "close", close_then_fail)
+
+    with pytest.raises(BaseExceptionGroup) as captured:
+        worker._bounded_resource_snapshot(timeout_seconds=1)
+
+    messages = tuple(str(error) for error in _collect_base_exceptions(captured.value))
+    assert any("probe exploded" in message for message in messages)
+    assert any("probe close denied" in message for message in messages)
+
+
+@pytest.mark.parametrize(
+    "close_failure",
+    [OSError("child connection close denied"), KeyboardInterrupt("child connection close aborted")],
+    ids=("oserror", "baseexception"),
+)
+def test_isolated_shard_child_connection_close_failure_cleans_started_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    close_failure: BaseException,
+) -> None:
+    from multiprocessing.connection import Connection
+
+    from rquant.resource_admission import TradingSession
+
+    claims = LabClaimSpool(tmp_path / "claims")
+    claim = _short_live_claim()
+    claims.publish(claim)
+    child_pid_path = tmp_path / "close-failure-child.pid"
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        registry=SlowPidRegistry(pid_path=child_pid_path, delay_seconds=0),
+    )
+    validated = worker._validate_closed_claim(claim)
+    original_close = Connection.close
+    parent_pid = os.getpid()
+    raised = False
+
+    def close_then_fail(connection: Connection) -> None:
+        nonlocal raised
+        original_close(connection)
+        if os.getpid() == parent_pid and not raised:
+            raised = True
+            raise close_failure
+
+    monkeypatch.setattr(Connection, "close", close_then_fail)
+
+    try:
+        if isinstance(close_failure, Exception):
+            control = worker._execute_shard_isolated(
+                claim,
+                validated,
+                runtime_code_sha="1" * 40,
+                hard_limit_seconds=1,
+                initial_session=TradingSession.CLOSED,
+            )
+            assert control.resource_error is not None
+            errors = _collect_base_exceptions(control.resource_error)
+        else:
+            with pytest.raises(BaseExceptionGroup) as captured:
+                worker._execute_shard_isolated(
+                    claim,
+                    validated,
+                    runtime_code_sha="1" * 40,
+                    hard_limit_seconds=1,
+                    initial_session=TradingSession.CLOSED,
+                )
+            errors = _collect_base_exceptions(captured.value)
+
+        assert raised is True
+        assert any("child connection close" in str(error) for error in errors)
+        assert child_pid_path.is_file()
+        _assert_process_gone(int(child_pid_path.read_text(encoding="ascii")))
+        assert all(
+            not child.name.startswith("lab-shard-") for child in multiprocessing.active_children()
+        )
+    finally:
+        if child_pid_path.is_file():
+            _kill_process_if_alive(int(child_pid_path.read_text(encoding="ascii")))
+
+
+def test_isolated_shard_preserves_child_close_and_cleanup_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from multiprocessing.connection import Connection
+    from multiprocessing.process import BaseProcess
+
+    from rquant.resource_admission import TradingSession
+
+    claims = LabClaimSpool(tmp_path / "claims")
+    claim = _short_live_claim()
+    claims.publish(claim)
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        registry=SlowPidRegistry(pid_path=tmp_path / "double-failure-child.pid", delay_seconds=0),
+    )
+    validated = worker._validate_closed_claim(claim)
+    original_connection_close = Connection.close
+    original_process_close = BaseProcess.close
+    parent_pid = os.getpid()
+    child_close_failed = False
+
+    def fail_first_parent_child_close(connection: Connection) -> None:
+        nonlocal child_close_failed
+        original_connection_close(connection)
+        if os.getpid() == parent_pid and not child_close_failed:
+            child_close_failed = True
+            raise OSError("child pipe close denied")
+
+    def fail_process_cleanup(process: BaseProcess) -> None:
+        original_process_close(process)
+        if process.name.startswith("lab-shard-"):
+            raise OSError("process sentinel close denied")
+
+    monkeypatch.setattr(Connection, "close", fail_first_parent_child_close)
+    monkeypatch.setattr(BaseProcess, "close", fail_process_cleanup)
+
+    control = worker._execute_shard_isolated(
+        claim,
+        validated,
+        runtime_code_sha="1" * 40,
+        hard_limit_seconds=1,
+        initial_session=TradingSession.CLOSED,
+    )
+
+    assert control.resource_error is not None
+    messages = tuple(str(error) for error in _collect_base_exceptions(control.resource_error))
+    assert any("child pipe close denied" in message for message in messages)
+    assert any("process sentinel close denied" in message for message in messages)
+    assert all(
+        not child.name.startswith("lab-shard-") for child in multiprocessing.active_children()
+    )
+
+
+def test_setsid_failure_fails_closed_before_adapter_execution(
+    tmp_path: Path,
+) -> None:
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    execution_marker = tmp_path / "adapter-executed.pid"
+    claim = _short_live_claim()
+    claims.publish(claim)
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        reports=reports,
+        registry=SlowPidRegistry(pid_path=execution_marker, delay_seconds=0),
+        isolation_session_initializer=FailingSessionInitializer(),
+    )
+
+    with pytest.raises(LabDaemonConfigurationError, match="setsid denied"):
+        worker.run_once()
+
+    assert not execution_marker.exists()
+    assert reports.pending() == ()
+    assert not worker.sealed_bundle_path(claim).exists()
+
+
+def test_resource_retry_cache_prunes_revoked_replaced_and_consumed_claims(
+    tmp_path: Path,
+) -> None:
+    from rquant.resource_admission import AdmissionPolicy, TradingSession
+
+    claims = LabClaimSpool(tmp_path / "claims")
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims.publish(claim)
+    snapshot_provider = MutableResourceSnapshotProvider(
+        _healthy_resource_snapshot(session=TradingSession.MORNING),
+        _healthy_resource_snapshot(session=TradingSession.POST_MARKET),
+    )
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        resource_snapshot_provider=snapshot_provider,
+        admission_policy_provider=StaticAdmissionPolicyProvider(
+            AdmissionPolicy(
+                allow_live_session=False,
+                max_live_backlog_age_seconds=10,
+                max_live_p95_latency_seconds=5,
+                min_available_memory_bytes=0,
+                min_available_disk_bytes=0,
+                max_io_pressure_pct=100,
+                max_cpu_load_pct=100,
+                max_expected_memory_bytes=8 * 1024**3,
+                max_expected_disk_bytes=50 * 1024**3,
+                max_expected_quota_units=0,
+                retry_delay_seconds=60,
+            )
+        ),
+        require_resource_admission=True,
+    )
+
+    assert worker.run_once().status == "deferred"
+    assert set(worker._resource_retry_at) == {claim.claim_token}
+    claims.revoke(claim, reason="scheduler cancelled deferred claim")
+
+    assert worker.run_once().status == "idle"
+    assert worker._resource_retry_at == {}
+
+    replacement = _retry_claim(claim)
+    worker._resource_retry_at[claim.claim_token] = NOW + timedelta(hours=1)
+    claims.publish(replacement)
+    assert worker.run_once().status == "deferred"
+    assert claim.claim_token not in worker._resource_retry_at
+    assert replacement.claim_token in worker._resource_retry_at
+    snapshot_provider.select(1)
+    worker._resource_retry_at[replacement.claim_token] = NOW - timedelta(seconds=1)
+
+    assert worker.run_once().status == "succeeded"
+    assert replacement.claim_token not in worker._resource_retry_at
+
+
+def test_resource_degradation_after_atomic_publish_rolls_back_before_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.resource_admission import AdmissionPolicy, TradingSession
+
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims.publish(claim)
+    snapshot_provider = MutableResourceSnapshotProvider(
+        _healthy_resource_snapshot(session=TradingSession.MORNING),
+        _healthy_resource_snapshot(session=TradingSession.MORNING).model_copy(
+            update={"live_healthy": False}
+        ),
+    )
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        reports=reports,
+        resource_snapshot_provider=snapshot_provider,
+        admission_policy_provider=StaticAdmissionPolicyProvider(
+            AdmissionPolicy(
+                allow_live_session=True,
+                max_live_shard_duration_ms=10**9,
+                max_live_backlog_age_seconds=10,
+                max_live_p95_latency_seconds=5,
+                min_available_memory_bytes=0,
+                min_available_disk_bytes=0,
+                max_io_pressure_pct=100,
+                max_cpu_load_pct=100,
+                max_expected_memory_bytes=8 * 1024**3,
+                max_expected_disk_bytes=50 * 1024**3,
+                max_expected_quota_units=0,
+                retry_delay_seconds=60,
+            )
+        ),
+        require_resource_admission=True,
+    )
+    original_publish = worker._publish_candidate
+
+    def publish_then_degrade(*args: object, **kwargs: object):
+        bundle = original_publish(*args, **kwargs)
+        snapshot_provider.select(1)
+        return bundle
+
+    monkeypatch.setattr(worker, "_publish_candidate", publish_then_degrade)
+
+    result = worker.run_once()
+
+    assert result.status == "stopped"
+    assert not worker.sealed_bundle_path(claim).exists()
+    assert isinstance(_reports(reports)[-1].body, LabWorkerStopped)
+    assert not any(isinstance(report.body, LabShardSucceeded) for report in _reports(reports))
+
+
+def test_post_publish_admission_timeout_rolls_back_without_false_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.resource_admission import AdmissionPolicy, TradingSession
+
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims.publish(claim)
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        reports=reports,
+        resource_snapshot_provider=StaticResourceSnapshotProvider(
+            _healthy_resource_snapshot(session=TradingSession.MORNING)
+        ),
+        admission_policy_provider=StaticAdmissionPolicyProvider(
+            AdmissionPolicy(
+                allow_live_session=True,
+                max_live_shard_duration_ms=10**9,
+                max_live_backlog_age_seconds=10,
+                max_live_p95_latency_seconds=5,
+                min_available_memory_bytes=0,
+                min_available_disk_bytes=0,
+                max_io_pressure_pct=100,
+                max_cpu_load_pct=100,
+                max_expected_memory_bytes=8 * 1024**3,
+                max_expected_disk_bytes=50 * 1024**3,
+                max_expected_quota_units=0,
+                retry_delay_seconds=60,
+            )
+        ),
+        require_resource_admission=True,
+    )
+    published = threading.Event()
+    prestarted_stages: list[object] = []
+    original_publish = worker._publish_candidate
+    original_evaluation = worker._resource_admission_evaluation
+    original_prestart = worker._prestart_authority_stage
+
+    def publish_then_mark(*args: object, **kwargs: object):
+        bundle = original_publish(*args, **kwargs)
+        published.set()
+        return bundle
+
+    def timeout_only_after_publish(*args: object, **kwargs: object):
+        if published.is_set():
+            raise TimeoutError("injected post-publish admission timeout")
+        return original_evaluation(*args, **kwargs)
+
+    def record_prestart(*args: object, **kwargs: object):
+        stage = original_prestart(*args, **kwargs)
+        prestarted_stages.append(stage)
+        return stage
+
+    monkeypatch.setattr(worker, "_publish_candidate", publish_then_mark)
+    monkeypatch.setattr(worker, "_resource_admission_evaluation", timeout_only_after_publish)
+    monkeypatch.setattr(worker, "_prestart_authority_stage", record_prestart)
+
+    result = worker.run_once()
+
+    assert result.status == "failed"
+    assert not worker.sealed_bundle_path(claim).exists()
+    assert isinstance(_reports(reports)[-1].body, LabShardFailed)
+    assert not any(isinstance(report.body, LabShardSucceeded) for report in _reports(reports))
+    assert worker._pending_success is None
+    assert len(prestarted_stages) == 1
+    stage = prestarted_stages[0]
+    assert stage.cleanup_complete.is_set()
+    assert stage.startup_complete.is_set()
+    assert stage.startup_thread is not None
+    assert not stage.startup_thread.is_alive()
+    assert stage.child is None
+    assert stage.owner == "closed"
+    assert all(
+        child.name != "lab-resource-authority" for child in multiprocessing.active_children()
+    )
+
+
+def test_prestarted_authority_cancel_during_handoff_reaps_owned_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.lab_worker as lab_worker
+
+    worker = _worker(
+        tmp_path,
+        resource_snapshot_provider=StaticResourceSnapshotProvider(_healthy_resource_snapshot()),
+        admission_policy_provider=StaticAdmissionPolicyProvider(_permissive_admission_policy()),
+        require_resource_admission=True,
+    )
+    child_ready = multiprocessing.get_context("spawn").Event()
+    child_pid_path = tmp_path / "prestarted-authority-handoff.pid"
+    child_pid: list[int] = []
+    handoff_entered = threading.Event()
+    release_handoff = threading.Event()
+    cancel_finished = threading.Event()
+
+    def start_child(**_kwargs: object):
+        process = multiprocessing.get_context("spawn").Process(
+            target=_ignore_term_forever,
+            args=(child_pid_path, child_ready),
+            name="lab-prestarted-authority-handoff",
+            daemon=False,
+        )
+        process.start()
+        assert process.pid is not None
+        assert child_ready.wait(timeout=2)
+        receiver, sender = multiprocessing.Pipe(duplex=False)
+        sender.close()
+        child_pid.append(process.pid)
+        return lab_worker._WireChild(
+            process=process,
+            connection=receiver,
+            group_id=process.pid,
+            address="test-prestarted-authority-handoff",
+        )
+
+    def pause_before_handoff(_stage: object, _child: object) -> None:
+        handoff_entered.set()
+        assert release_handoff.wait(timeout=2)
+
+    monkeypatch.setattr(worker, "_start_wire_child", start_child)
+    monkeypatch.setattr(
+        worker,
+        "_before_prestarted_authority_handoff_for_test",
+        pause_before_handoff,
+    )
+    stage = worker._prestart_authority_stage(
+        operation="admission",
+        spec=None,
+        admission_request=None,
+        deadline_microseconds=lab_worker._monotonic_microseconds() + 2_000_000,
+    )
+    canceller = threading.Thread(
+        target=lambda: (
+            worker._cancel_prestarted_authority_stage(stage, operation="admission"),
+            cancel_finished.set(),
+        )
+    )
+    try:
+        assert handoff_entered.wait(timeout=2)
+        canceller.start()
+        assert stage.cancelled.wait(timeout=2)
+        release_handoff.set()
+        assert cancel_finished.wait(timeout=2)
+        canceller.join(timeout=2)
+
+        assert stage.handoff.is_set()
+        assert stage.cleanup_complete.is_set()
+        assert stage.startup_complete.is_set()
+        assert stage.startup_thread is not None
+        assert not stage.startup_thread.is_alive()
+        assert stage.child is None
+        assert stage.owner == "closed"
+        assert child_pid
+        _assert_process_gone(child_pid[0])
+        assert all(
+            child.name != "lab-prestarted-authority-handoff"
+            for child in multiprocessing.active_children()
+        )
+    finally:
+        release_handoff.set()
+        worker._cancel_prestarted_authority_stage(stage, operation="admission")
+        canceller.join(timeout=2)
+        if child_pid:
+            _kill_process_if_alive(child_pid[0])
+
+
+def test_prestarted_authority_cancel_before_child_start_is_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.lab_worker as lab_worker
+
+    worker = _worker(
+        tmp_path,
+        resource_snapshot_provider=StaticResourceSnapshotProvider(_healthy_resource_snapshot()),
+        admission_policy_provider=StaticAdmissionPolicyProvider(_permissive_admission_policy()),
+        require_resource_admission=True,
+    )
+    startup_entered = threading.Event()
+    release_startup = threading.Event()
+    cancel_finished = threading.Event()
+    start_calls: list[object] = []
+
+    def pause_before_start(_stage: object) -> None:
+        startup_entered.set()
+        assert release_startup.wait(timeout=2)
+
+    monkeypatch.setattr(
+        worker,
+        "_before_prestarted_authority_start_for_test",
+        pause_before_start,
+    )
+    monkeypatch.setattr(
+        worker,
+        "_start_wire_child",
+        lambda **kwargs: start_calls.append(kwargs),
+    )
+    stage = worker._prestart_authority_stage(
+        operation="admission",
+        spec=None,
+        admission_request=None,
+        deadline_microseconds=lab_worker._monotonic_microseconds() + 2_000_000,
+    )
+    canceller = threading.Thread(
+        target=lambda: (
+            worker._cancel_prestarted_authority_stage(stage, operation="admission"),
+            cancel_finished.set(),
+        )
+    )
+    try:
+        assert startup_entered.wait(timeout=2)
+        canceller.start()
+        assert stage.cancelled.wait(timeout=2)
+        release_startup.set()
+        assert cancel_finished.wait(timeout=2)
+        canceller.join(timeout=2)
+
+        assert start_calls == []
+        assert stage.handoff.is_set()
+        assert stage.cleanup_complete.is_set()
+        assert stage.startup_complete.is_set()
+        assert stage.startup_thread is not None
+        assert not stage.startup_thread.is_alive()
+        assert stage.child is None
+        assert stage.owner == "closed"
+    finally:
+        release_startup.set()
+        worker._cancel_prestarted_authority_stage(stage, operation="admission")
+        canceller.join(timeout=2)
+
+
+def test_prestarted_authority_start_failure_completes_terminal_events(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.lab_worker as lab_worker
+
+    worker = _worker(
+        tmp_path,
+        resource_snapshot_provider=StaticResourceSnapshotProvider(_healthy_resource_snapshot()),
+        admission_policy_provider=StaticAdmissionPolicyProvider(_permissive_admission_policy()),
+        require_resource_admission=True,
+    )
+    monkeypatch.setattr(
+        worker,
+        "_start_wire_child",
+        lambda **_kwargs: (_ for _ in ()).throw(OSError("injected authority start failure")),
+    )
+    stage = worker._prestart_authority_stage(
+        operation="admission",
+        spec=None,
+        admission_request=None,
+        deadline_microseconds=lab_worker._monotonic_microseconds() + 2_000_000,
+    )
+
+    assert stage.handoff.wait(timeout=2)
+    worker._cancel_prestarted_authority_stage(stage, operation="admission")
+    worker._cancel_prestarted_authority_stage(stage, operation="admission")
+
+    assert stage.cleanup_complete.is_set()
+    assert stage.startup_complete.is_set()
+    assert stage.startup_thread is not None
+    assert not stage.startup_thread.is_alive()
+    assert isinstance(stage.error, OSError)
+    assert stage.child is None
+    assert stage.owner == "closed"
+
+
+def test_prestarted_authority_cancel_after_handoff_is_idempotent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.lab_worker as lab_worker
+
+    worker = _worker(
+        tmp_path,
+        resource_snapshot_provider=StaticResourceSnapshotProvider(_healthy_resource_snapshot()),
+        admission_policy_provider=StaticAdmissionPolicyProvider(_permissive_admission_policy()),
+        require_resource_admission=True,
+    )
+    child_ready = multiprocessing.get_context("spawn").Event()
+    child_pid_path = tmp_path / "prestarted-authority-after-handoff.pid"
+    child_pid: list[int] = []
+    close_calls: list[object] = []
+    original_close = worker._close_managed_authority_child
+
+    def start_child(**_kwargs: object):
+        process = multiprocessing.get_context("spawn").Process(
+            target=_ignore_term_forever,
+            args=(child_pid_path, child_ready),
+            name="lab-prestarted-authority-after-handoff",
+            daemon=False,
+        )
+        process.start()
+        assert process.pid is not None
+        assert child_ready.wait(timeout=2)
+        receiver, sender = multiprocessing.Pipe(duplex=False)
+        sender.close()
+        child_pid.append(process.pid)
+        return lab_worker._WireChild(
+            process=process,
+            connection=receiver,
+            group_id=process.pid,
+            address="test-prestarted-authority-after-handoff",
+        )
+
+    def record_close(*args: object, **kwargs: object) -> object:
+        close_calls.append(args[0])
+        return original_close(*args, **kwargs)
+
+    monkeypatch.setattr(worker, "_start_wire_child", start_child)
+    monkeypatch.setattr(worker, "_close_managed_authority_child", record_close)
+    stage = worker._prestart_authority_stage(
+        operation="admission",
+        spec=None,
+        admission_request=None,
+        deadline_microseconds=lab_worker._monotonic_microseconds() + 2_000_000,
+    )
+    try:
+        assert stage.handoff.wait(timeout=2)
+        worker._cancel_prestarted_authority_stage(stage, operation="admission")
+        worker._cancel_prestarted_authority_stage(stage, operation="admission")
+
+        assert stage.cleanup_complete.is_set()
+        assert stage.startup_complete.is_set()
+        assert stage.startup_thread is not None
+        assert not stage.startup_thread.is_alive()
+        assert stage.child is None
+        assert stage.owner == "closed"
+        assert len(close_calls) == 1
+        assert child_pid
+        _assert_process_gone(child_pid[0])
+        assert all(
+            child.name != "lab-prestarted-authority-after-handoff"
+            for child in multiprocessing.active_children()
+        )
+    finally:
+        worker._cancel_prestarted_authority_stage(stage, operation="admission")
+        if child_pid:
+            _kill_process_if_alive(child_pid[0])
+
+
+def test_managed_authority_reaper_retains_failed_handle_until_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.lab_worker as lab_worker
+
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.pid = 74123
+            self.join_calls = 0
+            self.close_calls = 0
+
+        def join(self, *, timeout: float) -> None:
+            del timeout
+            self.join_calls += 1
+
+        def close(self) -> None:
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise OSError("injected process handle close failure")
+
+    class FakeConnection:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    worker = _worker(tmp_path)
+    process = FakeProcess()
+    child = lab_worker._WireChild(
+        process=process,
+        connection=FakeConnection(),
+        group_id=74123,
+        address="managed-authority-retry",
+    )
+    managed = worker._register_authority_child(child, operation="admission", owner="direct")
+    terminate_calls = 0
+
+    def no_op_terminate(*_args: object, **_kwargs: object) -> None:
+        nonlocal terminate_calls
+        terminate_calls += 1
+
+    monkeypatch.setattr(worker, "_terminate_isolated_process", no_op_terminate)
+
+    first_error = worker._close_managed_authority_child(
+        managed,
+        owner="direct",
+        label="test authority",
+    )
+
+    assert isinstance(first_error, OSError)
+    assert managed.owner == "reap_pending"
+    assert managed.cleanup_retry_count == 1
+    assert managed.cleanup_error is first_error
+    assert not managed.cleanup_complete.is_set()
+    assert managed.os_process_exited_verified
+    assert managed.ipc_closed
+    assert not managed.process_handle_closed
+    assert process.join_calls == 1
+    assert terminate_calls == 1
+    with worker._managed_authority_children_lock:
+        assert worker._managed_authority_children == {74123: managed}
+
+    worker.close()
+
+    assert process.close_calls == 2
+    assert process.join_calls == 1
+    assert terminate_calls == 1
+    assert managed.owner == "closed"
+    assert managed.cleanup_complete.is_set()
+    with worker._managed_authority_children_lock:
+        assert worker._managed_authority_children == {}
+
+
+def test_managed_authority_reaper_permanent_failure_keeps_handle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.lab_worker as lab_worker
+
+    class FakeProcess:
+        pid = 74124
+
+        def join(self, *, timeout: float) -> None:
+            del timeout
+
+        def close(self) -> None:
+            return None
+
+    class FailingConnection:
+        closed = False
+
+        def close(self) -> None:
+            raise OSError("persistent IPC cleanup failure")
+
+    worker = _worker(tmp_path)
+    child = lab_worker._WireChild(
+        process=FakeProcess(),
+        connection=FailingConnection(),
+        group_id=74124,
+        address="managed-authority-permanent-failure",
+    )
+    managed = worker._register_authority_child(child, operation="admission", owner="direct")
+    monkeypatch.setattr(worker, "_terminate_isolated_process", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(lab_worker, "_AUTHORITY_CHILD_CLEANUP_BUDGET_MICROSECONDS", 1)
+
+    with pytest.raises(BaseExceptionGroup, match="authority child cleanup failed"):
+        worker.close()
+
+    assert managed.owner == "reap_pending"
+    assert managed.cleanup_retry_count >= 1
+    assert not managed.cleanup_complete.is_set()
+    assert managed.os_process_exited_verified
+    assert not managed.ipc_closed
+    assert managed.process_handle_closed
+    assert managed.last_errors
+    with worker._managed_authority_children_lock:
+        assert worker._managed_authority_children == {74124: managed}
+
+
+def test_managed_authority_reaper_converges_after_ipc_close_error(
+    tmp_path: Path,
+) -> None:
+    import rquant.lab_worker as lab_worker
+
+    class CloseThenRaise:
+        def __init__(self, connection: object) -> None:
+            self.connection = connection
+
+        @property
+        def closed(self) -> bool:
+            return bool(self.connection.closed)
+
+        def close(self) -> None:
+            self.connection.close()
+            raise OSError("injected IPC close diagnostic")
+
+    worker = _worker(tmp_path)
+    ready = multiprocessing.get_context("spawn").Event()
+    pid_path = tmp_path / "managed-authority-ipc-error.pid"
+    process = multiprocessing.get_context("spawn").Process(
+        target=_ignore_term_forever,
+        args=(pid_path, ready),
+        name="lab-resource-authority",
+        daemon=False,
+    )
+    process.start()
+    assert process.pid is not None
+    process_id = process.pid
+    assert ready.wait(timeout=2)
+    receiver, sender = multiprocessing.Pipe(duplex=False)
+    sender.close()
+    managed = worker._register_authority_child(
+        lab_worker._WireChild(
+            process=process,
+            connection=CloseThenRaise(receiver),
+            group_id=process_id,
+            address="managed-authority-ipc-error",
+        ),
+        operation="admission",
+        owner="direct",
+    )
+
+    try:
+        first_error = worker._close_managed_authority_child(
+            managed,
+            owner="direct",
+            label="test authority",
+        )
+
+        assert isinstance(first_error, OSError)
+        assert managed.os_process_exited_verified
+        assert managed.ipc_closed
+        assert managed.process_handle_closed
+        assert managed.cleanup_complete.is_set()
+        assert managed.owner == "closed"
+        with worker._managed_authority_children_lock:
+            assert worker._managed_authority_children == {}
+
+        worker.close()
+        _assert_process_gone(process_id)
+        assert all(child.pid != process_id for child in multiprocessing.active_children())
+    finally:
+        _kill_process_if_alive(process_id)
+
+
+def test_managed_authority_reaper_marks_closed_handle_before_post_close_interrupt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.lab_worker as lab_worker
+
+    worker = _worker(tmp_path)
+    ready = multiprocessing.get_context("spawn").Event()
+    pid_path = tmp_path / "managed-authority-close-interrupt.pid"
+    process = multiprocessing.get_context("spawn").Process(
+        target=_ignore_term_forever,
+        args=(pid_path, ready),
+        name="lab-resource-authority",
+        daemon=False,
+    )
+    process.start()
+    assert process.pid is not None
+    process_id = process.pid
+    assert ready.wait(timeout=2)
+    receiver, sender = multiprocessing.Pipe(duplex=False)
+    sender.close()
+    managed = worker._register_authority_child(
+        lab_worker._WireChild(
+            process=process,
+            connection=receiver,
+            group_id=process_id,
+            address="managed-authority-close-interrupt",
+        ),
+        operation="admission",
+        owner="direct",
+    )
+    monkeypatch.setattr(
+        worker,
+        "_after_managed_authority_process_close_for_test",
+        lambda _managed: (_ for _ in ()).throw(KeyboardInterrupt("post-close interrupt")),
+    )
+
+    try:
+        first_error = worker._close_managed_authority_child(
+            managed,
+            owner="direct",
+            label="test authority",
+        )
+
+        assert isinstance(first_error, KeyboardInterrupt)
+        assert managed.os_process_exited_verified
+        assert managed.ipc_closed
+        assert managed.process_handle_closed
+        assert managed.cleanup_complete.is_set()
+        assert managed.owner == "closed"
+        with worker._managed_authority_children_lock:
+            assert worker._managed_authority_children == {}
+
+        worker.close()
+        _assert_process_gone(process_id)
+        assert all(child.pid != process_id for child in multiprocessing.active_children())
+    finally:
+        _kill_process_if_alive(process_id)
+
+
+@pytest.mark.parametrize(
+    "primary_error",
+    (RuntimeError("primary"), TimeoutError("primary timeout"), KeyboardInterrupt("primary stop")),
+)
+def test_run_once_preserves_primary_before_cleanup_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    primary_error: BaseException,
+) -> None:
+    worker = _worker(tmp_path)
+    reaper_calls = 0
+
+    def reaper() -> None:
+        nonlocal reaper_calls
+        reaper_calls += 1
+        if reaper_calls == 2:
+            raise OSError("cleanup failed")
+
+    def raise_primary(**_kwargs: object) -> object:
+        raise primary_error
+
+    monkeypatch.setattr(worker, "_reap_managed_authority_children", reaper)
+    monkeypatch.setattr(worker, "_run_claim_once", raise_primary)
+
+    with pytest.raises(BaseExceptionGroup) as raised:
+        worker.run_once()
+
+    assert raised.value.exceptions[0] is primary_error
+    assert type(raised.value.exceptions[1]) is OSError
+    assert str(raised.value.exceptions[1]) == "cleanup failed"
+
+
+def test_run_once_preserves_primary_before_reservation_release_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker = _worker(tmp_path)
+    primary_error = RuntimeError("primary")
+    worker._active_resource_reservation = object()  # type: ignore[assignment]
+
+    def raise_primary(**_kwargs: object) -> object:
+        raise primary_error
+
+    monkeypatch.setattr(worker, "_run_claim_once", raise_primary)
+    monkeypatch.setattr(
+        worker,
+        "_release_resource_reservation",
+        lambda: (_ for _ in ()).throw(OSError("reservation release failed")),
+    )
+
+    with pytest.raises(BaseExceptionGroup) as raised:
+        worker.run_once()
+
+    assert raised.value.exceptions[0] is primary_error
+    assert type(raised.value.exceptions[1]) is OSError
+    assert str(raised.value.exceptions[1]) == "reservation release failed"
+
+
+def test_run_once_does_not_return_success_when_final_reap_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.lab_worker import LabWorkerTickResult
+
+    worker = _worker(tmp_path)
+    reaper_calls = 0
+
+    def reaper() -> None:
+        nonlocal reaper_calls
+        reaper_calls += 1
+        if reaper_calls == 2:
+            raise OSError("final cleanup failed")
+
+    monkeypatch.setattr(worker, "_reap_managed_authority_children", reaper)
+    monkeypatch.setattr(
+        worker,
+        "_run_claim_once",
+        lambda **_kwargs: LabWorkerTickResult(status="succeeded"),
+    )
+
+    with pytest.raises(OSError, match="final cleanup failed"):
+        worker.run_once()
+
+
+def test_post_publish_rollback_failure_reports_failure_without_false_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant.lab_worker import LabArtifactConflictError
+    from rquant.resource_admission import AdmissionPolicy, TradingSession
+
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims.publish(claim)
+    snapshot_provider = MutableResourceSnapshotProvider(
+        _healthy_resource_snapshot(session=TradingSession.MORNING),
+        _healthy_resource_snapshot(session=TradingSession.MORNING).model_copy(
+            update={"live_healthy": False}
+        ),
+    )
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        reports=reports,
+        resource_snapshot_provider=snapshot_provider,
+        admission_policy_provider=StaticAdmissionPolicyProvider(
+            AdmissionPolicy(
+                allow_live_session=True,
+                max_live_shard_duration_ms=10**9,
+                max_live_backlog_age_seconds=10,
+                max_live_p95_latency_seconds=5,
+                min_available_memory_bytes=0,
+                min_available_disk_bytes=0,
+                max_io_pressure_pct=100,
+                max_cpu_load_pct=100,
+                max_expected_memory_bytes=8 * 1024**3,
+                max_expected_disk_bytes=50 * 1024**3,
+                max_expected_quota_units=0,
+                retry_delay_seconds=60,
+            )
+        ),
+        require_resource_admission=True,
+    )
+    original_publish = worker._publish_candidate
+
+    def publish_then_degrade(*args: object, **kwargs: object):
+        bundle = original_publish(*args, **kwargs)
+        snapshot_provider.select(1)
+        return bundle
+
+    monkeypatch.setattr(worker, "_publish_candidate", publish_then_degrade)
+    monkeypatch.setattr(
+        worker,
+        "_rollback_sealed",
+        lambda _claim, _bundle: (_ for _ in ()).throw(
+            LabArtifactConflictError("injected rollback failure")
+        ),
+    )
+
+    result = worker.run_once()
+
+    assert result.status == "failed"
+    assert worker.sealed_bundle_path(claim).is_dir()
+    assert isinstance(_reports(reports)[-1].body, LabShardFailed)
+    assert not any(isinstance(report.body, LabShardSucceeded) for report in _reports(reports))
+    assert worker._pending_success is None
+
+
+def test_isolated_resource_admission_fails_closed_without_or_on_failed_provider(
+    tmp_path: Path,
+) -> None:
+    from rquant.lab_worker import LabWorker
+    from rquant.resource_admission import AdmissionPolicy
+
+    common = {
+        "worker_id": "worker-a",
+        "claim_spool": LabClaimSpool(tmp_path / "claims"),
+        "report_spool": LabReportSpool(tmp_path / "reports"),
+        "artifact_root": tmp_path / "artifacts",
+        "verified_code_sha_provider": lambda: "1" * 40,
+        "require_resource_admission": True,
+    }
+    with pytest.raises(LabDaemonConfigurationError, match="resource admission providers"):
+        LabWorker(**common)
+
+    claims = common["claim_spool"]
+    assert isinstance(claims, LabClaimSpool)
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims.publish(claim)
+    policy = AdmissionPolicy(
+        allow_live_session=False,
+        max_live_backlog_age_seconds=10,
+        max_live_p95_latency_seconds=5,
+        min_available_memory_bytes=0,
+        min_available_disk_bytes=0,
+        max_io_pressure_pct=100,
+        max_cpu_load_pct=100,
+        max_expected_memory_bytes=8 * 1024**3,
+        max_expected_disk_bytes=50 * 1024**3,
+        max_expected_quota_units=0,
+        retry_delay_seconds=60,
+    )
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        reports=common["report_spool"],
+        resource_snapshot_provider=FailingResourceSnapshotProvider("probe down"),
+        admission_policy_provider=StaticAdmissionPolicyProvider(policy),
+        require_resource_admission=True,
+    )
+
+    with pytest.raises(LabDaemonConfigurationError, match="resource snapshot provider failed"):
+        worker.run_once()
+    assert tuple(entry.claim for entry in claims.pending()) == (claim,)
+    assert common["report_spool"].pending() == ()
+
+
+def test_production_worker_requires_explicit_v2_resource_authority_manifest(
+    tmp_path: Path,
+) -> None:
+    from rquant.lab_resource_authority_adapter import ResourceAuthorityAdapterConfig
+    from rquant.lab_worker import (
+        LabWorker,
+        build_resource_journal_authority_manifest,
+    )
+    from rquant.runtime_resource_admission import StaticAdmissionPolicyProvider
+
+    common = {
+        "worker_id": "worker-a",
+        "claim_spool": LabClaimSpool(tmp_path / "claims"),
+        "report_spool": LabReportSpool(tmp_path / "reports"),
+        "artifact_root": tmp_path / "artifacts",
+        "verified_code_sha_provider": lambda: "1" * 40,
+        "require_resource_admission": True,
+        "production_mode": True,
+    }
+    with pytest.raises(LabDaemonConfigurationError, match="explicit V2"):
+        LabWorker(
+            **common,
+            resource_snapshot_provider=SequenceResourceSnapshotProvider(
+                _healthy_resource_snapshot()
+            ),
+            admission_policy_provider=StaticAdmissionPolicyProvider(_permissive_admission_policy()),
+        )
+
+    test_manifest = _test_authority_manifest(
+        tmp_path,
+        snapshot_provider=SequenceResourceSnapshotProvider(_healthy_resource_snapshot()),
+        policy_provider=StaticAdmissionPolicyProvider(_permissive_admission_policy()),
+        quota_provider=None,
+    )
+    with pytest.raises(LabDaemonConfigurationError, match="explicit V2"):
+        LabWorker(**common, resource_authority_manifest=test_manifest)
+
+    standalone_v2 = build_resource_journal_authority_manifest(
+        ResourceAuthorityAdapterConfig(
+            mode="test-standalone",
+            endpoint=Path("/tmp/rqa-prod-gate.sock"),
+            expected_uid=os.getuid(),
+            expected_gid=os.getgid(),
+            authority_id="test-resource-authority",
+            trusted_role_inventory_hash="a" * 64,
+        )
+    )
+    with pytest.raises(LabDaemonConfigurationError, match="production V2"):
+        LabWorker(**common, resource_authority_manifest=standalone_v2)
 
 
 def _retry_claim(claim: LabShardClaim) -> LabShardClaim:
@@ -3212,20 +9665,11 @@ def test_revoke_during_execute_is_fenced_before_seal_and_success(
     reports = LabReportSpool(tmp_path / "reports")
     claim = _claim(_nshape_compare_spec(hold_days=(1,)))
     claims.publish(claim)
-    executing = threading.Event()
-    release = threading.Event()
+    spawn = multiprocessing.get_context("spawn")
+    executing = spawn.Event()
+    release = spawn.Event()
 
-    class BlockingRegistry(RecordingRegistry):
-        def execute_shard(
-            self,
-            validated: ValidatedStrategyShard,
-            store: object,
-        ) -> LabShardExecutionResult:
-            executing.set()
-            assert release.wait(2)
-            return super().execute_shard(validated, store)
-
-    registry = BlockingRegistry()
+    registry = BlockingRegistry(executing=executing, release=release)
     worker = _worker(
         tmp_path,
         claims=claims,
@@ -3236,10 +9680,13 @@ def test_revoke_during_execute_is_fenced_before_seal_and_success(
     results: list[object] = []
     thread = threading.Thread(target=lambda: results.append(worker.run_once()))
     thread.start()
-    assert executing.wait(2)
+    entered_deadline = time.monotonic() + 2
+    while not registry._closed_entered_path.exists() and time.monotonic() < entered_deadline:
+        time.sleep(0.01)
+    assert registry._closed_entered_path.exists()
 
     claims.revoke(claim, reason="scheduler revoked running attempt")
-    release.set()
+    registry._closed_release_path.write_text("release", encoding="ascii")
     thread.join(timeout=2)
 
     assert not thread.is_alive()
@@ -3519,32 +9966,24 @@ def test_worker_deadline_before_execute_fails_without_running_shard(tmp_path: Pa
 
 
 def test_worker_deadline_after_execute_prevents_fence_and_seal(tmp_path: Path) -> None:
-    clock = [NOW]
+    deadline_reached = multiprocessing.get_context("spawn").Value("b", False)
     spec = _nshape_compare_spec(hold_days=(1,)).model_copy(
         update={"deadline": NOW + timedelta(seconds=1)}
     )
-
-    class DeadlineRegistry(RecordingRegistry):
-        def execute_shard(
-            self,
-            validated: ValidatedStrategyShard,
-            store: object,
-        ) -> LabShardExecutionResult:
-            result = super().execute_shard(validated, store)
-            clock[0] = spec.deadline
-            return result
 
     claims = LabClaimSpool(tmp_path / "claims")
     reports = LabReportSpool(tmp_path / "reports")
     claim = _claim(spec)
     claims.publish(claim)
+    registry = DeadlineRegistry(deadline_reached=deadline_reached)
     worker = _worker(
         tmp_path,
-        registry=DeadlineRegistry(),
+        registry=registry,
         claims=claims,
         reports=reports,
-        clock=lambda: clock[0],
+        clock=lambda: spec.deadline if deadline_reached.value else NOW,
     )
+    worker.clock = lambda: spec.deadline if registry._closed_deadline_path.exists() else NOW
 
     result = worker.run_once()
 
@@ -3763,6 +10202,89 @@ def test_stop_during_execution_reports_stopped_without_sealing(tmp_path: Path) -
     assert not worker.sealed_bundle_path(claim).exists()
 
 
+def test_stop_during_execution_releases_resource_reservation(tmp_path: Path) -> None:
+    from rquant.runtime_resource_admission import (
+        RuntimeResourceAdmissionError,
+        SQLiteResourceReservationStore,
+    )
+
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims.publish(claim)
+    store = SQLiteResourceReservationStore(
+        tmp_path / "resource-reservations.sqlite3",
+        clock=lambda: NOW,
+    )
+    worker = _worker(
+        tmp_path,
+        registry=RecordingRegistry(delay_seconds=0.2),
+        claims=claims,
+        reports=reports,
+        heartbeat_interval_seconds=0.01,
+        resource_snapshot_provider=StaticResourceSnapshotProvider(_healthy_resource_snapshot()),
+        admission_policy_provider=StaticAdmissionPolicyProvider(_permissive_admission_policy()),
+        resource_reservation_store=store,
+        require_resource_admission=True,
+    )
+    outcomes: list[object] = []
+    thread = threading.Thread(target=lambda: outcomes.append(worker.run_once()))
+    thread.start()
+    deadline = time.monotonic() + 2
+    active = ()
+    while not active and time.monotonic() < deadline:
+        try:
+            active = store.active_leases()
+        except RuntimeResourceAdmissionError as exc:
+            assert "lock wait timeout" in str(exc)
+        time.sleep(0.01)
+    assert len(active) == 1
+
+    worker.request_stop()
+    thread.join(timeout=3)
+
+    assert not thread.is_alive()
+    assert outcomes[0].status == "stopped"
+    assert store.active_leases() == ()
+    assert not worker.sealed_bundle_path(claim).exists()
+
+
+def test_job_deadline_terminates_child_and_releases_resource_reservation(
+    tmp_path: Path,
+) -> None:
+    from rquant.runtime_resource_admission import SQLiteResourceReservationStore
+
+    spec = _nshape_compare_spec(hold_days=(1,)).model_copy(
+        update={"deadline": NOW + timedelta(milliseconds=50)}
+    )
+    claim = _short_claim_for_spec(spec)
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    pid_path = tmp_path / "deadline-child.pid"
+    claims.publish(claim)
+    store = SQLiteResourceReservationStore(
+        tmp_path / "resource-reservations.sqlite3",
+        clock=lambda: NOW,
+    )
+    worker = _worker(
+        tmp_path,
+        registry=SlowPidRegistry(pid_path=pid_path, delay_seconds=0.2),
+        claims=claims,
+        reports=reports,
+        resource_snapshot_provider=StaticResourceSnapshotProvider(_healthy_resource_snapshot()),
+        admission_policy_provider=StaticAdmissionPolicyProvider(_permissive_admission_policy()),
+        resource_reservation_store=store,
+        lease_extension_seconds=5,
+        require_resource_admission=True,
+    )
+
+    result = worker.run_once()
+
+    assert result.status == "stopped"
+    assert store.active_leases() == ()
+    assert not worker.sealed_bundle_path(claim).exists()
+
+
 def test_bundle_is_canonical_and_obsolete_attempt_is_reclaimed_across_retry(
     tmp_path: Path,
 ) -> None:
@@ -3780,7 +10302,7 @@ def test_bundle_is_canonical_and_obsolete_attempt_is_reclaimed_across_retry(
         reports=reports,
     )
 
-    validated = worker.adapter_registry.validate_claim(claim)
+    validated = worker._validate_closed_claim(claim)
     first_result = registry.execute_shard(validated, object())
     first = worker._seal_result(claim, first_result)
     sealed = worker.sealed_bundle_path(claim)
@@ -3902,7 +10424,7 @@ def test_result_manifest_rejects_missing_or_forged_digest_provenance(
 def test_same_attempt_conflicting_result_fails_closed(tmp_path: Path) -> None:
     claim = _claim(_nshape_compare_spec(hold_days=(1,)))
     worker = _worker(tmp_path)
-    validated = worker.adapter_registry.validate_claim(claim)
+    validated = worker._validate_closed_claim(claim)
 
     def result(value: int) -> LabShardExecutionResult:
         return LabShardExecutionResult.from_validated(
@@ -4297,6 +10819,55 @@ class _MetadataStore:
         return ()
 
 
+class ObjectContext:
+    def __init__(self, value: object) -> None:
+        self.value = value
+
+    def __enter__(self) -> object:
+        return self.value
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+
+class MetadataStoreFactory:
+    def __init__(self, store: object) -> None:
+        self.store = store
+
+    def __call__(self) -> ObjectContext:
+        return ObjectContext(self.store)
+
+
+class FakeExecutionSessionFactory:
+    def __init__(self, *, expected_binding: object, expected_lake_root: Path) -> None:
+        self.expected_binding = expected_binding
+        self.expected_lake_root = expected_lake_root
+        self.opened = multiprocessing.get_context("spawn").Value("i", 0)
+
+    def __call__(self, binding: object, lake_root: Path) -> ObjectContext:
+        if binding != self.expected_binding:
+            raise AssertionError("research session received the wrong binding")
+        if lake_root != self.expected_lake_root:
+            raise AssertionError("research session received the wrong lake root")
+        with self.opened.get_lock():
+            self.opened.value += 1
+        return ObjectContext(object())
+
+
+class RecordingResearchStoreOpener:
+    def __init__(self) -> None:
+        self.requests = multiprocessing.get_context("spawn").Queue()
+
+    @contextmanager
+    def __call__(self, request: object, **_kwargs: object) -> Iterator[tuple[object, object]]:
+        self.requests.put(request)
+        yield object(), object()
+
+    def close(self) -> None:
+        self.requests.close()
+        self.requests.join_thread()
+
+
 def _formal_spec() -> ResearchRunSpec:
     identity = DatasetSnapshotIdentity(
         snapshot_id="a" * 64,
@@ -4313,35 +10884,15 @@ def _formal_spec() -> ResearchRunSpec:
 
 def test_formal_job_opens_verified_research_execution_session(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import rquant.lab_worker as lab_worker
-
     spec = _formal_spec()
     identity = spec.dataset_snapshot
     assert identity is not None
     metadata = _MetadataStore(identity)
-    opened: list[tuple[object, Path]] = []
-    session_store = object()
-
-    class FakeResearchExecutionSession:
-        def __init__(self, *, binding: object, lake_root: Path) -> None:
-            opened.append((binding, lake_root))
-
-        def __enter__(self) -> object:
-            return session_store
-
-        def __exit__(self, *_: object) -> None:
-            return None
-
-    @contextmanager
-    def metadata_factory() -> Iterator[object]:
-        yield metadata
-
-    monkeypatch.setattr(
-        lab_worker,
-        "ResearchExecutionSession",
-        FakeResearchExecutionSession,
+    lake_root = tmp_path / "lake"
+    execution_session_factory = FakeExecutionSessionFactory(
+        expected_binding=metadata.binding,
+        expected_lake_root=lake_root,
     )
     claims = LabClaimSpool(tmp_path / "claims")
     registry = RecordingRegistry()
@@ -4351,24 +10902,21 @@ def test_formal_job_opens_verified_research_execution_session(
         registry=registry,
         claims=claims,
         exploratory_store_factory=None,
-        metadata_store_factory=metadata_factory,
-        lake_root=tmp_path / "lake",
+        metadata_store_factory=MetadataStoreFactory(metadata),
+        lake_root=lake_root,
+        execution_session_factory=execution_session_factory,
     )
 
     result = worker.run_once()
 
     assert result.status == "succeeded"
-    assert opened == [(metadata.binding, tmp_path / "lake")]
-    assert registry.stores == [session_store]
+    assert execution_session_factory._closed_opened_path.is_file()
+    assert registry.executions == 1
 
 
 def test_legacy_formal_spec_uses_canonical_snapshot_strategy(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import rquant.lab_worker as lab_worker
-    from rquant.research_gate import ResearchGateRequest
-
     spec = _formal_spec().model_copy(
         update={
             "parameters": _formal_spec().parameters.model_copy(
@@ -4376,38 +10924,34 @@ def test_legacy_formal_spec_uses_canonical_snapshot_strategy(
             )
         }
     )
-    requests: list[ResearchGateRequest] = []
+    identity = spec.dataset_snapshot
+    assert identity is not None
+    metadata = _MetadataStore(identity)
+    research_store_opener = RecordingResearchStoreOpener()
 
-    @contextmanager
-    def gated_store(
-        request: ResearchGateRequest,
-        **_kwargs: object,
-    ) -> Iterator[tuple[object, object]]:
-        requests.append(request)
-        yield object(), object()
-
-    @contextmanager
-    def metadata_factory() -> Iterator[object]:
-        yield object()
-
-    monkeypatch.setattr(lab_worker, "open_gated_research_store", gated_store)
     claims = LabClaimSpool(tmp_path / "claims")
     claims.publish(_claim(spec))
     worker = _worker(
         tmp_path,
         claims=claims,
         exploratory_store_factory=None,
-        metadata_store_factory=metadata_factory,
+        metadata_store_factory=MetadataStoreFactory(metadata),
         lake_root=tmp_path / "lake",
+        research_store_opener=research_store_opener,
     )
 
-    result = worker.run_once()
+    try:
+        result = worker.run_once()
+        from rquant.research_gate import ResearchGateRequest
+
+        request = ResearchGateRequest.model_validate_json(
+            research_store_opener._closed_request_path.read_text(encoding="utf-8")
+        )
+    finally:
+        research_store_opener.close()
 
     assert result.status == "succeeded"
-    assert len(requests) == 1
-    assert requests[0].strategy_name == "n_shape"
-    assert requests[0].dataset_snapshot_id == spec.dataset_snapshot.snapshot_id
-    assert requests[0].dataset_binding_hash == spec.dataset_snapshot.binding_hash
+    assert request.strategy_name == "n_shape"
 
 
 def test_formal_snapshot_identity_mismatch_fails_before_execution(tmp_path: Path) -> None:
@@ -4417,10 +10961,6 @@ def test_formal_snapshot_identity_mismatch_fails_before_execution(tmp_path: Path
     metadata = _MetadataStore(identity)
     metadata.binding.binding_hash = "d" * 64
 
-    @contextmanager
-    def metadata_factory() -> Iterator[object]:
-        yield metadata
-
     claims = LabClaimSpool(tmp_path / "claims")
     registry = RecordingRegistry()
     claims.publish(_claim(spec))
@@ -4429,7 +10969,7 @@ def test_formal_snapshot_identity_mismatch_fails_before_execution(tmp_path: Path
         registry=registry,
         claims=claims,
         exploratory_store_factory=None,
-        metadata_store_factory=metadata_factory,
+        metadata_store_factory=MetadataStoreFactory(metadata),
         lake_root=tmp_path / "lake",
     )
 
@@ -4444,10 +10984,6 @@ def test_formal_runtime_clean_code_sha_must_match_spec(tmp_path: Path) -> None:
     identity = spec.dataset_snapshot
     assert identity is not None
 
-    @contextmanager
-    def metadata_factory() -> Iterator[object]:
-        yield _MetadataStore(identity)
-
     claims = LabClaimSpool(tmp_path / "claims")
     registry = RecordingRegistry()
     claims.publish(_claim(spec))
@@ -4456,7 +10992,7 @@ def test_formal_runtime_clean_code_sha_must_match_spec(tmp_path: Path) -> None:
         registry=registry,
         claims=claims,
         exploratory_store_factory=None,
-        metadata_store_factory=metadata_factory,
+        metadata_store_factory=MetadataStoreFactory(_MetadataStore(identity)),
         lake_root=tmp_path / "lake",
         verified_code_sha_provider=lambda: "f" * 40,
     )
@@ -4475,10 +11011,6 @@ def test_formal_reuses_full_research_gate_evidence_checks(tmp_path: Path) -> Non
     metadata.snapshot.strategy_name = "wrong_strategy"
     metadata.audit.p0_count = 1
 
-    @contextmanager
-    def metadata_factory() -> Iterator[object]:
-        yield metadata
-
     claims = LabClaimSpool(tmp_path / "claims")
     registry = RecordingRegistry()
     claims.publish(_claim(spec))
@@ -4487,7 +11019,7 @@ def test_formal_reuses_full_research_gate_evidence_checks(tmp_path: Path) -> Non
         registry=registry,
         claims=claims,
         exploratory_store_factory=None,
-        metadata_store_factory=metadata_factory,
+        metadata_store_factory=MetadataStoreFactory(metadata),
         lake_root=tmp_path / "lake",
     )
 
@@ -4859,6 +11391,50 @@ def test_rejected_success_receipt_returns_failed_without_second_terminal_report(
     assert not worker.sealed_bundle_path(claim).exists()
 
 
+def test_pending_success_rejects_old_attempt_receipt_then_accepts_current_receipt(
+    tmp_path: Path,
+) -> None:
+    claims = LabClaimSpool(tmp_path / "claims")
+    reports = LabReportSpool(tmp_path / "reports")
+    generation_one = _claim(_nshape_compare_spec(hold_days=(1,)))
+    generation_two = _retry_claim(generation_one)
+    claims.publish(generation_one)
+    claims.publish(generation_two)
+
+    def stale_success_receipt(
+        report: LabWorkerReport,
+        timeout_seconds: float,
+        stop: object,
+    ) -> LabReportReceipt:
+        accepted = _accept_report(report, timeout_seconds, stop)
+        if isinstance(report.body, LabShardSucceeded):
+            return accepted.model_copy(
+                update={
+                    "claim_token": generation_one.claim_token,
+                    "claim_generation": generation_one.claim_generation,
+                    "scheduler_fencing_token": generation_one.scheduler_fencing_token,
+                }
+            )
+        return accepted
+
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        reports=reports,
+        receipt_waiter=stale_success_receipt,
+    )
+
+    stale = worker.run_once()
+    worker.receipt_waiter = _accept_report
+    converged = worker.run_once()
+
+    assert stale.status == "unknown"
+    assert stale.report_id is not None
+    assert worker.sealed_bundle_path(generation_two).is_dir()
+    assert converged.status == "succeeded"
+    assert converged.report_id == stale.report_id
+
+
 def test_worker_waits_for_real_scheduler_receipts_before_completion(tmp_path: Path) -> None:
     from rquant.lab_job_protocol import LabCommandEnvelope, LabCommandSpool, SubmitJobCommand
     from rquant.lab_jobs import JobStatus, LabJobReader, LabJobStore
@@ -4927,6 +11503,7 @@ def test_worker_waits_for_real_scheduler_receipts_before_completion(tmp_path: Pa
 
 def test_crash_without_report_is_reclaimed_by_existing_lease_recovery(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from rquant.lab_job_protocol import LabCommandEnvelope, LabCommandSpool, SubmitJobCommand
     from rquant.lab_jobs import LabJobStore
@@ -4966,9 +11543,14 @@ def test_crash_without_report_is_reclaimed_by_existing_lease_recovery(
     original = claims.pending()[0].claim
     worker = _worker(
         tmp_path,
-        registry=RecordingRegistry(failure=WorkerCrash()),
+        registry=RecordingRegistry(),
         claims=claims,
         reports=reports,
+    )
+    monkeypatch.setattr(
+        worker,
+        "_execute_shard_isolated",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(WorkerCrash()),
     )
 
     with pytest.raises(WorkerCrash):
@@ -5091,7 +11673,7 @@ def test_stale_pending_success_does_not_block_obsolete_sealed_reclamation(
     generation_one = _claim(_nshape_compare_spec(hold_days=(1,)))
     claims.publish(generation_one)
     worker = _worker(tmp_path, claims=claims, reports=reports)
-    validated = worker.adapter_registry.validate_claim(generation_one)
+    validated = worker._validate_closed_claim(generation_one)
     result = RecordingRegistry().execute_shard(validated, object())
     manifest = worker._seal_result(generation_one, result)
     success = LabWorkerReport.from_claim(
@@ -5127,7 +11709,7 @@ def test_rejected_success_receipt_allows_obsolete_sealed_reclamation(
     )
     generation_one = _claim(_nshape_compare_spec(hold_days=(1,)))
     worker = _worker(tmp_path, reports=reports)
-    validated = worker.adapter_registry.validate_claim(generation_one)
+    validated = worker._validate_closed_claim(generation_one)
     result = RecordingRegistry().execute_shard(validated, object())
     manifest = worker._seal_result(generation_one, result)
     success = LabWorkerReport.from_claim(
@@ -5164,7 +11746,7 @@ def test_reclaimer_preserves_current_attempt_and_rejects_unsafe_entries(
     )
     current = _retry_claim(_claim(_nshape_compare_spec(hold_days=(1,))))
     worker = _worker(tmp_path, reports=reports)
-    validated = worker.adapter_registry.validate_claim(current)
+    validated = worker._validate_closed_claim(current)
     result = RecordingRegistry().execute_shard(validated, object())
     worker._seal_result(current, result)
     current_path = worker.sealed_bundle_path(current)
@@ -5299,7 +11881,7 @@ def _sealed_obsolete_attempt(
         claims=LabClaimSpool(tmp_path / "worker-claims"),
         reports=reports,
     )
-    validated = worker.adapter_registry.validate_claim(old_claim)
+    validated = worker._validate_closed_claim(old_claim)
     result = RecordingRegistry().execute_shard(validated, object())
     manifest = worker._seal_result(old_claim, result)
     return old_claim, current_claim, worker.sealed_bundle_path(old_claim), manifest
@@ -5757,7 +12339,7 @@ def test_seal_rejects_hardlink_created_at_atomic_rename_without_deleting(
 
     claim = _claim(_nshape_compare_spec(hold_days=(1,)))
     worker = _worker(tmp_path)
-    validated = worker.adapter_registry.validate_claim(claim)
+    validated = worker._validate_closed_claim(claim)
     result = RecordingRegistry().execute_shard(validated, object())
     sealed = worker.sealed_bundle_path(claim)
     external = tmp_path / "external-rename-artifact.parquet"
@@ -6866,7 +13448,7 @@ def test_sealed_rollback_crash_resumes_as_deferred_gc(
 ) -> None:
     claim = _claim(_nshape_compare_spec(hold_days=(1,)))
     worker = _worker(tmp_path)
-    validated = worker.adapter_registry.validate_claim(claim)
+    validated = worker._validate_closed_claim(claim)
     prepared = worker._prepare_result(
         claim,
         RecordingRegistry().execute_shard(validated, object()),
@@ -6917,7 +13499,7 @@ def test_worker_runtime_drift_at_atomic_publish_preserves_prepared_candidate(
 ) -> None:
     claim = _claim(_nshape_compare_spec(hold_days=(1,)))
     worker = _worker(tmp_path)
-    validated = worker.adapter_registry.validate_claim(claim)
+    validated = worker._validate_closed_claim(claim)
     prepared = worker._prepare_result(
         claim,
         RecordingRegistry().execute_shard(validated, object()),
@@ -6960,7 +13542,7 @@ def test_worker_runtime_drift_before_staging_creation_leaves_no_bundle(
 
     worker = _worker(tmp_path, verified_code_sha_provider=runtime_guard)
     claim = _claim(_nshape_compare_spec(hold_days=(1,)))
-    validated = worker.adapter_registry.validate_claim(claim)
+    validated = worker._validate_closed_claim(claim)
     result = RecordingRegistry().execute_shard(validated, object())
 
     def drift_after_parent_ready(_temporary: Path) -> None:
@@ -6993,7 +13575,7 @@ def test_worker_runtime_drift_before_parquet_publication_leaves_incomplete_stagi
 
     worker = _worker(tmp_path, verified_code_sha_provider=runtime_guard)
     claim = _claim(_nshape_compare_spec(hold_days=(1,)))
-    validated = worker.adapter_registry.validate_claim(claim)
+    validated = worker._validate_closed_claim(claim)
     result = RecordingRegistry().execute_shard(validated, object())
 
     def drift_after_parquet_fsync(_temporary: Path, _parquet_temp: Path) -> None:
@@ -7027,7 +13609,7 @@ def test_worker_runtime_drift_before_manifest_completion_leaves_no_complete_bund
 
     worker = _worker(tmp_path, verified_code_sha_provider=runtime_guard)
     claim = _claim(_nshape_compare_spec(hold_days=(1,)))
-    validated = worker.adapter_registry.validate_claim(claim)
+    validated = worker._validate_closed_claim(claim)
     result = RecordingRegistry().execute_shard(validated, object())
 
     def drift_after_manifest_fsync(_temporary: Path, _manifest_temp: Path) -> None:
@@ -7050,7 +13632,7 @@ def test_worker_runtime_drift_before_manifest_completion_leaves_no_complete_bund
 def test_sealed_rollback_hard_crash_resumes_in_new_process(tmp_path: Path) -> None:
     claim = _claim(_nshape_compare_spec(hold_days=(1,)))
     worker = _worker(tmp_path)
-    validated = worker.adapter_registry.validate_claim(claim)
+    validated = worker._validate_closed_claim(claim)
     worker._seal_result(
         claim,
         RecordingRegistry().execute_shard(validated, object()),
@@ -7088,7 +13670,7 @@ def test_sealed_rollback_recovers_every_prepared_intent_boundary(
 ) -> None:
     claim = _claim(_nshape_compare_spec(hold_days=(1,)))
     worker = _worker(tmp_path)
-    validated = worker.adapter_registry.validate_claim(claim)
+    validated = worker._validate_closed_claim(claim)
     prepared = worker._prepare_result(
         claim,
         RecordingRegistry().execute_shard(validated, object()),
@@ -7152,7 +13734,7 @@ def test_sealed_rollback_hard_exit_recovers_every_prepared_intent_boundary(
 ) -> None:
     claim = _claim(_nshape_compare_spec(hold_days=(1,)))
     worker = _worker(tmp_path)
-    validated = worker.adapter_registry.validate_claim(claim)
+    validated = worker._validate_closed_claim(claim)
     worker._seal_result(
         claim,
         RecordingRegistry().execute_shard(validated, object()),
@@ -7431,7 +14013,7 @@ def test_stale_success_rejection_retries_failed_reconciliation(
         claims=LabClaimSpool(tmp_path / "sealing-claims"),
         reports=reports,
     )
-    validated = sealing_worker.adapter_registry.validate_claim(old_claim)
+    validated = sealing_worker._validate_closed_claim(old_claim)
     result = RecordingRegistry().execute_shard(validated, object())
     manifest = sealing_worker._seal_result(old_claim, result)
     sealed = sealing_worker.sealed_bundle_path(old_claim)

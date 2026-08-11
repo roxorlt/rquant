@@ -54,8 +54,8 @@ from rquant.signal_contracts import SignalAction, SignalEnvelope
 from rquant.strategy_candidate_snapshot import (
     StrategyCandidatePriceBasis,
     StrategyCandidateRecord,
-    StrategyCandidateSnapshot,
     StrategyCandidateSnapshotSpool,
+    strategy_candidate_schema_fingerprint,
 )
 from rquant.strategy_live_service import run_strategy_live_batch
 from rquant.strategy_runner import (
@@ -85,6 +85,15 @@ DECISION_LOCAL = datetime(2026, 7, 31, 9, 40, 2, tzinfo=SHANGHAI)
 DECISION_UTC = DECISION_LOCAL.astimezone(UTC)
 PRODUCER_COMMIT = "a" * 40
 EVALUATOR_FINGERPRINT = "b" * 64
+DEFINITION_FINGERPRINT = "c" * 64
+STATIC_FEATURE_SCHEMA = {
+    "candidate_score": {"dtype": "number", "semantic": "candidate ranking score"}
+}
+CANDIDATE_SCHEMA_FINGERPRINT = strategy_candidate_schema_fingerprint(
+    strategy_id="fault-matrix",
+    strategy_version="1",
+    static_feature_schema=STATIC_FEATURE_SCHEMA,
+)
 
 
 def _file_signatures(root: Path) -> dict[str, tuple[int, int, int, int]]:
@@ -231,28 +240,33 @@ def _runner(path: Path) -> StrategyRunnerStore:
 def _candidate_loader(root: Path) -> RuntimeCandidateUniverseLoader:
     snapshot_root = (root / "candidate-snapshots").resolve()
     decision_at = DECISION_UTC - timedelta(days=1)
-    StrategyCandidateSnapshotSpool(snapshot_root).publish(
-        StrategyCandidateSnapshot.build(
-            sequence=0,
-            trade_date=DECISION_LOCAL.date(),
-            captured_at=DECISION_UTC,
-            producer_commit=PRODUCER_COMMIT,
-            rows=(
-                StrategyCandidateRecord(
-                    strategy_id=_strategy_spec().strategy_id,
-                    strategy_version=str(_strategy_spec().version),
-                    candidate_id="600000.SH",
-                    variant="fault-matrix",
-                    decision_at=decision_at,
-                    available_at=decision_at + timedelta(minutes=1),
-                    effective_trade_date=DECISION_LOCAL.date(),
-                    reference_trade_date=(DECISION_LOCAL - timedelta(days=1)).date(),
-                    price_basis=StrategyCandidatePriceBasis.QFQ_PIT,
-                    static_features={"candidate_score": 0.9},
-                    reference_snapshot_ids={"daily": "9" * 64},
-                ),
+    spec = _strategy_spec()
+    StrategyCandidateSnapshotSpool(snapshot_root).publish_strategy_records(
+        strategy_id=spec.strategy_id,
+        strategy_version=str(spec.version),
+        definition_fingerprint=DEFINITION_FINGERPRINT,
+        executable_fingerprint=EVALUATOR_FINGERPRINT,
+        candidate_schema_fingerprint=CANDIDATE_SCHEMA_FINGERPRINT,
+        static_feature_schema=STATIC_FEATURE_SCHEMA,
+        source_snapshot_ids={"candidate-input": "8" * 64},
+        trade_date=DECISION_LOCAL.date(),
+        captured_at=DECISION_UTC,
+        producer_commit=PRODUCER_COMMIT,
+        rows=(
+            StrategyCandidateRecord(
+                strategy_id=spec.strategy_id,
+                strategy_version=str(spec.version),
+                candidate_id="600000.SH",
+                variant="fault-matrix",
+                decision_at=decision_at,
+                available_at=decision_at + timedelta(minutes=1),
+                effective_trade_date=DECISION_LOCAL.date(),
+                reference_trade_date=(DECISION_LOCAL - timedelta(days=1)).date(),
+                price_basis=StrategyCandidatePriceBasis.QFQ_PIT,
+                static_features={"candidate_score": 0.9},
+                reference_snapshot_ids={"daily": "9" * 64},
             ),
-        )
+        ),
     )
     return RuntimeCandidateUniverseLoader(
         RuntimeCandidateUniverseConfig(
@@ -264,6 +278,11 @@ def _candidate_loader(root: Path) -> RuntimeCandidateUniverseLoader:
                     snapshot_root=snapshot_root,
                     required=True,
                     max_age_seconds=60,
+                    definition_fingerprint=DEFINITION_FINGERPRINT,
+                    executable_fingerprint=EVALUATOR_FINGERPRINT,
+                    candidate_schema_fingerprint=CANDIDATE_SCHEMA_FINGERPRINT,
+                    static_feature_names=("candidate_score",),
+                    static_feature_schema=STATIC_FEATURE_SCHEMA,
                 ),
             ),
         )
@@ -481,11 +500,14 @@ def test_missing_minute_is_degraded_and_never_substituted_with_zero() -> None:
         config=_feature_config(),
     )
 
-    status = result.envelope.field_status("amount_accel_5m")
+    status = result.envelope.field_status(
+        "amount_accel_5m",
+        candidate_id="600001.SH",
+    )
     rows = result.frame.set_index("ts_code")
     assert status is not None
-    assert status.status is FeatureAvailability.DEGRADED
-    assert status.reason == "partial_availability:non_contiguous_minutes"
+    assert status.status is FeatureAvailability.UNAVAILABLE
+    assert status.reason == "non_contiguous_minutes"
     assert pd.notna(rows.loc["600000.SH", "amount_accel_5m"])
     assert pd.isna(rows.loc["600001.SH", "amount_accel_5m"])
 

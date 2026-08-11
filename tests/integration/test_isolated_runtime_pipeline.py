@@ -49,8 +49,8 @@ from rquant.signal_router_runtime import (
 from rquant.strategy_candidate_snapshot import (
     StrategyCandidatePriceBasis,
     StrategyCandidateRecord,
-    StrategyCandidateSnapshot,
     StrategyCandidateSnapshotSpool,
+    strategy_candidate_schema_fingerprint,
 )
 from rquant.strategy_live_service import run_strategy_live_batch
 from rquant.strategy_runner import StrategyCandidateState, StrategyDecision, StrategyRunnerStore
@@ -66,6 +66,16 @@ OBSERVED = datetime(2026, 7, 31, 1, 40, 2, tzinfo=UTC)
 EXECUTION_TIME = OBSERVED + timedelta(minutes=1)
 TRADE_DATE = date(2026, 7, 31)
 POLICY_FINGERPRINT = "9" * 64
+DEFINITION_FINGERPRINT = "a" * 64
+EXECUTABLE_FINGERPRINT = "4" * 64
+STATIC_FEATURE_SCHEMA = {
+    "candidate_score": {"dtype": "number", "semantic": "candidate ranking score"}
+}
+CANDIDATE_SCHEMA_FINGERPRINT = strategy_candidate_schema_fingerprint(
+    strategy_id="isolated-e2e",
+    strategy_version="1",
+    static_feature_schema=STATIC_FEATURE_SCHEMA,
+)
 
 
 def _current_minute() -> pd.DataFrame:
@@ -178,28 +188,45 @@ def _paper_policy() -> PaperSignalPolicy:
 def _candidate_loader(tmp_path: Path) -> RuntimeCandidateUniverseLoader:
     root = (tmp_path / "candidate-snapshots").resolve()
     decision_at = OBSERVED - timedelta(days=1)
-    StrategyCandidateSnapshotSpool(root).publish(
-        StrategyCandidateSnapshot.build(
-            sequence=0,
-            trade_date=TRADE_DATE,
-            captured_at=OBSERVED,
-            producer_commit="3" * 40,
-            rows=(
-                StrategyCandidateRecord(
-                    strategy_id=_spec().strategy_id,
-                    strategy_version=str(_spec().version),
-                    candidate_id="600000.SH",
-                    variant="default",
-                    decision_at=decision_at,
-                    available_at=decision_at + timedelta(minutes=1),
-                    effective_trade_date=TRADE_DATE,
-                    reference_trade_date=date(2026, 7, 30),
-                    price_basis=StrategyCandidatePriceBasis.QFQ_PIT,
-                    static_features={"candidate_score": 0.95},
-                    reference_snapshot_ids={"daily": "8" * 64},
-                ),
+    StrategyCandidateSnapshotSpool(root).publish_strategy_records(
+        strategy_id=_spec().strategy_id,
+        strategy_version=str(_spec().version),
+        definition_fingerprint=DEFINITION_FINGERPRINT,
+        executable_fingerprint=EXECUTABLE_FINGERPRINT,
+        candidate_schema_fingerprint=CANDIDATE_SCHEMA_FINGERPRINT,
+        static_feature_schema=STATIC_FEATURE_SCHEMA,
+        source_snapshot_ids={"candidate_input": "8" * 64},
+        trade_date=TRADE_DATE,
+        captured_at=OBSERVED,
+        producer_commit="3" * 40,
+        rows=(
+            StrategyCandidateRecord(
+                strategy_id=_spec().strategy_id,
+                strategy_version=str(_spec().version),
+                candidate_id="600000.SH",
+                variant="default",
+                decision_at=decision_at,
+                available_at=decision_at + timedelta(minutes=1),
+                effective_trade_date=TRADE_DATE,
+                reference_trade_date=date(2026, 7, 30),
+                price_basis=StrategyCandidatePriceBasis.QFQ_PIT,
+                static_features={"candidate_score": 0.95},
+                reference_snapshot_ids={"daily": "8" * 64},
             ),
-        )
+            StrategyCandidateRecord(
+                strategy_id=_spec().strategy_id,
+                strategy_version=str(_spec().version),
+                candidate_id="600001.SH",
+                variant="default",
+                decision_at=decision_at,
+                available_at=decision_at + timedelta(minutes=1),
+                effective_trade_date=TRADE_DATE,
+                reference_trade_date=date(2026, 7, 30),
+                price_basis=StrategyCandidatePriceBasis.QFQ_PIT,
+                static_features={"candidate_score": 0.85},
+                reference_snapshot_ids={"daily": "8" * 64},
+            ),
+        ),
     )
     return RuntimeCandidateUniverseLoader(
         RuntimeCandidateUniverseConfig(
@@ -211,10 +238,29 @@ def _candidate_loader(tmp_path: Path) -> RuntimeCandidateUniverseLoader:
                     snapshot_root=root,
                     required=True,
                     max_age_seconds=300,
+                    definition_fingerprint=DEFINITION_FINGERPRINT,
+                    executable_fingerprint=EXECUTABLE_FINGERPRINT,
+                    candidate_schema_fingerprint=CANDIDATE_SCHEMA_FINGERPRINT,
+                    static_feature_names=("candidate_score",),
+                    static_feature_schema=STATIC_FEATURE_SCHEMA,
                 ),
             ),
         )
     )
+
+
+def test_pooled_candidate_loader_preserves_exact_strategy_identity(tmp_path: Path) -> None:
+    result = _candidate_loader(tmp_path).load(
+        as_of=OBSERVED,
+        required_trade_date=TRADE_DATE,
+    )
+
+    assert result.codes == ("600000.SH", "600001.SH")
+    assert len(result.authorities) == 1
+    evidence = result.authorities[0]
+    assert evidence.definition_fingerprint == DEFINITION_FINGERPRINT
+    assert evidence.executable_fingerprint == EXECUTABLE_FINGERPRINT
+    assert evidence.candidate_schema_fingerprint == CANDIDATE_SCHEMA_FINGERPRINT
 
 
 def test_pipeline_is_end_to_end_and_exact_replay_is_idempotent(tmp_path: Path) -> None:

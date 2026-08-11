@@ -28,6 +28,7 @@ from rquant.strategy_candidate_publish_service import (
     NShapeCandidateBatch,
 )
 from rquant.strategy_candidate_snapshot import StrategyCandidateSnapshotSpool
+from rquant.strategy_evaluators import BuiltinStrategyEvaluatorRegistry
 from rquant.strict_json import canonical_json_bytes
 
 TRADE_DATE = date(2026, 7, 31)
@@ -35,6 +36,20 @@ REFERENCE_DATE = date(2026, 7, 30)
 CAPTURED_AT = datetime(2026, 7, 31, 1, 30, tzinfo=UTC)
 AVAILABLE_AT = datetime(2026, 7, 31, 1, 26, tzinfo=UTC)
 COMMIT = "a" * 40
+REGISTRY = BuiltinStrategyEvaluatorRegistry(producer_commit=COMMIT)
+
+
+def _exact_strategy_settings(strategy_id: str) -> dict[str, object]:
+    definition = REGISTRY.load_definition(strategy_id, 1)
+    return {
+        "definition_fingerprint": definition.spec.spec_fingerprint,
+        "executable_fingerprint": definition.executable_fingerprint,
+        "candidate_schema_fingerprint": definition.candidate_schema_fingerprint,
+        "static_feature_schema": {
+            name: semantic.contract_payload()
+            for name, semantic in definition.static_feature_schema.items()
+        },
+    }
 
 
 def _authority(
@@ -130,6 +145,7 @@ def _manifest(
         settings={
             "strategy_id": strategy_id,
             "strategy_version": 1,
+            **_exact_strategy_settings(strategy_id),
             "candidate_input_path": str(candidate_input_path or (tmp_path / f"{strategy_id}.json")),
             "snapshot_root": str(snapshot_root or (tmp_path / "live" / strategy_id)),
         },
@@ -161,6 +177,7 @@ def test_candidate_publisher_dispatches_all_builtin_strategy_batches(
         CAPTURED_AT,
         strategy_id=strategy_id,
         strategy_version="1",
+        **_exact_strategy_settings(strategy_id),
     )
     assert snapshot is not None
     assert result.input_sequence == -1
@@ -171,6 +188,185 @@ def test_candidate_publisher_dispatches_all_builtin_strategy_batches(
         "candidate_input": "1" * 64,
         "strategy_candidate": snapshot.content_sha256,
     }
+
+
+def test_candidate_publisher_binds_static_strategy_semantics(tmp_path: Path) -> None:
+    input_path = tmp_path / "n_shape.json"
+    root = tmp_path / "live" / "n_shape"
+    identity = _exact_strategy_settings("n_shape")
+    definition_fingerprint = str(identity["definition_fingerprint"])
+    executable_fingerprint = str(identity["executable_fingerprint"])
+    candidate_schema_fingerprint = str(identity["candidate_schema_fingerprint"])
+    _write_input(input_path, _batch("n_shape"))
+    manifest = _manifest(
+        tmp_path,
+        candidate_input_path=input_path,
+        snapshot_root=root,
+    )
+    settings = dict(manifest.settings)
+    settings.update(
+        definition_fingerprint=definition_fingerprint,
+        executable_fingerprint=executable_fingerprint,
+        candidate_schema_fingerprint=candidate_schema_fingerprint,
+        static_feature_schema=identity["static_feature_schema"],
+    )
+
+    candidate_publisher_builder()(manifest.model_copy(update={"settings": settings}))()
+
+    snapshot = StrategyCandidateSnapshotSpool(root).read_strategy_as_of(
+        CAPTURED_AT,
+        strategy_id="n_shape",
+        strategy_version="1",
+        definition_fingerprint=definition_fingerprint,
+        executable_fingerprint=executable_fingerprint,
+        candidate_schema_fingerprint=candidate_schema_fingerprint,
+        static_feature_schema=identity["static_feature_schema"],
+    )
+    assert snapshot is not None
+    assert snapshot.schema_version == 3
+    assert snapshot.authority_binding is not None
+    assert snapshot.authority_binding.schema_version == 3
+    assert snapshot.authority_binding.definition_fingerprint == definition_fingerprint
+    assert snapshot.authority_binding.executable_fingerprint == executable_fingerprint
+    assert snapshot.authority_binding.candidate_schema_fingerprint == candidate_schema_fingerprint
+
+
+def test_auction_candidate_publisher_builds_live_input_during_auction_window(
+    tmp_path: Path,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    def auction_loader(**kwargs: object) -> CandidatePublishBatch:
+        calls.append(dict(kwargs))
+        return _batch("auction_gap")
+
+    root = tmp_path / "live" / "auction-gap"
+    manifest = RuntimeServiceManifest(
+        service_id="candidate.auction-gap.v1",
+        service_kind=RuntimeServiceKind.CANDIDATE_PUBLISHER,
+        plane=RuntimeServicePlane.LIVE,
+        interval_seconds=15,
+        stale_after_seconds=60,
+        producer_commit=COMMIT,
+        settings={
+            "strategy_id": "auction_gap",
+            "strategy_version": 1,
+            **_exact_strategy_settings("auction_gap"),
+            "input_mode": "auction_live",
+            "auction_spool_root": str(tmp_path / "auction-spool"),
+            "daily_database_path": str(tmp_path / "operational-ro.duckdb"),
+            "reference_registry_path": str(tmp_path / "reference.sqlite3"),
+            "calendar_path": str(tmp_path / "calendar.json"),
+            "calendar_expected_commit": COMMIT,
+            "calendar_content_sha256": "c" * 64,
+            "snapshot_root": str(root),
+        },
+    )
+    observed_at = datetime(2026, 7, 31, 1, 27, tzinfo=UTC)
+
+    result = candidate_publisher_builder(
+        auction_input_loader=auction_loader,
+        clock=lambda: observed_at,
+    )(manifest)()
+
+    assert len(calls) == 1
+    assert calls[0] == {
+        "auction_spool_root": tmp_path / "auction-spool",
+        "daily_database_path": tmp_path / "operational-ro.duckdb",
+        "reference_registry_path": tmp_path / "reference.sqlite3",
+        "calendar_path": tmp_path / "calendar.json",
+        "calendar_expected_commit": COMMIT,
+        "calendar_content_sha256": "c" * 64,
+        "trade_date": TRADE_DATE,
+        "observed_at": observed_at,
+        "producer_commit": COMMIT,
+    }
+    snapshot = StrategyCandidateSnapshotSpool(root).read_strategy_as_of(
+        CAPTURED_AT,
+        strategy_id="auction_gap",
+        strategy_version="1",
+        **_exact_strategy_settings("auction_gap"),
+    )
+    assert snapshot is not None
+    assert result.output_sequence == snapshot.sequence == 0
+    assert result.source_generations["candidate_input"] == "1" * 64
+
+
+def test_live_auction_input_mode_is_exclusive_and_strategy_specific() -> None:
+    base = {
+        "strategy_id": "auction_gap",
+        "strategy_version": 1,
+        **_exact_strategy_settings("auction_gap"),
+        "input_mode": "auction_live",
+        "auction_spool_root": "/tmp/auction-spool",
+        "daily_database_path": "/tmp/operational-ro.duckdb",
+        "reference_registry_path": "/tmp/reference.sqlite3",
+        "calendar_path": "/tmp/calendar.json",
+        "calendar_expected_commit": COMMIT,
+        "calendar_content_sha256": "c" * 64,
+        "snapshot_root": "/tmp/output",
+    }
+
+    CandidatePublisherRuntimeSettings.model_validate(base)
+    with pytest.raises(ValidationError, match="schema|auction_gap"):
+        CandidatePublisherRuntimeSettings.model_validate({**base, "strategy_id": "n_shape"})
+    with pytest.raises(ValidationError, match="candidate_input_path"):
+        CandidatePublisherRuntimeSettings.model_validate(
+            {**base, "candidate_input_path": "/tmp/input.json"}
+        )
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "definition_fingerprint",
+        "executable_fingerprint",
+        "candidate_schema_fingerprint",
+    ),
+)
+def test_candidate_runtime_requires_all_exact_strategy_fingerprints(field: str) -> None:
+    settings = {
+        "strategy_id": "n_shape",
+        "strategy_version": 1,
+        **_exact_strategy_settings("n_shape"),
+        "candidate_input_path": "/tmp/input.json",
+        "snapshot_root": "/tmp/output",
+    }
+    settings.pop(field)
+
+    with pytest.raises(ValidationError, match=field):
+        CandidatePublisherRuntimeSettings.model_validate(settings)
+
+
+def test_auction_candidate_publisher_rejects_naive_runtime_clock(tmp_path: Path) -> None:
+    manifest = RuntimeServiceManifest(
+        service_id="candidate.auction-gap.v1",
+        service_kind=RuntimeServiceKind.CANDIDATE_PUBLISHER,
+        plane=RuntimeServicePlane.LIVE,
+        interval_seconds=15,
+        stale_after_seconds=60,
+        producer_commit=COMMIT,
+        settings={
+            "strategy_id": "auction_gap",
+            "strategy_version": 1,
+            **_exact_strategy_settings("auction_gap"),
+            "input_mode": "auction_live",
+            "auction_spool_root": str(tmp_path / "auction-spool"),
+            "daily_database_path": str(tmp_path / "operational-ro.duckdb"),
+            "reference_registry_path": str(tmp_path / "reference.sqlite3"),
+            "calendar_path": str(tmp_path / "calendar.json"),
+            "calendar_expected_commit": COMMIT,
+            "calendar_content_sha256": "c" * 64,
+            "snapshot_root": str(tmp_path / "candidate"),
+        },
+    )
+    step = candidate_publisher_builder(
+        auction_input_loader=lambda **_: _batch("auction_gap"),
+        clock=lambda: datetime(2026, 7, 31, 9, 27),
+    )(manifest)
+
+    with pytest.raises(ValueError, match="timezone-aware"):
+        step()
 
 
 def test_candidate_publisher_reloads_each_step_and_publishes_only_new_semantics(
@@ -568,6 +764,7 @@ def test_candidate_runtime_settings_are_typed_frozen_and_paths_are_normalized(
     valid = CandidatePublisherRuntimeSettings(
         strategy_id="n_shape",
         strategy_version=1,
+        **_exact_strategy_settings("n_shape"),
         candidate_input_path=Path("/tmp/input.json"),
         snapshot_root=Path("/tmp/output"),
     )
