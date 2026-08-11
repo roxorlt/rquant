@@ -46,6 +46,25 @@ class TrustedGitExecutable:
     links: int
 
 
+@dataclass(frozen=True)
+class _TrustedGitPathIdentity:
+    path: Path
+    device: int
+    inode: int
+    mode: int
+    owner: int
+    links: int
+
+
+@dataclass(frozen=True)
+class TrustedGitRepository:
+    checkout_root: _TrustedGitPathIdentity
+    git_dir: _TrustedGitPathIdentity
+    common_dir: _TrustedGitPathIdentity
+    object_directory: _TrustedGitPathIdentity
+    index_file: _TrustedGitPathIdentity
+
+
 def bind_trusted_git_executable(path: Path | None = None) -> TrustedGitExecutable:
     raw = path or Path(os.environ.get("RQUANT_TRUSTED_GIT_PATH", str(_DEFAULT_TRUSTED_GIT_PATH)))
     candidate = Path(raw)
@@ -90,6 +109,74 @@ def bind_trusted_git_executable(path: Path | None = None) -> TrustedGitExecutabl
     )
 
 
+def _capture_git_path_identity(
+    path: Path,
+    *,
+    expect_directory: bool,
+) -> _TrustedGitPathIdentity:
+    try:
+        physical = path.resolve(strict=True)
+        observed = physical.lstat()
+    except OSError as exc:
+        raise ValueError("trusted Git repository path is unavailable") from exc
+    expected_type = stat.S_ISDIR if expect_directory else stat.S_ISREG
+    if not expected_type(observed.st_mode) or stat.S_ISLNK(observed.st_mode):
+        raise ValueError("trusted Git repository path has unsafe type")
+    return _TrustedGitPathIdentity(
+        path=physical,
+        device=observed.st_dev,
+        inode=observed.st_ino,
+        mode=observed.st_mode,
+        owner=observed.st_uid,
+        links=observed.st_nlink,
+    )
+
+
+def _assert_trusted_git_repository_identity(repository: TrustedGitRepository) -> None:
+    paths = (
+        (repository.checkout_root, True),
+        (repository.git_dir, True),
+        (repository.common_dir, True),
+        (repository.object_directory, True),
+        (repository.index_file, False),
+    )
+    for expected, expect_directory in paths:
+        if (
+            _capture_git_path_identity(
+                expected.path,
+                expect_directory=expect_directory,
+            )
+            != expected
+        ):
+            raise ValueError("trusted Git repository identity changed")
+
+
+def _trusted_git_environment(repository: TrustedGitRepository | None) -> dict[str, str]:
+    environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    environment.update(
+        {
+            "GIT_ATTR_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_TERMINAL_PROMPT": "0",
+            "LC_ALL": "C",
+        }
+    )
+    if repository is not None:
+        environment.update(
+            {
+                "GIT_COMMON_DIR": str(repository.common_dir.path),
+                "GIT_DIR": str(repository.git_dir.path),
+                "GIT_INDEX_FILE": str(repository.index_file.path),
+                "GIT_OBJECT_DIRECTORY": str(repository.object_directory.path),
+                "GIT_WORK_TREE": str(repository.checkout_root.path),
+            }
+        )
+    return environment
+
+
 def _run_trusted_git(
     binding: TrustedGitExecutable,
     arguments: list[str],
@@ -97,23 +184,127 @@ def _run_trusted_git(
     cwd: Path,
     text: bool = True,
     deadline_monotonic: float | None = None,
+    repository: TrustedGitRepository | None = None,
 ) -> subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes]:
+    try:
+        physical_cwd = cwd.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("trusted Git checkout is unavailable") from exc
+    if not physical_cwd.is_dir():
+        raise ValueError("trusted Git checkout is not a directory")
+    if repository is not None:
+        _assert_trusted_git_repository_identity(repository)
+        if physical_cwd != repository.checkout_root.path:
+            raise ValueError("trusted Git checkout binding mismatch")
     if bind_trusted_git_executable(binding.path) != binding:
         raise ValueError("trusted Git executable identity changed")
     result = run_contained(
-        [str(binding.path), *arguments],
-        cwd=cwd,
+        [
+            str(binding.path),
+            "--no-pager",
+            "--no-replace-objects",
+            "-C",
+            str(physical_cwd),
+            *arguments,
+        ],
+        cwd=physical_cwd,
         text=text,
         deadline_monotonic=(
             deadline_monotonic if deadline_monotonic is not None else time.monotonic() + 3
         ),
         check=False,
-        env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"},
+        env=_trusted_git_environment(repository),
         may_spawn_background_descendants=False,
     )
     if bind_trusted_git_executable(binding.path) != binding:
         raise ValueError("trusted Git executable identity changed")
+    if repository is not None:
+        _assert_trusted_git_repository_identity(repository)
     return result
+
+
+def _physical_git_path(raw_path: str) -> Path:
+    candidate = Path(raw_path)
+    if not candidate.is_absolute():
+        raise ValueError("trusted Git repository path is not absolute")
+    try:
+        return candidate.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("trusted Git repository path is unavailable") from exc
+
+
+def bind_trusted_git_repository(
+    executable: TrustedGitExecutable,
+    checkout_root: Path,
+    *,
+    deadline_monotonic: float | None = None,
+) -> TrustedGitRepository:
+    checkout_identity = _capture_git_path_identity(checkout_root, expect_directory=True)
+    metadata = _run_trusted_git(
+        executable,
+        [
+            "rev-parse",
+            "--path-format=absolute",
+            "--show-toplevel",
+            "--absolute-git-dir",
+            "--git-common-dir",
+            "--git-path",
+            "objects",
+            "--git-path",
+            "index",
+        ],
+        cwd=checkout_identity.path,
+        deadline_monotonic=deadline_monotonic,
+    )
+    if metadata.returncode != 0 or not isinstance(metadata.stdout, str):
+        raise ValueError("trusted Git repository metadata is unavailable")
+    metadata_paths = metadata.stdout.splitlines()
+    if len(metadata_paths) != 5 or not all(metadata_paths):
+        raise ValueError("trusted Git repository metadata is malformed")
+    top_level = _physical_git_path(metadata_paths[0])
+    if top_level != checkout_identity.path:
+        raise ValueError("trusted Git top-level does not match checkout")
+    git_dir, common_dir, object_directory, index_file = map(
+        _physical_git_path,
+        metadata_paths[1:],
+    )
+    git_dir_identity = _capture_git_path_identity(git_dir, expect_directory=True)
+    common_dir_identity = _capture_git_path_identity(common_dir, expect_directory=True)
+    object_identity = _capture_git_path_identity(object_directory, expect_directory=True)
+    index_identity = _capture_git_path_identity(index_file, expect_directory=False)
+    if object_identity.path != (common_dir_identity.path / "objects").resolve(strict=True):
+        raise ValueError("trusted Git object directory is outside repository metadata")
+    if index_identity.path != (git_dir_identity.path / "index").resolve(strict=True):
+        raise ValueError("trusted Git index is outside worktree metadata")
+    marker = checkout_identity.path / ".git"
+    try:
+        marker_identity = marker.lstat()
+    except OSError as exc:
+        raise ValueError("trusted Git checkout marker is unavailable") from exc
+    if stat.S_ISDIR(marker_identity.st_mode):
+        if (
+            marker.resolve(strict=True) != git_dir_identity.path
+            or git_dir_identity.path != common_dir_identity.path
+        ):
+            raise ValueError("trusted Git checkout metadata mismatch")
+    elif stat.S_ISREG(marker_identity.st_mode) and not stat.S_ISLNK(marker_identity.st_mode):
+        linked_metadata_root = common_dir_identity.path / "worktrees"
+        if (
+            git_dir_identity.path == common_dir_identity.path
+            or not git_dir_identity.path.is_relative_to(linked_metadata_root)
+        ):
+            raise ValueError("trusted Git linked worktree metadata mismatch")
+    else:
+        raise ValueError("trusted Git checkout marker has unsafe type")
+    repository = TrustedGitRepository(
+        checkout_root=checkout_identity,
+        git_dir=git_dir_identity,
+        common_dir=common_dir_identity,
+        object_directory=object_identity,
+        index_file=index_identity,
+    )
+    _assert_trusted_git_repository_identity(repository)
+    return repository
 
 
 class ResearchNotice(BaseModel):
@@ -278,11 +469,17 @@ def detect_code_commit(
     cwd = repo_root or Path(__file__).resolve().parents[2]
     try:
         git = bind_trusted_git_executable(trusted_git_path)
+        repository = bind_trusted_git_repository(
+            git,
+            cwd,
+            deadline_monotonic=deadline_monotonic,
+        )
         result = _run_trusted_git(
             git,
-            ["rev-parse", "HEAD"],
-            cwd=cwd,
+            ["rev-parse", "--verify", "HEAD^{commit}"],
+            cwd=repository.checkout_root.path,
             deadline_monotonic=deadline_monotonic,
+            repository=repository,
         )
     except (OSError, subprocess.SubprocessError, ValueError):
         return None
@@ -293,8 +490,9 @@ def detect_code_commit(
         status = _run_trusted_git(
             git,
             ["status", "--porcelain", "--untracked-files=normal"],
-            cwd=cwd,
+            cwd=repository.checkout_root.path,
             deadline_monotonic=deadline_monotonic,
+            repository=repository,
         )
     except (OSError, subprocess.SubprocessError, ValueError):
         return f"{commit}-dirty"
@@ -313,24 +511,25 @@ def detect_verified_code_commit(
     cwd = repo_root or Path(__file__).resolve().parents[2]
     try:
         git = bind_trusted_git_executable(trusted_git_path)
-        head = _run_trusted_git(
+        repository = bind_trusted_git_repository(
             git,
-            ["rev-parse", "HEAD"],
-            cwd=cwd,
+            cwd,
             deadline_monotonic=deadline_monotonic,
         )
-        checkout = _run_trusted_git(
+        head = _run_trusted_git(
             git,
-            ["rev-parse", "--show-toplevel"],
-            cwd=cwd,
+            ["rev-parse", "--verify", "HEAD^{commit}"],
+            cwd=repository.checkout_root.path,
             deadline_monotonic=deadline_monotonic,
+            repository=repository,
         )
         status = _run_trusted_git(
             git,
             ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
-            cwd=cwd,
+            cwd=repository.checkout_root.path,
             text=False,
             deadline_monotonic=deadline_monotonic,
+            repository=repository,
         )
         ignored_source_artifacts = _run_trusted_git(
             git,
@@ -343,9 +542,10 @@ def detect_verified_code_commit(
                 "--",
                 ":(top)src/rquant",
             ],
-            cwd=cwd,
+            cwd=repository.checkout_root.path,
             text=False,
             deadline_monotonic=deadline_monotonic,
+            repository=repository,
         )
     except (OSError, subprocess.SubprocessError, ValueError):
         return None
@@ -353,7 +553,6 @@ def detect_verified_code_commit(
     if (
         head.returncode != 0
         or re.fullmatch(r"[0-9a-f]{40}", commit) is None
-        or checkout.returncode != 0
         or status.returncode != 0
         or ignored_source_artifacts.returncode != 0
     ):
@@ -361,9 +560,7 @@ def detect_verified_code_commit(
     injected = os.getenv("RQUANT_CODE_COMMIT", "").strip()
     if injected and injected != commit:
         return None
-    checkout_root = Path(checkout.stdout.strip())
-    if not checkout_root.is_absolute():
-        return None
+    checkout_root = repository.checkout_root.path
     if status.stdout:
         return f"{commit}-dirty"
     for raw_path in ignored_source_artifacts.stdout.split(b"\0"):
