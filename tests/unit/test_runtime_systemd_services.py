@@ -42,6 +42,9 @@ CREDENTIAL_FILE = "/etc/credstore.encrypted/rquant-runtime/instances/%i/current.
 EXPECTED_EXECUTABLE = "/home/lighthouse/rquant/.venv/bin/python"
 EXPECTED_MODULE = "rquant.runtime_service_main"
 RETENTION_INSTANCE = "svc-248ba9b29fdc243fcd4f7d09641fbdedd61871ffeea693ea4eb26f36f264b349"
+REQUIRED_INACCESSIBLE_PATHS = {
+    "lab-jobs": frozenset({"/etc/rquant/lab-claim-finalizer-runtime"}),
+}
 
 
 def test_generic_write_plane_runtime_templates_are_retired() -> None:
@@ -450,6 +453,7 @@ def test_runtime_template_is_hardened_without_shell_or_manifest_secrets(
         "/home/lighthouse/rquant/.env",
         f"-{CURRENT_ROOT}/secrets",
         f"-{CURRENT_ROOT}/credentials",
+        *REQUIRED_INACCESSIBLE_PATHS.get(plane, ()),
     }
     assert service["ProtectProc"] == "invisible"
     assert service["ProtectKernelTunables"] == "true"
@@ -870,7 +874,16 @@ def test_runtime_templates_are_install_only_not_auto_enabled(plane: str) -> None
 @pytest.mark.parametrize("plane", TEMPLATES)
 def test_optional_runtime_masks_do_not_block_unit_start(plane: str) -> None:
     service = _load(plane)["Service"]
-    assert all(path.startswith("-") for path in service["InaccessiblePaths"].split()[1:])
+    inaccessible = service["InaccessiblePaths"].split()
+    required = REQUIRED_INACCESSIBLE_PATHS.get(plane, frozenset())
+    assert inaccessible[0] == "/home/lighthouse/rquant/.env"
+    assert set(inaccessible[1:]) == {
+        f"-{CURRENT_ROOT}/secrets",
+        f"-{CURRENT_ROOT}/credentials",
+        *required,
+    }
+    assert all(path.startswith("-") for path in inaccessible[1:] if path not in required)
+    assert all(not path.startswith("-") for path in required)
     for path in service.get("ReadOnlyPaths", "").split():
         if path.endswith(("/candidates", "/strategies")):
             assert path.startswith("-")

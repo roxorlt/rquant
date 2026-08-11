@@ -2292,11 +2292,19 @@ def _linux_process_inventory(
                 raise TimeoutError("process inventory timed out")
             if not entry.name.isdigit():
                 continue
-            raw = (entry / "stat").read_text(encoding="ascii")
+            try:
+                raw = (entry / "stat").read_text(encoding="ascii")
+            except OSError as exc:
+                if isinstance(exc, (FileNotFoundError, ProcessLookupError)) or exc.errno in {
+                    errno.ENOENT,
+                    errno.ESRCH,
+                }:
+                    continue
+                raise
             close = raw.rfind(")")
             fields = raw[close + 2 :].split()
             if close < 0 or len(fields) < 20:
-                continue
+                raise ValueError("process stat is malformed")
             pid = int(entry.name)
             identity = ProcessIdentity(pid, (int(fields[19]), 0))
             result[pid] = _ProcessObservation(

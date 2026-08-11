@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import inspect
 import os
 import shutil
@@ -79,6 +80,53 @@ def _observation(pid: int, parent: int, started: int) -> contained._ProcessObser
         identity=contained.ProcessIdentity(pid, (started, 0)),
         parent_pid=parent,
     )
+
+
+def _linux_stat_payload(pid: int, parent: int, started: int | str) -> str:
+    fields = ["S", str(parent), *(["0"] * 17), str(started)]
+    return f"{pid} (short lived worker) {' '.join(fields)}"
+
+
+class _FakeLinuxProcStat:
+    def __init__(self, payload: str | OSError) -> None:
+        self._payload = payload
+
+    def read_text(self, *, encoding: str) -> str:
+        assert encoding == "ascii"
+        if isinstance(self._payload, OSError):
+            raise self._payload
+        return self._payload
+
+
+class _FakeLinuxProcEntry:
+    def __init__(self, pid: int, payload: str | OSError) -> None:
+        self.name = str(pid)
+        self._stat = _FakeLinuxProcStat(payload)
+
+    def __truediv__(self, child: str) -> _FakeLinuxProcStat:
+        assert child == "stat"
+        return self._stat
+
+
+class _FakeLinuxProcRoot:
+    def __init__(self, entries: tuple[_FakeLinuxProcEntry, ...]) -> None:
+        self._entries = entries
+
+    def iterdir(self) -> Iterator[_FakeLinuxProcEntry]:
+        return iter(self._entries)
+
+
+def _install_fake_linux_proc(
+    monkeypatch: pytest.MonkeyPatch,
+    *entries: _FakeLinuxProcEntry,
+) -> None:
+    root = _FakeLinuxProcRoot(entries)
+
+    def path(value: str) -> _FakeLinuxProcRoot:
+        assert value == "/proc"
+        return root
+
+    monkeypatch.setattr(contained, "Path", path)
 
 
 def _close_test_fd_if_open(descriptor: int) -> None:
@@ -1729,6 +1777,109 @@ def test_descendant_discovery_uses_immutable_birth_parent_identity_after_reparen
     descendants = contained._discover_descendants(100, inventory, {100: root})
 
     assert descendants == {101: reparented_child}
+
+
+@pytest.mark.parametrize(
+    "gone_error",
+    (
+        FileNotFoundError(errno.ENOENT, "process exited"),
+        ProcessLookupError(errno.ESRCH, "process exited"),
+    ),
+    ids=("enoent", "esrch"),
+)
+def test_linux_inventory_skips_only_entries_gone_after_enumeration(
+    monkeypatch: pytest.MonkeyPatch,
+    gone_error: OSError,
+) -> None:
+    _install_fake_linux_proc(
+        monkeypatch,
+        _FakeLinuxProcEntry(101, _linux_stat_payload(101, 1, 11)),
+        _FakeLinuxProcEntry(102, gone_error),
+    )
+
+    inventory = contained._linux_process_inventory(time.monotonic() + 1)
+
+    assert inventory == {101: _observation(101, 1, 11)}
+
+
+def test_linux_inventory_keeps_permission_denial_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    denied = PermissionError(errno.EACCES, "proc stat denied")
+    _install_fake_linux_proc(monkeypatch, _FakeLinuxProcEntry(101, denied))
+
+    with pytest.raises(contained.ContainedProcessError, match="process inventory failed") as caught:
+        contained._linux_process_inventory(time.monotonic() + 1)
+
+    assert caught.value.__cause__ is denied
+
+
+@pytest.mark.parametrize(
+    "payload",
+    ("malformed stat", _linux_stat_payload(101, 1, "not-a-start-time")),
+    ids=("structure", "starttime"),
+)
+def test_linux_inventory_keeps_malformed_stat_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    payload: str,
+) -> None:
+    _install_fake_linux_proc(monkeypatch, _FakeLinuxProcEntry(101, payload))
+
+    with pytest.raises(contained.ContainedProcessError, match="process inventory failed") as caught:
+        contained._linux_process_inventory(time.monotonic() + 1)
+
+    assert isinstance(caught.value.__cause__, ValueError)
+
+
+def test_signal_identity_never_signals_reused_pid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old_identity = contained.ProcessIdentity(101, (11, 0))
+    replacement = _observation(101, 1, 99)
+    signalled: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        contained.os,
+        "kill",
+        lambda pid, signum: signalled.append((pid, signum)),
+    )
+
+    contained._signal_identity(old_identity, signal.SIGKILL, {101: replacement})
+
+    assert signalled == []
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="Linux /proc process-churn regression",
+)
+def test_linux_inventory_survives_short_lived_process_churn() -> None:
+    failures: list[BaseException] = []
+
+    def churn() -> None:
+        try:
+            for _ in range(64):
+                subprocess.run(
+                    [sys.executable, "-c", "pass"],
+                    check=True,
+                    timeout=5,
+                )
+        except BaseException as exc:
+            failures.append(exc)
+
+    worker = threading.Thread(target=churn)
+    worker.start()
+    inventories = 0
+    deadline = time.monotonic() + 20
+    try:
+        while worker.is_alive():
+            contained._linux_process_inventory(deadline)
+            inventories += 1
+    finally:
+        worker.join(timeout=20)
+
+    assert not worker.is_alive()
+    assert failures == []
+    assert inventories > 0
 
 
 class _FakeKernelTracker:
