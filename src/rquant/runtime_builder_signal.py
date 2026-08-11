@@ -29,6 +29,7 @@ from rquant.runtime_service_entrypoint import (
     RuntimeServiceManifest,
     RuntimeServiceStep,
 )
+from rquant.runtime_shadow_validation import ShadowStrategyBinding
 from rquant.signal_bus import (
     SignalBusRoutedRecord,
     SignalBusStore,
@@ -55,6 +56,7 @@ if TYPE_CHECKING:
         ServingSourceAuthorityReader,
     )
     from rquant.runtime_serving_snapshot import SourceReadResult
+    from rquant.serving_page_projection_source import SignalPageProjectionProducer
 
 _MAX_BATCH_LIMIT = 1_000
 _SIGNALS_DATASET_ID = "signals"
@@ -102,6 +104,10 @@ class _SignalBusSettings(RuntimeContractModel):
 class SignalRouterSourceSettings(RuntimeContractModel):
     source_id: str = Field(min_length=1)
     runner_state_path: Path | None = None
+    expected_strategy_registration_fingerprint: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     expected_strategy_spec_fingerprint: str | None = Field(
         default=None,
         pattern=r"^[0-9a-f]{64}$",
@@ -127,6 +133,7 @@ class SignalRouterSourceSettings(RuntimeContractModel):
     def validate_authority_group(self) -> SignalRouterSourceSettings:
         configured = (
             self.runner_state_path,
+            self.expected_strategy_registration_fingerprint,
             self.expected_strategy_spec_fingerprint,
             self.expected_evaluator_contract_fingerprint,
         )
@@ -147,6 +154,10 @@ class SignalRouterSettings(_SignalBusSettings):
     sources: tuple[SignalRouterSourceSettings, ...] = ()
     routing_policy_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     runner_state_path: Path | None = None
+    expected_strategy_registration_fingerprint: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     expected_strategy_spec_fingerprint: str | None = Field(
         default=None,
         pattern=r"^[0-9a-f]{64}$",
@@ -181,6 +192,7 @@ class SignalRouterSettings(_SignalBusSettings):
             value is not None
             for value in (
                 self.runner_state_path,
+                self.expected_strategy_registration_fingerprint,
                 self.expected_strategy_spec_fingerprint,
                 self.expected_evaluator_contract_fingerprint,
             )
@@ -208,6 +220,9 @@ class SignalRouterSettings(_SignalBusSettings):
             SignalRouterSourceSettings(
                 source_id=self.source_id,
                 runner_state_path=self.runner_state_path,
+                expected_strategy_registration_fingerprint=(
+                    self.expected_strategy_registration_fingerprint
+                ),
                 expected_strategy_spec_fingerprint=(self.expected_strategy_spec_fingerprint),
                 expected_evaluator_contract_fingerprint=(
                     self.expected_evaluator_contract_fingerprint
@@ -235,6 +250,22 @@ class NotifierSettings(RuntimeContractModel):
     pushdeer_recipient_id: str = Field(default="admin", min_length=1)
     pushplus_recipient_id: str = Field(default="admin", min_length=1)
     serving_authority_root: Path | None = None
+    page_projection_database_path: Path | None = None
+    page_projection_canvas_catalog_root: Path | None = None
+    page_projection_canvas_receipt_root: Path | None = None
+    page_projection_page_control_outbox_path: Path | None = None
+    page_projection_canvas_active_key_id: str | None = Field(
+        default=None,
+        pattern=r"^[a-z0-9][a-z0-9_.-]{0,127}$",
+    )
+    page_projection_canvas_active_public_key_pem: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=16_384,
+    )
+    page_projection_canvas_previous_public_key_pems: Mapping[str, str] = Field(
+        default_factory=dict
+    )
     serving_previous_producer_commit: str | None = Field(
         default=None,
         pattern=r"^[0-9a-f]{40}$",
@@ -245,6 +276,10 @@ class NotifierSettings(RuntimeContractModel):
     @field_validator(
         "signal_spool_root",
         "notification_state_path",
+        "page_projection_database_path",
+        "page_projection_canvas_catalog_root",
+        "page_projection_canvas_receipt_root",
+        "page_projection_page_control_outbox_path",
         "serving_authority_root",
     )
     @classmethod
@@ -259,6 +294,32 @@ class NotifierSettings(RuntimeContractModel):
     def validate_retry_window(self) -> NotifierSettings:
         if self.retry_max_seconds < self.retry_base_seconds:
             raise ValueError("retry_max_seconds must be at least retry_base_seconds")
+        if self.page_projection_database_path is not None and self.serving_authority_root is None:
+            raise ValueError("page projection database requires a signals serving authority root")
+        if (
+            self.page_projection_canvas_catalog_root is not None
+            and self.page_projection_database_path is None
+        ):
+            raise ValueError("canvas catalog projection requires a page projection database")
+        canvas_authority = (
+            self.page_projection_canvas_receipt_root,
+            self.page_projection_page_control_outbox_path,
+            self.page_projection_canvas_active_key_id,
+            self.page_projection_canvas_active_public_key_pem,
+        )
+        if self.page_projection_canvas_catalog_root is not None and any(
+            value is None for value in canvas_authority
+        ):
+            raise ValueError("canvas catalog projection requires its full public authority")
+        if self.page_projection_canvas_catalog_root is None and any(
+            value is not None for value in canvas_authority
+        ):
+            raise ValueError("canvas projection authority requires a catalog root")
+        if (
+            self.page_projection_canvas_active_key_id
+            in self.page_projection_canvas_previous_public_key_pems
+        ):
+            raise ValueError("canvas projection active key cannot also be previous")
         return self
 
     def open_store(self) -> NotificationStateStore:
@@ -551,6 +612,7 @@ def signal_router_builder(
             generations = {
                 "signal_route_spool": before_publish.source_generation_id,
             }
+            observed_at = clock()
             for index, source_settings in enumerate(settings.source_settings):
                 source_id = source_settings.source_id
                 source = resolved_source_loader(source_id)
@@ -559,6 +621,11 @@ def signal_router_builder(
                     source_id=source_id,
                     source=source,
                     after_sequence=current.last_sequence,
+                )
+                bus.bind_route_source(
+                    descriptor,
+                    routing_policy_fingerprint=settings.routing_policy_fingerprint,
+                    observed_at=observed_at,
                 )
                 sources[source_id] = source
                 descriptors[source_id] = descriptor
@@ -577,7 +644,6 @@ def signal_router_builder(
                     degraded_reasons=("signal_router:paused",),
                 )
 
-            observed_at = clock()
             remaining = settings.batch_limit
             processed_count = 0
             deferred_sources: set[str] = set()
@@ -652,6 +718,56 @@ def signal_router_builder(
     return build
 
 
+def build_shadow_runner_sources(
+    *,
+    manifest: RuntimeServiceManifest,
+    bindings: Mapping[str, ShadowStrategyBinding],
+) -> tuple[tuple[ShadowStrategyBinding, ReadonlyStrategyRunnerSignalSource], ...]:
+    """Construct production shadow readers from the router's frozen source authority."""
+
+    _require_manifest(manifest, kind=RuntimeServiceKind.SIGNAL_ROUTER)
+    settings = SignalRouterSettings.model_validate(dict(manifest.settings))
+    if not settings.has_manifest_authority:
+        raise ValueError("shadow runner sources require manifest source authority")
+    expected_ids = {item.source_id for item in settings.source_settings}
+    if set(bindings) != expected_ids:
+        raise ValueError("shadow source bindings must exactly cover router source authority")
+    result = []
+    for source_settings in settings.source_settings:
+        if (
+            source_settings.runner_state_path is None
+            or source_settings.expected_strategy_spec_fingerprint is None
+            or source_settings.expected_evaluator_contract_fingerprint is None
+            or source_settings.expected_strategy_registration_fingerprint is None
+        ):
+            raise ValueError("shadow runner source authority is incomplete")
+        binding = ShadowStrategyBinding.model_validate(bindings[source_settings.source_id])
+        if (
+            binding.definition_fingerprint
+            != source_settings.expected_strategy_registration_fingerprint
+        ):
+            raise ValueError("shadow binding definition identity does not match runner authority")
+        if (
+            binding.executable_fingerprint
+            != source_settings.expected_evaluator_contract_fingerprint
+        ):
+            raise ValueError("shadow binding executable identity does not match runner authority")
+        source = ReadonlyStrategyRunnerSignalSource(
+            source_id=source_settings.source_id,
+            path=source_settings.runner_state_path,
+            expected_strategy_spec_fingerprint=(source_settings.expected_strategy_spec_fingerprint),
+            expected_evaluator_contract_fingerprint=(
+                source_settings.expected_evaluator_contract_fingerprint
+            ),
+            busy_timeout_ms=settings.busy_timeout_ms,
+        )
+        strategy_id, strategy_version, _spec_fingerprint = source.strategy_identity()
+        if strategy_id != binding.strategy_id or strategy_version != binding.strategy_version:
+            raise ValueError("shadow binding strategy identity does not match runner authority")
+        result.append((binding, source))
+    return tuple(result)
+
+
 def notifier_builder(
     *,
     provider_loader: ProviderLoader | None = None,
@@ -666,6 +782,7 @@ def notifier_builder(
         authority_publisher: ServingSourceAuthorityPublisher | None = None
         authority_reader: ServingSourceAuthorityReader | None = None
         previous_authority_reader: ServingSourceAuthorityReader | None = None
+        page_projection_producer: SignalPageProjectionProducer | None = None
         if settings.serving_authority_root is not None:
             from rquant.runtime_serving_authority import (
                 ServingSourceAuthorityPublisher,
@@ -696,6 +813,40 @@ def notifier_builder(
                     expected_dataset_id=_SIGNALS_DATASET_ID,
                     expected_payload_kind="signal_delivery",
                 )
+            if settings.page_projection_database_path is not None:
+                from rquant.canvas_publication_receipt import Ed25519CanvasPublicationKeyring
+                from rquant.serving_page_projection_source import (
+                    DuckDBSignalPageProjectionSource,
+                    SignalPageProjectionProducer,
+                )
+
+                canvas_keyring = None
+                if settings.page_projection_canvas_catalog_root is not None:
+                    canvas_keyring = Ed25519CanvasPublicationKeyring(
+                        active_key_id=(settings.page_projection_canvas_active_key_id or ""),
+                        active_public_key=(
+                            settings.page_projection_canvas_active_public_key_pem or ""
+                        ).encode("utf-8"),
+                        previous_public_keys={
+                            key_id: public_key.encode("utf-8")
+                            for key_id, public_key in (
+                                settings.page_projection_canvas_previous_public_key_pems.items()
+                            )
+                        },
+                    )
+
+                page_projection_producer = SignalPageProjectionProducer(
+                    source=DuckDBSignalPageProjectionSource(
+                        settings.page_projection_database_path,
+                        canvas_catalog_root=settings.page_projection_canvas_catalog_root,
+                        canvas_receipt_root=settings.page_projection_canvas_receipt_root,
+                        canvas_publication_keyring=canvas_keyring,
+                        page_control_outbox=(
+                            settings.page_projection_page_control_outbox_path
+                        ),
+                    ),
+                    store=store,
+                )
         if provider_loader is None:
             from rquant.runtime_notification_providers import (
                 build_environment_notification_provider_loader,
@@ -718,12 +869,15 @@ def notifier_builder(
                 }
                 degraded = ["notifier:paused"]
                 if authority_publisher is not None and authority_reader is not None:
+                    authority_observed_at = clock()
+                    if page_projection_producer is not None:
+                        page_projection_producer.publish(authority_observed_at)
                     generation_id, omitted = _publish_signal_authority(
                         store=store,
                         publisher=authority_publisher,
                         reader=authority_reader,
                         previous_reader=previous_authority_reader,
-                        observed_at=clock(),
+                        observed_at=authority_observed_at,
                         history_limit=settings.serving_history_limit,
                     )
                     source_generations["signals_serving_authority"] = generation_id
@@ -798,12 +952,15 @@ def notifier_builder(
                 "signal_route_spool": descriptor.generation_id,
             }
             if authority_publisher is not None and authority_reader is not None:
+                authority_observed_at = clock()
+                if page_projection_producer is not None:
+                    page_projection_producer.publish(authority_observed_at)
                 generation_id, omitted = _publish_signal_authority(
                     store=store,
                     publisher=authority_publisher,
                     reader=authority_reader,
                     previous_reader=previous_authority_reader,
-                    observed_at=clock(),
+                    observed_at=authority_observed_at,
                     history_limit=settings.serving_history_limit,
                 )
                 source_generations["signals_serving_authority"] = generation_id
@@ -833,6 +990,7 @@ __all__ = [
     "SignalRouterSettings",
     "SignalRouterSourceSettings",
     "SignalSourceLoader",
+    "build_shadow_runner_sources",
     "notifier_builder",
     "signal_router_builder",
 ]

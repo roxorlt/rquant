@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 from collections.abc import Mapping
 from datetime import date
+from types import MappingProxyType
 from typing import Annotated, Literal
 from zoneinfo import ZoneInfo
 
@@ -15,6 +15,7 @@ from pydantic import (
     Field,
     StringConstraints,
     ValidationError,
+    field_serializer,
     field_validator,
     model_validator,
 )
@@ -34,7 +35,13 @@ from rquant.runtime_contracts import (
     RuntimeContractModel,
     canonical_sha256,
 )
-from rquant.strategy_candidate_snapshot import candidate_occurrence_id
+from rquant.strategy_candidate_snapshot import (
+    StrategyCandidateStaticFeatureSemantic,
+    candidate_occurrence_id,
+    serialize_candidate_static_features,
+    strategy_candidate_schema_fingerprint,
+    validate_candidate_static_features_against_schema,
+)
 from rquant.strategy_runner import canonical_feature_payload
 
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -59,9 +66,42 @@ class StrategyCandidateFeatureAuthority(RuntimeContractModel):
 
     strategy_id: str = Field(min_length=1)
     strategy_version: str = Field(min_length=1)
-    schema_version: Literal[1, 2, 3]
+    schema_version: Literal[3]
     generation_sha256: Sha256
+    authority_binding_sha256: Sha256
+    definition_fingerprint: Sha256
+    executable_fingerprint: Sha256
+    candidate_schema_fingerprint: Sha256
+    static_feature_names: tuple[str, ...] = Field(min_length=1)
+    static_feature_schema: Mapping[str, StrategyCandidateStaticFeatureSemantic]
     captured_at: AwareUtcDatetime
+
+    @field_validator("static_feature_schema")
+    @classmethod
+    def freeze_static_feature_schema(
+        cls,
+        value: Mapping[str, StrategyCandidateStaticFeatureSemantic],
+    ) -> Mapping[str, StrategyCandidateStaticFeatureSemantic]:
+        return MappingProxyType(dict(sorted(value.items())))
+
+    @field_serializer("static_feature_schema")
+    def serialize_static_feature_schema(
+        self,
+        value: Mapping[str, StrategyCandidateStaticFeatureSemantic],
+    ) -> dict[str, dict[str, str]]:
+        return {name: semantic.model_dump(mode="json") for name, semantic in value.items()}
+
+    @model_validator(mode="after")
+    def validate_static_schema(self) -> StrategyCandidateFeatureAuthority:
+        if self.static_feature_names != tuple(self.static_feature_schema):
+            raise ValueError("candidate authority static names must exactly match its schema")
+        if self.candidate_schema_fingerprint != strategy_candidate_schema_fingerprint(
+            strategy_id=self.strategy_id,
+            strategy_version=self.strategy_version,
+            static_feature_schema=self.static_feature_schema,
+        ):
+            raise ValueError("candidate authority schema fingerprint does not match")
+        return self
 
     @property
     def input_id(self) -> str:
@@ -78,18 +118,11 @@ def _canonical_json(payload: object) -> str:
     )
 
 
-def _is_json_scalar(value: object) -> bool:
-    if value is None:
-        return False
-    if isinstance(value, float):
-        return math.isfinite(value)
-    return isinstance(value, (str, bool, int))
-
-
 def _validate_flat_rows(
     rows: object,
     *,
     columns: tuple[str, ...],
+    nested_columns: tuple[str, ...] = (),
 ) -> list[dict[str, object]]:
     if not isinstance(rows, list):
         raise ValueError("payload rows must be a list")
@@ -98,8 +131,11 @@ def _validate_flat_rows(
     for row in rows:
         if not isinstance(row, dict) or set(row) != expected:
             raise ValueError("payload row columns do not match declared columns")
-        if any(isinstance(value, (dict, list)) for value in row.values()):
-            raise ValueError("joined feature payload forbids nested values")
+        if any(
+            isinstance(value, (dict, list)) and name not in nested_columns
+            for name, value in row.items()
+        ):
+            raise ValueError("only declared static features may contain nested values")
         validated.append(dict(row))
     return validated
 
@@ -160,14 +196,26 @@ class StrategyCandidateFeatureBatch(RuntimeContractModel):
             raise ValueError("joined payload common_batch_id does not match its output contract")
         if decoded["static_feature_names"] != list(self.static_feature_names):
             raise ValueError("joined payload static feature names do not match its output contract")
+        if self.static_feature_names != self.candidate_authority.static_feature_names:
+            raise ValueError("joined static feature names do not match candidate authority schema")
+        if not set(self.static_feature_names).issubset(self.columns):
+            raise ValueError("joined columns do not contain the complete static feature schema")
         if decoded["columns"] != list(self.columns):
             raise ValueError("joined payload columns do not match its output contract")
         if decoded["candidate_authority"] != self.candidate_authority.model_dump(mode="json"):
             raise ValueError(
                 "joined payload candidate authority does not match its output contract"
             )
-        rows = _validate_flat_rows(decoded["rows"], columns=self.columns)
+        rows = _validate_flat_rows(
+            decoded["rows"],
+            columns=self.columns,
+            nested_columns=self.static_feature_names,
+        )
         for row in rows:
+            validate_candidate_static_features_against_schema(
+                static_features={name: row[name] for name in self.static_feature_names},
+                static_feature_schema=self.candidate_authority.static_feature_schema,
+            )
             if (
                 row["candidate_generation_sha256"] != self.candidate_authority.generation_sha256
                 or row["candidate_snapshot_schema_version"]
@@ -190,12 +238,7 @@ class StrategyCandidateFeatureBatch(RuntimeContractModel):
         if _canonical_json(decoded) != self.payload_json:
             raise ValueError("joined feature payload must use canonical JSON")
         frame = pd.DataFrame(rows, columns=self.columns, dtype="object")
-        canonical_rows = json.loads(
-            canonical_feature_payload(
-                frame,
-                schema_version=self.envelope.schema_version,
-            )
-        )["rows"]
+        canonical_rows = json.loads(_canonical_json(frame.to_dict(orient="records")))
         if canonical_rows != rows:
             raise ValueError("joined feature rows cannot be restored losslessly")
         if self.envelope.row_count != len(rows):
@@ -210,16 +253,31 @@ class StrategyCandidateFeatureBatch(RuntimeContractModel):
             raise ValueError("candidate authority input is missing from envelope lineage")
         if self.common_batch_id not in self.envelope.input_batch_ids:
             raise ValueError("common parent input is missing from envelope lineage")
-        for name in self.static_feature_names:
-            statuses = tuple(
-                status for status in self.envelope.field_statuses if status.name == name
-            )
-            if (
-                len(statuses) != 1
-                or statuses[0].status is not FeatureAvailability.AVAILABLE
-                or statuses[0].available_at != self.candidate_authority.captured_at
-            ):
-                raise ValueError(f"static feature status does not bind authority capture: {name}")
+        candidate_ids = tuple(row["ts_code"] for row in rows)
+        if len(candidate_ids) != len(set(candidate_ids)):
+            raise ValueError("joined feature rows require unique candidate ids")
+        expected_static_statuses = {
+            (candidate_id, name)
+            for candidate_id in candidate_ids
+            for name in self.static_feature_names
+        }
+        static_statuses = tuple(
+            status
+            for status in self.envelope.field_statuses
+            if status.name in self.static_feature_names
+        )
+        if {(status.candidate_id, status.name) for status in static_statuses} != (
+            expected_static_statuses
+        ) or len(static_statuses) != len(expected_static_statuses):
+            raise ValueError("static feature statuses must exactly cover every candidate")
+        if any(
+            status.status is not FeatureAvailability.AVAILABLE
+            or status.source_event_time != self.candidate_authority.captured_at
+            or status.available_at != self.candidate_authority.captured_at
+            or status.actual_delay_seconds != 0.0
+            for status in static_statuses
+        ):
+            raise ValueError("static feature status does not bind authority capture")
         expected_batch_id = _joined_batch_id(
             common_batch_id=self.common_batch_id,
             authority=self.candidate_authority,
@@ -237,7 +295,11 @@ class StrategyCandidateFeatureBatch(RuntimeContractModel):
     @property
     def frame(self) -> pd.DataFrame:
         decoded = json.loads(self.payload_json)
-        rows = _validate_flat_rows(decoded["rows"], columns=self.columns)
+        rows = _validate_flat_rows(
+            decoded["rows"],
+            columns=self.columns,
+            nested_columns=self.static_feature_names,
+        )
         return pd.DataFrame(rows, columns=self.columns, dtype="object")
 
 
@@ -251,11 +313,7 @@ def _joined_batch_id(
     return canonical_sha256(
         {
             "common_batch_id": common_batch_id,
-            "strategy_id": authority.strategy_id,
-            "strategy_version": authority.strategy_version,
-            "candidate_snapshot_schema_version": authority.schema_version,
-            "candidate_generation_sha256": authority.generation_sha256,
-            "candidate_captured_at": authority.captured_at,
+            "candidate_authority": authority,
             "joined_content_hash": joined_content_hash,
             "input_batch_ids": input_batch_ids,
         }
@@ -316,28 +374,27 @@ def _requested_hits(
 def _static_feature_keys(
     hits: Mapping[str, CandidateUniverseHitEvidence],
     *,
+    expected_keys: tuple[str, ...],
+    static_feature_schema: Mapping[str, StrategyCandidateStaticFeatureSemantic],
     common_columns: set[str],
     common_statuses: set[str],
 ) -> tuple[str, ...]:
-    if not hits:
-        return ()
     key_sets = {tuple(sorted(hit.static_features)) for hit in hits.values()}
-    if len(key_sets) != 1:
+    if key_sets and key_sets != {expected_keys}:
         raise StrategyCandidateFeatureJoinError(
-            "all requested candidate hits must have the same static feature key set"
+            "candidate hit static features do not match the authority schema"
         )
-    keys = next(iter(key_sets), ())
+    keys = expected_keys
     for hit in hits.values():
-        for key in keys:
-            value = hit.static_features[key]
-            if value is None:
-                raise StrategyCandidateFeatureJoinError(f"static feature {key!r} cannot be null")
-            if isinstance(value, float) and not math.isfinite(value):
-                raise StrategyCandidateFeatureJoinError(f"static feature {key!r} must be finite")
-            if not _is_json_scalar(value):
-                raise StrategyCandidateFeatureJoinError(
-                    f"static feature {key!r} must be a JSON scalar"
-                )
+        try:
+            validate_candidate_static_features_against_schema(
+                static_features=hit.static_features,
+                static_feature_schema=static_feature_schema,
+            )
+        except ValueError as exc:
+            raise StrategyCandidateFeatureJoinError(
+                f"candidate static feature dtype validation failed: {exc}"
+            ) from exc
     reserved_overlap = set(keys) & _RESERVED_COLUMNS
     if reserved_overlap:
         raise StrategyCandidateFeatureJoinError(
@@ -426,6 +483,8 @@ def join_strategy_candidate_features(
         )
     static_keys = _static_feature_keys(
         hits,
+        expected_keys=authority.static_feature_names,
+        static_feature_schema=authority.static_feature_schema,
         common_columns=common_columns,
         common_statuses=common_status_names,
     )
@@ -447,22 +506,27 @@ def join_strategy_candidate_features(
                 "candidate_snapshot_schema_version": hit.schema_version,
             }
         )
-        row.update({key: hit.static_features[key] for key in static_keys})
+        row.update(
+            serialize_candidate_static_features(
+                {key: hit.static_features[key] for key in static_keys}
+            )
+        )
         joined_rows.append(dict(sorted(row.items())))
 
     columns = tuple(sorted(common_columns | set(static_keys) | _RESERVED_COLUMNS))
     joined_frame = pd.DataFrame(joined_rows, columns=columns, dtype="object")
-    canonical_joined_rows = json.loads(
-        canonical_feature_payload(
-            joined_frame,
-            schema_version=common_envelope.schema_version,
-        )
-    )["rows"]
+    canonical_joined_rows = json.loads(_canonical_json(joined_frame.to_dict(orient="records")))
     candidate_authority = StrategyCandidateFeatureAuthority(
         strategy_id=strategy_id,
         strategy_version=strategy_version,
         schema_version=authority.schema_version,
         generation_sha256=authority.generation_sha256,
+        authority_binding_sha256=authority.authority_binding_sha256,
+        definition_fingerprint=authority.definition_fingerprint,
+        executable_fingerprint=authority.executable_fingerprint,
+        candidate_schema_fingerprint=authority.candidate_schema_fingerprint,
+        static_feature_names=authority.static_feature_names,
+        static_feature_schema=authority.static_feature_schema,
         captured_at=authority.captured_at,
     )
     joined_payload = _canonical_json(
@@ -498,10 +562,15 @@ def join_strategy_candidate_features(
         )
     static_statuses = tuple(
         FeatureFieldStatus(
+            candidate_id=candidate_id,
             name=key,
             status=FeatureAvailability.AVAILABLE,
+            source_event_time=static_available_at,
             available_at=static_available_at,
+            decision_cutoff=common_envelope.decision_cutoff,
+            actual_delay_seconds=0.0,
         )
+        for candidate_id in sorted(row["ts_code"] for row in canonical_joined_rows)
         for key in static_keys
     )
     envelope = FeatureBatchEnvelope(
@@ -513,6 +582,8 @@ def join_strategy_candidate_features(
         sequence=common_envelope.sequence,
         event_time=common_envelope.event_time,
         available_at=common_envelope.available_at,
+        decision_cutoff=common_envelope.decision_cutoff,
+        actual_delay_seconds=common_envelope.actual_delay_seconds,
         row_count=len(joined_rows),
         content_hash=joined_content_hash,
         field_statuses=(*common_envelope.field_statuses, *static_statuses),

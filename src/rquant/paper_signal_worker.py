@@ -7,6 +7,7 @@ import sqlite3
 import time
 from collections.abc import Callable, Mapping
 from datetime import date, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
@@ -14,8 +15,18 @@ from typing import Annotated, Self
 
 from pydantic import Field, StringConstraints, field_serializer, field_validator, model_validator
 
-from rquant.paper_broker import BrokerExecutionContext, PaperBrokerStore
-from rquant.paper_contracts import PaperOrder, PaperOrderIntent, PaperOrderType, PaperSide
+from rquant.paper_broker import (
+    BrokerExecutionContext,
+    NoExecutableSellQuantityError,
+    PaperBrokerStore,
+)
+from rquant.paper_contracts import (
+    PaperOrder,
+    PaperOrderIntent,
+    PaperOrderType,
+    PaperSellQuantityAuthority,
+    PaperSide,
+)
 from rquant.runtime_contracts import (
     AwareUtcDatetime,
     RuntimeContractModel,
@@ -26,6 +37,36 @@ from rquant.signal_contracts import SignalAction, SignalEnvelope
 
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 CommitSha = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{40}$")]
+
+
+def _entry_signal_id(signal: SignalEnvelope) -> str | None:
+    if signal.action is SignalAction.B_INTENT:
+        return None
+    value = signal.evidence.get("entry_signal_id")
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError("SELL/REDUCE signal requires a lowercase SHA-256 entry_signal_id")
+    if value == signal.signal_id:
+        raise ValueError("entry_signal_id cannot equal the exit signal_id")
+    return value
+
+
+def _sell_tranche_fraction(signal: SignalEnvelope) -> Decimal:
+    if signal.action not in {SignalAction.REDUCE, SignalAction.S_INTENT}:
+        raise ValueError("sell tranche is only valid for SELL/REDUCE signals")
+    raw = signal.evidence.get("sell_tranche_fraction")
+    try:
+        fraction = Decimal(str(raw))
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError("SELL/REDUCE signal requires sell_tranche_fraction") from exc
+    if signal.action is SignalAction.S_INTENT and fraction != Decimal("1"):
+        raise ValueError("S_INTENT sell_tranche_fraction must equal one")
+    if signal.action is SignalAction.REDUCE and not Decimal("0") < fraction < Decimal("1"):
+        raise ValueError("REDUCE sell_tranche_fraction must be between zero and one")
+    return fraction
 
 
 class PaperSignalQueueStatus(StrEnum):
@@ -151,6 +192,7 @@ class PaperSignalQueueRecord(RuntimeContractModel):
     received_at: AwareUtcDatetime
     updated_at: AwareUtcDatetime
     last_error: str | None = None
+    execution_id: Sha256 | None = None
     quote: PaperQuoteSnapshot | None = None
     intent: PaperOrderIntent | None = None
     order: PaperOrder | None = None
@@ -160,19 +202,48 @@ class PaperSignalQueueRecord(RuntimeContractModel):
         if self.updated_at < self.received_at:
             raise ValueError("updated_at cannot precede received_at")
         if self.status is PaperSignalQueueStatus.PENDING:
-            if self.quote is not None or self.intent is not None or self.order is not None:
+            if (
+                self.execution_id is not None
+                or self.quote is not None
+                or self.intent is not None
+                or self.order is not None
+            ):
                 raise ValueError("pending signal cannot contain execution evidence")
         elif self.status is PaperSignalQueueStatus.PREPARED:
-            if self.quote is None or self.intent is None or self.order is not None:
-                raise ValueError("prepared signal requires quote and intent only")
+            if (
+                self.execution_id is None
+                or self.quote is None
+                or self.intent is None
+                or self.order is not None
+            ):
+                raise ValueError("prepared signal requires execution identity, quote, and intent")
         elif self.status is PaperSignalQueueStatus.COMPLETED:
-            if self.quote is None or self.intent is None or self.order is None:
-                raise ValueError("completed signal requires quote, intent, and order")
+            if (
+                self.execution_id is None
+                or self.quote is None
+                or self.intent is None
+                or self.order is None
+            ):
+                raise ValueError(
+                    "completed signal requires execution identity, quote, intent, and order"
+                )
         elif self.status is PaperSignalQueueStatus.IGNORED:
-            if self.quote is not None or self.intent is not None or self.order is not None:
+            if (
+                self.execution_id is not None
+                or self.quote is not None
+                or self.intent is not None
+                or self.order is not None
+            ):
                 raise ValueError("ignored signal cannot contain execution evidence")
-        elif self.order is not None or (self.quote is None) != (self.intent is None):
-            raise ValueError("expired signal may retain quote and intent as a complete audit pair")
+        elif self.order is not None or not (
+            (self.execution_id is None and self.quote is None and self.intent is None)
+            or (
+                self.execution_id is not None and self.quote is not None and self.intent is not None
+            )
+        ):
+            raise ValueError(
+                "expired signal may retain execution identity, quote, and intent as one audit set"
+            )
         return self
 
 
@@ -198,6 +269,24 @@ def _json(model: RuntimeContractModel) -> str:
 def _error_text(error: BaseException) -> str:
     message = str(error).strip() or "no detail"
     return f"{type(error).__name__}: {message}"
+
+
+def _prepared_execution_id(
+    *,
+    signal: SignalEnvelope,
+    intent: PaperOrderIntent,
+    quote: PaperQuoteSnapshot,
+    due_at: datetime,
+) -> str:
+    return canonical_sha256(
+        {
+            "producer": "paper_signal_worker",
+            "signal_id": signal.signal_id,
+            "intent_id": intent.intent_id,
+            "quote_snapshot_id": quote.snapshot_id,
+            "due_at": due_at,
+        }
+    )
 
 
 class PaperSignalQueueStore:
@@ -261,9 +350,11 @@ class PaperSignalQueueStore:
                     signal_json TEXT NOT NULL,
                     status TEXT NOT NULL,
                     due_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
                     received_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     last_error TEXT,
+                    execution_id TEXT,
                     quote_json TEXT,
                     intent_json TEXT,
                     order_json TEXT
@@ -273,11 +364,56 @@ class PaperSignalQueueStore:
                 CREATE TABLE IF NOT EXISTS paper_signal_prepare_history (
                     signal_id TEXT NOT NULL,
                     revision INTEGER NOT NULL CHECK(revision >= 1),
+                    execution_id TEXT,
                     quote_json TEXT NOT NULL,
                     intent_json TEXT NOT NULL,
                     replaced_at TEXT NOT NULL,
                     PRIMARY KEY(signal_id, revision)
                 );
+                """
+            )
+            queue_columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(paper_signal_queue)").fetchall()
+            }
+            if "execution_id" not in queue_columns:
+                connection.execute("ALTER TABLE paper_signal_queue ADD COLUMN execution_id TEXT")
+            if "expires_at" not in queue_columns:
+                connection.execute("ALTER TABLE paper_signal_queue ADD COLUMN expires_at TEXT")
+                legacy_rows = connection.execute(
+                    "SELECT signal_id, signal_json FROM paper_signal_queue"
+                ).fetchall()
+                for legacy_row in legacy_rows:
+                    try:
+                        legacy_signal = SignalEnvelope.model_validate_json(
+                            legacy_row["signal_json"]
+                        )
+                    except (TypeError, ValueError):
+                        continue
+                    connection.execute(
+                        "UPDATE paper_signal_queue SET expires_at = ? WHERE signal_id = ?",
+                        (legacy_signal.expires_at.isoformat(), legacy_row["signal_id"]),
+                    )
+            history_columns = {
+                str(row[1])
+                for row in connection.execute(
+                    "PRAGMA table_info(paper_signal_prepare_history)"
+                ).fetchall()
+            }
+            if "execution_id" not in history_columns:
+                connection.execute(
+                    "ALTER TABLE paper_signal_prepare_history ADD COLUMN execution_id TEXT"
+                )
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_signal_execution
+                ON paper_signal_queue(execution_id) WHERE execution_id IS NOT NULL
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_paper_signal_expiry
+                ON paper_signal_queue(status, expires_at, signal_id)
                 """
             )
             connection.execute("BEGIN IMMEDIATE")
@@ -364,15 +500,16 @@ class PaperSignalQueueStore:
                 connection.execute(
                     """
                     INSERT INTO paper_signal_queue(
-                        signal_id, signal_json, status, due_at,
+                        signal_id, signal_json, status, due_at, expires_at,
                         received_at, updated_at, last_error
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         signal.signal_id,
                         signal_json,
                         status.value,
                         due_at.isoformat(),
+                        signal.expires_at.isoformat(),
                         received.isoformat(),
                         received.isoformat(),
                         error,
@@ -398,20 +535,15 @@ class PaperSignalQueueStore:
                     """
                     UPDATE paper_signal_queue
                     SET status = ?,
-                        last_error = CASE
-                            WHEN status = ? THEN 'prepared signal expired before broker submission'
-                            ELSE 'signal expired before paper execution'
-                        END,
+                        last_error = 'signal expired before paper execution',
                         updated_at = ?
-                    WHERE status IN (?, ?) AND json_extract(signal_json, '$.expires_at') <= ?
+                    WHERE status = ? AND expires_at <= ?
                     """,
                     (
                         PaperSignalQueueStatus.EXPIRED.value,
-                        PaperSignalQueueStatus.PREPARED.value,
                         observed.isoformat(),
                         PaperSignalQueueStatus.PENDING.value,
-                        PaperSignalQueueStatus.PREPARED.value,
-                        observed.isoformat().replace("+00:00", "Z"),
+                        observed.isoformat(),
                     ),
                 )
                 rows = connection.execute(
@@ -440,6 +572,7 @@ class PaperSignalQueueStore:
         *,
         quote: PaperQuoteSnapshot,
         prepared_at: datetime,
+        sell_quantity_authority: PaperSellQuantityAuthority | None = None,
     ) -> PaperSignalQueueRecord:
         prepared = normalize_aware_utc(prepared_at)
         with self._connect() as connection:
@@ -461,10 +594,23 @@ class PaperSignalQueueStore:
                 if quote.available_at > prepared:
                     raise ValueError("quote is not available at paper decision time")
                 action = record.signal.action
-                quantity = self.policy.action_quantities[action]
                 side = PaperSide.BUY if action is SignalAction.B_INTENT else PaperSide.SELL
+                if side is PaperSide.BUY:
+                    if sell_quantity_authority is not None:
+                        raise ValueError("BUY preparation cannot carry SELL quantity authority")
+                    quantity = self.policy.action_quantities[action]
+                else:
+                    self._validate_sell_authority(
+                        record.signal,
+                        sell_quantity_authority,
+                        decision_cutoff=prepared,
+                    )
+                    assert sell_quantity_authority is not None
+                    quantity = sell_quantity_authority.requested_quantity
                 intent = PaperOrderIntent(
                     signal_id=record.signal.signal_id,
+                    entry_signal_id=_entry_signal_id(record.signal),
+                    sell_quantity_authority=sell_quantity_authority,
                     account_id=self.policy.account_id,
                     ts_code=record.signal.candidate_id,
                     side=side,
@@ -477,15 +623,22 @@ class PaperSignalQueueStore:
                     price_snapshot_id=quote.snapshot_id,
                     producer_commit=self.policy.producer_commit,
                 )
+                execution_id = _prepared_execution_id(
+                    signal=record.signal,
+                    intent=intent,
+                    quote=quote,
+                    due_at=record.due_at,
+                )
                 connection.execute(
                     """
                     UPDATE paper_signal_queue
-                    SET status = ?, quote_json = ?, intent_json = ?,
+                    SET status = ?, execution_id = ?, quote_json = ?, intent_json = ?,
                         last_error = NULL, updated_at = ?
                     WHERE signal_id = ? AND status = ?
                     """,
                     (
                         PaperSignalQueueStatus.PREPARED.value,
+                        execution_id,
                         _json(quote),
                         _json(intent),
                         prepared.isoformat(),
@@ -552,6 +705,7 @@ class PaperSignalQueueStore:
         *,
         quote: PaperQuoteSnapshot,
         prepared_at: datetime,
+        sell_quantity_authority: PaperSellQuantityAuthority | None = None,
     ) -> PaperSignalQueueRecord:
         """Replace an unsubmitted prepared quote while retaining prior audit evidence."""
 
@@ -573,14 +727,24 @@ class PaperSignalQueueStore:
                     raise ValueError("quote ts_code does not match signal candidate")
                 if quote.available_at > prepared:
                     raise ValueError("quote is not available at paper decision time")
-                if quote == record.quote:
-                    connection.rollback()
-                    return record
                 action = record.signal.action
-                quantity = self.policy.action_quantities[action]
                 side = PaperSide.BUY if action is SignalAction.B_INTENT else PaperSide.SELL
+                if side is PaperSide.BUY:
+                    if sell_quantity_authority is not None:
+                        raise ValueError("BUY preparation cannot carry SELL quantity authority")
+                    quantity = self.policy.action_quantities[action]
+                else:
+                    self._validate_sell_authority(
+                        record.signal,
+                        sell_quantity_authority,
+                        decision_cutoff=prepared,
+                    )
+                    assert sell_quantity_authority is not None
+                    quantity = sell_quantity_authority.requested_quantity
                 intent = PaperOrderIntent(
                     signal_id=record.signal.signal_id,
+                    entry_signal_id=_entry_signal_id(record.signal),
+                    sell_quantity_authority=sell_quantity_authority,
                     account_id=self.policy.account_id,
                     ts_code=record.signal.candidate_id,
                     side=side,
@@ -593,6 +757,19 @@ class PaperSignalQueueStore:
                     price_snapshot_id=quote.snapshot_id,
                     producer_commit=self.policy.producer_commit,
                 )
+                execution_id = _prepared_execution_id(
+                    signal=record.signal,
+                    intent=intent,
+                    quote=quote,
+                    due_at=record.due_at,
+                )
+                if (
+                    quote == record.quote
+                    and intent == record.intent
+                    and execution_id == record.execution_id
+                ):
+                    connection.rollback()
+                    return record
                 revision = int(
                     connection.execute(
                         """
@@ -605,12 +782,13 @@ class PaperSignalQueueStore:
                 connection.execute(
                     """
                     INSERT INTO paper_signal_prepare_history(
-                        signal_id, revision, quote_json, intent_json, replaced_at
-                    ) VALUES (?, ?, ?, ?, ?)
+                        signal_id, revision, execution_id, quote_json, intent_json, replaced_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
                     """,
                     (
                         signal_id,
                         revision,
+                        record.execution_id,
                         _json(record.quote),
                         _json(record.intent),
                         prepared.isoformat(),
@@ -619,10 +797,12 @@ class PaperSignalQueueStore:
                 connection.execute(
                     """
                     UPDATE paper_signal_queue
-                    SET quote_json = ?, intent_json = ?, last_error = NULL, updated_at = ?
+                    SET execution_id = ?, quote_json = ?, intent_json = ?,
+                        last_error = NULL, updated_at = ?
                     WHERE signal_id = ? AND status = ?
                     """,
                     (
+                        execution_id,
                         _json(quote),
                         _json(intent),
                         prepared.isoformat(),
@@ -638,6 +818,109 @@ class PaperSignalQueueStore:
         result = self.record(signal_id)
         assert result is not None
         return result
+
+    def ignore(
+        self,
+        signal_id: str,
+        *,
+        reason: str,
+        observed_at: datetime,
+    ) -> PaperSignalQueueRecord:
+        message = reason.strip()
+        if not message:
+            raise ValueError("ignore reason must not be empty")
+        observed = normalize_aware_utc(observed_at)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._required_row(connection, signal_id)
+                record = self._record_from_row(row)
+                if record.status is not PaperSignalQueueStatus.PENDING:
+                    raise ValueError(f"cannot ignore paper signal in {record.status.value}")
+                connection.execute(
+                    """
+                    UPDATE paper_signal_queue
+                    SET status = ?, last_error = ?, updated_at = ?
+                    WHERE signal_id = ? AND status = ?
+                    """,
+                    (
+                        PaperSignalQueueStatus.IGNORED.value,
+                        message,
+                        observed.isoformat(),
+                        signal_id,
+                        PaperSignalQueueStatus.PENDING.value,
+                    ),
+                )
+                connection.commit()
+            except BaseException:
+                if connection.in_transaction:
+                    connection.rollback()
+                raise
+        result = self.record(signal_id)
+        assert result is not None
+        return result
+
+    def expire_prepared_unsubmitted(
+        self,
+        signal_id: str,
+        *,
+        observed_at: datetime,
+    ) -> PaperSignalQueueRecord:
+        observed = normalize_aware_utc(observed_at)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._required_row(connection, signal_id)
+                record = self._record_from_row(row)
+                if record.status is not PaperSignalQueueStatus.PREPARED:
+                    raise ValueError(
+                        f"cannot expire prepared paper signal in {record.status.value}"
+                    )
+                if observed < record.signal.expires_at:
+                    raise ValueError("prepared paper signal has not expired")
+                connection.execute(
+                    """
+                    UPDATE paper_signal_queue
+                    SET status = ?, last_error = ?, updated_at = ?
+                    WHERE signal_id = ? AND status = ?
+                    """,
+                    (
+                        PaperSignalQueueStatus.EXPIRED.value,
+                        "prepared signal expired after authoritative broker absence",
+                        observed.isoformat(),
+                        signal_id,
+                        PaperSignalQueueStatus.PREPARED.value,
+                    ),
+                )
+                connection.commit()
+            except BaseException:
+                if connection.in_transaction:
+                    connection.rollback()
+                raise
+        result = self.record(signal_id)
+        assert result is not None
+        return result
+
+    def _validate_sell_authority(
+        self,
+        signal: SignalEnvelope,
+        authority: PaperSellQuantityAuthority | None,
+        *,
+        decision_cutoff: datetime,
+    ) -> None:
+        entry_signal_id = _entry_signal_id(signal)
+        if authority is None:
+            raise ValueError("SELL preparation requires quantity authority")
+        if (
+            authority.exit_signal_id != signal.signal_id
+            or authority.entry_signal_id != entry_signal_id
+            or authority.account_id != self.policy.account_id
+            or authority.ts_code != signal.candidate_id
+            or authority.action != signal.action.name
+            or authority.decision_cutoff != decision_cutoff
+            or authority.tranche_fraction != _sell_tranche_fraction(signal)
+        ):
+            raise ValueError("SELL quantity authority does not bind the queued signal")
 
     def record_error(
         self,
@@ -696,6 +979,7 @@ class PaperSignalQueueStore:
             received_at=datetime.fromisoformat(row["received_at"]),
             updated_at=datetime.fromisoformat(row["updated_at"]),
             last_error=row["last_error"],
+            execution_id=row["execution_id"],
             quote=(
                 PaperQuoteSnapshot.model_validate_json(row["quote_json"])
                 if row["quote_json"] is not None
@@ -729,19 +1013,44 @@ def run_paper_signal_batch(
     failed = 0
     for record in due:
         try:
+            broker.require_trusted_ledger()
             prepared = record
             if record.status is PaperSignalQueueStatus.PENDING:
+                sell_authority = _sell_quantity_authority(
+                    broker,
+                    record.signal,
+                    decision_cutoff=observed,
+                    trade_date=trade_date,
+                )
                 quote = quote_resolver(record.signal, observed)
                 prepared = queue.prepare(
                     record.signal.signal_id,
                     quote=quote,
                     prepared_at=observed,
+                    sell_quantity_authority=sell_authority,
                 )
             elif record.status is PaperSignalQueueStatus.PREPARED:
-                if record.intent is None:
-                    raise RuntimeError("prepared paper signal lacks immutable intent")
-                existing_order = broker.order_for_intent(record.intent.intent_id)
+                if record.intent is None or record.execution_id is None:
+                    raise RuntimeError(
+                        "prepared paper signal lacks immutable intent or execution identity"
+                    )
+                execution_order = broker.order_for_execution(record.execution_id)
+                intent_order = broker.order_for_intent(record.intent.intent_id)
+                if (execution_order is None) != (intent_order is None):
+                    raise RuntimeError(
+                        "prepared execution identity and intent do not resolve together"
+                    )
+                if (
+                    execution_order is not None
+                    and intent_order is not None
+                    and execution_order.order_id != intent_order.order_id
+                ):
+                    raise RuntimeError(
+                        "prepared execution identity and intent resolve to different orders"
+                    )
+                existing_order = execution_order or intent_order
                 if existing_order is not None:
+                    broker.reconcile()
                     queue.complete(
                         record.signal.signal_id,
                         order=existing_order,
@@ -749,16 +1058,32 @@ def run_paper_signal_batch(
                     )
                     completed += 1
                     continue
+                if observed >= record.signal.expires_at:
+                    queue.expire_prepared_unsubmitted(
+                        record.signal.signal_id,
+                        observed_at=observed,
+                    )
+                    continue
+                sell_authority = _sell_quantity_authority(
+                    broker,
+                    record.signal,
+                    decision_cutoff=observed,
+                    trade_date=trade_date,
+                )
                 quote = quote_resolver(record.signal, observed)
                 prepared = queue.refresh_prepared(
                     record.signal.signal_id,
                     quote=quote,
                     prepared_at=observed,
+                    sell_quantity_authority=sell_authority,
                 )
             if prepared.quote is None or prepared.intent is None:
                 raise RuntimeError("prepared paper signal lacks immutable execution evidence")
+            if prepared.execution_id is None:
+                raise RuntimeError("prepared paper signal lacks immutable execution identity")
             order = broker.submit_intent(
                 prepared.intent,
+                execution_id=prepared.execution_id,
                 decision_time=observed,
                 trade_date=trade_date,
                 quote=prepared.quote.context,
@@ -769,6 +1094,20 @@ def run_paper_signal_batch(
                 completed_at=observed,
             )
             completed += 1
+        except NoExecutableSellQuantityError as error:
+            if record.status is PaperSignalQueueStatus.PENDING:
+                queue.ignore(
+                    record.signal.signal_id,
+                    reason=str(error),
+                    observed_at=observed,
+                )
+                continue
+            queue.record_error(
+                record.signal.signal_id,
+                error=_error_text(error),
+                observed_at=observed,
+            )
+            failed += 1
         except Exception as error:
             queue.record_error(
                 record.signal.signal_id,
@@ -781,6 +1120,28 @@ def run_paper_signal_batch(
         due_count=len(due),
         completed_count=completed,
         failed_count=failed,
+    )
+
+
+def _sell_quantity_authority(
+    broker: PaperBrokerStore,
+    signal: SignalEnvelope,
+    *,
+    decision_cutoff: datetime,
+    trade_date: date,
+) -> PaperSellQuantityAuthority | None:
+    if signal.action is SignalAction.B_INTENT:
+        return None
+    entry_signal_id = _entry_signal_id(signal)
+    assert entry_signal_id is not None
+    return broker.sell_quantity_authority(
+        exit_signal_id=str(signal.signal_id),
+        entry_signal_id=entry_signal_id,
+        ts_code=signal.candidate_id,
+        action=signal.action.name,
+        tranche_fraction=_sell_tranche_fraction(signal),
+        decision_cutoff=decision_cutoff,
+        trade_date=trade_date,
     )
 
 

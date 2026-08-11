@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
-import hashlib
 import os
 import re
-import stat
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from pydantic import Field, StrictInt, field_validator
+from pydantic import Field, StrictInt, field_validator, model_validator
 
+from rquant.definition_registry import (
+    DefinitionExecutableIntegrityError,
+    ImmutableDefinitionRegistry,
+)
 from rquant.feature_spool import FeatureBatchSpool
 from rquant.runtime_candidate_universe import (
     CandidateUniverseAuthority,
@@ -20,6 +22,7 @@ from rquant.runtime_candidate_universe import (
     RuntimeCandidateUniverseLoader,
 )
 from rquant.runtime_contracts import RuntimeContractModel
+from rquant.runtime_market_session import load_market_calendar_authority
 from rquant.runtime_service_control import RuntimeServicePlane, RuntimeStepResult
 from rquant.runtime_service_entrypoint import (
     RuntimeServiceBuilder,
@@ -27,34 +30,69 @@ from rquant.runtime_service_entrypoint import (
     RuntimeServiceManifest,
     RuntimeServiceStep,
 )
-from rquant.strategy_live_service import run_strategy_live_batch
+from rquant.runtime_shadow_validation import CompletionAttestationSigner
+from rquant.signal_router_runtime import ReadonlySignalRouteAuthority
+from rquant.strategy_live_service import (
+    StrategyCompletionAttestationConfig,
+    run_strategy_live_batch,
+)
+from rquant.strategy_paper_lifecycle import PaperBrokerLifecycleReader
 from rquant.strategy_runner import StrategyEvaluator, StrategyRunnerStore
-from rquant.strategy_spec import StrategySpec
-from rquant.strict_json import strict_model_validate_json
 
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
-_DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-_PRIVATE_FILE_MODE = 0o600
 
 
 class StrategyLiveRuntimeSettings(RuntimeContractModel):
     feature_spool_root: Path
     runner_state_path: Path
-    strategy_spec_path: Path
-    strategy_spec_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    definition_registry_root: Path
+    strategy_registration_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    strategy_spec_fingerprint: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    evaluator_contract_fingerprint: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    strategy_executable_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    candidate_schema_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     candidate_snapshot_root: Path
+    paper_broker_path: Path
+    paper_account_id: str = Field(min_length=1)
     candidate_max_age_seconds: StrictInt = Field(gt=0)
     strategy_id: str = Field(min_length=1)
     strategy_version: StrictInt = Field(ge=1)
     batch_limit: StrictInt = Field(default=128, ge=1)
+    calendar_path: Path | None = None
+    calendar_expected_commit: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{40}$",
+    )
+    calendar_content_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    signal_bus_path: Path | None = None
+    routing_policy_fingerprint: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    producer_instance_id: str | None = Field(default=None, min_length=1)
+    producer_version: str | None = Field(default=None, min_length=1)
 
     @field_validator(
         "feature_spool_root",
         "runner_state_path",
-        "strategy_spec_path",
+        "definition_registry_root",
+        "paper_broker_path",
+        "calendar_path",
+        "signal_bus_path",
     )
     @classmethod
-    def require_absolute_path(cls, value: Path) -> Path:
+    def require_absolute_path(cls, value: Path | None) -> Path | None:
+        if value is None:
+            return None
         if not value.is_absolute() or value != Path(os.path.abspath(value)):
             raise ValueError("strategy runtime data paths must be absolute and normalized")
         return value
@@ -67,6 +105,29 @@ class StrategyLiveRuntimeSettings(RuntimeContractModel):
         if value != Path(os.path.abspath(value)):
             raise ValueError("candidate snapshot root must be normalized without traversal")
         return value
+
+    @model_validator(mode="after")
+    def validate_completion_authority(self) -> StrategyLiveRuntimeSettings:
+        authority = (
+            self.calendar_path,
+            self.calendar_expected_commit,
+            self.calendar_content_sha256,
+            self.signal_bus_path,
+            self.routing_policy_fingerprint,
+            self.producer_instance_id,
+            self.producer_version,
+            self.strategy_spec_fingerprint,
+            self.evaluator_contract_fingerprint,
+        )
+        if any(value is not None for value in authority) and not all(
+            value is not None for value in authority
+        ):
+            raise ValueError("strategy completion authority must be configured as one group")
+        return self
+
+    @property
+    def has_completion_authority(self) -> bool:
+        return self.calendar_path is not None
 
 
 @dataclass(frozen=True)
@@ -96,131 +157,30 @@ class StrategyEvaluatorBinding:
 StrategyEvaluatorLoader = Callable[[str, int], StrategyEvaluatorBinding]
 
 
-def _load_builtin_evaluator(
+def _require_production_completion_signer(
+    signer: CompletionAttestationSigner | None,
     *,
-    spec: StrategySpec,
-    producer_commit: str,
-) -> StrategyEvaluatorBinding:
-    from rquant.strategy_evaluators import BuiltinStrategyEvaluatorRegistry
+    active_key_id: str | None,
+) -> CompletionAttestationSigner:
+    from rquant.runtime_shadow_validation import Ed25519CompletionAttestationSigner
 
-    registry = BuiltinStrategyEvaluatorRegistry(producer_commit=producer_commit)
-    definition = registry.load_definition(spec.strategy_id, spec.version)
-    if definition.spec != spec:
-        raise ValueError("frozen strategy spec does not match built-in strategy spec")
-    return registry.load_binding(spec.strategy_id, spec.version)
-
-
-def _same_file_identity(left: os.stat_result, right: os.stat_result) -> bool:
-    return (
-        left.st_dev,
-        left.st_ino,
-        left.st_mode,
-        left.st_uid,
-        left.st_nlink,
-    ) == (
-        right.st_dev,
-        right.st_ino,
-        right.st_mode,
-        right.st_uid,
-        right.st_nlink,
-    )
-
-
-def _same_file_version(left: os.stat_result, right: os.stat_result) -> bool:
-    return _same_file_identity(left, right) and (
-        left.st_size,
-        left.st_mtime_ns,
-        left.st_ctime_ns,
-    ) == (
-        right.st_size,
-        right.st_mtime_ns,
-        right.st_ctime_ns,
-    )
-
-
-def _read_frozen_strategy_spec(path: Path, *, expected_sha256: str) -> StrategySpec:
-    if not path.is_absolute() or path != Path(os.path.abspath(path)):
-        raise ValueError("strategy spec path is unsafe")
-    parent_descriptor = -1
-    child_descriptor = -1
-    file_descriptor = -1
-    try:
-        parent_descriptor = os.open(path.anchor, _DIRECTORY_FLAGS)
-        for component in path.parts[1:-1]:
-            before = os.stat(
-                component,
-                dir_fd=parent_descriptor,
-                follow_symlinks=False,
-            )
-            if stat.S_ISLNK(before.st_mode):
-                raise ValueError("strategy spec path contains a symlink")
-            child_descriptor = os.open(
-                component,
-                _DIRECTORY_FLAGS,
-                dir_fd=parent_descriptor,
-            )
-            opened = os.fstat(child_descriptor)
-            active = os.stat(
-                component,
-                dir_fd=parent_descriptor,
-                follow_symlinks=False,
-            )
-            if not stat.S_ISDIR(opened.st_mode):
-                raise ValueError("strategy spec parent is unsafe")
-            if not _same_file_identity(before, opened) or not _same_file_identity(opened, active):
-                raise ValueError("strategy spec parent identity changed")
-            os.close(parent_descriptor)
-            parent_descriptor = child_descriptor
-            child_descriptor = -1
-
-        name = path.name
-        before = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
-        if stat.S_ISLNK(before.st_mode):
-            raise ValueError("strategy spec cannot be a symlink")
-        file_descriptor = os.open(
-            name,
-            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-            dir_fd=parent_descriptor,
-        )
-        opened = os.fstat(file_descriptor)
-        active = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
-        if not _same_file_identity(before, opened) or not _same_file_identity(opened, active):
-            raise ValueError("strategy spec identity changed")
-        if not stat.S_ISREG(opened.st_mode):
-            raise ValueError("strategy spec must be a regular file")
-        if opened.st_uid != os.getuid():
-            raise ValueError("strategy spec must be owned by the current uid")
-        if opened.st_nlink != 1:
-            raise ValueError("strategy spec hardlink count must be one")
-        if stat.S_IMODE(opened.st_mode) != _PRIVATE_FILE_MODE:
-            raise ValueError("strategy spec permissions must be 0600")
-        with os.fdopen(file_descriptor, "rb", closefd=False) as stream:
-            payload = stream.read()
-        after = os.fstat(file_descriptor)
-        current = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
-        if not _same_file_version(opened, after) or not _same_file_version(after, current):
-            raise ValueError("strategy spec identity changed while being read")
-    except OSError as exc:
-        raise ValueError("strategy spec is unavailable or contains an unsafe symlink") from exc
-    finally:
-        if file_descriptor >= 0:
-            os.close(file_descriptor)
-        if child_descriptor >= 0:
-            os.close(child_descriptor)
-        if parent_descriptor >= 0:
-            os.close(parent_descriptor)
-    if hashlib.sha256(payload).hexdigest() != expected_sha256:
-        raise ValueError("strategy spec content does not match frozen SHA-256")
-    try:
-        return strict_model_validate_json(StrategySpec, payload)
-    except ValueError as exc:
-        raise ValueError("strategy spec is invalid") from exc
+    if signer is None:
+        raise ValueError("strategy completion authority requires an attestation signer")
+    if not isinstance(signer, Ed25519CompletionAttestationSigner):
+        raise ValueError("strategy completion authority requires an Ed25519 attestation signer")
+    if active_key_id is None or not active_key_id.strip():
+        raise ValueError("strategy completion authority requires an active key id")
+    if signer.key_id != active_key_id:
+        raise ValueError("strategy completion signer must use the active key id")
+    return signer
 
 
 def strategy_live_builder(
     *,
     clock: Callable[[], datetime],
     evaluator_loader: StrategyEvaluatorLoader | None = None,
+    completion_attestation_signer: CompletionAttestationSigner | None = None,
+    completion_attestation_active_key_id: str | None = None,
 ) -> RuntimeServiceBuilder:
     """Build one stateful strategy step without dynamic imports or production I/O."""
 
@@ -229,31 +189,76 @@ def strategy_live_builder(
             raise ValueError("runtime service kind must be strategy_live")
         if manifest.plane is not RuntimeServicePlane.LIVE:
             raise ValueError("strategy-live service must run on the live plane")
+        if evaluator_loader is not None:
+            raise TypeError("arbitrary strategy evaluator loaders are not trusted")
 
         settings = StrategyLiveRuntimeSettings.model_validate(dict(manifest.settings))
-        spec = _read_frozen_strategy_spec(
-            settings.strategy_spec_path,
-            expected_sha256=settings.strategy_spec_sha256,
-        )
-        if spec.strategy_id != settings.strategy_id or spec.version != settings.strategy_version:
-            raise ValueError("strategy spec identity does not match runtime settings")
-        if spec.producer_commit != manifest.producer_commit:
-            raise ValueError("strategy spec producer commit does not match runtime manifest")
+        from rquant.strategy_evaluators import BuiltinStrategyEvaluatorRegistry
 
-        if evaluator_loader is None:
-            binding = _load_builtin_evaluator(
-                spec=spec,
-                producer_commit=manifest.producer_commit,
+        builtin_registry = BuiltinStrategyEvaluatorRegistry(
+            producer_commit=manifest.producer_commit
+        )
+        execution_registry = builtin_registry.trusted_executable_registry()
+        definition_registry = ImmutableDefinitionRegistry(
+            settings.definition_registry_root,
+            execution_registry=execution_registry,
+        )
+        build_at = clock()
+        try:
+            registration = definition_registry.read_strategy_spec(
+                settings.strategy_registration_fingerprint,
+                as_of=build_at,
             )
-        else:
-            binding = evaluator_loader(settings.strategy_id, settings.strategy_version)
+        except DefinitionExecutableIntegrityError as exc:
+            raise ValueError(
+                "published strategy evaluator fingerprint no longer matches the trusted graph"
+            ) from exc
+        if registration is None:
+            raise ValueError("published strategy registration is unavailable")
+        spec = registration.spec
+        if spec.strategy_id != settings.strategy_id or spec.version != settings.strategy_version:
+            raise ValueError("strategy registration identity does not match runtime settings")
+        if spec.producer_commit != manifest.producer_commit:
+            raise ValueError("strategy registration producer commit does not match manifest")
+        feature_registration = definition_registry.read_feature_contract(
+            registration.feature_contract_fingerprint,
+            as_of=build_at,
+        )
+        if feature_registration is None:
+            raise ValueError("published feature contract registration is unavailable")
+
+        definition = builtin_registry.load_definition(spec.strategy_id, spec.version)
+        if definition.spec.spec_fingerprint != spec.spec_fingerprint:
+            raise ValueError("published strategy spec does not match built-in strategy spec")
+        if (
+            settings.strategy_spec_fingerprint is not None
+            and settings.strategy_spec_fingerprint != spec.spec_fingerprint
+        ):
+            raise ValueError("strategy spec fingerprint does not match runtime binding")
+        if (
+            registration.candidate_schema_fingerprint != settings.candidate_schema_fingerprint
+            or definition.candidate_schema_fingerprint != settings.candidate_schema_fingerprint
+        ):
+            raise ValueError("candidate schema fingerprint does not match runtime binding")
+        binding = builtin_registry.load_binding(spec.strategy_id, spec.version)
         if not isinstance(binding, StrategyEvaluatorBinding):
-            raise TypeError("evaluator loader must return StrategyEvaluatorBinding")
+            raise TypeError("built-in evaluator registry returned an invalid binding")
         if (
             binding.strategy_id != settings.strategy_id
             or binding.strategy_version != settings.strategy_version
         ):
             raise ValueError("evaluator identity does not match runtime settings")
+        if (
+            binding.contract_fingerprint != registration.executable_fingerprint
+            or definition.executable_fingerprint != registration.executable_fingerprint
+            or settings.strategy_executable_fingerprint != registration.executable_fingerprint
+            or (
+                settings.evaluator_contract_fingerprint is not None
+                and settings.evaluator_contract_fingerprint
+                != binding.contract_fingerprint
+            )
+        ):
+            raise ValueError("built-in evaluator fingerprint does not match published registration")
 
         feature_spool = FeatureBatchSpool(settings.feature_spool_root)
         candidate_universe_loader = RuntimeCandidateUniverseLoader(
@@ -266,6 +271,14 @@ def strategy_live_builder(
                         snapshot_root=settings.candidate_snapshot_root,
                         required=True,
                         max_age_seconds=settings.candidate_max_age_seconds,
+                        definition_fingerprint=registration.fingerprint,
+                        executable_fingerprint=settings.strategy_executable_fingerprint,
+                        candidate_schema_fingerprint=settings.candidate_schema_fingerprint,
+                        static_feature_names=tuple(sorted(definition.static_feature_schema)),
+                        static_feature_schema={
+                            name: semantic.contract_payload()
+                            for name, semantic in definition.static_feature_schema.items()
+                        },
                     ),
                 ),
             )
@@ -274,7 +287,44 @@ def strategy_live_builder(
             settings.runner_state_path,
             spec=spec,
             evaluator_contract_fingerprint=binding.contract_fingerprint,
+            feature_contract=feature_registration.contract,
+            lifecycle_feature_source=PaperBrokerLifecycleReader(
+                settings.paper_broker_path,
+                account_id=settings.paper_account_id,
+            ),
         )
+        calendar = None
+        route_authority = None
+        completion_attestation = None
+        if settings.has_completion_authority:
+            completion_signer = _require_production_completion_signer(
+                completion_attestation_signer,
+                active_key_id=completion_attestation_active_key_id,
+            )
+            assert settings.calendar_path is not None
+            assert settings.calendar_expected_commit is not None
+            assert settings.calendar_content_sha256 is not None
+            assert settings.signal_bus_path is not None
+            assert settings.routing_policy_fingerprint is not None
+            calendar = load_market_calendar_authority(
+                settings.calendar_path,
+                expected_commit=settings.calendar_expected_commit,
+            )
+            if calendar.content_sha256 != settings.calendar_content_sha256:
+                raise ValueError("strategy calendar content identity does not match settings")
+            route_authority = ReadonlySignalRouteAuthority(
+                path=settings.signal_bus_path,
+                expected_routing_policy_fingerprint=(settings.routing_policy_fingerprint),
+            )
+            completion_attestation = StrategyCompletionAttestationConfig(
+                signer=completion_signer,
+                strategy_registration_fingerprint=registration.fingerprint,
+                executable_fingerprint=registration.executable_fingerprint,
+                candidate_schema_fingerprint=registration.candidate_schema_fingerprint,
+                feature_registration_fingerprint=feature_registration.fingerprint,
+                feature_contract_fingerprint=(feature_registration.contract.contract_fingerprint),
+                producer_manifest_fingerprint=manifest.manifest_fingerprint,
+            )
 
         def step() -> RuntimeStepResult:
             summary = run_strategy_live_batch(
@@ -284,6 +334,17 @@ def strategy_live_builder(
                 evaluator=binding.evaluator,
                 observed_at=clock(),
                 limit=settings.batch_limit,
+                calendar=calendar,
+                route_authority=route_authority,
+                completion_source_id=(
+                    manifest.service_id if settings.has_completion_authority else None
+                ),
+                producer_service_id=(
+                    manifest.service_id if settings.has_completion_authority else None
+                ),
+                producer_instance_id=settings.producer_instance_id,
+                producer_version=settings.producer_version,
+                completion_attestation=completion_attestation,
             )
             backlog = max(
                 0,

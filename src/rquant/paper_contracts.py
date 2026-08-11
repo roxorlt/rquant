@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from decimal import Decimal
+from decimal import ROUND_FLOOR, ROUND_HALF_UP, Decimal
 from enum import StrEnum
-from typing import Annotated, Self
+from typing import Annotated, Literal, Self
 
 from pydantic import Field, model_validator
 
@@ -21,6 +21,8 @@ NonNegativeLot = Annotated[int, Field(ge=0, multiple_of=100)]
 PositiveDecimal = Annotated[Decimal, Field(gt=0, allow_inf_nan=False)]
 NonNegativeDecimal = Annotated[Decimal, Field(ge=0, allow_inf_nan=False)]
 FiniteDecimal = Annotated[Decimal, Field(allow_inf_nan=False)]
+TrancheFraction = Annotated[Decimal, Field(gt=0, le=1, allow_inf_nan=False)]
+_PRICE_TICK = Decimal("0.0001")
 
 
 class PaperSide(StrEnum):
@@ -54,9 +56,54 @@ class PaperRejectReason(StrEnum):
     RISK_REJECTED = "RISK_REJECTED"
 
 
+class PaperSellQuantityAuthority(RuntimeContractModel):
+    snapshot_id: Sha256 | None = None
+    exit_signal_id: Sha256
+    entry_signal_id: Sha256
+    account_id: str = Field(min_length=1)
+    ts_code: str = Field(min_length=1)
+    action: Literal["REDUCE", "S_INTENT"]
+    decision_cutoff: AwareUtcDatetime
+    remaining_quantity: PositiveLot
+    available_quantity: NonNegativeLot
+    tranche_fraction: TrancheFraction
+    requested_quantity: PositiveLot
+    source_lot_fingerprint: Sha256
+
+    @model_validator(mode="after")
+    def validate_quantity_semantics(self) -> Self:
+        if self.available_quantity > self.remaining_quantity:
+            raise ValueError("available_quantity cannot exceed remaining_quantity")
+        if self.action == "S_INTENT":
+            if self.tranche_fraction != Decimal("1"):
+                raise ValueError("S_INTENT tranche_fraction must equal one")
+            expected = self.remaining_quantity
+        else:
+            if self.tranche_fraction >= Decimal("1"):
+                raise ValueError("REDUCE tranche_fraction must be below one")
+            shares = int(
+                (Decimal(self.remaining_quantity) * self.tranche_fraction).to_integral_value(
+                    rounding=ROUND_FLOOR
+                )
+            )
+            expected = shares // 100 * 100
+            if expected <= 0 or expected >= self.remaining_quantity:
+                raise ValueError("REDUCE has no legal partial 100-share lot")
+        if self.requested_quantity != expected:
+            raise ValueError("requested_quantity does not match tranche semantics")
+        expected_id = canonical_sha256(self.model_dump(mode="python", exclude={"snapshot_id"}))
+        if self.snapshot_id is None:
+            object.__setattr__(self, "snapshot_id", expected_id)
+        elif self.snapshot_id != expected_id:
+            raise ValueError("sell quantity snapshot_id does not match authority content")
+        return self
+
+
 class PaperOrderIntent(RuntimeContractModel):
     intent_id: Sha256 | None = None
     signal_id: Sha256
+    entry_signal_id: Sha256 | None = None
+    sell_quantity_authority: PaperSellQuantityAuthority | None = None
     account_id: str = Field(min_length=1)
     ts_code: str = Field(min_length=1)
     side: PaperSide
@@ -72,6 +119,22 @@ class PaperOrderIntent(RuntimeContractModel):
 
     @model_validator(mode="after")
     def validate_intent(self) -> Self:
+        if self.side is PaperSide.BUY and self.entry_signal_id is not None:
+            raise ValueError("BUY intent entry_signal_id must be absent")
+        if self.side is PaperSide.BUY and self.sell_quantity_authority is not None:
+            raise ValueError("BUY intent sell_quantity_authority must be absent")
+        if self.side is PaperSide.SELL and self.entry_signal_id is None:
+            raise ValueError("SELL intent entry_signal_id is required")
+        if self.side is PaperSide.SELL and self.sell_quantity_authority is None:
+            raise ValueError("SELL intent sell_quantity_authority is required")
+        if self.sell_quantity_authority is not None and (
+            self.sell_quantity_authority.exit_signal_id != self.signal_id
+            or self.sell_quantity_authority.entry_signal_id != self.entry_signal_id
+            or self.sell_quantity_authority.account_id != self.account_id
+            or self.sell_quantity_authority.ts_code != self.ts_code
+            or self.sell_quantity_authority.requested_quantity != self.quantity
+        ):
+            raise ValueError("SELL intent does not match sell quantity authority")
         if self.order_type is PaperOrderType.LIMIT and self.limit_price is None:
             raise ValueError("limit_price is required for LIMIT orders")
         if self.order_type is PaperOrderType.MARKET and self.limit_price is not None:
@@ -117,6 +180,10 @@ class PaperOrder(RuntimeContractModel):
         has_fills = self.filled_quantity > 0
         if has_fills != (self.average_fill_price is not None):
             raise ValueError("average_fill_price must be present iff fills exist")
+        if self.average_fill_price is not None and self.average_fill_price != (
+            self.average_fill_price.quantize(_PRICE_TICK, rounding=ROUND_HALF_UP)
+        ):
+            raise ValueError("average_fill_price must use the 0.0001 price tick")
 
         if self.status in {PaperOrderStatus.PENDING, PaperOrderStatus.ACCEPTED}:
             if self.filled_quantity != 0:
@@ -150,6 +217,7 @@ class PaperOrder(RuntimeContractModel):
 
 class PaperFill(RuntimeContractModel):
     fill_id: Sha256 | None = None
+    execution_id: Sha256
     order_id: Sha256
     sequence: int = Field(ge=1)
     quantity: PositiveLot
@@ -161,16 +229,35 @@ class PaperFill(RuntimeContractModel):
 
     @model_validator(mode="after")
     def validate_fill_id(self) -> Self:
-        expected = canonical_sha256({"order_id": self.order_id, "sequence": self.sequence})
+        expected = canonical_sha256({"order_id": self.order_id, "execution_id": self.execution_id})
         if self.fill_id is None:
             object.__setattr__(self, "fill_id", expected)
         elif self.fill_id != expected:
-            raise ValueError("fill_id does not match order_id and sequence")
+            raise ValueError("fill_id does not match order_id and execution_id")
         return self
 
     @property
     def notional(self) -> Decimal:
         return self.price * self.quantity
+
+
+class PaperExecutionReceipt(RuntimeContractModel):
+    execution_id: Sha256
+    request_fingerprint: Sha256
+    intent_id: Sha256
+    order: PaperOrder
+    fill: PaperFill | None = None
+    persisted_at: AwareUtcDatetime
+
+    @model_validator(mode="after")
+    def validate_execution(self) -> Self:
+        if self.order.intent_id != self.intent_id:
+            raise ValueError("execution receipt does not bind its intent and order")
+        if self.fill is not None and (
+            self.fill.execution_id != self.execution_id or self.fill.order_id != self.order.order_id
+        ):
+            raise ValueError("execution receipt does not bind its order and fill")
+        return self
 
 
 class PaperHolding(RuntimeContractModel):

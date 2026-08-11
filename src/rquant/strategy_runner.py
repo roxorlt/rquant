@@ -12,7 +12,8 @@ from collections.abc import Callable, Mapping, Sequence
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Protocol
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 from pydantic import (
@@ -27,14 +28,25 @@ from pydantic import (
 from rquant.feature_contracts import (
     FeatureAvailability,
     FeatureBatchEnvelope,
+    FeatureContract,
     FeatureFieldStatus,
+    FeatureInstanceEnvelope,
     FeatureRequirement,
+    LateFeaturePolicy,
+    MissingFeaturePolicy,
 )
+from rquant.feature_spool import FeatureSessionCloseMarker
 from rquant.runtime_contracts import (
     AwareUtcDatetime,
     RuntimeContractModel,
     canonical_sha256,
     normalize_aware_utc,
+)
+from rquant.runtime_shadow_validation import (
+    CompletionAttestationClaims,
+    CompletionAttestationSigner,
+    ShadowSourceCompletionReceipt,
+    shadow_completion_receipt_body_sha256,
 )
 from rquant.signal_contracts import SignalAction, SignalEnvelope
 from rquant.strategy_candidate_snapshot import candidate_occurrence_id
@@ -42,6 +54,12 @@ from rquant.strategy_spec import StrategyLifecycleState, StrategySpec
 
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_SHANGHAI = ZoneInfo("Asia/Shanghai")
+_MAX_SESSION_CLOSE_RECEIPT_BYTES = 64 * 1024
+_MAX_PROTOCOL_JSON_DEPTH = 64
+_MAX_PROTOCOL_JSON_NODES = 100_000
+_MAX_RUNNER_SESSION_RECORDS = 100_000
+_MAX_RUNNER_SESSION_RAW_BYTES = 128 * 1024 * 1024
 _CANDIDATE_METADATA_COLUMNS = (
     "candidate_occurrence_id",
     "candidate_effective_trade_date",
@@ -49,7 +67,7 @@ _CANDIDATE_METADATA_COLUMNS = (
     "candidate_generation_sha256",
     "candidate_snapshot_schema_version",
 )
-_CANDIDATE_STATE_SCHEMA = (
+_CANDIDATE_STATE_PRE_HIGH_WATERMARK_SCHEMA = (
     (0, "occurrence_id", "TEXT", 1, 1),
     (1, "candidate_id", "TEXT", 1, 0),
     (2, "candidate_effective_trade_date", "TEXT", 0, 0),
@@ -60,6 +78,11 @@ _CANDIDATE_STATE_SCHEMA = (
     (7, "last_feature_sequence", "INTEGER", 1, 0),
     (8, "last_feature_batch_id", "TEXT", 0, 0),
     (9, "updated_at", "TEXT", 1, 0),
+)
+_CANDIDATE_STATE_SCHEMA = _CANDIDATE_STATE_PRE_HIGH_WATERMARK_SCHEMA + (
+    (10, "eligible_high_price_raw", "REAL", 0, 0),
+    (11, "eligible_high_source_event_time", "TEXT", 0, 0),
+    (12, "eligible_high_available_at", "TEXT", 0, 0),
 )
 _LEGACY_CANDIDATE_STATE_SCHEMA = (
     (0, "candidate_id", "TEXT", 0, 1),
@@ -99,18 +122,93 @@ _RUNNER_SOURCE_IDENTITY_SCHEMA = (
     (0, "singleton", "INTEGER", 0, 1),
     (1, "source_generation_id", "TEXT", 1, 0),
 )
-_RUNNER_SIGNAL_SCHEMA = (
+_RUNNER_SIGNAL_LEGACY_SCHEMA = (
     (0, "sequence", "INTEGER", 0, 1),
     (1, "signal_id", "TEXT", 1, 0),
     (2, "feature_sequence", "INTEGER", 1, 0),
     (3, "payload_json", "TEXT", 1, 0),
+)
+_RUNNER_SIGNAL_SCHEMA = (
+    (0, "sequence", "INTEGER", 0, 1),
+    (1, "signal_id", "TEXT", 1, 0),
+    (2, "feature_sequence", "INTEGER", 1, 0),
+    (3, "candidate_id", "TEXT", 1, 0),
+    (4, "action", "TEXT", 1, 0),
+    (5, "entry_signal_id", "TEXT", 0, 0),
+    (6, "candidate_occurrence_id", "TEXT", 0, 0),
+    (7, "event_time", "TEXT", 1, 0),
+    (8, "available_at", "TEXT", 1, 0),
+    (9, "expires_at", "TEXT", 1, 0),
+    (10, "payload_json", "TEXT", 1, 0),
+)
+_RUNNER_SIGNAL_LEGACY_TABLE_SQL = (
+    "createtablerunner_signal("
+    "sequenceintegerprimarykeyautoincrement,"
+    "signal_idtextnotnullunique,"
+    "feature_sequenceintegernotnull,"
+    "payload_jsontextnotnull)"
 )
 _RUNNER_SIGNAL_TABLE_SQL = (
     "createtablerunner_signal("
     "sequenceintegerprimarykeyautoincrement,"
     "signal_idtextnotnullunique,"
     "feature_sequenceintegernotnull,"
+    "candidate_idtextnotnull,"
+    "actiontextnotnull,"
+    "entry_signal_idtext,"
+    "candidate_occurrence_idtext,"
+    "event_timetextnotnull,"
+    "available_attextnotnull,"
+    "expires_attextnotnull,"
     "payload_jsontextnotnull)"
+)
+_RUNNER_SIGNAL_ENTRY_INDEX_NAME = "runner_signal_entry_lookup_idx"
+_RUNNER_SIGNAL_ENTRY_INDEX_SQL = (
+    "createindexrunner_signal_entry_lookup_idxonrunner_signal("
+    "candidate_id,candidate_occurrence_id,action,sequencedesc)"
+)
+_RUNNER_SIGNAL_EXIT_INDEX_NAME = "runner_signal_exit_lookup_idx"
+_RUNNER_SIGNAL_EXIT_INDEX_SQL = (
+    "createindexrunner_signal_exit_lookup_idxonrunner_signal("
+    "candidate_id,candidate_occurrence_id,entry_signal_id,action,available_at,sequence)"
+)
+_RUNNER_SESSION_CLOSE_RECEIPT_SCHEMA = (
+    (0, "trade_date", "TEXT", 0, 1),
+    (1, "receipt_id", "TEXT", 1, 0),
+    (2, "source_id", "TEXT", 1, 0),
+    (3, "signal_high_watermark", "INTEGER", 1, 0),
+    (4, "payload_json", "TEXT", 1, 0),
+)
+_RUNNER_SESSION_CLOSE_RECEIPT_TABLE_SQL = (
+    "createtablerunner_session_close_receipt("
+    "trade_datetextprimarykey,"
+    "receipt_idtextnotnullunique,"
+    "source_idtextnotnull,"
+    "signal_high_watermarkintegernotnull,"
+    "payload_jsontextnotnull)"
+)
+_RUNNER_SESSION_SEGMENT_SCHEMA = (
+    (0, "trade_date", "TEXT", 0, 1),
+    (1, "runner_generation_id", "TEXT", 1, 0),
+    (2, "start_after_sequence", "INTEGER", 1, 0),
+    (3, "final_sequence", "INTEGER", 1, 0),
+    (4, "record_count", "INTEGER", 1, 0),
+    (5, "raw_bytes", "INTEGER", 1, 0),
+    (6, "chain_hash", "TEXT", 1, 0),
+    (7, "final_feature_sequence", "INTEGER", 1, 0),
+    (8, "final_feature_batch_id", "TEXT", 1, 0),
+)
+_RUNNER_SESSION_SEGMENT_TABLE_SQL = (
+    "createtablerunner_session_segment("
+    "trade_datetextprimarykey,"
+    "runner_generation_idtextnotnull,"
+    "start_after_sequenceintegernotnull,"
+    "final_sequenceintegernotnull,"
+    "record_countintegernotnull,"
+    "raw_bytesintegernotnull,"
+    "chain_hashtextnotnull,"
+    "final_feature_sequenceintegernotnull,"
+    "final_feature_batch_idtextnotnull)"
 )
 _SINGLETON_CHECK_SQL = "check(singleton=1)"
 _CANDIDATE_INPUT_MODE_CHECK_SQL = "check(candidate_input_modein('flat','occurrence'))"
@@ -119,10 +217,87 @@ _SOURCE_SEQUENCE_INDEX_SQL = (
     "createuniqueindexprocessed_batch_source_sequence_uq"
     "onprocessed_batch(source_sequence)wheresource_sequenceisnotnull"
 )
+_EXECUTION_LIFECYCLE_FEATURES = frozenset(
+    {
+        "entry_fill_status",
+        "exit_execution_status",
+        "position_closed",
+        "holding_trading_sessions",
+        "position_sellable",
+        "entry_price_raw",
+        "structure_stop_price_raw",
+        "eligible_high_price_raw",
+        "remaining_position_fraction",
+    }
+)
 
 
 class StrategyBatchConflictError(RuntimeError):
     """A runner input sequence was missing or reused with different evidence."""
+
+
+def _decode_session_close_receipt(raw: bytes) -> ShadowSourceCompletionReceipt:
+    if len(raw) > _MAX_SESSION_CLOSE_RECEIPT_BYTES:
+        raise ValueError("runner session close receipt exceeds the byte budget")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("runner session close receipt is not valid UTF-8") from exc
+    depth = 0
+    nodes = 0
+    in_string = False
+    escaped = False
+    in_atom = False
+    for character in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if in_atom:
+            if character not in " \t\r\n,]}":
+                continue
+            in_atom = False
+        if character == '"':
+            in_string = True
+            nodes += 1
+        elif character in "[{":
+            depth += 1
+            nodes += 1
+            if depth > _MAX_PROTOCOL_JSON_DEPTH:
+                raise ValueError("runner session close receipt exceeds the JSON depth budget")
+        elif character in "]}":
+            depth -= 1
+        elif character not in " \t\r\n,:":
+            in_atom = True
+            nodes += 1
+        if nodes > _MAX_PROTOCOL_JSON_NODES:
+            raise ValueError("runner session close receipt exceeds the JSON node budget")
+    try:
+        decoded = json.loads(text)
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise ValueError("runner session close receipt payload is invalid") from exc
+    stack = [decoded]
+    nodes = 0
+    while stack:
+        current = stack.pop()
+        nodes += 1
+        if nodes > _MAX_PROTOCOL_JSON_NODES:
+            raise ValueError("runner session close receipt exceeds the JSON node budget")
+        if isinstance(current, dict):
+            stack.extend(current.values())
+        elif isinstance(current, list):
+            stack.extend(current)
+    try:
+        receipt = ShadowSourceCompletionReceipt.model_validate(decoded)
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise ValueError("runner session close receipt payload is invalid") from exc
+    if raw != _json_payload(receipt).encode("utf-8"):
+        raise ValueError("runner session close receipt payload is not canonical")
+    return receipt
 
 
 class StrategySourceBatchReceipt(RuntimeContractModel):
@@ -132,6 +307,62 @@ class StrategySourceBatchReceipt(RuntimeContractModel):
     source_sequence: int = Field(ge=0)
     source_batch_id: str = Field(min_length=1)
     source_content_hash: Sha256
+
+
+class RunnerSignalRouteDrainEvidence(RuntimeContractModel):
+    """Durable signal-router state proving one runner prefix has no backlog."""
+
+    evidence_id: Sha256 | None = None
+    source_id: str = Field(min_length=1)
+    runner_generation_id: Sha256
+    strategy_spec_fingerprint: Sha256
+    signal_authority_generation_id: Sha256
+    routing_policy_fingerprint: Sha256
+    trade_date: date
+    segment_start_sequence: int = Field(ge=0)
+    segment_record_count: int = Field(ge=0)
+    segment_raw_bytes: int = Field(ge=0)
+    segment_chain_hash: Sha256
+    observed_high_watermark: int = Field(ge=0)
+    routed_through_sequence: int = Field(ge=0)
+    last_sequence: int = Field(ge=0)
+    route_receipts_sha256: Sha256
+    observed_at: AwareUtcDatetime
+
+    @model_validator(mode="after")
+    def validate_drain(self) -> RunnerSignalRouteDrainEvidence:
+        if self.routed_through_sequence < self.segment_start_sequence:
+            raise ValueError("route segment range is invalid")
+        if self.segment_record_count != (
+            self.routed_through_sequence - self.segment_start_sequence
+        ):
+            raise ValueError("route segment record count does not match its range")
+        if self.observed_high_watermark < self.routed_through_sequence:
+            raise ValueError("route authority did not observe the requested runner prefix")
+        if self.last_sequence < self.routed_through_sequence:
+            raise ValueError("signal route authority still has a runner backlog")
+        expected = canonical_sha256(self.model_dump(mode="python", exclude={"evidence_id"}))
+        if self.evidence_id is None:
+            object.__setattr__(self, "evidence_id", expected)
+        elif self.evidence_id != expected:
+            raise ValueError("route drain evidence id does not match content")
+        return self
+
+
+class StrategyLifecycleFeatureSource(Protocol):
+    def resolve(
+        self,
+        *,
+        candidate_id: str,
+        entry_signal: SignalEnvelope,
+        exit_signals: tuple[SignalEnvelope, ...],
+        decision_cutoff: datetime,
+        market_features: Mapping[str, object],
+        market_feature_statuses: Mapping[str, FeatureFieldStatus],
+        previous_eligible_high_price_raw: float | None,
+        previous_high_source_event_time: datetime | None,
+        previous_high_available_at: datetime | None,
+    ) -> FeatureInstanceEnvelope: ...
 
 
 def _freeze_json(value: object) -> object:
@@ -223,6 +454,9 @@ class StrategyCandidateState(RuntimeContractModel):
     last_feature_sequence: int = Field(ge=-1)
     last_feature_batch_id: str | None = None
     updated_at: AwareUtcDatetime
+    eligible_high_price_raw: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    eligible_high_source_event_time: AwareUtcDatetime | None = None
+    eligible_high_available_at: AwareUtcDatetime | None = None
 
     @model_validator(mode="after")
     def validate_candidate_metadata(self) -> StrategyCandidateState:
@@ -235,6 +469,24 @@ class StrategyCandidateState(RuntimeContractModel):
         )
         if any(value is None for value in values) and any(value is not None for value in values):
             raise ValueError("candidate occurrence metadata must be all present or all absent")
+        high_watermark = (
+            self.eligible_high_price_raw,
+            self.eligible_high_source_event_time,
+            self.eligible_high_available_at,
+        )
+        if any(value is None for value in high_watermark) and any(
+            value is not None for value in high_watermark
+        ):
+            raise ValueError("eligible high watermark evidence must be all present or all absent")
+        if (
+            self.eligible_high_source_event_time is not None
+            and self.eligible_high_available_at is not None
+            and (
+                self.eligible_high_source_event_time > self.eligible_high_available_at
+                or self.eligible_high_available_at > self.updated_at
+            )
+        ):
+            raise ValueError("eligible high watermark is not point-in-time visible")
         return self
 
     @property
@@ -266,6 +518,126 @@ class RunnerSignalRecord(RuntimeContractModel):
     signal: SignalEnvelope
 
 
+class _RunnerSessionSegment(RuntimeContractModel):
+    trade_date: date
+    runner_generation_id: Sha256
+    start_after_sequence: int = Field(ge=0)
+    final_sequence: int = Field(ge=0)
+    record_count: int = Field(ge=0)
+    raw_bytes: int = Field(ge=0)
+    chain_hash: Sha256
+    final_feature_sequence: int = Field(ge=0)
+    final_feature_batch_id: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_range(self) -> _RunnerSessionSegment:
+        if self.final_sequence < self.start_after_sequence:
+            raise ValueError("runner session segment sequence range is invalid")
+        if self.record_count != self.final_sequence - self.start_after_sequence:
+            raise ValueError("runner session segment record count does not match its range")
+        return self
+
+
+def _runner_segment_seed(
+    *,
+    trade_date: date,
+    runner_generation_id: str,
+    strategy_spec_fingerprint: str,
+) -> str:
+    return canonical_sha256(
+        {
+            "contract": "runner-session-segment-chain/v1",
+            "trade_date": trade_date,
+            "runner_generation_id": runner_generation_id,
+            "strategy_spec_fingerprint": strategy_spec_fingerprint,
+        }
+    )
+
+
+def _advance_runner_segment_chain(previous: str, record: RunnerSignalRecord) -> str:
+    payload = _canonical_json_bytes(record.model_dump(mode="json"))
+    return canonical_sha256(
+        {
+            "previous": previous,
+            "record_sha256": hashlib.sha256(payload).hexdigest(),
+            "record_bytes": len(payload),
+            "sequence": record.sequence,
+        }
+    )
+
+
+def _runner_session_raw_input_id(
+    *,
+    source_id: str,
+    runner_generation_id: str,
+    strategy_spec_fingerprint: str,
+    segment: _RunnerSessionSegment,
+) -> str:
+    return canonical_sha256(
+        {
+            "contract": "shadow-runner-session-raw-input/v3",
+            "descriptor": {
+                "source_id": source_id,
+                "generation_id": runner_generation_id,
+                "strategy_spec_fingerprint": strategy_spec_fingerprint,
+                "first_sequence": segment.start_after_sequence + 1,
+                "high_watermark": segment.final_sequence,
+                "trade_date": segment.trade_date,
+            },
+            "records_chain_hash": segment.chain_hash,
+            "record_count": segment.record_count,
+            "raw_bytes": segment.raw_bytes,
+        }
+    )
+
+
+def runner_signal_raw_input_id(
+    *,
+    source_id: str,
+    runner_generation_id: str,
+    strategy_spec_fingerprint: str,
+    high_watermark: int,
+    records: Sequence[RunnerSignalRecord],
+) -> str:
+    """Hash the frozen source descriptor and every raw runner record in its prefix."""
+
+    if not source_id.strip():
+        raise ValueError("runner source_id cannot be empty")
+    _validate_sha256(runner_generation_id, label="runner_generation_id")
+    _validate_sha256(strategy_spec_fingerprint, label="strategy_spec_fingerprint")
+    if isinstance(high_watermark, bool) or not isinstance(high_watermark, int):
+        raise ValueError("runner high watermark must be an integer")
+    if high_watermark < 0:
+        raise ValueError("runner high watermark must be nonnegative")
+    if len(records) != high_watermark:
+        raise ValueError("runner raw record prefix does not match its high watermark")
+    digest = hashlib.sha256()
+    consumed = 0
+    for expected, record in enumerate(records, start=1):
+        verified = RunnerSignalRecord.model_validate(record)
+        if verified.sequence != expected:
+            raise ValueError("runner raw record prefix has a sequence gap")
+        payload = _canonical_json_bytes(verified.model_dump(mode="json"))
+        digest.update(len(payload).to_bytes(8, "big"))
+        digest.update(payload)
+        consumed += len(payload)
+    return canonical_sha256(
+        {
+            "contract": "shadow-runner-raw-input/v2",
+            "descriptor": {
+                "source_id": source_id,
+                "generation_id": runner_generation_id,
+                "strategy_spec_fingerprint": strategy_spec_fingerprint,
+                "first_sequence": 1,
+                "high_watermark": high_watermark,
+            },
+            "records_sha256": digest.hexdigest(),
+            "record_count": len(records),
+            "raw_bytes": consumed,
+        }
+    )
+
+
 class StrategyBatchResult(RuntimeContractModel):
     feature_batch_id: str = Field(min_length=1)
     feature_sequence: int = Field(ge=0)
@@ -273,6 +645,24 @@ class StrategyBatchResult(RuntimeContractModel):
     transitioned_candidates: int = Field(ge=0)
     skipped_candidates: int = Field(ge=0)
     signals: tuple[RunnerSignalRecord, ...]
+    lifecycle_feature_fingerprints: Mapping[str, Sha256] = Field(default_factory=dict)
+
+    @field_validator("lifecycle_feature_fingerprints")
+    @classmethod
+    def freeze_lifecycle_fingerprints(
+        cls,
+        values: Mapping[str, Sha256],
+    ) -> Mapping[str, Sha256]:
+        if any(not key for key in values):
+            raise ValueError("lifecycle feature fingerprint keys cannot be empty")
+        return MappingProxyType(dict(sorted(values.items())))
+
+    @field_serializer("lifecycle_feature_fingerprints")
+    def serialize_lifecycle_fingerprints(
+        self,
+        values: Mapping[str, Sha256],
+    ) -> dict[str, Sha256]:
+        return dict(values)
 
     @model_validator(mode="after")
     def validate_counts(self) -> StrategyBatchResult:
@@ -293,6 +683,41 @@ def _json_payload(model: RuntimeContractModel) -> str:
         ensure_ascii=True,
         separators=(",", ":"),
         sort_keys=True,
+    )
+
+
+def _utc_iso(value: datetime) -> str:
+    return normalize_aware_utc(value).isoformat().replace("+00:00", "Z")
+
+
+def _signal_index_values(
+    signal: SignalEnvelope,
+) -> tuple[str, str, str | None, str | None, str, str, str]:
+    transition = signal.evidence.get("runner_transition")
+    occurrence_id: str | None = None
+    if transition is not None:
+        if not isinstance(transition, Mapping):
+            raise ValueError("runner_signal transition evidence must be a mapping")
+        raw_occurrence_id = transition.get("candidate_occurrence_id")
+        if raw_occurrence_id is not None:
+            occurrence_id = str(raw_occurrence_id)
+            _validate_sha256(occurrence_id, label="runner_signal candidate_occurrence_id")
+    raw_entry_signal_id = signal.evidence.get("entry_signal_id")
+    entry_signal_id = None if raw_entry_signal_id is None else str(raw_entry_signal_id)
+    if signal.action in {SignalAction.REDUCE, SignalAction.S_INTENT}:
+        if entry_signal_id is None:
+            raise ValueError("runner_signal exit requires entry_signal_id")
+        _validate_sha256(entry_signal_id, label="runner_signal entry_signal_id")
+    elif entry_signal_id is not None:
+        raise ValueError("runner_signal non-exit cannot carry entry_signal_id")
+    return (
+        signal.candidate_id,
+        signal.action.value,
+        entry_signal_id,
+        occurrence_id,
+        _utc_iso(signal.event_time),
+        _utc_iso(signal.available_at),
+        _utc_iso(signal.expires_at),
     )
 
 
@@ -455,12 +880,30 @@ class StrategyRunnerStore:
         *,
         spec: StrategySpec,
         evaluator_contract_fingerprint: Sha256,
+        feature_contract: FeatureContract | None = None,
+        lifecycle_feature_source: StrategyLifecycleFeatureSource | None = None,
         busy_timeout_ms: int = 5_000,
     ) -> None:
         if busy_timeout_ms < 1:
             raise ValueError("busy_timeout_ms must be positive")
         self.path = Path(path)
         self.spec = spec
+        if feature_contract is not None:
+            if not isinstance(feature_contract, FeatureContract):
+                raise TypeError("feature_contract must be a FeatureContract")
+            if feature_contract.contract_id != spec.feature_contract_id:
+                raise ValueError("feature contract id does not match strategy spec")
+            if feature_contract.version < spec.min_feature_contract_version:
+                raise ValueError("feature contract version is below strategy minimum")
+            if feature_contract.producer_commit != spec.producer_commit:
+                raise ValueError("feature contract producer commit does not match strategy spec")
+        self.feature_contract = feature_contract
+        self.lifecycle_feature_source = lifecycle_feature_source
+        self._feature_definitions = (
+            {}
+            if feature_contract is None
+            else {feature.name: feature for feature in feature_contract.features}
+        )
         self.evaluator_contract_fingerprint = _validate_sha256(
             evaluator_contract_fingerprint,
             label="evaluator_contract_fingerprint",
@@ -492,7 +935,9 @@ class StrategyRunnerStore:
             try:
                 self._audit_runner_metadata_schema(connection)
                 self._audit_runner_source_identity_schema(connection)
-                self._audit_runner_signal_schema(connection)
+                runner_signal_schema_state = self._audit_runner_signal_schema(connection)
+                self._audit_runner_session_close_receipt_schema(connection)
+                self._audit_runner_session_segment_schema(connection)
                 existing = self._read_persisted_runner_identity(connection)
                 if existing is not None:
                     if existing["strategy_spec_fingerprint"] != self.spec.spec_fingerprint:
@@ -512,6 +957,10 @@ class StrategyRunnerStore:
                 self._ensure_runner_metadata_schema(connection)
                 self._ensure_candidate_state_schema(connection)
                 self._ensure_processed_batch_schema(connection)
+                self._ensure_runner_signal_schema(
+                    connection,
+                    state=runner_signal_schema_state,
+                )
                 connection.execute(
                     """
                 CREATE TABLE IF NOT EXISTS runner_metadata (
@@ -536,17 +985,10 @@ class StrategyRunnerStore:
                     state TEXT NOT NULL,
                     last_feature_sequence INTEGER NOT NULL,
                     last_feature_batch_id TEXT,
-                    updated_at TEXT NOT NULL
-                )
-                """
-                )
-                connection.execute(
-                    """
-                CREATE TABLE IF NOT EXISTS runner_signal (
-                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                    signal_id TEXT NOT NULL UNIQUE,
-                    feature_sequence INTEGER NOT NULL,
-                    payload_json TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    eligible_high_price_raw REAL,
+                    eligible_high_source_event_time TEXT,
+                    eligible_high_available_at TEXT
                 )
                 """
                 )
@@ -584,10 +1026,39 @@ class StrategyRunnerStore:
                 )
                 """
                 )
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS runner_session_close_receipt (
+                        trade_date TEXT PRIMARY KEY,
+                        receipt_id TEXT NOT NULL UNIQUE,
+                        source_id TEXT NOT NULL,
+                        signal_high_watermark INTEGER NOT NULL,
+                        payload_json TEXT NOT NULL
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS runner_session_segment (
+                        trade_date TEXT PRIMARY KEY,
+                        runner_generation_id TEXT NOT NULL,
+                        start_after_sequence INTEGER NOT NULL,
+                        final_sequence INTEGER NOT NULL,
+                        record_count INTEGER NOT NULL,
+                        raw_bytes INTEGER NOT NULL,
+                        chain_hash TEXT NOT NULL,
+                        final_feature_sequence INTEGER NOT NULL,
+                        final_feature_batch_id TEXT NOT NULL
+                    )
+                    """
+                )
                 if self._audit_runner_metadata_schema(connection) != "current":
                     raise ValueError("runner_metadata schema did not upgrade to current")
                 self._audit_runner_source_identity_schema(connection)
-                self._audit_runner_signal_schema(connection)
+                if self._audit_runner_signal_schema(connection) != "current":
+                    raise ValueError("runner_signal schema did not upgrade to current")
+                self._audit_runner_session_close_receipt_schema(connection)
+                self._audit_runner_session_segment_schema(connection)
                 if self._processed_batch_schema_state(connection) != "current":
                     raise ValueError("processed_batch source receipt schema is incomplete")
                 self._audit_processed_batch_constraints(
@@ -753,10 +1224,103 @@ class StrategyRunnerStore:
         return constraints
 
     @classmethod
-    def _audit_runner_signal_schema(cls, connection: sqlite3.Connection) -> None:
-        if not cls._table_exists(connection, "runner_signal"):
+    def _audit_runner_session_close_receipt_schema(
+        cls,
+        connection: sqlite3.Connection,
+    ) -> None:
+        if not cls._table_exists(connection, "runner_session_close_receipt"):
             return
-        if cls._table_schema(connection, "runner_signal") != _RUNNER_SIGNAL_SCHEMA:
+        if cls._table_schema(connection, "runner_session_close_receipt") != (
+            _RUNNER_SESSION_CLOSE_RECEIPT_SCHEMA
+        ):
+            raise ValueError("runner session close receipt schema is unsupported")
+        if (
+            cls._schema_sql(
+                connection,
+                object_type="table",
+                name="runner_session_close_receipt",
+            )
+            != _RUNNER_SESSION_CLOSE_RECEIPT_TABLE_SQL
+        ):
+            raise ValueError("runner session close receipt canonical DDL is unsupported")
+        if ("receipt_id",) not in cls._unique_constraint_columns(
+            connection,
+            "runner_session_close_receipt",
+        ):
+            raise ValueError("runner session close receipt id must be unique")
+        preflight = connection.execute(
+            "SELECT COALESCE(max(length(CAST(payload_json AS BLOB))), 0) "
+            "FROM runner_session_close_receipt"
+        ).fetchone()
+        if preflight is None or int(preflight[0]) > _MAX_SESSION_CLOSE_RECEIPT_BYTES:
+            raise ValueError("runner session close receipt exceeds the byte budget")
+        for row in connection.execute(
+            "SELECT trade_date, receipt_id, source_id, signal_high_watermark, "
+            "CAST(payload_json AS BLOB) AS payload_bytes "
+            "FROM runner_session_close_receipt ORDER BY trade_date"
+        ):
+            cls._session_close_receipt_from_row(row)
+
+    @classmethod
+    def _audit_runner_session_segment_schema(cls, connection: sqlite3.Connection) -> None:
+        if not cls._table_exists(connection, "runner_session_segment"):
+            return
+        if cls._table_schema(connection, "runner_session_segment") != (
+            _RUNNER_SESSION_SEGMENT_SCHEMA
+        ):
+            raise ValueError("runner session segment schema is unsupported")
+        if (
+            cls._schema_sql(
+                connection,
+                object_type="table",
+                name="runner_session_segment",
+            )
+            != _RUNNER_SESSION_SEGMENT_TABLE_SQL
+        ):
+            raise ValueError("runner session segment canonical DDL is unsupported")
+        for row in connection.execute("SELECT * FROM runner_session_segment ORDER BY trade_date"):
+            cls._runner_session_segment_from_row(row)
+
+    @staticmethod
+    def _runner_session_segment_from_row(row: sqlite3.Row) -> _RunnerSessionSegment:
+        return _RunnerSessionSegment(
+            trade_date=date.fromisoformat(str(row["trade_date"])),
+            runner_generation_id=str(row["runner_generation_id"]),
+            start_after_sequence=int(row["start_after_sequence"]),
+            final_sequence=int(row["final_sequence"]),
+            record_count=int(row["record_count"]),
+            raw_bytes=int(row["raw_bytes"]),
+            chain_hash=str(row["chain_hash"]),
+            final_feature_sequence=int(row["final_feature_sequence"]),
+            final_feature_batch_id=str(row["final_feature_batch_id"]),
+        )
+
+    @staticmethod
+    def _session_close_receipt_from_row(
+        row: sqlite3.Row,
+    ) -> ShadowSourceCompletionReceipt:
+        raw_value = row["payload_bytes"]
+        if not isinstance(raw_value, bytes):
+            raise ValueError("runner session close receipt payload is not bytes")
+        receipt = _decode_session_close_receipt(raw_value)
+        if (
+            row["trade_date"] != receipt.trade_date.isoformat()
+            or row["receipt_id"] != receipt.receipt_id
+            or row["source_id"] != receipt.source_id
+            or int(row["signal_high_watermark"]) != receipt.high_watermark
+        ):
+            raise ValueError("runner session close receipt identity does not match payload")
+        return receipt
+
+    @classmethod
+    def _audit_runner_signal_schema(
+        cls,
+        connection: sqlite3.Connection,
+    ) -> Literal["legacy", "current"] | None:
+        if not cls._table_exists(connection, "runner_signal"):
+            return None
+        schema = cls._table_schema(connection, "runner_signal")
+        if schema not in {_RUNNER_SIGNAL_LEGACY_SCHEMA, _RUNNER_SIGNAL_SCHEMA}:
             raise ValueError("runner_signal schema is unsupported")
         if ("signal_id",) not in cls._unique_constraint_columns(connection, "runner_signal"):
             raise ValueError("runner_signal requires a signal_id UNIQUE constraint")
@@ -765,8 +1329,135 @@ class StrategyRunnerStore:
             object_type="table",
             name="runner_signal",
         )
+        if schema == _RUNNER_SIGNAL_LEGACY_SCHEMA:
+            if sql != _RUNNER_SIGNAL_LEGACY_TABLE_SQL:
+                raise ValueError("runner_signal canonical DDL is unsupported")
+            return "legacy"
         if sql != _RUNNER_SIGNAL_TABLE_SQL:
             raise ValueError("runner_signal canonical DDL is unsupported")
+        expected_indexes = {
+            _RUNNER_SIGNAL_ENTRY_INDEX_NAME: _RUNNER_SIGNAL_ENTRY_INDEX_SQL,
+            _RUNNER_SIGNAL_EXIT_INDEX_NAME: _RUNNER_SIGNAL_EXIT_INDEX_SQL,
+        }
+        for name, expected_sql in expected_indexes.items():
+            if (
+                cls._schema_sql(
+                    connection,
+                    object_type="index",
+                    name=name,
+                )
+                != expected_sql
+            ):
+                raise ValueError(f"runner_signal index {name} is unsupported")
+        for row in connection.execute("SELECT * FROM runner_signal ORDER BY sequence"):
+            cls._runner_signal_from_row(row)
+        return "current"
+
+    @staticmethod
+    def _runner_signal_from_row(row: sqlite3.Row) -> SignalEnvelope:
+        try:
+            signal = SignalEnvelope.model_validate_json(row["payload_json"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("runner_signal payload is invalid") from exc
+        indexed = _signal_index_values(signal)
+        actual = (
+            str(row["candidate_id"]),
+            str(row["action"]),
+            None if row["entry_signal_id"] is None else str(row["entry_signal_id"]),
+            (
+                None
+                if row["candidate_occurrence_id"] is None
+                else str(row["candidate_occurrence_id"])
+            ),
+            str(row["event_time"]),
+            str(row["available_at"]),
+            str(row["expires_at"]),
+        )
+        if (
+            row["signal_id"] != signal.signal_id
+            or actual != indexed
+            or row["payload_json"] != _json_payload(signal)
+        ):
+            raise ValueError("runner_signal indexed identity does not match canonical payload")
+        return signal
+
+    @classmethod
+    def _ensure_runner_signal_schema(
+        cls,
+        connection: sqlite3.Connection,
+        *,
+        state: Literal["legacy", "current"] | None,
+    ) -> None:
+        if state == "legacy":
+            legacy_rows = connection.execute(
+                "SELECT * FROM runner_signal ORDER BY sequence"
+            ).fetchall()
+            migrated: list[tuple[object, ...]] = []
+            for row in legacy_rows:
+                try:
+                    signal = SignalEnvelope.model_validate_json(row["payload_json"])
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("runner_signal legacy payload is invalid") from exc
+                if row["signal_id"] != signal.signal_id or row["payload_json"] != _json_payload(
+                    signal
+                ):
+                    raise ValueError(
+                        "runner_signal legacy identity does not match canonical payload"
+                    )
+                migrated.append(
+                    (
+                        row["sequence"],
+                        row["signal_id"],
+                        row["feature_sequence"],
+                        *_signal_index_values(signal),
+                        row["payload_json"],
+                    )
+                )
+            connection.execute("ALTER TABLE runner_signal RENAME TO runner_signal_legacy")
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS runner_signal (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                signal_id TEXT NOT NULL UNIQUE,
+                feature_sequence INTEGER NOT NULL,
+                candidate_id TEXT NOT NULL,
+                action TEXT NOT NULL,
+                entry_signal_id TEXT,
+                candidate_occurrence_id TEXT,
+                event_time TEXT NOT NULL,
+                available_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL
+            )
+            """
+        )
+        if state == "legacy":
+            connection.executemany(
+                """
+                INSERT INTO runner_signal(
+                    sequence, signal_id, feature_sequence, candidate_id, action,
+                    entry_signal_id, candidate_occurrence_id,
+                    event_time, available_at, expires_at, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                migrated,
+            )
+            connection.execute("DROP TABLE runner_signal_legacy")
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS runner_signal_entry_lookup_idx
+            ON runner_signal(candidate_id, candidate_occurrence_id, action, sequence DESC)
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS runner_signal_exit_lookup_idx
+            ON runner_signal(
+                candidate_id, candidate_occurrence_id, entry_signal_id,
+                action, available_at, sequence
+            )
+            """
+        )
 
     @classmethod
     def _read_persisted_runner_identity(
@@ -813,6 +1504,17 @@ class StrategyRunnerStore:
         )
         if schema == _CANDIDATE_STATE_SCHEMA:
             return
+        if schema == _CANDIDATE_STATE_PRE_HIGH_WATERMARK_SCHEMA:
+            connection.execute(
+                "ALTER TABLE candidate_state ADD COLUMN eligible_high_price_raw REAL"
+            )
+            connection.execute(
+                "ALTER TABLE candidate_state ADD COLUMN eligible_high_source_event_time TEXT"
+            )
+            connection.execute(
+                "ALTER TABLE candidate_state ADD COLUMN eligible_high_available_at TEXT"
+            )
+            return
         if schema != _LEGACY_CANDIDATE_STATE_SCHEMA:
             raise ValueError("candidate_state schema is unsupported")
         row_count = int(connection.execute("SELECT count(*) FROM candidate_state").fetchone()[0])
@@ -831,7 +1533,10 @@ class StrategyRunnerStore:
                 state TEXT NOT NULL,
                 last_feature_sequence INTEGER NOT NULL,
                 last_feature_batch_id TEXT,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                eligible_high_price_raw REAL,
+                eligible_high_source_event_time TEXT,
+                eligible_high_available_at TEXT
             )
             """
         )
@@ -952,6 +1657,108 @@ class StrategyRunnerStore:
         if cls._processed_batch_schema_state(connection) != "current":
             raise ValueError("processed_batch source receipt schema migration is incomplete")
 
+    def _update_runner_session_segment(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        envelope: FeatureBatchEnvelope,
+        records: Sequence[RunnerSignalRecord],
+    ) -> _RunnerSessionSegment:
+        trade_date = envelope.event_time.astimezone(_SHANGHAI).date()
+        row = connection.execute(
+            "SELECT * FROM runner_session_segment WHERE trade_date = ?",
+            (trade_date.isoformat(),),
+        ).fetchone()
+        if row is None:
+            if records:
+                start_after_sequence = records[0].sequence - 1
+            else:
+                watermark = connection.execute(
+                    "SELECT max(sequence) AS value FROM runner_signal"
+                ).fetchone()
+                start_after_sequence = (
+                    0
+                    if watermark is None or watermark["value"] is None
+                    else int(watermark["value"])
+                )
+            previous = _runner_segment_seed(
+                trade_date=trade_date,
+                runner_generation_id=self.source_generation_id,
+                strategy_spec_fingerprint=self.spec.spec_fingerprint,
+            )
+            final_sequence = start_after_sequence
+            record_count = 0
+            raw_bytes = 0
+        else:
+            persisted = self._runner_session_segment_from_row(row)
+            if persisted.runner_generation_id != self.source_generation_id:
+                raise StrategyBatchConflictError("runner session segment generation changed")
+            if envelope.sequence != persisted.final_feature_sequence + 1:
+                raise StrategyBatchConflictError(
+                    "runner session feature sequence must advance contiguously"
+                )
+            start_after_sequence = persisted.start_after_sequence
+            previous = persisted.chain_hash
+            final_sequence = persisted.final_sequence
+            record_count = persisted.record_count
+            raw_bytes = persisted.raw_bytes
+        for record in records:
+            verified = RunnerSignalRecord.model_validate(record)
+            if verified.sequence != final_sequence + 1:
+                raise StrategyBatchConflictError("runner session signal sequence has a gap")
+            payload = _canonical_json_bytes(verified.model_dump(mode="json"))
+            previous = _advance_runner_segment_chain(previous, verified)
+            final_sequence = verified.sequence
+            record_count += 1
+            raw_bytes += len(payload)
+            if record_count > _MAX_RUNNER_SESSION_RECORDS:
+                raise StrategyBatchConflictError("runner session segment exceeds the record budget")
+            if raw_bytes > _MAX_RUNNER_SESSION_RAW_BYTES:
+                raise StrategyBatchConflictError(
+                    "runner session segment exceeds the raw byte budget"
+                )
+        segment = _RunnerSessionSegment(
+            trade_date=trade_date,
+            runner_generation_id=self.source_generation_id,
+            start_after_sequence=start_after_sequence,
+            final_sequence=final_sequence,
+            record_count=record_count,
+            raw_bytes=raw_bytes,
+            chain_hash=previous,
+            final_feature_sequence=envelope.sequence,
+            final_feature_batch_id=envelope.batch_id,
+        )
+        connection.execute(
+            """
+            INSERT INTO runner_session_segment(
+                trade_date, runner_generation_id, start_after_sequence,
+                final_sequence, record_count, raw_bytes, chain_hash,
+                final_feature_sequence, final_feature_batch_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(trade_date) DO UPDATE SET
+                runner_generation_id = excluded.runner_generation_id,
+                start_after_sequence = excluded.start_after_sequence,
+                final_sequence = excluded.final_sequence,
+                record_count = excluded.record_count,
+                raw_bytes = excluded.raw_bytes,
+                chain_hash = excluded.chain_hash,
+                final_feature_sequence = excluded.final_feature_sequence,
+                final_feature_batch_id = excluded.final_feature_batch_id
+            """,
+            (
+                segment.trade_date.isoformat(),
+                segment.runner_generation_id,
+                segment.start_after_sequence,
+                segment.final_sequence,
+                segment.record_count,
+                segment.raw_bytes,
+                segment.chain_hash,
+                segment.final_feature_sequence,
+                segment.final_feature_batch_id,
+            ),
+        )
+        return segment
+
     def process_batch(
         self,
         envelope: FeatureBatchEnvelope,
@@ -981,6 +1788,11 @@ class StrategyRunnerStore:
             "occurrence" if "candidate_occurrence_id" in normalized.columns else "flat"
         )
         self._validate_feature_structure(envelope, normalized)
+        self._validate_feature_availability(
+            envelope,
+            normalized,
+            observed_at=observed_at,
+        )
         canonical_payload = canonical_feature_payload(
             normalized,
             schema_version=envelope.schema_version,
@@ -1021,6 +1833,19 @@ class StrategyRunnerStore:
                     connection.rollback()
                     return StrategyBatchResult.model_validate_json(existing["result_json"])
 
+                batch_trade_date = envelope.event_time.astimezone(_SHANGHAI).date()
+                closed = connection.execute(
+                    """
+                    SELECT receipt_id FROM runner_session_close_receipt
+                    WHERE trade_date = ?
+                    """,
+                    (batch_trade_date.isoformat(),),
+                ).fetchone()
+                if closed is not None:
+                    raise StrategyBatchConflictError(
+                        "late feature batch cannot mutate an already closed session"
+                    )
+
                 previous = connection.execute(
                     "SELECT * FROM processed_batch ORDER BY feature_sequence DESC LIMIT 1"
                 ).fetchone()
@@ -1048,6 +1873,7 @@ class StrategyRunnerStore:
                             )
 
                 records: list[RunnerSignalRecord] = []
+                lifecycle_feature_fingerprints: dict[str, str] = {}
                 transitioned = 0
                 skipped = 0
                 for row in normalized.to_dict(orient="records"):
@@ -1058,7 +1884,11 @@ class StrategyRunnerStore:
                         row,
                         observed_at,
                     )
-                    features = self._candidate_features(envelope, row)
+                    features = self._candidate_features(
+                        envelope,
+                        row,
+                        candidate_id=candidate_id,
+                    )
                     if features is None:
                         skipped += 1
                         self._write_state(
@@ -1072,6 +1902,18 @@ class StrategyRunnerStore:
                             ),
                         )
                         continue
+
+                    features, lifecycle_fingerprint, state = self._merge_lifecycle_features(
+                        connection,
+                        state=state,
+                        features=features,
+                        envelope=envelope,
+                        row=row,
+                        candidate_id=candidate_id,
+                        observed_at=observed_at,
+                    )
+                    if lifecycle_fingerprint is not None:
+                        lifecycle_feature_fingerprints[state.state_key] = lifecycle_fingerprint
 
                     decision = evaluator(self.spec, state, features)
                     if decision is None:
@@ -1106,6 +1948,23 @@ class StrategyRunnerStore:
                                 raise ValueError(
                                     "decision evidence cannot override runner_transition"
                                 )
+                            if decision.action in {
+                                SignalAction.REDUCE,
+                                SignalAction.S_INTENT,
+                            }:
+                                if "entry_signal_id" in evidence:
+                                    raise ValueError(
+                                        "decision evidence cannot override entry_signal_id"
+                                    )
+                                entry_signal = self._latest_entry_signal(
+                                    connection,
+                                    state=state,
+                                )
+                                if entry_signal is None:
+                                    raise ValueError(
+                                        "sell action requires a persisted entry signal"
+                                    )
+                                evidence["entry_signal_id"] = entry_signal.signal_id
                             evidence["runner_transition"] = {
                                 **state.runner_transition_metadata,
                                 "event": decision.event,
@@ -1115,6 +1974,11 @@ class StrategyRunnerStore:
                                 "feature_sequence": envelope.sequence,
                                 "evaluator_contract_fingerprint": (
                                     self.evaluator_contract_fingerprint
+                                ),
+                                **(
+                                    {}
+                                    if lifecycle_fingerprint is None
+                                    else {"lifecycle_feature_fingerprint": lifecycle_fingerprint}
                                 ),
                             }
                             signal = SignalEnvelope(
@@ -1133,13 +1997,22 @@ class StrategyRunnerStore:
                                 expires_at=observed_at + decision.expires_after,  # type: ignore[operator]
                                 producer_commit=self.spec.producer_commit,
                             )
+                            signal_payload = _json_payload(signal)
+                            signal_index_values = _signal_index_values(signal)
                             cursor = connection.execute(
                                 """
                                 INSERT INTO runner_signal(
-                                    signal_id, feature_sequence, payload_json
-                                ) VALUES (?, ?, ?)
+                                    signal_id, feature_sequence, candidate_id, action,
+                                    entry_signal_id, candidate_occurrence_id,
+                                    event_time, available_at, expires_at, payload_json
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                                 """,
-                                (signal.signal_id, envelope.sequence, _json_payload(signal)),
+                                (
+                                    signal.signal_id,
+                                    envelope.sequence,
+                                    *signal_index_values,
+                                    signal_payload,
+                                ),
                             )
                             records.append(
                                 RunnerSignalRecord(
@@ -1160,6 +2033,11 @@ class StrategyRunnerStore:
                         ),
                     )
 
+                self._update_runner_session_segment(
+                    connection,
+                    envelope=envelope,
+                    records=records,
+                )
                 result = StrategyBatchResult(
                     feature_batch_id=envelope.batch_id,
                     feature_sequence=envelope.sequence,
@@ -1167,6 +2045,7 @@ class StrategyRunnerStore:
                     transitioned_candidates=transitioned,
                     skipped_candidates=skipped,
                     signals=tuple(record.model_dump(mode="json") for record in records),
+                    lifecycle_feature_fingerprints=lifecycle_feature_fingerprints,
                 )
                 connection.execute(
                     """
@@ -1345,6 +2224,14 @@ class StrategyRunnerStore:
                 + ", ".join(incompatible_required)
             )
         requirements = self.spec.required_features + self._eligible_optional_requirements(envelope)
+        requirements = tuple(
+            requirement
+            for requirement in requirements
+            if not (
+                self.lifecycle_feature_source is not None
+                and requirement.name in _EXECUTION_LIFECYCLE_FEATURES
+            )
+        )
         missing_columns = sorted(
             requirement.name
             for requirement in requirements
@@ -1353,21 +2240,97 @@ class StrategyRunnerStore:
         if missing_columns:
             raise ValueError("missing feature columns: " + ", ".join(missing_columns))
         missing_statuses = sorted(
-            requirement.name
+            f"{candidate_id}:{requirement.name}"
+            for candidate_id in frame["ts_code"].astype(str)
             for requirement in requirements
-            if envelope.field_status(requirement.name) is None
+            if envelope.field_status(
+                requirement.name,
+                candidate_id=candidate_id,
+            )
+            is None
         )
         if missing_statuses:
             raise ValueError("missing field status for: " + ", ".join(missing_statuses))
+
+    def _validate_feature_availability(
+        self,
+        envelope: FeatureBatchEnvelope,
+        frame: pd.DataFrame,
+        *,
+        observed_at: datetime,
+    ) -> None:
+        if self.feature_contract is None:
+            return
+        if envelope.contract_version != self.feature_contract.version:
+            raise ValueError("feature envelope version does not match published contract")
+        requirements = self.spec.required_features + self._eligible_optional_requirements(envelope)
+        for candidate_id in frame["ts_code"].astype(str):
+            for requirement in requirements:
+                if (
+                    self.lifecycle_feature_source is not None
+                    and requirement.name in _EXECUTION_LIFECYCLE_FEATURES
+                ):
+                    continue
+                definition = self._feature_definitions.get(requirement.name)
+                if definition is None:
+                    raise ValueError(
+                        f"published feature contract does not define {requirement.name}"
+                    )
+                status = envelope.field_status(
+                    requirement.name,
+                    candidate_id=candidate_id,
+                )
+                if status is None:
+                    raise RuntimeError("feature structure was not validated")
+                if status.decision_cutoff > observed_at:
+                    raise ValueError(
+                        f"feature {candidate_id}:{requirement.name} decision_cutoff "
+                        "is in the future"
+                    )
+                availability = definition.availability_contract
+                if (
+                    status.status is FeatureAvailability.UNAVAILABLE
+                    and availability.missing_policy is MissingFeaturePolicy.FAIL_CLOSED
+                ):
+                    raise ValueError(
+                        f"feature {candidate_id}:{requirement.name} is missing under "
+                        "fail_closed policy"
+                    )
+                if status.actual_delay_seconds <= availability.max_delay_seconds:
+                    continue
+                if availability.late_policy is LateFeaturePolicy.FAIL_CLOSED:
+                    raise ValueError(
+                        f"feature {candidate_id}:{requirement.name} exceeds max_delay_seconds"
+                    )
+                expected_status = (
+                    FeatureAvailability.STALE
+                    if availability.late_policy is LateFeaturePolicy.MARK_STALE
+                    else FeatureAvailability.DEGRADED
+                )
+                if status.status is not expected_status:
+                    raise ValueError(
+                        f"feature {candidate_id}:{requirement.name} exceeds "
+                        f"max_delay_seconds without {expected_status.value} status"
+                    )
 
     def _candidate_features(
         self,
         envelope: FeatureBatchEnvelope,
         row: Mapping[str, object],
+        *,
+        candidate_id: str,
     ) -> Mapping[str, object] | None:
         features: dict[str, object] = {}
         for requirement in self.spec.required_features:
-            status = envelope.field_status(requirement.name)
+            if (
+                self.lifecycle_feature_source is not None
+                and requirement.name in _EXECUTION_LIFECYCLE_FEATURES
+            ):
+                continue
+            status = envelope.field_status(
+                requirement.name,
+                candidate_id=candidate_id,
+            )
             if status is None:
                 raise RuntimeError("feature structure was not validated")
             if not self._status_is_usable(
@@ -1380,7 +2343,15 @@ class StrategyRunnerStore:
                 return None
             features[requirement.name] = value
         for requirement in self._eligible_optional_requirements(envelope):
-            status = envelope.field_status(requirement.name)
+            if (
+                self.lifecycle_feature_source is not None
+                and requirement.name in _EXECUTION_LIFECYCLE_FEATURES
+            ):
+                continue
+            status = envelope.field_status(
+                requirement.name,
+                candidate_id=candidate_id,
+            )
             if status is None:
                 raise RuntimeError("feature structure was not validated")
             value = row[requirement.name]
@@ -1390,6 +2361,166 @@ class StrategyRunnerStore:
             ) and self._has_scalar_value(value):
                 features[requirement.name] = value
         return MappingProxyType(features)
+
+    def _merge_lifecycle_features(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        state: StrategyCandidateState,
+        features: Mapping[str, object],
+        envelope: FeatureBatchEnvelope,
+        row: Mapping[str, object],
+        candidate_id: str,
+        observed_at: datetime,
+    ) -> tuple[Mapping[str, object], str | None, StrategyCandidateState]:
+        if self.lifecycle_feature_source is None or state.state not in {
+            StrategyLifecycleState.ARMED,
+            StrategyLifecycleState.HOLDING,
+        }:
+            return features, None, state
+        entry_signal = self._latest_entry_signal(connection, state=state)
+        if entry_signal is None:
+            raise ValueError("armed or holding candidate is missing its entry signal")
+        session_high = row.get("session_high")
+        if not self._has_scalar_value(session_high):
+            raise ValueError("paper lifecycle requires candidate session_high")
+        session_high_status = envelope.field_status(
+            "session_high",
+            candidate_id=candidate_id,
+        )
+        if session_high_status is None:
+            raise ValueError("paper lifecycle requires candidate session_high status")
+        self._validate_instance_availability(
+            "session_high",
+            session_high_status,
+            observed_at=observed_at,
+            require_exact_cutoff=False,
+        )
+        lifecycle_market_features = dict(features)
+        lifecycle_market_features["session_high"] = session_high
+        overlay = self.lifecycle_feature_source.resolve(
+            candidate_id=state.candidate_id,
+            entry_signal=entry_signal,
+            exit_signals=self._exit_signals_for_entry(
+                connection,
+                state=state,
+                entry_signal=entry_signal,
+                decision_cutoff=observed_at,
+            ),
+            decision_cutoff=observed_at,
+            market_features=MappingProxyType(lifecycle_market_features),
+            market_feature_statuses=MappingProxyType({"session_high": session_high_status}),
+            previous_eligible_high_price_raw=state.eligible_high_price_raw,
+            previous_high_source_event_time=state.eligible_high_source_event_time,
+            previous_high_available_at=state.eligible_high_available_at,
+        )
+        if not isinstance(overlay, FeatureInstanceEnvelope):
+            raise TypeError("lifecycle source must return a FeatureInstanceEnvelope")
+        expected_names = (
+            {"entry_fill_status"}
+            if state.state is StrategyLifecycleState.ARMED
+            else _EXECUTION_LIFECYCLE_FEATURES - {"entry_fill_status"}
+        )
+        if not expected_names.issubset(overlay.values):
+            raise ValueError("paper lifecycle source is missing required state fields")
+        merged = dict(features)
+        for name, value in overlay.values.items():
+            if name not in _EXECUTION_LIFECYCLE_FEATURES:
+                raise ValueError("paper lifecycle source returned an undeclared field")
+            if name in merged:
+                raise ValueError("paper lifecycle source collided with market features")
+            status = overlay.field_status(name)
+            if status is None:
+                raise RuntimeError("feature instance envelope is internally inconsistent")
+            self._validate_instance_availability(name, status, observed_at=observed_at)
+            merged[name] = value
+        high_status = overlay.field_status("eligible_high_price_raw")
+        if high_status is not None:
+            if high_status.candidate_id not in {None, candidate_id}:
+                raise ValueError("paper lifecycle high watermark candidate does not match")
+            state = state.model_copy(
+                update={
+                    "eligible_high_price_raw": float(overlay.values["eligible_high_price_raw"]),
+                    "eligible_high_source_event_time": high_status.source_event_time,
+                    "eligible_high_available_at": high_status.available_at,
+                }
+            )
+        return MappingProxyType(merged), overlay.instance_fingerprint, state
+
+    def _validate_instance_availability(
+        self,
+        name: str,
+        status: FeatureFieldStatus,
+        *,
+        observed_at: datetime,
+        require_exact_cutoff: bool = True,
+    ) -> None:
+        if self.feature_contract is None:
+            raise ValueError("lifecycle features require a published feature contract")
+        definition = self._feature_definitions.get(name)
+        if definition is None:
+            raise ValueError(f"published feature contract does not define {name}")
+        if status.decision_cutoff > observed_at or (
+            require_exact_cutoff and status.decision_cutoff != observed_at
+        ):
+            raise ValueError(f"feature {name} decision_cutoff does not match runner cutoff")
+        availability = definition.availability_contract
+        if status.actual_delay_seconds > availability.max_delay_seconds:
+            if availability.late_policy is LateFeaturePolicy.FAIL_CLOSED:
+                raise ValueError(f"feature {name} exceeds max_delay_seconds")
+            expected_status = (
+                FeatureAvailability.STALE
+                if availability.late_policy is LateFeaturePolicy.MARK_STALE
+                else FeatureAvailability.DEGRADED
+            )
+            if status.status is not expected_status:
+                raise ValueError(
+                    f"feature {name} exceeds max_delay_seconds without "
+                    f"{expected_status.value} status"
+                )
+
+    @staticmethod
+    def _latest_entry_signal(
+        connection: sqlite3.Connection,
+        *,
+        state: StrategyCandidateState,
+    ) -> SignalEnvelope | None:
+        row = connection.execute(
+            """
+            SELECT * FROM runner_signal
+            WHERE candidate_id = ? AND candidate_occurrence_id IS ?
+              AND action = 'b_intent'
+            ORDER BY sequence DESC LIMIT 1
+            """,
+            (state.candidate_id, state.candidate_occurrence_id),
+        ).fetchone()
+        return None if row is None else StrategyRunnerStore._runner_signal_from_row(row)
+
+    @staticmethod
+    def _exit_signals_for_entry(
+        connection: sqlite3.Connection,
+        *,
+        state: StrategyCandidateState,
+        entry_signal: SignalEnvelope,
+        decision_cutoff: datetime,
+    ) -> tuple[SignalEnvelope, ...]:
+        rows = connection.execute(
+            """
+            SELECT * FROM runner_signal
+            WHERE candidate_id = ? AND candidate_occurrence_id IS ?
+              AND entry_signal_id = ?
+              AND action IN ('reduce', 's_intent')
+              AND available_at <= ?
+            ORDER BY sequence
+            """,
+            (
+                state.candidate_id,
+                state.candidate_occurrence_id,
+                entry_signal.signal_id,
+                _utc_iso(decision_cutoff),
+            ),
+        ).fetchall()
+        return tuple(StrategyRunnerStore._runner_signal_from_row(row) for row in rows)
 
     def _candidate_state(
         self,
@@ -1405,6 +2536,21 @@ class StrategyRunnerStore:
             (occurrence_id,),
         ).fetchone()
         if row is None:
+            if self.lifecycle_feature_source is not None:
+                active = connection.execute(
+                    """
+                    SELECT * FROM candidate_state
+                    WHERE candidate_id = ? AND state IN ('armed', 'holding')
+                    ORDER BY updated_at DESC
+                    """,
+                    (candidate_id,),
+                ).fetchall()
+                if len(active) > 1:
+                    raise StrategyBatchConflictError(
+                        "candidate has multiple active execution lifecycles"
+                    )
+                if active:
+                    return self._state_from_row(active[0])
             return StrategyCandidateState(
                 strategy_spec_fingerprint=self.spec.spec_fingerprint,
                 candidate_id=candidate_id,
@@ -1487,8 +2633,9 @@ class StrategyRunnerStore:
                 occurrence_id, candidate_id, candidate_effective_trade_date,
                 candidate_variant, candidate_generation_sha256,
                 candidate_snapshot_schema_version, state, last_feature_sequence,
-                last_feature_batch_id, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                last_feature_batch_id, updated_at, eligible_high_price_raw,
+                eligible_high_source_event_time, eligible_high_available_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(occurrence_id) DO UPDATE SET
                 candidate_id = excluded.candidate_id,
                 candidate_effective_trade_date = excluded.candidate_effective_trade_date,
@@ -1498,7 +2645,10 @@ class StrategyRunnerStore:
                 state = excluded.state,
                 last_feature_sequence = excluded.last_feature_sequence,
                 last_feature_batch_id = excluded.last_feature_batch_id,
-                updated_at = excluded.updated_at
+                updated_at = excluded.updated_at,
+                eligible_high_price_raw = excluded.eligible_high_price_raw,
+                eligible_high_source_event_time = excluded.eligible_high_source_event_time,
+                eligible_high_available_at = excluded.eligible_high_available_at
             """,
             (
                 state.state_key,
@@ -1515,6 +2665,17 @@ class StrategyRunnerStore:
                 state.last_feature_sequence,
                 state.last_feature_batch_id,
                 state.updated_at.isoformat(),
+                state.eligible_high_price_raw,
+                (
+                    None
+                    if state.eligible_high_source_event_time is None
+                    else state.eligible_high_source_event_time.isoformat()
+                ),
+                (
+                    None
+                    if state.eligible_high_available_at is None
+                    else state.eligible_high_available_at.isoformat()
+                ),
             ),
         )
 
@@ -1547,7 +2708,7 @@ class StrategyRunnerStore:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT sequence, payload_json FROM runner_signal
+                SELECT * FROM runner_signal
                 WHERE sequence > ? ORDER BY sequence
                 """,
                 (sequence,),
@@ -1555,10 +2716,403 @@ class StrategyRunnerStore:
         return tuple(
             RunnerSignalRecord(
                 sequence=row["sequence"],
-                signal=json.loads(row["payload_json"]),
+                signal=self._runner_signal_from_row(row),
             )
             for row in rows
         )
+
+    def _runner_records_through(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        high_watermark: int,
+    ) -> tuple[RunnerSignalRecord, ...]:
+        records: list[RunnerSignalRecord] = []
+        cursor = connection.execute(
+            """
+            SELECT * FROM runner_signal
+            WHERE sequence <= ? ORDER BY sequence
+            """,
+            (high_watermark,),
+        )
+        while True:
+            rows = cursor.fetchmany(1_000)
+            if not rows:
+                break
+            for row in rows:
+                records.append(
+                    RunnerSignalRecord(
+                        sequence=int(row["sequence"]),
+                        signal=self._runner_signal_from_row(row),
+                    )
+                )
+        return tuple(records)
+
+    def runner_raw_input_id(
+        self,
+        *,
+        source_id: str,
+        high_watermark: int,
+    ) -> str:
+        with self._connect() as connection:
+            records = self._runner_records_through(
+                connection,
+                high_watermark=high_watermark,
+            )
+        return runner_signal_raw_input_id(
+            source_id=source_id,
+            runner_generation_id=self.source_generation_id,
+            strategy_spec_fingerprint=self.spec.spec_fingerprint,
+            high_watermark=high_watermark,
+            records=records,
+        )
+
+    def runner_session_raw_input_id(
+        self,
+        *,
+        source_id: str,
+        trade_date: date,
+    ) -> str:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM runner_session_segment WHERE trade_date = ?",
+                (trade_date.isoformat(),),
+            ).fetchone()
+        if row is None:
+            raise ValueError("runner session segment is missing")
+        return _runner_session_raw_input_id(
+            source_id=source_id,
+            runner_generation_id=self.source_generation_id,
+            strategy_spec_fingerprint=self.spec.spec_fingerprint,
+            segment=self._runner_session_segment_from_row(row),
+        )
+
+    def runner_session_route_bounds(self, trade_date: date) -> tuple[int, int]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM runner_session_segment WHERE trade_date = ?",
+                (trade_date.isoformat(),),
+            ).fetchone()
+        if row is None:
+            raise ValueError("runner session segment is missing")
+        segment = self._runner_session_segment_from_row(row)
+        return segment.start_after_sequence, segment.final_sequence
+
+    def session_close_receipt(
+        self,
+        trade_date: date,
+    ) -> ShadowSourceCompletionReceipt | None:
+        with self._connect() as connection:
+            connection.execute("BEGIN")
+            size = connection.execute(
+                "SELECT length(CAST(payload_json AS BLOB)) "
+                "FROM runner_session_close_receipt WHERE trade_date = ?",
+                (trade_date.isoformat(),),
+            ).fetchone()
+            if size is None:
+                return None
+            if int(size[0]) > _MAX_SESSION_CLOSE_RECEIPT_BYTES:
+                raise ValueError("runner session close receipt exceeds the byte budget")
+            row = connection.execute(
+                """
+                SELECT trade_date, receipt_id, source_id, signal_high_watermark,
+                       CAST(payload_json AS BLOB) AS payload_bytes
+                FROM runner_session_close_receipt
+                WHERE trade_date = ?
+                """,
+                (trade_date.isoformat(),),
+            ).fetchone()
+        if row is None:
+            raise ValueError("runner session close receipt changed after byte preflight")
+        return self._session_close_receipt_from_row(row)
+
+    def publish_session_close_receipt(
+        self,
+        *,
+        trade_date: date,
+        session_close_at: datetime,
+        source_id: str,
+        calendar_generation_id: str,
+        producer_service_id: str,
+        producer_instance_id: str,
+        producer_version: str,
+        produced_at: datetime,
+        feature_close_marker: FeatureSessionCloseMarker,
+        attestation_signer: CompletionAttestationSigner,
+        strategy_registration_fingerprint: str,
+        executable_fingerprint: str,
+        candidate_schema_fingerprint: str,
+        feature_registration_fingerprint: str,
+        feature_contract_fingerprint: str,
+        producer_manifest_fingerprint: str,
+        route_evidence: RunnerSignalRouteDrainEvidence,
+        fault_hook: Callable[[str], None] | None = None,
+    ) -> ShadowSourceCompletionReceipt:
+        """Atomically seal one fully processed and fully routed SSE session."""
+
+        produced = normalize_aware_utc(produced_at)
+        close = normalize_aware_utc(session_close_at)
+        route = RunnerSignalRouteDrainEvidence.model_validate(route_evidence)
+        if not isinstance(feature_close_marker, FeatureSessionCloseMarker):
+            raise TypeError("feature close marker is required")
+        if not callable(getattr(attestation_signer, "issue", None)):
+            raise TypeError("completion attestation signer is required")
+        marker = FeatureSessionCloseMarker.model_validate(feature_close_marker)
+        if close.astimezone(_SHANGHAI).date() != trade_date:
+            raise ValueError("session close does not match trade_date")
+        if produced < close:
+            raise StrategyBatchConflictError(
+                "session close receipt cannot be produced before close"
+            )
+        if route.observed_at > produced:
+            raise StrategyBatchConflictError("route drain evidence is not visible at receipt time")
+        if route.source_id != source_id:
+            raise StrategyBatchConflictError("route drain evidence source does not match runner")
+        if route.runner_generation_id != self.source_generation_id:
+            raise StrategyBatchConflictError("route drain runner generation does not match")
+        if route.strategy_spec_fingerprint != self.spec.spec_fingerprint:
+            raise StrategyBatchConflictError("route drain strategy identity does not match")
+        _validate_sha256(calendar_generation_id, label="calendar_generation_id")
+        for label, value in (
+            ("strategy_registration_fingerprint", strategy_registration_fingerprint),
+            ("executable_fingerprint", executable_fingerprint),
+            ("candidate_schema_fingerprint", candidate_schema_fingerprint),
+            ("feature_registration_fingerprint", feature_registration_fingerprint),
+            ("feature_contract_fingerprint", feature_contract_fingerprint),
+            ("producer_manifest_fingerprint", producer_manifest_fingerprint),
+        ):
+            _validate_sha256(value, label=label)
+        if marker.trade_date != trade_date or marker.session_close_at != close:
+            raise StrategyBatchConflictError("feature close marker does not match session")
+        if marker.calendar_generation_id != calendar_generation_id:
+            raise StrategyBatchConflictError("feature close marker calendar generation changed")
+        if marker.produced_at > produced:
+            raise StrategyBatchConflictError("feature close marker was unavailable at receipt time")
+        if not producer_service_id.strip() or not producer_instance_id.strip():
+            raise ValueError("producer service and instance identities cannot be empty")
+        if not producer_version.strip():
+            raise ValueError("producer_version cannot be empty")
+
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                existing_size = connection.execute(
+                    "SELECT length(CAST(payload_json AS BLOB)) "
+                    "FROM runner_session_close_receipt WHERE trade_date = ?",
+                    (trade_date.isoformat(),),
+                ).fetchone()
+                if (
+                    existing_size is not None
+                    and int(existing_size[0]) > _MAX_SESSION_CLOSE_RECEIPT_BYTES
+                ):
+                    raise ValueError("runner session close receipt exceeds the byte budget")
+                existing = connection.execute(
+                    """
+                    SELECT trade_date, receipt_id, source_id, signal_high_watermark,
+                           CAST(payload_json AS BLOB) AS payload_bytes
+                    FROM runner_session_close_receipt
+                    WHERE trade_date = ?
+                    """,
+                    (trade_date.isoformat(),),
+                ).fetchone()
+                if existing is not None:
+                    persisted = self._session_close_receipt_from_row(existing)
+                    if (
+                        persisted.source_id != source_id
+                        or persisted.calendar_generation_id != calendar_generation_id
+                        or persisted.producer_service_id != producer_service_id
+                        or persisted.producer_instance_id != producer_instance_id
+                        or persisted.producer_version != producer_version
+                        or persisted.runner_generation_id != self.source_generation_id
+                        or persisted.signal_authority_generation_id
+                        != route.signal_authority_generation_id
+                        or persisted.route_receipts_id != route.route_receipts_sha256
+                        or persisted.feature_close_marker_id != marker.marker_id
+                    ):
+                        raise StrategyBatchConflictError(
+                            "conflicting immutable session close receipt"
+                        )
+                    persisted_attestation = persisted.completion_attestation
+                    if persisted_attestation is None:
+                        raise StrategyBatchConflictError(
+                            "durable session close receipt has no completion attestation"
+                        )
+                    persisted_claims = persisted_attestation.claims
+                    if (
+                        persisted_claims.strategy_registration_fingerprint
+                        != strategy_registration_fingerprint
+                        or persisted_claims.executable_fingerprint != executable_fingerprint
+                        or persisted_claims.candidate_schema_fingerprint
+                        != candidate_schema_fingerprint
+                        or persisted_claims.feature_registration_fingerprint
+                        != feature_registration_fingerprint
+                        or persisted_claims.feature_contract_fingerprint
+                        != feature_contract_fingerprint
+                        or persisted_claims.producer_manifest_fingerprint
+                        != producer_manifest_fingerprint
+                        or persisted_claims.routing_policy_fingerprint
+                        != route.routing_policy_fingerprint
+                    ):
+                        raise StrategyBatchConflictError(
+                            "conflicting completion attestation business identity"
+                        )
+                    connection.rollback()
+                    return persisted
+                processed = connection.execute(
+                    """
+                    SELECT feature_sequence, feature_batch_id, event_time,
+                           source_generation_id, source_sequence,
+                           source_batch_id, source_content_hash
+                    FROM processed_batch
+                    WHERE source_generation_id = ? AND source_sequence = ?
+                    """,
+                    (marker.source_generation_id, marker.final_sequence),
+                ).fetchone()
+                if (
+                    processed is None
+                    or int(processed["source_sequence"]) != marker.final_sequence
+                    or str(processed["source_batch_id"]) != marker.final_batch_id
+                    or str(processed["source_content_hash"]) != marker.final_content_hash
+                ):
+                    raise StrategyBatchConflictError(
+                        "runner has not consumed the exact feature session close marker"
+                    )
+                processed_event_time = normalize_aware_utc(
+                    datetime.fromisoformat(str(processed["event_time"]))
+                )
+                if processed_event_time != close:
+                    raise StrategyBatchConflictError(
+                        "runner final feature event must equal the exact 15:00 close"
+                    )
+                last_feature_sequence = int(processed["feature_sequence"])
+                segment_row = connection.execute(
+                    "SELECT * FROM runner_session_segment WHERE trade_date = ?",
+                    (trade_date.isoformat(),),
+                ).fetchone()
+                if segment_row is None:
+                    raise StrategyBatchConflictError("runner session segment is missing")
+                segment = self._runner_session_segment_from_row(segment_row)
+                if (
+                    route.trade_date != trade_date
+                    or route.segment_start_sequence != segment.start_after_sequence
+                    or route.segment_record_count != segment.record_count
+                ):
+                    raise StrategyBatchConflictError(
+                        "signal route backlog or segment mismatch with the runner session"
+                    )
+                if (
+                    segment.final_feature_sequence != last_feature_sequence
+                    or segment.final_feature_batch_id != str(processed["feature_batch_id"])
+                ):
+                    raise StrategyBatchConflictError(
+                        "runner session segment does not reach the feature close marker"
+                    )
+                signal_high_watermark = segment.final_sequence
+                if route.routed_through_sequence != signal_high_watermark:
+                    raise StrategyBatchConflictError(
+                        "signal route backlog is not drained through the runner close watermark"
+                    )
+                raw_input_id = _runner_session_raw_input_id(
+                    source_id=source_id,
+                    runner_generation_id=self.source_generation_id,
+                    strategy_spec_fingerprint=self.spec.spec_fingerprint,
+                    segment=segment,
+                )
+                unsigned_receipt = ShadowSourceCompletionReceipt(
+                    evidence_origin="production",
+                    source="isolated",
+                    source_id=source_id,
+                    trade_date=trade_date,
+                    session_close_at=close,
+                    complete_through=close,
+                    input_identity=raw_input_id,
+                    produced_at=produced,
+                    producer_commit=self.spec.producer_commit,
+                    producer_version=producer_version,
+                    producer_service_id=producer_service_id,
+                    producer_instance_id=producer_instance_id,
+                    runner_generation_id=self.source_generation_id,
+                    signal_authority_generation_id=route.signal_authority_generation_id,
+                    calendar_generation_id=calendar_generation_id,
+                    last_sequence=last_feature_sequence,
+                    high_watermark=signal_high_watermark,
+                    route_receipts_id=route.route_receipts_sha256,
+                    feature_source_generation_id=marker.source_generation_id,
+                    feature_close_marker_id=marker.marker_id,
+                    feature_segment_chain_hash=marker.segment_chain_hash,
+                    segment_start_sequence=segment.start_after_sequence,
+                    segment_record_count=segment.record_count,
+                    segment_chain_hash=segment.chain_hash,
+                )
+                claims = CompletionAttestationClaims(
+                    completion_receipt_body_sha256=shadow_completion_receipt_body_sha256(
+                        unsigned_receipt
+                    ),
+                    trade_date=trade_date,
+                    session_close_at=close,
+                    source_id=source_id,
+                    input_identity=raw_input_id,
+                    strategy_id=self.spec.strategy_id,
+                    strategy_version=self.spec.version,
+                    strategy_registration_fingerprint=strategy_registration_fingerprint,
+                    strategy_spec_fingerprint=self.spec.spec_fingerprint,
+                    executable_fingerprint=executable_fingerprint,
+                    candidate_schema_fingerprint=candidate_schema_fingerprint,
+                    feature_registration_fingerprint=feature_registration_fingerprint,
+                    feature_contract_fingerprint=feature_contract_fingerprint,
+                    routing_policy_fingerprint=route.routing_policy_fingerprint,
+                    producer_manifest_fingerprint=producer_manifest_fingerprint,
+                    producer_commit=self.spec.producer_commit,
+                    producer_version=producer_version,
+                    producer_service_id=producer_service_id,
+                    producer_instance_id=producer_instance_id,
+                    calendar_generation_id=calendar_generation_id,
+                    feature_source_generation_id=marker.source_generation_id,
+                    feature_close_marker_id=str(marker.marker_id),
+                    feature_segment_chain_hash=marker.segment_chain_hash,
+                    runner_generation_id=self.source_generation_id,
+                    runner_segment_start_sequence=segment.start_after_sequence,
+                    runner_segment_final_sequence=segment.final_sequence,
+                    runner_segment_record_count=segment.record_count,
+                    runner_segment_chain_hash=segment.chain_hash,
+                    signal_authority_generation_id=route.signal_authority_generation_id,
+                    route_receipts_id=route.route_receipts_sha256,
+                )
+                attestation = attestation_signer.issue(claims)
+                receipt = ShadowSourceCompletionReceipt.model_validate(
+                    {
+                        **unsigned_receipt.model_dump(
+                            mode="python",
+                            exclude={"receipt_id"},
+                        ),
+                        "completion_attestation": attestation,
+                    }
+                )
+                connection.execute(
+                    """
+                    INSERT INTO runner_session_close_receipt(
+                        trade_date, receipt_id, source_id,
+                        signal_high_watermark, payload_json
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        trade_date.isoformat(),
+                        receipt.receipt_id,
+                        source_id,
+                        signal_high_watermark,
+                        _json_payload(receipt),
+                    ),
+                )
+                if fault_hook is not None:
+                    fault_hook("after_session_close_receipt_insert")
+                connection.commit()
+                if fault_hook is not None:
+                    fault_hook("after_session_close_receipt_commit")
+                return receipt
+            except BaseException:
+                if connection.in_transaction:
+                    connection.rollback()
+                raise
 
     def last_batch_sequence(self) -> int:
         with self._connect() as connection:
@@ -1591,17 +3145,31 @@ class StrategyRunnerStore:
             last_feature_sequence=row["last_feature_sequence"],
             last_feature_batch_id=row["last_feature_batch_id"],
             updated_at=datetime.fromisoformat(row["updated_at"]),
+            eligible_high_price_raw=row["eligible_high_price_raw"],
+            eligible_high_source_event_time=(
+                None
+                if row["eligible_high_source_event_time"] is None
+                else datetime.fromisoformat(row["eligible_high_source_event_time"])
+            ),
+            eligible_high_available_at=(
+                None
+                if row["eligible_high_available_at"] is None
+                else datetime.fromisoformat(row["eligible_high_available_at"])
+            ),
         )
 
 
 __all__ = [
     "RunnerSignalRecord",
+    "RunnerSignalRouteDrainEvidence",
     "StrategyBatchConflictError",
     "StrategyBatchResult",
     "StrategyCandidateState",
     "StrategyDecision",
     "StrategyEvaluator",
+    "StrategyLifecycleFeatureSource",
     "StrategyRunnerStore",
     "StrategySourceBatchReceipt",
     "canonical_feature_payload",
+    "runner_signal_raw_input_id",
 ]

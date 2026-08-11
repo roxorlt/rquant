@@ -34,12 +34,15 @@ from rquant.strategy_candidate_snapshot import (
     StrategyCandidateSnapshot,
     StrategyCandidateSnapshotIntegrityError,
     StrategyCandidateSnapshotSpool,
+    StrategyCandidateStaticFeatureSemantic,
     candidate_occurrence_id,
     canonicalize_candidate_static_features,
     serialize_candidate_static_features,
     strategy_candidate_decision_trade_date,
+    strategy_candidate_schema_fingerprint,
     strategy_candidate_snapshot_content_sha256,
     thaw_candidate_static_features,
+    validate_candidate_static_features_against_schema,
 )
 
 CommitSha = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{40}$")]
@@ -58,6 +61,11 @@ class CandidateUniverseAuthority(RuntimeContractModel):
     snapshot_root: Path
     required: bool
     max_age_seconds: StrictInt = Field(gt=0)
+    definition_fingerprint: Sha256
+    executable_fingerprint: Sha256
+    candidate_schema_fingerprint: Sha256
+    static_feature_names: tuple[str, ...] = Field(min_length=1)
+    static_feature_schema: Mapping[str, StrategyCandidateStaticFeatureSemantic]
 
     @field_validator("snapshot_root")
     @classmethod
@@ -68,6 +76,35 @@ class CandidateUniverseAuthority(RuntimeContractModel):
         if value != normalized:
             raise ValueError("candidate snapshot root must be normalized without traversal")
         return value
+
+    @model_validator(mode="after")
+    def validate_static_semantic_binding(self) -> CandidateUniverseAuthority:
+        if self.static_feature_names != tuple(sorted(set(self.static_feature_names))):
+            raise ValueError("static feature names must be sorted and unique")
+        if self.static_feature_names != tuple(self.static_feature_schema):
+            raise ValueError("static feature names must exactly match the declared schema")
+        if self.candidate_schema_fingerprint != strategy_candidate_schema_fingerprint(
+            strategy_id=self.strategy_id,
+            strategy_version=self.strategy_version,
+            static_feature_schema=self.static_feature_schema,
+        ):
+            raise ValueError("candidate schema fingerprint does not match static schema")
+        return self
+
+    @field_validator("static_feature_schema")
+    @classmethod
+    def freeze_static_feature_schema(
+        cls,
+        value: Mapping[str, StrategyCandidateStaticFeatureSemantic],
+    ) -> Mapping[str, StrategyCandidateStaticFeatureSemantic]:
+        return MappingProxyType(dict(sorted(value.items())))
+
+    @field_serializer("static_feature_schema")
+    def serialize_static_feature_schema(
+        self,
+        value: Mapping[str, StrategyCandidateStaticFeatureSemantic],
+    ) -> dict[str, dict[str, str]]:
+        return {name: semantic.model_dump(mode="json") for name, semantic in value.items()}
 
     @property
     def identity(self) -> tuple[str, str]:
@@ -95,7 +132,12 @@ class CandidateUniverseAuthorityEvidence(RuntimeContractModel):
     strategy_version: str = Field(min_length=1)
     schema_version: Literal[1, 2, 3]
     generation_sha256: Sha256
-    authority_binding_sha256: Sha256 | None = None
+    authority_binding_sha256: Sha256
+    definition_fingerprint: Sha256
+    executable_fingerprint: Sha256
+    candidate_schema_fingerprint: Sha256
+    static_feature_names: tuple[str, ...] = Field(min_length=1)
+    static_feature_schema: Mapping[str, StrategyCandidateStaticFeatureSemantic]
     source_snapshot_ids: Mapping[str, Sha256] = Field(default_factory=dict)
     sequence: int = Field(ge=0)
     row_count: int = Field(ge=0)
@@ -112,6 +154,14 @@ class CandidateUniverseAuthorityEvidence(RuntimeContractModel):
             raise ValueError("source_snapshot_ids keys must be non-empty strings")
         return MappingProxyType(dict(sorted(value.items())))
 
+    @field_validator("static_feature_schema")
+    @classmethod
+    def freeze_static_feature_schema(
+        cls,
+        value: Mapping[str, StrategyCandidateStaticFeatureSemantic],
+    ) -> Mapping[str, StrategyCandidateStaticFeatureSemantic]:
+        return MappingProxyType(dict(sorted(value.items())))
+
     @field_serializer("source_snapshot_ids")
     def serialize_source_snapshot_ids(
         self,
@@ -119,17 +169,31 @@ class CandidateUniverseAuthorityEvidence(RuntimeContractModel):
     ) -> dict[str, str]:
         return dict(value)
 
+    @field_serializer("static_feature_schema")
+    def serialize_static_feature_schema(
+        self,
+        value: Mapping[str, StrategyCandidateStaticFeatureSemantic],
+    ) -> dict[str, dict[str, str]]:
+        return {name: semantic.model_dump(mode="json") for name, semantic in value.items()}
+
     @model_validator(mode="after")
     def validate_codes(self) -> CandidateUniverseAuthorityEvidence:
         if self.codes != tuple(sorted(set(self.codes))):
             raise ValueError("authority evidence codes must be sorted and unique")
         if self.row_count != len(self.codes):
             raise ValueError("authority row_count must equal its unique candidate codes")
-        if self.schema_version == 3:
-            if self.authority_binding_sha256 is None or not self.source_snapshot_ids:
-                raise ValueError("schema v3 authority evidence is incomplete")
-        elif self.authority_binding_sha256 is not None or self.source_snapshot_ids:
-            raise ValueError("legacy authority evidence cannot contain schema v3 fields")
+        if self.schema_version != 3:
+            raise ValueError("legacy candidate authority requires explicit schema v3 republish")
+        if not self.source_snapshot_ids:
+            raise ValueError("schema v3 authority evidence is incomplete")
+        if self.static_feature_names != tuple(self.static_feature_schema):
+            raise ValueError("authority evidence static names must exactly match its schema")
+        if self.candidate_schema_fingerprint != strategy_candidate_schema_fingerprint(
+            strategy_id=self.strategy_id,
+            strategy_version=self.strategy_version,
+            static_feature_schema=self.static_feature_schema,
+        ):
+            raise ValueError("authority evidence candidate schema fingerprint does not match")
         return self
 
 
@@ -190,6 +254,8 @@ class CandidateUniverseHitEvidence(RuntimeContractModel):
 
     @model_validator(mode="after")
     def validate_pit_order(self) -> CandidateUniverseHitEvidence:
+        if self.schema_version != 3:
+            raise ValueError("legacy candidate hit requires explicit schema v3 republish")
         if self.available_at < self.decision_at:
             raise ValueError("candidate hit available_at cannot precede decision_at")
         decision_trade_date = strategy_candidate_decision_trade_date(
@@ -330,6 +396,11 @@ class RuntimeCandidateUniverseResult(RuntimeContractModel):
                 raise ValueError("authority row_count does not match candidate hits")
             if tuple(sorted(hit.candidate_id for hit in hits)) != authority.codes:
                 raise ValueError("authority codes do not match candidate hits")
+            for hit in hits:
+                validate_candidate_static_features_against_schema(
+                    static_features=hit.static_features,
+                    static_feature_schema=authority.static_feature_schema,
+                )
             rows = tuple(
                 StrategyCandidateRecord(
                     strategy_id=hit.strategy_id,
@@ -352,6 +423,10 @@ class RuntimeCandidateUniverseResult(RuntimeContractModel):
                 authority_binding = StrategyCandidateAuthorityBinding.create(
                     strategy_id=authority.strategy_id,
                     strategy_version=authority.strategy_version,
+                    definition_fingerprint=authority.definition_fingerprint,
+                    executable_fingerprint=authority.executable_fingerprint,
+                    candidate_schema_fingerprint=authority.candidate_schema_fingerprint,
+                    static_feature_schema=authority.static_feature_schema,
                 )
                 if authority_binding.content_sha256 != authority.authority_binding_sha256:
                     raise ValueError("candidate authority binding hash does not match identity")
@@ -460,11 +535,14 @@ class RuntimeCandidateUniverseLoader:
                     strategy_version=authority.strategy_version,
                     schema_version=snapshot.schema_version,
                     generation_sha256=snapshot.content_sha256,
-                    authority_binding_sha256=(
-                        None
-                        if snapshot.authority_binding is None
-                        else snapshot.authority_binding.content_sha256
+                    authority_binding_sha256=snapshot.authority_binding.content_sha256,
+                    definition_fingerprint=snapshot.authority_binding.definition_fingerprint,
+                    executable_fingerprint=snapshot.authority_binding.executable_fingerprint,
+                    candidate_schema_fingerprint=(
+                        snapshot.authority_binding.candidate_schema_fingerprint
                     ),
+                    static_feature_names=snapshot.authority_binding.static_feature_names,
+                    static_feature_schema=snapshot.authority_binding.static_feature_schema,
                     source_snapshot_ids=snapshot.source_snapshot_ids,
                     sequence=snapshot.sequence,
                     row_count=len(snapshot.rows),
@@ -519,6 +597,10 @@ class RuntimeCandidateUniverseLoader:
                 as_of,
                 strategy_id=authority.strategy_id,
                 strategy_version=authority.strategy_version,
+                definition_fingerprint=authority.definition_fingerprint,
+                executable_fingerprint=authority.executable_fingerprint,
+                candidate_schema_fingerprint=authority.candidate_schema_fingerprint,
+                static_feature_schema=authority.static_feature_schema,
             )
         except (StrategyCandidateSnapshotIntegrityError, OSError, ValueError) as exc:
             raise self._error(authority, f"snapshot authority is damaged: {exc}") from exc
@@ -561,6 +643,19 @@ class RuntimeCandidateUniverseLoader:
             raise self._error(authority, "snapshot is not yet visible")
         if age_seconds > authority.max_age_seconds:
             raise self._error(authority, "snapshot is stale")
+        binding = snapshot.authority_binding
+        if snapshot.schema_version != 3 or binding is None or binding.schema_version != 3:
+            raise self._error(authority, "legacy candidate authority requires schema v3 republish")
+        if binding.definition_fingerprint != authority.definition_fingerprint:
+            raise self._error(authority, "candidate definition fingerprint does not match")
+        if binding.executable_fingerprint != authority.executable_fingerprint:
+            raise self._error(authority, "candidate executable fingerprint does not match")
+        if binding.candidate_schema_fingerprint != authority.candidate_schema_fingerprint:
+            raise self._error(authority, "candidate schema fingerprint does not match")
+        if binding.static_feature_names != authority.static_feature_names:
+            raise self._error(authority, "candidate static feature names do not match")
+        if binding.static_feature_schema != authority.static_feature_schema:
+            raise self._error(authority, "candidate static feature schema does not match")
         for row in snapshot.rows:
             if (row.strategy_id, row.strategy_version) != authority.identity:
                 raise self._error(authority, "candidate row authority identity mismatch")
@@ -573,6 +668,18 @@ class RuntimeCandidateUniverseLoader:
                 )
             if not _TS_CODE_PATTERN.fullmatch(row.candidate_id):
                 raise self._error(authority, f"invalid A-share candidate code: {row.candidate_id}")
+            if tuple(sorted(row.static_features)) != authority.static_feature_names:
+                raise self._error(authority, "candidate static feature schema does not match")
+            try:
+                validate_candidate_static_features_against_schema(
+                    static_features=row.static_features,
+                    static_feature_schema=authority.static_feature_schema,
+                )
+            except ValueError as exc:
+                raise self._error(
+                    authority,
+                    f"candidate static feature dtype does not match: {exc}",
+                ) from exc
 
     @staticmethod
     def _error(

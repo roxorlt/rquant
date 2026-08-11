@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import io
 import json
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from datetime import date, timedelta
 from decimal import Decimal
 from functools import lru_cache
@@ -21,17 +23,28 @@ from rquant.canonical_json_stream import (
     PandasJsonColumnAccessor,
     write_pandas_json_value,
 )
-from rquant.lab_shard_protocol import LabShardClaim, LabShardDefinition, LabShardWorkPlan
+from rquant.lab_shard_protocol import (
+    LabShardClaim,
+    LabShardClaimV2,
+    LabShardDefinition,
+    LabShardWorkPlan,
+    StrategyShardPayloadV2,
+)
 from rquant.research_run_spec import (
     FeatureContractIdentity,
     ResearchJobType,
     ResearchRunSpec,
+)
+from rquant.resource_admission import (
+    ResearchAdapterSourceUsage,
+    require_research_adapter_source_usage,
 )
 from rquant.strategy_execution_costs import apply_round_trip_execution_costs
 from rquant.strategy_replay_metrics import (
     auction_gap_metric_rows,
     growth_board_metric_rows,
 )
+from rquant.strict_json import canonical_json_bytes
 
 DATE_BUCKET_DAYS = 20
 ADAPTER_VERSION = "1"
@@ -41,6 +54,13 @@ N_SHAPE_COMPARE_MS_PER_CASE = 30_000
 N_SHAPE_OPTIMIZE_MS_PER_CASE = 120_000
 AUCTION_GAP_MS_PER_DAY = 30_000
 GROWTH_BOARD_SURGE_MS_PER_DAY = 45_000
+MAX_RESULT_WIRE_BYTES = 80 * 1024 * 1024
+MAX_RESULT_JSON_OVERHEAD_BYTES = 1024 * 1024
+MAX_TABLES = 8
+MAX_PARQUET_BYTES_PER_TABLE = 32 * 1024 * 1024
+_MAX_RESULT_BASE64_BYTES = MAX_RESULT_WIRE_BYTES - MAX_RESULT_JSON_OVERHEAD_BYTES
+MAX_AGGREGATE_PARQUET_BYTES = 3 * (_MAX_RESULT_BASE64_BYTES // 4 - MAX_TABLES)
+_MAX_RESULT_ENVELOPE_BYTES = 1024
 _LEGACY_STRATEGY_ALIASES: dict[
     tuple[str, ResearchJobType],
     tuple[str, ResearchJobType, str, frozenset[str]],
@@ -273,7 +293,7 @@ class StrategyShardPayload(StrategyAdapterModel):
 
 
 class ValidatedStrategyShard(StrategyAdapterModel):
-    claim: LabShardClaim
+    claim: LabShardClaim | LabShardClaimV2
     spec: ResearchRunSpec
     shard: StrategyShardInput
 
@@ -341,6 +361,153 @@ class LabShardExecutionResult(BaseModel):
             tables=tables,
             metrics=metrics,
         )
+
+
+def shard_wire_base64_size(byte_size: int) -> int:
+    if type(byte_size) is not int or byte_size < 0:
+        raise ValueError("shard wire byte size must be a non-negative integer")
+    return 4 * ((byte_size + 2) // 3)
+
+
+def validate_shard_wire_capacity(table_sizes: Sequence[int]) -> None:
+    table_count = len(table_sizes)
+    if table_count < 1 or table_count > MAX_TABLES:
+        raise ValueError(f"shard wire result must contain at most {MAX_TABLES} tables")
+    aggregate = 0
+    for byte_size in table_sizes:
+        if type(byte_size) is not int or not 1 <= byte_size <= MAX_PARQUET_BYTES_PER_TABLE:
+            raise ValueError("shard wire result exceeds the per-table Parquet byte limit")
+        aggregate += byte_size
+    if aggregate > MAX_AGGREGATE_PARQUET_BYTES:
+        raise ValueError("shard wire result exceeds the aggregate Parquet byte limit")
+
+
+class _BoundedParquetBuffer(io.BytesIO):
+    def write(self, value: bytes, /) -> int:
+        if self.tell() + len(value) > MAX_PARQUET_BYTES_PER_TABLE:
+            raise ValueError("shard wire result exceeds the per-table Parquet byte limit")
+        return super().write(value)
+
+
+class LabShardWireTable(StrategyAdapterModel):
+    name: str = Field(max_length=128, pattern=r"^[a-z][a-z0-9_]*$")
+    parquet_base64: str = Field(
+        max_length=shard_wire_base64_size(MAX_PARQUET_BYTES_PER_TABLE),
+        pattern=r"^[A-Za-z0-9+/]*={0,2}$",
+    )
+    byte_size: int = Field(ge=1, le=MAX_PARQUET_BYTES_PER_TABLE)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_base64_size(self) -> LabShardWireTable:
+        if len(self.parquet_base64) != shard_wire_base64_size(self.byte_size):
+            raise ValueError("shard wire table base64 length does not match byte size")
+        return self
+
+
+class LabShardExecutionWireResult(StrategyAdapterModel):
+    schema_version: Literal[1] = 1
+    shard_id: UUID
+    spec_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    payload_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    plan_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    adapter_id: str = Field(min_length=1, max_length=128)
+    adapter_version: str = Field(min_length=1, max_length=128)
+    tables: tuple[LabShardWireTable, ...] = Field(min_length=1, max_length=MAX_TABLES)
+    metrics: tuple[LabShardMetric, ...] = Field(default=(), max_length=256)
+
+    @model_validator(mode="after")
+    def validate_wire_capacity(self) -> LabShardExecutionWireResult:
+        validate_shard_wire_capacity(tuple(table.byte_size for table in self.tables))
+        names = tuple(table.name for table in self.tables)
+        if len(names) != len(set(names)):
+            raise ValueError("shard wire result table names must be unique")
+        metadata = self.model_dump(mode="json", round_trip=True)
+        metadata_tables = metadata["tables"]
+        assert isinstance(metadata_tables, list)
+        for table in metadata_tables:
+            assert isinstance(table, dict)
+            table["parquet_base64"] = ""
+        metadata_size = len(canonical_json_bytes(metadata))
+        if metadata_size + _MAX_RESULT_ENVELOPE_BYTES > MAX_RESULT_JSON_OVERHEAD_BYTES:
+            raise ValueError("shard wire result JSON metadata exceeds the size limit")
+        encoded_table_size = sum(len(table.parquet_base64) for table in self.tables)
+        if encoded_table_size + metadata_size + _MAX_RESULT_ENVELOPE_BYTES > MAX_RESULT_WIRE_BYTES:
+            raise ValueError("shard wire result exceeds the total wire size limit")
+        return self
+
+    @classmethod
+    def from_result(cls, value: LabShardExecutionResult) -> LabShardExecutionWireResult:
+        result = LabShardExecutionResult.model_validate(value)
+        validate_shard_wire_capacity((1,) * len(result.tables))
+        tables: list[LabShardWireTable] = []
+        for table in result.tables:
+            buffer = _BoundedParquetBuffer()
+            table.frame.to_parquet(buffer, index=False)
+            payload = buffer.getvalue()
+            validate_shard_wire_capacity(
+                tuple(existing.byte_size for existing in tables) + (len(payload),)
+            )
+            tables.append(
+                LabShardWireTable(
+                    name=table.name,
+                    parquet_base64=base64.b64encode(payload).decode("ascii"),
+                    byte_size=len(payload),
+                    sha256=hashlib.sha256(payload).hexdigest(),
+                )
+            )
+        return cls(
+            shard_id=result.shard_id,
+            spec_hash=result.spec_hash,
+            payload_hash=result.payload_hash,
+            plan_hash=result.plan_hash,
+            adapter_id=result.adapter_id,
+            adapter_version=result.adapter_version,
+            tables=tuple(tables),
+            metrics=result.metrics,
+        )
+
+    def to_result(self) -> LabShardExecutionResult:
+        validated = LabShardExecutionWireResult.model_validate(self)
+        tables: list[LabShardTable] = []
+        for table in validated.tables:
+            try:
+                payload = base64.b64decode(table.parquet_base64, validate=True)
+            except ValueError as exc:
+                raise ValueError("shard wire table is not canonical base64") from exc
+            if len(payload) != table.byte_size:
+                raise ValueError("shard wire table byte size mismatch")
+            if hashlib.sha256(payload).hexdigest() != table.sha256:
+                raise ValueError("shard wire table hash mismatch")
+            tables.append(
+                LabShardTable(
+                    name=table.name,
+                    frame=pd.read_parquet(io.BytesIO(payload)),
+                )
+            )
+        return LabShardExecutionResult(
+            shard_id=validated.shard_id,
+            spec_hash=validated.spec_hash,
+            payload_hash=validated.payload_hash,
+            plan_hash=validated.plan_hash,
+            adapter_id=validated.adapter_id,
+            adapter_version=validated.adapter_version,
+            tables=tuple(tables),
+            metrics=validated.metrics,
+        )
+
+
+class StrategyAdapterRegistryIdentity(StrategyAdapterModel):
+    adapter_id: str
+    adapter_version: str
+
+
+class StrategyAdapterRegistryDescriptor(StrategyAdapterModel):
+    schema_version: Literal[1] = 1
+    registry_id: Literal["rquant.strategy-adapters.builtin"] = "rquant.strategy-adapters.builtin"
+    registry_version: Literal[1] = 1
+    adapters: tuple[StrategyAdapterRegistryIdentity, ...]
+    manifest_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 class LabJobExecutionResult(BaseModel):
@@ -428,6 +595,8 @@ class StrategyJobAdapter(Protocol):
     snapshot_strategy_name: str
     job_type: ResearchJobType
 
+    def source_usage(self) -> ResearchAdapterSourceUsage: ...
+
     def build_shard_inputs(self, spec: ResearchRunSpec) -> tuple[StrategyShardInput, ...]: ...
 
     def build_work_plan(
@@ -441,6 +610,16 @@ class StrategyJobAdapter(Protocol):
         validated: ValidatedStrategyShard,
         store: object,
     ) -> LabShardExecutionResult: ...
+
+
+def _local_snapshot_source_usage(adapter_id: str) -> ResearchAdapterSourceUsage:
+    return ResearchAdapterSourceUsage(
+        adapter_id=adapter_id,
+        external=False,
+        immutable_snapshot=True,
+        expected_calls=0,
+        actual_calls=0,
+    )
 
 
 def _parameter_values(spec: ResearchRunSpec) -> dict[str, object]:
@@ -473,6 +652,9 @@ class NShapeCompareAdapter:
     strategy_name = "n_shape"
     snapshot_strategy_name = "n_shape"
     job_type = ResearchJobType.STRATEGY_REPLAY
+
+    def source_usage(self) -> ResearchAdapterSourceUsage:
+        return _local_snapshot_source_usage(self.adapter_id)
 
     def parameters(self, spec: ResearchRunSpec) -> NShapeCompareParameters:
         return NShapeCompareParameters.model_validate(
@@ -537,6 +719,9 @@ class NShapeOptimizeAdapter:
     strategy_name = "n_shape"
     snapshot_strategy_name = "n_shape"
     job_type = ResearchJobType.PARAMETER_SEARCH
+
+    def source_usage(self) -> ResearchAdapterSourceUsage:
+        return _local_snapshot_source_usage(self.adapter_id)
 
     def parameters(self, spec: ResearchRunSpec) -> NShapeOptimizeParameters:
         return NShapeOptimizeParameters.model_validate(
@@ -618,6 +803,9 @@ class AuctionGapAdapter:
     snapshot_strategy_name = "auction_gap"
     job_type = ResearchJobType.STRATEGY_REPLAY
 
+    def source_usage(self) -> ResearchAdapterSourceUsage:
+        return _local_snapshot_source_usage(self.adapter_id)
+
     def parameters(self, spec: ResearchRunSpec) -> AuctionGapParameters:
         return AuctionGapParameters.model_validate(_parse_parameters(spec, AuctionGapParameters))
 
@@ -697,6 +885,9 @@ class GrowthBoardSurgeAdapter:
     strategy_name = "growth_board_surge"
     snapshot_strategy_name = "growth_board_surge"
     job_type = ResearchJobType.STRATEGY_REPLAY
+
+    def source_usage(self) -> ResearchAdapterSourceUsage:
+        return _local_snapshot_source_usage(self.adapter_id)
 
     def parameters(self, spec: ResearchRunSpec) -> GrowthBoardSurgeParameters:
         return GrowthBoardSurgeParameters.model_validate(
@@ -792,7 +983,48 @@ class StrategyJobAdapterRegistry:
             raise ValueError("adapter registry identities must be unique")
         if len(strategies) != len(set(strategies)):
             raise ValueError("adapter registry strategy names must be unique")
+        for adapter in ordered:
+            source_usage = getattr(adapter, "source_usage", None)
+            if not callable(source_usage):
+                raise ValueError("research adapter source usage is required")
+            try:
+                usage = source_usage()
+            except Exception as exc:
+                raise ValueError("research adapter source usage is invalid") from exc
+            if not isinstance(usage, ResearchAdapterSourceUsage):
+                raise ValueError("research adapter source usage is invalid")
+            require_research_adapter_source_usage(
+                adapter_id=adapter.adapter_id,
+                usage=usage,
+            )
         self._adapters = ordered
+
+    def closed_descriptor(self) -> StrategyAdapterRegistryDescriptor:
+        adapters = tuple(
+            StrategyAdapterRegistryIdentity(
+                adapter_id=adapter.adapter_id,
+                adapter_version=adapter.adapter_version,
+            )
+            for adapter in self._adapters
+        )
+        payload = {
+            "adapters": [item.model_dump(mode="json") for item in adapters],
+            "registry_id": "rquant.strategy-adapters.builtin",
+            "registry_version": 1,
+            "schema_version": 1,
+        }
+        return StrategyAdapterRegistryDescriptor(
+            adapters=adapters,
+            manifest_hash=hashlib.sha256(
+                json.dumps(
+                    payload,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode("ascii")
+            ).hexdigest(),
+        )
 
     def for_spec(self, spec: ResearchRunSpec) -> StrategyJobAdapter:
         validated = ResearchRunSpec.model_validate(spec)
@@ -921,7 +1153,9 @@ class StrategyJobAdapterRegistry:
             for index, shard in enumerate(shard_inputs)
         )
 
-    def validate_claim(self, claim: LabShardClaim) -> ValidatedStrategyShard:
+    def validate_claim(self, claim: LabShardClaim | LabShardClaimV2) -> ValidatedStrategyShard:
+        if isinstance(claim, LabShardClaimV2):
+            return self._validate_source_claim_v2(claim)
         validated_claim = LabShardClaim.model_validate(claim)
         payload = StrategyShardPayload.model_validate_json(validated_claim.definition.payload_json)
         if payload.spec.spec_hash != validated_claim.spec_hash:
@@ -946,6 +1180,43 @@ class StrategyJobAdapterRegistry:
             raise ValueError("claim shard_index is outside the regenerated plan")
         if definitions[validated_claim.shard_index] != validated_claim.definition:
             raise ValueError("claim definition does not match regenerated plan identity")
+        return ValidatedStrategyShard(
+            claim=validated_claim,
+            spec=payload.spec,
+            shard=payload.shard,
+        )
+
+    def _validate_source_claim_v2(self, claim: LabShardClaimV2) -> ValidatedStrategyShard:
+        """Validate the signed V2 execution payload without changing V2 identity."""
+
+        validated_claim = LabShardClaimV2.model_validate(claim, strict=True)
+        source_payload = StrategyShardPayloadV2.model_validate_json(
+            validated_claim.definition.payload_json
+        )
+        payload = StrategyShardPayload.model_validate_json(source_payload.payload_json)
+        if (
+            payload.adapter_id,
+            payload.adapter_version,
+        ) != (
+            validated_claim.definition.adapter_id,
+            validated_claim.definition.adapter_version,
+        ):
+            raise ValueError("source execution payload adapter identity does not match claim")
+        adapter = self.get(payload.adapter_id, payload.adapter_version)
+        if self.for_spec(payload.spec) is not adapter:
+            raise ValueError("source execution payload adapter does not match ResearchRunSpec")
+        definitions = (
+            self._plan_p13_legacy(payload.spec)
+            if validated_claim.definition.work_plan is None
+            else self.plan(payload.spec)
+        )
+        if validated_claim.shard_index >= len(definitions):
+            raise ValueError("source claim shard_index is outside the regenerated plan")
+        expected_payload = StrategyShardPayload.model_validate_json(
+            definitions[validated_claim.shard_index].payload_json
+        )
+        if expected_payload != payload:
+            raise ValueError("source execution payload does not match regenerated shard")
         return ValidatedStrategyShard(
             claim=validated_claim,
             spec=payload.spec,

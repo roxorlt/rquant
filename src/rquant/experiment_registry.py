@@ -4,15 +4,26 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, date, datetime, time
 from decimal import Decimal
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Self
+from types import TracebackType
+from typing import Annotated, Literal, Self
+from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from pydantic import Field, model_validator
 
+from rquant.artifact_retention import (
+    PrivateSqlitePathAuthority,
+    close_verified_sqlite_connection,
+    execute_sqlite_setup_statement,
+    raise_preserving_cleanup_errors,
+    verified_sqlite_connection_scope,
+)
 from rquant.runtime_contracts import (
     AwareUtcDatetime,
     RuntimeContractModel,
@@ -30,6 +41,7 @@ SHANGHAI = ZoneInfo("Asia/Shanghai")
 class ExperimentStatus(StrEnum):
     REGISTERED = "registered"
     RUNNING = "running"
+    EXECUTED = "executed"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -142,6 +154,8 @@ class ForwardArtifactEvidence(RuntimeContractModel):
 class ExperimentSpec(RuntimeContractModel):
     experiment_id: Sha256 | None = None
     strategy_spec_fingerprint: Sha256
+    strategy_executable_fingerprint: Sha256
+    candidate_schema_fingerprint: Sha256
     dataset_snapshot_id: Sha256
     code_commit: CommitSha
     parameter_fingerprint: Sha256
@@ -167,6 +181,35 @@ class ExperimentSpec(RuntimeContractModel):
             object.__setattr__(self, "experiment_id", expected)
         elif self.experiment_id != expected:
             raise ValueError("experiment_id does not match canonical experiment identity")
+        return self
+
+
+class FormalExperimentPlan(RuntimeContractModel):
+    """Immutable, preregistered experiment identity eligible for formal submission."""
+
+    schema_version: Literal[1, 2] = 1
+    plan_id: Sha256 | None = None
+    spec: ExperimentSpec
+    hypothesis_variant: str = Field(min_length=1)
+    strategy_definition_fingerprint: Sha256 | None = None
+    definition_registration_record_hash: Sha256 | None = None
+    preregistered_at: AwareUtcDatetime
+
+    @model_validator(mode="after")
+    def validate_identity(self) -> Self:
+        definition_receipt = (
+            self.strategy_definition_fingerprint,
+            self.definition_registration_record_hash,
+        )
+        if self.schema_version == 2 and any(value is None for value in definition_receipt):
+            raise ValueError("current formal plan requires complete Definition Registry receipts")
+        if self.schema_version == 1 and any(value is not None for value in definition_receipt):
+            raise ValueError("legacy formal plan cannot carry current definition receipts")
+        expected = canonical_sha256(self.model_dump(mode="python", exclude={"plan_id"}))
+        if self.plan_id is None:
+            object.__setattr__(self, "plan_id", expected)
+        elif self.plan_id != expected:
+            raise ValueError("plan_id does not match canonical formal experiment plan")
         return self
 
 
@@ -238,6 +281,11 @@ class ExperimentAttempt(RuntimeContractModel):
                 value is not None for value in (self.completed_at, self.first_error, self.outcome)
             ):
                 raise ValueError("running attempt requires only started_at")
+        elif self.status is ExperimentStatus.EXECUTED:
+            if self.started_at is None or self.completed_at is None:
+                raise ValueError("executed attempt requires timing evidence")
+            if self.first_error is not None or self.outcome is not None:
+                raise ValueError("executed attempt cannot contain statistical evidence")
         elif self.status is ExperimentStatus.SUCCEEDED:
             if self.started_at is None or self.completed_at is None or self.outcome is None:
                 raise ValueError("succeeded attempt requires timing and outcome evidence")
@@ -246,6 +294,52 @@ class ExperimentAttempt(RuntimeContractModel):
         else:
             if self.completed_at is None or not self.first_error or self.outcome is not None:
                 raise ValueError("failed or cancelled attempt requires first_error and completion")
+        return self
+
+
+class ExperimentSubmissionIntent(RuntimeContractModel):
+    """Durable outbox payload atomically owned by an experiment attempt."""
+
+    schema_version: Literal[1, 2] = 1
+    request_id: UUID
+    job_id: UUID
+    experiment_id: Sha256
+    attempt_identity: Sha256
+    hypothesis_variant: str = Field(min_length=1)
+    formal_plan_id: Sha256 | None = None
+    strategy_definition_fingerprint: Sha256 | None = None
+    definition_registration_record_hash: Sha256 | None = None
+    command_content_hash: Sha256
+    envelope_json: str = Field(min_length=2)
+    envelope_sha256: Sha256
+
+    @model_validator(mode="after")
+    def validate_canonical_envelope(self) -> Self:
+        formal_receipts = (
+            self.formal_plan_id,
+            self.strategy_definition_fingerprint,
+            self.definition_registration_record_hash,
+        )
+        if self.schema_version == 2 and any(value is None for value in formal_receipts):
+            raise ValueError("current experiment submission requires complete formal receipts")
+        if self.schema_version == 1 and any(value is not None for value in formal_receipts):
+            raise ValueError("legacy experiment submission cannot carry current formal receipts")
+        try:
+            parsed = json.loads(self.envelope_json)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("envelope_json must be canonical JSON") from exc
+        canonical = json.dumps(
+            parsed,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        if canonical != self.envelope_json:
+            raise ValueError("envelope_json must use exact canonical JSON")
+        expected = canonical_sha256({"canonical_envelope_json": canonical})
+        if self.envelope_sha256 != expected:
+            raise ValueError("envelope_sha256 does not match canonical envelope JSON")
         return self
 
 
@@ -332,6 +426,444 @@ def _adjusted_outcome(outcome: ExperimentOutcome, value: Decimal | None) -> Expe
     return ExperimentOutcome.model_validate(payload)
 
 
+class PromotionDecisionReadSnapshot(RuntimeContractModel):
+    """One bounded point-in-time view of the append-only promotion ledger."""
+
+    decisions: tuple[PromotionDecision, ...] = ()
+    sequence: int = Field(ge=0)
+    event_time: AwareUtcDatetime | None = None
+
+
+def _validate_readonly_registry_schema(connection: sqlite3.Connection) -> None:
+    row = connection.execute(
+        "SELECT type FROM sqlite_master WHERE name = 'promotion_decision'"
+    ).fetchone()
+    if row is None or row[0] != "table":
+        raise ExperimentRegistryError("promotion_decision table is missing")
+    columns = tuple(
+        item[1] for item in connection.execute("PRAGMA table_info(promotion_decision)").fetchall()
+    )
+    expected = ("decision_id", "stage", "approved", "decided_at", "payload_json")
+    if columns != expected:
+        raise ExperimentRegistryError("promotion_decision schema is incompatible")
+
+
+def _bind_readonly_registry_authority(
+    path: Path,
+    *,
+    managed_trust_root: Path,
+) -> PrivateSqlitePathAuthority:
+    transient_error: ValueError | None = None
+    for _attempt in range(3):
+        try:
+            return PrivateSqlitePathAuthority(
+                path,
+                label="experiment registry",
+                create_if_missing=False,
+                managed_trust_root=managed_trust_root,
+            )
+        except ValueError as exc:
+            if str(exc) != "experiment registry managed trust root identity changed":
+                raise
+            transient_error = exc
+    assert transient_error is not None
+    raise transient_error
+
+
+class ExperimentRegistryReadonlyReader:
+    """Read promotion governance without initializing or mutating its SQLite ledger."""
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        managed_trust_root: Path,
+        busy_timeout_ms: int = 5_000,
+    ) -> None:
+        if busy_timeout_ms < 1:
+            raise ValueError("busy_timeout_ms must be positive")
+        self._path_authority = _bind_readonly_registry_authority(
+            path,
+            managed_trust_root=managed_trust_root,
+        )
+        self.path = self._path_authority.path
+        self.busy_timeout_ms = busy_timeout_ms
+
+    @contextmanager
+    def _read_snapshot(self) -> Iterator[sqlite3.Connection]:
+        try:
+            _ = self._path_authority.database_generation
+            has_wal_sidecars = any(self._path_authority.sqlite_sidecar_state())
+            immutable_generation = (
+                None if has_wal_sidecars else self._path_authority.begin_immutable_read()
+            )
+        except ValueError as exc:
+            if not self.path.exists():
+                message = f"experiment registry does not exist: {self.path}"
+            else:
+                message = "experiment registry path changed, has an active WAL, or is not quiescent"
+            raise ExperimentRegistryError(message) from exc
+        uri = (
+            self._path_authority.readonly_uri()
+            if has_wal_sidecars
+            else self._path_authority.immutable_readonly_uri()
+        )
+        try:
+            connection = self._path_authority.open_verified_connection(
+                lambda _path: sqlite3.connect(
+                    uri,
+                    uri=True,
+                    timeout=self.busy_timeout_ms / 1_000,
+                    isolation_level=None,
+                )
+            )
+        except (sqlite3.Error, ValueError) as exc:
+            raise ExperimentRegistryError(
+                "experiment registry path is unsafe while opening read-only"
+            ) from exc
+        with verified_sqlite_connection_scope(connection, self._path_authority):
+            try:
+                connection.row_factory = sqlite3.Row
+                execute_sqlite_setup_statement(
+                    connection,
+                    f"PRAGMA busy_timeout = {self.busy_timeout_ms}",
+                )
+                execute_sqlite_setup_statement(connection, "PRAGMA query_only = ON")
+                execute_sqlite_setup_statement(connection, "PRAGMA trusted_schema = OFF")
+                self._path_authority.rebind_ctime_after_trusted_sqlite_setup()
+                _validate_readonly_registry_schema(connection)
+                self._path_authority.rebind_ctime_after_trusted_sqlite_setup()
+                connection.execute("BEGIN")
+                self._path_authority.rebind_ctime_after_trusted_sqlite_setup()
+                self._assert_read_generation(immutable_generation)
+                yield connection
+                self._path_authority.rebind_ctime_after_trusted_sqlite_setup()
+                self._assert_read_generation(immutable_generation)
+                connection.execute("COMMIT")
+                self._assert_read_generation(immutable_generation)
+            except ValueError as exc:
+                if connection.in_transaction:
+                    connection.rollback()
+                raise ExperimentRegistryError(
+                    "experiment registry path changed during read"
+                ) from exc
+            except sqlite3.Error as exc:
+                if connection.in_transaction:
+                    connection.rollback()
+                raise ExperimentRegistryError("experiment registry read failed") from exc
+            except BaseException:
+                if connection.in_transaction:
+                    connection.rollback()
+                raise
+
+    def _assert_read_generation(
+        self,
+        immutable_generation: tuple[int, int, int, int, int] | None,
+    ) -> None:
+        if immutable_generation is None:
+            self._path_authority.assert_current()
+        else:
+            self._path_authority.assert_immutable_read_current(immutable_generation)
+
+    def read_promotion_decisions(
+        self,
+        *,
+        observed_at: datetime,
+        limit: int = 1_000,
+    ) -> PromotionDecisionReadSnapshot:
+        observed = normalize_aware_utc(observed_at)
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        cutoff = _utc_iso(observed)
+        with self._read_snapshot() as connection:
+            metadata = connection.execute(
+                """
+                SELECT COALESCE(MAX(rowid), 0) AS sequence,
+                       MAX(decided_at) AS event_time
+                FROM promotion_decision
+                WHERE decided_at <= ?
+                """,
+                (cutoff,),
+            ).fetchone()
+            rows = connection.execute(
+                """
+                SELECT rowid, decision_id, stage, approved, decided_at, payload_json
+                FROM promotion_decision
+                WHERE decided_at <= ?
+                ORDER BY decided_at DESC, decision_id DESC
+                LIMIT ?
+                """,
+                (cutoff, limit),
+            ).fetchall()
+
+        decisions: list[PromotionDecision] = []
+        for row in rows:
+            try:
+                decision = PromotionDecision.model_validate_json(row["payload_json"])
+                stored_time = _parse_utc(row["decided_at"])
+            except (TypeError, ValueError) as exc:
+                raise ExperimentRegistryError("promotion decision evidence is invalid") from exc
+            if (
+                decision.decision_id != row["decision_id"]
+                or decision.stage.value != row["stage"]
+                or int(decision.approved) != row["approved"]
+                or decision.decided_at != stored_time
+            ):
+                raise ExperimentRegistryError(
+                    "promotion decision payload does not match indexed evidence"
+                )
+            if decision.decided_at > observed:
+                raise ExperimentRegistryError("promotion decision contains future evidence")
+            decisions.append(decision)
+
+        decisions.sort(key=lambda item: (item.decided_at, item.decision_id))
+        event_time = _parse_utc(metadata["event_time"])
+        if event_time is not None and event_time > observed:
+            raise ExperimentRegistryError("promotion registry contains future evidence")
+        return PromotionDecisionReadSnapshot(
+            decisions=tuple(decisions),
+            sequence=int(metadata["sequence"]),
+            event_time=event_time,
+        )
+
+    def list_promotion_decisions(
+        self,
+        *,
+        observed_at: datetime,
+        limit: int = 1_000,
+    ) -> tuple[PromotionDecision, ...]:
+        return self.read_promotion_decisions(
+            observed_at=observed_at,
+            limit=limit,
+        ).decisions
+
+    def get_attempt(self, experiment_id: str) -> ExperimentAttempt:
+        """Read one terminal-attempt authority without acquiring a writer."""
+
+        with self._read_snapshot() as connection:
+            row = ExperimentRegistry._required_attempt_row(connection, experiment_id)
+            return ExperimentRegistry._attempt_from_row(connection, row)
+
+    def resolve_formal_plan(
+        self,
+        *,
+        strategy_spec_fingerprint: str,
+        strategy_executable_fingerprint: str,
+        candidate_schema_fingerprint: str,
+        dataset_snapshot_id: str,
+        code_commit: str,
+        parameter_fingerprint: str,
+        cost_model_fingerprint: str,
+        execution_model_fingerprint: str,
+        seed: int,
+        as_of: datetime,
+    ) -> FormalExperimentPlan:
+        """Resolve one exact visible formal plan without opening a writer."""
+
+        visible_at = normalize_aware_utc(as_of)
+        resolution_key = ExperimentRegistry._formal_plan_resolution_key(
+            strategy_spec_fingerprint=strategy_spec_fingerprint,
+            strategy_executable_fingerprint=strategy_executable_fingerprint,
+            candidate_schema_fingerprint=candidate_schema_fingerprint,
+            dataset_snapshot_id=dataset_snapshot_id,
+            code_commit=code_commit,
+            parameter_fingerprint=parameter_fingerprint,
+            cost_model_fingerprint=cost_model_fingerprint,
+            execution_model_fingerprint=execution_model_fingerprint,
+            seed=seed,
+        )
+        with self._read_snapshot() as connection:
+            rows = connection.execute(
+                """
+                SELECT plan_json FROM formal_experiment_plan
+                WHERE resolution_key = ? AND preregistered_at <= ?
+                ORDER BY preregistered_at, plan_id
+                """,
+                (resolution_key, _utc_iso(visible_at)),
+            ).fetchall()
+        if len(rows) != 1:
+            raise IncompleteHypothesisFamilyError(
+                "exactly one visible preregistered formal plan is required"
+            )
+        return FormalExperimentPlan.model_validate_json(rows[0]["plan_json"])
+
+    def resolve_formal_plan_by_id(
+        self,
+        plan_id: str,
+        *,
+        as_of: datetime,
+    ) -> FormalExperimentPlan:
+        """Read one exact visible plan without exposing mutation APIs."""
+
+        visible_at = normalize_aware_utc(as_of)
+        with self._read_snapshot() as connection:
+            rows = connection.execute(
+                """
+                SELECT plan_json FROM formal_experiment_plan
+                WHERE plan_id = ? AND preregistered_at <= ?
+                """,
+                (plan_id, _utc_iso(visible_at)),
+            ).fetchall()
+        if len(rows) != 1:
+            raise IncompleteHypothesisFamilyError(
+                "exactly one visible preregistered formal plan is required"
+            )
+        return FormalExperimentPlan.model_validate_json(rows[0]["plan_json"])
+
+
+class _ExperimentRegistryConnection(sqlite3.Connection):
+    identity_authority: PrivateSqlitePathAuthority | None = None
+    _identity_failed: bool = False
+
+    def _assert_identity_current(self) -> None:
+        authority = self.identity_authority
+        if authority is None:
+            return
+        try:
+            authority.assert_current()
+        except BaseException:
+            self._identity_failed = True
+            raise
+
+    def _rebind_identity_after_sqlite_change(self) -> None:
+        authority = self.identity_authority
+        if authority is None:
+            return
+        last_error: BaseException | None = None
+        for _attempt in range(3):
+            try:
+                authority.rebind_and_assert_current_after_trusted_sqlite_change()
+                return
+            except BaseException as exc:
+                last_error = exc
+        self._identity_failed = True
+        assert last_error is not None
+        raise last_error
+
+    def execute(
+        self,
+        sql: str,
+        parameters: tuple[object, ...] = (),
+        /,
+    ) -> sqlite3.Cursor:
+        self._rebind_identity_after_sqlite_change()
+        result = super().execute(sql, parameters)
+        self._rebind_identity_after_sqlite_change()
+        return result
+
+    def executescript(self, sql_script: str, /) -> sqlite3.Cursor:
+        self._rebind_identity_after_sqlite_change()
+        result = super().executescript(sql_script)
+        self._rebind_identity_after_sqlite_change()
+        return result
+
+    def executemany(
+        self,
+        sql: str,
+        seq_of_parameters: Iterator[tuple[object, ...]],
+        /,
+    ) -> sqlite3.Cursor:
+        self._rebind_identity_after_sqlite_change()
+        result = super().executemany(sql, seq_of_parameters)
+        self._rebind_identity_after_sqlite_change()
+        return result
+
+    def commit(self) -> None:
+        self._rebind_identity_after_sqlite_change()
+        super().commit()
+        self._rebind_identity_after_sqlite_change()
+
+    def rollback(self) -> None:
+        self._rebind_identity_after_sqlite_change()
+        super().rollback()
+        self._rebind_identity_after_sqlite_change()
+
+    def _close_underlying(self) -> None:
+        super().close()
+
+    def close(self, *, primary_error: BaseException | None = None) -> None:
+        authority = self.identity_authority
+        if authority is None:
+            self._close_verified(primary_error=primary_error, authority=None)
+            return
+        with authority.identity_boundary():
+            self._close_verified(primary_error=primary_error, authority=authority)
+
+    def _close_verified(
+        self,
+        *,
+        primary_error: BaseException | None,
+        authority: PrivateSqlitePathAuthority | None,
+    ) -> None:
+        pre_rebind_error: BaseException | None = None
+        identity_error: BaseException | None = None
+        close_error: BaseException | None = None
+        rebind_error: BaseException | None = None
+        postcheck_error: BaseException | None = None
+        if authority is not None:
+            try:
+                authority.rebind_ctime_after_trusted_sqlite_setup()
+            except BaseException as exc:
+                pre_rebind_error = exc
+        try:
+            self._assert_identity_current()
+        except BaseException as exc:
+            identity_error = exc
+        try:
+            self._close_underlying()
+        except BaseException as exc:
+            close_error = exc
+        if authority is not None and pre_rebind_error is None and identity_error is None:
+            try:
+                authority.rebind_ctime_after_trusted_sqlite_setup()
+            except BaseException as exc:
+                rebind_error = exc
+        try:
+            self._assert_identity_current()
+        except BaseException as exc:
+            postcheck_error = exc
+        raise_preserving_cleanup_errors(
+            primary_error=primary_error,
+            cleanup_errors=[
+                *([pre_rebind_error] if pre_rebind_error is not None else []),
+                *([identity_error] if identity_error is not None else []),
+                *([close_error] if close_error is not None else []),
+                *([rebind_error] if rebind_error is not None else []),
+                *([postcheck_error] if postcheck_error is not None else []),
+            ],
+            message="experiment registry operation and close failed",
+        )
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> Literal[False]:
+        operation_error: BaseException | None = None
+        try:
+            if exc_type is None:
+                self.commit()
+            else:
+                self.rollback()
+        except BaseException as operation_exc:
+            operation_error = operation_exc
+        close_primary = exc
+        if operation_error is not None:
+            close_primary = (
+                operation_error
+                if exc is None
+                else BaseExceptionGroup(
+                    "experiment transaction body and completion failed",
+                    [exc, operation_error],
+                )
+            )
+        self.close(primary_error=close_primary)
+        if operation_error is not None:
+            raise close_primary
+        return False
+
+
 class ExperimentRegistry:
     """Serialize experiment evidence and promotion decisions through SQLite WAL."""
 
@@ -339,12 +871,14 @@ class ExperimentRegistry:
         self,
         path: Path,
         *,
+        managed_trust_root: Path,
         minimum_comparable_trades: int = 30,
         significance_level: Decimal = Decimal("0.05"),
         minimum_forward_days: int = 10,
         minimum_forward_fills: int = 20,
         maximum_forward_drawdown: Decimal = Decimal("0.10"),
         busy_timeout_ms: int = 5_000,
+        artifact_terminal_hook: Callable[[str, str, datetime], None] | None = None,
     ) -> None:
         if minimum_comparable_trades < 1:
             raise ValueError("minimum_comparable_trades must be positive")
@@ -356,7 +890,14 @@ class ExperimentRegistry:
             raise ValueError("maximum_forward_drawdown must be in [0, 1]")
         if busy_timeout_ms < 1:
             raise ValueError("busy_timeout_ms must be positive")
-        self.path = Path(path)
+        self._path_authority = PrivateSqlitePathAuthority(
+            path,
+            label="experiment registry",
+            create_if_missing=True,
+            create_parent_if_missing=True,
+            managed_trust_root=managed_trust_root,
+        )
+        self.path = self._path_authority.path
         self.minimum_comparable_trades = minimum_comparable_trades
         self.significance_level = significance_level
         self.minimum_forward_days = minimum_forward_days
@@ -370,30 +911,52 @@ class ExperimentRegistry:
             maximum_forward_drawdown=maximum_forward_drawdown,
         )
         self.busy_timeout_ms = busy_timeout_ms
+        self._artifact_terminal_hook = artifact_terminal_hook
         self._initialize()
+        self._path_authority.durably_sync_current_database()
+
+    def _emit_artifact_terminal(self, experiment_id: str, completed_at: datetime) -> None:
+        if self._artifact_terminal_hook is not None:
+            self._artifact_terminal_hook("experiment", experiment_id, completed_at)
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(
-            self.path,
-            timeout=self.busy_timeout_ms / 1_000,
-            isolation_level=None,
-        )
-        connection.row_factory = sqlite3.Row
+        def open_writable(path: Path) -> sqlite3.Connection:
+            connection = sqlite3.connect(
+                self._path_authority.writable_uri(),
+                uri=True,
+                timeout=self.busy_timeout_ms / 1_000,
+                isolation_level=None,
+                factory=_ExperimentRegistryConnection,
+            )
+            assert isinstance(connection, _ExperimentRegistryConnection)
+            connection.identity_authority = self._path_authority
+            return connection
+
+        connection = self._path_authority.open_verified_connection(open_writable)
         try:
-            connection.execute(f"PRAGMA busy_timeout = {self.busy_timeout_ms}")
-            connection.execute("PRAGMA foreign_keys = ON")
-            connection.execute("PRAGMA journal_mode = WAL")
-            connection.execute("PRAGMA synchronous = FULL")
-        except BaseException:
-            connection.close()
+            connection.row_factory = sqlite3.Row
+            execute_sqlite_setup_statement(
+                connection,
+                f"PRAGMA busy_timeout = {self.busy_timeout_ms}",
+            )
+            execute_sqlite_setup_statement(connection, "PRAGMA foreign_keys = ON")
+            execute_sqlite_setup_statement(connection, "PRAGMA journal_mode = WAL")
+            execute_sqlite_setup_statement(connection, "PRAGMA synchronous = FULL")
+            self._path_authority.rebind_ctime_after_trusted_sqlite_setup()
+        except BaseException as exc:
+            close_verified_sqlite_connection(
+                connection,
+                self._path_authority,
+                primary_error=exc,
+            )
             raise
         return connection
 
     def _initialize(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
             connection.executescript(
                 """
+                BEGIN IMMEDIATE;
                 CREATE TABLE IF NOT EXISTS experiment_attempt (
                     experiment_id TEXT PRIMARY KEY,
                     hypothesis_family TEXT NOT NULL,
@@ -447,6 +1010,30 @@ class ExperimentRegistry:
                 );
                 CREATE INDEX IF NOT EXISTS promotion_decision_time_idx
                     ON promotion_decision(decided_at, decision_id);
+
+                CREATE TABLE IF NOT EXISTS experiment_submission_outbox (
+                    request_id TEXT PRIMARY KEY,
+                    job_id TEXT NOT NULL UNIQUE,
+                    experiment_id TEXT NOT NULL REFERENCES experiment_attempt(experiment_id),
+                    attempt_identity TEXT NOT NULL,
+                    intent_json TEXT NOT NULL,
+                    command_content_hash TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN ('prepared', 'published')),
+                    prepared_at TEXT NOT NULL,
+                    published_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS experiment_submission_pending_idx
+                    ON experiment_submission_outbox(state, prepared_at, request_id);
+
+                CREATE TABLE IF NOT EXISTS formal_experiment_plan (
+                    plan_id TEXT PRIMARY KEY,
+                    experiment_id TEXT NOT NULL UNIQUE,
+                    resolution_key TEXT NOT NULL UNIQUE,
+                    preregistered_at TEXT NOT NULL,
+                    plan_json TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS formal_experiment_plan_resolution_idx
+                    ON formal_experiment_plan(resolution_key, preregistered_at, plan_id);
                 """
             )
             policy_payload = _json_payload(self.policy)
@@ -530,6 +1117,171 @@ class ExperimentRegistry:
         return HypothesisFamilyManifest.model_validate_json(row["payload_json"])
 
     @staticmethod
+    def _formal_plan_resolution_key(
+        *,
+        strategy_spec_fingerprint: str,
+        strategy_executable_fingerprint: str,
+        candidate_schema_fingerprint: str,
+        dataset_snapshot_id: str,
+        code_commit: str,
+        parameter_fingerprint: str,
+        cost_model_fingerprint: str,
+        execution_model_fingerprint: str,
+        seed: int,
+    ) -> str:
+        return canonical_sha256(
+            {
+                "contract": "formal-experiment-resolution/v1",
+                "strategy_spec_fingerprint": strategy_spec_fingerprint,
+                "strategy_executable_fingerprint": strategy_executable_fingerprint,
+                "candidate_schema_fingerprint": candidate_schema_fingerprint,
+                "dataset_snapshot_id": dataset_snapshot_id,
+                "code_commit": code_commit,
+                "parameter_fingerprint": parameter_fingerprint,
+                "cost_model_fingerprint": cost_model_fingerprint,
+                "execution_model_fingerprint": execution_model_fingerprint,
+                "seed": seed,
+            }
+        )
+
+    def register_formal_plan(
+        self,
+        plan: FormalExperimentPlan,
+        *,
+        family_manifest: HypothesisFamilyManifest,
+    ) -> FormalExperimentPlan:
+        selected = FormalExperimentPlan.model_validate(plan.model_dump(mode="python"))
+        manifest = self.register_hypothesis_family(family_manifest)
+        spec = selected.spec
+        if spec.experiment_id not in manifest.experiment_ids:
+            raise IncompleteHypothesisFamilyError(
+                "formal plan is outside its preregistered hypothesis family"
+            )
+        if (
+            spec.hypothesis_family != manifest.hypothesis_family
+            or spec.metric_definition_fingerprint != manifest.metric_definition_fingerprint
+            or selected.preregistered_at < manifest.preregistered_at
+        ):
+            raise IncompleteHypothesisFamilyError(
+                "formal plan conflicts with its preregistered hypothesis family"
+            )
+        assert selected.plan_id is not None
+        assert spec.experiment_id is not None
+        resolution_key = self._formal_plan_resolution_key(
+            strategy_spec_fingerprint=spec.strategy_spec_fingerprint,
+            strategy_executable_fingerprint=spec.strategy_executable_fingerprint,
+            candidate_schema_fingerprint=spec.candidate_schema_fingerprint,
+            dataset_snapshot_id=spec.dataset_snapshot_id,
+            code_commit=spec.code_commit,
+            parameter_fingerprint=spec.parameter_fingerprint,
+            cost_model_fingerprint=spec.cost_model_fingerprint,
+            execution_model_fingerprint=spec.execution_model_fingerprint,
+            seed=spec.seed,
+        )
+        payload = _json_payload(selected)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                rows = connection.execute(
+                    """
+                    SELECT plan_json FROM formal_experiment_plan
+                    WHERE plan_id = ? OR experiment_id = ? OR resolution_key = ?
+                    """,
+                    (selected.plan_id, spec.experiment_id, resolution_key),
+                ).fetchall()
+                if rows:
+                    if len(rows) != 1 or rows[0]["plan_json"] != payload:
+                        raise ExperimentIdentityConflictError(
+                            "formal experiment plan identity has conflicting content"
+                        )
+                    connection.rollback()
+                    return selected
+                connection.execute(
+                    """
+                    INSERT INTO formal_experiment_plan(
+                        plan_id, experiment_id, resolution_key,
+                        preregistered_at, plan_json
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        selected.plan_id,
+                        spec.experiment_id,
+                        resolution_key,
+                        _utc_iso(selected.preregistered_at),
+                        payload,
+                    ),
+                )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+        return selected
+
+    def resolve_formal_plan(
+        self,
+        *,
+        strategy_spec_fingerprint: str,
+        strategy_executable_fingerprint: str,
+        candidate_schema_fingerprint: str,
+        dataset_snapshot_id: str,
+        code_commit: str,
+        parameter_fingerprint: str,
+        cost_model_fingerprint: str,
+        execution_model_fingerprint: str,
+        seed: int,
+        as_of: datetime,
+    ) -> FormalExperimentPlan:
+        visible_at = normalize_aware_utc(as_of)
+        resolution_key = self._formal_plan_resolution_key(
+            strategy_spec_fingerprint=strategy_spec_fingerprint,
+            strategy_executable_fingerprint=strategy_executable_fingerprint,
+            candidate_schema_fingerprint=candidate_schema_fingerprint,
+            dataset_snapshot_id=dataset_snapshot_id,
+            code_commit=code_commit,
+            parameter_fingerprint=parameter_fingerprint,
+            cost_model_fingerprint=cost_model_fingerprint,
+            execution_model_fingerprint=execution_model_fingerprint,
+            seed=seed,
+        )
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT plan_json FROM formal_experiment_plan
+                WHERE resolution_key = ? AND preregistered_at <= ?
+                ORDER BY preregistered_at, plan_id
+                """,
+                (resolution_key, _utc_iso(visible_at)),
+            ).fetchall()
+        if len(rows) != 1:
+            raise IncompleteHypothesisFamilyError(
+                "exactly one visible preregistered formal plan is required"
+            )
+        return FormalExperimentPlan.model_validate_json(rows[0]["plan_json"])
+
+    def resolve_formal_plan_by_id(
+        self,
+        plan_id: str,
+        *,
+        as_of: datetime,
+    ) -> FormalExperimentPlan:
+        """Read one exact visible plan from this authoritative registry."""
+
+        visible_at = normalize_aware_utc(as_of)
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT plan_json FROM formal_experiment_plan
+                WHERE plan_id = ? AND preregistered_at <= ?
+                """,
+                (plan_id, _utc_iso(visible_at)),
+            ).fetchone()
+        if row is None:
+            raise IncompleteHypothesisFamilyError(
+                "exact visible preregistered formal plan is required"
+            )
+        return FormalExperimentPlan.model_validate_json(row["plan_json"])
+
+    @staticmethod
     def _validated_spec(spec: ExperimentSpec) -> ExperimentSpec:
         expected = canonical_sha256(spec.model_dump(mode="python", exclude={"experiment_id"}))
         if spec.experiment_id != expected:
@@ -543,10 +1295,34 @@ class ExperimentRegistry:
         spec: ExperimentSpec,
         *,
         registered_at: datetime,
+        submission: ExperimentSubmissionIntent | None = None,
     ) -> ExperimentAttempt:
         spec = self._validated_spec(spec)
         registered_at = normalize_aware_utc(registered_at)
         payload = _json_payload(spec)
+        if submission is not None:
+            submission = ExperimentSubmissionIntent.model_validate(
+                submission.model_dump(mode="python")
+            )
+            expected_attempt_identity = canonical_sha256(
+                {
+                    "contract": "research-experiment-attempt/v1",
+                    "experiment_id": spec.experiment_id,
+                    "hypothesis_family": spec.hypothesis_family,
+                    "hypothesis_variant": submission.hypothesis_variant,
+                }
+            )
+            if (
+                submission.experiment_id != spec.experiment_id
+                or submission.attempt_identity != expected_attempt_identity
+            ):
+                raise ExperimentIdentityConflictError(
+                    "submission intent conflicts with immutable experiment ownership"
+                )
+            if submission.schema_version != 2:
+                raise ExperimentIdentityConflictError(
+                    "formal job submission requires current formal plan receipts"
+                )
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
@@ -561,6 +1337,41 @@ class ExperimentRegistry:
                     )
                 if registered_at < manifest.preregistered_at:
                     raise ValueError("registered_at cannot precede family preregistration")
+                if submission is not None:
+                    plan_row = connection.execute(
+                        """
+                        SELECT plan_json FROM formal_experiment_plan
+                        WHERE plan_id = ? AND preregistered_at <= ?
+                        """,
+                        (submission.formal_plan_id, _utc_iso(registered_at)),
+                    ).fetchone()
+                    if plan_row is None:
+                        raise IncompleteHypothesisFamilyError(
+                            "exact visible preregistered formal plan is required"
+                        )
+                    plan = FormalExperimentPlan.model_validate_json(plan_row["plan_json"])
+                    if plan.schema_version != 2:
+                        raise ExperimentIdentityConflictError(
+                            "legacy formal plan cannot own a current job submission"
+                        )
+                    exact_plan_receipts = (
+                        plan.plan_id,
+                        plan.spec,
+                        plan.hypothesis_variant,
+                        plan.strategy_definition_fingerprint,
+                        plan.definition_registration_record_hash,
+                    )
+                    submitted_plan_receipts = (
+                        submission.formal_plan_id,
+                        spec,
+                        submission.hypothesis_variant,
+                        submission.strategy_definition_fingerprint,
+                        submission.definition_registration_record_hash,
+                    )
+                    if exact_plan_receipts != submitted_plan_receipts:
+                        raise ExperimentIdentityConflictError(
+                            "submission intent conflicts with authoritative formal plan receipts"
+                        )
                 existing = connection.execute(
                     "SELECT spec_json FROM experiment_attempt WHERE experiment_id = ?",
                     (spec.experiment_id,),
@@ -570,28 +1381,191 @@ class ExperimentRegistry:
                         raise ExperimentIdentityConflictError(
                             f"experiment_id {spec.experiment_id} has conflicting content"
                         )
-                    connection.rollback()
-                    return self.get_attempt(spec.experiment_id)
-
-                connection.execute(
-                    """
-                    INSERT INTO experiment_attempt(
-                        experiment_id, hypothesis_family, spec_json, status, registered_at
-                    ) VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (
-                        spec.experiment_id,
-                        spec.hypothesis_family,
-                        payload,
-                        ExperimentStatus.REGISTERED.value,
-                        _utc_iso(registered_at),
-                    ),
-                )
+                else:
+                    connection.execute(
+                        """
+                        INSERT INTO experiment_attempt(
+                            experiment_id, hypothesis_family, spec_json, status, registered_at
+                        ) VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (
+                            spec.experiment_id,
+                            spec.hypothesis_family,
+                            payload,
+                            ExperimentStatus.REGISTERED.value,
+                            _utc_iso(registered_at),
+                        ),
+                    )
+                if submission is not None:
+                    intent_json = _json_payload(submission)
+                    existing_submission = connection.execute(
+                        """
+                        SELECT intent_json FROM experiment_submission_outbox
+                        WHERE request_id = ? OR job_id = ?
+                        """,
+                        (str(submission.request_id), str(submission.job_id)),
+                    ).fetchall()
+                    if existing_submission:
+                        if (
+                            len(existing_submission) != 1
+                            or existing_submission[0]["intent_json"] != intent_json
+                        ):
+                            raise ExperimentIdentityConflictError(
+                                "job submission identity has conflicting immutable content"
+                            )
+                    else:
+                        connection.execute(
+                            """
+                            INSERT INTO experiment_submission_outbox(
+                                request_id, job_id, experiment_id, attempt_identity,
+                                intent_json, command_content_hash, state, prepared_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, 'prepared', ?)
+                            """,
+                            (
+                                str(submission.request_id),
+                                str(submission.job_id),
+                                submission.experiment_id,
+                                submission.attempt_identity,
+                                intent_json,
+                                submission.command_content_hash,
+                                _utc_iso(registered_at),
+                            ),
+                        )
                 connection.commit()
             except BaseException:
                 connection.rollback()
                 raise
         return self.get_attempt(spec.experiment_id)
+
+    def list_pending_submissions(
+        self,
+        *,
+        limit: int = 100,
+    ) -> tuple[ExperimentSubmissionIntent, ...]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1_000:
+            raise ValueError("submission outbox limit must be from 1 through 1000")
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT intent_json FROM experiment_submission_outbox
+                WHERE state = 'prepared'
+                ORDER BY prepared_at, request_id
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return tuple(
+            ExperimentSubmissionIntent.model_validate_json(row["intent_json"]) for row in rows
+        )
+
+    def list_submission_intents(
+        self,
+        *,
+        limit: int = 1_000,
+    ) -> tuple[ExperimentSubmissionIntent, ...]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 10_000:
+            raise ValueError("submission intent limit must be from 1 through 10000")
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT intent_json FROM experiment_submission_outbox
+                ORDER BY prepared_at, request_id
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return tuple(
+            ExperimentSubmissionIntent.model_validate_json(row["intent_json"]) for row in rows
+        )
+
+    def list_recoverable_submission_intents(
+        self,
+        *,
+        limit: int = 1_000,
+    ) -> tuple[ExperimentSubmissionIntent, ...]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1_000:
+            raise ValueError("recoverable submission limit must be from 1 through 1000")
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT outbox.intent_json
+                FROM experiment_submission_outbox AS outbox
+                JOIN experiment_attempt AS attempt
+                  ON attempt.experiment_id = outbox.experiment_id
+                WHERE outbox.state = 'prepared'
+                   OR attempt.status IN (?, ?)
+                ORDER BY outbox.prepared_at, outbox.request_id
+                LIMIT ?
+                """,
+                (
+                    ExperimentStatus.REGISTERED.value,
+                    ExperimentStatus.RUNNING.value,
+                    limit,
+                ),
+            ).fetchall()
+        return tuple(
+            ExperimentSubmissionIntent.model_validate_json(row["intent_json"]) for row in rows
+        )
+
+    def get_submission_intent_for_job(
+        self,
+        job_id: UUID,
+    ) -> ExperimentSubmissionIntent | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT intent_json FROM experiment_submission_outbox
+                WHERE job_id = ?
+                """,
+                (str(job_id),),
+            ).fetchone()
+        return (
+            ExperimentSubmissionIntent.model_validate_json(row["intent_json"])
+            if row is not None
+            else None
+        )
+
+    def mark_submission_published(
+        self,
+        request_id: UUID,
+        *,
+        command_content_hash: str,
+        published_at: datetime,
+    ) -> None:
+        published_at = normalize_aware_utc(published_at)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    """
+                    SELECT command_content_hash, state, prepared_at, published_at
+                    FROM experiment_submission_outbox WHERE request_id = ?
+                    """,
+                    (str(request_id),),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(f"unknown experiment submission request: {request_id}")
+                if row["command_content_hash"] != command_content_hash:
+                    raise ExperimentIdentityConflictError(
+                        "published command hash conflicts with experiment outbox"
+                    )
+                if published_at < _parse_utc(row["prepared_at"]):  # type: ignore[operator]
+                    raise ValueError("published_at cannot precede outbox preparation")
+                if row["state"] == "published":
+                    connection.rollback()
+                    return
+                connection.execute(
+                    """
+                    UPDATE experiment_submission_outbox
+                    SET state = 'published', published_at = ?
+                    WHERE request_id = ? AND state = 'prepared'
+                    """,
+                    (_utc_iso(published_at), str(request_id)),
+                )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
 
     def start_attempt(self, experiment_id: str, *, started_at: datetime) -> ExperimentAttempt:
         started_at = normalize_aware_utc(started_at)
@@ -629,6 +1603,43 @@ class ExperimentRegistry:
                 raise
         return self.get_attempt(experiment_id)
 
+    def ensure_attempt_started(
+        self,
+        experiment_id: str,
+        *,
+        started_at: datetime,
+    ) -> ExperimentAttempt:
+        """Start once; retries retain the first immutable experiment start time."""
+
+        started_at = normalize_aware_utc(started_at)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._required_attempt_row(connection, experiment_id)
+                status = ExperimentStatus(row["status"])
+                if status is ExperimentStatus.REGISTERED:
+                    if started_at < _parse_utc(row["registered_at"]):  # type: ignore[operator]
+                        raise ValueError("started_at cannot precede registered_at")
+                    connection.execute(
+                        """
+                        UPDATE experiment_attempt SET status = ?, started_at = ?
+                        WHERE experiment_id = ? AND status = ?
+                        """,
+                        (
+                            ExperimentStatus.RUNNING.value,
+                            _utc_iso(started_at),
+                            experiment_id,
+                            ExperimentStatus.REGISTERED.value,
+                        ),
+                    )
+                    connection.commit()
+                else:
+                    connection.rollback()
+            except BaseException:
+                connection.rollback()
+                raise
+        return self.get_attempt(experiment_id)
+
     def record_success(
         self,
         outcome: ExperimentOutcome,
@@ -657,7 +1668,9 @@ class ExperimentRegistry:
                     ):
                         raise TerminalExperimentError("succeeded outcome is immutable")
                     connection.rollback()
-                    return self.get_attempt(outcome.experiment_id).outcome  # type: ignore[return-value]
+                    existing_outcome = self.get_attempt(outcome.experiment_id).outcome
+                    self._emit_artifact_terminal(outcome.experiment_id, completed_at)
+                    return existing_outcome  # type: ignore[return-value]
                 if status in {ExperimentStatus.FAILED, ExperimentStatus.CANCELLED}:
                     raise TerminalExperimentError("terminal attempt cannot become succeeded")
                 if status is not ExperimentStatus.RUNNING:
@@ -737,7 +1750,61 @@ class ExperimentRegistry:
             except BaseException:
                 connection.rollback()
                 raise
+        self._emit_artifact_terminal(outcome.experiment_id, completed_at)
         return outcome
+
+    def record_execution_completed(
+        self,
+        experiment_id: str,
+        *,
+        completed_at: datetime,
+    ) -> ExperimentAttempt:
+        """Seal successful compute without inventing statistical outcome evidence."""
+
+        completed_at = normalize_aware_utc(completed_at)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._required_attempt_row(connection, experiment_id)
+                status = ExperimentStatus(row["status"])
+                if status is ExperimentStatus.EXECUTED:
+                    if _parse_utc(row["completed_at"]) != completed_at:
+                        raise TerminalExperimentError("executed attempt completion is immutable")
+                    connection.rollback()
+                    return self.get_attempt(experiment_id)
+                if status in {
+                    ExperimentStatus.SUCCEEDED,
+                    ExperimentStatus.FAILED,
+                    ExperimentStatus.CANCELLED,
+                }:
+                    raise TerminalExperimentError(
+                        "terminal attempt cannot accept execution completion"
+                    )
+                if status is not ExperimentStatus.RUNNING:
+                    raise ExperimentRegistryError(
+                        "attempt must be running before execution completion"
+                    )
+                started_at = _parse_utc(row["started_at"])
+                if started_at is None or completed_at < started_at:
+                    raise ValueError("completed_at cannot precede started_at")
+                connection.execute(
+                    """
+                    UPDATE experiment_attempt
+                    SET status = ?, completed_at = ?
+                    WHERE experiment_id = ? AND status = ?
+                    """,
+                    (
+                        ExperimentStatus.EXECUTED.value,
+                        _utc_iso(completed_at),
+                        experiment_id,
+                        ExperimentStatus.RUNNING.value,
+                    ),
+                )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+        return self.get_attempt(experiment_id)
 
     def record_failure(
         self,
@@ -791,7 +1858,9 @@ class ExperimentRegistry:
                     ):
                         raise TerminalExperimentError("terminal failure evidence is immutable")
                     connection.rollback()
-                    return self.get_attempt(experiment_id)
+                    existing = self.get_attempt(experiment_id)
+                    self._emit_artifact_terminal(experiment_id, completed_at)
+                    return existing
                 if current in {
                     ExperimentStatus.SUCCEEDED,
                     ExperimentStatus.FAILED,
@@ -813,7 +1882,9 @@ class ExperimentRegistry:
             except BaseException:
                 connection.rollback()
                 raise
-        return self.get_attempt(experiment_id)
+        result = self.get_attempt(experiment_id)
+        self._emit_artifact_terminal(experiment_id, completed_at)
+        return result
 
     def get_attempt(self, experiment_id: str) -> ExperimentAttempt:
         with self._connect() as connection:
@@ -1134,6 +2205,74 @@ class ExperimentRegistry:
                 raise
         return decision
 
+    def read_promotion_decisions(
+        self,
+        *,
+        observed_at: datetime,
+        limit: int = 1_000,
+    ) -> PromotionDecisionReadSnapshot:
+        """Read the promotion ledger through this lifecycle-owned authority.
+
+        Serving publishers receive this narrow method from the live registry
+        composition.  They do not reopen an independent read-only registry
+        handle whose identity lifecycle could drift from terminal hooks.
+        """
+
+        observed = normalize_aware_utc(observed_at)
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        cutoff = _utc_iso(observed)
+        with self._connect() as connection:
+            metadata = connection.execute(
+                """
+                SELECT COALESCE(MAX(rowid), 0) AS sequence,
+                       MAX(decided_at) AS event_time
+                FROM promotion_decision
+                WHERE decided_at <= ?
+                """,
+                (cutoff,),
+            ).fetchone()
+            rows = connection.execute(
+                """
+                SELECT rowid, decision_id, stage, approved, decided_at, payload_json
+                FROM promotion_decision
+                WHERE decided_at <= ?
+                ORDER BY decided_at DESC, decision_id DESC
+                LIMIT ?
+                """,
+                (cutoff, limit),
+            ).fetchall()
+
+        decisions: list[PromotionDecision] = []
+        for row in rows:
+            try:
+                decision = PromotionDecision.model_validate_json(row["payload_json"])
+                stored_time = _parse_utc(row["decided_at"])
+            except (TypeError, ValueError) as exc:
+                raise ExperimentRegistryError("promotion decision evidence is invalid") from exc
+            if (
+                decision.decision_id != row["decision_id"]
+                or decision.stage.value != row["stage"]
+                or int(decision.approved) != row["approved"]
+                or decision.decided_at != stored_time
+            ):
+                raise ExperimentRegistryError(
+                    "promotion decision payload does not match indexed evidence"
+                )
+            if decision.decided_at > observed:
+                raise ExperimentRegistryError("promotion decision contains future evidence")
+            decisions.append(decision)
+
+        decisions.sort(key=lambda item: (item.decided_at, item.decision_id))
+        event_time = _parse_utc(metadata["event_time"])
+        if event_time is not None and event_time > observed:
+            raise ExperimentRegistryError("promotion registry contains future evidence")
+        return PromotionDecisionReadSnapshot(
+            decisions=tuple(decisions),
+            sequence=int(metadata["sequence"]),
+            event_time=event_time,
+        )
+
     def list_promotion_decisions(self) -> tuple[PromotionDecision, ...]:
         with self._connect() as connection:
             rows = connection.execute(
@@ -1164,9 +2303,8 @@ class ExperimentRegistry:
             )
         return HypothesisFamilyManifest.model_validate_json(row["payload_json"])
 
-    def _attempt_from_row(
-        self, connection: sqlite3.Connection, row: sqlite3.Row
-    ) -> ExperimentAttempt:
+    @staticmethod
+    def _attempt_from_row(connection: sqlite3.Connection, row: sqlite3.Row) -> ExperimentAttempt:
         outcome_row = connection.execute(
             """
             SELECT o.outcome_json, a.adjusted_p_value

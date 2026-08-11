@@ -153,11 +153,21 @@ class ServingSourceAuthorityPublisher:
         generations_fd = -1
         publications_fd = -1
         lock_fd = -1
+        generations_entry: DirectoryEntry | None = None
+        publications_entry: DirectoryEntry | None = None
         try:
             generations_fd = _open_or_create_child_directory(root_fd, "generations")
+            generations_entry = _directory_entry(root_fd, generations_fd, "generations")
             publications_fd = _open_or_create_child_directory(root_fd, "publications")
+            publications_entry = _directory_entry(root_fd, publications_fd, "publications")
             lock_fd = _open_publish_lock(root_fd)
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            _verify_publisher_directories(
+                chain,
+                root_fd=root_fd,
+                generations_entry=generations_entry,
+                publications_entry=publications_entry,
+            )
 
             current = _load_current_for_publisher(
                 root_fd=root_fd,
@@ -178,6 +188,14 @@ class ServingSourceAuthorityPublisher:
                             publications_fd,
                             pointer=current_pointer,
                             payload=current_pointer_bytes,
+                            max_bytes=self.max_bytes,
+                        )
+                        _verify_existing_current_pointer(
+                            chain,
+                            root_fd=root_fd,
+                            generations_entry=generations_entry,
+                            publications_entry=publications_entry,
+                            expected_payload=current_pointer_bytes,
                             max_bytes=self.max_bytes,
                         )
                         return current_pointer
@@ -244,7 +262,14 @@ class ServingSourceAuthorityPublisher:
                 max_bytes=self.max_bytes,
                 label="immutable publication",
             )
-            _replace_current_pointer(root_fd, pointer_bytes)
+            _replace_current_pointer(
+                root_fd,
+                pointer_bytes,
+                directory_chain=chain,
+                generations_entry=generations_entry,
+                publications_entry=publications_entry,
+                max_bytes=self.max_bytes,
+            )
             return pointer
         finally:
             if lock_fd >= 0:
@@ -997,7 +1022,15 @@ def _publish_immutable_payload(
             os.unlink(temporary, dir_fd=directory_fd)
 
 
-def _replace_current_pointer(root_fd: int, payload: bytes) -> None:
+def _replace_current_pointer(
+    root_fd: int,
+    payload: bytes,
+    *,
+    directory_chain: list[DirectoryEntry],
+    generations_entry: DirectoryEntry,
+    publications_entry: DirectoryEntry,
+    max_bytes: int,
+) -> None:
     temporary = f".current.{os.getpid()}.{secrets.token_hex(8)}.tmp"
     descriptor = -1
     try:
@@ -1013,8 +1046,16 @@ def _replace_current_pointer(root_fd: int, payload: bytes) -> None:
         )
         _write_all(descriptor, payload)
         os.fsync(descriptor)
-        os.close(descriptor)
-        descriptor = -1
+        staged = os.fstat(descriptor)
+        staged_at_path = os.stat(temporary, dir_fd=root_fd, follow_symlinks=False)
+        if not _same_regular_file(staged, staged_at_path):
+            raise ServingSourceAuthorityIntegrityError("staged current pointer identity is unsafe")
+        _verify_publisher_directories(
+            directory_chain,
+            root_fd=root_fd,
+            generations_entry=generations_entry,
+            publications_entry=publications_entry,
+        )
         os.rename(
             temporary,
             "current.json",
@@ -1022,12 +1063,116 @@ def _replace_current_pointer(root_fd: int, payload: bytes) -> None:
             dst_dir_fd=root_fd,
         )
         os.fsync(root_fd)
+        _verify_committed_current_pointer(
+            root_fd,
+            expected_identity=staged,
+            expected_payload=payload,
+            max_bytes=max_bytes,
+        )
+        _verify_publisher_directories(
+            directory_chain,
+            root_fd=root_fd,
+            generations_entry=generations_entry,
+            publications_entry=publications_entry,
+        )
     finally:
         with suppress(OSError):
             if descriptor >= 0:
                 os.close(descriptor)
         with suppress(OSError):
             os.unlink(temporary, dir_fd=root_fd)
+
+
+def _verify_existing_current_pointer(
+    directory_chain: list[DirectoryEntry],
+    *,
+    root_fd: int,
+    generations_entry: DirectoryEntry,
+    publications_entry: DirectoryEntry,
+    expected_payload: bytes,
+    max_bytes: int,
+) -> None:
+    _verify_publisher_directories(
+        directory_chain,
+        root_fd=root_fd,
+        generations_entry=generations_entry,
+        publications_entry=publications_entry,
+    )
+    observed = _read_regular_file_at(
+        root_fd,
+        "current.json",
+        max_bytes=max_bytes,
+        label="current pointer",
+        missing_unavailable=False,
+    )
+    if observed != expected_payload:
+        raise ServingSourceAuthorityIntegrityError(
+            "current pointer changed before publisher success"
+        )
+    assert observed is not None
+    _parse_pointer(observed)
+    _verify_publisher_directories(
+        directory_chain,
+        root_fd=root_fd,
+        generations_entry=generations_entry,
+        publications_entry=publications_entry,
+    )
+
+
+def _verify_committed_current_pointer(
+    root_fd: int,
+    *,
+    expected_identity: os.stat_result,
+    expected_payload: bytes,
+    max_bytes: int,
+) -> None:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            "current.json",
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=root_fd,
+        )
+        before = os.fstat(descriptor)
+        at_path_before = os.stat("current.json", dir_fd=root_fd, follow_symlinks=False)
+        if not _same_published_file_identity(expected_identity, before):
+            raise ServingSourceAuthorityIntegrityError("current pointer commit identity changed")
+        if not _same_regular_file(before, at_path_before):
+            raise ServingSourceAuthorityIntegrityError("current pointer identity is unsafe")
+        if before.st_size > max_bytes:
+            raise ServingSourceAuthorityIntegrityError(
+                "current pointer exceeds configured size limit"
+            )
+        chunks: list[bytes] = []
+        remaining = max_bytes + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        observed = b"".join(chunks)
+        after = os.fstat(descriptor)
+        at_path_after = os.stat("current.json", dir_fd=root_fd, follow_symlinks=False)
+        if not _same_observation(before, after) or not _same_regular_file(after, at_path_after):
+            raise ServingSourceAuthorityIntegrityError(
+                "current pointer changed after atomic publish"
+            )
+        if observed != expected_payload:
+            raise ServingSourceAuthorityIntegrityError(
+                "current pointer content changed after atomic publish"
+            )
+        _parse_pointer(observed)
+    except ServingSourceAuthorityIntegrityError:
+        raise
+    except OSError as exc:
+        raise ServingSourceAuthorityIntegrityError(
+            "current pointer path is unsafe after atomic publish"
+        ) from exc
+    finally:
+        with suppress(OSError):
+            if descriptor >= 0:
+                os.close(descriptor)
 
 
 DirectoryEntry = tuple[int, str | None, os.stat_result]
@@ -1052,7 +1197,7 @@ def _open_existing_directory_chain(path: Path) -> list[DirectoryEntry]:
     try:
         root_fd = os.open("/", flags)
         root_stat = os.fstat(root_fd)
-        if not stat.S_ISDIR(root_stat.st_mode):
+        if not _is_trusted_directory(root_stat):
             raise ServingSourceAuthorityIntegrityError("filesystem root is unsafe")
         chain.append((root_fd, None, root_stat))
         for component in path.parts[1:]:
@@ -1163,7 +1308,7 @@ def _read_regular_file_at(
 def _verify_directory_chain(chain: list[DirectoryEntry]) -> None:
     for index, (directory_fd, name, initial) in enumerate(chain):
         current = os.fstat(directory_fd)
-        if not _same_observation(initial, current) or not stat.S_ISDIR(current.st_mode):
+        if not _same_directory_identity(initial, current):
             raise ServingSourceAuthorityIntegrityError(
                 "authority directory changed while being read"
             )
@@ -1182,11 +1327,23 @@ def _verify_child_directory(parent_fd: int, entry: DirectoryEntry) -> None:
     directory_fd, name, initial = entry
     assert name is not None
     current = os.fstat(directory_fd)
-    if not _same_observation(initial, current) or not stat.S_ISDIR(current.st_mode):
+    if not _same_directory_identity(initial, current):
         raise ServingSourceAuthorityIntegrityError("authority directory changed while being read")
     at_path = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     if not _same_directory(current, at_path):
         raise ServingSourceAuthorityIntegrityError("authority directory changed while being read")
+
+
+def _verify_publisher_directories(
+    directory_chain: list[DirectoryEntry],
+    *,
+    root_fd: int,
+    generations_entry: DirectoryEntry,
+    publications_entry: DirectoryEntry,
+) -> None:
+    _verify_directory_chain(directory_chain)
+    _verify_child_directory(root_fd, generations_entry)
+    _verify_child_directory(root_fd, publications_entry)
 
 
 def _close_directory_chain(chain: list[DirectoryEntry]) -> None:
@@ -1258,19 +1415,83 @@ def _require_max_bytes(value: int) -> int:
 
 def _same_directory(first: os.stat_result, second: os.stat_result) -> bool:
     return (
-        stat.S_ISDIR(first.st_mode)
-        and stat.S_ISDIR(second.st_mode)
-        and _same_observation(first, second)
+        _is_trusted_directory(first)
+        and _is_trusted_directory(second)
+        and _same_directory_identity(first, second)
     )
 
 
 def _same_regular_file(first: os.stat_result, second: os.stat_result) -> bool:
     return (
-        stat.S_ISREG(first.st_mode)
-        and stat.S_ISREG(second.st_mode)
+        _is_trusted_regular_file(first)
+        and _is_trusted_regular_file(second)
         and first.st_nlink == 1
         and second.st_nlink == 1
         and _same_observation(first, second)
+    )
+
+
+def _same_published_file_identity(
+    first: os.stat_result,
+    second: os.stat_result,
+) -> bool:
+    return (
+        _is_trusted_regular_file(first)
+        and _is_trusted_regular_file(second)
+        and (
+            first.st_dev,
+            first.st_ino,
+            first.st_mode,
+            first.st_uid,
+            first.st_gid,
+            first.st_nlink,
+            first.st_size,
+        )
+        == (
+            second.st_dev,
+            second.st_ino,
+            second.st_mode,
+            second.st_uid,
+            second.st_gid,
+            second.st_nlink,
+            second.st_size,
+        )
+        and first.st_nlink == 1
+    )
+
+
+def _same_directory_identity(first: os.stat_result, second: os.stat_result) -> bool:
+    return (
+        _is_trusted_directory(first)
+        and _is_trusted_directory(second)
+        and (
+            first.st_dev,
+            first.st_ino,
+            first.st_uid,
+            first.st_gid,
+            first.st_mode,
+        )
+        == (
+            second.st_dev,
+            second.st_ino,
+            second.st_uid,
+            second.st_gid,
+            second.st_mode,
+        )
+    )
+
+
+def _is_trusted_directory(observation: os.stat_result) -> bool:
+    return stat.S_ISDIR(observation.st_mode) and _is_trusted_path_node(observation)
+
+
+def _is_trusted_regular_file(observation: os.stat_result) -> bool:
+    return stat.S_ISREG(observation.st_mode) and _is_trusted_path_node(observation)
+
+
+def _is_trusted_path_node(observation: os.stat_result) -> bool:
+    return observation.st_uid in {0, os.geteuid()} and not observation.st_mode & (
+        stat.S_IWGRP | stat.S_IWOTH
     )
 
 
@@ -1279,6 +1500,8 @@ def _same_observation(first: os.stat_result, second: os.stat_result) -> bool:
         first.st_dev,
         first.st_ino,
         first.st_mode,
+        first.st_uid,
+        first.st_gid,
         first.st_size,
         first.st_mtime_ns,
         first.st_ctime_ns,
@@ -1286,6 +1509,8 @@ def _same_observation(first: os.stat_result, second: os.stat_result) -> bool:
         second.st_dev,
         second.st_ino,
         second.st_mode,
+        second.st_uid,
+        second.st_gid,
         second.st_size,
         second.st_mtime_ns,
         second.st_ctime_ns,

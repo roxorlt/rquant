@@ -1,0 +1,4015 @@
+#!/usr/bin/python3
+"""Root-only Ed25519 signer for bounded rQuant Shadow report requests."""
+
+from __future__ import annotations
+
+import base64
+import fcntl
+import hashlib
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+from contextlib import suppress
+from datetime import (
+    date,
+    datetime,
+    timedelta,
+    timezone,
+)
+from datetime import (
+    time as datetime_time,
+)
+from pathlib import Path
+from typing import Optional
+from zoneinfo import ZoneInfo
+
+KEYS_FILE = Path("/etc/rquant/shadow-report-keys.json")
+LEGACY_SHADOW_ROOT = Path("/home/lighthouse/rquant/data/legacy-shadow")
+RECOVERY_STATE_ROOT = Path("/var/lib/rquant/shadow-recovery")
+MAX_REQUEST_BYTES = 2 * 1024 * 1024
+MAX_KEY_FILE_BYTES = 64 * 1024
+MAX_CALENDAR_FILE_BYTES = 4 * 1024 * 1024
+MAX_EXPORT_BYTES = 128 * 1024 * 1024
+READ_CHUNK_BYTES = 1024 * 1024
+KEY_ID = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
+SHA256 = re.compile(r"^[0-9a-f]{64}$")
+SIGNATURE = re.compile(r"^[A-Za-z0-9+/]{86}==$")
+COMMIT = re.compile(r"^[0-9a-f]{40}$")
+STAGING_NAME = re.compile(r"^\.staging-[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9a-f]{32}$")
+BOOT_ID = re.compile(r"^[0-9a-f-]{36}$")
+RECOVERY_NAMESPACE = "rquant-legacy-shadow-recovery-marker"
+RECOVERY_CAPTURE_NAMESPACE = "rquant-legacy-shadow-recovery-capture"
+FINALIZATION_NAMESPACE = "rquant-legacy-shadow-finalization-receipt"
+FINALIZATION_FILENAME = "finalization-receipt.json"
+FINALIZATION_PENDING_FILENAME = ".finalization-receipt.pending"
+_UTC = timezone.utc  # noqa: UP017 - deployed helper supports system Python 3.9.
+_DIRECTORY_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
+RECOVERY_WINDOW = timedelta(minutes=5)
+RECOVERY_CLOCK_TOLERANCE = timedelta(seconds=5)
+SHANGHAI = ZoneInfo("Asia/Shanghai")
+NAMESPACES = frozenset(
+    {
+        "rquant-shadow-completion-attestation",
+        "rquant-shadow-report-receipt",
+        RECOVERY_NAMESPACE,
+    }
+)
+_PREPARED_IMMUTABLE_FIELDS = frozenset(
+    {
+        "contract",
+        "schema_version",
+        "state",
+        "transaction_id",
+        "capture_token_id",
+        "request_payload_sha256",
+        "capture",
+        "draft",
+        "directory_device",
+        "directory_inode",
+        "artifact_digests",
+        "batch_digest",
+        "marker_payload_base64",
+        "marker_sha256",
+        "signed_payload_base64",
+        "signed_payload_sha256",
+        "marker_signature",
+    }
+)
+_PREPARED_STATE_FIELDS = frozenset(
+    {
+        "phase",
+        "state_sequence",
+        "previous_state_sha256",
+        "finalization_receipt_base64",
+        "finalization_receipt_sha256",
+        "finalization_durable_at",
+        "finalization_durable_monotonic_ns",
+        "finalization_durable_boot_id",
+        "finalization_durable_clock_source",
+    }
+)
+_PREPARED_FIELDS = _PREPARED_IMMUTABLE_FIELDS | _PREPARED_STATE_FIELDS
+_COMMITTED_FIELDS = frozenset(
+    {
+        "contract",
+        "schema_version",
+        "state",
+        "state_sequence",
+        "transaction_id",
+        "capture_token_id",
+        "request_payload_sha256",
+        "prepared_sha256",
+        "prepared_previous_state_sha256",
+        "marker_sha256",
+        "finalization_receipt_sha256",
+        "batch_digest",
+        "directory_device",
+        "directory_inode",
+        "artifact_digests",
+        "finalization_durable_at",
+        "finalization_durable_monotonic_ns",
+        "finalization_durable_boot_id",
+        "finalization_durable_clock_source",
+    }
+)
+_FINALIZATION_CLAIM_FIELDS = frozenset(
+    {
+        "contract",
+        "trade_date",
+        "source_id",
+        "producer_commit",
+        "producer_version",
+        "staging_name",
+        "transaction_id",
+        "capture_token_id",
+        "marker_id",
+        "marker_sha256",
+        "batch_digest",
+        "directory_device",
+        "directory_inode",
+        "artifact_digests",
+        "finalized_at",
+        "finalized_monotonic_ns",
+        "boot_id",
+        "clock_source",
+    }
+)
+
+
+def _test_fault(_point: str) -> None:
+    """Overridden only by the import-based unit-test wrapper."""
+
+
+class ShadowSignerError(ValueError):
+    pass
+
+
+def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ShadowSignerError("duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def _canonical_bytes(value: object) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _canonical_equal(left: object, right: object) -> bool:
+    return _canonical_bytes(left) == _canonical_bytes(right)
+
+
+def _exact_int(value: object, *, label: str, minimum: int = 0) -> int:
+    if type(value) is not int or value < minimum:
+        raise ShadowSignerError(f"{label} is invalid")
+    return value
+
+
+def _openssl() -> str:
+    for candidate in ("/opt/homebrew/bin/openssl", "/usr/bin/openssl"):
+        if Path(candidate).is_file():
+            return candidate
+    raise ShadowSignerError("openssl is unavailable")
+
+
+def _run_openssl(
+    arguments: list[str], *, input_data: bytes = b""
+) -> subprocess.CompletedProcess[bytes]:
+    try:
+        return subprocess.run(
+            [_openssl(), *arguments],
+            input=input_data,
+            capture_output=True,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ShadowSignerError("openssl operation failed") from exc
+
+
+def _secure_file(
+    path: Path,
+    *,
+    mode: int,
+    label: str,
+    maximum_bytes: int = MAX_KEY_FILE_BYTES,
+) -> bytes:
+    descriptor = -1
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        opened = os.fstat(descriptor)
+        named = os.stat(path, follow_symlinks=False)
+        expected_owner = 0 if os.geteuid() == 0 else os.geteuid()
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)
+            or opened.st_uid != expected_owner
+            or stat.S_IMODE(opened.st_mode) != mode
+            or not 0 < opened.st_size <= maximum_bytes
+        ):
+            raise ShadowSignerError(f"{label} is unsafe")
+        chunks: list[bytes] = []
+        total = 0
+        while chunk := os.read(descriptor, min(64 * 1024, maximum_bytes + 1 - total)):
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > maximum_bytes:
+                raise ShadowSignerError(f"{label} is unsafe")
+        payload = b"".join(chunks)
+        after = os.fstat(descriptor)
+        if len(payload) != opened.st_size or (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_size,
+            opened.st_mtime_ns,
+        ) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+            raise ShadowSignerError(f"{label} changed while reading")
+        return payload
+    except OSError as exc:
+        raise ShadowSignerError(f"{label} is unavailable") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _validate_public_key(value: object, *, label: str) -> str:
+    if not isinstance(value, str) or not value or len(value) > 8192:
+        raise ShadowSignerError(f"{label} is invalid")
+    result = _run_openssl(
+        ["pkey", "-pubin", "-pubcheck", "-text_pub", "-noout"],
+        input_data=value.encode("utf-8"),
+    )
+    if result.returncode != 0 or b"ED25519" not in result.stdout.upper():
+        raise ShadowSignerError(f"{label} is not Ed25519")
+    return value
+
+
+def _public_key_from_private(path: Path) -> str:
+    _secure_file(path, mode=0o600, label="Shadow private key")
+    result = _run_openssl(["pkey", "-in", str(path), "-pubout"])
+    if result.returncode != 0 or not result.stdout:
+        raise ShadowSignerError("Shadow private key is unusable")
+    return _validate_public_key(result.stdout.decode("utf-8"), label="Shadow active public key")
+
+
+def _load_keys(path: Path) -> tuple[str, Path, str, dict[str, str], Path]:
+    try:
+        document = json.loads(
+            _secure_file(path, mode=0o600, label="Shadow key manifest"),
+            object_pairs_hook=_unique_object,
+        )
+    except (TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ShadowSignerError("Shadow key manifest is invalid") from exc
+    expected = {
+        "schema_version",
+        "active_key_id",
+        "active_private_key_path",
+        "previous_public_keys",
+        "legacy_recovery_calendar_path",
+    }
+    if (
+        not isinstance(document, dict)
+        or set(document) != expected
+        or type(document.get("schema_version")) is not int
+        or document["schema_version"] != 2
+        or not isinstance(document.get("active_key_id"), str)
+        or KEY_ID.fullmatch(document["active_key_id"]) is None
+        or not isinstance(document.get("active_private_key_path"), str)
+        or not isinstance(document.get("previous_public_keys"), dict)
+        or not isinstance(document.get("legacy_recovery_calendar_path"), str)
+    ):
+        raise ShadowSignerError("Shadow key manifest shape is invalid")
+    private_key = Path(document["active_private_key_path"])
+    if not private_key.is_absolute() or private_key != Path(os.path.abspath(private_key)):
+        raise ShadowSignerError("Shadow private key path is invalid")
+    recovery_calendar = Path(document["legacy_recovery_calendar_path"])
+    if not recovery_calendar.is_absolute() or recovery_calendar != Path(
+        os.path.abspath(recovery_calendar)
+    ):
+        raise ShadowSignerError("Shadow recovery calendar path is invalid")
+    active_key_id = document["active_key_id"]
+    previous: dict[str, str] = {}
+    for key_id, public_key in document["previous_public_keys"].items():
+        if (
+            not isinstance(key_id, str)
+            or KEY_ID.fullmatch(key_id) is None
+            or key_id == active_key_id
+        ):
+            raise ShadowSignerError("Shadow previous key id is invalid")
+        previous[key_id] = _validate_public_key(public_key, label="Shadow previous public key")
+    return (
+        active_key_id,
+        private_key,
+        _public_key_from_private(private_key),
+        dict(sorted(previous.items())),
+        recovery_calendar,
+    )
+
+
+def _load_recovery_calendar(path: Path) -> frozenset[date]:
+    try:
+        document = json.loads(
+            _secure_file(
+                path,
+                mode=0o600,
+                label="Shadow recovery calendar",
+                maximum_bytes=MAX_CALENDAR_FILE_BYTES,
+            ),
+            object_pairs_hook=_unique_object,
+        )
+    except (TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ShadowSignerError("Shadow recovery calendar is invalid") from exc
+    expected = {
+        "schema_version",
+        "exchange",
+        "coverage_start",
+        "coverage_end",
+        "open_dates",
+        "content_sha256",
+    }
+    if (
+        not isinstance(document, dict)
+        or set(document) != expected
+        or type(document.get("schema_version")) is not int
+        or document["schema_version"] != 1
+        or document.get("exchange") != "SSE"
+        or not isinstance(document.get("coverage_start"), str)
+        or not isinstance(document.get("coverage_end"), str)
+        or not isinstance(document.get("open_dates"), list)
+        or not isinstance(document.get("content_sha256"), str)
+        or SHA256.fullmatch(document["content_sha256"]) is None
+    ):
+        raise ShadowSignerError("Shadow recovery calendar shape is invalid")
+    body = {key: value for key, value in document.items() if key != "content_sha256"}
+    if hashlib.sha256(_canonical_bytes(body)).hexdigest() != document["content_sha256"]:
+        raise ShadowSignerError("Shadow recovery calendar identity is invalid")
+    try:
+        coverage_start = date.fromisoformat(document["coverage_start"])
+        coverage_end = date.fromisoformat(document["coverage_end"])
+        open_dates = tuple(date.fromisoformat(value) for value in document["open_dates"])
+    except (TypeError, ValueError) as exc:
+        raise ShadowSignerError("Shadow recovery calendar dates are invalid") from exc
+    if (
+        coverage_start > coverage_end
+        or tuple(sorted(set(open_dates))) != open_dates
+        or any(item < coverage_start or item > coverage_end for item in open_dates)
+    ):
+        raise ShadowSignerError("Shadow recovery calendar coverage is invalid")
+    return frozenset(open_dates)
+
+
+def _read_boot_id() -> str:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            "/proc/sys/kernel/random/boot_id",
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+        )
+        observed = os.fstat(descriptor)
+        if not stat.S_ISREG(observed.st_mode) or observed.st_size > 128:
+            raise ShadowSignerError("Linux boot id source is unsafe")
+        value = os.read(descriptor, 129).decode("ascii").strip().lower()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ShadowSignerError("Linux boot id is unavailable") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    try:
+        return str(uuid.UUID(value))
+    except ValueError as exc:
+        raise ShadowSignerError("Linux boot id is invalid") from exc
+
+
+def _trusted_clock_snapshot() -> dict[str, object]:
+    if not hasattr(time, "CLOCK_REALTIME"):
+        raise ShadowSignerError("CLOCK_REALTIME is unavailable")
+    monotonic_clock = getattr(time, "CLOCK_BOOTTIME", None)
+    clock_source = "CLOCK_BOOTTIME"
+    if monotonic_clock is None:
+        monotonic_clock = getattr(time, "CLOCK_MONOTONIC", None)
+        clock_source = "CLOCK_MONOTONIC"
+    if monotonic_clock is None:
+        raise ShadowSignerError("a trusted monotonic clock is unavailable")
+    realtime_ns = time.clock_gettime_ns(time.CLOCK_REALTIME)
+    monotonic_ns = time.clock_gettime_ns(monotonic_clock)
+    wallclock = datetime.fromtimestamp(realtime_ns / 1_000_000_000, tz=_UTC)
+    return {
+        "wallclock_at": wallclock.isoformat(timespec="microseconds").replace("+00:00", "Z"),
+        "monotonic_ns": monotonic_ns,
+        "boot_id": _read_boot_id(),
+        "clock_source": clock_source,
+    }
+
+
+def _sign(private_key: Path, payload: bytes) -> str:
+    with tempfile.TemporaryDirectory(prefix="rquant-shadow-sign-") as directory:
+        payload_path = Path(directory) / "payload.bin"
+        payload_path.write_bytes(payload)
+        payload_path.chmod(0o600)
+        result = _run_openssl(
+            ["pkeyutl", "-sign", "-rawin", "-inkey", str(private_key), "-in", str(payload_path)]
+        )
+    if result.returncode != 0 or len(result.stdout) != 64:
+        raise ShadowSignerError("Shadow Ed25519 signing failed")
+    return base64.b64encode(result.stdout).decode("ascii")
+
+
+def _verify(public_key: str, payload: bytes, signature: str) -> bool:
+    if SIGNATURE.fullmatch(signature) is None:
+        return False
+    try:
+        decoded = base64.b64decode(signature, validate=True)
+    except (TypeError, ValueError):
+        return False
+    with tempfile.TemporaryDirectory(prefix="rquant-shadow-verify-") as directory:
+        root = Path(directory)
+        public_path = root / "public.pem"
+        payload_path = root / "payload.bin"
+        signature_path = root / "signature.bin"
+        public_path.write_text(public_key, encoding="utf-8")
+        payload_path.write_bytes(payload)
+        signature_path.write_bytes(decoded)
+        for path in (public_path, payload_path, signature_path):
+            path.chmod(0o600)
+        result = _run_openssl(
+            [
+                "pkeyutl",
+                "-verify",
+                "-pubin",
+                "-inkey",
+                str(public_path),
+                "-sigfile",
+                str(signature_path),
+                "-rawin",
+                "-in",
+                str(payload_path),
+            ]
+        )
+    return result.returncode == 0
+
+
+def _domain_payload(*, namespace: str, payload: bytes) -> bytes:
+    return _canonical_bytes(
+        {
+            "contract": "rquant-ed25519-domain-separation/v1",
+            "namespace": namespace,
+            "payload_sha256": hashlib.sha256(payload).hexdigest(),
+        }
+    )
+
+
+def _parse_utc(value: object, *, label: str) -> datetime:
+    if not isinstance(value, str) or len(value) > 64:
+        raise ShadowSignerError(f"{label} is invalid")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ShadowSignerError(f"{label} is invalid") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ShadowSignerError(f"{label} is invalid")
+    return parsed.astimezone(_UTC)
+
+
+def _utc_text(value: datetime) -> str:
+    return value.astimezone(_UTC).isoformat().replace("+00:00", "Z")
+
+
+def _validated_clock(value: object) -> tuple[datetime, int, str, str]:
+    expected = {"wallclock_at", "monotonic_ns", "boot_id", "clock_source"}
+    if (
+        not isinstance(value, dict)
+        or set(value) != expected
+        or type(value.get("monotonic_ns")) is not int
+        or value["monotonic_ns"] < 0
+        or not isinstance(value.get("boot_id"), str)
+        or BOOT_ID.fullmatch(value["boot_id"]) is None
+        or value.get("clock_source") not in {"CLOCK_BOOTTIME", "CLOCK_MONOTONIC"}
+    ):
+        raise ShadowSignerError("trusted recovery clock is invalid")
+    try:
+        boot_id = str(uuid.UUID(value["boot_id"]))
+    except ValueError as exc:
+        raise ShadowSignerError("trusted recovery boot id is invalid") from exc
+    return (
+        _parse_utc(value.get("wallclock_at"), label="trusted recovery wallclock"),
+        value["monotonic_ns"],
+        boot_id,
+        value["clock_source"],
+    )
+
+
+def _require_recovery_window(
+    *,
+    trade_date: date,
+    wallclock: datetime,
+    open_dates: frozenset[date],
+) -> None:
+    local = wallclock.astimezone(SHANGHAI)
+    session_close = datetime.combine(trade_date, datetime_time(15, 0), tzinfo=SHANGHAI)
+    if (
+        trade_date not in open_dates
+        or local.date() != trade_date
+        or not session_close <= local <= session_close + RECOVERY_WINDOW
+    ):
+        raise ShadowSignerError("legacy recovery signing is outside the trusted publish window")
+
+
+def _decode_request(payload: bytes) -> dict[str, object]:
+    if not payload or len(payload) > MAX_REQUEST_BYTES:
+        raise ShadowSignerError("Shadow signing request size is invalid")
+    try:
+        request = json.loads(payload, object_pairs_hook=_unique_object)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ShadowSignerError("Shadow signing request is invalid JSON") from exc
+    expected = {
+        "schema_version",
+        "operation",
+        "request_id",
+        "key_id",
+        "namespace",
+        "payload_base64",
+        "payload_sha256",
+    }
+    operation = request.get("operation") if isinstance(request, dict) else None
+    namespace = request.get("namespace") if isinstance(request, dict) else None
+    if operation == "sign" and namespace == RECOVERY_NAMESPACE:
+        raise ShadowSignerError("generic recovery signing is forbidden")
+    recovery_operation = operation in {
+        "capture-recovery",
+        "sign-recovery",
+        "resume-recovery",
+    }
+    if (
+        not isinstance(request, dict)
+        or set(request) != expected
+        or type(request.get("schema_version")) is not int
+        or request["schema_version"] != (2 if recovery_operation else 1)
+        or operation not in {"sign", "capture-recovery", "sign-recovery", "resume-recovery"}
+        or not isinstance(request.get("request_id"), str)
+        or SHA256.fullmatch(request["request_id"]) is None
+        or not isinstance(request.get("key_id"), str)
+        or KEY_ID.fullmatch(request["key_id"]) is None
+        or namespace not in NAMESPACES
+        or (recovery_operation and namespace != RECOVERY_NAMESPACE)
+        or (not recovery_operation and namespace == RECOVERY_NAMESPACE)
+        or not isinstance(request.get("payload_base64"), str)
+        or not isinstance(request.get("payload_sha256"), str)
+        or SHA256.fullmatch(request["payload_sha256"]) is None
+    ):
+        raise ShadowSignerError("Shadow signing request shape is invalid")
+    try:
+        decoded = base64.b64decode(request["payload_base64"], validate=True)
+    except (TypeError, ValueError) as exc:
+        raise ShadowSignerError("Shadow signing payload is invalid") from exc
+    if not decoded or len(decoded) > MAX_REQUEST_BYTES:
+        raise ShadowSignerError("Shadow signing payload size is invalid")
+    if hashlib.sha256(decoded).hexdigest() != request["payload_sha256"]:
+        raise ShadowSignerError("Shadow signing payload hash is invalid")
+    identity = {
+        "contract": (
+            "runtime-shadow-signing-request/v2"
+            if recovery_operation
+            else "runtime-shadow-signing-request/v1"
+        ),
+        "key_id": request["key_id"],
+        "namespace": namespace,
+        "payload_sha256": request["payload_sha256"],
+    }
+    if recovery_operation:
+        identity["operation"] = operation
+    if hashlib.sha256(_canonical_bytes(identity)).hexdigest() != request["request_id"]:
+        raise ShadowSignerError("Shadow signing request identity is invalid")
+    if recovery_operation:
+        try:
+            decoded_document = json.loads(decoded, object_pairs_hook=_unique_object)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ShadowSignerError("legacy recovery request payload is invalid") from exc
+        if _canonical_bytes(decoded_document) != decoded:
+            raise ShadowSignerError("legacy recovery request payload is not canonical")
+    return request
+
+
+def _export_public_keyring(keys_path: Path) -> None:
+    active_key_id, _private_key, active_public_key, previous, _calendar = _load_keys(keys_path)
+    sys.stdout.buffer.write(
+        _canonical_bytes(
+            {
+                "schema_version": 1,
+                "active_key_id": active_key_id,
+                "active_public_key": active_public_key,
+                "previous_public_keys": previous,
+            }
+        )
+    )
+
+
+def _request_document(request: dict[str, object]) -> dict[str, object]:
+    try:
+        payload = base64.b64decode(str(request["payload_base64"]), validate=True)
+        document = json.loads(payload, object_pairs_hook=_unique_object)
+    except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ShadowSignerError("legacy recovery request document is invalid") from exc
+    if not isinstance(document, dict) or _canonical_bytes(document) != payload:
+        raise ShadowSignerError("legacy recovery request document is invalid")
+    return document
+
+
+def _validate_recovery_binding(
+    document: object,
+    *,
+    contract: str,
+    extra_fields: frozenset[str] = frozenset(),
+) -> tuple[date, dict[str, object]]:
+    expected = {
+        "contract",
+        "trade_date",
+        "source_id",
+        "producer_commit",
+        "producer_version",
+        "staging_name",
+        *extra_fields,
+    }
+    if (
+        not isinstance(document, dict)
+        or set(document) != expected
+        or document.get("contract") != contract
+        or not isinstance(document.get("trade_date"), str)
+        or not isinstance(document.get("source_id"), str)
+        or not 0 < len(document["source_id"]) <= 256
+        or not isinstance(document.get("producer_commit"), str)
+        or COMMIT.fullmatch(document["producer_commit"]) is None
+        or not isinstance(document.get("producer_version"), str)
+        or not 0 < len(document["producer_version"]) <= 256
+        or not isinstance(document.get("staging_name"), str)
+        or STAGING_NAME.fullmatch(document["staging_name"]) is None
+    ):
+        raise ShadowSignerError("legacy recovery binding shape is invalid")
+    try:
+        trade_date = date.fromisoformat(document["trade_date"])
+    except ValueError as exc:
+        raise ShadowSignerError("legacy recovery trade date is invalid") from exc
+    if not document["staging_name"].startswith(f".staging-{trade_date.isoformat()}-"):
+        raise ShadowSignerError("legacy recovery staging date is invalid")
+    return trade_date, dict(document)
+
+
+def _open_absolute_directory(path: Path, *, label: str) -> int:
+    if not path.is_absolute() or path != Path(os.path.abspath(path)):
+        raise ShadowSignerError(f"{label} path is invalid")
+    descriptor = -1
+    try:
+        descriptor = os.open(path.anchor, _DIRECTORY_FLAGS)
+        for component in path.parts[1:]:
+            child = os.open(component, _DIRECTORY_FLAGS, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        observed = os.fstat(descriptor)
+        if not stat.S_ISDIR(observed.st_mode):
+            raise ShadowSignerError(f"{label} is unsafe")
+        return descriptor
+    except OSError as exc:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise ShadowSignerError(f"{label} is unavailable") from exc
+
+
+def _source_components(source_id: object) -> tuple[str, ...]:
+    if source_id == "legacy-monitor-events":
+        return ("monitor",)
+    if source_id == "legacy-surge-jsonl":
+        return ("surge",)
+    isolated_sources = {
+        "strategy.n_shape.v1": "n_shape",
+        "strategy.growth_board_surge.v1": "growth_board_surge",
+    }
+    if source_id in isolated_sources:
+        strategy_id = isolated_sources[source_id]
+        return ("isolated-runners", strategy_id)
+    raise ShadowSignerError("legacy recovery source is invalid")
+
+
+def _open_trusted_staging(*, source_id: object, staging_name: object) -> int:
+    if not isinstance(staging_name, str) or STAGING_NAME.fullmatch(staging_name) is None:
+        raise ShadowSignerError("legacy recovery staging name is invalid")
+    descriptor = _open_absolute_directory(
+        LEGACY_SHADOW_ROOT,
+        label="legacy recovery trusted root",
+    )
+    try:
+        for component in (*_source_components(source_id), staging_name):
+            child = os.open(component, _DIRECTORY_FLAGS, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        observed = os.fstat(descriptor)
+        if not stat.S_ISDIR(observed.st_mode):
+            raise ShadowSignerError("legacy recovery staging is unsafe")
+        return descriptor
+    except OSError as exc:
+        os.close(descriptor)
+        raise ShadowSignerError("legacy recovery staging is unavailable") from exc
+
+
+def _read_staging_artifact(
+    directory_descriptor: int,
+    filename: str,
+    *,
+    directory_owner: int,
+) -> tuple[bytes, os.stat_result]:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            filename,
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=directory_descriptor,
+        )
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != directory_owner
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) != 0o444
+            or before.st_size < 0
+            or before.st_size > MAX_EXPORT_BYTES
+        ):
+            raise ShadowSignerError(f"legacy recovery artifact {filename} is unsafe")
+        payload = bytearray()
+        while len(payload) <= MAX_EXPORT_BYTES:
+            chunk = os.read(
+                descriptor,
+                min(READ_CHUNK_BYTES, MAX_EXPORT_BYTES + 1 - len(payload)),
+            )
+            if not chunk:
+                break
+            payload.extend(chunk)
+        if len(payload) > MAX_EXPORT_BYTES:
+            raise ShadowSignerError(f"legacy recovery artifact {filename} is oversized")
+        after = os.fstat(descriptor)
+        rebound = os.stat(filename, dir_fd=directory_descriptor, follow_symlinks=False)
+        identity = (
+            "st_dev",
+            "st_ino",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+            "st_nlink",
+        )
+        if (
+            len(payload) != before.st_size
+            or any(getattr(before, key) != getattr(after, key) for key in identity)
+            or any(getattr(before, key) != getattr(rebound, key) for key in identity)
+        ):
+            raise ShadowSignerError(f"legacy recovery artifact {filename} changed while read")
+        return bytes(payload), before
+    except ShadowSignerError:
+        raise
+    except OSError as exc:
+        raise ShadowSignerError(f"legacy recovery artifact {filename} is unavailable") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _canonical_document(payload: bytes, *, label: str) -> object:
+    try:
+        document = json.loads(payload, object_pairs_hook=_unique_object)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ShadowSignerError(f"{label} is invalid") from exc
+    if _canonical_bytes(document) != payload:
+        raise ShadowSignerError(f"{label} is not canonical")
+    return document
+
+
+def _canonical_jsonl_count(payload: bytes, *, label: str) -> int:
+    if not payload:
+        return 0
+    if not payload.endswith(b"\n"):
+        raise ShadowSignerError(f"{label} is not canonical")
+    lines = payload.splitlines()
+    for line in lines:
+        _canonical_document(line, label=label)
+    return len(lines)
+
+
+_CONTRACT_DATE_FIELDS = frozenset({"trade_date"})
+_CONTRACT_DATETIME_FIELDS = frozenset(
+    {
+        "as_of",
+        "captured_at",
+        "complete_through",
+        "available_at",
+        "event_time",
+        "expires_at",
+        "first_success_at",
+        "finalized_at",
+        "last_success_at",
+        "produced_at",
+        "session_close_at",
+        "started_at",
+    }
+)
+
+
+def _contract_canonical_value(value: object, *, field_name: str | None = None) -> object:
+    if field_name in _CONTRACT_DATE_FIELDS:
+        if not isinstance(value, str):
+            raise ShadowSignerError(f"legacy recovery {field_name} is invalid")
+        try:
+            parsed_date = date.fromisoformat(value)
+        except ValueError as exc:
+            raise ShadowSignerError(f"legacy recovery {field_name} is invalid") from exc
+        return {"$date": parsed_date.isoformat()}
+    if field_name in _CONTRACT_DATETIME_FIELDS:
+        parsed_datetime = _parse_utc(value, label=f"legacy recovery {field_name}")
+        return {"$datetime": parsed_datetime.isoformat(timespec="microseconds")}
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if value != value or value in {float("inf"), float("-inf")}:
+            raise ShadowSignerError("legacy recovery numeric value is invalid")
+        return {"$float": repr(value)}
+    if isinstance(value, dict):
+        if any(not isinstance(key, str) for key in value):
+            raise ShadowSignerError("legacy recovery object key is invalid")
+        return {key: _contract_canonical_value(value[key], field_name=key) for key in sorted(value)}
+    if isinstance(value, list):
+        return [_contract_canonical_value(item) for item in value]
+    raise ShadowSignerError("legacy recovery canonical value is invalid")
+
+
+def _contract_sha256(value: object) -> str:
+    return hashlib.sha256(_canonical_bytes(_contract_canonical_value(value))).hexdigest()
+
+
+def _artifact_batch_digest(artifacts: dict[str, bytes]) -> str:
+    digest = hashlib.sha256()
+    for filename in sorted(artifacts):
+        payload = artifacts[filename]
+        digest.update(len(filename).to_bytes(4, "big"))
+        digest.update(filename.encode("ascii"))
+        digest.update(len(payload).to_bytes(8, "big"))
+        digest.update(hashlib.sha256(payload).digest())
+    return digest.hexdigest()
+
+
+def _monitor_input_identity(records: list[object], *, draft: dict[str, object]) -> str:
+    digest = hashlib.sha256()
+    raw_bytes = 0
+    for record in records:
+        payload = _canonical_bytes(record)
+        digest.update(len(payload).to_bytes(8, "big"))
+        digest.update(payload)
+        raw_bytes += len(payload)
+    return _contract_sha256(
+        {
+            "contract": "shadow-legacy-record-stream/v2",
+            "descriptor": {
+                "source_id": draft["source_id"],
+                "trade_date": draft["trade_date"],
+            },
+            "records_sha256": digest.hexdigest(),
+            "record_count": len(records),
+            "raw_bytes": raw_bytes,
+        }
+    )
+
+
+def _surge_input_identity(payload: bytes, *, draft: dict[str, object]) -> str:
+    return _contract_sha256(
+        {
+            "contract": "shadow-legacy-surge-raw-input/v2",
+            "descriptor": {
+                "source_id": draft["source_id"],
+                "trade_date": draft["trade_date"],
+                "format": "jsonl",
+            },
+            "records_sha256": hashlib.sha256(payload).hexdigest(),
+            "record_count": _canonical_jsonl_count(
+                payload,
+                label="legacy recovery surge records",
+            ),
+            "raw_bytes": len(payload),
+        }
+    )
+
+
+def _isolated_input_identity(
+    completed_batch: dict[str, object],
+    *,
+    draft: dict[str, object],
+) -> str:
+    snapshot = completed_batch.get("snapshot")
+    records = completed_batch.get("records")
+    if (
+        not isinstance(snapshot, dict)
+        or not isinstance(snapshot.get("descriptor"), dict)
+        or not isinstance(records, list)
+    ):
+        raise ShadowSignerError("legacy recovery isolated batch shape is invalid")
+    descriptor = snapshot["descriptor"]
+    required = {
+        "source_id",
+        "generation_id",
+        "strategy_spec_fingerprint",
+        "first_sequence",
+        "high_watermark",
+    }
+    if (
+        not required.issubset(descriptor)
+        or descriptor["source_id"] != draft["source_id"]
+        or type(descriptor["first_sequence"]) is not int
+        or type(descriptor["high_watermark"]) is not int
+    ):
+        raise ShadowSignerError("legacy recovery isolated descriptor is invalid")
+    chain = _contract_sha256(
+        {
+            "contract": "runner-session-segment-chain/v1",
+            "trade_date": draft["trade_date"],
+            "runner_generation_id": descriptor["generation_id"],
+            "strategy_spec_fingerprint": descriptor["strategy_spec_fingerprint"],
+        }
+    )
+    expected_sequence = descriptor["first_sequence"]
+    raw_bytes = 0
+    for record in records:
+        if (
+            not isinstance(record, dict)
+            or type(record.get("sequence")) is not int
+            or record["sequence"] != expected_sequence
+        ):
+            raise ShadowSignerError("legacy recovery isolated sequence is invalid")
+        payload = _canonical_bytes(record)
+        chain = _contract_sha256(
+            {
+                "previous": chain,
+                "record_sha256": hashlib.sha256(payload).hexdigest(),
+                "record_bytes": len(payload),
+                "sequence": expected_sequence,
+            }
+        )
+        raw_bytes += len(payload)
+        expected_sequence += 1
+    if len(records) != descriptor["high_watermark"] - descriptor["first_sequence"] + 1:
+        raise ShadowSignerError("legacy recovery isolated record count is invalid")
+    return _contract_sha256(
+        {
+            "contract": "shadow-runner-session-raw-input/v3",
+            "descriptor": {
+                "source_id": descriptor["source_id"],
+                "generation_id": descriptor["generation_id"],
+                "strategy_spec_fingerprint": descriptor["strategy_spec_fingerprint"],
+                "first_sequence": descriptor["first_sequence"],
+                "high_watermark": descriptor["high_watermark"],
+                "trade_date": draft["trade_date"],
+            },
+            "records_chain_hash": chain,
+            "record_count": len(records),
+            "raw_bytes": raw_bytes,
+        }
+    )
+
+
+def _write_all(descriptor: int, payload: bytes) -> None:
+    offset = 0
+    while offset < len(payload):
+        written = os.write(descriptor, payload[offset:])
+        if written <= 0:
+            raise ShadowSignerError("legacy recovery protected write failed")
+        offset += written
+
+
+def _capture_token_identity(capture: dict[str, object]) -> str:
+    return hashlib.sha256(_canonical_bytes(capture)).hexdigest()
+
+
+def _open_recovery_state_root() -> int:
+    descriptor = _open_absolute_directory(
+        RECOVERY_STATE_ROOT,
+        label="legacy recovery state root",
+    )
+    observed = os.fstat(descriptor)
+    expected_owner = 0 if os.geteuid() == 0 else os.geteuid()
+    if (
+        not stat.S_ISDIR(observed.st_mode)
+        or observed.st_uid != expected_owner
+        or stat.S_IMODE(observed.st_mode) != 0o700
+    ):
+        os.close(descriptor)
+        raise ShadowSignerError("legacy recovery state root is unsafe")
+    return descriptor
+
+
+def _transaction_identity(capture: dict[str, object]) -> str:
+    return _contract_sha256(
+        {
+            "contract": "legacy-shadow-recovery-transaction-identity/v1",
+            "capture_token_id": _capture_token_identity(capture),
+        }
+    )
+
+
+def _journal_names(transaction_id: str) -> tuple[str, str]:
+    return (
+        f"transaction-{transaction_id}.prepared.json",
+        f"transaction-{transaction_id}.committed.json",
+    )
+
+
+def _capture_seed_name(transaction_id: str) -> str:
+    return f"transaction-{transaction_id}.capture-seed.json"
+
+
+def _prepared_seed_name(transaction_id: str) -> str:
+    return f"transaction-{transaction_id}.prepared-seed.json"
+
+
+def _committed_seed_name(transaction_id: str) -> str:
+    return f"transaction-{transaction_id}.committed-seed.json"
+
+
+def _lock_recovery_state(state_descriptor: int) -> None:
+    try:
+        fcntl.flock(state_descriptor, fcntl.LOCK_EX)
+    except OSError as exc:
+        raise ShadowSignerError("legacy recovery state lock is unavailable") from exc
+
+
+def _read_protected_file_at(
+    directory_descriptor: int,
+    filename: str,
+    *,
+    label: str,
+    allowed_modes: frozenset[int],
+    maximum_bytes: int = MAX_REQUEST_BYTES * 8,
+) -> bytes:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            filename,
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=directory_descriptor,
+        )
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_uid != os.geteuid()
+            or stat.S_IMODE(before.st_mode) not in allowed_modes
+            or before.st_size < 0
+            or before.st_size > maximum_bytes
+        ):
+            raise ShadowSignerError(f"{label} is unsafe")
+        payload = bytearray()
+        while len(payload) <= maximum_bytes:
+            chunk = os.read(
+                descriptor,
+                min(READ_CHUNK_BYTES, maximum_bytes + 1 - len(payload)),
+            )
+            if not chunk:
+                break
+            payload.extend(chunk)
+        after = os.fstat(descriptor)
+        rebound = os.stat(filename, dir_fd=directory_descriptor, follow_symlinks=False)
+        identity = (
+            "st_dev",
+            "st_ino",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+            "st_nlink",
+        )
+        if (
+            len(payload) > maximum_bytes
+            or len(payload) != before.st_size
+            or any(getattr(before, key) != getattr(after, key) for key in identity)
+            or any(getattr(before, key) != getattr(rebound, key) for key in identity)
+        ):
+            raise ShadowSignerError(f"{label} changed while read")
+        return bytes(payload)
+    except ShadowSignerError:
+        raise
+    except OSError as exc:
+        raise ShadowSignerError(f"{label} is unavailable") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _load_journal_at(
+    state_descriptor: int,
+    filename: str,
+) -> tuple[dict[str, object], bytes] | None:
+    try:
+        payload = _read_protected_file_at(
+            state_descriptor,
+            filename,
+            label="legacy recovery transaction journal",
+            allowed_modes=frozenset({0o600}),
+        )
+    except ShadowSignerError as exc:
+        try:
+            os.stat(filename, dir_fd=state_descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        raise exc
+    document = _canonical_document(
+        payload,
+        label="legacy recovery transaction journal",
+    )
+    if not isinstance(document, dict):
+        raise ShadowSignerError("legacy recovery transaction journal is invalid")
+    return document, payload
+
+
+def _load_prepared_journal_at(
+    state_descriptor: int,
+    filename: str,
+) -> tuple[Optional[tuple[dict[str, object], bytes]], bool]:  # noqa: UP045
+    try:
+        payload = _read_protected_file_at(
+            state_descriptor,
+            filename,
+            label="legacy recovery prepared journal",
+            allowed_modes=frozenset({0o600}),
+        )
+    except ShadowSignerError as exc:
+        try:
+            os.stat(filename, dir_fd=state_descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            return None, False
+        raise exc
+    try:
+        document = json.loads(payload, object_pairs_hook=_unique_object)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None, True
+    if _canonical_bytes(document) != payload:
+        raise ShadowSignerError("legacy recovery prepared journal is not canonical")
+    if not isinstance(document, dict):
+        raise ShadowSignerError("legacy recovery prepared journal is invalid")
+    return (document, payload), False
+
+
+def _load_committed_journal_at(
+    state_descriptor: int,
+    filename: str,
+) -> tuple[Optional[tuple[dict[str, object], bytes]], Optional[bytes]]:  # noqa: UP045
+    try:
+        payload = _read_protected_file_at(
+            state_descriptor,
+            filename,
+            label="legacy recovery committed journal",
+            allowed_modes=frozenset({0o600}),
+        )
+    except ShadowSignerError as exc:
+        try:
+            os.stat(filename, dir_fd=state_descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            return None, None
+        raise exc
+    try:
+        document = json.loads(payload, object_pairs_hook=_unique_object)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None, payload
+    if _canonical_bytes(document) != payload:
+        raise ShadowSignerError("legacy recovery committed journal is not canonical")
+    if not isinstance(document, dict):
+        raise ShadowSignerError("legacy recovery committed journal is invalid")
+    return (document, payload), None
+
+
+def _write_new_with_fault(
+    descriptor: int,
+    payload: bytes,
+    *,
+    fault_point: str | None,
+) -> None:
+    if fault_point is None:
+        _write_all(descriptor, payload)
+        return
+    split = max(1, len(payload) // 2)
+    _write_all(descriptor, payload[:split])
+    _test_fault(fault_point)
+    _write_all(descriptor, payload[split:])
+
+
+def _cleanup_journal_temps_at(
+    state_descriptor: int,
+    filename: str,
+) -> None:
+    pattern = re.compile(rf"^{re.escape('.' + filename + '.tmp-')}[0-9a-f]{{32}}$")
+    try:
+        names = tuple(os.listdir(state_descriptor))
+    except OSError as exc:
+        raise ShadowSignerError("legacy recovery journal temp scan failed") from exc
+    matches = tuple(name for name in names if pattern.fullmatch(name))
+    if len(matches) > 32:
+        raise ShadowSignerError("legacy recovery journal temp budget exceeded")
+    removed = False
+    for name in matches:
+        try:
+            observed = os.stat(name, dir_fd=state_descriptor, follow_symlinks=False)
+        except OSError as exc:
+            raise ShadowSignerError("legacy recovery journal temp is unavailable") from exc
+        if (
+            not stat.S_ISREG(observed.st_mode)
+            or observed.st_uid != os.geteuid()
+            or observed.st_nlink != 1
+            or stat.S_IMODE(observed.st_mode) != 0o600
+        ):
+            raise ShadowSignerError("legacy recovery journal temp is unsafe")
+        try:
+            os.unlink(name, dir_fd=state_descriptor)
+        except OSError as exc:
+            raise ShadowSignerError("legacy recovery journal temp cleanup failed") from exc
+        removed = True
+    if removed:
+        try:
+            os.fsync(state_descriptor)
+        except OSError as exc:
+            raise ShadowSignerError("legacy recovery journal temp cleanup failed") from exc
+
+
+def _cleanup_committed_replace_temps_at(
+    state_descriptor: int,
+    committed_name: str,
+) -> None:
+    prefix = f".{committed_name}.replace-"
+    pattern = re.compile(rf"^{re.escape(prefix)}[0-9a-f]{{32}}$")
+    try:
+        names = tuple(os.listdir(state_descriptor))
+    except OSError as exc:
+        raise ShadowSignerError("legacy recovery committed repair temp scan failed") from exc
+    candidates = tuple(sorted(name for name in names if name.startswith(prefix)))
+    if len(candidates) > 32 or any(pattern.fullmatch(name) is None for name in candidates):
+        raise ShadowSignerError("legacy recovery committed repair temp name is unsafe")
+    expected_owner = 0 if os.geteuid() == 0 else os.geteuid()
+    validated: list[tuple[str, int, int]] = []
+    for name in candidates:
+        descriptor = -1
+        try:
+            named = os.stat(name, dir_fd=state_descriptor, follow_symlinks=False)
+            descriptor = os.open(
+                name,
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=state_descriptor,
+            )
+            opened = os.fstat(descriptor)
+        except OSError as exc:
+            raise ShadowSignerError(
+                "legacy recovery committed repair temp is unsafe"
+            ) from exc
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        if (
+            not stat.S_ISREG(named.st_mode)
+            or not stat.S_ISREG(opened.st_mode)
+            or named.st_uid != expected_owner
+            or opened.st_uid != expected_owner
+            or named.st_nlink != 1
+            or opened.st_nlink != 1
+            or stat.S_IMODE(named.st_mode) != 0o600
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino)
+        ):
+            raise ShadowSignerError("legacy recovery committed repair temp is unsafe")
+        validated.append((name, named.st_dev, named.st_ino))
+    for name, device, inode in validated:
+        try:
+            rebound = os.stat(name, dir_fd=state_descriptor, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(rebound.st_mode)
+                or rebound.st_uid != expected_owner
+                or rebound.st_nlink != 1
+                or stat.S_IMODE(rebound.st_mode) != 0o600
+                or (rebound.st_dev, rebound.st_ino) != (device, inode)
+            ):
+                raise ShadowSignerError(
+                    "legacy recovery committed repair temp changed before cleanup"
+                )
+            os.unlink(name, dir_fd=state_descriptor)
+        except ShadowSignerError:
+            raise
+        except OSError as exc:
+            raise ShadowSignerError(
+                "legacy recovery committed repair temp cleanup failed"
+            ) from exc
+    if validated:
+        try:
+            os.fsync(state_descriptor)
+        except OSError as exc:
+            raise ShadowSignerError(
+                "legacy recovery committed repair temp cleanup failed"
+            ) from exc
+
+
+def _publish_atomic_journal_at(
+    state_descriptor: int,
+    filename: str,
+    payload: bytes,
+    *,
+    label: str,
+    fault_prefix: str | None = None,
+) -> None:
+    _cleanup_journal_temps_at(state_descriptor, filename)
+    try:
+        existing = _read_protected_file_at(
+            state_descriptor,
+            filename,
+            label=label,
+            allowed_modes=frozenset({0o600}),
+        )
+    except ShadowSignerError as exc:
+        try:
+            os.stat(filename, dir_fd=state_descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            existing = None
+        else:
+            raise exc
+    if existing is not None:
+        if existing == payload:
+            return
+        raise ShadowSignerError(f"{label} conflicts with existing state")
+
+    temporary = f".{filename}.tmp-{uuid.uuid4().hex}"
+    descriptor = -1
+    renamed = False
+    try:
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=state_descriptor,
+        )
+        if fault_prefix is None:
+            _write_all(descriptor, payload)
+        else:
+            split = max(1, len(payload) // 2)
+            _write_all(descriptor, payload[:split])
+            os.fsync(descriptor)
+            _test_fault(f"{fault_prefix}-temp-write")
+            _write_all(descriptor, payload[split:])
+        os.fchmod(descriptor, 0o600)
+        os.fsync(descriptor)
+        if fault_prefix is not None:
+            _test_fault(f"{fault_prefix}-before-rename")
+        os.rename(
+            temporary,
+            filename,
+            src_dir_fd=state_descriptor,
+            dst_dir_fd=state_descriptor,
+        )
+        renamed = True
+        if fault_prefix is not None:
+            _test_fault(f"{fault_prefix}-after-rename")
+            _test_fault(f"{fault_prefix}-before-dir-fsync")
+        os.fsync(state_descriptor)
+        if fault_prefix is not None:
+            _test_fault(f"{fault_prefix}-after-dir-fsync")
+    except ShadowSignerError:
+        raise
+    except OSError as exc:
+        raise ShadowSignerError(f"{label} atomic publish failed") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if not renamed:
+            with suppress(FileNotFoundError):
+                os.unlink(temporary, dir_fd=state_descriptor)
+
+
+def _publish_exact_file_at(
+    directory_descriptor: int,
+    filename: str,
+    payload: bytes,
+    *,
+    mode: int,
+    label: str,
+    fault_point: str | None = None,
+) -> None:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            filename,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=directory_descriptor,
+        )
+    except FileExistsError:
+        existing = _read_protected_file_at(
+            directory_descriptor,
+            filename,
+            label=label,
+            allowed_modes=frozenset({0o600, mode}),
+        )
+        if (
+            existing == payload
+            and stat.S_IMODE(
+                os.stat(filename, dir_fd=directory_descriptor, follow_symlinks=False).st_mode
+            )
+            == mode
+        ):
+            return
+        repair_name = f".{filename}.repair-{uuid.uuid4().hex}"
+        repair_descriptor = -1
+        try:
+            repair_descriptor = os.open(
+                repair_name,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+                dir_fd=directory_descriptor,
+            )
+            _write_all(repair_descriptor, payload)
+            os.fchmod(repair_descriptor, mode)
+            os.fsync(repair_descriptor)
+            os.rename(
+                repair_name,
+                filename,
+                src_dir_fd=directory_descriptor,
+                dst_dir_fd=directory_descriptor,
+            )
+            os.fsync(directory_descriptor)
+            return
+        except OSError as exc:
+            raise ShadowSignerError(f"{label} repair failed") from exc
+        finally:
+            if repair_descriptor >= 0:
+                os.close(repair_descriptor)
+            with suppress(FileNotFoundError):
+                os.unlink(repair_name, dir_fd=directory_descriptor)
+    except OSError as exc:
+        raise ShadowSignerError(f"{label} publish failed") from exc
+    try:
+        _write_new_with_fault(descriptor, payload, fault_point=fault_point)
+        os.fchmod(descriptor, mode)
+        os.fsync(descriptor)
+        os.fsync(directory_descriptor)
+    except ShadowSignerError:
+        raise
+    except OSError as exc:
+        raise ShadowSignerError(f"{label} publish failed") from exc
+    finally:
+        os.close(descriptor)
+
+
+def _publish_new_exact_file_at(
+    directory_descriptor: int,
+    filename: str,
+    payload: bytes,
+    *,
+    mode: int,
+    label: str,
+    fault_point: str | None = None,
+) -> None:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            filename,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=directory_descriptor,
+        )
+    except FileExistsError as exc:
+        raise ShadowSignerError(f"{label} conflicts with existing state") from exc
+    except OSError as exc:
+        raise ShadowSignerError(f"{label} publish failed") from exc
+    try:
+        _write_new_with_fault(descriptor, payload, fault_point=fault_point)
+        os.fchmod(descriptor, mode)
+        os.fsync(descriptor)
+        os.fsync(directory_descriptor)
+    except ShadowSignerError:
+        raise
+    except OSError as exc:
+        raise ShadowSignerError(f"{label} publish failed") from exc
+    finally:
+        os.close(descriptor)
+
+
+def _exact_file_at(
+    directory_descriptor: int,
+    filename: str,
+    payload: bytes,
+    *,
+    mode: int,
+    label: str,
+) -> bool:
+    try:
+        existing = _read_protected_file_at(
+            directory_descriptor,
+            filename,
+            label=label,
+            allowed_modes=frozenset({0o600, mode}),
+        )
+    except ShadowSignerError as exc:
+        try:
+            os.stat(filename, dir_fd=directory_descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        raise exc
+    observed = os.stat(filename, dir_fd=directory_descriptor, follow_symlinks=False)
+    return existing == payload and stat.S_IMODE(observed.st_mode) == mode
+
+
+def _replace_journal_at(
+    state_descriptor: int,
+    filename: str,
+    payload: bytes,
+    *,
+    fault_prefix: str | None = None,
+) -> None:
+    temporary = f".{filename}.replace-{uuid.uuid4().hex}"
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=state_descriptor,
+        )
+        _write_all(descriptor, payload)
+        os.fchmod(descriptor, 0o600)
+        os.fsync(descriptor)
+        if fault_prefix is not None:
+            _test_fault(f"{fault_prefix}-after-temp-fsync")
+            _test_fault(f"{fault_prefix}-before-rename")
+        os.rename(
+            temporary,
+            filename,
+            src_dir_fd=state_descriptor,
+            dst_dir_fd=state_descriptor,
+        )
+        if fault_prefix is not None:
+            _test_fault(f"{fault_prefix}-after-rename")
+        os.fsync(state_descriptor)
+        if fault_prefix is not None:
+            _test_fault(f"{fault_prefix}-after-dir-fsync")
+    except OSError as exc:
+        raise ShadowSignerError("legacy recovery journal update failed") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        with suppress(FileNotFoundError):
+            os.unlink(temporary, dir_fd=state_descriptor)
+
+
+def _protect_transaction_files(
+    directory_descriptor: int,
+    filenames: frozenset[str],
+    *,
+    finalized: bool,
+) -> None:
+    protected_owner = 0 if os.geteuid() == 0 else os.geteuid()
+    for filename in sorted(filenames):
+        descriptor = os.open(
+            filename,
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=directory_descriptor,
+        )
+        try:
+            observed = os.fstat(descriptor)
+            if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
+                raise ShadowSignerError("legacy recovery protected artifact is unsafe")
+            if os.geteuid() == 0:
+                os.fchown(descriptor, protected_owner, -1)
+            os.fchmod(descriptor, 0o444)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    if os.geteuid() == 0:
+        os.fchown(directory_descriptor, protected_owner, -1)
+    os.fchmod(directory_descriptor, 0o555 if finalized else 0o700)
+    os.fsync(directory_descriptor)
+
+
+def _inspect_complete_staging(
+    directory_descriptor: int,
+    *,
+    draft: dict[str, object],
+    capture: dict[str, object],
+) -> tuple[os.stat_result, dict[str, str], str]:
+    directory_before = os.fstat(directory_descriptor)
+    if not stat.S_ISDIR(directory_before.st_mode) or stat.S_IMODE(directory_before.st_mode) not in {
+        0o700,
+        0o555,
+    }:
+        raise ShadowSignerError("legacy recovery staging is unsafe")
+    records_filename = (
+        "events.json"
+        if draft["source_id"] == "legacy-monitor-events"
+        else "events.jsonl"
+        if draft["source_id"] == "legacy-surge-jsonl"
+        else "completed-batch.json"
+    )
+    expected_names = {
+        records_filename,
+        "records.jsonl",
+        "completion.json",
+        "manifest.json",
+    }
+    try:
+        observed_names = set(os.listdir(directory_descriptor))
+    except OSError as exc:
+        raise ShadowSignerError("legacy recovery staging cannot be enumerated") from exc
+    allowed_names = {
+        *expected_names,
+        "recovery-marker.json",
+        FINALIZATION_FILENAME,
+        FINALIZATION_PENDING_FILENAME,
+    }
+    if not expected_names.issubset(observed_names) or not observed_names.issubset(allowed_names):
+        raise ShadowSignerError("legacy recovery staging is incomplete")
+    artifacts: dict[str, bytes] = {}
+    total_bytes = 0
+    for filename in sorted(expected_names):
+        payload, opened = _read_staging_artifact(
+            directory_descriptor,
+            filename,
+            directory_owner=directory_before.st_uid,
+        )
+        total_bytes += len(payload)
+        if total_bytes > MAX_EXPORT_BYTES:
+            raise ShadowSignerError("legacy recovery staging exceeds its byte budget")
+        artifacts[filename] = payload
+        del opened
+
+    manifest = _canonical_document(
+        artifacts["manifest.json"],
+        label="legacy recovery manifest",
+    )
+    completion = _canonical_document(
+        artifacts["completion.json"],
+        label="legacy recovery completion",
+    )
+    if not isinstance(manifest, dict) or not isinstance(completion, dict):
+        raise ShadowSignerError("legacy recovery metadata shape is invalid")
+    manifest_fields = {
+        "contract",
+        "batch_id",
+        "source_id",
+        "trade_date",
+        "producer_commit",
+        "producer_version",
+        "captured_at",
+        "as_of",
+        "records_filename",
+        "records_sha256",
+        "records_count",
+        "record_envelopes_sha256",
+        "completion_sha256",
+        "completion_receipt_id",
+        "input_identity",
+        "surge_collection_proof",
+        "runner_manifest_binding",
+        "accepted",
+    }
+    if (
+        set(manifest) != manifest_fields
+        or manifest.get("contract") != "legacy-shadow-export/v2"
+        or manifest.get("source_id") != draft["source_id"]
+        or manifest.get("trade_date") != draft["trade_date"]
+        or manifest.get("producer_commit") != draft["producer_commit"]
+        or manifest.get("producer_version") != draft["producer_version"]
+        or manifest.get("records_filename") != records_filename
+        or manifest.get("input_identity") != draft["input_identity"]
+        or manifest.get("accepted") is not True
+        or type(manifest.get("records_count")) is not int
+        or manifest["records_count"] < 0
+        or manifest["records_count"] > 100_000
+    ):
+        raise ShadowSignerError("legacy recovery manifest binding is invalid")
+    if _parse_utc(
+        manifest.get("captured_at"),
+        label="legacy recovery manifest captured_at",
+    ) != _parse_utc(
+        capture["captured_at"],
+        label="legacy recovery captured_at",
+    ):
+        raise ShadowSignerError("legacy recovery manifest capture binding is invalid")
+    trade_date = date.fromisoformat(str(draft["trade_date"]))
+    session_close = datetime.combine(
+        trade_date,
+        datetime_time(15, 0),
+        tzinfo=SHANGHAI,
+    ).astimezone(_UTC)
+    if (
+        _parse_utc(
+            manifest.get("as_of"),
+            label="legacy recovery manifest as_of",
+        )
+        != session_close
+    ):
+        raise ShadowSignerError("legacy recovery manifest close binding is invalid")
+    for field in (
+        "batch_id",
+        "records_sha256",
+        "record_envelopes_sha256",
+        "completion_sha256",
+        "completion_receipt_id",
+        "input_identity",
+    ):
+        if not isinstance(manifest.get(field), str) or SHA256.fullmatch(manifest[field]) is None:
+            raise ShadowSignerError("legacy recovery manifest digest is invalid")
+    manifest_body = {key: value for key, value in manifest.items() if key != "batch_id"}
+    if _contract_sha256(manifest_body) != manifest["batch_id"]:
+        raise ShadowSignerError("legacy recovery manifest identity digest is invalid")
+    if (
+        hashlib.sha256(artifacts[records_filename]).hexdigest() != manifest["records_sha256"]
+        or hashlib.sha256(artifacts["records.jsonl"]).hexdigest()
+        != manifest["record_envelopes_sha256"]
+        or hashlib.sha256(artifacts["completion.json"]).hexdigest() != manifest["completion_sha256"]
+    ):
+        raise ShadowSignerError("legacy recovery artifact digest is invalid")
+    if records_filename == "events.json":
+        records = _canonical_document(
+            artifacts[records_filename],
+            label="legacy recovery monitor records",
+        )
+        if not isinstance(records, list):
+            raise ShadowSignerError("legacy recovery monitor records shape is invalid")
+        record_count = len(records)
+        computed_input_identity = _monitor_input_identity(records, draft=draft)
+    elif records_filename == "events.jsonl":
+        record_count = _canonical_jsonl_count(
+            artifacts[records_filename],
+            label="legacy recovery surge records",
+        )
+        computed_input_identity = _surge_input_identity(
+            artifacts[records_filename],
+            draft=draft,
+        )
+    else:
+        completed_batch = _canonical_document(
+            artifacts[records_filename],
+            label="legacy recovery isolated batch",
+        )
+        if not isinstance(completed_batch, dict) or not isinstance(
+            completed_batch.get("records"), list
+        ):
+            raise ShadowSignerError("legacy recovery isolated batch shape is invalid")
+        record_count = len(completed_batch["records"])
+        computed_input_identity = _isolated_input_identity(
+            completed_batch,
+            draft=draft,
+        )
+    if (
+        record_count != manifest["records_count"]
+        or _canonical_jsonl_count(
+            artifacts["records.jsonl"],
+            label="legacy recovery record envelopes",
+        )
+        != record_count
+    ):
+        raise ShadowSignerError("legacy recovery record count is invalid")
+    if computed_input_identity != draft["input_identity"]:
+        raise ShadowSignerError("legacy recovery input identity digest mismatch")
+    if (manifest.get("surge_collection_proof") is None) != (
+        draft.get("surge_collection_proof_id") is None
+    ):
+        raise ShadowSignerError("legacy recovery surge proof binding is invalid")
+    if manifest.get("surge_collection_proof") is not None:
+        proof = manifest["surge_collection_proof"]
+        if (
+            not isinstance(proof, dict)
+            or proof.get("proof_id") != draft["surge_collection_proof_id"]
+            or _contract_sha256({key: value for key, value in proof.items() if key != "proof_id"})
+            != proof.get("proof_id")
+        ):
+            raise ShadowSignerError("legacy recovery surge proof binding is invalid")
+    if (manifest.get("runner_manifest_binding") is None) != (
+        draft.get("runner_manifest_binding_id") is None
+    ):
+        raise ShadowSignerError("legacy recovery runner binding is invalid")
+    if manifest.get("runner_manifest_binding") is not None:
+        binding = manifest["runner_manifest_binding"]
+        if (
+            not isinstance(binding, dict)
+            or binding.get("binding_id") != draft["runner_manifest_binding_id"]
+            or _contract_sha256(
+                {key: value for key, value in binding.items() if key != "binding_id"}
+            )
+            != binding.get("binding_id")
+        ):
+            raise ShadowSignerError("legacy recovery runner binding is invalid")
+    if (
+        completion.get("receipt_id") != manifest["completion_receipt_id"]
+        or completion.get("source_id") != draft["source_id"]
+        or completion.get("trade_date") != draft["trade_date"]
+        or completion.get("producer_commit") != draft["producer_commit"]
+        or completion.get("producer_version") != draft["producer_version"]
+        or completion.get("input_identity") != draft["input_identity"]
+        or completion.get("evidence_origin") != "production"
+        or completion.get("source")
+        != ("isolated" if records_filename == "completed-batch.json" else "legacy")
+        or _parse_utc(
+            completion.get("session_close_at"),
+            label="legacy recovery completion session_close_at",
+        )
+        != session_close
+        or _parse_utc(
+            completion.get("complete_through"),
+            label="legacy recovery completion complete_through",
+        )
+        != session_close
+        or _parse_utc(
+            completion.get("produced_at"),
+            label="legacy recovery completion produced_at",
+        )
+        > _parse_utc(
+            capture["captured_at"],
+            label="legacy recovery captured_at",
+        )
+    ):
+        raise ShadowSignerError("legacy recovery completion binding is invalid")
+    completion_body = {key: value for key, value in completion.items() if key != "receipt_id"}
+    if _contract_sha256(completion_body) != completion.get("receipt_id"):
+        raise ShadowSignerError("legacy recovery completion identity digest is invalid")
+    batch_digest = _artifact_batch_digest(artifacts)
+    if batch_digest != draft["batch_digest"]:
+        raise ShadowSignerError("legacy recovery complete staging digest mismatch")
+    directory_after = os.fstat(directory_descriptor)
+    for field in ("st_dev", "st_ino", "st_uid", "st_mode"):
+        if getattr(directory_before, field) != getattr(directory_after, field):
+            raise ShadowSignerError("legacy recovery staging changed while inspected")
+    artifact_digests = {
+        filename: hashlib.sha256(artifacts[filename]).hexdigest() for filename in sorted(artifacts)
+    }
+    return directory_before, artifact_digests, batch_digest
+
+
+def _protected_response(
+    *,
+    request: dict[str, object],
+    active_key_id: str,
+    private_key: Path,
+    signed_payload: bytes,
+    signature_namespace: str,
+    signature: str | None = None,
+) -> None:
+    if signature is None:
+        signature = _sign(
+            private_key,
+            _domain_payload(namespace=signature_namespace, payload=signed_payload),
+        )
+    response = {
+        "schema_version": 2,
+        "operation": request["operation"],
+        "request_id": request["request_id"],
+        "key_id": active_key_id,
+        "namespace": request["namespace"],
+        "request_payload_sha256": request["payload_sha256"],
+        "signed_payload_base64": base64.b64encode(signed_payload).decode("ascii"),
+        "signed_payload_sha256": hashlib.sha256(signed_payload).hexdigest(),
+        "signature": signature,
+    }
+    if SIGNATURE.fullmatch(signature) is None:
+        raise ShadowSignerError("Shadow signer returned an invalid signature")
+    sys.stdout.buffer.write(_canonical_bytes(response))
+
+
+def _capture_recovery(
+    *,
+    request: dict[str, object],
+    active_key_id: str,
+    private_key: Path,
+    recovery_calendar: Path,
+) -> None:
+    trade_date, binding = _validate_recovery_binding(
+        _request_document(request),
+        contract="rquant-legacy-shadow-recovery-capture-request/v1",
+    )
+    wallclock, monotonic_ns, boot_id, clock_source = _validated_clock(_trusted_clock_snapshot())
+    _require_recovery_window(
+        trade_date=trade_date,
+        wallclock=wallclock,
+        open_dates=_load_recovery_calendar(recovery_calendar),
+    )
+    claims = {
+        **binding,
+        "contract": "legacy-shadow-recovery-capture-claims/v1",
+        "captured_at": _utc_text(wallclock),
+        "captured_monotonic_ns": monotonic_ns,
+        "boot_id": boot_id,
+        "clock_source": clock_source,
+    }
+    signed_payload = _canonical_bytes(claims)
+    signature = _sign(
+        private_key,
+        _domain_payload(
+            namespace=RECOVERY_CAPTURE_NAMESPACE,
+            payload=signed_payload,
+        ),
+    )
+    capture = {
+        "contract": "legacy-shadow-recovery-capture/v1",
+        "key_id": active_key_id,
+        "signature_algorithm": "ed25519",
+        "claims_base64": base64.b64encode(signed_payload).decode("ascii"),
+        "signature": signature,
+    }
+    capture_token_id = _capture_token_identity(capture)
+    transaction_id = _transaction_identity(capture)
+    capture_seed = {
+        "contract": "legacy-shadow-recovery-capture-seed/v1",
+        "transaction_id": transaction_id,
+        "capture_token_id": capture_token_id,
+        "capture_request_payload_sha256": request["payload_sha256"],
+        "capture": capture,
+    }
+    state_descriptor = _open_recovery_state_root()
+    try:
+        _lock_recovery_state(state_descriptor)
+        _publish_atomic_journal_at(
+            state_descriptor,
+            _capture_seed_name(transaction_id),
+            _canonical_bytes(capture_seed),
+            label="legacy recovery capture seed",
+        )
+    finally:
+        os.close(state_descriptor)
+    _protected_response(
+        request=request,
+        active_key_id=active_key_id,
+        private_key=private_key,
+        signed_payload=signed_payload,
+        signature_namespace=RECOVERY_CAPTURE_NAMESPACE,
+        signature=signature,
+    )
+
+
+def _validate_capture_token(
+    capture: object,
+    *,
+    active_key_id: str,
+    active_public_key: str,
+) -> dict[str, object]:
+    expected = {
+        "contract",
+        "key_id",
+        "signature_algorithm",
+        "claims_base64",
+        "signature",
+    }
+    if (
+        not isinstance(capture, dict)
+        or set(capture) != expected
+        or capture.get("contract") != "legacy-shadow-recovery-capture/v1"
+        or capture.get("key_id") != active_key_id
+        or capture.get("signature_algorithm") != "ed25519"
+        or not isinstance(capture.get("claims_base64"), str)
+        or not isinstance(capture.get("signature"), str)
+    ):
+        raise ShadowSignerError("legacy recovery capture token shape is invalid")
+    try:
+        payload = base64.b64decode(capture["claims_base64"], validate=True)
+        claims = json.loads(payload, object_pairs_hook=_unique_object)
+    except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ShadowSignerError("legacy recovery capture token is invalid") from exc
+    if (
+        not isinstance(claims, dict)
+        or _canonical_bytes(claims) != payload
+        or not _verify(
+            active_public_key,
+            _domain_payload(namespace=RECOVERY_CAPTURE_NAMESPACE, payload=payload),
+            capture["signature"],
+        )
+    ):
+        raise ShadowSignerError("legacy recovery capture signature is invalid")
+    expected_claims = {
+        "contract",
+        "trade_date",
+        "source_id",
+        "producer_commit",
+        "producer_version",
+        "staging_name",
+        "captured_at",
+        "captured_monotonic_ns",
+        "boot_id",
+        "clock_source",
+    }
+    if (
+        set(claims) != expected_claims
+        or claims.get("contract") != "legacy-shadow-recovery-capture-claims/v1"
+        or type(claims.get("captured_monotonic_ns")) is not int
+        or claims["captured_monotonic_ns"] < 0
+        or not isinstance(claims.get("boot_id"), str)
+        or BOOT_ID.fullmatch(claims["boot_id"]) is None
+        or claims.get("clock_source") not in {"CLOCK_BOOTTIME", "CLOCK_MONOTONIC"}
+    ):
+        raise ShadowSignerError("legacy recovery capture claims are invalid")
+    _validate_recovery_binding(
+        {
+            key: value
+            for key, value in claims.items()
+            if key
+            not in {
+                "captured_at",
+                "captured_monotonic_ns",
+                "boot_id",
+                "clock_source",
+            }
+        },
+        contract="legacy-shadow-recovery-capture-claims/v1",
+    )
+    _parse_utc(claims["captured_at"], label="legacy recovery captured_at")
+    return claims
+
+
+def _load_capture_seed_at(
+    state_descriptor: int,
+    *,
+    transaction_id: str,
+    active_key_id: str,
+    active_public_key: str,
+) -> tuple[dict[str, object], dict[str, object]] | None:
+    loaded = _load_journal_at(
+        state_descriptor,
+        _capture_seed_name(transaction_id),
+    )
+    if loaded is None:
+        return None
+    seed, _payload = loaded
+    if (
+        set(seed)
+        != {
+            "contract",
+            "transaction_id",
+            "capture_token_id",
+            "capture_request_payload_sha256",
+            "capture",
+        }
+        or seed.get("contract") != "legacy-shadow-recovery-capture-seed/v1"
+    ):
+        raise ShadowSignerError("legacy recovery capture seed is invalid")
+    capture = seed.get("capture")
+    claims = _validate_capture_token(
+        capture,
+        active_key_id=active_key_id,
+        active_public_key=active_public_key,
+    )
+    if not isinstance(capture, dict):  # pragma: no cover - validated above
+        raise ShadowSignerError("legacy recovery capture seed is invalid")
+    capture_request = {
+        **{
+            key: value
+            for key, value in claims.items()
+            if key
+            not in {
+                "captured_at",
+                "captured_monotonic_ns",
+                "boot_id",
+                "clock_source",
+            }
+        },
+        "contract": "rquant-legacy-shadow-recovery-capture-request/v1",
+    }
+    capture_token_id = _capture_token_identity(capture)
+    if (
+        seed.get("transaction_id") != transaction_id
+        or _transaction_identity(capture) != transaction_id
+        or seed.get("capture_token_id") != capture_token_id
+        or seed.get("capture_request_payload_sha256")
+        != hashlib.sha256(_canonical_bytes(capture_request)).hexdigest()
+    ):
+        raise ShadowSignerError("legacy recovery capture seed binding is invalid")
+    return capture, claims
+
+
+def _draft_from_capture_staging(
+    *,
+    claims: dict[str, object],
+) -> dict[str, object]:
+    staging_descriptor = _open_trusted_staging(
+        source_id=claims["source_id"],
+        staging_name=claims["staging_name"],
+    )
+    try:
+        directory = os.fstat(staging_descriptor)
+        records_filename = (
+            "events.json"
+            if claims["source_id"] == "legacy-monitor-events"
+            else "events.jsonl"
+            if claims["source_id"] == "legacy-surge-jsonl"
+            else "completed-batch.json"
+        )
+        artifact_names = {
+            records_filename,
+            "records.jsonl",
+            "completion.json",
+            "manifest.json",
+        }
+        artifacts: dict[str, bytes] = {}
+        total_bytes = 0
+        for filename in sorted(artifact_names):
+            payload, _opened = _read_staging_artifact(
+                staging_descriptor,
+                filename,
+                directory_owner=directory.st_uid,
+            )
+            total_bytes += len(payload)
+            if total_bytes > MAX_EXPORT_BYTES:
+                raise ShadowSignerError("legacy recovery staging exceeds its byte budget")
+            artifacts[filename] = payload
+        manifest = _canonical_document(
+            artifacts["manifest.json"],
+            label="legacy recovery manifest",
+        )
+        if not isinstance(manifest, dict):
+            raise ShadowSignerError("legacy recovery manifest is invalid")
+        proof = manifest.get("surge_collection_proof")
+        runner_binding = manifest.get("runner_manifest_binding")
+        proof_id = (
+            None if proof is None else proof.get("proof_id") if isinstance(proof, dict) else None
+        )
+        runner_binding_id = (
+            None
+            if runner_binding is None
+            else runner_binding.get("binding_id")
+            if isinstance(runner_binding, dict)
+            else None
+        )
+        if (
+            manifest.get("source_id") != claims["source_id"]
+            or manifest.get("trade_date") != claims["trade_date"]
+            or manifest.get("producer_commit") != claims["producer_commit"]
+            or manifest.get("producer_version") != claims["producer_version"]
+            or manifest.get("records_filename") != records_filename
+            or not isinstance(manifest.get("input_identity"), str)
+            or SHA256.fullmatch(manifest["input_identity"]) is None
+            or (proof_id is not None and not isinstance(proof_id, str))
+            or (proof_id is not None and SHA256.fullmatch(proof_id) is None)
+            or (runner_binding_id is not None and not isinstance(runner_binding_id, str))
+            or (runner_binding_id is not None and SHA256.fullmatch(runner_binding_id) is None)
+        ):
+            raise ShadowSignerError("legacy recovery manifest seed binding is invalid")
+        draft = {
+            "contract": "legacy-shadow-recovery-marker-draft/v2",
+            "trade_date": claims["trade_date"],
+            "source_id": claims["source_id"],
+            "producer_commit": claims["producer_commit"],
+            "producer_version": claims["producer_version"],
+            "staging_name": claims["staging_name"],
+            "input_identity": manifest["input_identity"],
+            "batch_digest": _artifact_batch_digest(artifacts),
+            "surge_collection_proof_id": proof_id,
+            "runner_manifest_binding_id": runner_binding_id,
+        }
+        _inspect_complete_staging(
+            staging_descriptor,
+            draft=draft,
+            capture=claims,
+        )
+        return draft
+    finally:
+        os.close(staging_descriptor)
+
+
+def _load_prepared_seed_payload_at(
+    state_descriptor: int,
+    *,
+    transaction_id: str,
+    capture_token_id: str,
+    request_payload_sha256: str,
+) -> bytes | None:
+    loaded = _load_journal_at(
+        state_descriptor,
+        _prepared_seed_name(transaction_id),
+    )
+    if loaded is None:
+        return None
+    seed, _payload = loaded
+    if (
+        set(seed)
+        != {
+            "contract",
+            "schema_version",
+            "transaction_id",
+            "capture_token_id",
+            "request_payload_sha256",
+            "prepared_payload_base64",
+            "prepared_payload_sha256",
+        }
+        or seed.get("contract") != "legacy-shadow-recovery-prepared-seed/v2"
+        or type(seed.get("schema_version")) is not int
+        or seed["schema_version"] != 2
+    ):
+        raise ShadowSignerError("legacy recovery prepared seed is invalid")
+    try:
+        prepared_payload = base64.b64decode(
+            str(seed.get("prepared_payload_base64")),
+            validate=True,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ShadowSignerError("legacy recovery prepared seed is invalid") from exc
+    if (
+        seed.get("transaction_id") != transaction_id
+        or seed.get("capture_token_id") != capture_token_id
+        or seed.get("request_payload_sha256") != request_payload_sha256
+        or seed.get("prepared_payload_sha256") != hashlib.sha256(prepared_payload).hexdigest()
+    ):
+        raise ShadowSignerError("legacy recovery prepared seed binding is invalid")
+    return prepared_payload
+
+
+def _load_committed_seed_payload_at(
+    state_descriptor: int,
+    *,
+    transaction_id: str,
+    capture_token_id: str,
+    request_payload_sha256: str,
+) -> bytes | None:
+    loaded = _load_journal_at(
+        state_descriptor,
+        _committed_seed_name(transaction_id),
+    )
+    if loaded is None:
+        return None
+    seed, _payload = loaded
+    if (
+        set(seed)
+        != {
+            "contract",
+            "schema_version",
+            "transaction_id",
+            "capture_token_id",
+            "request_payload_sha256",
+            "prepared_sha256",
+            "committed_payload_base64",
+            "committed_payload_sha256",
+        }
+        or seed.get("contract") != "legacy-shadow-recovery-committed-seed/v1"
+        or type(seed.get("schema_version")) is not int
+        or seed["schema_version"] != 1
+    ):
+        raise ShadowSignerError("legacy recovery committed seed is invalid")
+    try:
+        committed_payload = base64.b64decode(
+            str(seed.get("committed_payload_base64")),
+            validate=True,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ShadowSignerError("legacy recovery committed seed is invalid") from exc
+    if (
+        seed.get("transaction_id") != transaction_id
+        or seed.get("capture_token_id") != capture_token_id
+        or seed.get("request_payload_sha256") != request_payload_sha256
+        or not isinstance(seed.get("prepared_sha256"), str)
+        or SHA256.fullmatch(seed["prepared_sha256"]) is None
+        or seed.get("committed_payload_sha256")
+        != hashlib.sha256(committed_payload).hexdigest()
+    ):
+        raise ShadowSignerError("legacy recovery committed seed binding is invalid")
+    committed = _canonical_document(
+        committed_payload,
+        label="legacy recovery committed seed payload",
+    )
+    if (
+        not isinstance(committed, dict)
+        or committed.get("transaction_id") != transaction_id
+        or committed.get("capture_token_id") != capture_token_id
+        or committed.get("request_payload_sha256") != request_payload_sha256
+        or committed.get("prepared_sha256") != seed["prepared_sha256"]
+    ):
+        raise ShadowSignerError("legacy recovery committed seed payload is invalid")
+    return committed_payload
+
+
+def _validate_prepared_marker_material(
+    prepared: dict[str, object],
+    *,
+    capture_claims: dict[str, object],
+    active_key_id: str,
+    active_public_key: str,
+) -> tuple[bytes, bytes, str, dict[str, object]]:
+    try:
+        marker_payload = base64.b64decode(
+            str(prepared["marker_payload_base64"]),
+            validate=True,
+        )
+        signing_payload = base64.b64decode(
+            str(prepared["signed_payload_base64"]),
+            validate=True,
+        )
+        signature = str(prepared["marker_signature"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ShadowSignerError("legacy recovery prepared marker material is invalid") from exc
+    marker = _canonical_document(
+        marker_payload,
+        label="legacy recovery prepared marker",
+    )
+    signing_document = _canonical_document(
+        signing_payload,
+        label="legacy recovery prepared signing payload",
+    )
+    draft = prepared["draft"]
+    if not isinstance(draft, dict):
+        raise ShadowSignerError("legacy recovery prepared draft is invalid")
+    expected_claim_fields = {
+        *draft,
+        "batch_digest",
+        "directory_device",
+        "directory_inode",
+        "artifact_digests",
+        "captured_at",
+        "produced_at",
+        "boot_id",
+        "captured_monotonic_ns",
+        "produced_monotonic_ns",
+        "clock_source",
+    }
+    if (
+        not isinstance(marker, dict)
+        or set(marker)
+        != {
+            "contract",
+            "marker_id",
+            "key_id",
+            "signature_algorithm",
+            "claims",
+            "signature",
+        }
+        or marker.get("contract") != "legacy-shadow-recovery-marker/v1"
+        or marker.get("key_id") != active_key_id
+        or marker.get("signature_algorithm") != "ed25519"
+        or marker.get("signature") != signature
+        or not isinstance(marker.get("claims"), dict)
+        or set(marker["claims"]) != expected_claim_fields
+        or not isinstance(signing_document, dict)
+        or set(signing_document) != {"contract", "namespace", "claims"}
+        or signing_document.get("contract") != "rquant-legacy-shadow-recovery-signing/v3"
+        or signing_document.get("namespace") != RECOVERY_NAMESPACE
+        or not _canonical_equal(signing_document.get("claims"), marker["claims"])
+        or hashlib.sha256(marker_payload).hexdigest() != prepared["marker_sha256"]
+        or hashlib.sha256(signing_payload).hexdigest() != prepared["signed_payload_sha256"]
+        or SIGNATURE.fullmatch(signature) is None
+        or not _verify(
+            active_public_key,
+            _domain_payload(namespace=RECOVERY_NAMESPACE, payload=signing_payload),
+            signature,
+        )
+    ):
+        raise ShadowSignerError("legacy recovery prepared marker material is invalid")
+    marker_values = {key: value for key, value in marker.items() if key != "marker_id"}
+    claims = marker["claims"]
+    expected_claim_bindings = {
+        **draft,
+        "contract": "legacy-shadow-recovery-marker-claims/v3",
+        "batch_digest": prepared["batch_digest"],
+        "directory_device": prepared["directory_device"],
+        "directory_inode": prepared["directory_inode"],
+        "artifact_digests": prepared["artifact_digests"],
+        "captured_at": _utc_text(
+            _parse_utc(
+                capture_claims["captured_at"],
+                label="legacy recovery captured_at",
+            )
+        ),
+        "boot_id": capture_claims["boot_id"],
+        "captured_monotonic_ns": capture_claims["captured_monotonic_ns"],
+        "clock_source": capture_claims["clock_source"],
+    }
+    if (
+        marker.get("marker_id") != _contract_sha256(marker_values)
+        or not _canonical_equal(
+            {name: claims.get(name) for name in expected_claim_bindings},
+            expected_claim_bindings,
+        )
+        or type(claims.get("directory_device")) is not int
+        or type(claims.get("directory_inode")) is not int
+        or type(claims.get("captured_monotonic_ns")) is not int
+        or type(claims.get("produced_monotonic_ns")) is not int
+        or claims["produced_monotonic_ns"] < capture_claims["captured_monotonic_ns"]
+    ):
+        raise ShadowSignerError("legacy recovery prepared marker binding is invalid")
+    produced_at = _parse_utc(
+        claims.get("produced_at"),
+        label="legacy recovery marker produced_at",
+    )
+    captured_at = _parse_utc(
+        claims.get("captured_at"),
+        label="legacy recovery marker captured_at",
+    )
+    _require_clock_progress(
+        previous_at=captured_at,
+        previous_monotonic_ns=int(claims["captured_monotonic_ns"]),
+        previous_boot_id=str(claims["boot_id"]),
+        previous_clock_source=str(claims["clock_source"]),
+        observed_at=produced_at,
+        observed_monotonic_ns=int(claims["produced_monotonic_ns"]),
+        observed_boot_id=str(claims["boot_id"]),
+        observed_clock_source=str(claims["clock_source"]),
+    )
+    return marker_payload, signing_payload, signature, marker
+
+
+def _validate_prepared_finalization_material(
+    prepared: dict[str, object],
+    *,
+    marker_payload: bytes,
+    marker: dict[str, object],
+    active_key_id: str,
+    active_public_key: str,
+) -> bytes:
+    try:
+        payload = base64.b64decode(
+            str(prepared["finalization_receipt_base64"]),
+            validate=True,
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ShadowSignerError("legacy recovery prepared finalization is invalid") from exc
+    receipt = _canonical_document(
+        payload,
+        label="legacy recovery prepared finalization receipt",
+    )
+    if (
+        not isinstance(receipt, dict)
+        or set(receipt)
+        != {
+            "contract",
+            "receipt_id",
+            "key_id",
+            "signature_algorithm",
+            "claims",
+            "signature",
+        }
+        or receipt.get("contract") != "legacy-shadow-finalization-receipt/v1"
+        or receipt.get("key_id") != active_key_id
+        or receipt.get("signature_algorithm") != "ed25519"
+        or not isinstance(receipt.get("claims"), dict)
+        or set(receipt["claims"]) != _FINALIZATION_CLAIM_FIELDS
+        or not isinstance(receipt.get("signature"), str)
+        or SIGNATURE.fullmatch(receipt["signature"]) is None
+        or hashlib.sha256(payload).hexdigest() != prepared["finalization_receipt_sha256"]
+    ):
+        raise ShadowSignerError("legacy recovery prepared finalization is invalid")
+    receipt_values = {key: value for key, value in receipt.items() if key != "receipt_id"}
+    claims = receipt["claims"]
+    marker_claims = marker.get("claims")
+    if not isinstance(marker_claims, dict):
+        raise ShadowSignerError("legacy recovery prepared finalization is invalid")
+    expected_claim_bindings = {
+        "contract": "legacy-shadow-finalization-claims/v1",
+        "trade_date": prepared["draft"]["trade_date"],
+        "source_id": prepared["draft"]["source_id"],
+        "producer_commit": prepared["draft"]["producer_commit"],
+        "producer_version": prepared["draft"]["producer_version"],
+        "staging_name": prepared["draft"]["staging_name"],
+        "transaction_id": prepared["transaction_id"],
+        "capture_token_id": prepared["capture_token_id"],
+        "marker_id": marker["marker_id"],
+        "marker_sha256": hashlib.sha256(marker_payload).hexdigest(),
+        "batch_digest": prepared["batch_digest"],
+        "directory_device": prepared["directory_device"],
+        "directory_inode": prepared["directory_inode"],
+        "artifact_digests": prepared["artifact_digests"],
+        "boot_id": marker_claims["boot_id"],
+        "clock_source": marker_claims["clock_source"],
+    }
+    signing_payload = _canonical_bytes(
+        {
+            "contract": "rquant-legacy-shadow-finalization-signing/v1",
+            "namespace": FINALIZATION_NAMESPACE,
+            "claims": claims,
+        }
+    )
+    if (
+        receipt.get("receipt_id") != _contract_sha256(receipt_values)
+        or not _canonical_equal(
+            {name: claims.get(name) for name in expected_claim_bindings},
+            expected_claim_bindings,
+        )
+        or type(claims.get("directory_device")) is not int
+        or type(claims.get("directory_inode")) is not int
+        or type(claims.get("finalized_monotonic_ns")) is not int
+        or not _verify(
+            active_public_key,
+            _domain_payload(
+                namespace=FINALIZATION_NAMESPACE,
+                payload=signing_payload,
+            ),
+            receipt["signature"],
+        )
+    ):
+        raise ShadowSignerError("legacy recovery prepared finalization binding is invalid")
+    return payload
+
+
+def _validate_prepared_state(
+    prepared: dict[str, object],
+    prepared_payload: bytes,
+    *,
+    seed_payload: bytes,
+    expected_binding: dict[str, object],
+    capture_claims: dict[str, object],
+    active_key_id: str,
+    active_public_key: str,
+) -> tuple[bytes, bytes, str, dict[str, object]]:
+    seed = _canonical_document(
+        seed_payload,
+        label="legacy recovery initial prepared seed payload",
+    )
+    if not isinstance(seed, dict):
+        raise ShadowSignerError("legacy recovery initial prepared seed is invalid")
+    for candidate in (seed, prepared):
+        if (
+            set(candidate) != _PREPARED_FIELDS
+            or candidate.get("contract") != "legacy-shadow-recovery-transaction/v2"
+            or type(candidate.get("schema_version")) is not int
+            or candidate["schema_version"] != 2
+            or candidate.get("state") != "prepared"
+            or type(candidate.get("state_sequence")) is not int
+            or type(candidate.get("directory_device")) is not int
+            or type(candidate.get("directory_inode")) is not int
+        ):
+            raise ShadowSignerError("legacy recovery prepared state schema is invalid")
+        _exact_int(
+            candidate["directory_device"],
+            label="legacy recovery prepared directory device",
+        )
+        _exact_int(
+            candidate["directory_inode"],
+            label="legacy recovery prepared directory inode",
+        )
+    seed_binding = {name: seed[name] for name in expected_binding}
+    immutable_seed = {name: seed[name] for name in _PREPARED_IMMUTABLE_FIELDS}
+    immutable_prepared = {name: prepared[name] for name in _PREPARED_IMMUTABLE_FIELDS}
+    if (
+        seed.get("phase") != "marker-prepared"
+        or seed.get("state_sequence") != 0
+        or seed.get("previous_state_sha256") is not None
+        or any(
+            seed.get(name) is not None
+            for name in _PREPARED_STATE_FIELDS
+            - {
+                "phase",
+                "state_sequence",
+                "previous_state_sha256",
+            }
+        )
+        or not _canonical_equal(seed_binding, expected_binding)
+        or not _canonical_equal(immutable_prepared, immutable_seed)
+    ):
+        raise ShadowSignerError("legacy recovery initial prepared seed binding is invalid")
+    phase = prepared.get("phase")
+    sequence = prepared.get("state_sequence")
+    if phase == "marker-prepared":
+        if sequence != 0 or prepared_payload != seed_payload:
+            raise ShadowSignerError("legacy recovery initial prepared identity mismatch")
+    elif phase == "finalization-prepared":
+        if (
+            sequence != 1
+            or prepared.get("previous_state_sha256") != hashlib.sha256(seed_payload).hexdigest()
+            or prepared.get("finalization_receipt_base64") is None
+            or prepared.get("finalization_receipt_sha256") is None
+            or any(
+                prepared.get(name) is not None
+                for name in {
+                    "finalization_durable_at",
+                    "finalization_durable_monotonic_ns",
+                    "finalization_durable_boot_id",
+                    "finalization_durable_clock_source",
+                }
+            )
+        ):
+            raise ShadowSignerError("legacy recovery finalization prepared state is invalid")
+    elif phase == "finalization-durable":
+        prior = {
+            **prepared,
+            "phase": "finalization-prepared",
+            "state_sequence": 1,
+            "previous_state_sha256": hashlib.sha256(seed_payload).hexdigest(),
+            "finalization_durable_at": None,
+            "finalization_durable_monotonic_ns": None,
+            "finalization_durable_boot_id": None,
+            "finalization_durable_clock_source": None,
+        }
+        if (
+            sequence != 2
+            or prepared.get("previous_state_sha256")
+            != hashlib.sha256(_canonical_bytes(prior)).hexdigest()
+            or prepared.get("finalization_receipt_base64") is None
+            or prepared.get("finalization_receipt_sha256") is None
+            or any(
+                prepared.get(name) is None
+                for name in {
+                    "finalization_durable_at",
+                    "finalization_durable_monotonic_ns",
+                    "finalization_durable_boot_id",
+                    "finalization_durable_clock_source",
+                }
+            )
+        ):
+            raise ShadowSignerError("legacy recovery durable prepared state is invalid")
+        _exact_int(
+            prepared["finalization_durable_monotonic_ns"],
+            label="legacy recovery finalization durable monotonic timestamp",
+        )
+    else:
+        raise ShadowSignerError("legacy recovery prepared phase is invalid")
+    marker_material = _validate_prepared_marker_material(
+        prepared,
+        capture_claims=capture_claims,
+        active_key_id=active_key_id,
+        active_public_key=active_public_key,
+    )
+    if phase != "marker-prepared":
+        _validate_prepared_finalization_material(
+            prepared,
+            marker_payload=marker_material[0],
+            marker=marker_material[3],
+            active_key_id=active_key_id,
+            active_public_key=active_public_key,
+        )
+    return marker_material
+
+
+def _prepared_finalization_payload(prepared: dict[str, object]) -> bytes:
+    try:
+        payload = base64.b64decode(
+            str(prepared["finalization_receipt_base64"]),
+            validate=True,
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ShadowSignerError("legacy recovery prepared finalization is invalid") from exc
+    if hashlib.sha256(payload).hexdigest() != prepared.get("finalization_receipt_sha256"):
+        raise ShadowSignerError("legacy recovery prepared finalization is invalid")
+    return payload
+
+
+def _committed_head_document(
+    *,
+    prepared: dict[str, object],
+    prepared_payload: bytes,
+    marker_payload: bytes,
+    finalization_payload: bytes,
+) -> dict[str, object]:
+    if prepared.get("phase") != "finalization-durable" or prepared.get("state_sequence") != 2:
+        raise ShadowSignerError("legacy recovery committed head is not durable")
+    return {
+        "contract": "legacy-shadow-recovery-transaction-commit/v2",
+        "schema_version": 2,
+        "state": "committed",
+        "state_sequence": 2,
+        "transaction_id": prepared["transaction_id"],
+        "capture_token_id": prepared["capture_token_id"],
+        "request_payload_sha256": prepared["request_payload_sha256"],
+        "prepared_sha256": hashlib.sha256(prepared_payload).hexdigest(),
+        "prepared_previous_state_sha256": prepared["previous_state_sha256"],
+        "marker_sha256": hashlib.sha256(marker_payload).hexdigest(),
+        "finalization_receipt_sha256": hashlib.sha256(finalization_payload).hexdigest(),
+        "batch_digest": prepared["batch_digest"],
+        "directory_device": prepared["directory_device"],
+        "directory_inode": prepared["directory_inode"],
+        "artifact_digests": prepared["artifact_digests"],
+        "finalization_durable_at": prepared["finalization_durable_at"],
+        "finalization_durable_monotonic_ns": prepared[
+            "finalization_durable_monotonic_ns"
+        ],
+        "finalization_durable_boot_id": prepared["finalization_durable_boot_id"],
+        "finalization_durable_clock_source": prepared["finalization_durable_clock_source"],
+    }
+
+
+def _validate_committed_head(
+    committed: dict[str, object],
+    committed_payload: bytes,
+    *,
+    expected: dict[str, object],
+) -> None:
+    if (
+        set(committed) != _COMMITTED_FIELDS
+        or committed.get("contract") != "legacy-shadow-recovery-transaction-commit/v2"
+        or type(committed.get("schema_version")) is not int
+        or committed["schema_version"] != 2
+        or committed.get("state") != "committed"
+        or type(committed.get("state_sequence")) is not int
+        or committed["state_sequence"] != 2
+        or type(committed.get("directory_device")) is not int
+        or type(committed.get("directory_inode")) is not int
+        or type(committed.get("finalization_durable_monotonic_ns")) is not int
+        or not isinstance(committed.get("artifact_digests"), dict)
+        or any(
+            not isinstance(value, str) or SHA256.fullmatch(value) is None
+            for value in committed.get("artifact_digests", {}).values()
+        )
+    ):
+        raise ShadowSignerError("legacy recovery committed head schema is invalid")
+    for field in (
+        "request_payload_sha256",
+        "prepared_sha256",
+        "prepared_previous_state_sha256",
+        "marker_sha256",
+        "finalization_receipt_sha256",
+        "batch_digest",
+    ):
+        if not isinstance(committed.get(field), str) or SHA256.fullmatch(committed[field]) is None:
+            raise ShadowSignerError("legacy recovery committed head digest is invalid")
+    _exact_int(
+        committed["directory_device"],
+        label="legacy recovery committed directory device",
+    )
+    _exact_int(
+        committed["directory_inode"],
+        label="legacy recovery committed directory inode",
+    )
+    _exact_int(
+        committed["finalization_durable_monotonic_ns"],
+        label="legacy recovery committed durable monotonic timestamp",
+    )
+    _parse_utc(
+        committed.get("finalization_durable_at"),
+        label="legacy recovery committed durable_at",
+    )
+    if (
+        not isinstance(committed.get("finalization_durable_boot_id"), str)
+        or BOOT_ID.fullmatch(committed["finalization_durable_boot_id"]) is None
+        or committed.get("finalization_durable_clock_source")
+        not in {"CLOCK_BOOTTIME", "CLOCK_MONOTONIC"}
+        or committed_payload != _canonical_bytes(committed)
+        or not _canonical_equal(committed, expected)
+    ):
+        raise ShadowSignerError("legacy recovery committed head conflicts with durable proof")
+
+
+def _validate_complete_committed_staging_at(
+    staging_descriptor: int,
+    *,
+    directory_stat: os.stat_result,
+    marker_payload: bytes,
+    finalization_payload: bytes,
+) -> None:
+    try:
+        observed_names = set(os.listdir(staging_descriptor))
+    except OSError as exc:
+        raise ShadowSignerError("legacy recovery committed staging is unavailable") from exc
+    observed = os.fstat(staging_descriptor)
+    if (
+        FINALIZATION_PENDING_FILENAME in observed_names
+        or stat.S_IMODE(observed.st_mode) != 0o555
+        or (observed.st_dev, observed.st_ino)
+        != (directory_stat.st_dev, directory_stat.st_ino)
+        or not _exact_file_at(
+            staging_descriptor,
+            "recovery-marker.json",
+            marker_payload,
+            mode=0o444,
+            label="legacy recovery marker",
+        )
+        or not _exact_file_at(
+            staging_descriptor,
+            FINALIZATION_FILENAME,
+            finalization_payload,
+            mode=0o444,
+            label="legacy recovery finalization receipt",
+        )
+    ):
+        raise ShadowSignerError("legacy recovery committed staging proof is invalid")
+
+
+def _validate_durable_prepared_clock(
+    prepared: dict[str, object],
+    *,
+    marker: dict[str, object],
+    finalization_payload: bytes,
+    trade_date: date,
+    open_dates: frozenset[date],
+) -> None:
+    marker_claims = marker.get("claims")
+    finalization = _canonical_document(
+        finalization_payload,
+        label="legacy recovery durable finalization receipt",
+    )
+    if (
+        not isinstance(marker_claims, dict)
+        or not isinstance(finalization, dict)
+        or not isinstance(finalization.get("claims"), dict)
+    ):
+        raise ShadowSignerError("legacy recovery durable clock proof is invalid")
+    finalization_claims = finalization["claims"]
+    produced_at = _parse_utc(
+        marker_claims.get("produced_at"),
+        label="legacy recovery durable marker produced_at",
+    )
+    finalized_at = _parse_utc(
+        finalization_claims.get("finalized_at"),
+        label="legacy recovery durable finalized_at",
+    )
+    durable_at = _parse_utc(
+        prepared.get("finalization_durable_at"),
+        label="legacy recovery finalization durable_at",
+    )
+    for observed_at in (produced_at, finalized_at, durable_at):
+        _require_recovery_window(
+            trade_date=trade_date,
+            wallclock=observed_at,
+            open_dates=open_dates,
+        )
+    _require_clock_progress(
+        previous_at=produced_at,
+        previous_monotonic_ns=_exact_int(
+            marker_claims.get("produced_monotonic_ns"),
+            label="legacy recovery durable marker monotonic timestamp",
+        ),
+        previous_boot_id=str(marker_claims.get("boot_id")),
+        previous_clock_source=str(marker_claims.get("clock_source")),
+        observed_at=finalized_at,
+        observed_monotonic_ns=_exact_int(
+            finalization_claims.get("finalized_monotonic_ns"),
+            label="legacy recovery durable finalized monotonic timestamp",
+        ),
+        observed_boot_id=str(finalization_claims.get("boot_id")),
+        observed_clock_source=str(finalization_claims.get("clock_source")),
+    )
+    _require_clock_progress(
+        previous_at=finalized_at,
+        previous_monotonic_ns=_exact_int(
+            finalization_claims.get("finalized_monotonic_ns"),
+            label="legacy recovery durable finalized monotonic timestamp",
+        ),
+        previous_boot_id=str(finalization_claims.get("boot_id")),
+        previous_clock_source=str(finalization_claims.get("clock_source")),
+        observed_at=durable_at,
+        observed_monotonic_ns=_exact_int(
+            prepared.get("finalization_durable_monotonic_ns"),
+            label="legacy recovery durable monotonic timestamp",
+        ),
+        observed_boot_id=str(prepared.get("finalization_durable_boot_id")),
+        observed_clock_source=str(prepared.get("finalization_durable_clock_source")),
+    )
+
+
+def _require_clock_progress(
+    *,
+    previous_at: datetime,
+    previous_monotonic_ns: int,
+    previous_boot_id: str,
+    previous_clock_source: str,
+    observed_at: datetime,
+    observed_monotonic_ns: int,
+    observed_boot_id: str,
+    observed_clock_source: str,
+) -> None:
+    if (
+        observed_boot_id != previous_boot_id
+        or observed_clock_source != previous_clock_source
+        or observed_at < previous_at
+        or observed_monotonic_ns < previous_monotonic_ns
+    ):
+        raise ShadowSignerError("legacy recovery trusted clock rollback detected")
+    wall_elapsed = observed_at - previous_at
+    monotonic_elapsed = timedelta(
+        microseconds=(observed_monotonic_ns - previous_monotonic_ns) // 1_000
+    )
+    if abs(wall_elapsed - monotonic_elapsed) > RECOVERY_CLOCK_TOLERANCE:
+        raise ShadowSignerError("legacy recovery trusted clock rollback detected")
+
+
+def _sign_recovery(
+    *,
+    request: dict[str, object],
+    active_key_id: str,
+    private_key: Path,
+    active_public_key: str,
+    recovery_calendar: Path,
+    document_override: Optional[dict[str, object]] = None,  # noqa: UP045
+    transaction_request_payload_sha256: Optional[str] = None,  # noqa: UP045
+    require_prepared: bool = False,
+) -> None:
+    document = document_override or _request_document(request)
+    transaction_request_sha256 = transaction_request_payload_sha256 or str(
+        request["payload_sha256"]
+    )
+    if (
+        set(document) != {"contract", "capture", "claims"}
+        or document.get("contract") != "rquant-legacy-shadow-recovery-sign-request/v2"
+    ):
+        raise ShadowSignerError("legacy recovery signing request shape is invalid")
+    capture = _validate_capture_token(
+        document["capture"],
+        active_key_id=active_key_id,
+        active_public_key=active_public_key,
+    )
+    trade_date, draft = _validate_recovery_binding(
+        document["claims"],
+        contract="legacy-shadow-recovery-marker-draft/v2",
+        extra_fields=frozenset(
+            {
+                "input_identity",
+                "batch_digest",
+                "surge_collection_proof_id",
+                "runner_manifest_binding_id",
+            }
+        ),
+    )
+    if (
+        not isinstance(draft.get("input_identity"), str)
+        or SHA256.fullmatch(draft["input_identity"]) is None
+        or not isinstance(draft.get("batch_digest"), str)
+        or SHA256.fullmatch(draft["batch_digest"]) is None
+        or (
+            draft.get("surge_collection_proof_id") is not None
+            and (
+                not isinstance(draft["surge_collection_proof_id"], str)
+                or SHA256.fullmatch(draft["surge_collection_proof_id"]) is None
+            )
+        )
+        or (
+            draft.get("runner_manifest_binding_id") is not None
+            and (
+                not isinstance(draft["runner_manifest_binding_id"], str)
+                or SHA256.fullmatch(draft["runner_manifest_binding_id"]) is None
+            )
+        )
+    ):
+        raise ShadowSignerError("legacy recovery marker draft is invalid")
+    for name in (
+        "trade_date",
+        "source_id",
+        "producer_commit",
+        "producer_version",
+        "staging_name",
+    ):
+        if draft[name] != capture[name]:
+            raise ShadowSignerError("legacy recovery capture binding mismatch")
+    capture_token_id = _capture_token_identity(document["capture"])
+    transaction_id = _transaction_identity(document["capture"])
+    prepared_name, committed_name = _journal_names(transaction_id)
+    state_descriptor = _open_recovery_state_root()
+    staging_descriptor = -1
+    try:
+        _lock_recovery_state(state_descriptor)
+        loaded_capture_seed = _load_capture_seed_at(
+            state_descriptor,
+            transaction_id=transaction_id,
+            active_key_id=active_key_id,
+            active_public_key=active_public_key,
+        )
+        if loaded_capture_seed is not None and (
+            loaded_capture_seed[0] != document["capture"] or loaded_capture_seed[1] != capture
+        ):
+            raise ShadowSignerError("legacy recovery capture seed conflicts with request")
+        staging_descriptor = _open_trusted_staging(
+            source_id=draft["source_id"],
+            staging_name=draft["staging_name"],
+        )
+        directory_stat, artifact_digests, batch_digest = _inspect_complete_staging(
+            staging_descriptor,
+            draft=draft,
+            capture=capture,
+        )
+        captured_at = _parse_utc(
+            capture["captured_at"],
+            label="legacy recovery captured_at",
+        )
+        open_dates = _load_recovery_calendar(recovery_calendar)
+        _require_recovery_window(
+            trade_date=trade_date,
+            wallclock=captured_at,
+            open_dates=open_dates,
+        )
+        expected_binding = {
+            "transaction_id": transaction_id,
+            "capture_token_id": capture_token_id,
+            "request_payload_sha256": transaction_request_sha256,
+            "capture": document["capture"],
+            "draft": draft,
+            "directory_device": directory_stat.st_dev,
+            "directory_inode": directory_stat.st_ino,
+            "artifact_digests": artifact_digests,
+            "batch_digest": batch_digest,
+        }
+        loaded_prepared, prepared_torn = _load_prepared_journal_at(
+            state_descriptor,
+            prepared_name,
+        )
+        loaded_committed, committed_torn_payload = _load_committed_journal_at(
+            state_descriptor,
+            committed_name,
+        )
+        seeded_payload = _load_prepared_seed_payload_at(
+            state_descriptor,
+            transaction_id=transaction_id,
+            capture_token_id=capture_token_id,
+            request_payload_sha256=transaction_request_sha256,
+        )
+        committed_seed_payload = _load_committed_seed_payload_at(
+            state_descriptor,
+            transaction_id=transaction_id,
+            capture_token_id=capture_token_id,
+            request_payload_sha256=transaction_request_sha256,
+        )
+        if loaded_committed is not None and loaded_prepared is None:
+            raise ShadowSignerError("legacy recovery committed head has no durable prepared state")
+        if committed_torn_payload is not None and committed_seed_payload is None:
+            raise ShadowSignerError("legacy recovery torn committed head has no trusted seed")
+        if committed_seed_payload is not None and loaded_committed is None:
+            if loaded_prepared is None or seeded_payload is None:
+                raise ShadowSignerError(
+                    "legacy recovery seed-bound head has no durable prepared proof"
+                )
+            prepared, prepared_payload = loaded_prepared
+            marker_payload, signing_payload, signature, marker = _validate_prepared_state(
+                prepared,
+                prepared_payload,
+                seed_payload=seeded_payload,
+                expected_binding=expected_binding,
+                capture_claims=capture,
+                active_key_id=active_key_id,
+                active_public_key=active_public_key,
+            )
+            if (
+                prepared.get("phase") != "finalization-durable"
+                or prepared.get("state_sequence") != 2
+            ):
+                raise ShadowSignerError(
+                    "legacy recovery seed-bound repair requires durable prepared head"
+                )
+            finalization_payload = _prepared_finalization_payload(prepared)
+            _validate_durable_prepared_clock(
+                prepared,
+                marker=marker,
+                finalization_payload=finalization_payload,
+                trade_date=trade_date,
+                open_dates=open_dates,
+            )
+            expected_committed = _committed_head_document(
+                prepared=prepared,
+                prepared_payload=prepared_payload,
+                marker_payload=marker_payload,
+                finalization_payload=finalization_payload,
+            )
+            expected_committed_payload = _canonical_bytes(expected_committed)
+            _validate_committed_head(
+                expected_committed,
+                expected_committed_payload,
+                expected=expected_committed,
+            )
+            if (
+                committed_seed_payload != expected_committed_payload
+                or (
+                    committed_torn_payload is not None
+                    and (
+                        len(committed_torn_payload) >= len(expected_committed_payload)
+                        or not expected_committed_payload.startswith(committed_torn_payload)
+                    )
+                )
+            ):
+                raise ShadowSignerError(
+                    "legacy recovery seed-bound head conflicts with trusted seed"
+                )
+            _validate_complete_committed_staging_at(
+                staging_descriptor,
+                directory_stat=directory_stat,
+                marker_payload=marker_payload,
+                finalization_payload=finalization_payload,
+            )
+            _cleanup_committed_replace_temps_at(state_descriptor, committed_name)
+            _replace_journal_at(
+                state_descriptor,
+                committed_name,
+                expected_committed_payload,
+                fault_prefix="committed-repair",
+            )
+            _protected_response(
+                request=request,
+                active_key_id=active_key_id,
+                private_key=private_key,
+                signed_payload=signing_payload,
+                signature_namespace=RECOVERY_NAMESPACE,
+                signature=signature,
+            )
+            return
+        if loaded_prepared is None:
+            if seeded_payload is not None:
+                seeded_prepared = _canonical_document(
+                    seeded_payload,
+                    label="legacy recovery seeded prepared transaction",
+                )
+                if not isinstance(seeded_prepared, dict):
+                    raise ShadowSignerError("legacy recovery prepared seed is invalid")
+                _validate_prepared_state(
+                    seeded_prepared,
+                    seeded_payload,
+                    seed_payload=seeded_payload,
+                    expected_binding=expected_binding,
+                    capture_claims=capture,
+                    active_key_id=active_key_id,
+                    active_public_key=active_public_key,
+                )
+                _cleanup_journal_temps_at(state_descriptor, prepared_name)
+                _replace_journal_at(
+                    state_descriptor,
+                    prepared_name,
+                    seeded_payload,
+                )
+                loaded_prepared = (seeded_prepared, seeded_payload)
+            elif prepared_torn and loaded_capture_seed is None:
+                raise ShadowSignerError(
+                    "legacy recovery torn prepared transaction has no trusted seed"
+                )
+        resumed = loaded_prepared is not None
+        if loaded_prepared is None:
+            if require_prepared:
+                raise ShadowSignerError("legacy recovery prepared transaction is unavailable")
+            produced_at, produced_monotonic_ns, boot_id, clock_source = _validated_clock(
+                _trusted_clock_snapshot()
+            )
+            _require_recovery_window(
+                trade_date=trade_date,
+                wallclock=produced_at,
+                open_dates=open_dates,
+            )
+            captured_monotonic_ns = capture["captured_monotonic_ns"]
+            _require_clock_progress(
+                previous_at=captured_at,
+                previous_monotonic_ns=captured_monotonic_ns,
+                previous_boot_id=capture["boot_id"],
+                previous_clock_source=capture["clock_source"],
+                observed_at=produced_at,
+                observed_monotonic_ns=produced_monotonic_ns,
+                observed_boot_id=boot_id,
+                observed_clock_source=clock_source,
+            )
+            produced_at_text = _utc_text(produced_at)
+            claims = {
+                **draft,
+                "contract": "legacy-shadow-recovery-marker-claims/v3",
+                "batch_digest": batch_digest,
+                "directory_device": directory_stat.st_dev,
+                "directory_inode": directory_stat.st_ino,
+                "artifact_digests": artifact_digests,
+                "captured_at": _utc_text(captured_at),
+                "produced_at": produced_at_text,
+                "boot_id": boot_id,
+                "captured_monotonic_ns": captured_monotonic_ns,
+                "produced_monotonic_ns": produced_monotonic_ns,
+                "clock_source": clock_source,
+            }
+            signing_payload = _canonical_bytes(
+                {
+                    "contract": "rquant-legacy-shadow-recovery-signing/v3",
+                    "namespace": RECOVERY_NAMESPACE,
+                    "claims": claims,
+                }
+            )
+            signature = _sign(
+                private_key,
+                _domain_payload(namespace=RECOVERY_NAMESPACE, payload=signing_payload),
+            )
+            signed_at, signed_monotonic_ns, signed_boot_id, signed_clock_source = _validated_clock(
+                _trusted_clock_snapshot()
+            )
+            _require_recovery_window(
+                trade_date=trade_date,
+                wallclock=signed_at,
+                open_dates=open_dates,
+            )
+            _require_clock_progress(
+                previous_at=produced_at,
+                previous_monotonic_ns=produced_monotonic_ns,
+                previous_boot_id=boot_id,
+                previous_clock_source=clock_source,
+                observed_at=signed_at,
+                observed_monotonic_ns=signed_monotonic_ns,
+                observed_boot_id=signed_boot_id,
+                observed_clock_source=signed_clock_source,
+            )
+            marker_values = {
+                "contract": "legacy-shadow-recovery-marker/v1",
+                "key_id": active_key_id,
+                "signature_algorithm": "ed25519",
+                "claims": claims,
+                "signature": signature,
+            }
+            marker = {
+                **marker_values,
+                "marker_id": _contract_sha256(marker_values),
+            }
+            marker_payload = _canonical_bytes(marker)
+            prepared = {
+                "contract": "legacy-shadow-recovery-transaction/v2",
+                "schema_version": 2,
+                "state": "prepared",
+                "phase": "marker-prepared",
+                "state_sequence": 0,
+                "previous_state_sha256": None,
+                "transaction_id": transaction_id,
+                "capture_token_id": capture_token_id,
+                "request_payload_sha256": transaction_request_sha256,
+                "capture": document["capture"],
+                "draft": draft,
+                "directory_device": directory_stat.st_dev,
+                "directory_inode": directory_stat.st_ino,
+                "artifact_digests": artifact_digests,
+                "batch_digest": batch_digest,
+                "marker_payload_base64": base64.b64encode(marker_payload).decode("ascii"),
+                "marker_sha256": hashlib.sha256(marker_payload).hexdigest(),
+                "signed_payload_base64": base64.b64encode(signing_payload).decode("ascii"),
+                "signed_payload_sha256": hashlib.sha256(signing_payload).hexdigest(),
+                "marker_signature": signature,
+                "finalization_receipt_base64": None,
+                "finalization_receipt_sha256": None,
+                "finalization_durable_at": None,
+                "finalization_durable_monotonic_ns": None,
+                "finalization_durable_boot_id": None,
+                "finalization_durable_clock_source": None,
+            }
+            prepared_payload = _canonical_bytes(prepared)
+            _validate_prepared_state(
+                prepared,
+                prepared_payload,
+                seed_payload=prepared_payload,
+                expected_binding=expected_binding,
+                capture_claims=capture,
+                active_key_id=active_key_id,
+                active_public_key=active_public_key,
+            )
+            prepared_seed = {
+                "contract": "legacy-shadow-recovery-prepared-seed/v2",
+                "schema_version": 2,
+                "transaction_id": transaction_id,
+                "capture_token_id": capture_token_id,
+                "request_payload_sha256": transaction_request_sha256,
+                "prepared_payload_base64": base64.b64encode(prepared_payload).decode("ascii"),
+                "prepared_payload_sha256": hashlib.sha256(prepared_payload).hexdigest(),
+            }
+            _publish_atomic_journal_at(
+                state_descriptor,
+                _prepared_seed_name(transaction_id),
+                _canonical_bytes(prepared_seed),
+                label="legacy recovery prepared seed",
+            )
+            seeded_payload = prepared_payload
+            if prepared_torn:
+                _replace_journal_at(
+                    state_descriptor,
+                    prepared_name,
+                    prepared_payload,
+                )
+            else:
+                _publish_atomic_journal_at(
+                    state_descriptor,
+                    prepared_name,
+                    prepared_payload,
+                    label="legacy recovery prepared journal",
+                    fault_prefix="prepared",
+                )
+            _test_fault("after-journal-prepare")
+        else:
+            prepared, prepared_payload = loaded_prepared
+            if seeded_payload is None:
+                raise ShadowSignerError(
+                    "legacy recovery prepared schema has no explicit seed; migration is denied"
+                )
+            marker_payload, signing_payload, signature, marker = _validate_prepared_state(
+                prepared,
+                prepared_payload,
+                seed_payload=seeded_payload,
+                expected_binding=expected_binding,
+                capture_claims=capture,
+                active_key_id=active_key_id,
+                active_public_key=active_public_key,
+            )
+
+        if loaded_committed is not None:
+            committed, committed_payload = loaded_committed
+            finalization_payload = _prepared_finalization_payload(prepared)
+            expected_committed = _committed_head_document(
+                prepared=prepared,
+                prepared_payload=prepared_payload,
+                marker_payload=marker_payload,
+                finalization_payload=finalization_payload,
+            )
+            _validate_committed_head(
+                committed,
+                committed_payload,
+                expected=expected_committed,
+            )
+            if committed_seed_payload != committed_payload:
+                raise ShadowSignerError(
+                    "legacy recovery committed head conflicts with trusted seed"
+                )
+            _validate_complete_committed_staging_at(
+                staging_descriptor,
+                directory_stat=directory_stat,
+                marker_payload=marker_payload,
+                finalization_payload=finalization_payload,
+            )
+            _cleanup_committed_replace_temps_at(state_descriptor, committed_name)
+            _protected_response(
+                request=request,
+                active_key_id=active_key_id,
+                private_key=private_key,
+                signed_payload=signing_payload,
+                signature_namespace=RECOVERY_NAMESPACE,
+                signature=signature,
+            )
+            return
+
+        marker_exact = _exact_file_at(
+            staging_descriptor,
+            "recovery-marker.json",
+            marker_payload,
+            mode=0o444,
+            label="legacy recovery marker",
+        )
+        if not marker_exact and resumed:
+            repair_at, repair_ns, repair_boot, repair_source = _validated_clock(
+                _trusted_clock_snapshot()
+            )
+            marker_claims = marker.get("claims")
+            if not isinstance(marker_claims, dict):
+                raise ShadowSignerError("legacy recovery prepared marker is invalid")
+            marker_produced_at = _parse_utc(
+                marker_claims.get("produced_at"),
+                label="legacy recovery marker produced_at",
+            )
+            _require_recovery_window(
+                trade_date=trade_date,
+                wallclock=repair_at,
+                open_dates=open_dates,
+            )
+            _require_clock_progress(
+                previous_at=marker_produced_at,
+                previous_monotonic_ns=int(marker_claims["produced_monotonic_ns"]),
+                previous_boot_id=str(marker_claims["boot_id"]),
+                previous_clock_source=str(marker_claims["clock_source"]),
+                observed_at=repair_at,
+                observed_monotonic_ns=repair_ns,
+                observed_boot_id=repair_boot,
+                observed_clock_source=repair_source,
+            )
+        _publish_exact_file_at(
+            staging_descriptor,
+            "recovery-marker.json",
+            marker_payload,
+            mode=0o444,
+            label="legacy recovery marker",
+            fault_point="marker-write",
+        )
+        durable_names = frozenset({*artifact_digests, "recovery-marker.json"})
+        _protect_transaction_files(
+            staging_descriptor,
+            durable_names,
+            finalized=False,
+        )
+        _test_fault("after-marker-fsync")
+
+        finalization_encoded = prepared.get("finalization_receipt_base64")
+        finalization_created = finalization_encoded is None
+        if finalization_created:
+            finalized_at, finalized_ns, finalized_boot, finalized_source = _validated_clock(
+                _trusted_clock_snapshot()
+            )
+            marker_claims = marker.get("claims")
+            if not isinstance(marker_claims, dict):
+                raise ShadowSignerError("legacy recovery prepared marker is invalid")
+            marker_produced_at = _parse_utc(
+                marker_claims.get("produced_at"),
+                label="legacy recovery marker produced_at",
+            )
+            _require_recovery_window(
+                trade_date=trade_date,
+                wallclock=finalized_at,
+                open_dates=open_dates,
+            )
+            _require_clock_progress(
+                previous_at=marker_produced_at,
+                previous_monotonic_ns=int(marker_claims["produced_monotonic_ns"]),
+                previous_boot_id=str(marker_claims["boot_id"]),
+                previous_clock_source=str(marker_claims["clock_source"]),
+                observed_at=finalized_at,
+                observed_monotonic_ns=finalized_ns,
+                observed_boot_id=finalized_boot,
+                observed_clock_source=finalized_source,
+            )
+            finalization_claims = {
+                "contract": "legacy-shadow-finalization-claims/v1",
+                "trade_date": draft["trade_date"],
+                "source_id": draft["source_id"],
+                "producer_commit": draft["producer_commit"],
+                "producer_version": draft["producer_version"],
+                "staging_name": draft["staging_name"],
+                "transaction_id": transaction_id,
+                "capture_token_id": capture_token_id,
+                "marker_id": marker["marker_id"],
+                "marker_sha256": hashlib.sha256(marker_payload).hexdigest(),
+                "batch_digest": batch_digest,
+                "directory_device": directory_stat.st_dev,
+                "directory_inode": directory_stat.st_ino,
+                "artifact_digests": artifact_digests,
+                "finalized_at": _utc_text(finalized_at),
+                "finalized_monotonic_ns": finalized_ns,
+                "boot_id": finalized_boot,
+                "clock_source": finalized_source,
+            }
+            finalization_signing_payload = _canonical_bytes(
+                {
+                    "contract": "rquant-legacy-shadow-finalization-signing/v1",
+                    "namespace": FINALIZATION_NAMESPACE,
+                    "claims": finalization_claims,
+                }
+            )
+            finalization_signature = _sign(
+                private_key,
+                _domain_payload(
+                    namespace=FINALIZATION_NAMESPACE,
+                    payload=finalization_signing_payload,
+                ),
+            )
+            finalization_values = {
+                "contract": "legacy-shadow-finalization-receipt/v1",
+                "key_id": active_key_id,
+                "signature_algorithm": "ed25519",
+                "claims": finalization_claims,
+                "signature": finalization_signature,
+            }
+            finalization_receipt = {
+                **finalization_values,
+                "receipt_id": _contract_sha256(finalization_values),
+            }
+            finalization_payload = _canonical_bytes(finalization_receipt)
+            prepared = {
+                **prepared,
+                "phase": "finalization-prepared",
+                "state_sequence": 1,
+                "previous_state_sha256": hashlib.sha256(prepared_payload).hexdigest(),
+                "finalization_receipt_base64": base64.b64encode(finalization_payload).decode(
+                    "ascii"
+                ),
+                "finalization_receipt_sha256": hashlib.sha256(finalization_payload).hexdigest(),
+            }
+            prepared_payload = _canonical_bytes(prepared)
+            if seeded_payload is None:  # pragma: no cover - created or loaded above
+                raise ShadowSignerError("legacy recovery prepared seed is unavailable")
+            _validate_prepared_state(
+                prepared,
+                prepared_payload,
+                seed_payload=seeded_payload,
+                expected_binding=expected_binding,
+                capture_claims=capture,
+                active_key_id=active_key_id,
+                active_public_key=active_public_key,
+            )
+            _replace_journal_at(state_descriptor, prepared_name, prepared_payload)
+            _test_fault("after-finalization-prepare")
+        else:
+            try:
+                finalization_payload = base64.b64decode(
+                    str(finalization_encoded),
+                    validate=True,
+                )
+            except (TypeError, ValueError) as exc:
+                raise ShadowSignerError("legacy recovery prepared finalization is invalid") from exc
+            if hashlib.sha256(finalization_payload).hexdigest() != prepared.get(
+                "finalization_receipt_sha256"
+            ):
+                raise ShadowSignerError("legacy recovery prepared finalization is invalid")
+
+        finalization_document = _canonical_document(
+            finalization_payload,
+            label="legacy recovery finalization receipt",
+        )
+        if not isinstance(finalization_document, dict) or not isinstance(
+            finalization_document.get("claims"),
+            dict,
+        ):
+            raise ShadowSignerError("legacy recovery finalization receipt is invalid")
+        finalized_claims = finalization_document["claims"]
+        finalized_at = _parse_utc(
+            finalized_claims.get("finalized_at"),
+            label="legacy recovery finalized_at",
+        )
+        durability_fields = (
+            prepared.get("finalization_durable_at"),
+            prepared.get("finalization_durable_monotonic_ns"),
+            prepared.get("finalization_durable_boot_id"),
+            prepared.get("finalization_durable_clock_source"),
+        )
+        receipt_exact = _exact_file_at(
+            staging_descriptor,
+            FINALIZATION_FILENAME,
+            finalization_payload,
+            mode=0o444,
+            label="legacy recovery finalization receipt",
+        )
+        if receipt_exact and all(value is None for value in durability_fields):
+            os.unlink(FINALIZATION_FILENAME, dir_fd=staging_descriptor)
+            os.fsync(staging_descriptor)
+            receipt_exact = False
+        if all(value is None for value in durability_fields):
+            pending_exact = _exact_file_at(
+                staging_descriptor,
+                FINALIZATION_PENDING_FILENAME,
+                finalization_payload,
+                mode=0o444,
+                label="legacy recovery pending finalization receipt",
+            )
+            if not pending_exact and not finalization_created:
+                repair_at, repair_ns, repair_boot, repair_source = _validated_clock(
+                    _trusted_clock_snapshot()
+                )
+                _require_recovery_window(
+                    trade_date=trade_date,
+                    wallclock=repair_at,
+                    open_dates=open_dates,
+                )
+                _require_clock_progress(
+                    previous_at=finalized_at,
+                    previous_monotonic_ns=int(finalized_claims["finalized_monotonic_ns"]),
+                    previous_boot_id=str(finalized_claims["boot_id"]),
+                    previous_clock_source=str(finalized_claims["clock_source"]),
+                    observed_at=repair_at,
+                    observed_monotonic_ns=repair_ns,
+                    observed_boot_id=repair_boot,
+                    observed_clock_source=repair_source,
+                )
+            _publish_exact_file_at(
+                staging_descriptor,
+                FINALIZATION_PENDING_FILENAME,
+                finalization_payload,
+                mode=0o444,
+                label="legacy recovery pending finalization receipt",
+                fault_point="finalization-receipt-materialize-write",
+            )
+            _test_fault("after-finalization-receipt-fsync")
+            durable_at, durable_ns, durable_boot, durable_source = _validated_clock(
+                _trusted_clock_snapshot()
+            )
+            try:
+                _require_recovery_window(
+                    trade_date=trade_date,
+                    wallclock=durable_at,
+                    open_dates=open_dates,
+                )
+                _require_clock_progress(
+                    previous_at=finalized_at,
+                    previous_monotonic_ns=int(finalized_claims["finalized_monotonic_ns"]),
+                    previous_boot_id=str(finalized_claims["boot_id"]),
+                    previous_clock_source=str(finalized_claims["clock_source"]),
+                    observed_at=durable_at,
+                    observed_monotonic_ns=durable_ns,
+                    observed_boot_id=durable_boot,
+                    observed_clock_source=durable_source,
+                )
+            except (KeyError, TypeError, ValueError, ShadowSignerError):
+                try:
+                    os.unlink(FINALIZATION_PENDING_FILENAME, dir_fd=staging_descriptor)
+                    os.fsync(staging_descriptor)
+                except OSError as exc:
+                    raise ShadowSignerError(
+                        "legacy recovery late finalization cannot be revoked"
+                    ) from exc
+                raise
+            prepared = {
+                **prepared,
+                "phase": "finalization-durable",
+                "state_sequence": 2,
+                "previous_state_sha256": hashlib.sha256(prepared_payload).hexdigest(),
+                "finalization_durable_at": durable_at.isoformat(timespec="microseconds").replace(
+                    "+00:00", "Z"
+                ),
+                "finalization_durable_monotonic_ns": durable_ns,
+                "finalization_durable_boot_id": durable_boot,
+                "finalization_durable_clock_source": durable_source,
+            }
+            prepared_payload = _canonical_bytes(prepared)
+            if seeded_payload is None:  # pragma: no cover - created or loaded above
+                raise ShadowSignerError("legacy recovery prepared seed is unavailable")
+            _validate_prepared_state(
+                prepared,
+                prepared_payload,
+                seed_payload=seeded_payload,
+                expected_binding=expected_binding,
+                capture_claims=capture,
+                active_key_id=active_key_id,
+                active_public_key=active_public_key,
+            )
+            _replace_journal_at(state_descriptor, prepared_name, prepared_payload)
+            _test_fault("after-finalization-durability-prepare")
+        elif any(value is None for value in durability_fields):
+            raise ShadowSignerError("legacy recovery finalization durability journal is invalid")
+        else:
+            durable_at = _parse_utc(
+                durability_fields[0],
+                label="legacy recovery finalization durable_at",
+            )
+            durable_ns = durability_fields[1]
+            durable_boot = durability_fields[2]
+            durable_source = durability_fields[3]
+            if (
+                type(durable_ns) is not int
+                or durable_ns < 0
+                or not isinstance(durable_boot, str)
+                or BOOT_ID.fullmatch(durable_boot) is None
+                or durable_source not in {"CLOCK_BOOTTIME", "CLOCK_MONOTONIC"}
+            ):
+                raise ShadowSignerError(
+                    "legacy recovery finalization durability journal is invalid"
+                )
+            _require_recovery_window(
+                trade_date=trade_date,
+                wallclock=durable_at,
+                open_dates=open_dates,
+            )
+            _require_clock_progress(
+                previous_at=finalized_at,
+                previous_monotonic_ns=int(finalized_claims["finalized_monotonic_ns"]),
+                previous_boot_id=str(finalized_claims["boot_id"]),
+                previous_clock_source=str(finalized_claims["clock_source"]),
+                observed_at=durable_at,
+                observed_monotonic_ns=durable_ns,
+                observed_boot_id=durable_boot,
+                observed_clock_source=durable_source,
+            )
+        if not receipt_exact:
+            pending_exact = _exact_file_at(
+                staging_descriptor,
+                FINALIZATION_PENDING_FILENAME,
+                finalization_payload,
+                mode=0o444,
+                label="legacy recovery pending finalization receipt",
+            )
+            if not pending_exact:
+                raise ShadowSignerError(
+                    "legacy recovery durable pending finalization is unavailable"
+                )
+            publish_at, publish_ns, publish_boot, publish_source = _validated_clock(
+                _trusted_clock_snapshot()
+            )
+            _require_recovery_window(
+                trade_date=trade_date,
+                wallclock=publish_at,
+                open_dates=open_dates,
+            )
+            _require_clock_progress(
+                previous_at=durable_at,
+                previous_monotonic_ns=durable_ns,
+                previous_boot_id=durable_boot,
+                previous_clock_source=durable_source,
+                observed_at=publish_at,
+                observed_monotonic_ns=publish_ns,
+                observed_boot_id=publish_boot,
+                observed_clock_source=publish_source,
+            )
+            _publish_exact_file_at(
+                staging_descriptor,
+                FINALIZATION_FILENAME,
+                finalization_payload,
+                mode=0o444,
+                label="legacy recovery finalization receipt",
+                fault_point="finalization-receipt-write",
+            )
+        with suppress(FileNotFoundError):
+            os.unlink(FINALIZATION_PENDING_FILENAME, dir_fd=staging_descriptor)
+            os.fsync(staging_descriptor)
+        _protect_transaction_files(
+            staging_descriptor,
+            frozenset({*durable_names, FINALIZATION_FILENAME}),
+            finalized=True,
+        )
+        final_directory_stat, final_artifact_digests, final_batch_digest = (
+            _inspect_complete_staging(
+                staging_descriptor,
+                draft=draft,
+                capture=capture,
+            )
+        )
+        if (
+            (final_directory_stat.st_dev, final_directory_stat.st_ino)
+            != (directory_stat.st_dev, directory_stat.st_ino)
+            or final_artifact_digests != artifact_digests
+            or final_batch_digest != batch_digest
+            or not _exact_file_at(
+                staging_descriptor,
+                "recovery-marker.json",
+                marker_payload,
+                mode=0o444,
+                label="legacy recovery marker",
+            )
+            or not _exact_file_at(
+                staging_descriptor,
+                FINALIZATION_FILENAME,
+                finalization_payload,
+                mode=0o444,
+                label="legacy recovery finalization receipt",
+            )
+        ):
+            raise ShadowSignerError("legacy recovery commit proof changed before commit")
+        _test_fault("before-ledger-commit")
+        committed = _committed_head_document(
+            prepared=prepared,
+            prepared_payload=prepared_payload,
+            marker_payload=marker_payload,
+            finalization_payload=finalization_payload,
+        )
+        committed_payload = _canonical_bytes(committed)
+        _validate_committed_head(
+            committed,
+            committed_payload,
+            expected=committed,
+        )
+        committed_seed = {
+            "contract": "legacy-shadow-recovery-committed-seed/v1",
+            "schema_version": 1,
+            "transaction_id": transaction_id,
+            "capture_token_id": capture_token_id,
+            "request_payload_sha256": transaction_request_sha256,
+            "prepared_sha256": committed["prepared_sha256"],
+            "committed_payload_base64": base64.b64encode(committed_payload).decode("ascii"),
+            "committed_payload_sha256": hashlib.sha256(committed_payload).hexdigest(),
+        }
+        _publish_atomic_journal_at(
+            state_descriptor,
+            _committed_seed_name(transaction_id),
+            _canonical_bytes(committed_seed),
+            label="legacy recovery committed seed",
+        )
+        _publish_new_exact_file_at(
+            state_descriptor,
+            committed_name,
+            committed_payload,
+            mode=0o600,
+            label="legacy recovery committed journal",
+            fault_point="ledger-commit-write",
+        )
+        _protected_response(
+            request=request,
+            active_key_id=active_key_id,
+            private_key=private_key,
+            signed_payload=signing_payload,
+            signature_namespace=RECOVERY_NAMESPACE,
+            signature=signature,
+        )
+    finally:
+        if staging_descriptor >= 0:
+            os.close(staging_descriptor)
+        os.close(state_descriptor)
+
+
+def _resume_recovery(
+    *,
+    request: dict[str, object],
+    active_key_id: str,
+    private_key: Path,
+    active_public_key: str,
+    recovery_calendar: Path,
+) -> None:
+    binding = _request_document(request)
+    expected_fields = {
+        "contract",
+        "trade_date",
+        "source_id",
+        "producer_commit",
+        "staging_name",
+    }
+    if (
+        not isinstance(binding, dict)
+        or set(binding) != expected_fields
+        or binding.get("contract") != "rquant-legacy-shadow-recovery-resume-request/v1"
+        or not isinstance(binding.get("trade_date"), str)
+        or not isinstance(binding.get("source_id"), str)
+        or not binding["source_id"]
+        or not isinstance(binding.get("producer_commit"), str)
+        or COMMIT.fullmatch(binding["producer_commit"]) is None
+        or not isinstance(binding.get("staging_name"), str)
+        or STAGING_NAME.fullmatch(binding["staging_name"]) is None
+    ):
+        raise ShadowSignerError("legacy recovery resume binding is invalid")
+    try:
+        date.fromisoformat(binding["trade_date"])
+    except ValueError as exc:
+        raise ShadowSignerError("legacy recovery resume trade date is invalid") from exc
+
+    state_descriptor = _open_recovery_state_root()
+    capture_matches: list[tuple[dict[str, object], dict[str, object]]] = []
+    prepared_matches: list[dict[str, object]] = []
+    capture_pattern = re.compile(r"^transaction-([0-9a-f]{64})\.capture-seed\.json$")
+    prepared_pattern = re.compile(r"^transaction-[0-9a-f]{64}\.prepared\.json$")
+    try:
+        _lock_recovery_state(state_descriptor)
+        names = tuple(os.listdir(state_descriptor))
+        if len(names) > 30_000:
+            raise ShadowSignerError("legacy recovery transaction journal budget exceeded")
+        for capture_name in sorted(name for name in names if capture_pattern.fullmatch(name)):
+            matched_name = capture_pattern.fullmatch(capture_name)
+            if matched_name is None:  # pragma: no cover - filtered above
+                continue
+            loaded_capture = _load_capture_seed_at(
+                state_descriptor,
+                transaction_id=matched_name.group(1),
+                active_key_id=active_key_id,
+                active_public_key=active_public_key,
+            )
+            if loaded_capture is None:  # pragma: no cover - listed above
+                continue
+            capture, claims = loaded_capture
+            if all(
+                claims.get(field_name) == binding[field_name]
+                for field_name in (
+                    "trade_date",
+                    "source_id",
+                    "producer_commit",
+                    "staging_name",
+                )
+            ):
+                capture_matches.append((capture, claims))
+        if not capture_matches:
+            for prepared_name in sorted(name for name in names if prepared_pattern.fullmatch(name)):
+                loaded = _load_journal_at(state_descriptor, prepared_name)
+                if loaded is None:
+                    continue
+                prepared, _payload = loaded
+                draft = prepared.get("draft")
+                if not isinstance(draft, dict):
+                    raise ShadowSignerError("legacy recovery prepared transaction is invalid")
+                if all(
+                    draft.get(field_name) == binding[field_name]
+                    for field_name in (
+                        "trade_date",
+                        "source_id",
+                        "producer_commit",
+                        "staging_name",
+                    )
+                ):
+                    prepared_matches.append(prepared)
+    finally:
+        os.close(state_descriptor)
+    if len(capture_matches) == 1:
+        capture, claims = capture_matches[0]
+        draft = _draft_from_capture_staging(claims=claims)
+        original_document = {
+            "contract": "rquant-legacy-shadow-recovery-sign-request/v2",
+            "capture": capture,
+            "claims": draft,
+        }
+        require_prepared = False
+    elif capture_matches:
+        raise ShadowSignerError("legacy recovery capture seed is ambiguous")
+    elif len(prepared_matches) == 1:
+        prepared = prepared_matches[0]
+        capture = prepared.get("capture")
+        draft = prepared.get("draft")
+        if not isinstance(capture, dict) or not isinstance(draft, dict):
+            raise ShadowSignerError("legacy recovery prepared transaction is invalid")
+        original_document = {
+            "contract": "rquant-legacy-shadow-recovery-sign-request/v2",
+            "capture": capture,
+            "claims": draft,
+        }
+        require_prepared = True
+    else:
+        raise ShadowSignerError("legacy recovery prepared transaction is unavailable or ambiguous")
+    original_payload_sha256 = hashlib.sha256(_canonical_bytes(original_document)).hexdigest()
+    if require_prepared and prepared.get("request_payload_sha256") != original_payload_sha256:
+        raise ShadowSignerError("legacy recovery prepared request binding is invalid")
+    _sign_recovery(
+        request=request,
+        active_key_id=active_key_id,
+        private_key=private_key,
+        active_public_key=active_public_key,
+        recovery_calendar=recovery_calendar,
+        document_override=original_document,
+        transaction_request_payload_sha256=original_payload_sha256,
+        require_prepared=require_prepared,
+    )
+
+
+def _sign_request(keys_path: Path) -> None:
+    request = _decode_request(sys.stdin.buffer.read(MAX_REQUEST_BYTES + 1))
+    (
+        active_key_id,
+        private_key,
+        active_public_key,
+        _previous,
+        recovery_calendar,
+    ) = _load_keys(keys_path)
+    if request["key_id"] != active_key_id:
+        raise ShadowSignerError("Shadow signing request does not use the active key")
+    if request["operation"] == "capture-recovery":
+        _capture_recovery(
+            request=request,
+            active_key_id=active_key_id,
+            private_key=private_key,
+            recovery_calendar=recovery_calendar,
+        )
+        return
+    if request["operation"] == "sign-recovery":
+        _sign_recovery(
+            request=request,
+            active_key_id=active_key_id,
+            private_key=private_key,
+            active_public_key=active_public_key,
+            recovery_calendar=recovery_calendar,
+        )
+        return
+    if request["operation"] == "resume-recovery":
+        _resume_recovery(
+            request=request,
+            active_key_id=active_key_id,
+            private_key=private_key,
+            active_public_key=active_public_key,
+            recovery_calendar=recovery_calendar,
+        )
+        return
+    payload = base64.b64decode(str(request["payload_base64"]), validate=True)
+    response = {
+        "schema_version": 1,
+        "operation": "sign",
+        "request_id": request["request_id"],
+        "key_id": active_key_id,
+        "namespace": request["namespace"],
+        "payload_sha256": request["payload_sha256"],
+        "signature": _sign(private_key, payload),
+    }
+    if SIGNATURE.fullmatch(str(response["signature"])) is None:
+        raise ShadowSignerError("Shadow signer returned an invalid signature")
+    sys.stdout.buffer.write(_canonical_bytes(response))
+
+
+def main(arguments: list[str]) -> int:
+    keys_path = KEYS_FILE
+    operation = "sign"
+    if arguments:
+        if arguments in (["--validate-key-material"], ["--export-public-keyring"]):
+            operation = arguments[0]
+        elif (
+            os.geteuid() != 0
+            and len(arguments) == 3
+            and arguments[0] == "--keys-file"
+            and arguments[2] in {"--validate-key-material", "--export-public-keyring"}
+        ):
+            keys_path = Path(arguments[1])
+            operation = arguments[2]
+        else:
+            raise ShadowSignerError("Shadow signer arguments are not allowed")
+    if operation == "--validate-key-material":
+        _active_key_id, _private_key, _public_key, _previous, recovery_calendar = _load_keys(
+            keys_path
+        )
+        _load_recovery_calendar(recovery_calendar)
+        return 0
+    if operation == "--export-public-keyring":
+        _export_public_keyring(keys_path)
+        return 0
+    _sign_request(keys_path)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except ShadowSignerError as exc:
+        print(f"Shadow signer rejected request: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc

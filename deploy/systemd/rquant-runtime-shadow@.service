@@ -1,0 +1,49 @@
+[Unit]
+Description=rQuant isolated post-close Shadow session (%i)
+After=network-online.target
+Wants=network-online.target
+OnFailure=rquant-alert@%n.service
+StartLimitIntervalSec=3600s
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=lighthouse
+Group=lighthouse
+WorkingDirectory=/home/lighthouse/rquant
+EnvironmentFile=/home/lighthouse/rquant/data/runtime/current/runtime.env
+Environment=APP_ENV=prod RQUANT_DISABLE_DOTENV=1
+Slice=rquant-research.slice
+ExecStart=/usr/local/libexec/rquant-workload-arbiter research -- /home/lighthouse/rquant/.venv/bin/python -m rquant.runtime_service_main --manifest /home/lighthouse/rquant/data/runtime/current/manifests/%i.json --control-root /home/lighthouse/rquant/data/runtime/control/shadow-sessions/%i --expected-commit ${RQUANT_RUNTIME_COMMIT} --expected-generation ${RQUANT_RUNTIME_GENERATION} --expected-kind shadow_session
+
+Restart=on-failure
+RestartSec=30s
+TimeoutStartSec=300s
+TimeoutStopSec=60s
+SuccessExitStatus=0 75
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+InaccessiblePaths=/home/lighthouse/rquant/.env -/home/lighthouse/rquant/data/runtime/current/secrets -/home/lighthouse/rquant/data/runtime/current/credentials
+ProtectProc=invisible
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+ReadWritePaths=/home/lighthouse/rquant/data/runtime/control/shadow-sessions/%i /home/lighthouse/rquant/data/runtime/research/shadow-reports
+ReadOnlyPaths=-/home/lighthouse/rquant/data/runtime/authorities/market-calendar -/home/lighthouse/rquant/data/legacy-shadow
+
+StandardOutput=journal
+StandardError=journal
+
+# Shadow remains an independent comparison service. It reads legacy exports but
+# never alters the legacy monitor, surge watcher, or their current writers.
+# Cloud deployment gate: systemd-analyze verify rquant-runtime-shadow@.service

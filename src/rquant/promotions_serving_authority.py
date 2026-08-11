@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Protocol
 
-from rquant.experiment_registry import ExperimentRegistryReadonlyReader
+from rquant.experiment_registry import PromotionDecisionReadSnapshot
 from rquant.runtime_contracts import canonical_sha256, normalize_aware_utc
 from rquant.runtime_serving_authority import (
     ServingSourceAuthorityPointer,
@@ -20,17 +21,28 @@ from rquant.serving_contracts import FreshnessStatus
 _EMPTY_EVENT_TIME = datetime(1970, 1, 1, tzinfo=UTC)
 
 
+class PromotionDecisionAuthority(Protocol):
+    """The narrow read capability used by serving publication."""
+
+    def read_promotion_decisions(
+        self,
+        *,
+        observed_at: datetime,
+        limit: int = 1_000,
+    ) -> PromotionDecisionReadSnapshot: ...
+
+
 class PromotionsSourceReader:
     """Convert the immutable promotion ledger into a bounded serving source result."""
 
     def __init__(
         self,
         *,
-        registry: ExperimentRegistryReadonlyReader,
+        registry: PromotionDecisionAuthority,
         limit: int = 1_000,
     ) -> None:
-        if not isinstance(registry, ExperimentRegistryReadonlyReader):
-            raise TypeError("registry must be ExperimentRegistryReadonlyReader")
+        if not callable(getattr(registry, "read_promotion_decisions", None)):
+            raise TypeError("registry must provide promotion decision reads")
         if limit < 1:
             raise ValueError("limit must be positive")
         self.registry = registry

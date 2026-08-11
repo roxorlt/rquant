@@ -5,13 +5,31 @@ from __future__ import annotations
 import os
 import re
 import stat
+from collections.abc import Callable, Mapping
+from datetime import UTC, date, datetime, time
 from pathlib import Path
+from types import MappingProxyType
 from typing import Annotated, Literal, Protocol, TypeAlias
+from zoneinfo import ZoneInfo
 
-from pydantic import Field, TypeAdapter, ValidationError, field_validator
+from pydantic import (
+    Field,
+    TypeAdapter,
+    ValidationError,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
+from rquant.auction_gap_candidate_input import (
+    AuctionGapCandidateInputError,
+    assemble_auction_gap_candidate_batch,
+)
 from rquant.live_contracts import BatchQualityStatus
-from rquant.runtime_contracts import RuntimeContractModel
+from rquant.live_spool import LiveBatchSpool
+from rquant.reference_data_registry import ReadonlyReferenceRegistry
+from rquant.runtime_contracts import RuntimeContractModel, normalize_aware_utc
+from rquant.runtime_market_session import load_market_calendar_authority
 from rquant.runtime_service_control import RuntimeServicePlane, RuntimeStepResult
 from rquant.runtime_service_entrypoint import (
     RuntimeServiceBuilder,
@@ -25,6 +43,10 @@ from rquant.strategy_candidate_publish_service import (
     GrowthBoardCandidateBatch,
     NShapeCandidateBatch,
     publish_candidate_batch,
+)
+from rquant.strategy_candidate_snapshot import (
+    StrategyCandidateStaticFeatureSemantic,
+    strategy_candidate_schema_fingerprint,
 )
 from rquant.strict_json import (
     StrictJsonError,
@@ -42,12 +64,32 @@ _COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 _MAX_CANDIDATE_INPUT_BYTES = 16 * 1024 * 1024
 _DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
 _FILE_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+_SHANGHAI = ZoneInfo("Asia/Shanghai")
+_AUCTION_INPUT_START = time(9, 26)
+_AUCTION_INPUT_END = time(9, 30)
 
 
 class CandidatePublisherRuntimeSettings(RuntimeContractModel):
     strategy_id: CandidateStrategyId
     strategy_version: Literal[1] = 1
-    candidate_input_path: Path
+    definition_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    executable_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    candidate_schema_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    static_feature_schema: Mapping[str, StrategyCandidateStaticFeatureSemantic]
+    input_mode: Literal["sealed_document", "auction_live"] = "sealed_document"
+    candidate_input_path: Path | None = None
+    auction_spool_root: Path | None = None
+    daily_database_path: Path | None = None
+    reference_registry_path: Path | None = None
+    calendar_path: Path | None = None
+    calendar_expected_commit: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{40}$",
+    )
+    calendar_content_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     snapshot_root: Path
 
     @field_validator("strategy_version", mode="before")
@@ -57,12 +99,68 @@ class CandidatePublisherRuntimeSettings(RuntimeContractModel):
             raise ValueError("strategy_version must be the strict integer 1")
         return value
 
-    @field_validator("candidate_input_path", "snapshot_root")
+    @field_validator("static_feature_schema")
     @classmethod
-    def require_normalized_absolute_path(cls, value: Path) -> Path:
+    def freeze_static_feature_schema(
+        cls,
+        value: Mapping[str, StrategyCandidateStaticFeatureSemantic],
+    ) -> Mapping[str, StrategyCandidateStaticFeatureSemantic]:
+        if not value:
+            raise ValueError("candidate static feature schema cannot be empty")
+        return MappingProxyType(dict(sorted(value.items())))
+
+    @field_serializer("static_feature_schema")
+    def serialize_static_feature_schema(
+        self,
+        value: Mapping[str, StrategyCandidateStaticFeatureSemantic],
+    ) -> dict[str, dict[str, str]]:
+        return {name: semantic.model_dump(mode="json") for name, semantic in value.items()}
+
+    @field_validator(
+        "candidate_input_path",
+        "auction_spool_root",
+        "daily_database_path",
+        "reference_registry_path",
+        "calendar_path",
+        "snapshot_root",
+    )
+    @classmethod
+    def require_normalized_absolute_path(cls, value: Path | None) -> Path | None:
+        if value is None:
+            return None
         if not value.is_absolute() or value != Path(os.path.abspath(value)):
             raise ValueError("candidate runtime paths must be absolute and normalized")
         return value
+
+    @model_validator(mode="after")
+    def validate_input_mode(self) -> CandidatePublisherRuntimeSettings:
+        if self.candidate_schema_fingerprint != strategy_candidate_schema_fingerprint(
+            strategy_id=self.strategy_id,
+            strategy_version=str(self.strategy_version),
+            static_feature_schema=self.static_feature_schema,
+        ):
+            raise ValueError("candidate schema fingerprint does not match static schema")
+        live_paths = (
+            self.auction_spool_root,
+            self.daily_database_path,
+            self.reference_registry_path,
+            self.calendar_path,
+            self.calendar_expected_commit,
+            self.calendar_content_sha256,
+        )
+        if self.input_mode == "sealed_document":
+            if self.candidate_input_path is None:
+                raise ValueError("candidate_input_path is required for sealed_document")
+            if any(path is not None for path in live_paths):
+                raise ValueError("auction live paths are forbidden for sealed_document")
+            return self
+        if self.strategy_id != "auction_gap":
+            raise ValueError("auction_live input mode is only valid for auction_gap")
+        if self.candidate_input_path is not None:
+            raise ValueError("candidate_input_path is forbidden for auction_live")
+        if any(path is None for path in live_paths):
+            raise ValueError("all auction live input paths are required")
+        return self
 
 
 class CandidateInputLoader(Protocol):
@@ -72,6 +170,22 @@ class CandidateInputLoader(Protocol):
         *,
         strategy_id: CandidateStrategyId,
         expected_commit: str,
+    ) -> CandidatePublishBatch: ...
+
+
+class AuctionCandidateInputLoader(Protocol):
+    def __call__(
+        self,
+        *,
+        auction_spool_root: Path,
+        daily_database_path: Path,
+        reference_registry_path: Path,
+        calendar_path: Path,
+        calendar_expected_commit: str,
+        calendar_content_sha256: str,
+        trade_date: date,
+        observed_at: datetime,
+        producer_commit: str,
     ) -> CandidatePublishBatch: ...
 
 
@@ -304,11 +418,47 @@ def load_candidate_input(
     )
 
 
+def load_live_auction_candidate_input(
+    *,
+    auction_spool_root: Path,
+    daily_database_path: Path,
+    reference_registry_path: Path,
+    calendar_path: Path,
+    calendar_expected_commit: str,
+    calendar_content_sha256: str,
+    trade_date: date,
+    observed_at: datetime,
+    producer_commit: str,
+) -> CandidatePublishBatch:
+    calendar = load_market_calendar_authority(
+        calendar_path,
+        expected_commit=calendar_expected_commit,
+    )
+    if calendar.content_sha256 != calendar_content_sha256:
+        raise ValueError("auction candidate calendar content identity mismatch")
+    return assemble_auction_gap_candidate_batch(
+        auction_spool=LiveBatchSpool(auction_spool_root),
+        daily_database_path=daily_database_path,
+        reference_registry=ReadonlyReferenceRegistry(reference_registry_path),
+        calendar=calendar,
+        trade_date=trade_date,
+        observed_at=observed_at,
+        producer_commit=producer_commit,
+    )
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
 def candidate_publisher_builder(
     *,
     candidate_input_loader: CandidateInputLoader | None = None,
+    auction_input_loader: AuctionCandidateInputLoader | None = None,
+    clock: Callable[[], datetime] = _utc_now,
 ) -> RuntimeServiceBuilder:
     loader: CandidateInputLoader = candidate_input_loader or load_candidate_input
+    live_auction_loader = auction_input_loader or load_live_auction_candidate_input
 
     def build(manifest: RuntimeServiceManifest) -> RuntimeServiceStep:
         if manifest.service_kind is not RuntimeServiceKind.CANDIDATE_PUBLISHER:
@@ -318,11 +468,43 @@ def candidate_publisher_builder(
         settings = CandidatePublisherRuntimeSettings.model_validate(dict(manifest.settings))
 
         def step() -> RuntimeStepResult:
-            loaded = loader(
-                settings.candidate_input_path,
-                strategy_id=settings.strategy_id,
-                expected_commit=manifest.producer_commit,
-            )
+            if settings.input_mode == "auction_live":
+                observed_at = normalize_aware_utc(clock())
+                local = observed_at.astimezone(_SHANGHAI)
+                local_time = local.timetz().replace(tzinfo=None)
+                if not _AUCTION_INPUT_START <= local_time <= _AUCTION_INPUT_END:
+                    return RuntimeStepResult()
+                if (
+                    settings.auction_spool_root is None
+                    or settings.daily_database_path is None
+                    or settings.reference_registry_path is None
+                    or settings.calendar_path is None
+                    or settings.calendar_expected_commit is None
+                    or settings.calendar_content_sha256 is None
+                ):
+                    raise RuntimeError("validated auction live paths disappeared")
+                try:
+                    loaded = live_auction_loader(
+                        auction_spool_root=settings.auction_spool_root,
+                        daily_database_path=settings.daily_database_path,
+                        reference_registry_path=settings.reference_registry_path,
+                        calendar_path=settings.calendar_path,
+                        calendar_expected_commit=settings.calendar_expected_commit,
+                        calendar_content_sha256=settings.calendar_content_sha256,
+                        trade_date=local.date(),
+                        observed_at=observed_at,
+                        producer_commit=manifest.producer_commit,
+                    )
+                except AuctionGapCandidateInputError:
+                    return RuntimeStepResult(degraded_reasons=("auction_gap_input_unavailable",))
+            else:
+                if settings.candidate_input_path is None:
+                    raise RuntimeError("validated candidate_input_path disappeared")
+                loaded = loader(
+                    settings.candidate_input_path,
+                    strategy_id=settings.strategy_id,
+                    expected_commit=manifest.producer_commit,
+                )
             batch = _validate_loaded_batch(
                 loaded,
                 strategy_id=settings.strategy_id,
@@ -332,6 +514,10 @@ def candidate_publisher_builder(
                 snapshot_root=settings.snapshot_root,
                 expected_commit=manifest.producer_commit,
                 batch=batch,
+                definition_fingerprint=settings.definition_fingerprint,
+                executable_fingerprint=settings.executable_fingerprint,
+                candidate_schema_fingerprint=settings.candidate_schema_fingerprint,
+                static_feature_schema=settings.static_feature_schema,
             )
             return RuntimeStepResult(
                 output_sequence=summary.snapshot_sequence,
@@ -349,11 +535,13 @@ def candidate_publisher_builder(
 
 
 __all__ = [
+    "AuctionCandidateInputLoader",
     "CandidateInputLoader",
     "CandidateInputDocument",
     "CandidatePublisherRuntimeSettings",
     "CandidateStrategyId",
     "candidate_publisher_builder",
     "load_candidate_input",
+    "load_live_auction_candidate_input",
     "serialize_candidate_input",
 ]

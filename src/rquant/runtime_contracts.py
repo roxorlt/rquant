@@ -10,6 +10,7 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 from enum import Enum
 from typing import Annotated
+from uuid import UUID
 
 from pydantic import AfterValidator, BaseModel, ConfigDict
 
@@ -59,6 +60,8 @@ def _canonical_value(value: object) -> object:
         return {"$datetime": normalized.isoformat(timespec="microseconds")}
     if isinstance(value, date):
         return {"$date": value.isoformat()}
+    if isinstance(value, UUID):
+        return {"$uuid": str(value)}
     if isinstance(value, Mapping):
         if any(not isinstance(key, str) for key in value):
             raise TypeError("canonical mappings require string keys")

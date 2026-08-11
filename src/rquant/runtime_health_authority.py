@@ -28,6 +28,7 @@ from rquant.runtime_serving_snapshot import (
     SourceReadResult,
 )
 from rquant.serving_contracts import FreshnessStatus
+from rquant.serving_read_models import ServingProjectionPayload
 
 _DIRECTORY_FLAGS = (
     os.O_RDONLY
@@ -37,6 +38,92 @@ _DIRECTORY_FLAGS = (
 )
 _FILE_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
 _DEFAULT_MAX_BYTES = 1024 * 1024
+
+
+def _service_summary(
+    services: tuple[RuntimeServiceHealth, ...],
+    *tokens: str,
+) -> tuple[str, str | None, datetime | None]:
+    selected = next(
+        (
+            service
+            for service in services
+            if any(token in service.service_id.lower() for token in tokens)
+        ),
+        None,
+    )
+    if selected is None:
+        return "unavailable", None, None
+    substate = "stale" if selected.stale else "healthy"
+    last_at = None if selected.heartbeat is None else selected.heartbeat.heartbeat_at
+    return selected.status.value, substate, last_at
+
+
+def _dashboard_summary_projection(
+    *,
+    services: tuple[RuntimeServiceHealth, ...],
+    observed_at: datetime,
+    source_receipts: dict[str, str],
+) -> tuple[ServingProjectionPayload, str]:
+    def timestamp(value: datetime | None) -> str | None:
+        return None if value is None else normalize_aware_utc(value).isoformat()
+
+    monitor_state, monitor_substate, monitor_last_at = _service_summary(
+        services,
+        "monitor",
+        "market-minute",
+    )
+    daily_state, daily_exec_status, daily_last_at = _service_summary(
+        services,
+        "daily",
+        "close",
+    )
+    dashboard_state, _dashboard_substate, _dashboard_last_at = _service_summary(
+        services,
+        "dashboard",
+    )
+    projection = ServingProjectionPayload(
+        table_name="dashboard_summary",
+        available_at=observed_at,
+        rows=(
+            {
+                "snapshot_key": "current",
+                "latest_daily_bar": None,
+                "latest_screen": None,
+                "daily_bar_rows": None,
+                "monitor_event_rows": None,
+                "minute_bar_rows": None,
+                "minute_codes": None,
+                "minute_min_time": None,
+                "minute_max_time": None,
+                "host_name": os.uname().nodename,
+                "monitor_state": monitor_state,
+                "monitor_substate": monitor_substate,
+                "monitor_next_at": None,
+                "monitor_last_at": timestamp(monitor_last_at),
+                "daily_state": daily_state,
+                "daily_exec_status": daily_exec_status,
+                "daily_next_at": None,
+                "daily_last_at": timestamp(daily_last_at),
+                "dashboard_state": dashboard_state,
+                "backup_snapshot_at": None,
+                "backup_source_bytes": None,
+                "backup_compressed_bytes": None,
+                "backup_last_download_at": None,
+                "backup_last_download_ip": None,
+                "backup_last_download_bytes": None,
+            },
+        ),
+    )
+    generation_id = canonical_sha256(
+        {
+            "contract": "runtime-health-dashboard-summary/v1",
+            "observed_at": observed_at,
+            "source_receipts": dict(sorted(source_receipts.items())),
+            "projection": projection,
+        }
+    )
+    return projection, generation_id
 
 
 class RuntimeHealthAuthorityIntegrityError(RuntimeError):
@@ -359,8 +446,18 @@ class RuntimeHealthSourceReader:
         services: list[RuntimeServiceHealth] = []
         reasons: list[str] = []
         event_times: list[datetime] = []
+        source_receipts: dict[str, str] = {}
         for source in self.sources:
             heartbeat = _read_heartbeat(source, max_bytes=self.max_heartbeat_bytes)
+            source_receipts[source.spec.service_id] = canonical_sha256(
+                {
+                    "contract": "runtime-health-source-receipt/v1",
+                    "control_root": str(source.control_root),
+                    "spec": source.spec.model_dump(mode="json"),
+                    "heartbeat": (None if heartbeat is None else heartbeat.model_dump(mode="json")),
+                    "observed_at": observed,
+                }
+            )
             if heartbeat is None:
                 services.append(
                     RuntimeServiceHealth(
@@ -394,6 +491,12 @@ class RuntimeHealthSourceReader:
 
         status = FreshnessStatus.FRESH if not reasons else FreshnessStatus.DEGRADED
         reason = None if not reasons else ",".join(sorted(reasons))
+        service_snapshot = tuple(services)
+        dashboard_projection, dashboard_generation_id = _dashboard_summary_projection(
+            services=service_snapshot,
+            observed_at=observed,
+            source_receipts=source_receipts,
+        )
         values: dict[str, object] = {
             "dataset_id": RUNTIME_HEALTH_DATASET_ID,
             "sequence": int(observed.timestamp() * 1_000_000),
@@ -401,7 +504,13 @@ class RuntimeHealthSourceReader:
             "published_at": observed,
             "status": status,
             "reason": reason,
-            "payload": RuntimeHealthPayload(runtime_services=tuple(services)),
+            "payload": RuntimeHealthPayload(
+                runtime_services=service_snapshot,
+                projections=(dashboard_projection,),
+                dashboard_summary_observed_at=observed,
+                dashboard_summary_generation_id=dashboard_generation_id,
+                dashboard_summary_source_receipts=source_receipts,
+            ),
         }
         values["generation_id"] = canonical_sha256(values)
         return SourceReadResult.model_validate(values)

@@ -11,8 +11,8 @@ Type=simple
 User=lighthouse
 Group=lighthouse
 WorkingDirectory=/home/lighthouse/rquant
-Environment=RQUANT_DISABLE_DOTENV=1
 EnvironmentFile=/home/lighthouse/rquant/data/runtime/current/runtime.env
+Environment=APP_ENV=prod RQUANT_DISABLE_DOTENV=1
 Slice=rquant-live.slice
 ExecStart=/home/lighthouse/rquant/.venv/bin/python -m rquant.runtime_service_main --manifest /home/lighthouse/rquant/data/runtime/current/manifests/%i.json --control-root /home/lighthouse/rquant/data/runtime/control/strategies/%i --expected-commit ${RQUANT_RUNTIME_COMMIT} --expected-generation ${RQUANT_RUNTIME_GENERATION} --expected-kind strategy_live
 

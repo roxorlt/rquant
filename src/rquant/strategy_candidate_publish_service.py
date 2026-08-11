@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from datetime import date
 from pathlib import Path
 from typing import Annotated, Literal, TypeAlias
@@ -72,6 +73,10 @@ def publish_candidate_batch(
     snapshot_root: Path,
     expected_commit: str,
     batch: CandidatePublishBatch,
+    definition_fingerprint: str,
+    executable_fingerprint: str,
+    candidate_schema_fingerprint: str,
+    static_feature_schema: Mapping[str, object],
 ) -> CandidatePublishSummary:
     if _COMMIT_PATTERN.fullmatch(expected_commit) is None:
         raise ValueError("expected commit must be a full lowercase Git SHA")
@@ -111,6 +116,10 @@ def publish_candidate_batch(
         captured_at=authority.captured_at,
         producer_commit=expected_commit,
         rows=rows,
+        definition_fingerprint=definition_fingerprint,
+        executable_fingerprint=executable_fingerprint,
+        candidate_schema_fingerprint=candidate_schema_fingerprint,
+        static_feature_schema=static_feature_schema,
     )
     return CandidatePublishSummary(
         strategy_id=strategy_id,

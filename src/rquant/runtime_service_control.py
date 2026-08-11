@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import fcntl
 import json
+import math
 import os
 import tempfile
+import time
 from collections.abc import Callable, Mapping
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
@@ -26,6 +28,8 @@ from rquant.runtime_contracts import (
 
 CommitSha = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{40}$")]
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+StepDuration = Annotated[float, Field(ge=0, allow_inf_nan=False)]
+_STEP_DURATION_WINDOW = 20
 
 
 class RuntimeServiceAlreadyRunningError(RuntimeError):
@@ -110,6 +114,12 @@ class RuntimeServiceHeartbeat(RuntimeContractModel):
     consecutive_failures: int = Field(default=0, ge=0)
     total_failures: int = Field(default=0, ge=0)
     total_successes: int = Field(default=0, ge=0)
+    last_step_duration_seconds: StepDuration | None = None
+    p95_step_duration_seconds: StepDuration | None = None
+    recent_step_durations_seconds: tuple[StepDuration, ...] = Field(
+        default=(),
+        max_length=_STEP_DURATION_WINDOW,
+    )
     source_generations: Mapping[str, Sha256] = Field(default_factory=dict)
     degraded_reasons: tuple[str, ...] = ()
     last_error: str | None = None
@@ -146,6 +156,19 @@ class RuntimeServiceHeartbeat(RuntimeContractModel):
             raise ValueError("active heartbeat cannot contain stop fields")
         if self.last_success_at is not None and self.last_success_at < self.started_at:
             raise ValueError("last_success_at cannot precede service start")
+        durations = self.recent_step_durations_seconds
+        if not durations:
+            if (
+                self.last_step_duration_seconds is not None
+                or self.p95_step_duration_seconds is not None
+            ):
+                raise ValueError("step latency summaries require a duration window")
+        else:
+            if self.last_step_duration_seconds != durations[-1]:
+                raise ValueError("last step duration must match the duration window tail")
+            expected_p95 = _nearest_rank_p95(durations)
+            if self.p95_step_duration_seconds != expected_p95:
+                raise ValueError("p95 step duration does not match the duration window")
         return self
 
 
@@ -164,6 +187,30 @@ Clock = Callable[[], datetime]
 def _error_text(error: BaseException) -> str:
     message = str(error).strip()
     return type(error).__name__ if not message else f"{type(error).__name__}: {message}"
+
+
+def _nearest_rank_p95(durations: tuple[float, ...]) -> float:
+    ordered = tuple(sorted(durations))
+    return ordered[max(0, math.ceil(0.95 * len(ordered)) - 1)]
+
+
+def _duration_updates(
+    current: RuntimeServiceHeartbeat,
+    duration_seconds: float | None,
+) -> dict[str, object]:
+    if duration_seconds is None:
+        return {}
+    if not isinstance(duration_seconds, int | float) or isinstance(duration_seconds, bool):
+        raise TypeError("duration_seconds must be a finite number")
+    duration = float(duration_seconds)
+    if not math.isfinite(duration) or duration < 0:
+        raise ValueError("duration_seconds must be finite and non-negative")
+    window = (*current.recent_step_durations_seconds, duration)[-_STEP_DURATION_WINDOW:]
+    return {
+        "last_step_duration_seconds": duration,
+        "p95_step_duration_seconds": _nearest_rank_p95(window),
+        "recent_step_durations_seconds": window,
+    }
 
 
 class RuntimeServiceControl:
@@ -285,7 +332,12 @@ class RuntimeServiceControl:
             raise RuntimeError("runtime service control is not active")
         return self._heartbeat
 
-    def record_success(self, result: RuntimeStepResult) -> RuntimeServiceHeartbeat:
+    def record_success(
+        self,
+        result: RuntimeStepResult,
+        *,
+        duration_seconds: float | None = None,
+    ) -> RuntimeServiceHeartbeat:
         current = self._require_active()
         if result.input_sequence < current.input_sequence:
             raise ValueError("input sequence cannot regress")
@@ -311,10 +363,16 @@ class RuntimeServiceControl:
                 source_generations=result.source_generations,
                 degraded_reasons=result.degraded_reasons,
                 last_error=None,
+                **_duration_updates(current, duration_seconds),
             )
         )
 
-    def record_failure(self, error: Exception) -> RuntimeServiceHeartbeat:
+    def record_failure(
+        self,
+        error: Exception,
+        *,
+        duration_seconds: float | None = None,
+    ) -> RuntimeServiceHeartbeat:
         current = self._require_active()
         return self._publish(
             self._validated_update(
@@ -325,6 +383,7 @@ class RuntimeServiceControl:
                 total_failures=current.total_failures + 1,
                 degraded_reasons=(),
                 last_error=_error_text(error),
+                **_duration_updates(current, duration_seconds),
             )
         )
 
@@ -378,6 +437,7 @@ def run_service_loop(
     stop_event: Event,
     interval_seconds: float,
     max_iterations: int | None = None,
+    monotonic_clock: Callable[[], float] = time.monotonic,
 ) -> RuntimeServiceHeartbeat:
     if interval_seconds < 0:
         raise ValueError("interval_seconds cannot be negative")
@@ -387,10 +447,19 @@ def run_service_loop(
     completed = 0
     try:
         while not stop_event.is_set() and (max_iterations is None or completed < max_iterations):
+            started = monotonic_clock()
             try:
-                control.record_success(step())
+                result = step()
             except Exception as error:
-                control.record_failure(error)
+                control.record_failure(
+                    error,
+                    duration_seconds=monotonic_clock() - started,
+                )
+            else:
+                control.record_success(
+                    result,
+                    duration_seconds=monotonic_clock() - started,
+                )
             completed += 1
             if max_iterations is None or completed < max_iterations:
                 stop_event.wait(interval_seconds)

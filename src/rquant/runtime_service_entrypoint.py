@@ -11,7 +11,7 @@ from enum import StrEnum
 from pathlib import Path
 from threading import Event
 from types import MappingProxyType
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated, Literal
 
 from pydantic import Field, JsonValue, StringConstraints, field_serializer, field_validator
 
@@ -25,6 +25,9 @@ from rquant.runtime_service_control import (
     RuntimeStepResult,
     run_service_loop,
 )
+
+if TYPE_CHECKING:
+    from rquant.runtime_artifact_terminal_lifecycle import ProductionArtifactTerminalLifecycle
 
 CommitSha = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{40}$")]
 _GENERATION_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -58,19 +61,33 @@ def _thaw_setting(value: object) -> object:
 
 
 class RuntimeServiceKind(StrEnum):
+    REFERENCE_SLOW_SOURCE = "reference_slow_source"
+    REFERENCE_SLOW_PUBLISHER = "reference_slow_publisher"
+    AUCTION_UNIVERSE_PUBLISHER = "auction_universe_publisher"
+    AUCTION_MATCH_SOURCE = "auction_match_source"
     MARKET_MINUTE_SOURCE = "market_minute_source"
+    WATCHLIST_QUOTE_SOURCE = "watchlist_quote_source"
+    DAILY_CLOSE_SOURCE = "daily_close_source"
+    SHADOW_SESSION = "shadow_session"
+    DAILY_PIPELINE_ORCHESTRATOR = "daily_pipeline_orchestrator"
     CANDIDATE_PUBLISHER = "candidate_publisher"
     FEATURE_LIVE = "feature_live"
     STRATEGY_LIVE = "strategy_live"
     SIGNAL_ROUTER = "signal_router"
     NOTIFIER = "notifier"
     PAPER_CONSUMER = "paper_consumer"
+    PAPER_CONSTRAINT_PUBLISHER = "paper_constraint_publisher"
     PAPER_BROKER = "paper_broker"
+    RUNTIME_HEALTH_PUBLISHER = "runtime_health_publisher"
+    LAB_JOBS_PUBLISHER = "lab_jobs_publisher"
+    LAB_ARTIFACT_CATALOG = "lab_artifact_catalog"
+    ARTIFACT_RETENTION = "artifact_retention"
+    PROMOTIONS_PUBLISHER = "promotions_publisher"
     SERVING_PUBLISHER = "serving_publisher"
 
 
 class RuntimeServiceManifest(RuntimeContractModel):
-    schema_version: int = Field(default=1, ge=1)
+    schema_version: Literal[1, 2] = 2
     service_id: str = Field(min_length=1)
     service_kind: RuntimeServiceKind
     plane: RuntimeServicePlane
@@ -112,9 +129,66 @@ RuntimeServiceStep = Callable[[], RuntimeStepResult]
 RuntimeServiceBuilder = Callable[[RuntimeServiceManifest], RuntimeServiceStep]
 
 
+class ArtifactTerminalOwnerStep:
+    """Keep one terminal-owner lifecycle alive for a runtime step's lifetime."""
+
+    def __init__(
+        self,
+        *,
+        step: RuntimeServiceStep,
+        artifact_terminal_lifecycle: ProductionArtifactTerminalLifecycle,
+        resource_closer: Callable[[], None] | None = None,
+    ) -> None:
+        self._step = step
+        self.artifact_terminal_lifecycle = artifact_terminal_lifecycle
+        self._resource_closer = resource_closer
+        self._closed = False
+
+    def __call__(self) -> RuntimeStepResult:
+        return self._step()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        errors: list[BaseException] = []
+        if self._resource_closer is not None:
+            try:
+                self._resource_closer()
+            except BaseException as exc:
+                errors.append(exc)
+        try:
+            self.artifact_terminal_lifecycle.close()
+        except BaseException as exc:
+            errors.append(exc)
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise BaseExceptionGroup("runtime owner cleanup failed", errors)
+
+
 class RuntimeServiceRegistry:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        artifact_terminal_lifecycle_factory: (
+            Callable[[], ProductionArtifactTerminalLifecycle] | None
+        ) = None,
+    ) -> None:
         self._builders: dict[RuntimeServiceKind, RuntimeServiceBuilder] = {}
+        self._artifact_terminal_lifecycle_factory = artifact_terminal_lifecycle_factory
+
+    def open_artifact_terminal_lifecycle(self) -> ProductionArtifactTerminalLifecycle:
+        """Open the production-only terminal-owner composition on demand.
+
+        Builders that create audit/snapshot/experiment terminal owners obtain the
+        shared hook composition here.  Readers and unrelated services never open
+        the lifecycle's writable authorities.
+        """
+
+        if self._artifact_terminal_lifecycle_factory is None:
+            raise RuntimeError("artifact terminal lifecycle is unavailable in this runtime")
+        return self._artifact_terminal_lifecycle_factory()
 
     def register(
         self,
@@ -132,10 +206,11 @@ class RuntimeServiceRegistry:
     def build(self, manifest: RuntimeServiceManifest) -> RuntimeServiceStep:
         try:
             builder = self._builders[manifest.service_kind]
-        except KeyError as exc:
-            raise KeyError(
-                f"runtime service builder is not registered: {manifest.service_kind.value}"
-            ) from exc
+        except KeyError:
+            raise ValueError(
+                "runtime service configuration error: builder is not registered for "
+                f"service kind {manifest.service_kind.value}"
+            ) from None
         return builder(manifest)
 
 
@@ -257,13 +332,18 @@ def run_runtime_service_manifest(
         spec=manifest.service_spec,
         clock=clock,
     )
-    return run_service_loop(
-        control,
-        step=step,
-        stop_event=stop_event,
-        interval_seconds=manifest.interval_seconds,
-        max_iterations=max_iterations,
-    )
+    try:
+        return run_service_loop(
+            control,
+            step=step,
+            stop_event=stop_event,
+            interval_seconds=manifest.interval_seconds,
+            max_iterations=max_iterations,
+        )
+    finally:
+        close = getattr(step, "close", None)
+        if callable(close):
+            close()
 
 
 __all__ = [
@@ -272,6 +352,7 @@ __all__ = [
     "RuntimeServiceManifest",
     "RuntimeServiceRegistry",
     "RuntimeServiceStep",
+    "ArtifactTerminalOwnerStep",
     "load_runtime_service_manifest",
     "run_runtime_service_manifest",
 ]

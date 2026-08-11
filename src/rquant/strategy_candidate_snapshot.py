@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import fcntl
 import json
+import math
 import os
 import re
 import stat
+from bisect import bisect_right
+from collections import OrderedDict
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from datetime import date, datetime
@@ -42,6 +45,8 @@ _PRIVATE_DIRECTORY_MODE = 0o700
 _PRIVATE_FILE_MODE = 0o600
 _MAX_GENERATIONS = 4_096
 _MAX_AUTHORITY_BYTES = 16 * 1024 * 1024
+_GENERATION_CACHE_MAX_ITEMS = 4
+_GENERATION_CACHE_MAX_BYTES = 32 * 1024 * 1024
 _DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
 _ASIA_SHANGHAI = ZoneInfo("Asia/Shanghai")
 
@@ -169,7 +174,11 @@ def _snapshot_content_identity(
         "rows": canonical_rows,
     }
     if schema_version == 3:
-        identity["authority_binding"] = authority_binding
+        identity["authority_binding"] = (
+            None
+            if authority_binding is None
+            else _authority_binding_payload(authority_binding, mode="python")
+        )
         identity["source_snapshot_ids"] = dict(sorted((source_snapshot_ids or {}).items()))
     return identity
 
@@ -284,15 +293,178 @@ class StrategyCandidateRecord(RuntimeContractModel):
         )
 
 
+class StrategyCandidateStaticFeatureSemantic(RuntimeContractModel):
+    dtype: str = Field(min_length=1)
+    semantic: str = Field(min_length=1)
+
+    @field_validator("dtype", mode="before")
+    @classmethod
+    def require_canonical_dtype(cls, value: object) -> str:
+        if not isinstance(value, str) or value not in {
+            "array",
+            "bool",
+            "integer",
+            "null",
+            "number",
+            "object",
+            "string",
+        }:
+            raise ValueError("dtype must be a canonical static feature dtype")
+        return value
+
+
+def validate_candidate_static_feature_value(
+    *,
+    name: str,
+    value: object,
+    semantic: StrategyCandidateStaticFeatureSemantic,
+) -> None:
+    """Validate one detached JSON value against its immutable schema semantic."""
+
+    dtype = semantic.dtype
+    valid = False
+    if dtype == "number":
+        valid = type(value) in {int, float} and (
+            not isinstance(value, float) or math.isfinite(value)
+        )
+    elif dtype == "integer":
+        valid = type(value) is int
+    elif dtype == "string":
+        valid = isinstance(value, str)
+    elif dtype == "bool":
+        valid = type(value) is bool
+    elif dtype == "object":
+        valid = isinstance(value, Mapping)
+    elif dtype == "array":
+        valid = isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray))
+    elif dtype == "null":
+        valid = value is None
+    if not valid:
+        raise ValueError(f"static feature {name!r} does not match declared dtype {dtype!r}")
+
+
+def validate_candidate_static_features_against_schema(
+    *,
+    static_features: Mapping[str, object],
+    static_feature_schema: Mapping[str, StrategyCandidateStaticFeatureSemantic],
+) -> None:
+    if tuple(sorted(static_features)) != tuple(sorted(static_feature_schema)):
+        raise ValueError("static feature names do not match declared schema")
+    for name, semantic in static_feature_schema.items():
+        validate_candidate_static_feature_value(
+            name=name,
+            value=static_features[name],
+            semantic=semantic,
+        )
+
+
+def _canonical_strategy_version(value: str) -> int:
+    if (
+        not isinstance(value, str)
+        or not value.isascii()
+        or not value.isdecimal()
+        or value == "0"
+        or str(int(value)) != value
+    ):
+        raise ValueError("strategy_version must be canonical positive integer text")
+    return int(value)
+
+
+def strategy_candidate_schema_fingerprint(
+    *,
+    strategy_id: str,
+    strategy_version: str,
+    static_feature_schema: Mapping[str, object],
+) -> str:
+    validated_schema = {
+        name: StrategyCandidateStaticFeatureSemantic.model_validate(semantic)
+        for name, semantic in static_feature_schema.items()
+    }
+    return canonical_sha256(
+        {
+            "contract": "strategy-candidate-static-schema/v1",
+            "strategy_id": strategy_id,
+            "strategy_version": _canonical_strategy_version(strategy_version),
+            "static_feature_schema": {
+                name: semantic.model_dump(mode="python")
+                for name, semantic in sorted(validated_schema.items())
+            },
+        }
+    )
+
+
 class StrategyCandidateAuthorityBinding(RuntimeContractModel):
-    schema_version: Literal[1]
+    schema_version: Literal[1, 2, 3]
     strategy_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
     strategy_version: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
+    definition_fingerprint: Sha256 | None = None
+    executable_fingerprint: Sha256 | None = None
+    candidate_schema_fingerprint: Sha256 | None = None
+    static_feature_names: tuple[str, ...] = ()
+    static_feature_schema: Mapping[str, StrategyCandidateStaticFeatureSemantic] = Field(
+        default_factory=dict
+    )
     content_sha256: Sha256
+
+    @field_validator("static_feature_names")
+    @classmethod
+    def canonicalize_static_feature_names(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if value != tuple(sorted(set(value))):
+            raise ValueError("authority static feature names must be sorted and unique")
+        return value
+
+    @field_validator("static_feature_schema")
+    @classmethod
+    def freeze_static_feature_schema(
+        cls,
+        value: Mapping[str, StrategyCandidateStaticFeatureSemantic],
+    ) -> Mapping[str, StrategyCandidateStaticFeatureSemantic]:
+        if any(not isinstance(name, str) or not name for name in value):
+            raise ValueError("authority static feature schema names must be nonempty")
+        return MappingProxyType(dict(sorted(value.items())))
+
+    @field_serializer("static_feature_schema")
+    def serialize_static_feature_schema(
+        self,
+        value: Mapping[str, StrategyCandidateStaticFeatureSemantic],
+    ) -> dict[str, dict[str, str]]:
+        return {name: semantic.model_dump(mode="json") for name, semantic in value.items()}
 
     @model_validator(mode="after")
     def validate_content_hash(self) -> StrategyCandidateAuthorityBinding:
-        expected = canonical_sha256(self.model_dump(mode="python", exclude={"content_sha256"}))
+        static_binding = (
+            self.definition_fingerprint,
+            self.executable_fingerprint,
+            self.candidate_schema_fingerprint,
+        )
+        if self.schema_version == 1 and any(item is not None for item in static_binding):
+            raise ValueError("schema v1 authority cannot contain static semantic fingerprints")
+        if self.schema_version == 2 and (
+            self.definition_fingerprint is None
+            or self.candidate_schema_fingerprint is None
+            or self.executable_fingerprint is not None
+        ):
+            raise ValueError("schema v2 authority requires its two legacy fingerprints")
+        if self.schema_version == 3:
+            if any(item is None for item in static_binding):
+                raise ValueError("schema v3 authority requires all semantic fingerprints")
+            if not self.static_feature_schema:
+                raise ValueError("schema v3 authority requires a static feature schema")
+            expected_names = tuple(self.static_feature_schema)
+            if self.static_feature_names != expected_names:
+                raise ValueError("authority static feature names must exactly match its schema")
+            expected_schema_fingerprint = strategy_candidate_schema_fingerprint(
+                strategy_id=self.strategy_id,
+                strategy_version=self.strategy_version,
+                static_feature_schema=self.static_feature_schema,
+            )
+            if self.candidate_schema_fingerprint != expected_schema_fingerprint:
+                raise ValueError("candidate schema fingerprint does not match static schema")
+        elif self.static_feature_names or self.static_feature_schema:
+            raise ValueError("legacy authority cannot contain a static feature schema")
+        expected = canonical_sha256(
+            _authority_binding_payload(self, mode="python", include_content_hash=False)
+        )
         if self.content_sha256 != expected:
             raise ValueError("authority binding content_sha256 does not bind its identity")
         return self
@@ -303,13 +475,47 @@ class StrategyCandidateAuthorityBinding(RuntimeContractModel):
         *,
         strategy_id: str,
         strategy_version: str,
+        definition_fingerprint: str,
+        executable_fingerprint: str,
+        candidate_schema_fingerprint: str,
+        static_feature_schema: Mapping[str, object],
     ) -> StrategyCandidateAuthorityBinding:
+        validated_schema = {
+            name: StrategyCandidateStaticFeatureSemantic.model_validate(semantic)
+            for name, semantic in static_feature_schema.items()
+        }
         identity = {
-            "schema_version": 1,
+            "schema_version": 3,
             "strategy_id": strategy_id,
             "strategy_version": strategy_version,
+            "definition_fingerprint": definition_fingerprint,
+            "executable_fingerprint": executable_fingerprint,
+            "candidate_schema_fingerprint": candidate_schema_fingerprint,
+            "static_feature_names": tuple(sorted(validated_schema)),
+            "static_feature_schema": dict(sorted(validated_schema.items())),
         }
         return cls(**identity, content_sha256=canonical_sha256(identity))
+
+
+def _authority_binding_payload(
+    binding: StrategyCandidateAuthorityBinding,
+    *,
+    mode: Literal["json", "python"],
+    include_content_hash: bool = True,
+) -> dict[str, object]:
+    exclude = set() if include_content_hash else {"content_sha256"}
+    payload = binding.model_dump(mode=mode, exclude=exclude)
+    if binding.schema_version == 1:
+        payload.pop("definition_fingerprint", None)
+        payload.pop("executable_fingerprint", None)
+        payload.pop("candidate_schema_fingerprint", None)
+        payload.pop("static_feature_names", None)
+        payload.pop("static_feature_schema", None)
+    elif binding.schema_version == 2:
+        payload.pop("executable_fingerprint", None)
+        payload.pop("static_feature_names", None)
+        payload.pop("static_feature_schema", None)
+    return payload
 
 
 class StrategyCandidateSnapshot(RuntimeContractModel):
@@ -377,6 +583,16 @@ class StrategyCandidateSnapshot(RuntimeContractModel):
                 (row.strategy_id, row.strategy_version) != expected_identity for row in self.rows
             ):
                 raise ValueError("schema v3 row identity does not match authority binding")
+            if any(
+                tuple(row.static_features) != self.authority_binding.static_feature_names
+                for row in self.rows
+            ):
+                raise ValueError("schema v3 row static features do not match authority schema")
+            for row in self.rows:
+                validate_candidate_static_features_against_schema(
+                    static_features=row.static_features,
+                    static_feature_schema=self.authority_binding.static_feature_schema,
+                )
         elif self.authority_binding is not None or self.source_snapshot_ids:
             raise ValueError("schema v1/v2 cannot contain schema v3 authority evidence")
         identities = [row.identity for row in self.rows]
@@ -442,6 +658,11 @@ class StrategyCandidateSnapshot(RuntimeContractModel):
     ) -> StrategyCandidateSnapshot:
         normalized_captured_at = normalize_aware_utc(captured_at)
         canonical_rows = tuple(sorted(rows, key=lambda row: row.identity))
+        for row in canonical_rows:
+            validate_candidate_static_features_against_schema(
+                static_features=row.static_features,
+                static_feature_schema=authority_binding.static_feature_schema,
+            )
         identity = _snapshot_content_identity(
             schema_version=3,
             sequence=sequence,
@@ -484,6 +705,92 @@ class StrategyCandidateSnapshotPointer(RuntimeContractModel):
         )
 
 
+class StrategyCandidateGenerationMetadata(RuntimeContractModel):
+    sequence: int = Field(ge=0)
+    generation_sha256: Sha256
+    schema_version: Literal[1, 2, 3]
+    trade_date: date
+    captured_at: AwareUtcDatetime
+    max_available_at: AwareUtcDatetime
+    producer_commit: CommitSha
+    authority_binding_sha256: Sha256 | None = None
+    size_bytes: int = Field(gt=0, le=_MAX_AUTHORITY_BYTES)
+
+    @model_validator(mode="after")
+    def validate_metadata(self) -> StrategyCandidateGenerationMetadata:
+        if self.max_available_at > self.captured_at:
+            raise ValueError("generation max_available_at cannot exceed captured_at")
+        if self.schema_version == 3 and self.authority_binding_sha256 is None:
+            raise ValueError("schema v3 generation metadata requires authority binding")
+        if self.schema_version != 3 and self.authority_binding_sha256 is not None:
+            raise ValueError("legacy generation metadata cannot bind strategy authority")
+        return self
+
+    @classmethod
+    def from_snapshot(
+        cls,
+        snapshot: StrategyCandidateSnapshot,
+        *,
+        size_bytes: int,
+    ) -> StrategyCandidateGenerationMetadata:
+        binding_sha = (
+            snapshot.authority_binding.content_sha256
+            if snapshot.authority_binding is not None
+            else None
+        )
+        return cls(
+            sequence=snapshot.sequence,
+            generation_sha256=snapshot.content_sha256,
+            schema_version=snapshot.schema_version,
+            trade_date=snapshot.trade_date,
+            captured_at=snapshot.captured_at,
+            max_available_at=max(
+                (row.available_at for row in snapshot.rows),
+                default=snapshot.captured_at,
+            ),
+            producer_commit=snapshot.producer_commit,
+            authority_binding_sha256=binding_sha,
+            size_bytes=size_bytes,
+        )
+
+    @property
+    def generation_name(self) -> str:
+        return f"{self.generation_sha256}.json"
+
+    @property
+    def pointer(self) -> StrategyCandidateSnapshotPointer:
+        return StrategyCandidateSnapshotPointer(
+            generation_sha256=self.generation_sha256,
+            sequence=self.sequence,
+            trade_date=self.trade_date,
+            captured_at=self.captured_at,
+            producer_commit=self.producer_commit,
+        )
+
+
+class StrategyCandidateGenerationIndex(RuntimeContractModel):
+    schema_version: Literal[1] = 1
+    entries: tuple[StrategyCandidateGenerationMetadata, ...]
+
+    @field_validator("entries")
+    @classmethod
+    def validate_entries(
+        cls,
+        value: tuple[StrategyCandidateGenerationMetadata, ...],
+    ) -> tuple[StrategyCandidateGenerationMetadata, ...]:
+        if len(value) > _MAX_GENERATIONS:
+            raise ValueError("strategy candidate generation count exceeds limit")
+        if tuple(entry.sequence for entry in value) != tuple(range(len(value))):
+            raise ValueError("generation metadata sequences must be contiguous")
+        hashes = tuple(entry.generation_sha256 for entry in value)
+        if len(hashes) != len(set(hashes)):
+            raise ValueError("generation metadata hashes must be unique")
+        captured = tuple(entry.captured_at for entry in value)
+        if captured != tuple(sorted(captured)):
+            raise ValueError("generation metadata captured_at cannot move backwards")
+        return value
+
+
 class StrategyCandidateSnapshotSpool:
     """Publish and resolve immutable point-in-time candidate generations."""
 
@@ -511,10 +818,16 @@ class StrategyCandidateSnapshotSpool:
         self.current_path = self.root / "current.json"
         self._lock_path = self.root / ".publish.lock"
         self._thread_lock = RLock()
-        self._generation_states: dict[str, tuple[int, ...]] = {}
-        self._generation_snapshots: dict[str, StrategyCandidateSnapshot] = {}
+        self._generation_cache: OrderedDict[
+            str,
+            tuple[tuple[int, ...], StrategyCandidateSnapshot, int],
+        ] = OrderedDict()
+        self._generation_cache_bytes = 0
 
-    def publish(self, snapshot: StrategyCandidateSnapshot) -> StrategyCandidateSnapshot:
+    def publish_legacy_for_migration(
+        self,
+        snapshot: StrategyCandidateSnapshot,
+    ) -> StrategyCandidateSnapshot:
         if not isinstance(snapshot, StrategyCandidateSnapshot):
             raise TypeError("snapshot must be a StrategyCandidateSnapshot")
         if snapshot.schema_version != 2:
@@ -528,8 +841,12 @@ class StrategyCandidateSnapshotSpool:
                 raise StrategyCandidateSnapshotIntegrityError(
                     "bound authority requires strategy-aware publication"
                 )
-            generations = self._read_all_generations(generations_fd)
-            if any(snapshot.schema_version == 3 for snapshot in generations.values()):
+            generations = self._read_generation_index(
+                root_fd,
+                generations_fd,
+                allow_one_orphan=True,
+            )
+            if any(entry.schema_version == 3 for entry in generations):
                 raise StrategyCandidateSnapshotIntegrityError(
                     "schema v3 bound generations require strategy-aware publication"
                 )
@@ -541,7 +858,7 @@ class StrategyCandidateSnapshotSpool:
                 raise
             return self._publish_locked(root_fd, generations_fd, generations, snapshot)
 
-    def publish_records(
+    def publish_legacy_records_for_migration(
         self,
         *,
         trade_date: date,
@@ -565,6 +882,10 @@ class StrategyCandidateSnapshotSpool:
         *,
         strategy_id: str,
         strategy_version: str,
+        definition_fingerprint: str,
+        executable_fingerprint: str,
+        candidate_schema_fingerprint: str,
+        static_feature_schema: Mapping[str, object],
         source_snapshot_ids: Mapping[str, str],
         trade_date: date,
         captured_at: datetime,
@@ -574,6 +895,10 @@ class StrategyCandidateSnapshotSpool:
         authority_binding = StrategyCandidateAuthorityBinding.create(
             strategy_id=strategy_id,
             strategy_version=strategy_version,
+            definition_fingerprint=definition_fingerprint,
+            executable_fingerprint=executable_fingerprint,
+            candidate_schema_fingerprint=candidate_schema_fingerprint,
+            static_feature_schema=static_feature_schema,
         )
         if not isinstance(source_snapshot_ids, Mapping):
             raise TypeError("source_snapshot_ids must be a mapping")
@@ -622,7 +947,11 @@ class StrategyCandidateSnapshotSpool:
         self._initialize_for_publish()
         with self._locked(exclusive=True) as (root_fd, generations_fd):
             self._cleanup_stale_temporaries(root_fd)
-            generations = self._read_all_generations(generations_fd)
+            generations = self._read_generation_index(
+                root_fd,
+                generations_fd,
+                allow_one_orphan=True,
+            )
             binding_exists = self._validate_authority_binding(
                 root_fd,
                 generations,
@@ -631,7 +960,11 @@ class StrategyCandidateSnapshotSpool:
             try:
                 self._validate_current_pointer(root_fd, generations)
             except StrategyCandidateSnapshotIntegrityError:
-                interrupted = None if not generations else generations[max(generations)]
+                interrupted = (
+                    None
+                    if not generations
+                    else self._load_generation(generations_fd, generations[-1])
+                )
                 if (
                     interrupted is not None
                     and validated_request.captured_at >= interrupted.captured_at
@@ -646,9 +979,11 @@ class StrategyCandidateSnapshotSpool:
             if authority_binding is not None and not binding_exists:
                 self._atomic_create_authority_binding(
                     root_fd,
-                    self._model_bytes(authority_binding),
+                    self._authority_binding_bytes(authority_binding),
                 )
-            current = None if not generations else generations[max(generations)]
+            current = (
+                None if not generations else self._load_generation(generations_fd, generations[-1])
+            )
             if current is not None and validated_request.captured_at < current.captured_at:
                 raise StrategyCandidateSnapshotIntegrityError(
                     "captured_at cannot move backwards across sequences"
@@ -667,9 +1002,28 @@ class StrategyCandidateSnapshotSpool:
             )
             return StrategyCandidatePublishResult(snapshot=published, published=True)
 
-    def read_authority_binding(self) -> StrategyCandidateAuthorityBinding:
-        with self._locked(exclusive=False) as (root_fd, _generations_fd):
-            return self._read_authority_binding(root_fd)
+    def read_authority_binding(
+        self,
+        *,
+        strategy_id: str,
+        strategy_version: str,
+        definition_fingerprint: str,
+        executable_fingerprint: str,
+        candidate_schema_fingerprint: str,
+        static_feature_schema: Mapping[str, object],
+    ) -> StrategyCandidateAuthorityBinding:
+        expected = StrategyCandidateAuthorityBinding.create(
+            strategy_id=strategy_id,
+            strategy_version=strategy_version,
+            definition_fingerprint=definition_fingerprint,
+            executable_fingerprint=executable_fingerprint,
+            candidate_schema_fingerprint=candidate_schema_fingerprint,
+            static_feature_schema=static_feature_schema,
+        )
+        with self._locked(exclusive=False) as (root_fd, generations_fd):
+            generations = self._read_generation_index(root_fd, generations_fd)
+            self._validate_authority_binding(root_fd, generations, expected=expected)
+            return expected
 
     def read_strategy_as_of(
         self,
@@ -677,32 +1031,40 @@ class StrategyCandidateSnapshotSpool:
         *,
         strategy_id: str,
         strategy_version: str,
+        definition_fingerprint: str,
+        executable_fingerprint: str,
+        candidate_schema_fingerprint: str,
+        static_feature_schema: Mapping[str, object],
     ) -> StrategyCandidateSnapshot | None:
         normalized_as_of = normalize_aware_utc(as_of)
         expected = StrategyCandidateAuthorityBinding.create(
             strategy_id=strategy_id,
             strategy_version=strategy_version,
+            definition_fingerprint=definition_fingerprint,
+            executable_fingerprint=executable_fingerprint,
+            candidate_schema_fingerprint=candidate_schema_fingerprint,
+            static_feature_schema=static_feature_schema,
         )
         with self._locked(exclusive=False) as (root_fd, generations_fd):
-            generations = self._read_all_generations(generations_fd)
+            generations = self._read_generation_index(root_fd, generations_fd)
             self._validate_authority_binding(
                 root_fd,
                 generations,
                 expected=expected,
             )
             self._validate_current_pointer(root_fd, generations)
-            return self._visible_snapshot(generations, normalized_as_of)
+            return self._visible_snapshot(generations_fd, generations, normalized_as_of)
 
     def _validate_authority_binding(
         self,
         root_fd: int,
-        generations: Mapping[int, StrategyCandidateSnapshot],
+        generations: Sequence[StrategyCandidateGenerationMetadata],
         *,
         expected: StrategyCandidateAuthorityBinding | None,
     ) -> bool:
         exists = self._entry_exists(root_fd, "authority.json")
         if expected is None:
-            if exists or any(snapshot.schema_version == 3 for snapshot in generations.values()):
+            if exists or any(entry.schema_version == 3 for entry in generations):
                 raise StrategyCandidateSnapshotIntegrityError(
                     "bound authority requires strategy-aware publication"
                 )
@@ -719,8 +1081,8 @@ class StrategyCandidateSnapshotSpool:
                 "strategy candidate authority is bound to a different identity"
             )
         if any(
-            snapshot.schema_version != 3 or snapshot.authority_binding != expected
-            for snapshot in generations.values()
+            entry.schema_version != 3 or entry.authority_binding_sha256 != expected.content_sha256
+            for entry in generations
         ):
             raise StrategyCandidateSnapshotIntegrityError(
                 "bound authority generations do not match root identity"
@@ -773,26 +1135,27 @@ class StrategyCandidateSnapshotSpool:
         self,
         root_fd: int,
         generations_fd: int,
-        generations: Mapping[int, StrategyCandidateSnapshot],
+        generations: Sequence[StrategyCandidateGenerationMetadata],
         snapshot: StrategyCandidateSnapshot,
     ) -> StrategyCandidateSnapshot:
-        existing = generations.get(snapshot.sequence)
+        existing = generations[snapshot.sequence] if snapshot.sequence < len(generations) else None
         if existing is not None:
-            if existing != snapshot:
+            loaded = self._load_generation(generations_fd, existing)
+            if loaded != snapshot:
                 raise StrategyCandidateSnapshotIntegrityError(
                     "immutable sequence already contains different content"
                 )
-            return existing
+            return loaded
         if len(generations) >= _MAX_GENERATIONS:
             raise StrategyCandidateSnapshotIntegrityError(
                 "strategy candidate generation count exceeds limit"
             )
-        expected_sequence = 0 if not generations else max(generations) + 1
+        expected_sequence = len(generations)
         if snapshot.sequence != expected_sequence:
             raise StrategyCandidateSnapshotIntegrityError(
                 f"next sequence must be {expected_sequence}, got {snapshot.sequence}"
             )
-        if generations and snapshot.captured_at < generations[max(generations)].captured_at:
+        if generations and snapshot.captured_at < generations[-1].captured_at:
             raise StrategyCandidateSnapshotIntegrityError(
                 "captured_at cannot move backwards across sequences"
             )
@@ -801,11 +1164,25 @@ class StrategyCandidateSnapshotSpool:
             raise StrategyCandidateSnapshotIntegrityError(
                 "generation hash already exists with conflicting sequence authority"
             )
+        snapshot_payload = self._snapshot_bytes(snapshot)
         self._atomic_create_generation(
             root_fd,
             generations_fd,
             generation_name,
-            self._snapshot_bytes(snapshot),
+            snapshot_payload,
+        )
+        updated_index = StrategyCandidateGenerationIndex(
+            entries=(
+                *generations,
+                StrategyCandidateGenerationMetadata.from_snapshot(
+                    snapshot,
+                    size_bytes=len(snapshot_payload),
+                ),
+            )
+        )
+        self._atomic_replace_generation_index(
+            root_fd,
+            self._model_bytes(updated_index),
         )
         self._atomic_replace_pointer(
             root_fd,
@@ -814,40 +1191,73 @@ class StrategyCandidateSnapshotSpool:
         return snapshot
 
     def read_as_of(self, as_of: datetime) -> StrategyCandidateSnapshot | None:
-        normalized_as_of = normalize_aware_utc(as_of)
+        normalize_aware_utc(as_of)
         with self._locked(exclusive=False) as (root_fd, generations_fd):
-            generations = self._read_all_generations(generations_fd)
-            self._validate_current_pointer(root_fd, generations)
-            return self._visible_snapshot(generations, normalized_as_of)
+            if self._entry_exists(root_fd, "authority.json"):
+                raise StrategyCandidateSnapshotIntegrityError(
+                    "strategy-aware authority requires read_strategy_as_of with exact binding"
+                )
+            generations = self._read_generation_index(root_fd, generations_fd)
+            if any(entry.schema_version == 3 for entry in generations):
+                raise StrategyCandidateSnapshotIntegrityError(
+                    "strategy-aware authority requires read_strategy_as_of with exact binding"
+                )
+            if generations:
+                raise StrategyCandidateSnapshotIntegrityError(
+                    "legacy authority requires explicit migration or republication"
+                )
+            return None
 
-    @staticmethod
-    def _visible_snapshot(
-        generations: Mapping[int, StrategyCandidateSnapshot],
+    def read_legacy_for_migration(
+        self,
         as_of: datetime,
     ) -> StrategyCandidateSnapshot | None:
-        visible = [
-            snapshot
-            for snapshot in generations.values()
-            if snapshot.captured_at <= as_of
-            and all(row.available_at <= as_of for row in snapshot.rows)
-        ]
-        return None if not visible else max(visible, key=lambda item: item.sequence)
+        normalized_as_of = normalize_aware_utc(as_of)
+        with self._locked(exclusive=False) as (root_fd, generations_fd):
+            generations = self._read_generation_index(
+                root_fd,
+                generations_fd,
+                allow_unindexed_legacy=True,
+            )
+            self._validate_authority_binding(root_fd, generations, expected=None)
+            self._validate_current_pointer(root_fd, generations)
+            return self._visible_snapshot(generations_fd, generations, normalized_as_of)
+
+    def _visible_snapshot(
+        self,
+        generations_fd: int,
+        generations: Sequence[StrategyCandidateGenerationMetadata],
+        as_of: datetime,
+    ) -> StrategyCandidateSnapshot | None:
+        visible_count = bisect_right(
+            tuple(entry.captured_at for entry in generations),
+            as_of,
+        )
+        if visible_count == 0:
+            return None
+        metadata = generations[visible_count - 1]
+        if metadata.max_available_at > as_of:
+            return None
+        return self._load_generation(generations_fd, metadata)
 
     @staticmethod
     def _same_file(left: os.stat_result, right: os.stat_result) -> bool:
-        return (
+        stable_identity_matches = (
             left.st_dev,
             left.st_ino,
             left.st_mode,
             left.st_uid,
-            left.st_nlink,
         ) == (
             right.st_dev,
             right.st_ino,
             right.st_mode,
             right.st_uid,
-            right.st_nlink,
         )
+        if not stable_identity_matches:
+            return False
+        if stat.S_ISDIR(left.st_mode) and stat.S_ISDIR(right.st_mode):
+            return True
+        return left.st_nlink == right.st_nlink
 
     @staticmethod
     def _validate_private_directory(observed: os.stat_result, *, label: str) -> None:
@@ -1062,76 +1472,181 @@ class StrategyCandidateSnapshotSpool:
                     os.close(lock_fd)
                 os.close(root_fd)
 
-    def _read_all_generations(self, generations_fd: int) -> dict[int, StrategyCandidateSnapshot]:
-        generations: dict[int, StrategyCandidateSnapshot] = {}
-        observed_names: set[str] = set()
+    def _read_generation_index(
+        self,
+        root_fd: int,
+        generations_fd: int,
+        *,
+        allow_one_orphan: bool = False,
+        allow_unindexed_legacy: bool = False,
+    ) -> tuple[StrategyCandidateGenerationMetadata, ...]:
+        index_exists = self._entry_exists(root_fd, "generation-index.json")
+        if index_exists:
+            payload = self._read_regular_file(
+                root_fd,
+                "generation-index.json",
+                label="generation index",
+            )
+            try:
+                index = StrategyCandidateGenerationIndex.model_validate_json(payload)
+            except ValueError as exc:
+                raise StrategyCandidateSnapshotIntegrityError(
+                    "strategy candidate generation index is invalid"
+                ) from exc
+            if self._model_bytes(index) != payload:
+                raise StrategyCandidateSnapshotIntegrityError(
+                    "strategy candidate generation index is not canonical JSON"
+                )
+            indexed = {entry.generation_name: entry for entry in index.entries}
+        else:
+            index = StrategyCandidateGenerationIndex(entries=())
+            indexed = {}
+
+        observed: dict[str, os.stat_result] = {}
         try:
             with os.scandir(generations_fd) as entries:
-                for index, entry in enumerate(entries, start=1):
-                    if index > _MAX_GENERATIONS:
+                for count, entry in enumerate(entries, start=1):
+                    if count > _MAX_GENERATIONS:
                         raise StrategyCandidateSnapshotIntegrityError(
                             "strategy candidate generation count exceeds limit"
                         )
-                    match = re.fullmatch(r"([0-9a-f]{64})\.json", entry.name)
-                    if match is None:
+                    if re.fullmatch(r"[0-9a-f]{64}\.json", entry.name) is None:
                         raise StrategyCandidateSnapshotIntegrityError(
                             "strategy candidate generations contain an unexpected entry"
                         )
-                    observed = entry.stat(follow_symlinks=False)
-                    if stat.S_ISLNK(observed.st_mode):
+                    entry_stat = entry.stat(follow_symlinks=False)
+                    if stat.S_ISLNK(entry_stat.st_mode):
                         raise StrategyCandidateSnapshotIntegrityError(
                             "generation cannot be a symlink"
                         )
-                    self._validate_private_file(observed, label="generation")
-                    state = self._cache_state(observed)
-                    cached_state = self._generation_states.get(entry.name)
-                    if cached_state is None:
-                        snapshot = self._read_snapshot(generations_fd, entry.name)
-                        active = os.stat(
-                            entry.name,
-                            dir_fd=generations_fd,
-                            follow_symlinks=False,
-                        )
-                        if self._cache_state(active) != state:
-                            raise StrategyCandidateSnapshotIntegrityError(
-                                "generation changed while populating cache"
-                            )
-                    else:
-                        if cached_state != state:
-                            raise StrategyCandidateSnapshotIntegrityError(
-                                "immutable generation changed after validation"
-                            )
-                        self._validate_cached_generation(
-                            generations_fd,
-                            entry.name,
-                            expected_state=state,
-                        )
-                        snapshot = self._generation_snapshots[entry.name]
-                    observed_names.add(entry.name)
-                    if snapshot.content_sha256 != match.group(1):
-                        raise StrategyCandidateSnapshotIntegrityError(
-                            "generation filename does not match content_sha256"
-                        )
-                    if snapshot.sequence in generations:
-                        raise StrategyCandidateSnapshotIntegrityError(
-                            "duplicate generation sequence conflict"
-                        )
-                    generations[snapshot.sequence] = snapshot
-                    self._generation_states[entry.name] = state
-                    self._generation_snapshots[entry.name] = snapshot
+                    self._validate_private_file(entry_stat, label="generation")
+                    observed[entry.name] = entry_stat
         except OSError as exc:
             raise StrategyCandidateSnapshotIntegrityError(
                 "strategy candidate generations are unreadable"
             ) from exc
-        if set(self._generation_states) - observed_names:
+
+        missing = set(indexed) - set(observed)
+        extras = set(observed) - set(indexed)
+        if missing:
             raise StrategyCandidateSnapshotIntegrityError(
-                "generation sequence is missing a previously validated entry"
+                "generation sequence is missing an indexed entry"
             )
-        if generations and sorted(generations) != list(range(max(generations) + 1)):
+        for name, metadata in indexed.items():
+            if observed[name].st_size != metadata.size_bytes:
+                raise StrategyCandidateSnapshotIntegrityError(
+                    "immutable generation size changed after indexing"
+                )
+        if not extras:
+            if observed and not index_exists:
+                raise StrategyCandidateSnapshotIntegrityError("generation index is missing")
+            return index.entries
+        if not index_exists and allow_unindexed_legacy:
+            migrated: dict[int, StrategyCandidateGenerationMetadata] = {}
+            for name in extras:
+                snapshot = self._read_snapshot(generations_fd, name)
+                if snapshot.schema_version == 3:
+                    raise StrategyCandidateSnapshotIntegrityError(
+                        "strategy-bound generation requires indexed republication"
+                    )
+                metadata = StrategyCandidateGenerationMetadata.from_snapshot(
+                    snapshot,
+                    size_bytes=observed[name].st_size,
+                )
+                if metadata.generation_name != name:
+                    raise StrategyCandidateSnapshotIntegrityError(
+                        "generation filename does not match content_sha256"
+                    )
+                if metadata.sequence in migrated:
+                    raise StrategyCandidateSnapshotIntegrityError(
+                        "duplicate generation sequence conflict"
+                    )
+                migrated[metadata.sequence] = metadata
+            if tuple(sorted(migrated)) != tuple(range(len(migrated))):
+                raise StrategyCandidateSnapshotIntegrityError(
+                    "generation sequence has a missing or conflicting entry"
+                )
+            return tuple(migrated[index] for index in range(len(migrated)))
+        if not allow_one_orphan or len(extras) != 1 or len(index.entries) >= _MAX_GENERATIONS:
             raise StrategyCandidateSnapshotIntegrityError(
-                "generation sequence has a missing or conflicting entry"
+                "generation index has a duplicate or unindexed generation"
             )
-        return generations
+        orphan_name = next(iter(extras))
+        orphan = self._read_snapshot(generations_fd, orphan_name)
+        if orphan.sequence != len(index.entries):
+            raise StrategyCandidateSnapshotIntegrityError(
+                "orphan generation sequence is not the next contiguous sequence"
+            )
+        if index.entries and orphan.captured_at < index.entries[-1].captured_at:
+            raise StrategyCandidateSnapshotIntegrityError(
+                "orphan generation captured_at moves backwards"
+            )
+        orphan_metadata = StrategyCandidateGenerationMetadata.from_snapshot(
+            orphan,
+            size_bytes=observed[orphan_name].st_size,
+        )
+        if orphan_metadata.generation_name != orphan_name:
+            raise StrategyCandidateSnapshotIntegrityError(
+                "orphan generation filename does not match content"
+            )
+        return (*index.entries, orphan_metadata)
+
+    def _load_generation(
+        self,
+        generations_fd: int,
+        metadata: StrategyCandidateGenerationMetadata,
+    ) -> StrategyCandidateSnapshot:
+        name = metadata.generation_name
+        try:
+            observed = os.stat(name, dir_fd=generations_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise StrategyCandidateSnapshotIntegrityError(
+                "indexed generation is missing or unsafe"
+            ) from exc
+        self._validate_private_file(observed, label="generation")
+        state = self._cache_state(observed)
+        cached = self._generation_cache.get(name)
+        if cached is not None:
+            cached_state, snapshot, _size = cached
+            if cached_state != state:
+                raise StrategyCandidateSnapshotIntegrityError(
+                    "immutable generation changed after validation"
+                )
+            self._validate_cached_generation(
+                generations_fd,
+                name,
+                expected_state=state,
+            )
+            self._generation_cache.move_to_end(name)
+            return snapshot
+
+        snapshot = self._read_snapshot(generations_fd, name)
+        active = os.stat(name, dir_fd=generations_fd, follow_symlinks=False)
+        if self._cache_state(active) != state:
+            raise StrategyCandidateSnapshotIntegrityError(
+                "generation changed while populating cache"
+            )
+        expected = StrategyCandidateGenerationMetadata.from_snapshot(
+            snapshot,
+            size_bytes=active.st_size,
+        )
+        if expected != metadata:
+            raise StrategyCandidateSnapshotIntegrityError(
+                "generation content does not match indexed metadata"
+            )
+        self._generation_cache[name] = (state, snapshot, active.st_size)
+        self._generation_cache_bytes += active.st_size
+        while (
+            len(self._generation_cache) > _GENERATION_CACHE_MAX_ITEMS
+            or self._generation_cache_bytes > _GENERATION_CACHE_MAX_BYTES
+        ):
+            evicted_name, (_evicted_state, _evicted_snapshot, evicted_size) = (
+                self._generation_cache.popitem(last=False)
+            )
+            self._generation_cache_bytes -= evicted_size
+            if evicted_name == name and not self._generation_cache:
+                break
+        return snapshot
 
     @staticmethod
     def _cache_state(observed: os.stat_result) -> tuple[int, ...]:
@@ -1182,7 +1697,7 @@ class StrategyCandidateSnapshotSpool:
     def _validate_current_pointer(
         self,
         root_fd: int,
-        generations: Mapping[int, StrategyCandidateSnapshot],
+        generations: Sequence[StrategyCandidateGenerationMetadata],
     ) -> None:
         pointer_exists = self._entry_exists(root_fd, "current.json")
         if not generations:
@@ -1194,12 +1709,10 @@ class StrategyCandidateSnapshotSpool:
         if not pointer_exists:
             raise StrategyCandidateSnapshotIntegrityError("current pointer is missing")
         pointer = self._read_pointer(root_fd)
-        latest = generations[max(generations)]
-        expected = StrategyCandidateSnapshotPointer.from_snapshot(latest)
+        latest = generations[-1]
+        expected = latest.pointer
         if pointer != expected:
-            if pointer.generation_sha256 not in {
-                snapshot.content_sha256 for snapshot in generations.values()
-            }:
+            if pointer.generation_sha256 not in {entry.generation_sha256 for entry in generations}:
                 raise StrategyCandidateSnapshotIntegrityError(
                     "current pointer generation is missing"
                 )
@@ -1210,10 +1723,10 @@ class StrategyCandidateSnapshotSpool:
     def _finish_interrupted_publish(
         self,
         root_fd: int,
-        generations: Mapping[int, StrategyCandidateSnapshot],
+        generations: Sequence[StrategyCandidateGenerationMetadata],
         snapshot: StrategyCandidateSnapshot,
     ) -> bool:
-        if not generations or generations[max(generations)] != snapshot:
+        if not generations or generations[-1].generation_sha256 != snapshot.content_sha256:
             return False
         if snapshot.sequence == 0:
             if self._entry_exists(root_fd, "current.json"):
@@ -1222,11 +1735,13 @@ class StrategyCandidateSnapshotSpool:
             if not self._entry_exists(root_fd, "current.json"):
                 return False
             pointer = self._read_pointer(root_fd)
-            previous = generations.get(snapshot.sequence - 1)
-            if previous is None or pointer != StrategyCandidateSnapshotPointer.from_snapshot(
-                previous
-            ):
+            previous = generations[snapshot.sequence - 1]
+            if pointer != previous.pointer:
                 return False
+        self._atomic_replace_generation_index(
+            root_fd,
+            self._model_bytes(StrategyCandidateGenerationIndex(entries=tuple(generations))),
+        )
         self._atomic_replace_pointer(
             root_fd,
             self._model_bytes(StrategyCandidateSnapshotPointer.from_snapshot(snapshot)),
@@ -1271,6 +1786,11 @@ class StrategyCandidateSnapshotSpool:
             payload.pop("schema_version")
             for row in payload["rows"]:
                 row.pop("effective_trade_date")
+        if snapshot.schema_version == 3 and snapshot.authority_binding is not None:
+            payload["authority_binding"] = _authority_binding_payload(
+                snapshot.authority_binding,
+                mode="json",
+            )
         return cls._canonical_json_bytes(payload)
 
     def _read_pointer(self, root_fd: int) -> StrategyCandidateSnapshotPointer:
@@ -1296,9 +1816,13 @@ class StrategyCandidateSnapshotSpool:
             binding = StrategyCandidateAuthorityBinding.model_validate_json(payload)
         except ValueError as exc:
             raise StrategyCandidateSnapshotIntegrityError("authority binding is invalid") from exc
-        if self._model_bytes(binding) != payload:
+        if self._authority_binding_bytes(binding) != payload:
             raise StrategyCandidateSnapshotIntegrityError("authority binding is not canonical JSON")
         return binding
+
+    @classmethod
+    def _authority_binding_bytes(cls, binding: StrategyCandidateAuthorityBinding) -> bytes:
+        return cls._canonical_json_bytes(_authority_binding_payload(binding, mode="json"))
 
     @staticmethod
     def _model_bytes(model: RuntimeContractModel) -> bytes:
@@ -1454,8 +1978,27 @@ class StrategyCandidateSnapshotSpool:
                 os.unlink(temporary_name, dir_fd=root_fd)
 
     @classmethod
+    def _atomic_replace_generation_index(cls, root_fd: int, payload: bytes) -> None:
+        temporary_name = f".generation-index.{uuid4().hex}.tmp"
+        try:
+            cls._write_temporary(root_fd, temporary_name, payload)
+            os.replace(
+                temporary_name,
+                "generation-index.json",
+                src_dir_fd=root_fd,
+                dst_dir_fd=root_fd,
+            )
+            os.fsync(root_fd)
+        finally:
+            with suppress(FileNotFoundError):
+                os.unlink(temporary_name, dir_fd=root_fd)
+
+    @classmethod
     def _cleanup_stale_temporaries(cls, root_fd: int) -> None:
-        pattern = re.compile(r"^\.(?:authority|candidate-generation|current)\.[0-9a-f]{32}\.tmp$")
+        pattern = re.compile(
+            r"^\.(?:authority|candidate-generation|current|generation-index)"
+            r"\.[0-9a-f]{32}\.tmp$"
+        )
         with os.scandir(root_fd) as entries:
             for entry in entries:
                 if pattern.fullmatch(entry.name) is None:

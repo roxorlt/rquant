@@ -92,6 +92,8 @@ _VENV_RELATIVE_SYMLINKS = frozenset({"bin/python3", "lib64"})
 ALL_LONG_RUNNING_SERVICES = (
     "rquant-canvas.service",
     "rquant-dashboard.service",
+    "rquant-daily-receipt-signer.socket",
+    "rquant-page-control.service",
     "rquant-monitor.service",
     "rquant-nl-screen.service",
     "rquant-panorama-auth.service",
@@ -115,6 +117,7 @@ SERVICE_TIMERS: dict[str, tuple[str, ...]] = {
 }
 PRIVILEGED_PREFIXES = (
     "deploy/launchd/",
+    "deploy/root-runtime/",
     "deploy/systemd/",
     "deploy/nginx/",
     "deploy/frp/",
@@ -142,6 +145,19 @@ SERVICE_PATTERNS: dict[str, tuple[str, ...]] = {
         "src/rquant/health.py",
         "src/rquant/risk/*",
         "src/rquant/state.py",
+    ),
+    "rquant-page-control.service": (
+        "src/rquant/page_control.py",
+        "src/rquant/page_control_service.py",
+        "src/rquant/canvas_publication_receipt.py",
+        "src/rquant/serving_page_projection_source.py",
+    ),
+    "rquant-daily-receipt-signer.socket": (
+        "deploy/root-runtime/daily_receipt_authority.py",
+        "deploy/libexec/rquant-daily-receipt-signer",
+        "scripts/install-runtime-credential-infra.sh",
+        "deploy/systemd/rquant-daily-receipt-signer.socket",
+        "deploy/systemd/rquant-daily-receipt-signer.service",
     ),
     "rquant-monitor.service": (
         "src/rquant/monitor.py",

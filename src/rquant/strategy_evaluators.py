@@ -8,14 +8,32 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import timedelta
 from decimal import Decimal
-from functools import wraps
 from numbers import Integral, Real
 from types import MappingProxyType
 
+from rquant.definition_registry import (
+    StrategyExitEligibility,
+    StrategyExitPriceBasis,
+    StrategyExitRule,
+    StrategyPercentStop,
+    StrategySellTranche,
+    StrategyStructureStop,
+    StrategyTrailingTakeProfit,
+    TrustedExecutableRegistry,
+    TrustedFeatureImplementation,
+    TrustedStrategyImplementation,
+    _callable_identity,
+    _strategy_executable_fingerprint,
+)
 from rquant.feature_contracts import FeatureRequirement, RequirementLevel
+from rquant.intraday_feature_engine import live_compute
 from rquant.runtime_builder_strategy import StrategyEvaluatorBinding
 from rquant.runtime_contracts import canonical_sha256
 from rquant.signal_contracts import SignalAction
+from rquant.strategy_candidate_snapshot import (
+    StrategyCandidateStaticFeatureSemantic,
+    strategy_candidate_schema_fingerprint,
+)
 from rquant.strategy_runner import (
     StrategyCandidateState,
     StrategyDecision,
@@ -34,6 +52,81 @@ _FEATURE_CONTRACT_VERSION = 3
 _CONTRACT_SCHEMA_VERSION = 1
 _EVALUATOR_SEMANTIC_VERSION = "1.0.0"
 _ENTRY_STATES = frozenset((StrategyLifecycleState.IDLE, StrategyLifecycleState.WATCHING))
+_LIFECYCLE_FEATURES = (
+    "entry_fill_status",
+    "exit_execution_status",
+    "position_closed",
+    "holding_trading_sessions",
+    "position_sellable",
+    "entry_price_raw",
+    "structure_stop_price_raw",
+    "eligible_high_price_raw",
+    "remaining_position_fraction",
+)
+_STOP_LOSS_BPS = 300
+_TRAILING_ACTIVATION_BPS = 800
+_TRAILING_RETRACEMENT_BPS = 300
+
+
+def project_execution_lifecycle_features(
+    source: Mapping[str, object],
+) -> Mapping[str, object]:
+    """Project only authoritative execution state into strategy lifecycle features."""
+    if not isinstance(source, Mapping):
+        raise TypeError("execution lifecycle source must be a mapping")
+    unknown = set(source).difference(_LIFECYCLE_FEATURES)
+    if unknown:
+        raise ValueError("unsupported execution lifecycle field: " + ", ".join(sorted(unknown)))
+
+    projected: dict[str, object] = {}
+    if "entry_fill_status" in source:
+        status = source["entry_fill_status"]
+        if status not in {"pending", "filled", "rejected"}:
+            raise ValueError("entry_fill_status must be pending, filled, or rejected")
+        projected["entry_fill_status"] = status
+    if "exit_execution_status" in source:
+        status = source["exit_execution_status"]
+        if status not in {"none", "pending", "retryable", "filled"}:
+            raise ValueError("exit_execution_status must be none, pending, retryable, or filled")
+        projected["exit_execution_status"] = status
+    if "position_closed" in source:
+        value = source["position_closed"]
+        if type(value) is not bool:
+            raise TypeError("position_closed must be a bool")
+        projected["position_closed"] = value
+    if "holding_trading_sessions" in source:
+        value = source["holding_trading_sessions"]
+        if isinstance(value, bool) or not isinstance(value, Integral) or value < 0:
+            raise ValueError("holding_trading_sessions must be a nonnegative integer")
+        projected["holding_trading_sessions"] = int(value)
+    if "position_sellable" in source:
+        value = source["position_sellable"]
+        if type(value) is not bool:
+            raise TypeError("position_sellable must be a bool")
+        projected["position_sellable"] = value
+
+    for name in (
+        "entry_price_raw",
+        "structure_stop_price_raw",
+        "eligible_high_price_raw",
+        "remaining_position_fraction",
+    ):
+        if name not in source:
+            continue
+        value = source[name]
+        if isinstance(value, bool) or not isinstance(value, (Real, Decimal)):
+            raise TypeError(f"{name} must be a number")
+        normalized = float(value)
+        if not math.isfinite(normalized) or (
+            normalized <= 0 and name != "remaining_position_fraction"
+        ):
+            raise ValueError(f"{name} must be finite and positive")
+        if name == "remaining_position_fraction" and normalized < 0:
+            raise ValueError("remaining_position_fraction cannot be negative")
+        if name == "remaining_position_fraction" and normalized > 1.0:
+            raise ValueError("remaining_position_fraction cannot exceed one")
+        projected[name] = normalized
+    return MappingProxyType(dict(sorted(projected.items())))
 
 
 @dataclass(frozen=True)
@@ -44,10 +137,14 @@ class StaticFeatureSemantic:
     semantic: str
 
     def __post_init__(self) -> None:
-        if not isinstance(self.dtype, str) or not self.dtype.strip():
-            raise ValueError("static feature dtype cannot be empty")
         if not isinstance(self.semantic, str) or not self.semantic.strip():
             raise ValueError("static feature semantic cannot be empty")
+        canonical = StrategyCandidateStaticFeatureSemantic(
+            dtype=self.dtype,
+            semantic=self.semantic,
+        )
+        object.__setattr__(self, "dtype", canonical.dtype)
+        object.__setattr__(self, "semantic", canonical.semantic)
 
     def contract_payload(self) -> dict[str, str]:
         return {"dtype": self.dtype, "semantic": self.semantic}
@@ -65,6 +162,9 @@ class BuiltinStrategyDefinition:
     static_feature_schema: Mapping[str, StaticFeatureSemantic]
     allowed_actions: tuple[SignalAction, ...]
     producer_commit: str
+    entry_evaluator: StrategyEvaluator
+    exit_evaluator: StrategyEvaluator
+    exit_rules: tuple[StrategyExitRule, ...]
     evaluator: StrategyEvaluator
 
     def __post_init__(self) -> None:
@@ -105,8 +205,20 @@ class BuiltinStrategyDefinition:
             raise ValueError("allowed_actions must be unique")
         if tuple(action.value for action in self.allowed_actions) != self.spec.allowed_actions:
             raise ValueError("allowed_actions must exactly match spec.allowed_actions")
-        if not callable(self.evaluator):
-            raise TypeError("evaluator must be callable")
+        if not all(
+            callable(evaluator)
+            for evaluator in (
+                self.entry_evaluator,
+                self.exit_evaluator,
+                self.evaluator,
+            )
+        ):
+            raise TypeError("strategy evaluators must be callable")
+        if not self.exit_rules:
+            raise ValueError("exit_rules cannot be empty")
+        exit_evaluator_id = _callable_identity(self.exit_evaluator)
+        if any(rule.evaluator_id != exit_evaluator_id for rule in self.exit_rules):
+            raise ValueError("exit rules must bind the built-in exit evaluator")
         frozen_schema = MappingProxyType(
             {name: semantic for name, semantic in sorted(self.static_feature_schema.items())}
         )
@@ -141,11 +253,45 @@ class BuiltinStrategyDefinition:
             },
             "allowed_actions": tuple(sorted(action.value for action in self.allowed_actions)),
             "producer_commit": self.producer_commit,
+            "executable_fingerprint": self.executable_fingerprint,
         }
 
     @property
     def contract_fingerprint(self) -> str:
         return canonical_sha256(self.contract_payload())
+
+    @property
+    def candidate_schema_fingerprint(self) -> str:
+        return strategy_candidate_schema_fingerprint(
+            strategy_id=self.strategy_id,
+            strategy_version=str(self.strategy_version),
+            static_feature_schema={
+                name: semantic.contract_payload()
+                for name, semantic in sorted(self.static_feature_schema.items())
+            },
+        )
+
+    @property
+    def executable_fingerprint(self) -> str:
+        registry = TrustedExecutableRegistry(
+            features=(),
+            strategies=(
+                TrustedStrategyImplementation(
+                    strategy_id=self.strategy_id,
+                    implementation_version=self.evaluator_semantic_version,
+                    candidate_schema_fingerprint=self.candidate_schema_fingerprint,
+                    entry_evaluator=self.entry_evaluator,
+                    exit_evaluator=self.exit_evaluator,
+                    runtime_evaluator=self.evaluator,
+                    entry_event="entry_filled",
+                    exit_rules=self.exit_rules,
+                ),
+            ),
+        )
+        return _strategy_executable_fingerprint(
+            self.spec,
+            registry.strategy_binding(self.spec),
+        )
 
 
 class BuiltinStrategyEvaluatorRegistry:
@@ -213,8 +359,47 @@ class BuiltinStrategyEvaluatorRegistry:
         return StrategyEvaluatorBinding(
             strategy_id=definition.strategy_id,
             strategy_version=definition.strategy_version,
-            contract_fingerprint=definition.contract_fingerprint,
+            contract_fingerprint=definition.executable_fingerprint,
             evaluator=definition.evaluator,
+        )
+
+    def trusted_executable_registry(self) -> TrustedExecutableRegistry:
+        feature_names = sorted(
+            {
+                requirement.name
+                for definition in self._definitions.values()
+                for requirement in (
+                    *definition.spec.required_features,
+                    *definition.spec.optional_features,
+                )
+            }
+        )
+        return TrustedExecutableRegistry(
+            features=tuple(
+                TrustedFeatureImplementation(
+                    feature_name=name,
+                    implementation_version=_EVALUATOR_SEMANTIC_VERSION,
+                    evaluator=(
+                        project_execution_lifecycle_features
+                        if name in _LIFECYCLE_FEATURES
+                        else live_compute
+                    ),
+                )
+                for name in feature_names
+            ),
+            strategies=tuple(
+                TrustedStrategyImplementation(
+                    strategy_id=definition.strategy_id,
+                    implementation_version=definition.evaluator_semantic_version,
+                    candidate_schema_fingerprint=definition.candidate_schema_fingerprint,
+                    entry_evaluator=definition.entry_evaluator,
+                    exit_evaluator=definition.exit_evaluator,
+                    runtime_evaluator=definition.evaluator,
+                    entry_event="entry_filled",
+                    exit_rules=definition.exit_rules,
+                )
+                for definition in self._definitions.values()
+            ),
         )
 
 
@@ -260,34 +445,15 @@ def _spec(
     )
 
 
-def _bind_evaluator(
-    evaluator: StrategyEvaluator,
-    spec: StrategySpec,
-) -> StrategyEvaluator:
-    expected_fingerprint = spec.spec_fingerprint
-
-    @wraps(evaluator)
-    def bound(
-        actual_spec: StrategySpec,
-        state: StrategyCandidateState,
-        features: Mapping[str, object],
-    ) -> StrategyDecision | None:
-        if not isinstance(actual_spec, StrategySpec):
-            raise TypeError("spec must be a StrategySpec")
-        if actual_spec.spec_fingerprint != expected_fingerprint:
-            raise ValueError("strategy spec fingerprint does not match evaluator binding")
-        return evaluator(actual_spec, state, features)
-
-    return bound
-
-
 def _definition(
     *,
     spec: StrategySpec,
     static_feature_schema: Mapping[str, StaticFeatureSemantic],
     allowed_actions: tuple[SignalAction, ...],
+    entry_evaluator: StrategyEvaluator,
     evaluator: StrategyEvaluator,
 ) -> BuiltinStrategyDefinition:
+    exit_rules = _builtin_exit_rules()
     return BuiltinStrategyDefinition(
         contract_schema_version=_CONTRACT_SCHEMA_VERSION,
         strategy_id=spec.strategy_id,
@@ -297,7 +463,66 @@ def _definition(
         static_feature_schema=static_feature_schema,
         allowed_actions=allowed_actions,
         producer_commit=spec.producer_commit,
-        evaluator=_bind_evaluator(evaluator, spec),
+        entry_evaluator=entry_evaluator,
+        exit_evaluator=_position_exit_evaluator,
+        exit_rules=exit_rules,
+        evaluator=evaluator,
+    )
+
+
+def _builtin_exit_rules() -> tuple[StrategyExitRule, ...]:
+    evaluator_id = _callable_identity(_position_exit_evaluator)
+    common = {
+        "evaluator_id": evaluator_id,
+        "eligibility": StrategyExitEligibility(
+            settlement_rule="a_share_t_plus_one",
+            minimum_holding_trading_sessions=1,
+            same_day_sell_allowed=False,
+            sellable_position_required=True,
+        ),
+        "price_basis": StrategyExitPriceBasis(
+            adjustment_basis="raw",
+            decision_price="minute_close",
+            execution_price="next_minute_open",
+        ),
+        "structure_stop": StrategyStructureStop(
+            reference="signal_support",
+            buffer_bps=0,
+        ),
+        "percent_stop": StrategyPercentStop(
+            maximum_loss_bps=_STOP_LOSS_BPS,
+            acts_as_fallback=True,
+        ),
+        "trailing_take_profit": StrategyTrailingTakeProfit(
+            activation_gain_bps=_TRAILING_ACTIVATION_BPS,
+            retracement_bps=_TRAILING_RETRACEMENT_BPS,
+            high_watermark="eligible_intraday_high",
+        ),
+    }
+    return (
+        StrategyExitRule(
+            event="take_profit_partial",
+            action=SignalAction.REDUCE.value,
+            sell_tranche=StrategySellTranche(
+                sequence=1,
+                position_fraction=0.5,
+                reevaluate_after_fill=True,
+                terminal_after_fill=False,
+            ),
+            **common,
+        ),
+        StrategyExitRule(
+            event="exit",
+            fill_event="exit_filled",
+            action=SignalAction.S_INTENT.value,
+            sell_tranche=StrategySellTranche(
+                sequence=2,
+                position_fraction=1.0,
+                reevaluate_after_fill=False,
+                terminal_after_fill=True,
+            ),
+            **common,
+        ),
     )
 
 
@@ -427,11 +652,148 @@ def _transition_only(
     )
 
 
+def _entry_fill_transition(
+    state: StrategyCandidateState,
+    features: Mapping[str, object],
+) -> StrategyDecision | None:
+    if state.state is not StrategyLifecycleState.ARMED:
+        return None
+    _ensure_features(features)
+    raw_status = features.get("entry_fill_status")
+    if raw_status is None or raw_status == "pending":
+        return None
+    if not isinstance(raw_status, str):
+        raise TypeError("feature entry_fill_status must be a string")
+    if raw_status == "filled":
+        return _transition_only(
+            event="entry_filled",
+            from_state=StrategyLifecycleState.ARMED,
+            to_state=StrategyLifecycleState.HOLDING,
+        )
+    if raw_status == "rejected":
+        return _transition_only(
+            event="entry_rejected",
+            from_state=StrategyLifecycleState.ARMED,
+            to_state=StrategyLifecycleState.TERMINAL,
+        )
+    raise ValueError("feature entry_fill_status must be pending, filled, or rejected")
+
+
+def _position_exit_evaluator(
+    spec: StrategySpec,
+    state: StrategyCandidateState,
+    features: Mapping[str, object],
+) -> StrategyDecision | None:
+    _ensure_strategy_identity(spec, spec.strategy_id)
+    if state.state is not StrategyLifecycleState.HOLDING:
+        return None
+    _ensure_features(features)
+    holding_sessions = _integer(features, "holding_trading_sessions")
+    sellable = _boolean(features, "position_sellable")
+    latest_close = _number(features, "latest_close")
+    entry_price = _number(features, "entry_price_raw")
+    structure_stop = _number(features, "structure_stop_price_raw")
+    eligible_high = _number(features, "eligible_high_price_raw")
+    remaining_fraction = _number(features, "remaining_position_fraction")
+    exit_execution_status = _text(features, "exit_execution_status")
+    position_closed = _boolean(features, "position_closed")
+    for name, value in (
+        ("latest_close", latest_close),
+        ("entry_price_raw", entry_price),
+        ("structure_stop_price_raw", structure_stop),
+        ("eligible_high_price_raw", eligible_high),
+    ):
+        _require_positive(value, name)
+    if holding_sessions < 0:
+        raise ValueError("feature holding_trading_sessions must be nonnegative")
+    if remaining_fraction > 1.0:
+        raise ValueError("feature remaining_position_fraction cannot exceed one")
+    if exit_execution_status not in {"none", "pending", "retryable", "filled"}:
+        raise ValueError(
+            "feature exit_execution_status must be none, pending, retryable, or filled"
+        )
+    if position_closed:
+        if remaining_fraction != 0.0 or exit_execution_status != "filled":
+            raise ValueError("position_closed requires zero remaining position and a verified fill")
+        return _transition_only(
+            event="exit_filled",
+            from_state=StrategyLifecycleState.HOLDING,
+            to_state=StrategyLifecycleState.TERMINAL,
+        )
+    if remaining_fraction <= 0.0:
+        raise ValueError("open position requires positive remaining_position_fraction")
+    if exit_execution_status == "pending":
+        return None
+    if eligible_high < latest_close:
+        raise ValueError("eligible_high_price_raw cannot be below latest_close")
+    if holding_sessions < 1 or not sellable:
+        return None
+
+    fallback_stop = entry_price * (1.0 - _STOP_LOSS_BPS / 10_000.0)
+    effective_stop = max(structure_stop, fallback_stop)
+    evidence = {
+        "latest_close": latest_close,
+        "entry_price_raw": entry_price,
+        "structure_stop_price_raw": structure_stop,
+        "effective_stop_price_raw": effective_stop,
+        "eligible_high_price_raw": eligible_high,
+        "holding_trading_sessions": holding_sessions,
+        "position_sellable": sellable,
+        "remaining_position_fraction": remaining_fraction,
+        "exit_execution_status": exit_execution_status,
+        "position_closed": position_closed,
+    }
+    expires_seconds = int(spec.parameters["expires_seconds"])
+    if latest_close <= effective_stop:
+        return _signal(
+            event="exit",
+            from_state=StrategyLifecycleState.HOLDING,
+            to_state=StrategyLifecycleState.HOLDING,
+            action=SignalAction.S_INTENT,
+            reason_codes=("t_plus_one_stop",),
+            evidence={**evidence, "sell_tranche_fraction": 1.0},
+            expires_seconds=expires_seconds,
+        )
+    trailing_activated = eligible_high >= entry_price * (1.0 + _TRAILING_ACTIVATION_BPS / 10_000.0)
+    trailing_hit = latest_close <= eligible_high * (1.0 - _TRAILING_RETRACEMENT_BPS / 10_000.0)
+    if trailing_activated and trailing_hit:
+        if remaining_fraction > 0.5:
+            return _signal(
+                event="take_profit_partial",
+                from_state=StrategyLifecycleState.HOLDING,
+                to_state=StrategyLifecycleState.HOLDING,
+                action=SignalAction.REDUCE,
+                reason_codes=("t_plus_one_trailing_take_profit",),
+                evidence={**evidence, "sell_tranche_fraction": 0.5},
+                expires_seconds=expires_seconds,
+            )
+        return _signal(
+            event="exit",
+            from_state=StrategyLifecycleState.HOLDING,
+            to_state=StrategyLifecycleState.HOLDING,
+            action=SignalAction.S_INTENT,
+            reason_codes=("t_plus_one_trailing_exit",),
+            evidence={**evidence, "sell_tranche_fraction": 1.0},
+            expires_seconds=expires_seconds,
+        )
+    return None
+
+
+def _ensure_strategy_identity(spec: StrategySpec, strategy_id: str) -> None:
+    if not isinstance(spec, StrategySpec):
+        raise TypeError("spec must be a StrategySpec")
+    if spec.strategy_id != strategy_id or spec.version != 1:
+        raise ValueError("strategy spec fingerprint does not match evaluator binding")
+
+
 def _n_shape_evaluator(
     spec: StrategySpec,
     state: StrategyCandidateState,
     features: Mapping[str, object],
 ) -> StrategyDecision | None:
+    _ensure_strategy_identity(spec, "n_shape")
+    if state.state is StrategyLifecycleState.ARMED:
+        return _entry_fill_transition(state, features)
     if not _ensure_entry_state(state):
         return None
     _ensure_features(features)
@@ -538,6 +900,9 @@ def _growth_board_surge_evaluator(
     state: StrategyCandidateState,
     features: Mapping[str, object],
 ) -> StrategyDecision | None:
+    _ensure_strategy_identity(spec, "growth_board_surge")
+    if state.state is StrategyLifecycleState.ARMED:
+        return _entry_fill_transition(state, features)
     if not _ensure_entry_state(state):
         return None
     _ensure_features(features)
@@ -672,7 +1037,10 @@ def _auction_gap_evaluator(
     state: StrategyCandidateState,
     features: Mapping[str, object],
 ) -> StrategyDecision | None:
-    if not _ensure_entry_state(state) or state.state is StrategyLifecycleState.WATCHING:
+    _ensure_strategy_identity(spec, "auction_gap")
+    if state.state is StrategyLifecycleState.ARMED:
+        return _entry_fill_transition(state, features)
+    if not _ensure_entry_state(state):
         return None
     _ensure_features(features)
     latest_close = _number(features, "latest_close")
@@ -735,6 +1103,22 @@ def _auction_gap_evaluator(
     )
     if not matched:
         return None
+    if state.state is StrategyLifecycleState.WATCHING:
+        return _signal(
+            event="entry_ready",
+            from_state=state.state,
+            to_state=StrategyLifecycleState.ARMED,
+            action=SignalAction.B_INTENT,
+            reason_codes=("auction_gap_confirmed", "vwap_supported"),
+            evidence={
+                "latest_close": latest_close,
+                "auction_price_raw": auction_price,
+                "auction_vol_ratio_5d": auction_ratio,
+                "gap_pct_close": gap_pct,
+                "candidate_price_basis": basis,
+            },
+            expires_seconds=expires_seconds,
+        )
     return _signal(
         event="observer_match",
         from_state=state.state,
@@ -759,8 +1143,76 @@ def _auction_gap_evaluator(
     )
 
 
+def _n_shape_runtime_evaluator(
+    spec: StrategySpec,
+    state: StrategyCandidateState,
+    features: Mapping[str, object],
+) -> StrategyDecision | None:
+    if state.state is StrategyLifecycleState.HOLDING:
+        _ensure_strategy_identity(spec, "n_shape")
+        return _position_exit_evaluator(spec, state, features)
+    return _n_shape_evaluator(spec, state, features)
+
+
+def _growth_board_surge_runtime_evaluator(
+    spec: StrategySpec,
+    state: StrategyCandidateState,
+    features: Mapping[str, object],
+) -> StrategyDecision | None:
+    if state.state is StrategyLifecycleState.HOLDING:
+        _ensure_strategy_identity(spec, "growth_board_surge")
+        return _position_exit_evaluator(spec, state, features)
+    return _growth_board_surge_evaluator(spec, state, features)
+
+
+def _auction_gap_runtime_evaluator(
+    spec: StrategySpec,
+    state: StrategyCandidateState,
+    features: Mapping[str, object],
+) -> StrategyDecision | None:
+    if state.state is StrategyLifecycleState.HOLDING:
+        _ensure_strategy_identity(spec, "auction_gap")
+        return _position_exit_evaluator(spec, state, features)
+    return _auction_gap_evaluator(spec, state, features)
+
+
+def _execution_lifecycle_transitions() -> tuple[StateTransition, ...]:
+    return (
+        StateTransition(
+            from_state=StrategyLifecycleState.ARMED,
+            event="entry_filled",
+            to_state=StrategyLifecycleState.HOLDING,
+        ),
+        StateTransition(
+            from_state=StrategyLifecycleState.ARMED,
+            event="entry_rejected",
+            to_state=StrategyLifecycleState.TERMINAL,
+        ),
+        StateTransition(
+            from_state=StrategyLifecycleState.HOLDING,
+            event="take_profit_partial",
+            to_state=StrategyLifecycleState.HOLDING,
+        ),
+        StateTransition(
+            from_state=StrategyLifecycleState.HOLDING,
+            event="exit",
+            to_state=StrategyLifecycleState.HOLDING,
+        ),
+        StateTransition(
+            from_state=StrategyLifecycleState.HOLDING,
+            event="exit_filled",
+            to_state=StrategyLifecycleState.TERMINAL,
+        ),
+    )
+
+
 def _build_n_shape_definition(producer_commit: str) -> BuiltinStrategyDefinition:
-    actions = (SignalAction.WATCH, SignalAction.B_INTENT)
+    actions = (
+        SignalAction.WATCH,
+        SignalAction.B_INTENT,
+        SignalAction.REDUCE,
+        SignalAction.S_INTENT,
+    )
     spec = _spec(
         strategy_id="n_shape",
         producer_commit=producer_commit,
@@ -782,6 +1234,7 @@ def _build_n_shape_definition(producer_commit: str) -> BuiltinStrategyDefinition
             "amount_accel_10m",
             "tick_rule_buy_sell_ratio_proxy",
             "historical_sessions",
+            *_LIFECYCLE_FEATURES,
         ),
         transitions=(
             StateTransition(
@@ -804,6 +1257,7 @@ def _build_n_shape_definition(producer_commit: str) -> BuiltinStrategyDefinition
                 event="support_broken",
                 to_state=StrategyLifecycleState.TERMINAL,
             ),
+            *_execution_lifecycle_transitions(),
         ),
         parameters={
             "carry_low_ratio": 1.0,
@@ -832,14 +1286,20 @@ def _build_n_shape_definition(producer_commit: str) -> BuiltinStrategyDefinition
             ),
         },
         allowed_actions=actions,
-        evaluator=_n_shape_evaluator,
+        entry_evaluator=_n_shape_evaluator,
+        evaluator=_n_shape_runtime_evaluator,
     )
 
 
 def _build_growth_board_surge_definition(
     producer_commit: str,
 ) -> BuiltinStrategyDefinition:
-    actions = (SignalAction.WATCH, SignalAction.B_INTENT)
+    actions = (
+        SignalAction.WATCH,
+        SignalAction.B_INTENT,
+        SignalAction.REDUCE,
+        SignalAction.S_INTENT,
+    )
     spec = _spec(
         strategy_id="growth_board_surge",
         producer_commit=producer_commit,
@@ -864,6 +1324,7 @@ def _build_growth_board_surge_definition(
             "tick_rule_buy_sell_ratio_proxy",
             "minute_volume",
             "cumulative_volume",
+            *_LIFECYCLE_FEATURES,
         ),
         transitions=(
             StateTransition(
@@ -881,6 +1342,7 @@ def _build_growth_board_surge_definition(
                 event="entry_ready",
                 to_state=StrategyLifecycleState.ARMED,
             ),
+            *_execution_lifecycle_transitions(),
         ),
         parameters={
             "min_rel_cumulative": 1.4,
@@ -911,12 +1373,18 @@ def _build_growth_board_surge_definition(
             "large_net_vol_t1": StaticFeatureSemantic("number", "t_minus_1_daily_proxy"),
         },
         allowed_actions=actions,
-        evaluator=_growth_board_surge_evaluator,
+        entry_evaluator=_growth_board_surge_evaluator,
+        evaluator=_growth_board_surge_runtime_evaluator,
     )
 
 
 def _build_auction_gap_definition(producer_commit: str) -> BuiltinStrategyDefinition:
-    actions = (SignalAction.WATCH,)
+    actions = (
+        SignalAction.WATCH,
+        SignalAction.B_INTENT,
+        SignalAction.REDUCE,
+        SignalAction.S_INTENT,
+    )
     spec = _spec(
         strategy_id="auction_gap",
         producer_commit=producer_commit,
@@ -937,6 +1405,7 @@ def _build_auction_gap_definition(producer_commit: str) -> BuiltinStrategyDefini
             "amount_accel_5m",
             "amount_accel_10m",
             "tick_rule_buy_sell_ratio_proxy",
+            *_LIFECYCLE_FEATURES,
         ),
         transitions=(
             StateTransition(
@@ -944,6 +1413,12 @@ def _build_auction_gap_definition(producer_commit: str) -> BuiltinStrategyDefini
                 event="observer_match",
                 to_state=StrategyLifecycleState.WATCHING,
             ),
+            StateTransition(
+                from_state=StrategyLifecycleState.WATCHING,
+                event="entry_ready",
+                to_state=StrategyLifecycleState.ARMED,
+            ),
+            *_execution_lifecycle_transitions(),
         ),
         parameters={
             "auction_ratio_min": 0.15,
@@ -973,5 +1448,6 @@ def _build_auction_gap_definition(producer_commit: str) -> BuiltinStrategyDefini
             ),
         },
         allowed_actions=actions,
-        evaluator=_auction_gap_evaluator,
+        entry_evaluator=_auction_gap_evaluator,
+        evaluator=_auction_gap_runtime_evaluator,
     )
