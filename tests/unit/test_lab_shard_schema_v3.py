@@ -1239,5 +1239,10 @@ def test_v3_identity_validation_rejects_incomplete_worker_report_table(
         connection.execute("DROP TABLE lab_worker_report")
         connection.execute("CREATE TABLE lab_worker_report (report_id TEXT PRIMARY KEY)")
 
-    with pytest.raises(lab_jobs.LabDatabaseIdentityError, match="lab_worker_report columns"):
+    with pytest.raises(
+        lab_jobs.LabDatabaseIdentityError,
+        match="^lab jobs SQLite v16 current schema is invalid$",
+    ) as error:
         LabJobReader(store.path).get_job(uuid4())
+    assert isinstance(error.value.__cause__, lab_jobs.LabDatabaseIdentityError)
+    assert "lab_worker_report columns" in str(error.value.__cause__)

@@ -1076,11 +1076,25 @@ def test_first_page_after_new_mutation_never_scans_the_historical_integrity_grap
         )
     else:
         lease = LabJobReader(store.path).list_leases()[-1]
+        # These synthetic records exercise the historical read graph, not queue recovery.
+        for job_id in _job_ids:
+            assert store.fail_unplanned_job(
+                job_id,
+                reason="historical job center graph fixture",
+                lease=lease,
+                now=NOW + timedelta(seconds=300),
+            )
+        historical_job = LabJobReader(store.path).get_job(_job_ids[0])
+        assert historical_job is not None
+        historical_version = historical_job.version
         store.release_scheduler_lease(
             lease,
             now=NOW + timedelta(seconds=300),
         )
         store = _ready_scenario(tmp_path, hold_days=(1,)).store
+        historical_job = LabJobReader(store.path).get_job(_job_ids[0])
+        assert historical_job is not None
+        assert historical_job.version == historical_version
 
     reader = _CountingReader(store.path)
     page = getattr(reader, reader_method)(limit=1)
