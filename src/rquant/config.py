@@ -9,6 +9,7 @@ import os
 import unicodedata
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import Field, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -68,6 +69,32 @@ class Settings(BaseSettings):
     lab_finalizer_authority_key_id: str = ""
     lab_finalizer_authority_key_path: Path | None = None
     lab_finalizer_authority_keyring_path: Path | None = None
+    # V2 workers receive one canonical public-only verification bundle.  It
+    # contains no finalizer or offline-root private signing material.
+    lab_v2_claim_publication_enabled: bool = False
+    lab_claim_publication_worker_verifier_path: Path | None = None
+    # Dedicated claim-finalizer process only.  The canonical material document
+    # references private runtime signing keys and must never be logged.
+    lab_claim_finalizer_enabled: bool = False
+    # Production daemons select only ``current`` below this controlled root.
+    # The legacy single-file field remains available for isolated development fixtures.
+    lab_claim_finalizer_runtime_material_root: Path | None = None
+    lab_claim_finalizer_runtime_trusted_base: Path = Path("/etc/rquant")
+    lab_claim_finalizer_runtime_material_path: Path | None = None
+    lab_claim_finalizer_owner_id: str = "rquant-claim-finalizer"
+    lab_claim_finalizer_lease_seconds: int = Field(default=60, ge=3, le=3_600)
+    lab_claim_finalizer_poll_interval_ms: int = Field(default=500, ge=1, le=60_000)
+    lab_claim_finalizer_max_publications_per_tick: int = Field(default=16, ge=1, le=100)
+    lab_claim_finalizer_failure_backoff_seconds: int = Field(default=1, ge=1, le=3_600)
+    lab_claim_finalizer_failure_backoff_max_seconds: int = Field(default=30, ge=1, le=3_600)
+    # The Lab process only receives verification keys through the service
+    # credential directory.  The compare-and-advance authority and its state
+    # remain outside the Lab runtime root.
+    lab_highwater_authority_command_json: str = ""
+    lab_highwater_stable_identity: str = ""
+    lab_highwater_trusted_keyring_path: Path | None = None
+    lab_highwater_timeout_seconds: float = Field(default=10.0, ge=0.1, le=300)
+    lab_highwater_allow_identity_rotation: bool = False
     lab_jobs_busy_timeout_ms: int = Field(default=5_000, ge=1)
     lab_scheduler_poll_interval_ms: int = Field(default=250, ge=1)
     lab_scheduler_lease_seconds: int = Field(default=60, ge=1)
@@ -79,6 +106,8 @@ class Settings(BaseSettings):
     lab_scheduler_max_claims_per_tick: int = Field(default=16, ge=1, le=128)
     lab_scheduler_max_claim_authority_per_tick: int = Field(default=128, ge=1, le=512)
     lab_scheduler_max_artifact_commits_per_tick: int = Field(default=64, ge=1, le=256)
+    lab_scheduler_full_integrity_interval_seconds: int = Field(default=3_600, ge=60)
+    lab_scheduler_full_integrity_budget_seconds: float = Field(default=30.0, ge=0.01, le=300)
     lab_scheduler_worker_ids: str = ""
     lab_worker_id: str = "rquant-mac-primary"
     lab_worker_poll_interval_ms: int = Field(default=250, ge=1)
@@ -86,6 +115,12 @@ class Settings(BaseSettings):
     lab_worker_lease_extension_seconds: int = Field(default=120, ge=1, le=3_600)
     lab_worker_receipt_timeout_seconds: int = Field(default=30, ge=1)
     lab_worker_max_shards_per_tick: int = Field(default=1, ge=1, le=1)
+    rquant_lab_resource_policy_version: str = ""
+    rquant_lab_resource_authority_config_json: str = ""
+    rquant_external_monotonic_root_service_config_path: Path | None = None
+    rquant_resource_authority_service_config_path: Path | None = None
+    rquant_lab_live_slo_authority_root: Path | None = None
+    rquant_lab_trade_calendar_path: Path | None = None
     lab_finalizer_poll_interval_ms: int = Field(default=1_000, ge=1)
     lab_finalizer_max_jobs_per_tick: int = Field(default=8, ge=1, le=128)
     lab_finalizer_failure_cooldown_seconds: int = Field(default=30, ge=1, le=3_600)
@@ -103,9 +138,11 @@ class Settings(BaseSettings):
     app_env: Literal["dev", "prod"] = "dev"
 
     pushdeer_keys: str = Field(default="")
+    pushdeer_recipient_ids: str = Field(default="admin")
     pushdeer_endpoint: str = Field(default="https://api2.pushdeer.com/message/push")
     pushplus_tokens: str = Field(default="")
-    pushplus_endpoint: str = Field(default="http://www.pushplus.plus/send")
+    pushplus_recipient_ids: str = Field(default="admin")
+    pushplus_endpoint: str = Field(default="https://www.pushplus.plus/send")
     notify_enabled: bool = True
     notification_state_path: Path | None = None
     notification_state_busy_timeout_ms: int = Field(default=5_000, ge=1)
@@ -163,6 +200,61 @@ class Settings(BaseSettings):
     def pushplus_token_list(self) -> list[str]:
         return [t.strip() for t in self.pushplus_tokens.split(",") if t.strip()]
 
+    @staticmethod
+    def _recipient_ids_for_credentials(
+        raw_recipient_ids: str,
+        credentials: list[str],
+        *,
+        default_recipient_id: str,
+    ) -> list[str]:
+        if not credentials:
+            return []
+        recipient_ids = [item.strip() for item in raw_recipient_ids.split(",") if item.strip()] or [
+            default_recipient_id
+        ]
+        if len(recipient_ids) == 1:
+            return recipient_ids * len(credentials)
+        if len(recipient_ids) != len(credentials):
+            raise ValueError(
+                "notification recipient ids must contain one shared id or one id per credential"
+            )
+        return recipient_ids
+
+    @property
+    def pushdeer_recipient_id_list(self) -> list[str]:
+        return self._recipient_ids_for_credentials(
+            self.pushdeer_recipient_ids,
+            self.pushdeer_key_list,
+            default_recipient_id="admin",
+        )
+
+    @property
+    def pushplus_recipient_id_list(self) -> list[str]:
+        return self._recipient_ids_for_credentials(
+            self.pushplus_recipient_ids,
+            self.pushplus_token_list,
+            default_recipient_id="admin",
+        )
+
+    @field_validator("pushdeer_endpoint", "pushplus_endpoint", mode="before")
+    @classmethod
+    def require_https_notification_endpoint(cls, v: object) -> object:
+        if not isinstance(v, str):
+            return v
+        normalized = v.strip()
+        if normalized == "http://www.pushplus.plus/send":
+            normalized = "https://www.pushplus.plus/send"
+        parsed = urlsplit(normalized)
+        if parsed.scheme.lower() != "https" or not parsed.netloc:
+            raise ValueError("notification endpoint must use HTTPS")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_notification_recipient_mappings(self) -> "Settings":
+        _ = self.pushdeer_recipient_id_list
+        _ = self.pushplus_recipient_id_list
+        return self
+
     @field_validator("intraday_quote_source", mode="after")
     @classmethod
     def validate_intraday_quote_source(cls, v: str) -> str:
@@ -211,7 +303,15 @@ class Settings(BaseSettings):
         "lab_readiness_dir",
         "lab_finalizer_authority_key_path",
         "lab_finalizer_authority_keyring_path",
+        "lab_claim_publication_worker_verifier_path",
+        "lab_claim_finalizer_runtime_material_root",
+        "lab_claim_finalizer_runtime_material_path",
+        "lab_highwater_trusted_keyring_path",
         "lab_trusted_git_path",
+        "rquant_lab_live_slo_authority_root",
+        "rquant_lab_trade_calendar_path",
+        "rquant_external_monotonic_root_service_config_path",
+        "rquant_resource_authority_service_config_path",
         mode="before",
     )
     @classmethod
@@ -232,7 +332,15 @@ class Settings(BaseSettings):
         "lab_readiness_dir",
         "lab_finalizer_authority_key_path",
         "lab_finalizer_authority_keyring_path",
+        "lab_claim_publication_worker_verifier_path",
+        "lab_claim_finalizer_runtime_material_root",
+        "lab_claim_finalizer_runtime_material_path",
+        "lab_highwater_trusted_keyring_path",
         "lab_trusted_git_path",
+        "rquant_lab_live_slo_authority_root",
+        "rquant_lab_trade_calendar_path",
+        "rquant_external_monotonic_root_service_config_path",
+        "rquant_resource_authority_service_config_path",
         mode="after",
     )
     @classmethod
@@ -344,6 +452,26 @@ class Settings(BaseSettings):
             < self.lab_finalizer_failure_cooldown_seconds
         ):
             raise ValueError("lab finalizer cooldown maximum must not be below its base")
+        if (
+            self.lab_claim_finalizer_failure_backoff_max_seconds
+            < self.lab_claim_finalizer_failure_backoff_seconds
+        ):
+            raise ValueError("claim finalizer backoff maximum must not be below its base")
+        if not self.lab_claim_finalizer_owner_id.strip():
+            raise ValueError("claim finalizer owner id must not be empty")
+        if (
+            self.lab_claim_finalizer_enabled or self.lab_v2_claim_publication_enabled
+        ) and self.lab_claim_finalizer_runtime_material_root is None:
+            raise ValueError(
+                "enabled V2 claim finalizer/worker requires "
+                "LAB_CLAIM_FINALIZER_RUNTIME_MATERIAL_ROOT"
+            )
+        if (
+            self.lab_claim_finalizer_enabled or self.lab_v2_claim_publication_enabled
+        ) and self.lab_claim_finalizer_runtime_material_path is not None:
+            raise ValueError(
+                "legacy LAB_CLAIM_FINALIZER_RUNTIME_MATERIAL_PATH is forbidden when V2 is enabled"
+            )
         lab_runtime_root = _canonical_absolute_path(
             self.lab_runtime_dir or self.data_dir / "lab-runtime",
             label="lab runtime root",
@@ -437,6 +565,10 @@ class Settings(BaseSettings):
             for path in (
                 self.lab_finalizer_authority_key_path,
                 self.lab_finalizer_authority_keyring_path,
+                self.lab_claim_publication_worker_verifier_path,
+                self.lab_claim_finalizer_runtime_material_root,
+                self.lab_claim_finalizer_runtime_material_path,
+                self.lab_highwater_trusted_keyring_path,
             )
             if path is not None
         )

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -53,6 +54,7 @@ ChangePlan = DeploymentChangePlan
 build_change_plan = build_deployment_change_plan
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 TARGET_PATTERN = re.compile(r"(?:v\d+\.\d+\.\d+|[0-9a-f]{40})")
+LINUX_PRODUCTION_RUNTIME_ROOT = Path("/home/lighthouse/rquant/data/runtime")
 
 
 class PolicyError(RuntimeError):
@@ -343,6 +345,17 @@ class DeployConfig:
     handoff_labels: tuple[str, ...] = ()
     lab_lifecycle_mode: str = "uninstalled"
     prepared_intent_operation_id: str = ""
+    runtime_production_inputs: Path | None = None
+    runtime_profile_output_dir: Path | None = None
+    runtime_root: Path | None = None
+    runtime_schema_v1_migration_authority: Path | None = None
+
+
+@dataclass
+class RuntimeProfileTransactionState:
+    runtime_root: Path | None = None
+    profile_applied: bool = False
+    preview_profile_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -383,6 +396,277 @@ def validate_release_profile(release_profile: str, platform_name: str) -> str:
 
 def _stdout(runner: Runner, args: list[str]) -> str:
     return runner.run(args).stdout.strip()
+
+
+def _json_object(runner: Runner, args: list[str], *, label: str) -> dict[str, object]:
+    raw = _stdout(runner, args)
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise DeployError(f"{label} returned invalid JSON") from exc
+    if not isinstance(payload, dict):
+        raise DeployError(f"{label} returned a non-object receipt")
+    return payload
+
+
+def _receipt_sha256(payload: dict[str, object], key: str, *, label: str) -> str:
+    value = payload.get(key)
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise DeployError(f"{label} returned an invalid {key}")
+    return value
+
+
+def _receipt_path(payload: dict[str, object], key: str, *, label: str) -> Path:
+    value = payload.get(key)
+    if not isinstance(value, str):
+        raise DeployError(f"{label} returned an invalid {key}")
+    path = Path(value)
+    if not path.is_absolute() or path != Path(os.path.abspath(path)):
+        raise DeployError(f"{label} returned a non-canonical {key}")
+    return path
+
+
+def _deploy_runtime_profile(
+    config: DeployConfig,
+    runner: Runner,
+    *,
+    target_sha: str,
+    action: str,
+    transaction: RuntimeProfileTransactionState,
+    apply_changes: bool = True,
+) -> Path | None:
+    inputs = config.runtime_production_inputs
+    output_dir = config.runtime_profile_output_dir
+    if inputs is None:
+        return None
+    if output_dir is None:  # pragma: no cover - deploy() validates the pair
+        raise PolicyError("runtime profile output directory is missing")
+    if action == "rollback":
+        if config.runtime_root is None:  # pragma: no cover - production policy validates this
+            raise PolicyError("runtime root is required for production rollback")
+        return config.runtime_root
+
+    production_command = [
+        config.rquant_bin,
+        "runtime-production-profile",
+        "--inputs",
+        str(inputs),
+        "--output-dir",
+        str(output_dir),
+        "--expected-commit",
+        target_sha,
+    ]
+    if config.release_profile == LINUX_RELEASE_PROFILE:
+        production_command.extend(["--runtime-mode", "linux-production"])
+    production = _json_object(
+        runner,
+        production_command,
+        label="runtime production profile",
+    )
+    if production.get("producer_commit") != target_sha:
+        raise DeployError("runtime production profile commit mismatch")
+    if production.get("status") != "dry_run":
+        raise DeployError("runtime production profile preview was not pure")
+    profile_id = _receipt_sha256(
+        production,
+        "profile_id",
+        label="runtime production profile",
+    )
+    profile_path = _receipt_path(
+        production,
+        "profile_path",
+        label="runtime production profile",
+    )
+    runtime_root = _receipt_path(
+        production,
+        "runtime_root",
+        label="runtime production profile",
+    )
+    if config.runtime_root is None or runtime_root != config.runtime_root:
+        raise DeployError("runtime production profile root mismatch")
+    expected_profile_path = output_dir / f"{profile_id}.json"
+    if profile_path != expected_profile_path:
+        raise DeployError("runtime production profile path mismatch")
+    if transaction.preview_profile_id is not None and transaction.preview_profile_id != profile_id:
+        raise DeployError("runtime production profile changed during deployment preview")
+    transaction.preview_profile_id = profile_id
+
+    prerequisite_command = [
+        config.rquant_bin,
+        "runtime-production-prerequisites",
+        "--inputs",
+        str(inputs),
+        "--expected-commit",
+        target_sha,
+    ]
+    if config.release_profile == LINUX_RELEASE_PROFILE:
+        prerequisite_command.extend(["--runtime-mode", "linux-production"])
+    prerequisite_preview = _json_object(
+        runner,
+        prerequisite_command,
+        label="runtime prerequisite preview",
+    )
+    if prerequisite_preview.get("profile_id") != profile_id:
+        raise DeployError("runtime prerequisite preview profile mismatch")
+
+    if not apply_changes:
+        return runtime_root
+    prerequisite_apply = _json_object(
+        runner,
+        [*prerequisite_command, "--apply", "--profile-id", profile_id],
+        label="runtime prerequisite apply",
+    )
+    if prerequisite_apply.get("profile_id") != profile_id:
+        raise DeployError("runtime prerequisite apply profile mismatch")
+    production_apply = _json_object(
+        runner,
+        [*production_command, "--apply", "--profile-id", profile_id],
+        label="runtime production profile apply",
+    )
+    if (
+        production_apply.get("producer_commit") != target_sha
+        or production_apply.get("profile_id") != profile_id
+        or production_apply.get("profile_path") != str(profile_path)
+        or production_apply.get("status") != "published"
+    ):
+        raise DeployError("runtime production profile publication mismatch")
+
+    profile_command = [
+        config.rquant_bin,
+        "runtime-deployment-profile",
+        "--profile",
+        str(profile_path),
+        "--runtime-root",
+        str(runtime_root),
+        "--expected-commit",
+        target_sha,
+    ]
+    profile_preview = _json_object(
+        runner,
+        profile_command,
+        label="runtime deployment profile preview",
+    )
+    if profile_preview.get("profile_id") != profile_id:
+        raise DeployError("runtime deployment profile preview mismatch")
+    profile_apply_command = [*profile_command, "--apply", "--profile-id", profile_id]
+    if config.runtime_schema_v1_migration_authority is not None:
+        profile_apply_command.extend(
+            [
+                "--schema-v1-migration-authority",
+                str(config.runtime_schema_v1_migration_authority),
+            ]
+        )
+    installed = _json_object(
+        runner,
+        profile_apply_command,
+        label="runtime deployment profile apply",
+    )
+    if (
+        installed.get("producer_commit") != target_sha
+        or installed.get("deployment_profile_id") != profile_id
+    ):
+        raise DeployError("runtime deployment profile receipt mismatch")
+    generation_hash = _receipt_sha256(
+        installed,
+        "generation_hash",
+        label="runtime deployment profile apply",
+    )
+    transaction.runtime_root = runtime_root
+    transaction.profile_applied = True
+    previous_generation = installed.get("previous_generation_hash")
+    if previous_generation is not None and (
+        not isinstance(previous_generation, str)
+        or re.fullmatch(r"[0-9a-f]{64}", previous_generation) is None
+    ):
+        raise DeployError("runtime deployment profile returned an invalid previous generation")
+
+    rollout_command = [
+        config.rquant_bin,
+        "runtime-deployment-rollout",
+        "--runtime-root",
+        str(runtime_root),
+        "--expected-commit",
+        target_sha,
+        "--profile-id",
+        profile_id,
+        "--generation-hash",
+        generation_hash,
+    ]
+    if isinstance(previous_generation, str):
+        rollout_command.extend(["--previous-generation-hash", previous_generation])
+    rollout = _json_object(runner, rollout_command, label="runtime deployment rollout")
+    if rollout.get("status") != "succeeded":
+        raise DeployError("runtime deployment rollout did not succeed")
+    return runtime_root
+
+
+def _rollback_runtime_profile(
+    config: DeployConfig,
+    runner: Runner,
+    *,
+    failed_commit: str,
+    previous_commit: str,
+    deployment_operation_id: str,
+) -> None:
+    if config.runtime_root is None:
+        return
+    operation_id = hashlib.sha256(
+        json.dumps(
+            {
+                "contract": "production-deploy-runtime-rollback/v1",
+                "runtime_root": str(config.runtime_root),
+                "failed_commit": failed_commit,
+                "previous_commit": previous_commit,
+                "deployment_operation_id": deployment_operation_id,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    payload = _json_object(
+        runner,
+        [
+            config.rquant_bin,
+            "runtime-deployment-rollback",
+            "--runtime-root",
+            str(config.runtime_root),
+            "--failed-commit",
+            failed_commit,
+            "--expected-previous-commit",
+            previous_commit,
+            "--operation-id",
+            operation_id,
+        ],
+        label="runtime deployment rollback",
+    )
+    if payload.get("status") not in {"rolled_back", "already_rolled_back"}:
+        raise DeployError("runtime deployment rollback did not succeed")
+
+
+def _prepare_job_center_authority(
+    config: DeployConfig,
+    runner: Runner,
+    *,
+    target_sha: str,
+    runtime_root: Path,
+) -> None:
+    """Publish the Job Center current manifest before any production daemon can start."""
+
+    command = [
+        config.rquant_bin,
+        "lab-runtime-prepare",
+        "--expected-checkout-root",
+        str(config.repo),
+        "--trusted-git-path",
+        str(config.git_path),
+        "--runtime-deployment-root",
+        str(runtime_root),
+        "--expected-code-sha",
+        target_sha,
+        "--startup-deadline-monotonic",
+        str(monotonic_time.monotonic() + config.command_timeout_seconds),
+    ]
+    runner.run(command)
 
 
 def _check_ancestor(
@@ -488,6 +772,51 @@ def _deployment_lock(path: Path) -> Iterator[None]:
         os.close(descriptor)
 
 
+@contextmanager
+def _deployment_preview_coordination(path: Path) -> Iterator[None]:
+    """Take an existing lock without creating any filesystem object."""
+
+    try:
+        parent = path.parent.lstat()
+        active = path.lstat()
+    except FileNotFoundError:
+        yield
+        return
+    if (
+        not stat.S_ISDIR(parent.st_mode)
+        or stat.S_ISLNK(parent.st_mode)
+        or parent.st_uid != os.getuid()
+        or stat.S_IMODE(parent.st_mode) != 0o700
+        or not stat.S_ISREG(active.st_mode)
+        or active.st_uid != os.getuid()
+        or active.st_nlink != 1
+        or stat.S_IMODE(active.st_mode) != 0o600
+    ):
+        raise PolicyError("production deployment preview coordination is unsafe")
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        opened = os.fstat(descriptor)
+        named = path.lstat()
+        if (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_uid, opened.st_nlink) != (
+            named.st_dev,
+            named.st_ino,
+            named.st_mode,
+            named.st_uid,
+            named.st_nlink,
+        ):
+            raise PolicyError("production deployment preview coordination changed")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise PolicyError("another production deployment is already running") from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
 def _active_units(
     runner: Runner,
     units: tuple[str, ...],
@@ -564,6 +893,7 @@ def _execute_transaction(
     intent: DeploymentIntent,
     *,
     action: str,
+    runtime_profile_transaction: RuntimeProfileTransactionState | None = None,
 ) -> DeploymentIntent:
     target_sha = intent.previous_sha if action == "rollback" else intent.target_sha
     git = str(config.git_path)
@@ -586,7 +916,27 @@ def _execute_transaction(
 
     runner.run([config.uv_bin, "sync", "--frozen"])
     intent = _advance_intent(config, authority, intent, f"{action}_dependencies_ready")
-    runner.run([config.rquant_bin, "preflight"])
+    transaction = runtime_profile_transaction or RuntimeProfileTransactionState()
+    runtime_root = _deploy_runtime_profile(
+        config,
+        runner,
+        target_sha=target_sha,
+        action=action,
+        transaction=transaction,
+    )
+    if runtime_root is None and action == "rollback":
+        runtime_root = config.runtime_root
+    if runtime_root is not None:
+        _prepare_job_center_authority(
+            config,
+            runner,
+            target_sha=target_sha,
+            runtime_root=runtime_root,
+        )
+    preflight_command = [config.rquant_bin, "preflight"]
+    if runtime_root is not None:
+        preflight_command.extend(["--runtime-root", str(runtime_root)])
+    runner.run(preflight_command)
     intent = _advance_intent(config, authority, intent, f"{action}_preflight_ready")
     intent = _advance_intent(config, authority, intent, "services_transitioning")
 
@@ -612,7 +962,7 @@ def _execute_transaction(
         "services_ready",
         restarted_services=restarted,
     )
-    runner.run([config.rquant_bin, "preflight"])
+    runner.run(preflight_command)
     intent = _advance_intent(config, authority, intent, "post_restart_preflight_ready")
     _restore_timers(runner, intent.active_timers)
     intent = _advance_intent(config, authority, intent, "timers_restored")
@@ -702,6 +1052,19 @@ def _recover_locked(
     intent = _advance_intent(config, authority, intent, "recovery_started")
     if requires_handoff and config.handoff_operation_id != intent.handoff_operation_id:
         raise PolicyError("deployment handoff rebound was not durably committed before mutation")
+    current_sha = _stdout(runner, [git, "rev-parse", "HEAD"])
+    if (
+        action == "rollback"
+        and config.runtime_root is not None
+        and current_sha == intent.target_sha
+    ):
+        _rollback_runtime_profile(
+            config,
+            runner,
+            failed_commit=intent.target_sha,
+            previous_commit=intent.previous_sha,
+            deployment_operation_id=intent.operation_id,
+        )
     authority.invalidate()
     completed = _execute_transaction(
         config,
@@ -722,6 +1085,46 @@ def _recover_locked(
     )
     _append_audit(config, result)
     return result
+
+
+def _verify_dry_run_consistency(
+    config: DeployConfig,
+    runner: Runner,
+    *,
+    target: str,
+    previous_sha: str,
+    target_sha: str,
+) -> None:
+    """Re-read every mutable generation after a lock-free deployment preview."""
+
+    transaction = RuntimeProfileTransactionState()
+    _deploy_runtime_profile(
+        config,
+        runner,
+        target_sha=target_sha,
+        action="deploy",
+        transaction=transaction,
+        apply_changes=False,
+    )
+    git = str(config.git_path)
+    if _stdout(runner, [git, "rev-parse", "--abbrev-ref", "HEAD"]) != "main":
+        raise PolicyError("production branch changed during dry-run")
+    if _stdout(runner, [git, "status", "--porcelain", "--untracked-files=no"]):
+        raise PolicyError("production worktree changed during dry-run")
+    if _stdout(runner, [git, "rev-parse", "HEAD"]) != previous_sha:
+        raise PolicyError("production generation changed during dry-run")
+    if _stdout(runner, [git, "rev-parse", "--verify", f"{target}^{{commit}}"]) != target_sha:
+        raise PolicyError("deployment target changed during dry-run")
+    if config.startup_generation is not None and config.startup_generation != previous_sha:
+        raise PolicyError("startup generation changed before dry-run completed")
+    _deploy_runtime_profile(
+        config,
+        runner,
+        target_sha=target_sha,
+        action="deploy",
+        transaction=transaction,
+        apply_changes=False,
+    )
 
 
 def _deploy_locked(
@@ -775,7 +1178,8 @@ def _deploy_locked(
         ):
             raise PolicyError("prepared deployment intent binding is invalid")
     else:
-        runner.run([git, "fetch", "--tags", "origin", "main"])
+        if not config.dry_run:
+            runner.run([git, "fetch", "--tags", "origin", "main"])
         if target.startswith("v"):
             tag_type = _stdout(runner, [git, "cat-file", "-t", target])
             if tag_type != "tag":
@@ -800,7 +1204,21 @@ def _deploy_locked(
 
         if previous_sha == target_sha:
             result = DeployResult("already_current", previous_sha, target_sha, target, (), (), ())
-            _append_audit(config, result)
+            if config.dry_run:
+                _verify_dry_run_consistency(
+                    config,
+                    runner,
+                    target=target,
+                    previous_sha=previous_sha,
+                    target_sha=target_sha,
+                )
+            else:
+                if config.runtime_root is None:  # pragma: no cover - production policy guards
+                    raise PolicyError("runtime root is required for production preflight")
+                runner.run(
+                    [config.rquant_bin, "preflight", "--runtime-root", str(config.runtime_root)]
+                )
+                _append_audit(config, result)
             return result
 
         _check_ancestor(
@@ -833,6 +1251,13 @@ def _deploy_locked(
         )
 
     if config.dry_run:
+        _verify_dry_run_consistency(
+            config,
+            runner,
+            target=target,
+            previous_sha=previous_sha,
+            target_sha=target_sha,
+        )
         result = DeployResult(
             "dry_run",
             previous_sha,
@@ -842,7 +1267,6 @@ def _deploy_locked(
             change_plan.restart_services,
             change_plan.handoff_daemons,
         )
-        _append_audit(config, result)
         return result
 
     if generation_authority is not None:
@@ -876,6 +1300,7 @@ def _deploy_locked(
                 operation_id=prepared_intent.operation_id,
             )
         generation_authority.invalidate()
+        runtime_profile_transaction = RuntimeProfileTransactionState()
         try:
             completed = _execute_transaction(
                 config,
@@ -884,6 +1309,7 @@ def _deploy_locked(
                 generation_finalizer,
                 intent,
                 action="deploy",
+                runtime_profile_transaction=runtime_profile_transaction,
             )
         except Exception as exc:
             try:
@@ -909,6 +1335,14 @@ def _deploy_locked(
                     recovery_authority.read_deployment_intent(),
                     "recovery_started",
                 )
+                if runtime_profile_transaction.profile_applied:
+                    _rollback_runtime_profile(
+                        config,
+                        recovery_runner,
+                        failed_commit=intent.target_sha,
+                        previous_commit=intent.previous_sha,
+                        deployment_operation_id=intent.operation_id,
+                    )
                 recovery_authority.invalidate()
                 completed = _execute_transaction(
                     config,
@@ -1024,6 +1458,42 @@ def deploy(
     generation_finalizer: GenerationFinalizer | None = None,
 ) -> DeployResult:
     validate_release_profile(config.release_profile, config.platform_name)
+    runtime_profile_values = (
+        config.runtime_production_inputs,
+        config.runtime_profile_output_dir,
+        config.runtime_root,
+    )
+    if any(value is not None for value in runtime_profile_values) and not all(
+        value is not None for value in runtime_profile_values
+    ):
+        raise PolicyError("runtime production inputs, output directory, and root are one group")
+    if config.release_profile == LINUX_RELEASE_PROFILE and not all(
+        value is not None for value in runtime_profile_values
+    ):
+        raise PolicyError("Linux production requires a complete runtime profile")
+    if (
+        config.release_profile == LINUX_RELEASE_PROFILE
+        and config.runtime_root != LINUX_PRODUCTION_RUNTIME_ROOT
+    ):
+        raise PolicyError(
+            f"Linux production runtime root must be exactly {LINUX_PRODUCTION_RUNTIME_ROOT}"
+        )
+    for path, label in (
+        (config.runtime_production_inputs, "runtime production inputs"),
+        (config.runtime_profile_output_dir, "runtime profile output directory"),
+        (config.runtime_root, "runtime root"),
+        (
+            config.runtime_schema_v1_migration_authority,
+            "runtime schema v1 migration authority",
+        ),
+    ):
+        if path is not None and (not path.is_absolute() or path != Path(os.path.abspath(path))):
+            raise PolicyError(f"{label} must be an absolute canonical path")
+    if (
+        config.runtime_schema_v1_migration_authority is not None
+        and config.runtime_production_inputs is None
+    ):
+        raise PolicyError("schema v1 migration authority requires a runtime profile")
     if config.lab_lifecycle_mode not in {"uninstalled", "installed"}:
         raise PolicyError("Lab lifecycle mode is invalid")
     if (
@@ -1069,6 +1539,10 @@ def deploy(
         handoff_labels=config.handoff_labels,
         lab_lifecycle_mode=config.lab_lifecycle_mode,
         prepared_intent_operation_id=config.prepared_intent_operation_id,
+        runtime_production_inputs=config.runtime_production_inputs,
+        runtime_profile_output_dir=config.runtime_profile_output_dir,
+        runtime_root=config.runtime_root,
+        runtime_schema_v1_migration_authority=(config.runtime_schema_v1_migration_authority),
     )
     effective_runner = runner or SubprocessRunner(
         repo,
@@ -1161,7 +1635,12 @@ def deploy(
             generation_authority,
             generation_finalizer,
         )
-    with _deployment_lock(lock_path):
+    coordination = (
+        _deployment_preview_coordination(lock_path)
+        if effective_config.dry_run
+        else _deployment_lock(lock_path)
+    )
+    with coordination:
         return _deploy_locked(
             effective_config,
             effective_runner,
@@ -1176,7 +1655,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repo", type=Path, default=Path.cwd())
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--deployment-lock-path", type=Path, required=True)
-    parser.add_argument("--deployment-lock-fd", type=int, required=True)
+    parser.add_argument("--deployment-lock-fd", type=int)
     parser.add_argument("--lab-handoff-lock-fd", type=int)
     parser.add_argument("--startup-generation", required=True)
     parser.add_argument("--trusted-git-path", type=Path, required=True)
@@ -1196,6 +1675,10 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("uninstalled", "installed"),
         default="uninstalled",
     )
+    parser.add_argument("--runtime-production-inputs", type=Path)
+    parser.add_argument("--runtime-profile-output-dir", type=Path)
+    parser.add_argument("--runtime-root", type=Path)
+    parser.add_argument("--runtime-schema-v1-migration-authority", type=Path)
     return parser
 
 
@@ -1223,6 +1706,10 @@ def main(argv: list[str] | None = None) -> int:
         handoff_labels=tuple(args.lab_handoff_label),
         lab_lifecycle_mode=args.lab_lifecycle_mode,
         prepared_intent_operation_id=args.prepared_intent_operation_id,
+        runtime_production_inputs=args.runtime_production_inputs,
+        runtime_profile_output_dir=args.runtime_profile_output_dir,
+        runtime_root=args.runtime_root,
+        runtime_schema_v1_migration_authority=(args.runtime_schema_v1_migration_authority),
     )
     try:
         result = deploy(config)

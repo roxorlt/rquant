@@ -831,6 +831,51 @@ def _wait_for_afternoon_open() -> None:
     time.sleep(wait_seconds)
 
 
+def _publish_legacy_shadow_export(
+    *,
+    spool: object,
+    trade_date: date,
+) -> Path:
+    """Mirror the closed legacy monitor output without reopening DuckDB."""
+
+    from rquant.legacy_shadow_export import (
+        LegacyMonitorCaptureSpool,
+        publish_legacy_monitor_production_export,
+    )
+    if not isinstance(spool, LegacyMonitorCaptureSpool):
+        raise TypeError("legacy monitor spool has an invalid contract")
+
+    return publish_legacy_monitor_production_export(
+        data_dir=settings.data_dir,
+        trade_date=trade_date,
+        spool=spool,
+    )
+
+
+def _prepare_legacy_shadow_spool(
+    *,
+    store: DuckDBStore,
+    trade_date: date,
+) -> object:
+    from rquant.legacy_shadow_export import prepare_legacy_monitor_production_spool
+
+    return prepare_legacy_monitor_production_spool(
+        data_dir=settings.data_dir,
+        trade_date=trade_date,
+        rows=store.iter_monitor_events(trade_date.isoformat(), batch_size=1_000),
+    )
+
+
+def _recover_legacy_shadow_export(trade_date: date) -> None:
+    from rquant.legacy_shadow_export import recover_production_legacy_shadow_exports
+
+    recover_production_legacy_shadow_exports(
+        data_dir=settings.data_dir,
+        trade_date=trade_date,
+        source="monitor",
+    )
+
+
 def run_monitor(interval: int = 5) -> int:
     """盘中监控主循环。"""
     from rquant.notify import notify
@@ -845,7 +890,11 @@ def run_monitor(interval: int = 5) -> int:
     # 拒绝一切新连接，整晚占锁会挡日终 research-sync / 本地研究写入。
     # 9:25 systemd 正常启动时 phase 是 pre，不受影响，_wait_for_market_open 会等到 9:30。
     if _market_phase() == "closed":
-        logger.info("已过收盘（>=15:00），不启动盘中监控，退出")
+        logger.info("已过收盘（>=15:00），仅尝试恢复既有 shadow staging")
+        try:
+            _recover_legacy_shadow_export(today)
+        except Exception:
+            logger.warning("legacy shadow monitor recovery unavailable; shadow will degrade")
         return 0
 
     with DuckDBStore() as store:
@@ -867,7 +916,6 @@ def run_monitor(interval: int = 5) -> int:
 
         ts_codes = [item.ts_code for item in watchlist]
         item_map = {item.ts_code: item for item in watchlist}
-        today_str = today.isoformat()
         triggers_summary: dict[str, int] = {}
         quote_provider: IntradayMinuteQuoteProvider | None = None
         if settings.intraday_quote_source == "akshare":
@@ -983,18 +1031,6 @@ def run_monitor(interval: int = 5) -> int:
 
             time.sleep(interval)
 
-        # 收盘后：事件汇总
-        all_events = store.query_monitor_events(today_str)
-        if not all_events.empty:
-            logger.info(f"当日事件汇总: {len(all_events)} 条")
-            for _, e in all_events.iterrows():
-                logger.info(
-                    f"  {e['ts_code']} {e['level']} "
-                    f"¥{e['trigger_price']:.2f} @ {e['trigger_time']}"
-                )
-        else:
-            logger.info("当日无事件触发")
-
         # 收盘后：退出检查（Phase 4 改造为自动踢出 + 推送）
         auto_kicked_count = check_exits(store, today)
 
@@ -1004,6 +1040,29 @@ def run_monitor(interval: int = 5) -> int:
             triggers_summary=triggers_summary,
             auto_kicked_count=auto_kicked_count or 0,
         )
+
+        # DuckDB 内只分页写有界 spool；签名、rename、发布在 writer context 外执行。
+        try:
+            monitor_spool = _prepare_legacy_shadow_spool(store=store, trade_date=today)
+        except Exception:
+            monitor_spool = None
+            logger.exception("legacy shadow monitor spool unavailable; shadow will degrade")
+
+    if monitor_spool is not None:
+        try:
+            shadow_export = _publish_legacy_shadow_export(
+                spool=monitor_spool,
+                trade_date=today,
+            )
+            logger.info(f"legacy shadow monitor export: {shadow_export}")
+        except Exception:
+            logger.exception("legacy shadow monitor export unavailable; shadow will degrade")
+
+    event_count = int(getattr(monitor_spool, "records_count", 0))
+    if event_count:
+        logger.info(f"当日事件汇总: {event_count} 条")
+    else:
+        logger.info("当日无事件触发")
 
     logger.info("监控结束")
     return 0

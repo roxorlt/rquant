@@ -10,10 +10,12 @@ from __future__ import annotations
 import json
 import os
 import signal
+import stat
 import subprocess
 import sys
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -121,7 +123,6 @@ def _build_n_shape_optimize_run(params: dict[str, Any]) -> StrategyLabSavedRun:
         build_gate_research_manifest,
         open_gated_research_store,
     )
-    from rquant.storage.duckdb import open_readonly_store
     from rquant.strategy_optimizer import run_strategy_optimization
 
     start_date = str(params["start_date"])
@@ -137,11 +138,18 @@ def _build_n_shape_optimize_run(params: dict[str, Any]) -> StrategyLabSavedRun:
     min_trades = int(params.get("min_trades") or 5)
 
     gate_payload = params.get("research_gate")
+    snapshot_value = params.get("_legacy_research_snapshot")
+    if not isinstance(snapshot_value, str):
+        raise PermissionError("legacy lab-run requires an explicit immutable research snapshot")
+    snapshot_path = Path(snapshot_value)
     manifest = None
     if gate_payload is not None:
         gate_request = ResearchGateRequest.model_validate(gate_payload)
+        if gate_request.mode != "exploratory":
+            raise PermissionError("legacy lab-run cannot execute formal research; use lab-worker")
         with open_gated_research_store(
-            gate_request
+            gate_request,
+            metadata_store_factory=lambda: _open_legacy_immutable_research_snapshot(snapshot_path),
         ) as (store, gate_decision):
             result = run_strategy_optimization(
                 store,
@@ -162,7 +170,7 @@ def _build_n_shape_optimize_run(params: dict[str, Any]) -> StrategyLabSavedRun:
             gate_decision,
         )
     else:
-        with open_readonly_store() as store:
+        with _open_legacy_immutable_research_snapshot(snapshot_path) as store:
             result = run_strategy_optimization(
                 store,
                 start_date=start_date,
@@ -227,17 +235,42 @@ def _enforce_spec_research_gate(run_type: str, params: dict[str, Any]) -> None:
         evaluate_store_research_gate,
         research_gate_metadata_ready,
     )
-    from rquant.storage.duckdb import open_readonly_store
-
     request = ResearchGateRequest.model_validate(payload)
     expected_strategy = {"n_shape_optimize": "n_shape"}.get(run_type)
     if expected_strategy is None or request.strategy_name != expected_strategy:
         raise PermissionError("后台任务的正式研究门策略标识不匹配")
-    with open_readonly_store() as store:
+    snapshot_value = params.get("_legacy_research_snapshot")
+    if not isinstance(snapshot_value, str):
+        raise PermissionError("legacy lab-run requires an explicit immutable research snapshot")
+    if request.mode != "exploratory":
+        raise PermissionError("legacy lab-run cannot execute formal research; use lab-worker")
+    with _open_legacy_immutable_research_snapshot(Path(snapshot_value)) as store:
         decision = evaluate_store_research_gate(store, request)
     if request.mode == "formal" and not research_gate_metadata_ready(decision):
         reasons = "; ".join(failure.message for failure in decision.failures)
         raise PermissionError(f"正式研究门未通过: {reasons}")
+
+
+@contextmanager
+def _open_legacy_immutable_research_snapshot(path: Path) -> Iterator[object]:
+    """Open the explicit local snapshot once and reject replacement during a legacy run."""
+    from rquant.storage.duckdb import DuckDBStore
+
+    if not path.is_absolute():
+        raise PermissionError("immutable research snapshot must be an absolute path")
+    resolved = Path(os.path.abspath(path))
+    try:
+        before = os.lstat(resolved)
+    except FileNotFoundError as exc:
+        raise PermissionError("immutable research snapshot does not exist") from exc
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise PermissionError("immutable research snapshot must be a regular non-symlink file")
+    identity = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+    with DuckDBStore(resolved, read_only=True) as store:
+        yield store
+    after = os.lstat(resolved)
+    if (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) != identity:
+        raise PermissionError("immutable research snapshot rotated during legacy lab-run")
 
 
 def execute_spec(spec: dict[str, Any], *, base_dir: Path | None = None) -> str:
@@ -277,6 +310,14 @@ def execute_spec(spec: dict[str, Any], *, base_dir: Path | None = None) -> str:
     logger.info(f"后台任务开始: {run_id} ({run_type})")
     try:
         params = dict(spec.get("params") or {})
+        if spec.get("research_snapshot_mismatch"):
+            raise PermissionError("immutable research snapshot mismatch between CLI and spec")
+        snapshot_value = spec.get("research_snapshot")
+        if not isinstance(snapshot_value, str) or not snapshot_value:
+            raise PermissionError("legacy lab-run requires an explicit immutable research snapshot")
+        if not Path(snapshot_value).is_absolute():
+            raise PermissionError("immutable research snapshot must be an absolute path")
+        params["_legacy_research_snapshot"] = snapshot_value
         _enforce_spec_research_gate(run_type, params)
         run = builder(params)
         saved = save_strategy_lab_run(run, base_dir=base_dir)

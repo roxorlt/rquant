@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager, nullcontext
@@ -19,7 +22,7 @@ from datetime import time as dtime
 from functools import partial
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from types import FrameType, TracebackType
+from types import FrameType, SimpleNamespace, TracebackType
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
@@ -38,12 +41,97 @@ from rquant.logging import setup_logging
 from rquant.storage.duckdb import DuckDBStore, open_readonly_store
 
 if TYPE_CHECKING:
+    from rquant.config import Settings
+    from rquant.daily_pipeline_report_authority import (
+        DailyPipelineDevelopmentTestReportAuthority,
+        DailyPipelineReportAuthorityCapability,
+    )
     from rquant.lab_daemon import LabRuntimeGuard, VerifiedLabRuntimeIdentity
+    from rquant.lab_worker import LabResourceAuthorityManifest
+    from rquant.runtime_deployment_bundle import RuntimeDeploymentReceipt
+    from rquant.runtime_deployment_profile import LabHighWaterRuntimeProfile
+    from rquant.runtime_resource_admission import (
+        ResourceProbe,
+        RuntimeResourceAdmissionBindings,
+    )
 
 # 重试配置
 _RETRY_COUNT = 3
 _RETRY_INTERVAL = 900  # 数据未就绪：15 分钟（等 tushare 数据出来）
 _NETWORK_RETRY_INTERVAL = 60  # 网络异常：1 分钟（tushare 抖动通常很快恢复）
+
+
+def _daily_notification_producer_commit() -> str:
+    """Use the deployment-bound commit when available; mark legacy CLI events as unverified."""
+    candidate = os.getenv("RQUANT_CODE_COMMIT", "").strip().lower()
+    if len(candidate) == 40 and all(character in "0123456789abcdef" for character in candidate):
+        return candidate
+    return "0" * 40
+
+
+def _record_daily_error_outbox(
+    *,
+    component: str,
+    exc: BaseException,
+    trade_date: date,
+) -> None:
+    """Persist a typed daily-close error signal; notification failures stop at health logging."""
+    try:
+        from rquant.config import settings
+        from rquant.daily_notification_producer import (
+            DailyNotificationProducer,
+            build_daily_error_signal,
+        )
+        from rquant.delivery_contracts import DeliveryChannel, DeliveryTarget
+        from rquant.signal_bus import SignalBusStore
+
+        targets = tuple(
+            [
+                *(
+                    DeliveryTarget(
+                        recipient_id=recipient_id,
+                        channel=DeliveryChannel.PUSHDEER,
+                    )
+                    for recipient_id in settings.pushdeer_recipient_id_list
+                ),
+                *(
+                    DeliveryTarget(
+                        recipient_id=recipient_id,
+                        channel=DeliveryChannel.PUSHPLUS,
+                    )
+                    for recipient_id in settings.pushplus_recipient_id_list
+                ),
+            ]
+            if settings.notify_enabled and settings.notify_error
+            else []
+        )
+        observed_at = datetime.now(UTC)
+        signal = build_daily_error_signal(
+            component=component,
+            error=exc,
+            trade_date=trade_date,
+            observed_at=observed_at,
+            producer_commit=_daily_notification_producer_commit(),
+        )
+        receipt = DailyNotificationProducer(
+            signal_bus=SignalBusStore(settings.data_dir / "daily-close-signal-bus.sqlite3"),
+            targets=targets,
+        ).emit(signal, received_at=observed_at)
+        logger.error(
+            "daily error persisted to notification outbox: component={} trade_date={} "
+            "signal_id={} targets={}",
+            component,
+            trade_date.isoformat(),
+            receipt.signal_id,
+            len(receipt.outbox_ids),
+        )
+    except Exception as notification_error:
+        logger.error(
+            "daily_notification_health=degraded component={} trade_date={} error_type={}",
+            component,
+            trade_date.isoformat(),
+            type(notification_error).__name__,
+        )
 
 
 def _ingest_with_retry(trade_date: str) -> int:
@@ -141,6 +229,69 @@ def _parse_sha256(value: str) -> str:
     except ValueError as exc:
         raise argparse.ArgumentTypeError("plan id 必须是 64 位 SHA256") from exc
     return normalized
+
+
+def _parse_commit_sha(value: str) -> str:
+    normalized = value.strip().lower()
+    if len(normalized) != 40:
+        raise argparse.ArgumentTypeError("code SHA 必须是 40 位十六进制")
+    try:
+        int(normalized, 16)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("code SHA 必须是 40 位十六进制") from exc
+    return normalized
+
+
+def _parse_bounded_int(
+    value: str,
+    *,
+    minimum: int,
+    maximum: int,
+    label: str,
+) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"{label} must be an integer") from exc
+    if not minimum <= parsed <= maximum:
+        raise argparse.ArgumentTypeError(f"{label} must be between {minimum} and {maximum}")
+    return parsed
+
+
+def _parse_recovery_deadline_seconds(value: str) -> int:
+    return _parse_bounded_int(
+        value,
+        minimum=1,
+        maximum=86_400,
+        label="recovery deadline seconds",
+    )
+
+
+def _parse_rehearsal_interval_seconds(value: str) -> int:
+    return _parse_bounded_int(
+        value,
+        minimum=60,
+        maximum=31_536_000,
+        label="rehearsal interval seconds",
+    )
+
+
+def _parse_recovery_max_attempts(value: str) -> int:
+    return _parse_bounded_int(
+        value,
+        minimum=1,
+        maximum=10,
+        label="recovery max attempts",
+    )
+
+
+def _parse_recovery_retry_delay_seconds(value: str) -> int:
+    return _parse_bounded_int(
+        value,
+        minimum=1,
+        maximum=3_600,
+        label="recovery retry delay seconds",
+    )
 
 
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -520,6 +671,21 @@ class _RQuantArgumentParser(argparse.ArgumentParser):
             plan_supplied = getattr(parsed, "plan_id", None) is not None
             if apply_requested != plan_supplied:
                 self.error("分钟历史修复必须同时传 --apply 和 --plan-id")
+        if getattr(parsed, "command", None) == "runtime-deployment-profile":
+            apply_requested = bool(getattr(parsed, "apply", False))
+            profile_id_supplied = getattr(parsed, "profile_id", None) is not None
+            if apply_requested != profile_id_supplied:
+                self.error("运行时画像正式安装必须同时传 --apply 和 --profile-id")
+        if getattr(parsed, "command", None) == "runtime-production-prerequisites":
+            apply_requested = bool(getattr(parsed, "apply", False))
+            profile_id_supplied = getattr(parsed, "profile_id", None) is not None
+            if apply_requested != profile_id_supplied:
+                self.error("生产前置 authority 安装必须同时传 --apply 和 --profile-id")
+        if getattr(parsed, "command", None) == "runtime-production-profile":
+            apply_requested = bool(getattr(parsed, "apply", False))
+            profile_id_supplied = getattr(parsed, "profile_id", None) is not None
+            if apply_requested != profile_id_supplied:
+                self.error("生产运行时画像发布必须同时传 --apply 和 --profile-id")
         return parsed
 
 
@@ -557,9 +723,11 @@ def cmd_serve(args: argparse.Namespace) -> int:
             logger.info(f"=== 每日任务完成: {summary} ===")
         except Exception as e:
             logger.exception(f"=== 每日任务异常 {trade_date} ===")
-            from rquant.notify import notify
-
-            notify("error", component="daily_job", exc=e)
+            _record_daily_error_outbox(
+                component="daily_job",
+                exc=e,
+                trade_date=date.fromisoformat(trade_date),
+            )
 
     def handle_signal(signum: int, frame: object) -> None:
         logger.info("收到退出信号，正在关闭调度器...")
@@ -652,12 +820,471 @@ def cmd_daily_indicator_backfill(args: argparse.Namespace) -> int:
     return 0
 
 
+def _daily_dag_control_plan(args: argparse.Namespace):
+    """Build one immutable plan without opening the writable daily ledger."""
+    from rquant.daily_pipeline_control import (
+        DailyPipelineControlPlan,
+        resolve_production_daily_storage_profile,
+    )
+    from rquant.daily_pipeline_ledger import DailyPipelineMode, DailyPipelineStorageProfile
+    from rquant.daily_pipeline_orchestrator import DEFAULT_DAILY_CLOSE_PIPELINE
+
+    if args.command == "daily-dag":
+        mode = DailyPipelineMode.PRODUCTION
+        storage_profile = resolve_production_daily_storage_profile(
+            expected_code_commit=args.code_commit,
+            expected_profile_hash=args.profile_hash,
+        )
+    elif args.command == "daily-dag-dev":
+        mode = DailyPipelineMode.SHADOW
+        storage_profile = DailyPipelineStorageProfile.create(
+            root=args.profile_root,
+            mode=mode,
+            profile_hash=args.profile_hash,
+        )
+    else:  # pragma: no cover - parser and dispatch constrain this boundary
+        raise ValueError("daily DAG command mode is unsupported")
+    spec = DEFAULT_DAILY_CLOSE_PIPELINE.to_run_spec(
+        mode=mode,
+        trade_date=args.trade_date,
+        source_generation_id=args.source_generation_id,
+        source_content_hash=args.source_content_hash,
+        command_manifest_hash=args.command_manifest_hash,
+        code_commit=args.code_commit,
+        profile_hash=args.profile_hash,
+        deadline_at=args.deadline_at,
+    )
+    return DailyPipelineControlPlan.create(
+        mode=mode,
+        run_spec=spec,
+        command_manifest_hash=args.command_manifest_hash,
+        storage_profile=storage_profile,
+    )
+
+
+def cmd_daily_dag(
+    args: argparse.Namespace,
+    *,
+    development_test_report_authority: DailyPipelineDevelopmentTestReportAuthority | None = None,
+) -> int:
+    """Preview or advance one exact, externally receipted daily DAG stage."""
+    from rquant.daily_pipeline_report_authority import (
+        DailyPipelineDevelopmentTestReportAuthority,
+    )
+
+    production_command = args.command == "daily-dag"
+    development_command = args.command == "daily-dag-dev"
+    if not production_command and not development_command:
+        logger.error("daily-dag command mode is unsupported")
+        return 2
+    development_absence_guard = None
+    if development_command:
+        from rquant.daily_pipeline_control import (
+            DailyPipelineProductionProfileError,
+            assert_daily_dag_dev_allowed,
+        )
+
+        try:
+            development_absence_guard = assert_daily_dag_dev_allowed()
+        except DailyPipelineProductionProfileError as exc:
+            logger.error("daily-dag-dev refused fixed production profile state: {}", exc)
+            return 2
+
+    def reconfirm_development_absence() -> bool:
+        if development_absence_guard is None:
+            return True
+        try:
+            development_absence_guard.assert_still_absent()
+        except DailyPipelineProductionProfileError as exc:
+            logger.error("daily-dag-dev production root absence changed: {}", exc)
+            return False
+        return True
+
+    from rquant.config import settings as runtime_settings
+
+    if development_test_report_authority is not None:
+        if not isinstance(
+            development_test_report_authority,
+            DailyPipelineDevelopmentTestReportAuthority,
+        ):
+            logger.error("daily-dag rejects an untyped report authority override")
+            return 2
+        if production_command:
+            logger.error("daily-dag production rejects development-test report authority")
+            return 2
+    if development_command and runtime_settings.app_env == "prod":
+        logger.error("daily-dag-dev is disabled in the production application profile")
+        return 2
+    if production_command and runtime_settings.app_env != "prod":
+        logger.error("daily-dag production requires the production application profile")
+        return 2
+    try:
+        plan = _daily_dag_control_plan(args)
+    except (OSError, RuntimeError, ValueError) as exc:
+        logger.error("daily-dag refused an invalid immutable storage profile: {}", exc)
+        return 2
+    if not reconfirm_development_absence():
+        return 2
+    if args.action == "preview":
+        _print_json(
+            {
+                "command": args.command,
+                "action": "preview",
+                "mode": plan.mode,
+                "plan_hash": plan.plan_hash,
+                "run_id": plan.run_spec.run_id,
+                "state_path": str(plan.storage_profile.state_path),
+                "command_manifest_path": str(plan.storage_profile.command_manifest_path),
+                "receipt_root": str(plan.storage_profile.receipt_root),
+                "report_root": str(plan.storage_profile.report_root),
+                "stage_ids": [stage.stage_id for stage in plan.run_spec.stages],
+                "write_performed": False,
+            }
+        )
+        return 0
+    if args.run_id != plan.run_spec.run_id or args.plan_hash != plan.plan_hash:
+        logger.error("daily-dag action binding does not match the previewed plan/run")
+        return 2
+    if args.action == "status":
+        if not reconfirm_development_absence():
+            return 2
+        if not plan.storage_profile.state_path.exists():
+            logger.error(
+                "daily-dag status state does not exist: {}",
+                plan.storage_profile.state_path,
+            )
+            return 2
+        from rquant.daily_pipeline_ledger import DailyPipelineLedger
+        from rquant.daily_pipeline_orchestrator import DailyPipelineStatus
+
+        ledger = DailyPipelineLedger(
+            storage_profile=plan.storage_profile,
+            service_owner=args.service_owner,
+        )
+        run = ledger.run(plan.run_spec.run_id)
+        if run.spec != plan.run_spec:
+            logger.error("daily-dag status state run does not match the bound plan")
+            return 2
+        stage_states = {
+            stage.stage_id: ledger.stage(run.run_id, stage.stage_id).state
+            for stage in plan.run_spec.stages
+        }
+        status = DailyPipelineStatus(
+            run_id=run.run_id,
+            state=run.state,
+            stage_states=stage_states,
+        )
+        _print_json(
+            {
+                "command": args.command,
+                "action": "status",
+                "mode": plan.mode,
+                "plan_hash": plan.plan_hash,
+                "run_id": plan.run_spec.run_id,
+                "status": status.model_dump(mode="json"),
+                "write_performed": False,
+            }
+        )
+        return 0
+    if not args.apply:
+        logger.error("daily-dag {} requires explicit --apply", args.action)
+        return 2
+    if args.source_spool_root is None:
+        logger.error("daily-dag execution requires --source-spool-root")
+        return 2
+    from rquant.daily_pipeline_command_manifest import load_daily_pipeline_command_manifest
+    from rquant.daily_pipeline_ledger import DailyPipelineLedger
+    from rquant.daily_pipeline_orchestrator import (
+        DailyCloseSpoolSourceResolver,
+        DailyPipelineOrchestrator,
+    )
+    from rquant.live_spool import LiveBatchSpool
+
+    if not reconfirm_development_absence():
+        return 2
+    manifest = load_daily_pipeline_command_manifest(
+        plan.storage_profile.command_manifest_path,
+        expected_storage_profile=plan.storage_profile,
+    )
+    if args.command_manifest_hash != manifest.manifest_hash:
+        logger.error(
+            "daily-dag command manifest hash is missing or does not match the reviewed file"
+        )
+        return 2
+    expected_stage_ids = tuple(stage.stage_id for stage in plan.run_spec.stages)
+    manifest_stage_ids = tuple(sorted(stage.stage_id for stage in manifest.stages))
+    if manifest_stage_ids != tuple(sorted(expected_stage_ids)):
+        logger.error("daily-dag command manifest does not exactly cover the immutable DAG")
+        return 2
+    if plan.mode == "production" and not getattr(args, "confirm_production", False):
+        logger.error("daily-dag production execution requires --confirm-production")
+        return 2
+    if not reconfirm_development_absence():
+        return 2
+    ledger = DailyPipelineLedger(
+        storage_profile=plan.storage_profile,
+        service_owner=args.service_owner,
+    )
+    orchestrator = DailyPipelineOrchestrator(
+        ledger=ledger,
+        service_owner=args.service_owner,
+        adapters=tuple(manifest.adapter_for(stage_id) for stage_id in expected_stage_ids),
+        source_resolver=DailyCloseSpoolSourceResolver(
+            LiveBatchSpool(args.source_spool_root, read_only=True, source_read_only=True)
+        ),
+        clock=lambda: datetime.now(UTC),
+    )
+    if args.action == "recover":
+        if not reconfirm_development_absence():
+            return 2
+        recovery = orchestrator.recover(run_id=plan.run_spec.run_id)
+        report = _publish_daily_dag_report_if_complete(
+            orchestrator=orchestrator,
+            run_id=plan.run_spec.run_id,
+            plan_hash=plan.plan_hash,
+            storage_profile=plan.storage_profile,
+            expected_mode=plan.mode,
+            development_test_authority=(
+                None
+                if development_test_report_authority is None
+                else development_test_report_authority.capability
+            ),
+        )
+        _print_json(
+            {
+                "command": args.command,
+                "action": "recover",
+                "mode": plan.mode,
+                "plan_hash": plan.plan_hash,
+                "run_id": plan.run_spec.run_id,
+                "recovery": recovery.model_dump(mode="json"),
+                "report": report,
+            }
+        )
+        return 0
+    if not reconfirm_development_absence():
+        return 2
+    try:
+        run = orchestrator.create_run(
+            mode=plan.run_spec.mode,
+            trade_date=plan.run_spec.trade_date,
+            source_generation_id=plan.run_spec.source_generation_id,
+            source_content_hash=plan.run_spec.source_content_hash,
+            command_manifest_hash=plan.run_spec.command_manifest_hash,
+            code_commit=plan.run_spec.code_commit,
+            profile_hash=plan.run_spec.profile_hash,
+            deadline_at=plan.run_spec.deadline_at,
+        )
+    except (RuntimeError, ValueError) as exc:
+        logger.error("daily-dag refused stale or invalid source identity: {}", exc)
+        return 2
+    if args.action == "retry":
+        orchestrator.recover(run_id=run.run_id)
+    outcome = orchestrator.advance(run.run_id)
+    status = orchestrator.status(run.run_id)
+    report = _publish_daily_dag_report_if_complete(
+        orchestrator=orchestrator,
+        run_id=run.run_id,
+        plan_hash=plan.plan_hash,
+        storage_profile=plan.storage_profile,
+        expected_mode=plan.mode,
+        development_test_authority=(
+            None
+            if development_test_report_authority is None
+            else development_test_report_authority.capability
+        ),
+    )
+    _print_json(
+        {
+            "command": args.command,
+            "action": args.action,
+            "mode": plan.mode,
+            "plan_hash": plan.plan_hash,
+            "run_id": run.run_id,
+            "outcome": None if outcome is None else outcome.model_dump(mode="json"),
+            "status": status.model_dump(mode="json"),
+            "report": report,
+        }
+    )
+    return 0
+
+
+def _publish_daily_dag_report_if_complete(
+    *,
+    orchestrator: object,
+    run_id: str,
+    plan_hash: str,
+    storage_profile: object,
+    expected_mode: object,
+    development_test_authority: DailyPipelineReportAuthorityCapability | None,
+) -> dict[str, str] | None:
+    """Publish terminal evidence through the separate monotonic CAS authority."""
+    from rquant.daily_pipeline_ledger import (
+        DailyPipelineMode,
+        DailyPipelineStorageProfile,
+        DailyRunState,
+        DailyStageState,
+    )
+    from rquant.daily_pipeline_orchestrator import DailyPipelineOrchestrator
+    from rquant.daily_pipeline_report_authority import (
+        DailyPipelineReportAuthorityClient,
+        DailyPipelineReportStore,
+        DailyPipelineRunReport,
+    )
+
+    if not isinstance(orchestrator, DailyPipelineOrchestrator):
+        raise TypeError("daily DAG report publisher requires DailyPipelineOrchestrator")
+    run = orchestrator.ledger.run(run_id)
+    if run.state is not DailyRunState.SUCCEEDED:
+        return None
+    profile = DailyPipelineStorageProfile.model_validate(storage_profile)
+    required_mode = DailyPipelineMode(expected_mode)
+    if run.spec.mode is not required_mode or profile.mode is not required_mode:
+        raise RuntimeError("daily DAG report mode does not match the native run mode")
+    if required_mode is DailyPipelineMode.PRODUCTION and (
+        run.spec.mode is not DailyPipelineMode.PRODUCTION
+    ):
+        raise RuntimeError("production daily report requires a native production run")
+    receipts = []
+    for stage_id in orchestrator.definition.stage_ids:
+        stage = orchestrator.ledger.stage(run_id, stage_id)
+        if stage.state is not DailyStageState.SUCCEEDED or stage.terminal_receipt_id is None:
+            raise RuntimeError("completed daily DAG is missing a terminal stage receipt")
+        receipt = orchestrator.ledger.receipt(stage.terminal_receipt_id)
+        if receipt is None:
+            raise RuntimeError("completed daily DAG terminal receipt is unavailable")
+        receipts.append(receipt)
+    report = DailyPipelineRunReport.create(
+        mode=run.spec.mode,
+        profile_hash=run.spec.profile_hash,
+        namespace_id=str(profile.namespace_id),
+        run_id=run_id,
+        plan_hash=plan_hash,
+        trade_date=run.spec.trade_date,
+        receipt_ids=tuple(receipt.receipt_id for receipt in receipts),
+        # The last terminal receipt is immutable; using its prepare time makes
+        # report publication idempotent across repeated apply/recover calls.
+        generated_at=receipts[-1].prepared_at,
+    )
+    if development_test_authority is None:
+        authority = DailyPipelineReportAuthorityClient.from_production_profile(
+            code_identity=run.spec.code_commit,
+            profile_identity=run.spec.profile_hash,
+            mode=run.spec.mode,
+            namespace_id=str(profile.namespace_id),
+        )
+    else:
+        authority = development_test_authority
+    path = DailyPipelineReportStore(
+        storage_profile=profile,
+        authority=authority,
+    ).publish(report)
+    return {"report_id": str(report.report_id), "path": str(path)}
+
+
+def cmd_daily_dag_shadow(args: argparse.Namespace) -> int:
+    """Read signed daily-DAG shadow evidence; this command never changes authority."""
+    from rquant.daily_shadow_validation import (
+        DailyRetirementGate,
+        DailyRetirementGateConfig,
+        DailyShadowHmacSigner,
+        DailyShadowReportStore,
+    )
+
+    secret = os.environ.get(args.signing_key_env, "").encode("utf-8")
+    if len(secret) < 32:
+        logger.error("daily shadow signing key is missing or too short: {}", args.signing_key_env)
+        return 2
+    store = DailyShadowReportStore(
+        Path(args.report_root),
+        signer=DailyShadowHmacSigner(key_id=args.key_id, secret=secret),
+        create=False,
+    )
+    expected = tuple(args.expected_trade_date)
+    if args.calendar_path is None or args.calendar_commit is None:
+        if args.action == "retirement-gate":
+            logger.error(
+                "daily-dag-shadow retirement-gate requires --calendar-path and --calendar-commit"
+            )
+            return 2
+        decision = {
+            "eligible": False,
+            "counted_trade_dates": [],
+            "reasons": ["calendar_authority_required_for_retirement"],
+            "freeze_identity": None,
+        }
+    else:
+        from rquant.runtime_market_session import load_market_calendar_authority
+
+        decision = DailyRetirementGate(
+            DailyRetirementGateConfig(minimum_real_trading_days=args.minimum_real_trading_days)
+        ).evaluate(
+            store,
+            expected_trade_dates=expected,
+            calendar=load_market_calendar_authority(
+                args.calendar_path,
+                expected_commit=args.calendar_commit,
+            ),
+        )
+    reports = []
+    for trade_date in expected:
+        report = store.load_optional(trade_date)
+        if report is None:
+            reports.append({"trade_date": trade_date.isoformat(), "status": "missing"})
+            continue
+        reports.append(
+            {
+                "trade_date": trade_date.isoformat(),
+                "status": "passed" if report.passed else "failed",
+                "evidence_origin": report.session.evidence_origin,
+                "report_id": report.report_id,
+                "freeze_identity": report.session.freeze_identity,
+                "discrepancy_counts": report.discrepancy_counts,
+            }
+        )
+    _print_json(
+        {
+            "command": "daily-dag-shadow",
+            "mode": "shadow_readonly",
+            "legacy_daily_authority": "unchanged",
+            "action": args.action,
+            "retirement_gate": (
+                decision.model_dump(mode="json") if hasattr(decision, "model_dump") else decision
+            ),
+            "reports": reports,
+        }
+    )
+    return 0
+
+
 def cmd_monitor(args: argparse.Namespace) -> int:
     """启动盘中实时监控。"""
     from rquant.monitor import run_monitor
 
     setup_logging()
     return run_monitor(interval=args.interval)
+
+
+def cmd_legacy_shadow_recover(args: argparse.Namespace) -> int:
+    """Promote only an existing signed legacy-shadow staging batch."""
+    from rquant.config import settings
+    from rquant.legacy_shadow_export import recover_production_legacy_shadow_exports
+
+    recovered = recover_production_legacy_shadow_exports(
+        data_dir=settings.data_dir,
+        trade_date=date.fromisoformat(args.date),
+        source=args.source,
+    )
+    _print_json(
+        {
+            "command": "legacy-shadow-recover",
+            "mode": "recovery_only",
+            "source": args.source,
+            "trade_date": args.date,
+            "recovered": {key: str(value) for key, value in recovered.items()},
+        }
+    )
+    return 0
 
 
 def _split_ts_codes(values: list[str]) -> list[str]:
@@ -2696,10 +3323,34 @@ def cmd_preflight(args: argparse.Namespace) -> int:
     """
     from rquant.config import settings
     from rquant.notify.client import PushDeerClient, PushPlusClient
-    from rquant.preflight import format_pushdeer_summary, format_report, run_all_checks
+    from rquant.preflight import CheckResult, format_pushdeer_summary, format_report, run_all_checks
 
     setup_logging()
-    results = run_all_checks(freshness_profile=args.profile)
+    recovery_config = None
+    recovery_failure: CheckResult | None = None
+    runtime_root = getattr(args, "runtime_root", None)
+    if runtime_root is not None:
+        try:
+            from rquant.runtime_deployment_profile import (
+                build_runtime_recovery_preflight_config,
+                load_current_runtime_deployment_profile,
+            )
+
+            runtime_profile = load_current_runtime_deployment_profile(Path(runtime_root))
+            recovery_config = build_runtime_recovery_preflight_config(runtime_profile)
+        except Exception as exc:
+            recovery_failure = CheckResult(
+                "runtime_recovery",
+                "fail",
+                f"recovery production profile 验证失败: {type(exc).__name__}",
+            )
+    results = run_all_checks(
+        freshness_profile=args.profile,
+        recovery_config=recovery_config,
+        runtime_root=None if runtime_root is None else Path(runtime_root),
+    )
+    if recovery_failure is not None:
+        results.append(recovery_failure)
     print(format_report(results))
 
     if args.notify:
@@ -2721,6 +3372,509 @@ def cmd_preflight(args: argparse.Namespace) -> int:
 
     fails = [r for r in results if r.status == "fail"]
     return 1 if fails else 0
+
+
+def _serve_closed_unix_authority(service: object, *, label: str) -> int:
+    stop = threading.Event()
+
+    def handle_signal(signum: int, frame: object) -> None:
+        del frame
+        logger.info(f"{label} 收到信号 {signum}，请求停止")
+        stop.set()
+        service.wake()
+
+    previous = {signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)}
+    for signum in previous:
+        signal.signal(signum, handle_signal)
+    try:
+        service.serve_forever(stop=stop)
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+    return 0
+
+
+def cmd_external_monotonic_root_serve(args: argparse.Namespace) -> int:
+    """Run the closed persistent external monotonic-root authority."""
+    from rquant.resource_authority_service import (
+        EXTERNAL_ROOT_ENVIRONMENT_KEYS,
+        EXTERNAL_ROOT_ENVIRONMENT_PATH,
+        ResourceAuthorityServiceError,
+        compose_external_monotonic_root_daemon,
+        load_closed_authority_environment,
+        load_external_monotonic_root_daemon_configuration,
+    )
+
+    environment_path = EXTERNAL_ROOT_ENVIRONMENT_PATH
+    environment = load_closed_authority_environment(
+        environment_path,
+        allowed_keys=EXTERNAL_ROOT_ENVIRONMENT_KEYS,
+        required_keys=EXTERNAL_ROOT_ENVIRONMENT_KEYS,
+        expected_uid=0,
+        expected_gid=0,
+    )
+    path = Path(args.config)
+    if environment["APP_ENV"] != "prod" or path != Path(
+        environment["RQUANT_EXTERNAL_MONOTONIC_ROOT_SERVICE_CONFIG_PATH"]
+    ):
+        raise ResourceAuthorityServiceError(
+            "external monotonic root CLI requires the configured production manifest"
+        )
+    service = compose_external_monotonic_root_daemon(
+        load_external_monotonic_root_daemon_configuration(
+            path,
+            expected_uid=0,
+            expected_gid=0,
+        )
+    )
+    return _serve_closed_unix_authority(service, label="external-monotonic-root")
+
+
+def cmd_resource_authority_serve(args: argparse.Namespace) -> int:
+    """Run the closed resource journal authority backed by the external root."""
+    from rquant.lab_resource_authority_adapter import parse_resource_authority_adapter_config
+    from rquant.resource_authority_service import (
+        RESOURCE_AUTHORITY_ENVIRONMENT_KEYS,
+        RESOURCE_AUTHORITY_ENVIRONMENT_PATH,
+        ResourceAuthorityServiceError,
+        compose_resource_authority_daemon,
+        load_closed_authority_environment,
+        load_resource_authority_daemon_configuration,
+    )
+    from rquant.runtime_resource_admission import admission_policy_for_version
+
+    environment = load_closed_authority_environment(
+        RESOURCE_AUTHORITY_ENVIRONMENT_PATH,
+        allowed_keys=RESOURCE_AUTHORITY_ENVIRONMENT_KEYS,
+        required_keys=RESOURCE_AUTHORITY_ENVIRONMENT_KEYS,
+        expected_uid=0,
+        expected_gid=0,
+    )
+    path = Path(args.config)
+    code_sha = environment["RQUANT_CODE_COMMIT"].strip().lower()
+    if (
+        environment["APP_ENV"] != "prod"
+        or path != Path(environment["RQUANT_RESOURCE_AUTHORITY_SERVICE_CONFIG_PATH"])
+        or (args.code_sha is not None and args.code_sha.strip().lower() != code_sha)
+        or len(code_sha) != 40
+        or any(character not in "0123456789abcdef" for character in code_sha)
+    ):
+        raise ResourceAuthorityServiceError(
+            "resource authority CLI requires the configured production identity"
+        )
+    configuration = load_resource_authority_daemon_configuration(
+        path,
+        expected_uid=0,
+        expected_gid=0,
+    )
+    worker_adapter = parse_resource_authority_adapter_config(
+        environment["RQUANT_LAB_RESOURCE_AUTHORITY_CONFIG_JSON"]
+    )
+    if worker_adapter != configuration.service_configuration.adapter_configuration:
+        raise ResourceAuthorityServiceError(
+            "resource authority service and worker manifests conflict"
+        )
+    authority_settings = SimpleNamespace(
+        app_env="prod",
+        lab_worker_artifact_dir_resolved=Path(environment["RQUANT_RESOURCE_AUTHORITY_STATE_DIR"]),
+        rquant_lab_live_slo_authority_root=Path(environment["RQUANT_LAB_LIVE_SLO_AUTHORITY_ROOT"]),
+        rquant_lab_trade_calendar_path=Path(environment["RQUANT_LAB_TRADE_CALENDAR_PATH"]),
+        rquant_lab_resource_policy_version=environment["RQUANT_LAB_RESOURCE_POLICY_VERSION"],
+    )
+    admission = _build_lab_worker_resource_admission(
+        settings=authority_settings,
+        code_sha=code_sha,
+        legacy_opt_out=False,
+    )
+    snapshot_provider = admission.resource_snapshot_provider
+    if not admission.require_resource_admission or snapshot_provider is None:
+        raise ResourceAuthorityServiceError(
+            "resource authority runtime snapshot provider is unavailable"
+        )
+    policy = admission_policy_for_version(authority_settings.rquant_lab_resource_policy_version)
+    service = compose_resource_authority_daemon(
+        configuration=configuration,
+        policy_provider=lambda: policy,
+        snapshot_provider=snapshot_provider,
+    )
+    return _serve_closed_unix_authority(service, label="resource-authority")
+
+
+def cmd_runtime_deployment_profile(args: argparse.Namespace) -> int:
+    """Preview or atomically install one immutable isolated-runtime profile."""
+    from rquant.runtime_deployment_profile import (
+        install_runtime_deployment_profile,
+        load_runtime_deployment_profile,
+        load_runtime_schema_v1_migration_authorization,
+        preview_runtime_deployment_profile,
+    )
+
+    profile = load_runtime_deployment_profile(
+        Path(args.profile),
+        expected_commit=str(args.expected_commit),
+    )
+    if not args.apply:
+        preview = preview_runtime_deployment_profile(
+            profile,
+            runtime_root=Path(args.runtime_root),
+            environ=os.environ,
+            schema_bootstrap_reason=args.schema_bootstrap_reason,
+        )
+        print(preview.model_dump_json(indent=2))
+        return 0
+    if args.profile_id != profile.profile_id:
+        logger.error("运行时画像已变化；请重新 dry-run 并核对新的 profile id")
+        return 2
+    migration_path = getattr(args, "schema_v1_migration_authority", None)
+    if profile.schema_v1_migration_authority is not None:
+        if migration_path is None:
+            logger.error("首次 schema v1 migration 必须显式传入审核授权文件")
+            return 2
+        explicit_authority = load_runtime_schema_v1_migration_authorization(Path(migration_path))
+        if explicit_authority != profile.schema_v1_migration_authority:
+            logger.error("显式 schema v1 migration 授权与 hash-bound profile 不一致")
+            return 2
+    elif migration_path is not None:
+        logger.error("当前 profile 不包含 schema v1 migration，拒绝无关授权文件")
+        return 2
+    receipt = install_runtime_deployment_profile(
+        profile,
+        runtime_root=Path(args.runtime_root),
+        environ=os.environ,
+        schema_bootstrap_reason=args.schema_bootstrap_reason,
+    )
+    print(receipt.model_dump_json(indent=2))
+    return 0
+
+
+def cmd_runtime_production_profile(args: argparse.Namespace) -> int:
+    """Preview or publish one immutable production profile from canonical inputs."""
+    from rquant.runtime_production_profile import (
+        build_production_runtime_profile,
+        load_production_runtime_profile_inputs,
+        publish_production_runtime_profile,
+    )
+
+    inputs = load_production_runtime_profile_inputs(
+        Path(args.inputs),
+        expected_commit=str(args.expected_commit),
+        expected_runtime_mode=str(getattr(args, "runtime_mode", "local-test")),
+    )
+    profile = build_production_runtime_profile(inputs)
+    if profile.profile_id is None:  # pragma: no cover - profile model invariant
+        raise ValueError("production runtime profile id is missing")
+    output = Path(args.output_dir) / f"{profile.profile_id}.json"
+    apply_requested = bool(getattr(args, "apply", False))
+    expected_profile_id = getattr(args, "profile_id", None)
+    if apply_requested:
+        if expected_profile_id != profile.profile_id:
+            raise ValueError("production runtime profile changed after preview")
+        published = publish_production_runtime_profile(
+            profile,
+            output,
+            production_runtime_root=inputs.runtime_root,
+        )
+    else:
+        if expected_profile_id is not None:
+            raise ValueError("production runtime profile id requires apply")
+        published = output
+    print(
+        json.dumps(
+            {
+                "producer_commit": profile.producer_commit,
+                "profile_id": profile.profile_id,
+                "profile_path": str(published),
+                "runtime_root": str(inputs.runtime_root),
+                "service_count": len(profile.manifests),
+                "status": "published" if apply_requested else "dry_run",
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def cmd_runtime_production_prerequisites(args: argparse.Namespace) -> int:
+    """Preview or install immutable authorities required by a production profile."""
+    from rquant.runtime_market_calendar_generation import market_calendar_generation_path
+    from rquant.runtime_production_profile import (
+        build_production_runtime_profile,
+        install_production_runtime_prerequisites,
+        load_production_runtime_profile_inputs,
+    )
+
+    inputs = load_production_runtime_profile_inputs(
+        Path(args.inputs),
+        expected_commit=str(args.expected_commit),
+        expected_runtime_mode=str(getattr(args, "runtime_mode", "local-test")),
+    )
+    profile = build_production_runtime_profile(inputs)
+    if profile.profile_id is None:  # pragma: no cover - profile model invariant
+        raise ValueError("production runtime profile id is missing")
+    target = market_calendar_generation_path(
+        inputs.runtime_root,
+        inputs.market_calendar_content_sha256,
+    )
+    retention_manifests = tuple(
+        manifest
+        for manifest in profile.manifests
+        if manifest.service_kind.value == "artifact_retention"
+    )
+    if len(retention_manifests) != 1:
+        raise ValueError("production profile must contain exactly one retention owner")
+    retention_catalog_receipt = (
+        Path(str(retention_manifests[0].settings["catalog_authority_root"])) / "current.json"
+    )
+    targets = (target, inputs.definition_registry_root, retention_catalog_receipt)
+    if not args.apply:
+        print(
+            json.dumps(
+                {
+                    "profile_id": profile.profile_id,
+                    "status": "dry_run",
+                    "targets": [str(path) for path in targets],
+                },
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+    if args.profile_id != profile.profile_id:
+        logger.error("生产画像已变化；请重新 dry-run 并核对新的 profile id")
+        return 2
+    installed = install_production_runtime_prerequisites(inputs)
+    print(
+        json.dumps(
+            {
+                "profile_id": profile.profile_id,
+                "status": "applied",
+                "targets": [str(path) for path in installed],
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def cmd_runtime_deployment_rollout(args: argparse.Namespace) -> int:
+    """Roll out one installed runtime generation through audited systemd health gates."""
+    from rquant.runtime_deployment_bundle import (
+        activate_runtime_deployment_generation,
+        load_current_runtime_deployment_receipt,
+        load_runtime_deployment_generation_receipt,
+    )
+    from rquant.runtime_deployment_rollout import (
+        SystemdRuntimeRolloutController,
+        build_runtime_generation_health_probe,
+        rollout_runtime_deployment,
+    )
+
+    runtime_root = Path(args.runtime_root)
+    current = load_current_runtime_deployment_receipt(
+        runtime_root,
+        expected_commit=str(args.expected_commit),
+        expected_profile_id=str(args.profile_id),
+    )
+    if current.generation_hash != args.generation_hash:
+        logger.error("运行时 current generation 与请求不一致")
+        return 2
+    receipt = current.model_copy(update={"previous_generation_hash": args.previous_generation_hash})
+
+    def load_previous(generation_hash: str) -> RuntimeDeploymentReceipt | None:
+        previous = load_runtime_deployment_generation_receipt(
+            runtime_root,
+            generation_hash=generation_hash,
+        )
+        return previous if previous.producer_commit == current.producer_commit else None
+
+    def activate_previous(previous: RuntimeDeploymentReceipt) -> object:
+        if previous.deployment_profile_id is None:
+            raise ValueError("previous runtime generation lacks a profile identity")
+        return activate_runtime_deployment_generation(
+            runtime_root,
+            generation_hash=previous.generation_hash,
+            expected_commit=previous.producer_commit,
+            expected_profile_id=previous.deployment_profile_id,
+        )
+
+    audit = rollout_runtime_deployment(
+        receipt,
+        controller=SystemdRuntimeRolloutController(
+            health_probe=build_runtime_generation_health_probe()
+        ),
+        current_receipt_loader=lambda: load_current_runtime_deployment_receipt(
+            runtime_root,
+            expected_commit=current.producer_commit,
+            expected_profile_id=str(current.deployment_profile_id),
+        ),
+        previous_receipt_loader=load_previous,
+        previous_generation_activator=activate_previous,
+        audit_root=(
+            Path(args.audit_root)
+            if args.audit_root is not None
+            else runtime_root / "control" / "deployment-rollouts"
+        ),
+        health_timeout_seconds=float(args.health_timeout_seconds),
+    )
+    print(audit.model_dump_json(indent=2))
+    return 0 if audit.status == "succeeded" else 2
+
+
+def cmd_runtime_deployment_rollback(args: argparse.Namespace) -> int:
+    """Restore the exact previous runtime generation before code rollback."""
+
+    from rquant.runtime_deployment_bundle import (
+        activate_runtime_deployment_generation,
+        load_current_runtime_deployment_receipt_unbound,
+        load_runtime_deployment_generation_receipt,
+    )
+    from rquant.runtime_deployment_rollout import (
+        SystemdRuntimeRolloutController,
+        build_runtime_generation_health_probe,
+        rollback_runtime_deployment,
+    )
+
+    runtime_root = Path(args.runtime_root)
+    current = load_current_runtime_deployment_receipt_unbound(runtime_root)
+    if current.producer_commit == args.expected_previous_commit:
+        print(
+            json.dumps(
+                {
+                    "status": "already_rolled_back",
+                    "generation_hash": current.generation_hash,
+                    "producer_commit": current.producer_commit,
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
+        return 0
+    if current.producer_commit != args.failed_commit:
+        logger.error("runtime current commit 既不是失败版本也不是预期回退版本")
+        return 2
+    if current.previous_generation_hash is None:
+        logger.error("runtime current generation 没有 previous generation")
+        return 2
+
+    def load_previous(generation_hash: str) -> RuntimeDeploymentReceipt | None:
+        previous = load_runtime_deployment_generation_receipt(
+            runtime_root,
+            generation_hash=generation_hash,
+        )
+        return previous if previous.producer_commit == args.expected_previous_commit else None
+
+    def activate_previous(previous: RuntimeDeploymentReceipt) -> object:
+        if previous.deployment_profile_id is None:
+            raise ValueError("previous runtime generation lacks a profile identity")
+        return activate_runtime_deployment_generation(
+            runtime_root,
+            generation_hash=previous.generation_hash,
+            expected_commit=previous.producer_commit,
+            expected_profile_id=previous.deployment_profile_id,
+        )
+
+    audit = rollback_runtime_deployment(
+        current,
+        operation_id=str(args.operation_id),
+        controller=SystemdRuntimeRolloutController(
+            health_probe=build_runtime_generation_health_probe()
+        ),
+        current_receipt_loader=lambda: load_current_runtime_deployment_receipt_unbound(
+            runtime_root
+        ),
+        previous_receipt_loader=load_previous,
+        previous_generation_activator=activate_previous,
+        audit_root=(
+            Path(args.audit_root)
+            if args.audit_root is not None
+            else runtime_root / "control" / "deployment-rollbacks"
+        ),
+        health_timeout_seconds=float(args.health_timeout_seconds),
+    )
+    print(audit.model_dump_json(indent=2))
+    return 0
+
+
+def cmd_runtime_schema_retirement(args: argparse.Namespace) -> int:
+    """Inspect or explicitly retire one post-cutover schema plan."""
+
+    from rquant.runtime_deployment_bundle import load_current_runtime_deployment_receipt
+    from rquant.runtime_deployment_rollout import (
+        load_runtime_deployment_rollout_audit,
+        preview_runtime_schema_retirement,
+        retire_runtime_schema_plan,
+    )
+
+    runtime_root = Path(args.runtime_root)
+    receipt = load_current_runtime_deployment_receipt(
+        runtime_root,
+        expected_commit=str(args.expected_commit),
+        expected_profile_id=str(args.profile_id),
+    )
+    if receipt.generation_hash != args.generation_hash:
+        logger.error("schema retirement generation 与 current runtime 不一致")
+        return 2
+    audit_root = (
+        Path(args.audit_root)
+        if args.audit_root is not None
+        else runtime_root / "control" / "deployment-rollouts"
+    )
+    audit = load_runtime_deployment_rollout_audit(
+        audit_root,
+        operation_id=str(args.rollout_operation_id),
+    )
+    now = datetime.now(UTC)
+    statuses = preview_runtime_schema_retirement(
+        receipt,
+        rollout_audit=audit,
+        now=now,
+    )
+    if args.retirement_action == "status":
+        print(
+            json.dumps(
+                {
+                    "status": "ready",
+                    "observed_at": now.isoformat(),
+                    "plans": [item.model_dump(mode="json") for item in statuses],
+                },
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
+        return 0
+    selected = next((item for item in statuses if item.plan_id == args.plan_id), None)
+    if selected is None:
+        logger.error("schema retirement plan 不属于当前 rollout")
+        return 2
+    if args.retirement_action == "dry-run":
+        print(
+            json.dumps(
+                {
+                    "status": "eligible" if selected.eligible else "waiting",
+                    "observed_at": now.isoformat(),
+                    "plan": selected.model_dump(mode="json"),
+                },
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
+        return 0
+    retired = retire_runtime_schema_plan(
+        receipt,
+        rollout_audit=audit,
+        plan_id=str(args.plan_id),
+        now=now,
+        operation_id=str(args.operation_id),
+    )
+    print(retired.model_dump_json(indent=2))
+    return 0
 
 
 def cmd_pre_market_check(args: argparse.Namespace) -> int:
@@ -2788,6 +3942,374 @@ def cmd_pool2(args: argparse.Namespace) -> int:
             logger.info(f"已从 Pool 2 移除: {args.ts_code}")
             return 0
 
+    return 0
+
+
+def cmd_runtime_recovery_backup(args: argparse.Namespace) -> int:
+    """Produce or inspect one signed, consistent recovery backup generation."""
+
+    from rquant.runtime_recovery_backup import (
+        RecoveryBackupAuthenticator,
+        RecoveryBackupProducer,
+        load_recovery_backup_config,
+        load_recovery_backup_generation,
+        recovery_backup_trusted_verifiers_for_active,
+    )
+
+    config = load_recovery_backup_config(args.config)
+    authenticator = RecoveryBackupAuthenticator.from_file(args.credential_file)
+    trusted_verifiers = recovery_backup_trusted_verifiers_for_active(authenticator)
+    if args.recovery_action == "status":
+        pointer, receipt, _target, tool, _expectations = load_recovery_backup_generation(
+            Path(config.publication_root),
+            trusted_verifiers=trusted_verifiers,
+        )
+        tool_verifier = trusted_verifiers.get(tool.key_id)
+        if tool_verifier is None or not tool_verifier.verify(
+            tool.signing_payload(), tool.signature
+        ):
+            raise RuntimeError("recovery backup verifier signature is invalid")
+        print(
+            json.dumps(
+                {
+                    "status": "ready",
+                    "manifest_id": pointer.manifest_id,
+                    "profile_generation": pointer.profile_generation,
+                    "receipt_id": receipt.receipt_id,
+                    "completed_at": receipt.completed_at.isoformat(),
+                    "paper_ledger_head": receipt.paper_ledger_head.head_id,
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
+        return 0
+    producer = RecoveryBackupProducer(
+        config=config,
+        signer=authenticator,
+        trusted_verifiers=trusted_verifiers,
+    )
+    preview = producer.preview()
+    if args.recovery_action == "dry-run":
+        print(preview.model_dump_json())
+        return 0
+    receipt = producer.execute(expected_plan_id=args.plan_id)
+    print(receipt.model_dump_json())
+    return 0
+
+
+def cmd_runtime_recovery_production_config(args: argparse.Namespace) -> int:
+    """Resolve backup settings only from the current hash-bound production profile."""
+
+    from rquant.runtime_deployment_profile import (
+        load_current_runtime_deployment_profile,
+        validate_runtime_recovery_backup_config,
+    )
+    from rquant.runtime_recovery_backup import load_recovery_backup_config
+
+    runtime_root = Path(args.runtime_root)
+    profile = load_current_runtime_deployment_profile(runtime_root)
+    recovery = profile.recovery
+    if recovery is None or recovery.profile_generation is None:
+        raise ValueError("current runtime profile has no recovery production configuration")
+    backup_config = load_recovery_backup_config(recovery.backup_config_path)
+    validate_runtime_recovery_backup_config(profile, backup_config)
+    print(
+        json.dumps(
+            {
+                "status": "ready",
+                "runtime_root": str(runtime_root),
+                "producer_commit": profile.producer_commit,
+                "profile_id": profile.profile_id,
+                "profile_generation": recovery.profile_generation,
+                "backup_environment": dict(recovery.backup_environment()),
+                "recovery_service_arguments": dict(recovery.recovery_service_arguments()),
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def _runtime_recovery_rehearsal_due(
+    *,
+    state_path: Path,
+    receipt_root: Path,
+    interval_seconds: int,
+    now: datetime,
+) -> tuple[bool, datetime | None, datetime | None]:
+    from rquant.runtime_recovery_service import load_verified_recovery_service_receipts
+
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("recovery rehearsal clock must be timezone-aware")
+    if type(interval_seconds) is not int or interval_seconds < 60:
+        raise ValueError("recovery rehearsal interval must be at least 60 seconds")
+    state_exists = state_path.exists()
+    receipts_exist = receipt_root.exists()
+    if not state_exists and not receipts_exist:
+        return True, None, None
+    if state_exists != receipts_exist:
+        raise ValueError("recovery rehearsal state and receipt root are inconsistent")
+    receipts = load_verified_recovery_service_receipts(
+        state_path=state_path,
+        receipt_root=receipt_root,
+    )
+    successful = tuple(
+        receipt
+        for receipt in receipts
+        if receipt.status == "succeeded" and receipt.verification_level == "full"
+    )
+    if not successful:
+        return True, None, None
+    last = max(receipt.completed_at for receipt in successful).astimezone(UTC)
+    observed_now = now.astimezone(UTC)
+    if last > observed_now:
+        raise ValueError("recovery rehearsal receipt is dated in the future")
+    next_due = last + timedelta(seconds=interval_seconds)
+    return observed_now >= next_due, last, next_due
+
+
+def cmd_runtime_recovery_production(args: argparse.Namespace) -> int:
+    """Run recovery using only the current trusted production profile."""
+
+    from rquant.runtime_deployment_profile import (
+        load_current_runtime_deployment_profile,
+        validate_runtime_recovery_backup_config,
+    )
+    from rquant.runtime_recovery_backup import load_recovery_backup_config
+
+    runtime_root = Path(args.runtime_root)
+    profile = load_current_runtime_deployment_profile(runtime_root)
+    recovery = profile.recovery
+    if recovery is None or recovery.profile_generation is None:
+        raise ValueError("current runtime profile has no recovery production configuration")
+    if recovery.profile_generation != str(args.expected_profile_generation):
+        raise ValueError("recovery unit profile generation is stale")
+    backup_config = load_recovery_backup_config(recovery.backup_config_path)
+    validate_runtime_recovery_backup_config(profile, backup_config)
+    arguments = dict(recovery.recovery_service_arguments())
+    required = {
+        "publication_root",
+        "state_path",
+        "receipt_root",
+        "restore_root",
+        "credential_file",
+        "lease_seconds",
+        "max_attempts",
+        "retry_delay_seconds",
+        "deadline_seconds",
+        "rehearsal_interval_seconds",
+    }
+    if set(arguments) != required:
+        raise ValueError("current recovery profile service arguments are incomplete")
+    action = str(args.production_recovery_action)
+    if action not in {"execute", "rehearse"}:  # pragma: no cover - argparse guards this
+        raise ValueError("unknown production recovery action")
+    rehearsal_interval = int(arguments["rehearsal_interval_seconds"])
+    if action == "rehearse":
+        due, last_successful, next_due = _runtime_recovery_rehearsal_due(
+            state_path=Path(arguments["state_path"]),
+            receipt_root=Path(arguments["receipt_root"]),
+            interval_seconds=rehearsal_interval,
+            now=_utc_now(),
+        )
+        if not due:
+            print(
+                json.dumps(
+                    {
+                        "last_successful_at": (
+                            None if last_successful is None else last_successful.isoformat()
+                        ),
+                        "next_due_at": None if next_due is None else next_due.isoformat(),
+                        "profile_generation": recovery.profile_generation,
+                        "reason": "rehearsal_not_due",
+                        "status": "skipped",
+                    },
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+            )
+            return 0
+    return cmd_runtime_recovery(
+        argparse.Namespace(
+            recovery_action="execute",
+            publication_root=Path(arguments["publication_root"]),
+            state_path=Path(arguments["state_path"]),
+            receipt_root=Path(arguments["receipt_root"]),
+            restore_root=Path(arguments["restore_root"]),
+            credential_file=Path(arguments["credential_file"]),
+            lease_seconds=int(arguments["lease_seconds"]),
+            max_attempts=int(arguments["max_attempts"]),
+            retry_delay_seconds=int(arguments["retry_delay_seconds"]),
+            deadline_seconds=int(arguments["deadline_seconds"]),
+            schedule_cycle_seconds=(None if action == "execute" else rehearsal_interval),
+            worker_id=(f"runtime-recovery-{action}-{recovery.profile_generation[:12]}"),
+            accept_current_plan=True,
+            plan_id=None,
+        )
+    )
+
+
+def _runtime_recovery_preview(args: argparse.Namespace) -> tuple[dict[str, object], object]:
+    from rquant.runtime_contracts import canonical_sha256
+    from rquant.runtime_recovery_backup import (
+        RecoveryBackupAuthenticator,
+        load_recovery_backup_generation,
+        recovery_backup_trusted_verifiers_for_active,
+    )
+    from rquant.runtime_recovery_coordinator import RuntimeRecoveryFixedReplayVerifier
+
+    authenticator = RecoveryBackupAuthenticator.from_file(args.credential_file)
+    trusted_verifiers = recovery_backup_trusted_verifiers_for_active(authenticator)
+    pointer, receipt, target, tool, expectations = load_recovery_backup_generation(
+        args.publication_root,
+        trusted_verifiers=trusted_verifiers,
+    )
+    verifier = RuntimeRecoveryFixedReplayVerifier(expectations=expectations.expectations)
+    tool_verifier = trusted_verifiers.get(tool.key_id)
+    if (
+        tool_verifier is None
+        or not tool_verifier.verify(tool.signing_payload(), tool.signature)
+        or verifier.fingerprint != tool.executable_fingerprint
+    ):
+        raise RuntimeError("recovery verifier bundle is not trusted")
+    plan = {
+        "contract": "runtime-recovery-execution-plan/v2",
+        "manifest_id": str(target.manifest_id),
+        "tool_bundle_id": str(tool.bundle_id),
+        "profile_generation": target.target_profile_generation,
+        "backup_receipt_id": str(receipt.receipt_id),
+        "publication_root": str(args.publication_root),
+        "state_path": str(args.state_path),
+        "receipt_root": str(args.receipt_root),
+        "restore_root": str(args.restore_root),
+        "credential_file": str(args.credential_file),
+        "worker_id": str(args.worker_id),
+        "lease_seconds": _runtime_recovery_lease_seconds(args),
+        "max_attempts": args.max_attempts,
+        "retry_delay_seconds": args.retry_delay_seconds,
+        "deadline_seconds": args.deadline_seconds,
+        "schedule_cycle_seconds": getattr(args, "schedule_cycle_seconds", None),
+    }
+    output = {
+        "status": "ready",
+        "plan_id": canonical_sha256(plan),
+        "manifest_id": pointer.manifest_id,
+        "profile_generation": pointer.profile_generation,
+        "deadline_seconds": args.deadline_seconds,
+    }
+    return output, (pointer, target, tool, verifier, tool_verifier)
+
+
+def _runtime_recovery_lease_seconds(args: argparse.Namespace) -> int:
+    configured = getattr(args, "lease_seconds", None)
+    if configured is not None:
+        return int(configured)
+    return min(300, max(10, int(args.deadline_seconds) // 3))
+
+
+def _runtime_recovery_request_id(
+    *,
+    manifest_id: str,
+    now: datetime,
+    schedule_cycle_seconds: int | None,
+) -> str:
+    """Return one stable request identity per external scheduler cycle."""
+
+    if schedule_cycle_seconds is None:
+        return f"rehearsal-{manifest_id}"
+    if type(schedule_cycle_seconds) is not int or schedule_cycle_seconds < 60:
+        raise ValueError("schedule cycle must be at least 60 seconds")
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("schedule cycle timestamp must be timezone-aware")
+    cycle = math.floor(now.astimezone(UTC).timestamp() / schedule_cycle_seconds)
+    return f"rehearsal-{manifest_id}-{schedule_cycle_seconds}-{cycle}"
+
+
+def cmd_runtime_recovery(args: argparse.Namespace) -> int:
+    """Dry-run, execute, or inspect one isolated runtime recovery rehearsal."""
+
+    from rquant.runtime_recovery_service import (
+        RuntimeRecoveryService,
+        load_verified_recovery_service_receipts,
+    )
+
+    preview, bindings = _runtime_recovery_preview(args)
+    if args.recovery_action == "dry-run":
+        print(json.dumps(preview, separators=(",", ":"), sort_keys=True))
+        return 0
+    if args.recovery_action == "status":
+        receipts = load_verified_recovery_service_receipts(
+            state_path=args.state_path,
+            receipt_root=args.receipt_root,
+        )
+        latest = (
+            None
+            if not receipts
+            else max(receipts, key=lambda item: (item.completed_at, str(item.receipt_id)))
+        )
+        print(
+            json.dumps(
+                {
+                    **preview,
+                    "status": "missing" if latest is None else latest.status,
+                    "service_receipt_id": None if latest is None else latest.receipt_id,
+                    "recovery_receipt_id": (None if latest is None else latest.recovery_receipt_id),
+                    "verification_level": (None if latest is None else latest.verification_level),
+                    "completed_at": (None if latest is None else latest.completed_at.isoformat()),
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
+        return 0
+    if not getattr(args, "accept_current_plan", False) and args.plan_id != preview["plan_id"]:
+        raise RuntimeError("recovery execution plan changed after dry-run")
+    pointer, target, _tool, verifier, signature_verifier = bindings
+    generation = args.publication_root.joinpath(*Path(pointer.generation_path).parts)
+    args.restore_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    service = RuntimeRecoveryService(
+        state_path=args.state_path,
+        receipt_root=args.receipt_root,
+        worker_id=args.worker_id,
+        lease_seconds=_runtime_recovery_lease_seconds(args),
+        max_attempts=args.max_attempts,
+        retry_delay_seconds=args.retry_delay_seconds,
+    )
+    now = datetime.now(UTC)
+    service.submit(
+        request_id=_runtime_recovery_request_id(
+            manifest_id=str(target.manifest_id),
+            now=now,
+            schedule_cycle_seconds=getattr(args, "schedule_cycle_seconds", None),
+        ),
+        backup_root=generation,
+        manifest_path=generation / "recovery-target.json",
+        tool_bundle_path=generation / "recovery-tool.json",
+        restore_root=args.restore_root,
+        deadline_at=now + timedelta(seconds=args.deadline_seconds),
+    )
+    result = service.run_real_once(
+        signature_verifier=signature_verifier,
+        fixed_replay_verifier=verifier,
+    )
+    print(
+        json.dumps(
+            {
+                **preview,
+                "status": "idle" if result is None else result.status,
+                "service_result": None if result is None else result.model_dump(mode="json"),
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    )
     return 0
 
 
@@ -2944,12 +4466,120 @@ def cmd_lab_run(args: argparse.Namespace) -> int:
         except Exception:
             logger.exception("lab-run 补写 error status 失败")
         return 1
+    research_snapshot = getattr(args, "research_snapshot", None)
+    if research_snapshot is not None:
+        resolved_snapshot = str(Path(research_snapshot).expanduser().resolve())
+        bound_snapshot = spec.get("research_snapshot")
+        if bound_snapshot is None:
+            spec["research_snapshot"] = resolved_snapshot
+        elif not isinstance(bound_snapshot, str) or (
+            str(Path(bound_snapshot).expanduser().resolve()) != resolved_snapshot
+        ):
+            spec["research_snapshot_mismatch"] = True
     try:
         run_id = execute_spec(spec)
     except Exception:
         logger.exception("lab-run 执行失败（error 已写入 status 文件）")
         return 1
     logger.info(f"lab-run 完成: {run_id}")
+    return 0
+
+
+def cmd_lab_integrity_audit(args: argparse.Namespace) -> int:
+    """Run the explicit full-ledger audit for a scheduleable Lab health check."""
+
+    from rquant.lab_highwater_authority import (
+        PRODUCTION_LAB_HIGHWATER_COMMAND,
+        LabHighWaterAuthorityClient,
+        LabHighWaterAuthorityConfig,
+        LabHighWaterAuthorityError,
+        load_highwater_trusted_keys,
+    )
+    from rquant.lab_jobs import (
+        InvalidStoredJobError,
+        LabDatabaseIdentityError,
+        LabJobReader,
+    )
+
+    path = Path(args.jobs_path).expanduser().resolve()
+    machine_receipt = bool(getattr(args, "machine_receipt", False))
+    require_highwater = bool(getattr(args, "require_external_highwater", False))
+    highwater_production_mode = bool(getattr(args, "highwater_production_mode", False))
+    highwater_observer = None
+    if require_highwater:
+        values = (
+            getattr(args, "highwater_command_json", None),
+            getattr(args, "highwater_stable_identity", None),
+            getattr(args, "highwater_code_identity", None),
+            getattr(args, "highwater_profile_identity", None),
+            getattr(args, "highwater_trusted_keyring", None),
+        )
+        if any(value is None or not str(value).strip() for value in values):
+            if not machine_receipt:
+                logger.error("lab integrity audit high-water options must be supplied together")
+            return 2
+        try:
+            command = json.loads(str(args.highwater_command_json))
+            if not isinstance(command, list) or not command:
+                raise ValueError("high-water command must be a nonempty JSON array")
+            command_parts = tuple(command)
+            if any(not isinstance(part, str) or not part for part in command_parts):
+                raise ValueError("high-water command contains an invalid argument")
+            if highwater_production_mode and command_parts != PRODUCTION_LAB_HIGHWATER_COMMAND:
+                raise ValueError("production high-water command must be the fixed sudo helper")
+            trusted_keys = load_highwater_trusted_keys(
+                Path(args.highwater_trusted_keyring).expanduser().resolve()
+            )
+            highwater_observer = LabHighWaterAuthorityClient(
+                LabHighWaterAuthorityConfig(
+                    command=command_parts,
+                    stable_identity=str(args.highwater_stable_identity),
+                    code_identity=str(args.highwater_code_identity),
+                    profile_identity=str(args.highwater_profile_identity),
+                    trusted_key_provider=trusted_keys.get,
+                    timeout_seconds=float(getattr(args, "highwater_timeout_seconds", 10.0)),
+                    allow_identity_rotation=bool(
+                        getattr(args, "highwater_allow_identity_rotation", False)
+                    ),
+                    production_mode=highwater_production_mode,
+                )
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            if not machine_receipt:
+                logger.error("lab integrity audit high-water credential is invalid: {}", exc)
+            return 2
+    try:
+        receipt = LabJobReader(
+            path,
+            highwater_observer=highwater_observer,
+            production_mode=require_highwater,
+        ).audit_integrity()
+    except (
+        InvalidStoredJobError,
+        LabDatabaseIdentityError,
+        LabHighWaterAuthorityError,
+        sqlite3.Error,
+        OSError,
+        ValueError,
+    ) as exc:
+        if not machine_receipt:
+            logger.error(
+                "lab integrity audit degraded: jobs_path={} error_type={} message={}",
+                path,
+                type(exc).__name__,
+                " ".join(str(exc).split())[:400],
+            )
+        return 2
+    if machine_receipt:
+        print(
+            json.dumps(
+                {"receipt_hash": receipt.receipt_hash},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    else:
+        logger.info("lab integrity audit healthy: {}", receipt.model_dump_json())
     return 0
 
 
@@ -3022,6 +4652,127 @@ def _lab_daemon_readiness_context(
     except BaseException:
         os.close(lease_fd)
         raise
+
+
+@dataclass(frozen=True)
+class _LabHighWaterRuntimeBinding:
+    observer: object | None
+    audit_command: tuple[str, ...] | None
+    state_path: Path | None
+    remediation_authorizer: Callable[[], None] | None
+    degradation_reporter: Callable[[str], None] | None
+    production_mode: bool
+
+
+def _resolve_lab_highwater_runtime_binding(
+    *,
+    settings: Settings,
+    code_sha: str,
+    profile_identity: str,
+    highwater_profile: LabHighWaterRuntimeProfile | None = None,
+    require_profile: bool = False,
+) -> _LabHighWaterRuntimeBinding:
+    """Bind Lab integrity checks to the profile-owned external authority."""
+
+    from rquant.lab_daemon import LabDaemonConfigurationError
+    from rquant.lab_highwater_authority import (
+        PRODUCTION_LAB_HIGHWATER_COMMAND,
+        LabHighWaterAuthorityClient,
+        LabHighWaterAuthorityConfig,
+        load_highwater_trusted_keys,
+    )
+
+    environment_overrides = (
+        settings.lab_highwater_authority_command_json.strip(),
+        settings.lab_highwater_stable_identity.strip(),
+        settings.lab_highwater_trusted_keyring_path,
+    )
+    if highwater_profile is None:
+        if require_profile:
+            raise LabDaemonConfigurationError(
+                "production Lab high-water authority must come from the immutable profile"
+            )
+        if any(environment_overrides):
+            raise LabDaemonConfigurationError(
+                "Lab high-water runtime environment overrides are not accepted"
+            )
+        return _LabHighWaterRuntimeBinding(None, None, None, None, None, False)
+    try:
+        command = tuple(highwater_profile.authority_command)
+        stable_identity = str(highwater_profile.stable_identity)
+        credential_path = Path(highwater_profile.trusted_keyring_path)
+        timeout_seconds = float(highwater_profile.timeout_seconds)
+        allow_identity_rotation = bool(highwater_profile.allow_identity_rotation)
+        production = bool(highwater_profile.production_mode)
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise LabDaemonConfigurationError("Lab high-water immutable profile is invalid") from exc
+    if not command or any(not part for part in command) or not stable_identity:
+        raise LabDaemonConfigurationError("Lab high-water immutable profile is incomplete")
+    runtime_root = settings.lab_runtime_dir_resolved
+    if credential_path.is_relative_to(runtime_root):
+        raise LabDaemonConfigurationError(
+            "Lab high-water verification credential must be outside the Lab runtime root"
+        )
+    if production and command != PRODUCTION_LAB_HIGHWATER_COMMAND:
+        raise LabDaemonConfigurationError(
+            "production Lab high-water authority must use the fixed sudo helper"
+        )
+    if production and any(option in {"--state-root", "--keys-file"} for option in command):
+        raise LabDaemonConfigurationError(
+            "production Lab cannot name high-water authority storage or signing keys"
+        )
+    try:
+        trusted_keys = load_highwater_trusted_keys(credential_path)
+        observer = LabHighWaterAuthorityClient(
+            LabHighWaterAuthorityConfig(
+                command=command,
+                stable_identity=stable_identity,
+                code_identity=code_sha,
+                profile_identity=profile_identity,
+                trusted_key_provider=trusted_keys.get,
+                timeout_seconds=timeout_seconds,
+                allow_identity_rotation=allow_identity_rotation,
+                production_mode=production,
+            )
+        )
+    except (OSError, ValueError) as exc:
+        raise LabDaemonConfigurationError(
+            "Lab high-water verification credential is unavailable or invalid"
+        ) from exc
+    audit_command = (
+        (
+            sys.executable,
+            "-m",
+            "rquant.cli",
+            "lab-integrity-audit",
+            "--jobs-path",
+            str(settings.lab_jobs_path_resolved),
+            "--require-external-highwater",
+            "--highwater-command-json",
+            json.dumps(list(command), separators=(",", ":")),
+            "--highwater-stable-identity",
+            stable_identity,
+            "--highwater-code-identity",
+            code_sha,
+            "--highwater-profile-identity",
+            profile_identity,
+            "--highwater-trusted-keyring",
+            str(credential_path),
+            "--highwater-timeout-seconds",
+            str(timeout_seconds),
+            "--machine-receipt",
+        )
+        + (("--highwater-production-mode",) if production else ())
+        + (("--highwater-allow-identity-rotation",) if allow_identity_rotation else ())
+    )
+    return _LabHighWaterRuntimeBinding(
+        observer,
+        audit_command,
+        settings.lab_finalizer_state_dir_resolved / "full-integrity-audit.json",
+        observer.authorize_remediation,
+        observer.mark_degraded,
+        production,
+    )
 
 
 def _lab_runtime_layout() -> tuple[dict[str, Path], dict[str, Path], dict[Path, Path]]:
@@ -3115,11 +4866,56 @@ def _verify_prepared_lab_runtime(
 
 def cmd_lab_runtime_prepare(args: argparse.Namespace) -> int:
     """Create/migrate the dedicated private Lab runtime namespace once."""
+    from rquant.artifact_retention_catalog_authority import (
+        initialize_retention_catalog_authority,
+    )
     from rquant.config import settings
-    from rquant.lab_daemon import prepare_lab_runtime_layout
+    from rquant.job_center_authority import (
+        publish_install_current_job_center_authority,
+        resolve_current_job_center_authority_binding,
+    )
+    from rquant.lab_daemon import (
+        prepare_lab_runtime_layout,
+        prepare_lab_runtime_sqlite_authority,
+    )
+    from rquant.lab_jobs import LabJobStore
 
     code_sha, _runtime_guard, _runtime_identity, runtime_identity_guard = (
         _establish_lab_runtime_identity(args)
+    )
+    expected_code_sha = getattr(args, "expected_code_sha", None)
+    if expected_code_sha is not None and expected_code_sha != code_sha:
+        raise RuntimeError("Lab runtime prepare code SHA does not match deployment target")
+    from rquant.runtime_deployment_profile import load_current_runtime_deployment_profile
+    from rquant.runtime_service_entrypoint import RuntimeServiceKind
+
+    deployment_root = Path(args.runtime_deployment_root)
+    profile = load_current_runtime_deployment_profile(deployment_root)
+    retention_manifests = tuple(
+        manifest
+        for manifest in profile.manifests
+        if manifest.service_kind is RuntimeServiceKind.ARTIFACT_RETENTION
+    )
+    if len(retention_manifests) != 1:
+        raise RuntimeError("Lab runtime prepare requires exactly one retention owner")
+    retention_manifest = retention_manifests[0]
+    if profile.producer_commit != code_sha or retention_manifest.producer_commit != code_sha:
+        raise RuntimeError("Lab runtime prepare retention owner is stale")
+    retention_settings = retention_manifest.settings
+    retention_state_root = Path(str(retention_settings["state_root"]))
+    retention_reference_store = Path(str(retention_settings["reference_store_path"]))
+    initialize_retention_catalog_authority(
+        state_root=retention_state_root,
+        reference_store_path=retention_reference_store,
+        producer_commit=code_sha,
+    )
+    binding = resolve_current_job_center_authority_binding(
+        deployment_root,
+        expected_code_sha=code_sha,
+        runtime_root=settings.lab_runtime_dir_resolved,
+        lab_jobs_path=settings.lab_jobs_path_resolved,
+        command_spool_path=settings.lab_job_command_dir_resolved,
+        final_artifact_root=settings.lab_final_artifact_dir_resolved,
     )
     directories, files, legacy = _lab_runtime_layout()
     prepare_lab_runtime_layout(
@@ -3129,6 +4925,37 @@ def cmd_lab_runtime_prepare(args: argparse.Namespace) -> int:
         managed_files=files,
         legacy_paths=legacy,
         mutation_guard=runtime_identity_guard,
+    )
+    sqlite_authority = prepare_lab_runtime_sqlite_authority(
+        settings.lab_runtime_dir_resolved,
+        label="lab jobs SQLite",
+        path=settings.lab_jobs_path_resolved,
+        mutation_guard=runtime_identity_guard,
+    )
+    try:
+        LabJobStore(
+            settings.lab_jobs_path_resolved,
+            busy_timeout_ms=settings.lab_jobs_busy_timeout_ms,
+            identity_authority=sqlite_authority,
+            mutation_guard=runtime_identity_guard,
+        ).initialize()
+    finally:
+        sqlite_authority.close()
+    publish_install_current_job_center_authority(
+        code_sha=code_sha,
+        deployment_profile_id=binding.deployment_profile_id,
+        deployment_generation_hash=binding.deployment_generation_hash,
+        runtime_deployment_root=binding.runtime_deployment_root,
+        current_code_sha=runtime_identity_guard,
+        runtime_root=binding.runtime_root,
+        lab_jobs_path=binding.lab_jobs_path,
+        command_spool_path=binding.command_spool_path,
+        final_artifact_root=binding.final_artifact_root,
+        definition_registry_root=binding.definition_registry_root,
+        experiment_registry_path=binding.experiment_registry_path,
+        dataset_authority_path=binding.dataset_authority_path,
+        catalog_authority_root=binding.catalog_authority_root,
+        catalog_authority_receipt_path=binding.catalog_authority_receipt_path,
     )
     logger.info(f"Lab runtime 已就绪: {settings.lab_runtime_dir_resolved}")
     return 0
@@ -3178,24 +5005,65 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
         allow_uninitialized_database=True,
     )
     from rquant.config import settings
+    from rquant.job_center_authority import resolve_current_job_center_authority_binding
     from rquant.lab_artifact_protocol import LabArtifactCommitSpool
     from rquant.lab_artifacts import LabJobArtifactStore
+    from rquant.lab_claim_finalizer_runtime import FinalizerRolloutPhase, FinalizerRolloutStore
     from rquant.lab_daemon import (
         LabAuthorityKeyring,
         LabDaemonConfigurationError,
         LabDaemonLock,
         ensure_private_directory,
+        load_lab_job_center_authority_manifest,
         prepare_lab_runtime_sqlite_authority,
         require_unique_runtime_paths,
     )
     from rquant.lab_job_protocol import LabCommandSpool
-    from rquant.lab_jobs import LabJobStore
-    from rquant.lab_scheduler import LabScheduler
+    from rquant.lab_jobs import LabJobReader, LabJobStore
+    from rquant.lab_scheduler import LabFullIntegrityAuditStateStore, LabScheduler
     from rquant.lab_shard_protocol import LabClaimSpool, LabReportSpool
     from rquant.lab_worker import LabArtifactReclaimer
     from rquant.strategy_job_adapters import default_strategy_job_adapter_registry
 
+    def load_current_authority() -> object:
+        binding = resolve_current_job_center_authority_binding(
+            Path(args.runtime_deployment_root),
+            expected_code_sha=runtime_identity_guard(),
+            runtime_root=settings.lab_runtime_dir_resolved,
+            lab_jobs_path=settings.lab_jobs_path_resolved,
+            command_spool_path=settings.lab_job_command_dir_resolved,
+            final_artifact_root=settings.lab_final_artifact_dir_resolved,
+        )
+        return load_lab_job_center_authority_manifest(
+            binding.runtime_root / "job-center-authority.json",
+            expected_code_sha=code_sha,
+            expected_research_root=binding.runtime_root,
+            expected_lab_jobs_path=binding.lab_jobs_path,
+            expected_command_spool_path=binding.command_spool_path,
+            expected_final_artifact_root=binding.final_artifact_root,
+            expected_runtime_deployment_root=binding.runtime_deployment_root,
+            expected_deployment_profile_id=binding.deployment_profile_id,
+            expected_deployment_generation_hash=binding.deployment_generation_hash,
+        )
+
+    load_current_authority()
     setup_logging()
+    rollout = None
+    if settings.lab_v2_claim_publication_enabled:
+        rollout = FinalizerRolloutStore(
+            settings.lab_finalizer_state_dir_resolved / "claim-finalizer-rollout.sqlite3",
+            create=False,
+        )
+        rollout.require_scheduler_v2_emit()
+
+    def v2_emit_permit(holder: str) -> AbstractContextManager[object]:
+        if not settings.lab_v2_claim_publication_enabled:
+            return nullcontext()
+        return FinalizerRolloutStore(
+            settings.lab_finalizer_state_dir_resolved / "claim-finalizer-rollout.sqlite3",
+            create=False,
+        ).emit_permit(holder=holder)
+
     if settings.lab_trusted_git_path != trusted_git_path:
         raise LabDaemonConfigurationError("trusted Git CLI path does not match Settings")
     if (
@@ -3209,6 +5077,21 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
         active_key_path=settings.lab_finalizer_authority_key_path,
         verification_keyring_path=settings.lab_finalizer_authority_keyring_path,
     )
+    binding = resolve_current_job_center_authority_binding(
+        Path(args.runtime_deployment_root),
+        expected_code_sha=runtime_identity_guard(),
+        runtime_root=settings.lab_runtime_dir_resolved,
+        lab_jobs_path=settings.lab_jobs_path_resolved,
+        command_spool_path=settings.lab_job_command_dir_resolved,
+        final_artifact_root=settings.lab_final_artifact_dir_resolved,
+    )
+    highwater = _resolve_lab_highwater_runtime_binding(
+        settings=settings,
+        code_sha=code_sha,
+        profile_identity=binding.deployment_profile_id,
+        highwater_profile=getattr(binding, "lab_highwater", None),
+        require_profile=getattr(binding, "runtime_mode", "local-test") == "linux-production",
+    )
     for label, path in (
         ("lab command spool", settings.lab_job_command_dir_resolved),
         ("lab claim spool", settings.lab_job_claim_dir_resolved),
@@ -3217,6 +5100,7 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
         ("lab final artifact root", settings.lab_final_artifact_dir_resolved),
         ("lab artifact commit spool", settings.lab_artifact_commit_dir_resolved),
         ("lab daemon lock root", settings.lab_daemon_lock_dir_resolved),
+        ("lab finalizer state root", settings.lab_finalizer_state_dir_resolved),
     ):
         ensure_private_directory(path, label=label, mutation_guard=runtime_identity_guard)
     runtime_paths = {
@@ -3227,6 +5111,7 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
         "lab final artifact root": settings.lab_final_artifact_dir_resolved,
         "lab artifact commit spool": settings.lab_artifact_commit_dir_resolved,
         "lab daemon lock root": settings.lab_daemon_lock_dir_resolved,
+        "lab finalizer state root": settings.lab_finalizer_state_dir_resolved,
         "lab authority signing key": settings.lab_finalizer_authority_key_path,
         "lab authority keyring": settings.lab_finalizer_authority_keyring_path,
     }
@@ -3258,6 +5143,13 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
                 mutation_guard=runtime_identity_guard,
             )
             store.initialize()
+            integrity_reader = LabJobReader(
+                settings.lab_jobs_path_resolved,
+                busy_timeout_ms=settings.lab_jobs_busy_timeout_ms,
+                identity_authority=sqlite_authority,
+                highwater_observer=highwater.observer,
+                production_mode=highwater.production_mode,
+            )
             report_spool = LabReportSpool(
                 settings.lab_job_report_dir_resolved,
                 mutation_guard=runtime_identity_guard,
@@ -3302,6 +5194,24 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
                     settings.lab_scheduler_max_artifact_commits_per_tick
                 ),
                 runtime_guard=runtime_identity_guard,
+                require_authority_manifest=True,
+                authority_manifest_loader=load_current_authority,
+                integrity_auditor=integrity_reader,
+                full_integrity_command=highwater.audit_command,
+                full_integrity_state_store=(
+                    None
+                    if highwater.state_path is None
+                    else LabFullIntegrityAuditStateStore(highwater.state_path)
+                ),
+                full_integrity_interval_seconds=(
+                    settings.lab_scheduler_full_integrity_interval_seconds
+                ),
+                full_integrity_budget_seconds=(
+                    settings.lab_scheduler_full_integrity_budget_seconds
+                ),
+                full_integrity_remediation_authorizer=highwater.remediation_authorizer,
+                full_integrity_degradation_reporter=highwater.degradation_reporter,
+                v2_emit_permit=v2_emit_permit,
             )
             readiness = _lab_daemon_readiness_context(
                 args,
@@ -3312,6 +5222,21 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
                 daemon_lock=daemon_lock,
             )
             with readiness:
+                if (
+                    rollout is not None
+                    and rollout.snapshot().phase is FinalizerRolloutPhase.V2_WORKERS_READY
+                ):
+                    rollout.transition(
+                        FinalizerRolloutPhase.SCHEDULER_EMITS_V2,
+                        evidence=f"scheduler-ready:{code_sha}",
+                    )
+                if bool(getattr(args, "remediate_full_integrity", False)):
+                    try:
+                        scheduler.remediate_full_integrity()
+                        logger.info("lab-scheduler full integrity remediation completed")
+                        return 0
+                    finally:
+                        scheduler.release()
                 if args.once:
                     try:
                         result = scheduler.run_once()
@@ -3340,6 +5265,253 @@ def cmd_lab_scheduler(args: argparse.Namespace) -> int:
             if artifact_store is not None:
                 artifact_store.close()
             sqlite_authority.close()
+            sqlite_authority.close()
+
+
+def _build_lab_worker_resource_admission(
+    *,
+    settings: Settings,
+    code_sha: str,
+    legacy_opt_out: bool,
+    clock: Callable[[], datetime] | None = None,
+    probe: ResourceProbe | None = None,
+) -> RuntimeResourceAdmissionBindings:
+    from rquant.runtime_market_session import load_market_calendar_authority
+    from rquant.runtime_resource_admission import (
+        RuntimeHealthAuthorityLiveSloProbeConfig,
+        RuntimeTradeCalendarSessionResolver,
+        build_runtime_resource_admission,
+    )
+
+    live_slo_root = settings.rquant_lab_live_slo_authority_root
+    live_slo_config = (
+        RuntimeHealthAuthorityLiveSloProbeConfig(
+            authority_root=live_slo_root,
+            expected_producer_commit=code_sha,
+        )
+        if live_slo_root is not None
+        else None
+    )
+    calendar_path = settings.rquant_lab_trade_calendar_path
+    session_resolver = (
+        RuntimeTradeCalendarSessionResolver(
+            load_market_calendar_authority(
+                calendar_path,
+                expected_commit=code_sha,
+            )
+        )
+        if calendar_path is not None
+        else None
+    )
+    return build_runtime_resource_admission(
+        app_env=settings.app_env,
+        disk_path=settings.lab_worker_artifact_dir_resolved,
+        configured_policy_version=settings.rquant_lab_resource_policy_version,
+        legacy_opt_out=legacy_opt_out,
+        clock=clock,
+        probe=probe,
+        live_slo_probe_config=live_slo_config,
+        session_resolver=session_resolver,
+    )
+
+
+def _build_lab_worker_resource_authority_manifest(
+    *,
+    settings: Settings,
+    resource_admission: RuntimeResourceAdmissionBindings,
+) -> LabResourceAuthorityManifest | None:
+    from rquant.lab_daemon import LabDaemonConfigurationError
+    from rquant.lab_resource_authority_adapter import (
+        ResourceAuthorityAdapterConfigurationError,
+        parse_resource_authority_adapter_config,
+    )
+    from rquant.lab_worker import (
+        build_builtin_resource_authority_manifest,
+        build_resource_journal_authority_manifest,
+    )
+
+    raw_config = settings.rquant_lab_resource_authority_config_json.strip()
+    if raw_config:
+        try:
+            configuration = parse_resource_authority_adapter_config(raw_config)
+        except ResourceAuthorityAdapterConfigurationError as exc:
+            raise LabDaemonConfigurationError(
+                "resource authority explicit V2 configuration is invalid"
+            ) from exc
+        if settings.app_env == "prod" and configuration.mode != "production":
+            raise LabDaemonConfigurationError(
+                "production worker requires an explicit V2 production resource authority"
+            )
+        return build_resource_journal_authority_manifest(configuration)
+    if settings.app_env == "prod":
+        raise LabDaemonConfigurationError(
+            "production worker requires an explicit V2 resource authority configuration"
+        )
+    if not resource_admission.require_resource_admission:
+        return None
+    if (
+        resource_admission.resource_snapshot_provider is None
+        or resource_admission.admission_policy_provider is None
+    ):
+        raise LabDaemonConfigurationError(
+            "required resource admission has no closed authority providers"
+        )
+    return build_builtin_resource_authority_manifest(
+        resource_admission.resource_snapshot_provider,
+        resource_admission.admission_policy_provider,
+    )
+
+
+def _build_lab_claim_publication_worker_verifier(
+    *,
+    settings: Settings,
+    ledger: object,
+    claim_spool: object,
+) -> object | None:
+    """Compose the V2 worker D gate from public-only, canonical material."""
+
+    from rquant.adapter_manifest import VerifyOnlyEd25519Keyring
+    from rquant.lab_claim_finalizer import LabClaimPublicationWorkerVerifier
+    from rquant.lab_claim_finalizer_trust import (
+        LabClaimFinalizerTrustError,
+        LabClaimFinalizerTrustVerifier,
+        LabClaimPublicationWorkerVerificationConfig,
+    )
+    from rquant.lab_claim_publication import (
+        LabClaimSpoolReceiptAuthorityV2,
+        LabClaimSpoolReceiptVerifier,
+    )
+    from rquant.lab_daemon import LabDaemonConfigurationError
+    from rquant.lab_jobs import LabJobStore
+    from rquant.lab_shard_protocol import LabClaimSpool
+    from rquant.source_broker_protocol import ServerCredentialsPolicy, SocketEndpointPolicy
+    from rquant.source_broker_v2_authority_service import SourceBrokerV2CurrentClaimUnixClient
+    from rquant.strict_json import strict_model_validate_canonical_json
+
+    if not settings.lab_v2_claim_publication_enabled:
+        return None
+    if settings.lab_claim_finalizer_runtime_material_root is None:
+        raise LabDaemonConfigurationError(
+            "V2 worker requires a controlled finalizer runtime material root"
+        )
+    from rquant.lab_claim_finalizer_runtime import (
+        FinalizerRuntimeError,
+        load_current_lab_claim_finalizer_generation,
+    )
+
+    try:
+        path = load_current_lab_claim_finalizer_generation(
+            settings.lab_claim_finalizer_runtime_material_root,
+            trusted_base=settings.lab_claim_finalizer_runtime_trusted_base,
+        ).worker_verifier_path
+    except FinalizerRuntimeError as exc:
+        raise LabDaemonConfigurationError(
+            "V2 worker cannot select a valid finalizer runtime generation"
+        ) from exc
+    try:
+        from rquant.authority_path_security import read_secure_regular_file
+
+        raw = read_secure_regular_file(
+            path,
+            trusted_root=settings.lab_claim_finalizer_runtime_material_root,
+            expected_uid=os.getuid(),
+            expected_gid=os.getgid(),
+            allowed_final_uids=frozenset({os.getuid()}),
+            allowed_final_gids=frozenset({os.getgid()}),
+            allowed_modes=frozenset({0o640}),
+            max_bytes=1_048_576,
+        )
+        configuration = strict_model_validate_canonical_json(
+            LabClaimPublicationWorkerVerificationConfig,
+            raw,
+        )
+        configuration.require_verify_only_roles()
+
+        def keyring(records: tuple[object, ...], purpose: str) -> VerifyOnlyEd25519Keyring:
+            typed = tuple(records)
+            return VerifyOnlyEd25519Keyring(
+                records=typed,  # type: ignore[arg-type]
+                issuer_allowlist={purpose: frozenset(record.issuer for record in typed)},  # type: ignore[attr-defined]
+                rotation_allowlist={
+                    (record.issuer, purpose): frozenset(
+                        item.key_id for item in typed if item.issuer == record.issuer
+                    )
+                    for record in typed
+                },
+            )
+
+        trust_verifier = LabClaimFinalizerTrustVerifier(
+            root_keyring=keyring(
+                configuration.root_public_keys,
+                "lab_claim_finalizer_root",
+            ),
+            finalizer_keyring=keyring(
+                configuration.finalizer_public_keys,
+                "lab_claim_finalizer",
+            ),
+        )
+        if type(ledger) is not LabJobStore:
+            raise TypeError("V2 worker requires an exact LabJobStore ledger")
+        with ledger._connect() as connection:  # noqa: SLF001 - fixed ledger binding
+            binding = ledger._finalizer_authority_binding(  # noqa: SLF001
+                connection,
+                path=ledger.path,
+            )
+        trust_verifier.require_certificate(
+            configuration.trust_certificate,
+            store_id=str(binding["store_id"]),
+            database_generation=binding["database_generation"],
+            schema_version=int(binding["schema_version"]),
+            now=datetime.now(UTC),
+        )
+        source_plan_keyring = keyring(
+            configuration.source_plan_public_keys,
+            "source_use_plan_v2",
+        )
+        client = SourceBrokerV2CurrentClaimUnixClient(
+            endpoint=SocketEndpointPolicy(
+                path=Path(configuration.current_claim_socket_path),
+                owner_uid=configuration.current_claim_socket_owner_uid,
+                group_gid=configuration.current_claim_socket_group_gid,
+                mode=configuration.current_claim_socket_mode,
+            ),
+            server_policy=ServerCredentialsPolicy(
+                expected_uid=configuration.current_claim_server_uid,
+                expected_gid=configuration.current_claim_server_gid,
+                expected_pid=configuration.current_claim_server_pid,
+            ),
+            timeout_ms=configuration.current_claim_timeout_ms,
+        )
+
+        class _VerifyOnlyCurrentClaimAuthority:
+            __slots__ = ("_client",)
+
+            def __init__(self, current_client: SourceBrokerV2CurrentClaimUnixClient) -> None:
+                self._client = current_client
+
+            def verify_current(self, *, binding: object, now: datetime) -> object:
+                return self._client.verify_current(binding=binding, now=now)  # type: ignore[arg-type]
+
+        if type(claim_spool) is not LabClaimSpool:
+            raise TypeError("V2 worker requires an exact LabClaimSpool")
+        return LabClaimPublicationWorkerVerifier(
+            ledger=ledger,
+            current_claim_authority=_VerifyOnlyCurrentClaimAuthority(client),
+            keyring=source_plan_keyring,
+            audience=configuration.audience,
+            spool_receipt_verifier=LabClaimSpoolReceiptVerifier(
+                spool=claim_spool,
+                authority=LabClaimSpoolReceiptAuthorityV2.model_validate(
+                    configuration.spool_receipt_authority,
+                    strict=True,
+                ),
+            ),
+            trust_verifier=trust_verifier,
+        )
+    except (LabClaimFinalizerTrustError, OSError, TypeError, ValueError) as exc:
+        raise LabDaemonConfigurationError(
+            "V2 claim publication public verifier material is invalid"
+        ) from exc
 
 
 def cmd_lab_worker(args: argparse.Namespace) -> int:
@@ -3350,20 +5522,31 @@ def cmd_lab_worker(args: argparse.Namespace) -> int:
     )
     _verify_prepared_lab_runtime(Path(args.expected_checkout_root), code_sha)
     from rquant.config import settings
+    from rquant.lab_claim_finalizer_runtime import FinalizerRolloutPhase, FinalizerRolloutStore
     from rquant.lab_daemon import (
         LabDaemonConfigurationError,
         LabDaemonLock,
         ensure_private_directory,
         require_unique_runtime_paths,
     )
+    from rquant.lab_jobs import LabJobStore
     from rquant.lab_shard_protocol import LabClaimSpool, LabReportSpool
-    from rquant.lab_worker import LAB_WORKER_MAX_SHARDS_PER_TICK, LabWorker
-    from rquant.storage.duckdb import open_readonly_store
-    from rquant.strategy_job_adapters import default_strategy_job_adapter_registry
+    from rquant.lab_worker import (
+        LAB_WORKER_MAX_SHARDS_PER_TICK,
+        LabWorker,
+        build_builtin_shard_runtime_manifest,
+    )
 
     setup_logging()
     if settings.lab_trusted_git_path != trusted_git_path:
         raise LabDaemonConfigurationError("trusted Git CLI path does not match Settings")
+    rollout = None
+    if settings.lab_v2_claim_publication_enabled:
+        rollout = FinalizerRolloutStore(
+            settings.lab_finalizer_state_dir_resolved / "claim-finalizer-rollout.sqlite3",
+            create=False,
+        )
+        rollout.require_v2_worker_enable()
     worker_id = (args.worker_id or settings.lab_worker_id).strip()
     if worker_id != settings.lab_worker_id:
         raise LabDaemonConfigurationError("worker CLI id does not match configured stable id")
@@ -3371,6 +5554,26 @@ def cmd_lab_worker(args: argparse.Namespace) -> int:
         raise LabDaemonConfigurationError("worker id is not present in scheduler allowlist")
     if settings.lab_worker_max_shards_per_tick != LAB_WORKER_MAX_SHARDS_PER_TICK:
         raise LabDaemonConfigurationError("worker batch must remain exactly one shard per tick")
+    resource_admission = _build_lab_worker_resource_admission(
+        settings=settings,
+        code_sha=code_sha,
+        legacy_opt_out=bool(getattr(args, "legacy_no_resource_admission", False)),
+    )
+    resource_authority_manifest = _build_lab_worker_resource_authority_manifest(
+        settings=settings,
+        resource_admission=resource_admission,
+    )
+    shard_runtime_manifest = build_builtin_shard_runtime_manifest(
+        catalog_path=settings.research_readonly_db_path_resolved,
+        forbidden_paths=(
+            settings.duckdb_path,
+            settings.duckdb_readonly_path_resolved,
+            settings.research_db_path_resolved,
+        ),
+        snapshot_root=settings.lab_worker_artifact_dir_resolved,
+        research_lake_root=settings.research_lake_dir_resolved,
+    )
+
     for label, path in (
         ("lab claim spool", settings.lab_job_claim_dir_resolved),
         ("lab report spool", settings.lab_job_report_dir_resolved),
@@ -3391,26 +5594,45 @@ def cmd_lab_worker(args: argparse.Namespace) -> int:
         "worker",
         mutation_guard=runtime_identity_guard,
     ) as daemon_lock:
+        claim_spool = LabClaimSpool(
+            settings.lab_job_claim_dir_resolved,
+            mutation_guard=runtime_identity_guard,
+        )
+        publication_verifier = _build_lab_claim_publication_worker_verifier(
+            settings=settings,
+            ledger=LabJobStore(
+                settings.lab_jobs_path_resolved,
+                busy_timeout_ms=settings.lab_jobs_busy_timeout_ms,
+            ),
+            claim_spool=claim_spool,
+        )
+        if (
+            rollout is not None
+            and rollout.snapshot().phase is FinalizerRolloutPhase.FINALIZER_READY
+        ):
+            rollout.transition(
+                FinalizerRolloutPhase.V2_WORKERS_READY,
+                evidence=f"worker-verified:{worker_id}:{code_sha}",
+            )
         worker = LabWorker(
             worker_id=worker_id,
-            claim_spool=LabClaimSpool(
-                settings.lab_job_claim_dir_resolved,
-                mutation_guard=runtime_identity_guard,
-            ),
+            claim_spool=claim_spool,
+            claim_publication_verifier=publication_verifier,  # type: ignore[arg-type]
+            v2_claim_publication_enabled=settings.lab_v2_claim_publication_enabled,
             report_spool=LabReportSpool(
                 settings.lab_job_report_dir_resolved,
                 mutation_guard=runtime_identity_guard,
             ),
             artifact_root=settings.lab_worker_artifact_dir_resolved,
-            adapter_registry=default_strategy_job_adapter_registry(),
-            exploratory_store_factory=open_readonly_store,
-            metadata_store_factory=open_readonly_store,
-            research_lake_root=settings.research_lake_dir_resolved,
+            shard_runtime_manifest=shard_runtime_manifest,
             heartbeat_interval_seconds=settings.lab_worker_heartbeat_seconds,
             lease_extension_seconds=settings.lab_worker_lease_extension_seconds,
             poll_interval_ms=settings.lab_worker_poll_interval_ms,
             receipt_timeout_seconds=settings.lab_worker_receipt_timeout_seconds,
             verified_code_sha_provider=runtime_identity_guard,
+            resource_authority_manifest=resource_authority_manifest,
+            require_resource_admission=resource_admission.require_resource_admission,
+            production_mode=settings.app_env == "prod",
         )
         readiness = _lab_daemon_readiness_context(
             args,
@@ -3584,7 +5806,299 @@ def cmd_lab_finalizer(args: argparse.Namespace) -> int:
         finally:
             if artifact_store is not None:
                 artifact_store.close()
-            sqlite_authority.close()
+
+
+def cmd_lab_claim_finalizer(args: argparse.Namespace) -> int:
+    """Run the dedicated authority-owned V2 claim publication finalizer."""
+
+    from rquant.config import settings
+    from rquant.lab_claim_finalizer_runtime import FinalizerRolloutPhase, FinalizerRolloutStore
+    from rquant.lab_daemon import (
+        LabDaemonConfigurationError,
+        LabDaemonLock,
+        ensure_private_directory,
+    )
+
+    if not settings.lab_claim_finalizer_enabled:
+        raise LabDaemonConfigurationError("claim finalizer is not enabled")
+    if settings.lab_claim_finalizer_runtime_material_root is None:
+        raise LabDaemonConfigurationError("claim finalizer runtime generation is missing")
+
+    trusted_git_path = Path(args.trusted_git_path)
+    code_sha, runtime_guard, runtime_identity, runtime_identity_guard = (
+        _establish_lab_runtime_identity(args)
+    )
+    _verify_prepared_lab_runtime(Path(args.expected_checkout_root), code_sha)
+    if settings.lab_trusted_git_path != trusted_git_path:
+        raise LabDaemonConfigurationError("trusted Git CLI path does not match Settings")
+    setup_logging()
+    ensure_private_directory(
+        settings.lab_job_claim_dir_resolved,
+        label="lab claim spool",
+        mutation_guard=runtime_identity_guard,
+    )
+    ensure_private_directory(
+        settings.lab_daemon_lock_dir_resolved,
+        label="lab daemon lock root",
+        mutation_guard=runtime_identity_guard,
+    )
+    from rquant.lab_claim_finalizer_composition import (
+        compose_production_lab_claim_finalizer_daemon,
+    )
+
+    with LabDaemonLock(
+        settings.lab_daemon_lock_dir_resolved,
+        "claim-finalizer",
+        mutation_guard=runtime_identity_guard,
+    ) as daemon_lock:
+        daemon = compose_production_lab_claim_finalizer_daemon(
+            settings=settings,
+            mutation_guard=runtime_identity_guard,
+        )
+        try:
+            readiness = _lab_daemon_readiness_context(
+                args,
+                label="com.roxor.rquant-lab-claim-finalizer",
+                code_sha=code_sha,
+                runtime_guard=runtime_guard,
+                runtime_identity=runtime_identity,
+                daemon_lock=daemon_lock,
+            )
+            with readiness:
+                if settings.lab_v2_claim_publication_enabled:
+                    rollout = FinalizerRolloutStore(
+                        settings.lab_finalizer_state_dir_resolved
+                        / "claim-finalizer-rollout.sqlite3",
+                        create=False,
+                    )
+                    if rollout.snapshot().phase is FinalizerRolloutPhase.PREFLIGHT_OK:
+                        rollout.transition(
+                            FinalizerRolloutPhase.FINALIZER_READY,
+                            evidence=f"finalizer-ready:{code_sha}",
+                        )
+                if args.once:
+                    result = daemon.run_once()
+                    logger.info(f"lab-claim-finalizer tick: {result.model_dump_json()}")
+                    return 1 if result.blocked else 0
+
+                def handle_signal(signum: int, frame: object) -> None:
+                    del frame
+                    logger.info(f"lab-claim-finalizer received signal {signum}; stopping")
+                    daemon.request_stop()
+
+                previous = {
+                    signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)
+                }
+                for signum in previous:
+                    signal.signal(signum, handle_signal)
+                try:
+                    daemon.run_forever()
+                finally:
+                    for signum, handler in previous.items():
+                        signal.signal(signum, handler)
+                return 0
+        finally:
+            daemon.close()
+
+
+def cmd_lab_claim_finalizer_trust(args: argparse.Namespace) -> int:
+    """Run the offline-only claim-finalizer certificate ceremony CLI."""
+
+    from rquant.adapter_manifest import Ed25519ContractSigner, Ed25519PublicKeyRecord
+    from rquant.lab_claim_finalizer_composition import _OpenSslFileSigningClient
+    from rquant.lab_claim_finalizer_runtime import (
+        inspect_offline_finalizer_certificate,
+        issue_offline_finalizer_certificate,
+        load_offline_finalizer_certificate,
+        read_offline_finalizer_material,
+        write_offline_finalizer_certificate,
+    )
+
+    if args.action == "inspect":
+        _print_json(
+            inspect_offline_finalizer_certificate(
+                load_offline_finalizer_certificate(args.certificate)
+            )
+        )
+        return 0
+    try:
+        not_before = datetime.fromisoformat(args.not_before)
+        expires_at = datetime.fromisoformat(args.expires_at)
+    except ValueError as exc:
+        raise ValueError("certificate timestamps must be ISO-8601") from exc
+    if not_before.tzinfo is None or expires_at.tzinfo is None:
+        raise ValueError("certificate timestamps must include a UTC offset")
+    root_record = Ed25519PublicKeyRecord(
+        key_id=args.root_key_id,
+        issuer=args.root_issuer,
+        key_purpose="lab_claim_finalizer_root",
+        rotation="active",
+        public_key_pem=read_offline_finalizer_material(args.root_public_key, private=False),
+    )
+    finalizer_record = Ed25519PublicKeyRecord(
+        key_id=args.finalizer_key_id,
+        issuer=args.finalizer_issuer,
+        key_purpose="lab_claim_finalizer",
+        rotation="active",
+        public_key_pem=read_offline_finalizer_material(args.finalizer_public_key, private=False),
+    )
+    root_signer = Ed25519ContractSigner(
+        key_id=root_record.key_id,
+        issuer=root_record.issuer,
+        key_purpose=root_record.key_purpose,
+        client=_OpenSslFileSigningClient(
+            private_key_path=args.root_private_key,
+            public_record=root_record,
+            allowed_namespaces=frozenset({"rquant-lab-claim-finalizer-root/v1"}),
+        ),
+    )
+    finalizer_identity = SimpleNamespace(
+        key_id=finalizer_record.key_id,
+        issuer=finalizer_record.issuer,
+        key_purpose=finalizer_record.key_purpose,
+        public_key_fingerprint=finalizer_record.public_key_fingerprint,
+    )
+    certificate = issue_offline_finalizer_certificate(
+        root_signer=root_signer,
+        finalizer_signer=finalizer_identity,
+        store_id=args.store_id,
+        database_generation=(args.database_device, args.database_inode),
+        schema_version=16,
+        not_before=not_before,
+        expires_at=expires_at,
+    )
+    if args.output is not None:
+        write_offline_finalizer_certificate(args.output, certificate)
+    _print_json(inspect_offline_finalizer_certificate(certificate))
+    return 0
+
+
+def cmd_lab_claim_finalizer_preflight(args: argparse.Namespace) -> int:
+    """Collect finalizer readiness from Settings and the current generation only."""
+
+    from rquant.config import settings
+    from rquant.lab_claim_finalizer_runtime import (
+        FinalizerPreflightCollector,
+        FinalizerRolloutPhase,
+        FinalizerRolloutStore,
+    )
+
+    report = FinalizerPreflightCollector(settings).collect()
+    if args.format == "markdown":
+        print(report.render_markdown(), end="")
+    else:
+        _print_json(
+            {"status": report.status, "checks": [item.model_dump() for item in report.checks]}
+        )
+    if args.apply and report.status == "ok":
+        state = FinalizerRolloutStore(
+            settings.lab_finalizer_state_dir_resolved / "claim-finalizer-rollout.sqlite3",
+            create=False,
+        )
+        if state.snapshot().phase is FinalizerRolloutPhase.MATERIAL_INSTALLED:
+            state.transition(
+                FinalizerRolloutPhase.PREFLIGHT_OK,
+                evidence=hashlib.sha256(report.model_dump_json().encode("utf-8")).hexdigest(),
+            )
+    return {"ok": 0, "skip": 0, "warn": 1, "fail": 2}[report.status]
+
+
+def cmd_lab_claim_finalizer_runtime(args: argparse.Namespace) -> int:
+    """Install or inspect already-signed finalizer material; this command cannot sign."""
+
+    from rquant.adapter_manifest import Ed25519PublicKeyRecord, VerifyOnlyEd25519Keyring
+    from rquant.lab_claim_finalizer_runtime import (
+        FinalizerRuntimeInstallRequest,
+        LabClaimFinalizerGenerationInstaller,
+        load_current_lab_claim_finalizer_generation,
+        read_offline_finalizer_material,
+    )
+
+    def service_identity() -> tuple[int, int]:
+        import grp
+        import pwd
+
+        try:
+            return (pwd.getpwnam(args.service_user).pw_uid, grp.getgrnam(args.service_group).gr_gid)
+        except KeyError as exc:
+            raise ValueError("service user/group cannot be resolved locally") from exc
+
+    if args.action == "inspect":
+        uid, gid = service_identity()
+        selected = load_current_lab_claim_finalizer_generation(
+            args.runtime_root,
+            expected_uid=uid,
+            expected_gid=gid,
+            trusted_base=args.trusted_base,
+        )
+        _print_json(
+            {
+                "generation_id": selected.generation_id,
+                "runtime_material": str(selected.runtime_material_path),
+                "worker_verifier": str(selected.worker_verifier_path),
+                "store_id": selected.manifest.store_id,
+            }
+        )
+        return 0
+    request = FinalizerRuntimeInstallRequest.model_validate_json(
+        read_offline_finalizer_material(args.request, private=False)
+    )
+    root_record = Ed25519PublicKeyRecord(
+        key_id=args.root_key_id,
+        issuer=args.root_issuer,
+        key_purpose="lab_claim_finalizer_root",
+        rotation="active",
+        public_key_pem=read_offline_finalizer_material(args.root_public_key, private=False),
+    )
+    root_keyring = VerifyOnlyEd25519Keyring(
+        records=(root_record,),
+        issuer_allowlist={"lab_claim_finalizer_root": frozenset({root_record.issuer})},
+        rotation_allowlist={
+            (root_record.issuer, "lab_claim_finalizer_root"): frozenset({root_record.key_id})
+        },
+    )
+    finalizer = request.finalizer_public_key
+    finalizer_keyring = VerifyOnlyEd25519Keyring(
+        records=(finalizer,),
+        issuer_allowlist={"lab_claim_finalizer": frozenset({finalizer.issuer})},
+        rotation_allowlist={
+            (finalizer.issuer, "lab_claim_finalizer"): frozenset({finalizer.key_id})
+        },
+    )
+    receipt = LabClaimFinalizerGenerationInstaller(
+        runtime_root=args.runtime_root,
+        root_keyring=root_keyring,
+        finalizer_keyring=finalizer_keyring,
+        expected_uid=service_identity()[0],
+        expected_gid=service_identity()[1],
+        trusted_base=args.trusted_base,
+    ).install(request, dry_run=args.dry_run)
+    _print_json(receipt.model_dump(mode="json"))
+    return 0
+
+
+def cmd_lab_claim_finalizer_rollout(args: argparse.Namespace) -> int:
+    """Operate the audited V2 drain gate without mutating publications."""
+
+    from rquant.config import settings
+    from rquant.lab_claim_finalizer_runtime import FinalizerRolloutStore
+    from rquant.lab_jobs import LabJobStore
+
+    state = FinalizerRolloutStore(
+        settings.lab_finalizer_state_dir_resolved / "claim-finalizer-rollout.sqlite3",
+        create=False,
+    )
+    if args.action == "status":
+        _print_json(state.snapshot().model_dump(mode="json"))
+        return 0
+    if args.action == "begin-drain":
+        _print_json(state.begin_rollback(evidence=args.evidence).model_dump(mode="json"))
+        return 0
+    job_store = LabJobStore(settings.lab_jobs_path_resolved)
+    _print_json(
+        state.complete_drain(evidence=args.evidence, job_store=job_store).model_dump(mode="json")
+    )
+    return 0
 
 
 def cmd_panorama_auth_serve(args: argparse.Namespace) -> int:
@@ -3748,6 +6262,121 @@ def build_parser() -> argparse.ArgumentParser:
         help="显式执行写入；默认只预演",
     )
 
+    daily_shadow_p = sub.add_parser(
+        "daily-dag-shadow",
+        help="只读检查新 daily DAG 的签名影子对账与退休门，不改变旧 daily 权威",
+    )
+    daily_shadow_p.add_argument(
+        "--report-root",
+        type=Path,
+        required=True,
+        help="daily DAG 影子报告根目录",
+    )
+    daily_shadow_p.add_argument(
+        "--expected-trade-date",
+        type=_parse_iso_date,
+        action="append",
+        required=True,
+        help="权威交易日（可重复），用于检查连续真实影子证据",
+    )
+    daily_shadow_p.add_argument(
+        "--minimum-real-trading-days",
+        type=int,
+        default=10,
+        help="退休门最少真实交易日（生产不得低于 10）",
+    )
+    daily_shadow_p.add_argument("--key-id", default="daily-shadow-v1", help="报告签名 key id")
+    daily_shadow_p.add_argument(
+        "--signing-key-env",
+        default="RQUANT_DAILY_SHADOW_SIGNING_KEY",
+        help="签名密钥环境变量名",
+    )
+    daily_shadow_p.add_argument(
+        "--calendar-path",
+        type=Path,
+        default=None,
+        help="SSE 交易日历 authority（retirement-gate 必填）",
+    )
+    daily_shadow_p.add_argument(
+        "--calendar-commit",
+        default=None,
+        help="calendar authority 绑定的 40 位 code commit（retirement-gate 必填）",
+    )
+    daily_shadow_p.add_argument(
+        "--action",
+        choices=("status", "retirement-gate"),
+        default="status",
+        help="只读操作（默认 status）",
+    )
+
+    daily_dag_p = sub.add_parser(
+        "daily-dag",
+        help="从已安装不可变 production profile 预演或受控推进 daily-close DAG",
+    )
+    daily_dag_dev_p = sub.add_parser(
+        "daily-dag-dev",
+        help="仅供非生产测试使用的 shadow daily-close DAG",
+    )
+    daily_dag_dev_p.add_argument(
+        "--profile-root",
+        type=Path,
+        required=True,
+        help="开发测试根目录；生产入口不接受自由根",
+    )
+    for daily_parser in (daily_dag_p, daily_dag_dev_p):
+        daily_parser.add_argument("--trade-date", type=_parse_iso_date, required=True)
+        daily_parser.add_argument(
+            "--source-generation-id",
+            type=_parse_sha256,
+            required=True,
+        )
+        daily_parser.add_argument(
+            "--source-content-hash",
+            type=_parse_sha256,
+            required=True,
+        )
+        daily_parser.add_argument("--code-commit", type=_parse_commit_sha, required=True)
+        daily_parser.add_argument("--profile-hash", type=_parse_sha256, required=True)
+        daily_parser.add_argument(
+            "--command-manifest-hash",
+            type=_parse_sha256,
+            required=True,
+            help="已审核 stage command manifest 的内容哈希；绑定进 run/effect/receipt",
+        )
+        daily_parser.add_argument(
+            "--source-spool-root",
+            type=Path,
+            default=None,
+            help="daily_close immutable spool root（执行动作必填）",
+        )
+        daily_parser.add_argument(
+            "--service-owner",
+            default="daily-close",
+            help="daily ledger stable service owner",
+        )
+        daily_parser.add_argument("--deadline-at", type=_parse_iso_datetime, default=None)
+        daily_parser.add_argument(
+            "--action",
+            choices=("preview", "status", "apply", "retry", "recover"),
+            default="preview",
+        )
+        daily_parser.add_argument(
+            "--run-id",
+            default=None,
+            help="apply/retry/recover 的预览 run id",
+        )
+        daily_parser.add_argument("--plan-hash", type=_parse_sha256, default=None)
+        daily_parser.add_argument(
+            "--apply",
+            action="store_true",
+            help="确认执行非 preview 动作；没有已安装 adapter manifest 时 fail closed",
+        )
+    daily_dag_p.add_argument(
+        "--confirm-production",
+        action="store_true",
+        help="执行 production DAG 的第二确认",
+    )
+
     monitor_p = sub.add_parser("monitor", help="启动盘中实时监控")
     monitor_p.add_argument(
         "--interval",
@@ -3755,6 +6384,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=5,
         help="轮询间隔秒数 (默认 5)",
     )
+    legacy_shadow_recover_p = sub.add_parser(
+        "legacy-shadow-recover",
+        help="仅恢复窗口内已签名的完整 legacy-shadow staging",
+    )
+    legacy_shadow_recover_p.add_argument(
+        "--source",
+        required=True,
+        choices=("monitor", "surge", "isolated-runners"),
+    )
+    legacy_shadow_recover_p.add_argument("--date", required=True)
 
     rt_min_p = sub.add_parser(
         "rt-minute-fetch",
@@ -5143,6 +7782,27 @@ def build_parser() -> argparse.ArgumentParser:
         default="production",
         help="数据新鲜度契约范围（默认 production）",
     )
+    pf_p.add_argument(
+        "--runtime-root",
+        type=Path,
+        help="验证当前 hash-bound runtime profile 的 recovery RPO/RTO 与演练凭据",
+    )
+
+    external_root_p = sub.add_parser(
+        "external-monotonic-root-serve",
+        help="运行持久 external monotonic root Unix authority",
+    )
+    external_root_p.add_argument("--config", type=Path, required=True)
+
+    resource_authority_p = sub.add_parser(
+        "resource-authority-serve",
+        help="运行 external-root-backed resource journal Unix authority",
+    )
+    resource_authority_p.add_argument("--config", type=Path, required=True)
+    resource_authority_p.add_argument(
+        "--code-sha",
+        help="完整生产 commit SHA；缺省读取 RQUANT_CODE_COMMIT",
+    )
 
     from rquant.surge_watch import SurgeConfig
 
@@ -5223,6 +7883,181 @@ def build_parser() -> argparse.ArgumentParser:
     alert_resolve_p = sub.add_parser("alert-resolve", help="服务恢复后关闭运维告警事故")
     alert_resolve_p.add_argument("--dedup-key", required=True, help="要关闭的事故事件键")
 
+    runtime_profile_p = sub.add_parser(
+        "runtime-deployment-profile",
+        help="预演或安装精确提交绑定的隔离运行时画像",
+    )
+    runtime_profile_p.add_argument("--profile", type=Path, required=True)
+    runtime_profile_p.add_argument("--runtime-root", type=Path, required=True)
+    runtime_profile_p.add_argument("--expected-commit", required=True)
+    runtime_profile_p.add_argument("--apply", action="store_true")
+    runtime_profile_p.add_argument("--profile-id", type=_parse_sha256)
+    runtime_profile_p.add_argument("--schema-bootstrap-reason")
+    runtime_profile_p.add_argument("--schema-v1-migration-authority", type=Path)
+
+    runtime_production_profile_p = sub.add_parser(
+        "runtime-production-profile",
+        help="从 canonical 输入生成内容寻址的生产运行时画像",
+    )
+    runtime_production_profile_p.add_argument("--inputs", type=Path, required=True)
+    runtime_production_profile_p.add_argument("--output-dir", type=Path, required=True)
+    runtime_production_profile_p.add_argument("--expected-commit", required=True)
+    runtime_production_profile_p.add_argument(
+        "--runtime-mode",
+        choices=("local-test", "linux-production"),
+        default="local-test",
+    )
+    runtime_production_profile_p.add_argument("--apply", action="store_true")
+    runtime_production_profile_p.add_argument("--profile-id", type=_parse_sha256)
+
+    runtime_production_prerequisites_p = sub.add_parser(
+        "runtime-production-prerequisites",
+        help="预演或安装生产画像所需的不可变 authority generation",
+    )
+    runtime_production_prerequisites_p.add_argument("--inputs", type=Path, required=True)
+    runtime_production_prerequisites_p.add_argument("--expected-commit", required=True)
+    runtime_production_prerequisites_p.add_argument(
+        "--runtime-mode",
+        choices=("local-test", "linux-production"),
+        default="local-test",
+    )
+    runtime_production_prerequisites_p.add_argument("--apply", action="store_true")
+    runtime_production_prerequisites_p.add_argument("--profile-id", type=_parse_sha256)
+
+    runtime_rollout_p = sub.add_parser(
+        "runtime-deployment-rollout",
+        help="按 generation 健康门滚动启动已安装的隔离运行时",
+    )
+    runtime_rollout_p.add_argument("--runtime-root", type=Path, required=True)
+    runtime_rollout_p.add_argument("--expected-commit", required=True)
+    runtime_rollout_p.add_argument("--profile-id", type=_parse_sha256, required=True)
+    runtime_rollout_p.add_argument("--generation-hash", type=_parse_sha256, required=True)
+    runtime_rollout_p.add_argument("--previous-generation-hash", type=_parse_sha256)
+    runtime_rollout_p.add_argument("--audit-root", type=Path)
+    runtime_rollout_p.add_argument("--health-timeout-seconds", type=float, default=120.0)
+
+    runtime_rollback_p = sub.add_parser(
+        "runtime-deployment-rollback",
+        help="在代码回滚前显式恢复 previous runtime generation",
+    )
+    runtime_rollback_p.add_argument("--runtime-root", type=Path, required=True)
+    runtime_rollback_p.add_argument("--failed-commit", required=True)
+    runtime_rollback_p.add_argument("--expected-previous-commit", required=True)
+    runtime_rollback_p.add_argument("--operation-id", type=_parse_sha256, required=True)
+    runtime_rollback_p.add_argument("--audit-root", type=Path)
+    runtime_rollback_p.add_argument("--health-timeout-seconds", type=float, default=120.0)
+
+    runtime_retirement_p = sub.add_parser(
+        "runtime-schema-retirement",
+        help="只读检查或显式执行 CUTOVER 后的 schema RETIRE",
+    )
+    runtime_retirement_sub = runtime_retirement_p.add_subparsers(
+        dest="retirement_action",
+        required=True,
+    )
+    for action in ("status", "dry-run", "apply"):
+        action_parser = runtime_retirement_sub.add_parser(action)
+        action_parser.add_argument("--runtime-root", type=Path, required=True)
+        action_parser.add_argument("--expected-commit", required=True)
+        action_parser.add_argument("--profile-id", type=_parse_sha256, required=True)
+        action_parser.add_argument("--generation-hash", type=_parse_sha256, required=True)
+        action_parser.add_argument(
+            "--rollout-operation-id",
+            type=_parse_sha256,
+            required=True,
+        )
+        action_parser.add_argument("--audit-root", type=Path)
+        if action != "status":
+            action_parser.add_argument("--plan-id", type=_parse_sha256, required=True)
+        if action == "apply":
+            action_parser.add_argument("--operation-id", type=_parse_sha256, required=True)
+
+    recovery_backup_p = sub.add_parser(
+        "runtime-recovery-backup",
+        help="生成或检查签名 recovery backup generation",
+    )
+    recovery_backup_sub = recovery_backup_p.add_subparsers(
+        dest="recovery_action",
+        required=True,
+    )
+    for action in ("dry-run", "execute", "status"):
+        action_parser = recovery_backup_sub.add_parser(action)
+        action_parser.add_argument("--config", type=Path, required=True)
+        action_parser.add_argument("--credential-file", type=Path, required=True)
+        if action == "execute":
+            action_parser.add_argument("--plan-id", type=_parse_sha256, required=True)
+
+    recovery_production_config_p = sub.add_parser(
+        "runtime-recovery-production-config",
+        help="从当前 hash-bound production profile 解析 recovery backup 环境",
+    )
+    recovery_production_config_p.add_argument("--runtime-root", type=Path, required=True)
+
+    recovery_production_p = sub.add_parser(
+        "runtime-recovery-production",
+        help="只从当前可信 production profile 执行 recovery",
+    )
+    recovery_production_sub = recovery_production_p.add_subparsers(
+        dest="production_recovery_action",
+        required=True,
+    )
+    for action in ("execute", "rehearse"):
+        action_parser = recovery_production_sub.add_parser(action)
+        action_parser.add_argument("--runtime-root", type=Path, required=True)
+        action_parser.add_argument(
+            "--expected-profile-generation",
+            type=_parse_sha256,
+            required=True,
+        )
+
+    recovery_p = sub.add_parser(
+        "runtime-recovery",
+        help="执行或检查隔离 runtime recovery rehearsal",
+    )
+    recovery_sub = recovery_p.add_subparsers(dest="recovery_action", required=True)
+    for action in ("dry-run", "execute", "status"):
+        action_parser = recovery_sub.add_parser(action)
+        action_parser.add_argument("--publication-root", type=Path, required=True)
+        action_parser.add_argument("--state-path", type=Path, required=True)
+        action_parser.add_argument("--receipt-root", type=Path, required=True)
+        action_parser.add_argument("--restore-root", type=Path, required=True)
+        action_parser.add_argument("--credential-file", type=Path, required=True)
+        action_parser.add_argument(
+            "--deadline-seconds",
+            type=_parse_recovery_deadline_seconds,
+            default=3600,
+        )
+        action_parser.add_argument(
+            "--schedule-cycle-seconds",
+            type=_parse_rehearsal_interval_seconds,
+            default=None,
+            help="外部 timer 周期，用于生成同周期幂等 request_id",
+        )
+        action_parser.add_argument("--worker-id", default="runtime-recovery")
+        action_parser.add_argument(
+            "--lease-seconds",
+            type=_parse_recovery_deadline_seconds,
+            default=None,
+        )
+        action_parser.add_argument(
+            "--max-attempts",
+            type=_parse_recovery_max_attempts,
+            default=3,
+        )
+        action_parser.add_argument(
+            "--retry-delay-seconds",
+            type=_parse_recovery_retry_delay_seconds,
+            default=60,
+        )
+        if action == "execute":
+            plan_group = action_parser.add_mutually_exclusive_group(required=True)
+            plan_group.add_argument("--plan-id", type=_parse_sha256)
+            plan_group.add_argument(
+                "--accept-current-plan",
+                action="store_true",
+                help="仅供受控 systemd oneshot 在同一进程内预演并执行当前不可变 generation",
+            )
+
     lab_run_p = sub.add_parser(
         "lab-run",
         help="执行 Strategy Lab 后台任务 spec（UI「后台运行」派生，内部命令）",
@@ -5233,6 +8068,32 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="任务 spec JSON 路径（launch_background_run 生成）",
     )
+    lab_run_p.add_argument(
+        "--research-snapshot",
+        type=Path,
+        help="仅本地兼容任务：显式不可变 research DuckDB 快照；正式研究请使用 lab-worker",
+    )
+
+    lab_integrity_audit_p = sub.add_parser(
+        "lab-integrity-audit",
+        help="运行 Strategy Lab 全账本完整性审计并输出健康状态",
+    )
+    lab_integrity_audit_p.add_argument(
+        "--jobs-path",
+        type=Path,
+        required=True,
+        help="待审计的 Lab SQLite 账本绝对路径",
+    )
+    lab_integrity_audit_p.add_argument("--require-external-highwater", action="store_true")
+    lab_integrity_audit_p.add_argument("--highwater-production-mode", action="store_true")
+    lab_integrity_audit_p.add_argument("--highwater-command-json")
+    lab_integrity_audit_p.add_argument("--highwater-stable-identity")
+    lab_integrity_audit_p.add_argument("--highwater-code-identity")
+    lab_integrity_audit_p.add_argument("--highwater-profile-identity")
+    lab_integrity_audit_p.add_argument("--highwater-trusted-keyring", type=Path)
+    lab_integrity_audit_p.add_argument("--highwater-timeout-seconds", type=float, default=10.0)
+    lab_integrity_audit_p.add_argument("--highwater-allow-identity-rotation", action="store_true")
+    lab_integrity_audit_p.add_argument("--machine-receipt", action="store_true")
 
     lab_runtime_prepare_p = sub.add_parser(
         "lab-runtime-prepare",
@@ -5240,9 +8101,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     lab_runtime_prepare_p.add_argument("--expected-checkout-root", required=True)
     lab_runtime_prepare_p.add_argument("--trusted-git-path", required=True)
-    lab_runtime_prepare_p.add_argument("--deployment-generation", required=True)
-    lab_runtime_prepare_p.add_argument("--deployment-lock-path", required=True)
-    lab_runtime_prepare_p.add_argument("--deployment-generation-fd", required=True, type=int)
+    lab_runtime_prepare_p.add_argument("--runtime-deployment-root", type=Path, required=True)
+    lab_runtime_prepare_p.add_argument("--expected-code-sha", type=_parse_commit_sha)
+    lab_runtime_prepare_p.add_argument("--deployment-generation")
+    lab_runtime_prepare_p.add_argument("--deployment-lock-path")
+    lab_runtime_prepare_p.add_argument("--deployment-generation-fd", type=int)
     lab_runtime_prepare_p.add_argument("--startup-deadline-monotonic", required=True, type=float)
     lab_runtime_prepare_p.add_argument("--deployment-operation-id")
     lab_runtime_prepare_p.add_argument("--deployment-environment-generation")
@@ -5279,6 +8142,7 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="launch contract 固定的可信绝对 Git 可执行文件",
     )
+    lab_scheduler_p.add_argument("--runtime-deployment-root", type=Path, required=True)
     lab_scheduler_p.add_argument("--deployment-generation", required=True)
     lab_scheduler_p.add_argument("--deployment-lock-path", required=True)
     lab_scheduler_p.add_argument("--deployment-generation-fd", required=True, type=int)
@@ -5289,6 +8153,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--once",
         action="store_true",
         help="只消费一批命令并退出",
+    )
+    lab_scheduler_p.add_argument(
+        "--remediate-full-integrity",
+        action="store_true",
+        help="仅在 authority 已消费管理员一次性 remediation 授权后清除持久 degraded",
     )
 
     lab_worker_p = sub.add_parser(
@@ -5321,6 +8190,103 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="只消费一个分片并退出",
     )
+    lab_worker_p.add_argument(
+        "--legacy-no-resource-admission",
+        action="store_true",
+        help="仅开发/测试允许：显式停用资源准入；生产环境拒绝启动",
+    )
+
+    lab_claim_finalizer_p = sub.add_parser(
+        "lab-claim-finalizer",
+        help="运行 authority-owned V2 claim publication finalizer",
+    )
+    lab_claim_finalizer_p.add_argument("--expected-checkout-root", required=True)
+    lab_claim_finalizer_p.add_argument("--trusted-git-path", required=True)
+    lab_claim_finalizer_p.add_argument("--deployment-generation", required=True)
+    lab_claim_finalizer_p.add_argument("--deployment-lock-path", required=True)
+    lab_claim_finalizer_p.add_argument(
+        "--deployment-generation-fd",
+        required=True,
+        type=int,
+    )
+    lab_claim_finalizer_p.add_argument(
+        "--startup-deadline-monotonic",
+        required=True,
+        type=float,
+    )
+    lab_claim_finalizer_p.add_argument("--deployment-operation-id")
+    lab_claim_finalizer_p.add_argument("--deployment-environment-generation")
+    lab_claim_finalizer_p.add_argument(
+        "--once",
+        action="store_true",
+        help="只处理一批 claim publication 并退出",
+    )
+
+    trust_p = sub.add_parser(
+        "lab-claim-finalizer-trust",
+        help="离线签发、检查或轮换 claim finalizer 信任证书",
+    )
+    trust_sub = trust_p.add_subparsers(dest="action", required=True)
+    trust_inspect_p = trust_sub.add_parser("inspect", help="只读检查 canonical 证书")
+    trust_inspect_p.add_argument("--certificate", type=Path, required=True)
+    for action in ("issue", "rotate"):
+        trust_action_p = trust_sub.add_parser(action, help="离线 root 签发新的 runtime 证书")
+        trust_action_p.add_argument("--root-private-key", type=Path, required=True)
+        trust_action_p.add_argument("--root-public-key", type=Path, required=True)
+        trust_action_p.add_argument("--root-issuer", default="lab-offline-root")
+        trust_action_p.add_argument("--root-key-id", default="lab-finalizer-root")
+        trust_action_p.add_argument("--finalizer-public-key", type=Path, required=True)
+        trust_action_p.add_argument("--finalizer-issuer", default="lab-finalizer")
+        trust_action_p.add_argument("--finalizer-key-id", default="lab-finalizer-runtime")
+        trust_action_p.add_argument("--store-id", required=True)
+        trust_action_p.add_argument("--database-device", type=int, required=True)
+        trust_action_p.add_argument("--database-inode", type=int, required=True)
+        trust_action_p.add_argument("--not-before", required=True)
+        trust_action_p.add_argument("--expires-at", required=True)
+        trust_action_p.add_argument("--output", type=Path)
+
+    claim_preflight_p = sub.add_parser(
+        "lab-claim-finalizer-preflight",
+        help="从 current generation 收集 claim finalizer 依赖和 SLO",
+    )
+    claim_preflight_p.add_argument("--format", choices=("json", "markdown"), default="json")
+    claim_preflight_p.add_argument(
+        "--apply",
+        action="store_true",
+        help="仅在真实 preflight OK 时 CAS 推进 MATERIAL_INSTALLED 到 PREFLIGHT_OK",
+    )
+
+    runtime_p = sub.add_parser(
+        "lab-claim-finalizer-runtime",
+        help="安装或检查已签 finalizer generation；没有签发权限",
+    )
+    runtime_sub = runtime_p.add_subparsers(dest="action", required=True)
+    runtime_inspect_p = runtime_sub.add_parser("inspect", help="只读检查 current generation")
+    runtime_inspect_p.add_argument("--runtime-root", type=Path, required=True)
+    runtime_inspect_p.add_argument("--service-user", required=True)
+    runtime_inspect_p.add_argument("--service-group", required=True)
+    runtime_inspect_p.add_argument("--trusted-base", type=Path, default=Path("/etc/rquant"))
+    runtime_install_p = runtime_sub.add_parser("install", help="验证并原子安装已签 generation")
+    runtime_install_p.add_argument("--runtime-root", type=Path, required=True)
+    runtime_install_p.add_argument("--request", type=Path, required=True)
+    runtime_install_p.add_argument("--root-public-key", type=Path, required=True)
+    runtime_install_p.add_argument("--root-issuer", required=True)
+    runtime_install_p.add_argument("--root-key-id", required=True)
+    runtime_install_p.add_argument("--service-user", required=True)
+    runtime_install_p.add_argument("--service-group", required=True)
+    runtime_install_p.add_argument("--trusted-base", type=Path, default=Path("/etc/rquant"))
+    runtime_install_p.add_argument("--dry-run", action="store_true")
+
+    rollout_p = sub.add_parser(
+        "lab-claim-finalizer-rollout",
+        help="查询或受控 drain V2 claim publication rollout",
+    )
+    rollout_sub = rollout_p.add_subparsers(dest="action", required=True)
+    rollout_sub.add_parser("status", help="读取 rollout CAS state")
+    begin_drain_p = rollout_sub.add_parser("begin-drain", help="先停止 scheduler V2 emit")
+    begin_drain_p.add_argument("--evidence", required=True)
+    complete_drain_p = rollout_sub.add_parser("complete-drain", help="仅清空非终态和 outbox 后 OFF")
+    complete_drain_p.add_argument("--evidence", required=True)
 
     lab_finalizer_p = sub.add_parser(
         "lab-finalizer",
@@ -5387,7 +8353,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     """CLI 入口函数。一次性命令的异常顶层捕获后推 PushDeer。
 
-    serve 内的 daily_job 自有 try/except + notify，main 不重复抓。
+    serve 内的 daily_job 自有 try/except + typed outbox，main 不重复抓。
     """
     parser = build_parser()
     args = parser.parse_args()
@@ -5397,6 +8363,9 @@ def main() -> int:
         "run-daily": cmd_run_daily,
         "ingest": cmd_ingest,
         "daily-indicator-backfill": cmd_daily_indicator_backfill,
+        "daily-dag": cmd_daily_dag,
+        "daily-dag-dev": cmd_daily_dag,
+        "daily-dag-shadow": cmd_daily_dag_shadow,
         "monitor": cmd_monitor,
         "rt-minute-fetch": cmd_rt_minute_fetch,
         "rt-minute-daily-fetch": cmd_rt_minute_daily_fetch,
@@ -5445,13 +8414,32 @@ def main() -> int:
         "midday-report": cmd_midday_report,
         "pre-market-check": cmd_pre_market_check,
         "preflight": cmd_preflight,
+        "external-monotonic-root-serve": cmd_external_monotonic_root_serve,
+        "resource-authority-serve": cmd_resource_authority_serve,
+        "runtime-production-prerequisites": cmd_runtime_production_prerequisites,
+        "runtime-production-profile": cmd_runtime_production_profile,
+        "runtime-deployment-profile": cmd_runtime_deployment_profile,
+        "runtime-deployment-rollout": cmd_runtime_deployment_rollout,
+        "runtime-deployment-rollback": cmd_runtime_deployment_rollback,
+        "runtime-schema-retirement": cmd_runtime_schema_retirement,
+        "runtime-recovery-backup": cmd_runtime_recovery_backup,
+        "runtime-recovery-production-config": cmd_runtime_recovery_production_config,
+        "runtime-recovery-production": cmd_runtime_recovery_production,
+        "runtime-recovery": cmd_runtime_recovery,
+        "legacy-shadow-recover": cmd_legacy_shadow_recover,
         "surge-watch": cmd_surge_watch,
         "lab-run": cmd_lab_run,
+        "lab-integrity-audit": cmd_lab_integrity_audit,
         "lab-runtime-prepare": cmd_lab_runtime_prepare,
         "lab-launchd-install": cmd_lab_launchd_install,
         "lab-launchd-uninstall": cmd_lab_launchd_uninstall,
         "lab-scheduler": cmd_lab_scheduler,
         "lab-worker": cmd_lab_worker,
+        "lab-claim-finalizer": cmd_lab_claim_finalizer,
+        "lab-claim-finalizer-trust": cmd_lab_claim_finalizer_trust,
+        "lab-claim-finalizer-preflight": cmd_lab_claim_finalizer_preflight,
+        "lab-claim-finalizer-runtime": cmd_lab_claim_finalizer_runtime,
+        "lab-claim-finalizer-rollout": cmd_lab_claim_finalizer_rollout,
         "lab-finalizer": cmd_lab_finalizer,
         "panorama-auth-serve": cmd_panorama_auth_serve,
         "panorama-user-add": cmd_panorama_user_add,
@@ -5476,8 +8464,22 @@ def main() -> int:
         "daily-report",
         "pre-market-check",
         "preflight",
+        "external-monotonic-root-serve",
+        "resource-authority-serve",
+        "daily-dag",
+        "daily-dag-dev",
+        "daily-dag-shadow",
+        "runtime-production-prerequisites",
+        "runtime-production-profile",
+        "runtime-deployment-profile",
+        "runtime-deployment-rollout",
+        "runtime-recovery-backup",
+        "runtime-recovery-production-config",
+        "runtime-recovery-production",
+        "runtime-recovery",
         "data-audit",
         "lab-run",
+        "lab-integrity-audit",
         "lab-runtime-prepare",
         "lab-launchd-install",
         "lab-launchd-uninstall",
@@ -5496,9 +8498,15 @@ def main() -> int:
         return handler(args)
     except Exception as e:
         logger.exception(f"=== {args.command} 异常 ===")
-        from rquant.notify import notify
+        if args.command == "run-daily":
+            _record_daily_error_outbox(
+                component="cli:run-daily",
+                exc=e,
+                trade_date=date.fromisoformat(args.date) if args.date else date.today(),
+            )
+        elif args.command not in {"monitor", "surge-watch"}:
+            from rquant.notify import notify
 
-        if args.command not in {"monitor", "surge-watch"}:
             notify("error", component=f"cli:{args.command}", exc=e)
         return 1
 

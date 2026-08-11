@@ -2,19 +2,40 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import json
+import re
+import threading
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
-from typing import Protocol, TypeVar
+from typing import Any, Protocol, TypeVar
 
 from pydantic import Field
 
 from rquant.runtime_contracts import AwareUtcDatetime, RuntimeContractModel, normalize_aware_utc
 from rquant.serving_contracts import FreshnessStatus, ServingGenerationManifest
-from rquant.serving_publisher import ServingReader
+from rquant.serving_publisher import (
+    ServingGenerationLease,
+    ServingIntegrityError,
+    ServingReader,
+    quote_serving_column_identifier,
+    quote_serving_table_identifier,
+)
+from rquant.serving_read_models import PAGE_PROJECTION_CONTRACTS
+
+_MAX_QUERY_BYTES = 32 * 1024
+_MAX_QUERY_PARAMETERS = 512
+_DEFAULT_RESULT_BYTES = 8 * 1024 * 1024
+_MAX_RESULT_BYTES = 64 * 1024 * 1024
+_FORBIDDEN_QUERY_TOKEN = re.compile(
+    r"\b(?:ATTACH|COPY|EXPORT|IMPORT|INSTALL|LOAD|PRAGMA|CALL|CREATE|DELETE|DROP|INSERT|"
+    r"MERGE|UPDATE|ALTER|VACUUM|CHECKPOINT|READ_CSV|READ_JSON|READ_PARQUET|PARQUET_SCAN|"
+    r"SQLITE_SCAN)\b",
+    flags=re.IGNORECASE,
+)
 
 
 class ConsoleLoadState(StrEnum):
@@ -27,6 +48,34 @@ class ConsoleFreshness(StrEnum):
     STALE = "stale"
     DEGRADED = "degraded"
     UNAVAILABLE = "unavailable"
+
+
+class ServingFrameState(StrEnum):
+    READY = "ready"
+    STALE = "stale"
+    DEGRADED = "degraded"
+    UNAVAILABLE = "unavailable"
+
+
+class ServingFrameResult(RuntimeContractModel):
+    state: ServingFrameState
+    detail: str
+    generation_id: str | None = None
+    generated_at: AwareUtcDatetime | None = None
+    columns: tuple[str, ...] = ()
+    rows: tuple[tuple[Any, ...], ...] = ()
+
+    def dataframe(self) -> object:
+        import pandas as pd
+
+        frame = pd.DataFrame(self.rows, columns=self.columns)
+        frame.attrs["serving"] = {
+            "state": self.state.value,
+            "detail": self.detail,
+            "generation_id": self.generation_id,
+            "generated_at": self.generated_at,
+        }
+        return frame
 
 
 class ConsoleLimits(RuntimeContractModel):
@@ -146,6 +195,11 @@ class RuntimeConsoleSnapshot(RuntimeContractModel):
 class _QueryResult(Protocol):
     def fetchall(self) -> list[tuple[object, ...]]: ...
 
+    def fetchmany(self, size: int) -> list[tuple[object, ...]]: ...
+
+    @property
+    def description(self) -> Sequence[Sequence[object]]: ...
+
 
 class _ReadonlyConnection(Protocol):
     def execute(self, sql: str, parameters: tuple[object, ...]) -> _QueryResult: ...
@@ -158,17 +212,20 @@ class _QuerySpec(RuntimeContractModel):
 
     @property
     def sql(self) -> str:
-        quoted_columns = ", ".join(f'"{column}"' for column in self.columns)
+        quoted_columns = ", ".join(
+            quote_serving_column_identifier(column) for column in self.columns
+        )
         quoted_order = ", ".join(self._order_term(term) for term in self.order_by)
-        return f'SELECT {quoted_columns} FROM "{self.table}" ORDER BY {quoted_order} LIMIT ?'
+        quoted_table = quote_serving_table_identifier(self.table)
+        return f"SELECT {quoted_columns} FROM {quoted_table} ORDER BY {quoted_order} LIMIT ?"
 
     @staticmethod
     def _order_term(term: str) -> str:
         parts = term.split()
         if len(parts) == 1:
-            return f'"{parts[0]}"'
+            return quote_serving_column_identifier(parts[0])
         if len(parts) == 2 and parts[1] in {"ASC", "DESC"}:
-            return f'"{parts[0]}" {parts[1]}'
+            return f"{quote_serving_column_identifier(parts[0])} {parts[1]}"
         raise ValueError("invalid fixed serving order term")
 
 
@@ -314,18 +371,270 @@ def _unavailable(error: Exception) -> RuntimeConsoleSnapshot:
     )
 
 
+def _validate_bounded_select(sql: str, parameters: Sequence[object]) -> str:
+    statement = sql.strip()
+    if not statement:
+        raise ValueError("sql cannot be empty")
+    if len(statement.encode("utf-8")) > _MAX_QUERY_BYTES:
+        raise ValueError("serving query exceeds its SQL byte budget")
+    if len(parameters) > _MAX_QUERY_PARAMETERS:
+        raise ValueError("serving query exceeds its parameter budget")
+    without_trailing = statement[:-1].rstrip() if statement.endswith(";") else statement
+    if ";" in without_trailing:
+        raise ServingIntegrityError("serving queries must contain one read-only SELECT")
+    first_token = without_trailing.split(None, 1)[0].upper()
+    if first_token not in {"SELECT", "WITH"} or _FORBIDDEN_QUERY_TOKEN.search(without_trailing):
+        raise ServingIntegrityError("serving queries must be a bounded read-only SELECT")
+    return without_trailing
+
+
+def require_serving_projections(
+    connection: _ReadonlyConnection,
+    required_projections: Sequence[str],
+) -> Mapping[str, datetime]:
+    """Fail closed unless every requested projection exists in this same connection."""
+
+    names = tuple(dict.fromkeys(required_projections))
+    if not names:
+        return MappingProxyType({})
+    if len(names) > 64 or any(not name or len(name) > 100 for name in names):
+        raise ValueError("required serving projections are invalid")
+    placeholders = ",".join("?" for _ in names)
+    rows = connection.execute(
+        "SELECT table_name, available, reason, available_at "
+        f"FROM projection_status WHERE table_name IN ({placeholders})",
+        names,
+    ).fetchall()
+    by_name = {str(row[0]): (bool(row[1]), row[2], row[3]) for row in rows}
+    unavailable = []
+    available_at: dict[str, datetime] = {}
+    for name in names:
+        state = by_name.get(name)
+        if state is None:
+            unavailable.append(f"{name}: status missing")
+        elif not state[0]:
+            reason = str(state[1] or "projection unavailable").replace("_", " ")
+            unavailable.append(f"{name}: {reason}")
+        elif state[2] is None:
+            unavailable.append(f"{name}: availability timestamp missing")
+        else:
+            available_at[name] = normalize_aware_utc(state[2])
+    if unavailable:
+        raise ServingIntegrityError("serving projection not published: " + "; ".join(unavailable))
+    return MappingProxyType(available_at)
+
+
+def query_acquired_serving_frame(
+    acquired: ServingGenerationLease,
+    sql: str,
+    parameters: Sequence[object] = (),
+    *,
+    now: datetime | None = None,
+    max_rows: int = 10_000,
+    max_result_bytes: int = _DEFAULT_RESULT_BYTES,
+    max_query_seconds: float = 2.0,
+    stale_after: timedelta = timedelta(minutes=10),
+    required_projections: Sequence[str] = (),
+) -> ServingFrameResult:
+    """Run one bounded query without re-reading the acquired generation pointer."""
+
+    if type(max_rows) is not int or max_rows < 1 or max_rows > 100_000:
+        raise ValueError("max_rows must be an integer between 1 and 100000")
+    if (
+        type(max_result_bytes) is not int
+        or max_result_bytes < 1
+        or max_result_bytes > _MAX_RESULT_BYTES
+    ):
+        raise ValueError("max_result_bytes must be between 1 and 67108864")
+    if (
+        isinstance(max_query_seconds, bool)
+        or not isinstance(max_query_seconds, (int, float))
+        or not 0.001 <= float(max_query_seconds) <= 30.0
+    ):
+        raise ValueError("max_query_seconds must be between 0.001 and 30")
+    if stale_after <= timedelta(0):
+        raise ValueError("stale_after must be positive")
+    observed_at = normalize_aware_utc(now or datetime.now(UTC))
+    try:
+        statement = _validate_bounded_select(sql, parameters)
+        if acquired.closed:
+            raise ServingIntegrityError("serving generation lease is closed")
+        manifest = acquired.manifest
+        if manifest.built_at > observed_at:
+            raise ServingIntegrityError("serving generation contains future evidence")
+        projection_available_at = require_serving_projections(
+            acquired.connection,
+            required_projections,
+        )
+        timer = threading.Timer(
+            float(max_query_seconds),
+            acquired.connection.interrupt,
+        )
+        timer.daemon = True
+        timer.start()
+        try:
+            result = acquired.connection.execute(statement, tuple(parameters))
+            rows = result.fetchmany(max_rows + 1)
+        finally:
+            timer.cancel()
+            timer.join()
+        if len(rows) > max_rows:
+            raise ServingIntegrityError("serving query exceeded its row budget")
+        result_bytes = len(
+            json.dumps(rows, ensure_ascii=True, default=str, separators=(",", ":")).encode("utf-8")
+        )
+        if result_bytes > max_result_bytes:
+            raise ServingIntegrityError("serving query exceeded its result byte budget")
+        columns = tuple(str(column[0]) for column in result.description)
+        required_dataset_ids = _required_projection_dataset_ids(required_projections)
+        relevant_watermarks = tuple(
+            item
+            for item in manifest.watermarks
+            if not required_dataset_ids or item.dataset_id in required_dataset_ids
+        )
+        missing_watermarks = required_dataset_ids.difference(
+            item.dataset_id for item in relevant_watermarks
+        )
+        if missing_watermarks:
+            raise ServingIntegrityError(
+                "serving generation lacks projection owner watermarks: "
+                + ", ".join(sorted(missing_watermarks))
+            )
+        freshness = _manifest_freshness(
+            manifest,
+            age=max(observed_at - manifest.built_at, timedelta(0)),
+            stale_after=stale_after,
+            dataset_ids=required_dataset_ids or None,
+        )
+        future_projections = tuple(
+            sorted(
+                name
+                for name, available_at in projection_available_at.items()
+                if available_at > observed_at
+            )
+        )
+        if future_projections:
+            raise ServingIntegrityError(
+                "serving projections contain future evidence: " + ", ".join(future_projections)
+            )
+        stale_projections = tuple(
+            sorted(
+                name
+                for name, available_at in projection_available_at.items()
+                if observed_at - available_at > stale_after
+            )
+        )
+        if freshness is ConsoleFreshness.FRESH and stale_projections:
+            freshness = ConsoleFreshness.STALE
+        state = {
+            ConsoleFreshness.FRESH: ServingFrameState.READY,
+            ConsoleFreshness.STALE: ServingFrameState.STALE,
+            ConsoleFreshness.DEGRADED: ServingFrameState.DEGRADED,
+            ConsoleFreshness.UNAVAILABLE: ServingFrameState.DEGRADED,
+        }[freshness]
+        non_fresh = tuple(
+            f"{item.dataset_id}:{item.status.value}:{item.reason or 'unspecified'}"
+            for item in relevant_watermarks
+            if item.status is not FreshnessStatus.FRESH
+        )
+        detail = (
+            "serving generation verified"
+            if state is ServingFrameState.READY
+            else f"serving generation {state.value}: "
+            + (
+                "; ".join(non_fresh)
+                or (
+                    "stale projections: " + ", ".join(stale_projections)
+                    if stale_projections
+                    else "built_at exceeded freshness budget"
+                )
+            )
+        )
+        return ServingFrameResult(
+            state=state,
+            detail=detail,
+            generation_id=manifest.generation_id,
+            generated_at=manifest.built_at,
+            columns=columns,
+            rows=tuple(tuple(row) for row in rows),
+        )
+    except Exception as error:
+        return ServingFrameResult(
+            state=ServingFrameState.UNAVAILABLE,
+            detail=_error_detail(error),
+        )
+
+
+def query_serving_frame(
+    serving_root: str | Path,
+    sql: str,
+    parameters: Sequence[object] = (),
+    *,
+    now: datetime | None = None,
+    max_rows: int = 10_000,
+    max_result_bytes: int = _DEFAULT_RESULT_BYTES,
+    max_query_seconds: float = 2.0,
+    stale_after: timedelta = timedelta(minutes=10),
+    required_projections: Sequence[str] = (),
+) -> ServingFrameResult:
+    """Acquire one serving generation and run one bounded query against it."""
+
+    try:
+        reader = ServingReader(serving_root)
+        with reader.acquire_generation() as acquired:
+            return query_acquired_serving_frame(
+                acquired,
+                sql,
+                parameters,
+                now=now,
+                max_rows=max_rows,
+                max_result_bytes=max_result_bytes,
+                max_query_seconds=max_query_seconds,
+                stale_after=stale_after,
+                required_projections=required_projections,
+            )
+    except Exception as error:
+        return ServingFrameResult(
+            state=ServingFrameState.UNAVAILABLE,
+            detail=_error_detail(error),
+        )
+
+
 def _manifest_freshness(
     manifest: ServingGenerationManifest,
     *,
     age: timedelta,
     stale_after: timedelta,
+    dataset_ids: frozenset[str] | None = None,
 ) -> ConsoleFreshness:
-    statuses = {watermark.status for watermark in manifest.watermarks}
+    statuses = {
+        watermark.status
+        for watermark in manifest.watermarks
+        if dataset_ids is None or watermark.dataset_id in dataset_ids
+    }
     if FreshnessStatus.UNAVAILABLE in statuses or FreshnessStatus.DEGRADED in statuses:
         return ConsoleFreshness.DEGRADED
     if age > stale_after or FreshnessStatus.STALE in statuses:
         return ConsoleFreshness.STALE
     return ConsoleFreshness.FRESH
+
+
+def _required_projection_dataset_ids(
+    required_projections: Sequence[str],
+) -> frozenset[str]:
+    unknown = tuple(
+        projection
+        for projection in required_projections
+        if projection not in PAGE_PROJECTION_CONTRACTS
+    )
+    if unknown:
+        raise ServingIntegrityError(
+            "unknown serving projection contract: " + ", ".join(sorted(unknown))
+        )
+    return frozenset(
+        PAGE_PROJECTION_CONTRACTS[projection].owner_dataset_id
+        for projection in required_projections
+    )
 
 
 def load_runtime_console(
@@ -343,25 +652,31 @@ def load_runtime_console(
     query_limits = limits or ConsoleLimits()
     try:
         reader = ServingReader(serving_root)
-        manifest = reader.current_manifest()
+        lease = reader.acquire_generation()
     except Exception as error:
         return _unavailable(error)
 
-    age = observed_at - manifest.built_at
-    if age < timedelta(0):
-        return RuntimeConsoleSnapshot(
-            state=ConsoleLoadState.DEGRADED,
-            freshness=ConsoleFreshness.DEGRADED,
-            detail="serving generation has a future built_at timestamp",
-            generation_id=manifest.generation_id,
-            generated_at=manifest.built_at,
-            age_seconds=0,
-            producer_commit=manifest.producer_commit,
-        )
-
-    freshness = _manifest_freshness(manifest, age=age, stale_after=stale_after)
+    manifest: ServingGenerationManifest | None = None
     try:
-        with reader.open_current_readonly() as connection:
+        with lease as acquired:
+            manifest = acquired.manifest
+            age = observed_at - manifest.built_at
+            if age < timedelta(0):
+                return RuntimeConsoleSnapshot(
+                    state=ConsoleLoadState.DEGRADED,
+                    freshness=ConsoleFreshness.DEGRADED,
+                    detail="serving generation has a future built_at timestamp",
+                    generation_id=manifest.generation_id,
+                    generated_at=manifest.built_at,
+                    age_seconds=0,
+                    producer_commit=manifest.producer_commit,
+                )
+            freshness = _manifest_freshness(
+                manifest,
+                age=age,
+                stale_after=stale_after,
+            )
+            connection = acquired.connection
             sections = {
                 "services": _read_rows(
                     connection,
@@ -407,6 +722,9 @@ def load_runtime_console(
                 ),
             }
     except Exception as error:
+        if manifest is None:
+            return _unavailable(error)
+        age = max(observed_at - manifest.built_at, timedelta(0))
         return RuntimeConsoleSnapshot(
             state=ConsoleLoadState.DEGRADED,
             freshness=ConsoleFreshness.DEGRADED,
@@ -445,5 +763,10 @@ __all__ = [
     "RuntimeConsoleSnapshot",
     "RuntimeServiceRow",
     "SignalRow",
+    "ServingFrameResult",
+    "ServingFrameState",
     "load_runtime_console",
+    "query_serving_frame",
+    "query_acquired_serving_frame",
+    "require_serving_projections",
 ]
