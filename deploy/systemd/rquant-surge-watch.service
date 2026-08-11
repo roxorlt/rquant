@@ -12,6 +12,7 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
+Slice=rquant-live.slice
 User=lighthouse
 Group=lighthouse
 WorkingDirectory=/home/lighthouse/rquant

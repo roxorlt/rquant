@@ -51,5 +51,11 @@ jobs:
           tests/unit/test_storage_duckdb.py
           tests/unit/test_minute_replay.py::test_replay_enters_when_strong_carry_breaks_t_high_and_exits_next_day
 
+      - name: SourceBroker V2 saga (51 tests)
+        run: uv run pytest -q tests/unit/test_source_broker_v2.py
+
+      - name: SourceBroker V2 frozen boundary
+        run: uv run python scripts/source_broker_v2_frozen.py
+
       - name: Full test suite
         run: uv run pytest -q

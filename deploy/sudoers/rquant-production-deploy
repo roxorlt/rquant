@@ -1,13 +1,44 @@
 # Install as /etc/sudoers.d/rquant-production-deploy with mode 0440.
 # Validate before install: visudo -cf deploy/sudoers/rquant-production-deploy
+# macOS Lab launchd handoff runs as its owning user; never grant launchctl through sudo.
 
 Cmnd_Alias RQUANT_SERVICE_RESTART = \
     /usr/bin/systemctl restart rquant-canvas.service, \
     /usr/bin/systemctl restart rquant-dashboard.service, \
+    /usr/bin/systemctl restart rquant-daily-receipt-signer.socket, \
+    /usr/bin/systemctl restart rquant-daily-receipt-signer.service, \
+    /usr/bin/systemctl restart rquant-page-control.service, \
     /usr/bin/systemctl restart rquant-monitor.service, \
     /usr/bin/systemctl restart rquant-nl-screen.service, \
     /usr/bin/systemctl restart rquant-panorama-auth.service, \
     /usr/bin/systemctl restart rquant-panorama.service, \
     /usr/bin/systemctl restart rquant-surge-watch.service
 
-lighthouse ALL=(root) NOPASSWD: RQUANT_SERVICE_RESTART
+Cmnd_Alias RQUANT_TIMER_TRANSITION = \
+    /usr/bin/systemctl stop rquant-monitor.timer, \
+    /usr/bin/systemctl start rquant-monitor.timer, \
+    /usr/bin/systemctl stop rquant-monitor-watchdog.timer, \
+    /usr/bin/systemctl start rquant-monitor-watchdog.timer, \
+    /usr/bin/systemctl stop rquant-surge-watch.timer, \
+    /usr/bin/systemctl start rquant-surge-watch.timer
+
+Cmnd_Alias RQUANT_RUNTIME_CREDENTIAL_SEAL = \
+    /usr/local/libexec/rquant-runtime-credential-sealer ""
+
+# The authority consumes only stdin.  The empty argument list is intentional:
+# allowing a runner to supply a helper path, state root or key path would turn
+# this root boundary into a confused-deputy write capability.
+Cmnd_Alias RQUANT_LAB_HIGHWATER_AUTHORITY = \
+    /usr/local/libexec/rquant-lab-highwater-authority ""
+
+# Canvas publication is likewise stdin-only and parameter-free.  PageControl
+# can ask to sign one bounded receipt but cannot select key material or a path.
+Cmnd_Alias RQUANT_CANVAS_PUBLICATION_SIGNER = \
+    /usr/local/libexec/rquant-canvas-publication-signer ""
+
+# Shadow reports use the same bounded stdin-only capability.  The research
+# runner can request an attestation or receipt signature, never choose keys.
+Cmnd_Alias RQUANT_SHADOW_REPORT_SIGNER = \
+    /usr/local/libexec/rquant-shadow-report-signer ""
+
+lighthouse ALL=(root) NOPASSWD: RQUANT_SERVICE_RESTART, RQUANT_TIMER_TRANSITION, RQUANT_RUNTIME_CREDENTIAL_SEAL, RQUANT_LAB_HIGHWATER_AUTHORITY, RQUANT_CANVAS_PUBLICATION_SIGNER, RQUANT_SHADOW_REPORT_SIGNER

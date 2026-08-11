@@ -42,7 +42,7 @@ sudo -u lighthouse /home/lighthouse/.local/bin/uv sync
 sudo -u lighthouse tee -a /home/lighthouse/rquant/.env <<'EOF'
 
 # ===== LLM (Week 7 NL 选股, v0.12.0) =====
-DEEPSEEK_API_KEY=sk-9ff304ab8a3c4b84b4f1d9621e7cfc04
+DEEPSEEK_API_KEY=<SET_VIA_ENVIRONMENT>
 DEEPSEEK_BASE_URL=https://api.deepseek.com
 DEEPSEEK_MODEL=deepseek-v4-flash
 EOF

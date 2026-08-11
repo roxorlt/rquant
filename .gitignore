@@ -99,10 +99,15 @@ logs/
 
 # 秘钥与环境变量
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
 config.local.*
 secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
 
 # Streamlit
 .streamlit/secrets.toml

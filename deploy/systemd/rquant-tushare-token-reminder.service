@@ -5,6 +5,7 @@ OnFailure=rquant-alert@%n.service
 
 [Service]
 Type=oneshot
+Slice=rquant-live.slice
 User=lighthouse
 Group=lighthouse
 WorkingDirectory=/home/lighthouse/rquant

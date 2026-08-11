@@ -1,0 +1,46 @@
+[Unit]
+Description=rQuant isolated notification worker (%i)
+After=network-online.target
+Wants=network-online.target
+OnFailure=rquant-alert@%n.service
+StartLimitIntervalSec=600s
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=lighthouse
+Group=lighthouse
+WorkingDirectory=/home/lighthouse/rquant
+EnvironmentFile=/home/lighthouse/rquant/data/runtime/current/runtime.env
+Environment=APP_ENV=prod RQUANT_DISABLE_DOTENV=1
+LoadCredentialEncrypted=capabilities.json:/etc/credstore.encrypted/rquant-runtime/instances/%i/current.cred
+Slice=rquant-live.slice
+ExecStart=/home/lighthouse/rquant/.venv/bin/python -m rquant.runtime_service_main --manifest /home/lighthouse/rquant/data/runtime/current/manifests/%i.json --control-root /home/lighthouse/rquant/data/runtime/control/notifiers/%i --expected-commit ${RQUANT_RUNTIME_COMMIT} --expected-generation ${RQUANT_RUNTIME_GENERATION} --expected-kind notifier
+
+Restart=on-failure
+RestartSec=10s
+TimeoutStartSec=120s
+TimeoutStopSec=60s
+SuccessExitStatus=0
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+InaccessiblePaths=/home/lighthouse/rquant/.env -/home/lighthouse/rquant/data/runtime/current/secrets -/home/lighthouse/rquant/data/runtime/current/credentials
+ProtectProc=invisible
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+ReadWritePaths=/home/lighthouse/rquant/data/runtime/control/notifiers/%i /home/lighthouse/rquant/data/runtime/live/notifications/%i
+ReadOnlyPaths=-/home/lighthouse/rquant/data/runtime/live/signal-bus/spool -/home/lighthouse/rquant/data/runtime/serving/page-control -/home/lighthouse/rquant/data/runtime/control/page-control.sqlite3
+
+StandardOutput=journal
+StandardError=journal

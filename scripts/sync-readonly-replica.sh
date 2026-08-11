@@ -16,6 +16,10 @@
 
 set -Eeuo pipefail
 
+if [[ "${RQUANT_WORKLOAD_ARBITER_HELD:-}" != "maintenance" ]]; then
+    exec /usr/local/libexec/rquant-workload-arbiter maintenance -- "$0" "$@"
+fi
+
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SRC="${PROJECT_DIR}/data/rquant.duckdb"
 DST="${PROJECT_DIR}/data/rquant_ro.duckdb"
