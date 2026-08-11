@@ -36,6 +36,18 @@ from rquant.lab_result_digest import (
     CURRENT_CONTENT_DIGEST_ALGORITHM,
     CURRENT_RESULT_MANIFEST_SCHEMA_VERSION,
 )
+from rquant.scheduler_intent_authorization import SchedulerIntentAuthorizationV1
+from rquant.source_broker_v2_job_protocol import SourceBrokerV2AuthorityRef
+from rquant.source_operation_contracts import (
+    CurrentClaimAuthorityProtocol,
+    SourceAttemptBindingV2,
+    SourceBrokerV2SchedulerIntentTemplate,
+    SourceIntentV2,
+    SourceOperationContractError,
+    SourceUsePlanV2,
+    require_current_claim_consumption_v2,
+    require_source_use_plan_v2,
+)
 from rquant.strict_json import (
     canonical_json_bytes,
     canonical_model_json_bytes,
@@ -44,6 +56,7 @@ from rquant.strict_json import (
 )
 
 _HASH_PATTERN = r"^[0-9a-f]{64}$"
+MAX_STRATEGY_SHARD_PAYLOAD_BYTES: Final[int] = 1_048_576
 _SPOOL_NAME = re.compile(
     r"(?:(?P<sequence>[0-9]{20})-)?"
     r"(?P<message_id>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
@@ -65,6 +78,8 @@ _ADMISSION_TEMP_NAME = re.compile(
     r"[0-9a-f]{4}-[0-9a-f]{12})-"
     r"[0-9a-f]{32}\.tmp"
 )
+_PUBLISH_RECEIPT_AUTHORITY_NAME = "receipt-authority-v2.json"
+_PUBLISH_RECEIPT_ENTRY_NAME = re.compile(r"^[0-9a-f]{64}\.json$")
 MAX_SHARD_HEARTBEAT_EXTENSION_SECONDS = 3_600
 SQLITE_SIGNED_INTEGER_MAX: Final[int] = (1 << 63) - 1
 LAB_SHARD_DURATION_MS_MIN: Final[float] = 1e-6
@@ -160,7 +175,37 @@ def _reject_constant(_: str) -> object:
     raise ValueError("payload must contain finite JSON values")
 
 
+def validate_strategy_shard_payload_utf8(raw: str | bytes, *, field: str) -> bytes:
+    """Accept exact text primitives and reject oversized input before parsing."""
+
+    if type(raw) is str:
+        try:
+            raw_bytes = raw.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ValueError(f"{field} rejected: reason=payload_utf8_invalid") from exc
+    elif type(raw) is bytes:
+        raw_bytes = raw
+        if len(raw_bytes) > MAX_STRATEGY_SHARD_PAYLOAD_BYTES:
+            raise ValueError(
+                f"{field} rejected: size_bytes={len(raw_bytes)} "
+                f"sha256={hashlib.sha256(raw_bytes).hexdigest()} reason=payload_too_large"
+            )
+        try:
+            raw_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"{field} rejected: reason=payload_utf8_invalid") from exc
+    else:
+        raise ValueError(f"{field} rejected: reason=payload_type_invalid")
+    if len(raw_bytes) > MAX_STRATEGY_SHARD_PAYLOAD_BYTES:
+        raise ValueError(
+            f"{field} rejected: size_bytes={len(raw_bytes)} "
+            f"sha256={hashlib.sha256(raw_bytes).hexdigest()} reason=payload_too_large"
+        )
+    return raw_bytes
+
+
 def _canonical_json_object(raw: str, *, field: str) -> str:
+    validate_strategy_shard_payload_utf8(raw, field=field)
     try:
         value = strict_json_loads(
             raw,
@@ -238,6 +283,160 @@ class LabShardDefinition(LabShardProtocolModel):
         return self
 
 
+class StrategyShardPayloadV1(LabShardProtocolModel):
+    """Legacy local-only payload; it can never authorize external source use."""
+
+    schema_version: Literal[1] = 1
+    network: Literal["none"] = "none"
+    adapter_id: str = Field(min_length=1, max_length=200)
+    adapter_version: str = Field(min_length=1, max_length=100)
+    payload_json: str = Field(min_length=2)
+
+    @model_validator(mode="after")
+    def validate_payload(self) -> StrategyShardPayloadV1:
+        object.__setattr__(
+            self,
+            "payload_json",
+            _canonical_json_object(self.payload_json, field="payload_json"),
+        )
+        return self
+
+
+class StrategyShardPayloadV2(LabShardProtocolModel):
+    """External-source payload; its source intent is closed and manifest-bound."""
+
+    schema_version: Literal[2] = 2
+    network: Literal["provider"] = "provider"
+    adapter_id: str = Field(min_length=1, max_length=200)
+    adapter_version: str = Field(min_length=1, max_length=100)
+    payload_json: str = Field(min_length=2)
+    source_intent: SourceIntentV2
+    source_contract_hash: str = Field(pattern=_HASH_PATTERN)
+    scheduler_intent_template: SourceBrokerV2SchedulerIntentTemplate | None = None
+    scheduler_intent_authorization: SchedulerIntentAuthorizationV1 | None = None
+
+    @classmethod
+    def from_source_intent(
+        cls,
+        *,
+        adapter_id: str,
+        adapter_version: str,
+        payload_json: str,
+        source_intent: SourceIntentV2,
+        scheduler_intent_template: SourceBrokerV2SchedulerIntentTemplate | None = None,
+        scheduler_intent_authorization: SchedulerIntentAuthorizationV1 | None = None,
+    ) -> StrategyShardPayloadV2:
+        return cls(
+            adapter_id=adapter_id,
+            adapter_version=adapter_version,
+            payload_json=payload_json,
+            source_intent=source_intent,
+            source_contract_hash=source_intent.source_contract_hash,
+            scheduler_intent_template=scheduler_intent_template,
+            scheduler_intent_authorization=scheduler_intent_authorization,
+        )
+
+    @model_validator(mode="after")
+    def validate_payload(self) -> StrategyShardPayloadV2:
+        source_manifest = self.source_intent.manifest
+        if (
+            self.adapter_id,
+            self.adapter_version,
+        ) != (
+            source_manifest.adapter_id,
+            source_manifest.adapter_version,
+        ):
+            raise ValueError("external payload adapter identity conflicts with source intent")
+        if self.source_contract_hash != self.source_intent.source_contract_hash:
+            raise ValueError("external payload source_contract_hash does not match source intent")
+        if (
+            self.scheduler_intent_template is not None
+            and self.scheduler_intent_template.source_intent != self.source_intent
+        ):
+            raise ValueError(
+                "external payload scheduler intent template conflicts with source intent"
+            )
+        if (
+            self.scheduler_intent_authorization is not None
+            and self.scheduler_intent_authorization.payload_commitment
+            != self.authorization_payload_commitment
+        ):
+            raise ValueError(
+                "external payload scheduler intent authorization conflicts with payload"
+            )
+        object.__setattr__(
+            self,
+            "payload_json",
+            _canonical_json_object(self.payload_json, field="payload_json"),
+        )
+        return self
+
+    @property
+    def authorization_payload_bytes(self) -> bytes:
+        return canonical_json_bytes(
+            self.model_dump(mode="json", exclude={"scheduler_intent_authorization"})
+        )
+
+    @property
+    def authorization_payload_commitment(self) -> str:
+        return hashlib.sha256(self.authorization_payload_bytes).hexdigest()
+
+    def with_scheduler_intent_authorization(
+        self,
+        authorization: SchedulerIntentAuthorizationV1,
+    ) -> StrategyShardPayloadV2:
+        return StrategyShardPayloadV2.model_validate(
+            self.model_dump(mode="python") | {"scheduler_intent_authorization": authorization}
+        )
+
+
+StrategyShardPayload = StrategyShardPayloadV1 | StrategyShardPayloadV2
+
+
+def parse_strategy_shard_payload(payload_json: str | bytes) -> StrategyShardPayload:
+    try:
+        payload = strict_json_loads(
+            validate_strategy_shard_payload_utf8(payload_json, field="payload_json")
+        )
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid strategy shard payload: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("strategy shard payload must encode a JSON object")
+    schema_version = payload.get("schema_version")
+    if type(schema_version) is not int:
+        raise ValueError("strategy shard payload schema_version must be an integer")
+    if schema_version == 1:
+        return StrategyShardPayloadV1.model_validate(payload)
+    if schema_version == 2:
+        return StrategyShardPayloadV2.model_validate_json(canonical_json_bytes(payload))
+    raise ValueError("unsupported strategy shard payload schema_version")
+
+
+def require_external_strategy_shard_payload(
+    payload: StrategyShardPayload,
+    *,
+    keyring: object,
+) -> StrategyShardPayloadV2:
+    if isinstance(payload, StrategyShardPayloadV1):
+        raise SourceOperationContractError("strategy shard payload v1 is permanently offline-only")
+    if not isinstance(payload, StrategyShardPayloadV2):
+        raise SourceOperationContractError(
+            "strategy shard payload must be a recognized v2 contract"
+        )
+    from rquant.adapter_manifest import VerifyOnlyEd25519Keyring
+
+    if not isinstance(keyring, VerifyOnlyEd25519Keyring):
+        raise SourceOperationContractError("strategy shard payload requires a verification keyring")
+    try:
+        validated = StrategyShardPayloadV2.model_validate(payload, strict=True)
+    except (TypeError, ValueError) as exc:
+        raise SourceOperationContractError(
+            f"strategy shard payload v2 contract is invalid: {exc}"
+        ) from exc
+    validated.source_intent.require_verified(keyring)
+    return validated
+
+
 class LabShardClaim(LabShardProtocolModel):
     schema_version: Literal[1] = 1
     job_id: UUID
@@ -277,9 +476,243 @@ class LabShardClaim(LabShardProtocolModel):
         return self.definition.plan_hash
 
 
+class LabShardClaimV2(LabShardProtocolModel):
+    """Current v2 claim, optionally carrying its authority-issued source plan."""
+
+    schema_version: Literal[2] = 2
+    job_id: UUID
+    spec_hash: str = Field(pattern=_HASH_PATTERN)
+    definition: LabShardDefinition
+    worker_id: str = Field(min_length=1)
+    claim_token: UUID
+    claim_generation: int = Field(strict=True, ge=1)
+    scheduler_fencing_token: int = Field(strict=True, ge=1)
+    claimed_at: datetime
+    lease_expires_at: datetime
+    source_use_plan: SourceUsePlanV2 | None = None
+    source_plan_hash: str | None = Field(default=None, pattern=_HASH_PATTERN)
+    manifest_hash: str = Field(pattern=_HASH_PATTERN)
+    adapter_code_hash: str = Field(pattern=_HASH_PATTERN)
+    payload_source_contract_hash: str = Field(pattern=_HASH_PATTERN)
+
+    @classmethod
+    def from_current_attempt(
+        cls,
+        *,
+        definition: LabShardDefinition,
+        attempt_binding: SourceAttemptBindingV2,
+        claimed_at: datetime,
+        lease_expires_at: datetime,
+    ) -> LabShardClaimV2:
+        if attempt_binding.spec_hash is None:
+            raise ValueError("lab source claim requires a spec_hash attempt binding")
+        validated_definition = LabShardDefinition.model_validate(definition, strict=True)
+        if attempt_binding.shard_id != validated_definition.shard_id:
+            raise ValueError("source attempt shard_id does not match shard definition")
+        payload = parse_strategy_shard_payload(validated_definition.payload_json)
+        if not isinstance(payload, StrategyShardPayloadV2):
+            raise ValueError("lab source claim v2 requires a v2 external payload")
+        return cls(
+            job_id=attempt_binding.job_id,
+            spec_hash=attempt_binding.spec_hash,
+            definition=validated_definition,
+            worker_id=attempt_binding.worker_id,
+            claim_token=attempt_binding.attempt_id,
+            claim_generation=attempt_binding.claim_generation,
+            scheduler_fencing_token=attempt_binding.scheduler_fencing_token,
+            claimed_at=claimed_at,
+            lease_expires_at=lease_expires_at,
+            manifest_hash=payload.source_intent.manifest_hash,
+            adapter_code_hash=payload.source_intent.manifest.adapter_code_hash,
+            payload_source_contract_hash=payload.source_contract_hash,
+        )
+
+    @model_validator(mode="after")
+    def validate_source_claim(self) -> LabShardClaimV2:
+        claimed_at = _utc(self.claimed_at, field="claimed_at")
+        lease_expires_at = _utc(self.lease_expires_at, field="lease_expires_at")
+        if lease_expires_at <= claimed_at:
+            raise ValueError("lease_expires_at must be after claimed_at")
+        definition = LabShardDefinition.model_validate(self.definition, strict=True)
+        payload = parse_strategy_shard_payload(definition.payload_json)
+        if not isinstance(payload, StrategyShardPayloadV2):
+            raise ValueError("lab source claim v2 requires a v2 external payload")
+        manifest = payload.source_intent.manifest
+        if (
+            definition.adapter_id,
+            definition.adapter_version,
+        ) != (
+            payload.adapter_id,
+            payload.adapter_version,
+        ) or (
+            payload.adapter_id,
+            payload.adapter_version,
+        ) != (
+            manifest.adapter_id,
+            manifest.adapter_version,
+        ):
+            raise ValueError("claim adapter identity conflicts with payload or signed manifest")
+        if self.adapter_code_hash != manifest.adapter_code_hash:
+            raise ValueError("claim adapter_code_hash does not match signed manifest")
+        if self.manifest_hash != payload.source_intent.manifest_hash:
+            raise ValueError("claim manifest_hash does not match signed source intent")
+        if self.payload_source_contract_hash != payload.source_contract_hash:
+            raise ValueError("claim payload source_contract_hash does not match payload")
+        expected_binding = SourceAttemptBindingV2(
+            job_id=self.job_id,
+            spec_hash=self.spec_hash,
+            shard_id=definition.shard_id,
+            attempt_id=self.claim_token,
+            claim_generation=self.claim_generation,
+            scheduler_fencing_token=self.scheduler_fencing_token,
+            worker_id=self.worker_id,
+        )
+        if self.source_use_plan is None:
+            if self.source_plan_hash is not None:
+                raise ValueError("unbound source claim cannot declare source_plan_hash")
+        else:
+            plan = SourceUsePlanV2.model_validate(self.source_use_plan, strict=True)
+            if self.source_plan_hash != plan.plan_hash:
+                raise ValueError("source_plan_hash does not match source use plan")
+            if plan.attempt_binding != expected_binding:
+                raise ValueError("source use plan attempt binding does not match claim")
+            if plan.lease_expires_at != lease_expires_at:
+                raise ValueError("source use plan lease_expires_at does not match claim")
+            expected_plan_identity = (
+                definition.adapter_id,
+                definition.adapter_version,
+                self.adapter_code_hash,
+                definition.payload_hash,
+                self.payload_source_contract_hash,
+                self.manifest_hash,
+                payload.source_intent.resource_request_hash,
+            )
+            observed_plan_identity = (
+                plan.adapter_id,
+                plan.adapter_version,
+                plan.adapter_code_hash,
+                plan.payload_hash,
+                plan.payload_source_contract_hash,
+                plan.manifest_hash,
+                plan.resource_request_hash,
+            )
+            if observed_plan_identity != expected_plan_identity:
+                raise ValueError(
+                    "source use plan identity conflicts with claim definition or payload"
+                )
+        object.__setattr__(self, "claimed_at", claimed_at)
+        object.__setattr__(self, "lease_expires_at", lease_expires_at)
+        object.__setattr__(self, "definition", definition)
+        return self
+
+    @property
+    def shard_id(self) -> UUID:
+        return self.definition.shard_id
+
+    @property
+    def shard_index(self) -> int:
+        return self.definition.shard_index
+
+    @property
+    def payload_hash(self) -> str:
+        return self.definition.payload_hash
+
+    @property
+    def plan_hash(self) -> str:
+        return self.definition.plan_hash
+
+    @property
+    def attempt_binding(self) -> SourceAttemptBindingV2:
+        return SourceAttemptBindingV2(
+            job_id=self.job_id,
+            spec_hash=self.spec_hash,
+            shard_id=self.definition.shard_id,
+            attempt_id=self.claim_token,
+            claim_generation=self.claim_generation,
+            scheduler_fencing_token=self.scheduler_fencing_token,
+            worker_id=self.worker_id,
+        )
+
+    @property
+    def strategy_payload(self) -> StrategyShardPayloadV2:
+        payload = parse_strategy_shard_payload(self.definition.payload_json)
+        if not isinstance(payload, StrategyShardPayloadV2):
+            raise ValueError("lab source claim v2 requires a v2 external payload")
+        return payload
+
+    def bind_source_use_plan(self, plan: SourceUsePlanV2) -> LabShardClaimV2:
+        if self.source_use_plan is not None:
+            raise ValueError("source claim is already bound to a source use plan")
+        validated_plan = SourceUsePlanV2.model_validate(plan, strict=True)
+        return LabShardClaimV2.model_validate(
+            {
+                **self.model_dump(mode="python"),
+                "source_use_plan": validated_plan,
+                "source_plan_hash": validated_plan.plan_hash,
+            },
+            strict=True,
+        )
+
+
+LabSpoolClaim = LabShardClaim | LabShardClaimV2
+
+
+def _validate_spool_claim(value: LabSpoolClaim) -> LabSpoolClaim:
+    if isinstance(value, LabShardClaimV2):
+        return LabShardClaimV2.model_validate(value, strict=True)
+    return LabShardClaim.model_validate(value, strict=True)
+
+
+def _parse_spool_claim(payload: bytes) -> LabSpoolClaim:
+    decoded = strict_json_loads(payload)
+    if not isinstance(decoded, dict):
+        raise ValueError("spool claim must encode a JSON object")
+    schema_version = decoded.get("schema_version")
+    if schema_version == 1:
+        return strict_model_validate_canonical_json(LabShardClaim, payload)
+    if schema_version == 2:
+        return strict_model_validate_canonical_json(LabShardClaimV2, payload)
+    raise ValueError("unsupported spool claim schema_version")
+
+
+def require_source_bound_claim_v2(
+    claim: LabShardClaimV2,
+    *,
+    keyring: object,
+    current_claim_authority: CurrentClaimAuthorityProtocol,
+    audience: str,
+    now: datetime,
+) -> LabShardClaimV2:
+    from rquant.adapter_manifest import VerifyOnlyEd25519Keyring
+
+    if not isinstance(keyring, VerifyOnlyEd25519Keyring):
+        raise SourceOperationContractError("source claim requires a verification keyring")
+    try:
+        validated_claim = LabShardClaimV2.model_validate(claim, strict=True)
+    except (TypeError, ValueError) as exc:
+        raise SourceOperationContractError(f"source claim contract is invalid: {exc}") from exc
+    if validated_claim.source_use_plan is None:
+        raise SourceOperationContractError("source claim is not bound to a source use plan")
+    plan = require_source_use_plan_v2(
+        validated_claim.source_use_plan,
+        keyring=keyring,
+        audience=audience,
+        now=now,
+    )
+    if plan.single_use_authority_id != current_claim_authority.authority_id:
+        raise SourceOperationContractError("source plan current-claim authority does not match")
+    require_current_claim_consumption_v2(
+        current_claim_authority=current_claim_authority,
+        plan=plan,
+        keyring=keyring,
+        now=now,
+    )
+    return validated_claim
+
+
 class LabClaimHighWater(LabShardProtocolModel):
     schema_version: Literal[1] = 1
-    claim: LabShardClaim
+    claim: LabSpoolClaim
     content_hash: str = ""
 
     @model_validator(mode="after")
@@ -293,7 +726,7 @@ class LabClaimHighWater(LabShardProtocolModel):
 
 class LabRetiredClaimAuthority(LabShardProtocolModel):
     schema_version: Literal[1] = 1
-    claim: LabShardClaim
+    claim: LabSpoolClaim
     outcome: Literal["accepted", "revoked"]
     reason: str = Field(min_length=1)
     content_hash: str = ""
@@ -335,7 +768,7 @@ class LabClaimDeliveryReceipt(LabShardProtocolModel):
 
     schema_version: Literal[1] = 1
     status: Literal["consumed", "revoked"] = "consumed"
-    claim: LabShardClaim
+    claim: LabSpoolClaim
     reason: str | None = Field(default=None, min_length=1)
     content_hash: str = ""
 
@@ -354,7 +787,7 @@ class LabClaimDeliveryReceipt(LabShardProtocolModel):
 
 class LabClaimRevocation(LabShardProtocolModel):
     schema_version: Literal[1] = 1
-    claim: LabShardClaim
+    claim: LabSpoolClaim
     reason: str = Field(min_length=1)
     content_hash: str = ""
 
@@ -375,7 +808,7 @@ class LabClaimRevocation(LabShardProtocolModel):
 
 class LabExecutionAdmission(LabShardProtocolModel):
     schema_version: Literal[1] = 1
-    claim: LabShardClaim
+    claim: LabSpoolClaim
     delivery_content_hash: str = Field(pattern=_HASH_PATTERN)
     content_hash: str = ""
 
@@ -657,7 +1090,7 @@ class LabReportReceipt(LabShardProtocolModel):
 
 class LabClaimSpoolEntry(LabShardProtocolModel):
     path: Path
-    claim: LabShardClaim
+    claim: LabSpoolClaim
     device: int = Field(ge=0)
     inode: int = Field(ge=1)
 
@@ -704,7 +1137,7 @@ class LabPendingClaimCursor(LabShardProtocolModel):
 
 
 class LabHotClaimBatch(LabShardProtocolModel):
-    claims: tuple[LabShardClaim, ...]
+    claims: tuple[LabSpoolClaim, ...]
     next_cursor: LabPendingClaimCursor
     scanned_namespaces: tuple[LabHotClaimNamespace, ...] = ()
     inspected: int = Field(ge=0)
@@ -792,8 +1225,9 @@ class LabClaimSpool(_TypedSpoolBase):
         self,
         root: Path,
         *,
-        claim_advance_hook: Callable[[LabShardClaim], None] | None = None,
+        claim_advance_hook: Callable[[LabSpoolClaim], None] | None = None,
         mutation_guard: Callable[[], object] | None = None,
+        publish_receipt_publisher: SourceBrokerV2AuthorityRef | None = None,
     ) -> None:
         super().__init__(root, mutation_guard=mutation_guard)
         self.current_dir = self.root / "current"
@@ -803,6 +1237,11 @@ class LabClaimSpool(_TypedSpoolBase):
         self.pending_cursor_path = self.root / ".hot-pending-cursor-v1.json"
         self.admitted_dir = self.root / "admitted"
         self.admission_tmp_dir = self.admitted_dir / ".tmp"
+        self.publish_receipt_dir = self.root / "publish-receipts-v2"
+        self.publish_receipt_authority_path = (
+            self.publish_receipt_dir / _PUBLISH_RECEIPT_AUTHORITY_NAME
+        )
+        self._publish_receipt_publisher = publish_receipt_publisher
         with self._exclusive_lock():
             self._ensure_directory(self.current_dir)
             self._ensure_directory(self.retired_dir)
@@ -810,16 +1249,17 @@ class LabClaimSpool(_TypedSpoolBase):
             self._ensure_directory(self.archived_revoked_dir)
             self._ensure_directory(self.admitted_dir)
             self._ensure_directory(self.admission_tmp_dir, mode=0o700)
+            self._ensure_directory(self.publish_receipt_dir)
         self._claim_advance_hook = claim_advance_hook
 
     def set_claim_advance_hook(
         self,
-        hook: Callable[[LabShardClaim], None],
+        hook: Callable[[LabSpoolClaim], None],
     ) -> None:
         self._claim_advance_hook = hook
 
     @staticmethod
-    def _claim_order(claim: LabShardClaim) -> tuple[int, int, datetime, int]:
+    def _claim_order(claim: LabSpoolClaim) -> tuple[int, int, datetime, int]:
         return (
             claim.claim_generation,
             claim.scheduler_fencing_token,
@@ -1114,7 +1554,7 @@ class LabClaimSpool(_TypedSpoolBase):
     def _before_admission_temporary_unlink(_temporary: Path) -> None:
         """Fault-injection boundary before dir-fd-bound admission cleanup."""
 
-    def _revocation_locked(self, claim: LabShardClaim) -> LabRevokedClaim | None:
+    def _revocation_locked(self, claim: LabSpoolClaim) -> LabRevokedClaim | None:
         path = self._revoked_path(claim.claim_token)
         if self._managed_entry_exists(path, path.parent):
             revoked = self._load_revocation_locked(claim.claim_token)
@@ -1149,7 +1589,7 @@ class LabClaimSpool(_TypedSpoolBase):
             ),
         )
 
-    def _unlink_current_locked(self, claim: LabShardClaim) -> None:
+    def _unlink_current_locked(self, claim: LabSpoolClaim) -> None:
         path = self._current_path(claim.job_id, claim.shard_id)
         if not self._managed_entry_exists(path, path.parent):
             return
@@ -1246,7 +1686,7 @@ class LabClaimSpool(_TypedSpoolBase):
             raise RequestContentConflictError("retired claim authority changed during publish")
         return published
 
-    def _retired_blocks_locked(self, claim: LabShardClaim) -> bool:
+    def _retired_blocks_locked(self, claim: LabSpoolClaim) -> bool:
         path = self._retired_path(claim.job_id, claim.shard_id)
         if not self._managed_entry_exists(path, path.parent):
             return False
@@ -1271,9 +1711,9 @@ class LabClaimSpool(_TypedSpoolBase):
         with self._exclusive_lock():
             return self._load_retired_locked(job_id, shard_id)
 
-    def current_claims(self) -> tuple[LabShardClaim, ...]:
+    def current_claims(self) -> tuple[LabSpoolClaim, ...]:
         with self._exclusive_lock():
-            claims: list[LabShardClaim] = []
+            claims: list[LabSpoolClaim] = []
             for path in sorted(self._managed_paths(self.current_dir, "*.json")):
                 match = _CURRENT_CLAIM_NAME.fullmatch(path.name)
                 if match is None:
@@ -1295,8 +1735,8 @@ class LabClaimSpool(_TypedSpoolBase):
             canonical_model_json_bytes(marker),
         )
 
-    def is_current(self, claim: LabShardClaim) -> bool:
-        validated = LabShardClaim.model_validate(claim)
+    def is_current(self, claim: LabSpoolClaim) -> bool:
+        validated = _validate_spool_claim(claim)
         with self._exclusive_lock():
             if self._revocation_locked(validated) is not None:
                 return False
@@ -1310,8 +1750,8 @@ class LabClaimSpool(_TypedSpoolBase):
             marker = self._load_current_locked(validated.job_id, validated.shard_id)
             return marker.claim == validated
 
-    def is_revoked(self, claim: LabShardClaim) -> bool:
-        validated = LabShardClaim.model_validate(claim)
+    def is_revoked(self, claim: LabSpoolClaim) -> bool:
+        validated = _validate_spool_claim(claim)
         with self._exclusive_lock():
             return self._revocation_locked(validated) is not None
 
@@ -1339,9 +1779,9 @@ class LabClaimSpool(_TypedSpoolBase):
             self._cleanup_admission_temporaries_locked()
             return self._load_admission_locked(claim_token)
 
-    def admit_execution(self, claim: LabShardClaim) -> LabAdmittedExecution:
+    def admit_execution(self, claim: LabSpoolClaim) -> LabAdmittedExecution:
         """Persist the single execution point-of-admission under the claim lock."""
-        validated = LabShardClaim.model_validate(claim)
+        validated = _validate_spool_claim(claim)
         with self._exclusive_lock():
             self._cleanup_admission_temporaries_locked()
             if self._revocation_locked(validated) is not None:
@@ -1390,9 +1830,9 @@ class LabClaimSpool(_TypedSpoolBase):
                 return existing
             return self._publish_admission_locked(admission)
 
-    def is_admitted(self, claim: LabShardClaim) -> bool:
+    def is_admitted(self, claim: LabSpoolClaim) -> bool:
         """Return whether immutable execution-admission history exists for the claim."""
-        validated = LabShardClaim.model_validate(claim)
+        validated = _validate_spool_claim(claim)
         with self._exclusive_lock():
             self._cleanup_admission_temporaries_locked()
             admission_path = self._admission_path(validated.claim_token)
@@ -1407,9 +1847,9 @@ class LabClaimSpool(_TypedSpoolBase):
 
     def publish(
         self,
-        claim: LabShardClaim,
+        claim: LabSpoolClaim,
     ) -> LabClaimSpoolEntry | LabConsumedClaim | LabRevokedClaim:
-        validated = LabShardClaim.model_validate(claim)
+        validated = _validate_spool_claim(claim)
         payload = canonical_model_json_bytes(validated)
         with self._exclusive_lock():
             revoked = self._revocation_locked(validated)
@@ -1465,9 +1905,160 @@ class LabClaimSpool(_TypedSpoolBase):
                 self._publish_current_locked(LabClaimHighWater(claim=validated))
             return entry
 
-    def revoke(self, claim: LabShardClaim, *, reason: str) -> LabRevokedClaim:
+    def _v2_published_entry_identity(
+        self,
+        entry: LabClaimSpoolEntry,
+        final_claim: LabShardClaimV2,
+    ) -> tuple[str, str, str]:
+        """Return the stable locator, entry id, and digest for a current final claim."""
+
+        validated_claim = LabShardClaimV2.model_validate(final_claim, strict=True)
+        if validated_claim.source_use_plan is None:
+            raise ValueError("v2 spool receipt requires a final bound claim")
+        published = self.load(entry.path)
+        if published != entry or published.claim != validated_claim:
+            raise ValueError("spool entry conflicts with final claim")
+        current = self._load_current_locked(validated_claim.job_id, validated_claim.shard_id)
+        if current.claim != validated_claim:
+            raise ValueError("spool entry does not hold the current final claim")
+        try:
+            locator = published.path.relative_to(self.root).as_posix()
+        except ValueError as exc:
+            raise ValueError("spool entry is outside the spool root") from exc
+        if not locator.startswith("pending/") or "/../" in f"/{locator}":
+            raise ValueError("spool entry locator is not a pending relative path")
+        content_digest = hashlib.sha256(canonical_model_json_bytes(validated_claim)).hexdigest()
+        entry_id = hashlib.sha256(
+            canonical_json_bytes(
+                {
+                    "content_digest": content_digest,
+                    "contract": "rquant-lab-claim-spool-entry-id/v2",
+                    "locator": locator,
+                }
+            )
+        ).hexdigest()
+        return locator, entry_id, content_digest
+
+    def v2_published_entry_identity(
+        self,
+        *,
+        entry: LabClaimSpoolEntry,
+        final_claim: LabShardClaimV2,
+    ) -> tuple[str, str, str]:
+        """Resolve the stable identity used by the v2 receipt factory."""
+
+        with self._exclusive_lock():
+            return self._v2_published_entry_identity(entry, final_claim)
+
+    def _persist_v2_publish_receipt_bytes(
+        self,
+        *,
+        entry: LabClaimSpoolEntry,
+        final_claim: LabShardClaimV2,
+        candidate_bytes: bytes,
+    ) -> bytes:
+        """Atomically retain the first receipt for an immutable final-claim entry."""
+
+        with self._exclusive_lock():
+            _locator, entry_id, _content_digest = self._v2_published_entry_identity(
+                entry,
+                final_claim,
+            )
+            target = self.publish_receipt_dir / f"{entry_id}.json"
+            if self._managed_entry_exists(target, self.publish_receipt_dir):
+                _candidate, stored, _stat = self._read_regular_child(
+                    target,
+                    self.publish_receipt_dir,
+                )
+                return stored
+            if not self._publish_no_clobber(target, candidate_bytes):
+                _candidate, stored, _stat = self._read_regular_child(
+                    target,
+                    self.publish_receipt_dir,
+                )
+                return stored
+            _candidate, stored, _stat = self._read_regular_child(target, self.publish_receipt_dir)
+            if stored != candidate_bytes:
+                raise InvalidCommandEnvelopeError("v2 publish receipt sidecar readback mismatch")
+            return stored
+
+    def v2_publish_receipt_authority_bytes(self) -> bytes:
+        """Return the stable, non-path authority descriptor for this spool root."""
+
+        with self._exclusive_lock():
+            target = self.publish_receipt_authority_path
+            if not self._managed_entry_exists(target, self.publish_receipt_dir):
+                if self._publish_receipt_publisher is None:
+                    raise InvalidCommandEnvelopeError(
+                        "v2 publish receipt authority publisher is not configured"
+                    )
+                candidate = canonical_json_bytes(
+                    {
+                        "contract": "rquant-lab-claim-spool-receipt-authority/v2",
+                        "publisher_authority": self._publish_receipt_publisher.model_dump(
+                            mode="json"
+                        ),
+                        "root_id": uuid4().hex,
+                        "schema_version": 2,
+                        "sidecar_protocol": "rquant-lab-claim-spool-publish-receipt/v2",
+                    }
+                )
+                if not self._publish_no_clobber(target, candidate):
+                    pass
+            _candidate, stored, _stat = self._read_regular_child(
+                target,
+                self.publish_receipt_dir,
+            )
+            try:
+                parsed = strict_json_loads(stored)
+            except Exception as exc:
+                raise InvalidCommandEnvelopeError(
+                    "v2 publish receipt authority descriptor is invalid"
+                ) from exc
+            if (
+                not isinstance(parsed, dict)
+                or set(parsed)
+                != {
+                    "contract",
+                    "publisher_authority",
+                    "root_id",
+                    "schema_version",
+                    "sidecar_protocol",
+                }
+                or parsed.get("contract") != "rquant-lab-claim-spool-receipt-authority/v2"
+                or parsed.get("schema_version") != 2
+                or parsed.get("sidecar_protocol") != "rquant-lab-claim-spool-publish-receipt/v2"
+                or not isinstance(parsed.get("root_id"), str)
+                or re.fullmatch(r"[0-9a-f]{32}", parsed["root_id"]) is None
+                or parsed.get("publisher_authority")
+                != (
+                    None
+                    if self._publish_receipt_publisher is None
+                    else self._publish_receipt_publisher.model_dump(mode="json")
+                )
+                or canonical_json_bytes(parsed) != stored
+            ):
+                raise InvalidCommandEnvelopeError(
+                    "v2 publish receipt authority descriptor is invalid"
+                )
+            return stored
+
+    def load_v2_publish_receipt_sidecar(self, entry_id: str) -> bytes:
+        """Read one immutable v2 receipt sidecar through the managed no-follow path."""
+
+        if _PUBLISH_RECEIPT_ENTRY_NAME.fullmatch(f"{entry_id}.json") is None:
+            raise ValueError("v2 publish receipt entry id is invalid")
+        with self._exclusive_lock():
+            target = self.publish_receipt_dir / f"{entry_id}.json"
+            _candidate, stored, _stat = self._read_regular_child(
+                target,
+                self.publish_receipt_dir,
+            )
+            return stored
+
+    def revoke(self, claim: LabSpoolClaim, *, reason: str) -> LabRevokedClaim:
         """Durably fence an exact delivery before removing its spool visibility."""
-        validated = LabShardClaim.model_validate(claim)
+        validated = _validate_spool_claim(claim)
         normalized_reason = " ".join(reason.split())
         if not normalized_reason:
             raise ValueError("revoke reason must not be empty")
@@ -1519,7 +2110,7 @@ class LabClaimSpool(_TypedSpoolBase):
                 )
             return revoked
 
-    def _archive_revocation_locked(self, claim: LabShardClaim) -> None:
+    def _archive_revocation_locked(self, claim: LabSpoolClaim) -> None:
         source = self._revoked_path(claim.claim_token)
         if not self._managed_entry_exists(source, source.parent):
             archived = self._load_archived_revocation_locked(claim.claim_token)
@@ -1553,13 +2144,13 @@ class LabClaimSpool(_TypedSpoolBase):
 
     def retire(
         self,
-        claim: LabShardClaim,
+        claim: LabSpoolClaim,
         *,
         outcome: Literal["accepted", "revoked"],
         reason: str,
     ) -> LabRetiredClaimAuthority:
         """Move exact terminal delivery authority out of the scheduler hot set."""
-        validated = LabShardClaim.model_validate(claim)
+        validated = _validate_spool_claim(claim)
         normalized_reason = " ".join(reason.split())
         if not normalized_reason:
             raise ValueError("retire reason must not be empty")
@@ -1639,7 +2230,7 @@ class LabClaimSpool(_TypedSpoolBase):
                 namespace: self._hot_namespace_paths(directories[namespace])
                 for namespace in namespace_order
             }
-            claims: dict[UUID, LabShardClaim] = {}
+            claims: dict[UUID, LabSpoolClaim] = {}
             pending_paths, next_cursor = self._pending_slice(
                 paths_by_namespace["pending"],
                 cursor=durable_cursor,
@@ -1687,12 +2278,12 @@ class LabClaimSpool(_TypedSpoolBase):
                 inspected=inspected,
             )
 
-    def delivery_claims(self) -> tuple[LabShardClaim, ...]:
+    def delivery_claims(self) -> tuple[LabSpoolClaim, ...]:
         """Return every non-revoked claim requiring SQLite reconciliation."""
         with self._exclusive_lock():
-            claims: dict[UUID, LabShardClaim] = {}
+            claims: dict[UUID, LabSpoolClaim] = {}
 
-            def remember(claim: LabShardClaim) -> None:
+            def remember(claim: LabSpoolClaim) -> None:
                 existing = claims.get(claim.claim_token)
                 if existing is not None and existing != claim:
                     raise RequestContentConflictError(
@@ -1738,7 +2329,7 @@ class LabClaimSpool(_TypedSpoolBase):
 
     def reconcile_claims(
         self,
-        claims: tuple[LabShardClaim, ...],
+        claims: tuple[LabSpoolClaim, ...],
     ) -> tuple[LabClaimReconcileResult, ...]:
         """Run claim hooks for an authority-selected snapshot without directory scans."""
         results: list[LabClaimReconcileResult] = []
@@ -1780,7 +2371,7 @@ class LabClaimSpool(_TypedSpoolBase):
         )
         try:
             _sequence, filename_token = self._message_name_parts(candidate.name)
-            claim = strict_model_validate_canonical_json(LabShardClaim, payload)
+            claim = _parse_spool_claim(payload)
         except Exception as exc:
             raise InvalidCommandEnvelopeError(
                 f"invalid shard claim {candidate.name}: {exc}",
@@ -1801,7 +2392,7 @@ class LabClaimSpool(_TypedSpoolBase):
     def pending(self, *, limit: int | None = None) -> tuple[LabClaimSpoolEntry, ...]:
         return tuple(self.load(path) for path in self.pending_paths(limit=limit))
 
-    def consume(self, entry: LabClaimSpoolEntry) -> LabShardClaim:
+    def consume(self, entry: LabClaimSpoolEntry) -> LabSpoolClaim:
         with self._exclusive_lock():
             current = self.load(entry.path)
             if (current.device, current.inode) != (entry.device, entry.inode):

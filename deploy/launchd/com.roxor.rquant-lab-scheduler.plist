@@ -49,7 +49,11 @@
     <dict>
         <key>PATH</key>
         <string>/usr/local/bin:/usr/bin:/bin</string>
+        <key>APP_ENV</key>
+        <string>prod</string>
         <key>PYTHONDONTWRITEBYTECODE</key>
+        <string>1</string>
+        <key>RQUANT_DISABLE_DOTENV</key>
         <string>1</string>
         <key>RQUANT_TRUSTED_GIT_PATH</key>
         <string>__RQUANT_TRUSTED_GIT__</string>

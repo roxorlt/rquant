@@ -5,18 +5,22 @@ from __future__ import annotations
 import base64
 import errno
 import hashlib
+import multiprocessing
 import os
 import re
 import signal
 import stat
 import threading
 import time
-from collections.abc import Callable, Iterator
-from contextlib import AbstractContextManager, contextmanager, suppress
+from collections.abc import Callable
+from contextlib import AbstractContextManager, suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from multiprocessing.connection import Client, Connection, Listener
+from multiprocessing.process import BaseProcess
 from pathlib import Path
 from types import FrameType
-from typing import Literal
+from typing import Literal, TypeVar
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import pandas as pd
@@ -27,9 +31,20 @@ from rquant.canonical_json_stream import (
     write_legacy_pandas_table_json,
 )
 from rquant.data_metadata import DatasetSnapshotBinding
+from rquant.lab_claim_finalizer import LabClaimFinalizerError, LabClaimPublicationWorkerVerifier
+from rquant.lab_claim_publication import V2_UNASSIGNED_WORKER_ID
 from rquant.lab_daemon import LabDaemonConfigurationError
 from rquant.lab_job_protocol import InvalidCommandEnvelopeError
 from rquant.lab_logging import _safe_structured_log
+from rquant.lab_resource_authority_adapter import (
+    LAB_RESOURCE_AUTHORITY_REGISTRY_HASH,
+    LAB_RESOURCE_AUTHORITY_REGISTRY_ID,
+    LAB_RESOURCE_AUTHORITY_REGISTRY_VERSION,
+    LabResourceAuthorityReservationAdapter,
+    ResourceAuthorityAdapterConfig,
+    ResourceAuthorityJournalClient,
+    parse_resource_authority_adapter_config,
+)
 from rquant.lab_result_digest import (
     CURRENT_CONTENT_DIGEST_ALGORITHM,
     CURRENT_RESULT_MANIFEST_SCHEMA_VERSION,
@@ -39,11 +54,13 @@ from rquant.lab_shard_protocol import (
     LabClaimNotConsumedError,
     LabClaimRevokedError,
     LabClaimSpool,
+    LabClaimSpoolEntry,
     LabClaimSupersededError,
     LabReportReceipt,
     LabReportSpool,
     LabReportSpoolEntry,
     LabShardClaim,
+    LabShardClaimV2,
     LabShardFailed,
     LabShardHeartbeat,
     LabShardSucceeded,
@@ -51,13 +68,49 @@ from rquant.lab_shard_protocol import (
     LabWorkerReport,
     LabWorkerStopped,
 )
-from rquant.research_gate import ResearchGateRequest, open_gated_research_store
+from rquant.research_gate import open_gated_research_store
 from rquant.research_run_spec import ResearchRunSpec
 from rquant.research_snapshot import ResearchExecutionSession
+from rquant.resource_admission import (
+    MICROSECONDS_PER_SECOND,
+    AdmissionDecision,
+    AdmissionOutcome,
+    AdmissionPolicy,
+    AdmissionRequest,
+    ResourceReservationIdentity,
+    ResourceReservationLease,
+    ResourceSnapshot,
+    SourceQuotaLease,
+    TradingSession,
+    derive_lab_admission_request,
+    evaluate_admission,
+    seconds_to_microseconds,
+    timedelta_microseconds,
+)
+from rquant.runtime_market_session import MarketCalendarAuthority
+from rquant.runtime_resource_admission import (
+    LocalResourceSnapshotProvider,
+    PersistentResourceReservationStore,
+    RuntimeHealthAuthorityLiveSloProbeConfig,
+    RuntimeHealthAuthorityWatermark,
+    RuntimeTradeCalendarSessionResolver,
+    SystemResourceProbe,
+)
+from rquant.runtime_resource_admission import (
+    StaticAdmissionPolicyProvider as RuntimeStaticAdmissionPolicyProvider,
+)
+from rquant.runtime_resource_admission import (
+    _system_clock as _runtime_resource_system_clock,
+)
+from rquant.source_operation_contracts import SourceOperationContractError
 from rquant.strategy_job_adapters import (
+    MAX_RESULT_WIRE_BYTES,
     LabShardExecutionResult,
+    LabShardExecutionWireResult,
     LabShardMetric,
     StrategyJobAdapterRegistry,
+    StrategyShardPayload,
+    ValidatedStrategyShard,
     default_strategy_job_adapter_registry,
 )
 from rquant.strict_json import (
@@ -93,10 +146,74 @@ _GARBAGE_RECOVERY_QUEUE_NAME = re.compile(r"(?P<sequence>[0-9]{20})\.json")
 _QUEUE_MIGRATION_CHAIN_GENESIS = hashlib.sha256(
     b"rquant:lab-quarantine-recovery-migration-chain:v3"
 ).hexdigest()
+_LIVE_TRADING_SESSIONS = frozenset(
+    {
+        TradingSession.PRE_MARKET,
+        TradingSession.MORNING,
+        TradingSession.LUNCH,
+        TradingSession.AFTERNOON,
+    }
+)
+_CHILD_TERMINATE_GRACE_MICROSECONDS = 50_000
+_CHILD_OUTCOME_EXIT_GRACE_MICROSECONDS = 250_000
+_ISOLATION_READY_TIMEOUT_MICROSECONDS = 2_000_000
+_PROCESS_CLEANUP_RETRIES = 3
+_RESOURCE_RESERVATION_LOCK_WAIT_MAX_MICROSECONDS = 50_000
+_RESOURCE_AUTHORITY_POLL_MICROSECONDS = 10_000
+_MAX_CONTROL_WIRE_BYTES = 1024 * 1024
+_MAX_SHARD_RESULT_WIRE_BYTES = MAX_RESULT_WIRE_BYTES
+_AUTHORITY_SPAWN_ALLOWANCE_MICROSECONDS = 750_000
+_PRESTART_AUTHORITY_CLEANUP_RESERVE_MICROSECONDS = 250_000
+_AUTHORITY_CHILD_CLEANUP_BUDGET_MICROSECONDS = 250_000
+_BUILTIN_SHARD_REGISTRY_ID = "rquant.lab-shard.builtin"
+_BUILTIN_SHARD_REGISTRY_VERSION = 1
+_BUILTIN_SHARD_REGISTRY_HASH = hashlib.sha256(b"rquant:lab-shard:builtin:v1").hexdigest()
+_BUILTIN_AUTHORITY_REGISTRY_ID = "rquant.lab-authority.builtin"
+_BUILTIN_AUTHORITY_REGISTRY_VERSION = 1
+_BUILTIN_AUTHORITY_REGISTRY_HASH = hashlib.sha256(b"rquant:lab-authority:builtin:v1").hexdigest()
+_TEST_AUTHORITY_REGISTRY_ID = "rquant.lab-authority.test-fixture"
+_TEST_AUTHORITY_REGISTRY_VERSION = 1
+_TEST_AUTHORITY_REGISTRY_HASH = hashlib.sha256(b"rquant:lab-authority:test-fixture:v1").hexdigest()
+_TEST_SHARD_REGISTRY_ID = "rquant.lab-shard.test-fixture"
+_TEST_SHARD_REGISTRY_VERSION = 1
+_TEST_SHARD_REGISTRY_HASH = hashlib.sha256(b"rquant:lab-shard:test-fixture:v1").hexdigest()
+
+
+def _microseconds_to_seconds(value: int) -> float:
+    return max(0, value) / MICROSECONDS_PER_SECOND
+
+
+def _positive_duration_microseconds(value: object, *, label: str) -> int:
+    microseconds = seconds_to_microseconds(value, label=label)
+    if microseconds <= 0:
+        raise ValueError(f"{label} must be positive")
+    return microseconds
+
+
+def _monotonic_microseconds() -> int:
+    return time.monotonic_ns() // 1_000
+
+
+def _canonical_monotonic_clock(
+    clock: Callable[[], float],
+    *,
+    label: str,
+) -> Callable[[], int]:
+    if clock is time.monotonic:
+        return _monotonic_microseconds
+
+    def read_microseconds() -> int:
+        return seconds_to_microseconds(clock(), label=label)
+
+    return read_microseconds
 
 
 def _system_clock() -> datetime:
     return datetime.now(UTC)
+
+
+def _start_isolated_session() -> None:
+    os.setsid()
 
 
 def _utc(value: datetime) -> datetime:
@@ -111,6 +228,18 @@ def _sha256_bytes(payload: bytes) -> str:
 
 def _canonical_json(value: object) -> str:
     return canonical_json_bytes(value).decode("utf-8")
+
+
+def _bounded_exception_message(error: BaseException) -> str:
+    if isinstance(error, BaseExceptionGroup):
+        details = "; ".join(
+            f"{type(nested).__name__}: {_bounded_exception_message(nested)}"
+            for nested in error.exceptions
+        )
+        message = f"{error.message}: {details}"
+    else:
+        message = " ".join(str(error).split()) or type(error).__name__
+    return message[:400]
 
 
 def _file_sha256(path: Path) -> str:
@@ -157,6 +286,236 @@ class LabWorkerModel(BaseModel):
     )
 
 
+class LabWireModel(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        revalidate_instances="always",
+        str_strip_whitespace=True,
+        strict=True,
+    )
+
+
+class LabClosedRegistryBinding(LabWireModel):
+    registry_id: str = Field(pattern=r"^[a-z0-9][a-z0-9._-]{2,127}$")
+    registry_version: int = Field(ge=1, le=1_000_000)
+    registry_hash: str = Field(pattern=_HASH_PATTERN)
+    configuration_json: str
+
+    @model_validator(mode="after")
+    def validate_configuration(self) -> LabClosedRegistryBinding:
+        strict_canonical_json_loads(self.configuration_json)
+        return self
+
+
+class LabShardRuntimeManifest(LabWireModel):
+    schema_version: Literal[1] = 1
+    registry: LabClosedRegistryBinding
+
+
+class LabResourceAuthorityManifest(LabWireModel):
+    schema_version: Literal[1] = 1
+    registry: LabClosedRegistryBinding
+
+
+class LabSnapshotAuthorityState(LabWireModel):
+    schema_version: Literal[1] = 1
+    state_kind: Literal["runtime-health-watermark", "test-fixture"]
+    state_json: str
+
+    @model_validator(mode="after")
+    def validate_state_json(self) -> LabSnapshotAuthorityState:
+        strict_canonical_json_loads(self.state_json)
+        return self
+
+
+class _BuiltinSnapshotAuthorityConfig(LabWireModel):
+    disk_path: Path
+    live_slo_config: RuntimeHealthAuthorityLiveSloProbeConfig
+    market_calendar: MarketCalendarAuthority
+
+
+class _BuiltinResourceAuthorityConfig(LabWireModel):
+    snapshot: _BuiltinSnapshotAuthorityConfig
+    policy: AdmissionPolicy
+
+
+class _AuthorityWireRequest(LabWireModel):
+    message_type: Literal["authority-request"] = "authority-request"
+    operation: Literal["admission", "policy", "snapshot", "quota"]
+    manifest: LabResourceAuthorityManifest
+    spec: ResearchRunSpec | None = None
+    admission_request: AdmissionRequest | None = None
+    snapshot: ResourceSnapshot | None = None
+    authority_state: LabSnapshotAuthorityState | None = None
+
+
+class _AuthorityWireResult(LabWireModel):
+    message_type: Literal["authority-result"] = "authority-result"
+    operation: Literal["admission", "policy", "snapshot", "quota"]
+    policy: AdmissionPolicy | None = None
+    snapshot: ResourceSnapshot | None = None
+    quota_lease: SourceQuotaLease | None = None
+    authority_state: LabSnapshotAuthorityState | None = None
+    error_type: str | None = None
+    message: str | None = None
+
+
+class _ShardWireRequest(LabWireModel):
+    message_type: Literal["shard-request"] = "shard-request"
+    manifest: LabShardRuntimeManifest
+    validated: ValidatedStrategyShard
+    runtime_code_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
+
+
+class _IsolatedExecutionWireOutcome(LabWireModel):
+    message_type: Literal["shard-outcome"] = "shard-outcome"
+    result: LabShardExecutionWireResult | None = None
+    phase: Literal["session", "execute"] | None = None
+    error_type: str | None = None
+    message: str | None = None
+    configuration_error: bool = False
+
+
+def _closed_configuration_json(value: LabWireModel) -> str:
+    return canonical_json_bytes(value.model_dump(mode="json", round_trip=True)).decode("utf-8")
+
+
+def build_builtin_resource_authority_manifest(
+    snapshot_provider: object,
+    policy_provider: object,
+    quota_provider: object | None = None,
+) -> LabResourceAuthorityManifest:
+    if quota_provider is not None:
+        raise LabDaemonConfigurationError(
+            "legacy source quota provider is not registered in the closed authority registry"
+        )
+    if type(snapshot_provider) is not LocalResourceSnapshotProvider:
+        raise LabDaemonConfigurationError(
+            "legacy resource snapshot provider is not registered in the closed authority registry"
+        )
+    if type(policy_provider) is not RuntimeStaticAdmissionPolicyProvider:
+        raise LabDaemonConfigurationError(
+            "legacy admission policy provider is not registered in the closed authority registry"
+        )
+    if (
+        type(snapshot_provider.probe) is not SystemResourceProbe
+        or type(snapshot_provider.session_resolver) is not RuntimeTradeCalendarSessionResolver
+        or snapshot_provider.clock is not _runtime_resource_system_clock
+        or snapshot_provider.live_slo_config is None
+    ):
+        raise LabDaemonConfigurationError(
+            "legacy resource snapshot provider has no closed built-in descriptor"
+        )
+    configuration = _BuiltinResourceAuthorityConfig(
+        snapshot=_BuiltinSnapshotAuthorityConfig(
+            disk_path=snapshot_provider.disk_path,
+            live_slo_config=snapshot_provider.live_slo_config,
+            market_calendar=snapshot_provider.session_resolver.authority,
+        ),
+        policy=policy_provider.policy,
+    )
+    return LabResourceAuthorityManifest(
+        registry=LabClosedRegistryBinding(
+            registry_id=_BUILTIN_AUTHORITY_REGISTRY_ID,
+            registry_version=_BUILTIN_AUTHORITY_REGISTRY_VERSION,
+            registry_hash=_BUILTIN_AUTHORITY_REGISTRY_HASH,
+            configuration_json=_closed_configuration_json(configuration),
+        )
+    )
+
+
+def build_resource_journal_authority_manifest(
+    configuration: ResourceAuthorityAdapterConfig,
+) -> LabResourceAuthorityManifest:
+    """Bind the worker explicitly to the V2 external resource-journal registry."""
+
+    validated = ResourceAuthorityAdapterConfig.model_validate(configuration, strict=True)
+    return LabResourceAuthorityManifest(
+        registry=LabClosedRegistryBinding(
+            registry_id=LAB_RESOURCE_AUTHORITY_REGISTRY_ID,
+            registry_version=LAB_RESOURCE_AUTHORITY_REGISTRY_VERSION,
+            registry_hash=LAB_RESOURCE_AUTHORITY_REGISTRY_HASH,
+            configuration_json=canonical_json_bytes(
+                validated.model_dump(mode="json", round_trip=True)
+            ).decode("utf-8"),
+        )
+    )
+
+
+def build_builtin_shard_runtime_manifest(
+    *,
+    catalog_path: Path,
+    forbidden_paths: tuple[Path, ...],
+    snapshot_root: Path,
+    research_lake_root: Path,
+) -> LabShardRuntimeManifest:
+    from rquant.lab_worker_registry import builtin_lab_shard_configuration
+
+    configuration = builtin_lab_shard_configuration(
+        catalog_path=catalog_path,
+        forbidden_paths=forbidden_paths,
+        snapshot_root=snapshot_root,
+        research_lake_root=research_lake_root,
+    )
+    return LabShardRuntimeManifest(
+        registry=LabClosedRegistryBinding(
+            registry_id=_BUILTIN_SHARD_REGISTRY_ID,
+            registry_version=_BUILTIN_SHARD_REGISTRY_VERSION,
+            registry_hash=_BUILTIN_SHARD_REGISTRY_HASH,
+            configuration_json=canonical_json_bytes(
+                configuration.model_dump(mode="json", round_trip=True)
+            ).decode("utf-8"),
+        )
+    )
+
+
+WireModelT = TypeVar("WireModelT", bound=LabWireModel)
+
+
+def _encode_wire_message(value: LabWireModel) -> bytes:
+    return canonical_json_bytes(value.model_dump(mode="json", round_trip=True))
+
+
+def _decode_wire_message(
+    payload: bytes,
+    *,
+    model: type[WireModelT],
+    max_bytes: int,
+    label: str,
+) -> WireModelT:
+    if type(payload) is not bytes:
+        raise LabDaemonConfigurationError(f"{label} must be bytes")
+    if len(payload) > max_bytes:
+        raise LabDaemonConfigurationError(f"{label} exceeds the wire size limit")
+    try:
+        strict_canonical_json_loads(payload)
+        validated = model.model_validate_json(payload)
+        if _encode_wire_message(validated) != payload:
+            raise ValueError("wire schema validation changed the canonical payload")
+        return validated
+    except Exception as exc:
+        if isinstance(exc, LabDaemonConfigurationError):
+            raise
+        raise LabDaemonConfigurationError(
+            f"{label} is malformed: {_bounded_exception_message(exc)}"
+        ) from exc
+
+
+def _assert_primitive_process_start(
+    target: Callable[..., object],
+    arguments: tuple[object, ...],
+) -> None:
+    allowed_targets = {
+        globals().get("_authority_wire_child"),
+        globals().get("_shard_wire_child"),
+    }
+    if target not in allowed_targets:
+        raise LabDaemonConfigurationError("child process target is not registered")
+    if any(type(argument) not in {bytes, str, int} for argument in arguments):
+        raise LabDaemonConfigurationError("child process arguments must be primitive wire values")
+
+
 class LabShardArtifactManifest(LabWorkerModel):
     name: str = Field(pattern=r"^[a-z][a-z0-9_]*$")
     file_name: str = Field(pattern=r"^[0-9]{3}-[a-z][a-z0-9_]*\.parquet$")
@@ -182,6 +541,12 @@ class LabShardResultManifest(LabWorkerModel):
     plan_hash: str = Field(pattern=_HASH_PATTERN)
     adapter_id: str = Field(min_length=1)
     adapter_version: str = Field(min_length=1)
+    experiment_id: str | None = Field(default=None, pattern=_HASH_PATTERN)
+    experiment_attempt_identity: str | None = Field(default=None, pattern=_HASH_PATTERN)
+    strategy_execution_identity_hash: str | None = Field(default=None, pattern=_HASH_PATTERN)
+    strategy_spec_fingerprint: str | None = Field(default=None, pattern=_HASH_PATTERN)
+    strategy_executable_fingerprint: str | None = Field(default=None, pattern=_HASH_PATTERN)
+    candidate_schema_fingerprint: str | None = Field(default=None, pattern=_HASH_PATTERN)
     artifacts: tuple[LabShardArtifactManifest, ...]
     metrics: tuple[LabShardMetric, ...] = ()
 
@@ -196,6 +561,18 @@ class LabShardResultManifest(LabWorkerModel):
                 raise ValueError("current result manifest requires complete digest provenance")
         elif provenance != (None, None):
             raise ValueError("legacy result manifest cannot carry current digest provenance")
+        ownership = (
+            self.experiment_id,
+            self.experiment_attempt_identity,
+            self.strategy_execution_identity_hash,
+            self.strategy_spec_fingerprint,
+            self.strategy_executable_fingerprint,
+            self.candidate_schema_fingerprint,
+        )
+        if any(value is not None for value in ownership) and any(
+            value is None for value in ownership
+        ):
+            raise ValueError("result manifest ownership identity must be complete")
         names = tuple(artifact.name for artifact in self.artifacts)
         files = tuple(artifact.file_name for artifact in self.artifacts)
         if not names:
@@ -234,6 +611,7 @@ class LabWorkerHealthWarning(LabWorkerModel):
 class LabWorkerTickResult(LabWorkerModel):
     status: Literal[
         "idle",
+        "deferred",
         "succeeded",
         "failed",
         "stopped",
@@ -244,7 +622,125 @@ class LabWorkerTickResult(LabWorkerModel):
     claim_token: UUID | None = None
     manifest_hash: str | None = Field(default=None, pattern=_HASH_PATTERN)
     report_id: UUID | None = None
+    admission_decision: AdmissionDecision | None = None
     health_warnings: tuple[LabWorkerHealthWarning, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_admission_decision(self) -> LabWorkerTickResult:
+        if (self.status == "deferred") != (self.admission_decision is not None):
+            raise ValueError("only a deferred worker tick may carry an admission decision")
+        return self
+
+
+@dataclass(frozen=True)
+class _ResourceAdmissionEvaluation:
+    decision: AdmissionDecision
+    request: AdmissionRequest
+    snapshot: ResourceSnapshot
+    policy: AdmissionPolicy
+    quota_lease: SourceQuotaLease | None = None
+
+
+@dataclass(frozen=True)
+class _IsolatedExecutionOutcome:
+    result: LabShardExecutionResult | None = None
+    phase: Literal["session", "execute"] | None = None
+    error_type: str | None = None
+    message: str | None = None
+    configuration_error: bool = False
+
+
+class _IsolationReadiness(LabWireModel):
+    message_type: Literal["readiness"] = "readiness"
+    ready: bool
+    child_pid: int
+    group_id: int | None = None
+    error_type: str | None = None
+    message: str | None = None
+
+
+class _IsolationStartAck(LabWireModel):
+    message_type: Literal["start-ack"] = "start-ack"
+    accepted: bool
+    not_after_monotonic_microseconds: int | None
+    execution_limit_microseconds: int | None = Field(default=None, ge=1)
+
+
+@dataclass(frozen=True)
+class _IsolatedExecutionControl:
+    outcome: _IsolatedExecutionOutcome | None = None
+    stop_reason: str | None = None
+    preemption: AdmissionDecision | None = None
+    resource_error: Exception | None = None
+    heartbeat_error: Exception | None = None
+
+
+@dataclass
+class _WireChild:
+    process: BaseProcess
+    connection: Connection
+    group_id: int
+    address: str
+
+
+@dataclass
+class _ManagedAuthorityChild:
+    """One registered authority process with one mutable cleanup owner."""
+
+    child: _WireChild
+    process_id: int
+    cached_pid: int
+    operation: Literal["admission", "policy", "snapshot", "quota"]
+    owner: Literal[
+        "direct",
+        "startup",
+        "ready",
+        "startup_cleanup",
+        "consumer",
+        "canceller",
+        "tick_cleanup",
+        "reap_pending",
+        "closed",
+    ]
+    lock: threading.Lock
+    cancelled: threading.Event
+    cleanup_complete: threading.Event
+    os_process_exited_verified: bool = False
+    ipc_closed: bool = False
+    process_handle_closed: bool = False
+    last_errors: tuple[BaseException, ...] = ()
+    cleanup_error: BaseException | None = None
+    cleanup_retry_count: int = 0
+    cleanup_in_progress: bool = False
+
+
+@dataclass
+class _PrestartedAuthorityStage:
+    handoff: threading.Event
+    startup_complete: threading.Event
+    cleanup_complete: threading.Event
+    cancelled: threading.Event
+    lock: threading.Lock
+    deadline_microseconds: int
+    cleanup_deadline_microseconds: int
+    startup_thread: threading.Thread | None = None
+    managed_child: _ManagedAuthorityChild | None = None
+    error: BaseException | None = None
+    owner: Literal["startup", "ready", "startup_cleanup", "consumer", "canceller", "closed"] = (
+        "startup"
+    )
+
+    @property
+    def child(self) -> _WireChild | None:
+        """Compatibility view used only by stage lifecycle assertions."""
+
+        return None if self.managed_child is None else self.managed_child.child
+
+
+class LabIsolatedExecutionError(RuntimeError):
+    def __init__(self, *, remote_error_type: str, message: str) -> None:
+        super().__init__(message)
+        self.remote_error_type = remote_error_type
 
 
 class LabPreparedFileIdentity(LabWorkerModel):
@@ -936,7 +1432,7 @@ class LabSealedShardBundle(LabWorkerModel):
 
 
 class LabPendingSuccess(LabWorkerModel):
-    claim: LabShardClaim
+    claim: LabShardClaim | LabShardClaimV2
     report: LabWorkerReport
     bundle: LabSealedShardBundle
     receipt_state: Literal["reported", "awaiting_receipt", "unknown"]
@@ -955,27 +1451,463 @@ class LabArtifactConflictError(RuntimeError):
 
 
 class LabStopSignal:
-    """Signal-handler-safe cooperative stop flag with bounded polling waits."""
+    """Cooperative stop flag whose waits are immediately interruptible."""
 
     def __init__(self) -> None:
-        self._requested = False
+        self._event = threading.Event()
 
     def request(self) -> None:
-        self._requested = True
+        self._event.set()
 
     def is_set(self) -> bool:
-        return self._requested
+        return self._event.is_set()
 
     def wait(self, timeout_seconds: float) -> bool:
-        if self._requested:
-            return True
-        time.sleep(max(0.0, timeout_seconds))
-        return self._requested
+        return self._event.wait(max(0.0, timeout_seconds))
 
 
 StoreFactory = Callable[[], AbstractContextManager[object]]
 ReceiptWaiter = Callable[[LabWorkerReport, float, LabStopSignal], LabReportReceipt]
 CodeShaProvider = Callable[[], str | None]
+ResourceSnapshotProvider = Callable[[], ResourceSnapshot]
+AdmissionPolicyProvider = Callable[[ResearchRunSpec], AdmissionPolicy]
+SourceQuotaLeaseProvider = Callable[
+    [AdmissionRequest, ResourceSnapshot],
+    SourceQuotaLease | None,
+]
+
+
+def _runtime_watermark_state(
+    watermark: RuntimeHealthAuthorityWatermark | None,
+) -> LabSnapshotAuthorityState | None:
+    if watermark is None:
+        return None
+    return LabSnapshotAuthorityState(
+        state_kind="runtime-health-watermark",
+        state_json=canonical_json_bytes(watermark.model_dump(mode="json", round_trip=True)).decode(
+            "utf-8"
+        ),
+    )
+
+
+def _runtime_watermark_from_state(
+    state: LabSnapshotAuthorityState | None,
+) -> RuntimeHealthAuthorityWatermark | None:
+    if state is None:
+        return None
+    if state.state_kind != "runtime-health-watermark":
+        raise LabDaemonConfigurationError("snapshot authority state kind mismatch")
+    return RuntimeHealthAuthorityWatermark.model_validate_json(
+        state.state_json,
+        strict=True,
+    )
+
+
+def _verify_registry_binding(
+    binding: LabClosedRegistryBinding,
+    *,
+    registry_id: str,
+    registry_version: int,
+    registry_hash: str,
+    label: str,
+) -> None:
+    if binding.registry_id != registry_id or binding.registry_version != registry_version:
+        raise LabDaemonConfigurationError(f"{label} registry identity mismatch")
+    if binding.registry_hash != registry_hash:
+        raise LabDaemonConfigurationError(f"{label} registry hash mismatch")
+
+
+def _resolve_builtin_authority(
+    request: _AuthorityWireRequest,
+) -> _AuthorityWireResult:
+    binding = request.manifest.registry
+    _verify_registry_binding(
+        binding,
+        registry_id=_BUILTIN_AUTHORITY_REGISTRY_ID,
+        registry_version=_BUILTIN_AUTHORITY_REGISTRY_VERSION,
+        registry_hash=_BUILTIN_AUTHORITY_REGISTRY_HASH,
+        label="resource authority",
+    )
+    configuration = _BuiltinResourceAuthorityConfig.model_validate_json(
+        binding.configuration_json,
+        strict=True,
+    )
+    if request.operation == "policy":
+        return _AuthorityWireResult(operation="policy", policy=configuration.policy)
+    if request.operation == "quota":
+        if request.admission_request is None or request.snapshot is None:
+            raise LabDaemonConfigurationError("quota authority request is incomplete")
+        return _AuthorityWireResult(operation="quota")
+
+    watermark = _runtime_watermark_from_state(request.authority_state)
+    spawned = LocalResourceSnapshotProvider(
+        disk_path=configuration.snapshot.disk_path,
+        clock=_runtime_resource_system_clock,
+        probe=SystemResourceProbe(),
+        live_slo_config=configuration.snapshot.live_slo_config,
+        session_resolver=RuntimeTradeCalendarSessionResolver(
+            configuration.snapshot.market_calendar
+        ),
+    ).spawn_probe_provider()
+    spawned.authority_watermark = watermark
+    snapshot = spawned()
+    return _AuthorityWireResult(
+        operation=request.operation,
+        policy=(configuration.policy if request.operation == "admission" else None),
+        snapshot=snapshot,
+        quota_lease=None,
+        authority_state=_runtime_watermark_state(spawned.export_probe_state()),
+    )
+
+
+def _resolve_test_authority(request: _AuthorityWireRequest) -> _AuthorityWireResult:
+    binding = request.manifest.registry
+    _verify_registry_binding(
+        binding,
+        registry_id=_TEST_AUTHORITY_REGISTRY_ID,
+        registry_version=_TEST_AUTHORITY_REGISTRY_VERSION,
+        registry_hash=_TEST_AUTHORITY_REGISTRY_HASH,
+        label="test resource authority",
+    )
+    from tests.lab_worker_authority_fixture import evaluate_lab_authority_fixture
+
+    raw = evaluate_lab_authority_fixture(
+        strict_canonical_json_loads(binding.configuration_json),
+        operation=request.operation,
+        spec=request.spec,
+        admission_request=request.admission_request,
+        snapshot=request.snapshot,
+        authority_state=request.authority_state,
+    )
+    return _AuthorityWireResult.model_validate(raw, strict=True)
+
+
+def _resolve_resource_journal_authority(
+    request: _AuthorityWireRequest,
+) -> _AuthorityWireResult:
+    binding = request.manifest.registry
+    _verify_registry_binding(
+        binding,
+        registry_id=LAB_RESOURCE_AUTHORITY_REGISTRY_ID,
+        registry_version=LAB_RESOURCE_AUTHORITY_REGISTRY_VERSION,
+        registry_hash=LAB_RESOURCE_AUTHORITY_REGISTRY_HASH,
+        label="resource journal authority",
+    )
+    configuration = ResourceAuthorityAdapterConfig.model_validate_json(
+        binding.configuration_json,
+        strict=True,
+    )
+    client = ResourceAuthorityJournalClient(configuration)
+    operation_id = hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "admission_request": (
+                    None
+                    if request.admission_request is None
+                    else request.admission_request.model_dump(mode="json")
+                ),
+                "contract": "rquant-lab-resource-authority-stage/v2",
+                "operation": request.operation,
+                "spec": None if request.spec is None else request.spec.model_dump(mode="json"),
+            }
+        )
+    ).hexdigest()
+    if request.operation == "policy":
+        return _AuthorityWireResult(
+            operation="policy", policy=client.policy(operation_id=operation_id)
+        )
+    if request.operation == "snapshot":
+        return _AuthorityWireResult(
+            operation="snapshot", snapshot=client.snapshot(operation_id=operation_id)
+        )
+    if request.operation == "admission":
+        policy, snapshot = client.admission(operation_id=operation_id)
+        return _AuthorityWireResult(
+            operation="admission",
+            policy=policy,
+            snapshot=snapshot,
+        )
+    raise LabDaemonConfigurationError(
+        "resource journal authority does not provide source quota leases"
+    )
+
+
+def _resolve_authority(request: _AuthorityWireRequest) -> _AuthorityWireResult:
+    registry_id = request.manifest.registry.registry_id
+    if registry_id == _BUILTIN_AUTHORITY_REGISTRY_ID:
+        return _resolve_builtin_authority(request)
+    if registry_id == _TEST_AUTHORITY_REGISTRY_ID:
+        return _resolve_test_authority(request)
+    if registry_id == LAB_RESOURCE_AUTHORITY_REGISTRY_ID:
+        return _resolve_resource_journal_authority(request)
+    raise LabDaemonConfigurationError("resource authority registry is not registered")
+
+
+def _research_execution_session_factory(
+    binding: DatasetSnapshotBinding,
+    lake_root: Path,
+) -> AbstractContextManager[object]:
+    return ResearchExecutionSession(binding=binding, lake_root=lake_root)
+
+
+def _resolve_shard_result(request: _ShardWireRequest) -> LabShardExecutionResult:
+    binding = request.manifest.registry
+    if binding.registry_id == _BUILTIN_SHARD_REGISTRY_ID:
+        _verify_registry_binding(
+            binding,
+            registry_id=_BUILTIN_SHARD_REGISTRY_ID,
+            registry_version=_BUILTIN_SHARD_REGISTRY_VERSION,
+            registry_hash=_BUILTIN_SHARD_REGISTRY_HASH,
+            label="shard runtime",
+        )
+        from rquant.lab_worker_registry import execute_builtin_lab_shard
+
+        return execute_builtin_lab_shard(
+            strict_canonical_json_loads(binding.configuration_json),
+            request.validated,
+            runtime_code_sha=request.runtime_code_sha,
+        )
+    if binding.registry_id == _TEST_SHARD_REGISTRY_ID:
+        _verify_registry_binding(
+            binding,
+            registry_id=_TEST_SHARD_REGISTRY_ID,
+            registry_version=_TEST_SHARD_REGISTRY_VERSION,
+            registry_hash=_TEST_SHARD_REGISTRY_HASH,
+            label="test shard runtime",
+        )
+        from tests.lab_worker_shard_fixture import execute_lab_shard_fixture
+
+        return execute_lab_shard_fixture(
+            strict_canonical_json_loads(binding.configuration_json),
+            request.validated,
+            runtime_code_sha=request.runtime_code_sha,
+        )
+    raise LabDaemonConfigurationError("shard runtime registry is not registered")
+
+
+def _connect_wire_child(address: str, authkey: bytes) -> Connection:
+    return Client(address, family="AF_UNIX", authkey=authkey)
+
+
+def _validate_outbound_wire_size(
+    payload_size: int,
+    *,
+    max_bytes: int,
+    label: str,
+) -> None:
+    if type(payload_size) is not int or payload_size < 0 or payload_size > max_bytes:
+        raise LabDaemonConfigurationError(f"{label} exceeds the outbound wire size limit")
+
+
+def _send_wire(
+    connection: Connection,
+    value: LabWireModel,
+    *,
+    max_bytes: int = _MAX_CONTROL_WIRE_BYTES,
+    label: str = "wire message",
+) -> None:
+    payload = _encode_wire_message(value)
+    _validate_outbound_wire_size(len(payload), max_bytes=max_bytes, label=label)
+    connection.send_bytes(payload)
+
+
+def _recv_wire(
+    connection: Connection,
+    *,
+    model: type[WireModelT],
+    max_bytes: int,
+    label: str,
+) -> WireModelT:
+    try:
+        payload = connection.recv_bytes(maxlength=max_bytes)
+    except (EOFError, OSError) as exc:
+        raise LabDaemonConfigurationError(f"{label} transport failed") from exc
+    return _decode_wire_message(
+        payload,
+        model=model,
+        max_bytes=max_bytes,
+        label=label,
+    )
+
+
+def _new_wire_listener() -> tuple[Listener, str, bytes]:
+    address = f"/private/tmp/rqlw-{uuid4().hex}.sock"
+    authkey = os.urandom(32)
+    listener = Listener(address, family="AF_UNIX", authkey=authkey, backlog=1)
+    os.chmod(address, 0o600)
+    socket_listener = listener._listener._socket
+    socket_listener.settimeout(_microseconds_to_seconds(_RESOURCE_AUTHORITY_POLL_MICROSECONDS))
+    return listener, address, authkey
+
+
+def _close_wire_listener(listener: Listener, address: str) -> None:
+    listener.close()
+    with suppress(FileNotFoundError):
+        os.unlink(address)
+
+
+def _authority_wire_child(
+    request_bytes: bytes,
+    address: str,
+    authkey: bytes,
+    max_wire_bytes: int,
+) -> None:
+    connection: Connection | None = None
+    try:
+        child_pid = os.getpid()
+        os.setsid()
+        connection = _connect_wire_child(address, authkey)
+        request = _decode_wire_message(
+            request_bytes,
+            model=_AuthorityWireRequest,
+            max_bytes=max_wire_bytes,
+            label="authority request",
+        )
+        _send_wire(
+            connection,
+            _IsolationReadiness(
+                ready=True,
+                child_pid=child_pid,
+                group_id=os.getpgrp(),
+            ),
+        )
+        acknowledgement = _recv_wire(
+            connection,
+            model=_IsolationStartAck,
+            max_bytes=max_wire_bytes,
+            label="authority start acknowledgement",
+        )
+        if not acknowledgement.accepted:
+            return
+        deadline = acknowledgement.not_after_monotonic_microseconds
+        if acknowledgement.execution_limit_microseconds is not None:
+            execution_deadline = (
+                _monotonic_microseconds() + acknowledgement.execution_limit_microseconds
+            )
+            deadline = execution_deadline if deadline is None else min(deadline, execution_deadline)
+        if deadline is not None and _monotonic_microseconds() >= deadline:
+            return
+        try:
+            result = _resolve_authority(request)
+        except BaseException as exc:
+            result = _AuthorityWireResult(
+                operation=request.operation,
+                error_type=type(exc).__name__,
+                message=_bounded_exception_message(exc),
+            )
+        _send_wire(connection, result)
+    except BaseException as exc:
+        if connection is not None:
+            with suppress(BrokenPipeError, EOFError, OSError):
+                _send_wire(
+                    connection,
+                    _IsolationReadiness(
+                        ready=False,
+                        child_pid=os.getpid(),
+                        error_type=type(exc).__name__,
+                        message=_bounded_exception_message(exc),
+                    ),
+                )
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def _prepare_test_shard_fixture(request: _ShardWireRequest) -> None:
+    if request.manifest.registry.registry_id != _TEST_SHARD_REGISTRY_ID:
+        return
+    from tests.lab_worker_shard_fixture import prepare_lab_shard_fixture
+
+    prepare_lab_shard_fixture(
+        strict_canonical_json_loads(request.manifest.registry.configuration_json)
+    )
+
+
+def _shard_wire_child(
+    request_bytes: bytes,
+    address: str,
+    authkey: bytes,
+    max_wire_bytes: int,
+) -> None:
+    connection: Connection | None = None
+    request: _ShardWireRequest | None = None
+    try:
+        child_pid = os.getpid()
+        os.setsid()
+        connection = _connect_wire_child(address, authkey)
+        request = _decode_wire_message(
+            request_bytes,
+            model=_ShardWireRequest,
+            max_bytes=max_wire_bytes,
+            label="shard request",
+        )
+        _prepare_test_shard_fixture(request)
+        _send_wire(
+            connection,
+            _IsolationReadiness(
+                ready=True,
+                child_pid=child_pid,
+                group_id=os.getpgrp(),
+            ),
+        )
+        acknowledgement = _recv_wire(
+            connection,
+            model=_IsolationStartAck,
+            max_bytes=max_wire_bytes,
+            label="shard start acknowledgement",
+        )
+        if not acknowledgement.accepted:
+            return
+        deadline = acknowledgement.not_after_monotonic_microseconds
+        if deadline is not None and _monotonic_microseconds() >= deadline:
+            return
+        try:
+            result = _resolve_shard_result(request)
+            if deadline is not None and _monotonic_microseconds() >= deadline:
+                raise TimeoutError("isolated shard deadline reached before result publication")
+            outcome = _IsolatedExecutionWireOutcome(
+                result=LabShardExecutionWireResult.from_result(result)
+            )
+        except PermissionError as exc:
+            outcome = _IsolatedExecutionWireOutcome(
+                phase="session",
+                error_type=type(exc).__name__,
+                message=_bounded_exception_message(exc),
+            )
+        except LabDaemonConfigurationError as exc:
+            outcome = _IsolatedExecutionWireOutcome(
+                phase="session",
+                error_type=type(exc).__name__,
+                message=_bounded_exception_message(exc),
+                configuration_error=True,
+            )
+        except BaseException as exc:
+            outcome = _IsolatedExecutionWireOutcome(
+                phase="execute",
+                error_type=type(exc).__name__,
+                message=_bounded_exception_message(exc),
+            )
+        _send_wire(
+            connection,
+            outcome,
+            max_bytes=MAX_RESULT_WIRE_BYTES,
+            label="isolated shard outcome",
+        )
+    except BaseException as exc:
+        if connection is not None:
+            with suppress(BrokenPipeError, EOFError, OSError):
+                _send_wire(
+                    connection,
+                    _IsolationReadiness(
+                        ready=False,
+                        child_pid=os.getpid(),
+                        error_type=type(exc).__name__,
+                        message=_bounded_exception_message(exc),
+                    ),
+                )
+    finally:
+        if connection is not None:
+            connection.close()
 
 
 class LabWorker:
@@ -984,6 +1916,8 @@ class LabWorker:
         *,
         worker_id: str,
         claim_spool: LabClaimSpool,
+        claim_publication_verifier: LabClaimPublicationWorkerVerifier | None = None,
+        v2_claim_publication_enabled: bool = False,
         report_spool: LabReportSpool,
         artifact_root: Path,
         adapter_registry: StrategyJobAdapterRegistry | None = None,
@@ -991,47 +1925,241 @@ class LabWorker:
         metadata_store_factory: StoreFactory | None = None,
         research_lake_root: Path | None = None,
         heartbeat_interval_seconds: float = 30.0,
+        resource_recheck_interval_seconds: float = 1.0,
+        resource_probe_timeout_seconds: float = 1.0,
         lease_extension_seconds: int = 120,
         poll_interval_ms: int = 250,
         receipt_timeout_seconds: float = 30.0,
         quarantine_reconcile_interval_seconds: float = 300.0,
         receipt_waiter: ReceiptWaiter | None = None,
         verified_code_sha_provider: CodeShaProvider | None = None,
+        resource_snapshot_provider: ResourceSnapshotProvider | None = None,
+        admission_policy_provider: AdmissionPolicyProvider | None = None,
+        source_quota_lease_provider: SourceQuotaLeaseProvider | None = None,
+        resource_reservation_store: PersistentResourceReservationStore | None = None,
+        require_resource_admission: bool = False,
         clock: Callable[[], datetime] = _system_clock,
         monotonic_clock: Callable[[], float] = time.monotonic,
+        isolation_monotonic_clock: Callable[[], float] = time.monotonic,
+        isolation_session_initializer: Callable[[], None] | None = None,
+        execution_session_factory: Callable[
+            [DatasetSnapshotBinding, Path], AbstractContextManager[object]
+        ] = _research_execution_session_factory,
+        research_store_opener: Callable[
+            ..., AbstractContextManager[tuple[object, object]]
+        ] = open_gated_research_store,
+        shard_runtime_manifest: LabShardRuntimeManifest | None = None,
+        resource_authority_manifest: LabResourceAuthorityManifest | None = None,
+        production_mode: bool = False,
     ) -> None:
         normalized_worker_id = worker_id.strip()
         if not normalized_worker_id:
             raise ValueError("worker_id must not be empty")
-        if heartbeat_interval_seconds <= 0:
-            raise ValueError("heartbeat_interval_seconds must be positive")
-        if lease_extension_seconds < 1 or lease_extension_seconds > 3_600:
+        heartbeat_interval_microseconds = _positive_duration_microseconds(
+            heartbeat_interval_seconds,
+            label="heartbeat_interval_seconds",
+        )
+        resource_recheck_interval_microseconds = _positive_duration_microseconds(
+            resource_recheck_interval_seconds,
+            label="resource_recheck_interval_seconds",
+        )
+        resource_probe_timeout_microseconds = _positive_duration_microseconds(
+            resource_probe_timeout_seconds,
+            label="resource_probe_timeout_seconds",
+        )
+        receipt_timeout_microseconds = _positive_duration_microseconds(
+            receipt_timeout_seconds,
+            label="receipt_timeout_seconds",
+        )
+        quarantine_reconcile_interval_microseconds = _positive_duration_microseconds(
+            quarantine_reconcile_interval_seconds,
+            label="quarantine_reconcile_interval_seconds",
+        )
+        if (
+            isinstance(lease_extension_seconds, bool)
+            or not isinstance(lease_extension_seconds, int)
+            or lease_extension_seconds < 1
+            or lease_extension_seconds > 3_600
+        ):
             raise ValueError("lease_extension_seconds must be from 1 through 3600")
+        if isinstance(poll_interval_ms, bool) or not isinstance(poll_interval_ms, int):
+            raise ValueError("poll_interval_ms must be a positive integer")
         if poll_interval_ms < 1:
             raise ValueError("poll_interval_ms must be positive")
-        if receipt_timeout_seconds <= 0:
-            raise ValueError("receipt_timeout_seconds must be positive")
-        if quarantine_reconcile_interval_seconds <= 0:
-            raise ValueError("quarantine_reconcile_interval_seconds must be positive")
+        if not isinstance(require_resource_admission, bool):
+            raise ValueError("require_resource_admission must be a boolean")
+        if not isinstance(v2_claim_publication_enabled, bool):
+            raise ValueError("v2_claim_publication_enabled must be a boolean")
+        if v2_claim_publication_enabled and claim_publication_verifier is None:
+            raise LabDaemonConfigurationError(
+                "V2 claim publication requires a published-claim verifier"
+            )
+        closed_adapter_registry = default_strategy_job_adapter_registry()
+        if adapter_registry is not None and adapter_registry is not closed_adapter_registry:
+            raise LabDaemonConfigurationError(
+                "legacy or third-party adapter registry is not registered"
+            )
+        custom_shard_runtime = (
+            any(
+                value is not None
+                for value in (
+                    exploratory_store_factory,
+                    metadata_store_factory,
+                    research_lake_root,
+                    isolation_session_initializer,
+                )
+            )
+            or execution_session_factory is not _research_execution_session_factory
+            or (research_store_opener is not open_gated_research_store)
+        )
+        if custom_shard_runtime:
+            raise LabDaemonConfigurationError(
+                "legacy shard callbacks require a closed shard runtime manifest"
+            )
+        legacy_admission_providers = (
+            resource_snapshot_provider,
+            admission_policy_provider,
+            source_quota_lease_provider,
+        )
+        if type(production_mode) is not bool:
+            raise TypeError("worker production_mode must be bool")
+        if production_mode and any(provider is not None for provider in legacy_admission_providers):
+            raise LabDaemonConfigurationError(
+                "production worker requires an explicit V2 resource authority manifest"
+            )
+        if resource_authority_manifest is not None and any(
+            provider is not None for provider in legacy_admission_providers
+        ):
+            raise LabDaemonConfigurationError(
+                "closed resource authority manifest conflicts with legacy providers"
+            )
+        if (
+            not production_mode
+            and resource_authority_manifest is None
+            and any(provider is not None for provider in legacy_admission_providers)
+        ):
+            if resource_snapshot_provider is None or admission_policy_provider is None:
+                raise LabDaemonConfigurationError(
+                    "resource admission providers must be configured together"
+                )
+            resource_authority_manifest = build_builtin_resource_authority_manifest(
+                resource_snapshot_provider,
+                admission_policy_provider,
+                source_quota_lease_provider,
+            )
+        if production_mode and (
+            resource_authority_manifest is None
+            or (
+                resource_authority_manifest.registry.registry_id,
+                resource_authority_manifest.registry.registry_version,
+                resource_authority_manifest.registry.registry_hash,
+            )
+            != (
+                LAB_RESOURCE_AUTHORITY_REGISTRY_ID,
+                LAB_RESOURCE_AUTHORITY_REGISTRY_VERSION,
+                LAB_RESOURCE_AUTHORITY_REGISTRY_HASH,
+            )
+        ):
+            raise LabDaemonConfigurationError(
+                "production worker requires an explicit V2 resource authority manifest"
+            )
+        if require_resource_admission and resource_authority_manifest is None:
+            raise LabDaemonConfigurationError(
+                "isolated worker resource admission providers require a closed authority manifest"
+            )
+        if resource_reservation_store is not None and resource_authority_manifest is None:
+            raise LabDaemonConfigurationError(
+                "resource reservation store requires a closed resource authority manifest"
+            )
+        resource_journal_configuration: ResourceAuthorityAdapterConfig | None = None
+        if (
+            resource_authority_manifest is not None
+            and resource_authority_manifest.registry.registry_id
+            == LAB_RESOURCE_AUTHORITY_REGISTRY_ID
+        ):
+            if resource_reservation_store is not None:
+                raise LabDaemonConfigurationError(
+                    "resource journal registry owns the reservation adapter"
+                )
+            resource_journal_configuration = parse_resource_authority_adapter_config(
+                resource_authority_manifest.registry.configuration_json
+            )
+            if production_mode and resource_journal_configuration.mode != "production":
+                raise LabDaemonConfigurationError(
+                    "production worker requires a production V2 resource authority"
+                )
         self.worker_id = normalized_worker_id
+        self.production_mode = production_mode
         self.claim_spool = claim_spool
+        self.claim_publication_verifier = claim_publication_verifier
+        self.v2_claim_publication_enabled = v2_claim_publication_enabled
         self.report_spool = report_spool
         self.artifact_root = Path(artifact_root).resolve()
-        self.adapter_registry = adapter_registry or default_strategy_job_adapter_registry()
-        self.exploratory_store_factory = exploratory_store_factory
-        self.metadata_store_factory = metadata_store_factory
-        self.research_lake_root = (
-            None if research_lake_root is None else Path(research_lake_root).resolve()
-        )
-        self.heartbeat_interval_seconds = heartbeat_interval_seconds
+        self.adapter_registry = closed_adapter_registry
+        self.heartbeat_interval_microseconds = heartbeat_interval_microseconds
+        self.resource_recheck_interval_microseconds = resource_recheck_interval_microseconds
+        self.resource_probe_timeout_microseconds = resource_probe_timeout_microseconds
         self.lease_extension_seconds = lease_extension_seconds
-        self.poll_interval_ms = poll_interval_ms
-        self.receipt_timeout_seconds = receipt_timeout_seconds
-        self.quarantine_reconcile_interval_seconds = quarantine_reconcile_interval_seconds
+        self.poll_interval_microseconds = poll_interval_ms * 1_000
+        self.receipt_timeout_microseconds = receipt_timeout_microseconds
+        # This is deliberately only the pre-publication admission budget.  Receipt
+        # convergence and background cleanup have their own bounded phases.
+        self.prepublication_admission_budget_microseconds = max(
+            receipt_timeout_microseconds * 2,
+            resource_probe_timeout_microseconds * 2 + _AUTHORITY_SPAWN_ALLOWANCE_MICROSECONDS,
+        )
+        # The post-seal check has its own rollback-safety phase.  It must be
+        # long enough to acquire fresh evidence, but cannot reopen a full
+        # pre-publication-sized wait after the bundle is already sealed.
+        self.post_publish_rollback_safety_budget_microseconds = min(
+            resource_probe_timeout_microseconds,
+            _AUTHORITY_SPAWN_ALLOWANCE_MICROSECONDS,
+        )
+        self.quarantine_reconcile_interval_microseconds = quarantine_reconcile_interval_microseconds
+        self._uses_local_receipt_waiter = receipt_waiter is None
         self.receipt_waiter = receipt_waiter or self._wait_for_receipt
         self.verified_code_sha_provider = verified_code_sha_provider
+        self.resource_authority_manifest = resource_authority_manifest
+        self.resource_reservation_store = (
+            None
+            if resource_authority_manifest is None
+            else (
+                LabResourceAuthorityReservationAdapter(resource_journal_configuration)
+                if resource_journal_configuration is not None
+                else resource_reservation_store
+                or PersistentResourceReservationStore(
+                    self.artifact_root.parent / "resource-reservations.db",
+                    clock=clock,
+                )
+            )
+        )
+        self.require_resource_admission = require_resource_admission
         self.clock = clock
-        self.monotonic_clock = monotonic_clock
+        self.monotonic_microseconds_clock = _canonical_monotonic_clock(
+            monotonic_clock,
+            label="monotonic_clock",
+        )
+        self.isolation_monotonic_microseconds_clock = _canonical_monotonic_clock(
+            isolation_monotonic_clock,
+            label="isolation_monotonic_clock",
+        )
+        if shard_runtime_manifest is None:
+            from rquant.lab_worker_registry import (
+                unconfigured_builtin_lab_shard_configuration,
+            )
+
+            shard_configuration = unconfigured_builtin_lab_shard_configuration()
+            shard_runtime_manifest = LabShardRuntimeManifest(
+                registry=LabClosedRegistryBinding(
+                    registry_id=_BUILTIN_SHARD_REGISTRY_ID,
+                    registry_version=_BUILTIN_SHARD_REGISTRY_VERSION,
+                    registry_hash=_BUILTIN_SHARD_REGISTRY_HASH,
+                    configuration_json=canonical_json_bytes(
+                        shard_configuration.model_dump(mode="json", round_trip=True)
+                    ).decode("utf-8"),
+                )
+            )
+        self.shard_runtime_manifest = shard_runtime_manifest
         self.artifact_reclaimer = LabArtifactReclaimer(
             artifact_root=self.artifact_root,
             report_spool=self.report_spool,
@@ -1039,12 +2167,111 @@ class LabWorker:
         )
         self.claim_spool.set_claim_advance_hook(self.artifact_reclaimer.reclaim)
         self._stop = LabStopSignal()
+        self._isolation_start_gate = threading.RLock()
+        self._isolation_start_condition = threading.Condition(self._isolation_start_gate)
+        self._isolation_stop_generation = 0
         self._terminal_lock = threading.Lock()
         self._pending_success: LabPendingSuccess | None = None
-        self._next_quarantine_reconcile_at = 0.0
+        self._next_quarantine_reconcile_at_microseconds = 0
+        self._resource_retry_at: dict[UUID, datetime] = {}
+        self._resource_reservation_lock = threading.Lock()
+        self._active_resource_reservation: ResourceReservationLease | None = None
+        self._resource_snapshot_authority_state_lock = threading.Lock()
+        self._resource_snapshot_authority_state: LabSnapshotAuthorityState | None = None
+        self._managed_authority_children_lock = threading.Lock()
+        self._managed_authority_children: dict[int, _ManagedAuthorityChild] = {}
 
     def request_stop(self) -> None:
-        self._stop.request()
+        with self._isolation_start_condition:
+            self._isolation_stop_generation += 1
+            self._stop.request()
+            self._isolation_start_condition.notify_all()
+
+    @staticmethod
+    def _before_isolation_start_commit_for_test() -> None:
+        """Deterministic test barrier immediately before the atomic start gate."""
+
+    @staticmethod
+    def _during_isolation_start_commit_for_test() -> None:
+        """Deterministic test barrier while stop/check/ACK commit is serialized."""
+
+    @staticmethod
+    def _before_prestarted_authority_start_for_test(
+        _stage: _PrestartedAuthorityStage,
+    ) -> None:
+        """Deterministic test barrier before the prestarted authority child exists."""
+
+    @staticmethod
+    def _before_prestarted_authority_handoff_for_test(
+        _stage: _PrestartedAuthorityStage,
+        _child: _WireChild,
+    ) -> None:
+        """Deterministic test barrier before startup transfers child ownership."""
+
+    @staticmethod
+    def _after_managed_authority_process_close_for_test(
+        _managed: _ManagedAuthorityChild,
+    ) -> None:
+        """Deterministic test hook after a managed process handle has closed."""
+
+    def _verify_closed_registries(self) -> None:
+        binding = self.shard_runtime_manifest.registry
+        allowed_shard_registries = {
+            (
+                _BUILTIN_SHARD_REGISTRY_ID,
+                _BUILTIN_SHARD_REGISTRY_VERSION,
+                _BUILTIN_SHARD_REGISTRY_HASH,
+            ),
+            (
+                _TEST_SHARD_REGISTRY_ID,
+                _TEST_SHARD_REGISTRY_VERSION,
+                _TEST_SHARD_REGISTRY_HASH,
+            ),
+        }
+        if (
+            binding.registry_id,
+            binding.registry_version,
+            binding.registry_hash,
+        ) not in allowed_shard_registries:
+            raise LabDaemonConfigurationError("shard registry hash or identity mismatch")
+        if self.resource_authority_manifest is None:
+            return
+        authority = self.resource_authority_manifest.registry
+        allowed_authority_registries = {
+            (
+                _BUILTIN_AUTHORITY_REGISTRY_ID,
+                _BUILTIN_AUTHORITY_REGISTRY_VERSION,
+                _BUILTIN_AUTHORITY_REGISTRY_HASH,
+            ),
+            (
+                _TEST_AUTHORITY_REGISTRY_ID,
+                _TEST_AUTHORITY_REGISTRY_VERSION,
+                _TEST_AUTHORITY_REGISTRY_HASH,
+            ),
+            (
+                LAB_RESOURCE_AUTHORITY_REGISTRY_ID,
+                LAB_RESOURCE_AUTHORITY_REGISTRY_VERSION,
+                LAB_RESOURCE_AUTHORITY_REGISTRY_HASH,
+            ),
+        }
+        if (
+            authority.registry_id,
+            authority.registry_version,
+            authority.registry_hash,
+        ) not in allowed_authority_registries:
+            raise LabDaemonConfigurationError("authority registry hash or identity mismatch")
+        if self.production_mode and (
+            authority.registry_id,
+            authority.registry_version,
+            authority.registry_hash,
+        ) != (
+            LAB_RESOURCE_AUTHORITY_REGISTRY_ID,
+            LAB_RESOURCE_AUTHORITY_REGISTRY_VERSION,
+            LAB_RESOURCE_AUTHORITY_REGISTRY_HASH,
+        ):
+            raise LabDaemonConfigurationError(
+                "production worker requires an explicit V2 resource authority manifest"
+            )
 
     def _verify_runtime_guard(self, *, expected_sha: str | None = None) -> str:
         if self.verified_code_sha_provider is None:
@@ -1219,6 +2446,26 @@ class LabWorker:
             or receipt.shard_id != report.shard_id
         ):
             raise ValueError("report receipt identity does not match published report")
+        if (
+            receipt.worker_id,
+            receipt.claim_token,
+            receipt.claim_generation,
+            receipt.scheduler_fencing_token,
+            receipt.report_type,
+            receipt.result_manifest_hash,
+        ) != (
+            report.worker_id,
+            report.claim_token,
+            report.claim_generation,
+            report.scheduler_fencing_token,
+            report.body.report_type,
+            (
+                report.body.result_manifest_hash
+                if isinstance(report.body, LabShardSucceeded)
+                else None
+            ),
+        ):
+            raise ValueError("report receipt attempt identity does not match published report")
 
     def _make_report(
         self,
@@ -1265,7 +2512,11 @@ class LabWorker:
         timeout_seconds: float,
         stop: LabStopSignal,
     ) -> LabReportReceipt:
-        timeout_at = time.monotonic() + timeout_seconds
+        timeout_microseconds = _positive_duration_microseconds(
+            timeout_seconds,
+            label="receipt timeout_seconds",
+        )
+        timeout_at_microseconds = _monotonic_microseconds() + timeout_microseconds
         receipt_path = self.report_spool.ack_dir / f"{report.report_id}.json"
         while True:
             if os.path.lexists(receipt_path):
@@ -1280,10 +2531,25 @@ class LabWorker:
                 return receipt
             if stop.is_set():
                 raise InterruptedError("worker stop requested while waiting for report receipt")
-            remaining = timeout_at - time.monotonic()
-            if remaining <= 0:
+            remaining_microseconds = timeout_at_microseconds - _monotonic_microseconds()
+            if remaining_microseconds <= 0:
                 raise TimeoutError(f"report receipt timed out: {report.report_id}")
-            stop.wait(min(0.05, remaining))
+            stop.wait(_microseconds_to_seconds(min(50_000, remaining_microseconds)))
+
+    def _receipt_wait_timeout_seconds(self) -> float:
+        return _microseconds_to_seconds(self.receipt_timeout_microseconds)
+
+    def _retry_local_receipt_wait(
+        self,
+        report: LabWorkerReport,
+    ) -> LabReportReceipt:
+        timeout_seconds = self._receipt_wait_timeout_seconds()
+        self.report_spool.publish(report)
+        return self._wait_for_receipt(
+            report,
+            timeout_seconds,
+            self._stop,
+        )
 
     def _publish_and_wait(
         self,
@@ -1292,10 +2558,25 @@ class LabWorker:
         *,
         stop: LabStopSignal,
     ) -> LabReportReceipt:
+        timeout_seconds = self._receipt_wait_timeout_seconds()
         report = self._publish_report(claim, body)
         try:
-            receipt = self.receipt_waiter(report, self.receipt_timeout_seconds, stop)
+            receipt = self.receipt_waiter(
+                report,
+                timeout_seconds,
+                stop,
+            )
         except TimeoutError as exc:
+            if self._uses_local_receipt_waiter:
+                try:
+                    receipt = self._retry_local_receipt_wait(report)
+                except TimeoutError:
+                    pass
+                else:
+                    self._validate_receipt_identity(report, receipt)
+                    if receipt.status != "accepted":
+                        raise PermissionError(f"worker report rejected: {receipt.reason}")
+                    return receipt
             _safe_structured_log(
                 "warning",
                 "report_receipt_timeout",
@@ -1356,8 +2637,10 @@ class LabWorker:
             return False
         return True
 
-    def _next_owned_claim(self) -> LabShardClaim | None:
+    def _next_owned_claim_entry(self) -> LabClaimSpoolEntry | None:
         now = _utc(self.clock())
+        actionable_tokens: set[UUID] = set()
+        selected: LabClaimSpoolEntry | None = None
         for path in self.claim_spool.pending_paths():
             try:
                 entry = self.claim_spool.load(path)
@@ -1382,75 +2665,1584 @@ class LabWorker:
                 continue
             if claim.lease_expires_at <= now:
                 continue
-            if claim.worker_id != self.worker_id:
+            owned = claim.worker_id == self.worker_id or (
+                isinstance(claim, LabShardClaimV2) and claim.worker_id == V2_UNASSIGNED_WORKER_ID
+            )
+            if not owned:
                 continue
-            try:
-                self._verify_runtime_guard()
-                return self.claim_spool.consume(entry)
-            except (
-                InvalidCommandEnvelopeError,
-                LabClaimAlreadyConsumedError,
-                LabClaimRevokedError,
-                LabClaimSupersededError,
-                OSError,
+            actionable_tokens.add(claim.claim_token)
+            if selected is not None:
+                continue
+            retry_at = self._resource_retry_at.get(claim.claim_token)
+            if retry_at is not None and retry_at > now:
+                continue
+            selected = entry
+        self._resource_retry_at = {
+            token: retry_at
+            for token, retry_at in self._resource_retry_at.items()
+            if token in actionable_tokens and retry_at > now
+        }
+        if selected is None:
+            return None
+        self._resource_retry_at.pop(selected.claim.claim_token, None)
+        self._verify_runtime_guard()
+        return selected
+
+    def _consume_selected_claim(
+        self, entry: LabClaimSpoolEntry
+    ) -> LabShardClaim | LabShardClaimV2 | None:
+        try:
+            self._verify_runtime_guard()
+            if isinstance(entry.claim, LabShardClaimV2):
+                if self.claim_publication_verifier is None:
+                    raise LabDaemonConfigurationError(
+                        "V2 claim publication verifier is not configured"
+                    )
+                self.claim_publication_verifier.require_published_claim(
+                    entry.claim,
+                    now=_utc(self.clock()),
+                )
+            return self.claim_spool.consume(entry)
+        except (
+            InvalidCommandEnvelopeError,
+            LabClaimAlreadyConsumedError,
+            LabClaimRevokedError,
+            LabClaimSupersededError,
+            LabClaimFinalizerError,
+            SourceOperationContractError,
+            OSError,
+        ):
+            return None
+        finally:
+            self._resource_retry_at.pop(entry.claim.claim_token, None)
+
+    def _require_v2_publication_before_admission(self, entry: LabClaimSpoolEntry) -> None:
+        """Gate V2 entries before any resource or authority-child side effect."""
+
+        if not isinstance(entry.claim, LabShardClaimV2):
+            return
+        if self.claim_publication_verifier is None:
+            raise LabDaemonConfigurationError("V2 claim publication verifier is not configured")
+        self.claim_publication_verifier.require_published_claim(
+            entry.claim,
+            now=_utc(self.clock()),
+        )
+
+    def _resource_admission_decision(
+        self,
+        claim: LabShardClaim,
+        spec: ResearchRunSpec,
+        *,
+        tick_deadline_microseconds: int | None = None,
+    ) -> AdmissionDecision | None:
+        evaluation = self._resource_admission_evaluation(
+            claim,
+            spec,
+            tick_deadline_microseconds=tick_deadline_microseconds,
+        )
+        return None if evaluation is None else evaluation.decision
+
+    def _receive_wire_before_deadline(
+        self,
+        child: _WireChild,
+        *,
+        model: type[WireModelT],
+        max_bytes: int,
+        deadline_microseconds: int,
+        label: str,
+        honor_worker_stop: bool = True,
+    ) -> WireModelT:
+        while True:
+            if honor_worker_stop and self._stop.is_set():
+                raise InterruptedError(f"worker stop requested during {label}")
+            remaining = deadline_microseconds - _monotonic_microseconds()
+            if remaining <= 0:
+                raise TimeoutError(f"{label} timed out")
+            if child.connection.poll(
+                _microseconds_to_seconds(min(_RESOURCE_AUTHORITY_POLL_MICROSECONDS, remaining))
             ):
-                continue
-        return None
+                return _recv_wire(
+                    child.connection,
+                    model=model,
+                    max_bytes=max_bytes,
+                    label=label,
+                )
+            if not child.process.is_alive():
+                raise LabDaemonConfigurationError(f"{label} process exited without evidence")
+
+    def _start_wire_child(
+        self,
+        *,
+        target: Callable[..., object],
+        request_bytes: bytes,
+        process_name: str,
+        deadline_microseconds: int,
+        label: str,
+        max_wire_bytes: int,
+        honor_worker_stop_during_readiness: bool = True,
+    ) -> _WireChild:
+        listener, address, authkey = _new_wire_listener()
+        context = multiprocessing.get_context("spawn")
+        arguments: tuple[object, ...] = (
+            request_bytes,
+            address,
+            authkey,
+            max_wire_bytes,
+        )
+        _assert_primitive_process_start(target, arguments)
+        process = context.Process(
+            target=target,
+            args=arguments,
+            name=process_name,
+            daemon=False,
+        )
+        connection: Connection | None = None
+        started = False
+        try:
+            process.start()
+            started = True
+            while connection is None:
+                if honor_worker_stop_during_readiness and self._stop.is_set():
+                    raise InterruptedError(f"worker stop requested during {label}")
+                if _monotonic_microseconds() >= deadline_microseconds:
+                    raise TimeoutError(f"{label} timed out")
+                try:
+                    connection = listener.accept()
+                except TimeoutError:
+                    if not process.is_alive():
+                        raise LabDaemonConfigurationError(
+                            f"{label} process exited before connecting"
+                        ) from None
+            provisional = _WireChild(
+                process=process,
+                connection=connection,
+                group_id=-1,
+                address=address,
+            )
+            readiness = self._receive_wire_before_deadline(
+                provisional,
+                model=_IsolationReadiness,
+                max_bytes=_MAX_CONTROL_WIRE_BYTES,
+                deadline_microseconds=deadline_microseconds,
+                label=f"{label} readiness",
+                honor_worker_stop=honor_worker_stop_during_readiness,
+            )
+            if (
+                not readiness.ready
+                or process.pid is None
+                or readiness.child_pid != process.pid
+                or readiness.group_id != process.pid
+            ):
+                raise LabDaemonConfigurationError(
+                    readiness.message or f"{label} process readiness failed"
+                )
+            try:
+                observed_group_id = os.getpgid(process.pid)
+            except ProcessLookupError as exc:
+                raise LabDaemonConfigurationError(
+                    f"{label} process exited before identity verification"
+                ) from exc
+            if observed_group_id != readiness.group_id:
+                raise LabDaemonConfigurationError(f"{label} process group verification failed")
+            return _WireChild(
+                process=process,
+                connection=connection,
+                group_id=observed_group_id,
+                address=address,
+            )
+        except BaseException:
+            if connection is not None:
+                with suppress(BaseException):
+                    connection.close()
+            if started:
+                with suppress(BaseException):
+                    self._terminate_isolated_process(
+                        process,
+                        isolated_group_id=process.pid,
+                    )
+            with suppress(BaseException):
+                process.close()
+            raise
+        finally:
+            _close_wire_listener(listener, address)
+
+    def _close_wire_child(
+        self,
+        child: _WireChild,
+        *,
+        label: str,
+        allow_graceful_termination: bool = True,
+    ) -> None:
+        errors: list[BaseException] = []
+        try:
+            child_pid = child.process.pid
+        except BaseException as exc:
+            errors.append(exc)
+            child_pid = None
+        try:
+            self._terminate_isolated_process(
+                child.process,
+                isolated_group_id=child.group_id,
+                allow_graceful_termination=allow_graceful_termination,
+            )
+        except BaseException as exc:
+            errors.append(exc)
+        try:
+            child.connection.close()
+        except BaseException as exc:
+            errors.append(exc)
+        if child_pid is not None:
+            try:
+                child.process.join(timeout=0)
+                if any(
+                    active_child.pid == child_pid
+                    for active_child in multiprocessing.active_children()
+                ):
+                    raise RuntimeError(
+                        f"{label} child remained in multiprocessing registry after reap"
+                    )
+            except BaseException as exc:
+                errors.append(exc)
+        try:
+            child.process.close()
+        except BaseException as exc:
+            errors.append(exc)
+        if errors:
+            raise BaseExceptionGroup(f"{label} cleanup failed", errors)
+
+    def _register_authority_child(
+        self,
+        child: _WireChild,
+        *,
+        operation: Literal["admission", "policy", "snapshot", "quota"],
+        owner: Literal["direct", "startup"],
+        cancelled: threading.Event | None = None,
+    ) -> _ManagedAuthorityChild:
+        process_id = child.process.pid
+        if process_id is None:  # pragma: no cover - _start_wire_child verifies this
+            raise LabDaemonConfigurationError("authority child has no process PID")
+        managed = _ManagedAuthorityChild(
+            child=child,
+            process_id=process_id,
+            cached_pid=process_id,
+            operation=operation,
+            owner=owner,
+            lock=threading.Lock(),
+            cancelled=cancelled or threading.Event(),
+            cleanup_complete=threading.Event(),
+        )
+        with self._managed_authority_children_lock:
+            if process_id in self._managed_authority_children:
+                raise LabDaemonConfigurationError("authority child PID is already registered")
+            self._managed_authority_children[process_id] = managed
+        return managed
+
+    @staticmethod
+    def _transfer_managed_authority_owner(
+        managed: _ManagedAuthorityChild,
+        *,
+        expected: Literal[
+            "direct",
+            "startup",
+            "ready",
+            "startup_cleanup",
+            "consumer",
+            "canceller",
+            "tick_cleanup",
+            "reap_pending",
+        ],
+        target: Literal[
+            "ready",
+            "startup_cleanup",
+            "consumer",
+            "canceller",
+            "tick_cleanup",
+            "reap_pending",
+        ],
+    ) -> None:
+        with managed.lock:
+            if managed.owner != expected:
+                raise LabDaemonConfigurationError(
+                    "managed authority child ownership changed unexpectedly"
+                )
+            managed.owner = target
+
+    def _close_managed_authority_child(
+        self,
+        managed: _ManagedAuthorityChild,
+        *,
+        owner: Literal[
+            "direct",
+            "startup_cleanup",
+            "consumer",
+            "canceller",
+            "tick_cleanup",
+            "reap_pending",
+        ],
+        label: str,
+    ) -> BaseException | None:
+        errors: list[BaseException] = []
+        with managed.lock:
+            if managed.owner != owner:
+                return LabDaemonConfigurationError(
+                    "managed authority child cleanup owner changed unexpectedly"
+                )
+            if managed.cleanup_in_progress:
+                return LabDaemonConfigurationError(
+                    "managed authority child cleanup is already in progress"
+                )
+            managed.cleanup_in_progress = True
+
+        if not managed.os_process_exited_verified:
+            process = managed.child.process
+            try:
+                self._terminate_isolated_process(
+                    process,
+                    isolated_group_id=managed.child.group_id,
+                )
+            except BaseException as exc:
+                errors.append(exc)
+            try:
+                process.join(timeout=0)
+            except BaseException as exc:
+                errors.append(exc)
+            else:
+                try:
+                    os.kill(managed.cached_pid, 0)
+                except ProcessLookupError:
+                    active_child_exists = any(
+                        active_child.pid == managed.cached_pid
+                        for active_child in multiprocessing.active_children()
+                    )
+                    if not active_child_exists:
+                        with managed.lock:
+                            managed.os_process_exited_verified = True
+                    else:
+                        errors.append(
+                            RuntimeError(
+                                f"{label} child remained in multiprocessing registry after reap"
+                            )
+                        )
+                except BaseException as exc:
+                    errors.append(exc)
+                else:
+                    errors.append(RuntimeError(f"{label} child remained alive after reap"))
+
+        if not managed.ipc_closed:
+            connection = managed.child.connection
+            try:
+                connection.close()
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                try:
+                    ipc_closed = bool(connection.closed)
+                except BaseException as exc:
+                    errors.append(exc)
+                    ipc_closed = False
+                if ipc_closed:
+                    with managed.lock:
+                        managed.ipc_closed = True
+
+        if managed.os_process_exited_verified and not managed.process_handle_closed:
+            process = managed.child.process
+            try:
+                process.close()
+            except BaseException as exc:
+                errors.append(exc)
+            else:
+                with managed.lock:
+                    managed.process_handle_closed = True
+                try:
+                    self._after_managed_authority_process_close_for_test(managed)
+                except BaseException as exc:
+                    errors.append(exc)
+
+        cleanup_error: BaseException | None = None
+        if errors:
+            cleanup_error = (
+                errors[0]
+                if len(errors) == 1
+                else BaseExceptionGroup(f"{label} cleanup diagnostics", errors)
+            )
+        with managed.lock:
+            complete = (
+                managed.os_process_exited_verified
+                and managed.ipc_closed
+                and managed.process_handle_closed
+            )
+            if not complete and cleanup_error is None:
+                cleanup_error = RuntimeError(f"{label} cleanup did not converge")
+            if cleanup_error is not None:
+                managed.last_errors = tuple(errors) or (cleanup_error,)
+                managed.cleanup_error = cleanup_error
+            managed.cleanup_in_progress = False
+            if complete:
+                managed.owner = "closed"
+            else:
+                managed.owner = "reap_pending"
+                managed.cleanup_retry_count += 1
+
+        if complete:
+            with self._managed_authority_children_lock:
+                if self._managed_authority_children.get(managed.process_id) is managed:
+                    del self._managed_authority_children[managed.process_id]
+            managed.cleanup_complete.set()
+        return cleanup_error
+
+    def _reap_managed_authority_children(self) -> None:
+        deadline_microseconds = (
+            _monotonic_microseconds() + _AUTHORITY_CHILD_CLEANUP_BUDGET_MICROSECONDS
+        )
+        errors: list[BaseException] = []
+        while True:
+            with self._managed_authority_children_lock:
+                managed_children = tuple(self._managed_authority_children.values())
+            if not managed_children:
+                break
+            progressed = False
+            for managed in managed_children:
+                with managed.lock:
+                    owner = managed.owner
+                    if managed.cleanup_in_progress:
+                        continue
+                    if owner == "startup":
+                        managed.cancelled.set()
+                    elif owner in {"direct", "ready", "reap_pending"}:
+                        managed.owner = "tick_cleanup"
+                        owner = "tick_cleanup"
+                        progressed = True
+                if owner == "tick_cleanup":
+                    error = self._close_managed_authority_child(
+                        managed,
+                        owner="tick_cleanup",
+                        label="resource authority tick cleanup",
+                    )
+                    if error is not None:
+                        errors.append(error)
+            with self._managed_authority_children_lock:
+                if not self._managed_authority_children:
+                    break
+            if _monotonic_microseconds() >= deadline_microseconds:
+                errors.append(RuntimeError("authority child cleanup budget exhausted"))
+                break
+            if not progressed:
+                managed_children[0].cleanup_complete.wait(
+                    _microseconds_to_seconds(_RESOURCE_AUTHORITY_POLL_MICROSECONDS)
+                )
+        if errors:
+            raise BaseExceptionGroup("authority child cleanup failed", errors)
+
+    def _prestart_authority_stage(
+        self,
+        *,
+        operation: Literal["admission", "policy", "snapshot", "quota"],
+        spec: ResearchRunSpec | None,
+        admission_request: AdmissionRequest | None,
+        deadline_microseconds: int,
+    ) -> _PrestartedAuthorityStage:
+        manifest = self.resource_authority_manifest
+        if manifest is None:
+            raise LabDaemonConfigurationError("resource authority manifest is unavailable")
+        request = _AuthorityWireRequest(
+            operation=operation,
+            manifest=manifest,
+            spec=spec,
+            admission_request=admission_request,
+            authority_state=(
+                self._accepted_snapshot_authority_state()
+                if operation in {"admission", "snapshot"}
+                else None
+            ),
+        )
+        stage = _PrestartedAuthorityStage(
+            handoff=threading.Event(),
+            startup_complete=threading.Event(),
+            cleanup_complete=threading.Event(),
+            cancelled=threading.Event(),
+            lock=threading.Lock(),
+            deadline_microseconds=deadline_microseconds,
+            cleanup_deadline_microseconds=(
+                deadline_microseconds + _PRESTART_AUTHORITY_CLEANUP_RESERVE_MICROSECONDS
+            ),
+        )
+        label = {
+            "admission": "resource admission authority",
+            "policy": "admission policy provider",
+            "snapshot": "resource snapshot provider",
+            "quota": "source quota lease provider",
+        }[operation]
+
+        def prestart() -> None:
+            child: _WireChild | None = None
+            managed_child: _ManagedAuthorityChild | None = None
+            cleanup_as_startup = False
+            startup_error: BaseException | None = None
+            try:
+                self._before_prestarted_authority_start_for_test(stage)
+                with stage.lock:
+                    if stage.cancelled.is_set():
+                        stage.owner = "closed"
+                        stage.handoff.set()
+                        stage.cleanup_complete.set()
+                        return
+                child = self._start_wire_child(
+                    target=_authority_wire_child,
+                    request_bytes=_encode_wire_message(request),
+                    process_name=(
+                        "lab-resource-probe"
+                        if operation == "snapshot"
+                        else "lab-resource-authority"
+                    ),
+                    deadline_microseconds=deadline_microseconds,
+                    label=label,
+                    max_wire_bytes=_MAX_CONTROL_WIRE_BYTES,
+                )
+                managed_child = self._register_authority_child(
+                    child,
+                    operation=operation,
+                    owner="startup",
+                    cancelled=stage.cancelled,
+                )
+                # Startup owns the child until this lock commits a handoff.  A
+                # concurrent cancellation can observe that owner, but never
+                # closes the child while startup may still be using it.
+                with stage.lock:
+                    if stage.owner != "startup":  # pragma: no cover - invariant
+                        raise LabDaemonConfigurationError(
+                            "prestarted authority startup ownership changed unexpectedly"
+                        )
+                    stage.managed_child = managed_child
+                self._before_prestarted_authority_handoff_for_test(stage, child)
+                with stage.lock:
+                    if stage.cancelled.is_set():
+                        self._transfer_managed_authority_owner(
+                            managed_child,
+                            expected="startup",
+                            target="startup_cleanup",
+                        )
+                        stage.owner = "startup_cleanup"
+                        cleanup_as_startup = True
+                    else:
+                        self._transfer_managed_authority_owner(
+                            managed_child,
+                            expected="startup",
+                            target="ready",
+                        )
+                        stage.owner = "ready"
+                    stage.handoff.set()
+            except BaseException as exc:
+                startup_error = exc
+                with stage.lock:
+                    if child is None:
+                        stage.error = exc
+                        stage.owner = "closed"
+                        stage.handoff.set()
+                        stage.cleanup_complete.set()
+                    else:
+                        if managed_child is None:
+                            try:
+                                self._close_wire_child(child, label=label)
+                            except BaseException as cleanup_error:
+                                stage.error = BaseExceptionGroup(
+                                    "prestarted authority registration cleanup failed",
+                                    [exc, cleanup_error],
+                                )
+                            else:
+                                stage.error = exc
+                            stage.owner = "closed"
+                            stage.handoff.set()
+                            stage.cleanup_complete.set()
+                        else:
+                            stage.managed_child = managed_child
+                            self._transfer_managed_authority_owner(
+                                managed_child,
+                                expected="startup",
+                                target="startup_cleanup",
+                            )
+                            stage.owner = "startup_cleanup"
+                            stage.handoff.set()
+                            cleanup_as_startup = True
+            finally:
+                if cleanup_as_startup and managed_child is not None:
+                    self._finish_prestarted_authority_cleanup(
+                        stage,
+                        managed_child,
+                        owner="startup_cleanup",
+                        label=label,
+                        startup_error=startup_error,
+                    )
+                with stage.lock:
+                    if stage.owner == "startup":
+                        stage.owner = "closed"
+                        stage.handoff.set()
+                        stage.cleanup_complete.set()
+                stage.startup_complete.set()
+
+        startup_thread = threading.Thread(
+            target=prestart,
+            name=f"lab-prestart-authority-{operation}",
+            daemon=False,
+        )
+        stage.startup_thread = startup_thread
+        startup_thread.start()
+        return stage
+
+    @staticmethod
+    def _await_prestarted_authority_event(
+        event: threading.Event,
+        *,
+        deadline_microseconds: int,
+        label: str,
+    ) -> None:
+        while not event.is_set():
+            remaining = deadline_microseconds - _monotonic_microseconds()
+            if remaining <= 0:
+                raise TimeoutError(f"{label} timed out")
+            event.wait(
+                _microseconds_to_seconds(min(_RESOURCE_AUTHORITY_POLL_MICROSECONDS, remaining))
+            )
+
+    def _await_prestarted_authority_shutdown(
+        self,
+        stage: _PrestartedAuthorityStage,
+        *,
+        label: str,
+        deadline_microseconds: int,
+    ) -> None:
+        self._await_prestarted_authority_event(
+            stage.handoff,
+            deadline_microseconds=deadline_microseconds,
+            label=f"{label} handoff",
+        )
+        self._await_prestarted_authority_event(
+            stage.cleanup_complete,
+            deadline_microseconds=deadline_microseconds,
+            label=f"{label} cleanup",
+        )
+        startup_thread = stage.startup_thread
+        if startup_thread is not None:
+            remaining = deadline_microseconds - _monotonic_microseconds()
+            if remaining <= 0 and startup_thread.is_alive():
+                raise TimeoutError(f"{label} startup thread cleanup timed out")
+            startup_thread.join(_microseconds_to_seconds(max(0, remaining)))
+            if startup_thread.is_alive():
+                raise TimeoutError(f"{label} startup thread cleanup timed out")
+
+    def _cancel_prestarted_authority_stage(
+        self,
+        stage: _PrestartedAuthorityStage | None,
+        *,
+        operation: Literal["admission", "policy", "snapshot", "quota"],
+        deadline_microseconds: int | None = None,
+    ) -> None:
+        if stage is None:
+            return
+        label = {
+            "admission": "resource admission authority",
+            "policy": "admission policy provider",
+            "snapshot": "resource snapshot provider",
+            "quota": "source quota lease provider",
+        }[operation]
+        phase_deadline_microseconds = min(
+            stage.cleanup_deadline_microseconds,
+            deadline_microseconds
+            if deadline_microseconds is not None
+            else stage.cleanup_deadline_microseconds,
+        )
+        stage.cancelled.set()
+        managed_child: _ManagedAuthorityChild | None = None
+        with stage.lock:
+            if stage.owner == "ready":
+                managed_child = stage.managed_child
+                if managed_child is None:  # pragma: no cover - ownership invariant
+                    raise LabDaemonConfigurationError(
+                        "prestarted authority ready stage has no child"
+                    )
+                self._transfer_managed_authority_owner(
+                    managed_child,
+                    expected="ready",
+                    target="canceller",
+                )
+                stage.owner = "canceller"
+        if managed_child is not None:
+            cleanup_error = self._finish_prestarted_authority_cleanup(
+                stage,
+                managed_child,
+                owner="canceller",
+                label=label,
+            )
+            if cleanup_error is not None:
+                raise cleanup_error
+        self._await_prestarted_authority_shutdown(
+            stage,
+            label=label,
+            deadline_microseconds=phase_deadline_microseconds,
+        )
+
+    def _finish_prestarted_authority_cleanup(
+        self,
+        stage: _PrestartedAuthorityStage,
+        managed_child: _ManagedAuthorityChild,
+        *,
+        owner: Literal["startup_cleanup", "canceller", "consumer"],
+        label: str,
+        startup_error: BaseException | None = None,
+    ) -> BaseException | None:
+        cleanup_error = self._close_managed_authority_child(
+            managed_child,
+            owner=owner,
+            label=label,
+        )
+        with stage.lock:
+            if stage.owner != owner or stage.managed_child is not managed_child:
+                cleanup_error = cleanup_error or LabDaemonConfigurationError(
+                    "prestarted authority child ownership changed during cleanup"
+                )
+            if stage.error is None:
+                stage.error = startup_error or cleanup_error
+            if cleanup_error is None:
+                stage.managed_child = None
+                stage.owner = "closed"
+                stage.handoff.set()
+                stage.cleanup_complete.set()
+        return cleanup_error
+
+    def _complete_prestarted_authority_stage(
+        self,
+        stage: _PrestartedAuthorityStage,
+        *,
+        operation: Literal["admission", "policy", "snapshot", "quota"],
+        deadline_microseconds: int,
+    ) -> _AuthorityWireResult:
+        label = {
+            "admission": "resource admission authority",
+            "policy": "admission policy provider",
+            "snapshot": "resource snapshot provider",
+            "quota": "source quota lease provider",
+        }[operation]
+        while not stage.handoff.is_set():
+            if self._stop.is_set():
+                raise InterruptedError(f"worker stop requested during {label} prestart")
+            remaining = deadline_microseconds - _monotonic_microseconds()
+            if remaining <= 0:
+                raise TimeoutError(f"{label} prestart timed out")
+            stage.handoff.wait(
+                _microseconds_to_seconds(min(_RESOURCE_AUTHORITY_POLL_MICROSECONDS, remaining))
+            )
+        interrupted = False
+        with stage.lock:
+            error = stage.error
+            if stage.cancelled.is_set():
+                interrupted = True
+            elif stage.owner != "ready":
+                managed_child = None
+            else:
+                managed_child = stage.managed_child
+                if managed_child is not None:
+                    self._transfer_managed_authority_owner(
+                        managed_child,
+                        expected="ready",
+                        target="consumer",
+                    )
+                stage.owner = "consumer"
+        if interrupted:
+            self._await_prestarted_authority_shutdown(
+                stage,
+                label=label,
+                deadline_microseconds=deadline_microseconds,
+            )
+            raise InterruptedError(f"worker stop requested during {label} prestart")
+        if error is not None:
+            self._await_prestarted_authority_shutdown(
+                stage,
+                label=label,
+                deadline_microseconds=deadline_microseconds,
+            )
+            raise error
+        if managed_child is None:
+            self._await_prestarted_authority_shutdown(
+                stage,
+                label=label,
+                deadline_microseconds=deadline_microseconds,
+            )
+            raise LabDaemonConfigurationError(f"{label} prestart returned no child")
+        primary_error: BaseException | None = None
+        result: _AuthorityWireResult | None = None
+        try:
+            _send_wire(
+                managed_child.child.connection,
+                _IsolationStartAck(
+                    accepted=True,
+                    not_after_monotonic_microseconds=deadline_microseconds,
+                ),
+            )
+            result = self._receive_wire_before_deadline(
+                managed_child.child,
+                model=_AuthorityWireResult,
+                max_bytes=_MAX_CONTROL_WIRE_BYTES,
+                deadline_microseconds=deadline_microseconds,
+                label=label,
+            )
+            if result.operation != operation:
+                raise LabDaemonConfigurationError(f"{label} operation mismatch")
+            if result.error_type is not None:
+                raise LabDaemonConfigurationError(
+                    f"{label} failed: {result.error_type}: {result.message or 'unknown failure'}"
+                )
+        except BaseException as exc:
+            primary_error = exc
+        cleanup_error = self._finish_prestarted_authority_cleanup(
+            stage,
+            managed_child,
+            owner="consumer",
+            label=label,
+        )
+        self._await_prestarted_authority_shutdown(
+            stage,
+            label=label,
+            deadline_microseconds=deadline_microseconds,
+        )
+        if primary_error is not None and cleanup_error is not None:
+            raise BaseExceptionGroup(f"{label} and cleanup failed", [primary_error, cleanup_error])
+        if primary_error is not None:
+            raise primary_error
+        if cleanup_error is not None:
+            raise cleanup_error
+        if result is None:  # pragma: no cover - guarded above
+            raise LabDaemonConfigurationError(f"{label} returned no evidence")
+        return result
+
+    def _run_authority_stage(
+        self,
+        *,
+        operation: Literal["admission", "policy", "snapshot", "quota"],
+        spec: ResearchRunSpec | None,
+        admission_request: AdmissionRequest | None = None,
+        snapshot: ResourceSnapshot | None = None,
+        timeout_microseconds: int,
+        not_after_monotonic_microseconds: int | None = None,
+        include_spawn_allowance: bool = True,
+    ) -> _AuthorityWireResult:
+        manifest = self.resource_authority_manifest
+        if manifest is None:
+            raise LabDaemonConfigurationError("resource authority manifest is unavailable")
+        if timeout_microseconds <= 0:
+            raise TimeoutError(f"{operation} authority timed out")
+        total_budget = timeout_microseconds + (
+            _AUTHORITY_SPAWN_ALLOWANCE_MICROSECONDS if include_spawn_allowance else 0
+        )
+        deadline_microseconds = _monotonic_microseconds() + total_budget
+        if not_after_monotonic_microseconds is not None:
+            deadline_microseconds = min(
+                deadline_microseconds,
+                not_after_monotonic_microseconds,
+            )
+        request = _AuthorityWireRequest(
+            operation=operation,
+            manifest=manifest,
+            spec=spec,
+            admission_request=admission_request,
+            snapshot=snapshot,
+            authority_state=(
+                self._accepted_snapshot_authority_state()
+                if operation in {"admission", "snapshot"}
+                else None
+            ),
+        )
+        label = {
+            "admission": "resource admission authority",
+            "policy": "admission policy provider",
+            "snapshot": "resource snapshot provider",
+            "quota": "source quota lease provider",
+        }[operation]
+        child: _WireChild | None = None
+        managed_child: _ManagedAuthorityChild | None = None
+        primary_error: BaseException | None = None
+        result: _AuthorityWireResult | None = None
+        try:
+            child = self._start_wire_child(
+                target=_authority_wire_child,
+                request_bytes=_encode_wire_message(request),
+                process_name=(
+                    "lab-resource-probe" if operation == "snapshot" else "lab-resource-authority"
+                ),
+                deadline_microseconds=deadline_microseconds,
+                label=label,
+                max_wire_bytes=_MAX_CONTROL_WIRE_BYTES,
+            )
+            managed_child = self._register_authority_child(
+                child,
+                operation=operation,
+                owner="direct",
+            )
+            _send_wire(
+                managed_child.child.connection,
+                _IsolationStartAck(
+                    accepted=True,
+                    not_after_monotonic_microseconds=deadline_microseconds,
+                ),
+            )
+            result = self._receive_wire_before_deadline(
+                managed_child.child,
+                model=_AuthorityWireResult,
+                max_bytes=_MAX_CONTROL_WIRE_BYTES,
+                deadline_microseconds=deadline_microseconds,
+                label=label,
+            )
+            if result.operation != operation:
+                raise LabDaemonConfigurationError(f"{label} operation mismatch")
+            if result.error_type is not None:
+                raise LabDaemonConfigurationError(
+                    f"{label} failed: {result.error_type}: {result.message or 'unknown failure'}"
+                )
+        except BaseException as exc:
+            primary_error = exc
+        cleanup_error: BaseException | None = None
+        if managed_child is not None:
+            cleanup_error = self._close_managed_authority_child(
+                managed_child,
+                owner="direct",
+                label=label,
+            )
+        elif child is not None:
+            try:
+                self._close_wire_child(child, label=label)
+            except BaseException as exc:
+                cleanup_error = exc
+        if primary_error is not None and cleanup_error is not None:
+            raise BaseExceptionGroup(
+                f"{label} and cleanup failed",
+                [primary_error, cleanup_error],
+            )
+        if primary_error is not None:
+            raise primary_error
+        if cleanup_error is not None:
+            raise cleanup_error
+        if result is None:  # pragma: no cover - guarded above
+            raise LabDaemonConfigurationError(f"{label} returned no evidence")
+        return result
+
+    def _run_admission_authority(
+        self,
+        *,
+        spec: ResearchRunSpec,
+        request: AdmissionRequest,
+        timeout_microseconds: int,
+        not_after_monotonic_microseconds: int,
+        cancellation_requested: Callable[[], bool] | None = None,
+    ) -> _ResourceAdmissionEvaluation:
+        if cancellation_requested is not None and cancellation_requested():
+            raise InterruptedError("resource admission authority was cancelled")
+        stage_count = 2 + int(request.expected_quota_units > 0)
+        result = self._run_authority_stage(
+            operation="admission",
+            spec=spec,
+            admission_request=request,
+            timeout_microseconds=timeout_microseconds * stage_count,
+            not_after_monotonic_microseconds=not_after_monotonic_microseconds,
+        )
+        return self._admission_evaluation_from_authority_result(
+            result,
+            request=request,
+            cancellation_requested=cancellation_requested,
+        )
+
+    def _admission_evaluation_from_authority_result(
+        self,
+        result: _AuthorityWireResult,
+        *,
+        request: AdmissionRequest,
+        cancellation_requested: Callable[[], bool] | None = None,
+    ) -> _ResourceAdmissionEvaluation:
+        if cancellation_requested is not None and cancellation_requested():
+            raise InterruptedError("resource admission authority was cancelled")
+        if result.policy is None:
+            raise LabDaemonConfigurationError(
+                "admission policy provider returned an invalid contract"
+            )
+        if result.snapshot is None:
+            raise LabDaemonConfigurationError(
+                "resource snapshot provider returned an invalid contract"
+            )
+        if cancellation_requested is not None and cancellation_requested():
+            raise InterruptedError("resource admission authority was cancelled")
+        self._record_snapshot_authority_state(result.authority_state)
+        now = _utc(self.clock())
+        if result.snapshot.observed_at > now:
+            raise LabDaemonConfigurationError("resource snapshot is from the future")
+        if (
+            timedelta_microseconds(now - result.snapshot.observed_at)
+            > result.policy.max_snapshot_age_microseconds
+        ):
+            raise LabDaemonConfigurationError("resource snapshot is stale")
+        return _ResourceAdmissionEvaluation(
+            decision=evaluate_admission(
+                request,
+                result.snapshot,
+                result.policy,
+                quota_lease=result.quota_lease,
+            ),
+            request=request,
+            snapshot=result.snapshot,
+            policy=result.policy,
+            quota_lease=result.quota_lease,
+        )
+
+    def _remaining_prepublication_budget_microseconds(
+        self,
+        prepublication_deadline_microseconds: int | None,
+        *,
+        operation: str,
+    ) -> int | None:
+        if prepublication_deadline_microseconds is None:
+            return None
+        remaining_microseconds = (
+            prepublication_deadline_microseconds - self.monotonic_microseconds_clock()
+        )
+        if remaining_microseconds <= 0:
+            raise TimeoutError(f"pre-publication admission deadline reached before {operation}")
+        return remaining_microseconds
+
+    def _early_prepublication_probe_timeout_microseconds(
+        self,
+        prepublication_deadline_microseconds: int | None,
+        *,
+        operation: str,
+    ) -> int:
+        if prepublication_deadline_microseconds is None:
+            return self.resource_probe_timeout_microseconds
+        remaining_microseconds = self._remaining_prepublication_budget_microseconds(
+            prepublication_deadline_microseconds,
+            operation=operation,
+        )
+        if remaining_microseconds is None:  # pragma: no cover - guarded above
+            return self.resource_probe_timeout_microseconds
+        final_probe_reserve_microseconds = min(
+            self.resource_probe_timeout_microseconds,
+            _AUTHORITY_SPAWN_ALLOWANCE_MICROSECONDS,
+        )
+        available_microseconds = remaining_microseconds - final_probe_reserve_microseconds
+        if available_microseconds <= 0:
+            raise TimeoutError("pre-publication admission deadline has no final authority reserve")
+        return min(self.resource_probe_timeout_microseconds, available_microseconds)
+
+    def _resource_admission_evaluation(
+        self,
+        claim: LabShardClaim,
+        spec: ResearchRunSpec,
+        *,
+        probe_timeout_microseconds: int | None = None,
+        authority_not_after_monotonic_microseconds: int | None = None,
+        reservation_recheck_gate: Callable[[], None] | None = None,
+        cancellation_requested: Callable[[], bool] | None = None,
+        tick_deadline_microseconds: int | None = None,
+        prestarted_admission_stage: _PrestartedAuthorityStage | None = None,
+    ) -> _ResourceAdmissionEvaluation | None:
+        def cancelled() -> bool:
+            return self._stop.is_set() or (
+                cancellation_requested is not None and cancellation_requested()
+            )
+
+        if cancelled():
+            raise InterruptedError("resource admission evaluation was cancelled")
+        if self.resource_authority_manifest is None:
+            if self.require_resource_admission:
+                raise LabDaemonConfigurationError(
+                    "isolated worker resource authority is unavailable"
+                )
+            return None
+        timeout_microseconds = (
+            self.resource_probe_timeout_microseconds
+            if probe_timeout_microseconds is None
+            else min(
+                self.resource_probe_timeout_microseconds,
+                probe_timeout_microseconds,
+            )
+        )
+        remaining_tick_budget = self._remaining_prepublication_budget_microseconds(
+            tick_deadline_microseconds,
+            operation="resource admission authority",
+        )
+        if remaining_tick_budget is not None:
+            timeout_microseconds = min(timeout_microseconds, remaining_tick_budget)
+        if authority_not_after_monotonic_microseconds is None:
+            remaining_spec = timedelta_microseconds(spec.deadline - _utc(self.clock()))
+            authority_not_after_monotonic_microseconds = _monotonic_microseconds() + max(
+                0, remaining_spec
+            )
+        if remaining_tick_budget is not None:
+            authority_not_after_monotonic_microseconds = min(
+                authority_not_after_monotonic_microseconds,
+                _monotonic_microseconds() + remaining_tick_budget,
+            )
+        request = self._resource_admission_request(claim, spec)
+        if prestarted_admission_stage is None:
+            evidence = self._run_admission_authority(
+                spec=spec,
+                request=request,
+                timeout_microseconds=timeout_microseconds,
+                not_after_monotonic_microseconds=authority_not_after_monotonic_microseconds,
+                cancellation_requested=cancelled,
+            )
+        else:
+            evidence = self._admission_evaluation_from_authority_result(
+                self._complete_prestarted_authority_stage(
+                    prestarted_admission_stage,
+                    operation="admission",
+                    deadline_microseconds=authority_not_after_monotonic_microseconds,
+                ),
+                request=request,
+                cancellation_requested=cancelled,
+            )
+        if cancelled():
+            raise InterruptedError("resource admission evaluation was cancelled")
+        self._remaining_prepublication_budget_microseconds(
+            tick_deadline_microseconds,
+            operation="resource admission recheck",
+        )
+        policy = evidence.policy
+        snapshot = evidence.snapshot
+        quota_lease = evidence.quota_lease
+
+        def immutable_snapshot_provider() -> ResourceSnapshot:
+            return snapshot
+
+        def immutable_quota_lease_provider(
+            _request: AdmissionRequest,
+            _snapshot: ResourceSnapshot,
+        ) -> SourceQuotaLease | None:
+            return quota_lease
+
+        if reservation_recheck_gate is not None:
+            reservation_recheck_gate()
+        remaining_tick_budget = self._remaining_prepublication_budget_microseconds(
+            tick_deadline_microseconds,
+            operation="resource reservation recheck",
+        )
+        with self._resource_reservation_lock:
+            if cancelled():
+                raise InterruptedError("resource admission evaluation was cancelled")
+            active_lease = self._active_resource_reservation
+        if active_lease is not None:
+            store = self.resource_reservation_store
+            if store is None:  # pragma: no cover - constructor invariant
+                raise LabDaemonConfigurationError(
+                    "active resource reservation has no persistent store"
+                )
+            try:
+                admitted = store.recheck(
+                    lease=active_lease,
+                    identity=self._resource_reservation_identity(claim),
+                    request=request,
+                    policy=policy,
+                    snapshot_provider=immutable_snapshot_provider,
+                    lease_seconds=self.lease_extension_seconds,
+                    quota_lease_provider=immutable_quota_lease_provider,
+                    lock_wait_timeout_seconds=_microseconds_to_seconds(
+                        min(
+                            _RESOURCE_RESERVATION_LOCK_WAIT_MAX_MICROSECONDS,
+                            remaining_tick_budget
+                            if remaining_tick_budget is not None
+                            else _RESOURCE_RESERVATION_LOCK_WAIT_MAX_MICROSECONDS,
+                            max(
+                                0,
+                                authority_not_after_monotonic_microseconds
+                                - _monotonic_microseconds(),
+                            ),
+                        )
+                    ),
+                    stop_requested=cancelled,
+                )
+            except Exception as exc:
+                if cancelled():
+                    raise InterruptedError(
+                        "worker stop requested during resource reservation recheck"
+                    ) from exc
+                if _monotonic_microseconds() >= authority_not_after_monotonic_microseconds:
+                    raise TimeoutError("resource admission recheck timed out") from exc
+                if isinstance(exc, LabDaemonConfigurationError):
+                    raise
+                raise LabDaemonConfigurationError(
+                    str(exc) or "resource reservation recheck failed"
+                ) from exc
+            if cancelled():
+                raise InterruptedError("resource admission evaluation was cancelled")
+            self._remaining_prepublication_budget_microseconds(
+                tick_deadline_microseconds,
+                operation="resource reservation recheck result",
+            )
+            with self._resource_reservation_lock:
+                if cancelled():
+                    raise InterruptedError("resource admission evaluation was cancelled")
+                if self._active_resource_reservation != active_lease:
+                    raise LabDaemonConfigurationError("resource reservation changed during recheck")
+                if admitted.lease is not None:
+                    self._active_resource_reservation = admitted.lease
+            return _ResourceAdmissionEvaluation(
+                decision=admitted.decision,
+                request=admitted.request,
+                snapshot=admitted.snapshot,
+                policy=admitted.policy,
+                quota_lease=quota_lease,
+            )
+        if cancelled():
+            raise InterruptedError("resource admission evaluation was cancelled")
+        self._remaining_prepublication_budget_microseconds(
+            tick_deadline_microseconds,
+            operation="resource admission result",
+        )
+        return _ResourceAdmissionEvaluation(
+            decision=evaluate_admission(request, snapshot, policy, quota_lease=quota_lease),
+            request=request,
+            snapshot=snapshot,
+            policy=policy,
+            quota_lease=quota_lease,
+        )
+
+    def _resource_admission_inputs(
+        self,
+        claim: LabShardClaim,
+        spec: ResearchRunSpec,
+        *,
+        policy_override: AdmissionPolicy | None = None,
+        authority_callback_timeout_microseconds: int | None = None,
+    ) -> tuple[AdmissionPolicy, AdmissionRequest]:
+        policy = policy_override
+        if policy is None:
+            result = self._run_authority_stage(
+                operation="policy",
+                spec=spec,
+                timeout_microseconds=(
+                    self.resource_probe_timeout_microseconds
+                    if authority_callback_timeout_microseconds is None
+                    else authority_callback_timeout_microseconds
+                ),
+            )
+            policy = result.policy
+        if policy is None:
+            raise LabDaemonConfigurationError(
+                "admission policy provider returned an invalid contract"
+            )
+        return policy, self._resource_admission_request(claim, spec)
+
+    @staticmethod
+    def _resource_admission_request(
+        claim: LabShardClaim,
+        spec: ResearchRunSpec,
+    ) -> AdmissionRequest:
+        try:
+            return derive_lab_admission_request(
+                job_id=claim.job_id,
+                spec=spec,
+                work_plan=claim.definition.work_plan,
+            )
+        except Exception as exc:
+            raise LabDaemonConfigurationError(
+                "resource admission request derivation failed"
+            ) from exc
+
+    def _bounded_initial_resource_admission(
+        self,
+        claim: LabShardClaim,
+        spec: ResearchRunSpec,
+        *,
+        timeout_microseconds: int,
+        not_after_monotonic_microseconds: int,
+    ) -> _ResourceAdmissionEvaluation | None:
+        if self.resource_authority_manifest is None:
+            if self.require_resource_admission:
+                raise LabDaemonConfigurationError(
+                    "isolated worker resource authority is unavailable"
+                )
+            return None
+        request = self._resource_admission_request(claim, spec)
+        return self._run_admission_authority(
+            spec=spec,
+            request=request,
+            timeout_microseconds=timeout_microseconds,
+            not_after_monotonic_microseconds=not_after_monotonic_microseconds,
+        )
+
+    def _source_quota_lease(
+        self,
+        spec: ResearchRunSpec,
+        request: AdmissionRequest,
+        snapshot: ResourceSnapshot,
+        *,
+        authority_callback_timeout_microseconds: int | None = None,
+        authority_not_after_monotonic_microseconds: int | None = None,
+    ) -> SourceQuotaLease | None:
+        if request.expected_quota_units <= 0:
+            return None
+        result = self._run_authority_stage(
+            operation="quota",
+            spec=spec,
+            admission_request=request,
+            snapshot=snapshot,
+            timeout_microseconds=(
+                self.resource_probe_timeout_microseconds
+                if authority_callback_timeout_microseconds is None
+                else authority_callback_timeout_microseconds
+            ),
+            not_after_monotonic_microseconds=(authority_not_after_monotonic_microseconds),
+        )
+        return result.quota_lease
+
+    def _resource_reservation_identity(
+        self,
+        claim: LabShardClaim,
+    ) -> ResourceReservationIdentity:
+        return ResourceReservationIdentity(
+            job_id=claim.job_id,
+            run_id=claim.spec_hash,
+            shard_id=claim.shard_id,
+            attempt_id=claim.claim_token,
+            claim_generation=claim.claim_generation,
+            scheduler_fencing_token=claim.scheduler_fencing_token,
+            worker_id=claim.worker_id,
+        )
+
+    def _reserve_resource_admission(
+        self,
+        claim: LabShardClaim,
+        spec: ResearchRunSpec,
+        *,
+        tick_deadline_microseconds: int | None = None,
+    ) -> _ResourceAdmissionEvaluation | None:
+        if self.resource_authority_manifest is None:
+            if self.require_resource_admission:
+                raise LabDaemonConfigurationError(
+                    "isolated worker resource authority is unavailable"
+                )
+            return None
+        remaining_microseconds = timedelta_microseconds(spec.deadline - _utc(self.clock()))
+        remaining_tick_budget = self._remaining_prepublication_budget_microseconds(
+            tick_deadline_microseconds,
+            operation="initial resource admission",
+        )
+        if remaining_tick_budget is not None:
+            remaining_microseconds = min(remaining_microseconds, remaining_tick_budget)
+        if remaining_microseconds <= 0:
+            raise TimeoutError("ResearchRunSpec deadline reached before resource reservation")
+        admission_deadline_microseconds = (
+            self.monotonic_microseconds_clock() + remaining_microseconds
+        )
+        authority_not_after_monotonic_microseconds = (
+            _monotonic_microseconds() + remaining_microseconds
+        )
+        operation_timeout_microseconds = min(
+            remaining_microseconds,
+            self._early_prepublication_probe_timeout_microseconds(
+                tick_deadline_microseconds,
+                operation="initial resource admission authority",
+            ),
+        )
+        evaluation = self._bounded_initial_resource_admission(
+            claim,
+            spec,
+            timeout_microseconds=operation_timeout_microseconds,
+            not_after_monotonic_microseconds=authority_not_after_monotonic_microseconds,
+        )
+        if evaluation is None:
+            return None
+        if self._stop.is_set():
+            raise InterruptedError("worker stop requested during resource reservation admission")
+        remaining_tick_budget = self._remaining_prepublication_budget_microseconds(
+            tick_deadline_microseconds,
+            operation="resource reservation transaction",
+        )
+        if remaining_tick_budget is not None:
+            remaining_tick_budget -= min(
+                self.resource_probe_timeout_microseconds,
+                _AUTHORITY_SPAWN_ALLOWANCE_MICROSECONDS,
+            )
+        transaction_timeout_microseconds = min(
+            operation_timeout_microseconds,
+            remaining_tick_budget
+            if remaining_tick_budget is not None
+            else operation_timeout_microseconds,
+            max(
+                0,
+                admission_deadline_microseconds - self.monotonic_microseconds_clock(),
+            ),
+        )
+        if transaction_timeout_microseconds <= 0:
+            raise TimeoutError(
+                "ResearchRunSpec deadline reached before resource reservation transaction"
+            )
+        if self.resource_reservation_store is None:
+            return evaluation
+
+        def immutable_snapshot_provider() -> ResourceSnapshot:
+            return evaluation.snapshot
+
+        def immutable_quota_lease_provider(
+            _request: AdmissionRequest,
+            _snapshot: ResourceSnapshot,
+        ) -> SourceQuotaLease | None:
+            return evaluation.quota_lease
+
+        with self._resource_reservation_lock:
+            if self._active_resource_reservation is not None:
+                raise LabDaemonConfigurationError(
+                    "worker already owns an active resource reservation"
+                )
+            try:
+                admitted = self.resource_reservation_store.reserve(
+                    identity=self._resource_reservation_identity(claim),
+                    request=evaluation.request,
+                    policy=evaluation.policy,
+                    snapshot_provider=immutable_snapshot_provider,
+                    lease_seconds=self.lease_extension_seconds,
+                    quota_lease_provider=immutable_quota_lease_provider,
+                    lock_wait_timeout_seconds=_microseconds_to_seconds(
+                        min(
+                            _RESOURCE_RESERVATION_LOCK_WAIT_MAX_MICROSECONDS,
+                            transaction_timeout_microseconds,
+                        )
+                    ),
+                    stop_requested=self._stop.is_set,
+                )
+            except Exception as exc:
+                if self._stop.is_set():
+                    raise InterruptedError(
+                        "worker stop requested during resource reservation admission"
+                    ) from exc
+                if self.monotonic_microseconds_clock() >= admission_deadline_microseconds:
+                    raise TimeoutError(
+                        "ResearchRunSpec deadline reached during resource reservation admission"
+                    ) from exc
+                if isinstance(exc, LabDaemonConfigurationError):
+                    raise
+                raise LabDaemonConfigurationError(
+                    str(exc) or "resource reservation admission failed"
+                ) from exc
+            if admitted.lease is not None:
+                self._remaining_prepublication_budget_microseconds(
+                    tick_deadline_microseconds,
+                    operation="resource reservation admission result",
+                )
+                self._active_resource_reservation = admitted.lease
+            if self._stop.is_set():
+                raise InterruptedError(
+                    "worker stop requested during resource reservation admission"
+                )
+            if (
+                _utc(self.clock()) >= spec.deadline
+                or self.monotonic_microseconds_clock() >= admission_deadline_microseconds
+            ):
+                raise TimeoutError(
+                    "ResearchRunSpec deadline reached during resource reservation admission"
+                )
+            self._remaining_prepublication_budget_microseconds(
+                tick_deadline_microseconds,
+                operation="resource reservation admission result",
+            )
+            return _ResourceAdmissionEvaluation(
+                decision=admitted.decision,
+                request=admitted.request,
+                snapshot=admitted.snapshot,
+                policy=admitted.policy,
+                quota_lease=evaluation.quota_lease,
+            )
+
+    def _release_resource_reservation(self) -> None:
+        with self._resource_reservation_lock:
+            lease = self._active_resource_reservation
+            if lease is None:
+                return
+            store = self.resource_reservation_store
+            if store is None:  # pragma: no cover - constructor invariant
+                raise LabDaemonConfigurationError(
+                    "active resource reservation has no persistent store"
+                )
+            self._active_resource_reservation = None
+            store.release(
+                lease,
+                identity=lease.identity,
+                lock_wait_timeout_seconds=_microseconds_to_seconds(
+                    _RESOURCE_RESERVATION_LOCK_WAIT_MAX_MICROSECONDS
+                ),
+            )
+
+    def _accepted_snapshot_authority_state(self) -> LabSnapshotAuthorityState | None:
+        with self._resource_snapshot_authority_state_lock:
+            return self._resource_snapshot_authority_state
+
+    def _record_snapshot_authority_state(
+        self,
+        state: LabSnapshotAuthorityState | None,
+    ) -> None:
+        if state is not None and type(state) is not LabSnapshotAuthorityState:
+            raise LabDaemonConfigurationError(
+                "resource snapshot authority returned an invalid closed state"
+            )
+        with self._resource_snapshot_authority_state_lock:
+            self._resource_snapshot_authority_state = state
+
+    @property
+    def snapshot_authority_watermark(
+        self,
+    ) -> RuntimeHealthAuthorityWatermark | None:
+        state = self._accepted_snapshot_authority_state()
+        if state is None or state.state_kind != "runtime-health-watermark":
+            return None
+        return _runtime_watermark_from_state(state)
+
+    def _bounded_resource_snapshot(self, *, timeout_seconds: float) -> ResourceSnapshot:
+        timeout_microseconds = _positive_duration_microseconds(
+            timeout_seconds,
+            label="resource snapshot timeout_seconds",
+        )
+        try:
+            return self._bounded_resource_snapshot_microseconds(
+                timeout_microseconds=timeout_microseconds
+            )
+        except TimeoutError as exc:
+            raise LabDaemonConfigurationError("resource snapshot provider timed out") from exc
+
+    def _bounded_resource_snapshot_microseconds(
+        self,
+        *,
+        timeout_microseconds: int,
+        not_after_monotonic_microseconds: int | None = None,
+        include_spawn_allowance: bool = False,
+    ) -> ResourceSnapshot:
+        result = self._run_authority_stage(
+            operation="snapshot",
+            spec=None,
+            timeout_microseconds=timeout_microseconds,
+            not_after_monotonic_microseconds=not_after_monotonic_microseconds,
+            include_spawn_allowance=include_spawn_allowance,
+        )
+        if result.snapshot is None:
+            raise LabDaemonConfigurationError(
+                "resource snapshot provider returned an invalid contract"
+            )
+        self._record_snapshot_authority_state(result.authority_state)
+        return result.snapshot
 
     def _verified_runtime_code_sha(self, spec: ResearchRunSpec) -> str:
         return self._verify_runtime_guard(expected_sha=spec.code_sha)
 
-    @contextmanager
-    def _open_store(
-        self,
-        spec: ResearchRunSpec,
-        *,
-        runtime_code_sha: str,
-    ) -> Iterator[object]:
-        if spec.research_status == "exploratory":
-            if self.exploratory_store_factory is None:
-                raise PermissionError(
-                    "exploratory worker execution requires an explicit read-only store factory"
+    def _validate_closed_claim(
+        self, claim: LabShardClaim | LabShardClaimV2
+    ) -> ValidatedStrategyShard:
+        binding = self.shard_runtime_manifest.registry
+        if binding.registry_id == _TEST_SHARD_REGISTRY_ID:
+            configuration = strict_canonical_json_loads(binding.configuration_json)
+            if (
+                isinstance(configuration, dict)
+                and configuration.get("bypass_parent_validation") is True
+            ):
+                payload = StrategyShardPayload.model_validate_json(claim.definition.payload_json)
+                return ValidatedStrategyShard(
+                    claim=claim,
+                    spec=payload.spec,
+                    shard=payload.shard,
                 )
-            with self.exploratory_store_factory() as store:
-                yield store
-            return
-
-        identity = spec.dataset_snapshot
-        if identity is None:
-            raise PermissionError("formal worker execution requires dataset_snapshot")
-        if self.metadata_store_factory is None or self.research_lake_root is None:
-            raise PermissionError(
-                "formal worker execution requires metadata store and research lake"
-            )
-        adapter = self.adapter_registry.for_spec(spec)
-        request = ResearchGateRequest(
-            mode="formal",
-            strategy_name=adapter.snapshot_strategy_name,
-            start_date=spec.parameters.start_date,
-            end_date=spec.parameters.end_date,
-            audit_run_id=identity.audit_run_id,
-            dataset_snapshot_id=identity.snapshot_id,
-            dataset_binding_hash=identity.binding_hash,
-            code_commit=runtime_code_sha,
-        )
-
-        def execution_session_factory(
-            binding: DatasetSnapshotBinding,
-            lake_root: Path,
-        ) -> AbstractContextManager[object]:
-            return ResearchExecutionSession(
-                binding=binding,
-                lake_root=lake_root,
-            )
-
-        with open_gated_research_store(
-            request,
-            metadata_store_factory=self.metadata_store_factory,
-            execution_session_factory=execution_session_factory,
-            lake_root=self.research_lake_root,
-        ) as (execution_store, _decision):
-            yield execution_store
+        return self.adapter_registry.validate_claim(claim)
 
     def _heartbeat_loop(
         self,
@@ -1458,7 +4250,8 @@ class LabWorker:
         finished: threading.Event,
         errors: list[Exception],
     ) -> None:
-        while not finished.wait(self.heartbeat_interval_seconds):
+        heartbeat_interval_seconds = _microseconds_to_seconds(self.heartbeat_interval_microseconds)
+        while not finished.wait(heartbeat_interval_seconds):
             try:
                 self._publish_report(
                     claim,
@@ -1469,6 +4262,632 @@ class LabWorker:
             except Exception as exc:
                 errors.append(exc)
                 finished.set()
+
+    def _resource_monitor_loop(
+        self,
+        claim: LabShardClaim,
+        spec: ResearchRunSpec,
+        finished: threading.Event,
+        preemptions: list[AdmissionDecision],
+        errors: list[Exception],
+    ) -> None:
+        resource_recheck_interval_seconds = _microseconds_to_seconds(
+            self.resource_recheck_interval_microseconds
+        )
+        while True:
+            if finished.wait(resource_recheck_interval_seconds):
+                return
+            try:
+                decision = self._resource_admission_decision(
+                    claim,
+                    spec,
+                )
+            except Exception as exc:
+                errors.append(exc)
+                return
+            if decision is not None and decision.outcome is not AdmissionOutcome.ADMITTED:
+                preemptions.append(decision)
+                return
+
+    @staticmethod
+    def _terminate_isolated_process(
+        process: BaseProcess,
+        *,
+        isolated_group_id: int | None,
+        allow_graceful_termination: bool = True,
+    ) -> None:
+        errors: list[BaseException] = []
+
+        def attempt(
+            label: str,
+            action: Callable[[], object],
+            *,
+            process_lookup_is_success: bool = False,
+        ) -> None:
+            try:
+                action()
+            except ProcessLookupError as exc:
+                if not process_lookup_is_success:
+                    errors.append(BaseExceptionGroup(f"{label} failed", [exc]))
+            except PermissionError as exc:
+                if not process_lookup_is_success:
+                    errors.append(BaseExceptionGroup(f"{label} failed", [exc]))
+            except BaseException as exc:
+                errors.append(BaseExceptionGroup(f"{label} failed", [exc]))
+
+        try:
+            pid = process.pid
+        except BaseException as exc:
+            errors.append(BaseExceptionGroup("process PID probe failed", [exc]))
+            pid = None
+        try:
+            parent_group_id = os.getpgrp()
+        except BaseException as exc:
+            errors.append(BaseExceptionGroup("parent process-group probe failed", [exc]))
+            parent_group_id = None
+        group_owned = (
+            pid is not None
+            and isolated_group_id == pid
+            and parent_group_id is not None
+            and isolated_group_id != parent_group_id
+        )
+
+        def pid_exists() -> bool:
+            if pid is None:
+                return False
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return False
+            except BaseException as exc:
+                errors.append(BaseExceptionGroup("PID existence probe failed", [exc]))
+                return True
+            return True
+
+        def direct_child_active() -> bool:
+            try:
+                if process.exitcode is not None:
+                    return False
+            except BaseException as exc:
+                errors.append(BaseExceptionGroup("process exitcode probe failed", [exc]))
+            return pid_exists()
+
+        def group_exists() -> bool:
+            if not group_owned or isolated_group_id is None:
+                return False
+            try:
+                os.killpg(isolated_group_id, 0)
+            except ProcessLookupError:
+                return False
+            except PermissionError:
+                return True
+            except BaseException as exc:
+                errors.append(BaseExceptionGroup("process-group existence probe failed", [exc]))
+                return True
+            return True
+
+        attempt("initial process reap", lambda: process.join(timeout=0))
+        if allow_graceful_termination:
+            if group_owned and isolated_group_id is not None:
+                attempt(
+                    "process-group SIGTERM",
+                    lambda: os.killpg(isolated_group_id, signal.SIGTERM),
+                    process_lookup_is_success=True,
+                )
+            if direct_child_active():
+                attempt(
+                    "PID SIGTERM",
+                    process.terminate,
+                    process_lookup_is_success=True,
+                )
+            attempt(
+                "post-SIGTERM process reap",
+                lambda: process.join(_microseconds_to_seconds(_CHILD_TERMINATE_GRACE_MICROSECONDS)),
+            )
+
+        retry_join_microseconds = max(
+            1,
+            _CHILD_TERMINATE_GRACE_MICROSECONDS // _PROCESS_CLEANUP_RETRIES,
+        )
+        for _attempt_number in range(_PROCESS_CLEANUP_RETRIES):
+            if direct_child_active():
+                attempt(
+                    "PID SIGKILL",
+                    process.kill,
+                    process_lookup_is_success=True,
+                )
+            if group_owned and isolated_group_id is not None:
+                attempt(
+                    "process-group SIGKILL",
+                    lambda: os.killpg(isolated_group_id, signal.SIGKILL),
+                    process_lookup_is_success=True,
+                )
+            attempt(
+                "post-SIGKILL process reap",
+                lambda: process.join(_microseconds_to_seconds(retry_join_microseconds)),
+            )
+
+        process_reported_alive = False
+        try:
+            process_reported_alive = process.is_alive()
+        except BaseException as exc:
+            errors.append(BaseExceptionGroup("process liveness probe failed", [exc]))
+
+        process_pid_exists = direct_child_active()
+        process_group_exists = group_exists()
+        verification_deadline_microseconds = (
+            _monotonic_microseconds() + _CHILD_TERMINATE_GRACE_MICROSECONDS
+        )
+        while (
+            process_pid_exists or process_group_exists
+        ) and _monotonic_microseconds() < verification_deadline_microseconds:
+            remaining_microseconds = max(
+                1,
+                verification_deadline_microseconds - _monotonic_microseconds(),
+            )
+            attempt(
+                "verification process reap",
+                lambda remaining_microseconds=remaining_microseconds: process.join(
+                    _microseconds_to_seconds(min(10_000, remaining_microseconds))
+                ),
+            )
+            process_pid_exists = direct_child_active()
+            process_group_exists = group_exists()
+
+        try:
+            process_reported_alive = process.is_alive()
+        except BaseException as exc:
+            errors.append(BaseExceptionGroup("final process liveness probe failed", [exc]))
+
+        if process_reported_alive or process_pid_exists:
+            errors.append(RuntimeError("isolated shard child could not be terminated and reaped"))
+        if process_group_exists:
+            errors.append(RuntimeError("isolated shard process group still exists after cleanup"))
+        if errors:
+            raise BaseExceptionGroup("isolated process cleanup failed", errors)
+
+    def _execute_shard_isolated(
+        self,
+        claim: LabShardClaim,
+        validated: ValidatedStrategyShard,
+        *,
+        runtime_code_sha: str,
+        hard_limit_seconds: float,
+        initial_session: TradingSession,
+        tick_deadline_microseconds: int | None = None,
+    ) -> _IsolatedExecutionControl:
+        hard_limit_microseconds = _positive_duration_microseconds(
+            hard_limit_seconds,
+            label="isolated live shard hard_limit_seconds",
+        )
+        hard_limit_milliseconds = hard_limit_microseconds // 1_000
+        parent_started = self.isolation_monotonic_microseconds_clock()
+        deadline_remaining_microseconds = max(
+            0,
+            timedelta_microseconds(validated.spec.deadline - _utc(self.clock())),
+        )
+        spec_deadline = parent_started + deadline_remaining_microseconds
+        hard_deadline = spec_deadline
+        child_budget = deadline_remaining_microseconds
+        spec_child_deadline = _monotonic_microseconds() + child_budget
+        result_child_deadline = spec_child_deadline
+        ack_live_limit_microseconds = (
+            hard_limit_microseconds if initial_session in _LIVE_TRADING_SESSIONS else None
+        )
+        request = _ShardWireRequest(
+            manifest=self.shard_runtime_manifest,
+            validated=validated,
+            runtime_code_sha=runtime_code_sha,
+        )
+        finished = threading.Event()
+        heartbeat_errors: list[Exception] = []
+        heartbeat = threading.Thread(
+            target=self._heartbeat_loop,
+            args=(claim, finished, heartbeat_errors),
+            name=f"lab-heartbeat-{claim.claim_token}",
+            daemon=True,
+        )
+        child: _WireChild | None = None
+        outcome: _IsolatedExecutionOutcome | None = None
+        stop_reason: str | None = None
+        preemption: AdmissionDecision | None = None
+        resource_error: Exception | None = None
+        lifecycle_error: BaseException | None = None
+        cleanup_errors: list[BaseException] = []
+        pre_ack_resource_refresh: threading.Thread | None = None
+        pre_ack_refresh_cancelled = threading.Event()
+        pre_ack_refresh_complete = threading.Event()
+        pre_ack_evaluation: _ResourceAdmissionEvaluation | None = None
+        pre_ack_stop_reason: str | None = None
+        pre_ack_resource_error: Exception | None = None
+        child_ready = False
+        isolation_start_aborted = False
+
+        def deadline_stop_reason(now_microseconds: int) -> str:
+            if now_microseconds >= spec_deadline:
+                return "ResearchRunSpec deadline reached during isolated shard execution"
+            return f"hard live execution limit reached: {hard_limit_milliseconds}ms"
+
+        def apply_resource_evaluation(
+            evaluation: _ResourceAdmissionEvaluation | None,
+            now_microseconds: int,
+            *,
+            execution_active: bool,
+        ) -> None:
+            nonlocal ack_live_limit_microseconds, hard_deadline, preemption
+            nonlocal result_child_deadline, stop_reason
+            if (
+                evaluation is not None
+                and evaluation.decision.outcome is not AdmissionOutcome.ADMITTED
+            ):
+                preemption = evaluation.decision
+                return
+            if evaluation is not None and evaluation.snapshot.session in _LIVE_TRADING_SESSIONS:
+                live_limit = evaluation.policy.max_live_shard_duration_ms * 1_000
+                if execution_active:
+                    hard_deadline = min(hard_deadline, now_microseconds + live_limit)
+                    result_child_deadline = min(
+                        result_child_deadline,
+                        _monotonic_microseconds() + live_limit,
+                    )
+                else:
+                    ack_live_limit_microseconds = (
+                        live_limit
+                        if ack_live_limit_microseconds is None
+                        else min(ack_live_limit_microseconds, live_limit)
+                    )
+            active_deadline = hard_deadline if execution_active else spec_deadline
+            if self.isolation_monotonic_microseconds_clock() >= active_deadline:
+                stop_reason = deadline_stop_reason(self.isolation_monotonic_microseconds_clock())
+
+        def await_child_readiness_before_reservation_recheck() -> None:
+            with self._isolation_start_condition:
+                self._isolation_start_condition.wait_for(
+                    lambda: child_ready or isolation_start_aborted or self._stop.is_set()
+                )
+                if self._stop.is_set():
+                    raise InterruptedError(
+                        "worker stop requested before resource reservation recheck"
+                    )
+                if isolation_start_aborted:
+                    raise InterruptedError(
+                        "isolated shard startup aborted before resource reservation recheck"
+                    )
+
+        def refresh_admission(
+            *,
+            execution_active: bool,
+            wait_for_child_readiness: bool = False,
+        ) -> None:
+            nonlocal resource_error, stop_reason
+            authority_deadline = hard_deadline if execution_active else spec_deadline
+            authority_child_deadline = (
+                result_child_deadline if execution_active else spec_child_deadline
+            )
+            remaining = authority_deadline - self.isolation_monotonic_microseconds_clock()
+            if remaining <= 0:
+                stop_reason = deadline_stop_reason(self.isolation_monotonic_microseconds_clock())
+                return
+            try:
+                evaluation = self._resource_admission_evaluation(
+                    claim,
+                    validated.spec,
+                    probe_timeout_microseconds=min(
+                        self.resource_probe_timeout_microseconds,
+                        remaining,
+                    ),
+                    authority_not_after_monotonic_microseconds=min(
+                        authority_child_deadline,
+                        _monotonic_microseconds() + remaining,
+                    ),
+                    reservation_recheck_gate=(
+                        await_child_readiness_before_reservation_recheck
+                        if wait_for_child_readiness
+                        else None
+                    ),
+                    tick_deadline_microseconds=(
+                        None if execution_active else tick_deadline_microseconds
+                    ),
+                )
+            except (InterruptedError, TimeoutError):
+                if self._stop.is_set():
+                    stop_reason = "worker stop requested during resource reservation recheck"
+                else:
+                    stop_reason = deadline_stop_reason(
+                        self.isolation_monotonic_microseconds_clock()
+                    )
+                return
+            except Exception as exc:
+                resource_error = exc
+                return
+            apply_resource_evaluation(
+                evaluation,
+                self.isolation_monotonic_microseconds_clock(),
+                execution_active=execution_active,
+            )
+
+        def refresh_pre_ack_admission() -> None:
+            nonlocal pre_ack_evaluation, pre_ack_resource_error, pre_ack_stop_reason
+
+            def cancelled() -> bool:
+                return pre_ack_refresh_cancelled.is_set() or self._stop.is_set()
+
+            try:
+                remaining = spec_deadline - self.isolation_monotonic_microseconds_clock()
+                if remaining <= 0:
+                    if not cancelled():
+                        pre_ack_stop_reason = deadline_stop_reason(
+                            self.isolation_monotonic_microseconds_clock()
+                        )
+                    return
+                pre_ack_timeout_microseconds = (
+                    self._early_prepublication_probe_timeout_microseconds(
+                        tick_deadline_microseconds,
+                        operation="pre-ACK resource admission authority",
+                    )
+                )
+                evaluation = self._resource_admission_evaluation(
+                    claim,
+                    validated.spec,
+                    probe_timeout_microseconds=min(
+                        self.resource_probe_timeout_microseconds,
+                        remaining,
+                        pre_ack_timeout_microseconds,
+                    ),
+                    authority_not_after_monotonic_microseconds=min(
+                        spec_child_deadline,
+                        _monotonic_microseconds() + remaining,
+                    ),
+                    reservation_recheck_gate=await_child_readiness_before_reservation_recheck,
+                    cancellation_requested=cancelled,
+                    tick_deadline_microseconds=tick_deadline_microseconds,
+                )
+            except (InterruptedError, TimeoutError):
+                if not cancelled():
+                    pre_ack_stop_reason = deadline_stop_reason(
+                        self.isolation_monotonic_microseconds_clock()
+                    )
+            except Exception as exc:
+                if not cancelled():
+                    pre_ack_resource_error = exc
+            else:
+                if not cancelled():
+                    pre_ack_evaluation = evaluation
+            finally:
+                pre_ack_refresh_complete.set()
+
+        try:
+            if self.resource_authority_manifest is not None:
+                pre_ack_resource_refresh = threading.Thread(
+                    target=refresh_pre_ack_admission,
+                    name=f"lab-pre-ack-resource-{claim.claim_token}",
+                    daemon=True,
+                )
+                pre_ack_resource_refresh.start()
+            readiness_deadline = min(
+                spec_child_deadline,
+                _monotonic_microseconds() + _ISOLATION_READY_TIMEOUT_MICROSECONDS,
+            )
+            child = self._start_wire_child(
+                target=_shard_wire_child,
+                request_bytes=_encode_wire_message(request),
+                process_name=f"lab-shard-{claim.claim_token}",
+                deadline_microseconds=readiness_deadline,
+                label="isolated shard",
+                max_wire_bytes=_MAX_CONTROL_WIRE_BYTES,
+                honor_worker_stop_during_readiness=False,
+            )
+            with self._isolation_start_condition:
+                child_ready = True
+                self._isolation_start_condition.notify_all()
+            if pre_ack_resource_refresh is not None:
+                while not pre_ack_refresh_complete.is_set():
+                    now = self.isolation_monotonic_microseconds_clock()
+                    if self._stop.is_set():
+                        pre_ack_refresh_cancelled.set()
+                        stop_reason = "worker stop requested before isolated shard start"
+                        break
+                    if now >= spec_deadline:
+                        pre_ack_refresh_cancelled.set()
+                        stop_reason = deadline_stop_reason(now)
+                        break
+                    pre_ack_refresh_complete.wait(
+                        _microseconds_to_seconds(min(10_000, spec_deadline - now))
+                    )
+                if pre_ack_refresh_complete.is_set() and not pre_ack_refresh_cancelled.is_set():
+                    if pre_ack_stop_reason is not None:
+                        stop_reason = pre_ack_stop_reason
+                    elif pre_ack_resource_error is not None:
+                        resource_error = pre_ack_resource_error
+                    else:
+                        apply_resource_evaluation(
+                            pre_ack_evaluation,
+                            self.isolation_monotonic_microseconds_clock(),
+                            execution_active=False,
+                        )
+            self._before_isolation_start_commit_for_test()
+            with self._isolation_start_gate:
+                start_generation = self._isolation_stop_generation
+                if self._stop.is_set():
+                    stop_reason = "worker stop requested before isolated shard start"
+                elif self.isolation_monotonic_microseconds_clock() >= hard_deadline:
+                    stop_reason = deadline_stop_reason(
+                        self.isolation_monotonic_microseconds_clock()
+                    )
+                if not any(
+                    value is not None for value in (stop_reason, preemption, resource_error)
+                ):
+                    self._during_isolation_start_commit_for_test()
+                    if self._stop.is_set() or self._isolation_stop_generation != start_generation:
+                        stop_reason = "worker stop requested before isolated shard start"
+                    else:
+                        # The accepted ACK is the child's adapter-start permit.  Stop
+                        # requests serialize on this same gate, so they observe either
+                        # a pre-ACK stop or an already committed post-ACK execution.
+                        _send_wire(
+                            child.connection,
+                            _IsolationStartAck(
+                                accepted=True,
+                                not_after_monotonic_microseconds=spec_child_deadline,
+                                execution_limit_microseconds=ack_live_limit_microseconds,
+                            ),
+                        )
+                        ack_success_microseconds = self.isolation_monotonic_microseconds_clock()
+                        if ack_success_microseconds >= spec_deadline:
+                            stop_reason = deadline_stop_reason(ack_success_microseconds)
+                        elif ack_live_limit_microseconds is not None:
+                            hard_deadline = min(
+                                spec_deadline,
+                                ack_success_microseconds + ack_live_limit_microseconds,
+                            )
+                            result_child_deadline = min(
+                                spec_child_deadline,
+                                _monotonic_microseconds() + ack_live_limit_microseconds,
+                            )
+            if not any(value is not None for value in (stop_reason, preemption, resource_error)):
+                heartbeat.start()
+                next_resource_check = (
+                    self.isolation_monotonic_microseconds_clock()
+                    + self.resource_recheck_interval_microseconds
+                )
+                while True:
+                    now = self.isolation_monotonic_microseconds_clock()
+                    if self._stop.is_set():
+                        stop_reason = "worker stop requested during isolated shard execution"
+                        break
+                    if heartbeat_errors:
+                        break
+                    if now >= hard_deadline:
+                        stop_reason = deadline_stop_reason(now)
+                        break
+                    if child.connection.poll(0):
+                        candidate = self._receive_wire_before_deadline(
+                            child,
+                            model=_IsolatedExecutionWireOutcome,
+                            max_bytes=_MAX_SHARD_RESULT_WIRE_BYTES,
+                            deadline_microseconds=result_child_deadline,
+                            label="isolated shard outcome",
+                        )
+                        now = self.isolation_monotonic_microseconds_clock()
+                        if now >= hard_deadline:
+                            stop_reason = deadline_stop_reason(now)
+                            break
+                        if candidate.result is not None:
+                            outcome = _IsolatedExecutionOutcome(result=candidate.result.to_result())
+                        else:
+                            outcome = _IsolatedExecutionOutcome(
+                                phase=candidate.phase,
+                                error_type=candidate.error_type,
+                                message=candidate.message,
+                                configuration_error=candidate.configuration_error,
+                            )
+                        break
+                    if not child.process.is_alive():
+                        resource_error = RuntimeError(
+                            "isolated shard child exited without an outcome"
+                        )
+                        break
+                    if self.resource_authority_manifest is not None and now >= next_resource_check:
+                        refresh_admission(execution_active=True)
+                        if any(
+                            value is not None for value in (stop_reason, preemption, resource_error)
+                        ):
+                            break
+                        next_resource_check = (
+                            self.isolation_monotonic_microseconds_clock()
+                            + self.resource_recheck_interval_microseconds
+                        )
+                    wait_microseconds = min(
+                        50_000,
+                        max(1_000, hard_deadline - now),
+                        max(1_000, next_resource_check - now),
+                    )
+                    self._stop.wait(_microseconds_to_seconds(wait_microseconds))
+        except (InterruptedError, TimeoutError) as exc:
+            if self._stop.is_set():
+                stop_reason = str(exc) or "worker stop requested during isolated shard execution"
+            else:
+                stop_reason = deadline_stop_reason(self.isolation_monotonic_microseconds_clock())
+        except Exception as exc:
+            resource_error = exc
+        except BaseException as exc:
+            lifecycle_error = exc
+        finally:
+            pre_ack_refresh_cancelled.set()
+            with self._isolation_start_condition:
+                isolation_start_aborted = True
+                self._isolation_start_condition.notify_all()
+            try:
+                finished.set()
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+            if heartbeat.ident is not None:
+                try:
+                    heartbeat.join()
+                except BaseException as exc:
+                    cleanup_errors.append(exc)
+            if child is not None:
+                try:
+                    self._close_wire_child(
+                        child,
+                        label="isolated shard",
+                        allow_graceful_termination=(stop_reason is None and preemption is None),
+                    )
+                except BaseException as exc:
+                    cleanup_errors.append(exc)
+
+        if lifecycle_error is not None and cleanup_errors:
+            raise BaseExceptionGroup(
+                "isolated shard lifecycle and cleanup failed",
+                [lifecycle_error, *cleanup_errors],
+            )
+        if lifecycle_error is not None:
+            raise lifecycle_error
+        fatal_cleanup_errors = [
+            error for error in cleanup_errors if not isinstance(error, Exception)
+        ]
+        if fatal_cleanup_errors:
+            raise BaseExceptionGroup("isolated shard cleanup failed", cleanup_errors)
+        if cleanup_errors:
+            primary_error: Exception | None = resource_error
+            if primary_error is None and stop_reason is not None:
+                primary_error = RuntimeError(stop_reason)
+            if primary_error is None and preemption is not None:
+                primary_error = RuntimeError(
+                    "resource admission revoked during isolated shard execution: "
+                    + ",".join(preemption.reason_codes)
+                )
+            if primary_error is None and heartbeat_errors:
+                primary_error = heartbeat_errors[0]
+            if (
+                primary_error is None
+                and outcome is not None
+                and outcome.result is None
+                and outcome.error_type is not None
+            ):
+                primary_error = LabIsolatedExecutionError(
+                    remote_error_type=outcome.error_type,
+                    message=outcome.message or "isolated shard execution failed",
+                )
+            combined = ([primary_error] if primary_error is not None else []) + cleanup_errors
+            resource_error = (
+                combined[0]
+                if len(combined) == 1
+                else ExceptionGroup(
+                    "isolated shard execution and cleanup failed",
+                    combined,
+                )
+            )
+            outcome = None
+            stop_reason = None
+            preemption = None
+        return _IsolatedExecutionControl(
+            outcome=outcome,
+            stop_reason=stop_reason,
+            preemption=preemption,
+            resource_error=resource_error,
+            heartbeat_error=heartbeat_errors[0] if heartbeat_errors else None,
+        )
 
     def _check_deadline(self, spec: ResearchRunSpec) -> None:
         if _utc(self.clock()) >= spec.deadline:
@@ -1593,6 +5012,9 @@ class LabWorker:
                     content_sha256=canonical_shard_frame_digest(persisted),
                 )
             )
+        validated_spec = self._validate_closed_claim(claim).spec
+        execution = validated_spec.strategy_execution
+        experiment = validated_spec.experiment
         manifest = LabShardResultManifest(
             worker_code_sha=worker_code_sha,
             content_digest_algorithm=CURRENT_CONTENT_DIGEST_ALGORITHM,
@@ -1606,6 +5028,22 @@ class LabWorker:
             plan_hash=claim.plan_hash,
             adapter_id=claim.definition.adapter_id,
             adapter_version=claim.definition.adapter_version,
+            experiment_id=None if experiment is None else experiment.experiment_id,
+            experiment_attempt_identity=(
+                None if experiment is None else experiment.attempt_identity
+            ),
+            strategy_execution_identity_hash=(
+                None if execution is None else execution.identity_hash
+            ),
+            strategy_spec_fingerprint=(
+                None if execution is None else execution.strategy_spec_fingerprint
+            ),
+            strategy_executable_fingerprint=(
+                None if execution is None else execution.strategy_executable_fingerprint
+            ),
+            candidate_schema_fingerprint=(
+                None if execution is None else execution.candidate_schema_fingerprint
+            ),
             artifacts=tuple(artifacts),
             metrics=result.metrics,
         )
@@ -1799,7 +5237,7 @@ class LabWorker:
         self._verify_runtime_guard(expected_sha=worker_code_sha)
         self._validate_result_identity(claim, result)
         resolved_code_sha = worker_code_sha or self._verified_runtime_code_sha(
-            self.adapter_registry.validate_claim(claim).spec
+            self._validate_closed_claim(claim).spec
         )
         sealed = self.sealed_bundle_path(claim)
         temporary_root = self._temporary_bundle_path(claim)
@@ -2066,11 +5504,52 @@ class LabWorker:
         try:
             receipt = self.receipt_waiter(
                 pending.report,
-                self.receipt_timeout_seconds,
+                self._receipt_wait_timeout_seconds(),
                 self._stop,
             )
             self._validate_receipt_identity(pending.report, receipt)
         except TimeoutError as exc:
+            if self._uses_local_receipt_waiter:
+                try:
+                    receipt = self._retry_local_receipt_wait(pending.report)
+                    self._validate_receipt_identity(pending.report, receipt)
+                except TimeoutError:
+                    pass
+                except InterruptedError:
+                    return self._set_pending_receipt_state("reported")
+                except Exception as retry_error:
+                    _safe_structured_log(
+                        "error",
+                        "success_receipt_transport_failed",
+                        message=str(retry_error) or type(retry_error).__name__,
+                        component="lab_worker",
+                        worker_id=self.worker_id,
+                        job_id=str(pending.claim.job_id),
+                        shard_id=str(pending.claim.shard_id),
+                        claim_token=str(pending.claim.claim_token),
+                        report_id=str(pending.report.report_id),
+                        error_type=type(retry_error).__name__,
+                    )
+                    return self._set_pending_receipt_state("unknown")
+                else:
+                    if receipt.status == "rejected":
+                        self._rollback_sealed(pending.claim, pending.bundle)
+                        self._pending_success = None
+                        self._resource_retry_at.pop(pending.claim.claim_token, None)
+                        return LabWorkerTickResult(
+                            status="failed",
+                            claim_token=pending.claim.claim_token,
+                            manifest_hash=pending.bundle.manifest.manifest_hash,
+                            report_id=pending.report.report_id,
+                        )
+                    self._pending_success = None
+                    self._resource_retry_at.pop(pending.claim.claim_token, None)
+                    return LabWorkerTickResult(
+                        status="succeeded",
+                        claim_token=pending.claim.claim_token,
+                        manifest_hash=pending.bundle.manifest.manifest_hash,
+                        report_id=pending.report.report_id,
+                    )
             _safe_structured_log(
                 "warning",
                 "success_receipt_timeout",
@@ -2102,6 +5581,7 @@ class LabWorker:
         if receipt.status == "rejected":
             self._rollback_sealed(pending.claim, pending.bundle)
             self._pending_success = None
+            self._resource_retry_at.pop(pending.claim.claim_token, None)
             return LabWorkerTickResult(
                 status="failed",
                 claim_token=pending.claim.claim_token,
@@ -2109,6 +5589,7 @@ class LabWorker:
                 report_id=pending.report.report_id,
             )
         self._pending_success = None
+        self._resource_retry_at.pop(pending.claim.claim_token, None)
         return LabWorkerTickResult(
             status="succeeded",
             claim_token=pending.claim.claim_token,
@@ -2123,7 +5604,9 @@ class LabWorker:
         phase: Literal["claim", "session", "execute", "deadline", "fence", "seal"],
         error: Exception,
     ) -> LabWorkerTickResult:
-        message = (" ".join(str(error).split()) or type(error).__name__)[:400]
+        message = _bounded_exception_message(error)
+        error_type = getattr(error, "remote_error_type", type(error).__name__)
+        self._resource_retry_at.pop(claim.claim_token, None)
         _safe_structured_log(
             "warning" if phase in {"deadline", "fence"} else "error",
             "shard_execution_failed",
@@ -2136,11 +5619,11 @@ class LabWorker:
             claim_token=str(claim.claim_token),
             claim_generation=claim.claim_generation,
             scheduler_fencing_token=claim.scheduler_fencing_token,
-            error_type=type(error).__name__,
+            error_type=error_type,
         )
         failure = LabWorkerFailure(
             phase=phase,
-            error_type=type(error).__name__,
+            error_type=error_type,
             message=message,
         )
         self._best_effort_report(
@@ -2150,14 +5633,17 @@ class LabWorker:
         return LabWorkerTickResult(status="failed", claim_token=claim.claim_token)
 
     def _stopped_result(self, claim: LabShardClaim, *, reason: str) -> LabWorkerTickResult:
+        self._resource_retry_at.pop(claim.claim_token, None)
         self._best_effort_report(claim, LabWorkerStopped(reason=reason))
         return LabWorkerTickResult(status="stopped", claim_token=claim.claim_token)
 
     def _maybe_reconcile_quarantine(self) -> tuple[LabWorkerHealthWarning, ...]:
-        now = time.monotonic()
-        if now < self._next_quarantine_reconcile_at:
+        now_microseconds = _monotonic_microseconds()
+        if now_microseconds < self._next_quarantine_reconcile_at_microseconds:
             return ()
-        self._next_quarantine_reconcile_at = now + self.quarantine_reconcile_interval_seconds
+        self._next_quarantine_reconcile_at_microseconds = (
+            now_microseconds + self.quarantine_reconcile_interval_microseconds
+        )
         self._verify_runtime_guard()
         try:
             self.artifact_reclaimer.recover_active(max_entries=16)
@@ -2180,26 +5666,164 @@ class LabWorker:
             )
         return ()
 
-    def run_once(self) -> LabWorkerTickResult:
-        self._verify_runtime_guard()
-        warnings = (
-            ()
-            if self._pending_success is not None or self._stop.is_set()
-            else self._maybe_reconcile_quarantine()
-        )
-        result = self._run_claim_once()
-        if not warnings:
-            return result
-        return result.model_copy(update={"health_warnings": warnings})
+    def close(self) -> None:
+        """Boundedly retry any retained authority-child cleanup handles."""
 
-    def _run_claim_once(self) -> LabWorkerTickResult:
+        self._reap_managed_authority_children()
+
+    def run_once(self) -> LabWorkerTickResult:
+        primary_error: BaseException | None = None
+        result: LabWorkerTickResult | None = None
+        try:
+            self._reap_managed_authority_children()
+            self._verify_closed_registries()
+            self._verify_runtime_guard()
+            prepublication_deadline_microseconds = (
+                None
+                if self.resource_authority_manifest is None
+                else (
+                    self.monotonic_microseconds_clock()
+                    + self.prepublication_admission_budget_microseconds
+                )
+            )
+            warnings = (
+                ()
+                if self._pending_success is not None or self._stop.is_set()
+                else self._maybe_reconcile_quarantine()
+            )
+            result = self._run_claim_once(
+                tick_deadline_microseconds=prepublication_deadline_microseconds,
+            )
+            if warnings:
+                result = result.model_copy(update={"health_warnings": warnings})
+        except BaseException as exc:
+            primary_error = exc
+
+        cleanup_errors: list[BaseException] = []
+        try:
+            if self._active_resource_reservation is not None:
+                self._release_resource_reservation()
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+        try:
+            self._reap_managed_authority_children()
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+
+        if primary_error is not None:
+            if cleanup_errors:
+                raise BaseExceptionGroup(
+                    "worker tick and cleanup failed",
+                    [primary_error, *cleanup_errors],
+                ) from primary_error
+            raise primary_error
+        if cleanup_errors:
+            if len(cleanup_errors) == 1:
+                raise cleanup_errors[0]
+            raise BaseExceptionGroup("worker tick cleanup failed", cleanup_errors)
+        if result is None:  # pragma: no cover - control-flow invariant
+            raise LabDaemonConfigurationError("worker tick returned no result")
+        return result
+
+    def _run_claim_once(
+        self,
+        *,
+        tick_deadline_microseconds: int | None,
+    ) -> LabWorkerTickResult:
         if self._pending_success is not None:
             return self._await_pending_success()
         if self._stop.is_set():
             return LabWorkerTickResult(status="stopped")
-        claim = self._next_owned_claim()
-        if claim is None:
+        entry = self._next_owned_claim_entry()
+        if entry is None:
             return LabWorkerTickResult(status="idle")
+        try:
+            self._require_v2_publication_before_admission(entry)
+        except (LabClaimFinalizerError, SourceOperationContractError):
+            return LabWorkerTickResult(status="idle")
+        claim = entry.claim
+        if self._stop.is_set():
+            return LabWorkerTickResult(status="stopped", claim_token=claim.claim_token)
+
+        try:
+            validated = self._validate_closed_claim(claim)
+        except Exception as exc:
+            if self._consume_selected_claim(entry) is None:
+                return LabWorkerTickResult(status="idle")
+            return self._failure_result(claim, phase="claim", error=exc)
+
+        try:
+            runtime_code_sha = self._verified_runtime_code_sha(validated.spec)
+        except LabDaemonConfigurationError:
+            raise
+        except Exception as exc:
+            if self._consume_selected_claim(entry) is None:
+                return LabWorkerTickResult(status="idle")
+            return self._failure_result(claim, phase="session", error=exc)
+
+        try:
+            self._check_deadline(validated.spec)
+        except Exception as exc:
+            if self._consume_selected_claim(entry) is None:
+                return LabWorkerTickResult(status="idle")
+            return self._failure_result(claim, phase="deadline", error=exc)
+
+        try:
+            admission_evaluation = self._reserve_resource_admission(
+                claim,
+                validated.spec,
+                tick_deadline_microseconds=tick_deadline_microseconds,
+            )
+        except (InterruptedError, TimeoutError) as exc:
+            if isinstance(exc, TimeoutError):
+                if self._consume_selected_claim(entry) is None:
+                    return LabWorkerTickResult(status="idle")
+                return self._stopped_result(
+                    claim,
+                    reason=str(exc) or "worker tick deadline reached",
+                )
+            if self._consume_selected_claim(entry) is None:
+                return LabWorkerTickResult(status="idle")
+            return self._stopped_result(
+                claim,
+                reason=str(exc) or type(exc).__name__,
+            )
+        decision = None if admission_evaluation is None else admission_evaluation.decision
+        if decision is not None and decision.outcome is not AdmissionOutcome.ADMITTED:
+            retry_at = decision.retry_at or (
+                _utc(self.clock())
+                + timedelta(
+                    seconds=max(
+                        1,
+                        _microseconds_to_seconds(self.poll_interval_microseconds),
+                    )
+                )
+            )
+            self._resource_retry_at[claim.claim_token] = retry_at
+            _safe_structured_log(
+                "info",
+                "shard_resource_admission_deferred",
+                message="research shard remains pending until resource admission recovers",
+                component="lab_worker",
+                worker_id=self.worker_id,
+                job_id=str(claim.job_id),
+                shard_id=str(claim.shard_id),
+                claim_token=str(claim.claim_token),
+                admission_outcome=decision.outcome.value,
+                reason_codes=decision.reason_codes,
+                retry_at=retry_at.isoformat(),
+            )
+            return LabWorkerTickResult(
+                status="deferred",
+                claim_token=claim.claim_token,
+                admission_decision=decision,
+            )
+
+        consumed = self._consume_selected_claim(entry)
+        if consumed is None:
+            return LabWorkerTickResult(status="idle")
+        claim = consumed
+
         if self._stop.is_set():
             return self._stopped_result(
                 claim,
@@ -2216,23 +5840,6 @@ class LabWorker:
             return self._failure_result(claim, phase="claim", error=exc)
 
         try:
-            validated = self.adapter_registry.validate_claim(claim)
-        except Exception as exc:
-            return self._failure_result(claim, phase="claim", error=exc)
-
-        try:
-            runtime_code_sha = self._verified_runtime_code_sha(validated.spec)
-        except LabDaemonConfigurationError:
-            raise
-        except Exception as exc:
-            return self._failure_result(claim, phase="session", error=exc)
-
-        try:
-            self._check_deadline(validated.spec)
-        except Exception as exc:
-            return self._failure_result(claim, phase="deadline", error=exc)
-
-        try:
             self._verify_runtime_guard(expected_sha=runtime_code_sha)
             self.claim_spool.admit_execution(claim)
         except (
@@ -2247,71 +5854,267 @@ class LabWorker:
         except Exception as exc:
             return self._failure_result(claim, phase="claim", error=exc)
 
-        monotonic_started = self.monotonic_clock()
-        finished = threading.Event()
+        monotonic_started_microseconds = self.monotonic_microseconds_clock()
+        result: LabShardExecutionResult | None = None
         heartbeat_errors: list[Exception] = []
-        heartbeat = threading.Thread(
-            target=self._heartbeat_loop,
-            args=(claim, finished, heartbeat_errors),
-            name=f"lab-heartbeat-{claim.claim_token}",
-            daemon=True,
-        )
-        heartbeat.start()
+        resource_preemptions: list[AdmissionDecision] = []
+        resource_errors: list[Exception] = []
         prepared: LabPreparedShardBundle | None = None
         operation_error: Exception | None = None
         operation_phase: Literal["session", "execute", "deadline", "seal"] = "execute"
         stop_reason: str | None = None
-        try:
-            try:
-                with self._open_store(
-                    validated.spec,
-                    runtime_code_sha=runtime_code_sha,
-                ) as store:
-                    result = self.adapter_registry.execute_shard(validated, store)
-            except PermissionError as exc:
-                operation_phase = "session"
-                operation_error = exc
-            except LabDaemonConfigurationError:
-                raise
-            except Exception as exc:
-                operation_phase = "execute"
-                operation_error = exc
-            if operation_error is None:
-                if self._stop.is_set():
-                    stop_reason = "worker stop requested after shard execution"
-                else:
-                    try:
-                        self._check_deadline(validated.spec)
-                    except Exception as exc:
-                        operation_phase = "deadline"
-                        operation_error = exc
-            if operation_error is None and stop_reason is None:
+        background_finished: threading.Event | None = None
+        background_heartbeat: threading.Thread | None = None
+        background_resource_monitor: threading.Thread | None = None
+        work_plan = claim.definition.work_plan
+        default_hard_limit_seconds = (
+            5.0 if work_plan is None else max(0.001, work_plan.static_duration_ms / 1_000)
+        )
+        control = self._execute_shard_isolated(
+            claim,
+            validated,
+            runtime_code_sha=runtime_code_sha,
+            hard_limit_seconds=(
+                default_hard_limit_seconds
+                if admission_evaluation is None
+                else admission_evaluation.policy.max_live_shard_duration_ms / 1_000
+            ),
+            initial_session=(
+                TradingSession.CLOSED
+                if admission_evaluation is None
+                else admission_evaluation.snapshot.session
+            ),
+            tick_deadline_microseconds=tick_deadline_microseconds,
+        )
+        stop_reason = control.stop_reason
+        if control.preemption is not None:
+            resource_preemptions.append(control.preemption)
+        if control.resource_error is not None:
+            resource_errors.append(control.resource_error)
+        if control.heartbeat_error is not None:
+            heartbeat_errors.append(control.heartbeat_error)
+        if control.outcome is not None:
+            if control.outcome.configuration_error:
+                raise LabDaemonConfigurationError(
+                    control.outcome.message or "isolated shard configuration failed"
+                )
+            if control.outcome.result is not None:
                 try:
-                    self._verify_runtime_guard(expected_sha=runtime_code_sha)
+                    result = LabShardExecutionResult.model_validate(control.outcome.result)
+                except Exception as exc:
+                    operation_phase = "execute"
+                    operation_error = exc
+            elif control.outcome.phase is not None:
+                operation_phase = control.outcome.phase
+                operation_error = LabIsolatedExecutionError(
+                    remote_error_type=(control.outcome.error_type or "RuntimeError"),
+                    message=(control.outcome.message or "isolated shard execution failed"),
+                )
+        if (
+            result is not None
+            and stop_reason is None
+            and not resource_preemptions
+            and not resource_errors
+            and not heartbeat_errors
+            and operation_error is None
+        ):
+            background_finished = threading.Event()
+            background_heartbeat = threading.Thread(
+                target=self._heartbeat_loop,
+                args=(claim, background_finished, heartbeat_errors),
+                name=f"lab-heartbeat-{claim.claim_token}",
+                daemon=True,
+            )
+            background_heartbeat.start()
+            background_resource_monitor = threading.Thread(
+                target=self._resource_monitor_loop,
+                args=(
+                    claim,
+                    validated.spec,
+                    background_finished,
+                    resource_preemptions,
+                    resource_errors,
+                ),
+                name=f"lab-resource-monitor-{claim.claim_token}",
+                daemon=True,
+            )
+            background_resource_monitor.start()
+
+        if operation_error is None and stop_reason is None:
+            if self._stop.is_set():
+                stop_reason = "worker stop requested after shard execution"
+            else:
+                try:
+                    self._check_deadline(validated.spec)
+                except Exception as exc:
+                    operation_phase = "deadline"
+                    operation_error = exc
+
+        if background_finished is not None:
+            background_finished.set()
+        if background_heartbeat is not None:
+            background_heartbeat.join()
+        if background_resource_monitor is not None:
+            background_resource_monitor.join()
+
+        effective_expiry: datetime | None = None
+        publish_decision: AdmissionDecision | None = None
+        post_publish_admission_stage: _PrestartedAuthorityStage | None = None
+
+        if (
+            operation_error is None
+            and stop_reason is None
+            and not resource_preemptions
+            and not resource_errors
+            and not heartbeat_errors
+            and result is not None
+        ):
+            try:
+                self._verify_runtime_guard(expected_sha=runtime_code_sha)
+                self._assert_publish_boundary(
+                    claim,
+                    deadline=validated.spec.deadline,
+                    effective_expiry=None,
+                    require_current_claim=True,
+                )
+                try:
+                    receipt = self._publish_and_wait(
+                        claim,
+                        LabShardHeartbeat(
+                            lease_extension_seconds=self.lease_extension_seconds,
+                        ),
+                        stop=self._stop,
+                    )
+                except TimeoutError:
+                    effective_expiry = claim.lease_expires_at
+                else:
+                    effective_expiry = receipt.accepted_at + timedelta(
+                        seconds=self.lease_extension_seconds
+                    )
+                self._assert_publish_boundary(
+                    claim,
+                    deadline=validated.spec.deadline,
+                    effective_expiry=effective_expiry,
+                    require_current_claim=True,
+                )
+                # Starting the isolated child is not an authority call: the child
+                # cannot resolve the request until the post-seal start ACK below.
+                # It overlaps only process startup with the required final fresh
+                # pre-publication admission, keeping the additional safety phase
+                # bounded without making the post-seal evidence stale.
+                if self.resource_authority_manifest is not None:
+                    post_publish_admission_stage = self._prestart_authority_stage(
+                        operation="admission",
+                        spec=validated.spec,
+                        admission_request=self._resource_admission_request(claim, validated.spec),
+                        deadline_microseconds=(
+                            self.monotonic_microseconds_clock()
+                            + self.post_publish_rollback_safety_budget_microseconds
+                        ),
+                    )
+                publish_evaluation = self._resource_admission_evaluation(
+                    claim,
+                    validated.spec,
+                    tick_deadline_microseconds=tick_deadline_microseconds,
+                )
+                publish_decision = (
+                    None if publish_evaluation is None else publish_evaluation.decision
+                )
+                if (
+                    publish_decision is not None
+                    and publish_decision.outcome is not AdmissionOutcome.ADMITTED
+                ):
+                    self._cancel_prestarted_authority_stage(
+                        post_publish_admission_stage,
+                        operation="admission",
+                    )
+                    resource_preemptions.append(publish_decision)
+                else:
+                    self._assert_publish_boundary(
+                        claim,
+                        deadline=validated.spec.deadline,
+                        effective_expiry=effective_expiry,
+                        require_current_claim=True,
+                    )
                     prepared = self._prepare_result(
                         claim,
                         result,
                         worker_code_sha=runtime_code_sha,
                     )
-                    self._check_deadline(validated.spec)
-                except TimeoutError as exc:
-                    operation_phase = "deadline"
-                    operation_error = exc
-                except LabDaemonConfigurationError:
-                    raise
-                except Exception as exc:
-                    operation_phase = "seal"
-                    operation_error = exc
-                if self._stop.is_set():
-                    stop_reason = "worker stop requested after candidate serialization"
-        finally:
-            finished.set()
-            heartbeat.join()
+                    try:
+                        self._check_deadline(validated.spec)
+                    except TimeoutError as exc:
+                        operation_phase = "seal"
+                        operation_error = exc
+            except InterruptedError:
+                self._cancel_prestarted_authority_stage(
+                    post_publish_admission_stage,
+                    operation="admission",
+                )
+                stop_reason = "worker stop requested while confirming final shard fence"
+            except TimeoutError as exc:
+                self._cancel_prestarted_authority_stage(
+                    post_publish_admission_stage,
+                    operation="admission",
+                )
+                resource_errors.append(exc)
+            except LabDaemonConfigurationError:
+                self._cancel_prestarted_authority_stage(
+                    post_publish_admission_stage,
+                    operation="admission",
+                )
+                raise
+            except Exception as exc:
+                self._cancel_prestarted_authority_stage(
+                    post_publish_admission_stage,
+                    operation="admission",
+                )
+                resource_errors.append(exc)
+            if self._stop.is_set():
+                stop_reason = "worker stop requested after candidate serialization"
+
+        if resource_preemptions:
+            self._cancel_prestarted_authority_stage(
+                post_publish_admission_stage,
+                operation="admission",
+            )
+            self._discard_prepared(prepared)
+            reasons = ",".join(resource_preemptions[0].reason_codes)
+            return self._stopped_result(
+                claim,
+                reason=f"resource admission revoked during shard execution: {reasons}",
+            )
+        if resource_errors:
+            self._cancel_prestarted_authority_stage(
+                post_publish_admission_stage,
+                operation="admission",
+            )
+            self._discard_prepared(prepared)
+            if isinstance(resource_errors[0], LabDaemonConfigurationError):
+                raise resource_errors[0]
+            if isinstance(resource_errors[0], TimeoutError):
+                return self._stopped_result(
+                    claim,
+                    reason=str(resource_errors[0]) or "worker tick deadline reached",
+                )
+            return self._failure_result(
+                claim,
+                phase="fence",
+                error=resource_errors[0],
+            )
 
         if stop_reason is not None:
+            self._cancel_prestarted_authority_stage(
+                post_publish_admission_stage,
+                operation="admission",
+            )
             self._discard_prepared(prepared)
             return self._stopped_result(claim, reason=stop_reason)
         if operation_error is not None:
+            self._cancel_prestarted_authority_stage(
+                post_publish_admission_stage,
+                operation="admission",
+            )
             self._discard_prepared(prepared)
             return self._failure_result(
                 claim,
@@ -2319,6 +6122,10 @@ class LabWorker:
                 error=operation_error,
             )
         if heartbeat_errors:
+            self._cancel_prestarted_authority_stage(
+                post_publish_admission_stage,
+                operation="admission",
+            )
             self._discard_prepared(prepared)
             if isinstance(heartbeat_errors[0], LabDaemonConfigurationError):
                 raise heartbeat_errors[0]
@@ -2327,13 +6134,31 @@ class LabWorker:
                 phase="fence",
                 error=heartbeat_errors[0],
             )
+        if result is None:  # pragma: no cover - execution state invariant
+            self._cancel_prestarted_authority_stage(
+                post_publish_admission_stage,
+                operation="admission",
+            )
+            return self._failure_result(
+                claim,
+                phase="execute",
+                error=RuntimeError("worker did not receive a shard execution result"),
+            )
         if self._stop.is_set():
+            self._cancel_prestarted_authority_stage(
+                post_publish_admission_stage,
+                operation="admission",
+            )
             self._discard_prepared(prepared)
             return self._stopped_result(
                 claim,
                 reason="worker stop requested after candidate serialization",
             )
         if prepared is None:  # pragma: no cover - operation state invariant
+            self._cancel_prestarted_authority_stage(
+                post_publish_admission_stage,
+                operation="admission",
+            )
             return self._failure_result(
                 claim,
                 phase="seal",
@@ -2344,37 +6169,39 @@ class LabWorker:
             self._assert_publish_boundary(
                 claim,
                 deadline=validated.spec.deadline,
-                effective_expiry=None,
-                require_current_claim=True,
-            )
-            receipt = self._publish_and_wait(
-                claim,
-                LabShardHeartbeat(
-                    lease_extension_seconds=self.lease_extension_seconds,
-                ),
-                stop=self._stop,
-            )
-            effective_expiry = receipt.accepted_at + timedelta(seconds=self.lease_extension_seconds)
-            self._assert_publish_boundary(
-                claim,
-                deadline=validated.spec.deadline,
                 effective_expiry=effective_expiry,
                 require_current_claim=True,
             )
         except InterruptedError:
+            self._cancel_prestarted_authority_stage(
+                post_publish_admission_stage,
+                operation="admission",
+            )
             self._discard_prepared(prepared)
             return self._stopped_result(
                 claim,
                 reason="worker stop requested while confirming final shard fence",
             )
         except LabDaemonConfigurationError:
+            self._cancel_prestarted_authority_stage(
+                post_publish_admission_stage,
+                operation="admission",
+            )
             self._discard_prepared(prepared)
             raise
         except Exception as exc:
+            self._cancel_prestarted_authority_stage(
+                post_publish_admission_stage,
+                operation="admission",
+            )
             self._discard_prepared(prepared)
             return self._failure_result(claim, phase="fence", error=exc)
 
         try:
+            self._remaining_prepublication_budget_microseconds(
+                tick_deadline_microseconds,
+                operation="atomic shard publish",
+            )
             bundle = self._publish_candidate(
                 claim,
                 prepared,
@@ -2383,19 +6210,70 @@ class LabWorker:
                 validate_concurrent_race=False,
             )
         except InterruptedError:
+            self._cancel_prestarted_authority_stage(
+                post_publish_admission_stage,
+                operation="admission",
+            )
             return self._stopped_result(
                 claim,
                 reason="worker stop requested at atomic shard publish boundary",
             )
         except TimeoutError as exc:
+            self._cancel_prestarted_authority_stage(
+                post_publish_admission_stage,
+                operation="admission",
+            )
             return self._failure_result(claim, phase="deadline", error=exc)
         except LabDaemonConfigurationError:
+            self._cancel_prestarted_authority_stage(
+                post_publish_admission_stage,
+                operation="admission",
+            )
             raise
         except Exception as exc:
+            self._cancel_prestarted_authority_stage(
+                post_publish_admission_stage,
+                operation="admission",
+            )
             return self._failure_result(claim, phase="seal", error=exc)
+
+        post_publish_rollback_deadline_microseconds = (
+            None
+            if self.resource_authority_manifest is None
+            else (
+                self.monotonic_microseconds_clock()
+                + self.post_publish_rollback_safety_budget_microseconds
+            )
+        )
 
         try:
             with self._terminal_lock:
+                post_publish_evaluation = self._resource_admission_evaluation(
+                    claim,
+                    validated.spec,
+                    tick_deadline_microseconds=post_publish_rollback_deadline_microseconds,
+                    prestarted_admission_stage=post_publish_admission_stage,
+                )
+                post_publish_decision = (
+                    None if post_publish_evaluation is None else post_publish_evaluation.decision
+                )
+                if (
+                    post_publish_decision is not None
+                    and post_publish_decision.outcome is not AdmissionOutcome.ADMITTED
+                ):
+                    reasons = ",".join(post_publish_decision.reason_codes)
+                    try:
+                        self._rollback_sealed(claim, bundle)
+                    except Exception as rollback_error:
+                        return self._failure_result(
+                            claim,
+                            phase="fence",
+                            error=rollback_error,
+                        )
+                    return self._stopped_result(
+                        claim,
+                        reason=(f"resource admission revoked before success report: {reasons}"),
+                    )
                 self._assert_publish_boundary(
                     claim,
                     deadline=validated.spec.deadline,
@@ -2403,15 +6281,17 @@ class LabWorker:
                     require_current_claim=True,
                 )
                 work_plan = claim.definition.work_plan
-                telemetry = (
-                    LabShardTelemetry.from_work_plan(
-                        work_plan,
-                        monotonic_started=monotonic_started,
-                        monotonic_finished=self.monotonic_clock(),
+                telemetry = None
+                if work_plan is not None:
+                    monotonic_finished_microseconds = self.monotonic_microseconds_clock()
+                    elapsed_microseconds = (
+                        monotonic_finished_microseconds - monotonic_started_microseconds
                     )
-                    if work_plan is not None
-                    else None
-                )
+                    telemetry = LabShardTelemetry.from_work_plan(
+                        work_plan,
+                        monotonic_started=0.0,
+                        monotonic_finished=_microseconds_to_seconds(elapsed_microseconds),
+                    )
                 report = self._make_report(
                     claim,
                     LabShardSucceeded.current(
@@ -2429,20 +6309,49 @@ class LabWorker:
                 self._verify_runtime_guard(expected_sha=runtime_code_sha)
                 self.report_spool.publish(report)
         except InterruptedError:
-            self._rollback_sealed(claim, bundle)
+            self._cancel_prestarted_authority_stage(
+                post_publish_admission_stage,
+                operation="admission",
+            )
+            try:
+                self._rollback_sealed(claim, bundle)
+            except Exception as rollback_error:
+                return self._failure_result(claim, phase="fence", error=rollback_error)
             return self._stopped_result(
                 claim,
                 reason="worker stop requested before success point-of-no-return",
             )
         except TimeoutError as exc:
-            self._rollback_sealed(claim, bundle)
-            return self._failure_result(claim, phase="deadline", error=exc)
+            self._cancel_prestarted_authority_stage(
+                post_publish_admission_stage,
+                operation="admission",
+            )
+            try:
+                self._rollback_sealed(claim, bundle)
+            except Exception as rollback_error:
+                return self._failure_result(claim, phase="fence", error=rollback_error)
+            return self._failure_result(claim, phase="fence", error=exc)
         except LabDaemonConfigurationError:
+            self._cancel_prestarted_authority_stage(
+                post_publish_admission_stage,
+                operation="admission",
+            )
             self._rollback_sealed(claim, bundle)
             raise
         except Exception as exc:
+            self._cancel_prestarted_authority_stage(
+                post_publish_admission_stage,
+                operation="admission",
+            )
             if self._pending_success is None:
-                self._rollback_sealed(claim, bundle)
+                try:
+                    self._rollback_sealed(claim, bundle)
+                except Exception as rollback_error:
+                    return self._failure_result(
+                        claim,
+                        phase="fence",
+                        error=rollback_error,
+                    )
                 return self._failure_result(claim, phase="fence", error=exc)
             _safe_structured_log(
                 "error",
@@ -2476,10 +6385,13 @@ class LabWorker:
                     and result.status in {"idle", "reported", "awaiting_receipt", "unknown"}
                 ):
                     return
-                self._stop.wait(self.poll_interval_ms / 1_000)
+                self._stop.wait(_microseconds_to_seconds(self.poll_interval_microseconds))
         finally:
-            if previous_handler is not None:
-                signal.signal(signal.SIGTERM, previous_handler)
+            try:
+                self.close()
+            finally:
+                if previous_handler is not None:
+                    signal.signal(signal.SIGTERM, previous_handler)
 
 
 class LabArtifactReclaimer:
@@ -6336,8 +10248,12 @@ class LabArtifactReclaimer:
                 )
                 self._write_ledger(ledger)
 
-    def reclaim(self, current_claim: LabShardClaim) -> None:
-        validated = LabShardClaim.model_validate(current_claim)
+    def reclaim(self, current_claim: LabShardClaim | LabShardClaimV2) -> None:
+        validated = (
+            LabShardClaimV2.model_validate(current_claim, strict=True)
+            if isinstance(current_claim, LabShardClaimV2)
+            else LabShardClaim.model_validate(current_claim)
+        )
         attempts_root = self.sealed_bundle_path(validated).parent
         ledger_dir = self._ledger_dir(validated)
         self._assert_safe_artifact_ancestors(attempts_root)

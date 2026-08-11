@@ -23,7 +23,9 @@ from pydantic import (
     model_validator,
 )
 
+from rquant.experiment_registry import ExperimentSpec
 from rquant.research_manifest import ResearchStatus
+from rquant.runtime_contracts import canonical_sha256
 
 
 class ResearchJobType(StrEnum):
@@ -357,8 +359,90 @@ def _canonical_value(value: object) -> object:
     raise TypeError(f"unsupported canonical value: {type(value).__name__}")
 
 
+def _canonical_hash(value: object) -> str:
+    payload = json.dumps(
+        _canonical_value(value),
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+class StrategyExecutionIdentity(RunSpecModel):
+    """Content-addressed Definition Registry evidence bound to one research run."""
+
+    schema_version: Literal[1] = 1
+    strategy_id: str = Field(min_length=1)
+    strategy_version: int = Field(strict=True, ge=1)
+    adapter_id: str = Field(min_length=1)
+    adapter_version: str = Field(min_length=1)
+    strategy_spec_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    strategy_definition_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    strategy_executable_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    candidate_schema_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    definition_registration_record_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    definition_registered_at: datetime
+    definition_available_at: datetime
+    producer_code_commit: str = Field(pattern=r"^[0-9a-f]{40}$")
+    identity_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("definition_registered_at", "definition_available_at", mode="before")
+    @classmethod
+    def validate_definition_time(cls, value: object) -> datetime:
+        return _parse_aware_datetime(value, field_name="definition registration time")
+
+    @model_validator(mode="after")
+    def validate_identity(self) -> StrategyExecutionIdentity:
+        if self.definition_available_at < self.definition_registered_at:
+            raise ValueError("definition_available_at cannot precede definition_registered_at")
+        expected = _canonical_hash(self.model_dump(mode="python", exclude={"identity_hash"}))
+        if self.identity_hash is None:
+            object.__setattr__(self, "identity_hash", expected)
+        elif self.identity_hash != expected:
+            raise ValueError("identity_hash does not match canonical strategy execution identity")
+        return self
+
+
+class ResearchExperimentIdentity(RunSpecModel):
+    """Stable experiment ownership; worker retries retain the same attempt identity."""
+
+    schema_version: Literal[1, 2] = 1
+    spec: ExperimentSpec
+    experiment_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    hypothesis_family: str = Field(min_length=1)
+    hypothesis_variant: str = Field(min_length=1)
+    formal_plan_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    attempt_identity: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_attempt_identity(self) -> ResearchExperimentIdentity:
+        if self.spec.experiment_id != self.experiment_id:
+            raise ValueError("experiment_id does not match immutable ExperimentSpec")
+        if self.spec.hypothesis_family != self.hypothesis_family:
+            raise ValueError("hypothesis_family does not match immutable ExperimentSpec")
+        if self.schema_version == 2 and self.formal_plan_id is None:
+            raise ValueError("formal_plan_id is required for current experiment ownership")
+        if self.schema_version == 1 and self.formal_plan_id is not None:
+            raise ValueError("legacy experiment ownership cannot carry formal_plan_id")
+        expected = _canonical_hash(
+            {
+                "contract": "research-experiment-attempt/v1",
+                "experiment_id": self.experiment_id,
+                "hypothesis_family": self.hypothesis_family,
+                "hypothesis_variant": self.hypothesis_variant,
+            }
+        )
+        if self.attempt_identity is None:
+            object.__setattr__(self, "attempt_identity", expected)
+        elif self.attempt_identity != expected:
+            raise ValueError("attempt_identity does not match canonical experiment ownership")
+        return self
+
+
 class ResearchRunSpec(RunSpecModel):
-    schema_version: Literal[1, 2] = 2
+    schema_version: Literal[1, 2, 3] = 2
     job_type: ResearchJobType
     parameters: ResearchRunParameters
     code_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
@@ -369,6 +453,8 @@ class ResearchRunSpec(RunSpecModel):
     resource_class: ResourceClass
     deadline: datetime
     research_status: ResearchStatus = "exploratory"
+    strategy_execution: StrategyExecutionIdentity | None = None
+    experiment: ResearchExperimentIdentity | None = None
 
     @field_validator("deadline", mode="before")
     @classmethod
@@ -381,8 +467,8 @@ class ResearchRunSpec(RunSpecModel):
         if not isinstance(data, Mapping):
             return data
         schema_version = data.get("schema_version", 2)
-        if type(schema_version) is not int or schema_version not in {1, 2}:
-            raise ValueError("schema_version must be integer 1 or 2")
+        if type(schema_version) is not int or schema_version not in {1, 2, 3}:
+            raise ValueError("schema_version must be integer 1, 2, or 3")
         if schema_version != 1:
             return data
         snapshot = data.get("dataset_snapshot")
@@ -412,6 +498,53 @@ class ResearchRunSpec(RunSpecModel):
                 raise ValueError(
                     "dataset_snapshot.audit_run_id is required above exploratory status"
                 )
+        if self.schema_version < 3:
+            if self.strategy_execution is not None or self.experiment is not None:
+                raise ValueError("legacy run specs cannot carry v3 ownership identity")
+            return self
+        if self.strategy_execution is None:
+            raise ValueError("v3 requires strategy_execution")
+        if self.experiment is None:
+            raise ValueError("v3 requires experiment")
+        if self.dataset_snapshot is None or self.dataset_snapshot.audit_run_id is None:
+            raise ValueError("v3 requires an audited immutable dataset snapshot")
+        if self.strategy_execution.strategy_id != self.parameters.strategy_name:
+            raise ValueError("strategy_execution.strategy_id must match parameters.strategy_name")
+        if self.strategy_execution.producer_code_commit != self.code_sha:
+            raise ValueError("strategy_execution.producer_code_commit must match code_sha")
+        experiment_spec = self.experiment.spec
+        assert self.dataset_snapshot is not None
+        exact_experiment_identity = (
+            experiment_spec.strategy_spec_fingerprint,
+            experiment_spec.strategy_executable_fingerprint,
+            experiment_spec.candidate_schema_fingerprint,
+            experiment_spec.dataset_snapshot_id,
+            experiment_spec.code_commit,
+            experiment_spec.parameter_fingerprint,
+            experiment_spec.cost_model_fingerprint,
+            experiment_spec.execution_model_fingerprint,
+            experiment_spec.seed,
+        )
+        expected_experiment_identity = (
+            self.strategy_execution.strategy_spec_fingerprint,
+            self.strategy_execution.strategy_executable_fingerprint,
+            self.strategy_execution.candidate_schema_fingerprint,
+            self.dataset_snapshot.snapshot_id,
+            self.code_sha,
+            canonical_sha256(self.parameters),
+            canonical_sha256(self.execution_costs),
+            canonical_sha256(
+                {
+                    "contract": "lab-adapter-execution/v1",
+                    "adapter_id": self.strategy_execution.adapter_id,
+                    "adapter_version": self.strategy_execution.adapter_version,
+                    "feature_contract": self.feature_contract,
+                }
+            ),
+            self.random_seed,
+        )
+        if exact_experiment_identity != expected_experiment_identity:
+            raise ValueError("experiment spec does not exactly bind the v3 research run")
         return self
 
     @model_serializer(mode="wrap")
@@ -424,7 +557,22 @@ class ResearchRunSpec(RunSpecModel):
             snapshot = payload.get("dataset_snapshot")
             if isinstance(snapshot, dict):
                 snapshot.pop("audit_run_id", None)
+        if self.schema_version < 3 and isinstance(payload, dict):
+            payload.pop("strategy_execution", None)
+            payload.pop("experiment", None)
         return payload
+
+    @property
+    def catalog_owner_eligible(self) -> bool:
+        return (
+            self.schema_version == 3
+            and self.strategy_execution is not None
+            and self.experiment is not None
+            and self.experiment.schema_version == 2
+            and self.experiment.formal_plan_id is not None
+            and self.dataset_snapshot is not None
+            and self.dataset_snapshot.audit_run_id is not None
+        )
 
     def model_copy(
         self,

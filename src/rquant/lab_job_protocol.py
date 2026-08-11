@@ -1761,6 +1761,15 @@ class LabCommandSpool:
         envelope: LabCommandEnvelope,
     ) -> LabSpoolEntry | LabAcknowledgedCommand:
         validated = LabCommandEnvelope.model_validate(envelope)
+        command = validated.command
+        if (
+            isinstance(command, SubmitJobCommand)
+            and command.spec.schema_version == 2
+            and command.spec.research_status != "exploratory"
+        ):
+            raise InvalidCommandEnvelopeError(
+                "new v2 comparable submissions require explicit exploratory migration"
+            )
         payload = canonical_model_json_bytes(validated)
         with self._exclusive_lock():
             ack_path = self.ack_dir / f"{validated.request_id}.json"

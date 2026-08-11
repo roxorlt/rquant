@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import re
 import stat
-from datetime import date, datetime
+from collections.abc import Callable
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Annotated, Literal, TypeAlias
@@ -12,6 +13,14 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from rquant.definition_registry import ImmutableDefinitionRegistry, StrategySpecRegistration
+from rquant.experiment_registry import (
+    ExperimentAttempt,
+    ExperimentRegistry,
+    ExperimentSubmissionIntent,
+    FormalExperimentPlan,
+    IncompleteHypothesisFamilyError,
+)
 from rquant.lab_job_protocol import (
     CancelJobCommand,
     LabAcknowledgedCommand,
@@ -27,6 +36,7 @@ from rquant.lab_job_protocol import (
 )
 from rquant.lab_jobs import (
     MAX_JOB_SHARDS,
+    FormalSubmissionAuthorityError,
     JobStatus,
     LabJobReader,
 )
@@ -36,12 +46,15 @@ from rquant.research_run_spec import (
     ExecutionCostSpec,
     FeatureContractIdentity,
     ParameterKind,
+    ResearchExperimentIdentity,
     ResearchJobType,
     ResearchParameter,
     ResearchRunParameters,
     ResearchRunSpec,
     ResourceClass,
+    StrategyExecutionIdentity,
 )
+from rquant.runtime_contracts import canonical_sha256
 from rquant.strategy_job_adapters import (
     AuctionGapParameters,
     GrowthBoardSurgeParameters,
@@ -50,6 +63,7 @@ from rquant.strategy_job_adapters import (
     build_adapter_execution_contract,
     default_strategy_job_adapter_registry,
 )
+from rquant.strict_json import canonical_json_bytes
 
 _CLEAN_CODE_SHA = re.compile(r"^[0-9a-f]{40}$")
 _MAX_RESEARCH_DATE_SPAN_DAYS = 5 * 366
@@ -318,6 +332,8 @@ def build_research_job_submission(
     deadline: datetime,
     job_id: UUID,
     max_attempts: int = 1,
+    trusted_strategy_registration: StrategySpecRegistration | None = None,
+    formal_experiment_plan: FormalExperimentPlan | None = None,
 ) -> ResearchJobSubmission:
     decision = ResearchGateDecision.model_validate(gate_decision)
     if not decision.allowed:
@@ -336,14 +352,31 @@ def build_research_job_submission(
             _research_parameter(name, getattr(typed_parameters, name))
             for name in type(typed_parameters).model_fields
         )
+        parameters = ResearchRunParameters(
+            strategy_name=strategy_name,
+            start_date=run_input.start_date,
+            end_date=run_input.end_date,
+            arguments=arguments,
+        )
+        ownership_values = _validated_research_ownership(
+            decision=decision,
+            strategy_name=strategy_name,
+            adapter_id=adapter_id,
+            adapter_version="1",
+            code_sha=code_sha,
+            deadline=deadline,
+            dataset_snapshot=dataset_snapshot,
+            feature_contract=feature_contract,
+            execution_costs=execution_costs,
+            parameters=parameters,
+            random_seed=random_seed,
+            trusted_strategy_registration=trusted_strategy_registration,
+            formal_experiment_plan=formal_experiment_plan,
+        )
         spec = ResearchRunSpec(
+            schema_version=ownership_values[0],
             job_type=job_type,
-            parameters=ResearchRunParameters(
-                strategy_name=strategy_name,
-                start_date=run_input.start_date,
-                end_date=run_input.end_date,
-                arguments=arguments,
-            ),
+            parameters=parameters,
             code_sha=code_sha,
             dataset_snapshot=dataset_snapshot,
             feature_contract=feature_contract,
@@ -352,6 +385,8 @@ def build_research_job_submission(
             resource_class=resource_class,
             deadline=deadline,
             research_status=decision.research_status,
+            strategy_execution=ownership_values[1],
+            experiment=ownership_values[2],
         )
     except (TypeError, ValueError, ValidationError) as exc:
         raise ResearchJobSubmissionError("input_bounds", str(exc)) from exc
@@ -362,6 +397,125 @@ def build_research_job_submission(
         max_attempts=max_attempts,
     )
     return ResearchJobSubmission(spec=spec, command=command)
+
+
+def _validated_research_ownership(
+    *,
+    decision: ResearchGateDecision,
+    strategy_name: str,
+    adapter_id: str,
+    adapter_version: str,
+    code_sha: str,
+    deadline: datetime,
+    dataset_snapshot: DatasetSnapshotIdentity | None,
+    feature_contract: FeatureContractIdentity,
+    execution_costs: ExecutionCostSpec,
+    parameters: ResearchRunParameters,
+    random_seed: int,
+    trusted_strategy_registration: StrategySpecRegistration | None,
+    formal_experiment_plan: FormalExperimentPlan | None,
+) -> tuple[
+    Literal[2, 3],
+    StrategyExecutionIdentity | None,
+    ResearchExperimentIdentity | None,
+]:
+    supplied = (
+        trusted_strategy_registration is not None,
+        formal_experiment_plan is not None,
+    )
+    if not any(supplied):
+        if decision.research_status != "exploratory":
+            raise ValueError(
+                "formal research submission requires a trusted strategy registration, "
+                "and exact formal experiment plan"
+            )
+        return 2, None, None
+    if not all(supplied):
+        raise ValueError(
+            "trusted strategy registration and exact formal experiment plan "
+            "must be supplied together"
+        )
+    assert trusted_strategy_registration is not None
+    assert formal_experiment_plan is not None
+    registration = StrategySpecRegistration.model_validate(
+        trusted_strategy_registration.model_dump(mode="python")
+    )
+    plan = FormalExperimentPlan.model_validate(formal_experiment_plan.model_dump(mode="python"))
+    if plan.schema_version != 2:
+        raise ValueError("formal research requires a current FormalExperimentPlan")
+    experiment = plan.spec
+    if registration.logical_id != strategy_name or registration.spec.strategy_id != strategy_name:
+        raise ValueError("trusted strategy registration does not match strategy_name")
+    if registration.producer_commit != code_sha or registration.spec.producer_commit != code_sha:
+        raise ValueError("trusted strategy registration does not match code SHA")
+    if registration.available_at > deadline:
+        raise ValueError("trusted strategy registration is not visible by the run deadline")
+    if plan.preregistered_at > deadline:
+        raise ValueError("formal experiment plan is not visible by the run deadline")
+    if (
+        plan.strategy_definition_fingerprint != registration.fingerprint
+        or plan.definition_registration_record_hash != registration.record_hash
+    ):
+        raise ValueError("formal experiment plan does not match Definition Registry receipts")
+    execution = StrategyExecutionIdentity(
+        strategy_id=registration.logical_id,
+        strategy_version=registration.version,
+        adapter_id=adapter_id,
+        adapter_version=adapter_version,
+        strategy_spec_fingerprint=registration.spec.spec_fingerprint,
+        strategy_definition_fingerprint=registration.fingerprint,
+        strategy_executable_fingerprint=registration.executable_fingerprint,
+        candidate_schema_fingerprint=registration.candidate_schema_fingerprint,
+        definition_registration_record_hash=registration.record_hash,
+        definition_registered_at=registration.registered_at,
+        definition_available_at=registration.available_at,
+        producer_code_commit=registration.producer_commit,
+    )
+    if dataset_snapshot is None:
+        raise ValueError("catalog-bound experiment requires an immutable dataset snapshot")
+    expected = (
+        registration.spec.spec_fingerprint,
+        registration.executable_fingerprint,
+        registration.candidate_schema_fingerprint,
+        dataset_snapshot.snapshot_id,
+        code_sha,
+        canonical_sha256(parameters),
+        canonical_sha256(execution_costs),
+        canonical_sha256(
+            {
+                "contract": "lab-adapter-execution/v1",
+                "adapter_id": adapter_id,
+                "adapter_version": adapter_version,
+                "feature_contract": feature_contract,
+            }
+        ),
+        random_seed,
+    )
+    actual = (
+        experiment.strategy_spec_fingerprint,
+        experiment.strategy_executable_fingerprint,
+        experiment.candidate_schema_fingerprint,
+        experiment.dataset_snapshot_id,
+        experiment.code_commit,
+        experiment.parameter_fingerprint,
+        experiment.cost_model_fingerprint,
+        experiment.execution_model_fingerprint,
+        experiment.seed,
+    )
+    if actual != expected:
+        raise ValueError("experiment spec does not exactly match the trusted research run")
+    return (
+        3,
+        execution,
+        ResearchExperimentIdentity(
+            schema_version=2,
+            spec=experiment,
+            experiment_id=experiment.experiment_id,
+            hypothesis_family=experiment.hypothesis_family,
+            hypothesis_variant=plan.hypothesis_variant,
+            formal_plan_id=plan.plan_id,
+        ),
+    )
 
 
 class SubmissionSpoolIdentity(JobCenterModel):
@@ -426,9 +580,226 @@ CommandSubmissionResult: TypeAlias = Annotated[
 class LabCommandSubmissionFacade:
     """Read scheduler state and publish commands without opening a writable ledger."""
 
-    def __init__(self, *, reader: LabJobReader, spool: LabCommandSpool) -> None:
+    def __init__(
+        self,
+        *,
+        reader: LabJobReader,
+        spool: LabCommandSpool,
+        experiment_registry: ExperimentRegistry | None = None,
+        definition_registry: ImmutableDefinitionRegistry | None = None,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
         self.reader = reader
         self.spool = spool
+        self.experiment_registry = experiment_registry
+        self.definition_registry = definition_registry
+        self.clock = clock or (lambda: datetime.now(UTC))
+
+    @staticmethod
+    def _experiment_submission_intent(
+        envelope: LabCommandEnvelope,
+    ) -> ExperimentSubmissionIntent | None:
+        command = envelope.command
+        if not isinstance(command, SubmitJobCommand):
+            return None
+        spec = command.spec
+        if spec.schema_version < 3:
+            return None
+        if spec.experiment is None or not spec.catalog_owner_eligible:
+            raise ValueError("v3 research job is missing experiment ownership")
+        envelope_json = canonical_json_bytes(envelope.model_dump(mode="json")).decode("utf-8")
+        return ExperimentSubmissionIntent(
+            schema_version=2,
+            request_id=envelope.request_id,
+            job_id=command.job_id,
+            experiment_id=spec.experiment.experiment_id,
+            attempt_identity=spec.experiment.attempt_identity,
+            hypothesis_variant=spec.experiment.hypothesis_variant,
+            formal_plan_id=spec.experiment.formal_plan_id,
+            strategy_definition_fingerprint=(
+                spec.strategy_execution.strategy_definition_fingerprint
+            ),
+            definition_registration_record_hash=(
+                spec.strategy_execution.definition_registration_record_hash
+            ),
+            command_content_hash=envelope.content_hash,
+            envelope_json=envelope_json,
+            envelope_sha256=canonical_sha256({"canonical_envelope_json": envelope_json}),
+        )
+
+    def _validate_formal_submission_authorities(
+        self,
+        envelope: LabCommandEnvelope,
+        *,
+        observed_at: datetime,
+    ) -> tuple[ExperimentSubmissionIntent, ResearchExperimentIdentity]:
+        intent = self._experiment_submission_intent(envelope)
+        if intent is None:
+            raise FormalSubmissionAuthorityError("formal v3 submission identity is required")
+        if self.experiment_registry is None:
+            raise FormalSubmissionAuthorityError(
+                "v3 research submission requires an authoritative ExperimentRegistry"
+            )
+        command = envelope.command
+        assert isinstance(command, SubmitJobCommand)
+        assert command.spec.experiment is not None
+        assert command.spec.strategy_execution is not None
+        experiment = command.spec.experiment
+        execution = command.spec.strategy_execution
+        assert experiment.formal_plan_id is not None
+        try:
+            plan = self.experiment_registry.resolve_formal_plan_by_id(
+                experiment.formal_plan_id,
+                as_of=observed_at,
+            )
+        except IncompleteHypothesisFamilyError as exc:
+            raise FormalSubmissionAuthorityError("exact formal plan is unavailable") from exc
+        if (
+            plan.schema_version != 2
+            or plan.spec != experiment.spec
+            or plan.hypothesis_variant != experiment.hypothesis_variant
+            or plan.strategy_definition_fingerprint != execution.strategy_definition_fingerprint
+            or plan.definition_registration_record_hash
+            != execution.definition_registration_record_hash
+        ):
+            raise FormalSubmissionAuthorityError(
+                "formal plan receipts do not exactly match the research job"
+            )
+        if self.definition_registry is None:
+            raise FormalSubmissionAuthorityError(
+                "v3 research submission requires an authoritative Definition Registry"
+            )
+        registration = self.definition_registry.read_strategy_spec(
+            execution.strategy_definition_fingerprint,
+            as_of=observed_at,
+        )
+        if registration is None:
+            raise FormalSubmissionAuthorityError("trusted strategy registration is not visible")
+        exact_registration = (
+            registration.logical_id,
+            registration.version,
+            registration.spec.spec_fingerprint,
+            registration.fingerprint,
+            registration.executable_fingerprint,
+            registration.candidate_schema_fingerprint,
+            registration.record_hash,
+            registration.registered_at,
+            registration.available_at,
+            registration.producer_commit,
+        )
+        submitted_registration = (
+            execution.strategy_id,
+            execution.strategy_version,
+            execution.strategy_spec_fingerprint,
+            execution.strategy_definition_fingerprint,
+            execution.strategy_executable_fingerprint,
+            execution.candidate_schema_fingerprint,
+            execution.definition_registration_record_hash,
+            execution.definition_registered_at,
+            execution.definition_available_at,
+            execution.producer_code_commit,
+        )
+        if exact_registration != submitted_registration:
+            raise FormalSubmissionAuthorityError(
+                "strategy execution identity conflicts with authoritative Definition Registry"
+            )
+        return intent, experiment
+
+    def _prepare_experiment_submission(self, envelope: LabCommandEnvelope) -> None:
+        if self._experiment_submission_intent(envelope) is None:
+            return
+        observed_at = self.clock()
+        intent, experiment = self._validate_formal_submission_authorities(
+            envelope,
+            observed_at=observed_at,
+        )
+        assert self.experiment_registry is not None
+        self.experiment_registry.register_attempt(
+            experiment.spec,
+            registered_at=observed_at,
+            submission=intent,
+        )
+
+    def validate_prepared_experiment_submission(
+        self,
+        envelope: LabCommandEnvelope,
+        *,
+        observed_at: datetime,
+    ) -> None:
+        """Re-read exact immutable ownership before the Job Center transaction writes."""
+
+        intent, experiment = self._validate_formal_submission_authorities(
+            envelope,
+            observed_at=observed_at,
+        )
+        assert self.experiment_registry is not None
+        stored_intent = self.experiment_registry.get_submission_intent_for_job(
+            envelope.command.job_id
+        )
+        if stored_intent != intent:
+            raise FormalSubmissionAuthorityError(
+                "formal submission has no exact prepared Experiment ownership intent"
+            )
+        try:
+            attempt = self.experiment_registry.get_attempt(experiment.experiment_id)
+        except KeyError as exc:
+            raise FormalSubmissionAuthorityError(
+                "formal submission has no registered Experiment attempt"
+            ) from exc
+        if attempt.spec != experiment.spec:
+            raise FormalSubmissionAuthorityError(
+                "formal submission Experiment attempt identity conflicts with its plan"
+            )
+
+    def _mark_experiment_submission_published(self, envelope: LabCommandEnvelope) -> None:
+        intent = self._experiment_submission_intent(envelope)
+        if intent is None:
+            return
+        if self.experiment_registry is None:  # pragma: no cover - guarded by prepare
+            raise RuntimeError("v3 research submission requires an ExperimentRegistry")
+        self.experiment_registry.mark_submission_published(
+            envelope.request_id,
+            command_content_hash=envelope.content_hash,
+            published_at=self.clock(),
+        )
+
+    def recover_pending_experiment_submissions(
+        self,
+        *,
+        limit: int = 100,
+    ) -> tuple[CommandSubmissionReceipt, ...]:
+        if self.experiment_registry is None:
+            return ()
+        recovered: list[CommandSubmissionReceipt] = []
+        for intent in self.experiment_registry.list_pending_submissions(limit=limit):
+            envelope = LabCommandEnvelope.model_validate_json(intent.envelope_json)
+            if (
+                envelope.request_id != intent.request_id
+                or envelope.command.job_id != intent.job_id
+                or envelope.content_hash != intent.command_content_hash
+            ):
+                raise RuntimeError("experiment submission outbox conflicts with command envelope")
+            published = self._publish(envelope)
+            if isinstance(published, CommandSubmissionConflict):
+                raise RuntimeError("experiment submission recovery hit a command conflict")
+            self._mark_experiment_submission_published(envelope)
+            recovered.append(published)
+        return tuple(recovered)
+
+    def synchronize_experiment_lifecycle(
+        self,
+        job_id: UUID,
+        *,
+        observed_at: datetime,
+    ) -> ExperimentAttempt:
+        """Recover one experiment attempt from the authoritative job state."""
+
+        if self.experiment_registry is None:
+            raise RuntimeError("experiment lifecycle synchronization requires ExperimentRegistry")
+        return ExperimentJobLifecycleSynchronizer(
+            reader=self.reader,
+            registry=self.experiment_registry,
+        ).synchronize(job_id, observed_at=observed_at)
 
     @staticmethod
     def _request_id(interaction_key: str | None) -> UUID:
@@ -594,12 +965,17 @@ class LabCommandSubmissionFacade:
         interaction_key: str | None = None,
     ) -> CommandSubmissionResult:
         validated = SubmitJobCommand.model_validate(command)
+        if validated.spec.schema_version < 3 and validated.spec.research_status != "exploratory":
+            raise ValueError("v2 comparable/formal jobs are not executable; migrate as exploratory")
         envelope = LabCommandEnvelope(
             request_id=self._request_id(interaction_key),
             command=validated,
         )
         existing = self._existing(envelope)
         if existing is not None:
+            if isinstance(existing, CommandSubmissionReceipt):
+                self._prepare_experiment_submission(envelope)
+                self._mark_experiment_submission_published(envelope)
             return existing
         if self.reader.get_job(validated.job_id) is not None:
             return CommandSubmissionConflict(
@@ -607,7 +983,11 @@ class LabCommandSubmissionFacade:
                 job_id=validated.job_id,
                 reason="job_id_exists",
             )
-        return self._publish(envelope)
+        self._prepare_experiment_submission(envelope)
+        published = self._publish(envelope)
+        if isinstance(published, CommandSubmissionReceipt):
+            self._mark_experiment_submission_published(envelope)
+        return published
 
     def submit_rerun(
         self,
@@ -740,4 +1120,137 @@ class LabCommandSubmissionFacade:
                 reason=reason,
             ),
             interaction_key=interaction_key,
+        )
+
+
+class ExperimentJobLifecycleSynchronizer:
+    """Map authoritative Job Center states onto one stable experiment attempt."""
+
+    def __init__(self, *, reader: LabJobReader, registry: ExperimentRegistry) -> None:
+        self.reader = reader
+        self.registry = registry
+
+    def synchronize(self, job_id: UUID, *, observed_at: datetime) -> ExperimentAttempt:
+        job = self.reader.get_job(job_id)
+        if job is None:
+            raise KeyError(f"unknown lab job: {job_id}")
+        if job.updated_at > observed_at:
+            raise ValueError("job lifecycle evidence is from the future")
+        experiment = job.spec.experiment
+        if job.spec.schema_version != 3 or experiment is None:
+            raise ValueError("legacy lab jobs cannot mutate experiment lifecycle")
+        experiment_id = experiment.experiment_id
+        if job.status in {JobStatus.RUNNING, JobStatus.CHECKPOINTED, JobStatus.SUCCEEDED}:
+            attempt = self.registry.ensure_attempt_started(
+                experiment_id,
+                started_at=job.updated_at,
+            )
+            if job.status is JobStatus.SUCCEEDED:
+                return self.registry.record_execution_completed(
+                    experiment_id,
+                    completed_at=job.updated_at,
+                )
+            return attempt
+        if job.status is JobStatus.FAILED and not job.recoverable:
+            return self.registry.record_failure(
+                experiment_id,
+                first_error=(
+                    f"lab job failed after {job.attempt_count}/{job.max_attempts} attempts"
+                ),
+                completed_at=job.updated_at,
+            )
+        if job.status is JobStatus.CANCELLED:
+            return self.registry.cancel_attempt(
+                experiment_id,
+                first_error="lab job cancelled",
+                completed_at=job.updated_at,
+            )
+        return self.registry.get_attempt(experiment_id)
+
+
+class ExperimentLifecycleRecoveryResult(JobCenterModel):
+    recovered_submission_count: int = Field(ge=0)
+    synchronized_job_ids: tuple[UUID, ...]
+
+
+class ExperimentLifecycleCoordinator:
+    """Recover the durable submission outbox and converge every owned job attempt."""
+
+    _MAX_RECOVERY_JOBS = 999
+
+    def __init__(self, facade: LabCommandSubmissionFacade) -> None:
+        if facade.experiment_registry is None:
+            raise RuntimeError("experiment lifecycle coordinator requires ExperimentRegistry")
+        self.facade = facade
+        self.registry = facade.experiment_registry
+
+    def validate_submission(
+        self,
+        envelope: LabCommandEnvelope,
+        *,
+        observed_at: datetime,
+    ) -> None:
+        command = envelope.command
+        if not isinstance(command, SubmitJobCommand):
+            return
+        if command.spec.schema_version == 2:
+            if command.spec.research_status != "exploratory":
+                raise FormalSubmissionAuthorityError(
+                    "new v2 comparable submissions require explicit exploratory migration"
+                )
+            return
+        if command.spec.schema_version != 3:
+            return
+        self.facade.validate_prepared_experiment_submission(
+            envelope,
+            observed_at=observed_at,
+        )
+
+    def synchronize(
+        self,
+        job_id: UUID,
+        *,
+        observed_at: datetime,
+    ) -> ExperimentAttempt | None:
+        intent = self.registry.get_submission_intent_for_job(job_id)
+        job = self.facade.reader.get_job(job_id)
+        if job is None:
+            if intent is None:
+                return None
+            raise RuntimeError("experiment-owned job is missing from Job Center authority")
+        if intent is None:
+            if job.spec.schema_version == 3:
+                raise RuntimeError("v3 job is missing Experiment Registry submission ownership")
+            return None
+        experiment = job.spec.experiment
+        if (
+            job.spec.schema_version != 3
+            or experiment is None
+            or experiment.experiment_id != intent.experiment_id
+            or experiment.attempt_identity != intent.attempt_identity
+        ):
+            raise RuntimeError("Job Center and Experiment Registry ownership conflict")
+        return self.facade.synchronize_experiment_lifecycle(
+            job_id,
+            observed_at=observed_at,
+        )
+
+    def recover(self, *, observed_at: datetime) -> ExperimentLifecycleRecoveryResult:
+        recovered = self.facade.recover_pending_experiment_submissions(
+            limit=self._MAX_RECOVERY_JOBS
+        )
+        intents = self.registry.list_recoverable_submission_intents(
+            limit=self._MAX_RECOVERY_JOBS + 1
+        )
+        if len(intents) > self._MAX_RECOVERY_JOBS:
+            raise RuntimeError("experiment lifecycle recovery exceeds its bounded job budget")
+        synchronized: list[UUID] = []
+        for intent in intents:
+            if self.facade.reader.get_job(intent.job_id) is None:
+                continue
+            self.synchronize(intent.job_id, observed_at=observed_at)
+            synchronized.append(intent.job_id)
+        return ExperimentLifecycleRecoveryResult(
+            recovered_submission_count=len(recovered),
+            synchronized_job_ids=tuple(synchronized),
         )

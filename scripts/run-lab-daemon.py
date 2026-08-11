@@ -11,7 +11,7 @@ import stat
 import subprocess
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,12 +20,19 @@ from types import ModuleType
 sys.dont_write_bytecode = True
 
 _ALLOWED_DAEMONS = frozenset(
-    {"lab-scheduler", "lab-worker", "lab-finalizer", "lab-runtime-prepare"}
+    {
+        "lab-scheduler",
+        "lab-worker",
+        "lab-finalizer",
+        "lab-claim-finalizer",
+        "lab-runtime-prepare",
+    }
 )
 _HANDOFF_LABELS = {
     "lab-scheduler": "com.roxor.rquant-lab-scheduler",
     "lab-worker": "com.roxor.rquant-lab-worker",
     "lab-finalizer": "com.roxor.rquant-lab-finalizer",
+    "lab-claim-finalizer": "com.roxor.rquant-lab-claim-finalizer",
 }
 _PYTHON_INJECTION_VARIABLES = (
     "PYTHONHOME",
@@ -33,10 +40,40 @@ _PYTHON_INJECTION_VARIABLES = (
     "PYTHONPATH",
     "PYTHONSTARTUP",
 )
+_LAB_HIGHWATER_ENVIRONMENT_PREFIX = "LAB_HIGHWATER_"
 
 
 class WrapperError(RuntimeError):
     pass
+
+
+def _production_daemon_environment(
+    daemon_command: str,
+    *,
+    environ: Mapping[str, str],
+) -> dict[str, str]:
+    """Return the environment allowed across the production scheduler boundary."""
+
+    controlled = dict(environ)
+    if daemon_command != "lab-scheduler":
+        return controlled
+    poisoned_names = tuple(
+        sorted(name for name in controlled if name.startswith(_LAB_HIGHWATER_ENVIRONMENT_PREFIX))
+    )
+    if poisoned_names:
+        raise WrapperError(
+            "Lab scheduler environment contains forbidden high-water overrides: "
+            + ", ".join(poisoned_names)
+        )
+    app_env = controlled.get("APP_ENV")
+    if app_env not in (None, "prod"):
+        raise WrapperError("Lab scheduler APP_ENV downgrade is not allowed")
+    disable_dotenv = controlled.get("RQUANT_DISABLE_DOTENV")
+    if disable_dotenv not in (None, "1"):
+        raise WrapperError("Lab scheduler dotenv policy downgrade is not allowed")
+    controlled["APP_ENV"] = "prod"
+    controlled["RQUANT_DISABLE_DOTENV"] = "1"
+    return controlled
 
 
 def _load_contained_runner() -> Callable[..., subprocess.CompletedProcess[object]]:
@@ -273,6 +310,82 @@ def _validate_daemon_argv(
     return executable, executable_identity
 
 
+def _bind_exact_option(
+    argv: list[str],
+    *,
+    option: str,
+    expected: str,
+    label: str,
+) -> None:
+    values = [argv[index + 1] for index, value in enumerate(argv[:-1]) if value == option]
+    if not values:
+        argv.extend([option, expected])
+        return
+    if values != [expected]:
+        raise WrapperError(f"{label} does not match wrapper-controlled context")
+
+
+def _replace_bound_option(argv: list[str], *, option: str, value: str) -> list[str]:
+    """Rebind one already-validated option while preserving daemon argument order."""
+
+    rebound = list(argv)
+    indexes = [index for index, candidate in enumerate(rebound[:-1]) if candidate == option]
+    if len(indexes) != 1:
+        raise WrapperError(f"{option} is not uniquely bound")
+    rebound[indexes[0] + 1] = value
+    return rebound
+
+
+def _bind_controlled_daemon_arguments(
+    root: Path,
+    trusted_git: Path,
+    daemon_argv: list[str],
+    *,
+    environ: Mapping[str, str],
+) -> list[str]:
+    """Bind daemon arguments only from the verified checkout and controlled environment."""
+
+    if len(daemon_argv) < 2 or daemon_argv[1] not in _ALLOWED_DAEMONS:
+        raise WrapperError("formal Lab daemon command is missing or invalid")
+    bound = list(daemon_argv)
+    _bind_exact_option(
+        bound,
+        option="--expected-checkout-root",
+        expected=str(root),
+        label="daemon checkout root",
+    )
+    _bind_exact_option(
+        bound,
+        option="--trusted-git-path",
+        expected=str(trusted_git),
+        label="daemon trusted Git path",
+    )
+    if daemon_argv[1] in {"lab-runtime-prepare", "lab-scheduler"}:
+        raw_runtime_root = environ.get("RQUANT_RUNTIME_ROOT", "")
+        if (
+            not raw_runtime_root
+            or raw_runtime_root.strip() != raw_runtime_root
+            or "\x00" in raw_runtime_root
+            or "\n" in raw_runtime_root
+            or "\r" in raw_runtime_root
+        ):
+            raise WrapperError(
+                "RQUANT_RUNTIME_ROOT must name the controlled runtime deployment profile root"
+            )
+        runtime_root = _canonical_absolute(
+            raw_runtime_root,
+            label="controlled runtime deployment root",
+        )
+        _require_owned_directory(runtime_root, label="controlled runtime deployment root")
+        _bind_exact_option(
+            bound,
+            option="--runtime-deployment-root",
+            expected=str(runtime_root),
+            label="runtime deployment root",
+        )
+    return bound
+
+
 def _expected_deployment_lock(root: Path) -> Path:
     return root.parent / ".rquant-deploy" / f"{root.name}.lock"
 
@@ -407,6 +520,7 @@ def _run_preflight(
     handoff_label: str | None = None,
     daemon_command: str,
     immutable_generation: bool = False,
+    release_managed_checkout: bool = False,
     deadline_monotonic: float,
 ) -> None:
     _assert_trusted_git(git_path, git_identity)
@@ -434,6 +548,8 @@ def _run_preflight(
         command.extend(["--provisional-handoff-label", handoff_label])
     if immutable_generation:
         command.append("--immutable-generation")
+    if release_managed_checkout:
+        command.append("--release-managed-checkout")
     result = run_contained(
         command,
         cwd=root,
@@ -461,6 +577,7 @@ def _run_prepared_sentinel_preflight(
     root: Path,
     daemon_command: str,
     immutable_generation: bool = False,
+    release_managed_checkout: bool = False,
     deadline_monotonic: float,
 ) -> None:
     command = [
@@ -476,6 +593,8 @@ def _run_prepared_sentinel_preflight(
     ]
     if immutable_generation:
         command.append("--immutable-generation")
+    if release_managed_checkout:
+        command.append("--release-managed-checkout")
     result = run_contained(
         command,
         cwd=root,
@@ -506,7 +625,7 @@ def _immutable_generation_main(
         raise WrapperError("wrapper is outside the immutable release generation")
     if len(daemon_argv) < 2 or Path(daemon_argv[0]) != launcher:
         raise WrapperError("daemon launcher is outside the immutable release generation")
-    if daemon_argv[1] not in _HANDOFF_LABELS:
+    if daemon_argv[1] not in _ALLOWED_DAEMONS:
         raise WrapperError("formal Lab daemon command is missing or invalid")
     _run_prepared_sentinel_preflight(
         python=python,
@@ -518,24 +637,16 @@ def _immutable_generation_main(
     )
     lock_path, lock_fd = _acquire_immutable_generation(code_root, args.deployment_lock_path)
     trusted_git, trusted_git_identity = _require_trusted_git(args.trusted_git_path)
+    daemon_argv = _bind_controlled_daemon_arguments(
+        code_root,
+        trusted_git,
+        daemon_argv,
+        environ=os.environ,
+    )
     expected_commit = args.expected_commit
     if len(expected_commit) != 40 or any(c not in "0123456789abcdef" for c in expected_commit):
         raise WrapperError("immutable generation commit is invalid")
-    handoff_label = _HANDOFF_LABELS[daemon_argv[1]]
-    _run_preflight(
-        python=python,
-        preflight=code_root / "scripts" / "preflight-lab-runtime.py",
-        root=code_root,
-        expected_commit=expected_commit,
-        git_path=trusted_git,
-        git_identity=trusted_git_identity,
-        deployment_lock_path=lock_path,
-        deployment_lock_fd=lock_fd,
-        handoff_label=handoff_label,
-        daemon_command=daemon_argv[1],
-        immutable_generation=True,
-        deadline_monotonic=startup_deadline,
-    )
+    handoff_label = _HANDOFF_LABELS.get(daemon_argv[1])
     release_module = _load_release_authority(code_root / "src" / "rquant" / "release_generation.py")
     marker = release_module.ReleaseGenerationAuthority(
         repo=code_root,
@@ -572,14 +683,9 @@ def _immutable_generation_main(
             str(launcher),
             "--startup-deadline-monotonic",
             str(startup_deadline),
-            "--provisional-handoff-label",
-            handoff_label,
+            *(["--provisional-handoff-label", handoff_label] if handoff_label is not None else []),
             "--",
             *daemon_argv[1:],
-            "--expected-checkout-root",
-            str(code_root),
-            "--trusted-git-path",
-            str(trusted_git),
             "--deployment-generation",
             expected_commit,
             "--deployment-lock-path",
@@ -645,6 +751,13 @@ def main(argv: list[str] | None = None) -> int:
         daemon_argv = list(args.daemon_argv)
         if daemon_argv and daemon_argv[0] == "--":
             daemon_argv.pop(0)
+        daemon_command = daemon_argv[1] if len(daemon_argv) >= 2 else ""
+        controlled_environment = _production_daemon_environment(
+            daemon_command,
+            environ=os.environ,
+        )
+        os.environ.clear()
+        os.environ.update(controlled_environment)
         if args.expected_code_root is not None:
             if args.expected_commit is None:
                 raise WrapperError("immutable generation requires an exact commit")
@@ -655,6 +768,12 @@ def main(argv: list[str] | None = None) -> int:
             )
         root, venv, python, runtime_identities = _require_runtime_root(args.expected_checkout_root)
         trusted_git, trusted_git_identity = _require_trusted_git(args.trusted_git_path)
+        daemon_argv = _bind_controlled_daemon_arguments(
+            root,
+            trusted_git,
+            daemon_argv,
+            environ=os.environ,
+        )
         for variable in _PYTHON_INJECTION_VARIABLES:
             if os.environ.get(variable):
                 raise WrapperError(f"Python environment injection is not allowed: {variable}")
@@ -682,6 +801,7 @@ def main(argv: list[str] | None = None) -> int:
             preflight=preflight,
             root=root,
             daemon_command=daemon_argv[1],
+            release_managed_checkout=True,
             deadline_monotonic=startup_deadline,
         )
         deployment_lock_path, generation_lock_fd = _acquire_deployment_generation(
@@ -706,6 +826,7 @@ def main(argv: list[str] | None = None) -> int:
             deployment_lock_fd=generation_lock_fd,
             handoff_label=handoff_label,
             daemon_command=daemon_argv[1],
+            release_managed_checkout=True,
             deadline_monotonic=startup_deadline,
         )
         try:
@@ -761,19 +882,6 @@ def main(argv: list[str] | None = None) -> int:
             != expected_commit
         ):
             raise WrapperError("Lab runtime identity changed during preflight")
-        _run_preflight(
-            python=selected_python,
-            preflight=preflight,
-            root=root,
-            expected_commit=expected_commit,
-            git_path=trusted_git,
-            git_identity=trusted_git_identity,
-            deployment_lock_path=deployment_lock_path,
-            deployment_lock_fd=generation_lock_fd,
-            handoff_label=handoff_label,
-            daemon_command=daemon_argv[1],
-            deadline_monotonic=startup_deadline,
-        )
         final_root, final_venv, final_python, final_runtime_identities = _require_runtime_root(
             args.expected_checkout_root
         )
@@ -806,19 +914,6 @@ def main(argv: list[str] | None = None) -> int:
             != expected_commit
         ):
             raise WrapperError("Lab runtime identity changed before daemon exec")
-        _run_preflight(
-            python=selected_python,
-            preflight=preflight,
-            root=root,
-            expected_commit=expected_commit,
-            git_path=trusted_git,
-            git_identity=trusted_git_identity,
-            deployment_lock_path=deployment_lock_path,
-            deployment_lock_fd=generation_lock_fd,
-            handoff_label=handoff_label,
-            daemon_command=daemon_argv[1],
-            deadline_monotonic=startup_deadline,
-        )
         rebound_executable, rebound_executable_identity = _validate_daemon_argv(
             root,
             venv,
@@ -877,46 +972,41 @@ def main(argv: list[str] | None = None) -> int:
         os.environ.pop("__PYVENV_LAUNCHER__", None)
         sys.stdout.flush()
         sys.stderr.flush()
+        immutable_code_root = release_module.generation_code_root(selected_venv)
+        immutable_wrapper = immutable_code_root / "scripts" / "run-lab-daemon.py"
+        _require_owned_directory(immutable_code_root, label="immutable code root")
+        _require_owned_regular(immutable_wrapper, label="immutable Lab runtime wrapper")
+        immutable_daemon_argv = _replace_bound_option(
+            daemon_argv,
+            option="--expected-checkout-root",
+            value=str(immutable_code_root),
+        )
+        immutable_daemon_argv = _replace_bound_option(
+            immutable_daemon_argv,
+            option="--trusted-git-path",
+            value=str(trusted_git),
+        )
+        immutable_daemon_argv[0] = str(selected_launcher)
+        os.chdir(immutable_code_root)
         os.execv(
             selected_python,
             [
                 str(selected_python),
                 "-I",
                 "-S",
-                str(bootstrap),
+                str(immutable_wrapper),
                 "--expected-checkout-root",
                 str(root),
+                "--expected-code-root",
+                str(immutable_code_root),
                 "--expected-commit",
                 expected_commit,
-                "--expected-runtime-root",
-                str(selected_venv),
                 "--trusted-git-path",
                 str(trusted_git),
                 "--deployment-lock-path",
                 str(deployment_lock_path),
-                "--deployment-lock-fd",
-                str(generation_lock_fd),
-                "--expected-launcher",
-                str(selected_launcher),
-                "--startup-deadline-monotonic",
-                str(startup_deadline),
-                *(
-                    ["--provisional-handoff-label", handoff_label]
-                    if handoff_label is not None
-                    else []
-                ),
                 "--",
-                *daemon_argv[1:],
-                "--deployment-generation",
-                expected_commit,
-                "--deployment-lock-path",
-                str(deployment_lock_path),
-                "--deployment-generation-fd",
-                str(generation_lock_fd),
-                "--deployment-operation-id",
-                final_marker.operation_id,
-                "--deployment-environment-generation",
-                final_marker.environment_generation_id,
+                *immutable_daemon_argv,
             ],
         )
     except (OSError, subprocess.SubprocessError, WrapperError) as exc:

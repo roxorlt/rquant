@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -11,9 +12,11 @@ import sqlite3
 from base64 import urlsafe_b64decode, urlsafe_b64encode
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
+from threading import Lock
 from types import TracebackType
 from typing import TYPE_CHECKING, Literal, Protocol, Self
 from urllib.parse import quote
@@ -22,6 +25,8 @@ from weakref import ReferenceType, ref
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from rquant.adapter_manifest import VerifyOnlyEd25519Keyring
+from rquant.current_claim_authority import PersistentCurrentClaimAuthority
 from rquant.lab_artifact_protocol import (
     LabArtifactCommitEnvelope,
     LabArtifactCommitReceipt,
@@ -31,6 +36,35 @@ from rquant.lab_artifact_protocol import (
     authenticate_artifact_commit_identity,
 )
 from rquant.lab_artifacts import LabArtifactIndexEvidence
+from rquant.lab_claim_finalizer_trust import (
+    LabClaimFinalizerPublicationAttestation,
+    LabClaimFinalizerTrustCertificate,
+    LabClaimFinalizerTrustError,
+    LabClaimFinalizerTrustVerifier,
+    build_lab_claim_finalizer_publication_attestation,
+    require_lab_claim_finalizer_publication_attestation,
+)
+from rquant.lab_claim_publication import (
+    V2_UNASSIGNED_WORKER_ID,
+    ClaimPublicationAuditAction,
+    ClaimPublicationStatus,
+    HeldDraft,
+    LabClaimPublicationAuditRecord,
+    LabClaimPublicationFinalizerAuthority,
+    LabClaimPublicationFinalizerRootKey,
+    LabClaimPublicationIdentity,
+    LabClaimPublicationMutation,
+    LabClaimPublicationObservationDegradation,
+    LabClaimPublicationRecord,
+    LabClaimPublicationRolloutEvidence,
+    LabClaimPublicationRolloutEvidenceOutboxItem,
+    LabClaimSpoolReceiptVerifier,
+    PublishReceipt,
+    QueueBinding,
+    ReadyBinding,
+    require_v2_spool_receipt_provenance,
+    source_stage_store_authority_from_canonical_bytes,
+)
 from rquant.lab_eta import LabEtaEstimate, LabEtaInput, LabEtaStatus
 from rquant.lab_job_protocol import (
     CancelJobCommand,
@@ -54,6 +88,7 @@ from rquant.lab_shard_protocol import (
     SQLITE_SIGNED_INTEGER_MAX,
     LabReportReceipt,
     LabShardClaim,
+    LabShardClaimV2,
     LabShardDefinition,
     LabShardFailed,
     LabShardHeartbeat,
@@ -62,11 +97,34 @@ from rquant.lab_shard_protocol import (
     LabShardWorkPlan,
     LabWorkerReport,
     LabWorkerStopped,
+    StrategyShardPayloadV2,
+    parse_strategy_shard_payload,
+    validate_strategy_shard_payload_utf8,
+)
+from rquant.lab_source_stage import (
+    LabSourceStageBinding,
+    LabSourceStageState,
+    LabSourceStageStore,
+    LabSourceStageStoreAuthority,
 )
 from rquant.research_run_spec import (
     ResearchJobType,
     ResearchRunSpec,
     ResourceClass,
+)
+from rquant.source_broker_v2_job_protocol import (
+    SourceBrokerV2JobOutcomeStatus,
+    canonical_job_model_bytes,
+)
+from rquant.source_operation_contracts import (
+    CurrentClaimAuthorityProtocol,
+    CurrentClaimConsumptionBindingV2,
+    CurrentClaimConsumptionV2,
+    SourceAttemptBindingV2,
+    SourceOperationContractError,
+    SourceUsePlanV2,
+    require_current_claim_consumption_v2,
+    require_source_use_plan_v2,
 )
 from rquant.strict_json import (
     canonical_json_bytes,
@@ -112,12 +170,20 @@ class InvalidStoredJobError(RuntimeError):
     """Stored spec content or denormalized query columns were tampered with."""
 
 
+class LabIntegrityDegradedError(RuntimeError):
+    """A bounded or full ledger audit failed, so a daemon must fail closed."""
+
+
 class CancelConfirmationRequiredError(RuntimeError):
     """Cancellation must preserve intent until a worker claim is invalidated."""
 
 
 class LabDatabaseIdentityError(RuntimeError):
     """The configured SQLite file is not this ledger at a supported version."""
+
+
+class FormalSubmissionAuthorityError(ValueError):
+    """A formal submission lacks exact, independently resolved ownership evidence."""
 
 
 class ShardPlanConflictError(RuntimeError):
@@ -128,13 +194,33 @@ class ArtifactCommitDeadlineExpiredError(RuntimeError):
     """A staged artifact success crossed its job deadline before commit."""
 
 
+class ClaimPublicationConflictError(RuntimeError):
+    """A claim-publication attempt conflicts with durable attempt identity or bytes."""
+
+
+class InvalidClaimPublicationTransitionError(RuntimeError):
+    """A claim-publication transition violates the frozen publication state matrix."""
+
+
 _APPLICATION_ID = 0x52514A42
 _LEGACY_SCHEMA_VERSION = 1
 _V2_SCHEMA_VERSION = 2
 _V3_SCHEMA_VERSION = 3
 _V4_SCHEMA_VERSION = 4
-_PREVIOUS_SCHEMA_VERSION = 5
-_SCHEMA_VERSION = 6
+_V5_SCHEMA_VERSION = 5
+_V6_SCHEMA_VERSION = 6
+_V7_SCHEMA_VERSION = 7
+_V8_SCHEMA_VERSION = 8
+_V9_SCHEMA_VERSION = 9
+_V10_SCHEMA_VERSION = 10
+_V11_SCHEMA_VERSION = 11
+_V12_SCHEMA_VERSION = 12
+_V13_SCHEMA_VERSION = 13
+_V14_SCHEMA_VERSION = 14
+_V15_SCHEMA_VERSION = 15
+_PREVIOUS_SCHEMA_VERSION = _V15_SCHEMA_VERSION
+_SCHEMA_VERSION = 16
+LAB_JOBS_SCHEMA_GENERATION = _SCHEMA_VERSION
 RESULT_CONTRACT_VERSION = "p1.4a-telemetry-v1"
 COMPLETE_RESULT_CONTRACT_VERSION = "p1.4b-complete-result-v1"
 _SUBMIT_AUTH_FUNCTION = "rquant_lab_submit_authorized"
@@ -143,8 +229,21 @@ _READY_TERMINAL_AUTH_FUNCTION = "rquant_lab_ready_terminal_authorized"
 _ARTIFACT_COMMIT_AUTH_FUNCTION = "rquant_lab_artifact_commit_authorized"
 _ARTIFACT_INDEX_AUTH_FUNCTION = "rquant_lab_artifact_index_authorized"
 _ARTIFACT_SUCCESS_AUTH_FUNCTION = "rquant_lab_artifact_success_authorized"
+_CLAIM_PUBLICATION_AUTH_FUNCTION = "rquant_lab_claim_publication_authorized"
+_CLAIM_PUBLICATION_AUDIT_AUTH_FUNCTION = "rquant_lab_claim_publication_audit_authorized"
+_LEDGER_CHAIN_STEP_FUNCTION = "rquant_lab_ledger_chain_step"
+_ROLLOUT_EVIDENCE_REASON_CODE = "rollout_evidence_pending"
+_ROLLOUT_EVIDENCE_REASON_HASH = hashlib.sha256(
+    _ROLLOUT_EVIDENCE_REASON_CODE.encode("ascii")
+).hexdigest()
+_ROLLOUT_EVIDENCE_INITIAL_ERROR_CLASS = "RolloutEvidencePending"
 LAB_ETA_COMPLETED_LIMIT_MAX = 256
 MAX_JOB_SHARDS = 128
+STALE_RECOVERY_BATCH_SIZE = 32
+PRECLAIM_CANDIDATE_BATCH_SIZE = 32
+PRECLAIM_FAIR_SCAN_INTERVAL = 4
+IDLE_CONTROL_AFTER_BATCH_SIZE = STALE_RECOVERY_BATCH_SIZE // 2
+IDLE_CONTROL_BEFORE_BATCH_SIZE = STALE_RECOVERY_BATCH_SIZE - IDLE_CONTROL_AFTER_BATCH_SIZE
 LAB_JOB_LIST_LIMIT_MAX = 100
 LAB_JOB_DETAIL_SHARD_LIMIT_MAX = 256
 LAB_JOB_DETAIL_EVENT_LIMIT_MAX = 512
@@ -174,6 +273,8 @@ class _LabWriteAuthorization:
         "_artifact_commit",
         "_artifact_index",
         "_artifact_success",
+        "_claim_publication",
+        "_claim_publication_audit",
         "_connection_ref",
         "_epoch",
         "_ready_terminal",
@@ -190,6 +291,8 @@ class _LabWriteAuthorization:
         self._artifact_commit: tuple[int, str, str, str] | None = None
         self._artifact_index: tuple[int, str, str, str] | None = None
         self._artifact_success: tuple[int, str, str, str, int, int] | None = None
+        self._claim_publication: tuple[int, str, str, int, str] | None = None
+        self._claim_publication_audit: tuple[int, str, str, str, str] | None = None
 
     def _require_transaction(self) -> int:
         connection = self._connection_ref()
@@ -211,6 +314,8 @@ class _LabWriteAuthorization:
                 self._artifact_commit,
                 self._artifact_index,
                 self._artifact_success,
+                self._claim_publication,
+                self._claim_publication_audit,
             )
         ):
             self._epoch += 1
@@ -220,6 +325,8 @@ class _LabWriteAuthorization:
         self._artifact_commit = None
         self._artifact_index = None
         self._artifact_success = None
+        self._claim_publication = None
+        self._claim_publication_audit = None
 
     @contextmanager
     def authorize_submit(self, job_id: UUID, spec_json: str) -> Iterator[None]:
@@ -338,6 +445,51 @@ class _LabWriteAuthorization:
             if self._artifact_success is not None and self._artifact_success[0] == epoch:
                 self._artifact_success = None
 
+    @contextmanager
+    def authorize_claim_publication(
+        self,
+        record: LabClaimPublicationRecord,
+    ) -> Iterator[None]:
+        if self._claim_publication is not None:
+            raise RuntimeError("claim publication SQL authorization is already active")
+        epoch = self._require_transaction()
+        self._claim_publication = (
+            epoch,
+            str(record.identity.attempt_id),
+            record.status.value,
+            record.version,
+            record.record_commitment,
+        )
+        try:
+            yield
+        finally:
+            if self._claim_publication is not None and self._claim_publication[0] == epoch:
+                self._claim_publication = None
+
+    @contextmanager
+    def authorize_claim_publication_audit(
+        self,
+        audit: LabClaimPublicationAuditRecord,
+    ) -> Iterator[None]:
+        if self._claim_publication_audit is not None:
+            raise RuntimeError("claim publication audit SQL authorization is already active")
+        epoch = self._require_transaction()
+        self._claim_publication_audit = (
+            epoch,
+            str(audit.audit_ref),
+            str(audit.attempt_id),
+            audit.action.value,
+            audit.audit_hash,
+        )
+        try:
+            yield
+        finally:
+            if (
+                self._claim_publication_audit is not None
+                and self._claim_publication_audit[0] == epoch
+            ):
+                self._claim_publication_audit = None
+
     def submit_authorized(self, job_id: object, spec_json: object) -> int:
         grant = self._submit
         return int(
@@ -428,6 +580,46 @@ class _LabWriteAuthorization:
                 str(evidence_json),
                 old_version,
                 new_version,
+            )
+        )
+
+    def claim_publication_authorized(
+        self,
+        attempt_id: object,
+        status: object,
+        version: object,
+        record_commitment: object,
+    ) -> int:
+        grant = self._claim_publication
+        return int(
+            grant is not None
+            and self._is_current_transaction(grant[0])
+            and grant[1:]
+            == (
+                str(attempt_id),
+                str(status),
+                version,
+                str(record_commitment),
+            )
+        )
+
+    def claim_publication_audit_authorized(
+        self,
+        audit_ref: object,
+        attempt_id: object,
+        action: object,
+        audit_hash: object,
+    ) -> int:
+        grant = self._claim_publication_audit
+        return int(
+            grant is not None
+            and self._is_current_transaction(grant[0])
+            and grant[1:]
+            == (
+                str(audit_ref),
+                str(attempt_id),
+                str(action),
+                str(audit_hash),
             )
         )
 
@@ -749,6 +941,349 @@ class LabLeaseRecord(LabRecordModel):
     heartbeat_at: datetime
     expires_at: datetime
     released_at: datetime | None = None
+
+
+class LabPreclaimRejection(LabRecordModel):
+    job_id: UUID
+    shard_id: UUID
+    payload_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    reason: str = Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")
+
+
+class LabClaimSelection(LabRecordModel):
+    claim: LabShardClaim | LabShardClaimV2 | None = None
+    rejections: tuple[LabPreclaimRejection, ...] = ()
+
+
+class CurrentSchedulerFenceReceipt(LabRecordModel):
+    """Public, exact proof that one scheduler lease still owns one stage attempt."""
+
+    receipt_version: Literal[1] = 1
+    canonical_job_store_path: str = Field(min_length=1)
+    database_generation: tuple[int, int]
+    store_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    application_id: int = Field(ge=1)
+    schema_version: int = Field(ge=1)
+    implementation_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    binding: LabSourceStageBinding
+    owner_id: str = Field(min_length=1, max_length=200)
+    scheduler_fencing_token: int = Field(ge=1)
+    lease_id: int = Field(ge=1)
+    lease_commitment: str = Field(pattern=r"^[0-9a-f]{64}$")
+    issued_at: datetime
+    expires_at: datetime
+    row_commitment: str = Field(pattern=r"^[0-9a-f]{64}$")
+    receipt_commitment: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_commitments(self) -> CurrentSchedulerFenceReceipt:
+        issued = _utc(self.issued_at)
+        expires = _utc(self.expires_at)
+        if expires <= issued:
+            raise ValueError("scheduler fence receipt timestamps are invalid")
+        if not Path(self.canonical_job_store_path).is_absolute():
+            raise ValueError("scheduler fence receipt path must be absolute")
+        expected_row = _scheduler_fence_row_commitment(
+            owner_id=self.owner_id,
+            scheduler_fencing_token=self.scheduler_fencing_token,
+            lease_id=self.lease_id,
+            lease_commitment=self.lease_commitment,
+            issued_at=issued,
+            expires_at=expires,
+        )
+        if self.row_commitment != expected_row:
+            raise ValueError("scheduler fence receipt row commitment is invalid")
+        expected_receipt = _scheduler_fence_receipt_commitment(
+            canonical_job_store_path=self.canonical_job_store_path,
+            database_generation=self.database_generation,
+            store_id=self.store_id,
+            application_id=self.application_id,
+            schema_version=self.schema_version,
+            implementation_digest=self.implementation_digest,
+            binding=self.binding,
+            row_commitment=self.row_commitment,
+        )
+        if self.receipt_commitment != expected_receipt:
+            raise ValueError("scheduler fence receipt commitment is invalid")
+        object.__setattr__(self, "issued_at", issued)
+        object.__setattr__(self, "expires_at", expires)
+        return self
+
+
+class JobStoreSchedulerFenceVerifier:
+    """Verify and hold an exact JobStore scheduler lease across a stage commit."""
+
+    def __init__(self, store: LabJobStore) -> None:
+        if type(store) is not LabJobStore:
+            raise TypeError("scheduler fence verifier requires an exact LabJobStore")
+        self._store = store
+
+    @contextmanager
+    def hold_current(
+        self,
+        receipt: CurrentSchedulerFenceReceipt,
+        *,
+        binding: LabSourceStageBinding,
+        now: datetime,
+    ) -> Iterator[None]:
+        current = _utc(now)
+        connection = self._store._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            _validate_database_identity(connection, allow_unclaimed_empty=False)
+            _validate_current_schema(connection)
+            self._verify_in_connection(
+                connection,
+                receipt=receipt,
+                binding=binding,
+                now=current,
+            )
+            yield
+            self._verify_in_connection(
+                connection,
+                receipt=receipt,
+                binding=binding,
+                now=current,
+            )
+            connection.commit()
+        except BaseException:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def verify_current(
+        self,
+        receipt: CurrentSchedulerFenceReceipt,
+        *,
+        binding: LabSourceStageBinding,
+        now: datetime,
+    ) -> None:
+        with self.hold_current(receipt, binding=binding, now=now):
+            return
+
+    def _verify_in_connection(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        receipt: CurrentSchedulerFenceReceipt,
+        binding: LabSourceStageBinding,
+        now: datetime,
+    ) -> None:
+        if binding != receipt.binding:
+            raise SchedulerLeaseFencedError("scheduler fence receipt binding is not exact")
+        authority = self._store._scheduler_fence_authority(connection)
+        if (
+            receipt.canonical_job_store_path != authority["canonical_job_store_path"]
+            or receipt.database_generation != authority["database_generation"]
+            or receipt.store_id != authority["store_id"]
+            or receipt.application_id != authority["application_id"]
+            or receipt.schema_version != authority["schema_version"]
+            or receipt.implementation_digest != authority["implementation_digest"]
+        ):
+            raise SchedulerLeaseFencedError("scheduler fence receipt authority changed")
+        row = connection.execute(
+            "SELECT * FROM lab_lease WHERE lease_id = ?", (receipt.lease_id,)
+        ).fetchone()
+        if row is None:
+            raise SchedulerLeaseFencedError("scheduler fence receipt lease is missing")
+        commitment = _scheduler_fence_lease_commitment(row)
+        active = connection.execute(
+            "SELECT lease_id FROM lab_lease WHERE lease_name = ? AND released_at IS NULL "
+            "ORDER BY fencing_token DESC LIMIT 1",
+            (LabJobStore.LEASE_NAME,),
+        ).fetchone()
+        if (
+            str(row["lease_name"]) != LabJobStore.LEASE_NAME
+            or str(row["owner_id"]) != receipt.owner_id
+            or _strict_sqlite_int(row["fencing_token"], field="lab_lease.fencing_token", minimum=1)
+            != receipt.scheduler_fencing_token
+            or commitment != receipt.lease_commitment
+            or _load_time(str(row["acquired_at"])) != receipt.issued_at
+            or _load_time(str(row["expires_at"])) != receipt.expires_at
+            or row["released_at"] is not None
+            or receipt.expires_at <= now
+            or active is None
+            or _strict_sqlite_int(active["lease_id"], field="lab_lease.lease_id", minimum=1)
+            != receipt.lease_id
+        ):
+            raise SchedulerLeaseFencedError("scheduler fence receipt is stale")
+
+
+_FROZEN_JOB_STORE_SCHEDULER_FENCE_HOLD_CURRENT = JobStoreSchedulerFenceVerifier.hold_current
+
+_FROZEN_JOB_STORE_CURRENT_CLAIM_HOLD_CURRENT = PersistentCurrentClaimAuthority.hold_current
+_FROZEN_JOB_STORE_CURRENT_CLAIM_HOLD_CURRENT_SOURCE_DIGEST = hashlib.sha256(
+    inspect.getsource(_FROZEN_JOB_STORE_CURRENT_CLAIM_HOLD_CURRENT).encode("utf-8")
+).hexdigest()
+
+
+@contextmanager
+def hold_trusted_current_claim(
+    authority: CurrentClaimAuthorityProtocol,
+    *,
+    binding: CurrentClaimConsumptionBindingV2,
+    now: datetime,
+    _expected_authority_type: type[PersistentCurrentClaimAuthority] = (
+        PersistentCurrentClaimAuthority
+    ),
+    _hold_current: Callable[..., object] = _FROZEN_JOB_STORE_CURRENT_CLAIM_HOLD_CURRENT,
+    _source_digest: str = _FROZEN_JOB_STORE_CURRENT_CLAIM_HOLD_CURRENT_SOURCE_DIGEST,
+) -> Iterator[CurrentClaimConsumptionV2]:
+    """Freeze the only current-authority dispatch allowed around C/D CAS."""
+
+    if type(authority) is not _expected_authority_type:
+        raise ClaimPublicationConflictError("current_authority_guard_untrusted")
+    # The call target is captured in defaults, not looked up through a mutable
+    # module/class attribute. The comparisons turn common monkeypatch attempts
+    # into a fail-closed integrity error rather than silently dispatching them.
+    if (
+        globals().get("_FROZEN_JOB_STORE_CURRENT_CLAIM_HOLD_CURRENT") is not _hold_current
+        or PersistentCurrentClaimAuthority.hold_current is not _hold_current
+    ):
+        raise ClaimPublicationConflictError("current_authority_guard_dispatch_tampered")
+    try:
+        observed_source_digest = hashlib.sha256(
+            inspect.getsource(_hold_current).encode("utf-8")
+        ).hexdigest()
+    except (OSError, TypeError):
+        raise ClaimPublicationConflictError("current_authority_guard_dispatch_tampered") from None
+    if observed_source_digest != _source_digest:
+        raise ClaimPublicationConflictError("current_authority_guard_dispatch_tampered")
+    with _hold_current(
+        authority,
+        binding=binding,
+        now=now,
+    ) as receipt:
+        yield receipt
+
+
+_TEST_ONLY_SCHEDULER_FENCE_HOLD_HOOK_LOCK = Lock()
+_TEST_ONLY_SCHEDULER_FENCE_HOLD_HOOK: (
+    Callable[[CurrentSchedulerFenceReceipt, LabSourceStageBinding, datetime], Iterator[None]] | None
+) = None
+
+
+@contextmanager
+def _test_only_scheduler_fence_hold_hook(
+    hook: Callable[[CurrentSchedulerFenceReceipt, LabSourceStageBinding, datetime], Iterator[None]],
+) -> Iterator[None]:
+    """Pause an already-held trusted fence in a narrow test scope only."""
+
+    global _TEST_ONLY_SCHEDULER_FENCE_HOLD_HOOK
+    with _TEST_ONLY_SCHEDULER_FENCE_HOLD_HOOK_LOCK:
+        if _TEST_ONLY_SCHEDULER_FENCE_HOLD_HOOK is not None:
+            raise RuntimeError("scheduler fence test hook is already active")
+        _TEST_ONLY_SCHEDULER_FENCE_HOLD_HOOK = hook
+    try:
+        yield
+    finally:
+        with _TEST_ONLY_SCHEDULER_FENCE_HOLD_HOOK_LOCK:
+            _TEST_ONLY_SCHEDULER_FENCE_HOLD_HOOK = None
+
+
+@contextmanager
+def hold_current_trusted_scheduler_fence(
+    verifier: JobStoreSchedulerFenceVerifier,
+    receipt: CurrentSchedulerFenceReceipt,
+    *,
+    binding: LabSourceStageBinding,
+    now: datetime,
+    _hold_current: Callable[
+        [
+            JobStoreSchedulerFenceVerifier,
+            CurrentSchedulerFenceReceipt,
+        ],
+        Iterator[None],
+    ] = _FROZEN_JOB_STORE_SCHEDULER_FENCE_HOLD_CURRENT,
+) -> Iterator[None]:
+    """Hold the module-load-time JobStore fence dispatch for Stage mutations."""
+
+    if type(verifier) is not JobStoreSchedulerFenceVerifier:
+        raise SchedulerLeaseFencedError("scheduler fence verifier is not trusted")
+    if type(receipt) is not CurrentSchedulerFenceReceipt or receipt.binding != binding:
+        raise SchedulerLeaseFencedError("scheduler fence receipt binding is not exact")
+    with _hold_current(verifier, receipt, binding=binding, now=now):
+        with _TEST_ONLY_SCHEDULER_FENCE_HOLD_HOOK_LOCK:
+            hook = _TEST_ONLY_SCHEDULER_FENCE_HOLD_HOOK
+        if hook is None:
+            yield
+            return
+        with hook(receipt, binding, now):
+            yield
+
+
+def _scheduler_fence_lease_commitment(row: Mapping[str, object]) -> str:
+    return hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "contract": "rquant-current-scheduler-fence-lease/v1",
+                "lease_id": _strict_sqlite_int(
+                    row["lease_id"], field="lab_lease.lease_id", minimum=1
+                ),
+                "owner_id": str(row["owner_id"]),
+                "token": str(row["token"]),
+                "fencing_token": _strict_sqlite_int(
+                    row["fencing_token"], field="lab_lease.fencing_token", minimum=1
+                ),
+                "acquired_at": _dump_time(_load_time(str(row["acquired_at"]))),
+                "expires_at": _dump_time(_load_time(str(row["expires_at"]))),
+            }
+        )
+    ).hexdigest()
+
+
+def _scheduler_fence_row_commitment(
+    *,
+    owner_id: str,
+    scheduler_fencing_token: int,
+    lease_id: int,
+    lease_commitment: str,
+    issued_at: datetime,
+    expires_at: datetime,
+) -> str:
+    return hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "contract": "rquant-current-scheduler-fence-row/v1",
+                "owner_id": owner_id,
+                "scheduler_fencing_token": scheduler_fencing_token,
+                "lease_id": lease_id,
+                "lease_commitment": lease_commitment,
+                "issued_at": _dump_time(_utc(issued_at)),
+                "expires_at": _dump_time(_utc(expires_at)),
+            }
+        )
+    ).hexdigest()
+
+
+def _scheduler_fence_receipt_commitment(
+    *,
+    canonical_job_store_path: str,
+    database_generation: tuple[int, int],
+    store_id: str,
+    application_id: int,
+    schema_version: int,
+    implementation_digest: str,
+    binding: LabSourceStageBinding,
+    row_commitment: str,
+) -> str:
+    return hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "contract": "rquant-current-scheduler-fence-receipt/v1",
+                "canonical_job_store_path": canonical_job_store_path,
+                "database_generation": database_generation,
+                "store_id": store_id,
+                "application_id": application_id,
+                "schema_version": schema_version,
+                "implementation_digest": implementation_digest,
+                "binding": binding.model_dump(mode="json"),
+                "row_commitment": row_commitment,
+            }
+        )
+    ).hexdigest()
 
 
 class LabCommandRecord(LabRecordModel):
@@ -1127,16 +1662,209 @@ class LabJobSummary(LabRecordModel):
 class LabJobPage(LabRecordModel):
     """One live-query page, not a database snapshot.
 
-    ``total_count`` is recomputed for the current filters on every call.
+    ``total_count`` for an unfiltered page comes from the writer-maintained
+    summary row. Filtered totals are deliberately unknown: exact totals for
+    arbitrary date and substring predicates require an unbounded history scan.
     ``has_more`` only reports whether the current live result has another row
     after this page's immutable keyset boundary. Mutable filter membership,
     including status, may change between page requests.
     """
 
     items: tuple[LabJobSummary, ...]
-    total_count: int = Field(ge=0)
+    total_count: int | None = Field(default=None, ge=0)
     has_more: bool
     next_cursor: str | None
+
+
+class LabGraphIntegrityTableCounts(LabRecordModel):
+    lab_job: int = Field(ge=0)
+    lab_shard: int = Field(ge=0)
+    lab_event: int = Field(ge=0)
+    lab_lease: int = Field(ge=0)
+    lab_artifact: int = Field(ge=0)
+    lab_command: int = Field(ge=0)
+    lab_worker_report: int = Field(ge=0)
+    lab_artifact_commit: int = Field(ge=0)
+    lab_job_result_artifact: int = Field(ge=0)
+    lab_scheduler_state: int = Field(ge=0)
+    lab_claim_publication: int = Field(default=0, ge=0)
+    lab_claim_publication_audit: int = Field(default=0, ge=0)
+    lab_ledger_chain_entry: int = Field(ge=1)
+
+
+class LabGraphIntegrityReceipt(LabRecordModel):
+    """Verified whole-ledger audit summary pinned to one immutable read generation."""
+
+    schema_version: Literal[2] = 2
+    database_generation: tuple[int, int]
+    mutation_epoch: int = Field(ge=0)
+    chain_generation: int = Field(ge=0)
+    chain_head_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    table_counts: LabGraphIntegrityTableCounts
+    receipt_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @staticmethod
+    def _content_hash(
+        *,
+        database_generation: tuple[int, int],
+        mutation_epoch: int,
+        chain_generation: int,
+        chain_head_hash: str,
+        table_counts: LabGraphIntegrityTableCounts,
+    ) -> str:
+        return hashlib.sha256(
+            canonical_json_bytes(
+                {
+                    "schema_version": 2,
+                    "database_generation": database_generation,
+                    "mutation_epoch": mutation_epoch,
+                    "chain_generation": chain_generation,
+                    "chain_head_hash": chain_head_hash,
+                    "table_counts": table_counts.model_dump(mode="json"),
+                }
+            )
+        ).hexdigest()
+
+    @classmethod
+    def verified(
+        cls,
+        *,
+        database_generation: tuple[int, int],
+        mutation_epoch: int,
+        chain_generation: int,
+        chain_head_hash: str,
+        table_counts: LabGraphIntegrityTableCounts,
+    ) -> LabGraphIntegrityReceipt:
+        return cls(
+            database_generation=database_generation,
+            mutation_epoch=mutation_epoch,
+            chain_generation=chain_generation,
+            chain_head_hash=chain_head_hash,
+            table_counts=table_counts,
+            receipt_hash=cls._content_hash(
+                database_generation=database_generation,
+                mutation_epoch=mutation_epoch,
+                chain_generation=chain_generation,
+                chain_head_hash=chain_head_hash,
+                table_counts=table_counts,
+            ),
+        )
+
+    @model_validator(mode="after")
+    def validate_generation_binding(self) -> LabGraphIntegrityReceipt:
+        if any(type(value) is not int or value < 0 for value in self.database_generation):
+            raise ValueError("database generation must contain non-negative integers")
+        expected = self._content_hash(
+            database_generation=self.database_generation,
+            mutation_epoch=self.mutation_epoch,
+            chain_generation=self.chain_generation,
+            chain_head_hash=self.chain_head_hash,
+            table_counts=self.table_counts,
+        )
+        if self.receipt_hash != expected:
+            raise ValueError("integrity receipt hash does not bind its generation and summary")
+        return self
+
+
+class LabIncrementalIntegrityReceipt(LabRecordModel):
+    """Bounded chain-tail receipt used on daemon lifecycle boundaries.
+
+    This receipt deliberately does not claim to validate every historical row.
+    Daemons validate the current append-only tail before accepting more work;
+    ``audit_integrity`` remains the periodic full-graph authority.
+    """
+
+    schema_version: Literal[1] = 1
+    database_generation: tuple[int, int]
+    mutation_epoch: int = Field(ge=0)
+    chain_generation: int = Field(ge=0)
+    chain_head_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    checked_chain_entries: int = Field(ge=1, le=129)
+    receipt_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @staticmethod
+    def _content_hash(
+        *,
+        database_generation: tuple[int, int],
+        mutation_epoch: int,
+        chain_generation: int,
+        chain_head_hash: str,
+        checked_chain_entries: int,
+    ) -> str:
+        return hashlib.sha256(
+            canonical_json_bytes(
+                {
+                    "schema_version": 1,
+                    "database_generation": database_generation,
+                    "mutation_epoch": mutation_epoch,
+                    "chain_generation": chain_generation,
+                    "chain_head_hash": chain_head_hash,
+                    "checked_chain_entries": checked_chain_entries,
+                }
+            )
+        ).hexdigest()
+
+    @classmethod
+    def verified(
+        cls,
+        *,
+        database_generation: tuple[int, int],
+        mutation_epoch: int,
+        chain_generation: int,
+        chain_head_hash: str,
+        checked_chain_entries: int,
+    ) -> LabIncrementalIntegrityReceipt:
+        return cls(
+            database_generation=database_generation,
+            mutation_epoch=mutation_epoch,
+            chain_generation=chain_generation,
+            chain_head_hash=chain_head_hash,
+            checked_chain_entries=checked_chain_entries,
+            receipt_hash=cls._content_hash(
+                database_generation=database_generation,
+                mutation_epoch=mutation_epoch,
+                chain_generation=chain_generation,
+                chain_head_hash=chain_head_hash,
+                checked_chain_entries=checked_chain_entries,
+            ),
+        )
+
+    @model_validator(mode="after")
+    def validate_generation_binding(self) -> LabIncrementalIntegrityReceipt:
+        if any(type(value) is not int or value < 0 for value in self.database_generation):
+            raise ValueError("database generation must contain non-negative integers")
+        expected = self._content_hash(
+            database_generation=self.database_generation,
+            mutation_epoch=self.mutation_epoch,
+            chain_generation=self.chain_generation,
+            chain_head_hash=self.chain_head_hash,
+            checked_chain_entries=self.checked_chain_entries,
+        )
+        if self.receipt_hash != expected:
+            raise ValueError("incremental integrity receipt hash does not bind its chain tail")
+        return self
+
+
+class LabHighWaterObserver(Protocol):
+    """Compare-and-advance observer backed by an independent authority process.
+
+    The Lab process holds no signing or write capability over the observed
+    high-water: implementations submit the watermark (bound to the graph audit
+    receipt hash) to an external authority and raise on any rollback, replay,
+    or degraded condition so readers fail closed.
+    """
+
+    def observe(
+        self,
+        *,
+        database_generation: tuple[int, int],
+        schema_generation: int,
+        mutation_epoch: int,
+        chain_generation: int,
+        chain_head_hash: str,
+        receipt_kind: Literal["incremental", "full"],
+        receipt_hash: str,
+    ) -> object: ...
 
 
 class LabFinalizationCandidate(LabRecordModel):
@@ -1351,6 +2079,19 @@ class _LabStagedArtifactCommit:
         self.rollback()
 
 
+@dataclass(frozen=True)
+class _ClaimPublicationDecision:
+    mutation: LabClaimPublicationMutation | None = None
+    error: RuntimeError | None = None
+
+    def resolved(self) -> LabClaimPublicationMutation:
+        if self.error is not None:
+            raise self.error
+        if self.mutation is None:
+            raise RuntimeError("claim publication decision is incomplete")
+        return self.mutation
+
+
 _ALLOWED_TRANSITIONS: dict[JobStatus, frozenset[JobStatus]] = {
     JobStatus.QUEUED: frozenset({JobStatus.RUNNING, JobStatus.CANCELLED}),
     JobStatus.RUNNING: frozenset(
@@ -1452,6 +2193,42 @@ def _strict_sqlite_bool(value: object, *, field: str) -> bool:
     return bool(integer)
 
 
+def _strict_sqlite_blob(value: object, *, field: str) -> bytes:
+    if type(value) is not bytes:
+        raise InvalidStoredJobError(f"{field} must be a SQLite blob, found {type(value).__name__}")
+    return value
+
+
+_LEDGER_CHAIN_GENESIS_HASH = hashlib.sha256(
+    canonical_json_bytes({"contract": "rquant-lab-ledger-chain/v1", "generation": 0})
+).hexdigest()
+
+
+def _ledger_chain_step(
+    previous_hash: object,
+    chain_generation: object,
+    mutation_epoch: object,
+) -> str:
+    """Return the canonical append-only head for one committed ledger mutation."""
+
+    if type(previous_hash) is not str or re.fullmatch(r"[0-9a-f]{64}", previous_hash) is None:
+        raise ValueError("ledger chain previous hash is invalid")
+    if type(chain_generation) is not int or chain_generation < 0:
+        raise ValueError("ledger chain generation is invalid")
+    if type(mutation_epoch) is not int or mutation_epoch < 0:
+        raise ValueError("ledger chain mutation epoch is invalid")
+    return hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "contract": "rquant-lab-ledger-chain/v1",
+                "previous_hash": previous_hash,
+                "chain_generation": chain_generation,
+                "mutation_epoch": mutation_epoch,
+            }
+        )
+    ).hexdigest()
+
+
 def _canonical_uuid_text(value: object, *, field: str) -> UUID:
     if type(value) is not str:
         raise InvalidStoredJobError(
@@ -1467,6 +2244,7 @@ def _canonical_uuid_text(value: object, *, field: str) -> UUID:
 
 
 _SHARD_ROW_VALID_FUNCTION = "rquant_lab_shard_row_valid"
+_PAYLOAD_PROTOCOL_VALID_FUNCTION = "rquant_lab_payload_protocol_valid"
 _STRATEGY_NAME_FUNCTION = "rquant_lab_strategy_name"
 _SHARD_HASH_RE = re.compile(r"[0-9a-f]{64}")
 _SHARD_PLAN_NAME_RE = re.compile(r"[a-z][a-z0-9_]*")
@@ -1479,6 +2257,7 @@ def _canonical_shard_payload(value: str) -> str:
     def reject_constant(_value: str) -> object:
         raise ValueError("non-finite shard payload values are not allowed")
 
+    validate_strategy_shard_payload_utf8(value, field="lab_shard.payload_json")
     parsed = strict_json_loads(
         value,
         parse_float=reject_float,
@@ -1487,6 +2266,40 @@ def _canonical_shard_payload(value: str) -> str:
     if not isinstance(parsed, dict):
         raise ValueError("shard payload must encode a JSON object")
     return canonical_json_bytes(parsed).decode("utf-8")
+
+
+def _payload_protocol_version(value: str) -> int:
+    canonical = _canonical_shard_payload(value)
+    if value != canonical:
+        raise ValueError("shard payload JSON is not canonical")
+    payload = strict_json_loads(canonical)
+    assert isinstance(payload, dict)
+    schema_version = payload.get("schema_version")
+    if schema_version is None:
+        return 1
+    if type(schema_version) is not int or schema_version not in {1, 2}:
+        raise ValueError("shard payload has an unsupported protocol version")
+    if schema_version == 2:
+        parsed = parse_strategy_shard_payload(canonical)
+        if not isinstance(parsed, StrategyShardPayloadV2):
+            raise ValueError("shard payload v2 parser dispatch failed")
+    return schema_version
+
+
+def _sqlite_payload_protocol_valid(payload_json: object, protocol_version: object) -> int:
+    try:
+        return int(
+            type(payload_json) is str
+            and _payload_protocol_version(payload_json)
+            == _strict_sqlite_int(
+                protocol_version,
+                field="lab_shard.payload_protocol_version",
+                minimum=1,
+                maximum=2,
+            )
+        )
+    except (TypeError, ValueError, InvalidStoredJobError):
+        return 0
 
 
 def _canonical_stored_json_object(value: str, *, field: str) -> str:
@@ -1901,6 +2714,149 @@ def _worker_report_record_from_row(
 
 def _canonical_model_json(model: BaseModel) -> str:
     return canonical_model_json_bytes(model).decode("utf-8")
+
+
+def _claim_publication_record_from_values(
+    values: Mapping[str, object],
+) -> LabClaimPublicationRecord:
+    material = dict(values)
+    identity_value = material.get("identity")
+    material["identity"] = LabClaimPublicationIdentity.model_validate(identity_value)
+    provisional = LabClaimPublicationRecord.model_construct(
+        **material,
+        record_commitment="0" * 64,
+    )
+    material["record_commitment"] = provisional.recomputed_commitment()
+    return LabClaimPublicationRecord.model_validate(material)
+
+
+def _claim_publication_record_from_row(row: sqlite3.Row) -> LabClaimPublicationRecord:
+    stored_id = str(row["attempt_id"])
+    try:
+
+        def blob(name: str) -> bytes | None:
+            return (
+                _strict_sqlite_blob(row[name], field=f"lab_claim_publication.{name}")
+                if row[name] is not None
+                else None
+            )
+
+        def text(name: str) -> str | None:
+            return str(row[name]) if row[name] is not None else None
+
+        return LabClaimPublicationRecord(
+            identity=LabClaimPublicationIdentity(
+                attempt_id=_canonical_uuid_text(
+                    row["attempt_id"], field="lab_claim_publication.attempt_id"
+                ),
+                job_id=_canonical_uuid_text(row["job_id"], field="lab_claim_publication.job_id"),
+                shard_id=_canonical_uuid_text(
+                    row["shard_id"], field="lab_claim_publication.shard_id"
+                ),
+                claim_token=_canonical_uuid_text(
+                    row["claim_token"], field="lab_claim_publication.claim_token"
+                ),
+                claim_generation=_strict_sqlite_int(
+                    row["claim_generation"],
+                    field="lab_claim_publication.claim_generation",
+                    minimum=1,
+                ),
+                scheduler_fencing_token=_strict_sqlite_int(
+                    row["scheduler_fencing_token"],
+                    field="lab_claim_publication.scheduler_fencing_token",
+                    minimum=1,
+                ),
+                worker_id=str(row["worker_id"]),
+                spec_hash=str(row["spec_hash"]),
+                plan_hash=str(row["plan_hash"]),
+                payload_hash=str(row["payload_hash"]),
+            ),
+            claim_preimage_bytes=_strict_sqlite_blob(
+                row["claim_preimage_bytes"],
+                field="lab_claim_publication.claim_preimage_bytes",
+            ),
+            claim_preimage_hash=str(row["claim_preimage_hash"]),
+            claim_protocol=str(row["claim_protocol"]),
+            claim_protocol_version=str(row["claim_protocol_version"]),
+            source_wait_deadline=_load_time(str(row["source_wait_deadline"])),
+            publication_deadline=_load_time(str(row["publication_deadline"])),
+            source_stage_authority_bytes=_strict_sqlite_blob(
+                row["source_stage_authority_bytes"],
+                field="lab_claim_publication.source_stage_authority_bytes",
+            ),
+            source_stage_authority_hash=str(row["source_stage_authority_hash"]),
+            source_stage_binding_bytes=blob("source_stage_binding_bytes"),
+            source_stage_binding_hash=text("source_stage_binding_hash"),
+            source_intent_bytes=blob("source_intent_bytes"),
+            source_intent_hash=text("source_intent_hash"),
+            source_operation_id=text("source_operation_id"),
+            source_operation_hash=text("source_operation_hash"),
+            queued_source_stage_record_hash=text("queued_source_stage_record_hash"),
+            ready_source_stage_record_bytes=blob("ready_source_stage_record_bytes"),
+            ready_source_stage_record_hash=text("ready_source_stage_record_hash"),
+            verified_source_outcome_hash=text("verified_source_outcome_hash"),
+            verified_evidence_chain_hash=text("verified_evidence_chain_hash"),
+            source_use_plan_bytes=blob("source_use_plan_bytes"),
+            source_use_plan_hash=text("source_use_plan_hash"),
+            final_claim_bytes=blob("final_claim_bytes"),
+            final_claim_hash=text("final_claim_hash"),
+            current_claim_receipt_bytes=blob("current_claim_receipt_bytes"),
+            current_claim_receipt_hash=text("current_claim_receipt_hash"),
+            spool_receipt_bytes=blob("spool_receipt_bytes"),
+            spool_receipt_hash=text("spool_receipt_hash"),
+            status=ClaimPublicationStatus(str(row["status"])),
+            version=_strict_sqlite_int(
+                row["version"], field="lab_claim_publication.version", minimum=0
+            ),
+            created_at=_load_time(str(row["created_at"])),
+            updated_at=_load_time(str(row["updated_at"])),
+            queued_at=(_load_time(str(row["queued_at"])) if row["queued_at"] is not None else None),
+            ready_at=(_load_time(str(row["ready_at"])) if row["ready_at"] is not None else None),
+            published_at=(
+                _load_time(str(row["published_at"])) if row["published_at"] is not None else None
+            ),
+            aborted_at=(
+                _load_time(str(row["aborted_at"])) if row["aborted_at"] is not None else None
+            ),
+            terminal_reason=text("terminal_reason"),
+            record_commitment=str(row["record_commitment"]),
+        )
+    except Exception as exc:
+        if isinstance(exc, InvalidStoredJobError):
+            raise
+        raise InvalidStoredJobError(f"invalid stored claim publication record {stored_id}") from exc
+
+
+def _claim_publication_audit_from_row(
+    row: sqlite3.Row,
+) -> LabClaimPublicationAuditRecord:
+    stored_id = str(row["audit_ref"])
+    try:
+        return LabClaimPublicationAuditRecord(
+            audit_ref=_canonical_uuid_text(
+                row["audit_ref"],
+                field="lab_claim_publication_audit.audit_ref",
+            ),
+            attempt_id=_canonical_uuid_text(
+                row["attempt_id"],
+                field="lab_claim_publication_audit.attempt_id",
+            ),
+            action=ClaimPublicationAuditAction(str(row["action"])),
+            prior_status=(
+                ClaimPublicationStatus(str(row["prior_status"]))
+                if row["prior_status"] is not None
+                else None
+            ),
+            new_status=ClaimPublicationStatus(str(row["new_status"])),
+            reason_code=str(row["reason_code"]),
+            record_commitment=str(row["record_commitment"]),
+            occurred_at=_load_time(str(row["occurred_at"])),
+            audit_hash=str(row["audit_hash"]),
+        )
+    except Exception as exc:
+        if isinstance(exc, InvalidStoredJobError):
+            raise
+        raise InvalidStoredJobError(f"invalid stored claim publication audit {stored_id}") from exc
 
 
 def _artifact_commit_record_from_row(
@@ -2451,6 +3407,7 @@ def _validate_v5_schema(
     connection: sqlite3.Connection,
     *,
     allow_epoch_triggers: bool = False,
+    extra_trigger_sql: Mapping[str, str] | None = None,
 ) -> None:
     _validate_v4_schema(connection)
     _validate_v5_table_sql(
@@ -2583,6 +3540,8 @@ def _validate_v5_schema(
     expected_trigger_sql = dict(_V5_EXPECTED_TRIGGER_SQL)
     if allow_epoch_triggers:
         expected_trigger_sql.update(_LEDGER_EPOCH_TRIGGER_SQL)
+    if extra_trigger_sql is not None:
+        expected_trigger_sql.update(extra_trigger_sql)
     expected_triggers = frozenset(expected_trigger_sql)
     missing_triggers = sorted(expected_triggers - existing_triggers)
     unexpected_triggers = sorted(existing_triggers - expected_triggers)
@@ -2607,8 +3566,22 @@ def _validate_v5_schema(
             )
 
 
-def _validate_v6_schema(connection: sqlite3.Connection) -> None:
-    _validate_v5_schema(connection, allow_epoch_triggers=True)
+def _validate_v6_schema(
+    connection: sqlite3.Connection,
+    *,
+    allow_v7_triggers: bool = True,
+    extra_trigger_sql: Mapping[str, str] | None = None,
+) -> None:
+    accepted_extra_triggers: dict[str, str] = {}
+    if allow_v7_triggers:
+        accepted_extra_triggers.update(_LAB_JOB_SUMMARY_TRIGGER_SQL)
+    if extra_trigger_sql is not None:
+        accepted_extra_triggers.update(extra_trigger_sql)
+    _validate_v5_schema(
+        connection,
+        allow_epoch_triggers=True,
+        extra_trigger_sql=accepted_extra_triggers or None,
+    )
     _validate_v5_table_sql(
         connection,
         table="lab_ledger_epoch",
@@ -2629,6 +3602,528 @@ def _validate_v6_schema(connection: sqlite3.Connection) -> None:
         or rows[0][1] < 0
     ):
         raise LabDatabaseIdentityError("lab jobs SQLite v6 epoch authority is invalid")
+
+
+def _validate_v7_schema(
+    connection: sqlite3.Connection,
+    *,
+    allow_v8_triggers: bool = False,
+    extra_trigger_sql: Mapping[str, str] | None = None,
+) -> None:
+    accepted_extra_triggers: dict[str, str] = {}
+    if allow_v8_triggers:
+        accepted_extra_triggers.update(_V8_PUBLICATION_TRIGGER_SQL)
+    if extra_trigger_sql is not None:
+        accepted_extra_triggers.update(extra_trigger_sql)
+    _validate_v6_schema(
+        connection,
+        allow_v7_triggers=True,
+        extra_trigger_sql=accepted_extra_triggers or None,
+    )
+    for table, statement in (
+        ("lab_ledger_chain", _LEDGER_CHAIN_TABLE_STATEMENT),
+        ("lab_ledger_chain_entry", _LEDGER_CHAIN_ENTRY_TABLE_STATEMENT),
+        ("lab_job_list_summary", _LAB_JOB_LIST_SUMMARY_TABLE_STATEMENT),
+        (
+            "lab_finalization_candidate_summary",
+            _LAB_FINALIZATION_CANDIDATE_SUMMARY_TABLE_STATEMENT,
+        ),
+    ):
+        _validate_v5_table_sql(connection, table=table, expected=statement)
+    chain_rows = connection.execute(
+        "SELECT singleton, chain_generation, head_hash FROM lab_ledger_chain"
+    ).fetchall()
+    if (
+        len(chain_rows) != 1
+        or type(chain_rows[0][0]) is not int
+        or chain_rows[0][0] != 1
+        or type(chain_rows[0][1]) is not int
+        or chain_rows[0][1] < 0
+        or type(chain_rows[0][2]) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", chain_rows[0][2]) is None
+    ):
+        raise LabDatabaseIdentityError("lab jobs SQLite v7 chain authority is invalid")
+    latest = connection.execute(
+        "SELECT mutation_epoch, previous_hash, entry_hash FROM lab_ledger_chain_entry "
+        "WHERE chain_generation = ?",
+        (chain_rows[0][1],),
+    ).fetchone()
+    if (
+        latest is None
+        or type(latest[0]) is not int
+        or latest[0] < 0
+        or type(latest[1]) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", latest[1]) is None
+        or type(latest[2]) is not str
+        or latest[2] != chain_rows[0][2]
+    ):
+        raise LabDatabaseIdentityError("lab jobs SQLite v7 chain head is invalid")
+    for table in ("lab_job_list_summary", "lab_finalization_candidate_summary"):
+        rows = connection.execute(f"SELECT singleton, total_count FROM {table}").fetchall()
+        if (
+            len(rows) != 1
+            or type(rows[0][0]) is not int
+            or rows[0][0] != 1
+            or type(rows[0][1]) is not int
+            or rows[0][1] < 0
+        ):
+            raise LabDatabaseIdentityError(f"lab jobs SQLite v7 {table} is invalid")
+
+
+def _validate_v8_schema(
+    connection: sqlite3.Connection,
+    *,
+    extra_trigger_sql: Mapping[str, str] | None = None,
+) -> None:
+    for table, statement in (
+        ("lab_claim_publication", _CLAIM_PUBLICATION_TABLE_STATEMENT),
+        ("lab_claim_publication_audit", _CLAIM_PUBLICATION_AUDIT_TABLE_STATEMENT),
+    ):
+        _validate_v5_table_sql(connection, table=table, expected=statement)
+    _validate_v7_schema(
+        connection,
+        allow_v8_triggers=True,
+        extra_trigger_sql=extra_trigger_sql,
+    )
+    for name, statement in (
+        (
+            "ix_lab_claim_publication_held_deadline",
+            _CLAIM_PUBLICATION_HELD_DEADLINE_INDEX_STATEMENT,
+        ),
+        (
+            "ix_lab_claim_publication_reconcile_deadline",
+            _CLAIM_PUBLICATION_RECONCILE_INDEX_STATEMENT,
+        ),
+        (
+            "ix_lab_claim_publication_audit_attempt",
+            _CLAIM_PUBLICATION_AUDIT_INDEX_STATEMENT,
+        ),
+    ):
+        row = connection.execute(
+            "SELECT sql FROM sqlite_schema WHERE type = 'index' AND name = ?",
+            (name,),
+        ).fetchone()
+        if row is None or row[0] is None or not _sql_ddl_equivalent(statement, str(row[0])):
+            raise LabDatabaseIdentityError(f"lab jobs SQLite v8 index {name} is invalid")
+
+
+def _validate_v9_schema(
+    connection: sqlite3.Connection,
+    *,
+    extra_trigger_sql: Mapping[str, str] | None = None,
+    allow_v10_indexes: bool = False,
+) -> None:
+    _validate_v8_schema(connection, extra_trigger_sql=extra_trigger_sql)
+    expected_indexes = [("ix_lab_shard_active_claims", _ACTIVE_CLAIMS_INDEX_STATEMENT)]
+    if not allow_v10_indexes:
+        expected_indexes.append(("ix_lab_shard_stale_recovery", _STALE_RECOVERY_INDEX_STATEMENT))
+    for name, statement in expected_indexes:
+        row = connection.execute(
+            "SELECT sql FROM sqlite_schema WHERE type = 'index' AND name = ?",
+            (name,),
+        ).fetchone()
+        if row is None or row[0] is None or not _sql_ddl_equivalent(statement, str(row[0])):
+            raise LabDatabaseIdentityError(f"lab jobs SQLite v9 index {name} is invalid")
+
+
+def _validate_v10_schema(connection: sqlite3.Connection) -> None:
+    _validate_v9_schema(
+        connection,
+        extra_trigger_sql=_V10_PAYLOAD_PROTOCOL_TRIGGER_SQL,
+        allow_v10_indexes=True,
+    )
+    _validate_v5_column_identity(
+        connection,
+        table="lab_shard",
+        column="payload_protocol_version",
+        declared_type="INTEGER",
+        not_null=True,
+        primary_key_position=0,
+        default="1",
+    )
+    for name, statement in (
+        ("ix_lab_shard_stale_recovery", _V10_STALE_RECOVERY_INDEX_STATEMENT),
+        ("ix_lab_shard_v2_reconciliation", _V10_V2_RECONCILIATION_INDEX_STATEMENT),
+    ):
+        row = connection.execute(
+            "SELECT sql FROM sqlite_schema WHERE type = 'index' AND name = ?",
+            (name,),
+        ).fetchone()
+        if row is None or row[0] is None or not _sql_ddl_equivalent(statement, str(row[0])):
+            raise LabDatabaseIdentityError(f"lab jobs SQLite v10 index {name} is invalid")
+
+
+def _validate_v11_schema(
+    connection: sqlite3.Connection,
+    *,
+    allow_v12_idle_control_indexes: bool = False,
+) -> None:
+    _validate_v10_schema(connection)
+    _validate_v5_table_sql(
+        connection,
+        table="lab_recovery_cursor",
+        expected=_RECOVERY_CURSOR_TABLE_STATEMENT,
+    )
+    for name, statement in (
+        (
+            "ix_lab_shard_exhausted_queued_v1_recovery",
+            _V11_EXHAUSTED_QUEUED_V1_RECOVERY_INDEX_STATEMENT,
+        ),
+        (
+            "ix_lab_shard_exhausted_checkpointed_v1_recovery",
+            _V11_EXHAUSTED_CHECKPOINTED_V1_RECOVERY_INDEX_STATEMENT,
+        ),
+        *(
+            ()
+            if allow_v12_idle_control_indexes
+            else (("ix_lab_job_idle_control_recovery", _V11_IDLE_CONTROL_RECOVERY_INDEX_STATEMENT),)
+        ),
+    ):
+        row = connection.execute(
+            "SELECT sql FROM sqlite_schema WHERE type = 'index' AND name = ?",
+            (name,),
+        ).fetchone()
+        if row is None or row[0] is None or not _sql_ddl_equivalent(statement, str(row[0])):
+            raise LabDatabaseIdentityError(f"lab jobs SQLite v11 index {name} is invalid")
+    for row in connection.execute(
+        "SELECT cursor_created_at, cursor_job_id FROM lab_recovery_cursor"
+    ).fetchall():
+        try:
+            _load_time(str(row["cursor_created_at"]))
+            _canonical_uuid_text(
+                row["cursor_job_id"],
+                field="lab_recovery_cursor.cursor_job_id",
+            )
+        except (TypeError, ValueError, InvalidStoredJobError) as exc:
+            raise LabDatabaseIdentityError(
+                "lab jobs SQLite v11 recovery cursor is invalid"
+            ) from exc
+
+
+def _validate_v12_schema(connection: sqlite3.Connection) -> None:
+    _validate_v11_schema(connection, allow_v12_idle_control_indexes=True)
+    for name, statement in (
+        ("ix_lab_job_idle_control_recovery", _V12_IDLE_CONTROL_RECOVERY_INDEX_STATEMENT),
+        ("ix_lab_shard_idle_control_eligibility", _V12_IDLE_CONTROL_SHARD_INDEX_STATEMENT),
+    ):
+        row = connection.execute(
+            "SELECT sql FROM sqlite_schema WHERE type = 'index' AND name = ?",
+            (name,),
+        ).fetchone()
+        if row is None or row[0] is None or not _sql_ddl_equivalent(statement, str(row[0])):
+            raise LabDatabaseIdentityError(f"lab jobs SQLite v12 index {name} is invalid")
+
+
+def _validate_v13_schema(connection: sqlite3.Connection) -> None:
+    _validate_v12_schema(connection)
+    row = connection.execute(
+        "SELECT sql FROM sqlite_schema WHERE type = 'index' AND name = ?",
+        ("ix_lab_shard_preclaim_candidate",),
+    ).fetchone()
+    if (
+        row is None
+        or row[0] is None
+        or not _sql_ddl_equivalent(
+            _V13_PRECLAIM_CANDIDATE_INDEX_STATEMENT,
+            str(row[0]),
+        )
+    ):
+        raise LabDatabaseIdentityError("lab jobs SQLite v13 preclaim candidate index is invalid")
+
+
+def _validate_v14_schema(connection: sqlite3.Connection) -> None:
+    _validate_v13_schema(connection)
+    state_columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(lab_scheduler_state)").fetchall()
+    }
+    required_columns = {
+        "claim_cursor_shard_index",
+        "claim_cursor_shard_id",
+        "claim_cursor_sequence",
+    }
+    missing = sorted(required_columns - state_columns)
+    if missing:
+        raise LabDatabaseIdentityError(
+            "lab jobs SQLite v14 scheduler cursor columns are missing: " + ", ".join(missing)
+        )
+    fair_cursor = connection.execute(
+        "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'lab_preclaim_fair_cursor'"
+    ).fetchone()
+    if fair_cursor is None:
+        raise LabDatabaseIdentityError("lab jobs SQLite v14 is missing fair preclaim cursor")
+
+
+def _validate_v15_schema(connection: sqlite3.Connection) -> None:
+    _validate_v14_schema(connection)
+    required = {
+        "lab_claim_publication_finalizer_lease",
+        "lab_claim_publication_finalizer_observation",
+        "lab_claim_publication_finalizer_root_anchor",
+    }
+    observed = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_schema WHERE type = 'table'"
+        ).fetchall()
+    }
+    missing = sorted(required - observed)
+    if missing:
+        raise LabDatabaseIdentityError(
+            "lab jobs SQLite v15 finalizer authority tables are missing: " + ", ".join(missing)
+        )
+    columns = {
+        str(row[1])
+        for row in connection.execute(
+            "PRAGMA table_info(lab_claim_publication_finalizer_lease)"
+        ).fetchall()
+    }
+    if "root_descriptor" not in columns:
+        raise LabDatabaseIdentityError("lab jobs SQLite v15 finalizer root descriptor is missing")
+
+
+def _validate_v16_schema(connection: sqlite3.Connection) -> None:
+    _validate_v15_schema(connection)
+    required_columns = {
+        "lab_claim_publication_finalizer_observation": {
+            "observation_ref",
+            "attempt_id",
+            "authority_fencing_token",
+            "event_type",
+            "reason_code",
+            "record_commitment",
+            "observed_at",
+        },
+        "lab_claim_publication_finalizer_attestation": {
+            "attempt_id",
+            "publication_status",
+            "certificate_bytes",
+            "certificate_hash",
+            "attestation_bytes",
+            "attestation_hash",
+            "created_at",
+        },
+        "lab_claim_publication_finalizer_trust_cache": {
+            "singleton",
+            "certificate_bytes",
+            "certificate_hash",
+            "cached_at",
+        },
+        "lab_claim_publication_finalizer_observation_degradation": {
+            "degradation_ref",
+            "attempt_id",
+            "publication_identity_hash",
+            "authority_fencing_token",
+            "event_type",
+            "reason_code",
+            "reason_code_hash",
+            "error_class",
+            "next_retry_at",
+            "created_at",
+            "drained_at",
+        },
+    }
+    for table, expected in required_columns.items():
+        columns = {
+            str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        missing = sorted(expected - columns)
+        if missing:
+            raise LabDatabaseIdentityError(
+                f"lab jobs SQLite v16 {table} columns are missing: " + ", ".join(missing)
+            )
+    required_indexes = {
+        "ix_lab_claim_publication_finalizer_observation_attempt",
+        "ix_lab_claim_publication_finalizer_degradation_due",
+    }
+    observed_indexes = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_schema WHERE type = 'index'"
+        ).fetchall()
+    }
+    missing_indexes = sorted(required_indexes - observed_indexes)
+    if missing_indexes:
+        raise LabDatabaseIdentityError(
+            "lab jobs SQLite v16 finalizer indexes are missing: " + ", ".join(missing_indexes)
+        )
+
+
+def _validate_current_schema(connection: sqlite3.Connection) -> None:
+    """Validate the complete schema required by every current runtime operation."""
+
+    try:
+        _validate_v16_schema(connection)
+    except LabDatabaseIdentityError as exc:
+        raise LabDatabaseIdentityError("lab jobs SQLite v16 current schema is invalid") from exc
+
+
+def _migrate_v13_to_v14(connection: sqlite3.Connection) -> None:
+    """Persist shard-level keyset positions for bounded preclaim fairness."""
+
+    _validate_v13_schema(connection)
+    columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(lab_scheduler_state)").fetchall()
+    }
+    if "claim_cursor_shard_index" not in columns:
+        connection.execute(
+            "ALTER TABLE lab_scheduler_state ADD COLUMN claim_cursor_shard_index INTEGER"
+        )
+    if "claim_cursor_shard_id" not in columns:
+        connection.execute("ALTER TABLE lab_scheduler_state ADD COLUMN claim_cursor_shard_id TEXT")
+    if "claim_cursor_sequence" not in columns:
+        connection.execute(
+            """
+            ALTER TABLE lab_scheduler_state
+            ADD COLUMN claim_cursor_sequence INTEGER NOT NULL DEFAULT 0
+            CHECK (typeof(claim_cursor_sequence) = 'integer' AND claim_cursor_sequence >= 0)
+            """
+        )
+    connection.execute(_V14_PRECLAIM_FAIR_CURSOR_TABLE_STATEMENT)
+
+
+def _migrate_v14_to_v15(connection: sqlite3.Connection) -> None:
+    """Install durable fenced authority and redacted observation tables."""
+
+    _validate_v14_schema(connection)
+    connection.execute(_V15_FINALIZER_LEASE_TABLE_STATEMENT)
+    connection.execute(_V15_FINALIZER_ROOT_ANCHOR_TABLE_STATEMENT)
+    columns = {
+        str(row[1])
+        for row in connection.execute(
+            "PRAGMA table_info(lab_claim_publication_finalizer_lease)"
+        ).fetchall()
+    }
+    if "root_descriptor" not in columns:
+        connection.execute(
+            "ALTER TABLE lab_claim_publication_finalizer_lease "
+            "ADD COLUMN root_descriptor TEXT NOT NULL DEFAULT ''"
+        )
+    connection.execute(_V15_FINALIZER_OBSERVATION_TABLE_STATEMENT)
+    connection.execute(_V15_FINALIZER_OBSERVATION_INDEX_STATEMENT)
+
+
+def _migrate_v15_to_v16(connection: sqlite3.Connection) -> None:
+    """Add untrusted certificate cache and signed C/D attestations.
+
+    v15's local HMAC anchor deliberately has no migration path to trust: V2
+    callers must present an externally verified certificate after this upgrade.
+    """
+
+    _validate_v15_schema(connection)
+    connection.execute(_V16_FINALIZER_TRUST_CACHE_TABLE_STATEMENT)
+    connection.execute(_V16_FINALIZER_ATTESTATION_TABLE_STATEMENT)
+    connection.execute(_V16_FINALIZER_OBSERVATION_DEGRADATION_TABLE_STATEMENT)
+    connection.execute(_V16_FINALIZER_OBSERVATION_DEGRADATION_INDEX_STATEMENT)
+
+
+def _migrate_v7_to_v8(connection: sqlite3.Connection) -> None:
+    """Install the additive claim-publication authority on a valid v7 ledger."""
+
+    _validate_v7_schema(connection, allow_v8_triggers=False)
+    for statement in _V8_SCHEMA_STATEMENTS[len(_V7_SCHEMA_STATEMENTS) :]:
+        connection.execute(statement)
+
+
+def _migrate_v8_to_v9(connection: sqlite3.Connection) -> None:
+    """Install bounded active-claim and stale-recovery indexes on a v8 ledger."""
+
+    _validate_v8_schema(connection)
+    for statement in _V9_SCHEMA_STATEMENTS[len(_V8_SCHEMA_STATEMENTS) :]:
+        connection.execute(statement)
+
+
+def _migrate_v9_to_v10(connection: sqlite3.Connection) -> None:
+    """Persist and validate the shard payload protocol before recovery can index it."""
+
+    _validate_v9_schema(connection)
+    columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(lab_shard)").fetchall()}
+    if "payload_protocol_version" in columns:
+        _validate_v10_schema(connection)
+        return
+    connection.execute(
+        """
+        ALTER TABLE lab_shard ADD COLUMN payload_protocol_version INTEGER
+        NOT NULL DEFAULT 1
+        CHECK (
+            typeof(payload_protocol_version) = 'integer'
+            AND payload_protocol_version IN (1, 2)
+        )
+        """
+    )
+    rows = connection.execute(
+        "SELECT job_id, shard_id, payload_json FROM lab_shard ORDER BY job_id, shard_id"
+    ).fetchall()
+    try:
+        for row in rows:
+            protocol_version = _payload_protocol_version(str(row["payload_json"]))
+            connection.execute(
+                """
+                UPDATE lab_shard SET payload_protocol_version = ?
+                WHERE job_id = ? AND shard_id = ?
+                """,
+                (protocol_version, str(row["job_id"]), str(row["shard_id"])),
+            )
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise LabDatabaseIdentityError(
+            "lab jobs SQLite v10 payload protocol backfill failed"
+        ) from exc
+    connection.execute("DROP INDEX ix_lab_shard_stale_recovery")
+    for statement in _V10_SCHEMA_STATEMENTS[len(_V9_SCHEMA_STATEMENTS) :]:
+        connection.execute(statement)
+
+
+def _migrate_v10_to_v11(connection: sqlite3.Connection) -> None:
+    """Install bounded exhausted and idle-control recovery authorities."""
+
+    _validate_v10_schema(connection)
+    for statement in _V11_SCHEMA_STATEMENTS[len(_V10_SCHEMA_STATEMENTS) :]:
+        connection.execute(statement)
+
+
+def _migrate_v11_to_v12(connection: sqlite3.Connection) -> None:
+    """Make idle-control recovery candidates bounded, eligible, and fair."""
+
+    _validate_v11_schema(connection)
+    connection.execute("DROP INDEX ix_lab_job_idle_control_recovery")
+    for statement in _V12_SCHEMA_STATEMENTS[len(_V11_SCHEMA_STATEMENTS) - 1 :]:
+        connection.execute(statement)
+
+
+def _migrate_v12_to_v13(connection: sqlite3.Connection) -> None:
+    """Install the bounded protocol-discriminated preclaim candidate index."""
+
+    _validate_v12_schema(connection)
+    connection.execute(_V13_PRECLAIM_CANDIDATE_INDEX_STATEMENT)
+
+
+def _migrate_v6_to_v7(connection: sqlite3.Connection) -> None:
+    """Install idempotent chain and read-summary authorities for a v6 ledger."""
+
+    _validate_v6_schema(connection, allow_v7_triggers=False)
+    for statement in _V7_SCHEMA_STATEMENTS[len(_V6_SCHEMA_STATEMENTS) :]:
+        connection.execute(statement)
+    epoch = _strict_sqlite_int(
+        connection.execute(
+            "SELECT mutation_epoch FROM lab_ledger_epoch WHERE singleton = 1"
+        ).fetchone()[0],
+        field="lab_ledger_epoch.mutation_epoch",
+        minimum=0,
+    )
+    existing = connection.execute("SELECT COUNT(*) FROM lab_ledger_chain_entry").fetchone()[0]
+    if existing == 1:
+        migrated_head = _ledger_chain_step(_LEDGER_CHAIN_GENESIS_HASH, 0, epoch)
+        connection.execute(
+            "UPDATE lab_ledger_chain SET chain_generation = 0, head_hash = ? WHERE singleton = 1",
+            (migrated_head,),
+        )
+        connection.execute(
+            "UPDATE lab_ledger_chain_entry "
+            "SET mutation_epoch = ?, previous_hash = ?, entry_hash = ? "
+            "WHERE chain_generation = 0",
+            (epoch, _LEDGER_CHAIN_GENESIS_HASH, migrated_head),
+        )
 
 
 def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
@@ -3194,13 +4689,20 @@ class LabJobReader:
         *,
         busy_timeout_ms: int = 5_000,
         identity_authority: LabSqliteIdentityAuthority | None = None,
+        highwater_observer: LabHighWaterObserver | None = None,
+        production_mode: bool = False,
     ) -> None:
         if busy_timeout_ms < 1:
             raise ValueError("busy_timeout_ms must be positive")
         self.path = Path(path)
         self.busy_timeout_ms = busy_timeout_ms
         self.identity_authority = identity_authority
-        self._validated_graph_generation: tuple[int, int, int] | None = None
+        if production_mode and highwater_observer is None:
+            raise ValueError("production Lab reader requires the external high-water authority")
+        self.highwater_observer = highwater_observer
+        self._validated_graph_generation: tuple[object, ...] | None = None
+        self._validated_graph_receipt: LabGraphIntegrityReceipt | None = None
+        self._integrity_anchor: tuple[tuple[int, int], int, int, str] | None = None
         self.graph_validation_runs = 0
         self.graph_validation_peak_batch = 0
         if identity_authority is not None and identity_authority.path != self.path:
@@ -3254,6 +4756,18 @@ class LabJobReader:
             deterministic=True,
         )
         connection.create_function(
+            _PAYLOAD_PROTOCOL_VALID_FUNCTION,
+            2,
+            _sqlite_payload_protocol_valid,
+            deterministic=True,
+        )
+        connection.create_function(
+            _LEDGER_CHAIN_STEP_FUNCTION,
+            3,
+            _ledger_chain_step,
+            deterministic=True,
+        )
+        connection.create_function(
             _STRATEGY_NAME_FUNCTION,
             1,
             _sqlite_strategy_name,
@@ -3268,11 +4782,32 @@ class LabJobReader:
                 connection,
                 allow_unclaimed_empty=False,
             )
-            _validate_v6_schema(connection)
+            _validate_current_schema(connection)
         except BaseException:
             connection.close()
             raise
         return connection
+
+    def _storage_revision(self) -> tuple[tuple[int, int, int, int, int] | None, ...]:
+        revisions: list[tuple[int, int, int, int, int] | None] = []
+        # Opening a read connection may update SQLite's shared-memory sidecar;
+        # it is not a content revision. The database and WAL files are.
+        for suffix in ("", "-wal"):
+            try:
+                observed = Path(f"{self.path}{suffix}").stat(follow_symlinks=False)
+            except FileNotFoundError:
+                revisions.append(None)
+            else:
+                revisions.append(
+                    (
+                        observed.st_dev,
+                        observed.st_ino,
+                        observed.st_size,
+                        observed.st_mtime_ns,
+                        observed.st_ctime_ns,
+                    )
+                )
+        return tuple(revisions)
 
     @contextmanager
     def _read_snapshot(self, *, label: str) -> Iterator[sqlite3.Connection]:
@@ -3457,6 +4992,13 @@ class LabJobReader:
                 and _canonical_shard_payload(payload_json) != payload_json
             ):
                 raise ValueError("shard payload JSON is not canonical")
+            if _payload_protocol_version(payload_json) != _strict_sqlite_int(
+                row["payload_protocol_version"],
+                field="lab_shard.payload_protocol_version",
+                minimum=1,
+                maximum=2,
+            ):
+                raise ValueError("shard payload protocol does not match payload JSON")
             if failure_json is not None:
                 _canonical_stored_json_object(failure_json, field="lab_shard.failure_json")
             if checkpoint_json is not None:
@@ -3971,9 +5513,19 @@ class LabJobReader:
             ) from exc
 
     @staticmethod
-    def _summary_stats_sql() -> str:
-        return """
-            WITH shard_stats AS (
+    def _summary_stats_sql(
+        *,
+        leading_ctes: str | None = None,
+        shard_job_scope: str | None = None,
+    ) -> str:
+        cte_prefix = f"{leading_ctes}," if leading_ctes is not None else ""
+        shard_scope = (
+            f"WHERE job_id IN (SELECT job_id FROM {shard_job_scope})"
+            if shard_job_scope is not None
+            else ""
+        )
+        return f"""
+            WITH {cte_prefix} shard_stats AS (
                 SELECT job_id,
                        COUNT(*) AS shard_count,
                        SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END)
@@ -4000,7 +5552,7 @@ class LabJobReader:
                            AS latest_heartbeat_at,
                        SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END)
                            AS active_count
-                FROM lab_shard GROUP BY job_id
+                FROM lab_shard {shard_scope} GROUP BY job_id
             )
         """
 
@@ -4076,12 +5628,14 @@ class LabJobReader:
         *,
         table: str,
         validator: Callable[[sqlite3.Row], object],
-    ) -> None:
+    ) -> int:
         cursor = connection.execute(f"SELECT * FROM {table}")
+        count = 0
         while True:
             rows = cursor.fetchmany(64)
             if not rows:
-                return
+                return count
+            count += len(rows)
             self.graph_validation_peak_batch = max(
                 self.graph_validation_peak_batch,
                 len(rows),
@@ -4089,9 +5643,60 @@ class LabJobReader:
             for row in rows:
                 validator(row)
 
-    def _validate_authoritative_graph(self, connection: sqlite3.Connection) -> None:
-        """Validate every persistent reader authority before applying visibility filters."""
+    def _validate_ledger_chain(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        expected_generation: int,
+        expected_head_hash: str,
+    ) -> int:
+        cursor = connection.execute(
+            "SELECT chain_generation, mutation_epoch, previous_hash, entry_hash "
+            "FROM lab_ledger_chain_entry ORDER BY chain_generation"
+        )
+        expected_entry_generation = 0
+        previous_hash = _LEDGER_CHAIN_GENESIS_HASH
+        count = 0
+        while True:
+            rows = cursor.fetchmany(64)
+            if not rows:
+                break
+            self.graph_validation_peak_batch = max(self.graph_validation_peak_batch, len(rows))
+            for row in rows:
+                generation = _strict_sqlite_int(
+                    row["chain_generation"],
+                    field="lab_ledger_chain_entry.chain_generation",
+                    minimum=0,
+                )
+                _strict_sqlite_int(
+                    row["mutation_epoch"],
+                    field="lab_ledger_chain_entry.mutation_epoch",
+                    minimum=0,
+                )
+                entry_previous = row["previous_hash"]
+                entry_hash = row["entry_hash"]
+                if (
+                    generation != expected_entry_generation
+                    or entry_previous != previous_hash
+                    or type(entry_hash) is not str
+                    or re.fullmatch(r"[0-9a-f]{64}", entry_hash) is None
+                ):
+                    raise InvalidStoredJobError("Lab job graph chain entry is invalid")
+                previous_hash = entry_hash
+                expected_entry_generation += 1
+                count += 1
+        if (
+            count == 0
+            or expected_entry_generation - 1 != expected_generation
+            or previous_hash != expected_head_hash
+        ):
+            raise InvalidStoredJobError("Lab job graph chain head conflicts with its entries")
+        return count
 
+    @staticmethod
+    def _chain_authority_from_rows(
+        connection: sqlite3.Connection,
+    ) -> tuple[int, int, str]:
         epoch_row = connection.execute(
             "SELECT mutation_epoch FROM lab_ledger_epoch WHERE singleton = 1"
         ).fetchone()
@@ -4102,15 +5707,249 @@ class LabJobReader:
             field="lab_ledger_epoch.mutation_epoch",
             minimum=0,
         )
+        chain_row = connection.execute(
+            "SELECT chain_generation, head_hash FROM lab_ledger_chain WHERE singleton = 1"
+        ).fetchone()
+        if chain_row is None:
+            raise InvalidStoredJobError("Lab job graph chain authority is missing")
+        chain_generation = _strict_sqlite_int(
+            chain_row["chain_generation"],
+            field="lab_ledger_chain.chain_generation",
+            minimum=0,
+        )
+        chain_head_hash = chain_row["head_hash"]
+        if (
+            type(chain_head_hash) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", chain_head_hash) is None
+        ):
+            raise InvalidStoredJobError("Lab job graph chain head is invalid")
+        return epoch, chain_generation, chain_head_hash
+
+    @staticmethod
+    def _validate_incremental_summaries(connection: sqlite3.Connection) -> None:
+        for table in ("lab_job_list_summary", "lab_finalization_candidate_summary"):
+            row = connection.execute(
+                f"SELECT singleton, total_count FROM {table} WHERE singleton = 1"
+            ).fetchone()
+            if (
+                row is None
+                or _strict_sqlite_int(
+                    row["singleton"],
+                    field=f"{table}.singleton",
+                    minimum=1,
+                )
+                != 1
+            ):
+                raise InvalidStoredJobError(f"{table} authority is missing")
+            _strict_sqlite_int(
+                row["total_count"],
+                field=f"{table}.total_count",
+                minimum=0,
+            )
+
+    def _validate_chain_tail(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        epoch: int,
+        chain_generation: int,
+        chain_head_hash: str,
+        max_chain_entries: int,
+    ) -> int:
+        start_generation = max(0, chain_generation - max_chain_entries)
+        rows = connection.execute(
+            "SELECT chain_generation, mutation_epoch, previous_hash, entry_hash "
+            "FROM lab_ledger_chain_entry "
+            "WHERE chain_generation >= ? AND chain_generation <= ? "
+            "ORDER BY chain_generation",
+            (start_generation, chain_generation),
+        ).fetchall()
+        if not rows:
+            raise InvalidStoredJobError("Lab job graph chain tail is missing")
+        expected_generation = start_generation
+        previous_hash: str | None = None
+        for row in rows:
+            generation = _strict_sqlite_int(
+                row["chain_generation"],
+                field="lab_ledger_chain_entry.chain_generation",
+                minimum=0,
+            )
+            entry_epoch = _strict_sqlite_int(
+                row["mutation_epoch"],
+                field="lab_ledger_chain_entry.mutation_epoch",
+                minimum=0,
+            )
+            entry_previous = row["previous_hash"]
+            entry_hash = row["entry_hash"]
+            if (
+                generation != expected_generation
+                or type(entry_previous) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", entry_previous) is None
+                or type(entry_hash) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", entry_hash) is None
+            ):
+                raise InvalidStoredJobError("Lab job graph chain tail is invalid")
+            if previous_hash is not None and entry_previous != previous_hash:
+                raise InvalidStoredJobError("Lab job graph chain tail linkage is invalid")
+            if generation == 0 and entry_previous != _LEDGER_CHAIN_GENESIS_HASH:
+                raise InvalidStoredJobError("Lab job graph chain genesis is invalid")
+            previous_hash = entry_hash
+            expected_generation += 1
+            if generation == chain_generation and entry_epoch != epoch:
+                raise InvalidStoredJobError(
+                    "Lab job graph chain tail conflicts with mutation epoch"
+                )
+        if expected_generation - 1 != chain_generation or previous_hash != chain_head_hash:
+            raise InvalidStoredJobError("Lab job graph chain tail conflicts with its authority")
+        return len(rows)
+
+    def _advance_integrity_anchor(
+        self,
+        *,
+        database_generation: tuple[int, int],
+        mutation_epoch: int,
+        chain_generation: int,
+        chain_head_hash: str,
+        receipt_kind: Literal["incremental", "full"],
+        receipt_hash: str,
+    ) -> None:
+        """Advance the reader-held receipt anchor without permitting rollback.
+
+        The SQLite ledger is protected by the runtime's private identity
+        authority, while this in-process receipt anchors successive reads. A
+        same-inode writer cannot silently rewind epoch and chain state after a
+        daemon has observed a newer committed generation.  When an external
+        high-water observer is configured, every watermark is also submitted
+        (bound to the audit receipt hash) to the independent compare-and-advance
+        authority, which fails closed on rollback, replay, or degradation.
+        """
+
+        observed = (
+            database_generation,
+            mutation_epoch,
+            chain_generation,
+            chain_head_hash,
+        )
+        previous = self._integrity_anchor
+        if previous is not None:
+            (
+                previous_database_generation,
+                previous_epoch,
+                previous_chain_generation,
+                previous_head,
+            ) = previous
+            if database_generation != previous_database_generation:
+                raise LabDatabaseIdentityError(
+                    "Lab job graph database generation changed after audit"
+                )
+            if chain_generation < previous_chain_generation:
+                raise InvalidStoredJobError(
+                    "Lab job graph chain generation rolled back after audit"
+                )
+            if chain_generation == previous_chain_generation:
+                if mutation_epoch != previous_epoch or chain_head_hash != previous_head:
+                    raise InvalidStoredJobError("Lab job graph chain authority changed in place")
+                return
+            if mutation_epoch <= previous_epoch:
+                raise InvalidStoredJobError("Lab job graph mutation epoch rolled back after audit")
+        if self.highwater_observer is not None:
+            self.highwater_observer.observe(
+                database_generation=database_generation,
+                schema_generation=_SCHEMA_VERSION,
+                mutation_epoch=mutation_epoch,
+                chain_generation=chain_generation,
+                chain_head_hash=chain_head_hash,
+                receipt_kind=receipt_kind,
+                receipt_hash=receipt_hash,
+            )
+        self._integrity_anchor = observed
+
+    def audit_incremental(
+        self,
+        *,
+        max_chain_entries: int = 16,
+    ) -> LabIncrementalIntegrityReceipt:
+        """Validate the current authority and a bounded append-only chain tail.
+
+        The scheduler and finalizer call this before they accept more work. It
+        catches epoch rollback, current summary damage, and tail corruption in
+        O(max_chain_entries) SQLite work; ``audit_integrity`` is retained for
+        periodic whole-history validation.
+        """
+
+        if not 1 <= max_chain_entries <= 128:
+            raise ValueError("max_chain_entries must be between 1 and 128")
+        with self._read_snapshot(label="lab job incremental integrity audit") as connection:
+            if not isinstance(connection, _LabJobReaderConnection):
+                raise InvalidStoredJobError("Lab job graph database generation is unavailable")
+            database_generation = connection.database_generation
+            if database_generation is None:
+                raise InvalidStoredJobError("Lab job graph database generation is unavailable")
+            storage_revision = self._storage_revision()
+            epoch, chain_generation, chain_head_hash = self._chain_authority_from_rows(connection)
+            checked_chain_entries = self._validate_chain_tail(
+                connection,
+                epoch=epoch,
+                chain_generation=chain_generation,
+                chain_head_hash=chain_head_hash,
+                max_chain_entries=max_chain_entries,
+            )
+            self._validate_incremental_summaries(connection)
+            final_epoch, final_chain_generation, final_chain_head_hash = (
+                self._chain_authority_from_rows(connection)
+            )
+            if (final_epoch, final_chain_generation, final_chain_head_hash) != (
+                epoch,
+                chain_generation,
+                chain_head_hash,
+            ) or self._storage_revision() != storage_revision:
+                raise InvalidStoredJobError("Lab job graph changed during incremental validation")
+            receipt = LabIncrementalIntegrityReceipt.verified(
+                database_generation=database_generation,
+                mutation_epoch=epoch,
+                chain_generation=chain_generation,
+                chain_head_hash=chain_head_hash,
+                checked_chain_entries=checked_chain_entries,
+            )
+            self._advance_integrity_anchor(
+                database_generation=database_generation,
+                mutation_epoch=epoch,
+                chain_generation=chain_generation,
+                chain_head_hash=chain_head_hash,
+                receipt_kind="incremental",
+                receipt_hash=receipt.receipt_hash,
+            )
+            return receipt
+
+    def _validate_authoritative_graph(
+        self,
+        connection: sqlite3.Connection,
+    ) -> LabGraphIntegrityReceipt:
+        """Validate every persistent authority for an explicit audit receipt."""
+
+        epoch, chain_generation, chain_head_hash = self._chain_authority_from_rows(connection)
         if not isinstance(connection, _LabJobReaderConnection):
             raise InvalidStoredJobError("Lab job graph database generation is unavailable")
         database_generation = connection.database_generation
         if database_generation is None:
             raise InvalidStoredJobError("Lab job graph database generation is unavailable")
-        graph_generation = (*database_generation, epoch)
+        storage_revision = self._storage_revision()
+        graph_generation = (
+            *database_generation,
+            chain_generation,
+            chain_head_hash,
+            storage_revision,
+        )
         if self._validated_graph_generation == graph_generation:
-            return
+            if self._validated_graph_receipt is None:
+                raise InvalidStoredJobError("Lab job graph audit receipt is missing")
+            return self._validated_graph_receipt
         self.graph_validation_runs += 1
+        chain_entry_count = self._validate_ledger_chain(
+            connection,
+            expected_generation=chain_generation,
+            expected_head_hash=chain_head_hash,
+        )
         foreign_key_error = connection.execute("PRAGMA foreign_key_check").fetchone()
         if foreign_key_error is not None:
             raise InvalidStoredJobError("Lab job graph contains a foreign-key violation")
@@ -4123,8 +5962,11 @@ class LabJobReader:
             ("lab_worker_report", _worker_report_record_from_row),
             ("lab_artifact_commit", _artifact_commit_record_from_row),
             ("lab_job_result_artifact", _result_artifact_evidence_from_row),
+            ("lab_claim_publication", _claim_publication_record_from_row),
+            ("lab_claim_publication_audit", _claim_publication_audit_from_row),
         )
         job_cursor = connection.execute("SELECT * FROM lab_job")
+        table_counts: dict[str, int] = {"lab_job": 0}
         while True:
             rows = job_cursor.fetchmany(64)
             if not rows:
@@ -4133,21 +5975,24 @@ class LabJobReader:
                 self.graph_validation_peak_batch,
                 len(rows),
             )
+            table_counts["lab_job"] += len(rows)
             for row in rows:
                 job = self._job_from_row(row)
                 self._validate_complete_result_graph(connection, job)
         for table, validator in validators:
-            self._stream_validated_rows(
+            table_counts[table] = self._stream_validated_rows(
                 connection,
                 table=table,
                 validator=validator,
             )
 
         cursor = connection.execute("SELECT * FROM lab_scheduler_state")
+        scheduler_state_count = 0
         while True:
             batch = cursor.fetchmany(64)
             if not batch:
                 break
+            scheduler_state_count += len(batch)
             self.graph_validation_peak_batch = max(
                 self.graph_validation_peak_batch,
                 len(batch),
@@ -4177,7 +6022,48 @@ class LabJobReader:
             != epoch
         ):
             raise InvalidStoredJobError("Lab job graph changed during validation")
+        final_chain_row = connection.execute(
+            "SELECT chain_generation, head_hash FROM lab_ledger_chain WHERE singleton = 1"
+        ).fetchone()
+        if (
+            final_chain_row is None
+            or _strict_sqlite_int(
+                final_chain_row["chain_generation"],
+                field="lab_ledger_chain.chain_generation",
+                minimum=0,
+            )
+            != chain_generation
+            or final_chain_row["head_hash"] != chain_head_hash
+        ):
+            raise InvalidStoredJobError("Lab job graph chain changed during validation")
+        if self._storage_revision() != storage_revision:
+            raise InvalidStoredJobError("Lab job graph storage changed during validation")
+        table_counts["lab_scheduler_state"] = scheduler_state_count
+        table_counts["lab_ledger_chain_entry"] = chain_entry_count
+        receipt = LabGraphIntegrityReceipt.verified(
+            database_generation=database_generation,
+            mutation_epoch=epoch,
+            chain_generation=chain_generation,
+            chain_head_hash=chain_head_hash,
+            table_counts=LabGraphIntegrityTableCounts.model_validate(table_counts),
+        )
+        self._advance_integrity_anchor(
+            database_generation=database_generation,
+            mutation_epoch=epoch,
+            chain_generation=chain_generation,
+            chain_head_hash=chain_head_hash,
+            receipt_kind="full",
+            receipt_hash=receipt.receipt_hash,
+        )
         self._validated_graph_generation = graph_generation
+        self._validated_graph_receipt = receipt
+        return receipt
+
+    def audit_integrity(self) -> LabGraphIntegrityReceipt:
+        """Explicitly validate the complete ledger and return its generation-bound receipt."""
+
+        with self._read_snapshot(label="lab job graph integrity audit") as connection:
+            return self._validate_authoritative_graph(connection)
 
     @classmethod
     def _summary_from_row(cls, row: sqlite3.Row) -> LabJobSummary:
@@ -4189,6 +6075,25 @@ class LabJobReader:
         has_result_index = _strict_sqlite_bool(row["has_result_index"], field="has_result_index")
         if (job.result_state is LabResultState.SEALED) != has_result_index:
             raise InvalidStoredJobError("job summary result index conflicts with result state")
+        if (
+            job.requires_complete_result
+            and job.result_state in {LabResultState.READY, LabResultState.SEALED}
+            and (progress.total_shards == 0 or progress.succeeded_shards != progress.total_shards)
+        ):
+            raise InvalidStoredJobError(
+                "ready or sealed job summary requires all and only succeeded shards"
+            )
+        if (
+            job.requires_complete_result
+            and job.result_state is LabResultState.PENDING
+            and job.status is JobStatus.RUNNING
+            and job.result_contract_version == COMPLETE_RESULT_CONTRACT_VERSION
+            and progress.total_shards > 0
+            and progress.succeeded_shards == progress.total_shards
+        ):
+            raise InvalidStoredJobError(
+                "running job summary with all shards succeeded must be result ready"
+            )
         if has_result_index:
             try:
                 evidence = strict_model_validate_canonical_json(
@@ -4242,7 +6147,6 @@ class LabJobReader:
             raise ValueError(f"limit must be between 1 and {LAB_JOB_LIST_LIMIT_MAX}")
         selected_filters = LabJobListFilters.model_validate(filters or LabJobListFilters())
         clauses, parameters = self._job_filters_sql(selected_filters)
-        total_where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         page_clauses = list(clauses)
         page_parameters = list(parameters)
         if cursor is not None:
@@ -4253,21 +6157,50 @@ class LabJobReader:
         if len(page_parameters) + 1 > LAB_JOB_LIST_QUERY_PARAMETER_MAX:
             raise ValueError("job list query exceeds the SQL parameter budget")
         page_where = f" WHERE {' AND '.join(page_clauses)}" if page_clauses else ""
-        with self._read_snapshot(label="job list") as connection:
-            self._validate_authoritative_graph(connection)
-            total_row = connection.execute(
-                f"SELECT COUNT(*) AS total_count FROM lab_job AS j{total_where}",
-                parameters,
-            ).fetchone()
-            rows = connection.execute(
-                f"{self._summary_stats_sql()} "
-                f"SELECT {self._summary_columns_sql()} FROM lab_job AS j "
-                f"LEFT JOIN shard_stats AS ss ON ss.job_id = j.job_id{page_where} "
-                "ORDER BY j.created_at DESC, j.job_id DESC LIMIT ?",
-                (*page_parameters, limit + 1),
-            ).fetchall()
-        assert total_row is not None
-        total_count = _strict_sqlite_int(total_row["total_count"], field="total_count", minimum=0)
+        try:
+            with self._read_snapshot(label="job list") as connection:
+                total_row = (
+                    connection.execute(
+                        "SELECT total_count FROM lab_job_list_summary WHERE singleton = 1"
+                    ).fetchone()
+                    if not clauses
+                    else None
+                )
+                page_cte = (
+                    "page_jobs AS MATERIALIZED ("
+                    f"SELECT j.* FROM lab_job AS j{page_where} "
+                    "ORDER BY j.created_at DESC, j.job_id DESC LIMIT ?"
+                    ")"
+                )
+                stats_sql = self._summary_stats_sql(
+                    leading_ctes=page_cte,
+                    shard_job_scope="page_jobs",
+                )
+                rows = connection.execute(
+                    f"{stats_sql} "
+                    f"SELECT {self._summary_columns_sql()} FROM page_jobs AS j "
+                    "LEFT JOIN shard_stats AS ss ON ss.job_id = j.job_id "
+                    "ORDER BY j.created_at DESC, j.job_id DESC",
+                    (*page_parameters, limit + 1),
+                ).fetchall()
+                for row in rows[:limit]:
+                    page_job = self._job_from_row(row)
+                    if page_job.result_state is LabResultState.SEALED:
+                        self._validate_complete_result_graph(connection, page_job)
+        except sqlite3.OperationalError as exc:
+            if (
+                selected_filters.keyword is not None
+                and "user-defined function raised exception" in str(exc)
+            ):
+                raise InvalidStoredJobError(
+                    "invalid stored lab job encountered while filtering strategy names"
+                ) from exc
+            raise
+        total_count = (
+            _strict_sqlite_int(total_row["total_count"], field="total_count", minimum=0)
+            if total_row is not None
+            else None
+        )
         has_more = len(rows) > limit
         visible = rows[:limit]
         items = tuple(self._summary_from_row(row) for row in visible)
@@ -4303,25 +6236,27 @@ class LabJobReader:
             "j.result_contract_version = ?",
         ]
         parameters: list[object] = [COMPLETE_RESULT_CONTRACT_VERSION]
-        total_where = f" WHERE {' AND '.join(clauses)}"
         if cursor is not None:
             cursor_time, cursor_id = self._decode_cursor(cursor)
             clauses.append("(j.updated_at < ? OR (j.updated_at = ? AND j.job_id < ?))")
             parameters.extend((cursor_time, cursor_time, str(cursor_id)))
         with self._read_snapshot(label="finalization candidate list") as connection:
-            self._validate_authoritative_graph(connection)
             total_row = connection.execute(
-                f"SELECT COUNT(*) AS total_count FROM lab_job AS j{total_where}",
-                (COMPLETE_RESULT_CONTRACT_VERSION,),
+                "SELECT total_count FROM lab_finalization_candidate_summary WHERE singleton = 1"
             ).fetchone()
             rows = connection.execute(
                 f"SELECT j.* FROM lab_job AS j WHERE {' AND '.join(clauses)} "
                 "ORDER BY j.updated_at DESC, j.job_id DESC LIMIT ?",
                 (*parameters, limit + 1),
             ).fetchall()
+            snapshots = tuple(
+                self._finalization_snapshot_from_row(connection, row) for row in rows[:limit]
+            )
         assert total_row is not None
         has_more = len(rows) > limit
-        jobs = tuple(self._job_from_row(row) for row in rows[:limit])
+        if any(snapshot is None for snapshot in snapshots):
+            raise InvalidStoredJobError("finalization candidate changed inside its read snapshot")
+        jobs = tuple(snapshot.job for snapshot in snapshots if snapshot is not None)
         items = tuple(
             LabFinalizationCandidate(
                 job_id=job.job_id,
@@ -4697,6 +6632,99 @@ class LabJobReader:
             connection.execute("COMMIT")
             return authority
 
+    def _finalization_snapshot_from_row(
+        self,
+        connection: sqlite3.Connection,
+        job_row: sqlite3.Row,
+        *,
+        invoke_job_read_boundary: bool = False,
+    ) -> LabFinalizationSnapshot | None:
+        job = self._job_from_row(job_row)
+        self._validate_complete_result_graph(connection, job)
+        if invoke_job_read_boundary:
+            self._after_finalization_job_read(job.job_id)
+        if (
+            job.status is not JobStatus.RUNNING
+            or job.result_state is not LabResultState.READY
+            or job.result_contract_version != COMPLETE_RESULT_CONTRACT_VERSION
+            or not job.requires_complete_result
+            or job.control_intent is not ControlIntent.NONE
+        ):
+            return None
+
+        ready_event_rows = connection.execute(
+            """
+            SELECT * FROM lab_event
+            WHERE job_id = ? AND event_type = 'job_result_ready'
+              AND job_version = ?
+            ORDER BY event_id
+            """,
+            (str(job.job_id), job.version),
+        ).fetchall()
+        if len(ready_event_rows) != 1:
+            raise InvalidStoredJobError(
+                "ready finalization snapshot requires exactly one ready epoch event"
+            )
+        ready_event = self._event_from_row(ready_event_rows[0])
+
+        shard_rows = connection.execute(
+            "SELECT * FROM lab_shard WHERE job_id = ? ORDER BY shard_index",
+            (str(job.job_id),),
+        ).fetchall()
+        shards = tuple(self._shard_from_row(row) for row in shard_rows)
+        if not shards or any(shard.status is not ShardStatus.SUCCEEDED for shard in shards):
+            raise InvalidStoredJobError(
+                "ready finalization snapshot requires all and only succeeded shards"
+            )
+
+        report_rows = connection.execute(
+            """
+            SELECT * FROM lab_worker_report
+            WHERE job_id = ? AND status = 'accepted'
+              AND report_type = 'shard_succeeded'
+            ORDER BY shard_id, applied_at, report_id
+            """,
+            (str(job.job_id),),
+        ).fetchall()
+        reports_by_shard: dict[UUID, list[LabWorkerReportRecord]] = {}
+        for row in report_rows:
+            report_id = _canonical_uuid_text(
+                row["report_id"],
+                field="lab_worker_report.report_id",
+            )
+            record = _worker_report_record_from_row(
+                row,
+                expected_report_id=report_id,
+            )
+            reports_by_shard.setdefault(record.report.shard_id, []).append(record)
+
+        shard_ids = {shard.shard_id for shard in shards}
+        if set(reports_by_shard) != shard_ids or any(
+            len(records) != 1 for records in reports_by_shard.values()
+        ):
+            raise InvalidStoredJobError(
+                "each finalization shard requires exactly one accepted success report"
+            )
+        try:
+            return LabFinalizationSnapshot(
+                job=job,
+                ready_epoch=LabFinalizationReadyEpoch(
+                    job_version=job.version,
+                    event=ready_event,
+                ),
+                shards=tuple(
+                    LabFinalizationShardEvidence(
+                        shard=shard,
+                        accepted_success=reports_by_shard[shard.shard_id][0],
+                    )
+                    for shard in shards
+                ),
+            )
+        except Exception as exc:
+            raise InvalidStoredJobError(
+                f"invalid finalization snapshot for job {job.job_id}: {exc}"
+            ) from exc
+
     def get_finalization_snapshot(self, job_id: UUID) -> LabFinalizationSnapshot | None:
         """Return one validated ready-result graph from a single read transaction."""
 
@@ -4711,91 +6739,11 @@ class LabJobReader:
             if job_row is None:
                 connection.execute("COMMIT")
                 return None
-            job = self._job_from_row(job_row)
-            self._validate_complete_result_graph(connection, job)
-            self._after_finalization_job_read(job_id)
-            if (
-                job.status is not JobStatus.RUNNING
-                or job.result_state is not LabResultState.READY
-                or job.result_contract_version != COMPLETE_RESULT_CONTRACT_VERSION
-                or not job.requires_complete_result
-                or job.control_intent is not ControlIntent.NONE
-            ):
-                connection.execute("COMMIT")
-                return None
-
-            ready_event_rows = connection.execute(
-                """
-                SELECT * FROM lab_event
-                WHERE job_id = ? AND event_type = 'job_result_ready'
-                  AND job_version = ?
-                ORDER BY event_id
-                """,
-                (str(job_id), job.version),
-            ).fetchall()
-            if len(ready_event_rows) != 1:
-                raise InvalidStoredJobError(
-                    "ready finalization snapshot requires exactly one ready epoch event"
-                )
-            ready_event = self._event_from_row(ready_event_rows[0])
-
-            shard_rows = connection.execute(
-                "SELECT * FROM lab_shard WHERE job_id = ? ORDER BY shard_index",
-                (str(job_id),),
-            ).fetchall()
-            shards = tuple(self._shard_from_row(row) for row in shard_rows)
-            if not shards or any(shard.status is not ShardStatus.SUCCEEDED for shard in shards):
-                raise InvalidStoredJobError(
-                    "ready finalization snapshot requires all and only succeeded shards"
-                )
-
-            report_rows = connection.execute(
-                """
-                SELECT * FROM lab_worker_report
-                WHERE job_id = ? AND status = 'accepted'
-                  AND report_type = 'shard_succeeded'
-                ORDER BY shard_id, applied_at, report_id
-                """,
-                (str(job_id),),
-            ).fetchall()
-            reports_by_shard: dict[UUID, list[LabWorkerReportRecord]] = {}
-            for row in report_rows:
-                report_id = _canonical_uuid_text(
-                    row["report_id"],
-                    field="lab_worker_report.report_id",
-                )
-                record = _worker_report_record_from_row(
-                    row,
-                    expected_report_id=report_id,
-                )
-                reports_by_shard.setdefault(record.report.shard_id, []).append(record)
-
-            shard_ids = {shard.shard_id for shard in shards}
-            if set(reports_by_shard) != shard_ids or any(
-                len(records) != 1 for records in reports_by_shard.values()
-            ):
-                raise InvalidStoredJobError(
-                    "each finalization shard requires exactly one accepted success report"
-                )
-            try:
-                snapshot = LabFinalizationSnapshot(
-                    job=job,
-                    ready_epoch=LabFinalizationReadyEpoch(
-                        job_version=job.version,
-                        event=ready_event,
-                    ),
-                    shards=tuple(
-                        LabFinalizationShardEvidence(
-                            shard=shard,
-                            accepted_success=reports_by_shard[shard.shard_id][0],
-                        )
-                        for shard in shards
-                    ),
-                )
-            except Exception as exc:
-                raise InvalidStoredJobError(
-                    f"invalid finalization snapshot for job {job_id}: {exc}"
-                ) from exc
+            snapshot = self._finalization_snapshot_from_row(
+                connection,
+                job_row,
+                invoke_job_read_boundary=True,
+            )
             connection.execute("COMMIT")
             return snapshot
         except BaseException as exc:
@@ -5169,9 +7117,31 @@ class LabJobStore:
             authorization.artifact_success_authorized,
         )
         connection.create_function(
+            _CLAIM_PUBLICATION_AUTH_FUNCTION,
+            4,
+            authorization.claim_publication_authorized,
+        )
+        connection.create_function(
+            _CLAIM_PUBLICATION_AUDIT_AUTH_FUNCTION,
+            4,
+            authorization.claim_publication_audit_authorized,
+        )
+        connection.create_function(
             _SHARD_ROW_VALID_FUNCTION,
             32,
             _sqlite_shard_row_valid,
+            deterministic=True,
+        )
+        connection.create_function(
+            _PAYLOAD_PROTOCOL_VALID_FUNCTION,
+            2,
+            _sqlite_payload_protocol_valid,
+            deterministic=True,
+        )
+        connection.create_function(
+            _LEDGER_CHAIN_STEP_FUNCTION,
+            3,
+            _ledger_chain_step,
             deterministic=True,
         )
         connection.row_factory = sqlite3.Row
@@ -5182,7 +7152,7 @@ class LabJobStore:
                     connection,
                     allow_unclaimed_empty=False,
                 )
-                _validate_v6_schema(connection)
+                _validate_current_schema(connection)
             connection.execute("PRAGMA foreign_keys = ON")
             connection.execute("PRAGMA synchronous = FULL")
         except BaseException:
@@ -5203,11 +7173,32 @@ class LabJobStore:
                 connection,
                 allow_unclaimed_empty=False,
             )
-            _validate_v6_schema(connection)
+            _validate_current_schema(connection)
             yield connection
             if self.mutation_guard is not None:
                 self.mutation_guard()
             connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    @contextmanager
+    def _read_transaction(self) -> Iterator[sqlite3.Connection]:
+        """Return one read-only, internally consistent snapshot without a write lock."""
+
+        connection = self._connect()
+        try:
+            connection.execute("PRAGMA query_only = ON")
+            connection.execute("BEGIN DEFERRED")
+            _validate_database_identity(
+                connection,
+                allow_unclaimed_empty=False,
+            )
+            _validate_current_schema(connection)
+            yield connection
+            connection.rollback()
         except BaseException:
             connection.rollback()
             raise
@@ -5228,7 +7219,17 @@ class LabJobStore:
                         _V2_SCHEMA_VERSION,
                         _V3_SCHEMA_VERSION,
                         _V4_SCHEMA_VERSION,
-                        _PREVIOUS_SCHEMA_VERSION,
+                        _V5_SCHEMA_VERSION,
+                        _V6_SCHEMA_VERSION,
+                        _V7_SCHEMA_VERSION,
+                        _V8_SCHEMA_VERSION,
+                        _V9_SCHEMA_VERSION,
+                        _V10_SCHEMA_VERSION,
+                        _V11_SCHEMA_VERSION,
+                        _V12_SCHEMA_VERSION,
+                        _V13_SCHEMA_VERSION,
+                        _V14_SCHEMA_VERSION,
+                        _V15_SCHEMA_VERSION,
                         _SCHEMA_VERSION,
                     }
                 ),
@@ -5243,7 +7244,17 @@ class LabJobStore:
                         _V2_SCHEMA_VERSION,
                         _V3_SCHEMA_VERSION,
                         _V4_SCHEMA_VERSION,
-                        _PREVIOUS_SCHEMA_VERSION,
+                        _V5_SCHEMA_VERSION,
+                        _V6_SCHEMA_VERSION,
+                        _V7_SCHEMA_VERSION,
+                        _V8_SCHEMA_VERSION,
+                        _V9_SCHEMA_VERSION,
+                        _V10_SCHEMA_VERSION,
+                        _V11_SCHEMA_VERSION,
+                        _V12_SCHEMA_VERSION,
+                        _V13_SCHEMA_VERSION,
+                        _V14_SCHEMA_VERSION,
+                        _V15_SCHEMA_VERSION,
                         _SCHEMA_VERSION,
                     }
                 ),
@@ -5281,12 +7292,69 @@ class LabJobStore:
                 _migrate_v4_to_v5(connection)
             elif starting_version == _V4_SCHEMA_VERSION:
                 _migrate_v4_to_v5(connection)
-            elif starting_version == _PREVIOUS_SCHEMA_VERSION:
+            elif starting_version == _V5_SCHEMA_VERSION:
                 _validate_v5_schema(connection)
+            elif starting_version == _V6_SCHEMA_VERSION:
+                _migrate_v6_to_v7(connection)
+            elif starting_version == _V7_SCHEMA_VERSION:
+                _migrate_v7_to_v8(connection)
+                _migrate_v8_to_v9(connection)
+            elif starting_version == _V8_SCHEMA_VERSION:
+                _migrate_v8_to_v9(connection)
+            elif starting_version == _V9_SCHEMA_VERSION:
+                _validate_v9_schema(connection)
+            elif starting_version == _V10_SCHEMA_VERSION:
+                _validate_v10_schema(connection)
+            elif starting_version == _V11_SCHEMA_VERSION:
+                _validate_v11_schema(connection)
+            elif starting_version == _V12_SCHEMA_VERSION:
+                _validate_v12_schema(connection)
+            elif starting_version == _V13_SCHEMA_VERSION:
+                _validate_v13_schema(connection)
+            elif starting_version == _V14_SCHEMA_VERSION:
+                _validate_v14_schema(connection)
+            elif starting_version == _V15_SCHEMA_VERSION:
+                _migrate_v15_to_v16(connection)
+                _validate_v16_schema(connection)
+            elif starting_version == _SCHEMA_VERSION:
+                _validate_v16_schema(connection)
             for statement in _SCHEMA_STATEMENTS:
                 connection.execute(statement)
+            if starting_version != _SCHEMA_VERSION:
+                if starting_version not in {
+                    _V11_SCHEMA_VERSION,
+                    _V12_SCHEMA_VERSION,
+                    _V13_SCHEMA_VERSION,
+                    _V14_SCHEMA_VERSION,
+                    _V15_SCHEMA_VERSION,
+                }:
+                    if starting_version != _V10_SCHEMA_VERSION:
+                        _migrate_v9_to_v10(connection)
+                    _migrate_v10_to_v11(connection)
+                if starting_version not in {
+                    _V12_SCHEMA_VERSION,
+                    _V13_SCHEMA_VERSION,
+                    _V14_SCHEMA_VERSION,
+                    _V15_SCHEMA_VERSION,
+                }:
+                    _migrate_v11_to_v12(connection)
+                if starting_version not in {
+                    _V13_SCHEMA_VERSION,
+                    _V14_SCHEMA_VERSION,
+                    _V15_SCHEMA_VERSION,
+                }:
+                    _migrate_v12_to_v13(connection)
+                if starting_version not in {_V14_SCHEMA_VERSION, _V15_SCHEMA_VERSION}:
+                    _migrate_v13_to_v14(connection)
+                if starting_version < _V15_SCHEMA_VERSION:
+                    _migrate_v14_to_v15(connection)
+                _migrate_v15_to_v16(connection)
             _normalize_legacy_terminal_shards(connection)
-            _validate_v6_schema(connection)
+            if starting_version < _V15_SCHEMA_VERSION:
+                _migrate_v14_to_v15(connection)
+            if starting_version < _SCHEMA_VERSION:
+                _migrate_v15_to_v16(connection)
+            _validate_v16_schema(connection)
             connection.execute(f"PRAGMA user_version = {self.SCHEMA_VERSION}")
             if self.mutation_guard is not None:
                 self.mutation_guard()
@@ -5873,7 +7941,7 @@ class LabJobStore:
         try:
             connection.execute("BEGIN IMMEDIATE")
             _validate_database_identity(connection, allow_unclaimed_empty=False)
-            _validate_v6_schema(connection)
+            _validate_current_schema(connection)
             self._validate_lease(connection, lease, now=current)
             existed_before_apply = (
                 connection.execute(
@@ -6036,6 +8104,85 @@ class LabJobStore:
         ):
             raise SchedulerLeaseFencedError("scheduler lease has been superseded")
         return row
+
+    def _scheduler_fence_authority(self, connection: sqlite3.Connection) -> dict[str, object]:
+        canonical_path = self.path.resolve(strict=True)
+        observed = canonical_path.stat(follow_symlinks=False)
+        application_id = _strict_sqlite_int(
+            connection.execute("PRAGMA application_id").fetchone()[0],
+            field="PRAGMA application_id",
+            minimum=1,
+        )
+        schema_version = _strict_sqlite_int(
+            connection.execute("PRAGMA user_version").fetchone()[0],
+            field="PRAGMA user_version",
+            minimum=1,
+        )
+        implementation_digest = hashlib.sha256(
+            canonical_json_bytes(
+                {
+                    "class": "rquant.lab_jobs.LabJobStore",
+                    "claim_contract": "rquant-current-scheduler-fence/v1",
+                    "schema_version": _SCHEMA_VERSION,
+                }
+            )
+        ).hexdigest()
+        store_id = hashlib.sha256(
+            canonical_json_bytes(
+                {
+                    "canonical_path": str(canonical_path),
+                    "database_generation": (observed.st_dev, observed.st_ino),
+                    "application_id": application_id,
+                    "schema_version": schema_version,
+                    "implementation_digest": implementation_digest,
+                }
+            )
+        ).hexdigest()
+        return {
+            "canonical_job_store_path": str(canonical_path),
+            "database_generation": (observed.st_dev, observed.st_ino),
+            "store_id": store_id,
+            "application_id": application_id,
+            "schema_version": schema_version,
+            "implementation_digest": implementation_digest,
+        }
+
+    def issue_current_scheduler_fence_receipt(
+        self,
+        *,
+        lease: LabLeaseRecord,
+        binding: LabSourceStageBinding,
+        now: datetime,
+    ) -> CurrentSchedulerFenceReceipt:
+        current = _utc(now)
+        with self._read_transaction() as connection:
+            row = self._validate_lease(connection, lease, now=current)
+            authority = self._scheduler_fence_authority(connection)
+            lease_commitment = _scheduler_fence_lease_commitment(row)
+            row_commitment = _scheduler_fence_row_commitment(
+                owner_id=lease.owner_id,
+                scheduler_fencing_token=lease.fencing_token,
+                lease_id=lease.lease_id,
+                lease_commitment=lease_commitment,
+                issued_at=lease.acquired_at,
+                expires_at=lease.expires_at,
+            )
+            return CurrentSchedulerFenceReceipt(
+                **authority,
+                binding=binding,
+                owner_id=lease.owner_id,
+                scheduler_fencing_token=lease.fencing_token,
+                lease_id=lease.lease_id,
+                lease_commitment=lease_commitment,
+                issued_at=lease.acquired_at,
+                expires_at=lease.expires_at,
+                row_commitment=row_commitment,
+                receipt_commitment=_scheduler_fence_receipt_commitment(
+                    **authority,
+                    binding=binding,
+                    row_commitment=row_commitment,
+                ),
+            )
 
     def renew_scheduler_lease(
         self,
@@ -6229,6 +8376,8 @@ class LabJobStore:
         reason: str,
     ) -> sqlite3.Row:
         job_id = _canonical_uuid_text(job_row["job_id"], field="lab_job.job_id")
+        if job_id in self._jobs_requiring_v2_reconciliation(connection, (job_id,)):
+            return job_row
         exhausted_candidate = connection.execute(
             """
             SELECT 1 FROM lab_shard
@@ -6353,6 +8502,36 @@ class LabJobStore:
             lease=lease,
             now=now,
             reason=reason,
+        )
+
+    @staticmethod
+    def _jobs_requiring_v2_reconciliation(
+        connection: sqlite3.Connection,
+        job_ids: tuple[UUID, ...],
+    ) -> frozenset[UUID]:
+        """Return a bounded batch of jobs that generic failure recovery must not mutate."""
+
+        if not job_ids:
+            return frozenset()
+        unique_ids = tuple(sorted(set(job_ids), key=str))
+        placeholders = ", ".join("?" for _ in unique_ids)
+        rows = connection.execute(
+            f"""
+            SELECT DISTINCT shard.job_id
+            FROM lab_shard AS shard
+            WHERE shard.job_id IN ({placeholders})
+              AND (
+                  shard.payload_protocol_version = 2
+                  OR EXISTS (
+                      SELECT 1 FROM lab_claim_publication AS publication
+                      WHERE publication.job_id = shard.job_id
+                  )
+              )
+            """,
+            tuple(str(job_id) for job_id in unique_ids),
+        ).fetchall()
+        return frozenset(
+            _canonical_uuid_text(row["job_id"], field="lab_shard.job_id") for row in rows
         )
 
     def _adopt_running_job_fence(
@@ -6739,6 +8918,7 @@ class LabJobStore:
         *,
         lease: LabLeaseRecord,
         now: datetime,
+        submission_authority: Callable[[LabCommandEnvelope, datetime], None] | None = None,
     ) -> LabCommandReceipt:
         validated = LabCommandEnvelope.model_validate(envelope)
         current = _utc(now)
@@ -6747,6 +8927,13 @@ class LabJobStore:
             existing = self._apply_existing_or_conflict(connection, validated)
             if existing is not None:
                 return existing
+            command = validated.command
+            if isinstance(command, SubmitJobCommand) and command.spec.schema_version == 3:
+                if submission_authority is None:
+                    raise FormalSubmissionAuthorityError(
+                        "formal v3 submission requires authoritative ownership validation"
+                    )
+                submission_authority(validated, current)
             receipt = self._apply_new_command(
                 connection,
                 validated,
@@ -6848,12 +9035,28 @@ class LabJobStore:
         lease: LabLeaseRecord,
         now: datetime,
     ) -> LabCommandReceipt:
-        if command.spec.schema_version != 2:
+        if command.spec.schema_version not in {2, 3}:
             return self._receipt_for_rejection(
                 envelope,
                 reason="unsupported_spec_version",
                 job_version=None,
             )
+        if command.spec.schema_version == 3 and not command.spec.catalog_owner_eligible:
+            return self._receipt_for_rejection(
+                envelope,
+                reason="v3_catalog_owner_identity_required",
+                job_version=None,
+            )
+        if command.spec.schema_version == 2 and command.spec.research_status != "exploratory":
+            return self._receipt_for_rejection(
+                envelope,
+                reason="v2_formal_requires_exploratory_migration",
+                job_version=None,
+            )
+        if command.spec.schema_version == 3:
+            submission_reason = "submitted_v3_owned"
+        else:
+            submission_reason = "submitted_legacy_v2_exploratory_non_owner"
         if existing_row is not None:
             return self._receipt_for_rejection(
                 envelope,
@@ -6899,7 +9102,7 @@ class LabJobStore:
             prior_status=None,
             new_status=JobStatus.QUEUED,
             job_version=0,
-            reason="submitted",
+            reason=submission_reason,
             fencing_token=lease.fencing_token,
             now=now,
         )
@@ -6908,7 +9111,7 @@ class LabJobStore:
             content_hash=envelope.content_hash,
             job_id=command.job_id,
             status="applied",
-            reason="submitted",
+            reason=submission_reason,
             job_version=0,
         )
 
@@ -7327,6 +9530,7 @@ class LabJobStore:
             raise ValueError(f"a shard plan may contain at most {MAX_JOB_SHARDS} shards")
         validated = tuple(LabShardDefinition.model_validate(item) for item in definitions)
         ordered = tuple(sorted(validated, key=lambda item: item.shard_index))
+        protocol_versions = tuple(_payload_protocol_version(item.payload_json) for item in ordered)
         if tuple(item.shard_index for item in ordered) != tuple(range(len(ordered))):
             raise ValueError("shard indexes must be unique and contiguous from zero")
         plan_hashes = {item.plan_hash for item in ordered}
@@ -7408,14 +9612,14 @@ class LabJobStore:
                 "UPDATE lab_job SET result_contract_version = ? WHERE job_id = ?",
                 (result_contract_version, str(job_id)),
             )
-            for item in ordered:
+            for item, protocol_version in zip(ordered, protocol_versions, strict=True):
                 work_plan = item.work_plan
                 connection.execute(
                     """
                     INSERT INTO lab_shard (
                         shard_id, job_id, shard_index, status, version,
                         attempt_count, max_attempts, plan_hash, adapter_id,
-                        adapter_version, payload_json, payload_hash,
+                        adapter_version, payload_json, payload_hash, payload_protocol_version,
                         worker_id, scheduler_fencing_token, claim_token,
                         claim_generation, claimed_at, heartbeat_at,
                         lease_expires_at, result_manifest_hash, failure_json,
@@ -7424,7 +9628,7 @@ class LabJobStore:
                         duration_ms, throughput_units_per_second,
                         completion_sequence
                     ) VALUES (
-                        ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?, ?,
                         NULL, NULL, NULL, 0, NULL, NULL, NULL,
                         NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?,
                         NULL, NULL, NULL
@@ -7441,6 +9645,7 @@ class LabJobStore:
                         item.adapter_version,
                         item.payload_json,
                         item.payload_hash,
+                        protocol_version,
                         _dump_time(current),
                         _dump_time(current),
                         work_plan.phase if work_plan is not None else None,
@@ -7678,6 +9883,25 @@ class LabJobStore:
             ),
         )
 
+    @staticmethod
+    def _external_payload_v2(payload_json: str) -> StrategyShardPayloadV2 | None:
+        """Recognize only an explicit V2 payload; all prior payloads remain local V1."""
+
+        try:
+            validate_strategy_shard_payload_utf8(payload_json, field="lab_shard.payload_json")
+            decoded = strict_json_loads(payload_json)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not isinstance(decoded, dict) or decoded.get("schema_version") != 2:
+            return None
+        try:
+            payload = parse_strategy_shard_payload(payload_json)
+        except (TypeError, ValueError) as exc:
+            raise InvalidStoredJobError(f"invalid v2 strategy shard payload: {exc}") from exc
+        if not isinstance(payload, StrategyShardPayloadV2):  # pragma: no cover - parser dispatch
+            raise InvalidStoredJobError("v2 strategy shard payload has an invalid protocol")
+        return payload
+
     def _recover_stale_shards_in_transaction(
         self,
         connection: sqlite3.Connection,
@@ -7691,42 +9915,71 @@ class LabJobStore:
             JOIN lab_job AS j ON j.job_id = s.job_id
             WHERE s.status = ?
               AND j.status = ?
+              AND s.payload_protocol_version = 1
               AND (
                 s.scheduler_fencing_token IS NULL
                 OR s.scheduler_fencing_token <> ?
                 OR s.lease_expires_at IS NULL
                 OR s.lease_expires_at <= ?
               )
-            ORDER BY j.created_at, s.shard_index
+            ORDER BY s.job_id, s.shard_index, s.shard_id
+            LIMIT ?
             """,
             (
                 ShardStatus.RUNNING.value,
                 JobStatus.RUNNING.value,
                 lease.fencing_token,
                 _dump_time(now),
+                STALE_RECOVERY_BATCH_SIZE,
             ),
         ).fetchall()
         reclaimed_job_ids: set[UUID] = set()
         paused_job_ids: set[UUID] = set()
         cancelled_job_ids: set[UUID] = set()
-        exhausted_rows = connection.execute(
-            """
-            SELECT s.job_id, s.shard_id FROM lab_shard AS s
-            JOIN lab_job AS j ON j.job_id = s.job_id
-            WHERE j.status IN (?, ?, ?) AND j.control_intent <> ?
-              AND s.status IN (?, ?)
-              AND s.attempt_count >= s.max_attempts
-            ORDER BY j.created_at, s.shard_index
-            """,
-            (
-                JobStatus.QUEUED.value,
-                JobStatus.RUNNING.value,
-                JobStatus.CHECKPOINTED.value,
-                ControlIntent.CANCEL_REQUESTED.value,
-                ShardStatus.QUEUED.value,
-                ShardStatus.CHECKPOINTED.value,
-            ),
-        ).fetchall()
+        exhausted_by_status: list[list[sqlite3.Row]] = []
+        for exhausted_status in (ShardStatus.QUEUED, ShardStatus.CHECKPOINTED):
+            exhausted_status_predicate, exhausted_index_name = (
+                ("s.status = 'queued'", "ix_lab_shard_exhausted_queued_v1_recovery")
+                if exhausted_status is ShardStatus.QUEUED
+                else (
+                    "s.status = 'checkpointed'",
+                    "ix_lab_shard_exhausted_checkpointed_v1_recovery",
+                )
+            )
+            exhausted_by_status.append(
+                connection.execute(
+                    f"""
+                    SELECT s.job_id, s.shard_id, s.shard_index
+                    FROM lab_shard AS s INDEXED BY {exhausted_index_name}
+                    CROSS JOIN lab_job AS j ON j.job_id = s.job_id
+                    WHERE j.status IN (?, ?, ?) AND j.control_intent <> ?
+                      AND {exhausted_status_predicate}
+                      AND s.attempt_count >= s.max_attempts
+                      AND s.payload_protocol_version = 1
+                    ORDER BY s.job_id, s.shard_index, s.shard_id
+                    LIMIT ?
+                    """,
+                    (
+                        JobStatus.QUEUED.value,
+                        JobStatus.RUNNING.value,
+                        JobStatus.CHECKPOINTED.value,
+                        ControlIntent.CANCEL_REQUESTED.value,
+                        STALE_RECOVERY_BATCH_SIZE,
+                    ),
+                ).fetchall()
+            )
+        exhausted_share = STALE_RECOVERY_BATCH_SIZE // len(exhausted_by_status)
+        exhausted_rows = [
+            row for status_rows in exhausted_by_status for row in status_rows[:exhausted_share]
+        ]
+        exhausted_overflow = sorted(
+            (row for status_rows in exhausted_by_status for row in status_rows[exhausted_share:]),
+            key=lambda row: (str(row["job_id"]), int(row["shard_index"]), str(row["shard_id"])),
+        )
+        exhausted_rows.extend(exhausted_overflow[: STALE_RECOVERY_BATCH_SIZE - len(exhausted_rows)])
+        exhausted_rows.sort(
+            key=lambda row: (str(row["job_id"]), int(row["shard_index"]), str(row["shard_id"]))
+        )
         failed_job_causes: dict[UUID, UUID] = {}
         for exhausted in exhausted_rows:
             failed_job_causes.setdefault(
@@ -7751,9 +10004,19 @@ class LabJobStore:
                     job_id,
                     _canonical_uuid_text(stale["shard_id"], field="lab_shard.shard_id"),
                 )
+        reconciliation_job_ids = self._jobs_requiring_v2_reconciliation(
+            connection,
+            tuple(failed_job_causes),
+        )
+        for fenced_job_id in reconciliation_job_ids:
+            failed_job_causes.pop(fenced_job_id, None)
         for stale in stale_rows:
             job_id = _canonical_uuid_text(stale["job_id"], field="lab_shard.job_id")
+            if job_id in reconciliation_job_ids:
+                continue
             if job_id in failed_job_causes:
+                continue
+            if self._stale_v2_shard_requires_publication_reconciliation(stale):
                 continue
             job_row = self._load_job_row(connection, job_id)
             assert job_row is not None
@@ -7789,27 +10052,124 @@ class LabJobStore:
             )
             if cursor.rowcount == 1:
                 reclaimed_job_ids.add(job_id)
-        idle_control_rows = connection.execute(
+        idle_cursor = connection.execute(
             """
-            SELECT j.job_id, j.control_intent FROM lab_job AS j
-            WHERE j.status = ? AND j.control_intent IN (?, ?)
-              AND EXISTS (
-                SELECT 1 FROM lab_shard AS planned
-                WHERE planned.job_id = j.job_id
-              )
-              AND NOT EXISTS (
-                SELECT 1 FROM lab_shard AS s
-                WHERE s.job_id = j.job_id AND s.status = ?
-              )
-            """,
-            (
-                JobStatus.RUNNING.value,
-                ControlIntent.PAUSE_REQUESTED.value,
-                ControlIntent.CANCEL_REQUESTED.value,
-                ShardStatus.RUNNING.value,
-            ),
-        ).fetchall()
-        for row in idle_control_rows:
+            SELECT cursor_created_at, cursor_job_id
+            FROM lab_recovery_cursor WHERE cursor_key = 'idle_control'
+            """
+        ).fetchone()
+        idle_after_candidates: list[sqlite3.Row]
+        idle_before_candidates: list[sqlite3.Row] = []
+        idle_cursor_advance: sqlite3.Row | None = None
+        if idle_cursor is None:
+            idle_after_candidates = connection.execute(
+                """
+                SELECT j.job_id, j.control_intent, j.created_at FROM lab_job AS j
+                INDEXED BY ix_lab_job_idle_control_recovery
+                WHERE j.status = 'running'
+                  AND j.control_intent IN ('pause_requested', 'cancel_requested')
+                  AND EXISTS (
+                      SELECT 1 FROM lab_shard AS planned
+                      INDEXED BY ix_lab_shard_idle_control_eligibility
+                      WHERE planned.job_id = j.job_id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM lab_shard AS active
+                      INDEXED BY ix_lab_shard_idle_control_eligibility
+                      WHERE active.job_id = j.job_id AND active.status = 'running'
+                  )
+                ORDER BY j.created_at, j.job_id
+                LIMIT ?
+                """,
+                (IDLE_CONTROL_AFTER_BATCH_SIZE,),
+            ).fetchall()
+            if idle_after_candidates:
+                idle_cursor_advance = idle_after_candidates[-1]
+        else:
+            try:
+                cursor_created_at = _dump_time(_load_time(str(idle_cursor["cursor_created_at"])))
+                cursor_job_id = _canonical_uuid_text(
+                    idle_cursor["cursor_job_id"],
+                    field="lab_recovery_cursor.cursor_job_id",
+                )
+            except (TypeError, ValueError, InvalidStoredJobError) as exc:
+                raise InvalidStoredJobError(
+                    "invalid persisted idle-control recovery cursor"
+                ) from exc
+            idle_after_candidates = connection.execute(
+                """
+                SELECT j.job_id, j.control_intent, j.created_at FROM lab_job AS j
+                INDEXED BY ix_lab_job_idle_control_recovery
+                WHERE j.status = 'running'
+                  AND j.control_intent IN ('pause_requested', 'cancel_requested')
+                  AND EXISTS (
+                      SELECT 1 FROM lab_shard AS planned
+                      INDEXED BY ix_lab_shard_idle_control_eligibility
+                      WHERE planned.job_id = j.job_id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM lab_shard AS active
+                      INDEXED BY ix_lab_shard_idle_control_eligibility
+                      WHERE active.job_id = j.job_id AND active.status = 'running'
+                  )
+                  AND (j.created_at > ? OR (j.created_at = ? AND j.job_id > ?))
+                ORDER BY j.created_at, j.job_id
+                LIMIT ?
+                """,
+                (
+                    cursor_created_at,
+                    cursor_created_at,
+                    str(cursor_job_id),
+                    IDLE_CONTROL_AFTER_BATCH_SIZE,
+                ),
+            ).fetchall()
+            if idle_after_candidates:
+                idle_cursor_advance = idle_after_candidates[-1]
+            idle_before_candidates = connection.execute(
+                """
+                SELECT j.job_id, j.control_intent, j.created_at FROM lab_job AS j
+                INDEXED BY ix_lab_job_idle_control_recovery
+                WHERE j.status = 'running'
+                  AND j.control_intent IN ('pause_requested', 'cancel_requested')
+                  AND EXISTS (
+                      SELECT 1 FROM lab_shard AS planned
+                      INDEXED BY ix_lab_shard_idle_control_eligibility
+                      WHERE planned.job_id = j.job_id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM lab_shard AS active
+                      INDEXED BY ix_lab_shard_idle_control_eligibility
+                      WHERE active.job_id = j.job_id AND active.status = 'running'
+                  )
+                  AND (j.created_at < ? OR (j.created_at = ? AND j.job_id <= ?))
+                ORDER BY j.created_at, j.job_id
+                LIMIT ?
+                """,
+                (
+                    cursor_created_at,
+                    cursor_created_at,
+                    str(cursor_job_id),
+                    IDLE_CONTROL_BEFORE_BATCH_SIZE,
+                ),
+            ).fetchall()
+        if idle_cursor_advance is not None:
+            connection.execute(
+                """
+                INSERT INTO lab_recovery_cursor (
+                    cursor_key, cursor_created_at, cursor_job_id, updated_at
+                ) VALUES ('idle_control', ?, ?, ?)
+                ON CONFLICT(cursor_key) DO UPDATE SET
+                    cursor_created_at = excluded.cursor_created_at,
+                    cursor_job_id = excluded.cursor_job_id,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    str(idle_cursor_advance["created_at"]),
+                    str(idle_cursor_advance["job_id"]),
+                    _dump_time(now),
+                ),
+            )
+        for row in idle_after_candidates + idle_before_candidates:
             job_id = _canonical_uuid_text(row["job_id"], field="lab_job.job_id")
             if ControlIntent(str(row["control_intent"])) is ControlIntent.PAUSE_REQUESTED:
                 paused_job_ids.add(job_id)
@@ -7885,6 +10245,3136 @@ class LabJobStore:
                 )
         return reclaimed_job_ids | paused_job_ids | cancelled_job_ids | set(failed_job_causes)
 
+    def _stale_v2_shard_requires_publication_reconciliation(
+        self,
+        shard_row: sqlite3.Row,
+    ) -> bool:
+        """Fence every explicit V2 shard until an explicit reconciler owns its next attempt.
+
+        Generic shard recovery cannot prove that an external source operation stopped,
+        including after the publication ledger records ABORTED.  The immutable
+        publication record and its audit chain therefore remain the durable
+        reconciliation work item instead of permitting an implicit new attempt.
+        """
+
+        payload = self._external_payload_v2(str(shard_row["payload_json"]))
+        if payload is None:
+            return False
+        return payload is not None
+
+    @staticmethod
+    def _append_claim_publication_audit(
+        connection: sqlite3.Connection,
+        record: LabClaimPublicationRecord,
+        *,
+        action: ClaimPublicationAuditAction,
+        prior_status: ClaimPublicationStatus | None,
+        reason_code: str,
+        now: datetime,
+    ) -> LabClaimPublicationAuditRecord:
+        values: dict[str, object] = {
+            "audit_ref": uuid4(),
+            "attempt_id": record.identity.attempt_id,
+            "action": action,
+            "prior_status": prior_status,
+            "new_status": record.status,
+            "reason_code": reason_code,
+            "record_commitment": record.record_commitment,
+            "occurred_at": _utc(now),
+        }
+        provisional = LabClaimPublicationAuditRecord.model_construct(
+            **values,
+            audit_hash="0" * 64,
+        )
+        audit = LabClaimPublicationAuditRecord.model_validate(
+            {**values, "audit_hash": provisional.recomputed_hash()}
+        )
+        with _write_authorization(connection).authorize_claim_publication_audit(audit):
+            connection.execute(
+                """
+                INSERT INTO lab_claim_publication_audit (
+                    audit_ref, attempt_id, action, prior_status, new_status,
+                    reason_code, record_commitment, occurred_at, audit_hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(audit.audit_ref),
+                    str(audit.attempt_id),
+                    audit.action.value,
+                    audit.prior_status.value if audit.prior_status is not None else None,
+                    audit.new_status.value,
+                    audit.reason_code,
+                    audit.record_commitment,
+                    _dump_time(audit.occurred_at),
+                    audit.audit_hash,
+                ),
+            )
+        return audit
+
+    @classmethod
+    def _publication_conflict_decision(
+        cls,
+        connection: sqlite3.Connection,
+        record: LabClaimPublicationRecord,
+        *,
+        reason_code: str,
+        now: datetime,
+        error_type: type[RuntimeError] = ClaimPublicationConflictError,
+    ) -> _ClaimPublicationDecision:
+        cls._append_claim_publication_audit(
+            connection,
+            record,
+            action=ClaimPublicationAuditAction.CONFLICT,
+            prior_status=record.status,
+            reason_code=reason_code,
+            now=now,
+        )
+        return _ClaimPublicationDecision(error=error_type(reason_code))
+
+    @staticmethod
+    def _validate_claim_publication_shard_binding(
+        connection: sqlite3.Connection,
+        identity: LabClaimPublicationIdentity,
+        *,
+        now: datetime,
+    ) -> None:
+        row = connection.execute(
+            """
+            SELECT j.status AS job_status, s.status, s.claim_token, s.claim_generation,
+                   s.scheduler_fencing_token, s.worker_id, s.lease_expires_at,
+                   s.plan_hash, s.payload_hash, j.spec_hash
+            FROM lab_shard AS s
+            JOIN lab_job AS j ON j.job_id = s.job_id
+            WHERE s.job_id = ? AND s.shard_id = ?
+            """,
+            (str(identity.job_id), str(identity.shard_id)),
+        ).fetchone()
+        if row is None:
+            raise ClaimPublicationConflictError("attempt_identity_conflict")
+        try:
+            matches = (
+                str(row["job_status"]) == JobStatus.RUNNING.value
+                and str(row["status"]) == ShardStatus.RUNNING.value
+                and _canonical_uuid_text(
+                    row["claim_token"],
+                    field="lab_shard.claim_token",
+                )
+                == identity.claim_token
+                and _strict_sqlite_int(
+                    row["claim_generation"],
+                    field="lab_shard.claim_generation",
+                    minimum=1,
+                )
+                == identity.claim_generation
+                and _strict_sqlite_int(
+                    row["scheduler_fencing_token"],
+                    field="lab_shard.scheduler_fencing_token",
+                    minimum=1,
+                )
+                == identity.scheduler_fencing_token
+                and str(row["worker_id"]) == identity.worker_id
+                and str(row["spec_hash"]) == identity.spec_hash
+                and str(row["plan_hash"]) == identity.plan_hash
+                and str(row["payload_hash"]) == identity.payload_hash
+                and row["lease_expires_at"] is not None
+                and _load_time(str(row["lease_expires_at"])) > _utc(now)
+            )
+        except InvalidStoredJobError:
+            raise
+        if not matches:
+            raise ClaimPublicationConflictError("attempt_identity_conflict")
+
+    @staticmethod
+    def _claim_publication_matches_held(
+        record: LabClaimPublicationRecord,
+        held: HeldDraft,
+        source_stage_authority: LabSourceStageStoreAuthority,
+    ) -> bool:
+        authority_bytes = canonical_model_json_bytes(source_stage_authority)
+        return (
+            record.identity == held.identity
+            and record.claim_preimage_bytes == held.claim_preimage_bytes
+            and record.claim_preimage_hash == held.claim_preimage_hash
+            and record.claim_protocol == held.claim_protocol
+            and record.claim_protocol_version == held.claim_protocol_version
+            and record.source_wait_deadline == held.source_wait_deadline
+            and record.publication_deadline == held.publication_deadline
+            and record.source_stage_authority_bytes == authority_bytes
+            and record.source_stage_authority_hash == hashlib.sha256(authority_bytes).hexdigest()
+            and record.status is ClaimPublicationStatus.HELD_SOURCE
+        )
+
+    @staticmethod
+    def _claim_publication_matches_queue(
+        record: LabClaimPublicationRecord,
+        binding: QueueBinding,
+    ) -> bool:
+        return (
+            record.source_stage_binding_bytes == binding.source_stage_binding_bytes
+            and record.source_stage_binding_hash == binding.source_stage_binding_hash
+            and record.source_intent_bytes == binding.source_intent_bytes
+            and record.source_intent_hash == binding.source_intent_hash
+            and record.source_operation_id == binding.source_operation_id
+            and record.source_operation_hash == binding.source_operation_hash
+        )
+
+    @staticmethod
+    def _claim_publication_matches_ready(
+        record: LabClaimPublicationRecord,
+        binding: ReadyBinding,
+    ) -> bool:
+        return (
+            record.ready_source_stage_record_bytes == binding.ready_source_stage_record_bytes
+            and record.ready_source_stage_record_hash == binding.ready_source_stage_record_hash
+            and record.verified_source_outcome_hash == binding.verified_source_outcome_hash
+            and record.verified_evidence_chain_hash == binding.verified_evidence_chain_hash
+            and record.source_use_plan_bytes == binding.source_use_plan_bytes
+            and record.source_use_plan_hash == binding.source_use_plan_hash
+            and record.final_claim_bytes == binding.final_claim_bytes
+            and record.final_claim_hash == binding.final_claim_hash
+            and record.current_claim_receipt_bytes == binding.current_claim_receipt_bytes
+            and record.current_claim_receipt_hash == binding.current_claim_receipt_hash
+        )
+
+    @staticmethod
+    def _claim_publication_matches_receipt(
+        record: LabClaimPublicationRecord,
+        receipt: PublishReceipt,
+    ) -> bool:
+        return (
+            record.spool_receipt_bytes == receipt.spool_receipt_bytes
+            and record.spool_receipt_hash == receipt.spool_receipt_hash
+        )
+
+    @staticmethod
+    def _publication_values(record: LabClaimPublicationRecord) -> dict[str, object]:
+        return {
+            name: getattr(record, name)
+            for name in type(record).model_fields
+            if name != "record_commitment"
+        }
+
+    @staticmethod
+    def _claim_publication_snapshot_matches(
+        record: LabClaimPublicationRecord,
+        expected: LabClaimPublicationRecord,
+    ) -> bool:
+        return (
+            record.status is expected.status
+            and record.version == expected.version
+            and record.record_commitment == expected.record_commitment
+            and record.source_stage_authority_hash == expected.source_stage_authority_hash
+        )
+
+    def _read_claim_publication_for_external_validation(
+        self,
+        identity: LabClaimPublicationIdentity,
+    ) -> LabClaimPublicationRecord:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM lab_claim_publication WHERE attempt_id = ?",
+                (str(identity.attempt_id),),
+            ).fetchone()
+        if row is None:
+            raise ClaimPublicationConflictError("attempt_identity_conflict")
+        record = _claim_publication_record_from_row(row)
+        if record.identity != identity:
+            raise ClaimPublicationConflictError("attempt_identity_conflict")
+        return record
+
+    @staticmethod
+    def _sqlite_data_version(connection: sqlite3.Connection) -> int:
+        row = connection.execute("PRAGMA data_version").fetchone()
+        if row is None:
+            raise InvalidStoredJobError("PRAGMA data_version did not return a value")
+        return _strict_sqlite_int(row[0], field="PRAGMA data_version", minimum=0)
+
+    def _read_ready_claim_publication_snapshot(
+        self,
+        identity: LabClaimPublicationIdentity,
+        *,
+        expected: LabClaimPublicationRecord,
+        now: datetime,
+    ) -> LabClaimPublicationRecord:
+        """Read the ready record and its shard identity in one non-blocking snapshot."""
+
+        with self._connect() as connection:
+            connection.execute("PRAGMA query_only = ON")
+            before_data_version = self._sqlite_data_version(connection)
+            connection.execute("BEGIN DEFERRED")
+            try:
+                row = connection.execute(
+                    "SELECT * FROM lab_claim_publication WHERE attempt_id = ?",
+                    (str(identity.attempt_id),),
+                ).fetchone()
+                if row is None:
+                    raise ClaimPublicationConflictError("attempt_identity_conflict")
+                record = _claim_publication_record_from_row(row)
+                if record.identity != identity:
+                    raise ClaimPublicationConflictError("attempt_identity_conflict")
+                if not self._claim_publication_snapshot_matches(record, expected):
+                    raise ClaimPublicationConflictError("publication_cas_conflict")
+                self._validate_claim_publication_shard_binding(
+                    connection,
+                    identity,
+                    now=now,
+                )
+            finally:
+                connection.rollback()
+            after_data_version = self._sqlite_data_version(connection)
+        if after_data_version != before_data_version:
+            raise ClaimPublicationConflictError("publication_cas_conflict")
+        return record
+
+    def _prevalidate_claim_publication_mutation(
+        self,
+        identity: LabClaimPublicationIdentity,
+        *,
+        lease: LabLeaseRecord,
+        now: datetime,
+        allow_higher_fence_recovery: bool = False,
+    ) -> None:
+        with self._connect() as connection:
+            self._validate_lease(connection, lease, now=now)
+        if identity.scheduler_fencing_token != lease.fencing_token and (
+            not allow_higher_fence_recovery
+            or identity.scheduler_fencing_token > lease.fencing_token
+        ):
+            raise SchedulerLeaseFencedError("publication_fence_conflict")
+
+    def _publication_replay(
+        self,
+        connection: sqlite3.Connection,
+        record: LabClaimPublicationRecord,
+        *,
+        reason_code: str,
+        now: datetime,
+    ) -> _ClaimPublicationDecision:
+        audit = self._append_claim_publication_audit(
+            connection,
+            record,
+            action=ClaimPublicationAuditAction.REPLAYED,
+            prior_status=record.status,
+            reason_code=reason_code,
+            now=now,
+        )
+        return _ClaimPublicationDecision(
+            mutation=LabClaimPublicationMutation(
+                record=record,
+                audit_ref=audit.audit_ref,
+                replayed=True,
+            )
+        )
+
+    @staticmethod
+    def _publication_terminal_read(record: LabClaimPublicationRecord) -> _ClaimPublicationDecision:
+        return _ClaimPublicationDecision(
+            mutation=LabClaimPublicationMutation(
+                record=record,
+                audit_ref=None,
+                replayed=True,
+            )
+        )
+
+    @classmethod
+    def _validate_ready_claim_for_publication_record(
+        cls,
+        record: LabClaimPublicationRecord,
+        identity: LabClaimPublicationIdentity,
+        *,
+        current_claim_authority: CurrentClaimAuthorityProtocol,
+        keyring: VerifyOnlyEd25519Keyring,
+        audience: str,
+        now: datetime,
+        allow_published: bool,
+    ) -> LabShardClaimV2:
+        allowed_statuses = {ClaimPublicationStatus.READY_TO_PUBLISH}
+        if allow_published:
+            allowed_statuses.add(ClaimPublicationStatus.PUBLISHED)
+        if record.status not in allowed_statuses:
+            raise InvalidClaimPublicationTransitionError("transition_not_allowed")
+        try:
+            preimage = strict_model_validate_canonical_json(
+                LabShardClaimV2,
+                record.claim_preimage_bytes.decode("utf-8"),
+            )
+            final_claim = strict_model_validate_canonical_json(
+                LabShardClaimV2,
+                (record.final_claim_bytes or b"").decode("utf-8"),
+            )
+            stored_plan = strict_model_validate_canonical_json(
+                SourceUsePlanV2,
+                (record.source_use_plan_bytes or b"").decode("utf-8"),
+            )
+            stored_receipt = strict_model_validate_canonical_json(
+                CurrentClaimConsumptionV2,
+                (record.current_claim_receipt_bytes or b"").decode("utf-8"),
+            )
+        except (TypeError, UnicodeDecodeError, ValueError) as exc:
+            raise ClaimPublicationConflictError("ready_binding_conflict") from exc
+        if not isinstance(preimage, LabShardClaimV2) or not isinstance(
+            final_claim, LabShardClaimV2
+        ):
+            raise ClaimPublicationConflictError("ready_binding_conflict")
+        if not isinstance(stored_plan, SourceUsePlanV2) or not isinstance(
+            stored_receipt, CurrentClaimConsumptionV2
+        ):
+            raise ClaimPublicationConflictError("ready_binding_conflict")
+        verified_plan = require_source_use_plan_v2(
+            stored_plan,
+            keyring=keyring,
+            audience=audience,
+            now=now,
+        )
+        current_receipt = require_current_claim_consumption_v2(
+            current_claim_authority=current_claim_authority,
+            plan=verified_plan,
+            keyring=keyring,
+            now=now,
+        )
+        if (
+            preimage != LabShardClaimV2.model_validate(preimage, strict=True)
+            or LabClaimPublicationIdentity.from_claim(preimage) != identity
+            or final_claim != preimage.bind_source_use_plan(verified_plan)
+            or stored_receipt != current_receipt
+            or stored_receipt.signed_plan != verified_plan
+        ):
+            raise ClaimPublicationConflictError("ready_binding_conflict")
+        return final_claim
+
+    def validate_ready_claim_for_publication(
+        self,
+        identity: LabClaimPublicationIdentity,
+        *,
+        current_claim_authority: CurrentClaimAuthorityProtocol,
+        keyring: VerifyOnlyEd25519Keyring,
+        audience: str,
+        now: datetime,
+    ) -> LabShardClaimV2:
+        validated_identity = LabClaimPublicationIdentity.model_validate(identity.model_dump())
+        current = _utc(now)
+        phase_one_record = self._read_claim_publication_for_external_validation(validated_identity)
+        final_claim = self._validate_ready_claim_for_publication_record(
+            phase_one_record,
+            validated_identity,
+            current_claim_authority=current_claim_authority,
+            keyring=keyring,
+            audience=audience,
+            now=current,
+            allow_published=False,
+        )
+        snapshot_record = self._read_ready_claim_publication_snapshot(
+            validated_identity,
+            expected=phase_one_record,
+            now=current,
+        )
+        rechecked_record = self._read_claim_publication_for_external_validation(validated_identity)
+        if not self._claim_publication_snapshot_matches(rechecked_record, snapshot_record):
+            raise ClaimPublicationConflictError("publication_cas_conflict")
+        return final_claim
+
+    def validate_published_claim_for_worker(
+        self,
+        identity: LabClaimPublicationIdentity,
+        *,
+        current_claim_authority: CurrentClaimAuthorityProtocol,
+        keyring: VerifyOnlyEd25519Keyring,
+        audience: str,
+        now: datetime,
+    ) -> LabShardClaimV2:
+        """Read-only D validation for a V2 worker before its spool consume."""
+
+        validated_identity = LabClaimPublicationIdentity.model_validate(identity.model_dump())
+        current = _utc(now)
+        record = self._read_claim_publication_for_external_validation(validated_identity)
+        final_claim = self._validate_ready_claim_for_publication_record(
+            record,
+            validated_identity,
+            current_claim_authority=current_claim_authority,
+            keyring=keyring,
+            audience=audience,
+            now=current,
+            allow_published=True,
+        )
+        self._read_ready_claim_publication_snapshot(
+            validated_identity,
+            expected=record,
+            now=current,
+        )
+        return final_claim
+
+    def _load_claim_publication_for_mutation(
+        self,
+        connection: sqlite3.Connection,
+        identity: LabClaimPublicationIdentity,
+        *,
+        lease: LabLeaseRecord,
+        now: datetime,
+        allow_higher_fence_recovery: bool = False,
+    ) -> LabClaimPublicationRecord:
+        self._validate_lease(connection, lease, now=now)
+        if identity.scheduler_fencing_token != lease.fencing_token and (
+            not allow_higher_fence_recovery
+            or identity.scheduler_fencing_token > lease.fencing_token
+        ):
+            raise SchedulerLeaseFencedError("publication_fence_conflict")
+        row = connection.execute(
+            "SELECT * FROM lab_claim_publication WHERE attempt_id = ?",
+            (str(identity.attempt_id),),
+        ).fetchone()
+        if row is None:
+            raise ClaimPublicationConflictError("attempt_identity_conflict")
+        record = _claim_publication_record_from_row(row)
+        if record.identity != identity:
+            decision = self._publication_conflict_decision(
+                connection,
+                record,
+                reason_code="attempt_identity_conflict",
+                now=now,
+            )
+            return decision.resolved().record
+        return record
+
+    def _update_claim_publication_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        prior: LabClaimPublicationRecord,
+        transitioned: LabClaimPublicationRecord,
+        *,
+        reason_code: str,
+        now: datetime,
+    ) -> _ClaimPublicationDecision:
+        with _write_authorization(connection).authorize_claim_publication(transitioned):
+            cursor = connection.execute(
+                """
+                UPDATE lab_claim_publication
+                SET status = ?, version = ?, source_stage_binding_bytes = ?,
+                    source_stage_binding_hash = ?, source_intent_bytes = ?,
+                    source_intent_hash = ?, source_operation_id = ?, source_operation_hash = ?,
+                    queued_source_stage_record_hash = ?, ready_source_stage_record_bytes = ?,
+                    ready_source_stage_record_hash = ?, verified_source_outcome_hash = ?,
+                    verified_evidence_chain_hash = ?, source_use_plan_bytes = ?,
+                    source_use_plan_hash = ?, final_claim_bytes = ?, final_claim_hash = ?,
+                    current_claim_receipt_bytes = ?, current_claim_receipt_hash = ?,
+                    spool_receipt_bytes = ?, spool_receipt_hash = ?, updated_at = ?,
+                    queued_at = ?, ready_at = ?, published_at = ?, aborted_at = ?,
+                    terminal_reason = ?, record_commitment = ?
+                WHERE attempt_id = ? AND status = ? AND version = ? AND record_commitment = ?
+                    AND source_stage_authority_hash = ?
+                """,
+                (
+                    transitioned.status.value,
+                    transitioned.version,
+                    transitioned.source_stage_binding_bytes,
+                    transitioned.source_stage_binding_hash,
+                    transitioned.source_intent_bytes,
+                    transitioned.source_intent_hash,
+                    transitioned.source_operation_id,
+                    transitioned.source_operation_hash,
+                    transitioned.queued_source_stage_record_hash,
+                    transitioned.ready_source_stage_record_bytes,
+                    transitioned.ready_source_stage_record_hash,
+                    transitioned.verified_source_outcome_hash,
+                    transitioned.verified_evidence_chain_hash,
+                    transitioned.source_use_plan_bytes,
+                    transitioned.source_use_plan_hash,
+                    transitioned.final_claim_bytes,
+                    transitioned.final_claim_hash,
+                    transitioned.current_claim_receipt_bytes,
+                    transitioned.current_claim_receipt_hash,
+                    transitioned.spool_receipt_bytes,
+                    transitioned.spool_receipt_hash,
+                    _dump_time(transitioned.updated_at),
+                    _dump_time(transitioned.queued_at) if transitioned.queued_at else None,
+                    _dump_time(transitioned.ready_at) if transitioned.ready_at else None,
+                    _dump_time(transitioned.published_at) if transitioned.published_at else None,
+                    _dump_time(transitioned.aborted_at) if transitioned.aborted_at else None,
+                    transitioned.terminal_reason,
+                    transitioned.record_commitment,
+                    str(prior.identity.attempt_id),
+                    prior.status.value,
+                    prior.version,
+                    prior.record_commitment,
+                    prior.source_stage_authority_hash,
+                ),
+            )
+        if cursor.rowcount != 1:
+            raise ClaimPublicationConflictError("publication_cas_conflict")
+        audit = self._append_claim_publication_audit(
+            connection,
+            transitioned,
+            action=ClaimPublicationAuditAction.TRANSITIONED,
+            prior_status=prior.status,
+            reason_code=reason_code,
+            now=now,
+        )
+        return _ClaimPublicationDecision(
+            mutation=LabClaimPublicationMutation(
+                record=transitioned,
+                audit_ref=audit.audit_ref,
+                replayed=False,
+            )
+        )
+
+    def _create_held_claim_publication_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        held: HeldDraft,
+        *,
+        source_stage_authority: LabSourceStageStoreAuthority,
+        lease: LabLeaseRecord,
+        now: datetime,
+    ) -> _ClaimPublicationDecision:
+        """Write an A record without probing the shard table or source systems."""
+
+        if not connection.in_transaction:
+            raise RuntimeError("claim publication creation requires an active transaction")
+        validated = HeldDraft.model_validate(held.model_dump())
+        validated_authority = LabSourceStageStoreAuthority.model_validate(
+            source_stage_authority.model_dump()
+        )
+        authority_bytes = canonical_model_json_bytes(validated_authority)
+        authority_hash = hashlib.sha256(authority_bytes).hexdigest()
+        current = _utc(now)
+        self._validate_lease(connection, lease, now=current)
+        if validated.identity.scheduler_fencing_token != lease.fencing_token:
+            raise SchedulerLeaseFencedError("publication_fence_conflict")
+        existing_row = connection.execute(
+            "SELECT * FROM lab_claim_publication WHERE attempt_id = ?",
+            (str(validated.identity.attempt_id),),
+        ).fetchone()
+        if existing_row is not None:
+            existing = _claim_publication_record_from_row(existing_row)
+            if self._claim_publication_matches_held(existing, validated, validated_authority):
+                return self._publication_replay(
+                    connection,
+                    existing,
+                    reason_code="held_source_replay",
+                    now=current,
+                )
+            return self._publication_conflict_decision(
+                connection,
+                existing,
+                reason_code="attempt_content_conflict",
+                now=current,
+            )
+        record = _claim_publication_record_from_values(
+            {
+                "identity": validated.identity,
+                "claim_preimage_bytes": validated.claim_preimage_bytes,
+                "claim_preimage_hash": validated.claim_preimage_hash,
+                "claim_protocol": validated.claim_protocol,
+                "claim_protocol_version": validated.claim_protocol_version,
+                "source_wait_deadline": validated.source_wait_deadline,
+                "publication_deadline": validated.publication_deadline,
+                "source_stage_authority_bytes": authority_bytes,
+                "source_stage_authority_hash": authority_hash,
+                "status": ClaimPublicationStatus.HELD_SOURCE,
+                "version": 0,
+                "created_at": current,
+                "updated_at": current,
+            }
+        )
+        try:
+            with _write_authorization(connection).authorize_claim_publication(record):
+                connection.execute(
+                    """
+                    INSERT INTO lab_claim_publication (
+                        attempt_id, job_id, shard_id, claim_token, claim_generation,
+                        scheduler_fencing_token, worker_id, spec_hash, plan_hash, payload_hash,
+                        claim_preimage_bytes, claim_preimage_hash, claim_protocol,
+                        claim_protocol_version, source_wait_deadline, publication_deadline,
+                        source_stage_authority_bytes, source_stage_authority_hash,
+                        status, version, created_at, updated_at, record_commitment
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?
+                    )
+                    """,
+                    (
+                        str(record.identity.attempt_id),
+                        str(record.identity.job_id),
+                        str(record.identity.shard_id),
+                        str(record.identity.claim_token),
+                        record.identity.claim_generation,
+                        record.identity.scheduler_fencing_token,
+                        record.identity.worker_id,
+                        record.identity.spec_hash,
+                        record.identity.plan_hash,
+                        record.identity.payload_hash,
+                        record.claim_preimage_bytes,
+                        record.claim_preimage_hash,
+                        record.claim_protocol,
+                        record.claim_protocol_version,
+                        _dump_time(record.source_wait_deadline),
+                        _dump_time(record.publication_deadline),
+                        record.source_stage_authority_bytes,
+                        record.source_stage_authority_hash,
+                        record.status.value,
+                        record.version,
+                        _dump_time(record.created_at),
+                        _dump_time(record.updated_at),
+                        record.record_commitment,
+                    ),
+                )
+        except sqlite3.IntegrityError as exc:
+            if "UNIQUE constraint failed" not in str(exc):
+                raise
+            raise ClaimPublicationConflictError("claim_identity_conflict") from exc
+        audit = self._append_claim_publication_audit(
+            connection,
+            record,
+            action=ClaimPublicationAuditAction.CREATED,
+            prior_status=None,
+            reason_code="attempt_created",
+            now=current,
+        )
+        return _ClaimPublicationDecision(
+            mutation=LabClaimPublicationMutation(
+                record=record, audit_ref=audit.audit_ref, replayed=False
+            )
+        )
+
+    def create_held_claim_publication(
+        self,
+        held: HeldDraft,
+        *,
+        source_stage_store: LabSourceStageStore,
+        lease: LabLeaseRecord,
+        now: datetime,
+    ) -> LabClaimPublicationMutation:
+        source_stage_authority = LabSourceStageStoreAuthority.model_validate(
+            source_stage_store.authority.model_dump()
+        )
+        with self._transaction() as connection:
+            decision = self._create_held_claim_publication_in_transaction(
+                connection,
+                HeldDraft.model_validate(held.model_dump()),
+                source_stage_authority=source_stage_authority,
+                lease=lease,
+                now=now,
+            )
+        return decision.resolved()
+
+    @staticmethod
+    def _queue_binding_for_identity(
+        binding: QueueBinding,
+        identity: LabClaimPublicationIdentity,
+    ) -> None:
+        stage_binding = strict_model_validate_canonical_json(
+            LabSourceStageBinding,
+            binding.source_stage_binding_bytes.decode("utf-8"),
+        )
+        if (
+            stage_binding.job_id,
+            stage_binding.shard_id,
+            stage_binding.attempt_id,
+            stage_binding.claim_token,
+            stage_binding.claim_generation,
+            stage_binding.scheduler_fencing_token,
+            stage_binding.worker_id,
+            stage_binding.spec_hash,
+            stage_binding.plan_hash,
+        ) != (
+            identity.job_id,
+            identity.shard_id,
+            identity.attempt_id,
+            identity.claim_token,
+            identity.claim_generation,
+            identity.scheduler_fencing_token,
+            identity.worker_id,
+            identity.spec_hash,
+            identity.plan_hash,
+        ):
+            raise ClaimPublicationConflictError("source_stage_binding_conflict")
+
+    @staticmethod
+    def _source_stage_store_for_record(
+        record: LabClaimPublicationRecord,
+    ) -> LabSourceStageStore:
+        authority = source_stage_store_authority_from_canonical_bytes(
+            record.source_stage_authority_bytes
+        )
+        try:
+            store = LabSourceStageStore(
+                Path(authority.canonical_stage_db_path),
+                queue_store_path=Path(authority.canonical_queue_db_path),
+            )
+            observed = store.authority
+            if (
+                observed.model_dump(mode="python") != authority.model_dump(mode="python")
+                or observed.authority_hash != authority.authority_hash
+            ):
+                raise ValueError("source-stage authority identity changed")
+            return store
+        except Exception as exc:
+            raise ClaimPublicationConflictError("source_stage_authority_conflict") from exc
+
+    @classmethod
+    def _require_queued_source_stage(
+        cls,
+        record: LabClaimPublicationRecord,
+        binding: QueueBinding,
+        identity: LabClaimPublicationIdentity,
+    ) -> str:
+        cls._queue_binding_for_identity(binding, identity)
+        stage_binding = strict_model_validate_canonical_json(
+            LabSourceStageBinding,
+            binding.source_stage_binding_bytes.decode("utf-8"),
+        )
+        stage_record = cls._source_stage_store_for_record(record).get(stage_binding)
+        if (
+            stage_record is None
+            or stage_record.state is not LabSourceStageState.QUEUED
+            or stage_record.binding != stage_binding
+            or stage_record.intent_bytes != binding.source_intent_bytes
+            or stage_record.intent_hash != binding.source_intent_hash
+            or stage_record.operation_id != binding.source_operation_id
+            or stage_record.operation_hash != binding.source_operation_hash
+            or stage_record.record_hash == "0" * 64
+        ):
+            raise ClaimPublicationConflictError("queued_source_stage_conflict")
+        return stage_record.record_hash
+
+    def _queue_claim_publication_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        identity: LabClaimPublicationIdentity,
+        binding: QueueBinding,
+        *,
+        expected: LabClaimPublicationRecord,
+        queued_stage_record_hash: str | None,
+        lease: LabLeaseRecord,
+        now: datetime,
+        allow_higher_fence_recovery: bool,
+    ) -> _ClaimPublicationDecision:
+        if not connection.in_transaction:
+            raise RuntimeError("claim publication queue requires an active transaction")
+        current = _utc(now)
+        validated = QueueBinding.model_validate(binding.model_dump())
+        record = self._load_claim_publication_for_mutation(
+            connection,
+            identity,
+            lease=lease,
+            now=current,
+            allow_higher_fence_recovery=allow_higher_fence_recovery,
+        )
+        if not self._claim_publication_snapshot_matches(record, expected):
+            if (
+                record.status is ClaimPublicationStatus.SOURCE_QUEUED
+                and self._claim_publication_matches_queue(record, validated)
+            ):
+                return self._publication_replay(
+                    connection, record, reason_code="source_queued_replay", now=current
+                )
+            raise ClaimPublicationConflictError("publication_cas_conflict")
+        if record.status is ClaimPublicationStatus.SOURCE_QUEUED:
+            if self._claim_publication_matches_queue(record, validated):
+                return self._publication_replay(
+                    connection, record, reason_code="source_queued_replay", now=current
+                )
+            return self._publication_conflict_decision(
+                connection,
+                record,
+                reason_code="source_queued_content_conflict",
+                now=current,
+            )
+        if record.status in {ClaimPublicationStatus.PUBLISHED, ClaimPublicationStatus.ABORTED}:
+            return self._publication_conflict_decision(
+                connection,
+                record,
+                reason_code="terminal_status_immutable",
+                now=current,
+                error_type=InvalidClaimPublicationTransitionError,
+            )
+        if record.status is not ClaimPublicationStatus.HELD_SOURCE:
+            return self._publication_conflict_decision(
+                connection,
+                record,
+                reason_code="transition_not_allowed",
+                now=current,
+                error_type=InvalidClaimPublicationTransitionError,
+            )
+        self._validate_claim_publication_shard_binding(
+            connection,
+            identity,
+            now=current,
+        )
+        if queued_stage_record_hash is None:
+            raise RuntimeError("queued source stage validation was not completed")
+        operation_row = connection.execute(
+            "SELECT * FROM lab_claim_publication WHERE source_operation_id = ?",
+            (validated.source_operation_id,),
+        ).fetchone()
+        if operation_row is not None and str(operation_row["attempt_id"]) != str(
+            identity.attempt_id
+        ):
+            other = _claim_publication_record_from_row(operation_row)
+            return self._publication_conflict_decision(
+                connection,
+                other,
+                reason_code="source_operation_conflict",
+                now=current,
+            )
+        values = self._publication_values(record)
+        values.update(
+            {
+                **validated.model_dump(mode="python"),
+                "queued_source_stage_record_hash": queued_stage_record_hash,
+                "status": ClaimPublicationStatus.SOURCE_QUEUED,
+                "version": 1,
+                "updated_at": current,
+                "queued_at": current,
+            }
+        )
+        return self._update_claim_publication_in_transaction(
+            connection,
+            record,
+            _claim_publication_record_from_values(values),
+            reason_code="held_source_to_source_queued",
+            now=current,
+        )
+
+    def queue_claim_publication(
+        self,
+        identity: LabClaimPublicationIdentity,
+        binding: QueueBinding,
+        *,
+        lease: LabLeaseRecord,
+        now: datetime,
+    ) -> LabClaimPublicationMutation:
+        return self._queue_claim_publication(
+            identity,
+            binding,
+            lease=lease,
+            now=now,
+            allow_higher_fence_recovery=False,
+        )
+
+    def _queue_claim_publication_after_scheduler_takeover(
+        self,
+        identity: LabClaimPublicationIdentity,
+        binding: QueueBinding,
+        *,
+        lease: LabLeaseRecord,
+        now: datetime,
+    ) -> LabClaimPublicationMutation:
+        return self._queue_claim_publication(
+            identity,
+            binding,
+            lease=lease,
+            now=now,
+            allow_higher_fence_recovery=True,
+        )
+
+    def _queue_claim_publication(
+        self,
+        identity: LabClaimPublicationIdentity,
+        binding: QueueBinding,
+        *,
+        lease: LabLeaseRecord,
+        now: datetime,
+        allow_higher_fence_recovery: bool,
+    ) -> LabClaimPublicationMutation:
+        validated_identity = LabClaimPublicationIdentity.model_validate(identity.model_dump())
+        validated_binding = QueueBinding.model_validate(binding.model_dump())
+        phase_one_record = self._read_claim_publication_for_external_validation(validated_identity)
+        self._prevalidate_claim_publication_mutation(
+            validated_identity,
+            lease=lease,
+            now=now,
+            allow_higher_fence_recovery=allow_higher_fence_recovery,
+        )
+        queued_stage_record_hash: str | None = None
+        if phase_one_record.status is ClaimPublicationStatus.HELD_SOURCE:
+            queued_stage_record_hash = self._require_queued_source_stage(
+                phase_one_record,
+                validated_binding,
+                validated_identity,
+            )
+        with self._transaction() as connection:
+            decision = self._queue_claim_publication_in_transaction(
+                connection,
+                validated_identity,
+                validated_binding,
+                expected=phase_one_record,
+                queued_stage_record_hash=queued_stage_record_hash,
+                lease=lease,
+                now=now,
+                allow_higher_fence_recovery=allow_higher_fence_recovery,
+            )
+        return decision.resolved()
+
+    @classmethod
+    def _ready_binding_for_record(
+        cls,
+        record: LabClaimPublicationRecord,
+        signed_plan: SourceUsePlanV2,
+        final_bound_claim: LabShardClaimV2,
+        *,
+        current_claim_authority: CurrentClaimAuthorityProtocol,
+        keyring: VerifyOnlyEd25519Keyring,
+        audience: str,
+        now: datetime,
+    ) -> ReadyBinding:
+        plan = SourceUsePlanV2.model_validate(signed_plan.model_dump())
+        final_claim = LabShardClaimV2.model_validate(final_bound_claim.model_dump())
+        preimage = strict_model_validate_canonical_json(
+            LabShardClaimV2,
+            record.claim_preimage_bytes.decode("utf-8"),
+        )
+        queued_stage_binding = strict_model_validate_canonical_json(
+            LabSourceStageBinding,
+            (record.source_stage_binding_bytes or b"").decode("utf-8"),
+        )
+        stage_record = cls._source_stage_store_for_record(record).get(queued_stage_binding)
+        if stage_record is None:
+            raise ClaimPublicationConflictError("ready_source_stage_conflict")
+        stage_record_bytes = canonical_job_model_bytes(stage_record)
+        if (
+            stage_record.state is not LabSourceStageState.READY
+            or stage_record.ready_at is None
+            or stage_record.ready_at > now
+            or stage_record.record_hash == "0" * 64
+            or stage_record.binding != queued_stage_binding
+            or stage_record.intent_bytes != record.source_intent_bytes
+            or stage_record.intent_hash != record.source_intent_hash
+            or stage_record.operation_id != record.source_operation_id
+            or stage_record.operation_hash != record.source_operation_hash
+            or stage_record.outcome is None
+            or stage_record.outcome.status is not SourceBrokerV2JobOutcomeStatus.SUCCESS
+        ):
+            raise ClaimPublicationConflictError("ready_source_stage_conflict")
+        verified_plan = require_source_use_plan_v2(
+            plan,
+            keyring=keyring,
+            audience=audience,
+            now=now,
+        )
+        receipt = require_current_claim_consumption_v2(
+            current_claim_authority=current_claim_authority,
+            plan=verified_plan,
+            keyring=keyring,
+            now=now,
+        )
+        receipt_bytes = canonical_model_json_bytes(receipt)
+        if (
+            verified_plan != plan
+            or verified_plan.operation_id != record.source_operation_id
+            or verified_plan.attempt_binding != preimage.attempt_binding
+            or verified_plan.lease_expires_at != preimage.lease_expires_at
+            or current_claim_authority.authority_id != verified_plan.single_use_authority_id
+            or final_claim != preimage.bind_source_use_plan(verified_plan)
+            or receipt.signed_plan != verified_plan
+            or receipt.committed_at < stage_record.ready_at
+        ):
+            raise ClaimPublicationConflictError("ready_binding_conflict")
+        return ReadyBinding(
+            ready_source_stage_record_bytes=stage_record_bytes,
+            ready_source_stage_record_hash=hashlib.sha256(stage_record_bytes).hexdigest(),
+            verified_source_outcome_hash=stage_record.outcome.outcome_hash,
+            verified_evidence_chain_hash=stage_record.outcome.evidence_chain_hash,
+            source_use_plan_bytes=canonical_model_json_bytes(verified_plan),
+            source_use_plan_hash=hashlib.sha256(
+                canonical_model_json_bytes(verified_plan)
+            ).hexdigest(),
+            final_claim_bytes=canonical_model_json_bytes(final_claim),
+            final_claim_hash=hashlib.sha256(canonical_model_json_bytes(final_claim)).hexdigest(),
+            current_claim_receipt_bytes=receipt_bytes,
+            current_claim_receipt_hash=hashlib.sha256(receipt_bytes).hexdigest(),
+        )
+
+    def _mark_claim_publication_ready_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        identity: LabClaimPublicationIdentity,
+        *,
+        expected: LabClaimPublicationRecord,
+        ready_binding: ReadyBinding | None,
+        lease: LabLeaseRecord,
+        now: datetime,
+    ) -> _ClaimPublicationDecision:
+        if not connection.in_transaction:
+            raise RuntimeError("claim publication ready requires an active transaction")
+        current = _utc(now)
+        record = self._load_claim_publication_for_mutation(
+            connection, identity, lease=lease, now=current
+        )
+        if not self._claim_publication_snapshot_matches(record, expected):
+            if (
+                record.status is ClaimPublicationStatus.READY_TO_PUBLISH
+                and ready_binding is not None
+                and self._claim_publication_matches_ready(record, ready_binding)
+            ):
+                self._validate_claim_publication_shard_binding(
+                    connection,
+                    identity,
+                    now=current,
+                )
+                return self._publication_replay(
+                    connection, record, reason_code="ready_to_publish_replay", now=current
+                )
+            raise ClaimPublicationConflictError("publication_cas_conflict")
+        if record.status in {ClaimPublicationStatus.PUBLISHED, ClaimPublicationStatus.ABORTED}:
+            return self._publication_conflict_decision(
+                connection,
+                record,
+                reason_code="terminal_status_immutable",
+                now=current,
+                error_type=InvalidClaimPublicationTransitionError,
+            )
+        if record.status not in {
+            ClaimPublicationStatus.SOURCE_QUEUED,
+            ClaimPublicationStatus.READY_TO_PUBLISH,
+        }:
+            return self._publication_conflict_decision(
+                connection,
+                record,
+                reason_code="transition_not_allowed",
+                now=current,
+                error_type=InvalidClaimPublicationTransitionError,
+            )
+        self._validate_claim_publication_shard_binding(
+            connection,
+            identity,
+            now=current,
+        )
+        if ready_binding is None:
+            raise RuntimeError("ready publication validation was not completed")
+        validated = ready_binding
+        if record.status is ClaimPublicationStatus.READY_TO_PUBLISH:
+            if self._claim_publication_matches_ready(record, validated):
+                return self._publication_replay(
+                    connection, record, reason_code="ready_to_publish_replay", now=current
+                )
+            return self._publication_conflict_decision(
+                connection, record, reason_code="ready_content_conflict", now=current
+            )
+        values = self._publication_values(record)
+        values.update(
+            {
+                **validated.model_dump(mode="python"),
+                "status": ClaimPublicationStatus.READY_TO_PUBLISH,
+                "version": 2,
+                "updated_at": current,
+                "ready_at": current,
+            }
+        )
+        return self._update_claim_publication_in_transaction(
+            connection,
+            record,
+            _claim_publication_record_from_values(values),
+            reason_code="source_queued_to_ready_to_publish",
+            now=current,
+        )
+
+    def mark_claim_publication_ready(
+        self,
+        identity: LabClaimPublicationIdentity,
+        signed_plan: SourceUsePlanV2,
+        final_bound_claim: LabShardClaimV2,
+        *,
+        current_claim_authority: CurrentClaimAuthorityProtocol,
+        keyring: VerifyOnlyEd25519Keyring,
+        audience: str,
+        lease: LabLeaseRecord,
+        now: datetime,
+    ) -> LabClaimPublicationMutation:
+        validated_identity = LabClaimPublicationIdentity.model_validate(identity.model_dump())
+        validated_plan = SourceUsePlanV2.model_validate(signed_plan.model_dump())
+        validated_final_claim = LabShardClaimV2.model_validate(final_bound_claim.model_dump())
+        current = _utc(now)
+        phase_one_record = self._read_claim_publication_for_external_validation(validated_identity)
+        self._prevalidate_claim_publication_mutation(
+            validated_identity,
+            lease=lease,
+            now=current,
+        )
+        ready_binding: ReadyBinding | None = None
+        if phase_one_record.status in {
+            ClaimPublicationStatus.SOURCE_QUEUED,
+            ClaimPublicationStatus.READY_TO_PUBLISH,
+        }:
+            ready_binding = self._ready_binding_for_record(
+                phase_one_record,
+                validated_plan,
+                validated_final_claim,
+                current_claim_authority=current_claim_authority,
+                keyring=keyring,
+                audience=audience,
+                now=current,
+            )
+        with self._transaction() as connection:
+            decision = self._mark_claim_publication_ready_in_transaction(
+                connection,
+                validated_identity,
+                expected=phase_one_record,
+                ready_binding=ready_binding,
+                lease=lease,
+                now=now,
+            )
+        return decision.resolved()
+
+    def _publish_claim_publication_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        identity: LabClaimPublicationIdentity,
+        spool_receipt: PublishReceipt,
+        *,
+        expected: LabClaimPublicationRecord,
+        validated_ready_claim: LabShardClaimV2 | None,
+        spool_receipt_verifier: LabClaimSpoolReceiptVerifier | None,
+        lease: LabLeaseRecord,
+        now: datetime,
+    ) -> _ClaimPublicationDecision:
+        if not connection.in_transaction:
+            raise RuntimeError("claim publication publish requires an active transaction")
+        current = _utc(now)
+        validated = PublishReceipt.model_validate(spool_receipt.model_dump())
+        terminal_row = connection.execute(
+            "SELECT * FROM lab_claim_publication WHERE attempt_id = ?",
+            (str(identity.attempt_id),),
+        ).fetchone()
+        if terminal_row is not None:
+            terminal_record = _claim_publication_record_from_row(terminal_row)
+            if terminal_record.identity != identity:
+                raise ClaimPublicationConflictError("attempt_identity_conflict")
+            if terminal_record.status is ClaimPublicationStatus.PUBLISHED:
+                terminal_claim = strict_model_validate_canonical_json(
+                    LabShardClaimV2,
+                    terminal_record.final_claim_bytes or b"",
+                )
+                require_v2_spool_receipt_provenance(
+                    validated,
+                    final_claim=terminal_claim,
+                    verifier=spool_receipt_verifier,
+                )
+                if self._claim_publication_matches_receipt(terminal_record, validated):
+                    return self._publication_terminal_read(terminal_record)
+                return self._publication_conflict_decision(
+                    connection,
+                    terminal_record,
+                    reason_code="published_receipt_conflict",
+                    now=current,
+                )
+            if not self._claim_publication_snapshot_matches(terminal_record, expected):
+                raise ClaimPublicationConflictError("publication_cas_conflict")
+        record = self._load_claim_publication_for_mutation(
+            connection, identity, lease=lease, now=current
+        )
+        if not self._claim_publication_snapshot_matches(record, expected):
+            raise ClaimPublicationConflictError("publication_cas_conflict")
+        if record.status is ClaimPublicationStatus.ABORTED:
+            return self._publication_conflict_decision(
+                connection,
+                record,
+                reason_code="terminal_status_immutable",
+                now=current,
+                error_type=InvalidClaimPublicationTransitionError,
+            )
+        if record.status is not ClaimPublicationStatus.READY_TO_PUBLISH:
+            return self._publication_conflict_decision(
+                connection,
+                record,
+                reason_code="transition_not_allowed",
+                now=current,
+                error_type=InvalidClaimPublicationTransitionError,
+            )
+        if validated_ready_claim is None:
+            raise RuntimeError("ready claim validation was not completed")
+        require_v2_spool_receipt_provenance(
+            validated,
+            final_claim=validated_ready_claim,
+            verifier=spool_receipt_verifier,
+        )
+        self._validate_claim_publication_shard_binding(
+            connection,
+            identity,
+            now=current,
+        )
+        values = self._publication_values(record)
+        values.update(
+            {
+                **validated.model_dump(mode="python"),
+                "status": ClaimPublicationStatus.PUBLISHED,
+                "version": 3,
+                "updated_at": current,
+                "published_at": current,
+            }
+        )
+        return self._update_claim_publication_in_transaction(
+            connection,
+            record,
+            _claim_publication_record_from_values(values),
+            reason_code="ready_to_publish_to_published",
+            now=current,
+        )
+
+    def publish_claim_publication(
+        self,
+        identity: LabClaimPublicationIdentity,
+        spool_receipt: PublishReceipt,
+        *,
+        current_claim_authority: CurrentClaimAuthorityProtocol,
+        keyring: VerifyOnlyEd25519Keyring,
+        audience: str,
+        lease: LabLeaseRecord,
+        now: datetime,
+        spool_receipt_verifier: LabClaimSpoolReceiptVerifier | None = None,
+    ) -> LabClaimPublicationMutation:
+        validated_identity = LabClaimPublicationIdentity.model_validate(identity.model_dump())
+        validated_receipt = PublishReceipt.model_validate(spool_receipt.model_dump())
+        current = _utc(now)
+        phase_one_record = self._read_claim_publication_for_external_validation(validated_identity)
+        if phase_one_record.status is not ClaimPublicationStatus.PUBLISHED:
+            self._prevalidate_claim_publication_mutation(
+                validated_identity,
+                lease=lease,
+                now=current,
+            )
+        validated_ready_claim: LabShardClaimV2 | None = None
+        if phase_one_record.status is ClaimPublicationStatus.READY_TO_PUBLISH:
+            validated_ready_claim = self._validate_ready_claim_for_publication_record(
+                phase_one_record,
+                validated_identity,
+                current_claim_authority=current_claim_authority,
+                keyring=keyring,
+                audience=audience,
+                now=current,
+                allow_published=False,
+            )
+        elif phase_one_record.status is ClaimPublicationStatus.PUBLISHED:
+            final_claim = strict_model_validate_canonical_json(
+                LabShardClaimV2,
+                phase_one_record.final_claim_bytes or b"",
+            )
+            require_v2_spool_receipt_provenance(
+                validated_receipt,
+                final_claim=final_claim,
+                verifier=spool_receipt_verifier,
+            )
+        with self._transaction() as connection:
+            decision = self._publish_claim_publication_in_transaction(
+                connection,
+                validated_identity,
+                validated_receipt,
+                expected=phase_one_record,
+                validated_ready_claim=validated_ready_claim,
+                spool_receipt_verifier=spool_receipt_verifier,
+                lease=lease,
+                now=now,
+            )
+        return decision.resolved()
+
+    @staticmethod
+    def _finalizer_authority_binding(
+        connection: sqlite3.Connection, *, path: Path
+    ) -> dict[str, object]:
+        canonical_path = path.resolve(strict=True)
+        observed = canonical_path.stat(follow_symlinks=False)
+        application_id = _strict_sqlite_int(
+            connection.execute("PRAGMA application_id").fetchone()[0],
+            field="PRAGMA application_id",
+            minimum=1,
+        )
+        schema_version = _strict_sqlite_int(
+            connection.execute("PRAGMA user_version").fetchone()[0],
+            field="PRAGMA user_version",
+            minimum=1,
+        )
+        implementation_digest = hashlib.sha256(
+            canonical_json_bytes(
+                {
+                    "class": "rquant.lab_jobs.LabJobStore",
+                    "claim_contract": "rquant-claim-publication-finalizer-authority/v2",
+                    "schema_version": _SCHEMA_VERSION,
+                }
+            )
+        ).hexdigest()
+        generation = (observed.st_dev, observed.st_ino)
+        store_id = hashlib.sha256(
+            canonical_json_bytes(
+                {
+                    "canonical_path": str(canonical_path),
+                    "database_generation": generation,
+                    "application_id": application_id,
+                    "schema_version": schema_version,
+                    "implementation_digest": implementation_digest,
+                }
+            )
+        ).hexdigest()
+        return {
+            "canonical_job_store_path": str(canonical_path),
+            "database_generation": generation,
+            "store_id": store_id,
+            "schema_version": schema_version,
+            "implementation_digest": implementation_digest,
+        }
+
+    @staticmethod
+    def _finalizer_authority_commitment(
+        *,
+        store_id: str,
+        owner_id: str,
+        lease_id: int,
+        fencing_token: int,
+        root_descriptor: str,
+        root_key_digest: str,
+        acquired_at: datetime,
+        expires_at: datetime,
+    ) -> str:
+        return hashlib.sha256(
+            canonical_json_bytes(
+                {
+                    "contract": "rquant-claim-publication-finalizer-lease/v2",
+                    "store_id": store_id,
+                    "owner_id": owner_id,
+                    "lease_id": lease_id,
+                    "fencing_token": fencing_token,
+                    "root_descriptor": root_descriptor,
+                    "root_key_digest": root_key_digest,
+                    "acquired_at": _dump_time(_utc(acquired_at)),
+                    "expires_at": _dump_time(_utc(expires_at)),
+                }
+            )
+        ).hexdigest()
+
+    @staticmethod
+    def _finalizer_authority_mac_payload(
+        *,
+        binding: Mapping[str, object],
+        owner_id: str,
+        lease_id: int,
+        fencing_token: int,
+        acquired_at: datetime,
+        expires_at: datetime,
+        lease_commitment: str,
+    ) -> bytes:
+        return canonical_json_bytes(
+            {
+                "contract": "rquant-claim-publication-finalizer-authority/v3",
+                "store_id": binding["store_id"],
+                "database_generation": binding["database_generation"],
+                "implementation_digest": binding["implementation_digest"],
+                "owner_id": owner_id,
+                "lease_id": lease_id,
+                "fencing_token": fencing_token,
+                "acquired_at": _dump_time(_utc(acquired_at)),
+                "expires_at": _dump_time(_utc(expires_at)),
+                "lease_commitment": lease_commitment,
+            }
+        )
+
+    @staticmethod
+    def _require_finalizer_root_anchor(
+        connection: sqlite3.Connection,
+        root_key: LabClaimPublicationFinalizerRootKey,
+    ) -> None:
+        row = connection.execute(
+            "SELECT root_descriptor, root_key_digest "
+            "FROM lab_claim_publication_finalizer_root_anchor WHERE singleton = 1"
+        ).fetchone()
+        if row is None:
+            raise ClaimPublicationConflictError("finalizer_root_unbootstrapped")
+        if (
+            str(row["root_descriptor"]) != root_key.descriptor
+            or str(row["root_key_digest"]) != root_key.key_digest
+        ):
+            raise ClaimPublicationConflictError("finalizer_root_conflict")
+
+    def _acquire_claim_publication_finalizer_authority(
+        self,
+        *,
+        owner_id: str,
+        lease_seconds: int,
+        root_key: LabClaimPublicationFinalizerRootKey,
+        trust_certificate: LabClaimFinalizerTrustCertificate,
+        trust_verifier: LabClaimFinalizerTrustVerifier,
+        runtime_signer: object,
+        now: datetime,
+    ) -> LabClaimPublicationFinalizerAuthority:
+        """Issue the sole durable C/D capability; not part of Scheduler composition."""
+
+        owner = owner_id.strip()
+        if not owner or lease_seconds < 1:
+            raise ValueError("finalizer authority owner and lease must be valid")
+        current = _utc(now)
+        if type(root_key) is not LabClaimPublicationFinalizerRootKey:
+            raise TypeError("finalizer authority requires an exact root key")
+        with self._transaction() as connection:
+            binding = self._finalizer_authority_binding(connection, path=self.path)
+            try:
+                trust_verifier.require_certificate(
+                    trust_certificate,
+                    store_id=str(binding["store_id"]),
+                    database_generation=binding["database_generation"],  # type: ignore[arg-type]
+                    schema_version=int(binding["schema_version"]),
+                    now=current,
+                )
+                trust_verifier.require_runtime_signer(trust_certificate, runtime_signer)  # type: ignore[arg-type]
+            except (LabClaimFinalizerTrustError, TypeError, ValueError) as exc:
+                raise ClaimPublicationConflictError("finalizer_external_trust_invalid") from exc
+            certificate_bytes = canonical_model_json_bytes(trust_certificate)
+            connection.execute(
+                """
+                INSERT INTO lab_claim_publication_finalizer_trust_cache (
+                    singleton, certificate_bytes, certificate_hash, cached_at
+                ) VALUES (1, ?, ?, ?)
+                ON CONFLICT(singleton) DO UPDATE SET
+                    certificate_bytes = excluded.certificate_bytes,
+                    certificate_hash = excluded.certificate_hash,
+                    cached_at = excluded.cached_at
+                """,
+                (
+                    certificate_bytes,
+                    hashlib.sha256(certificate_bytes).hexdigest(),
+                    _dump_time(current),
+                ),
+            )
+            existing = connection.execute(
+                "SELECT * FROM lab_claim_publication_finalizer_lease WHERE singleton = 1"
+            ).fetchone()
+            if (
+                existing is not None
+                and existing["released_at"] is None
+                and _load_time(str(existing["expires_at"])) > current
+                and str(existing["owner_id"]) != owner
+            ):
+                raise ClaimPublicationConflictError("finalizer_authority_unavailable")
+            if (
+                existing is not None
+                and existing["released_at"] is None
+                and _load_time(str(existing["expires_at"])) > current
+                and str(existing["owner_id"]) == owner
+            ):
+                descriptor = str(existing["root_descriptor"])
+                digest = str(existing["token_commitment"])
+                if descriptor != root_key.descriptor or digest != root_key.key_digest:
+                    raise ClaimPublicationConflictError("finalizer_authority_root_conflict")
+                acquired_at = _load_time(str(existing["acquired_at"]))
+                expires_at = _load_time(str(existing["expires_at"]))
+                lease_id = _strict_sqlite_int(
+                    existing["lease_id"], field="finalizer.lease_id", minimum=1
+                )
+                fence = _strict_sqlite_int(
+                    existing["fencing_token"], field="finalizer.fencing_token", minimum=1
+                )
+                commitment = str(existing["lease_commitment"])
+                authority_mac = root_key.sign(
+                    self._finalizer_authority_mac_payload(
+                        binding=binding,
+                        owner_id=owner,
+                        lease_id=lease_id,
+                        fencing_token=fence,
+                        acquired_at=acquired_at,
+                        expires_at=expires_at,
+                        lease_commitment=commitment,
+                    )
+                )
+                return LabClaimPublicationFinalizerAuthority(
+                    **binding,
+                    owner_id=owner,
+                    lease_id=lease_id,
+                    fencing_token=fence,
+                    root_key=root_key,
+                    expires_at=expires_at,
+                    lease_commitment=commitment,
+                    authority_mac=authority_mac,
+                    trust_certificate=trust_certificate,
+                    trust_verifier=trust_verifier,
+                    runtime_signer=runtime_signer,
+                )
+            prior_fence = (
+                0
+                if existing is None
+                else _strict_sqlite_int(
+                    existing["fencing_token"],
+                    field="lab_claim_publication_finalizer_lease.fencing_token",
+                    minimum=1,
+                )
+            )
+            prior_lease_id = (
+                0
+                if existing is None
+                else _strict_sqlite_int(
+                    existing["lease_id"],
+                    field="lab_claim_publication_finalizer_lease.lease_id",
+                    minimum=1,
+                )
+            )
+            lease_id = prior_lease_id + 1
+            fence = prior_fence + 1
+            expires_at = current + timedelta(seconds=lease_seconds)
+            commitment = self._finalizer_authority_commitment(
+                store_id=str(binding["store_id"]),
+                owner_id=owner,
+                lease_id=lease_id,
+                fencing_token=fence,
+                root_descriptor=root_key.descriptor,
+                root_key_digest=root_key.key_digest,
+                acquired_at=current,
+                expires_at=expires_at,
+            )
+            authority_mac = root_key.sign(
+                self._finalizer_authority_mac_payload(
+                    binding=binding,
+                    owner_id=owner,
+                    lease_id=lease_id,
+                    fencing_token=fence,
+                    acquired_at=current,
+                    expires_at=expires_at,
+                    lease_commitment=commitment,
+                )
+            )
+            connection.execute(
+                """
+                INSERT INTO lab_claim_publication_finalizer_lease (
+                    singleton, canonical_job_store_path, database_device, database_inode,
+                    store_id, schema_version, implementation_digest, owner_id, lease_id,
+                    fencing_token, root_descriptor, token_commitment, lease_commitment, acquired_at,
+                    heartbeat_at, expires_at, released_at
+                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                ON CONFLICT(singleton) DO UPDATE SET
+                    canonical_job_store_path = excluded.canonical_job_store_path,
+                    database_device = excluded.database_device,
+                    database_inode = excluded.database_inode,
+                    store_id = excluded.store_id,
+                    schema_version = excluded.schema_version,
+                    implementation_digest = excluded.implementation_digest,
+                    owner_id = excluded.owner_id,
+                    lease_id = excluded.lease_id,
+                    fencing_token = excluded.fencing_token,
+                    root_descriptor = excluded.root_descriptor,
+                    token_commitment = excluded.token_commitment,
+                    lease_commitment = excluded.lease_commitment,
+                    acquired_at = excluded.acquired_at,
+                    heartbeat_at = excluded.heartbeat_at,
+                    expires_at = excluded.expires_at,
+                    released_at = NULL
+                """,
+                (
+                    binding["canonical_job_store_path"],
+                    binding["database_generation"][0],
+                    binding["database_generation"][1],
+                    binding["store_id"],
+                    binding["schema_version"],
+                    binding["implementation_digest"],
+                    owner,
+                    lease_id,
+                    fence,
+                    root_key.descriptor,
+                    root_key.key_digest,
+                    commitment,
+                    _dump_time(current),
+                    _dump_time(current),
+                    _dump_time(expires_at),
+                ),
+            )
+        return LabClaimPublicationFinalizerAuthority(
+            **binding,
+            owner_id=owner,
+            lease_id=lease_id,
+            fencing_token=fence,
+            root_key=root_key,
+            expires_at=expires_at,
+            lease_commitment=commitment,
+            authority_mac=authority_mac,
+            trust_certificate=trust_certificate,
+            trust_verifier=trust_verifier,
+            runtime_signer=runtime_signer,
+        )
+
+    def _renew_claim_publication_finalizer_authority(
+        self,
+        authority: LabClaimPublicationFinalizerAuthority,
+        *,
+        lease_seconds: int,
+        now: datetime,
+    ) -> LabClaimPublicationFinalizerAuthority:
+        if lease_seconds < 1:
+            raise ValueError("finalizer authority lease must be positive")
+        current = _utc(now)
+        with self._transaction() as connection:
+            self._require_claim_publication_finalizer_authority(connection, authority, now=current)
+            binding = self._finalizer_authority_binding(connection, path=self.path)
+            expires_at = current + timedelta(seconds=lease_seconds)
+            root_row = connection.execute(
+                "SELECT root_descriptor, token_commitment, acquired_at "
+                "FROM lab_claim_publication_finalizer_lease WHERE singleton = 1"
+            ).fetchone()
+            root_descriptor = str(root_row["root_descriptor"])
+            root_key_digest = str(root_row["token_commitment"])
+            acquired_at = _load_time(str(root_row["acquired_at"]))
+            commitment = self._finalizer_authority_commitment(
+                store_id=str(binding["store_id"]),
+                owner_id=authority.owner_id,
+                lease_id=authority.lease_id,
+                fencing_token=authority.fencing_token,
+                root_descriptor=root_descriptor,
+                root_key_digest=root_key_digest,
+                acquired_at=acquired_at,
+                expires_at=expires_at,
+            )
+            connection.execute(
+                """
+                UPDATE lab_claim_publication_finalizer_lease
+                SET heartbeat_at = ?, expires_at = ?, lease_commitment = ?
+                WHERE singleton = 1
+                """,
+                (_dump_time(current), _dump_time(expires_at), commitment),
+            )
+        authority_mac = authority._root_key.sign(
+            self._finalizer_authority_mac_payload(
+                binding=binding,
+                owner_id=authority.owner_id,
+                lease_id=authority.lease_id,
+                fencing_token=authority.fencing_token,
+                acquired_at=acquired_at,
+                expires_at=expires_at,
+                lease_commitment=commitment,
+            )
+        )
+        return LabClaimPublicationFinalizerAuthority(
+            **binding,
+            owner_id=authority.owner_id,
+            lease_id=authority.lease_id,
+            fencing_token=authority.fencing_token,
+            root_key=authority._root_key,
+            expires_at=expires_at,
+            lease_commitment=commitment,
+            authority_mac=authority_mac,
+            trust_certificate=authority._trust_certificate,
+            trust_verifier=authority._trust_verifier,
+            runtime_signer=authority._runtime_signer,
+        )
+
+    def _release_claim_publication_finalizer_authority(
+        self,
+        authority: LabClaimPublicationFinalizerAuthority,
+        *,
+        now: datetime,
+    ) -> None:
+        current = _utc(now)
+        with self._transaction() as connection:
+            self._require_claim_publication_finalizer_authority(connection, authority, now=current)
+            connection.execute(
+                """
+                UPDATE lab_claim_publication_finalizer_lease
+                SET released_at = ? WHERE singleton = 1
+                """,
+                (_dump_time(current),),
+            )
+
+    def _require_claim_publication_finalizer_authority(
+        self,
+        connection: sqlite3.Connection,
+        authority: LabClaimPublicationFinalizerAuthority,
+        *,
+        now: datetime,
+    ) -> None:
+        if type(authority) is not LabClaimPublicationFinalizerAuthority:
+            raise ClaimPublicationConflictError("finalizer_authority_conflict")
+        binding = self._finalizer_authority_binding(connection, path=self.path)
+        if authority._trust_certificate is None or authority._trust_verifier is None:
+            raise ClaimPublicationConflictError("finalizer_external_trust_invalid")
+        try:
+            authority._trust_verifier.require_certificate(
+                authority._trust_certificate,
+                store_id=str(binding["store_id"]),
+                database_generation=binding["database_generation"],  # type: ignore[arg-type]
+                schema_version=int(binding["schema_version"]),
+                now=_utc(now),
+            )
+            authority._trust_verifier.require_runtime_signer(
+                authority._trust_certificate,
+                authority._runtime_signer,  # type: ignore[arg-type]
+            )
+        except (LabClaimFinalizerTrustError, TypeError, ValueError) as exc:
+            raise ClaimPublicationConflictError("finalizer_external_trust_invalid") from exc
+        row = connection.execute(
+            "SELECT * FROM lab_claim_publication_finalizer_lease WHERE singleton = 1"
+        ).fetchone()
+        if row is None:
+            raise ClaimPublicationConflictError("finalizer_authority_missing")
+        root_descriptor = str(row["root_descriptor"])
+        root_key_digest = str(row["token_commitment"])
+        acquired_at = _load_time(str(row["acquired_at"]))
+        expires_at = _load_time(str(row["expires_at"]))
+        matches = (
+            authority.canonical_job_store_path == binding["canonical_job_store_path"]
+            and authority.database_generation == binding["database_generation"]
+            and authority.store_id == binding["store_id"]
+            and authority.schema_version == binding["schema_version"]
+            and authority.implementation_digest == binding["implementation_digest"]
+            and str(row["canonical_job_store_path"]) == binding["canonical_job_store_path"]
+            and (
+                _strict_sqlite_int(row["database_device"], field="finalizer.database_device"),
+                _strict_sqlite_int(row["database_inode"], field="finalizer.database_inode"),
+            )
+            == binding["database_generation"]
+            and str(row["store_id"]) == binding["store_id"]
+            and _strict_sqlite_int(
+                row["schema_version"], field="finalizer.schema_version", minimum=1
+            )
+            == binding["schema_version"]
+            and str(row["implementation_digest"]) == binding["implementation_digest"]
+            and str(row["owner_id"]) == authority.owner_id
+            and _strict_sqlite_int(row["lease_id"], field="finalizer.lease_id", minimum=1)
+            == authority.lease_id
+            and _strict_sqlite_int(row["fencing_token"], field="finalizer.fencing_token", minimum=1)
+            == authority.fencing_token
+            and str(row["lease_commitment"]) == authority.lease_commitment
+            and authority.expires_at == expires_at
+            and authority.root_mac_matches(
+                self._finalizer_authority_mac_payload(
+                    binding=binding,
+                    owner_id=str(row["owner_id"]),
+                    lease_id=_strict_sqlite_int(
+                        row["lease_id"], field="finalizer.lease_id", minimum=1
+                    ),
+                    fencing_token=_strict_sqlite_int(
+                        row["fencing_token"], field="finalizer.fencing_token", minimum=1
+                    ),
+                    acquired_at=acquired_at,
+                    expires_at=expires_at,
+                    lease_commitment=str(row["lease_commitment"]),
+                ),
+                root_descriptor=root_descriptor,
+                key_digest=root_key_digest,
+            )
+            and row["released_at"] is None
+            and _load_time(str(row["expires_at"])) > _utc(now)
+        )
+        if not matches:
+            raise ClaimPublicationConflictError("finalizer_authority_conflict")
+
+    def _load_claim_publication_for_finalizer_mutation(
+        self,
+        connection: sqlite3.Connection,
+        identity: LabClaimPublicationIdentity,
+        *,
+        authority: LabClaimPublicationFinalizerAuthority,
+        now: datetime,
+    ) -> LabClaimPublicationRecord:
+        self._require_claim_publication_finalizer_authority(connection, authority, now=_utc(now))
+        row = connection.execute(
+            "SELECT * FROM lab_claim_publication WHERE attempt_id = ?",
+            (str(identity.attempt_id),),
+        ).fetchone()
+        if row is None:
+            raise ClaimPublicationConflictError("attempt_identity_conflict")
+        record = _claim_publication_record_from_row(row)
+        if record.identity != identity:
+            raise ClaimPublicationConflictError("attempt_identity_conflict")
+        return record
+
+    def _build_finalizer_attestation(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        authority: LabClaimPublicationFinalizerAuthority,
+        record: LabClaimPublicationRecord,
+        now: datetime,
+    ) -> tuple[bytes, bytes]:
+        if (
+            authority._trust_certificate is None
+            or authority._trust_verifier is None
+            or authority._runtime_signer is None
+            or record.status
+            not in {ClaimPublicationStatus.READY_TO_PUBLISH, ClaimPublicationStatus.PUBLISHED}
+        ):
+            raise ClaimPublicationConflictError("finalizer_external_trust_invalid")
+        binding = self._finalizer_authority_binding(connection, path=self.path)
+        try:
+            certificate_bytes, attestation_bytes = (
+                build_lab_claim_finalizer_publication_attestation(
+                    certificate=authority._trust_certificate,
+                    signer=authority._runtime_signer,  # type: ignore[arg-type]
+                    attempt_id=str(record.identity.attempt_id),
+                    claim_generation=record.identity.claim_generation,
+                    scheduler_fencing_token=record.identity.scheduler_fencing_token,
+                    finalizer_fencing_token=authority.fencing_token,
+                    publication_status=record.status.value,
+                    source_use_plan_hash=record.source_use_plan_hash or "",
+                    final_claim_hash=record.final_claim_hash or "",
+                    spool_receipt_hash=record.spool_receipt_hash,
+                    store_id=str(binding["store_id"]),
+                    schema_version=int(binding["schema_version"]),
+                )
+            )
+            require_lab_claim_finalizer_publication_attestation(
+                verifier=authority._trust_verifier,
+                certificate_bytes=certificate_bytes,
+                attestation_bytes=attestation_bytes,
+                store_id=str(binding["store_id"]),
+                database_generation=binding["database_generation"],  # type: ignore[arg-type]
+                schema_version=int(binding["schema_version"]),
+                now=now,
+                attempt_id=str(record.identity.attempt_id),
+                claim_generation=record.identity.claim_generation,
+                scheduler_fencing_token=record.identity.scheduler_fencing_token,
+                finalizer_fencing_token=authority.fencing_token,
+                publication_status=record.status.value,
+                source_use_plan_hash=record.source_use_plan_hash or "",
+                final_claim_hash=record.final_claim_hash or "",
+                spool_receipt_hash=record.spool_receipt_hash,
+            )
+        except (LabClaimFinalizerTrustError, TypeError, ValueError) as exc:
+            raise ClaimPublicationConflictError("finalizer_publication_signature_invalid") from exc
+        return certificate_bytes, attestation_bytes
+
+    @staticmethod
+    def _persist_finalizer_attestation(
+        connection: sqlite3.Connection,
+        *,
+        record: LabClaimPublicationRecord,
+        certificate_bytes: bytes,
+        attestation_bytes: bytes,
+        now: datetime,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO lab_claim_publication_finalizer_attestation (
+                attempt_id, publication_status, certificate_bytes, certificate_hash,
+                attestation_bytes, attestation_hash, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(record.identity.attempt_id),
+                record.status.value,
+                certificate_bytes,
+                hashlib.sha256(certificate_bytes).hexdigest(),
+                attestation_bytes,
+                hashlib.sha256(attestation_bytes).hexdigest(),
+                _dump_time(_utc(now)),
+            ),
+        )
+
+    def _insert_claim_publication_rollout_evidence_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        record: LabClaimPublicationRecord,
+        authority: LabClaimPublicationFinalizerAuthority,
+        now: datetime,
+    ) -> None:
+        """Enqueue the signed D record without extending the frozen v16 schema."""
+
+        if not connection.in_transaction:
+            raise RuntimeError("rollout evidence enqueue requires an active transaction")
+        evidence = LabClaimPublicationRolloutEvidence.from_record(record)
+        degradation_ref = uuid5(
+            NAMESPACE_URL,
+            "|".join(
+                (
+                    "rquant-claim-publication-rollout-evidence/v1",
+                    str(evidence.attempt_id),
+                    evidence.evidence_hash,
+                )
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO lab_claim_publication_finalizer_observation_degradation (
+                degradation_ref, attempt_id, publication_identity_hash,
+                authority_fencing_token, event_type, reason_code, reason_code_hash,
+                error_class, next_retry_at, created_at, drained_at
+            ) VALUES (?, ?, ?, ?, 'published', ?, ?, ?, ?, ?, NULL)
+            """,
+            (
+                str(degradation_ref),
+                str(evidence.attempt_id),
+                evidence.evidence_hash,
+                authority.fencing_token,
+                _ROLLOUT_EVIDENCE_REASON_CODE,
+                _ROLLOUT_EVIDENCE_REASON_HASH,
+                _ROLLOUT_EVIDENCE_INITIAL_ERROR_CLASS,
+                _dump_time(_utc(now)),
+                _dump_time(_utc(now)),
+            ),
+        )
+
+    def validate_finalizer_publication_attestation(
+        self,
+        identity: LabClaimPublicationIdentity,
+        *,
+        trust_verifier: LabClaimFinalizerTrustVerifier,
+        publication_status: ClaimPublicationStatus,
+        now: datetime,
+    ) -> None:
+        """Verify the external C/D trust chain before a worker may consume V2 work."""
+
+        validated = LabClaimPublicationIdentity.model_validate(identity.model_dump())
+        current = _utc(now)
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM lab_claim_publication WHERE attempt_id = ?",
+                (str(validated.attempt_id),),
+            ).fetchone()
+            attestation_row = connection.execute(
+                """
+                SELECT certificate_bytes, certificate_hash, attestation_bytes, attestation_hash
+                FROM lab_claim_publication_finalizer_attestation
+                WHERE attempt_id = ? AND publication_status = ?
+                """,
+                (str(validated.attempt_id), publication_status.value),
+            ).fetchone()
+            if row is None or attestation_row is None:
+                raise ClaimPublicationConflictError("finalizer_publication_signature_missing")
+            record = _claim_publication_record_from_row(row)
+            if record.identity != validated or record.status is not publication_status:
+                raise ClaimPublicationConflictError("finalizer_publication_signature_invalid")
+            certificate_bytes = _strict_sqlite_blob(
+                attestation_row["certificate_bytes"],
+                field="lab_claim_publication_finalizer_attestation.certificate_bytes",
+            )
+            attestation_bytes = _strict_sqlite_blob(
+                attestation_row["attestation_bytes"],
+                field="lab_claim_publication_finalizer_attestation.attestation_bytes",
+            )
+            if hashlib.sha256(certificate_bytes).hexdigest() != str(
+                attestation_row["certificate_hash"]
+            ) or hashlib.sha256(attestation_bytes).hexdigest() != str(
+                attestation_row["attestation_hash"]
+            ):
+                raise ClaimPublicationConflictError("finalizer_publication_signature_invalid")
+            try:
+                attestation = strict_model_validate_canonical_json(
+                    LabClaimFinalizerPublicationAttestation,
+                    attestation_bytes,
+                )
+                binding = self._finalizer_authority_binding(connection, path=self.path)
+                require_lab_claim_finalizer_publication_attestation(
+                    verifier=trust_verifier,
+                    certificate_bytes=certificate_bytes,
+                    attestation_bytes=attestation_bytes,
+                    store_id=str(binding["store_id"]),
+                    database_generation=binding["database_generation"],  # type: ignore[arg-type]
+                    schema_version=int(binding["schema_version"]),
+                    now=current,
+                    attempt_id=str(record.identity.attempt_id),
+                    claim_generation=record.identity.claim_generation,
+                    scheduler_fencing_token=record.identity.scheduler_fencing_token,
+                    finalizer_fencing_token=attestation.finalizer_fencing_token,
+                    publication_status=publication_status.value,
+                    source_use_plan_hash=record.source_use_plan_hash or "",
+                    final_claim_hash=record.final_claim_hash or "",
+                    spool_receipt_hash=record.spool_receipt_hash,
+                )
+            except (LabClaimFinalizerTrustError, TypeError, ValueError) as exc:
+                raise ClaimPublicationConflictError(
+                    "finalizer_publication_signature_invalid"
+                ) from exc
+
+    def validate_finalizer_published_attestation(
+        self,
+        identity: LabClaimPublicationIdentity,
+        *,
+        trust_verifier: LabClaimFinalizerTrustVerifier,
+        now: datetime,
+    ) -> None:
+        self.validate_finalizer_publication_attestation(
+            identity,
+            trust_verifier=trust_verifier,
+            publication_status=ClaimPublicationStatus.PUBLISHED,
+            now=now,
+        )
+
+    def validate_finalizer_ready_attestation(
+        self,
+        identity: LabClaimPublicationIdentity,
+        *,
+        trust_verifier: LabClaimFinalizerTrustVerifier,
+        now: datetime,
+    ) -> None:
+        self.validate_finalizer_publication_attestation(
+            identity,
+            trust_verifier=trust_verifier,
+            publication_status=ClaimPublicationStatus.READY_TO_PUBLISH,
+            now=now,
+        )
+
+    def _finalizer_mark_claim_publication_ready_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        identity: LabClaimPublicationIdentity,
+        *,
+        expected: LabClaimPublicationRecord,
+        ready_binding: ReadyBinding | None,
+        authority: LabClaimPublicationFinalizerAuthority,
+        now: datetime,
+    ) -> _ClaimPublicationDecision:
+        if not connection.in_transaction:
+            raise RuntimeError("finalizer ready requires an active transaction")
+        current = _utc(now)
+        record = self._load_claim_publication_for_finalizer_mutation(
+            connection, identity, authority=authority, now=current
+        )
+        if not self._claim_publication_snapshot_matches(record, expected):
+            if (
+                record.status is ClaimPublicationStatus.READY_TO_PUBLISH
+                and ready_binding is not None
+                and self._claim_publication_matches_ready(record, ready_binding)
+            ):
+                return self._publication_replay(
+                    connection, record, reason_code="finalizer_ready_replay", now=current
+                )
+            raise ClaimPublicationConflictError("publication_cas_conflict")
+        if record.status is ClaimPublicationStatus.PUBLISHED:
+            return self._publication_terminal_read(record)
+        if record.status is ClaimPublicationStatus.ABORTED:
+            return self._publication_conflict_decision(
+                connection,
+                record,
+                reason_code="terminal_status_immutable",
+                now=current,
+                error_type=InvalidClaimPublicationTransitionError,
+            )
+        if record.status not in {
+            ClaimPublicationStatus.SOURCE_QUEUED,
+            ClaimPublicationStatus.READY_TO_PUBLISH,
+        }:
+            return self._publication_conflict_decision(
+                connection,
+                record,
+                reason_code="transition_not_allowed",
+                now=current,
+                error_type=InvalidClaimPublicationTransitionError,
+            )
+        self._validate_claim_publication_shard_binding(connection, identity, now=current)
+        if ready_binding is None:
+            raise RuntimeError("finalizer ready validation was not completed")
+        if record.status is ClaimPublicationStatus.READY_TO_PUBLISH:
+            if self._claim_publication_matches_ready(record, ready_binding):
+                return self._publication_replay(
+                    connection, record, reason_code="finalizer_ready_replay", now=current
+                )
+            return self._publication_conflict_decision(
+                connection, record, reason_code="ready_content_conflict", now=current
+            )
+        values = self._publication_values(record)
+        values.update(
+            {
+                **ready_binding.model_dump(mode="python"),
+                "status": ClaimPublicationStatus.READY_TO_PUBLISH,
+                "version": 2,
+                "updated_at": current,
+                "ready_at": current,
+            }
+        )
+        updated = _claim_publication_record_from_values(values)
+        certificate_bytes, attestation_bytes = self._build_finalizer_attestation(
+            connection,
+            authority=authority,
+            record=updated,
+            now=current,
+        )
+        decision = self._update_claim_publication_in_transaction(
+            connection,
+            record,
+            updated,
+            reason_code="finalizer_source_queued_to_ready_to_publish",
+            now=current,
+        )
+        self._persist_finalizer_attestation(
+            connection,
+            record=updated,
+            certificate_bytes=certificate_bytes,
+            attestation_bytes=attestation_bytes,
+            now=current,
+        )
+        return decision
+
+    def finalizer_mark_claim_publication_ready(
+        self,
+        identity: LabClaimPublicationIdentity,
+        signed_plan: SourceUsePlanV2,
+        final_bound_claim: LabShardClaimV2,
+        *,
+        current_claim_authority: CurrentClaimAuthorityProtocol,
+        keyring: VerifyOnlyEd25519Keyring,
+        audience: str,
+        authority: LabClaimPublicationFinalizerAuthority,
+        now: datetime,
+    ) -> LabClaimPublicationMutation:
+        """CAS C using a finalizer capability, never a scheduler lease."""
+
+        if type(authority) is not LabClaimPublicationFinalizerAuthority:
+            raise ClaimPublicationConflictError("finalizer_authority_conflict")
+        validated_identity = LabClaimPublicationIdentity.model_validate(identity.model_dump())
+        validated_plan = SourceUsePlanV2.model_validate(signed_plan.model_dump())
+        validated_claim = LabShardClaimV2.model_validate(final_bound_claim.model_dump())
+        current = _utc(now)
+        phase_one_record = self._read_claim_publication_for_external_validation(validated_identity)
+        ready_binding: ReadyBinding | None = None
+        if phase_one_record.status in {
+            ClaimPublicationStatus.SOURCE_QUEUED,
+            ClaimPublicationStatus.READY_TO_PUBLISH,
+        }:
+            ready_binding = self._ready_binding_for_record(
+                phase_one_record,
+                validated_plan,
+                validated_claim,
+                current_claim_authority=current_claim_authority,
+                keyring=keyring,
+                audience=audience,
+                now=current,
+            )
+        if phase_one_record.status in {
+            ClaimPublicationStatus.SOURCE_QUEUED,
+            ClaimPublicationStatus.READY_TO_PUBLISH,
+        }:
+            binding = CurrentClaimConsumptionBindingV2.from_plan(validated_plan)
+            with (
+                hold_trusted_current_claim(
+                    current_claim_authority,
+                    binding=binding,
+                    now=current,
+                ),
+                self._transaction() as connection,
+            ):
+                decision = self._finalizer_mark_claim_publication_ready_in_transaction(
+                    connection,
+                    validated_identity,
+                    expected=phase_one_record,
+                    ready_binding=ready_binding,
+                    authority=authority,
+                    now=current,
+                )
+        else:
+            with self._transaction() as connection:
+                decision = self._finalizer_mark_claim_publication_ready_in_transaction(
+                    connection,
+                    validated_identity,
+                    expected=phase_one_record,
+                    ready_binding=ready_binding,
+                    authority=authority,
+                    now=current,
+                )
+        return decision.resolved()
+
+    def _finalizer_publish_claim_publication_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        identity: LabClaimPublicationIdentity,
+        spool_receipt: PublishReceipt,
+        *,
+        expected: LabClaimPublicationRecord,
+        validated_ready_claim: LabShardClaimV2 | None,
+        authority: LabClaimPublicationFinalizerAuthority,
+        now: datetime,
+    ) -> _ClaimPublicationDecision:
+        if not connection.in_transaction:
+            raise RuntimeError("finalizer publish requires an active transaction")
+        current = _utc(now)
+        validated = PublishReceipt.model_validate(spool_receipt.model_dump())
+        record = self._load_claim_publication_for_finalizer_mutation(
+            connection, identity, authority=authority, now=current
+        )
+        if not self._claim_publication_snapshot_matches(record, expected):
+            if (
+                record.status is ClaimPublicationStatus.PUBLISHED
+                and self._claim_publication_matches_receipt(record, validated)
+            ):
+                return self._publication_terminal_read(record)
+            raise ClaimPublicationConflictError("publication_cas_conflict")
+        if record.status is ClaimPublicationStatus.PUBLISHED:
+            if self._claim_publication_matches_receipt(record, validated):
+                return self._publication_terminal_read(record)
+            return self._publication_conflict_decision(
+                connection, record, reason_code="published_receipt_conflict", now=current
+            )
+        if record.status is ClaimPublicationStatus.ABORTED:
+            return self._publication_conflict_decision(
+                connection,
+                record,
+                reason_code="terminal_status_immutable",
+                now=current,
+                error_type=InvalidClaimPublicationTransitionError,
+            )
+        if record.status is not ClaimPublicationStatus.READY_TO_PUBLISH:
+            return self._publication_conflict_decision(
+                connection,
+                record,
+                reason_code="transition_not_allowed",
+                now=current,
+                error_type=InvalidClaimPublicationTransitionError,
+            )
+        if validated_ready_claim is None:
+            raise RuntimeError("finalizer publish validation was not completed")
+        self._validate_claim_publication_shard_binding(connection, identity, now=current)
+        values = self._publication_values(record)
+        values.update(
+            {
+                **validated.model_dump(mode="python"),
+                "status": ClaimPublicationStatus.PUBLISHED,
+                "version": 3,
+                "updated_at": current,
+                "published_at": current,
+            }
+        )
+        updated = _claim_publication_record_from_values(values)
+        certificate_bytes, attestation_bytes = self._build_finalizer_attestation(
+            connection,
+            authority=authority,
+            record=updated,
+            now=current,
+        )
+        decision = self._update_claim_publication_in_transaction(
+            connection,
+            record,
+            updated,
+            reason_code="finalizer_ready_to_published",
+            now=current,
+        )
+        self._persist_finalizer_attestation(
+            connection,
+            record=updated,
+            certificate_bytes=certificate_bytes,
+            attestation_bytes=attestation_bytes,
+            now=current,
+        )
+        self._insert_claim_publication_rollout_evidence_in_transaction(
+            connection,
+            record=updated,
+            authority=authority,
+            now=current,
+        )
+        return decision
+
+    def finalizer_publish_claim_publication(
+        self,
+        identity: LabClaimPublicationIdentity,
+        spool_receipt: PublishReceipt,
+        *,
+        current_claim_authority: CurrentClaimAuthorityProtocol,
+        keyring: VerifyOnlyEd25519Keyring,
+        audience: str,
+        spool_receipt_verifier: LabClaimSpoolReceiptVerifier,
+        authority: LabClaimPublicationFinalizerAuthority,
+        now: datetime,
+    ) -> LabClaimPublicationMutation:
+        """CAS D after an externally verified typed receipt has become durable."""
+
+        if type(authority) is not LabClaimPublicationFinalizerAuthority:
+            raise ClaimPublicationConflictError("finalizer_authority_conflict")
+        validated_identity = LabClaimPublicationIdentity.model_validate(identity.model_dump())
+        validated_receipt = PublishReceipt.model_validate(spool_receipt.model_dump())
+        current = _utc(now)
+        phase_one_record = self._read_claim_publication_for_external_validation(validated_identity)
+        validated_ready_claim: LabShardClaimV2 | None = None
+        if phase_one_record.status is ClaimPublicationStatus.READY_TO_PUBLISH:
+            if authority._trust_verifier is None:
+                raise ClaimPublicationConflictError("finalizer_external_trust_invalid")
+            self.validate_finalizer_ready_attestation(
+                validated_identity,
+                trust_verifier=authority._trust_verifier,
+                now=current,
+            )
+            validated_ready_claim = self.validate_ready_claim_for_publication(
+                validated_identity,
+                current_claim_authority=current_claim_authority,
+                keyring=keyring,
+                audience=audience,
+                now=current,
+            )
+            require_v2_spool_receipt_provenance(
+                validated_receipt,
+                final_claim=validated_ready_claim,
+                verifier=spool_receipt_verifier,
+            )
+        elif phase_one_record.status is ClaimPublicationStatus.PUBLISHED:
+            final_claim = strict_model_validate_canonical_json(
+                LabShardClaimV2,
+                phase_one_record.final_claim_bytes or b"",
+            )
+            require_v2_spool_receipt_provenance(
+                validated_receipt,
+                final_claim=final_claim,
+                verifier=spool_receipt_verifier,
+            )
+        if phase_one_record.status is ClaimPublicationStatus.READY_TO_PUBLISH:
+            stored_plan = strict_model_validate_canonical_json(
+                SourceUsePlanV2,
+                phase_one_record.source_use_plan_bytes or b"",
+            )
+            with (
+                hold_trusted_current_claim(
+                    current_claim_authority,
+                    binding=CurrentClaimConsumptionBindingV2.from_plan(stored_plan),
+                    now=current,
+                ),
+                self._transaction() as connection,
+            ):
+                decision = self._finalizer_publish_claim_publication_in_transaction(
+                    connection,
+                    validated_identity,
+                    validated_receipt,
+                    expected=phase_one_record,
+                    validated_ready_claim=validated_ready_claim,
+                    authority=authority,
+                    now=current,
+                )
+        else:
+            with self._transaction() as connection:
+                decision = self._finalizer_publish_claim_publication_in_transaction(
+                    connection,
+                    validated_identity,
+                    validated_receipt,
+                    expected=phase_one_record,
+                    validated_ready_claim=validated_ready_claim,
+                    authority=authority,
+                    now=current,
+                )
+        return decision.resolved()
+
+    def _insert_claim_publication_finalizer_observation(
+        self,
+        connection: sqlite3.Connection,
+        identity: LabClaimPublicationIdentity,
+        *,
+        authority: LabClaimPublicationFinalizerAuthority,
+        observation_fencing_token: int,
+        event_type: Literal["ready", "published", "replayed", "blocked"],
+        reason_code: str,
+        now: datetime,
+    ) -> None:
+        record = self._load_claim_publication_for_finalizer_mutation(
+            connection,
+            identity,
+            authority=authority,
+            now=now,
+        )
+        observation_ref = uuid5(
+            NAMESPACE_URL,
+            "|".join(
+                (
+                    "rquant-claim-publication-finalizer-observation/v1",
+                    str(identity.attempt_id),
+                    str(observation_fencing_token),
+                    event_type,
+                    reason_code,
+                    record.record_commitment,
+                )
+            ),
+        )
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO lab_claim_publication_finalizer_observation (
+                observation_ref, attempt_id, authority_fencing_token, event_type,
+                reason_code, record_commitment, observed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(observation_ref),
+                str(identity.attempt_id),
+                observation_fencing_token,
+                event_type,
+                reason_code,
+                record.record_commitment,
+                _dump_time(now),
+            ),
+        )
+
+    def finalizer_record_claim_publication_observation(
+        self,
+        identity: LabClaimPublicationIdentity,
+        *,
+        authority: LabClaimPublicationFinalizerAuthority,
+        event_type: Literal["ready", "published", "replayed", "blocked"],
+        reason_code: str,
+        now: datetime,
+    ) -> None:
+        """Persist redacted finalizer progress without recording payload bytes."""
+
+        if type(authority) is not LabClaimPublicationFinalizerAuthority:
+            raise ClaimPublicationConflictError("finalizer_authority_conflict")
+        if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", reason_code):
+            raise ValueError("finalizer observation reason is invalid")
+        current = _utc(now)
+        validated = LabClaimPublicationIdentity.model_validate(identity.model_dump())
+        with self._transaction() as connection:
+            self._insert_claim_publication_finalizer_observation(
+                connection,
+                validated,
+                authority=authority,
+                observation_fencing_token=authority.fencing_token,
+                event_type=event_type,
+                reason_code=reason_code,
+                now=current,
+            )
+
+    def finalizer_record_claim_publication_observation_degradation(
+        self,
+        identity: LabClaimPublicationIdentity,
+        *,
+        authority: LabClaimPublicationFinalizerAuthority,
+        event_type: Literal["ready", "published", "replayed", "blocked"],
+        reason_code: str,
+        error_class: str,
+        next_retry_at: datetime,
+        now: datetime,
+    ) -> None:
+        """Persist bounded, redacted retry metadata on a separate transaction."""
+
+        if type(authority) is not LabClaimPublicationFinalizerAuthority:
+            raise ClaimPublicationConflictError("finalizer_authority_conflict")
+        if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", reason_code):
+            raise ValueError("finalizer degradation reason is invalid")
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,127}", error_class):
+            raise ValueError("finalizer degradation error class is invalid")
+        current = _utc(now)
+        retry_at = _utc(next_retry_at)
+        if retry_at < current:
+            raise ValueError("finalizer degradation retry time is invalid")
+        validated = LabClaimPublicationIdentity.model_validate(identity.model_dump())
+        identity_hash = hashlib.sha256(canonical_model_json_bytes(validated)).hexdigest()
+        reason_hash = hashlib.sha256(reason_code.encode("ascii")).hexdigest()
+        degradation_ref = uuid5(
+            NAMESPACE_URL,
+            "|".join(
+                (
+                    "rquant-claim-publication-finalizer-observation-degradation/v1",
+                    str(validated.attempt_id),
+                    identity_hash,
+                    str(authority.fencing_token),
+                    event_type,
+                    reason_hash,
+                    error_class,
+                )
+            ),
+        )
+        with self._transaction() as connection:
+            self._load_claim_publication_for_finalizer_mutation(
+                connection,
+                validated,
+                authority=authority,
+                now=current,
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO lab_claim_publication_finalizer_observation_degradation (
+                    degradation_ref, attempt_id, publication_identity_hash,
+                    authority_fencing_token, event_type, reason_code, reason_code_hash,
+                    error_class, next_retry_at, created_at, drained_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    str(degradation_ref),
+                    str(validated.attempt_id),
+                    identity_hash,
+                    authority.fencing_token,
+                    event_type,
+                    reason_code,
+                    reason_hash,
+                    error_class,
+                    _dump_time(retry_at),
+                    _dump_time(current),
+                ),
+            )
+
+    def _claim_publication_rollout_evidence_item_from_row(
+        self,
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+    ) -> LabClaimPublicationRolloutEvidenceOutboxItem:
+        reason_code = str(row["reason_code"])
+        if (
+            reason_code != _ROLLOUT_EVIDENCE_REASON_CODE
+            or str(row["reason_code_hash"]) != _ROLLOUT_EVIDENCE_REASON_HASH
+            or str(row["event_type"]) != "published"
+        ):
+            raise ClaimPublicationConflictError("rollout_evidence_outbox_binding_invalid")
+        error_class = str(row["error_class"])
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,127}", error_class):
+            raise ClaimPublicationConflictError("rollout_evidence_outbox_binding_invalid")
+        attempt_id = _canonical_uuid_text(row["attempt_id"], field="rollout_evidence.attempt_id")
+        publication_row = connection.execute(
+            "SELECT * FROM lab_claim_publication WHERE attempt_id = ?",
+            (str(attempt_id),),
+        ).fetchone()
+        if publication_row is None:
+            raise ClaimPublicationConflictError("rollout_evidence_publication_missing")
+        record = _claim_publication_record_from_row(publication_row)
+        evidence = LabClaimPublicationRolloutEvidence.from_record(record)
+        if evidence.evidence_hash != str(row["publication_identity_hash"]):
+            raise ClaimPublicationConflictError("rollout_evidence_outbox_binding_invalid")
+        attestation_row = connection.execute(
+            """
+            SELECT certificate_bytes, certificate_hash, attestation_bytes, attestation_hash
+            FROM lab_claim_publication_finalizer_attestation
+            WHERE attempt_id = ? AND publication_status = 'PUBLISHED'
+            """,
+            (str(attempt_id),),
+        ).fetchone()
+        if attestation_row is None:
+            raise ClaimPublicationConflictError("rollout_evidence_attestation_missing")
+        certificate_bytes = _strict_sqlite_blob(
+            attestation_row["certificate_bytes"],
+            field="rollout_evidence.certificate_bytes",
+        )
+        attestation_bytes = _strict_sqlite_blob(
+            attestation_row["attestation_bytes"],
+            field="rollout_evidence.attestation_bytes",
+        )
+        if hashlib.sha256(certificate_bytes).hexdigest() != str(
+            attestation_row["certificate_hash"]
+        ) or hashlib.sha256(attestation_bytes).hexdigest() != str(
+            attestation_row["attestation_hash"]
+        ):
+            raise ClaimPublicationConflictError("rollout_evidence_attestation_invalid")
+        return LabClaimPublicationRolloutEvidenceOutboxItem(
+            degradation_ref=_canonical_uuid_text(
+                row["degradation_ref"], field="rollout_evidence.degradation_ref"
+            ),
+            evidence=evidence,
+            record=record,
+            authority_fencing_token=_strict_sqlite_int(
+                row["authority_fencing_token"],
+                field="rollout_evidence.authority_fencing_token",
+                minimum=1,
+            ),
+            next_retry_at=_load_time(str(row["next_retry_at"])),
+            created_at=_load_time(str(row["created_at"])),
+        )
+
+    def list_due_claim_publication_rollout_evidence(
+        self,
+        *,
+        authority: LabClaimPublicationFinalizerAuthority,
+        now: datetime,
+        limit: int = 32,
+    ) -> tuple[LabClaimPublicationRolloutEvidenceOutboxItem, ...]:
+        """Return one authority-fenced bounded batch without trusting retry metadata."""
+
+        if type(authority) is not LabClaimPublicationFinalizerAuthority:
+            raise ClaimPublicationConflictError("finalizer_authority_conflict")
+        if not 1 <= limit <= 100:
+            raise ValueError("rollout evidence drain limit must be between 1 and 100")
+        current = _utc(now)
+        with self._transaction() as connection:
+            self._require_claim_publication_finalizer_authority(connection, authority, now=current)
+            rows = connection.execute(
+                """
+                SELECT * FROM lab_claim_publication_finalizer_observation_degradation
+                WHERE drained_at IS NULL AND next_retry_at <= ? AND reason_code = ?
+                ORDER BY next_retry_at, created_at, degradation_ref
+                LIMIT ?
+                """,
+                (_dump_time(current), _ROLLOUT_EVIDENCE_REASON_CODE, limit),
+            ).fetchall()
+            return tuple(
+                self._claim_publication_rollout_evidence_item_from_row(connection, row)
+                for row in rows
+            )
+
+    def finalizer_ack_claim_publication_rollout_evidence(
+        self,
+        item: LabClaimPublicationRolloutEvidenceOutboxItem,
+        *,
+        authority: LabClaimPublicationFinalizerAuthority,
+        now: datetime,
+    ) -> None:
+        """Acknowledge only the exact row whose external rollout insert succeeded."""
+
+        validated = LabClaimPublicationRolloutEvidenceOutboxItem.model_validate(item)
+        current = _utc(now)
+        with self._transaction() as connection:
+            self._require_claim_publication_finalizer_authority(connection, authority, now=current)
+            row = connection.execute(
+                """
+                SELECT * FROM lab_claim_publication_finalizer_observation_degradation
+                WHERE degradation_ref = ?
+                """,
+                (str(validated.degradation_ref),),
+            ).fetchone()
+            if row is None:
+                raise ClaimPublicationConflictError("rollout_evidence_outbox_missing")
+            current_item = self._claim_publication_rollout_evidence_item_from_row(connection, row)
+            if current_item != validated:
+                raise ClaimPublicationConflictError("rollout_evidence_outbox_binding_invalid")
+            if row["drained_at"] is None:
+                changed = connection.execute(
+                    """
+                    UPDATE lab_claim_publication_finalizer_observation_degradation
+                    SET drained_at = ?
+                    WHERE degradation_ref = ? AND drained_at IS NULL
+                    """,
+                    (_dump_time(current), str(validated.degradation_ref)),
+                ).rowcount
+                if changed != 1:
+                    raise ClaimPublicationConflictError("rollout_evidence_ack_conflict")
+
+    def finalizer_defer_claim_publication_rollout_evidence(
+        self,
+        item: LabClaimPublicationRolloutEvidenceOutboxItem,
+        *,
+        authority: LabClaimPublicationFinalizerAuthority,
+        error_class: str,
+        next_retry_at: datetime,
+        now: datetime,
+    ) -> None:
+        """Retain a redacted recorder outage for a later exact replay."""
+
+        validated = LabClaimPublicationRolloutEvidenceOutboxItem.model_validate(item)
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,127}", error_class):
+            raise ValueError("rollout evidence error class is invalid")
+        current = _utc(now)
+        retry_at = _utc(next_retry_at)
+        if retry_at <= current:
+            raise ValueError("rollout evidence retry time is invalid")
+        with self._transaction() as connection:
+            self._require_claim_publication_finalizer_authority(connection, authority, now=current)
+            row = connection.execute(
+                """
+                SELECT * FROM lab_claim_publication_finalizer_observation_degradation
+                WHERE degradation_ref = ? AND drained_at IS NULL
+                """,
+                (str(validated.degradation_ref),),
+            ).fetchone()
+            if row is None:
+                raise ClaimPublicationConflictError("rollout_evidence_outbox_missing")
+            current_item = self._claim_publication_rollout_evidence_item_from_row(connection, row)
+            if current_item != validated:
+                raise ClaimPublicationConflictError("rollout_evidence_outbox_binding_invalid")
+            changed = connection.execute(
+                """
+                UPDATE lab_claim_publication_finalizer_observation_degradation
+                SET error_class = ?, next_retry_at = ?
+                WHERE degradation_ref = ? AND drained_at IS NULL
+                """,
+                (error_class, _dump_time(retry_at), str(validated.degradation_ref)),
+            ).rowcount
+            if changed != 1:
+                raise ClaimPublicationConflictError("rollout_evidence_defer_conflict")
+
+    def count_pending_claim_publication_rollout_evidence(self) -> int:
+        with self._read_transaction() as connection:
+            return int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM lab_claim_publication_finalizer_observation_degradation
+                    WHERE drained_at IS NULL AND reason_code = ?
+                    """,
+                    (_ROLLOUT_EVIDENCE_REASON_CODE,),
+                ).fetchone()[0]
+            )
+
+    def count_pending_claim_publication_observation_degradations(self) -> int:
+        with self._read_transaction() as connection:
+            return int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM lab_claim_publication_finalizer_observation_degradation
+                    WHERE drained_at IS NULL AND reason_code <> ?
+                    """,
+                    (_ROLLOUT_EVIDENCE_REASON_CODE,),
+                ).fetchone()[0]
+            )
+
+    def count_nonterminal_claim_publications(self) -> int:
+        with self._read_transaction() as connection:
+            return int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM lab_claim_publication
+                    WHERE status NOT IN ('PUBLISHED', 'ABORTED')
+                    """
+                ).fetchone()[0]
+            )
+
+    def list_reconciled_claim_publication_rollout_evidence(
+        self,
+    ) -> tuple[LabClaimPublicationRolloutEvidence, ...]:
+        """Require one drained local outbox row for every durable PUBLISHED record."""
+
+        with self._read_transaction() as connection:
+            publication_rows = connection.execute(
+                """
+                SELECT * FROM lab_claim_publication
+                WHERE status = 'PUBLISHED'
+                ORDER BY attempt_id
+                """
+            ).fetchall()
+            evidence: list[LabClaimPublicationRolloutEvidence] = []
+            for publication_row in publication_rows:
+                record = _claim_publication_record_from_row(publication_row)
+                outbox_rows = connection.execute(
+                    """
+                    SELECT * FROM lab_claim_publication_finalizer_observation_degradation
+                    WHERE attempt_id = ? AND reason_code = ?
+                    ORDER BY degradation_ref
+                    """,
+                    (str(record.identity.attempt_id), _ROLLOUT_EVIDENCE_REASON_CODE),
+                ).fetchall()
+                if len(outbox_rows) != 1 or outbox_rows[0]["drained_at"] is None:
+                    raise ClaimPublicationConflictError("rollout_evidence_reconciliation_gap")
+                item = self._claim_publication_rollout_evidence_item_from_row(
+                    connection, outbox_rows[0]
+                )
+                evidence.append(item.evidence)
+            return tuple(evidence)
+
+    def list_claim_publication_finalizer_observation_degradations(
+        self,
+        attempt_id: UUID,
+    ) -> tuple[LabClaimPublicationObservationDegradation, ...]:
+        with self._read_transaction() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM lab_claim_publication_finalizer_observation_degradation
+                WHERE attempt_id = ? AND drained_at IS NULL AND reason_code <> ?
+                ORDER BY created_at, degradation_ref
+                """,
+                (str(attempt_id), _ROLLOUT_EVIDENCE_REASON_CODE),
+            ).fetchall()
+        return tuple(
+            LabClaimPublicationObservationDegradation(
+                degradation_ref=UUID(str(row["degradation_ref"])),
+                attempt_id=UUID(str(row["attempt_id"])),
+                publication_identity_hash=str(row["publication_identity_hash"]),
+                authority_fencing_token=_strict_sqlite_int(
+                    row["authority_fencing_token"],
+                    field="finalizer_degradation.authority_fencing_token",
+                    minimum=1,
+                ),
+                event_type=str(row["event_type"]),
+                reason_code=str(row["reason_code"]),
+                reason_code_hash=str(row["reason_code_hash"]),
+                error_class=str(row["error_class"]),
+                next_retry_at=_load_time(str(row["next_retry_at"])),
+                created_at=_load_time(str(row["created_at"])),
+            )
+            for row in rows
+        )
+
+    def finalizer_drain_claim_publication_observation_degradations(
+        self,
+        *,
+        authority: LabClaimPublicationFinalizerAuthority,
+        now: datetime,
+        limit: int = 32,
+    ) -> int:
+        """Retry one bounded due batch and mark each exact row drained atomically."""
+
+        if type(authority) is not LabClaimPublicationFinalizerAuthority:
+            raise ClaimPublicationConflictError("finalizer_authority_conflict")
+        if not 1 <= limit <= 100:
+            raise ValueError("finalizer degradation drain limit must be between 1 and 100")
+        current = _utc(now)
+        drained = 0
+        with self._transaction() as connection:
+            self._require_claim_publication_finalizer_authority(
+                connection,
+                authority,
+                now=current,
+            )
+            rows = connection.execute(
+                """
+                SELECT * FROM lab_claim_publication_finalizer_observation_degradation
+                WHERE drained_at IS NULL AND next_retry_at <= ? AND reason_code <> ?
+                ORDER BY next_retry_at, created_at, degradation_ref
+                LIMIT ?
+                """,
+                (_dump_time(current), _ROLLOUT_EVIDENCE_REASON_CODE, limit),
+            ).fetchall()
+            for row in rows:
+                attempt_id = UUID(str(row["attempt_id"]))
+                publication_row = connection.execute(
+                    "SELECT * FROM lab_claim_publication WHERE attempt_id = ?",
+                    (str(attempt_id),),
+                ).fetchone()
+                if publication_row is None:
+                    raise ClaimPublicationConflictError("attempt_identity_conflict")
+                record = _claim_publication_record_from_row(publication_row)
+                identity_hash = hashlib.sha256(
+                    canonical_model_json_bytes(record.identity)
+                ).hexdigest()
+                reason_code = str(row["reason_code"])
+                if identity_hash != str(row["publication_identity_hash"]) or hashlib.sha256(
+                    reason_code.encode("ascii")
+                ).hexdigest() != str(row["reason_code_hash"]):
+                    raise ClaimPublicationConflictError("finalizer_degradation_binding_invalid")
+                self._insert_claim_publication_finalizer_observation(
+                    connection,
+                    record.identity,
+                    authority=authority,
+                    observation_fencing_token=_strict_sqlite_int(
+                        row["authority_fencing_token"],
+                        field="finalizer_degradation.authority_fencing_token",
+                        minimum=1,
+                    ),
+                    event_type=str(row["event_type"]),  # type: ignore[arg-type]
+                    reason_code=reason_code,
+                    now=current,
+                )
+                drained += connection.execute(
+                    """
+                    UPDATE lab_claim_publication_finalizer_observation_degradation
+                    SET drained_at = ?
+                    WHERE degradation_ref = ? AND drained_at IS NULL
+                    """,
+                    (_dump_time(current), str(row["degradation_ref"])),
+                ).rowcount
+        return drained
+
+    def list_claim_publication_finalizer_observations(
+        self,
+        attempt_id: UUID,
+    ) -> tuple[tuple[str, str, str, int], ...]:
+        """Return only redacted observation fields for operators and tests."""
+
+        with self._read_transaction() as connection:
+            rows = connection.execute(
+                """
+                SELECT event_type, reason_code, record_commitment, authority_fencing_token
+                FROM lab_claim_publication_finalizer_observation
+                WHERE attempt_id = ?
+                ORDER BY observed_at, observation_ref
+                """,
+                (str(attempt_id),),
+            ).fetchall()
+        return tuple(
+            (
+                str(row["event_type"]),
+                str(row["reason_code"]),
+                str(row["record_commitment"]),
+                _strict_sqlite_int(
+                    row["authority_fencing_token"],
+                    field="lab_claim_publication_finalizer_observation.authority_fencing_token",
+                    minimum=1,
+                ),
+            )
+            for row in rows
+        )
+
+    def _abort_claim_publication_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        identity: LabClaimPublicationIdentity,
+        *,
+        terminal_reason: str,
+        lease: LabLeaseRecord,
+        now: datetime,
+    ) -> _ClaimPublicationDecision:
+        if not connection.in_transaction:
+            raise RuntimeError("claim publication abort requires an active transaction")
+        if re.fullmatch(r"[a-z][a-z0-9_]{0,63}", terminal_reason) is None:
+            raise ValueError("terminal_reason must be a stable code")
+        current = _utc(now)
+        record = self._load_claim_publication_for_mutation(
+            connection, identity, lease=lease, now=current
+        )
+        if record.status is ClaimPublicationStatus.ABORTED:
+            if record.terminal_reason == terminal_reason:
+                return self._publication_replay(
+                    connection, record, reason_code="aborted_replay", now=current
+                )
+            return self._publication_conflict_decision(
+                connection, record, reason_code="terminal_reason_conflict", now=current
+            )
+        if record.status is ClaimPublicationStatus.PUBLISHED:
+            return self._publication_conflict_decision(
+                connection,
+                record,
+                reason_code="terminal_status_immutable",
+                now=current,
+                error_type=InvalidClaimPublicationTransitionError,
+            )
+        values = self._publication_values(record)
+        values.update(
+            {
+                "status": ClaimPublicationStatus.ABORTED,
+                "version": record.version + 1,
+                "updated_at": current,
+                "aborted_at": current,
+                "terminal_reason": terminal_reason,
+            }
+        )
+        return self._update_claim_publication_in_transaction(
+            connection,
+            record,
+            _claim_publication_record_from_values(values),
+            reason_code=f"{record.status.value.lower()}_to_aborted",
+            now=current,
+        )
+
+    def abort_claim_publication(
+        self,
+        identity: LabClaimPublicationIdentity,
+        *,
+        terminal_reason: str,
+        lease: LabLeaseRecord,
+        now: datetime,
+    ) -> LabClaimPublicationMutation:
+        validated_identity = LabClaimPublicationIdentity.model_validate(identity.model_dump())
+        with self._transaction() as connection:
+            decision = self._abort_claim_publication_in_transaction(
+                connection,
+                validated_identity,
+                terminal_reason=terminal_reason,
+                lease=lease,
+                now=now,
+            )
+        return decision.resolved()
+
+    def get_claim_publication(
+        self,
+        attempt_id: UUID,
+    ) -> LabClaimPublicationRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM lab_claim_publication WHERE attempt_id = ?",
+                (str(attempt_id),),
+            ).fetchone()
+        return _claim_publication_record_from_row(row) if row is not None else None
+
+    def list_claim_publication_audit(
+        self,
+        attempt_id: UUID,
+    ) -> tuple[LabClaimPublicationAuditRecord, ...]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM lab_claim_publication_audit
+                WHERE attempt_id = ?
+                ORDER BY occurred_at, audit_ref
+                """,
+                (str(attempt_id),),
+            ).fetchall()
+        return tuple(_claim_publication_audit_from_row(row) for row in rows)
+
+    def _list_claim_publications_by_deadline(
+        self,
+        *,
+        statuses: tuple[ClaimPublicationStatus, ...],
+        deadline_column: Literal["source_wait_deadline", "publication_deadline"],
+        now: datetime,
+        limit: int,
+    ) -> tuple[LabClaimPublicationRecord, ...]:
+        if not 1 <= limit <= 500:
+            raise ValueError("limit must be between 1 and 500")
+        if not statuses:
+            raise ValueError("at least one claim publication status is required")
+        current = _utc(now)
+        placeholders = ", ".join("?" for _ in statuses)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT * FROM lab_claim_publication
+                WHERE status IN ({placeholders}) AND {deadline_column} <= ?
+                ORDER BY {deadline_column}, attempt_id
+                LIMIT ?
+                """,
+                (*tuple(status.value for status in statuses), _dump_time(current), limit),
+            ).fetchall()
+        return tuple(_claim_publication_record_from_row(row) for row in rows)
+
+    def list_expired_source_claim_publications(
+        self,
+        *,
+        now: datetime,
+        limit: int = 100,
+    ) -> tuple[LabClaimPublicationRecord, ...]:
+        return self._list_claim_publications_by_deadline(
+            statuses=(
+                ClaimPublicationStatus.HELD_SOURCE,
+                ClaimPublicationStatus.SOURCE_QUEUED,
+            ),
+            deadline_column="source_wait_deadline",
+            now=now,
+            limit=limit,
+        )
+
+    def list_expired_held_claim_publications(
+        self,
+        *,
+        now: datetime,
+        limit: int = 100,
+    ) -> tuple[LabClaimPublicationRecord, ...]:
+        return self.list_expired_source_claim_publications(now=now, limit=limit)
+
+    def list_claim_publication_reconcile_candidates(
+        self,
+        *,
+        now: datetime,
+        limit: int = 100,
+    ) -> tuple[LabClaimPublicationRecord, ...]:
+        return self._list_claim_publications_by_deadline(
+            statuses=(ClaimPublicationStatus.READY_TO_PUBLISH,),
+            deadline_column="publication_deadline",
+            now=now,
+            limit=limit,
+        )
+
+    def list_claim_publication_finalizer_candidates(
+        self,
+        *,
+        limit: int = 32,
+    ) -> tuple[LabClaimPublicationRecord, ...]:
+        """Return one bounded C/D candidate batch for the authority-owned daemon."""
+
+        if not 1 <= limit <= 100:
+            raise ValueError("claim finalizer candidate limit must be between 1 and 100")
+        with self._read_transaction() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM lab_claim_publication
+                WHERE status IN ('SOURCE_QUEUED', 'READY_TO_PUBLISH')
+                ORDER BY CASE status WHEN 'READY_TO_PUBLISH' THEN 0 ELSE 1 END,
+                         updated_at, attempt_id
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return tuple(_claim_publication_record_from_row(row) for row in rows)
+
+    def list_v2_reconciliation_candidates(
+        self,
+        *,
+        now: datetime,
+        limit: int = 100,
+    ) -> tuple[LabClaimPublicationRecord, ...]:
+        """Return a bounded, index-backed cross-stage V2 recovery batch.
+
+        The two publication deadline indexes have different clocks, so each
+        status is read through its matching index and the small merged batch is
+        ordered in memory.  This deliberately avoids a full-ledger scan.
+        """
+
+        if not 1 <= limit <= 500:
+            raise ValueError("limit must be between 1 and 500")
+        _utc(now)
+        candidates: dict[UUID, LabClaimPublicationRecord] = {}
+        for status, deadline_column in (
+            (ClaimPublicationStatus.HELD_SOURCE, "source_wait_deadline"),
+            (ClaimPublicationStatus.SOURCE_QUEUED, "source_wait_deadline"),
+            (ClaimPublicationStatus.READY_TO_PUBLISH, "publication_deadline"),
+        ):
+            with self._connect() as connection:
+                rows = connection.execute(
+                    f"""
+                    SELECT * FROM lab_claim_publication
+                    WHERE status = ?
+                    ORDER BY {deadline_column}, attempt_id
+                    LIMIT ?
+                    """,
+                    (status.value, limit),
+                ).fetchall()
+            records = tuple(_claim_publication_record_from_row(row) for row in rows)
+            candidates.update({record.identity.attempt_id: record for record in records})
+        ordered = sorted(
+            candidates.values(),
+            key=lambda record: (
+                record.updated_at,
+                record.identity.attempt_id.hex,
+            ),
+        )
+        return tuple(ordered[:limit])
+
     def recover_stale_shards(
         self,
         lease: LabLeaseRecord,
@@ -7901,6 +13391,456 @@ class LabJobStore:
             )
         return tuple(sorted(recovered, key=str))
 
+    def _claim_preclaim_candidate_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        row: sqlite3.Row,
+        job_id: UUID,
+        job_created_at: datetime,
+        job_row: sqlite3.Row,
+        worker: str,
+        shard_lease_seconds: int,
+        lease: LabLeaseRecord,
+        now: datetime,
+        source_stage_store: LabSourceStageStore | None,
+        source_wait_deadline: datetime | None,
+        publication_deadline: datetime | None,
+        v2_precondition: Callable[[StrategyShardPayloadV2, LabShardClaimV2, datetime], None] | None,
+        prevalidated_v2: frozenset[tuple[UUID, UUID, str, int, int, str, int, str]] | None,
+        use_fair_cursor: bool,
+    ) -> LabShardClaim | LabShardClaimV2 | LabPreclaimRejection | None:
+        definition = self._definition_from_shard_row(row)
+        spec_hash = str(job_row["spec_hash"])
+        payload = self._external_payload_v2(definition.payload_json)
+        prospective_claim: LabShardClaimV2 | None = None
+        source_deadline: datetime | None = None
+        publish_deadline: datetime | None = None
+        shard_version = _strict_sqlite_int(row["version"], field="lab_shard.version", minimum=0)
+        generation = (
+            _strict_sqlite_int(
+                row["claim_generation"],
+                field="lab_shard.claim_generation",
+                minimum=0,
+            )
+            + 1
+        )
+        attempt_count = (
+            _strict_sqlite_int(row["attempt_count"], field="lab_shard.attempt_count", minimum=0) + 1
+        )
+        claim_token = uuid4()
+        expires_at = now + timedelta(seconds=shard_lease_seconds)
+        if payload is not None:
+            if prevalidated_v2 is not None:
+                snapshot_identity = (
+                    job_id,
+                    definition.shard_id,
+                    definition.payload_hash,
+                    shard_version,
+                    attempt_count - 1,
+                    spec_hash,
+                    generation,
+                    worker,
+                )
+                if snapshot_identity not in prevalidated_v2:
+                    return LabPreclaimRejection(
+                        job_id=job_id,
+                        shard_id=definition.shard_id,
+                        payload_hash=definition.payload_hash,
+                        reason="source_preclaim_rejected",
+                    )
+            if type(source_stage_store) is not LabSourceStageStore:
+                raise ValueError("v2 claim requires an exact source_stage_store")
+            if source_wait_deadline is None or publication_deadline is None:
+                raise ValueError("v2 claim requires explicit source and publication deadlines")
+            source_deadline = _utc(source_wait_deadline)
+            publish_deadline = _utc(publication_deadline)
+            if source_deadline <= now:
+                raise ValueError("source_wait_deadline must be after claim time")
+            if publish_deadline < source_deadline:
+                raise ValueError("source_wait_deadline must not exceed publication_deadline")
+            if publish_deadline > expires_at:
+                raise ValueError("publication_deadline must not exceed shard lease expiry")
+            prospective_claim = LabShardClaimV2.from_current_attempt(
+                definition=definition,
+                attempt_binding=SourceAttemptBindingV2(
+                    job_id=job_id,
+                    spec_hash=spec_hash,
+                    shard_id=definition.shard_id,
+                    attempt_id=claim_token,
+                    claim_generation=generation,
+                    scheduler_fencing_token=lease.fencing_token,
+                    worker_id=worker,
+                ),
+                claimed_at=now,
+                lease_expires_at=expires_at,
+            )
+            if v2_precondition is not None:
+                try:
+                    v2_precondition(payload, prospective_claim, now)
+                except (SourceOperationContractError, ValueError):
+                    return LabPreclaimRejection(
+                        job_id=job_id,
+                        shard_id=definition.shard_id,
+                        payload_hash=definition.payload_hash,
+                        reason="source_preclaim_rejected",
+                    )
+        job_status = JobStatus(str(job_row["status"]))
+        if job_status is JobStatus.QUEUED:
+            self._transition_in_transaction(
+                connection,
+                job_row,
+                target_status=JobStatus.RUNNING,
+                lease=lease,
+                reason="first shard claimed",
+                now=now,
+                request_id=None,
+                recoverable=None,
+                event_type="job_started",
+            )
+        else:
+            self._adopt_running_job_fence(
+                connection,
+                job_row,
+                lease=lease,
+                now=now,
+            )
+        cursor = connection.execute(
+            """
+            UPDATE lab_shard
+            SET status = ?, version = ?, attempt_count = ?, worker_id = ?,
+                scheduler_fencing_token = ?, claim_token = ?,
+                claim_generation = ?, claimed_at = ?, heartbeat_at = ?,
+                lease_expires_at = ?, result_manifest_hash = NULL,
+                failure_json = NULL, finished_at = NULL, updated_at = ?
+            WHERE job_id = ? AND shard_id = ? AND version = ? AND status = ?
+            """,
+            (
+                ShardStatus.RUNNING.value,
+                shard_version + 1,
+                attempt_count,
+                worker,
+                lease.fencing_token,
+                str(claim_token),
+                generation,
+                _dump_time(now),
+                _dump_time(now),
+                _dump_time(expires_at),
+                _dump_time(now),
+                str(row["job_id"]),
+                str(row["shard_id"]),
+                shard_version,
+                ShardStatus.QUEUED.value,
+            ),
+        )
+        if cursor.rowcount != 1:
+            return None
+        self._store_preclaim_cursor(
+            connection,
+            job_created_at=job_created_at,
+            job_id=job_id,
+            shard_index=_strict_sqlite_int(
+                row["shard_index"],
+                field="lab_shard.shard_index",
+                minimum=0,
+            ),
+            shard_id=_canonical_uuid_text(row["shard_id"], field="lab_shard.shard_id"),
+            now=now,
+            use_fair_cursor=use_fair_cursor,
+        )
+        if payload is None:
+            return LabShardClaim(
+                job_id=job_id,
+                spec_hash=spec_hash,
+                definition=definition,
+                worker_id=worker,
+                claim_token=claim_token,
+                claim_generation=generation,
+                scheduler_fencing_token=lease.fencing_token,
+                claimed_at=now,
+                lease_expires_at=expires_at,
+            )
+        assert source_deadline is not None and publish_deadline is not None
+        assert prospective_claim is not None
+        source_stage_authority = LabSourceStageStoreAuthority.model_validate(
+            source_stage_store.authority.model_dump()
+        )
+        preimage_bytes = canonical_model_json_bytes(prospective_claim)
+        self._create_held_claim_publication_in_transaction(
+            connection,
+            HeldDraft(
+                identity=LabClaimPublicationIdentity.from_claim(prospective_claim),
+                claim_preimage_bytes=preimage_bytes,
+                claim_preimage_hash=hashlib.sha256(preimage_bytes).hexdigest(),
+                source_wait_deadline=source_deadline,
+                publication_deadline=publish_deadline,
+            ),
+            source_stage_authority=source_stage_authority,
+            lease=lease,
+            now=now,
+        ).resolved()
+        return prospective_claim
+
+    def _prevalidate_v2_preclaim_candidates(
+        self,
+        *,
+        worker: str,
+        shard_lease_seconds: int,
+        lease: LabLeaseRecord,
+        now: datetime,
+        source_wait_deadline: datetime | None,
+        publication_deadline: datetime | None,
+        v2_precondition: Callable[[StrategyShardPayloadV2, LabShardClaimV2, datetime], None],
+    ) -> frozenset[tuple[UUID, UUID, str, int, int, str, int, str]]:
+        """Validate a bounded v2 snapshot before acquiring the scheduler write lock."""
+
+        if source_wait_deadline is None or publication_deadline is None:
+            raise ValueError("v2 claim requires explicit source and publication deadlines")
+        source_deadline = _utc(source_wait_deadline)
+        publish_deadline = _utc(publication_deadline)
+        expires_at = now + timedelta(seconds=shard_lease_seconds)
+        if (
+            source_deadline <= now
+            or publish_deadline < source_deadline
+            or publish_deadline > expires_at
+        ):
+            # The write phase preserves the legacy deferred-deadline behavior for a
+            # selected candidate; an earlier V1 candidate must still remain claimable.
+            return frozenset()
+        with self._read_transaction() as connection:
+            cursor = connection.execute(
+                """
+                SELECT claim_cursor_created_at, claim_cursor_job_id,
+                       claim_cursor_shard_index, claim_cursor_shard_id,
+                       claim_cursor_sequence
+                FROM lab_scheduler_state WHERE state_key = 'claim_job_cursor'
+                """
+            ).fetchone()
+            cursor_predicate = ""
+            cursor_parameters: tuple[object, ...] = ()
+            if cursor is not None:
+                sequence = _strict_sqlite_int(
+                    cursor["claim_cursor_sequence"],
+                    field="lab_scheduler_state.claim_cursor_sequence",
+                    minimum=0,
+                )
+                if sequence % PRECLAIM_FAIR_SCAN_INTERVAL == PRECLAIM_FAIR_SCAN_INTERVAL - 1:
+                    cursor = connection.execute(
+                        """
+                        SELECT claim_cursor_created_at, claim_cursor_job_id,
+                               claim_cursor_shard_index, claim_cursor_shard_id
+                        FROM lab_preclaim_fair_cursor WHERE singleton = 1
+                        """
+                    ).fetchone()
+                if (
+                    cursor is not None
+                    and cursor["claim_cursor_created_at"] is not None
+                    and cursor["claim_cursor_job_id"] is not None
+                    and cursor["claim_cursor_shard_index"] is not None
+                    and cursor["claim_cursor_shard_id"] is not None
+                ):
+                    cursor_created_at = _load_time(str(cursor["claim_cursor_created_at"]))
+                    cursor_job_id = _canonical_uuid_text(
+                        cursor["claim_cursor_job_id"],
+                        field="lab_scheduler_state.claim_cursor_job_id",
+                    )
+                    cursor_shard_index = _strict_sqlite_int(
+                        cursor["claim_cursor_shard_index"],
+                        field="lab_scheduler_state.claim_cursor_shard_index",
+                        minimum=0,
+                    )
+                    cursor_shard_id = _canonical_uuid_text(
+                        cursor["claim_cursor_shard_id"],
+                        field="lab_scheduler_state.claim_cursor_shard_id",
+                    )
+                    cursor_predicate = """
+                      AND (j.created_at > ? OR (
+                          j.created_at = ? AND (j.job_id > ? OR (
+                              j.job_id = ? AND (s.shard_index > ? OR (
+                                  s.shard_index = ? AND s.shard_id > ?
+                              ))
+                          ))
+                      ))
+                    """
+                    cursor_parameters = (
+                        _dump_time(cursor_created_at),
+                        _dump_time(cursor_created_at),
+                        str(cursor_job_id),
+                        str(cursor_job_id),
+                        cursor_shard_index,
+                        cursor_shard_index,
+                        str(cursor_shard_id),
+                    )
+            rows = connection.execute(
+                f"""
+                SELECT s.*, j.spec_hash AS job_spec_hash
+                FROM lab_shard AS s
+                JOIN lab_job AS j ON j.job_id = s.job_id
+                WHERE s.status = ? AND s.payload_protocol_version = 2
+                  AND s.attempt_count < s.max_attempts
+                  AND j.status IN (?, ?) AND j.control_intent = ? AND j.deadline > ?
+                  {cursor_predicate}
+                ORDER BY j.created_at, j.job_id, s.shard_index, s.shard_id
+                LIMIT ?
+                """,
+                (
+                    ShardStatus.QUEUED.value,
+                    JobStatus.QUEUED.value,
+                    JobStatus.RUNNING.value,
+                    ControlIntent.NONE.value,
+                    _dump_time(now),
+                    *cursor_parameters,
+                    PRECLAIM_CANDIDATE_BATCH_SIZE,
+                ),
+            ).fetchall()
+            if not rows and cursor_predicate:
+                rows = connection.execute(
+                    """
+                    SELECT s.*, j.spec_hash AS job_spec_hash
+                    FROM lab_shard AS s
+                    JOIN lab_job AS j ON j.job_id = s.job_id
+                    WHERE s.status = ? AND s.payload_protocol_version = 2
+                      AND s.attempt_count < s.max_attempts
+                      AND j.status IN (?, ?) AND j.control_intent = ? AND j.deadline > ?
+                    ORDER BY j.created_at, j.job_id, s.shard_index, s.shard_id
+                    LIMIT ?
+                    """,
+                    (
+                        ShardStatus.QUEUED.value,
+                        JobStatus.QUEUED.value,
+                        JobStatus.RUNNING.value,
+                        ControlIntent.NONE.value,
+                        _dump_time(now),
+                        PRECLAIM_CANDIDATE_BATCH_SIZE,
+                    ),
+                ).fetchall()
+        validated: set[tuple[UUID, UUID, str, int, int, str, int, str]] = set()
+        for row in rows:
+            definition = self._definition_from_shard_row(row)
+            payload = self._external_payload_v2(definition.payload_json)
+            if payload is None:  # pragma: no cover - schema trigger guards this invariant
+                raise InvalidStoredJobError("v2 shard payload is not externally authorized")
+            job_id = _canonical_uuid_text(row["job_id"], field="lab_shard.job_id")
+            shard_version = _strict_sqlite_int(row["version"], field="lab_shard.version", minimum=0)
+            attempt_count = _strict_sqlite_int(
+                row["attempt_count"], field="lab_shard.attempt_count", minimum=0
+            )
+            generation = (
+                _strict_sqlite_int(
+                    row["claim_generation"], field="lab_shard.claim_generation", minimum=0
+                )
+                + 1
+            )
+            prospective = LabShardClaimV2.from_current_attempt(
+                definition=definition,
+                attempt_binding=SourceAttemptBindingV2(
+                    job_id=job_id,
+                    spec_hash=str(row["job_spec_hash"]),
+                    shard_id=definition.shard_id,
+                    attempt_id=uuid4(),
+                    claim_generation=generation,
+                    scheduler_fencing_token=lease.fencing_token,
+                    worker_id=worker,
+                ),
+                claimed_at=now,
+                lease_expires_at=expires_at,
+            )
+            try:
+                v2_precondition(payload, prospective, now)
+            except (SourceOperationContractError, ValueError):
+                continue
+            validated.add(
+                (
+                    job_id,
+                    definition.shard_id,
+                    definition.payload_hash,
+                    shard_version,
+                    attempt_count,
+                    str(row["job_spec_hash"]),
+                    generation,
+                    worker,
+                )
+            )
+        return frozenset(validated)
+
+    def _store_preclaim_cursor(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        job_created_at: datetime,
+        job_id: UUID,
+        shard_index: int,
+        shard_id: UUID,
+        now: datetime,
+        use_fair_cursor: bool,
+    ) -> None:
+        """Advance the durable preclaim keyset cursor in the claim transaction."""
+
+        sequence_row = connection.execute(
+            "SELECT COALESCE(MAX(claim_cursor_sequence), 0) + 1 FROM lab_scheduler_state"
+        ).fetchone()
+        assert sequence_row is not None
+        sequence = _strict_sqlite_int(
+            sequence_row[0],
+            field="lab_scheduler_state.claim_cursor_sequence",
+            minimum=1,
+        )
+        if use_fair_cursor:
+            connection.execute(
+                """
+                UPDATE lab_scheduler_state
+                SET claim_cursor_sequence = ?, updated_at = ?
+                WHERE state_key = 'claim_job_cursor'
+                """,
+                (sequence, _dump_time(now)),
+            )
+            connection.execute(
+                """
+                INSERT INTO lab_preclaim_fair_cursor (
+                    singleton, claim_cursor_created_at, claim_cursor_job_id,
+                    claim_cursor_shard_index, claim_cursor_shard_id, updated_at
+                ) VALUES (1, ?, ?, ?, ?, ?)
+                ON CONFLICT(singleton) DO UPDATE SET
+                    claim_cursor_created_at = excluded.claim_cursor_created_at,
+                    claim_cursor_job_id = excluded.claim_cursor_job_id,
+                    claim_cursor_shard_index = excluded.claim_cursor_shard_index,
+                    claim_cursor_shard_id = excluded.claim_cursor_shard_id,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    _dump_time(job_created_at),
+                    str(job_id),
+                    shard_index,
+                    str(shard_id),
+                    _dump_time(now),
+                ),
+            )
+            return
+        connection.execute(
+            """
+            INSERT INTO lab_scheduler_state (
+                state_key, claim_cursor_created_at, claim_cursor_job_id,
+                claim_cursor_shard_index, claim_cursor_shard_id,
+                claim_cursor_sequence, updated_at
+            ) VALUES ('claim_job_cursor', ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(state_key) DO UPDATE SET
+                claim_cursor_created_at = excluded.claim_cursor_created_at,
+                claim_cursor_job_id = excluded.claim_cursor_job_id,
+                claim_cursor_shard_index = excluded.claim_cursor_shard_index,
+                claim_cursor_shard_id = excluded.claim_cursor_shard_id,
+                claim_cursor_sequence = excluded.claim_cursor_sequence,
+                updated_at = excluded.updated_at
+            """,
+            (
+                _dump_time(job_created_at),
+                str(job_id),
+                shard_index,
+                str(shard_id),
+                sequence,
+                _dump_time(now),
+            ),
+        )
+
     def claim_next_shard(
         self,
         *,
@@ -7908,13 +13848,47 @@ class LabJobStore:
         shard_lease_seconds: int,
         lease: LabLeaseRecord,
         now: datetime,
-    ) -> LabShardClaim | None:
+        source_stage_store: LabSourceStageStore | None = None,
+        source_wait_deadline: datetime | None = None,
+        publication_deadline: datetime | None = None,
+        allowed_payload_protocol_versions: tuple[int, ...] = (1, 2),
+        v2_precondition: (
+            Callable[[StrategyShardPayloadV2, LabShardClaimV2, datetime], None] | None
+        ) = None,
+        include_diagnostics: bool = False,
+    ) -> LabShardClaim | LabShardClaimV2 | LabClaimSelection | None:
+        rejections: list[LabPreclaimRejection] = []
+
+        def selected(
+            claim: LabShardClaim | LabShardClaimV2 | None,
+        ) -> LabShardClaim | LabShardClaimV2 | LabClaimSelection | None:
+            if include_diagnostics:
+                return LabClaimSelection(claim=claim, rejections=tuple(rejections))
+            return claim
+
         worker = worker_id.strip()
         if not worker:
             raise ValueError("worker_id must not be empty")
         if shard_lease_seconds < 1:
             raise ValueError("shard_lease_seconds must be positive")
+        allowed_protocols = tuple(sorted(set(allowed_payload_protocol_versions)))
+        if not allowed_protocols or any(version not in {1, 2} for version in allowed_protocols):
+            raise ValueError("allowed_payload_protocol_versions must contain only 1 or 2")
+        protocol_placeholders = ", ".join("?" for _ in allowed_protocols)
         current = _utc(now)
+        prevalidated_v2: frozenset[tuple[UUID, UUID, str, int, int, str, int, str]] | None = None
+        if v2_precondition is not None and 2 in allowed_protocols:
+            prevalidated_v2 = self._prevalidate_v2_preclaim_candidates(
+                worker=worker,
+                shard_lease_seconds=shard_lease_seconds,
+                lease=lease,
+                now=current,
+                source_wait_deadline=source_wait_deadline,
+                publication_deadline=publication_deadline,
+                v2_precondition=v2_precondition,
+            )
+            v2_precondition = None
+
         with self._transaction() as connection:
             self._validate_lease(connection, lease, now=current)
             self._recover_stale_shards_in_transaction(
@@ -7938,17 +13912,43 @@ class LabJobStore:
                 ),
             ).fetchone()
             if active_worker is not None:
-                return None
+                return selected(None)
             claim_cursor = connection.execute(
                 """
-                SELECT claim_cursor_created_at, claim_cursor_job_id
+                SELECT claim_cursor_created_at, claim_cursor_job_id,
+                       claim_cursor_shard_index, claim_cursor_shard_id,
+                       claim_cursor_sequence
                 FROM lab_scheduler_state
                 WHERE state_key = 'claim_job_cursor'
                 """
             ).fetchone()
+            use_fair_cursor = False
+            if claim_cursor is not None:
+                sequence = _strict_sqlite_int(
+                    claim_cursor["claim_cursor_sequence"],
+                    field="lab_scheduler_state.claim_cursor_sequence",
+                    minimum=0,
+                )
+                use_fair_cursor = sequence % PRECLAIM_FAIR_SCAN_INTERVAL == (
+                    PRECLAIM_FAIR_SCAN_INTERVAL - 1
+                )
+                if use_fair_cursor:
+                    claim_cursor = connection.execute(
+                        """
+                        SELECT claim_cursor_created_at, claim_cursor_job_id,
+                               claim_cursor_shard_index, claim_cursor_shard_id
+                        FROM lab_preclaim_fair_cursor WHERE singleton = 1
+                        """
+                    ).fetchone()
+            cursor_created_at: datetime | None = None
+            cursor_job_id: UUID | None = None
+            cursor_shard_index: int | None = None
+            cursor_shard_id: UUID | None = None
+            job_candidate: sqlite3.Row | None = None
+            job_candidate_uses_shard_cursor = False
             if claim_cursor is None:
                 job_candidate = connection.execute(
-                    """
+                    f"""
                     SELECT j.job_id, j.created_at
                     FROM lab_job AS j
                     WHERE j.status IN (?, ?)
@@ -7958,6 +13958,7 @@ class LabJobStore:
                         SELECT 1 FROM lab_shard AS s
                         WHERE s.job_id = j.job_id
                           AND s.status = ?
+                          AND s.payload_protocol_version IN ({protocol_placeholders})
                           AND s.attempt_count < s.max_attempts
                       )
                     ORDER BY j.created_at, j.job_id
@@ -7969,6 +13970,7 @@ class LabJobStore:
                         ControlIntent.NONE.value,
                         _dump_time(current),
                         ShardStatus.QUEUED.value,
+                        *allowed_protocols,
                     ),
                 ).fetchone()
             else:
@@ -7978,42 +13980,114 @@ class LabJobStore:
                         claim_cursor["claim_cursor_job_id"],
                         field="lab_scheduler_state.claim_cursor_job_id",
                     )
+                    cursor_index_value = claim_cursor["claim_cursor_shard_index"]
+                    cursor_id_value = claim_cursor["claim_cursor_shard_id"]
+                    if (cursor_index_value is None) != (cursor_id_value is None):
+                        raise ValueError("persisted shard cursor is incomplete")
+                    if cursor_index_value is not None:
+                        cursor_shard_index = _strict_sqlite_int(
+                            cursor_index_value,
+                            field="lab_scheduler_state.claim_cursor_shard_index",
+                            minimum=0,
+                        )
+                        cursor_shard_id = _canonical_uuid_text(
+                            cursor_id_value,
+                            field="lab_scheduler_state.claim_cursor_shard_id",
+                        )
                 except (TypeError, ValueError) as exc:
                     raise InvalidStoredJobError("invalid persisted claim job cursor") from exc
                 cursor_created_at_dump = _dump_time(cursor_created_at)
-                job_candidate = connection.execute(
-                    """
-                    SELECT j.job_id, j.created_at
-                    FROM lab_job AS j
-                    WHERE j.status IN (?, ?)
-                      AND j.control_intent = ?
-                      AND j.deadline > ?
-                      AND EXISTS (
-                        SELECT 1 FROM lab_shard AS s
-                        WHERE s.job_id = j.job_id
-                          AND s.status = ?
-                          AND s.attempt_count < s.max_attempts
-                      )
-                    ORDER BY CASE
-                        WHEN j.created_at > ?
-                          OR (j.created_at = ? AND j.job_id > ?)
-                        THEN 0 ELSE 1 END,
-                        j.created_at, j.job_id
-                    LIMIT 1
-                    """,
-                    (
-                        JobStatus.QUEUED.value,
-                        JobStatus.RUNNING.value,
-                        ControlIntent.NONE.value,
-                        _dump_time(current),
-                        ShardStatus.QUEUED.value,
-                        cursor_created_at_dump,
-                        cursor_created_at_dump,
-                        str(cursor_job_id),
-                    ),
-                ).fetchone()
+                if cursor_shard_index is not None and cursor_shard_id is not None:
+                    job_candidate = connection.execute(
+                        f"""
+                        SELECT j.job_id, j.created_at
+                        FROM lab_job AS j
+                        WHERE j.job_id = ? AND j.created_at = ?
+                          AND j.status IN (?, ?)
+                          AND j.control_intent = ? AND j.deadline > ?
+                          AND EXISTS (
+                            SELECT 1 FROM lab_shard AS s
+                            WHERE s.job_id = j.job_id AND s.status = ?
+                              AND s.payload_protocol_version IN ({protocol_placeholders})
+                              AND s.attempt_count < s.max_attempts
+                              AND (s.shard_index > ? OR (
+                                  s.shard_index = ? AND s.shard_id > ?
+                              ))
+                          )
+                        """,
+                        (
+                            str(cursor_job_id),
+                            cursor_created_at_dump,
+                            JobStatus.QUEUED.value,
+                            JobStatus.RUNNING.value,
+                            ControlIntent.NONE.value,
+                            _dump_time(current),
+                            ShardStatus.QUEUED.value,
+                            *allowed_protocols,
+                            cursor_shard_index,
+                            cursor_shard_index,
+                            str(cursor_shard_id),
+                        ),
+                    ).fetchone()
+                    job_candidate_uses_shard_cursor = job_candidate is not None
+                if job_candidate is None:
+                    job_candidate = connection.execute(
+                        f"""
+                        SELECT j.job_id, j.created_at
+                        FROM lab_job AS j
+                        WHERE j.status IN (?, ?)
+                          AND j.control_intent = ? AND j.deadline > ?
+                          AND (j.created_at > ? OR (
+                              j.created_at = ? AND j.job_id > ?
+                          ))
+                          AND EXISTS (
+                            SELECT 1 FROM lab_shard AS s
+                            WHERE s.job_id = j.job_id AND s.status = ?
+                              AND s.payload_protocol_version IN ({protocol_placeholders})
+                              AND s.attempt_count < s.max_attempts
+                          )
+                        ORDER BY j.created_at, j.job_id
+                        LIMIT 1
+                        """,
+                        (
+                            JobStatus.QUEUED.value,
+                            JobStatus.RUNNING.value,
+                            ControlIntent.NONE.value,
+                            _dump_time(current),
+                            cursor_created_at_dump,
+                            cursor_created_at_dump,
+                            str(cursor_job_id),
+                            ShardStatus.QUEUED.value,
+                            *allowed_protocols,
+                        ),
+                    ).fetchone()
+                if job_candidate is None:
+                    job_candidate = connection.execute(
+                        f"""
+                        SELECT j.job_id, j.created_at
+                        FROM lab_job AS j
+                        WHERE j.status IN (?, ?)
+                          AND j.control_intent = ? AND j.deadline > ?
+                          AND EXISTS (
+                            SELECT 1 FROM lab_shard AS s
+                            WHERE s.job_id = j.job_id AND s.status = ?
+                              AND s.payload_protocol_version IN ({protocol_placeholders})
+                              AND s.attempt_count < s.max_attempts
+                          )
+                        ORDER BY j.created_at, j.job_id
+                        LIMIT 1
+                        """,
+                        (
+                            JobStatus.QUEUED.value,
+                            JobStatus.RUNNING.value,
+                            ControlIntent.NONE.value,
+                            _dump_time(current),
+                            ShardStatus.QUEUED.value,
+                            *allowed_protocols,
+                        ),
+                    ).fetchone()
             if job_candidate is None:
-                return None
+                return selected(None)
             try:
                 job_id = _canonical_uuid_text(
                     job_candidate["job_id"],
@@ -8022,119 +14096,246 @@ class LabJobStore:
                 job_created_at = _load_time(str(job_candidate["created_at"]))
             except (TypeError, ValueError) as exc:
                 raise InvalidStoredJobError("invalid claimable job identity") from exc
-            row = connection.execute(
+            shard_cursor_parameters: tuple[object, ...] = ()
+            shard_cursor_predicate = ""
+            if (
+                job_candidate_uses_shard_cursor
+                and cursor_job_id == job_id
+                and cursor_shard_index is not None
+                and cursor_shard_id is not None
+            ):
+                shard_cursor_predicate = """
+                  AND (shard_index > ? OR (shard_index = ? AND shard_id > ?))
                 """
-                SELECT * FROM lab_shard
-                WHERE job_id = ? AND status = ?
+                shard_cursor_parameters = (
+                    cursor_shard_index,
+                    cursor_shard_index,
+                    str(cursor_shard_id),
+                )
+            rows = connection.execute(
+                f"""
+                SELECT * FROM lab_shard INDEXED BY ix_lab_shard_preclaim_candidate
+                WHERE job_id = ? AND status = 'queued'
+                  AND payload_protocol_version IN ({protocol_placeholders})
                   AND attempt_count < max_attempts
+                  {shard_cursor_predicate}
                 ORDER BY shard_index, shard_id
-                LIMIT 1
+                LIMIT ?
                 """,
                 (
                     str(job_id),
-                    ShardStatus.QUEUED.value,
+                    *allowed_protocols,
+                    *shard_cursor_parameters,
+                    PRECLAIM_CANDIDATE_BATCH_SIZE,
                 ),
-            ).fetchone()
-            if row is None:
+            ).fetchall()
+            if not rows:
                 raise InvalidStoredJobError("claimable job has no claimable shard")
             job_row = self._load_job_row(connection, job_id)
             assert job_row is not None
-            job_status = JobStatus(str(job_row["status"]))
-            if job_status is JobStatus.QUEUED:
-                job_row = self._transition_in_transaction(
+            deferred_deadline_error: ValueError | None = None
+            for row in rows:
+                try:
+                    candidate = self._claim_preclaim_candidate_in_transaction(
+                        connection,
+                        row=row,
+                        job_id=job_id,
+                        job_created_at=job_created_at,
+                        job_row=job_row,
+                        worker=worker,
+                        shard_lease_seconds=shard_lease_seconds,
+                        lease=lease,
+                        now=current,
+                        source_stage_store=source_stage_store,
+                        source_wait_deadline=source_wait_deadline,
+                        publication_deadline=publication_deadline,
+                        v2_precondition=v2_precondition,
+                        prevalidated_v2=prevalidated_v2,
+                        use_fair_cursor=use_fair_cursor,
+                    )
+                except ValueError as exc:
+                    if str(exc) != "publication_deadline must not exceed shard lease expiry":
+                        raise
+                    deferred_deadline_error = exc
+                    candidate = LabPreclaimRejection(
+                        job_id=job_id,
+                        shard_id=_canonical_uuid_text(row["shard_id"], field="lab_shard.shard_id"),
+                        payload_hash=str(row["payload_hash"]),
+                        reason="source_preclaim_rejected",
+                    )
+                if isinstance(candidate, LabPreclaimRejection):
+                    rejections.append(candidate)
+                    continue
+                if candidate is not None:
+                    return selected(candidate)
+            if rejections:
+                last_rows = rows
+                last_job_id = job_id
+                last_job_created_at = job_created_at
+                if len(rows) < PRECLAIM_CANDIDATE_BATCH_SIZE:
+                    next_job = connection.execute(
+                        f"""
+                        SELECT j.job_id, j.created_at
+                        FROM lab_job AS j
+                        WHERE j.status IN (?, ?)
+                          AND j.control_intent = ? AND j.deadline > ?
+                          AND (j.created_at > ? OR (
+                              j.created_at = ? AND j.job_id > ?
+                          ))
+                          AND EXISTS (
+                            SELECT 1 FROM lab_shard AS s
+                            WHERE s.job_id = j.job_id AND s.status = ?
+                              AND s.payload_protocol_version IN ({protocol_placeholders})
+                              AND s.attempt_count < s.max_attempts
+                          )
+                        ORDER BY j.created_at, j.job_id
+                        LIMIT 1
+                        """,
+                        (
+                            JobStatus.QUEUED.value,
+                            JobStatus.RUNNING.value,
+                            ControlIntent.NONE.value,
+                            _dump_time(current),
+                            _dump_time(job_created_at),
+                            _dump_time(job_created_at),
+                            str(job_id),
+                            ShardStatus.QUEUED.value,
+                            *allowed_protocols,
+                        ),
+                    ).fetchone()
+                    if next_job is None:
+                        next_job = connection.execute(
+                            f"""
+                            SELECT j.job_id, j.created_at
+                            FROM lab_job AS j
+                            WHERE j.job_id <> ? AND j.status IN (?, ?)
+                              AND j.control_intent = ? AND j.deadline > ?
+                              AND EXISTS (
+                                SELECT 1 FROM lab_shard AS s
+                                WHERE s.job_id = j.job_id AND s.status = ?
+                                  AND s.payload_protocol_version IN ({protocol_placeholders})
+                                  AND s.attempt_count < s.max_attempts
+                              )
+                            ORDER BY j.created_at, j.job_id
+                            LIMIT 1
+                            """,
+                            (
+                                str(job_id),
+                                JobStatus.QUEUED.value,
+                                JobStatus.RUNNING.value,
+                                ControlIntent.NONE.value,
+                                _dump_time(current),
+                                ShardStatus.QUEUED.value,
+                                *allowed_protocols,
+                            ),
+                        ).fetchone()
+                    if next_job is None and deferred_deadline_error is not None:
+                        raise deferred_deadline_error
+                    if next_job is not None:
+                        next_job_id = _canonical_uuid_text(
+                            next_job["job_id"], field="lab_job.job_id"
+                        )
+                        next_job_created_at = _load_time(str(next_job["created_at"]))
+                        next_rows = connection.execute(
+                            f"""
+                            SELECT * FROM lab_shard INDEXED BY ix_lab_shard_preclaim_candidate
+                            WHERE job_id = ? AND status = 'queued'
+                              AND payload_protocol_version IN ({protocol_placeholders})
+                              AND attempt_count < max_attempts
+                            ORDER BY shard_index, shard_id
+                            LIMIT ?
+                            """,
+                            (
+                                str(next_job_id),
+                                *allowed_protocols,
+                                PRECLAIM_CANDIDATE_BATCH_SIZE - len(rows),
+                            ),
+                        ).fetchall()
+                        next_job_row = self._load_job_row(connection, next_job_id)
+                        assert next_job_row is not None
+                        for row in next_rows:
+                            candidate = self._claim_preclaim_candidate_in_transaction(
+                                connection,
+                                row=row,
+                                job_id=next_job_id,
+                                job_created_at=next_job_created_at,
+                                job_row=next_job_row,
+                                worker=worker,
+                                shard_lease_seconds=shard_lease_seconds,
+                                lease=lease,
+                                now=current,
+                                source_stage_store=source_stage_store,
+                                source_wait_deadline=source_wait_deadline,
+                                publication_deadline=publication_deadline,
+                                v2_precondition=v2_precondition,
+                                prevalidated_v2=prevalidated_v2,
+                                use_fair_cursor=use_fair_cursor,
+                            )
+                            if isinstance(candidate, LabPreclaimRejection):
+                                rejections.append(candidate)
+                                continue
+                            if candidate is not None:
+                                return selected(candidate)
+                        if next_rows:
+                            last_rows = next_rows
+                            last_job_id = next_job_id
+                            last_job_created_at = next_job_created_at
+                last_row = last_rows[-1]
+                self._store_preclaim_cursor(
                     connection,
-                    job_row,
-                    target_status=JobStatus.RUNNING,
-                    lease=lease,
-                    reason="first shard claimed",
+                    job_created_at=last_job_created_at,
+                    job_id=last_job_id,
+                    shard_index=_strict_sqlite_int(
+                        last_row["shard_index"],
+                        field="lab_shard.shard_index",
+                        minimum=0,
+                    ),
+                    shard_id=_canonical_uuid_text(
+                        last_row["shard_id"],
+                        field="lab_shard.shard_id",
+                    ),
                     now=current,
-                    request_id=None,
-                    recoverable=None,
-                    event_type="job_started",
+                    use_fair_cursor=use_fair_cursor,
                 )
-            else:
-                job_row = self._adopt_running_job_fence(
-                    connection,
-                    job_row,
-                    lease=lease,
-                    now=current,
-                )
-            shard_version = _strict_sqlite_int(row["version"], field="lab_shard.version", minimum=0)
-            generation = (
-                _strict_sqlite_int(
-                    row["claim_generation"],
-                    field="lab_shard.claim_generation",
-                    minimum=0,
-                )
-                + 1
-            )
-            attempt_count = (
-                _strict_sqlite_int(row["attempt_count"], field="lab_shard.attempt_count", minimum=0)
-                + 1
-            )
-            claim_token = uuid4()
-            expires_at = current + timedelta(seconds=shard_lease_seconds)
-            cursor = connection.execute(
-                """
-                UPDATE lab_shard
-                SET status = ?, version = ?, attempt_count = ?, worker_id = ?,
-                    scheduler_fencing_token = ?, claim_token = ?,
-                    claim_generation = ?, claimed_at = ?, heartbeat_at = ?,
-                    lease_expires_at = ?, result_manifest_hash = NULL,
-                    failure_json = NULL, finished_at = NULL, updated_at = ?
-                WHERE job_id = ? AND shard_id = ? AND version = ? AND status = ?
-                """,
-                (
-                    ShardStatus.RUNNING.value,
-                    shard_version + 1,
-                    attempt_count,
-                    worker,
-                    lease.fencing_token,
-                    str(claim_token),
-                    generation,
-                    _dump_time(current),
-                    _dump_time(current),
-                    _dump_time(expires_at),
-                    _dump_time(current),
-                    str(row["job_id"]),
-                    str(row["shard_id"]),
-                    shard_version,
-                    ShardStatus.QUEUED.value,
-                ),
-            )
-            if cursor.rowcount != 1:
-                return None
-            connection.execute(
-                """
-                INSERT INTO lab_scheduler_state (
-                    state_key, claim_cursor_created_at,
-                    claim_cursor_job_id, updated_at
-                ) VALUES ('claim_job_cursor', ?, ?, ?)
-                ON CONFLICT(state_key) DO UPDATE SET
-                    claim_cursor_created_at = excluded.claim_cursor_created_at,
-                    claim_cursor_job_id = excluded.claim_cursor_job_id,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    _dump_time(job_created_at),
-                    str(job_id),
-                    _dump_time(current),
-                ),
-            )
-            definition = self._definition_from_shard_row(row)
-            spec_hash = str(job_row["spec_hash"])
-            claim = LabShardClaim(
-                job_id=job_id,
-                spec_hash=spec_hash,
-                definition=definition,
-                worker_id=worker,
-                claim_token=claim_token,
-                claim_generation=generation,
-                scheduler_fencing_token=lease.fencing_token,
-                claimed_at=current,
-                lease_expires_at=expires_at,
-            )
-        return claim
+        return selected(None)
+
+    def claim_next_source_stage(
+        self,
+        *,
+        shard_lease_seconds: int,
+        lease: LabLeaseRecord,
+        now: datetime,
+        source_stage_store: LabSourceStageStore,
+        source_wait_deadline: datetime,
+        publication_deadline: datetime,
+        v2_precondition: Callable[[StrategyShardPayloadV2, LabShardClaimV2, datetime], None],
+        include_diagnostics: bool = False,
+    ) -> LabShardClaimV2 | LabClaimSelection | None:
+        """Create a V2 source attempt without selecting a real worker.
+
+        ``v2-unassigned`` is a protocol route, not a worker identity.  A worker
+        can atomically consume a published V2 entry after the D ledger gate.
+        """
+
+        selected = self.claim_next_shard(
+            worker_id=V2_UNASSIGNED_WORKER_ID,
+            shard_lease_seconds=shard_lease_seconds,
+            lease=lease,
+            now=now,
+            source_stage_store=source_stage_store,
+            source_wait_deadline=source_wait_deadline,
+            publication_deadline=publication_deadline,
+            allowed_payload_protocol_versions=(2,),
+            v2_precondition=v2_precondition,
+            include_diagnostics=include_diagnostics,
+        )
+        if isinstance(selected, LabClaimSelection) or selected is None:
+            return selected
+        if not isinstance(
+            selected, LabShardClaimV2
+        ):  # pragma: no cover - protocol filter invariant
+            raise InvalidStoredJobError("source-stage claim did not select a V2 attempt")
+        return selected
 
     def list_active_claims(
         self,
@@ -8142,17 +14343,38 @@ class LabJobStore:
         *,
         now: datetime,
         initial_lease_seconds: int,
-    ) -> tuple[LabShardClaim, ...]:
+    ) -> tuple[LabShardClaim | LabShardClaimV2, ...]:
         if initial_lease_seconds < 1:
             raise ValueError("initial_lease_seconds must be positive")
         current = _utc(now)
-        with self._transaction() as connection:
+        with self._read_transaction() as connection:
             self._validate_lease(connection, lease, now=current)
             rows = connection.execute(
                 """
-                SELECT s.*, j.spec_hash AS job_spec_hash
+                SELECT
+                    publication.*,
+                    s.job_id AS shard_job_id,
+                    s.shard_id AS shard_shard_id,
+                    s.shard_index AS shard_shard_index,
+                    s.claim_token AS shard_claim_token,
+                    s.claim_generation AS shard_claim_generation,
+                    s.scheduler_fencing_token AS shard_scheduler_fencing_token,
+                    s.worker_id AS shard_worker_id,
+                    s.claimed_at AS shard_claimed_at,
+                    s.adapter_id AS shard_adapter_id,
+                    s.adapter_version AS shard_adapter_version,
+                    s.plan_hash AS shard_plan_hash,
+                    s.payload_json AS shard_payload_json,
+                    s.payload_hash AS shard_payload_hash,
+                    s.phase AS shard_phase,
+                    s.work_unit_name AS shard_work_unit_name,
+                    s.work_units AS shard_work_units,
+                    s.static_duration_ms AS shard_static_duration_ms,
+                    j.spec_hash AS job_spec_hash
                 FROM lab_shard AS s
                 JOIN lab_job AS j ON j.job_id = s.job_id
+                LEFT JOIN lab_claim_publication AS publication
+                  ON publication.attempt_id = s.claim_token
                 WHERE s.status = ?
                   AND s.scheduler_fencing_token = ?
                   AND s.lease_expires_at > ?
@@ -8164,30 +14386,95 @@ class LabJobStore:
                     _dump_time(current),
                 ),
             ).fetchall()
-            claims: list[LabShardClaim] = []
+            claims: list[LabShardClaim | LabShardClaimV2] = []
             for row in rows:
                 try:
-                    claimed_at = _load_time(str(row["claimed_at"]))
+                    claimed_at = _load_time(str(row["shard_claimed_at"]))
+                    definition = LabShardDefinition(
+                        shard_id=_canonical_uuid_text(
+                            row["shard_shard_id"], field="lab_shard.shard_id"
+                        ),
+                        shard_index=_strict_sqlite_int(
+                            row["shard_shard_index"],
+                            field="lab_shard.shard_index",
+                            minimum=0,
+                        ),
+                        adapter_id=str(row["shard_adapter_id"]),
+                        adapter_version=str(row["shard_adapter_version"]),
+                        plan_hash=str(row["shard_plan_hash"]),
+                        payload_json=str(row["shard_payload_json"]),
+                        payload_hash=str(row["shard_payload_hash"]),
+                        work_plan=(
+                            LabShardWorkPlan(
+                                phase=str(row["shard_phase"]),
+                                work_unit_name=str(row["shard_work_unit_name"]),
+                                work_units=_strict_sqlite_int(
+                                    row["shard_work_units"],
+                                    field="lab_shard.work_units",
+                                    minimum=1,
+                                    maximum=SQLITE_SIGNED_INTEGER_MAX,
+                                ),
+                                static_duration_ms=_strict_sqlite_int(
+                                    row["shard_static_duration_ms"],
+                                    field="lab_shard.static_duration_ms",
+                                    minimum=1,
+                                    maximum=SQLITE_SIGNED_INTEGER_MAX,
+                                ),
+                            )
+                            if row["shard_phase"] is not None
+                            else None
+                        ),
+                    )
+                    payload = self._external_payload_v2(definition.payload_json)
+                    claim_token = _canonical_uuid_text(
+                        row["shard_claim_token"], field="lab_shard.claim_token"
+                    )
+                    if payload is not None:
+                        if row["attempt_id"] is None:
+                            continue
+                        publication = _claim_publication_record_from_row(row)
+                        if publication.status not in {
+                            ClaimPublicationStatus.READY_TO_PUBLISH,
+                            ClaimPublicationStatus.PUBLISHED,
+                        }:
+                            continue
+                        if publication.final_claim_bytes is None:
+                            raise InvalidStoredJobError("visible v2 publication has no final claim")
+                        final_claim = strict_model_validate_canonical_json(
+                            LabShardClaimV2,
+                            publication.final_claim_bytes.decode("utf-8"),
+                        )
+                        if canonical_model_json_bytes(final_claim) != publication.final_claim_bytes:
+                            raise InvalidStoredJobError(
+                                "visible v2 publication final claim is not canonical"
+                            )
+                        if (
+                            LabClaimPublicationIdentity.from_claim(final_claim)
+                            != publication.identity
+                            or final_claim.claim_token != claim_token
+                        ):
+                            raise InvalidStoredJobError(
+                                "visible v2 publication does not match the running shard attempt"
+                            )
+                        claims.append(final_claim)
+                        continue
                     claims.append(
                         LabShardClaim(
                             job_id=_canonical_uuid_text(
-                                row["job_id"],
+                                row["shard_job_id"],
                                 field="lab_shard.job_id",
                             ),
                             spec_hash=str(row["job_spec_hash"]),
-                            definition=self._definition_from_shard_row(row),
-                            worker_id=str(row["worker_id"]),
-                            claim_token=_canonical_uuid_text(
-                                row["claim_token"],
-                                field="lab_shard.claim_token",
-                            ),
+                            definition=definition,
+                            worker_id=str(row["shard_worker_id"]),
+                            claim_token=claim_token,
                             claim_generation=_strict_sqlite_int(
-                                row["claim_generation"],
+                                row["shard_claim_generation"],
                                 field="lab_shard.claim_generation",
                                 minimum=1,
                             ),
                             scheduler_fencing_token=_strict_sqlite_int(
-                                row["scheduler_fencing_token"],
+                                row["shard_scheduler_fencing_token"],
                                 field="lab_shard.scheduler_fencing_token",
                                 minimum=1,
                             ),
@@ -8197,7 +14484,7 @@ class LabJobStore:
                     )
                 except Exception as exc:
                     raise InvalidStoredJobError(
-                        f"invalid active claim for shard {row['shard_id']}: {exc}"
+                        f"invalid active claim for shard {row['shard_shard_id']}: {exc}"
                     ) from exc
         return tuple(claims)
 
@@ -10215,6 +16502,62 @@ CREATE TABLE IF NOT EXISTS lab_ledger_epoch (
         CHECK (typeof(mutation_epoch) = 'integer' AND mutation_epoch >= 0)
 )
 """
+_LEDGER_CHAIN_TABLE_STATEMENT = """
+CREATE TABLE IF NOT EXISTS lab_ledger_chain (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    chain_generation INTEGER NOT NULL
+        CHECK (typeof(chain_generation) = 'integer' AND chain_generation >= 0),
+    head_hash TEXT NOT NULL
+        CHECK (typeof(head_hash) = 'text' AND length(head_hash) = 64)
+)
+"""
+_LEDGER_CHAIN_ENTRY_TABLE_STATEMENT = """
+CREATE TABLE IF NOT EXISTS lab_ledger_chain_entry (
+    chain_generation INTEGER PRIMARY KEY
+        CHECK (typeof(chain_generation) = 'integer' AND chain_generation >= 0),
+    mutation_epoch INTEGER NOT NULL
+        CHECK (typeof(mutation_epoch) = 'integer' AND mutation_epoch >= 0),
+    previous_hash TEXT NOT NULL
+        CHECK (typeof(previous_hash) = 'text' AND length(previous_hash) = 64),
+    entry_hash TEXT NOT NULL
+        CHECK (typeof(entry_hash) = 'text' AND length(entry_hash) = 64)
+)
+"""
+_LAB_JOB_LIST_SUMMARY_TABLE_STATEMENT = """
+CREATE TABLE IF NOT EXISTS lab_job_list_summary (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    total_count INTEGER NOT NULL
+        CHECK (typeof(total_count) = 'integer' AND total_count >= 0)
+)
+"""
+_LAB_FINALIZATION_CANDIDATE_SUMMARY_TABLE_STATEMENT = """
+CREATE TABLE IF NOT EXISTS lab_finalization_candidate_summary (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    total_count INTEGER NOT NULL
+        CHECK (typeof(total_count) = 'integer' AND total_count >= 0)
+)
+"""
+_FINALIZATION_CANDIDATE_PREDICATE = """
+status = 'running'
+AND control_intent = 'none'
+AND result_state = 'ready'
+AND requires_complete_result = 1
+AND result_contract_version = 'p1.4b-complete-result-v1'
+""".strip()
+
+
+def _finalization_candidate_predicate(reference: str = "") -> str:
+    return "\nAND ".join(
+        (
+            f"{reference}status = 'running'",
+            f"{reference}control_intent = 'none'",
+            f"{reference}result_state = 'ready'",
+            f"{reference}requires_complete_result = 1",
+            f"{reference}result_contract_version = '{COMPLETE_RESULT_CONTRACT_VERSION}'",
+        )
+    )
+
+
 _LEDGER_EPOCH_TABLES = (
     "lab_job",
     "lab_command",
@@ -10234,8 +16577,25 @@ def _ledger_epoch_trigger_statement(table: str, action: str) -> str:
 CREATE TRIGGER IF NOT EXISTS trg_lab_epoch_{table}_{action.lower()}
 AFTER {action} ON {table}
 BEGIN
+    INSERT INTO lab_ledger_chain_entry (
+        chain_generation, mutation_epoch, previous_hash, entry_hash
+    )
+    SELECT chain.chain_generation + 1,
+           epoch.mutation_epoch + 1,
+           chain.head_hash,
+           lower(hex(randomblob(32)))
+    FROM lab_ledger_chain AS chain
+    JOIN lab_ledger_epoch AS epoch ON epoch.singleton = 1
+    WHERE chain.singleton = 1;
     UPDATE lab_ledger_epoch
     SET mutation_epoch = mutation_epoch + 1
+    WHERE singleton = 1;
+    UPDATE lab_ledger_chain
+    SET chain_generation = chain_generation + 1,
+        head_hash = (
+            SELECT entry_hash FROM lab_ledger_chain_entry
+            WHERE chain_generation = lab_ledger_chain.chain_generation + 1
+        )
     WHERE singleton = 1;
 END
 """
@@ -10246,8 +16606,880 @@ _LEDGER_EPOCH_TRIGGER_SQL = {
     for table in _LEDGER_EPOCH_TABLES
     for action in ("INSERT", "UPDATE", "DELETE")
 }
-_SCHEMA_STATEMENTS = _V5_SCHEMA_STATEMENTS + (
+_LAB_JOB_SUMMARY_TRIGGER_SQL = {
+    "trg_lab_job_list_summary_insert": (
+        """
+CREATE TRIGGER IF NOT EXISTS trg_lab_job_list_summary_insert
+AFTER INSERT ON lab_job
+BEGIN
+    UPDATE lab_job_list_summary SET total_count = total_count + 1 WHERE singleton = 1;
+    UPDATE lab_finalization_candidate_summary
+    SET total_count = total_count + CASE WHEN """
+        + _finalization_candidate_predicate("NEW.")
+        + """ THEN 1 ELSE 0 END
+    WHERE singleton = 1;
+END
+"""
+    ),
+    "trg_lab_job_list_summary_delete": (
+        """
+CREATE TRIGGER IF NOT EXISTS trg_lab_job_list_summary_delete
+AFTER DELETE ON lab_job
+BEGIN
+    UPDATE lab_job_list_summary SET total_count = total_count - 1 WHERE singleton = 1;
+    UPDATE lab_finalization_candidate_summary
+    SET total_count = total_count - CASE WHEN """
+        + _finalization_candidate_predicate("OLD.")
+        + """ THEN 1 ELSE 0 END
+    WHERE singleton = 1;
+END
+"""
+    ),
+    "trg_lab_job_list_summary_update": (
+        """
+CREATE TRIGGER IF NOT EXISTS trg_lab_job_list_summary_update
+AFTER UPDATE OF status, control_intent, result_state, requires_complete_result,
+                result_contract_version ON lab_job
+BEGIN
+    UPDATE lab_finalization_candidate_summary
+    SET total_count = total_count
+        + CASE WHEN """
+        + _finalization_candidate_predicate("NEW.")
+        + """ THEN 1 ELSE 0 END
+        - CASE WHEN """
+        + _finalization_candidate_predicate("OLD.")
+        + """ THEN 1 ELSE 0 END
+    WHERE singleton = 1;
+END
+"""
+    ),
+}
+_V6_SCHEMA_STATEMENTS = _V5_SCHEMA_STATEMENTS + (
     _LEDGER_EPOCH_TABLE_STATEMENT,
     "INSERT OR IGNORE INTO lab_ledger_epoch (singleton, mutation_epoch) VALUES (1, 0)",
     *_LEDGER_EPOCH_TRIGGER_SQL.values(),
 )
+_LEDGER_CHAIN_SEED_STATEMENT = f"""
+INSERT OR IGNORE INTO lab_ledger_chain (
+    singleton, chain_generation, head_hash
+) VALUES (1, 0, '{_LEDGER_CHAIN_GENESIS_HASH}')
+"""
+_LEDGER_CHAIN_ENTRY_SEED_STATEMENT = f"""
+INSERT OR IGNORE INTO lab_ledger_chain_entry (
+    chain_generation, mutation_epoch, previous_hash, entry_hash
+) VALUES (0, 0, '{_LEDGER_CHAIN_GENESIS_HASH}', '{_LEDGER_CHAIN_GENESIS_HASH}')
+"""
+_LAB_JOB_LIST_SUMMARY_SEED_STATEMENT = """
+INSERT OR IGNORE INTO lab_job_list_summary (singleton, total_count)
+SELECT 1, COUNT(*) FROM lab_job
+"""
+_LAB_FINALIZATION_CANDIDATE_SUMMARY_SEED_STATEMENT = f"""
+INSERT OR IGNORE INTO lab_finalization_candidate_summary (singleton, total_count)
+SELECT 1, COUNT(*) FROM lab_job
+WHERE {_FINALIZATION_CANDIDATE_PREDICATE}
+"""
+_LAB_JOB_CREATED_KEYSET_INDEX_STATEMENT = """
+CREATE INDEX IF NOT EXISTS ix_lab_job_created_keyset
+ON lab_job(created_at DESC, job_id DESC)
+"""
+_LAB_JOB_FINALIZATION_CANDIDATE_INDEX_STATEMENT = """
+CREATE INDEX IF NOT EXISTS ix_lab_job_finalization_candidates
+ON lab_job(
+    status, control_intent, result_state, requires_complete_result,
+    result_contract_version, updated_at DESC, job_id DESC
+)
+"""
+_CANONICAL_UTC_TIMESTAMP_GLOB = (
+    "'[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:"
+    "[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]+00:00'"
+)
+_V7_SCHEMA_STATEMENTS = _V6_SCHEMA_STATEMENTS + (
+    _LEDGER_CHAIN_TABLE_STATEMENT,
+    _LEDGER_CHAIN_ENTRY_TABLE_STATEMENT,
+    _LAB_JOB_LIST_SUMMARY_TABLE_STATEMENT,
+    _LAB_FINALIZATION_CANDIDATE_SUMMARY_TABLE_STATEMENT,
+    _LEDGER_CHAIN_SEED_STATEMENT,
+    _LEDGER_CHAIN_ENTRY_SEED_STATEMENT,
+    _LAB_JOB_LIST_SUMMARY_SEED_STATEMENT,
+    _LAB_FINALIZATION_CANDIDATE_SUMMARY_SEED_STATEMENT,
+    _LAB_JOB_CREATED_KEYSET_INDEX_STATEMENT,
+    _LAB_JOB_FINALIZATION_CANDIDATE_INDEX_STATEMENT,
+    *_LAB_JOB_SUMMARY_TRIGGER_SQL.values(),
+)
+_CLAIM_PUBLICATION_TABLE_STATEMENT = f"""
+CREATE TABLE IF NOT EXISTS lab_claim_publication (
+    attempt_id TEXT PRIMARY KEY CHECK (typeof(attempt_id) = 'text'),
+    job_id TEXT NOT NULL CHECK (typeof(job_id) = 'text'),
+    shard_id TEXT NOT NULL CHECK (typeof(shard_id) = 'text'),
+    claim_token TEXT NOT NULL CHECK (typeof(claim_token) = 'text'),
+    claim_generation INTEGER NOT NULL CHECK (
+        typeof(claim_generation) = 'integer' AND claim_generation >= 1
+    ),
+    scheduler_fencing_token INTEGER NOT NULL CHECK (
+        typeof(scheduler_fencing_token) = 'integer' AND scheduler_fencing_token >= 1
+    ),
+    worker_id TEXT NOT NULL CHECK (typeof(worker_id) = 'text'),
+    spec_hash TEXT NOT NULL CHECK (typeof(spec_hash) = 'text' AND length(spec_hash) = 64),
+    plan_hash TEXT NOT NULL CHECK (typeof(plan_hash) = 'text' AND length(plan_hash) = 64),
+    payload_hash TEXT NOT NULL CHECK (typeof(payload_hash) = 'text' AND length(payload_hash) = 64),
+    claim_preimage_bytes BLOB NOT NULL CHECK (typeof(claim_preimage_bytes) = 'blob'),
+    claim_preimage_hash TEXT NOT NULL CHECK (
+        typeof(claim_preimage_hash) = 'text' AND length(claim_preimage_hash) = 64
+    ),
+    claim_protocol TEXT NOT NULL CHECK (claim_protocol = 'rquant-lab-shard-claim'),
+    claim_protocol_version TEXT NOT NULL CHECK (claim_protocol_version = 'v2'),
+    source_wait_deadline TEXT NOT NULL CHECK (
+        typeof(source_wait_deadline) = 'text'
+        AND length(source_wait_deadline) = 32
+        AND source_wait_deadline GLOB {_CANONICAL_UTC_TIMESTAMP_GLOB}
+        AND julianday(source_wait_deadline) IS NOT NULL
+AND substr(source_wait_deadline, 1, 10) = strftime('%Y-%m-%d', source_wait_deadline, '+0 days')
+AND substr(source_wait_deadline, 12, 8) = strftime('%H:%M:%S', source_wait_deadline, '+0 seconds')
+    ),
+    publication_deadline TEXT NOT NULL CHECK (
+        typeof(publication_deadline) = 'text'
+        AND length(publication_deadline) = 32
+        AND publication_deadline GLOB {_CANONICAL_UTC_TIMESTAMP_GLOB}
+        AND julianday(publication_deadline) IS NOT NULL
+AND substr(publication_deadline, 1, 10) = strftime('%Y-%m-%d', publication_deadline, '+0 days')
+AND substr(publication_deadline, 12, 8) = strftime('%H:%M:%S', publication_deadline, '+0 seconds')
+    ),
+    source_stage_authority_bytes BLOB NOT NULL CHECK (
+        typeof(source_stage_authority_bytes) = 'blob'
+    ),
+    source_stage_authority_hash TEXT NOT NULL CHECK (
+        typeof(source_stage_authority_hash) = 'text'
+        AND length(source_stage_authority_hash) = 64
+    ),
+    source_stage_binding_bytes BLOB,
+    source_stage_binding_hash TEXT CHECK (
+        source_stage_binding_hash IS NULL
+        OR (
+            typeof(source_stage_binding_hash) = 'text'
+            AND length(source_stage_binding_hash) = 64
+        )
+    ),
+    source_intent_bytes BLOB,
+    source_intent_hash TEXT CHECK (
+        source_intent_hash IS NULL
+        OR (typeof(source_intent_hash) = 'text' AND length(source_intent_hash) = 64)
+    ),
+    source_operation_id TEXT UNIQUE CHECK (
+        source_operation_id IS NULL
+        OR (typeof(source_operation_id) = 'text' AND length(source_operation_id) = 64)
+    ),
+    source_operation_hash TEXT CHECK (
+        source_operation_hash IS NULL
+        OR (typeof(source_operation_hash) = 'text' AND length(source_operation_hash) = 64)
+    ),
+    queued_source_stage_record_hash TEXT CHECK (
+        queued_source_stage_record_hash IS NULL
+        OR (
+            typeof(queued_source_stage_record_hash) = 'text'
+            AND length(queued_source_stage_record_hash) = 64
+            AND queued_source_stage_record_hash <> (
+                '0000000000000000000000000000000000000000000000000000000000000000'
+            )
+        )
+    ),
+    ready_source_stage_record_bytes BLOB,
+    ready_source_stage_record_hash TEXT CHECK (
+        ready_source_stage_record_hash IS NULL
+        OR (
+            typeof(ready_source_stage_record_hash) = 'text'
+            AND length(ready_source_stage_record_hash) = 64
+        )
+    ),
+    verified_source_outcome_hash TEXT CHECK (
+        verified_source_outcome_hash IS NULL
+        OR (
+            typeof(verified_source_outcome_hash) = 'text'
+            AND length(verified_source_outcome_hash) = 64
+        )
+    ),
+    verified_evidence_chain_hash TEXT CHECK (
+        verified_evidence_chain_hash IS NULL
+        OR (
+            typeof(verified_evidence_chain_hash) = 'text'
+            AND length(verified_evidence_chain_hash) = 64
+        )
+    ),
+    source_use_plan_bytes BLOB,
+    source_use_plan_hash TEXT CHECK (
+        source_use_plan_hash IS NULL
+        OR (typeof(source_use_plan_hash) = 'text' AND length(source_use_plan_hash) = 64)
+    ),
+    final_claim_bytes BLOB,
+    final_claim_hash TEXT CHECK (
+        final_claim_hash IS NULL
+        OR (typeof(final_claim_hash) = 'text' AND length(final_claim_hash) = 64)
+    ),
+    current_claim_receipt_bytes BLOB,
+    current_claim_receipt_hash TEXT CHECK (
+        current_claim_receipt_hash IS NULL
+        OR (typeof(current_claim_receipt_hash) = 'text' AND length(current_claim_receipt_hash) = 64)
+    ),
+    spool_receipt_bytes BLOB,
+    spool_receipt_hash TEXT CHECK (
+        spool_receipt_hash IS NULL
+        OR (typeof(spool_receipt_hash) = 'text' AND length(spool_receipt_hash) = 64)
+    ),
+    status TEXT NOT NULL CHECK (
+        status IN ('HELD_SOURCE','SOURCE_QUEUED','READY_TO_PUBLISH','PUBLISHED','ABORTED')
+    ),
+    version INTEGER NOT NULL CHECK (typeof(version) = 'integer' AND version >= 0),
+    created_at TEXT NOT NULL CHECK (
+        typeof(created_at) = 'text'
+        AND length(created_at) = 32
+        AND created_at GLOB {_CANONICAL_UTC_TIMESTAMP_GLOB}
+    ),
+    updated_at TEXT NOT NULL CHECK (
+        typeof(updated_at) = 'text'
+        AND length(updated_at) = 32
+        AND updated_at GLOB {_CANONICAL_UTC_TIMESTAMP_GLOB}
+    ),
+    queued_at TEXT,
+    ready_at TEXT,
+    published_at TEXT,
+    aborted_at TEXT,
+    terminal_reason TEXT,
+    record_commitment TEXT NOT NULL CHECK (
+        typeof(record_commitment) = 'text' AND length(record_commitment) = 64
+    ),
+    CHECK (source_wait_deadline <= publication_deadline),
+    UNIQUE (
+        job_id,
+        shard_id,
+        claim_token,
+        claim_generation,
+        scheduler_fencing_token,
+        worker_id,
+        spec_hash,
+        plan_hash,
+        payload_hash
+    ),
+    FOREIGN KEY (job_id, shard_id) REFERENCES lab_shard(job_id, shard_id) ON DELETE RESTRICT,
+    CHECK ((source_stage_binding_bytes IS NULL) = (source_stage_binding_hash IS NULL)),
+    CHECK ((source_intent_bytes IS NULL) = (source_intent_hash IS NULL)),
+    CHECK ((ready_source_stage_record_bytes IS NULL) = (ready_source_stage_record_hash IS NULL)),
+    CHECK ((source_use_plan_bytes IS NULL) = (source_use_plan_hash IS NULL)),
+    CHECK ((final_claim_bytes IS NULL) = (final_claim_hash IS NULL)),
+    CHECK ((current_claim_receipt_bytes IS NULL) = (current_claim_receipt_hash IS NULL)),
+    CHECK ((spool_receipt_bytes IS NULL) = (spool_receipt_hash IS NULL)),
+    CHECK (
+        (
+            status = 'HELD_SOURCE'
+            AND version = 0
+            AND source_stage_binding_bytes IS NULL
+            AND source_intent_bytes IS NULL
+            AND source_operation_id IS NULL
+            AND source_operation_hash IS NULL
+            AND queued_source_stage_record_hash IS NULL
+            AND ready_source_stage_record_bytes IS NULL
+            AND verified_source_outcome_hash IS NULL
+            AND verified_evidence_chain_hash IS NULL
+            AND source_use_plan_bytes IS NULL
+            AND final_claim_bytes IS NULL
+            AND current_claim_receipt_bytes IS NULL
+            AND spool_receipt_bytes IS NULL
+            AND queued_at IS NULL
+            AND ready_at IS NULL
+            AND published_at IS NULL
+            AND aborted_at IS NULL
+            AND terminal_reason IS NULL
+        )
+        OR (
+            status = 'SOURCE_QUEUED'
+            AND version = 1
+            AND source_stage_binding_bytes IS NOT NULL
+            AND source_intent_bytes IS NOT NULL
+            AND source_operation_id IS NOT NULL
+            AND source_operation_hash IS NOT NULL
+            AND queued_source_stage_record_hash IS NOT NULL
+            AND ready_source_stage_record_bytes IS NULL
+            AND verified_source_outcome_hash IS NULL
+            AND verified_evidence_chain_hash IS NULL
+            AND source_use_plan_bytes IS NULL
+            AND final_claim_bytes IS NULL
+            AND current_claim_receipt_bytes IS NULL
+            AND spool_receipt_bytes IS NULL
+            AND queued_at IS NOT NULL
+            AND ready_at IS NULL
+            AND published_at IS NULL
+            AND aborted_at IS NULL
+            AND terminal_reason IS NULL
+        )
+        OR (
+            status = 'READY_TO_PUBLISH'
+            AND version = 2
+            AND source_stage_binding_bytes IS NOT NULL
+            AND source_intent_bytes IS NOT NULL
+            AND source_operation_id IS NOT NULL
+            AND source_operation_hash IS NOT NULL
+            AND queued_source_stage_record_hash IS NOT NULL
+            AND ready_source_stage_record_bytes IS NOT NULL
+            AND verified_source_outcome_hash IS NOT NULL
+            AND verified_evidence_chain_hash IS NOT NULL
+            AND source_use_plan_bytes IS NOT NULL
+            AND final_claim_bytes IS NOT NULL
+            AND current_claim_receipt_bytes IS NOT NULL
+            AND spool_receipt_bytes IS NULL
+            AND queued_at IS NOT NULL
+            AND ready_at IS NOT NULL
+            AND published_at IS NULL
+            AND aborted_at IS NULL
+            AND terminal_reason IS NULL
+        )
+        OR (
+            status = 'PUBLISHED'
+            AND version = 3
+            AND source_stage_binding_bytes IS NOT NULL
+            AND source_intent_bytes IS NOT NULL
+            AND source_operation_id IS NOT NULL
+            AND source_operation_hash IS NOT NULL
+            AND queued_source_stage_record_hash IS NOT NULL
+            AND ready_source_stage_record_bytes IS NOT NULL
+            AND verified_source_outcome_hash IS NOT NULL
+            AND verified_evidence_chain_hash IS NOT NULL
+            AND source_use_plan_bytes IS NOT NULL
+            AND final_claim_bytes IS NOT NULL
+            AND current_claim_receipt_bytes IS NOT NULL
+            AND spool_receipt_bytes IS NOT NULL
+            AND queued_at IS NOT NULL
+            AND ready_at IS NOT NULL
+            AND published_at IS NOT NULL
+            AND aborted_at IS NULL
+            AND terminal_reason IS NULL
+        )
+        OR (
+            status = 'ABORTED'
+            AND version IN (1, 2, 3)
+            AND aborted_at IS NOT NULL
+            AND published_at IS NULL
+            AND spool_receipt_bytes IS NULL
+            AND terminal_reason IS NOT NULL
+            AND (
+                (
+                    version = 1
+                    AND source_stage_binding_bytes IS NULL
+                    AND source_intent_bytes IS NULL
+                    AND source_operation_id IS NULL
+                    AND source_operation_hash IS NULL
+                    AND queued_source_stage_record_hash IS NULL
+                    AND ready_source_stage_record_bytes IS NULL
+                    AND verified_source_outcome_hash IS NULL
+                    AND verified_evidence_chain_hash IS NULL
+                    AND source_use_plan_bytes IS NULL
+                    AND final_claim_bytes IS NULL
+                    AND current_claim_receipt_bytes IS NULL
+                    AND queued_at IS NULL
+                    AND ready_at IS NULL
+                )
+                OR (
+                    version = 2
+                    AND source_stage_binding_bytes IS NOT NULL
+                    AND source_intent_bytes IS NOT NULL
+                    AND source_operation_id IS NOT NULL
+                    AND source_operation_hash IS NOT NULL
+                    AND queued_source_stage_record_hash IS NOT NULL
+                    AND ready_source_stage_record_bytes IS NULL
+                    AND verified_source_outcome_hash IS NULL
+                    AND verified_evidence_chain_hash IS NULL
+                    AND source_use_plan_bytes IS NULL
+                    AND final_claim_bytes IS NULL
+                    AND current_claim_receipt_bytes IS NULL
+                    AND queued_at IS NOT NULL
+                    AND ready_at IS NULL
+                )
+                OR (
+                    version = 3
+                    AND source_stage_binding_bytes IS NOT NULL
+                    AND source_intent_bytes IS NOT NULL
+                    AND source_operation_id IS NOT NULL
+                    AND source_operation_hash IS NOT NULL
+                    AND queued_source_stage_record_hash IS NOT NULL
+                    AND ready_source_stage_record_bytes IS NOT NULL
+                    AND verified_source_outcome_hash IS NOT NULL
+                    AND verified_evidence_chain_hash IS NOT NULL
+                    AND source_use_plan_bytes IS NOT NULL
+                    AND final_claim_bytes IS NOT NULL
+                    AND current_claim_receipt_bytes IS NOT NULL
+                    AND queued_at IS NOT NULL
+                    AND ready_at IS NOT NULL
+                )
+            )
+        )
+    )
+)
+"""
+_CLAIM_PUBLICATION_AUDIT_TABLE_STATEMENT = f"""
+CREATE TABLE IF NOT EXISTS lab_claim_publication_audit (
+    audit_ref TEXT PRIMARY KEY CHECK (typeof(audit_ref) = 'text'),
+    attempt_id TEXT NOT NULL CHECK (typeof(attempt_id) = 'text'),
+    action TEXT NOT NULL CHECK (action IN ('created','transitioned','replayed','conflict')),
+    prior_status TEXT CHECK (
+        prior_status IS NULL
+        OR prior_status IN ('HELD_SOURCE','SOURCE_QUEUED','READY_TO_PUBLISH','PUBLISHED','ABORTED')
+    ),
+    new_status TEXT NOT NULL CHECK (
+        new_status IN ('HELD_SOURCE','SOURCE_QUEUED','READY_TO_PUBLISH','PUBLISHED','ABORTED')
+    ),
+    reason_code TEXT NOT NULL CHECK (typeof(reason_code) = 'text'),
+    record_commitment TEXT NOT NULL CHECK (
+        typeof(record_commitment) = 'text' AND length(record_commitment) = 64
+    ),
+    occurred_at TEXT NOT NULL CHECK (
+        typeof(occurred_at) = 'text'
+        AND length(occurred_at) = 32
+        AND occurred_at GLOB {_CANONICAL_UTC_TIMESTAMP_GLOB}
+    ),
+    audit_hash TEXT NOT NULL CHECK (typeof(audit_hash) = 'text' AND length(audit_hash) = 64),
+    FOREIGN KEY (attempt_id) REFERENCES lab_claim_publication(attempt_id) ON DELETE RESTRICT
+)
+"""
+_CLAIM_PUBLICATION_HELD_DEADLINE_INDEX_STATEMENT = """
+CREATE INDEX IF NOT EXISTS ix_lab_claim_publication_held_deadline
+ON lab_claim_publication(status, source_wait_deadline, attempt_id)
+WHERE status IN ('HELD_SOURCE','SOURCE_QUEUED')
+"""
+_CLAIM_PUBLICATION_RECONCILE_INDEX_STATEMENT = """
+CREATE INDEX IF NOT EXISTS ix_lab_claim_publication_reconcile_deadline
+ON lab_claim_publication(status, publication_deadline, attempt_id)
+WHERE status = 'READY_TO_PUBLISH'
+"""
+_CLAIM_PUBLICATION_AUDIT_INDEX_STATEMENT = """
+CREATE INDEX IF NOT EXISTS ix_lab_claim_publication_audit_attempt
+ON lab_claim_publication_audit(attempt_id, occurred_at, audit_ref)
+"""
+_CLAIM_PUBLICATION_INSERT_AUTH_TRIGGER = f"""
+CREATE TRIGGER IF NOT EXISTS trg_lab_claim_publication_insert_auth
+BEFORE INSERT ON lab_claim_publication
+WHEN {_CLAIM_PUBLICATION_AUTH_FUNCTION}(
+    NEW.attempt_id, NEW.status, NEW.version, NEW.record_commitment
+) <> 1
+BEGIN
+    SELECT RAISE(ABORT, 'publication mutation is not authorized');
+END
+"""
+_CLAIM_PUBLICATION_UPDATE_AUTH_TRIGGER = f"""
+CREATE TRIGGER IF NOT EXISTS trg_lab_claim_publication_update_auth
+BEFORE UPDATE ON lab_claim_publication
+WHEN {_CLAIM_PUBLICATION_AUTH_FUNCTION}(
+    NEW.attempt_id, NEW.status, NEW.version, NEW.record_commitment
+) <> 1
+BEGIN
+    SELECT RAISE(ABORT, 'publication mutation is not authorized');
+END
+"""
+_CLAIM_PUBLICATION_AUDIT_INSERT_AUTH_TRIGGER = f"""
+CREATE TRIGGER IF NOT EXISTS trg_lab_claim_publication_audit_insert_auth
+BEFORE INSERT ON lab_claim_publication_audit
+WHEN {_CLAIM_PUBLICATION_AUDIT_AUTH_FUNCTION}(
+    NEW.audit_ref, NEW.attempt_id, NEW.action, NEW.audit_hash
+) <> 1
+BEGIN
+    SELECT RAISE(ABORT, 'publication audit mutation is not authorized');
+END
+"""
+_CLAIM_PUBLICATION_UPDATE_GUARD_TRIGGER = """
+CREATE TRIGGER IF NOT EXISTS trg_lab_claim_publication_update_guard
+BEFORE UPDATE ON lab_claim_publication
+WHEN OLD.status IN ('PUBLISHED','ABORTED')
+ OR NEW.attempt_id IS NOT OLD.attempt_id
+ OR NEW.job_id IS NOT OLD.job_id
+ OR NEW.shard_id IS NOT OLD.shard_id
+ OR NEW.claim_token IS NOT OLD.claim_token
+ OR NEW.claim_generation IS NOT OLD.claim_generation
+ OR NEW.scheduler_fencing_token IS NOT OLD.scheduler_fencing_token
+ OR NEW.worker_id IS NOT OLD.worker_id
+ OR NEW.spec_hash IS NOT OLD.spec_hash
+ OR NEW.plan_hash IS NOT OLD.plan_hash
+ OR NEW.payload_hash IS NOT OLD.payload_hash
+ OR NEW.claim_preimage_bytes IS NOT OLD.claim_preimage_bytes
+ OR NEW.claim_preimage_hash IS NOT OLD.claim_preimage_hash
+ OR NEW.claim_protocol IS NOT OLD.claim_protocol
+ OR NEW.claim_protocol_version IS NOT OLD.claim_protocol_version
+ OR NEW.source_wait_deadline IS NOT OLD.source_wait_deadline
+ OR NEW.publication_deadline IS NOT OLD.publication_deadline
+ OR NEW.source_stage_authority_bytes IS NOT OLD.source_stage_authority_bytes
+ OR NEW.source_stage_authority_hash IS NOT OLD.source_stage_authority_hash
+ OR NEW.created_at IS NOT OLD.created_at
+ OR NOT (
+    (OLD.status = 'HELD_SOURCE' AND NEW.status IN ('SOURCE_QUEUED','ABORTED'))
+    OR (OLD.status = 'SOURCE_QUEUED' AND NEW.status IN ('READY_TO_PUBLISH','ABORTED'))
+    OR (OLD.status = 'READY_TO_PUBLISH' AND NEW.status IN ('PUBLISHED','ABORTED'))
+ )
+ OR NEW.version <> OLD.version + 1
+ OR (
+    OLD.status <> 'HELD_SOURCE'
+    AND (
+        NEW.source_stage_binding_bytes IS NOT OLD.source_stage_binding_bytes
+        OR NEW.source_stage_binding_hash IS NOT OLD.source_stage_binding_hash
+        OR NEW.source_intent_bytes IS NOT OLD.source_intent_bytes
+        OR NEW.source_intent_hash IS NOT OLD.source_intent_hash
+        OR NEW.source_operation_id IS NOT OLD.source_operation_id
+        OR NEW.source_operation_hash IS NOT OLD.source_operation_hash
+        OR NEW.queued_source_stage_record_hash IS NOT OLD.queued_source_stage_record_hash
+        OR NEW.queued_at IS NOT OLD.queued_at
+    )
+ )
+ OR (
+    OLD.status <> 'SOURCE_QUEUED'
+    AND (
+        NEW.ready_source_stage_record_bytes IS NOT OLD.ready_source_stage_record_bytes
+        OR NEW.ready_source_stage_record_hash IS NOT OLD.ready_source_stage_record_hash
+        OR NEW.verified_source_outcome_hash IS NOT OLD.verified_source_outcome_hash
+        OR NEW.verified_evidence_chain_hash IS NOT OLD.verified_evidence_chain_hash
+        OR NEW.source_use_plan_bytes IS NOT OLD.source_use_plan_bytes
+        OR NEW.source_use_plan_hash IS NOT OLD.source_use_plan_hash
+        OR NEW.final_claim_bytes IS NOT OLD.final_claim_bytes
+        OR NEW.final_claim_hash IS NOT OLD.final_claim_hash
+        OR NEW.current_claim_receipt_bytes IS NOT OLD.current_claim_receipt_bytes
+        OR NEW.current_claim_receipt_hash IS NOT OLD.current_claim_receipt_hash
+        OR NEW.ready_at IS NOT OLD.ready_at
+    )
+ )
+ OR (
+    OLD.status <> 'READY_TO_PUBLISH'
+    AND (
+        NEW.spool_receipt_bytes IS NOT OLD.spool_receipt_bytes
+        OR NEW.spool_receipt_hash IS NOT OLD.spool_receipt_hash
+        OR NEW.published_at IS NOT OLD.published_at
+    )
+ )
+ OR (
+    NEW.status <> 'ABORTED'
+    AND (
+        NEW.aborted_at IS NOT OLD.aborted_at
+        OR NEW.terminal_reason IS NOT OLD.terminal_reason
+    )
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'terminal publication is immutable');
+END
+"""
+_CLAIM_PUBLICATION_NO_DELETE_TRIGGER = """
+CREATE TRIGGER IF NOT EXISTS trg_lab_claim_publication_no_delete
+BEFORE DELETE ON lab_claim_publication
+BEGIN
+    SELECT RAISE(ABORT, 'claim publication is immutable');
+END
+"""
+_CLAIM_PUBLICATION_AUDIT_NO_UPDATE_TRIGGER = """
+CREATE TRIGGER IF NOT EXISTS trg_lab_claim_publication_audit_no_update
+BEFORE UPDATE ON lab_claim_publication_audit
+BEGIN
+    SELECT RAISE(ABORT, 'claim publication audit is immutable');
+END
+"""
+_CLAIM_PUBLICATION_AUDIT_NO_DELETE_TRIGGER = """
+CREATE TRIGGER IF NOT EXISTS trg_lab_claim_publication_audit_no_delete
+BEFORE DELETE ON lab_claim_publication_audit
+BEGIN
+    SELECT RAISE(ABORT, 'claim publication audit is immutable');
+END
+"""
+
+_V8_LEDGER_EPOCH_TRIGGER_SQL = {
+    f"trg_lab_epoch_{table}_{action.lower()}": _ledger_epoch_trigger_statement(table, action)
+    for table in ("lab_claim_publication", "lab_claim_publication_audit")
+    for action in ("INSERT", "UPDATE", "DELETE")
+}
+_V8_PUBLICATION_TRIGGER_SQL = {
+    "trg_lab_claim_publication_insert_auth": _CLAIM_PUBLICATION_INSERT_AUTH_TRIGGER,
+    "trg_lab_claim_publication_update_auth": _CLAIM_PUBLICATION_UPDATE_AUTH_TRIGGER,
+    "trg_lab_claim_publication_audit_insert_auth": (_CLAIM_PUBLICATION_AUDIT_INSERT_AUTH_TRIGGER),
+    "trg_lab_claim_publication_update_guard": _CLAIM_PUBLICATION_UPDATE_GUARD_TRIGGER,
+    "trg_lab_claim_publication_no_delete": _CLAIM_PUBLICATION_NO_DELETE_TRIGGER,
+    "trg_lab_claim_publication_audit_no_update": _CLAIM_PUBLICATION_AUDIT_NO_UPDATE_TRIGGER,
+    "trg_lab_claim_publication_audit_no_delete": _CLAIM_PUBLICATION_AUDIT_NO_DELETE_TRIGGER,
+    **_V8_LEDGER_EPOCH_TRIGGER_SQL,
+}
+_V8_SCHEMA_STATEMENTS = _V7_SCHEMA_STATEMENTS + (
+    _CLAIM_PUBLICATION_TABLE_STATEMENT,
+    _CLAIM_PUBLICATION_AUDIT_TABLE_STATEMENT,
+    _CLAIM_PUBLICATION_HELD_DEADLINE_INDEX_STATEMENT,
+    _CLAIM_PUBLICATION_RECONCILE_INDEX_STATEMENT,
+    _CLAIM_PUBLICATION_AUDIT_INDEX_STATEMENT,
+    *_V8_PUBLICATION_TRIGGER_SQL.values(),
+)
+_ACTIVE_CLAIMS_INDEX_STATEMENT = """
+CREATE INDEX IF NOT EXISTS ix_lab_shard_active_claims
+ON lab_shard(
+    status, scheduler_fencing_token, lease_expires_at,
+    job_id, shard_index, shard_id
+)
+WHERE status = 'running'
+"""
+_STALE_RECOVERY_INDEX_STATEMENT = """
+CREATE INDEX IF NOT EXISTS ix_lab_shard_stale_recovery
+ON lab_shard(status, lease_expires_at, job_id, shard_index, shard_id)
+WHERE status = 'running'
+"""
+_V9_SCHEMA_STATEMENTS = _V8_SCHEMA_STATEMENTS + (
+    _ACTIVE_CLAIMS_INDEX_STATEMENT,
+    _STALE_RECOVERY_INDEX_STATEMENT,
+)
+_V10_STALE_RECOVERY_INDEX_STATEMENT = """
+CREATE INDEX IF NOT EXISTS ix_lab_shard_stale_recovery
+ON lab_shard(
+    status, payload_protocol_version, job_id, shard_index, shard_id, lease_expires_at
+)
+WHERE status = 'running' AND payload_protocol_version = 1
+"""
+_V10_V2_RECONCILIATION_INDEX_STATEMENT = """
+CREATE INDEX IF NOT EXISTS ix_lab_shard_v2_reconciliation
+ON lab_shard(job_id, shard_id, lease_expires_at)
+WHERE status = 'running' AND payload_protocol_version = 2
+"""
+_V10_PAYLOAD_PROTOCOL_INSERT_TRIGGER = """
+CREATE TRIGGER IF NOT EXISTS trg_lab_shard_payload_protocol_insert
+BEFORE INSERT ON lab_shard
+WHEN (
+    json_valid(NEW.payload_json) <> 1
+    OR NEW.payload_protocol_version <> CASE
+        WHEN json_type(NEW.payload_json, '$.schema_version') IS NULL THEN 1
+        WHEN json_type(NEW.payload_json, '$.schema_version') = 'integer'
+             AND json_extract(NEW.payload_json, '$.schema_version') IN (1, 2)
+            THEN json_extract(NEW.payload_json, '$.schema_version')
+        ELSE 0
+    END
+)
+BEGIN
+    SELECT RAISE(ABORT, 'shard payload protocol conflicts with payload_json');
+END
+"""
+_V10_PAYLOAD_PROTOCOL_UPDATE_TRIGGER = """
+CREATE TRIGGER IF NOT EXISTS trg_lab_shard_payload_protocol_update
+BEFORE UPDATE OF payload_json, payload_protocol_version ON lab_shard
+WHEN (
+    json_valid(NEW.payload_json) <> 1
+    OR NEW.payload_protocol_version <> CASE
+        WHEN json_type(NEW.payload_json, '$.schema_version') IS NULL THEN 1
+        WHEN json_type(NEW.payload_json, '$.schema_version') = 'integer'
+             AND json_extract(NEW.payload_json, '$.schema_version') IN (1, 2)
+            THEN json_extract(NEW.payload_json, '$.schema_version')
+        ELSE 0
+    END
+)
+BEGIN
+    SELECT RAISE(ABORT, 'shard payload protocol conflicts with payload_json');
+END
+"""
+_V10_PAYLOAD_PROTOCOL_TRIGGER_SQL = {
+    "trg_lab_shard_payload_protocol_insert": _V10_PAYLOAD_PROTOCOL_INSERT_TRIGGER,
+    "trg_lab_shard_payload_protocol_update": _V10_PAYLOAD_PROTOCOL_UPDATE_TRIGGER,
+}
+_V10_SCHEMA_STATEMENTS = _V9_SCHEMA_STATEMENTS + (
+    _V10_STALE_RECOVERY_INDEX_STATEMENT,
+    _V10_V2_RECONCILIATION_INDEX_STATEMENT,
+    *_V10_PAYLOAD_PROTOCOL_TRIGGER_SQL.values(),
+)
+_RECOVERY_CURSOR_TABLE_STATEMENT = """
+CREATE TABLE IF NOT EXISTS lab_recovery_cursor (
+    cursor_key TEXT PRIMARY KEY CHECK (
+        typeof(cursor_key) = 'text' AND cursor_key = 'idle_control'
+    ),
+    cursor_created_at TEXT NOT NULL CHECK (typeof(cursor_created_at) = 'text'),
+    cursor_job_id TEXT NOT NULL CHECK (
+        typeof(cursor_job_id) = 'text' AND length(cursor_job_id) = 36
+    ),
+    updated_at TEXT NOT NULL CHECK (typeof(updated_at) = 'text')
+)
+"""
+_V11_EXHAUSTED_QUEUED_V1_RECOVERY_INDEX_STATEMENT = """
+CREATE INDEX IF NOT EXISTS ix_lab_shard_exhausted_queued_v1_recovery
+ON lab_shard(status, payload_protocol_version, job_id, shard_index, shard_id)
+WHERE payload_protocol_version = 1
+  AND status = 'queued'
+  AND attempt_count >= max_attempts
+"""
+_V11_EXHAUSTED_CHECKPOINTED_V1_RECOVERY_INDEX_STATEMENT = """
+CREATE INDEX IF NOT EXISTS ix_lab_shard_exhausted_checkpointed_v1_recovery
+ON lab_shard(status, payload_protocol_version, job_id, shard_index, shard_id)
+WHERE payload_protocol_version = 1
+  AND status = 'checkpointed'
+  AND attempt_count >= max_attempts
+"""
+_V11_IDLE_CONTROL_RECOVERY_INDEX_STATEMENT = """
+CREATE INDEX IF NOT EXISTS ix_lab_job_idle_control_recovery
+ON lab_job(status, created_at, job_id)
+WHERE status = 'running'
+"""
+_V11_SCHEMA_STATEMENTS = _V10_SCHEMA_STATEMENTS + (
+    _RECOVERY_CURSOR_TABLE_STATEMENT,
+    _V11_EXHAUSTED_QUEUED_V1_RECOVERY_INDEX_STATEMENT,
+    _V11_EXHAUSTED_CHECKPOINTED_V1_RECOVERY_INDEX_STATEMENT,
+    _V11_IDLE_CONTROL_RECOVERY_INDEX_STATEMENT,
+)
+_V12_IDLE_CONTROL_RECOVERY_INDEX_STATEMENT = """
+CREATE INDEX IF NOT EXISTS ix_lab_job_idle_control_recovery
+ON lab_job(status, created_at, job_id)
+WHERE status = 'running'
+  AND control_intent IN ('pause_requested', 'cancel_requested')
+"""
+_V12_IDLE_CONTROL_SHARD_INDEX_STATEMENT = """
+CREATE INDEX IF NOT EXISTS ix_lab_shard_idle_control_eligibility
+ON lab_shard(job_id, status)
+"""
+_V12_SCHEMA_STATEMENTS = _V11_SCHEMA_STATEMENTS[:-1] + (
+    _V12_IDLE_CONTROL_RECOVERY_INDEX_STATEMENT,
+    _V12_IDLE_CONTROL_SHARD_INDEX_STATEMENT,
+)
+_V13_PRECLAIM_CANDIDATE_INDEX_STATEMENT = """
+CREATE INDEX IF NOT EXISTS ix_lab_shard_preclaim_candidate
+ON lab_shard(job_id, shard_index, shard_id, payload_protocol_version)
+WHERE status = 'queued'
+"""
+_V13_SCHEMA_STATEMENTS = _V12_SCHEMA_STATEMENTS + (_V13_PRECLAIM_CANDIDATE_INDEX_STATEMENT,)
+_V14_PRECLAIM_FAIR_CURSOR_TABLE_STATEMENT = """
+CREATE TABLE IF NOT EXISTS lab_preclaim_fair_cursor (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    claim_cursor_created_at TEXT,
+    claim_cursor_job_id TEXT,
+    claim_cursor_shard_index INTEGER,
+    claim_cursor_shard_id TEXT,
+    updated_at TEXT NOT NULL CHECK (typeof(updated_at) = 'text'),
+    CHECK (
+        (claim_cursor_created_at IS NULL AND claim_cursor_job_id IS NULL
+         AND claim_cursor_shard_index IS NULL AND claim_cursor_shard_id IS NULL)
+        OR
+        (typeof(claim_cursor_created_at) = 'text' AND typeof(claim_cursor_job_id) = 'text'
+         AND typeof(claim_cursor_shard_index) = 'integer'
+         AND claim_cursor_shard_index >= 0 AND typeof(claim_cursor_shard_id) = 'text')
+    )
+)
+"""
+_V15_FINALIZER_LEASE_TABLE_STATEMENT = """
+CREATE TABLE IF NOT EXISTS lab_claim_publication_finalizer_lease (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    canonical_job_store_path TEXT NOT NULL CHECK (typeof(canonical_job_store_path) = 'text'),
+    database_device INTEGER NOT NULL CHECK (typeof(database_device) = 'integer'),
+    database_inode INTEGER NOT NULL CHECK (typeof(database_inode) = 'integer'),
+    store_id TEXT NOT NULL CHECK (typeof(store_id) = 'text' AND length(store_id) = 64),
+    schema_version INTEGER NOT NULL CHECK (
+        typeof(schema_version) = 'integer' AND schema_version >= 1
+    ),
+    implementation_digest TEXT NOT NULL CHECK (
+        typeof(implementation_digest) = 'text' AND length(implementation_digest) = 64
+    ),
+    owner_id TEXT NOT NULL CHECK (typeof(owner_id) = 'text' AND length(owner_id) BETWEEN 1 AND 200),
+    lease_id INTEGER NOT NULL CHECK (typeof(lease_id) = 'integer' AND lease_id >= 1),
+    fencing_token INTEGER NOT NULL CHECK (typeof(fencing_token) = 'integer' AND fencing_token >= 1),
+    root_descriptor TEXT NOT NULL CHECK (
+        typeof(root_descriptor) = 'text' AND length(root_descriptor) BETWEEN 1 AND 200
+    ),
+    token_commitment TEXT NOT NULL CHECK (
+        typeof(token_commitment) = 'text' AND length(token_commitment) = 64
+    ),
+    lease_commitment TEXT NOT NULL CHECK (
+        typeof(lease_commitment) = 'text' AND length(lease_commitment) = 64
+    ),
+    acquired_at TEXT NOT NULL CHECK (typeof(acquired_at) = 'text'),
+    heartbeat_at TEXT NOT NULL CHECK (typeof(heartbeat_at) = 'text'),
+    expires_at TEXT NOT NULL CHECK (typeof(expires_at) = 'text'),
+    released_at TEXT,
+    CHECK (expires_at > acquired_at)
+)
+"""
+_V15_FINALIZER_ROOT_ANCHOR_TABLE_STATEMENT = """
+CREATE TABLE IF NOT EXISTS lab_claim_publication_finalizer_root_anchor (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    root_descriptor TEXT NOT NULL CHECK (
+        typeof(root_descriptor) = 'text' AND length(root_descriptor) BETWEEN 1 AND 200
+    ),
+    root_key_digest TEXT NOT NULL CHECK (
+        typeof(root_key_digest) = 'text' AND length(root_key_digest) = 64
+    )
+) STRICT
+"""
+_V15_FINALIZER_OBSERVATION_TABLE_STATEMENT = """
+CREATE TABLE IF NOT EXISTS lab_claim_publication_finalizer_observation (
+    observation_ref TEXT PRIMARY KEY CHECK (typeof(observation_ref) = 'text'),
+    attempt_id TEXT NOT NULL CHECK (typeof(attempt_id) = 'text'),
+    authority_fencing_token INTEGER NOT NULL CHECK (
+        typeof(authority_fencing_token) = 'integer' AND authority_fencing_token >= 1
+    ),
+    event_type TEXT NOT NULL CHECK (event_type IN ('ready','published','replayed','blocked')),
+    reason_code TEXT NOT NULL CHECK (
+        typeof(reason_code) = 'text' AND length(reason_code) BETWEEN 1 AND 64
+    ),
+    record_commitment TEXT CHECK (
+        record_commitment IS NULL
+        OR (typeof(record_commitment) = 'text' AND length(record_commitment) = 64)
+    ),
+    observed_at TEXT NOT NULL CHECK (typeof(observed_at) = 'text'),
+    UNIQUE(attempt_id, authority_fencing_token, event_type, reason_code, record_commitment),
+    FOREIGN KEY (attempt_id) REFERENCES lab_claim_publication(attempt_id) ON DELETE RESTRICT
+)
+"""
+_V15_FINALIZER_OBSERVATION_INDEX_STATEMENT = """
+CREATE INDEX IF NOT EXISTS ix_lab_claim_publication_finalizer_observation_attempt
+ON lab_claim_publication_finalizer_observation(attempt_id, observed_at, observation_ref)
+"""
+_V16_FINALIZER_ATTESTATION_TABLE_STATEMENT = """
+CREATE TABLE IF NOT EXISTS lab_claim_publication_finalizer_attestation (
+    attempt_id TEXT NOT NULL CHECK (typeof(attempt_id) = 'text'),
+    publication_status TEXT NOT NULL CHECK (
+        publication_status IN ('READY_TO_PUBLISH', 'PUBLISHED')
+    ),
+    certificate_bytes BLOB NOT NULL CHECK (typeof(certificate_bytes) = 'blob'),
+    certificate_hash TEXT NOT NULL CHECK (
+        typeof(certificate_hash) = 'text' AND length(certificate_hash) = 64
+    ),
+    attestation_bytes BLOB NOT NULL CHECK (typeof(attestation_bytes) = 'blob'),
+    attestation_hash TEXT NOT NULL CHECK (
+        typeof(attestation_hash) = 'text' AND length(attestation_hash) = 64
+    ),
+    created_at TEXT NOT NULL CHECK (typeof(created_at) = 'text'),
+    PRIMARY KEY (attempt_id, publication_status),
+    FOREIGN KEY (attempt_id) REFERENCES lab_claim_publication(attempt_id) ON DELETE RESTRICT
+) STRICT
+"""
+_V16_FINALIZER_TRUST_CACHE_TABLE_STATEMENT = """
+CREATE TABLE IF NOT EXISTS lab_claim_publication_finalizer_trust_cache (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    certificate_bytes BLOB NOT NULL CHECK (typeof(certificate_bytes) = 'blob'),
+    certificate_hash TEXT NOT NULL CHECK (
+        typeof(certificate_hash) = 'text' AND length(certificate_hash) = 64
+    ),
+    cached_at TEXT NOT NULL CHECK (typeof(cached_at) = 'text')
+) STRICT
+"""
+_V16_FINALIZER_OBSERVATION_DEGRADATION_TABLE_STATEMENT = """
+CREATE TABLE IF NOT EXISTS lab_claim_publication_finalizer_observation_degradation (
+    degradation_ref TEXT PRIMARY KEY CHECK (typeof(degradation_ref) = 'text'),
+    attempt_id TEXT NOT NULL CHECK (typeof(attempt_id) = 'text'),
+    publication_identity_hash TEXT NOT NULL CHECK (
+        typeof(publication_identity_hash) = 'text' AND length(publication_identity_hash) = 64
+    ),
+    authority_fencing_token INTEGER NOT NULL CHECK (
+        typeof(authority_fencing_token) = 'integer' AND authority_fencing_token >= 1
+    ),
+    event_type TEXT NOT NULL CHECK (event_type IN ('ready','published','replayed','blocked')),
+    reason_code TEXT NOT NULL CHECK (
+        typeof(reason_code) = 'text' AND length(reason_code) BETWEEN 1 AND 64
+    ),
+    reason_code_hash TEXT NOT NULL CHECK (
+        typeof(reason_code_hash) = 'text' AND length(reason_code_hash) = 64
+    ),
+    error_class TEXT NOT NULL CHECK (
+        typeof(error_class) = 'text' AND length(error_class) BETWEEN 1 AND 128
+    ),
+    next_retry_at TEXT NOT NULL CHECK (typeof(next_retry_at) = 'text'),
+    created_at TEXT NOT NULL CHECK (typeof(created_at) = 'text'),
+    drained_at TEXT,
+    UNIQUE(
+        attempt_id, publication_identity_hash, authority_fencing_token,
+        event_type, reason_code_hash, error_class
+    ),
+    FOREIGN KEY (attempt_id) REFERENCES lab_claim_publication(attempt_id) ON DELETE RESTRICT
+) STRICT
+"""
+_V16_FINALIZER_OBSERVATION_DEGRADATION_INDEX_STATEMENT = """
+CREATE INDEX IF NOT EXISTS ix_lab_claim_publication_finalizer_degradation_due
+ON lab_claim_publication_finalizer_observation_degradation(
+    drained_at, next_retry_at, created_at, degradation_ref
+)
+"""
+_SCHEMA_STATEMENTS = _V9_SCHEMA_STATEMENTS

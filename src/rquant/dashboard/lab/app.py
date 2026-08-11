@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import stat
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -14,57 +15,74 @@ from uuid import UUID, uuid4
 
 import pandas as pd
 import streamlit as st
+from pydantic import TypeAdapter
 
 from rquant.config import settings
 from rquant.dashboard.lab.job_center import (
+    RegistryBackedFormalExperimentResolver,
     StrategyLabJobCenterController,
     StrategyLabSubmissionContext,
 )
+from rquant.dashboard.serving_page_data import ServingPageRenderContext
+from rquant.dashboard.serving_page_ui import render_serving_state_banner
 from rquant.dashboard.strategy_lab_data import (
     TUSHARE_PERMISSION_LABELS,
     TUSHARE_STAGE_LABELS,
     TUSHARE_STATUS_LABELS,
-    dataframe_preview,
+    TushareMetadataResult,
+    TushareMetadataState,
     format_tushare_catalog_display,
     growth_board_ablation_specs,
-    load_tushare_activity_packages,
-    load_tushare_interface_catalog,
-    load_tushare_purchase_goods,
+    load_tushare_activity_packages_state,
+    load_tushare_interface_catalog_state,
+    load_tushare_purchase_goods_state,
     safe_replay_end_date,
 )
-from rquant.dashboard.strategy_lab_runs import (
-    RUN_TYPE_LABELS,
-    list_strategy_lab_runs,
-)
-from rquant.lab_artifact_export import LabJobZipExportFacade
+from rquant.definition_registry import ImmutableDefinitionRegistry
+from rquant.experiment_registry import ExperimentRegistryReadonlyReader
+from rquant.job_center_authority import resolve_current_job_center_authority_binding
 from rquant.lab_artifact_preview import ArtifactPreviewReader
-from rquant.lab_artifacts import LabJobArtifactStore
+from rquant.lab_daemon import (
+    LabJobCenterAuthorityManifest,
+    load_lab_job_center_authority_manifest,
+)
 from rquant.lab_job_center import (
     AuctionGapRunInput,
     CommandSubmissionResult,
     GrowthBoardSurgeRunInput,
-    LabCommandSubmissionFacade,
     NShapeComparisonRunInput,
     NShapeOptimizationRunInput,
     ResearchRunInput,
 )
-from rquant.lab_job_protocol import LabCommandSpool
+from rquant.lab_job_protocol import (
+    CancelJobCommand,
+    LabCommand,
+    PauseJobCommand,
+    ResumeJobCommand,
+    RetryJobCommand,
+    SubmitJobCommand,
+)
 from rquant.lab_jobs import (
     JobStatus,
     LabJobDetail,
     LabJobListFilters,
     LabJobReader,
 )
+from rquant.page_control import (
+    DiscardLabArtifactZip,
+    ExportLabArtifactZip,
+    InitializeLabExports,
+    LabArtifactZipResult,
+    PageControlClient,
+    SubmitLabCommand,
+)
 from rquant.research_gate import (
     ResearchGateDecision,
-    ResearchGateFailure,
     ResearchGateRequest,
-    evaluate_store_research_gate,
     research_gate_metadata_ready,
 )
 from rquant.research_manifest import (
     CURRENT_RESEARCH_NOTICES,
-    RESEARCH_STATUS_LABELS,
     detect_verified_code_commit,
 )
 from rquant.research_run_spec import (
@@ -73,7 +91,7 @@ from rquant.research_run_spec import (
     ResearchJobType,
     ResourceClass,
 )
-from rquant.storage.duckdb import open_readonly_connection, open_readonly_store
+from rquant.strategy_evaluators import BuiltinStrategyEvaluatorRegistry
 from rquant.strategy_job_adapters import (
     AuctionGapParameters,
     GrowthBoardSurgeParameters,
@@ -102,6 +120,8 @@ _VARIANT_LABELS: Final = {
     "vp_risk_only": "90 日价量动态风控",
     "vp_90": "90 日价量过滤及风控",
 }
+_page_control = PageControlClient()
+_COMMAND_RESULT_ADAPTER = TypeAdapter(CommandSubmissionResult)
 _JOB_STATUS_LABELS: Final = {
     JobStatus.QUEUED: "排队",
     JobStatus.RUNNING: "运行中",
@@ -120,12 +140,18 @@ _RESOURCE_LABELS: Final = {
     ResourceClass.STANDARD: "标准",
     ResourceClass.HEAVY: "重型",
 }
+_page_serving_context: ServingPageRenderContext | None = None
 
 
 @dataclass(frozen=True)
 class _JobCenterRuntime:
     controller: StrategyLabJobCenterController
-    artifact_store: LabJobArtifactStore
+    experiment_registry: ExperimentRegistryReadonlyReader
+    definition_registry: ImmutableDefinitionRegistry
+
+
+class JobCenterRuntimeUnavailableError(RuntimeError):
+    """A formal Job Center authority is absent or cannot be verified."""
 
 
 @dataclass(frozen=True)
@@ -165,162 +191,189 @@ def _configure_page() -> None:
 
 @st.cache_resource
 def _job_center_runtime() -> _JobCenterRuntime:
-    _ensure_private_runtime_directory(settings.lab_runtime_dir_resolved)
-    reader = LabJobReader(settings.lab_jobs_path_resolved)
-    commands = LabCommandSubmissionFacade(
-        reader=reader,
-        spool=LabCommandSpool(settings.lab_job_command_dir_resolved),
+    try:
+        code_sha = _verified_code_sha()
+        if code_sha is None:
+            raise JobCenterRuntimeUnavailableError("Job Center 无法验证当前运行代码 SHA")
+        raw_deployment_root = os.environ.get("RQUANT_RUNTIME_ROOT", "")
+        if not raw_deployment_root:
+            raise JobCenterRuntimeUnavailableError(
+                "Job Center 缺少受控 RQUANT_RUNTIME_ROOT deployment profile"
+            )
+        binding = resolve_current_job_center_authority_binding(
+            Path(raw_deployment_root),
+            expected_code_sha=code_sha,
+            runtime_root=settings.lab_runtime_dir_resolved,
+            lab_jobs_path=settings.lab_jobs_path_resolved,
+            command_spool_path=settings.lab_job_command_dir_resolved,
+            final_artifact_root=settings.lab_final_artifact_dir_resolved,
+        )
+        _require_private_runtime_directory(binding.runtime_root)
+        manifest = load_lab_job_center_authority_manifest(
+            binding.runtime_root / "job-center-authority.json",
+            expected_code_sha=code_sha,
+            expected_research_root=binding.runtime_root,
+            expected_lab_jobs_path=binding.lab_jobs_path,
+            expected_command_spool_path=binding.command_spool_path,
+            expected_final_artifact_root=binding.final_artifact_root,
+            expected_runtime_deployment_root=binding.runtime_deployment_root,
+            expected_deployment_profile_id=binding.deployment_profile_id,
+            expected_deployment_generation_hash=binding.deployment_generation_hash,
+        )
+        return _build_job_center_runtime(manifest)
+    except JobCenterRuntimeUnavailableError:
+        raise
+    except Exception as exc:
+        raise JobCenterRuntimeUnavailableError(
+            f"Job Center authority manifest unavailable: {type(exc).__name__}: {exc}"
+        ) from exc
+
+
+def _build_job_center_runtime(
+    manifest: LabJobCenterAuthorityManifest,
+    *,
+    clock: Callable[[], datetime] | None = None,
+) -> _JobCenterRuntime:
+    authority = LabJobCenterAuthorityManifest.model_validate(manifest)
+    authority_clock = clock or (lambda: datetime.now(UTC))
+    required_files = (
+        authority.lab_jobs_path,
+        authority.experiment_registry_path,
+        authority.dataset_authority_path,
     )
-    artifact_root = settings.lab_final_artifact_dir_resolved
-    artifact_store = LabJobArtifactStore(artifact_root)
-    export_root = settings.lab_runtime_dir_resolved / "exports"
-    export_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    export_root.chmod(0o700)
-    controller = StrategyLabJobCenterController(
-        reader=reader,
-        commands=commands,
-        preview_reader=ArtifactPreviewReader(
-            reader=reader,
-            artifact_root=artifact_root,
-        ),
-        zip_exports=LabJobZipExportFacade(
-            reader=reader,
-            artifact_store=artifact_store,
-            export_root=export_root,
-        ),
+    required_directories = (
+        authority.research_root,
+        authority.command_spool_path,
+        authority.final_artifact_root,
+        authority.definition_registry_root,
     )
-    return _JobCenterRuntime(controller=controller, artifact_store=artifact_store)
+    if any(not path.is_file() for path in required_files) or any(
+        not path.is_dir() for path in required_directories
+    ):
+        raise JobCenterRuntimeUnavailableError("Job Center authority evidence is incomplete")
+    try:
+        export_root = authority.research_root / "exports"
+        _ensure_private_runtime_directory(export_root)
+        reader = LabJobReader(authority.lab_jobs_path)
+        experiments = ExperimentRegistryReadonlyReader(
+            authority.experiment_registry_path,
+            managed_trust_root=authority.research_root,
+        )
+        definitions = ImmutableDefinitionRegistry(
+            authority.definition_registry_root,
+            execution_registry=BuiltinStrategyEvaluatorRegistry(
+                producer_commit=authority.code_sha
+            ).trusted_executable_registry(),
+        )
+        as_of = authority_clock()
+        for strategy_name in ("n_shape", "auction_gap", "growth_board_surge"):
+            if definitions.latest_strategy_spec(strategy_name, as_of=as_of) is None:
+                raise JobCenterRuntimeUnavailableError(
+                    f"Definition Registry 缺少 {strategy_name} 权威定义"
+                )
+        controller = StrategyLabJobCenterController(
+            reader=reader,
+            preview_reader=ArtifactPreviewReader(
+                reader=reader,
+                artifact_root=authority.final_artifact_root,
+            ),
+            definition_registry=definitions,
+            formal_experiment_resolver=RegistryBackedFormalExperimentResolver(experiments),
+            clock=authority_clock,
+        )
+    except JobCenterRuntimeUnavailableError:
+        raise
+    except Exception as exc:
+        raise JobCenterRuntimeUnavailableError(
+            f"Job Center authority verification failed: {type(exc).__name__}: {exc}"
+        ) from exc
+    return _JobCenterRuntime(
+        controller=controller,
+        experiment_registry=experiments,
+        definition_registry=definitions,
+    )
 
 
 def _ensure_private_runtime_directory(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    receipt = _page_control.submit(
+        InitializeLabExports(
+            command_id=uuid4().hex,
+            requested_at=datetime.now(UTC),
+            export_root=path,
+            runtime_root=path,
+        )
+    )
+    if receipt.status != "succeeded":
+        raise RuntimeError(receipt.error or "Lab export initialization failed")
+    _require_private_runtime_directory(path)
+
+
+def _require_private_runtime_directory(path: Path) -> None:
     observed = path.lstat()
     if not stat.S_ISDIR(observed.st_mode) or observed.st_uid != os.geteuid():
         raise RuntimeError("lab runtime root must be an owned physical directory")
     if stat.S_IMODE(observed.st_mode) != 0o700:
-        path.chmod(0o700, follow_symlinks=False)
-        tightened = path.lstat()
-        if (
-            not stat.S_ISDIR(tightened.st_mode)
-            or tightened.st_uid != os.geteuid()
-            or stat.S_IMODE(tightened.st_mode) != 0o700
-        ):
-            raise RuntimeError("lab runtime root permissions could not be tightened")
+        raise RuntimeError("lab runtime root must have mode 0700")
 
 
-@st.cache_data(ttl=300)
-def _query_readonly(sql: str, params: tuple[object, ...] = ()) -> pd.DataFrame | None:
-    try:
-        connection = open_readonly_connection()
-    except Exception:
-        return None
-    try:
-        return connection.execute(sql, list(params)).fetchdf()
-    except Exception:
-        return None
-    finally:
-        connection.close()
-
-
-@st.cache_data(ttl=300)
 def _trading_calendar() -> tuple[date, ...]:
-    frame = _query_readonly("SELECT DISTINCT trade_date FROM daily_bar ORDER BY trade_date")
-    if frame is None or frame.empty:
+    if _page_serving_context is None:
+        st.error("交易日历 Serving 不可用")
         return ()
-    return tuple(
-        value.date() if hasattr(value, "date") else value for value in frame["trade_date"].tolist()
-    )
+    result = _page_serving_context.trading_calendar()
+    render_serving_state_banner(st, result, label="交易日历")
+    return result.value
 
 
-@st.cache_data(ttl=300)
 def _screen_bounds(preset_name: str) -> tuple[date | None, date | None, int]:
-    if preset_name == "n-shape-combined":
-        frame = _query_readonly(
-            """
-            SELECT MIN(trade_date) AS min_date,
-                   MAX(trade_date) AS max_date,
-                   COUNT(*) AS candidates
-            FROM (
-                SELECT DISTINCT trade_date, ts_code
-                FROM screen_result
-                WHERE preset_name IN ('n-shape-pool1', 'n-shape-pool2')
-            )
-            """
-        )
-    else:
-        frame = _query_readonly(
-            """
-            SELECT MIN(trade_date) AS min_date,
-                   MAX(trade_date) AS max_date,
-                   COUNT(*) AS candidates
-            FROM screen_result
-            WHERE preset_name = ?
-            """,
-            (preset_name,),
-        )
-    if frame is None or frame.empty or pd.isna(frame.iloc[0]["min_date"]):
+    if _page_serving_context is None:
+        st.error("候选区间 Serving 不可用")
         return None, None, 0
-    row = frame.iloc[0]
-    minimum = row["min_date"].date() if hasattr(row["min_date"], "date") else row["min_date"]
-    maximum = row["max_date"].date() if hasattr(row["max_date"], "date") else row["max_date"]
-    return minimum, maximum, int(row["candidates"])
+    result = _page_serving_context.screen_bounds(preset_name)
+    render_serving_state_banner(st, result, label="候选区间")
+    return result.value
 
 
-@st.cache_data(ttl=300)
 def _minute_overview() -> pd.DataFrame | None:
-    return _query_readonly(
-        """
-        SELECT COUNT(*) AS rows_count,
-               COUNT(DISTINCT ts_code) AS codes_count,
-               COUNT(DISTINCT CAST(trade_time AS DATE)) AS trade_dates,
-               MIN(trade_time) AS min_time,
-               MAX(trade_time) AS max_time
-        FROM minute_bar
-        WHERE freq = '1min'
-        """
-    )
+    if _page_serving_context is None:
+        return None
+    result = _page_serving_context.minute_coverage()
+    render_serving_state_banner(st, result, label="分钟数据覆盖")
+    frame = result.value
+    if frame is None or frame.empty:
+        return frame
+    total = frame.loc[frame["is_total"]]
+    return total.drop(columns=["is_total", "source"]).reset_index(drop=True)
 
 
-@st.cache_data(ttl=300)
 def _minute_source_overview() -> pd.DataFrame | None:
-    return _query_readonly(
-        """
-        SELECT source,
-               COUNT(*) AS rows_count,
-               COUNT(DISTINCT ts_code) AS codes_count,
-               COUNT(DISTINCT CAST(trade_time AS DATE)) AS trade_dates,
-               MIN(trade_time) AS min_time,
-               MAX(trade_time) AS max_time
-        FROM minute_bar
-        WHERE freq = '1min'
-        GROUP BY source
-        ORDER BY rows_count DESC
-        """
+    if _page_serving_context is None:
+        return None
+    result = _page_serving_context.minute_coverage()
+    render_serving_state_banner(st, result, label="分钟数据覆盖")
+    frame = result.value
+    if frame is None:
+        return None
+    return frame.loc[~frame["is_total"]].drop(columns=["is_total"]).reset_index(drop=True)
+
+
+@st.cache_data(ttl=900)
+def _tushare_catalog() -> TushareMetadataResult:
+    return load_tushare_interface_catalog_state(
+        settings.data_dir / "tushare_interface_audit.duckdb"
     )
 
 
 @st.cache_data(ttl=900)
-def _tushare_catalog() -> pd.DataFrame:
-    try:
-        return load_tushare_interface_catalog(settings.data_dir / "tushare_interface_audit.duckdb")
-    except Exception:
-        return pd.DataFrame()
+def _tushare_goods() -> TushareMetadataResult:
+    return load_tushare_purchase_goods_state(settings.data_dir / "tushare_interface_audit.duckdb")
 
 
 @st.cache_data(ttl=900)
-def _tushare_goods() -> pd.DataFrame:
-    try:
-        return load_tushare_purchase_goods(settings.data_dir / "tushare_interface_audit.duckdb")
-    except Exception:
-        return pd.DataFrame()
-
-
-@st.cache_data(ttl=900)
-def _tushare_packages() -> pd.DataFrame:
-    try:
-        return load_tushare_activity_packages(settings.data_dir / "tushare_interface_audit.duckdb")
-    except Exception:
-        return pd.DataFrame()
+def _tushare_packages() -> TushareMetadataResult:
+    return load_tushare_activity_packages_state(
+        settings.data_dir / "tushare_interface_audit.duckdb"
+    )
 
 
 @st.cache_data(ttl=30)
@@ -331,7 +384,6 @@ def _verified_code_sha() -> str | None:
     return detected if detected and _EXACT_SHA.fullmatch(detected) else None
 
 
-@st.cache_data(ttl=60)
 def _current_research_gate(
     mode: str,
     strategy_name: str,
@@ -346,24 +398,13 @@ def _current_research_gate(
         end_date=end_date,
         code_commit=code_sha,
     )
-    try:
-        with open_readonly_store() as store:
-            decision = evaluate_store_research_gate(store, request)
-    except Exception as exc:
-        failure = ResearchGateFailure(
-            code="metadata_unavailable",
-            message=f"研究门元数据不可用: {type(exc).__name__}: {exc}",
-        )
-        decision = ResearchGateDecision(
-            allowed=mode == "exploratory",
-            research_status="exploratory",
-            audit_run_id=None,
-            dataset_snapshot_id=None,
-            dataset_binding_hash=None,
-            coverage_ratios={},
-            coverage_counts={},
-            failures=(failure,),
-        )
+    if _page_serving_context is None:
+        st.error("研究门 Serving 不可用")
+        decision = ServingPageRenderContext.unavailable_research_gate(request)
+    else:
+        result = _page_serving_context.research_gate(request)
+        render_serving_state_banner(st, result, label="研究门")
+        decision = result.value
     return request, decision
 
 
@@ -557,6 +598,24 @@ def _render_submission_result(result: CommandSubmissionResult) -> None:
     st.warning(f"命令未接受：{result.reason}")
 
 
+def _submit_lab_control(
+    command: LabCommand,
+    *,
+    interaction_key: str,
+) -> CommandSubmissionResult:
+    receipt = _page_control.submit(
+        SubmitLabCommand(
+            command_id=uuid4().hex,
+            requested_at=datetime.now(UTC),
+            command=command,
+            interaction_key=interaction_key,
+        )
+    )
+    if receipt.status != "succeeded" or receipt.result is None:
+        raise RuntimeError(receipt.error or "Lab control command failed")
+    return _COMMAND_RESULT_ADAPTER.validate_python(receipt.result)
+
+
 def _submit_run(
     controller: StrategyLabJobCenterController,
     run_input: ResearchRunInput,
@@ -569,11 +628,15 @@ def _submit_run(
     try:
         context = _submission_context(ui, request, decision)
         job_id = uuid4()
-        result = controller.submit(
+        command = controller.build_submission_command(
             run_input,
             context=context,
-            interaction_key=f"{form_key}:{job_id}",
             job_id=job_id,
+            as_of=datetime.now(UTC),
+        )
+        result = _submit_lab_control(
+            command,
+            interaction_key=f"{form_key}:{job_id}",
         )
     except Exception as exc:
         st.error(f"提交失败：{type(exc).__name__}: {exc}")
@@ -1244,10 +1307,12 @@ def _render_job_detail(
         key=f"pause-{job.job_id}-{job.version}",
     ):
         _render_control_result(
-            controller.pause(
-                job.job_id,
-                expected_version=job.version,
-                reason="strategy-lab-ui",
+            _submit_lab_control(
+                PauseJobCommand(
+                    job_id=job.job_id,
+                    expected_version=job.version,
+                    reason="strategy-lab-ui",
+                ),
                 interaction_key=f"pause:{job.job_id}:{job.version}",
             )
         )
@@ -1258,10 +1323,12 @@ def _render_job_detail(
         key=f"resume-{job.job_id}-{job.version}",
     ):
         _render_control_result(
-            controller.resume(
-                job.job_id,
-                expected_version=job.version,
-                reason="strategy-lab-ui",
+            _submit_lab_control(
+                ResumeJobCommand(
+                    job_id=job.job_id,
+                    expected_version=job.version,
+                    reason="strategy-lab-ui",
+                ),
                 interaction_key=f"resume:{job.job_id}:{job.version}",
             )
         )
@@ -1272,10 +1339,12 @@ def _render_job_detail(
         key=f"cancel-{job.job_id}-{job.version}",
     ):
         _render_control_result(
-            controller.cancel(
-                job.job_id,
-                expected_version=job.version,
-                reason="strategy-lab-ui",
+            _submit_lab_control(
+                CancelJobCommand(
+                    job_id=job.job_id,
+                    expected_version=job.version,
+                    reason="strategy-lab-ui",
+                ),
                 interaction_key=f"cancel:{job.job_id}:{job.version}",
             )
         )
@@ -1286,10 +1355,12 @@ def _render_job_detail(
         key=f"retry-{job.job_id}-{job.version}",
     ):
         _render_control_result(
-            controller.retry(
-                job.job_id,
-                expected_version=job.version,
-                reason="strategy-lab-ui",
+            _submit_lab_control(
+                RetryJobCommand(
+                    job_id=job.job_id,
+                    expected_version=job.version,
+                    reason="strategy-lab-ui",
+                ),
                 interaction_key=f"retry:{job.job_id}:{job.version}",
             )
         )
@@ -1298,11 +1369,15 @@ def _render_job_detail(
         width="stretch",
         key=f"rerun-{job.job_id}-{job.version}",
     ):
+        new_job_id = uuid4()
         _render_control_result(
-            controller.rerun(
-                job.job_id,
-                max_attempts=job.max_attempts,
-                interaction_key=f"rerun:{job.job_id}:{job.version}",
+            _submit_lab_control(
+                SubmitJobCommand(
+                    job_id=new_job_id,
+                    spec=job.spec,
+                    max_attempts=job.max_attempts,
+                ),
+                interaction_key=f"rerun:{job.job_id}:{job.version}:{new_job_id}",
             )
         )
 
@@ -1369,25 +1444,46 @@ def _render_artifact(
             hide_index=True,
         )
     if st.button("生成完整 ZIP", key=f"export-{job_id}"):
-        receipt = None
+        exported: LabArtifactZipResult | None = None
         try:
-            receipt = controller.export_zip(job_id)
-            with receipt.path.open("rb") as handle:
-                st.download_button(
-                    "下载完整结果包",
-                    data=handle,
-                    file_name=f"{job_id}.zip",
-                    mime="application/zip",
-                    width="stretch",
-                    key=f"download-export-{receipt.request_id}",
+            control_receipt = _page_control.submit(
+                ExportLabArtifactZip(
+                    command_id=uuid4().hex,
+                    requested_at=datetime.now(UTC),
+                    job_id=job_id,
                 )
-            st.caption(f"SHA256 `{receipt.sha256}` · {receipt.byte_size:,} 字节")
+            )
+            if control_receipt.status != "succeeded" or control_receipt.result is None:
+                raise RuntimeError(control_receipt.error or "Lab ZIP export failed")
+            exported = LabArtifactZipResult.model_validate(control_receipt.result)
+            payload = exported.path.read_bytes()
+            st.download_button(
+                "下载完整结果包",
+                data=payload,
+                file_name=f"{job_id}.zip",
+                mime="application/zip",
+                width="stretch",
+                key=f"download-export-{exported.request_id}",
+            )
+            st.caption(f"SHA256 `{exported.sha256}` · {exported.byte_size:,} 字节")
         except Exception as exc:
             st.error(f"导出失败：{type(exc).__name__}: {exc}")
         finally:
-            if receipt is not None:
+            if exported is not None:
                 try:
-                    controller.discard_zip(receipt)
+                    discard = _page_control.submit(
+                        DiscardLabArtifactZip(
+                            command_id=uuid4().hex,
+                            requested_at=datetime.now(UTC),
+                            request_id=exported.request_id,
+                            job_id=exported.job_id,
+                            path=exported.path,
+                            byte_size=exported.byte_size,
+                            sha256=exported.sha256,
+                        )
+                    )
+                    if discard.status != "succeeded":
+                        raise RuntimeError(discard.error or "Lab ZIP discard failed")
                 except Exception as exc:
                     st.warning(f"临时 ZIP 清理失败：{type(exc).__name__}: {exc}")
 
@@ -1440,7 +1536,10 @@ def _render_job_center(controller: StrategyLabJobCenterController) -> None:
     except Exception as exc:
         st.warning(f"任务账本尚不可用：{type(exc).__name__}: {exc}")
         return
-    st.caption(f"匹配 {page.total_count:,} 个任务")
+    if page.total_count is None:
+        st.caption("当前筛选使用按页加载")
+    else:
+        st.caption(f"匹配 {page.total_count:,} 个任务")
     if not page.items:
         st.info("当前筛选没有任务")
         return
@@ -1533,10 +1632,17 @@ def _render_data_coverage() -> None:
 
 def _render_data_interfaces() -> None:
     st.header("数据接口")
-    catalog = _tushare_catalog()
-    if catalog.empty:
-        st.info("暂无 Tushare 接口目录")
+    catalog_result = _tushare_catalog()
+    if catalog_result.state is TushareMetadataState.MISSING:
+        st.warning(catalog_result.detail)
         return
+    if catalog_result.state is TushareMetadataState.CORRUPT:
+        st.error(catalog_result.detail)
+        return
+    if catalog_result.state is TushareMetadataState.EMPTY:
+        st.info(catalog_result.detail)
+        return
+    catalog = catalog_result.frame
     f1, f2, f3 = st.columns(3)
     stages = f1.multiselect(
         "接入阶段",
@@ -1569,98 +1675,110 @@ def _render_data_interfaces() -> None:
         width="stretch",
         hide_index=True,
     )
-    goods = _tushare_goods()
-    if not goods.empty:
+    goods_result = _tushare_goods()
+    if goods_result.state is TushareMetadataState.MISSING:
+        st.warning(goods_result.detail)
+    elif goods_result.state is TushareMetadataState.CORRUPT:
+        st.error(goods_result.detail)
+    elif goods_result.state is TushareMetadataState.EMPTY:
+        st.info(goods_result.detail)
+    elif goods_result.state is TushareMetadataState.READY:
         with st.expander("独立权限及积分商品", expanded=False):
-            st.dataframe(goods, width="stretch", hide_index=True)
-    packages = _tushare_packages()
-    if not packages.empty:
+            st.dataframe(goods_result.frame, width="stretch", hide_index=True)
+    packages_result = _tushare_packages()
+    if packages_result.state is TushareMetadataState.MISSING:
+        st.warning(packages_result.detail)
+    elif packages_result.state is TushareMetadataState.CORRUPT:
+        st.error(packages_result.detail)
+    elif packages_result.state is TushareMetadataState.EMPTY:
+        st.info(packages_result.detail)
+    elif packages_result.state is TushareMetadataState.READY:
         with st.expander("套餐", expanded=False):
-            st.dataframe(packages, width="stretch", hide_index=True)
+            st.dataframe(packages_result.frame, width="stretch", hide_index=True)
 
 
 def _render_legacy_history() -> None:
     st.header("旧版历史")
-    runs = list_strategy_lab_runs(limit=50)
-    if not runs:
-        st.info("暂无旧版研究记录")
+    if _page_serving_context is None:
+        st.error("旧版历史 Serving 不可用")
         return
-    labels = {
-        index: (
-            f"{run.created_at.astimezone(CST):%m-%d %H:%M} · "
-            f"{RUN_TYPE_LABELS.get(run.run_type, run.run_type)} · {run.title}"
-        )
-        for index, run in enumerate(runs)
-    }
-    selected = st.selectbox(
-        "记录",
-        list(labels),
-        format_func=lambda item: labels[item],
-        key="legacy_run_index",
+    result = _page_serving_context.dataframe(
+        """
+        SELECT run_id, run_type, title, created_at, research_status, markdown
+        FROM lab_legacy_history
+        ORDER BY created_at DESC, run_id DESC
+        LIMIT 50
+        """,
+        max_rows=50,
+        max_result_bytes=1024 * 1024,
+        required_projections=("lab_legacy_history",),
     )
-    run = runs[int(selected)]
-    c1, c2, c3 = st.columns(3)
-    c1.metric("类型", RUN_TYPE_LABELS.get(run.run_type, run.run_type))
-    c2.metric("可信度", RESEARCH_STATUS_LABELS[run.manifest.research_status])
-    c3.metric("表格数", len(run.tables))
-    st.download_button(
-        "下载旧版 Markdown",
-        data=run.markdown,
-        file_name=f"{run.run_id}.md",
-        mime="text/markdown",
-        key=f"legacy-download-{run.run_id}",
+    render_serving_state_banner(st, result, label="旧版历史")
+    if result.value is None or result.value.empty:
+        st.info("暂无已发布的旧版历史归档")
+        return
+    st.dataframe(
+        result.value.drop(columns=["markdown"], errors="ignore"),
+        width="stretch",
+        hide_index=True,
     )
-    st.json({"参数": run.params, "指标": run.metrics})
-    for table in run.tables:
-        with st.expander(
-            f"{table.name} · {table.total_rows:,} 行"
-            + ("（旧记录已截断）" if table.truncated else ""),
-            expanded=False,
-        ):
-            frame, _ = dataframe_preview(pd.DataFrame(table.rows), max_rows=500)
-            st.dataframe(frame, width="stretch", hide_index=True)
 
 
 def run_strategy_lab_app() -> None:
-    _configure_page()
-    st.title("rQuant Strategy Lab")
-    for notice in CURRENT_RESEARCH_NOTICES:
-        if notice.severity == "error":
-            st.error(f"{notice.title}：{notice.body}")
-        elif notice.severity == "warning":
-            st.warning(f"{notice.title}：{notice.body}")
+    global _page_serving_context
     try:
-        runtime = _job_center_runtime()
-    except Exception as exc:
-        st.error(f"Job Center 初始化失败：{type(exc).__name__}: {exc}")
-        return
-    view = st.sidebar.radio(
-        "视图",
-        (
-            "任务中心",
-            "N 字策略",
-            "集合竞价跳空",
-            "科创及创业板放量",
-            "数据覆盖",
-            "数据接口",
-            "旧版历史",
-        ),
-        key="strategy_lab_view",
-    )
-    ui = _research_settings()
-    if ui.code_sha is None:
-        st.sidebar.warning("代码目录不是干净的精确提交，任务提交已禁用")
-    if view == "任务中心":
-        _render_job_center(runtime.controller)
-    elif view == "N 字策略":
-        _render_n_shape(runtime.controller, ui)
-    elif view == "集合竞价跳空":
-        _render_auction_gap(runtime.controller, ui)
-    elif view == "科创及创业板放量":
-        _render_growth_board(runtime.controller, ui)
-    elif view == "数据覆盖":
-        _render_data_coverage()
-    elif view == "数据接口":
-        _render_data_interfaces()
-    else:
-        _render_legacy_history()
+        _page_serving_context = ServingPageRenderContext.open(
+            os.environ.get("RQUANT_SERVING_ROOT", "data/serving")
+        )
+    except Exception:
+        _page_serving_context = None
+    try:
+        _configure_page()
+        st.title("rQuant Strategy Lab")
+        for notice in CURRENT_RESEARCH_NOTICES:
+            if notice.severity == "error":
+                st.error(f"{notice.title}：{notice.body}")
+            elif notice.severity == "warning":
+                st.warning(f"{notice.title}：{notice.body}")
+        try:
+            runtime = _job_center_runtime()
+        except JobCenterRuntimeUnavailableError as exc:
+            st.error(f"Job Center 当前不可用：{exc}")
+            return
+        except Exception as exc:
+            st.error(f"Job Center 初始化失败：{type(exc).__name__}: {exc}")
+            return
+        view = st.sidebar.radio(
+            "视图",
+            (
+                "任务中心",
+                "N 字策略",
+                "集合竞价跳空",
+                "科创及创业板放量",
+                "数据覆盖",
+                "数据接口",
+                "旧版历史",
+            ),
+            key="strategy_lab_view",
+        )
+        ui = _research_settings()
+        if ui.code_sha is None:
+            st.sidebar.warning("代码目录不是干净的精确提交，任务提交已禁用")
+        if view == "任务中心":
+            _render_job_center(runtime.controller)
+        elif view == "N 字策略":
+            _render_n_shape(runtime.controller, ui)
+        elif view == "集合竞价跳空":
+            _render_auction_gap(runtime.controller, ui)
+        elif view == "科创及创业板放量":
+            _render_growth_board(runtime.controller, ui)
+        elif view == "数据覆盖":
+            _render_data_coverage()
+        elif view == "数据接口":
+            _render_data_interfaces()
+        else:
+            _render_legacy_history()
+    finally:
+        if _page_serving_context is not None:
+            _page_serving_context.close()
+        _page_serving_context = None

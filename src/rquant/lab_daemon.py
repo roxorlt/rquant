@@ -19,13 +19,26 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Event, Thread
 from types import MappingProxyType
-from typing import Protocol, TypeVar
+from typing import TYPE_CHECKING, Protocol, TypeVar
 from uuid import UUID, uuid4
 
 from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from rquant.job_center_authority import (
+    JobCenterAuthorityIntegrityError,
+    load_job_center_authority,
+)
+from rquant.job_center_authority import (
+    JobCenterAuthorityManifest as LabJobCenterAuthorityManifest,
+)
 from rquant.lab_artifact_protocol import LabFinalizerAuthorityKey
+from rquant.lab_jobs import LabIntegrityDegradedError
+
+if TYPE_CHECKING:
+    from rquant.lab_job_center import ExperimentLifecycleCoordinator
+    from rquant.lab_job_protocol import LabCommandSpool
+    from rquant.lab_jobs import LabJobReader
 
 
 def _load_strict_json() -> tuple[
@@ -71,6 +84,81 @@ _LAB_RUNTIME_PREPARED_MAX_BYTES = 1024 * 1024
 
 class LabDaemonConfigurationError(RuntimeError):
     """A daemon cannot start without weakening its trust boundary."""
+
+
+def load_lab_job_center_authority_manifest(
+    path: Path,
+    *,
+    expected_code_sha: str,
+    expected_research_root: Path,
+    expected_lab_jobs_path: Path,
+    expected_command_spool_path: Path,
+    expected_final_artifact_root: Path,
+    expected_runtime_deployment_root: Path | None = None,
+    expected_deployment_profile_id: str | None = None,
+    expected_deployment_generation_hash: str | None = None,
+) -> LabJobCenterAuthorityManifest:
+    """Compatibility wrapper over the content-bound authority loader."""
+
+    try:
+        return load_job_center_authority(
+            path,
+            expected_code_sha=expected_code_sha,
+            runtime_root=expected_research_root,
+            lab_jobs_path=expected_lab_jobs_path,
+            command_spool_path=expected_command_spool_path,
+            final_artifact_root=expected_final_artifact_root,
+            runtime_deployment_root=expected_runtime_deployment_root,
+            deployment_profile_id=expected_deployment_profile_id,
+            deployment_generation_hash=expected_deployment_generation_hash,
+        )
+    except (JobCenterAuthorityIntegrityError, OSError, ValueError) as exc:
+        raise LabDaemonConfigurationError("Job Center authority manifest is invalid") from exc
+
+
+def build_experiment_lifecycle_coordinator(
+    manifest: LabJobCenterAuthorityManifest,
+    *,
+    reader: LabJobReader | None = None,
+    spool: LabCommandSpool | None = None,
+    clock: Callable[[], datetime] | None = None,
+) -> ExperimentLifecycleCoordinator:
+    """Compose the writer-side Experiment lifecycle from the verified manifest."""
+
+    from rquant.definition_registry import ImmutableDefinitionRegistry
+    from rquant.lab_job_center import (
+        ExperimentLifecycleCoordinator,
+        LabCommandSubmissionFacade,
+    )
+    from rquant.lab_job_protocol import LabCommandSpool
+    from rquant.lab_jobs import LabJobReader
+    from rquant.runtime_artifact_terminal_lifecycle import (
+        build_production_artifact_terminal_lifecycle,
+    )
+    from rquant.strategy_evaluators import BuiltinStrategyEvaluatorRegistry
+
+    authority = LabJobCenterAuthorityManifest.model_validate(manifest)
+    selected_reader = reader or LabJobReader(authority.lab_jobs_path)
+    selected_spool = spool or LabCommandSpool(authority.command_spool_path)
+    terminal_lifecycle = build_production_artifact_terminal_lifecycle(
+        runtime_root=authority.runtime_deployment_root,
+        experiment_registry_path=authority.experiment_registry_path,
+    )
+    registry = terminal_lifecycle.experiment_registry
+    definitions = ImmutableDefinitionRegistry(
+        authority.definition_registry_root,
+        execution_registry=BuiltinStrategyEvaluatorRegistry(
+            producer_commit=authority.code_sha
+        ).trusted_executable_registry(),
+    )
+    facade = LabCommandSubmissionFacade(
+        reader=selected_reader,
+        spool=selected_spool,
+        experiment_registry=registry,
+        definition_registry=definitions,
+        clock=clock,
+    )
+    return ExperimentLifecycleCoordinator(facade)
 
 
 class LabDaemonReadiness(BaseModel):
@@ -3040,6 +3128,10 @@ class _Finalizer(Protocol):
     def finalize(self, job_id: UUID) -> _FinalizationResult: ...
 
 
+class _IncrementalIntegrityAuditor(Protocol):
+    def audit_incremental(self, *, max_chain_entries: int) -> object: ...
+
+
 class LabFinalizerFailureState(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -3675,6 +3767,8 @@ class LabFinalizerDaemon:
         failure_cooldown_max_seconds: int,
         runtime_guard: Callable[[], str] | None = None,
         now_provider: Callable[[], datetime] | None = None,
+        integrity_auditor: _IncrementalIntegrityAuditor | None = None,
+        max_integrity_chain_entries: int = 16,
     ) -> None:
         if not 1 <= max_jobs_per_tick <= 128:
             raise ValueError("max_jobs_per_tick must be between 1 and 128")
@@ -3684,6 +3778,8 @@ class LabFinalizerDaemon:
             raise ValueError("failure_cooldown_seconds must be positive")
         if failure_cooldown_max_seconds < failure_cooldown_seconds:
             raise ValueError("failure cooldown maximum must not be below its base")
+        if not 1 <= max_integrity_chain_entries <= 128:
+            raise ValueError("max_integrity_chain_entries must be between 1 and 128")
         self.reader = reader
         self.finalizer = finalizer
         self.state_store = state_store
@@ -3693,6 +3789,11 @@ class LabFinalizerDaemon:
         self.failure_cooldown_max_seconds = failure_cooldown_max_seconds
         self.runtime_guard = runtime_guard
         self.now_provider = now_provider or (lambda: datetime.now(UTC))
+        discovered_auditor = getattr(reader, "audit_incremental", None)
+        if integrity_auditor is None and callable(discovered_auditor):
+            integrity_auditor = reader  # type: ignore[assignment]
+        self.integrity_auditor = integrity_auditor
+        self.max_integrity_chain_entries = max_integrity_chain_entries
         self._stop = Event()
 
     def request_stop(self) -> None:
@@ -3701,6 +3802,25 @@ class LabFinalizerDaemon:
     def _verify_runtime(self) -> None:
         if self.runtime_guard is not None:
             self.runtime_guard()
+
+    def _audit_integrity(self) -> None:
+        if self.integrity_auditor is None:
+            return
+        try:
+            self.integrity_auditor.audit_incremental(
+                max_chain_entries=self.max_integrity_chain_entries
+            )
+        except Exception as exc:
+            message = " ".join((str(exc) or type(exc).__name__).split())[:400]
+            logger.error(
+                "lab-finalizer integrity audit degraded: phase=finalizer_pre_tick "
+                "error_type={} message={}",
+                type(exc).__name__,
+                message,
+            )
+            raise LabIntegrityDegradedError(
+                "finalizer_pre_tick: incremental ledger audit degraded: " + message
+            ) from exc
 
     @staticmethod
     def _make_failure_room(
@@ -3724,6 +3844,7 @@ class LabFinalizerDaemon:
 
     def run_once(self) -> LabFinalizerTickResult:
         self._verify_runtime()
+        self._audit_integrity()
         state = self.state_store.load()
         page = self.reader.list_finalization_candidates(
             limit=self.max_jobs_per_tick,

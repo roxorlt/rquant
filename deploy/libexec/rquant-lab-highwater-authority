@@ -1,0 +1,1223 @@
+#!/usr/bin/python3
+"""Independent monotonic compare-and-advance high-water authority for Lab audits.
+
+The Lab runtime submits audit watermarks over stdin and receives a signed
+receipt on stdout.  The authority owns its chain state and signing keys in a
+directory the Lab uid cannot write, so a compromised or rolled-back Lab process
+cannot lower the recorded high-water: every observation is compared against the
+durable chain head and only equal ("unchanged") or strictly advancing
+("advanced") watermarks are accepted.  Rollback attempts exit with code 3 so
+callers fail closed.
+
+Runs as root with pinned state/keys paths in production (invoked through the
+sudo allowlist); non-root invocations must name --state-root/--keys-file
+explicitly, which supports true cross-process tests against this same code.
+"""
+
+from __future__ import annotations
+
+import base64
+import fcntl
+import hashlib
+import json
+import os
+import pwd
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+from contextlib import suppress
+from dataclasses import dataclass
+from pathlib import Path
+from uuid import uuid4
+
+STATE_ROOT = Path("/var/lib/rquant/lab-highwater")
+KEYS_FILE = Path("/etc/rquant/lab-highwater-keys.json")
+PUBLIC_KEYS_FILE = Path("/etc/rquant/lab-highwater-trusted-keys.json")
+RUNTIME_USER = "lighthouse"
+_GENESIS_HASH = "0" * 64
+_LOG_NAME = "chain.jsonl"
+_CURRENT_NAME = "current.json"
+_REMEDIATION_NAME = "remediation.json"
+_AUDIT_DEGRADED_NAME = "integrity-degraded.json"
+_WRITER_LOCK_NAME = ".writer.lock"
+_MAX_REQUEST_BYTES = 64 * 1024
+_MAX_RECORD_BYTES = 16 * 1024
+_MAX_LOG_BYTES = 8 * 1024 * 1024
+_MAX_LOG_RECORDS = 65_536
+_HEX64 = re.compile(r"^[0-9a-f]{64}$")
+_CODE_IDENTITY = re.compile(r"^[0-9a-f]{40,128}$")
+_PROFILE_IDENTITY = re.compile(r"^[0-9a-f]{64,128}$")
+_KEY_ID = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+_RECEIPT_KINDS = frozenset({"incremental", "full"})
+_ED25519_SIGNATURE = re.compile(r"^[A-Za-z0-9+/]{86}==$")
+
+REJECTION_EXIT_CODE = 3
+
+
+class RequestError(ValueError):
+    """The request is malformed or the authority state is unusable."""
+
+
+class RejectionError(RuntimeError):
+    """The observation conflicts with the durable monotonic high-water."""
+
+
+def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise RequestError("duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def _canonical_bytes(value: object) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _require_str(value: object, *, field: str, pattern: re.Pattern[str] | None = None) -> str:
+    if not isinstance(value, str) or not value:
+        raise RequestError(f"high-water request {field} is invalid")
+    if pattern is not None and pattern.fullmatch(value) is None:
+        raise RequestError(f"high-water request {field} is invalid")
+    return value
+
+
+def _require_int(value: object, *, field: str, minimum: int) -> int:
+    if type(value) is not int or value < minimum:
+        raise RequestError(f"high-water request {field} is invalid")
+    return value
+
+
+def _decode_request(payload: bytes) -> dict[str, object]:
+    if not payload or len(payload) > _MAX_REQUEST_BYTES:
+        raise RequestError("high-water request size is unsafe")
+    try:
+        decoded = json.loads(payload, object_pairs_hook=_unique_object)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise RequestError("high-water request is not valid JSON") from exc
+    if not isinstance(decoded, dict) or decoded.get("schema_version") != 1:
+        raise RequestError("high-water request version is invalid")
+    operation = decoded.get("operation")
+    if operation == "status":
+        if set(decoded) != {"schema_version", "operation", "stable_identity", "nonce"}:
+            raise RequestError("high-water status request shape is invalid")
+        _require_str(decoded["stable_identity"], field="stable_identity")
+        if len(str(decoded["stable_identity"])) > 512:
+            raise RequestError("high-water request stable_identity is invalid")
+        _require_str(decoded["nonce"], field="nonce", pattern=_HEX64)
+        return decoded
+    if operation == "remediate":
+        expected_keys = {
+            "schema_version",
+            "operation",
+            "stable_identity",
+            "code_identity",
+            "profile_identity",
+            "nonce",
+        }
+        if set(decoded) != expected_keys:
+            raise RequestError("high-water remediation request shape is invalid")
+        stable_identity = _require_str(decoded["stable_identity"], field="stable_identity")
+        if len(stable_identity) > 512:
+            raise RequestError("high-water request stable_identity is invalid")
+        _require_str(decoded["code_identity"], field="code_identity", pattern=_CODE_IDENTITY)
+        _require_str(
+            decoded["profile_identity"], field="profile_identity", pattern=_PROFILE_IDENTITY
+        )
+        _require_str(decoded["nonce"], field="nonce", pattern=_HEX64)
+        return decoded
+    if operation == "degrade":
+        expected_keys = {
+            "schema_version",
+            "operation",
+            "stable_identity",
+            "code_identity",
+            "profile_identity",
+            "reason_hash",
+            "nonce",
+        }
+        if set(decoded) != expected_keys:
+            raise RequestError("high-water degradation request shape is invalid")
+        stable_identity = _require_str(decoded["stable_identity"], field="stable_identity")
+        if len(stable_identity) > 512:
+            raise RequestError("high-water request stable_identity is invalid")
+        _require_str(decoded["code_identity"], field="code_identity", pattern=_CODE_IDENTITY)
+        _require_str(
+            decoded["profile_identity"], field="profile_identity", pattern=_PROFILE_IDENTITY
+        )
+        _require_str(decoded["reason_hash"], field="reason_hash", pattern=_HEX64)
+        _require_str(decoded["nonce"], field="nonce", pattern=_HEX64)
+        return decoded
+    if operation != "observe":
+        raise RequestError("high-water request operation is invalid")
+    expected_keys = {
+        "schema_version",
+        "operation",
+        "stable_identity",
+        "database_generation",
+        "schema_generation",
+        "mutation_epoch",
+        "chain_generation",
+        "chain_head_hash",
+        "receipt_kind",
+        "receipt_hash",
+        "code_identity",
+        "profile_identity",
+        "allow_identity_rotation",
+        "nonce",
+    }
+    if set(decoded) != expected_keys:
+        raise RequestError("high-water observe request shape is invalid")
+    stable_identity = _require_str(decoded["stable_identity"], field="stable_identity")
+    if len(stable_identity) > 512:
+        raise RequestError("high-water request stable_identity is invalid")
+    generation = decoded["database_generation"]
+    if (
+        not isinstance(generation, list)
+        or len(generation) != 2
+        or any(type(part) is not int or part < 0 for part in generation)
+    ):
+        raise RequestError("high-water request database_generation is invalid")
+    _require_int(decoded["schema_generation"], field="schema_generation", minimum=1)
+    _require_int(decoded["mutation_epoch"], field="mutation_epoch", minimum=0)
+    _require_int(decoded["chain_generation"], field="chain_generation", minimum=0)
+    _require_str(decoded["chain_head_hash"], field="chain_head_hash", pattern=_HEX64)
+    if decoded["receipt_kind"] not in _RECEIPT_KINDS:
+        raise RequestError("high-water request receipt_kind is invalid")
+    _require_str(decoded["receipt_hash"], field="receipt_hash", pattern=_HEX64)
+    _require_str(decoded["code_identity"], field="code_identity", pattern=_CODE_IDENTITY)
+    _require_str(decoded["profile_identity"], field="profile_identity", pattern=_PROFILE_IDENTITY)
+    if not isinstance(decoded["allow_identity_rotation"], bool):
+        raise RequestError("high-water request allow_identity_rotation is invalid")
+    _require_str(decoded["nonce"], field="nonce", pattern=_HEX64)
+    return decoded
+
+
+@dataclass(frozen=True)
+class _SigningKey:
+    private_key_path: Path
+    public_key: bytes
+
+
+@dataclass(frozen=True)
+class _KeyMaterial:
+    generation: int
+    previous_manifest_hash: str
+    active_key_id: str
+    active_signing_key: _SigningKey
+    previous_public_keys: dict[str, bytes]
+
+    @property
+    def verification_keys(self) -> dict[str, bytes]:
+        return {
+            self.active_key_id: self.active_signing_key.public_key,
+            **self.previous_public_keys,
+        }
+
+
+@dataclass(frozen=True)
+class _PublicKeyring:
+    document: dict[str, object]
+    generation: int
+    previous_manifest_hash: str
+    active_key_id: str
+    active_public_key: bytes
+    previous_public_keys: dict[str, bytes]
+    manifest_hash: str
+
+    @property
+    def verification_keys(self) -> dict[str, bytes]:
+        return {self.active_key_id: self.active_public_key, **self.previous_public_keys}
+
+
+def _openssl_binary() -> str:
+    for candidate in ("/opt/homebrew/bin/openssl", "/usr/bin/openssl"):
+        if Path(candidate).is_file():
+            return candidate
+    raise RequestError("openssl is unavailable for high-water Ed25519 signing")
+
+
+def _run_openssl(arguments: list[str], *, input_data: bytes) -> subprocess.CompletedProcess[bytes]:
+    try:
+        return subprocess.run(
+            [_openssl_binary(), *arguments],
+            input=input_data,
+            capture_output=True,
+            check=False,
+            timeout=5.0,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RequestError("high-water Ed25519 operation is unavailable") from exc
+
+
+def _secure_regular_file(
+    path: Path,
+    *,
+    label: str,
+    require_mode: int,
+    allowed_owner_uids: set[int] | None = None,
+) -> bytes:
+    descriptor = -1
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        observed = os.fstat(descriptor)
+        named = os.stat(path, follow_symlinks=False)
+        required_owners = (
+            allowed_owner_uids
+            if allowed_owner_uids is not None
+            else {0 if os.geteuid() == 0 else os.geteuid()}
+        )
+        if (
+            not stat.S_ISREG(observed.st_mode)
+            or observed.st_nlink != 1
+            or (observed.st_dev, observed.st_ino) != (named.st_dev, named.st_ino)
+            or observed.st_uid not in required_owners
+            or stat.S_IMODE(observed.st_mode) != require_mode
+            or observed.st_size <= 0
+            or observed.st_size > _MAX_REQUEST_BYTES
+        ):
+            raise RequestError(f"{label} is unsafe")
+        payload = os.read(descriptor, _MAX_REQUEST_BYTES + 1)
+        after = os.fstat(descriptor)
+        if len(payload) != observed.st_size or (
+            observed.st_dev,
+            observed.st_ino,
+            observed.st_size,
+            observed.st_mtime_ns,
+        ) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+            raise RequestError(f"{label} changed while reading")
+        return payload
+    except OSError as exc:
+        raise RequestError(f"{label} is unavailable") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _public_key_from_private(private_key_path: Path) -> bytes:
+    result = _run_openssl(
+        ["pkey", "-in", str(private_key_path), "-pubout"], input_data=b""
+    )
+    if result.returncode != 0 or not result.stdout:
+        raise RequestError("high-water private key is not readable")
+    inspected = _run_openssl(
+        ["pkey", "-pubin", "-pubcheck", "-text_pub", "-noout"],
+        input_data=result.stdout,
+    )
+    if inspected.returncode != 0 or b"ED25519" not in inspected.stdout.upper():
+        raise RequestError("high-water private key is not Ed25519")
+    return result.stdout
+
+
+def _validated_public_key(value: object, *, label: str) -> bytes:
+    if not isinstance(value, str) or not value or len(value) > 8_192:
+        raise RequestError(f"{label} is invalid")
+    public_key = value.encode("utf-8")
+    inspected = _run_openssl(
+        ["pkey", "-pubin", "-pubcheck", "-text_pub", "-noout"],
+        input_data=public_key,
+    )
+    if inspected.returncode != 0 or b"ED25519" not in inspected.stdout.upper():
+        raise RequestError(f"{label} is not Ed25519")
+    return public_key
+
+
+def _sign_ed25519(private_key_path: Path, payload: bytes) -> str:
+    with tempfile.TemporaryDirectory(prefix="rquant-highwater-sign-") as directory:
+        message_path = Path(directory) / "message.bin"
+        message_path.write_bytes(payload)
+        os.chmod(message_path, 0o600)
+        result = _run_openssl(
+            [
+                "pkeyutl",
+                "-sign",
+                "-rawin",
+                "-inkey",
+                str(private_key_path),
+                "-in",
+                str(message_path),
+            ],
+            input_data=b"",
+        )
+    if result.returncode != 0 or len(result.stdout) != 64:
+        raise RequestError("high-water Ed25519 signing failed")
+    return base64.b64encode(result.stdout).decode("ascii")
+
+
+def _verify_ed25519(public_key: bytes, payload: bytes, signature: object) -> bool:
+    if not isinstance(signature, str) or _ED25519_SIGNATURE.fullmatch(signature) is None:
+        return False
+    try:
+        signature_bytes = base64.b64decode(signature, validate=True)
+        if len(signature_bytes) != 64:
+            return False
+        with tempfile.TemporaryDirectory(prefix="rquant-highwater-authority-") as directory:
+            root = Path(directory)
+            public_key_path = root / "public.pem"
+            signature_path = root / "signature.bin"
+            message_path = root / "message.bin"
+            public_key_path.write_bytes(public_key)
+            signature_path.write_bytes(signature_bytes)
+            message_path.write_bytes(payload)
+            os.chmod(public_key_path, 0o600)
+            os.chmod(signature_path, 0o600)
+            os.chmod(message_path, 0o600)
+            result = _run_openssl(
+                [
+                    "pkeyutl",
+                    "-verify",
+                    "-pubin",
+                    "-inkey",
+                    str(public_key_path),
+                    "-sigfile",
+                    str(signature_path),
+                    "-rawin",
+                    "-in",
+                    str(message_path),
+                ],
+                input_data=b"",
+            )
+    except (OSError, RequestError, ValueError):
+        return False
+    return result.returncode == 0
+
+
+def _load_keys(keys_file: Path) -> _KeyMaterial:
+    payload = _secure_regular_file(
+        keys_file, label="high-water signing keys file", require_mode=0o600
+    )
+    try:
+        document = json.loads(payload, object_pairs_hook=_unique_object)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise RequestError("high-water signing keys file is not valid JSON") from exc
+    if (
+        not isinstance(document, dict)
+        or document.get("schema_version") != 3
+        or set(document)
+        != {
+            "schema_version",
+            "generation",
+            "previous_manifest_hash",
+            "active_key_id",
+            "active_private_key_path",
+            "previous_public_keys",
+        }
+    ):
+        raise RequestError("high-water signing keys file shape is invalid")
+    generation = document["generation"]
+    previous_manifest_hash = document["previous_manifest_hash"]
+    active_key_id = document["active_key_id"]
+    raw_private_key_path = document["active_private_key_path"]
+    raw_previous_public_keys = document["previous_public_keys"]
+    if type(generation) is not int or generation < 1:
+        raise RequestError("high-water signing key generation is invalid")
+    if (
+        not isinstance(previous_manifest_hash, str)
+        or _HEX64.fullmatch(previous_manifest_hash) is None
+    ):
+        raise RequestError("high-water signing previous manifest hash is invalid")
+    if not isinstance(active_key_id, str) or _KEY_ID.fullmatch(active_key_id) is None:
+        raise RequestError("high-water signing active key id is invalid")
+    if not isinstance(raw_private_key_path, str):
+        raise RequestError("high-water active private key path is invalid")
+    private_key_path = Path(raw_private_key_path)
+    if (
+        not private_key_path.is_absolute()
+        or private_key_path != Path(os.path.abspath(private_key_path))
+    ):
+        raise RequestError("high-water signing key path must be absolute and normalized")
+    _secure_regular_file(
+        private_key_path,
+        label="high-water active private key",
+        require_mode=0o600,
+    )
+    active_signing_key = _SigningKey(
+        private_key_path=private_key_path,
+        public_key=_public_key_from_private(private_key_path),
+    )
+    if not isinstance(raw_previous_public_keys, dict):
+        raise RequestError("high-water previous public keys are invalid")
+    if generation == 1 and (
+        previous_manifest_hash != _GENESIS_HASH or raw_previous_public_keys
+    ):
+        raise RequestError("high-water signing genesis binding is invalid")
+    if generation > 1 and (
+        previous_manifest_hash == _GENESIS_HASH or not raw_previous_public_keys
+    ):
+        raise RequestError("high-water signing rotation binding is invalid")
+    previous_public_keys: dict[str, bytes] = {}
+    for key_id, raw_public_key in raw_previous_public_keys.items():
+        if not isinstance(key_id, str) or _KEY_ID.fullmatch(key_id) is None:
+            raise RequestError("high-water previous public keys contain an invalid key id")
+        if key_id == active_key_id:
+            raise RequestError("high-water active key cannot also be a previous key")
+        previous_public_keys[key_id] = _validated_public_key(
+            raw_public_key,
+            label="high-water previous public key",
+        )
+    return _KeyMaterial(
+        generation=generation,
+        previous_manifest_hash=previous_manifest_hash,
+        active_key_id=active_key_id,
+        active_signing_key=active_signing_key,
+        previous_public_keys=previous_public_keys,
+    )
+
+
+def _public_keyring_document(material: _KeyMaterial) -> dict[str, object]:
+    body: dict[str, object] = {
+        "schema_version": 3,
+        "generation": material.generation,
+        "previous_manifest_hash": material.previous_manifest_hash,
+        "active_key_id": material.active_key_id,
+        "active_public_key": material.active_signing_key.public_key.decode("utf-8"),
+        "previous_public_keys": {
+            key_id: public_key.decode("utf-8")
+            for key_id, public_key in sorted(material.previous_public_keys.items())
+        },
+    }
+    manifest_hash = hashlib.sha256(_canonical_bytes(body)).hexdigest()
+    return {
+        **body,
+        "manifest_hash": manifest_hash,
+        "signature": _sign_ed25519(
+            material.active_signing_key.private_key_path,
+            manifest_hash.encode("ascii"),
+        ),
+    }
+
+
+def _public_keyring_owner_uids() -> set[int]:
+    owners = {os.geteuid()}
+    if os.geteuid() == 0:
+        try:
+            owners.add(pwd.getpwnam(RUNTIME_USER).pw_uid)
+        except KeyError as exc:
+            raise RequestError("high-water runtime user is unavailable") from exc
+    return owners
+
+
+def _decode_public_keyring(payload: bytes) -> _PublicKeyring:
+    try:
+        document = json.loads(payload, object_pairs_hook=_unique_object)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise RequestError("high-water public keyring is not valid JSON") from exc
+    expected_fields = {
+        "schema_version",
+        "generation",
+        "previous_manifest_hash",
+        "active_key_id",
+        "active_public_key",
+        "previous_public_keys",
+        "manifest_hash",
+        "signature",
+    }
+    if (
+        not isinstance(document, dict)
+        or document.get("schema_version") != 3
+        or set(document) != expected_fields
+    ):
+        raise RequestError("high-water public keyring shape is invalid")
+    generation = document["generation"]
+    previous_manifest_hash = document["previous_manifest_hash"]
+    active_key_id = document["active_key_id"]
+    raw_previous_public_keys = document["previous_public_keys"]
+    if type(generation) is not int or generation < 1:
+        raise RequestError("high-water public keyring generation is invalid")
+    if (
+        not isinstance(previous_manifest_hash, str)
+        or _HEX64.fullmatch(previous_manifest_hash) is None
+    ):
+        raise RequestError("high-water public keyring previous manifest hash is invalid")
+    if not isinstance(active_key_id, str) or _KEY_ID.fullmatch(active_key_id) is None:
+        raise RequestError("high-water public keyring active key id is invalid")
+    active_public_key = _validated_public_key(
+        document["active_public_key"], label="high-water active public key"
+    )
+    if not isinstance(raw_previous_public_keys, dict):
+        raise RequestError("high-water previous public keys are invalid")
+    if generation == 1 and (
+        previous_manifest_hash != _GENESIS_HASH or raw_previous_public_keys
+    ):
+        raise RequestError("high-water public keyring genesis binding is invalid")
+    if generation > 1 and (
+        previous_manifest_hash == _GENESIS_HASH or not raw_previous_public_keys
+    ):
+        raise RequestError("high-water public keyring rotation binding is invalid")
+    previous_public_keys: dict[str, bytes] = {}
+    for key_id, raw_public_key in raw_previous_public_keys.items():
+        if not isinstance(key_id, str) or _KEY_ID.fullmatch(key_id) is None:
+            raise RequestError("high-water previous public key id is invalid")
+        if key_id == active_key_id:
+            raise RequestError("high-water active key cannot also be a previous key")
+        previous_public_keys[key_id] = _validated_public_key(
+            raw_public_key, label="high-water previous public key"
+        )
+    body = {key: document[key] for key in expected_fields - {"manifest_hash", "signature"}}
+    expected_hash = hashlib.sha256(_canonical_bytes(body)).hexdigest()
+    manifest_hash = document["manifest_hash"]
+    if not isinstance(manifest_hash, str) or manifest_hash != expected_hash:
+        raise RequestError("high-water public keyring manifest hash is invalid")
+    if not _verify_ed25519(
+        active_public_key,
+        manifest_hash.encode("ascii"),
+        document["signature"],
+    ):
+        raise RequestError("high-water public keyring manifest signature is invalid")
+    return _PublicKeyring(
+        document=document,
+        generation=generation,
+        previous_manifest_hash=previous_manifest_hash,
+        active_key_id=active_key_id,
+        active_public_key=active_public_key,
+        previous_public_keys=previous_public_keys,
+        manifest_hash=manifest_hash,
+    )
+
+
+def _load_public_keyring(path: Path) -> _PublicKeyring:
+    return _decode_public_keyring(
+        _secure_regular_file(
+            path,
+            label="high-water public keyring",
+            require_mode=0o444,
+            allowed_owner_uids=_public_keyring_owner_uids(),
+        )
+    )
+
+
+def _export_public_keyring(
+    keys_file: Path,
+    *,
+    current_keyring_path: Path | None,
+) -> bytes:
+    candidate = _decode_public_keyring(
+        _canonical_bytes(_public_keyring_document(_load_keys(keys_file)))
+    )
+    if current_keyring_path is None or not current_keyring_path.exists():
+        if candidate.generation != 1:
+            raise RequestError("high-water public keyring initial generation must be one")
+        return _canonical_bytes(candidate.document)
+    current = _load_public_keyring(current_keyring_path)
+    if candidate.manifest_hash == current.manifest_hash:
+        return _canonical_bytes(candidate.document)
+    if candidate.generation != current.generation + 1:
+        raise RequestError("high-water public keyring generation did not advance exactly once")
+    if candidate.previous_manifest_hash != current.manifest_hash:
+        raise RequestError("high-water public keyring previous manifest hash is invalid")
+    if candidate.active_key_id == current.active_key_id:
+        raise RequestError("high-water public keyring rotation did not change the active key")
+    if candidate.previous_public_keys != current.verification_keys:
+        raise RequestError("high-water public keyring rotation dropped or changed historical keys")
+    return _canonical_bytes(candidate.document)
+
+
+def _record_hash(payload: dict[str, object]) -> str:
+    return hashlib.sha256(_canonical_bytes(payload)).hexdigest()
+
+
+def _signed_record(
+    *,
+    sequence: int,
+    previous_record_hash: str,
+    request: dict[str, object],
+    key_id: str,
+    signing_key: _SigningKey,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "sequence": sequence,
+        "previous_record_hash": previous_record_hash,
+        "stable_identity": request["stable_identity"],
+        "database_generation": list(request["database_generation"]),  # type: ignore[call-overload]
+        "schema_generation": request["schema_generation"],
+        "mutation_epoch": request["mutation_epoch"],
+        "chain_generation": request["chain_generation"],
+        "chain_head_hash": request["chain_head_hash"],
+        "receipt_kind": request["receipt_kind"],
+        "receipt_hash": request["receipt_hash"],
+        "code_identity": request["code_identity"],
+        "profile_identity": request["profile_identity"],
+        "key_id": key_id,
+    }
+    digest = _record_hash(payload)
+    payload["record_hash"] = digest
+    payload["signature"] = _sign_ed25519(signing_key.private_key_path, digest.encode("ascii"))
+    return payload
+
+
+def _verify_record(record: object, keys: dict[str, bytes]) -> dict[str, object]:
+    if not isinstance(record, dict):
+        raise RequestError("high-water chain record is invalid")
+    for field in ("record_hash", "signature"):
+        if not isinstance(record.get(field), str):
+            raise RequestError("high-water chain record is invalid")
+    payload = {
+        key: value for key, value in record.items() if key not in {"record_hash", "signature"}
+    }
+    expected_hash = _record_hash(payload)
+    if str(record["record_hash"]) != expected_hash:
+        raise RequestError("high-water chain record hash is invalid")
+    key_id = record.get("key_id")
+    if not isinstance(key_id, str) or key_id not in keys:
+        raise RequestError("high-water chain record signing key is unknown")
+    if not _verify_ed25519(
+        keys[key_id],
+        expected_hash.encode("ascii"),
+        record["signature"],
+    ):
+        raise RequestError("high-water chain record signature is invalid")
+    return record
+
+
+def _open_state_directory(state_root: Path, stable_identity: str) -> int:
+    if not state_root.is_absolute() or state_root != Path(os.path.abspath(state_root)):
+        raise RequestError("high-water state root must be absolute and normalized")
+
+    def open_child(parent_descriptor: int, name: str, *, create: bool, private: bool) -> int:
+        if create:
+            try:
+                os.mkdir(name, mode=0o700, dir_fd=parent_descriptor)
+            except FileExistsError:
+                pass
+            except OSError as exc:
+                raise RequestError("high-water state directory cannot be created") from exc
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(name, flags, dir_fd=parent_descriptor)
+            opened = os.fstat(descriptor)
+            active = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        except OSError as exc:
+            raise RequestError("high-water state directory cannot be opened safely") from exc
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or (opened.st_dev, opened.st_ino, opened.st_mode) != (
+                active.st_dev,
+                active.st_ino,
+                active.st_mode,
+            )
+            or (private and (opened.st_uid != os.geteuid() or opened.st_mode & 0o077))
+        ):
+            os.close(descriptor)
+            raise RequestError("high-water state directory is not private")
+        return descriptor
+
+    root_descriptor = -1
+    try:
+        root_descriptor = os.open(
+            state_root.anchor,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        for component in state_root.parts[1:]:
+            child = open_child(root_descriptor, component, create=True, private=False)
+            os.close(root_descriptor)
+            root_descriptor = child
+        observed_root = os.fstat(root_descriptor)
+        if (
+            not stat.S_ISDIR(observed_root.st_mode)
+            or observed_root.st_uid != os.geteuid()
+            or observed_root.st_mode & 0o077
+        ):
+            raise RequestError("high-water state root is not private")
+    except BaseException:
+        if root_descriptor >= 0:
+            os.close(root_descriptor)
+        raise
+    identity_slug = hashlib.sha256(stable_identity.encode("utf-8")).hexdigest()
+    try:
+        descriptor = open_child(root_descriptor, identity_slug, create=True, private=True)
+    finally:
+        os.close(root_descriptor)
+    return descriptor
+
+
+def _read_name(descriptor: int, name: str) -> bytes | None:
+    try:
+        file_descriptor = os.open(
+            name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=descriptor,
+        )
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise RequestError("high-water state file cannot be opened safely") from exc
+    try:
+        before = os.fstat(file_descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_size > _MAX_LOG_BYTES
+        ):
+            raise RequestError("high-water state file identity is invalid")
+        chunks: list[bytes] = []
+        remaining = _MAX_LOG_BYTES + 1
+        while remaining:
+            block = os.read(file_descriptor, min(65_536, remaining))
+            if not block:
+                break
+            chunks.append(block)
+            remaining -= len(block)
+        payload = b"".join(chunks)
+        after = os.fstat(file_descriptor)
+        if len(payload) > _MAX_LOG_BYTES or (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+        ) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+            raise RequestError("high-water state file changed while reading")
+        return payload
+    finally:
+        os.close(file_descriptor)
+
+
+def _load_records(descriptor: int, keys: dict[str, bytes]) -> list[dict[str, object]]:
+    payload = _read_name(descriptor, _LOG_NAME)
+    if payload is None:
+        return []
+    if not payload.endswith(b"\n"):
+        raise RequestError("high-water chain log is incomplete")
+    lines = payload[:-1].split(b"\n")
+    if len(lines) > _MAX_LOG_RECORDS:
+        raise RequestError("high-water chain log record count is invalid")
+    records: list[dict[str, object]] = []
+    previous = _GENESIS_HASH
+    for sequence, line in enumerate(lines):
+        if len(line) > _MAX_RECORD_BYTES:
+            raise RequestError("high-water chain record exceeds size bound")
+        try:
+            decoded = json.loads(line, object_pairs_hook=_unique_object)
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise RequestError("high-water chain record is invalid") from exc
+        if _canonical_bytes(decoded) != line:
+            raise RequestError("high-water chain record is not canonical")
+        record = _verify_record(decoded, keys)
+        if record.get("sequence") != sequence or record.get("previous_record_hash") != previous:
+            raise RequestError("high-water chain is invalid")
+        previous = str(record["record_hash"])
+        records.append(record)
+    return records
+
+
+def _write_named_json(descriptor: int, name: str, document: dict[str, object]) -> None:
+    temporary = f".{name}.{uuid4().hex}.tmp"
+    payload = _canonical_bytes(document)
+    try:
+        file_descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=descriptor,
+        )
+        try:
+            os.write(file_descriptor, payload)
+            os.fsync(file_descriptor)
+        finally:
+            os.close(file_descriptor)
+        os.replace(temporary, name, src_dir_fd=descriptor, dst_dir_fd=descriptor)
+        os.fsync(descriptor)
+    finally:
+        with suppress(FileNotFoundError):
+            os.unlink(temporary, dir_fd=descriptor)
+
+
+def _write_current(descriptor: int, record: dict[str, object]) -> None:
+    _write_named_json(descriptor, _CURRENT_NAME, record)
+
+
+def _recover_current(
+    descriptor: int,
+    records: list[dict[str, object]],
+    keys: dict[str, bytes],
+) -> None:
+    payload = _read_name(descriptor, _CURRENT_NAME)
+    if not records:
+        if payload is not None:
+            raise RequestError("high-water current exists without a chain")
+        return
+    current = records[-1]
+    if payload is not None:
+        try:
+            decoded = json.loads(payload, object_pairs_hook=_unique_object)
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise RequestError("high-water current is invalid") from exc
+        if _canonical_bytes(decoded) != payload:
+            raise RequestError("high-water current is not canonical")
+        pointer = _verify_record(decoded, keys)
+        if pointer.get("record_hash") == current.get("record_hash"):
+            return
+        pointer_sequence = pointer.get("sequence")
+        if type(pointer_sequence) is int and pointer_sequence > int(str(current["sequence"])):
+            raise RequestError("high-water current exceeds its chain")
+    _write_current(descriptor, current)
+
+
+def _append_record(descriptor: int, record: dict[str, object]) -> None:
+    payload = _canonical_bytes(record) + b"\n"
+    log_descriptor = os.open(
+        _LOG_NAME,
+        os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+        dir_fd=descriptor,
+    )
+    try:
+        before = os.fstat(log_descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_size + len(payload) > _MAX_LOG_BYTES
+        ):
+            raise RequestError("high-water chain log exceeds bounds")
+        os.write(log_descriptor, payload)
+        os.fsync(log_descriptor)
+    finally:
+        os.close(log_descriptor)
+    os.fsync(descriptor)
+
+
+def _load_audit_degradation(descriptor: int) -> dict[str, object] | None:
+    payload = _read_name(descriptor, _AUDIT_DEGRADED_NAME)
+    if payload is None:
+        return None
+    try:
+        document = json.loads(payload, object_pairs_hook=_unique_object)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise RequestError("high-water audit degradation is invalid") from exc
+    if _canonical_bytes(document) != payload:
+        raise RequestError("high-water audit degradation is not canonical")
+    if (
+        not isinstance(document, dict)
+        or document.get("schema_version") != 1
+        or set(document)
+        != {"schema_version", "stable_identity", "code_identity", "profile_identity", "reason_hash"}
+        or not isinstance(document.get("stable_identity"), str)
+        or _CODE_IDENTITY.fullmatch(str(document.get("code_identity"))) is None
+        or _PROFILE_IDENTITY.fullmatch(str(document.get("profile_identity"))) is None
+        or _HEX64.fullmatch(str(document.get("reason_hash"))) is None
+    ):
+        raise RequestError("high-water audit degradation shape is invalid")
+    return document
+
+
+def _record_audit_degradation(descriptor: int, request: dict[str, object]) -> None:
+    desired = {
+        "schema_version": 1,
+        "stable_identity": request["stable_identity"],
+        "code_identity": request["code_identity"],
+        "profile_identity": request["profile_identity"],
+        "reason_hash": request["reason_hash"],
+    }
+    current = _load_audit_degradation(descriptor)
+    if current is not None and current != desired:
+        raise RejectionError("high-water audit degradation conflicts with the current runtime")
+    if current is None:
+        _write_named_json(descriptor, _AUDIT_DEGRADED_NAME, desired)
+
+
+def _consume_remediation_authorization(descriptor: int, request: dict[str, object]) -> None:
+    degradation = _load_audit_degradation(descriptor)
+    if degradation is None:
+        raise RejectionError("high-water audit remediation is not pending")
+    if (
+        degradation["stable_identity"] != request["stable_identity"]
+        or degradation["code_identity"] != request["code_identity"]
+        or degradation["profile_identity"] != request["profile_identity"]
+    ):
+        raise RejectionError("high-water audit remediation does not bind this runtime")
+    payload = _read_name(descriptor, _REMEDIATION_NAME)
+    if payload is None:
+        raise RejectionError("high-water remediation is not authorized")
+    try:
+        authorization = json.loads(payload, object_pairs_hook=_unique_object)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise RequestError("high-water remediation authorization is invalid") from exc
+    if _canonical_bytes(authorization) != payload:
+        raise RequestError("high-water remediation authorization is not canonical")
+    expected = {
+        "schema_version": 1,
+        "stable_identity": request["stable_identity"],
+        "code_identity": request["code_identity"],
+        "profile_identity": request["profile_identity"],
+    }
+    if authorization != expected:
+        raise RejectionError("high-water remediation authorization does not bind this runtime")
+    try:
+        os.unlink(_REMEDIATION_NAME, dir_fd=descriptor)
+        os.unlink(_AUDIT_DEGRADED_NAME, dir_fd=descriptor)
+        os.fsync(descriptor)
+    except OSError as exc:
+        raise RequestError("high-water remediation authorization could not be consumed") from exc
+
+
+def _signed_receipt(
+    *,
+    operation: str,
+    outcome: str,
+    nonce: str,
+    high_water: dict[str, object] | None,
+    key_id: str,
+    signing_key: _SigningKey,
+) -> dict[str, object]:
+    receipt: dict[str, object] = {
+        "schema_version": 1,
+        "operation": operation,
+        "outcome": outcome,
+        "nonce": nonce,
+        "high_water": high_water,
+        "key_id": key_id,
+    }
+    digest = _record_hash(receipt)
+    receipt["receipt_hash"] = digest
+    receipt["signature"] = _sign_ed25519(signing_key.private_key_path, digest.encode("ascii"))
+    return receipt
+
+
+def _watermark_view(record: dict[str, object]) -> dict[str, object]:
+    return {
+        "sequence": record["sequence"],
+        "stable_identity": record["stable_identity"],
+        "database_generation": record["database_generation"],
+        "schema_generation": record["schema_generation"],
+        "mutation_epoch": record["mutation_epoch"],
+        "chain_generation": record["chain_generation"],
+        "chain_head_hash": record["chain_head_hash"],
+        "receipt_kind": record["receipt_kind"],
+        "receipt_hash": record["receipt_hash"],
+        "code_identity": record["code_identity"],
+        "profile_identity": record["profile_identity"],
+        "record_hash": record["record_hash"],
+    }
+
+
+def _compare_and_advance(
+    request: dict[str, object],
+    records: list[dict[str, object]],
+) -> tuple[str, bool]:
+    """Return (outcome, append_needed); raise RejectionError on conflicts."""
+
+    if not records:
+        return "advanced", True
+    previous = records[-1]
+    if previous["stable_identity"] != request["stable_identity"]:
+        raise RejectionError("high-water stable identity conflicts")
+    rotation = bool(request["allow_identity_rotation"])
+    identity_changed = (
+        previous["code_identity"] != request["code_identity"]
+        or previous["profile_identity"] != request["profile_identity"]
+        or previous["database_generation"] != list(request["database_generation"])  # type: ignore[call-overload]
+        or previous["schema_generation"] != request["schema_generation"]
+    )
+    schema_generation = int(str(request["schema_generation"]))
+    previous_schema = int(str(previous["schema_generation"]))
+    if schema_generation < previous_schema:
+        raise RejectionError("high-water schema generation rolled back")
+    if identity_changed and not rotation:
+        if previous["database_generation"] != list(request["database_generation"]):  # type: ignore[call-overload]
+            raise RejectionError("high-water database generation changed")
+        raise RejectionError("high-water code or profile identity conflicts")
+    chain_generation = int(str(request["chain_generation"]))
+    mutation_epoch = int(str(request["mutation_epoch"]))
+    previous_chain = int(str(previous["chain_generation"]))
+    previous_epoch = int(str(previous["mutation_epoch"]))
+    if chain_generation < previous_chain or mutation_epoch < previous_epoch:
+        raise RejectionError("high-water observed ledger rolled back")
+    if chain_generation == previous_chain:
+        if (
+            mutation_epoch != previous_epoch
+            or request["chain_head_hash"] != previous["chain_head_hash"]
+        ):
+            raise RejectionError("high-water chain changed in place")
+        if identity_changed:
+            return "advanced", True
+        return "unchanged", False
+    return "advanced", True
+
+
+def process_request(
+    payload: bytes,
+    *,
+    state_root: Path,
+    keys_file: Path,
+) -> tuple[dict[str, object], int]:
+    """Process one request; returns (receipt, exit_code 0)."""
+
+    request = _decode_request(payload)
+    key_material = _load_keys(keys_file)
+    active_key_id = key_material.active_key_id
+    signing_key = key_material.active_signing_key
+    verification_keys = key_material.verification_keys
+    stable_identity = str(request["stable_identity"])
+    nonce = str(request["nonce"])
+    descriptor = _open_state_directory(state_root, stable_identity)
+    lock_descriptor = -1
+    try:
+        lock_descriptor = os.open(
+            _WRITER_LOCK_NAME,
+            os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=descriptor,
+        )
+        lock_identity = os.fstat(lock_descriptor)
+        if not stat.S_ISREG(lock_identity.st_mode) or lock_identity.st_nlink != 1:
+            raise RequestError("high-water writer lock is invalid")
+        fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+        records = _load_records(descriptor, verification_keys)
+        _recover_current(descriptor, records, verification_keys)
+        if request["operation"] == "status":
+            high_water = _watermark_view(records[-1]) if records else None
+            receipt = _signed_receipt(
+                operation="status",
+                outcome="current",
+                nonce=nonce,
+                high_water=high_water,
+                key_id=active_key_id,
+                signing_key=signing_key,
+            )
+            return receipt, 0
+        if request["operation"] == "degrade":
+            _record_audit_degradation(descriptor, request)
+            receipt = _signed_receipt(
+                operation="degrade",
+                outcome="degraded",
+                nonce=nonce,
+                high_water=_watermark_view(records[-1]) if records else None,
+                key_id=active_key_id,
+                signing_key=signing_key,
+            )
+            return receipt, 0
+        if request["operation"] == "remediate":
+            _consume_remediation_authorization(descriptor, request)
+            receipt = _signed_receipt(
+                operation="remediate",
+                outcome="authorized",
+                nonce=nonce,
+                high_water=_watermark_view(records[-1]) if records else None,
+                key_id=active_key_id,
+                signing_key=signing_key,
+            )
+            return receipt, 0
+        if _load_audit_degradation(descriptor) is not None:
+            raise RejectionError("high-water audit remediation is required")
+        outcome, append_needed = _compare_and_advance(request, records)
+        if append_needed:
+            record = _signed_record(
+                sequence=len(records),
+                previous_record_hash=(
+                    str(records[-1]["record_hash"]) if records else _GENESIS_HASH
+                ),
+                request=request,
+                key_id=active_key_id,
+                signing_key=signing_key,
+            )
+            _append_record(descriptor, record)
+            _write_current(descriptor, record)
+            records.append(record)
+        receipt = _signed_receipt(
+            operation="observe",
+            outcome=outcome,
+            nonce=nonce,
+            high_water=_watermark_view(records[-1]),
+            key_id=active_key_id,
+            signing_key=signing_key,
+        )
+        return receipt, 0
+    except OSError as exc:
+        raise RequestError("high-water state could not be persisted") from exc
+    finally:
+        if lock_descriptor >= 0:
+            fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+            os.close(lock_descriptor)
+        os.close(descriptor)
+
+
+def main() -> int:
+    arguments = sys.argv[1:]
+    state_root = STATE_ROOT
+    keys_file = KEYS_FILE
+    if os.geteuid() == 0:
+        if arguments == ["--validate-key-material"]:
+            material = _load_keys(KEYS_FILE)
+            public_keyring = _public_keyring_document(material)
+            print(
+                _canonical_bytes(
+                    {
+                        "active_key_id": material.active_key_id,
+                        "generation": material.generation,
+                        "key_ids": sorted(material.verification_keys),
+                        "public_keyring_manifest_hash": public_keyring["manifest_hash"],
+                        "status": "validated",
+                    }
+                ).decode("ascii")
+            )
+            return 0
+        if arguments == ["--export-public-keyring"]:
+            sys.stdout.buffer.write(
+                _export_public_keyring(
+                    KEYS_FILE,
+                    current_keyring_path=(PUBLIC_KEYS_FILE if PUBLIC_KEYS_FILE.exists() else None),
+                )
+            )
+            return 0
+        if arguments:
+            raise RequestError("root high-water authority does not accept arguments")
+    else:
+        exporting_keyring = (
+            len(arguments) in {3, 5}
+            and arguments[:1] == ["--keys-file"]
+            and arguments[2] == "--export-public-keyring"
+        )
+        if exporting_keyring:
+            keys_file = Path(arguments[1])
+            if not keys_file.is_absolute():
+                raise RequestError("high-water authority keys path must be absolute")
+            current_keyring_path: Path | None = None
+            if len(arguments) == 5:
+                if arguments[3] != "--current-keyring":
+                    raise RequestError("high-water public keyring export arguments are invalid")
+                current_keyring_path = Path(arguments[4])
+                if not current_keyring_path.is_absolute():
+                    raise RequestError("high-water public keyring path must be absolute")
+            sys.stdout.buffer.write(
+                _export_public_keyring(
+                    keys_file,
+                    current_keyring_path=current_keyring_path,
+                )
+            )
+            return 0
+        if (
+            len(arguments) != 4
+            or arguments[0] != "--state-root"
+            or arguments[2] != "--keys-file"
+        ):
+            raise RequestError(
+                "non-root high-water authority requires --state-root and --keys-file"
+            )
+        state_root = Path(arguments[1])
+        keys_file = Path(arguments[3])
+        if not state_root.is_absolute() or not keys_file.is_absolute():
+            raise RequestError("high-water authority paths must be absolute")
+    payload = sys.stdin.buffer.read(_MAX_REQUEST_BYTES + 1)
+    receipt, exit_code = process_request(payload, state_root=state_root, keys_file=keys_file)
+    sys.stdout.buffer.write(_canonical_bytes(receipt))
+    return exit_code
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except RejectionError as exc:
+        print(f"high-water observation rejected: {exc}", file=sys.stderr)
+        raise SystemExit(REJECTION_EXIT_CODE) from None
+    except Exception as exc:
+        print(f"high-water authority failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        raise SystemExit(1) from None

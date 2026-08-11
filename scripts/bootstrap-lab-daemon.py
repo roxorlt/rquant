@@ -31,10 +31,20 @@ def _load_contained_runner() -> object:
 
 
 run_contained = _load_contained_runner()
+DAILY_RECEIPT_AUTHORITY_ENV_PREFIXES = (
+    "RQUANT_DAILY_RECEIPT_",
+    "RQ_DAILY_SHADOW_RECEIPT_",
+)
 
 
 class BootstrapError(RuntimeError):
     pass
+
+
+def _reject_daily_receipt_environment() -> None:
+    for key in os.environ:
+        if key.startswith(DAILY_RECEIPT_AUTHORITY_ENV_PREFIXES):
+            raise BootstrapError("Daily receipt authority environment is not allowed")
 
 
 @dataclass(frozen=True)
@@ -185,10 +195,12 @@ def main(argv: list[str] | None = None) -> int:
     if not math.isfinite(startup_deadline) or time.monotonic() >= startup_deadline:
         parser.error("startup deadline is invalid or expired")
     try:
+        _reject_daily_receipt_environment()
         daemon_argv = list(args.daemon_argv)
         if daemon_argv and daemon_argv[0] == "--":
             daemon_argv.pop(0)
         if not daemon_argv or daemon_argv[0] not in {
+            "lab-runtime-prepare",
             "lab-scheduler",
             "lab-worker",
             "lab-finalizer",

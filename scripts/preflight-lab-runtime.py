@@ -634,19 +634,30 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--provisional-handoff-label")
     parser.add_argument("--prepared-sentinel-only", action="store_true")
     parser.add_argument("--immutable-generation", action="store_true")
+    parser.add_argument("--release-managed-checkout", action="store_true")
     parser.add_argument(
         "--lab-daemon-command",
-        choices=("lab-scheduler", "lab-worker", "lab-finalizer", "lab-runtime-prepare"),
+        choices=(
+            "lab-scheduler",
+            "lab-worker",
+            "lab-claim-finalizer",
+            "lab-finalizer",
+            "lab-runtime-prepare",
+        ),
         required=True,
     )
     args = parser.parse_args(argv)
     try:
+        if args.release_managed_checkout and args.immutable_generation:
+            raise PreflightError(
+                "release-managed checkout and immutable generation are mutually exclusive"
+            )
         if args.prepared_sentinel_only:
             checkout = _physical_checkout_root(args.checkout_root)
             _verify_prepared_lab_runtime(
                 checkout,
                 daemon_command=args.lab_daemon_command,
-                bind_checkout=not args.immutable_generation,
+                bind_checkout=not (args.immutable_generation or args.release_managed_checkout),
                 immutable_config=args.immutable_generation,
             )
             print("Lab runtime preflight: verified prepared sentinel")
@@ -667,7 +678,7 @@ def main(argv: list[str] | None = None) -> int:
         _verify_prepared_lab_runtime(
             checkout,
             daemon_command=args.lab_daemon_command,
-            bind_checkout=not args.immutable_generation,
+            bind_checkout=not (args.immutable_generation or args.release_managed_checkout),
             immutable_config=args.immutable_generation,
         )
         if args.immutable_generation:
