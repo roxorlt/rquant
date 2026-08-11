@@ -30,6 +30,115 @@ class SecureCreatedFile:
     created: bool
 
 
+@dataclass
+class SecureRegularFileLease:
+    """Retain an opened file and its descriptor-bound ancestor chain."""
+
+    _trusted_root: Path
+    _descriptors: list[int]
+    _links: tuple[tuple[int, str, int], ...]
+    _parent_descriptor: int
+    _name: str
+    _descriptor: int
+    _metadata: os.stat_result
+    _closed: bool = False
+
+    @property
+    def metadata(self) -> SecurePathMetadata:
+        observed = self._metadata
+        return SecurePathMetadata(
+            uid=observed.st_uid,
+            gid=observed.st_gid,
+            mode=stat.S_IMODE(observed.st_mode),
+            device=observed.st_dev,
+            inode=observed.st_ino,
+            size=observed.st_size,
+        )
+
+    def require_unchanged(self) -> None:
+        if self._closed:
+            raise AuthorityPathSecurityError("protected file lease is closed")
+        try:
+            root_named = os.stat(self._trusted_root, follow_symlinks=False)
+            root_opened = os.fstat(self._descriptors[0])
+            if (
+                not stat.S_ISDIR(root_named.st_mode)
+                or stat.S_ISLNK(root_named.st_mode)
+                or (root_named.st_dev, root_named.st_ino)
+                != (root_opened.st_dev, root_opened.st_ino)
+            ):
+                raise AuthorityPathSecurityError("trusted root identity changed")
+            for parent, name, child in self._links:
+                named = os.stat(name, dir_fd=parent, follow_symlinks=False)
+                opened = os.fstat(child)
+                if (
+                    not stat.S_ISDIR(named.st_mode)
+                    or stat.S_ISLNK(named.st_mode)
+                    or (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino)
+                ):
+                    raise AuthorityPathSecurityError("protected path ancestor changed")
+            named = os.stat(self._name, dir_fd=self._parent_descriptor, follow_symlinks=False)
+            opened = os.fstat(self._descriptor)
+        except AuthorityPathSecurityError:
+            raise
+        except OSError as exc:
+            raise AuthorityPathSecurityError("protected path changed while leased") from exc
+
+        def identity(value: os.stat_result) -> tuple[int, ...]:
+            return (
+                value.st_dev,
+                value.st_ino,
+                value.st_mode,
+                value.st_nlink,
+                value.st_uid,
+                value.st_gid,
+                value.st_size,
+                value.st_mtime_ns,
+                value.st_ctime_ns,
+            )
+
+        if identity(named) != identity(self._metadata) or identity(opened) != identity(
+            self._metadata
+        ):
+            raise AuthorityPathSecurityError("protected file changed while leased")
+
+    def read_all(self, *, max_bytes: int) -> bytes:
+        if max_bytes < 1:
+            raise ValueError("secure file bound is invalid")
+        self.require_unchanged()
+        try:
+            os.lseek(self._descriptor, 0, os.SEEK_SET)
+            chunks: list[bytes] = []
+            total = 0
+            while chunk := os.read(self._descriptor, min(64 * 1024, max_bytes + 1 - total)):
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > max_bytes:
+                    raise AuthorityPathSecurityError("protected file is oversized")
+        except AuthorityPathSecurityError:
+            raise
+        except OSError as exc:
+            raise AuthorityPathSecurityError("protected file cannot be read") from exc
+        self.require_unchanged()
+        return b"".join(chunks)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for descriptor in reversed(self._descriptors):
+            with suppress(OSError):
+                os.close(descriptor)
+
+    def __enter__(self) -> SecureRegularFileLease:
+        if self._closed:
+            raise AuthorityPathSecurityError("protected file lease is closed")
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
+
+
 def _canonical_relative(path: Path, trusted_root: Path) -> tuple[str, ...]:
     candidate = Path(os.path.abspath(path))
     root = Path(os.path.abspath(trusted_root))
@@ -166,6 +275,133 @@ def secure_path_metadata(
         for descriptor in reversed(descriptors):
             with suppress(OSError):
                 os.close(descriptor)
+
+
+def open_secure_regular_file_lease(
+    path: Path,
+    *,
+    trusted_root: Path = Path("/"),
+    allowed_ancestor_uids: frozenset[int] | None = None,
+    expected_uid: int,
+    expected_gid: int,
+    allowed_final_uids: frozenset[int] | None = None,
+    allowed_final_gids: frozenset[int] | None = None,
+    allowed_modes: frozenset[int],
+    max_bytes: int,
+    min_bytes: int = 1,
+) -> SecureRegularFileLease:
+    """Open a bounded regular file while retaining every bound descriptor."""
+
+    if max_bytes < 1 or min_bytes < 0 or min_bytes > max_bytes or not allowed_modes:
+        raise ValueError("secure file policy is invalid")
+    relative_parts = _canonical_relative(path, trusted_root)
+    allowed = allowed_ancestor_uids or frozenset({0, expected_uid})
+    final_uids = allowed_final_uids or frozenset({expected_uid})
+    final_gids = allowed_final_gids or frozenset({expected_gid})
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    descriptors: list[int] = []
+    links: list[tuple[int, str, int]] = []
+    lease_created = False
+    try:
+        root_named = os.stat(trusted_root, follow_symlinks=False)
+        parent = os.open(trusted_root, directory_flags)
+        descriptors.append(parent)
+        root_opened = os.fstat(parent)
+        _validate_directory(root_opened, allowed_owner_uids=allowed, label="trusted root")
+        if stat.S_ISLNK(root_named.st_mode) or (root_named.st_dev, root_named.st_ino) != (
+            root_opened.st_dev,
+            root_opened.st_ino,
+        ):
+            raise AuthorityPathSecurityError("trusted root identity changed")
+        for component in relative_parts[:-1]:
+            named = os.stat(component, dir_fd=parent, follow_symlinks=False)
+            child = os.open(component, directory_flags, dir_fd=parent)
+            opened = os.fstat(child)
+            try:
+                _validate_directory(
+                    named,
+                    allowed_owner_uids=allowed,
+                    label="protected path",
+                )
+                if (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino):
+                    raise AuthorityPathSecurityError("protected path ancestor identity changed")
+            except BaseException:
+                os.close(child)
+                raise
+            links.append((parent, component, child))
+            descriptors.append(child)
+            parent = child
+        name = relative_parts[-1]
+        named = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(named.st_mode)
+            or stat.S_ISLNK(named.st_mode)
+            or named.st_nlink != 1
+            or named.st_uid not in final_uids
+            or named.st_gid not in final_gids
+            or stat.S_IMODE(named.st_mode) not in allowed_modes
+            or not min_bytes <= named.st_size <= max_bytes
+        ):
+            raise AuthorityPathSecurityError("protected file owner, mode, or identity is unsafe")
+        descriptor = os.open(
+            name,
+            os.O_RDONLY
+            | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent,
+        )
+        descriptors.append(descriptor)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino)
+            or (
+                named.st_mode,
+                named.st_nlink,
+                named.st_uid,
+                named.st_gid,
+                named.st_size,
+                named.st_mtime_ns,
+                named.st_ctime_ns,
+            )
+            != (
+                opened.st_mode,
+                opened.st_nlink,
+                opened.st_uid,
+                opened.st_gid,
+                opened.st_size,
+                opened.st_mtime_ns,
+                opened.st_ctime_ns,
+            )
+        ):
+            raise AuthorityPathSecurityError("protected file changed while opening")
+        lease = SecureRegularFileLease(
+            _trusted_root=trusted_root,
+            _descriptors=descriptors,
+            _links=tuple(links),
+            _parent_descriptor=parent,
+            _name=name,
+            _descriptor=descriptor,
+            _metadata=opened,
+        )
+        lease_created = True
+        return lease
+    except AuthorityPathSecurityError:
+        raise
+    except OSError as exc:
+        raise AuthorityPathSecurityError("protected path is unavailable") from exc
+    finally:
+        if not lease_created:
+            for opened_descriptor in reversed(descriptors):
+                with suppress(OSError):
+                    os.close(opened_descriptor)
 
 
 def read_secure_regular_file(
