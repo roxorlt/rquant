@@ -1,0 +1,14 @@
+[Unit]
+Description=rQuant Research Workload Plane
+
+[Slice]
+CPUAccounting=true
+CPUWeight=100
+CPUQuota=100%
+IOAccounting=true
+IOWeight=100
+MemoryAccounting=true
+MemoryHigh=512M
+MemoryMax=768M
+TasksAccounting=true
+TasksMax=128
