@@ -108,7 +108,7 @@ class ConsumerCursor(RuntimeContractModel):
         return canonical_sha256(self.model_dump(mode="python"))
 
 
-class CurrentPointer(RuntimeContractModel):
+class BatchPointer(RuntimeContractModel):
     channel: LiveChannel
     source_generation_id: Sha256Hex
     batch_id: NonEmptyStr
@@ -118,18 +118,17 @@ class CurrentPointer(RuntimeContractModel):
     quality_status: BatchQualityStatus
     published_at: AwareUtcDatetime
 
-    @model_validator(mode="after")
-    def validate_current_quality(self) -> CurrentPointer:
-        if self.quality_status in {
-            BatchQualityStatus.CANDIDATE,
-            BatchQualityStatus.QUARANTINED,
-        }:
-            raise ValueError(f"{self.quality_status.value} batch cannot be current")
-        return self
-
     @property
     def identity_sha256(self) -> str:
         return canonical_sha256(self.model_dump(mode="python"))
+
+
+class CurrentPointer(BatchPointer):
+    @model_validator(mode="after")
+    def validate_current_quality(self) -> CurrentPointer:
+        if self.quality_status is not BatchQualityStatus.PUBLISHED:
+            raise ValueError(f"{self.quality_status.value} batch cannot be current")
+        return self
 
 
 class LiveSourceDescriptor(RuntimeContractModel):

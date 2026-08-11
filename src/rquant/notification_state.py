@@ -7,11 +7,13 @@ import json
 import sqlite3
 from collections.abc import Mapping
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from datetime import datetime
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Literal, Self
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_serializer, field_validator, model_validator
 
 from rquant.delivery_contracts import (
     DeliveryChannel,
@@ -25,6 +27,7 @@ from rquant.runtime_contracts import (
     canonical_sha256,
     normalize_aware_utc,
 )
+from rquant.serving_contracts import FreshnessStatus
 from rquant.signal_bus import (
     SignalBusRoutedRecord,
     SignalBusSourceDescriptor,
@@ -35,6 +38,27 @@ from rquant.signal_contracts import SignalEnvelope
 
 if TYPE_CHECKING:
     from rquant.runtime_serving_snapshot import SignalDeliveryPayload
+
+from rquant.serving_read_models import ServingProjectionPayload
+
+_NOTIFICATION_PROJECTION_TABLES = frozenset(
+    {
+        "screen_result",
+        "pool2_watch",
+        "monitor_event",
+        "surge_event",
+        "market_snapshot",
+        "market_overview",
+        "intraday_kline",
+        "screen_bounds",
+        "minute_coverage",
+        "canvas_diagnostic",
+        "canvas_latest_trade_date",
+        "canvas_hit",
+        "canvas_definition",
+    }
+)
+_MAX_SERVING_DELIVERIES = 10_000
 
 
 class NotificationReplicationError(RuntimeError):
@@ -115,6 +139,166 @@ class NotificationRecipientMigrationSummary(RuntimeContractModel):
     audit_ids: tuple[str, ...]
 
 
+class NotificationProjectionSourceReceipt(RuntimeContractModel):
+    """Canonical receipt for one already-verified PIT projection authority."""
+
+    dataset_id: str = Field(min_length=1)
+    generation_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    sequence: int = Field(ge=0)
+    event_time: AwareUtcDatetime
+    published_at: AwareUtcDatetime
+    status: FreshnessStatus = FreshnessStatus.FRESH
+    projections: tuple[ServingProjectionPayload, ...] = Field(min_length=1)
+    receipt_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("projections")
+    @classmethod
+    def canonicalize_source_projections(
+        cls,
+        value: tuple[ServingProjectionPayload, ...],
+    ) -> tuple[ServingProjectionPayload, ...]:
+        return tuple(sorted(value, key=lambda projection: projection.table_name))
+
+    @model_validator(mode="after")
+    def validate_receipt(self) -> Self:
+        table_names = tuple(projection.table_name for projection in self.projections)
+        if len(table_names) != len(set(table_names)):
+            raise ValueError("notification projection source contains duplicate tables")
+        if self.status is not FreshnessStatus.FRESH:
+            raise ValueError("notification projection source must be fresh")
+        if self.event_time > self.published_at:
+            raise ValueError("notification projection source event time exceeds publication")
+        if any(projection.available_at > self.published_at for projection in self.projections):
+            raise ValueError("notification projection source contains future evidence")
+        expected = canonical_sha256(self.model_dump(mode="python", exclude={"receipt_id"}))
+        if self.receipt_id != expected:
+            raise ValueError("notification projection source receipt does not match content")
+        return self
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        dataset_id: str,
+        generation_id: str,
+        sequence: int,
+        event_time: datetime,
+        published_at: datetime,
+        projections: tuple[ServingProjectionPayload, ...],
+    ) -> NotificationProjectionSourceReceipt:
+        values = {
+            "dataset_id": dataset_id,
+            "generation_id": generation_id,
+            "sequence": sequence,
+            "event_time": normalize_aware_utc(event_time),
+            "published_at": normalize_aware_utc(published_at),
+            "status": FreshnessStatus.FRESH,
+            "projections": tuple(sorted(projections, key=lambda item: item.table_name)),
+        }
+        return cls(**values, receipt_id=canonical_sha256(values))
+
+
+class NotificationProjectionAuthoritySnapshot(RuntimeContractModel):
+    """One bounded PIT publication for every notification-owned page projection."""
+
+    schema_version: int = Field(default=1, ge=1)
+    observed_at: AwareUtcDatetime
+    available_at: AwareUtcDatetime
+    source_receipts: Mapping[str, str] = Field(min_length=1)
+    projections: tuple[ServingProjectionPayload, ...]
+    generation_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("source_receipts", mode="after")
+    @classmethod
+    def freeze_source_receipts(cls, value: Mapping[str, str]) -> Mapping[str, str]:
+        if any(not key or len(receipt) != 64 for key, receipt in value.items()):
+            raise ValueError("notification projection source receipts are invalid")
+        if any(
+            any(character not in "0123456789abcdef" for character in receipt)
+            for receipt in value.values()
+        ):
+            raise ValueError("notification projection source receipts are invalid")
+        return MappingProxyType(dict(sorted(value.items())))
+
+    @field_serializer("source_receipts")
+    def serialize_source_receipts(self, value: Mapping[str, str]) -> dict[str, str]:
+        return dict(value)
+
+    @field_validator("projections")
+    @classmethod
+    def canonicalize_projections(
+        cls,
+        value: tuple[ServingProjectionPayload, ...],
+    ) -> tuple[ServingProjectionPayload, ...]:
+        return tuple(sorted(value, key=lambda projection: projection.table_name))
+
+    @model_validator(mode="after")
+    def validate_snapshot(self) -> Self:
+        table_names = tuple(projection.table_name for projection in self.projections)
+        if len(table_names) != len(set(table_names)) or set(table_names) != (
+            _NOTIFICATION_PROJECTION_TABLES
+        ):
+            raise ValueError(
+                "notification authority must publish exactly the notification projections"
+            )
+        if self.available_at > self.observed_at:
+            raise ValueError("notification projection availability exceeds observation time")
+        if any(projection.available_at > self.available_at for projection in self.projections):
+            raise ValueError("notification projection contains future source evidence")
+        expected = canonical_sha256(self.model_dump(mode="python", exclude={"generation_id"}))
+        if self.generation_id != expected:
+            raise ValueError("notification projection generation does not match content")
+        return self
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        observed_at: datetime,
+        available_at: datetime,
+        source_receipts: Mapping[str, str],
+        projections: tuple[ServingProjectionPayload, ...],
+    ) -> NotificationProjectionAuthoritySnapshot:
+        values = {
+            "schema_version": 1,
+            "observed_at": normalize_aware_utc(observed_at),
+            "available_at": normalize_aware_utc(available_at),
+            "source_receipts": dict(source_receipts),
+            "projections": tuple(sorted(projections, key=lambda item: item.table_name)),
+        }
+        return cls(**values, generation_id=canonical_sha256(values))
+
+    @classmethod
+    def create_from_sources(
+        cls,
+        *,
+        observed_at: datetime,
+        sources: tuple[NotificationProjectionSourceReceipt, ...],
+    ) -> NotificationProjectionAuthoritySnapshot:
+        observed = normalize_aware_utc(observed_at)
+        validated = tuple(
+            NotificationProjectionSourceReceipt.model_validate(source) for source in sources
+        )
+        if not validated:
+            raise ValueError("notification projection sources cannot be empty")
+        dataset_ids = tuple(source.dataset_id for source in validated)
+        if len(dataset_ids) != len(set(dataset_ids)):
+            raise ValueError("notification projection sources must have unique dataset ids")
+        if any(source.published_at > observed for source in validated):
+            raise ValueError("notification projection source contains future publication")
+        projections = tuple(
+            projection
+            for source in sorted(validated, key=lambda item: item.dataset_id)
+            for projection in source.projections
+        )
+        return cls.create(
+            observed_at=observed,
+            available_at=max(source.published_at for source in validated),
+            source_receipts={source.dataset_id: source.receipt_id for source in validated},
+            projections=projections,
+        )
+
+
 @dataclass(frozen=True)
 class NotificationServingSnapshot:
     observed_at: AwareUtcDatetime
@@ -124,6 +308,8 @@ class NotificationServingSnapshot:
     omitted_signal_count: int
     truncated: bool
     payload: SignalDeliveryPayload
+    projection_generation_id: str | None = None
+    projection_source_receipts: Mapping[str, str] = dataclass_field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if any(
@@ -142,6 +328,8 @@ class NotificationServingSnapshot:
             raise ValueError("visible signal count does not match truncation counts")
         if self.truncated != (self.omitted_signal_count > 0):
             raise ValueError("truncated flag does not match omitted signal count")
+        if (self.projection_generation_id is None) != (not self.projection_source_receipts):
+            raise ValueError("notification projection identity and receipts must be bound")
 
 
 class NotificationStateStore(SignalBusStore):
@@ -228,6 +416,14 @@ class NotificationStateStore(SignalBusStore):
                     original_record_hash TEXT NOT NULL,
                     observed_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS notification_projection_authority (
+                    generation_id TEXT PRIMARY KEY,
+                    observed_at TEXT NOT NULL,
+                    available_at TEXT NOT NULL,
+                    source_receipts_json TEXT NOT NULL,
+                    payload_json TEXT NOT NULL
+                );
                 """
             )
             for table in (
@@ -236,6 +432,7 @@ class NotificationStateStore(SignalBusStore):
                 "delivery_outbox",
                 "delivery_attempt",
                 "delivery_unknown",
+                "notification_projection_authority",
             ):
                 for operation in ("INSERT", "UPDATE", "DELETE"):
                     trigger = f"notification_revision_{table}_{operation.lower()}"
@@ -258,6 +455,16 @@ class NotificationStateStore(SignalBusStore):
                     BEFORE {operation} ON notification_source_route_receipt
                     BEGIN
                         SELECT RAISE(ABORT, 'notification source route receipt is immutable');
+                    END
+                    """
+                )
+                connection.execute(
+                    f"""
+                    CREATE TRIGGER IF NOT EXISTS
+                        notification_projection_authority_immutable_{operation.lower()}
+                    BEFORE {operation} ON notification_projection_authority
+                    BEGIN
+                        SELECT RAISE(ABORT, 'notification projection authority is immutable');
                     END
                     """
                 )
@@ -284,6 +491,54 @@ class NotificationStateStore(SignalBusStore):
                     END
                     """
                 )
+
+    def publish_projection_authority(
+        self,
+        snapshot: NotificationProjectionAuthoritySnapshot,
+    ) -> str:
+        validated = NotificationProjectionAuthoritySnapshot.model_validate(snapshot)
+        payload_json = validated.model_dump_json()
+        observed_text = validated.observed_at.isoformat(timespec="microseconds")
+        available_text = validated.available_at.isoformat(timespec="microseconds")
+        receipts_json = json.dumps(
+            dict(validated.source_receipts),
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        with self._write_transaction() as connection:
+            existing = connection.execute(
+                "SELECT payload_json FROM notification_projection_authority "
+                "WHERE generation_id = ?",
+                (validated.generation_id,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    NotificationProjectionAuthoritySnapshot.model_validate_json(
+                        existing["payload_json"]
+                    )
+                    != validated
+                ):
+                    raise NotificationReplicationError(
+                        "notification projection generation conflicts with immutable content"
+                    )
+                return validated.generation_id
+            connection.execute(
+                """
+                INSERT INTO notification_projection_authority(
+                    generation_id, observed_at, available_at,
+                    source_receipts_json, payload_json
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    validated.generation_id,
+                    observed_text,
+                    available_text,
+                    receipts_json,
+                    payload_json,
+                ),
+            )
+        return validated.generation_id
 
     def replication_cursor(self) -> NotificationReplicationCursor:
         connection = self._connect_readonly()
@@ -443,46 +698,88 @@ class NotificationStateStore(SignalBusStore):
             ).fetchone()
             if revision_row is None:
                 raise RuntimeError("notification state revision is missing")
-            rows = connection.execute(
+            observed_text = observed.isoformat(timespec="microseconds")
+            projection_row = connection.execute(
                 """
+                SELECT payload_json
+                FROM notification_projection_authority
+                WHERE available_at <= ? AND observed_at <= ?
+                ORDER BY available_at DESC, observed_at DESC, generation_id DESC
+                LIMIT 1
+                """,
+                (observed_text, observed_text),
+            ).fetchone()
+            projection_snapshot = (
+                None
+                if projection_row is None
+                else NotificationProjectionAuthoritySnapshot.model_validate_json(
+                    projection_row["payload_json"]
+                )
+            )
+            observed_text = observed.isoformat(timespec="microseconds").replace("+00:00", "Z")
+            visible_predicate = """
+                julianday(signal.received_at) <= julianday(?)
+                AND julianday(json_extract(signal.payload_json, '$.available_at'))
+                    <= julianday(?)
+                AND julianday(json_extract(receipt.receipt_json, '$.routed_at'))
+                    <= julianday(?)
+            """
+            visible_row = connection.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM notification_source_route_receipt AS receipt
+                JOIN signal_envelope AS signal
+                  ON signal.global_sequence = receipt.global_sequence
+                 AND signal.signal_id = receipt.signal_id
+                WHERE {visible_predicate}
+                """,
+                (observed_text, observed_text, observed_text),
+            ).fetchone()
+            visible_signal_count = 0 if visible_row is None else int(visible_row[0])
+            rows = connection.execute(
+                f"""
                 SELECT signal.global_sequence, signal.payload_json, signal.received_at,
                        receipt.receipt_json
                 FROM notification_source_route_receipt AS receipt
                 JOIN signal_envelope AS signal
                   ON signal.global_sequence = receipt.global_sequence
                  AND signal.signal_id = receipt.signal_id
-                ORDER BY signal.global_sequence
-                """
+                WHERE {visible_predicate}
+                ORDER BY signal.global_sequence DESC
+                LIMIT ?
+                """,
+                (observed_text, observed_text, observed_text, history_limit),
             ).fetchall()
 
-            visible: list[tuple[ServingSignalRecord, SignalRouteReceipt]] = []
-            for row in rows:
+            selected: list[tuple[ServingSignalRecord, SignalRouteReceipt]] = []
+            for row in reversed(rows):
                 signal = SignalEnvelope.model_validate_json(row["payload_json"])
                 route = SignalRouteReceipt.model_validate_json(row["receipt_json"])
                 received_at = normalize_aware_utc(datetime.fromisoformat(row["received_at"]))
                 if (
-                    signal.available_at <= observed
-                    and received_at <= observed
-                    and route.routed_at <= observed
+                    signal.available_at > observed
+                    or received_at > observed
+                    or route.routed_at > observed
                 ):
-                    visible.append(
-                        (
-                            ServingSignalRecord(
-                                global_sequence=row["global_sequence"],
-                                signal=signal,
-                            ),
-                            route,
-                        )
+                    raise NotificationReplicationError(
+                        "SQL-visible notification evidence is future-dated"
                     )
+                selected.append(
+                    (
+                        ServingSignalRecord(
+                            global_sequence=row["global_sequence"],
+                            signal=signal,
+                        ),
+                        route,
+                    )
+                )
 
-            selected = visible[-history_limit:]
             signal_records = tuple(item[0] for item in selected)
             routes = tuple(item[1] for item in selected)
             signal_ids = tuple(record.signal.signal_id for record in signal_records)
             deliveries = ()
             if signal_ids:
                 placeholders = ",".join("?" for _ in signal_ids)
-                observed_text = observed.isoformat(timespec="microseconds").replace("+00:00", "Z")
                 delivery_rows = connection.execute(
                     f"""
                     SELECT * FROM delivery_outbox
@@ -490,9 +787,19 @@ class NotificationStateStore(SignalBusStore):
                       AND created_at <= ?
                       AND updated_at <= ?
                     ORDER BY global_sequence, recipient_id, channel, outbox_id
+                    LIMIT ?
                     """,
-                    (*signal_ids, observed_text, observed_text),
+                    (
+                        *signal_ids,
+                        observed_text,
+                        observed_text,
+                        _MAX_SERVING_DELIVERIES + 1,
+                    ),
                 ).fetchall()
+                if len(delivery_rows) > _MAX_SERVING_DELIVERIES:
+                    raise NotificationReplicationError(
+                        "notification serving deliveries exceed the bounded projection limit"
+                    )
                 deliveries = tuple(self._outbox_from_row(row) for row in delivery_rows)
             connection.execute("COMMIT")
         except BaseException:
@@ -512,16 +819,23 @@ class NotificationStateStore(SignalBusStore):
             signals=coherent.signals,
             routes=coherent.routes,
             deliveries=coherent.deliveries,
+            projections=(() if projection_snapshot is None else projection_snapshot.projections),
         )
-        omitted = len(visible) - len(selected)
+        omitted = visible_signal_count - len(selected)
         return NotificationServingSnapshot(
             observed_at=observed,
             sequence=int(revision_row["revision"]),
-            visible_signal_count=len(visible),
+            visible_signal_count=visible_signal_count,
             returned_signal_count=len(selected),
             omitted_signal_count=omitted,
             truncated=omitted > 0,
             payload=payload,
+            projection_generation_id=(
+                None if projection_snapshot is None else projection_snapshot.generation_id
+            ),
+            projection_source_receipts=(
+                {} if projection_snapshot is None else projection_snapshot.source_receipts
+            ),
         )
 
     def apply_recipient_alias_migrations(
@@ -1030,6 +1344,8 @@ class NotificationStateStore(SignalBusStore):
 
 __all__ = [
     "NotificationAuthorityHandoff",
+    "NotificationProjectionAuthoritySnapshot",
+    "NotificationProjectionSourceReceipt",
     "NotificationRecipientMigrationAudit",
     "NotificationRecipientMigrationSummary",
     "NotificationReplicationCursor",

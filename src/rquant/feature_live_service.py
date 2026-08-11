@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, time
+from typing import TYPE_CHECKING
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 from pydantic import Field
@@ -36,6 +38,25 @@ from rquant.runtime_contracts import (
     canonical_sha256,
     normalize_aware_utc,
 )
+from rquant.runtime_market_session import MarketCalendarAuthority
+
+if TYPE_CHECKING:
+    from rquant.runtime_schema_registry import RuntimeSchemaDualWriter
+
+_SHANGHAI = ZoneInfo("Asia/Shanghai")
+_SESSION_CLOSE = time(15, 0)
+
+
+def current_runtime_schema_dual_writer(
+    channel_id: str,
+    *,
+    producer_commit: str,
+) -> RuntimeSchemaDualWriter | None:
+    from rquant.runtime_schema_registry import (
+        current_runtime_schema_dual_writer as current_writer,
+    )
+
+    return current_writer(channel_id, producer_commit=producer_commit)
 
 
 class FeatureLiveBatchSummary(RuntimeContractModel):
@@ -49,6 +70,7 @@ class FeatureLiveBatchSummary(RuntimeContractModel):
     replayed_count: int = Field(ge=0)
     stale_count: int = Field(ge=0)
     has_deferred_batches: bool
+    close_marker_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
 
 FeatureLiveFaultHook = Callable[[str], None]
@@ -150,13 +172,18 @@ def _empty_result(
         sequence=sequence,
         event_time=available_at,
         available_at=available_at,
+        decision_cutoff=available_at,
+        actual_delay_seconds=0.0,
         row_count=0,
         content_hash=content_hash,
         field_statuses=tuple(
             FeatureFieldStatus(
                 name=name,
                 status=status,
+                source_event_time=available_at,
                 available_at=available_at,
+                decision_cutoff=available_at,
+                actual_delay_seconds=0.0,
                 reason=reason,
             )
             for name in STATUS_COLUMNS
@@ -185,13 +212,17 @@ def _degrade_result(
 
     statuses = tuple(
         FeatureFieldStatus(
+            candidate_id=status.candidate_id,
             name=status.name,
             status=(
                 FeatureAvailability.DEGRADED
                 if status.status is FeatureAvailability.AVAILABLE
                 else status.status
             ),
+            source_event_time=status.source_event_time,
             available_at=status.available_at,
+            decision_cutoff=status.decision_cutoff,
+            actual_delay_seconds=status.actual_delay_seconds,
             reason=merge_reason(status.reason),
         )
         for status in result.envelope.field_statuses
@@ -216,12 +247,16 @@ def run_feature_live_batch(
     limit: int,
     consumer_id: str = "feature-live",
     fault_hook: FeatureLiveFaultHook | None = None,
+    schema_dual_writer: RuntimeSchemaDualWriter | None = None,
+    calendar: MarketCalendarAuthority | None = None,
 ) -> FeatureLiveBatchSummary:
     observed = normalize_aware_utc(observed_at)
     if not historical_snapshot_id:
         raise ValueError("historical_snapshot_id cannot be empty")
     if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
         raise ValueError("limit must be a positive integer")
+    if calendar is not None and calendar.generated_at > observed:
+        raise ValueError("feature completion calendar was generated after observed_at")
     descriptor = raw_spool.source_descriptor(LiveChannel.MARKET_MINUTE)
     cursor = raw_spool.load_cursor(consumer_id, LiveChannel.MARKET_MINUTE)
     started_after = -1 if cursor is None else cursor.last_sequence
@@ -282,7 +317,24 @@ def run_feature_live_batch(
                     result,
                     reasons=envelope.degraded_reasons,
                 )
+        schema_writer = schema_dual_writer or current_runtime_schema_dual_writer(
+            "runtime.intraday_feature.batch-envelope",
+            producer_commit=config.producer_commit,
+        )
+        prepared_schema_write = (
+            None
+            if schema_writer is None
+            else schema_writer.prepare_payload(
+                result.envelope.model_dump(mode="json"),
+                observed_at=result.envelope.available_at,
+            )
+        )
         feature_spool.publish(result.envelope, result.payload_bytes)
+        if schema_writer is not None and prepared_schema_write is not None:
+            schema_writer.commit_payload(
+                prepared_schema_write,
+                operation_id=f"intraday-feature:{result.envelope.batch_id}",
+            )
         if fault_hook is not None:
             fault_hook("after_feature_publish")
         raw_spool.commit_cursor(
@@ -301,6 +353,43 @@ def run_feature_live_batch(
         last_sequence = envelope.sequence
 
     feature_descriptor = feature_spool.source_descriptor()
+    has_deferred_batches = last_sequence < descriptor.high_watermark
+    close_marker_id: str | None = None
+    if calendar is not None and not has_deferred_batches and descriptor.high_watermark >= 0:
+        local_observed = observed.astimezone(_SHANGHAI)
+        trade_date = local_observed.date()
+        if (
+            calendar.coverage_start <= trade_date <= calendar.coverage_end
+            and trade_date in calendar.open_dates
+        ):
+            session_close = datetime.combine(
+                trade_date,
+                _SESSION_CLOSE,
+                tzinfo=_SHANGHAI,
+            ).astimezone(observed.tzinfo)
+            if observed >= session_close:
+                final_records = raw_spool.list_after(
+                    LiveChannel.MARKET_MINUTE,
+                    sequence=descriptor.high_watermark - 1,
+                    limit=1,
+                )
+                if len(final_records) != 1:
+                    raise ValueError("raw minute final batch is unavailable at close")
+                final_record = final_records[0]
+                if final_record.envelope.event_time_end == session_close:
+                    marker = feature_spool.publish_session_close_marker(
+                        trade_date=trade_date,
+                        session_close_at=session_close,
+                        produced_at=observed,
+                        calendar_generation_id=calendar.content_sha256,
+                        complete_through=session_close,
+                        upstream_source_generation_id=descriptor.generation_id,
+                        upstream_final_sequence=final_record.envelope.sequence,
+                        upstream_final_batch_id=final_record.envelope.batch_id,
+                        upstream_final_content_hash=final_record.envelope.content_sha256,
+                        fault_hook=fault_hook,
+                    )
+                    close_marker_id = marker.marker_id
     return FeatureLiveBatchSummary(
         observed_at=observed,
         source_generation_id=descriptor.generation_id,
@@ -311,7 +400,8 @@ def run_feature_live_batch(
         processed_count=processed,
         replayed_count=replayed,
         stale_count=stale,
-        has_deferred_batches=last_sequence < descriptor.high_watermark,
+        has_deferred_batches=has_deferred_batches,
+        close_marker_id=close_marker_id,
     )
 
 

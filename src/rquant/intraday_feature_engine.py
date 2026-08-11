@@ -482,35 +482,32 @@ def _field_statuses(
     rows: list[dict[str, object]],
     row_reasons: list[dict[str, str | None]],
     *,
+    source_event_times: dict[str, datetime],
     available_at: datetime,
+    decision_cutoff: datetime,
 ) -> tuple[FeatureFieldStatus, ...]:
     statuses: list[FeatureFieldStatus] = []
-    for name in STATUS_COLUMNS:
-        availability = [row[name] is not None for row in rows]
-        reasons = sorted(
-            {
-                reason_map[name] or "missing_value"
-                for present, reason_map in zip(availability, row_reasons, strict=True)
-                if not present
-            }
-        )
-        if all(availability):
-            status = FeatureAvailability.AVAILABLE
-            reason = None
-        elif any(availability):
-            status = FeatureAvailability.DEGRADED
-            reason = f"partial_availability:{','.join(reasons)}"
-        else:
-            status = FeatureAvailability.UNAVAILABLE
-            reason = ",".join(reasons)
-        statuses.append(
-            FeatureFieldStatus(
-                name=name,
-                status=status,
-                available_at=available_at,
-                reason=reason,
+    for row, reason_map in zip(rows, row_reasons, strict=True):
+        candidate_id = str(row["ts_code"])
+        source_event_time = source_event_times[candidate_id]
+        for name in STATUS_COLUMNS:
+            present = row[name] is not None
+            statuses.append(
+                FeatureFieldStatus(
+                    candidate_id=candidate_id,
+                    name=name,
+                    status=(
+                        FeatureAvailability.AVAILABLE
+                        if present
+                        else FeatureAvailability.UNAVAILABLE
+                    ),
+                    source_event_time=source_event_time,
+                    available_at=available_at,
+                    decision_cutoff=decision_cutoff,
+                    actual_delay_seconds=(available_at - source_event_time).total_seconds(),
+                    reason=None if present else reason_map[name] or "missing_value",
+                )
             )
-        )
     return tuple(statuses)
 
 
@@ -569,6 +566,11 @@ def _semantic_compute(
     visible = closed_current_day
     if visible.empty:
         raise IntradayFeatureValidationError("current_minutes has no rows visible at decision_time")
+    source_event_time = visible["_utc_time"].max().to_pydatetime()
+    source_event_times = {
+        str(ts_code): group["_utc_time"].max().to_pydatetime()
+        for ts_code, group in visible.groupby("ts_code", sort=True)
+    }
 
     rows: list[dict[str, object]] = []
     reasons: list[dict[str, str | None]] = []
@@ -600,7 +602,7 @@ def _semantic_compute(
             "config_fingerprint": canonical_sha256(config.model_dump(mode="python")),
             "input_batch_ids": sorted_input_ids,
             "sequence": sequence,
-            "event_time": decision_utc,
+            "event_time": source_event_time,
             "content_hash": content_hash,
             "producer_commit": config.producer_commit,
         }
@@ -612,14 +614,18 @@ def _semantic_compute(
         contract_version=config.contract_version,
         input_batch_ids=sorted_input_ids,
         sequence=sequence,
-        event_time=decision_utc,
+        event_time=source_event_time,
         available_at=available_at,
+        decision_cutoff=decision_utc,
+        actual_delay_seconds=(available_at - source_event_time).total_seconds(),
         row_count=len(rows),
         content_hash=content_hash,
         field_statuses=_field_statuses(
             rows,
             reasons,
+            source_event_times=source_event_times,
             available_at=available_at,
+            decision_cutoff=decision_utc,
         ),
         producer_commit=config.producer_commit,
     )

@@ -7,11 +7,10 @@ import fcntl
 import hashlib
 import os
 import re
-import secrets
 import stat
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
-from datetime import UTC, date, datetime, time, timedelta
+from datetime import UTC, date, datetime, time
 from io import BytesIO
 from typing import Annotated
 from zoneinfo import ZoneInfo
@@ -22,6 +21,7 @@ from pydantic import Field, StringConstraints, model_validator
 
 from rquant.live_contracts import (
     BatchEnvelope,
+    BatchPointer,
     BatchQualityStatus,
     CurrentPointer,
     LiveChannel,
@@ -32,10 +32,13 @@ from rquant.runtime_contracts import (
     canonical_sha256,
     normalize_aware_utc,
 )
-from rquant.source_quota_store import SourceQuotaStore
+from rquant.source_quota_store import (
+    SourceQuotaAttemptOutcome,
+    SourceQuotaConflictError,
+    SourceQuotaStore,
+)
 
 CommitSha = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{40}$")]
-PointerGeneration = tuple[int, int, int, int] | None
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _TS_CODE = re.compile(r"^[0-9]{6}\.(?:SH|SZ|BJ)$")
 
@@ -68,7 +71,7 @@ class AuctionMatchGatewayConfig(RuntimeContractModel):
 
 
 class AuctionMatchCapture(RuntimeContractModel):
-    pointer: CurrentPointer
+    pointer: CurrentPointer | BatchPointer
     published: bool
     expected_count: int = Field(gt=0)
     observed_count: int = Field(ge=0)
@@ -95,13 +98,17 @@ class AuctionMatchGateway:
         fetcher: Callable[[date], pd.DataFrame],
         config: AuctionMatchGatewayConfig,
         quota_store: SourceQuotaStore | None = None,
+        dispatch_clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.spool = spool
         self._fetcher = fetcher
         self.config = config
         self._quota_store = quota_store
+        self._dispatch_clock = dispatch_clock
         if config.quota_units_per_window is not None and quota_store is None:
             raise ValueError("quota_store is required when quota governance is enabled")
+        if config.quota_units_per_window is not None and dispatch_clock is None:
+            raise ValueError("dispatch_clock is required when quota governance is enabled")
 
     @staticmethod
     def _normalize_universe(
@@ -236,43 +243,58 @@ class AuctionMatchGateway:
         trade_date: date,
         received: datetime,
         source_request_id: str,
+        retry_ordinal: int,
     ) -> pd.DataFrame:
         if self._quota_store is None or self.config.quota_units_per_window is None:
             return self._fetcher(trade_date)
-        window_start = received.replace(second=0, microsecond=0)
-        window_reset = window_start + timedelta(minutes=1)
-        window_id = window_start.strftime("%Y%m%dT%H%M")
-        self._quota_store.declare_window(
-            source=self.config.source,
-            window_id=window_id,
-            starts_at=window_start,
-            resets_at=window_reset,
-            total_units=self.config.quota_units_per_window,
-        )
-        usage_id = canonical_sha256(
+        attempt_id = canonical_sha256(
             {
+                "protocol": "auction-source-attempt-v2",
+                "source": self.config.source,
+                "trade_date": trade_date,
+                "session": "auction_match",
                 "source_request_id": source_request_id,
-                "producer_version": self.config.producer_version,
-                "attempt_nonce": secrets.token_hex(16),
+                "retry_ordinal": retry_ordinal,
             }
         )
-        lease = self._quota_store.acquire(
+        if self._dispatch_clock is None:
+            raise SourceQuotaConflictError("auction-match dispatch clock is required")
+        attempt, created = self._quota_store.begin_transport_dispatch(
             source=self.config.source,
-            owner=f"auction-match:{usage_id}",
+            owner=f"auction-match:{attempt_id}",
+            attempt_id=attempt_id,
+            logical_request_id=attempt_id,
+            api_name="stk_auction",
+            call_ordinal=1,
             units=self.config.quota_cost_per_request,
-            now=received,
-            expires_at=min(received + timedelta(seconds=10), window_reset),
+            total_units=self.config.quota_units_per_window,
+            window_kind="minute",
+            clock=self._dispatch_clock,
         )
-        try:
-            return self._fetcher(trade_date)
-        finally:
-            self._quota_store.consume(
-                lease.lease_id,
-                usage_id=usage_id,
-                units=self.config.quota_cost_per_request,
-                now=received,
+        if not created:
+            if attempt.outcome is SourceQuotaAttemptOutcome.PENDING:
+                attempt = self._quota_store.recover_attempt(
+                    attempt_id,
+                    now=normalize_aware_utc(self._dispatch_clock()),
+                )
+            raise SourceQuotaConflictError(
+                f"auction-match source attempt already exists: {attempt.outcome.value}"
             )
-            self._quota_store.release(lease.lease_id, now=received)
+        try:
+            result = self._fetcher(trade_date)
+        except Exception:
+            self._quota_store.commit_attempt(
+                attempt.attempt_id,
+                outcome=SourceQuotaAttemptOutcome.FAILURE,
+                now=normalize_aware_utc(self._dispatch_clock()),
+            )
+            raise
+        self._quota_store.commit_attempt(
+            attempt.attempt_id,
+            outcome=SourceQuotaAttemptOutcome.SUCCESS,
+            now=normalize_aware_utc(self._dispatch_clock()),
+        )
+        return result
 
     @contextmanager
     def _capture_lock(self) -> Iterator[bool]:
@@ -406,58 +428,28 @@ class AuctionMatchGateway:
         )
 
     def _latest_envelope(self) -> BatchEnvelope | None:
-        current = self.spool.current(LiveChannel.AUCTION_MATCH)
-        if current is None:
+        records = self.spool.list_after(LiveChannel.AUCTION_MATCH, sequence=-1)
+        if not records:
             return None
-        records = self.spool.list_after(
-            LiveChannel.AUCTION_MATCH,
-            sequence=current.sequence - 1,
-        )
-        if len(records) != 1:
-            raise AuctionMatchValidationError("current live batch cannot be resolved")
-        return records[0].envelope
-
-    def _current_pointer_generation(self) -> PointerGeneration:
-        path = self.spool.current_root / f"{LiveChannel.AUCTION_MATCH.value}.json"
-        try:
-            observed = path.lstat()
-        except FileNotFoundError:
-            return None
-        except OSError as exc:
-            raise AuctionMatchValidationError("current pointer is unavailable") from exc
-        if (
-            not stat.S_ISREG(observed.st_mode)
-            or observed.st_uid != os.getuid()
-            or observed.st_nlink != 1
-            or stat.S_IMODE(observed.st_mode) != 0o600
-        ):
-            raise AuctionMatchValidationError("current pointer path is unsafe")
-        return (
-            observed.st_dev,
-            observed.st_ino,
-            observed.st_size,
-            observed.st_mtime_ns,
-        )
+        return records[-1].envelope
 
     def _completed_published_capture(
         self,
         *,
         source_request_id: str,
         event_at: datetime,
-        received: datetime,
+        retry_ordinal: int,
         expected: tuple[str, ...],
         required: tuple[str, ...],
-        waited: bool,
-        pointer_advanced: bool,
     ) -> AuctionMatchCapture | None:
         latest = self._latest_envelope()
         if (
             latest is None
+            or retry_ordinal != 0
             or latest.source_request_id != source_request_id
             or latest.event_time_start != event_at
             or latest.event_time_end != event_at
             or latest.quality_status is not BatchQualityStatus.PUBLISHED
-            or (not pointer_advanced and not waited and latest.received_at != received)
         ):
             return None
         current = self.spool.current(LiveChannel.AUCTION_MATCH)
@@ -492,16 +484,19 @@ class AuctionMatchGateway:
         required: tuple[str, ...],
         source_request_id: str,
         event_at: datetime,
+        retry_ordinal: int,
     ) -> AuctionMatchCapture:
         quality = BatchQualityStatus.PUBLISHED
         degraded_reasons: list[str] = []
         source_failed = False
         raw_empty = False
+        latest = self._latest_envelope()
         try:
             raw = self._fetch_with_quota(
                 trade_date=trade_date,
                 received=received,
                 source_request_id=source_request_id,
+                retry_ordinal=retry_ordinal,
             )
         except Exception as exc:
             source_failed = True
@@ -534,7 +529,6 @@ class AuctionMatchGateway:
         payload = self.encode_payload(frame)
         content_hash = hashlib.sha256(payload).hexdigest()
         reasons = tuple(degraded_reasons)
-        latest = self._latest_envelope()
         if (
             latest is not None
             and latest.source_request_id == source_request_id
@@ -544,9 +538,29 @@ class AuctionMatchGateway:
             and latest.quality_status is quality
             and latest.degraded_reasons == reasons
         ):
-            pointer = self.spool.current(LiveChannel.AUCTION_MATCH)
-            if pointer is None:
-                raise AuctionMatchValidationError("live current pointer disappeared")
+            if latest.quality_status is BatchQualityStatus.PUBLISHED:
+                pointer = self.spool.current(LiveChannel.AUCTION_MATCH)
+                if pointer is None:
+                    raise AuctionMatchValidationError("live current pointer disappeared")
+            else:
+                records = self.spool.list_after(
+                    LiveChannel.AUCTION_MATCH,
+                    sequence=latest.sequence - 1,
+                )
+                if len(records) != 1 or records[0].envelope != latest:
+                    raise AuctionMatchValidationError("latest live batch cannot be resolved")
+                pointer = BatchPointer(
+                    channel=latest.channel,
+                    source_generation_id=self.spool.source_descriptor(
+                        LiveChannel.AUCTION_MATCH
+                    ).generation_id,
+                    batch_id=latest.batch_id,
+                    sequence=latest.sequence,
+                    revision=latest.revision,
+                    content_sha256=latest.content_sha256,
+                    quality_status=latest.quality_status,
+                    published_at=latest.available_at,
+                )
             return AuctionMatchCapture(
                 pointer=pointer,
                 published=False,
@@ -611,9 +625,12 @@ class AuctionMatchGateway:
         received_at: datetime,
         expected_codes: Iterable[str],
         required_codes: Iterable[str] = (),
+        retry_ordinal: int = 0,
     ) -> AuctionMatchCapture:
         if type(trade_date) is not date:
             raise AuctionMatchValidationError("trade_date must be a date")
+        if type(retry_ordinal) is not int or retry_ordinal < 0:
+            raise AuctionMatchValidationError("retry_ordinal must be a nonnegative int")
         try:
             received = normalize_aware_utc(received_at)
         except ValueError as exc:
@@ -647,17 +664,13 @@ class AuctionMatchGateway:
             }
         )
         event_at = self._event_time(trade_date)
-        entry_pointer_generation = self._current_pointer_generation()
-        with self._capture_lock() as waited:
-            pointer_advanced = self._current_pointer_generation() != entry_pointer_generation
+        with self._capture_lock():
             completed = self._completed_published_capture(
                 source_request_id=source_request_id,
                 event_at=event_at,
-                received=received,
+                retry_ordinal=retry_ordinal,
                 expected=expected,
                 required=required,
-                waited=waited,
-                pointer_advanced=pointer_advanced,
             )
             if completed is not None:
                 return completed
@@ -668,4 +681,5 @@ class AuctionMatchGateway:
                 required=required,
                 source_request_id=source_request_id,
                 event_at=event_at,
+                retry_ordinal=retry_ordinal,
             )
