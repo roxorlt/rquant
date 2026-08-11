@@ -24,6 +24,8 @@ from tests.runtime_code_e2e_support import (
     install_test_package,
 )
 
+ROOT = Path(__file__).resolve().parents[2]
+
 
 def _operator(
     root: Path,
@@ -54,17 +56,9 @@ def _migration(package: RuntimeCodeTestPackage) -> RuntimeCodeMigrationRequest:
         install=package.request(),
         formal_services=(
             RuntimeCodeFormalService(
-                command="lab-worker",
-                arguments=(
-                    "--runtime-code-config",
-                    "/etc/rquant/runtime-code-bootstrap.json",
-                    "--runtime-code-trusted-base",
-                    "/etc/rquant",
-                    "--runtime-code-authority-uid",
-                    "0",
-                    "--runtime-code-authority-gid",
-                    "0",
-                ),
+                command="lab-claim-finalizer",
+                unit_path=ROOT / "deploy/systemd/rquant-lab-claim-finalizer.service",
+                wrapper_path=ROOT / "scripts/run-lab-daemon.py",
             ),
         ),
         expected_configuration_path=Path("/etc/rquant/runtime-code-bootstrap.json"),
@@ -200,8 +194,9 @@ def test_preflight_rejects_legacy_service_arguments_and_residue_without_writes(
         update={
             "formal_services": (
                 RuntimeCodeFormalService(
-                    command="lab-worker",
-                    arguments=("--trusted-git-path", "/usr/bin/git"),
+                    command="lab-claim-finalizer",
+                    unit_path=ROOT / "deploy/systemd/rquant-lab-claim-finalizer.service",
+                    wrapper_path=ROOT / "scripts/run-lab-daemon.py",
                 ),
             ),
             "legacy_paths": (legacy,),
@@ -213,6 +208,30 @@ def test_preflight_rejects_legacy_service_arguments_and_residue_without_writes(
 
     assert not (operator.runtime_root / "current").exists()
     assert not (operator.runtime_root / "generations").exists()
+
+
+def test_preflight_reads_actual_unit_and_rejects_static_drift(
+    tmp_path: Path,
+) -> None:
+    package = build_test_package(tmp_path / "package")
+    operator = _operator(tmp_path / "operator", package)
+    unit = tmp_path / "rquant-lab-claim-finalizer.service"
+    raw = (ROOT / "deploy/systemd/rquant-lab-claim-finalizer.service").read_text(encoding="utf-8")
+    unit.write_text(raw.replace("-- lab-claim-finalizer", "-- lab-claim-finalizer --drift"))
+    request = _migration(package).model_copy(
+        update={
+            "formal_services": (
+                RuntimeCodeFormalService(
+                    command="lab-claim-finalizer",
+                    unit_path=unit,
+                    wrapper_path=ROOT / "scripts/run-lab-daemon.py",
+                ),
+            ),
+        }
+    )
+
+    with pytest.raises(RuntimeCodeOperationError, match="service artifact"):
+        operator.dry_run(request)
 
 
 def test_install_atomically_selects_candidate_and_retains_previous_pointer(

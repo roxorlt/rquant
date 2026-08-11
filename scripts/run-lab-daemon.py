@@ -19,6 +19,8 @@ from types import ModuleType
 
 sys.dont_write_bytecode = True
 
+FORMAL_RUNTIME_WRAPPER_CONTRACT = "rquant-formal-runtime-wrapper/v1"
+
 _ALLOWED_DAEMONS = frozenset(
     {
         "lab-scheduler",
@@ -736,7 +738,114 @@ def _selected_release_runtime(
     return venv, python, launcher, identities
 
 
+def _acquire_formal_deployment_lock(path: Path) -> int:
+    path = _canonical_absolute(path, label="formal deployment lock")
+    parent = path.parent
+    try:
+        parent_identity = _require_owned_directory(parent, label="formal deployment lock root")
+        parent_fd = os.open(
+            parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            descriptor = os.open(
+                path.name,
+                os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=parent_fd,
+            )
+            opened = os.fstat(descriptor)
+            active = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        finally:
+            os.close(parent_fd)
+        if (
+            _require_owned_directory(parent, label="formal deployment lock root") != parent_identity
+            or _PathIdentity.capture(opened) != _PathIdentity.capture(active)
+            or not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.getuid()
+            or opened.st_nlink != 1
+            or stat.S_IMODE(opened.st_mode) != 0o600
+        ):
+            os.close(descriptor)
+            raise WrapperError("formal deployment lock is unsafe")
+        fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        os.set_inheritable(descriptor, True)
+        return descriptor
+    except BlockingIOError as exc:
+        raise WrapperError("formal deployment generation is being updated") from exc
+    except OSError as exc:
+        raise WrapperError("formal deployment lock is unavailable") from exc
+
+
+def _formal_main(argv: list[str]) -> int:
+    formal_runtime = importlib.import_module("rquant.formal_runtime")
+    formal_command = importlib.import_module("rquant.formal_runtime_command")
+    formal_composition = importlib.import_module("rquant.formal_runtime_composition")
+    formal_runtime_error = formal_runtime.FormalRuntimeError
+    bind_formal_runtime = formal_runtime.bind_formal_runtime
+    exec_formal_runtime = formal_runtime.exec_formal_runtime
+    formal_runtime_command_error = formal_command.FormalRuntimeCommandError
+    compose_formal_daemon_argv = formal_command.compose_formal_daemon_argv
+    parse_formal_wrapper_argv = formal_command.parse_formal_wrapper_argv
+    formal_runtime_composition_error = formal_composition.FormalRuntimeCompositionError
+    open_formal_runtime_capability = formal_composition.open_formal_runtime_capability
+
+    startup_deadline = time.monotonic() + 60.0
+    lock_fd = -1
+    capability = None
+    try:
+        binding = parse_formal_wrapper_argv(argv)
+        controlled_environment = _production_daemon_environment(
+            binding.command,
+            environ=os.environ,
+        )
+        os.environ.clear()
+        os.environ.update(controlled_environment)
+        lock_fd = _acquire_formal_deployment_lock(binding.deployment_lock_path)
+        capability = open_formal_runtime_capability(
+            configuration_path=binding.bootstrap.configuration_path,
+            trusted_base=binding.bootstrap.trusted_base,
+            expected_authority_uid=binding.bootstrap.authority_uid,
+            expected_authority_gid=binding.bootstrap.authority_gid,
+            startup_deadline_monotonic=startup_deadline,
+        )
+        daemon_argv = compose_formal_daemon_argv(
+            binding,
+            deployment_generation=capability.evidence.provenance_commit,
+            deployment_generation_fd=lock_fd,
+            startup_deadline_monotonic=startup_deadline,
+        )
+        session = bind_formal_runtime(
+            capability,
+            daemon_argv=daemon_argv,
+            environment_source=os.environ,
+            expected_python_abi=capability.loaded.attestation.execution_spec.python_abi,
+        )
+        capability = None
+        sys.stdout.flush()
+        sys.stderr.flush()
+        exec_formal_runtime(session)
+    except (
+        formal_runtime_command_error,
+        formal_runtime_composition_error,
+        formal_runtime_error,
+        OSError,
+        WrapperError,
+    ) as exc:
+        print(f"Lab formal daemon wrapper failed: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        if capability is not None:
+            capability.close()
+        if lock_fd >= 0:
+            os.close(lock_fd)
+    return 1
+
+
 def main(argv: list[str] | None = None) -> int:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    if raw_argv[:1] == ["formal"]:
+        return _formal_main(raw_argv[1:])
     startup_deadline = time.monotonic() + 60
     parser = argparse.ArgumentParser()
     parser.add_argument("--expected-checkout-root", required=True)
@@ -745,7 +854,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--trusted-git-path", required=True)
     parser.add_argument("--deployment-lock-path", required=True)
     parser.add_argument("daemon_argv", nargs=argparse.REMAINDER)
-    args = parser.parse_args(argv)
+    args = parser.parse_args(raw_argv)
     generation_lock_fd = -1
     try:
         daemon_argv = list(args.daemon_argv)

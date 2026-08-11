@@ -6207,10 +6207,15 @@ def cmd_panorama_user_list(args: argparse.Namespace) -> int:
 
 
 def _add_formal_runtime_bootstrap_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--runtime-code-config", type=Path, required=True)
-    parser.add_argument("--runtime-code-trusted-base", type=Path, required=True)
-    parser.add_argument("--runtime-code-authority-uid", type=int, required=True)
-    parser.add_argument("--runtime-code-authority-gid", type=int, required=True)
+    from rquant.formal_runtime_command import add_formal_runtime_bootstrap_arguments
+
+    add_formal_runtime_bootstrap_arguments(parser)
+
+
+def _add_formal_runtime_deployment_arguments(parser: argparse.ArgumentParser) -> None:
+    from rquant.formal_runtime_command import add_formal_runtime_deployment_arguments
+
+    add_formal_runtime_deployment_arguments(parser)
 
 
 def cmd_runtime_code(args: argparse.Namespace) -> int:
@@ -8310,12 +8315,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_formal_runtime_bootstrap_arguments(lab_scheduler_p)
     lab_scheduler_p.add_argument("--runtime-deployment-root", type=Path, required=True)
-    lab_scheduler_p.add_argument("--deployment-generation", required=True)
-    lab_scheduler_p.add_argument("--deployment-lock-path", required=True)
-    lab_scheduler_p.add_argument("--deployment-generation-fd", required=True, type=int)
-    lab_scheduler_p.add_argument("--startup-deadline-monotonic", required=True, type=float)
-    lab_scheduler_p.add_argument("--deployment-operation-id")
-    lab_scheduler_p.add_argument("--deployment-environment-generation")
+    _add_formal_runtime_deployment_arguments(lab_scheduler_p)
     lab_scheduler_p.add_argument(
         "--once",
         action="store_true",
@@ -8332,12 +8332,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="运行 Strategy Lab 后台分片 worker",
     )
     _add_formal_runtime_bootstrap_arguments(lab_worker_p)
-    lab_worker_p.add_argument("--deployment-generation", required=True)
-    lab_worker_p.add_argument("--deployment-lock-path", required=True)
-    lab_worker_p.add_argument("--deployment-generation-fd", required=True, type=int)
-    lab_worker_p.add_argument("--startup-deadline-monotonic", required=True, type=float)
-    lab_worker_p.add_argument("--deployment-operation-id")
-    lab_worker_p.add_argument("--deployment-environment-generation")
+    _add_formal_runtime_deployment_arguments(lab_worker_p)
     lab_worker_p.add_argument(
         "--worker-id",
         default=None,
@@ -8359,20 +8354,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="运行 authority-owned V2 claim publication finalizer",
     )
     _add_formal_runtime_bootstrap_arguments(lab_claim_finalizer_p)
-    lab_claim_finalizer_p.add_argument("--deployment-generation", required=True)
-    lab_claim_finalizer_p.add_argument("--deployment-lock-path", required=True)
-    lab_claim_finalizer_p.add_argument(
-        "--deployment-generation-fd",
-        required=True,
-        type=int,
-    )
-    lab_claim_finalizer_p.add_argument(
-        "--startup-deadline-monotonic",
-        required=True,
-        type=float,
-    )
-    lab_claim_finalizer_p.add_argument("--deployment-operation-id")
-    lab_claim_finalizer_p.add_argument("--deployment-environment-generation")
+    _add_formal_runtime_deployment_arguments(lab_claim_finalizer_p)
     lab_claim_finalizer_p.add_argument(
         "--once",
         action="store_true",
@@ -8450,12 +8432,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="只读聚合已完成分片并发布完整结果 commit",
     )
     _add_formal_runtime_bootstrap_arguments(lab_finalizer_p)
-    lab_finalizer_p.add_argument("--deployment-generation", required=True)
-    lab_finalizer_p.add_argument("--deployment-lock-path", required=True)
-    lab_finalizer_p.add_argument("--deployment-generation-fd", required=True, type=int)
-    lab_finalizer_p.add_argument("--startup-deadline-monotonic", required=True, type=float)
-    lab_finalizer_p.add_argument("--deployment-operation-id")
-    lab_finalizer_p.add_argument("--deployment-environment-generation")
+    _add_formal_runtime_deployment_arguments(lab_finalizer_p)
     lab_finalizer_p.add_argument(
         "--once",
         action="store_true",

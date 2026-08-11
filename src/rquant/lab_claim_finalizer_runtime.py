@@ -1800,29 +1800,18 @@ class FinalizerUnitCheck:
 def verify_lab_claim_finalizer_unit(systemd_root: Path) -> FinalizerUnitCheck:
     path = systemd_root / "rquant-lab-claim-finalizer.service"
     try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
-        return FinalizerUnitCheck(status="fail", details=("finalizer unit missing",))
-    required = (
-        "Type=simple",
-        "Slice=rquant-research.slice",
-        "ExecStart=",
-        "lab-claim-finalizer",
-        "Restart=on-failure",
-        "RuntimeDirectory=",
-        "UMask=0077",
-        "PrivateTmp=true",
-        "ProtectSystem=strict",
-        "NoNewPrivileges=true",
-        "RestrictAddressFamilies=AF_UNIX",
-        "RequiresMountsFor=",
-        "ReadWritePaths=",
-        "InaccessiblePaths=",
-    )
-    details = tuple(f"missing {item}" for item in required if item not in text)
-    forbidden = ("WatchdogSec=", "rquant-runtime-lab-jobs")
-    details += tuple(f"forbidden {item}" for item in forbidden if item in text)
-    return FinalizerUnitCheck(status="ok" if not details else "fail", details=details)
+        from rquant.formal_runtime_command import inspect_formal_systemd_service
+
+        inspect_formal_systemd_service(
+            unit_path=path,
+            wrapper_source_path=systemd_root.parents[1] / "scripts" / "run-lab-daemon.py",
+        )
+    except (OSError, RuntimeError) as exc:
+        return FinalizerUnitCheck(
+            status="fail",
+            details=(f"formal finalizer service artifact invalid: {exc}",),
+        )
+    return FinalizerUnitCheck(status="ok")
 
 
 __all__ = [

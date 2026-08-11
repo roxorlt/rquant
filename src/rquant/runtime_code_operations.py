@@ -210,7 +210,13 @@ class RuntimeCodeFormalService(RuntimeContractModel):
         "lab-scheduler",
         "lab-worker",
     ]
-    arguments: tuple[str, ...] = Field(min_length=1)
+    unit_path: Path
+    wrapper_path: Path
+
+    @field_validator("unit_path", "wrapper_path", mode="after")
+    @classmethod
+    def validate_paths(cls, value: Path) -> Path:
+        return _absolute_path(value)
 
 
 class RuntimeCodeMigrationRequest(RuntimeContractModel):
@@ -642,9 +648,11 @@ class RuntimeCodeGenerationOperator:
 
     def dry_run(self, request: RuntimeCodeMigrationRequest) -> RuntimeCodeInstallPlan:
         try:
-            checks = self._preflight_migration(request)
             verified, receipt, current = self._verify_install_candidate(request.install)
-            del verified
+            checks = self._preflight_migration(
+                request,
+                deployment_generation=verified.attestation.provenance_commit,
+            )
             return RuntimeCodeInstallPlan(
                 generation_id=receipt.generation_id,
                 previous_generation_id=(
@@ -720,7 +728,18 @@ class RuntimeCodeGenerationOperator:
         ) as exc:
             raise RuntimeCodeOperationError("runtime code current generation is invalid") from exc
 
-    def _preflight_migration(self, request: RuntimeCodeMigrationRequest) -> tuple[str, ...]:
+    def _preflight_migration(
+        self,
+        request: RuntimeCodeMigrationRequest,
+        *,
+        deployment_generation: str,
+    ) -> tuple[str, ...]:
+        from rquant.formal_runtime_command import (
+            FormalRuntimeCommandError,
+            compose_formal_daemon_argv,
+            inspect_formal_systemd_service,
+        )
+
         self._require_subject(
             audience=request.install.expected_audience,
             installation_id=request.install.expected_installation_id,
@@ -738,27 +757,36 @@ class RuntimeCodeGenerationOperator:
         for service in request.formal_services:
             if service.command not in _FORMAL_COMMANDS:
                 raise RuntimeCodeOperationError("formal runtime service command is invalid")
-            arguments = service.arguments
-            if any(argument in _LEGACY_ARGUMENTS for argument in arguments):
-                raise RuntimeCodeOperationError(
-                    "legacy runtime Git or checkout arguments are forbidden",
-                    exit_code=RUNTIME_CODE_EXIT_CONFLICT,
+            try:
+                inspected = inspect_formal_systemd_service(
+                    unit_path=service.unit_path,
+                    wrapper_source_path=service.wrapper_path,
                 )
-            expected = {
-                "--runtime-code-config": str(request.expected_configuration_path),
-                "--runtime-code-trusted-base": str(request.expected_trusted_base),
-                "--runtime-code-authority-uid": str(request.expected_authority_uid),
-                "--runtime-code-authority-gid": str(request.expected_authority_gid),
-            }
-            for flag, value in expected.items():
-                if _argument_value(arguments, flag) != value:
-                    raise RuntimeCodeOperationError(
-                        "formal runtime service arguments do not match immutable configuration",
-                        exit_code=RUNTIME_CODE_EXIT_CONFLICT,
+                binding = inspected.wrapper.bootstrap
+                if (
+                    inspected.wrapper.command != service.command
+                    or binding.configuration_path != request.expected_configuration_path
+                    or binding.trusted_base != request.expected_trusted_base
+                    or binding.authority_uid != request.expected_authority_uid
+                    or binding.authority_gid != request.expected_authority_gid
+                ):
+                    raise FormalRuntimeCommandError(
+                        "formal runtime service binding does not match migration request"
                     )
+                compose_formal_daemon_argv(
+                    inspected.wrapper,
+                    deployment_generation=deployment_generation,
+                    deployment_generation_fd=3,
+                    startup_deadline_monotonic=1.0,
+                )
+            except (FormalRuntimeCommandError, OSError) as exc:
+                raise RuntimeCodeOperationError(
+                    "formal runtime service artifact validation failed",
+                    exit_code=RUNTIME_CODE_EXIT_CONFLICT,
+                ) from exc
         return (
             "public-trust-material-verified",
-            "formal-service-arguments-verified",
+            "formal-service-artifacts-and-argv-verified",
             "legacy-runtime-residue-absent",
         )
 
@@ -867,13 +895,6 @@ def _next_promotion(
         current.promotion_receipt.promotion_sequence + 1,
         current.promotion_receipt.receipt_hash,
     )
-
-
-def _argument_value(arguments: tuple[str, ...], flag: str) -> str | None:
-    positions = [index for index, argument in enumerate(arguments) if argument == flag]
-    if len(positions) != 1 or positions[0] + 1 >= len(arguments):
-        return None
-    return arguments[positions[0] + 1]
 
 
 def _read_secure_file(

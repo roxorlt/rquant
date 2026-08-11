@@ -1,7 +1,8 @@
 [Unit]
 Description=rQuant Lab claim publication finalizer
+Requires=rquant-external-monotonic-root.service
 RequiresMountsFor=/home/lighthouse/rquant/data/runtime/research
-After=local-fs.target
+After=local-fs.target rquant-external-monotonic-root.service
 
 [Service]
 Type=simple
@@ -11,8 +12,8 @@ Group=lighthouse
 WorkingDirectory=/home/lighthouse/rquant
 EnvironmentFile=/etc/rquant/lab-claim-finalizer.env
 Environment=APP_ENV=prod RQUANT_DISABLE_DOTENV=1 PYTHONDONTWRITEBYTECODE=1
-ExecStartPre=/home/lighthouse/rquant/.venv/bin/rquant lab-claim-finalizer-preflight --format json
-ExecStart=/usr/local/libexec/rquant-workload-arbiter research -- /home/lighthouse/rquant/.venv/bin/python -I -S /home/lighthouse/rquant/scripts/run-lab-daemon.py --expected-checkout-root /home/lighthouse/rquant --trusted-git-path /usr/bin/git --deployment-lock-path /home/lighthouse/.rquant-deploy/rquant.lock -- /home/lighthouse/rquant/.venv/bin/rquant lab-claim-finalizer --expected-checkout-root /home/lighthouse/rquant --trusted-git-path /usr/bin/git
+ExecStartPre=/home/lighthouse/rquant/.venv/bin/rquant runtime-code dry-run --runtime-code-config /etc/rquant/runtime-code-bootstrap.json --runtime-code-trusted-base /etc/rquant --runtime-code-authority-uid 0 --runtime-code-authority-gid 0 --request /etc/rquant/runtime-code-migration.json --format json
+ExecStart=/usr/local/libexec/rquant-workload-arbiter research -- /home/lighthouse/rquant/.venv/bin/python -I /home/lighthouse/rquant/scripts/run-lab-daemon.py formal --runtime-code-config /etc/rquant/runtime-code-bootstrap.json --runtime-code-trusted-base /etc/rquant --runtime-code-authority-uid 0 --runtime-code-authority-gid 0 --deployment-lock-path /run/rquant-lab-claim-finalizer/deployment.lock -- lab-claim-finalizer
 SuccessExitStatus=0 75
 Restart=on-failure
 RestartSec=5s
@@ -37,8 +38,8 @@ RestrictRealtime=true
 LockPersonality=true
 CapabilityBoundingSet=
 AmbientCapabilities=
-ReadOnlyPaths=/etc/rquant/lab-claim-finalizer.env /etc/rquant/lab-claim-finalizer-runtime /home/lighthouse/rquant/scripts/run-lab-daemon.py
-ReadWritePaths=/run/rquant-lab-claim-finalizer /home/lighthouse/.rquant-deploy /home/lighthouse/rquant/data/runtime/research/lab-finalizer-state /home/lighthouse/rquant/data/runtime/research/claims /home/lighthouse/rquant/data/runtime/research/locks /home/lighthouse/rquant/data/runtime/research/readiness /home/lighthouse/rquant/data/runtime/research/lab_jobs.sqlite3 /home/lighthouse/rquant/data/runtime/research/lab_jobs.sqlite3-wal /home/lighthouse/rquant/data/runtime/research/lab_jobs.sqlite3-shm
+ReadOnlyPaths=/etc/rquant/runtime-code-bootstrap.json /etc/rquant/runtime-code-migration.json /etc/rquant/lab-claim-finalizer.env /etc/rquant/lab-claim-finalizer-runtime /home/lighthouse/rquant/scripts/run-lab-daemon.py
+ReadWritePaths=/run/rquant-lab-claim-finalizer /home/lighthouse/rquant/data/runtime/research/lab-finalizer-state /home/lighthouse/rquant/data/runtime/research/claims /home/lighthouse/rquant/data/runtime/research/locks /home/lighthouse/rquant/data/runtime/research/readiness /home/lighthouse/rquant/data/runtime/research/lab_jobs.sqlite3 /home/lighthouse/rquant/data/runtime/research/lab_jobs.sqlite3-wal /home/lighthouse/rquant/data/runtime/research/lab_jobs.sqlite3-shm
 InaccessiblePaths=/home/lighthouse/rquant/.env /home/lighthouse/rquant/data/runtime/current/secrets /home/lighthouse/rquant/data/runtime/current/credentials /home/lighthouse/rquant/data/runtime/research/legacy-lab-finalizer /home/lighthouse/rquant/data/runtime/research/lab-finalizer
 
 StandardOutput=journal

@@ -11,11 +11,31 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[2]
 SYSTEMD = ROOT / "deploy" / "systemd"
 GIB = 1024**3
 MIB = 1024**2
 NOW = datetime(2026, 8, 5, 2, 0, tzinfo=UTC)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_settings_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = tmp_path / ".settings-data"
+    parquet = data / "parquet"
+    logs = data / "logs"
+    parquet.mkdir(parents=True)
+    logs.mkdir()
+    monkeypatch.setenv("RQUANT_DISABLE_DOTENV", "1")
+    monkeypatch.setenv("TUSHARE_TOKEN_MAIN", "0" * 32)
+    monkeypatch.setenv("DATA_DIR", str(data))
+    monkeypatch.setenv("DUCKDB_PATH", str(data / "rquant.duckdb"))
+    monkeypatch.setenv("PARQUET_DIR", str(parquet))
+    monkeypatch.setenv("LOG_DIR", str(logs))
 
 
 def _write_arbiter_provenance(tmp_path: Path) -> tuple[Path, Path]:
@@ -75,12 +95,13 @@ def test_lab_claim_finalizer_uses_research_arbiter_and_exit_75_contract() -> Non
     assert "EnvironmentFile=/etc/rquant/lab-claim-finalizer.env" in content
     assert (
         "ExecStartPre=/home/lighthouse/rquant/.venv/bin/rquant "
-        "lab-claim-finalizer-preflight --format json"
+        "runtime-code dry-run --runtime-code-config "
+        "/etc/rquant/runtime-code-bootstrap.json"
     ) in content
     assert (
         f"ExecStart={WORKLOAD_ARBITER_PATH} research -- "
-        "/home/lighthouse/rquant/.venv/bin/python -I -S "
-        "/home/lighthouse/rquant/scripts/run-lab-daemon.py "
+        "/home/lighthouse/rquant/.venv/bin/python -I "
+        "/home/lighthouse/rquant/scripts/run-lab-daemon.py formal "
     ) in content
     assert "SuccessExitStatus=0 75" in content
 

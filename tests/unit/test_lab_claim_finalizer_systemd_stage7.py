@@ -17,15 +17,17 @@ def test_dedicated_finalizer_unit_is_daemon_only_and_minimally_authorized() -> N
     assert "Type=simple" in unit
     assert "lab-claim-finalizer" in unit
     assert "ExecStartPre=" in unit
-    assert "lab-claim-finalizer-preflight --format json" in unit
+    assert "runtime-code dry-run" in unit
     assert "scripts/run-lab-daemon.py" in unit
-    assert "--expected-checkout-root /home/lighthouse/rquant" in unit
-    assert "--deployment-lock-path /home/lighthouse/.rquant-deploy/rquant.lock" in unit
+    assert "--expected-checkout-root" not in unit
+    assert "--trusted-git-path" not in unit
+    assert "--runtime-code-config /etc/rquant/runtime-code-bootstrap.json" in unit
+    assert "--deployment-lock-path /run/rquant-lab-claim-finalizer/deployment.lock" in unit
     assert "WatchdogSec" not in unit
     assert "rquant-runtime-lab-jobs" not in unit
 
 
-def test_finalizer_unit_uses_the_existing_wrapper_argument_contract() -> None:
+def test_finalizer_unit_uses_the_formal_wrapper_argument_contract() -> None:
     import importlib.util
     import sys
 
@@ -38,8 +40,8 @@ def test_finalizer_unit_uses_the_existing_wrapper_argument_contract() -> None:
     unit = (ROOT / "deploy" / "systemd" / "rquant-lab-claim-finalizer.service").read_text(
         encoding="utf-8"
     )
-    assert "lab-claim-finalizer" in module._ALLOWED_DAEMONS
-    assert "--deployment-generation" not in unit.split("ExecStart=", maxsplit=1)[1]
+    assert module.FORMAL_RUNTIME_WRAPPER_CONTRACT == "rquant-formal-runtime-wrapper/v1"
+    assert " formal --runtime-code-config" in unit.split("ExecStart=", maxsplit=1)[1]
 
 
 def test_offline_trust_cli_keeps_issue_rotate_separate_from_runtime_command() -> None:
