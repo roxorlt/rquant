@@ -7,6 +7,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from pathlib import Path
+from threading import Barrier, Event
 from uuid import UUID, uuid4
 
 import pytest
@@ -15,6 +16,7 @@ import rquant.lab_jobs as lab_jobs
 from rquant.lab_job_protocol import (
     CancelJobCommand,
     LabCommandEnvelope,
+    LabCommandReceipt,
     PauseJobCommand,
     RequestContentConflictError,
     ResumeJobCommand,
@@ -40,6 +42,7 @@ from rquant.lab_shard_protocol import (
     LAB_SHARD_DURATION_MS_MAX_EXCLUSIVE,
     LAB_SHARD_DURATION_MS_MIN,
     SQLITE_SIGNED_INTEGER_MAX,
+    LabReportReceipt,
     LabShardClaim,
     LabShardDefinition,
     LabShardFailed,
@@ -901,31 +904,186 @@ def test_retry_atomically_fences_old_nonterminal_claims(tmp_path: Path) -> None:
     assert retry.status == "applied"
     reset = LabJobReader(store.path).list_shards(job_id)
     assert all(shard.status is ShardStatus.QUEUED for shard in reset)
-    assert all(shard.claim_token is None for shard in reset)
+    reset_by_shard_id = {shard.shard_id: shard for shard in reset}
+    for shard in reset:
+        assert (
+            shard.worker_id,
+            shard.scheduler_fencing_token,
+            shard.claim_token,
+            shard.claimed_at,
+            shard.heartbeat_at,
+            shard.lease_expires_at,
+            shard.result_manifest_hash,
+            shard.failure_json,
+            shard.finished_at,
+            shard.checkpoint_json,
+        ) == (None, None, None, None, None, None, None, None, None, None)
 
-    _claim(store, lease, worker="worker-new-a", now_offset=6)
-    fresh_for_same_shard = _claim(store, lease, worker="worker-new-b", now_offset=7)
-    assert fresh_for_same_shard.shard_id == stale_claim.shard_id
-    assert fresh_for_same_shard.claim_generation > stale_claim.claim_generation
+    fresh_claims = tuple(
+        _claim(store, lease, worker=worker, now_offset=offset)
+        for worker, offset in (
+            ("worker-new-a", 6),
+            ("worker-new-b", 7),
+            ("worker-new-c", 8),
+        )
+    )
+    assert {claim.shard_id for claim in fresh_claims} == {shard.shard_id for shard in reset}
+    fresh_for_stale_shard = next(
+        claim for claim in fresh_claims if claim.shard_id == stale_claim.shard_id
+    )
+    assert fresh_for_stale_shard.scheduler_fencing_token == stale_claim.scheduler_fencing_token
+    assert fresh_for_stale_shard.claim_token != stale_claim.claim_token
+    assert fresh_for_stale_shard.claim_generation == stale_claim.claim_generation + 1
+
+    before_old_report = next(
+        shard
+        for shard in LabJobReader(store.path).list_shards(job_id)
+        if shard.shard_id == stale_claim.shard_id
+    )
+    assert (
+        before_old_report.attempt_count == reset_by_shard_id[stale_claim.shard_id].attempt_count + 1
+    )
 
     stale = store.apply_worker_report(
         _report(
             stale_claim,
             LabShardSucceeded(result_manifest_hash="8" * 64),
-            offset=8,
+            offset=9,
         ),
         lease=lease,
-        now=NOW + timedelta(seconds=8),
+        now=NOW + timedelta(seconds=9),
     )
     assert stale.status == "rejected"
-    assert stale.reason in {
-        "stale_claim_worker",
-        "stale_claim_token",
-        "stale_claim_generation",
-    }
-    current = LabJobReader(store.path).list_shards(job_id)[stale_claim.shard_index]
+    assert stale.reason == "stale_claim_worker"
+    current = next(
+        shard
+        for shard in LabJobReader(store.path).list_shards(job_id)
+        if shard.shard_id == stale_claim.shard_id
+    )
+    assert current == before_old_report
     assert current.status is ShardStatus.RUNNING
     assert current.result_manifest_hash is None
+
+
+def test_retry_commit_is_atomically_visible_to_independent_reader(tmp_path: Path) -> None:
+    store, lease, job_id = _setup(tmp_path, count=3)
+    failed_claim = _claim(store, lease, worker="worker-failed")
+    _claim(store, lease, worker="worker-stale", now_offset=3)
+    failed = store.apply_worker_report(
+        _report(
+            failed_claim,
+            LabShardFailed(failure_json='{"kind":"source"}'),
+            offset=4,
+        ),
+        lease=lease,
+        now=NOW + timedelta(seconds=4),
+    )
+    assert failed.status == "accepted"
+    before_job = LabJobReader(store.path).get_job(job_id)
+    before_shards = LabJobReader(store.path).list_shards(job_id)
+    assert before_job is not None and before_job.status is JobStatus.FAILED
+
+    entered_precommit = Event()
+    release_precommit = Event()
+
+    def block_precommit() -> None:
+        entered_precommit.set()
+        assert release_precommit.wait(timeout=5)
+
+    retry_store = LabJobStore(store.path, mutation_guard=block_precommit)
+    envelope = LabCommandEnvelope(
+        request_id=uuid4(),
+        command=RetryJobCommand(
+            job_id=job_id,
+            expected_version=before_job.version,
+            reason="test retry visibility",
+        ),
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            retry_store.apply_command,
+            envelope,
+            lease=lease,
+            now=NOW + timedelta(seconds=5),
+        )
+        assert entered_precommit.wait(timeout=5)
+        reader = LabJobReader(store.path)
+        assert reader.get_job(job_id) == before_job
+        assert reader.list_shards(job_id) == before_shards
+        release_precommit.set()
+        assert future.result(timeout=5).status == "applied"
+
+    after_job = LabJobReader(store.path).get_job(job_id)
+    after_shards = LabJobReader(store.path).list_shards(job_id)
+    assert after_job is not None and after_job.status is JobStatus.QUEUED
+    assert all(shard.status is ShardStatus.QUEUED for shard in after_shards)
+    assert all(shard.claim_token is None for shard in after_shards)
+
+
+def test_retry_races_old_report_without_persisting_old_result(tmp_path: Path) -> None:
+    store, lease, job_id = _setup(tmp_path, count=3)
+    failed_claim = _claim(store, lease, worker="worker-failed")
+    stale_claim = _claim(store, lease, worker="worker-stale", now_offset=3)
+    failed = store.apply_worker_report(
+        _report(
+            failed_claim,
+            LabShardFailed(failure_json='{"kind":"source"}'),
+            offset=4,
+        ),
+        lease=lease,
+        now=NOW + timedelta(seconds=4),
+    )
+    assert failed.status == "accepted"
+    failed_job = LabJobReader(store.path).get_job(job_id)
+    assert failed_job is not None and failed_job.status is JobStatus.FAILED
+
+    barrier = Barrier(2)
+    retry_envelope = LabCommandEnvelope(
+        request_id=uuid4(),
+        command=RetryJobCommand(
+            job_id=job_id,
+            expected_version=failed_job.version,
+            reason="race old report",
+        ),
+    )
+    stale_report = _report(
+        stale_claim,
+        LabShardSucceeded(result_manifest_hash="8" * 64),
+        offset=5,
+    )
+
+    def retry() -> LabCommandReceipt:
+        barrier.wait()
+        return LabJobStore(store.path, busy_timeout_ms=5_000).apply_command(
+            retry_envelope,
+            lease=lease,
+            now=NOW + timedelta(seconds=5),
+        )
+
+    def report_old_claim() -> LabReportReceipt:
+        barrier.wait()
+        return LabJobStore(store.path, busy_timeout_ms=5_000).apply_worker_report(
+            stale_report,
+            lease=lease,
+            now=NOW + timedelta(seconds=5),
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        retry_future = executor.submit(retry)
+        report_future = executor.submit(report_old_claim)
+        retry_receipt = retry_future.result(timeout=5)
+        report_receipt = report_future.result(timeout=5)
+
+    assert retry_receipt.status == "applied"
+    assert report_receipt.status == "rejected"
+    assert report_receipt.reason == "stale_shard_fence"
+    final_job = LabJobReader(store.path).get_job(job_id)
+    final_shards = LabJobReader(store.path).list_shards(job_id)
+    assert final_job is not None and final_job.status is JobStatus.QUEUED
+    assert all(shard.status is ShardStatus.QUEUED for shard in final_shards)
+    assert all(shard.result_manifest_hash is None for shard in final_shards)
+    assert all(shard.claim_token is None for shard in final_shards)
 
 
 def test_recoverable_shard_failure_terminalizes_tree_before_atomic_retry(
@@ -1646,11 +1804,27 @@ def test_pause_checkpoints_when_all_active_claims_expire_and_requeue(
         now=NOW + timedelta(seconds=11),
     )
     assert resume.status == "applied"
-    fresh = _claim(store, lease, worker="worker-c", now_offset=12)
-    assert fresh.shard_id == first.shard_id
-    assert fresh.claim_generation == first.claim_generation + 1
-    assert fresh.claim_token != first.claim_token
-    assert second.shard_id != fresh.shard_id
+    fresh_claims = tuple(
+        _claim(store, lease, worker=worker, now_offset=offset)
+        for worker, offset in (
+            ("worker-c", 12),
+            ("worker-d", 13),
+            ("worker-e", 14),
+        )
+    )
+    assert {claim.shard_id for claim in fresh_claims} == {shard.shard_id for shard in reclaimed}
+    fresh_for_first = next(claim for claim in fresh_claims if claim.shard_id == first.shard_id)
+    assert fresh_for_first.scheduler_fencing_token == first.scheduler_fencing_token
+    assert fresh_for_first.claim_generation == first.claim_generation + 1
+    assert fresh_for_first.claim_token != first.claim_token
+    assert second.shard_id != fresh_for_first.shard_id
+    current_for_first = next(
+        shard
+        for shard in LabJobReader(store.path).list_shards(job_id)
+        if shard.shard_id == first.shard_id
+    )
+    reclaimed_first = next(shard for shard in reclaimed if shard.shard_id == first.shard_id)
+    assert current_for_first.attempt_count == reclaimed_first.attempt_count + 1
 
 
 def test_pause_waits_for_every_already_running_shard_before_checkpoint(
@@ -2013,7 +2187,7 @@ def test_stale_reclaim_exhaustion_terminalizes_every_nonterminal_sibling(
     assert late.status == "rejected"
 
 
-def test_job_round_robin_claim_cursor_is_persistent_across_store_restart(
+def test_main_claim_cursor_is_persistent_across_store_restart(
     tmp_path: Path,
 ) -> None:
     store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
@@ -2055,11 +2229,12 @@ def test_job_round_robin_claim_cursor_is_persistent_across_store_restart(
     )
 
     assert first.job_id == old.job_id
-    assert second.job_id == new_job_id
-    assert second.shard_index == 0
+    assert second.job_id == old.job_id
+    assert second.shard_index == first.shard_index + 1
+    assert second.job_id != new_job_id
 
 
-def test_retried_large_job_cannot_reset_fair_cursor_and_insert_ahead(
+def test_retried_large_job_preserves_main_cursor_before_fair_scan(
     tmp_path: Path,
 ) -> None:
     store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
@@ -2115,7 +2290,9 @@ def test_retried_large_job_cannot_reset_fair_cursor_and_insert_ahead(
         now_offset=7,
     )
 
-    assert claim_after_retry.job_id == new_job_id
+    assert claim_after_retry.job_id == old.job_id
+    assert claim_after_retry.shard_index == old_claim.shard_index + 1
+    assert claim_after_retry.job_id != new_job_id
 
 
 @pytest.mark.parametrize(

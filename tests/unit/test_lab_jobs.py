@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from base64 import b64encode
 from collections.abc import Callable
@@ -104,6 +105,18 @@ OLD_V1_SPEC_JSON = (
 )
 OLD_V1_SPEC_HASH = "bab8a079dd4cbad1a7e8343d2872d0f87707945f416af1e3eb088af13c367f3b"
 OLD_V1_COMMAND_HASH = "65c3859a9f38541641cf9b87093042ed863c451c5bb69a0bfd0053b07d86eace"
+
+
+def _assert_current_schema_rejection(
+    action: Callable[[], object],
+    *,
+    cause_match: str,
+) -> None:
+    with pytest.raises(LabDatabaseIdentityError, match="v16 current schema is invalid") as raised:
+        action()
+    cause = raised.value.__cause__
+    assert isinstance(cause, LabDatabaseIdentityError)
+    assert re.search(cause_match, str(cause))
 
 
 class _StagedLifecycleConnection:
@@ -3220,7 +3233,7 @@ def _create_609c599_v1_fixture(
     return rows
 
 
-def test_initialize_creates_v12_schema_and_required_pragmas(
+def test_initialize_creates_v16_strict_schema_and_required_pragmas(
     tmp_path: Path,
 ) -> None:
     store = _store(tmp_path)
@@ -3233,10 +3246,13 @@ def test_initialize_creates_v12_schema_and_required_pragmas(
         user_version = connection.execute("PRAGMA user_version").fetchone()[0]
         journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
         synchronous = connection.execute("PRAGMA synchronous").fetchone()[0]
-        schema_sql = " ".join(
-            str(row[0])
-            for row in connection.execute("SELECT sql FROM sqlite_master WHERE type = 'table'")
-        ).upper()
+        table_sql = {
+            str(row[0]): str(row[1])
+            for row in connection.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        schema_sql = " ".join(table_sql.values()).upper()
 
     assert {
         "lab_command",
@@ -3251,12 +3267,25 @@ def test_initialize_creates_v12_schema_and_required_pragmas(
         "lab_claim_publication",
         "lab_claim_publication_audit",
         "lab_recovery_cursor",
+        "lab_preclaim_fair_cursor",
+        "lab_claim_publication_finalizer_lease",
+        "lab_claim_publication_finalizer_root_anchor",
+        "lab_claim_publication_finalizer_observation",
+        "lab_claim_publication_finalizer_attestation",
+        "lab_claim_publication_finalizer_trust_cache",
+        "lab_claim_publication_finalizer_observation_degradation",
     } <= tables
     assert application_id == LabJobStore.APPLICATION_ID
     assert user_version == LabJobStore.SCHEMA_VERSION
     assert str(journal_mode).lower() == "wal"
     assert synchronous == 2
-    assert ") STRICT" not in schema_sql
+    strict_tables = {
+        "lab_claim_publication_finalizer_root_anchor",
+        "lab_claim_publication_finalizer_attestation",
+        "lab_claim_publication_finalizer_trust_cache",
+        "lab_claim_publication_finalizer_observation_degradation",
+    }
+    assert all(table_sql[table].upper().rstrip().endswith("STRICT") for table in strict_tables)
     assert "TYPEOF(RECEIPT_JOB_VERSION) = 'INTEGER'" in " ".join(schema_sql.split())
     normalized_schema = " ".join(schema_sql.split())
     assert "CHECK (SOURCE_WAIT_DEADLINE <= PUBLICATION_DEADLINE)" in normalized_schema
@@ -3313,8 +3342,10 @@ def test_v10_reopen_refuses_claim_publication_schema_without_canonical_deadline_
 
     with pytest.raises(LabDatabaseIdentityError, match="v5 table.*invalid constraints"):
         LabJobStore(store.path).initialize()
-    with pytest.raises(LabDatabaseIdentityError, match="v5 table.*invalid constraints"):
-        LabJobReader(store.path).get_job(uuid4())
+    _assert_current_schema_rejection(
+        lambda: LabJobReader(store.path).get_job(uuid4()),
+        cause_match="v5 table.*invalid constraints",
+    )
 
 
 def test_initialize_migrates_v6_chain_and_read_summaries_idempotently(tmp_path: Path) -> None:
@@ -3475,8 +3506,10 @@ def test_reader_rejects_same_name_structurally_wrong_v5_trigger(tmp_path: Path) 
             """
         )
 
-    with pytest.raises(LabDatabaseIdentityError, match="trigger.*structure"):
-        LabJobReader(store.path).get_job(uuid4())
+    _assert_current_schema_rejection(
+        lambda: LabJobReader(store.path).get_job(uuid4()),
+        cause_match="trigger.*structure",
+    )
 
 
 def test_sql_ddl_equivalence_preserves_quoted_literal_bytes_and_escapes() -> None:
@@ -3537,8 +3570,10 @@ def test_v5_trigger_validator_rejects_string_literal_case_change(tmp_path: Path)
         connection.execute(f'DROP TRIGGER "{trigger}"')
         connection.execute(changed)
 
-    with pytest.raises(LabDatabaseIdentityError, match="trigger.*structure"):
-        LabJobReader(store.path).get_job(uuid4())
+    _assert_current_schema_rejection(
+        lambda: LabJobReader(store.path).get_job(uuid4()),
+        cause_match="trigger.*structure",
+    )
 
 
 def test_v5_schema_rejects_unexpected_persistent_trigger(tmp_path: Path) -> None:
@@ -3554,10 +3589,14 @@ def test_v5_schema_rejects_unexpected_persistent_trigger(tmp_path: Path) -> None
             """
         )
 
-    with pytest.raises(LabDatabaseIdentityError, match="unexpected.*trigger|trigger.*set"):
-        LabJobReader(store.path).get_job(uuid4())
-    with pytest.raises(LabDatabaseIdentityError, match="unexpected.*trigger|trigger.*set"):
-        store.connection_pragmas()
+    _assert_current_schema_rejection(
+        lambda: LabJobReader(store.path).get_job(uuid4()),
+        cause_match="unexpected.*trigger|trigger.*set",
+    )
+    _assert_current_schema_rejection(
+        store.connection_pragmas,
+        cause_match="unexpected.*trigger|trigger.*set",
+    )
 
 
 def test_v12_schema_identity_ignores_connection_local_temp_trigger(tmp_path: Path) -> None:
@@ -3583,8 +3622,10 @@ def test_v5_schema_rejects_missing_persistent_trigger(tmp_path: Path) -> None:
     with sqlite3.connect(store.path) as connection:
         connection.execute("DROP TRIGGER trg_lab_result_artifact_no_delete")
 
-    with pytest.raises(LabDatabaseIdentityError, match="missing.*trigger"):
-        LabJobReader(store.path).get_job(uuid4())
+    _assert_current_schema_rejection(
+        lambda: LabJobReader(store.path).get_job(uuid4()),
+        cause_match="missing.*trigger",
+    )
 
 
 @pytest.mark.parametrize(
@@ -3626,10 +3667,14 @@ def test_v5_schema_requires_exact_complete_result_parent_guards(
             """
         )
 
-    with pytest.raises(LabDatabaseIdentityError, match="trigger.*structure"):
-        LabJobReader(store.path).get_job(uuid4())
-    with pytest.raises(LabDatabaseIdentityError, match="trigger.*structure"):
-        store.connection_pragmas()
+    _assert_current_schema_rejection(
+        lambda: LabJobReader(store.path).get_job(uuid4()),
+        cause_match="trigger.*structure",
+    )
+    _assert_current_schema_rejection(
+        store.connection_pragmas,
+        cause_match="trigger.*structure",
+    )
 
 
 @pytest.mark.parametrize(
@@ -3750,10 +3795,14 @@ def test_v5_schema_requires_exact_shard_parent_guards(
             """
         )
 
-    with pytest.raises(LabDatabaseIdentityError, match="trigger.*structure"):
-        LabJobReader(store.path).get_job(uuid4())
-    with pytest.raises(LabDatabaseIdentityError, match="trigger.*structure"):
-        store.connection_pragmas()
+    _assert_current_schema_rejection(
+        lambda: LabJobReader(store.path).get_job(uuid4()),
+        cause_match="trigger.*structure",
+    )
+    _assert_current_schema_rejection(
+        store.connection_pragmas,
+        cause_match="trigger.*structure",
+    )
 
 
 @pytest.mark.parametrize(
@@ -3796,10 +3845,14 @@ def test_v5_reader_rejects_trigger_with_replaced_authorization_udf(
             )
         )
 
-    with pytest.raises(LabDatabaseIdentityError, match="trigger.*structure"):
-        LabJobReader(store.path).get_job(uuid4())
-    with pytest.raises(LabDatabaseIdentityError, match="trigger.*structure"):
-        store.connection_pragmas()
+    _assert_current_schema_rejection(
+        lambda: LabJobReader(store.path).get_job(uuid4()),
+        cause_match="trigger.*structure",
+    )
+    _assert_current_schema_rejection(
+        store.connection_pragmas,
+        cause_match="trigger.*structure",
+    )
 
 
 def _replace_empty_v5_table_with_weakened_ddl(
@@ -3911,8 +3964,10 @@ def test_v5_reader_rejects_same_columns_with_weakened_table_constraints(
         new=new,
     )
 
-    with pytest.raises(LabDatabaseIdentityError, match="v5.*constraint|primary|unique|foreign"):
-        LabJobReader(store.path).get_job(uuid4())
+    _assert_current_schema_rejection(
+        lambda: LabJobReader(store.path).get_job(uuid4()),
+        cause_match="v5.*constraint|primary|unique|foreign",
+    )
 
 
 @pytest.mark.parametrize(
@@ -3953,8 +4008,10 @@ def test_v5_reader_rejects_weakened_job_checks_in_sqlite_schema(
         connection.execute(f"PRAGMA schema_version = {schema_version + 1}")
         connection.execute("PRAGMA writable_schema = OFF")
 
-    with pytest.raises(LabDatabaseIdentityError, match="v5.*constraint"):
-        LabJobReader(store.path).get_job(uuid4())
+    _assert_current_schema_rejection(
+        lambda: LabJobReader(store.path).get_job(uuid4()),
+        cause_match="v5.*constraint",
+    )
 
 
 def test_v5_store_and_reader_reopen_exact_schema(tmp_path: Path) -> None:
