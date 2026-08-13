@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import date
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -28,10 +29,12 @@ def _surge_row(**overrides: object) -> dict[str, object]:
 
 
 def test_surge_history_display_inserts_normalized_trade_date() -> None:
-    rows = pd.DataFrame([
-        _surge_row(trade_date=date(2026, 7, 29)),
-        _surge_row(trade_date="2026-07-28"),
-    ])
+    rows = pd.DataFrame(
+        [
+            _surge_row(trade_date=date(2026, 7, 29)),
+            _surge_row(trade_date="2026-07-28"),
+        ]
+    )
 
     display = panorama._surge_history_display(rows)
 
@@ -54,12 +57,12 @@ def test_cached_surge_history_strips_query_before_loading(
     monkeypatch.setattr(
         panorama,
         "search_surge_history",
-        lambda query: calls.append(query) or pd.DataFrame(),
+        lambda query, *, store: calls.append(query) or pd.DataFrame(),
     )
     panorama.cached_surge_history.clear()
 
     try:
-        panorama.cached_surge_history("  芯片  ")
+        panorama.cached_surge_history("generation-1", "  芯片  ", SimpleNamespace())
     finally:
         panorama.cached_surge_history.clear()
 
@@ -67,10 +70,12 @@ def test_cached_surge_history_strips_query_before_loading(
 
 
 def test_surge_history_table_key_tracks_query_and_ordered_result_identity() -> None:
-    rows = pd.DataFrame([
-        _surge_row(trade_date="2026-07-29", confirmed_at="10:15"),
-        _surge_row(trade_date="2026-07-28", confirmed_at="09:45"),
-    ])
+    rows = pd.DataFrame(
+        [
+            _surge_row(trade_date="2026-07-29", confirmed_at="10:15"),
+            _surge_row(trade_date="2026-07-28", confirmed_at="09:45"),
+        ]
+    )
     duplicate = rows.copy()
     inserted = pd.concat(
         [pd.DataFrame([_surge_row(trade_date="2026-07-30", confirmed_at="09:31")]), rows],
@@ -92,24 +97,36 @@ def test_historical_surge_detail_loads_day_trend_and_all_event_marks(
 ) -> None:
     day = date(2026, 7, 29)
     calls: list[tuple[str, object]] = []
-    trend = pd.DataFrame({
-        "dt": pd.to_datetime(["2026-07-29 09:30", "2026-07-29 10:15"]),
-        "price": [10.0, 10.5],
-        "avg_price": [10.0, 10.25],
-        "volume": [100.0, 200.0],
-    })
-    marks = pd.DataFrame([{
-        "date": day, "confirmed_at": "10:15", "rel_cum": 3.2,
-    }])
+    trend = pd.DataFrame(
+        {
+            "dt": pd.to_datetime(["2026-07-29 09:30", "2026-07-29 10:15"]),
+            "price": [10.0, 10.5],
+            "avg_price": [10.0, 10.25],
+            "volume": [100.0, 200.0],
+        }
+    )
+    marks = pd.DataFrame(
+        [
+            {
+                "date": day,
+                "confirmed_at": "10:15",
+                "rel_cum": 3.2,
+            }
+        ]
+    )
     monkeypatch.setattr(
         panorama,
         "cached_historical_intraday_trend",
-        lambda ts_code, day_key: calls.append(("trend", (ts_code, day_key))) or trend,
+        lambda generation_id, ts_code, day_key, store: (
+            calls.append(("trend", (generation_id, ts_code, day_key))) or trend
+        ),
     )
     monkeypatch.setattr(
         panorama,
         "cached_surge_event_marks",
-        lambda ts_code, day_key: calls.append(("marks", (ts_code, day_key))) or marks,
+        lambda generation_id, ts_code, day_key, store: (
+            calls.append(("marks", (generation_id, ts_code, day_key))) or marks
+        ),
     )
     monkeypatch.setattr(panorama.st, "markdown", lambda text: calls.append(("title", text)))
     monkeypatch.setattr(
@@ -117,31 +134,39 @@ def test_historical_surge_detail_loads_day_trend_and_all_event_marks(
     )
     monkeypatch.setattr(panorama.st, "caption", lambda text: calls.append(("caption", text)))
 
-    panorama.render_historical_surge_detail("688255.SH", "芯片先锋", day)
+    panorama.render_historical_surge_detail(
+        "688255.SH", "芯片先锋", day, SimpleNamespace(generation_id="generation-1")
+    )
 
-    assert ("trend", ("688255.SH", "2026-07-29")) in calls
-    assert ("marks", ("688255.SH", "2026-07-29")) in calls
+    assert ("trend", ("generation-1", "688255.SH", "2026-07-29")) in calls
+    assert ("marks", ("generation-1", "688255.SH", "2026-07-29")) in calls
     assert any(kind == "chart" for kind, _ in calls)
 
 
 def test_trend_chart_tooltip_exposes_repeated_mark_count_and_values() -> None:
     day = date(2026, 7, 29)
-    trend = pd.DataFrame({
-        "dt": pd.to_datetime(["2026-07-29 09:47"]),
-        "price": [10.5],
-        "avg_price": [10.5],
-        "volume": [100.0],
-    })
-    marks = pd.DataFrame([
-        {"date": day, "confirmed_at": "09:47", "rel_cum": 3.2},
-        {"date": day, "confirmed_at": "09:47", "rel_cum": 3.3},
-    ])
+    trend = pd.DataFrame(
+        {
+            "dt": pd.to_datetime(["2026-07-29 09:47"]),
+            "price": [10.5],
+            "avg_price": [10.5],
+            "volume": [100.0],
+        }
+    )
+    marks = pd.DataFrame(
+        [
+            {"date": day, "confirmed_at": "09:47", "rel_cum": 3.2},
+            {"date": day, "confirmed_at": "09:47", "rel_cum": 3.3},
+        ]
+    )
 
     spec = panorama._trend_chart(trend, marks).to_dict()
     tooltip = spec["vconcat"][0]["layer"][2]["encoding"]["tooltip"]
 
     assert [item["field"] for item in tooltip] == [
-        "label", "trigger_count", "rel_cum_values",
+        "label",
+        "trigger_count",
+        "rel_cum_values",
     ]
 
 
@@ -149,13 +174,13 @@ def test_historical_surge_detail_explains_unavailable_minute_data(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     messages: list[str] = []
-    monkeypatch.setattr(
-        panorama, "cached_historical_intraday_trend", lambda *_: pd.DataFrame()
-    )
+    monkeypatch.setattr(panorama, "cached_historical_intraday_trend", lambda *_: pd.DataFrame())
     monkeypatch.setattr(panorama.st, "markdown", lambda _: None)
     monkeypatch.setattr(panorama.st, "info", messages.append)
 
-    panorama.render_historical_surge_detail("688255.SH", "芯片先锋", date(2026, 7, 29))
+    panorama.render_historical_surge_detail(
+        "688255.SH", "芯片先锋", date(2026, 7, 29), SimpleNamespace(generation_id="generation-1")
+    )
 
     assert "该日分钟数据未入库/暂不可用" in messages[0]
-    assert "只读副本" in messages[0]
+    assert "Serving" in messages[0]

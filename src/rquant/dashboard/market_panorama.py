@@ -35,7 +35,6 @@ from rquant.panorama_data import (
     MarketPulse,
     board_constituents,
     compute_market_pulse,
-    fetch_intraday_trend,
     industry_fallback_members,
     load_board_members,
     load_daily_kline,
@@ -52,10 +51,10 @@ from rquant.panorama_data import (
     load_surge_log,
     load_surge_marks,
     load_surge_runtime_config,
+    open_panorama_serving_generation,
     search_surge_history,
     surge_mark_positions,
     volume_directions,
-    open_panorama_serving_generation,
 )
 
 CST = timezone(timedelta(hours=8))
@@ -181,64 +180,51 @@ def serving_constituents(
     )
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def cached_trend(ts_code: str, ndays: int) -> tuple[pd.DataFrame, str]:
-    """个股分时（ndays=1）/ 5日线（ndays=5）+ 路由标签。"""
-    trend = fetch_intraday_trend(ts_code, ndays)
-    return trend, trend.attrs.get("route", "none")
+@st.cache_data(ttl=30, show_spinner=False)
+def cached_surge_history(generation_id: str, query: str, _store: Any) -> pd.DataFrame:
+    """Cross-day search cache is scoped to one immutable Serving generation."""
+    return search_surge_history(query.strip(), store=_store)
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def cached_kline(ts_code: str) -> pd.DataFrame:
-    """日K 基础序列（只读副本 daily_bar）；当日临时 bar 拼接在 UI 层做（依赖实时快照）。"""
-    return load_daily_kline(ts_code)
+def cached_historical_intraday_trend(
+    generation_id: str, ts_code: str, day_key: str, _store: Any
+) -> pd.DataFrame:
+    """Historical minute data cache is scoped to one immutable Serving generation."""
+    return load_historical_intraday_trend(ts_code, date.fromisoformat(day_key), store=_store)
 
 
 @st.cache_data(ttl=30, show_spinner=False)
-def cached_surge_log(day_key: str) -> pd.DataFrame:
-    """指定日期爆量台账（键为该日 ISO 字符串，切换日期/跨日自动失效；ttl 30s 让盘中增长
-    的当日 jsonl 被读到）。"""
-    return load_surge_log(date.fromisoformat(day_key))
-
-
-@st.cache_data(ttl=30, show_spinner=False)
-def cached_surge_history(query: str) -> pd.DataFrame:
-    """跨日爆量检索（键=去首尾空白后的代码或名称查询）。"""
-    return search_surge_history(query.strip())
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def cached_historical_intraday_trend(ts_code: str, day_key: str) -> pd.DataFrame:
-    """指定交易日完整分钟线（只读副本，避免历史回看触发实时网络取数）。"""
-    return load_historical_intraday_trend(ts_code, date.fromisoformat(day_key))
-
-
-@st.cache_data(ttl=30, show_spinner=False)
-def cached_surge_event_marks(ts_code: str, day_key: str) -> pd.DataFrame:
-    """指定交易日的全部爆量确认点，而非台账的每日首次确认。"""
-    return load_surge_event_marks(ts_code, date.fromisoformat(day_key))
+def cached_surge_event_marks(
+    generation_id: str, ts_code: str, day_key: str, _store: Any
+) -> pd.DataFrame:
+    """Historical event marks cache is scoped to one immutable Serving generation."""
+    return load_surge_event_marks(ts_code, date.fromisoformat(day_key), store=_store)
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def cached_surge_marks(ts_code: str, dates_key: str) -> pd.DataFrame:
-    """图表标记（键 = 票 + 交易日集合字符串；日集合来自 trend 实际数据）。"""
+def cached_surge_marks(
+    generation_id: str, ts_code: str, dates_key: str, _store: Any
+) -> pd.DataFrame:
+    """Chart event marks cache is scoped to one immutable Serving generation."""
     dates = [date.fromisoformat(s) for s in dates_key.split(",") if s]
-    return load_surge_marks(ts_code, dates)
+    return load_surge_marks(ts_code, dates, store=_store)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def cached_runtime_config() -> dict | None:
-    return load_surge_runtime_config()
+def cached_runtime_config(generation_id: str, _store: Any) -> dict | None:
+    return load_surge_runtime_config(store=_store)
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def cached_pulse_history(day_key: str) -> pd.DataFrame:
-    return load_pulse_history()
+def cached_pulse_history(generation_id: str, day_key: str, _store: Any) -> pd.DataFrame:
+    return load_pulse_history(date.fromisoformat(day_key), store=_store)
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def cached_pulse_alerts(day_key: str) -> pd.DataFrame:
-    return load_pulse_alerts()
+def cached_pulse_alerts(generation_id: str, day_key: str, _store: Any) -> pd.DataFrame:
+    return load_pulse_alerts(date.fromisoformat(day_key), store=_store)
+
 
 # ── 数据整形 helpers ──────────────────────────────────────────────────────────
 
@@ -392,19 +378,22 @@ def _pulse_facet_chart(hist: pd.DataFrame) -> alt.VConcatChart:
     ticks = hist["t"].tolist()[:: max(1, len(hist) // 6)]
     x = alt.X("t:O", title=None, axis=alt.Axis(values=ticks, labelAngle=0))
     rows = [
-        alt.Chart(hist).mark_line(color=color).encode(
+        alt.Chart(hist)
+        .mark_line(color=color)
+        .encode(
             x=x,
             y=alt.Y(f"{col}:Q", title=title, scale=alt.Scale(zero=False)),
             tooltip=["t", alt.Tooltip(f"{col}:Q", title=title)],
-        ).properties(height=64)
+        )
+        .properties(height=64)
         for col, title, color in _PULSE_FACETS
     ]
     return alt.vconcat(*rows).resolve_scale(x="shared", y="independent")
 
 
-def _render_pulse_alert_line(now: datetime) -> None:
+def _render_pulse_alert_line(now: datetime, store: Any) -> None:
     """最近 30 分钟内的异动：常驻 warning + 新异动一次性 toast（会话内去重）。"""
-    alerts = cached_pulse_alerts(now.date().isoformat())
+    alerts = cached_pulse_alerts(str(store.generation_id), now.date().isoformat(), store)
     if alerts.empty:
         return
     latest = alerts.iloc[-1]
@@ -424,7 +413,9 @@ def _render_pulse_alert_line(now: datetime) -> None:
         st.toast(f"⚡ {latest['t']} {latest['kind_label']}：{latest['message']}")
 
 
-def render_pulse(snapshot: pd.DataFrame, as_of: str, snap_route: str, status: dict) -> None:
+def render_pulse(
+    snapshot: pd.DataFrame, as_of: str, snap_route: str, status: dict, store: Any
+) -> None:
     pulse = compute_market_pulse(snapshot)
     if pulse.total_count == 0:
         detail = str(snapshot.attrs.get("serving_detail") or "市场快照投影没有可展示数据")
@@ -442,10 +433,12 @@ def render_pulse(snapshot: pd.DataFrame, as_of: str, snap_route: str, status: di
     c4.metric("上涨占比", f"{pulse.up_ratio_pct:.1f}%")
     c5.metric("涨/跌家数", f"{pulse.up_count} / {pulse.down_count}")
     st.caption(_snapshot_status_line(as_of, snap_route, status))
-    _render_pulse_alert_line(datetime.now(CST))
+    _render_pulse_alert_line(datetime.now(CST), store)
     with c6, st.popover("📈", width="stretch"):
         st.caption(f"快照 {as_of} · 有效样本 {pulse.total_count} 只（停牌除外）")
-        hist = cached_pulse_history(datetime.now(CST).date().isoformat())
+        hist = cached_pulse_history(
+            str(store.generation_id), datetime.now(CST).date().isoformat(), store
+        )
         if len(hist) >= 2:
             st.altair_chart(_pulse_facet_chart(hist), width="stretch")
             st.caption("数据来源：服务端全天历史（surge-watch 每分钟落盘）")
@@ -638,7 +631,8 @@ def _trend_chart(trend: pd.DataFrame, marks: pd.DataFrame | None = None) -> alt.
         layers.append(avg_line)
     mark_pos = (
         surge_mark_positions(trend, marks)
-        if marks is not None and not marks.empty else pd.DataFrame()
+        if marks is not None and not marks.empty
+        else pd.DataFrame()
     )
     if not mark_pos.empty:
         mark_tip = [
@@ -647,14 +641,14 @@ def _trend_chart(trend: pd.DataFrame, marks: pd.DataFrame | None = None) -> alt.
             alt.Tooltip("rel_cum_values:N", title="累计倍数"),
         ]
         layers.append(
-            alt.Chart(mark_pos).mark_rule(
-                color="#f97316", strokeDash=[6, 4], size=2
-            ).encode(x=alt.X("idx:Q", scale=x_scale), tooltip=mark_tip)
+            alt.Chart(mark_pos)
+            .mark_rule(color="#f97316", strokeDash=[6, 4], size=2)
+            .encode(x=alt.X("idx:Q", scale=x_scale), tooltip=mark_tip)
         )
         layers.append(
-            alt.Chart(mark_pos).mark_point(
-                color="#f97316", filled=True, size=80
-            ).encode(x=alt.X("idx:Q", scale=x_scale), y="price:Q", tooltip=mark_tip)
+            alt.Chart(mark_pos)
+            .mark_point(color="#f97316", filled=True, size=80)
+            .encode(x=alt.X("idx:Q", scale=x_scale), y="price:Q", tooltip=mark_tip)
         )
     price = alt.layer(*layers).properties(height=220)
     x_vol = alt.X(
@@ -772,7 +766,9 @@ def render_stock_chart(
             st.warning(f"{period}数据不可用：{detail[:140]}")
             return
         days = sorted(pd.to_datetime(trend["dt"]).dt.date.unique())
-        marks = cached_surge_marks(ts_code, ",".join(d.isoformat() for d in days))
+        marks = cached_surge_marks(
+            str(store.generation_id), ts_code, ",".join(d.isoformat() for d in days), store
+        )
         st.altair_chart(_trend_chart(trend, marks), width="stretch")
         st.caption(
             f"数据路由：{ROUTE_LABELS.get(route, route)}"
@@ -824,11 +820,7 @@ def _surge_log_display(df: pd.DataFrame) -> pd.DataFrame:
 
 def _surge_history_display(df: pd.DataFrame) -> pd.DataFrame:
     """跨日台账展示：日期单列格式化，余列严格复用日台账口径。"""
-    dates = (
-        pd.to_datetime(df.get("trade_date"), errors="coerce")
-        .dt.strftime("%Y-%m-%d")
-        .fillna("")
-    )
+    dates = pd.to_datetime(df.get("trade_date"), errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
     display = _surge_log_display(df.drop(columns=["trade_date"], errors="ignore"))
     display.insert(0, "日期", dates.reset_index(drop=True))
     return display
@@ -849,9 +841,9 @@ def _surge_history_table_key(query: str, df: pd.DataFrame) -> str:
 _BOARD_LABELS = {"main": "主板", "gem": "创业", "star": "科创", "bj": "北交"}
 
 
-def _surge_caption(n_rows: int) -> str:
+def _surge_caption(n_rows: int, store: Any) -> str:
     """页脚口径：优先 runtime_config 动态展示，缺失退回写死文案。"""
-    cfg = cached_runtime_config()
+    cfg = cached_runtime_config(str(store.generation_id), store)
     if cfg:
         boards = "/".join(_BOARD_LABELS.get(b, str(b)) for b in cfg.get("boards", []))
         return (
@@ -868,17 +860,17 @@ def _surge_caption(n_rows: int) -> str:
     )
 
 
-def render_historical_surge_detail(ts_code: str, name: str, day: date) -> None:
+def render_historical_surge_detail(ts_code: str, name: str, day: date, store: Any) -> None:
     """指定爆量日复盘：完整分钟趋势与该标的当天每个确认时刻。"""
     day_key = day.isoformat()
     st.markdown(f"**{ts_code} {name or '—'} · {day_key}**")
-    trend = cached_historical_intraday_trend(ts_code, day_key)
+    trend = cached_historical_intraday_trend(str(store.generation_id), ts_code, day_key, store)
     if trend.empty:
-        st.info(f"{day_key} 该日分钟数据未入库/暂不可用（只读副本 minute_bar 缺该日记录）")
+        st.info(f"{day_key} 该日分钟数据未入库/暂不可用（Serving 分钟投影缺该日记录）")
         return
-    marks = cached_surge_event_marks(ts_code, day_key)
+    marks = cached_surge_event_marks(str(store.generation_id), ts_code, day_key, store)
     st.altair_chart(_trend_chart(trend, marks), width="stretch")
-    st.caption("数据来源：只读副本 · 量柱色=分钟涨跌近似（tick-rule） · 橙线=爆量确认")
+    st.caption("数据来源：Serving 投影 · 量柱色=分钟涨跌近似（tick-rule） · 橙线=爆量确认")
 
 
 def _render_surge_table(df: pd.DataFrame, *, table_key: str, historical: bool) -> int | None:
@@ -905,7 +897,7 @@ def render_surge_log(store: Any) -> None:
     )
     normalized_query = query.strip()
     if normalized_query:
-        df = cached_surge_history(normalized_query)
+        df = cached_surge_history(str(store.generation_id), normalized_query, store)
         st.caption(f"跨日检索 · 命中 {len(df)} 条（每标的每日保留首次确认）")
         if df.empty:
             st.info(f"未找到“{normalized_query}”的爆量记录")
@@ -924,7 +916,7 @@ def render_surge_log(store: Any) -> None:
             st.info("该记录日期无效，暂不能加载历史趋势")
             return
         render_historical_surge_detail(
-            str(row["ts_code"]), str(row.get("name", "")), selected_day.date()
+            str(row["ts_code"]), str(row.get("name", "")), selected_day.date(), store
         )
         return
 
@@ -945,13 +937,13 @@ def render_surge_log(store: Any) -> None:
             st.info(f"{sel.isoformat()} 无爆量记录")
         return
     idx = _render_surge_table(df, table_key=f"surge_tbl_{sel.isoformat()}", historical=False)
-    caption = _surge_caption(len(df))
+    caption = _surge_caption(len(df), store)
     st.caption(caption)
     if idx is None or idx >= len(df):
         st.info("点选记录查看对应交易日的完整分钟趋势与全部爆量确认点")
         return
     row = df.iloc[idx]
-    render_historical_surge_detail(str(row["ts_code"]), str(row.get("name", "")), sel)
+    render_historical_surge_detail(str(row["ts_code"]), str(row.get("name", "")), sel, store)
 
 
 # ── 页面主体 ──────────────────────────────────────────────────────────────────
@@ -996,7 +988,7 @@ def render_body() -> None:
             snap_route = str(snapshot.attrs.get("route") or "serving")
 
             with tab_panorama:
-                render_pulse(snapshot, as_of, snap_route, status)
+                render_pulse(snapshot, as_of, snap_route, status, store)
                 left, right = st.columns([52, 48])
                 with left:
                     board_code, board_name = render_overview(store, snap_route)

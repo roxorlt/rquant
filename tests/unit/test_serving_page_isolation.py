@@ -148,12 +148,38 @@ def test_pages_do_not_run_large_operational_scans_or_replays() -> None:
 def test_market_panorama_ui_uses_only_one_serving_generation_without_source_poller() -> None:
     path = _PROJECT_ROOT / "src/rquant/dashboard/market_panorama.py"
     source = path.read_text(encoding="utf-8")
+    data_source = (_PROJECT_ROOT / "src/rquant/panorama_data.py").read_text(encoding="utf-8")
 
     assert "SourcePoller" not in source
     assert "panorama_poller" not in source
     assert "fetch_intraday_trend" not in source
+    assert "SourcePoller" not in data_source
+    assert "panorama_poller" not in data_source
     assert "open_panorama_serving_generation" in source
     assert source.count("open_panorama_serving_generation()") == 1
+
+
+def test_market_panorama_helpers_accept_the_render_serving_reader() -> None:
+    """The page must pass its one lease through every data-dependent helper."""
+
+    path = _PROJECT_ROOT / "src/rquant/dashboard/market_panorama.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    helper_names = {
+        "render_pulse",
+        "render_stock_chart",
+        "render_historical_surge_detail",
+        "render_surge_log",
+    }
+    helpers = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in helper_names
+    }
+
+    assert helpers.keys() == helper_names
+    for name, helper in helpers.items():
+        parameter_names = {argument.arg for argument in helper.args.args}
+        assert "store" in parameter_names, name
 
 
 def test_all_streamlit_pages_render_explicit_serving_health_banners() -> None:

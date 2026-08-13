@@ -1,13 +1,12 @@
 """盘中市场全景页数据获取层（P0）。
 
-所有外部源调用集中在本模块，每个 fetcher 独立 try/except + 空态返回：
-akshare 断了页面不炸，UI 侧对空 DataFrame 渲染灰态。
+本模块包含历史行情归一化 helper 与 Serving 投影 reader。市场全景页面只使用注入的
+immutable Serving generation；它不会读取行情源、运行中的状态文件或操作库。
 
-数据源与刷新节奏（快照/资金流由 panorama_poller 后台拉取，其余 TTL 由 UI 层
-st.cache_data 控制）：
+历史来源与刷新节奏（由独立采集职责维护）：
 - S1 全市场快照：三级路由 东财 push2 clist 直连 → 同一实现走 SOCKS 云端出口 →
   新浪 ``ak.stock_zh_a_spot`` 兜底（sina 逐页 70 页，盘外被限速单次可 >90s，
-  只作最后兜底；``allow_sina=False`` 可跳过该级，熔断由 SourcePoller 管）
+  只作最后兜底；``allow_sina=False`` 可跳过该级）
 - S2 板块资金流：三级路由 东财直连 → 东财·SOCKS 云端出口 → 同花顺即时兜底
   （办公网出口 IP 被东财拉黑、同花顺云端 403，两者互补，见 fetch_sector_fund_flow）
 - L  独立 serving generation（dc_board / dc_board_member / kpl_concept_member /
@@ -18,7 +17,7 @@ Session + trust_env=False + 桌面 UA/Referer + Connection:close。2026-07-06 �
 事故：东财风控钉住长驻进程的连接状态（同进程连续 RST、新进程三路秒通），必须
 强制每次新 TCP/TLS 且不吸系统代理环境。
 
-本模块只读 ``ServingReader`` 的不可变 generation，缺表或损坏时返回空态，
+Serving reader 只读不可变 generation，缺表或损坏时返回空态，
 绝不连接或回退生产主库。
 """
 
@@ -44,13 +43,10 @@ if TYPE_CHECKING:
 from rquant.dashboard.runtime_console_data import (
     ServingFrameResult,
     ServingFrameState,
-    query_acquired_serving_frame,
-    require_serving_projections,
 )
+from rquant.dashboard.serving_page_data import ServingPageRenderContext
 from rquant.limit_up_pool import to_ts_code
-from rquant.serving_publisher import ServingReader
 from rquant.state.derive import _classify_board, _detect_st, _limit_pct, _round_half_up
-from rquant.storage.duckdb import DuckDBStore, open_readonly_store
 
 _CST = timezone(timedelta(hours=8))  # A 股墙钟（当日 events 文件按此取「今日」）
 
@@ -70,19 +66,18 @@ class _ReadableStore(Protocol):
 class _ServingStore:
     def __init__(self, required_projections: tuple[str, ...] = ()) -> None:
         root = os.environ.get("RQUANT_SERVING_ROOT", "data/serving")
-        self._lease = ServingReader(root).acquire_generation()
-        self._conn = self._lease.connection
-        self.generation_id = self._lease.manifest.generation_id
+        self._context = ServingPageRenderContext.open(root)
+        self.generation_id = self._context.generation_id
         self._query_results: list[ServingFrameResult] = []
         self._pending_projections: list[str] = []
         try:
             self.require_projections(required_projections)
         except Exception:
-            self._lease.close()
+            self._context.close()
             raise
 
     def close(self) -> None:
-        self._lease.close()
+        self._context.close()
 
     def query_pool2_active(self) -> pd.DataFrame:
         return self.query_frame(
@@ -92,7 +87,6 @@ class _ServingStore:
         )
 
     def require_projections(self, names: tuple[str, ...]) -> None:
-        require_serving_projections(self._conn, names)
         for name in names:
             if name not in self._pending_projections:
                 self._pending_projections.append(name)
@@ -118,8 +112,7 @@ class _ServingStore:
     ) -> pd.DataFrame:
         required_projections = tuple(self._pending_projections)
         self._pending_projections.clear()
-        result = query_acquired_serving_frame(
-            self._lease,
+        result = self._context.query(
             sql,
             parameters,
             max_rows=max_rows,
@@ -400,8 +393,7 @@ def fetch_market_snapshot(allow_sina: bool = True) -> pd.DataFrame:
     东财 push2 clist 直连（自实现分页 + 加固 Session，办公网被拉黑时秒败）→
     同一实现走 SOCKS 云端出口（环境变量 RQUANT_PANORAMA_SOCKS 可覆盖代理地址，
     置空禁用该级）→ 新浪 ``ak.stock_zh_a_spot`` 兜底（逐页限速单次可 10-90s）→
-    全失败返回空。``allow_sina=False`` 跳过 sina 级——SourcePoller 对 sina 单独
-    熔断，不允许它反复吊死后台拉取循环。
+    全失败返回空。``allow_sina=False`` 跳过 sina 级，避免反复触发慢速分页。
 
     返回列：ts_code, name, price, open, high, low, pre_close, pct_chg,
     volume(股), amount(元)——东财成交量单位手，归一 ×100 保持列契约。
@@ -1375,13 +1367,9 @@ def _empty_historical_intraday_trend() -> pd.DataFrame:
 
 
 def load_historical_intraday_trend(
-    ts_code: str, day: date, store: DuckDBStore | None = None
+    ts_code: str, day: date, store: _ReadableStore | None = None
 ) -> pd.DataFrame:
-    """读取指定交易日的本地 1 分钟线，并计算日内累计成交均价。
-
-    历史回看只读 DuckDB 副本；分钟源的优先级和去重由
-    ``DuckDBStore.query_minute_bars`` 统一保证。无数据或副本不可用时返回稳定空表。
-    """
+    """Read one historical minute trend from the injected serving generation."""
     if _fake_enabled():
         trend = _fake_intraday_trend(ts_code, ndays=1).copy()
         trend["dt"] = _session_minute_stamps(pd.Timestamp(day))
@@ -1389,36 +1377,49 @@ def load_historical_intraday_trend(
 
     owns = store is None
     try:
-        store = store or open_readonly_store(required_tables=("minute_bar",))
-    except Exception as exc:
-        logger.warning(f"历史分时只读库打开失败: {type(exc).__name__}: {exc}")
+        store = store or _open_serving_store(("intraday_kline",))
+    except Exception as error:
+        logger.warning(f"历史分时 serving 打开失败: {type(error).__name__}: {error}")
         return _empty_historical_intraday_trend()
-
-    start = datetime.combine(day, datetime.min.time())
-    end = datetime.combine(day, datetime.max.time())
     try:
-        raw = store.query_minute_bars(ts_code, start, end, freq="1min")
-    except Exception as exc:
-        logger.warning(f"历史分时查询失败: {ts_code} {type(exc).__name__}: {exc}")
-        return _empty_historical_intraday_trend()
+        _require_projection(store, "intraday_kline")
+        raw = _read_frame(
+            store,
+            """
+            SELECT trade_time AS dt, close AS price, vol AS volume, amount
+            FROM intraday_kline
+            WHERE ts_code = ? AND CAST(trade_time AS DATE) = ?
+            ORDER BY trade_time
+            LIMIT 300
+            """,
+            [ts_code, day],
+            max_rows=300,
+            max_result_bytes=128 * 1024,
+        )
+        raw = _bind_serving_generation(raw, store)
+    except Exception as error:
+        logger.warning(f"历史分时 serving 查询失败: {ts_code} {type(error).__name__}: {error}")
+        return _serving_unavailable(error, _HISTORICAL_TREND_COLUMNS)
     finally:
         if owns:
             store.close()
 
     if raw.empty:
-        return _empty_historical_intraday_trend()
-    trend = pd.DataFrame({
-        "dt": pd.to_datetime(raw.get("trade_time"), errors="coerce"),
-        "price": pd.to_numeric(raw.get("close"), errors="coerce"),
-        "volume": pd.to_numeric(raw.get("vol"), errors="coerce"),
-        "amount": pd.to_numeric(raw.get("amount"), errors="coerce"),
-    }).dropna(subset=["dt"])
+        return _bind_serving_generation(_empty_historical_intraday_trend(), store)
+    trend = pd.DataFrame(
+        {
+            "dt": pd.to_datetime(raw.get("dt"), errors="coerce"),
+            "price": pd.to_numeric(raw.get("price"), errors="coerce"),
+            "volume": pd.to_numeric(raw.get("volume"), errors="coerce"),
+            "amount": pd.to_numeric(raw.get("amount"), errors="coerce"),
+        }
+    ).dropna(subset=["dt"])
     if trend.empty:
-        return _empty_historical_intraday_trend()
+        return _bind_serving_generation(_empty_historical_intraday_trend(), store)
     trend = trend.sort_values("dt", kind="stable").reset_index(drop=True)
     cumulative_volume = trend["volume"].cumsum()
     trend["avg_price"] = trend["amount"].cumsum() / cumulative_volume.where(cumulative_volume > 0)
-    return trend[_HISTORICAL_TREND_COLUMNS]
+    return _bind_serving_generation(trend[_HISTORICAL_TREND_COLUMNS], store)
 
 
 def surge_mark_positions(trend: pd.DataFrame, marks: pd.DataFrame) -> pd.DataFrame:
@@ -1462,13 +1463,15 @@ def surge_mark_positions(trend: pd.DataFrame, marks: pd.DataFrame) -> pd.DataFra
             label += f" {trigger_count}次 · {rel_cum_values}"
         elif rel_cum_values != "—":
             label += f" · {rel_cum_values}"
-        rows.append({
-            "idx": idx,
-            "price": float(prices.iloc[idx]),
-            "label": label,
-            "trigger_count": trigger_count,
-            "rel_cum_values": rel_cum_values,
-        })
+        rows.append(
+            {
+                "idx": idx,
+                "price": float(prices.iloc[idx]),
+                "label": label,
+                "trigger_count": trigger_count,
+                "rel_cum_values": rel_cum_values,
+            }
+        )
     return pd.DataFrame(rows, columns=cols)
 
 
@@ -1611,10 +1614,17 @@ _SURGE_HISTORY_COLUMNS = ["trade_date", *_SURGE_LOG_COLUMNS]
 _SURGE_EVENT_MARK_COLUMNS = ["date", "confirmed_at", "rel_cum"]
 _SURGE_EVENT_FILENAME_RE = re.compile(r"events-([0-9]{4}-[0-9]{2}-[0-9]{2})\.jsonl")
 _SURGE_CONFIRMED_AT_RE = re.compile(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]")
-_PULSE_LOG_COLUMNS = ["t", "limit_up", "limit_down", "broken", "up", "down",
-                      "up_ratio_pct", "total"]
-_PULSE_ALERT_COLUMNS = ["t", "kind", "kind_label", "before", "after",
-                        "window_minutes", "message"]
+_PULSE_LOG_COLUMNS = [
+    "t",
+    "limit_up",
+    "limit_down",
+    "broken",
+    "up",
+    "down",
+    "up_ratio_pct",
+    "total",
+]
+_PULSE_ALERT_COLUMNS = ["t", "kind", "kind_label", "before", "after", "window_minutes", "message"]
 _RUNTIME_CONFIG_NAME = "runtime_config.json"
 
 
@@ -1633,9 +1643,7 @@ def _read_jsonl_records(path: Path, required_key: str) -> list[dict]:
             return []
         content = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
-        logger.warning(
-            f"JSONL 文件读取失败，已降级为空: {path}: {type(exc).__name__}: {exc}"
-        )
+        logger.warning(f"JSONL 文件读取失败，已降级为空: {path}: {type(exc).__name__}: {exc}")
         return []
     records: list[dict] = []
     for line in content.splitlines():
@@ -1717,7 +1725,12 @@ def load_surge_log(
     )
 
 
-def search_surge_history(query: str, *, live_dir: Path | None = None) -> pd.DataFrame:
+def search_surge_history(
+    query: str,
+    *,
+    store: _ReadableStore | None = None,
+    live_dir: Path | None = None,
+) -> pd.DataFrame:
     """按代码或名称跨日搜索爆量记录，每标的每天保留首次确认。
 
     只读取命名严格为 ``events-YYYY-MM-DD.jsonl`` 的文件；坏文件、坏行及非法日期
@@ -1726,6 +1739,34 @@ def search_surge_history(query: str, *, live_dir: Path | None = None) -> pd.Data
     normalized_query = query.strip().casefold()
     if not normalized_query:
         return pd.DataFrame(columns=_SURGE_HISTORY_COLUMNS)
+
+    if live_dir is None:
+        owns = store is None
+        try:
+            store = store or _open_serving_store(("surge_event",))
+            _require_projection(store, "surge_event")
+            frame = _read_frame(
+                store,
+                """
+                SELECT trade_date, confirmed_at, ts_code, name, theme, price, pct_chg,
+                       cum_amount, rel_cum, room_to_limit_pct, status
+                FROM surge_event
+                WHERE LOWER(CAST(ts_code AS VARCHAR)) LIKE ?
+                   OR LOWER(COALESCE(name, '')) LIKE ?
+                ORDER BY trade_date DESC, confirmed_at DESC, ts_code
+                LIMIT 10000
+                """,
+                [f"%{normalized_query}%", f"%{normalized_query}%"],
+                max_rows=10_000,
+                max_result_bytes=2 * 1024 * 1024,
+            )
+            return _bind_serving_generation(frame, store)
+        except Exception as error:
+            logger.warning(f"爆量历史 serving 查询失败: {type(error).__name__}: {error}")
+            return _serving_unavailable(error, _SURGE_HISTORY_COLUMNS)
+        finally:
+            if owns:
+                store.close()
 
     try:
         event_paths = list(_surge_live_dir(live_dir).glob("events-*.jsonl"))
@@ -1754,13 +1795,10 @@ def search_surge_history(query: str, *, live_dir: Path | None = None) -> pd.Data
         for col in _SURGE_LOG_COLUMNS:
             if col not in daily.columns:
                 daily[col] = None
-        matches = (
-            daily["ts_code"].fillna("").astype(str).str.casefold().str.contains(
-                normalized_query, regex=False
-            )
-            | daily["name"].fillna("").astype(str).str.casefold().str.contains(
-                normalized_query, regex=False
-            )
+        matches = daily["ts_code"].fillna("").astype(str).str.casefold().str.contains(
+            normalized_query, regex=False
+        ) | daily["name"].fillna("").astype(str).str.casefold().str.contains(
+            normalized_query, regex=False
         )
         if matches.any():
             matched = daily.loc[matches, _SURGE_LOG_COLUMNS].copy()
@@ -1777,13 +1815,20 @@ def search_surge_history(query: str, *, live_dir: Path | None = None) -> pd.Data
 
 
 def load_pulse_history(
-    day: date | None = None, *, live_dir: Path | None = None
+    day: date | None = None,
+    *,
+    store: _ReadableStore | None = None,
+    live_dir: Path | None = None,
 ) -> pd.DataFrame:
     """当日脉搏分钟历史（surge-watch 落盘）。缺失/坏行降级，列契约恒定。"""
     if _fake_enabled():
         return _fake_pulse_history()
     if day is None:
         day = datetime.now(_CST).date()
+    if live_dir is None:
+        return _serving_unavailable(
+            RuntimeError("pulse history projection is not published"), _PULSE_LOG_COLUMNS
+        )
     path = _surge_live_dir(live_dir) / f"pulse-{day.isoformat()}.jsonl"
     records = _read_jsonl_records(path, "t")
     if not records:
@@ -1796,13 +1841,20 @@ def load_pulse_history(
 
 
 def load_pulse_alerts(
-    day: date | None = None, *, live_dir: Path | None = None
+    day: date | None = None,
+    *,
+    store: _ReadableStore | None = None,
+    live_dir: Path | None = None,
 ) -> pd.DataFrame:
     """当日脉搏异动事件（surge-watch 落盘），按文件顺序（即时间序）。"""
     if _fake_enabled():
         return _fake_pulse_alerts()
     if day is None:
         day = datetime.now(_CST).date()
+    if live_dir is None:
+        return _serving_unavailable(
+            RuntimeError("pulse alert projection is not published"), _PULSE_ALERT_COLUMNS
+        )
     path = _surge_live_dir(live_dir) / f"pulse_alerts-{day.isoformat()}.jsonl"
     records = _read_jsonl_records(path, "t")
     if not records:
@@ -1814,11 +1866,20 @@ def load_pulse_alerts(
     return df[_PULSE_ALERT_COLUMNS]
 
 
-def load_surge_runtime_config(*, live_dir: Path | None = None) -> dict | None:
+def load_surge_runtime_config(
+    *, store: _ReadableStore | None = None, live_dir: Path | None = None
+) -> dict | None:
     """surge-watch 当前生效口径（启动时原子写）。缺失/损坏 → None。"""
     if _fake_enabled():
-        return {"boards": ["main", "gem", "star", "bj"], "k_rough": 1.2,
-                "k_cum": 2.5, "ratio_cap": 8.0, "tushare_rate_per_min": 2}
+        return {
+            "boards": ["main", "gem", "star", "bj"],
+            "k_rough": 1.2,
+            "k_cum": 2.5,
+            "ratio_cap": 8.0,
+            "tushare_rate_per_min": 2,
+        }
+    if live_dir is None:
+        return None
     path = _surge_live_dir(live_dir) / _RUNTIME_CONFIG_NAME
     try:
         obj = json.loads(path.read_text(encoding="utf-8"))
@@ -1828,7 +1889,11 @@ def load_surge_runtime_config(*, live_dir: Path | None = None) -> dict | None:
 
 
 def load_surge_marks(
-    ts_code: str, dates: list[date], *, live_dir: Path | None = None
+    ts_code: str,
+    dates: list[date],
+    *,
+    store: _ReadableStore | None = None,
+    live_dir: Path | None = None,
 ) -> pd.DataFrame:
     """指定交易日集合内该票每天最早爆量确认（图表标记源）。
 
@@ -1836,29 +1901,61 @@ def load_surge_marks(
     """
     rows: list[dict] = []
     for d in dates:
-        df = load_surge_log(d, live_dir=live_dir)
+        df = load_surge_log(d, store=store, live_dir=live_dir)
         if df.empty or "ts_code" not in df.columns:
             continue
         sub = df[df["ts_code"].astype(str) == ts_code]
         if sub.empty:
             continue
         r = sub.iloc[0]
-        rows.append({
-            "date": d,
-            "confirmed_at": str(r.get("confirmed_at", "")),
-            "rel_cum": pd.to_numeric(pd.Series([r.get("rel_cum")]), errors="coerce").iloc[0],
-        })
+        rows.append(
+            {
+                "date": d,
+                "confirmed_at": str(r.get("confirmed_at", "")),
+                "rel_cum": pd.to_numeric(pd.Series([r.get("rel_cum")]), errors="coerce").iloc[0],
+            }
+        )
     return pd.DataFrame(rows, columns=["date", "confirmed_at", "rel_cum"])
 
 
 def load_surge_event_marks(
-    ts_code: str, day: date, *, live_dir: Path | None = None
+    ts_code: str,
+    day: date,
+    *,
+    store: _ReadableStore | None = None,
+    live_dir: Path | None = None,
 ) -> pd.DataFrame:
     """读取某日某标的全部爆量触发，用于历史分时图逐次标记。
 
     与 ``load_surge_log`` 的每票首次确认台账语义不同，此处保留同一时点的重复事件，
     并按确认时间稳定排序，以保留原始 JSONL 的相对顺序。
     """
+    if live_dir is None:
+        owns = store is None
+        try:
+            store = store or _open_serving_store(("surge_event",))
+            _require_projection(store, "surge_event")
+            frame = _read_frame(
+                store,
+                """
+                SELECT CAST(trade_date AS DATE) AS date, confirmed_at, rel_cum
+                FROM surge_event
+                WHERE ts_code = ? AND trade_date = ?
+                ORDER BY confirmed_at
+                LIMIT 1000
+                """,
+                [ts_code, day],
+                max_rows=1_000,
+                max_result_bytes=128 * 1024,
+            )
+            return _bind_serving_generation(frame, store)
+        except Exception as error:
+            logger.warning(f"爆量标记 serving 查询失败: {type(error).__name__}: {error}")
+            return _serving_unavailable(error, _SURGE_EVENT_MARK_COLUMNS)
+        finally:
+            if owns:
+                store.close()
+
     path = _surge_live_dir(live_dir) / f"events-{day.isoformat()}.jsonl"
     records = _read_jsonl_records(path, "ts_code")
     rows: list[dict[str, object]] = []
@@ -1868,11 +1965,15 @@ def load_surge_event_marks(
         confirmed_at = str(record.get("confirmed_at") or "")
         if _SURGE_CONFIRMED_AT_RE.fullmatch(confirmed_at) is None:
             continue
-        rows.append({
-            "date": day,
-            "confirmed_at": confirmed_at,
-            "rel_cum": pd.to_numeric(pd.Series([record.get("rel_cum")]), errors="coerce").iloc[0],
-        })
+        rows.append(
+            {
+                "date": day,
+                "confirmed_at": confirmed_at,
+                "rel_cum": pd.to_numeric(pd.Series([record.get("rel_cum")]), errors="coerce").iloc[
+                    0
+                ],
+            }
+        )
     if not rows:
         return pd.DataFrame(columns=_SURGE_EVENT_MARK_COLUMNS)
     return (
@@ -2079,15 +2180,42 @@ def _fake_daily_kline(ts_code: str, n: int = 120) -> pd.DataFrame:
 def _fake_surge_log() -> pd.DataFrame:
     """3 条确定性爆量台账：与 _FAKE_CODES 网格对齐（600001 涨停、600003 炸板）。"""
     rows = [
-        {"confirmed_at": "09:47", "ts_code": "600001.SH", "name": "假票600001",
-         "theme": "人形机器人", "price": 11.0, "pct_chg": 10.0, "rel_cum": 3.2,
-         "cum_amount": 5.2e8, "room_to_limit_pct": 0.0, "status": "unbuyable"},
-        {"confirmed_at": "10:12", "ts_code": "600003.SH", "name": "假票600003",
-         "theme": "人形机器人", "price": 10.4, "pct_chg": 4.0, "rel_cum": 5.1,
-         "cum_amount": 3.1e8, "room_to_limit_pct": 5.8, "status": "confirmed"},
-        {"confirmed_at": "13:05", "ts_code": "600010.SH", "name": "假票600010",
-         "theme": "算力", "price": 12.6, "pct_chg": 6.3, "rel_cum": 2.7,
-         "cum_amount": 2.4e8, "room_to_limit_pct": 3.5, "status": "confirmed"},
+        {
+            "confirmed_at": "09:47",
+            "ts_code": "600001.SH",
+            "name": "假票600001",
+            "theme": "人形机器人",
+            "price": 11.0,
+            "pct_chg": 10.0,
+            "rel_cum": 3.2,
+            "cum_amount": 5.2e8,
+            "room_to_limit_pct": 0.0,
+            "status": "unbuyable",
+        },
+        {
+            "confirmed_at": "10:12",
+            "ts_code": "600003.SH",
+            "name": "假票600003",
+            "theme": "人形机器人",
+            "price": 10.4,
+            "pct_chg": 4.0,
+            "rel_cum": 5.1,
+            "cum_amount": 3.1e8,
+            "room_to_limit_pct": 5.8,
+            "status": "confirmed",
+        },
+        {
+            "confirmed_at": "13:05",
+            "ts_code": "600010.SH",
+            "name": "假票600010",
+            "theme": "算力",
+            "price": 12.6,
+            "pct_chg": 6.3,
+            "rel_cum": 2.7,
+            "cum_amount": 2.4e8,
+            "room_to_limit_pct": 3.5,
+            "status": "confirmed",
+        },
     ]
     return pd.DataFrame(rows)
 
@@ -2097,12 +2225,18 @@ def _fake_pulse_history() -> pd.DataFrame:
     rows: list[dict] = []
     minute = 9 * 60 + 30
     for i in range(120):
-        rows.append({
-            "t": f"{minute // 60:02d}:{minute % 60:02d}",
-            "limit_up": 20 + i // 6, "limit_down": 3 + i // 40, "broken": 2 + i // 15,
-            "up": 2600 + i * 5, "down": 2400 - i * 5,
-            "up_ratio_pct": round(48 + i * 0.1, 2), "total": 5400,
-        })
+        rows.append(
+            {
+                "t": f"{minute // 60:02d}:{minute % 60:02d}",
+                "limit_up": 20 + i // 6,
+                "limit_down": 3 + i // 40,
+                "broken": 2 + i // 15,
+                "up": 2600 + i * 5,
+                "down": 2400 - i * 5,
+                "up_ratio_pct": round(48 + i * 0.1, 2),
+                "total": 5400,
+            }
+        )
         minute += 1
         if minute == 11 * 60 + 31:
             minute = 13 * 60 + 1
@@ -2112,8 +2246,17 @@ def _fake_pulse_history() -> pd.DataFrame:
 def _fake_pulse_alerts() -> pd.DataFrame:
     """1 条炸板潮；t 取当前时间 − 5 分钟（唯一非硬编码字段，保证提示条恒可见）。"""
     t = (datetime.now(_CST) - timedelta(minutes=5)).strftime("%H:%M")
-    return pd.DataFrame([{
-        "t": t, "kind": "broken_surge", "kind_label": "炸板潮",
-        "before": 2.0, "after": 6.0, "window_minutes": 10,
-        "message": "炸板 10 分钟 2 → 6（+4）",
-    }], columns=_PULSE_ALERT_COLUMNS)
+    return pd.DataFrame(
+        [
+            {
+                "t": t,
+                "kind": "broken_surge",
+                "kind_label": "炸板潮",
+                "before": 2.0,
+                "after": 6.0,
+                "window_minutes": 10,
+                "message": "炸板 10 分钟 2 → 6（+4）",
+            }
+        ],
+        columns=_PULSE_ALERT_COLUMNS,
+    )
