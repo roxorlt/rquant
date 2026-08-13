@@ -27,6 +27,7 @@ from rquant.market_minute_gateway import MarketMinuteGateway, MarketMinuteValida
 from rquant.paper_broker import BrokerExecutionContext
 from rquant.paper_execution_constraints import PaperExecutionConstraintAuthority
 from rquant.paper_signal_worker import PaperQuoteSnapshot
+from rquant.research_run_spec import InstrumentContext
 from rquant.runtime_contracts import RuntimeContractModel, normalize_aware_utc
 from rquant.signal_contracts import SignalAction, SignalEnvelope
 
@@ -59,6 +60,22 @@ class PaperQuoteCandidateMissingError(PaperQuoteStaleError):
 
 class PaperTradeCalendarError(PaperQuoteResolutionError):
     """The frozen SSE calendar cannot establish the acquisition date."""
+
+
+def _a_share_instrument_context(ts_code: str) -> InstrumentContext:
+    normalized = ts_code.upper()
+    if len(normalized) != 9 or not normalized[:6].isdigit():
+        raise PaperQuoteIntegrityError("paper quote has an unsupported instrument identifier")
+    exchange = {".SH": "SSE", ".SZ": "SZSE"}.get(normalized[-3:])
+    if exchange is None:
+        raise PaperQuoteIntegrityError("paper quote has an unsupported instrument context")
+    return InstrumentContext(
+        ts_code=normalized,
+        market="CN",
+        exchange=exchange,
+        instrument_class="EQUITY",
+        security_class="A_SHARE",
+    )
 
 
 class PaperQuoteResolverConfig(RuntimeContractModel):
@@ -348,6 +365,7 @@ class PaperPitQuoteResolver:
             available_at=quote_available_at,
             context=BrokerExecutionContext(
                 executable_price=Decimal(str(row["close"])),
+                instrument_context=_a_share_instrument_context(signal.candidate_id),
                 acquisition_available_date=acquisition_date,
                 suspended=constraint.suspended,
                 limit_locked=constraint.limit_locked,

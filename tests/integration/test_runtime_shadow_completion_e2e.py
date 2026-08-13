@@ -19,7 +19,7 @@ from rquant.feature_contracts import (
     RequirementLevel,
 )
 from rquant.feature_spool import FeatureBatchSpool, FeatureSessionCloseMarker
-from rquant.paper_broker import BrokerCostPolicy, PaperBrokerStore
+from rquant.paper_broker import PaperBrokerStore
 from rquant.runtime_definition_bootstrap import plan_builtin_definitions
 from rquant.runtime_deployment_bundle import strategy_live_producer_version
 from rquant.runtime_deployment_profile import (
@@ -73,6 +73,7 @@ from rquant.strategy_spec import (
     StrategySpec,
 )
 from rquant.strict_json import canonical_json_bytes
+from tests.paper_cost_fixtures import paper_cost_policy
 from tests.shadow_ed25519_support import create_shadow_ed25519_test_authority
 from tests.unit.test_runtime_builder_strategy import (
     _publish as _publish_strategy_feature,
@@ -543,11 +544,7 @@ def test_runtime_service_main_once_strategy_live_mints_ed25519_completion_receip
         paper_broker_path,
         account_id="shadow-main",
         initial_cash=Decimal("100000"),
-        cost_policy=BrokerCostPolicy(
-            commission_rate=Decimal("0.0003"),
-            minimum_commission=Decimal("5"),
-            sell_stamp_tax_rate=Decimal("0.001"),
-        ),
+        cost_policy=paper_cost_policy(),
     )
     plan = plan_builtin_definitions(producer_commit=COMMIT)
     strategy = next(item for item in plan.strategies if item.strategy_id == "n_shape")

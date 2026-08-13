@@ -21,6 +21,7 @@ from rquant.paper_signal_worker import (
     QuoteResolver,
     run_paper_signal_batch,
 )
+from rquant.research_run_spec import ExecutionCostSpec
 from rquant.runtime_contracts import RuntimeContractModel, canonical_sha256
 from rquant.runtime_service_control import RuntimeServicePlane, RuntimeStepResult
 from rquant.runtime_service_entrypoint import (
@@ -83,11 +84,7 @@ class PaperBrokerSettings(PaperSignalPolicySettings):
     consumer_state_path: Path
     broker_path: Path
     initial_cash: Decimal = Field(gt=0, allow_inf_nan=False)
-    commission_rate: Decimal = Field(ge=0, lt=1, allow_inf_nan=False)
-    minimum_commission: Decimal = Field(ge=0, allow_inf_nan=False)
-    sell_stamp_tax_rate: Decimal = Field(ge=0, lt=1, allow_inf_nan=False)
-    buy_slippage_bps: Decimal = Field(default=Decimal("0"), ge=0, lt=10_000)
-    sell_slippage_bps: Decimal = Field(default=Decimal("0"), ge=0, lt=10_000)
+    execution_cost_spec: ExecutionCostSpec
     limit: StrictInt = Field(gt=0)
     busy_timeout_ms: StrictInt = Field(default=5_000, gt=0)
     raw_spool_root: Path | None = None
@@ -134,16 +131,12 @@ class PaperBrokerSettings(PaperSignalPolicySettings):
             value is not None for value in configured
         ):
             raise ValueError("paper PIT authorities must be configured together")
+        if not self.execution_cost_spec.is_alignment_eligible:
+            raise ValueError("paper broker requires an explicit v3 execution_cost_spec")
         return self
 
     def cost_policy(self) -> BrokerCostPolicy:
-        return BrokerCostPolicy(
-            commission_rate=self.commission_rate,
-            minimum_commission=self.minimum_commission,
-            sell_stamp_tax_rate=self.sell_stamp_tax_rate,
-            buy_slippage_bps=self.buy_slippage_bps,
-            sell_slippage_bps=self.sell_slippage_bps,
-        )
+        return BrokerCostPolicy.from_execution_cost_spec(self.execution_cost_spec)
 
 
 def _paper_settings(
@@ -347,6 +340,7 @@ def paper_broker_builder(
                     source_generations={
                         "signal_route_spool": descriptor.generation_id,
                         "paper_cost_policy": cost_policy.fingerprint,
+                        "paper_execution_cost_spec": cost_policy.cost_spec_id,
                         "paper_signal_policy": policy.fingerprint,
                         **constraint_generation,
                         **(
@@ -382,6 +376,7 @@ def paper_broker_builder(
                 source_generations={
                     "signal_route_spool": descriptor.generation_id,
                     "paper_cost_policy": cost_policy.fingerprint,
+                    "paper_execution_cost_spec": cost_policy.cost_spec_id,
                     "paper_signal_policy": policy.fingerprint,
                     **constraint_generation,
                     **(

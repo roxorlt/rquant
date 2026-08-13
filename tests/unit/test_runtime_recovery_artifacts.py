@@ -28,7 +28,7 @@ from rquant.lab_worker import (
     LabShardResultManifest,
     canonical_shard_frame_digest,
 )
-from rquant.paper_broker import BrokerCostPolicy, PaperBrokerStore
+from rquant.paper_broker import PaperBrokerStore
 from rquant.reference_data_registry import (
     ReferenceDataset,
     ReferenceRecord,
@@ -62,6 +62,7 @@ from rquant.serving_contracts import (
 )
 from rquant.serving_publisher import ServingPublisher, ServingTableSpec
 from rquant.strict_json import canonical_json_bytes
+from tests.paper_cost_fixtures import paper_cost_policy
 
 COMMIT_A = "a" * 40
 COMMIT_B = "b" * 40
@@ -221,11 +222,7 @@ def _create_paper_ledger(path: Path) -> None:
         path,
         account_id="paper-main",
         initial_cash=Decimal("100000"),
-        cost_policy=BrokerCostPolicy(
-            commission_rate=Decimal("0.0003"),
-            minimum_commission=Decimal("5"),
-            sell_stamp_tax_rate=Decimal("0.001"),
-        ),
+        cost_policy=paper_cost_policy(),
     ).require_trusted_ledger()
     sealed = path.with_name("paper-sealed.sqlite3")
     source = sqlite3.connect(path)
@@ -437,7 +434,7 @@ def _build_bundle(
             source_path="paper.sqlite3",
             restore_path="state/paper.sqlite3",
             generation_id=_sha256(source / "paper.sqlite3"),
-            schema_version="paper-ledger-v4",
+            schema_version="paper-ledger-v5",
             relations=(
                 "paper_ledger_attestation",
                 "paper_ledger_head_marker",

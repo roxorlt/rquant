@@ -137,7 +137,8 @@ def test_notional_costs_emit_cash_amounts_effective_bps_and_provenance() -> None
     assert row["execution_cost_amount"] == 10.0
     assert row["effective_execution_cost_bps"] == 100.0
     assert row["execution_cost_mode"] == "notional"
-    assert bool(row["paper_execution_comparable"])
+    assert not bool(row["paper_execution_comparable"])
+    assert row["paper_execution_comparability_reason"] == "UNBOUND_RESEARCH_COST"
     assert row["minimum_commission"] == 5.0
     assert row["research_notional_per_trade"] == 1000.0
 

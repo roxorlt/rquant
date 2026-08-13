@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from rquant.paper_broker import BrokerCostPolicy, BrokerExecutionContext, PaperBrokerStore
+from rquant.paper_broker import BrokerExecutionContext, PaperBrokerStore
 from rquant.paper_contracts import PaperOrderStatus, PaperRejectReason
 from rquant.paper_signal_worker import (
     PaperQuoteSnapshot,
@@ -17,6 +17,7 @@ from rquant.paper_signal_worker import (
     run_paper_signal_batch,
 )
 from rquant.signal_contracts import SignalAction, SignalEnvelope
+from tests.paper_cost_fixtures import paper_cost_policy, paper_instrument_context
 from tests.unit.test_paper_broker import (
     _downgrade_v3_initial_execution_evidence,
     _ledger_rows,
@@ -98,6 +99,7 @@ def _quote(
         context=BrokerExecutionContext(
             executable_price=Decimal(price),
             acquisition_available_date=acquisition_available_date,
+            instrument_context=paper_instrument_context("600000.SH"),
         ),
         producer_commit="f" * 40,
     )
@@ -108,11 +110,7 @@ def _broker(path: Path) -> PaperBrokerStore:
         path,
         account_id=ACCOUNT_ID,
         initial_cash=Decimal("100000"),
-        cost_policy=BrokerCostPolicy(
-            commission_rate=Decimal("0.0003"),
-            minimum_commission=Decimal("5"),
-            sell_stamp_tax_rate=Decimal("0.001"),
-        ),
+        cost_policy=paper_cost_policy(),
     )
 
 
@@ -245,6 +243,7 @@ def test_queue_and_broker_restart_across_commit_preserves_execution_provenance(
             context=BrokerExecutionContext(
                 executable_price=Decimal("10.50"),
                 acquisition_available_date=NEXT_TRADE_DATE,
+                instrument_context=paper_instrument_context("600000.SH"),
             ),
             producer_commit=new_commit,
         ),

@@ -19,12 +19,14 @@ from rquant.feature_contracts import (
     FeatureInstanceEnvelope,
 )
 from rquant.paper_contracts import (
+    PaperCostProvenanceState,
     PaperFill,
     PaperOrder,
     PaperOrderIntent,
     PaperOrderStatus,
     PaperSide,
 )
+from rquant.research_run_spec import ExecutionCostSpec
 from rquant.runtime_contracts import normalize_aware_utc
 from rquant.signal_contracts import SignalAction, SignalEnvelope
 
@@ -39,6 +41,7 @@ _REQUIRED_TABLES = frozenset(
         "paper_lot_consumption",
         "paper_execution_receipt",
         "paper_ledger_schema",
+        "paper_cost_spec",
     }
 )
 
@@ -103,24 +106,9 @@ class PaperBrokerLifecycleReader:
             schema = connection.execute(
                 "SELECT * FROM paper_ledger_schema WHERE singleton = 1"
             ).fetchone()
-            if schema is None or int(schema["schema_version"]) != 4:
+            if schema is None or int(schema["schema_version"]) != 5:
                 raise PaperLifecycleIntegrityError(
-                    "paper broker ledger schema requires explicit v4 migration"
-                )
-            unknown_columns = (
-                "unknown_fill_availability_count",
-                "unknown_lot_availability_count",
-                "unknown_consumption_availability_count",
-                "unknown_lot_provenance_count",
-                "unknown_intent_identity_count",
-                "unknown_execution_identity_count",
-                "unknown_lot_timeline_count",
-                "unknown_initial_execution_identity_count",
-                "unknown_execution_receipt_count",
-            )
-            if any(int(schema[column]) != 0 for column in unknown_columns):
-                raise PaperLifecycleIntegrityError(
-                    "paper broker ledger contains legacy rows with unknown PIT identity"
+                    "paper broker ledger schema requires explicit v5 migration"
                 )
             required_columns = {
                 "paper_intent": {
@@ -130,7 +118,21 @@ class PaperBrokerLifecycleReader:
                     "initial_execution_request_fingerprint",
                 },
                 "paper_order": {"entry_signal_id"},
-                "paper_fill": {"execution_id", "persisted_at"},
+                "broker_account": {
+                    "cost_spec_id",
+                    "cost_spec_schema_version",
+                    "cost_provenance_state",
+                },
+                "paper_fill": {
+                    "execution_id",
+                    "persisted_at",
+                    "transfer_fee",
+                    "total_fees",
+                    "cost_spec_id",
+                    "cost_spec_schema_version",
+                    "cost_context_fingerprint",
+                    "cost_provenance_state",
+                },
                 "paper_lot": {"entry_signal_id", "persisted_at"},
                 "paper_lot_consumption": {"persisted_at"},
                 "paper_execution_receipt": {
@@ -141,6 +143,12 @@ class PaperBrokerLifecycleReader:
                     "request_json",
                     "receipt_json",
                     "persisted_at",
+                    "transfer_fee",
+                    "total_fees",
+                    "cost_spec_id",
+                    "cost_spec_schema_version",
+                    "cost_context_fingerprint",
+                    "cost_provenance_state",
                 },
             }
             for table, expected in required_columns.items():
@@ -153,11 +161,63 @@ class PaperBrokerLifecycleReader:
                         f"paper broker {table} lacks PIT/provenance columns"
                     )
             account = connection.execute(
-                "SELECT 1 FROM broker_account WHERE account_id = ?",
+                """
+                SELECT cost_spec_id, cost_spec_schema_version, cost_provenance_state
+                FROM broker_account WHERE account_id = ?
+                """,
                 (self.account_id,),
             ).fetchone()
             if account is None:
                 raise PaperLifecycleIntegrityError("paper broker account is unavailable")
+            if (
+                account["cost_provenance_state"] != PaperCostProvenanceState.KNOWN_V3.value
+                or account["cost_spec_schema_version"] != 3
+                or account["cost_spec_id"] is None
+            ):
+                raise PaperLifecycleIntegrityError(
+                    "paper broker account is audit-only because cost provenance is unknown"
+                )
+            authority = connection.execute(
+                """
+                SELECT schema_version, canonical_json
+                FROM paper_cost_spec WHERE cost_spec_id = ?
+                """,
+                (account["cost_spec_id"],),
+            ).fetchone()
+            if authority is None or authority["schema_version"] != 3:
+                raise PaperLifecycleIntegrityError("paper broker v3 cost authority is unavailable")
+            try:
+                cost_spec = ExecutionCostSpec.from_canonical_json(authority["canonical_json"])
+            except (TypeError, ValueError) as exc:
+                raise PaperLifecycleIntegrityError(
+                    "paper broker v3 cost authority is invalid"
+                ) from exc
+            if (
+                not cost_spec.is_alignment_eligible
+                or cost_spec.cost_spec_id != account["cost_spec_id"]
+                or cost_spec.slippage is None
+            ):
+                raise PaperLifecycleIntegrityError(
+                    "paper broker v3 cost authority does not bind account"
+                )
+            self._price_tick = cost_spec.slippage.price_tick
+            legacy_cost_rows = connection.execute(
+                """
+                SELECT
+                    (SELECT COUNT(*) FROM paper_fill AS f
+                     JOIN paper_order AS o ON o.order_id = f.order_id
+                     WHERE o.account_id = ?
+                       AND f.cost_provenance_state IS NOT 'KNOWN_V3')
+                    +
+                    (SELECT COUNT(*) FROM paper_execution_receipt
+                     WHERE account_id = ? AND cost_provenance_state IS NOT 'KNOWN_V3')
+                """,
+                (self.account_id, self.account_id),
+            ).fetchone()[0]
+            if int(legacy_cost_rows) != 0:
+                raise PaperLifecycleIntegrityError(
+                    "paper broker account has unknown execution cost provenance"
+                )
 
     def _validate_file(self) -> None:
         try:
@@ -444,6 +504,33 @@ class PaperBrokerLifecycleReader:
         except (TypeError, ValueError) as exc:
             raise PaperLifecycleIntegrityError("paper broker order does not reconcile") from exc
 
+    @staticmethod
+    def _paper_fill(row: sqlite3.Row) -> PaperFill:
+        try:
+            fill = PaperFill(
+                fill_id=row["fill_id"],
+                execution_id=row["execution_id"],
+                order_id=row["order_id"],
+                sequence=row["sequence"],
+                quantity=row["quantity"],
+                price=row["price"],
+                commission=row["commission"],
+                transfer_fee=row["transfer_fee"],
+                tax=row["tax"],
+                total_fees=row["total_fees"],
+                cost_spec_id=row["cost_spec_id"],
+                cost_spec_schema_version=row["cost_spec_schema_version"],
+                cost_context_fingerprint=row["cost_context_fingerprint"],
+                cost_provenance_state=row["cost_provenance_state"],
+                executed_at=row["executed_at"],
+                price_snapshot_id=row["price_snapshot_id"],
+            )
+        except (TypeError, ValueError) as exc:
+            raise PaperLifecycleIntegrityError("paper broker fill is invalid") from exc
+        if fill.cost_provenance_state is not PaperCostProvenanceState.KNOWN_V3:
+            raise PaperLifecycleIntegrityError("paper broker fill has unknown cost provenance")
+        return fill
+
     def _rebuild_position(
         self,
         connection: sqlite3.Connection,
@@ -478,23 +565,9 @@ class PaperBrokerLifecycleReader:
                 )
             if persisted_at > decision_cutoff:
                 continue
-            try:
-                fill = PaperFill(
-                    fill_id=row["fill_id"],
-                    execution_id=row["execution_id"],
-                    order_id=row["order_id"],
-                    sequence=row["sequence"],
-                    quantity=row["quantity"],
-                    price=row["price"],
-                    commission=row["commission"],
-                    tax=row["tax"],
-                    executed_at=row["executed_at"],
-                    price_snapshot_id=row["price_snapshot_id"],
-                )
-                fills.append(fill)
-                fill_persisted_at[str(fill.fill_id)] = persisted_at
-            except (TypeError, ValueError) as exc:
-                raise PaperLifecycleIntegrityError("paper broker BUY fill is invalid") from exc
+            fill = self._paper_fill(row)
+            fills.append(fill)
+            fill_persisted_at[str(fill.fill_id)] = persisted_at
         if tuple(fill.sequence for fill in fills) != tuple(range(1, len(fills) + 1)):
             raise PaperLifecycleIntegrityError("paper broker BUY fill sequence is incomplete")
         filled_quantity = sum(fill.quantity for fill in fills)
@@ -512,7 +585,7 @@ class PaperBrokerLifecycleReader:
                         Decimal("0"),
                     )
                     / filled_quantity
-                ).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+                ).quantize(self._price_tick, rounding=ROUND_HALF_UP)
                 if visible_order.average_fill_price != weighted_price:
                     raise PaperLifecycleIntegrityError(
                         "paper broker order and BUY fill price do not reconcile"
@@ -647,7 +720,9 @@ class PaperBrokerLifecycleReader:
         for fill in fills:
             fill_id = str(fill.fill_id)
             lot = lots_by_id[fill_id]
-            expected_unit_cost = (fill.notional + fill.commission) / fill.quantity
+            if fill.total_fees is None:
+                raise PaperLifecycleIntegrityError("paper broker BUY fill has unknown total fees")
+            expected_unit_cost = (fill.notional + fill.total_fees) / fill.quantity
             if (
                 lot["account_id"] != self.account_id
                 or lot["ts_code"] != candidate_id
@@ -859,21 +934,7 @@ class PaperBrokerLifecycleReader:
                 raise PaperLifecycleIntegrityError("SELL fill availability precedes execution")
             if fill_available > decision_cutoff:
                 continue
-            try:
-                fill = PaperFill(
-                    fill_id=fill_row["fill_id"],
-                    execution_id=fill_row["execution_id"],
-                    order_id=fill_row["order_id"],
-                    sequence=fill_row["sequence"],
-                    quantity=fill_row["quantity"],
-                    price=fill_row["price"],
-                    commission=fill_row["commission"],
-                    tax=fill_row["tax"],
-                    executed_at=fill_row["executed_at"],
-                    price_snapshot_id=fill_row["price_snapshot_id"],
-                )
-            except (TypeError, ValueError) as exc:
-                raise PaperLifecycleIntegrityError("SELL fill is invalid") from exc
+            fill = self._paper_fill(fill_row)
             fills.append((fill, fill_available))
         if tuple(fill.sequence for fill, _ in fills) != tuple(range(1, len(fills) + 1)):
             raise PaperLifecycleIntegrityError("SELL fill sequence is incomplete")
@@ -934,7 +995,7 @@ class PaperBrokerLifecycleReader:
                         Decimal("0"),
                     )
                     / filled_quantity
-                ).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+                ).quantize(self._price_tick, rounding=ROUND_HALF_UP)
                 if order.average_fill_price != average:
                     raise PaperLifecycleIntegrityError("SELL order and fill price do not reconcile")
             elif order.average_fill_price is not None:

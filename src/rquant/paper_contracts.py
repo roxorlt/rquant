@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from decimal import ROUND_FLOOR, ROUND_HALF_UP, Decimal
+from decimal import ROUND_FLOOR, Decimal
 from enum import StrEnum
 from typing import Annotated, Literal, Self
 
 from pydantic import Field, model_validator
 
+from rquant.research_run_spec import ExecutionCostCalculation
 from rquant.runtime_contracts import (
     AwareUtcDatetime,
     RuntimeContractModel,
@@ -22,7 +23,6 @@ PositiveDecimal = Annotated[Decimal, Field(gt=0, allow_inf_nan=False)]
 NonNegativeDecimal = Annotated[Decimal, Field(ge=0, allow_inf_nan=False)]
 FiniteDecimal = Annotated[Decimal, Field(allow_inf_nan=False)]
 TrancheFraction = Annotated[Decimal, Field(gt=0, le=1, allow_inf_nan=False)]
-_PRICE_TICK = Decimal("0.0001")
 
 
 class PaperSide(StrEnum):
@@ -54,6 +54,11 @@ class PaperRejectReason(StrEnum):
     INVALID_LOT = "INVALID_LOT"
     EXPIRED = "EXPIRED"
     RISK_REJECTED = "RISK_REJECTED"
+
+
+class PaperCostProvenanceState(StrEnum):
+    KNOWN_V3 = "KNOWN_V3"
+    LEGACY_UNKNOWN = "LEGACY_UNKNOWN"
 
 
 class PaperSellQuantityAuthority(RuntimeContractModel):
@@ -180,11 +185,6 @@ class PaperOrder(RuntimeContractModel):
         has_fills = self.filled_quantity > 0
         if has_fills != (self.average_fill_price is not None):
             raise ValueError("average_fill_price must be present iff fills exist")
-        if self.average_fill_price is not None and self.average_fill_price != (
-            self.average_fill_price.quantize(_PRICE_TICK, rounding=ROUND_HALF_UP)
-        ):
-            raise ValueError("average_fill_price must use the 0.0001 price tick")
-
         if self.status in {PaperOrderStatus.PENDING, PaperOrderStatus.ACCEPTED}:
             if self.filled_quantity != 0:
                 raise ValueError(f"{self.status.value} order cannot have fills")
@@ -223,7 +223,13 @@ class PaperFill(RuntimeContractModel):
     quantity: PositiveLot
     price: PositiveDecimal
     commission: NonNegativeDecimal
+    transfer_fee: NonNegativeDecimal | None = None
     tax: NonNegativeDecimal
+    total_fees: NonNegativeDecimal | None = None
+    cost_spec_id: Sha256 | None = None
+    cost_spec_schema_version: Literal[3] | None = None
+    cost_context_fingerprint: Sha256 | None = None
+    cost_provenance_state: PaperCostProvenanceState = PaperCostProvenanceState.LEGACY_UNKNOWN
     executed_at: AwareUtcDatetime
     price_snapshot_id: Sha256
 
@@ -234,6 +240,27 @@ class PaperFill(RuntimeContractModel):
             object.__setattr__(self, "fill_id", expected)
         elif self.fill_id != expected:
             raise ValueError("fill_id does not match order_id and execution_id")
+        return self
+
+    @model_validator(mode="after")
+    def validate_cost_provenance(self) -> Self:
+        values = (
+            self.transfer_fee,
+            self.total_fees,
+            self.cost_spec_id,
+            self.cost_spec_schema_version,
+            self.cost_context_fingerprint,
+        )
+        if self.cost_provenance_state is PaperCostProvenanceState.LEGACY_UNKNOWN:
+            if any(value is not None for value in values):
+                raise ValueError("legacy paper fill must not invent v3 cost provenance")
+            return self
+        if any(value is None for value in values):
+            raise ValueError("known v3 paper fill requires complete cost provenance")
+        assert self.transfer_fee is not None
+        assert self.total_fees is not None
+        if self.total_fees != self.commission + self.transfer_fee + self.tax:
+            raise ValueError("paper fill total_fees must equal its fee components")
         return self
 
     @property
@@ -247,6 +274,11 @@ class PaperExecutionReceipt(RuntimeContractModel):
     intent_id: Sha256
     order: PaperOrder
     fill: PaperFill | None = None
+    cost_spec_id: Sha256 | None = None
+    cost_spec_schema_version: Literal[3] | None = None
+    cost_context_fingerprint: Sha256 | None = None
+    cost_provenance_state: PaperCostProvenanceState = PaperCostProvenanceState.LEGACY_UNKNOWN
+    cost_calculation: ExecutionCostCalculation | None = None
     persisted_at: AwareUtcDatetime
 
     @model_validator(mode="after")
@@ -257,6 +289,38 @@ class PaperExecutionReceipt(RuntimeContractModel):
             self.fill.execution_id != self.execution_id or self.fill.order_id != self.order.order_id
         ):
             raise ValueError("execution receipt does not bind its order and fill")
+        values = (
+            self.cost_spec_id,
+            self.cost_spec_schema_version,
+            self.cost_context_fingerprint,
+        )
+        if self.cost_provenance_state is PaperCostProvenanceState.LEGACY_UNKNOWN:
+            if any(value is not None for value in values) or self.cost_calculation is not None:
+                raise ValueError("legacy execution receipt must not invent v3 cost provenance")
+            return self
+        if any(value is None for value in values):
+            raise ValueError("known v3 execution receipt requires complete cost provenance")
+        if self.fill is not None:
+            if self.cost_calculation is None:
+                raise ValueError("known v3 fill receipt requires resolved cost calculation")
+            if (
+                self.fill.cost_provenance_state is not PaperCostProvenanceState.KNOWN_V3
+                or self.fill.cost_spec_id != self.cost_spec_id
+                or self.fill.cost_spec_schema_version != self.cost_spec_schema_version
+                or self.fill.cost_context_fingerprint != self.cost_context_fingerprint
+                or self.fill.price != self.cost_calculation.executed_price
+                or self.fill.commission != self.cost_calculation.commission
+                or self.fill.transfer_fee != self.cost_calculation.transfer_fee
+                or self.fill.tax != self.cost_calculation.stamp_duty
+                or self.fill.total_fees != self.cost_calculation.total_fees
+            ):
+                raise ValueError("known v3 execution receipt does not match its fill")
+        if self.cost_calculation is not None and (
+            self.cost_calculation.cost_spec_id != self.cost_spec_id
+            or self.cost_calculation.cost_spec_schema_version != self.cost_spec_schema_version
+            or self.cost_calculation.cost_context_fingerprint != self.cost_context_fingerprint
+        ):
+            raise ValueError("known v3 execution receipt does not match cost calculation")
         return self
 
 

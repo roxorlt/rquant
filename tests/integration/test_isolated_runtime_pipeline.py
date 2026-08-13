@@ -14,7 +14,7 @@ from rquant.intraday_feature_engine import IntradayFeatureConfig
 from rquant.live_spool import LiveBatchSpool
 from rquant.market_minute_gateway import MarketMinuteGateway, MarketMinuteGatewayConfig
 from rquant.notification_worker import NotificationDelivery, run_notification_batch
-from rquant.paper_broker import BrokerCostPolicy, BrokerExecutionContext, PaperBrokerStore
+from rquant.paper_broker import BrokerExecutionContext, PaperBrokerStore
 from rquant.paper_signal_consumer import (
     PaperSignalConsumerStateStore,
     consume_signal_bus_to_paper,
@@ -60,6 +60,7 @@ from rquant.strategy_spec import (
     StrategyRunMode,
     StrategySpec,
 )
+from tests.paper_cost_fixtures import paper_cost_policy, paper_instrument_context
 
 SHANGHAI = timezone(timedelta(hours=8))
 OBSERVED = datetime(2026, 7, 31, 1, 40, 2, tzinfo=UTC)
@@ -363,11 +364,7 @@ def test_pipeline_is_end_to_end_and_exact_replay_is_idempotent(tmp_path: Path) -
         tmp_path / "paper-broker.sqlite3",
         account_id="paper-main",
         initial_cash=Decimal("100000"),
-        cost_policy=BrokerCostPolicy(
-            commission_rate=Decimal("0.0003"),
-            minimum_commission=Decimal("5"),
-            sell_stamp_tax_rate=Decimal("0.001"),
-        ),
+        cost_policy=paper_cost_policy(),
     )
     paper_run = run_paper_signal_batch(
         paper_queue,
@@ -381,6 +378,7 @@ def test_pipeline_is_end_to_end_and_exact_replay_is_idempotent(tmp_path: Path) -
             context=BrokerExecutionContext(
                 executable_price=Decimal("10.10"),
                 acquisition_available_date=date(2026, 8, 3),
+                instrument_context=paper_instrument_context(signal.candidate_id),
             ),
             producer_commit="6" * 40,
         ),
