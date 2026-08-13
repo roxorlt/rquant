@@ -1880,7 +1880,7 @@ def test_offline_v4_migration_keeps_legacy_cost_evidence_null_and_requires_a_fre
     diagnostic = migrated.ledger_trust_status()
     assert diagnostic.state == "quarantined"
     unknown = {item.field: item.count for item in diagnostic.unknown_evidence}
-    assert unknown["unknown_cost_provenance_count"] == 5
+    assert unknown["unknown_cost_provenance_count"] == 7
     with sqlite3.connect(candidate) as connection:
         account = connection.execute(
             "SELECT cash, realized_pnl, cost_spec_id, cost_spec_schema_version, "
@@ -1896,12 +1896,14 @@ def test_offline_v4_migration_keeps_legacy_cost_evidence_null_and_requires_a_fre
             "cost_context_fingerprint, cost_provenance_state "
             "FROM paper_execution_receipt ORDER BY execution_id"
         ).fetchall()
-    assert account == ("10088.9000", "88.9000", None, None, "LEGACY_UNKNOWN")
+    assert account == ("162888.1000", "2900.1000", None, None, "LEGACY_UNKNOWN")
     assert fills == [
+        (None, None, None, None, None, "LEGACY_UNKNOWN"),
         (None, None, None, None, None, "LEGACY_UNKNOWN"),
         (None, None, None, None, None, "LEGACY_UNKNOWN"),
     ]
     assert receipts == [
+        (None, None, None, None, None, "LEGACY_UNKNOWN"),
         (None, None, None, None, None, "LEGACY_UNKNOWN"),
         (None, None, None, None, None, "LEGACY_UNKNOWN"),
     ]

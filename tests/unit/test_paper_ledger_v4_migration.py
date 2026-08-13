@@ -24,7 +24,7 @@ from tests.fixtures.paper_ledger_v4_fixture import (
 _PARENT_COMMIT = "c088774c3199c02edf203a3af758452eb38a5118"
 _PARENT_SCHEMA_VERSION = 4
 _PARENT_INTERNAL_MIGRATION_VERSION = 2
-_FIXTURE_SHA256 = "9dc51ed7104035a54172f850ecf6bb75f344b565d35db7845722b4acbb2a94f7"
+_FIXTURE_SHA256 = "be1497e0725f6427ff5c61db64b79fdd504a9968b547fd69effc5f55882a0822"
 
 
 def _sha256(path: Path) -> str:
@@ -34,11 +34,13 @@ def _sha256(path: Path) -> str:
 def _assert_corrupt_v4_rejected(
     source_path: Path,
     candidate_path: Path,
+    *,
+    match: str | None = None,
 ) -> None:
     source_bytes = source_path.read_bytes()
     source_sha256 = _sha256(source_path)
 
-    with pytest.raises(PaperV4ReconciliationError):
+    with pytest.raises(PaperV4ReconciliationError, match=match):
         migrate_v4_ledger_copy(
             source_path,
             candidate_path,
@@ -48,6 +50,100 @@ def _assert_corrupt_v4_rejected(
     assert source_path.read_bytes() == source_bytes
     assert _sha256(source_path) == source_sha256
     assert not candidate_path.exists()
+
+
+def _canonical_lot_ids(connection: sqlite3.Connection) -> tuple[str, ...]:
+    return tuple(
+        str(row[0])
+        for row in connection.execute(
+            """
+            SELECT lot_id FROM paper_lot
+            ORDER BY available_date, acquisition_trade_date, buy_executed_at,
+                     buy_persisted_at, buy_fill_sequence, lot_id
+            """
+        ).fetchall()
+    )
+
+
+def test_v4_migration_accepts_canonical_fifo_when_lot_ids_are_inverse_chronology(
+    tmp_path: Path,
+) -> None:
+    source = create_parent_v4_fixture(tmp_path / "source.sqlite3")
+    candidate = tmp_path / "candidate.sqlite3"
+    with sqlite3.connect(source.path) as connection:
+        chronological_lot_ids = _canonical_lot_ids(connection)
+        allocations = tuple(
+            (str(row[0]), int(row[1]))
+            for row in connection.execute(
+                """
+                SELECT c.lot_id, c.quantity
+                FROM paper_lot_consumption AS c
+                JOIN paper_lot AS l ON l.lot_id = c.lot_id
+                ORDER BY l.available_date, l.acquisition_trade_date, l.buy_executed_at,
+                         l.buy_persisted_at, l.buy_fill_sequence, l.lot_id
+                """
+            ).fetchall()
+        )
+
+    assert chronological_lot_ids == tuple(sorted(chronological_lot_ids, reverse=True))
+    assert allocations == (
+        (chronological_lot_ids[0], 200),
+        (chronological_lot_ids[1], 100),
+    )
+    report = V4LedgerReconciler().reconcile(source.path)
+    result = migrate_v4_ledger_copy(
+        source.path,
+        candidate,
+        migration_code_identity="test-migration-code",
+    )
+    assert report.is_verified
+    assert result.reconciliation_verified
+    assert candidate.is_file()
+
+
+def test_v4_migration_rejects_non_fifo_multi_lot_consumption_before_candidate(
+    tmp_path: Path,
+) -> None:
+    source = create_parent_v4_fixture(tmp_path / "source.sqlite3")
+    with sqlite3.connect(source.path) as connection:
+        chronological_lot_ids = _canonical_lot_ids(connection)
+        sell_fill_id = str(
+            connection.execute(
+                """
+                SELECT f.fill_id FROM paper_fill AS f
+                JOIN paper_order AS o ON o.order_id = f.order_id
+                WHERE o.side = 'SELL'
+                """
+            ).fetchone()[0]
+        )
+        immutable_trigger = str(
+            connection.execute(
+                """
+                SELECT sql FROM sqlite_master
+                WHERE type = 'trigger' AND name = 'paper_lot_consumption_row_immutable'
+                """
+            ).fetchone()[0]
+        )
+        connection.execute("DROP TRIGGER paper_lot_consumption_row_immutable")
+        connection.execute(
+            "UPDATE paper_lot_consumption SET quantity = 100 WHERE fill_id = ? AND lot_id = ?",
+            (sell_fill_id, chronological_lot_ids[0]),
+        )
+        connection.execute(
+            "UPDATE paper_lot_consumption SET quantity = 200 WHERE fill_id = ? AND lot_id = ?",
+            (sell_fill_id, chronological_lot_ids[1]),
+        )
+        connection.execute(
+            "UPDATE paper_lot SET remaining_quantity = 100 WHERE lot_id IN (?, ?)",
+            chronological_lot_ids,
+        )
+        connection.execute(immutable_trigger)
+
+    _assert_corrupt_v4_rejected(
+        source.path,
+        tmp_path / "candidate.sqlite3",
+        match="not FIFO",
+    )
 
 
 @pytest.mark.parametrize(
@@ -102,8 +198,8 @@ def test_v4_migration_rejects_corrupt_realized_pnl_before_candidate(tmp_path: Pa
 def test_v4_migration_rejects_corrupt_receipt_payload_before_candidate(tmp_path: Path) -> None:
     source = create_parent_v4_fixture(tmp_path / "source.sqlite3")
     payload = source.path.read_bytes()
-    original = b'"executable_price":"11.00"'
-    corrupted = b'"executable_price":"12.00"'
+    original = b'"executable_price":"210.00"'
+    corrupted = b'"executable_price":"211.00"'
     assert payload.count(original) == 1
     source.path.write_bytes(payload.replace(original, corrupted, 1))
 
@@ -236,7 +332,7 @@ def test_parent_v4_binary_fixture_has_parent_provenance_and_migrates_without_dow
             """
         ).fetchall()
     assert candidate_account == source_account
-    assert legacy_fills == [(None, None, None, None, None, "LEGACY_UNKNOWN")] * 2
+    assert legacy_fills == [(None, None, None, None, None, "LEGACY_UNKNOWN")] * 3
 
 
 @pytest.mark.parametrize("failure_after_phase", OFFLINE_MIGRATION_PHASES)
