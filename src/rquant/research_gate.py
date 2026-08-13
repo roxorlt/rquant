@@ -432,6 +432,8 @@ def build_gate_research_manifest(
     decision: ResearchGateDecision,
     *,
     code_trust_evidence: CodeTrustEvidence | None = None,
+    strategy_spec_hash: str | None = None,
+    result_hash: str | None = None,
 ) -> ResearchManifest:
     warnings = [failure.message for failure in decision.failures]
     numerator = sum(item[0] for item in decision.coverage_counts.values())
@@ -464,6 +466,8 @@ def build_gate_research_manifest(
         code_trust_evidence=code_trust_evidence,
         dataset_snapshot_id=decision.dataset_snapshot_id,
         dataset_binding_hash=decision.dataset_binding_hash,
+        strategy_spec_hash=strategy_spec_hash,
+        result_hash=result_hash,
         coverage_numerator=numerator,
         coverage_denominator=denominator,
         data_start_date=request.start_date,

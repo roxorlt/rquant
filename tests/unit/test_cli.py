@@ -1474,6 +1474,16 @@ class TestResearchMinuteRepair:
 
 class TestFormalSmokeReplay:
     def test_parser_requires_exact_formal_evidence(self) -> None:
+        runtime_arguments = [
+            "--runtime-code-config",
+            "/tmp/runtime-code-bootstrap.json",
+            "--runtime-code-trusted-base",
+            "/tmp",
+            "--runtime-code-authority-uid",
+            "1",
+            "--runtime-code-authority-gid",
+            "1",
+        ]
         args = build_parser().parse_args(
             [
                 "formal-smoke-replay",
@@ -1491,6 +1501,7 @@ class TestFormalSmokeReplay:
                 "c" * 64,
                 "--output-dir",
                 "/tmp/formal-smoke",
+                *runtime_arguments,
             ]
         )
 
@@ -1519,6 +1530,7 @@ class TestFormalSmokeReplay:
                     "b" * 64,
                     "--binding-hash",
                     "c" * 64,
+                    *runtime_arguments,
                 ]
             )
         with pytest.raises(SystemExit):
@@ -1539,6 +1551,7 @@ class TestFormalSmokeReplay:
                     "c" * 64,
                     "--mode",
                     "exploratory",
+                    *runtime_arguments,
                 ]
             )
 
@@ -1568,7 +1581,6 @@ class TestFormalSmokeReplay:
         capability.evidence = CodeTrustEvidence(
             generation_id="a" * 64,
             attestation_sha256="b" * 64,
-            bundle_sha256="c" * 64,
             content_root_sha256="d" * 64,
             promotion_sequence=1,
             provenance_commit="d" * 40,
@@ -1638,8 +1650,8 @@ class TestFormalSmokeReplay:
         from unittest.mock import MagicMock
 
         from rquant import cli
-        from rquant import formal_smoke_replay as smoke_module
         from rquant import formal_runtime_composition as composition_module
+        from rquant import formal_smoke_replay as smoke_module
 
         run = MagicMock()
         monkeypatch.setattr(

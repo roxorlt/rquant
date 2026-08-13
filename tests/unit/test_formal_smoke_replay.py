@@ -10,14 +10,15 @@ import pandas as pd
 import pytest
 from pydantic import ValidationError
 
+from rquant.runtime_code_generation import RuntimeCodeGenerationCapability
+
 
 def _open_signed_runtime_capability(
     tmp_path: Path,
     *,
     provenance_commit: str = "d" * 40,
-) -> "RuntimeCodeGenerationCapability":
+) -> RuntimeCodeGenerationCapability:
     """Open the same signed immutable-generation capability used by runtime tests."""
-    from rquant.runtime_code_generation import RuntimeCodeGenerationCapability
     from tests.runtime_code_e2e_support import (
         build_test_package,
         install_test_package,
@@ -71,14 +72,17 @@ def test_formal_smoke_specs_are_fixed_versioned_and_hash_stable(
     assert first.end_date == date(2026, 7, 2)
     assert len(first.spec_hash) == 64
     assert first.spec_hash == second.spec_hash
-    assert first.model_copy(
-        update={
-            "parameters": {
-                **first.parameters,
-                "test_parameter": "changed",
+    assert (
+        first.model_copy(
+            update={
+                "parameters": {
+                    **first.parameters,
+                    "test_parameter": "changed",
+                }
             }
-        }
-    ).spec_hash != first.spec_hash
+        ).spec_hash
+        != first.spec_hash
+    )
 
 
 def test_formal_smoke_specs_bind_the_documented_v1_parameters() -> None:
@@ -209,12 +213,8 @@ def test_formal_smoke_execution_uses_exact_gate_and_persists_evidence(
                 "win_rate_pct": 100.0,
             },
             tables={
-                "strategy_summary": pd.DataFrame(
-                    [{"strategy": "n_shape", "trades": 1}]
-                ),
-                "trades": pd.DataFrame(
-                    [{"ts_code": "000001.SZ", "ret_pct": 3.5}]
-                ),
+                "strategy_summary": pd.DataFrame([{"strategy": "n_shape", "trades": 1}]),
+                "trades": pd.DataFrame([{"ts_code": "000001.SZ", "ret_pct": 3.5}]),
             },
             sample_count=1,
         )
@@ -260,26 +260,19 @@ def test_formal_smoke_execution_uses_exact_gate_and_persists_evidence(
     assert saved.manifest.schema_version == 3
     assert saved.manifest.research_status == "comparable"
     assert saved.manifest.dataset_snapshot_id == request.dataset_snapshot_id
-    assert (
-        saved.manifest.dataset_binding_hash
-        == request.dataset_binding_hash
-    )
+    assert saved.manifest.dataset_binding_hash == request.dataset_binding_hash
     assert saved.manifest.strategy_spec_hash == result.strategy_spec_hash
     assert saved.manifest.result_hash == result.result_hash
     assert saved.manifest.missing_evidence == []
     assert saved.manifest.code_trust_evidence == request.runtime_capability.evidence
-    evidence = next(
-        table for table in saved.tables if table.name == "formal_evidence"
-    )
+    evidence = next(table for table in saved.tables if table.name == "formal_evidence")
     assert evidence.rows == [
         {
             "audit_run_id": request.audit_run_id,
             "dataset_snapshot_id": request.dataset_snapshot_id,
             "dataset_binding_hash": request.dataset_binding_hash,
             "code_commit": request.code_commit,
-            "code_trust_evidence": request.runtime_capability.evidence.model_dump(
-                mode="json"
-            ),
+            "code_trust_evidence": request.runtime_capability.evidence.model_dump(mode="json"),
         }
     ]
 
@@ -514,13 +507,14 @@ def test_formal_smoke_rejects_invalid_runtime_generation_before_execution(
         capability.close()
     elif invalid_state == "generation_changed":
         pointer = capability.loaded.generation_root.parent.parent / "current"
+        pointer.chmod(0o600)
         pointer.write_text("e" * 64 + "\n", encoding="ascii")
     else:
         source = capability.release_root / "src/rquant/app.py"
-        replacement = source.with_name("replacement.py")
-        replacement.write_bytes(b"TAMPERED = True\n")
-        replacement.chmod(0o444)
-        replacement.replace(source)
+        source.parent.chmod(0o700)
+        source.chmod(0o600)
+        source.write_bytes(b"TAMPERED = True\n")
+        source.chmod(0o444)
 
     try:
         with pytest.raises(Exception, match="runtime|generation|capability|unchanged"):
@@ -558,9 +552,7 @@ def test_n_shape_formal_smoke_adapter_uses_only_fixed_v1_variant(
                     }
                 ]
             ),
-            trades=pd.DataFrame(
-                [{"ts_code": "000001.SZ", "ret_pct": 3.5}]
-            ),
+            trades=pd.DataFrame([{"ts_code": "000001.SZ", "ret_pct": 3.5}]),
         )
 
     monkeypatch.setattr(

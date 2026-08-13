@@ -9,11 +9,12 @@ from typing import Any, Literal
 import pandas as pd
 from pydantic import BaseModel, ConfigDict, computed_field, model_validator
 
-from rquant.authority_path_security import AuthorityPathSecurityError
 from rquant.auction_gap_strategy import AuctionGapMinuteReplayConfig
+from rquant.authority_path_security import AuthorityPathSecurityError
 from rquant.dashboard.strategy_lab_runs import (
     _canonical_json_bytes,
     _hash_json_value,
+    _result_hash,
     _strategy_spec_hash,
     build_strategy_lab_run,
     save_strategy_lab_run,
@@ -110,21 +111,15 @@ class FormalSmokeReplayRequest(BaseModel):
             "dataset_binding_hash",
         ):
             if re.fullmatch(_HASH_PATTERN, getattr(self, field_name)) is None:
-                raise ValueError(
-                    f"formal smoke {field_name} must be a 64-character hash"
-                )
+                raise ValueError(f"formal smoke {field_name} must be a 64-character hash")
         if re.fullmatch(_COMMIT_PATTERN, self.code_commit) is None:
-            raise ValueError(
-                "formal smoke code_commit must be a clean 40-character commit"
-            )
+            raise ValueError("formal smoke code_commit must be a clean 40-character commit")
         try:
             self.runtime_capability.require_live()
         except (AuthorityPathSecurityError, RuntimeCodeGenerationError) as exc:
             raise ValueError("formal smoke runtime capability is invalid") from exc
         if self.runtime_capability.evidence.provenance_commit != self.code_commit:
-            raise ValueError(
-                "formal smoke code_commit does not match runtime capability"
-            )
+            raise ValueError("formal smoke code_commit does not match runtime capability")
         return self
 
 
@@ -240,9 +235,7 @@ def _execute_formal_smoke_spec(
         return _execute_growth_board_surge(store, spec)
     if spec.strategy == "auction_gap":
         return _execute_auction_gap(store, spec)
-    raise ValueError(
-        f"unsupported formal smoke strategy: {spec.strategy}"
-    )
+    raise ValueError(f"unsupported formal smoke strategy: {spec.strategy}")
 
 
 def _return_metrics(
@@ -293,9 +286,7 @@ def _execute_n_shape(
         max_hold_days=int(parameters["max_hold_days"]),
         freq=str(parameters["freq"]),
         paper_config=PaperTradeConfig.model_validate(parameters["paper"]),
-        factor_score_threshold=float(
-            parameters["factor_score_threshold"]
-        ),
+        factor_score_threshold=float(parameters["factor_score_threshold"]),
     )
     mean_ret_pct, win_rate_pct = _return_metrics(result.trades)
     return FormalSmokeComputation(
@@ -390,9 +381,7 @@ def _verify_gate_evidence(
     decision: object,
 ) -> None:
     if not decision.allowed or decision.research_status != "comparable":
-        raise PermissionError(
-            "formal smoke gate did not return comparable research status"
-        )
+        raise PermissionError("formal smoke gate did not return comparable research status")
     expected = {
         "audit_run_id": request.audit_run_id,
         "dataset_snapshot_id": request.dataset_snapshot_id,
@@ -400,9 +389,7 @@ def _verify_gate_evidence(
     }
     for field_name, expected_value in expected.items():
         if getattr(decision, field_name) != expected_value:
-            raise PermissionError(
-                f"formal smoke gate {field_name} does not match request"
-            )
+            raise PermissionError(f"formal smoke gate {field_name} does not match request")
 
 
 def _require_runtime_code_evidence(
@@ -416,9 +403,7 @@ def _require_runtime_code_evidence(
         raise PermissionError("formal smoke runtime capability is invalid") from exc
     evidence = capability.evidence
     if evidence.provenance_commit != request.code_commit:
-        raise PermissionError(
-            "formal smoke code_commit does not match runtime capability"
-        )
+        raise PermissionError("formal smoke code_commit does not match runtime capability")
     return evidence
 
 
@@ -465,14 +450,18 @@ def run_formal_smoke_replay(
             }
         ]
     )
-    tables = _canonicalize_formal_tables({
-        **computation.tables,
-        "formal_evidence": evidence,
-    })
+    tables = _canonicalize_formal_tables(
+        {
+            **computation.tables,
+            "formal_evidence": evidence,
+        }
+    )
     manifest = build_gate_research_manifest(
         gate_request,
         decision,
         code_trust_evidence=code_trust_evidence,
+        strategy_spec_hash=spec.spec_hash,
+        result_hash=_result_hash(computation.metrics, tables),
     )
     require_formal_research_manifest(
         manifest,
