@@ -314,8 +314,8 @@ def _verify_daily_orchestrator_completion(
         DailyPipelineOrchestratorSettings,
         DailyShadowStageArtifact,
         DailyShadowStageCompletionReceipt,
-        daily_shadow_stage_receipt_keyring,
         daily_shadow_ledger_owner,
+        daily_shadow_stage_receipt_keyring,
         load_daily_shadow_run_completion_receipt,
     )
     from rquant.runtime_deployment_profile import RuntimeDeploymentProfile
@@ -327,7 +327,7 @@ def _verify_daily_orchestrator_completion(
         settings = DailyPipelineOrchestratorSettings.model_validate(dict(manifest.settings))
         if settings.service_owner != manifest.service_id:
             return False
-        source_generations = dict(getattr(heartbeat, "source_generations"))
+        source_generations = dict(heartbeat.source_generations)
         profile_hash = source_generations["daily_pipeline_profile"]
         namespace_id = source_generations["daily_pipeline_namespace"]
         command_manifest_hash = source_generations["daily_pipeline_command_manifest"]

@@ -151,7 +151,9 @@ def _daily_orchestrator_probe_fixture(
     }
     settings_stages = ("screen", "raw_capture", "backup") if misordered_stages else stage_ids
     if missing_stage is not None:
-        settings_stages = tuple(stage_id for stage_id in settings_stages if stage_id != missing_stage)
+        settings_stages = tuple(
+            stage_id for stage_id in settings_stages if stage_id != missing_stage
+        )
     storage_root = tmp_path / "storage"
     namespace_root = storage_root / namespace_id
     deployment_profile_path = tmp_path / "deployment-profile.json"
@@ -170,7 +172,11 @@ def _daily_orchestrator_probe_fixture(
     def _output_identity(stage_id: str) -> str:
         return canonical_sha256({"stage": stage_id, "kind": "output"})
 
-    def _receipt_payload(stage_id: str, order: int, dependency_receipt_ids: tuple[str, ...]) -> dict[str, object]:
+    def _receipt_payload(
+        stage_id: str,
+        order: int,
+        dependency_receipt_ids: tuple[str, ...],
+    ) -> dict[str, object]:
         key_id = "previous-key" if stage_id == previous_key_stage else "active-key"
         exit_status = 1 if stage_id == nonzero_stage else 0
         payload = {
@@ -244,7 +250,7 @@ def _daily_orchestrator_probe_fixture(
             }
         )
 
-    for stage_id, payload in receipt_payloads.items():
+    for _stage_id, payload in receipt_payloads.items():
         receipt_by_id[str(payload["receipt_id"])] = _to_receipt(payload)
 
     if mutate_receipt is not None:
@@ -310,7 +316,12 @@ def _daily_orchestrator_probe_fixture(
             )
             self.active_key_id = active_key_id
 
-        def verify_stage_receipt(self, receipt_obj: SimpleNamespace, *, require_active: bool = False) -> bool:
+        def verify_stage_receipt(
+            self,
+            receipt_obj: SimpleNamespace,
+            *,
+            require_active: bool = False,
+        ) -> bool:
             expected_signature = (
                 f"sig:{receipt_obj.key_id}:{receipt_obj.stage_id}:"
                 f"{receipt_obj.exit_status}:{receipt_obj.output_identity}"
@@ -327,7 +338,9 @@ def _daily_orchestrator_probe_fixture(
         ) -> bool:
             if require_active and receipt_obj.key_id != self.active_key_id:
                 return False
-            return receipt_obj.signature == f"sig:{receipt_obj.key_id}:run:{receipt_obj.exit_status}"
+            return receipt_obj.signature == (
+                f"sig:{receipt_obj.key_id}:run:{receipt_obj.exit_status}"
+            )
 
     class FakeStorageProfile:
         @staticmethod
@@ -426,38 +439,40 @@ def _daily_orchestrator_probe_fixture(
     monkeypatch.setattr(
         daily_builder_module,
         "load_daily_shadow_run_completion_receipt",
-        lambda _storage, _receipt_id: SimpleNamespace(
-            receipt_id=completion_receipt_id,
-            run_id="run-1",
-            mode=mode_shadow,
-            trade_date=datetime(2026, 8, 2, tzinfo=UTC).date(),
-            profile_hash=profile_hash,
-            source_generation_id=source_generation_id,
-            source_content_hash=source_content_hash,
-            command_manifest_hash=command_manifest_hash,
-            input_identity="input-1",
-            stage_order=stage_ids,
-            stage_receipt_ids=tuple(stage_receipt_ids[stage_id] for stage_id in stage_ids),
-            previous_receipt_hash=canonical_sha256(
-                {
-                    "contract": "daily-shadow-stage-previous-receipt-chain/v1",
-                    "dependency_receipt_ids": tuple(
-                        stage_receipt_ids[stage_id] for stage_id in stage_ids
-                    ),
-                }
-            ),
-            final_backup_stage_id="backup",
-            final_backup_receipt_id=stage_receipt_ids["backup"],
-            final_backup_output_identity=backup_payload["output_identity"],
-            final_backup_result=_to_result(backup_payload["result"]),
-            exit_status=0,
-            code_commit=receipt.producer_commit,
-            key_id="active-key",
-            signature_algorithm="ed25519",
-            signature="sig:active-key:run:0",
-        )
-        if _receipt_id == "rcpt-backup"
-        else (_ for _ in ()).throw(FileNotFoundError(_receipt_id)),
+        lambda _storage, _receipt_id: (
+            SimpleNamespace(
+                receipt_id=completion_receipt_id,
+                run_id="run-1",
+                mode=mode_shadow,
+                trade_date=datetime(2026, 8, 2, tzinfo=UTC).date(),
+                profile_hash=profile_hash,
+                source_generation_id=source_generation_id,
+                source_content_hash=source_content_hash,
+                command_manifest_hash=command_manifest_hash,
+                input_identity="input-1",
+                stage_order=stage_ids,
+                stage_receipt_ids=tuple(stage_receipt_ids[stage_id] for stage_id in stage_ids),
+                previous_receipt_hash=canonical_sha256(
+                    {
+                        "contract": "daily-shadow-stage-previous-receipt-chain/v1",
+                        "dependency_receipt_ids": tuple(
+                            stage_receipt_ids[stage_id] for stage_id in stage_ids
+                        ),
+                    }
+                ),
+                final_backup_stage_id="backup",
+                final_backup_receipt_id=stage_receipt_ids["backup"],
+                final_backup_output_identity=backup_payload["output_identity"],
+                final_backup_result=_to_result(backup_payload["result"]),
+                exit_status=0,
+                code_commit=receipt.producer_commit,
+                key_id="active-key",
+                signature_algorithm="ed25519",
+                signature="sig:active-key:run:0",
+            )
+            if _receipt_id == "rcpt-backup"
+            else (_ for _ in ()).throw(FileNotFoundError(_receipt_id))
+        ),
     )
     monkeypatch.setattr(
         daily_builder_module,
@@ -551,8 +566,7 @@ def _daily_orchestrator_probe_fixture(
     monkeypatch.setattr(
         "rquant.runtime_deployment_rollout.load_runtime_service_manifest",
         lambda path, **kwargs: (
-            path
-            == receipt.runtime_root / "current" / "manifests" / f"{instance}.json"
+            path == receipt.runtime_root / "current" / "manifests" / f"{instance}.json"
             and kwargs["expected_commit"] == receipt.producer_commit
             and kwargs["expected_generation"] == receipt.generation_hash
             and manifest
@@ -566,7 +580,12 @@ def _daily_orchestrator_probe_fixture(
             and heartbeat
         ),
     )
-    return build_runtime_generation_health_probe(clock=lambda: now), receipt, unit, recorded_keyrings
+    return (
+        build_runtime_generation_health_probe(clock=lambda: now),
+        receipt,
+        unit,
+        recorded_keyrings,
+    )
 
 
 def test_rollout_orders_dependencies_and_replays_completed_audit_without_actions(

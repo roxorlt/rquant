@@ -12,7 +12,6 @@ from rquant.runtime_definition_bootstrap import (
 )
 from rquant.strategy_evaluators import BuiltinStrategyEvaluatorRegistry
 
-
 COMMIT = "a" * 40
 NOW = datetime(2026, 8, 2, 8, 0, tzinfo=UTC)
 

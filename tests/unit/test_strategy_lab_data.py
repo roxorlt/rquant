@@ -12,6 +12,19 @@ from rquant.security_status import SHANGHAI, SecurityStatusDaily
 from rquant.storage.duckdb import DuckDBStore
 
 
+def test_strategy_lab_reexports_canonical_replay_metrics() -> None:
+    from rquant import strategy_replay_metrics
+    from rquant.dashboard import strategy_lab_data
+
+    assert (
+        strategy_lab_data.auction_gap_metric_rows is strategy_replay_metrics.auction_gap_metric_rows
+    )
+    assert (
+        strategy_lab_data.growth_board_metric_rows
+        is strategy_replay_metrics.growth_board_metric_rows
+    )
+
+
 def test_safe_replay_end_date_keeps_full_exit_window() -> None:
     from rquant.dashboard.strategy_lab_data import safe_replay_end_date
 
@@ -67,24 +80,26 @@ def test_safe_replay_end_date_respects_pool_max_date() -> None:
 def test_format_tushare_catalog_display_decodes_json_fields() -> None:
     from rquant.dashboard.strategy_lab_data import format_tushare_catalog_display
 
-    df = pd.DataFrame([
-        {
-            "doc_id": 374,
-            "title": "A股实时分钟",
-            "api_name": "rt_min",
-            "priority": 1,
-            "integration_status": "recommended",
-            "integration_stage": "stage_1_realtime",
-            "update_cadence": "intraday_realtime",
-            "target_table_hint": "minute_bar",
-            "permission_level": "official_permission",
-            "strategy_value": "盘中监控、实时触发、模拟盘",
-            "category_path": '["股票数据", "行情数据", "实时分钟"]',
-            "capability_tags": '["intraday_realtime"]',
-            "limit_note": "单次最大1000行",
-            "permission_note": "正式权限请参阅 权限说明",
-        }
-    ])
+    df = pd.DataFrame(
+        [
+            {
+                "doc_id": 374,
+                "title": "A股实时分钟",
+                "api_name": "rt_min",
+                "priority": 1,
+                "integration_status": "recommended",
+                "integration_stage": "stage_1_realtime",
+                "update_cadence": "intraday_realtime",
+                "target_table_hint": "minute_bar",
+                "permission_level": "official_permission",
+                "strategy_value": "盘中监控、实时触发、模拟盘",
+                "category_path": '["股票数据", "行情数据", "实时分钟"]',
+                "capability_tags": '["intraday_realtime"]',
+                "limit_note": "单次最大1000行",
+                "permission_note": "正式权限请参阅 权限说明",
+            }
+        ]
+    )
 
     display = format_tushare_catalog_display(df)
 
@@ -120,32 +135,34 @@ def test_tushare_metadata_state_distinguishes_missing_corrupt_and_empty(
 def test_format_tushare_catalog_display_shows_quote_and_points_gap() -> None:
     from rquant.dashboard.strategy_lab_data import format_tushare_catalog_display
 
-    df = pd.DataFrame([
-        {
-            "doc_id": 374,
-            "title": "A股实时分钟",
-            "api_name": "rt_min",
-            "priority": 1,
-            "integration_status": "recommended",
-            "integration_stage": "stage_1_realtime",
-            "update_cadence": "intraday_realtime",
-            "target_table_hint": "minute_bar",
-            "permission_level": "official_permission",
-            "strategy_value": "盘中监控、实时触发、模拟盘",
-            "category_path": '["股票数据", "行情数据", "实时分钟"]',
-            "capability_tags": '["intraday_realtime"]',
-            "limit_note": "单次可同时请求300个公司",
-            "permission_note": "需 5000 积分或单独购买权限",
-            "permission_good_name": "A股分钟RT",
-            "permission_price": 1000.0,
-            "permission_duration_unit": "1M",
-            "permission_api_count": 2,
-            "required_points": 5000,
-            "current_points": 2173,
-            "points_gap": 2827,
-            "estimated_points_cost": 282.7,
-        }
-    ])
+    df = pd.DataFrame(
+        [
+            {
+                "doc_id": 374,
+                "title": "A股实时分钟",
+                "api_name": "rt_min",
+                "priority": 1,
+                "integration_status": "recommended",
+                "integration_stage": "stage_1_realtime",
+                "update_cadence": "intraday_realtime",
+                "target_table_hint": "minute_bar",
+                "permission_level": "official_permission",
+                "strategy_value": "盘中监控、实时触发、模拟盘",
+                "category_path": '["股票数据", "行情数据", "实时分钟"]',
+                "capability_tags": '["intraday_realtime"]',
+                "limit_note": "单次可同时请求300个公司",
+                "permission_note": "需 5000 积分或单独购买权限",
+                "permission_good_name": "A股分钟RT",
+                "permission_price": 1000.0,
+                "permission_duration_unit": "1M",
+                "permission_api_count": 2,
+                "required_points": 5000,
+                "current_points": 2173,
+                "points_gap": 2827,
+                "estimated_points_cost": 282.7,
+            }
+        ]
+    )
 
     display = format_tushare_catalog_display(df)
 
@@ -156,19 +173,23 @@ def test_format_tushare_catalog_display_shows_quote_and_points_gap() -> None:
 def test_auction_gap_metric_rows_compares_baseline_and_minute_replay() -> None:
     from rquant.dashboard.strategy_lab_data import auction_gap_metric_rows
 
-    baseline = pd.DataFrame({
-        "ts_code": ["600000.SH", "000001.SZ"],
-        "next_open_ret_pct": [2.0, -1.0],
-        "hit_limit_up_today": [True, False],
-        "intraday_high_ret_pct": [8.0, 1.0],
-        "day_close_ret_pct": [5.0, -2.0],
-    })
-    minute = pd.DataFrame({
-        "ts_code": ["600000.SH"],
-        "ret_pct": [3.0],
-        "b_hit_limit_up_today": [True],
-        "exit_reason": ["next_auction_weak"],
-    })
+    baseline = pd.DataFrame(
+        {
+            "ts_code": ["600000.SH", "000001.SZ"],
+            "next_open_ret_pct": [2.0, -1.0],
+            "hit_limit_up_today": [True, False],
+            "intraday_high_ret_pct": [8.0, 1.0],
+            "day_close_ret_pct": [5.0, -2.0],
+        }
+    )
+    minute = pd.DataFrame(
+        {
+            "ts_code": ["600000.SH"],
+            "ret_pct": [3.0],
+            "b_hit_limit_up_today": [True],
+            "exit_reason": ["next_auction_weak"],
+        }
+    )
 
     rows = auction_gap_metric_rows(baseline, minute)
 
@@ -191,11 +212,13 @@ def test_auction_gap_metric_rows_compares_baseline_and_minute_replay() -> None:
 def test_growth_board_metric_rows_summarizes_minute_replay() -> None:
     from rquant.dashboard.strategy_lab_data import growth_board_metric_rows
 
-    trades = pd.DataFrame({
-        "ts_code": ["300001.SZ", "688001.SH", "300002.SZ"],
-        "ret_pct": [10.0, -2.0, 1.0],
-        "hit_limit_up_today": [True, False, True],
-    })
+    trades = pd.DataFrame(
+        {
+            "ts_code": ["300001.SZ", "688001.SH", "300002.SZ"],
+            "ret_pct": [10.0, -2.0, 1.0],
+            "hit_limit_up_today": [True, False, True],
+        }
+    )
 
     rows = growth_board_metric_rows(trades)
 
@@ -321,34 +344,42 @@ def test_query_growth_board_candidates_uses_exact_point_in_time_status(
     store = DuckDBStore(tmp_path / "strategy-lab.duckdb")
     signal_date = date(2026, 6, 25)
     codes = [f"30000{index}.SZ" for index in range(1, 9)]
-    store.upsert_daily(pd.DataFrame([
-        {
-            "ts_code": ts_code,
-            "trade_date": signal_date,
-            "open": 10.0,
-            "high": 10.2,
-            "low": 9.8,
-            "close": 10.1,
-            "pre_close": 10.0,
-            "change": 0.1,
-            "pct_chg": 1.0,
-            "vol": 1000.0,
-            "amount": 10000.0,
-        }
-        for ts_code in codes
-    ]))
-    store.upsert_stock_basic(pd.DataFrame([
-        {
-            "ts_code": ts_code,
-            "symbol": ts_code[:6],
-            "name": "*ST当前名",
-            "area": "深圳",
-            "industry": "测试",
-            "list_date": "20200101",
-            "market": "创业板",
-        }
-        for ts_code in (codes[0], codes[6])
-    ]))
+    store.upsert_daily(
+        pd.DataFrame(
+            [
+                {
+                    "ts_code": ts_code,
+                    "trade_date": signal_date,
+                    "open": 10.0,
+                    "high": 10.2,
+                    "low": 9.8,
+                    "close": 10.1,
+                    "pre_close": 10.0,
+                    "change": 0.1,
+                    "pct_chg": 1.0,
+                    "vol": 1000.0,
+                    "amount": 10000.0,
+                }
+                for ts_code in codes
+            ]
+        )
+    )
+    store.upsert_stock_basic(
+        pd.DataFrame(
+            [
+                {
+                    "ts_code": ts_code,
+                    "symbol": ts_code[:6],
+                    "name": "*ST当前名",
+                    "area": "深圳",
+                    "industry": "测试",
+                    "list_date": "20200101",
+                    "market": "创业板",
+                }
+                for ts_code in (codes[0], codes[6])
+            ]
+        )
+    )
     store._conn.execute(
         "INSERT INTO daily_state (ts_code, trade_date, is_st) VALUES (?, ?, TRUE)",
         [codes[6], signal_date],
@@ -382,41 +413,43 @@ def test_query_growth_board_candidates_uses_exact_point_in_time_status(
         )
 
     boundary = datetime(2026, 6, 25, 9, 30, tzinfo=SHANGHAI)
-    store.upsert_stock_status((
-        status(codes[0], signal_date, name="历史一号", is_st=False, available_at=boundary),
-        status(codes[1], signal_date, name="*ST历史二号", is_st=True, available_at=boundary),
-        status(codes[2], signal_date, name=None, is_st=False, available_at=boundary),
-        status(
-            codes[3],
-            date(2026, 6, 24),
-            name="历史四号前日",
-            is_st=False,
-            available_at=datetime(2026, 6, 24, 9, 30, tzinfo=SHANGHAI),
-        ),
-        status(
-            codes[3],
-            date(2026, 6, 26),
-            name="历史四号后日",
-            is_st=False,
-            available_at=datetime(2026, 6, 26, 9, 30, tzinfo=SHANGHAI),
-        ),
-        status(
-            codes[4],
-            signal_date,
-            name=None,
-            is_st=None,
-            conflict_reason="test_conflict",
-        ),
-        status(
-            codes[5],
-            signal_date,
-            name="历史六号",
-            is_st=False,
-            available_at=datetime(2026, 6, 25, 9, 30, 1, tzinfo=SHANGHAI),
-        ),
-        status(codes[6], signal_date, name="历史七号", is_st=False, available_at=boundary),
-        status(codes[7], signal_date, name=None, is_st=None),
-    ))
+    store.upsert_stock_status(
+        (
+            status(codes[0], signal_date, name="历史一号", is_st=False, available_at=boundary),
+            status(codes[1], signal_date, name="*ST历史二号", is_st=True, available_at=boundary),
+            status(codes[2], signal_date, name=None, is_st=False, available_at=boundary),
+            status(
+                codes[3],
+                date(2026, 6, 24),
+                name="历史四号前日",
+                is_st=False,
+                available_at=datetime(2026, 6, 24, 9, 30, tzinfo=SHANGHAI),
+            ),
+            status(
+                codes[3],
+                date(2026, 6, 26),
+                name="历史四号后日",
+                is_st=False,
+                available_at=datetime(2026, 6, 26, 9, 30, tzinfo=SHANGHAI),
+            ),
+            status(
+                codes[4],
+                signal_date,
+                name=None,
+                is_st=None,
+                conflict_reason="test_conflict",
+            ),
+            status(
+                codes[5],
+                signal_date,
+                name="历史六号",
+                is_st=False,
+                available_at=datetime(2026, 6, 25, 9, 30, 1, tzinfo=SHANGHAI),
+            ),
+            status(codes[6], signal_date, name="历史七号", is_st=False, available_at=boundary),
+            status(codes[7], signal_date, name=None, is_st=None),
+        )
+    )
 
     candidates = query_growth_board_candidates(
         store._conn,

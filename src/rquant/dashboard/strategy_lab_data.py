@@ -15,14 +15,12 @@ import duckdb
 import pandas as pd
 from pydantic import BaseModel, Field
 
+from rquant import strategy_replay_metrics
 from rquant.config import settings
 from rquant.metadata_catalog import ImmutableDuckDBMetadataCatalog
-from rquant.strategy_replay_metrics import (
-    auction_gap_metric_rows as auction_gap_metric_rows,
-)
-from rquant.strategy_replay_metrics import (
-    growth_board_metric_rows as growth_board_metric_rows,
-)
+
+auction_gap_metric_rows = strategy_replay_metrics.auction_gap_metric_rows
+growth_board_metric_rows = strategy_replay_metrics.growth_board_metric_rows
 
 TUSHARE_STAGE_LABELS: dict[str, str] = {
     "stage_0_integrated": "0 已接入",
@@ -213,31 +211,16 @@ def estimate_strategy_optimization_workload(
     has_walk_forward = walk_forward_folds > 0
     replay_runs = hold_count * strategy_count * (2 + int(has_walk_forward))
     replay_candidate_passes = (
-        candidate_count
-        * hold_count
-        * strategy_count
-        * (1 + int(has_walk_forward))
+        candidate_count * hold_count * strategy_count * (1 + int(has_walk_forward))
     )
-    topn_combinations = (
-        hold_count
-        * strategy_count
-        * 2
-        * topn_count
-        * score_profile_count
-    )
+    topn_combinations = hold_count * strategy_count * 2 * topn_count * score_profile_count
     walk_forward_topn_combinations = (
-        hold_count
-        * walk_forward_folds
-        * strategy_count
-        * 2
-        * topn_count
-        * score_profile_count
+        hold_count * walk_forward_folds * strategy_count * 2 * topn_count * score_profile_count
     )
     estimated_seconds = round(
         replay_candidate_passes * seconds_per_candidate_pass
         + replay_runs * seconds_per_replay_run
-        + (topn_combinations + walk_forward_topn_combinations)
-        * seconds_per_topn_combination,
+        + (topn_combinations + walk_forward_topn_combinations) * seconds_per_topn_combination,
         3,
     )
     return StrategyOptimizationWorkloadEstimate(
@@ -273,8 +256,7 @@ def estimate_growth_board_workload(
         raise ValueError(msg)
     candidate_passes = candidate_count * variant_count
     estimated_seconds = round(
-        candidate_passes * seconds_per_candidate_pass
-        + variant_count * seconds_per_variant,
+        candidate_passes * seconds_per_candidate_pass + variant_count * seconds_per_variant,
         3,
     )
     return GrowthBoardWorkloadEstimate(
@@ -338,132 +320,6 @@ def safe_replay_end_date(
         return None
     calendar_safe_end = trading_calendar[-required_tail]
     return min(pool_max_date, calendar_safe_end)
-
-
-def _pct_mean(series: pd.Series) -> float | None:
-    clean = pd.to_numeric(series, errors="coerce").dropna()
-    if clean.empty:
-        return None
-    return round(float(clean.mean()), 4)
-
-
-def _pct_median(series: pd.Series) -> float | None:
-    clean = pd.to_numeric(series, errors="coerce").dropna()
-    if clean.empty:
-        return None
-    return round(float(clean.median()), 4)
-
-
-def _win_rate(series: pd.Series) -> float | None:
-    clean = pd.to_numeric(series, errors="coerce").dropna()
-    if clean.empty:
-        return None
-    return round(float((clean > 0).mean() * 100), 4)
-
-
-def _bool_rate(series: pd.Series) -> float | None:
-    clean = series.dropna()
-    if clean.empty:
-        return None
-    return round(float(clean.astype(bool).mean() * 100), 4)
-
-
-def auction_gap_metric_rows(
-    baseline: pd.DataFrame,
-    minute_trades: pd.DataFrame,
-) -> pd.DataFrame:
-    """汇总集合竞价基准与分钟 B/S replay，用于 Strategy Lab 对比。"""
-    candidates_count = len(baseline)
-    baseline_ret = (
-        baseline["next_open_ret_pct"]
-        if "next_open_ret_pct" in baseline.columns
-        else pd.Series(dtype=float)
-    )
-    minute_ret = (
-        minute_trades["ret_pct"]
-        if "ret_pct" in minute_trades.columns
-        else pd.Series(dtype=float)
-    )
-    baseline_hit = (
-        baseline["hit_limit_up_today"]
-        if "hit_limit_up_today" in baseline.columns
-        else pd.Series(dtype=bool)
-    )
-    baseline_high_ret = (
-        baseline["intraday_high_ret_pct"]
-        if "intraday_high_ret_pct" in baseline.columns
-        else pd.Series(dtype=float)
-    )
-    baseline_close_ret = (
-        baseline["day_close_ret_pct"]
-        if "day_close_ret_pct" in baseline.columns
-        else pd.Series(dtype=float)
-    )
-    minute_hit = (
-        minute_trades["b_hit_limit_up_today"]
-        if "b_hit_limit_up_today" in minute_trades.columns
-        else pd.Series(dtype=bool)
-    )
-    weak_exit_rate = None
-    if not minute_trades.empty and "exit_reason" in minute_trades.columns:
-        weak_exit_rate = round(
-            float(minute_trades["exit_reason"].fillna("").eq("next_auction_weak").mean() * 100),
-            4,
-        )
-    return pd.DataFrame([
-        {
-            "策略": "竞价直接B/次日开盘S",
-            "候选": candidates_count,
-            "交易": candidates_count,
-            "触发率%": 100.0 if candidates_count else None,
-            "当日上板率%": _bool_rate(baseline_hit),
-            "当日最高均值%": _pct_mean(baseline_high_ret),
-            "当日收盘均值%": _pct_mean(baseline_close_ret),
-            "平均收益%": _pct_mean(baseline_ret),
-            "中位收益%": _pct_median(baseline_ret),
-            "胜率%": _win_rate(baseline_ret),
-            "弱竞价退出%": None,
-        },
-        {
-            "策略": "竞价候选/分钟B/S",
-            "候选": candidates_count,
-            "交易": len(minute_trades),
-            "触发率%": round(len(minute_trades) / candidates_count * 100, 4)
-            if candidates_count
-            else None,
-            "当日上板率%": _bool_rate(minute_hit),
-            "当日最高均值%": None,
-            "当日收盘均值%": None,
-            "平均收益%": _pct_mean(minute_ret),
-            "中位收益%": _pct_median(minute_ret),
-            "胜率%": _win_rate(minute_ret),
-            "弱竞价退出%": weak_exit_rate,
-        },
-    ])
-
-
-def growth_board_metric_rows(
-    trades: pd.DataFrame,
-    *,
-    strategy_name: str = "科创/创业放量追击",
-) -> pd.DataFrame:
-    """汇总科创/创业板分钟放量 replay，用于 Strategy Lab 对比。"""
-    ret = trades["ret_pct"] if "ret_pct" in trades.columns else pd.Series(dtype=float)
-    hit = (
-        trades["hit_limit_up_today"]
-        if "hit_limit_up_today" in trades.columns
-        else pd.Series(dtype=bool)
-    )
-    return pd.DataFrame([
-        {
-            "策略": strategy_name,
-            "交易": len(trades),
-            "当日上板率%": _bool_rate(hit),
-            "平均收益%": _pct_mean(ret),
-            "中位收益%": _pct_median(ret),
-            "胜率%": _win_rate(ret),
-        }
-    ])
 
 
 def dataframe_preview(
@@ -535,10 +391,7 @@ def _point_unit_price(goods: pd.DataFrame) -> float | None:
         return None
     candidates = goods[
         (goods["good_type"] == 1)
-        & (
-            goods["name"].astype(str).str.contains("自定义", na=False)
-            | (goods["good_id"] == 7)
-        )
+        & (goods["name"].astype(str).str.contains("自定义", na=False) | (goods["good_id"] == 7))
     ]
     if candidates.empty or pd.isna(candidates.iloc[0]["price"]):
         return None
@@ -835,14 +688,14 @@ def format_tushare_catalog_display(df: pd.DataFrame) -> pd.DataFrame:
     ]:
         if column not in out.columns:
             out[column] = ""
-    out["阶段"] = out["integration_stage"].map(TUSHARE_STAGE_LABELS).fillna(
-        out["integration_stage"]
+    out["阶段"] = (
+        out["integration_stage"].map(TUSHARE_STAGE_LABELS).fillna(out["integration_stage"])
     )
-    out["状态"] = out["integration_status"].map(TUSHARE_STATUS_LABELS).fillna(
-        out["integration_status"]
+    out["状态"] = (
+        out["integration_status"].map(TUSHARE_STATUS_LABELS).fillna(out["integration_status"])
     )
-    out["权限"] = out["permission_level"].map(TUSHARE_PERMISSION_LABELS).fillna(
-        out["permission_level"]
+    out["权限"] = (
+        out["permission_level"].map(TUSHARE_PERMISSION_LABELS).fillna(out["permission_level"])
     )
     out["路径"] = out["category_path"].apply(lambda value: " > ".join(_decode_json_list(value)))
     out["能力"] = out["capability_tags"].apply(lambda value: "、".join(_decode_json_list(value)))

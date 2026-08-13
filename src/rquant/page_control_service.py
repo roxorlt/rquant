@@ -136,9 +136,7 @@ def build_page_control_service_with_dependencies(
     if allowed_lab_export_roots is None:
         configured_roots = os.environ.get("RQUANT_PAGE_CONTROL_ALLOWED_EXPORT_ROOTS", "")
         allowed_roots = tuple(
-            Path(value.strip())
-            for value in configured_roots.split(os.pathsep)
-            if value.strip()
+            Path(value.strip()) for value in configured_roots.split(os.pathsep) if value.strip()
         ) or (settings.lab_runtime_dir_resolved / "exports",)
     else:
         allowed_roots = allowed_lab_export_roots
@@ -237,7 +235,9 @@ def main(
     if page_profile.data_dir is None or page_profile.log_dir is None:
         raise ValueError("Canvas publication storage authority is missing from runtime profile")
     if page_profile.page_projection_canvas_catalog_root != page_profile.data_dir / "canvases":
-        raise ValueError("Canvas catalog root must remain derived from the PageControl data directory")
+        raise ValueError(
+            "Canvas catalog root must remain derived from the PageControl data directory"
+        )
     canvas_profile = page_profile.canvas_publication
     if profile.runtime_mode == "linux-production" and (
         canvas_profile.signer_command != PRODUCTION_CANVAS_SIGNER_COMMAND

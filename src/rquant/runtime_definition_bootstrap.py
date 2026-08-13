@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime
 from pathlib import Path
 from typing import Literal, Self
 
@@ -23,7 +22,6 @@ from rquant.runtime_contracts import (
     canonical_sha256,
 )
 from rquant.strategy_evaluators import BuiltinStrategyEvaluatorRegistry
-
 
 StrategyId = Literal["n_shape", "growth_board_surge", "auction_gap"]
 _FEATURE_CONTRACT_ID = "intraday-pit"
@@ -289,7 +287,8 @@ def bootstrap_builtin_definitions(
                 "published strategy definition differs from bootstrap plan: "
                 f"{definition.strategy_id} "
                 f"registration={record.fingerprint == planned.registration_fingerprint} "
-                f"candidate={record.candidate_schema_fingerprint == planned.candidate_schema_fingerprint} "
+                f"candidate="
+                f"{record.candidate_schema_fingerprint == planned.candidate_schema_fingerprint} "
                 f"executable={record.executable_fingerprint == planned.executable_fingerprint}"
             )
     return plan
