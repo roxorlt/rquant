@@ -28,6 +28,31 @@ CANONICAL_STRICT_JSON = ROOT / "src" / "rquant" / "strict_json.py"
 CONTAINED_SUBPROCESS = ROOT / "src" / "rquant" / "contained_subprocess.py"
 STRICT_JSON = ROOT / "scripts" / "strict_json.py"
 _ORIGINAL_OS_WALK = os.walk
+_PREFLIGHT_PATH_ENVIRONMENT_KEYS = frozenset(
+    {
+        "DATA_DIR",
+        "LAB_RUNTIME_DIR",
+        "LAB_JOBS_PATH",
+        "LAB_JOB_COMMAND_DIR",
+        "LAB_JOB_CLAIM_DIR",
+        "LAB_JOB_REPORT_DIR",
+        "LAB_WORKER_ARTIFACT_DIR",
+        "LAB_FINAL_ARTIFACT_DIR",
+        "LAB_ARTIFACT_COMMIT_DIR",
+        "LAB_DAEMON_LOCK_DIR",
+        "LAB_FINALIZER_STATE_DIR",
+        "LAB_READINESS_DIR",
+    }
+)
+_WRAPPER_CHILD_OS_ENVIRONMENT_KEYS = frozenset(
+    {"HOME", "LANG", "PATH", "TEMP", "TMP", "TMPDIR", "TZ"}
+)
+_WRAPPER_CHILD_TEST_ENVIRONMENT_KEYS = frozenset(
+    {"LAB_WRAPPER_HOLD_SECONDS", "RQUANT_RELEASE_GENERATION_MIN_FREE_BYTES"}
+)
+_WRAPPER_PYTHON_INJECTION_ENVIRONMENT_KEYS = frozenset(
+    {"PYTHONHOME", "PYTHONINSPECT", "PYTHONPATH", "PYTHONSTARTUP"}
+)
 
 
 @pytest.mark.parametrize("script", (WRAPPER, BOOTSTRAP, ROOT / "src" / "rquant" / "lab_daemon.py"))
@@ -555,17 +580,36 @@ def _handoff_payload(
     }
 
 
+def _wrapper_child_environment(marker: Path) -> dict[str, str]:
+    controlled_path_keys = {key.casefold() for key in _PREFLIGHT_PATH_ENVIRONMENT_KEYS}
+    allowed_keys = _WRAPPER_CHILD_OS_ENVIRONMENT_KEYS | _WRAPPER_CHILD_TEST_ENVIRONMENT_KEYS
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if (key in allowed_keys or key.startswith("LC_"))
+        and key.casefold() not in controlled_path_keys
+    }
+    environment["LAB_WRAPPER_MARKER"] = str(marker)
+    environment["LAB_RUNTIME_IDENTITY_MARKER"] = str(marker.with_suffix(".runtime.json"))
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    return environment
+
+
+def _remove_wrapper_controlled_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    controlled_path_keys = {key.casefold() for key in _PREFLIGHT_PATH_ENVIRONMENT_KEYS}
+    for key in tuple(os.environ):
+        if (
+            key in _WRAPPER_PYTHON_INJECTION_ENVIRONMENT_KEYS
+            or key.casefold() in controlled_path_keys
+        ):
+            monkeypatch.delenv(key, raising=False)
+
+
 def _run_wrapper(
     checkout: Path,
     executable: Path,
     marker: Path,
 ) -> subprocess.CompletedProcess[str]:
-    environment = os.environ.copy()
-    for variable in ("PYTHONHOME", "PYTHONINSPECT", "PYTHONPATH", "PYTHONSTARTUP"):
-        environment.pop(variable, None)
-    environment["LAB_WRAPPER_MARKER"] = str(marker)
-    environment["LAB_RUNTIME_IDENTITY_MARKER"] = str(marker.with_suffix(".runtime.json"))
-    environment["PYTHONDONTWRITEBYTECODE"] = "1"
     return subprocess.run(
         [
             str(checkout / ".venv" / "bin" / "python"),
@@ -590,7 +634,7 @@ def _run_wrapper(
             "--once",
         ],
         cwd=checkout,
-        env=environment,
+        env=_wrapper_child_environment(marker),
         capture_output=True,
         text=True,
         check=False,
@@ -623,6 +667,31 @@ def test_lab_runtime_wrapper_runs_preflight_before_daemon_exec(tmp_path: Path) -
     assert runtime["prefix"] != str(checkout / ".venv")
 
 
+def test_lab_runtime_wrapper_ignores_ambient_preflight_path_overrides(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkout, executable, marker = _runtime_checkout(tmp_path)
+    ambient_root = tmp_path / "unrelated-ambient-paths"
+    ambient_root.mkdir()
+    for index, key in enumerate(sorted(_PREFLIGHT_PATH_ENVIRONMENT_KEYS)):
+        environment_key = key.lower() if index % 2 else key.title()
+        monkeypatch.setenv(environment_key, str(ambient_root / key.lower()))
+
+    child_environment = _wrapper_child_environment(marker)
+    assert not {key.casefold() for key in child_environment}.intersection(
+        key.casefold() for key in _PREFLIGHT_PATH_ENVIRONMENT_KEYS
+    )
+    assert "TUSHARE_TOKEN_MAIN" not in child_environment
+
+    result = _run_wrapper(checkout, executable, marker)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Lab runtime preflight:" in result.stdout
+    assert "fake daemon executed" in result.stdout
+    assert marker.is_file()
+
+
 def test_immutable_generation_wrapper_ignores_mutated_checkout_code(tmp_path: Path) -> None:
     checkout, _executable, _marker = _runtime_checkout(
         tmp_path,
@@ -642,16 +711,7 @@ def test_immutable_generation_wrapper_ignores_mutated_checkout_code(tmp_path: Pa
     generation = Path(str(published["venv_path"]))
     code_root = generation / "release"
     checkout.rename(tmp_path / "removed-checkout")
-    environment = os.environ.copy()
-    for variable in ("PYTHONHOME", "PYTHONINSPECT", "PYTHONPATH", "PYTHONSTARTUP"):
-        environment.pop(variable, None)
-    environment.update(
-        {
-            "LAB_WRAPPER_MARKER": str(marker),
-            "LAB_RUNTIME_IDENTITY_MARKER": str(marker.with_suffix(".runtime.json")),
-            "PYTHONDONTWRITEBYTECODE": "1",
-        }
-    )
+    environment = _wrapper_child_environment(marker)
 
     result = subprocess.run(
         [
@@ -1028,16 +1088,8 @@ def test_running_daemon_holds_one_complete_generation_against_deployment(
     import fcntl
 
     checkout, executable, marker = _runtime_checkout(tmp_path)
-    environment = os.environ.copy()
-    for variable in ("PYTHONHOME", "PYTHONINSPECT", "PYTHONPATH", "PYTHONSTARTUP"):
-        environment.pop(variable, None)
-    environment.update(
-        {
-            "LAB_WRAPPER_MARKER": str(marker),
-            "LAB_WRAPPER_HOLD_SECONDS": "1.0",
-            "PYTHONDONTWRITEBYTECODE": "1",
-        }
-    )
+    environment = _wrapper_child_environment(marker)
+    environment["LAB_WRAPPER_HOLD_SECONDS"] = "1.0"
     process = subprocess.Popen(
         [
             str(checkout / ".venv" / "bin" / "python"),
@@ -1160,8 +1212,7 @@ def test_lab_runtime_wrapper_rejects_executable_inode_replacement_during_preflig
     monkeypatch.setattr(os, "execv", lambda *args: exec_calls.append(args))
     monkeypatch.setattr(sys, "executable", str(checkout / ".venv" / "bin" / "python"))
     monkeypatch.chdir(checkout)
-    for variable in ("PYTHONHOME", "PYTHONINSPECT", "PYTHONPATH", "PYTHONSTARTUP"):
-        monkeypatch.delenv(variable, raising=False)
+    _remove_wrapper_controlled_environment(monkeypatch)
 
     result = namespace["main"](
         [
@@ -1219,8 +1270,7 @@ def test_lab_runtime_wrapper_rechecks_tracked_cleanliness_after_preflight(
     monkeypatch.setattr(os, "execv", lambda *args: exec_calls.append(args))
     monkeypatch.setattr(sys, "executable", str(checkout / ".venv" / "bin" / "python"))
     monkeypatch.chdir(checkout)
-    for variable in ("PYTHONHOME", "PYTHONINSPECT", "PYTHONPATH", "PYTHONSTARTUP"):
-        monkeypatch.delenv(variable, raising=False)
+    _remove_wrapper_controlled_environment(monkeypatch)
 
     result = namespace["main"](
         [
@@ -1283,8 +1333,7 @@ def test_lab_runtime_wrapper_rechecks_complete_checkout_after_second_preflight(
     monkeypatch.setattr(os, "execv", lambda *args: exec_calls.append(args))
     monkeypatch.setattr(sys, "executable", str(checkout / ".venv" / "bin" / "python"))
     monkeypatch.chdir(checkout)
-    for variable in ("PYTHONHOME", "PYTHONINSPECT", "PYTHONPATH", "PYTHONSTARTUP"):
-        monkeypatch.delenv(variable, raising=False)
+    _remove_wrapper_controlled_environment(monkeypatch)
 
     result = namespace["main"](
         [
@@ -1330,12 +1379,8 @@ def test_lab_runtime_wrapper_ignores_fake_venv_git(
         "UNTRUSTED = True\n",
         encoding="utf-8",
     )
-    environment = os.environ.copy()
-    for variable in ("PYTHONHOME", "PYTHONINSPECT", "PYTHONPATH", "PYTHONSTARTUP"):
-        environment.pop(variable, None)
+    environment = _wrapper_child_environment(marker)
     environment["PATH"] = f"{fake_git.parent}:{environment.get('PATH', '')}"
-    environment["LAB_WRAPPER_MARKER"] = str(marker)
-    environment["PYTHONDONTWRITEBYTECODE"] = "1"
 
     result = subprocess.run(
         [
@@ -1414,10 +1459,7 @@ def test_lab_runtime_wrapper_rejects_mismatched_daemon_root(tmp_path: Path) -> N
     checkout, executable, marker = _runtime_checkout(tmp_path)
     other = tmp_path / "other"
     other.mkdir()
-    environment = os.environ.copy()
-    for variable in ("PYTHONHOME", "PYTHONINSPECT", "PYTHONPATH", "PYTHONSTARTUP"):
-        environment.pop(variable, None)
-    environment["LAB_WRAPPER_MARKER"] = str(marker)
+    environment = _wrapper_child_environment(marker)
 
     result = subprocess.run(
         [
