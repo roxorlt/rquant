@@ -425,17 +425,92 @@ def test_scheduler_observes_reconcile_required_source_stage_without_new_side_eff
 
 def test_scheduler_reports_redacted_stable_reason_after_source_stage_root_replacement(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     pending = _pending_source_stage(tmp_path)
+    assert pending.scheduler.lease is not None
+    next_envelope = LabCommandEnvelope(
+        request_id=uuid4(),
+        command=SubmitJobCommand(
+            job_id=uuid4(),
+            spec=_spec(deadline=pending.current + timedelta(minutes=5)),
+            max_attempts=1,
+        ),
+    )
+    assert (
+        pending.store.apply_command(
+            next_envelope,
+            lease=pending.scheduler.lease,
+            now=pending.current,
+        ).status
+        == "applied"
+    )
+    _payload, next_source_claim = authorized_payload_and_claim(
+        now=pending.current,
+        shard_index=0,
+    )
+    pending.store.plan_job(
+        next_envelope.command.job_id,
+        (next_source_claim.definition,),
+        lease=pending.scheduler.lease,
+        now=pending.current,
+    )
+    tracked_job_ids = (pending.binding.job_id, next_envelope.command.job_id)
+    before_jobs = tuple(
+        LabJobReader(pending.store.path).get_job(job_id) for job_id in tracked_job_ids
+    )
+    before_shards = tuple(
+        LabJobReader(pending.store.path).list_shards(job_id) for job_id in tracked_job_ids
+    )
+    before_publication = pending.store.get_claim_publication(pending.claim_token)  # type: ignore[arg-type]
+    assert before_publication is not None
+    before_publication_audit = pending.store.list_claim_publication_audit(  # type: ignore[arg-type]
+        pending.claim_token
+    )
+    with sqlite3.connect(pending.store.path) as connection:
+        before_publication_rows = tuple(
+            connection.execute("SELECT * FROM lab_claim_publication ORDER BY attempt_id").fetchall()
+        )
+        before_publication_audit_rows = tuple(
+            connection.execute(
+                "SELECT * FROM lab_claim_publication_audit ORDER BY occurred_at, audit_ref"
+            ).fetchall()
+        )
+        before_cursor_rows = tuple(
+            connection.execute("SELECT * FROM lab_scheduler_state ORDER BY state_key").fetchall()
+        )
+        before_fair_cursor_rows = tuple(
+            connection.execute(
+                "SELECT * FROM lab_preclaim_fair_cursor ORDER BY singleton"
+            ).fetchall()
+        )
+    with sqlite3.connect(pending.queue_path) as connection:
+        before_queue_rows = tuple(
+            connection.execute(
+                "SELECT * FROM source_broker_v2_jobs ORDER BY operation_id"
+            ).fetchall()
+        )
+    before_spool = pending.claim_spool.pending()
     stage_path = pending.stage_store.path
+    writer = pending.scheduler._source_stage_lease  # noqa: SLF001
+    assert writer is not None
     for candidate in (stage_path, Path(f"{stage_path}-wal"), Path(f"{stage_path}-shm")):
         candidate.unlink(missing_ok=True)
-    LabSourceStageStore(
+    replacement = LabSourceStageStore(
         stage_path,
         queue_store_path=pending.queue_path,
         manifest_keyring=authorities().authorization_keyring,
         authorization_keyring=authorities().authorization_keyring,
     )
+    source_selection_calls = 0
+    claim_next_source_stage = pending.store.claim_next_source_stage
+
+    def count_source_selection(**kwargs: object) -> object:
+        nonlocal source_selection_calls
+        source_selection_calls += 1
+        return claim_next_source_stage(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(pending.store, "claim_next_source_stage", count_source_selection)
     records: list[dict[str, object]] = []
     sink_id = logger.add(lambda message: records.append(message.record), level="WARNING")
     try:
@@ -444,6 +519,63 @@ def test_scheduler_reports_redacted_stable_reason_after_source_stage_root_replac
         logger.remove(sink_id)
 
     assert tick.source_stage_reconcile_required == 1
+    assert source_selection_calls == 1
+    assert (
+        tuple(LabJobReader(pending.store.path).get_job(job_id) for job_id in tracked_job_ids)
+        == before_jobs
+    )
+    assert (
+        tuple(LabJobReader(pending.store.path).list_shards(job_id) for job_id in tracked_job_ids)
+        == before_shards
+    )
+    assert pending.store.get_claim_publication(pending.claim_token) == before_publication  # type: ignore[arg-type]
+    assert (
+        pending.store.list_claim_publication_audit(pending.claim_token) == before_publication_audit
+    )  # type: ignore[arg-type]
+    with sqlite3.connect(pending.store.path) as connection:
+        assert (
+            tuple(
+                connection.execute(
+                    "SELECT * FROM lab_claim_publication ORDER BY attempt_id"
+                ).fetchall()
+            )
+            == before_publication_rows
+        )
+        assert (
+            tuple(
+                connection.execute(
+                    "SELECT * FROM lab_claim_publication_audit ORDER BY occurred_at, audit_ref"
+                ).fetchall()
+            )
+            == before_publication_audit_rows
+        )
+        assert (
+            tuple(
+                connection.execute(
+                    "SELECT * FROM lab_scheduler_state ORDER BY state_key"
+                ).fetchall()
+            )
+            == before_cursor_rows
+        )
+        assert (
+            tuple(
+                connection.execute(
+                    "SELECT * FROM lab_preclaim_fair_cursor ORDER BY singleton"
+                ).fetchall()
+            )
+            == before_fair_cursor_rows
+        )
+    with sqlite3.connect(pending.queue_path) as connection:
+        assert (
+            tuple(
+                connection.execute(
+                    "SELECT * FROM source_broker_v2_jobs ORDER BY operation_id"
+                ).fetchall()
+            )
+            == before_queue_rows
+        )
+    assert pending.claim_spool.pending() == before_spool
+    assert replacement.get(pending.binding) is None
     matched = [
         record
         for record in records
@@ -452,10 +584,13 @@ def test_scheduler_reports_redacted_stable_reason_after_source_stage_root_replac
     assert len(matched) == 1
     context = matched[0]["extra"]
     assert context["reason"] == "source_stage_missing"
-    assert str(stage_path) not in str(matched[0]["message"])
-    writer = pending.scheduler._source_stage_lease  # noqa: SLF001
-    assert writer is not None
-    assert str(writer.token) not in str(matched[0])
+    assert context["job_id"] == str(pending.binding.job_id)
+    assert context["shard_id"] == str(pending.binding.shard_id)
+    assert context["claim_token"] == str(pending.claim_token)
+    logged = "\n".join(str(record) for record in records)
+    assert str(stage_path) not in logged
+    assert before_publication.source_stage_authority_hash not in logged
+    assert str(writer.token) not in logged
 
 
 def test_scheduler_observes_runner_ready_stage_without_publishing_worker_claim(

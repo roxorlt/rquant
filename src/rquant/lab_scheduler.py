@@ -2056,18 +2056,21 @@ class LabScheduler:
                 authority_now = mutation_now
                 deadlines_expired += self._expire_deadlines(lease, observed_at=mutation_now)
                 self._verify_runtime()
-                selection = self.store.claim_next_source_stage(
-                    shard_lease_seconds=self.shard_lease_seconds,
-                    lease=lease,
-                    now=mutation_now,
-                    source_stage_store=self.source_stage_store,
-                    source_wait_deadline=mutation_now
-                    + timedelta(seconds=self.source_wait_timeout_seconds),
-                    publication_deadline=mutation_now
-                    + timedelta(seconds=self.publication_timeout_seconds),
-                    v2_precondition=self._v2_preclaim_precondition(captured_now=mutation_now),
-                    include_diagnostics=True,
-                )
+                try:
+                    selection = self.store.claim_next_source_stage(
+                        shard_lease_seconds=self.shard_lease_seconds,
+                        lease=lease,
+                        now=mutation_now,
+                        source_stage_store=self.source_stage_store,
+                        source_wait_deadline=mutation_now
+                        + timedelta(seconds=self.source_wait_timeout_seconds),
+                        publication_deadline=mutation_now
+                        + timedelta(seconds=self.publication_timeout_seconds),
+                        v2_precondition=self._v2_preclaim_precondition(captured_now=mutation_now),
+                        include_diagnostics=True,
+                    )
+                except LabSourceStageAuthorityError:
+                    break
                 assert isinstance(selection, LabClaimSelection)
                 preclaim_blocked += len(selection.rejections)
                 for rejection in selection.rejections:
