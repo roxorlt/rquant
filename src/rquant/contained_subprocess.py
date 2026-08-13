@@ -1985,11 +1985,14 @@ class _LinuxSubreaperProcessTracker:
         self._pending_pidfds: list[int] = []
         self._root_pid: int | None = None
         self._root_started: tuple[int, int] | None = None
+        self._root_identity: ProcessIdentity | None = None
         self._previous_subreaper = 0
         self._owns_subreaper_lock = False
         self._subreaper_changed = False
         self._subreaper_owner: _LinuxSubreaperProcessTracker | None = None
         self._subreaper_depth = 0
+        self._nested_trackers: set[_LinuxSubreaperProcessTracker] = set()
+        self._excluded_ancestor_roots: set[ProcessIdentity] = set()
 
     def _enable_subreaper(self, deadline: float) -> None:
         _require_no_execution_hooks()
@@ -1997,6 +2000,7 @@ class _LinuxSubreaperProcessTracker:
         if owner is not None:
             owner._subreaper_depth += 1
             self._subreaper_owner = owner
+            owner._nested_trackers.add(self)
             return
         remaining = deadline - time.monotonic()
         if remaining <= 0 or not _LINUX_SUBREAPER_LOCK.acquire(timeout=remaining):
@@ -2071,6 +2075,14 @@ class _LinuxSubreaperProcessTracker:
             raise ContainedProcessError("kernel root registration failed")
         self._root_pid = pid
         self._root_started = observed.identity.started
+        self._root_identity = observed.identity
+        owner = self._subreaper_owner
+        if owner is not None and owner is not self:
+            self._excluded_ancestor_roots = {
+                tracker._root_identity
+                for tracker in (owner, *owner._nested_trackers)
+                if tracker is not self and tracker._root_identity is not None
+            }
         self._bind_pid(observed.identity)
         return observed.identity
 
@@ -2082,7 +2094,8 @@ class _LinuxSubreaperProcessTracker:
         descendants = _discover_descendants(self._root_pid, inventory, self._known)
         for observation in inventory.values():
             if (
-                observation.parent_pid == os.getpid()
+                observation.identity not in self._excluded_ancestor_roots
+                and observation.parent_pid == os.getpid()
                 and observation.identity.started >= self._root_started
             ):
                 descendants[observation.identity.pid] = observation.identity
@@ -2143,6 +2156,7 @@ class _LinuxSubreaperProcessTracker:
             else:
                 owner._subreaper_depth -= 1
                 self._subreaper_owner = None
+                owner._nested_trackers.discard(self)
         elif self._owns_subreaper_lock:
             if owner is self and self._subreaper_depth != 1:
                 _record_cleanup_error(
@@ -2647,8 +2661,14 @@ def run_contained(
     Passing ``False`` is therefore a caller guarantee that the command does not
     intentionally daemonize; it is not a stronger Darwin kernel guarantee.
     Active trace or profile hooks are rejected before containment acquires resources.
+    The caller must be the Python main thread because containment owns process signal
+    handlers for its full lifetime.
     """
 
+    if threading.current_thread() is not threading.main_thread():
+        raise ContainedProcessError(
+            "contained subprocess execution requires the Python main thread"
+        )
     _require_no_execution_hooks()
     remaining = deadline_monotonic - clock()
     if remaining <= 0:

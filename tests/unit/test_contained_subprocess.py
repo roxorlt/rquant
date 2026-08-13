@@ -6511,6 +6511,270 @@ def test_nested_run_restores_outer_then_original_signal_handlers(tmp_path: Path)
     assert {signum: signal.getsignal(signum) for signum in before} == before
 
 
+def _linux_subreaper_state() -> int:
+    libc = ctypes.CDLL(None, use_errno=True)
+    current = ctypes.c_int()
+    if (
+        libc.prctl(
+            contained._LinuxSubreaperProcessTracker._PR_GET_CHILD_SUBREAPER,
+            ctypes.byref(current),
+            0,
+            0,
+            0,
+        )
+        != 0
+    ):
+        raise OSError(ctypes.get_errno(), "could not read Linux child subreaper state")
+    return int(current.value)
+
+
+def _contained_signal_handlers() -> dict[int, object]:
+    return {signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)}
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux containment lifecycle")
+def test_linux_run_contained_rejects_non_main_thread_before_spawn(tmp_path: Path) -> None:
+    marker = tmp_path / "non-main-thread-spawned"
+    failures: list[BaseException] = []
+
+    def invoke() -> None:
+        try:
+            contained.run_contained(
+                [sys.executable, "-c", f"from pathlib import Path; Path({str(marker)!r}).touch()"],
+                cwd=tmp_path,
+                deadline_monotonic=time.monotonic() + 2,
+                may_spawn_background_descendants=False,
+            )
+        except BaseException as exc:
+            failures.append(exc)
+
+    worker = threading.Thread(target=invoke)
+    worker.start()
+    worker.join(timeout=3)
+
+    assert not worker.is_alive()
+    assert len(failures) == 1
+    assert isinstance(failures[0], contained.ContainedProcessError)
+    assert "main thread" in str(failures[0])
+    assert not marker.exists()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux containment lifecycle")
+def test_linux_run_contained_two_level_inner_failure_restores_boundary(tmp_path: Path) -> None:
+    before_subreaper = _linux_subreaper_state()
+    before_handlers = _contained_signal_handlers()
+    entered = False
+
+    def invoke_inner() -> bool:
+        nonlocal entered
+        if entered:
+            return False
+        entered = True
+        with pytest.raises(subprocess.CalledProcessError):
+            contained.run_contained(
+                [sys.executable, "-c", "import sys; sys.exit(23)"],
+                cwd=tmp_path,
+                deadline_monotonic=time.monotonic() + 3,
+                check=True,
+                may_spawn_background_descendants=False,
+            )
+        return False
+
+    completed = contained.run_contained(
+        [sys.executable, "-c", "pass"],
+        cwd=tmp_path,
+        deadline_monotonic=time.monotonic() + 5,
+        cancellation_check=invoke_inner,
+        check=True,
+        may_spawn_background_descendants=False,
+    )
+
+    assert completed.returncode == 0
+    assert entered
+    assert _linux_subreaper_state() == before_subreaper
+    assert _contained_signal_handlers() == before_handlers
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux containment lifecycle")
+def test_linux_run_contained_three_level_outer_failure_restores_boundary(tmp_path: Path) -> None:
+    before_subreaper = _linux_subreaper_state()
+    before_handlers = _contained_signal_handlers()
+    entered_middle = False
+    entered_inner = False
+
+    def invoke_inner() -> bool:
+        nonlocal entered_inner
+        if entered_inner:
+            return False
+        entered_inner = True
+        completed = contained.run_contained(
+            [sys.executable, "-c", "pass"],
+            cwd=tmp_path,
+            deadline_monotonic=time.monotonic() + 2,
+            check=True,
+            may_spawn_background_descendants=False,
+        )
+        assert completed.returncode == 0
+        raise RuntimeError("middle containment failure")
+
+    def invoke_middle() -> bool:
+        nonlocal entered_middle
+        if entered_middle:
+            return False
+        entered_middle = True
+        with pytest.raises(RuntimeError, match="middle containment failure"):
+            contained.run_contained(
+                [sys.executable, "-c", "pass"],
+                cwd=tmp_path,
+                deadline_monotonic=time.monotonic() + 3,
+                cancellation_check=invoke_inner,
+                check=True,
+                may_spawn_background_descendants=False,
+            )
+        raise RuntimeError("outer containment failure")
+
+    with pytest.raises(RuntimeError, match="outer containment failure"):
+        contained.run_contained(
+            [sys.executable, "-c", "pass"],
+            cwd=tmp_path,
+            deadline_monotonic=time.monotonic() + 5,
+            cancellation_check=invoke_middle,
+            check=True,
+            may_spawn_background_descendants=False,
+        )
+
+    assert entered_middle
+    assert entered_inner
+    assert _linux_subreaper_state() == before_subreaper
+    assert _contained_signal_handlers() == before_handlers
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux containment lifecycle")
+def test_linux_nested_inner_timeout_preserves_outer_cleanup_boundary(tmp_path: Path) -> None:
+    before_subreaper = _linux_subreaper_state()
+    before_handlers = _contained_signal_handlers()
+    entered = False
+
+    def invoke_inner() -> bool:
+        nonlocal entered
+        if entered:
+            return False
+        entered = True
+        with pytest.raises(subprocess.TimeoutExpired):
+            contained.run_contained(
+                [sys.executable, "-c", "import time; time.sleep(10)"],
+                cwd=tmp_path,
+                deadline_monotonic=time.monotonic() + 0.6,
+                may_spawn_background_descendants=False,
+            )
+        return False
+
+    completed = contained.run_contained(
+        [sys.executable, "-c", "pass"],
+        cwd=tmp_path,
+        deadline_monotonic=time.monotonic() + 5,
+        cancellation_check=invoke_inner,
+        check=True,
+        may_spawn_background_descendants=False,
+    )
+
+    assert completed.returncode == 0
+    assert entered
+    assert _linux_subreaper_state() == before_subreaper
+    assert _contained_signal_handlers() == before_handlers
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux containment lifecycle")
+def test_linux_nested_detached_child_cleanup_preserves_outer_boundary(tmp_path: Path) -> None:
+    marker = tmp_path / "detached-child-marker"
+    before_subreaper = _linux_subreaper_state()
+    before_handlers = _contained_signal_handlers()
+    entered = False
+    detached = (
+        "import subprocess,sys,time; "
+        "subprocess.Popen([sys.executable,'-c',"
+        "\"import pathlib,sys,time;time.sleep(.3);pathlib.Path(sys.argv[1]).write_text('x')\","
+        "sys.argv[1]],start_new_session=True);time.sleep(.05)"
+    )
+
+    def invoke_inner() -> bool:
+        nonlocal entered
+        if entered:
+            return False
+        entered = True
+        with pytest.raises(contained.ContainedProcessError):
+            contained.run_contained(
+                [sys.executable, "-c", detached, str(marker)],
+                cwd=tmp_path,
+                deadline_monotonic=time.monotonic() + 3,
+                check=True,
+                may_spawn_background_descendants=True,
+            )
+        return False
+
+    completed = contained.run_contained(
+        [sys.executable, "-c", "pass"],
+        cwd=tmp_path,
+        deadline_monotonic=time.monotonic() + 5,
+        cancellation_check=invoke_inner,
+        check=True,
+        may_spawn_background_descendants=False,
+    )
+
+    time.sleep(0.5)
+    assert completed.returncode == 0
+    assert entered
+    assert not marker.exists()
+    assert _linux_subreaper_state() == before_subreaper
+    assert _contained_signal_handlers() == before_handlers
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux subreaper concurrency")
+def test_linux_real_subreaper_tracker_serializes_two_threads() -> None:
+    before_subreaper = _linux_subreaper_state()
+    first_enabled = threading.Event()
+    release_first = threading.Event()
+    second_enabled = threading.Event()
+    failures: list[BaseException] = []
+
+    def first() -> None:
+        tracker = contained._LinuxSubreaperProcessTracker()
+        try:
+            tracker._enable_subreaper(time.monotonic() + 3)
+            first_enabled.set()
+            assert release_first.wait(timeout=2)
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            tracker.close()
+
+    def second() -> None:
+        tracker = contained._LinuxSubreaperProcessTracker()
+        try:
+            assert first_enabled.wait(timeout=2)
+            tracker._enable_subreaper(time.monotonic() + 3)
+            second_enabled.set()
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            tracker.close()
+
+    first_thread = threading.Thread(target=first)
+    second_thread = threading.Thread(target=second)
+    first_thread.start()
+    second_thread.start()
+    assert first_enabled.wait(timeout=2)
+    assert not second_enabled.wait(timeout=0.1)
+    release_first.set()
+    first_thread.join(timeout=4)
+    second_thread.join(timeout=4)
+
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert failures == []
+    assert _linux_subreaper_state() == before_subreaper
+
+
 def test_cleanup_permission_error_does_not_skip_root_reap(monkeypatch) -> None:
     class Process(_FinishedProcess):
         communicated = False
