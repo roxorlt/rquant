@@ -5,7 +5,11 @@ from __future__ import annotations
 from decimal import Decimal
 
 from rquant.paper_broker import BrokerCostPolicy
-from rquant.research_run_spec import ExecutionCostSpec, InstrumentContext
+from rquant.research_run_spec import (
+    ExecutionCostSpec,
+    InstrumentClassificationProvenance,
+    InstrumentContext,
+)
 
 
 def paper_execution_cost_spec(
@@ -17,6 +21,7 @@ def paper_execution_cost_spec(
     buy_slippage_bps: Decimal = Decimal("0"),
     sell_slippage_bps: Decimal = Decimal("0"),
     engine_version: str = "test-paper-cost-engine-v3",
+    price_tick: Decimal = Decimal("0.0001"),
 ) -> ExecutionCostSpec:
     selectors = (
         ("cn-sse-a-share", "SSE"),
@@ -72,7 +77,7 @@ def paper_execution_cost_spec(
                 "owner": "shared_cost_engine",
                 "buy_bps": str(buy_slippage_bps),
                 "sell_bps": str(sell_slippage_bps),
-                "price_tick": "0.0001",
+                "price_tick": str(price_tick),
                 "price_rounding": "HALF_UP",
             },
             "money": {"quantum": "0.01", "rounding": "HALF_UP"},
@@ -98,4 +103,9 @@ def paper_instrument_context(ts_code: str = "600000.SH") -> InstrumentContext:
         exchange=exchange,
         instrument_class="EQUITY",
         security_class="A_SHARE",
+        classification_provenance=InstrumentClassificationProvenance(
+            reference_dataset="security_listing_status",
+            reference_record_id="a" * 64,
+            reference_generation_id="b" * 64,
+        ),
     )

@@ -39,7 +39,11 @@ NEXT_TRADE_DAY = date(2026, 8, 3)
 T0931 = datetime(2026, 7, 31, 1, 31, tzinfo=UTC)
 
 
-def _signal(action: SignalAction = SignalAction.B_INTENT) -> SignalEnvelope:
+def _signal(
+    action: SignalAction = SignalAction.B_INTENT,
+    *,
+    candidate_id: str = CODE,
+) -> SignalEnvelope:
     return SignalEnvelope(
         schema_version=1,
         strategy_id="n-shape",
@@ -49,7 +53,7 @@ def _signal(action: SignalAction = SignalAction.B_INTENT) -> SignalEnvelope:
         feature_snapshot_id="d" * 64,
         event_time=T0931,
         available_at=T0931 + timedelta(seconds=2),
-        candidate_id=CODE,
+        candidate_id=candidate_id,
         action=action,
         reason_codes=("paper-pit",),
         evidence={},
@@ -148,6 +152,8 @@ def _write_constraints(
     sequence: int = 1,
     available_at: datetime = T0931 - timedelta(minutes=1),
     published_at: datetime = T0931 - timedelta(minutes=1),
+    instrument_context: dict[str, object] | None = None,
+    include_instrument_context: bool = True,
 ) -> tuple[Path, str]:
     tmp_path.mkdir(parents=True, exist_ok=True)
     constraint_payload: dict[str, object] = {
@@ -161,10 +167,20 @@ def _write_constraints(
         "risk_rejected": risk_rejected,
         "source_snapshot_ids": {
             "market_minute": "8" * 64,
-            "security_status": "9" * 64,
+            "reference_slow": "9" * 64,
+            "reference_listing": "7" * 64,
         },
         "producer_commit": COMMIT,
     }
+    constraint_payload["instrument_context"] = (
+        (
+            _attested_context(ts_code=constraint_code, exchange="SSE")
+            if instrument_context is None
+            else instrument_context
+        )
+        if include_instrument_context
+        else None
+    )
     constraint_payload["content_hash"] = canonical_sha256(constraint_payload)
     constraint = PaperExecutionConstraintSnapshot.model_validate(constraint_payload)
     batch_payload: dict[str, object] = {
@@ -197,6 +213,8 @@ def _resolver(
     buy_limit_locked: bool = False,
     sell_limit_locked: bool = False,
     risk_rejected: bool = False,
+    instrument_context: dict[str, object] | None = None,
+    include_instrument_context: bool = True,
 ) -> PaperPitQuoteResolver:
     tmp_path.mkdir(parents=True, exist_ok=True)
     calendar_path = tmp_path / "calendar.json"
@@ -209,6 +227,8 @@ def _resolver(
         buy_limit_locked=buy_limit_locked,
         sell_limit_locked=sell_limit_locked,
         risk_rejected=risk_rejected,
+        instrument_context=instrument_context,
+        include_instrument_context=include_instrument_context,
     )
     return PaperPitQuoteResolver(
         PaperQuoteResolverConfig(
@@ -223,6 +243,91 @@ def _resolver(
             max_visible_scan_batches=max_visible_scan_batches,
         )
     )
+
+
+def _attested_context(
+    *,
+    ts_code: str,
+    exchange: str,
+    instrument_class: str = "EQUITY",
+    security_class: str = "A_SHARE",
+) -> dict[str, object]:
+    return {
+        "ts_code": ts_code,
+        "market": "CN",
+        "exchange": exchange,
+        "instrument_class": instrument_class,
+        "security_class": security_class,
+        "classification_provenance": {
+            "reference_dataset": "security_listing_status",
+            "reference_record_id": "1" * 64,
+            "reference_generation_id": "2" * 64,
+        },
+    }
+
+
+def test_quote_requires_an_attested_a_share_context_and_never_infers_from_code(
+    tmp_path: Path,
+) -> None:
+    spool = LiveBatchSpool(tmp_path / "raw-spool")
+    _publish(spool, sequence=0, available_at=T0931, rows=[_minute_row()])
+
+    resolver = _resolver(
+        tmp_path / "valid",
+        spool,
+        instrument_context=_attested_context(ts_code=CODE, exchange="SSE"),
+    )
+    quote = resolver(_signal(), T0931)
+    assert quote.context.instrument_context.classification_provenance.reference_dataset == (
+        "security_listing_status"
+    )
+
+    unclassified_spool = LiveBatchSpool(tmp_path / "unclassified-spool")
+    _publish(unclassified_spool, sequence=0, available_at=T0931, rows=[_minute_row()])
+    with pytest.raises(PaperQuoteIntegrityError, match="classification"):
+        _resolver(
+            tmp_path / "unclassified",
+            unclassified_spool,
+            include_instrument_context=False,
+        )(_signal(), T0931)
+
+
+@pytest.mark.parametrize(
+    ("code", "exchange", "instrument_class", "security_class"),
+    [
+        ("510300.SH", "SSE", "FUND", "ETF"),
+        ("113001.SH", "SSE", "BOND", "CONVERTIBLE"),
+        ("159915.SZ", "SZSE", "FUND", "ETF"),
+    ],
+)
+def test_quote_rejects_attested_non_a_share_exchange_symbols(
+    tmp_path: Path,
+    code: str,
+    exchange: str,
+    instrument_class: str,
+    security_class: str,
+) -> None:
+    spool = LiveBatchSpool(tmp_path / "raw-spool")
+    _publish(
+        spool,
+        sequence=0,
+        available_at=T0931,
+        rows=[_minute_row(ts_code=code)],
+    )
+    resolver = _resolver(
+        tmp_path,
+        spool,
+        constraint_code=code,
+        instrument_context=_attested_context(
+            ts_code=code,
+            exchange=exchange,
+            instrument_class=instrument_class,
+            security_class=security_class,
+        ),
+    )
+
+    with pytest.raises(PaperQuoteIntegrityError, match="A_SHARE"):
+        resolver(_signal(candidate_id=code), T0931)
 
 
 def test_quote_carries_directional_execution_constraints_and_authority_evidence(
@@ -249,7 +354,8 @@ def test_quote_carries_directional_execution_constraints_and_authority_evidence(
     assert buy.constraint_authority_sha256 == pointer["file_sha256"]
     assert buy.constraint_source_snapshot_ids == {
         "market_minute": "8" * 64,
-        "security_status": "9" * 64,
+        "reference_slow": "9" * 64,
+        "reference_listing": "7" * 64,
     }
 
 

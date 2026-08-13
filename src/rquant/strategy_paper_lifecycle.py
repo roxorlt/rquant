@@ -755,7 +755,7 @@ class PaperBrokerLifecycleReader:
                 Decimal("0"),
             )
             / filled_quantity
-        ).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+        ).quantize(self._price_tick, rounding=ROUND_HALF_UP)
         entry_available = max(entry.intent_persisted_at, *fill_persisted_at.values())
         latest_available = max(entry_available, latest_available)
         return _RebuiltPosition(

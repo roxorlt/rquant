@@ -26,6 +26,12 @@ from rquant.paper_contracts import (
     PaperSide,
 )
 from rquant.strategy_paper_lifecycle import PaperBrokerLifecycleReader
+from tests.fixtures.paper_ledger_v4_fixture import (
+    LEGACY_ACCOUNT_ID,
+    archived_v4_rows,
+    create_parent_v4_fixture,
+    sha256_file,
+)
 from tests.paper_cost_fixtures import (
     paper_cost_policy,
     paper_execution_cost_spec,
@@ -153,6 +159,11 @@ def _replace_schema_metadata_with_v3(connection: sqlite3.Connection) -> None:
         DROP TRIGGER IF EXISTS paper_ledger_attestation_update_immutable;
         DROP TRIGGER IF EXISTS paper_ledger_attestation_delete_immutable;
         DROP TRIGGER IF EXISTS paper_ledger_attestation_delete_tamper;
+        DROP TABLE IF EXISTS paper_ledger_v4_archive_binding;
+        DROP TABLE IF EXISTS paper_ledger_schema_v4_archive;
+        DROP TABLE IF EXISTS paper_ledger_attestation_v4_archive;
+        DROP TABLE IF EXISTS paper_ledger_head_marker_v4_archive;
+        DROP TABLE IF EXISTS paper_ledger_tamper_marker_v4_archive;
         DROP TABLE IF EXISTS paper_ledger_head_marker;
         DROP TABLE IF EXISTS paper_ledger_tamper_marker;
         DROP TABLE IF EXISTS paper_ledger_attestation;
@@ -1848,65 +1859,51 @@ def test_v3_unknown_execution_evidence_quarantines_every_broker_write(
     assert _ledger_rows(path) == before
 
 
-def test_v4_migration_keeps_legacy_cost_evidence_null_and_requires_a_fresh_binding(
+def test_offline_v4_migration_keeps_legacy_cost_evidence_null_and_requires_a_fresh_binding(
     tmp_path: Path,
     cost_policy: BrokerCostPolicy,
 ) -> None:
-    new_store = _store(tmp_path / "new.sqlite3", cost_policy)
-    assert new_store.ledger_trust_status().state == "trusted"
+    source = create_parent_v4_fixture(tmp_path / "source.sqlite3")
+    candidate = tmp_path / "candidate.sqlite3"
+    paper_broker_module.migrate_paper_ledger_v4_offline_copy(source.path, candidate)
 
-    path = tmp_path / "migratable.sqlite3"
-    seeded = _store(path, cost_policy)
-    seeded.submit_intent(
-        _intent(),
-        execution_id="1" * 64,
-        decision_time=BUY_TIME,
-        trade_date=BUY_DATE,
-        quote=_quote("10.00"),
+    migrated = PaperBrokerStore(
+        candidate,
+        account_id=LEGACY_ACCOUNT_ID,
+        initial_cash=Decimal("10000.00"),
+        cost_policy=cost_policy,
     )
-    with sqlite3.connect(path) as connection:
-        before_account = connection.execute(
-            "SELECT cash, realized_pnl FROM broker_account WHERE account_id = ?",
-            (ACCOUNT_ID,),
-        ).fetchone()
-        _replace_schema_metadata_with_v3(connection)
-
-    migrated = _store(path, cost_policy)
     diagnostic = migrated.ledger_trust_status()
     assert diagnostic.state == "quarantined"
     unknown = {item.field: item.count for item in diagnostic.unknown_evidence}
-    assert unknown["unknown_cost_provenance_count"] == 3
-    with sqlite3.connect(path) as connection:
+    assert unknown["unknown_cost_provenance_count"] == 4
+    with sqlite3.connect(candidate) as connection:
         account = connection.execute(
             "SELECT cash, realized_pnl, cost_spec_id, cost_spec_schema_version, "
             "cost_provenance_state FROM broker_account WHERE account_id = ?",
-            (ACCOUNT_ID,),
+            (LEGACY_ACCOUNT_ID,),
         ).fetchone()
-        fill = connection.execute(
+        fills = connection.execute(
             "SELECT transfer_fee, total_fees, cost_spec_id, cost_spec_schema_version, "
-            "cost_context_fingerprint, cost_provenance_state FROM paper_fill"
-        ).fetchone()
-        receipt = connection.execute(
+            "cost_context_fingerprint, cost_provenance_state FROM paper_fill ORDER BY fill_id"
+        ).fetchall()
+        receipts = connection.execute(
             "SELECT transfer_fee, total_fees, cost_spec_id, cost_spec_schema_version, "
-            "cost_context_fingerprint, cost_provenance_state FROM paper_execution_receipt"
-        ).fetchone()
-        assert account == (*before_account, None, None, "LEGACY_UNKNOWN")
-        assert fill == (None, None, None, None, None, "LEGACY_UNKNOWN")
-        assert receipt == (None, None, None, None, None, "LEGACY_UNKNOWN")
-        assert (
-            connection.execute("SELECT COUNT(*) FROM paper_ledger_attestation").fetchone()[0] == 1
-        )
-        assert (
-            connection.execute("SELECT COUNT(*) FROM paper_ledger_head_marker").fetchone()[0] == 1
-        )
-        assert (
-            connection.execute("SELECT COUNT(*) FROM paper_ledger_tamper_marker").fetchone()[0] == 0
-        )
+            "cost_context_fingerprint, cost_provenance_state "
+            "FROM paper_execution_receipt ORDER BY execution_id"
+        ).fetchall()
+    assert account == ("8995.00", "0.00", None, None, "LEGACY_UNKNOWN")
+    assert fills == [(None, None, None, None, None, "LEGACY_UNKNOWN")]
+    assert receipts == [
+        (None, None, None, None, None, "LEGACY_UNKNOWN"),
+        (None, None, None, None, None, "LEGACY_UNKNOWN"),
+    ]
     with pytest.raises(PaperBrokerReconciliationError, match="audit-only"):
         migrated.submit_intent(
             _intent(
                 signal_seed="b",
                 event_time=BUY_TIME + timedelta(seconds=1),
+                account_id=LEGACY_ACCOUNT_ID,
             ),
             execution_id="2" * 64,
             decision_time=BUY_TIME + timedelta(seconds=2),
@@ -1915,7 +1912,7 @@ def test_v4_migration_keeps_legacy_cost_evidence_null_and_requires_a_fresh_bindi
         )
 
     fresh = PaperBrokerStore(
-        path,
+        candidate,
         account_id="paper-v5-fresh",
         initial_cash=Decimal("100000"),
         cost_policy=cost_policy,
@@ -1933,7 +1930,8 @@ def test_v4_migration_keeps_legacy_cost_evidence_null_and_requires_a_fresh_bindi
     )
     assert fresh.reconcile().order_count == 1
     assert (
-        PaperBrokerLifecycleReader(path, account_id="paper-v5-fresh").account_id == "paper-v5-fresh"
+        PaperBrokerLifecycleReader(candidate, account_id="paper-v5-fresh").account_id
+        == "paper-v5-fresh"
     )
 
 
@@ -2193,3 +2191,139 @@ def test_zero_fill_sell_order_provenance_is_reconciled(
 
     with pytest.raises(PaperBrokerReconciliationError, match="entry_signal_id|provenance"):
         store.reconcile()
+
+
+_OFFLINE_MIGRATION_PHASES = (
+    "schema_additions",
+    "legacy_cost_evidence",
+    "archive",
+    "v5_schema",
+    "archive_protection",
+    "attestation",
+    "verification",
+)
+
+
+def _historical_business_rows(path: Path) -> dict[str, tuple[tuple[object, ...], ...]]:
+    queries = {
+        "broker_account": """
+            SELECT account_id, initial_cash, cash, realized_pnl, cost_policy_fingerprint
+            FROM broker_account ORDER BY account_id
+        """,
+        "paper_lot": """
+            SELECT lot_id, account_id, ts_code, entry_signal_id, acquisition_trade_date,
+                   available_date, original_quantity, remaining_quantity, unit_cost,
+                   persisted_at, buy_executed_at, buy_persisted_at, buy_fill_sequence
+            FROM paper_lot ORDER BY lot_id
+        """,
+        "paper_execution_receipt": """
+            SELECT execution_id, account_id, intent_id, order_id, request_fingerprint,
+                   request_json, receipt_json, persisted_at
+            FROM paper_execution_receipt ORDER BY execution_id
+        """,
+    }
+    with sqlite3.connect(path) as connection:
+        return {
+            name: tuple(tuple(row) for row in connection.execute(query))
+            for name, query in queries.items()
+        }
+
+
+def test_v4_open_fails_closed_and_offline_copy_preserves_parent_history(tmp_path: Path) -> None:
+    source = create_parent_v4_fixture(tmp_path / "source.sqlite3")
+    source_bytes = source.path.read_bytes()
+    with pytest.raises(PaperBrokerReconciliationError, match="offline migration required"):
+        PaperBrokerStore(
+            source.path,
+            account_id=LEGACY_ACCOUNT_ID,
+            initial_cash=Decimal("10000.00"),
+            cost_policy=paper_cost_policy(),
+        )
+    assert source.path.read_bytes() == source_bytes
+
+    candidate = tmp_path / "candidate.sqlite3"
+    result = paper_broker_module.migrate_paper_ledger_v4_offline_copy(source.path, candidate)
+
+    assert result.source_sha256 == source.source_sha256
+    assert result.candidate_path == candidate
+    assert result.reconciliation_verified
+    assert source.path.read_bytes() == source_bytes
+    assert sha256_file(source.path) == source.source_sha256
+    assert _historical_business_rows(candidate) == {
+        "broker_account": tuple(row[:5] for row in source.historical_rows["broker_account"]),
+        "paper_lot": source.historical_rows["paper_lot"],
+        "paper_execution_receipt": source.historical_rows["paper_execution_receipt"],
+    }
+    assert archived_v4_rows(candidate) == {
+        key: source.historical_rows[key]
+        for key in (
+            "paper_ledger_schema",
+            "paper_ledger_attestation",
+            "paper_ledger_head_marker",
+            "paper_ledger_tamper_marker",
+        )
+    }
+    with sqlite3.connect(candidate) as connection:
+        fill = connection.execute(
+            """
+            SELECT transfer_fee, total_fees, cost_spec_id, cost_spec_schema_version,
+                   cost_context_fingerprint, cost_provenance_state
+            FROM paper_fill
+            """
+        ).fetchone()
+        receipt = connection.execute(
+            """
+            SELECT transfer_fee, total_fees, cost_spec_id, cost_spec_schema_version,
+                   cost_context_fingerprint, cost_provenance_state
+            FROM paper_execution_receipt WHERE execution_id = ?
+            """,
+            ("5" * 64,),
+        ).fetchone()
+    assert fill == (None, None, None, None, None, "LEGACY_UNKNOWN")
+    assert receipt == (None, None, None, None, None, "LEGACY_UNKNOWN")
+
+
+@pytest.mark.parametrize("failure_after_phase", _OFFLINE_MIGRATION_PHASES)
+def test_offline_v4_migration_failure_never_mutates_the_source_or_promotes_candidate(
+    tmp_path: Path,
+    failure_after_phase: str,
+) -> None:
+    source = create_parent_v4_fixture(tmp_path / "source.sqlite3")
+    source_bytes = source.path.read_bytes()
+    candidate = tmp_path / "candidate.sqlite3"
+
+    with pytest.raises(PaperBrokerReconciliationError, match="simulated migration failure"):
+        paper_broker_module.migrate_paper_ledger_v4_offline_copy(
+            source.path,
+            candidate,
+            failure_after_phase=failure_after_phase,
+        )
+
+    assert source.path.read_bytes() == source_bytes
+    assert sha256_file(source.path) == source.source_sha256
+    assert not candidate.exists()
+
+
+def test_offline_migration_archive_tamper_quarantines_the_candidate(tmp_path: Path) -> None:
+    source = create_parent_v4_fixture(tmp_path / "source.sqlite3")
+    candidate = tmp_path / "candidate.sqlite3"
+    paper_broker_module.migrate_paper_ledger_v4_offline_copy(source.path, candidate)
+
+    with sqlite3.connect(candidate) as connection:
+        connection.execute("DROP TRIGGER paper_ledger_attestation_v4_archive_update_immutable")
+        connection.execute("UPDATE paper_ledger_attestation_v4_archive SET event_kind = 'tampered'")
+
+    diagnostic = PaperBrokerStore(
+        candidate,
+        account_id=LEGACY_ACCOUNT_ID,
+        initial_cash=Decimal("10000.00"),
+        cost_policy=paper_cost_policy(),
+    )
+    assert diagnostic.ledger_trust_status().state == "quarantined"
+    with pytest.raises(PaperBrokerReconciliationError, match="archive"):
+        PaperBrokerStore(
+            candidate,
+            account_id="fresh-v5-account",
+            initial_cash=Decimal("10000.00"),
+            cost_policy=paper_cost_policy(),
+        )

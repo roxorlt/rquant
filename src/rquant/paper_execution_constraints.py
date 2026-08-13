@@ -27,6 +27,7 @@ from pydantic import (
     model_validator,
 )
 
+from rquant.research_run_spec import InstrumentContext
 from rquant.runtime_contracts import (
     AwareUtcDatetime,
     RuntimeContractModel,
@@ -71,6 +72,7 @@ class PaperExecutionConstraintSnapshot(_StrictContractModel):
     buy_limit_locked: bool
     sell_limit_locked: bool
     risk_rejected: bool
+    instrument_context: InstrumentContext | None = None
     source_snapshot_ids: Mapping[str, Sha256]
     producer_commit: CommitSha
     content_hash: Sha256
@@ -99,6 +101,8 @@ class PaperExecutionConstraintSnapshot(_StrictContractModel):
             raise ValueError("trade_date must match available_at in Asia/Shanghai")
         if self.expires_at.astimezone(_SHANGHAI).date() != self.trade_date:
             raise ValueError("expires_at must remain on trade_date in Asia/Shanghai")
+        if self.instrument_context is not None and self.instrument_context.ts_code != self.ts_code:
+            raise ValueError("instrument_context ts_code must match constraint ts_code")
         expected = canonical_sha256(self.model_dump(mode="python", exclude={"content_hash"}))
         if self.content_hash != expected:
             raise ValueError("snapshot content_hash does not match canonical content")
@@ -165,6 +169,7 @@ class PaperExecutionConstraintDecision(_StrictContractModel):
     suspended: bool
     limit_locked: bool
     risk_rejected: bool
+    instrument_context: InstrumentContext | None
     source_snapshot_ids: Mapping[str, Sha256]
     producer_commit: CommitSha
     constraint_content_hash: Sha256
@@ -371,6 +376,7 @@ class PaperExecutionConstraintAuthority:
                 record.buy_limit_locked if direction == "buy" else record.sell_limit_locked
             ),
             risk_rejected=record.risk_rejected,
+            instrument_context=record.instrument_context,
             source_snapshot_ids=record.source_snapshot_ids,
             producer_commit=record.producer_commit,
             constraint_content_hash=record.content_hash,

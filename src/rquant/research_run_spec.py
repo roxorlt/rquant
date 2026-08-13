@@ -314,6 +314,14 @@ class InstrumentSelector(RunSpecModel):
         return (self.market, self.exchange, self.instrument_class, self.security_class)
 
 
+class InstrumentClassificationProvenance(RunSpecModel):
+    """Immutable listing-authority evidence for one execution instrument context."""
+
+    reference_dataset: Literal["security_listing_status"]
+    reference_record_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    reference_generation_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class InstrumentContext(RunSpecModel):
     """Normalized authoritative classification used to select one v3 cost rule set."""
 
@@ -322,6 +330,7 @@ class InstrumentContext(RunSpecModel):
     exchange: str = Field(min_length=1)
     instrument_class: str = Field(min_length=1)
     security_class: str = Field(min_length=1)
+    classification_provenance: InstrumentClassificationProvenance | None = None
 
     @field_validator(
         "ts_code",
