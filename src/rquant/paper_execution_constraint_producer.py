@@ -27,6 +27,7 @@ from rquant.reference_data_registry import (
     ReferenceLookup,
     ReferenceRegistry,
 )
+from rquant.research_run_spec import InstrumentClassificationProvenance, InstrumentContext
 from rquant.runtime_contracts import (
     AwareUtcDatetime,
     RuntimeContractModel,
@@ -89,6 +90,8 @@ class _ReferenceState(RuntimeContractModel):
     limit_up_price: Decimal
     limit_down_price: Decimal
     source_snapshot_id: Sha256
+    listing_snapshot_id: Sha256
+    instrument_context: InstrumentContext
 
 
 class PaperExecutionConstraintProducer:
@@ -289,9 +292,11 @@ class PaperExecutionConstraintProducer:
                 "buy_limit_locked": close == state.limit_up_price,
                 "sell_limit_locked": close == state.limit_down_price,
                 "risk_rejected": state.risk_rejected,
+                "instrument_context": state.instrument_context.model_dump(mode="json"),
                 "source_snapshot_ids": {
                     "market_minute": minute.source_snapshot_id,
                     "reference_slow": state.source_snapshot_id,
+                    "reference_listing": state.listing_snapshot_id,
                 },
                 "producer_commit": self.producer_commit,
             }
@@ -343,6 +348,18 @@ class PaperExecutionConstraintProducer:
             raise PaperExecutionConstraintEvidenceError(
                 f"{ts_code} required reference evidence is unavailable"
             ) from exc
+        try:
+            listing = self.reference_registry.as_of(
+                dataset_id=ReferenceDataset.LISTING_STATUS,
+                key=ts_code,
+                event_time=event_time,
+                decision_time=decision_time,
+                generation_id=generation_id,
+            )
+        except ReferenceDataUnavailableError as exc:
+            raise PaperExecutionConstraintEvidenceError(
+                f"{ts_code} listing classification is unavailable"
+            ) from exc
         is_st = _required_bool(st, "is_st")
         is_suspended = _required_bool(suspension, "is_suspended")
         limit_up = _required_price(price_limit, "limit_up_price")
@@ -351,12 +368,15 @@ class PaperExecutionConstraintProducer:
             raise PaperExecutionConstraintEvidenceError(
                 f"{ts_code} price limit boundaries are not ordered"
             )
+        instrument_context = _required_a_share_instrument_context(listing)
         return _ReferenceState(
             suspended=is_suspended,
             risk_rejected=is_st,
             limit_up_price=limit_up,
             limit_down_price=limit_down,
             source_snapshot_id=generation_id,
+            listing_snapshot_id=listing.record.record_id,
+            instrument_context=instrument_context,
         )
 
 
@@ -367,6 +387,44 @@ def _required_bool(lookup: ReferenceLookup, field: str) -> bool:
             f"{lookup.record.key} {field} reference value must be boolean"
         )
     return value
+
+
+def _required_a_share_instrument_context(lookup: ReferenceLookup) -> InstrumentContext:
+    """Build execution context only from an attested listing-status record."""
+
+    payload = lookup.record.payload
+    fields = ("market", "exchange", "instrument_class", "security_class")
+    values: dict[str, str] = {}
+    for field in fields:
+        value = payload.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise PaperExecutionConstraintEvidenceError(
+                f"{lookup.record.key} listing classification {field} is missing"
+            )
+        values[field] = value
+    try:
+        context = InstrumentContext(
+            ts_code=lookup.record.key,
+            **values,
+            classification_provenance=InstrumentClassificationProvenance(
+                reference_dataset=ReferenceDataset.LISTING_STATUS.value,
+                reference_record_id=lookup.record.record_id,
+                reference_generation_id=lookup.generation_id,
+            ),
+        )
+    except ValueError as exc:
+        raise PaperExecutionConstraintEvidenceError(
+            f"{lookup.record.key} listing classification is invalid"
+        ) from exc
+    if (
+        context.market != "CN"
+        or context.instrument_class != "EQUITY"
+        or context.security_class != "A_SHARE"
+    ):
+        raise PaperExecutionConstraintEvidenceError(
+            f"{lookup.record.key} listing classification is not an A_SHARE"
+        )
+    return context
 
 
 def _required_price(lookup: ReferenceLookup, field: str) -> Decimal:

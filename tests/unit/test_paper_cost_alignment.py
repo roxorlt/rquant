@@ -96,13 +96,18 @@ def _v3_spec(
     )
 
 
-def _context() -> dict[str, str]:
+def _context() -> dict[str, object]:
     return {
         "ts_code": "600000.SH",
         "market": "CN",
         "exchange": "SSE",
         "instrument_class": "EQUITY",
         "security_class": "A_SHARE",
+        "classification_provenance": {
+            "reference_dataset": "security_listing_status",
+            "reference_record_id": "a" * 64,
+            "reference_generation_id": "b" * 64,
+        },
     }
 
 
@@ -223,6 +228,100 @@ def test_paper_rejects_mismatched_instrument_context_before_ledger_mutation(tmp_
         assert connection.execute("SELECT COUNT(*) FROM paper_execution_receipt").fetchone()[0] == 0
 
 
+def test_paper_rejects_unclassified_context_before_ledger_mutation(tmp_path: Path) -> None:
+    path = tmp_path / "paper.sqlite3"
+    store = _paper_store(path)
+
+    with pytest.raises(ValueError, match="trusted.*classification"):
+        store.submit_intent(
+            _paper_intent(signal_seed="a"),
+            execution_id="e" * 64,
+            decision_time=_BUY_TIME,
+            trade_date=_BUY_DATE,
+            quote=BrokerExecutionContext(
+                executable_price=Decimal("10.00"),
+                acquisition_available_date=_NEXT_TRADE_DATE,
+                instrument_context=InstrumentContext(
+                    ts_code="600000.SH",
+                    market="CN",
+                    exchange="SSE",
+                    instrument_class="EQUITY",
+                    security_class="A_SHARE",
+                ),
+            ),
+        )
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM paper_intent").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM paper_order").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM paper_fill").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    ("ts_code", "exchange", "instrument_class", "security_class"),
+    [
+        ("510300.SH", "SSE", "FUND", "ETF"),
+        ("113001.SH", "SSE", "BOND", "CONVERTIBLE"),
+        ("159915.SZ", "SZSE", "FUND", "ETF"),
+    ],
+)
+def test_paper_rejects_non_a_share_context_even_when_a_rule_would_match(
+    tmp_path: Path,
+    ts_code: str,
+    exchange: str,
+    instrument_class: str,
+    security_class: str,
+) -> None:
+    payload = _v3_spec().model_dump(mode="json")
+    payload.pop("cost_spec_id", None)
+    selector_id = "attested-non-a-share"
+    payload["instrument_selectors"].append(
+        {
+            "selector_id": selector_id,
+            "market": "CN",
+            "exchange": exchange,
+            "instrument_class": instrument_class,
+            "security_class": security_class,
+        }
+    )
+    for rules_name in ("commission_rules", "transfer_fee_rules", "stamp_duty_rules"):
+        copied = dict(payload[rules_name][0])
+        copied["rule_id"] = f"{rules_name}-{selector_id}"
+        copied["selector_id"] = selector_id
+        payload[rules_name].append(copied)
+    path = tmp_path / "paper.sqlite3"
+    store = _paper_store(path, spec=ExecutionCostSpec.model_validate(payload))
+
+    with pytest.raises(ValueError, match="A_SHARE"):
+        store.submit_intent(
+            _paper_intent(signal_seed="b", ts_code=ts_code),
+            execution_id="f" * 64,
+            decision_time=_BUY_TIME,
+            trade_date=_BUY_DATE,
+            quote=BrokerExecutionContext(
+                executable_price=Decimal("10.00"),
+                acquisition_available_date=_NEXT_TRADE_DATE,
+                instrument_context=InstrumentContext(
+                    ts_code=ts_code,
+                    market="CN",
+                    exchange=exchange,
+                    instrument_class=instrument_class,
+                    security_class=security_class,
+                    classification_provenance={
+                        "reference_dataset": "security_listing_status",
+                        "reference_record_id": "a" * 64,
+                        "reference_generation_id": "b" * 64,
+                    },
+                ),
+            ),
+        )
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM paper_intent").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM paper_order").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM paper_fill").fetchone()[0] == 0
+
+
 def test_shared_v3_calculator_returns_buy_sell_components_and_context_identity() -> None:
     from rquant.order_execution_costs import calculate_execution_costs
 
@@ -314,10 +413,11 @@ def test_v3_research_replay_uses_shared_costs_but_is_unbound_for_paper() -> None
     assert row["execution_cost_spec_id"] == _v3_spec().cost_spec_id
 
 
-def test_strict_v3_binding_comparator_requires_exact_known_evidence() -> None:
+def test_strict_v3_binding_comparator_requires_a_trusted_persisted_export(tmp_path: Path) -> None:
     from rquant.order_execution_costs import calculate_execution_costs
     from rquant.strategy_execution_costs import (
         ExecutionCostBindingEvidence,
+        PaperExecutionCostBindingExport,
         compare_execution_cost_bindings,
     )
 
@@ -332,12 +432,29 @@ def test_strict_v3_binding_comparator_requires_exact_known_evidence() -> None:
         execution_cost_spec=spec,
         calculations=(calculation,),
     )
-    paper = ExecutionCostBindingEvidence(
+    forged = ExecutionCostBindingEvidence(
         provenance_state="KNOWN_V3",
         execution_cost_spec=spec,
         calculations=(calculation,),
     )
 
+    forged_result = compare_execution_cost_bindings(research, forged)
+    assert not forged_result.is_comparable
+    assert forged_result.reason == "UNTRUSTED_PAPER_EVIDENCE"
+    forged_export = object.__new__(PaperExecutionCostBindingExport)
+    forged_export_result = compare_execution_cost_bindings(research, forged_export)
+    assert not forged_export_result.is_comparable
+    assert forged_export_result.reason == "UNTRUSTED_PAPER_EVIDENCE"
+
+    store = _paper_store(tmp_path / "paper.sqlite3", spec=spec)
+    store.submit_intent(
+        _paper_intent(signal_seed="a"),
+        execution_id="1" * 64,
+        decision_time=_BUY_TIME,
+        trade_date=_BUY_DATE,
+        quote=_paper_quote("10.00"),
+    )
+    paper = store.export_reconciled_execution_cost_binding(("1" * 64,))
     exact = compare_execution_cost_bindings(research, paper)
     unbound = compare_execution_cost_bindings(
         research.model_copy(update={"provenance_state": "V3_UNBOUND"}),
@@ -350,7 +467,7 @@ def test_strict_v3_binding_comparator_requires_exact_known_evidence() -> None:
     assert unbound.reason == "UNBOUND_RESEARCH_COST"
 
 
-def test_strict_v3_binding_comparator_has_machine_negative_reasons() -> None:
+def test_strict_v3_binding_comparator_has_machine_negative_reasons(tmp_path: Path) -> None:
     from rquant.order_execution_costs import calculate_execution_costs
     from rquant.strategy_execution_costs import (
         ExecutionCostBindingEvidence,
@@ -368,6 +485,15 @@ def test_strict_v3_binding_comparator_has_machine_negative_reasons() -> None:
         execution_cost_spec=spec,
         calculations=(calculation,),
     )
+    store = _paper_store(tmp_path / "paper.sqlite3", spec=spec)
+    store.submit_intent(
+        _paper_intent(signal_seed="a"),
+        execution_id="1" * 64,
+        decision_time=_BUY_TIME,
+        trade_date=_BUY_DATE,
+        quote=_paper_quote("10.00"),
+    )
+    paper = store.export_reconciled_execution_cost_binding(("1" * 64,))
     different_spec = _v3_spec(engine_version="different-engine-v3")
     different_calculation = calculate_execution_costs(
         different_spec,
@@ -391,53 +517,53 @@ def test_strict_v3_binding_comparator_has_machine_negative_reasons() -> None:
     cases = (
         (
             ExecutionCostBindingEvidence(provenance_state="LEGACY_UNKNOWN"),
-            exact,
+            paper,
             "LEGACY_UNKNOWN_COST_PROVENANCE",
         ),
         (
             ExecutionCostBindingEvidence(provenance_state="V3_UNBOUND", rate_only=True),
-            exact,
+            paper,
             "RATE_ONLY_RESEARCH_COST",
         ),
         (
             exact,
             ExecutionCostBindingEvidence(provenance_state="V3_UNBOUND"),
-            "UNBOUND_PAPER_COST",
+            "UNTRUSTED_PAPER_EVIDENCE",
         ),
         (
-            exact,
             ExecutionCostBindingEvidence(
                 provenance_state="KNOWN_V3",
                 execution_cost_spec=different_spec,
                 calculations=(different_calculation,),
             ),
+            paper,
             "COST_SPEC_ID_MISMATCH",
         ),
         (
-            exact,
             ExecutionCostBindingEvidence(
                 provenance_state="KNOWN_V3",
                 execution_cost_spec=spec,
                 calculations=(calculation, calculation),
             ),
+            paper,
             "FILL_TOPOLOGY_MISMATCH",
         ),
         (
-            exact,
             ExecutionCostBindingEvidence(
                 provenance_state="KNOWN_V3",
                 execution_cost_spec=spec,
                 calculations=(different_context,),
             ),
+            paper,
             "INSTRUMENT_CONTEXT_MISMATCH",
         ),
         (
-            exact,
             ExecutionCostBindingEvidence(
                 provenance_state="KNOWN_V3",
                 execution_cost_spec=spec,
                 calculations=(tampered_rules,),
             ),
+            paper,
             "SELECTED_RULE_MISMATCH",
         ),
     )

@@ -76,6 +76,8 @@ def _complete_reference_registry(
     is_st: bool = False,
     is_suspended: bool = False,
     price_payload: dict[str, object] | None = None,
+    listing_payload: dict[str, object] | None = None,
+    include_listing: bool = True,
     published_at: datetime = DEFAULT_REFERENCE_PUBLISHED_AT,
 ) -> tuple[ReferenceRegistry, str]:
     registry = ReferenceRegistry(root / "reference.sqlite3")
@@ -96,6 +98,20 @@ def _complete_reference_registry(
         if price_payload is not None
         else {"limit_up_price": 11.0, "limit_down_price": 9.0},
     )
+    if include_listing:
+        _append_reference(
+            registry,
+            dataset=ReferenceDataset.LISTING_STATUS,
+            payload=listing_payload
+            if listing_payload is not None
+            else {
+                "market": "CN",
+                "exchange": "SSE",
+                "instrument_class": "EQUITY",
+                "security_class": "A_SHARE",
+                "status": "listed",
+            },
+        )
     generation = registry.publish(published_at=published_at)
     return registry, generation.generation_id
 
@@ -205,7 +221,7 @@ def test_produces_pit_intervals_and_publishes_existing_authority(tmp_path: Path)
         for record in publication.batch.records
     )
     assert all(
-        set(record.source_snapshot_ids) == {"market_minute", "reference_slow"}
+        set(record.source_snapshot_ids) == {"market_minute", "reference_slow", "reference_listing"}
         for record in publication.batch.records
     )
     for first, second in zip(
@@ -260,6 +276,64 @@ def test_maps_visible_slow_status_to_risk_and_suspension(
     record = publication.batch.records[0]
     assert record.risk_rejected is expected_risk
     assert record.suspended is expected_suspended
+
+
+def test_listing_classification_is_attested_and_fails_closed_for_missing_or_non_a_share(
+    tmp_path: Path,
+) -> None:
+    missing_registry, missing_generation = _complete_reference_registry(
+        tmp_path / "missing",
+        include_listing=False,
+    )
+    missing_spool = _minute_spool(tmp_path / "missing", ((31, 10.0),))
+    with pytest.raises(PaperExecutionConstraintEvidenceError, match="classification"):
+        _producer(
+            tmp_path / "missing",
+            registry=missing_registry,
+            spool=missing_spool,
+            published_at=_cn(9, 31, 30),
+        ).produce(_request(generation_id=missing_generation, observed_at=_cn(9, 31, 30)))
+
+    fund_registry, fund_generation = _complete_reference_registry(
+        tmp_path / "fund",
+        listing_payload={
+            "market": "CN",
+            "exchange": "SSE",
+            "instrument_class": "FUND",
+            "security_class": "ETF",
+            "status": "listed",
+        },
+    )
+    fund_spool = _minute_spool(tmp_path / "fund", ((31, 10.0),))
+    with pytest.raises(PaperExecutionConstraintEvidenceError, match="A_SHARE"):
+        _producer(
+            tmp_path / "fund",
+            registry=fund_registry,
+            spool=fund_spool,
+            published_at=_cn(9, 31, 30),
+        ).produce(_request(generation_id=fund_generation, observed_at=_cn(9, 31, 30)))
+
+    registry, generation_id = _complete_reference_registry(tmp_path / "a-share")
+    spool = _minute_spool(tmp_path / "a-share", ((31, 10.0),))
+    publication = _producer(
+        tmp_path / "a-share",
+        registry=registry,
+        spool=spool,
+        published_at=_cn(9, 31, 30),
+    ).produce(_request(generation_id=generation_id, observed_at=_cn(9, 31, 30)))
+    listing = registry.as_of(
+        dataset_id=ReferenceDataset.LISTING_STATUS,
+        key=CODE,
+        event_time=_cn(9, 31),
+        decision_time=_cn(9, 31, 5),
+        generation_id=generation_id,
+    )
+    context = publication.batch.records[0].instrument_context
+
+    assert context.scope_key == ("CN", "SSE", "EQUITY", "A_SHARE")
+    assert context.classification_provenance.reference_dataset == "security_listing_status"
+    assert context.classification_provenance.reference_record_id == listing.record.record_id
+    assert context.classification_provenance.reference_generation_id == generation_id
 
 
 def test_excludes_future_minute_evidence_without_advancing_the_cutoff(

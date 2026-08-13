@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from decimal import ROUND_FLOOR, Decimal, InvalidOperation
 from typing import Literal
+from weakref import WeakKeyDictionary
 
 import pandas as pd
 from pydantic import Field, model_validator
@@ -18,7 +19,7 @@ from rquant.order_execution_costs import (
     calculate_order_execution_costs,
 )
 from rquant.research_run_spec import ExecutionCostSpec, InstrumentContext
-from rquant.runtime_contracts import RuntimeContractModel
+from rquant.runtime_contracts import RuntimeContractModel, canonical_sha256
 
 COST_MODEL_VERSION = "a-share-round-trip-v1"
 RATE_ONLY_COST_MODEL_VERSION = "a-share-round-trip-rate-only-v2"
@@ -56,6 +57,104 @@ class ExecutionCostBindingEvidence(RuntimeContractModel):
         return self
 
 
+class PaperExecutionCostBindingExport:
+    """Opaque capability issued only from a reconciled persisted paper ledger."""
+
+    __slots__ = ("__weakref__",)
+
+    def __new__(cls) -> PaperExecutionCostBindingExport:
+        raise TypeError("paper execution cost binding exports are ledger-issued only")
+
+
+class _VerifiedPaperExecutionCostBinding(RuntimeContractModel):
+    """Private immutable facts retained behind a ledger-issued export capability."""
+
+    account_id: str = Field(min_length=1)
+    execution_ids: tuple[str, ...] = Field(min_length=1)
+    receipt_execution_ids: tuple[str, ...] = Field(min_length=1)
+    fill_ids: tuple[str, ...] = Field(min_length=1)
+    execution_cost_spec: ExecutionCostSpec
+    calculations: tuple[ExecutionCostCalculation, ...] = Field(min_length=1)
+    runtime_generation: str = Field(pattern=r"^[0-9a-f]{64}$")
+    attestation_head_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    attestation_revision: int = Field(ge=1)
+    account_evidence_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    binding_fingerprint: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_binding(self) -> _VerifiedPaperExecutionCostBinding:
+        if (
+            len(self.execution_ids) != len(set(self.execution_ids))
+            or self.receipt_execution_ids != self.execution_ids
+            or len(self.fill_ids) != len(self.execution_ids)
+            or len(self.calculations) != len(self.execution_ids)
+        ):
+            raise ValueError(
+                "paper binding execution, receipt, fill, and calculation topology differs"
+            )
+        if not self.execution_cost_spec.is_alignment_eligible:
+            raise ValueError("paper binding requires an alignment-eligible v3 cost spec")
+        assert self.execution_cost_spec.cost_spec_id is not None
+        for calculation in self.calculations:
+            if (
+                calculation.cost_spec_id != self.execution_cost_spec.cost_spec_id
+                or calculation.cost_engine_version != self.execution_cost_spec.cost_engine_version
+            ):
+                raise ValueError("paper binding calculation does not match its v3 cost spec")
+        expected = canonical_sha256(self.model_dump(mode="python", exclude={"binding_fingerprint"}))
+        if self.binding_fingerprint is None:
+            object.__setattr__(self, "binding_fingerprint", expected)
+        elif self.binding_fingerprint != expected:
+            raise ValueError("paper binding fingerprint does not match immutable evidence")
+        return self
+
+
+_TRUSTED_PAPER_EXECUTION_BINDINGS: WeakKeyDictionary[
+    PaperExecutionCostBindingExport,
+    _VerifiedPaperExecutionCostBinding,
+] = WeakKeyDictionary()
+
+
+def _issue_reconciled_paper_execution_cost_binding(
+    *,
+    account_id: str,
+    execution_ids: tuple[str, ...],
+    receipt_execution_ids: tuple[str, ...],
+    fill_ids: tuple[str, ...],
+    execution_cost_spec: ExecutionCostSpec,
+    calculations: tuple[ExecutionCostCalculation, ...],
+    runtime_generation: str,
+    attestation_head_fingerprint: str,
+    attestation_revision: int,
+    account_evidence_fingerprint: str,
+) -> PaperExecutionCostBindingExport:
+    """Register an opaque export after the broker has independently verified it."""
+
+    evidence = _VerifiedPaperExecutionCostBinding(
+        account_id=account_id,
+        execution_ids=execution_ids,
+        receipt_execution_ids=receipt_execution_ids,
+        fill_ids=fill_ids,
+        execution_cost_spec=execution_cost_spec,
+        calculations=calculations,
+        runtime_generation=runtime_generation,
+        attestation_head_fingerprint=attestation_head_fingerprint,
+        attestation_revision=attestation_revision,
+        account_evidence_fingerprint=account_evidence_fingerprint,
+    )
+    export = object.__new__(PaperExecutionCostBindingExport)
+    _TRUSTED_PAPER_EXECUTION_BINDINGS[export] = evidence
+    return export
+
+
+def _trusted_paper_execution_binding(
+    value: object,
+) -> _VerifiedPaperExecutionCostBinding | None:
+    if not isinstance(value, PaperExecutionCostBindingExport):
+        return None
+    return _TRUSTED_PAPER_EXECUTION_BINDINGS.get(value)
+
+
 class ExecutionCostComparability(RuntimeContractModel):
     is_comparable: bool
     reason: str = Field(min_length=1)
@@ -67,22 +166,23 @@ def _not_comparable(reason: str) -> ExecutionCostComparability:
 
 def compare_execution_cost_bindings(
     research: ExecutionCostBindingEvidence,
-    paper: ExecutionCostBindingEvidence,
+    paper: object,
 ) -> ExecutionCostComparability:
     """Fail closed unless both sources bind the identical v3 fill calculation evidence."""
 
-    if research.rate_only or paper.rate_only:
+    if research.rate_only:
         return _not_comparable("RATE_ONLY_RESEARCH_COST")
     if research.provenance_state == "V3_UNBOUND":
         return _not_comparable("UNBOUND_RESEARCH_COST")
-    if research.provenance_state == "LEGACY_UNKNOWN" or paper.provenance_state == "LEGACY_UNKNOWN":
+    if research.provenance_state == "LEGACY_UNKNOWN":
         return _not_comparable("LEGACY_UNKNOWN_COST_PROVENANCE")
-    if paper.provenance_state == "V3_UNBOUND":
-        return _not_comparable("UNBOUND_PAPER_COST")
-    if research.execution_cost_spec is None or paper.execution_cost_spec is None:
+    verified_paper = _trusted_paper_execution_binding(paper)
+    if verified_paper is None:
+        return _not_comparable("UNTRUSTED_PAPER_EVIDENCE")
+    if research.execution_cost_spec is None:
         return _not_comparable("MISSING_COST_SPEC")
     research_spec = research.execution_cost_spec
-    paper_spec = paper.execution_cost_spec
+    paper_spec = verified_paper.execution_cost_spec
     if not research_spec.is_alignment_eligible or not paper_spec.is_alignment_eligible:
         return _not_comparable("LEGACY_COST_SCHEMA")
     if research_spec.cost_spec_id != paper_spec.cost_spec_id:
@@ -107,11 +207,11 @@ def compare_execution_cost_bindings(
         or research_spec.assessment_unit != paper_spec.assessment_unit
     ):
         return _not_comparable("FEE_BASIS_OR_MONEY_ROUNDING_MISMATCH")
-    if len(research.calculations) != len(paper.calculations):
+    if len(research.calculations) != len(verified_paper.calculations):
         return _not_comparable("FILL_TOPOLOGY_MISMATCH")
     for research_calculation, paper_calculation in zip(
         research.calculations,
-        paper.calculations,
+        verified_paper.calculations,
         strict=True,
     ):
         if research_calculation.order_input != paper_calculation.order_input:

@@ -32,12 +32,16 @@ T1_AT = datetime(2026, 8, 3, 1, 40, tzinfo=UTC)
 CODE = "600000.SH"
 
 
-def _broker(path: Path) -> PaperBrokerStore:
+def _broker(
+    path: Path,
+    *,
+    price_tick: Decimal = Decimal("0.0001"),
+) -> PaperBrokerStore:
     return PaperBrokerStore(
         path,
         account_id="paper-main",
         initial_cash=Decimal("200000"),
-        cost_policy=paper_cost_policy(),
+        cost_policy=paper_cost_policy(price_tick=price_tick),
     )
 
 
@@ -97,6 +101,7 @@ def _submit_buy(
     price: str = "11.00",
     executed_at: datetime = BUY_AT,
     persisted_at: datetime | None = None,
+    executable_quantity: int | None = None,
 ) -> str:
     intent = PaperOrderIntent(
         signal_id=signal.signal_id,
@@ -121,6 +126,7 @@ def _submit_buy(
             executable_price=Decimal(price),
             acquisition_available_date=date(2026, 8, 3),
             instrument_context=paper_instrument_context(CODE),
+            executable_quantity=executable_quantity,
         ),
     )
     return str(order.order_id)
@@ -758,6 +764,39 @@ def test_late_incremental_sell_fill_is_hidden_until_its_own_availability(
     assert before["eligible_high_price_raw"] == pytest.approx(14.0)
     assert after["exit_execution_status"] == "filled"
     assert after["position_closed"] is True
+
+
+def test_lifecycle_reconstructs_multi_fill_entry_price_at_the_v3_price_tick(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "paper.sqlite3"
+    broker = _broker(path, price_tick=Decimal("0.01"))
+    entry = _entry_signal()
+    order_id = _submit_buy(
+        broker,
+        entry,
+        quantity=200,
+        price="10.004",
+        executable_quantity=100,
+    )
+    broker.apply_execution(
+        order_id,
+        execution_id="6" * 64,
+        executed_at=BUY_AT + timedelta(minutes=1),
+        trade_date=date(2026, 7, 31),
+        quantity=100,
+        quote=BrokerExecutionContext(
+            executable_price=Decimal("10.005"),
+            executable_quantity=100,
+            acquisition_available_date=date(2026, 8, 3),
+            instrument_context=paper_instrument_context(CODE),
+        ),
+        price_snapshot_id="7" * 64,
+    )
+
+    values = _resolve(path, entry, cutoff=BUY_AT + timedelta(minutes=2))
+
+    assert values["entry_price_raw"] == pytest.approx(10.01)
 
 
 def test_unknown_legacy_fill_availability_fails_closed(tmp_path: Path) -> None:

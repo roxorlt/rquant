@@ -8,6 +8,12 @@
 selectors, component rules, executed-notional/per-fill semantics, shared-engine
 slippage, price tick, and money rounding.
 
+Paper quote contexts require an attested `A_SHARE` classification from the
+`security_listing_status` reference chain, including its record and generation
+provenance. Symbol suffixes and six-digit code shapes are never classification
+authority: missing, fund, bond, ETF, or otherwise non-A-share context rejects
+before ledger mutation.
+
 The research target notional is replay topology, not a fee-contract field. A
 strict comparison therefore checks the resolved fill inputs and calculations in
 addition to the v3 spec ID. V1 and v2 specs remain readable for historical
@@ -38,14 +44,31 @@ The execution request fingerprint includes the v3 spec, engine, normalized
 context, and resolved calculation. Replaying identical evidence returns the
 original receipt; changed evidence conflicts before ledger mutation.
 
+The strict paper/research comparator accepts only an opaque
+`PaperExecutionCostBindingExport` issued by
+`PaperBrokerStore.export_reconciled_execution_cost_binding(...)`. The broker
+issues it only after reconciling persisted account, fill, receipt, cost-spec,
+runtime-generation, and attestation-head evidence. Constructed caller objects,
+including lookalike v3 evidence, are untrusted and compare false.
+
 ## Offline Migration and Cutover
 
-Before migrating a v4 paper SQLite file, stop its writer and create a verified,
-offline file copy. Open only that copy with the v5 code path. Migration is one
-SQLite transaction and deliberately leaves historical cash, P&L, lots, receipt
-JSON, and legacy fee fields unchanged. It sets the new authority and fee fields
-to `NULL`, marks prior account/fill/receipt evidence `LEGACY_UNKNOWN`, and
-attests `unknown_cost_provenance_count`.
+Opening a v4 file through `PaperBrokerStore` fails closed with `offline
+migration required`; it never mutates the source. Stop the writer, checkpoint
+the SQLite source (no active WAL, SHM, or journal sidecar), and use
+`migrate_paper_ledger_v4_offline_copy(source_path, candidate_path)`. The API
+copies the source to a candidate, migrates and verifies that candidate in a
+single SQLite transaction, checks integrity/trust/reconciliation, and promotes
+only the verified candidate atomically. Every injected or ordinary failure
+leaves the source bytes and hash unchanged.
+
+Migration deliberately leaves historical cash, P&L, lots, receipt JSON, and
+legacy fee fields unchanged. It sets the new authority and fee fields to
+`NULL`, marks prior account/fill/receipt evidence `LEGACY_UNKNOWN`, and attests
+`unknown_cost_provenance_count`. The original v4 schema, attestation, head, and
+tamper-marker facts are retained in immutable archive tables. Their content and
+the recorded predecessor schema/attestation/head fingerprints are part of the
+v5 integrity chain; archive tampering quarantines the candidate.
 
 Legacy accounts are audit-only. Create a new v5 account bound to the active
 explicit v3 spec before performing aligned executions. A fresh account can be

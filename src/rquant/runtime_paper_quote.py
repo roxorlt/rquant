@@ -62,20 +62,29 @@ class PaperTradeCalendarError(PaperQuoteResolutionError):
     """The frozen SSE calendar cannot establish the acquisition date."""
 
 
-def _a_share_instrument_context(ts_code: str) -> InstrumentContext:
-    normalized = ts_code.upper()
-    if len(normalized) != 9 or not normalized[:6].isdigit():
-        raise PaperQuoteIntegrityError("paper quote has an unsupported instrument identifier")
-    exchange = {".SH": "SSE", ".SZ": "SZSE"}.get(normalized[-3:])
-    if exchange is None:
-        raise PaperQuoteIntegrityError("paper quote has an unsupported instrument context")
-    return InstrumentContext(
-        ts_code=normalized,
-        market="CN",
-        exchange=exchange,
-        instrument_class="EQUITY",
-        security_class="A_SHARE",
-    )
+def _require_attested_a_share_instrument_context(
+    ts_code: str,
+    instrument_context: InstrumentContext | None,
+) -> InstrumentContext:
+    """Reject quote execution unless constraints carry trusted listing evidence."""
+
+    if instrument_context is None:
+        raise PaperQuoteIntegrityError("paper quote has no trusted instrument classification")
+    normalized = ts_code.strip().upper()
+    if instrument_context.ts_code != normalized:
+        raise PaperQuoteIntegrityError(
+            "paper quote instrument classification does not match signal"
+        )
+    provenance = instrument_context.classification_provenance
+    if provenance is None or provenance.reference_dataset != "security_listing_status":
+        raise PaperQuoteIntegrityError("paper quote has no trusted instrument classification")
+    if (
+        instrument_context.market != "CN"
+        or instrument_context.instrument_class != "EQUITY"
+        or instrument_context.security_class != "A_SHARE"
+    ):
+        raise PaperQuoteIntegrityError("paper quote classification is not an A_SHARE")
+    return instrument_context
 
 
 class PaperQuoteResolverConfig(RuntimeContractModel):
@@ -365,7 +374,10 @@ class PaperPitQuoteResolver:
             available_at=quote_available_at,
             context=BrokerExecutionContext(
                 executable_price=Decimal(str(row["close"])),
-                instrument_context=_a_share_instrument_context(signal.candidate_id),
+                instrument_context=_require_attested_a_share_instrument_context(
+                    signal.candidate_id,
+                    constraint.instrument_context,
+                ),
                 acquisition_available_date=acquisition_date,
                 suspended=constraint.suspended,
                 limit_locked=constraint.limit_locked,
