@@ -339,12 +339,8 @@ def test_run_entry_mode_comparison_can_compare_profile_variants(
         max_hold_days=1,
     )
 
-    assert set(result.summary["profile_variant"]) == {
-        "baseline", "vp_risk_only", "vp_90"
-    }
-    assert set(result.trades["profile_variant"]) == {
-        "baseline", "vp_risk_only", "vp_90"
-    }
+    assert set(result.summary["profile_variant"]) == {"baseline", "vp_risk_only", "vp_90"}
+    assert set(result.trades["profile_variant"]) == {"baseline", "vp_risk_only", "vp_90"}
 
 
 def test_comparison_rejects_two_nonzero_slippage_owners_before_replay() -> None:
