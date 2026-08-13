@@ -79,6 +79,7 @@ def build_test_package(
     sequence: int = 1,
     previous_receipt_sha256: str = "0" * 64,
     source: bytes = b"VALUE = 1\n",
+    source_path: str = "release/src/rquant/app.py",
     provenance_commit: str = "2" * 40,
     authorities: tuple[object, ...] | None = None,
     promotion_state: CurrentPromotion | None = None,
@@ -86,6 +87,7 @@ def build_test_package(
     environment_allowlist: tuple[str, ...] = ("RQUANT_ALLOWED",),
     interpreter_bytes: bytes = INTERPRETER_BYTES,
     launcher_bytes: bytes = LAUNCHER_BYTES,
+    import_roots: tuple[str, ...] = ("release/src",),
     python_abi: str = "test-abi",
     now: datetime = NOW,
 ) -> RuntimeCodeTestPackage:
@@ -137,7 +139,7 @@ def build_test_package(
                 content=launcher_bytes,
             ),
             RuntimeCodeBundleEntry(
-                path="release/src/rquant/app.py",
+                path=source_path,
                 mode=0o444,
                 content=source,
             ),
@@ -159,7 +161,7 @@ def build_test_package(
         execution_spec=RuntimeCodeExecutionSpec(
             launcher_path="release/bin/rquant",
             working_directory="release",
-            import_roots=("release/src",),
+            import_roots=import_roots,
             interpreter_path="release/bin/python",
             interpreter_sha256=hashlib.sha256(interpreter_bytes).hexdigest(),
             python_abi=python_abi,

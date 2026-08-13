@@ -4,6 +4,7 @@ import ast
 import subprocess
 import sys
 from pathlib import Path
+from xml.etree import ElementTree
 
 import pytest
 
@@ -153,4 +154,72 @@ def test_runtime_fd_exec_ci_job_pins_official_actions() -> None:
     ) in job
     assert "uv sync --frozen" in job
     assert "--junitxml=" in job
+    assert "if-no-files-found: error" in job
+
+
+def _write_exact_junit(path: Path, *, tests: int = 2, skipped: int = 0) -> None:
+    suite = ElementTree.Element(
+        "testsuite",
+        tests=str(tests),
+        failures="0",
+        errors="0",
+        skipped=str(skipped),
+    )
+    for index in range(tests):
+        case = ElementTree.SubElement(suite, "testcase", name=f"exact-{index}")
+        if index < skipped:
+            ElementTree.SubElement(case, "skipped")
+    ElementTree.ElementTree(suite).write(path, encoding="unicode")
+
+
+def test_real_generation_junit_parser_rejects_changed_case_count(tmp_path: Path) -> None:
+    from tests.formal_smoke_real_generation_support import verify_exact_junit
+
+    report = tmp_path / "changed-count.xml"
+    _write_exact_junit(report, tests=1)
+
+    with pytest.raises(ValueError, match="exactly 2"):
+        verify_exact_junit(report)
+
+
+def test_real_generation_junit_parser_rejects_skipped_case(tmp_path: Path) -> None:
+    from tests.formal_smoke_real_generation_support import verify_exact_junit
+
+    report = tmp_path / "skipped.xml"
+    _write_exact_junit(report, skipped=1)
+
+    with pytest.raises(ValueError, match="skipped"):
+        verify_exact_junit(report)
+
+
+def test_real_generation_exact_ci_job_is_no_skip_and_redacted() -> None:
+    workflow = (Path(__file__).parents[2] / ".github" / "workflows" / "ci.yml").read_text(
+        encoding="utf-8"
+    )
+    job = workflow.split("  formal-smoke-real-generation-linux:\n", maxsplit=1)[1]
+
+    assert "name: Linux real generation smoke (${{ matrix.python-version }})" in job
+    assert "timeout-minutes: 6" in job
+    assert 'python-version: ["3.11", "3.12"]' in job
+    assert "RQUANT_FORMAL_EXACT_ROOT: ${{ runner.temp }}" in job
+    assert 'exact_root="${RQUANT_FORMAL_EXACT_ROOT}"' in job
+    assert '>> "${GITHUB_ENV}"' not in job
+    assert "uv sync --frozen" in job
+    assert "openssl genpkey -algorithm ED25519" in job
+    assert "chmod 700" in job
+    assert "-m linux_exact" in job
+    assert "--junitxml=" in job
+    assert "verify-ci-evidence" in job
+    assert "formal-smoke-real-generation-facts" in job
+    assert (
+        "uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # actions/checkout@v4"
+    ) in job
+    assert (
+        "uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065"
+        " # actions/setup-python@v5"
+    ) in job
+    assert (
+        "uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+        " # actions/upload-artifact@v4"
+    ) in job
     assert "if-no-files-found: error" in job
