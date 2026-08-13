@@ -2168,6 +2168,7 @@ class TestPreflightParser:
     def test_resource_authority_daemon_cli_uses_only_the_closed_environment(
         self,
         monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
     ) -> None:
         import rquant.cli as cli
         import rquant.lab_resource_authority_adapter as adapter_module
@@ -2178,27 +2179,50 @@ class TestPreflightParser:
         configuration = SimpleNamespace(
             service_configuration=SimpleNamespace(adapter_configuration=adapter)
         )
-        environment = {
-            "APP_ENV": "prod",
-            "RQUANT_CODE_COMMIT": "1" * 40,
-            "RQUANT_LAB_LIVE_SLO_AUTHORITY_ROOT": ("/var/lib/rquant-serving/runtime_health"),
-            "RQUANT_LAB_RESOURCE_AUTHORITY_CONFIG_JSON": "{}",
-            "RQUANT_LAB_RESOURCE_POLICY_VERSION": "lab-resource-v1",
-            "RQUANT_LAB_TRADE_CALENDAR_PATH": ("/var/lib/rquant-serving/market-calendar.json"),
-            "RQUANT_RESOURCE_AUTHORITY_SERVICE_CONFIG_PATH": (
-                "/etc/rquant/resource-authority.json"
-            ),
-            "RQUANT_RESOURCE_AUTHORITY_STATE_DIR": ("/var/lib/rquant-resource-authority"),
-        }
+        source = (
+            Path(__file__).resolve().parents[2]
+            / "deploy"
+            / "env"
+            / "resource-authority.env.example"
+        )
+        installed = tmp_path / "resource-authority.env"
+        installed.write_bytes(source.read_bytes())
+        installed.chmod(0o444)
+        real_loader = authority_service.load_closed_authority_environment
+
+        def load_first_install_environment(
+            path: Path,
+            *,
+            allowed_keys: frozenset[str],
+            required_keys: frozenset[str],
+            **_kwargs: object,
+        ) -> dict[str, str]:
+            assert path == authority_service.RESOURCE_AUTHORITY_ENVIRONMENT_PATH
+            return real_loader(
+                installed,
+                allowed_keys=allowed_keys,
+                required_keys=required_keys,
+                trusted_root=tmp_path,
+                expected_uid=os.geteuid(),
+                expected_gid=os.getegid(),
+            )
+
         snapshot_provider = object()
         policy = object()
         service = object()
         captured: dict[str, object] = {}
 
+        def build_admission(**kwargs: object) -> SimpleNamespace:
+            captured["code_sha"] = kwargs["code_sha"]
+            return SimpleNamespace(
+                require_resource_admission=True,
+                resource_snapshot_provider=snapshot_provider,
+            )
+
         monkeypatch.setattr(
             authority_service,
             "load_closed_authority_environment",
-            lambda *_args, **_kwargs: environment,
+            load_first_install_environment,
         )
         monkeypatch.setattr(
             authority_service,
@@ -2213,10 +2237,7 @@ class TestPreflightParser:
         monkeypatch.setattr(
             cli,
             "_build_lab_worker_resource_admission",
-            lambda **_kwargs: SimpleNamespace(
-                require_resource_admission=True,
-                resource_snapshot_provider=snapshot_provider,
-            ),
+            build_admission,
         )
         monkeypatch.setattr(
             admission_module,
@@ -2238,12 +2259,16 @@ class TestPreflightParser:
             cli.cmd_resource_authority_serve(
                 argparse.Namespace(
                     config=Path("/etc/rquant/resource-authority.json"),
-                    code_sha="1" * 40,
+                    code_sha=None,
                 )
             )
             == 0
         )
         assert captured["policy_version"] == "lab-resource-v1"
+        code_sha = captured["code_sha"]
+        assert isinstance(code_sha, str)
+        assert len(code_sha) == 40
+        assert all(character in "0123456789abcdef" for character in code_sha)
         composition = captured["composition"]
         assert isinstance(composition, dict)
         assert composition["configuration"] is configuration

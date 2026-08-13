@@ -388,6 +388,42 @@ def test_resource_authority_install_draft_is_explicit_and_does_not_expand_sudo()
         assert forbidden not in resource_env
 
 
+def test_first_install_authority_environment_examples_are_closed(tmp_path: Path) -> None:
+    from rquant.resource_authority_service import (
+        EXTERNAL_ROOT_ENVIRONMENT_KEYS,
+        RESOURCE_AUTHORITY_ENVIRONMENT_KEYS,
+        load_closed_authority_environment,
+    )
+
+    project_root = Path(__file__).resolve().parents[2]
+    registries = {
+        "external-root.env": EXTERNAL_ROOT_ENVIRONMENT_KEYS,
+        "resource-authority.env": RESOURCE_AUTHORITY_ENVIRONMENT_KEYS,
+    }
+    loaded: dict[str, dict[str, str]] = {}
+    for installed_name, keys in registries.items():
+        source = project_root / "deploy" / "env" / f"{installed_name}.example"
+        installed = tmp_path / installed_name
+        installed.write_bytes(source.read_bytes())
+        installed.chmod(0o444)
+        loaded[installed_name] = load_closed_authority_environment(
+            installed,
+            allowed_keys=keys,
+            required_keys=keys,
+            trusted_root=tmp_path,
+            expected_uid=os.geteuid(),
+            expected_gid=os.getegid(),
+        )
+
+    assert loaded["external-root.env"] == {
+        "APP_ENV": "prod",
+        "RQUANT_EXTERNAL_MONOTONIC_ROOT_SERVICE_CONFIG_PATH": (
+            "/etc/rquant/external-monotonic-root.json"
+        ),
+    }
+    assert frozenset(loaded["resource-authority.env"]) == RESOURCE_AUTHORITY_ENVIRONMENT_KEYS
+
+
 @pytest.mark.parametrize(
     "payload",
     (
