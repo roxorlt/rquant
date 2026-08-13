@@ -11,6 +11,7 @@ from typing import Literal
 from pydantic import Field, StrictBool, StrictInt, field_validator, model_validator
 
 from rquant.paper_broker import BrokerCostPolicy, PaperBrokerStore
+from rquant.paper_ledger_anchor import Ed25519PaperLedgerAnchorVerifier
 from rquant.paper_signal_consumer import (
     PaperSignalConsumerStateStore,
     consume_signal_bus_to_paper,
@@ -94,6 +95,10 @@ class PaperBrokerSettings(PaperSignalPolicySettings):
         pattern=r"^[0-9a-f]{64}$",
     )
     execution_constraint_root: Path | None = None
+    ledger_id: str | None = Field(default=None, min_length=1)
+    ledger_anchor_path: Path | None = None
+    ledger_anchor_public_key_path: Path | None = None
+    ledger_anchor_key_id: str | None = Field(default=None, min_length=1)
     timestamp_semantics: Literal["bar_end", "provider_snapshot"] = "provider_snapshot"
     quote_max_age_seconds: StrictInt = Field(default=90, gt=0, le=300)
     max_finalize_scan_batches: StrictInt = Field(default=32, gt=0, le=120)
@@ -110,6 +115,8 @@ class PaperBrokerSettings(PaperSignalPolicySettings):
         "trade_calendar_path",
         "execution_constraint_root",
         "serving_authority_root",
+        "ledger_anchor_path",
+        "ledger_anchor_public_key_path",
     )
     @classmethod
     def require_absolute_path(cls, value: Path | None) -> Path | None:
@@ -133,6 +140,16 @@ class PaperBrokerSettings(PaperSignalPolicySettings):
             raise ValueError("paper PIT authorities must be configured together")
         if not self.execution_cost_spec.is_alignment_eligible:
             raise ValueError("paper broker requires an explicit v3 execution_cost_spec")
+        anchor_values = (
+            self.ledger_id,
+            self.ledger_anchor_path,
+            self.ledger_anchor_public_key_path,
+            self.ledger_anchor_key_id,
+        )
+        if any(value is not None for value in anchor_values) and not all(
+            value is not None for value in anchor_values
+        ):
+            raise ValueError("paper ledger anchor settings must be configured together")
         return self
 
     def cost_policy(self) -> BrokerCostPolicy:
@@ -273,6 +290,19 @@ def paper_broker_builder(
             initial_cash=settings.initial_cash,
             cost_policy=cost_policy,
             busy_timeout_ms=settings.busy_timeout_ms,
+            **(
+                {}
+                if settings.ledger_anchor_public_key_path is None
+                else {
+                    "ledger_id": settings.ledger_id,
+                    "ledger_anchor_path": settings.ledger_anchor_path,
+                    "ledger_anchor_verifier": Ed25519PaperLedgerAnchorVerifier(
+                        active_key_id=settings.ledger_anchor_key_id,
+                        active_public_key=(settings.ledger_anchor_public_key_path.read_bytes()),
+                        allowed_ledger_id=settings.ledger_id,
+                    ),
+                }
+            ),
         )
         state = PaperSignalConsumerStateStore(
             settings.consumer_state_path,

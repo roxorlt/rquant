@@ -2,11 +2,8 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
-import os
 import secrets
-import shutil
 import sqlite3
 from collections.abc import Mapping
 from datetime import UTC, date, datetime
@@ -21,6 +18,7 @@ from rquant.order_execution_costs import calculate_execution_costs
 from rquant.paper_contracts import (
     PaperAccountSnapshot,
     PaperCostProvenanceState,
+    PaperExecutionCostComparison,
     PaperExecutionReceipt,
     PaperFill,
     PaperHolding,
@@ -32,6 +30,10 @@ from rquant.paper_contracts import (
     PaperSellQuantityAuthority,
     PaperSide,
 )
+from rquant.paper_ledger_anchor import (
+    Ed25519PaperLedgerAnchorVerifier,
+    PaperLedgerAnchor,
+)
 from rquant.research_run_spec import (
     ExecutionCostCalculation,
     ExecutionCostOrderInput,
@@ -40,8 +42,8 @@ from rquant.research_run_spec import (
 )
 from rquant.runtime_contracts import AwareUtcDatetime, RuntimeContractModel, canonical_sha256
 from rquant.strategy_execution_costs import (
-    PaperExecutionCostBindingExport,
-    _issue_reconciled_paper_execution_cost_binding,
+    ExecutionCostBindingEvidence,
+    compare_execution_cost_math,
 )
 
 NonNegativeDecimal = Annotated[Decimal, Field(ge=0, allow_inf_nan=False)]
@@ -60,7 +62,8 @@ _LEDGER_UNKNOWN_COLUMNS = (
     "unknown_execution_receipt_count",
     "unknown_cost_provenance_count",
 )
-_LEDGER_MIGRATION_VERSION = 3
+_LEDGER_MIGRATION_VERSION = 4
+_V4_LEDGER_MIGRATION_VERSION = 2
 _LEDGER_COUNT_TABLES = {
     "broker_account_count": "broker_account",
     "intent_count": "paper_intent",
@@ -131,6 +134,7 @@ _V5_ATTESTED_ONLY_OBJECTS = (
     "paper_fill_known_v3_required",
     *_V4_ARCHIVE_TABLES,
     "paper_ledger_v4_archive_binding",
+    "paper_ledger_migration_attestation",
     "paper_ledger_schema_v4_archive_update_immutable",
     "paper_ledger_schema_v4_archive_delete_immutable",
     "paper_ledger_attestation_v4_archive_update_immutable",
@@ -141,6 +145,8 @@ _V5_ATTESTED_ONLY_OBJECTS = (
     "paper_ledger_tamper_marker_v4_archive_delete_immutable",
     "paper_ledger_v4_archive_binding_update_immutable",
     "paper_ledger_v4_archive_binding_delete_immutable",
+    "paper_ledger_migration_attestation_update_immutable",
+    "paper_ledger_migration_attestation_delete_immutable",
 )
 _ATTESTED_SCHEMA_OBJECTS = _V4_ATTESTED_SCHEMA_OBJECTS + _V5_ATTESTED_ONLY_OBJECTS
 _OFFLINE_MIGRATION_PHASES = (
@@ -224,30 +230,6 @@ class PaperBrokerReconciliation(RuntimeContractModel):
     open_lot_quantity: int = Field(ge=0)
     cash: NonNegativeDecimal
     realized_pnl: Decimal = Field(allow_inf_nan=False)
-
-
-class PaperOfflineMigrationResult(RuntimeContractModel):
-    """Verified result of an offline v4-to-v5 candidate promotion."""
-
-    source_path: Path
-    candidate_path: Path
-    source_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    candidate_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    reconciliation_verified: bool
-
-
-class _PaperExecutionBindingSnapshot(RuntimeContractModel):
-    """Immutable persisted facts used to issue one trusted comparator export."""
-
-    account_id: str = Field(min_length=1)
-    execution_ids: tuple[str, ...] = Field(min_length=1)
-    receipt_execution_ids: tuple[str, ...] = Field(min_length=1)
-    fill_ids: tuple[str, ...] = Field(min_length=1)
-    calculations: tuple[ExecutionCostCalculation, ...] = Field(min_length=1)
-    runtime_generation: str = Field(pattern=r"^[0-9a-f]{64}$")
-    attestation_head_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
-    attestation_revision: int = Field(ge=1)
-    account_evidence_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 class PaperLedgerUnknownEvidence(RuntimeContractModel):
@@ -337,6 +319,9 @@ class PaperBrokerStore:
         initial_cash: Decimal,
         cost_policy: BrokerCostPolicy,
         busy_timeout_ms: int = 5_000,
+        ledger_id: str | None = None,
+        ledger_anchor_path: Path | None = None,
+        ledger_anchor_verifier: Ed25519PaperLedgerAnchorVerifier | None = None,
     ) -> None:
         if not account_id.strip():
             raise ValueError("account_id must not be empty")
@@ -349,6 +334,16 @@ class PaperBrokerStore:
         self.initial_cash = initial_cash
         self.cost_policy = cost_policy
         self.busy_timeout_ms = busy_timeout_ms
+        anchor_values = (ledger_id, ledger_anchor_path, ledger_anchor_verifier)
+        if any(value is not None for value in anchor_values) and not all(
+            value is not None for value in anchor_values
+        ):
+            raise ValueError("paper ledger anchor settings must be configured together")
+        if ledger_id is not None and not ledger_id.strip():
+            raise ValueError("paper ledger id must not be empty")
+        self.ledger_id = None if ledger_id is None else ledger_id.strip()
+        self.ledger_anchor_path = None if ledger_anchor_path is None else Path(ledger_anchor_path)
+        self.ledger_anchor_verifier = ledger_anchor_verifier
         self._reject_online_v4_open()
         self._initialize()
 
@@ -786,33 +781,10 @@ class PaperBrokerStore:
             )
         )
 
-    @staticmethod
-    def _v4_archive_content_fingerprint(connection: sqlite3.Connection) -> str:
-        rows: list[dict[str, object]] = []
-        for table in _V4_ARCHIVE_TABLES:
-            if not PaperBrokerStore._table_exists(connection, table):
-                raise PaperBrokerReconciliationError("paper ledger v4 archive is incomplete")
-            columns = tuple(
-                str(row[1])
-                for row in connection.execute(f'PRAGMA table_info("{table}")').fetchall()
-            )
-            for row in connection.execute(f'SELECT * FROM "{table}" ORDER BY rowid').fetchall():
-                rows.append(
-                    {
-                        "table": table,
-                        "columns": columns,
-                        "values": tuple(row),
-                    }
-                )
-        return canonical_sha256(tuple(rows))
-
     @classmethod
     def _validate_v4_archive(cls, connection: sqlite3.Connection) -> None:
-        binding = connection.execute(
-            "SELECT * FROM paper_ledger_v4_archive_binding WHERE singleton = 1 LIMIT 1"
-        ).fetchone()
-        if binding is None:
-            raise PaperBrokerReconciliationError("paper ledger v4 archive binding is missing")
+        from rquant.paper_ledger_migration import validate_migration_attestation
+
         archive_schema = connection.execute(
             "SELECT * FROM paper_ledger_schema_v4_archive WHERE singleton = 1 LIMIT 1"
         ).fetchone()
@@ -826,32 +798,52 @@ class PaperBrokerStore:
             raise PaperBrokerReconciliationError("paper ledger v4 archive facts are missing")
         attestation_payload = cls._validate_attestation_row(archive_attestation)
         cls._validate_head_marker_row(archive_head)
+        try:
+            migration = validate_migration_attestation(connection)
+        except (TypeError, ValueError, sqlite3.DatabaseError) as exc:
+            raise PaperBrokerReconciliationError(
+                "paper ledger migration archive digest mismatch"
+            ) from exc
         if (
             int(archive_schema["schema_version"]) != 4
-            or str(binding["predecessor_v4_schema_fingerprint"])
-            != str(attestation_payload["schema_fingerprint"])
             or str(archive_attestation["attestation_fingerprint"])
-            != str(binding["predecessor_v4_attestation_fingerprint"])
+            != migration.predecessor_v4_attestation_fingerprint
             or str(archive_head["head_marker_fingerprint"])
-            != str(binding["predecessor_v4_head_fingerprint"])
+            != migration.predecessor_v4_head_marker_fingerprint
             or str(archive_head["attestation_fingerprint"])
             != str(archive_attestation["attestation_fingerprint"])
             or int(attestation_payload["schema_version"]) != 4
             or str(attestation_payload["schema_fingerprint"])
-            != str(binding["predecessor_v4_schema_fingerprint"])
+            != migration.predecessor_v4_schema_fingerprint
             or str(archive_head["schema_fingerprint"])
-            != str(binding["predecessor_v4_schema_fingerprint"])
-            or str(binding["archive_content_fingerprint"])
-            != cls._v4_archive_content_fingerprint(connection)
+            != migration.predecessor_v4_schema_fingerprint
         ):
             raise PaperBrokerReconciliationError("paper ledger v4 archive integrity conflict")
 
     @classmethod
-    def _verify_v5_migration_in_connection(cls, connection: sqlite3.Connection) -> None:
+    def _verify_v5_migration_in_connection(
+        cls,
+        connection: sqlite3.Connection,
+        *,
+        expected_v4_report: object | None = None,
+    ) -> None:
         integrity = connection.execute("PRAGMA integrity_check").fetchone()
         if integrity is None or str(integrity[0]).lower() != "ok":
             raise PaperBrokerReconciliationError("paper ledger candidate integrity check failed")
         cls._validate_v4_archive(connection)
+        from rquant.paper_ledger_migration import validate_migration_attestation
+
+        migration_attestation = validate_migration_attestation(connection)
+        if expected_v4_report is not None and (
+            not bool(getattr(expected_v4_report, "is_verified", False))
+            or str(getattr(expected_v4_report, "digest", ""))
+            != migration_attestation.v4_reconciliation_report_digest
+            or str(getattr(expected_v4_report, "source_sha256", ""))
+            != migration_attestation.source_sha256
+        ):
+            raise PaperBrokerReconciliationError(
+                "paper ledger candidate v4 reconciliation report differs"
+            )
         status = cls._ledger_trust_status(connection)
         if status.schema_version != 5 or status.reason not in {
             "verified_schema_v5",
@@ -1188,7 +1180,11 @@ class PaperBrokerStore:
                 reason="schema_metadata_missing",
             )
         columns = cls._table_columns(connection, "paper_ledger_schema")
-        required = {"schema_version", *_LEDGER_UNKNOWN_COLUMNS}
+        required = {
+            "schema_version",
+            "internal_migration_version",
+            *_LEDGER_UNKNOWN_COLUMNS,
+        }
         if not required <= columns:
             return PaperLedgerTrustStatus(
                 state="quarantined",
@@ -1215,6 +1211,13 @@ class PaperBrokerStore:
                 reason="unsupported_schema_version",
                 unknown_evidence=unknown,
             )
+        if int(row["internal_migration_version"]) != _LEDGER_MIGRATION_VERSION:
+            return PaperLedgerTrustStatus(
+                state="quarantined",
+                schema_version=schema_version,
+                reason="unsupported_internal_migration_version",
+                unknown_evidence=unknown,
+            )
         if not cls._table_exists(connection, "paper_ledger_attestation"):
             return PaperLedgerTrustStatus(
                 state="quarantined",
@@ -1227,7 +1230,7 @@ class PaperBrokerStore:
             return PaperLedgerTrustStatus(
                 state="quarantined",
                 schema_version=schema_version,
-                reason="archive_integrity_conflict",
+                reason="migration_archive_digest_mismatch",
             )
         schema_fingerprint = cls._schema_fingerprint(connection)
         if schema_fingerprint is None:
@@ -1244,6 +1247,17 @@ class PaperBrokerStore:
                 schema_version=schema_version,
                 reason="migration_attestation_conflict",
             )
+        try:
+            from rquant.paper_ledger_migration import validate_migration_attestation
+
+            immutable_migration = validate_migration_attestation(connection)
+        except (TypeError, ValueError, sqlite3.DatabaseError):
+            return PaperLedgerTrustStatus(
+                state="quarantined",
+                schema_version=schema_version,
+                reason="migration_archive_digest_mismatch",
+                unknown_evidence=unknown,
+            )
         if (
             int(migration["migration_version"]) != _LEDGER_MIGRATION_VERSION
             or int(latest["migration_version"]) != _LEDGER_MIGRATION_VERSION
@@ -1251,6 +1265,8 @@ class PaperBrokerStore:
             or int(latest["schema_version"]) != schema_version
             or str(migration["schema_fingerprint"]) != schema_fingerprint
             or str(latest["schema_fingerprint"]) != schema_fingerprint
+            or str(migration["migration_attestation_fingerprint"]) != immutable_migration.digest
+            or str(latest["migration_attestation_fingerprint"]) != immutable_migration.digest
         ):
             return PaperLedgerTrustStatus(
                 state="quarantined",
@@ -1717,7 +1733,7 @@ class PaperBrokerStore:
                 for column, table in _LEDGER_COUNT_TABLES.items()
             }
             migration_report = {
-                "migration_version": _LEDGER_MIGRATION_VERSION,
+                "migration_version": _V4_LEDGER_MIGRATION_VERSION,
                 "schema_version": 4,
                 "schema_fingerprint": schema_fingerprint,
                 "unknown_evidence": unknown,
@@ -1730,7 +1746,7 @@ class PaperBrokerStore:
                 {
                     "revision": 1,
                     "ledger_generation": secrets.token_hex(32),
-                    "migration_version": _LEDGER_MIGRATION_VERSION,
+                    "migration_version": _V4_LEDGER_MIGRATION_VERSION,
                     "schema_version": 4,
                     "schema_fingerprint": schema_fingerprint,
                     "previous_attestation_fingerprint": None,
@@ -1775,6 +1791,11 @@ class PaperBrokerStore:
         connection: sqlite3.Connection,
         *,
         failure_after_phase: str | None = None,
+        source_sha256: str | None = None,
+        v4_reconciliation_report_digest: str | None = None,
+        migration_code_identity: str = "rquant-fresh-v5-bootstrap",
+        source_schema_identity: str | None = None,
+        target_schema_identity: str = "paper-ledger-schema-v5-internal-4",
     ) -> None:
         """Promote v4 evidence without assigning fees that were never persisted."""
 
@@ -1788,6 +1809,13 @@ class PaperBrokerStore:
             raise PaperBrokerReconciliationError("paper ledger schema metadata is missing")
         schema_version = int(schema_row["schema_version"])
         if schema_version == 5:
+            if (
+                "internal_migration_version" not in schema_row
+                or int(schema_row["internal_migration_version"]) != _LEDGER_MIGRATION_VERSION
+            ):
+                raise PaperBrokerReconciliationError(
+                    "paper ledger schema v5 uses an unsupported internal migration version"
+                )
             return
         if schema_version != 4:
             raise PaperBrokerReconciliationError(
@@ -1815,6 +1843,19 @@ class PaperBrokerStore:
             raise PaperBrokerReconciliationError("paper ledger v4 attestation head is invalid")
         previous_v4_attestation = str(previous_attestation["attestation_fingerprint"])
         previous_v4_head = str(previous_head["head_marker_fingerprint"])
+        source_sha256 = source_sha256 or canonical_sha256(
+            {
+                "kind": "fresh-v5-bootstrap",
+                "schema_fingerprint": previous_v4_schema_fingerprint,
+            }
+        )
+        v4_reconciliation_report_digest = v4_reconciliation_report_digest or canonical_sha256(
+            {
+                "kind": "fresh-v5-empty-v4-report",
+                "schema_fingerprint": previous_v4_schema_fingerprint,
+            }
+        )
+        source_schema_identity = source_schema_identity or previous_v4_schema_fingerprint
         schema_columns = set(schema_row.keys())
         old_unknown = {
             column: int(schema_row[column])
@@ -1962,6 +2003,9 @@ class PaperBrokerStore:
                 CREATE TABLE paper_ledger_schema (
                     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
                     schema_version INTEGER NOT NULL CHECK(schema_version = 5),
+                    internal_migration_version INTEGER NOT NULL CHECK(
+                        internal_migration_version = 4
+                    ),
                     migrated_at TEXT NOT NULL,
                     unknown_fill_availability_count INTEGER NOT NULL CHECK(
                         unknown_fill_availability_count >= 0
@@ -2055,34 +2099,21 @@ class PaperBrokerStore:
                 );
                 CREATE TABLE paper_ledger_v4_archive_binding (
                     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
-                    predecessor_v4_schema_fingerprint TEXT NOT NULL,
-                    predecessor_v4_attestation_fingerprint TEXT NOT NULL,
-                    predecessor_v4_head_fingerprint TEXT NOT NULL,
-                    archive_content_fingerprint TEXT NOT NULL
+                    binding_payload_json TEXT NOT NULL,
+                    archive_binding_fingerprint TEXT NOT NULL
+                );
+                CREATE TABLE paper_ledger_migration_attestation (
+                    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                    report_json TEXT NOT NULL,
+                    migration_attestation_digest TEXT NOT NULL UNIQUE
                 );
                 """,
-            )
-            archive_content_fingerprint = self._v4_archive_content_fingerprint(connection)
-            connection.execute(
-                """
-                INSERT INTO paper_ledger_v4_archive_binding(
-                    singleton, predecessor_v4_schema_fingerprint,
-                    predecessor_v4_attestation_fingerprint,
-                    predecessor_v4_head_fingerprint, archive_content_fingerprint
-                ) VALUES (1, ?, ?, ?, ?)
-                """,
-                (
-                    previous_v4_schema_fingerprint,
-                    previous_v4_attestation,
-                    previous_v4_head,
-                    archive_content_fingerprint,
-                ),
             )
             unknown_cost_count = sum(legacy_cost_evidence.values())
             connection.execute(
                 """
                 INSERT INTO paper_ledger_schema(
-                    singleton, schema_version, migrated_at,
+                    singleton, schema_version, internal_migration_version, migrated_at,
                     unknown_fill_availability_count,
                     unknown_lot_availability_count,
                     unknown_consumption_availability_count,
@@ -2093,7 +2124,10 @@ class PaperBrokerStore:
                     unknown_initial_execution_identity_count,
                     unknown_execution_receipt_count,
                     unknown_cost_provenance_count
-                ) VALUES (1, 5, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (
+                    1, 5, 4, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
                 """,
                 (
                     old_unknown.get("unknown_fill_availability_count", 0),
@@ -2248,9 +2282,28 @@ class PaperBrokerStore:
                 CREATE TRIGGER paper_ledger_v4_archive_binding_delete_immutable
                 BEFORE DELETE ON paper_ledger_v4_archive_binding
                 BEGIN SELECT RAISE(ABORT, 'paper v4 archive binding is immutable'); END;
+                CREATE TRIGGER paper_ledger_migration_attestation_update_immutable
+                BEFORE UPDATE ON paper_ledger_migration_attestation
+                BEGIN SELECT RAISE(ABORT, 'paper migration attestation is immutable'); END;
+                CREATE TRIGGER paper_ledger_migration_attestation_delete_immutable
+                BEFORE DELETE ON paper_ledger_migration_attestation
+                BEGIN SELECT RAISE(ABORT, 'paper migration attestation is immutable'); END;
                 """,
             )
             self._migration_checkpoint(failure_after_phase, "archive_protection")
+            from rquant.paper_ledger_migration import write_migration_attestation
+
+            immutable_migration = write_migration_attestation(
+                connection,
+                source_sha256=source_sha256,
+                predecessor_v4_schema_fingerprint=previous_v4_schema_fingerprint,
+                predecessor_v4_attestation_fingerprint=previous_v4_attestation,
+                predecessor_v4_head_marker_fingerprint=previous_v4_head,
+                v4_reconciliation_report_digest=v4_reconciliation_report_digest,
+                migration_code_identity=migration_code_identity,
+                source_schema_identity=source_schema_identity,
+                target_schema_identity=target_schema_identity,
+            )
             schema_fingerprint = self._schema_fingerprint(connection)
             if schema_fingerprint is None:
                 raise PaperBrokerReconciliationError(
@@ -2260,18 +2313,7 @@ class PaperBrokerStore:
                 column: int(connection.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0])
                 for column, table in _LEDGER_COUNT_TABLES.items()
             }
-            migration_report = {
-                "migration_version": _LEDGER_MIGRATION_VERSION,
-                "schema_version": 5,
-                "schema_fingerprint": schema_fingerprint,
-                "previous_v4_attestation_fingerprint": previous_v4_attestation,
-                "previous_v4_head_fingerprint": previous_v4_head,
-                "previous_v4_schema_fingerprint": previous_v4_schema_fingerprint,
-                "archive_content_fingerprint": archive_content_fingerprint,
-                "unknown_cost_provenance": legacy_cost_evidence,
-                "counts": counts,
-            }
-            migration_fingerprint = canonical_sha256(migration_report)
+            migration_fingerprint = immutable_migration.digest
             self._insert_attestation(
                 connection,
                 {
@@ -2291,6 +2333,7 @@ class PaperBrokerStore:
             self._migration_checkpoint(failure_after_phase, "attestation")
             self._verify_v5_migration_in_connection(connection)
             self._migration_checkpoint(failure_after_phase, "verification")
+            connection.execute("PRAGMA user_version = 5")
             connection.commit()
         except BaseException:
             if connection.in_transaction:
@@ -4624,116 +4667,309 @@ class PaperBrokerStore:
             realized_pnl=stored_realized,
         )
 
-    def export_reconciled_execution_cost_binding(
+    def compare_research_execution_costs(
         self,
+        research: ExecutionCostBindingEvidence,
+        *,
+        account_id: str,
         execution_ids: tuple[str, ...],
-    ) -> PaperExecutionCostBindingExport:
-        """Issue opaque comparison evidence only for a stable reconciled receipt set."""
+    ) -> PaperExecutionCostComparison:
+        """Compare only after one anchored, reconciled, read-transaction snapshot."""
 
         normalized_ids = tuple(_execution_id(value) for value in execution_ids)
         if not normalized_ids or len(normalized_ids) != len(set(normalized_ids)):
             raise ValueError("execution_ids must be a non-empty unique tuple")
-        snapshot = self._execution_binding_snapshot(normalized_ids)
-        self.reconcile()
-        if self._current_attestation_identity() != (
-            snapshot.runtime_generation,
-            snapshot.attestation_head_fingerprint,
-            snapshot.attestation_revision,
-        ):
-            raise PaperBrokerReconciliationError(
-                "paper ledger changed while comparator evidence was being reconciled"
+        if account_id != self.account_id:
+            return PaperExecutionCostComparison(
+                is_comparable=False,
+                reason="ACCOUNT_BINDING_MISMATCH",
+                account_id=account_id,
+                execution_ids=normalized_ids,
             )
-        return _issue_reconciled_paper_execution_cost_binding(
-            account_id=snapshot.account_id,
-            execution_ids=snapshot.execution_ids,
-            receipt_execution_ids=snapshot.receipt_execution_ids,
-            fill_ids=snapshot.fill_ids,
-            execution_cost_spec=self.cost_policy.execution_cost_spec,
-            calculations=snapshot.calculations,
-            runtime_generation=snapshot.runtime_generation,
-            attestation_head_fingerprint=snapshot.attestation_head_fingerprint,
-            attestation_revision=snapshot.attestation_revision,
-            account_evidence_fingerprint=snapshot.account_evidence_fingerprint,
-        )
-
-    def _execution_binding_snapshot(
-        self,
-        execution_ids: tuple[str, ...],
-    ) -> _PaperExecutionBindingSnapshot:
         with self._connect() as connection:
             connection.execute("BEGIN")
             try:
                 self._require_trusted_ledger(connection)
                 account = connection.execute(
                     """
-                    SELECT account_id, initial_cash, cash, realized_pnl, cost_spec_id,
-                           cost_spec_schema_version, cost_provenance_state
+                    SELECT cost_spec_id, cost_spec_schema_version, cost_provenance_state
                     FROM broker_account WHERE account_id = ?
                     """,
-                    (self.account_id,),
+                    (account_id,),
                 ).fetchone()
-                if account is None:
-                    raise PaperBrokerReconciliationError("paper broker account is missing")
-                _migration, latest = self._attestation_head(connection)
-                receipts: list[PaperExecutionReceipt] = []
-                for execution_id in execution_ids:
-                    receipt = self._execution_receipt(connection, execution_id=execution_id)
-                    if receipt is None:
-                        raise PaperBrokerReconciliationError(
-                            "requested paper execution receipt is missing"
-                        )
-                    if (
-                        receipt.cost_provenance_state is not PaperCostProvenanceState.KNOWN_V3
-                        or receipt.fill is None
-                        or receipt.cost_calculation is None
-                        or receipt.cost_spec_id != self.cost_policy.cost_spec_id
-                    ):
-                        raise PaperBrokerReconciliationError(
-                            "requested paper receipt is not a known v3 persisted fill"
-                        )
-                    receipts.append(receipt)
-                account_evidence_fingerprint = canonical_sha256(
-                    {
-                        "account_id": str(account["account_id"]),
-                        "initial_cash": str(account["initial_cash"]),
-                        "cash": str(account["cash"]),
-                        "realized_pnl": str(account["realized_pnl"]),
-                        "cost_spec_id": str(account["cost_spec_id"]),
-                        "cost_spec_schema_version": int(account["cost_spec_schema_version"]),
-                        "cost_provenance_state": str(account["cost_provenance_state"]),
-                    }
+                if (
+                    account is None
+                    or account["cost_provenance_state"] != PaperCostProvenanceState.KNOWN_V3.value
+                    or int(account["cost_spec_schema_version"]) != 3
+                    or account["cost_spec_id"] is None
+                ):
+                    raise PaperBrokerReconciliationError(
+                        "paper comparator account lacks a known v3 cost binding"
+                    )
+                authority = connection.execute(
+                    """
+                    SELECT canonical_json FROM paper_cost_spec
+                    WHERE cost_spec_id = ? AND schema_version = 3
+                    """,
+                    (account["cost_spec_id"],),
+                ).fetchone()
+                if authority is None:
+                    raise PaperBrokerReconciliationError(
+                        "paper comparator cost authority is missing"
+                    )
+                spec = ExecutionCostSpec.from_canonical_json(authority["canonical_json"])
+                if spec.cost_spec_id != account["cost_spec_id"]:
+                    raise PaperBrokerReconciliationError(
+                        "paper comparator cost authority identity is invalid"
+                    )
+                reconciliation_digest, calculations = self._reconcile_comparison_snapshot(
+                    connection,
+                    spec=spec,
+                    execution_ids=normalized_ids,
                 )
-                return _PaperExecutionBindingSnapshot(
-                    account_id=self.account_id,
-                    execution_ids=execution_ids,
-                    receipt_execution_ids=tuple(receipt.execution_id for receipt in receipts),
-                    fill_ids=tuple(str(receipt.fill.fill_id) for receipt in receipts),
-                    calculations=tuple(
-                        receipt.cost_calculation for receipt in receipts if receipt.cost_calculation
+                migration, latest = self._attestation_head(connection)
+                marker = connection.execute(
+                    "SELECT * FROM paper_ledger_head_marker WHERE revision = ? LIMIT 1",
+                    (int(latest["revision"]),),
+                ).fetchone()
+                if marker is None:
+                    raise PaperBrokerReconciliationError(
+                        "paper comparator canonical head marker is missing"
+                    )
+                observed = {
+                    "ledger_generation": str(latest["ledger_generation"]),
+                    "head_revision": int(latest["revision"]),
+                    "head_marker_fingerprint": str(marker["head_marker_fingerprint"]),
+                    "attestation_fingerprint": str(latest["attestation_fingerprint"]),
+                    "migration_attestation_digest": str(
+                        migration["migration_attestation_fingerprint"]
                     ),
-                    runtime_generation=str(latest["ledger_generation"]),
-                    attestation_head_fingerprint=str(latest["attestation_fingerprint"]),
-                    attestation_revision=int(latest["revision"]),
-                    account_evidence_fingerprint=account_evidence_fingerprint,
+                    "reconciliation_digest": reconciliation_digest,
+                }
+                if not self._anchor_matches_current_head(observed):
+                    return PaperExecutionCostComparison(
+                        is_comparable=False,
+                        reason="CURRENT_HEAD_UNANCHORED",
+                        account_id=account_id,
+                        execution_ids=normalized_ids,
+                        **observed,
+                    )
+                math_match = compare_execution_cost_math(research, spec, calculations)
+                if not math_match.matches:
+                    return PaperExecutionCostComparison(
+                        is_comparable=False,
+                        reason=math_match.reason,
+                        account_id=account_id,
+                        execution_ids=normalized_ids,
+                        **observed,
+                    )
+                return PaperExecutionCostComparison(
+                    is_comparable=True,
+                    reason="EXACT_V3_BOUND",
+                    account_id=account_id,
+                    execution_ids=normalized_ids,
+                    **observed,
+                )
+            except (PaperBrokerReconciliationError, TypeError, ValueError, sqlite3.DatabaseError):
+                return PaperExecutionCostComparison(
+                    is_comparable=False,
+                    reason="PAPER_LEDGER_RECONCILIATION_FAILED",
+                    account_id=account_id,
+                    execution_ids=normalized_ids,
                 )
             finally:
                 if connection.in_transaction:
                     connection.rollback()
 
-    def _current_attestation_identity(self) -> tuple[str, str, int]:
-        with self._connect() as connection:
-            connection.execute("BEGIN")
-            try:
-                self._require_trusted_ledger(connection)
-                _migration, latest = self._attestation_head(connection)
-                return (
-                    str(latest["ledger_generation"]),
-                    str(latest["attestation_fingerprint"]),
-                    int(latest["revision"]),
+    def _anchor_matches_current_head(self, observed: Mapping[str, object]) -> bool:
+        path = self.ledger_anchor_path
+        verifier = self.ledger_anchor_verifier
+        if self.ledger_id is None or path is None or verifier is None:
+            return False
+        if not path.is_file() or path.is_symlink() or path.stat().st_size > 64 * 1024:
+            return False
+        try:
+            anchor = PaperLedgerAnchor.model_validate_json(path.read_bytes())
+        except (OSError, ValueError):
+            return False
+        claims = anchor.claims
+        return verifier.verify(anchor) and (
+            claims.ledger_id == self.ledger_id
+            and claims.schema_version == 5
+            and claims.migration_attestation_digest == observed["migration_attestation_digest"]
+            and claims.head_revision == observed["head_revision"]
+            and claims.head_marker_fingerprint == observed["head_marker_fingerprint"]
+            and claims.attestation_fingerprint == observed["attestation_fingerprint"]
+        )
+
+    def _reconcile_comparison_snapshot(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        spec: ExecutionCostSpec,
+        execution_ids: tuple[str, ...],
+    ) -> tuple[str, tuple[ExecutionCostCalculation, ...]]:
+        account = connection.execute(
+            "SELECT * FROM broker_account WHERE account_id = ?",
+            (self.account_id,),
+        ).fetchone()
+        if account is None:
+            raise PaperBrokerReconciliationError("paper comparator account is missing")
+        authority_row = connection.execute(
+            "SELECT * FROM paper_account_authority WHERE account_id = ?",
+            (self.account_id,),
+        ).fetchone()
+        if authority_row is None:
+            raise PaperBrokerReconciliationError("paper comparator account authority is missing")
+        authority = PaperAccountAuthoritySnapshot(
+            revision=authority_row["revision"],
+            state_fingerprint=authority_row["state_fingerprint"],
+            producer_commit=authority_row["producer_commit"],
+            snapshot=PaperAccountSnapshot.model_validate_json(authority_row["snapshot_json"]),
+        )
+        if (
+            authority.snapshot.account_id != self.account_id
+            or authority.snapshot.cash != Decimal(account["cash"])
+            or authority.snapshot.realized_pnl != Decimal(account["realized_pnl"])
+        ):
+            raise PaperBrokerReconciliationError(
+                "paper comparator persisted account authority differs"
+            )
+        fill_rows = connection.execute(
+            """
+            SELECT f.*, o.side FROM paper_fill AS f
+            JOIN paper_order AS o ON o.order_id = f.order_id
+            WHERE o.account_id = ?
+            ORDER BY f.executed_at, f.persisted_at, f.sequence, f.fill_id
+            """,
+            (self.account_id,),
+        ).fetchall()
+        expected_cash = Decimal(account["initial_cash"])
+        expected_realized = Decimal("0")
+        reconciled_fills: list[dict[str, object]] = []
+        requested: dict[str, ExecutionCostCalculation] = {}
+        for row in fill_rows:
+            fill = self._fill_from_row(row)
+            receipt = self._execution_receipt(connection, execution_id=fill.execution_id)
+            if (
+                receipt is None
+                or receipt.fill != fill
+                or receipt.order.account_id != self.account_id
+                or receipt.cost_calculation is None
+                or receipt.cost_provenance_state is not PaperCostProvenanceState.KNOWN_V3
+            ):
+                raise PaperBrokerReconciliationError(
+                    "paper comparator fill receipt does not reconcile"
                 )
-            finally:
-                if connection.in_transaction:
-                    connection.rollback()
+            calculation = receipt.cost_calculation
+            replayed = calculate_execution_costs(
+                spec,
+                calculation.order_input,
+                calculation.instrument_context,
+            )
+            if (
+                replayed != calculation
+                or fill.price != replayed.executed_price
+                or fill.commission != replayed.commission
+                or fill.transfer_fee != replayed.transfer_fee
+                or fill.tax != replayed.stamp_duty
+                or fill.total_fees != replayed.total_fees
+            ):
+                raise PaperBrokerReconciliationError(
+                    "paper comparator shared-engine replay differs from persisted fill"
+                )
+            assert fill.total_fees is not None
+            if row["side"] == PaperSide.BUY.value:
+                expected_cash -= fill.notional + fill.total_fees
+                lot = connection.execute(
+                    "SELECT * FROM paper_lot WHERE lot_id = ?",
+                    (fill.fill_id,),
+                ).fetchone()
+                if (
+                    lot is None
+                    or int(lot["original_quantity"]) != fill.quantity
+                    or Decimal(lot["unit_cost"])
+                    != (fill.notional + fill.total_fees) / fill.quantity
+                ):
+                    raise PaperBrokerReconciliationError(
+                        "paper comparator BUY lot basis does not reconcile"
+                    )
+            else:
+                allocations = connection.execute(
+                    """
+                    SELECT quantity, unit_cost FROM paper_lot_consumption
+                    WHERE fill_id = ? ORDER BY lot_id
+                    """,
+                    (fill.fill_id,),
+                ).fetchall()
+                if sum(int(item["quantity"]) for item in allocations) != fill.quantity:
+                    raise PaperBrokerReconciliationError(
+                        "paper comparator SELL FIFO allocation does not reconcile"
+                    )
+                basis = sum(
+                    (Decimal(item["unit_cost"]) * int(item["quantity"]) for item in allocations),
+                    Decimal("0"),
+                )
+                proceeds = fill.notional - fill.total_fees
+                expected_cash += proceeds
+                expected_realized += proceeds - basis
+            if fill.execution_id in execution_ids:
+                requested[fill.execution_id] = replayed
+            reconciled_fills.append(fill.model_dump(mode="python"))
+        for lot in connection.execute(
+            "SELECT * FROM paper_lot WHERE account_id = ? ORDER BY lot_id",
+            (self.account_id,),
+        ).fetchall():
+            consumed = int(
+                connection.execute(
+                    "SELECT COALESCE(SUM(quantity), 0) FROM paper_lot_consumption WHERE lot_id = ?",
+                    (lot["lot_id"],),
+                ).fetchone()[0]
+            )
+            if int(lot["remaining_quantity"]) + consumed != int(lot["original_quantity"]):
+                raise PaperBrokerReconciliationError(
+                    "paper comparator lot quantity does not reconcile"
+                )
+        authority_quantities = {
+            holding.code: holding.quantity for holding in authority.snapshot.holdings
+        }
+        open_quantities = {
+            str(row["ts_code"]): int(row["quantity"])
+            for row in connection.execute(
+                """
+                SELECT ts_code, SUM(remaining_quantity) AS quantity FROM paper_lot
+                WHERE account_id = ? AND remaining_quantity > 0 GROUP BY ts_code
+                """,
+                (self.account_id,),
+            ).fetchall()
+        }
+        if authority_quantities != open_quantities:
+            raise PaperBrokerReconciliationError(
+                "paper comparator account authority holdings differ"
+            )
+        if (
+            Decimal(account["cash"]) != expected_cash
+            or Decimal(account["realized_pnl"]) != expected_realized
+        ):
+            raise PaperBrokerReconciliationError(
+                "paper comparator account cash or realized P&L does not reconcile"
+            )
+        if set(requested) != set(execution_ids):
+            raise PaperBrokerReconciliationError(
+                "paper comparator requested execution topology does not reconcile"
+            )
+        digest = canonical_sha256(
+            {
+                "account_id": self.account_id,
+                "initial_cash": str(account["initial_cash"]),
+                "cash": str(account["cash"]),
+                "realized_pnl": str(account["realized_pnl"]),
+                "cost_spec_id": str(account["cost_spec_id"]),
+                "account_authority_fingerprint": authority.state_fingerprint,
+                "fills": tuple(reconciled_fills),
+            }
+        )
+        return digest, tuple(requested[execution_id] for execution_id in execution_ids)
 
     def _reconcile_sell_entry_provenance(
         self,
@@ -4809,98 +5045,3 @@ class PaperBrokerStore:
         except ValueError:
             errors.append(f"{label} is invalid")
             return None
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _offline_migration_connection(path: Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(path, isolation_level=None)
-    connection.row_factory = sqlite3.Row
-    try:
-        connection.execute("PRAGMA foreign_keys = ON")
-        enabled = connection.execute("PRAGMA foreign_keys").fetchone()
-        if enabled is None or int(enabled[0]) != 1:
-            raise PaperBrokerReconciliationError(
-                "offline paper migration requires SQLite foreign_keys enforcement"
-            )
-        connection.execute("PRAGMA synchronous = FULL")
-    except BaseException:
-        connection.close()
-        raise
-    return connection
-
-
-def migrate_paper_ledger_v4_offline_copy(
-    source_path: Path,
-    candidate_path: Path,
-    *,
-    failure_after_phase: str | None = None,
-) -> PaperOfflineMigrationResult:
-    """Copy a closed v4 ledger, verify the v5 candidate, then atomically promote it."""
-
-    if failure_after_phase not in {None, *_OFFLINE_MIGRATION_PHASES}:
-        raise ValueError("unsupported offline migration failure phase")
-    source = Path(source_path).absolute()
-    candidate = Path(candidate_path).absolute()
-    if source == candidate:
-        raise ValueError("offline migration source and candidate paths must differ")
-    if not source.is_file() or source.is_symlink():
-        raise PaperBrokerReconciliationError("offline migration source must be a regular file")
-    if candidate.exists():
-        raise PaperBrokerReconciliationError("offline migration candidate path already exists")
-    for suffix in ("-wal", "-shm", "-journal"):
-        sidecar = Path(f"{source}{suffix}")
-        if sidecar.exists() and sidecar.stat().st_size:
-            raise PaperBrokerReconciliationError(
-                "offline migration requires a checkpointed source copy"
-            )
-    candidate.parent.mkdir(parents=True, exist_ok=True)
-    source_sha256 = _sha256_file(source)
-    temporary = candidate.with_name(f".{candidate.name}.offline-migrating-{secrets.token_hex(12)}")
-    try:
-        shutil.copyfile(source, temporary)
-        store = object.__new__(PaperBrokerStore)
-        store.path = temporary
-        store.account_id = "offline-migration-verifier"
-        store.busy_timeout_ms = 5_000
-        with _offline_migration_connection(temporary) as connection:
-            store._ensure_ledger_schema_v5(
-                connection,
-                failure_after_phase=failure_after_phase,
-            )
-        with _offline_migration_connection(temporary) as connection:
-            PaperBrokerStore._verify_v5_migration_in_connection(connection)
-        if _sha256_file(source) != source_sha256:
-            raise PaperBrokerReconciliationError(
-                "offline migration source changed while candidate was being verified"
-            )
-        candidate_sha256 = _sha256_file(temporary)
-        with temporary.open("rb") as candidate_file:
-            os.fsync(candidate_file.fileno())
-        os.replace(temporary, candidate)
-        directory_descriptor = os.open(candidate.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_descriptor)
-        finally:
-            os.close(directory_descriptor)
-        return PaperOfflineMigrationResult(
-            source_path=source,
-            candidate_path=candidate,
-            source_sha256=source_sha256,
-            candidate_sha256=candidate_sha256,
-            reconciliation_verified=True,
-        )
-    except BaseException:
-        if temporary.exists():
-            temporary.unlink()
-        if _sha256_file(source) != source_sha256:
-            raise PaperBrokerReconciliationError(
-                "offline migration source changed unexpectedly"
-            ) from None
-        raise

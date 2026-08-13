@@ -1,0 +1,41 @@
+{
+  "account_id": "legacy-v4-account",
+  "initial_cash": "10000.00",
+  "cost_policy": {
+    "commission_rate": "0.0003",
+    "minimum_commission": "5.00",
+    "sell_stamp_tax_rate": "0.001",
+    "buy_slippage_bps": "0",
+    "sell_slippage_bps": "0"
+  },
+  "ts_code": "600000.SH",
+  "producer_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "price_snapshot_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "frozen_now": "2026-07-30T00:00:00+00:00",
+  "ledger_generation": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "executions": [
+    {
+      "side": "BUY",
+      "signal_id": "1111111111111111111111111111111111111111111111111111111111111111",
+      "execution_id": "2222222222222222222222222222222222222222222222222222222222222222",
+      "event_time": "2026-07-31T01:30:58+00:00",
+      "decision_time": "2026-07-31T01:31:00+00:00",
+      "persisted_at": "2026-07-31T01:31:00+00:00",
+      "trade_date": "2026-07-31",
+      "available_date": "2026-08-03",
+      "quantity": 100,
+      "price": "10.00"
+    },
+    {
+      "side": "SELL",
+      "signal_id": "3333333333333333333333333333333333333333333333333333333333333333",
+      "execution_id": "4444444444444444444444444444444444444444444444444444444444444444",
+      "event_time": "2026-08-03T01:30:58+00:00",
+      "decision_time": "2026-08-03T01:31:00+00:00",
+      "persisted_at": "2026-08-03T01:31:00+00:00",
+      "trade_date": "2026-08-03",
+      "quantity": 100,
+      "price": "11.00"
+    }
+  ]
+}
