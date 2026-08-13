@@ -420,15 +420,32 @@ def test_wrapper_binds_profile_root_and_checkout_arguments_from_controlled_conte
     bound = namespace["_bind_controlled_daemon_arguments"](
         checkout,
         TRUSTED_GIT,
-        [str(checkout / ".venv/bin/rquant"), "lab-runtime-prepare"],
+        [
+            str(checkout / ".venv/bin/rquant"),
+            "lab-runtime-prepare",
+            "--runtime-code-config",
+            "/etc/rquant/runtime-code-bootstrap.json",
+            "--runtime-code-trusted-base",
+            "/etc/rquant",
+            "--runtime-code-authority-uid",
+            "0",
+            "--runtime-code-authority-gid",
+            "0",
+        ],
         environ={"RQUANT_RUNTIME_ROOT": str(runtime_root)},
     )
 
-    assert bound[-6:] == [
-        "--expected-checkout-root",
-        str(checkout),
-        "--trusted-git-path",
-        str(TRUSTED_GIT),
+    assert bound == [
+        str(checkout / ".venv/bin/rquant"),
+        "lab-runtime-prepare",
+        "--runtime-code-config",
+        "/etc/rquant/runtime-code-bootstrap.json",
+        "--runtime-code-trusted-base",
+        "/etc/rquant",
+        "--runtime-code-authority-uid",
+        "0",
+        "--runtime-code-authority-gid",
+        "0",
         "--runtime-deployment-root",
         str(runtime_root),
     ]
@@ -646,10 +663,9 @@ def test_lab_runtime_wrapper_runs_preflight_before_daemon_exec(tmp_path: Path) -
     )
     assert result.stdout.count("Lab runtime preflight:") == 1
     daemon_argv = json.loads(marker.read_text(encoding="utf-8"))
-    assert daemon_argv[:2] == [
-        "lab-worker",
-        "--expected-checkout-root",
-    ]
+    assert daemon_argv[:4] == ["lab-worker", "--worker-id", "rquant-mac-primary", "--once"]
+    assert "--expected-checkout-root" not in daemon_argv
+    assert "--trusted-git-path" not in daemon_argv
     assert daemon_argv[daemon_argv.index("--deployment-operation-id") + 1]
     assert len(daemon_argv[daemon_argv.index("--deployment-environment-generation") + 1]) == 64
     runtime = json.loads(marker.with_suffix(".runtime.json").read_text(encoding="utf-8"))

@@ -287,20 +287,8 @@ def _validate_daemon_argv(
     )
     if daemon_argv[1] not in _ALLOWED_DAEMONS:
         raise WrapperError("unsupported Lab daemon command")
-    root_values = [
-        daemon_argv[index + 1]
-        for index, value in enumerate(daemon_argv[:-1])
-        if value == "--expected-checkout-root"
-    ]
-    if root_values != [str(root)]:
-        raise WrapperError("daemon expected checkout root does not match wrapper binding")
-    git_values = [
-        daemon_argv[index + 1]
-        for index, value in enumerate(daemon_argv[:-1])
-        if value == "--trusted-git-path"
-    ]
-    if git_values != [str(trusted_git)]:
-        raise WrapperError("daemon trusted Git path does not match wrapper binding")
+    if any(option in daemon_argv for option in ("--expected-checkout-root", "--trusted-git-path")):
+        raise WrapperError("legacy daemon checkout or Git arguments are forbidden")
     for forbidden in (
         "--deployment-generation",
         "--deployment-generation-fd",
@@ -327,17 +315,6 @@ def _bind_exact_option(
         raise WrapperError(f"{label} does not match wrapper-controlled context")
 
 
-def _replace_bound_option(argv: list[str], *, option: str, value: str) -> list[str]:
-    """Rebind one already-validated option while preserving daemon argument order."""
-
-    rebound = list(argv)
-    indexes = [index for index, candidate in enumerate(rebound[:-1]) if candidate == option]
-    if len(indexes) != 1:
-        raise WrapperError(f"{option} is not uniquely bound")
-    rebound[indexes[0] + 1] = value
-    return rebound
-
-
 def _bind_controlled_daemon_arguments(
     root: Path,
     trusted_git: Path,
@@ -350,18 +327,19 @@ def _bind_controlled_daemon_arguments(
     if len(daemon_argv) < 2 or daemon_argv[1] not in _ALLOWED_DAEMONS:
         raise WrapperError("formal Lab daemon command is missing or invalid")
     bound = list(daemon_argv)
-    _bind_exact_option(
-        bound,
-        option="--expected-checkout-root",
-        expected=str(root),
-        label="daemon checkout root",
-    )
-    _bind_exact_option(
-        bound,
-        option="--trusted-git-path",
-        expected=str(trusted_git),
-        label="daemon trusted Git path",
-    )
+    for option, expected, label in (
+        ("--expected-checkout-root", str(root), "daemon checkout root"),
+        ("--trusted-git-path", str(trusted_git), "daemon trusted Git path"),
+    ):
+        indexes = [index for index, value in enumerate(bound) if value == option]
+        if not indexes:
+            continue
+        if any(index == len(bound) - 1 for index in indexes):
+            raise WrapperError(f"{label} is incomplete")
+        values = [bound[index + 1] for index in indexes]
+        if values != [expected]:
+            raise WrapperError(f"{label} does not match wrapper-controlled context")
+        del bound[indexes[0] : indexes[0] + 2]
     if daemon_argv[1] in {"lab-runtime-prepare", "lab-scheduler"}:
         raw_runtime_root = environ.get("RQUANT_RUNTIME_ROOT", "")
         if (
@@ -1085,16 +1063,7 @@ def main(argv: list[str] | None = None) -> int:
         immutable_wrapper = immutable_code_root / "scripts" / "run-lab-daemon.py"
         _require_owned_directory(immutable_code_root, label="immutable code root")
         _require_owned_regular(immutable_wrapper, label="immutable Lab runtime wrapper")
-        immutable_daemon_argv = _replace_bound_option(
-            daemon_argv,
-            option="--expected-checkout-root",
-            value=str(immutable_code_root),
-        )
-        immutable_daemon_argv = _replace_bound_option(
-            immutable_daemon_argv,
-            option="--trusted-git-path",
-            value=str(trusted_git),
-        )
+        immutable_daemon_argv = list(daemon_argv)
         immutable_daemon_argv[0] = str(selected_launcher)
         os.chdir(immutable_code_root)
         os.execv(

@@ -42,6 +42,22 @@ _LAB_DAEMON_GENERATION_ARGUMENTS = [
     "--startup-deadline-monotonic",
     str(_LAB_STARTUP_DEADLINE),
 ]
+_LAB_RUNTIME_BOOTSTRAP_ARGUMENTS = [
+    "--runtime-code-config",
+    "/etc/rquant/runtime-code-bootstrap.json",
+    "--runtime-code-trusted-base",
+    "/etc/rquant",
+    "--runtime-code-authority-uid",
+    "0",
+    "--runtime-code-authority-gid",
+    "0",
+]
+_LAB_RUNTIME_BOOTSTRAP_VALUES = {
+    "runtime_code_config": Path("/etc/rquant/runtime-code-bootstrap.json"),
+    "runtime_code_trusted_base": Path("/etc/rquant"),
+    "runtime_code_authority_uid": 0,
+    "runtime_code_authority_gid": 0,
+}
 
 
 def test_legacy_shadow_recovery_cli_is_recovery_only() -> None:
@@ -4656,6 +4672,7 @@ class TestLabSchedulerCli:
     @pytest.fixture(autouse=True)
     def configured_daemon_runtime(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from rquant import (
+            cli,
             job_center_authority,
             lab_artifact_protocol,
             lab_artifacts,
@@ -4699,6 +4716,11 @@ class TestLabSchedulerCli:
                 assert callable(mutation_guard)
 
         monkeypatch.setattr(lab_daemon, "LabDaemonLock", FakeLock)
+        monkeypatch.setattr(
+            cli,
+            "_establish_lab_runtime_identity",
+            lambda _args: ("1" * 40, object(), object(), lambda: "1" * 40),
+        )
         monkeypatch.setattr(
             lab_daemon,
             "require_lab_runtime_binding",
@@ -4759,10 +4781,7 @@ class TestLabSchedulerCli:
         scheduler = build_parser().parse_args(
             [
                 "lab-scheduler",
-                "--expected-checkout-root",
-                _LAB_EXPECTED_ROOT,
-                "--trusted-git-path",
-                _LAB_TRUSTED_GIT,
+                *_LAB_RUNTIME_BOOTSTRAP_ARGUMENTS,
                 "--runtime-deployment-root",
                 "/tmp/rquant-production-runtime",
                 *_LAB_DAEMON_GENERATION_ARGUMENTS,
@@ -4780,10 +4799,7 @@ class TestLabSchedulerCli:
         args = build_parser().parse_args(
             [
                 "lab-scheduler",
-                "--expected-checkout-root",
-                _LAB_EXPECTED_ROOT,
-                "--trusted-git-path",
-                _LAB_TRUSTED_GIT,
+                *_LAB_RUNTIME_BOOTSTRAP_ARGUMENTS,
                 "--runtime-deployment-root",
                 "/tmp/rquant-production-runtime",
                 *_LAB_DAEMON_GENERATION_ARGUMENTS,
@@ -4803,7 +4819,7 @@ class TestLabSchedulerCli:
 
         monkeypatch.setattr(
             lab_daemon,
-            "verify_lab_runtime_prepared",
+            "load_lab_job_center_authority_manifest",
             lambda *_args, **_kwargs: (_ for _ in ()).throw(
                 lab_daemon.LabDaemonConfigurationError("prepared sentinel missing")
             ),
@@ -4820,8 +4836,7 @@ class TestLabSchedulerCli:
             cmd_lab_scheduler(
                 argparse.Namespace(
                     once=True,
-                    expected_checkout_root=_LAB_EXPECTED_ROOT,
-                    trusted_git_path=_LAB_TRUSTED_GIT,
+                    **_LAB_RUNTIME_BOOTSTRAP_VALUES,
                     runtime_deployment_root="/tmp/rquant-production-runtime",
                     startup_deadline_monotonic=_LAB_STARTUP_DEADLINE,
                 )
@@ -4855,8 +4870,7 @@ class TestLabSchedulerCli:
             cmd_lab_scheduler(
                 argparse.Namespace(
                     once=True,
-                    expected_checkout_root=_LAB_EXPECTED_ROOT,
-                    trusted_git_path=_LAB_TRUSTED_GIT,
+                    **_LAB_RUNTIME_BOOTSTRAP_VALUES,
                     runtime_deployment_root="/tmp/rquant-production-runtime",
                     startup_deadline_monotonic=_LAB_STARTUP_DEADLINE,
                 )
@@ -5001,8 +5015,7 @@ class TestLabSchedulerCli:
         result = cmd_lab_scheduler(
             argparse.Namespace(
                 once=True,
-                expected_checkout_root=_LAB_EXPECTED_ROOT,
-                trusted_git_path=_LAB_TRUSTED_GIT,
+                **_LAB_RUNTIME_BOOTSTRAP_VALUES,
                 runtime_deployment_root="/tmp/rquant-production-runtime",
                 startup_deadline_monotonic=_LAB_STARTUP_DEADLINE,
             )
@@ -5079,8 +5092,7 @@ class TestLabSchedulerCli:
         result = cmd_lab_scheduler(
             argparse.Namespace(
                 once=False,
-                expected_checkout_root=_LAB_EXPECTED_ROOT,
-                trusted_git_path=_LAB_TRUSTED_GIT,
+                **_LAB_RUNTIME_BOOTSTRAP_VALUES,
                 runtime_deployment_root="/tmp/rquant-production-runtime",
                 startup_deadline_monotonic=_LAB_STARTUP_DEADLINE,
             )

@@ -12,6 +12,7 @@ import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from rquant.artifact_retention_catalog_authority import (
@@ -30,6 +31,8 @@ from rquant.runtime_deployment_profile import (
 )
 from rquant.runtime_service_control import RuntimeServicePlane
 from rquant.runtime_service_entrypoint import RuntimeServiceKind, RuntimeServiceManifest
+from tests.formal_smoke_real_generation_support import real_promotion_authority
+from tests.runtime_code_e2e_support import build_test_package, install_test_package
 
 ROOT = Path(__file__).resolve().parents[2]
 TRUSTED_GIT = Path("/usr/bin/git")
@@ -438,6 +441,34 @@ def _runtime_env(runtime_root: Path, research: Path, tmp_path: Path) -> dict[str
     return env
 
 
+def _runtime_code_arguments(configuration_path: Path, trusted_base: Path) -> tuple[str, ...]:
+    return (
+        "--runtime-code-config",
+        str(configuration_path),
+        "--runtime-code-trusted-base",
+        str(trusted_base),
+        "--runtime-code-authority-uid",
+        str(os.getuid()),
+        "--runtime-code-authority-gid",
+        str(os.getgid()),
+    )
+
+
+def _install_runtime_code_generation(
+    root: Path,
+    *,
+    provenance_commit: str,
+) -> tuple[object, Path, Path, object]:
+    package = build_test_package(
+        root / "package",
+        provenance_commit=provenance_commit,
+        python_abi=sys.implementation.cache_tag or "invalid",
+        now=datetime.now(UTC),
+    )
+    trusted_base, runtime_root, installer = install_test_package(root, package)
+    return package, trusted_base, runtime_root, installer
+
+
 def _wrapper_command(checkout: Path, *daemon_args: str) -> list[str]:
     deployment_lock = checkout.parent / ".rquant-deploy" / f"{checkout.name}.lock"
     return [
@@ -491,6 +522,10 @@ def test_real_wrapper_cli_first_install_sha_roll_and_scheduler_auto_load(
     _prepare_authority_dependencies(runtime_root, commit=first_sha)
     first_profile_id, first_generation = _install_profile(runtime_root, commit=first_sha)
     env = _runtime_env(runtime_root, research, tmp_path)
+    first_package, trusted_base, code_runtime_root, installer = _install_runtime_code_generation(
+        tmp_path / "runtime-code-first",
+        provenance_commit=first_sha,
+    )
     (
         _first_release,
         first_marker_generation,
@@ -500,84 +535,96 @@ def test_real_wrapper_cli_first_install_sha_roll_and_scheduler_auto_load(
         previous_sha=None,
         target_sha=first_sha,
     )
-    prepare_command = _wrapper_command(checkout, "lab-runtime-prepare")
     try:
-        first = _run(prepare_command, cwd=checkout, env=env)
-        assert first.returncode == 0, first.stderr
-        retention = next(
-            manifest.settings
-            for manifest in _profile(runtime_root, commit=first_sha).manifests
-            if manifest.service_kind is RuntimeServiceKind.ARTIFACT_RETENTION
+        first_generation_context = SimpleNamespace(
+            package=first_package,
+            trusted_base=trusted_base,
+            runtime_root=code_runtime_root,
         )
-        retention_authority = load_retention_catalog_authority(
-            Path(str(retention["catalog_authority_root"])),
-            expected_producer_commit=first_sha,
-            expected_reference_store_path=Path(str(retention["reference_store_path"])),
-        )
-        assert retention_authority.current_receipt_path.exists()
-        current = research / "job-center-authority.json"
-        first_manifest = load_job_center_authority(
-            current,
-            expected_code_sha=first_sha,
-            runtime_root=research,
-            runtime_deployment_root=runtime_root,
-            deployment_profile_id=first_profile_id,
-            deployment_generation_hash=first_generation,
-        )
-        first_payload = current.read_bytes()
+        with real_promotion_authority(
+            tmp_path / "promotion-first",
+            generation=first_generation_context,
+        ) as first_configuration:
+            first_arguments = _runtime_code_arguments(first_configuration, trusted_base)
+            first = _run(
+                _wrapper_command(checkout, "lab-runtime-prepare", *first_arguments),
+                cwd=checkout,
+                env=env,
+            )
+            assert first.returncode == 0, first.stderr
+            retention = next(
+                manifest.settings
+                for manifest in _profile(runtime_root, commit=first_sha).manifests
+                if manifest.service_kind is RuntimeServiceKind.ARTIFACT_RETENTION
+            )
+            retention_authority = load_retention_catalog_authority(
+                Path(str(retention["catalog_authority_root"])),
+                expected_producer_commit=first_sha,
+                expected_reference_store_path=Path(str(retention["reference_store_path"])),
+            )
+            assert retention_authority.current_receipt_path.exists()
+            current = research / "job-center-authority.json"
+            first_manifest = load_job_center_authority(
+                current,
+                expected_code_sha=first_sha,
+                runtime_root=research,
+                runtime_deployment_root=runtime_root,
+                deployment_profile_id=first_profile_id,
+                deployment_generation_hash=first_generation,
+            )
+            first_payload = current.read_bytes()
 
-        missing_env = {**env, "RQUANT_RUNTIME_ROOT": str(tmp_path / "missing-runtime")}
-        missing = _run(
-            _wrapper_command(checkout, "lab-runtime-prepare"),
-            cwd=checkout,
-            env=missing_env,
-        )
-        assert missing.returncode != 0
-        assert current.read_bytes() == first_payload
+            missing_env = {**env, "RQUANT_RUNTIME_ROOT": str(tmp_path / "missing-runtime")}
+            missing = _run(
+                _wrapper_command(checkout, "lab-runtime-prepare", *first_arguments),
+                cwd=checkout,
+                env=missing_env,
+            )
+            assert missing.returncode != 0
+            assert current.read_bytes() == first_payload
 
-        (checkout / "rollout-marker.txt").write_text("second\n", encoding="utf-8")
-        subprocess.run([str(TRUSTED_GIT), "add", "rollout-marker.txt"], cwd=checkout, check=True)
-        subprocess.run(
-            [
-                str(TRUSTED_GIT),
-                "-c",
-                "user.name=rQuant Tests",
-                "-c",
-                "user.email=tests@rquant.invalid",
-                "commit",
-                "-qm",
-                "roll authority SHA",
-            ],
-            cwd=checkout,
-            check=True,
-        )
-        second_sha = _git(checkout, "rev-parse", "HEAD")
-        second_profile_id, second_generation = _install_profile(
-            runtime_root,
-            commit=second_sha,
-        )
-        (research / ".job-center-authority.candidate.json").write_bytes(b'{"half":')
-        (research / ".job-center-authority.candidate.json").chmod(0o600)
+            (checkout / "rollout-marker.txt").write_text("second\n", encoding="utf-8")
+            subprocess.run(
+                [str(TRUSTED_GIT), "add", "rollout-marker.txt"], cwd=checkout, check=True
+            )
+            subprocess.run(
+                [
+                    str(TRUSTED_GIT),
+                    "-c",
+                    "user.name=rQuant Tests",
+                    "-c",
+                    "user.email=tests@rquant.invalid",
+                    "commit",
+                    "-qm",
+                    "roll authority SHA",
+                ],
+                cwd=checkout,
+                check=True,
+            )
+            second_sha = _git(checkout, "rev-parse", "HEAD")
+            second_profile_id, second_generation = _install_profile(
+                runtime_root,
+                commit=second_sha,
+            )
+            (research / ".job-center-authority.candidate.json").write_bytes(b'{"half":')
+            (research / ".job-center-authority.candidate.json").chmod(0o600)
 
-        scheduler_before_roll = _run(
-            [
-                str(checkout / ".venv" / "bin" / "rquant"),
-                "lab-scheduler",
-                "--expected-checkout-root",
-                str(checkout),
-                "--trusted-git-path",
-                str(TRUSTED_GIT),
-                "--runtime-deployment-root",
-                str(runtime_root),
-                "--startup-deadline-monotonic",
-                str(time.monotonic() + 30),
-                "--once",
-            ],
-            cwd=checkout,
-            env=env,
-        )
-        assert scheduler_before_roll.returncode != 0
-        assert current.read_bytes() == first_payload
+            scheduler_before_roll = _run(
+                [
+                    str(checkout / ".venv" / "bin" / "rquant"),
+                    "lab-scheduler",
+                    *first_arguments,
+                    "--runtime-deployment-root",
+                    str(runtime_root),
+                    "--startup-deadline-monotonic",
+                    str(time.monotonic() + 30),
+                    "--once",
+                ],
+                cwd=checkout,
+                env=env,
+            )
+            assert scheduler_before_roll.returncode != 0
+            assert current.read_bytes() == first_payload
 
         _publish_release_generation(
             checkout,
@@ -586,28 +633,49 @@ def test_real_wrapper_cli_first_install_sha_roll_and_scheduler_auto_load(
             previous_marker_generation=first_marker_generation,
             previous_environment_generation=first_environment_generation,
         )
-        second_prepare = _run(
-            _wrapper_command(checkout, "lab-runtime-prepare"),
-            cwd=checkout,
-            env=env,
+        second_package = build_test_package(
+            tmp_path / "runtime-code-second" / "package",
+            sequence=2,
+            previous_receipt_sha256=hashlib.sha256(first_package.receipt_bytes).hexdigest(),
+            provenance_commit=second_sha,
+            authorities=first_package.authorities,
+            promotion_state=first_package.promotion_state,
+            python_abi=sys.implementation.cache_tag or "invalid",
+            now=datetime.now(UTC),
         )
-        assert second_prepare.returncode == 0, second_prepare.stderr
-        second_manifest = load_job_center_authority(
-            current,
-            expected_code_sha=second_sha,
-            runtime_root=research,
-            runtime_deployment_root=runtime_root,
-            deployment_profile_id=second_profile_id,
-            deployment_generation_hash=second_generation,
+        installer.install(second_package.request())
+        second_generation_context = SimpleNamespace(
+            package=second_package,
+            trusted_base=trusted_base,
+            runtime_root=code_runtime_root,
         )
-        assert second_manifest.manifest_hash != first_manifest.manifest_hash
-        assert not (research / ".job-center-authority.candidate.json").exists()
-        _prepare_scheduler_keys(research, env)
-        scheduler_after_roll = _run(
-            _wrapper_command(checkout, "lab-scheduler", "--once"),
-            cwd=checkout,
-            env=env,
-        )
-        assert scheduler_after_roll.returncode == 0, scheduler_after_roll.stderr
+        with real_promotion_authority(
+            tmp_path / "promotion-second",
+            generation=second_generation_context,
+        ) as second_configuration:
+            second_arguments = _runtime_code_arguments(second_configuration, trusted_base)
+            second_prepare = _run(
+                _wrapper_command(checkout, "lab-runtime-prepare", *second_arguments),
+                cwd=checkout,
+                env=env,
+            )
+            assert second_prepare.returncode == 0, second_prepare.stderr
+            second_manifest = load_job_center_authority(
+                current,
+                expected_code_sha=second_sha,
+                runtime_root=research,
+                runtime_deployment_root=runtime_root,
+                deployment_profile_id=second_profile_id,
+                deployment_generation_hash=second_generation,
+            )
+            assert second_manifest.manifest_hash != first_manifest.manifest_hash
+            assert not (research / ".job-center-authority.candidate.json").exists()
+            _prepare_scheduler_keys(research, env)
+            scheduler_after_roll = _run(
+                _wrapper_command(checkout, "lab-scheduler", *second_arguments, "--once"),
+                cwd=checkout,
+                env=env,
+            )
+            assert scheduler_after_roll.returncode == 0, scheduler_after_roll.stderr
     finally:
         _relax_release_tree(checkout.parent / ".rquant-deploy" / f"{checkout.name}.lock")
