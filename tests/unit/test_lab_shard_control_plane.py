@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from pathlib import Path
 from threading import Barrier, Event
+from unittest.mock import patch
 from uuid import UUID, uuid4
 
 import pytest
@@ -55,7 +56,7 @@ from rquant.lab_shard_protocol import (
 )
 from rquant.strategy_job_adapters import StrategyShardPayload
 
-from .test_lab_jobs import NOW, _lease, _submit, _submit_job
+from .test_lab_jobs import NOW, _database_state, _lease, _submit, _submit_job
 from .test_strategy_job_adapters import _p13_frozen_claim
 
 PLAN_HASH = "4" * 64
@@ -873,6 +874,7 @@ def test_active_worker_poll_does_not_mutate_or_detach_stale_recovery(
     abandoned = _claim(store, lease, worker="worker-a", duration=5)
     active = _claim(store, lease, worker="worker-b", now_offset=3, duration=30)
     before = {shard.shard_id: shard for shard in LabJobReader(store.path).list_shards(job_id)}
+    before_database = _database_state(store)
 
     duplicate = store.claim_next_shard(
         worker_id=active.worker_id,
@@ -882,6 +884,7 @@ def test_active_worker_poll_does_not_mutate_or_detach_stale_recovery(
     )
 
     assert duplicate is None
+    assert _database_state(store) == before_database
     after_duplicate = {
         shard.shard_id: shard for shard in LabJobReader(store.path).list_shards(job_id)
     }
@@ -910,6 +913,75 @@ def test_active_worker_poll_does_not_mutate_or_detach_stale_recovery(
     assert current.worker_id == reclaimed.worker_id
     assert current.claim_generation == reclaimed.claim_generation
     assert current.claim_token == reclaimed.claim_token
+
+
+def test_compatible_stale_v1_is_replaced_by_one_atomic_claim_cas(
+    tmp_path: Path,
+) -> None:
+    store, lease, job_id = _setup(tmp_path, count=2, max_attempts=4)
+    abandoned = _claim(store, lease, worker="worker-a", duration=5)
+    before = {shard.shard_id: shard for shard in LabJobReader(store.path).list_shards(job_id)}
+    statements: list[str] = []
+    connect = store._connect
+
+    def traced_connect(*, validate_identity: bool = True) -> sqlite3.Connection:
+        connection = connect(validate_identity=validate_identity)
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    with patch.object(store, "_connect", side_effect=traced_connect):
+        reclaimed = _claim(
+            store,
+            lease,
+            worker="worker-b",
+            now_offset=8,
+            duration=30,
+        )
+
+    normalized = tuple(" ".join(statement.lower().split()) for statement in statements)
+    assert reclaimed.shard_id == abandoned.shard_id
+    assert reclaimed.claim_generation == abandoned.claim_generation + 1
+    assert reclaimed.claim_token != abandoned.claim_token
+    assert not any(
+        "update lab_shard set status = 'queued'" in statement for statement in normalized
+    )
+    assert any(
+        "update lab_shard set status = 'running'" in statement
+        and "and status = 'running'" in statement
+        for statement in normalized
+    )
+    after = {shard.shard_id: shard for shard in LabJobReader(store.path).list_shards(job_id)}
+    replaced = after[abandoned.shard_id]
+    assert replaced.status is ShardStatus.RUNNING
+    assert replaced.version == before[abandoned.shard_id].version + 1
+    assert replaced.attempt_count == before[abandoned.shard_id].attempt_count + 1
+    assert replaced.worker_id == reclaimed.worker_id
+    assert replaced.claim_token == reclaimed.claim_token
+    queued_sibling = next(shard for shard in after.values() if shard.shard_id != reclaimed.shard_id)
+    assert queued_sibling == next(
+        shard for shard in before.values() if shard.shard_id == queued_sibling.shard_id
+    )
+
+    for offset, body in enumerate(
+        (
+            LabShardHeartbeat(lease_extension_seconds=30),
+            LabShardSucceeded(result_manifest_hash="6" * 64),
+            LabShardFailed(failure_json='{"reason":"late"}'),
+        ),
+        start=9,
+    ):
+        rejected = store.apply_worker_report(
+            _report(abandoned, body, offset=offset),
+            lease=lease,
+            now=NOW + timedelta(seconds=offset),
+        )
+        assert rejected.status == "rejected"
+    fenced = {shard.shard_id: shard for shard in LabJobReader(store.path).list_shards(job_id)}[
+        reclaimed.shard_id
+    ]
+    assert fenced.worker_id == reclaimed.worker_id
+    assert fenced.claim_token == reclaimed.claim_token
+    assert fenced.claim_generation == reclaimed.claim_generation
 
 
 def test_recovery_priority_preserves_bounded_fair_scan_across_jobs(
@@ -1886,6 +1958,15 @@ def test_pause_checkpoints_when_all_active_claims_expire_and_requeue(
         )
         is None
     )
+    requested = LabJobReader(store.path).get_job(job_id)
+    assert requested is not None and requested.status is JobStatus.RUNNING
+    assert requested.control_intent is ControlIntent.PAUSE_REQUESTED
+    assert LabJobReader(store.path).list_shards(job_id) == before
+
+    assert store.recover_stale_shards(
+        lease,
+        now=NOW + timedelta(seconds=9),
+    ) == (job_id,)
 
     checkpointed = LabJobReader(store.path).get_job(job_id)
     reclaimed = LabJobReader(store.path).list_shards(job_id)
@@ -2102,6 +2183,13 @@ def test_cancel_requested_job_converges_when_active_claim_expires(tmp_path: Path
     )
 
     assert fresh is None
+    requested = LabJobReader(store.path).get_job(job_id)
+    assert requested is not None and requested.status is JobStatus.RUNNING
+    assert requested.control_intent is ControlIntent.CANCEL_REQUESTED
+    assert store.recover_stale_shards(
+        lease,
+        now=NOW + timedelta(seconds=8),
+    ) == (job_id,)
     job = LabJobReader(store.path).get_job(job_id)
     assert job is not None and job.status is JobStatus.CANCELLED
     assert all(
@@ -2140,6 +2228,13 @@ def test_cancel_requested_job_converges_during_scheduler_takeover(tmp_path: Path
     )
 
     assert fresh is None
+    requested = LabJobReader(store.path).get_job(job_id)
+    assert requested is not None and requested.status is JobStatus.RUNNING
+    assert requested.control_intent is ControlIntent.CANCEL_REQUESTED
+    assert store.recover_stale_shards(
+        new_lease,
+        now=NOW + timedelta(seconds=12),
+    ) == (job_id,)
     job = LabJobReader(store.path).get_job(job_id)
     assert job is not None and job.status is JobStatus.CANCELLED
     _assert_control_plane_invariants(store, job_id, lease=new_lease, now_offset=12)
@@ -2163,6 +2258,10 @@ def test_stale_reclaim_exhaustion_fails_shard_and_parent_job(tmp_path: Path) -> 
     )
 
     assert claim is None
+    assert store.recover_stale_shards(
+        lease,
+        now=NOW + timedelta(seconds=8),
+    ) == (job_id,)
     job = LabJobReader(store.path).get_job(job_id)
     shard = LabJobReader(store.path).list_shards(job_id)[0]
     assert job is not None and job.status is JobStatus.FAILED
@@ -2291,6 +2390,10 @@ def test_stale_reclaim_exhaustion_terminalizes_every_nonterminal_sibling(
     _seed_checkpointed_sibling(store, lease, job_id, shard_index=3)
     before = LabJobReader(store.path).list_shards(job_id)
 
+    assert store.recover_stale_shards(
+        lease,
+        now=NOW + timedelta(seconds=8),
+    ) == (job_id,)
     claim = store.claim_next_shard(
         worker_id="worker-new",
         shard_lease_seconds=30,

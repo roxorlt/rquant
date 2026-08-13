@@ -245,6 +245,24 @@ def test_scheduler_tick_result_preclaim_blocked_defaults_to_zero() -> None:
     assert result.preclaim_blocked == 0
 
 
+def test_scheduler_tick_does_not_run_maintenance_recovery_before_claim_routes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, spool = _components(tmp_path)
+    scheduler = _scheduler(store, spool)
+
+    def reject_hidden_maintenance(*_args: object, **_kwargs: object) -> tuple[UUID, ...]:
+        raise AssertionError("maintenance recovery must not precede caller claim routing")
+
+    monkeypatch.setattr(store, "recover_stale_shards", reject_hidden_maintenance)
+
+    result = scheduler.run_once()
+
+    assert result.lease_acquired is True
+    assert result.recovered == 0
+
+
 def test_scheduler_runs_full_integrity_audit_on_persistent_due_cadence(tmp_path: Path) -> None:
     store, spool = _components(tmp_path)
     observed = tmp_path / "full-audit-pids.log"

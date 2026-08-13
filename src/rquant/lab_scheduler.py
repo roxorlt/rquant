@@ -1742,13 +1742,6 @@ class LabScheduler:
         else:
             lease, recovery_now = self._mutation_context()
         self._verify_runtime()
-        stale_recovered_job_ids = self.store.recover_stale_shards(
-            lease,
-            now=recovery_now,
-        )
-        recovered += len(stale_recovered_job_ids)
-        for job_id in stale_recovered_job_ids:
-            self._synchronize_lifecycle(job_id, observed_at=recovery_now)
         source_stage = self._recover_source_stage(lease=lease, now=recovery_now)
         authority_now = recovery_now
         processed = 0

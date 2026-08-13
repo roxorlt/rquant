@@ -505,6 +505,25 @@ def _store(tmp_path: Path, *, timeout: int = 1_234) -> LabJobStore:
     return store
 
 
+def _database_state(
+    store: LabJobStore,
+) -> tuple[tuple[str, tuple[tuple[object, ...], ...]], ...]:
+    with sqlite3.connect(store.path) as connection:
+        tables = tuple(
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name"
+            ).fetchall()
+        )
+        return tuple(
+            (
+                table,
+                tuple(connection.execute(f'SELECT * FROM "{table}" ORDER BY rowid').fetchall()),
+            )
+            for table in tables
+        )
+
+
 def _register_unprivileged_job_functions(connection: sqlite3.Connection) -> None:
     connection.create_function(
         lab_jobs._ARTIFACT_SUCCESS_AUTH_FUNCTION,
@@ -869,6 +888,246 @@ def _plan_v2_job(store: LabJobStore, lease: LabLeaseRecord) -> LabJobRecord:
     return job
 
 
+def test_v2_only_claim_does_not_mutate_incompatible_stale_v1(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    lease = _lease(store, seconds=120)
+    v1_job = _submit_job(store, lease)
+    store.plan_job(
+        v1_job.job_id,
+        _v1_definitions(1),
+        lease=lease,
+        now=NOW + timedelta(seconds=1),
+    )
+    abandoned = store.claim_next_shard(
+        worker_id="legacy-owner",
+        shard_lease_seconds=5,
+        lease=lease,
+        now=NOW + timedelta(seconds=2),
+        allowed_payload_protocol_versions=(1,),
+    )
+    assert isinstance(abandoned, lab_jobs.LabShardClaim)
+    before = _database_state(store)
+
+    selection = store.claim_next_source_stage(
+        shard_lease_seconds=90,
+        lease=lease,
+        now=NOW + timedelta(seconds=8),
+        source_stage_store=_source_stage_store(tmp_path / "v2-only-stage"),
+        source_wait_deadline=NOW + timedelta(seconds=30),
+        publication_deadline=NOW + timedelta(seconds=60),
+        v2_precondition=lambda _payload, _claim, _now: None,
+        include_diagnostics=True,
+    )
+
+    assert isinstance(selection, lab_jobs.LabClaimSelection)
+    assert selection.claim is None
+    assert selection.rejections == ()
+    assert _database_state(store) == before
+
+    reclaimed = store.claim_next_shard(
+        worker_id="legacy-reclaimer",
+        shard_lease_seconds=30,
+        lease=lease,
+        now=NOW + timedelta(seconds=9),
+        allowed_payload_protocol_versions=(1,),
+    )
+    assert isinstance(reclaimed, lab_jobs.LabShardClaim)
+    assert reclaimed.shard_id == abandoned.shard_id
+    assert reclaimed.claim_generation == abandoned.claim_generation + 1
+    assert reclaimed.claim_token != abandoned.claim_token
+
+
+def test_rejected_v2_precondition_cannot_recover_v1_for_another_caller(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    lease = _lease(store, seconds=120)
+    v1_job = _submit_job(store, lease)
+    store.plan_job(
+        v1_job.job_id,
+        _v1_definitions(1),
+        lease=lease,
+        now=NOW + timedelta(seconds=1),
+    )
+    abandoned = store.claim_next_shard(
+        worker_id="legacy-owner",
+        shard_lease_seconds=5,
+        lease=lease,
+        now=NOW + timedelta(seconds=2),
+        allowed_payload_protocol_versions=(1,),
+    )
+    assert isinstance(abandoned, lab_jobs.LabShardClaim)
+    v2_job = _submit_job(store, lease)
+    v2_definition = _v2_definition()
+    store.plan_job(
+        v2_job.job_id,
+        (v2_definition,),
+        lease=lease,
+        now=NOW + timedelta(seconds=3),
+    )
+    source_stage = _source_stage_store(tmp_path / "rejected-v2-stage")
+
+    def reject_v2(
+        _payload: StrategyShardPayloadV2,
+        _claim: LabShardClaimV2,
+        _now: datetime,
+    ) -> None:
+        raise SourceOperationContractError("source capability unavailable")
+
+    before = _database_state(store)
+    blocked = store.claim_next_source_stage(
+        shard_lease_seconds=90,
+        lease=lease,
+        now=NOW + timedelta(seconds=8),
+        source_stage_store=source_stage,
+        source_wait_deadline=NOW + timedelta(seconds=30),
+        publication_deadline=NOW + timedelta(seconds=60),
+        v2_precondition=reject_v2,
+        include_diagnostics=True,
+    )
+
+    assert isinstance(blocked, lab_jobs.LabClaimSelection)
+    assert blocked.claim is None
+    assert len(blocked.rejections) == 1
+    assert blocked.rejections[0].shard_id == v2_definition.shard_id
+    assert _database_state(store) == before
+
+    mixed = store.claim_next_shard(
+        worker_id="mixed-reclaimer",
+        shard_lease_seconds=90,
+        lease=lease,
+        now=NOW + timedelta(seconds=9),
+        source_stage_store=source_stage,
+        source_wait_deadline=NOW + timedelta(seconds=30),
+        publication_deadline=NOW + timedelta(seconds=60),
+        allowed_payload_protocol_versions=(1, 2),
+        v2_precondition=reject_v2,
+        include_diagnostics=True,
+    )
+    assert isinstance(mixed, lab_jobs.LabClaimSelection)
+    assert isinstance(mixed.claim, lab_jobs.LabShardClaim)
+    assert mixed.claim.shard_id == abandoned.shard_id
+    assert mixed.claim.claim_generation == abandoned.claim_generation + 1
+    assert len(mixed.rejections) == 1
+    v2_shard = LabJobReader(store.path).list_shards(v2_job.job_id)[0]
+    assert v2_shard.status is lab_jobs.ShardStatus.QUEUED
+    assert v2_shard.attempt_count == 0
+
+
+def test_empty_claim_does_not_mutate_recovery_cursor_or_publication_state(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    lease = _lease(store, seconds=120)
+    before = _database_state(store)
+
+    selection = store.claim_next_shard(
+        worker_id="idle-worker",
+        shard_lease_seconds=30,
+        lease=lease,
+        now=NOW + timedelta(seconds=2),
+        allowed_payload_protocol_versions=(1,),
+        include_diagnostics=True,
+    )
+
+    assert isinstance(selection, lab_jobs.LabClaimSelection)
+    assert selection.claim is None
+    assert selection.rejections == ()
+    assert _database_state(store) == before
+
+
+def test_stale_scheduler_lease_cannot_mutate_an_eligible_recovery_plan(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    old_lease = _lease(store, seconds=10)
+    job = _submit_job(store, old_lease)
+    store.plan_job(
+        job.job_id,
+        _v1_definitions(1),
+        lease=old_lease,
+        now=NOW + timedelta(seconds=1),
+    )
+    abandoned = store.claim_next_shard(
+        worker_id="old-worker",
+        shard_lease_seconds=5,
+        lease=old_lease,
+        now=NOW + timedelta(seconds=2),
+        allowed_payload_protocol_versions=(1,),
+    )
+    assert isinstance(abandoned, lab_jobs.LabShardClaim)
+    store.acquire_scheduler_lease(
+        owner_id="scheduler-b",
+        lease_seconds=60,
+        now=NOW + timedelta(seconds=11),
+    )
+    before = _database_state(store)
+
+    with pytest.raises(SchedulerLeaseFencedError):
+        store.claim_next_shard(
+            worker_id="late-worker",
+            shard_lease_seconds=30,
+            lease=old_lease,
+            now=NOW + timedelta(seconds=12),
+            allowed_payload_protocol_versions=(1,),
+        )
+
+    assert _database_state(store) == before
+
+
+def test_atomic_stale_claim_cas_loss_rolls_back_all_target_effects(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    lease = _lease(store, seconds=120)
+    job = _submit_job(store, lease)
+    store.plan_job(
+        job.job_id,
+        _v1_definitions(1),
+        lease=lease,
+        now=NOW + timedelta(seconds=1),
+    )
+    abandoned = store.claim_next_shard(
+        worker_id="old-worker",
+        shard_lease_seconds=5,
+        lease=lease,
+        now=NOW + timedelta(seconds=2),
+        allowed_payload_protocol_versions=(1,),
+    )
+    assert isinstance(abandoned, lab_jobs.LabShardClaim)
+    before = _database_state(store)
+    connect = store._connect
+
+    def reject_direct_stale_cas(*, validate_identity: bool = True) -> sqlite3.Connection:
+        connection = connect(validate_identity=validate_identity)
+        connection.execute(
+            """
+            CREATE TEMP TRIGGER reject_direct_stale_cas
+            BEFORE UPDATE ON lab_shard
+            WHEN OLD.status = 'running' AND NEW.status = 'running'
+              AND NEW.claim_generation = OLD.claim_generation + 1
+            BEGIN
+                SELECT RAISE(IGNORE);
+            END
+            """
+        )
+        return connection
+
+    with patch.object(store, "_connect", side_effect=reject_direct_stale_cas):
+        claim = store.claim_next_shard(
+            worker_id="cas-loser",
+            shard_lease_seconds=30,
+            lease=lease,
+            now=NOW + timedelta(seconds=8),
+            allowed_payload_protocol_versions=(1,),
+        )
+
+    assert claim is None
+    assert _database_state(store) == before
+
+
 def test_claim_next_shard_skips_rejected_v2_candidate_for_later_v1_in_same_tick(
     tmp_path: Path,
 ) -> None:
@@ -1209,7 +1468,7 @@ def test_v2_precondition_runs_before_the_preclaim_write_transaction(
     assert isinstance(claim, LabShardClaimV2)
 
 
-def test_preclaim_cursor_revalidates_33_keyring_candidates_after_recovery(
+def test_rejected_preclaim_does_not_advance_cursor_before_revalidation(
     tmp_path: Path,
 ) -> None:
     store = _store(tmp_path)
@@ -1237,6 +1496,7 @@ def test_preclaim_cursor_revalidates_33_keyring_candidates_after_recovery(
     ) -> None:
         raise SourceOperationContractError("unknown signing key")
 
+    before = _database_state(store)
     blocked = store.claim_next_shard(
         worker_id="scheduler-a",
         shard_lease_seconds=90,
@@ -1251,6 +1511,7 @@ def test_preclaim_cursor_revalidates_33_keyring_candidates_after_recovery(
     assert isinstance(blocked, lab_jobs.LabClaimSelection)
     assert blocked.claim is None
     assert len(blocked.rejections) == lab_jobs.PRECLAIM_CANDIDATE_BATCH_SIZE
+    assert _database_state(store) == before
 
     recovered = store.claim_next_shard(
         worker_id="scheduler-b",
@@ -1263,7 +1524,7 @@ def test_preclaim_cursor_revalidates_33_keyring_candidates_after_recovery(
         v2_precondition=_real_v2_preclaim(authorities),
     )
     assert isinstance(recovered, LabShardClaimV2)
-    assert recovered.definition.shard_id == definitions[-1].shard_id
+    assert recovered.definition.shard_id == definitions[0].shard_id
 
     wrapped = store.claim_next_shard(
         worker_id="scheduler-c",
@@ -1276,12 +1537,12 @@ def test_preclaim_cursor_revalidates_33_keyring_candidates_after_recovery(
         v2_precondition=_real_v2_preclaim(authorities),
     )
     assert isinstance(wrapped, LabShardClaimV2)
-    assert wrapped.definition.shard_id == definitions[0].shard_id
+    assert wrapped.definition.shard_id == definitions[1].shard_id
     first = LabJobReader(store.path).list_shards(job.job_id)[0]
     assert first.attempt_count == 1 and first.claim_generation == 1
 
 
-def test_preclaim_cursor_reaches_same_job_v1_after_32_rejected_v2_candidates(
+def test_preclaim_selects_same_job_v1_without_advancing_on_rejected_v2(
     tmp_path: Path,
 ) -> None:
     store = _store(tmp_path)
@@ -1330,24 +1591,14 @@ def test_preclaim_cursor_reaches_same_job_v1_after_32_rejected_v2_candidates(
         include_diagnostics=True,
     )
     assert isinstance(first, lab_jobs.LabClaimSelection)
-    assert first.claim is None
+    assert isinstance(first.claim, lab_jobs.LabShardClaim)
+    assert first.claim.definition.shard_id == later_v1.shard_id
     assert len(first.rejections) == lab_jobs.PRECLAIM_CANDIDATE_BATCH_SIZE
-
-    second = store.claim_next_shard(
-        worker_id="cursor-b",
-        shard_lease_seconds=90,
-        source_stage_store=stage_store,
-        source_wait_deadline=NOW + timedelta(seconds=30),
-        publication_deadline=NOW + timedelta(seconds=60),
-        lease=lease,
-        now=NOW + timedelta(seconds=3),
-        v2_precondition=reject_v2,
-    )
-    assert isinstance(second, lab_jobs.LabShardClaim)
-    assert second.definition.shard_id == later_v1.shard_id
+    shards = LabJobReader(store.path).list_shards(job.job_id)
+    assert all(shard.attempt_count == 0 for shard in shards[:-1])
 
 
-def test_preclaim_cursor_reaches_same_job_v1_after_64_rejected_v2_candidates(
+def test_preclaim_v1_fallback_skips_more_than_one_rejected_v2_batch(
     tmp_path: Path,
 ) -> None:
     store = _store(tmp_path)
@@ -1384,34 +1635,23 @@ def test_preclaim_cursor_reaches_same_job_v1_after_64_rejected_v2_candidates(
     ) -> None:
         raise ValueError("keyring unavailable")
 
-    for offset in range(2):
-        selection = store.claim_next_shard(
-            worker_id=f"cursor-{offset}",
-            shard_lease_seconds=90,
-            source_stage_store=stage_store,
-            source_wait_deadline=NOW + timedelta(seconds=30),
-            publication_deadline=NOW + timedelta(seconds=60),
-            lease=lease,
-            now=NOW + timedelta(seconds=2 + offset),
-            v2_precondition=reject_v2,
-            include_diagnostics=True,
-        )
-        assert isinstance(selection, lab_jobs.LabClaimSelection)
-        assert selection.claim is None
-        assert len(selection.rejections) == lab_jobs.PRECLAIM_CANDIDATE_BATCH_SIZE
-
-    claimed = store.claim_next_shard(
-        worker_id="cursor-final",
+    selection = store.claim_next_shard(
+        worker_id="cursor-fallback",
         shard_lease_seconds=90,
         source_stage_store=stage_store,
         source_wait_deadline=NOW + timedelta(seconds=30),
         publication_deadline=NOW + timedelta(seconds=60),
         lease=lease,
-        now=NOW + timedelta(seconds=4),
+        now=NOW + timedelta(seconds=2),
         v2_precondition=reject_v2,
+        include_diagnostics=True,
     )
-    assert isinstance(claimed, lab_jobs.LabShardClaim)
-    assert claimed.definition.shard_id == later_v1.shard_id
+    assert isinstance(selection, lab_jobs.LabClaimSelection)
+    assert isinstance(selection.claim, lab_jobs.LabShardClaim)
+    assert selection.claim.definition.shard_id == later_v1.shard_id
+    assert len(selection.rejections) == lab_jobs.PRECLAIM_CANDIDATE_BATCH_SIZE
+    shards = LabJobReader(store.path).list_shards(job.job_id)
+    assert all(shard.attempt_count == 0 for shard in shards[:-1])
 
 
 def test_preclaim_fair_cursor_rechecks_old_recovered_v2_despite_newer_candidates(
@@ -1909,6 +2149,119 @@ def test_stale_recovery_is_bounded_and_leaves_v2_publication_fenced(tmp_path: Pa
     )
     assert isinstance(reclaimed, lab_jobs.LabShardClaim)
     assert reclaimed.claim_generation == 2
+
+
+def test_caller_stale_plan_is_bounded_indexed_and_mutates_only_selected_v1(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    lease = _lease(store, seconds=120)
+    v1_job = _submit_job(store, lease, max_attempts=4)
+    candidate_count = lab_jobs.STALE_RECOVERY_BATCH_SIZE + 1
+    store.plan_job(
+        v1_job.job_id,
+        _v1_definitions(candidate_count),
+        lease=lease,
+        now=NOW + timedelta(seconds=1),
+    )
+    for index in range(candidate_count):
+        claim = store.claim_next_shard(
+            worker_id=f"bounded-v1-{index}",
+            shard_lease_seconds=5,
+            lease=lease,
+            now=NOW + timedelta(seconds=2),
+            allowed_payload_protocol_versions=(1,),
+        )
+        assert isinstance(claim, lab_jobs.LabShardClaim)
+
+    v2_job = _submit_job(store, lease)
+    store.plan_job(
+        v2_job.job_id,
+        _v2_definitions(lab_jobs.PRECLAIM_CANDIDATE_BATCH_SIZE + 1),
+        lease=lease,
+        now=NOW + timedelta(seconds=3),
+    )
+    source_stage = _source_stage_store(tmp_path / "bounded-source-stage")
+    v2_claim = store.claim_next_shard(
+        worker_id="bounded-v2-owner",
+        shard_lease_seconds=30,
+        lease=lease,
+        now=NOW + timedelta(seconds=4),
+        source_stage_store=source_stage,
+        source_wait_deadline=NOW + timedelta(seconds=20),
+        publication_deadline=NOW + timedelta(seconds=25),
+        allowed_payload_protocol_versions=(2,),
+    )
+    assert isinstance(v2_claim, LabShardClaimV2)
+    v2_before = LabJobReader(store.path).list_shards(v2_job.job_id)
+    statements: list[str] = []
+    connect = store._connect
+
+    def traced_connect(*, validate_identity: bool = True) -> sqlite3.Connection:
+        connection = connect(validate_identity=validate_identity)
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    expired_at = NOW + timedelta(seconds=40)
+    with patch.object(store, "_connect", side_effect=traced_connect):
+        reclaimed = store.claim_next_shard(
+            worker_id="bounded-reclaimer",
+            shard_lease_seconds=30,
+            lease=lease,
+            now=expired_at,
+            allowed_payload_protocol_versions=(1,),
+        )
+
+    assert isinstance(reclaimed, lab_jobs.LabShardClaim)
+    v1_after = LabJobReader(store.path).list_shards(v1_job.job_id)
+    assert all(shard.status is lab_jobs.ShardStatus.RUNNING for shard in v1_after)
+    assert sum(shard.claim_generation == 2 for shard in v1_after) == 1
+    assert sum(shard.attempt_count == 2 for shard in v1_after) == 1
+    assert LabJobReader(store.path).list_shards(v2_job.job_id) == v2_before
+    normalized = tuple(" ".join(statement.upper().split()) for statement in statements)
+    selector = tuple(
+        statement
+        for statement in normalized
+        if "INDEXED BY IX_LAB_SHARD_STALE_RECOVERY" in statement
+        and statement.startswith("SELECT S.*")
+    )
+    assert len(selector) == 1
+    assert f"LIMIT {lab_jobs.PRECLAIM_CANDIDATE_BATCH_SIZE}" in selector[0]
+    assert "OFFSET" not in selector[0]
+
+    with store._read_transaction() as connection:
+        plan = connection.execute(
+            """
+            EXPLAIN QUERY PLAN
+            SELECT s.* FROM lab_shard AS s INDEXED BY ix_lab_shard_stale_recovery
+            JOIN lab_job AS j ON j.job_id = s.job_id
+            WHERE s.status = 'running' AND s.payload_protocol_version = 1
+              AND s.payload_protocol_version IN (?)
+              AND s.attempt_count < s.max_attempts
+              AND j.status IN (?, ?) AND j.control_intent = ? AND j.deadline > ?
+              AND (
+                s.scheduler_fencing_token IS NULL
+                OR s.scheduler_fencing_token <> ?
+                OR s.lease_expires_at IS NULL
+                OR s.lease_expires_at <= ?
+              )
+            ORDER BY s.job_id, s.shard_index, s.shard_id
+            LIMIT ?
+            """,
+            (
+                1,
+                JobStatus.QUEUED.value,
+                JobStatus.RUNNING.value,
+                ControlIntent.NONE.value,
+                expired_at.isoformat(timespec="microseconds"),
+                lease.fencing_token,
+                expired_at.isoformat(timespec="microseconds"),
+                lab_jobs.PRECLAIM_CANDIDATE_BATCH_SIZE,
+            ),
+        ).fetchall()
+    details = "\n".join(str(row[3]) for row in plan).upper()
+    assert "IX_LAB_SHARD_STALE_RECOVERY" in details
+    assert "TEMP B-TREE" not in details
 
 
 def test_stale_recovery_uses_v1_protocol_index_with_v2_majority(tmp_path: Path) -> None:

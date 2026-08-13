@@ -955,6 +955,37 @@ class LabClaimSelection(LabRecordModel):
     rejections: tuple[LabPreclaimRejection, ...] = ()
 
 
+@dataclass(frozen=True)
+class _V2PreclaimSnapshotIdentity:
+    job_id: UUID
+    shard_id: UUID
+    payload_hash: str
+    shard_version: int
+    attempt_count: int
+    spec_hash: str
+    claim_generation: int
+    worker_id: str
+    scheduler_fencing_token: int
+    source_wait_deadline: datetime | None
+    publication_deadline: datetime | None
+    source_stage_authority_hash: str | None
+
+
+@dataclass(frozen=True)
+class _V2PreclaimSnapshotBatch:
+    eligible: frozenset[_V2PreclaimSnapshotIdentity]
+    rejections: tuple[LabPreclaimRejection, ...]
+
+
+@dataclass(frozen=True)
+class _EligibleAttemptPlan:
+    source_status: ShardStatus
+    row: sqlite3.Row
+    job_id: UUID
+    job_created_at: datetime
+    job_row: sqlite3.Row
+
+
 class CurrentSchedulerFenceReceipt(LabRecordModel):
     """Public, exact proof that one scheduler lease still owns one stage attempt."""
 
@@ -9937,7 +9968,6 @@ class LabJobStore:
         *,
         lease: LabLeaseRecord,
         now: datetime,
-        reclaimed_shards: set[tuple[UUID, int, UUID]] | None = None,
     ) -> set[UUID]:
         stale_rows = connection.execute(
             """
@@ -10082,18 +10112,6 @@ class LabJobStore:
             )
             if cursor.rowcount == 1:
                 reclaimed_job_ids.add(job_id)
-                if reclaimed_shards is not None:
-                    reclaimed_shards.add(
-                        (
-                            job_id,
-                            _strict_sqlite_int(
-                                stale["shard_index"],
-                                field="lab_shard.shard_index",
-                                minimum=0,
-                            ),
-                            _canonical_uuid_text(stale["shard_id"], field="lab_shard.shard_id"),
-                        )
-                    )
         idle_cursor = connection.execute(
             """
             SELECT cursor_created_at, cursor_job_id
@@ -13433,14 +13451,139 @@ class LabJobStore:
             )
         return tuple(sorted(recovered, key=str))
 
-    def _claim_preclaim_candidate_in_transaction(
-        self,
-        connection: sqlite3.Connection,
+    @staticmethod
+    def _source_stage_authority_hash(
+        source_stage_store: LabSourceStageStore | None,
+    ) -> str | None:
+        if type(source_stage_store) is not LabSourceStageStore:
+            return None
+        authority = LabSourceStageStoreAuthority.model_validate(
+            source_stage_store.authority.model_dump()
+        )
+        return hashlib.sha256(canonical_model_json_bytes(authority)).hexdigest()
+
+    @staticmethod
+    def _v2_preclaim_snapshot_identity(
         *,
         row: sqlite3.Row,
         job_id: UUID,
-        job_created_at: datetime,
-        job_row: sqlite3.Row,
+        spec_hash: str,
+        worker: str,
+        lease: LabLeaseRecord,
+        source_wait_deadline: datetime | None,
+        publication_deadline: datetime | None,
+        source_stage_authority_hash: str | None,
+    ) -> _V2PreclaimSnapshotIdentity:
+        return _V2PreclaimSnapshotIdentity(
+            job_id=job_id,
+            shard_id=_canonical_uuid_text(row["shard_id"], field="lab_shard.shard_id"),
+            payload_hash=str(row["payload_hash"]),
+            shard_version=_strict_sqlite_int(row["version"], field="lab_shard.version", minimum=0),
+            attempt_count=_strict_sqlite_int(
+                row["attempt_count"], field="lab_shard.attempt_count", minimum=0
+            ),
+            spec_hash=spec_hash,
+            claim_generation=(
+                _strict_sqlite_int(
+                    row["claim_generation"],
+                    field="lab_shard.claim_generation",
+                    minimum=0,
+                )
+                + 1
+            ),
+            worker_id=worker,
+            scheduler_fencing_token=lease.fencing_token,
+            source_wait_deadline=source_wait_deadline,
+            publication_deadline=publication_deadline,
+            source_stage_authority_hash=source_stage_authority_hash,
+        )
+
+    @staticmethod
+    def _queued_attempt_protocol_predicate(
+        *,
+        alias: str,
+        allowed_protocols: tuple[int, ...],
+        prevalidated_v2: frozenset[_V2PreclaimSnapshotIdentity] | None,
+    ) -> tuple[str, tuple[object, ...]]:
+        placeholders = ", ".join("?" for _ in allowed_protocols)
+        base = f"{alias}.payload_protocol_version IN ({placeholders})"
+        if prevalidated_v2 is None:
+            return base, tuple(allowed_protocols)
+        keys = tuple(
+            sorted(
+                {(identity.job_id, identity.shard_id) for identity in prevalidated_v2},
+                key=lambda item: (str(item[0]), str(item[1])),
+            )
+        )
+        if not keys:
+            return f"{base} AND {alias}.payload_protocol_version = 1", tuple(allowed_protocols)
+        key_predicate = " OR ".join(f"({alias}.job_id = ? AND {alias}.shard_id = ?)" for _ in keys)
+        return (
+            f"{base} AND ({alias}.payload_protocol_version = 1 OR ({key_predicate}))",
+            (
+                *allowed_protocols,
+                *(value for key in keys for value in (str(key[0]), str(key[1]))),
+            ),
+        )
+
+    def _stale_v1_attempt_plans(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        allowed_protocols: tuple[int, ...],
+        lease: LabLeaseRecord,
+        now: datetime,
+    ) -> tuple[_EligibleAttemptPlan, ...]:
+        protocol_placeholders = ", ".join("?" for _ in allowed_protocols)
+        rows = connection.execute(
+            f"""
+            SELECT s.* FROM lab_shard AS s INDEXED BY ix_lab_shard_stale_recovery
+            JOIN lab_job AS j ON j.job_id = s.job_id
+            WHERE s.status = 'running' AND s.payload_protocol_version = 1
+              AND s.payload_protocol_version IN ({protocol_placeholders})
+              AND s.attempt_count < s.max_attempts
+              AND j.status IN (?, ?) AND j.control_intent = ? AND j.deadline > ?
+              AND (
+                s.scheduler_fencing_token IS NULL
+                OR s.scheduler_fencing_token <> ?
+                OR s.lease_expires_at IS NULL
+                OR s.lease_expires_at <= ?
+              )
+            ORDER BY s.job_id, s.shard_index, s.shard_id
+            LIMIT ?
+            """,
+            (
+                *allowed_protocols,
+                JobStatus.QUEUED.value,
+                JobStatus.RUNNING.value,
+                ControlIntent.NONE.value,
+                _dump_time(now),
+                lease.fencing_token,
+                _dump_time(now),
+                PRECLAIM_CANDIDATE_BATCH_SIZE,
+            ),
+        ).fetchall()
+        plans: list[_EligibleAttemptPlan] = []
+        for row in rows:
+            job_id = _canonical_uuid_text(row["job_id"], field="lab_shard.job_id")
+            job_row = self._load_job_row(connection, job_id)
+            assert job_row is not None
+            plans.append(
+                _EligibleAttemptPlan(
+                    source_status=ShardStatus.RUNNING,
+                    row=row,
+                    job_id=job_id,
+                    job_created_at=_load_time(str(job_row["created_at"])),
+                    job_row=job_row,
+                )
+            )
+        return tuple(plans)
+
+    def _claim_eligible_attempt_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        plan: _EligibleAttemptPlan,
         worker: str,
         shard_lease_seconds: int,
         lease: LabLeaseRecord,
@@ -13449,9 +13592,14 @@ class LabJobStore:
         source_wait_deadline: datetime | None,
         publication_deadline: datetime | None,
         v2_precondition: Callable[[StrategyShardPayloadV2, LabShardClaimV2, datetime], None] | None,
-        prevalidated_v2: frozenset[tuple[UUID, UUID, str, int, int, str, int, str]] | None,
+        prevalidated_v2: frozenset[_V2PreclaimSnapshotIdentity] | None,
+        source_stage_authority_hash: str | None,
         use_fair_cursor: bool,
     ) -> LabShardClaim | LabShardClaimV2 | LabPreclaimRejection | None:
+        row = plan.row
+        job_id = plan.job_id
+        job_created_at = plan.job_created_at
+        job_row = plan.job_row
         definition = self._definition_from_shard_row(row)
         spec_hash = str(job_row["spec_hash"])
         payload = self._external_payload_v2(definition.payload_json)
@@ -13472,17 +13620,24 @@ class LabJobStore:
         )
         claim_token = uuid4()
         expires_at = now + timedelta(seconds=shard_lease_seconds)
+        source_stage_authority: LabSourceStageStoreAuthority | None = None
         if payload is not None:
+            source_deadline = (
+                _utc(source_wait_deadline) if source_wait_deadline is not None else None
+            )
+            publish_deadline = (
+                _utc(publication_deadline) if publication_deadline is not None else None
+            )
             if prevalidated_v2 is not None:
-                snapshot_identity = (
-                    job_id,
-                    definition.shard_id,
-                    definition.payload_hash,
-                    shard_version,
-                    attempt_count - 1,
-                    spec_hash,
-                    generation,
-                    worker,
+                snapshot_identity = self._v2_preclaim_snapshot_identity(
+                    row=row,
+                    job_id=job_id,
+                    spec_hash=spec_hash,
+                    worker=worker,
+                    lease=lease,
+                    source_wait_deadline=source_deadline,
+                    publication_deadline=publish_deadline,
+                    source_stage_authority_hash=source_stage_authority_hash,
                 )
                 if snapshot_identity not in prevalidated_v2:
                     return LabPreclaimRejection(
@@ -13495,8 +13650,7 @@ class LabJobStore:
                 raise ValueError("v2 claim requires an exact source_stage_store")
             if source_wait_deadline is None or publication_deadline is None:
                 raise ValueError("v2 claim requires explicit source and publication deadlines")
-            source_deadline = _utc(source_wait_deadline)
-            publish_deadline = _utc(publication_deadline)
+            assert source_deadline is not None and publish_deadline is not None
             if source_deadline <= now:
                 raise ValueError("source_wait_deadline must be after claim time")
             if publish_deadline < source_deadline:
@@ -13527,71 +13681,35 @@ class LabJobStore:
                         payload_hash=definition.payload_hash,
                         reason="source_preclaim_rejected",
                     )
-        job_status = JobStatus(str(job_row["status"]))
-        if job_status is JobStatus.QUEUED:
-            self._transition_in_transaction(
-                connection,
-                job_row,
-                target_status=JobStatus.RUNNING,
-                lease=lease,
-                reason="first shard claimed",
-                now=now,
-                request_id=None,
-                recoverable=None,
-                event_type="job_started",
+            source_stage_authority = LabSourceStageStoreAuthority.model_validate(
+                source_stage_store.authority.model_dump()
             )
-        else:
-            self._adopt_running_job_fence(
-                connection,
-                job_row,
-                lease=lease,
-                now=now,
-            )
-        cursor = connection.execute(
-            """
-            UPDATE lab_shard
-            SET status = ?, version = ?, attempt_count = ?, worker_id = ?,
-                scheduler_fencing_token = ?, claim_token = ?,
-                claim_generation = ?, claimed_at = ?, heartbeat_at = ?,
-                lease_expires_at = ?, result_manifest_hash = NULL,
-                failure_json = NULL, finished_at = NULL, updated_at = ?
-            WHERE job_id = ? AND shard_id = ? AND version = ? AND status = ?
-            """,
-            (
-                ShardStatus.RUNNING.value,
-                shard_version + 1,
-                attempt_count,
-                worker,
-                lease.fencing_token,
-                str(claim_token),
-                generation,
-                _dump_time(now),
-                _dump_time(now),
-                _dump_time(expires_at),
-                _dump_time(now),
-                str(row["job_id"]),
-                str(row["shard_id"]),
-                shard_version,
-                ShardStatus.QUEUED.value,
-            ),
-        )
-        if cursor.rowcount != 1:
+            if prevalidated_v2 is not None and (
+                hashlib.sha256(canonical_model_json_bytes(source_stage_authority)).hexdigest()
+                != source_stage_authority_hash
+            ):
+                return LabPreclaimRejection(
+                    job_id=job_id,
+                    shard_id=definition.shard_id,
+                    payload_hash=definition.payload_hash,
+                    reason="source_preclaim_rejected",
+                )
+        if ShardStatus(str(row["status"])) is not plan.source_status:
             return None
-        self._store_preclaim_cursor(
-            connection,
-            job_created_at=job_created_at,
-            job_id=job_id,
-            shard_index=_strict_sqlite_int(
-                row["shard_index"],
-                field="lab_shard.shard_index",
-                minimum=0,
-            ),
-            shard_id=_canonical_uuid_text(row["shard_id"], field="lab_shard.shard_id"),
-            now=now,
-            use_fair_cursor=use_fair_cursor,
-        )
+        if attempt_count > _strict_sqlite_int(
+            row["max_attempts"], field="lab_shard.max_attempts", minimum=1
+        ):
+            return None
+        job_status = JobStatus(str(job_row["status"]))
+        if (
+            job_status not in {JobStatus.QUEUED, JobStatus.RUNNING}
+            or ControlIntent(str(job_row["control_intent"])) is not ControlIntent.NONE
+            or _load_time(str(job_row["deadline"])) <= now
+        ):
+            return None
+        result: LabShardClaim | LabShardClaimV2
         if payload is None:
-            return LabShardClaim(
+            result = LabShardClaim(
                 job_id=job_id,
                 spec_hash=spec_hash,
                 definition=definition,
@@ -13602,26 +13720,115 @@ class LabJobStore:
                 claimed_at=now,
                 lease_expires_at=expires_at,
             )
-        assert source_deadline is not None and publish_deadline is not None
-        assert prospective_claim is not None
-        source_stage_authority = LabSourceStageStoreAuthority.model_validate(
-            source_stage_store.authority.model_dump()
-        )
-        preimage_bytes = canonical_model_json_bytes(prospective_claim)
-        self._create_held_claim_publication_in_transaction(
-            connection,
-            HeldDraft(
-                identity=LabClaimPublicationIdentity.from_claim(prospective_claim),
-                claim_preimage_bytes=preimage_bytes,
-                claim_preimage_hash=hashlib.sha256(preimage_bytes).hexdigest(),
-                source_wait_deadline=source_deadline,
-                publication_deadline=publish_deadline,
-            ),
-            source_stage_authority=source_stage_authority,
-            lease=lease,
-            now=now,
-        ).resolved()
-        return prospective_claim
+        else:
+            assert prospective_claim is not None
+            result = prospective_claim
+        stale_predicate = ""
+        stale_parameters: tuple[object, ...] = ()
+        if plan.source_status is ShardStatus.RUNNING:
+            stale_predicate = """
+              AND payload_protocol_version = 1
+              AND attempt_count < max_attempts
+              AND (
+                scheduler_fencing_token IS NULL
+                OR scheduler_fencing_token <> ?
+                OR lease_expires_at IS NULL
+                OR lease_expires_at <= ?
+              )
+            """
+            stale_parameters = (lease.fencing_token, _dump_time(now))
+        connection.execute("SAVEPOINT lab_eligible_attempt_claim")
+        try:
+            if job_status is JobStatus.QUEUED:
+                self._transition_in_transaction(
+                    connection,
+                    job_row,
+                    target_status=JobStatus.RUNNING,
+                    lease=lease,
+                    reason="first shard claimed",
+                    now=now,
+                    request_id=None,
+                    recoverable=None,
+                    event_type="job_started",
+                )
+            else:
+                self._adopt_running_job_fence(
+                    connection,
+                    job_row,
+                    lease=lease,
+                    now=now,
+                )
+            cursor = connection.execute(
+                f"""
+                UPDATE lab_shard
+                SET status = ?, version = ?, attempt_count = ?, worker_id = ?,
+                    scheduler_fencing_token = ?, claim_token = ?,
+                    claim_generation = ?, claimed_at = ?, heartbeat_at = ?,
+                    lease_expires_at = ?, result_manifest_hash = NULL,
+                    failure_json = NULL, finished_at = NULL, updated_at = ?
+                WHERE job_id = ? AND shard_id = ? AND version = ? AND status = ?
+                  {stale_predicate}
+                """,
+                (
+                    ShardStatus.RUNNING.value,
+                    shard_version + 1,
+                    attempt_count,
+                    worker,
+                    lease.fencing_token,
+                    str(claim_token),
+                    generation,
+                    _dump_time(now),
+                    _dump_time(now),
+                    _dump_time(expires_at),
+                    _dump_time(now),
+                    str(row["job_id"]),
+                    str(row["shard_id"]),
+                    shard_version,
+                    plan.source_status.value,
+                    *stale_parameters,
+                ),
+            )
+            if cursor.rowcount != 1:
+                connection.execute("ROLLBACK TO SAVEPOINT lab_eligible_attempt_claim")
+                connection.execute("RELEASE SAVEPOINT lab_eligible_attempt_claim")
+                return None
+            self._store_preclaim_cursor(
+                connection,
+                job_created_at=job_created_at,
+                job_id=job_id,
+                shard_index=_strict_sqlite_int(
+                    row["shard_index"],
+                    field="lab_shard.shard_index",
+                    minimum=0,
+                ),
+                shard_id=_canonical_uuid_text(row["shard_id"], field="lab_shard.shard_id"),
+                now=now,
+                use_fair_cursor=use_fair_cursor,
+            )
+            if payload is not None:
+                assert source_deadline is not None and publish_deadline is not None
+                assert prospective_claim is not None
+                assert source_stage_authority is not None
+                preimage_bytes = canonical_model_json_bytes(prospective_claim)
+                self._create_held_claim_publication_in_transaction(
+                    connection,
+                    HeldDraft(
+                        identity=LabClaimPublicationIdentity.from_claim(prospective_claim),
+                        claim_preimage_bytes=preimage_bytes,
+                        claim_preimage_hash=hashlib.sha256(preimage_bytes).hexdigest(),
+                        source_wait_deadline=source_deadline,
+                        publication_deadline=publish_deadline,
+                    ),
+                    source_stage_authority=source_stage_authority,
+                    lease=lease,
+                    now=now,
+                ).resolved()
+        except BaseException:
+            connection.execute("ROLLBACK TO SAVEPOINT lab_eligible_attempt_claim")
+            connection.execute("RELEASE SAVEPOINT lab_eligible_attempt_claim")
+            raise
+        connection.execute("RELEASE SAVEPOINT lab_eligible_attempt_claim")
+        return result
 
     def _prevalidate_v2_preclaim_candidates(
         self,
@@ -13632,8 +13839,9 @@ class LabJobStore:
         now: datetime,
         source_wait_deadline: datetime | None,
         publication_deadline: datetime | None,
+        source_stage_authority_hash: str | None,
         v2_precondition: Callable[[StrategyShardPayloadV2, LabShardClaimV2, datetime], None],
-    ) -> frozenset[tuple[UUID, UUID, str, int, int, str, int, str]]:
+    ) -> _V2PreclaimSnapshotBatch:
         """Validate a bounded v2 snapshot before acquiring the scheduler write lock."""
 
         if source_wait_deadline is None or publication_deadline is None:
@@ -13648,7 +13856,7 @@ class LabJobStore:
         ):
             # The write phase preserves the legacy deferred-deadline behavior for a
             # selected candidate; an earlier V1 candidate must still remain claimable.
-            return frozenset()
+            return _V2PreclaimSnapshotBatch(eligible=frozenset(), rejections=())
         with self._read_transaction() as connection:
             cursor = connection.execute(
                 """
@@ -13756,17 +13964,14 @@ class LabJobStore:
                         PRECLAIM_CANDIDATE_BATCH_SIZE,
                     ),
                 ).fetchall()
-        validated: set[tuple[UUID, UUID, str, int, int, str, int, str]] = set()
+        validated: set[_V2PreclaimSnapshotIdentity] = set()
+        rejections: list[LabPreclaimRejection] = []
         for row in rows:
             definition = self._definition_from_shard_row(row)
             payload = self._external_payload_v2(definition.payload_json)
             if payload is None:  # pragma: no cover - schema trigger guards this invariant
                 raise InvalidStoredJobError("v2 shard payload is not externally authorized")
             job_id = _canonical_uuid_text(row["job_id"], field="lab_shard.job_id")
-            shard_version = _strict_sqlite_int(row["version"], field="lab_shard.version", minimum=0)
-            attempt_count = _strict_sqlite_int(
-                row["attempt_count"], field="lab_shard.attempt_count", minimum=0
-            )
             generation = (
                 _strict_sqlite_int(
                     row["claim_generation"], field="lab_shard.claim_generation", minimum=0
@@ -13790,20 +13995,31 @@ class LabJobStore:
             try:
                 v2_precondition(payload, prospective, now)
             except (SourceOperationContractError, ValueError):
+                rejections.append(
+                    LabPreclaimRejection(
+                        job_id=job_id,
+                        shard_id=definition.shard_id,
+                        payload_hash=definition.payload_hash,
+                        reason="source_preclaim_rejected",
+                    )
+                )
                 continue
             validated.add(
-                (
-                    job_id,
-                    definition.shard_id,
-                    definition.payload_hash,
-                    shard_version,
-                    attempt_count,
-                    str(row["job_spec_hash"]),
-                    generation,
-                    worker,
+                self._v2_preclaim_snapshot_identity(
+                    row=row,
+                    job_id=job_id,
+                    spec_hash=str(row["job_spec_hash"]),
+                    worker=worker,
+                    lease=lease,
+                    source_wait_deadline=source_deadline,
+                    publication_deadline=publish_deadline,
+                    source_stage_authority_hash=source_stage_authority_hash,
                 )
             )
-        return frozenset(validated)
+        return _V2PreclaimSnapshotBatch(
+            eligible=frozenset(validated),
+            rejections=tuple(rejections),
+        )
 
     def _store_preclaim_cursor(
         self,
@@ -13916,19 +14132,23 @@ class LabJobStore:
         allowed_protocols = tuple(sorted(set(allowed_payload_protocol_versions)))
         if not allowed_protocols or any(version not in {1, 2} for version in allowed_protocols):
             raise ValueError("allowed_payload_protocol_versions must contain only 1 or 2")
-        protocol_placeholders = ", ".join("?" for _ in allowed_protocols)
         current = _utc(now)
-        prevalidated_v2: frozenset[tuple[UUID, UUID, str, int, int, str, int, str]] | None = None
+        prevalidated_v2: frozenset[_V2PreclaimSnapshotIdentity] | None = None
+        source_stage_authority_hash: str | None = None
         if v2_precondition is not None and 2 in allowed_protocols:
-            prevalidated_v2 = self._prevalidate_v2_preclaim_candidates(
+            source_stage_authority_hash = self._source_stage_authority_hash(source_stage_store)
+            prevalidation = self._prevalidate_v2_preclaim_candidates(
                 worker=worker,
                 shard_lease_seconds=shard_lease_seconds,
                 lease=lease,
                 now=current,
                 source_wait_deadline=source_wait_deadline,
                 publication_deadline=publication_deadline,
+                source_stage_authority_hash=source_stage_authority_hash,
                 v2_precondition=v2_precondition,
             )
+            prevalidated_v2 = prevalidation.eligible
+            rejections.extend(prevalidation.rejections)
             v2_precondition = None
 
         with self._transaction() as connection:
@@ -13977,71 +14197,16 @@ class LabJobStore:
                         FROM lab_preclaim_fair_cursor WHERE singleton = 1
                         """
                     ).fetchone()
-            reclaimed_shards: set[tuple[UUID, int, UUID]] = set()
-            fair_work_available = use_fair_cursor and (
-                connection.execute(
-                    f"""
-                    SELECT 1 FROM lab_shard AS s
-                    JOIN lab_job AS j ON j.job_id = s.job_id
-                    WHERE s.status = ?
-                      AND s.payload_protocol_version IN ({protocol_placeholders})
-                      AND s.attempt_count < s.max_attempts
-                      AND j.status IN (?, ?) AND j.control_intent = ? AND j.deadline > ?
-                    LIMIT 1
-                    """,
-                    (
-                        ShardStatus.QUEUED.value,
-                        *allowed_protocols,
-                        JobStatus.QUEUED.value,
-                        JobStatus.RUNNING.value,
-                        ControlIntent.NONE.value,
-                        _dump_time(current),
-                    ),
-                ).fetchone()
-                is not None
+            stale_plans = self._stale_v1_attempt_plans(
+                connection,
+                allowed_protocols=allowed_protocols,
+                lease=lease,
+                now=current,
             )
-            if not fair_work_available:
-                self._recover_stale_shards_in_transaction(
+            if not use_fair_cursor and stale_plans:
+                candidate = self._claim_eligible_attempt_in_transaction(
                     connection,
-                    lease=lease,
-                    now=current,
-                    reclaimed_shards=reclaimed_shards,
-                )
-            for reclaimed_job_id, _reclaimed_shard_index, reclaimed_shard_id in sorted(
-                reclaimed_shards,
-                key=lambda item: (str(item[0]), item[1], str(item[2])),
-            ):
-                row = connection.execute(
-                    f"""
-                    SELECT s.* FROM lab_shard AS s
-                    JOIN lab_job AS j ON j.job_id = s.job_id
-                    WHERE s.job_id = ? AND s.shard_id = ?
-                      AND s.status = ?
-                      AND s.payload_protocol_version IN ({protocol_placeholders})
-                      AND s.attempt_count < s.max_attempts
-                      AND j.status IN (?, ?) AND j.control_intent = ? AND j.deadline > ?
-                    """,
-                    (
-                        str(reclaimed_job_id),
-                        str(reclaimed_shard_id),
-                        ShardStatus.QUEUED.value,
-                        *allowed_protocols,
-                        JobStatus.QUEUED.value,
-                        JobStatus.RUNNING.value,
-                        ControlIntent.NONE.value,
-                        _dump_time(current),
-                    ),
-                ).fetchone()
-                if row is None:
-                    continue
-                job_row = self._load_job_row(connection, reclaimed_job_id)
-                assert job_row is not None
-                candidate = self._claim_preclaim_candidate_in_transaction(
-                    connection,
-                    row=row,
-                    job_id=reclaimed_job_id,
-                    job_created_at=_load_time(str(job_row["created_at"])),
-                    job_row=job_row,
+                    plan=stale_plans[0],
                     worker=worker,
                     shard_lease_seconds=shard_lease_seconds,
                     lease=lease,
@@ -14051,13 +14216,19 @@ class LabJobStore:
                     publication_deadline=publication_deadline,
                     v2_precondition=v2_precondition,
                     prevalidated_v2=prevalidated_v2,
+                    source_stage_authority_hash=source_stage_authority_hash,
                     use_fair_cursor=use_fair_cursor,
                 )
-                if isinstance(candidate, LabPreclaimRejection):
-                    rejections.append(candidate)
-                    continue
-                if candidate is not None:
-                    return selected(candidate)
+                return selected(
+                    candidate if not isinstance(candidate, LabPreclaimRejection) else None
+                )
+            queued_protocol_predicate, queued_protocol_parameters = (
+                self._queued_attempt_protocol_predicate(
+                    alias="s",
+                    allowed_protocols=allowed_protocols,
+                    prevalidated_v2=prevalidated_v2,
+                )
+            )
             cursor_created_at: datetime | None = None
             cursor_job_id: UUID | None = None
             cursor_shard_index: int | None = None
@@ -14076,7 +14247,7 @@ class LabJobStore:
                         SELECT 1 FROM lab_shard AS s
                         WHERE s.job_id = j.job_id
                           AND s.status = ?
-                          AND s.payload_protocol_version IN ({protocol_placeholders})
+                          AND {queued_protocol_predicate}
                           AND s.attempt_count < s.max_attempts
                       )
                     ORDER BY j.created_at, j.job_id
@@ -14088,7 +14259,7 @@ class LabJobStore:
                         ControlIntent.NONE.value,
                         _dump_time(current),
                         ShardStatus.QUEUED.value,
-                        *allowed_protocols,
+                        *queued_protocol_parameters,
                     ),
                 ).fetchone()
             else:
@@ -14126,7 +14297,7 @@ class LabJobStore:
                           AND EXISTS (
                             SELECT 1 FROM lab_shard AS s
                             WHERE s.job_id = j.job_id AND s.status = ?
-                              AND s.payload_protocol_version IN ({protocol_placeholders})
+                              AND {queued_protocol_predicate}
                               AND s.attempt_count < s.max_attempts
                               AND (s.shard_index > ? OR (
                                   s.shard_index = ? AND s.shard_id > ?
@@ -14141,7 +14312,7 @@ class LabJobStore:
                             ControlIntent.NONE.value,
                             _dump_time(current),
                             ShardStatus.QUEUED.value,
-                            *allowed_protocols,
+                            *queued_protocol_parameters,
                             cursor_shard_index,
                             cursor_shard_index,
                             str(cursor_shard_id),
@@ -14161,7 +14332,7 @@ class LabJobStore:
                           AND EXISTS (
                             SELECT 1 FROM lab_shard AS s
                             WHERE s.job_id = j.job_id AND s.status = ?
-                              AND s.payload_protocol_version IN ({protocol_placeholders})
+                              AND {queued_protocol_predicate}
                               AND s.attempt_count < s.max_attempts
                           )
                         ORDER BY j.created_at, j.job_id
@@ -14176,7 +14347,7 @@ class LabJobStore:
                             cursor_created_at_dump,
                             str(cursor_job_id),
                             ShardStatus.QUEUED.value,
-                            *allowed_protocols,
+                            *queued_protocol_parameters,
                         ),
                     ).fetchone()
                 if job_candidate is None:
@@ -14189,7 +14360,7 @@ class LabJobStore:
                           AND EXISTS (
                             SELECT 1 FROM lab_shard AS s
                             WHERE s.job_id = j.job_id AND s.status = ?
-                              AND s.payload_protocol_version IN ({protocol_placeholders})
+                              AND {queued_protocol_predicate}
                               AND s.attempt_count < s.max_attempts
                           )
                         ORDER BY j.created_at, j.job_id
@@ -14201,10 +14372,29 @@ class LabJobStore:
                             ControlIntent.NONE.value,
                             _dump_time(current),
                             ShardStatus.QUEUED.value,
-                            *allowed_protocols,
+                            *queued_protocol_parameters,
                         ),
                     ).fetchone()
             if job_candidate is None:
+                if use_fair_cursor and stale_plans:
+                    candidate = self._claim_eligible_attempt_in_transaction(
+                        connection,
+                        plan=stale_plans[0],
+                        worker=worker,
+                        shard_lease_seconds=shard_lease_seconds,
+                        lease=lease,
+                        now=current,
+                        source_stage_store=source_stage_store,
+                        source_wait_deadline=source_wait_deadline,
+                        publication_deadline=publication_deadline,
+                        v2_precondition=v2_precondition,
+                        prevalidated_v2=prevalidated_v2,
+                        source_stage_authority_hash=source_stage_authority_hash,
+                        use_fair_cursor=use_fair_cursor,
+                    )
+                    return selected(
+                        candidate if not isinstance(candidate, LabPreclaimRejection) else None
+                    )
                 return selected(None)
             try:
                 job_id = _canonical_uuid_text(
@@ -14223,7 +14413,7 @@ class LabJobStore:
                 and cursor_shard_id is not None
             ):
                 shard_cursor_predicate = """
-                  AND (shard_index > ? OR (shard_index = ? AND shard_id > ?))
+                  AND (s.shard_index > ? OR (s.shard_index = ? AND s.shard_id > ?))
                 """
                 shard_cursor_parameters = (
                     cursor_shard_index,
@@ -14232,17 +14422,17 @@ class LabJobStore:
                 )
             rows = connection.execute(
                 f"""
-                SELECT * FROM lab_shard INDEXED BY ix_lab_shard_preclaim_candidate
-                WHERE job_id = ? AND status = 'queued'
-                  AND payload_protocol_version IN ({protocol_placeholders})
-                  AND attempt_count < max_attempts
+                SELECT s.* FROM lab_shard AS s INDEXED BY ix_lab_shard_preclaim_candidate
+                WHERE s.job_id = ? AND s.status = 'queued'
+                  AND {queued_protocol_predicate}
+                  AND s.attempt_count < s.max_attempts
                   {shard_cursor_predicate}
-                ORDER BY shard_index, shard_id
+                ORDER BY s.shard_index, s.shard_id
                 LIMIT ?
                 """,
                 (
                     str(job_id),
-                    *allowed_protocols,
+                    *queued_protocol_parameters,
                     *shard_cursor_parameters,
                     PRECLAIM_CANDIDATE_BATCH_SIZE,
                 ),
@@ -14254,12 +14444,15 @@ class LabJobStore:
             deferred_deadline_error: ValueError | None = None
             for row in rows:
                 try:
-                    candidate = self._claim_preclaim_candidate_in_transaction(
+                    candidate = self._claim_eligible_attempt_in_transaction(
                         connection,
-                        row=row,
-                        job_id=job_id,
-                        job_created_at=job_created_at,
-                        job_row=job_row,
+                        plan=_EligibleAttemptPlan(
+                            source_status=ShardStatus.QUEUED,
+                            row=row,
+                            job_id=job_id,
+                            job_created_at=job_created_at,
+                            job_row=job_row,
+                        ),
                         worker=worker,
                         shard_lease_seconds=shard_lease_seconds,
                         lease=lease,
@@ -14269,6 +14462,7 @@ class LabJobStore:
                         publication_deadline=publication_deadline,
                         v2_precondition=v2_precondition,
                         prevalidated_v2=prevalidated_v2,
+                        source_stage_authority_hash=source_stage_authority_hash,
                         use_fair_cursor=use_fair_cursor,
                     )
                 except ValueError as exc:
@@ -14284,15 +14478,10 @@ class LabJobStore:
                 if isinstance(candidate, LabPreclaimRejection):
                     rejections.append(candidate)
                     continue
-                if candidate is not None:
-                    return selected(candidate)
-            if rejections:
-                last_rows = rows
-                last_job_id = job_id
-                last_job_created_at = job_created_at
-                if len(rows) < PRECLAIM_CANDIDATE_BATCH_SIZE:
-                    next_job = connection.execute(
-                        f"""
+                return selected(candidate)
+            if rejections and len(rows) < PRECLAIM_CANDIDATE_BATCH_SIZE:
+                next_job = connection.execute(
+                    f"""
                         SELECT j.job_id, j.created_at
                         FROM lab_job AS j
                         WHERE j.status IN (?, ?)
@@ -14303,27 +14492,27 @@ class LabJobStore:
                           AND EXISTS (
                             SELECT 1 FROM lab_shard AS s
                             WHERE s.job_id = j.job_id AND s.status = ?
-                              AND s.payload_protocol_version IN ({protocol_placeholders})
+                              AND {queued_protocol_predicate}
                               AND s.attempt_count < s.max_attempts
                           )
                         ORDER BY j.created_at, j.job_id
                         LIMIT 1
                         """,
-                        (
-                            JobStatus.QUEUED.value,
-                            JobStatus.RUNNING.value,
-                            ControlIntent.NONE.value,
-                            _dump_time(current),
-                            _dump_time(job_created_at),
-                            _dump_time(job_created_at),
-                            str(job_id),
-                            ShardStatus.QUEUED.value,
-                            *allowed_protocols,
-                        ),
-                    ).fetchone()
-                    if next_job is None:
-                        next_job = connection.execute(
-                            f"""
+                    (
+                        JobStatus.QUEUED.value,
+                        JobStatus.RUNNING.value,
+                        ControlIntent.NONE.value,
+                        _dump_time(current),
+                        _dump_time(job_created_at),
+                        _dump_time(job_created_at),
+                        str(job_id),
+                        ShardStatus.QUEUED.value,
+                        *queued_protocol_parameters,
+                    ),
+                ).fetchone()
+                if next_job is None:
+                    next_job = connection.execute(
+                        f"""
                             SELECT j.job_id, j.created_at
                             FROM lab_job AS j
                             WHERE j.job_id <> ? AND j.status IN (?, ?)
@@ -14331,89 +14520,89 @@ class LabJobStore:
                               AND EXISTS (
                                 SELECT 1 FROM lab_shard AS s
                                 WHERE s.job_id = j.job_id AND s.status = ?
-                                  AND s.payload_protocol_version IN ({protocol_placeholders})
+                                  AND {queued_protocol_predicate}
                                   AND s.attempt_count < s.max_attempts
                               )
                             ORDER BY j.created_at, j.job_id
                             LIMIT 1
                             """,
-                            (
-                                str(job_id),
-                                JobStatus.QUEUED.value,
-                                JobStatus.RUNNING.value,
-                                ControlIntent.NONE.value,
-                                _dump_time(current),
-                                ShardStatus.QUEUED.value,
-                                *allowed_protocols,
-                            ),
-                        ).fetchone()
-                    if next_job is None and deferred_deadline_error is not None:
-                        raise deferred_deadline_error
-                    if next_job is not None:
-                        next_job_id = _canonical_uuid_text(
-                            next_job["job_id"], field="lab_job.job_id"
-                        )
-                        next_job_created_at = _load_time(str(next_job["created_at"]))
-                        next_rows = connection.execute(
-                            f"""
-                            SELECT * FROM lab_shard INDEXED BY ix_lab_shard_preclaim_candidate
-                            WHERE job_id = ? AND status = 'queued'
-                              AND payload_protocol_version IN ({protocol_placeholders})
-                              AND attempt_count < max_attempts
-                            ORDER BY shard_index, shard_id
+                        (
+                            str(job_id),
+                            JobStatus.QUEUED.value,
+                            JobStatus.RUNNING.value,
+                            ControlIntent.NONE.value,
+                            _dump_time(current),
+                            ShardStatus.QUEUED.value,
+                            *queued_protocol_parameters,
+                        ),
+                    ).fetchone()
+                if next_job is None and deferred_deadline_error is not None:
+                    raise deferred_deadline_error
+                if next_job is not None:
+                    next_job_id = _canonical_uuid_text(next_job["job_id"], field="lab_job.job_id")
+                    next_job_created_at = _load_time(str(next_job["created_at"]))
+                    next_rows = connection.execute(
+                        f"""
+                            SELECT s.* FROM lab_shard AS s
+                            INDEXED BY ix_lab_shard_preclaim_candidate
+                            WHERE s.job_id = ? AND s.status = 'queued'
+                              AND {queued_protocol_predicate}
+                              AND s.attempt_count < s.max_attempts
+                            ORDER BY s.shard_index, s.shard_id
                             LIMIT ?
                             """,
-                            (
-                                str(next_job_id),
-                                *allowed_protocols,
-                                PRECLAIM_CANDIDATE_BATCH_SIZE - len(rows),
-                            ),
-                        ).fetchall()
-                        next_job_row = self._load_job_row(connection, next_job_id)
-                        assert next_job_row is not None
-                        for row in next_rows:
-                            candidate = self._claim_preclaim_candidate_in_transaction(
-                                connection,
+                        (
+                            str(next_job_id),
+                            *queued_protocol_parameters,
+                            PRECLAIM_CANDIDATE_BATCH_SIZE - len(rows),
+                        ),
+                    ).fetchall()
+                    next_job_row = self._load_job_row(connection, next_job_id)
+                    assert next_job_row is not None
+                    for row in next_rows:
+                        candidate = self._claim_eligible_attempt_in_transaction(
+                            connection,
+                            plan=_EligibleAttemptPlan(
+                                source_status=ShardStatus.QUEUED,
                                 row=row,
                                 job_id=next_job_id,
                                 job_created_at=next_job_created_at,
                                 job_row=next_job_row,
-                                worker=worker,
-                                shard_lease_seconds=shard_lease_seconds,
-                                lease=lease,
-                                now=current,
-                                source_stage_store=source_stage_store,
-                                source_wait_deadline=source_wait_deadline,
-                                publication_deadline=publication_deadline,
-                                v2_precondition=v2_precondition,
-                                prevalidated_v2=prevalidated_v2,
-                                use_fair_cursor=use_fair_cursor,
-                            )
-                            if isinstance(candidate, LabPreclaimRejection):
-                                rejections.append(candidate)
-                                continue
-                            if candidate is not None:
-                                return selected(candidate)
-                        if next_rows:
-                            last_rows = next_rows
-                            last_job_id = next_job_id
-                            last_job_created_at = next_job_created_at
-                last_row = last_rows[-1]
-                self._store_preclaim_cursor(
+                            ),
+                            worker=worker,
+                            shard_lease_seconds=shard_lease_seconds,
+                            lease=lease,
+                            now=current,
+                            source_stage_store=source_stage_store,
+                            source_wait_deadline=source_wait_deadline,
+                            publication_deadline=publication_deadline,
+                            v2_precondition=v2_precondition,
+                            prevalidated_v2=prevalidated_v2,
+                            source_stage_authority_hash=source_stage_authority_hash,
+                            use_fair_cursor=use_fair_cursor,
+                        )
+                        if isinstance(candidate, LabPreclaimRejection):
+                            rejections.append(candidate)
+                            continue
+                        return selected(candidate)
+            if use_fair_cursor and stale_plans:
+                candidate = self._claim_eligible_attempt_in_transaction(
                     connection,
-                    job_created_at=last_job_created_at,
-                    job_id=last_job_id,
-                    shard_index=_strict_sqlite_int(
-                        last_row["shard_index"],
-                        field="lab_shard.shard_index",
-                        minimum=0,
-                    ),
-                    shard_id=_canonical_uuid_text(
-                        last_row["shard_id"],
-                        field="lab_shard.shard_id",
-                    ),
+                    plan=stale_plans[0],
+                    worker=worker,
+                    shard_lease_seconds=shard_lease_seconds,
+                    lease=lease,
                     now=current,
+                    source_stage_store=source_stage_store,
+                    source_wait_deadline=source_wait_deadline,
+                    publication_deadline=publication_deadline,
+                    v2_precondition=v2_precondition,
+                    prevalidated_v2=prevalidated_v2,
+                    source_stage_authority_hash=source_stage_authority_hash,
                     use_fair_cursor=use_fair_cursor,
+                )
+                return selected(
+                    candidate if not isinstance(candidate, LabPreclaimRejection) else None
                 )
         return selected(None)
 
