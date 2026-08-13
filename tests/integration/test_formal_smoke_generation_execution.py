@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import os
+import time
 from contextlib import suppress
 from datetime import date
 from pathlib import Path
@@ -309,6 +310,124 @@ def test_missing_receipt_and_child_failure_leave_no_saved_run(tmp_path: Path) ->
         _run(tmp_path, exchange=fail)
     assert not list((tmp_path / "output").glob("strategy_lab_runs/*"))
     assert not list((tmp_path / "output").glob(".formal-smoke-*"))
+
+
+def test_receipt_fd_holder_times_out_reaps_process_group_and_cleans_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant import formal_smoke_execution as execution_module
+    from rquant.formal_smoke_execution import FormalSmokeExecutionError
+
+    identity_path = tmp_path / "child-process-group.txt"
+    parent_pid = os.getpid()
+    direct_children: list[int] = []
+    original_fork = os.fork
+
+    def tracked_fork() -> int:
+        process_id = original_fork()
+        if os.getpid() == parent_pid and process_id > 0:
+            direct_children.append(process_id)
+        return process_id
+
+    def retain_receipt_fd_forever(
+        _session: object,
+        *,
+        request_descriptor: int,
+        receipt_descriptor: int,
+    ) -> None:
+        del request_descriptor, receipt_descriptor
+        child_pid = os.getpid()
+        descendant_pid = os.fork()
+        if descendant_pid == 0:
+            time.sleep(30)
+            os._exit(0)
+        identity_path.write_text(
+            f"{child_pid}:{os.getpgrp()}\n{descendant_pid}:{os.getpgid(descendant_pid)}\n",
+            encoding="ascii",
+        )
+        time.sleep(30)
+
+    monkeypatch.setattr(execution_module.os, "fork", tracked_fork)
+    monkeypatch.setattr(
+        execution_module,
+        "exec_formal_smoke_child",
+        retain_receipt_fd_forever,
+    )
+
+    def exchange(session: object, request_bytes: bytes):
+        return execution_module._exchange_formal_smoke_child(
+            session,
+            request_bytes,
+            deadline_monotonic=time.monotonic() + 0.25,
+        )
+
+    started = time.monotonic()
+    with pytest.raises(FormalSmokeExecutionError, match="deadline"):
+        _run(tmp_path, exchange=exchange)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 2
+    assert len(direct_children) == 1
+    with pytest.raises(ChildProcessError):
+        os.waitpid(direct_children[0], os.WNOHANG)
+    identities = tuple(
+        tuple(int(value) for value in line.split(":"))
+        for line in identity_path.read_text(encoding="ascii").splitlines()
+    )
+    assert identities[0][0] == direct_children[0]
+    assert all(process_id == process_group for process_id, process_group in identities[:1])
+    assert identities[1][1] == direct_children[0]
+    assert not list((tmp_path / "output").glob("strategy_lab_runs/*"))
+    assert not list((tmp_path / "output").glob(".formal-smoke-*"))
+
+
+def test_publication_directory_swap_before_link_fails_closed_in_both_directories(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant import formal_smoke_execution as execution_module
+    from rquant.formal_smoke_execution import FormalSmokeExecutionError
+
+    success = _success_exchange()
+    output = tmp_path / "output"
+    displaced = output / "validated-strategy-lab-runs"
+    current = output / "strategy_lab_runs"
+    original_link = os.link
+    swapped = False
+    marked_verified = False
+
+    def swapping_link(
+        source: object,
+        destination: object,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            current.rename(displaced)
+            current.mkdir(mode=0o755)
+        original_link(source, destination, *args, **kwargs)
+
+    def exchange(session: object, request_bytes: bytes):
+        process_result = success(session, request_bytes)
+        monkeypatch.setattr(execution_module.os, "link", swapping_link)
+        return process_result
+
+    def mark_verified(_capability: object, _binding_digest: str) -> None:
+        nonlocal marked_verified
+        marked_verified = True
+
+    monkeypatch.setattr(execution_module, "_mark_verified_execution", mark_verified)
+
+    with pytest.raises(FormalSmokeExecutionError):
+        _run(tmp_path, exchange=exchange)
+
+    assert swapped
+    assert not marked_verified
+    assert not list(current.glob("*"))
+    assert not list(displaced.glob("*"))
 
 
 def test_closed_or_tampered_generation_fails_before_child_execution(tmp_path: Path) -> None:

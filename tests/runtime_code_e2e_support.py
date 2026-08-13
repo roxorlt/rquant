@@ -57,6 +57,7 @@ class RuntimeCodeTestPackage:
     certificate_bytes: bytes
     receipt_bytes: bytes
     receipt: RuntimeCodePromotionReceipt
+    now: datetime
 
     def request(self) -> RuntimeCodeInstallRequest:
         return RuntimeCodeInstallRequest(
@@ -68,7 +69,7 @@ class RuntimeCodeTestPackage:
             expected_audience="formal-lab",
             expected_installation_id="installation-a",
             expected_target_platform="test-platform",
-            now=NOW,
+            now=self.now,
         )
 
 
@@ -83,6 +84,10 @@ def build_test_package(
     promotion_state: CurrentPromotion | None = None,
     extra_entries: tuple[RuntimeCodeBundleEntry, ...] = (),
     environment_allowlist: tuple[str, ...] = ("RQUANT_ALLOWED",),
+    interpreter_bytes: bytes = INTERPRETER_BYTES,
+    launcher_bytes: bytes = LAUNCHER_BYTES,
+    python_abi: str = "test-abi",
+    now: datetime = NOW,
 ) -> RuntimeCodeTestPackage:
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     if authorities is None:
@@ -124,12 +129,12 @@ def build_test_package(
             RuntimeCodeBundleEntry(
                 path="release/bin/python",
                 mode=0o555,
-                content=INTERPRETER_BYTES,
+                content=interpreter_bytes,
             ),
             RuntimeCodeBundleEntry(
                 path="release/bin/rquant",
                 mode=0o555,
-                content=LAUNCHER_BYTES,
+                content=launcher_bytes,
             ),
             RuntimeCodeBundleEntry(
                 path="release/src/rquant/app.py",
@@ -145,8 +150,8 @@ def build_test_package(
         audience="formal-lab",
         installation_id="installation-a",
         target_platform="test-platform",
-        not_before=NOW - timedelta(minutes=1),
-        expires_at=NOW + timedelta(days=1),
+        not_before=now - timedelta(minutes=1),
+        expires_at=now + timedelta(days=1),
     )
     attestation = sign_runtime_code_attestation(
         signer=runtime_signer,
@@ -156,16 +161,16 @@ def build_test_package(
             working_directory="release",
             import_roots=("release/src",),
             interpreter_path="release/bin/python",
-            interpreter_sha256=hashlib.sha256(INTERPRETER_BYTES).hexdigest(),
-            python_abi="test-abi",
+            interpreter_sha256=hashlib.sha256(interpreter_bytes).hexdigest(),
+            python_abi=python_abi,
             environment_allowlist=environment_allowlist,
         ),
         audience="formal-lab",
         installation_id="installation-a",
         target_platform="test-platform",
         provenance_commit=provenance_commit,
-        not_before=NOW - timedelta(minutes=1),
-        expires_at=NOW + timedelta(hours=1),
+        not_before=now - timedelta(minutes=1),
+        expires_at=now + timedelta(hours=1),
     )
     attestation_bytes = canonical_model_json_bytes(attestation)
     generation_id = compute_runtime_code_generation_id(
@@ -263,6 +268,7 @@ def build_test_package(
         certificate_bytes=certificate_bytes,
         receipt_bytes=receipt_bytes,
         receipt=receipt,
+        now=now,
     )
 
 
@@ -304,5 +310,5 @@ def open_test_capability(
         expected_audience="formal-lab",
         expected_installation_id="installation-a",
         expected_target_platform="test-platform",
-        now=NOW,
+        now=package.now,
     )

@@ -243,6 +243,18 @@ def _parse_commit_sha(value: str) -> str:
     return normalized
 
 
+def _parse_formal_smoke_timeout_seconds(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("formal smoke timeout must be a number") from exc
+    if not math.isfinite(parsed) or not 0.1 <= parsed <= 86_400:
+        raise argparse.ArgumentTypeError(
+            "formal smoke timeout must be between 0.1 and 86400 seconds"
+        )
+    return parsed
+
+
 def _parse_bounded_int(
     value: str,
     *,
@@ -1580,6 +1592,7 @@ def cmd_formal_smoke_replay(args: argparse.Namespace) -> int:
                 expected_authority_gid=args.runtime_code_authority_gid,
             ),
             environment_source=os.environ,
+            execution_deadline_monotonic=(time.monotonic() + args.execution_timeout_seconds),
         )
         _print_json(result.model_dump(mode="json"))
         return 0
@@ -6830,6 +6843,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="Strategy Lab 记录根目录（默认使用配置 data_dir）",
+    )
+    formal_smoke_p.add_argument(
+        "--execution-timeout-seconds",
+        type=_parse_formal_smoke_timeout_seconds,
+        default=3600.0,
+        help=argparse.SUPPRESS,
     )
     _add_formal_runtime_bootstrap_arguments(formal_smoke_p)
 

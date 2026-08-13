@@ -1501,6 +1501,8 @@ class TestFormalSmokeReplay:
                 "c" * 64,
                 "--output-dir",
                 "/tmp/formal-smoke",
+                "--execution-timeout-seconds",
+                "0.25",
                 *runtime_arguments,
             ]
         )
@@ -1513,6 +1515,7 @@ class TestFormalSmokeReplay:
         assert args.snapshot_id == "b" * 64
         assert args.binding_hash == "c" * 64
         assert args.output_dir == Path("/tmp/formal-smoke")
+        assert args.execution_timeout_seconds == 0.25
 
         with pytest.raises(SystemExit):
             build_parser().parse_args(
@@ -1530,6 +1533,27 @@ class TestFormalSmokeReplay:
                     "b" * 64,
                     "--binding-hash",
                     "c" * 64,
+                    *runtime_arguments,
+                ]
+            )
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(
+                [
+                    "formal-smoke-replay",
+                    "--strategy",
+                    "n_shape",
+                    "--start-date",
+                    "2026-04-01",
+                    "--end-date",
+                    "2026-07-02",
+                    "--audit-run-id",
+                    "a" * 64,
+                    "--snapshot-id",
+                    "b" * 64,
+                    "--binding-hash",
+                    "c" * 64,
+                    "--execution-timeout-seconds",
+                    "0",
                     *runtime_arguments,
                 ]
             )
@@ -1640,6 +1664,7 @@ class TestFormalSmokeReplay:
         assert reference.expected_authority_uid == 1
         assert reference.expected_authority_gid == 1
         assert run.call_args.kwargs["environment_source"] is os.environ
+        assert run.call_args.kwargs["execution_deadline_monotonic"] > time.monotonic()
         assert json.loads(capsys.readouterr().out) == result.model_dump.return_value
 
     def test_command_rejects_missing_runtime_capability_before_compute(
