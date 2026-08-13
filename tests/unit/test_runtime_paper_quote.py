@@ -392,8 +392,44 @@ def test_latest_stale_or_candidate_missing_batch_never_falls_back(
         available_at=T0931 + timedelta(minutes=1),
         rows=[_minute_row(ts_code=OTHER_CODE, close=11.0)],
     )
-    with pytest.raises(PaperQuoteCandidateMissingError, match=CODE):
+    with pytest.raises(PaperQuoteStaleError, match=CODE):
         _resolver(tmp_path / "missing", missing_spool)(_signal(), T0931 + timedelta(minutes=1))
+
+
+def test_provider_snapshot_candidate_missing_batch_never_uses_prior_sequence(
+    tmp_path: Path,
+) -> None:
+    spool = LiveBatchSpool(tmp_path / "raw-spool")
+    _publish(
+        spool,
+        sequence=0,
+        available_at=T0931 + timedelta(minutes=1, seconds=5),
+        rows=[_minute_row(trade_time=T0931 + timedelta(minutes=1), close=10.2)],
+    )
+    _publish(
+        spool,
+        sequence=1,
+        available_at=T0931 + timedelta(minutes=1, seconds=25),
+        rows=[
+            _minute_row(
+                ts_code=OTHER_CODE,
+                trade_time=T0931 + timedelta(minutes=1),
+                close=11.0,
+            )
+        ],
+    )
+    _publish(
+        spool,
+        sequence=2,
+        available_at=T0931 + timedelta(minutes=2, seconds=5),
+        rows=[_minute_row(trade_time=T0931 + timedelta(minutes=2), close=10.4)],
+    )
+
+    with pytest.raises(PaperQuoteStaleError, match="sequence 1|600000.SH"):
+        _resolver(tmp_path, spool, timestamp_semantics="provider_snapshot")(
+            _signal(),
+            T0931 + timedelta(minutes=2, seconds=10),
+        )
 
 
 def test_current_visible_quote_does_not_scan_historical_manifests(

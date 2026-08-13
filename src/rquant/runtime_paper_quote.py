@@ -53,7 +53,7 @@ class PaperQuoteStaleError(PaperQuoteUnavailableError):
     """The latest visible market-minute batch explicitly reported STALE."""
 
 
-class PaperQuoteCandidateMissingError(PaperQuoteUnavailableError):
+class PaperQuoteCandidateMissingError(PaperQuoteStaleError):
     """The latest visible batch has no usable row for the signal candidate."""
 
 
@@ -413,15 +413,12 @@ class PaperPitQuoteResolver:
                 raise PaperQuoteUnavailableError(
                     "provider snapshot finalization crossed an unpublished batch"
                 )
-            try:
-                row = self._latest_candidate_row(
-                    envelope,
-                    payload,
-                    candidate_id=candidate_id,
-                    observed_at=observed_at,
-                )
-            except PaperQuoteCandidateMissingError:
-                continue
+            row = self._latest_candidate_row(
+                envelope,
+                payload,
+                candidate_id=candidate_id,
+                observed_at=observed_at,
+            )
             event_time = row["trade_time"].to_pydatetime()
             if event_time < advancing_time:
                 expected_advance = _next_trading_minute(event_time)
@@ -454,9 +451,22 @@ class PaperPitQuoteResolver:
         if pointer.channel is not LiveChannel.MARKET_MINUTE:
             raise PaperQuoteIntegrityError("market-minute current pointer channel mismatch")
 
+        channel_root = root / "batches" / LiveChannel.MARKET_MINUTE.value
+        descriptor = _open_directory_no_symlinks(channel_root)
+        try:
+            sequences = [
+                int(name.removesuffix(".json"))
+                for name in os.listdir(descriptor)
+                if name.endswith(".json") and name.removesuffix(".json").isdigit()
+            ]
+        finally:
+            os.close(descriptor)
+        if not sequences:
+            raise PaperQuoteUnavailableError("no market-minute batch is available")
+        high_watermark = max(sequences)
         selected: BatchEnvelope | None = None
-        lower_bound = max(-1, pointer.sequence - self.config.max_visible_scan_batches)
-        for sequence in range(pointer.sequence, lower_bound, -1):
+        lower_bound = max(-1, high_watermark - self.config.max_visible_scan_batches)
+        for sequence in range(high_watermark, lower_bound, -1):
             envelope, _payload = self._load_batch(sequence, load_payload=False)
             if sequence == pointer.sequence and (
                 envelope.batch_id != pointer.batch_id
