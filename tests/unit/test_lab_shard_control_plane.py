@@ -866,6 +866,117 @@ def test_stale_reclaim_prioritizes_lowest_abandoned_shard_before_fresh_work(
     assert reclaimed.claim_token != first.claim_token
 
 
+def test_active_worker_poll_does_not_mutate_or_detach_stale_recovery(
+    tmp_path: Path,
+) -> None:
+    store, lease, job_id = _setup(tmp_path, count=3, max_attempts=4)
+    abandoned = _claim(store, lease, worker="worker-a", duration=5)
+    active = _claim(store, lease, worker="worker-b", now_offset=3, duration=30)
+    before = {shard.shard_id: shard for shard in LabJobReader(store.path).list_shards(job_id)}
+
+    duplicate = store.claim_next_shard(
+        worker_id=active.worker_id,
+        shard_lease_seconds=30,
+        lease=lease,
+        now=NOW + timedelta(seconds=8),
+    )
+
+    assert duplicate is None
+    after_duplicate = {
+        shard.shard_id: shard for shard in LabJobReader(store.path).list_shards(job_id)
+    }
+    assert after_duplicate[abandoned.shard_id] == before[abandoned.shard_id]
+    assert after_duplicate[active.shard_id] == before[active.shard_id]
+
+    reclaimed = _claim(store, lease, worker="worker-c", now_offset=9, duration=30)
+    assert reclaimed.shard_id == abandoned.shard_id
+    assert reclaimed.claim_generation == abandoned.claim_generation + 1
+    assert reclaimed.claim_token != abandoned.claim_token
+
+    late = store.apply_worker_report(
+        _report(
+            abandoned,
+            LabShardSucceeded(result_manifest_hash="6" * 64),
+            offset=10,
+        ),
+        lease=lease,
+        now=NOW + timedelta(seconds=10),
+    )
+    current = {shard.shard_id: shard for shard in LabJobReader(store.path).list_shards(job_id)}[
+        abandoned.shard_id
+    ]
+    assert late.status == "rejected"
+    assert current.status is ShardStatus.RUNNING
+    assert current.worker_id == reclaimed.worker_id
+    assert current.claim_generation == reclaimed.claim_generation
+    assert current.claim_token == reclaimed.claim_token
+
+
+def test_recovery_priority_preserves_bounded_fair_scan_across_jobs(
+    tmp_path: Path,
+) -> None:
+    store = LabJobStore(tmp_path / "lab_jobs.sqlite3")
+    store.initialize()
+    lease = _lease(store, seconds=600)
+    recovery_job_id = UUID("00000000-0000-0000-0000-000000000001")
+    fresh_job_id = UUID("00000000-0000-0000-0000-000000000002")
+    for job_id, definition in (
+        (recovery_job_id, _definition(0)),
+        (fresh_job_id, _definition(0, plan_hash="5" * 64)),
+    ):
+        submitted = _submit(job_id=job_id, max_attempts=8)
+        assert store.apply_command(submitted, lease=lease, now=NOW).status == "applied"
+        store.plan_job(
+            job_id,
+            (definition,),
+            lease=lease,
+            now=NOW + timedelta(seconds=1),
+        )
+
+    recovery_claims = [_claim(store, lease, worker="worker-a", now_offset=2, duration=1)]
+    for worker, now_offset in (("worker-b", 4), ("worker-c", 6)):
+        recovery_claims.append(
+            _claim(
+                store,
+                lease,
+                worker=worker,
+                now_offset=now_offset,
+                duration=1,
+            )
+        )
+        assert recovery_claims[-1].job_id == recovery_job_id
+        assert recovery_claims[-1].shard_id == recovery_claims[0].shard_id
+
+    before_fair = {
+        (shard.job_id, shard.shard_id): shard
+        for job_id in (recovery_job_id, fresh_job_id)
+        for shard in LabJobReader(store.path).list_shards(job_id)
+    }
+    fair = _claim(store, lease, worker="worker-d", now_offset=8, duration=30)
+
+    assert len(recovery_claims) == lab_jobs.PRECLAIM_FAIR_SCAN_INTERVAL - 1
+    assert [claim.claim_generation for claim in recovery_claims] == [1, 2, 3]
+    assert len({claim.claim_token for claim in recovery_claims}) == len(recovery_claims)
+    assert fair.job_id == fresh_job_id
+    assert fair.claim_generation == 1
+    after_fair = {
+        (shard.job_id, shard.shard_id): shard
+        for job_id in (recovery_job_id, fresh_job_id)
+        for shard in LabJobReader(store.path).list_shards(job_id)
+    }
+    recovery_key = (recovery_job_id, recovery_claims[-1].shard_id)
+    assert after_fair[recovery_key] == before_fair[recovery_key]
+
+    reclaimed = _claim(store, lease, worker="worker-e", now_offset=10, duration=30)
+    assert reclaimed.job_id == recovery_job_id
+    assert reclaimed.shard_id == recovery_claims[-1].shard_id
+    assert reclaimed.claim_generation == recovery_claims[-1].claim_generation + 1
+    fresh = LabJobReader(store.path).list_shards(fresh_job_id)[0]
+    assert fresh.status is ShardStatus.RUNNING
+    assert fresh.worker_id == fair.worker_id
+    assert fresh.claim_token == fair.claim_token
+
+
 def test_scheduler_takeover_fences_old_report_and_reclaims_shard(tmp_path: Path) -> None:
     store, old_lease, job_id = _setup(tmp_path, scheduler_lease_seconds=10)
     old = _claim(store, old_lease, duration=5)

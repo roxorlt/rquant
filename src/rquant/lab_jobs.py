@@ -13933,13 +13933,6 @@ class LabJobStore:
 
         with self._transaction() as connection:
             self._validate_lease(connection, lease, now=current)
-            reclaimed_shards: set[tuple[UUID, int, UUID]] = set()
-            self._recover_stale_shards_in_transaction(
-                connection,
-                lease=lease,
-                now=current,
-                reclaimed_shards=reclaimed_shards,
-            )
             active_worker = connection.execute(
                 """
                 SELECT 1 FROM lab_shard
@@ -13984,6 +13977,36 @@ class LabJobStore:
                         FROM lab_preclaim_fair_cursor WHERE singleton = 1
                         """
                     ).fetchone()
+            reclaimed_shards: set[tuple[UUID, int, UUID]] = set()
+            fair_work_available = use_fair_cursor and (
+                connection.execute(
+                    f"""
+                    SELECT 1 FROM lab_shard AS s
+                    JOIN lab_job AS j ON j.job_id = s.job_id
+                    WHERE s.status = ?
+                      AND s.payload_protocol_version IN ({protocol_placeholders})
+                      AND s.attempt_count < s.max_attempts
+                      AND j.status IN (?, ?) AND j.control_intent = ? AND j.deadline > ?
+                    LIMIT 1
+                    """,
+                    (
+                        ShardStatus.QUEUED.value,
+                        *allowed_protocols,
+                        JobStatus.QUEUED.value,
+                        JobStatus.RUNNING.value,
+                        ControlIntent.NONE.value,
+                        _dump_time(current),
+                    ),
+                ).fetchone()
+                is not None
+            )
+            if not fair_work_available:
+                self._recover_stale_shards_in_transaction(
+                    connection,
+                    lease=lease,
+                    now=current,
+                    reclaimed_shards=reclaimed_shards,
+                )
             for reclaimed_job_id, _reclaimed_shard_index, reclaimed_shard_id in sorted(
                 reclaimed_shards,
                 key=lambda item: (str(item[0]), item[1], str(item[2])),
