@@ -38,9 +38,7 @@ MANIFEST_ID = canonical_sha256({"manifest": "service-test"})
 TOOL_ID = canonical_sha256({"tool": "service-test"})
 PROFILE_ID = canonical_sha256({"profile": "service-test"})
 COMMIT = "a" * 40
-LEGACY_RECEIPT_FIXTURE = (
-    Path(__file__).parents[1] / "fixtures" / "recovery_service_receipt_v1.json"
-)
+LEGACY_RECEIPT_FIXTURE = Path(__file__).parents[1] / "fixtures" / "recovery_service_receipt_v1.json"
 
 
 class _Clock:
@@ -666,9 +664,7 @@ def test_v3_to_v4_receipt_migration_is_idempotent_and_audited(tmp_path: Path) ->
     finally:
         connection.close()
     upgrades = [
-        item["event"]
-        for item in events
-        if item["event"]["event"] == "legacy_receipt_upgraded"
+        item["event"] for item in events if item["event"]["event"] == "legacy_receipt_upgraded"
     ]
     assert upgrades == [
         {

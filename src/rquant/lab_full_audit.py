@@ -112,9 +112,7 @@ class LabFullAuditChildRunner:
         try:
             receipt = strict_model_validate_json(LabGraphIntegrityReceipt, result.stdout)
         except Exception as exc:
-            raise LabFullAuditChildError(
-                "full ledger audit returned an invalid receipt"
-            ) from exc
+            raise LabFullAuditChildError("full ledger audit returned an invalid receipt") from exc
         return receipt
 
 

@@ -177,9 +177,7 @@ def _shadow_stage_environment(
             {
                 "RQUANT_DAILY_STAGE_ID": stage_id,
                 "RQ_DAILY_SHADOW_ADAPTER_STAGE": stage_id,
-                "RQ_DAILY_SHADOW_ADAPTER_IDENTITY": (
-                    f"daily-shadow-stage/{stage_id}/v1"
-                ),
+                "RQ_DAILY_SHADOW_ADAPTER_IDENTITY": (f"daily-shadow-stage/{stage_id}/v1"),
                 "RQUANT_DAILY_RUN_MODE": DailyPipelineMode.SHADOW.value,
                 "RQUANT_DAILY_PROFILE_HASH": profile_hash,
                 "RQUANT_DAILY_STORAGE_ROOT": str(storage_profile.root),
@@ -245,9 +243,7 @@ def test_daily_orchestrator_rejects_nonzero_child_with_valid_receipt(
     from rquant.daily_pipeline_orchestrator import subprocess as orchestrator_subprocess
 
     real_popen = orchestrator_subprocess.Popen
-    stage_argvs = {
-        tuple(command["argv"]) for command in manifest.settings["stage_commands"]
-    }
+    stage_argvs = {tuple(command["argv"]) for command in manifest.settings["stage_commands"]}
 
     class ReceiptWritingProcess:
         pid = 123456
@@ -721,9 +717,7 @@ def test_daily_orchestrator_rejects_receipt_signed_by_untrusted_key(
 ) -> None:
     runtime_root = (tmp_path / "runtime").resolve()
     _publish_daily_close_source(runtime_root)
-    trusted_authority = create_daily_ed25519_test_authority(
-        tmp_path / "trusted-daily-receipt"
-    )
+    trusted_authority = create_daily_ed25519_test_authority(tmp_path / "trusted-daily-receipt")
     forged_authority = create_daily_ed25519_test_authority(
         tmp_path / "forged-daily-receipt",
         key_id=trusted_authority.key_id,
@@ -873,10 +867,10 @@ def test_replica_sync_fails_closed_after_serving_payload_tamper(
             receipt_authority=receipt_authority,
         ),
     ):
-            run_daily_shadow_stage_adapter_from_environment(
-                "replica_sync",
-                issued_at=datetime(2026, 8, 3, 10, 1, tzinfo=UTC),
-            )
+        run_daily_shadow_stage_adapter_from_environment(
+            "replica_sync",
+            issued_at=datetime(2026, 8, 3, 10, 1, tzinfo=UTC),
+        )
 
     assert not (storage_profile.namespace_root / "replica-sync" / "current.json").exists()
     assert not (storage_profile.namespace_root / "research-ingest").exists()

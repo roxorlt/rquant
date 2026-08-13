@@ -239,11 +239,7 @@ def _write_calendar_generation(root: Path) -> tuple[Path, MarketCalendarAuthorit
         generated_at=datetime(2026, 7, 1, tzinfo=UTC),
     )
     path = (
-        root
-        / "authorities"
-        / "market-calendar"
-        / "generations"
-        / f"{calendar.content_sha256}.json"
+        root / "authorities" / "market-calendar" / "generations" / f"{calendar.content_sha256}.json"
     )
     path.parent.mkdir(parents=True)
     path.write_text(calendar.model_dump_json(), encoding="utf-8")

@@ -204,13 +204,16 @@ class DailyPipelineReportAuthorityClient:
                 "daily report authority requires the production profile"
             )
         verified_mode = DailyPipelineMode(mode)
-        if canonical_sha256(
-            {
-                "contract": "daily-pipeline-storage-namespace/v1",
-                "mode": verified_mode,
-                "profile_hash": profile_identity,
-            }
-        ) != namespace_id:
+        if (
+            canonical_sha256(
+                {
+                    "contract": "daily-pipeline-storage-namespace/v1",
+                    "mode": verified_mode,
+                    "profile_hash": profile_identity,
+                }
+            )
+            != namespace_id
+        ):
             raise DailyPipelineReportAuthorityError(
                 "daily report authority storage namespace is invalid"
             )
@@ -225,8 +228,7 @@ class DailyPipelineReportAuthorityClient:
                 LabHighWaterAuthorityConfig(
                     command=PRODUCTION_LAB_HIGHWATER_COMMAND,
                     stable_identity=(
-                        "daily-pipeline-report:daily-close:"
-                        f"{verified_mode.value}:{namespace_id}:v2"
+                        f"daily-pipeline-report:daily-close:{verified_mode.value}:{namespace_id}:v2"
                     ),
                     code_identity=code_identity,
                     profile_identity=profile_identity,

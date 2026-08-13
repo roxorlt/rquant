@@ -185,9 +185,7 @@ def _safe_read(
 ) -> bytes:
     profile = DailyPipelineStorageProfile.model_validate(storage_profile)
     expected_root = (
-        profile.receipt_root
-        if leaf == "receipts"
-        else profile.command_manifest_path.parent
+        profile.receipt_root if leaf == "receipts" else profile.command_manifest_path.parent
     )
     if path.parent != expected_root:
         raise DailyPipelineCommandManifestError(f"{label} escapes its storage profile")
@@ -382,12 +380,8 @@ def publish_external_stage_receipt_from_environment(
         mode=mode,
         profile_hash=_required_environment("RQUANT_DAILY_PROFILE_HASH"),
     )
-    if storage_profile.namespace_id != _required_environment(
-        "RQUANT_DAILY_STORAGE_NAMESPACE_ID"
-    ):
-        raise DailyPipelineCommandManifestError(
-            "external stage receipt storage namespace is stale"
-        )
+    if storage_profile.namespace_id != _required_environment("RQUANT_DAILY_STORAGE_NAMESPACE_ID"):
+        raise DailyPipelineCommandManifestError("external stage receipt storage namespace is stale")
     ledger_path = _absolute_normalized(
         Path(_required_environment("RQUANT_DAILY_LEDGER_PATH")),
         label="daily pipeline ledger",
@@ -680,9 +674,7 @@ def load_daily_pipeline_command_manifest(
             label="daily pipeline command manifest",
             max_bytes=_MAX_RECEIPT_BYTES,
         )
-        manifest = DailyPipelineCommandManifest.model_validate(
-            strict_canonical_json_loads(payload)
-        )
+        manifest = DailyPipelineCommandManifest.model_validate(strict_canonical_json_loads(payload))
         if manifest.storage_profile != profile or manifest.mode is not profile.mode:
             raise DailyPipelineCommandManifestError(
                 "daily pipeline command manifest storage profile mismatch"

@@ -65,7 +65,7 @@ def _hold_catalog_writer(
         writer_owner="catalog-process",
         retention_writer_credential=(
             artifact_retention_module.ArtifactRetentionWriterCredential.model_validate(
-            credential_payload
+                credential_payload
             )
         ),
         clock=lambda: NOW,
@@ -98,8 +98,6 @@ def _acquire_retention_writer(
             result.put(("written", time.monotonic() - started))
     except Exception as exc:
         result.put((type(exc).__name__, str(exc)))
-
-
 
 
 def _registration() -> ArtifactBundleRegistration:
@@ -249,9 +247,7 @@ def test_retention_writer_rejects_label_takeover_and_old_credential_after_rotati
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "references.sqlite3"
-    original = _writer_credential(
-        not_before=NOW - timedelta(minutes=5)
-    )
+    original = _writer_credential(not_before=NOW - timedelta(minutes=5))
     correct = ArtifactReferenceStore(
         path,
         managed_trust_root=tmp_path,

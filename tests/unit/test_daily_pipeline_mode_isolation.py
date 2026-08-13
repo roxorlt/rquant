@@ -115,9 +115,7 @@ def test_production_storage_root_comes_from_current_immutable_runtime_profile(
             observed_roots.append(Path(root))
             or SimpleNamespace(
                 runtime_mode="linux-production",
-                production_runtime_root=str(
-                    deployment_module.LINUX_PRODUCTION_RUNTIME_ROOT
-                ),
+                production_runtime_root=str(deployment_module.LINUX_PRODUCTION_RUNTIME_ROOT),
                 producer_commit="e" * 40,
                 profile_id=PROFILE_HASH,
             )

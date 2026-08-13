@@ -154,9 +154,7 @@ def build_production_artifact_terminal_lifecycle(
         state_root = _private_state_root(runtime_root)
         return ProductionArtifactTerminalLifecycle(
             catalog_registration_sink=ArtifactCatalogRegistrationSink(
-                ArtifactCatalogRegistrationOutbox(
-                    state_root / "catalog-registration-outbox"
-                )
+                ArtifactCatalogRegistrationOutbox(state_root / "catalog-registration-outbox")
             )
         )
     if service_kind is RuntimeServiceKind.LAB_JOBS_PUBLISHER:

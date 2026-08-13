@@ -20,9 +20,7 @@ def _prepare_runner(tmp_path: Path) -> tuple[Path, dict[str, str], Path]:
     script = project / "scripts" / "run-research-ingest-daily.sh"
     script.parent.mkdir(parents=True)
     script.write_text(
-        (ROOT / "scripts" / "run-research-ingest-daily.sh").read_text(
-            encoding="utf-8"
-        ),
+        (ROOT / "scripts" / "run-research-ingest-daily.sh").read_text(encoding="utf-8"),
         encoding="utf-8",
     )
     script.chmod(0o755)
@@ -105,9 +103,7 @@ def test_runner_only_checks_required_replica_readiness_before_ingest(
 
 
 def test_runner_has_no_replica_sync_or_arbiter_path_override() -> None:
-    content = (ROOT / "scripts/run-research-ingest-daily.sh").read_text(
-        encoding="utf-8"
-    )
+    content = (ROOT / "scripts/run-research-ingest-daily.sh").read_text(encoding="utf-8")
 
     assert "sync-readonly-replica.sh" not in content
     assert "RQUANT_WORKLOAD_ARBITER" not in content
@@ -135,9 +131,7 @@ def test_runner_normalizes_readiness_failure_to_retryable_one(
 ) -> None:
     script, env, calls = _prepare_runner(tmp_path)
     env["RUNNER_READINESS_EXIT"] = "1"
-    readiness_failure = subprocess.run(
-        [str(script)], capture_output=True, text=True, env=env
-    )
+    readiness_failure = subprocess.run([str(script)], capture_output=True, text=True, env=env)
 
     assert readiness_failure.returncode == 1
     assert calls.read_text(encoding="utf-8").splitlines() == [
@@ -152,9 +146,7 @@ def test_runner_retries_exactly_four_times_for_one_fixed_trade_date(
     env["RQUANT_RESEARCH_INGEST_MAX_ATTEMPTS"] = "4"
     env["RUNNER_INGEST_FAILURES"] = "4"
 
-    result = subprocess.run(
-        [str(script)], capture_output=True, text=True, env=env
-    )
+    result = subprocess.run([str(script)], capture_output=True, text=True, env=env)
 
     assert result.returncode == 1
     lines = calls.read_text(encoding="utf-8").splitlines()
@@ -170,9 +162,7 @@ def test_runner_does_not_retry_degraded_or_disabled_exit(tmp_path: Path) -> None
         env["RUNNER_INGEST_FAILURES"] = "4"
         env["RUNNER_INGEST_EXIT"] = str(exit_code)
 
-        result = subprocess.run(
-            [str(script)], capture_output=True, text=True, env=env
-        )
+        result = subprocess.run([str(script)], capture_output=True, text=True, env=env)
 
         assert result.returncode == exit_code
         lines = calls.read_text(encoding="utf-8").splitlines()

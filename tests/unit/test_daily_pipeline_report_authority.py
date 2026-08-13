@@ -100,8 +100,7 @@ def test_production_report_authority_uses_fixed_shared_public_key_client(
     assert isinstance(client, report_authority.DailyPipelineReportAuthorityClient)
     assert captured["command"] == PRODUCTION_LAB_HIGHWATER_COMMAND
     assert captured["stable_identity"] == (
-        "daily-pipeline-report:daily-close:production:"
-        f"{production_profile.namespace_id}:v2"
+        f"daily-pipeline-report:daily-close:production:{production_profile.namespace_id}:v2"
     )
     assert captured["production_mode"] is True
     assert captured["allow_identity_rotation"] is True
@@ -117,8 +116,7 @@ def test_production_report_authority_uses_fixed_shared_public_key_client(
         namespace_id=str(shadow_profile.namespace_id),
     )
     assert captured["stable_identity"] == (
-        "daily-pipeline-report:daily-close:shadow:"
-        f"{shadow_profile.namespace_id}:v2"
+        f"daily-pipeline-report:daily-close:shadow:{shadow_profile.namespace_id}:v2"
     )
 
 

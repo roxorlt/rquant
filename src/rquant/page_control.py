@@ -350,17 +350,11 @@ class _BoundManagedDirectory:
                     f"managed directory ancestor changed while bound: {self.path}"
                 ) from exc
             if stat.S_ISLNK(entry.st_mode):
-                raise ValueError(
-                    f"managed directory ancestor cannot be a symlink: {self.path}"
-                )
+                raise ValueError(f"managed directory ancestor cannot be a symlink: {self.path}")
             if not stat.S_ISDIR(entry.st_mode):
-                raise ValueError(
-                    f"managed directory ancestor is not a directory: {self.path}"
-                )
+                raise ValueError(f"managed directory ancestor is not a directory: {self.path}")
             if _file_node_tuple(entry) != _file_node_tuple(os.fstat(child)):
-                raise ValueError(
-                    f"managed directory ancestor changed while bound: {self.path}"
-                )
+                raise ValueError(f"managed directory ancestor changed while bound: {self.path}")
 
     def duplicate(self) -> int:
         self.verify()
@@ -372,9 +366,9 @@ class _BoundManagedDirectory:
                 os.close(descriptor)
 
 
-_ACTIVE_EFFECT_DIRECTORY_BINDINGS: ContextVar[
-    Mapping[Path, _BoundManagedDirectory] | None
-] = ContextVar("page_control_effect_directory_bindings", default=None)
+_ACTIVE_EFFECT_DIRECTORY_BINDINGS: ContextVar[Mapping[Path, _BoundManagedDirectory] | None] = (
+    ContextVar("page_control_effect_directory_bindings", default=None)
+)
 
 
 @dataclass(frozen=True)
@@ -470,17 +464,16 @@ def read_canvas_current_head(
         ):
             raise ValueError("canvas current head predecessor is invalid")
         if state == "active":
-            if not isinstance(active_receipt_id, str) or re.fullmatch(
-                r"[0-9a-f]{64}", active_receipt_id
-            ) is None:
+            if (
+                not isinstance(active_receipt_id, str)
+                or re.fullmatch(r"[0-9a-f]{64}", active_receipt_id) is None
+            ):
                 raise ValueError("canvas current head publication identity is invalid")
         elif active_receipt_id is not None:
             raise ValueError("canvas tombstone cannot reference an active publication")
         if not isinstance(command_kind, str) or not command_kind:
             raise ValueError("canvas current head command kind is invalid")
-        if not isinstance(command_hash, str) or re.fullmatch(
-            r"[0-9a-f]{64}", command_hash
-        ) is None:
+        if not isinstance(command_hash, str) or re.fullmatch(r"[0-9a-f]{64}", command_hash) is None:
             raise ValueError("canvas current head command hash is invalid")
         canonical_payload = json.dumps(
             payload,
@@ -505,10 +498,7 @@ def read_canvas_current_head(
     for index, node in enumerate(nodes):
         expected_sequence = index + 1
         expected_previous = None if index == 0 else nodes[index - 1].receipt.receipt_id
-        if (
-            node.sequence != expected_sequence
-            or node.previous_head_receipt_id != expected_previous
-        ):
+        if node.sequence != expected_sequence or node.previous_head_receipt_id != expected_previous:
             raise ValueError("canvas current head chain is not linear and complete")
     current = nodes[-1]
     if not keyring.verify_publication_receipt(current.receipt, require_active=True):
@@ -568,9 +558,7 @@ class PageControlOutbox:
     @staticmethod
     def _ensure_column(connection: sqlite3.Connection, name: str, definition: str) -> None:
         try:
-            connection.execute(
-                f"ALTER TABLE page_control_command ADD COLUMN {name} {definition}"
-            )
+            connection.execute(f"ALTER TABLE page_control_command ADD COLUMN {name} {definition}")
         except sqlite3.OperationalError as exc:
             if "duplicate column name" not in str(exc):
                 raise
@@ -896,9 +884,7 @@ class PageControlOutbox:
         now: datetime | None = None,
     ) -> tuple[PageControlEffectRecord, bool]:
         command_hash = _command_hash(command)
-        observed_at = _normalize_utc(now or datetime.now(UTC)).isoformat(
-            timespec="microseconds"
-        )
+        observed_at = _normalize_utc(now or datetime.now(UTC)).isoformat(timespec="microseconds")
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
@@ -1094,9 +1080,7 @@ class PageControlOutbox:
             ).fetchall()
         for row in rows:
             command = _COMMAND_ADAPTER.validate_json(row["payload_json"])
-            if command.kind != row["command_kind"] or _command_hash(command) != row[
-                "command_hash"
-            ]:
+            if command.kind != row["command_kind"] or _command_hash(command) != row["command_hash"]:
                 raise ValueError("PageControl canvas mutation authority is malformed")
             affected_canvas = (
                 command.name
@@ -1221,9 +1205,7 @@ class PageControlConsumer:
     def _assert_command_time(self, command: PageControlCommandValue) -> None:
         observed_at = _normalize_utc(self.clock())
         if command.requested_at > observed_at + _MAX_REQUEST_FUTURE_SKEW:
-            raise ValueError(
-                "page control command requested_at exceeds allowed future clock skew"
-            )
+            raise ValueError("page control command requested_at exceeds allowed future clock skew")
 
     def _execute_claim(self, claim: PageControlClaim) -> _ExecutionOutcome:
         command = claim.command
@@ -1424,10 +1406,7 @@ class PageControlConsumer:
                     continue
                 binding = _bind_managed_directory(path, create=False)
                 observed = os.fstat(binding.descriptor)
-                if (
-                    observed.st_dev != raw.get("st_dev")
-                    or observed.st_ino != raw.get("st_ino")
-                ):
+                if observed.st_dev != raw.get("st_dev") or observed.st_ino != raw.get("st_ino"):
                     binding.close()
                     raise ValueError(f"fenced directory generation changed: {path}")
                 bindings[path] = binding
@@ -1456,9 +1435,7 @@ class PageControlConsumer:
 
     @staticmethod
     def _bound_effect_directory_descriptor(path: Path) -> int | None:
-        binding = (_ACTIVE_EFFECT_DIRECTORY_BINDINGS.get() or {}).get(
-            Path(os.path.abspath(path))
-        )
+        binding = (_ACTIVE_EFFECT_DIRECTORY_BINDINGS.get() or {}).get(Path(os.path.abspath(path)))
         if binding is None:
             return None
         binding.verify()
@@ -1578,9 +1555,7 @@ class PageControlConsumer:
                 )
             ]
             if command.canvas_name is not None and command.canvas_name != "__default__":
-                targets.extend(
-                    self._canvas_publication_fence_targets(command.canvas_name)
-                )
+                targets.extend(self._canvas_publication_fence_targets(command.canvas_name))
             return tuple(targets)
         if isinstance(command, SaveNlPreset):
             return (
@@ -1597,9 +1572,7 @@ class PageControlConsumer:
                 )
             ]
             if command.canvas_name is not None and command.canvas_name != "__default__":
-                targets.extend(
-                    self._canvas_publication_fence_targets(command.canvas_name)
-                )
+                targets.extend(self._canvas_publication_fence_targets(command.canvas_name))
             return tuple(targets)
         if isinstance(command, AppendNlQueryLog):
             return (
@@ -1656,9 +1629,7 @@ class PageControlConsumer:
         return {
             "schema_version": _LOCAL_FILESYSTEM_FENCE_SCHEMA_VERSION,
             "kind": "local_filesystem_fence",
-            "targets": [
-                self._local_effect_target_identity(target) for target in targets
-            ],
+            "targets": [self._local_effect_target_identity(target) for target in targets],
         }
 
     @staticmethod
@@ -1709,9 +1680,7 @@ class PageControlConsumer:
         raw_targets = result.get("targets")
         if not isinstance(raw_targets, list):
             return "local filesystem effect has an invalid directory fence"
-        expected_paths = {
-            str(Path(os.path.abspath(target.path))) for target in targets
-        }
+        expected_paths = {str(Path(os.path.abspath(target.path))) for target in targets}
         observed_by_path: dict[str, Mapping[str, object]] = {}
         for raw_target in raw_targets:
             if not isinstance(raw_target, Mapping):
@@ -1860,11 +1829,7 @@ class PageControlConsumer:
             identity_command=identity,
         )
         requested_at = publication_command.requested_at
-        created_at = (
-            existing.created_at
-            if existing is not None
-            else requested_at
-        )
+        created_at = existing.created_at if existing is not None else requested_at
         signer, keyring = self._require_canvas_publication_authority()
         if getattr(signer, "key_id", None) != keyring.active_key_id:
             raise ValueError("CanvasPublicationReceipt signer key must be active")
@@ -2063,9 +2028,7 @@ class PageControlConsumer:
             )
             _signer, keyring = self._require_canvas_publication_authority()
             if not keyring.verify_publication_receipt(publication, require_active=True):
-                raise ValueError(
-                    "CanvasPublicationReceipt active signature verification failed"
-                )
+                raise ValueError("CanvasPublicationReceipt active signature verification failed")
             if publication.claims.catalog_record != record:
                 raise ValueError("CanvasPublicationReceipt catalog semantics do not match")
             if publication.claims.command.name != canvas_name:
@@ -2090,15 +2053,23 @@ class PageControlConsumer:
             ) from exc
 
     def _canvas_head_root(self, canvas_name: str) -> Path:
-        return self.data_dir / "canvas-publication-heads" / _validated_name(
-            canvas_name,
-            label="canvas name",
+        return (
+            self.data_dir
+            / "canvas-publication-heads"
+            / _validated_name(
+                canvas_name,
+                label="canvas name",
+            )
         )
 
     def _canvas_watermark_root(self, canvas_name: str) -> Path:
-        return self.data_dir / _CANVAS_WATERMARK_DIRECTORY / _validated_name(
-            canvas_name,
-            label="canvas name",
+        return (
+            self.data_dir
+            / _CANVAS_WATERMARK_DIRECTORY
+            / _validated_name(
+                canvas_name,
+                label="canvas name",
+            )
         )
 
     def _current_canvas_head(self, canvas_name: str) -> CanvasCurrentHead | None:
@@ -2147,9 +2118,7 @@ class PageControlConsumer:
         if latest is None:
             if head is None:
                 return
-            raise ValueError(
-                "canvas current head lacks authoritative PageControl command history"
-            )
+            raise ValueError("canvas current head lacks authoritative PageControl command history")
         if (
             head is None
             or head.receipt.claims.command.command_id != latest.command_id
@@ -2189,8 +2158,7 @@ class PageControlConsumer:
             return current
         if (
             current is not None
-            and identity_command.requested_at
-            < current.receipt.claims.command.requested_at
+            and identity_command.requested_at < current.receipt.claims.command.requested_at
         ):
             raise ValueError("canvas current head is newer than the requested update")
         payload = {
@@ -2198,9 +2166,7 @@ class PageControlConsumer:
             "authority_command_kind": identity_command.kind,
             "canvas_name": canvas_name,
             "contract": _CANVAS_HEAD_CONTRACT,
-            "previous_head_receipt_id": (
-                None if current is None else current.receipt.receipt_id
-            ),
+            "previous_head_receipt_id": (None if current is None else current.receipt.receipt_id),
             "publication_receipt_id": publication_receipt_id,
             "sequence": 1 if current is None else current.sequence + 1,
             "state": state,
@@ -2247,19 +2213,12 @@ class PageControlConsumer:
             return
         expected_sequence = 1 if current is None else current.sequence + 1
         expected_previous = None if current is None else current.receipt.receipt_id
-        if (
-            head.sequence != expected_sequence
-            or head.previous_head_receipt_id != expected_previous
-        ):
+        if head.sequence != expected_sequence or head.previous_head_receipt_id != expected_previous:
             raise ValueError("canvas immutable watermark would fork or roll back")
-        watermark_root = self._canvas_watermark_root(
-            head.receipt.claims.command.name
-        )
+        watermark_root = self._canvas_watermark_root(head.receipt.claims.command.name)
         CanvasPublicationReceiptStore(
             watermark_root,
-            directory_descriptor=self._bound_effect_directory_descriptor(
-                watermark_root
-            ),
+            directory_descriptor=self._bound_effect_directory_descriptor(watermark_root),
         ).write_immutable(head.receipt)
         published = self._current_canvas_watermark(head.receipt.claims.command.name)
         if published is None or published.receipt.receipt_id != head.receipt.receipt_id:
@@ -2304,9 +2263,7 @@ class PageControlConsumer:
         self,
     ) -> tuple[CanvasPublicationSigner, CanvasPublicationKeyring]:
         if self.canvas_publication_signer is None or self.canvas_publication_keyring is None:
-            raise RuntimeError(
-                "CanvasPublicationReceipt signer and public keyring are required"
-            )
+            raise RuntimeError("CanvasPublicationReceipt signer and public keyring are required")
         return self.canvas_publication_signer, self.canvas_publication_keyring
 
     def _canvas_publication_receipt_store(self) -> CanvasPublicationReceiptStore:
@@ -2480,9 +2437,9 @@ class PageControlConsumer:
                 _PRIVATE_FILE_MODE,
                 dir_fd=descriptor,
             )
-            payload_bytes = (
-                json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
-            ).encode("utf-8")
+            payload_bytes = (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode(
+                "utf-8"
+            )
             with os.fdopen(file_descriptor, "wb", closefd=False) as handle:
                 handle.write(payload_bytes)
                 handle.flush()
@@ -2720,20 +2677,14 @@ def _bind_managed_directory(path: Path, *, create: bool) -> _BoundManagedDirecto
                 os.mkdir(component, _PRIVATE_DIRECTORY_MODE, dir_fd=parent)
                 entry = os.stat(component, dir_fd=parent, follow_symlinks=False)
             if stat.S_ISLNK(entry.st_mode):
-                raise ValueError(
-                    f"managed directory ancestor cannot be a symlink: {normalized}"
-                )
+                raise ValueError(f"managed directory ancestor cannot be a symlink: {normalized}")
             if not stat.S_ISDIR(entry.st_mode):
-                raise ValueError(
-                    f"managed directory ancestor is not a directory: {normalized}"
-                )
+                raise ValueError(f"managed directory ancestor is not a directory: {normalized}")
             descriptor = os.open(component, flags, dir_fd=parent)
             opened = os.fstat(descriptor)
             if _file_node_tuple(entry) != _file_node_tuple(opened):
                 os.close(descriptor)
-                raise ValueError(
-                    f"managed directory ancestor changed while opening: {normalized}"
-                )
+                raise ValueError(f"managed directory ancestor changed while opening: {normalized}")
             descriptors.append(descriptor)
             component_names.append(component)
             if index == len(components) - 1:
@@ -2851,8 +2802,7 @@ def _append_managed_jsonl(
             _verify_open_directory_matches_path(path.parent, directory)
             return
         line = (
-            json.dumps(record, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
-            + "\n"
+            json.dumps(record, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n"
         ).encode("utf-8")
         os.lseek(file_descriptor, 0, os.SEEK_END)
         written = os.write(file_descriptor, line)
@@ -2997,15 +2947,13 @@ def _ambiguous_external_effect_result_from_row(row: sqlite3.Row) -> dict[str, ob
             "command_kind": row["command_kind"],
             "command_hash": row["command_hash"],
             "reason": (
-                "legacy external Lab command was processing without a PageControl "
-                "effect journal"
+                "legacy external Lab command was processing without a PageControl effect journal"
             ),
         }
     return {
         **_ambiguous_lab_effect_result(command),
         "reason": (
-            "legacy external Lab command was processing without a PageControl "
-            "effect journal"
+            "legacy external Lab command was processing without a PageControl effect journal"
         ),
     }
 
@@ -3031,9 +2979,7 @@ class _PageControlExecutionMutex:
             )
         except OSError as exc:
             self._close()
-            raise ValueError(
-                f"consumer mutex cannot be opened safely: {self.path}"
-            ) from exc
+            raise ValueError(f"consumer mutex cannot be opened safely: {self.path}") from exc
         opened = os.fstat(self.file_descriptor)
         if not stat.S_ISREG(opened.st_mode):
             self._close()

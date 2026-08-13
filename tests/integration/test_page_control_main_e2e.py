@@ -47,9 +47,7 @@ def _manifest(runtime_root: Path) -> RuntimeServiceManifest:
         producer_commit=COMMIT,
         settings={
             "lab_jobs_path": str(runtime_root / "research" / "lab_jobs.sqlite3"),
-            "authority_root": str(
-                runtime_root / "research" / "serving-authorities" / "lab-jobs"
-            ),
+            "authority_root": str(runtime_root / "research" / "serving-authorities" / "lab-jobs"),
         },
     )
 
@@ -117,9 +115,7 @@ response = {
     "signature": base64.b64encode(signature).decode("ascii"),
 }
 sys.stdout.write(json.dumps(response, sort_keys=True, separators=(",", ":")))
-""".replace("__OPENSSL__", repr(_openssl())).replace(
-            "__PRIVATE_KEY__", repr(str(private_key))
-        ),
+""".replace("__OPENSSL__", repr(_openssl())).replace("__PRIVATE_KEY__", repr(str(private_key))),
         encoding="utf-8",
     )
     helper.chmod(0o700)

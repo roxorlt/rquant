@@ -193,9 +193,7 @@ def test_stdin_helper_is_not_a_receipt_signing_authority(tmp_path: Path) -> None
         _stdin_operation(
             module,
             keys_path,
-            canonical_json_bytes(
-                {"operation": "attest-key-material", "schema_version": 1}
-            ),
+            canonical_json_bytes({"operation": "attest-key-material", "schema_version": 1}),
         )
 
     assert "_sign_request" not in module
@@ -216,9 +214,7 @@ def test_stdin_helper_validates_key_material_without_signing(tmp_path: Path) -> 
         _stdin_operation(
             module,
             keys_path,
-            canonical_json_bytes(
-                {"operation": "validate-key-material", "schema_version": 1}
-            ),
+            canonical_json_bytes({"operation": "validate-key-material", "schema_version": 1}),
         )
         == "validate-key-material"
     )
@@ -244,9 +240,10 @@ def test_active_public_key_verifies_keyring_and_previous_keys_are_history_only(
     assert keyring["active_key_id"] == key_id
     assert keyring["active_public_key"] == public_key
     assert keyring["generation"] == 2
-    assert keyring["previous_manifest_hash"] == json.loads(
-        current_keyring.read_text(encoding="utf-8")
-    )["manifest_hash"]
+    assert (
+        keyring["previous_manifest_hash"]
+        == json.loads(current_keyring.read_text(encoding="utf-8"))["manifest_hash"]
+    )
     assert keyring["previous_public_keys"].keys() == {"daily-v1"}
     assert keyring["previous_public_keys"]["daily-v1"] == previous_public_key
     assert len(keyring["manifest_hash"]) == 64
@@ -269,7 +266,7 @@ def test_active_public_key_verifies_keyring_and_previous_keys_are_history_only(
 
 def test_public_keyring_rotation_rejects_history_drop_and_bad_chain(
     tmp_path: Path,
-    ) -> None:
+) -> None:
     module = runpy.run_path(str(HELPER))
     keys_path, _active_public_key, _key_id, current_keyring = _rotated_key_material(tmp_path)
     bad = json.loads(keys_path.read_text(encoding="utf-8"))
@@ -320,7 +317,9 @@ def test_rejects_duplicate_keys_and_noncanonical_json(tmp_path: Path) -> None:
 
     duplicate = (
         b'{"schema_version":1,"operation":"sign","operation":"sign",'
-        b'"request_id":"' + (b"a" * 64) + b'","key_id":"'
+        b'"request_id":"'
+        + (b"a" * 64)
+        + b'","key_id":"'
         + key_id.encode("ascii")
         + b'","namespace":"'
         + STAGE_NAMESPACE.encode("ascii")

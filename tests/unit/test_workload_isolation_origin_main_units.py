@@ -100,12 +100,8 @@ def test_origin_main_services_keep_exact_behavior_and_only_add_live_slice() -> N
 
 
 def test_origin_main_timer_calendars_are_byte_exact() -> None:
-    assert (SYSTEMD / "rquant-morning-pulse.timer").read_text(
-        encoding="utf-8"
-    ) == MORNING_TIMER
-    assert (SYSTEMD / "rquant-midday-report.timer").read_text(
-        encoding="utf-8"
-    ) == MIDDAY_TIMER
+    assert (SYSTEMD / "rquant-morning-pulse.timer").read_text(encoding="utf-8") == MORNING_TIMER
+    assert (SYSTEMD / "rquant-midday-report.timer").read_text(encoding="utf-8") == MIDDAY_TIMER
 
 
 def test_temporary_integration_records_origin_and_future_three_way_audit() -> None:

@@ -108,8 +108,7 @@ class ShadowSessionSettings(RuntimeContractModel):
             runner = runner_bindings[binding.strategy_id]
             if (
                 runner.strategy_version != binding.strategy_version
-                or runner.strategy_registration_fingerprint
-                != binding.definition_fingerprint
+                or runner.strategy_registration_fingerprint != binding.definition_fingerprint
                 or runner.executable_fingerprint != binding.executable_fingerprint
             ):
                 raise ValueError("Shadow runner manifest differs from its strategy binding")
@@ -150,8 +149,7 @@ class _FilesystemRunnerSource(ShadowRunnerSignalSource):
         )
         attestation = accepted.completion_receipt.completion_attestation
         if (
-            accepted.manifest.runner_manifest_binding
-            != self._expected_runner_binding
+            accepted.manifest.runner_manifest_binding != self._expected_runner_binding
             or attestation is None
             or attestation.claims.strategy_id != self._strategy_id
         ):
@@ -177,9 +175,9 @@ class _FilesystemRunnerSource(ShadowRunnerSignalSource):
         batch = self._accepted(trade_date).completed_batch
         if batch is None:
             raise ValueError("Shadow isolated runner export batch is unavailable")
-        records = tuple(
-            record for record in batch.records if record.sequence > after_sequence
-        )[:limit]
+        records = tuple(record for record in batch.records if record.sequence > after_sequence)[
+            :limit
+        ]
         return RunnerSignalBatch(
             snapshot=batch.snapshot,
             after_sequence=after_sequence,
@@ -257,8 +255,7 @@ class FilesystemShadowSessionInputLoader:
                 filesystem_policy=filesystem_policy,
             )
             runner_bindings = {
-                binding.strategy_id: binding
-                for binding in settings.runner_manifest_bindings
+                binding.strategy_id: binding for binding in settings.runner_manifest_bindings
             }
             if any(
                 binding.producer_commit != expected_export_commit
@@ -389,9 +386,7 @@ def shadow_session_builder(
             except (OSError, TypeError, ValueError):
                 return RuntimeStepResult(
                     processed_count=0,
-                    source_generations={
-                        "shadow_session": settings.calendar_content_sha256
-                    },
+                    source_generations={"shadow_session": settings.calendar_content_sha256},
                     degraded_reasons=("shadow:legacy_export_unavailable",),
                 )
             trade_date = selection.latest_closed_session

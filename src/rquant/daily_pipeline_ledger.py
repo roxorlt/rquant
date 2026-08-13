@@ -67,9 +67,7 @@ class DailyPipelineMode(StrEnum):
 class DailyPipelineStorageProfile(RuntimeContractModel):
     """Physical daily-DAG namespace bound to one mode and runtime profile."""
 
-    contract: Literal["daily-pipeline-storage-profile/v1"] = (
-        "daily-pipeline-storage-profile/v1"
-    )
+    contract: Literal["daily-pipeline-storage-profile/v1"] = "daily-pipeline-storage-profile/v1"
     root: Path
     mode: DailyPipelineMode
     profile_hash: Sha256
@@ -137,10 +135,7 @@ _DIRECTORY_OPEN_FLAGS = (
     | getattr(os, "O_CLOEXEC", 0)
 )
 _REGULAR_FILE_OPEN_FLAGS = (
-    os.O_RDWR
-    | os.O_CREAT
-    | getattr(os, "O_NOFOLLOW", 0)
-    | getattr(os, "O_CLOEXEC", 0)
+    os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
 )
 
 
@@ -225,9 +220,7 @@ class DailyPipelineStorageBinding:
                     controlled=False,
                 )
                 descriptors.append(parent_fd)
-                identities.append(
-                    DailyPipelinePathIdentity.from_stat(current, os.fstat(parent_fd))
-                )
+                identities.append(DailyPipelinePathIdentity.from_stat(current, os.fstat(parent_fd)))
             for component in (verified.mode.value, str(verified.namespace_id)):
                 current /= component
                 parent_fd = _open_bound_directory(
@@ -238,9 +231,7 @@ class DailyPipelineStorageBinding:
                     controlled=True,
                 )
                 descriptors.append(parent_fd)
-                identities.append(
-                    DailyPipelinePathIdentity.from_stat(current, os.fstat(parent_fd))
-                )
+                identities.append(DailyPipelinePathIdentity.from_stat(current, os.fstat(parent_fd)))
             namespace_fd = parent_fd
             for name in cls._LEAVES:
                 child_path = current / name
@@ -300,9 +291,7 @@ class DailyPipelineStorageBinding:
                     "daily pipeline storage binding contains an unsafe path"
                 )
             if not identity.matches(observed):
-                raise DailyPipelineLedgerError(
-                    "daily pipeline storage binding was replaced"
-                )
+                raise DailyPipelineLedgerError("daily pipeline storage binding was replaced")
         observed_leaf = os.fstat(self.leaf_fd)
         expected_leaf = next(
             identity for identity in self.identities if identity.path == self.declared_root
@@ -396,9 +385,7 @@ def _open_bound_directory(
     if not stat.S_ISDIR(observed.st_mode):
         os.close(descriptor)
         raise DailyPipelineLedgerError("daily pipeline storage component is not a directory")
-    if controlled and (
-        observed.st_uid != os.geteuid() or stat.S_IMODE(observed.st_mode) != 0o700
-    ):
+    if controlled and (observed.st_uid != os.geteuid() or stat.S_IMODE(observed.st_mode) != 0o700):
         os.close(descriptor)
         raise DailyPipelineLedgerError(
             "daily pipeline controlled storage directory has unsafe owner or mode"
@@ -1443,9 +1430,7 @@ class DailyPipelineLedger:
             verified.mode is not self.storage_profile.mode
             or verified.profile_hash != self.storage_profile.profile_hash
         ):
-            raise DailyPipelineLedgerError(
-                "daily run does not match the ledger storage profile"
-            )
+            raise DailyPipelineLedgerError("daily run does not match the ledger storage profile")
         observed = normalize_aware_utc(now)
         spec_json = _canonical_model_json(verified)
         spec_hash = canonical_sha256(verified)

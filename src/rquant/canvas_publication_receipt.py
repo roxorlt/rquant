@@ -532,9 +532,7 @@ class CanvasPublicationReceiptStore:
         try:
             observed = os.fstat(descriptor)
             if not stat.S_ISDIR(observed.st_mode):
-                raise ValueError(
-                    "canvas publication receipt bound descriptor is not a directory"
-                )
+                raise ValueError("canvas publication receipt bound descriptor is not a directory")
             _verify_open_directory_matches_path(self.root, descriptor)
             return descriptor
         except Exception:
@@ -771,9 +769,9 @@ def _open_or_create_receipt_directory(path: Path) -> int:
 
 
 def _canvas_catalog_publication_bytes(record: CanvasPublicationCatalogRecord) -> bytes:
-    return (
-        json.dumps(record.model_dump(mode="json"), ensure_ascii=False, indent=2) + "\n"
-    ).encode("utf-8")
+    return (json.dumps(record.model_dump(mode="json"), ensure_ascii=False, indent=2) + "\n").encode(
+        "utf-8"
+    )
 
 
 def _open_existing_receipt_directory(path: Path) -> int:

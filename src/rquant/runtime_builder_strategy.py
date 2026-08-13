@@ -254,8 +254,7 @@ def strategy_live_builder(
             or settings.strategy_executable_fingerprint != registration.executable_fingerprint
             or (
                 settings.evaluator_contract_fingerprint is not None
-                and settings.evaluator_contract_fingerprint
-                != binding.contract_fingerprint
+                and settings.evaluator_contract_fingerprint != binding.contract_fingerprint
             )
         ):
             raise ValueError("built-in evaluator fingerprint does not match published registration")

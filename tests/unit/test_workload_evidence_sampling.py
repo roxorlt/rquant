@@ -104,9 +104,7 @@ def test_append_only_samples_summarize_strict_auditable_evidence(
 
     assert raw_bytes.count(b"\n") == WINDOW_SAMPLE_COUNT
     records = [json.loads(line) for line in raw_bytes.splitlines()]
-    assert [record["sequence"] for record in records] == list(
-        range(1, WINDOW_SAMPLE_COUNT + 1)
-    )
+    assert [record["sequence"] for record in records] == list(range(1, WINDOW_SAMPLE_COUNT + 1))
     assert records[0]["previous_record_sha256"] == "0" * 64
     assert records[1]["previous_record_sha256"] == records[0]["record_sha256"]
     assert records[0]["sample"]["boot_id"] == BOOT_ID
@@ -404,9 +402,7 @@ def test_summary_rejects_a_rewritten_record_even_with_a_self_declared_hash(
 
 def test_cloud_summary_step_is_explicit_fixed_path_and_never_controls_units() -> None:
     root = Path(__file__).resolve().parents[2]
-    script = (root / "scripts/summarize-workload-high-water.sh").read_text(
-        encoding="utf-8"
-    )
+    script = (root / "scripts/summarize-workload-high-water.sh").read_text(encoding="utf-8")
 
     assert "PATH=/usr/sbin:/usr/bin:/sbin:/bin" in script
     assert "/home/lighthouse/rquant/.venv/bin/python" in script

@@ -1242,8 +1242,7 @@ def _highwater_observer(
         "active_key_id": key_id,
         "active_private_key_path": str(_highwater_key_pair(root, key_id)[0]),
         "previous_public_keys": {
-            name: _highwater_key_pair(root, name)[1].decode("utf-8")
-            for name in previous_key_ids
+            name: _highwater_key_pair(root, name)[1].decode("utf-8") for name in previous_key_ids
         },
     }
     keys_path.write_text(json.dumps(document), encoding="utf-8")

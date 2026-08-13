@@ -91,9 +91,7 @@ def _published(tmp_path: Path) -> tuple[DailyCloseGateway, object]:
                 "circ_mv": 180_000.0,
             },
         ),
-        "adj_factor": (
-            {"ts_code": "600000.SH", "trade_date": TRADE_DATE, "adj_factor": 1.01},
-        ),
+        "adj_factor": ({"ts_code": "600000.SH", "trade_date": TRADE_DATE, "adj_factor": 1.01},),
         "index_daily": (
             {
                 "ts_code": "000001.SH",
@@ -187,6 +185,7 @@ def _seed_database(path: Path) -> None:
             """,
             [TRADE_DATE, COMMITTED_AT],
         )
+
 
 _NOTIFICATION_TARGETS = (
     DeliveryTarget(recipient_id="daily-close-test", channel=DeliveryChannel.PUSHDEER),

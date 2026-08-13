@@ -94,7 +94,7 @@ def test_reviewed_command_manifest_uses_env_bound_external_receipt(tmp_path: Pat
                 receipt_root=receipt_root,
                 receipt_key_id=key.key_id,
             ),
-        )
+        ),
     )
     adapter = manifest.adapter_for(
         "capture",
@@ -156,17 +156,20 @@ def test_manifest_loader_rejects_noncanonical_or_unsafe_input(tmp_path: Path) ->
                 receipt_root=storage_profile.receipt_root,
                 receipt_key_id="test-receipt",
             ),
-        )
+        ),
     )
     path = storage_profile.command_manifest_path
     DailyPipelineStorageBinding.open(storage_profile, leaf="control").close()
     path.write_bytes(canonical_model_json_bytes(manifest))
     path.chmod(0o600)
 
-    assert load_daily_pipeline_command_manifest(
-        path.resolve(),
-        expected_storage_profile=storage_profile,
-    ) == manifest
+    assert (
+        load_daily_pipeline_command_manifest(
+            path.resolve(),
+            expected_storage_profile=storage_profile,
+        )
+        == manifest
+    )
 
     path.write_text('{"stages": []}', encoding="utf-8")
     path.chmod(0o600)

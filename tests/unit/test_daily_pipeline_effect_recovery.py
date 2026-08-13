@@ -81,7 +81,7 @@ def _orchestrator(tmp_path: Path):
                 receipt_root=storage_profile.receipt_root,
                 receipt_key_id=key.key_id,
             ),
-        )
+        ),
     )
     orchestrator = DailyPipelineOrchestrator(
         ledger=DailyPipelineLedger(
@@ -154,9 +154,7 @@ def test_immutable_external_receipt_recovers_after_ledger_gap_without_reexecutio
         "RQUANT_DAILY_LEDGER_PATH": str(orchestrator.ledger.path),
         "RQUANT_DAILY_STORAGE_ROOT": str(orchestrator.ledger.storage_profile.root),
         "RQUANT_DAILY_PROFILE_HASH": orchestrator.ledger.storage_profile.profile_hash,
-        "RQUANT_DAILY_STORAGE_NAMESPACE_ID": str(
-            orchestrator.ledger.storage_profile.namespace_id
-        ),
+        "RQUANT_DAILY_STORAGE_NAMESPACE_ID": str(orchestrator.ledger.storage_profile.namespace_id),
         "RQUANT_DAILY_SERVICE_OWNER": orchestrator.ledger.service_owner,
         "RQUANT_DAILY_COMMAND_MANIFEST_HASH": manifest_hash,
         "RQUANT_DAILY_FENCING_TOKEN": str(lease.fencing_token),

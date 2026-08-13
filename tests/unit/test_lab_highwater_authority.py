@@ -133,14 +133,10 @@ def _write_private_key_manifest(
 ) -> Path:
     resolved_key_ids = key_ids or {"hw-v1"}
     previous_key_ids = resolved_key_ids - {active_key_id}
-    active_private, _active_public = _key_pair(
-        path.parent / "key-material", active_key_id
-    )
+    active_private, _active_public = _key_pair(path.parent / "key-material", active_key_id)
     previous_public_keys: dict[str, str] = {}
     for key_id in sorted(previous_key_ids):
-        previous_private, previous_public = _key_pair(
-            path.parent / "key-material", key_id
-        )
+        previous_private, previous_public = _key_pair(path.parent / "key-material", key_id)
         previous_public_keys[key_id] = previous_public.decode("utf-8")
         previous_private.unlink(missing_ok=True)
     payload = {
@@ -167,9 +163,7 @@ def _write_private_key_manifest_v3(
     active_private, _active_public = _key_pair(path.parent / "key-material", active_key_id)
     previous_public_keys: dict[str, str] = {}
     for key_id in sorted(previous_key_ids or set()):
-        previous_private, previous_public = _key_pair(
-            path.parent / "key-material", key_id
-        )
+        previous_private, previous_public = _key_pair(path.parent / "key-material", key_id)
         previous_public_keys[key_id] = previous_public.decode("utf-8")
         previous_private.unlink(missing_ok=True)
     payload = {
@@ -236,9 +230,7 @@ def _client(
         "--keys-file",
         str(keys_file),
     )
-    trusted_keys = trusted if trusted is not None else _trusted_keys(
-        tmp_path, key_ids or {"hw-v1"}
-    )
+    trusted_keys = trusted if trusted is not None else _trusted_keys(tmp_path, key_ids or {"hw-v1"})
     return LabHighWaterAuthorityClient(
         LabHighWaterAuthorityConfig(
             command=resolved_command,
@@ -303,9 +295,7 @@ def test_observe_advances_then_deduplicates_identical_watermarks(tmp_path: Path)
 
     chain_lines = [
         json.loads(line)
-        for line in (
-            (tmp_path / "state").glob("*/chain.jsonl").__next__().read_text().splitlines()
-        )
+        for line in ((tmp_path / "state").glob("*/chain.jsonl").__next__().read_text().splitlines())
     ]
     assert [record["sequence"] for record in chain_lines] == [0, 1]
 
@@ -673,9 +663,7 @@ def test_public_keyring_tamper_and_schema_downgrade_fail_closed(tmp_path: Path) 
 
     downgraded = {
         "schema_version": 2,
-        "keys": {
-            "hw-v1": _trusted_keys(tmp_path, {"hw-v1"})["hw-v1"].decode("utf-8")
-        },
+        "keys": {"hw-v1": _trusted_keys(tmp_path, {"hw-v1"})["hw-v1"].decode("utf-8")},
     }
     path.write_bytes(canonical_json_bytes(downgraded))
     with pytest.raises(ValueError, match="shape|version"):

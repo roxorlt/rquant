@@ -509,10 +509,13 @@ def test_real_audit_terminal_event_reaches_retention_run_step_via_outbox(
     result = runtime.run_step()
 
     assert result.processed_count == 1
-    assert runtime.reference_store.list_active_owner_references(
-        owner_type="audit",
-        owner_id=audit.audit_run_id,
-    ) == ()
+    assert (
+        runtime.reference_store.list_active_owner_references(
+            owner_type="audit",
+            owner_id=audit.audit_run_id,
+        )
+        == ()
+    )
     duck.close()
 
 
@@ -791,8 +794,7 @@ def test_retention_migrates_one_legal_oversized_bundle_without_cursor_starvation
 
     assert result.processed_count == 1
     active_tiers = {
-        copy.storage_tier
-        for copy in runtime.reference_store.list_active_copies(content_sha256)
+        copy.storage_tier for copy in runtime.reference_store.list_active_copies(content_sha256)
     }
     assert active_tiers == {
         StorageTier.HOT,

@@ -65,8 +65,7 @@ def test_required_resource_authority_preflight_rejects_unknown_environment_key(
     external_env = tmp_path / "external.env"
     resource_env = tmp_path / "resource.env"
     external_env.write_text(
-        "APP_ENV=prod\n"
-        f"RQUANT_EXTERNAL_MONOTONIC_ROOT_SERVICE_CONFIG_PATH={external_config}\n",
+        f"APP_ENV=prod\nRQUANT_EXTERNAL_MONOTONIC_ROOT_SERVICE_CONFIG_PATH={external_config}\n",
         encoding="ascii",
     )
     resource_env.write_text(
@@ -109,8 +108,7 @@ def test_required_resource_authority_preflight_rejects_wrong_unit_environment_fi
     external_env = tmp_path / "external.env"
     resource_env = tmp_path / "resource.env"
     external_env.write_text(
-        "APP_ENV=prod\n"
-        f"RQUANT_EXTERNAL_MONOTONIC_ROOT_SERVICE_CONFIG_PATH={external_config}\n",
+        f"APP_ENV=prod\nRQUANT_EXTERNAL_MONOTONIC_ROOT_SERVICE_CONFIG_PATH={external_config}\n",
         encoding="ascii",
     )
     resource_env.write_text(

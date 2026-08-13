@@ -170,9 +170,7 @@ def test_installer_rejects_a_symlinked_shadow_recovery_state_directory(
 
 
 def test_shadow_recovery_helper_has_fixed_openat_authority_contract() -> None:
-    helper = (ROOT / "deploy/libexec/rquant-shadow-report-signer").read_text(
-        encoding="utf-8"
-    )
+    helper = (ROOT / "deploy/libexec/rquant-shadow-report-signer").read_text(encoding="utf-8")
     installer = INSTALLER.read_text(encoding="utf-8")
 
     assert 'LEGACY_SHADOW_ROOT = Path("/home/lighthouse/rquant/data/legacy-shadow")' in helper

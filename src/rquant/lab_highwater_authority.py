@@ -210,11 +210,7 @@ def _verify_production_helper_identity(command: tuple[str, ...]) -> None:
         raise ValueError("production high-water authority command must be the fixed sudo helper")
     for directory in (Path("/usr"), Path("/usr/local"), Path("/usr/local/libexec")):
         observed = os.stat(directory, follow_symlinks=False)
-        if (
-            not stat.S_ISDIR(observed.st_mode)
-            or observed.st_uid != 0
-            or observed.st_mode & 0o022
-        ):
+        if not stat.S_ISDIR(observed.st_mode) or observed.st_uid != 0 or observed.st_mode & 0o022:
             raise ValueError("production high-water helper parent is not root-owned and immutable")
     descriptor = -1
     try:
@@ -256,9 +252,7 @@ class LabHighWaterAuthorityConfig:
     )
 
     def __post_init__(self) -> None:
-        if not self.command or any(
-            not isinstance(part, str) or not part for part in self.command
-        ):
+        if not self.command or any(not isinstance(part, str) or not part for part in self.command):
             raise ValueError("high-water authority command is invalid")
         if not self.stable_identity or len(self.stable_identity) > 512:
             raise ValueError("high-water authority stable_identity is invalid")
@@ -449,18 +443,14 @@ class LabHighWaterAuthorityClient:
             ) from exc
         active_key_id = self.config.resolved_active_key_id()
         if active_key_id is None:
-            raise LabHighWaterDegradedError(
-                "high-water active signing key is unavailable"
-            )
+            raise LabHighWaterDegradedError("high-water active signing key is unavailable")
         if receipt.key_id != active_key_id:
             raise LabHighWaterDegradedError(
                 "high-water live receipt was not signed by the active signing key"
             )
         receipt.verify(
             lambda key_id: (
-                self.config.trusted_key_provider(key_id)
-                if key_id == active_key_id
-                else None
+                self.config.trusted_key_provider(key_id) if key_id == active_key_id else None
             )
         )
         if receipt.nonce != nonce:

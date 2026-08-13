@@ -553,9 +553,7 @@ def test_strategy_builder_publishes_completion_only_after_router_drain(
     bus_path = Path(str(manifest.settings["signal_bus_path"]))
     bus = SignalBusStore(bus_path)
     observed = [SESSION_CLOSE + timedelta(seconds=3)]
-    attestation_authority = create_shadow_ed25519_test_authority(
-        tmp_path / "completion-keys"
-    )
+    attestation_authority = create_shadow_ed25519_test_authority(tmp_path / "completion-keys")
     step = strategy_live_builder(
         clock=lambda: observed[0],
         completion_attestation_signer=attestation_authority.signer,

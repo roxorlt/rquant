@@ -157,11 +157,7 @@ class SurgeCollectionTracker:
         observed_at: datetime,
         snapshot: pd.DataFrame | None,
     ) -> bool:
-        route = (
-            str(snapshot.attrs.get("route", "none"))
-            if snapshot is not None
-            else "none"
-        )
+        route = str(snapshot.attrs.get("route", "none")) if snapshot is not None else "none"
         if snapshot is None or snapshot.empty or "ts_code" not in snapshot.columns:
             self.observe_failure(observed_at, route=route)
             return False
@@ -239,9 +235,7 @@ class SurgeCollectionTracker:
                 source_routes=tuple(sorted(self.source_routes)),
                 market_universe_id=self.market_universe_id,
                 market_universe_expected_count=len(self.market_universe),
-                minimum_market_coverage_count=(
-                    self.observed_minimum_market_coverage_count
-                ),
+                minimum_market_coverage_count=(self.observed_minimum_market_coverage_count),
                 minimum_market_coverage_bps=(
                     self.observed_minimum_market_coverage_count
                     * 10_000
@@ -357,11 +351,11 @@ class SurgeConfig(BaseModel):
     # 可买性守卫：确认时现价距涨停价 ≤ 该 %（或已封板）标 unbuyable（报文加「临近涨停」
     # icon,仍推送、仍占「每票每日一次」名额）。0 = 只标已封板；负值可整体关闭（room 恒 > 负值）。
     max_room_to_limit_pct: float = 1.0
-    cum_lookback_days: int = 4       # 同刻累计中位回溯交易日数（v3 默认 4）
-    max_per_push: int = 8            # 单条报文最多 N 只，超出折叠
+    cum_lookback_days: int = 4  # 同刻累计中位回溯交易日数（v3 默认 4）
+    max_per_push: int = 8  # 单条报文最多 N 只，超出折叠
     silent_until_hhmm: str = "09:31"  # 该时刻前只收集不推送（用户要求 9:31 起就推）
-    tushare_rate_per_min: int = 2    # 确认层 stk_mins 限频（次/分）
-    tushare_max_retries: int = 3     # 单候选取数失败重试上限（延后不阻塞队列）
+    tushare_rate_per_min: int = 2  # 确认层 stk_mins 限频（次/分）
+    tushare_max_retries: int = 3  # 单候选取数失败重试上限（延后不阻塞队列）
     miss_circuit_threshold: int = 5  # 快照连续 miss 触发降级告警 + 退避
     # 检测范围（不是取数范围）：全市场快照在检测层按此过滤。默认创业+科创，
     # RQUANT_SURGE_BOARDS 可覆盖（default_factory 构造时读 env）。
@@ -379,13 +373,13 @@ class SurgeConfirmed(BaseModel):
     ts_code: str
     name: str
     theme: str = ""
-    confirmed_at: str = ""            # HH:MM
-    price: float = 0.0                # 推送当时价（入场价,供次日 S 点/最终收益闭环用）
+    confirmed_at: str = ""  # HH:MM
+    price: float = 0.0  # 推送当时价（入场价,供次日 S 点/最终收益闭环用）
     pct_chg: float = 0.0
-    cum_amount: float = 0.0           # 当日累计成交额（元）
-    rel_cum: float = 0.0              # today_cum / N 日同刻累计额中位（v3 纯累计核心判据）
-    rough_ratio: float = 0.0          # cum / (20 日均额 × 曲线(t))
-    minute_delta: float | None = None       # 本分钟增量（元，v2 遗留研究字段）
+    cum_amount: float = 0.0  # 当日累计成交额（元）
+    rel_cum: float = 0.0  # today_cum / N 日同刻累计额中位（v3 纯累计核心判据）
+    rough_ratio: float = 0.0  # cum / (20 日均额 × 曲线(t))
+    minute_delta: float | None = None  # 本分钟增量（元，v2 遗留研究字段）
     minute_delta_median: float | None = None  # N 日同分钟增量中位（元，v2 遗留研究字段）
     room_to_limit_pct: float | None = None  # 距涨停空间（%）
     return_1m_pct: float | None = None
@@ -406,9 +400,7 @@ class SurgePushHistory(BaseModel):
     @property
     def pushed_today(self) -> set[str]:
         return {
-            code
-            for code, push_dates in self.push_dates_by_code.items()
-            if self.as_of in push_dates
+            code for code, push_dates in self.push_dates_by_code.items() if self.as_of in push_dates
         }
 
     def count(self, ts_code: str) -> int:
@@ -418,7 +410,7 @@ class SurgePushHistory(BaseModel):
 class TickResult(BaseModel):
     """单分钟 tick 的产出：待推送报文 + 本分钟新确认（落 events）。"""
 
-    pushes: list[tuple[str, str]] = []   # [(title, body)]
+    pushes: list[tuple[str, str]] = []  # [(title, body)]
     confirmed: list[SurgeConfirmed] = []
 
 
@@ -430,11 +422,11 @@ class SurgeBaseline:
     """启动预载的市场基线（全部载内存）。"""
 
     avg_amount_20d: dict[str, float]  # ts_code → 元（daily_bar 千元 ×1000）
-    theme: dict[str, str]             # ts_code → 题材名（三级兜底链首个命中，见 load_theme_map）
-    curve: np.ndarray                 # 241 点进度曲线
+    theme: dict[str, str]  # ts_code → 题材名（三级兜底链首个命中，见 load_theme_map）
+    curve: np.ndarray  # 241 点进度曲线
     # rt_min 快照只带 ts_code/close/vol/amount，不带名称/昨收，故预载补齐（2026-07-07 换源）：
     code_universe: list[str] = field(default_factory=list)  # 全 A 股代码（stock_basic，喂 rt_min）
-    name_map: dict[str, str] = field(default_factory=dict)   # ts_code → 名称（ST 判定 + 报文）
+    name_map: dict[str, str] = field(default_factory=dict)  # ts_code → 名称（ST 判定 + 报文）
     pre_close: dict[str, float] = field(default_factory=dict)  # ts_code → T-1 收盘（涨停价/涨幅）
 
 
@@ -636,8 +628,12 @@ def preload_baseline(curve_path: Path | None = None) -> SurgeBaseline:
         f"代码全集={len(codes)} 只、昨收={len(pre_close)} 只"
     )
     return SurgeBaseline(
-        avg_amount_20d=avg20, theme=theme, curve=curve,
-        code_universe=codes, name_map=names, pre_close=pre_close,
+        avg_amount_20d=avg20,
+        theme=theme,
+        curve=curve,
+        code_universe=codes,
+        name_map=names,
+        pre_close=pre_close,
     )
 
 
@@ -653,8 +649,17 @@ def preload_baseline(curve_path: Path | None = None) -> SurgeBaseline:
 #   唯 daily_bar 是千元（load_avg_amount_20d 已 ×1000），不涉 rt_min。
 
 _RT_MIN_SNAPSHOT_COLS = [
-    "ts_code", "name", "price", "open", "high", "low",
-    "pre_close", "pct_chg", "volume", "amount", "trade_time",
+    "ts_code",
+    "name",
+    "price",
+    "open",
+    "high",
+    "low",
+    "pre_close",
+    "pct_chg",
+    "volume",
+    "amount",
+    "trade_time",
 ]
 
 
@@ -704,8 +709,11 @@ class CumulativeTracker:
                 continue
             code = str(r.ts_code)
             self._cum[code] = {
-                col: (float(getattr(r, col)) if getattr(r, col, None) is not None
-                      and not pd.isna(getattr(r, col, None)) else 0.0)
+                col: (
+                    float(getattr(r, col))
+                    if getattr(r, col, None) is not None and not pd.isna(getattr(r, col, None))
+                    else 0.0
+                )
                 for col in self._CUM_COLS
             }
             self._last_minute[code] = _minute_of_day(ts)
@@ -738,11 +746,7 @@ class CumulativeTracker:
                         minute = _minute_of_day(ts)
             cum = self._cum.setdefault(code, {c: 0.0 for c in self._CUM_COLS})
             last = self._last_minute.get(code)
-            advance = (
-                belongs_to_session
-                and minute is not None
-                and (last is None or minute > last)
-            )
+            advance = belongs_to_session and minute is not None and (last is None or minute > last)
             if advance:
                 for col in self._CUM_COLS:
                     v = getattr(r, col, None)
@@ -847,8 +851,8 @@ def _detection_domain(snapshot: pd.DataFrame, boards: tuple[str, ...]) -> pd.Dat
 class ThreeDayBaseline:
     """某票近 3 交易日的同刻累计额 / 同分钟增量中位（对齐 241 网格）。"""
 
-    cum_median: np.ndarray      # 241 点：3 日同刻累计额中位（元）
-    minute_median: np.ndarray   # 241 点：3 日同分钟增量中位（元）
+    cum_median: np.ndarray  # 241 点：3 日同刻累计额中位（元）
+    minute_median: np.ndarray  # 241 点：3 日同分钟增量中位（元）
     days_used: int
 
 
@@ -1188,10 +1192,7 @@ class SurgeWatcher:
         cached_strength = self.today_price_strength.get(code)
         if code in self.today_cum_series and (
             not self.config.require_price_strength
-            or (
-                cached_strength is not None
-                and cached_strength.minute_index >= required_gi
-            )
+            or (cached_strength is not None and cached_strength.minute_index >= required_gi)
         ):
             return
         try:
@@ -1409,10 +1410,7 @@ def build_surge_messages(
         if c.room_to_limit_pct is not None:
             price_parts.append(f"距涨停：{c.room_to_limit_pct:.1f}%")
         lines.append(f"- {' ｜ '.join(price_parts)}")
-        lines.append(
-            f"- 累计比：{n}日 {c.rel_cum:.1f}×"
-            f" ｜ 累计额：{_fmt_amount(c.cum_amount)}"
-        )
+        lines.append(f"- 累计比：{n}日 {c.rel_cum:.1f}× ｜ 累计额：{_fmt_amount(c.cum_amount)}")
         lines.append(f"- 近5日推送次数：{c.push_count_5d}")
 
         # 增量段仅在增量门开启时展示（v3 默认关，纯累计口径不看单分钟）。
@@ -1427,9 +1425,7 @@ def build_surge_messages(
                 if c.outer_inner_ratio_approx is not None
                 else "外盘占优"
             )
-            lines.append(
-                f"- 方向：1分钟 {c.return_1m_pct:+.2f}% ｜ {flow}"
-            )
+            lines.append(f"- 方向：1分钟 {c.return_1m_pct:+.2f}% ｜ {flow}")
         lines.append("")
     if extra > 0:
         lines.append(f"- 另有 {extra} 只（本分钟共 {len(confirmed)} 只确认）")
@@ -1440,8 +1436,7 @@ def build_surge_messages(
     )
     vwap_seg = " / VWAP门" if config.require_vwap else ""
     direction_seg = (
-        f" / 1分钟>{config.min_return_1m_pct:g}%"
-        f"且外/内≈>{config.min_outer_inner_ratio:g}"
+        f" / 1分钟>{config.min_return_1m_pct:g}%且外/内≈>{config.min_outer_inner_ratio:g}"
         if config.require_price_strength
         else ""
     )
@@ -1533,9 +1528,7 @@ def load_recent_push_history(
         try:
             lines = path.read_text(encoding="utf-8").splitlines()
         except OSError as e:
-            logger.warning(
-                f"surge 推送历史读取失败 {path.name}: {type(e).__name__}: {e}"
-            )
+            logger.warning(f"surge 推送历史读取失败 {path.name}: {type(e).__name__}: {e}")
             continue
         for line in lines:
             if not line.strip():
@@ -1679,14 +1672,12 @@ def run_surge_watch(
 
     baseline = baseline or preload_baseline()
     notify_fn = notify_fn or _default_notify
-    live_dir = (base_dir or default_live_dir())
+    live_dir = base_dir or default_live_dir()
     trading_days_loader = recent_trading_days_fn or _load_recent_trading_days
     try:
         recent_trading_days = trading_days_loader(day)
     except Exception as e:
-        logger.warning(
-            f"近5交易日窗口加载失败，退化为仅今日: {type(e).__name__}: {e}"
-        )
+        logger.warning(f"近5交易日窗口加载失败，退化为仅今日: {type(e).__name__}: {e}")
         recent_trading_days = (day,)
     push_history = load_recent_push_history(live_dir, day, recent_trading_days)
 
@@ -1714,8 +1705,10 @@ def run_surge_watch(
         today_cum_fetcher = _default_today_cum_fetcher
 
     watcher = SurgeWatcher(
-        baseline, config=config,
-        minute_fetcher=minute_fetcher, today_cum_fetcher=today_cum_fetcher,
+        baseline,
+        config=config,
+        minute_fetcher=minute_fetcher,
+        today_cum_fetcher=today_cum_fetcher,
         push_history=push_history,
     )
     events_path = live_dir / f"events-{day.isoformat()}.jsonl"
@@ -1758,9 +1751,7 @@ def run_surge_watch(
             try:
                 full = snapshot_fetcher()
             except Exception as exc:
-                logger.warning(
-                    f"surge 快照 provider 失败（{type(exc).__name__}: {exc}）"
-                )
+                logger.warning(f"surge 快照 provider 失败（{type(exc).__name__}: {exc}）")
                 full = None
             route = full.attrs.get("route", "none") if full is not None else "none"
             collection_tracker.observe_snapshot(now, full)
@@ -1854,10 +1845,11 @@ def run_simulate(
     baseline = baseline or _load_sim_baseline(sim_dir) or preload_baseline()
     minute_fetcher = minute_fetcher or _sim_minute_fetcher(sim_dir)
     notify_fn = notify_fn or _default_notify
-    live_dir = (base_dir or default_live_dir())
+    live_dir = base_dir or default_live_dir()
     reserved = {"confirm_bars.parquet"}
     files = sorted(
-        p for p in sim_dir.glob("*.parquet")
+        p
+        for p in sim_dir.glob("*.parquet")
         if not p.name.endswith(".tmp") and p.name not in reserved
     )
     if not files:
@@ -1928,7 +1920,7 @@ def _sim_day(path: Path) -> date:
     """文件名含 YYYY-MM-DD 则用之，否则回落今天。"""
     stem = path.stem
     for i in range(len(stem) - 9):
-        chunk = stem[i:i + 10]
+        chunk = stem[i : i + 10]
         try:
             return date.fromisoformat(chunk)
         except ValueError:

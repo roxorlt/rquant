@@ -75,7 +75,10 @@ def check_duckdb_lock(path: Path) -> CheckResult:
         return CheckResult("duckdb_lock", "warn", f"DuckDB 文件不存在: {path}")
     try:
         r = subprocess.run(
-            ["lsof", str(path)], capture_output=True, text=True, timeout=5,
+            ["lsof", str(path)],
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
     except subprocess.TimeoutExpired:
         return CheckResult("duckdb_lock", "fail", "lsof 5s 超时")
@@ -105,16 +108,19 @@ def check_duckdb_lock(path: Path) -> CheckResult:
 
     if len(rw_holders) > 1:
         return CheckResult(
-            "duckdb_lock", "fail",
+            "duckdb_lock",
+            "fail",
             f"{len(rw_holders)} 个写锁持有者：{', '.join(rw_holders)} — monitor 启动会撞锁",
         )
     if len(rw_holders) == 1:
         return CheckResult(
-            "duckdb_lock", "ok",
+            "duckdb_lock",
+            "ok",
             f"RW: {rw_holders[0]} + RO: {len(ro_holders)} 个",
         )
     return CheckResult(
-        "duckdb_lock", "ok",
+        "duckdb_lock",
+        "ok",
         f"无写锁（monitor 未跑），RO 持有: {len(ro_holders)} 个",
     )
 
@@ -125,8 +131,8 @@ def check_disk_space(path: Path, warn_gb: float = 5.0) -> CheckResult:
     if not target.exists():
         return CheckResult("disk", "fail", f"路径不存在: {path}")
     usage = shutil.disk_usage(target)
-    free_gb = usage.free / (1024 ** 3)
-    total_gb = usage.total / (1024 ** 3)
+    free_gb = usage.free / (1024**3)
+    total_gb = usage.total / (1024**3)
     pct_used = usage.used / usage.total * 100
     msg = f"剩余 {free_gb:.1f}GB / {total_gb:.0f}GB ({pct_used:.0f}% 已用)"
     if free_gb < warn_gb:
@@ -175,7 +181,8 @@ def check_tushare_credits(token: str | None, warn_threshold: int = 500) -> Check
             rows_msg = f"（{n_rows} 个积分包合计）" if n_rows > 1 else ""
             if pts < warn_threshold:
                 return CheckResult(
-                    "tushare", "warn",
+                    "tushare",
+                    "warn",
                     f"{pts} 积分{rows_msg} (低于阈值 {warn_threshold}){expire_msg}",
                 )
             return CheckResult("tushare", "ok", f"{pts} 积分{rows_msg}{expire_msg}")
@@ -197,7 +204,9 @@ def check_systemd_services(units: list[str]) -> list[CheckResult]:
         try:
             r = subprocess.run(
                 ["systemctl", "is-active", unit],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True,
+                text=True,
+                timeout=5,
             )
         except subprocess.TimeoutExpired:
             results.append(CheckResult(f"svc:{unit}", "fail", "systemctl 超时"))
@@ -260,7 +269,9 @@ def runtime_deployment_service_checks(
 
 
 def check_recent_errors(
-    units: list[str], hours: int = 24, warn_count: int = 10,
+    units: list[str],
+    hours: int = 24,
+    warn_count: int = 10,
 ) -> CheckResult:
     """journalctl 扫近 hours 小时各 unit 的 priority>=err 条数。"""
     if not shutil.which("journalctl"):
@@ -270,11 +281,18 @@ def check_recent_errors(
         try:
             r = subprocess.run(
                 [
-                    "journalctl", "-u", unit,
+                    "journalctl",
+                    "-u",
+                    unit,
                     f"--since={hours} hours ago",
-                    "-p", "err", "--no-pager", "--quiet",
+                    "-p",
+                    "err",
+                    "--no-pager",
+                    "--quiet",
                 ],
-                capture_output=True, text=True, timeout=10,
+                capture_output=True,
+                text=True,
+                timeout=10,
             )
         except subprocess.TimeoutExpired:
             logger.warning(f"journalctl -u {unit} 超时，跳过此 unit")
@@ -284,7 +302,8 @@ def check_recent_errors(
         total += len(lines)
     if total >= warn_count:
         return CheckResult(
-            "recent_errors", "warn",
+            "recent_errors",
+            "warn",
             f"近 {hours}h ERROR {total} 条 (阈值 {warn_count})",
         )
     return CheckResult("recent_errors", "ok", f"近 {hours}h ERROR {total} 条")
@@ -298,15 +317,11 @@ def run_all_checks(*, runtime_root: Path | None = None) -> list[CheckResult]:
     resolved_runtime_root = runtime_root or Path(
         os.environ.get("RQUANT_RUNTIME_ROOT", str(settings.data_dir / "runtime"))
     )
-    runtime_inspection, runtime_result = runtime_deployment_service_checks(
-        resolved_runtime_root
-    )
+    runtime_inspection, runtime_result = runtime_deployment_service_checks(resolved_runtime_root)
     systemd_units = list(
         dict.fromkeys((*SERVICES_TO_CHECK, *runtime_inspection.strict_authority_units))
     )
-    journal_units = list(
-        dict.fromkeys((*SERVICES_TO_CHECK, *runtime_inspection.inventory_units))
-    )
+    journal_units = list(dict.fromkeys((*SERVICES_TO_CHECK, *runtime_inspection.inventory_units)))
     results: list[CheckResult] = []
     results.append(check_duckdb_lock(settings.duckdb_path))
     results.append(check_disk_space(settings.duckdb_path.parent))

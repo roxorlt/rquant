@@ -54,9 +54,7 @@ def run_canvas_app() -> None:
             definition_names = definitions.value["name"].astype(str).tolist()
             selected_definition = st.selectbox("已保存画布", definition_names)
             st.dataframe(
-                definitions.value.loc[
-                    definitions.value["name"] == selected_definition
-                ],
+                definitions.value.loc[definitions.value["name"] == selected_definition],
                 width="stretch",
                 hide_index=True,
             )
@@ -102,14 +100,17 @@ def run_canvas_app() -> None:
             description = st.text_input("描述", key="canvas_description")
             if st.button("创建画布", type="primary"):
                 try:
-                    _submit(client, SaveCanvas(
-                        command_id=uuid4().hex,
-                        requested_at=datetime.now(UTC),
-                        name=name,
-                        description=description,
-                        pool_refs=(),
-                        source="canvas_page",
-                    ))
+                    _submit(
+                        client,
+                        SaveCanvas(
+                            command_id=uuid4().hex,
+                            requested_at=datetime.now(UTC),
+                            name=name,
+                            description=description,
+                            pool_refs=(),
+                            source="canvas_page",
+                        ),
+                    )
                     st.success("已提交，下一次 Serving 发布后可见")
                 except PageControlUnavailableError as exc:
                     st.warning(f"PageControl 暂不可用，未写入：{exc}")
@@ -121,15 +122,18 @@ def run_canvas_app() -> None:
             description = st.text_input("池描述", key="pool_description")
             if st.button("创建空池", type="primary"):
                 try:
-                    _submit(client, SaveUserPool(
-                        command_id=uuid4().hex,
-                        requested_at=datetime.now(UTC),
-                        base_name=base_name,
-                        description=description,
-                        rule_calls=(),
-                        include_columns=(),
-                        source="canvas_page",
-                    ))
+                    _submit(
+                        client,
+                        SaveUserPool(
+                            command_id=uuid4().hex,
+                            requested_at=datetime.now(UTC),
+                            base_name=base_name,
+                            description=description,
+                            rule_calls=(),
+                            include_columns=(),
+                            source="canvas_page",
+                        ),
+                    )
                     st.success("已提交，下一次 Serving 发布后可见")
                 except PageControlUnavailableError as exc:
                     st.warning(f"PageControl 暂不可用，未写入：{exc}")

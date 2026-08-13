@@ -276,9 +276,7 @@ def _read_deploy_controls(path: Path) -> dict[str, str]:
             continue
         key, raw_value = line.split("=", 1)
         if key.strip().startswith(DAILY_RECEIPT_AUTHORITY_PREFIXES):
-            raise DeployBootstrapError(
-                "Daily receipt authority cannot be configured through .env"
-            )
+            raise DeployBootstrapError("Daily receipt authority cannot be configured through .env")
         if key != key.strip() or re.fullmatch(r"[A-Z][A-Z0-9_]*", key) is None:
             if key.strip().startswith(DEPLOY_CONTROL_PREFIXES):
                 raise DeployBootstrapError(
@@ -4108,9 +4106,7 @@ def main(argv: list[str] | None = None) -> int:
                     prepare_target=prepare_target,
                 )
             lock_missing_preview = (
-                dry_run
-                and not args.register_lab_installation
-                and not lock_path.exists()
+                dry_run and not args.register_lab_installation and not lock_path.exists()
             )
             if not lock_missing_preview:
                 lock_fd = _acquire_lock(

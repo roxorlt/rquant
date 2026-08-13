@@ -61,9 +61,7 @@ def _spec(**changes: object) -> StrategySpec:
             _requirement("same_minute_amount_ratio", RequirementLevel.REQUIRED),
             _requirement("vwap_position", RequirementLevel.REQUIRED),
         ),
-        "optional_features": (
-            _requirement("amount_accel_5m", RequirementLevel.OPTIONAL),
-        ),
+        "optional_features": (_requirement("amount_accel_5m", RequirementLevel.OPTIONAL),),
         "initial_state": StrategyLifecycleState.IDLE,
         "transitions": _transitions(),
         "parameters": {"entry": {"min_ratio": 2.0}, "top_n": 3},
@@ -87,16 +85,10 @@ def test_state_transition_requires_nonempty_event() -> None:
 def test_strategy_feature_requirements_match_declared_bucket() -> None:
     with pytest.raises(ValidationError, match="required_features"):
         _spec(
-            required_features=(
-                _requirement("same_minute_amount_ratio", RequirementLevel.OPTIONAL),
-            )
+            required_features=(_requirement("same_minute_amount_ratio", RequirementLevel.OPTIONAL),)
         )
     with pytest.raises(ValidationError, match="optional_features"):
-        _spec(
-            optional_features=(
-                _requirement("amount_accel_5m", RequirementLevel.REQUIRED),
-            )
-        )
+        _spec(optional_features=(_requirement("amount_accel_5m", RequirementLevel.REQUIRED),))
 
 
 def test_strategy_feature_names_are_unique_and_disjoint() -> None:
@@ -104,11 +96,7 @@ def test_strategy_feature_names_are_unique_and_disjoint() -> None:
     with pytest.raises(ValidationError, match="unique"):
         _spec(required_features=(repeated, repeated))
     with pytest.raises(ValidationError, match="disjoint"):
-        _spec(
-            optional_features=(
-                _requirement("vwap_position", RequirementLevel.OPTIONAL),
-            )
-        )
+        _spec(optional_features=(_requirement("vwap_position", RequirementLevel.OPTIONAL),))
     with pytest.raises(ValidationError, match="allowed_actions.*unique"):
         _spec(allowed_actions=("buy", "buy"))
 

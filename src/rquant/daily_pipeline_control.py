@@ -143,9 +143,7 @@ class _BoundDirectoryIdentity:
                 descriptor_state.st_mode,
             )
         ):
-            raise DailyPipelineProductionProfileError(
-                "fixed production runtime path was replaced"
-            )
+            raise DailyPipelineProductionProfileError("fixed production runtime path was replaced")
 
 
 class _FixedProductionRuntimeBinding:
@@ -182,9 +180,7 @@ class _FixedProductionRuntimeBinding:
             parent = os.open("/", _DIRECTORY_OPEN_FLAGS)
             descriptors.append(parent)
             current = Path("/")
-            identities.append(
-                _BoundDirectoryIdentity.capture(path=current, descriptor=parent)
-            )
+            identities.append(_BoundDirectoryIdentity.capture(path=current, descriptor=parent))
             components = candidate.parts[1:]
             for index, component in enumerate(components):
                 current /= component
@@ -210,9 +206,7 @@ class _FixedProductionRuntimeBinding:
                     binding.assert_current()
                     return binding
                 descriptors.append(parent)
-                identities.append(
-                    _BoundDirectoryIdentity.capture(path=current, descriptor=parent)
-                )
+                identities.append(_BoundDirectoryIdentity.capture(path=current, descriptor=parent))
             final = identities[-1]
             if final.owner != os.geteuid() or stat.S_IMODE(final.mode) != 0o700:
                 raise DailyPipelineProductionProfileError(
@@ -241,9 +235,7 @@ class _FixedProductionRuntimeBinding:
 
     def assert_current(self) -> None:
         if self._closed:
-            raise DailyPipelineProductionProfileError(
-                "fixed production runtime binding is closed"
-            )
+            raise DailyPipelineProductionProfileError("fixed production runtime binding is closed")
         for identity in self.identities:
             identity.assert_current()
         if self.final_absent:
@@ -424,9 +416,7 @@ def _load_profile_from_binding(
     loader=None,
 ) -> RuntimeDeploymentProfile:
     if binding.final_absent:
-        raise DailyPipelineProductionProfileError(
-            "fixed production runtime profile is absent"
-        )
+        raise DailyPipelineProductionProfileError("fixed production runtime profile is absent")
     if loader is None:
         from rquant.runtime_deployment_profile import (
             load_current_runtime_deployment_profile as loader,

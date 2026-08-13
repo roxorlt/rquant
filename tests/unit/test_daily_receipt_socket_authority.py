@@ -75,9 +75,7 @@ def test_authority_has_no_injectable_peer_credential_seam() -> None:
     parameters = inspect.signature(serve_daily_receipt_socket_authority).parameters
     assert "peer_credential_provider" not in parameters
     assert not any(
-        fragment in name
-        for name in parameters
-        for fragment in ("peer", "credential", "provider")
+        fragment in name for name in parameters for fragment in ("peer", "credential", "provider")
     )
     assert not hasattr(authority_module, "PeerCredentialProvider")
     assert "SO_PEERCRED" in inspect.getsource(authority_module._peer_credentials)
@@ -117,9 +115,10 @@ def test_signature_envelope_binds_namespace_nonce_payload_hash_and_key_id() -> N
         "payload_sha256": "b" * 64,
         "key_id": "daily-v1",
     }
-    assert frozenset(
-        {DAILY_RECEIPT_NAMESPACE_STAGE, DAILY_RECEIPT_NAMESPACE_RUN}
-    ) == DAILY_RECEIPT_NAMESPACES
+    assert (
+        frozenset({DAILY_RECEIPT_NAMESPACE_STAGE, DAILY_RECEIPT_NAMESPACE_RUN})
+        == DAILY_RECEIPT_NAMESPACES
+    )
 
     for overrides, expected in (
         ({"namespace": "rquant-shadow-report-receipt"}, "namespace"),
@@ -179,9 +178,7 @@ def test_production_client_pins_the_fixed_socket_and_daily_namespaces(
     )
 
     assert client.socket_path == DAILY_RECEIPT_SOCKET_ENDPOINT
-    assert Path(
-        "/etc/rquant/daily-receipt-trusted-keys.json"
-    ) == DAILY_RECEIPT_TRUSTED_KEYRING_PATH
+    assert Path("/etc/rquant/daily-receipt-trusted-keys.json") == DAILY_RECEIPT_TRUSTED_KEYRING_PATH
     with pytest.raises(ValueError, match="namespace"):
         client.sign(namespace="rquant-shadow-report-receipt", payload=b"payload")
 

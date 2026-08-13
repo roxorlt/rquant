@@ -28,9 +28,7 @@ CommitSha = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{40}$")]
 
 def _freeze_json(value: object) -> object:
     if isinstance(value, Mapping):
-        return MappingProxyType(
-            {key: _freeze_json(item) for key, item in sorted(value.items())}
-        )
+        return MappingProxyType({key: _freeze_json(item) for key, item in sorted(value.items())})
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         return tuple(_freeze_json(item) for item in value)
     return value

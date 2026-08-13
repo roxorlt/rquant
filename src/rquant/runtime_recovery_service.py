@@ -1106,12 +1106,9 @@ class RuntimeRecoveryService:
                 or payload != expected
                 or hashlib.sha256(payload).hexdigest() != hashlib.sha256(expected).hexdigest()
                 or _directory_fd_identity(root_before) != _directory_fd_identity(root_after)
-                or _directory_fd_identity(archive_before)
-                != _directory_fd_identity(archive_after)
+                or _directory_fd_identity(archive_before) != _directory_fd_identity(archive_after)
             ):
-                raise RecoveryServiceIntegrityError(
-                    "archived legacy recovery receipt differs"
-                )
+                raise RecoveryServiceIntegrityError("archived legacy recovery receipt differs")
             if expected_identity is not None and observed_identity != expected_identity:
                 raise RecoveryServiceIntegrityError(
                     "legacy recovery receipt archive changed after write"
@@ -1942,11 +1939,9 @@ class RuntimeRecoveryService:
                 label="legacy recovery receipt archive",
                 required_mode=0o700,
             )
-            if (
-                _directory_fd_identity(root_before) != _directory_fd_identity(root_after)
-                or _directory_fd_identity(archive_before)
-                != _directory_fd_identity(archive_after)
-            ):
+            if _directory_fd_identity(root_before) != _directory_fd_identity(
+                root_after
+            ) or _directory_fd_identity(archive_before) != _directory_fd_identity(archive_after):
                 raise RecoveryServiceIntegrityError(
                     "legacy recovery receipt archive directory changed"
                 )

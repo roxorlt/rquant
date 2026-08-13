@@ -36,9 +36,7 @@ def _runtime_manifest(runtime_root: Path) -> RuntimeServiceManifest:
         producer_commit=COMMIT,
         settings={
             "lab_jobs_path": str(runtime_root / "research" / "lab_jobs.sqlite3"),
-            "authority_root": str(
-                runtime_root / "research" / "serving-authorities" / "lab-jobs"
-            ),
+            "authority_root": str(runtime_root / "research" / "serving-authorities" / "lab-jobs"),
         },
     )
 
@@ -228,9 +226,11 @@ def test_explicit_production_root_rejects_local_test_profile_before_signer_probe
     monkeypatch.setattr(
         deployment_profile_module,
         "load_current_runtime_deployment_profile",
-        lambda root: profile
-        if root == LINUX_PRODUCTION_RUNTIME_ROOT
-        else pytest.fail("unexpected runtime root"),
+        lambda root: (
+            profile
+            if root == LINUX_PRODUCTION_RUNTIME_ROOT
+            else pytest.fail("unexpected runtime root")
+        ),
     )
     monkeypatch.setattr(
         page_control_service.SecureCanvasPublicationSigningClient,

@@ -384,8 +384,7 @@ def test_linux_production_profile_requires_fixed_daily_socket_authority_only() -
     )
     assert "receipt_signer_command" not in daily.settings
     assert all(
-        "helper" not in key and "argv" not in key and "env" not in key
-        for key in daily.settings
+        "helper" not in key and "argv" not in key and "env" not in key for key in daily.settings
     )
 
     with pytest.raises(ValueError, match="Daily.*socket authority"):

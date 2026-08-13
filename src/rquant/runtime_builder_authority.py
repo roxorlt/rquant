@@ -303,6 +303,7 @@ def lab_jobs_publisher_builder(
                 eta_completed_limit=settings.eta_completed_limit,
                 page_projection_reader=page_projection_reader,
             )
+
             def step() -> RuntimeStepResult:
                 source = reader(clock())
                 pointer = publisher.publish(source)

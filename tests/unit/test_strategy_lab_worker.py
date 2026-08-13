@@ -390,14 +390,10 @@ class TestExecuteSpec:
         assert status is not None
         assert status.state == "error"
 
-    def test_base_dir_from_spec(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_base_dir_from_spec(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         from rquant.dashboard import strategy_lab_worker as worker
 
-        monkeypatch.setitem(
-            worker._SPEC_BUILDERS, "n_shape_optimize", lambda params: _fake_run()
-        )
+        monkeypatch.setitem(worker._SPEC_BUILDERS, "n_shape_optimize", lambda params: _fake_run())
         spec = {
             "run_type": "n_shape_optimize",
             "run_id": "run-specdir",
@@ -545,32 +541,28 @@ class TestLabRunCli:
         assert status is not None
         assert "mismatch" in (status.error or "")
 
-    def test_cmd_lab_run_success(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_cmd_lab_run_success(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         import argparse
 
         from rquant.cli import cmd_lab_run
         from rquant.dashboard import strategy_lab_worker as worker
 
-        monkeypatch.setitem(
-            worker._SPEC_BUILDERS, "n_shape_optimize", lambda params: _fake_run()
-        )
+        monkeypatch.setitem(worker._SPEC_BUILDERS, "n_shape_optimize", lambda params: _fake_run())
         snapshot = tmp_path / "research-immutable.duckdb"
         snapshot.touch()
         spec_path = tmp_path / "spec.json"
         spec_path.write_text(
-            json.dumps({
-                "run_type": "n_shape_optimize",
-                "run_id": "run-cli-ok",
-                "base_dir": str(tmp_path),
-                "params": {},
-            }),
+            json.dumps(
+                {
+                    "run_type": "n_shape_optimize",
+                    "run_id": "run-cli-ok",
+                    "base_dir": str(tmp_path),
+                    "params": {},
+                }
+            ),
             encoding="utf-8",
         )
-        code = cmd_lab_run(
-            argparse.Namespace(spec=str(spec_path), research_snapshot=snapshot)
-        )
+        code = cmd_lab_run(argparse.Namespace(spec=str(spec_path), research_snapshot=snapshot))
         assert code == 0
         status = worker.read_run_status("run-cli-ok", base_dir=tmp_path)
         assert status is not None
@@ -592,17 +584,17 @@ class TestLabRunCli:
         snapshot.touch()
         spec_path = tmp_path / "spec.json"
         spec_path.write_text(
-            json.dumps({
-                "run_type": "n_shape_optimize",
-                "run_id": "run-cli-bad",
-                "base_dir": str(tmp_path),
-                "params": {},
-            }),
+            json.dumps(
+                {
+                    "run_type": "n_shape_optimize",
+                    "run_id": "run-cli-bad",
+                    "base_dir": str(tmp_path),
+                    "params": {},
+                }
+            ),
             encoding="utf-8",
         )
-        code = cmd_lab_run(
-            argparse.Namespace(spec=str(spec_path), research_snapshot=snapshot)
-        )
+        code = cmd_lab_run(argparse.Namespace(spec=str(spec_path), research_snapshot=snapshot))
         assert code == 1
         status = worker.read_run_status("run-cli-bad", base_dir=tmp_path)
         assert status is not None

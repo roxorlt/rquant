@@ -74,9 +74,7 @@ class RouterReceipt(RuntimeContractModel):
             RouterDisposition.DUPLICATE,
         }:
             if self.global_sequence is None:
-                raise ValueError(
-                    "accepted and duplicate receipts require global_sequence"
-                )
+                raise ValueError("accepted and duplicate receipts require global_sequence")
         else:
             if self.global_sequence is not None:
                 raise ValueError("quarantined receipts cannot have global_sequence")
@@ -166,9 +164,7 @@ class OutboxAttempt(RuntimeContractModel):
             raise ValueError("completed_at must be at or after started_at")
         if self.success:
             if self.provider_receipt is None or self.error is not None:
-                raise ValueError(
-                    "successful attempts require provider_receipt and forbid error"
-                )
+                raise ValueError("successful attempts require provider_receipt and forbid error")
         elif self.error is None or self.provider_receipt is not None:
             raise ValueError("failed attempts require error and forbid provider_receipt")
         return self

@@ -41,13 +41,8 @@ def test_run_all_checks_passes_receipt_bound_quote_advisory_to_real_workload_pro
         encoding="utf-8",
     )
     arbiter = tmp_path / "rquant-workload-arbiter"
-    source_arbiter = (
-        Path(__file__).resolve().parents[2]
-        / "deploy/libexec/rquant-workload-arbiter"
-    )
-    arbiter.write_bytes(
-        source_arbiter.read_bytes()
-    )
+    source_arbiter = Path(__file__).resolve().parents[2] / "deploy/libexec/rquant-workload-arbiter"
+    arbiter.write_bytes(source_arbiter.read_bytes())
     arbiter.chmod(0o755)
     arbiter_hash = tmp_path / "rquant-workload-arbiter.sha256"
     arbiter_hash.write_text(
@@ -68,8 +63,7 @@ def test_run_all_checks_passes_receipt_bound_quote_advisory_to_real_workload_pro
             return SimpleNamespace(
                 returncode=0,
                 stdout=(
-                    "LoadState=loaded\nActiveState=failed\n"
-                    "Slice=rquant-live.slice\nControlGroup=\n"
+                    "LoadState=loaded\nActiveState=failed\nSlice=rquant-live.slice\nControlGroup=\n"
                 ),
                 stderr="",
             )

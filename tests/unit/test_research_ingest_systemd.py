@@ -12,10 +12,7 @@ def test_research_ingest_service_uses_daily_default_and_failure_relay() -> None:
     content = (SYSTEMD / "rquant-research-ingest.service").read_text(encoding="utf-8")
 
     assert "Requires=rquant-replica-sync.service" in content
-    assert (
-        "After=network-online.target rquant-daily.service "
-        "rquant-replica-sync.service" in content
-    )
+    assert "After=network-online.target rquant-daily.service rquant-replica-sync.service" in content
     assert "OnFailure=rquant-alert@%n.service" in content
     assert "StartLimitIntervalSec" not in content
     assert "StartLimitBurst" not in content

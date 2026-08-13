@@ -615,8 +615,9 @@ def test_run_injects_lazy_terminal_lifecycle_into_standard_owner_assembly(
     monkeypatch.setattr("rquant.runtime_service_main.resolve_checkout_commit", lambda: COMMIT)
     monkeypatch.setattr(
         "rquant.runtime_service_main.build_runtime_artifact_terminal_lifecycle_factory",
-        lambda root, *, service_kind: events.append(("factory", root, service_kind))
-        or (lambda: sentinel),
+        lambda root, *, service_kind: (
+            events.append(("factory", root, service_kind)) or (lambda: sentinel)
+        ),
     )
     monkeypatch.setattr(
         "rquant.runtime_service_main.load_runtime_schema_service_bindings",

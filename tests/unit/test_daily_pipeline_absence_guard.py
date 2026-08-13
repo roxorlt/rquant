@@ -167,18 +167,14 @@ def test_component_open_error_with_present_directory_is_rejected(tmp_path: Path)
     (base / "present").mkdir(mode=0o700)
     dir_fd = os.open(base, os.O_RDONLY)
     try:
-        with pytest.raises(
-            DailyPipelineProductionProfileError, match="unsafe or was replaced"
-        ):
+        with pytest.raises(DailyPipelineProductionProfileError, match="unsafe or was replaced"):
             _assert_component_verified_absent(
                 "present",
                 dir_fd=dir_fd,
                 open_error=FileNotFoundError(),
                 final=True,
             )
-        with pytest.raises(
-            DailyPipelineProductionProfileError, match="changed while validating"
-        ):
+        with pytest.raises(DailyPipelineProductionProfileError, match="changed while validating"):
             _assert_component_verified_absent(
                 "truly-absent",
                 dir_fd=dir_fd,
@@ -186,9 +182,7 @@ def test_component_open_error_with_present_directory_is_rejected(tmp_path: Path)
                 final=True,
             )
         (base / "plain-file").write_bytes(b"x")
-        with pytest.raises(
-            DailyPipelineProductionProfileError, match="non-directory"
-        ):
+        with pytest.raises(DailyPipelineProductionProfileError, match="non-directory"):
             _assert_component_verified_absent(
                 "plain-file",
                 dir_fd=dir_fd,

@@ -185,7 +185,7 @@ def test_claim_next_exhaustion_refreshes_single_stage_run_to_failed(tmp_path: Pa
         now=NOW,
     )
     with sqlite3.connect(ledger.path) as connection:
-            connection.execute(
+        connection.execute(
             """
             UPDATE daily_pipeline_stage
             SET state = ?, attempts = ?, next_attempt_at = NULL
@@ -907,11 +907,11 @@ def test_finalize_rejects_swapped_terminal_receipt_pointer(tmp_path: Path) -> No
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                    other.receipt_id,
-                    other.mode.value,
-                    ledger.storage_profile.profile_hash,
-                    ledger.storage_profile.namespace_id,
-                    other.run_id,
+                other.receipt_id,
+                other.mode.value,
+                ledger.storage_profile.profile_hash,
+                ledger.storage_profile.namespace_id,
+                other.run_id,
                 other.stage_id,
                 other.attempt_number,
                 other.result.content_hash,

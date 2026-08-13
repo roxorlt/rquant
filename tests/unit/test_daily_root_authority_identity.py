@@ -47,9 +47,10 @@ def test_loaded_source_identity_rejects_non_single_file_zipapp(tmp_path: Path) -
 def test_loaded_source_identity_rejects_duplicate_main_entry(tmp_path: Path) -> None:
     module = _load_root_authority()
     archive = tmp_path / "authority.pyz"
-    with pytest.warns(UserWarning, match="Duplicate name"), zipfile.ZipFile(
-        archive, "w", compression=zipfile.ZIP_STORED
-    ) as bundle:
+    with (
+        pytest.warns(UserWarning, match="Duplicate name"),
+        zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_STORED) as bundle,
+    ):
         bundle.writestr("__main__.py", b"first\n")
         bundle.writestr("__main__.py", b"second\n")
 

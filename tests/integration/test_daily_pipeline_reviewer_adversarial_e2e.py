@@ -78,7 +78,7 @@ def test_prepositioned_forged_external_receipt_is_rejected(tmp_path: Path) -> No
                 receipt_root=storage_profile.receipt_root,
                 receipt_key_id=trusted_key.key_id,
             ),
-        )
+        ),
     )
     ledger = DailyPipelineLedger(
         storage_profile=storage_profile,
@@ -463,15 +463,12 @@ def test_deleted_local_report_and_ledger_cannot_roll_back_external_authority(
         LabHighWaterAuthorityConfig(
             command=(str(capability),),
             stable_identity=(
-                "daily-pipeline-report:daily-close:shadow:"
-                f"{storage_profile.namespace_id}:v2"
+                f"daily-pipeline-report:daily-close:shadow:{storage_profile.namespace_id}:v2"
             ),
             code_identity="1" * 40,
             profile_identity="2" * 64,
             active_key_id=AUTHORITY_KEY_ID,
-            trusted_key_provider=lambda key_id: (
-                public_key if key_id == AUTHORITY_KEY_ID else None
-            ),
+            trusted_key_provider=lambda key_id: public_key if key_id == AUTHORITY_KEY_ID else None,
             allow_identity_rotation=True,
         )
     )

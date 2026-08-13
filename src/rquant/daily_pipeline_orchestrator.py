@@ -542,10 +542,7 @@ class DailyPipelineOrchestrator:
                         lease,
                         attempt,
                         code="child_process_failed",
-                        message=(
-                            "stage child exited with nonzero status: "
-                            f"{observed_exit_status}"
-                        ),
+                        message=(f"stage child exited with nonzero status: {observed_exit_status}"),
                         retryable=True,
                         now=self._now(None),
                         elapsed_seconds=time.monotonic() - started,
@@ -855,9 +852,7 @@ class DailyPipelineOrchestrator:
             "RQUANT_DAILY_LEDGER_PATH": str(self.ledger.path),
             "RQUANT_DAILY_STORAGE_ROOT": str(self.ledger.storage_profile.root),
             "RQUANT_DAILY_PROFILE_HASH": context.run.spec.profile_hash,
-            "RQUANT_DAILY_STORAGE_NAMESPACE_ID": str(
-                self.ledger.storage_profile.namespace_id
-            ),
+            "RQUANT_DAILY_STORAGE_NAMESPACE_ID": str(self.ledger.storage_profile.namespace_id),
             "RQUANT_DAILY_SERVICE_OWNER": self._service_owner,
             "RQUANT_DAILY_INPUT_IDENTITY": context.run.input_identity,
             "RQUANT_DAILY_SOURCE_GENERATION_ID": context.run.spec.source_generation_id,

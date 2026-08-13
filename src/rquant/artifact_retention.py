@@ -1678,9 +1678,7 @@ class ArtifactReferenceStore:
             "not_before": _parse_datetime(row["not_before"]),
             "expires_at": _parse_datetime(row["expires_at"]),
             "revoked_at": (
-                _parse_datetime(row["revoked_at"])
-                if row["revoked_at"] is not None
-                else None
+                _parse_datetime(row["revoked_at"]) if row["revoked_at"] is not None else None
             ),
         }
 
@@ -1707,9 +1705,7 @@ class ArtifactReferenceStore:
         )
 
     def _bind_controlled_writer_credential(self, connection: sqlite3.Connection) -> None:
-        result = connection.execute(
-            "SELECT * FROM artifact_writer_credential WHERE singleton = 1"
-        )
+        result = connection.execute("SELECT * FROM artifact_writer_credential WHERE singleton = 1")
         # Lock-boundary probes intentionally implement only BEGIN/ROLLBACK. They
         # cannot represent a real SQLite credential store, so preserve the tested
         # operational error instead of masking it with a probe-only AttributeError.

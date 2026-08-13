@@ -225,9 +225,7 @@ def _continuous_boot_segments(
     previous: WorkloadSample | None = None
     for sample in samples:
         if previous is not None and sample.sampled_at <= previous.sampled_at:
-            raise WorkloadEvidenceError(
-                "workload evidence wall clock is not strictly increasing"
-            )
+            raise WorkloadEvidenceError("workload evidence wall clock is not strictly increasing")
         if previous is None or sample.boot_id != previous.boot_id:
             if sample.boot_id in seen_boot_ids:
                 raise WorkloadEvidenceError(
@@ -241,13 +239,8 @@ def _continuous_boot_segments(
                     "workload evidence monotonic clock is not strictly increasing"
                 )
             wall_gap = (sample.sampled_at - previous.sampled_at).total_seconds()
-            monotonic_gap = (
-                sample.clock_boottime_ns - previous.clock_boottime_ns
-            ) / 1_000_000_000
-            if (
-                wall_gap > _MAX_SAMPLE_GAP_SECONDS
-                or monotonic_gap > _MAX_SAMPLE_GAP_SECONDS
-            ):
+            monotonic_gap = (sample.clock_boottime_ns - previous.clock_boottime_ns) / 1_000_000_000
+            if wall_gap > _MAX_SAMPLE_GAP_SECONDS or monotonic_gap > _MAX_SAMPLE_GAP_SECONDS:
                 raise WorkloadEvidenceError(
                     "workload evidence sampling gap exceeds 450 seconds: "
                     f"wall={wall_gap:.3f}s monotonic={monotonic_gap:.3f}s"
@@ -265,9 +258,7 @@ def _latest_complete_segment(
         first = segment[0]
         last = segment[-1]
         wall_seconds = (last.sampled_at - first.sampled_at).total_seconds()
-        monotonic_seconds = (
-            last.clock_boottime_ns - first.clock_boottime_ns
-        ) / 1_000_000_000
+        monotonic_seconds = (last.clock_boottime_ns - first.clock_boottime_ns) / 1_000_000_000
         if (
             wall_seconds >= _MIN_WINDOW_SECONDS
             and monotonic_seconds >= _MIN_WINDOW_SECONDS
@@ -321,14 +312,10 @@ def summarize_workload_samples(path: Path) -> WorkloadHighWaterEvidence:
         monitor_current_mib=latest.monitor.memory_current_mib,
         monitor_peak_mib=max(sample.monitor.memory_peak_mib for sample in samples),
         live_concurrent_peak_mib=max(sample.live_peak_mib for sample in samples),
-        serving_concurrent_peak_mib=max(
-            sample.serving_peak_mib for sample in samples
-        ),
+        serving_concurrent_peak_mib=max(sample.serving_peak_mib for sample in samples),
         backup_peak_mib=max(sample.backup.memory_peak_mib for sample in samples),
         replica_peak_mib=max(sample.replica.memory_peak_mib for sample in samples),
-        maintenance_concurrent_peak_mib=max(
-            sample.maintenance_peak_mib for sample in samples
-        ),
+        maintenance_concurrent_peak_mib=max(sample.maintenance_peak_mib for sample in samples),
         backup_successful_runs=backup_runs,
         replica_successful_runs=replica_runs,
         backup_sample_count=len(samples),
@@ -336,9 +323,7 @@ def summarize_workload_samples(path: Path) -> WorkloadHighWaterEvidence:
         backup_successful_runtime_seconds=backup_runtime,
         replica_successful_runtime_seconds=replica_runtime,
         raw_evidence_sha256=hashlib.sha256(raw).hexdigest(),
-        os_system_slice_peak_mib=max(
-            sample.os_system_slice_peak_mib for sample in samples
-        ),
+        os_system_slice_peak_mib=max(sample.os_system_slice_peak_mib for sample in samples),
         min_mem_available_mib=min(sample.mem_available_mib for sample in samples),
     )
 
@@ -489,19 +474,11 @@ def collect_workload_sample(
         mem_available_mib=available,
         live_current_mib=_mib(slices["rquant-live.slice"].get("MemoryCurrent")),
         live_peak_mib=_mib(slices["rquant-live.slice"].get("MemoryPeak")),
-        serving_current_mib=_mib(
-            slices["rquant-serving.slice"].get("MemoryCurrent")
-        ),
+        serving_current_mib=_mib(slices["rquant-serving.slice"].get("MemoryCurrent")),
         serving_peak_mib=_mib(slices["rquant-serving.slice"].get("MemoryPeak")),
-        maintenance_current_mib=_mib(
-            slices["rquant-maintenance.slice"].get("MemoryCurrent")
-        ),
-        maintenance_peak_mib=_mib(
-            slices["rquant-maintenance.slice"].get("MemoryPeak")
-        ),
-        os_system_slice_current_mib=_mib(
-            slices["system.slice"].get("MemoryCurrent")
-        ),
+        maintenance_current_mib=_mib(slices["rquant-maintenance.slice"].get("MemoryCurrent")),
+        maintenance_peak_mib=_mib(slices["rquant-maintenance.slice"].get("MemoryPeak")),
+        os_system_slice_current_mib=_mib(slices["system.slice"].get("MemoryCurrent")),
         os_system_slice_peak_mib=_mib(slices["system.slice"].get("MemoryPeak")),
         monitor=units["rquant-monitor.service"],
         backup=units["rquant-backup.service"],

@@ -43,9 +43,7 @@ DAILY_RECEIPT_ALLOWED_USER = "lighthouse"
 DAILY_RECEIPT_ALLOWED_GROUP = "lighthouse"
 DAILY_RECEIPT_NAMESPACE_STAGE = "rquant-daily-shadow-stage-completion-receipt"
 DAILY_RECEIPT_NAMESPACE_RUN = "rquant-daily-shadow-run-completion-receipt"
-DAILY_RECEIPT_NAMESPACES = frozenset(
-    {DAILY_RECEIPT_NAMESPACE_STAGE, DAILY_RECEIPT_NAMESPACE_RUN}
-)
+DAILY_RECEIPT_NAMESPACES = frozenset({DAILY_RECEIPT_NAMESPACE_STAGE, DAILY_RECEIPT_NAMESPACE_RUN})
 DAILY_RECEIPT_IDENTITY_PROTOCOL = "rquant-daily-receipt-authority.identity"
 DAILY_RECEIPT_IDENTITY_OPERATION = "identity"
 DAILY_RECEIPT_IDENTITY_VERSION = 1
@@ -81,9 +79,7 @@ class DailyReceiptSocketSigningResponse(RuntimeContractModel):
 class DailyReceiptSocketIdentityResponse(RuntimeContractModel):
     version: Literal[1] = 1
     operation: Literal["identity"] = "identity"
-    protocol: Literal["rquant-daily-receipt-authority.identity"] = (
-        DAILY_RECEIPT_IDENTITY_PROTOCOL
-    )
+    protocol: Literal["rquant-daily-receipt-authority.identity"] = DAILY_RECEIPT_IDENTITY_PROTOCOL
     nonce: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     key_id: str = Field(pattern=r"^[a-z0-9][a-z0-9_.-]{0,127}$")
@@ -111,10 +107,7 @@ class DailyReceiptSocketSigningClient:
         _test_endpoint: bool = False,
     ) -> None:
         normalized_socket = Path(os.path.abspath(socket_path))
-        if (
-            not _test_endpoint
-            and normalized_socket != DAILY_RECEIPT_SOCKET_ENDPOINT
-        ):
+        if not _test_endpoint and normalized_socket != DAILY_RECEIPT_SOCKET_ENDPOINT:
             raise ValueError("Daily receipt socket endpoint must be fixed")
         if not active_key_id or _KEY_ID.fullmatch(active_key_id) is None:
             raise ValueError("Daily receipt active key id is invalid")
@@ -124,8 +117,7 @@ class DailyReceiptSocketSigningClient:
         if active_key_id in previous:
             raise ValueError("Daily receipt active key cannot also be previous")
         if any(
-            _KEY_ID.fullmatch(key_id) is None or not public
-            for key_id, public in previous.items()
+            _KEY_ID.fullmatch(key_id) is None or not public for key_id, public in previous.items()
         ):
             raise ValueError("Daily receipt previous public keyring is invalid")
         if not 0.1 <= timeout_seconds <= 30:
@@ -657,13 +649,9 @@ def _load_keys(path: Path) -> tuple[int, str, str, Path, str, dict[str, str]]:
     if not private_key.is_absolute() or private_key != Path(os.path.abspath(private_key)):
         raise DailyReceiptSocketAuthorityError("Daily private key path is invalid")
     raw_previous = document["previous_public_keys"]
-    if generation == 1 and (
-        previous_manifest_hash != _GENESIS_MANIFEST_HASH or raw_previous
-    ):
+    if generation == 1 and (previous_manifest_hash != _GENESIS_MANIFEST_HASH or raw_previous):
         raise DailyReceiptSocketAuthorityError("Daily key manifest genesis binding is invalid")
-    if generation > 1 and (
-        previous_manifest_hash == _GENESIS_MANIFEST_HASH or not raw_previous
-    ):
+    if generation > 1 and (previous_manifest_hash == _GENESIS_MANIFEST_HASH or not raw_previous):
         raise DailyReceiptSocketAuthorityError("Daily key manifest rotation binding is invalid")
     previous: dict[str, str] = {}
     for key_id, public_key in raw_previous.items():
@@ -742,11 +730,7 @@ def load_daily_receipt_trusted_keyring(path: Path) -> DailyReceiptTrustedKeyring
         raise DailyReceiptSocketAuthorityError("Daily public keyring genesis binding is invalid")
     if generation > 1 and (previous_manifest_hash == _GENESIS_MANIFEST_HASH or not previous):
         raise DailyReceiptSocketAuthorityError("Daily public keyring rotation binding is invalid")
-    body = {
-        key: document[key]
-        for key in expected
-        if key not in {"manifest_hash", "signature"}
-    }
+    body = {key: document[key] for key in expected if key not in {"manifest_hash", "signature"}}
     expected_hash = hashlib.sha256(canonical_json_bytes(body)).hexdigest()
     if document["manifest_hash"] != expected_hash:
         raise DailyReceiptSocketAuthorityError("Daily public keyring manifest hash is invalid")
@@ -1029,18 +1013,14 @@ def _validate_inherited_listener(fd: int, *, expected_path: Path) -> socket.sock
             raise DailyReceiptSocketAuthorityError("Daily inherited fd is not an AF_UNIX socket")
         socket_type = listener.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE)
         if socket_type != socket.SOCK_STREAM:
-            raise DailyReceiptSocketAuthorityError(
-                "Daily inherited fd is not a SOCK_STREAM socket"
-            )
+            raise DailyReceiptSocketAuthorityError("Daily inherited fd is not a SOCK_STREAM socket")
         if hasattr(socket, "SO_ACCEPTCONN"):
             try:
                 accepting = listener.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN)
             except OSError:
                 accepting = 0
             if accepting != 1:
-                raise DailyReceiptSocketAuthorityError(
-                    "Daily inherited socket is not listening"
-                )
+                raise DailyReceiptSocketAuthorityError("Daily inherited socket is not listening")
         bound = listener.getsockname()
         if isinstance(bound, bytes):
             bound = bound.decode("utf-8", errors="strict")

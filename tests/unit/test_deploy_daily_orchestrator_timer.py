@@ -24,10 +24,7 @@ def test_accept_enables_exact_daily_orchestrator_instance_on_same_head(
 
     assert result.returncode == 0, result.stdout + result.stderr
     call_lines = calls.read_text(encoding="utf-8").splitlines()
-    assert (
-        "sudo systemctl enable rquant-runtime-daily-orchestrator@svc-shadow.timer"
-        in call_lines
-    )
+    assert "sudo systemctl enable rquant-runtime-daily-orchestrator@svc-shadow.timer" in call_lines
     assert not _contains_call(call_lines, "systemctl start")
     assert not _contains_call(call_lines, "systemctl restart")
     assert _contains_call(
@@ -86,10 +83,7 @@ def test_accept_changed_daily_orchestrator_template_validates_exact_inactive_ins
 
     assert result.returncode == 0, result.stdout + result.stderr
     call_lines = calls.read_text(encoding="utf-8").splitlines()
-    assert (
-        "sudo systemctl enable rquant-runtime-daily-orchestrator@svc-shadow.timer"
-        in call_lines
-    )
+    assert "sudo systemctl enable rquant-runtime-daily-orchestrator@svc-shadow.timer" in call_lines
     assert not _contains_call(call_lines, "systemctl start")
     assert not _contains_call(call_lines, "systemctl restart")
     assert not _contains_call(
@@ -116,9 +110,7 @@ def test_accept_repeated_for_enabled_inactive_daily_orchestrator_does_not_restar
         changed_files="deploy/systemd/rquant-runtime-daily-orchestrator@.timer",
     )
     env["RQUANT_DAILY_ORCHESTRATOR_INSTANCE"] = "svc-shadow"
-    env["DEPLOY_TEST_ENABLED_UNIT"] = (
-        "rquant-runtime-daily-orchestrator@svc-shadow.timer"
-    )
+    env["DEPLOY_TEST_ENABLED_UNIT"] = "rquant-runtime-daily-orchestrator@svc-shadow.timer"
 
     result = subprocess.run(
         ["/bin/bash", str(script), "--accept-daily-orchestrator-timer"],
@@ -130,10 +122,7 @@ def test_accept_repeated_for_enabled_inactive_daily_orchestrator_does_not_restar
 
     assert result.returncode == 0, result.stdout + result.stderr
     call_lines = calls.read_text(encoding="utf-8").splitlines()
-    assert (
-        "sudo systemctl enable rquant-runtime-daily-orchestrator@svc-shadow.timer"
-        in call_lines
-    )
+    assert "sudo systemctl enable rquant-runtime-daily-orchestrator@svc-shadow.timer" in call_lines
     assert not _contains_call(call_lines, "systemctl start")
     assert not _contains_call(call_lines, "systemctl restart")
     assert not _contains_call(call_lines, "NextElapseUSecRealtime")
@@ -239,10 +228,7 @@ def test_start_daily_orchestrator_timer_starts_exact_instance_without_enable(
 
     assert result.returncode == 0, result.stdout + result.stderr
     call_lines = calls.read_text(encoding="utf-8").splitlines()
-    assert (
-        "sudo systemctl start rquant-runtime-daily-orchestrator@svc-shadow.timer"
-        in call_lines
-    )
+    assert "sudo systemctl start rquant-runtime-daily-orchestrator@svc-shadow.timer" in call_lines
     assert not _contains_call(call_lines, "systemctl enable")
     assert _contains_call(
         call_lines,

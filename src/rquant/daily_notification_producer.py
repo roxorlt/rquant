@@ -105,11 +105,10 @@ class DailyNotificationProducer:
         received_at: datetime,
     ) -> DailyNotificationOutboxReceipt:
         receipt = self._signal_bus.ingest(signal, received_at=received_at)
-        if (
-            receipt.signal_id != signal.signal_id
-            or receipt.disposition
-            not in {RouterDisposition.ACCEPTED, RouterDisposition.DUPLICATE}
-        ):
+        if receipt.signal_id != signal.signal_id or receipt.disposition not in {
+            RouterDisposition.ACCEPTED,
+            RouterDisposition.DUPLICATE,
+        }:
             raise DailyNotificationProducerError(
                 "daily notification signal ingest rejected; refusing to route"
             )

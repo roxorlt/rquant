@@ -649,9 +649,7 @@ class DailyPipelineOrchestratorSettings(RuntimeContractModel):
     def validate_previous_receipt_keys(cls, value: Mapping[str, str]) -> dict[str, str]:
         previous = dict(sorted(value.items()))
         if any(
-            not public_key
-            or not key_id
-            or any(character.isspace() for character in key_id)
+            not public_key or not key_id or any(character.isspace() for character in key_id)
             for key_id, public_key in previous.items()
         ):
             raise ValueError("daily receipt previous public keyring is invalid")
@@ -726,9 +724,7 @@ def _reject_privileged_signer_command(command: tuple[str, ...]) -> None:
 
     if Path(command[0]).name.lower() in _PRIVILEGE_ESCALATING_EXECUTABLES:
         raise ValueError("daily receipt signer command must not escalate privilege")
-    if any(
-        Path(argument).name == _PRODUCTION_DAILY_SIGNER_HELPER_NAME for argument in command
-    ):
+    if any(Path(argument).name == _PRODUCTION_DAILY_SIGNER_HELPER_NAME for argument in command):
         raise ValueError(
             "daily receipt signer command must not select the production signer helper"
         )
@@ -945,9 +941,7 @@ def daily_shadow_stage_receipt_signer(
                     socket_path=verified.receipt_signer_socket_endpoint,
                     active_key_id=verified.receipt_active_key_id,
                     active_public_key_pem=verified.receipt_active_public_key_pem,
-                    previous_public_key_pems=dict(
-                        verified.receipt_previous_public_key_pems
-                    ),
+                    previous_public_key_pems=dict(verified.receipt_previous_public_key_pems),
                     timeout_seconds=verified.receipt_signer_timeout_seconds,
                 ),
             )
@@ -2425,9 +2419,7 @@ def _command_manifest_payload(
         "contract": "daily-shadow-command-manifest/v1",
         "mode": settings.mode,
         "storage_profile": storage_profile.model_dump(mode="json"),
-        "stages": [
-            command.model_dump(mode="json") for command in settings.stage_commands
-        ],
+        "stages": [command.model_dump(mode="json") for command in settings.stage_commands],
     }
 
 
@@ -2578,9 +2570,7 @@ def daily_pipeline_orchestrator_builder(
                         storage_profile=storage,
                         command_manifest_hash=command_manifest_hash,
                         receipt_keyring=receipt_keyring,
-                        receipt_signer_command=(
-                            settings.offline_test_receipt_signer_command or ()
-                        ),
+                        receipt_signer_command=(settings.offline_test_receipt_signer_command or ()),
                         receipt_signer_socket_endpoint=settings.receipt_signer_socket_endpoint,
                         receipt_trusted_keyring_path=settings.receipt_trusted_keyring_path,
                         receipt_signer_key_id=settings.receipt_active_key_id,
@@ -2655,7 +2645,7 @@ def daily_pipeline_orchestrator_builder(
                     "daily_pipeline_namespace": str(storage.namespace_id),
                     "daily_pipeline_command_manifest": command_manifest_hash,
                     "daily_pipeline_completion_receipt": run_completion_receipt.receipt_id,
-                }
+                },
             )
 
         return step

@@ -124,9 +124,7 @@ def test_crashed_research_releases_kernel_lock(tmp_path: Path) -> None:
     )
 
     assert maintenance.returncode == 0
-    assert list(
-        (tmp_path / "run/rquant-workload-isolation/research-pids").iterdir()
-    ) == []
+    assert list((tmp_path / "run/rquant-workload-isolation/research-pids").iterdir()) == []
 
 
 def test_registry_binds_pid_starttime_and_boot_id(tmp_path: Path) -> None:
@@ -156,11 +154,14 @@ def test_registry_binds_pid_starttime_and_boot_id(tmp_path: Path) -> None:
 def test_pid_reuse_collision_is_reaped_without_signalling_live_process(
     tmp_path: Path,
 ) -> None:
-    assert subprocess.run(
-        _command(tmp_path, "maintenance", "raise SystemExit(0)"),
-        check=False,
-        timeout=2,
-    ).returncode == 0
+    assert (
+        subprocess.run(
+            _command(tmp_path, "maintenance", "raise SystemExit(0)"),
+            check=False,
+            timeout=2,
+        ).returncode
+        == 0
+    )
     lock_root = tmp_path / "run/rquant-workload-isolation"
     identities = lock_root / "process-identities"
     identity = {

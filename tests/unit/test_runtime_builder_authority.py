@@ -248,9 +248,9 @@ def test_lab_jobs_builder_publishes_from_research_owned_ledger(tmp_path: Path) -
         stale_after_seconds=90,
         producer_commit=COMMIT,
         settings={
-                "lab_jobs_path": str(ledger_path),
-                "research_metadata_path": str(metadata_path),
-                "authority_root": str(authority_root),
+            "lab_jobs_path": str(ledger_path),
+            "research_metadata_path": str(metadata_path),
+            "authority_root": str(authority_root),
             "max_jobs": 10,
         },
     )

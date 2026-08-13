@@ -50,10 +50,7 @@ def test_round_trip_cost_formula_uses_multiplicative_gross_factor() -> None:
     costs = _costs(commission="10", stamp="5", transfer="1", slippage="2")
     actual = apply_round_trip_execution_costs(pd.DataFrame([{"ret_pct": 10.0}]), costs)
     expected = (
-        Decimal("1.1")
-        * (1 - Decimal("18") / 10_000)
-        / (1 + Decimal("13") / 10_000)
-        - 1
+        Decimal("1.1") * (1 - Decimal("18") / 10_000) / (1 + Decimal("13") / 10_000) - 1
     ) * 100
 
     assert actual.loc[0, "ret_pct"] == pytest.approx(float(expected))

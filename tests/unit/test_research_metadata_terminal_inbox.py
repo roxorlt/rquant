@@ -95,14 +95,20 @@ def test_typed_metadata_inbox_replays_terminal_facts_once_after_restart(tmp_path
     claimed = inbox.claim_next(limit=1)
     assert len(claimed) == 1
     assert claimed[0].command_id in {audit.command_id, snapshot.command_id}
-    assert ResearchMetadataTerminalCommandProcessor(
-        inbox=ResearchMetadataTerminalInbox(tmp_path / "metadata-inbox"),
-        database_path=database,
-    ).run_once() == 2
-    assert ResearchMetadataTerminalCommandProcessor(
-        inbox=ResearchMetadataTerminalInbox(tmp_path / "metadata-inbox"),
-        database_path=database,
-    ).run_once() == 0
+    assert (
+        ResearchMetadataTerminalCommandProcessor(
+            inbox=ResearchMetadataTerminalInbox(tmp_path / "metadata-inbox"),
+            database_path=database,
+        ).run_once()
+        == 2
+    )
+    assert (
+        ResearchMetadataTerminalCommandProcessor(
+            inbox=ResearchMetadataTerminalInbox(tmp_path / "metadata-inbox"),
+            database_path=database,
+        ).run_once()
+        == 0
+    )
 
     with DuckDBStore(database, read_only=True) as store:
         assert store.get_data_audit_run(audit.audit_run.audit_run_id).status == "completed"  # type: ignore[union-attr]

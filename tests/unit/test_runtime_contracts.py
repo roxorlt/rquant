@@ -60,12 +60,8 @@ def test_canonical_sha256_is_stable_for_key_order_and_equivalent_timezones() -> 
 def test_canonical_sha256_encodes_uuid_with_an_explicit_type_marker() -> None:
     value = UUID("12345678-1234-5678-1234-567812345678")
 
-    assert canonical_sha256({"job_id": value}) == canonical_sha256(
-        {"job_id": UUID(str(value))}
-    )
-    assert canonical_sha256({"job_id": value}) != canonical_sha256(
-        {"job_id": str(value)}
-    )
+    assert canonical_sha256({"job_id": value}) == canonical_sha256({"job_id": UUID(str(value))})
+    assert canonical_sha256({"job_id": value}) != canonical_sha256({"job_id": str(value)})
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])

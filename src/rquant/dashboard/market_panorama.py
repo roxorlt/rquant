@@ -230,7 +230,6 @@ def cached_pulse_alerts(generation_id: str, day_key: str, _store: Any) -> pd.Dat
     return load_pulse_alerts(date.fromisoformat(day_key), store=_store)
 
 
-
 # ── 数据整形 helpers ──────────────────────────────────────────────────────────
 
 

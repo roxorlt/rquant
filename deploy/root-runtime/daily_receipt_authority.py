@@ -430,9 +430,7 @@ def _signature_envelope(
     }
 
 
-def _identity_envelope(
-    *, nonce: str, source_sha256: str, key_id: str
-) -> dict[str, object]:
+def _identity_envelope(*, nonce: str, source_sha256: str, key_id: str) -> dict[str, object]:
     if (
         SHA256.fullmatch(nonce) is None
         or SHA256.fullmatch(source_sha256) is None
@@ -472,9 +470,7 @@ class Authority:
             )
         request = _decode_request(payload)
         key_id, private_key = _load_active_key()
-        canonical_payload = base64.b64decode(
-            str(request["canonical_payload"]), validate=True
-        )
+        canonical_payload = base64.b64decode(str(request["canonical_payload"]), validate=True)
         envelope = _signature_envelope(
             namespace=str(request["namespace"]),
             nonce=str(request["nonce"]),
@@ -549,9 +545,7 @@ def _serve_one(
                 with suppress(OSError, TimeoutError, AuthorityError):
                     _write_frame(
                         connection,
-                        canonical_json_bytes(
-                            {"ok": False, "error": _safe_error(exc)}
-                        ),
+                        canonical_json_bytes({"ok": False, "error": _safe_error(exc)}),
                     )
     finally:
         slots.release()

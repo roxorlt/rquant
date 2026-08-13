@@ -36,13 +36,14 @@ from rquant.workload_isolation import (
 @dataclass
 class ServiceSnapshot:
     """单个 systemd unit 今天的状态摘要。"""
+
     unit: str
-    active_state: str            # active | inactive | failed | activating | ...
-    sub_state: str               # running | dead | exited | failed | ...
-    start_today: datetime | None # 今天的 ExecMainStart（不是今天的就 None）
+    active_state: str  # active | inactive | failed | activating | ...
+    sub_state: str  # running | dead | exited | failed | ...
+    start_today: datetime | None  # 今天的 ExecMainStart（不是今天的就 None）
     exit_today: datetime | None  # 今天的 ExecMainExit（不是今天的就 None）
-    exit_status: int | None      # 今天的 ExecMainStatus（数字）
-    duration_sec: int | None     # exit - start 秒数（如有）
+    exit_status: int | None  # 今天的 ExecMainStatus（数字）
+    duration_sec: int | None  # exit - start 秒数（如有）
 
 
 @dataclass(frozen=True)
@@ -84,22 +85,29 @@ def get_service_snapshot(unit: str, today: date | None = None) -> ServiceSnapsho
     try:
         result = subprocess.run(
             [
-                "systemctl", "show", unit,
+                "systemctl",
+                "show",
+                unit,
                 "--property=ActiveState,SubState,ExecMainStartTimestamp,"
                 "ExecMainExitTimestamp,ExecMainStatus",
             ],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         props = dict(
-            line.split("=", 1) for line in result.stdout.strip().split("\n")
-            if "=" in line
+            line.split("=", 1) for line in result.stdout.strip().split("\n") if "=" in line
         )
     except Exception as e:
         logger.error(f"systemctl show {unit} 失败: {e}")
         return ServiceSnapshot(
-            unit=unit, active_state="unknown", sub_state="",
-            start_today=None, exit_today=None,
-            exit_status=None, duration_sec=None,
+            unit=unit,
+            active_state="unknown",
+            sub_state="",
+            start_today=None,
+            exit_today=None,
+            exit_status=None,
+            duration_sec=None,
         )
 
     start = _parse_systemd_ts(props.get("ExecMainStartTimestamp", ""))
@@ -165,9 +173,7 @@ def get_workload_isolation_snapshot() -> WorkloadIsolationSnapshot:
         try:
             checks.append(probe())
         except (OSError, subprocess.TimeoutExpired) as exc:
-            checks.append(
-                WorkloadCheck(name, "fail", f"{type(exc).__name__}: {str(exc)[:160]}")
-            )
+            checks.append(WorkloadCheck(name, "fail", f"{type(exc).__name__}: {str(exc)[:160]}"))
     statuses = {check.status for check in checks}
     if "fail" in statuses:
         status = "fail"
@@ -175,9 +181,7 @@ def get_workload_isolation_snapshot() -> WorkloadIsolationSnapshot:
         status = "warn"
     else:
         status = "ok"
-    detail = "; ".join(
-        f"{check.status}: {check.summary}" for check in checks
-    )
+    detail = "; ".join(f"{check.status}: {check.summary}" for check in checks)
     return WorkloadIsolationSnapshot(status=status, detail=detail)
 
 
@@ -303,9 +307,7 @@ def build_daily_report(
                     f"{_fmt_time(monitor.exit_today)} 跑足 {_fmt_duration(dur)}（含跨午休）"
                 )
             else:
-                lines.append(
-                    f"⚠️ monitor: 时长仅 {_fmt_duration(dur)}，疑似跨午休 bug 复发"
-                )
+                lines.append(f"⚠️ monitor: 时长仅 {_fmt_duration(dur)}，疑似跨午休 bug 复发")
         elif monitor.start_today and not monitor.exit_today:
             lines.append(
                 f"⏳ monitor: {_fmt_time(monitor.start_today)} 启动后仍 "
@@ -338,8 +340,7 @@ def build_daily_report(
             )
     elif alert_n == 0:
         lines.append(
-            f"✅ watchdog: 交易时段 {in_window_total} 次"
-            f"（active={active_n} skip={skip_n}），无告警"
+            f"✅ watchdog: 交易时段 {in_window_total} 次（active={active_n} skip={skip_n}），无告警"
         )
     else:
         lines.append(
@@ -375,10 +376,7 @@ def build_daily_report(
     # === 业务数据 ===
     pl = business.get("price_level_events", 0)
     if is_trading_day_flag:
-        lines.append(
-            f"📈 业务: price_level 触发 {pl} 条 · "
-            f"pool1 待筛选(17:00 后) · pool2 待筛选"
-        )
+        lines.append(f"📈 业务: price_level 触发 {pl} 条 · pool1 待筛选(17:00 后) · pool2 待筛选")
     else:
         lines.append("📈 业务: 非交易日，无业务数据更新")
 
@@ -444,7 +442,12 @@ def generate_and_send_daily_report(
         business = count_today_business_data(store, today)
 
     subject, body = build_daily_report(
-        today, trading_day, monitor_snap, daily_snap, watchdog_counts, business,
+        today,
+        trading_day,
+        monitor_snap,
+        daily_snap,
+        watchdog_counts,
+        business,
         authority_identity=authority_identity,
         workload_isolation=workload_isolation,
     )
@@ -455,8 +458,7 @@ def generate_and_send_daily_report(
         lines = ["", "## ⚠️ 今日未送达告警（推送失败已落盘兜底）"]
         for f in alert_fails:
             lines.append(
-                f"- {f.get('failed_at', '?')} `{f.get('unit', '?')}` "
-                f"— {f.get('subject', '')}"
+                f"- {f.get('failed_at', '?')} `{f.get('unit', '?')}` — {f.get('subject', '')}"
             )
         body += "\n" + "\n".join(lines)
 

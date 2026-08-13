@@ -51,8 +51,16 @@ from rquant.surge_watch import (
 )
 
 CST = timezone(timedelta(hours=8))
-_SNAP_COLS = ["ts_code", "name", "price", "pre_close", "pct_chg", "volume", "amount",
-              "limit_up_price"]
+_SNAP_COLS = [
+    "ts_code",
+    "name",
+    "price",
+    "pre_close",
+    "pct_chg",
+    "volume",
+    "amount",
+    "limit_up_price",
+]
 
 
 def mk_snap(rows: list[dict]) -> pd.DataFrame:
@@ -74,9 +82,12 @@ def flat_curve() -> np.ndarray:
 
 
 def mk_baseline(
-    avg20: dict[str, float], *, curve: np.ndarray | None = None,
+    avg20: dict[str, float],
+    *,
+    curve: np.ndarray | None = None,
     theme: dict[str, str] | None = None,
-    code_universe: list[str] | None = None, name_map: dict[str, str] | None = None,
+    code_universe: list[str] | None = None,
+    name_map: dict[str, str] | None = None,
     pre_close: dict[str, float] | None = None,
 ) -> SurgeBaseline:
     return SurgeBaseline(
@@ -107,8 +118,9 @@ def mk_rt_min(rows: list[dict]) -> pd.DataFrame:
     return df
 
 
-def mk_rt_min_daily(amounts: list[float], *, start: dt_time = dt_time(9, 30),
-                    ts_code: str = "300001.SZ") -> pd.DataFrame:
+def mk_rt_min_daily(
+    amounts: list[float], *, start: dt_time = dt_time(9, 30), ts_code: str = "300001.SZ"
+) -> pd.DataFrame:
     """构造 rt_min_daily 当日全序列（当分钟量），从 start 起每分钟一根。"""
     day = date(2026, 7, 6)
     rows = []
@@ -125,7 +137,7 @@ def mk_minute_bars(
     rows: list[dict] = []
     for d, amts in day_amounts.items():
         for i, a in enumerate(amts):
-            t = (datetime.combine(d, start) + timedelta(minutes=i))
+            t = datetime.combine(d, start) + timedelta(minutes=i)
             rows.append({"ts_code": "X", "trade_time": t, "amount": float(a)})
     return pd.DataFrame(rows, columns=["ts_code", "trade_time", "amount"])
 
@@ -152,9 +164,9 @@ class TestU1Curve:
         p.write_text(json.dumps({"points": pts}), encoding="utf-8")
         c = load_progress_curve(p)
         assert len(c) == CURVE_POINTS
-        assert (np.diff(c) >= -1e-9).all()      # 单调不减
-        assert c[0] < 0.2 and c[0] >= 0          # 首≈0
-        assert abs(c[-1] - 1.0) < 1e-9           # 尾=1
+        assert (np.diff(c) >= -1e-9).all()  # 单调不减
+        assert c[0] < 0.2 and c[0] >= 0  # 首≈0
+        assert abs(c[-1] - 1.0) < 1e-9  # 尾=1
 
     def test_missing_file_falls_back_linear_with_warning(self, tmp_path: Path, caplog) -> None:
         c = load_progress_curve(tmp_path / "nope.json")
@@ -174,12 +186,12 @@ class TestU1Curve:
 
     def test_grid_index_boundaries(self) -> None:
         assert grid_index(dt_time(9, 30)) == 0
-        assert grid_index(dt_time(9, 0)) == 0        # 盘前钳制
+        assert grid_index(dt_time(9, 0)) == 0  # 盘前钳制
         assert grid_index(dt_time(11, 30)) == 120
-        assert grid_index(dt_time(12, 0)) == 120     # 午休并入上午末点
+        assert grid_index(dt_time(12, 0)) == 120  # 午休并入上午末点
         assert grid_index(dt_time(13, 1)) == 121
         assert grid_index(dt_time(15, 0)) == 240
-        assert grid_index(dt_time(15, 30)) == 240    # 收盘后钳制
+        assert grid_index(dt_time(15, 30)) == 240  # 收盘后钳制
 
 
 # ── U2 粗筛 ─────────────────────────────────────────────────────────────────────
@@ -195,31 +207,82 @@ class TestU2Rough:
     def test_threshold_exact_boundary_passes(self) -> None:
         base, cfg, gi = self._base()
         thr = cfg.k_rough * 1e8 * float(base.curve[gi])
-        snap = mk_snap([{"ts_code": "300001.SZ", "price": 11, "pre_close": 10,
-                         "pct_chg": 5, "volume": 1e6, "amount": thr}])
+        snap = mk_snap(
+            [
+                {
+                    "ts_code": "300001.SZ",
+                    "price": 11,
+                    "pre_close": 10,
+                    "pct_chg": 5,
+                    "volume": 1e6,
+                    "amount": thr,
+                }
+            ]
+        )
         assert _rough_candidates(snap, base, cfg, gi) == ["300001.SZ"]
-        snap2 = mk_snap([{"ts_code": "300001.SZ", "price": 11, "pre_close": 10,
-                          "pct_chg": 5, "volume": 1e6, "amount": thr - 1}])
+        snap2 = mk_snap(
+            [
+                {
+                    "ts_code": "300001.SZ",
+                    "price": 11,
+                    "pre_close": 10,
+                    "pct_chg": 5,
+                    "volume": 1e6,
+                    "amount": thr - 1,
+                }
+            ]
+        )
         assert _rough_candidates(snap2, base, cfg, gi) == []
 
     def test_st_excluded(self) -> None:
         base, cfg, gi = self._base()
         thr = cfg.k_rough * 1e8 * float(base.curve[gi])
-        snap = mk_snap([{"ts_code": "300001.SZ", "name": "ST科", "price": 11, "pre_close": 10,
-                         "pct_chg": 5, "volume": 1e6, "amount": thr * 3}])
+        snap = mk_snap(
+            [
+                {
+                    "ts_code": "300001.SZ",
+                    "name": "ST科",
+                    "price": 11,
+                    "pre_close": 10,
+                    "pct_chg": 5,
+                    "volume": 1e6,
+                    "amount": thr * 3,
+                }
+            ]
+        )
         assert _rough_candidates(snap, base, cfg, gi) == []
 
     def test_pct_chg_non_positive_excluded(self) -> None:
         base, cfg, gi = self._base()
         thr = cfg.k_rough * 1e8 * float(base.curve[gi])
-        snap = mk_snap([{"ts_code": "300001.SZ", "price": 9, "pre_close": 10,
-                         "pct_chg": -1, "volume": 1e6, "amount": thr * 3}])
+        snap = mk_snap(
+            [
+                {
+                    "ts_code": "300001.SZ",
+                    "price": 9,
+                    "pre_close": 10,
+                    "pct_chg": -1,
+                    "volume": 1e6,
+                    "amount": thr * 3,
+                }
+            ]
+        )
         assert _rough_candidates(snap, base, cfg, gi) == []
 
     def test_missing_baseline_skipped(self) -> None:
         base, cfg, gi = self._base()  # avg20 只有 300001
-        snap = mk_snap([{"ts_code": "301999.SZ", "price": 11, "pre_close": 10,
-                         "pct_chg": 5, "volume": 1e6, "amount": 9e9}])
+        snap = mk_snap(
+            [
+                {
+                    "ts_code": "301999.SZ",
+                    "price": 11,
+                    "pre_close": 10,
+                    "pct_chg": 5,
+                    "volume": 1e6,
+                    "amount": 9e9,
+                }
+            ]
+        )
         assert _rough_candidates(snap, base, cfg, gi) == []
 
     def test_yuan_vs_thousand_yuan_trap(self) -> None:
@@ -230,23 +293,43 @@ class TestU2Rough:
         """
         cfg = SurgeConfig()
         gi = grid_index(dt_time(11, 0))
-        base_yuan = mk_baseline({"300001.SZ": 1e8})       # 正确：1 亿元 → 高阈值
-        base_thousand = mk_baseline({"300001.SZ": 1e5})   # 错误：当千元用 → 阈值 1000× 偏小
+        base_yuan = mk_baseline({"300001.SZ": 1e8})  # 正确：1 亿元 → 高阈值
+        base_thousand = mk_baseline({"300001.SZ": 1e5})  # 错误：当千元用 → 阈值 1000× 偏小
         # 当日额压在元口径阈值之下（对 k_rough 放松鲁棒）：thousand 口径阈值小 1000×，误放行
         amount = cfg.k_rough * 1e8 * float(base_yuan.curve[gi]) * 0.9
-        snap = mk_snap([{"ts_code": "300001.SZ", "price": 11, "pre_close": 10,
-                         "pct_chg": 5, "volume": 1e6, "amount": amount}])
+        snap = mk_snap(
+            [
+                {
+                    "ts_code": "300001.SZ",
+                    "price": 11,
+                    "pre_close": 10,
+                    "pct_chg": 5,
+                    "volume": 1e6,
+                    "amount": amount,
+                }
+            ]
+        )
         assert _rough_candidates(snap, base_yuan, cfg, gi) == []
         assert _rough_candidates(snap, base_thousand, cfg, gi) == ["300001.SZ"]
 
     def test_relaxed_rough_admits_earlier_candidate(self) -> None:
         """粗筛放松 1.5→1.2：卡在 [1.2×,1.5×) 阈值带的当日额，v3 放行早入确认池，旧值挡下。"""
         base, _cfg, gi = self._base()
-        amount = 1.35 * 1e8 * float(base.curve[gi])   # 300001 avg20=1e8，量在两阈值之间
-        snap = mk_snap([{"ts_code": "300001.SZ", "price": 11, "pre_close": 10,
-                         "pct_chg": 5, "volume": 1e6, "amount": amount}])
-        assert _rough_candidates(snap, base, SurgeConfig(), gi) == ["300001.SZ"]   # v3 1.2 放行
-        assert _rough_candidates(snap, base, SurgeConfig(k_rough=1.5), gi) == []   # 旧 1.5 挡下
+        amount = 1.35 * 1e8 * float(base.curve[gi])  # 300001 avg20=1e8，量在两阈值之间
+        snap = mk_snap(
+            [
+                {
+                    "ts_code": "300001.SZ",
+                    "price": 11,
+                    "pre_close": 10,
+                    "pct_chg": 5,
+                    "volume": 1e6,
+                    "amount": amount,
+                }
+            ]
+        )
+        assert _rough_candidates(snap, base, SurgeConfig(), gi) == ["300001.SZ"]  # v3 1.2 放行
+        assert _rough_candidates(snap, base, SurgeConfig(k_rough=1.5), gi) == []  # 旧 1.5 挡下
 
 
 # ── U3 分钟序列 ─────────────────────────────────────────────────────────────────
@@ -260,8 +343,8 @@ class TestU3MinuteSeries:
         w._update_cum_series(mk_snap([{"ts_code": "300001.SZ", "amount": 260}]), 1)
         arr = w.cum_series["300001.SZ"]
         assert arr[0] == 100 and arr[1] == 260
-        assert _minute_delta(arr, 1) == 160          # 本分钟增量
-        assert _minute_delta(arr, 0) == 100          # 首格无前值 → 本身
+        assert _minute_delta(arr, 1) == 160  # 本分钟增量
+        assert _minute_delta(arr, 0) == 100  # 首格无前值 → 本身
 
     def test_snapshot_miss_leaves_nan_then_recovers(self) -> None:
         base = mk_baseline({})
@@ -272,7 +355,7 @@ class TestU3MinuteSeries:
         w._update_cum_series(mk_snap([{"ts_code": "300001.SZ", "amount": 300}]), 2)
         arr = w.cum_series["300001.SZ"]
         assert np.isnan(arr[1])
-        assert _minute_delta(arr, 2) == 200          # 跳过 NaN 取到 idx0=100
+        assert _minute_delta(arr, 2) == 200  # 跳过 NaN 取到 idx0=100
 
 
 # ── U4 确认层 ───────────────────────────────────────────────────────────────────
@@ -284,11 +367,13 @@ class TestU4Confirm:
 
     def _three_day_bars(self) -> pd.DataFrame:
         d = self._today()
-        return mk_minute_bars({
-            d - timedelta(days=1): [300, 300, 300],
-            d - timedelta(days=2): [200, 200, 200],
-            d - timedelta(days=3): [100, 100, 100],
-        })
+        return mk_minute_bars(
+            {
+                d - timedelta(days=1): [300, 300, 300],
+                d - timedelta(days=2): [200, 200, 200],
+                d - timedelta(days=3): [100, 100, 100],
+            }
+        )
 
     def test_three_day_median_construction(self) -> None:
         base = build_three_day_baseline(self._three_day_bars(), self._today(), 3)
@@ -297,7 +382,7 @@ class TestU4Confirm:
         assert base.cum_median[0] == 200
         assert base.cum_median[1] == 400
         assert base.cum_median[2] == 600
-        assert base.minute_median[0] == 200          # 同分钟增量中位
+        assert base.minute_median[0] == 200  # 同分钟增量中位
 
     def _confirm_watcher(self, **cfg_kw) -> tuple[SurgeWatcher, pd.DataFrame, datetime, int]:
         """gi=2（09:32，skip_first_minutes=1 后首个可确认格），cum_median[2]=600。"""
@@ -314,32 +399,72 @@ class TestU4Confirm:
     def test_pure_cum_lower_boundary(self) -> None:
         """纯累计下门 k_cum=2.5：rel 恰好 2.5（amount=1500）→ 确认；1499→2.498<2.5→拒。"""
         w, _bars, now, gi = self._confirm_watcher()
-        snap = mk_snap([{"ts_code": "300001.SZ", "price": 1.0, "pre_close": 0.9,
-                         "pct_chg": 5, "volume": 1e6, "amount": 1500}])
+        snap = mk_snap(
+            [
+                {
+                    "ts_code": "300001.SZ",
+                    "price": 1.0,
+                    "pre_close": 0.9,
+                    "pct_chg": 5,
+                    "volume": 1e6,
+                    "amount": 1500,
+                }
+            ]
+        )
         w._evaluate("300001.SZ", snap, now, gi)
         assert "300001.SZ" in w.pushed_today
         assert w._pending_push[0].rel_cum == 2.5
 
     def test_pure_cum_below_lower_rejected(self) -> None:
         w, _bars, now, gi = self._confirm_watcher()
-        snap = mk_snap([{"ts_code": "300001.SZ", "price": 1.0, "pre_close": 0.9,
-                         "pct_chg": 5, "volume": 1e6, "amount": 1499}])   # rel 2.498 < 2.5
+        snap = mk_snap(
+            [
+                {
+                    "ts_code": "300001.SZ",
+                    "price": 1.0,
+                    "pre_close": 0.9,
+                    "pct_chg": 5,
+                    "volume": 1e6,
+                    "amount": 1499,
+                }
+            ]
+        )  # rel 2.498 < 2.5
         w._evaluate("300001.SZ", snap, now, gi)
         assert "300001.SZ" not in w.pushed_today
 
     def test_confirmation_rechecks_current_price_is_above_previous_close(self) -> None:
         """候选排队后转跌时，确认层必须重新检查当前涨幅，不能沿用粗筛时状态。"""
         w, _bars, now, gi = self._confirm_watcher()
-        snap = mk_snap([{"ts_code": "300001.SZ", "price": 0.89, "pre_close": 0.9,
-                         "pct_chg": -1.11, "volume": 1e6, "amount": 1500}])
+        snap = mk_snap(
+            [
+                {
+                    "ts_code": "300001.SZ",
+                    "price": 0.89,
+                    "pre_close": 0.9,
+                    "pct_chg": -1.11,
+                    "volume": 1e6,
+                    "amount": 1500,
+                }
+            ]
+        )
         w._evaluate("300001.SZ", snap, now, gi)
         assert "300001.SZ" not in w.pushed_today
 
     def test_ratio_cap_upper_boundary(self) -> None:
         """毒尾封顶 ratio_cap=8.0：rel 恰好 8.0（amount=4800）→ 确认（含上界）。"""
         w, _bars, now, gi = self._confirm_watcher()
-        snap = mk_snap([{"ts_code": "300001.SZ", "price": 1.0, "pre_close": 0.9,
-                         "pct_chg": 5, "volume": 1e6, "amount": 4800}])
+        snap = mk_snap(
+            [
+                {
+                    "ts_code": "300001.SZ",
+                    "price": 1.0,
+                    "pre_close": 0.9,
+                    "pct_chg": 5,
+                    "volume": 1e6,
+                    "amount": 4800,
+                }
+            ]
+        )
         w._evaluate("300001.SZ", snap, now, gi)
         assert "300001.SZ" in w.pushed_today
         assert w._pending_push[0].rel_cum == 8.0
@@ -347,16 +472,36 @@ class TestU4Confirm:
     def test_ratio_cap_toxic_tail_rejected(self) -> None:
         """rel > ratio_cap 视为极端出货毒尾（放巨量往往出货）→ 不推。"""
         w, _bars, now, gi = self._confirm_watcher()
-        snap = mk_snap([{"ts_code": "300001.SZ", "price": 1.0, "pre_close": 0.9,
-                         "pct_chg": 5, "volume": 1e6, "amount": 4801}])   # rel 8.002 > 8.0
+        snap = mk_snap(
+            [
+                {
+                    "ts_code": "300001.SZ",
+                    "price": 1.0,
+                    "pre_close": 0.9,
+                    "pct_chg": 5,
+                    "volume": 1e6,
+                    "amount": 4801,
+                }
+            ]
+        )  # rel 8.002 > 8.0
         w._evaluate("300001.SZ", snap, now, gi)
         assert "300001.SZ" not in w.pushed_today
 
     def test_skip_first_minutes_blocks_before_eligible(self) -> None:
         """skip_first_minutes=1：9:30(gi0)/9:31(gi1) 恒不确认，即便 rel 已过下门。"""
         w, _bars, _now, _gi = self._confirm_watcher()
-        snap = mk_snap([{"ts_code": "300001.SZ", "price": 1.0, "pre_close": 0.9,
-                         "pct_chg": 5, "volume": 1e6, "amount": 4000}])   # rel≫2.5 于任意格
+        snap = mk_snap(
+            [
+                {
+                    "ts_code": "300001.SZ",
+                    "price": 1.0,
+                    "pre_close": 0.9,
+                    "pct_chg": 5,
+                    "volume": 1e6,
+                    "amount": 4000,
+                }
+            ]
+        )  # rel≫2.5 于任意格
         # 9:31（gi=1）被 skip 挡下，不确认
         w._evaluate("300001.SZ", snap, datetime(2026, 7, 6, 9, 31, tzinfo=CST), 1)
         assert "300001.SZ" not in w.pushed_today
@@ -368,8 +513,18 @@ class TestU4Confirm:
         """require_vwap=True 时才叠加 VWAP 门（v3 默认关）：price<vwap 则拒。"""
         # rel=4800/600=8.0 落带内，但 price 1.0 < vwap(amount/volume=4800/1000=4.8) → 拒
         w_on, _b, now, gi = self._confirm_watcher(require_vwap=True)
-        snap = mk_snap([{"ts_code": "300001.SZ", "price": 1.0, "pre_close": 0.9,
-                         "pct_chg": 5, "volume": 1000, "amount": 4800}])
+        snap = mk_snap(
+            [
+                {
+                    "ts_code": "300001.SZ",
+                    "price": 1.0,
+                    "pre_close": 0.9,
+                    "pct_chg": 5,
+                    "volume": 1000,
+                    "amount": 4800,
+                }
+            ]
+        )
         w_on._evaluate("300001.SZ", snap, now, gi)
         assert "300001.SZ" not in w_on.pushed_today
         # 默认关：同一 snap 不看 VWAP → 确认
@@ -381,9 +536,9 @@ class TestU4Confirm:
         """当日缓存命中不重拉（tushare spy 调用数）。"""
         calls: list[str] = []
         # 大基线：过 rough 但 rel<k_cum（cum 250k / N 日中位 300k = 0.83×）→ 不确认但已缓存
-        big_bars = mk_minute_bars({
-            self._today() - timedelta(days=i): [100000, 100000, 100000] for i in (1, 2, 3)
-        })
+        big_bars = mk_minute_bars(
+            {self._today() - timedelta(days=i): [100000, 100000, 100000] for i in (1, 2, 3)}
+        )
 
         def spy(code: str, d: date) -> pd.DataFrame:
             calls.append(code)
@@ -391,14 +546,24 @@ class TestU4Confirm:
 
         base = mk_baseline({"300001.SZ": 1e6}, curve=flat_curve())
         w = SurgeWatcher(base, config=SurgeConfig(), minute_fetcher=spy)
-        snap = mk_snap([{"ts_code": "300001.SZ", "price": 100.0, "pre_close": 90,
-                         "pct_chg": 5, "volume": 1e6, "amount": 250000}])
+        snap = mk_snap(
+            [
+                {
+                    "ts_code": "300001.SZ",
+                    "price": 100.0,
+                    "pre_close": 90,
+                    "pct_chg": 5,
+                    "volume": 1e6,
+                    "amount": 250000,
+                }
+            ]
+        )
         w.tick(snap, datetime(2026, 7, 6, 10, 0, tzinfo=CST))
         assert calls == ["300001.SZ"]
-        assert "300001.SZ" not in w.pushed_today      # rel<k_cum(2.5) 未确认
+        assert "300001.SZ" not in w.pushed_today  # rel<k_cum(2.5) 未确认
         # 下一分钟仍未确认，命中缓存不再拉
         w.tick(snap, datetime(2026, 7, 6, 10, 1, tzinfo=CST))
-        assert calls == ["300001.SZ"]                # 无第二次取数
+        assert calls == ["300001.SZ"]  # 无第二次取数
         assert "300001.SZ" in w.confirm_cache
 
 
@@ -420,24 +585,39 @@ class TestU5DedupSilentFold:
     def _snap_at(self, gi: int, bars: pd.DataFrame, rel: float = 4.0) -> pd.DataFrame:
         # amount = rel × N日同刻累计中位 → rel_cum 精确 = rel（落 [k_cum,ratio_cap]）
         amount = rel_amount(bars, gi, rel)
-        return mk_snap([{"ts_code": "300001.SZ", "price": 100.0, "pre_close": 90,
-                         "pct_chg": 5, "volume": 1e6, "amount": amount}])
+        return mk_snap(
+            [
+                {
+                    "ts_code": "300001.SZ",
+                    "price": 100.0,
+                    "pre_close": 90,
+                    "pct_chg": 5,
+                    "volume": 1e6,
+                    "amount": amount,
+                }
+            ]
+        )
 
     def test_once_per_day(self) -> None:
         w, bars = self._watcher()
-        snap = self._snap_at(30, bars)               # gi30=10:00，rel=4 落带内
+        snap = self._snap_at(30, bars)  # gi30=10:00，rel=4 落带内
         r1 = w.tick(snap, datetime(2026, 7, 6, 10, 0, tzinfo=CST))
         assert r1.confirmed and r1.confirmed[0].ts_code == "300001.SZ"
         r2 = w.tick(snap, datetime(2026, 7, 6, 10, 1, tzinfo=CST))
-        assert r2.confirmed == []                    # 每票每日仅推一次
+        assert r2.confirmed == []  # 每票每日仅推一次
 
     def test_previous_trading_day_push_does_not_block_today(self) -> None:
         w0, bars = self._watcher()
         day = date(2026, 7, 6)
         history = SurgePushHistory(
             as_of=day,
-            window_dates=(date(2026, 6, 30), date(2026, 7, 1), date(2026, 7, 2),
-                          date(2026, 7, 3), day),
+            window_dates=(
+                date(2026, 6, 30),
+                date(2026, 7, 1),
+                date(2026, 7, 2),
+                date(2026, 7, 3),
+                day,
+            ),
             push_dates_by_code={"300001.SZ": frozenset({date(2026, 7, 3)})},
         )
         w = SurgeWatcher(
@@ -481,12 +661,13 @@ class TestU5DedupSilentFold:
         # 默认 silent_until=09:31 已无静默窗，用显式 09:35 测「窗内收集、窗后 flush」机制
         bars = self._bars()
         base = mk_baseline({"300001.SZ": 1.0}, curve=flat_curve())
-        w = SurgeWatcher(base, config=SurgeConfig(silent_until_hhmm="09:35"),
-                         minute_fetcher=lambda c, dd: bars)
-        snap = self._snap_at(2, bars)                # gi2=9:32（skip=0 可确认）
+        w = SurgeWatcher(
+            base, config=SurgeConfig(silent_until_hhmm="09:35"), minute_fetcher=lambda c, dd: bars
+        )
+        snap = self._snap_at(2, bars)  # gi2=9:32（skip=0 可确认）
         r_silent = w.tick(snap, datetime(2026, 7, 6, 9, 32, tzinfo=CST))  # 9:35 前
         assert r_silent.pushes == [] and r_silent.confirmed == []
-        assert len(w._pending_push) == 1             # 收集不丢
+        assert len(w._pending_push) == 1  # 收集不丢
         r_flush = w.tick(mk_snap([]), datetime(2026, 7, 6, 9, 35, tzinfo=CST))
         assert r_flush.pushes and r_flush.confirmed[0].ts_code == "300001.SZ"
 
@@ -527,12 +708,23 @@ class TestU6RateLimit:
             mk_baseline(avg20, curve=flat_curve()), config=SurgeConfig(), minute_fetcher=spy
         )
         # amount 1e7 ≫ rough 阈值 → 全部入队（本例只验限频/FIFO，不看确认结果）
-        snap = mk_snap([{"ts_code": c, "price": 1.0, "pre_close": 0.9,
-                         "pct_chg": 5, "volume": 100, "amount": 1e7} for c in codes])
+        snap = mk_snap(
+            [
+                {
+                    "ts_code": c,
+                    "price": 1.0,
+                    "pre_close": 0.9,
+                    "pct_chg": 5,
+                    "volume": 100,
+                    "amount": 1e7,
+                }
+                for c in codes
+            ]
+        )
         for k in range(6):
             w.tick(snap, datetime(2026, 7, 6, 10, k, tzinfo=CST))
-            assert len(calls) == min(2 * (k + 1), 10)   # 每 tick 至多 2 次
-        assert calls == codes                            # FIFO 顺序
+            assert len(calls) == min(2 * (k + 1), 10)  # 每 tick 至多 2 次
+        assert calls == codes  # FIFO 顺序
 
     def test_failed_candidate_retries_without_blocking(self) -> None:
         state = {"fail_once": True}
@@ -545,19 +737,44 @@ class TestU6RateLimit:
             return bars
 
         codes = ["300000.SZ", "300001.SZ"]
-        w = SurgeWatcher(mk_baseline({c: 1e6 for c in codes}, curve=flat_curve()),
-                         config=SurgeConfig(), minute_fetcher=spy)
+        w = SurgeWatcher(
+            mk_baseline({c: 1e6 for c in codes}, curve=flat_curve()),
+            config=SurgeConfig(),
+            minute_fetcher=spy,
+        )
         # amount 使 rel_cum=4 落带内（gi30，cum_median[30]=3.1e6）→ 取数成功即确认
         amt0 = rel_amount(bars, 30, 4.0)
-        snap = mk_snap([{"ts_code": c, "price": 1.0, "pre_close": 0.9,
-                         "pct_chg": 5, "volume": 1e8, "amount": amt0} for c in codes])
+        snap = mk_snap(
+            [
+                {
+                    "ts_code": c,
+                    "price": 1.0,
+                    "pre_close": 0.9,
+                    "pct_chg": 5,
+                    "volume": 1e8,
+                    "amount": amt0,
+                }
+                for c in codes
+            ]
+        )
         w.tick(snap, datetime(2026, 7, 6, 10, 0, tzinfo=CST))  # 300000 失败, 300001 成功
         assert "300001.SZ" in w.pushed_today
         assert "300000.SZ" not in w.pushed_today
         # 下一分钟（gi31）amount 相应 rel=4 → 300000 重试成功即确认
         amt1 = rel_amount(bars, 31, 4.0)
-        snap2 = mk_snap([{"ts_code": c, "price": 1.0, "pre_close": 0.9,
-                          "pct_chg": 5, "volume": 1e8, "amount": amt1} for c in codes])
+        snap2 = mk_snap(
+            [
+                {
+                    "ts_code": c,
+                    "price": 1.0,
+                    "pre_close": 0.9,
+                    "pct_chg": 5,
+                    "volume": 1e8,
+                    "amount": amt1,
+                }
+                for c in codes
+            ]
+        )
         w.tick(snap2, datetime(2026, 7, 6, 10, 1, tzinfo=CST))  # 300000 重试成功
         assert "300000.SZ" in w.pushed_today
 
@@ -606,7 +823,7 @@ class TestU7Guards:
             baseline=mk_baseline({}),
             base_dir=tmp_path,
             is_trading_day_fn=lambda d: True,
-            snapshot_fetcher=lambda: None,   # provider 恒失败
+            snapshot_fetcher=lambda: None,  # provider 恒失败
             minute_fetcher=lambda c, d: pd.DataFrame(),
             notify_fn=lambda scene, **k: notifies.append((scene, k)),
             now_fn=now_fn,
@@ -614,7 +831,7 @@ class TestU7Guards:
             max_ticks=8,
         )
         err = [n for n in notifies if n[0] == "error"]
-        assert len(err) == 1                         # 降级告警恰一条
+        assert len(err) == 1  # 降级告警恰一条
         # streak 5/6/7 的退避 = 60/120/300（前 4 次 miss 每次 60）
         assert sleeps[:4] == [60, 60, 60, 60]
         assert sleeps[4:7] == [60, 120, 300]
@@ -679,9 +896,7 @@ def test_surge_collection_proof_marks_a_recovered_provider_miss() -> None:
         market_universe=frozenset({"300001.SZ"}),
         minimum_market_coverage_count=1,
     )
-    full_market = mk_snap(
-        [{"ts_code": "300001.SZ", "price": 10, "pre_close": 10}]
-    )
+    full_market = mk_snap([{"ts_code": "300001.SZ", "price": 10, "pre_close": 10}])
     full_market.attrs["route"] = "tushare_rt"
     tracker.observe_snapshot(datetime(2026, 8, 3, 9, 30, tzinfo=CST), full_market)
     tracker.observe_failure(
@@ -707,12 +922,7 @@ def test_surge_runner_exports_only_after_a_continuous_natural_close(
     started = datetime(2026, 8, 3, 9, 25, tzinfo=CST)
     clock = {"t": started}
     codes = ["300001.SZ", "600001.SH"]
-    full_market = mk_snap(
-        [
-            {"ts_code": code, "price": 10, "pre_close": 10}
-            for code in codes
-        ]
-    )
+    full_market = mk_snap([{"ts_code": code, "price": 10, "pre_close": 10} for code in codes])
     full_market.attrs["route"] = "tushare_rt"
     monkeypatch.setattr("rquant.surge_watch._MIN_FULL_MARKET_COVERAGE_COUNT", 1)
     monkeypatch.setattr(
@@ -728,9 +938,7 @@ def test_surge_runner_exports_only_after_a_continuous_natural_close(
         minute_fetcher=lambda _code, _day: pd.DataFrame(),
         notify_fn=lambda *_args, **_kwargs: None,
         now_fn=lambda: clock["t"],
-        sleep_fn=lambda seconds: clock.__setitem__(
-            "t", clock["t"] + timedelta(seconds=seconds)
-        ),
+        sleep_fn=lambda seconds: clock.__setitem__("t", clock["t"] + timedelta(seconds=seconds)),
     )
     run_surge_watch(
         baseline=mk_baseline({}),
@@ -747,9 +955,7 @@ def test_surge_runner_exports_only_after_a_continuous_natural_close(
 
     assert len(observed) == 1
     assert observed[0]["trade_date"] == started.date()
-    assert observed[0]["events_path"] == (
-        tmp_path / "natural-close" / "events-2026-08-03.jsonl"
-    )
+    assert observed[0]["events_path"] == (tmp_path / "natural-close" / "events-2026-08-03.jsonl")
     assert observed[0]["collection_proof"].nonempty_successful_snapshots > 0
     assert observed[0]["collection_proof"].minimum_market_coverage_bps == 10_000
 
@@ -776,9 +982,7 @@ def test_surge_all_day_empty_snapshots_degrade_without_completion(
         minute_fetcher=lambda _code, _day: pd.DataFrame(),
         notify_fn=lambda *_args, **_kwargs: None,
         now_fn=lambda: clock["t"],
-        sleep_fn=lambda seconds: clock.__setitem__(
-            "t", clock["t"] + timedelta(seconds=seconds)
-        ),
+        sleep_fn=lambda seconds: clock.__setitem__("t", clock["t"] + timedelta(seconds=seconds)),
     )
 
     assert observed == []
@@ -795,9 +999,7 @@ def test_surge_partial_market_coverage_degrades_without_completion(
         lambda **kwargs: observed.append(kwargs) or (tmp_path / "surge", {}),
     )
     monkeypatch.setattr("rquant.surge_watch._MIN_FULL_MARKET_COVERAGE_COUNT", 1)
-    partial = mk_snap(
-        [{"ts_code": "300001.SZ", "price": 10, "pre_close": 10}]
-    )
+    partial = mk_snap([{"ts_code": "300001.SZ", "price": 10, "pre_close": 10}])
     partial.attrs["route"] = "tushare_rt"
 
     run_surge_watch(
@@ -811,9 +1013,7 @@ def test_surge_partial_market_coverage_degrades_without_completion(
         minute_fetcher=lambda _code, _day: pd.DataFrame(),
         notify_fn=lambda *_args, **_kwargs: None,
         now_fn=lambda: clock["t"],
-        sleep_fn=lambda seconds: clock.__setitem__(
-            "t", clock["t"] + timedelta(seconds=seconds)
-        ),
+        sleep_fn=lambda seconds: clock.__setitem__("t", clock["t"] + timedelta(seconds=seconds)),
     )
 
     assert observed == []
@@ -904,9 +1104,7 @@ def test_surge_all_day_provider_failure_has_no_completion_proof(
         minute_fetcher=lambda _code, _day: pd.DataFrame(),
         notify_fn=lambda *_args, **_kwargs: None,
         now_fn=lambda: clock["t"],
-        sleep_fn=lambda seconds: clock.__setitem__(
-            "t", clock["t"] + timedelta(seconds=seconds)
-        ),
+        sleep_fn=lambda seconds: clock.__setitem__("t", clock["t"] + timedelta(seconds=seconds)),
     )
     assert observed == []
 
@@ -935,9 +1133,7 @@ def test_surge_two_minute_provider_gap_degrades_even_after_recovery(
         minute_fetcher=lambda _code, _day: pd.DataFrame(),
         notify_fn=lambda *_args, **_kwargs: None,
         now_fn=lambda: clock["t"],
-        sleep_fn=lambda seconds: clock.__setitem__(
-            "t", clock["t"] + timedelta(seconds=seconds)
-        ),
+        sleep_fn=lambda seconds: clock.__setitem__("t", clock["t"] + timedelta(seconds=seconds)),
     )
     assert observed == []
 
@@ -948,8 +1144,19 @@ def test_surge_two_minute_provider_gap_degrades_even_after_recovery(
 class TestU8Persist:
     def test_events_jsonl_structure(self, tmp_path: Path) -> None:
         p = tmp_path / "events.jsonl"
-        append_events(p, [SurgeConfirmed(ts_code="300001.SZ", name="n", theme="人形机器人",
-                                         confirmed_at="10:05", rel_cum=2.5, cum_amount=9e7)])
+        append_events(
+            p,
+            [
+                SurgeConfirmed(
+                    ts_code="300001.SZ",
+                    name="n",
+                    theme="人形机器人",
+                    confirmed_at="10:05",
+                    rel_cum=2.5,
+                    cum_amount=9e7,
+                )
+            ],
+        )
         append_events(p, [SurgeConfirmed(ts_code="688001.SH", name="m", confirmed_at="10:06")])
         lines = p.read_text(encoding="utf-8").strip().split("\n")
         assert len(lines) == 2
@@ -972,9 +1179,7 @@ class TestU8Persist:
             '{"ts_code":"300001.SZ"}\n', encoding="utf-8"
         )
         (tmp_path / "events-2026-07-10.jsonl").write_text(
-            '{"ts_code":"300001.SZ"}\n'
-            '{"ts_code":"300001.SZ"}\n'
-            '{"ts_code":"688001.SH"}\n',
+            '{"ts_code":"300001.SZ"}\n{"ts_code":"300001.SZ"}\n{"ts_code":"688001.SH"}\n',
             encoding="utf-8",
         )
         (tmp_path / "events-2026-07-11.jsonl").write_text(
@@ -1001,7 +1206,7 @@ class TestU8Persist:
         cum["300001.SZ"][2] = 300.0
         df = series_to_frame(cum)
         assert set(df.columns) == {"ts_code", "minute_idx", "cum_amount"}
-        assert len(df) == 2                          # 只落非 NaN 格
+        assert len(df) == 2  # 只落非 NaN 格
         p = tmp_path / "s.parquet"
         atomic_write_parquet(df, p)
         back = pd.read_parquet(p)
@@ -1019,8 +1224,18 @@ class TestU8Persist:
 
 class TestU9CloudFeed:
     def _cloud_df(self) -> pd.DataFrame:
-        df = mk_snap([{"ts_code": "300001.SZ", "price": 11, "pre_close": 10, "pct_chg": 5,
-                       "volume": 1e6, "amount": 9e7}])
+        df = mk_snap(
+            [
+                {
+                    "ts_code": "300001.SZ",
+                    "price": 11,
+                    "pre_close": 10,
+                    "pct_chg": 5,
+                    "volume": 1e6,
+                    "amount": 9e7,
+                }
+            ]
+        )
         return df
 
     def test_fresh_cloud_feed_skips_local_fetch(self, tmp_path: Path) -> None:
@@ -1037,15 +1252,16 @@ class TestU9CloudFeed:
         poller = SourcePoller(
             now=lambda: 1000.0,
             snapshot_fetcher=snap_fetch,
-            flow_fetcher=lambda s: pd.DataFrame({"board_name": ["x"], "main_net_amount": [1]},
-                                                ).assign(),
+            flow_fetcher=lambda s: pd.DataFrame(
+                {"board_name": ["x"], "main_net_amount": [1]},
+            ).assign(),
             cloud_feed_fetcher=lambda: (self._cloud_df(), "cloud_feed"),
             drop_dir=tmp_path,
         )
         poller._poll_snapshot()
         df, as_of, route = poller.snapshot()
         assert route == "cloud_feed" and not df.empty
-        assert spy["n"] == 0                          # 本机自拉零调用
+        assert spy["n"] == 0  # 本机自拉零调用
 
     def test_stale_or_failed_cloud_falls_back(self, tmp_path: Path) -> None:
         from rquant.panorama_poller import SourcePoller
@@ -1062,7 +1278,7 @@ class TestU9CloudFeed:
             now=lambda: 1000.0,
             snapshot_fetcher=snap_fetch,
             flow_fetcher=lambda s: pd.DataFrame(),
-            cloud_feed_fetcher=lambda: None,          # 陈旧/失败 → None
+            cloud_feed_fetcher=lambda: None,  # 陈旧/失败 → None
             drop_dir=tmp_path,
         )
         poller._poll_snapshot()
@@ -1112,20 +1328,28 @@ class TestU10Push:
         assert "机器人A·人形机器人 +8.3% 累计比" not in body
 
     def test_message_structure_fields(self) -> None:
-        c = SurgeConfirmed(ts_code="300001.SZ", name="机器人A", theme="人形机器人",
-                           pct_chg=8.3, rel_cum=2.7, cum_amount=1.2e8,
-                           minute_delta=3e6, minute_delta_median=1e6, room_to_limit_pct=4.5)
+        c = SurgeConfirmed(
+            ts_code="300001.SZ",
+            name="机器人A",
+            theme="人形机器人",
+            pct_chg=8.3,
+            rel_cum=2.7,
+            cum_amount=1.2e8,
+            minute_delta=3e6,
+            minute_delta_median=1e6,
+            room_to_limit_pct=4.5,
+        )
         now = datetime(2026, 7, 6, 10, 5, tzinfo=CST)
         title, body = build_surge_messages([c], now, SurgeConfig())[0]
         assert "10:05" in title
-        assert "人形机器人" in body                   # 题材
-        assert "累计比：4日 2.7×" in body             # 纯累计比值（N=4）
-        assert "距涨停：4.5%" in body                  # 距涨停空间
-        assert "口径 v4(累计+方向)" in body            # 尾注口径版本
-        assert "累计比值∈[2.5,8]" in body            # 上下门口径
-        assert "9:31起判" in body                     # skip=0 → 9:31 起判（首个可确认格）
-        assert "增量门" not in body                   # v2 增量门 v3 默认关，报文不出现
-        assert "观察提示，非买入信号" in body          # 定位尾注
+        assert "人形机器人" in body  # 题材
+        assert "累计比：4日 2.7×" in body  # 纯累计比值（N=4）
+        assert "距涨停：4.5%" in body  # 距涨停空间
+        assert "口径 v4(累计+方向)" in body  # 尾注口径版本
+        assert "累计比值∈[2.5,8]" in body  # 上下门口径
+        assert "9:31起判" in body  # skip=0 → 9:31 起判（首个可确认格）
+        assert "增量门" not in body  # v2 增量门 v3 默认关，报文不出现
+        assert "观察提示，非买入信号" in body  # 定位尾注
 
     def test_message_shows_five_trading_day_push_count(self) -> None:
         confirmed = SurgeConfirmed(
@@ -1148,8 +1372,18 @@ class TestU10Push:
         bars = mk_minute_bars({d - timedelta(days=i): [1e4] * 241 for i in (1, 2, 3)})
         notifies: list = []
         clock = {"t": datetime(2026, 7, 6, 10, 0, tzinfo=CST)}
-        snap = mk_snap([{"ts_code": "300001.SZ", "price": 1.0, "pre_close": 0.9,
-                         "pct_chg": 5, "volume": 1e8, "amount": rel_amount(bars, 30, 4.0)}])
+        snap = mk_snap(
+            [
+                {
+                    "ts_code": "300001.SZ",
+                    "price": 1.0,
+                    "pre_close": 0.9,
+                    "pct_chg": 5,
+                    "volume": 1e8,
+                    "amount": rel_amount(bars, 30, 4.0),
+                }
+            ]
+        )
 
         def now_fn() -> datetime:
             return clock["t"]
@@ -1169,7 +1403,7 @@ class TestU10Push:
             sleep_fn=sleep_fn,
             max_ticks=2,
         )
-        assert notifies == []                         # dry-run 零推送
+        assert notifies == []  # dry-run 零推送
         out = capsys.readouterr().out
         assert "DRY-RUN" in out and "300001.SZ" in out
 
@@ -1204,8 +1438,8 @@ class TestNotifyScene:
         monkeypatch.setattr(notify_api, "PushDeerClient", _PD)
         monkeypatch.setattr(notify_api, "PushPlusClient", _PP)
         notify_api.notify("surge_watch", title="爆量", body="x")
-        assert len(pd_calls) == 1                     # 推 PushDeer（admin）
-        assert pp_calls == []                         # 不推 PushPlus（美丞）
+        assert len(pd_calls) == 1  # 推 PushDeer（admin）
+        assert pp_calls == []  # 不推 PushPlus（美丞）
 
 
 # ── E1 一天快照序列回放（自包含离线 fixture） ───────────────────────────────────
@@ -1221,10 +1455,15 @@ def _write_sim_fixture(sim_dir: Path) -> None:
     day = date(2026, 7, 6)
     sim_dir.mkdir(parents=True, exist_ok=True)
     per_min = {"300111.SZ": 1e5, "300222.SZ": 1e5, "688333.SH": 1e6}  # 确认基线 m/min
-    (sim_dir / "baseline.json").write_text(json.dumps({
-        "avg20": {c: 1e4 for c in per_min},         # avg20 微小 → 粗筛恒过，候选早入确认池
-        "theme": {"300111.SZ": "人形机器人", "300222.SZ": "存储芯片"},
-    }), encoding="utf-8")
+    (sim_dir / "baseline.json").write_text(
+        json.dumps(
+            {
+                "avg20": {c: 1e4 for c in per_min},  # avg20 微小 → 粗筛恒过，候选早入确认池
+                "theme": {"300111.SZ": "人形机器人", "300222.SZ": "存储芯片"},
+            }
+        ),
+        encoding="utf-8",
+    )
     rows: list[dict] = []
     for c in per_min:
         for dd in (1, 2, 3):
@@ -1237,17 +1476,40 @@ def _write_sim_fixture(sim_dir: Path) -> None:
     for i in range(37):
         t = (datetime(2026, 7, 6, 9, 30) + timedelta(minutes=i)).time()
         hhmm = f"{t.hour:02d}{t.minute:02d}"
-        g_amt = 3.0 * (i + 1) * 1e5                          # G：rel 恒 3.0（9:31 即越 2.5）
-        h_amt = 1e4 if i < 35 else 10.0 * (i + 1) * 1e5      # H：10:05(i=35) rel=10 毒尾
-        k_amt = 1.5 * (i + 1) * 1e6                          # K：rel 恒 1.5 累计不足
-        snap = mk_snap([
-            {"ts_code": "300111.SZ", "name": "机器人G", "price": 25, "pre_close": 22,
-             "pct_chg": 9, "volume": 1e7, "amount": g_amt},
-            {"ts_code": "300222.SZ", "name": "存储H", "price": 15, "pre_close": 13.5,
-             "pct_chg": 8, "volume": 1e7, "amount": h_amt},
-            {"ts_code": "688333.SH", "name": "科创K", "price": 30, "pre_close": 27,
-             "pct_chg": 7, "volume": 1e7, "amount": k_amt},
-        ])
+        g_amt = 3.0 * (i + 1) * 1e5  # G：rel 恒 3.0（9:31 即越 2.5）
+        h_amt = 1e4 if i < 35 else 10.0 * (i + 1) * 1e5  # H：10:05(i=35) rel=10 毒尾
+        k_amt = 1.5 * (i + 1) * 1e6  # K：rel 恒 1.5 累计不足
+        snap = mk_snap(
+            [
+                {
+                    "ts_code": "300111.SZ",
+                    "name": "机器人G",
+                    "price": 25,
+                    "pre_close": 22,
+                    "pct_chg": 9,
+                    "volume": 1e7,
+                    "amount": g_amt,
+                },
+                {
+                    "ts_code": "300222.SZ",
+                    "name": "存储H",
+                    "price": 15,
+                    "pre_close": 13.5,
+                    "pct_chg": 8,
+                    "volume": 1e7,
+                    "amount": h_amt,
+                },
+                {
+                    "ts_code": "688333.SH",
+                    "name": "科创K",
+                    "price": 30,
+                    "pre_close": 27,
+                    "pct_chg": 7,
+                    "volume": 1e7,
+                    "amount": k_amt,
+                },
+            ]
+        )
         snap.to_parquet(sim_dir / f"2026-07-06T{hhmm}.parquet", index=False)
 
 
@@ -1274,7 +1536,7 @@ class TestE1Simulate:
         assert by_code["300111.SZ"]["rel_cum"] == 3.0
         assert by_code["300111.SZ"]["theme"] == "人形机器人"
         g_push = [p for p in pushes if "机器人G" in p[1]["body"]][0]
-        assert "09:31" in g_push[1]["title"]         # 推送发生在 09:31
+        assert "09:31" in g_push[1]["title"]  # 推送发生在 09:31
         body = g_push[1]["body"]
         assert "口径 v4(累计+方向)" in body and "观察提示，非买入信号" in body
         assert all(p[0] == "surge_watch" for p in pushes)
@@ -1314,19 +1576,14 @@ def _theme_store(tmp_path: Path, *, tables: dict[str, str]) -> _RawStore:
 
 
 _KPL_MEMBER_DDL = (
-    "CREATE TABLE kpl_concept_member "
-    "(board_code VARCHAR, board_name VARCHAR, con_code VARCHAR)"
+    "CREATE TABLE kpl_concept_member (board_code VARCHAR, board_name VARCHAR, con_code VARCHAR)"
 )
 _KPL_DAILY_DDL = (
     "CREATE TABLE kpl_concept_member_daily "
     "(trade_date DATE, board_code VARCHAR, board_name VARCHAR, con_code VARCHAR)"
 )
-_DC_BOARD_DDL = (
-    "CREATE TABLE dc_board (ts_code VARCHAR, name VARCHAR, idx_type VARCHAR)"
-)
-_DC_MEMBER_DDL = (
-    "CREATE TABLE dc_board_member (board_code VARCHAR, con_code VARCHAR)"
-)
+_DC_BOARD_DDL = "CREATE TABLE dc_board (ts_code VARCHAR, name VARCHAR, idx_type VARCHAR)"
+_DC_MEMBER_DDL = "CREATE TABLE dc_board_member (board_code VARCHAR, con_code VARCHAR)"
 
 
 class TestU11ThemeMapFallback:
@@ -1334,8 +1591,7 @@ class TestU11ThemeMapFallback:
         store = _theme_store(tmp_path, tables={"kpl": _KPL_MEMBER_DDL})
         store._conn.executemany(
             "INSERT INTO kpl_concept_member VALUES (?, ?, ?)",
-            [("000129.KP", "人形机器人", "300111.SZ"),
-             ("000130.KP", "存储", "300222.SZ")],
+            [("000129.KP", "人形机器人", "300111.SZ"), ("000130.KP", "存储", "300222.SZ")],
         )
         with _capture_loguru() as logs:
             m = load_theme_map(store)
@@ -1346,8 +1602,10 @@ class TestU11ThemeMapFallback:
         store = _theme_store(tmp_path, tables={"kpl": _KPL_MEMBER_DDL})
         store._conn.executemany(
             "INSERT INTO kpl_concept_member VALUES (?, ?, ?)",
-            [("000129.KP", "人形机器人", "300111.SZ"),
-             ("000131.KP", "减速器", "300111.SZ")],  # 同票第二题材，应被忽略
+            [
+                ("000129.KP", "人形机器人", "300111.SZ"),
+                ("000131.KP", "减速器", "300111.SZ"),
+            ],  # 同票第二题材，应被忽略
         )
         m = load_theme_map(store)
         assert m == {"300111.SZ": "人形机器人"}
@@ -1356,8 +1614,10 @@ class TestU11ThemeMapFallback:
         store = _theme_store(tmp_path, tables={"daily": _KPL_DAILY_DDL})
         store._conn.executemany(
             "INSERT INTO kpl_concept_member_daily VALUES (?, ?, ?, ?)",
-            [(date(2026, 7, 2), "000130.KP", "旧题材", "300222.SZ"),
-             (date(2026, 7, 3), "000129.KP", "最新题材", "300111.SZ")],
+            [
+                (date(2026, 7, 2), "000130.KP", "旧题材", "300222.SZ"),
+                (date(2026, 7, 3), "000129.KP", "最新题材", "300111.SZ"),
+            ],
         )
         with _capture_loguru() as logs:
             m = load_theme_map(store)
@@ -1366,13 +1626,13 @@ class TestU11ThemeMapFallback:
         assert any("命中 kpl_concept_member_daily" in x for x in logs)
 
     def test_level3_dc_concept_when_kpl_missing(self, tmp_path: Path) -> None:
-        store = _theme_store(
-            tmp_path, tables={"b": _DC_BOARD_DDL, "m": _DC_MEMBER_DDL}
-        )
+        store = _theme_store(tmp_path, tables={"b": _DC_BOARD_DDL, "m": _DC_MEMBER_DDL})
         store._conn.executemany(
             "INSERT INTO dc_board VALUES (?, ?, ?)",
-            [("BK0001", "工程建设", "概念板块"),
-             ("BK0002", "钢铁行业", "行业板块")],  # 非概念，应被 WHERE 排除
+            [
+                ("BK0001", "工程建设", "概念板块"),
+                ("BK0002", "钢铁行业", "行业板块"),
+            ],  # 非概念，应被 WHERE 排除
         )
         store._conn.executemany(
             "INSERT INTO dc_board_member VALUES (?, ?)",
@@ -1426,14 +1686,14 @@ class TestU11ThemeMapFallback:
 class TestU12ConfigDefaults:
     def test_v3_defaults(self) -> None:
         cfg = SurgeConfig()
-        assert cfg.k_cum == 2.5                  # 纯累计下门（替代 v2 k_confirm=3.0）
-        assert cfg.ratio_cap == 8.0              # 毒尾封顶：比值 >8 视为极端出货不推
-        assert cfg.skip_first_minutes == 0       # 9:31（gi=1）起即可确认（用户要求尽早推）
+        assert cfg.k_cum == 2.5  # 纯累计下门（替代 v2 k_confirm=3.0）
+        assert cfg.ratio_cap == 8.0  # 毒尾封顶：比值 >8 视为极端出货不推
+        assert cfg.skip_first_minutes == 0  # 9:31（gi=1）起即可确认（用户要求尽早推）
         assert cfg.silent_until_hhmm == "09:31"  # 9:31 起就推
-        assert cfg.cum_lookback_days == 4        # N 日同刻累计中位（v2 是 3）
-        assert cfg.k_delta_confirm == 0.0        # v2 增量门 v3 默认关
-        assert cfg.require_vwap is False         # v2 VWAP 门 v3 默认关
-        assert cfg.k_rough == 1.2                # 粗筛放松 1.5→1.2，候选早入确认池
+        assert cfg.cum_lookback_days == 4  # N 日同刻累计中位（v2 是 3）
+        assert cfg.k_delta_confirm == 0.0  # v2 增量门 v3 默认关
+        assert cfg.require_vwap is False  # v2 VWAP 门 v3 默认关
+        assert cfg.k_rough == 1.2  # 粗筛放松 1.5→1.2，候选早入确认池
         assert cfg.max_room_to_limit_pct == 1.0  # 可买性守卫保留，距涨停≤1% 不推
 
 
@@ -1458,7 +1718,7 @@ class TestU13DeltaGate:
         return mk_minute_bars({d - timedelta(days=i): [100, 100, 100] for i in (1, 2, 3)})
 
     def _watcher(self, bars: pd.DataFrame, *, minute_delta: float, k_delta: float) -> tuple:
-        cfg = SurgeConfig(k_delta_confirm=k_delta)   # v3 默认关，显式开增量门测门
+        cfg = SurgeConfig(k_delta_confirm=k_delta)  # v3 默认关，显式开增量门测门
         base = mk_baseline({"300001.SZ": 1e6}, curve=flat_curve())
         w = SurgeWatcher(base, config=cfg, minute_fetcher=lambda c, d: bars)
         gi = 30
@@ -1468,10 +1728,20 @@ class TestU13DeltaGate:
         amount = rel_amount(bars, gi, 4.0)
         arr = np.full(CURVE_POINTS, np.nan)
         arr[gi - 1] = amount - minute_delta
-        arr[gi] = amount                  # 本分钟增量 = minute_delta
+        arr[gi] = amount  # 本分钟增量 = minute_delta
         w.cum_series["300001.SZ"] = arr
-        snap = mk_snap([{"ts_code": "300001.SZ", "price": 100.0, "pre_close": 90,
-                         "pct_chg": 5, "volume": 1e6, "amount": amount}])
+        snap = mk_snap(
+            [
+                {
+                    "ts_code": "300001.SZ",
+                    "price": 100.0,
+                    "pre_close": 90,
+                    "pct_chg": 5,
+                    "volume": 1e6,
+                    "amount": amount,
+                }
+            ]
+        )
         return w, snap, now, gi
 
     def test_delta_gate_passes_at_boundary(self) -> None:
@@ -1526,18 +1796,28 @@ class TestU14Buyability:
         arr[gi] = amount
         w.cum_series["300001.SZ"] = arr
         # gem 20cm：limit_up = pre_close×1.2（mk_snap 默认档）
-        snap = mk_snap([{"ts_code": "300001.SZ", "price": price, "pre_close": pre_close,
-                         "pct_chg": 8, "volume": 1e6, "amount": amount}])
+        snap = mk_snap(
+            [
+                {
+                    "ts_code": "300001.SZ",
+                    "price": price,
+                    "pre_close": pre_close,
+                    "pct_chg": 8,
+                    "volume": 1e6,
+                    "amount": amount,
+                }
+            ]
+        )
         return w, snap, now, gi
 
     def test_within_room_marked_unbuyable_still_pushed(self) -> None:
         # pre_close 100 → limit_up 120；price 119.5 → room 0.42% ≤1% → 标 unbuyable，仍进待推送
         w, snap, now, gi = self._confirmable(price=119.5, pre_close=100)
         w._evaluate("300001.SZ", snap, now, gi)
-        assert "300001.SZ" in w.pushed_today          # 仍占「每票每日一次」名额
-        assert len(w._pending_push) == 1              # unbuyable 也进报文
+        assert "300001.SZ" in w.pushed_today  # 仍占「每票每日一次」名额
+        assert len(w._pending_push) == 1  # unbuyable 也进报文
         assert w._pending_push[0].status == "unbuyable"
-        assert w._pending_events == []                # 保留字段恒空
+        assert w._pending_events == []  # 保留字段恒空
 
     def test_already_sealed_marked_still_pushed(self) -> None:
         # price = limit_up（封板）→ room 0 ≤1% → 标 unbuyable，仍进待推送
@@ -1551,10 +1831,10 @@ class TestU14Buyability:
         w, snap, now, gi = self._confirmable(price=119.5, pre_close=100)
         w._evaluate("300001.SZ", snap, now, gi)
         res = w._flush(now)
-        assert len(res.pushes) == 1                   # 现在会推送
+        assert len(res.pushes) == 1  # 现在会推送
         _title, body = res.pushes[0]
-        assert "🔔临近涨停" in body                    # room 0.42%>0 → 临近涨停 icon
-        assert "临近涨停/🔒已封板 1 只" in body         # 图例行
+        assert "🔔临近涨停" in body  # room 0.42%>0 → 临近涨停 icon
+        assert "临近涨停/🔒已封板 1 只" in body  # 图例行
         assert len(res.confirmed) == 1 and res.confirmed[0].status == "unbuyable"
 
     def test_sealed_pushed_with_locked_icon(self) -> None:
@@ -1582,8 +1862,20 @@ class TestU15CliParse:
         from rquant.cli import build_parser
 
         args = build_parser().parse_args(
-            ["surge-watch", "--k-cum", "3.0", "--ratio-cap", "10", "--skip-first-minutes", "2",
-             "--k-delta", "1.5", "--require-vwap", "--max-room", "0.5"]
+            [
+                "surge-watch",
+                "--k-cum",
+                "3.0",
+                "--ratio-cap",
+                "10",
+                "--skip-first-minutes",
+                "2",
+                "--k-delta",
+                "1.5",
+                "--require-vwap",
+                "--max-room",
+                "0.5",
+            ]
         )
         assert args.k_cum == 3.0
         assert args.ratio_cap == 10.0
@@ -1614,38 +1906,66 @@ def _write_sim_v3_fixture(sim_dir: Path) -> None:
     day = date(2026, 7, 6)
     sim_dir.mkdir(parents=True, exist_ok=True)
     names = {"300901.SZ": "毒D", "300902.SZ": "拦E", "300903.SZ": "爆F"}
-    (sim_dir / "baseline.json").write_text(json.dumps({
-        "avg20": {c: 1e6 for c in names},          # 候选在爆量分钟入池（pre-boom 压 1e4 落选）
-        "theme": {"300903.SZ": "存储芯片"},
-    }), encoding="utf-8")
+    (sim_dir / "baseline.json").write_text(
+        json.dumps(
+            {
+                "avg20": {c: 1e6 for c in names},  # 候选在爆量分钟入池（pre-boom 压 1e4 落选）
+                "theme": {"300903.SZ": "存储芯片"},
+            }
+        ),
+        encoding="utf-8",
+    )
 
     rows: list[dict] = []
     for dd in (1, 2, 3):
         d0 = day - timedelta(days=dd)
-        for c in names:                             # 三票同基线 1e5/min（全 241 网格）
+        for c in names:  # 三票同基线 1e5/min（全 241 网格）
             for i in range(241):
                 t = datetime.combine(d0, dt_time(9, 30)) + timedelta(minutes=i)
                 rows.append({"ts_code": c, "trade_time": t, "amount": 1e5})
     pd.DataFrame(rows).to_parquet(sim_dir / "confirm_bars.parquet", index=False)
 
-    for i in range(37):                             # 09:30..10:06 逐分钟（morning gi==i）
+    for i in range(37):  # 09:30..10:06 逐分钟（morning gi==i）
         t = (datetime(2026, 7, 6, 9, 30) + timedelta(minutes=i)).time()
         hhmm = f"{t.hour:02d}{t.minute:02d}"
-        boom = i >= 35                              # 10:05 起爆量
+        boom = i >= 35  # 10:05 起爆量
         base_cum = (i + 1) * 1e5
-        d_amt = 10.0 * base_cum if boom else 1e4    # D：rel=10 > ratio_cap(8) 毒尾
-        ef_amt = 4.0 * base_cum if boom else 1e4    # E/F：rel=4 落带内
-        snap = mk_snap([
-            # D：rel=10 毒尾 → 不确认、无 event（price/room 不影响，先被 cap 拦）
-            {"ts_code": "300901.SZ", "name": "毒D", "price": 11.0, "pre_close": 10,
-             "pct_chg": 10, "volume": 1e7, "amount": d_amt},
-            # E：limit_up=12.0，price 11.9 → room 0.84% ≤1% → 确认但 unbuyable
-            {"ts_code": "300902.SZ", "name": "拦E", "price": 11.9, "pre_close": 10,
-             "pct_chg": 19, "volume": 1e9, "amount": ef_amt},
-            # F：price 11 → room 9.1% >1% → 正常推送
-            {"ts_code": "300903.SZ", "name": "爆F", "price": 11.0, "pre_close": 10,
-             "pct_chg": 10, "volume": 1e9, "amount": ef_amt},
-        ])
+        d_amt = 10.0 * base_cum if boom else 1e4  # D：rel=10 > ratio_cap(8) 毒尾
+        ef_amt = 4.0 * base_cum if boom else 1e4  # E/F：rel=4 落带内
+        snap = mk_snap(
+            [
+                # D：rel=10 毒尾 → 不确认、无 event（price/room 不影响，先被 cap 拦）
+                {
+                    "ts_code": "300901.SZ",
+                    "name": "毒D",
+                    "price": 11.0,
+                    "pre_close": 10,
+                    "pct_chg": 10,
+                    "volume": 1e7,
+                    "amount": d_amt,
+                },
+                # E：limit_up=12.0，price 11.9 → room 0.84% ≤1% → 确认但 unbuyable
+                {
+                    "ts_code": "300902.SZ",
+                    "name": "拦E",
+                    "price": 11.9,
+                    "pre_close": 10,
+                    "pct_chg": 19,
+                    "volume": 1e9,
+                    "amount": ef_amt,
+                },
+                # F：price 11 → room 9.1% >1% → 正常推送
+                {
+                    "ts_code": "300903.SZ",
+                    "name": "爆F",
+                    "price": 11.0,
+                    "pre_close": 10,
+                    "pct_chg": 10,
+                    "volume": 1e9,
+                    "amount": ef_amt,
+                },
+            ]
+        )
         snap.to_parquet(sim_dir / f"2026-07-06T{hhmm}.parquet", index=False)
 
 
@@ -1674,7 +1994,7 @@ class TestE2SimulateV3Gates:
         assert len(pushes) == 1
         body = pushes[0][1]["body"]
         assert "爆F" in body and "拦E" in body
-        assert "🔔临近涨停" in body                    # E 距涨停 0.84%>0 → 临近涨停 icon
+        assert "🔔临近涨停" in body  # E 距涨停 0.84%>0 → 临近涨停 icon
         assert "口径 v4(累计+方向)" in body and "观察提示，非买入信号" in body
 
 
@@ -1687,16 +2007,51 @@ class TestU16FullMarketRefactor:
     def _full_market(self) -> pd.DataFrame:
         """主板/创业/科创/北交所 + 一只 ST 创业股，amount 足够大（避免 rough 落选干扰）。"""
         rows = [
-            {"ts_code": "600519.SH", "name": "主板甲", "price": 11, "pre_close": 10,
-             "pct_chg": 10, "volume": 1e7, "amount": 5e8},   # main
-            {"ts_code": "300111.SZ", "name": "创业乙", "price": 11, "pre_close": 10,
-             "pct_chg": 10, "volume": 1e7, "amount": 5e8},   # gem
-            {"ts_code": "688333.SH", "name": "科创丙", "price": 11, "pre_close": 10,
-             "pct_chg": 10, "volume": 1e7, "amount": 5e8},   # star
-            {"ts_code": "830001.BJ", "name": "北交丁", "price": 11, "pre_close": 10,
-             "pct_chg": 10, "volume": 1e7, "amount": 5e8},   # bj
-            {"ts_code": "300777.SZ", "name": "ST妖戊", "price": 11, "pre_close": 10,
-             "pct_chg": 10, "volume": 1e7, "amount": 5e8},   # gem 但 ST
+            {
+                "ts_code": "600519.SH",
+                "name": "主板甲",
+                "price": 11,
+                "pre_close": 10,
+                "pct_chg": 10,
+                "volume": 1e7,
+                "amount": 5e8,
+            },  # main
+            {
+                "ts_code": "300111.SZ",
+                "name": "创业乙",
+                "price": 11,
+                "pre_close": 10,
+                "pct_chg": 10,
+                "volume": 1e7,
+                "amount": 5e8,
+            },  # gem
+            {
+                "ts_code": "688333.SH",
+                "name": "科创丙",
+                "price": 11,
+                "pre_close": 10,
+                "pct_chg": 10,
+                "volume": 1e7,
+                "amount": 5e8,
+            },  # star
+            {
+                "ts_code": "830001.BJ",
+                "name": "北交丁",
+                "price": 11,
+                "pre_close": 10,
+                "pct_chg": 10,
+                "volume": 1e7,
+                "amount": 5e8,
+            },  # bj
+            {
+                "ts_code": "300777.SZ",
+                "name": "ST妖戊",
+                "price": 11,
+                "pre_close": 10,
+                "pct_chg": 10,
+                "volume": 1e7,
+                "amount": 5e8,
+            },  # gem 但 ST
         ]
         return mk_snap(rows)
 
@@ -1734,7 +2089,7 @@ class TestU16FullMarketRefactor:
             max_ticks=1,
         )
         full_back = pd.read_parquet(tmp_path / "snapshot_full.parquet")
-        assert "600519.SH" in set(full_back["ts_code"])   # 主板行进共享 feed
+        assert "600519.SH" in set(full_back["ts_code"])  # 主板行进共享 feed
         assert "830001.BJ" in set(full_back["ts_code"])
         det_back = pd.read_parquet(tmp_path / "snapshot.parquet")
         assert set(det_back["ts_code"]) == {"300111.SZ", "688333.SH", "300777.SZ"}
@@ -1742,23 +2097,36 @@ class TestU16FullMarketRefactor:
     def test_full_market_code_universe_covers_all_boards(self) -> None:
         """rt_min 代码全集覆盖主板/创业/科创/北交所（全景 feed 需全市场，检测层再收窄）。"""
         base = mk_baseline(
-            {}, code_universe=["600519.SH", "300111.SZ", "688333.SH", "830001.BJ"],
-            name_map={"600519.SH": "主板甲", "300111.SZ": "创业乙",
-                      "688333.SH": "科创丙", "830001.BJ": "北交丁"},
+            {},
+            code_universe=["600519.SH", "300111.SZ", "688333.SH", "830001.BJ"],
+            name_map={
+                "600519.SH": "主板甲",
+                "300111.SZ": "创业乙",
+                "688333.SH": "科创丙",
+                "830001.BJ": "北交丁",
+            },
             pre_close={c: 10.0 for c in ("600519.SH", "300111.SZ", "688333.SH", "830001.BJ")},
         )
         seen: dict[str, list[str]] = {}
 
         def fake_rt_min(codes: list[str]) -> pd.DataFrame:
             seen["codes"] = list(codes)
-            return mk_rt_min([
-                {"ts_code": c, "close": 11.0, "vol": 1e6, "amount": 5e8,
-                 "trade_time": "2026-07-06 10:00:00"} for c in codes
-            ])
+            return mk_rt_min(
+                [
+                    {
+                        "ts_code": c,
+                        "close": 11.0,
+                        "vol": 1e6,
+                        "amount": 5e8,
+                        "trade_time": "2026-07-06 10:00:00",
+                    }
+                    for c in codes
+                ]
+            )
 
         out = fetch_full_market_snapshot(base, CumulativeTracker(), rt_min_fn=fake_rt_min)
         for c in ("600519.SH", "300111.SZ", "688333.SH", "830001.BJ"):
-            assert c in seen["codes"]       # rt_min 请求全市场
+            assert c in seen["codes"]  # rt_min 请求全市场
             assert c in set(out["ts_code"])
 
 
@@ -1767,8 +2135,16 @@ class TestU16FullMarketRefactor:
 
 class TestU17CumulativeTracker:
     def _raw(self, amount: float, vol: float, tt: str, code: str = "300001.SZ") -> pd.DataFrame:
-        return pd.DataFrame([{"ts_code": code, "amount": float(amount),
-                              "volume": float(vol), "trade_time": pd.Timestamp(tt)}])
+        return pd.DataFrame(
+            [
+                {
+                    "ts_code": code,
+                    "amount": float(amount),
+                    "volume": float(vol),
+                    "trade_time": pd.Timestamp(tt),
+                }
+            ]
+        )
 
     def test_same_minute_no_double_add(self) -> None:
         t = CumulativeTracker()
@@ -1795,8 +2171,8 @@ class TestU17CumulativeTracker:
         t = CumulativeTracker()
         t.update(self._raw(100, 10, "2026-07-07 09:31:00"))
         d = t.update(self._raw(60, 6, "2026-07-07 09:32:00"))
-        assert d["amount"].iloc[0] == 160        # 累计额
-        assert d["volume"].iloc[0] == 16         # 累计量同步
+        assert d["amount"].iloc[0] == 160  # 累计额
+        assert d["volume"].iloc[0] == 16  # 累计量同步
 
     def test_regression_minute_not_added(self) -> None:
         t = CumulativeTracker()
@@ -1809,16 +2185,26 @@ class TestU17CumulativeTracker:
         t = CumulativeTracker()
         t.update(self._raw(100, 10, "2026-07-07 09:31:00"))
         d = t.update(self._raw(np.nan, np.nan, "2026-07-07 09:32:00"))
-        assert d["amount"].iloc[0] == 100        # 当分钟量缺失 → 累计不变
+        assert d["amount"].iloc[0] == 100  # 当分钟量缺失 → 累计不变
 
     def test_multi_code_independent(self) -> None:
         t = CumulativeTracker()
-        raw = pd.DataFrame([
-            {"ts_code": "300001.SZ", "amount": 100.0, "volume": 10.0,
-             "trade_time": pd.Timestamp("2026-07-07 09:31:00")},
-            {"ts_code": "688001.SH", "amount": 50.0, "volume": 5.0,
-             "trade_time": pd.Timestamp("2026-07-07 09:31:00")},
-        ])
+        raw = pd.DataFrame(
+            [
+                {
+                    "ts_code": "300001.SZ",
+                    "amount": 100.0,
+                    "volume": 10.0,
+                    "trade_time": pd.Timestamp("2026-07-07 09:31:00"),
+                },
+                {
+                    "ts_code": "688001.SH",
+                    "amount": 50.0,
+                    "volume": 5.0,
+                    "trade_time": pd.Timestamp("2026-07-07 09:31:00"),
+                },
+            ]
+        )
         out = t.update(raw)
         by = dict(zip(out["ts_code"], out["amount"], strict=True))
         assert by["300001.SZ"] == 100 and by["688001.SH"] == 50
@@ -1830,58 +2216,104 @@ class TestU17CumulativeTracker:
 class TestU18RtMinSnapshot:
     def _base(self) -> SurgeBaseline:
         return mk_baseline(
-            {}, code_universe=["300001.SZ", "600519.SH"],
+            {},
+            code_universe=["300001.SZ", "600519.SH"],
             name_map={"300001.SZ": "创业甲", "600519.SH": "贵州茅台"},
             pre_close={"300001.SZ": 10.0, "600519.SH": 1700.0},
         )
 
     def test_normalize_columns_route_and_pct(self) -> None:
-        raw = mk_rt_min([
-            {"ts_code": "300001.SZ", "close": 11.0, "vol": 1e6, "amount": 5e7,
-             "trade_time": "2026-07-06 09:31:00"},
-            {"ts_code": "600519.SH", "close": 1710.0, "vol": 1e5, "amount": 8e7,
-             "trade_time": "2026-07-06 09:31:00"},
-        ])
-        out = fetch_full_market_snapshot(self._base(), CumulativeTracker(),
-                                         rt_min_fn=lambda c: raw)
+        raw = mk_rt_min(
+            [
+                {
+                    "ts_code": "300001.SZ",
+                    "close": 11.0,
+                    "vol": 1e6,
+                    "amount": 5e7,
+                    "trade_time": "2026-07-06 09:31:00",
+                },
+                {
+                    "ts_code": "600519.SH",
+                    "close": 1710.0,
+                    "vol": 1e5,
+                    "amount": 8e7,
+                    "trade_time": "2026-07-06 09:31:00",
+                },
+            ]
+        )
+        out = fetch_full_market_snapshot(self._base(), CumulativeTracker(), rt_min_fn=lambda c: raw)
         assert out.attrs["route"] == "tushare_rt"
         r = out[out["ts_code"] == "300001.SZ"].iloc[0]
-        assert r["price"] == 11.0                        # price=close
-        assert r["pre_close"] == 10.0                     # 预载补齐
-        assert r["name"] == "创业甲"                       # 预载补齐（rt_min 无名称）
-        assert abs(r["pct_chg"] - 10.0) < 1e-9            # (11/10-1)*100
-        assert "limit_up_price" in out.columns            # add_limit_prices 已应用
+        assert r["price"] == 11.0  # price=close
+        assert r["pre_close"] == 10.0  # 预载补齐
+        assert r["name"] == "创业甲"  # 预载补齐（rt_min 无名称）
+        assert abs(r["pct_chg"] - 10.0) < 1e-9  # (11/10-1)*100
+        assert "limit_up_price" in out.columns  # add_limit_prices 已应用
         # gem 20cm：limit_up = 10×1.2 = 12.0
         assert abs(float(r["limit_up_price"]) - 12.0) < 1e-9
 
     def test_amount_yuan_and_volume_share_no_conversion(self) -> None:
         """单位核对：rt_min amount=元、vol=股，首分钟累计=当分钟量，不换算。"""
-        raw = mk_rt_min([{"ts_code": "300001.SZ", "close": 11.0, "vol": 1234567,
-                          "amount": 5e7, "trade_time": "2026-07-06 09:31:00"}])
-        out = fetch_full_market_snapshot(self._base(), CumulativeTracker(),
-                                         rt_min_fn=lambda c: raw)
+        raw = mk_rt_min(
+            [
+                {
+                    "ts_code": "300001.SZ",
+                    "close": 11.0,
+                    "vol": 1234567,
+                    "amount": 5e7,
+                    "trade_time": "2026-07-06 09:31:00",
+                }
+            ]
+        )
+        out = fetch_full_market_snapshot(self._base(), CumulativeTracker(), rt_min_fn=lambda c: raw)
         r = out[out["ts_code"] == "300001.SZ"].iloc[0]
-        assert r["amount"] == 5e7                          # 元，不换算
-        assert r["volume"] == 1234567                      # 股，不换算
+        assert r["amount"] == 5e7  # 元，不换算
+        assert r["volume"] == 1234567  # 股，不换算
 
     def test_amount_accumulates_across_minutes(self) -> None:
         base, tracker = self._base(), CumulativeTracker()
-        out1 = fetch_full_market_snapshot(base, tracker, rt_min_fn=lambda c: mk_rt_min(
-            [{"ts_code": "300001.SZ", "close": 11.0, "vol": 1e6, "amount": 5e7,
-              "trade_time": "2026-07-06 09:31:00"}]))
+        out1 = fetch_full_market_snapshot(
+            base,
+            tracker,
+            rt_min_fn=lambda c: mk_rt_min(
+                [
+                    {
+                        "ts_code": "300001.SZ",
+                        "close": 11.0,
+                        "vol": 1e6,
+                        "amount": 5e7,
+                        "trade_time": "2026-07-06 09:31:00",
+                    }
+                ]
+            ),
+        )
         assert out1[out1["ts_code"] == "300001.SZ"].iloc[0]["amount"] == 5e7
-        out2 = fetch_full_market_snapshot(base, tracker, rt_min_fn=lambda c: mk_rt_min(
-            [{"ts_code": "300001.SZ", "close": 11.5, "vol": 1e6, "amount": 3e7,
-              "trade_time": "2026-07-06 09:32:00"}]))
+        out2 = fetch_full_market_snapshot(
+            base,
+            tracker,
+            rt_min_fn=lambda c: mk_rt_min(
+                [
+                    {
+                        "ts_code": "300001.SZ",
+                        "close": 11.5,
+                        "vol": 1e6,
+                        "amount": 3e7,
+                        "trade_time": "2026-07-06 09:32:00",
+                    }
+                ]
+            ),
+        )
         assert out2[out2["ts_code"] == "300001.SZ"].iloc[0]["amount"] == 8e7  # 累计
 
     def test_empty_rt_min_returns_none_route(self) -> None:
-        out = fetch_full_market_snapshot(self._base(), CumulativeTracker(),
-                                         rt_min_fn=lambda c: pd.DataFrame())
+        out = fetch_full_market_snapshot(
+            self._base(), CumulativeTracker(), rt_min_fn=lambda c: pd.DataFrame()
+        )
         assert out.attrs["route"] == "none" and out.empty
 
     def test_rt_min_failure_returns_none_route(self) -> None:
         """rt_min 失败（IP 反爬事故场景）→ route=none，本 tick miss（plan U5）。"""
+
         def boom(codes: list[str]) -> pd.DataFrame:
             raise ConnectionError("Remote end closed connection without response")
 
@@ -1894,12 +2326,21 @@ class TestU18RtMinSnapshot:
 
         def fn(codes: list[str]) -> pd.DataFrame:
             called["n"] += 1
-            return mk_rt_min([{"ts_code": "300001.SZ", "close": 11.0, "vol": 1,
-                               "amount": 1, "trade_time": "2026-07-06 09:31:00"}])
+            return mk_rt_min(
+                [
+                    {
+                        "ts_code": "300001.SZ",
+                        "close": 11.0,
+                        "vol": 1,
+                        "amount": 1,
+                        "trade_time": "2026-07-06 09:31:00",
+                    }
+                ]
+            )
 
         out = fetch_full_market_snapshot(base, CumulativeTracker(), rt_min_fn=fn)
         assert out.attrs["route"] == "none" and out.empty
-        assert called["n"] == 0                            # 无代码 → 不发请求
+        assert called["n"] == 0  # 无代码 → 不发请求
 
 
 # ── U19 重启 seed（读上一份当日 snapshot_full 续算）plan U3 ──────────────────────
@@ -1907,25 +2348,50 @@ class TestU18RtMinSnapshot:
 
 class TestU19RestartSeed:
     def _base(self) -> SurgeBaseline:
-        return mk_baseline({}, code_universe=["300001.SZ"], name_map={"300001.SZ": "甲"},
-                           pre_close={"300001.SZ": 10.0})
+        return mk_baseline(
+            {},
+            code_universe=["300001.SZ"],
+            name_map={"300001.SZ": "甲"},
+            pre_close={"300001.SZ": 10.0},
+        )
 
     def _prev_snapshot(self, day: date, amount: float, vol: float) -> pd.DataFrame:
         """模拟上一份 snapshot_full（含累计 amount/volume + trade_time）。"""
-        return pd.DataFrame([{
-            "ts_code": "300001.SZ", "name": "甲", "price": 11.0, "pre_close": 10.0,
-            "pct_chg": 10.0, "volume": float(vol), "amount": float(amount),
-            "trade_time": pd.Timestamp(datetime.combine(day, dt_time(9, 31))),
-        }])
+        return pd.DataFrame(
+            [
+                {
+                    "ts_code": "300001.SZ",
+                    "name": "甲",
+                    "price": 11.0,
+                    "pre_close": 10.0,
+                    "pct_chg": 10.0,
+                    "volume": float(vol),
+                    "amount": float(amount),
+                    "trade_time": pd.Timestamp(datetime.combine(day, dt_time(9, 31))),
+                }
+            ]
+        )
 
     def test_seed_same_day_continues(self) -> None:
         day = date(2026, 7, 6)
         t = CumulativeTracker()
         assert t.seed(self._prev_snapshot(day, 5e7, 1e6), day) == 1
         # 续加 09:32 当分钟量 3e7 → 累计 8e7（承接 seed 的 5e7）
-        out = fetch_full_market_snapshot(self._base(), t, rt_min_fn=lambda c: mk_rt_min(
-            [{"ts_code": "300001.SZ", "close": 11.5, "vol": 1e6, "amount": 3e7,
-              "trade_time": "2026-07-06 09:32:00"}]))
+        out = fetch_full_market_snapshot(
+            self._base(),
+            t,
+            rt_min_fn=lambda c: mk_rt_min(
+                [
+                    {
+                        "ts_code": "300001.SZ",
+                        "close": 11.5,
+                        "vol": 1e6,
+                        "amount": 3e7,
+                        "trade_time": "2026-07-06 09:32:00",
+                    }
+                ]
+            ),
+        )
         assert out[out["ts_code"] == "300001.SZ"].iloc[0]["amount"] == 8e7
 
     def test_seed_other_day_from_zero(self) -> None:
@@ -1933,9 +2399,21 @@ class TestU19RestartSeed:
         t = CumulativeTracker()
         # 上一份是 7-4（非当日）→ 不 seed
         assert t.seed(self._prev_snapshot(date(2026, 7, 4), 5e7, 1e6), day) == 0
-        out = fetch_full_market_snapshot(self._base(), t, rt_min_fn=lambda c: mk_rt_min(
-            [{"ts_code": "300001.SZ", "close": 11.5, "vol": 1e6, "amount": 3e7,
-              "trade_time": "2026-07-06 09:32:00"}]))
+        out = fetch_full_market_snapshot(
+            self._base(),
+            t,
+            rt_min_fn=lambda c: mk_rt_min(
+                [
+                    {
+                        "ts_code": "300001.SZ",
+                        "close": 11.5,
+                        "vol": 1e6,
+                        "amount": 3e7,
+                        "trade_time": "2026-07-06 09:32:00",
+                    }
+                ]
+            ),
+        )
         assert out[out["ts_code"] == "300001.SZ"].iloc[0]["amount"] == 3e7  # 从零，非 8e7
 
     def test_run_seeds_from_prev_snapshot_full(self, tmp_path: Path) -> None:
@@ -1949,8 +2427,17 @@ class TestU19RestartSeed:
         import rquant.surge_watch as sw
 
         def fake_rt_min(codes: list[str]) -> pd.DataFrame:
-            return mk_rt_min([{"ts_code": "300001.SZ", "close": 11.5, "vol": 1e6,
-                               "amount": 3e7, "trade_time": "2026-07-06 09:32:00"}])
+            return mk_rt_min(
+                [
+                    {
+                        "ts_code": "300001.SZ",
+                        "close": 11.5,
+                        "vol": 1e6,
+                        "amount": 3e7,
+                        "trade_time": "2026-07-06 09:32:00",
+                    }
+                ]
+            )
 
         orig = sw._default_rt_min_fn
         sw._default_rt_min_fn = fake_rt_min
@@ -1964,8 +2451,7 @@ class TestU19RestartSeed:
                 minute_fetcher=lambda c, d: pd.DataFrame(),
                 notify_fn=lambda *a, **k: None,
                 now_fn=lambda: clock["t"],
-                sleep_fn=lambda s: clock.__setitem__(
-                    "t", clock["t"] + timedelta(seconds=s)),
+                sleep_fn=lambda s: clock.__setitem__("t", clock["t"] + timedelta(seconds=s)),
                 max_ticks=1,
             )
         finally:
@@ -1979,10 +2465,10 @@ class TestU19RestartSeed:
 
 class TestU20RtMinDailyConfirm:
     def test_today_cum_series_cumsum_and_future_nan(self) -> None:
-        bars = mk_rt_min_daily([1e5, 1e5, 1e5])            # 09:30/31/32 各 1e5
+        bars = mk_rt_min_daily([1e5, 1e5, 1e5])  # 09:30/31/32 各 1e5
         arr = today_cum_series_from_rt_min_daily(bars)
         assert arr[0] == 1e5 and arr[1] == 2e5 and arr[2] == 3e5  # cumsum
-        assert np.isnan(arr[3])                             # 未覆盖分钟 → NaN（不外推）
+        assert np.isnan(arr[3])  # 未覆盖分钟 → NaN（不外推）
 
     def test_empty_rt_min_daily_all_nan(self) -> None:
         arr = today_cum_series_from_rt_min_daily(pd.DataFrame())
@@ -2013,13 +2499,24 @@ class TestU20RtMinDailyConfirm:
         bars = mk_minute_bars({d - timedelta(days=i): [1e5] * 241 for i in (1, 2, 3)})
         base = mk_baseline({"300001.SZ": 1e4}, curve=flat_curve())  # avg20 微小 → rough 恒过
         w = SurgeWatcher(
-                         base,
-                         config=SurgeConfig(require_price_strength=require_price_strength),
-                         minute_fetcher=lambda c, dd: bars,
-                         today_cum_fetcher=today_cum_fetcher)
+            base,
+            config=SurgeConfig(require_price_strength=require_price_strength),
+            minute_fetcher=lambda c, dd: bars,
+            today_cum_fetcher=today_cum_fetcher,
+        )
         now = datetime(2026, 7, 6, 10, 0, tzinfo=CST)
-        snap = mk_snap([{"ts_code": "300001.SZ", "price": 100.0, "pre_close": 90,
-                         "pct_chg": 5, "volume": 1e8, "amount": snap_amount}])
+        snap = mk_snap(
+            [
+                {
+                    "ts_code": "300001.SZ",
+                    "price": 100.0,
+                    "pre_close": 90,
+                    "pct_chg": 5,
+                    "volume": 1e8,
+                    "amount": snap_amount,
+                }
+            ]
+        )
         return w, snap, now
 
     def test_precise_rt_min_daily_drives_confirm(self) -> None:
@@ -2032,7 +2529,7 @@ class TestU20RtMinDailyConfirm:
 
         # 快照 amount 仅 2e6 → 近似 rel=2e6/3.1e6=0.65<2.5，靠 rt_min_daily 精确值才确认
         w, snap, now = self._confirm_setup(today_cum_fetcher=fetch, snap_amount=2e6)
-        res = w.tick(snap, now)                             # 10:00 已过静默窗，确认即 flush
+        res = w.tick(snap, now)  # 10:00 已过静默窗，确认即 flush
         assert "300001.SZ" in w.pushed_today
         assert res.confirmed[0].rel_cum == 4.0
         assert res.confirmed[0].cum_amount == round(1.24e7, 0)  # 精确 cumsum 值入报文
@@ -2064,7 +2561,8 @@ class TestU20RtMinDailyConfirm:
         """rt_min_daily 空 → 退快照累加器近似（不阻塞）：rel 由快照 amount 决定。"""
         # 快照 amount = 1.24e7 → 累加器近似 rel=4.0 落带内 → 确认
         w, snap, now = self._confirm_setup(
-            today_cum_fetcher=lambda c, d: pd.DataFrame(), snap_amount=1.24e7)
+            today_cum_fetcher=lambda c, d: pd.DataFrame(), snap_amount=1.24e7
+        )
         res = w.tick(snap, now)
         assert "300001.SZ" in w.pushed_today
         assert res.confirmed[0].rel_cum == 4.0
@@ -2076,12 +2574,12 @@ class TestU20RtMinDailyConfirm:
 
         def fetch(c: str, d: date) -> pd.DataFrame:
             calls.append(c)
-            return mk_rt_min_daily([1e4] * 31)             # rel 极小 → 不确认，留缓存
+            return mk_rt_min_daily([1e4] * 31)  # rel 极小 → 不确认，留缓存
 
         w, snap, now = self._confirm_setup(today_cum_fetcher=fetch, snap_amount=1e4)
         w.tick(snap, datetime(2026, 7, 6, 10, 0, tzinfo=CST))
         w.tick(snap, datetime(2026, 7, 6, 10, 1, tzinfo=CST))
-        assert calls == ["300001.SZ"]                      # 仅一次 rt_min_daily
+        assert calls == ["300001.SZ"]  # 仅一次 rt_min_daily
 
 
 class TestPulseWiring:
@@ -2089,21 +2587,38 @@ class TestPulseWiring:
         from rquant.surge_watch import RUNTIME_CONFIG_NAME, SurgeBaseline, linear_progress_curve
 
         day = date(2026, 7, 29)
-        clock = iter([
-            datetime(2026, 7, 29, 9, 31, tzinfo=CST),
-            datetime(2026, 7, 29, 9, 32, tzinfo=CST),
-            datetime(2026, 7, 29, 9, 33, tzinfo=CST),
-            datetime(2026, 7, 29, 9, 34, tzinfo=CST),
-        ])
-        snap = pd.DataFrame([{
-            "ts_code": "300001.SZ", "name": "T1", "price": 10.5, "high": 10.6,
-            "pre_close": 10.0, "pct_chg": 5.0, "volume": 1e6, "amount": 1e7,
-            "limit_up_price": 12.0, "limit_down_price": 8.0,
-        }])
+        clock = iter(
+            [
+                datetime(2026, 7, 29, 9, 31, tzinfo=CST),
+                datetime(2026, 7, 29, 9, 32, tzinfo=CST),
+                datetime(2026, 7, 29, 9, 33, tzinfo=CST),
+                datetime(2026, 7, 29, 9, 34, tzinfo=CST),
+            ]
+        )
+        snap = pd.DataFrame(
+            [
+                {
+                    "ts_code": "300001.SZ",
+                    "name": "T1",
+                    "price": 10.5,
+                    "high": 10.6,
+                    "pre_close": 10.0,
+                    "pct_chg": 5.0,
+                    "volume": 1e6,
+                    "amount": 1e7,
+                    "limit_up_price": 12.0,
+                    "limit_down_price": 8.0,
+                }
+            ]
+        )
         snap.attrs["route"] = "test"
         run_surge_watch(
-            dry_run=True, force_session=True, max_ticks=2, base_dir=tmp_path,
-            now_fn=lambda: next(clock), sleep_fn=lambda s: None,
+            dry_run=True,
+            force_session=True,
+            max_ticks=2,
+            base_dir=tmp_path,
+            now_fn=lambda: next(clock),
+            sleep_fn=lambda s: None,
             snapshot_fetcher=lambda: snap.copy(),
             minute_fetcher=lambda code, d: pd.DataFrame(),
             is_trading_day_fn=lambda d: True,

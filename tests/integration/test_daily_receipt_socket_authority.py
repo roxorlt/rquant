@@ -267,8 +267,7 @@ def test_socket_authority_identity_probe_is_nonce_bound_and_signed(
         assert response.key_id == key_id
         assert len(response.source_sha256) == 64
         source = (
-            Path(__file__).resolve().parents[2]
-            / "src/rquant/daily_receipt_socket_authority.py"
+            Path(__file__).resolve().parents[2] / "src/rquant/daily_receipt_socket_authority.py"
         )
         assert response.source_sha256 == hashlib.sha256(source.read_bytes()).hexdigest()
     finally:
@@ -426,8 +425,8 @@ def test_socket_authority_signs_with_the_active_key_only_after_rotation(
 ) -> None:
     """Rotation keeps retired keys for history verification, never for new signatures."""
 
-    keys_path, active_key_id, active_public, previous_key_id, previous_public = (
-        _rotated_manifest(tmp_path)
+    keys_path, active_key_id, active_public, previous_key_id, previous_public = _rotated_manifest(
+        tmp_path
     )
     process, socket_path = _start_server(tmp_path, keys_path=keys_path, max_connections=1)
     try:

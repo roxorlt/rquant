@@ -415,9 +415,7 @@ def _open_verified_root(root: Path) -> int:
     try:
         descriptor = os.open(root, flags)
     except OSError as exc:
-        raise LabHighWaterAuthorityError(
-            "high-water state root cannot be opened safely"
-        ) from exc
+        raise LabHighWaterAuthorityError("high-water state root cannot be opened safely") from exc
     try:
         observed = os.fstat(descriptor)
         if (
@@ -491,9 +489,7 @@ class _LabHighWaterStore:
         except FileNotFoundError:
             return None
         except OSError as exc:
-            raise LabHighWaterAuthorityError(
-                f"high-water {name} cannot be opened safely"
-            ) from exc
+            raise LabHighWaterAuthorityError(f"high-water {name} cannot be opened safely") from exc
         try:
             before = os.fstat(file_descriptor)
             if (
@@ -612,11 +608,7 @@ class _LabHighWaterStore:
         else:
             expected_sequence = checkpoint.sequence + 1
             previous_hash = checkpoint.record_hash
-        if (
-            checkpoint is not None
-            and raw_records
-            and raw_records[0].sequence != expected_sequence
-        ):
+        if checkpoint is not None and raw_records and raw_records[0].sequence != expected_sequence:
             self._verify_stale_chain(raw_records, checkpoint=checkpoint)
             return _StoreState(checkpoint=checkpoint, records=(), needs_truncate=True)
         for record in raw_records:
@@ -682,10 +674,7 @@ class _LabHighWaterStore:
         try:
             lock_descriptor = os.open(
                 _WRITER_LOCK_NAME,
-                os.O_RDWR
-                | os.O_CREAT
-                | getattr(os, "O_NOFOLLOW", 0)
-                | getattr(os, "O_CLOEXEC", 0),
+                os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
                 0o600,
                 dir_fd=descriptor,
             )
@@ -901,9 +890,9 @@ class LabHighWaterAuthorityServer:
         head = state.head
         if head is not None and head.request_id == request.request_id:
             if self._request_matches_head(request, head):
-                return self._journaled(request, self._completed(
-                    request.request_id, outcome="unchanged", state=head
-                ))
+                return self._journaled(
+                    request, self._completed(request.request_id, outcome="unchanged", state=head)
+                )
             return self._refused(
                 request.request_id,
                 code="replay",
@@ -941,9 +930,9 @@ class LabHighWaterAuthorityServer:
             client_key_id=request.key_id,
         )
         self.store.append(record)
-        return self._journaled(request, self._completed(
-            request.request_id, outcome="advanced", state=record
-        ))
+        return self._journaled(
+            request, self._completed(request.request_id, outcome="advanced", state=record)
+        )
 
     def _journaled(self, request: LabHighWaterAdvanceRequest, response_line: bytes) -> bytes:
         with self._journal_lock:
@@ -1123,18 +1112,12 @@ class LabHighWaterAuthorityClient:
                 raise LabHighWaterAuthorityError(
                     "high-water anchored schema generation conflicts with the observed ledger"
                 )
-            if (
-                chain_generation < head.chain_generation
-                or mutation_epoch < head.mutation_epoch
-            ):
+            if chain_generation < head.chain_generation or mutation_epoch < head.mutation_epoch:
                 raise LabHighWaterRollbackError(
                     "observed Lab ledger is behind the high-water authority"
                 )
             if chain_generation == head.chain_generation:
-                if (
-                    mutation_epoch != head.mutation_epoch
-                    or chain_head_hash != head.chain_head_hash
-                ):
+                if mutation_epoch != head.mutation_epoch or chain_head_hash != head.chain_head_hash:
                     raise LabHighWaterAuthorityError(
                         "observed Lab chain changed in place behind the high-water authority"
                     )

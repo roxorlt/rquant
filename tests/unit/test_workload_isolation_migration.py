@@ -42,7 +42,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
     capability.chmod(0o600)
     _write_executable(
         bin_dir / "systemctl",
-        r'''#!/usr/bin/env bash
+        r"""#!/usr/bin/env bash
 set -euo pipefail
 root=$(cd "$(dirname "$0")/../.." && pwd)
 state="${root}/state"
@@ -131,11 +131,11 @@ case "${1:-}" in
     exit 9
     ;;
 esac
-''',
+""",
     )
     _write_executable(
         bin_dir / "rm",
-        r'''#!/usr/bin/env bash
+        r"""#!/usr/bin/env bash
 set -euo pipefail
 root=$(cd "$(dirname "$0")/../.." && pwd)
 state="${root}/state"
@@ -145,11 +145,11 @@ if [[ "${RQUANT_MIGRATION_FAULT:-}" == remove && ! -e "${marker}" ]]; then
     exit 1
 fi
 exec /bin/rm "$@"
-''',
+""",
     )
     _write_executable(
         bin_dir / "flock",
-        f'''#!{sys.executable}
+        f"""#!{sys.executable}
 import fcntl
 import os
 import pathlib
@@ -166,11 +166,11 @@ if hold_seconds:
     root = pathlib.Path(__file__).resolve().parents[2]
     (root / "state" / "migration-lock-held").write_text("held\\n", encoding="utf-8")
     time.sleep(hold_seconds)
-''',
+""",
     )
     _write_executable(
         bin_dir / "sync",
-        r'''#!/usr/bin/env bash
+        r"""#!/usr/bin/env bash
 set -euo pipefail
 root=$(cd "$(dirname "$0")/../.." && pwd)
 state="${root}/state"
@@ -204,7 +204,7 @@ if [[ -e "${units}/rquant-runtime-live@.service" ]]; then
 else
     /bin/rm -f "${state}/durable-template"
 fi
-''',
+""",
     )
     (bin_dir / "python3").symlink_to(sys.executable)
     return root, unit_dir, state_dir
@@ -301,9 +301,7 @@ def test_test_root_guard_precedes_all_derived_or_mutating_paths() -> None:
     script = SCRIPT.read_text(encoding="utf-8")
 
     euid_guard = script.index("EUID == 0")
-    canonicalization = script.index(
-        'canonical_test_root=$(canonicalize_test_root "${TEST_ROOT}")'
-    )
+    canonicalization = script.index('canonical_test_root=$(canonicalize_test_root "${TEST_ROOT}")')
     test_systemctl = script.index('SYSTEMCTL="${TEST_ROOT}/usr/bin/systemctl"')
     first_mkdir = script.index('"${MKDIR}" -p -- "${JOURNAL_ROOT}"')
     assert euid_guard < canonicalization < test_systemctl < first_mkdir
@@ -599,14 +597,10 @@ def test_migration_uses_fixed_lifetime_lock_and_atomic_journal_writes() -> None:
     assert '>"${STAGING_DIR}/phase"' not in script
     assert "filesystem_durability_barrier rollback || return 1" in script
     rollback_barrier = script.index("filesystem_durability_barrier rollback")
-    rollback_journal_delete = script.index(
-        'remove_journal "${journal}"', rollback_barrier
-    )
+    rollback_journal_delete = script.index('remove_journal "${journal}"', rollback_barrier)
     assert rollback_barrier < rollback_journal_delete
     accept_barrier = script.rindex("filesystem_durability_barrier accept")
-    committed_phase = script.rindex(
-        'write_transaction_phase "${TRANSACTION_DIR}" committed'
-    )
+    committed_phase = script.rindex('write_transaction_phase "${TRANSACTION_DIR}" committed')
     assert accept_barrier < committed_phase
 
 

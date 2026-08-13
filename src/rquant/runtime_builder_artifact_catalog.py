@@ -126,9 +126,7 @@ def artifact_catalog_builder(
         lifecycle = open_artifact_terminal_lifecycle()
         try:
             if lifecycle.catalog_registration_sink is None:
-                raise RuntimeError(
-                    "artifact catalog lifecycle registration capability is missing"
-                )
+                raise RuntimeError("artifact catalog lifecycle registration capability is missing")
             composition = build_lab_artifact_owner_reader_composition(
                 lab_jobs_path=settings.lab_jobs_path,
                 lab_jobs_managed_trust_root=settings.research_root,

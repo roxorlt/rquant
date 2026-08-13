@@ -128,12 +128,8 @@ def _service_for(
             lab_backend=lab_backend,
             clock=lambda: now,
             lease_seconds=1,
-            canvas_publication_signer=(
-                None if authority is None else authority.signer
-            ),
-            canvas_publication_keyring=(
-                None if authority is None else authority.keyring
-            ),
+            canvas_publication_signer=(None if authority is None else authority.signer),
+            canvas_publication_keyring=(None if authority is None else authority.keyring),
         ),
     )
 
@@ -445,9 +441,7 @@ def test_page_control_save_canvas_writes_signed_immutable_publication_receipt(
     record_path = data_dir / "canvases" / "breakout.json"
     catalog_record = json.loads(record_path.read_text(encoding="utf-8"))
     publication_receipt_id = receipt.result["publication_receipt_id"]
-    publication_path = (
-        data_dir / "canvas-publication-receipts" / f"{publication_receipt_id}.json"
-    )
+    publication_path = data_dir / "canvas-publication-receipts" / f"{publication_receipt_id}.json"
     assert publication_path.exists()
     publication = CanvasPublicationReceipt.model_validate_json(
         publication_path.read_text(encoding="utf-8")
@@ -469,9 +463,9 @@ def test_page_control_save_canvas_writes_signed_immutable_publication_receipt(
     assert publication.receipt_id == catalog_record["publication_receipt_id"]
     assert publication.receipt_id == receipt.result["publication_receipt_id"]
     assert publication.receipt_hash == receipt.result["publication_receipt_hash"]
-    assert receipt.result["publication_generation_id"] == catalog_record[
-        "publication_generation_id"
-    ]
+    assert (
+        receipt.result["publication_generation_id"] == catalog_record["publication_generation_id"]
+    )
     assert receipt.result["publication_effect_id"] == publication.claims.effect_id
 
 
@@ -632,9 +626,10 @@ def test_page_control_restart_replays_incomplete_canvas_command_once(
 
     assert first.status == duplicate.status == "succeeded"
     assert first.result == duplicate.result
-    assert json.loads((data_dir / "canvases" / "breakout.json").read_text())[
-        "record_hash"
-    ] == first.result["record_hash"]
+    assert (
+        json.loads((data_dir / "canvases" / "breakout.json").read_text())["record_hash"]
+        == first.result["record_hash"]
+    )
 
 
 def test_page_control_restart_after_signed_canvas_receipt_reuses_byte_identical_publication(
@@ -698,12 +693,10 @@ def test_page_control_restart_after_signed_canvas_receipt_reuses_byte_identical_
     assert duplicate.result == first.result
     assert tuple((data_dir / "canvas-publication-receipts").glob("*.json")) == receipt_files
     assert receipt_files[0].read_bytes() == first_bytes
-    assert first.result["publication_generation_id"] == duplicate.result[
-        "publication_generation_id"
-    ]
-    assert first.result["publication_receipt_hash"] == duplicate.result[
-        "publication_receipt_hash"
-    ]
+    assert (
+        first.result["publication_generation_id"] == duplicate.result["publication_generation_id"]
+    )
+    assert first.result["publication_receipt_hash"] == duplicate.result["publication_receipt_hash"]
 
 
 def test_page_control_default_consumer_identity_reuses_receipt_after_restart(
@@ -778,9 +771,7 @@ def test_page_control_default_consumer_identity_reuses_receipt_after_restart(
 
     assert first.status is PageControlStatus.SUCCEEDED
     assert duplicate.result == first.result
-    assert tuple((data_dir / "canvas-publication-receipts").glob("*.json")) == (
-        first_receipt_path,
-    )
+    assert tuple((data_dir / "canvas-publication-receipts").glob("*.json")) == (first_receipt_path,)
     assert first_receipt_path.read_bytes() == first_bytes
     publication = CanvasPublicationReceipt.model_validate_json(
         first_receipt_path.read_text(encoding="utf-8")
@@ -1459,9 +1450,10 @@ def test_page_control_save_canvas_resumes_after_effect_crash_without_rewriting(
 
     assert receipt.status is PageControlStatus.SUCCEEDED
     assert writes == [data_dir / "canvases" / "breakout.json"]
-    assert json.loads((data_dir / "canvases" / "breakout.json").read_text())[
-        "command_id"
-    ] == "after-effect-canvas"
+    assert (
+        json.loads((data_dir / "canvases" / "breakout.json").read_text())["command_id"]
+        == "after-effect-canvas"
+    )
 
 
 def test_page_control_set_canvas_pool_refs_resumes_after_effect_crash_without_rewriting(
@@ -1517,9 +1509,10 @@ def test_page_control_set_canvas_pool_refs_resumes_after_effect_crash_without_re
 
     assert receipt.status is PageControlStatus.SUCCEEDED
     assert writes == [data_dir / "canvases" / "breakout.json"]
-    assert json.loads((data_dir / "canvases" / "breakout.json").read_text())[
-        "pool_refs"
-    ] == ["n-shape-pool1", "user/strong"]
+    assert json.loads((data_dir / "canvases" / "breakout.json").read_text())["pool_refs"] == [
+        "n-shape-pool1",
+        "user/strong",
+    ]
 
 
 def test_page_control_user_pool_commands_resume_after_effect_crash_without_rewriting(
@@ -1657,9 +1650,9 @@ def test_page_control_save_user_pool_canvas_chain_resumes_partial_effect(
         data_dir / "user_presets" / "breakout.json",
         data_dir / "canvases" / "breakout.json",
     ]
-    assert json.loads((data_dir / "canvases" / "breakout.json").read_text())[
-        "pool_refs"
-    ] == ["user/breakout"]
+    assert json.loads((data_dir / "canvases" / "breakout.json").read_text())["pool_refs"] == [
+        "user/breakout"
+    ]
 
 
 def test_page_control_fork_builtin_canvas_chain_resumes_partial_effect(
@@ -1725,9 +1718,9 @@ def test_page_control_fork_builtin_canvas_chain_resumes_partial_effect(
         data_dir / "user_presets" / "forked.json",
         data_dir / "canvases" / "breakout.json",
     ]
-    assert json.loads((data_dir / "canvases" / "breakout.json").read_text())[
-        "pool_refs"
-    ] == ["user/forked"]
+    assert json.loads((data_dir / "canvases" / "breakout.json").read_text())["pool_refs"] == [
+        "user/forked"
+    ]
 
 
 def test_page_control_mutex_blocks_local_stale_reclaim_before_canvas_write(

@@ -238,9 +238,7 @@ class TestIdentityBinding:
             _observe(rotated, mutation_epoch=4, chain_generation=2, chain_head_hash=HEAD_HASH_B)
 
     def test_identity_rotation_allowed_when_configured(self, tmp_path: Path) -> None:
-        server = LabHighWaterAuthorityServer(
-            _server_config(tmp_path, allow_identity_rotation=True)
-        )
+        server = LabHighWaterAuthorityServer(_server_config(tmp_path, allow_identity_rotation=True))
         server.bind()
         stop = threading.Event()
         thread = threading.Thread(target=server.serve_forever, kwargs={"stop": stop}, daemon=True)
@@ -295,9 +293,7 @@ class TestKeyAuthority:
         assert head is not None
         assert head.client_key_id == CLIENT_KEY_2.key_id
 
-    def test_client_rejects_untrusted_authority_signature(
-        self, authority_root: Path
-    ) -> None:
+    def test_client_rejects_untrusted_authority_signature(self, authority_root: Path) -> None:
         other_authority = LabHighWaterKey(key_id="authority-2", secret=b"z" * 32)
         server = LabHighWaterAuthorityServer(
             _server_config(authority_root, signing_key_provider=lambda: other_authority)
@@ -500,9 +496,7 @@ class TestDurability:
             thread2.join(timeout=10)
 
     def test_unreachable_authority_fails_closed(self, tmp_path: Path) -> None:
-        client = LabHighWaterAuthorityClient(
-            _client_config(tmp_path, timeout_seconds=0.5)
-        )
+        client = LabHighWaterAuthorityClient(_client_config(tmp_path, timeout_seconds=0.5))
         with pytest.raises(LabHighWaterAuthorityError):
             _observe(client, mutation_epoch=1, chain_generation=1)
         with pytest.raises(LabHighWaterAuthorityError):
