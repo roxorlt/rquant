@@ -1303,7 +1303,9 @@ Inventory = Callable[[float], dict[int, _ProcessObservation]]
 _CONTAINMENT_ENVIRONMENT_KEY = "RQUANT_CONTAINMENT_TOKEN"
 _MAX_PROCESS_ARGUMENT_BYTES = 4 * 1024 * 1024
 _LINUX_SUBREAPER_LOCK = threading.Lock()
-_LINUX_SUBREAPER_OWNERSHIP = threading.local()
+_LINUX_SUBREAPER_METADATA_LOCK = threading.Lock()
+_LINUX_SUBREAPER_MEMBERSHIP = threading.local()
+_LINUX_SUBREAPER_RECORD: _LinuxSubreaperOwnershipRecord | None = None
 _DARWIN_UNIQUE_IDENTITY_FLAVOR = 17
 _DARWIN_UNIQUE_IDENTITY_SIZE = 56
 _DARWIN_LIST_FDS_FLAVOR = 1
@@ -1314,6 +1316,20 @@ _DARWIN_PIPE_HANDLE_OFFSET = 160
 _DARWIN_FD_ENTRY_SIZE = 8
 _MAX_DARWIN_FD_LIST_BYTES = 4 * 1024 * 1024
 DarwinPipeMarker = tuple[int, int]
+
+
+@dataclass
+class _LinuxSubreaperOwnershipRecord:
+    """The sole process-wide authority for an active Linux subreaper boundary."""
+
+    token: object
+    owner_thread: threading.Thread
+    outer: _LinuxSubreaperProcessTracker
+    members: set[_LinuxSubreaperProcessTracker]
+    depth: int
+    previous_subreaper: int = 0
+    subreaper_changed: bool = False
+    phase: str = "ACQUIRING"
 
 
 def _file_descriptor_is_closed(
@@ -1986,38 +2002,91 @@ class _LinuxSubreaperProcessTracker:
         self._root_pid: int | None = None
         self._root_started: tuple[int, int] | None = None
         self._root_identity: ProcessIdentity | None = None
-        self._previous_subreaper = 0
-        self._owns_subreaper_lock = False
-        self._subreaper_changed = False
-        self._subreaper_owner: _LinuxSubreaperProcessTracker | None = None
-        self._subreaper_depth = 0
-        self._nested_trackers: set[_LinuxSubreaperProcessTracker] = set()
+        self._subreaper_record: _LinuxSubreaperOwnershipRecord | None = None
+        self._subreaper_lifecycle = "NEW"
         self._excluded_ancestor_roots: set[ProcessIdentity] = set()
 
     def _enable_subreaper(self, deadline: float) -> None:
+        global _LINUX_SUBREAPER_RECORD
+
         _require_no_execution_hooks()
-        owner = getattr(_LINUX_SUBREAPER_OWNERSHIP, "owner", None)
-        if owner is not None:
-            owner._subreaper_depth += 1
-            self._subreaper_owner = owner
-            owner._nested_trackers.add(self)
-            return
+        current_thread = threading.current_thread()
+        with _LINUX_SUBREAPER_METADATA_LOCK:
+            record = _LINUX_SUBREAPER_RECORD
+            member_token = getattr(_LINUX_SUBREAPER_MEMBERSHIP, "token", None)
+            if record is not None and current_thread is record.owner_thread:
+                if member_token is not record.token:
+                    raise ContainedProcessError("subreaper ownership token is invalid")
+                if record.phase != "ACTIVE":
+                    raise ContainedProcessError("subreaper ownership transition is in progress")
+                if self._subreaper_lifecycle != "NEW":
+                    raise ContainedProcessError("subreaper tracker is already registered")
+                record.members.add(self)
+                record.depth += 1
+                self._subreaper_record = record
+                self._subreaper_lifecycle = "ACTIVE"
+                return
+            if self._subreaper_lifecycle != "NEW":
+                raise ContainedProcessError("subreaper tracker is already registered")
+            self._subreaper_lifecycle = "REGISTERING"
+
         remaining = deadline - time.monotonic()
         if remaining <= 0 or not _LINUX_SUBREAPER_LOCK.acquire(timeout=remaining):
+            with _LINUX_SUBREAPER_METADATA_LOCK:
+                if self._subreaper_lifecycle == "REGISTERING":
+                    self._subreaper_lifecycle = "NEW"
             raise TimeoutError("subreaper registration deadline expired")
-        self._owns_subreaper_lock = True
-        self._subreaper_owner = self
-        self._subreaper_depth = 1
-        _LINUX_SUBREAPER_OWNERSHIP.owner = self
-        libc = ctypes.CDLL(None, use_errno=True)
-        current = ctypes.c_int()
-        if libc.prctl(self._PR_GET_CHILD_SUBREAPER, ctypes.byref(current), 0, 0, 0) != 0:
-            raise ContainedProcessError("could not read child subreaper state")
-        self._previous_subreaper = int(current.value)
-        if self._previous_subreaper != 1:
-            if libc.prctl(self._PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
-                raise ContainedProcessError("could not enable child subreaper")
-            self._subreaper_changed = True
+
+        token = object()
+        record = _LinuxSubreaperOwnershipRecord(
+            token=token,
+            owner_thread=current_thread,
+            outer=self,
+            members={self},
+            depth=1,
+        )
+        with _LINUX_SUBREAPER_METADATA_LOCK:
+            if _LINUX_SUBREAPER_RECORD is not None:
+                self._subreaper_lifecycle = "NEW"
+                _LINUX_SUBREAPER_LOCK.release()
+                raise ContainedProcessError("subreaper ownership registration raced")
+            _LINUX_SUBREAPER_RECORD = record
+            _LINUX_SUBREAPER_MEMBERSHIP.token = token
+            self._subreaper_record = record
+
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            current = ctypes.c_int()
+            if libc.prctl(self._PR_GET_CHILD_SUBREAPER, ctypes.byref(current), 0, 0, 0) != 0:
+                raise ContainedProcessError("could not read child subreaper state")
+            previous_subreaper = int(current.value)
+            changed = False
+            if previous_subreaper != 1:
+                if libc.prctl(self._PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
+                    raise ContainedProcessError("could not enable child subreaper")
+                changed = True
+        except BaseException as exc:
+            with _LINUX_SUBREAPER_METADATA_LOCK:
+                if _LINUX_SUBREAPER_RECORD is record:
+                    _LINUX_SUBREAPER_RECORD = None
+                if getattr(_LINUX_SUBREAPER_MEMBERSHIP, "token", None) is token:
+                    del _LINUX_SUBREAPER_MEMBERSHIP.token
+                self._subreaper_record = None
+                self._subreaper_lifecycle = "NEW"
+            _LINUX_SUBREAPER_LOCK.release()
+            if isinstance(exc, ContainedProcessError):
+                raise
+            raise ContainedProcessError("could not configure child subreaper state") from exc
+
+        with _LINUX_SUBREAPER_METADATA_LOCK:
+            if _LINUX_SUBREAPER_RECORD is not record:
+                raise ContainedProcessError(
+                    "subreaper ownership record was lost during registration"
+                )
+            record.previous_subreaper = previous_subreaper
+            record.subreaper_changed = changed
+            record.phase = "ACTIVE"
+            self._subreaper_lifecycle = "ACTIVE"
 
     def _bind_pid(self, identity: ProcessIdentity) -> None:
         _require_no_execution_hooks()
@@ -2076,13 +2145,14 @@ class _LinuxSubreaperProcessTracker:
         self._root_pid = pid
         self._root_started = observed.identity.started
         self._root_identity = observed.identity
-        owner = self._subreaper_owner
-        if owner is not None and owner is not self:
-            self._excluded_ancestor_roots = {
-                tracker._root_identity
-                for tracker in (owner, *owner._nested_trackers)
-                if tracker is not self and tracker._root_identity is not None
-            }
+        with _LINUX_SUBREAPER_METADATA_LOCK:
+            record = self._subreaper_record
+            if record is not None:
+                self._excluded_ancestor_roots = {
+                    tracker._root_identity
+                    for tracker in record.members
+                    if tracker is not self and tracker._root_identity is not None
+                }
         self._bind_pid(observed.identity)
         return observed.identity
 
@@ -2120,6 +2190,41 @@ class _LinuxSubreaperProcessTracker:
         return dict(self._known)
 
     def close(self) -> None:
+        global _LINUX_SUBREAPER_RECORD
+
+        record: _LinuxSubreaperOwnershipRecord | None = None
+        is_outer = False
+        with _LINUX_SUBREAPER_METADATA_LOCK:
+            if self._subreaper_lifecycle == "REGISTERING":
+                raise ContainedProcessError("subreaper ownership transition is in progress")
+            record = self._subreaper_record
+            if record is not None:
+                if (
+                    _LINUX_SUBREAPER_RECORD is not record
+                    or self not in record.members
+                    or record.phase != "ACTIVE"
+                ):
+                    raise ContainedProcessError("subreaper ownership record is invalid")
+                if (
+                    threading.current_thread() is not record.owner_thread
+                    or getattr(_LINUX_SUBREAPER_MEMBERSHIP, "token", None) is not record.token
+                ):
+                    raise ContainedProcessError("subreaper ownership belongs to a different thread")
+                is_outer = record.outer is self
+                if is_outer:
+                    if record.depth != 1:
+                        raise ContainedProcessError(
+                            "nested subreaper tracker remains active during cleanup"
+                        )
+                    record.phase = "RESTORING"
+                else:
+                    if record.depth <= 1:
+                        raise ContainedProcessError("subreaper ownership depth is invalid")
+                    record.members.remove(self)
+                    record.depth -= 1
+                    self._subreaper_record = None
+                    self._subreaper_lifecycle = "CLOSED"
+
         cleanup_errors: list[BaseException] = []
         remaining_descriptors: list[int] = []
         for descriptor in (*self._pending_pidfds, *self._pidfds.values()):
@@ -2140,56 +2245,43 @@ class _LinuxSubreaperProcessTracker:
                 cleanup_errors,
                 ContainedProcessError("kernel process tracker descriptors remain open"),
             )
-        restore_failed = False
-        owner = self._subreaper_owner
-        if owner is not None and owner is not self:
-            if getattr(_LINUX_SUBREAPER_OWNERSHIP, "owner", None) is not owner:
-                _record_cleanup_error(
-                    cleanup_errors,
-                    ContainedProcessError("subreaper ownership belongs to a different thread"),
-                )
-            elif owner._subreaper_depth <= 1:
-                _record_cleanup_error(
-                    cleanup_errors,
-                    ContainedProcessError("subreaper ownership depth is invalid"),
-                )
-            else:
-                owner._subreaper_depth -= 1
-                self._subreaper_owner = None
-                owner._nested_trackers.discard(self)
-        elif self._owns_subreaper_lock:
-            if owner is self and self._subreaper_depth != 1:
-                _record_cleanup_error(
-                    cleanup_errors,
-                    ContainedProcessError("nested subreaper tracker remains active during cleanup"),
-                )
-            else:
-                if owner is self:
-                    del _LINUX_SUBREAPER_OWNERSHIP.owner
-                    self._subreaper_owner = None
-                    self._subreaper_depth = 0
-                try:
-                    if self._subreaper_changed:
-                        libc = ctypes.CDLL(None, use_errno=True)
-                        restore_failed = (
-                            libc.prctl(
-                                self._PR_SET_CHILD_SUBREAPER,
-                                self._previous_subreaper,
-                                0,
-                                0,
-                                0,
-                            )
-                            != 0
+        if record is not None and is_outer:
+            restore_failed = False
+            try:
+                if record.subreaper_changed:
+                    libc = ctypes.CDLL(None, use_errno=True)
+                    restore_failed = (
+                        libc.prctl(
+                            self._PR_SET_CHILD_SUBREAPER,
+                            record.previous_subreaper,
+                            0,
+                            0,
                         )
-                finally:
-                    self._subreaper_changed = False
-                    self._owns_subreaper_lock = False
-                    _LINUX_SUBREAPER_LOCK.release()
-        if restore_failed:
-            _record_cleanup_error(
-                cleanup_errors,
-                ContainedProcessError("could not restore child subreaper state"),
-            )
+                        != 0
+                    )
+            except BaseException:
+                restore_failed = True
+            if restore_failed:
+                with _LINUX_SUBREAPER_METADATA_LOCK:
+                    if _LINUX_SUBREAPER_RECORD is record:
+                        record.phase = "ACTIVE"
+                _record_cleanup_error(
+                    cleanup_errors,
+                    ContainedProcessError("could not restore child subreaper state"),
+                )
+            else:
+                with _LINUX_SUBREAPER_METADATA_LOCK:
+                    if _LINUX_SUBREAPER_RECORD is not record:
+                        raise ContainedProcessError("subreaper ownership record is invalid")
+                    if getattr(_LINUX_SUBREAPER_MEMBERSHIP, "token", None) is not record.token:
+                        raise ContainedProcessError("subreaper ownership token is invalid")
+                    del _LINUX_SUBREAPER_MEMBERSHIP.token
+                    _LINUX_SUBREAPER_RECORD = None
+                    record.members.remove(self)
+                    record.depth = 0
+                    self._subreaper_record = None
+                    self._subreaper_lifecycle = "CLOSED"
+                _LINUX_SUBREAPER_LOCK.release()
         if cleanup_errors:
             _raise_tracker_cleanup_error(
                 "kernel process tracker cleanup failed",

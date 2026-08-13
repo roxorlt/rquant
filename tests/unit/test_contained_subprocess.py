@@ -353,9 +353,8 @@ def test_linux_register_root_rejects_hooks_before_tracker_state_changes(
         assert tracker._known == {}
         assert tracker._pidfds == {}
         assert tracker._pending_pidfds == []
-        assert not tracker._owns_subreaper_lock
-        assert not tracker._subreaper_changed
-        assert tracker._previous_subreaper == 0
+        assert tracker._subreaper_lifecycle == "NEW"
+        assert tracker._subreaper_record is None
         assert sys.gettrace() is (trace_hook if use_trace else None)
         assert sys.getprofile() is (profile_hook if use_profile else None)
     finally:
@@ -406,9 +405,8 @@ def test_linux_enable_subreaper_rejects_hooks_before_lock_and_prctl(
             tracker._enable_subreaper(time.monotonic() + 1)
 
         assert calls == {"lock": 0, "cdll": 0, "prctl": 0}
-        assert not tracker._owns_subreaper_lock
-        assert not tracker._subreaper_changed
-        assert tracker._previous_subreaper == 0
+        assert tracker._subreaper_lifecycle == "NEW"
+        assert tracker._subreaper_record is None
         assert sys.gettrace() is (trace_hook if hook_kind == "trace" else None)
         assert sys.getprofile() is (profile_hook if hook_kind == "profile" else None)
     finally:
@@ -1286,18 +1284,14 @@ def test_linux_poll_rejects_hooks_before_inventory_and_state_changes(
         tracker._known[descendant.pid] = descendant
     tracker._pidfds = {root.pid: 9001}
     tracker._pending_pidfds = [9002]
-    tracker._previous_subreaper = 1
-    tracker._owns_subreaper_lock = True
-    tracker._subreaper_changed = True
     expected_state = (
         dict(tracker._known),
         dict(tracker._pidfds),
         list(tracker._pending_pidfds),
         tracker._root_pid,
         tracker._root_started,
-        tracker._previous_subreaper,
-        tracker._owns_subreaper_lock,
-        tracker._subreaper_changed,
+        tracker._subreaper_lifecycle,
+        tracker._subreaper_record,
     )
     inventory_calls = 0
 
@@ -1330,9 +1324,8 @@ def test_linux_poll_rejects_hooks_before_inventory_and_state_changes(
             list(tracker._pending_pidfds),
             tracker._root_pid,
             tracker._root_started,
-            tracker._previous_subreaper,
-            tracker._owns_subreaper_lock,
-            tracker._subreaper_changed,
+            tracker._subreaper_lifecycle,
+            tracker._subreaper_record,
         ) == expected_state
         assert sys.gettrace() is (trace_hook if hook_kind in {"trace", "both"} else None)
         assert sys.getprofile() is (profile_hook if hook_kind in {"profile", "both"} else None)
@@ -3219,31 +3212,324 @@ def test_linux_subreaper_non_owner_thread_cannot_reenter(
     assert isinstance(second_failure[0], TimeoutError)
 
 
-def test_linux_subreaper_restore_failure_releases_process_wide_lock(monkeypatch) -> None:
-    tracker = contained._LinuxSubreaperProcessTracker()
-    tracker._owns_subreaper_lock = True
-    tracker._previous_subreaper = 0
-    tracker._subreaper_changed = True
-    released: list[bool] = []
+class _FakeLinuxSubreaperLibc:
+    subreaper = 0
+    fail_get = False
+    fail_enable = False
+    restore_failures = 0
+    calls: list[tuple[int, int]] = []
 
-    class _FailingLibc:
-        @staticmethod
-        def prctl(*_args) -> int:
+    @classmethod
+    def reset(cls) -> None:
+        cls.subreaper = 0
+        cls.fail_get = False
+        cls.fail_enable = False
+        cls.restore_failures = 0
+        cls.calls = []
+
+    @classmethod
+    def prctl(cls, operation: int, value: object, *_args: object) -> int:
+        if operation == contained._LinuxSubreaperProcessTracker._PR_GET_CHILD_SUBREAPER:
+            cls.calls.append((operation, cls.subreaper))
+            if cls.fail_get:
+                return -1
+            ctypes.cast(value, ctypes.POINTER(ctypes.c_int)).contents.value = cls.subreaper
+            return 0
+        assert operation == contained._LinuxSubreaperProcessTracker._PR_SET_CHILD_SUBREAPER
+        assert isinstance(value, int)
+        cls.calls.append((operation, value))
+        if value == 1 and cls.fail_enable:
             return -1
+        if value == 0 and cls.restore_failures:
+            cls.restore_failures -= 1
+            return -1
+        cls.subreaper = value
+        return 0
 
-    class _FakeLock:
-        @staticmethod
-        def release() -> None:
-            released.append(True)
 
-    monkeypatch.setattr(contained.ctypes, "CDLL", lambda *_args, **_kwargs: _FailingLibc())
-    monkeypatch.setattr(contained, "_LINUX_SUBREAPER_LOCK", _FakeLock())
+def _install_fake_linux_subreaper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> type[_FakeLinuxSubreaperLibc]:
+    _FakeLinuxSubreaperLibc.reset()
+    monkeypatch.setattr(
+        contained.ctypes, "CDLL", lambda *_args, **_kwargs: _FakeLinuxSubreaperLibc()
+    )
+    monkeypatch.setattr(contained, "_LINUX_SUBREAPER_LOCK", threading.Lock())
+    monkeypatch.setattr(
+        contained, "_LINUX_SUBREAPER_METADATA_LOCK", threading.Lock(), raising=False
+    )
+    monkeypatch.setattr(contained, "_LINUX_SUBREAPER_RECORD", None, raising=False)
+    monkeypatch.setattr(contained, "_LINUX_SUBREAPER_MEMBERSHIP", threading.local(), raising=False)
+    return _FakeLinuxSubreaperLibc
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux subreaper ownership")
+def test_linux_subreaper_foreign_outer_close_fails_closed_then_owner_recovers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[int, int]] = []
+    close_started = threading.Event()
+    close_finished = threading.Event()
+    foreign_errors: list[BaseException] = []
+
+    class _FakeLibc:
+        subreaper = 0
+
+        @classmethod
+        def prctl(cls, operation: int, value: object, *_args: object) -> int:
+            if operation == contained._LinuxSubreaperProcessTracker._PR_GET_CHILD_SUBREAPER:
+                ctypes.cast(value, ctypes.POINTER(ctypes.c_int)).contents.value = cls.subreaper
+            else:
+                assert isinstance(value, int)
+                cls.subreaper = value
+            calls.append((operation, cls.subreaper))
+            return 0
+
+    monkeypatch.setattr(contained.ctypes, "CDLL", lambda *_args, **_kwargs: _FakeLibc())
+    monkeypatch.setattr(contained, "_LINUX_SUBREAPER_LOCK", threading.Lock())
+    tracker = contained._LinuxSubreaperProcessTracker()
+    read_fd, write_fd = contained.os.pipe()
+    tracker._pidfds[101] = read_fd
+    tracker._enable_subreaper(time.monotonic() + 1)
+    calls_before_foreign_close = list(calls)
+
+    def close_from_foreign_thread() -> None:
+        close_started.set()
+        try:
+            tracker.close()
+        except BaseException as exc:
+            foreign_errors.append(exc)
+        finally:
+            close_finished.set()
+
+    worker = threading.Thread(target=close_from_foreign_thread)
+    worker.start()
+    assert close_started.wait(timeout=1)
+    assert close_finished.wait(timeout=1)
+    worker.join(timeout=1)
+    try:
+        assert not worker.is_alive()
+        assert len(foreign_errors) == 1
+        assert isinstance(foreign_errors[0], contained.ContainedProcessError)
+        assert calls == calls_before_foreign_close
+        assert tracker._pidfds == {101: read_fd}
+        contained.os.fstat(read_fd)
+    finally:
+        tracker.close()
+        _close_test_fd_if_open(write_fd)
+
+    assert calls == [
+        (contained._LinuxSubreaperProcessTracker._PR_GET_CHILD_SUBREAPER, 0),
+        (contained._LinuxSubreaperProcessTracker._PR_SET_CHILD_SUBREAPER, 1),
+        (contained._LinuxSubreaperProcessTracker._PR_SET_CHILD_SUBREAPER, 0),
+    ]
+
+
+def test_linux_subreaper_owner_recovery_after_foreign_close_releases_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    libc = _install_fake_linux_subreaper(monkeypatch)
+    tracker = contained._LinuxSubreaperProcessTracker()
+    tracker._enable_subreaper(time.monotonic() + 1)
+    foreign_errors: list[BaseException] = []
+
+    def foreign_close() -> None:
+        try:
+            tracker.close()
+        except BaseException as exc:
+            foreign_errors.append(exc)
+
+    worker = threading.Thread(target=foreign_close)
+    worker.start()
+    worker.join(timeout=1)
+    assert not worker.is_alive()
+    assert len(foreign_errors) == 1
+    assert isinstance(foreign_errors[0], contained.ContainedProcessError)
+
+    tracker.close()
+    successor = contained._LinuxSubreaperProcessTracker()
+    successor._enable_subreaper(time.monotonic() + 1)
+    successor.close()
+
+    assert libc.calls == [
+        (tracker._PR_GET_CHILD_SUBREAPER, 0),
+        (tracker._PR_SET_CHILD_SUBREAPER, 1),
+        (tracker._PR_SET_CHILD_SUBREAPER, 0),
+        (tracker._PR_GET_CHILD_SUBREAPER, 0),
+        (tracker._PR_SET_CHILD_SUBREAPER, 1),
+        (tracker._PR_SET_CHILD_SUBREAPER, 0),
+    ]
+
+
+def test_linux_subreaper_foreign_nested_close_preserves_owner_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    libc = _install_fake_linux_subreaper(monkeypatch)
+    outer = contained._LinuxSubreaperProcessTracker()
+    inner = contained._LinuxSubreaperProcessTracker()
+    outer._enable_subreaper(time.monotonic() + 1)
+    inner._enable_subreaper(time.monotonic() + 1)
+    before = list(libc.calls)
+    errors: list[BaseException] = []
+
+    def foreign_close() -> None:
+        try:
+            inner.close()
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=foreign_close)
+    worker.start()
+    worker.join(timeout=1)
+    assert not worker.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], contained.ContainedProcessError)
+    assert libc.calls == before
+
+    inner.close()
+    outer.close()
+    assert libc.calls[-1] == (outer._PR_SET_CHILD_SUBREAPER, 0)
+
+
+def test_linux_subreaper_out_of_order_outer_close_is_non_mutating(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    libc = _install_fake_linux_subreaper(monkeypatch)
+    outer = contained._LinuxSubreaperProcessTracker()
+    inner = contained._LinuxSubreaperProcessTracker()
+    outer._enable_subreaper(time.monotonic() + 1)
+    inner._enable_subreaper(time.monotonic() + 1)
+    before = list(libc.calls)
+
+    with pytest.raises(contained.ContainedProcessError, match="nested subreaper tracker"):
+        outer.close()
+
+    assert libc.calls == before
+    inner.close()
+    outer.close()
+    assert libc.calls[-1] == (outer._PR_SET_CHILD_SUBREAPER, 0)
+
+
+def test_linux_subreaper_repeated_terminal_close_does_not_restore_twice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    libc = _install_fake_linux_subreaper(monkeypatch)
+    tracker = contained._LinuxSubreaperProcessTracker()
+    tracker._enable_subreaper(time.monotonic() + 1)
+    tracker.close()
+    tracker.close()
+
+    assert libc.calls == [
+        (tracker._PR_GET_CHILD_SUBREAPER, 0),
+        (tracker._PR_SET_CHILD_SUBREAPER, 1),
+        (tracker._PR_SET_CHILD_SUBREAPER, 0),
+    ]
+
+
+def test_linux_subreaper_second_top_level_waits_for_owner_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    libc = _install_fake_linux_subreaper(monkeypatch)
+    first_enabled = threading.Event()
+    release_first = threading.Event()
+    second_enabled = threading.Event()
+    failures: list[BaseException] = []
+
+    def first() -> None:
+        tracker = contained._LinuxSubreaperProcessTracker()
+        try:
+            tracker._enable_subreaper(time.monotonic() + 2)
+            first_enabled.set()
+            assert release_first.wait(timeout=1)
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            tracker.close()
+
+    def second() -> None:
+        tracker = contained._LinuxSubreaperProcessTracker()
+        try:
+            assert first_enabled.wait(timeout=1)
+            tracker._enable_subreaper(time.monotonic() + 2)
+            second_enabled.set()
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            tracker.close()
+
+    first_thread = threading.Thread(target=first)
+    second_thread = threading.Thread(target=second)
+    first_thread.start()
+    second_thread.start()
+    assert first_enabled.wait(timeout=1)
+    assert not second_enabled.wait(timeout=0.05)
+    release_first.set()
+    first_thread.join(timeout=2)
+    second_thread.join(timeout=2)
+
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert failures == []
+    assert (
+        libc.calls.count((contained._LinuxSubreaperProcessTracker._PR_SET_CHILD_SUBREAPER, 0)) == 2
+    )
+
+
+@pytest.mark.parametrize("failure", ("get", "set"), ids=("get", "set"))
+def test_linux_subreaper_enable_failure_unwinds_for_later_registration(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    libc = _install_fake_linux_subreaper(monkeypatch)
+    if failure == "get":
+        libc.fail_get = True
+    else:
+        libc.fail_enable = True
+    failed = contained._LinuxSubreaperProcessTracker()
+
+    with pytest.raises(contained.ContainedProcessError):
+        failed._enable_subreaper(time.monotonic() + 1)
+
+    libc.fail_get = False
+    libc.fail_enable = False
+    successor = contained._LinuxSubreaperProcessTracker()
+    successor._enable_subreaper(time.monotonic() + 1)
+    successor.close()
+    assert libc.subreaper == 0
+
+
+def test_linux_subreaper_restore_failure_keeps_owner_for_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    libc = _install_fake_linux_subreaper(monkeypatch)
+    tracker = contained._LinuxSubreaperProcessTracker()
+    tracker._enable_subreaper(time.monotonic() + 1)
+    libc.restore_failures = 1
 
     with pytest.raises(contained.ContainedProcessError, match="restore child subreaper"):
         tracker.close()
 
-    assert released == [True]
-    assert not tracker._owns_subreaper_lock
+    blocked: list[BaseException] = []
+
+    def second_top_level() -> None:
+        contender = contained._LinuxSubreaperProcessTracker()
+        try:
+            contender._enable_subreaper(time.monotonic() + 0.05)
+        except BaseException as exc:
+            blocked.append(exc)
+        finally:
+            contender.close()
+
+    worker = threading.Thread(target=second_top_level)
+    worker.start()
+    worker.join(timeout=1)
+    assert not worker.is_alive()
+    assert len(blocked) == 1
+    assert isinstance(blocked[0], TimeoutError)
+
+    tracker.close()
+    assert libc.subreaper == 0
+    assert libc.calls.count((tracker._PR_SET_CHILD_SUBREAPER, 0)) == 2
 
 
 @pytest.mark.parametrize("persistent", (False, True), ids=("retry", "persistent"))
@@ -6773,6 +7059,45 @@ def test_linux_real_subreaper_tracker_serializes_two_threads() -> None:
     assert not second_thread.is_alive()
     assert failures == []
     assert _linux_subreaper_state() == before_subreaper
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux subreaper lifecycle")
+def test_linux_real_subreaper_foreign_close_then_owner_recovery() -> None:
+    before_subreaper = _linux_subreaper_state()
+    before_handlers = _contained_signal_handlers()
+    tracker = contained._LinuxSubreaperProcessTracker()
+    foreign_started = threading.Event()
+    foreign_finished = threading.Event()
+    foreign_errors: list[BaseException] = []
+
+    tracker._enable_subreaper(time.monotonic() + 3)
+
+    def foreign_close() -> None:
+        foreign_started.set()
+        try:
+            tracker.close()
+        except BaseException as exc:
+            foreign_errors.append(exc)
+        finally:
+            foreign_finished.set()
+
+    worker = threading.Thread(target=foreign_close)
+    worker.start()
+    assert foreign_started.wait(timeout=2)
+    assert foreign_finished.wait(timeout=2)
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    assert len(foreign_errors) == 1
+    assert isinstance(foreign_errors[0], contained.ContainedProcessError)
+    assert _linux_subreaper_state() == 1
+
+    tracker.close()
+    successor = contained._LinuxSubreaperProcessTracker()
+    successor._enable_subreaper(time.monotonic() + 3)
+    successor.close()
+
+    assert _linux_subreaper_state() == before_subreaper
+    assert _contained_signal_handlers() == before_handlers
 
 
 def test_cleanup_permission_error_does_not_skip_root_reap(monkeypatch) -> None:
