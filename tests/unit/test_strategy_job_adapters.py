@@ -925,6 +925,47 @@ def test_nshape_compare_adapter_matches_legacy_fixture(tmp_path) -> None:
     )
 
 
+def test_nshape_compare_nonzero_execution_costs_match_legacy_direct_and_reduce_returns(
+    tmp_path: Path,
+) -> None:
+    from rquant.storage.duckdb import DuckDBStore
+    from rquant.strategy_compare import run_entry_mode_comparison
+    from rquant.strategy_job_adapters import default_strategy_job_adapter_registry
+    from tests.unit.test_minute_replay import _seed_daily_and_screen, _seed_minutes
+
+    spec = _spec(
+        "n_shape",
+        _parameter("hold_days", "integer_list", (1,)),
+        _parameter("entry_modes", "text_list", ("first_break",)),
+        _parameter("profile_variants", "text_list", ("baseline",)),
+        start_date=date(2026, 6, 24),
+        end_date=date(2026, 6, 24),
+    ).model_copy(update={"execution_costs": _nonzero_costs()})
+    with DuckDBStore(tmp_path / "compare-costs.duckdb") as store:
+        _seed_daily_and_screen(store)
+        _seed_minutes(store)
+        expected = run_entry_mode_comparison(
+            store,
+            start_date=spec.parameters.start_date,
+            end_date=spec.parameters.end_date,
+            entry_modes=["first_break"],
+            profile_variants=["baseline"],
+            max_hold_days=1,
+            execution_costs=spec.execution_costs,
+        )
+        actual = default_strategy_job_adapter_registry().execute_shard(
+            default_strategy_job_adapter_registry().validate_claim(_claim(spec)),
+            store,
+        )
+
+    actual_summary = _result_table(actual, "summary")
+    actual_trades = _result_table(actual, "trades")
+    pd.testing.assert_frame_equal(actual_summary, expected.summary)
+    pd.testing.assert_frame_equal(actual_trades, expected.trades)
+    assert actual_trades["ret_pct"].lt(actual_trades["gross_ret_pct"]).all()
+    assert actual_summary.iloc[0]["mean_ret_pct"] < actual_trades["gross_ret_pct"].mean()
+
+
 def test_nshape_optimize_adapter_matches_legacy_fixture(tmp_path) -> None:
     from rquant.storage.duckdb import DuckDBStore
     from rquant.strategy_job_adapters import default_strategy_job_adapter_registry
@@ -962,6 +1003,19 @@ def test_nshape_optimize_adapter_matches_legacy_fixture(tmp_path) -> None:
         registry = default_strategy_job_adapter_registry()
         actual = registry.execute_shard(registry.validate_claim(_claim(spec)), store)
         costly_spec = spec.model_copy(update={"execution_costs": _nonzero_costs()})
+        costly_expected = run_strategy_optimization(
+            store,
+            start_date=date(2026, 6, 24),
+            end_date=date(2026, 6, 24),
+            entry_modes=["first_break"],
+            profile_variants=["baseline"],
+            max_hold_days_options=[1],
+            validation_ratio=0.0,
+            min_trades=1,
+            top_n_options=[1],
+            score_profile_names=["v1"],
+            execution_costs=costly_spec.execution_costs,
+        )
         costly = registry.execute_shard(
             registry.validate_claim(_claim(costly_spec)),
             store,
@@ -970,6 +1024,12 @@ def test_nshape_optimize_adapter_matches_legacy_fixture(tmp_path) -> None:
     pd.testing.assert_frame_equal(_result_table(actual, "rankings"), expected.rankings)
     pd.testing.assert_frame_equal(_result_table(actual, "trades"), expected.trades)
     pd.testing.assert_frame_equal(_result_table(actual, "topn_rankings"), expected.topn_rankings)
+    pd.testing.assert_frame_equal(_result_table(costly, "rankings"), costly_expected.rankings)
+    pd.testing.assert_frame_equal(_result_table(costly, "trades"), costly_expected.trades)
+    pd.testing.assert_frame_equal(
+        _result_table(costly, "topn_rankings"),
+        costly_expected.topn_rankings,
+    )
     costly_trades = _result_table(costly, "trades")
     costly_rankings = _result_table(costly, "rankings")
     assert "gross_ret_pct" in costly_trades.columns
