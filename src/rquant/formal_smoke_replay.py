@@ -19,6 +19,11 @@ from rquant.dashboard.strategy_lab_runs import (
     build_strategy_lab_run,
     save_strategy_lab_run,
 )
+from rquant.formal_smoke_protocol import (
+    FormalSmokeReplayRequest,
+    FormalSmokeReplayResult,
+    FormalSmokeStrategy,
+)
 from rquant.growth_board_surge_strategy import GrowthBoardSurgeConfig
 from rquant.minute_replay import DEFAULT_FACTOR_SCORE_THRESHOLD
 from rquant.paper import PaperTradeConfig
@@ -29,23 +34,13 @@ from rquant.research_gate import (
 )
 from rquant.research_manifest import require_formal_research_manifest
 from rquant.runtime_code_attestation import CodeTrustEvidence
-from rquant.runtime_code_generation import (
-    RuntimeCodeGenerationCapability,
-    RuntimeCodeGenerationError,
-)
+from rquant.runtime_code_generation import RuntimeCodeGenerationError
 
-FormalSmokeStrategy = Literal[
-    "n_shape",
-    "growth_board_surge",
-    "auction_gap",
-]
 FormalSmokeRunType = Literal[
     "n_shape_compare",
     "growth_board_surge",
     "auction_gap",
 ]
-_HASH_PATTERN = r"^[0-9a-f]{64}$"
-_COMMIT_PATTERN = r"^[0-9a-f]{40}$"
 
 
 class FormalSmokeSpec(BaseModel):
@@ -83,46 +78,6 @@ class FormalSmokeSpec(BaseModel):
         }
 
 
-class FormalSmokeReplayRequest(BaseModel):
-    model_config = ConfigDict(
-        arbitrary_types_allowed=True,
-        extra="forbid",
-        frozen=True,
-    )
-
-    strategy: FormalSmokeStrategy
-    start_date: date
-    end_date: date
-    audit_run_id: str
-    dataset_snapshot_id: str
-    dataset_binding_hash: str
-    code_commit: str
-    runtime_capability: RuntimeCodeGenerationCapability
-
-    @model_validator(mode="after")
-    def validate_request(self) -> FormalSmokeReplayRequest:
-        if self.start_date > self.end_date:
-            raise ValueError("formal smoke start_date cannot be after end_date")
-        import re
-
-        for field_name in (
-            "audit_run_id",
-            "dataset_snapshot_id",
-            "dataset_binding_hash",
-        ):
-            if re.fullmatch(_HASH_PATTERN, getattr(self, field_name)) is None:
-                raise ValueError(f"formal smoke {field_name} must be a 64-character hash")
-        if re.fullmatch(_COMMIT_PATTERN, self.code_commit) is None:
-            raise ValueError("formal smoke code_commit must be a clean 40-character commit")
-        try:
-            self.runtime_capability.require_live()
-        except (AuthorityPathSecurityError, RuntimeCodeGenerationError) as exc:
-            raise ValueError("formal smoke runtime capability is invalid") from exc
-        if self.runtime_capability.evidence.provenance_commit != self.code_commit:
-            raise ValueError("formal smoke code_commit does not match runtime capability")
-        return self
-
-
 class FormalSmokeComputation(BaseModel):
     model_config = ConfigDict(
         arbitrary_types_allowed=True,
@@ -133,26 +88,6 @@ class FormalSmokeComputation(BaseModel):
     metrics: dict[str, Any]
     tables: dict[str, pd.DataFrame]
     sample_count: int
-
-
-class FormalSmokeReplayResult(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    status: Literal["comparable"] = "comparable"
-    strategy: FormalSmokeStrategy
-    fixed_spec_version: Literal["stage1-smoke-v1"]
-    run_id: str
-    audit_run_id: str
-    dataset_snapshot_id: str
-    dataset_binding_hash: str
-    code_commit: str
-    strategy_spec_hash: str
-    result_hash: str
-    sample_count: int
-    metrics: dict[str, Any]
-    missing_evidence: tuple[str, ...]
-    json_path: Path
-    markdown_path: Path
 
 
 def _n_shape_parameters() -> dict[str, Any]:
@@ -395,7 +330,6 @@ def _verify_gate_evidence(
 def _require_runtime_code_evidence(
     request: FormalSmokeReplayRequest,
 ) -> CodeTrustEvidence:
-    """Return evidence only while the request capability remains verified and current."""
     capability = request.runtime_capability
     try:
         capability.require_live()
@@ -411,6 +345,7 @@ def run_formal_smoke_replay(
     request: FormalSmokeReplayRequest,
     *,
     base_dir: Path | None = None,
+    staging_base_dir: Path | None = None,
 ) -> FormalSmokeReplayResult:
     code_trust_evidence = _require_runtime_code_evidence(request)
     spec = build_formal_smoke_spec(
@@ -481,6 +416,7 @@ def run_formal_smoke_replay(
             manifest=manifest,
         ),
         base_dir=base_dir,
+        staging_base_dir=staging_base_dir,
     )
     strategy_spec_hash = saved.manifest.strategy_spec_hash
     result_hash = saved.manifest.result_hash

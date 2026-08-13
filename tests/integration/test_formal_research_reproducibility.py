@@ -10,7 +10,11 @@ import pandas as pd
 import pytest
 
 from rquant.backfill_manifest import EligibilityRecord, EligibilityResolution
-from rquant.dashboard.strategy_lab_runs import build_strategy_lab_run
+from rquant.dashboard.strategy_lab_runs import (
+    _result_hash,
+    _strategy_spec_hash,
+    build_strategy_lab_run,
+)
 from rquant.data_metadata import (
     DataAuditRun,
     DataAuditRunFinalization,
@@ -26,7 +30,9 @@ from rquant.research_gate import (
     open_gated_research_store,
 )
 from rquant.research_lake import export_research_dataset
+from rquant.research_manifest import require_formal_research_manifest
 from rquant.research_snapshot import build_dataset_snapshot_binding
+from rquant.runtime_code_generation import RuntimeCodeGenerationCapability
 from rquant.storage.duckdb import DuckDBStore
 from rquant.strategy_dependencies import (
     StrategyExecutionDependencies,
@@ -118,17 +124,9 @@ def _seed_gate_evidence(
         store.upsert_dataset_coverage(
             DatasetCoverage(
                 snapshot_id=building_snapshot.snapshot_id,
-                dataset_id=(
-                    "strategy_eligibility"
-                    if scope == "eligibility"
-                    else "minute_bar"
-                ),
+                dataset_id=("strategy_eligibility" if scope == "eligibility" else "minute_bar"),
                 coverage_scope=scope,
-                table_name=(
-                    "backfill_manifest"
-                    if scope == "eligibility"
-                    else "minute_bar"
-                ),
+                table_name=("backfill_manifest" if scope == "eligibility" else "minute_bar"),
                 expected_count=1,
                 available_count=1,
             )
@@ -139,9 +137,7 @@ def _seed_gate_evidence(
             table_watermarks={
                 "manifest_start_date": _TRADE_DATE.isoformat(),
                 "manifest_end_date": _TRADE_DATE.isoformat(),
-                "eligibility_resolution_hash": (
-                    eligibility_resolution.resolution_hash
-                ),
+                "eligibility_resolution_hash": (eligibility_resolution.resolution_hash),
             },
             completed_at=_AS_OF + timedelta(minutes=2),
         ),
@@ -169,7 +165,9 @@ def _run_formal_result(
     store: DuckDBStore,
     request: ResearchGateRequest,
     lake_root: Path,
+    capability: RuntimeCodeGenerationCapability,
 ) -> tuple[pd.DataFrame, str]:
+    capability.require_live()
     with open_gated_research_store(
         request,
         metadata_store_factory=lambda: nullcontext(store),
@@ -184,15 +182,27 @@ def _run_formal_result(
             ORDER BY d.ts_code, m.trade_time
             """
         ).fetchdf()
+    params = {"signal": "fixed-v1"}
+    metrics = {"row_count": len(result)}
+    tables = {"result": result}
+    manifest = build_gate_research_manifest(
+        request,
+        decision,
+        code_trust_evidence=capability.evidence,
+        strategy_spec_hash=_strategy_spec_hash("formal_reproducibility", params),
+        result_hash=_result_hash(metrics, tables),
+    )
+    require_formal_research_manifest(manifest, capability=capability)
     run = build_strategy_lab_run(
         run_type="formal_reproducibility",
         title="formal reproducibility",
-        params={"signal": "fixed-v1"},
-        metrics={"row_count": len(result)},
-        tables={"result": result},
-        manifest=build_gate_research_manifest(request, decision),
+        params=params,
+        metrics=metrics,
+        tables=tables,
+        manifest=manifest,
     )
-    assert run.manifest.schema_version == 2
+    assert run.manifest.schema_version == 3
+    assert run.manifest.code_trust_evidence == capability.evidence
     assert run.manifest.result_hash is not None
     return result, run.manifest.result_hash
 
@@ -201,9 +211,25 @@ def _run_formal_result(
 def test_formal_result_survives_source_updates_and_rejects_corruption(
     tmp_path: Path,
 ) -> None:
+    from tests.runtime_code_e2e_support import (
+        build_test_package,
+        install_test_package,
+        open_test_capability,
+    )
+
     lake_root = tmp_path / "lake"
     catalog = ResearchCatalog(tmp_path / "research.duckdb")
-    with DuckDBStore(tmp_path / "source.duckdb") as store:
+    package = build_test_package(
+        tmp_path / "runtime-package",
+        provenance_commit=_COMMIT,
+    )
+    trusted_base, runtime_root, _installer = install_test_package(tmp_path, package)
+    capability = open_test_capability(
+        trusted_base=trusted_base,
+        runtime_root=runtime_root,
+        package=package,
+    )
+    with capability, DuckDBStore(tmp_path / "source.duckdb") as store:
         eligibility_resolution = _eligibility_resolution()
         _seed_source(store)
         export_research_dataset(
@@ -243,7 +269,12 @@ def test_formal_result_survives_source_updates_and_rejects_corruption(
             code_commit=_COMMIT,
         )
 
-        first_result, first_hash = _run_formal_result(store, request, lake_root)
+        first_result, first_hash = _run_formal_result(
+            store,
+            request,
+            lake_root,
+            capability,
+        )
 
         store._conn.execute(
             "UPDATE daily_bar SET close = 99 WHERE ts_code = '000001.SZ';"
@@ -259,7 +290,12 @@ def test_formal_result_survives_source_updates_and_rejects_corruption(
             code_commit=_COMMIT,
         )
 
-        second_result, second_hash = _run_formal_result(store, request, lake_root)
+        second_result, second_hash = _run_formal_result(
+            store,
+            request,
+            lake_root,
+            capability,
+        )
         pd.testing.assert_frame_equal(first_result, second_result)
         assert first_hash == second_hash
 
@@ -271,4 +307,4 @@ def test_formal_result_survives_source_updates_and_rejects_corruption(
         (lake_root / lake_artifact.relative_path).write_bytes(b"corrupt")
 
         with pytest.raises(ValueError, match="file (size|hash)|Parquet|parquet"):
-            _run_formal_result(store, request, lake_root)
+            _run_formal_result(store, request, lake_root, capability)

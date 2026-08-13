@@ -1565,7 +1565,7 @@ class TestFormalSmokeReplay:
 
         from rquant import cli
         from rquant import formal_runtime_composition as composition_module
-        from rquant import formal_smoke_replay as smoke_module
+        from rquant import formal_smoke_execution as execution_module
         from rquant.runtime_code_attestation import CodeTrustEvidence
 
         result = MagicMock()
@@ -1586,19 +1586,14 @@ class TestFormalSmokeReplay:
             provenance_commit="d" * 40,
         )
 
-        class FakeRequest:
-            def __init__(self, **values: object) -> None:
-                self.__dict__.update(values)
-
         monkeypatch.setattr(
             composition_module,
             "open_formal_runtime_capability",
             lambda **_kwargs: capability,
         )
-        monkeypatch.setattr(smoke_module, "FormalSmokeReplayRequest", FakeRequest)
         monkeypatch.setattr(
-            smoke_module,
-            "run_formal_smoke_replay",
+            execution_module,
+            "run_attested_formal_smoke",
             run,
         )
         args = build_parser().parse_args(
@@ -1631,16 +1626,20 @@ class TestFormalSmokeReplay:
 
         assert cli.cmd_formal_smoke_replay(args) == 0
 
-        request = run.call_args.args[0]
-        assert request.strategy == "n_shape"
-        assert request.start_date == date(2026, 4, 1)
-        assert request.end_date == date(2026, 7, 2)
-        assert request.audit_run_id == "a" * 64
-        assert request.dataset_snapshot_id == "b" * 64
-        assert request.dataset_binding_hash == "c" * 64
-        assert request.code_commit == "d" * 40
-        assert request.runtime_capability is capability
-        assert run.call_args.kwargs == {"base_dir": tmp_path}
+        assert run.call_args.args == (capability,)
+        assert run.call_args.kwargs["strategy"] == "n_shape"
+        assert run.call_args.kwargs["start_date"] == date(2026, 4, 1)
+        assert run.call_args.kwargs["end_date"] == date(2026, 7, 2)
+        assert run.call_args.kwargs["audit_run_id"] == "a" * 64
+        assert run.call_args.kwargs["dataset_snapshot_id"] == "b" * 64
+        assert run.call_args.kwargs["dataset_binding_hash"] == "c" * 64
+        assert run.call_args.kwargs["output_dir"] == tmp_path
+        reference = run.call_args.kwargs["bootstrap_reference"]
+        assert reference.configuration_path == Path("/tmp/runtime-code-bootstrap.json")
+        assert reference.trusted_base == Path("/tmp")
+        assert reference.expected_authority_uid == 1
+        assert reference.expected_authority_gid == 1
+        assert run.call_args.kwargs["environment_source"] is os.environ
         assert json.loads(capsys.readouterr().out) == result.model_dump.return_value
 
     def test_command_rejects_missing_runtime_capability_before_compute(
@@ -1651,7 +1650,7 @@ class TestFormalSmokeReplay:
 
         from rquant import cli
         from rquant import formal_runtime_composition as composition_module
-        from rquant import formal_smoke_replay as smoke_module
+        from rquant import formal_smoke_execution as execution_module
 
         run = MagicMock()
         monkeypatch.setattr(
@@ -1660,8 +1659,8 @@ class TestFormalSmokeReplay:
             lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("invalid")),
         )
         monkeypatch.setattr(
-            smoke_module,
-            "run_formal_smoke_replay",
+            execution_module,
+            "run_attested_formal_smoke",
             run,
         )
         args = build_parser().parse_args(

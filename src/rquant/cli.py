@@ -1538,10 +1538,11 @@ def cmd_formal_smoke_replay(args: argparse.Namespace) -> int:
         FormalRuntimeCompositionError,
         open_formal_runtime_capability,
     )
-    from rquant.formal_smoke_replay import (
-        FormalSmokeReplayRequest,
-        run_formal_smoke_replay,
+    from rquant.formal_smoke_execution import (
+        FormalSmokeExecutionError,
+        run_attested_formal_smoke,
     )
+    from rquant.formal_smoke_protocol import FormalSmokeBootstrapReference
 
     setup_logging()
     try:
@@ -1553,29 +1554,57 @@ def cmd_formal_smoke_replay(args: argparse.Namespace) -> int:
             startup_deadline_monotonic=time.monotonic() + 30,
         )
         capability.require_live()
-        code_commit = capability.evidence.provenance_commit
     except (FormalRuntimeCompositionError, RuntimeError) as exc:
         logger.error(f"formal smoke replay runtime capability is unavailable: {exc}")
         return 2
     try:
-        request = FormalSmokeReplayRequest(
+        if args.output_dir is None:
+            from rquant.config import settings
+
+            output_dir = settings.data_dir
+        else:
+            output_dir = args.output_dir
+        result = run_attested_formal_smoke(
+            capability,
             strategy=args.strategy,
             start_date=args.start_date,
             end_date=args.end_date,
             audit_run_id=args.audit_run_id,
             dataset_snapshot_id=args.snapshot_id,
             dataset_binding_hash=args.binding_hash,
-            code_commit=code_commit,
-            runtime_capability=capability,
-        )
-        result = run_formal_smoke_replay(
-            request,
-            base_dir=args.output_dir,
+            output_dir=output_dir,
+            bootstrap_reference=FormalSmokeBootstrapReference(
+                configuration_path=args.runtime_code_config,
+                trusted_base=args.runtime_code_trusted_base,
+                expected_authority_uid=args.runtime_code_authority_uid,
+                expected_authority_gid=args.runtime_code_authority_gid,
+            ),
+            environment_source=os.environ,
         )
         _print_json(result.model_dump(mode="json"))
         return 0
+    except FormalSmokeExecutionError as exc:
+        logger.error(f"formal smoke replay attested execution failed: {exc}")
+        return 2
     finally:
         capability.close()
+
+
+def cmd_formal_smoke_runtime_execute(args: argparse.Namespace) -> int:
+    """Run the generation-only side of the private FD protocol."""
+    from rquant.formal_smoke_runtime_entry import (
+        FormalSmokeGenerationEntryError,
+        run_formal_smoke_generation_entry,
+    )
+
+    try:
+        return run_formal_smoke_generation_entry(
+            request_fd=args.request_fd,
+            receipt_fd=args.receipt_fd,
+        )
+    except (FormalSmokeGenerationEntryError, OSError, RuntimeError, ValueError) as exc:
+        logger.error(f"formal smoke generation entry failed: {exc}")
+        return 70
 
 
 def cmd_stage1_acceptance(args: argparse.Namespace) -> int:
@@ -6804,6 +6833,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_formal_runtime_bootstrap_arguments(formal_smoke_p)
 
+    formal_smoke_runtime_p = sub.add_parser(
+        "formal-smoke-runtime-execute",
+        help=argparse.SUPPRESS,
+    )
+    formal_smoke_runtime_p.add_argument("--request-fd", type=int, required=True)
+    formal_smoke_runtime_p.add_argument("--receipt-fd", type=int, required=True)
+
     stage1_acceptance_p = sub.add_parser(
         "stage1-acceptance",
         help="只读预演一个策略的 Stage 1 验收身份、状态与资源预算",
@@ -8517,6 +8553,7 @@ def main() -> int:
         "research-repair-auction": cmd_research_repair_auction,
         "research-repair-minute": cmd_research_repair_minute,
         "formal-smoke-replay": cmd_formal_smoke_replay,
+        "formal-smoke-runtime-execute": cmd_formal_smoke_runtime_execute,
         "stage1-acceptance": cmd_stage1_acceptance,
         "research-ingest-readiness": cmd_research_ingest_readiness,
         "research-authority-status": cmd_research_authority_status,
@@ -8630,6 +8667,7 @@ def main() -> int:
         "lab-worker",
         "lab-finalizer",
         "runtime-code",
+        "formal-smoke-runtime-execute",
         "panorama-auth-serve",
         "panorama-user-add",
         "panorama-user-remove",

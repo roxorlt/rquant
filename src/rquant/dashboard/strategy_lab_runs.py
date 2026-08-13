@@ -339,15 +339,19 @@ def save_strategy_lab_run(
     run: StrategyLabSavedRun,
     *,
     base_dir: Path | None = None,
+    staging_base_dir: Path | None = None,
 ) -> StrategyLabSavedRun:
     out_dir = strategy_lab_runs_dir(base_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    write_dir = strategy_lab_runs_dir(staging_base_dir) if staging_base_dir else out_dir
+    write_dir.mkdir(parents=True, exist_ok=True)
     json_path = out_dir / f"{run.run_id}.json"
     markdown_path = out_dir / f"{run.run_id}.md"
+    write_json_path = write_dir / json_path.name
+    write_markdown_path = write_dir / markdown_path.name
     payload = run.model_copy(update={"json_path": json_path, "markdown_path": markdown_path})
     json_created = False
     try:
-        with json_path.open("x", encoding="utf-8") as handle:
+        with write_json_path.open("x", encoding="utf-8") as handle:
             handle.write(
                 json.dumps(
                     payload.model_dump(mode="json"),
@@ -356,11 +360,11 @@ def save_strategy_lab_run(
                 )
             )
         json_created = True
-        with markdown_path.open("x", encoding="utf-8") as handle:
+        with write_markdown_path.open("x", encoding="utf-8") as handle:
             handle.write(run.markdown)
     except BaseException:
-        if json_created and not markdown_path.exists():
-            json_path.unlink(missing_ok=True)
+        if json_created and not write_markdown_path.exists():
+            write_json_path.unlink(missing_ok=True)
         raise
     return payload
 

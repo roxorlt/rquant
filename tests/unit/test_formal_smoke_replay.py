@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
@@ -475,34 +476,26 @@ def test_formal_smoke_rejects_capability_provenance_commit_mismatch(
 )
 def test_formal_smoke_rejects_invalid_runtime_generation_before_execution(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
     invalid_state: str,
 ) -> None:
-    import rquant.formal_smoke_replay as smoke_module
-    from rquant.formal_smoke_replay import (
-        FormalSmokeReplayRequest,
-        run_formal_smoke_replay,
+    from rquant.formal_smoke_execution import (
+        FormalSmokeChildProcessResult,
+        FormalSmokeExecutionError,
+        _run_attested_formal_smoke,
     )
+    from rquant.formal_smoke_protocol import FormalSmokeBootstrapReference
 
     capability = _open_signed_runtime_capability(tmp_path)
-    request = FormalSmokeReplayRequest(
-        strategy="n_shape",
-        start_date=date(2026, 4, 1),
-        end_date=date(2026, 7, 2),
-        audit_run_id="a" * 64,
-        dataset_snapshot_id="b" * 64,
-        dataset_binding_hash="c" * 64,
-        code_commit="d" * 40,
-        runtime_capability=capability,
-    )
     executed = False
 
-    def reject_execution(_store: object, _spec: object) -> object:
+    def reject_execution(
+        _session: object,
+        _request_bytes: bytes,
+    ) -> FormalSmokeChildProcessResult:
         nonlocal executed
         executed = True
-        raise AssertionError("strategy compute must not run")
+        return FormalSmokeChildProcessResult(exit_code=0, receipt_bytes=b"forbidden")
 
-    monkeypatch.setattr(smoke_module, "_execute_formal_smoke_spec", reject_execution)
     if invalid_state == "closed":
         capability.close()
     elif invalid_state == "generation_changed":
@@ -517,8 +510,25 @@ def test_formal_smoke_rejects_invalid_runtime_generation_before_execution(
         source.chmod(0o444)
 
     try:
-        with pytest.raises(Exception, match="runtime|generation|capability|unchanged"):
-            run_formal_smoke_replay(request, base_dir=tmp_path)
+        with pytest.raises(FormalSmokeExecutionError):
+            _run_attested_formal_smoke(
+                capability,
+                strategy="n_shape",
+                start_date=date(2026, 4, 1),
+                end_date=date(2026, 7, 2),
+                audit_run_id="a" * 64,
+                dataset_snapshot_id="b" * 64,
+                dataset_binding_hash="c" * 64,
+                output_dir=tmp_path,
+                bootstrap_reference=FormalSmokeBootstrapReference(
+                    configuration_path=(tmp_path / "authority/bootstrap.json").absolute(),
+                    trusted_base=(tmp_path / "authority").absolute(),
+                    expected_authority_uid=os.getuid(),
+                    expected_authority_gid=os.getgid(),
+                ),
+                environment_source={},
+                exchange=reject_execution,
+            )
     finally:
         capability.close()
 

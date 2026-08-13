@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import shutil
 import stat
 import uuid
@@ -162,7 +163,8 @@ class RuntimeCodeGenerationCapability:
         self._pointer_lease = pointer_lease
         self._artifact_leases = artifact_leases
         self._reverify = reverify
-        self.audit_events = audit_events
+        self._audit_events = audit_events
+        self._execution_binding_digest: str | None = None
         self._closed = False
 
     @property
@@ -172,6 +174,14 @@ class RuntimeCodeGenerationCapability:
     @property
     def release_root(self) -> Path:
         return self.loaded.release_root
+
+    @property
+    def audit_events(self) -> tuple[str, ...]:
+        return self._audit_events
+
+    @property
+    def execution_binding_digest(self) -> str | None:
+        return self._execution_binding_digest
 
     def require_live(self) -> None:
         if self._closed:
@@ -183,6 +193,20 @@ class RuntimeCodeGenerationCapability:
             lease.require_unchanged()
         if self._reverify().evidence != self.evidence:
             raise RuntimeCodeGenerationError("runtime generation evidence changed")
+
+    def _mark_verified_execution(self, binding_digest: str) -> None:
+        """Record a child execution only after its generation receipt was verified."""
+
+        if re.fullmatch(_HASH_PATTERN, binding_digest) is None:
+            raise RuntimeCodeGenerationError("runtime execution binding digest is invalid")
+        self.require_live()
+        if self._execution_binding_digest not in {None, binding_digest}:
+            raise RuntimeCodeGenerationError("runtime execution binding changed")
+        self._execution_binding_digest = binding_digest
+        self._audit_events = tuple(
+            "execution-binding-verified" if event == "execution-binding-pending" else event
+            for event in self._audit_events
+        )
 
     def close(self) -> None:
         if self._closed:
