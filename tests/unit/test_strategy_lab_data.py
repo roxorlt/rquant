@@ -12,6 +12,20 @@ from rquant.security_status import SHANGHAI, SecurityStatusDaily
 from rquant.storage.duckdb import DuckDBStore
 
 
+def _assert_metric_frame_contract(
+    actual: pd.DataFrame,
+    expected: pd.DataFrame,
+    *,
+    dtypes: tuple[str, ...],
+) -> None:
+    pd.testing.assert_frame_equal(actual, expected)
+    assert tuple(str(dtype) for dtype in actual.dtypes) == dtypes
+    assert isinstance(actual.index, pd.RangeIndex)
+    assert actual.index.name is None
+    assert actual.columns.name is None
+    assert actual.attrs == {}
+
+
 def test_strategy_lab_reexports_canonical_replay_metrics() -> None:
     from rquant import strategy_replay_metrics
     from rquant.dashboard import strategy_lab_data
@@ -22,6 +36,159 @@ def test_strategy_lab_reexports_canonical_replay_metrics() -> None:
     assert (
         strategy_lab_data.growth_board_metric_rows
         is strategy_replay_metrics.growth_board_metric_rows
+    )
+
+
+def test_auction_gap_metric_rows_preserves_legacy_empty_contract() -> None:
+    from rquant.dashboard.strategy_lab_data import auction_gap_metric_rows
+
+    actual = auction_gap_metric_rows(pd.DataFrame(), pd.DataFrame())
+    expected = pd.DataFrame(
+        [
+            {
+                "策略": "竞价直接B/次日开盘S",
+                "候选": 0,
+                "交易": 0,
+                "触发率%": None,
+                "当日上板率%": None,
+                "当日最高均值%": None,
+                "当日收盘均值%": None,
+                "平均收益%": None,
+                "中位收益%": None,
+                "胜率%": None,
+                "弱竞价退出%": None,
+            },
+            {
+                "策略": "竞价候选/分钟B/S",
+                "候选": 0,
+                "交易": 0,
+                "触发率%": None,
+                "当日上板率%": None,
+                "当日最高均值%": None,
+                "当日收盘均值%": None,
+                "平均收益%": None,
+                "中位收益%": None,
+                "胜率%": None,
+                "弱竞价退出%": None,
+            },
+        ]
+    )
+
+    _assert_metric_frame_contract(
+        actual,
+        expected,
+        dtypes=("str", "int64", "int64", *("object",) * 8),
+    )
+
+
+def test_auction_gap_metric_rows_preserves_legacy_nonempty_contract() -> None:
+    from rquant.dashboard.strategy_lab_data import auction_gap_metric_rows
+
+    baseline = pd.DataFrame(
+        {
+            "next_open_ret_pct": [2.0, -1.0],
+            "hit_limit_up_today": [True, False],
+            "intraday_high_ret_pct": [8.0, 1.0],
+            "day_close_ret_pct": [5.0, -2.0],
+        }
+    )
+    minute = pd.DataFrame(
+        {
+            "ret_pct": [3.0],
+            "b_hit_limit_up_today": [True],
+            "exit_reason": ["next_auction_weak"],
+        }
+    )
+    actual = auction_gap_metric_rows(baseline, minute)
+    expected = pd.DataFrame(
+        [
+            {
+                "策略": "竞价直接B/次日开盘S",
+                "候选": 2,
+                "交易": 2,
+                "触发率%": 100.0,
+                "当日上板率%": 50.0,
+                "当日最高均值%": 4.5,
+                "当日收盘均值%": 1.5,
+                "平均收益%": 0.5,
+                "中位收益%": 0.5,
+                "胜率%": 50.0,
+                "弱竞价退出%": None,
+            },
+            {
+                "策略": "竞价候选/分钟B/S",
+                "候选": 2,
+                "交易": 1,
+                "触发率%": 50.0,
+                "当日上板率%": 100.0,
+                "当日最高均值%": None,
+                "当日收盘均值%": None,
+                "平均收益%": 3.0,
+                "中位收益%": 3.0,
+                "胜率%": 100.0,
+                "弱竞价退出%": 100.0,
+            },
+        ]
+    )
+
+    _assert_metric_frame_contract(
+        actual,
+        expected,
+        dtypes=("str", "int64", "int64", *("float64",) * 8),
+    )
+
+
+def test_growth_board_metric_rows_preserves_legacy_empty_contract() -> None:
+    from rquant.dashboard.strategy_lab_data import growth_board_metric_rows
+
+    actual = growth_board_metric_rows(pd.DataFrame(), strategy_name="去掉VWAP")
+    expected = pd.DataFrame(
+        [
+            {
+                "策略": "去掉VWAP",
+                "交易": 0,
+                "当日上板率%": None,
+                "平均收益%": None,
+                "中位收益%": None,
+                "胜率%": None,
+            }
+        ]
+    )
+
+    _assert_metric_frame_contract(
+        actual,
+        expected,
+        dtypes=("str", "int64", *("object",) * 4),
+    )
+
+
+def test_growth_board_metric_rows_preserves_legacy_nonempty_contract() -> None:
+    from rquant.dashboard.strategy_lab_data import growth_board_metric_rows
+
+    trades = pd.DataFrame(
+        {
+            "ret_pct": [10.0, -2.0, 1.0],
+            "hit_limit_up_today": [True, False, True],
+        }
+    )
+    actual = growth_board_metric_rows(trades)
+    expected = pd.DataFrame(
+        [
+            {
+                "策略": "科创/创业放量追击",
+                "交易": 3,
+                "当日上板率%": 66.6667,
+                "平均收益%": 3.0,
+                "中位收益%": 1.0,
+                "胜率%": 66.6667,
+            }
+        ]
+    )
+
+    _assert_metric_frame_contract(
+        actual,
+        expected,
+        dtypes=("str", "int64", *("float64",) * 4),
     )
 
 

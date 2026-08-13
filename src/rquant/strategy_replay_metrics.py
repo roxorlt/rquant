@@ -105,8 +105,7 @@ def auction_gap_metric_rows(
             },
         ]
     )
-    metric_columns = rows.columns.difference(["策略", "候选", "交易"], sort=False)
-    return rows.astype({column: "float64" for column in metric_columns})
+    return rows
 
 
 def growth_board_metric_rows(
@@ -133,5 +132,4 @@ def growth_board_metric_rows(
             }
         ]
     )
-    metric_columns = rows.columns.difference(["策略", "交易"], sort=False)
-    return rows.astype({column: "float64" for column in metric_columns})
+    return rows
