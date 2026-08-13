@@ -874,10 +874,12 @@ class RecordingRegistry:
         *,
         delay_seconds: float = 0.0,
         failure: BaseException | None = None,
+        legacy_profile: str | None = None,
     ) -> None:
         self.delegate = default_strategy_job_adapter_registry()
         self.delay_seconds = delay_seconds
         self.failure = failure
+        self.legacy_profile = legacy_profile
         self._executions = multiprocessing.get_context("spawn").Value("i", 0)
         self.stores: list[object] = []
 
@@ -2678,6 +2680,7 @@ def _test_shard_manifest(
                     "message": str(registry.failure),
                 }
             ),
+            "legacy_profile": registry.legacy_profile,
         }
         artifact_profile = getattr(registry, "artifact_profile", None)
         if artifact_profile == "nshape_projection":

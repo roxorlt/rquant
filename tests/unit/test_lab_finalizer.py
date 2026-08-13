@@ -16,7 +16,6 @@ from datetime import timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
 
-import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -95,7 +94,6 @@ from rquant.strategy_job_adapters import (
     LabShardExecutionResult,
     LabShardMetric,
     LabShardTable,
-    ValidatedStrategyShard,
     build_adapter_execution_contract,
     default_strategy_job_adapter_registry,
 )
@@ -114,6 +112,8 @@ TEST_AUTHORITY_KEY = LabFinalizerAuthorityKey(
     key_id="finalizer-test-key",
     secret=b"f" * 32,
 )
+LEGACY_TEST_CODE_SHA = "53dc0afe74d5af44f1d4a4bcda149d6a5b52c854"
+LEGACY_BOUNDARY_DIGEST = "0103274351e3ced582911b8718b7df4506c3bd70418c6ac907fb582f80c6dab8"
 
 
 def test_finalizer_shard_limit_cannot_exceed_ledger_authority() -> None:
@@ -124,6 +124,61 @@ def test_finalizer_shard_limit_cannot_exceed_ledger_authority() -> None:
 
 def _authority_key_provider() -> LabFinalizerAuthorityKey:
     return TEST_AUTHORITY_KEY
+
+
+def _legacy_spec(hold_days: tuple[int, ...]) -> ResearchRunSpec:
+    base_spec = _nshape_compare_spec(hold_days=hold_days)
+    return ResearchRunSpec.model_validate(
+        {
+            **base_spec.model_dump(mode="python"),
+            "code_sha": LEGACY_TEST_CODE_SHA,
+            "feature_contract": build_adapter_execution_contract(
+                "nshape-compare",
+                "1",
+                LEGACY_TEST_CODE_SHA,
+            ),
+        }
+    )
+
+
+def _legacy_digest_policy() -> LabResultDigestPolicy:
+    return LabResultDigestPolicy(
+        legacy_allowlist=(LabLegacyContentDigestProvenance(code_sha=LEGACY_TEST_CODE_SHA),)
+    )
+
+
+def _assert_persisted_legacy_profile(profile: str, frame: pd.DataFrame) -> None:
+    if profile == "uint64_max":
+        assert tuple(frame.columns) == ("hold_days",)
+        assert str(frame["hold_days"].dtype) == "uint64"
+        assert frame.iloc[0, 0] == 2**64 - 1
+        return
+    if profile == "table_context":
+        assert tuple(frame.columns) == (
+            "a\x00b",
+            "float32_rounding",
+            "legacy_bytes",
+            "duration",
+        )
+        assert str(frame["a\x00b"].dtype) == "float16"
+        assert str(frame["float32_rounding"].dtype) == "float32"
+        assert frame["float32_rounding"].iloc[0] == -394.478118896484375
+        assert frame["legacy_bytes"].iloc[0] == b"\xc3"
+        assert str(frame["duration"].dtype) == "timedelta64[ns]"
+        assert frame["duration"].iloc[0] == pd.Timedelta("-1 days 23:56:21.971770440")
+        return
+    if profile == "boundary_terminal_bytes":
+        assert tuple(frame.columns) == ("legacy_bytes",)
+        assert frame.iloc[0, 0] == b"x" * 4096 + bytes.fromhex("d0")
+        return
+    raise AssertionError(f"unknown legacy test profile: {profile}")
+
+
+def _legacy_profile_digest(profile: str, frame: pd.DataFrame) -> str:
+    _assert_persisted_legacy_profile(profile, frame)
+    if profile == "boundary_terminal_bytes":
+        return LEGACY_BOUNDARY_DIGEST
+    return _legacy_canonical_shard_frame_digest(frame)
 
 
 def _authority_verification_key_provider(
@@ -388,6 +443,7 @@ def _ready_scenario(
         reports=reports,
         verified_code_sha_provider=lambda: resolved_spec.code_sha,
     )
+    legacy_profile = None if worker_registry is None else worker_registry.legacy_profile
     for _ in hold_days:
         assert worker.run_once().status == "succeeded"
         if forged_current_content_hash is not None:
@@ -463,6 +519,21 @@ def _ready_scenario(
                 (attempt / "manifest.json").read_bytes()
             )
             legacy_payload = current.model_dump(mode="python", exclude_none=True)
+            if legacy_profile is not None:
+                legacy_artifacts = []
+                for artifact in current.artifacts:
+                    persisted = pd.read_parquet(attempt / artifact.file_name)
+                    legacy_artifacts.append(
+                        artifact.model_copy(
+                            update={
+                                "content_sha256": _legacy_profile_digest(
+                                    legacy_profile,
+                                    persisted,
+                                )
+                            }
+                        ).model_dump(mode="python")
+                    )
+                legacy_payload["artifacts"] = legacy_artifacts
             legacy_payload["schema_version"] = 1
             legacy_payload.pop("worker_code_sha", None)
             legacy_payload.pop("content_digest_algorithm", None)
@@ -495,41 +566,7 @@ def _ready_scenario(
     )
 
 
-class _LegacyUnsignedRegistry(RecordingRegistry):
-    def execute_shard(
-        self,
-        validated: ValidatedStrategyShard,
-        store: object,
-    ) -> LabShardExecutionResult:
-        result = super().execute_shard(validated, store)
-        frame = result.tables[0].frame.copy()
-        frame["hold_days"] = pd.Series([2**64 - 1], dtype="uint64")
-        return result.model_copy(update={"tables": (LabShardTable(name="trades", frame=frame),)})
-
-
 class _LegacyTableContextRegistry(RecordingRegistry):
-    def execute_shard(
-        self,
-        validated: ValidatedStrategyShard,
-        store: object,
-    ) -> LabShardExecutionResult:
-        result = super().execute_shard(validated, store)
-        frame = pd.DataFrame(
-            {
-                "a\x00b": pd.Series([np.finfo(np.float16).tiny], dtype="float16"),
-                "float32_rounding": pd.Series(
-                    [np.float32(-394.478118896484375)],
-                    dtype="float32",
-                ),
-                "legacy_bytes": pd.Series([b"\xc3"], dtype=object),
-                "duration": pd.Series(
-                    [pd.Timedelta("-1 days 23:56:21.971770440")],
-                    dtype="timedelta64[ns]",
-                ),
-            }
-        )
-        return result.model_copy(update={"tables": (LabShardTable(name="trades", frame=frame),)})
-
     def aggregate_results(
         self,
         spec: ResearchRunSpec,
@@ -549,24 +586,6 @@ class _LegacyTableContextRegistry(RecordingRegistry):
             for index, result in enumerate(results)
         )
         return self.delegate.aggregate_results(spec, normalized)
-
-
-class _LegacyBoundaryBytesRegistry(_LegacyTableContextRegistry):
-    def execute_shard(
-        self,
-        validated: ValidatedStrategyShard,
-        store: object,
-    ) -> LabShardExecutionResult:
-        result = RecordingRegistry.execute_shard(self, validated, store)
-        frame = pd.DataFrame(
-            {
-                "legacy_bytes": pd.Series(
-                    [b"x" * 4096 + bytes.fromhex("d0")],
-                    dtype=object,
-                )
-            }
-        )
-        return result.model_copy(update={"tables": (LabShardTable(name="trades", frame=frame),)})
 
 
 def _ack_artifact_commit(
@@ -722,7 +741,7 @@ def test_current_terminal_bytes_manifest_with_forged_content_hash_fails_closed(
     scenario = _ready_scenario(
         tmp_path,
         hold_days=(1,),
-        worker_registry=_LegacyBoundaryBytesRegistry(),
+        worker_registry=RecordingRegistry(legacy_profile="boundary_terminal_bytes"),
     )
     snapshot = LabJobReader(scenario.store.path).get_finalization_snapshot(scenario.job_id)
     assert snapshot is not None
@@ -746,7 +765,7 @@ def test_finalizer_rejects_scheduler_accepted_current_forged_content_hash(
     scenario = _ready_scenario(
         tmp_path,
         hold_days=(1,),
-        worker_registry=_LegacyBoundaryBytesRegistry(),
+        worker_registry=RecordingRegistry(legacy_profile="boundary_terminal_bytes"),
         forged_current_content_hash="0" * 64,
     )
 
@@ -1068,21 +1087,16 @@ def test_finalizer_daemon_fails_closed_when_incremental_audit_is_degraded(
 
 def test_finalizer_recovers_accepted_legacy_uint64_bundle(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import rquant.lab_worker as lab_worker_module
-
-    with monkeypatch.context() as legacy_worker:
-        legacy_worker.setattr(
-            lab_worker_module,
-            "canonical_shard_frame_digest",
-            _legacy_canonical_shard_frame_digest,
-        )
-        scenario = _ready_scenario(
-            tmp_path,
-            hold_days=(1,),
-            worker_registry=_LegacyUnsignedRegistry(),
-        )
+    profile = "uint64_max"
+    scenario = _ready_scenario(
+        tmp_path,
+        hold_days=(1,),
+        worker_registry=RecordingRegistry(legacy_profile=profile),
+        spec=_legacy_spec((1,)),
+        result_digest_policy=_legacy_digest_policy(),
+        rewrite_pending_as_legacy_v1=True,
+    )
 
     snapshot = LabJobReader(scenario.store.path).get_finalization_snapshot(scenario.job_id)
     assert snapshot is not None
@@ -1091,34 +1105,49 @@ def test_finalizer_recovers_accepted_legacy_uint64_bundle(
     manifest = LabShardResultManifest.model_validate_json((attempt / "manifest.json").read_bytes())
     artifact = manifest.artifacts[0]
     persisted = pd.read_parquet(attempt / artifact.file_name)
-    assert str(persisted["hold_days"].dtype) == "uint64"
-    assert artifact.content_sha256 == _legacy_canonical_shard_frame_digest(persisted)
+    _assert_persisted_legacy_profile(profile, persisted)
+    assert manifest.schema_version == 1
+    assert manifest.worker_code_sha is None
+    assert manifest.content_digest_algorithm is None
+    assert artifact.content_sha256 == _legacy_profile_digest(profile, persisted)
     assert evidence.accepted_success.receipt.status == "accepted"
 
-    result = scenario.finalizer().finalize(scenario.job_id)
+    untrusted_legacy = LabFinalizer(
+        reader=LabJobReader(scenario.store.path),
+        shard_artifact_root=scenario.root / "artifacts",
+        artifact_store=scenario.artifact_store,
+        commit_spool=scenario.commit_spool,
+        adapter_registry=default_strategy_job_adapter_registry(),
+        verified_code_sha_provider=lambda: LEGACY_TEST_CODE_SHA,
+        finalizer_authority_key_provider=_authority_key_provider,
+    )
+    with pytest.raises(LabFinalizationIntegrityError, match="provenance is not authorized"):
+        untrusted_legacy.finalize(scenario.job_id)
+    assert scenario.commit_spool.pending() == ()
+    assert not (scenario.artifact_store.sealed_root / scenario.job_id.hex).exists()
 
-    assert result.status == "published"
+    result = scenario.finalizer().finalize(scenario.job_id)
+    replay = scenario.finalizer().finalize(scenario.job_id)
+
+    assert result.status == replay.status == "published"
+    assert replay.request_id == result.request_id
+    assert replay.complete_result_hash == result.complete_result_hash
     assert len(scenario.commit_spool.pending()) == 1
 
 
 def test_finalizer_recovers_accepted_legacy_table_context_bundle(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import rquant.lab_worker as lab_worker_module
-
-    registry = _LegacyTableContextRegistry()
-    with monkeypatch.context() as legacy_worker:
-        legacy_worker.setattr(
-            lab_worker_module,
-            "canonical_shard_frame_digest",
-            _legacy_canonical_shard_frame_digest,
-        )
-        scenario = _ready_scenario(
-            tmp_path,
-            hold_days=(1,),
-            worker_registry=registry,
-        )
+    profile = "table_context"
+    registry = _LegacyTableContextRegistry(legacy_profile=profile)
+    scenario = _ready_scenario(
+        tmp_path,
+        hold_days=(1,),
+        worker_registry=registry,
+        spec=_legacy_spec((1,)),
+        result_digest_policy=_legacy_digest_policy(),
+        rewrite_pending_as_legacy_v1=True,
+    )
 
     snapshot = LabJobReader(scenario.store.path).get_finalization_snapshot(scenario.job_id)
     assert snapshot is not None
@@ -1127,14 +1156,26 @@ def test_finalizer_recovers_accepted_legacy_table_context_bundle(
     manifest = LabShardResultManifest.model_validate_json((attempt / "manifest.json").read_bytes())
     artifact = manifest.artifacts[0]
     persisted = pd.read_parquet(attempt / artifact.file_name)
-    assert tuple(persisted.columns) == (
-        "a\x00b",
-        "float32_rounding",
-        "legacy_bytes",
-        "duration",
-    )
-    assert artifact.content_sha256 == _legacy_canonical_shard_frame_digest(persisted)
+    _assert_persisted_legacy_profile(profile, persisted)
+    assert manifest.schema_version == 1
+    assert manifest.worker_code_sha is None
+    assert manifest.content_digest_algorithm is None
+    assert artifact.content_sha256 == _legacy_profile_digest(profile, persisted)
     assert evidence.accepted_success.receipt.status == "accepted"
+
+    untrusted_legacy = LabFinalizer(
+        reader=LabJobReader(scenario.store.path),
+        shard_artifact_root=scenario.root / "artifacts",
+        artifact_store=scenario.artifact_store,
+        commit_spool=scenario.commit_spool,
+        adapter_registry=registry,
+        verified_code_sha_provider=lambda: LEGACY_TEST_CODE_SHA,
+        finalizer_authority_key_provider=_authority_key_provider,
+    )
+    with pytest.raises(LabFinalizationIntegrityError, match="provenance is not authorized"):
+        untrusted_legacy.finalize(scenario.job_id)
+    assert scenario.commit_spool.pending() == ()
+    assert not (scenario.artifact_store.sealed_root / scenario.job_id.hex).exists()
 
     finalizer = LabFinalizer(
         reader=LabJobReader(scenario.store.path),
@@ -1142,60 +1183,33 @@ def test_finalizer_recovers_accepted_legacy_table_context_bundle(
         artifact_store=scenario.artifact_store,
         commit_spool=scenario.commit_spool,
         adapter_registry=registry,
-        verified_code_sha_provider=lambda: "1" * 40,
+        verified_code_sha_provider=lambda: LEGACY_TEST_CODE_SHA,
         finalizer_authority_key_provider=_authority_key_provider,
+        result_digest_policy=_legacy_digest_policy(),
     )
     result = finalizer.finalize(scenario.job_id)
+    replay = finalizer.finalize(scenario.job_id)
 
-    assert result.status == "published"
+    assert result.status == replay.status == "published"
+    assert replay.request_id == result.request_id
+    assert replay.complete_result_hash == result.complete_result_hash
     assert len(scenario.commit_spool.pending()) == 1
 
 
 def test_finalizer_recovers_accepted_legacy_boundary_truncated_bytes_bundle(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import rquant.lab_worker as lab_worker_module
-
-    observed_legacy_digest = "0103274351e3ced582911b8718b7df4506c3bd70418c6ac907fb582f80c6dab8"
-
-    def legacy_boundary_digest(frame: pd.DataFrame) -> str:
-        if tuple(frame.columns) == ("legacy_bytes",):
-            assert frame.iloc[0, 0] == b"x" * 4096 + bytes.fromhex("d0")
-            return observed_legacy_digest
-        return _legacy_canonical_shard_frame_digest(frame)
-
-    registry = _LegacyBoundaryBytesRegistry()
-    legacy_code_sha = "53dc0afe74d5af44f1d4a4bcda149d6a5b52c854"
-    base_spec = _nshape_compare_spec(hold_days=(1,))
-    legacy_spec = ResearchRunSpec.model_validate(
-        {
-            **base_spec.model_dump(mode="python"),
-            "code_sha": legacy_code_sha,
-            "feature_contract": build_adapter_execution_contract(
-                "nshape-compare",
-                "1",
-                legacy_code_sha,
-            ),
-        }
+    profile = "boundary_terminal_bytes"
+    registry = _LegacyTableContextRegistry(legacy_profile=profile)
+    policy = _legacy_digest_policy()
+    scenario = _ready_scenario(
+        tmp_path,
+        hold_days=(1,),
+        worker_registry=registry,
+        spec=_legacy_spec((1,)),
+        result_digest_policy=policy,
+        rewrite_pending_as_legacy_v1=True,
     )
-    policy = LabResultDigestPolicy(
-        legacy_allowlist=(LabLegacyContentDigestProvenance(code_sha=legacy_code_sha),)
-    )
-    with monkeypatch.context() as legacy_worker:
-        legacy_worker.setattr(
-            lab_worker_module,
-            "canonical_shard_frame_digest",
-            legacy_boundary_digest,
-        )
-        scenario = _ready_scenario(
-            tmp_path,
-            hold_days=(1,),
-            worker_registry=registry,
-            spec=legacy_spec,
-            result_digest_policy=policy,
-            rewrite_pending_as_legacy_v1=True,
-        )
 
     assert len(scenario.legacy_report_bytes) == 1
     legacy_report_id = json.loads(scenario.legacy_report_bytes[0])["report_id"]
@@ -1214,7 +1228,9 @@ def test_finalizer_recovers_accepted_legacy_boundary_truncated_bytes_bundle(
     assert manifest.schema_version == 1
     assert manifest.worker_code_sha is None
     assert manifest.content_digest_algorithm is None
-    assert manifest.artifacts[0].content_sha256 == observed_legacy_digest
+    persisted = pd.read_parquet(attempt / manifest.artifacts[0].file_name)
+    _assert_persisted_legacy_profile(profile, persisted)
+    assert manifest.artifacts[0].content_sha256 == _legacy_profile_digest(profile, persisted)
 
     untrusted_legacy = LabFinalizer(
         reader=LabJobReader(scenario.store.path),
@@ -1222,7 +1238,7 @@ def test_finalizer_recovers_accepted_legacy_boundary_truncated_bytes_bundle(
         artifact_store=scenario.artifact_store,
         commit_spool=scenario.commit_spool,
         adapter_registry=registry,
-        verified_code_sha_provider=lambda: legacy_code_sha,
+        verified_code_sha_provider=lambda: LEGACY_TEST_CODE_SHA,
         finalizer_authority_key_provider=_authority_key_provider,
     )
     with pytest.raises(LabFinalizationIntegrityError, match="provenance is not authorized"):
@@ -1234,13 +1250,17 @@ def test_finalizer_recovers_accepted_legacy_boundary_truncated_bytes_bundle(
         artifact_store=scenario.artifact_store,
         commit_spool=scenario.commit_spool,
         adapter_registry=registry,
-        verified_code_sha_provider=lambda: legacy_code_sha,
+        verified_code_sha_provider=lambda: LEGACY_TEST_CODE_SHA,
         finalizer_authority_key_provider=_authority_key_provider,
         result_digest_policy=policy,
     )
     result = finalizer.finalize(scenario.job_id)
 
-    assert result.status == "published"
+    replay = finalizer.finalize(scenario.job_id)
+
+    assert result.status == replay.status == "published"
+    assert replay.request_id == result.request_id
+    assert replay.complete_result_hash == result.complete_result_hash
     assert len(scenario.commit_spool.pending()) == 1
 
 

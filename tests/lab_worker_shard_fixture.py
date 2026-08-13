@@ -7,7 +7,9 @@ import threading
 import time
 from datetime import UTC, date, datetime
 from pathlib import Path
+from typing import Literal
 
+import numpy as np
 import pandas as pd
 
 from rquant.lab_daemon import LabDaemonConfigurationError
@@ -27,6 +29,30 @@ class _BlockingReduceValue:
         self._marker_path.write_text("child result reduce invoked", encoding="ascii")
         threading.Event().wait()
         raise AssertionError("unreachable")
+
+
+_LegacyProfile = Literal["uint64_max", "table_context", "boundary_terminal_bytes"]
+
+
+def _legacy_profile_frame(profile: _LegacyProfile) -> pd.DataFrame:
+    if profile == "uint64_max":
+        return pd.DataFrame({"hold_days": pd.Series([2**64 - 1], dtype="uint64")})
+    if profile == "table_context":
+        return pd.DataFrame(
+            {
+                "a\x00b": pd.Series([np.finfo(np.float16).tiny], dtype="float16"),
+                "float32_rounding": pd.Series([np.float32(-394.478118896484375)], dtype="float32"),
+                "legacy_bytes": pd.Series([b"\xc3"], dtype=object),
+                "duration": pd.Series(
+                    [pd.Timedelta("-1 days 23:56:21.971770440")], dtype="timedelta64[ns]"
+                ),
+            }
+        )
+    if profile == "boundary_terminal_bytes":
+        return pd.DataFrame(
+            {"legacy_bytes": pd.Series([b"x" * 4096 + bytes.fromhex("d0")], dtype=object)}
+        )
+    raise AssertionError(f"unknown legacy test profile: {profile}")
 
 
 def _counter_increment(path_value: object) -> int:
@@ -221,19 +247,26 @@ def execute_lab_shard_fixture(
         Path(str(adapter["path"])).write_text(str(os.getpid()), encoding="ascii")
         if kind != "successful-tree":
             threading.Event().wait()
+    profile = adapter.get("legacy_profile")
+    if profile is not None:
+        if profile not in {"uint64_max", "table_context", "boundary_terminal_bytes"}:
+            raise LabDaemonConfigurationError("legacy test profile is not registered")
+        frame = _legacy_profile_frame(profile)
+    else:
+        frame = pd.DataFrame(
+            [
+                {
+                    "hold_days": getattr(validated.shard, "hold_days", 1),
+                    "ret_pct": 1.25,
+                }
+            ]
+        )
     return LabShardExecutionResult.from_validated(
         validated,
         tables=(
             LabShardTable(
                 name="trades",
-                frame=pd.DataFrame(
-                    [
-                        {
-                            "hold_days": getattr(validated.shard, "hold_days", 1),
-                            "ret_pct": 1.25,
-                        }
-                    ]
-                ),
+                frame=frame,
             ),
         ),
     )
