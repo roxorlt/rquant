@@ -24,6 +24,7 @@ from rquant.paper_contracts import (
     PaperSide,
 )
 from rquant.research_run_spec import ExecutionCostSpec, InstrumentContext
+from tests.paper_ledger_anchor_support import PaperLedgerTestAuthority
 
 _ACCOUNT_ID = "paper-cost-alignment"
 _BUY_TIME = datetime(2026, 8, 10, 1, 31, tzinfo=UTC)
@@ -124,12 +125,23 @@ def _paper_store(
     *,
     spec: ExecutionCostSpec | None = None,
     initial_cash: Decimal = Decimal("10000.00"),
+    anchor_authority: PaperLedgerTestAuthority | None = None,
+    anchor_path: Path | None = None,
 ) -> PaperBrokerStore:
     return PaperBrokerStore(
         path,
         account_id=_ACCOUNT_ID,
         initial_cash=initial_cash,
         cost_policy=_paper_policy(spec),
+        **(
+            {}
+            if anchor_authority is None or anchor_path is None
+            else {
+                "ledger_id": anchor_authority.ledger_id,
+                "ledger_anchor_path": anchor_path,
+                "ledger_anchor_verifier": anchor_authority.verifier,
+            }
+        ),
     )
 
 
@@ -413,12 +425,11 @@ def test_v3_research_replay_uses_shared_costs_but_is_unbound_for_paper() -> None
     assert row["execution_cost_spec_id"] == _v3_spec().cost_spec_id
 
 
-def test_strict_v3_binding_comparator_requires_a_trusted_persisted_export(tmp_path: Path) -> None:
+def test_pure_v3_cost_math_match_is_explicitly_non_authoritative() -> None:
     from rquant.order_execution_costs import calculate_execution_costs
     from rquant.strategy_execution_costs import (
         ExecutionCostBindingEvidence,
-        PaperExecutionCostBindingExport,
-        compare_execution_cost_bindings,
+        compare_execution_cost_math,
     )
 
     spec = _v3_spec()
@@ -432,21 +443,53 @@ def test_strict_v3_binding_comparator_requires_a_trusted_persisted_export(tmp_pa
         execution_cost_spec=spec,
         calculations=(calculation,),
     )
-    forged = ExecutionCostBindingEvidence(
+    match = compare_execution_cost_math(research, spec, (calculation,))
+    assert match.matches
+    assert match.reason == "EXACT_MATH_MATCH"
+    assert not hasattr(match, "is_comparable")
+
+
+def test_store_backed_comparator_rejects_all_caller_forged_paper_facts(
+    tmp_path: Path,
+) -> None:
+    import rquant.strategy_execution_costs as strategy_costs
+    from rquant.order_execution_costs import calculate_execution_costs
+    from tests.paper_ledger_anchor_support import create_paper_ledger_test_authority
+
+    spec = _v3_spec()
+    calculation = calculate_execution_costs(
+        spec,
+        {"side": "BUY", "reference_price": "10.00", "quantity": 100},
+        _context(),
+    )
+    research = strategy_costs.ExecutionCostBindingEvidence(
         provenance_state="KNOWN_V3",
         execution_cost_spec=spec,
         calculations=(calculation,),
     )
 
-    forged_result = compare_execution_cost_bindings(research, forged)
-    assert not forged_result.is_comparable
-    assert forged_result.reason == "UNTRUSTED_PAPER_EVIDENCE"
-    forged_export = object.__new__(PaperExecutionCostBindingExport)
-    forged_export_result = compare_execution_cost_bindings(research, forged_export)
-    assert not forged_export_result.is_comparable
-    assert forged_export_result.reason == "UNTRUSTED_PAPER_EVIDENCE"
+    issuer = getattr(
+        strategy_costs,
+        "_issue_reconciled_paper_execution_cost_binding",
+        None,
+    )
+    assert issuer is None, "caller-accessible paper evidence issuer remains authoritative"
+    assert not hasattr(strategy_costs, "PaperExecutionCostBindingExport")
+    assert not hasattr(strategy_costs, "_VerifiedPaperExecutionCostBinding")
+    assert not hasattr(strategy_costs, "_TRUSTED_PAPER_EXECUTION_BINDINGS")
+    assert not hasattr(strategy_costs, "compare_execution_cost_bindings")
+    assert not hasattr(PaperBrokerStore, "export_reconciled_execution_cost_binding")
 
-    store = _paper_store(tmp_path / "paper.sqlite3", spec=spec)
+    authority = create_paper_ledger_test_authority(tmp_path / "anchor-key")
+    anchor_path = tmp_path / "current-head-anchor.json"
+    store = _paper_store(
+        tmp_path / "paper.sqlite3",
+        spec=spec,
+        anchor_authority=authority,
+        anchor_path=anchor_path,
+    )
+    assert not hasattr(research, "is_comparable")
+    assert callable(store.compare_research_execution_costs)
     store.submit_intent(
         _paper_intent(signal_seed="a"),
         execution_id="1" * 64,
@@ -454,25 +497,59 @@ def test_strict_v3_binding_comparator_requires_a_trusted_persisted_export(tmp_pa
         trade_date=_BUY_DATE,
         quote=_paper_quote("10.00"),
     )
-    paper = store.export_reconciled_execution_cost_binding(("1" * 64,))
-    exact = compare_execution_cost_bindings(research, paper)
-    unbound = compare_execution_cost_bindings(
-        research.model_copy(update={"provenance_state": "V3_UNBOUND"}),
-        paper,
+    unanchored = store.compare_research_execution_costs(
+        research,
+        account_id=_ACCOUNT_ID,
+        execution_ids=("1" * 64,),
+    )
+    assert not unanchored.is_comparable
+    assert unanchored.reason == "PAPER_LEDGER_RECONCILIATION_FAILED"
+
+    store.account_authority_snapshot(
+        as_of=_BUY_TIME + timedelta(seconds=1),
+        market_prices={"600000.SH": calculation.executed_price},
+        producer_commit=_PRODUCER_COMMIT,
+    )
+    still_unanchored = store.compare_research_execution_costs(
+        research,
+        account_id=_ACCOUNT_ID,
+        execution_ids=("1" * 64,),
+    )
+    assert not still_unanchored.is_comparable
+    assert still_unanchored.reason == "CURRENT_HEAD_UNANCHORED"
+    authority.write_current_anchor(store.path, anchor_path)
+    exact = store.compare_research_execution_costs(
+        research,
+        account_id=_ACCOUNT_ID,
+        execution_ids=("1" * 64,),
+    )
+    fabricated = calculation.model_copy(
+        update={"executed_price": calculation.executed_price + Decimal("0.01")}
+    )
+    forged = store.compare_research_execution_costs(
+        strategy_costs.ExecutionCostBindingEvidence(
+            provenance_state="KNOWN_V3",
+            execution_cost_spec=spec,
+            calculations=(fabricated,),
+        ),
+        account_id=_ACCOUNT_ID,
+        execution_ids=("1" * 64,),
     )
 
     assert exact.is_comparable
     assert exact.reason == "EXACT_V3_BOUND"
-    assert not unbound.is_comparable
-    assert unbound.reason == "UNBOUND_RESEARCH_COST"
+    assert exact.reconciliation_digest is not None
+    assert exact.head_marker_fingerprint is not None
+    assert not forged.is_comparable
+    assert forged.reason == "RESOLVED_CALCULATION_MISMATCH"
 
 
 def test_strict_v3_binding_comparator_has_machine_negative_reasons(tmp_path: Path) -> None:
     from rquant.order_execution_costs import calculate_execution_costs
     from rquant.strategy_execution_costs import (
         ExecutionCostBindingEvidence,
-        compare_execution_cost_bindings,
     )
+    from tests.paper_ledger_anchor_support import create_paper_ledger_test_authority
 
     spec = _v3_spec()
     calculation = calculate_execution_costs(
@@ -485,7 +562,14 @@ def test_strict_v3_binding_comparator_has_machine_negative_reasons(tmp_path: Pat
         execution_cost_spec=spec,
         calculations=(calculation,),
     )
-    store = _paper_store(tmp_path / "paper.sqlite3", spec=spec)
+    authority = create_paper_ledger_test_authority(tmp_path / "anchor-key")
+    anchor_path = tmp_path / "current-head-anchor.json"
+    store = _paper_store(
+        tmp_path / "paper.sqlite3",
+        spec=spec,
+        anchor_authority=authority,
+        anchor_path=anchor_path,
+    )
     store.submit_intent(
         _paper_intent(signal_seed="a"),
         execution_id="1" * 64,
@@ -493,7 +577,12 @@ def test_strict_v3_binding_comparator_has_machine_negative_reasons(tmp_path: Pat
         trade_date=_BUY_DATE,
         quote=_paper_quote("10.00"),
     )
-    paper = store.export_reconciled_execution_cost_binding(("1" * 64,))
+    store.account_authority_snapshot(
+        as_of=_BUY_TIME + timedelta(seconds=1),
+        market_prices={"600000.SH": calculation.executed_price},
+        producer_commit=_PRODUCER_COMMIT,
+    )
+    authority.write_current_anchor(store.path, anchor_path)
     different_spec = _v3_spec(engine_version="different-engine-v3")
     different_calculation = calculate_execution_costs(
         different_spec,
@@ -517,18 +606,11 @@ def test_strict_v3_binding_comparator_has_machine_negative_reasons(tmp_path: Pat
     cases = (
         (
             ExecutionCostBindingEvidence(provenance_state="LEGACY_UNKNOWN"),
-            paper,
             "LEGACY_UNKNOWN_COST_PROVENANCE",
         ),
         (
             ExecutionCostBindingEvidence(provenance_state="V3_UNBOUND", rate_only=True),
-            paper,
             "RATE_ONLY_RESEARCH_COST",
-        ),
-        (
-            exact,
-            ExecutionCostBindingEvidence(provenance_state="V3_UNBOUND"),
-            "UNTRUSTED_PAPER_EVIDENCE",
         ),
         (
             ExecutionCostBindingEvidence(
@@ -536,7 +618,6 @@ def test_strict_v3_binding_comparator_has_machine_negative_reasons(tmp_path: Pat
                 execution_cost_spec=different_spec,
                 calculations=(different_calculation,),
             ),
-            paper,
             "COST_SPEC_ID_MISMATCH",
         ),
         (
@@ -545,7 +626,6 @@ def test_strict_v3_binding_comparator_has_machine_negative_reasons(tmp_path: Pat
                 execution_cost_spec=spec,
                 calculations=(calculation, calculation),
             ),
-            paper,
             "FILL_TOPOLOGY_MISMATCH",
         ),
         (
@@ -554,7 +634,6 @@ def test_strict_v3_binding_comparator_has_machine_negative_reasons(tmp_path: Pat
                 execution_cost_spec=spec,
                 calculations=(different_context,),
             ),
-            paper,
             "INSTRUMENT_CONTEXT_MISMATCH",
         ),
         (
@@ -563,15 +642,25 @@ def test_strict_v3_binding_comparator_has_machine_negative_reasons(tmp_path: Pat
                 execution_cost_spec=spec,
                 calculations=(tampered_rules,),
             ),
-            paper,
             "SELECTED_RULE_MISMATCH",
         ),
     )
 
-    for research, paper, reason in cases:
-        result = compare_execution_cost_bindings(research, paper)
+    for research, reason in cases:
+        result = store.compare_research_execution_costs(
+            research,
+            account_id=_ACCOUNT_ID,
+            execution_ids=("1" * 64,),
+        )
         assert not result.is_comparable
         assert result.reason == reason
+
+    exact_result = store.compare_research_execution_costs(
+        exact,
+        account_id=_ACCOUNT_ID,
+        execution_ids=("1" * 64,),
+    )
+    assert exact_result.is_comparable
 
 
 @pytest.mark.parametrize(

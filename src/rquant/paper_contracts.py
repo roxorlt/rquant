@@ -6,7 +6,7 @@ from decimal import ROUND_FLOOR, Decimal
 from enum import StrEnum
 from typing import Annotated, Literal, Self
 
-from pydantic import Field, model_validator
+from pydantic import Field, computed_field, model_validator
 
 from rquant.research_run_spec import ExecutionCostCalculation
 from rquant.runtime_contracts import (
@@ -59,6 +59,77 @@ class PaperRejectReason(StrEnum):
 class PaperCostProvenanceState(StrEnum):
     KNOWN_V3 = "KNOWN_V3"
     LEGACY_UNKNOWN = "LEGACY_UNKNOWN"
+
+
+class PaperLedgerAnchorClaims(RuntimeContractModel):
+    contract: Literal["rquant-paper-ledger-head/v1"] = "rquant-paper-ledger-head/v1"
+    ledger_id: str = Field(min_length=1)
+    schema_version: Literal[5]
+    migration_attestation_digest: Sha256
+    head_revision: int = Field(ge=1)
+    head_marker_fingerprint: Sha256
+    attestation_fingerprint: Sha256
+    key_id: str = Field(min_length=1)
+    issued_at: AwareUtcDatetime
+
+
+class PaperLedgerAnchor(RuntimeContractModel):
+    claims: PaperLedgerAnchorClaims
+    signature: str = Field(min_length=1)
+
+
+class PaperLedgerArchiveTableBinding(RuntimeContractModel):
+    table: str = Field(min_length=1)
+    columns: tuple[str, ...] = Field(min_length=1)
+    source_key_ordering: tuple[str, ...] = Field(min_length=1)
+
+
+class PaperLedgerArchiveBinding(RuntimeContractModel):
+    source_sha256: Sha256
+    archive_tables: tuple[PaperLedgerArchiveTableBinding, ...] = Field(min_length=1)
+    predecessor_v4_schema_fingerprint: Sha256
+    predecessor_v4_attestation_fingerprint: Sha256
+    predecessor_v4_head_marker_fingerprint: Sha256
+    source_schema_identity: str = Field(min_length=1)
+
+
+class PaperLedgerMigrationAttestation(RuntimeContractModel):
+    contract: Literal["rquant-paper-ledger-migration/v2"] = "rquant-paper-ledger-migration/v2"
+    source_sha256: Sha256
+    predecessor_v4_schema_fingerprint: Sha256
+    predecessor_v4_attestation_fingerprint: Sha256
+    predecessor_v4_head_marker_fingerprint: Sha256
+    archive_binding_fingerprint: Sha256
+    archive_digest: Sha256
+    v4_reconciliation_report_digest: Sha256
+    migration_code_identity: str = Field(min_length=1)
+    migration_algorithm_id: Literal["paper-ledger-v4-to-v5-archive-v2"] = (
+        "paper-ledger-v4-to-v5-archive-v2"
+    )
+    source_schema_identity: str = Field(min_length=1)
+    target_schema_identity: str = Field(min_length=1)
+    target_schema_version: Literal[5] = 5
+    target_internal_migration_version: Literal[4] = 4
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def digest(self) -> str:
+        return canonical_sha256(self.model_dump(mode="python", exclude={"digest"}))
+
+
+class PaperExecutionCostComparison(RuntimeContractModel):
+    """Audit output from one reconciled and externally anchored ledger snapshot."""
+
+    is_comparable: bool
+    reason: str = Field(min_length=1)
+    account_id: str = Field(min_length=1)
+    execution_ids: tuple[str, ...]
+    ledger_generation: Sha256 | None = None
+    head_revision: int | None = Field(default=None, ge=1)
+    head_marker_fingerprint: Sha256 | None = None
+    attestation_fingerprint: Sha256 | None = None
+    migration_attestation_digest: Sha256 | None = None
+    reconciliation_digest: Sha256 | None = None
 
 
 class PaperSellQuantityAuthority(RuntimeContractModel):

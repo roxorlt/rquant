@@ -28,7 +28,7 @@ or ambiguous selector evidence is invalid.
 
 ## Paper Ledger
 
-Fresh paper ledgers use schema v5/internal migration v3. A new account is bound
+Fresh paper ledgers use schema v5/internal migration v4. A new account is bound
 immutably to one persisted canonical `paper_cost_spec`. Every new fill and
 execution receipt is `KNOWN_V3` and stores transfer fee, total fees, spec ID,
 schema version, context fingerprint, and the resolved receipt evidence.
@@ -44,12 +44,21 @@ The execution request fingerprint includes the v3 spec, engine, normalized
 context, and resolved calculation. Replaying identical evidence returns the
 original receipt; changed evidence conflicts before ledger mutation.
 
-The strict paper/research comparator accepts only an opaque
-`PaperExecutionCostBindingExport` issued by
-`PaperBrokerStore.export_reconciled_execution_cost_binding(...)`. The broker
-issues it only after reconciling persisted account, fill, receipt, cost-spec,
-runtime-generation, and attestation-head evidence. Constructed caller objects,
-including lookalike v3 evidence, are untrusted and compare false.
+Pure cost-math matching is non-authoritative. The only exact comparison API is
+`PaperBrokerStore.compare_research_execution_costs(...)`; callers provide only
+research evidence, the bound account ID, and ordered persisted execution IDs.
+Within one read transaction the store reads and reconciles the account, cost
+spec, orders, fills, receipts, authority snapshot, and ledger head, then replays
+each fill through the shared engine. No export token, issuer, cache,
+caller-supplied paper fact, or alternate exact-v3 path exists.
+
+Exact comparison also requires an external
+`rquant-paper-ledger-head/v1` Ed25519 checkpoint naming the configured ledger,
+current v5 head, and migration-attestation digest. Runtime wiring contains only
+a pinned public key and allowed ledger ID. Missing, invalid, stale, or
+different-head evidence returns `CURRENT_HEAD_UNANCHORED`; local diagnostics
+remain available, but exact comparability is false. This patch does not contain
+a production private key or issue a production anchor.
 
 ## Offline Migration and Cutover
 
@@ -57,25 +66,35 @@ Opening a v4 file through `PaperBrokerStore` fails closed with `offline
 migration required`; it never mutates the source. Stop the writer, checkpoint
 the SQLite source (no active WAL, SHM, or journal sidecar), and use
 `migrate_paper_ledger_v4_offline_copy(source_path, candidate_path)`. The API
-copies the source to a candidate, migrates and verifies that candidate in a
-single SQLite transaction, checks integrity/trust/reconciliation, and promotes
-only the verified candidate atomically. Every injected or ordinary failure
-leaves the source bytes and hash unchanged.
+first verifies the closed regular source using the frozen
+schema-v4/internal-2 reconciler. That independent replay validates cash, FIFO
+lots and consumptions, realized P&L, receipts, and the predecessor
+attestation/head using observed v4 commission-and-tax accounting. It then copies
+the source to a distinct temporary path, transforms only that copy in an
+explicit transaction, verifies it, and atomically publishes only the requested
+offline candidate. Every injected or ordinary phase failure leaves the source
+bytes and SHA-256 unchanged and publishes no candidate.
 
 Migration deliberately leaves historical cash, P&L, lots, receipt JSON, and
 legacy fee fields unchanged. It sets the new authority and fee fields to
 `NULL`, marks prior account/fill/receipt evidence `LEGACY_UNKNOWN`, and attests
 `unknown_cost_provenance_count`. The original v4 schema, attestation, head, and
-tamper-marker facts are retained in immutable archive tables. Their content and
-the recorded predecessor schema/attestation/head fingerprints are part of the
-v5 integrity chain; archive tampering quarantines the candidate.
+tamper-marker facts are retained as canonical primary-key-ordered rows in
+immutable archive tables. A non-self-referential archive binding and digest are
+recorded in the immutable `rquant-paper-ledger-migration/v2` report; its digest
+is carried by revision 1, every later v5 head, and the external head anchor.
+Coordinated archive-plus-binding tampering therefore fails migration-attestation
+validation, while a forged internal head still fails external verification.
 
 Legacy accounts are audit-only. Create a new v5 account bound to the active
 explicit v3 spec before performing aligned executions. A fresh account can be
 reconciled and read beside quarantined legacy evidence; the legacy account
 cannot submit executions. To roll back a failed or unsuitable migration,
-replace the working offline copy with the verified pre-migration copy. Do not
-run this migration against production as part of routine deployment.
+discard the candidate and retain the verified pre-migration source. The result
+derives reconciliation state from the independent v4 report and permits live
+promotion only with a valid current-head anchor; the local migrator returns an
+unanchored audit candidate. Do not run this migration against production as
+part of routine deployment.
 
 ## Verification
 
@@ -88,7 +107,14 @@ DATA_DIR=/private/tmp/rquant-stage8-paper-cost-alignment-tests/data \
 DUCKDB_PATH=/private/tmp/rquant-stage8-paper-cost-alignment-tests/data/rquant.duckdb \
 PARQUET_DIR=/private/tmp/rquant-stage8-paper-cost-alignment-tests/parquet \
 LOG_DIR=/private/tmp/rquant-stage8-paper-cost-alignment-tests/log \
-.venv/bin/python -m pytest tests/unit/test_paper_cost_alignment.py tests/unit/test_paper_broker.py -q
+.venv/bin/python -m pytest -q \
+  tests/unit/test_paper_cost_alignment.py \
+  tests/unit/test_paper_broker.py \
+  tests/unit/test_paper_ledger_v4_migration.py \
+  tests/unit/test_paper_ledger_anchor.py \
+  tests/unit/test_strategy_paper_lifecycle.py \
+  tests/unit/test_runtime_builder_paper.py \
+  tests/unit/test_runtime_paper_quote.py
 ```
 
 An exact `KNOWN_V3` comparison is true only when spec ID, engine, normalized
