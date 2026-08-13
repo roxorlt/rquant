@@ -89,7 +89,7 @@ rQuant 是个人自用的 A 股条件筛选、分钟监控与告警平台。它�
 - [可信策略研究与盘中监控路线图](docs/plans/2026-07-13-rquant-trustworthy-strategy-roadmap.md)
 - [不可变执行快照设计](docs/plans/2026-07-17-stage1-execution-snapshot-design.md)
 - [研究数据云化、告警治理与 Strategy Lab 重构计划](docs/plans/2026-07-16-research-cloud-alert-lab-implementation.md)
-- [Strategy Lab 自动优化说明](docs/strategy-lab-auto-optimization-guide.md)
+- [Strategy Lab 与持久 Job Center 自动优化说明](docs/strategy-lab-auto-optimization-guide.md)
 
 ## 运行架构
 
@@ -217,7 +217,7 @@ bash scripts/check-core-quality.sh
 # 健康看板
 .venv/bin/streamlit run src/rquant/dashboard/app.py --server.port 8501
 
-# Strategy Lab
+# Strategy Lab（提交到持久 Job Center；关闭页面或切换页签不影响后台任务）
 .venv/bin/streamlit run src/rquant/dashboard/strategy_lab.py --server.port 8504
 
 # 盘中全景
