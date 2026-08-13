@@ -1874,13 +1874,16 @@ def test_offline_v4_migration_keeps_legacy_cost_evidence_null_and_requires_a_fre
     migrated = PaperBrokerStore(
         candidate,
         account_id=LEGACY_ACCOUNT_ID,
-        initial_cash=Decimal("10000.00"),
+        initial_cash=source.initial_cash_for(LEGACY_ACCOUNT_ID),
         cost_policy=cost_policy,
     )
     diagnostic = migrated.ledger_trust_status()
     assert diagnostic.state == "quarantined"
     unknown = {item.field: item.count for item in diagnostic.unknown_evidence}
-    assert unknown["unknown_cost_provenance_count"] == 7
+    assert unknown["unknown_cost_provenance_count"] == sum(
+        len(source.historical_rows[table])
+        for table in ("broker_account", "paper_fill", "paper_execution_receipt")
+    )
     with sqlite3.connect(candidate) as connection:
         account = connection.execute(
             "SELECT cash, realized_pnl, cost_spec_id, cost_spec_schema_version, "
@@ -1897,16 +1900,12 @@ def test_offline_v4_migration_keeps_legacy_cost_evidence_null_and_requires_a_fre
             "FROM paper_execution_receipt ORDER BY execution_id"
         ).fetchall()
     assert account == ("162888.1000", "2900.1000", None, None, "LEGACY_UNKNOWN")
-    assert fills == [
-        (None, None, None, None, None, "LEGACY_UNKNOWN"),
-        (None, None, None, None, None, "LEGACY_UNKNOWN"),
-        (None, None, None, None, None, "LEGACY_UNKNOWN"),
-    ]
-    assert receipts == [
-        (None, None, None, None, None, "LEGACY_UNKNOWN"),
-        (None, None, None, None, None, "LEGACY_UNKNOWN"),
-        (None, None, None, None, None, "LEGACY_UNKNOWN"),
-    ]
+    assert fills == [(None, None, None, None, None, "LEGACY_UNKNOWN")] * len(
+        source.historical_rows["paper_fill"]
+    )
+    assert receipts == [(None, None, None, None, None, "LEGACY_UNKNOWN")] * len(
+        source.historical_rows["paper_execution_receipt"]
+    )
     with pytest.raises(PaperBrokerReconciliationError, match="audit-only"):
         migrated.submit_intent(
             _intent(
@@ -2245,7 +2244,7 @@ def test_v4_open_fails_closed_and_offline_copy_preserves_parent_history(tmp_path
         PaperBrokerStore(
             source.path,
             account_id=LEGACY_ACCOUNT_ID,
-            initial_cash=Decimal("10000.00"),
+            initial_cash=source.initial_cash_for(LEGACY_ACCOUNT_ID),
             cost_policy=paper_cost_policy(),
         )
     assert source.path.read_bytes() == source_bytes
@@ -2325,7 +2324,7 @@ def test_offline_migration_archive_tamper_quarantines_the_candidate(tmp_path: Pa
     diagnostic = PaperBrokerStore(
         candidate,
         account_id=LEGACY_ACCOUNT_ID,
-        initial_cash=Decimal("10000.00"),
+        initial_cash=source.initial_cash_for(LEGACY_ACCOUNT_ID),
         cost_policy=paper_cost_policy(),
     )
     assert diagnostic.ledger_trust_status().state == "quarantined"

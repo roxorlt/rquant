@@ -308,6 +308,156 @@ def _account_state_fingerprint(snapshot: PaperAccountSnapshot) -> str:
     )
 
 
+_PAPER_LEDGER_FINANCIAL_STATE_CONTRACT = "rquant-paper-ledger-financial-state/v1"
+_PAPER_LEDGER_FINANCIAL_STATE_TABLES = (
+    (
+        "broker_account",
+        (
+            "account_id",
+            "initial_cash",
+            "cash",
+            "realized_pnl",
+            "cost_policy_fingerprint",
+            "cost_spec_id",
+            "cost_spec_schema_version",
+            "cost_provenance_state",
+        ),
+        "account_id",
+    ),
+    (
+        "paper_cost_spec",
+        ("cost_spec_id", "schema_version", "cost_engine_version", "canonical_json", "persisted_at"),
+        "cost_spec_id",
+    ),
+    (
+        "paper_intent",
+        (
+            "intent_id",
+            "account_id",
+            "signal_id",
+            "entry_signal_id",
+            "ts_code",
+            "side",
+            "initial_execution_id",
+            "initial_execution_request_fingerprint",
+            "payload_json",
+            "persisted_at",
+        ),
+        "intent_id",
+    ),
+    (
+        "paper_order",
+        (
+            "order_id",
+            "intent_id",
+            "account_id",
+            "ts_code",
+            "side",
+            "entry_signal_id",
+            "order_type",
+            "quantity",
+            "filled_quantity",
+            "average_fill_price",
+            "status",
+            "reject_reason",
+            "created_at",
+            "updated_at",
+        ),
+        "order_id",
+    ),
+    (
+        "paper_fill",
+        (
+            "fill_id",
+            "execution_id",
+            "order_id",
+            "sequence",
+            "quantity",
+            "price",
+            "commission",
+            "transfer_fee",
+            "tax",
+            "total_fees",
+            "cost_spec_id",
+            "cost_spec_schema_version",
+            "cost_context_fingerprint",
+            "cost_provenance_state",
+            "executed_at",
+            "persisted_at",
+            "price_snapshot_id",
+        ),
+        "fill_id",
+    ),
+    (
+        "paper_lot",
+        (
+            "lot_id",
+            "account_id",
+            "ts_code",
+            "entry_signal_id",
+            "acquisition_trade_date",
+            "available_date",
+            "original_quantity",
+            "remaining_quantity",
+            "unit_cost",
+            "persisted_at",
+            "buy_executed_at",
+            "buy_persisted_at",
+            "buy_fill_sequence",
+        ),
+        "lot_id",
+    ),
+    (
+        "paper_lot_consumption",
+        ("fill_id", "lot_id", "quantity", "unit_cost", "persisted_at"),
+        "fill_id, lot_id",
+    ),
+    (
+        "paper_execution_receipt",
+        (
+            "execution_id",
+            "account_id",
+            "intent_id",
+            "order_id",
+            "request_fingerprint",
+            "request_json",
+            "receipt_json",
+            "transfer_fee",
+            "total_fees",
+            "cost_spec_id",
+            "cost_spec_schema_version",
+            "cost_context_fingerprint",
+            "cost_provenance_state",
+            "persisted_at",
+        ),
+        "execution_id",
+    ),
+    (
+        "paper_account_authority",
+        ("account_id", "revision", "state_fingerprint", "producer_commit", "snapshot_json"),
+        "account_id",
+    ),
+)
+
+
+def paper_ledger_financial_state_digest(connection: sqlite3.Connection) -> str:
+    """Hash the complete financial state using stable table and primary-key ordering."""
+
+    tables: dict[str, tuple[dict[str, object], ...]] = {}
+    for table, columns, order_by in _PAPER_LEDGER_FINANCIAL_STATE_TABLES:
+        column_sql = ", ".join(f'"{column}"' for column in columns)
+        rows = connection.execute(
+            f'SELECT {column_sql} FROM "{table}" ORDER BY {order_by}'
+        ).fetchall()
+        tables[table] = tuple(dict(zip(columns, row, strict=True)) for row in rows)
+    return canonical_sha256(
+        {
+            "contract": _PAPER_LEDGER_FINANCIAL_STATE_CONTRACT,
+            "tables": tables,
+        }
+    )
+
+
 class PaperBrokerStore:
     """Own the only mutable paper ledger and serialize all writes through SQLite."""
 
@@ -4727,6 +4877,7 @@ class PaperBrokerStore:
                     spec=spec,
                     execution_ids=normalized_ids,
                 )
+                financial_state_digest = paper_ledger_financial_state_digest(connection)
                 migration, latest = self._attestation_head(connection)
                 marker = connection.execute(
                     "SELECT * FROM paper_ledger_head_marker WHERE revision = ? LIMIT 1",
@@ -4744,6 +4895,7 @@ class PaperBrokerStore:
                     "migration_attestation_digest": str(
                         migration["migration_attestation_fingerprint"]
                     ),
+                    "financial_state_digest": financial_state_digest,
                     "reconciliation_digest": reconciliation_digest,
                 }
                 if not self._anchor_matches_current_head(observed):
@@ -4800,6 +4952,7 @@ class PaperBrokerStore:
             and claims.head_revision == observed["head_revision"]
             and claims.head_marker_fingerprint == observed["head_marker_fingerprint"]
             and claims.attestation_fingerprint == observed["attestation_fingerprint"]
+            and claims.financial_state_digest == observed["financial_state_digest"]
         )
 
     def _reconcile_comparison_snapshot(
@@ -4835,24 +4988,280 @@ class PaperBrokerStore:
             raise PaperBrokerReconciliationError(
                 "paper comparator persisted account authority differs"
             )
+        order_rows = connection.execute(
+            """
+            SELECT
+                o.*,
+                i.signal_id AS intent_signal_id,
+                i.entry_signal_id AS intent_entry_signal_id,
+                i.ts_code AS intent_ts_code,
+                i.side AS intent_side,
+                i.initial_execution_id,
+                i.initial_execution_request_fingerprint,
+                i.payload_json AS intent_payload_json
+            FROM paper_order AS o
+            JOIN paper_intent AS i ON i.intent_id = o.intent_id
+            WHERE o.account_id = ? ORDER BY o.order_id
+            """,
+            (self.account_id,),
+        ).fetchall()
+        orders = {str(row["order_id"]): row for row in order_rows}
+        if len(orders) != len(order_rows):
+            raise PaperBrokerReconciliationError("paper comparator order identity is duplicated")
         fill_rows = connection.execute(
             """
-            SELECT f.*, o.side FROM paper_fill AS f
+            SELECT f.*, o.side, o.ts_code AS order_ts_code,
+                   o.entry_signal_id AS order_entry_signal_id
+            FROM paper_fill AS f
             JOIN paper_order AS o ON o.order_id = f.order_id
             WHERE o.account_id = ?
             ORDER BY f.executed_at, f.persisted_at, f.sequence, f.fill_id
             """,
             (self.account_id,),
         ).fetchall()
+        fills_by_order: dict[str, list[sqlite3.Row]] = {}
+        fills_by_execution: dict[str, sqlite3.Row] = {}
+        for row in fill_rows:
+            execution_id = str(row["execution_id"])
+            if execution_id in fills_by_execution:
+                raise PaperBrokerReconciliationError(
+                    "paper comparator execution fill identity is duplicated"
+                )
+            fills_by_execution[execution_id] = row
+            fills_by_order.setdefault(str(row["order_id"]), []).append(row)
+        receipt_rows = connection.execute(
+            "SELECT * FROM paper_execution_receipt WHERE account_id = ? ORDER BY execution_id",
+            (self.account_id,),
+        ).fetchall()
+        receipts_by_execution = {str(row["execution_id"]): row for row in receipt_rows}
+        if len(receipts_by_execution) != len(receipt_rows):
+            raise PaperBrokerReconciliationError("paper comparator receipt identity is duplicated")
+        expected_receipt_ids = {
+            str(row["initial_execution_id"])
+            for row in order_rows
+            if row["initial_execution_id"] is not None
+        } | set(fills_by_execution)
+        if set(receipts_by_execution) != expected_receipt_ids:
+            raise PaperBrokerReconciliationError(
+                "paper comparator execution receipt topology does not reconcile"
+            )
+        receipts: dict[str, PaperExecutionReceipt] = {}
+        requests: dict[str, dict[str, object]] = {}
+        for execution_id, row in receipts_by_execution.items():
+            receipt = self._execution_receipt(connection, execution_id=execution_id)
+            if receipt is None:
+                raise PaperBrokerReconciliationError(
+                    "paper comparator execution receipt is missing"
+                )
+            try:
+                request = json.loads(str(row["request_json"]))
+            except (TypeError, ValueError) as exc:
+                raise PaperBrokerReconciliationError(
+                    "paper comparator execution request is invalid"
+                ) from exc
+            if not isinstance(request, dict):
+                raise PaperBrokerReconciliationError(
+                    "paper comparator execution request must be an object"
+                )
+            receipts[execution_id] = receipt
+            requests[execution_id] = request
+        intents_by_order: dict[str, PaperOrderIntent] = {}
+        for order_id, order_row in orders.items():
+            try:
+                intent = PaperOrderIntent.model_validate_json(order_row["intent_payload_json"])
+            except (TypeError, ValueError) as exc:
+                raise PaperBrokerReconciliationError(
+                    f"paper comparator order {order_id} intent is invalid"
+                ) from exc
+            if (
+                intent.intent_id != order_row["intent_id"]
+                or intent.account_id != self.account_id
+                or intent.signal_id != order_row["intent_signal_id"]
+                or intent.entry_signal_id != order_row["intent_entry_signal_id"]
+                or intent.ts_code != order_row["intent_ts_code"]
+                or intent.side.value != order_row["intent_side"]
+                or intent.ts_code != order_row["ts_code"]
+                or intent.side.value != order_row["side"]
+                or intent.order_type.value != order_row["order_type"]
+                or intent.quantity != int(order_row["quantity"])
+            ):
+                raise PaperBrokerReconciliationError(
+                    "paper comparator intent/order identity does not reconcile"
+                )
+            order_fills = sorted(
+                fills_by_order.get(order_id, []),
+                key=lambda row: (int(row["sequence"]), str(row["fill_id"])),
+            )
+            sequences = tuple(int(row["sequence"]) for row in order_fills)
+            if sequences != tuple(range(1, len(order_fills) + 1)):
+                raise PaperBrokerReconciliationError(
+                    "paper comparator order fill sequence does not reconcile"
+                )
+            try:
+                order = self._order_from_row(order_row)
+            except (TypeError, ValueError) as exc:
+                raise PaperBrokerReconciliationError(
+                    f"paper comparator order {order_id} is invalid"
+                ) from exc
+            filled_quantity = sum(int(row["quantity"]) for row in order_fills)
+            if filled_quantity != order.filled_quantity:
+                raise PaperBrokerReconciliationError(
+                    "paper comparator order filled quantity does not reconcile"
+                )
+            expected_entry_signal_id = (
+                None if intent.side is PaperSide.BUY else intent.entry_signal_id
+            )
+            if order_row["entry_signal_id"] != expected_entry_signal_id:
+                raise PaperBrokerReconciliationError(
+                    "paper comparator order entry provenance does not reconcile"
+                )
+            if order_fills:
+                average_fill_price = (
+                    sum(
+                        (Decimal(row["price"]) * int(row["quantity"]) for row in order_fills),
+                        Decimal("0"),
+                    )
+                    / filled_quantity
+                ).quantize(self._execution_price_tick, rounding=ROUND_HALF_UP)
+                if order.average_fill_price != average_fill_price:
+                    raise PaperBrokerReconciliationError(
+                        "paper comparator order average fill price does not reconcile"
+                    )
+            elif order.average_fill_price is not None:
+                raise PaperBrokerReconciliationError(
+                    "paper comparator unfilled order has an average fill price"
+                )
+            if (
+                order.status
+                in {
+                    PaperOrderStatus.PENDING,
+                    PaperOrderStatus.ACCEPTED,
+                    PaperOrderStatus.REJECTED,
+                }
+                and filled_quantity != 0
+            ):
+                raise PaperBrokerReconciliationError(
+                    "paper comparator unfilled order has persisted fills"
+                )
+            if order.status is PaperOrderStatus.PARTIALLY_FILLED and not (
+                0 < filled_quantity < order.quantity
+            ):
+                raise PaperBrokerReconciliationError(
+                    "paper comparator partial order fill state does not reconcile"
+                )
+            if order.status is PaperOrderStatus.FILLED and filled_quantity != order.quantity:
+                raise PaperBrokerReconciliationError(
+                    "paper comparator filled order fill state does not reconcile"
+                )
+            if order.status in {PaperOrderStatus.CANCELLED, PaperOrderStatus.EXPIRED} and not (
+                0 <= filled_quantity < order.quantity
+            ):
+                raise PaperBrokerReconciliationError(
+                    "paper comparator closed order fill state does not reconcile"
+                )
+            initial_execution_id = order_row["initial_execution_id"]
+            if initial_execution_id is None:
+                raise PaperBrokerReconciliationError(
+                    "paper comparator initial execution identity is missing"
+                )
+            initial_execution_id = str(initial_execution_id)
+            initial_receipt = receipts.get(initial_execution_id)
+            initial_request = requests.get(initial_execution_id)
+            initial_fill = fills_by_execution.get(initial_execution_id)
+            if (
+                initial_receipt is None
+                or initial_request is None
+                or initial_receipt.intent_id != intent.intent_id
+                or initial_receipt.order.order_id != order_id
+                or initial_receipt.request_fingerprint
+                != order_row["initial_execution_request_fingerprint"]
+                or initial_request.get("kind") != "INITIAL"
+                or initial_request.get("execution_id") != initial_execution_id
+                or initial_request.get("intent_id") != intent.intent_id
+            ):
+                raise PaperBrokerReconciliationError(
+                    "paper comparator initial execution receipt does not reconcile"
+                )
+            if initial_fill is None:
+                if initial_receipt.fill is not None:
+                    raise PaperBrokerReconciliationError(
+                        "paper comparator unfilled initial execution contains a fill"
+                    )
+            elif (
+                str(initial_fill["order_id"]) != order_id
+                or int(initial_fill["sequence"]) != 1
+                or initial_receipt.fill != self._fill_from_row(initial_fill)
+            ):
+                raise PaperBrokerReconciliationError(
+                    "paper comparator initial execution is not its first fill"
+                )
+            for fill_row in order_fills:
+                execution_id = str(fill_row["execution_id"])
+                receipt = receipts.get(execution_id)
+                request = requests.get(execution_id)
+                expected_kind = "INITIAL" if execution_id == initial_execution_id else "INCREMENTAL"
+                cumulative_quantity = sum(
+                    int(previous["quantity"])
+                    for previous in order_fills
+                    if int(previous["sequence"]) <= int(fill_row["sequence"])
+                )
+                if (
+                    receipt is None
+                    or request is None
+                    or receipt.fill != self._fill_from_row(fill_row)
+                    or receipt.intent_id != intent.intent_id
+                    or receipt.order.order_id != order_id
+                    or receipt.order.filled_quantity != cumulative_quantity
+                    or request.get("kind") != expected_kind
+                    or request.get("execution_id") != execution_id
+                ):
+                    raise PaperBrokerReconciliationError(
+                        "paper comparator fill execution receipt does not reconcile"
+                    )
+            intents_by_order[order_id] = intent
+        lot_rows = connection.execute(
+            "SELECT * FROM paper_lot WHERE account_id = ? ORDER BY lot_id",
+            (self.account_id,),
+        ).fetchall()
+        lots = {str(row["lot_id"]): row for row in lot_rows}
+        if len(lots) != len(lot_rows):
+            raise PaperBrokerReconciliationError("paper comparator lot identity is duplicated")
+
+        def lot_fifo_key(lot: sqlite3.Row) -> tuple[str, str, str, str, int, str]:
+            return (
+                str(lot["available_date"]),
+                str(lot["acquisition_trade_date"]),
+                str(lot["buy_executed_at"]),
+                str(lot["buy_persisted_at"]),
+                int(lot["buy_fill_sequence"]),
+                str(lot["lot_id"]),
+            )
+
+        relevant_consumptions = connection.execute(
+            "SELECT * FROM paper_lot_consumption ORDER BY fill_id, lot_id"
+        ).fetchall()
+        fill_ids = {str(row["fill_id"]) for row in fill_rows}
+        account_consumptions = tuple(
+            row
+            for row in relevant_consumptions
+            if str(row["fill_id"]) in fill_ids or str(row["lot_id"]) in lots
+        )
+        consumptions_by_fill: dict[str, list[sqlite3.Row]] = {}
+        for row in account_consumptions:
+            consumptions_by_fill.setdefault(str(row["fill_id"]), []).append(row)
         expected_cash = Decimal(account["initial_cash"])
         expected_realized = Decimal("0")
+        lot_remaining: dict[str, int] = {}
+        reconciled_consumptions: set[tuple[str, str]] = set()
         reconciled_fills: list[dict[str, object]] = []
         requested: dict[str, ExecutionCostCalculation] = {}
         for row in fill_rows:
             fill = self._fill_from_row(row)
-            receipt = self._execution_receipt(connection, execution_id=fill.execution_id)
+            receipt = receipts.get(fill.execution_id)
+            request = requests.get(fill.execution_id)
             if (
                 receipt is None
+                or request is None
                 or receipt.fill != fill
                 or receipt.order.account_id != self.account_id
                 or receipt.cost_calculation is None
@@ -4861,6 +5270,25 @@ class PaperBrokerStore:
                 raise PaperBrokerReconciliationError(
                     "paper comparator fill receipt does not reconcile"
                 )
+            trade_date_value = request.get("trade_date")
+            if not isinstance(trade_date_value, str):
+                raise PaperBrokerReconciliationError(
+                    "paper comparator execution trade date is missing"
+                )
+            try:
+                trade_date = date.fromisoformat(trade_date_value)
+            except ValueError as exc:
+                raise PaperBrokerReconciliationError(
+                    "paper comparator execution trade date is invalid"
+                ) from exc
+            if trade_date != fill.executed_at.astimezone(_SHANGHAI).date():
+                raise PaperBrokerReconciliationError(
+                    "paper comparator execution trade date does not match fill time"
+                )
+            order_row = orders.get(fill.order_id)
+            intent = intents_by_order.get(fill.order_id)
+            if order_row is None or intent is None:
+                raise PaperBrokerReconciliationError("paper comparator fill has no order intent")
             calculation = receipt.cost_calculation
             replayed = calculate_execution_costs(
                 spec,
@@ -4881,69 +5309,175 @@ class PaperBrokerStore:
             assert fill.total_fees is not None
             if row["side"] == PaperSide.BUY.value:
                 expected_cash -= fill.notional + fill.total_fees
-                lot = connection.execute(
-                    "SELECT * FROM paper_lot WHERE lot_id = ?",
-                    (fill.fill_id,),
-                ).fetchone()
+                lot = lots.get(fill.fill_id)
+                quote = request.get("quote")
+                if not isinstance(quote, dict):
+                    raise PaperBrokerReconciliationError(
+                        "paper comparator BUY quote provenance is missing"
+                    )
+                available_date_value = quote.get("acquisition_available_date")
+                if not isinstance(available_date_value, str):
+                    raise PaperBrokerReconciliationError(
+                        "paper comparator BUY available date is missing"
+                    )
+                try:
+                    available_date = date.fromisoformat(available_date_value)
+                except ValueError as exc:
+                    raise PaperBrokerReconciliationError(
+                        "paper comparator BUY available date is invalid"
+                    ) from exc
                 if (
                     lot is None
+                    or lot["account_id"] != self.account_id
+                    or lot["ts_code"] != order_row["ts_code"]
+                    or lot["entry_signal_id"] != intent.signal_id
                     or int(lot["original_quantity"]) != fill.quantity
                     or Decimal(lot["unit_cost"])
                     != (fill.notional + fill.total_fees) / fill.quantity
+                    or self._required_ledger_timestamp(
+                        lot["persisted_at"], label="paper comparator BUY lot persisted_at"
+                    )
+                    != self._required_ledger_timestamp(
+                        row["persisted_at"], label="paper comparator BUY fill persisted_at"
+                    )
+                    or self._required_ledger_timestamp(
+                        lot["buy_executed_at"], label="paper comparator BUY lot executed_at"
+                    )
+                    != fill.executed_at
+                    or self._required_ledger_timestamp(
+                        lot["buy_persisted_at"], label="paper comparator BUY lot availability"
+                    )
+                    != self._required_ledger_timestamp(
+                        row["persisted_at"], label="paper comparator BUY fill availability"
+                    )
+                    or int(lot["buy_fill_sequence"]) != fill.sequence
+                    or lot["acquisition_trade_date"] != trade_date.isoformat()
+                    or lot["available_date"] != available_date.isoformat()
+                    or available_date <= trade_date
                 ):
                     raise PaperBrokerReconciliationError(
-                        "paper comparator BUY lot basis does not reconcile"
+                        "paper comparator BUY lot provenance or basis does not reconcile"
                     )
+                lot_remaining[fill.fill_id] = fill.quantity
             else:
-                allocations = connection.execute(
-                    """
-                    SELECT quantity, unit_cost FROM paper_lot_consumption
-                    WHERE fill_id = ? ORDER BY lot_id
-                    """,
-                    (fill.fill_id,),
-                ).fetchall()
+                allocations = consumptions_by_fill.get(fill.fill_id, [])
                 if sum(int(item["quantity"]) for item in allocations) != fill.quantity:
                     raise PaperBrokerReconciliationError(
                         "paper comparator SELL FIFO allocation does not reconcile"
+                    )
+                eligible = sorted(
+                    (
+                        lot
+                        for lot_id, lot in lots.items()
+                        if lot_remaining.get(lot_id, 0) > 0
+                        and lot["ts_code"] == order_row["ts_code"]
+                        and lot["entry_signal_id"] == order_row["entry_signal_id"]
+                        and str(lot["available_date"]) <= trade_date.isoformat()
+                    ),
+                    key=lot_fifo_key,
+                )
+                remaining_to_consume = fill.quantity
+                expected_allocations: list[tuple[str, int]] = []
+                for lot in eligible:
+                    lot_id = str(lot["lot_id"])
+                    quantity = min(lot_remaining[lot_id], remaining_to_consume)
+                    if quantity:
+                        expected_allocations.append((lot_id, quantity))
+                        remaining_to_consume -= quantity
+                    if remaining_to_consume == 0:
+                        break
+                if any(str(item["lot_id"]) not in lots for item in allocations):
+                    raise PaperBrokerReconciliationError(
+                        "paper comparator SELL allocation has an unknown lot"
+                    )
+                allocations = sorted(
+                    allocations,
+                    key=lambda item: lot_fifo_key(lots[str(item["lot_id"])]),
+                )
+                actual_allocations = [
+                    (str(item["lot_id"]), int(item["quantity"])) for item in allocations
+                ]
+                if remaining_to_consume or actual_allocations != expected_allocations:
+                    raise PaperBrokerReconciliationError(
+                        "paper comparator SELL allocation is not canonical FIFO"
                     )
                 basis = sum(
                     (Decimal(item["unit_cost"]) * int(item["quantity"]) for item in allocations),
                     Decimal("0"),
                 )
+                for allocation in allocations:
+                    lot_id = str(allocation["lot_id"])
+                    lot = lots.get(lot_id)
+                    if (
+                        lot is None
+                        or lot["account_id"] != self.account_id
+                        or lot["ts_code"] != order_row["ts_code"]
+                        or lot["entry_signal_id"] != order_row["entry_signal_id"]
+                        or Decimal(allocation["unit_cost"]) != Decimal(lot["unit_cost"])
+                        or self._required_ledger_timestamp(
+                            allocation["persisted_at"],
+                            label="paper comparator SELL consumption availability",
+                        )
+                        != self._required_ledger_timestamp(
+                            row["persisted_at"],
+                            label="paper comparator SELL fill availability",
+                        )
+                    ):
+                        raise PaperBrokerReconciliationError(
+                            "paper comparator SELL consumption provenance does not reconcile"
+                        )
+                    lot_remaining[lot_id] -= int(allocation["quantity"])
+                    reconciled_consumptions.add((fill.fill_id, lot_id))
                 proceeds = fill.notional - fill.total_fees
                 expected_cash += proceeds
                 expected_realized += proceeds - basis
             if fill.execution_id in execution_ids:
                 requested[fill.execution_id] = replayed
             reconciled_fills.append(fill.model_dump(mode="python"))
-        for lot in connection.execute(
-            "SELECT * FROM paper_lot WHERE account_id = ? ORDER BY lot_id",
-            (self.account_id,),
-        ).fetchall():
-            consumed = int(
-                connection.execute(
-                    "SELECT COALESCE(SUM(quantity), 0) FROM paper_lot_consumption WHERE lot_id = ?",
-                    (lot["lot_id"],),
-                ).fetchone()[0]
+        if {
+            (str(row["fill_id"]), str(row["lot_id"])) for row in account_consumptions
+        } != reconciled_consumptions:
+            raise PaperBrokerReconciliationError(
+                "paper comparator consumption topology does not reconcile"
             )
-            if int(lot["remaining_quantity"]) + consumed != int(lot["original_quantity"]):
+        if set(lots) != set(lot_remaining):
+            raise PaperBrokerReconciliationError("paper comparator lot topology does not reconcile")
+        for lot_id, lot in lots.items():
+            if int(lot["remaining_quantity"]) != lot_remaining[lot_id]:
                 raise PaperBrokerReconciliationError(
                     "paper comparator lot quantity does not reconcile"
                 )
-        authority_quantities = {
-            holding.code: holding.quantity for holding in authority.snapshot.holdings
+        authority_date = authority.snapshot.as_of_time.astimezone(_SHANGHAI).date().isoformat()
+        expected_holdings: dict[str, tuple[int, int, Decimal]] = {}
+        for lot in lots.values():
+            remaining = lot_remaining[str(lot["lot_id"])]
+            if remaining <= 0:
+                continue
+            quantity, available, total_cost = expected_holdings.get(
+                str(lot["ts_code"]), (0, 0, Decimal("0"))
+            )
+            expected_holdings[str(lot["ts_code"])] = (
+                quantity + remaining,
+                available + (remaining if str(lot["available_date"]) <= authority_date else 0),
+                total_cost + Decimal(lot["unit_cost"]) * remaining,
+            )
+        authority_holdings = {
+            holding.code: (
+                holding.quantity,
+                holding.available_quantity,
+                holding.average_cost,
+            )
+            for holding in authority.snapshot.holdings
         }
-        open_quantities = {
-            str(row["ts_code"]): int(row["quantity"])
-            for row in connection.execute(
-                """
-                SELECT ts_code, SUM(remaining_quantity) AS quantity FROM paper_lot
-                WHERE account_id = ? AND remaining_quantity > 0 GROUP BY ts_code
-                """,
-                (self.account_id,),
-            ).fetchall()
+        expected_authority_holdings = {
+            code: (quantity, available, total_cost / quantity)
+            for code, (quantity, available, total_cost) in expected_holdings.items()
         }
-        if authority_quantities != open_quantities:
+        if (
+            authority_holdings != expected_authority_holdings
+            or authority.snapshot.available_cash != Decimal(account["cash"])
+            or authority.snapshot.frozen_cash != Decimal("0")
+        ):
             raise PaperBrokerReconciliationError(
                 "paper comparator account authority holdings differ"
             )
@@ -4967,6 +5501,26 @@ class PaperBrokerStore:
                 "cost_spec_id": str(account["cost_spec_id"]),
                 "account_authority_fingerprint": authority.state_fingerprint,
                 "fills": tuple(reconciled_fills),
+                "lots": tuple(
+                    {
+                        "lot_id": lot_id,
+                        "remaining_quantity": lot_remaining[lot_id],
+                        "unit_cost": str(lot["unit_cost"]),
+                        "available_date": str(lot["available_date"]),
+                        "acquisition_trade_date": str(lot["acquisition_trade_date"]),
+                    }
+                    for lot_id, lot in sorted(lots.items())
+                ),
+                "consumptions": tuple(
+                    {
+                        "fill_id": str(item["fill_id"]),
+                        "lot_id": str(item["lot_id"]),
+                        "quantity": int(item["quantity"]),
+                        "unit_cost": str(item["unit_cost"]),
+                    }
+                    for item in account_consumptions
+                ),
+                "financial_state_digest": paper_ledger_financial_state_digest(connection),
             }
         )
         return digest, tuple(requested[execution_id] for execution_id in execution_ids)

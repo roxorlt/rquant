@@ -18,6 +18,16 @@ from unittest.mock import patch
 PARENT_COMMIT = "c088774c3199c02edf203a3af758452eb38a5118"
 SCHEMA_VERSION = 4
 INTERNAL_MIGRATION_VERSION = 2
+SOURCE_WIDE_COUNT_TABLES = {
+    "broker_account_count": "broker_account",
+    "intent_count": "paper_intent",
+    "order_count": "paper_order",
+    "fill_count": "paper_fill",
+    "lot_count": "paper_lot",
+    "consumption_count": "paper_lot_consumption",
+    "receipt_count": "paper_execution_receipt",
+    "authority_count": "paper_account_authority",
+}
 
 
 def _canonical_json(value: object) -> bytes:
@@ -104,6 +114,10 @@ def _fixture_measurements(path: Path) -> dict[str, object]:
                 "paper_execution_receipt",
             )
         }
+        source_wide_counts = {
+            column: int(connection.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0])
+            for column, table in SOURCE_WIDE_COUNT_TABLES.items()
+        }
     finally:
         connection.close()
     if schema is None or migration is None or attestation is None or head is None:
@@ -128,6 +142,7 @@ def _fixture_measurements(path: Path) -> dict[str, object]:
         "predecessor_attestation_fingerprint": str(attestation[1]),
         "predecessor_head_fingerprint": str(head[0]),
         "seeded_business_rows_fingerprint": _sha256_bytes(_canonical_json(business_rows)),
+        "source_wide_counts": source_wide_counts,
     }
 
 
@@ -144,6 +159,13 @@ def _driver(parent_root: Path, output: Path, seed_path: Path) -> None:
     if parent_broker._LEDGER_MIGRATION_VERSION != INTERNAL_MIGRATION_VERSION:
         raise RuntimeError("parent internal migration version is not 2")
     seed = json.loads(seed_path.read_text(encoding="utf-8"))
+    accounts = seed.get("accounts")
+    if (
+        not isinstance(accounts, list)
+        or len(accounts) != 2
+        or not all(isinstance(account, dict) for account in accounts)
+    ):
+        raise RuntimeError("fixture seed must declare exactly two account objects")
     frozen_now = datetime.fromisoformat(seed["frozen_now"]).astimezone(UTC)
 
     class FrozenDateTime(datetime):
@@ -161,94 +183,100 @@ def _driver(parent_root: Path, output: Path, seed_path: Path) -> None:
             return_value=str(seed["ledger_generation"]),
         ),
     ):
-        store = PaperBrokerStore(
-            output,
-            account_id=seed["account_id"],
-            initial_cash=Decimal(seed["initial_cash"]),
-            cost_policy=policy,
-        )
-        buy = seed["executions"][0]
-        buy_event = datetime.fromisoformat(buy["event_time"])
-        buy_intent = PaperOrderIntent(
-            signal_id=buy["signal_id"],
-            account_id=seed["account_id"],
-            ts_code=seed["ts_code"],
-            side=PaperSide.BUY,
-            order_type=PaperOrderType.MARKET,
-            quantity=buy["quantity"],
-            event_time=buy_event,
-            available_at=buy_event + timedelta(seconds=1),
-            expires_at=buy_event + timedelta(minutes=5),
-            earliest_execution_at=buy_event + timedelta(seconds=1),
-            price_snapshot_id=seed["price_snapshot_id"],
-            producer_commit=seed["producer_commit"],
-        )
-        buy_order = store.submit_intent(
-            buy_intent,
-            execution_id=buy["execution_id"],
-            decision_time=datetime.fromisoformat(buy["decision_time"]),
-            persisted_at=datetime.fromisoformat(buy["persisted_at"]),
-            trade_date=date.fromisoformat(buy["trade_date"]),
-            quote=BrokerExecutionContext(
-                executable_price=Decimal(buy["price"]),
-                executable_quantity=buy["executable_quantity"],
-                acquisition_available_date=date.fromisoformat(buy["available_date"]),
-            ),
-        )
-        incremental_buy = seed["executions"][1]
-        store.apply_execution(
-            buy_order.order_id,
-            execution_id=incremental_buy["execution_id"],
-            executed_at=datetime.fromisoformat(incremental_buy["executed_at"]),
-            persisted_at=datetime.fromisoformat(incremental_buy["persisted_at"]),
-            trade_date=date.fromisoformat(incremental_buy["trade_date"]),
-            quantity=incremental_buy["quantity"],
-            price_snapshot_id=seed["price_snapshot_id"],
-            quote=BrokerExecutionContext(
-                executable_price=Decimal(incremental_buy["price"]),
-                executable_quantity=incremental_buy["quantity"],
-                acquisition_available_date=date.fromisoformat(incremental_buy["available_date"]),
-            ),
-        )
-        sell = seed["executions"][2]
-        sell_decision = datetime.fromisoformat(sell["decision_time"])
-        authority = store.sell_quantity_authority(
-            exit_signal_id=sell["signal_id"],
-            entry_signal_id=buy["signal_id"],
-            ts_code=seed["ts_code"],
-            action=sell["action"],
-            tranche_fraction=Decimal(sell["tranche_fraction"]),
-            decision_cutoff=sell_decision,
-            trade_date=date.fromisoformat(sell["trade_date"]),
-        )
-        sell_event = datetime.fromisoformat(sell["event_time"])
-        sell_intent = PaperOrderIntent(
-            signal_id=sell["signal_id"],
-            entry_signal_id=buy["signal_id"],
-            sell_quantity_authority=authority,
-            account_id=seed["account_id"],
-            ts_code=seed["ts_code"],
-            side=PaperSide.SELL,
-            order_type=PaperOrderType.MARKET,
-            quantity=sell["quantity"],
-            event_time=sell_event,
-            available_at=sell_event + timedelta(seconds=1),
-            expires_at=sell_event + timedelta(minutes=5),
-            earliest_execution_at=sell_event + timedelta(seconds=1),
-            price_snapshot_id=seed["price_snapshot_id"],
-            producer_commit=seed["producer_commit"],
-        )
-        store.submit_intent(
-            sell_intent,
-            execution_id=sell["execution_id"],
-            decision_time=sell_decision,
-            persisted_at=datetime.fromisoformat(sell["persisted_at"]),
-            trade_date=date.fromisoformat(sell["trade_date"]),
-            quote=BrokerExecutionContext(executable_price=Decimal(sell["price"])),
-        )
-        reconciliation = store.reconcile()
-        if not reconciliation.is_consistent:
-            raise RuntimeError("parent fixture business ledger did not reconcile")
+        for account in accounts:
+            executions = account.get("executions")
+            if not isinstance(executions, list) or len(executions) != 3:
+                raise RuntimeError("fixture account must declare BUY, incremental BUY, and SELL")
+            buy, incremental_buy, sell = executions
+            if not all(isinstance(execution, dict) for execution in executions):
+                raise RuntimeError("fixture execution must be an object")
+            store = PaperBrokerStore(
+                output,
+                account_id=str(account["account_id"]),
+                initial_cash=Decimal(str(account["initial_cash"])),
+                cost_policy=policy,
+            )
+            buy_event = datetime.fromisoformat(str(buy["event_time"]))
+            buy_intent = PaperOrderIntent(
+                signal_id=str(buy["signal_id"]),
+                account_id=str(account["account_id"]),
+                ts_code=str(account["ts_code"]),
+                side=PaperSide.BUY,
+                order_type=PaperOrderType.MARKET,
+                quantity=int(buy["quantity"]),
+                event_time=buy_event,
+                available_at=buy_event + timedelta(seconds=1),
+                expires_at=buy_event + timedelta(minutes=5),
+                earliest_execution_at=buy_event + timedelta(seconds=1),
+                price_snapshot_id=str(account["price_snapshot_id"]),
+                producer_commit=str(seed["producer_commit"]),
+            )
+            buy_order = store.submit_intent(
+                buy_intent,
+                execution_id=str(buy["execution_id"]),
+                decision_time=datetime.fromisoformat(str(buy["decision_time"])),
+                persisted_at=datetime.fromisoformat(str(buy["persisted_at"])),
+                trade_date=date.fromisoformat(str(buy["trade_date"])),
+                quote=BrokerExecutionContext(
+                    executable_price=Decimal(str(buy["price"])),
+                    executable_quantity=int(buy["executable_quantity"]),
+                    acquisition_available_date=date.fromisoformat(str(buy["available_date"])),
+                ),
+            )
+            store.apply_execution(
+                buy_order.order_id,
+                execution_id=str(incremental_buy["execution_id"]),
+                executed_at=datetime.fromisoformat(str(incremental_buy["executed_at"])),
+                persisted_at=datetime.fromisoformat(str(incremental_buy["persisted_at"])),
+                trade_date=date.fromisoformat(str(incremental_buy["trade_date"])),
+                quantity=int(incremental_buy["quantity"]),
+                price_snapshot_id=str(account["price_snapshot_id"]),
+                quote=BrokerExecutionContext(
+                    executable_price=Decimal(str(incremental_buy["price"])),
+                    executable_quantity=int(incremental_buy["quantity"]),
+                    acquisition_available_date=date.fromisoformat(
+                        str(incremental_buy["available_date"])
+                    ),
+                ),
+            )
+            sell_decision = datetime.fromisoformat(str(sell["decision_time"]))
+            authority = store.sell_quantity_authority(
+                exit_signal_id=str(sell["signal_id"]),
+                entry_signal_id=str(buy["signal_id"]),
+                ts_code=str(account["ts_code"]),
+                action=str(sell["action"]),
+                tranche_fraction=Decimal(str(sell["tranche_fraction"])),
+                decision_cutoff=sell_decision,
+                trade_date=date.fromisoformat(str(sell["trade_date"])),
+            )
+            sell_event = datetime.fromisoformat(str(sell["event_time"]))
+            sell_intent = PaperOrderIntent(
+                signal_id=str(sell["signal_id"]),
+                entry_signal_id=str(buy["signal_id"]),
+                sell_quantity_authority=authority,
+                account_id=str(account["account_id"]),
+                ts_code=str(account["ts_code"]),
+                side=PaperSide.SELL,
+                order_type=PaperOrderType.MARKET,
+                quantity=int(sell["quantity"]),
+                event_time=sell_event,
+                available_at=sell_event + timedelta(seconds=1),
+                expires_at=sell_event + timedelta(minutes=5),
+                earliest_execution_at=sell_event + timedelta(seconds=1),
+                price_snapshot_id=str(account["price_snapshot_id"]),
+                producer_commit=str(seed["producer_commit"]),
+            )
+            store.submit_intent(
+                sell_intent,
+                execution_id=str(sell["execution_id"]),
+                decision_time=sell_decision,
+                persisted_at=datetime.fromisoformat(str(sell["persisted_at"])),
+                trade_date=date.fromisoformat(str(sell["trade_date"])),
+                quote=BrokerExecutionContext(executable_price=Decimal(str(sell["price"]))),
+            )
+            reconciliation = store.reconcile()
+            if not reconciliation.is_consistent:
+                raise RuntimeError("parent fixture business ledger did not reconcile")
     with sqlite3.connect(output) as connection:
         connection.execute(
             "UPDATE paper_ledger_schema SET migrated_at = ? WHERE singleton = 1",
@@ -262,22 +290,24 @@ def _driver(parent_root: Path, output: Path, seed_path: Path) -> None:
         ).fetchone()
         if schema != (SCHEMA_VERSION,) or migration != (INTERNAL_MIGRATION_VERSION,):
             raise RuntimeError("parent fixture schema identity differs")
-        chronological_lot_ids = tuple(
-            str(row[0])
-            for row in connection.execute(
-                """
-                SELECT lot_id FROM paper_lot
-                ORDER BY available_date, acquisition_trade_date, buy_executed_at,
-                         buy_persisted_at, buy_fill_sequence, lot_id
-                """
-            ).fetchall()
-        )
-        if len(chronological_lot_ids) != 2 or chronological_lot_ids != tuple(
-            sorted(chronological_lot_ids, reverse=True)
-        ):
-            raise RuntimeError(
-                "parent fixture lot ids are not inverse to canonical FIFO chronology"
+        for account in accounts:
+            chronological_lot_ids = tuple(
+                str(row[0])
+                for row in connection.execute(
+                    """
+                    SELECT lot_id FROM paper_lot WHERE account_id = ?
+                    ORDER BY available_date, acquisition_trade_date, buy_executed_at,
+                             buy_persisted_at, buy_fill_sequence, lot_id
+                    """,
+                    (str(account["account_id"]),),
+                ).fetchall()
             )
+            if len(chronological_lot_ids) != 2 or chronological_lot_ids != tuple(
+                sorted(chronological_lot_ids, reverse=True)
+            ):
+                raise RuntimeError(
+                    "parent fixture lot ids are not inverse to canonical FIFO chronology"
+                )
 
 
 def _build(repo: Path, output_dir: Path) -> None:

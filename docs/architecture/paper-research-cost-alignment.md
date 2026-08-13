@@ -53,9 +53,15 @@ each fill through the shared engine. No export token, issuer, cache,
 caller-supplied paper fact, or alternate exact-v3 path exists.
 
 Exact comparison also requires an external
-`rquant-paper-ledger-head/v1` Ed25519 checkpoint naming the configured ledger,
-current v5 head, and migration-attestation digest. Runtime wiring contains only
-a pinned public key, allowed ledger ID, positive
+`rquant-paper-ledger-head/v2` Ed25519 checkpoint naming the configured ledger,
+current v5 head, migration-attestation digest, and a canonical
+`rquant-paper-ledger-financial-state/v1` root. The root covers every financial
+table in fixed primary-key order: accounts, cost authority, intents, orders,
+fills, lots, consumptions, execution receipts, and account-authority snapshots.
+The comparator recalculates both its full canonical FIFO/T+1 reconciliation
+digest and the root inside one read transaction; a valid signature over a
+different or malformed financial state cannot yield `EXACT_V3_BOUND`. Runtime
+wiring contains only a pinned public key, allowed ledger ID, positive
 `ledger_anchor_max_age_seconds`, non-negative
 `ledger_anchor_future_skew_seconds`, and the runtime builder's trusted clock.
 The verifier normalizes that construction-time clock to UTC and accepts
@@ -88,23 +94,35 @@ sequence, then lot ID. The persisted allocation query explicitly joins each
 consumption to its lot, BUY fill, and BUY order; lexical lot ID order has no
 authority. Multi-fill receipt order snapshots are validated at their own
 cumulative fill sequence rather than against the order's later final state.
+Each intent's initial execution ID and request fingerprint must bind one
+initial receipt; a filled initial receipt may coincide only with sequence one
+of its own order, never a later fill or another order's fill.
 Direct migration tests corrupt each lot provenance field, consumption mapping,
 realized P&L, and receipt payload; every case rejects before a candidate exists
 while preserving the corrupt source's pre-attempt hash. The migrator then
-copies a verified source to a distinct temporary path, transforms only that
-copy in an explicit transaction, verifies it, and atomically publishes only
-the requested offline candidate. Every injected or ordinary phase failure
-leaves the source bytes and SHA-256 unchanged and publishes no candidate.
+opens the closed regular source with no-follow semantics, descriptor-copies a
+private snapshot before reconciliation, and binds the reconciliation report,
+source hash, and v5 migration attestation to that snapshot. Device/inode/size/
+mtime/ctime identity and sidecar absence are rechecked before publication, so
+path replacement, mutation, WAL/SHM/journal appearance, or replacement-and-
+restore races reject and clean up the temporary snapshot and candidate. It
+transforms only the snapshot copy in an explicit transaction and hard-links it
+into the requested offline candidate after verification. Every injected or
+ordinary phase failure leaves the source bytes and SHA-256 unchanged and
+publishes no candidate.
 
 The committed v4 fixture is built only by running exact parent
 `c088774c3199c02edf203a3af758452eb38a5118` with parent `src` first. Its seed
-uses the parent's public partial/incremental execution APIs to create a
-500-share BUY as 200- and 300-share fills, then a 300-share SELL across both
-lots. The seed fixes explicit parent execution IDs so chronological lot IDs are
-intentionally inverse to lexical order. The closed binary SHA-256 is
-`be1497e0725f6427ff5c61db64b79fdd504a9968b547fd69effc5f55882a0822`;
+uses the parent's public partial/incremental execution APIs for two independent
+accounts holding the same symbol. Each account creates a 500-share BUY as 200-
+and 300-share fills, then a different SELL across canonical FIFO lots; their
+cash and realized P&L are independently fixed in the seed. The seed fixes
+explicit parent execution IDs so chronological lot IDs are intentionally
+inverse to lexical order per account. The closed binary SHA-256 is
+`250f54945a5b169355649df53c16ef4a172f6d9ca370619371216f2d96c46f82`;
 the manifest independently freezes schema 4/internal migration 2, schema
-objects, triggers, predecessor identities, seed identity, and business rows.
+objects, triggers, predecessor identities, source-wide table counts, seed
+identity, and business rows.
 
 Migration deliberately leaves historical cash, P&L, lots, receipt JSON, and
 legacy fee fields unchanged. It sets the new authority and fee fields to
@@ -132,13 +150,15 @@ part of routine deployment.
 Run the focused local checks in the project virtual environment:
 
 ```sh
-cd /Users/roxor/brain/30-projects/rQuant/.worktrees/stage8-paper-cost-alignment
+cd /Users/roxor/brain/30-projects/rQuant/.worktrees/stage8-paper-cost-quality-fix
 RQUANT_DISABLE_DOTENV=1 TUSHARE_TOKEN_MAIN=00000000000000000000000000000000 \
-DATA_DIR=/private/tmp/rquant-stage8-paper-cost-alignment-tests/data \
-DUCKDB_PATH=/private/tmp/rquant-stage8-paper-cost-alignment-tests/data/rquant.duckdb \
-PARQUET_DIR=/private/tmp/rquant-stage8-paper-cost-alignment-tests/parquet \
-LOG_DIR=/private/tmp/rquant-stage8-paper-cost-alignment-tests/log \
-.venv/bin/python -m pytest -q \
+DATA_DIR=/private/tmp/rquant-stage8-paper-cost-quality-fix/data \
+DUCKDB_PATH=/private/tmp/rquant-stage8-paper-cost-quality-fix/data/rquant.duckdb \
+PARQUET_DIR=/private/tmp/rquant-stage8-paper-cost-quality-fix/data/parquet \
+LOG_DIR=/private/tmp/rquant-stage8-paper-cost-quality-fix/logs \
+TMPDIR=/private/tmp/rquant-stage8-paper-cost-quality-fix \
+UV_PROJECT_ENVIRONMENT=/private/tmp/rquant-stage8-paper-cost-quality-fix/venv \
+uv run --offline pytest -q \
   tests/unit/test_paper_cost_alignment.py \
   tests/unit/test_paper_broker.py \
   tests/unit/test_paper_ledger_v4_migration.py \

@@ -15,7 +15,7 @@ from rquant.paper_contracts import PaperLedgerAnchor, PaperLedgerAnchorClaims
 from rquant.runtime_contracts import normalize_aware_utc
 from rquant.strict_json import canonical_json_bytes
 
-_ANCHOR_NAMESPACE = "rquant-paper-ledger-head"
+_ANCHOR_NAMESPACE = "rquant-paper-ledger-head/v2"
 _SIGNATURE_BYTES = 64
 
 
@@ -23,7 +23,7 @@ def paper_ledger_anchor_signing_payload(claims: PaperLedgerAnchorClaims) -> byte
     payload = canonical_json_bytes(claims.model_dump(mode="json"))
     return canonical_json_bytes(
         {
-            "contract": "rquant-ed25519-domain-separation/v1",
+            "contract": "rquant-ed25519-domain-separation/v2",
             "namespace": _ANCHOR_NAMESPACE,
             "payload_sha256": hashlib.sha256(payload).hexdigest(),
         }

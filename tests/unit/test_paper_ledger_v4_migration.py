@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
+import rquant.paper_ledger_migration as paper_ledger_migration
 from rquant.paper_broker import PaperBrokerStore
 from rquant.paper_ledger_migration import (
     OFFLINE_MIGRATION_PHASES,
@@ -18,13 +21,24 @@ from tests.fixtures.paper_ledger_v4_fixture import (
     EXPECTED_V4_ATTESTATION_FINGERPRINT,
     EXPECTED_V4_HEAD_FINGERPRINT,
     EXPECTED_V4_SCHEMA_FINGERPRINT,
+    LEGACY_ACCOUNT_ID,
     create_parent_v4_fixture,
 )
 
 _PARENT_COMMIT = "c088774c3199c02edf203a3af758452eb38a5118"
 _PARENT_SCHEMA_VERSION = 4
 _PARENT_INTERNAL_MIGRATION_VERSION = 2
-_FIXTURE_SHA256 = "be1497e0725f6427ff5c61db64b79fdd504a9968b547fd69effc5f55882a0822"
+_FIXTURE_SHA256 = "250f54945a5b169355649df53c16ef4a172f6d9ca370619371216f2d96c46f82"
+_SOURCE_WIDE_COUNT_TABLES = {
+    "broker_account_count": "broker_account",
+    "intent_count": "paper_intent",
+    "order_count": "paper_order",
+    "fill_count": "paper_fill",
+    "lot_count": "paper_lot",
+    "consumption_count": "paper_lot_consumption",
+    "receipt_count": "paper_execution_receipt",
+    "authority_count": "paper_account_authority",
+}
 
 
 def _sha256(path: Path) -> str:
@@ -52,17 +66,29 @@ def _assert_corrupt_v4_rejected(
     assert not candidate_path.exists()
 
 
-def _canonical_lot_ids(connection: sqlite3.Connection) -> tuple[str, ...]:
+def _canonical_lot_ids(connection: sqlite3.Connection, account_id: str) -> tuple[str, ...]:
     return tuple(
         str(row[0])
         for row in connection.execute(
             """
-            SELECT lot_id FROM paper_lot
+            SELECT lot_id FROM paper_lot WHERE account_id = ?
             ORDER BY available_date, acquisition_trade_date, buy_executed_at,
                      buy_persisted_at, buy_fill_sequence, lot_id
-            """
+            """,
+            (account_id,),
         ).fetchall()
     )
+
+
+def _two_account_seed() -> tuple[dict[str, object], ...]:
+    seed_path = Path(__file__).parents[1] / "fixtures" / "paper_ledger_v4_seed.json"
+    payload = json.loads(seed_path.read_text(encoding="utf-8"))
+    accounts = payload.get("accounts")
+    assert isinstance(accounts, list) and len(accounts) == 2, (
+        "exact-parent v4 fixture must declare two deterministic accounts"
+    )
+    assert all(isinstance(account, dict) for account in accounts)
+    return tuple(account for account in accounts if isinstance(account, dict))
 
 
 def test_v4_migration_accepts_canonical_fifo_when_lot_ids_are_inverse_chronology(
@@ -71,7 +97,7 @@ def test_v4_migration_accepts_canonical_fifo_when_lot_ids_are_inverse_chronology
     source = create_parent_v4_fixture(tmp_path / "source.sqlite3")
     candidate = tmp_path / "candidate.sqlite3"
     with sqlite3.connect(source.path) as connection:
-        chronological_lot_ids = _canonical_lot_ids(connection)
+        chronological_lot_ids = _canonical_lot_ids(connection, LEGACY_ACCOUNT_ID)
         allocations = tuple(
             (str(row[0]), int(row[1]))
             for row in connection.execute(
@@ -79,9 +105,11 @@ def test_v4_migration_accepts_canonical_fifo_when_lot_ids_are_inverse_chronology
                 SELECT c.lot_id, c.quantity
                 FROM paper_lot_consumption AS c
                 JOIN paper_lot AS l ON l.lot_id = c.lot_id
+                WHERE l.account_id = ?
                 ORDER BY l.available_date, l.acquisition_trade_date, l.buy_executed_at,
                          l.buy_persisted_at, l.buy_fill_sequence, l.lot_id
-                """
+                """,
+                (LEGACY_ACCOUNT_ID,),
             ).fetchall()
         )
 
@@ -106,14 +134,15 @@ def test_v4_migration_rejects_non_fifo_multi_lot_consumption_before_candidate(
 ) -> None:
     source = create_parent_v4_fixture(tmp_path / "source.sqlite3")
     with sqlite3.connect(source.path) as connection:
-        chronological_lot_ids = _canonical_lot_ids(connection)
+        chronological_lot_ids = _canonical_lot_ids(connection, LEGACY_ACCOUNT_ID)
         sell_fill_id = str(
             connection.execute(
                 """
                 SELECT f.fill_id FROM paper_fill AS f
                 JOIN paper_order AS o ON o.order_id = f.order_id
-                WHERE o.side = 'SELL'
-                """
+                WHERE o.account_id = ? AND o.side = 'SELL'
+                """,
+                (LEGACY_ACCOUNT_ID,),
             ).fetchone()[0]
         )
         immutable_trigger = str(
@@ -144,6 +173,105 @@ def test_v4_migration_rejects_non_fifo_multi_lot_consumption_before_candidate(
         tmp_path / "candidate.sqlite3",
         match="not FIFO",
     )
+
+
+def test_rqs8_p1_006_offline_migration_rejects_source_replacement_and_restore(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = create_parent_v4_fixture(tmp_path / "source.sqlite3")
+    replacement = create_parent_v4_fixture(tmp_path / "replacement.sqlite3")
+    candidate = tmp_path / "candidate.sqlite3"
+    source_bytes = source.path.read_bytes()
+
+    with sqlite3.connect(replacement.path) as connection:
+        connection.execute("PRAGMA application_id = 0x52513838")
+    assert replacement.path.read_bytes() != source_bytes
+    assert V4LedgerReconciler().reconcile(replacement.path).is_verified
+
+    original_reconcile = V4LedgerReconciler.reconcile
+
+    def reconcile_then_replace_and_restore(
+        self: V4LedgerReconciler,
+        source_path: Path,
+    ) -> object:
+        report = original_reconcile(self, source_path)
+        parked = source.path.with_name("source-before-replacement.sqlite3")
+        os.replace(source.path, parked)
+        os.replace(replacement.path, source.path)
+        os.replace(source.path, replacement.path)
+        os.replace(parked, source.path)
+        return report
+
+    monkeypatch.setattr(
+        V4LedgerReconciler,
+        "reconcile",
+        reconcile_then_replace_and_restore,
+    )
+
+    with pytest.raises(ValueError, match="source.*changed|source.*replaced"):
+        paper_ledger_migration.migrate_v4_ledger_copy(
+            source.path,
+            candidate,
+            migration_code_identity="test-migration-code",
+        )
+
+    assert source.path.read_bytes() == source_bytes
+    assert not candidate.exists()
+
+
+@pytest.mark.parametrize("cross_role", (False, True), ids=("later-fill", "cross-role"))
+def test_rqs8_p2_003_v4_rejects_rebound_initial_execution_receipts(
+    tmp_path: Path,
+    cross_role: bool,
+) -> None:
+    source = create_parent_v4_fixture(tmp_path / "source.sqlite3")
+    candidate = tmp_path / "candidate.sqlite3"
+
+    with sqlite3.connect(source.path) as connection:
+        immutable_trigger = str(
+            connection.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type = 'trigger' AND name = 'paper_intent_identity_immutable'"
+            ).fetchone()[0]
+        )
+        rebound_receipt = connection.execute(
+            """
+            SELECT f.execution_id, r.request_fingerprint
+            FROM paper_fill AS f
+            JOIN paper_execution_receipt AS r ON r.execution_id = f.execution_id
+            JOIN paper_order AS o ON o.order_id = f.order_id
+            WHERE o.account_id = ? AND o.side = 'BUY' AND f.sequence = 2
+            """,
+            (LEGACY_ACCOUNT_ID,),
+        ).fetchone()
+        assert rebound_receipt is not None
+        target_side = "SELL" if cross_role else "BUY"
+        connection.execute("DROP TRIGGER paper_intent_identity_immutable")
+        connection.execute(
+            """
+            UPDATE paper_intent
+            SET initial_execution_id = ?, initial_execution_request_fingerprint = ?
+            WHERE account_id = ? AND side = ?
+            """,
+            (
+                str(rebound_receipt[0]),
+                str(rebound_receipt[1]),
+                LEGACY_ACCOUNT_ID,
+                target_side,
+            ),
+        )
+        connection.execute(immutable_trigger)
+
+    with pytest.raises(PaperV4ReconciliationError, match="initial execution"):
+        V4LedgerReconciler().reconcile(source.path)
+    with pytest.raises(PaperV4ReconciliationError, match="initial execution"):
+        migrate_v4_ledger_copy(
+            source.path,
+            candidate,
+            migration_code_identity="test-migration-code",
+        )
+    assert not candidate.exists()
 
 
 @pytest.mark.parametrize(
@@ -289,7 +417,9 @@ def test_parent_v4_binary_fixture_has_parent_provenance_and_migrates_without_dow
     assert manifest["internal_migration_version"] == _PARENT_INTERNAL_MIGRATION_VERSION
     assert manifest["fixture_sha256"] == _FIXTURE_SHA256
     assert manifest["seed_sha256"] == hashlib.sha256(seed_path.read_bytes()).hexdigest()
-    assert {execution["side"] for execution in seed["executions"]} == {"BUY", "SELL"}
+    assert {
+        execution["side"] for account in seed["accounts"] for execution in account["executions"]
+    } == {"BUY", "SELL"}
     assert manifest["schema_fingerprint"] == EXPECTED_V4_SCHEMA_FINGERPRINT
     assert manifest["predecessor_attestation_fingerprint"] == EXPECTED_V4_ATTESTATION_FINGERPRINT
     assert manifest["predecessor_head_fingerprint"] == EXPECTED_V4_HEAD_FINGERPRINT
@@ -332,7 +462,135 @@ def test_parent_v4_binary_fixture_has_parent_provenance_and_migrates_without_dow
             """
         ).fetchall()
     assert candidate_account == source_account
-    assert legacy_fills == [(None, None, None, None, None, "LEGACY_UNKNOWN")] * 3
+    assert legacy_fills == [(None, None, None, None, None, "LEGACY_UNKNOWN")] * 6
+
+
+def test_rqs8_p2_004_exact_parent_fixture_replays_two_independent_accounts(
+    tmp_path: Path,
+) -> None:
+    accounts = _two_account_seed()
+    source = create_parent_v4_fixture(tmp_path / "source.sqlite3")
+    candidate = tmp_path / "candidate.sqlite3"
+    report = V4LedgerReconciler().reconcile(source.path)
+    expected_accounts = {
+        str(account["account_id"]): (
+            Decimal(str(account["initial_cash"])),
+            Decimal(str(account["expected_cash"])),
+            Decimal(str(account["expected_realized_pnl"])),
+        )
+        for account in accounts
+    }
+    observed_accounts = {
+        account.account_id: (
+            account.initial_cash,
+            account.stored_cash,
+            account.stored_realized_pnl,
+        )
+        for account in report.accounts
+    }
+    assert observed_accounts == expected_accounts
+
+    fixture_dir = Path(__file__).parents[1] / "fixtures"
+    manifest = json.loads(
+        (fixture_dir / "paper_ledger_v4.manifest.json").read_text(encoding="utf-8")
+    )
+    with sqlite3.connect(source.path) as connection:
+        observed_counts = {
+            column: int(connection.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0])
+            for column, table in _SOURCE_WIDE_COUNT_TABLES.items()
+        }
+        head = connection.execute(
+            "SELECT payload_json FROM paper_ledger_head_marker ORDER BY revision DESC LIMIT 1"
+        ).fetchone()
+        lots = connection.execute(
+            "SELECT account_id, ts_code FROM paper_lot ORDER BY account_id, lot_id"
+        ).fetchall()
+    assert head is not None
+    assert manifest["source_wide_counts"] == observed_counts
+    assert {
+        column: int(json.loads(str(head[0]))[column]) for column in _SOURCE_WIDE_COUNT_TABLES
+    } == observed_counts
+    assert {str(row[0]) for row in lots} == set(expected_accounts)
+    assert {str(row[1]) for row in lots} == {"600000.SH"}
+
+    result = migrate_v4_ledger_copy(
+        source.path,
+        candidate,
+        migration_code_identity="test-migration-code",
+    )
+    assert result.v4_report == report
+    assert result.reconciliation_verified
+
+
+@pytest.mark.parametrize("corruption", ("lot", "receipt"))
+def test_rqs8_p2_004_v4_rejects_cross_account_lot_and_receipt_corruption(
+    tmp_path: Path,
+    corruption: str,
+) -> None:
+    accounts = _two_account_seed()
+    source = create_parent_v4_fixture(tmp_path / "source.sqlite3")
+    candidate = tmp_path / "candidate.sqlite3"
+    first_account, second_account = (str(account["account_id"]) for account in accounts)
+
+    with sqlite3.connect(source.path) as connection:
+        if corruption == "lot":
+            immutable_trigger = str(
+                connection.execute(
+                    "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
+                    "AND name = 'paper_lot_consumption_row_immutable'"
+                ).fetchone()[0]
+            )
+            target = connection.execute(
+                """
+                SELECT c.fill_id, c.lot_id
+                FROM paper_lot_consumption AS c
+                JOIN paper_fill AS f ON f.fill_id = c.fill_id
+                JOIN paper_order AS o ON o.order_id = f.order_id
+                WHERE o.account_id = ? AND o.side = 'SELL'
+                LIMIT 1
+                """,
+                (first_account,),
+            ).fetchone()
+            foreign_lot = connection.execute(
+                "SELECT lot_id FROM paper_lot WHERE account_id = ? ORDER BY lot_id LIMIT 1",
+                (second_account,),
+            ).fetchone()
+            assert target is not None and foreign_lot is not None
+            connection.execute("DROP TRIGGER paper_lot_consumption_row_immutable")
+            connection.execute(
+                "UPDATE paper_lot_consumption SET lot_id = ? WHERE fill_id = ? AND lot_id = ?",
+                (str(foreign_lot[0]), str(target[0]), str(target[1])),
+            )
+            connection.execute(immutable_trigger)
+        else:
+            immutable_trigger = str(
+                connection.execute(
+                    "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
+                    "AND name = 'paper_execution_receipt_update_immutable'"
+                ).fetchone()[0]
+            )
+            receipt = connection.execute(
+                "SELECT execution_id FROM paper_execution_receipt "
+                "WHERE account_id = ? ORDER BY execution_id LIMIT 1",
+                (first_account,),
+            ).fetchone()
+            assert receipt is not None
+            connection.execute("DROP TRIGGER paper_execution_receipt_update_immutable")
+            connection.execute(
+                "UPDATE paper_execution_receipt SET account_id = ? WHERE execution_id = ?",
+                (second_account, str(receipt[0])),
+            )
+            connection.execute(immutable_trigger)
+
+    with pytest.raises(PaperV4ReconciliationError):
+        V4LedgerReconciler().reconcile(source.path)
+    with pytest.raises(PaperV4ReconciliationError):
+        migrate_v4_ledger_copy(
+            source.path,
+            candidate,
+            migration_code_identity="test-migration-code",
+        )
+    assert not candidate.exists()
 
 
 @pytest.mark.parametrize("failure_after_phase", OFFLINE_MIGRATION_PHASES)

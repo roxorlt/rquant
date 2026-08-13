@@ -85,6 +85,7 @@ def _anchor(
         head_revision=7,
         head_marker_fingerprint="b" * 64,
         attestation_fingerprint="c" * 64,
+        financial_state_digest="d" * 64,
         key_id="paper-ledger-test-v1",
         issued_at=issued_at,
     )
@@ -120,6 +121,11 @@ def test_ed25519_paper_ledger_anchor_binds_the_complete_current_head(tmp_path: P
     assert not verifier.verify(
         anchor.model_copy(
             update={"claims": claims.model_copy(update={"migration_attestation_digest": "e" * 64})}
+        )
+    )
+    assert not verifier.verify(
+        anchor.model_copy(
+            update={"claims": claims.model_copy(update={"financial_state_digest": "f" * 64})}
         )
     )
     assert not verifier.verify(anchor.model_copy(update={"signature": "not-base64"}))

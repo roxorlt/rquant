@@ -7,15 +7,16 @@ import json
 import shutil
 import sqlite3
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 
 PARENT_V4_COMMIT = "c088774c3199c02edf203a3af758452eb38a5118"
-EXPECTED_V4_FIXTURE_SHA256 = "be1497e0725f6427ff5c61db64b79fdd504a9968b547fd69effc5f55882a0822"
+EXPECTED_V4_FIXTURE_SHA256 = "250f54945a5b169355649df53c16ef4a172f6d9ca370619371216f2d96c46f82"
 EXPECTED_V4_SCHEMA_FINGERPRINT = "3ae9e0749b1132f8b1e55f15866534e1bcae9a0815fd0d7c6837297fc45dcc70"
 EXPECTED_V4_ATTESTATION_FINGERPRINT = (
-    "60af0359fa0b3111ce0e718b60628d432c4b1e00f7d4d9a70695155c12b02bd7"
+    "1f0ecebc1cadcbec180f4f0602eddd011db53186f3343e08737a74970a2814b4"
 )
-EXPECTED_V4_HEAD_FINGERPRINT = "9ac8cf4689e5cd3d75fd94442ae7673672b2ff7c47e117ab3c9bb1999fff86fa"
+EXPECTED_V4_HEAD_FINGERPRINT = "5dc1333dc63aa053e15405063083683c0ae2db15e655f21aa6bf433e47dc8ed1"
 LEGACY_ACCOUNT_ID = "legacy-v4-account"
 
 _ROOT = Path(__file__).resolve().parent
@@ -46,6 +47,14 @@ class ParentV4Fixture:
     predecessor_attestation_fingerprint: str
     predecessor_head_fingerprint: str
     historical_rows: dict[str, tuple[tuple[object, ...], ...]]
+
+    def initial_cash_for(self, account_id: str) -> Decimal:
+        matches = [
+            row for row in self.historical_rows["broker_account"] if str(row[0]) == account_id
+        ]
+        if len(matches) != 1:
+            raise AssertionError("parent-v4 fixture account identity is ambiguous")
+        return Decimal(str(matches[0][1]))
 
 
 def sha256_file(path: Path) -> str:

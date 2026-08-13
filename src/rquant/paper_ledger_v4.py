@@ -311,16 +311,46 @@ def _validate_receipts(
     orders: dict[str, sqlite3.Row],
     fills: tuple[sqlite3.Row, ...],
 ) -> None:
-    expected = {
-        str(intent["initial_execution_id"]): (str(intent_id), None)
-        for intent_id, intent in intents.items()
-    }
-    expected.update(
-        {
-            str(fill["execution_id"]): (str(orders[str(fill["order_id"])]["intent_id"]), fill)
-            for fill in fills
-        }
-    )
+    order_by_intent = {str(order["intent_id"]): order for order in orders.values()}
+    if len(order_by_intent) != len(orders):
+        raise PaperV4ReconciliationError("v4 initial execution order topology is invalid")
+    fills_by_execution = {str(fill["execution_id"]): fill for fill in fills}
+    if len(fills_by_execution) != len(fills):
+        raise PaperV4ReconciliationError("v4 execution fill identity is duplicated")
+
+    # An initial execution may be the first fill of its own order, but can never
+    # be rebound to a later fill or a fill belonging to another intent.
+    initial_by_execution: dict[str, tuple[str, sqlite3.Row, sqlite3.Row | None]] = {}
+    for intent_id, intent in intents.items():
+        initial_execution_id = str(intent["initial_execution_id"])
+        order = order_by_intent.get(str(intent_id))
+        if order is None:
+            raise PaperV4ReconciliationError("v4 initial execution has no order")
+        initial_fill = fills_by_execution.get(initial_execution_id)
+        if initial_fill is not None and (
+            str(initial_fill["order_id"]) != str(order["order_id"])
+            or int(initial_fill["sequence"]) != 1
+        ):
+            raise PaperV4ReconciliationError(
+                "v4 initial execution is rebound to a non-initial fill"
+            )
+        if initial_execution_id in initial_by_execution:
+            raise PaperV4ReconciliationError("v4 initial execution identity is duplicated")
+        initial_by_execution[initial_execution_id] = (str(intent_id), order, initial_fill)
+
+    expected: dict[str, tuple[str, sqlite3.Row, sqlite3.Row | None, str]] = {}
+    for execution_id, (intent_id, order, initial_fill) in initial_by_execution.items():
+        expected[execution_id] = (intent_id, order, initial_fill, "INITIAL")
+    for execution_id, fill in fills_by_execution.items():
+        order = orders.get(str(fill["order_id"]))
+        if order is None:
+            raise PaperV4ReconciliationError("v4 fill execution has no order")
+        initial = initial_by_execution.get(execution_id)
+        if initial is not None:
+            if initial[2] is not fill:
+                raise PaperV4ReconciliationError("v4 initial execution role is ambiguous")
+            continue
+        expected[execution_id] = (str(order["intent_id"]), order, fill, "INCREMENTAL")
     receipts = connection.execute(
         "SELECT * FROM paper_execution_receipt WHERE account_id = ? ORDER BY execution_id",
         (account_id,),
@@ -329,12 +359,21 @@ def _validate_receipts(
         raise PaperV4ReconciliationError("v4 receipt identity set is incomplete or duplicated")
     for row in receipts:
         execution_id = str(row["execution_id"])
-        intent_id, expected_fill = expected[execution_id]
-        order = orders[str(row["order_id"])]
+        intent_id, order, expected_fill, expected_kind = expected[execution_id]
         request = _json_object(row["request_json"], label=f"v4 receipt {execution_id} request")
         receipt = _json_object(row["receipt_json"], label=f"v4 receipt {execution_id}")
         if canonical_sha256(request) != str(row["request_fingerprint"]):
             raise PaperV4ReconciliationError("v4 receipt request fingerprint differs")
+        if request.get("kind") != expected_kind or request.get("execution_id") != execution_id:
+            raise PaperV4ReconciliationError("v4 execution receipt role differs")
+        if expected_kind == "INITIAL":
+            intent = intents[intent_id]
+            if request.get("intent_id") != intent_id or str(row["request_fingerprint"]) != str(
+                intent["initial_execution_request_fingerprint"]
+            ):
+                raise PaperV4ReconciliationError("v4 initial execution receipt fingerprint differs")
+        elif request.get("order_id") != str(order["order_id"]):
+            raise PaperV4ReconciliationError("v4 incremental execution receipt order differs")
         receipt_order = receipt.get("order")
         receipt_fill = receipt.get("fill")
         receipt_filled_quantity = (

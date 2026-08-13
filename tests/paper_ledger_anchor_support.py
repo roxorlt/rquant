@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from rquant.paper_broker import paper_ledger_financial_state_digest
 from rquant.paper_ledger_anchor import (
     Ed25519PaperLedgerAnchorVerifier,
     PaperLedgerAnchor,
@@ -50,6 +51,7 @@ class PaperLedgerTestAuthority:
                 FROM paper_ledger_head_marker ORDER BY revision DESC LIMIT 1
                 """
             ).fetchone()
+            financial_state_digest = paper_ledger_financial_state_digest(connection)
         if migration is None or head is None:
             raise AssertionError("paper ledger current head is unavailable")
         claims = PaperLedgerAnchorClaims(
@@ -59,6 +61,7 @@ class PaperLedgerTestAuthority:
             head_revision=int(head["revision"]),
             head_marker_fingerprint=str(head["head_marker_fingerprint"]),
             attestation_fingerprint=str(head["attestation_fingerprint"]),
+            financial_state_digest=financial_state_digest,
             key_id="paper-ledger-test-v1",
             issued_at=issued_at,
         )

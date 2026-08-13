@@ -62,13 +62,14 @@ class PaperCostProvenanceState(StrEnum):
 
 
 class PaperLedgerAnchorClaims(RuntimeContractModel):
-    contract: Literal["rquant-paper-ledger-head/v1"] = "rquant-paper-ledger-head/v1"
+    contract: Literal["rquant-paper-ledger-head/v2"] = "rquant-paper-ledger-head/v2"
     ledger_id: str = Field(min_length=1)
     schema_version: Literal[5]
     migration_attestation_digest: Sha256
     head_revision: int = Field(ge=1)
     head_marker_fingerprint: Sha256
     attestation_fingerprint: Sha256
+    financial_state_digest: Sha256
     key_id: str = Field(min_length=1)
     issued_at: AwareUtcDatetime
 
@@ -129,6 +130,7 @@ class PaperExecutionCostComparison(RuntimeContractModel):
     head_marker_fingerprint: Sha256 | None = None
     attestation_fingerprint: Sha256 | None = None
     migration_attestation_digest: Sha256 | None = None
+    financial_state_digest: Sha256 | None = None
     reconciliation_digest: Sha256 | None = None
 
 
