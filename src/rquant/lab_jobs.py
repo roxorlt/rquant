@@ -3882,8 +3882,36 @@ def _validate_v15_schema(connection: sqlite3.Connection) -> None:
         raise LabDatabaseIdentityError("lab jobs SQLite v15 finalizer root descriptor is missing")
 
 
+def _validate_v16_finalizer_strict_support(connection: sqlite3.Connection) -> None:
+    try:
+        connection.execute("SELECT strict FROM pragma_table_list WHERE 0").fetchall()
+    except Exception as exc:
+        raise LabDatabaseIdentityError(
+            "lab jobs SQLite v16 finalizer STRICT contract is unavailable or invalid"
+        ) from exc
+
+
+def _validate_v16_finalizer_strict_tables(connection: sqlite3.Connection) -> None:
+    for table, statement in _V16_FINALIZER_STRICT_TABLES:
+        try:
+            _validate_v5_table_sql(connection, table=table, expected=statement)
+            rows = connection.execute(
+                "SELECT strict FROM pragma_table_list "
+                "WHERE schema = 'main' AND name = ? AND type = 'table'",
+                (table,),
+            ).fetchall()
+            if len(rows) != 1 or type(rows[0][0]) is not int or rows[0][0] != 1:
+                raise ValueError("STRICT table metadata is invalid")
+        except Exception as exc:
+            raise LabDatabaseIdentityError(
+                f"lab jobs SQLite v16 finalizer STRICT contract is unavailable or invalid: {table}"
+            ) from exc
+
+
 def _validate_v16_schema(connection: sqlite3.Connection) -> None:
     _validate_v15_schema(connection)
+    _validate_v16_finalizer_strict_support(connection)
+    _validate_v16_finalizer_strict_tables(connection)
     required_columns = {
         "lab_claim_publication_finalizer_observation": {
             "observation_ref",
@@ -7210,6 +7238,7 @@ class LabJobStore:
             self.path.parent.mkdir(parents=True, exist_ok=True)
         connection = self._connect(validate_identity=False)
         try:
+            _validate_v16_finalizer_strict_support(connection)
             _validate_database_identity(
                 connection,
                 allow_unclaimed_empty=True,
@@ -17482,4 +17511,22 @@ ON lab_claim_publication_finalizer_observation_degradation(
     drained_at, next_retry_at, created_at, degradation_ref
 )
 """
+_V16_FINALIZER_STRICT_TABLES = (
+    (
+        "lab_claim_publication_finalizer_root_anchor",
+        _V15_FINALIZER_ROOT_ANCHOR_TABLE_STATEMENT,
+    ),
+    (
+        "lab_claim_publication_finalizer_attestation",
+        _V16_FINALIZER_ATTESTATION_TABLE_STATEMENT,
+    ),
+    (
+        "lab_claim_publication_finalizer_trust_cache",
+        _V16_FINALIZER_TRUST_CACHE_TABLE_STATEMENT,
+    ),
+    (
+        "lab_claim_publication_finalizer_observation_degradation",
+        _V16_FINALIZER_OBSERVATION_DEGRADATION_TABLE_STATEMENT,
+    ),
+)
 _SCHEMA_STATEMENTS = _V9_SCHEMA_STATEMENTS

@@ -119,6 +119,99 @@ def _assert_current_schema_rejection(
     assert re.search(cause_match, str(cause))
 
 
+class _StrictPragmaCursor:
+    def __init__(self, rows: list[tuple[object, ...]]) -> None:
+        self._rows = rows
+
+    def fetchall(self) -> list[tuple[object, ...]]:
+        return self._rows
+
+
+class _StrictPragmaTableListFaultConnection:
+    def __init__(self, connection: sqlite3.Connection, *, mode: str) -> None:
+        self._connection = connection
+        self._mode = mode
+
+    def execute(self, statement: str, parameters: object = ()) -> object:
+        if "pragma_table_list" not in statement.lower():
+            return self._connection.execute(statement, parameters)
+        if self._mode == "unavailable":
+            raise sqlite3.OperationalError("pragma table_list unavailable")
+        if "where 0" in statement.lower():
+            return self._connection.execute(statement, parameters)
+        if self._mode == "empty":
+            return _StrictPragmaCursor([])
+        return _StrictPragmaCursor([(True,)])
+
+
+class _StrictPragmaUnavailableStoreConnection(lab_jobs._LabJobStoreConnection):
+    executed_statements: list[str] = []
+
+    def execute(self, statement: str, parameters: object = ()) -> sqlite3.Cursor:
+        type(self).executed_statements.append(statement)
+        if "pragma_table_list" in statement.lower():
+            raise sqlite3.OperationalError("pragma table_list unavailable")
+        return super().execute(statement, parameters)
+
+
+class _StrictPragmaUnavailableReaderConnection(lab_jobs._LabJobReaderConnection):
+    def execute(self, statement: str, parameters: object = ()) -> sqlite3.Cursor:
+        if "pragma_table_list" in statement.lower():
+            raise sqlite3.OperationalError("pragma table_list unavailable")
+        return super().execute(statement, parameters)
+
+
+_FINALIZER_STRICT_TABLE_CONTRACTS = (
+    (
+        "lab_claim_publication_finalizer_root_anchor",
+        lab_jobs._V15_FINALIZER_ROOT_ANCHOR_TABLE_STATEMENT,
+        None,
+    ),
+    (
+        "lab_claim_publication_finalizer_attestation",
+        lab_jobs._V16_FINALIZER_ATTESTATION_TABLE_STATEMENT,
+        None,
+    ),
+    (
+        "lab_claim_publication_finalizer_trust_cache",
+        lab_jobs._V16_FINALIZER_TRUST_CACHE_TABLE_STATEMENT,
+        None,
+    ),
+    (
+        "lab_claim_publication_finalizer_observation_degradation",
+        lab_jobs._V16_FINALIZER_OBSERVATION_DEGRADATION_TABLE_STATEMENT,
+        lab_jobs._V16_FINALIZER_OBSERVATION_DEGRADATION_INDEX_STATEMENT,
+    ),
+)
+
+
+def _rebuild_finalizer_table_without_strict(
+    path: Path,
+    *,
+    table: str,
+    statement: str,
+    index_statement: str | None,
+) -> None:
+    replacement = statement.replace(") STRICT", ")", 1)
+    if table == "lab_claim_publication_finalizer_observation_degradation":
+        replacement = replacement.replace(
+            "degradation_ref TEXT PRIMARY KEY",
+            "degradation_ref TEXT NOT NULL PRIMARY KEY",
+            1,
+        )
+    with sqlite3.connect(path) as connection:
+        connection.execute(f'DROP TABLE "{table}"')
+        connection.execute(replacement)
+        if index_statement is not None:
+            connection.execute(index_statement)
+        strict = connection.execute(
+            "SELECT strict FROM pragma_table_list "
+            "WHERE schema = 'main' AND name = ? AND type = 'table'",
+            (table,),
+        ).fetchone()
+    assert strict == (0,)
+
+
 class _StagedLifecycleConnection:
     def __init__(
         self,
@@ -3299,6 +3392,142 @@ def test_initialize_creates_v16_strict_schema_and_required_pragmas(
     assert pragmas.synchronous == 2
     assert pragmas.foreign_keys == 1
     assert pragmas.busy_timeout_ms == 1_234
+
+
+@pytest.mark.parametrize(
+    ("table", "statement", "index_statement"),
+    _FINALIZER_STRICT_TABLE_CONTRACTS,
+    ids=("root-anchor", "attestation", "trust-cache", "observation-degradation"),
+)
+def test_current_schema_rejects_each_non_strict_finalizer_table_before_business_sql(
+    tmp_path: Path,
+    table: str,
+    statement: str,
+    index_statement: str | None,
+) -> None:
+    store = _store(tmp_path)
+    lease = _lease(store)
+    before = (lease.heartbeat_at, lease.expires_at)
+    _rebuild_finalizer_table_without_strict(
+        store.path,
+        table=table,
+        statement=statement,
+        index_statement=index_statement,
+    )
+
+    _assert_current_schema_rejection(
+        lambda: LabJobReader(store.path).get_job(uuid4()),
+        cause_match=rf"finalizer STRICT contract.*{table}",
+    )
+    _assert_current_schema_rejection(
+        lambda: store.renew_scheduler_lease(
+            lease,
+            lease_seconds=60,
+            now=NOW + timedelta(seconds=1),
+        ),
+        cause_match=rf"finalizer STRICT contract.*{table}",
+    )
+
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute(
+            "SELECT heartbeat_at, expires_at FROM lab_lease WHERE lease_id = ?",
+            (lease.lease_id,),
+        ).fetchone() == tuple(value.isoformat(timespec="microseconds") for value in before)
+
+
+def test_current_schema_accepts_declared_finalizer_strict_boundary(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    lease = _lease(store)
+    strict_tables = tuple(contract[0] for contract in _FINALIZER_STRICT_TABLE_CONTRACTS)
+    with sqlite3.connect(store.path) as connection:
+        strict_rows = connection.execute(
+            "SELECT name, strict FROM pragma_table_list "
+            "WHERE schema = 'main' AND name IN (?, ?, ?, ?) ORDER BY name",
+            strict_tables,
+        ).fetchall()
+        observation_strict = connection.execute(
+            "SELECT strict FROM pragma_table_list "
+            "WHERE schema = 'main' AND name = 'lab_claim_publication_finalizer_observation'",
+        ).fetchone()
+
+    assert strict_rows == [(table, 1) for table in sorted(strict_tables)]
+    assert observation_strict == (0,)
+    assert LabJobReader(store.path).get_job(uuid4()) is None
+    renewed = store.renew_scheduler_lease(
+        lease,
+        lease_seconds=60,
+        now=NOW + timedelta(seconds=1),
+    )
+    assert renewed.expires_at == NOW + timedelta(seconds=61)
+
+
+@pytest.mark.parametrize("mode", ("unavailable", "empty", "malformed"))
+def test_current_schema_fails_closed_when_finalizer_strict_pragma_cannot_attest(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    store = _store(tmp_path)
+    with sqlite3.connect(store.path) as connection:
+        fault_connection = _StrictPragmaTableListFaultConnection(connection, mode=mode)
+        _assert_current_schema_rejection(
+            lambda: lab_jobs._validate_current_schema(fault_connection),  # noqa: SLF001
+            cause_match="finalizer STRICT contract is unavailable or invalid",
+        )
+
+
+def test_initialize_fails_closed_before_schema_ddl_when_strict_pragma_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _StrictPragmaUnavailableStoreConnection.executed_statements = []
+    monkeypatch.setattr(
+        lab_jobs,
+        "_LabJobStoreConnection",
+        _StrictPragmaUnavailableStoreConnection,
+    )
+
+    with pytest.raises(
+        LabDatabaseIdentityError,
+        match="finalizer STRICT contract is unavailable or invalid",
+    ):
+        LabJobStore(tmp_path / "strict-pragma-unavailable.sqlite3").initialize()
+
+    assert not any(
+        statement.lstrip().upper().startswith("CREATE")
+        for statement in _StrictPragmaUnavailableStoreConnection.executed_statements
+    )
+
+
+def test_reader_and_writer_fail_closed_when_strict_pragma_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    lease = _lease(store)
+
+    monkeypatch.setattr(
+        lab_jobs,
+        "_LabJobReaderConnection",
+        _StrictPragmaUnavailableReaderConnection,
+    )
+    _assert_current_schema_rejection(
+        lambda: LabJobReader(store.path).get_job(uuid4()),
+        cause_match="finalizer STRICT contract is unavailable or invalid",
+    )
+
+    monkeypatch.setattr(
+        lab_jobs,
+        "_LabJobStoreConnection",
+        _StrictPragmaUnavailableStoreConnection,
+    )
+    _assert_current_schema_rejection(
+        lambda: store.renew_scheduler_lease(
+            lease,
+            lease_seconds=60,
+            now=NOW + timedelta(seconds=1),
+        ),
+        cause_match="finalizer STRICT contract is unavailable or invalid",
+    )
 
 
 def test_v10_reopen_refuses_claim_publication_schema_without_canonical_deadline_checks(

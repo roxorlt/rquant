@@ -285,6 +285,22 @@ def test_v15_to_v16_finalizer_authority_migration_is_reentrant_and_fail_closed(
         assert connection.execute(
             "SELECT COUNT(*) FROM lab_claim_publication_finalizer_trust_cache"
         ).fetchone() == (0,)
+        strict_rows = connection.execute(
+            "SELECT name, strict FROM pragma_table_list "
+            "WHERE schema = 'main' AND name IN (?, ?, ?, ?) ORDER BY name",
+            (
+                "lab_claim_publication_finalizer_root_anchor",
+                "lab_claim_publication_finalizer_attestation",
+                "lab_claim_publication_finalizer_trust_cache",
+                "lab_claim_publication_finalizer_observation_degradation",
+            ),
+        ).fetchall()
+        assert strict_rows == [
+            ("lab_claim_publication_finalizer_attestation", 1),
+            ("lab_claim_publication_finalizer_observation_degradation", 1),
+            ("lab_claim_publication_finalizer_root_anchor", 1),
+            ("lab_claim_publication_finalizer_trust_cache", 1),
+        ]
 
     # The legacy local anchor is retained as untrusted history.  A V2 lease can
     # only acquire after composition supplies an independently signed cert.
