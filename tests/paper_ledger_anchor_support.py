@@ -5,7 +5,7 @@ import shutil
 import sqlite3
 import subprocess
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -31,7 +31,13 @@ class PaperLedgerTestAuthority:
     private_key: Path
     verifier: Ed25519PaperLedgerAnchorVerifier
 
-    def write_current_anchor(self, database: Path, anchor_path: Path) -> PaperLedgerAnchor:
+    def write_current_anchor(
+        self,
+        database: Path,
+        anchor_path: Path,
+        *,
+        issued_at: datetime,
+    ) -> PaperLedgerAnchor:
         with sqlite3.connect(database) as connection:
             connection.row_factory = sqlite3.Row
             migration = connection.execute(
@@ -54,7 +60,7 @@ class PaperLedgerTestAuthority:
             head_marker_fingerprint=str(head["head_marker_fingerprint"]),
             attestation_fingerprint=str(head["attestation_fingerprint"]),
             key_id="paper-ledger-test-v1",
-            issued_at=datetime(2026, 8, 14, 1, 2, tzinfo=UTC),
+            issued_at=issued_at,
         )
         payload_path = self.private_key.parent / "paper-ledger-anchor.payload"
         signature_path = self.private_key.parent / "paper-ledger-anchor.signature"
@@ -88,6 +94,9 @@ class PaperLedgerTestAuthority:
 def create_paper_ledger_test_authority(
     root: Path,
     *,
+    as_of: datetime,
+    max_age: timedelta,
+    future_skew: timedelta,
     ledger_id: str = "paper-ledger-test",
 ) -> PaperLedgerTestAuthority:
     root.mkdir(parents=True, exist_ok=True)
@@ -112,6 +121,9 @@ def create_paper_ledger_test_authority(
         active_key_id="paper-ledger-test-v1",
         active_public_key=public_key.read_bytes(),
         allowed_ledger_id=ledger_id,
+        max_age=max_age,
+        future_skew=future_skew,
+        clock=lambda: as_of,
     )
     return PaperLedgerTestAuthority(
         ledger_id=ledger_id,

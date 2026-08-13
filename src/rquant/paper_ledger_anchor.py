@@ -7,9 +7,12 @@ import hashlib
 import shutil
 import subprocess
 import tempfile
+from collections.abc import Callable
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from rquant.paper_contracts import PaperLedgerAnchor, PaperLedgerAnchorClaims
+from rquant.runtime_contracts import normalize_aware_utc
 from rquant.strict_json import canonical_json_bytes
 
 _ANCHOR_NAMESPACE = "rquant-paper-ledger-head"
@@ -109,6 +112,9 @@ class Ed25519PaperLedgerAnchorVerifier:
         active_key_id: str,
         active_public_key: bytes,
         allowed_ledger_id: str,
+        max_age: timedelta,
+        future_skew: timedelta,
+        clock: Callable[[], datetime],
     ) -> None:
         if not active_key_id.strip() or any(character.isspace() for character in active_key_id):
             raise ValueError("paper ledger anchor key id is invalid")
@@ -116,14 +122,29 @@ class Ed25519PaperLedgerAnchorVerifier:
             raise ValueError("paper ledger anchor ledger id is invalid")
         if not isinstance(active_public_key, bytes) or not active_public_key:
             raise ValueError("paper ledger anchor public key is invalid")
+        if not isinstance(max_age, timedelta) or max_age <= timedelta(0):
+            raise ValueError("paper ledger anchor max_age must be positive")
+        if not isinstance(future_skew, timedelta) or future_skew < timedelta(0):
+            raise ValueError("paper ledger anchor future_skew cannot be negative")
+        if not callable(clock):
+            raise ValueError("paper ledger anchor clock must be callable")
         _validate_public_key(active_public_key)
         self.active_key_id = active_key_id
         self.allowed_ledger_id = allowed_ledger_id
+        self.max_age = max_age
+        self.future_skew = future_skew
+        self._clock = clock
         self._active_public_key = active_public_key
 
     def verify(self, anchor: PaperLedgerAnchor) -> bool:
         claims = anchor.claims
         if claims.key_id != self.active_key_id or claims.ledger_id != self.allowed_ledger_id:
+            return False
+        try:
+            as_of = normalize_aware_utc(self._clock())
+        except (AttributeError, TypeError, ValueError):
+            return False
+        if claims.issued_at > as_of + self.future_skew or as_of - claims.issued_at > self.max_age:
             return False
         return _verify_signature(
             public_key=self._active_public_key,

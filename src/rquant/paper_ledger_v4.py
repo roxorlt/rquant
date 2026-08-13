@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
@@ -447,6 +447,15 @@ def _account_report(
         "SELECT * FROM paper_lot WHERE account_id = ? ORDER BY lot_id", (account_id,)
     ).fetchall()
     lots = {str(row["lot_id"]): row for row in lot_rows}
+    fill_ids = {str(row["fill_id"]) for row in fills}
+    account_consumptions = tuple(
+        row
+        for row in connection.execute(
+            "SELECT * FROM paper_lot_consumption ORDER BY fill_id, lot_id"
+        ).fetchall()
+        if str(row["fill_id"]) in fill_ids or str(row["lot_id"]) in lots
+    )
+    reconciled_consumptions: set[tuple[str, str]] = set()
     for fill in fills:
         order = orders[str(fill["order_id"])]
         intent = intents[str(order["intent_id"])]
@@ -463,6 +472,32 @@ def _account_report(
             replayed_cash -= notional + commission
             lot = lots.get(str(fill["fill_id"]))
             expected_unit_cost = (notional + commission) / quantity
+            receipt = connection.execute(
+                "SELECT request_json FROM paper_execution_receipt WHERE execution_id = ?",
+                (fill["execution_id"],),
+            ).fetchone()
+            if receipt is None:
+                raise PaperV4ReconciliationError("v4 BUY receipt is missing")
+            request = _json_object(
+                receipt["request_json"],
+                label=f"v4 BUY receipt {fill['execution_id']} request",
+            )
+            quote = request.get("quote")
+            if not isinstance(quote, dict):
+                raise PaperV4ReconciliationError("v4 BUY receipt quote is invalid")
+            acquisition_trade_date = request.get("trade_date")
+            available_date = quote.get("acquisition_available_date")
+            if not isinstance(acquisition_trade_date, str) or not isinstance(available_date, str):
+                raise PaperV4ReconciliationError("v4 BUY receipt trade-date provenance is missing")
+            try:
+                acquisition_date_value = date.fromisoformat(acquisition_trade_date)
+                available_date_value = date.fromisoformat(available_date)
+            except ValueError as exc:
+                raise PaperV4ReconciliationError(
+                    "v4 BUY receipt trade-date provenance is invalid"
+                ) from exc
+            fill_executed_at = _timestamp(fill["executed_at"], label="v4 fill executed_at")
+            fill_persisted_at = _timestamp(fill["persisted_at"], label="v4 fill persisted_at")
             if (
                 lot is None
                 or lot["account_id"] != account_id
@@ -470,8 +505,17 @@ def _account_report(
                 or lot["entry_signal_id"] != intent["signal_id"]
                 or int(lot["original_quantity"]) != quantity
                 or _decimal(lot["unit_cost"], label="v4 lot unit_cost") != expected_unit_cost
+                or _timestamp(lot["persisted_at"], label="v4 lot persisted_at") != fill_persisted_at
+                or _timestamp(lot["buy_executed_at"], label="v4 lot buy_executed_at")
+                != fill_executed_at
+                or _timestamp(lot["buy_persisted_at"], label="v4 lot buy_persisted_at")
+                != fill_persisted_at
+                or int(lot["buy_fill_sequence"]) != int(fill["sequence"])
+                or str(lot["acquisition_trade_date"]) != acquisition_trade_date
+                or str(lot["available_date"]) != available_date
+                or available_date_value <= acquisition_date_value
             ):
-                raise PaperV4ReconciliationError("v4 BUY lot basis is invalid")
+                raise PaperV4ReconciliationError("v4 BUY lot provenance or basis is invalid")
             lot_remaining[str(lot["lot_id"])] = quantity
         else:
             consumptions = connection.execute(
@@ -518,17 +562,27 @@ def _account_report(
             for row in consumptions:
                 lot_id = str(row["lot_id"])
                 lot = lots.get(lot_id)
-                if lot is None:
-                    raise PaperV4ReconciliationError("v4 consumption lot is missing")
+                if (
+                    lot is None
+                    or str(row["fill_id"]) != str(fill["fill_id"])
+                    or _timestamp(row["persisted_at"], label="v4 consumption persisted_at")
+                    != _timestamp(fill["persisted_at"], label="v4 sell fill persisted_at")
+                ):
+                    raise PaperV4ReconciliationError("v4 consumption provenance is invalid")
                 unit_cost = _decimal(row["unit_cost"], label="v4 consumption unit_cost")
                 if unit_cost != _decimal(lot["unit_cost"], label="v4 lot unit_cost"):
                     raise PaperV4ReconciliationError("v4 consumption unit cost differs")
                 consumed = int(row["quantity"])
                 lot_remaining[lot_id] -= consumed
                 basis += unit_cost * consumed
+                reconciled_consumptions.add((str(row["fill_id"]), lot_id))
             proceeds = notional - commission - tax
             replayed_cash += proceeds
             replayed_realized += proceeds - basis
+    if {
+        (str(row["fill_id"]), str(row["lot_id"])) for row in account_consumptions
+    } != reconciled_consumptions:
+        raise PaperV4ReconciliationError("v4 consumption mapping is incomplete or invalid")
     for lot_id, lot in lots.items():
         if lot_id not in lot_remaining:
             raise PaperV4ReconciliationError("v4 lot has no corresponding BUY fill")

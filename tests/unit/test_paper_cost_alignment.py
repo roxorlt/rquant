@@ -32,6 +32,9 @@ _BUY_DATE = date(2026, 8, 10)
 _NEXT_TRADE_DATE = date(2026, 8, 11)
 _PRICE_SNAPSHOT_ID = "b" * 64
 _PRODUCER_COMMIT = "c" * 40
+_ANCHOR_NOW = datetime(2026, 8, 14, 1, 2, tzinfo=UTC)
+_ANCHOR_MAX_AGE = timedelta(minutes=5)
+_ANCHOR_FUTURE_SKEW = timedelta(seconds=30)
 
 
 def _v3_spec(
@@ -480,7 +483,12 @@ def test_store_backed_comparator_rejects_all_caller_forged_paper_facts(
     assert not hasattr(strategy_costs, "compare_execution_cost_bindings")
     assert not hasattr(PaperBrokerStore, "export_reconciled_execution_cost_binding")
 
-    authority = create_paper_ledger_test_authority(tmp_path / "anchor-key")
+    authority = create_paper_ledger_test_authority(
+        tmp_path / "anchor-key",
+        as_of=_ANCHOR_NOW,
+        max_age=_ANCHOR_MAX_AGE,
+        future_skew=_ANCHOR_FUTURE_SKEW,
+    )
     anchor_path = tmp_path / "current-head-anchor.json"
     store = _paper_store(
         tmp_path / "paper.sqlite3",
@@ -517,7 +525,7 @@ def test_store_backed_comparator_rejects_all_caller_forged_paper_facts(
     )
     assert not still_unanchored.is_comparable
     assert still_unanchored.reason == "CURRENT_HEAD_UNANCHORED"
-    authority.write_current_anchor(store.path, anchor_path)
+    authority.write_current_anchor(store.path, anchor_path, issued_at=_ANCHOR_NOW)
     exact = store.compare_research_execution_costs(
         research,
         account_id=_ACCOUNT_ID,
@@ -544,11 +552,9 @@ def test_store_backed_comparator_rejects_all_caller_forged_paper_facts(
     assert forged.reason == "RESOLVED_CALCULATION_MISMATCH"
 
 
-def test_strict_v3_binding_comparator_has_machine_negative_reasons(tmp_path: Path) -> None:
+def test_store_comparator_rejects_stale_signed_anchor(tmp_path: Path) -> None:
     from rquant.order_execution_costs import calculate_execution_costs
-    from rquant.strategy_execution_costs import (
-        ExecutionCostBindingEvidence,
-    )
+    from rquant.strategy_execution_costs import ExecutionCostBindingEvidence
     from tests.paper_ledger_anchor_support import create_paper_ledger_test_authority
 
     spec = _v3_spec()
@@ -557,12 +563,17 @@ def test_strict_v3_binding_comparator_has_machine_negative_reasons(tmp_path: Pat
         {"side": "BUY", "reference_price": "10.00", "quantity": 100},
         _context(),
     )
-    exact = ExecutionCostBindingEvidence(
+    research = ExecutionCostBindingEvidence(
         provenance_state="KNOWN_V3",
         execution_cost_spec=spec,
         calculations=(calculation,),
     )
-    authority = create_paper_ledger_test_authority(tmp_path / "anchor-key")
+    authority = create_paper_ledger_test_authority(
+        tmp_path / "anchor-key",
+        as_of=_ANCHOR_NOW,
+        max_age=_ANCHOR_MAX_AGE,
+        future_skew=_ANCHOR_FUTURE_SKEW,
+    )
     anchor_path = tmp_path / "current-head-anchor.json"
     store = _paper_store(
         tmp_path / "paper.sqlite3",
@@ -582,7 +593,66 @@ def test_strict_v3_binding_comparator_has_machine_negative_reasons(tmp_path: Pat
         market_prices={"600000.SH": calculation.executed_price},
         producer_commit=_PRODUCER_COMMIT,
     )
-    authority.write_current_anchor(store.path, anchor_path)
+    authority.write_current_anchor(
+        store.path,
+        anchor_path,
+        issued_at=_ANCHOR_NOW - _ANCHOR_MAX_AGE - timedelta(microseconds=1),
+    )
+
+    comparison = store.compare_research_execution_costs(
+        research,
+        account_id=_ACCOUNT_ID,
+        execution_ids=("1" * 64,),
+    )
+
+    assert not comparison.is_comparable
+    assert comparison.reason == "CURRENT_HEAD_UNANCHORED"
+
+
+def test_strict_v3_binding_comparator_has_machine_negative_reasons(tmp_path: Path) -> None:
+    from rquant.order_execution_costs import calculate_execution_costs
+    from rquant.strategy_execution_costs import (
+        ExecutionCostBindingEvidence,
+    )
+    from tests.paper_ledger_anchor_support import create_paper_ledger_test_authority
+
+    spec = _v3_spec()
+    calculation = calculate_execution_costs(
+        spec,
+        {"side": "BUY", "reference_price": "10.00", "quantity": 100},
+        _context(),
+    )
+    exact = ExecutionCostBindingEvidence(
+        provenance_state="KNOWN_V3",
+        execution_cost_spec=spec,
+        calculations=(calculation,),
+    )
+    authority = create_paper_ledger_test_authority(
+        tmp_path / "anchor-key",
+        as_of=_ANCHOR_NOW,
+        max_age=_ANCHOR_MAX_AGE,
+        future_skew=_ANCHOR_FUTURE_SKEW,
+    )
+    anchor_path = tmp_path / "current-head-anchor.json"
+    store = _paper_store(
+        tmp_path / "paper.sqlite3",
+        spec=spec,
+        anchor_authority=authority,
+        anchor_path=anchor_path,
+    )
+    store.submit_intent(
+        _paper_intent(signal_seed="a"),
+        execution_id="1" * 64,
+        decision_time=_BUY_TIME,
+        trade_date=_BUY_DATE,
+        quote=_paper_quote("10.00"),
+    )
+    store.account_authority_snapshot(
+        as_of=_BUY_TIME + timedelta(seconds=1),
+        market_prices={"600000.SH": calculation.executed_price},
+        producer_commit=_PRODUCER_COMMIT,
+    )
+    authority.write_current_anchor(store.path, anchor_path, issued_at=_ANCHOR_NOW)
     different_spec = _v3_spec(engine_version="different-engine-v3")
     different_calculation = calculate_execution_costs(
         different_spec,
