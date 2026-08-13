@@ -1303,6 +1303,7 @@ Inventory = Callable[[float], dict[int, _ProcessObservation]]
 _CONTAINMENT_ENVIRONMENT_KEY = "RQUANT_CONTAINMENT_TOKEN"
 _MAX_PROCESS_ARGUMENT_BYTES = 4 * 1024 * 1024
 _LINUX_SUBREAPER_LOCK = threading.Lock()
+_LINUX_SUBREAPER_OWNERSHIP = threading.local()
 _DARWIN_UNIQUE_IDENTITY_FLAVOR = 17
 _DARWIN_UNIQUE_IDENTITY_SIZE = 56
 _DARWIN_LIST_FDS_FLAVOR = 1
@@ -1987,13 +1988,23 @@ class _LinuxSubreaperProcessTracker:
         self._previous_subreaper = 0
         self._owns_subreaper_lock = False
         self._subreaper_changed = False
+        self._subreaper_owner: _LinuxSubreaperProcessTracker | None = None
+        self._subreaper_depth = 0
 
     def _enable_subreaper(self, deadline: float) -> None:
         _require_no_execution_hooks()
+        owner = getattr(_LINUX_SUBREAPER_OWNERSHIP, "owner", None)
+        if owner is not None:
+            owner._subreaper_depth += 1
+            self._subreaper_owner = owner
+            return
         remaining = deadline - time.monotonic()
         if remaining <= 0 or not _LINUX_SUBREAPER_LOCK.acquire(timeout=remaining):
             raise TimeoutError("subreaper registration deadline expired")
         self._owns_subreaper_lock = True
+        self._subreaper_owner = self
+        self._subreaper_depth = 1
+        _LINUX_SUBREAPER_OWNERSHIP.owner = self
         libc = ctypes.CDLL(None, use_errno=True)
         current = ctypes.c_int()
         if libc.prctl(self._PR_GET_CHILD_SUBREAPER, ctypes.byref(current), 0, 0, 0) != 0:
@@ -2117,24 +2128,49 @@ class _LinuxSubreaperProcessTracker:
                 ContainedProcessError("kernel process tracker descriptors remain open"),
             )
         restore_failed = False
-        if self._owns_subreaper_lock:
-            try:
-                if self._subreaper_changed:
-                    libc = ctypes.CDLL(None, use_errno=True)
-                    restore_failed = (
-                        libc.prctl(
-                            self._PR_SET_CHILD_SUBREAPER,
-                            self._previous_subreaper,
-                            0,
-                            0,
-                            0,
+        owner = self._subreaper_owner
+        if owner is not None and owner is not self:
+            if getattr(_LINUX_SUBREAPER_OWNERSHIP, "owner", None) is not owner:
+                _record_cleanup_error(
+                    cleanup_errors,
+                    ContainedProcessError("subreaper ownership belongs to a different thread"),
+                )
+            elif owner._subreaper_depth <= 1:
+                _record_cleanup_error(
+                    cleanup_errors,
+                    ContainedProcessError("subreaper ownership depth is invalid"),
+                )
+            else:
+                owner._subreaper_depth -= 1
+                self._subreaper_owner = None
+        elif self._owns_subreaper_lock:
+            if owner is self and self._subreaper_depth != 1:
+                _record_cleanup_error(
+                    cleanup_errors,
+                    ContainedProcessError("nested subreaper tracker remains active during cleanup"),
+                )
+            else:
+                if owner is self:
+                    del _LINUX_SUBREAPER_OWNERSHIP.owner
+                    self._subreaper_owner = None
+                    self._subreaper_depth = 0
+                try:
+                    if self._subreaper_changed:
+                        libc = ctypes.CDLL(None, use_errno=True)
+                        restore_failed = (
+                            libc.prctl(
+                                self._PR_SET_CHILD_SUBREAPER,
+                                self._previous_subreaper,
+                                0,
+                                0,
+                                0,
+                            )
+                            != 0
                         )
-                        != 0
-                    )
-            finally:
-                self._subreaper_changed = False
-                self._owns_subreaper_lock = False
-                _LINUX_SUBREAPER_LOCK.release()
+                finally:
+                    self._subreaper_changed = False
+                    self._owns_subreaper_lock = False
+                    _LINUX_SUBREAPER_LOCK.release()
         if restore_failed:
             _record_cleanup_error(
                 cleanup_errors,

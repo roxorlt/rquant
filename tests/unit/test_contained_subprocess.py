@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import errno
 import inspect
 import os
@@ -3048,6 +3049,174 @@ def test_linux_subreaper_reaps_only_known_adopted_descendants(monkeypatch) -> No
     tracker.poll(deadline=10)
 
     assert reaped == [101, 102]
+
+
+def test_linux_subreaper_reentrant_trackers_restore_once_after_nested_exceptions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[int, int]] = []
+
+    class _FakeLibc:
+        subreaper = 0
+
+        @classmethod
+        def prctl(cls, operation: int, value: object, *_args: object) -> int:
+            if operation == contained._LinuxSubreaperProcessTracker._PR_GET_CHILD_SUBREAPER:
+                ctypes.cast(value, ctypes.POINTER(ctypes.c_int)).contents.value = cls.subreaper
+            else:
+                assert isinstance(value, int)
+                cls.subreaper = value
+            calls.append((operation, cls.subreaper))
+            return 0
+
+    monkeypatch.setattr(contained.ctypes, "CDLL", lambda *_args, **_kwargs: _FakeLibc())
+    monkeypatch.setattr(contained, "_LINUX_SUBREAPER_LOCK", threading.Lock())
+    outer = contained._LinuxSubreaperProcessTracker()
+    middle = contained._LinuxSubreaperProcessTracker()
+    inner = contained._LinuxSubreaperProcessTracker()
+
+    outer._enable_subreaper(time.monotonic() + 1)
+    try:
+        middle._enable_subreaper(time.monotonic() + 1)
+        try:
+            inner._enable_subreaper(time.monotonic() + 1)
+            try:
+                raise RuntimeError("inner failure")
+            finally:
+                inner.close()
+        finally:
+            middle.close()
+        raise RuntimeError("outer failure")
+    except RuntimeError:
+        pass
+    finally:
+        outer.close()
+
+    assert calls == [
+        (contained._LinuxSubreaperProcessTracker._PR_GET_CHILD_SUBREAPER, 0),
+        (contained._LinuxSubreaperProcessTracker._PR_SET_CHILD_SUBREAPER, 1),
+        (contained._LinuxSubreaperProcessTracker._PR_SET_CHILD_SUBREAPER, 0),
+    ]
+
+
+def test_linux_subreaper_remains_serialized_across_threads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[int, int]] = []
+    first_enabled = threading.Event()
+    release_first = threading.Event()
+    second_enabled = threading.Event()
+    failures: list[BaseException] = []
+
+    class _FakeLibc:
+        subreaper = 0
+
+        @classmethod
+        def prctl(cls, operation: int, value: object, *_args: object) -> int:
+            if operation == contained._LinuxSubreaperProcessTracker._PR_GET_CHILD_SUBREAPER:
+                ctypes.cast(value, ctypes.POINTER(ctypes.c_int)).contents.value = cls.subreaper
+            else:
+                assert isinstance(value, int)
+                cls.subreaper = value
+            calls.append((operation, cls.subreaper))
+            return 0
+
+    monkeypatch.setattr(contained.ctypes, "CDLL", lambda *_args, **_kwargs: _FakeLibc())
+    monkeypatch.setattr(contained, "_LINUX_SUBREAPER_LOCK", threading.Lock())
+
+    def first() -> None:
+        tracker = contained._LinuxSubreaperProcessTracker()
+        try:
+            tracker._enable_subreaper(time.monotonic() + 2)
+            first_enabled.set()
+            assert release_first.wait(timeout=1)
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            tracker.close()
+
+    def second() -> None:
+        tracker = contained._LinuxSubreaperProcessTracker()
+        try:
+            assert first_enabled.wait(timeout=1)
+            tracker._enable_subreaper(time.monotonic() + 2)
+            second_enabled.set()
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            tracker.close()
+
+    first_thread = threading.Thread(target=first)
+    second_thread = threading.Thread(target=second)
+    first_thread.start()
+    second_thread.start()
+    assert first_enabled.wait(timeout=1)
+    assert not second_enabled.wait(timeout=0.05)
+    release_first.set()
+    first_thread.join(timeout=2)
+    second_thread.join(timeout=2)
+
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert failures == []
+    assert calls == [
+        (contained._LinuxSubreaperProcessTracker._PR_GET_CHILD_SUBREAPER, 0),
+        (contained._LinuxSubreaperProcessTracker._PR_SET_CHILD_SUBREAPER, 1),
+        (contained._LinuxSubreaperProcessTracker._PR_SET_CHILD_SUBREAPER, 0),
+        (contained._LinuxSubreaperProcessTracker._PR_GET_CHILD_SUBREAPER, 0),
+        (contained._LinuxSubreaperProcessTracker._PR_SET_CHILD_SUBREAPER, 1),
+        (contained._LinuxSubreaperProcessTracker._PR_SET_CHILD_SUBREAPER, 0),
+    ]
+
+
+def test_linux_subreaper_non_owner_thread_cannot_reenter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_enabled = threading.Event()
+    release_first = threading.Event()
+    second_failure: list[BaseException] = []
+
+    class _FakeLibc:
+        @staticmethod
+        def prctl(operation: int, value: object, *_args: object) -> int:
+            if operation == contained._LinuxSubreaperProcessTracker._PR_GET_CHILD_SUBREAPER:
+                ctypes.cast(value, ctypes.POINTER(ctypes.c_int)).contents.value = 0
+            return 0
+
+    monkeypatch.setattr(contained.ctypes, "CDLL", lambda *_args, **_kwargs: _FakeLibc())
+    monkeypatch.setattr(contained, "_LINUX_SUBREAPER_LOCK", threading.Lock())
+
+    def first() -> None:
+        tracker = contained._LinuxSubreaperProcessTracker()
+        try:
+            tracker._enable_subreaper(time.monotonic() + 1)
+            first_enabled.set()
+            assert release_first.wait(timeout=1)
+        finally:
+            tracker.close()
+
+    def second() -> None:
+        tracker = contained._LinuxSubreaperProcessTracker()
+        try:
+            assert first_enabled.wait(timeout=1)
+            tracker._enable_subreaper(time.monotonic() + 0.05)
+        except BaseException as exc:
+            second_failure.append(exc)
+        finally:
+            tracker.close()
+
+    first_thread = threading.Thread(target=first)
+    second_thread = threading.Thread(target=second)
+    first_thread.start()
+    second_thread.start()
+    second_thread.join(timeout=1)
+    release_first.set()
+    first_thread.join(timeout=1)
+
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert len(second_failure) == 1
+    assert isinstance(second_failure[0], TimeoutError)
 
 
 def test_linux_subreaper_restore_failure_releases_process_wide_lock(monkeypatch) -> None:
