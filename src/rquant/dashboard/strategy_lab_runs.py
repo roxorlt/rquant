@@ -307,7 +307,7 @@ def build_strategy_lab_run(
     base_manifest = manifest or new_exploratory_manifest(run_type)
     enriched_manifest = ResearchManifest.model_validate({
         **base_manifest.model_dump(exclude={"missing_evidence"}),
-        "schema_version": 2,
+        "schema_version": max(2, base_manifest.schema_version),
         "strategy_spec_hash": _strategy_spec_hash(run_type, params),
         "result_hash": _result_hash(metrics, tables),
     })

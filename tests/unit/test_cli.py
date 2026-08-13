@@ -1551,8 +1551,9 @@ class TestFormalSmokeReplay:
         from unittest.mock import MagicMock
 
         from rquant import cli
+        from rquant import formal_runtime_composition as composition_module
         from rquant import formal_smoke_replay as smoke_module
-        from rquant import research_manifest as manifest_module
+        from rquant.runtime_code_attestation import CodeTrustEvidence
 
         result = MagicMock()
         result.model_dump.return_value = {
@@ -1563,12 +1564,26 @@ class TestFormalSmokeReplay:
             "result_hash": "f" * 64,
         }
         run = MagicMock(return_value=result)
-        monkeypatch.setattr(
-            manifest_module,
-            "detect_verified_code_commit",
-            lambda: "d" * 40,
-            raising=False,
+        capability = MagicMock()
+        capability.evidence = CodeTrustEvidence(
+            generation_id="a" * 64,
+            attestation_sha256="b" * 64,
+            bundle_sha256="c" * 64,
+            content_root_sha256="d" * 64,
+            promotion_sequence=1,
+            provenance_commit="d" * 40,
         )
+
+        class FakeRequest:
+            def __init__(self, **values: object) -> None:
+                self.__dict__.update(values)
+
+        monkeypatch.setattr(
+            composition_module,
+            "open_formal_runtime_capability",
+            lambda **_kwargs: capability,
+        )
+        monkeypatch.setattr(smoke_module, "FormalSmokeReplayRequest", FakeRequest)
         monkeypatch.setattr(
             smoke_module,
             "run_formal_smoke_replay",
@@ -1591,6 +1606,14 @@ class TestFormalSmokeReplay:
                 "c" * 64,
                 "--output-dir",
                 str(tmp_path),
+                "--runtime-code-config",
+                "/tmp/runtime-code-bootstrap.json",
+                "--runtime-code-trusted-base",
+                "/tmp",
+                "--runtime-code-authority-uid",
+                "1",
+                "--runtime-code-authority-gid",
+                "1",
             ]
         )
 
@@ -1604,10 +1627,11 @@ class TestFormalSmokeReplay:
         assert request.dataset_snapshot_id == "b" * 64
         assert request.dataset_binding_hash == "c" * 64
         assert request.code_commit == "d" * 40
+        assert request.runtime_capability is capability
         assert run.call_args.kwargs == {"base_dir": tmp_path}
         assert json.loads(capsys.readouterr().out) == result.model_dump.return_value
 
-    def test_command_rejects_dirty_or_missing_commit_before_compute(
+    def test_command_rejects_missing_runtime_capability_before_compute(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -1615,14 +1639,13 @@ class TestFormalSmokeReplay:
 
         from rquant import cli
         from rquant import formal_smoke_replay as smoke_module
-        from rquant import research_manifest as manifest_module
+        from rquant import formal_runtime_composition as composition_module
 
         run = MagicMock()
         monkeypatch.setattr(
-            manifest_module,
-            "detect_verified_code_commit",
-            lambda: "d" * 40 + "-dirty",
-            raising=False,
+            composition_module,
+            "open_formal_runtime_capability",
+            lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("invalid")),
         )
         monkeypatch.setattr(
             smoke_module,
@@ -1644,6 +1667,14 @@ class TestFormalSmokeReplay:
                 "b" * 64,
                 "--binding-hash",
                 "c" * 64,
+                "--runtime-code-config",
+                "/tmp/runtime-code-bootstrap.json",
+                "--runtime-code-trusted-base",
+                "/tmp",
+                "--runtime-code-authority-uid",
+                "1",
+                "--runtime-code-authority-gid",
+                "1",
             ]
         )
 

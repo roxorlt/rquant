@@ -9,6 +9,7 @@ from typing import Any, Literal
 import pandas as pd
 from pydantic import BaseModel, ConfigDict, computed_field, model_validator
 
+from rquant.authority_path_security import AuthorityPathSecurityError
 from rquant.auction_gap_strategy import AuctionGapMinuteReplayConfig
 from rquant.dashboard.strategy_lab_runs import (
     _canonical_json_bytes,
@@ -24,6 +25,12 @@ from rquant.research_gate import (
     ResearchGateRequest,
     build_gate_research_manifest,
     open_gated_research_store,
+)
+from rquant.research_manifest import require_formal_research_manifest
+from rquant.runtime_code_attestation import CodeTrustEvidence
+from rquant.runtime_code_generation import (
+    RuntimeCodeGenerationCapability,
+    RuntimeCodeGenerationError,
 )
 
 FormalSmokeStrategy = Literal[
@@ -76,7 +83,11 @@ class FormalSmokeSpec(BaseModel):
 
 
 class FormalSmokeReplayRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(
+        arbitrary_types_allowed=True,
+        extra="forbid",
+        frozen=True,
+    )
 
     strategy: FormalSmokeStrategy
     start_date: date
@@ -85,6 +96,7 @@ class FormalSmokeReplayRequest(BaseModel):
     dataset_snapshot_id: str
     dataset_binding_hash: str
     code_commit: str
+    runtime_capability: RuntimeCodeGenerationCapability
 
     @model_validator(mode="after")
     def validate_request(self) -> FormalSmokeReplayRequest:
@@ -104,6 +116,14 @@ class FormalSmokeReplayRequest(BaseModel):
         if re.fullmatch(_COMMIT_PATTERN, self.code_commit) is None:
             raise ValueError(
                 "formal smoke code_commit must be a clean 40-character commit"
+            )
+        try:
+            self.runtime_capability.require_live()
+        except (AuthorityPathSecurityError, RuntimeCodeGenerationError) as exc:
+            raise ValueError("formal smoke runtime capability is invalid") from exc
+        if self.runtime_capability.evidence.provenance_commit != self.code_commit:
+            raise ValueError(
+                "formal smoke code_commit does not match runtime capability"
             )
         return self
 
@@ -385,11 +405,29 @@ def _verify_gate_evidence(
             )
 
 
+def _require_runtime_code_evidence(
+    request: FormalSmokeReplayRequest,
+) -> CodeTrustEvidence:
+    """Return evidence only while the request capability remains verified and current."""
+    capability = request.runtime_capability
+    try:
+        capability.require_live()
+    except (AuthorityPathSecurityError, RuntimeCodeGenerationError) as exc:
+        raise PermissionError("formal smoke runtime capability is invalid") from exc
+    evidence = capability.evidence
+    if evidence.provenance_commit != request.code_commit:
+        raise PermissionError(
+            "formal smoke code_commit does not match runtime capability"
+        )
+    return evidence
+
+
 def run_formal_smoke_replay(
     request: FormalSmokeReplayRequest,
     *,
     base_dir: Path | None = None,
 ) -> FormalSmokeReplayResult:
+    code_trust_evidence = _require_runtime_code_evidence(request)
     spec = build_formal_smoke_spec(
         request.strategy,
         start_date=request.start_date,
@@ -407,7 +445,12 @@ def run_formal_smoke_replay(
     )
     with open_gated_research_store(gate_request) as (store, decision):
         _verify_gate_evidence(request, decision)
+        if _require_runtime_code_evidence(request) != code_trust_evidence:
+            raise PermissionError("formal smoke runtime capability evidence changed")
         computation = _execute_formal_smoke_spec(store, spec)
+
+    if _require_runtime_code_evidence(request) != code_trust_evidence:
+        raise PermissionError("formal smoke runtime capability evidence changed")
 
     if "formal_evidence" in computation.tables:
         raise ValueError("formal smoke computation uses reserved evidence table")
@@ -418,6 +461,7 @@ def run_formal_smoke_replay(
                 "dataset_snapshot_id": request.dataset_snapshot_id,
                 "dataset_binding_hash": request.dataset_binding_hash,
                 "code_commit": request.code_commit,
+                "code_trust_evidence": code_trust_evidence.model_dump(mode="json"),
             }
         ]
     )
@@ -425,7 +469,15 @@ def run_formal_smoke_replay(
         **computation.tables,
         "formal_evidence": evidence,
     })
-    manifest = build_gate_research_manifest(gate_request, decision)
+    manifest = build_gate_research_manifest(
+        gate_request,
+        decision,
+        code_trust_evidence=code_trust_evidence,
+    )
+    require_formal_research_manifest(
+        manifest,
+        capability=request.runtime_capability,
+    )
     title = (
         f"Stage 1 {request.strategy} formal smoke "
         f"{request.start_date.isoformat()} to {request.end_date.isoformat()}"

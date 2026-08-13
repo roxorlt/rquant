@@ -8,6 +8,35 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
+from pydantic import ValidationError
+
+
+def _open_signed_runtime_capability(
+    tmp_path: Path,
+    *,
+    provenance_commit: str = "d" * 40,
+) -> "RuntimeCodeGenerationCapability":
+    """Open the same signed immutable-generation capability used by runtime tests."""
+    from rquant.runtime_code_generation import RuntimeCodeGenerationCapability
+    from tests.runtime_code_e2e_support import (
+        build_test_package,
+        install_test_package,
+        open_test_capability,
+    )
+
+    package = build_test_package(
+        tmp_path / "runtime-package",
+        provenance_commit=provenance_commit,
+    )
+    trusted_base, runtime_root, _installer = install_test_package(
+        tmp_path,
+        package,
+    )
+    return open_test_capability(
+        trusted_base=trusted_base,
+        runtime_root=runtime_root,
+        package=package,
+    )
 
 
 @pytest.mark.parametrize(
@@ -150,6 +179,7 @@ def test_formal_smoke_execution_uses_exact_gate_and_persists_evidence(
         run_formal_smoke_replay,
     )
 
+    capability = _open_signed_runtime_capability(tmp_path)
     request = FormalSmokeReplayRequest(
         strategy="n_shape",
         start_date=date(2026, 4, 1),
@@ -158,6 +188,7 @@ def test_formal_smoke_execution_uses_exact_gate_and_persists_evidence(
         dataset_snapshot_id="b" * 64,
         dataset_binding_hash="c" * 64,
         code_commit="d" * 40,
+        runtime_capability=capability,
     )
     captured_requests = []
     execution_store = object()
@@ -199,8 +230,11 @@ def test_formal_smoke_execution_uses_exact_gate_and_persists_evidence(
         execute_fixed_spec,
     )
 
-    result = run_formal_smoke_replay(request, base_dir=tmp_path)
-    repeated = run_formal_smoke_replay(request, base_dir=tmp_path)
+    try:
+        result = run_formal_smoke_replay(request, base_dir=tmp_path)
+        repeated = run_formal_smoke_replay(request, base_dir=tmp_path)
+    finally:
+        capability.close()
 
     assert len(captured_requests) == 2
     gate_request = captured_requests[0]
@@ -223,7 +257,7 @@ def test_formal_smoke_execution_uses_exact_gate_and_persists_evidence(
     assert repeated.result_hash == result.result_hash
 
     saved = load_strategy_lab_run(result.run_id, base_dir=tmp_path)
-    assert saved.manifest.schema_version == 2
+    assert saved.manifest.schema_version == 3
     assert saved.manifest.research_status == "comparable"
     assert saved.manifest.dataset_snapshot_id == request.dataset_snapshot_id
     assert (
@@ -233,6 +267,7 @@ def test_formal_smoke_execution_uses_exact_gate_and_persists_evidence(
     assert saved.manifest.strategy_spec_hash == result.strategy_spec_hash
     assert saved.manifest.result_hash == result.result_hash
     assert saved.manifest.missing_evidence == []
+    assert saved.manifest.code_trust_evidence == request.runtime_capability.evidence
     evidence = next(
         table for table in saved.tables if table.name == "formal_evidence"
     )
@@ -242,6 +277,9 @@ def test_formal_smoke_execution_uses_exact_gate_and_persists_evidence(
             "dataset_snapshot_id": request.dataset_snapshot_id,
             "dataset_binding_hash": request.dataset_binding_hash,
             "code_commit": request.code_commit,
+            "code_trust_evidence": request.runtime_capability.evidence.model_dump(
+                mode="json"
+            ),
         }
     ]
 
@@ -257,6 +295,7 @@ def test_formal_smoke_result_hash_is_stable_when_strategy_row_order_changes(
         run_formal_smoke_replay,
     )
 
+    capability = _open_signed_runtime_capability(tmp_path)
     request = FormalSmokeReplayRequest(
         strategy="growth_board_surge",
         start_date=date(2026, 4, 1),
@@ -265,6 +304,7 @@ def test_formal_smoke_result_hash_is_stable_when_strategy_row_order_changes(
         dataset_snapshot_id="b" * 64,
         dataset_binding_hash="c" * 64,
         code_commit="d" * 40,
+        runtime_capability=capability,
     )
     execution_count = 0
 
@@ -319,8 +359,11 @@ def test_formal_smoke_result_hash_is_stable_when_strategy_row_order_changes(
         execute_with_unstable_order,
     )
 
-    first = run_formal_smoke_replay(request, base_dir=tmp_path)
-    second = run_formal_smoke_replay(request, base_dir=tmp_path)
+    try:
+        first = run_formal_smoke_replay(request, base_dir=tmp_path)
+        second = run_formal_smoke_replay(request, base_dir=tmp_path)
+    finally:
+        capability.close()
 
     assert first.run_id != second.run_id
     assert first.result_hash == second.result_hash
@@ -347,6 +390,7 @@ def test_formal_smoke_execution_fails_closed_on_gate_evidence_mismatch(
         run_formal_smoke_replay,
     )
 
+    capability = _open_signed_runtime_capability(tmp_path)
     request = FormalSmokeReplayRequest(
         strategy="n_shape",
         start_date=date(2026, 4, 1),
@@ -355,6 +399,7 @@ def test_formal_smoke_execution_fails_closed_on_gate_evidence_mismatch(
         dataset_snapshot_id="b" * 64,
         dataset_binding_hash="c" * 64,
         code_commit="d" * 40,
+        runtime_capability=capability,
     )
     executed = False
 
@@ -380,8 +425,108 @@ def test_formal_smoke_execution_fails_closed_on_gate_evidence_mismatch(
         reject_execution,
     )
 
-    with pytest.raises(PermissionError, match=message):
-        run_formal_smoke_replay(request, base_dir=tmp_path)
+    try:
+        with pytest.raises(PermissionError, match=message):
+            run_formal_smoke_replay(request, base_dir=tmp_path)
+    finally:
+        capability.close()
+
+    assert executed is False
+    assert not (tmp_path / "strategy_lab_runs").exists()
+
+
+def test_formal_smoke_rejects_missing_runtime_generation_capability(
+    tmp_path: Path,
+) -> None:
+    from rquant.formal_smoke_replay import FormalSmokeReplayRequest
+
+    with pytest.raises(ValidationError, match="runtime_capability"):
+        FormalSmokeReplayRequest(
+            strategy="n_shape",
+            start_date=date(2026, 4, 1),
+            end_date=date(2026, 7, 2),
+            audit_run_id="a" * 64,
+            dataset_snapshot_id="b" * 64,
+            dataset_binding_hash="c" * 64,
+            code_commit="d" * 40,
+        )
+
+    assert not (tmp_path / "strategy_lab_runs").exists()
+
+
+def test_formal_smoke_rejects_capability_provenance_commit_mismatch(
+    tmp_path: Path,
+) -> None:
+    from rquant.formal_smoke_replay import FormalSmokeReplayRequest
+
+    capability = _open_signed_runtime_capability(tmp_path)
+    try:
+        with pytest.raises(ValidationError, match="code_commit"):
+            FormalSmokeReplayRequest(
+                strategy="n_shape",
+                start_date=date(2026, 4, 1),
+                end_date=date(2026, 7, 2),
+                audit_run_id="a" * 64,
+                dataset_snapshot_id="b" * 64,
+                dataset_binding_hash="c" * 64,
+                code_commit="e" * 40,
+                runtime_capability=capability,
+            )
+    finally:
+        capability.close()
+
+
+@pytest.mark.parametrize(
+    "invalid_state",
+    ["closed", "generation_changed", "bundle_tampered"],
+)
+def test_formal_smoke_rejects_invalid_runtime_generation_before_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_state: str,
+) -> None:
+    import rquant.formal_smoke_replay as smoke_module
+    from rquant.formal_smoke_replay import (
+        FormalSmokeReplayRequest,
+        run_formal_smoke_replay,
+    )
+
+    capability = _open_signed_runtime_capability(tmp_path)
+    request = FormalSmokeReplayRequest(
+        strategy="n_shape",
+        start_date=date(2026, 4, 1),
+        end_date=date(2026, 7, 2),
+        audit_run_id="a" * 64,
+        dataset_snapshot_id="b" * 64,
+        dataset_binding_hash="c" * 64,
+        code_commit="d" * 40,
+        runtime_capability=capability,
+    )
+    executed = False
+
+    def reject_execution(_store: object, _spec: object) -> object:
+        nonlocal executed
+        executed = True
+        raise AssertionError("strategy compute must not run")
+
+    monkeypatch.setattr(smoke_module, "_execute_formal_smoke_spec", reject_execution)
+    if invalid_state == "closed":
+        capability.close()
+    elif invalid_state == "generation_changed":
+        pointer = capability.loaded.generation_root.parent.parent / "current"
+        pointer.write_text("e" * 64 + "\n", encoding="ascii")
+    else:
+        source = capability.release_root / "src/rquant/app.py"
+        replacement = source.with_name("replacement.py")
+        replacement.write_bytes(b"TAMPERED = True\n")
+        replacement.chmod(0o444)
+        replacement.replace(source)
+
+    try:
+        with pytest.raises(Exception, match="runtime|generation|capability|unchanged"):
+            run_formal_smoke_replay(request, base_dir=tmp_path)
+    finally:
+        capability.close()
 
     assert executed is False
     assert not (tmp_path / "strategy_lab_runs").exists()

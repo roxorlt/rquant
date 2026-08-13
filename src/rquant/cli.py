@@ -1534,32 +1534,48 @@ def cmd_research_repair_minute(args: argparse.Namespace) -> int:
 
 def cmd_formal_smoke_replay(args: argparse.Namespace) -> int:
     """Run one fixed strategy spec through the exact formal research binding."""
+    from rquant.formal_runtime_composition import (
+        FormalRuntimeCompositionError,
+        open_formal_runtime_capability,
+    )
     from rquant.formal_smoke_replay import (
         FormalSmokeReplayRequest,
         run_formal_smoke_replay,
     )
-    from rquant.research_manifest import detect_verified_code_commit
 
     setup_logging()
-    code_commit = detect_verified_code_commit()
-    if not _valid_clean_commit(code_commit):
-        logger.error("formal smoke replay requires a clean 40-character git commit")
+    try:
+        capability = open_formal_runtime_capability(
+            configuration_path=args.runtime_code_config,
+            trusted_base=args.runtime_code_trusted_base,
+            expected_authority_uid=args.runtime_code_authority_uid,
+            expected_authority_gid=args.runtime_code_authority_gid,
+            startup_deadline_monotonic=time.monotonic() + 30,
+        )
+        capability.require_live()
+        code_commit = capability.evidence.provenance_commit
+    except (FormalRuntimeCompositionError, RuntimeError) as exc:
+        logger.error(f"formal smoke replay runtime capability is unavailable: {exc}")
         return 2
-    request = FormalSmokeReplayRequest(
-        strategy=args.strategy,
-        start_date=args.start_date,
-        end_date=args.end_date,
-        audit_run_id=args.audit_run_id,
-        dataset_snapshot_id=args.snapshot_id,
-        dataset_binding_hash=args.binding_hash,
-        code_commit=code_commit,
-    )
-    result = run_formal_smoke_replay(
-        request,
-        base_dir=args.output_dir,
-    )
-    _print_json(result.model_dump(mode="json"))
-    return 0
+    try:
+        request = FormalSmokeReplayRequest(
+            strategy=args.strategy,
+            start_date=args.start_date,
+            end_date=args.end_date,
+            audit_run_id=args.audit_run_id,
+            dataset_snapshot_id=args.snapshot_id,
+            dataset_binding_hash=args.binding_hash,
+            code_commit=code_commit,
+            runtime_capability=capability,
+        )
+        result = run_formal_smoke_replay(
+            request,
+            base_dir=args.output_dir,
+        )
+        _print_json(result.model_dump(mode="json"))
+        return 0
+    finally:
+        capability.close()
 
 
 def cmd_stage1_acceptance(args: argparse.Namespace) -> int:
@@ -6786,6 +6802,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Strategy Lab 记录根目录（默认使用配置 data_dir）",
     )
+    _add_formal_runtime_bootstrap_arguments(formal_smoke_p)
 
     stage1_acceptance_p = sub.add_parser(
         "stage1-acceptance",
