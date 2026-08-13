@@ -9937,6 +9937,7 @@ class LabJobStore:
         *,
         lease: LabLeaseRecord,
         now: datetime,
+        reclaimed_shards: set[tuple[UUID, int, UUID]] | None = None,
     ) -> set[UUID]:
         stale_rows = connection.execute(
             """
@@ -10081,6 +10082,18 @@ class LabJobStore:
             )
             if cursor.rowcount == 1:
                 reclaimed_job_ids.add(job_id)
+                if reclaimed_shards is not None:
+                    reclaimed_shards.add(
+                        (
+                            job_id,
+                            _strict_sqlite_int(
+                                stale["shard_index"],
+                                field="lab_shard.shard_index",
+                                minimum=0,
+                            ),
+                            _canonical_uuid_text(stale["shard_id"], field="lab_shard.shard_id"),
+                        )
+                    )
         idle_cursor = connection.execute(
             """
             SELECT cursor_created_at, cursor_job_id
@@ -13920,10 +13933,12 @@ class LabJobStore:
 
         with self._transaction() as connection:
             self._validate_lease(connection, lease, now=current)
+            reclaimed_shards: set[tuple[UUID, int, UUID]] = set()
             self._recover_stale_shards_in_transaction(
                 connection,
                 lease=lease,
                 now=current,
+                reclaimed_shards=reclaimed_shards,
             )
             active_worker = connection.execute(
                 """
@@ -13969,6 +13984,57 @@ class LabJobStore:
                         FROM lab_preclaim_fair_cursor WHERE singleton = 1
                         """
                     ).fetchone()
+            for reclaimed_job_id, _reclaimed_shard_index, reclaimed_shard_id in sorted(
+                reclaimed_shards,
+                key=lambda item: (str(item[0]), item[1], str(item[2])),
+            ):
+                row = connection.execute(
+                    f"""
+                    SELECT s.* FROM lab_shard AS s
+                    JOIN lab_job AS j ON j.job_id = s.job_id
+                    WHERE s.job_id = ? AND s.shard_id = ?
+                      AND s.status = ?
+                      AND s.payload_protocol_version IN ({protocol_placeholders})
+                      AND s.attempt_count < s.max_attempts
+                      AND j.status IN (?, ?) AND j.control_intent = ? AND j.deadline > ?
+                    """,
+                    (
+                        str(reclaimed_job_id),
+                        str(reclaimed_shard_id),
+                        ShardStatus.QUEUED.value,
+                        *allowed_protocols,
+                        JobStatus.QUEUED.value,
+                        JobStatus.RUNNING.value,
+                        ControlIntent.NONE.value,
+                        _dump_time(current),
+                    ),
+                ).fetchone()
+                if row is None:
+                    continue
+                job_row = self._load_job_row(connection, reclaimed_job_id)
+                assert job_row is not None
+                candidate = self._claim_preclaim_candidate_in_transaction(
+                    connection,
+                    row=row,
+                    job_id=reclaimed_job_id,
+                    job_created_at=_load_time(str(job_row["created_at"])),
+                    job_row=job_row,
+                    worker=worker,
+                    shard_lease_seconds=shard_lease_seconds,
+                    lease=lease,
+                    now=current,
+                    source_stage_store=source_stage_store,
+                    source_wait_deadline=source_wait_deadline,
+                    publication_deadline=publication_deadline,
+                    v2_precondition=v2_precondition,
+                    prevalidated_v2=prevalidated_v2,
+                    use_fair_cursor=use_fair_cursor,
+                )
+                if isinstance(candidate, LabPreclaimRejection):
+                    rejections.append(candidate)
+                    continue
+                if candidate is not None:
+                    return selected(candidate)
             cursor_created_at: datetime | None = None
             cursor_job_id: UUID | None = None
             cursor_shard_index: int | None = None

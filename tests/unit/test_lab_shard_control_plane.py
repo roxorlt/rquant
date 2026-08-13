@@ -850,6 +850,22 @@ def test_expired_claim_reclaim_rejects_all_old_report_types(
     assert shard.claim_generation == 2
 
 
+def test_stale_reclaim_prioritizes_lowest_abandoned_shard_before_fresh_work(
+    tmp_path: Path,
+) -> None:
+    store, lease, _job_id = _setup(tmp_path, count=3)
+    first = _claim(store, lease, worker="worker-a", duration=5)
+    second = _claim(store, lease, worker="worker-b", now_offset=3, duration=5)
+
+    reclaimed = _claim(store, lease, worker="worker-c", now_offset=9, duration=30)
+
+    assert first.shard_index == 0
+    assert second.shard_index == 1
+    assert reclaimed.shard_id == first.shard_id
+    assert reclaimed.claim_generation == first.claim_generation + 1
+    assert reclaimed.claim_token != first.claim_token
+
+
 def test_scheduler_takeover_fences_old_report_and_reclaims_shard(tmp_path: Path) -> None:
     store, old_lease, job_id = _setup(tmp_path, scheduler_lease_seconds=10)
     old = _claim(store, old_lease, duration=5)

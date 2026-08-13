@@ -343,6 +343,7 @@ def test_worker_loss_does_not_block_live_or_page_checkpoint_resume(
         with_work_plan=True,
     )
     abandoned = _claim(store, lease, worker="worker-a", duration=5)
+    assert abandoned.shard_index == 0
     page = LabJobReader(store.path)
     assert page.get_job(job_id).status is JobStatus.RUNNING  # type: ignore[union-attr]
 
