@@ -50,6 +50,7 @@ markers = [
     "network: 需要联网的测试（默认跳过，用 -m network 显式跑）",
     "integration: 集成测试（跨模块，可能较慢）",
     "linux_exact: Linux immutable-runtime exact gate (excluded from the generic suite)",
+    "exact_timeout(seconds): executable wall-clock bound for a complete exact test protocol",
 ]
 addopts = "-v --strict-markers -m 'not network and not linux_exact'"
 

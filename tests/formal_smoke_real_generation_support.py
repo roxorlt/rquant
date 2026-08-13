@@ -4,11 +4,14 @@ import argparse
 import hashlib
 import importlib.metadata
 import io
+import json
 import os
+import signal
 import stat
 import subprocess
 import sys
 import sysconfig
+import tarfile
 import threading
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
@@ -17,6 +20,7 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path, PurePosixPath
 from xml.etree import ElementTree
 
+import pytest
 from pydantic import ConfigDict, Field
 
 from rquant.external_monotonic_root import (
@@ -33,7 +37,13 @@ from rquant.external_monotonic_root_service import (
 )
 from rquant.formal_runtime_composition import FormalRuntimeBootstrapConfiguration
 from rquant.formal_smoke_protocol import FormalSmokeExecutionReceipt, FormalSmokeStrategy
-from rquant.runtime_code_attestation import CodeTrustEvidence, RuntimeCodeBundleEntry
+from rquant.runtime_code_attestation import (
+    CodeTrustEvidence,
+    RuntimeCodeAttestation,
+    RuntimeCodeBundleEntry,
+    RuntimeCodeExecutionSpec,
+    RuntimeCodeFile,
+)
 from rquant.runtime_contracts import RuntimeContractModel, canonical_sha256
 from rquant.strict_json import (
     canonical_model_json_bytes,
@@ -49,6 +59,21 @@ _TRADE_DATE = date(2026, 7, 14)
 _AS_OF = datetime(2026, 7, 14, 9, tzinfo=UTC)
 _MAX_CLOSURE_BYTES = 512 * 1024 * 1024
 _EXACT_CASE_COUNT = 2
+_HASH_PATTERN = r"^[0-9a-f]{64}$"
+PRODUCT_IMPORT_ROOTS = ("release/runtime-site-packages", "release/src")
+_EXACT_TEST_NAMES = frozenset(
+    {
+        "test_checkout_b_executes_real_generation_a_and_publishes_bound_artifacts",
+        "test_real_generation_business_gate_rejects_unknown_audit_and_snapshot",
+    }
+)
+_PROVENANCE_MODULE_PATHS = {
+    "rquant": "release/src/rquant/__init__.py",
+    "rquant.cli": "release/src/rquant/cli.py",
+    "rquant.formal_smoke_runtime_entry": ("release/src/rquant/formal_smoke_runtime_entry.py"),
+    "rquant.formal_smoke_replay": "release/src/rquant/formal_smoke_replay.py",
+    "rquant.strategy_compare": "release/src/rquant/strategy_compare.py",
+}
 _RUNTIME_DISTRIBUTIONS = (
     "annotated-types",
     "duckdb",
@@ -95,14 +120,41 @@ class FormalSmokeInput(RuntimeContractModel):
     dataset_binding_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
+class RedactedArtifactDigests(RuntimeContractModel):
+    model_config = ConfigDict(
+        frozen=True,
+        extra="forbid",
+        serialize_by_alias=True,
+        validate_by_alias=True,
+        validate_by_name=False,
+    )
+
+    json_sha256: str = Field(alias="json", serialization_alias="json", pattern=_HASH_PATTERN)
+    markdown_sha256: str = Field(
+        alias="markdown",
+        serialization_alias="markdown",
+        pattern=_HASH_PATTERN,
+    )
+
+
 class RedactedExactFacts(RuntimeContractModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     python_version: str = Field(pattern=r"^[0-9]+\.[0-9]+\.[0-9]+$")
-    generation_id: str = Field(pattern=r"^[0-9a-f]{64}$")
-    content_root_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    receipt_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
-    artifact_digests: tuple[str, str]
+    generation_id: str = Field(pattern=_HASH_PATTERN)
+    content_root_sha256: str = Field(pattern=_HASH_PATTERN)
+    receipt_digest: str = Field(pattern=_HASH_PATTERN)
+    artifact_digests: RedactedArtifactDigests
+
+
+class ModuleProvenance(RuntimeContractModel):
+    name: str = Field(min_length=1)
+    relative_path: str = Field(min_length=1)
+    sha256: str = Field(pattern=_HASH_PATTERN)
+
+
+class GenerationProvenanceProbe(RuntimeContractModel):
+    modules: tuple[ModuleProvenance, ...]
 
 
 @dataclass(frozen=True)
@@ -123,6 +175,7 @@ class RealFormalSmokeGeneration:
     formal_data: SealedFormalSmokeData
     code_trust_evidence: CodeTrustEvidence
     import_roots: tuple[str, ...]
+    provenance_probe: GenerationProvenanceProbe
 
 
 @dataclass(frozen=True)
@@ -145,14 +198,71 @@ def _source_commit(source_root: Path) -> str:
     commit = head.stdout.strip().lower()
     if len(commit) != 40 or any(character not in "0123456789abcdef" for character in commit):
         raise RuntimeError("real generation source commit is invalid")
-    source_diff = subprocess.run(
-        ("git", "diff", "--quiet", "HEAD", "--", "src/rquant"),
+    _require_clean_rquant_source(source_root)
+    return commit
+
+
+def _run_git(source_root: Path, *arguments: str) -> bytes:
+    result = subprocess.run(
+        ("git", *arguments),
         cwd=source_root,
         check=False,
+        capture_output=True,
     )
-    if source_diff.returncode != 0:
-        raise RuntimeError("real generation rQuant source differs from its commit")
-    return commit
+    if result.returncode != 0:
+        raise RuntimeError("real generation HEAD source is unavailable")
+    return result.stdout
+
+
+def verified_head_rquant_sources(source_root: Path) -> dict[PurePosixPath, bytes]:
+    _require_clean_rquant_source(source_root)
+    archive = _run_git(
+        source_root,
+        "archive",
+        "--format=tar",
+        "HEAD",
+        "src/rquant",
+    )
+    prefix = PurePosixPath("src/rquant")
+    sources: dict[PurePosixPath, bytes] = {}
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as tree:
+        for member in tree.getmembers():
+            if member.isdir():
+                continue
+            if not member.isfile():
+                raise RuntimeError("real generation HEAD source is not a regular file")
+            tracked_path = PurePosixPath(member.name)
+            try:
+                relative = tracked_path.relative_to(prefix)
+            except ValueError as exc:
+                raise RuntimeError("real generation HEAD source path escapes rQuant") from exc
+            extracted = tree.extractfile(member)
+            if extracted is None:
+                raise RuntimeError("real generation HEAD source bytes are unavailable")
+            head_bytes = extracted.read()
+            source = source_root.joinpath(*tracked_path.parts)
+            observed = source.lstat()
+            if not stat.S_ISREG(observed.st_mode) or stat.S_ISLNK(observed.st_mode):
+                raise RuntimeError("real generation HEAD source is not a regular file")
+            if source.read_bytes() != head_bytes:
+                raise RuntimeError("real generation rQuant source differs from HEAD")
+            sources[relative] = head_bytes
+    if PurePosixPath("__init__.py") not in sources:
+        raise RuntimeError("real generation HEAD source has no rQuant package")
+    return sources
+
+
+def _require_clean_rquant_source(source_root: Path) -> None:
+    status = _run_git(
+        source_root,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+        "--",
+        "src/rquant",
+    )
+    if status:
+        raise RuntimeError("real generation rQuant source differs from HEAD")
 
 
 def _seed_formal_source(store: object) -> None:
@@ -331,25 +441,47 @@ def _add_entry(
     entries[entry.path] = entry
 
 
-def _source_entries(source_root: Path) -> tuple[RuntimeCodeBundleEntry, ...]:
-    package_root = source_root / "src" / "rquant"
+def _source_entries(
+    sources: Mapping[PurePosixPath, bytes],
+) -> tuple[RuntimeCodeBundleEntry, ...]:
     entries: dict[str, RuntimeCodeBundleEntry] = {}
-    for source in sorted(package_root.rglob("*")):
-        relative = source.relative_to(package_root)
-        if "__pycache__" in relative.parts or source.suffix == ".pyc":
-            continue
-        if source.is_symlink():
-            raise RuntimeError(f"real rQuant source contains a symlink: {relative.as_posix()}")
-        if not source.is_file() or relative == Path("__init__.py"):
+    for relative, content in sorted(sources.items(), key=lambda item: item[0].as_posix()):
+        if relative == PurePosixPath("__init__.py"):
             continue
         _add_entry(
             entries,
-            _regular_entry(
-                source=source,
-                target=PurePosixPath("release/src/rquant") / relative.as_posix(),
+            RuntimeCodeBundleEntry(
+                path=(PurePosixPath("release/src/rquant") / relative).as_posix(),
+                mode=0o444,
+                content=content,
             ),
         )
     return tuple(entries[path] for path in sorted(entries))
+
+
+def require_no_higher_priority_rquant_provider(
+    entries: tuple[RuntimeCodeBundleEntry, ...],
+    *,
+    import_roots: tuple[str, ...],
+) -> None:
+    if import_roots != PRODUCT_IMPORT_ROOTS:
+        raise RuntimeError("real generation import roots do not use product order")
+    source_index = import_roots.index("release/src")
+    for root_value in import_roots[:source_index]:
+        root = PurePosixPath(root_value)
+        for entry in entries:
+            path = PurePosixPath(entry.path)
+            try:
+                relative = path.relative_to(root)
+            except ValueError:
+                continue
+            first = relative.parts[0].casefold() if relative.parts else ""
+            if first == "rquant" or (
+                len(relative.parts) == 1 and relative.name.casefold() == "rquant.py"
+            ):
+                raise RuntimeError(
+                    f"real generation higher-priority rQuant provider is forbidden: {entry.path}"
+                )
 
 
 def _stdlib_entries() -> tuple[RuntimeCodeBundleEntry, ...]:
@@ -448,6 +580,83 @@ def _child_environment(root: Path, formal_data: SealedFormalSmokeData) -> dict[s
     return values
 
 
+_PROVENANCE_PROBE = "\n".join(
+    (
+        "import hashlib, importlib, json, os, sys",
+        "generation = os.path.realpath(sys.argv[1])",
+        "roots = json.loads(sys.argv[2])",
+        "names = json.loads(sys.argv[3])",
+        "sys.path[:0] = roots",
+        "modules = []",
+        "for name in names:",
+        "    module = importlib.import_module(name)",
+        "    path = os.path.realpath(module.__file__)",
+        "    with open(path, 'rb') as source:",
+        "        digest = hashlib.sha256(source.read()).hexdigest()",
+        "    modules.append({'name': name, 'relative_path': os.path.relpath(path, generation), "
+        "'sha256': digest})",
+        "sys.stdout.write(json.dumps({'modules': modules}, sort_keys=True, separators=(',', ':')))",
+    )
+)
+
+
+def probe_installed_generation_provenance(
+    *,
+    generation_root: Path,
+    execution_spec: RuntimeCodeExecutionSpec,
+    attested_files: tuple[RuntimeCodeFile, ...],
+    environment: Mapping[str, str],
+) -> GenerationProvenanceProbe:
+    if execution_spec.import_roots != PRODUCT_IMPORT_ROOTS:
+        raise RuntimeError("real generation provenance probe import roots are invalid")
+    if any(name.startswith(("GIT_", "PYTHON", "DYLD_", "LD_")) for name in environment):
+        raise RuntimeError("real generation provenance probe has a routing environment")
+    interpreter = generation_root.joinpath(*PurePosixPath(execution_spec.interpreter_path).parts)
+    absolute_roots = tuple(
+        os.fspath(generation_root.joinpath(*PurePosixPath(root).parts))
+        for root in execution_spec.import_roots
+    )
+    result = subprocess.run(
+        (
+            os.fspath(interpreter),
+            "-I",
+            "-B",
+            "-S",
+            "-c",
+            _PROVENANCE_PROBE,
+            os.fspath(generation_root),
+            json.dumps(absolute_roots, separators=(",", ":")),
+            json.dumps(tuple(_PROVENANCE_MODULE_PATHS), separators=(",", ":")),
+        ),
+        cwd=generation_root / "release",
+        env=dict(environment),
+        check=False,
+        capture_output=True,
+        timeout=30,
+    )
+    if result.returncode != 0 or result.stderr:
+        raise RuntimeError("real generation provenance probe failed")
+    probe = strict_model_validate_canonical_json(GenerationProvenanceProbe, result.stdout)
+    expected_names = tuple(_PROVENANCE_MODULE_PATHS)
+    if tuple(module.name for module in probe.modules) != expected_names:
+        raise RuntimeError("real generation provenance probe module set is invalid")
+    by_path = {file.path: file for file in attested_files}
+    source_root = PurePosixPath("release/src/rquant")
+    for module in probe.modules:
+        expected_path = _PROVENANCE_MODULE_PATHS[module.name]
+        path = PurePosixPath(module.relative_path)
+        if (
+            path.as_posix() != module.relative_path
+            or path != PurePosixPath(expected_path)
+            or not path.is_relative_to(source_root)
+        ):
+            raise RuntimeError("real generation provenance module escaped reviewed source")
+        descriptor = by_path.get(module.relative_path)
+        if descriptor is None or descriptor.sha256 != module.sha256:
+            raise RuntimeError("real generation provenance module is not attested")
+    return probe
+
+
 def build_real_formal_smoke_generation(
     root: Path,
     *,
@@ -472,18 +681,29 @@ def build_real_formal_smoke_generation(
     python_abi = sys.implementation.cache_tag
     if python_abi is None:
         raise RuntimeError("active Python ABI tag is unavailable")
-    import_roots = ("release/runtime-site-packages", "release/src")
+    source_files = verified_head_rquant_sources(source_root)
+    import_roots = PRODUCT_IMPORT_ROOTS
+    execution_spec = RuntimeCodeExecutionSpec(
+        launcher_path="release/bin/rquant",
+        working_directory="release",
+        import_roots=import_roots,
+        interpreter_path="release/bin/python",
+        interpreter_sha256=hashlib.sha256(interpreter.read_bytes()).hexdigest(),
+        python_abi=python_abi,
+        environment_allowlist=_CHILD_ENVIRONMENT_NAMES,
+    )
+    dependencies = (*_stdlib_entries(), *_distribution_entries(venv_root))
+    require_no_higher_priority_rquant_provider(dependencies, import_roots=import_roots)
     closure = (
-        *_source_entries(source_root),
-        *_stdlib_entries(),
-        *_distribution_entries(venv_root),
+        *_source_entries(source_files),
+        *dependencies,
     )
     closure_bytes = sum(len(entry.content) for entry in closure)
     if not 0 < closure_bytes <= _MAX_CLOSURE_BYTES:
         raise RuntimeError(f"real generation closure size is invalid: {closure_bytes}")
     package = build_test_package(
         root / "signed-package",
-        source=(source_root / "src" / "rquant" / "__init__.py").read_bytes(),
+        source=source_files[PurePosixPath("__init__.py")],
         source_path="release/src/rquant/__init__.py",
         provenance_commit=formal_data.code_commit,
         extra_entries=tuple(closure),
@@ -503,15 +723,29 @@ def build_real_formal_smoke_generation(
         promotion_sequence=package.receipt.promotion_sequence,
         provenance_commit=formal_data.code_commit,
     )
+    child_environment = _child_environment(root, formal_data)
+    attestation = strict_model_validate_canonical_json(
+        RuntimeCodeAttestation,
+        package.attestation_bytes,
+    )
+    if attestation.execution_spec != execution_spec:
+        raise RuntimeError("real generation signed execution spec changed")
+    provenance_probe = probe_installed_generation_provenance(
+        generation_root=generation_root,
+        execution_spec=attestation.execution_spec,
+        attested_files=attestation.files,
+        environment=child_environment,
+    )
     return RealFormalSmokeGeneration(
         package=package,
         trusted_base=trusted_base,
         runtime_root=runtime_root,
         generation_root=generation_root,
-        child_environment=_child_environment(root, formal_data),
+        child_environment=child_environment,
         formal_data=formal_data,
         code_trust_evidence=evidence,
         import_roots=import_roots,
+        provenance_probe=provenance_probe,
     )
 
 
@@ -738,6 +972,7 @@ def write_redacted_exact_facts_if_requested(
     path = Path(raw_path)
     if not path.is_absolute() or path.parent.resolve(strict=True) != path.parent:
         raise RuntimeError("real generation facts path is not canonical absolute")
+    artifact_digests = {artifact.kind: artifact.sha256 for artifact in receipt.artifacts}
     facts = RedactedExactFacts(
         python_version=(
             f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
@@ -745,7 +980,7 @@ def write_redacted_exact_facts_if_requested(
         generation_id=generation.code_trust_evidence.generation_id,
         content_root_sha256=generation.code_trust_evidence.content_root_sha256,
         receipt_digest=receipt_digest,
-        artifact_digests=tuple(sorted(artifact.sha256 for artifact in receipt.artifacts)),
+        artifact_digests=RedactedArtifactDigests.model_validate(artifact_digests),
     )
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
@@ -762,22 +997,104 @@ def write_redacted_exact_facts_if_requested(
 
 def verify_exact_junit(path: Path) -> None:
     root = ElementTree.parse(path).getroot()
+    if root.tag not in {"testsuite", "testsuites"}:
+        raise ValueError("real generation JUnit has no test suite")
     suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
     if not suites or any(suite.tag != "testsuite" for suite in suites):
         raise ValueError("real generation JUnit has no test suite")
+    if any(suite.findall(".//testsuite") for suite in suites):
+        raise ValueError("real generation JUnit contains nested suites")
     cases = [case for suite in suites for case in suite.findall("testcase")]
-    declared_tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
-    if declared_tests != _EXACT_CASE_COUNT or len(cases) != _EXACT_CASE_COUNT:
+    if len(root.findall(".//testcase")) != len(cases):
+        raise ValueError("real generation JUnit testcase nesting is invalid")
+
+    totals = {field: 0 for field in ("tests", "failures", "errors", "skipped", "deselected")}
+    for suite in suites:
+        suite_cases = suite.findall("testcase")
+        observed = {
+            "tests": len(suite_cases),
+            "failures": sum(bool(case.findall("failure")) for case in suite_cases),
+            "errors": sum(bool(case.findall("error")) for case in suite_cases),
+            "skipped": sum(bool(case.findall("skipped")) for case in suite_cases),
+            "deselected": 0,
+        }
+        for field, value in observed.items():
+            try:
+                declared = int(suite.attrib.get(field, "0"))
+            except ValueError as exc:
+                raise ValueError("real generation JUnit summary is invalid") from exc
+            if declared < 0 or declared != value:
+                raise ValueError(f"real generation JUnit {field} summary mismatch")
+            totals[field] += value
+
+    if root.tag == "testsuites":
+        for field, value in totals.items():
+            if field not in root.attrib:
+                continue
+            try:
+                declared = int(root.attrib[field])
+            except ValueError as exc:
+                raise ValueError("real generation JUnit root summary is invalid") from exc
+            if declared < 0 or declared != value:
+                raise ValueError(f"real generation JUnit root {field} summary mismatch")
+
+    if totals["tests"] != _EXACT_CASE_COUNT or len(cases) != _EXACT_CASE_COUNT:
         raise ValueError("real generation JUnit must contain exactly 2 cases")
-    for field in ("failures", "errors"):
-        if sum(int(suite.attrib.get(field, "0")) for suite in suites):
-            raise ValueError(f"real generation JUnit contains {field}")
-    if sum(int(suite.attrib.get("skipped", "0")) for suite in suites) or any(
-        case.findall("skipped") for case in cases
+    for outcome, field in (
+        ("failure", "failures"),
+        ("error", "errors"),
+        ("skipped", "skipped"),
     ):
-        raise ValueError("real generation JUnit contains a skipped case")
-    if any(int(suite.attrib.get("deselected", "0")) for suite in suites):
-        raise ValueError("real generation JUnit contains deselected cases")
+        if totals[field]:
+            raise ValueError(f"real generation JUnit contains {outcome}")
+    if totals["deselected"]:
+        raise ValueError("real generation JUnit contains deselected")
+    names = tuple(case.attrib.get("name", "") for case in cases)
+    if len(set(names)) != _EXACT_CASE_COUNT or frozenset(names) != _EXACT_TEST_NAMES:
+        raise ValueError("real generation JUnit testcase set is invalid")
+
+
+class ExactNodeTimeoutError(TimeoutError):
+    pass
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers",
+        "exact_timeout(seconds): fail a complete exact test protocol after a wall-clock bound",
+    )
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_protocol(
+    item: pytest.Item,
+    nextitem: pytest.Item | None,
+) -> Iterator[None]:
+    del nextitem
+    marker = item.get_closest_marker("exact_timeout")
+    if marker is None:
+        yield
+        return
+    if threading.current_thread() is not threading.main_thread():
+        raise RuntimeError("exact node timeout requires the main thread")
+    seconds = float(marker.args[0]) if marker.args else 0.0
+    if not 0 < seconds <= 180:
+        raise RuntimeError("exact node timeout must be in (0, 180]")
+    previous_timer = signal.getitimer(signal.ITIMER_REAL)
+    if previous_timer != (0.0, 0.0):
+        raise RuntimeError("exact node timeout cannot replace an active timer")
+    previous_handler = signal.getsignal(signal.SIGALRM)
+
+    def expire(_signum: int, _frame: object) -> None:
+        raise ExactNodeTimeoutError(f"exact node exceeded {seconds:g} seconds")
+
+    signal.signal(signal.SIGALRM, expire)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
 
 
 def verify_ci_evidence(

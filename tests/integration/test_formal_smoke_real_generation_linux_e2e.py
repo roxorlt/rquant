@@ -53,6 +53,7 @@ def _assert_no_output_residue(output: Path) -> None:
     assert not list(output.glob("strategy_lab_runs/*"))
 
 
+@pytest.mark.exact_timeout(180)
 def test_checkout_b_executes_real_generation_a_and_publishes_bound_artifacts(
     real_generation: RealFormalSmokeGeneration,
     tmp_path: Path,
@@ -84,7 +85,21 @@ def test_checkout_b_executes_real_generation_a_and_publishes_bound_artifacts(
     assert evidence.generation_id == generation.package.receipt.generation_id
     assert evidence.content_root_sha256 == generation.package.receipt.content_root_sha256
     assert receipt.execution_identity.generation_root == generation.generation_root
-    assert receipt.execution_identity.import_roots == generation.import_roots
+    assert receipt.execution_identity.import_roots == (
+        "release/runtime-site-packages",
+        "release/src",
+    )
+    assert generation.import_roots == receipt.execution_identity.import_roots
+    probe_paths = {
+        module.name: module.relative_path for module in generation.provenance_probe.modules
+    }
+    assert probe_paths == {
+        "rquant": "release/src/rquant/__init__.py",
+        "rquant.cli": "release/src/rquant/cli.py",
+        "rquant.formal_smoke_runtime_entry": ("release/src/rquant/formal_smoke_runtime_entry.py"),
+        "rquant.formal_smoke_replay": "release/src/rquant/formal_smoke_replay.py",
+        "rquant.strategy_compare": "release/src/rquant/strategy_compare.py",
+    }
     attested_paths = {item.path for item in receipt.execution_identity.code_files}
     assert {
         "release/src/rquant/cli.py",
@@ -119,6 +134,7 @@ def test_checkout_b_executes_real_generation_a_and_publishes_bound_artifacts(
     )
 
 
+@pytest.mark.exact_timeout(180)
 def test_real_generation_business_gate_rejects_unknown_audit_and_snapshot(
     real_generation: RealFormalSmokeGeneration,
     tmp_path: Path,
