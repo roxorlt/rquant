@@ -59,3 +59,70 @@ jobs:
 
       - name: Full test suite
         run: uv run pytest -q
+
+  runtime-fd-exec-linux:
+    name: Linux FD-exec exact (${{ matrix.python-version }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    env:
+      RQUANT_DISABLE_DOTENV: "1"
+      TUSHARE_TOKEN_MAIN: "00000000000000000000000000000000"
+      DATA_DIR: ${{ github.workspace }}/.ci/data
+      DUCKDB_PATH: ${{ github.workspace }}/.ci/data/test.duckdb
+      DUCKDB_READONLY_PATH: ${{ github.workspace }}/.ci/data/test_ro.duckdb
+      PARQUET_DIR: ${{ github.workspace }}/.ci/data/parquet
+      LOG_DIR: ${{ github.workspace }}/.ci/logs
+      NOTIFY_ENABLED: "false"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install uv
+        run: python -m pip install uv==0.10.11
+
+      - name: Install locked dependencies
+        run: uv sync --frozen
+
+      - name: Run exact Linux FD-exec node with no skips
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p test-results
+          uv run pytest -o addopts='' -rA \
+            --junitxml="test-results/fd-exec-py${{ matrix.python-version }}.xml" \
+            tests/integration/test_runtime_code_bootstrap.py::test_linux_default_executor_executes_verified_descriptor_after_path_swap
+          python - "test-results/fd-exec-py${{ matrix.python-version }}.xml" <<'PY'
+          from pathlib import Path
+          import sys
+          from xml.etree import ElementTree
+
+          report = Path(sys.argv[1])
+          root = ElementTree.parse(report).getroot()
+          suites = [root] if root.tag == "testsuite" else list(root)
+          assert len(suites) == 1, (root.tag, len(suites))
+          suite = suites[0]
+          assert suite.tag == "testsuite", suite.tag
+          assert int(suite.attrib.get("tests", "0")) == 1, suite.attrib
+          assert int(suite.attrib.get("failures", "0")) == 0, suite.attrib
+          assert int(suite.attrib.get("errors", "0")) == 0, suite.attrib
+          assert int(suite.attrib.get("skipped", "0")) == 0, suite.attrib
+          cases = suite.findall("testcase")
+          assert len(cases) == 1, len(cases)
+          assert not cases[0].findall("skipped"), "exact node was skipped"
+          PY
+
+      - name: Upload FD-exec JUnit evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fd-exec-junit-py${{ matrix.python-version }}
+          path: test-results/
+          if-no-files-found: error

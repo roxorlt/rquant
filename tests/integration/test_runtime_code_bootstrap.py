@@ -9,12 +9,6 @@ from pathlib import Path
 
 import pytest
 
-from tests.runtime_code_e2e_support import (
-    build_test_package,
-    install_test_package,
-    open_test_capability,
-)
-
 
 def test_p0_07_post_verify_replacement_fails_before_target_process(
     tmp_path: Path,
@@ -25,6 +19,11 @@ def test_p0_07_post_verify_replacement_fails_before_target_process(
         FormalRuntimeError,
         bind_formal_runtime,
         exec_formal_runtime,
+    )
+    from tests.runtime_code_e2e_support import (
+        build_test_package,
+        install_test_package,
+        open_test_capability,
     )
 
     monkeypatch.setattr(os, "chdir", lambda _path: None)
@@ -89,6 +88,11 @@ def test_verified_interpreter_fd_cannot_be_hijacked_by_a_final_path_swap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from rquant.formal_runtime import bind_formal_runtime, exec_formal_runtime
+    from tests.runtime_code_e2e_support import (
+        build_test_package,
+        install_test_package,
+        open_test_capability,
+    )
 
     package = build_test_package(tmp_path / "package")
     trusted_base, runtime_root, _installer = install_test_package(tmp_path, package)
@@ -138,6 +142,11 @@ def test_verified_interpreter_fd_is_closed_when_executor_raises(
 ) -> None:
     from rquant.formal_runtime import bind_formal_runtime, exec_formal_runtime
     from rquant.runtime_code_generation import RuntimeCodeGenerationError
+    from tests.runtime_code_e2e_support import (
+        build_test_package,
+        install_test_package,
+        open_test_capability,
+    )
 
     package = build_test_package(tmp_path / "package")
     trusted_base, runtime_root, _installer = install_test_package(tmp_path, package)
@@ -171,6 +180,7 @@ def test_verified_interpreter_fd_is_closed_when_executor_raises(
 def test_default_executor_uses_execve_descriptor_when_supported(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from rquant import fd_exec
     from rquant.formal_runtime import _exec_verified_descriptor
 
     calls: list[tuple[int, tuple[str, ...], dict[str, str]]] = []
@@ -178,8 +188,8 @@ def test_default_executor_uses_execve_descriptor_when_supported(
     def capture(descriptor: int, argv: tuple[str, ...], environment: dict[str, str]) -> None:
         calls.append((descriptor, argv, environment))
 
-    monkeypatch.setattr(os, "execve", capture)
-    monkeypatch.setattr(os, "supports_fd", frozenset({capture}))
+    monkeypatch.setattr(fd_exec.os, "execve", capture)
+    monkeypatch.setattr(fd_exec.os, "supports_fd", frozenset({capture}))
     _exec_verified_descriptor(17, ("python", "-I", "-S", "launcher"), {"SAFE": "1"})
     assert calls == [(17, ("python", "-I", "-S", "launcher"), {"SAFE": "1"})]
 
@@ -202,7 +212,7 @@ def test_default_executor_fails_closed_without_fd_exec_support() -> None:
 def test_linux_default_executor_executes_verified_descriptor_after_path_swap(
     tmp_path: Path,
 ) -> None:
-    from rquant.formal_runtime import _exec_verified_descriptor
+    from rquant.fd_exec import exec_verified_descriptor
 
     assert os.execve in os.supports_fd
     candidate = tmp_path / "verified-sh"
@@ -223,7 +233,7 @@ def test_linux_default_executor_executes_verified_descriptor_after_path_swap(
             os.close(read_fd)
             os.dup2(write_fd, 1)
             os.close(write_fd)
-            _exec_verified_descriptor(
+            exec_verified_descriptor(
                 descriptor,
                 (str(candidate), "-c", "printf 'VERIFIED-FD\\n'; exit 23"),
                 {"PATH": "/usr/bin:/bin"},
@@ -252,6 +262,11 @@ def test_formal_runtime_does_not_wrap_unexpected_liveness_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from rquant.formal_runtime import bind_formal_runtime
+    from tests.runtime_code_e2e_support import (
+        build_test_package,
+        install_test_package,
+        open_test_capability,
+    )
 
     package = build_test_package(tmp_path / "package")
     trusted_base, runtime_root, _installer = install_test_package(tmp_path, package)
@@ -284,6 +299,11 @@ def test_p0_10_inherited_python_user_site_loader_and_import_roots_are_rejected(
         FormalRuntimeError,
         bind_formal_runtime,
         exec_formal_runtime,
+    )
+    from tests.runtime_code_e2e_support import (
+        build_test_package,
+        install_test_package,
+        open_test_capability,
     )
 
     external = tmp_path / "external"
@@ -344,6 +364,11 @@ def test_p0_12_target_import_and_subprocess_are_after_all_trust_checks(
     from rquant.lab_daemon import require_lab_runtime_binding
     from rquant.lab_finalizer import LabFinalizer
     from rquant.research_manifest import ResearchManifest, require_formal_research_manifest
+    from tests.runtime_code_e2e_support import (
+        build_test_package,
+        install_test_package,
+        open_test_capability,
+    )
 
     package = build_test_package(tmp_path / "package")
     trusted_base, runtime_root, _installer = install_test_package(tmp_path, package)
@@ -430,7 +455,11 @@ def test_missing_invalid_or_tampered_evidence_blocks_before_target_execution(
         RuntimeCodeGenerationError,
         open_attested_runtime_generation,
     )
-    from tests.runtime_code_e2e_support import NOW
+    from tests.runtime_code_e2e_support import (
+        NOW,
+        build_test_package,
+        install_test_package,
+    )
 
     package = build_test_package(tmp_path / "package")
     trusted_base, runtime_root, _installer = install_test_package(tmp_path, package)

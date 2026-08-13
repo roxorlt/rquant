@@ -15,6 +15,7 @@ from rquant.authority_path_security import (
     SecureRegularFileLease,
     open_secure_regular_file_lease,
 )
+from rquant.fd_exec import DescriptorExecutionError, exec_verified_descriptor
 from rquant.runtime_code_attestation import CodeTrustEvidence
 from rquant.runtime_code_generation import (
     RuntimeCodeGenerationCapability,
@@ -232,10 +233,10 @@ def _exec_verified_descriptor(
     argv: tuple[str, ...],
     environment: Mapping[str, str],
 ) -> object:
-    execve = os.execve
-    if execve not in os.supports_fd:
-        raise FormalRuntimeError("formal descriptor execution is unavailable on this platform")
-    return execve(descriptor, argv, dict(environment))
+    try:
+        return exec_verified_descriptor(descriptor, argv, environment)
+    except DescriptorExecutionError as exc:
+        raise FormalRuntimeError(str(exc)) from exc
 
 
 def exec_formal_runtime(
