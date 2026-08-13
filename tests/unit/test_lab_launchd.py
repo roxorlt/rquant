@@ -126,7 +126,7 @@ def test_lab_launchd_templates_do_not_bind_mutable_checkout_runtime() -> None:
 )
 def test_real_worktree_launcher_rejects_symlinked_venv_before_config() -> None:
     environment = os.environ.copy()
-    environment["PYTHONPATH"] = str(ROOT / "src")
+    environment.pop("PYTHONPATH", None)
     environment["DATA_DIR"] = "relative-data-must-not-be-read"
 
     result = subprocess.run(

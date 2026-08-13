@@ -2679,6 +2679,9 @@ def _test_shard_manifest(
                 }
             ),
         }
+        artifact_profile = getattr(registry, "artifact_profile", None)
+        if artifact_profile == "nshape_projection":
+            adapter["artifact_profile"] = artifact_profile
     else:
         adapter = {"kind": "unregistered", "message": "adapter is not spawn-serializable"}
     session: dict[str, object] = {"kind": "default"}

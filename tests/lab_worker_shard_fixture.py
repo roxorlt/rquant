@@ -5,6 +5,7 @@ import os
 import signal
 import threading
 import time
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pandas as pd
@@ -160,7 +161,58 @@ def execute_lab_shard_fixture(
                 ),
             ),
         )
-    elif kind in {"sigterm-tree", "term-exit-tree", "successful-tree"}:
+    if adapter.get("artifact_profile") == "nshape_projection":
+        return LabShardExecutionResult.from_validated(
+            validated,
+            tables=(
+                LabShardTable(
+                    name="summary",
+                    frame=pd.DataFrame(
+                        [
+                            {
+                                "entry_mode": "first_break",
+                                "profile_variant": "baseline",
+                                "candidates": 1,
+                                "trades": 1,
+                                "trigger_rate_pct": 100.0,
+                                "mean_ret_pct": 2.0,
+                                "median_ret_pct": 2.0,
+                                "win_rate_pct": 100.0,
+                                "best_ret_pct": 2.0,
+                                "worst_ret_pct": 2.0,
+                                "gap_stop_rate_pct": 0.0,
+                            }
+                        ]
+                    ),
+                ),
+                LabShardTable(
+                    name="trades",
+                    frame=pd.DataFrame(
+                        [
+                            {
+                                "entry_mode": "first_break",
+                                "profile_variant": "baseline",
+                                "signal_date": date(2026, 6, 30),
+                                "ts_code": "600000.SH",
+                                "name": "PF Bank",
+                                "entry_time": datetime(2026, 6, 30, 1, 31, tzinfo=UTC),
+                                "entry_price_raw": 10.0,
+                                "entry_price": 10.0,
+                                "stop_loss_basis": 9.5,
+                                "take_profit_basis": 11.0,
+                                "volume_profile_lookbacks": "90",
+                                "volume_profile_rr": 2.0,
+                                "exit_time": datetime(2026, 6, 30, 7, 0, tzinfo=UTC),
+                                "exit_price": 10.2,
+                                "exit_reason": "close",
+                                "ret_pct": 2.0,
+                            }
+                        ]
+                    ),
+                ),
+            ),
+        )
+    if kind in {"sigterm-tree", "term-exit-tree", "successful-tree"}:
         if kind == "sigterm-tree":
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
         elif kind == "term-exit-tree":

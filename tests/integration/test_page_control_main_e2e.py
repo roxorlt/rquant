@@ -165,6 +165,18 @@ def _install_profile(
     )
 
 
+def _dummy_settings_environment(runtime_root: Path) -> dict[str, str]:
+    settings_root = runtime_root / "dummy-settings"
+    return {
+        "RQUANT_DISABLE_DOTENV": "1",
+        "TUSHARE_TOKEN_MAIN": "x" * 32,
+        "DATA_DIR": str(settings_root / "data"),
+        "DUCKDB_PATH": str(settings_root / "data" / "rquant.duckdb"),
+        "PARQUET_DIR": str(settings_root / "parquet"),
+        "LOG_DIR": str(settings_root / "logs"),
+    }
+
+
 def _start_main(runtime_root: Path) -> subprocess.Popen[bytes]:
     source_root = Path(__file__).resolve().parents[2] / "src"
     code = (
@@ -176,6 +188,7 @@ def _start_main(runtime_root: Path) -> subprocess.Popen[bytes]:
         (sys.executable, "-c", code, str(runtime_root), COMMIT),
         cwd=Path(__file__).resolve().parents[2],
         env={
+            **_dummy_settings_environment(runtime_root),
             "LANG": "C",
             "PATH": "/usr/bin:/bin",
             "PYTHONPATH": str(source_root),

@@ -1337,6 +1337,9 @@ def test_release_generation_blocking_probes_preserve_shared_absolute_deadline(
     repo, _lock_path, commit, python = _generation(tmp_path)
     destination = tmp_path / "release-code"
     original_run = module.run_contained
+    expected_version, expected_abi = module._python_facts(python)
+    expected_cache_tag, separator, expected_soabi = expected_abi.partition(":")
+    assert separator
     observed_deadlines: list[float] = []
     requested_caps: list[float] = []
     absolute_deadline = time.monotonic() + 2
@@ -1352,7 +1355,14 @@ def test_release_generation_blocking_probes_preserve_shared_absolute_deadline(
             return subprocess.CompletedProcess(
                 command,
                 0,
-                '{"cache_tag":"cpython-312","soabi":"cpython-312-darwin","version":"3.12.13"}\n',
+                json.dumps(
+                    {
+                        "cache_tag": expected_cache_tag,
+                        "soabi": expected_soabi,
+                        "version": expected_version,
+                    }
+                )
+                + "\n",
                 "",
             )
         return original_run(*args, **kwargs)
@@ -1380,8 +1390,7 @@ def test_release_generation_blocking_probes_preserve_shared_absolute_deadline(
     )
     version, abi = module._python_facts(python, timeout_provider=inherited_deadline)
 
-    assert version.startswith(f"{sys.version_info.major}.{sys.version_info.minor}.")
-    assert abi != ":"
+    assert (version, abi) == (expected_version, expected_abi)
     assert len(observed_deadlines) == len(requested_caps) == 6
     assert observed_deadlines == [absolute_deadline] * 6
 

@@ -5,7 +5,6 @@ from decimal import Decimal
 from pathlib import Path
 from uuid import UUID
 
-import pandas as pd
 import pytest
 
 from rquant.artifact_retention import ArtifactReferenceStore
@@ -73,8 +72,6 @@ from rquant.research_run_spec import (
 from rquant.runtime_contracts import canonical_sha256
 from rquant.strategy_evaluators import BuiltinStrategyEvaluatorRegistry
 from rquant.strategy_job_adapters import (
-    LabShardExecutionResult,
-    LabShardTable,
     NShapeCompareParameters,
     build_adapter_execution_contract,
     default_strategy_job_adapter_registry,
@@ -90,6 +87,7 @@ from tests.unit.test_lab_worker import (
     MetadataStoreFactory,
     RecordingRegistry,
     RecordingResearchStoreOpener,
+    _MetadataStore,
     _worker,
 )
 
@@ -97,58 +95,7 @@ CODE_SHA = "1" * 40
 
 
 class _ProjectionRecordingRegistry(RecordingRegistry):
-    def execute_shard(self, validated, store):  # type: ignore[no-untyped-def]
-        del store
-        return LabShardExecutionResult.from_validated(
-            validated,
-            tables=(
-                LabShardTable(
-                    name="summary",
-                    frame=pd.DataFrame(
-                        [
-                            {
-                                "entry_mode": "first_break",
-                                "profile_variant": "baseline",
-                                "candidates": 1,
-                                "trades": 1,
-                                "trigger_rate_pct": 100.0,
-                                "mean_ret_pct": 2.0,
-                                "median_ret_pct": 2.0,
-                                "win_rate_pct": 100.0,
-                                "best_ret_pct": 2.0,
-                                "worst_ret_pct": 2.0,
-                                "gap_stop_rate_pct": 0.0,
-                            }
-                        ]
-                    ),
-                ),
-                LabShardTable(
-                    name="trades",
-                    frame=pd.DataFrame(
-                        [
-                            {
-                                "entry_mode": "first_break",
-                                "profile_variant": "baseline",
-                                "signal_date": date(2026, 6, 30),
-                                "ts_code": "600000.SH",
-                                "name": "PF Bank",
-                                "entry_time": datetime(2026, 6, 30, 1, 31, tzinfo=UTC),
-                                "entry_price_raw": 10.0,
-                                "entry_price": 10.0,
-                                "stop_loss_basis": 9.5,
-                                "take_profit_basis": 11.0,
-                                "volume_profile_lookbacks": "90",
-                                "volume_profile_rr": 2.0,
-                                "exit_time": datetime(2026, 6, 30, 7, 0, tzinfo=UTC),
-                                "exit_price": 10.2,
-                                "exit_reason": "close",
-                                "ret_pct": 2.0,
-                            }
-                        ]
-                    ),
-                ),
-            ),
-        )
+    artifact_profile = "nshape_projection"
 
 
 @pytest.mark.parametrize("auto_release", [False, True], ids=["crash-recovery", "auto-compose"])
@@ -422,13 +369,14 @@ def test_real_job_completion_is_discovered_with_exact_experiment_ownership(
     scheduler.run_once()
     claim = claims.pending()[0].claim
     research_store_opener = RecordingResearchStoreOpener()
+    formal_store = _MetadataStore(snapshot)
     worker = _worker(
         tmp_path,
         registry=_ProjectionRecordingRegistry(),
         claims=claims,
         reports=reports,
         exploratory_store_factory=None,
-        metadata_store_factory=MetadataStoreFactory(object()),
+        metadata_store_factory=MetadataStoreFactory(formal_store),
         lake_root=tmp_path / "research-lake",
         research_store_opener=research_store_opener,
         verified_code_sha_provider=lambda: CODE_SHA,

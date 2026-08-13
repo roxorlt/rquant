@@ -20,6 +20,17 @@ SCRIPT = ROOT / "scripts" / "preflight-lab-runtime.py"
 TRUSTED_GIT = Path("/usr/bin/git")
 RELEASE_AUTHORITY = ROOT / "src" / "rquant" / "release_generation.py"
 _ORIGINAL_OS_WALK = os.walk
+_SETTINGS_ENVIRONMENT_KEYS = frozenset(
+    {"TUSHARE_TOKEN_MAIN", "DATA_DIR", "DUCKDB_PATH", "PARQUET_DIR", "LOG_DIR"}
+)
+
+
+def _clear_settings_environment(monkeypatch: pytest.MonkeyPatch, *keys: str) -> None:
+    selected = _SETTINGS_ENVIRONMENT_KEYS if not keys else frozenset(keys)
+    casefolded = {key.casefold() for key in selected}
+    for key in tuple(os.environ):
+        if key.casefold() in casefolded:
+            monkeypatch.delenv(key, raising=False)
 
 
 @pytest.fixture(autouse=True)
@@ -517,8 +528,7 @@ def test_stdlib_dotenv_lab_paths_match_settings_supported_subset(
     )
     dotenv.chmod(0o600)
     namespace = runpy.run_path(str(SCRIPT))
-    monkeypatch.delenv("DATA_DIR", raising=False)
-    monkeypatch.delenv("data_dir", raising=False)
+    _clear_settings_environment(monkeypatch, "DATA_DIR")
 
     values = namespace["_dotenv_values"](dotenv)
     preflight_path = namespace["_configured_path"](
@@ -554,9 +564,7 @@ def test_stdlib_preflight_requires_nonempty_data_dir_like_settings(
         lines.append(data_assignment)
     dotenv.write_text("\n".join(lines) + "\n", encoding="utf-8")
     dotenv.chmod(0o600)
-    for key in tuple(os.environ):
-        if key.casefold() == "data_dir":
-            monkeypatch.delenv(key, raising=False)
+    _clear_settings_environment(monkeypatch, "DATA_DIR")
     namespace = runpy.run_path(str(SCRIPT))
 
     with pytest.raises(ValidationError):
@@ -652,9 +660,7 @@ def test_stdlib_preflight_optional_lab_path_defaults_match_settings(
         encoding="utf-8",
     )
     dotenv.chmod(0o600)
-    for environment_key in tuple(os.environ):
-        if environment_key.casefold() in {"data_dir", key.casefold()}:
-            monkeypatch.delenv(environment_key, raising=False)
+    _clear_settings_environment(monkeypatch, "DATA_DIR", key)
     namespace = runpy.run_path(str(SCRIPT))
     values = namespace["_dotenv_values"](dotenv)
     configured = Settings(_env_file=dotenv)
@@ -695,6 +701,7 @@ def test_stdlib_dotenv_rejects_unsupported_lab_path_syntax(
 @pytest.mark.parametrize("keyword", ("EXPORT", "Export", "eXport"))
 def test_stdlib_dotenv_rejects_ambiguous_nonlowercase_export_like_python_dotenv(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     keyword: str,
 ) -> None:
     checkout = tmp_path / "checkout"
@@ -717,6 +724,7 @@ def test_stdlib_dotenv_rejects_ambiguous_nonlowercase_export_like_python_dotenv(
         encoding="utf-8",
     )
     dotenv.chmod(0o600)
+    _clear_settings_environment(monkeypatch)
     configured = Settings(_env_file=dotenv)
     namespace = runpy.run_path(str(SCRIPT))
 

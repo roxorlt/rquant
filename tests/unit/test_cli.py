@@ -6214,8 +6214,15 @@ def test_lab_claim_finalizer_command_runs_real_authority_finalizer_once(
     from tempfile import mkdtemp
     from threading import Event, Thread
 
-    from rquant import cli as cli_module
-    from rquant import config, lab_daemon, source_broker_v2_authority
+    from rquant import (
+        cli as cli_module,
+    )
+    from rquant import (
+        config,
+        lab_claim_finalizer_runtime,
+        lab_daemon,
+        source_broker_v2_authority,
+    )
     from rquant.current_claim_authority import ExternalCurrentClaimRootConfig
     from rquant.external_monotonic_root import UnixSocketExternalMonotonicRootManifest
     from rquant.external_monotonic_root_service import (
@@ -6447,7 +6454,8 @@ def test_lab_claim_finalizer_command_runs_real_authority_finalizer_once(
             "lab_claim_publication_worker_verifier_path": None,
             "lab_highwater_trusted_keyring_path": None,
             "lab_claim_finalizer_enabled": True,
-            "lab_claim_finalizer_runtime_material_path": material_path,
+            "lab_claim_finalizer_runtime_material_root": private_root,
+            "lab_claim_finalizer_runtime_material_path": None,
             "lab_claim_finalizer_owner_id": "finalizer-replay",
             "lab_claim_finalizer_lease_seconds": 60,
             "lab_claim_finalizer_poll_interval_ms": 10,
@@ -6471,6 +6479,11 @@ def test_lab_claim_finalizer_command_runs_real_authority_finalizer_once(
             pass
 
     monkeypatch.setattr(config, "settings", test_settings)
+    monkeypatch.setattr(
+        lab_claim_finalizer_runtime,
+        "load_current_lab_claim_finalizer_generation",
+        lambda *_args, **_kwargs: SimpleNamespace(runtime_material_path=material_path),
+    )
     monkeypatch.setattr(lab_daemon, "LabDaemonLock", FakeLock)
     monkeypatch.setattr(
         lab_daemon,
@@ -6554,6 +6567,7 @@ def test_lab_claim_finalizer_command_runs_real_authority_finalizer_once(
 
 def test_claim_finalizer_production_composition_rejects_missing_private_and_certificate(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from rquant.lab_claim_finalizer_composition import (
         compose_production_lab_claim_finalizer_daemon,
@@ -6563,7 +6577,17 @@ def test_claim_finalizer_production_composition_rejects_missing_private_and_cert
     material = tmp_path / "claim-finalizer-private.json"
     material.write_bytes(b"{}")
     material.chmod(0o600)
-    settings = SimpleNamespace(lab_claim_finalizer_runtime_material_path=material)
+    runtime_material_root = tmp_path / "runtime-material"
+    runtime_material_root.mkdir(mode=0o700)
+    monkeypatch.setattr(
+        "rquant.lab_claim_finalizer_runtime.load_current_lab_claim_finalizer_generation",
+        lambda *_args, **_kwargs: SimpleNamespace(runtime_material_path=material),
+    )
+    settings = SimpleNamespace(
+        lab_claim_finalizer_runtime_material_path=material,
+        lab_claim_finalizer_runtime_material_root=runtime_material_root,
+        lab_claim_finalizer_runtime_trusted_base=tmp_path,
+    )
 
     with pytest.raises(LabDaemonConfigurationError, match="runtime material is invalid"):
         compose_production_lab_claim_finalizer_daemon(settings=settings)
