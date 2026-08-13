@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pandas as pd
 import pytest
 
 import rquant.panorama_data as panorama_data
+from rquant.dashboard.serving_only_page_data import ServingFrameResult, ServingFrameState
 from rquant.panorama_data import (
     load_historical_intraday_trend,
     load_pulse_alerts,
@@ -212,6 +213,7 @@ def test_missing_serving_pulse_projections_are_explicit_without_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     generation_id = "b" * 64
+    generated_at = datetime(2026, 7, 29, 1, 30, tzinfo=UTC)
 
     class _Connection:
         def execute(self, sql: str, _parameters: object) -> object:
@@ -220,12 +222,18 @@ def test_missing_serving_pulse_projections_are_explicit_without_fallback(
     class _Store:
         _conn = _Connection()
         generation_id = "b" * 64
+        evidence = ServingFrameResult(
+            state=ServingFrameState.UNAVAILABLE,
+            detail="serving projection not published",
+            generation_id=generation_id,
+            generated_at=generated_at,
+        )
 
         def close(self) -> None:
             return None
 
-        def serving_health(self) -> None:
-            return None
+        def serving_health(self) -> ServingFrameResult:
+            return self.evidence
 
     def fallback_called(*_args: object, **_kwargs: object) -> object:
         raise AssertionError("operational or source fallback must not be called")
@@ -245,6 +253,11 @@ def test_missing_serving_pulse_projections_are_explicit_without_fallback(
         alerts.attrs["serving_generation_id"],
         runtime.generation_id,
     } == {generation_id}
+    assert {
+        history.attrs["serving_generated_at"],
+        alerts.attrs["serving_generated_at"],
+        runtime.generated_at,
+    } == {generated_at}
 
 
 class TestSurgeMarks:

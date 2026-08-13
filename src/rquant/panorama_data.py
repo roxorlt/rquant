@@ -186,11 +186,18 @@ def _serving_unavailable(
     store: _ReadableStore | None = None,
 ) -> pd.DataFrame:
     frame = pd.DataFrame(columns=columns)
-    frame.attrs["serving_state"] = "unavailable"
-    frame.attrs["serving_detail"] = f"{type(error).__name__}: {error}"
-    generation_id = None if store is None else getattr(store, "generation_id", None)
-    if generation_id is not None:
-        frame.attrs["serving_generation_id"] = generation_id
+    evidence = None if store is None else store.serving_health()
+    if evidence is None:
+        frame.attrs["serving_state"] = "unavailable"
+        frame.attrs["serving_detail"] = f"{type(error).__name__}: {error}"
+        generation_id = None if store is None else getattr(store, "generation_id", None)
+        if generation_id is not None:
+            frame.attrs["serving_generation_id"] = generation_id
+    else:
+        frame.attrs["serving_state"] = evidence.state.value
+        frame.attrs["serving_detail"] = evidence.detail
+        frame.attrs["serving_generation_id"] = evidence.generation_id
+        frame.attrs["serving_generated_at"] = evidence.generated_at
     return frame
 
 

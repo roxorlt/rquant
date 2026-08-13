@@ -18,7 +18,14 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 import duckdb
-from pydantic import Field, StringConstraints, field_serializer, field_validator, model_validator
+from pydantic import (
+    ConfigDict,
+    Field,
+    StringConstraints,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
 from rquant.canvas_publication_receipt import (
     CanvasPublicationCatalogRecord,
@@ -1743,6 +1750,8 @@ class CanvasDefinitionProjectionRow(RuntimeContractModel):
 
 
 class PulseHistoryProjectionRow(RuntimeContractModel):
+    model_config = ConfigDict(strict=True)
+
     trade_date: date
     as_of: AwareUtcDatetime
     t: str = Field(pattern=r"^(?:[01][0-9]|2[0-3]):[0-5][0-9]$")
@@ -1756,6 +1765,8 @@ class PulseHistoryProjectionRow(RuntimeContractModel):
 
 
 class PulseAlertProjectionRow(RuntimeContractModel):
+    model_config = ConfigDict(strict=True)
+
     trade_date: date
     as_of: AwareUtcDatetime
     t: str = Field(pattern=r"^(?:[01][0-9]|2[0-3]):[0-5][0-9]$")
@@ -1768,6 +1779,8 @@ class PulseAlertProjectionRow(RuntimeContractModel):
 
 
 class SurgeRuntimeConfigProjectionRow(RuntimeContractModel):
+    model_config = ConfigDict(strict=True)
+
     trade_date: date
     as_of: AwareUtcDatetime
     boards: tuple[str, ...] = Field(min_length=1, max_length=4)
@@ -2000,12 +2013,18 @@ def _read_surge_live_projection_sources(
                 "surge runtime config fields do not match the writer contract"
             )
         file_time = _source_file_time(item, observed=observed, name="runtime config")
+        normalized = dict(value)
         try:
-            config_day = date.fromisoformat(str(value.pop("day")))
+            day_value = normalized.pop("day")
+            boards_value = normalized.get("boards")
+            if not isinstance(day_value, str) or not isinstance(boards_value, list):
+                raise ValueError("runtime config source types are invalid")
+            normalized["boards"] = tuple(boards_value)
+            config_day = date.fromisoformat(day_value)
             row = SurgeRuntimeConfigProjectionRow(
                 trade_date=config_day,
                 as_of=file_time,
-                **value,
+                **normalized,
             )
         except ValueError as exc:
             raise PageProjectionSourceIntegrityError("surge runtime config is invalid") from exc

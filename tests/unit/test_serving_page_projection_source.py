@@ -370,6 +370,142 @@ def test_signal_source_rejects_malformed_present_pulse_file(tmp_path: Path) -> N
         DuckDBSignalPageProjectionSource(database, surge_live_root=live_root)(NOW)
 
 
+@pytest.mark.parametrize(
+    ("filename", "payload", "error_match"),
+    (
+        (
+            "pulse-2026-08-03.jsonl",
+            {
+                "t": "09:31",
+                "limit_up": "20",
+                "limit_down": 2,
+                "broken": 1,
+                "up": 2600,
+                "down": 2400,
+                "up_ratio_pct": 50.0,
+                "total": 5400,
+            },
+            "pulse history row is invalid",
+        ),
+        (
+            "pulse-2026-08-03.jsonl",
+            {
+                "t": "09:31",
+                "limit_up": True,
+                "limit_down": 2,
+                "broken": 1,
+                "up": 2600,
+                "down": 2400,
+                "up_ratio_pct": 50.0,
+                "total": 5400,
+            },
+            "pulse history row is invalid",
+        ),
+        (
+            "pulse_alerts-2026-08-03.jsonl",
+            {
+                "t": "10:15",
+                "kind": "broken_surge",
+                "kind_label": "炸板潮",
+                "before": "2.0",
+                "after": 6.0,
+                "window_minutes": 10,
+                "message": "炸板异动",
+            },
+            "pulse alert row is invalid",
+        ),
+        (
+            "runtime_config.json",
+            {
+                "day": "2026-08-03",
+                "boards": ["main", "gem"],
+                "k_rough": "1.2",
+                "k_cum": 2.5,
+                "ratio_cap": 8.0,
+                "skip_first_minutes": 0,
+                "tushare_rate_per_min": 2,
+                "require_price_strength": True,
+                "max_room_to_limit_pct": 1.0,
+            },
+            "surge runtime config is invalid",
+        ),
+        (
+            "runtime_config.json",
+            {
+                "day": "2026-08-03",
+                "boards": ["main", "gem"],
+                "k_rough": 1.2,
+                "k_cum": 2.5,
+                "ratio_cap": 8.0,
+                "skip_first_minutes": 0,
+                "tushare_rate_per_min": 2,
+                "require_price_strength": "false",
+                "max_room_to_limit_pct": 1.0,
+            },
+            "surge runtime config is invalid",
+        ),
+        (
+            "runtime_config.json",
+            {
+                "day": "2026-08-03",
+                "boards": ["main", "gem"],
+                "k_rough": 1.2,
+                "k_cum": 2.5,
+                "ratio_cap": 8.0,
+                "skip_first_minutes": 0,
+                "tushare_rate_per_min": 2,
+                "require_price_strength": 0,
+                "max_room_to_limit_pct": 1.0,
+            },
+            "surge runtime config is invalid",
+        ),
+        (
+            "runtime_config.json",
+            {
+                "day": "2026-08-03",
+                "boards": ["main", 3],
+                "k_rough": 1.2,
+                "k_cum": 2.5,
+                "ratio_cap": 8.0,
+                "skip_first_minutes": 0,
+                "tushare_rate_per_min": 2,
+                "require_price_strength": True,
+                "max_room_to_limit_pct": 1.0,
+            },
+            "surge runtime config is invalid",
+        ),
+    ),
+)
+def test_signal_projection_producer_rejects_wrong_source_types_without_generation(
+    tmp_path: Path,
+    filename: str,
+    payload: dict[str, object],
+    error_match: str,
+) -> None:
+    database = tmp_path / "rquant_ro.duckdb"
+    _signal_projection_database(database)
+    live_root = tmp_path / "surge_live"
+    live_root.mkdir()
+    source_path = live_root / filename
+    suffix = "\n" if filename.endswith(".jsonl") else ""
+    source_path.write_text(json.dumps(payload, ensure_ascii=False) + suffix, encoding="utf-8")
+    source_timestamp = (NOW - timedelta(seconds=1)).timestamp()
+    os.utime(source_path, (source_timestamp, source_timestamp))
+    store = NotificationStateStore(tmp_path / "notification.sqlite3")
+    producer = SignalPageProjectionProducer(
+        source=DuckDBSignalPageProjectionSource(database, surge_live_root=live_root),
+        store=store,
+    )
+
+    before = store.serving_snapshot(observed_at=NOW, history_limit=1)
+    with pytest.raises(PageProjectionSourceIntegrityError, match=error_match):
+        producer.publish(NOW)
+    after = store.serving_snapshot(observed_at=NOW, history_limit=1)
+
+    assert before.projection_generation_id is None
+    assert after.projection_generation_id is None
+
+
 def test_duckdb_signal_source_binds_generation_opened_during_connect(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
