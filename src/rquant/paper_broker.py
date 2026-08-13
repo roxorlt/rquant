@@ -14,6 +14,11 @@ from zoneinfo import ZoneInfo
 
 from pydantic import Field, model_validator
 
+from rquant.order_execution_costs import (
+    OrderExecutionCosts,
+    calculate_order_execution_costs,
+    calculate_slipped_price,
+)
 from rquant.paper_contracts import (
     PaperAccountSnapshot,
     PaperExecutionReceipt,
@@ -2032,13 +2037,14 @@ class PaperBrokerStore:
                 if intent_row is None:
                     raise PaperBrokerReconciliationError("paper order is missing its intent")
                 intent = PaperOrderIntent.model_validate_json(intent_row["payload_json"])
-                fill_price = self._fill_price(intent.side, quote.executable_price)
-                commission = self._commission(fill_price * quantity)
-                tax = (
-                    self._stamp_tax(fill_price * quantity)
-                    if intent.side is PaperSide.SELL
-                    else Decimal("0.00")
+                execution_costs = self._execution_costs(
+                    intent.side,
+                    quote.executable_price,
+                    quantity,
                 )
+                fill_price = execution_costs.executed_price
+                commission = execution_costs.commission
+                tax = execution_costs.stamp_duty
                 if order.status not in {
                     PaperOrderStatus.ACCEPTED,
                     PaperOrderStatus.PARTIALLY_FILLED,
@@ -2357,12 +2363,14 @@ class PaperBrokerStore:
             raise ValueError("executable_quantity cannot exceed intent quantity")
         if execution_quantity == 0:
             return self._new_order(intent, decision_time), None
-        commission = self._commission(fill_price * execution_quantity)
-        tax = (
-            self._stamp_tax(fill_price * execution_quantity)
-            if intent.side is PaperSide.SELL
-            else Decimal("0.00")
+        execution_costs = self._execution_costs(
+            intent.side,
+            quote.executable_price,
+            execution_quantity,
         )
+        fill_price = execution_costs.executed_price
+        commission = execution_costs.commission
+        tax = execution_costs.stamp_duty
         if intent.side is PaperSide.BUY:
             if quote.acquisition_available_date is None:
                 raise ValueError("BUY execution requires acquisition_available_date")
@@ -2452,21 +2460,38 @@ class PaperBrokerStore:
         )
 
     def _fill_price(self, side: PaperSide, executable_price: Decimal) -> Decimal:
-        if side is PaperSide.BUY:
-            multiplier = Decimal("1") + self.cost_policy.buy_slippage_bps / _BPS
-        else:
-            multiplier = Decimal("1") - self.cost_policy.sell_slippage_bps / _BPS
-        return (executable_price * multiplier).quantize(_PRICE_TICK, rounding=ROUND_HALF_UP)
+        return calculate_slipped_price(
+            executable_price,
+            side="buy" if side is PaperSide.BUY else "sell",
+            slippage_bps=(
+                self.cost_policy.buy_slippage_bps
+                if side is PaperSide.BUY
+                else self.cost_policy.sell_slippage_bps
+            ),
+            price_tick=_PRICE_TICK,
+        )
 
-    def _commission(self, notional: Decimal) -> Decimal:
-        return max(
-            notional * self.cost_policy.commission_rate,
-            self.cost_policy.minimum_commission,
-        ).quantize(_CENT, rounding=ROUND_HALF_UP)
-
-    def _stamp_tax(self, notional: Decimal) -> Decimal:
-        return (notional * self.cost_policy.sell_stamp_tax_rate).quantize(
-            _CENT, rounding=ROUND_HALF_UP
+    def _execution_costs(
+        self,
+        side: PaperSide,
+        executable_price: Decimal,
+        quantity: int,
+    ) -> OrderExecutionCosts:
+        return calculate_order_execution_costs(
+            side="buy" if side is PaperSide.BUY else "sell",
+            reference_price=executable_price,
+            quantity=quantity,
+            commission_rate=self.cost_policy.commission_rate,
+            minimum_commission=self.cost_policy.minimum_commission,
+            transfer_fee_rate=Decimal("0"),
+            sell_stamp_duty_rate=self.cost_policy.sell_stamp_tax_rate,
+            slippage_bps=(
+                self.cost_policy.buy_slippage_bps
+                if side is PaperSide.BUY
+                else self.cost_policy.sell_slippage_bps
+            ),
+            price_tick=_PRICE_TICK,
+            money_quantum=_CENT,
         )
 
     def _insert_order(

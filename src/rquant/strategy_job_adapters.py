@@ -686,6 +686,7 @@ class NShapeCompareAdapter:
         validated: ValidatedStrategyShard,
         store: object,
     ) -> LabShardExecutionResult:
+        from rquant.paper import PaperTradeConfig
         from rquant.strategy_compare import run_entry_mode_comparison
 
         if not isinstance(validated.shard, HoldDaysShardInput):
@@ -701,6 +702,7 @@ class NShapeCompareAdapter:
             max_hold_days=validated.shard.hold_days,
             freq=parameters.freq,
             factor_score_threshold=float(parameters.factor_score_threshold),
+            paper_config=PaperTradeConfig(entry_slippage_pct=0),
             execution_costs=validated.spec.execution_costs,
         )
         return LabShardExecutionResult.from_validated(
@@ -1391,24 +1393,18 @@ def _concat_shard_frames(frames: tuple[pd.DataFrame, ...]) -> pd.DataFrame:
 
 
 def _rerank_optimizer_table(table: LabShardTable) -> pd.DataFrame:
-    frame = table.frame
-    sort_columns: tuple[str, ...] | None = None
-    if table.name in {"rankings", "topn_rankings"}:
-        sort_columns = ("robust_score", "test_trades", "train_trades")
+    from rquant.strategy_ranking import StrategyRankingTable, rank_strategy_table
+
+    ranking_name: StrategyRankingTable
+    if table.name == "rankings":
+        ranking_name = "rankings"
+    elif table.name == "topn_rankings":
+        ranking_name = "topn_rankings"
     elif table.name == "walk_forward_rankings":
-        sort_columns = ("robust_score", "folds", "test_trades")
-    if sort_columns is None or frame.empty:
-        return frame
-    reranked = (
-        frame.drop(columns="rank")
-        .sort_values(
-            list(sort_columns),
-            ascending=[False] * len(sort_columns),
-        )
-        .reset_index(drop=True)
-    )
-    reranked.insert(0, "rank", range(1, len(reranked) + 1))
-    return reranked
+        ranking_name = "walk_forward_rankings"
+    else:
+        return table.frame
+    return rank_strategy_table(table.frame, table_name=ranking_name)
 
 
 @lru_cache(maxsize=1)

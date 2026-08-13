@@ -14,13 +14,21 @@ def _costs(
     stamp: str = "0",
     transfer: str = "0",
     slippage: str = "0",
+    schema_version: int = 1,
+    minimum: str = "0",
+    notional: str | None = None,
 ) -> ExecutionCostSpec:
-    return ExecutionCostSpec(
+    values: dict[str, object] = dict(
+        schema_version=schema_version,
         commission_bps=Decimal(commission),
         stamp_duty_bps=Decimal(stamp),
         transfer_fee_bps=Decimal(transfer),
         slippage_bps=Decimal(slippage),
     )
+    if schema_version == 2:
+        values["minimum_commission"] = Decimal(minimum)
+        values["research_notional_per_trade"] = None if notional is None else Decimal(notional)
+    return ExecutionCostSpec.model_validate(values)
 
 
 def test_zero_execution_costs_preserve_legacy_rows_exactly() -> None:
@@ -99,3 +107,52 @@ def test_valid_cost_application_never_returns_less_than_total_loss() -> None:
     )
 
     assert (actual["ret_pct"] > -100).all()
+
+
+def test_notional_costs_emit_cash_amounts_effective_bps_and_provenance() -> None:
+    from rquant.strategy_execution_costs import apply_round_trip_execution_costs
+
+    actual = apply_round_trip_execution_costs(
+        pd.DataFrame(
+            [
+                {
+                    "entry_price": 10.0,
+                    "exit_price": 11.0,
+                    "ret_pct": 10.0,
+                }
+            ]
+        ),
+        _costs(
+            schema_version=2,
+            commission="30",
+            minimum="5",
+            notional="1000",
+        ),
+    )
+
+    expected_net = (Decimal("1095") / Decimal("1005") - 1) * 100
+    row = actual.iloc[0]
+    assert row["gross_ret_pct"] == 10.0
+    assert row["ret_pct"] == pytest.approx(float(expected_net))
+    assert row["research_quantity"] == 100
+    assert row["buy_commission_amount"] == 5.0
+    assert row["sell_commission_amount"] == 5.0
+    assert row["execution_cost_amount"] == 10.0
+    assert row["effective_execution_cost_bps"] == 100.0
+    assert row["execution_cost_mode"] == "notional"
+    assert bool(row["paper_execution_comparable"])
+    assert row["minimum_commission"] == 5.0
+    assert row["research_notional_per_trade"] == 1000.0
+
+
+def test_v2_rate_only_costs_are_explicitly_not_paper_comparable() -> None:
+    from rquant.strategy_execution_costs import apply_round_trip_execution_costs
+
+    actual = apply_round_trip_execution_costs(
+        pd.DataFrame([{"ret_pct": 10.0}]),
+        _costs(schema_version=2, commission="3"),
+    )
+
+    assert actual.loc[0, "execution_cost_mode"] == "rate_only"
+    assert not bool(actual.loc[0, "paper_execution_comparable"])
+    assert "execution_cost_amount" not in actual.columns

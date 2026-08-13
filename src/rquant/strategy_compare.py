@@ -142,6 +142,13 @@ def run_entry_mode_comparison(
     execution_costs: ExecutionCostSpec | None = None,
 ) -> StrategyComparisonResult:
     """按多个入场模式跑分钟 replay，并生成对比表。"""
+    if (
+        paper_config is not None
+        and paper_config.entry_slippage_pct > 0
+        and execution_costs is not None
+        and execution_costs.slippage_bps > 0
+    ):
+        raise ValueError("slippage must have exactly one owner per comparison run")
     candidates_count = _candidate_count(store, start_date, end_date, preset_name)
     trade_frames: list[pd.DataFrame] = []
     summary_rows: list[dict[str, object]] = []

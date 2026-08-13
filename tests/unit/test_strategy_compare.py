@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 
 import pandas as pd
 import pytest
@@ -161,3 +162,24 @@ def test_run_entry_mode_comparison_can_compare_profile_variants(
     assert set(result.trades["profile_variant"]) == {
         "baseline", "vp_risk_only", "vp_90"
     }
+
+
+def test_comparison_rejects_two_nonzero_slippage_owners_before_replay() -> None:
+    from rquant.paper import PaperTradeConfig
+    from rquant.research_run_spec import ExecutionCostSpec
+    from rquant.strategy_compare import run_entry_mode_comparison
+
+    with pytest.raises(ValueError, match="slippage.*owner"):
+        run_entry_mode_comparison(
+            object(),  # type: ignore[arg-type]
+            start_date="2026-06-24",
+            end_date="2026-06-24",
+            entry_modes=["first_break"],
+            paper_config=PaperTradeConfig(entry_slippage_pct=0.001),
+            execution_costs=ExecutionCostSpec(
+                commission_bps=Decimal("0"),
+                stamp_duty_bps=Decimal("0"),
+                transfer_fee_bps=Decimal("0"),
+                slippage_bps=Decimal("10"),
+            ),
+        )

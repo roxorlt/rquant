@@ -252,6 +252,24 @@ def test_buy_fills_atomically_and_accounts_for_minimum_commission(
     assert snapshot.nav == Decimal("100195.00")
 
 
+def test_buy_commission_uses_rate_above_minimum_threshold(
+    tmp_path: Path,
+    cost_policy: BrokerCostPolicy,
+) -> None:
+    store = _store(tmp_path / "paper.sqlite3", cost_policy, initial_cash="2000000")
+
+    order = store.submit_intent(
+        _intent(quantity=100_000),
+        decision_time=BUY_TIME,
+        trade_date=BUY_DATE,
+        quote=_quote("10.00"),
+    )
+
+    fill = store.fills(order.order_id)[0]
+    assert fill.notional == Decimal("1000000.0000")
+    assert fill.commission == Decimal("300.00")
+
+
 def test_account_authority_revision_is_persistent_and_not_driven_by_wall_clock(
     tmp_path: Path,
     cost_policy: BrokerCostPolicy,

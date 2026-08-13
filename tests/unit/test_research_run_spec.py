@@ -484,6 +484,51 @@ def test_hash_changes_when_a_reproducibility_input_changes() -> None:
     assert _spec(dataset_snapshot=changed_audit).spec_hash != base.spec_hash
 
 
+def test_execution_cost_v2_serializes_notional_contract_and_changes_cache_identity() -> None:
+    legacy = _costs()
+    notional = ExecutionCostSpec(
+        schema_version=2,
+        commission_bps=Decimal("2.5"),
+        stamp_duty_bps=Decimal("5"),
+        transfer_fee_bps=Decimal("0.1"),
+        slippage_bps=Decimal("3"),
+        minimum_commission=Decimal("5"),
+        research_notional_per_trade=Decimal("100000"),
+    )
+
+    restored = ExecutionCostSpec.model_validate_json(notional.model_dump_json(round_trip=True))
+
+    assert legacy.model_dump(mode="json") == {
+        "commission_bps": "2.5",
+        "stamp_duty_bps": "5",
+        "transfer_fee_bps": "0.1",
+        "slippage_bps": "3",
+    }
+    assert restored == notional
+    assert restored.model_dump(mode="json") == {
+        "schema_version": 2,
+        "commission_bps": "2.5",
+        "stamp_duty_bps": "5",
+        "transfer_fee_bps": "0.1",
+        "slippage_bps": "3",
+        "minimum_commission": "5",
+        "research_notional_per_trade": "100000",
+    }
+    assert _spec(execution_costs=notional).spec_hash != _spec(execution_costs=legacy).spec_hash
+
+
+def test_execution_cost_v2_rejects_minimum_without_research_notional() -> None:
+    with pytest.raises(ValidationError, match="minimum.*notional"):
+        ExecutionCostSpec(
+            schema_version=2,
+            commission_bps=Decimal("2.5"),
+            stamp_duty_bps=Decimal("5"),
+            transfer_fee_bps=Decimal("0.1"),
+            slippage_bps=Decimal("3"),
+            minimum_commission=Decimal("5"),
+        )
+
+
 def test_spec_model_copy_revalidates_snapshot_grade_gate() -> None:
     comparable = _spec()
 

@@ -12,6 +12,7 @@ from rquant.minute_replay import MinuteFreq
 from rquant.research_run_spec import ExecutionCostSpec
 from rquant.storage.duckdb import DuckDBStore
 from rquant.strategy_compare import EntryMode, ProfileVariant, run_entry_mode_comparison
+from rquant.strategy_ranking import rank_strategy_table
 from rquant.topn_selection import (
     MARKET_TEMPERATURE_FEATURE,
     FeatureScoreProfile,
@@ -393,11 +394,7 @@ def run_strategy_optimization(
             - (rankings["train_mean_ret_pct"].fillna(0.0)
                - rankings["test_mean_ret_pct"].fillna(0.0)).abs() * 0.2
         ).round(4)
-        rankings = rankings.sort_values(
-            ["robust_score", "test_trades", "train_trades"],
-            ascending=[False, False, False],
-        ).reset_index(drop=True)
-        rankings.insert(0, "rank", range(1, len(rankings) + 1))
+        rankings = rank_strategy_table(rankings, table_name="rankings")
 
     trades = pd.concat(trade_frames, ignore_index=True) if trade_frames else pd.DataFrame()
     topn_rankings = (
@@ -412,11 +409,10 @@ def run_strategy_optimization(
             - (topn_rankings["train_mean_ret_pct"].fillna(0.0)
                - topn_rankings["test_mean_ret_pct"].fillna(0.0)).abs() * 0.2
         ).round(4)
-        topn_rankings = topn_rankings.sort_values(
-            ["robust_score", "test_trades", "train_trades"],
-            ascending=[False, False, False],
-        ).reset_index(drop=True)
-        topn_rankings.insert(0, "rank", range(1, len(topn_rankings) + 1))
+        topn_rankings = rank_strategy_table(
+            topn_rankings,
+            table_name="topn_rankings",
+        )
 
     topn_trades = (
         pd.concat(topn_trade_frames, ignore_index=True)
@@ -436,11 +432,10 @@ def run_strategy_optimization(
             axis=1,
             min_trades=min_trades,
         )
-        walk_forward_rankings = walk_forward_rankings.sort_values(
-            ["robust_score", "folds", "test_trades"],
-            ascending=[False, False, False],
-        ).reset_index(drop=True)
-        walk_forward_rankings.insert(0, "rank", range(1, len(walk_forward_rankings) + 1))
+        walk_forward_rankings = rank_strategy_table(
+            walk_forward_rankings,
+            table_name="walk_forward_rankings",
+        )
 
     walk_forward_trades = (
         pd.concat(walk_forward_trade_frames, ignore_index=True)

@@ -283,20 +283,42 @@ class FeatureContractIdentity(RunSpecModel):
 
 
 class ExecutionCostSpec(RunSpecModel):
+    schema_version: Literal[1, 2] = 1
     commission_bps: Decimal = Field(ge=0, le=10_000)
     stamp_duty_bps: Decimal = Field(ge=0, le=10_000)
     transfer_fee_bps: Decimal = Field(ge=0, le=10_000)
     slippage_bps: Decimal = Field(ge=0, le=10_000)
+    minimum_commission: Decimal = Field(default=Decimal("0"), ge=0)
+    research_notional_per_trade: Decimal | None = Field(default=None, gt=0)
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_versioned_input(cls, data: object) -> object:
+        if not isinstance(data, Mapping):
+            return data
+        schema_version = data.get("schema_version", 1)
+        if type(schema_version) is not int or schema_version not in {1, 2}:
+            raise ValueError("execution cost schema_version must be integer 1 or 2")
+        if schema_version == 1 and (
+            data.get("minimum_commission", Decimal("0")) != 0
+            or data.get("research_notional_per_trade") is not None
+        ):
+            raise ValueError("v1 execution costs cannot carry notional fee fields")
+        return data
 
     @field_validator(
         "commission_bps",
         "stamp_duty_bps",
         "transfer_fee_bps",
         "slippage_bps",
+        "minimum_commission",
+        "research_notional_per_trade",
         mode="before",
     )
     @classmethod
-    def validate_finite_decimal(cls, value: object) -> Decimal:
+    def validate_finite_decimal(cls, value: object) -> Decimal | None:
+        if value is None:
+            return None
         return _parse_decimal(value, field_name="execution cost")
 
     @model_validator(mode="after")
@@ -307,7 +329,21 @@ class ExecutionCostSpec(RunSpecModel):
             raise ValueError("buy-side execution costs must total less than 10000 bps")
         if sell_total >= 10_000:
             raise ValueError("sell-side execution costs must total less than 10000 bps")
+        if self.minimum_commission > 0 and self.research_notional_per_trade is None:
+            raise ValueError("minimum commission requires research notional per trade")
         return self
+
+    @model_serializer(mode="wrap")
+    def serialize_versioned_contract(
+        self,
+        handler: SerializerFunctionWrapHandler,
+    ) -> object:
+        payload = handler(self)
+        if self.schema_version == 1 and isinstance(payload, dict):
+            payload.pop("schema_version", None)
+            payload.pop("minimum_commission", None)
+            payload.pop("research_notional_per_trade", None)
+        return payload
 
 
 def _canonical_decimal(value: Decimal) -> str:

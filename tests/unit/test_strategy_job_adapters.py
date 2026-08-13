@@ -279,6 +279,18 @@ def _nonzero_costs() -> ExecutionCostSpec:
     )
 
 
+def _notional_costs() -> ExecutionCostSpec:
+    return ExecutionCostSpec(
+        schema_version=2,
+        commission_bps=Decimal("10"),
+        stamp_duty_bps=Decimal("5"),
+        transfer_fee_bps=Decimal("1"),
+        slippage_bps=Decimal("2"),
+        minimum_commission=Decimal("5"),
+        research_notional_per_trade=Decimal("100000"),
+    )
+
+
 def _legacy_strategy_spec(spec: ResearchRunSpec, strategy_name: str) -> ResearchRunSpec:
     return spec.model_copy(
         update={"parameters": spec.parameters.model_copy(update={"strategy_name": strategy_name})}
@@ -881,6 +893,41 @@ def test_nshape_optimize_executes_only_the_claimed_hold_days(
     assert captured == [[3]]
 
 
+def test_nshape_compare_adapter_assigns_slippage_only_to_execution_cost_spec(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.strategy_compare as compare
+    from rquant.paper import PaperTradeConfig
+    from rquant.strategy_job_adapters import default_strategy_job_adapter_registry
+
+    captured: dict[str, object] = {}
+
+    def fake_compare(
+        store: object,
+        **kwargs: object,
+    ) -> compare.StrategyComparisonResult:
+        del store
+        captured.update(kwargs)
+        return compare.StrategyComparisonResult(
+            candidates_count=0,
+            trades=pd.DataFrame(),
+            summary=pd.DataFrame(),
+        )
+
+    monkeypatch.setattr(compare, "run_entry_mode_comparison", fake_compare)
+    spec = _nshape_compare_spec(hold_days=(1,)).model_copy(
+        update={"execution_costs": _notional_costs()}
+    )
+    registry = default_strategy_job_adapter_registry()
+
+    registry.execute_shard(registry.validate_claim(_claim(spec)), object())
+
+    paper_config = captured["paper_config"]
+    assert isinstance(paper_config, PaperTradeConfig)
+    assert paper_config.entry_slippage_pct == 0
+    assert captured["execution_costs"] == spec.execution_costs
+
+
 def test_nshape_compare_adapter_matches_legacy_fixture(tmp_path) -> None:
     from rquant.storage.duckdb import DuckDBStore
     from rquant.strategy_compare import run_entry_mode_comparison
@@ -930,7 +977,11 @@ def test_nshape_compare_nonzero_execution_costs_match_legacy_direct_and_reduce_r
 ) -> None:
     from rquant.storage.duckdb import DuckDBStore
     from rquant.strategy_compare import run_entry_mode_comparison
-    from rquant.strategy_job_adapters import default_strategy_job_adapter_registry
+    from rquant.strategy_job_adapters import (
+        LabShardExecutionWireResult,
+        StrategyShardPayload,
+        default_strategy_job_adapter_registry,
+    )
     from tests.unit.test_minute_replay import _seed_daily_and_screen, _seed_minutes
 
     spec = _spec(
@@ -940,7 +991,7 @@ def test_nshape_compare_nonzero_execution_costs_match_legacy_direct_and_reduce_r
         _parameter("profile_variants", "text_list", ("baseline",)),
         start_date=date(2026, 6, 24),
         end_date=date(2026, 6, 24),
-    ).model_copy(update={"execution_costs": _nonzero_costs()})
+    ).model_copy(update={"execution_costs": _notional_costs()})
     with DuckDBStore(tmp_path / "compare-costs.duckdb") as store:
         _seed_daily_and_screen(store)
         _seed_minutes(store)
@@ -953,15 +1004,24 @@ def test_nshape_compare_nonzero_execution_costs_match_legacy_direct_and_reduce_r
             max_hold_days=1,
             execution_costs=spec.execution_costs,
         )
-        actual = default_strategy_job_adapter_registry().execute_shard(
-            default_strategy_job_adapter_registry().validate_claim(_claim(spec)),
+        registry = default_strategy_job_adapter_registry()
+        definition = registry.plan(spec)[0]
+        actual = registry.execute_shard(
+            registry.validate_claim(_claim(spec)),
             store,
         )
+        restored = LabShardExecutionWireResult.from_result(actual).to_result()
 
     actual_summary = _result_table(actual, "summary")
     actual_trades = _result_table(actual, "trades")
+    payload = StrategyShardPayload.model_validate_json(definition.payload_json)
     pd.testing.assert_frame_equal(actual_summary, expected.summary)
     pd.testing.assert_frame_equal(actual_trades, expected.trades)
+    pd.testing.assert_frame_equal(_result_table(restored, "trades"), actual_trades)
+    assert payload.spec.execution_costs == spec.execution_costs
+    assert actual_trades.iloc[0]["execution_cost_schema_version"] == 2
+    assert actual_trades.iloc[0]["minimum_commission"] == 5.0
+    assert actual_trades.iloc[0]["research_notional_per_trade"] == 100000.0
     assert actual_trades["ret_pct"].lt(actual_trades["gross_ret_pct"]).all()
     assert actual_summary.iloc[0]["mean_ret_pct"] < actual_trades["gross_ret_pct"].mean()
 
@@ -1002,7 +1062,7 @@ def test_nshape_optimize_adapter_matches_legacy_fixture(tmp_path) -> None:
         )
         registry = default_strategy_job_adapter_registry()
         actual = registry.execute_shard(registry.validate_claim(_claim(spec)), store)
-        costly_spec = spec.model_copy(update={"execution_costs": _nonzero_costs()})
+        costly_spec = spec.model_copy(update={"execution_costs": _notional_costs()})
         costly_expected = run_strategy_optimization(
             store,
             start_date=date(2026, 6, 24),
@@ -1255,7 +1315,7 @@ def test_nshape_optimize_multi_hold_aggregate_matches_legacy_global_result(
         job_type=ResearchJobType.PARAMETER_SEARCH,
         start_date=date(2026, 6, 24),
         end_date=date(2026, 6, 24),
-    )
+    ).model_copy(update={"execution_costs": _notional_costs()})
     registry = default_strategy_job_adapter_registry()
     with DuckDBStore(tmp_path / "aggregate-optimize.duckdb") as store:
         _seed_daily_and_screen(store)
