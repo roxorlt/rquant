@@ -44,14 +44,10 @@ _PREFLIGHT_PATH_ENVIRONMENT_KEYS = frozenset(
         "LAB_READINESS_DIR",
     }
 )
-_WRAPPER_CHILD_OS_ENVIRONMENT_KEYS = frozenset(
-    {"HOME", "LANG", "PATH", "TEMP", "TMP", "TMPDIR", "TZ"}
-)
+_WRAPPER_CHILD_OS_ENVIRONMENT_KEYS = frozenset({"HOME", "PATH", "TEMP", "TMP", "TMPDIR", "TZ"})
+_WRAPPER_CHILD_LOCALE_ENVIRONMENT_KEYS = frozenset({"LANG", "LC_ALL"})
 _WRAPPER_CHILD_TEST_ENVIRONMENT_KEYS = frozenset(
     {"LAB_WRAPPER_HOLD_SECONDS", "RQUANT_RELEASE_GENERATION_MIN_FREE_BYTES"}
-)
-_WRAPPER_PYTHON_INJECTION_ENVIRONMENT_KEYS = frozenset(
-    {"PYTHONHOME", "PYTHONINSPECT", "PYTHONPATH", "PYTHONSTARTUP"}
 )
 
 
@@ -580,29 +576,26 @@ def _handoff_payload(
     }
 
 
-def _wrapper_child_environment(marker: Path) -> dict[str, str]:
-    controlled_path_keys = {key.casefold() for key in _PREFLIGHT_PATH_ENVIRONMENT_KEYS}
-    allowed_keys = _WRAPPER_CHILD_OS_ENVIRONMENT_KEYS | _WRAPPER_CHILD_TEST_ENVIRONMENT_KEYS
-    environment = {
-        key: value
-        for key, value in os.environ.items()
-        if (key in allowed_keys or key.startswith("LC_"))
-        and key.casefold() not in controlled_path_keys
-    }
-    environment["LAB_WRAPPER_MARKER"] = str(marker)
-    environment["LAB_RUNTIME_IDENTITY_MARKER"] = str(marker.with_suffix(".runtime.json"))
+def _wrapper_child_environment(marker: Path | None = None) -> dict[str, str]:
+    allowed_keys = (
+        _WRAPPER_CHILD_OS_ENVIRONMENT_KEYS
+        | _WRAPPER_CHILD_LOCALE_ENVIRONMENT_KEYS
+        | _WRAPPER_CHILD_TEST_ENVIRONMENT_KEYS
+    )
+    environment = {key: os.environ[key] for key in allowed_keys if key in os.environ}
+    if marker is not None:
+        environment["LAB_WRAPPER_MARKER"] = str(marker)
+        environment["LAB_RUNTIME_IDENTITY_MARKER"] = str(marker.with_suffix(".runtime.json"))
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
     return environment
 
 
-def _remove_wrapper_controlled_environment(monkeypatch: pytest.MonkeyPatch) -> None:
-    controlled_path_keys = {key.casefold() for key in _PREFLIGHT_PATH_ENVIRONMENT_KEYS}
+def _install_wrapper_main_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    environment = _wrapper_child_environment()
     for key in tuple(os.environ):
-        if (
-            key in _WRAPPER_PYTHON_INJECTION_ENVIRONMENT_KEYS
-            or key.casefold() in controlled_path_keys
-        ):
-            monkeypatch.delenv(key, raising=False)
+        monkeypatch.delenv(key, raising=False)
+    for key, value in environment.items():
+        monkeypatch.setenv(key, value)
 
 
 def _run_wrapper(
@@ -690,6 +683,83 @@ def test_lab_runtime_wrapper_ignores_ambient_preflight_path_overrides(
     assert "Lab runtime preflight:" in result.stdout
     assert "fake daemon executed" in result.stdout
     assert marker.is_file()
+
+
+def test_wrapper_harness_rejects_synthetic_credentials_in_child_and_direct_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkout, executable, marker = _runtime_checkout(tmp_path)
+    synthetic_environment = {
+        "REVIEW_SYNTHETIC_TOKEN": "ordinary-token",
+        "LC_REVIEW_SYNTHETIC_TOKEN": "locale-token",
+        "mIxEd_CaSe_SeCrEt": "mixed-secret",
+        "tUsHaRe_ToKeN_MaIn": "mixed-credential",
+        "dAtA_dIr": str(tmp_path / "ambient-data"),
+        "lAb_JoBs_PaTh": str(tmp_path / "ambient-lab-jobs.sqlite3"),
+    }
+    for key, value in synthetic_environment.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("LANG", "C")
+    monkeypatch.setenv("LC_ALL", "C")
+
+    child_environment = _wrapper_child_environment(marker)
+    synthetic_keys = {key.casefold() for key in synthetic_environment}
+    assert child_environment["LAB_WRAPPER_MARKER"] == str(marker)
+    assert child_environment["LANG"] == "C"
+    assert child_environment["LC_ALL"] == "C"
+    assert not {key.casefold() for key in child_environment}.intersection(synthetic_keys)
+
+    namespace = runpy.run_path(str(WRAPPER), run_name="lab_wrapper_test")
+    namespace["main"].__globals__["__file__"] = str(checkout / "scripts" / WRAPPER.name)
+    original_run = namespace["main"].__globals__["run_contained"]
+    preflight_environments: list[dict[str, str]] = []
+    exec_calls: list[tuple[object, ...]] = []
+
+    def capture_preflight_environment(
+        command: list[str],
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        if any(Path(str(value)).name == PREFLIGHT.name for value in command):
+            preflight_environments.append(dict(os.environ))
+        return original_run(command, **kwargs)
+
+    monkeypatch.setitem(
+        namespace["main"].__globals__, "run_contained", capture_preflight_environment
+    )
+    monkeypatch.setattr(os, "execv", lambda *args: exec_calls.append(args))
+    monkeypatch.setattr(sys, "executable", str(checkout / ".venv" / "bin" / "python"))
+    monkeypatch.chdir(checkout)
+    _install_wrapper_main_environment(monkeypatch)
+
+    result = namespace["main"](
+        [
+            "--expected-checkout-root",
+            str(checkout),
+            "--trusted-git-path",
+            str(TRUSTED_GIT),
+            "--deployment-lock-path",
+            str(_deployment_lock_path(checkout)),
+            "--",
+            str(executable),
+            "lab-worker",
+            "--expected-checkout-root",
+            str(checkout),
+            "--trusted-git-path",
+            str(TRUSTED_GIT),
+            "--worker-id",
+            "rquant-mac-primary",
+            "--once",
+        ]
+    )
+
+    assert result == 1
+    assert exec_calls
+    assert preflight_environments
+    assert all(
+        not {key.casefold() for key in environment}.intersection(synthetic_keys)
+        for environment in preflight_environments
+    )
 
 
 def test_immutable_generation_wrapper_ignores_mutated_checkout_code(tmp_path: Path) -> None:
@@ -1212,7 +1282,7 @@ def test_lab_runtime_wrapper_rejects_executable_inode_replacement_during_preflig
     monkeypatch.setattr(os, "execv", lambda *args: exec_calls.append(args))
     monkeypatch.setattr(sys, "executable", str(checkout / ".venv" / "bin" / "python"))
     monkeypatch.chdir(checkout)
-    _remove_wrapper_controlled_environment(monkeypatch)
+    _install_wrapper_main_environment(monkeypatch)
 
     result = namespace["main"](
         [
@@ -1270,7 +1340,7 @@ def test_lab_runtime_wrapper_rechecks_tracked_cleanliness_after_preflight(
     monkeypatch.setattr(os, "execv", lambda *args: exec_calls.append(args))
     monkeypatch.setattr(sys, "executable", str(checkout / ".venv" / "bin" / "python"))
     monkeypatch.chdir(checkout)
-    _remove_wrapper_controlled_environment(monkeypatch)
+    _install_wrapper_main_environment(monkeypatch)
 
     result = namespace["main"](
         [
@@ -1333,7 +1403,7 @@ def test_lab_runtime_wrapper_rechecks_complete_checkout_after_second_preflight(
     monkeypatch.setattr(os, "execv", lambda *args: exec_calls.append(args))
     monkeypatch.setattr(sys, "executable", str(checkout / ".venv" / "bin" / "python"))
     monkeypatch.chdir(checkout)
-    _remove_wrapper_controlled_environment(monkeypatch)
+    _install_wrapper_main_environment(monkeypatch)
 
     result = namespace["main"](
         [
