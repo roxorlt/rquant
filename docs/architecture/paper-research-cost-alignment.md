@@ -101,15 +101,17 @@ Direct migration tests corrupt each lot provenance field, consumption mapping,
 realized P&L, and receipt payload; every case rejects before a candidate exists
 while preserving the corrupt source's pre-attempt hash. The migrator then
 opens the closed regular source with no-follow semantics, descriptor-copies a
-private snapshot before reconciliation, and binds the reconciliation report,
-source hash, and v5 migration attestation to that snapshot. Device/inode/size/
-mtime/ctime identity and sidecar absence are rechecked before publication, so
-path replacement, mutation, WAL/SHM/journal appearance, or replacement-and-
-restore races reject and clean up the temporary snapshot and candidate. It
-transforms only the snapshot copy in an explicit transaction and hard-links it
-into the requested offline candidate after verification. Every injected or
-ordinary phase failure leaves the source bytes and SHA-256 unchanged and
-publishes no candidate.
+private snapshot before reconciliation, retains that descriptor through the
+transformation copy, and binds the reconciliation report, copied-byte hash, and
+v5 migration attestation to that snapshot. Device/inode/size/mtime/ctime
+identity, descriptor identity, and sidecar absence are rechecked before
+publication, so path replacement, mutation, WAL/SHM/journal appearance, or
+replacement-and-restore races reject and clean up the temporary snapshot and
+candidate. It transforms only the descriptor copy in an explicit transaction
+and hard-links it into the requested offline candidate after verification.
+Every injected or ordinary phase failure, including one immediately after the
+hard-link publication boundary, leaves the source bytes and SHA-256 unchanged
+and publishes no candidate.
 
 The committed v4 fixture is built only by running exact parent
 `c088774c3199c02edf203a3af758452eb38a5118` with parent `src` first. Its seed

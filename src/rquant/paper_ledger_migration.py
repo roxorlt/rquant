@@ -8,6 +8,7 @@ import os
 import secrets
 import sqlite3
 import stat
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -40,6 +41,7 @@ OFFLINE_MIGRATION_PHASES = (
     "archive_protection",
     "attestation",
     "verification",
+    "publication",
 )
 _ARCHIVE_TABLE_SPECS = (
     ("paper_ledger_schema_v4_archive", ("singleton",)),
@@ -82,7 +84,9 @@ class _SourceIdentity:
 class _SourceSnapshot:
     path: Path
     sha256: str
-    identity: _SourceIdentity
+    source_identity: _SourceIdentity
+    snapshot_identity: _SourceIdentity
+    descriptor: int
 
 
 def _canonical_json(value: object) -> str:
@@ -272,6 +276,10 @@ def _source_identity(path: Path) -> _SourceIdentity:
         raise ValueError("offline migration source cannot be inspected") from exc
     if not stat.S_ISREG(metadata.st_mode):
         raise ValueError("offline migration source must be a regular file")
+    return _identity_from_metadata(metadata)
+
+
+def _identity_from_metadata(metadata: os.stat_result) -> _SourceIdentity:
     return _SourceIdentity(
         device=metadata.st_dev,
         inode=metadata.st_ino,
@@ -309,16 +317,12 @@ def _path_entry_exists(path: Path) -> bool:
     return os.path.lexists(path)
 
 
-def _write_descriptor_copy(
-    source_descriptor: int,
-    destination: Path,
-) -> str:
-    destination_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    destination_flags |= getattr(os, "O_CLOEXEC", 0)
-    try:
-        destination_descriptor = os.open(destination, destination_flags, 0o600)
-    except OSError as exc:
-        raise ValueError("offline migration private snapshot cannot be created") from exc
+def _unlink_path_entry(path: Path) -> None:
+    with suppress(FileNotFoundError):
+        path.unlink()
+
+
+def _copy_descriptor_bytes(source_descriptor: int, destination_descriptor: int) -> str:
     digest = hashlib.sha256()
     try:
         while chunk := os.read(source_descriptor, 1024 * 1024):
@@ -332,9 +336,84 @@ def _write_descriptor_copy(
         os.fsync(destination_descriptor)
     except OSError as exc:
         raise ValueError("offline migration private snapshot cannot be written") from exc
+    return digest.hexdigest()
+
+
+def _write_descriptor_copy(
+    source_descriptor: int,
+    destination: Path,
+) -> str:
+    destination_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    destination_flags |= getattr(os, "O_CLOEXEC", 0)
+    try:
+        destination_descriptor = os.open(destination, destination_flags, 0o600)
+    except OSError as exc:
+        raise ValueError("offline migration private snapshot cannot be created") from exc
+    try:
+        return _copy_descriptor_bytes(source_descriptor, destination_descriptor)
     finally:
         os.close(destination_descriptor)
-    return digest.hexdigest()
+
+
+def _create_private_snapshot(
+    source_descriptor: int,
+    snapshot: Path,
+) -> tuple[int, str, _SourceIdentity]:
+    snapshot_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    snapshot_flags |= getattr(os, "O_CLOEXEC", 0)
+    try:
+        write_descriptor = os.open(snapshot, snapshot_flags, 0o600)
+    except OSError as exc:
+        raise ValueError("offline migration private snapshot cannot be created") from exc
+    snapshot_descriptor: int | None = None
+    try:
+        snapshot_sha256 = _copy_descriptor_bytes(source_descriptor, write_descriptor)
+        metadata = os.fstat(write_descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError("offline migration private snapshot is not a regular file")
+        snapshot_identity = _identity_from_metadata(metadata)
+        read_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        read_flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            snapshot_descriptor = os.open(snapshot, read_flags)
+        except OSError as exc:
+            raise ValueError("offline migration private snapshot changed or was replaced") from exc
+        write_metadata = os.fstat(write_descriptor)
+        read_metadata = os.fstat(snapshot_descriptor)
+        path_metadata = os.lstat(snapshot)
+        if (
+            not stat.S_ISREG(write_metadata.st_mode)
+            or not stat.S_ISREG(read_metadata.st_mode)
+            or not stat.S_ISREG(path_metadata.st_mode)
+            or _identity_from_metadata(write_metadata) != snapshot_identity
+            or _identity_from_metadata(read_metadata) != snapshot_identity
+            or _identity_from_metadata(path_metadata) != snapshot_identity
+        ):
+            raise ValueError("offline migration private snapshot changed or was replaced")
+    except BaseException:
+        if snapshot_descriptor is not None:
+            os.close(snapshot_descriptor)
+        os.close(write_descriptor)
+        _unlink_path_entry(snapshot)
+        raise
+    os.close(write_descriptor)
+    assert snapshot_descriptor is not None
+    return snapshot_descriptor, snapshot_sha256, snapshot_identity
+
+
+def _assert_private_snapshot_unchanged(snapshot: _SourceSnapshot) -> None:
+    try:
+        path_metadata = os.lstat(snapshot.path)
+        descriptor_metadata = os.fstat(snapshot.descriptor)
+    except OSError as exc:
+        raise ValueError("offline migration private snapshot changed or was replaced") from exc
+    if (
+        not stat.S_ISREG(path_metadata.st_mode)
+        or not stat.S_ISREG(descriptor_metadata.st_mode)
+        or _identity_from_metadata(path_metadata) != snapshot.snapshot_identity
+        or _identity_from_metadata(descriptor_metadata) != snapshot.snapshot_identity
+    ):
+        raise ValueError("offline migration private snapshot changed or was replaced")
 
 
 def _snapshot_closed_source(source: Path, snapshot: Path) -> _SourceSnapshot:
@@ -345,57 +424,50 @@ def _snapshot_closed_source(source: Path, snapshot: Path) -> _SourceSnapshot:
         source_descriptor = os.open(source, source_flags)
     except OSError as exc:
         raise ValueError("offline migration source cannot be opened safely") from exc
+    snapshot_descriptor: int | None = None
     try:
         opened = os.fstat(source_descriptor)
-        opened_identity = _SourceIdentity(
-            device=opened.st_dev,
-            inode=opened.st_ino,
-            size=opened.st_size,
-            modified_ns=opened.st_mtime_ns,
-            changed_ns=opened.st_ctime_ns,
-        )
+        opened_identity = _identity_from_metadata(opened)
         if not stat.S_ISREG(opened.st_mode) or opened_identity != expected_identity:
             raise ValueError("offline migration source changed before private snapshot")
         _assert_source_sidecars_absent(source)
-        snapshot_sha256 = _write_descriptor_copy(source_descriptor, snapshot)
-        after_copy = os.fstat(source_descriptor)
-        after_copy_identity = _SourceIdentity(
-            device=after_copy.st_dev,
-            inode=after_copy.st_ino,
-            size=after_copy.st_size,
-            modified_ns=after_copy.st_mtime_ns,
-            changed_ns=after_copy.st_ctime_ns,
+        snapshot_descriptor, snapshot_sha256, snapshot_identity = _create_private_snapshot(
+            source_descriptor,
+            snapshot,
         )
+        after_copy = os.fstat(source_descriptor)
+        after_copy_identity = _identity_from_metadata(after_copy)
         if after_copy_identity != expected_identity:
             raise ValueError("offline migration source changed during private snapshot")
         _assert_source_unchanged(source, expected_identity)
+        source_snapshot = _SourceSnapshot(
+            path=snapshot,
+            sha256=snapshot_sha256,
+            source_identity=expected_identity,
+            snapshot_identity=snapshot_identity,
+            descriptor=snapshot_descriptor,
+        )
+        _assert_private_snapshot_unchanged(source_snapshot)
     except BaseException:
-        if snapshot.exists():
-            snapshot.unlink()
+        if snapshot_descriptor is not None:
+            os.close(snapshot_descriptor)
+        _unlink_path_entry(snapshot)
         raise
     finally:
         os.close(source_descriptor)
-    return _SourceSnapshot(
-        path=snapshot,
-        sha256=snapshot_sha256,
-        identity=expected_identity,
-    )
+    return source_snapshot
 
 
-def _copy_private_snapshot(snapshot: Path, destination: Path) -> None:
-    source_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-    source_flags |= getattr(os, "O_NOFOLLOW", 0)
+def _copy_private_snapshot(snapshot: _SourceSnapshot, destination: Path) -> None:
+    _assert_private_snapshot_unchanged(snapshot)
     try:
-        source_descriptor = os.open(snapshot, source_flags)
+        os.lseek(snapshot.descriptor, 0, os.SEEK_SET)
     except OSError as exc:
-        raise ValueError("offline migration private snapshot cannot be reopened") from exc
-    try:
-        opened = os.fstat(source_descriptor)
-        if not stat.S_ISREG(opened.st_mode):
-            raise ValueError("offline migration private snapshot is not a regular file")
-        _write_descriptor_copy(source_descriptor, destination)
-    finally:
-        os.close(source_descriptor)
+        raise ValueError("offline migration private snapshot descriptor is not usable") from exc
+    copied_sha256 = _write_descriptor_copy(snapshot.descriptor, destination)
+    if copied_sha256 != snapshot.sha256:
+        raise ValueError("offline migration private snapshot copy hash differs")
+    _assert_private_snapshot_unchanged(snapshot)
 
 
 def _checkpoint(failure_after_phase: str | None, phase: str) -> None:
@@ -423,15 +495,16 @@ def migrate_v4_ledger_copy(
     snapshot = candidate.with_name(f".{candidate.name}.offline-source-{secrets.token_hex(12)}")
     temporary = candidate.with_name(f".{candidate.name}.offline-migrating-{secrets.token_hex(12)}")
     promoted = False
+    source_snapshot: _SourceSnapshot | None = None
     try:
         source_snapshot = _snapshot_closed_source(source, snapshot)
         _checkpoint(failure_after_phase, "source_preflight")
         report = V4LedgerReconciler().reconcile(source_snapshot.path)
         if report.source_sha256 != source_snapshot.sha256 or not report.is_verified:
             raise ValueError("offline migration v4 reconciliation report is invalid")
-        _assert_source_unchanged(source, source_snapshot.identity)
+        _assert_source_unchanged(source, source_snapshot.source_identity)
         _checkpoint(failure_after_phase, "source_reconciliation")
-        _copy_private_snapshot(source_snapshot.path, temporary)
+        _copy_private_snapshot(source_snapshot, temporary)
         from rquant.paper_broker import PaperBrokerStore
 
         store = object.__new__(PaperBrokerStore)
@@ -445,7 +518,9 @@ def migrate_v4_ledger_copy(
             connection.execute("PRAGMA synchronous = FULL")
             store._ensure_ledger_schema_v5(
                 connection,
-                failure_after_phase=failure_after_phase,
+                failure_after_phase=(
+                    None if failure_after_phase == "publication" else failure_after_phase
+                ),
                 source_sha256=source_snapshot.sha256,
                 v4_reconciliation_report_digest=report.digest,
                 migration_code_identity=migration_code_identity,
@@ -465,7 +540,7 @@ def migrate_v4_ledger_copy(
         finally:
             connection.close()
         _checkpoint(failure_after_phase, "verification")
-        _assert_source_unchanged(source, source_snapshot.identity)
+        _assert_source_unchanged(source, source_snapshot.source_identity)
         candidate_sha256 = sha256_file(temporary)
         with temporary.open("rb") as stream:
             os.fsync(stream.fileno())
@@ -473,6 +548,7 @@ def migrate_v4_ledger_copy(
             raise ValueError("offline migration candidate already exists")
         os.link(temporary, candidate)
         promoted = True
+        _checkpoint(failure_after_phase, "publication")
         temporary.unlink()
         directory = os.open(candidate.parent, os.O_RDONLY)
         try:
@@ -489,16 +565,15 @@ def migrate_v4_ledger_copy(
             anchor_state="CURRENT_HEAD_UNANCHORED",
         )
     except BaseException:
-        if temporary.exists():
-            temporary.unlink()
-        if snapshot.exists():
-            snapshot.unlink()
+        _unlink_path_entry(temporary)
+        _unlink_path_entry(snapshot)
         if promoted and _path_entry_exists(candidate) and not candidate.is_symlink():
             candidate.unlink()
         raise
     finally:
-        if snapshot.exists():
-            snapshot.unlink()
+        if source_snapshot is not None:
+            os.close(source_snapshot.descriptor)
+        _unlink_path_entry(snapshot)
 
 
 def migrate_paper_ledger_v4_offline_copy(

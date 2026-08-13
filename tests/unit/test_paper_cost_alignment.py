@@ -611,6 +611,98 @@ def test_store_comparator_rejects_stale_signed_anchor(tmp_path: Path) -> None:
     assert comparison.reason == "CURRENT_HEAD_UNANCHORED"
 
 
+def test_rqs8_p1_007_anchor_requires_the_committed_live_financial_state_root(
+    tmp_path: Path,
+) -> None:
+    from rquant.order_execution_costs import calculate_execution_costs
+    from rquant.strategy_execution_costs import ExecutionCostBindingEvidence
+    from tests.paper_ledger_anchor_support import create_paper_ledger_test_authority
+
+    spec = _v3_spec()
+    calculation = calculate_execution_costs(
+        spec,
+        {"side": "BUY", "reference_price": "10.00", "quantity": 100},
+        _context(),
+    )
+    research = ExecutionCostBindingEvidence(
+        provenance_state="KNOWN_V3",
+        execution_cost_spec=spec,
+        calculations=(calculation,),
+    )
+    authority = create_paper_ledger_test_authority(
+        tmp_path / "anchor-key",
+        as_of=_ANCHOR_NOW,
+        max_age=_ANCHOR_MAX_AGE,
+        future_skew=_ANCHOR_FUTURE_SKEW,
+    )
+    anchor_path = tmp_path / "current-head-anchor.json"
+    store = _paper_store(
+        tmp_path / "paper.sqlite3",
+        spec=spec,
+        anchor_authority=authority,
+        anchor_path=anchor_path,
+    )
+    store.submit_intent(
+        _paper_intent(signal_seed="a"),
+        execution_id="1" * 64,
+        decision_time=_BUY_TIME,
+        trade_date=_BUY_DATE,
+        quote=_paper_quote("10.00"),
+    )
+    store.account_authority_snapshot(
+        as_of=_BUY_TIME + timedelta(seconds=1),
+        market_prices={"600000.SH": calculation.executed_price},
+        producer_commit=_PRODUCER_COMMIT,
+    )
+    authority.write_current_anchor(store.path, anchor_path, issued_at=_ANCHOR_NOW)
+    signed_anchor_before = anchor_path.read_bytes()
+
+    exact_before = store.compare_research_execution_costs(
+        research,
+        account_id=_ACCOUNT_ID,
+        execution_ids=("1" * 64,),
+    )
+    assert exact_before.is_comparable
+    assert exact_before.reason == "EXACT_V3_BOUND"
+    assert exact_before.financial_state_digest is not None
+
+    with sqlite3.connect(store.path) as connection:
+        head_before = connection.execute(
+            "SELECT head_marker_fingerprint, payload_json "
+            "FROM paper_ledger_head_marker ORDER BY revision DESC LIMIT 1"
+        ).fetchone()
+        connection.execute(
+            "UPDATE paper_account_authority SET producer_commit = ? WHERE account_id = ?",
+            ("b" * 40, _ACCOUNT_ID),
+        )
+        head_after = connection.execute(
+            "SELECT head_marker_fingerprint, payload_json "
+            "FROM paper_ledger_head_marker ORDER BY revision DESC LIMIT 1"
+        ).fetchone()
+
+    assert head_after == head_before
+    assert anchor_path.read_bytes() == signed_anchor_before
+    stale_root = store.compare_research_execution_costs(
+        research,
+        account_id=_ACCOUNT_ID,
+        execution_ids=("1" * 64,),
+    )
+    assert not stale_root.is_comparable
+    assert stale_root.reason == "CURRENT_HEAD_UNANCHORED"
+    assert stale_root.head_marker_fingerprint == exact_before.head_marker_fingerprint
+    assert stale_root.financial_state_digest != exact_before.financial_state_digest
+
+    authority.write_current_anchor(store.path, anchor_path, issued_at=_ANCHOR_NOW)
+    exact_after = store.compare_research_execution_costs(
+        research,
+        account_id=_ACCOUNT_ID,
+        execution_ids=("1" * 64,),
+    )
+    assert exact_after.is_comparable
+    assert exact_after.reason == "EXACT_V3_BOUND"
+    assert exact_after.financial_state_digest == stale_root.financial_state_digest
+
+
 def test_rqs8_p1_007_anchor_rejects_synchronized_non_fifo_financial_state_tamper(
     tmp_path: Path,
 ) -> None:

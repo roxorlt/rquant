@@ -66,6 +66,37 @@ def _assert_corrupt_v4_rejected(
     assert not candidate_path.exists()
 
 
+def _assert_no_offline_migration_artifacts(candidate_path: Path) -> None:
+    assert not os.path.lexists(candidate_path)
+    assert not tuple(candidate_path.parent.glob(f".{candidate_path.name}.offline-source-*"))
+    assert not tuple(candidate_path.parent.glob(f".{candidate_path.name}.offline-migrating-*"))
+
+
+def _assert_direct_and_offline_v4_rejected(
+    source_path: Path,
+    candidate_path: Path,
+    *,
+    match: str,
+) -> None:
+    source_bytes = source_path.read_bytes()
+    source_sha256 = _sha256(source_path)
+
+    with pytest.raises(PaperV4ReconciliationError, match=match):
+        V4LedgerReconciler().reconcile(source_path)
+    assert source_path.read_bytes() == source_bytes
+    assert _sha256(source_path) == source_sha256
+
+    with pytest.raises(PaperV4ReconciliationError, match=match):
+        migrate_v4_ledger_copy(
+            source_path,
+            candidate_path,
+            migration_code_identity="test-migration-code",
+        )
+    assert source_path.read_bytes() == source_bytes
+    assert _sha256(source_path) == source_sha256
+    _assert_no_offline_migration_artifacts(candidate_path)
+
+
 def _canonical_lot_ids(connection: sqlite3.Connection, account_id: str) -> tuple[str, ...]:
     return tuple(
         str(row[0])
@@ -220,6 +251,61 @@ def test_rqs8_p1_006_offline_migration_rejects_source_replacement_and_restore(
     assert not candidate.exists()
 
 
+@pytest.mark.parametrize(
+    "replacement_kind",
+    ("regular-file", "hardlink", "symlink"),
+)
+def test_rqs8_p1_006_offline_migration_rejects_private_snapshot_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replacement_kind: str,
+) -> None:
+    source = create_parent_v4_fixture(tmp_path / "source.sqlite3")
+    replacement = create_parent_v4_fixture(tmp_path / "replacement.sqlite3")
+    candidate = tmp_path / "candidate.sqlite3"
+    source_bytes = source.path.read_bytes()
+    source_sha256 = _sha256(source.path)
+
+    with sqlite3.connect(replacement.path) as connection:
+        connection.execute("PRAGMA application_id = 0x52513838")
+    assert replacement.path.read_bytes() != source_bytes
+    assert V4LedgerReconciler().reconcile(replacement.path).is_verified
+
+    original_reconcile = V4LedgerReconciler.reconcile
+
+    def reconcile_then_replace_private_snapshot(
+        self: V4LedgerReconciler,
+        snapshot_path: Path,
+    ) -> object:
+        report = original_reconcile(self, snapshot_path)
+        snapshot = Path(snapshot_path)
+        snapshot.unlink()
+        if replacement_kind == "regular-file":
+            os.replace(replacement.path, snapshot)
+        elif replacement_kind == "hardlink":
+            os.link(replacement.path, snapshot)
+        else:
+            snapshot.symlink_to(tmp_path / "missing-private-snapshot.sqlite3")
+        return report
+
+    monkeypatch.setattr(
+        V4LedgerReconciler,
+        "reconcile",
+        reconcile_then_replace_private_snapshot,
+    )
+
+    with pytest.raises(ValueError, match="private snapshot changed or was replaced"):
+        migrate_v4_ledger_copy(
+            source.path,
+            candidate,
+            migration_code_identity="test-migration-code",
+        )
+
+    assert source.path.read_bytes() == source_bytes
+    assert _sha256(source.path) == source_sha256
+    _assert_no_offline_migration_artifacts(candidate)
+
+
 @pytest.mark.parametrize("cross_role", (False, True), ids=("later-fill", "cross-role"))
 def test_rqs8_p2_003_v4_rejects_rebound_initial_execution_receipts(
     tmp_path: Path,
@@ -272,6 +358,97 @@ def test_rqs8_p2_003_v4_rejects_rebound_initial_execution_receipts(
             migration_code_identity="test-migration-code",
         )
     assert not candidate.exists()
+
+
+def test_rqs8_p2_003_v4_rejects_initial_receipt_fingerprint_only_mismatch(
+    tmp_path: Path,
+) -> None:
+    source = create_parent_v4_fixture(tmp_path / "source.sqlite3")
+    candidate = tmp_path / "candidate.sqlite3"
+
+    with sqlite3.connect(source.path) as connection:
+        immutable_trigger = str(
+            connection.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type = 'trigger' AND name = 'paper_intent_identity_immutable'"
+            ).fetchone()[0]
+        )
+        initial_execution_id = str(
+            connection.execute(
+                "SELECT initial_execution_id FROM paper_intent "
+                "WHERE account_id = ? AND side = 'BUY'",
+                (LEGACY_ACCOUNT_ID,),
+            ).fetchone()[0]
+        )
+        connection.execute("DROP TRIGGER paper_intent_identity_immutable")
+        connection.execute(
+            "UPDATE paper_intent SET initial_execution_request_fingerprint = ? "
+            "WHERE account_id = ? AND side = 'BUY'",
+            ("f" * 64, LEGACY_ACCOUNT_ID),
+        )
+        connection.execute(immutable_trigger)
+        retained_execution_id = str(
+            connection.execute(
+                "SELECT initial_execution_id FROM paper_intent "
+                "WHERE account_id = ? AND side = 'BUY'",
+                (LEGACY_ACCOUNT_ID,),
+            ).fetchone()[0]
+        )
+
+    assert retained_execution_id == initial_execution_id
+    _assert_direct_and_offline_v4_rejected(
+        source.path,
+        candidate,
+        match="^v4 initial execution receipt fingerprint differs$",
+    )
+
+
+def test_rqs8_p2_003_v4_rejects_cross_account_initial_id_rebound(
+    tmp_path: Path,
+) -> None:
+    accounts = _two_account_seed()
+    source = create_parent_v4_fixture(tmp_path / "source.sqlite3")
+    candidate = tmp_path / "candidate.sqlite3"
+    target_account, foreign_account = (str(account["account_id"]) for account in accounts)
+
+    with sqlite3.connect(source.path) as connection:
+        immutable_trigger = str(
+            connection.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type = 'trigger' AND name = 'paper_intent_identity_immutable'"
+            ).fetchone()[0]
+        )
+        foreign_incremental = connection.execute(
+            """
+            SELECT f.execution_id, r.request_fingerprint
+            FROM paper_fill AS f
+            JOIN paper_order AS o ON o.order_id = f.order_id
+            JOIN paper_execution_receipt AS r ON r.execution_id = f.execution_id
+            WHERE o.account_id = ? AND f.sequence = 2
+            """,
+            (foreign_account,),
+        ).fetchone()
+        assert foreign_incremental is not None
+        connection.execute("DROP TRIGGER paper_intent_identity_immutable")
+        connection.execute(
+            """
+            UPDATE paper_intent
+            SET initial_execution_id = ?, initial_execution_request_fingerprint = ?
+            WHERE account_id = ? AND side = 'BUY'
+            """,
+            (
+                str(foreign_incremental[0]),
+                str(foreign_incremental[1]),
+                target_account,
+            ),
+        )
+        connection.execute(immutable_trigger)
+
+    _assert_direct_and_offline_v4_rejected(
+        source.path,
+        candidate,
+        match="^v4 receipt identity set is incomplete or duplicated$",
+    )
 
 
 @pytest.mark.parametrize(
@@ -613,3 +790,23 @@ def test_all_offline_migration_phase_failures_leave_source_and_candidate_unchang
     assert source.path.read_bytes() == source_bytes
     assert _sha256(source.path) == source.source_sha256
     assert not candidate.exists()
+
+
+def test_rqs8_p1_006_publication_failure_removes_candidate_and_private_files(
+    tmp_path: Path,
+) -> None:
+    source = create_parent_v4_fixture(tmp_path / "source.sqlite3")
+    source_bytes = source.path.read_bytes()
+    candidate = tmp_path / "candidate.sqlite3"
+
+    with pytest.raises(RuntimeError, match="simulated migration failure after publication"):
+        migrate_v4_ledger_copy(
+            source.path,
+            candidate,
+            migration_code_identity="test-migration-code",
+            failure_after_phase="publication",
+        )
+
+    assert source.path.read_bytes() == source_bytes
+    assert _sha256(source.path) == source.source_sha256
+    _assert_no_offline_migration_artifacts(candidate)
