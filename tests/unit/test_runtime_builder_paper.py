@@ -8,7 +8,11 @@ import pytest
 
 from rquant.paper_broker import BrokerExecutionContext
 from rquant.paper_signal_worker import PaperQuoteSnapshot
-from rquant.runtime_builder_paper import paper_broker_builder, paper_consumer_builder
+from rquant.runtime_builder_paper import (
+    PaperBrokerSettings,
+    paper_broker_builder,
+    paper_consumer_builder,
+)
 from rquant.runtime_service_control import RuntimeServicePlane
 from rquant.runtime_service_entrypoint import RuntimeServiceKind, RuntimeServiceManifest
 from rquant.runtime_serving_authority import ServingSourceAuthorityReader
@@ -394,6 +398,32 @@ def test_paper_broker_default_loader_requires_complete_authorities(tmp_path: Pat
         paper_broker_builder(clock=lambda: NOW)(
             _manifest(tmp_path, RuntimeServiceKind.PAPER_BROKER)
         )
+
+
+def test_paper_anchor_runtime_settings_require_explicit_freshness_policy(
+    tmp_path: Path,
+) -> None:
+    anchor_settings = {
+        "ledger_id": "paper-ledger-test",
+        "ledger_anchor_path": str((tmp_path / "anchor.json").resolve()),
+        "ledger_anchor_public_key_path": str((tmp_path / "public.pem").resolve()),
+        "ledger_anchor_key_id": "paper-ledger-test-v1",
+    }
+
+    with pytest.raises(ValueError, match="anchor settings"):
+        PaperBrokerSettings.model_validate({**_broker_settings(tmp_path), **anchor_settings})
+
+    settings = PaperBrokerSettings.model_validate(
+        {
+            **_broker_settings(tmp_path),
+            **anchor_settings,
+            "ledger_anchor_max_age_seconds": 300,
+            "ledger_anchor_future_skew_seconds": 30,
+        }
+    )
+
+    assert settings.ledger_anchor_max_age_seconds == 300
+    assert settings.ledger_anchor_future_skew_seconds == 30
 
 
 def test_paper_builders_reject_wrong_plane_and_relative_paths(tmp_path: Path) -> None:

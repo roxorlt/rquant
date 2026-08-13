@@ -55,10 +55,16 @@ caller-supplied paper fact, or alternate exact-v3 path exists.
 Exact comparison also requires an external
 `rquant-paper-ledger-head/v1` Ed25519 checkpoint naming the configured ledger,
 current v5 head, and migration-attestation digest. Runtime wiring contains only
-a pinned public key and allowed ledger ID. Missing, invalid, stale, or
-different-head evidence returns `CURRENT_HEAD_UNANCHORED`; local diagnostics
-remain available, but exact comparability is false. This patch does not contain
-a production private key or issue a production anchor.
+a pinned public key, allowed ledger ID, positive
+`ledger_anchor_max_age_seconds`, non-negative
+`ledger_anchor_future_skew_seconds`, and the runtime builder's trusted clock.
+The verifier normalizes that construction-time clock to UTC and accepts
+`issued_at` only when it is no older than the configured maximum age and no
+further in the future than the configured skew; both boundaries are inclusive.
+The comparison caller cannot provide or override the clock. Missing, invalid,
+stale, future, or different-head evidence returns `CURRENT_HEAD_UNANCHORED`;
+local diagnostics remain available, but exact comparability is false. This
+patch does not contain a production private key or issue a production anchor.
 
 ## Offline Migration and Cutover
 
@@ -69,11 +75,20 @@ the SQLite source (no active WAL, SHM, or journal sidecar), and use
 first verifies the closed regular source using the frozen
 schema-v4/internal-2 reconciler. That independent replay validates cash, FIFO
 lots and consumptions, realized P&L, receipts, and the predecessor
-attestation/head using observed v4 commission-and-tax accounting. It then copies
-the source to a distinct temporary path, transforms only that copy in an
-explicit transaction, verifies it, and atomically publishes only the requested
-offline candidate. Every injected or ordinary phase failure leaves the source
-bytes and SHA-256 unchanged and publishes no candidate.
+attestation/head using observed v4 commission-and-tax accounting. Every BUY lot
+must exactly match its source fill's account, instrument, signal, quantity,
+basis, executed/persisted timestamps, sequence, and acquisition trade date. Its
+availability date must exactly match the persisted execution request's
+authoritative acquisition-availability fact and must be later than the
+acquisition trade date. Consumption rows must map only to SELL fills and pass
+FIFO, quantity, unit-cost, ordering, and persisted-time checks. Direct migration
+tests corrupt each lot provenance field, consumption mapping, realized P&L, and
+receipt payload; every case rejects before a candidate exists while preserving
+the corrupt source's pre-attempt hash. The migrator then copies a verified
+source to a distinct temporary path, transforms only that copy in an explicit
+transaction, verifies it, and atomically publishes only the requested offline
+candidate. Every injected or ordinary phase failure leaves the source bytes and
+SHA-256 unchanged and publishes no candidate.
 
 Migration deliberately leaves historical cash, P&L, lots, receipt JSON, and
 legacy fee fields unchanged. It sets the new authority and fee fields to

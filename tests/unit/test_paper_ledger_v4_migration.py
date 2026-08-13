@@ -31,6 +31,85 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _assert_corrupt_v4_rejected(
+    source_path: Path,
+    candidate_path: Path,
+) -> None:
+    source_bytes = source_path.read_bytes()
+    source_sha256 = _sha256(source_path)
+
+    with pytest.raises(PaperV4ReconciliationError):
+        migrate_v4_ledger_copy(
+            source_path,
+            candidate_path,
+            migration_code_identity="test-migration-code",
+        )
+
+    assert source_path.read_bytes() == source_bytes
+    assert _sha256(source_path) == source_sha256
+    assert not candidate_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    (
+        ("buy_executed_at", "2099-01-01T00:00:00.000000Z"),
+        ("buy_persisted_at", "2099-01-01T00:00:00.000000Z"),
+        ("buy_fill_sequence", 2),
+        ("acquisition_trade_date", "2026-07-30"),
+        ("available_date", "2026-08-01"),
+    ),
+)
+def test_v4_migration_rejects_corrupt_buy_lot_provenance_before_candidate(
+    tmp_path: Path,
+    column: str,
+    value: object,
+) -> None:
+    source = create_parent_v4_fixture(tmp_path / "source.sqlite3")
+    with sqlite3.connect(source.path) as connection:
+        connection.execute(f'UPDATE paper_lot SET "{column}" = ?', (value,))
+
+    _assert_corrupt_v4_rejected(source.path, tmp_path / "candidate.sqlite3")
+
+
+def test_v4_migration_rejects_consumption_with_wrong_fill_provenance(
+    tmp_path: Path,
+) -> None:
+    source = create_parent_v4_fixture(tmp_path / "source.sqlite3")
+    with sqlite3.connect(source.path) as connection:
+        buy_fill_id = connection.execute(
+            "SELECT fill_id FROM paper_fill ORDER BY executed_at LIMIT 1"
+        ).fetchone()[0]
+        lot = connection.execute(
+            "SELECT lot_id, original_quantity, unit_cost, persisted_at FROM paper_lot LIMIT 1"
+        ).fetchone()
+        connection.execute(
+            "INSERT INTO paper_lot_consumption VALUES (?, ?, ?, ?, ?)",
+            (buy_fill_id, *lot),
+        )
+
+    _assert_corrupt_v4_rejected(source.path, tmp_path / "candidate.sqlite3")
+
+
+def test_v4_migration_rejects_corrupt_realized_pnl_before_candidate(tmp_path: Path) -> None:
+    source = create_parent_v4_fixture(tmp_path / "source.sqlite3")
+    with sqlite3.connect(source.path) as connection:
+        connection.execute("UPDATE broker_account SET realized_pnl = '89.9000'")
+
+    _assert_corrupt_v4_rejected(source.path, tmp_path / "candidate.sqlite3")
+
+
+def test_v4_migration_rejects_corrupt_receipt_payload_before_candidate(tmp_path: Path) -> None:
+    source = create_parent_v4_fixture(tmp_path / "source.sqlite3")
+    payload = source.path.read_bytes()
+    original = b'"executable_price":"11.00"'
+    corrupted = b'"executable_price":"12.00"'
+    assert payload.count(original) == 1
+    source.path.write_bytes(payload.replace(original, corrupted, 1))
+
+    _assert_corrupt_v4_rejected(source.path, tmp_path / "candidate.sqlite3")
+
+
 def test_v4_migration_rejects_cash_not_explained_by_independent_replay(
     tmp_path: Path,
 ) -> None:

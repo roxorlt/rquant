@@ -99,6 +99,8 @@ class PaperBrokerSettings(PaperSignalPolicySettings):
     ledger_anchor_path: Path | None = None
     ledger_anchor_public_key_path: Path | None = None
     ledger_anchor_key_id: str | None = Field(default=None, min_length=1)
+    ledger_anchor_max_age_seconds: StrictInt | None = Field(default=None, gt=0)
+    ledger_anchor_future_skew_seconds: StrictInt | None = Field(default=None, ge=0)
     timestamp_semantics: Literal["bar_end", "provider_snapshot"] = "provider_snapshot"
     quote_max_age_seconds: StrictInt = Field(default=90, gt=0, le=300)
     max_finalize_scan_batches: StrictInt = Field(default=32, gt=0, le=120)
@@ -145,6 +147,8 @@ class PaperBrokerSettings(PaperSignalPolicySettings):
             self.ledger_anchor_path,
             self.ledger_anchor_public_key_path,
             self.ledger_anchor_key_id,
+            self.ledger_anchor_max_age_seconds,
+            self.ledger_anchor_future_skew_seconds,
         )
         if any(value is not None for value in anchor_values) and not all(
             value is not None for value in anchor_values
@@ -300,6 +304,9 @@ def paper_broker_builder(
                         active_key_id=settings.ledger_anchor_key_id,
                         active_public_key=(settings.ledger_anchor_public_key_path.read_bytes()),
                         allowed_ledger_id=settings.ledger_id,
+                        max_age=timedelta(seconds=settings.ledger_anchor_max_age_seconds),
+                        future_skew=timedelta(seconds=settings.ledger_anchor_future_skew_seconds),
+                        clock=clock,
                     ),
                 }
             ),
