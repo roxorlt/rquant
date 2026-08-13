@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -58,6 +59,53 @@ _LAB_RUNTIME_BOOTSTRAP_VALUES = {
     "runtime_code_authority_uid": 0,
     "runtime_code_authority_gid": 0,
 }
+
+
+def _stub_lab_runtime_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    code_sha: str = "1" * 40,
+    identity_guard: Callable[[], str] | None = None,
+) -> None:
+    guard = identity_guard or (lambda: code_sha)
+    monkeypatch.setattr(
+        "rquant.cli._establish_lab_runtime_identity",
+        lambda _args: (code_sha, object(), object(), guard),
+    )
+
+
+def _prepare_v2_worker_rollout(
+    monkeypatch: pytest.MonkeyPatch,
+    root: Path,
+) -> None:
+    from rquant.config import settings
+    from rquant.lab_claim_finalizer_runtime import FinalizerRolloutPhase, FinalizerRolloutStore
+
+    state_root = root / "finalizer-state"
+    state_root.mkdir(mode=0o700)
+    monkeypatch.setattr(settings, "lab_finalizer_state_dir", state_root)
+    monkeypatch.setattr(settings, "lab_claim_finalizer_runtime_material_root", root)
+    rollout = FinalizerRolloutStore(state_root / "claim-finalizer-rollout.sqlite3")
+    for phase, evidence in (
+        (FinalizerRolloutPhase.MATERIAL_INSTALLED, "test-material-installed"),
+        (FinalizerRolloutPhase.PREFLIGHT_OK, "test-preflight-ok"),
+        (FinalizerRolloutPhase.FINALIZER_READY, "test-finalizer-ready"),
+    ):
+        rollout.transition(phase, evidence=evidence)
+
+
+def test_real_lab_runtime_identity_rejects_incomplete_bootstrap() -> None:
+    from rquant import cli
+    from rquant.lab_daemon import LabDaemonConfigurationError
+
+    with pytest.raises(
+        LabDaemonConfigurationError,
+        match=(
+            r"--runtime-code-config.*--runtime-code-trusted-base.*"
+            r"--runtime-code-authority-uid.*--runtime-code-authority-gid"
+        ),
+    ):
+        cli._establish_lab_runtime_identity(argparse.Namespace())
 
 
 def test_legacy_shadow_recovery_cli_is_recovery_only() -> None:
@@ -5198,10 +5246,7 @@ class TestLabWorkerCli:
         args = build_parser().parse_args(
             [
                 "lab-worker",
-                "--expected-checkout-root",
-                _LAB_EXPECTED_ROOT,
-                "--trusted-git-path",
-                _LAB_TRUSTED_GIT,
+                *_LAB_RUNTIME_BOOTSTRAP_ARGUMENTS,
                 *_LAB_DAEMON_GENERATION_ARGUMENTS,
                 "--worker-id",
                 "worker-a",
@@ -5210,6 +5255,19 @@ class TestLabWorkerCli:
         )
 
         assert args.command == "lab-worker"
+        assert args.runtime_code_config == _LAB_RUNTIME_BOOTSTRAP_VALUES["runtime_code_config"]
+        assert (
+            args.runtime_code_trusted_base
+            == _LAB_RUNTIME_BOOTSTRAP_VALUES["runtime_code_trusted_base"]
+        )
+        assert (
+            args.runtime_code_authority_uid
+            == _LAB_RUNTIME_BOOTSTRAP_VALUES["runtime_code_authority_uid"]
+        )
+        assert (
+            args.runtime_code_authority_gid
+            == _LAB_RUNTIME_BOOTSTRAP_VALUES["runtime_code_authority_gid"]
+        )
         assert args.worker_id == "worker-a"
         assert args.once is True
         assert args.legacy_no_resource_admission is False
@@ -5218,10 +5276,7 @@ class TestLabWorkerCli:
         args = build_parser().parse_args(
             [
                 "lab-worker",
-                "--expected-checkout-root",
-                _LAB_EXPECTED_ROOT,
-                "--trusted-git-path",
-                _LAB_TRUSTED_GIT,
+                *_LAB_RUNTIME_BOOTSTRAP_ARGUMENTS,
                 *_LAB_DAEMON_GENERATION_ARGUMENTS,
                 "--legacy-no-resource-admission",
             ]
@@ -5247,6 +5302,7 @@ class TestLabWorkerCli:
         from rquant.cli import cmd_lab_worker
         from rquant.config import settings
 
+        _stub_lab_runtime_identity(monkeypatch)
         monkeypatch.setattr(settings, field, value)
 
         with pytest.raises(RuntimeError, match=message):
@@ -5456,6 +5512,10 @@ class TestLabWorkerCli:
             ),
         )
         monkeypatch.setattr(
+            "rquant.cli._establish_lab_runtime_identity",
+            lambda _args: lab_daemon.verify_lab_runtime_prepared(),
+        )
+        monkeypatch.setattr(
             lab_daemon,
             "ensure_private_directory",
             lambda *_args, **_kwargs: pytest.fail(
@@ -5621,13 +5681,17 @@ class TestLabWorkerCli:
             payload_kind="runtime_health",
             clock=lambda: observed_at - timedelta(seconds=1),
         ).publish(SourceReadResult.model_validate(source_values))
+        calendar_dates = (
+            observed_at.date(),
+            (observed_at + timedelta(days=1)).date(),
+        )
         calendar = MarketCalendarAuthority.create(
             schema_version=1,
             exchange="SSE",
             producer_commit=commit,
-            coverage_start=observed_at.date(),
-            coverage_end=observed_at.date(),
-            open_dates=(observed_at.date(),),
+            coverage_start=calendar_dates[0],
+            coverage_end=calendar_dates[-1],
+            open_dates=calendar_dates,
             generated_at=observed_at - timedelta(days=1),
         )
         calendar_path = tmp_path / "market-calendar.json"
@@ -5732,6 +5796,7 @@ class TestLabWorkerCli:
         monkeypatch.setattr(lab_shard_protocol, "LabReportSpool", FakeSpool)
         monkeypatch.setattr(lab_worker, "LabWorker", FakeWorker)
         monkeypatch.setattr("rquant.cli.setup_logging", lambda: None)
+        _stub_lab_runtime_identity(monkeypatch)
 
         result = cmd_lab_worker(
             argparse.Namespace(
@@ -5763,8 +5828,18 @@ class TestLabWorkerCli:
         material_path = None if material is None else tmp_path / "invalid-verifier.json"
         if material_path is not None:
             material_path.write_bytes(material)
+            material_path.chmod(0o640)
         monkeypatch.setattr(settings, "lab_v2_claim_publication_enabled", True)
         monkeypatch.setattr(settings, "lab_claim_publication_worker_verifier_path", material_path)
+        _prepare_v2_worker_rollout(monkeypatch, tmp_path)
+        verifier_path = material_path or tmp_path / "missing-verifier.json"
+        if material_path is None:
+            verifier_path.write_bytes(b"{}")
+            verifier_path.chmod(0o640)
+        monkeypatch.setattr(
+            "rquant.lab_claim_finalizer_runtime.load_current_lab_claim_finalizer_generation",
+            lambda *_args, **_kwargs: SimpleNamespace(worker_verifier_path=verifier_path),
+        )
         monkeypatch.setattr(lab_worker, "LabWorker", lambda **_kwargs: pytest.fail("worker built"))
         monkeypatch.setattr(
             lab_shard_protocol,
@@ -5772,6 +5847,7 @@ class TestLabWorkerCli:
             lambda *_args, **_kwargs: object(),
         )
         monkeypatch.setattr("rquant.cli.setup_logging", lambda: None)
+        _stub_lab_runtime_identity(monkeypatch)
 
         with pytest.raises(LabDaemonConfigurationError, match="public verifier material"):
             cmd_lab_worker(
@@ -5876,9 +5952,14 @@ class TestLabWorkerCli:
         )
         material_path = runtime / "claim-publication-verifier.json"
         material_path.write_bytes(canonical_model_json_bytes(material))
-        material_path.chmod(0o600)
+        material_path.chmod(0o640)
         monkeypatch.setattr(settings, "lab_v2_claim_publication_enabled", True)
         monkeypatch.setattr(settings, "lab_claim_publication_worker_verifier_path", material_path)
+        _prepare_v2_worker_rollout(monkeypatch, tmp_path)
+        monkeypatch.setattr(
+            "rquant.lab_claim_finalizer_runtime.load_current_lab_claim_finalizer_generation",
+            lambda *_args, **_kwargs: SimpleNamespace(worker_verifier_path=material_path),
+        )
         captured: dict[str, object] = {}
 
         class FakeWorker:
@@ -5890,6 +5971,7 @@ class TestLabWorkerCli:
 
         monkeypatch.setattr(lab_worker, "LabWorker", FakeWorker)
         monkeypatch.setattr("rquant.cli.setup_logging", lambda: None)
+        _stub_lab_runtime_identity(monkeypatch)
 
         assert (
             cmd_lab_worker(
@@ -5988,6 +6070,15 @@ class TestLabWorkerCli:
         monkeypatch.setattr(lab_shard_protocol, "LabReportSpool", MinimalSpool)
         monkeypatch.setattr(lab_worker, "LabWorker", MinimalWorker)
         monkeypatch.setattr("rquant.cli.setup_logging", lambda: None)
+        monkeypatch.setattr(
+            "rquant.cli._establish_lab_runtime_identity",
+            lambda _args: (
+                current["sha"],
+                object(),
+                object(),
+                lambda: current["sha"],
+            ),
+        )
         args = argparse.Namespace(
             worker_id="worker-a",
             once=True,
@@ -6067,6 +6158,7 @@ class TestLabWorkerCli:
         monkeypatch.setattr(lab_shard_protocol, "LabReportSpool", FakeSpool)
         monkeypatch.setattr(lab_worker, "LabWorker", FakeWorker)
         monkeypatch.setattr("rquant.cli.setup_logging", lambda: None)
+        _stub_lab_runtime_identity(monkeypatch)
         monkeypatch.setattr(signal, "signal", fake_signal)
 
         result = cmd_lab_worker(
@@ -6166,6 +6258,7 @@ class TestDailyDagDevAbsenceGuardRegression:
 
 def test_lab_claim_finalizer_command_is_registered_and_requires_private_material(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     from rquant import config
     from rquant.cli import build_parser, cmd_lab_claim_finalizer
@@ -6175,10 +6268,7 @@ def test_lab_claim_finalizer_command_is_registered_and_requires_private_material
     parsed = parser.parse_args(
         [
             "lab-claim-finalizer",
-            "--expected-checkout-root",
-            "/tmp/checkout",
-            "--trusted-git-path",
-            "/usr/bin/git",
+            *_LAB_RUNTIME_BOOTSTRAP_ARGUMENTS,
             "--deployment-generation",
             "generation-a",
             "--deployment-lock-path",
@@ -6191,6 +6281,19 @@ def test_lab_claim_finalizer_command_is_registered_and_requires_private_material
         ]
     )
     assert parsed.command == "lab-claim-finalizer"
+    assert parsed.runtime_code_config == _LAB_RUNTIME_BOOTSTRAP_VALUES["runtime_code_config"]
+    assert (
+        parsed.runtime_code_trusted_base
+        == _LAB_RUNTIME_BOOTSTRAP_VALUES["runtime_code_trusted_base"]
+    )
+    assert (
+        parsed.runtime_code_authority_uid
+        == _LAB_RUNTIME_BOOTSTRAP_VALUES["runtime_code_authority_uid"]
+    )
+    assert (
+        parsed.runtime_code_authority_gid
+        == _LAB_RUNTIME_BOOTSTRAP_VALUES["runtime_code_authority_gid"]
+    )
     assert parsed.once is True
 
     monkeypatch.setattr(config.settings, "lab_claim_finalizer_enabled", True, raising=False)
@@ -6200,7 +6303,27 @@ def test_lab_claim_finalizer_command_is_registered_and_requires_private_material
         None,
         raising=False,
     )
-    with pytest.raises(LabDaemonConfigurationError, match="private.*material|material.*missing"):
+    runtime_root = tmp_path / "finalizer-runtime"
+    runtime_root.mkdir(mode=0o700)
+    monkeypatch.setattr(
+        config.settings,
+        "lab_claim_finalizer_runtime_material_root",
+        runtime_root,
+        raising=False,
+    )
+    monkeypatch.setattr(config.settings, "lab_job_claim_dir", tmp_path / "claims", raising=False)
+    monkeypatch.setattr(config.settings, "lab_daemon_lock_dir", tmp_path / "locks", raising=False)
+    _stub_lab_runtime_identity(monkeypatch)
+    monkeypatch.setattr(
+        "rquant.lab_claim_finalizer_runtime.load_current_lab_claim_finalizer_generation",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            runtime_material_path=runtime_root / "missing-runtime-material.json",
+        ),
+    )
+    with pytest.raises(
+        LabDaemonConfigurationError,
+        match="claim finalizer runtime material is invalid",
+    ):
         cmd_lab_claim_finalizer(parsed)
 
 

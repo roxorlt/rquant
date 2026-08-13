@@ -91,6 +91,16 @@ def test_run_all_checks_passes_receipt_bound_quote_advisory_to_real_workload_pro
     monkeypatch.setattr(preflight, "check_data_freshness", lambda **_kwargs: ok)
     monkeypatch.setattr(
         preflight,
+        "verify_source_quota_ledger",
+        lambda *_args, **_kwargs: ok,
+    )
+    monkeypatch.setattr(
+        preflight,
+        "verify_resource_authority_services",
+        lambda *_args, **_kwargs: ok,
+    )
+    monkeypatch.setattr(
+        preflight,
         "verify_workload_unit_declarations",
         lambda _path: WorkloadCheck("workload_unit_declarations", "ok", "ok"),
     )

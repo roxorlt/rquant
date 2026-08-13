@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import os
 import plistlib
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -120,39 +122,49 @@ def test_lab_launchd_templates_do_not_bind_mutable_checkout_runtime() -> None:
         assert "__RQUANT_CODE_ROOT__" in serialized
 
 
-@pytest.mark.skipif(
-    not (ROOT / ".venv" / "bin" / "rquant").is_file(),
-    reason="linked worktree runtime is unavailable",
-)
-def test_real_worktree_launcher_rejects_symlinked_venv_before_config() -> None:
+def test_real_worktree_launcher_rejects_symlinked_venv_before_config(
+    tmp_path: Path,
+) -> None:
+    checkout = tmp_path / "synthetic-checkout"
+    scripts = checkout / "scripts"
+    scripts.mkdir(parents=True, mode=0o700)
+    wrapper = scripts / "run-lab-daemon.py"
+    shutil.copy2(ROOT / "scripts" / "run-lab-daemon.py", wrapper)
+    wrapper.chmod(0o700)
+    contained_runner = checkout / "src" / "rquant" / "contained_subprocess.py"
+    contained_runner.parent.mkdir(parents=True, mode=0o700)
+    shutil.copy2(ROOT / "src" / "rquant" / "contained_subprocess.py", contained_runner)
+    benign_venv = Path(sys.executable).resolve().parent.parent
+    (checkout / ".venv").symlink_to(benign_venv, target_is_directory=True)
+
     environment = os.environ.copy()
     environment.pop("PYTHONPATH", None)
     environment["DATA_DIR"] = "relative-data-must-not-be-read"
 
     result = subprocess.run(
         [
-            str(ROOT / ".venv" / "bin" / "python"),
+            str(sys.executable),
             "-I",
             "-S",
-            str(ROOT / "scripts" / "run-lab-daemon.py"),
+            str(wrapper),
             "--expected-checkout-root",
-            str(ROOT),
+            str(checkout),
             "--trusted-git-path",
             TRUSTED_GIT,
             "--deployment-lock-path",
-            str(ROOT.parent / ".rquant-deploy" / f"{ROOT.name}.lock"),
+            str(tmp_path / "deployment.lock"),
             "--",
-            str(ROOT / ".venv" / "bin" / "rquant"),
+            str(checkout / ".venv" / "bin" / "rquant"),
             "lab-worker",
             "--expected-checkout-root",
-            str(ROOT),
+            str(checkout),
             "--trusted-git-path",
             TRUSTED_GIT,
             "--worker-id",
             "rquant-mac-primary",
             "--once",
         ],
-        cwd=ROOT,
+        cwd=checkout,
         env=environment,
         capture_output=True,
         text=True,

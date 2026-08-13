@@ -9838,13 +9838,16 @@ def test_slow_candidate_loses_one_second_lease_to_new_generation(
     outcomes = []
     thread = threading.Thread(target=lambda: outcomes.append(worker.run_once()))
     thread.start()
-    write_timeout = time.monotonic() + 1
+    write_timeout = time.monotonic() + 3
     while not write_started.is_set() and time.monotonic() < write_timeout:
         scheduler.run_once()
         time.sleep(0.01)
     assert write_started.is_set()
     time.sleep(1.05)
     clock[0] = NOW + timedelta(seconds=2)
+    assert scheduler.lease is not None
+    recovered_job_ids = store.recover_stale_shards(scheduler.lease, now=clock[0])
+    assert recovered_job_ids == (original.job_id,)
     recovery = scheduler.run_once()
     replacement = claims.pending()[0].claim
     release_write.set()
@@ -9856,7 +9859,7 @@ def test_slow_candidate_loses_one_second_lease_to_new_generation(
     scheduler.release()
 
     assert not thread.is_alive()
-    assert recovery.recovered == 1
+    assert recovery.recovered == 0
     assert replacement.claim_generation == original.claim_generation + 1
     assert outcomes[0].status == "failed"
     assert not worker.sealed_bundle_path(original).exists()
@@ -11565,10 +11568,13 @@ def test_crash_without_report_is_reclaimed_by_existing_lease_recovery(
     assert claims.pending() == ()
     assert reports.pending() == ()
     clock[0] = NOW + timedelta(seconds=21)
+    assert scheduler.lease is not None
+    recovered_job_ids = store.recover_stale_shards(scheduler.lease, now=clock[0])
+    assert recovered_job_ids == (original.job_id,)
     result = scheduler.run_once()
     recovered = claims.pending()[0].claim
 
-    assert result.recovered == 1
+    assert result.recovered == 0
     assert recovered.shard_id == original.shard_id
     assert recovered.claim_generation == original.claim_generation + 1
     assert recovered.claim_token != original.claim_token
@@ -11630,10 +11636,13 @@ def test_hard_crash_after_rename_is_reclaimed_before_generation_two_runs(
     assert sealed_one.is_dir()
 
     clock[0] = NOW + timedelta(seconds=21)
+    assert scheduler.lease is not None
+    recovered_job_ids = store.recover_stale_shards(scheduler.lease, now=clock[0])
+    assert recovered_job_ids == (job_id,)
     recovery = scheduler.run_once()
     generation_two = claims.pending()[0].claim
 
-    assert recovery.recovered == 1
+    assert recovery.recovered == 0
     assert generation_two.claim_generation == generation_one.claim_generation + 1
     assert not sealed_one.exists()
 

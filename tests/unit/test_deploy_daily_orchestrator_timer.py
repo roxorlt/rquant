@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+from datetime import datetime, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -309,6 +310,9 @@ def test_ordinary_timer_next_trigger_parses_on_macos_style_bsd_date(
         tmp_path,
         changed_files="deploy/systemd/rquant-monitor.timer",
     )
+    env["DEPLOY_TEST_DAILY_NEXT"] = (datetime.now() + timedelta(days=1)).strftime(
+        "%a %Y-%m-%d %H:%M:%S CST"
+    )
 
     result = subprocess.run(
         ["/bin/bash", str(script)],
@@ -513,7 +517,7 @@ case "${{1:-}}" in
       elif [[ "${{unit}}" == rquant-runtime-daily-orchestrator@*.timer ]]; then
         printf '%s\\n' "${{DEPLOY_TEST_DAILY_NEXT:-Wed 2026-08-05 17:15:00 CST}}"
       else
-        printf 'Wed 2026-08-05 17:15:00 CST\\n'
+        printf '%s\\n' "${{DEPLOY_TEST_DAILY_NEXT:-Wed 2026-08-05 17:15:00 CST}}"
       fi
       exit 0
     fi

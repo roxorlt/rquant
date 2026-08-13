@@ -542,12 +542,22 @@ def test_scheduler_takeover_without_workers_converges_expired_control_intent(
         clock=lambda: clock[0],
     )
 
-    result = scheduler.run_once()
-
     reader = LabJobReader(store.path)
+    before_job = reader.get_job(job.job_id)
+    before_shard = reader.list_shards(job.job_id)[0]
+    result = scheduler.run_once()
     after = reader.get_job(job.job_id)
     shard = reader.list_shards(job.job_id)[0]
-    assert result.recovered >= 1
+    assert result.recovered == 0
+    assert after == before_job
+    assert shard == before_shard
+    assert scheduler.lease is not None
+    recovered = store.recover_stale_shards(scheduler.lease, now=clock[0])
+    assert recovered == (job.job_id,)
+    reconcile = scheduler.run_once()
+    assert reconcile.recovered == 0
+    after = reader.get_job(job.job_id)
+    shard = reader.list_shards(job.job_id)[0]
     assert after is not None and after.status is expected_job
     assert shard.status is expected_shard
     assert shard.worker_id is None
@@ -599,12 +609,22 @@ def test_scheduler_without_workers_recovers_expired_uncontrolled_shard(
         clock=lambda: clock[0],
     )
 
-    result = scheduler.run_once()
-
     reader = LabJobReader(store.path)
+    before_job = reader.get_job(job.job_id)
+    before_shard = reader.list_shards(job.job_id)[0]
+    result = scheduler.run_once()
     after = reader.get_job(job.job_id)
     shard = reader.list_shards(job.job_id)[0]
-    assert result.recovered >= 1
+    assert result.recovered == 0
+    assert after == before_job
+    assert shard == before_shard
+    assert scheduler.lease is not None
+    recovered = store.recover_stale_shards(scheduler.lease, now=clock[0])
+    assert recovered == (job.job_id,)
+    reconcile = scheduler.run_once()
+    assert reconcile.recovered == 0
+    after = reader.get_job(job.job_id)
+    shard = reader.list_shards(job.job_id)[0]
     assert after is not None and after.status is expected_job
     assert shard.status is expected_shard
     assert shard.worker_id is None
@@ -645,13 +665,23 @@ def test_scheduler_takeover_revokes_terminal_max_attempts_claim(tmp_path: Path) 
         clock=lambda: clock[0],
     )
 
+    reader = LabJobReader(store.path)
+    before_job = reader.get_job(job.job_id)
+    before_shard = reader.list_shards(job.job_id)[0]
     result = scheduler.run_once()
 
     assert result.claims_revoked == 1
+    assert result.recovered == 0
     assert result.claim_revoke_failures == 0
     assert claims.pending() == ()
     assert isinstance(claims.publish(claim), LabRevokedClaim)
-    reader = LabJobReader(store.path)
+    assert reader.get_job(job.job_id) == before_job
+    assert reader.list_shards(job.job_id)[0] == before_shard
+    assert scheduler.lease is not None
+    recovered = store.recover_stale_shards(scheduler.lease, now=clock[0])
+    assert recovered == (job.job_id,)
+    reconcile = scheduler.run_once()
+    assert reconcile.recovered == 0
     assert reader.get_job(job.job_id).status is JobStatus.FAILED
     assert reader.list_shards(job.job_id)[0].status is ShardStatus.FAILED
 
