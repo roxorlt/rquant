@@ -313,6 +313,7 @@ def test_signal_source_publishes_generation_pinned_pulse_and_runtime_config(
         encoding="utf-8",
     )
     source_timestamp = (NOW - timedelta(seconds=1)).timestamp()
+    source_available_at = datetime.fromtimestamp(source_timestamp, tz=UTC)
     for path in live_root.iterdir():
         os.utime(path, (source_timestamp, source_timestamp))
 
@@ -322,6 +323,10 @@ def test_signal_source_publishes_generation_pinned_pulse_and_runtime_config(
     )(NOW)
 
     projections = {item.table_name: item for item in snapshot.projections}
+    assert {
+        projections[name].available_at
+        for name in ("pulse_history", "pulse_alert", "surge_runtime_config")
+    } == {source_available_at}
     assert projections["pulse_history"].rows[0]["t"] == "09:31"
     assert projections["pulse_history"].rows[0]["as_of"] == "2026-08-03T01:31:00+00:00"
     assert projections["pulse_alert"].rows[0]["kind"] == "broken_surge"
@@ -329,7 +334,7 @@ def test_signal_source_publishes_generation_pinned_pulse_and_runtime_config(
         {
             "snapshot_key": "current",
             "trade_date": "2026-08-03",
-            "as_of": (NOW - timedelta(seconds=1)).isoformat(),
+            "as_of": source_available_at.isoformat(),
             "boards_json": '["main","gem"]',
             "k_rough": 1.2,
             "k_cum": 2.5,

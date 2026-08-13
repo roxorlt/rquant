@@ -40,8 +40,14 @@ _OVERVIEW_COLUMNS = [
 
 @pytest.fixture(autouse=True)
 def _isolate_fake_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """默认清掉 fake 开关，走真实路径；U7 显式 setenv 覆盖。"""
+    """A legacy environment flag must never select the Panorama fixture backend."""
     monkeypatch.delenv("RQUANT_PANORAMA_FAKE", raising=False)
+
+
+@pytest.fixture
+def _test_fixture_backend() -> Iterator[None]:
+    with panorama_data._panorama_test_fixtures():
+        yield
 
 
 # ── 合并总表 fixtures ──────────────────────────────────────────────────────────
@@ -466,11 +472,12 @@ class TestFakeModeU7:
     def test_env_gate_isolation(self, monkeypatch: pytest.MonkeyPatch) -> None:
         assert panorama_data._fake_enabled() is False
         monkeypatch.setenv("RQUANT_PANORAMA_FAKE", "1")
-        assert panorama_data._fake_enabled() is True
+        assert panorama_data._fake_enabled() is False
+        with panorama_data._panorama_test_fixtures():
+            assert panorama_data._fake_enabled() is True
+        assert panorama_data._fake_enabled() is False
 
-    def test_all_eight_fetchers_shape(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("RQUANT_PANORAMA_FAKE", "1")
-
+    def test_all_eight_fetchers_shape(self, _test_fixture_backend: None) -> None:
         snap = panorama_data.fetch_market_snapshot()
         assert set(
             [
@@ -529,21 +536,19 @@ class TestFakeModeU7:
         ).issubset(kline.columns)
         assert len(kline) == 120
 
-    def test_fake_kline_mixed_candles(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_fake_kline_mixed_candles(self, _test_fixture_backend: None) -> None:
         """fake 日K 必须阳/阴混合，红/绿两条蜡烛渲染路径都有视觉覆盖。"""
-        monkeypatch.setenv("RQUANT_PANORAMA_FAKE", "1")
         kl = panorama_data.load_daily_kline("600001.SH")
         assert (kl["close"] > kl["open"]).any()
         assert (kl["close"] < kl["open"]).any()
 
     def test_fake_intraday_real_session_stamps_with_lunch_gap(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, _test_fixture_backend: None
     ) -> None:
         """fake 分时 dt 覆盖 09:30–11:29 与 13:00–15:00 两段、不含 11:30–12:59 午休。
 
         午休断裂是分时图空档修复（idx 序号轴）的可视验证前提，fake 必须复现。
         """
-        monkeypatch.setenv("RQUANT_PANORAMA_FAKE", "1")
         trend = panorama_data.fetch_intraday_trend("600001.SH", ndays=1)
         assert len(trend) == 240
         assert trend["dt"].dt.date.nunique() == 1
@@ -554,11 +559,8 @@ class TestFakeModeU7:
         assert trend["dt"].iloc[0].strftime("%H:%M") == "09:30"
         assert trend["dt"].iloc[-1].strftime("%H:%M") == "14:59"
 
-    def test_fake_5day_has_five_distinct_trading_days(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_fake_5day_has_five_distinct_trading_days(self, _test_fixture_backend: None) -> None:
         """5 日 fake 含 5 个交易日各 240 根真实时段时间戳（隔夜断裂，可视验证空档）。"""
-        monkeypatch.setenv("RQUANT_PANORAMA_FAKE", "1")
         trend5 = panorama_data.fetch_intraday_trend("600001.SH", ndays=5)
         assert len(trend5) == 1200
         per_day = trend5.groupby(trend5["dt"].dt.date).size()
@@ -567,16 +569,14 @@ class TestFakeModeU7:
         hm = trend5["dt"].dt.strftime("%H:%M")
         assert ((hm >= "11:30") & (hm <= "12:59")).sum() == 0
 
-    def test_fake_snapshot_has_two_limit_ups(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("RQUANT_PANORAMA_FAKE", "1")
+    def test_fake_snapshot_has_two_limit_ups(self, _test_fixture_backend: None) -> None:
         snap = add_limit_prices(panorama_data.fetch_market_snapshot())
         pulse = panorama_data.compute_market_pulse(snap)
         assert pulse.limit_up_count >= 2
         assert pulse.broken_count >= 1
 
-    def test_fake_overview_board_code_join(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_fake_overview_board_code_join(self, _test_fixture_backend: None) -> None:
         # fake 资金流 board_code 可精确 join 成分板块（覆盖精确 join 路径）
-        monkeypatch.setenv("RQUANT_PANORAMA_FAKE", "1")
         snap = add_limit_prices(panorama_data.fetch_market_snapshot())
         members = panorama_data.load_board_members()
         flow = panorama_data.fetch_sector_fund_flow("行业资金流")

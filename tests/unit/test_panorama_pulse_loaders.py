@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from datetime import UTC, date, datetime
 from pathlib import Path
 
@@ -33,6 +34,12 @@ def _write_lines(path: Path, rows: list[dict]) -> None:
 
 
 DAY = date(2026, 7, 29)
+
+
+@pytest.fixture
+def _test_fixture_backend() -> Iterator[None]:
+    with panorama_data._panorama_test_fixtures():
+        yield
 
 
 class TestPulseHistory:
@@ -424,8 +431,7 @@ class TestHistoricalIntradayTrend:
 
 
 class TestFakeMode:
-    def test_fake_covers_all_new_loaders(self, monkeypatch) -> None:
-        monkeypatch.setenv("RQUANT_PANORAMA_FAKE", "1")
+    def test_fake_covers_all_new_loaders(self, _test_fixture_backend: None) -> None:
         hist = load_pulse_history()
         assert len(hist) >= 60 and hist.iloc[0]["t"] == "09:30"
         alerts = load_pulse_alerts()

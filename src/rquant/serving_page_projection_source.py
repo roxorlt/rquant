@@ -1956,6 +1956,7 @@ def _read_surge_live_projection_sources(
     history_source = None
     if history_file is not None:
         raw, item = history_file
+        file_available_at = _source_file_time(item, observed=observed, name="pulse history")
         rows = tuple(
             _pulse_history_source_row(value, trade_date=trade_date)
             for value in _parse_jsonl_objects(
@@ -1963,17 +1964,17 @@ def _read_surge_live_projection_sources(
                 name=f"pulse-{trade_date.isoformat()}.jsonl",
             )
         )
-        _source_file_time(item, observed=observed, name="pulse history")
         if any(row.as_of > observed for row in rows):
             raise PageProjectionSourceIntegrityError("pulse history contains future evidence")
         history_source = PulseHistoryProjectionSource(
-            available_at=observed,
+            available_at=file_available_at,
             rows=rows,
         )
 
     alert_source = None
     if alert_file is not None:
         raw, item = alert_file
+        file_available_at = _source_file_time(item, observed=observed, name="pulse alerts")
         rows = tuple(
             _pulse_alert_source_row(value, trade_date=trade_date)
             for value in _parse_jsonl_objects(
@@ -1981,10 +1982,9 @@ def _read_surge_live_projection_sources(
                 name=f"pulse_alerts-{trade_date.isoformat()}.jsonl",
             )
         )
-        _source_file_time(item, observed=observed, name="pulse alerts")
         if any(row.as_of > observed for row in rows):
             raise PageProjectionSourceIntegrityError("pulse alerts contain future evidence")
-        alert_source = PulseAlertProjectionSource(available_at=observed, rows=rows)
+        alert_source = PulseAlertProjectionSource(available_at=file_available_at, rows=rows)
 
     config_source = None
     if config_file is not None:
@@ -2033,7 +2033,7 @@ def _read_surge_live_projection_sources(
                 "surge runtime config contains a future trade date"
             )
         config_source = SurgeRuntimeConfigProjectionSource(
-            available_at=observed,
+            available_at=file_time,
             row=row,
         )
     return history_source, alert_source, config_source

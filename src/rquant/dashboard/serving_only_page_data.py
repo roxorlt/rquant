@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType, TracebackType
-from typing import Any, Protocol, Self
+from typing import Any, Literal, Protocol, Self
 
 from rquant.runtime_contracts import AwareUtcDatetime, RuntimeContractModel, normalize_aware_utc
 from rquant.serving_contracts import (
@@ -51,6 +51,7 @@ class ServingFrameState(StrEnum):
 
 
 class ServingFrameResult(RuntimeContractModel):
+    source: Literal["serving"] = "serving"
     state: ServingFrameState
     detail: str
     generation_id: str | None = None
@@ -63,6 +64,7 @@ class ServingFrameResult(RuntimeContractModel):
 
         frame = pd.DataFrame(self.rows, columns=self.columns)
         frame.attrs["serving"] = {
+            "source": self.source,
             "state": self.state.value,
             "detail": self.detail,
             "generation_id": self.generation_id,

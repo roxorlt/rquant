@@ -762,6 +762,7 @@ def test_page_projections_are_atomic_bounded_and_independent_from_operational_db
         connection.execute("BEGIN TRANSACTION")
         connection.execute("INSERT INTO production_only VALUES (1)")
     monkeypatch.setenv("RQUANT_SERVING_ROOT", str(runtime_root / "serving"))
+    monkeypatch.setenv("RQUANT_PANORAMA_FAKE", "1")
     try:
         dashboard_result = query_serving_frame(
             runtime_root / "serving",

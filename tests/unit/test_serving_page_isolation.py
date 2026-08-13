@@ -17,6 +17,7 @@ from rquant.dashboard.runtime_console_data import (
     ServingFrameState,
     query_serving_frame,
 )
+from rquant.dashboard.serving_only_page_data import ServingOnlyRenderContext
 from rquant.serving_contracts import FreshnessStatus, ServingDatasetWatermark
 from rquant.serving_publisher import ServingPublisher, ServingTableSpec
 
@@ -164,6 +165,15 @@ def test_market_panorama_ui_uses_only_one_serving_generation_without_source_poll
     assert "live_dir=" not in source
     assert "open_panorama_serving_generation" in source
     assert source.count("open_panorama_serving_generation()") == 1
+
+
+def test_panorama_service_clears_fixture_flag_after_environment_file() -> None:
+    service = (_PROJECT_ROOT / "deploy/systemd/rquant-panorama.service").read_text(encoding="utf-8")
+
+    environment_file = service.index("EnvironmentFile=/home/lighthouse/rquant/.env")
+    fixture_clear = service.index("Environment=RQUANT_PANORAMA_FAKE=")
+
+    assert fixture_clear > environment_file
 
 
 def test_panorama_import_and_real_serving_open_are_operational_dependency_free(
@@ -687,6 +697,152 @@ def test_page_render_context_keeps_one_generation_after_pointer_rotation(tmp_pat
     assert context.generation_id == first.generation_id
     assert before.generation_id == after.generation_id == first.generation_id
     assert before.rows == after.rows == (("old",),)
+
+
+def test_serving_frame_contract_covers_all_states_across_pointer_rotation(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "serving"
+    first_built_at = datetime(2026, 8, 3, 1, 0, tzinfo=UTC)
+    second_built_at = first_built_at + timedelta(minutes=1)
+    publisher = ServingPublisher(
+        root,
+        producer_commit="a" * 40,
+        table_specs={
+            "projection_status": ServingTableSpec(sort_keys=("table_name",)),
+            "page_data": ServingTableSpec(sort_keys=("id",)),
+            "pulse_history": ServingTableSpec(sort_keys=("trade_date", "as_of")),
+            "unavailable_data": ServingTableSpec(sort_keys=("id",)),
+        },
+    )
+
+    def tables(*, value: str, available_at: datetime) -> dict[str, pd.DataFrame]:
+        return {
+            "projection_status": pd.DataFrame(
+                {
+                    "table_name": ["page_data", "pulse_history", "unavailable_data"],
+                    "available": [True, True, False],
+                    "reason": [None, None, "projection_not_published"],
+                    "owner_dataset_id": ["signals", "signals", "signals"],
+                    "available_at": [first_built_at, available_at, None],
+                }
+            ),
+            "page_data": pd.DataFrame({"id": [1], "value": [value]}),
+            "pulse_history": pd.DataFrame(
+                {
+                    "trade_date": [date(2026, 8, 3)],
+                    "as_of": [available_at],
+                    "t": ["09:31"],
+                }
+            ),
+            "unavailable_data": pd.DataFrame(
+                {"id": pd.Series(dtype="int64"), "value": pd.Series(dtype="string")}
+            ),
+        }
+
+    first = publisher.publish(
+        tables(value="first", available_at=first_built_at - timedelta(minutes=30)),
+        watermarks=(
+            ServingDatasetWatermark(
+                dataset_id="signals",
+                generation_id="signals-1",
+                event_time=first_built_at,
+                published_at=first_built_at,
+                sequence=1,
+                status=FreshnessStatus.FRESH,
+            ),
+        ),
+        source_generations={"signals": "signals-1"},
+        built_at=first_built_at,
+    )
+
+    with ServingOnlyRenderContext.open(
+        root,
+        now=first_built_at,
+        stale_after=timedelta(minutes=10),
+    ) as first_context:
+        ready_rows = first_context.query(
+            "SELECT id, value FROM page_data",
+            required_projections=("page_data",),
+        )
+        ready_empty = first_context.query(
+            "SELECT id, value FROM page_data WHERE id = 999",
+            required_projections=("page_data",),
+        )
+        stale = first_context.query(
+            "SELECT trade_date, as_of, t FROM pulse_history",
+            required_projections=("pulse_history",),
+        )
+        unavailable = first_context.query(
+            "SELECT id, value FROM unavailable_data",
+            required_projections=("unavailable_data",),
+        )
+
+        second = publisher.publish(
+            tables(value="second", available_at=second_built_at),
+            watermarks=(
+                ServingDatasetWatermark(
+                    dataset_id="signals",
+                    generation_id="signals-2",
+                    event_time=second_built_at,
+                    published_at=second_built_at,
+                    sequence=2,
+                    status=FreshnessStatus.DEGRADED,
+                    reason="source-degraded",
+                ),
+            ),
+            source_generations={"signals": "signals-2"},
+            built_at=second_built_at,
+        )
+        pinned_after_rotation = first_context.query(
+            "SELECT id, value FROM page_data",
+            required_projections=("page_data",),
+        )
+
+    with ServingOnlyRenderContext.open(root, now=second_built_at) as second_context:
+        degraded = second_context.query(
+            "SELECT id, value FROM page_data",
+            required_projections=("page_data",),
+        )
+
+    assert first.generation_id != second.generation_id
+    assert ready_rows.state is ServingFrameState.READY
+    assert ready_rows.rows == ((1, "first"),)
+    assert ready_empty.state is ServingFrameState.READY
+    assert ready_empty.rows == ()
+    assert stale.state is ServingFrameState.STALE
+    assert stale.rows == ((date(2026, 8, 3), first_built_at - timedelta(minutes=30), "09:31"),)
+    assert unavailable.state is ServingFrameState.UNAVAILABLE
+    assert unavailable.rows == ()
+    assert degraded.state is ServingFrameState.DEGRADED
+    assert degraded.rows == ((1, "second"),)
+    assert pinned_after_rotation.rows == ((1, "first"),)
+
+    first_results = (ready_rows, ready_empty, stale, unavailable, pinned_after_rotation)
+    assert {result.source for result in first_results} == {"serving"}
+    assert {result.generation_id for result in first_results} == {first.generation_id}
+    assert {result.generated_at for result in first_results} == {first_built_at}
+    assert degraded.source == "serving"
+    assert degraded.generation_id == second.generation_id
+    assert degraded.generated_at == second_built_at
+
+    expected_states = {
+        "ready_rows": (ready_rows, ServingFrameState.READY),
+        "ready_empty": (ready_empty, ServingFrameState.READY),
+        "stale": (stale, ServingFrameState.STALE),
+        "unavailable": (unavailable, ServingFrameState.UNAVAILABLE),
+        "degraded": (degraded, ServingFrameState.DEGRADED),
+    }
+    for name, (result, expected_state) in expected_states.items():
+        evidence = result.dataframe().attrs["serving"]
+        expected_generation = second if name == "degraded" else first
+        assert evidence == {
+            "source": "serving",
+            "state": expected_state.value,
+            "detail": result.detail,
+            "generation_id": expected_generation.generation_id,
+            "generated_at": expected_generation.built_at,
+        }
 
 
 def test_page_convenience_result_preserves_stale_state_instead_of_returning_raw_value(

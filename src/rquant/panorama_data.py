@@ -28,6 +28,7 @@ import os
 import re
 from collections.abc import Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
@@ -125,6 +126,7 @@ class _ServingStore:
             raise RuntimeError(result.detail)
         frame = result.dataframe()
         assert isinstance(frame, pd.DataFrame)
+        frame.attrs["serving_source"] = result.source
         frame.attrs["serving_state"] = result.state.value
         frame.attrs["serving_detail"] = result.detail
         frame.attrs["serving_generation_id"] = result.generation_id
@@ -186,6 +188,7 @@ def _serving_unavailable(
     store: _ReadableStore | None = None,
 ) -> pd.DataFrame:
     frame = pd.DataFrame(columns=columns)
+    frame.attrs["serving_source"] = "serving"
     evidence = None if store is None else store.serving_health()
     if evidence is None:
         frame.attrs["serving_state"] = "unavailable"
@@ -283,9 +286,25 @@ ROUTE_LABELS: dict[str, str] = {
 }
 
 
+_TEST_FIXTURE_BACKEND_ENABLED: ContextVar[bool] = ContextVar(
+    "panorama_test_fixture_backend_enabled",
+    default=False,
+)
+
+
+@contextmanager
+def _panorama_test_fixtures() -> Iterator[None]:
+    """Explicitly enable deterministic fixtures inside an isolated test context."""
+
+    token = _TEST_FIXTURE_BACKEND_ENABLED.set(True)
+    try:
+        yield
+    finally:
+        _TEST_FIXTURE_BACKEND_ENABLED.reset(token)
+
+
 def _fake_enabled() -> bool:
-    """RQUANT_PANORAMA_FAKE=1 时全数据层返回确定性 fixture（e2e 可测性）。"""
-    return os.environ.get("RQUANT_PANORAMA_FAKE", "").strip() == "1"
+    return _TEST_FIXTURE_BACKEND_ENABLED.get()
 
 
 class MarketPulse(BaseModel):
@@ -2145,7 +2164,7 @@ def load_surge_event_marks(
     )
 
 
-# ── A4 Fake 模式确定性 fixture（RQUANT_PANORAMA_FAKE=1，e2e 可测性） ────────────
+# ── A4 显式 test-only backend 确定性 fixture ──────────────────────────────────
 #
 # 全部固定 seed / 硬编码，列与类型必须与真实路径完全一致。核心样本：
 # 30 只主板票（600001..600030.SH），涨停 600001/600002（price==limit_up_price），
