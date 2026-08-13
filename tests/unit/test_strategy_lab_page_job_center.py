@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import ast
+import runpy
 import stat
+import sys
 from datetime import UTC, date, datetime
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -145,6 +147,29 @@ def test_strategy_lab_entrypoint_only_delegates_to_the_job_center_app() -> None:
     tree = _tree(ENTRYPOINT)
     assert _imports(tree) == {"__future__", "rquant.dashboard.lab.app"}
     assert _called_names(tree) == {"run_strategy_lab_app"}
+
+
+def test_strategy_lab_entrypoint_smoke_delegates_when_run_as_a_script(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tree = _tree(ENTRYPOINT)
+    assert _imports(tree) == {"__future__", "rquant.dashboard.lab.app"}
+
+    calls: list[None] = []
+    lab_package = ModuleType("rquant.dashboard.lab")
+    lab_package.__path__ = []  # type: ignore[attr-defined]
+    app_module = ModuleType("rquant.dashboard.lab.app")
+
+    def run_strategy_lab_app() -> None:
+        calls.append(None)
+
+    app_module.run_strategy_lab_app = run_strategy_lab_app
+    monkeypatch.setitem(sys.modules, "rquant.dashboard.lab", lab_package)
+    monkeypatch.setitem(sys.modules, "rquant.dashboard.lab.app", app_module)
+
+    runpy.run_path(str(ENTRYPOINT), run_name="__main__")
+
+    assert calls == [None]
 
 
 def test_strategy_lab_page_has_no_legacy_execution_dependencies() -> None:
