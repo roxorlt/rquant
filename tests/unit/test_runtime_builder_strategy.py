@@ -28,7 +28,6 @@ from rquant.feature_contracts import (
 )
 from rquant.feature_spool import FeatureBatchSpool
 from rquant.paper_broker import (
-    BrokerCostPolicy,
     BrokerExecutionContext,
     PaperBrokerStore,
 )
@@ -62,6 +61,7 @@ from rquant.strategy_runner import (
     canonical_feature_payload,
 )
 from rquant.strategy_spec import StrategyLifecycleState, StrategySpec
+from tests.paper_cost_fixtures import paper_cost_policy, paper_instrument_context
 from tests.shadow_ed25519_support import (
     create_rotating_shadow_ed25519_test_authority,
     create_shadow_ed25519_test_authority,
@@ -160,11 +160,7 @@ def _manifest(
             paper_broker_path,
             account_id="paper-main",
             initial_cash=Decimal("100000"),
-            cost_policy=BrokerCostPolicy(
-                commission_rate=Decimal("0.0003"),
-                minimum_commission=Decimal("5"),
-                sell_stamp_tax_rate=Decimal("0.001"),
-            ),
+            cost_policy=paper_cost_policy(),
         )
     settings: dict[str, object] = {
         "feature_spool_root": str(tmp_path / "features"),
@@ -705,11 +701,7 @@ def test_strategy_builder_uses_real_paper_fill_for_holding_and_t_plus_one_exit(
         tmp_path / "paper-broker.sqlite3",
         account_id="paper-main",
         initial_cash=Decimal("100000"),
-        cost_policy=BrokerCostPolicy(
-            commission_rate=Decimal("0.0003"),
-            minimum_commission=Decimal("5"),
-            sell_stamp_tax_rate=Decimal("0.001"),
-        ),
+        cost_policy=paper_cost_policy(),
     )
     intent_available = current_time[0] + timedelta(seconds=1)
     broker.submit_intent(
@@ -732,6 +724,7 @@ def test_strategy_builder_uses_real_paper_fill_for_holding_and_t_plus_one_exit(
         quote=BrokerExecutionContext(
             executable_price=Decimal("11.00"),
             acquisition_available_date=date(2026, 8, 3),
+            instrument_context=paper_instrument_context("600000.SH"),
         ),
     )
 

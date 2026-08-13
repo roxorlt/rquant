@@ -14,13 +14,10 @@ from zoneinfo import ZoneInfo
 
 from pydantic import Field, model_validator
 
-from rquant.order_execution_costs import (
-    OrderExecutionCosts,
-    calculate_order_execution_costs,
-    calculate_slipped_price,
-)
+from rquant.order_execution_costs import calculate_execution_costs
 from rquant.paper_contracts import (
     PaperAccountSnapshot,
+    PaperCostProvenanceState,
     PaperExecutionReceipt,
     PaperFill,
     PaperHolding,
@@ -32,13 +29,17 @@ from rquant.paper_contracts import (
     PaperSellQuantityAuthority,
     PaperSide,
 )
+from rquant.research_run_spec import (
+    ExecutionCostCalculation,
+    ExecutionCostOrderInput,
+    ExecutionCostSpec,
+    InstrumentContext,
+)
 from rquant.runtime_contracts import AwareUtcDatetime, RuntimeContractModel, canonical_sha256
 
 NonNegativeDecimal = Annotated[Decimal, Field(ge=0, allow_inf_nan=False)]
 PositiveDecimal = Annotated[Decimal, Field(gt=0, allow_inf_nan=False)]
-_CENT = Decimal("0.01")
 _PRICE_TICK = Decimal("0.0001")
-_BPS = Decimal("10000")
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _LEDGER_UNKNOWN_COLUMNS = (
     "unknown_fill_availability_count",
@@ -50,8 +51,9 @@ _LEDGER_UNKNOWN_COLUMNS = (
     "unknown_lot_timeline_count",
     "unknown_initial_execution_identity_count",
     "unknown_execution_receipt_count",
+    "unknown_cost_provenance_count",
 )
-_LEDGER_MIGRATION_VERSION = 2
+_LEDGER_MIGRATION_VERSION = 3
 _LEDGER_COUNT_TABLES = {
     "broker_account_count": "broker_account",
     "intent_count": "paper_intent",
@@ -65,6 +67,7 @@ _LEDGER_COUNT_TABLES = {
 _LEDGER_ATTESTATION_COUNT_COLUMNS = tuple(_LEDGER_COUNT_TABLES)
 _ATTESTED_SCHEMA_OBJECTS = (
     "broker_account",
+    "paper_cost_spec",
     "paper_intent",
     "paper_order",
     "paper_fill",
@@ -85,13 +88,20 @@ _ATTESTED_SCHEMA_OBJECTS = (
     "idx_paper_lot_position_fifo",
     "idx_paper_consumption_lot_pit",
     "idx_paper_execution_receipt_intent",
+    "idx_paper_fill_cost_provenance",
     "paper_intent_persisted_at_immutable",
     "paper_intent_identity_immutable",
     "paper_execution_receipt_update_immutable",
     "paper_execution_receipt_delete_immutable",
+    "paper_execution_receipt_known_v3_required",
+    "paper_cost_spec_update_immutable",
+    "paper_cost_spec_delete_immutable",
+    "broker_account_known_v3_required",
+    "broker_account_cost_binding_immutable",
     "paper_fill_persisted_at_immutable",
     "paper_fill_row_immutable",
     "paper_fill_delete_immutable",
+    "paper_fill_known_v3_required",
     "paper_lot_persisted_at_immutable",
     "paper_lot_entry_signal_id_immutable",
     "paper_lot_consumption_persisted_at_immutable",
@@ -104,6 +114,21 @@ _ATTESTED_SCHEMA_OBJECTS = (
     "paper_ledger_head_marker_delete_immutable",
     "paper_ledger_tamper_marker_update_immutable",
     "paper_ledger_tamper_marker_delete_immutable",
+)
+_V5_ATTESTED_ONLY_OBJECTS = frozenset(
+    {
+        "paper_cost_spec",
+        "idx_paper_fill_cost_provenance",
+        "paper_execution_receipt_known_v3_required",
+        "paper_cost_spec_update_immutable",
+        "paper_cost_spec_delete_immutable",
+        "broker_account_known_v3_required",
+        "broker_account_cost_binding_immutable",
+        "paper_fill_known_v3_required",
+    }
+)
+_V4_ATTESTED_SCHEMA_OBJECTS = tuple(
+    name for name in _ATTESTED_SCHEMA_OBJECTS if name not in _V5_ATTESTED_ONLY_OBJECTS
 )
 
 
@@ -128,31 +153,40 @@ class NoExecutableSellQuantityError(ValueError):
 
 
 class BrokerCostPolicy(RuntimeContractModel):
-    """Immutable costs used for one broker runtime generation."""
+    """A paper broker can execute only from one explicit v3 cost authority."""
 
-    commission_rate: NonNegativeDecimal
-    minimum_commission: NonNegativeDecimal
-    sell_stamp_tax_rate: NonNegativeDecimal
-    buy_slippage_bps: NonNegativeDecimal = Decimal("0")
-    sell_slippage_bps: NonNegativeDecimal = Decimal("0")
+    execution_cost_spec: ExecutionCostSpec
+    cost_spec_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
     @model_validator(mode="after")
-    def validate_slippage(self) -> BrokerCostPolicy:
-        if self.buy_slippage_bps >= _BPS or self.sell_slippage_bps >= _BPS:
-            raise ValueError("slippage bps must be below 10000")
-        if self.commission_rate >= 1 or self.sell_stamp_tax_rate >= 1:
-            raise ValueError("cost rates must be below one")
+    def validate_execution_cost_spec(self) -> BrokerCostPolicy:
+        spec = ExecutionCostSpec.model_validate(self.execution_cost_spec)
+        if not spec.is_alignment_eligible or spec.cost_spec_id is None:
+            raise ValueError("paper broker requires an alignment-eligible v3 execution_cost_spec")
+        if self.cost_spec_id is None:
+            object.__setattr__(self, "cost_spec_id", spec.cost_spec_id)
+        elif self.cost_spec_id != spec.cost_spec_id:
+            raise ValueError("paper broker cost_spec_id must match execution_cost_spec")
         return self
+
+    @classmethod
+    def from_execution_cost_spec(cls, spec: ExecutionCostSpec) -> BrokerCostPolicy:
+        validated = ExecutionCostSpec.model_validate(spec)
+        if not validated.is_alignment_eligible or validated.cost_spec_id is None:
+            raise ValueError("paper broker requires an explicit v3 execution_cost_spec")
+        return cls(execution_cost_spec=validated, cost_spec_id=validated.cost_spec_id)
 
     @property
     def fingerprint(self) -> str:
-        return canonical_sha256(self.model_dump(mode="python"))
+        assert self.cost_spec_id is not None
+        return self.cost_spec_id
 
 
 class BrokerExecutionContext(RuntimeContractModel):
     """Frozen executable quote and explicit market/risk constraints."""
 
     executable_price: PositiveDecimal
+    instrument_context: InstrumentContext
     executable_quantity: int | None = Field(default=None, ge=0, multiple_of=100)
     acquisition_available_date: date | None = None
     suspended: bool = False
@@ -297,6 +331,11 @@ class PaperBrokerStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
             if self._has_attestation(connection):
+                schema = connection.execute(
+                    "SELECT schema_version FROM paper_ledger_schema WHERE singleton = 1 LIMIT 1"
+                ).fetchone()
+                if schema is not None and int(schema["schema_version"]) == 4:
+                    self._ensure_ledger_schema_v5(connection)
                 self._ledger_trust_status(connection)
                 self._initialize_account(connection)
                 return
@@ -494,6 +533,7 @@ class PaperBrokerStore:
                 """
             )
             self._ensure_ledger_schema_v4(connection)
+            self._ensure_ledger_schema_v5(connection)
             self._initialize_account(connection)
 
     @staticmethod
@@ -535,7 +575,8 @@ class PaperBrokerStore:
     def _initialize_account(self, connection: sqlite3.Connection) -> None:
         row = connection.execute(
             """
-            SELECT initial_cash, cost_policy_fingerprint
+            SELECT initial_cash, cost_policy_fingerprint, cost_spec_id,
+                   cost_spec_schema_version, cost_provenance_state
             FROM broker_account WHERE account_id = ?
             """,
             (self.account_id,),
@@ -543,23 +584,33 @@ class PaperBrokerStore:
         if row is not None:
             if Decimal(row["initial_cash"]) != self.initial_cash:
                 raise ValueError("existing account initial_cash does not match")
-            if row["cost_policy_fingerprint"] != self.cost_policy.fingerprint:
-                raise ValueError("existing account cost_policy does not match")
+            if row["cost_provenance_state"] == PaperCostProvenanceState.LEGACY_UNKNOWN.value:
+                return
+            if (
+                row["cost_provenance_state"] != PaperCostProvenanceState.KNOWN_V3.value
+                or row["cost_spec_schema_version"] != 3
+                or row["cost_spec_id"] != self.cost_policy.cost_spec_id
+                or row["cost_policy_fingerprint"] != self.cost_policy.fingerprint
+            ):
+                raise ValueError("existing account v3 cost binding does not match")
             return
-        self._raise_if_ledger_untrusted(self._ledger_trust_status(connection))
+        self._require_schema_integrity(connection)
         connection.execute("BEGIN IMMEDIATE")
         try:
-            self._require_trusted_ledger(connection)
+            self._require_schema_integrity(connection)
             existing = connection.execute(
                 "SELECT 1 FROM broker_account WHERE account_id = ? LIMIT 1",
                 (self.account_id,),
             ).fetchone()
             if existing is None:
+                self._ensure_paper_cost_spec_authority(connection)
+                assert self.cost_policy.cost_spec_id is not None
                 connection.execute(
                     """
                     INSERT INTO broker_account(
-                        account_id, initial_cash, cash, realized_pnl, cost_policy_fingerprint
-                    ) VALUES (?, ?, ?, ?, ?)
+                        account_id, initial_cash, cash, realized_pnl, cost_policy_fingerprint,
+                        cost_spec_id, cost_spec_schema_version, cost_provenance_state
+                    ) VALUES (?, ?, ?, ?, ?, ?, 3, 'KNOWN_V3')
                     """,
                     (
                         self.account_id,
@@ -567,6 +618,7 @@ class PaperBrokerStore:
                         _money(self.initial_cash),
                         "0",
                         self.cost_policy.fingerprint,
+                        self.cost_policy.cost_spec_id,
                     ),
                 )
                 self._append_ledger_attestation(
@@ -576,7 +628,8 @@ class PaperBrokerStore:
                         {
                             "account_id": self.account_id,
                             "initial_cash": self.initial_cash,
-                            "cost_policy_fingerprint": self.cost_policy.fingerprint,
+                            "cost_spec_id": self.cost_policy.cost_spec_id,
+                            "cost_spec_schema_version": 3,
                         }
                     ),
                     count_deltas={"broker_account_count": 1},
@@ -587,6 +640,39 @@ class PaperBrokerStore:
                 connection.rollback()
             raise
 
+    def _ensure_paper_cost_spec_authority(self, connection: sqlite3.Connection) -> None:
+        spec = self.cost_policy.execution_cost_spec
+        assert spec.cost_spec_id is not None
+        assert spec.cost_engine_version is not None
+        canonical_json = spec.canonical_json()
+        row = connection.execute(
+            "SELECT * FROM paper_cost_spec WHERE cost_spec_id = ?",
+            (spec.cost_spec_id,),
+        ).fetchone()
+        if row is None:
+            connection.execute(
+                """
+                INSERT INTO paper_cost_spec(
+                    cost_spec_id, schema_version, cost_engine_version, canonical_json, persisted_at
+                ) VALUES (?, 3, ?, ?, ?)
+                """,
+                (
+                    spec.cost_spec_id,
+                    spec.cost_engine_version,
+                    canonical_json,
+                    _utc_iso(datetime.now(UTC)),
+                ),
+            )
+            return
+        if (
+            row["schema_version"] != 3
+            or row["cost_engine_version"] != spec.cost_engine_version
+            or row["canonical_json"] != canonical_json
+        ):
+            raise PaperBrokerReconciliationError(
+                "paper cost spec authority conflicts with the active v3 execution cost spec"
+            )
+
     @staticmethod
     def _table_columns(connection: sqlite3.Connection, table: str) -> set[str]:
         return {
@@ -594,17 +680,21 @@ class PaperBrokerStore:
         }
 
     @staticmethod
-    def _schema_fingerprint(connection: sqlite3.Connection) -> str | None:
-        placeholders = ",".join("?" for _ in _ATTESTED_SCHEMA_OBJECTS)
+    def _schema_fingerprint(
+        connection: sqlite3.Connection,
+        *,
+        objects: tuple[str, ...] = _ATTESTED_SCHEMA_OBJECTS,
+    ) -> str | None:
+        placeholders = ",".join("?" for _ in objects)
         rows = connection.execute(
             f"""
             SELECT type, name, sql FROM sqlite_master
             WHERE name IN ({placeholders})
             ORDER BY type, name
             """,
-            _ATTESTED_SCHEMA_OBJECTS,
+            objects,
         ).fetchall()
-        if {str(row["name"]) for row in rows} != set(_ATTESTED_SCHEMA_OBJECTS):
+        if {str(row["name"]) for row in rows} != set(objects):
             return None
         return canonical_sha256(
             tuple(
@@ -913,7 +1003,7 @@ class PaperBrokerStore:
             "revision": int(latest["revision"]) + 1,
             "ledger_generation": str(latest["ledger_generation"]),
             "migration_version": _LEDGER_MIGRATION_VERSION,
-            "schema_version": 4,
+            "schema_version": 5,
             "schema_fingerprint": str(latest["schema_fingerprint"]),
             "previous_attestation_fingerprint": str(latest["attestation_fingerprint"]),
             "migration_attestation_fingerprint": str(
@@ -966,18 +1056,11 @@ class PaperBrokerStore:
             for column in _LEDGER_UNKNOWN_COLUMNS
             if int(row[column]) > 0
         )
-        if schema_version != 4:
+        if schema_version != 5:
             return PaperLedgerTrustStatus(
                 state="quarantined",
                 schema_version=schema_version,
                 reason="unsupported_schema_version",
-                unknown_evidence=unknown,
-            )
-        if unknown:
-            return PaperLedgerTrustStatus(
-                state="quarantined",
-                schema_version=schema_version,
-                reason="unknown_legacy_execution_evidence",
                 unknown_evidence=unknown,
             )
         if not cls._table_exists(connection, "paper_ledger_attestation"):
@@ -1014,10 +1097,17 @@ class PaperBrokerStore:
                 schema_version=schema_version,
                 reason="migration_attestation_schema_conflict",
             )
+        if unknown:
+            return PaperLedgerTrustStatus(
+                state="quarantined",
+                schema_version=schema_version,
+                reason="unknown_legacy_execution_evidence",
+                unknown_evidence=unknown,
+            )
         return PaperLedgerTrustStatus(
             state="trusted",
             schema_version=schema_version,
-            reason="verified_schema_v4",
+            reason="verified_schema_v5",
         )
 
     @staticmethod
@@ -1038,13 +1128,67 @@ class PaperBrokerStore:
             return self._ledger_trust_status(connection)
 
     def require_trusted_ledger(self) -> None:
-        """Fail before an operational caller prepares or submits execution evidence."""
+        """Fail unless this account has a known immutable v3 cost binding."""
 
         with self._connect() as connection:
-            self._raise_if_ledger_untrusted(self._ledger_trust_status(connection))
+            self._require_execution_ready(connection)
 
     def _require_trusted_ledger(self, connection: sqlite3.Connection) -> None:
-        self._raise_if_ledger_untrusted(self._ledger_trust_status(connection))
+        self._require_execution_ready(connection)
+
+    def _require_schema_integrity(self, connection: sqlite3.Connection) -> None:
+        """Permit a fresh v5 account beside quarantined legacy evidence only."""
+
+        status = self._ledger_trust_status(connection)
+        if status.state == "trusted":
+            return
+        if status.schema_version == 5 and status.reason == "unknown_legacy_execution_evidence":
+            return
+        self._raise_if_ledger_untrusted(status)
+
+    def _require_execution_ready(self, connection: sqlite3.Connection) -> None:
+        self._require_schema_integrity(connection)
+        row = connection.execute(
+            """
+            SELECT cost_spec_id, cost_spec_schema_version, cost_provenance_state
+            FROM broker_account WHERE account_id = ?
+            """,
+            (self.account_id,),
+        ).fetchone()
+        if row is None:
+            raise PaperBrokerReconciliationError("paper broker account is missing")
+        if (
+            row["cost_provenance_state"] != PaperCostProvenanceState.KNOWN_V3.value
+            or row["cost_spec_schema_version"] != 3
+            or row["cost_spec_id"] != self.cost_policy.cost_spec_id
+        ):
+            raise PaperLedgerQuarantinedError(
+                "paper broker account is quarantined and audit-only because its cost "
+                "provenance is not bound to the active v3 execution cost spec"
+            )
+        self._require_active_cost_spec_authority(connection)
+
+    def _require_active_cost_spec_authority(self, connection: sqlite3.Connection) -> None:
+        spec = self.cost_policy.execution_cost_spec
+        assert spec.cost_spec_id is not None
+        assert spec.cost_engine_version is not None
+        authority = connection.execute(
+            """
+            SELECT schema_version, cost_engine_version, canonical_json
+            FROM paper_cost_spec WHERE cost_spec_id = ?
+            """,
+            (spec.cost_spec_id,),
+        ).fetchone()
+        if (
+            authority is None
+            or authority["schema_version"] != 3
+            or authority["cost_engine_version"] != spec.cost_engine_version
+            or authority["canonical_json"] != spec.canonical_json()
+        ):
+            raise PaperLedgerQuarantinedError(
+                "paper broker account is quarantined and audit-only because its v3 cost "
+                "authority does not match the active execution cost spec"
+            )
 
     def _ensure_ledger_schema_v4(self, connection: sqlite3.Connection) -> None:
         additions = {
@@ -1399,7 +1543,10 @@ class PaperBrokerStore:
             )
             if not connection.in_transaction:
                 connection.execute("BEGIN IMMEDIATE")
-            schema_fingerprint = self._schema_fingerprint(connection)
+            schema_fingerprint = self._schema_fingerprint(
+                connection,
+                objects=_V4_ATTESTED_SCHEMA_OBJECTS,
+            )
             if schema_fingerprint is None:
                 raise PaperBrokerReconciliationError(
                     "paper ledger schema cannot be attested after migration"
@@ -1431,6 +1578,445 @@ class PaperBrokerStore:
                     "event_fingerprint": migration_fingerprint,
                     **counts,
                     "persisted_at": persisted_at,
+                },
+            )
+            connection.commit()
+        except BaseException:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+
+    def _ensure_ledger_schema_v5(self, connection: sqlite3.Connection) -> None:
+        """Promote v4 evidence without assigning fees that were never persisted."""
+
+        schema_row = connection.execute(
+            "SELECT * FROM paper_ledger_schema WHERE singleton = 1 LIMIT 1"
+        ).fetchone()
+        if schema_row is None:
+            raise PaperBrokerReconciliationError("paper ledger schema metadata is missing")
+        schema_version = int(schema_row["schema_version"])
+        if schema_version == 5:
+            return
+        if schema_version != 4:
+            raise PaperBrokerReconciliationError(
+                "unsupported paper ledger schema requires explicit migration"
+            )
+
+        previous_head = connection.execute(
+            "SELECT attestation_fingerprint FROM paper_ledger_attestation "
+            "ORDER BY revision DESC LIMIT 1"
+        ).fetchone()
+        previous_v4_attestation = (
+            None if previous_head is None else str(previous_head["attestation_fingerprint"])
+        )
+        schema_columns = set(schema_row.keys())
+        old_unknown = {
+            column: int(schema_row[column])
+            for column in _LEDGER_UNKNOWN_COLUMNS
+            if column in schema_columns
+        }
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            additions = {
+                "broker_account": {
+                    "cost_spec_id": "TEXT",
+                    "cost_spec_schema_version": "INTEGER",
+                    "cost_provenance_state": "TEXT",
+                },
+                "paper_fill": {
+                    "transfer_fee": "TEXT",
+                    "total_fees": "TEXT",
+                    "cost_spec_id": "TEXT",
+                    "cost_spec_schema_version": "INTEGER",
+                    "cost_context_fingerprint": "TEXT",
+                    "cost_provenance_state": "TEXT",
+                },
+                "paper_execution_receipt": {
+                    "transfer_fee": "TEXT",
+                    "total_fees": "TEXT",
+                    "cost_spec_id": "TEXT",
+                    "cost_spec_schema_version": "INTEGER",
+                    "cost_context_fingerprint": "TEXT",
+                    "cost_provenance_state": "TEXT",
+                },
+            }
+            for table, columns in additions.items():
+                existing = self._table_columns(connection, table)
+                for name, sql_type in columns.items():
+                    if name not in existing:
+                        connection.execute(f'ALTER TABLE "{table}" ADD COLUMN "{name}" {sql_type}')
+
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS paper_cost_spec (
+                    cost_spec_id TEXT PRIMARY KEY,
+                    schema_version INTEGER NOT NULL CHECK(schema_version = 3),
+                    cost_engine_version TEXT NOT NULL,
+                    canonical_json TEXT NOT NULL,
+                    persisted_at TEXT NOT NULL,
+                    UNIQUE(schema_version, cost_engine_version, canonical_json)
+                )
+                """
+            )
+            for trigger in (
+                "paper_execution_receipt_update_immutable",
+                "paper_execution_receipt_delete_immutable",
+                "paper_execution_receipt_known_v3_required",
+                "paper_cost_spec_update_immutable",
+                "paper_cost_spec_delete_immutable",
+                "broker_account_known_v3_required",
+                "paper_fill_persisted_at_immutable",
+                "paper_fill_row_immutable",
+                "paper_fill_delete_immutable",
+                "paper_fill_known_v3_required",
+                "broker_account_cost_binding_immutable",
+                "paper_ledger_attestation_update_immutable",
+                "paper_ledger_attestation_delete_immutable",
+                "paper_ledger_attestation_delete_tamper",
+                "paper_ledger_head_marker_update_immutable",
+                "paper_ledger_head_marker_delete_immutable",
+                "paper_ledger_tamper_marker_update_immutable",
+                "paper_ledger_tamper_marker_delete_immutable",
+            ):
+                connection.execute(f'DROP TRIGGER IF EXISTS "{trigger}"')
+
+            # Existing v4 rows have no receipt-level v3 authority.  Preserve their
+            # balances and old fields exactly, rather than reconstructing a fee split.
+            connection.execute(
+                """
+                UPDATE broker_account
+                SET cost_spec_id = NULL,
+                    cost_spec_schema_version = NULL,
+                    cost_provenance_state = 'LEGACY_UNKNOWN'
+                """
+            )
+            connection.execute(
+                """
+                UPDATE paper_fill
+                SET transfer_fee = NULL,
+                    total_fees = NULL,
+                    cost_spec_id = NULL,
+                    cost_spec_schema_version = NULL,
+                    cost_context_fingerprint = NULL,
+                    cost_provenance_state = 'LEGACY_UNKNOWN'
+                """
+            )
+            connection.execute(
+                """
+                UPDATE paper_execution_receipt
+                SET transfer_fee = NULL,
+                    total_fees = NULL,
+                    cost_spec_id = NULL,
+                    cost_spec_schema_version = NULL,
+                    cost_context_fingerprint = NULL,
+                    cost_provenance_state = 'LEGACY_UNKNOWN'
+                """
+            )
+
+            legacy_cost_evidence = {
+                "account": int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM broker_account "
+                        "WHERE cost_provenance_state = 'LEGACY_UNKNOWN'"
+                    ).fetchone()[0]
+                ),
+                "fill": int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM paper_fill "
+                        "WHERE cost_provenance_state = 'LEGACY_UNKNOWN'"
+                    ).fetchone()[0]
+                ),
+                "receipt": int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM paper_execution_receipt "
+                        "WHERE cost_provenance_state = 'LEGACY_UNKNOWN'"
+                    ).fetchone()[0]
+                ),
+            }
+
+            for table, archive in (
+                ("paper_ledger_head_marker", "paper_ledger_head_marker_v4_archive"),
+                ("paper_ledger_tamper_marker", "paper_ledger_tamper_marker_v4_archive"),
+                ("paper_ledger_attestation", "paper_ledger_attestation_v4_archive"),
+                ("paper_ledger_schema", "paper_ledger_schema_v4_archive"),
+            ):
+                candidate = archive
+                archive_number = 2
+                while self._table_exists(connection, candidate):
+                    candidate = f"{archive}_{archive_number}"
+                    archive_number += 1
+                connection.execute(f'ALTER TABLE "{table}" RENAME TO "{candidate}"')
+
+            connection.executescript(
+                """
+                CREATE TABLE paper_ledger_schema (
+                    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                    schema_version INTEGER NOT NULL CHECK(schema_version = 5),
+                    migrated_at TEXT NOT NULL,
+                    unknown_fill_availability_count INTEGER NOT NULL CHECK(
+                        unknown_fill_availability_count >= 0
+                    ),
+                    unknown_lot_availability_count INTEGER NOT NULL CHECK(
+                        unknown_lot_availability_count >= 0
+                    ),
+                    unknown_consumption_availability_count INTEGER NOT NULL CHECK(
+                        unknown_consumption_availability_count >= 0
+                    ),
+                    unknown_lot_provenance_count INTEGER NOT NULL CHECK(
+                        unknown_lot_provenance_count >= 0
+                    ),
+                    unknown_intent_identity_count INTEGER NOT NULL CHECK(
+                        unknown_intent_identity_count >= 0
+                    ),
+                    unknown_execution_identity_count INTEGER NOT NULL CHECK(
+                        unknown_execution_identity_count >= 0
+                    ),
+                    unknown_lot_timeline_count INTEGER NOT NULL CHECK(
+                        unknown_lot_timeline_count >= 0
+                    ),
+                    unknown_initial_execution_identity_count INTEGER NOT NULL CHECK(
+                        unknown_initial_execution_identity_count >= 0
+                    ),
+                    unknown_execution_receipt_count INTEGER NOT NULL CHECK(
+                        unknown_execution_receipt_count >= 0
+                    ),
+                    unknown_cost_provenance_count INTEGER NOT NULL CHECK(
+                        unknown_cost_provenance_count >= 0
+                    )
+                );
+                CREATE TABLE paper_ledger_attestation (
+                    revision INTEGER PRIMARY KEY CHECK(revision >= 1),
+                    ledger_generation TEXT NOT NULL,
+                    migration_version INTEGER NOT NULL,
+                    schema_version INTEGER NOT NULL,
+                    schema_fingerprint TEXT NOT NULL,
+                    previous_attestation_fingerprint TEXT,
+                    migration_attestation_fingerprint TEXT NOT NULL,
+                    event_kind TEXT NOT NULL,
+                    event_fingerprint TEXT NOT NULL,
+                    broker_account_count INTEGER NOT NULL CHECK(broker_account_count >= 0),
+                    intent_count INTEGER NOT NULL CHECK(intent_count >= 0),
+                    order_count INTEGER NOT NULL CHECK(order_count >= 0),
+                    fill_count INTEGER NOT NULL CHECK(fill_count >= 0),
+                    lot_count INTEGER NOT NULL CHECK(lot_count >= 0),
+                    consumption_count INTEGER NOT NULL CHECK(consumption_count >= 0),
+                    receipt_count INTEGER NOT NULL CHECK(receipt_count >= 0),
+                    authority_count INTEGER NOT NULL CHECK(authority_count >= 0),
+                    payload_json TEXT NOT NULL,
+                    attestation_fingerprint TEXT NOT NULL UNIQUE,
+                    persisted_at TEXT NOT NULL,
+                    FOREIGN KEY(previous_attestation_fingerprint)
+                        REFERENCES paper_ledger_attestation(attestation_fingerprint)
+                        ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED
+                );
+                CREATE TABLE paper_ledger_head_marker (
+                    revision INTEGER PRIMARY KEY CHECK(revision >= 1),
+                    ledger_generation TEXT NOT NULL,
+                    migration_version INTEGER NOT NULL,
+                    schema_version INTEGER NOT NULL,
+                    schema_fingerprint TEXT NOT NULL,
+                    attestation_fingerprint TEXT NOT NULL UNIQUE,
+                    previous_head_marker_fingerprint TEXT,
+                    migration_attestation_fingerprint TEXT NOT NULL,
+                    broker_account_count INTEGER NOT NULL CHECK(broker_account_count >= 0),
+                    intent_count INTEGER NOT NULL CHECK(intent_count >= 0),
+                    order_count INTEGER NOT NULL CHECK(order_count >= 0),
+                    fill_count INTEGER NOT NULL CHECK(fill_count >= 0),
+                    lot_count INTEGER NOT NULL CHECK(lot_count >= 0),
+                    consumption_count INTEGER NOT NULL CHECK(consumption_count >= 0),
+                    receipt_count INTEGER NOT NULL CHECK(receipt_count >= 0),
+                    authority_count INTEGER NOT NULL CHECK(authority_count >= 0),
+                    payload_json TEXT NOT NULL,
+                    head_marker_fingerprint TEXT NOT NULL UNIQUE,
+                    persisted_at TEXT NOT NULL,
+                    FOREIGN KEY(attestation_fingerprint)
+                        REFERENCES paper_ledger_attestation(attestation_fingerprint)
+                        ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
+                    FOREIGN KEY(previous_head_marker_fingerprint)
+                        REFERENCES paper_ledger_head_marker(head_marker_fingerprint)
+                        ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED
+                );
+                CREATE TABLE paper_ledger_tamper_marker (
+                    tamper_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    target_revision INTEGER NOT NULL,
+                    target_attestation_fingerprint TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    detected_at TEXT NOT NULL
+                );
+                """
+            )
+            unknown_cost_count = sum(legacy_cost_evidence.values())
+            connection.execute(
+                """
+                INSERT INTO paper_ledger_schema(
+                    singleton, schema_version, migrated_at,
+                    unknown_fill_availability_count,
+                    unknown_lot_availability_count,
+                    unknown_consumption_availability_count,
+                    unknown_lot_provenance_count,
+                    unknown_intent_identity_count,
+                    unknown_execution_identity_count,
+                    unknown_lot_timeline_count,
+                    unknown_initial_execution_identity_count,
+                    unknown_execution_receipt_count,
+                    unknown_cost_provenance_count
+                ) VALUES (1, 5, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    old_unknown.get("unknown_fill_availability_count", 0),
+                    old_unknown.get("unknown_lot_availability_count", 0),
+                    old_unknown.get("unknown_consumption_availability_count", 0),
+                    old_unknown.get("unknown_lot_provenance_count", 0),
+                    old_unknown.get("unknown_intent_identity_count", 0),
+                    old_unknown.get("unknown_execution_identity_count", 0),
+                    old_unknown.get("unknown_lot_timeline_count", 0),
+                    old_unknown.get("unknown_initial_execution_identity_count", 0),
+                    old_unknown.get("unknown_execution_receipt_count", 0),
+                    unknown_cost_count,
+                ),
+            )
+            connection.executescript(
+                """
+                CREATE INDEX IF NOT EXISTS idx_paper_fill_cost_provenance
+                ON paper_fill(cost_provenance_state, cost_spec_id, cost_context_fingerprint);
+                CREATE TRIGGER paper_execution_receipt_update_immutable
+                BEFORE UPDATE ON paper_execution_receipt
+                BEGIN SELECT RAISE(ABORT, 'paper execution receipt is immutable'); END;
+                CREATE TRIGGER paper_execution_receipt_delete_immutable
+                BEFORE DELETE ON paper_execution_receipt
+                BEGIN SELECT RAISE(ABORT, 'paper execution receipt is immutable'); END;
+                CREATE TRIGGER paper_execution_receipt_known_v3_required
+                BEFORE INSERT ON paper_execution_receipt
+                WHEN NEW.cost_provenance_state IS NOT 'KNOWN_V3'
+                  OR NEW.transfer_fee IS NULL
+                  OR NEW.total_fees IS NULL
+                  OR NEW.cost_spec_id IS NULL
+                  OR NEW.cost_spec_schema_version IS NOT 3
+                  OR NEW.cost_context_fingerprint IS NULL
+                  OR NOT EXISTS (
+                      SELECT 1 FROM paper_cost_spec AS spec
+                      WHERE spec.cost_spec_id = NEW.cost_spec_id
+                  )
+                BEGIN
+                    SELECT RAISE(
+                        ABORT,
+                        'new paper execution receipt requires KNOWN_V3 cost evidence'
+                    );
+                END;
+                CREATE TRIGGER paper_cost_spec_update_immutable
+                BEFORE UPDATE ON paper_cost_spec
+                BEGIN SELECT RAISE(ABORT, 'paper cost spec authority is immutable'); END;
+                CREATE TRIGGER paper_cost_spec_delete_immutable
+                BEFORE DELETE ON paper_cost_spec
+                BEGIN SELECT RAISE(ABORT, 'paper cost spec authority is immutable'); END;
+                CREATE TRIGGER broker_account_known_v3_required
+                BEFORE INSERT ON broker_account
+                WHEN NEW.cost_provenance_state IS NOT 'KNOWN_V3'
+                  OR NEW.cost_spec_id IS NULL
+                  OR NEW.cost_spec_schema_version IS NOT 3
+                  OR NEW.cost_policy_fingerprint IS NOT NEW.cost_spec_id
+                  OR NOT EXISTS (
+                      SELECT 1 FROM paper_cost_spec AS spec
+                      WHERE spec.cost_spec_id = NEW.cost_spec_id
+                  )
+                BEGIN
+                    SELECT RAISE(
+                        ABORT,
+                        'new paper broker account requires known v3 cost binding'
+                    );
+                END;
+                CREATE TRIGGER broker_account_cost_binding_immutable
+                BEFORE UPDATE OF initial_cash, cost_policy_fingerprint, cost_spec_id,
+                                 cost_spec_schema_version, cost_provenance_state
+                ON broker_account
+                BEGIN SELECT RAISE(ABORT, 'paper broker account cost binding is immutable'); END;
+                CREATE TRIGGER paper_fill_persisted_at_immutable
+                BEFORE UPDATE OF persisted_at ON paper_fill
+                WHEN NEW.persisted_at IS NOT OLD.persisted_at
+                BEGIN SELECT RAISE(ABORT, 'paper_fill persisted_at is immutable'); END;
+                CREATE TRIGGER paper_fill_row_immutable
+                BEFORE UPDATE ON paper_fill
+                BEGIN SELECT RAISE(ABORT, 'paper_fill row is immutable'); END;
+                CREATE TRIGGER paper_fill_delete_immutable
+                BEFORE DELETE ON paper_fill
+                BEGIN SELECT RAISE(ABORT, 'paper_fill row is immutable'); END;
+                CREATE TRIGGER paper_fill_known_v3_required
+                BEFORE INSERT ON paper_fill
+                WHEN NEW.cost_provenance_state IS NOT 'KNOWN_V3'
+                  OR NEW.transfer_fee IS NULL
+                  OR NEW.total_fees IS NULL
+                  OR NEW.cost_spec_id IS NULL
+                  OR NEW.cost_spec_schema_version IS NOT 3
+                  OR NEW.cost_context_fingerprint IS NULL
+                  OR NOT EXISTS (
+                      SELECT 1 FROM paper_cost_spec AS spec
+                      WHERE spec.cost_spec_id = NEW.cost_spec_id
+                  )
+                BEGIN SELECT RAISE(ABORT, 'new paper fill requires KNOWN_V3 cost evidence'); END;
+                CREATE TRIGGER paper_ledger_attestation_update_immutable
+                BEFORE UPDATE ON paper_ledger_attestation
+                BEGIN SELECT RAISE(ABORT, 'paper ledger attestation is immutable'); END;
+                CREATE TRIGGER paper_ledger_attestation_delete_immutable
+                BEFORE DELETE ON paper_ledger_attestation
+                BEGIN SELECT RAISE(ABORT, 'paper ledger attestation is immutable'); END;
+                CREATE TRIGGER paper_ledger_attestation_delete_tamper
+                AFTER DELETE ON paper_ledger_attestation
+                BEGIN
+                    INSERT INTO paper_ledger_tamper_marker(
+                        target_revision, target_attestation_fingerprint,
+                        reason, detected_at
+                    ) VALUES (
+                        OLD.revision, OLD.attestation_fingerprint,
+                        'attestation_deleted',
+                        strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    );
+                END;
+                CREATE TRIGGER paper_ledger_head_marker_update_immutable
+                BEFORE UPDATE ON paper_ledger_head_marker
+                BEGIN SELECT RAISE(ABORT, 'paper ledger canonical head is immutable'); END;
+                CREATE TRIGGER paper_ledger_head_marker_delete_immutable
+                BEFORE DELETE ON paper_ledger_head_marker
+                BEGIN SELECT RAISE(ABORT, 'paper ledger canonical head is immutable'); END;
+                CREATE TRIGGER paper_ledger_tamper_marker_update_immutable
+                BEFORE UPDATE ON paper_ledger_tamper_marker
+                BEGIN SELECT RAISE(ABORT, 'paper ledger tamper marker is immutable'); END;
+                CREATE TRIGGER paper_ledger_tamper_marker_delete_immutable
+                BEFORE DELETE ON paper_ledger_tamper_marker
+                BEGIN SELECT RAISE(ABORT, 'paper ledger tamper marker is immutable'); END;
+                """
+            )
+            schema_fingerprint = self._schema_fingerprint(connection)
+            if schema_fingerprint is None:
+                raise PaperBrokerReconciliationError(
+                    "paper ledger schema cannot be attested after v5 migration"
+                )
+            counts = {
+                column: int(connection.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0])
+                for column, table in _LEDGER_COUNT_TABLES.items()
+            }
+            migration_report = {
+                "migration_version": _LEDGER_MIGRATION_VERSION,
+                "schema_version": 5,
+                "schema_fingerprint": schema_fingerprint,
+                "previous_v4_attestation_fingerprint": previous_v4_attestation,
+                "unknown_cost_provenance": legacy_cost_evidence,
+                "counts": counts,
+            }
+            migration_fingerprint = canonical_sha256(migration_report)
+            self._insert_attestation(
+                connection,
+                {
+                    "revision": 1,
+                    "ledger_generation": secrets.token_hex(32),
+                    "migration_version": _LEDGER_MIGRATION_VERSION,
+                    "schema_version": 5,
+                    "schema_fingerprint": schema_fingerprint,
+                    "previous_attestation_fingerprint": None,
+                    "migration_attestation_fingerprint": migration_fingerprint,
+                    "event_kind": "migration_audit",
+                    "event_fingerprint": migration_fingerprint,
+                    **counts,
+                    "persisted_at": _utc_iso(datetime.now(UTC)),
                 },
             )
             connection.commit()
@@ -1772,6 +2358,16 @@ class PaperBrokerStore:
             )
         )
         payload = _intent_payload(intent)
+        calculation_quantity = (
+            intent.quantity if quote.executable_quantity in {None, 0} else quote.executable_quantity
+        )
+        self._require_matching_instrument_context(intent.ts_code, quote.instrument_context)
+        execution_costs = self._execution_costs(
+            intent.side,
+            quote.executable_price,
+            calculation_quantity,
+            quote.instrument_context,
+        )
         request_payload, request_fingerprint = _execution_request_evidence(
             {
                 "kind": "INITIAL",
@@ -1781,6 +2377,7 @@ class PaperBrokerStore:
                 "persisted_at": _utc_iso(persisted_at),
                 "trade_date": trade_date.isoformat(),
                 "quote": quote.model_dump(mode="json"),
+                "cost_evidence": self._cost_evidence(execution_costs),
             }
         )
         with self._connect() as connection:
@@ -1864,6 +2461,7 @@ class PaperBrokerStore:
                     decision_time=decision_time,
                     trade_date=trade_date,
                     quote=quote,
+                    execution_costs=execution_costs,
                 )
                 if fill is not None and order.updated_at < persisted_at:
                     order = order.model_copy(update={"updated_at": persisted_at})
@@ -1879,12 +2477,13 @@ class PaperBrokerStore:
                         available_date=quote.acquisition_available_date,
                         persisted_at=persisted_at,
                     )
-                receipt = PaperExecutionReceipt(
+                receipt = self._execution_receipt_with_cost(
                     execution_id=resolved_execution_id,
                     request_fingerprint=request_fingerprint,
                     intent_id=intent.intent_id,
                     order=order,
                     fill=fill,
+                    calculation=execution_costs,
                     persisted_at=persisted_at,
                 )
                 self._insert_execution_receipt(
@@ -1984,6 +2583,29 @@ class PaperBrokerStore:
             character not in "0123456789abcdef" for character in price_snapshot_id
         ):
             raise ValueError("price_snapshot_id must be a lowercase SHA-256 digest")
+        with self._connect() as connection:
+            intent_row = connection.execute(
+                """
+                SELECT i.payload_json
+                FROM paper_order AS o
+                JOIN paper_intent AS i ON i.intent_id = o.intent_id
+                WHERE o.account_id = ? AND o.order_id = ?
+                """,
+                (self.account_id, order_id),
+            ).fetchone()
+        if intent_row is None:
+            raise KeyError(f"unknown paper order: {order_id}")
+        preflight_intent = PaperOrderIntent.model_validate_json(intent_row["payload_json"])
+        self._require_matching_instrument_context(
+            preflight_intent.ts_code,
+            quote.instrument_context,
+        )
+        execution_costs = self._execution_costs(
+            preflight_intent.side,
+            quote.executable_price,
+            quantity,
+            quote.instrument_context,
+        )
         request_payload, request_fingerprint = _execution_request_evidence(
             {
                 "kind": "INCREMENTAL",
@@ -1995,6 +2617,7 @@ class PaperBrokerStore:
                 "quantity": quantity,
                 "quote": quote.model_dump(mode="json"),
                 "price_snapshot_id": price_snapshot_id,
+                "cost_evidence": self._cost_evidence(execution_costs),
             }
         )
         with self._connect() as connection:
@@ -2037,14 +2660,11 @@ class PaperBrokerStore:
                 if intent_row is None:
                     raise PaperBrokerReconciliationError("paper order is missing its intent")
                 intent = PaperOrderIntent.model_validate_json(intent_row["payload_json"])
-                execution_costs = self._execution_costs(
-                    intent.side,
-                    quote.executable_price,
-                    quantity,
-                )
+                if intent.side is not preflight_intent.side:
+                    raise PaperBrokerReconciliationError(
+                        "paper order changed while preparing v3 cost evidence"
+                    )
                 fill_price = execution_costs.executed_price
-                commission = execution_costs.commission
-                tax = execution_costs.stamp_duty
                 if order.status not in {
                     PaperOrderStatus.ACCEPTED,
                     PaperOrderStatus.PARTIALLY_FILLED,
@@ -2079,7 +2699,7 @@ class PaperBrokerStore:
                     if quote.acquisition_available_date <= trade_date:
                         raise ValueError("BUY available date must be after acquisition trade date")
                     cash = self._account_values(connection)[0]
-                    if cash < fill_price * quantity + commission:
+                    if cash < execution_costs.executed_notional + execution_costs.total_fees:
                         raise ValueError("insufficient cash for incremental execution")
                 else:
                     if intent.entry_signal_id is None:
@@ -2094,14 +2714,12 @@ class PaperBrokerStore:
                     )
                     if total < quantity or available < quantity:
                         raise ValueError("insufficient authoritative position for incremental SELL")
-                fill = PaperFill(
+                fill = self._paper_fill(
                     order_id=order_id,
                     execution_id=execution_id,
                     sequence=sequence,
                     quantity=quantity,
-                    price=fill_price,
-                    commission=commission,
-                    tax=tax,
+                    calculation=execution_costs,
                     executed_at=execution_time,
                     price_snapshot_id=price_snapshot_id,
                 )
@@ -2128,7 +2746,8 @@ class PaperBrokerStore:
                     - fill_price * quantity
                 )
                 average_price = ((previous_notional + fill_price * quantity) / new_filled).quantize(
-                    _PRICE_TICK, rounding=ROUND_HALF_UP
+                    self._execution_price_tick,
+                    rounding=ROUND_HALF_UP,
                 )
                 status = (
                     PaperOrderStatus.FILLED
@@ -2159,12 +2778,13 @@ class PaperBrokerStore:
                         "updated_at": max(order.updated_at, persistence_time),
                     }
                 )
-                receipt = PaperExecutionReceipt(
+                receipt = self._execution_receipt_with_cost(
                     execution_id=execution_id,
                     request_fingerprint=request_fingerprint,
                     intent_id=intent.intent_id,
                     order=receipt_order,
                     fill=fill,
+                    calculation=execution_costs,
                     persisted_at=persistence_time,
                 )
                 self._insert_execution_receipt(
@@ -2329,6 +2949,7 @@ class PaperBrokerStore:
         decision_time: datetime,
         trade_date: date,
         quote: BrokerExecutionContext,
+        execution_costs: ExecutionCostCalculation,
     ) -> tuple[PaperOrder, PaperFill | None]:
         reject_reason: PaperRejectReason | None = None
         if quote.suspended:
@@ -2345,7 +2966,7 @@ class PaperBrokerStore:
         if decision_time < intent.earliest_execution_at:
             return self._new_order(intent, decision_time), None
 
-        fill_price = self._fill_price(intent.side, quote.executable_price)
+        fill_price = execution_costs.executed_price
         # Frozen conservative rule: a missed limit remains ACCEPTED with no cash
         # reservation. A retry of the same immutable intent returns this evidence.
         if intent.order_type is PaperOrderType.LIMIT:
@@ -2363,21 +2984,18 @@ class PaperBrokerStore:
             raise ValueError("executable_quantity cannot exceed intent quantity")
         if execution_quantity == 0:
             return self._new_order(intent, decision_time), None
-        execution_costs = self._execution_costs(
-            intent.side,
-            quote.executable_price,
-            execution_quantity,
-        )
+        if execution_costs.order_input.quantity != execution_quantity:
+            raise PaperBrokerReconciliationError(
+                "initial execution cost evidence quantity does not match the resolved fill"
+            )
         fill_price = execution_costs.executed_price
-        commission = execution_costs.commission
-        tax = execution_costs.stamp_duty
         if intent.side is PaperSide.BUY:
             if quote.acquisition_available_date is None:
                 raise ValueError("BUY execution requires acquisition_available_date")
             if quote.acquisition_available_date <= trade_date:
                 raise ValueError("BUY available date must be after acquisition trade date")
             cash = self._account_values(connection)[0]
-            if cash < fill_price * execution_quantity + commission:
+            if cash < execution_costs.executed_notional + execution_costs.total_fees:
                 return self._new_order(
                     intent,
                     decision_time,
@@ -2419,14 +3037,12 @@ class PaperBrokerStore:
             filled_quantity=execution_quantity,
             fill_price=fill_price,
         )
-        fill = PaperFill(
+        fill = self._paper_fill(
             order_id=filled.order_id,
             execution_id=execution_id,
             sequence=1,
             quantity=execution_quantity,
-            price=fill_price,
-            commission=commission,
-            tax=tax,
+            calculation=execution_costs,
             executed_at=decision_time,
             price_snapshot_id=intent.price_snapshot_id,
         )
@@ -2459,40 +3075,101 @@ class PaperBrokerStore:
             updated_at=decision_time,
         )
 
-    def _fill_price(self, side: PaperSide, executable_price: Decimal) -> Decimal:
-        return calculate_slipped_price(
-            executable_price,
-            side="buy" if side is PaperSide.BUY else "sell",
-            slippage_bps=(
-                self.cost_policy.buy_slippage_bps
-                if side is PaperSide.BUY
-                else self.cost_policy.sell_slippage_bps
-            ),
-            price_tick=_PRICE_TICK,
-        )
-
     def _execution_costs(
         self,
         side: PaperSide,
         executable_price: Decimal,
         quantity: int,
-    ) -> OrderExecutionCosts:
-        return calculate_order_execution_costs(
-            side="buy" if side is PaperSide.BUY else "sell",
-            reference_price=executable_price,
-            quantity=quantity,
-            commission_rate=self.cost_policy.commission_rate,
-            minimum_commission=self.cost_policy.minimum_commission,
-            transfer_fee_rate=Decimal("0"),
-            sell_stamp_duty_rate=self.cost_policy.sell_stamp_tax_rate,
-            slippage_bps=(
-                self.cost_policy.buy_slippage_bps
-                if side is PaperSide.BUY
-                else self.cost_policy.sell_slippage_bps
+        instrument_context: InstrumentContext,
+    ) -> ExecutionCostCalculation:
+        return calculate_execution_costs(
+            self.cost_policy.execution_cost_spec,
+            ExecutionCostOrderInput(
+                side="BUY" if side is PaperSide.BUY else "SELL",
+                reference_price=executable_price,
+                quantity=quantity,
             ),
-            price_tick=_PRICE_TICK,
-            money_quantum=_CENT,
+            instrument_context,
         )
+
+    @staticmethod
+    def _require_matching_instrument_context(
+        ts_code: str,
+        instrument_context: InstrumentContext,
+    ) -> None:
+        if instrument_context.ts_code != ts_code.strip().upper():
+            raise ValueError("execution instrument_context ts_code does not match intent ts_code")
+
+    @staticmethod
+    def _cost_evidence(calculation: ExecutionCostCalculation) -> dict[str, object]:
+        return {
+            "cost_spec_id": calculation.cost_spec_id,
+            "cost_spec_schema_version": calculation.cost_spec_schema_version,
+            "cost_engine_version": calculation.cost_engine_version,
+            "cost_context_fingerprint": calculation.cost_context_fingerprint,
+            "resolved_calculation_fingerprint": calculation.resolved_calculation_fingerprint,
+            "calculation": calculation.model_dump(mode="json"),
+        }
+
+    @staticmethod
+    def _paper_fill(
+        *,
+        order_id: str,
+        execution_id: str,
+        sequence: int,
+        quantity: int,
+        calculation: ExecutionCostCalculation,
+        executed_at: datetime,
+        price_snapshot_id: str,
+    ) -> PaperFill:
+        return PaperFill(
+            order_id=order_id,
+            execution_id=execution_id,
+            sequence=sequence,
+            quantity=quantity,
+            price=calculation.executed_price,
+            commission=calculation.commission,
+            transfer_fee=calculation.transfer_fee,
+            tax=calculation.stamp_duty,
+            total_fees=calculation.total_fees,
+            cost_spec_id=calculation.cost_spec_id,
+            cost_spec_schema_version=calculation.cost_spec_schema_version,
+            cost_context_fingerprint=calculation.cost_context_fingerprint,
+            cost_provenance_state=PaperCostProvenanceState.KNOWN_V3,
+            executed_at=executed_at,
+            price_snapshot_id=price_snapshot_id,
+        )
+
+    @staticmethod
+    def _execution_receipt_with_cost(
+        *,
+        execution_id: str,
+        request_fingerprint: str,
+        intent_id: str,
+        order: PaperOrder,
+        fill: PaperFill | None,
+        calculation: ExecutionCostCalculation,
+        persisted_at: datetime,
+    ) -> PaperExecutionReceipt:
+        return PaperExecutionReceipt(
+            execution_id=execution_id,
+            request_fingerprint=request_fingerprint,
+            intent_id=intent_id,
+            order=order,
+            fill=fill,
+            cost_spec_id=calculation.cost_spec_id,
+            cost_spec_schema_version=calculation.cost_spec_schema_version,
+            cost_context_fingerprint=calculation.cost_context_fingerprint,
+            cost_provenance_state=PaperCostProvenanceState.KNOWN_V3,
+            cost_calculation=calculation,
+            persisted_at=persisted_at,
+        )
+
+    @property
+    def _execution_price_tick(self) -> Decimal:
+        slippage = self.cost_policy.execution_cost_spec.slippage
+        assert slippage is not None
+        return slippage.price_tick
 
     def _insert_order(
         self,
@@ -2548,12 +3225,25 @@ class PaperBrokerStore:
             separators=(",", ":"),
             sort_keys=True,
         )
+        calculation = receipt.cost_calculation
+        if (
+            receipt.cost_provenance_state is not PaperCostProvenanceState.KNOWN_V3
+            or calculation is None
+            or receipt.cost_spec_id is None
+            or receipt.cost_spec_schema_version is None
+            or receipt.cost_context_fingerprint is None
+        ):
+            raise PaperBrokerReconciliationError(
+                "new paper execution receipt requires complete KNOWN_V3 cost evidence"
+            )
         connection.execute(
             """
             INSERT INTO paper_execution_receipt(
                 execution_id, account_id, intent_id, order_id,
-                request_fingerprint, request_json, receipt_json, persisted_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                request_fingerprint, request_json, receipt_json,
+                transfer_fee, total_fees, cost_spec_id, cost_spec_schema_version,
+                cost_context_fingerprint, cost_provenance_state, persisted_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 receipt.execution_id,
@@ -2563,6 +3253,12 @@ class PaperBrokerStore:
                 receipt.request_fingerprint,
                 request_payload,
                 receipt_payload,
+                _money(calculation.transfer_fee),
+                _money(calculation.total_fees),
+                receipt.cost_spec_id,
+                receipt.cost_spec_schema_version,
+                receipt.cost_context_fingerprint,
+                receipt.cost_provenance_state.value,
                 _utc_iso(receipt.persisted_at),
             ),
         )
@@ -2607,6 +3303,37 @@ class PaperBrokerStore:
             )
         if not isinstance(request_value, dict):
             raise PaperBrokerReconciliationError("execution request evidence must be an object")
+        if receipt.cost_provenance_state is PaperCostProvenanceState.KNOWN_V3:
+            calculation = receipt.cost_calculation
+            if (
+                calculation is None
+                or receipt.cost_spec_id != row["cost_spec_id"]
+                or receipt.cost_spec_schema_version != row["cost_spec_schema_version"]
+                or receipt.cost_context_fingerprint != row["cost_context_fingerprint"]
+                or receipt.cost_provenance_state.value != row["cost_provenance_state"]
+                or _money(calculation.transfer_fee) != row["transfer_fee"]
+                or _money(calculation.total_fees) != row["total_fees"]
+                or request_value.get("cost_evidence") != self._cost_evidence(calculation)
+            ):
+                raise PaperBrokerReconciliationError(
+                    "persisted execution receipt v3 cost evidence does not reconcile"
+                )
+        elif (
+            any(
+                row[field] is not None
+                for field in (
+                    "transfer_fee",
+                    "total_fees",
+                    "cost_spec_id",
+                    "cost_spec_schema_version",
+                    "cost_context_fingerprint",
+                )
+            )
+            or row["cost_provenance_state"] != PaperCostProvenanceState.LEGACY_UNKNOWN.value
+        ):
+            raise PaperBrokerReconciliationError(
+                "legacy execution receipt must retain unknown cost provenance"
+            )
         kind = request_value.get("kind")
         if request_value.get("execution_id") != receipt.execution_id or request_value.get(
             "persisted_at"
@@ -2654,8 +3381,10 @@ class PaperBrokerStore:
             """
             INSERT INTO paper_fill(
                 fill_id, execution_id, order_id, sequence, quantity, price, commission,
-                tax, executed_at, persisted_at, price_snapshot_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                transfer_fee, tax, total_fees, cost_spec_id, cost_spec_schema_version,
+                cost_context_fingerprint, cost_provenance_state,
+                executed_at, persisted_at, price_snapshot_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 fill.fill_id,
@@ -2665,7 +3394,13 @@ class PaperBrokerStore:
                 fill.quantity,
                 _money(fill.price),
                 _money(fill.commission),
+                _money(fill.transfer_fee) if fill.transfer_fee is not None else None,
                 _money(fill.tax),
+                _money(fill.total_fees) if fill.total_fees is not None else None,
+                fill.cost_spec_id,
+                fill.cost_spec_schema_version,
+                fill.cost_context_fingerprint,
+                fill.cost_provenance_state.value,
                 _utc_iso(fill.executed_at),
                 _utc_iso(persisted_at),
                 fill.price_snapshot_id,
@@ -2674,7 +3409,8 @@ class PaperBrokerStore:
         cash, realized = self._account_values(connection)
         if intent.side is PaperSide.BUY:
             assert available_date is not None
-            total_cost = fill.notional + fill.commission
+            assert fill.total_fees is not None
+            total_cost = fill.notional + fill.total_fees
             connection.execute(
                 "UPDATE broker_account SET cash = ? WHERE account_id = ?",
                 (_money(cash - total_cost), self.account_id),
@@ -2765,7 +3501,8 @@ class PaperBrokerStore:
             consumption_count += 1
         if remaining:
             raise PaperBrokerReconciliationError("available lot allocation became incomplete")
-        net_proceeds = fill.notional - fill.commission - fill.tax
+        assert fill.total_fees is not None
+        net_proceeds = fill.notional - fill.total_fees
         connection.execute(
             """
             UPDATE broker_account SET cash = ?, realized_pnl = ? WHERE account_id = ?
@@ -2911,7 +3648,13 @@ class PaperBrokerStore:
             quantity=row["quantity"],
             price=row["price"],
             commission=row["commission"],
+            transfer_fee=row["transfer_fee"],
             tax=row["tax"],
+            total_fees=row["total_fees"],
+            cost_spec_id=row["cost_spec_id"],
+            cost_spec_schema_version=row["cost_spec_schema_version"],
+            cost_context_fingerprint=row["cost_context_fingerprint"],
+            cost_provenance_state=row["cost_provenance_state"],
             executed_at=row["executed_at"],
             price_snapshot_id=row["price_snapshot_id"],
         )
@@ -3134,23 +3877,41 @@ class PaperBrokerStore:
             self._require_trusted_ledger(connection)
             account = connection.execute(
                 """
-                SELECT initial_cash, cash, realized_pnl FROM broker_account
+                SELECT initial_cash, cash, realized_pnl, cost_spec_id,
+                       cost_spec_schema_version, cost_provenance_state
+                FROM broker_account
                 WHERE account_id = ?
                 """,
                 (self.account_id,),
             ).fetchone()
             if account is None:
                 raise PaperBrokerReconciliationError("broker account is missing")
+            spec = self.cost_policy.execution_cost_spec
+            assert spec.cost_spec_id is not None
+            assert spec.cost_engine_version is not None
+            authority = connection.execute(
+                "SELECT schema_version, cost_engine_version, canonical_json "
+                "FROM paper_cost_spec WHERE cost_spec_id = ?",
+                (spec.cost_spec_id,),
+            ).fetchone()
+            if (
+                account["cost_provenance_state"] != PaperCostProvenanceState.KNOWN_V3.value
+                or account["cost_spec_schema_version"] != 3
+                or account["cost_spec_id"] != spec.cost_spec_id
+                or authority is None
+                or authority["schema_version"] != 3
+                or authority["cost_engine_version"] != spec.cost_engine_version
+                or authority["canonical_json"] != spec.canonical_json()
+            ):
+                raise PaperBrokerReconciliationError(
+                    "paper account v3 cost authority does not reconcile"
+                )
             schema = connection.execute(
                 "SELECT * FROM paper_ledger_schema WHERE singleton = 1"
             ).fetchone()
-            if schema is None or int(schema["schema_version"]) != 4:
+            if schema is None or int(schema["schema_version"]) != 5:
                 raise PaperBrokerReconciliationError(
-                    "paper ledger requires explicit schema v4 migration"
-                )
-            if any(int(schema[column]) != 0 for column in _LEDGER_UNKNOWN_COLUMNS):
-                raise PaperBrokerReconciliationError(
-                    "paper ledger contains legacy rows with unknown PIT identity"
+                    "paper ledger requires explicit schema v5 migration"
                 )
             orders = connection.execute(
                 """
@@ -3335,7 +4096,7 @@ class PaperBrokerStore:
                             Decimal("0"),
                         )
                         / fill_quantity
-                    ).quantize(_PRICE_TICK, rounding=ROUND_HALF_UP)
+                    ).quantize(self._execution_price_tick, rounding=ROUND_HALF_UP)
                     if order.average_fill_price != weighted_price:
                         errors.append(f"order {order.order_id} average fill price mismatch")
                 elif order.average_fill_price is not None:
@@ -3368,7 +4129,13 @@ class PaperBrokerStore:
             expected_cash = Decimal(account["initial_cash"])
             expected_realized = Decimal("0")
             for fill in fills:
-                parsed = self._fill_from_row(fill)
+                try:
+                    parsed = self._fill_from_row(fill)
+                except (TypeError, ValueError) as exc:
+                    errors.append(
+                        f"paper fill {fill['fill_id']} v3 cost evidence is invalid: {exc}"
+                    )
+                    continue
                 receipt = receipts.get(str(parsed.execution_id))
                 if receipt is None or receipt.fill != parsed:
                     errors.append(f"fill {parsed.fill_id} immutable execution receipt mismatch")
@@ -3377,6 +4144,36 @@ class PaperBrokerStore:
                 except (TypeError, ValueError) as exc:
                     errors.append(f"fill {parsed.fill_id} intent payload is invalid: {exc}")
                     continue
+                calculation = None if receipt is None else receipt.cost_calculation
+                if (
+                    parsed.cost_provenance_state is not PaperCostProvenanceState.KNOWN_V3
+                    or calculation is None
+                    or calculation.order_input.side.value != fill["side"]
+                    or calculation.order_input.quantity != parsed.quantity
+                    or calculation.cost_spec_id != parsed.cost_spec_id
+                    or calculation.cost_spec_schema_version != parsed.cost_spec_schema_version
+                    or calculation.cost_context_fingerprint != parsed.cost_context_fingerprint
+                ):
+                    errors.append(f"fill {parsed.fill_id} v3 cost provenance mismatch")
+                else:
+                    try:
+                        recomputed = calculate_execution_costs(
+                            spec,
+                            calculation.order_input,
+                            calculation.instrument_context,
+                        )
+                    except (TypeError, ValueError) as exc:
+                        errors.append(f"fill {parsed.fill_id} v3 cost context is invalid: {exc}")
+                    else:
+                        if (
+                            recomputed != calculation
+                            or parsed.price != calculation.executed_price
+                            or parsed.commission != calculation.commission
+                            or parsed.transfer_fee != calculation.transfer_fee
+                            or parsed.tax != calculation.stamp_duty
+                            or parsed.total_fees != calculation.total_fees
+                        ):
+                            errors.append(f"fill {parsed.fill_id} v3 cost calculation mismatch")
                 persisted_at = self._reconciliation_timestamp(
                     fill["persisted_at"],
                     label=f"fill {parsed.fill_id} persisted_at",
@@ -3401,7 +4198,8 @@ class PaperBrokerStore:
                 if fill["order_entry_signal_id"] != expected_entry_signal_id:
                     errors.append(f"order {parsed.order_id} entry_signal_id provenance mismatch")
                 if fill["side"] == PaperSide.BUY.value:
-                    expected_cash -= parsed.notional + parsed.commission
+                    assert parsed.total_fees is not None
+                    expected_cash -= parsed.notional + parsed.total_fees
                     lot = connection.execute(
                         """
                         SELECT
@@ -3456,7 +4254,8 @@ class PaperBrokerStore:
                         ):
                             errors.append(f"buy fill {parsed.fill_id} lot timeline mismatch")
                 else:
-                    expected_cash += parsed.notional - parsed.commission - parsed.tax
+                    assert parsed.total_fees is not None
+                    expected_cash += parsed.notional - parsed.total_fees
                     allocations = connection.execute(
                         """
                         SELECT
@@ -3505,9 +4304,7 @@ class PaperBrokerStore:
                         ),
                         Decimal("0"),
                     )
-                    expected_realized += (
-                        parsed.notional - parsed.commission - parsed.tax - cost_basis
-                    )
+                    expected_realized += parsed.notional - parsed.total_fees - cost_basis
 
             lots = connection.execute(
                 """

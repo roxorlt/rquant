@@ -150,7 +150,7 @@ def _inputs(tmp_path: Path) -> ProductionRuntimeProfileInputs:
                 kind=RealRecoveryArtifactKind.STATE_SQLITE,
                 source_path=(f"runtime/live/paper-brokers/{broker_instance}/broker.sqlite3"),
                 restore_path="state/paper.sqlite3",
-                schema_version="paper-ledger-v4",
+                schema_version="paper-ledger-v5",
                 relations=(
                     "paper_ledger_attestation",
                     "paper_ledger_head_marker",
@@ -1433,6 +1433,30 @@ def test_production_profile_binds_three_strategy_authorities_end_to_end(
         settings["calendar_expected_commit"] == inputs.market_calendar_producer_commit
         for settings in calendar_settings
     )
+
+
+def test_production_profile_paper_broker_binds_explicit_v3_cost_provenance(
+    tmp_path: Path,
+) -> None:
+    _, by_kind = _by_kind(_inputs(tmp_path))
+    manifest = by_kind[RuntimeServiceKind.PAPER_BROKER][0]
+    settings = PaperBrokerSettings.model_validate(dict(manifest.settings))
+    spec = settings.execution_cost_spec
+    policy = settings.cost_policy()
+
+    assert spec.schema_version == 3
+    assert spec.is_alignment_eligible
+    assert spec.cost_spec_id == policy.cost_spec_id
+    assert spec.cost_engine_version is not None
+    assert spec.fee_notional_basis == "EXECUTED_NOTIONAL"
+    assert spec.assessment_unit == "FILL"
+    assert spec.slippage is not None
+    assert spec.slippage.owner == "shared_cost_engine"
+    assert spec.money is not None
+    assert len(spec.instrument_selectors) == 2
+    assert len(spec.commission_rules) == len(spec.instrument_selectors)
+    assert len(spec.transfer_fee_rules) == len(spec.instrument_selectors)
+    assert len(spec.stamp_duty_rules) == len(spec.instrument_selectors)
 
 
 def test_production_profile_binds_daily_close_to_its_immutable_live_spool(

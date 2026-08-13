@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from rquant.feature_spool import FeatureBatchSpool
-from rquant.paper_broker import BrokerCostPolicy, BrokerExecutionContext, PaperBrokerStore
+from rquant.paper_broker import BrokerExecutionContext, PaperBrokerStore
 from rquant.paper_contracts import PaperOrderStatus
 from rquant.paper_signal_worker import (
     PaperQuoteSnapshot,
@@ -20,6 +20,7 @@ from rquant.runtime_builder_strategy import strategy_live_builder
 from rquant.runtime_service_entrypoint import RuntimeServiceManifest
 from rquant.signal_contracts import SignalAction, SignalEnvelope
 from rquant.strategy_spec import StrategyLifecycleState
+from tests.paper_cost_fixtures import paper_cost_policy, paper_instrument_context
 from tests.unit.test_runtime_builder_strategy import (
     COMMIT,
     NOW,
@@ -49,11 +50,7 @@ def test_builtin_exit_reaches_terminal_only_after_exact_sell_fill(
         tmp_path / "paper-broker.sqlite3",
         account_id="paper-main",
         initial_cash=Decimal("100000"),
-        cost_policy=BrokerCostPolicy(
-            commission_rate=Decimal("0.0003"),
-            minimum_commission=Decimal("5"),
-            sell_stamp_tax_rate=Decimal("0.001"),
-        ),
+        cost_policy=paper_cost_policy(),
     )
     queue = PaperSignalQueueStore(
         tmp_path / "paper-signal.sqlite3",
@@ -107,6 +104,7 @@ def test_builtin_exit_reaches_terminal_only_after_exact_sell_fill(
             context=BrokerExecutionContext(
                 executable_price=Decimal("11.00"),
                 acquisition_available_date=date(2026, 8, 3),
+                instrument_context=paper_instrument_context("600000.SH"),
             ),
             producer_commit=COMMIT,
         ),
@@ -176,6 +174,7 @@ def test_builtin_exit_reaches_terminal_only_after_exact_sell_fill(
             context=BrokerExecutionContext(
                 executable_price=Decimal(str(exit_close)),
                 executable_quantity=(200 if strategy_id == "n_shape" else None),
+                instrument_context=paper_instrument_context("600000.SH"),
             ),
             producer_commit=COMMIT,
         ),
@@ -221,6 +220,7 @@ def test_builtin_exit_reaches_terminal_only_after_exact_sell_fill(
             quote=BrokerExecutionContext(
                 executable_price=Decimal("13.35"),
                 executable_quantity=300,
+                instrument_context=paper_instrument_context("600000.SH"),
             ),
             price_snapshot_id="9" * 64,
         )
@@ -269,7 +269,10 @@ def test_builtin_exit_reaches_terminal_only_after_exact_sell_fill(
             ts_code="600000.SH",
             event_time=final_sell_at,
             available_at=final_sell_at,
-            context=BrokerExecutionContext(executable_price=Decimal("13.25")),
+            context=BrokerExecutionContext(
+                executable_price=Decimal("13.25"),
+                instrument_context=paper_instrument_context("600000.SH"),
+            ),
             producer_commit=COMMIT,
         ),
         limit=10,

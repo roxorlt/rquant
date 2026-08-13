@@ -9,7 +9,6 @@ import pytest
 
 from rquant.feature_contracts import FeatureAvailability, FeatureFieldStatus
 from rquant.paper_broker import (
-    BrokerCostPolicy,
     BrokerExecutionContext,
     PaperBrokerReconciliationError,
     PaperBrokerStore,
@@ -25,6 +24,7 @@ from rquant.strategy_paper_lifecycle import (
     PaperBrokerLifecycleReader,
     PaperLifecycleIntegrityError,
 )
+from tests.paper_cost_fixtures import paper_cost_policy, paper_instrument_context
 
 COMMIT = "a" * 40
 BUY_AT = datetime(2026, 7, 31, 1, 40, tzinfo=UTC)
@@ -37,11 +37,7 @@ def _broker(path: Path) -> PaperBrokerStore:
         path,
         account_id="paper-main",
         initial_cash=Decimal("200000"),
-        cost_policy=BrokerCostPolicy(
-            commission_rate=Decimal("0.0003"),
-            minimum_commission=Decimal("5"),
-            sell_stamp_tax_rate=Decimal("0.001"),
-        ),
+        cost_policy=paper_cost_policy(),
     )
 
 
@@ -124,6 +120,7 @@ def _submit_buy(
         quote=BrokerExecutionContext(
             executable_price=Decimal(price),
             acquisition_available_date=date(2026, 8, 3),
+            instrument_context=paper_instrument_context(CODE),
         ),
     )
     return str(order.order_id)
@@ -180,6 +177,7 @@ def _submit_sell(
             executable_price=Decimal(executable_price),
             executable_quantity=executable_quantity,
             suspended=suspended,
+            instrument_context=paper_instrument_context(CODE),
         ),
     )
     return signal
@@ -733,6 +731,7 @@ def test_late_incremental_sell_fill_is_hidden_until_its_own_availability(
         quote=BrokerExecutionContext(
             executable_price=Decimal("12.50"),
             executable_quantity=500,
+            instrument_context=paper_instrument_context(CODE),
         ),
         price_snapshot_id="8" * 64,
     )

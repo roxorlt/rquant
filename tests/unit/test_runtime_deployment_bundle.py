@@ -32,6 +32,7 @@ from rquant.runtime_service_entrypoint import (
     RuntimeServiceManifest,
 )
 from rquant.schema_compatibility import RolloutPhase
+from tests.paper_cost_fixtures import paper_execution_cost_spec
 
 COMMIT = "a" * 40
 CALENDAR_SHA256 = "c" * 64
@@ -1826,9 +1827,7 @@ def test_accepts_single_process_paper_broker_manifest(tmp_path: Path) -> None:
                 **policy,
                 **broker_base.model_dump(mode="json")["settings"],
                 "initial_cash": "100000",
-                "commission_rate": "0.0003",
-                "minimum_commission": "5",
-                "sell_stamp_tax_rate": "0.001",
+                "execution_cost_spec": paper_execution_cost_spec().model_dump(mode="json"),
                 "raw_spool_root": str(root.parent / "market-minute"),
                 "trade_calendar_path": str(root.parent / "calendar.json"),
                 "trade_calendar_sha256": "f" * 64,

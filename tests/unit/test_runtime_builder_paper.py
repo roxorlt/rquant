@@ -26,6 +26,7 @@ from rquant.signal_router_runtime import (
     route_runner_signals,
 )
 from rquant.strategy_runner import RunnerSignalRecord
+from tests.paper_cost_fixtures import paper_execution_cost_spec, paper_instrument_context
 
 NOW = datetime(2026, 7, 31, 1, 30, tzinfo=UTC)
 COMMIT = "a" * 40
@@ -59,9 +60,7 @@ def _broker_settings(tmp_path: Path) -> dict[str, object]:
         "broker_path": str(tmp_path / "broker.sqlite3"),
         **_policy_settings(),
         "initial_cash": "100000",
-        "commission_rate": "0.0003",
-        "minimum_commission": "5",
-        "sell_stamp_tax_rate": "0.001",
+        "execution_cost_spec": paper_execution_cost_spec().model_dump(mode="json"),
         "limit": 10,
     }
 
@@ -202,6 +201,7 @@ def test_paper_broker_executes_due_signal_from_independent_queue(tmp_path: Path)
             available_at=execution_time,
             context=BrokerExecutionContext(
                 executable_price=Decimal("10.00"),
+                instrument_context=paper_instrument_context(),
                 acquisition_available_date=date(2026, 8, 3),
             ),
             producer_commit=COMMIT,
@@ -218,7 +218,7 @@ def test_paper_broker_executes_due_signal_from_independent_queue(tmp_path: Path)
     assert result.processed_count == 1
     assert result.backlog_count == 0
     assert result.degraded_reasons == ()
-    assert len(result.source_generations) == 3
+    assert len(result.source_generations) == 4
 
 
 def test_paper_broker_publishes_account_authority_with_explicit_stale_marks(
@@ -245,6 +245,7 @@ def test_paper_broker_publishes_account_authority_with_explicit_stale_marks(
             available_at=execution_time,
             context=BrokerExecutionContext(
                 executable_price=Decimal("10.00"),
+                instrument_context=paper_instrument_context(),
                 acquisition_available_date=date(2026, 8, 3),
             ),
             producer_commit=COMMIT,
@@ -337,6 +338,7 @@ def test_paper_broker_default_loader_binds_manifest_pit_authorities(
                 available_at=execution_time,
                 context=BrokerExecutionContext(
                     executable_price=Decimal("10.00"),
+                    instrument_context=paper_instrument_context(),
                     acquisition_available_date=date(2026, 8, 3),
                 ),
                 producer_commit=COMMIT,

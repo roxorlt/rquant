@@ -25,6 +25,12 @@ from rquant.paper_contracts import (
     PaperSellQuantityAuthority,
     PaperSide,
 )
+from rquant.strategy_paper_lifecycle import PaperBrokerLifecycleReader
+from tests.paper_cost_fixtures import (
+    paper_cost_policy,
+    paper_execution_cost_spec,
+    paper_instrument_context,
+)
 
 ACCOUNT_ID = "paper-main"
 BUY_TIME = datetime(2026, 7, 31, 1, 31, tzinfo=UTC)
@@ -36,13 +42,7 @@ PRODUCER_COMMIT = "c" * 40
 
 @pytest.fixture
 def cost_policy() -> BrokerCostPolicy:
-    return BrokerCostPolicy(
-        commission_rate=Decimal("0.0003"),
-        minimum_commission=Decimal("5.00"),
-        sell_stamp_tax_rate=Decimal("0.001"),
-        buy_slippage_bps=Decimal("0"),
-        sell_slippage_bps=Decimal("0"),
-    )
+    return paper_cost_policy()
 
 
 def _intent(
@@ -55,12 +55,13 @@ def _intent(
     event_time: datetime = BUY_TIME - timedelta(seconds=2),
     entry_signal_id: str | None = None,
     sell_quantity_authority: PaperSellQuantityAuthority | None = None,
+    account_id: str = ACCOUNT_ID,
 ) -> PaperOrderIntent:
     return PaperOrderIntent(
         signal_id=signal_seed * 64,
         entry_signal_id=entry_signal_id,
         sell_quantity_authority=sell_quantity_authority,
-        account_id=ACCOUNT_ID,
+        account_id=account_id,
         ts_code="600000.SH",
         side=side,
         order_type=order_type,
@@ -120,6 +121,7 @@ def _quote(
     return BrokerExecutionContext(
         executable_price=Decimal(price),
         acquisition_available_date=available_date,
+        instrument_context=paper_instrument_context(),
         **({} if executable_quantity is None else {"executable_quantity": executable_quantity}),
         suspended=suspended,
         limit_locked=limit_locked,
@@ -721,9 +723,11 @@ def test_reopen_rejects_cost_policy_drift(
 ) -> None:
     path = tmp_path / "paper.sqlite3"
     _store(path, cost_policy)
-    changed = cost_policy.model_copy(update={"commission_rate": Decimal("0.0005")})
+    changed = BrokerCostPolicy.from_execution_cost_spec(
+        paper_execution_cost_spec(commission_bps=Decimal("5"))
+    )
 
-    with pytest.raises(ValueError, match="cost_policy"):
+    with pytest.raises(ValueError, match="cost binding"):
         _store(path, changed)
 
 
@@ -1322,7 +1326,7 @@ def test_sell_consumes_buy_lots_in_real_acquisition_execution_order(
     assert store.reconcile().realized_pnl == Decimal("1987.00")
 
 
-def test_schema_v4_has_first_class_identity_receipts_and_indexed_lookup_plans(
+def test_schema_v5_has_first_class_v3_cost_receipts_and_indexed_lookup_plans(
     tmp_path: Path,
     cost_policy: BrokerCostPolicy,
 ) -> None:
@@ -1382,8 +1386,8 @@ def test_schema_v4_has_first_class_identity_receipts_and_indexed_lookup_plans(
             ).fetchall()
         )
 
-    assert schema_version == 4
-    assert migration_version == 2
+    assert schema_version == 5
+    assert migration_version == 3
     assert {
         "signal_id",
         "entry_signal_id",
@@ -1392,12 +1396,26 @@ def test_schema_v4_has_first_class_identity_receipts_and_indexed_lookup_plans(
         "initial_execution_id",
         "initial_execution_request_fingerprint",
     } <= intent_columns
-    assert "execution_id" in fill_columns
+    assert {
+        "execution_id",
+        "transfer_fee",
+        "total_fees",
+        "cost_spec_id",
+        "cost_spec_schema_version",
+        "cost_context_fingerprint",
+        "cost_provenance_state",
+    } <= fill_columns
     assert {
         "execution_id",
         "request_fingerprint",
         "request_json",
         "receipt_json",
+        "transfer_fee",
+        "total_fees",
+        "cost_spec_id",
+        "cost_spec_schema_version",
+        "cost_context_fingerprint",
+        "cost_provenance_state",
         "persisted_at",
     } <= receipt_columns
     assert "idx_paper_intent_account_signal" in intent_plan
@@ -1422,7 +1440,57 @@ def test_schema_v4_has_first_class_identity_receipts_and_indexed_lookup_plans(
     ) in head_fks
 
 
-def test_trusted_v4_reopen_uses_only_bounded_attestation_checks(
+def test_schema_v5_rejects_unbound_new_account_and_fill_rows(
+    tmp_path: Path,
+    cost_policy: BrokerCostPolicy,
+) -> None:
+    path = tmp_path / "paper.sqlite3"
+    store = _store(path, cost_policy)
+    partial = store.submit_intent(
+        _intent(quantity=200),
+        execution_id="1" * 64,
+        decision_time=BUY_TIME,
+        trade_date=BUY_DATE,
+        quote=_quote("10.00", executable_quantity=100),
+    )
+    spec = cost_policy.execution_cost_spec
+    assert spec.cost_spec_id is not None
+
+    with sqlite3.connect(path) as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="known v3 cost binding"):
+            connection.execute(
+                """
+                INSERT INTO broker_account(
+                    account_id, initial_cash, cash, realized_pnl, cost_policy_fingerprint,
+                    cost_spec_id, cost_spec_schema_version, cost_provenance_state
+                ) VALUES (?, '1000', '1000', '0', ?, ?, 3, NULL)
+                """,
+                ("paper-unbound", spec.cost_spec_id, spec.cost_spec_id),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="requires KNOWN_V3 cost evidence"):
+            connection.execute(
+                """
+                INSERT INTO paper_fill(
+                    fill_id, execution_id, order_id, sequence, quantity, price, commission,
+                    transfer_fee, tax, total_fees, cost_spec_id, cost_spec_schema_version,
+                    cost_context_fingerprint, cost_provenance_state,
+                    executed_at, persisted_at, price_snapshot_id
+                ) VALUES (?, ?, ?, 2, 100, '10', '0', '0', '0', '0', ?, 3, ?, NULL, ?, ?, ?)
+                """,
+                (
+                    "f" * 64,
+                    "e" * 64,
+                    partial.order_id,
+                    spec.cost_spec_id,
+                    "d" * 64,
+                    BUY_TIME.isoformat().replace("+00:00", "Z"),
+                    BUY_TIME.isoformat().replace("+00:00", "Z"),
+                    "9" * 64,
+                ),
+            )
+
+
+def test_trusted_v5_reopen_uses_only_bounded_attestation_checks(
     tmp_path: Path,
     cost_policy: BrokerCostPolicy,
     monkeypatch: pytest.MonkeyPatch,
@@ -1734,17 +1802,17 @@ def test_v3_unknown_execution_evidence_quarantines_every_broker_write(
 
     assert store.order(partial.order_id) == partial
     assert len(store.fills(partial.order_id)) == 1
-    with pytest.raises(PaperBrokerReconciliationError, match="quarantin|untrusted"):
+    with pytest.raises(PaperBrokerReconciliationError, match="quarantin|untrusted|audit-only"):
         store.fills()
-    with pytest.raises(PaperBrokerReconciliationError, match="quarantin|untrusted"):
+    with pytest.raises(PaperBrokerReconciliationError, match="quarantin|untrusted|audit-only"):
         store.account_snapshot(
             as_of=BUY_TIME,
             market_prices={"600000.SH": Decimal("10.00")},
         )
-    with pytest.raises(PaperBrokerReconciliationError, match="quarantin|untrusted"):
+    with pytest.raises(PaperBrokerReconciliationError, match="quarantin|untrusted|audit-only"):
         store.latest_execution_prices(as_of=BUY_TIME)
 
-    with pytest.raises(PaperBrokerReconciliationError, match="quarantin|untrusted"):
+    with pytest.raises(PaperBrokerReconciliationError, match="quarantin|untrusted|audit-only"):
         store.submit_intent(
             _intent(signal_seed="b", event_time=BUY_TIME),
             execution_id="b" * 64,
@@ -1752,7 +1820,7 @@ def test_v3_unknown_execution_evidence_quarantines_every_broker_write(
             trade_date=BUY_DATE,
             quote=_quote("11.00"),
         )
-    with pytest.raises(PaperBrokerReconciliationError, match="quarantin|untrusted"):
+    with pytest.raises(PaperBrokerReconciliationError, match="quarantin|untrusted|audit-only"):
         store.apply_execution(
             partial.order_id,
             execution_id="c" * 64,
@@ -1762,28 +1830,27 @@ def test_v3_unknown_execution_evidence_quarantines_every_broker_write(
             quote=_quote("10.10", executable_quantity=500),
             price_snapshot_id="8" * 64,
         )
-    with pytest.raises(PaperBrokerReconciliationError, match="quarantin|untrusted"):
+    with pytest.raises(PaperBrokerReconciliationError, match="quarantin|untrusted|audit-only"):
         store.close_open_order(
             partial.order_id,
             status=PaperOrderStatus.CANCELLED,
             decided_at=BUY_TIME + timedelta(minutes=1),
         )
-    with pytest.raises(PaperBrokerReconciliationError, match="quarantin|untrusted"):
+    with pytest.raises(PaperBrokerReconciliationError, match="quarantin|untrusted|audit-only"):
         store.account_authority_snapshot(
             as_of=BUY_TIME,
             market_prices={"600000.SH": Decimal("10.00")},
             producer_commit=PRODUCER_COMMIT,
         )
-    with pytest.raises(PaperBrokerReconciliationError, match="quarantin|untrusted"):
+    with pytest.raises(PaperBrokerReconciliationError, match="quarantin|untrusted|audit-only"):
         store.reconcile()
 
     assert _ledger_rows(path) == before
 
 
-def test_new_and_evidence_complete_v3_ledgers_remain_writable(
+def test_v4_migration_keeps_legacy_cost_evidence_null_and_requires_a_fresh_binding(
     tmp_path: Path,
     cost_policy: BrokerCostPolicy,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     new_store = _store(tmp_path / "new.sqlite3", cost_policy)
     assert new_store.ledger_trust_status().state == "trusted"
@@ -1798,25 +1865,34 @@ def test_new_and_evidence_complete_v3_ledgers_remain_writable(
         quote=_quote("10.00"),
     )
     with sqlite3.connect(path) as connection:
+        before_account = connection.execute(
+            "SELECT cash, realized_pnl FROM broker_account WHERE account_id = ?",
+            (ACCOUNT_ID,),
+        ).fetchone()
         _replace_schema_metadata_with_v3(connection)
 
-    statements: list[str] = []
-    real_connect = paper_broker_module.sqlite3.connect
-
-    def traced_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
-        connection = real_connect(*args, **kwargs)
-        connection.set_trace_callback(statements.append)
-        return connection
-
-    monkeypatch.setattr(paper_broker_module.sqlite3, "connect", traced_connect)
     migrated = _store(path, cost_policy)
     diagnostic = migrated.ledger_trust_status()
-    assert diagnostic.state == "trusted"
-    assert diagnostic.unknown_evidence == ()
-    traced = "\n".join(statements).lower()
-    assert "select intent_id, payload_json from paper_intent" in traced
-    assert "count(*) from paper_intent" in traced
+    assert diagnostic.state == "quarantined"
+    unknown = {item.field: item.count for item in diagnostic.unknown_evidence}
+    assert unknown["unknown_cost_provenance_count"] == 3
     with sqlite3.connect(path) as connection:
+        account = connection.execute(
+            "SELECT cash, realized_pnl, cost_spec_id, cost_spec_schema_version, "
+            "cost_provenance_state FROM broker_account WHERE account_id = ?",
+            (ACCOUNT_ID,),
+        ).fetchone()
+        fill = connection.execute(
+            "SELECT transfer_fee, total_fees, cost_spec_id, cost_spec_schema_version, "
+            "cost_context_fingerprint, cost_provenance_state FROM paper_fill"
+        ).fetchone()
+        receipt = connection.execute(
+            "SELECT transfer_fee, total_fees, cost_spec_id, cost_spec_schema_version, "
+            "cost_context_fingerprint, cost_provenance_state FROM paper_execution_receipt"
+        ).fetchone()
+        assert account == (*before_account, None, None, "LEGACY_UNKNOWN")
+        assert fill == (None, None, None, None, None, "LEGACY_UNKNOWN")
+        assert receipt == (None, None, None, None, None, "LEGACY_UNKNOWN")
         assert (
             connection.execute("SELECT COUNT(*) FROM paper_ledger_attestation").fetchone()[0] == 1
         )
@@ -1826,17 +1902,39 @@ def test_new_and_evidence_complete_v3_ledgers_remain_writable(
         assert (
             connection.execute("SELECT COUNT(*) FROM paper_ledger_tamper_marker").fetchone()[0] == 0
         )
-    migrated.submit_intent(
+    with pytest.raises(PaperBrokerReconciliationError, match="audit-only"):
+        migrated.submit_intent(
+            _intent(
+                signal_seed="b",
+                event_time=BUY_TIME + timedelta(seconds=1),
+            ),
+            execution_id="2" * 64,
+            decision_time=BUY_TIME + timedelta(seconds=2),
+            trade_date=BUY_DATE,
+            quote=_quote("11.00"),
+        )
+
+    fresh = PaperBrokerStore(
+        path,
+        account_id="paper-v5-fresh",
+        initial_cash=Decimal("100000"),
+        cost_policy=cost_policy,
+    )
+    fresh.submit_intent(
         _intent(
             signal_seed="b",
             event_time=BUY_TIME + timedelta(seconds=1),
+            account_id="paper-v5-fresh",
         ),
         execution_id="2" * 64,
         decision_time=BUY_TIME + timedelta(seconds=2),
         trade_date=BUY_DATE,
         quote=_quote("11.00"),
     )
-    assert migrated.reconcile().order_count == 2
+    assert fresh.reconcile().order_count == 1
+    assert (
+        PaperBrokerLifecycleReader(path, account_id="paper-v5-fresh").account_id == "paper-v5-fresh"
+    )
 
 
 def test_incremental_execution_rejects_backdated_sequence_without_mutation(
