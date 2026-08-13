@@ -12,7 +12,7 @@ from typing import Generic, Self, TypeVar
 
 import pandas as pd
 
-from rquant.dashboard.runtime_console_data import (
+from rquant.dashboard.serving_only_page_data import (
     ServingFrameResult,
     ServingFrameState,
     query_acquired_serving_frame,

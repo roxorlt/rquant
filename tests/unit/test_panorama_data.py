@@ -73,6 +73,7 @@ def test_panorama_health_propagates_projection_staleness(
                         "table_name": "market_snapshot",
                         "available": True,
                         "reason": None,
+                        "owner_dataset_id": "signals",
                         "available_at": available_at,
                     }
                 ]

@@ -33,6 +33,7 @@ from rquant.panorama_data import (
     BOARD_SYSTEMS,
     ROUTE_LABELS,
     MarketPulse,
+    ServingRuntimeConfigRead,
     board_constituents,
     compute_market_pulse,
     industry_fallback_members,
@@ -212,7 +213,10 @@ def cached_surge_marks(
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def cached_runtime_config(generation_id: str, _store: Any) -> dict | None:
+def cached_runtime_config(
+    generation_id: str,
+    _store: Any,
+) -> ServingRuntimeConfigRead | dict[str, object] | None:
     return load_surge_runtime_config(store=_store)
 
 
@@ -395,6 +399,10 @@ def _render_pulse_alert_line(now: datetime, store: Any) -> None:
     """最近 30 分钟内的异动：常驻 warning + 新异动一次性 toast（会话内去重）。"""
     alerts = cached_pulse_alerts(str(store.generation_id), now.date().isoformat(), store)
     if alerts.empty:
+        state = str(alerts.attrs.get("serving_state") or "")
+        if state in {"unavailable", "degraded"}:
+            detail = str(alerts.attrs.get("serving_detail") or "未提供状态详情")
+            st.warning(f"脉搏异动该代未发布/降级：{detail[:140]}")
         return
     latest = alerts.iloc[-1]
     try:
@@ -439,6 +447,10 @@ def render_pulse(
         hist = cached_pulse_history(
             str(store.generation_id), datetime.now(CST).date().isoformat(), store
         )
+        history_state = str(hist.attrs.get("serving_state") or "")
+        if history_state in {"unavailable", "degraded"}:
+            detail = str(hist.attrs.get("serving_detail") or "未提供状态详情")
+            st.warning(f"脉搏历史该代未发布/降级：{detail[:140]}")
         if len(hist) >= 2:
             st.altair_chart(_pulse_facet_chart(hist), width="stretch")
             st.caption("数据来源：服务端全天历史（surge-watch 每分钟落盘）")
@@ -455,7 +467,7 @@ def render_pulse(
                 .properties(height=160)
             )
             st.altair_chart(chart, width="stretch")
-            st.caption("数据来源：本会话累积（服务端历史不可用，本地兜底）")
+            st.caption("数据来源：本会话临时累积（不替代服务端历史）")
         else:
             st.caption("脉搏曲线累积中（需 ≥2 分钟样本）")
 
@@ -842,8 +854,24 @@ _BOARD_LABELS = {"main": "主板", "gem": "创业", "star": "科创", "bj": "北
 
 
 def _surge_caption(n_rows: int, store: Any) -> str:
-    """页脚口径：优先 runtime_config 动态展示，缺失退回写死文案。"""
+    """页脚口径：展示同代 runtime config 或明确的未发布状态。"""
     cfg = cached_runtime_config(str(store.generation_id), store)
+    if isinstance(cfg, ServingRuntimeConfigRead):
+        if cfg.config is None:
+            return (
+                f"检测口径该代未发布/降级：{cfg.detail[:100]}"
+                " · 以下台账仍来自同代 Serving 投影"
+                f" · 共 {n_rows} 条"
+            )
+        config = cfg.config
+        boards = "/".join(_BOARD_LABELS.get(board, board) for board in config.boards)
+        return (
+            f"检测范围：{boards or '—'}"
+            f" · 口径 v4：累计放量 {config.k_cum:g}-{config.ratio_cap:g}×"
+            " + 当前分钟上涨 + 外盘占优（tick-rule 近似）"
+            " · 每标的取当日最早识别时刻"
+            f" · 观察提示非买入信号 · 共 {n_rows} 条"
+        )
     if cfg:
         boards = "/".join(_BOARD_LABELS.get(b, str(b)) for b in cfg.get("boards", []))
         return (
@@ -890,6 +918,9 @@ def _render_surge_table(df: pd.DataFrame, *, table_key: str, historical: bool) -
 def render_surge_log(store: Any) -> None:
     """爆量台账：空搜索按日查看；搜索时跨日检索，并可复盘任一爆量日。"""
     today = datetime.now(CST).date()
+    runtime_config = cached_runtime_config(str(store.generation_id), store)
+    if isinstance(runtime_config, ServingRuntimeConfigRead) and runtime_config.config is None:
+        st.warning(f"检测口径该代未发布/降级：{runtime_config.detail[:140]}")
     query = st.text_input(
         "搜索标的",
         placeholder="输入股票代码或名称，跨天检索全部爆量记录",

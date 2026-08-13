@@ -816,9 +816,7 @@ def _validate_manifest_authority(
     elif manifest.service_kind is RuntimeServiceKind.DAILY_CLOSE_SOURCE:
         readonly_exclusions = {
             "daily close state": runtime_root / "live" / "daily-close",
-            "daily close control": (
-                runtime_root / "control" / "daily-close-sources" / instance
-            ),
+            "daily close control": (runtime_root / "control" / "daily-close-sources" / instance),
         }
     elif manifest.service_kind is RuntimeServiceKind.SHADOW_SESSION:
         readonly_exclusions = {
@@ -981,9 +979,7 @@ def _validate_manifest_authority(
         }
         for setting_name, expected_path in expected_paths.items():
             if Path(str(manifest.settings.get(setting_name, ""))) != expected_path:
-                raise ValueError(
-                    f"{setting_name} must equal the daily-close source systemd path"
-                )
+                raise ValueError(f"{setting_name} must equal the daily-close source systemd path")
     if manifest.service_kind is RuntimeServiceKind.SHADOW_SESSION:
         expected_paths = {
             "calendar_path": _expected_market_calendar_generation(
@@ -1019,9 +1015,7 @@ def _validate_manifest_authority(
         }
         for setting_name, expected_path in expected_paths.items():
             if Path(str(manifest.settings.get(setting_name, ""))) != expected_path:
-                raise ValueError(
-                    f"{setting_name} must equal the daily orchestrator systemd path"
-                )
+                raise ValueError(f"{setting_name} must equal the daily orchestrator systemd path")
         if manifest.settings.get("mode") != "shadow":
             raise ValueError("daily orchestrator must remain in shadow mode")
     if manifest.service_kind is RuntimeServiceKind.REFERENCE_SLOW_PUBLISHER:
@@ -1322,6 +1316,13 @@ def _validate_manifest_authority(
                 raise ValueError(
                     "page_projection_database_path must be an external absolute read-only snapshot"
                 )
+            if Path(str(manifest.settings.get("page_projection_surge_live_root", ""))) != (
+                projection_database.parent / "surge_live"
+            ):
+                raise ValueError(
+                    "page_projection_surge_live_root must equal the operational data "
+                    "surge_live source"
+                )
         if "page_projection_canvas_catalog_root" in manifest.settings:
             expected_catalog_root = runtime_root / "serving" / "page-control" / "canvases"
             if (
@@ -1333,10 +1334,7 @@ def _validate_manifest_authority(
                 )
             expected_authority_paths = {
                 "page_projection_canvas_receipt_root": (
-                    runtime_root
-                    / "serving"
-                    / "page-control"
-                    / "canvas-publication-receipts"
+                    runtime_root / "serving" / "page-control" / "canvas-publication-receipts"
                 ),
                 "page_projection_page_control_outbox_path": (
                     runtime_root / "control" / "page-control.sqlite3"

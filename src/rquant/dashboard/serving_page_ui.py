@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from rquant.dashboard.runtime_console_data import ServingFrameState
+from rquant.dashboard.serving_only_page_data import ServingFrameState
 
 
 class _BannerTarget(Protocol):

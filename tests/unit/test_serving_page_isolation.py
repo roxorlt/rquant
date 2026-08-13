@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 import ast
+import json
+import os
+import subprocess
+import sys
+import textwrap
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -155,8 +160,80 @@ def test_market_panorama_ui_uses_only_one_serving_generation_without_source_poll
     assert "fetch_intraday_trend" not in source
     assert "SourcePoller" not in data_source
     assert "panorama_poller" not in data_source
+    assert "rquant.config" not in data_source
+    assert "live_dir=" not in source
     assert "open_panorama_serving_generation" in source
     assert source.count("open_panorama_serving_generation()") == 1
+
+
+def test_panorama_import_and_real_serving_open_are_operational_dependency_free(
+    tmp_path: Path,
+) -> None:
+    serving_root = tmp_path / "serving"
+    built_at = datetime(2026, 8, 2, 1, 0, tzinfo=UTC)
+    ServingPublisher(
+        serving_root,
+        producer_commit="a" * 40,
+        table_specs={"proof": ServingTableSpec(sort_keys=("value",))},
+    ).publish(
+        {"proof": pd.DataFrame({"value": ["serving-only"]})},
+        watermarks=(
+            ServingDatasetWatermark(
+                dataset_id="proof",
+                generation_id="proof-1",
+                event_time=built_at,
+                published_at=built_at,
+                sequence=1,
+                status=FreshnessStatus.FRESH,
+            ),
+        ),
+        source_generations={"proof": "proof-1"},
+        built_at=built_at,
+    )
+    script = textwrap.dedent(
+        """
+        import sys
+        from rquant.panorama_data import open_panorama_serving_generation
+        import rquant.dashboard.market_panorama
+
+        with open_panorama_serving_generation() as store:
+            frame = store.query_frame(
+                "SELECT value FROM proof",
+                max_rows=1,
+                max_result_bytes=1024,
+            )
+            assert frame["value"].tolist() == ["serving-only"]
+
+        forbidden = (
+            "rquant.config",
+            "rquant.storage.duckdb",
+            "rquant.panorama_poller",
+        )
+        loaded = sorted(name for name in forbidden if name in sys.modules)
+        assert loaded == [], loaded
+        """
+    )
+    environment = {
+        "PATH": os.environ.get("PATH", ""),
+        "PYTHONPATH": str(_PROJECT_ROOT / "src"),
+        "RQUANT_DISABLE_DOTENV": "1",
+        "RQUANT_SERVING_ROOT": str(serving_root),
+    }
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=_PROJECT_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+
+    assert completed.returncode == 0, json.dumps(
+        {"stdout": completed.stdout, "stderr": completed.stderr},
+        ensure_ascii=False,
+    )
 
 
 def test_market_panorama_helpers_accept_the_render_serving_reader() -> None:
@@ -322,6 +399,7 @@ def test_query_requires_published_projection_and_rejects_unbounded_sql(
                     "table_name": ["dashboard_summary"],
                     "available": [False],
                     "reason": ["projection_not_published"],
+                    "owner_dataset_id": ["runtime_health"],
                     "available_at": [None],
                 }
             ),
@@ -461,6 +539,7 @@ def test_serving_query_scopes_watermark_state_to_required_projection_owner(
                     "table_name": ["dashboard_summary", "screen_bounds"],
                     "available": [True, True],
                     "reason": [None, None],
+                    "owner_dataset_id": ["runtime_health", "signals"],
                     "available_at": [built_at, built_at],
                 }
             ),
@@ -529,6 +608,7 @@ def test_serving_query_fails_closed_when_projection_owner_watermark_is_missing(
                     "table_name": ["screen_bounds"],
                     "available": [True],
                     "reason": [None],
+                    "owner_dataset_id": ["signals"],
                     "available_at": [built_at],
                 }
             ),

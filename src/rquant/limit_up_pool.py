@@ -18,6 +18,7 @@ import pandas as pd
 from loguru import logger
 
 from rquant.data_metadata import DataQualityIssue, stable_sha256, utc_now
+from rquant.security_codes import to_ts_code
 from rquant.storage.duckdb import DuckDBStore, _duckdb_transaction_is_active
 
 # akshare stock_zt_pool_em 中文列 → limit_up_pool_daily 列
@@ -76,8 +77,7 @@ class LimitUpPoolWriteConflictError(LimitUpPoolCaptureError):
     def __init__(self, trade_date: date) -> None:
         self.trade_date = trade_date
         super().__init__(
-            "limit-up-pool concurrent business write blocked capture: "
-            f"{trade_date.isoformat()}"
+            f"limit-up-pool concurrent business write blocked capture: {trade_date.isoformat()}"
         )
 
 
@@ -136,21 +136,6 @@ def _record_data_quality_issue(
             issue.last_seen_at,
         ],
     )
-
-
-def to_ts_code(symbol: str) -> str | None:
-    """'002273' → '002273.SZ'。6 开头 .SH，0/3 开头 .SZ，4/8/9 开头 .BJ。"""
-    sym = str(symbol).strip()
-    if len(sym) != 6 or not sym.isdigit():
-        return None
-    head = sym[0]
-    if head == "6":
-        return f"{sym}.SH"
-    if head in ("0", "3"):
-        return f"{sym}.SZ"
-    if head in ("4", "8", "9"):
-        return f"{sym}.BJ"
-    return None
 
 
 def _normalize_seal_time(value: object) -> str | None:
@@ -340,10 +325,7 @@ def _allow_remote_fetch(store: DuckDBStore, trading_date: date) -> bool:
         raise LimitUpPoolCalendarGuardError(
             trading_date,
             stage="pre_fetch",
-            detail=(
-                "limit-up-pool calendar unknown before fetch: "
-                f"{trading_date.isoformat()}"
-            ),
+            detail=(f"limit-up-pool calendar unknown before fetch: {trading_date.isoformat()}"),
         )
     if not calendar_day.is_open:
         _record_calendar_issue(
@@ -353,8 +335,7 @@ def _allow_remote_fetch(store: DuckDBStore, trading_date: date) -> bool:
             state="closed",
         )
         logger.warning(
-            "涨停池拒绝休市日采集: "
-            f"date={trading_date.isoformat()} exchange={_CALENDAR_EXCHANGE}"
+            f"涨停池拒绝休市日采集: date={trading_date.isoformat()} exchange={_CALENDAR_EXCHANGE}"
         )
         return False
     _resolve_open_issues(
@@ -490,9 +471,7 @@ def _write_with_final_calendar_check(
     return rows
 
 
-def capture_zt_pool(
-    trade_date: date | None = None, store: DuckDBStore | None = None
-) -> int:
+def capture_zt_pool(trade_date: date | None = None, store: DuckDBStore | None = None) -> int:
     """抓当日涨停池并落库，返回写入行数。
 
     权威日历明确休市时记录 P1 并跳过；日历未知或抓取期间发生变化时
@@ -516,9 +495,7 @@ def capture_zt_pool(
         logger.warning(f"涨停池抓取失败（东财源偶发不可用）: date={ds} err={e}")
         return 0
     if raw is None or raw.empty:
-        logger.warning(
-            f"涨停池返回空: date={ds}（历史日期无数据 / 当日无涨停 / 源不可用）"
-        )
+        logger.warning(f"涨停池返回空: date={ds}（历史日期无数据 / 当日无涨停 / 源不可用）")
         return 0
 
     try:

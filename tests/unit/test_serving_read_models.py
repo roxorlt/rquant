@@ -38,7 +38,7 @@ def test_serving_physical_table_specs_have_a_canonical_fingerprint() -> None:
     second = serving_physical_table_specs_fingerprint()
 
     assert first == second
-    assert first == "9645e460a332d4a3b6121673821be9ac6445e8ea67faab33dee6778b5c641948"
+    assert first == "78cbded6cb27a09532d0cf253bcebcf6e4f24c29cfa96c59652a479a4b9c6fd5"
 
 
 def _signal() -> SignalEnvelope:
@@ -268,6 +268,10 @@ def test_page_projections_build_typed_bounded_tables_and_explicit_availability()
     assert status.loc["daily_bar", "owner_generation_id"] == "9" * 64
     assert bool(status.loc["market_overview", "available"]) is False
     assert status.loc["market_overview", "reason"] == "projection_not_published"
+    for table_name in ("pulse_history", "pulse_alert", "surge_runtime_config"):
+        assert bool(status.loc[table_name, "available"]) is False
+        assert status.loc[table_name, "owner_dataset_id"] == "signals"
+        assert status.loc[table_name, "reason"] == "projection_not_published"
 
 
 def test_projection_contract_rejects_duplicate_columns_and_unknown_sort_keys() -> None:

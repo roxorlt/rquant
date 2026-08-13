@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import UTC, date, datetime
 from types import SimpleNamespace
 
 import pandas as pd
 import pytest
 
 from rquant.dashboard import market_panorama as panorama
+from rquant.dashboard.serving_only_page_data import ServingFrameState
 
 
 def _surge_row(**overrides: object) -> dict[str, object]:
@@ -67,6 +68,43 @@ def test_cached_surge_history_strips_query_before_loading(
         panorama.cached_surge_history.clear()
 
     assert calls == ["芯片"]
+
+
+def test_missing_pulse_alert_projection_is_rendered_explicitly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    alerts = pd.DataFrame(columns=["t", "kind", "kind_label", "message"])
+    alerts.attrs.update(
+        serving_state="unavailable",
+        serving_detail="pulse alert: projection not published",
+    )
+    warnings: list[str] = []
+    monkeypatch.setattr(panorama, "cached_pulse_alerts", lambda *_args: alerts)
+    monkeypatch.setattr(panorama.st, "warning", lambda message: warnings.append(message))
+
+    panorama._render_pulse_alert_line(
+        datetime(2026, 8, 3, 10, 30, tzinfo=panorama.CST),
+        SimpleNamespace(generation_id="generation-1"),
+    )
+
+    assert warnings == ["脉搏异动该代未发布/降级：pulse alert: projection not published"]
+
+
+def test_missing_runtime_config_caption_does_not_claim_static_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unavailable = panorama.ServingRuntimeConfigRead(
+        state=ServingFrameState.UNAVAILABLE,
+        detail="surge runtime config: projection not published",
+        generation_id="a" * 64,
+        generated_at=datetime(2026, 8, 3, 2, 0, tzinfo=UTC),
+    )
+    monkeypatch.setattr(panorama, "cached_runtime_config", lambda *_args: unavailable)
+
+    caption = panorama._surge_caption(3, SimpleNamespace(generation_id="a" * 64))
+
+    assert "该代未发布/降级" in caption
+    assert "静态" not in caption
 
 
 def test_surge_history_table_key_tracks_query_and_ordered_result_identity() -> None:

@@ -1006,6 +1006,29 @@ def test_notifier_builtin_refreshes_signal_page_projections_from_replica(
         )
     finally:
         connection.close()
+    surge_live_root = (tmp_path / "surge_live").resolve()
+    surge_live_root.mkdir()
+    (surge_live_root / "runtime_config.json").write_text(
+        json.dumps(
+            {
+                "day": "2026-07-31",
+                "boards": ["main", "gem"],
+                "k_rough": 1.2,
+                "k_cum": 2.5,
+                "ratio_cap": 8.0,
+                "skip_first_minutes": 0,
+                "tushare_rate_per_min": 2,
+                "require_price_strength": True,
+                "max_room_to_limit_pct": 1.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    source_timestamp = (NOW - timedelta(seconds=1)).timestamp()
+    os.utime(
+        surge_live_root / "runtime_config.json",
+        (source_timestamp, source_timestamp),
+    )
     authority_root = (tmp_path / "serving-signals").resolve()
     step = notifier_builder(
         provider_loader=lambda: {DeliveryChannel.PUSHDEER: _Provider()},
@@ -1015,6 +1038,7 @@ def test_notifier_builtin_refreshes_signal_page_projections_from_replica(
             tmp_path,
             serving_authority_root=str(authority_root),
             page_projection_database_path=str(replica),
+            page_projection_surge_live_root=str(surge_live_root),
         )
     )
 
@@ -1029,6 +1053,7 @@ def test_notifier_builtin_refreshes_signal_page_projections_from_replica(
     projections = {item.table_name: item for item in published.payload.projections}
     assert projections["screen_bounds"].rows[0]["preset_name"] == "n-shape-pool1"
     assert projections["minute_coverage"].rows[0]["source"] == "all"
+    assert projections["surge_runtime_config"].rows[0]["boards_json"] == '["main","gem"]'
 
 
 def test_notifier_takes_over_signals_authority_from_exact_previous_commit(

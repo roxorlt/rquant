@@ -35,17 +35,17 @@ from typing import TYPE_CHECKING, Any, Protocol
 import numpy as np
 import pandas as pd
 from loguru import logger
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 if TYPE_CHECKING:
     import requests
 
-from rquant.dashboard.runtime_console_data import (
+from rquant.dashboard.serving_only_page_data import (
     ServingFrameResult,
     ServingFrameState,
+    ServingOnlyRenderContext,
 )
-from rquant.dashboard.serving_page_data import ServingPageRenderContext
-from rquant.limit_up_pool import to_ts_code
+from rquant.security_codes import to_ts_code
 from rquant.state.derive import _classify_board, _detect_st, _limit_pct, _round_half_up
 
 _CST = timezone(timedelta(hours=8))  # A 股墙钟（当日 events 文件按此取「今日」）
@@ -66,7 +66,7 @@ class _ReadableStore(Protocol):
 class _ServingStore:
     def __init__(self, required_projections: tuple[str, ...] = ()) -> None:
         root = os.environ.get("RQUANT_SERVING_ROOT", "data/serving")
-        self._context = ServingPageRenderContext.open(root)
+        self._context = ServingOnlyRenderContext.open(root)
         self.generation_id = self._context.generation_id
         self._query_results: list[ServingFrameResult] = []
         self._pending_projections: list[str] = []
@@ -125,6 +125,10 @@ class _ServingStore:
             raise RuntimeError(result.detail)
         frame = result.dataframe()
         assert isinstance(frame, pd.DataFrame)
+        frame.attrs["serving_state"] = result.state.value
+        frame.attrs["serving_detail"] = result.detail
+        frame.attrs["serving_generation_id"] = result.generation_id
+        frame.attrs["serving_generated_at"] = result.generated_at
         return frame
 
 
@@ -175,10 +179,18 @@ def _read_frame(
     return connection.execute(sql, parameters).fetchdf()
 
 
-def _serving_unavailable(error: Exception, columns: list[str] | None = None) -> pd.DataFrame:
+def _serving_unavailable(
+    error: Exception,
+    columns: list[str] | None = None,
+    *,
+    store: _ReadableStore | None = None,
+) -> pd.DataFrame:
     frame = pd.DataFrame(columns=columns)
     frame.attrs["serving_state"] = "unavailable"
     frame.attrs["serving_detail"] = f"{type(error).__name__}: {error}"
+    generation_id = None if store is None else getattr(store, "generation_id", None)
+    if generation_id is not None:
+        frame.attrs["serving_generation_id"] = generation_id
     return frame
 
 
@@ -1595,9 +1607,7 @@ def load_daily_kline(
 # ── surge-watch 当日爆量台账（只读 events jsonl，绝不写） ──────────────────────
 
 # events jsonl 每行 = 一只票的 SurgeConfirmed.model_dump()（见 surge_watch.SurgeConfirmed）。
-# 与 surge_watch.LIVE_DIR_NAME 对齐；此处硬编码字面量避免为一个只读消费者反向依赖
-# surge_watch（后者会拉进 tushare/state.derive 等重依赖）。
-_SURGE_LIVE_DIR_NAME = "surge_live"
+# 文件读取分支只供显式注入的 legacy fixture/ingestion 测试使用。
 _SURGE_LOG_COLUMNS = [
     "confirmed_at",
     "ts_code",
@@ -1625,15 +1635,47 @@ _PULSE_LOG_COLUMNS = [
     "total",
 ]
 _PULSE_ALERT_COLUMNS = ["t", "kind", "kind_label", "before", "after", "window_minutes", "message"]
+_PULSE_HISTORY_SERVING_COLUMNS = ["trade_date", "as_of", *_PULSE_LOG_COLUMNS]
+_PULSE_ALERT_SERVING_COLUMNS = ["trade_date", "as_of", *_PULSE_ALERT_COLUMNS]
 _RUNTIME_CONFIG_NAME = "runtime_config.json"
 
 
-def _surge_live_dir(live_dir: Path | None) -> Path:
-    if live_dir is not None:
-        return live_dir
-    from rquant.config import settings
+class SurgeRuntimeConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
-    return settings.data_dir / _SURGE_LIVE_DIR_NAME
+    trade_date: date | None = None
+    as_of: datetime | None = None
+    boards: tuple[str, ...] = ()
+    k_rough: float = 1.2
+    k_cum: float = 2.5
+    ratio_cap: float = 8.0
+    skip_first_minutes: int = Field(default=0, ge=0)
+    tushare_rate_per_min: int = Field(default=2, ge=1)
+    require_price_strength: bool = True
+    max_room_to_limit_pct: float = 1.0
+
+    @field_validator("boards")
+    @classmethod
+    def validate_boards(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) != len(set(value)) or not set(value).issubset({"main", "gem", "star", "bj"}):
+            raise ValueError("surge runtime config boards are invalid")
+        return value
+
+
+class ServingRuntimeConfigRead(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    state: ServingFrameState
+    detail: str
+    generation_id: str | None = None
+    generated_at: datetime | None = None
+    config: SurgeRuntimeConfig | None = None
+
+
+def _surge_live_dir(live_dir: Path | None) -> Path:
+    if live_dir is None:
+        raise ValueError("legacy surge file reads require an explicit live_dir")
+    return live_dir
 
 
 def _read_jsonl_records(path: Path, required_key: str) -> list[dict]:
@@ -1667,8 +1709,8 @@ def load_surge_log(
 ) -> pd.DataFrame:
     """读当日 surge-watch events jsonl，**每标的只保留 confirmed_at 最早的一行**，按时间升序。
 
-    默认读 ``settings.data_dir/surge_live/events-{day}.jsonl``（day 缺省今日 CST）；
-    ``live_dir`` 可注入（单测）。文件缺失/空 → 空表（带标准列）；坏行（非法 JSON /
+    production 路径只读 Serving；显式 ``live_dir`` 仅保留给 legacy fixture/ingestion
+    测试。文件缺失/空 → 空表（带标准列）；坏行（非法 JSON /
     非 dict / 缺 ts_code）逐行跳过，不让单条脏数据拖垮整表。confirmed_at 为定长
     ``HH:MM``，字典序即时间序，故排序后按 ts_code 保留首行即当日最早识别时刻。
     """
@@ -1826,9 +1868,35 @@ def load_pulse_history(
     if day is None:
         day = datetime.now(_CST).date()
     if live_dir is None:
-        return _serving_unavailable(
-            RuntimeError("pulse history projection is not published"), _PULSE_LOG_COLUMNS
-        )
+        owns = store is None
+        try:
+            store = store or _open_serving_store(("pulse_history",))
+            _require_projection(store, "pulse_history")
+            frame = _read_frame(
+                store,
+                """
+                SELECT trade_date, as_of, t, limit_up, limit_down, broken,
+                       up, down, up_ratio_pct, total
+                FROM pulse_history
+                WHERE trade_date = ?
+                ORDER BY as_of
+                LIMIT 512
+                """,
+                [day],
+                max_rows=512,
+                max_result_bytes=256 * 1024,
+            )
+            return _bind_serving_generation(frame, store)
+        except Exception as error:
+            logger.warning(f"脉搏历史 serving 查询失败: {type(error).__name__}: {error}")
+            return _serving_unavailable(
+                error,
+                _PULSE_HISTORY_SERVING_COLUMNS,
+                store=store,
+            )
+        finally:
+            if owns and store is not None:
+                store.close()
     path = _surge_live_dir(live_dir) / f"pulse-{day.isoformat()}.jsonl"
     records = _read_jsonl_records(path, "t")
     if not records:
@@ -1852,9 +1920,35 @@ def load_pulse_alerts(
     if day is None:
         day = datetime.now(_CST).date()
     if live_dir is None:
-        return _serving_unavailable(
-            RuntimeError("pulse alert projection is not published"), _PULSE_ALERT_COLUMNS
-        )
+        owns = store is None
+        try:
+            store = store or _open_serving_store(("pulse_alert",))
+            _require_projection(store, "pulse_alert")
+            frame = _read_frame(
+                store,
+                """
+                SELECT trade_date, as_of, t, kind, kind_label, before, after,
+                       window_minutes, message
+                FROM pulse_alert
+                WHERE trade_date = ?
+                ORDER BY as_of, kind
+                LIMIT 512
+                """,
+                [day],
+                max_rows=512,
+                max_result_bytes=512 * 1024,
+            )
+            return _bind_serving_generation(frame, store)
+        except Exception as error:
+            logger.warning(f"脉搏异动 serving 查询失败: {type(error).__name__}: {error}")
+            return _serving_unavailable(
+                error,
+                _PULSE_ALERT_SERVING_COLUMNS,
+                store=store,
+            )
+        finally:
+            if owns and store is not None:
+                store.close()
     path = _surge_live_dir(live_dir) / f"pulse_alerts-{day.isoformat()}.jsonl"
     records = _read_jsonl_records(path, "t")
     if not records:
@@ -1868,7 +1962,7 @@ def load_pulse_alerts(
 
 def load_surge_runtime_config(
     *, store: _ReadableStore | None = None, live_dir: Path | None = None
-) -> dict | None:
+) -> ServingRuntimeConfigRead | dict[str, object] | None:
     """surge-watch 当前生效口径（启动时原子写）。缺失/损坏 → None。"""
     if _fake_enabled():
         return {
@@ -1879,7 +1973,68 @@ def load_surge_runtime_config(
             "tushare_rate_per_min": 2,
         }
     if live_dir is None:
-        return None
+        owns = store is None
+        try:
+            store = store or _open_serving_store(("surge_runtime_config",))
+            _require_projection(store, "surge_runtime_config")
+            frame = _read_frame(
+                store,
+                """
+                SELECT trade_date, as_of, boards_json, k_rough, k_cum, ratio_cap,
+                       skip_first_minutes, tushare_rate_per_min,
+                       require_price_strength, max_room_to_limit_pct
+                FROM surge_runtime_config
+                WHERE snapshot_key = 'current'
+                LIMIT 1
+                """,
+                max_rows=1,
+                max_result_bytes=16 * 1024,
+            )
+            if frame.empty:
+                raise RuntimeError("surge runtime config projection has no current row")
+            row = frame.iloc[0]
+            boards = json.loads(str(row["boards_json"]))
+            if not isinstance(boards, list) or not all(isinstance(board, str) for board in boards):
+                raise ValueError("serving runtime config boards_json is invalid")
+            config = SurgeRuntimeConfig(
+                trade_date=row["trade_date"],
+                as_of=row["as_of"],
+                boards=tuple(boards),
+                k_rough=row["k_rough"],
+                k_cum=row["k_cum"],
+                ratio_cap=row["ratio_cap"],
+                skip_first_minutes=row["skip_first_minutes"],
+                tushare_rate_per_min=row["tushare_rate_per_min"],
+                require_price_strength=row["require_price_strength"],
+                max_room_to_limit_pct=row["max_room_to_limit_pct"],
+            )
+            return ServingRuntimeConfigRead(
+                state=ServingFrameState(
+                    str(frame.attrs.get("serving_state", ServingFrameState.READY.value))
+                ),
+                detail=str(frame.attrs.get("serving_detail", "serving generation verified")),
+                generation_id=getattr(store, "generation_id", None),
+                generated_at=frame.attrs.get("serving_generated_at"),
+                config=config,
+            )
+        except Exception as error:
+            evidence = None if store is None else store.serving_health()
+            return ServingRuntimeConfigRead(
+                state=(ServingFrameState.UNAVAILABLE if evidence is None else evidence.state),
+                detail=(
+                    f"{type(error).__name__}: {error}" if evidence is None else evidence.detail
+                ),
+                generation_id=(
+                    getattr(store, "generation_id", None)
+                    if evidence is None
+                    else evidence.generation_id
+                ),
+                generated_at=None if evidence is None else evidence.generated_at,
+                config=None,
+            )
+        finally:
+            if owns and store is not None:
+                store.close()
     path = _surge_live_dir(live_dir) / _RUNTIME_CONFIG_NAME
     try:
         obj = json.loads(path.read_text(encoding="utf-8"))

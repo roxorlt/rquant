@@ -257,6 +257,119 @@ def test_duckdb_signal_source_builds_bounded_pit_page_projections(tmp_path: Path
     assert "future" not in snapshot.model_dump_json()
 
 
+def test_signal_source_publishes_generation_pinned_pulse_and_runtime_config(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "rquant_ro.duckdb"
+    _signal_projection_database(database)
+    live_root = tmp_path / "surge_live"
+    live_root.mkdir()
+    (live_root / "pulse-2026-08-03.jsonl").write_text(
+        json.dumps(
+            {
+                "t": "09:31",
+                "limit_up": 20,
+                "limit_down": 2,
+                "broken": 1,
+                "up": 2600,
+                "down": 2400,
+                "up_ratio_pct": 50.0,
+                "total": 5400,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (live_root / "pulse_alerts-2026-08-03.jsonl").write_text(
+        json.dumps(
+            {
+                "t": "10:15",
+                "kind": "broken_surge",
+                "kind_label": "炸板潮",
+                "before": 2.0,
+                "after": 6.0,
+                "window_minutes": 10,
+                "message": "炸板异动",
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (live_root / "runtime_config.json").write_text(
+        json.dumps(
+            {
+                "day": "2026-08-03",
+                "boards": ["main", "gem"],
+                "k_rough": 1.2,
+                "k_cum": 2.5,
+                "ratio_cap": 8.0,
+                "skip_first_minutes": 0,
+                "tushare_rate_per_min": 2,
+                "require_price_strength": True,
+                "max_room_to_limit_pct": 1.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    source_timestamp = (NOW - timedelta(seconds=1)).timestamp()
+    for path in live_root.iterdir():
+        os.utime(path, (source_timestamp, source_timestamp))
+
+    snapshot = DuckDBSignalPageProjectionSource(
+        database,
+        surge_live_root=live_root,
+    )(NOW)
+
+    projections = {item.table_name: item for item in snapshot.projections}
+    assert projections["pulse_history"].rows[0]["t"] == "09:31"
+    assert projections["pulse_history"].rows[0]["as_of"] == "2026-08-03T01:31:00+00:00"
+    assert projections["pulse_alert"].rows[0]["kind"] == "broken_surge"
+    assert projections["surge_runtime_config"].rows == (
+        {
+            "snapshot_key": "current",
+            "trade_date": "2026-08-03",
+            "as_of": (NOW - timedelta(seconds=1)).isoformat(),
+            "boards_json": '["main","gem"]',
+            "k_rough": 1.2,
+            "k_cum": 2.5,
+            "ratio_cap": 8.0,
+            "skip_first_minutes": 0,
+            "tushare_rate_per_min": 2,
+            "require_price_strength": True,
+            "max_room_to_limit_pct": 1.0,
+        },
+    )
+    assert snapshot.available_at == max(item.available_at for item in snapshot.projections)
+
+
+def test_signal_source_omits_missing_optional_pulse_projections(tmp_path: Path) -> None:
+    database = tmp_path / "rquant_ro.duckdb"
+    _signal_projection_database(database)
+
+    snapshot = DuckDBSignalPageProjectionSource(
+        database,
+        surge_live_root=tmp_path / "missing-surge-live",
+    )(NOW)
+
+    names = {item.table_name for item in snapshot.projections}
+    assert not {"pulse_history", "pulse_alert", "surge_runtime_config"}.intersection(names)
+
+
+def test_signal_source_rejects_malformed_present_pulse_file(tmp_path: Path) -> None:
+    database = tmp_path / "rquant_ro.duckdb"
+    _signal_projection_database(database)
+    live_root = tmp_path / "surge_live"
+    live_root.mkdir()
+    pulse = live_root / "pulse-2026-08-03.jsonl"
+    pulse.write_text("{broken\n", encoding="utf-8")
+    source_timestamp = (NOW - timedelta(seconds=1)).timestamp()
+    os.utime(pulse, (source_timestamp, source_timestamp))
+
+    with pytest.raises(PageProjectionSourceIntegrityError, match="invalid JSON"):
+        DuckDBSignalPageProjectionSource(database, surge_live_root=live_root)(NOW)
+
+
 def test_duckdb_signal_source_binds_generation_opened_during_connect(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -267,8 +380,7 @@ def test_duckdb_signal_source_binds_generation_opened_during_connect(
     _signal_projection_database(attacker)
     with duckdb.connect(str(attacker)) as connection:
         connection.execute(
-            "UPDATE screen_result SET preset_name = 'attacker' "
-            "WHERE preset_name = 'n-shape-pool1'"
+            "UPDATE screen_result SET preset_name = 'attacker' WHERE preset_name = 'n-shape-pool1'"
         )
     original_connect = duckdb.connect
     attacker_swaps = 0
@@ -319,17 +431,17 @@ def test_signal_source_publishes_canvas_definitions_from_bounded_catalog(tmp_pat
     projections = {item.table_name: item for item in snapshot.projections}
     definition = projections["canvas_definition"].rows[0]
     assert {key: value for key, value in definition.items() if key != "version_hash"} == {
-            "name": "breakout",
-            "description": "突破候选",
-            "pool_refs_json": '["n-shape-pool1","user/strong"]',
-            "created_at": "2026-08-02T07:00:00Z",
-            "updated_at": "2026-08-02T07:00:00Z",
-            "source": "canvas_page",
-            "command_id": "canvas-page-command",
-            "command_hash": str(definition["command_hash"]),
-            "source_identity_hash": str(definition["source_identity_hash"]),
-            "record_hash": receipt.result["record_hash"],
-        }
+        "name": "breakout",
+        "description": "突破候选",
+        "pool_refs_json": '["n-shape-pool1","user/strong"]',
+        "created_at": "2026-08-02T07:00:00Z",
+        "updated_at": "2026-08-02T07:00:00Z",
+        "source": "canvas_page",
+        "command_id": "canvas-page-command",
+        "command_hash": str(definition["command_hash"]),
+        "source_identity_hash": str(definition["source_identity_hash"]),
+        "record_hash": receipt.result["record_hash"],
+    }
     assert len(str(definition["version_hash"])) == 64
     assert len(str(definition["record_hash"])) == 64
 
@@ -766,9 +878,9 @@ def test_signal_source_readonly_audit_allows_same_inode_completed_mutation(
 
     snapshot = source(NOW)
 
-    definition = {
-        item.table_name: item for item in snapshot.projections
-    }["canvas_definition"].rows[0]
+    definition = {item.table_name: item for item in snapshot.projections}["canvas_definition"].rows[
+        0
+    ]
     assert definition["command_id"] == "same-inode-v2"
 
 
@@ -828,9 +940,9 @@ def test_signal_source_ignores_non_authoritative_page_control_result_json(
         page_control_outbox=outbox.path,
     )(NOW)
 
-    definitions = {
-        projection.table_name: projection for projection in snapshot.projections
-    }["canvas_definition"]
+    definitions = {projection.table_name: projection for projection in snapshot.projections}[
+        "canvas_definition"
+    ]
     assert definitions.rows[0]["command_id"] == command.command_id
 
 
@@ -1231,14 +1343,10 @@ def test_canvas_head_suffix_deletion_blocks_projection_and_subsequent_update(
             )
         )
         assert deleted.status is PageControlStatus.SUCCEEDED
-    head_files = tuple(
-        (data_dir / "canvas-publication-heads" / "breakout").glob("*.json")
-    )
+    head_files = tuple((data_dir / "canvas-publication-heads" / "breakout").glob("*.json"))
 
     def head_sequence(path: Path) -> int:
-        publication = CanvasPublicationReceipt.model_validate_json(
-            path.read_text(encoding="utf-8")
-        )
+        publication = CanvasPublicationReceipt.model_validate_json(path.read_text(encoding="utf-8"))
         payload = json.loads(publication.claims.command.description)
         return int(payload["sequence"])
 
@@ -1278,11 +1386,9 @@ def test_signal_source_configured_canvas_root_requires_readonly_audit_authority(
     database = tmp_path / "rquant_ro.duckdb"
     _signal_projection_database(database)
     if signed_catalog:
-        _outbox, catalog, _command, _receipt, authority = (
-            _save_signed_canvas_catalog_record(
-                tmp_path,
-                command_id="configured-root-no-audit",
-            )
+        _outbox, catalog, _command, _receipt, authority = _save_signed_canvas_catalog_record(
+            tmp_path,
+            command_id="configured-root-no-audit",
         )
         receipt_root = catalog.parent / "canvas-publication-receipts"
     else:
@@ -1321,9 +1427,7 @@ def test_signal_source_configured_canvas_root_requires_complete_receipt_authorit
         DuckDBSignalPageProjectionSource(
             database,
             canvas_catalog_root=catalog,
-            canvas_receipt_root=(
-                None if missing_authority == "receipt_root" else receipt_root
-            ),
+            canvas_receipt_root=(None if missing_authority == "receipt_root" else receipt_root),
             canvas_publication_keyring=(
                 None if missing_authority == "keyring" else authority.keyring
             ),

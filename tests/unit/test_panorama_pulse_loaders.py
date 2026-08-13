@@ -112,6 +112,141 @@ class TestRuntimeConfig:
         assert load_surge_runtime_config(live_dir=tmp_path) is None
 
 
+def test_production_pulse_and_runtime_loaders_use_one_injected_serving_generation() -> None:
+    generation_id = "a" * 64
+
+    class _Result:
+        def __init__(self, frame: pd.DataFrame) -> None:
+            self._frame = frame
+
+        def fetchdf(self) -> pd.DataFrame:
+            return self._frame.copy()
+
+    class _Connection:
+        queries: list[str] = []
+
+        def execute(self, sql: str, _parameters: object) -> _Result:
+            self.queries.append(sql)
+            if "FROM pulse_history" in sql:
+                return _Result(
+                    pd.DataFrame(
+                        {
+                            "trade_date": [DAY],
+                            "as_of": ["2026-07-29T01:31:00Z"],
+                            "t": ["09:31"],
+                            "limit_up": [20],
+                            "limit_down": [2],
+                            "broken": [1],
+                            "up": [2600],
+                            "down": [2400],
+                            "up_ratio_pct": [50.0],
+                            "total": [5400],
+                        }
+                    )
+                )
+            if "FROM pulse_alert" in sql:
+                return _Result(
+                    pd.DataFrame(
+                        {
+                            "trade_date": [DAY],
+                            "as_of": ["2026-07-29T02:15:00Z"],
+                            "t": ["10:15"],
+                            "kind": ["broken_surge"],
+                            "kind_label": ["炸板潮"],
+                            "before": [2.0],
+                            "after": [6.0],
+                            "window_minutes": [10],
+                            "message": ["炸板异动"],
+                        }
+                    )
+                )
+            if "FROM surge_runtime_config" in sql:
+                return _Result(
+                    pd.DataFrame(
+                        {
+                            "snapshot_key": ["current"],
+                            "trade_date": [DAY],
+                            "as_of": ["2026-07-29T01:25:00Z"],
+                            "boards_json": ['["main","gem"]'],
+                            "k_rough": [1.2],
+                            "k_cum": [2.5],
+                            "ratio_cap": [8.0],
+                            "skip_first_minutes": [5],
+                            "tushare_rate_per_min": [2],
+                            "require_price_strength": [True],
+                            "max_room_to_limit_pct": [3.0],
+                        }
+                    )
+                )
+            raise AssertionError(f"unexpected serving query: {sql}")
+
+    class _Store:
+        _conn = _Connection()
+
+        def close(self) -> None:
+            return None
+
+        def serving_health(self) -> None:
+            return None
+
+        generation_id = "a" * 64
+
+    store = _Store()
+    history = load_pulse_history(DAY, store=store)
+    alerts = load_pulse_alerts(DAY, store=store)
+    runtime = load_surge_runtime_config(store=store)
+
+    assert history["t"].tolist() == ["09:31"]
+    assert alerts["kind"].tolist() == ["broken_surge"]
+    assert runtime.config is not None
+    assert runtime.config.boards == ("main", "gem")
+    assert {
+        history.attrs["serving_generation_id"],
+        alerts.attrs["serving_generation_id"],
+        runtime.generation_id,
+    } == {generation_id}
+    assert len(store._conn.queries) == 3
+
+
+def test_missing_serving_pulse_projections_are_explicit_without_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generation_id = "b" * 64
+
+    class _Connection:
+        def execute(self, sql: str, _parameters: object) -> object:
+            raise RuntimeError(f"projection not published in generation: {sql.split('FROM')[1]}")
+
+    class _Store:
+        _conn = _Connection()
+        generation_id = "b" * 64
+
+        def close(self) -> None:
+            return None
+
+        def serving_health(self) -> None:
+            return None
+
+    def fallback_called(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("operational or source fallback must not be called")
+
+    monkeypatch.setattr(panorama_data, "_open_serving_store", fallback_called)
+    store = _Store()
+
+    history = load_pulse_history(DAY, store=store)
+    alerts = load_pulse_alerts(DAY, store=store)
+    runtime = load_surge_runtime_config(store=store)
+
+    assert history.empty and history.attrs["serving_state"] == "unavailable"
+    assert alerts.empty and alerts.attrs["serving_state"] == "unavailable"
+    assert runtime.state.value == "unavailable" and runtime.config is None
+    assert {
+        history.attrs["serving_generation_id"],
+        alerts.attrs["serving_generation_id"],
+        runtime.generation_id,
+    } == {generation_id}
+
+
 class TestSurgeMarks:
     def test_earliest_per_day_and_missing_days_skipped(self, tmp_path: Path) -> None:
         d1, d2, d3 = date(2026, 7, 27), date(2026, 7, 28), date(2026, 7, 29)

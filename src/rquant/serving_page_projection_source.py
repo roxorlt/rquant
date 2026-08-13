@@ -9,7 +9,7 @@ import stat
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, time
 from pathlib import Path
 from tempfile import mkdtemp
 from types import MappingProxyType
@@ -68,6 +68,10 @@ _MAX_CANVAS_DEFINITIONS = 512
 _MAX_CANVAS_DEFINITION_BYTES = 64 * 1024
 _MAX_CANVAS_CATALOG_BYTES = 2 * 1024 * 1024
 _MAX_RESEARCH_GATES = 512
+_MAX_PULSE_ROWS = 512
+_MAX_PULSE_FILE_BYTES = 256 * 1024
+_MAX_ALERT_FILE_BYTES = 512 * 1024
+_MAX_RUNTIME_CONFIG_BYTES = 16 * 1024
 _CANVAS_CATALOG_SCHEMA_VERSION = 1
 _PAGE_CONTROL_PROTOCOL_MARKER = "safe-effect-journal-v2"
 _PAGE_CONTROL_PROTOCOL_VERSION = 2
@@ -134,10 +138,7 @@ class _BoundReadonlyDirectory:
 def _bind_readonly_directory(path: Path, *, label: str) -> _BoundReadonlyDirectory:
     normalized = Path(os.path.abspath(path))
     flags = (
-        os.O_RDONLY
-        | os.O_CLOEXEC
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
+        os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     )
     descriptors: list[int] = []
     component_names: list[str] = []
@@ -154,9 +155,7 @@ def _bind_readonly_directory(path: Path, *, label: str) -> _BoundReadonlyDirecto
             opened = os.fstat(descriptor)
             if (entry.st_dev, entry.st_ino) != (opened.st_dev, opened.st_ino):
                 os.close(descriptor)
-                raise PageProjectionSourceIntegrityError(
-                    f"{label} ancestor rotated while open"
-                )
+                raise PageProjectionSourceIntegrityError(f"{label} ancestor rotated while open")
             descriptors.append(descriptor)
             component_names.append(component)
         binding = _BoundReadonlyDirectory(
@@ -179,6 +178,44 @@ def _bind_readonly_directory(path: Path, *, label: str) -> _BoundReadonlyDirecto
 
 def _file_identity(value: os.stat_result) -> tuple[int, int, int, int]:
     return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns
+
+
+def _read_bound_optional_file(
+    binding: _BoundReadonlyDirectory,
+    name: str,
+    *,
+    max_bytes: int,
+) -> tuple[bytes, os.stat_result] | None:
+    try:
+        item = os.stat(name, dir_fd=binding.descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(item.st_mode) or not stat.S_ISREG(item.st_mode):
+        raise PageProjectionSourceIntegrityError(
+            f"surge live source {name} must be a regular non-symlink file"
+        )
+    if item.st_size > max_bytes:
+        raise PageProjectionSourceIntegrityError(f"surge live source {name} exceeds size bound")
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=binding.descriptor,
+    )
+    try:
+        opened = os.fstat(descriptor)
+        if _file_identity(opened) != _file_identity(item):
+            raise PageProjectionSourceIntegrityError(f"surge live source {name} rotated while open")
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            raw = handle.read(max_bytes + 1)
+        after = os.fstat(descriptor)
+        if _file_identity(after) != _file_identity(opened):
+            raise PageProjectionSourceIntegrityError(f"surge live source {name} changed while read")
+    finally:
+        os.close(descriptor)
+    if len(raw) > max_bytes:
+        raise PageProjectionSourceIntegrityError(f"surge live source {name} exceeds size bound")
+    binding.verify()
+    return raw, opened
 
 
 def _local_naive(value: datetime) -> datetime:
@@ -226,10 +263,9 @@ class _StableReadonlyDuckDB:
             os.link(self.path, bound_path, follow_symlinks=False)
             bound = os.lstat(bound_path)
             after_link = os.lstat(self.path)
-            if (
-                _file_identity(bound) != _file_identity(before)
-                or _file_identity(after_link) != _file_identity(before)
-            ):
+            if _file_identity(bound) != _file_identity(before) or _file_identity(
+                after_link
+            ) != _file_identity(before):
                 raise PageProjectionSourceIntegrityError(
                     "projection database rotated while binding its opened generation"
                 )
@@ -375,26 +411,21 @@ class _ReadonlyPageControlAuditReader:
             os.link(self.path, bound_path, follow_symlinks=False)
             bound = os.lstat(bound_path)
             after_link = os.lstat(self.path)
-            if (
-                _file_identity(bound) != _file_identity(before)
-                or _file_identity(after_link) != _file_identity(before)
-            ):
+            if _file_identity(bound) != _file_identity(before) or _file_identity(
+                after_link
+            ) != _file_identity(before):
                 raise PageProjectionSourceIntegrityError(
                     "PageControl audit rotated while binding its exact generation"
                 )
             connection = self._connect(bound_path)
             self._validate_schema_connection(connection)
             connection.execute("BEGIN")
-            before_data_version = int(
-                connection.execute("PRAGMA data_version").fetchone()[0]
-            )
+            before_data_version = int(connection.execute("PRAGMA data_version").fetchone()[0])
             after_data_version = before_data_version
             self._snapshot_connection = connection
             self.assert_quiescent()
             yield
-            after_data_version = int(
-                connection.execute("PRAGMA data_version").fetchone()[0]
-            )
+            after_data_version = int(connection.execute("PRAGMA data_version").fetchone()[0])
         except BaseException:
             self._snapshot_connection = None
             if connection is not None:
@@ -485,9 +516,7 @@ class _ReadonlyPageControlAuditReader:
                 raise PageProjectionSourceIntegrityError(
                     "PageControl audit schema is invalid or incomplete"
                 )
-        foreign_keys = connection.execute(
-            "PRAGMA foreign_key_list(page_control_effect)"
-        ).fetchall()
+        foreign_keys = connection.execute("PRAGMA foreign_key_list(page_control_effect)").fetchall()
         if not any(
             str(row[2]) == "page_control_command"
             and str(row[3]) == "command_id"
@@ -579,8 +608,7 @@ class _ReadonlyPageControlAuditReader:
     def _canvas_name_for_audit(audit: _ReadonlyPageControlAudit) -> str | None:
         field_name = (
             "name"
-            if audit.command_kind
-            in {"save_canvas", "delete_canvas", "set_canvas_pool_refs"}
+            if audit.command_kind in {"save_canvas", "delete_canvas", "set_canvas_pool_refs"}
             else "canvas_name"
         )
         value = audit.payload.get(field_name)
@@ -598,18 +626,14 @@ class _ReadonlyPageControlAuditReader:
             payload = json.loads(row["payload_json"])
             status = PageControlStatus(row["status"])
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise PageProjectionSourceIntegrityError(
-                "PageControl audit row is malformed"
-            ) from exc
+            raise PageProjectionSourceIntegrityError("PageControl audit row is malformed") from exc
         if not isinstance(payload, dict):
             raise PageProjectionSourceIntegrityError(
                 "PageControl audit command payload is not an object"
             )
         command_id = str(row["command_id"])
         if payload.get("command_id") != command_id:
-            raise PageProjectionSourceIntegrityError(
-                "PageControl audit command identity mismatch"
-            )
+            raise PageProjectionSourceIntegrityError("PageControl audit command identity mismatch")
         command_hash = str(row["command_hash"])
         if canonical_sha256(payload) != command_hash:
             raise PageProjectionSourceIntegrityError(
@@ -644,19 +668,19 @@ class DuckDBSignalPageProjectionSource:
         canvas_receipt_root: Path | None = None,
         canvas_publication_keyring: CanvasPublicationKeyring | None = None,
         page_control_outbox: PageControlOutbox | Path | None = None,
+        surge_live_root: Path | None = None,
     ) -> None:
         self.database_path = Path(os.path.abspath(database_path))
         self.canvas_catalog_root = (
-            None
-            if canvas_catalog_root is None
-            else Path(os.path.abspath(canvas_catalog_root))
+            None if canvas_catalog_root is None else Path(os.path.abspath(canvas_catalog_root))
         )
         self.canvas_receipt_root = (
-            None
-            if canvas_receipt_root is None
-            else Path(os.path.abspath(canvas_receipt_root))
+            None if canvas_receipt_root is None else Path(os.path.abspath(canvas_receipt_root))
         )
         self.canvas_publication_keyring = canvas_publication_keyring
+        self.surge_live_root = (
+            None if surge_live_root is None else Path(os.path.abspath(surge_live_root))
+        )
         if page_control_outbox is None:
             self.page_control_outbox = None
         else:
@@ -799,6 +823,10 @@ class DuckDBSignalPageProjectionSource:
             raise PageProjectionSourceIntegrityError("projection database has no PIT evidence")
         available = _database_timestamp(available_row[0])
         canvas_definitions = self._canvas_definitions(observed=observed)
+        pulse_history, pulse_alerts, runtime_config = _read_surge_live_projection_sources(
+            self.surge_live_root,
+            observed=observed,
+        )
         if canvas_definitions:
             available = max(
                 available,
@@ -816,6 +844,9 @@ class DuckDBSignalPageProjectionSource:
             ),
             canvas_hits=hits,
             canvas_definitions=canvas_definitions,
+            pulse_history=pulse_history,
+            pulse_alerts=pulse_alerts,
+            surge_runtime_config=runtime_config,
         )
 
     def _canvas_definitions(
@@ -851,7 +882,7 @@ class DuckDBSignalPageProjectionSource:
                 if stat.S_ISLNK(item.st_mode) or not stat.S_ISREG(item.st_mode):
                     raise PageProjectionSourceIntegrityError(
                         "canvas catalog record must be a regular non-symlink file"
-                )
+                    )
                 if item.st_size > _MAX_CANVAS_DEFINITION_BYTES:
                     raise PageProjectionSourceIntegrityError(
                         "canvas catalog record exceeds size bound"
@@ -920,9 +951,7 @@ class DuckDBSignalPageProjectionSource:
             label="canvas current head",
             observed=observed,
         )
-        watermark_root = (
-            self.canvas_catalog_root.parent / "canvas-publication-watermarks"
-        )
+        watermark_root = self.canvas_catalog_root.parent / "canvas-publication-watermarks"
         watermarks = self._read_canvas_head_authority(
             watermark_root,
             label="canvas immutable watermark",
@@ -972,14 +1001,11 @@ class DuckDBSignalPageProjectionSource:
         try:
             binding = _bind_readonly_directory(root, label=label)
         except FileNotFoundError as exc:
-            has_audit_authority = (
-                self.page_control_outbox is not None
-                and bool(self.page_control_outbox.canvas_mutations())
+            has_audit_authority = self.page_control_outbox is not None and bool(
+                self.page_control_outbox.canvas_mutations()
             )
             if has_audit_authority:
-                raise PageProjectionSourceIntegrityError(
-                    f"{label} authority is missing"
-                ) from exc
+                raise PageProjectionSourceIntegrityError(f"{label} authority is missing") from exc
             return {}
         descriptor = binding.descriptor
         try:
@@ -1042,9 +1068,7 @@ class DuckDBSignalPageProjectionSource:
             raise PageProjectionSourceIntegrityError(
                 "PageControl command authority mismatch for canvas current head"
             )
-        latest = self.page_control_outbox.canvas_mutations().get(
-            head.receipt.claims.command.name
-        )
+        latest = self.page_control_outbox.canvas_mutations().get(head.receipt.claims.command.name)
         if latest is None or latest.command_id != audit.command_id:
             raise PageProjectionSourceIntegrityError(
                 "canvas current head is not the latest PageControl mutation authority"
@@ -1087,9 +1111,7 @@ class DuckDBSignalPageProjectionSource:
         self._verify_canvas_receipt_time(publication, observed=observed)
         self._verify_canvas_publication_receipt_semantics(row, publication)
         if self.canvas_catalog_root is None:
-            raise PageProjectionSourceIntegrityError(
-                "canvas current head root cannot be derived"
-            )
+            raise PageProjectionSourceIntegrityError("canvas current head root cannot be derived")
         try:
             head = read_canvas_current_head(
                 self.canvas_catalog_root.parent / "canvas-publication-heads",
@@ -1176,9 +1198,7 @@ class DuckDBSignalPageProjectionSource:
             generation_id=row.publication_generation_id,
         )
         if publication.receipt_id != expected_receipt_id:
-            raise PageProjectionSourceIntegrityError(
-                "canvas publication receipt identity mismatch"
-            )
+            raise PageProjectionSourceIntegrityError("canvas publication receipt identity mismatch")
         catalog = claims.catalog_record
         if catalog.model_dump(mode="json") != {
             "schema_version": row.schema_version,
@@ -1640,6 +1660,7 @@ class CanvasDefinitionProjectionRow(RuntimeContractModel):
         pool_refs = raw.get("pool_refs", [])
         if not isinstance(pool_refs, list) or not all(isinstance(item, str) for item in pool_refs):
             raise PageProjectionSourceIntegrityError("canvas catalog record pool_refs are invalid")
+
         def parse_time(field: str) -> datetime:
             value = raw.get(field)
             if not isinstance(value, str):
@@ -1658,6 +1679,7 @@ class CanvasDefinitionProjectionRow(RuntimeContractModel):
                     "canvas catalog record contains future evidence"
                 )
             return parsed
+
         created_at = parse_time("created_at")
         updated_at = parse_time("updated_at")
         description = raw.get("description", "")
@@ -1720,6 +1742,284 @@ class CanvasDefinitionProjectionRow(RuntimeContractModel):
             raise PageProjectionSourceIntegrityError("canvas catalog record is invalid") from exc
 
 
+class PulseHistoryProjectionRow(RuntimeContractModel):
+    trade_date: date
+    as_of: AwareUtcDatetime
+    t: str = Field(pattern=r"^(?:[01][0-9]|2[0-3]):[0-5][0-9]$")
+    limit_up: int = Field(ge=0)
+    limit_down: int = Field(ge=0)
+    broken: int = Field(ge=0)
+    up: int = Field(ge=0)
+    down: int = Field(ge=0)
+    up_ratio_pct: float | None = None
+    total: int = Field(ge=0)
+
+
+class PulseAlertProjectionRow(RuntimeContractModel):
+    trade_date: date
+    as_of: AwareUtcDatetime
+    t: str = Field(pattern=r"^(?:[01][0-9]|2[0-3]):[0-5][0-9]$")
+    kind: str = Field(min_length=1, max_length=64)
+    kind_label: str = Field(min_length=1, max_length=64)
+    before: float
+    after: float
+    window_minutes: int = Field(ge=1, le=241)
+    message: str = Field(min_length=1, max_length=2_048)
+
+
+class SurgeRuntimeConfigProjectionRow(RuntimeContractModel):
+    trade_date: date
+    as_of: AwareUtcDatetime
+    boards: tuple[str, ...] = Field(min_length=1, max_length=4)
+    k_rough: float
+    k_cum: float
+    ratio_cap: float
+    skip_first_minutes: int = Field(ge=0, le=240)
+    tushare_rate_per_min: int = Field(ge=1, le=1_000)
+    require_price_strength: bool
+    max_room_to_limit_pct: float
+
+    @field_validator("boards")
+    @classmethod
+    def validate_boards(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        allowed = {"main", "gem", "star", "bj"}
+        if len(value) != len(set(value)) or not set(value).issubset(allowed):
+            raise ValueError("surge runtime config boards are invalid")
+        return value
+
+
+class PulseHistoryProjectionSource(RuntimeContractModel):
+    available_at: AwareUtcDatetime
+    rows: tuple[PulseHistoryProjectionRow, ...] = Field(max_length=_MAX_PULSE_ROWS)
+
+
+class PulseAlertProjectionSource(RuntimeContractModel):
+    available_at: AwareUtcDatetime
+    rows: tuple[PulseAlertProjectionRow, ...] = Field(max_length=_MAX_PULSE_ROWS)
+
+
+class SurgeRuntimeConfigProjectionSource(RuntimeContractModel):
+    available_at: AwareUtcDatetime
+    row: SurgeRuntimeConfigProjectionRow
+
+
+def _source_file_time(
+    item: os.stat_result,
+    *,
+    observed: datetime,
+    name: str,
+) -> datetime:
+    value = datetime.fromtimestamp(item.st_mtime_ns / 1_000_000_000, tz=UTC)
+    if value > observed:
+        raise PageProjectionSourceIntegrityError(
+            f"surge live source {name} contains future file evidence"
+        )
+    return value
+
+
+def _parse_jsonl_objects(raw: bytes, *, name: str) -> tuple[dict[str, object], ...]:
+    try:
+        content = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise PageProjectionSourceIntegrityError(
+            f"surge live source {name} is not valid UTF-8"
+        ) from exc
+    rows: list[dict[str, object]] = []
+    for line_number, line in enumerate(content.splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise PageProjectionSourceIntegrityError(
+                f"surge live source {name} has invalid JSON at line {line_number}"
+            ) from exc
+        if not isinstance(value, dict):
+            raise PageProjectionSourceIntegrityError(
+                f"surge live source {name} line {line_number} must be an object"
+            )
+        rows.append(value)
+        if len(rows) > _MAX_PULSE_ROWS:
+            raise PageProjectionSourceIntegrityError(f"surge live source {name} exceeds row bound")
+    return tuple(rows)
+
+
+def _pulse_as_of(trade_date: date, minute: str) -> datetime:
+    try:
+        parsed_time = time.fromisoformat(minute)
+    except ValueError as exc:
+        raise PageProjectionSourceIntegrityError("pulse minute is invalid") from exc
+    return datetime.combine(trade_date, parsed_time, tzinfo=_SHANGHAI).astimezone(UTC)
+
+
+def _pulse_history_source_row(
+    value: dict[str, object],
+    *,
+    trade_date: date,
+) -> PulseHistoryProjectionRow:
+    expected = {
+        "t",
+        "limit_up",
+        "limit_down",
+        "broken",
+        "up",
+        "down",
+        "up_ratio_pct",
+        "total",
+    }
+    if set(value) != expected:
+        raise PageProjectionSourceIntegrityError("pulse history fields are invalid")
+    try:
+        return PulseHistoryProjectionRow(
+            trade_date=trade_date,
+            as_of=_pulse_as_of(trade_date, str(value["t"])),
+            **value,
+        )
+    except ValueError as exc:
+        raise PageProjectionSourceIntegrityError("pulse history row is invalid") from exc
+
+
+def _pulse_alert_source_row(
+    value: dict[str, object],
+    *,
+    trade_date: date,
+) -> PulseAlertProjectionRow:
+    expected = {
+        "t",
+        "kind",
+        "kind_label",
+        "before",
+        "after",
+        "window_minutes",
+        "message",
+    }
+    if set(value) != expected:
+        raise PageProjectionSourceIntegrityError("pulse alert fields are invalid")
+    try:
+        return PulseAlertProjectionRow(
+            trade_date=trade_date,
+            as_of=_pulse_as_of(trade_date, str(value["t"])),
+            **value,
+        )
+    except ValueError as exc:
+        raise PageProjectionSourceIntegrityError("pulse alert row is invalid") from exc
+
+
+def _read_surge_live_projection_sources(
+    root: Path | None,
+    *,
+    observed: datetime,
+) -> tuple[
+    PulseHistoryProjectionSource | None,
+    PulseAlertProjectionSource | None,
+    SurgeRuntimeConfigProjectionSource | None,
+]:
+    if root is None:
+        return None, None, None
+    try:
+        binding = _bind_readonly_directory(root, label="surge live projection source")
+    except FileNotFoundError:
+        return None, None, None
+    trade_date = observed.astimezone(_SHANGHAI).date()
+    try:
+        history_file = _read_bound_optional_file(
+            binding,
+            f"pulse-{trade_date.isoformat()}.jsonl",
+            max_bytes=_MAX_PULSE_FILE_BYTES,
+        )
+        alert_file = _read_bound_optional_file(
+            binding,
+            f"pulse_alerts-{trade_date.isoformat()}.jsonl",
+            max_bytes=_MAX_ALERT_FILE_BYTES,
+        )
+        config_file = _read_bound_optional_file(
+            binding,
+            "runtime_config.json",
+            max_bytes=_MAX_RUNTIME_CONFIG_BYTES,
+        )
+    finally:
+        binding.close()
+
+    history_source = None
+    if history_file is not None:
+        raw, item = history_file
+        rows = tuple(
+            _pulse_history_source_row(value, trade_date=trade_date)
+            for value in _parse_jsonl_objects(
+                raw,
+                name=f"pulse-{trade_date.isoformat()}.jsonl",
+            )
+        )
+        _source_file_time(item, observed=observed, name="pulse history")
+        if any(row.as_of > observed for row in rows):
+            raise PageProjectionSourceIntegrityError("pulse history contains future evidence")
+        history_source = PulseHistoryProjectionSource(
+            available_at=observed,
+            rows=rows,
+        )
+
+    alert_source = None
+    if alert_file is not None:
+        raw, item = alert_file
+        rows = tuple(
+            _pulse_alert_source_row(value, trade_date=trade_date)
+            for value in _parse_jsonl_objects(
+                raw,
+                name=f"pulse_alerts-{trade_date.isoformat()}.jsonl",
+            )
+        )
+        _source_file_time(item, observed=observed, name="pulse alerts")
+        if any(row.as_of > observed for row in rows):
+            raise PageProjectionSourceIntegrityError("pulse alerts contain future evidence")
+        alert_source = PulseAlertProjectionSource(available_at=observed, rows=rows)
+
+    config_source = None
+    if config_file is not None:
+        raw, item = config_file
+        try:
+            value = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise PageProjectionSourceIntegrityError(
+                "surge runtime config is not valid JSON"
+            ) from exc
+        if not isinstance(value, dict):
+            raise PageProjectionSourceIntegrityError("surge runtime config must be an object")
+        expected_fields = {
+            "day",
+            "boards",
+            "k_rough",
+            "k_cum",
+            "ratio_cap",
+            "skip_first_minutes",
+            "tushare_rate_per_min",
+            "require_price_strength",
+            "max_room_to_limit_pct",
+        }
+        if set(value) != expected_fields:
+            raise PageProjectionSourceIntegrityError(
+                "surge runtime config fields do not match the writer contract"
+            )
+        file_time = _source_file_time(item, observed=observed, name="runtime config")
+        try:
+            config_day = date.fromisoformat(str(value.pop("day")))
+            row = SurgeRuntimeConfigProjectionRow(
+                trade_date=config_day,
+                as_of=file_time,
+                **value,
+            )
+        except ValueError as exc:
+            raise PageProjectionSourceIntegrityError("surge runtime config is invalid") from exc
+        if config_day > trade_date:
+            raise PageProjectionSourceIntegrityError(
+                "surge runtime config contains a future trade date"
+            )
+        config_source = SurgeRuntimeConfigProjectionSource(
+            available_at=observed,
+            row=row,
+        )
+    return history_source, alert_source, config_source
+
+
 class ResearchGateProjectionRow(RuntimeContractModel):
     strategy_name: str = Field(min_length=1)
     range_start: date
@@ -1762,7 +2062,7 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
 
     @model_validator(mode="after")
     def validate_snapshot(self) -> Self:
-        expected_names = {
+        required_names = {
             "screen_bounds",
             "minute_coverage",
             "canvas_diagnostic",
@@ -1770,7 +2070,11 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
             "canvas_hit",
             "canvas_definition",
         }
-        if {item.table_name for item in self.projections} != expected_names:
+        optional_names = {"pulse_history", "pulse_alert", "surge_runtime_config"}
+        published_names = {item.table_name for item in self.projections}
+        if not required_names.issubset(published_names) or not published_names.issubset(
+            required_names | optional_names
+        ):
             raise ValueError("signal page projection snapshot is incomplete")
         expected = canonical_sha256(self.model_dump(mode="python", exclude={"content_sha256"}))
         if self.content_sha256 != expected:
@@ -1788,6 +2092,9 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
         canvas_latest_trade_date: CanvasLatestTradeDateProjectionRow | None = None,
         canvas_hits: tuple[CanvasHitProjectionRow, ...] = (),
         canvas_definitions: tuple[CanvasDefinitionProjectionRow, ...] = (),
+        pulse_history: PulseHistoryProjectionSource | None = None,
+        pulse_alerts: PulseAlertProjectionSource | None = None,
+        surge_runtime_config: SurgeRuntimeConfigProjectionSource | None = None,
     ) -> SignalPageProjectionSnapshot:
         available = normalize_aware_utc(available_at)
         rows = {
@@ -1805,11 +2112,9 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
                 )
             ),
             "canvas_hit": tuple(_canvas_hit_row(row) for row in canvas_hits),
-            "canvas_definition": tuple(
-                _canvas_definition_row(row) for row in canvas_definitions
-            ),
+            "canvas_definition": tuple(_canvas_definition_row(row) for row in canvas_definitions),
         }
-        projections = tuple(
+        projections: tuple[ServingProjectionPayload, ...] = tuple(
             ServingProjectionPayload(
                 table_name=table_name,
                 available_at=available,
@@ -1817,7 +2122,34 @@ class SignalPageProjectionSnapshot(RuntimeContractModel):
             )
             for table_name, table_rows in sorted(rows.items())
         )
-        identity = {"available_at": available, "projections": projections}
+        optional: list[ServingProjectionPayload] = []
+        if pulse_history is not None:
+            optional.append(
+                ServingProjectionPayload(
+                    table_name="pulse_history",
+                    available_at=pulse_history.available_at,
+                    rows=tuple(_pulse_history_row(row) for row in pulse_history.rows),
+                )
+            )
+        if pulse_alerts is not None:
+            optional.append(
+                ServingProjectionPayload(
+                    table_name="pulse_alert",
+                    available_at=pulse_alerts.available_at,
+                    rows=tuple(_pulse_alert_row(row) for row in pulse_alerts.rows),
+                )
+            )
+        if surge_runtime_config is not None:
+            optional.append(
+                ServingProjectionPayload(
+                    table_name="surge_runtime_config",
+                    available_at=surge_runtime_config.available_at,
+                    rows=(_surge_runtime_config_row(surge_runtime_config.row),),
+                )
+            )
+        projections = tuple(sorted((*projections, *optional), key=lambda item: item.table_name))
+        snapshot_available = max(item.available_at for item in projections)
+        identity = {"available_at": snapshot_available, "projections": projections}
         return cls(**identity, content_sha256=canonical_sha256(identity))
 
 
@@ -1896,9 +2228,7 @@ def _canvas_definition_row(row: CanvasDefinitionProjectionRow) -> dict[str, obje
     return {
         "name": row.name,
         "description": row.description,
-        "pool_refs_json": json.dumps(
-            list(row.pool_refs), ensure_ascii=True, separators=(",", ":")
-        ),
+        "pool_refs_json": json.dumps(list(row.pool_refs), ensure_ascii=True, separators=(",", ":")),
         "created_at": row.created_at.isoformat().replace("+00:00", "Z"),
         "updated_at": row.updated_at.isoformat().replace("+00:00", "Z"),
         "source": row.source,
@@ -1907,6 +2237,53 @@ def _canvas_definition_row(row: CanvasDefinitionProjectionRow) -> dict[str, obje
         "source_identity_hash": row.source_identity_hash,
         "record_hash": row.record_hash,
         "version_hash": row.version_hash,
+    }
+
+
+def _pulse_history_row(row: PulseHistoryProjectionRow) -> dict[str, object]:
+    return {
+        "trade_date": row.trade_date.isoformat(),
+        "as_of": row.as_of.isoformat(),
+        "t": row.t,
+        "limit_up": row.limit_up,
+        "limit_down": row.limit_down,
+        "broken": row.broken,
+        "up": row.up,
+        "down": row.down,
+        "up_ratio_pct": row.up_ratio_pct,
+        "total": row.total,
+    }
+
+
+def _pulse_alert_row(row: PulseAlertProjectionRow) -> dict[str, object]:
+    return {
+        "trade_date": row.trade_date.isoformat(),
+        "as_of": row.as_of.isoformat(),
+        "t": row.t,
+        "kind": row.kind,
+        "kind_label": row.kind_label,
+        "before": row.before,
+        "after": row.after,
+        "window_minutes": row.window_minutes,
+        "message": row.message,
+    }
+
+
+def _surge_runtime_config_row(
+    row: SurgeRuntimeConfigProjectionRow,
+) -> dict[str, object]:
+    return {
+        "snapshot_key": "current",
+        "trade_date": row.trade_date.isoformat(),
+        "as_of": row.as_of.isoformat(),
+        "boards_json": json.dumps(list(row.boards), ensure_ascii=True, separators=(",", ":")),
+        "k_rough": row.k_rough,
+        "k_cum": row.k_cum,
+        "ratio_cap": row.ratio_cap,
+        "skip_first_minutes": row.skip_first_minutes,
+        "tushare_rate_per_min": row.tushare_rate_per_min,
+        "require_price_strength": row.require_price_strength,
+        "max_room_to_limit_pct": row.max_room_to_limit_pct,
     }
 
 
@@ -1946,8 +2323,14 @@ __all__ = [
     "DuckDBSignalPageProjectionSource",
     "LabPageProjectionSnapshot",
     "MinuteCoverageProjectionRow",
+    "PulseAlertProjectionRow",
+    "PulseAlertProjectionSource",
+    "PulseHistoryProjectionRow",
+    "PulseHistoryProjectionSource",
     "ResearchGateProjectionRow",
     "ScreenBoundsProjectionRow",
     "SignalPageProjectionProducer",
     "SignalPageProjectionSnapshot",
+    "SurgeRuntimeConfigProjectionRow",
+    "SurgeRuntimeConfigProjectionSource",
 ]

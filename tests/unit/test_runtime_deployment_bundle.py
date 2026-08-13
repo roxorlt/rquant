@@ -1924,6 +1924,33 @@ def test_owner_serving_authority_must_use_exclusive_instance_root(
         )
 
 
+def test_notifier_page_projection_surge_root_is_bound_to_operational_data(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "runtime"
+    manifest = _manifest(
+        root,
+        service_id="notifier-admin",
+        kind=RuntimeServiceKind.NOTIFIER,
+        plane=RuntimeServicePlane.LIVE,
+    )
+    settings = manifest.model_dump(mode="python")["settings"]
+    assert isinstance(settings, dict)
+    settings["page_projection_database_path"] = str(
+        root.parent / "operational" / "rquant_ro.duckdb"
+    )
+    settings["page_projection_surge_live_root"] = str(root.parent / "wrong-data" / "surge_live")
+    manifest = manifest.model_copy(update={"settings": settings})
+
+    with pytest.raises(ValueError, match="surge_live source"):
+        install_runtime_deployment_bundle(
+            root,
+            producer_commit=COMMIT,
+            manifests=(manifest,),
+            capability_env={manifest.service_id: {}},
+        )
+
+
 @pytest.mark.parametrize(
     "kind",
     (

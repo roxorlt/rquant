@@ -1457,6 +1457,9 @@ def build_production_runtime_profile(
                 "lease_seconds": 30,
                 "serving_authority_root": str(notifier_root / "serving-authority"),
                 "page_projection_database_path": str(config.operational_database_path),
+                "page_projection_surge_live_root": str(
+                    config.operational_database_path.parent / "surge_live"
+                ),
                 **(
                     {
                         "page_projection_canvas_catalog_root": str(

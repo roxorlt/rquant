@@ -41,7 +41,7 @@ if TYPE_CHECKING:
 
 from rquant.serving_read_models import ServingProjectionPayload
 
-_NOTIFICATION_PROJECTION_TABLES = frozenset(
+_REQUIRED_NOTIFICATION_PROJECTION_TABLES = frozenset(
     {
         "screen_result",
         "pool2_watch",
@@ -57,6 +57,12 @@ _NOTIFICATION_PROJECTION_TABLES = frozenset(
         "canvas_hit",
         "canvas_definition",
     }
+)
+_OPTIONAL_NOTIFICATION_PROJECTION_TABLES = frozenset(
+    {"pulse_history", "pulse_alert", "surge_runtime_config"}
+)
+_NOTIFICATION_PROJECTION_TABLES = (
+    _REQUIRED_NOTIFICATION_PROJECTION_TABLES | _OPTIONAL_NOTIFICATION_PROJECTION_TABLES
 )
 _MAX_SERVING_DELIVERIES = 10_000
 
@@ -235,11 +241,15 @@ class NotificationProjectionAuthoritySnapshot(RuntimeContractModel):
     @model_validator(mode="after")
     def validate_snapshot(self) -> Self:
         table_names = tuple(projection.table_name for projection in self.projections)
-        if len(table_names) != len(set(table_names)) or set(table_names) != (
-            _NOTIFICATION_PROJECTION_TABLES
+        published = set(table_names)
+        if (
+            len(table_names) != len(published)
+            or not _REQUIRED_NOTIFICATION_PROJECTION_TABLES.issubset(published)
+            or not published.issubset(_NOTIFICATION_PROJECTION_TABLES)
         ):
             raise ValueError(
-                "notification authority must publish exactly the notification projections"
+                "notification authority must publish exactly the notification projections "
+                "required by the core contract and only registered optional projections"
             )
         if self.available_at > self.observed_at:
             raise ValueError("notification projection availability exceeds observation time")

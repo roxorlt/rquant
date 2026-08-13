@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -29,7 +31,10 @@ from rquant.panorama_data import (
     load_intraday_kline_projection,
     load_market_overview_projection,
     load_market_snapshot_projection,
+    load_pulse_alerts,
+    load_pulse_history,
     load_surge_log,
+    load_surge_runtime_config,
     open_panorama_serving_generation,
 )
 from rquant.paper_contracts import PaperAccountSnapshot
@@ -548,6 +553,59 @@ def test_page_projections_are_atomic_bounded_and_independent_from_operational_db
     assert isinstance(canvas_receipt.result, dict)
     assert not (tmp_path / "canvas-catalog" / "breakout.json").exists()
     canvas_catalog = page_data_dir / "canvases"
+    surge_live_root = tmp_path / "surge_live"
+    surge_live_root.mkdir()
+    (surge_live_root / "pulse-2026-08-02.jsonl").write_text(
+        json.dumps(
+            {
+                "t": "09:31",
+                "limit_up": 20,
+                "limit_down": 2,
+                "broken": 1,
+                "up": 2600,
+                "down": 2400,
+                "up_ratio_pct": 50.0,
+                "total": 5400,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (surge_live_root / "pulse_alerts-2026-08-02.jsonl").write_text(
+        json.dumps(
+            {
+                "t": "10:15",
+                "kind": "broken_surge",
+                "kind_label": "炸板潮",
+                "before": 2.0,
+                "after": 6.0,
+                "window_minutes": 10,
+                "message": "炸板异动",
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (surge_live_root / "runtime_config.json").write_text(
+        json.dumps(
+            {
+                "day": "2026-08-02",
+                "boards": ["main", "gem"],
+                "k_rough": 1.2,
+                "k_cum": 2.5,
+                "ratio_cap": 8.0,
+                "skip_first_minutes": 0,
+                "tushare_rate_per_min": 2,
+                "require_price_strength": True,
+                "max_room_to_limit_pct": 1.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    surge_source_timestamp = (NOW - timedelta(seconds=3)).timestamp()
+    for path in surge_live_root.iterdir():
+        os.utime(path, (surge_source_timestamp, surge_source_timestamp))
     page_table_names = {
         "screen_bounds",
         "minute_coverage",
@@ -559,6 +617,7 @@ def test_page_projections_are_atomic_bounded_and_independent_from_operational_db
     SignalPageProjectionProducer(
         source=DuckDBSignalPageProjectionSource(
             signal_page_database,
+            surge_live_root=surge_live_root,
             canvas_catalog_root=canvas_catalog,
             canvas_receipt_root=page_data_dir / "canvas-publication-receipts",
             canvas_publication_keyring=page_authority.keyring,
@@ -733,6 +792,9 @@ def test_page_projections_are_atomic_bounded_and_independent_from_operational_db
                 day=datetime(2026, 7, 31, tzinfo=UTC).date(),
                 store=panorama_store,
             )
+            pulse_history = load_pulse_history(date(2026, 8, 2), store=panorama_store)
+            pulse_alerts = load_pulse_alerts(date(2026, 8, 2), store=panorama_store)
+            runtime_config = load_surge_runtime_config(store=panorama_store)
         nl_result = query_serving_frame(
             runtime_root / "serving",
             "SELECT * FROM nl_screen_universe WHERE trade_date = CAST(? AS DATE) LIMIT 8000",
@@ -791,6 +853,10 @@ def test_page_projections_are_atomic_bounded_and_independent_from_operational_db
     assert intraday["price"].tolist() == [10.6]
     assert members["con_code"].tolist() == ["600000.SH"]
     assert surge["ts_code"].tolist() == ["600000.SH"]
+    assert pulse_history["t"].tolist() == ["09:31"]
+    assert pulse_alerts["kind"].tolist() == ["broken_surge"]
+    assert runtime_config.config is not None
+    assert runtime_config.config.boards == ("main", "gem")
     assert nl_result.state is ServingFrameState.READY
     nl_frame = nl_result.dataframe()
     assert isinstance(nl_frame, pd.DataFrame)
@@ -807,10 +873,8 @@ def test_page_projections_are_atomic_bounded_and_independent_from_operational_db
     assert canvas_diagnostics == [("final", 1)]
     assert canvas_definitions_result.value is not None
     assert canvas_definitions_result.value["name"].tolist() == ["breakout"]
-    assert canvas_definitions_result.value["pool_refs_json"].tolist() == ["[\"n-shape-pool1\"]"]
-    assert canvas_definitions_result.value["command_id"].tolist() == [
-        "serving-page-e2e-breakout"
-    ]
+    assert canvas_definitions_result.value["pool_refs_json"].tolist() == ['["n-shape-pool1"]']
+    assert canvas_definitions_result.value["command_id"].tolist() == ["serving-page-e2e-breakout"]
     assert canvas_definitions_result.value["record_hash"].tolist() == [
         canvas_receipt.result["record_hash"]
     ]
@@ -840,6 +904,9 @@ def test_page_projections_are_atomic_bounded_and_independent_from_operational_db
         intraday.attrs["serving_generation_id"],
         members.attrs["serving_generation_id"],
         surge.attrs["serving_generation_id"],
+        pulse_history.attrs["serving_generation_id"],
+        pulse_alerts.attrs["serving_generation_id"],
+        runtime_config.generation_id,
         nl_result.generation_id,
         canvas_generation,
         lab_generation,

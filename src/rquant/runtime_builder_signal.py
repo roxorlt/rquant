@@ -251,6 +251,7 @@ class NotifierSettings(RuntimeContractModel):
     pushplus_recipient_id: str = Field(default="admin", min_length=1)
     serving_authority_root: Path | None = None
     page_projection_database_path: Path | None = None
+    page_projection_surge_live_root: Path | None = None
     page_projection_canvas_catalog_root: Path | None = None
     page_projection_canvas_receipt_root: Path | None = None
     page_projection_page_control_outbox_path: Path | None = None
@@ -263,9 +264,7 @@ class NotifierSettings(RuntimeContractModel):
         min_length=1,
         max_length=16_384,
     )
-    page_projection_canvas_previous_public_key_pems: Mapping[str, str] = Field(
-        default_factory=dict
-    )
+    page_projection_canvas_previous_public_key_pems: Mapping[str, str] = Field(default_factory=dict)
     serving_previous_producer_commit: str | None = Field(
         default=None,
         pattern=r"^[0-9a-f]{40}$",
@@ -277,6 +276,7 @@ class NotifierSettings(RuntimeContractModel):
         "signal_spool_root",
         "notification_state_path",
         "page_projection_database_path",
+        "page_projection_surge_live_root",
         "page_projection_canvas_catalog_root",
         "page_projection_canvas_receipt_root",
         "page_projection_page_control_outbox_path",
@@ -296,6 +296,11 @@ class NotifierSettings(RuntimeContractModel):
             raise ValueError("retry_max_seconds must be at least retry_base_seconds")
         if self.page_projection_database_path is not None and self.serving_authority_root is None:
             raise ValueError("page projection database requires a signals serving authority root")
+        if (
+            self.page_projection_surge_live_root is not None
+            and self.page_projection_database_path is None
+        ):
+            raise ValueError("surge live projection requires a page projection database")
         if (
             self.page_projection_canvas_catalog_root is not None
             and self.page_projection_database_path is None
@@ -838,12 +843,11 @@ def notifier_builder(
                 page_projection_producer = SignalPageProjectionProducer(
                     source=DuckDBSignalPageProjectionSource(
                         settings.page_projection_database_path,
+                        surge_live_root=settings.page_projection_surge_live_root,
                         canvas_catalog_root=settings.page_projection_canvas_catalog_root,
                         canvas_receipt_root=settings.page_projection_canvas_receipt_root,
                         canvas_publication_keyring=canvas_keyring,
-                        page_control_outbox=(
-                            settings.page_projection_page_control_outbox_path
-                        ),
+                        page_control_outbox=(settings.page_projection_page_control_outbox_path),
                     ),
                     store=store,
                 )

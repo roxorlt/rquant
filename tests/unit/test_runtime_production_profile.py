@@ -586,6 +586,12 @@ def test_production_profile_declares_the_complete_isolated_runtime(
         "PUSHDEER_KEYS",
         "PUSHPLUS_TOKENS",
     )
+    notifier_settings = NotifierSettings.model_validate(
+        dict(by_kind[RuntimeServiceKind.NOTIFIER][0].settings)
+    )
+    assert notifier_settings.page_projection_surge_live_root == (
+        inputs.operational_database_path.parent / "surge_live"
+    )
     assert profile.capability_environment[
         by_kind[RuntimeServiceKind.ARTIFACT_RETENTION][0].service_id
     ] == ("RQ_ARTIFACT_RETENTION_WRITER_CREDENTIAL",)
