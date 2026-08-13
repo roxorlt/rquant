@@ -337,6 +337,16 @@ def _validate_receipts(
             raise PaperV4ReconciliationError("v4 receipt request fingerprint differs")
         receipt_order = receipt.get("order")
         receipt_fill = receipt.get("fill")
+        receipt_filled_quantity = (
+            0
+            if expected_fill is None
+            else sum(
+                int(fill["quantity"])
+                for fill in fills
+                if fill["order_id"] == expected_fill["order_id"]
+                and int(fill["sequence"]) <= int(expected_fill["sequence"])
+            )
+        )
         if (
             receipt.get("execution_id") != execution_id
             or receipt.get("request_fingerprint") != row["request_fingerprint"]
@@ -351,7 +361,7 @@ def _validate_receipts(
             or receipt_order.get("account_id") != account_id
             or receipt_order.get("side") != order["side"]
             or receipt_order.get("quantity") != int(order["quantity"])
-            or receipt_order.get("filled_quantity") != int(order["filled_quantity"])
+            or receipt_order.get("filled_quantity") != receipt_filled_quantity
         ):
             raise PaperV4ReconciliationError("v4 receipt/order identity differs")
         if expected_fill is None:
@@ -519,8 +529,17 @@ def _account_report(
             lot_remaining[str(lot["lot_id"])] = quantity
         else:
             consumptions = connection.execute(
-                "SELECT * FROM paper_lot_consumption WHERE fill_id = ? ORDER BY lot_id",
-                (fill["fill_id"],),
+                """
+                SELECT c.fill_id, c.lot_id, c.quantity, c.unit_cost, c.persisted_at
+                FROM paper_lot_consumption AS c
+                JOIN paper_lot AS l ON l.lot_id = c.lot_id
+                JOIN paper_fill AS buy_fill ON buy_fill.fill_id = l.lot_id
+                JOIN paper_order AS buy_order ON buy_order.order_id = buy_fill.order_id
+                WHERE c.fill_id = ? AND buy_order.account_id = ?
+                ORDER BY l.available_date, l.acquisition_trade_date, l.buy_executed_at,
+                         l.buy_persisted_at, l.buy_fill_sequence, l.lot_id
+                """,
+                (fill["fill_id"], account_id),
             ).fetchall()
             if sum(int(row["quantity"]) for row in consumptions) != quantity:
                 raise PaperV4ReconciliationError("v4 SELL consumption quantity differs")

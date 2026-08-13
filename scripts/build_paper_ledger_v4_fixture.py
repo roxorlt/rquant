@@ -183,7 +183,7 @@ def _driver(parent_root: Path, output: Path, seed_path: Path) -> None:
             price_snapshot_id=seed["price_snapshot_id"],
             producer_commit=seed["producer_commit"],
         )
-        store.submit_intent(
+        buy_order = store.submit_intent(
             buy_intent,
             execution_id=buy["execution_id"],
             decision_time=datetime.fromisoformat(buy["decision_time"]),
@@ -191,17 +191,33 @@ def _driver(parent_root: Path, output: Path, seed_path: Path) -> None:
             trade_date=date.fromisoformat(buy["trade_date"]),
             quote=BrokerExecutionContext(
                 executable_price=Decimal(buy["price"]),
+                executable_quantity=buy["executable_quantity"],
                 acquisition_available_date=date.fromisoformat(buy["available_date"]),
             ),
         )
-        sell = seed["executions"][1]
+        incremental_buy = seed["executions"][1]
+        store.apply_execution(
+            buy_order.order_id,
+            execution_id=incremental_buy["execution_id"],
+            executed_at=datetime.fromisoformat(incremental_buy["executed_at"]),
+            persisted_at=datetime.fromisoformat(incremental_buy["persisted_at"]),
+            trade_date=date.fromisoformat(incremental_buy["trade_date"]),
+            quantity=incremental_buy["quantity"],
+            price_snapshot_id=seed["price_snapshot_id"],
+            quote=BrokerExecutionContext(
+                executable_price=Decimal(incremental_buy["price"]),
+                executable_quantity=incremental_buy["quantity"],
+                acquisition_available_date=date.fromisoformat(incremental_buy["available_date"]),
+            ),
+        )
+        sell = seed["executions"][2]
         sell_decision = datetime.fromisoformat(sell["decision_time"])
         authority = store.sell_quantity_authority(
             exit_signal_id=sell["signal_id"],
             entry_signal_id=buy["signal_id"],
             ts_code=seed["ts_code"],
-            action="S_INTENT",
-            tranche_fraction=Decimal("1"),
+            action=sell["action"],
+            tranche_fraction=Decimal(sell["tranche_fraction"]),
             decision_cutoff=sell_decision,
             trade_date=date.fromisoformat(sell["trade_date"]),
         )
@@ -246,6 +262,22 @@ def _driver(parent_root: Path, output: Path, seed_path: Path) -> None:
         ).fetchone()
         if schema != (SCHEMA_VERSION,) or migration != (INTERNAL_MIGRATION_VERSION,):
             raise RuntimeError("parent fixture schema identity differs")
+        chronological_lot_ids = tuple(
+            str(row[0])
+            for row in connection.execute(
+                """
+                SELECT lot_id FROM paper_lot
+                ORDER BY available_date, acquisition_trade_date, buy_executed_at,
+                         buy_persisted_at, buy_fill_sequence, lot_id
+                """
+            ).fetchall()
+        )
+        if len(chronological_lot_ids) != 2 or chronological_lot_ids != tuple(
+            sorted(chronological_lot_ids, reverse=True)
+        ):
+            raise RuntimeError(
+                "parent fixture lot ids are not inverse to canonical FIFO chronology"
+            )
 
 
 def _build(repo: Path, output_dir: Path) -> None:

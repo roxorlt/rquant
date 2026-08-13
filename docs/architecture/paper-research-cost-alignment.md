@@ -81,14 +81,30 @@ basis, executed/persisted timestamps, sequence, and acquisition trade date. Its
 availability date must exactly match the persisted execution request's
 authoritative acquisition-availability fact and must be later than the
 acquisition trade date. Consumption rows must map only to SELL fills and pass
-FIFO, quantity, unit-cost, ordering, and persisted-time checks. Direct migration
-tests corrupt each lot provenance field, consumption mapping, realized P&L, and
-receipt payload; every case rejects before a candidate exists while preserving
-the corrupt source's pre-attempt hash. The migrator then copies a verified
-source to a distinct temporary path, transforms only that copy in an explicit
-transaction, verifies it, and atomically publishes only the requested offline
-candidate. Every injected or ordinary phase failure leaves the source bytes and
-SHA-256 unchanged and publishes no candidate.
+FIFO, quantity, unit-cost, ordering, and persisted-time checks. Expected and
+persisted allocations use the same canonical tuple: availability date,
+acquisition trade date, BUY execution time, BUY persistence time, fill
+sequence, then lot ID. The persisted allocation query explicitly joins each
+consumption to its lot, BUY fill, and BUY order; lexical lot ID order has no
+authority. Multi-fill receipt order snapshots are validated at their own
+cumulative fill sequence rather than against the order's later final state.
+Direct migration tests corrupt each lot provenance field, consumption mapping,
+realized P&L, and receipt payload; every case rejects before a candidate exists
+while preserving the corrupt source's pre-attempt hash. The migrator then
+copies a verified source to a distinct temporary path, transforms only that
+copy in an explicit transaction, verifies it, and atomically publishes only
+the requested offline candidate. Every injected or ordinary phase failure
+leaves the source bytes and SHA-256 unchanged and publishes no candidate.
+
+The committed v4 fixture is built only by running exact parent
+`c088774c3199c02edf203a3af758452eb38a5118` with parent `src` first. Its seed
+uses the parent's public partial/incremental execution APIs to create a
+500-share BUY as 200- and 300-share fills, then a 300-share SELL across both
+lots. The seed fixes explicit parent execution IDs so chronological lot IDs are
+intentionally inverse to lexical order. The closed binary SHA-256 is
+`be1497e0725f6427ff5c61db64b79fdd504a9968b547fd69effc5f55882a0822`;
+the manifest independently freezes schema 4/internal migration 2, schema
+objects, triggers, predecessor identities, seed identity, and business rows.
 
 Migration deliberately leaves historical cash, P&L, lots, receipt JSON, and
 legacy fee fields unchanged. It sets the new authority and fee fields to

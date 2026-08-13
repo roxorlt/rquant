@@ -1,6 +1,6 @@
 {
   "account_id": "legacy-v4-account",
-  "initial_cash": "10000.00",
+  "initial_cash": "200000.00",
   "cost_policy": {
     "commission_rate": "0.0003",
     "minimum_commission": "5.00",
@@ -23,8 +23,19 @@
       "persisted_at": "2026-07-31T01:31:00+00:00",
       "trade_date": "2026-07-31",
       "available_date": "2026-08-03",
-      "quantity": 100,
-      "price": "10.00"
+      "quantity": 500,
+      "executable_quantity": 200,
+      "price": "200.00"
+    },
+    {
+      "side": "BUY",
+      "execution_id": "0d9d81da508fd94c7a9e86593b58810f01cea35c099e8aea780e1b5e3925d854",
+      "executed_at": "2026-07-31T01:31:30+00:00",
+      "persisted_at": "2026-07-31T01:31:30+00:00",
+      "trade_date": "2026-07-31",
+      "available_date": "2026-08-03",
+      "quantity": 300,
+      "price": "200.00"
     },
     {
       "side": "SELL",
@@ -34,8 +45,10 @@
       "decision_time": "2026-08-03T01:31:00+00:00",
       "persisted_at": "2026-08-03T01:31:00+00:00",
       "trade_date": "2026-08-03",
-      "quantity": 100,
-      "price": "11.00"
+      "quantity": 300,
+      "price": "210.00",
+      "action": "REDUCE",
+      "tranche_fraction": "0.6"
     }
   ]
 }
