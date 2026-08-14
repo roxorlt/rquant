@@ -19,7 +19,9 @@
 
 - **CI 全集分片**：原 90 分钟单 job 拆为 Python 3.11/3.12 的 core preflight 与 4 个
   fail-fast-disabled full-suite shard；版本化 nodeid manifest、pytest `@argsfile` runner 和
-  每版本 JUnit 聚合契约会在 collect drift、漏片/重片、artifact 混入或测试失败时 fail closed。
+  每版本 JUnit 聚合契约会在 collect drift、漏片/重片、artifact 混入或测试失败时 fail closed；
+  v1 selector 固定为空，strict canonical JSON 与仓库内 `tests/**/*.py` 路径/大小边界拒绝
+  option、路径穿越、重复 key、未知字段及符号链接逃逸。
 
 - **模拟盘发布证据**：paper publication v4 将执行成本证据与不可变 SQLite 镜像绑定，发布前后
   复核 schema、账本和源文件身份，避免迁移时把可变源库当作已验证输入。

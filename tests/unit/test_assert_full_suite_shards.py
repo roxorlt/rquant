@@ -10,18 +10,50 @@ import pytest
 from scripts import full_suite_shards as shards
 from tests.support import assert_full_suite_shards as validator
 
+NODEIDS = (
+    "tests/a.py::test_a",
+    "tests/b.py::test_b",
+    "tests/c.py::test_c",
+    "tests/d.py::test_d",
+)
+
+
+def _repository_for_manifest(root: Path) -> Path:
+    return root.parent / "repository"
+
 
 def _write_bundle(root: Path) -> dict[str, object]:
+    repository_root = _repository_for_manifest(root)
+    for nodeid in NODEIDS:
+        path = repository_root / nodeid.partition("::")[0]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("def test_case():\n    assert True\n", encoding="utf-8")
     return shards.write_manifest_bundle(
         root,
         selector=(),
-        shard_nodeids=(
-            ("tests/a.py::test_a",),
-            ("tests/b.py::test_b",),
-            ("tests/c.py::test_c",),
-            ("tests/d.py::test_d",),
-        ),
+        shard_nodeids=tuple((nodeid,) for nodeid in NODEIDS),
         expected_skips=1,
+        repository_root=repository_root,
+    )
+
+
+def _validate(
+    manifest_root: Path,
+    artifacts: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, int]:
+    repository_root = _repository_for_manifest(manifest_root)
+
+    def collect(_selector: tuple[str, ...], *, repository_root: Path) -> tuple[str, ...]:
+        assert repository_root == _repository_for_manifest(manifest_root)
+        return NODEIDS
+
+    monkeypatch.setattr(shards, "collect_nodeids", collect)
+    return validator.validate_artifacts(
+        manifest_root,
+        artifacts,
+        expected_python="3.12",
+        repository_root=repository_root,
     )
 
 
@@ -71,29 +103,39 @@ def _write_artifacts(
         (artifact / "junit.xml").write_text(xml, encoding="utf-8")
 
 
-def test_validator_aggregates_real_testcases_and_skips(tmp_path: Path) -> None:
+def test_validator_aggregates_real_testcases_and_skips(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     manifest_root = tmp_path / "manifest"
     index = _write_bundle(manifest_root)
     artifacts = tmp_path / "artifacts"
     _write_artifacts(artifacts, index)
 
-    summary = validator.validate_artifacts(manifest_root, artifacts, expected_python="3.12")
+    summary = _validate(manifest_root, artifacts, monkeypatch)
 
     assert summary == {"cases": 4, "skipped": 1, "failures": 0, "errors": 0}
 
 
 @pytest.mark.parametrize("outcome", ("failure", "error"))
-def test_validator_rejects_a_failed_or_errored_testcase(tmp_path: Path, outcome: str) -> None:
+def test_validator_rejects_a_failed_or_errored_testcase(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+) -> None:
     manifest_root = tmp_path / "manifest"
     index = _write_bundle(manifest_root)
     artifacts = tmp_path / "artifacts"
     _write_artifacts(artifacts, index, outcome=outcome)
 
     with pytest.raises(validator.ContractError, match="failure|error"):
-        validator.validate_artifacts(manifest_root, artifacts, expected_python="3.12")
+        _validate(manifest_root, artifacts, monkeypatch)
 
 
-def test_validator_rejects_missing_or_mixed_shard_artifacts(tmp_path: Path) -> None:
+def test_validator_rejects_missing_or_mixed_shard_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     manifest_root = tmp_path / "manifest"
     index = _write_bundle(manifest_root)
     artifacts = tmp_path / "artifacts"
@@ -101,15 +143,18 @@ def test_validator_rejects_missing_or_mixed_shard_artifacts(tmp_path: Path) -> N
     (artifacts / "full-suite-evidence-py3.12-shard1").rename(artifacts / "wrong-shard")
 
     with pytest.raises(validator.ContractError, match="artifact directories"):
-        validator.validate_artifacts(manifest_root, artifacts, expected_python="3.12")
+        _validate(manifest_root, artifacts, monkeypatch)
 
     (artifacts / "wrong-shard").rename(artifacts / "full-suite-evidence-py3.12-shard1")
     (artifacts / "full-suite-evidence-py3.12-shard1" / "junit.xml").unlink()
     with pytest.raises(validator.ContractError, match="malformed JUnit"):
-        validator.validate_artifacts(manifest_root, artifacts, expected_python="3.12")
+        _validate(manifest_root, artifacts, monkeypatch)
 
 
-def test_validator_rejects_malformed_junit_and_python_version_mismatch(tmp_path: Path) -> None:
+def test_validator_rejects_malformed_junit_and_python_version_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     manifest_root = tmp_path / "manifest"
     index = _write_bundle(manifest_root)
     artifacts = tmp_path / "artifacts"
@@ -118,8 +163,8 @@ def test_validator_rejects_malformed_junit_and_python_version_mismatch(tmp_path:
     (target / "junit.xml").write_text("<not-junit>", encoding="utf-8")
 
     with pytest.raises(validator.ContractError, match="malformed|JUnit"):
-        validator.validate_artifacts(manifest_root, artifacts, expected_python="3.12")
+        _validate(manifest_root, artifacts, monkeypatch)
 
     _write_artifacts(artifacts, index, python_version="3.11")
     with pytest.raises(validator.ContractError, match="artifact directories|python"):
-        validator.validate_artifacts(manifest_root, artifacts, expected_python="3.12")
+        _validate(manifest_root, artifacts, monkeypatch)

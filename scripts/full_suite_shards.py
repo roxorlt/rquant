@@ -6,18 +6,34 @@ import argparse
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
+import unicodedata
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 SCHEMA_VERSION = 1
 SHARD_COUNT = 4
 INDEX_NAME = "index.json"
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+MAX_NODEID_BYTES = 1_100_000
+MAX_JSONL_LINE_BYTES = MAX_NODEID_BYTES + 32
+MAX_INDEX_BYTES = 64 * 1024
+MAX_SHARD_MANIFEST_BYTES = 2 * 1024 * 1024
+MAX_MANIFEST_TOTAL_BYTES = 4 * 1024 * 1024
+MAX_COLLECTION_BYTES = MAX_MANIFEST_TOTAL_BYTES
+
+_INDEX_FIELDS = frozenset({"schema_version", "selector", "partition", "full_suite", "shards"})
+_PARTITION_FIELDS = frozenset({"algorithm", "shard_count"})
+_FULL_SUITE_FIELDS = frozenset({"cases", "skips", "sha256"})
+_SHARD_FIELDS = frozenset({"id", "path", "count", "sha256"})
+_NODEID_FIELDS = frozenset({"nodeid"})
+_COLLECTION_FIELDS = frozenset({"nodeids"})
 
 # These are conservative historical weights for files that dominated the former
 # monolithic CI job. Every other file still contributes its case count.
@@ -35,8 +51,112 @@ class ContractError(ValueError):
     """Raised when checked-in CI selection evidence cannot be trusted."""
 
 
+def _is_line_control(character: str) -> bool:
+    return unicodedata.category(character) in {"Cc", "Zl", "Zp"}
+
+
 def _canonical_json(value: object) -> str:
-    return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return json.dumps(
+        value,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ContractError(f"duplicate JSON key: {key}")
+        value[key] = item
+    return value
+
+
+def _require_exact_fields(value: dict[str, Any], expected: frozenset[str], *, label: str) -> None:
+    actual = set(value)
+    if actual != expected:
+        missing = sorted(expected - actual)
+        extra = sorted(actual - expected)
+        raise ContractError(f"{label} fields differ: missing={missing} extra={extra}")
+
+
+def _decode_canonical_object(raw: bytes, *, label: str) -> dict[str, Any]:
+    try:
+        decoded = json.loads(raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
+    except ContractError:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ContractError(f"{label} is not valid UTF-8 JSON") from exc
+    if type(decoded) is not dict:
+        raise ContractError(f"{label} is not a JSON object")
+    try:
+        canonical = (_canonical_json(decoded) + "\n").encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError) as exc:
+        raise ContractError(f"{label} cannot be encoded canonically") from exc
+    if raw != canonical:
+        raise ContractError(f"{label} is not canonical JSON with one LF newline")
+    return decoded
+
+
+def _read_bounded_regular_file(path: Path, *, maximum: int, label: str) -> bytes:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise ContractError(f"{label} is unavailable: {path}") from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise ContractError(f"{label} must be a regular non-symlink file: {path}")
+    if metadata.st_size > maximum:
+        raise ContractError(f"{label} exceeds size limit {maximum}: {path}")
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise ContractError(f"{label} cannot be read: {path}") from exc
+    if len(raw) > maximum:
+        raise ContractError(f"{label} exceeds size limit {maximum}: {path}")
+    return raw
+
+
+def _validate_repository_root(repository_root: Path) -> Path:
+    try:
+        metadata = repository_root.lstat()
+        resolved = repository_root.resolve(strict=True)
+    except OSError as exc:
+        raise ContractError("repository root is unavailable") from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise ContractError("repository root must be a non-symlink directory")
+    if resolved != repository_root:
+        raise ContractError("repository root must be an absolute canonical path")
+    return resolved
+
+
+def _validate_test_file(relative: str, *, repository_root: Path) -> None:
+    resolved_root = _validate_repository_root(repository_root)
+    candidate = repository_root
+    parts = PurePosixPath(relative).parts
+    for index, part in enumerate(parts):
+        candidate /= part
+        try:
+            metadata = candidate.lstat()
+        except OSError as exc:
+            raise ContractError(f"nodeid test file is unavailable: {relative}") from exc
+        if stat.S_ISLNK(metadata.st_mode):
+            raise ContractError(f"nodeid test path contains a symlink: {relative}")
+        final = index == len(parts) - 1
+        if final and not stat.S_ISREG(metadata.st_mode):
+            raise ContractError(f"nodeid test path is not a regular file: {relative}")
+        if not final and not stat.S_ISDIR(metadata.st_mode):
+            raise ContractError(f"nodeid test path ancestor is not a directory: {relative}")
+    try:
+        resolved = candidate.resolve(strict=True)
+        resolved_relative = resolved.relative_to(resolved_root).as_posix()
+    except (OSError, ValueError) as exc:
+        raise ContractError(
+            f"nodeid test path resolves outside the repository: {relative}"
+        ) from exc
+    if resolved != candidate or resolved_relative != relative:
+        raise ContractError(f"nodeid test path is not canonical: {relative}")
 
 
 def nodeid_digest(nodeids: Sequence[str]) -> str:
@@ -46,22 +166,73 @@ def nodeid_digest(nodeids: Sequence[str]) -> str:
     return hashlib.sha256("".join(f"{nodeid}\n" for nodeid in unique).encode("utf-8")).hexdigest()
 
 
-def _file_for_nodeid(nodeid: str) -> str:
-    path, separator, _ = nodeid.partition("::")
-    if not separator or not path.endswith(".py"):
+def _valid_digest(value: object) -> bool:
+    return (
+        type(value) is str
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _file_for_nodeid(
+    nodeid: str,
+    *,
+    repository_root: Path = REPOSITORY_ROOT,
+    validated_files: set[str] | None = None,
+) -> str:
+    if type(nodeid) is not str or not nodeid:
+        raise ContractError("pytest nodeid must be a nonempty string")
+    try:
+        encoded = nodeid.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ContractError("pytest nodeid is not valid UTF-8") from exc
+    if len(encoded) > MAX_NODEID_BYTES:
+        raise ContractError(f"pytest nodeid exceeds size limit {MAX_NODEID_BYTES}")
+    if any(_is_line_control(character) for character in nodeid):
+        raise ContractError("pytest nodeid contains a control character")
+    path, separator, selection = nodeid.partition("::")
+    if not separator or not selection:
         raise ContractError(f"invalid pytest nodeid: {nodeid!r}")
+    if nodeid.startswith("-") or path.startswith("-"):
+        raise ContractError("pytest nodeid cannot be option-prefixed")
+    pure_path = PurePosixPath(path)
+    raw_parts = path.split("/")
+    if (
+        pure_path.is_absolute()
+        or path != pure_path.as_posix()
+        or "\\" in path
+        or any(part in {"", ".", ".."} for part in raw_parts)
+        or len(pure_path.parts) < 2
+        or pure_path.parts[0] != "tests"
+        or pure_path.suffix != ".py"
+    ):
+        raise ContractError(f"pytest nodeid path is not canonical under tests/: {path!r}")
+    if validated_files is None or path not in validated_files:
+        _validate_test_file(path, repository_root=repository_root)
+        if validated_files is not None:
+            validated_files.add(path)
     return path
 
 
 def plan_shards(
-    nodeids: Sequence[str], *, shard_count: int = SHARD_COUNT
+    nodeids: Sequence[str],
+    *,
+    shard_count: int = SHARD_COUNT,
+    repository_root: Path = REPOSITORY_ROOT,
 ) -> tuple[tuple[str, ...], ...]:
     """Use deterministic LPT on test-file history, not directory or case count alone."""
     if shard_count != SHARD_COUNT:
         raise ContractError(f"the full-suite contract requires exactly {SHARD_COUNT} shards")
     files: dict[str, list[str]] = defaultdict(list)
+    validated_files: set[str] = set()
     for nodeid in sorted(nodeids):
-        files[_file_for_nodeid(nodeid)].append(nodeid)
+        files[
+            _file_for_nodeid(
+                nodeid,
+                repository_root=repository_root,
+                validated_files=validated_files,
+            )
+        ].append(nodeid)
     weighted_files = sorted(
         files.items(),
         key=lambda item: (-max(len(item[1]), STATIC_FILE_WEIGHTS.get(item[0], 0)), item[0]),
@@ -85,26 +256,41 @@ def write_manifest_bundle(
     selector: Sequence[str],
     shard_nodeids: Sequence[Sequence[str]],
     expected_skips: int,
+    repository_root: Path = REPOSITORY_ROOT,
 ) -> dict[str, Any]:
+    if type(selector) not in {list, tuple} or selector:
+        raise ContractError("v1 manifest selector must be exactly empty")
     if len(shard_nodeids) != SHARD_COUNT:
         raise ContractError(f"expected {SHARD_COUNT} shard nodeid lists")
-    if expected_skips < 0:
+    if type(expected_skips) is not int or expected_skips < 0:
         raise ContractError("expected skips must be nonnegative")
-    root.mkdir(parents=True, exist_ok=True)
     normalized = tuple(tuple(sorted(group)) for group in shard_nodeids)
+    validated_files: set[str] = set()
+    for group in normalized:
+        for nodeid in group:
+            _file_for_nodeid(
+                nodeid,
+                repository_root=repository_root,
+                validated_files=validated_files,
+            )
     full_nodeids = tuple(nodeid for group in normalized for nodeid in group)
     full_digest = nodeid_digest(full_nodeids)
-    shards = []
+    shard_payloads: list[bytes] = []
+    shards: list[dict[str, Any]] = []
     for shard_id, nodeids in enumerate(normalized):
-        path = _jsonl_path(root, shard_id)
-        path.write_text(
-            "".join(_canonical_json({"nodeid": nodeid}) + "\n" for nodeid in nodeids),
-            encoding="utf-8",
+        lines = tuple(
+            (_canonical_json({"nodeid": nodeid}) + "\n").encode("utf-8") for nodeid in nodeids
         )
+        if any(len(line) > MAX_JSONL_LINE_BYTES for line in lines):
+            raise ContractError(f"shard {shard_id} JSONL line exceeds size limit")
+        payload = b"".join(lines)
+        if len(payload) > MAX_SHARD_MANIFEST_BYTES:
+            raise ContractError(f"shard {shard_id} manifest exceeds size limit")
+        shard_payloads.append(payload)
         shards.append(
             {
                 "id": shard_id,
-                "path": path.name,
+                "path": f"shard-{shard_id}.jsonl",
                 "count": len(nodeids),
                 "sha256": nodeid_digest(nodeids),
             }
@@ -116,77 +302,114 @@ def write_manifest_bundle(
         "full_suite": {"cases": len(full_nodeids), "skips": expected_skips, "sha256": full_digest},
         "shards": shards,
     }
-    (root / INDEX_NAME).write_text(_canonical_json(index) + "\n", encoding="utf-8")
+    index_payload = (_canonical_json(index) + "\n").encode("utf-8")
+    if len(index_payload) > MAX_INDEX_BYTES:
+        raise ContractError("manifest index exceeds size limit")
+    if len(index_payload) + sum(map(len, shard_payloads)) > MAX_MANIFEST_TOTAL_BYTES:
+        raise ContractError("manifest total size exceeds limit")
+    root.mkdir(parents=True, exist_ok=True)
+    (root / INDEX_NAME).write_bytes(index_payload)
+    for shard_id, payload in enumerate(shard_payloads):
+        _jsonl_path(root, shard_id).write_bytes(payload)
     return index
 
 
-def _read_json(path: Path) -> dict[str, Any]:
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ContractError(f"cannot read manifest JSON {path}") from exc
-    if not isinstance(value, dict):
-        raise ContractError(f"manifest JSON is not an object: {path}")
-    return value
+def _read_json(path: Path, *, maximum: int, label: str) -> dict[str, Any]:
+    raw = _read_bounded_regular_file(path, maximum=maximum, label=label)
+    return _decode_canonical_object(raw, label=label)
 
 
-def _read_jsonl(path: Path) -> tuple[str, ...]:
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError as exc:
-        raise ContractError(f"cannot read shard manifest {path}") from exc
+def _read_jsonl(path: Path, *, repository_root: Path) -> tuple[str, ...]:
+    raw = _read_bounded_regular_file(
+        path,
+        maximum=MAX_SHARD_MANIFEST_BYTES,
+        label="shard manifest",
+    )
+    lines = raw.splitlines(keepends=True)
     nodeids: list[str] = []
-    for line_number, line in enumerate(lines, start=1):
-        try:
-            entry = json.loads(line)
-        except json.JSONDecodeError as exc:
-            raise ContractError(f"invalid JSONL at {path}:{line_number}") from exc
-        if (
-            not isinstance(entry, dict)
-            or set(entry) != {"nodeid"}
-            or not isinstance(entry["nodeid"], str)
-        ):
+    validated_files: set[str] = set()
+    for line_number, raw_line in enumerate(lines, start=1):
+        if len(raw_line) > MAX_JSONL_LINE_BYTES:
+            raise ContractError(f"shard manifest line exceeds size limit at {path}:{line_number}")
+        entry = _decode_canonical_object(
+            raw_line,
+            label=f"shard manifest line {path}:{line_number}",
+        )
+        _require_exact_fields(entry, _NODEID_FIELDS, label="shard nodeid record")
+        if type(entry["nodeid"]) is not str:
             raise ContractError(f"invalid shard nodeid record at {path}:{line_number}")
-        _file_for_nodeid(entry["nodeid"])
+        _file_for_nodeid(
+            entry["nodeid"],
+            repository_root=repository_root,
+            validated_files=validated_files,
+        )
         nodeids.append(entry["nodeid"])
     if len(set(nodeids)) != len(nodeids):
         raise ContractError(f"duplicate nodeid inside shard manifest {path}")
     return tuple(nodeids)
 
 
-def load_manifest(root: Path) -> tuple[dict[str, Any], tuple[tuple[str, ...], ...]]:
-    index = _read_json(root / INDEX_NAME)
-    if index.get("schema_version") != SCHEMA_VERSION:
+def load_manifest(
+    root: Path,
+    *,
+    repository_root: Path = REPOSITORY_ROOT,
+) -> tuple[dict[str, Any], tuple[tuple[str, ...], ...]]:
+    manifest_paths = (
+        root / INDEX_NAME,
+        *(_jsonl_path(root, shard) for shard in range(SHARD_COUNT)),
+    )
+    total_size = 0
+    for path in manifest_paths:
+        try:
+            total_size += path.lstat().st_size
+        except OSError as exc:
+            raise ContractError(f"manifest file is unavailable: {path}") from exc
+    if total_size > MAX_MANIFEST_TOTAL_BYTES:
+        raise ContractError("manifest total size exceeds limit")
+    index = _read_json(root / INDEX_NAME, maximum=MAX_INDEX_BYTES, label="manifest index")
+    _require_exact_fields(index, _INDEX_FIELDS, label="manifest index")
+    if type(index["schema_version"]) is not int or index["schema_version"] != SCHEMA_VERSION:
         raise ContractError("unsupported full-suite manifest schema")
-    selector = index.get("selector")
-    if not isinstance(selector, list) or not all(isinstance(item, str) for item in selector):
-        raise ContractError("manifest selector is invalid")
-    partition = index.get("partition")
-    if not isinstance(partition, dict) or partition.get("shard_count") != SHARD_COUNT:
-        raise ContractError("manifest does not define four shards")
-    full = index.get("full_suite")
+    if type(index["selector"]) is not list or index["selector"] != []:
+        raise ContractError("v1 manifest selector must be exactly []")
+    partition = index["partition"]
+    if type(partition) is not dict:
+        raise ContractError("manifest partition is invalid")
+    _require_exact_fields(partition, _PARTITION_FIELDS, label="manifest partition")
     if (
-        not isinstance(full, dict)
-        or not all(
-            isinstance(full.get(field), int) and full[field] >= 0 for field in ("cases", "skips")
-        )
-        or not isinstance(full.get("sha256"), str)
+        partition["algorithm"] != "lpt-file-static-v1"
+        or type(partition["shard_count"]) is not int
+        or partition["shard_count"] != SHARD_COUNT
     ):
+        raise ContractError("manifest does not define four shards")
+    full = index["full_suite"]
+    if type(full) is not dict:
         raise ContractError("manifest full-suite contract is invalid")
-    shard_entries = index.get("shards")
-    if not isinstance(shard_entries, list) or len(shard_entries) != SHARD_COUNT:
+    _require_exact_fields(full, _FULL_SUITE_FIELDS, label="manifest full-suite contract")
+    if not all(
+        type(full[field]) is int and full[field] >= 0 for field in ("cases", "skips")
+    ) or not _valid_digest(full["sha256"]):
+        raise ContractError("manifest full-suite contract is invalid")
+    shard_entries = index["shards"]
+    if type(shard_entries) is not list or len(shard_entries) != SHARD_COUNT:
         raise ContractError("manifest shard index is invalid")
     nodeid_groups: list[tuple[str, ...]] = []
     for shard_id, entry in enumerate(shard_entries):
-        if not isinstance(entry, dict):
+        if type(entry) is not dict:
             raise ContractError("manifest shard entry is invalid")
-        if entry.get("id") != shard_id or entry.get("path") != f"shard-{shard_id}.jsonl":
+        _require_exact_fields(entry, _SHARD_FIELDS, label="manifest shard entry")
+        if (
+            type(entry["id"]) is not int
+            or entry["id"] != shard_id
+            or type(entry["path"]) is not str
+            or entry["path"] != f"shard-{shard_id}.jsonl"
+        ):
             raise ContractError("manifest shard identity is invalid")
-        if not isinstance(entry.get("count"), int) or entry["count"] < 0:
+        if type(entry["count"]) is not int or entry["count"] < 0:
             raise ContractError("manifest shard count is invalid")
-        if not isinstance(entry.get("sha256"), str):
+        if not _valid_digest(entry["sha256"]):
             raise ContractError("manifest shard digest is invalid")
-        nodeids = _read_jsonl(root / entry["path"])
+        nodeids = _read_jsonl(root / entry["path"], repository_root=repository_root)
         if len(nodeids) != entry["count"] or nodeid_digest(nodeids) != entry["sha256"]:
             raise ContractError(f"manifest shard {shard_id} digest or count differs")
         nodeid_groups.append(nodeids)
@@ -199,10 +422,12 @@ def load_manifest(root: Path) -> tuple[dict[str, Any], tuple[tuple[str, ...], ..
 
 
 def validate_manifest(
-    root: Path, collected_nodeids: Sequence[str]
+    root: Path,
+    *,
+    repository_root: Path = REPOSITORY_ROOT,
 ) -> tuple[dict[str, Any], tuple[tuple[str, ...], ...]]:
-    index, groups = load_manifest(root)
-    expected = tuple(sorted(collected_nodeids))
+    index, groups = load_manifest(root, repository_root=repository_root)
+    expected = tuple(sorted(collect_nodeids((), repository_root=repository_root)))
     actual = tuple(sorted(nodeid for group in groups for nodeid in group))
     if len(set(expected)) != len(expected):
         raise ContractError("full-suite collection contains duplicate nodeids")
@@ -232,17 +457,21 @@ def pytest_collection_finish(session: Any) -> None:
     )
 
 
-def collect_nodeids(selector: Sequence[str]) -> tuple[str, ...]:
+def collect_nodeids(
+    selector: Sequence[str],
+    *,
+    repository_root: Path = REPOSITORY_ROOT,
+) -> tuple[str, ...]:
     with tempfile.TemporaryDirectory(prefix="rquant-full-suite-collect-") as directory:
         output = Path(directory) / "collection.json"
         environment = os.environ.copy()
         environment.pop("PYTEST_ADDOPTS", None)
-        repository_root = str(Path(__file__).resolve().parent.parent)
+        pythonpath_root = str(Path(__file__).resolve().parent.parent)
         existing_pythonpath = environment.get("PYTHONPATH")
         environment["PYTHONPATH"] = (
-            repository_root
+            pythonpath_root
             if not existing_pythonpath
-            else os.pathsep.join((repository_root, existing_pythonpath))
+            else os.pathsep.join((pythonpath_root, existing_pythonpath))
         )
         environment["RQUANT_FULL_SUITE_COLLECTION_PATH"] = str(output)
         command = [
@@ -257,6 +486,7 @@ def collect_nodeids(selector: Sequence[str]) -> tuple[str, ...]:
         ]
         completed = subprocess.run(
             command,
+            cwd=repository_root,
             check=False,
             capture_output=True,
             text=True,
@@ -265,27 +495,50 @@ def collect_nodeids(selector: Sequence[str]) -> tuple[str, ...]:
         if completed.returncode != 0:
             details = (completed.stderr + completed.stdout)[-1_600:]
             raise ContractError(f"pytest collection failed: {details}")
-        payload = _read_json(output)
-    nodeids = payload.get("nodeids")
-    if not isinstance(nodeids, list) or not all(isinstance(nodeid, str) for nodeid in nodeids):
+        payload = _read_json(
+            output,
+            maximum=MAX_COLLECTION_BYTES,
+            label="pytest collection evidence",
+        )
+        _require_exact_fields(payload, _COLLECTION_FIELDS, label="pytest collection evidence")
+    nodeids = payload["nodeids"]
+    if type(nodeids) is not list or not all(type(nodeid) is str for nodeid in nodeids):
         raise ContractError("pytest collection hook emitted invalid nodeids")
     if len(set(nodeids)) != len(nodeids):
         raise ContractError("pytest collection emitted duplicate nodeids")
+    validated_files: set[str] = set()
+    for nodeid in nodeids:
+        _file_for_nodeid(
+            nodeid,
+            repository_root=repository_root,
+            validated_files=validated_files,
+        )
     return tuple(sorted(nodeids))
 
 
 def parse_argsfile_line(line: str) -> str:
-    if not line or any(character in line for character in "\x00\r\n"):
+    if not line or any(_is_line_control(character) for character in line):
         raise ContractError("pytest argsfile line is not a valid nodeid")
+    if len(line.encode("utf-8")) > MAX_NODEID_BYTES:
+        raise ContractError("pytest argsfile nodeid exceeds size limit")
     return line
 
 
 @contextmanager
-def argsfile_for_nodeids(nodeids: Sequence[str], *, directory: Path) -> Iterator[Path]:
+def argsfile_for_nodeids(
+    nodeids: Sequence[str],
+    *,
+    directory: Path,
+    repository_root: Path = REPOSITORY_ROOT,
+) -> Iterator[Path]:
     directory.mkdir(parents=True, exist_ok=True)
+    validated_files: set[str] = set()
     for nodeid in nodeids:
-        if not nodeid or any(character in nodeid for character in "\x00\r\n"):
-            raise ContractError("nodeid cannot be encoded safely in a pytest argsfile")
+        _file_for_nodeid(
+            nodeid,
+            repository_root=repository_root,
+            validated_files=validated_files,
+        )
     with tempfile.NamedTemporaryFile(
         mode="w",
         encoding="utf-8",
@@ -334,10 +587,7 @@ def run_shard(
     selection_evidence: Path | None,
     basetemp: Path | None,
 ) -> int:
-    index, groups = load_manifest(manifest_root)
-    selector = tuple(index["selector"])
-    full_nodeids = collect_nodeids(selector)
-    index, groups = validate_manifest(manifest_root, full_nodeids)
+    index, groups = validate_manifest(manifest_root)
     if not 0 <= shard_id < SHARD_COUNT:
         raise ContractError(f"shard must be between 0 and {SHARD_COUNT - 1}")
     nodeids = groups[shard_id]

@@ -84,9 +84,12 @@ def validate_artifacts(
     artifact_root: Path,
     *,
     expected_python: str,
+    repository_root: Path = shards.REPOSITORY_ROOT,
 ) -> dict[str, int]:
-    index, groups = shards.load_manifest(manifest_root)
-    shards.validate_manifest(manifest_root, tuple(nodeid for group in groups for nodeid in group))
+    index, _groups = shards.validate_manifest(
+        manifest_root,
+        repository_root=repository_root,
+    )
     expected_names = {
         f"full-suite-evidence-py{expected_python}-shard{shard_id}"
         for shard_id in range(shards.SHARD_COUNT)
