@@ -161,7 +161,7 @@ class PublicationRootPolicy(RuntimeContractModel):
                 and self.root_mode == 0o700
                 and self.generations_mode == 0o700
                 and self.building_mode == 0o700
-                and self.committed_generation_mode == 0o500
+                and self.committed_generation_mode == 0o700
                 and self.object_mode == 0o400
                 and self.manifest_mode == 0o400
                 and self.acl_requirement == "UNOBSERVED_LOCAL_AUDIT"
@@ -181,7 +181,7 @@ class PublicationRootPolicy(RuntimeContractModel):
                 and self.root_mode == 0o750
                 and self.generations_mode == 0o750
                 and self.building_mode == 0o700
-                and self.committed_generation_mode == 0o550
+                and self.committed_generation_mode == 0o750
                 and self.object_mode == 0o440
                 and self.manifest_mode == 0o440
                 and self.acl_requirement != "UNOBSERVED_LOCAL_AUDIT"
@@ -396,7 +396,7 @@ AclObserver: TypeAlias = Callable[[Path], tuple[str, str | None]]
 
 
 @dataclass
-class PublicationRootHandle:
+class _PublicationRootHandle:
     policy: PublicationRootPolicy
     observation: PublicationRootObservation
     root_fd: int
@@ -408,8 +408,8 @@ class PublicationRootHandle:
 
 
 @dataclass
-class PaperMigrationPublicationContext:
-    root: PublicationRootHandle
+class _PaperMigrationPublicationContext:
+    root: _PublicationRootHandle
     publication_nonce: str
     building_name: str
     generation_name: str
@@ -434,7 +434,7 @@ def local_audit_publication_root_policy(publication_root: Path) -> PublicationRo
         root_mode=0o700,
         generations_mode=0o700,
         building_mode=0o700,
-        committed_generation_mode=0o500,
+        committed_generation_mode=0o700,
         object_mode=0o400,
         manifest_mode=0o400,
         acl_requirement="UNOBSERVED_LOCAL_AUDIT",
@@ -584,7 +584,7 @@ def observe_publication_root(
     *,
     create_generations: bool,
     acl_observer: AclObserver | None = None,
-) -> PublicationRootHandle:
+) -> _PublicationRootHandle:
     _preflight_platform_primitives()
     if os.geteuid() != policy.owner_uid:
         raise ValueError("effective UID does not match publication policy")
@@ -681,7 +681,7 @@ def observe_publication_root(
             generations=generations_identity,
             capabilities=capabilities,
         )
-        return PublicationRootHandle(policy, observation, root_fd, generations_fd)
+        return _PublicationRootHandle(policy, observation, root_fd, generations_fd)
     except BaseException:
         if generations_fd is not None:
             os.close(generations_fd)
@@ -693,13 +693,13 @@ def observe_publication_root(
             os.close(trusted_base_fd)
 
 
-def begin_paper_migration_publication(
+def _begin_paper_migration_publication(
     publication_root: Path,
     *,
     root_policy: PublicationRootPolicy,
     publication_nonce: str | None = None,
     acl_observer: AclObserver | None = None,
-) -> PaperMigrationPublicationContext:
+) -> _PaperMigrationPublicationContext:
     if _absolute_lexical_path(publication_root) != root_policy.publication_root:
         raise ValueError("publication root and root policy disagree lexically")
     root = observe_publication_root(
@@ -745,7 +745,7 @@ def begin_paper_migration_publication(
             assert root_policy.reader_gid is not None
             os.fchown(ready_fd, root_policy.owner_uid, root_policy.reader_gid)
         os.fchmod(ready_fd, root_policy.building_mode)
-        return PaperMigrationPublicationContext(
+        return _PaperMigrationPublicationContext(
             root=root,
             publication_nonce=nonce,
             building_name=building_name,
@@ -849,7 +849,7 @@ def _checkpoint(failure_after_phase: str | None, phase: str) -> None:
 
 
 def _post_commit_state(
-    context: PaperMigrationPublicationContext,
+    context: _PaperMigrationPublicationContext,
     *,
     object_name: str,
     candidate_sha256: str,
@@ -868,7 +868,7 @@ def _post_commit_state(
 
 
 def _validate_receipt_from_generation(
-    root: PublicationRootHandle,
+    root: _PublicationRootHandle,
     *,
     generation_name: str,
     expected_receipt: PaperMigrationPublicationReceipt | None = None,
@@ -967,8 +967,8 @@ def _validate_receipt_from_generation(
         os.close(generation_fd)
 
 
-def publish_paper_migration_generation(
-    context: PaperMigrationPublicationContext,
+def _publish_paper_migration_generation(
+    context: _PaperMigrationPublicationContext,
     *,
     source_sha256: str,
     candidate_sha256: str,
@@ -1030,9 +1030,17 @@ def publish_paper_migration_generation(
             mode=policy.object_mode,
             label="publication object",
         )
-        ready_before_manifest = _directory_identity(os.fstat(context.ready_fd))
-        generation_identity = ready_before_manifest.model_copy(
-            update={"mode": policy.committed_generation_mode}
+        if policy.profile == "SEPARATED_IDENTITY":
+            assert policy.reader_gid is not None
+            os.fchown(context.ready_fd, policy.owner_uid, policy.reader_gid)
+        os.fchmod(context.ready_fd, policy.committed_generation_mode)
+        generation_identity = _directory_identity(os.fstat(context.ready_fd))
+        _validate_directory(
+            generation_identity,
+            uid=policy.owner_uid,
+            gid=policy.group_gid,
+            mode=policy.committed_generation_mode,
+            label="committed generation",
         )
         manifest = PaperMigrationPublicationManifest(
             policy_profile=policy.profile,
@@ -1084,13 +1092,19 @@ def publish_paper_migration_generation(
             mode=policy.manifest_mode,
             label="publication manifest",
         )
-        if _directory_identity(os.fstat(context.ready_fd)) != ready_before_manifest:
+        if _directory_identity(os.fstat(context.ready_fd)) != generation_identity:
             raise ValueError("ready generation identity changed before publication")
         if _inventory(context.ready_fd) != (object_name, _MANIFEST_NAME):
             raise ValueError("ready generation inventory is not exact")
         os.fsync(transformed_fd)
         os.fsync(manifest_fd)
         os.fsync(context.ready_fd)
+        if _file_identity(os.fstat(transformed_fd)) != object_identity:
+            raise ValueError("publication object identity changed before publication")
+        if _file_identity(os.fstat(manifest_fd)) != manifest_identity:
+            raise ValueError("publication manifest identity changed before publication")
+        if _directory_identity(os.fstat(context.ready_fd)) != generation_identity:
+            raise ValueError("ready generation identity changed before publication")
         _checkpoint(failure_after_phase, "before_local_failure_disposition")
         _checkpoint(failure_after_phase, "before_generation_noreplace_rename")
 
@@ -1105,10 +1119,6 @@ def publish_paper_migration_generation(
             context.generation_name,
             on_success=mark_generation_renamed,
         )
-        os.fchmod(context.ready_fd, policy.committed_generation_mode)
-        if _directory_identity(os.fstat(context.ready_fd)) != generation_identity:
-            raise ValueError("committed generation identity differs after rename")
-        os.fsync(context.ready_fd)
         _checkpoint(failure_after_phase, "after_generation_rename_before_parent_fsync")
         try:
             os.fsync(context.building_fd)
@@ -1198,7 +1208,7 @@ def recover_paper_migration_publication(
         raise ValueError("unsupported publication recovery failure phase")
     if state.policy_id != root_policy.policy_id:
         raise ValueError("post-commit state and root policy disagree")
-    root: PublicationRootHandle | None = None
+    root: _PublicationRootHandle | None = None
     building_fd: int | None = None
     try:
         root = observe_publication_root(root_policy, create_generations=False)
@@ -1279,7 +1289,7 @@ def materialize_paper_migration_for_audit(
         raise ValueError("unsupported materialization failure phase")
     if receipt.manifest.root_observation.policy_id != root_policy.policy_id:
         raise ValueError("publication receipt and root policy disagree")
-    root: PublicationRootHandle | None = None
+    root: _PublicationRootHandle | None = None
     object_fd: int | None = None
     staging_fd: int | None = None
     destination_fd: int | None = None
@@ -1446,12 +1456,7 @@ __all__ = [
     "PublicationRootPolicy",
     "PublicationStableDirectoryIdentity",
     "PublicationState",
-    "begin_paper_migration_publication",
-    "canonical_manifest_bytes",
     "local_audit_publication_root_policy",
     "materialize_paper_migration_for_audit",
-    "observe_publication_root",
-    "parse_canonical_manifest",
-    "publish_paper_migration_generation",
     "recover_paper_migration_publication",
 ]

@@ -167,12 +167,12 @@ validation, while a forged internal head still fails external verification.
 Legacy accounts are audit-only. Create a new v5 account bound to the active
 explicit v3 spec before performing aligned executions. A fresh account can be
 reconciled and read beside quarantined legacy evidence; the legacy account
-cannot submit executions. To roll back a failed or unsuitable migration,
-discard the candidate and retain the verified pre-migration source. The result
-derives reconciliation state from the independent v4 report and permits live
-promotion only with a valid current-head anchor; the local migrator returns an
-unanchored audit candidate. Do not run this migration against production as
-part of routine deployment.
+cannot submit executions. The migration result is audit-only and never authorizes live promotion.
+The library does not delete publication residue.
+Residue cleanup, production identity or filesystem provisioning, anchoring, and
+promotion require separate designs and explicit authorization. Retain the
+verified pre-migration source, and do not run this migration against production
+as part of routine deployment.
 
 ## Verification
 

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import inspect
 import json
 import os
 import sqlite3
 import stat
+import sys
 from pathlib import Path
 
 import pytest
@@ -88,6 +90,255 @@ def test_rename_success_before_parent_fsync_is_post_commit_indeterminate(
     assert source.path.read_bytes() == source_bytes
     receipt = recover_paper_migration_publication(state, root_policy=policy)
     assert receipt.publication_state == "GENERATION_DURABLE_VERIFIED"
+
+
+def test_post_rename_seam_is_immediate_and_observes_declared_generation_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = create_parent_v4_fixture(tmp_path / "source.sqlite3")
+    publication_root = _private_directory(tmp_path / "publication")
+    policy = local_audit_publication_root_policy(publication_root)
+    original_begin = migration_module._begin_paper_migration_publication
+    original_rename = publication_module.rename_noreplace_at
+    original_open = os.open
+    original_read = os.read
+    original_close = os.close
+    original_fchmod = os.fchmod
+    original_fchown = os.fchown
+    original_fstat = os.fstat
+    original_fsync = os.fsync
+    original_write = os.write
+    original_mkdir = os.mkdir
+    original_unlink = os.unlink
+    original_rmdir = os.rmdir
+    original_os_rename = os.rename
+    original_checkpoint = publication_module._checkpoint
+    generation_rename_returned = False
+    seam_entered = False
+    post_rename_operations: list[str] = []
+    callback_observed: list[bool] = []
+    rename_identities: list[publication_module.PublicationStableDirectoryIdentity] = []
+    manifest_identities: list[publication_module.PublicationStableDirectoryIdentity] = []
+    seam_identities: list[publication_module.PublicationStableDirectoryIdentity] = []
+
+    def forbidden_identity_projection(
+        _self: object,
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        raise AssertionError("generation identity must come from post-mode fstat")
+
+    def tracked_rename(
+        source_fd: int,
+        source_name: str,
+        destination_fd: int,
+        destination_name: str,
+        *,
+        on_success: object | None = None,
+    ) -> None:
+        nonlocal generation_rename_returned
+        if generation_rename_returned and not seam_entered:
+            post_rename_operations.append("rename_noreplace_at")
+        is_generation = source_name == "ready" and destination_name.startswith("generation-")
+        callback_called = False
+
+        if is_generation:
+            ready_fd = original_open(
+                source_name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=source_fd,
+            )
+            manifest_fd = original_open(
+                "publication-manifest.json",
+                os.O_RDONLY | os.O_NOFOLLOW,
+                dir_fd=ready_fd,
+            )
+            try:
+                identity = publication_module._directory_identity(original_fstat(ready_fd))
+                raw_manifest_parts: list[bytes] = []
+                while chunk := original_read(manifest_fd, 65536):
+                    raw_manifest_parts.append(chunk)
+                manifest = publication_module.parse_canonical_manifest(b"".join(raw_manifest_parts))
+                rename_identities.append(identity)
+                manifest_identities.append(manifest.generation_identity)
+                assert identity.mode == policy.committed_generation_mode
+            finally:
+                original_close(manifest_fd)
+                original_close(ready_fd)
+
+        def tracked_success() -> None:
+            nonlocal callback_called
+            assert on_success is not None
+            on_success()
+            callback_called = True
+
+        original_rename(
+            source_fd,
+            source_name,
+            destination_fd,
+            destination_name,
+            on_success=tracked_success if on_success is not None else None,
+        )
+        if is_generation:
+            callback_observed.append(callback_called)
+            generation_rename_returned = True
+
+    def record_post_rename(operation: str) -> None:
+        if generation_rename_returned and not seam_entered:
+            post_rename_operations.append(operation)
+
+    def tracked_fchmod(descriptor: int, mode: int) -> None:
+        record_post_rename("fchmod")
+        original_fchmod(descriptor, mode)
+
+    def tracked_fchown(descriptor: int, uid: int, gid: int) -> None:
+        record_post_rename("fchown")
+        original_fchown(descriptor, uid, gid)
+
+    def tracked_fstat(descriptor: int) -> os.stat_result:
+        record_post_rename("fstat")
+        return original_fstat(descriptor)
+
+    def tracked_fsync(descriptor: int) -> None:
+        record_post_rename("fsync")
+        original_fsync(descriptor)
+
+    def tracked_open(*args: object, **kwargs: object) -> int:
+        record_post_rename("open")
+        return original_open(*args, **kwargs)
+
+    def tracked_write(descriptor: int, data: bytes) -> int:
+        record_post_rename("write")
+        return original_write(descriptor, data)
+
+    def tracked_mkdir(*args: object, **kwargs: object) -> None:
+        record_post_rename("mkdir")
+        original_mkdir(*args, **kwargs)
+
+    def tracked_unlink(*args: object, **kwargs: object) -> None:
+        record_post_rename("unlink")
+        original_unlink(*args, **kwargs)
+
+    def tracked_rmdir(*args: object, **kwargs: object) -> None:
+        record_post_rename("rmdir")
+        original_rmdir(*args, **kwargs)
+
+    def tracked_os_rename(*args: object, **kwargs: object) -> None:
+        record_post_rename("rename")
+        original_os_rename(*args, **kwargs)
+
+    def begin_then_enable_operation_tracking(*args: object, **kwargs: object) -> object:
+        context = original_begin(*args, **kwargs)
+        monkeypatch.setattr(publication_module.os, "open", tracked_open)
+        monkeypatch.setattr(publication_module.os, "fchmod", tracked_fchmod)
+        monkeypatch.setattr(publication_module.os, "fchown", tracked_fchown)
+        monkeypatch.setattr(publication_module.os, "fstat", tracked_fstat)
+        monkeypatch.setattr(publication_module.os, "fsync", tracked_fsync)
+        monkeypatch.setattr(publication_module.os, "write", tracked_write)
+        monkeypatch.setattr(publication_module.os, "mkdir", tracked_mkdir)
+        monkeypatch.setattr(publication_module.os, "unlink", tracked_unlink)
+        monkeypatch.setattr(publication_module.os, "rmdir", tracked_rmdir)
+        monkeypatch.setattr(publication_module.os, "rename", tracked_os_rename)
+        monkeypatch.setattr(
+            publication_module.os,
+            "supports_dir_fd",
+            os.supports_dir_fd | {tracked_open, tracked_unlink, tracked_os_rename},
+        )
+        return context
+
+    def inspect_immediate_seam(fault: str | None, phase: str) -> None:
+        nonlocal seam_entered
+        if phase == "after_generation_rename_before_parent_fsync":
+            assert generation_rename_returned
+            seam_entered = True
+            generation = next((publication_root / "generations").glob("generation-*"))
+            seam_identities.append(publication_module._directory_identity(generation.stat()))
+        original_checkpoint(fault, phase)
+
+    monkeypatch.setattr(
+        publication_module.PublicationStableDirectoryIdentity,
+        "model_copy",
+        forbidden_identity_projection,
+    )
+    monkeypatch.setattr(
+        migration_module,
+        "_begin_paper_migration_publication",
+        begin_then_enable_operation_tracking,
+    )
+    monkeypatch.setattr(publication_module, "rename_noreplace_at", tracked_rename)
+    monkeypatch.setattr(publication_module, "_checkpoint", inspect_immediate_seam)
+
+    with pytest.raises(PaperMigrationPostCommitIndeterminateError) as caught:
+        migrate_v4_ledger_copy(
+            source.path,
+            publication_root,
+            root_policy=policy,
+            migration_code_identity="test-migration-code",
+            failure_after_phase="after_generation_rename_before_parent_fsync",
+        )
+
+    assert post_rename_operations == []
+    assert callback_observed == [True]
+    assert rename_identities == manifest_identities == seam_identities
+    receipt = recover_paper_migration_publication(caught.value.state, root_policy=policy)
+    assert receipt.publication_state == "GENERATION_DURABLE_VERIFIED"
+    assert receipt.manifest.generation_identity == seam_identities[0]
+    assert receipt.manifest.generation_identity.mode == policy.committed_generation_mode
+
+
+def test_ready_final_mode_failure_is_precommit_before_manifest_and_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = create_parent_v4_fixture(tmp_path / "source.sqlite3")
+    source_sha256 = hashlib.sha256(source.path.read_bytes()).hexdigest()
+    publication_root = _private_directory(tmp_path / "publication")
+    policy = local_audit_publication_root_policy(publication_root)
+    original_begin = migration_module._begin_paper_migration_publication
+    original_fchmod = os.fchmod
+    destructive_calls: list[str] = []
+    ready_fd: int | None = None
+
+    def begin_then_reject_final_mode(*args: object, **kwargs: object) -> object:
+        nonlocal ready_fd
+        context = original_begin(*args, **kwargs)
+        ready_fd = context.ready_fd
+        monkeypatch.setattr(publication_module.os, "fchmod", fail_ready_final_mode)
+        monkeypatch.setattr(publication_module.os, "unlink", forbidden_destructive)
+        monkeypatch.setattr(publication_module.os, "rmdir", forbidden_destructive)
+        return context
+
+    def fail_ready_final_mode(descriptor: int, mode: int) -> None:
+        if descriptor == ready_fd and mode == policy.committed_generation_mode:
+            raise PermissionError(errno.EACCES, "injected ready final-mode failure")
+        original_fchmod(descriptor, mode)
+
+    def forbidden_destructive(*_args: object, **_kwargs: object) -> None:
+        destructive_calls.append("destructive")
+        raise AssertionError("publication attempted destructive cleanup")
+
+    monkeypatch.setattr(
+        migration_module,
+        "_begin_paper_migration_publication",
+        begin_then_reject_final_mode,
+    )
+
+    with pytest.raises(PaperMigrationPreCommitError) as caught:
+        migrate_v4_ledger_copy(
+            source.path,
+            publication_root,
+            root_policy=policy,
+            migration_code_identity="test-migration-code",
+        )
+
+    assert caught.value.orphan is not None
+    orphan = publication_root / "generations" / caught.value.orphan.building_name
+    assert orphan.is_dir()
+    assert not (orphan / "ready" / "publication-manifest.json").exists()
+    assert not list((publication_root / "generations").glob("generation-*"))
+    assert hashlib.sha256(source.path.read_bytes()).hexdigest() == source_sha256
+    assert destructive_calls == []
 
 
 @pytest.mark.parametrize(
@@ -232,7 +483,7 @@ def test_workspace_creation_failure_reports_visible_building_orphan(
         observe_then_fail_building_open,
     )
     with pytest.raises(PaperMigrationPreCommitError) as caught:
-        publication_module.begin_paper_migration_publication(
+        publication_module._begin_paper_migration_publication(
             publication_root,
             root_policy=policy,
             publication_nonce=nonce,
@@ -345,7 +596,7 @@ def test_local_audit_failure_disposition_never_unlinks_any_named_entry(
         calls.append("destructive")
         raise AssertionError("publication attempted destructive cleanup")
 
-    original_begin = migration_module.begin_paper_migration_publication
+    original_begin = migration_module._begin_paper_migration_publication
 
     def begin_then_trap_cleanup(*args: object, **kwargs: object) -> object:
         context = original_begin(*args, **kwargs)
@@ -355,7 +606,7 @@ def test_local_audit_failure_disposition_never_unlinks_any_named_entry(
 
     monkeypatch.setattr(
         migration_module,
-        "begin_paper_migration_publication",
+        "_begin_paper_migration_publication",
         begin_then_trap_cleanup,
     )
     with pytest.raises(PaperMigrationPreCommitError) as caught:
@@ -375,6 +626,11 @@ def test_local_audit_failure_disposition_never_unlinks_any_named_entry(
 def test_local_audit_root_policy_exact_modes_creation_and_revalidation(tmp_path: Path) -> None:
     publication_root = _private_directory(tmp_path / "publication")
     policy = local_audit_publication_root_policy(publication_root)
+    assert policy.committed_generation_mode == 0o700
+    legacy_policy = policy.model_dump(mode="python", exclude={"policy_id"})
+    legacy_policy["committed_generation_mode"] = 0o500
+    with pytest.raises(ValidationError, match="LOCAL_AUDIT publication policy is not exact"):
+        PublicationRootPolicy.model_validate(legacy_policy)
     handle = observe_publication_root(policy, create_generations=True)
     observation = handle.observation
     handle.close()
@@ -429,7 +685,7 @@ def test_consumer_rejects_receipt_synchronized_file_mode_policy_violation(
     manifest_path.write_bytes(raw_manifest)
     if entry == "object":
         manifest_path.chmod(0o400)
-    generation.chmod(0o500)
+    generation.chmod(policy.committed_generation_mode)
     forged_receipt = type(receipt)(
         manifest=manifest,
         manifest_sha256=hashlib.sha256(raw_manifest).hexdigest(),
@@ -464,11 +720,19 @@ def test_separated_identity_policy_requires_preprovisioning_and_acl_observer(
         root_mode=0o750,
         generations_mode=0o750,
         building_mode=0o700,
-        committed_generation_mode=0o550,
+        committed_generation_mode=0o750,
         object_mode=0o440,
         manifest_mode=0o440,
         acl_requirement="REQUIRE_NO_EXTENDED_ACL",
     )
+    assert policy.committed_generation_mode == 0o750
+    legacy_policy = policy.model_dump(mode="python", exclude={"policy_id"})
+    legacy_policy["committed_generation_mode"] = 0o550
+    with pytest.raises(
+        ValidationError,
+        match="SEPARATED_IDENTITY publication policy is not exact",
+    ):
+        PublicationRootPolicy.model_validate(legacy_policy)
     with pytest.raises(ValueError, match="ACL observer"):
         observe_publication_root(policy, create_generations=False)
     handle = observe_publication_root(
@@ -514,17 +778,32 @@ def test_separated_identity_policy_requires_preprovisioning_and_acl_observer(
         )
 
 
-def test_actual_platform_publication_capabilities(tmp_path: Path) -> None:
+def test_actual_platform_publication_capabilities(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     source_dir = _private_directory(tmp_path / "source")
     destination_dir = _private_directory(tmp_path / "destination")
     source_fd = os.open(source_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     destination_fd = os.open(destination_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    original_fsync = os.fsync
+    fsync_calls = {"file": 0, "source_parent": 0, "destination_parent": 0}
     marked_success = False
+
+    def tracked_fsync(descriptor: int) -> None:
+        if descriptor == source_fd:
+            fsync_calls["source_parent"] += 1
+        elif descriptor == destination_fd:
+            fsync_calls["destination_parent"] += 1
+        elif stat.S_ISREG(os.fstat(descriptor).st_mode):
+            fsync_calls["file"] += 1
+        original_fsync(descriptor)
 
     def mark_success() -> None:
         nonlocal marked_success
         marked_success = True
 
+    monkeypatch.setattr(os, "fsync", tracked_fsync)
     try:
         object_fd = os.open(
             "object-ready",
@@ -575,44 +854,76 @@ def test_actual_platform_publication_capabilities(tmp_path: Path) -> None:
         assert (destination_dir / "ledger-object").read_bytes() == b"object-one"
         assert (source_dir / "object-collision").read_bytes() == b"object-two"
 
-        os.mkdir("ready-generation", 0o700, dir_fd=source_fd)
-        ready_fd = os.open(
-            "ready-generation",
-            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-            dir_fd=source_fd,
-        )
-        try:
-            os.fsync(ready_fd)
-        finally:
-            os.close(ready_fd)
-        marked_success = False
-        rename_noreplace_at(
-            source_fd,
-            "ready-generation",
-            destination_fd,
-            "generation",
-            on_success=mark_success,
-        )
-        os.fsync(destination_fd)
-        os.fsync(source_fd)
-        assert marked_success
-        assert (destination_dir / "generation").is_dir()
+        if sys.platform == "darwin":
+            for mode in (0o500, 0o550):
+                source_name = f"ready-denied-{mode:o}"
+                destination_name = f"generation-denied-{mode:o}"
+                os.mkdir(source_name, mode, dir_fd=source_fd)
+                (source_dir / source_name).chmod(mode)
+                marked_success = False
+                with pytest.raises(OSError) as caught:
+                    rename_noreplace_at(
+                        source_fd,
+                        source_name,
+                        destination_fd,
+                        destination_name,
+                        on_success=mark_success,
+                    )
+                assert caught.value.errno == errno.EACCES
+                assert not marked_success
+                assert (source_dir / source_name).is_dir()
+                assert not os.path.lexists(destination_dir / destination_name)
+        else:
+            assert sys.platform.startswith("linux")
+
+        for mode in (0o700, 0o750):
+            source_name = f"ready-generation-{mode:o}"
+            destination_name = f"generation-{mode:o}"
+            os.mkdir(source_name, mode, dir_fd=source_fd)
+            (source_dir / source_name).chmod(mode)
+            ready_fd = os.open(
+                source_name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=source_fd,
+            )
+            try:
+                os.fsync(ready_fd)
+            finally:
+                os.close(ready_fd)
+            marked_success = False
+            rename_noreplace_at(
+                source_fd,
+                source_name,
+                destination_fd,
+                destination_name,
+                on_success=mark_success,
+            )
+            os.fsync(source_fd)
+            os.fsync(destination_fd)
+            assert marked_success
+            generation = destination_dir / destination_name
+            assert generation.is_dir()
+            assert stat.S_IMODE(generation.stat().st_mode) == mode
 
         os.mkdir("ready-collision", 0o700, dir_fd=source_fd)
+        os.mkdir("generation-collision", 0o700, dir_fd=destination_fd)
         marked_success = False
         with pytest.raises(FileExistsError):
             rename_noreplace_at(
                 source_fd,
                 "ready-collision",
                 destination_fd,
-                "generation",
+                "generation-collision",
                 on_success=mark_success,
             )
         os.fsync(destination_fd)
         os.fsync(source_fd)
         assert not marked_success
-        assert (destination_dir / "generation").is_dir()
+        assert (destination_dir / "generation-collision").is_dir()
         assert (source_dir / "ready-collision").is_dir()
+        assert fsync_calls["file"] >= 2
+        assert fsync_calls["source_parent"] >= 1
+        assert fsync_calls["destination_parent"] >= 1
     finally:
         os.close(destination_fd)
         os.close(source_fd)
@@ -625,6 +936,8 @@ def test_materialization_mutation_after_first_hash_is_rejected(
     result, policy, staging, _source, root = _publish(tmp_path)
     object_path = _object_path(result, root)
     original_checkpoint = publication_module._checkpoint
+    original_connect = sqlite3.connect
+    sqlite_opens: list[str] = []
 
     def mutate(fault: str | None, phase: str) -> None:
         if phase == "after_materialization_first_object_hash":
@@ -633,13 +946,23 @@ def test_materialization_mutation_after_first_hash_is_rejected(
                 stream.write(b"mutation")
         original_checkpoint(fault, phase)
 
+    def tracked_connect(database: object, *args: object, **kwargs: object) -> sqlite3.Connection:
+        sqlite_opens.append(os.fspath(database))
+        return original_connect(database, *args, **kwargs)
+
     monkeypatch.setattr(publication_module, "_checkpoint", mutate)
-    with pytest.raises(PaperMigrationMaterializationError):
+    monkeypatch.setattr(publication_module.sqlite3, "connect", tracked_connect)
+    with pytest.raises(PaperMigrationMaterializationError) as caught:
         materialize_paper_migration_for_audit(
             result.publication,
             root_policy=policy,
             staging_root=staging,
         )
+    assert sqlite_opens == []
+    assert caught.value.orphan is not None
+    orphan = staging / caught.value.orphan.private_name
+    assert orphan.is_file()
+    assert stat.S_IMODE(orphan.stat().st_mode) == 0o600
 
 
 def test_materialization_mutation_during_copy_is_rejected(
@@ -649,6 +972,8 @@ def test_materialization_mutation_during_copy_is_rejected(
     result, policy, staging, _source, root = _publish(tmp_path)
     object_path = _object_path(result, root)
     original_checkpoint = publication_module._checkpoint
+    original_connect = sqlite3.connect
+    sqlite_opens: list[str] = []
 
     def mutate(fault: str | None, phase: str) -> None:
         if phase == "during_materialization_copy":
@@ -657,13 +982,58 @@ def test_materialization_mutation_during_copy_is_rejected(
                 stream.write(b"mutation")
         original_checkpoint(fault, phase)
 
+    def tracked_connect(database: object, *args: object, **kwargs: object) -> sqlite3.Connection:
+        sqlite_opens.append(os.fspath(database))
+        return original_connect(database, *args, **kwargs)
+
     monkeypatch.setattr(publication_module, "_checkpoint", mutate)
+    monkeypatch.setattr(publication_module.sqlite3, "connect", tracked_connect)
     with pytest.raises(PaperMigrationMaterializationError) as caught:
         materialize_paper_migration_for_audit(
             result.publication,
             root_policy=policy,
             staging_root=staging,
         )
+    assert caught.value.orphan is not None
+    orphan = staging / caught.value.orphan.private_name
+    assert orphan.is_file()
+    assert stat.S_IMODE(orphan.stat().st_mode) == 0o600
+    assert sqlite_opens == []
+
+
+def test_materialization_final_destination_rehash_mismatch_prevents_sqlite_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result, policy, staging, _source, _root = _publish(tmp_path)
+    original_hash_fd = publication_module._hash_fd
+    original_connect = sqlite3.connect
+    hash_calls = 0
+    sqlite_opens: list[str] = []
+
+    def mismatch_final_destination(descriptor: int) -> tuple[str, int]:
+        nonlocal hash_calls
+        hash_calls += 1
+        digest, size = original_hash_fd(descriptor)
+        if hash_calls == 3:
+            return "0" * 64, size
+        return digest, size
+
+    def tracked_connect(database: object, *args: object, **kwargs: object) -> sqlite3.Connection:
+        sqlite_opens.append(os.fspath(database))
+        return original_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(publication_module, "_hash_fd", mismatch_final_destination)
+    monkeypatch.setattr(publication_module.sqlite3, "connect", tracked_connect)
+    with pytest.raises(PaperMigrationMaterializationError) as caught:
+        materialize_paper_migration_for_audit(
+            result.publication,
+            root_policy=policy,
+            staging_root=staging,
+        )
+
+    assert hash_calls == 3
+    assert sqlite_opens == []
     assert caught.value.orphan is not None
     orphan = staging / caught.value.orphan.private_name
     assert orphan.is_file()
@@ -749,6 +1119,28 @@ def test_only_verified_private_materialization_reaches_sqlite(
 
 
 def test_legacy_candidate_api_and_result_fields_are_absent(tmp_path: Path) -> None:
+    public_operations = {
+        name
+        for module in (migration_module, publication_module)
+        for name in module.__all__
+        if inspect.isfunction(getattr(module, name))
+        and name.startswith(
+            ("begin_", "materialize_", "migrate_", "observe_", "publish_", "recover_")
+        )
+    }
+    assert public_operations == {
+        "materialize_paper_migration_for_audit",
+        "migrate_paper_ledger_v4_offline_copy",
+        "migrate_v4_ledger_copy",
+        "recover_paper_migration_publication",
+    }
+    for private_detail in (
+        "PaperMigrationPublicationContext",
+        "PublicationRootHandle",
+        "begin_paper_migration_publication",
+        "publish_paper_migration_generation",
+    ):
+        assert not hasattr(publication_module, private_detail)
     signature = inspect.signature(migrate_v4_ledger_copy)
     assert "candidate_path" not in signature.parameters
     source = create_parent_v4_fixture(tmp_path / "source.sqlite3")
@@ -774,11 +1166,22 @@ def test_legacy_candidate_api_and_result_fields_are_absent(tmp_path: Path) -> No
             getattr(result, field)
 
 
-@pytest.mark.parametrize("extra_name", ("transformed.sqlite3-wal", "extra", "link"))
+@pytest.mark.parametrize(
+    ("extra_name", "entry_kind"),
+    (
+        ("transformed.sqlite3-wal", "file"),
+        ("transformed.sqlite3-shm", "file"),
+        ("transformed.sqlite3-journal", "file"),
+        ("transformed.sqlite3.tmp", "file"),
+        ("link", "symlink"),
+        ("extra", "file"),
+    ),
+)
 def test_publication_rejects_wal_sidecars_and_unexpected_inventory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     extra_name: str,
+    entry_kind: str,
 ) -> None:
     source = create_parent_v4_fixture(tmp_path / "source.sqlite3")
     source_sha = hashlib.sha256(source.path.read_bytes()).hexdigest()
@@ -790,7 +1193,7 @@ def test_publication_rejects_wal_sidecars_and_unexpected_inventory(
         if phase == "after_sqlite_connections_closed":
             building = next((publication_root / "generations").glob(".building-*"))
             target = building / "ready" / extra_name
-            if extra_name == "link":
+            if entry_kind == "symlink":
                 target.symlink_to("transformed.sqlite3")
             else:
                 target.write_bytes(b"unexpected")
@@ -875,6 +1278,24 @@ def test_publication_contract_contains_no_current_pointer() -> None:
     assert not any("current" in name.lower() for name in publication_module.__all__)
 
 
+def test_paper_migration_documentation_is_audit_only() -> None:
+    document = (
+        Path(__file__).parents[2] / "docs" / "architecture" / "paper-research-cost-alignment.md"
+    ).read_text(encoding="utf-8")
+    for stale_claim in (
+        "discard the candidate",
+        "permits live promotion",
+        "unanchored audit candidate",
+    ):
+        assert stale_claim not in document
+    for required_claim in (
+        "The migration result is audit-only and never authorizes live promotion.",
+        "The library does not delete publication residue.",
+        "require separate designs and explicit authorization",
+    ):
+        assert required_claim in document
+
+
 @pytest.mark.parametrize(
     "replacement_kind",
     ("regular", "symlink", "hardlink", "directory", "generation", "generations", "root"),
@@ -888,7 +1309,7 @@ def test_consumer_rejects_regular_symlink_hardlink_and_directory_swap(
     generation = object_path.parent
     replacement_path: Path
     if replacement_kind in {"regular", "symlink", "hardlink", "directory"}:
-        generation.chmod(0o700)
+        generation.chmod(policy.committed_generation_mode)
         parked = generation / "parked-object"
         object_path.rename(parked)
         replacement_path = object_path
@@ -900,13 +1321,13 @@ def test_consumer_rejects_regular_symlink_hardlink_and_directory_swap(
             os.link(parked, object_path)
         else:
             object_path.mkdir()
-        generation.chmod(0o500)
+        generation.chmod(policy.committed_generation_mode)
     elif replacement_kind == "generation":
         parked = generation.with_name("parked-generation")
-        generation.chmod(0o700)
+        generation.chmod(policy.committed_generation_mode)
         generation.rename(parked)
-        parked.chmod(0o500)
-        generation.mkdir(mode=0o500)
+        parked.chmod(policy.committed_generation_mode)
+        generation.mkdir(mode=policy.committed_generation_mode)
         replacement_path = generation
     elif replacement_kind == "generations":
         generations = generation.parent

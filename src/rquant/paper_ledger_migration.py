@@ -28,9 +28,9 @@ from rquant.paper_migration_publication import (
     PaperMigrationPreCommitError,
     PaperOfflineMigrationResult,
     PublicationRootPolicy,
-    begin_paper_migration_publication,
+    _begin_paper_migration_publication,
+    _publish_paper_migration_generation,
     materialize_paper_migration_for_audit,
-    publish_paper_migration_generation,
     recover_paper_migration_publication,
 )
 from rquant.runtime_contracts import canonical_sha256
@@ -521,7 +521,7 @@ def migrate_v4_ledger_copy(
     source_snapshot: _SourceSnapshot | None = None
     receipt = None
     try:
-        context = begin_paper_migration_publication(
+        context = _begin_paper_migration_publication(
             publication_root,
             root_policy=root_policy,
         )
@@ -612,7 +612,7 @@ def migrate_v4_ledger_copy(
         _checkpoint(failure_after_phase, "after_sqlite_connections_closed")
         _assert_source_unchanged(source, source_snapshot.source_identity)
         candidate_sha256 = sha256_file(temporary)
-        receipt = publish_paper_migration_generation(
+        receipt = _publish_paper_migration_generation(
             context,
             source_sha256=source_snapshot.sha256,
             candidate_sha256=candidate_sha256,
