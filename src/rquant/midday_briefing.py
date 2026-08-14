@@ -973,8 +973,6 @@ def _merge_vol_ratio(codes: pd.DataFrame, avg20: pd.DataFrame) -> pd.DataFrame:
     必须 ×1000 对齐后再比。
     """
     merged = codes.merge(avg20[["ts_code", "avg_amount_20d"]], on="ts_code", how="inner")
-    if merged.empty:
-        return merged
     denom = merged["avg_amount_20d"] * 1000.0  # 千元 → 元
     merged["_vol_ratio"] = merged["amount"] / denom.where(denom > 0)
     return merged[merged["_vol_ratio"].notna()]
