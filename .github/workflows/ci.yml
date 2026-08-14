@@ -158,9 +158,43 @@ jobs:
         run: uv sync --frozen
 
       - name: Exercise the native no-replace primitive with no skips
-        run: >-
-          uv run pytest -o addopts='' -rA
-          tests/unit/test_paper_migration_publication.py::test_actual_platform_publication_capabilities
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p test-results
+          uv run pytest -o addopts='' -rA \
+            --junitxml="test-results/paper-publication-${{ matrix.os }}.xml" \
+            tests/unit/test_paper_migration_publication.py::test_actual_platform_publication_capabilities
+          python - "test-results/paper-publication-${{ matrix.os }}.xml" <<'PY'
+          from pathlib import Path
+          import sys
+          from xml.etree import ElementTree
+
+          report = Path(sys.argv[1])
+          root = ElementTree.parse(report).getroot()
+          assert root.tag in {"testsuite", "testsuites"}, root.tag
+          suites = [root] if root.tag == "testsuite" else list(root)
+          assert len(suites) == 1, (root.tag, len(suites))
+          suite = suites[0]
+          assert suite.tag == "testsuite", suite.tag
+          assert int(suite.attrib.get("tests", "0")) == 1, suite.attrib
+          assert int(suite.attrib.get("failures", "0")) == 0, suite.attrib
+          assert int(suite.attrib.get("errors", "0")) == 0, suite.attrib
+          assert int(suite.attrib.get("skipped", "0")) == 0, suite.attrib
+          cases = suite.findall("testcase")
+          assert len(cases) == 1, len(cases)
+          assert not cases[0].findall("failure"), "exact node failed"
+          assert not cases[0].findall("error"), "exact node errored"
+          assert not cases[0].findall("skipped"), "exact node was skipped"
+          PY
+
+      - name: Upload paper-publication JUnit evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # actions/upload-artifact@v4
+        with:
+          name: paper-publication-junit-${{ matrix.os }}
+          path: test-results/paper-publication-${{ matrix.os }}.xml
+          if-no-files-found: error
 
   formal-smoke-real-generation-linux:
     name: Linux real generation smoke (${{ matrix.python-version }})

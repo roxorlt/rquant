@@ -163,6 +163,37 @@ def test_runtime_fd_exec_ci_job_pins_official_actions() -> None:
     assert "if-no-files-found: error" in job
 
 
+def test_paper_publication_ci_job_machine_rejects_skipped_exact_node() -> None:
+    workflow = (Path(__file__).parents[2] / ".github" / "workflows" / "ci.yml").read_text(
+        encoding="utf-8"
+    )
+    job = workflow.split("  paper-publication-primitives:\n", maxsplit=1)[1].split(
+        "\n  formal-smoke-real-generation-linux:", maxsplit=1
+    )[0]
+    node = (
+        "tests/unit/test_paper_migration_publication.py"
+        "::test_actual_platform_publication_capabilities"
+    )
+    report = "test-results/paper-publication-${{ matrix.os }}.xml"
+
+    assert "os: [macos-14, ubuntu-24.04]" in job
+    assert job.count(node) == 1
+    assert "pytest -o addopts='' -rA" in job
+    assert f'--junitxml="{report}"' in job
+    assert f"python - \"{report}\" <<'PY'" in job
+    assert "ElementTree.parse(report).getroot()" in job
+    assert "assert len(suites) == 1" in job
+    assert 'assert int(suite.attrib.get("tests", "0")) == 1' in job
+    assert 'assert int(suite.attrib.get("failures", "0")) == 0' in job
+    assert 'assert int(suite.attrib.get("errors", "0")) == 0' in job
+    assert 'assert int(suite.attrib.get("skipped", "0")) == 0' in job
+    assert "assert len(cases) == 1" in job
+    assert 'assert not cases[0].findall("skipped")' in job
+    assert "name: paper-publication-junit-${{ matrix.os }}" in job
+    assert f"path: {report}" in job
+    assert "if-no-files-found: error" in job
+
+
 def _write_exact_junit(
     path: Path,
     *,
