@@ -1546,6 +1546,7 @@ def cmd_research_repair_minute(args: argparse.Namespace) -> int:
 
 def cmd_formal_smoke_replay(args: argparse.Namespace) -> int:
     """Run one fixed strategy spec through the exact formal research binding."""
+    setup_logging(enqueue=False)
     from rquant.formal_runtime_composition import (
         FormalRuntimeCompositionError,
         open_formal_runtime_capability,

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ast
-import inspect
 import json
 import os
 import subprocess
@@ -181,7 +180,7 @@ def test_paper_publication_ci_job_machine_rejects_skipped_exact_node() -> None:
 
     assert "os: [macos-14, ubuntu-24.04]" in job
     assert 'root="${RUNNER_TEMP}/rquant-paper-publication"' in job
-    assert 'printf \'DATA_DIR=%s/data\\n\' "${root}"' in job
+    assert "printf 'DATA_DIR=%s/data\\n' \"${root}\"" in job
     assert '>> "${GITHUB_ENV}"' in job
     assert job.count(node) == 1
     assert "pytest -o addopts='' -rA" in job
@@ -551,13 +550,18 @@ def test_real_generation_outer_cli_isolated_from_authority_threads(
 
     def run_outer(
         arguments: tuple[str, ...],
-        **kwargs: object,
+        *,
+        cwd: Path,
+        environment: dict[str, str],
+        timeout_seconds: float,
     ) -> subprocess.CompletedProcess[str]:
         captured["arguments"] = arguments
-        captured.update(kwargs)
+        captured["cwd"] = cwd
+        captured["env"] = environment
+        captured["timeout"] = timeout_seconds
         return subprocess.CompletedProcess(arguments, 0, '{"status":"ok"}\n', "")
 
-    monkeypatch.setattr(support.subprocess, "run", run_outer)
+    monkeypatch.setattr(support, "_run_isolated_checkout_command", run_outer)
     monkeypatch.setattr(
         "rquant.cli.main",
         lambda: pytest.fail("formal smoke outer CLI ran in the authority thread process"),
@@ -585,26 +589,125 @@ def test_real_generation_outer_cli_isolated_from_authority_threads(
     assert arguments[:3] == (sys.executable, "-I", "-c")
     assert "from rquant import cli" in arguments[3]
     assert arguments[4] == os.fspath(Path(__file__).parents[2] / "src")
-    assert captured["capture_output"] is True
-    assert captured["text"] is True
-    assert captured["check"] is False
     assert captured["timeout"] <= 120
     environment = captured["env"]
     assert isinstance(environment, dict)
     assert environment["RQUANT_DISABLE_DOTENV"] == "1"
-    assert not any(
-        name.startswith(("GIT_", "PYTHON", "DYLD_", "LD_")) for name in environment
-    )
+    assert not any(name.startswith(("GIT_", "PYTHON", "DYLD_", "LD_")) for name in environment)
     assert invocation.exit_code == 0
     assert invocation.stdout == '{"status":"ok"}'
 
 
-def test_formal_smoke_cli_does_not_start_async_logging_before_descriptor_exec() -> None:
-    from rquant.cli import cmd_formal_smoke_replay
+def test_outer_checkout_timeout_reaps_ignoring_descendant_process(
+    tmp_path: Path,
+) -> None:
+    from tests import formal_smoke_real_generation_support as support
 
-    source = inspect.getsource(cmd_formal_smoke_replay)
+    descendant_pid_path = tmp_path / "descendant.pid"
+    launcher = tmp_path / "hold-process-group.py"
+    launcher.write_text(
+        "import signal, subprocess, sys, time\n"
+        "from pathlib import Path\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "child = subprocess.Popen((\n"
+        "    sys.executable, '-c',\n"
+        "    'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)',\n"
+        "))\n"
+        "Path(sys.argv[1]).write_text(str(child.pid), encoding='ascii')\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
 
-    assert "setup_logging" not in source
+    completed = support._run_isolated_checkout_command(
+        (sys.executable, os.fspath(launcher), os.fspath(descendant_pid_path)),
+        cwd=tmp_path,
+        environment={},
+        timeout_seconds=0.75,
+    )
+
+    assert completed.returncode == 124
+    assert descendant_pid_path.exists()
+    descendant_pid = int(descendant_pid_path.read_text(encoding="ascii"))
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        try:
+            os.kill(descendant_pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        pytest.fail(f"timed-out checkout descendant {descendant_pid} is still alive")
+
+
+def test_formal_smoke_synchronous_logging_preserves_configured_file_audit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant import logging as logging_module
+
+    configured: list[tuple[object, dict[str, object]]] = []
+    monkeypatch.setattr(logging_module, "_initialized", False)
+    monkeypatch.setattr(logging_module.logger, "remove", lambda: None)
+    monkeypatch.setattr(
+        logging_module.logger,
+        "add",
+        lambda sink, **kwargs: configured.append((sink, kwargs)),
+    )
+
+    logging_module.setup_logging(enqueue=False)
+
+    assert len(configured) == 2
+    assert configured[0][0] is sys.stderr
+    file_sink, file_options = configured[1]
+    assert str(file_sink).endswith("rquant_{time:YYYY-MM-DD}.log")
+    assert file_options["level"] == logging_module.settings.log_level
+    assert file_options["rotation"] == "00:00"
+    assert file_options["retention"] == "30 days"
+    assert file_options["compression"] == "zip"
+    assert file_options["enqueue"] is False
+
+
+def test_formal_smoke_synchronous_logging_writes_without_background_thread(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / "data"
+    log_root = tmp_path / "logs"
+    environment = {
+        "RQUANT_DISABLE_DOTENV": "1",
+        "TUSHARE_TOKEN_MAIN": "0" * 32,
+        "DATA_DIR": os.fspath(data_root),
+        "DUCKDB_PATH": os.fspath(data_root / "rquant.duckdb"),
+        "PARQUET_DIR": os.fspath(tmp_path / "parquet"),
+        "LOG_DIR": os.fspath(log_root),
+        "PATH": os.environ.get("PATH", os.defpath),
+    }
+    script = (
+        "import json, threading\n"
+        "from loguru import logger\n"
+        "from rquant.logging import setup_logging\n"
+        "before = {thread.ident for thread in threading.enumerate()}\n"
+        "setup_logging(enqueue=False)\n"
+        "logger.info('formal-sync-audit')\n"
+        "logger.complete()\n"
+        "created = [\n"
+        "    thread.name for thread in threading.enumerate() if thread.ident not in before\n"
+        "]\n"
+        "print(json.dumps(created))\n"
+    )
+
+    completed = subprocess.run(
+        (sys.executable, "-c", script),
+        cwd=Path(__file__).parents[2],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == []
+    log_files = tuple(log_root.glob("rquant_*.log"))
+    assert len(log_files) == 1
+    assert "formal-sync-audit" in log_files[0].read_text(encoding="utf-8")
 
 
 def test_real_generation_exact_ci_job_is_no_skip_and_redacted() -> None:
@@ -620,7 +723,7 @@ def test_real_generation_exact_ci_job_is_no_skip_and_redacted() -> None:
     assert "${{ runner.temp }}" not in job_declaration
     assert 'exact_root="${RUNNER_TEMP}/rquant-formal-exact-py${{ matrix.python-version }}"' in job
     assert 'exact_root="${RQUANT_FORMAL_EXACT_ROOT}"' in job
-    assert 'printf \'RQUANT_FORMAL_EXACT_ROOT=%s\\n\' "${exact_root}"' in job
+    assert "printf 'RQUANT_FORMAL_EXACT_ROOT=%s\\n' \"${exact_root}\"" in job
     assert '>> "${GITHUB_ENV}"' in job
     assert "uv sync --frozen" in job
     assert "openssl genpkey -algorithm ED25519" in job
@@ -643,8 +746,7 @@ def test_real_generation_exact_ci_job_is_no_skip_and_redacted() -> None:
         " # actions/upload-artifact@v4"
     ) in job
     assert (
-        "path: ${{ runner.temp }}/rquant-formal-exact-py"
-        "${{ matrix.python-version }}/test-results/"
+        "path: ${{ runner.temp }}/rquant-formal-exact-py${{ matrix.python-version }}/test-results/"
     ) in job
     assert "path: ${{ env.RQUANT_FORMAL_EXACT_ROOT }}/test-results/" not in job
     assert "if-no-files-found: error" in job

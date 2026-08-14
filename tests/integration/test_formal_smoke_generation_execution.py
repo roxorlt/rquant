@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import inspect
 import os
+import subprocess
+import sys
 import threading
 import time
 from contextlib import suppress
@@ -321,38 +323,45 @@ def test_receipt_fd_holder_times_out_reaps_process_group_and_cleans_staging(
     from rquant.formal_smoke_execution import FormalSmokeExecutionError
 
     identity_path = tmp_path / "child-process-group.txt"
-    parent_pid = os.getpid()
-    direct_children: list[int] = []
-    original_fork = os.fork
-
-    def tracked_fork() -> int:
-        process_id = original_fork()
-        if os.getpid() == parent_pid and process_id > 0:
-            direct_children.append(process_id)
-        return process_id
+    child_processes: list[subprocess.Popen[bytes]] = []
 
     def retain_receipt_fd_forever(
         _session: object,
         *,
         request_descriptor: int,
         receipt_descriptor: int,
-    ) -> None:
-        del request_descriptor, receipt_descriptor
-        child_pid = os.getpid()
-        descendant_pid = os.fork()
-        if descendant_pid == 0:
-            time.sleep(30)
-            os._exit(0)
-        identity_path.write_text(
-            f"{child_pid}:{os.getpgrp()}\n{descendant_pid}:{os.getpgid(descendant_pid)}\n",
-            encoding="ascii",
+    ) -> object:
+        script = (
+            "import os, subprocess, sys, time\n"
+            "descendant = subprocess.Popen((sys.executable, '-c', 'import time; time.sleep(30)'))\n"
+            "with open(sys.argv[1], 'w', encoding='ascii') as target:\n"
+            "    target.write(f'{os.getpid()}:{os.getpgrp()}\\n')\n"
+            "    target.write(f'{descendant.pid}:{os.getpgid(descendant.pid)}\\n')\n"
+            "time.sleep(30)\n"
         )
-        time.sleep(30)
+        process = subprocess.Popen(
+            (
+                sys.executable,
+                "-c",
+                script,
+                os.fspath(identity_path),
+            ),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            pass_fds=(request_descriptor, receipt_descriptor),
+            start_new_session=True,
+        )
+        child_processes.append(process)
+        return execution_module._FormalSmokeChildProcess(
+            process=process,
+            lifetime_descriptor=-1,
+        )
 
-    monkeypatch.setattr(execution_module.os, "fork", tracked_fork)
     monkeypatch.setattr(
         execution_module,
-        "exec_formal_smoke_child",
+        "_spawn_formal_smoke_child",
         retain_receipt_fd_forever,
     )
 
@@ -369,47 +378,140 @@ def test_receipt_fd_holder_times_out_reaps_process_group_and_cleans_staging(
     elapsed = time.monotonic() - started
 
     assert elapsed < 2
-    assert len(direct_children) == 1
-    with pytest.raises(ChildProcessError):
-        os.waitpid(direct_children[0], os.WNOHANG)
+    assert len(child_processes) == 1
+    assert child_processes[0].poll() is not None
     identities = tuple(
         tuple(int(value) for value in line.split(":"))
         for line in identity_path.read_text(encoding="ascii").splitlines()
     )
-    assert identities[0][0] == direct_children[0]
+    assert identities[0][0] == child_processes[0].pid
     assert all(process_id == process_group for process_id, process_group in identities[:1])
-    assert identities[1][1] == direct_children[0]
+    assert identities[1][1] == child_processes[0].pid
     assert not list((tmp_path / "output").glob("strategy_lab_runs/*"))
     assert not list((tmp_path / "output").glob(".formal-smoke-*"))
 
 
-def test_formal_smoke_child_fails_before_fork_from_multithreaded_process() -> None:
-    from rquant.formal_smoke_execution import (
-        FormalSmokeExecutionError,
-        _exchange_formal_smoke_child,
-    )
+def test_formal_smoke_child_launch_has_no_fork_window_when_thread_starts_after_pipe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant import formal_smoke_execution as execution_module
 
-    stop = threading.Event()
-    ready = threading.Event()
+    late_stop = threading.Event()
+    late_ready = threading.Event()
+    child_done = threading.Event()
+    child_threads: list[threading.Thread] = []
+    real_pipe = os.pipe
+    pipe_count = 0
 
-    def hold_thread() -> None:
-        ready.set()
-        stop.wait(timeout=5)
+    def hold_late_thread() -> None:
+        late_ready.set()
+        late_stop.wait(timeout=5)
 
-    thread = threading.Thread(target=hold_thread, name="formal-smoke-threat-model")
-    thread.start()
-    try:
-        assert ready.wait(timeout=1)
-        with pytest.raises(FormalSmokeExecutionError, match="single-threaded"):
-            _exchange_formal_smoke_child(
-                object(),  # type: ignore[arg-type]
-                b"{}",
-                deadline_monotonic=time.monotonic() + 1,
+    late_thread = threading.Thread(target=hold_late_thread, name="formal-smoke-late-thread")
+
+    def racing_pipe() -> tuple[int, int]:
+        nonlocal pipe_count
+        descriptors = real_pipe()
+        pipe_count += 1
+        if pipe_count == 1:
+            late_thread.start()
+            assert late_ready.wait(timeout=1)
+        return descriptors
+
+    class FakeProcess:
+        pid = 999_999
+
+        def poll(self) -> int | None:
+            return 0 if child_done.is_set() else None
+
+    class FakeLaunch:
+        def __init__(self, request_descriptor: int, receipt_descriptor: int) -> None:
+            self.inherited_descriptors = (
+                os.open(os.devnull, os.O_RDONLY),
+                os.dup(request_descriptor),
+                os.dup(receipt_descriptor),
+                os.open(os.devnull, os.O_RDONLY),
             )
+            self.interpreter_descriptor = self.inherited_descriptors[0]
+            self.argv = ("verified-python", "formal-smoke-runtime-execute")
+            self.environment: dict[str, str] = {}
+            self.working_directory = Path("/")
+
+        def __enter__(self) -> FakeLaunch:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            for descriptor in self.inherited_descriptors:
+                os.close(descriptor)
+
+    def prepare_launch(
+        _session: object,
+        *,
+        request_descriptor: int,
+        receipt_descriptor: int,
+    ) -> FakeLaunch:
+        assert late_ready.is_set()
+        return FakeLaunch(request_descriptor, receipt_descriptor)
+
+    def start_supervisor(command: tuple[str, ...], **kwargs: object) -> FakeProcess:
+        assert late_ready.is_set()
+        assert command[:4] == (sys.executable, "-I", "-S", "-c")
+        assert kwargs["start_new_session"] is True
+        assert kwargs["env"] == {}
+        assert "preexec_fn" not in kwargs
+        pass_fds = kwargs["pass_fds"]
+        assert isinstance(pass_fds, tuple)
+        child_request = os.dup(pass_fds[1])
+        child_receipt = os.dup(pass_fds[2])
+
+        def exchange_bytes() -> None:
+            try:
+                request = bytearray()
+                while True:
+                    chunk = os.read(child_request, 64 * 1024)
+                    if not chunk:
+                        break
+                    request.extend(chunk)
+                os.write(child_receipt, b"receipt:" + bytes(request))
+            finally:
+                os.close(child_request)
+                os.close(child_receipt)
+                child_done.set()
+
+        child_thread = threading.Thread(target=exchange_bytes, name="formal-smoke-fake-child")
+        child_threads.append(child_thread)
+        child_thread.start()
+        return FakeProcess()
+
+    monkeypatch.setattr(execution_module.os, "pipe", racing_pipe)
+    monkeypatch.setattr(
+        execution_module.os,
+        "fork",
+        lambda: pytest.fail("formal smoke launch used Python os.fork after the thread race"),
+    )
+    monkeypatch.setattr(
+        execution_module,
+        "prepare_formal_smoke_launch",
+        prepare_launch,
+    )
+    monkeypatch.setattr(execution_module.subprocess, "Popen", start_supervisor)
+
+    try:
+        result = execution_module._exchange_formal_smoke_child(
+            object(),  # type: ignore[arg-type]
+            b"request",
+            deadline_monotonic=time.monotonic() + 2,
+        )
     finally:
-        stop.set()
-        thread.join(timeout=1)
-    assert not thread.is_alive()
+        late_stop.set()
+        late_thread.join(timeout=1)
+        for child_thread in child_threads:
+            child_thread.join(timeout=1)
+
+    assert result.exit_code == 0
+    assert result.receipt_bytes == b"receipt:request"
+    assert not late_thread.is_alive()
+    assert all(not child_thread.is_alive() for child_thread in child_threads)
 
 
 def test_publication_directory_swap_before_link_fails_closed_in_both_directories(

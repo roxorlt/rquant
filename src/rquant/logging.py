@@ -17,7 +17,7 @@ from rquant.config import settings
 _initialized = False
 
 
-def setup_logging() -> None:
+def setup_logging(*, enqueue: bool = True) -> None:
     global _initialized
     if _initialized:
         return
@@ -41,8 +41,10 @@ def setup_logging() -> None:
         rotation="00:00",
         retention="30 days",
         compression="zip",
-        enqueue=True,
-        format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} - {message}",
+        enqueue=enqueue,
+        format=(
+            "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} - {message}"
+        ),
     )
 
     _initialized = True

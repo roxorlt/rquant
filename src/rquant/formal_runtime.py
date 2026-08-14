@@ -7,6 +7,7 @@ import json
 import os
 from collections.abc import Callable, Mapping
 from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
@@ -145,6 +146,28 @@ class FormalRuntimeSession:
 
     def __enter__(self) -> FormalRuntimeSession:
         self.require_live()
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
+
+
+@dataclass(frozen=True)
+class PreparedFormalSmokeLaunch:
+    """Descriptor-only launch values retained until the helper process is spawned."""
+
+    interpreter_descriptor: int
+    argv: tuple[str, ...]
+    environment: dict[str, str]
+    working_directory: Path
+    inherited_descriptors: tuple[int, ...]
+
+    def close(self) -> None:
+        for descriptor in self.inherited_descriptors:
+            with suppress(OSError):
+                os.close(descriptor)
+
+    def __enter__(self) -> PreparedFormalSmokeLaunch:
         return self
 
     def __exit__(self, *_args: object) -> None:
@@ -350,6 +373,50 @@ def bind_formal_smoke_runtime(
     )
 
 
+def prepare_formal_smoke_launch(
+    session: FormalRuntimeSession,
+    *,
+    request_descriptor: int,
+    receipt_descriptor: int,
+) -> PreparedFormalSmokeLaunch:
+    """Duplicate verified descriptors for one race-free subprocess handoff."""
+
+    sources: tuple[int, ...] = ()
+    try:
+        session.require_live()
+        if not session.plan.launcher_via_descriptor:
+            raise FormalRuntimeError("formal smoke launcher is not descriptor-bound")
+        sources = tuple(
+            os.dup(descriptor)
+            for descriptor in (
+                session.require_interpreter_descriptor(),
+                request_descriptor,
+                receipt_descriptor,
+                session.require_launcher_descriptor(),
+            )
+        )
+        interpreter_source, request_source, receipt_source, launcher_source = sources
+        replacements = {
+            _REQUEST_FD_PLACEHOLDER: str(request_source),
+            _RECEIPT_FD_PLACEHOLDER: str(receipt_source),
+            _LAUNCHER_FD_PLACEHOLDER: str(launcher_source),
+        }
+        argv = tuple(replacements.get(value, value) for value in session.plan.argv)
+        os.lseek(launcher_source, 0, os.SEEK_SET)
+        return PreparedFormalSmokeLaunch(
+            interpreter_descriptor=interpreter_source,
+            argv=argv,
+            environment=dict(session.plan.environment),
+            working_directory=session.plan.working_directory,
+            inherited_descriptors=sources,
+        )
+    except BaseException:
+        for descriptor in sources:
+            with suppress(OSError):
+                os.close(descriptor)
+        raise
+
+
 def _exec_verified_descriptor(
     descriptor: int,
     argv: tuple[str, ...],
@@ -428,6 +495,7 @@ __all__ = [
     "FormalRuntimeAudit",
     "FormalRuntimeError",
     "FormalRuntimeLaunchPlan",
+    "PreparedFormalSmokeLaunch",
     "FormalRuntimeCodeAuthority",
     "FormalRuntimeSession",
     "FORMAL_SMOKE_BOOTSTRAP_SHA256",
@@ -436,4 +504,5 @@ __all__ = [
     "bind_formal_smoke_runtime",
     "exec_formal_smoke_child",
     "exec_formal_runtime",
+    "prepare_formal_smoke_launch",
 ]

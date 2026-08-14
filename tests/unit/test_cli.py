@@ -1665,6 +1665,7 @@ class TestFormalSmokeReplay:
             "result_hash": "f" * 64,
         }
         run = MagicMock(return_value=result)
+        setup_logging = MagicMock()
         capability = MagicMock()
         capability.evidence = CodeTrustEvidence(
             generation_id="a" * 64,
@@ -1684,6 +1685,7 @@ class TestFormalSmokeReplay:
             "run_attested_formal_smoke",
             run,
         )
+        monkeypatch.setattr(cli, "setup_logging", setup_logging)
         args = build_parser().parse_args(
             [
                 "formal-smoke-replay",
@@ -1714,6 +1716,7 @@ class TestFormalSmokeReplay:
 
         assert cli.cmd_formal_smoke_replay(args) == 0
 
+        setup_logging.assert_called_once_with(enqueue=False)
         assert run.call_args.args == (capability,)
         assert run.call_args.kwargs["strategy"] == "n_shape"
         assert run.call_args.kwargs["start_date"] == date(2026, 4, 1)

@@ -13,8 +13,9 @@ import sys
 import sysconfig
 import tarfile
 import threading
+import time
 from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path, PurePosixPath
@@ -962,35 +963,56 @@ def invoke_outer_formal_smoke_cli_from_checkout_b(
     if any(name.startswith(routing_prefixes) for name in child_environment):
         raise ValueError("formal smoke checkout environment contains a routing variable")
     environment = {
-        name: value
-        for name, value in os.environ.items()
-        if not name.startswith(routing_prefixes)
+        name: value for name, value in os.environ.items() if not name.startswith(routing_prefixes)
     }
     environment.update(child_environment)
-    try:
-        completed = subprocess.run(
-            arguments,
-            cwd=source_root,
-            env=environment,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds + 15,
-        )
-    except subprocess.TimeoutExpired as exc:
-        stderr = exc.stderr or ""
-        if isinstance(stderr, bytes):
-            stderr = stderr.decode("utf-8", errors="replace")
+    completed = _run_isolated_checkout_command(
+        arguments,
+        cwd=source_root,
+        environment=environment,
+        timeout_seconds=timeout_seconds + 15,
+    )
+    if completed.returncode == 124:
         return CliInvocation(
             exit_code=124,
             stdout="",
-            stderr=f"{stderr}formal smoke outer CLI deadline expired\n",
+            stderr=f"{completed.stderr}formal smoke outer CLI deadline expired\n",
         )
     return CliInvocation(
         exit_code=completed.returncode,
         stdout=completed.stdout.strip(),
         stderr=completed.stderr,
     )
+
+
+def _run_isolated_checkout_command(
+    arguments: tuple[str, ...],
+    *,
+    cwd: Path,
+    environment: Mapping[str, str],
+    timeout_seconds: float,
+) -> subprocess.CompletedProcess[str]:
+    process = subprocess.Popen(
+        arguments,
+        cwd=cwd,
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        with suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGTERM)
+        time.sleep(0.1)
+        with suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        stdout, stderr = process.communicate()
+        return subprocess.CompletedProcess(arguments, 124, stdout, stderr)
+    return subprocess.CompletedProcess(arguments, process.returncode, stdout, stderr)
 
 
 def write_redacted_exact_facts_if_requested(
