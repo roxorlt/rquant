@@ -41,6 +41,7 @@ def _snapshot_payload(**overrides: object) -> dict[str, object]:
         "buy_limit_locked": True,
         "sell_limit_locked": False,
         "risk_rejected": False,
+        "instrument_context": None,
         "source_snapshot_ids": {"minute_bar": "c" * 64, "risk": "d" * 64},
         "producer_commit": COMMIT,
     }

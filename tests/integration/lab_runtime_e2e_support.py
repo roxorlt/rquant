@@ -66,6 +66,7 @@ from tests.unit.test_lab_worker import (
     MetadataStoreFactory,
     RecordingRegistry,
     RecordingResearchStoreOpener,
+    _MetadataStore,
     _worker,
 )
 
@@ -293,6 +294,7 @@ def create_real_sealed_lab_job(
     )
     scheduler.run_once()
     opener = RecordingResearchStoreOpener()
+    formal_store = _MetadataStore(snapshot)
 
     def accept_report(
         report: LabWorkerReport,
@@ -312,7 +314,7 @@ def create_real_sealed_lab_job(
         claims=claims,
         reports=reports,
         exploratory_store_factory=None,
-        metadata_store_factory=MetadataStoreFactory(object()),
+        metadata_store_factory=MetadataStoreFactory(formal_store),
         lake_root=tmp_path / "research-lake",
         research_store_opener=opener,
         verified_code_sha_provider=lambda: code_sha,

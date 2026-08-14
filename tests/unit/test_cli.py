@@ -5734,7 +5734,12 @@ class TestLabWorkerCli:
         assert snapshot.live_healthy is True
         watermark = worker.snapshot_authority_watermark
         if snapshot.live_slo_applicable:
-            assert snapshot.live_backlog_age_seconds == 2
+            expected_backlog_age = (
+                snapshot.observed_at - (observed_at - timedelta(seconds=2))
+            ).total_seconds()
+            assert snapshot.live_backlog_age_seconds == pytest.approx(
+                expected_backlog_age, abs=1e-6
+            )
             assert watermark is not None
             assert watermark.sequence == 1
         else:

@@ -65,6 +65,16 @@ def _reference(path: Path) -> str:
         (ReferenceDataset.ST_STATUS, {"is_st": False}),
         (ReferenceDataset.SUSPENSION_STATUS, {"is_suspended": False}),
         (
+            ReferenceDataset.LISTING_STATUS,
+            {
+                "market": "CN",
+                "exchange": "SSE",
+                "instrument_class": "EQUITY",
+                "security_class": "A_SHARE",
+                "status": "listed",
+            },
+        ),
+        (
             ReferenceDataset.PRICE_LIMIT_REGIME,
             {"limit_up_price": 11.0, "limit_down_price": 9.0},
         ),
