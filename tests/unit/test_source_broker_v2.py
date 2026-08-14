@@ -2261,19 +2261,15 @@ def test_v2_saga_rejects_tampered_historical_source_authority_receipt(
     ).advance(replay_request, now=NOW + timedelta(seconds=1))
     original_replay = replay_transport.replay
     security = replay_transport._security
-    mutations: tuple[tuple[str, dict[str, object], bool], ...] = (
-        (
-            "signature",
-            {"signature": base64.b64encode(b"x" * 64).decode("ascii")},
-            False,
-        ),
-        ("challenge", {"challenge": "a" * 64}, True),
-        ("request-hash", {"request_hash": "b" * 64}, True),
-        ("result-hash", {"result_hash": "c" * 64}, True),
-        ("binding", {"operation_id": "d" * 64}, True),
-    )
 
-    for label, updates, resign in mutations:
+    def assert_forged_replay_rejected(
+        *,
+        label: str,
+        forge: Callable[
+            [SourceBrokerV2ReplayResponse],
+            SourceBrokerV2ReplayResponse,
+        ],
+    ) -> None:
         case_root = replay_root / label
         case_root.mkdir()
 
@@ -2281,18 +2277,11 @@ def test_v2_saga_rejects_tampered_historical_source_authority_receipt(
             payload: bytes,
             *,
             deadline: float | None = None,
-            updates: dict[str, object] = updates,
-            resign: bool = resign,
         ) -> bytes:
             valid = SourceBrokerV2ReplayResponse.model_validate_json(
                 original_replay(payload, deadline=deadline)
             )
-            forged = valid.model_copy(update=updates)
-            if resign:
-                forged = forged.model_copy(
-                    update={"signature": security.sign(forged.signing_bytes())}
-                )
-            return canonical_model_json_bytes(forged)
+            return canonical_model_json_bytes(forge(valid))
 
         with monkeypatch.context() as patch:
             patch.setattr(replay_transport, "replay", forged_replay)
@@ -2311,6 +2300,120 @@ def test_v2_saga_rejects_tampered_historical_source_authority_receipt(
                 )
         assert replay_transport.dispatch_calls == 1
         assert replay_transport.finalize_calls == 1
+
+    outer_mutations: tuple[tuple[str, dict[str, object], bool], ...] = (
+        (
+            "signature",
+            {"signature": base64.b64encode(b"x" * 64).decode("ascii")},
+            False,
+        ),
+        ("challenge", {"challenge": "a" * 64}, True),
+        ("request-hash", {"request_hash": "b" * 64}, True),
+        ("binding", {"operation_id": "d" * 64}, True),
+    )
+
+    for label, updates, resign in outer_mutations:
+
+        def forge_outer(
+            valid: SourceBrokerV2ReplayResponse,
+            *,
+            updates: dict[str, object] = updates,
+            resign: bool = resign,
+        ) -> SourceBrokerV2ReplayResponse:
+            forged = valid.model_copy(update=updates)
+            if resign:
+                forged = forged.model_copy(
+                    update={"signature": security.sign(forged.signing_bytes())}
+                )
+            return forged
+
+        assert_forged_replay_rejected(label=label, forge=forge_outer)
+
+    result_binding_mutations: tuple[tuple[SourceBrokerV2OutboxPhase, str, object], ...] = (
+        (SourceBrokerV2OutboxPhase.DISPATCH, "saga_id", "forged-saga"),
+        (SourceBrokerV2OutboxPhase.DISPATCH, "operation_id", "e" * 64),
+        (SourceBrokerV2OutboxPhase.DISPATCH, "request_hash", "f" * 64),
+        (SourceBrokerV2OutboxPhase.SOURCE_FINALIZE, "saga_id", "forged-saga"),
+        (SourceBrokerV2OutboxPhase.SOURCE_FINALIZE, "operation_id", "e" * 64),
+        (SourceBrokerV2OutboxPhase.SOURCE_FINALIZE, "request_hash", "f" * 64),
+    )
+
+    for phase, field, replacement in result_binding_mutations:
+
+        def forge_result_binding(
+            valid: SourceBrokerV2ReplayResponse,
+            *,
+            phase: SourceBrokerV2OutboxPhase = phase,
+            field: str = field,
+            replacement: object = replacement,
+        ) -> SourceBrokerV2ReplayResponse:
+            if valid.phase is not phase:
+                return valid
+            assert valid.result is not None
+            response_type = (
+                SourceBrokerV2DispatchResponse
+                if phase is SourceBrokerV2OutboxPhase.DISPATCH
+                else SourceBrokerV2FinalizeResponse
+            )
+            embedded = response_type.model_validate_json(valid.result)
+            forged_result = canonical_model_json_bytes(
+                embedded.model_copy(update={field: replacement})
+            )
+            forged = valid.model_copy(
+                update={
+                    "result": forged_result,
+                    "result_hash": canonical_sha256(strict_canonical_json_loads(forged_result)),
+                }
+            )
+            return forged.model_copy(update={"signature": security.sign(forged.signing_bytes())})
+
+        case_root = replay_root / f"result-{phase.value}-{field.replace('_', '-')}"
+        case_root.mkdir()
+        operation_id = source_effect_operation_id(
+            saga_id="saga-replay-forgery",
+            phase=phase,
+        )
+        stored_result = (
+            replay_transport._dispatch_results
+            if phase is SourceBrokerV2OutboxPhase.DISPATCH
+            else replay_transport._finalize_results
+        )[operation_id]
+        response_type = (
+            SourceBrokerV2DispatchResponse
+            if phase is SourceBrokerV2OutboxPhase.DISPATCH
+            else SourceBrokerV2FinalizeResponse
+        )
+        operation_request_hash = response_type.model_validate_json(stored_result).request_hash
+
+        def forged_result_replay(
+            payload: bytes,
+            *,
+            deadline: float | None = None,
+        ) -> bytes:
+            valid = SourceBrokerV2ReplayResponse.model_validate_json(
+                original_replay(payload, deadline=deadline)
+            )
+            return canonical_model_json_bytes(forge_result_binding(valid))
+
+        with monkeypatch.context() as patch:
+            patch.setattr(replay_transport, "replay", forged_result_replay)
+            forged_saga = SourceBrokerV2Saga.for_nonproduction(
+                case_root / "saga.sqlite3",
+                saga_id="saga-replay-forgery",
+                current_claim_authority=replay_current,
+                quota_adapter=replay_quota,
+                transport=replay_transport,
+                lineage_authority=replay_lineage,
+            )
+            with pytest.raises(
+                SourceBrokerV2SagaIntegrityError,
+                match="source terminal result is invalid",
+            ):
+                forged_saga._replay_source_operation(
+                    phase=phase,
+                    operation_id=operation_id,
+                    operation_request_hash=operation_request_hash,
+                )
 
 
 def test_v2_saga_lookup_unavailable_never_dispatches_and_requires_reconcile(
