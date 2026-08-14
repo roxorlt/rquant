@@ -327,9 +327,7 @@ def _portable_lifecycle_spawn_factory(
     ) -> object:
         control_read, control_write = real_pipe()
         status_read, status_write = real_pipe()
-        tracked_descriptors.extend(
-            (control_read, control_write, status_read, status_write)
-        )
+        tracked_descriptors.extend((control_read, control_write, status_read, status_write))
         try:
             process = subprocess.Popen(
                 (
@@ -511,8 +509,7 @@ def test_wrapped_outer_failure_reports_only_stable_redacted_phase_and_reason(
         _run(tmp_path, exchange=_success_exchange())
 
     assert str(raised.value) == (
-        "formal smoke attested execution failed "
-        f"(phase={expected_phase} reason={expected_reason})"
+        f"formal smoke attested execution failed (phase={expected_phase} reason={expected_reason})"
     )
     assert secret not in str(raised.value)
     assert raised.value.__cause__ is None
@@ -548,8 +545,7 @@ def test_exchange_value_error_reports_redacted_fixed_subphase(
         )
 
     assert str(raised.value) == (
-        "formal smoke child exchange failed "
-        "(subphase=setup_request_pipe reason=pipe_contract)"
+        "formal smoke child exchange failed (subphase=setup_request_pipe reason=pipe_contract)"
     )
     assert raised.value.__cause__ is None
     assert raised.value.__suppress_context__ is True
@@ -1055,7 +1051,8 @@ def test_teardown_ready_wait_supports_descriptor_above_select_fd_limit() -> None
         ("reap", "cleanup_reap", "process_reap_contract"),
     ),
 )
-def test_cleanup_value_error_records_exact_safe_subphase(
+def test_cleanup_value_error_still_kills_real_group_and_reaps_supervisor(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     fault: str,
     expected_subphase: str,
@@ -1064,59 +1061,71 @@ def test_cleanup_value_error_records_exact_safe_subphase(
     from rquant import formal_smoke_execution as execution_module
 
     secret = f"secret cleanup path=/private/{fault} argv=--token"
-    control_read, control_write = os.pipe()
-    status_read, status_write = os.pipe()
-
-    class FakePopen:
-        pid = 41_046
-        returncode: int | None = None
-
-    process = execution_module._FormalSmokeChildProcess(
-        process=FakePopen(),  # type: ignore[arg-type]
-        lifetime_descriptor=control_write,
-        status_descriptor=status_read,
-    )
-    progress = execution_module._FormalSmokeExchangeProgress()
-
-    def fail(*_args: object, **_kwargs: object) -> object:
-        raise ValueError(secret)
-
-    monkeypatch.setattr(
+    identity_path = tmp_path / f"{fault}-cleanup-process-group.txt"
+    tracked_descriptors: list[int] = []
+    spawn, spawned = _portable_lifecycle_spawn_factory(
         execution_module,
-        "_await_supervisor_teardown_ready",
-        fail if fault == "teardown-wait" else lambda *_args, **_kwargs: False,
+        identity_path=identity_path,
+        tracked_descriptors=tracked_descriptors,
+        supervisor_kills_only_itself=False,
     )
-    monkeypatch.setattr(
-        execution_module,
-        "_observe_supervisor_without_reaping",
-        fail if fault == "waitid" else lambda _process: None,
-    )
-    monkeypatch.setattr(
-        execution_module,
-        "_final_kill_supervisor_group",
-        fail if fault == "kill" else lambda _process: None,
-    )
-    monkeypatch.setattr(
-        execution_module,
-        "_reap_known_supervisor",
-        fail if fault == "reap" else lambda _process, **_kwargs: -signal.SIGKILL,
-    )
+    monkeypatch.setattr(execution_module, "_spawn_formal_smoke_child", spawn)
 
+    target_name = {
+        "teardown-wait": "_await_supervisor_teardown_ready",
+        "waitid": "_observe_supervisor_without_reaping",
+        "kill": "_final_kill_supervisor_group",
+        "reap": "_reap_known_supervisor",
+    }[fault]
+    original = getattr(execution_module, target_name)
+    injected = False
+
+    def fail_once(*args: object, **kwargs: object) -> object:
+        nonlocal injected
+        if not injected:
+            injected = True
+            raise ValueError(secret)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(execution_module, target_name, fail_once)
+
+    supervisor: subprocess.Popen[bytes] | None = None
+    descendant_pid: int | None = None
     try:
-        with pytest.raises(ValueError) as raised:
-            execution_module._cleanup_formal_smoke_supervisor(
-                process,
-                progress=progress,
+        with pytest.raises(
+            execution_module.FormalSmokeCleanupError,
+            match=(
+                "formal smoke supervisor cleanup failed "
+                f"\\(subphase={expected_subphase} reason={expected_reason}\\)"
+            ),
+        ) as raised:
+            execution_module._exchange_formal_smoke_child(
+                object(),  # type: ignore[arg-type]
+                b"request",
+                deadline_monotonic=time.monotonic() + 2,
             )
-        diagnostic = progress.value_error(raised.value)
-        assert str(diagnostic) == (
+
+        identities = tuple(
+            tuple(int(value) for value in line.split(":"))
+            for line in identity_path.read_text(encoding="ascii").splitlines()
+        )
+        supervisor = spawned[0]
+        descendant_pid = identities[1][0]
+
+        assert injected
+        assert str(raised.value.__cause__) == (
             "formal smoke child exchange failed "
             f"(subphase={expected_subphase} reason={expected_reason})"
         )
-        assert secret not in str(diagnostic)
+        assert secret not in "".join(traceback.format_exception(raised.value))
+        _assert_pid_disappears(descendant_pid)
+        with pytest.raises(ChildProcessError):
+            os.waitpid(supervisor.pid, os.WNOHANG)
+        for descriptor in set(tracked_descriptors):
+            with pytest.raises(OSError):
+                os.fstat(descriptor)
     finally:
-        os.close(control_read)
-        os.close(status_write)
+        _emergency_reap_test_processes(supervisor, descendant_pid)
 
 
 @pytest.mark.skipif(
@@ -1297,11 +1306,7 @@ def test_post_spawn_initialization_failure_cleans_group_and_all_descriptors(
         def fail_close(descriptor: int) -> None:
             nonlocal close_failed
             real_close(descriptor)
-            if (
-                not close_failed
-                and tracked_descriptors
-                and descriptor == tracked_descriptors[0]
-            ):
+            if not close_failed and tracked_descriptors and descriptor == tracked_descriptors[0]:
                 close_failed = True
                 raise InjectedInitializationError(fault)
 
@@ -1336,15 +1341,15 @@ def test_post_spawn_initialization_failure_cleans_group_and_all_descriptors(
                 real_close(descriptor)
 
 
-def test_cleanup_failure_is_explicit_and_preserves_initialization_failure_as_cause(
+def test_cleanup_failure_links_only_redacted_initialization_diagnostic(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from rquant import formal_smoke_execution as execution_module
 
-    class InjectedInitializationError(RuntimeError):
-        pass
-
     held_descriptors: list[int] = []
+    secret_path = "/private/formal-smoke-secret.py"
+    secret_argv = "--authority-token=argv-secret"
+    secret_token = "credential-token-secret"
 
     class FakePopen:
         pid = 41_043
@@ -1375,7 +1380,7 @@ def test_cleanup_failure_is_explicit_and_preserves_initialization_failure_as_cau
         raise execution_module.FormalSmokeCleanupError("forced cleanup failure")
 
     def fail_selector_constructor() -> object:
-        raise InjectedInitializationError("forced initialization failure")
+        raise ValueError(f"{secret_path} {secret_argv} {secret_token}")
 
     monkeypatch.setattr(
         execution_module,
@@ -1408,8 +1413,15 @@ def test_cleanup_failure_is_explicit_and_preserves_initialization_failure_as_cau
             with suppress(OSError):
                 os.close(descriptor)
 
-    assert isinstance(captured.value.__cause__, InjectedInitializationError)
-    assert "initialization" in str(captured.value.__cause__)
+    assert isinstance(captured.value.__cause__, execution_module.FormalSmokeExecutionError)
+    assert str(captured.value.__cause__) == (
+        "formal smoke child exchange failed (subphase=create_selector reason=selector_contract)"
+    )
+    assert captured.value.__suppress_context__ is True
+    assert isinstance(captured.value.__context__, ValueError)
+    rendered = "".join(traceback.format_exception(captured.value))
+    for secret in (secret_path, secret_argv, secret_token):
+        assert secret not in rendered
 
 
 def test_formal_smoke_child_launch_has_no_fork_window_when_thread_starts_after_pipe(

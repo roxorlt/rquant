@@ -91,7 +91,7 @@ jobs:
         run: >-
           uv run python tests/support/assert_junit_contract.py
           --path "test-results/full-py${{ matrix.python-version }}.xml"
-          --suites 1 --tests 11091 --failures 0 --errors 0 --skipped 48 --cases 11091
+          --suites 1 --tests 11118 --failures 0 --errors 0 --skipped 48 --cases 11118
           --allow-skipped-cases 48
 
       - name: Upload full suite JUnit evidence

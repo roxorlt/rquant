@@ -273,7 +273,25 @@ class _FormalSmokeExchangeProgress:
             else _exchange_value_error_reason(self.subphase)
         )
         return FormalSmokeExecutionError(
-            "formal smoke child exchange failed "
+            f"formal smoke child exchange failed (subphase={self.subphase.value} reason={reason})"
+        )
+
+    def redacted_error(self, exc: BaseException) -> FormalSmokeExecutionError:
+        if isinstance(exc, ValueError):
+            return self.value_error(exc)
+        reason = _formal_smoke_failure_component(exc) or "internal_error"
+        return FormalSmokeExecutionError(
+            f"formal smoke child exchange failed (subphase={self.subphase.value} reason={reason})"
+        )
+
+    def cleanup_value_error(self, exc: ValueError) -> FormalSmokeCleanupError:
+        reason = (
+            "validation_error"
+            if isinstance(exc, ValidationError)
+            else _exchange_value_error_reason(self.subphase)
+        )
+        return FormalSmokeCleanupError(
+            "formal smoke supervisor cleanup failed "
             f"(subphase={self.subphase.value} reason={reason})"
         )
 
@@ -295,9 +313,7 @@ class _FormalSmokeExchangeProgress:
             f"receipt_eof={str(self.receipt_eof).lower()}",
             f"status_reported={str(self.status_reported).lower()}",
         )
-        return FormalSmokeExecutionError(
-            f"formal smoke child deadline expired ({' '.join(facts)})"
-        )
+        return FormalSmokeExecutionError(f"formal smoke child deadline expired ({' '.join(facts)})")
 
 
 FormalSmokeExchange = Callable[
@@ -382,9 +398,7 @@ def _waitid_return_code(observation: _WaitidObservation) -> int:
         return status
     if code in (os.CLD_KILLED, os.CLD_DUMPED):
         return -status
-    raise FormalSmokeCleanupError(
-        f"formal smoke supervisor returned unexpected wait state {code}"
-    )
+    raise FormalSmokeCleanupError(f"formal smoke supervisor returned unexpected wait state {code}")
 
 
 def _observe_supervisor_without_reaping(
@@ -392,9 +406,7 @@ def _observe_supervisor_without_reaping(
 ) -> int | None:
     if process.process.returncode is not None:
         process.state = _SupervisorLifecycleState.REAPED
-        raise FormalSmokeCleanupError(
-            "formal smoke supervisor was already reaped before cleanup"
-        )
+        raise FormalSmokeCleanupError("formal smoke supervisor was already reaped before cleanup")
     try:
         observation = os.waitid(
             os.P_PID,
@@ -435,10 +447,7 @@ def _reap_known_supervisor(
 def _final_kill_supervisor_group(
     process: _FormalSmokeChildProcess,
 ) -> FormalSmokeCleanupError | None:
-    if (
-        process.state is _SupervisorLifecycleState.REAPED
-        or process.process.returncode is not None
-    ):
+    if process.state is _SupervisorLifecycleState.REAPED or process.process.returncode is not None:
         process.state = _SupervisorLifecycleState.REAPED
         return FormalSmokeCleanupError(
             "formal smoke supervisor was reaped before final group cleanup"
@@ -450,9 +459,7 @@ def _final_kill_supervisor_group(
         return None
     except PermissionError:
         process.state = _SupervisorLifecycleState.GROUP_SIGNAL_DENIED
-        return FormalSmokeCleanupError(
-            "formal smoke supervisor group cleanup permission denied"
-        )
+        return FormalSmokeCleanupError("formal smoke supervisor group cleanup permission denied")
     process.state = _SupervisorLifecycleState.FINAL_GROUP_KILL_SENT
     return None
 
@@ -491,82 +498,134 @@ def _cleanup_formal_smoke_supervisor(
 ) -> None:
     cleanup_deadline = time.monotonic() + _SUPERVISOR_CLEANUP_SECONDS
     cleanup_error: FormalSmokeCleanupError | None = None
+    cleanup_diagnostic: FormalSmokeExecutionError | None = None
+    cleanup_diagnostic_error: FormalSmokeCleanupError | None = None
     request_delivered = False
+    observed_return_code: int | None = None
+    reaped_return_code: int | None = None
+    cleanup_progress = progress or _FormalSmokeExchangeProgress()
+
+    def set_subphase(subphase: _FormalSmokeExchangeSubphase) -> None:
+        cleanup_progress.subphase = subphase
+
+    def record_value_error(exc: ValueError) -> None:
+        nonlocal cleanup_diagnostic, cleanup_diagnostic_error
+        if cleanup_diagnostic is None:
+            cleanup_diagnostic = cleanup_progress.value_error(exc)
+            cleanup_diagnostic_error = cleanup_progress.cleanup_value_error(exc)
+
     try:
-        if progress is not None:
-            progress.subphase = _FormalSmokeExchangeSubphase.CLEANUP_VALIDATE_ANCHOR
+        set_subphase(_FormalSmokeExchangeSubphase.CLEANUP_VALIDATE_ANCHOR)
         if process.process.returncode is not None:
             process.state = _SupervisorLifecycleState.REAPED
-            raise FormalSmokeCleanupError(
+            cleanup_error = FormalSmokeCleanupError(
                 "formal smoke supervisor was already reaped before cleanup"
             )
-        try:
-            if progress is not None:
-                progress.subphase = _FormalSmokeExchangeSubphase.CLEANUP_TEARDOWN_REQUEST
-            request_delivered = (
-                os.write(process.lifetime_descriptor, _SUPERVISOR_TEARDOWN_REQUEST) == 1
-            )
-        except OSError:
-            request_delivered = False
-        finally:
-            with suppress(OSError):
-                process.close_lifetime()
-        if request_delivered:
-            process.state = _SupervisorLifecycleState.TEARDOWN_REQUESTED
+        else:
+            try:
+                set_subphase(_FormalSmokeExchangeSubphase.CLEANUP_TEARDOWN_REQUEST)
+                request_delivered = (
+                    os.write(process.lifetime_descriptor, _SUPERVISOR_TEARDOWN_REQUEST) == 1
+                )
+            except OSError:
+                request_delivered = False
+            except ValueError as exc:
+                record_value_error(exc)
+            finally:
+                try:
+                    process.close_lifetime()
+                except OSError:
+                    pass
+                except ValueError as exc:
+                    set_subphase(_FormalSmokeExchangeSubphase.CLEANUP_CLOSE_DESCRIPTORS)
+                    record_value_error(exc)
+            if request_delivered:
+                process.state = _SupervisorLifecycleState.TEARDOWN_REQUESTED
 
-        owned_deadline = time.monotonic()
-        if request_delivered:
-            owned_deadline = min(
-                cleanup_deadline,
-                owned_deadline + _SUPERVISOR_OWNED_GRACE_SECONDS,
-            )
-            if progress is not None:
-                progress.subphase = _FormalSmokeExchangeSubphase.CLEANUP_TEARDOWN_WAIT
-            _await_supervisor_teardown_ready(
-                process,
-                deadline_monotonic=owned_deadline,
-            )
+            owned_deadline = time.monotonic()
+            if request_delivered:
+                owned_deadline = min(
+                    cleanup_deadline,
+                    owned_deadline + _SUPERVISOR_OWNED_GRACE_SECONDS,
+                )
+                set_subphase(_FormalSmokeExchangeSubphase.CLEANUP_TEARDOWN_WAIT)
+                try:
+                    _await_supervisor_teardown_ready(
+                        process,
+                        deadline_monotonic=owned_deadline,
+                    )
+                except ValueError as exc:
+                    record_value_error(exc)
 
-        if progress is not None:
-            progress.subphase = _FormalSmokeExchangeSubphase.CLEANUP_WAITID
-        observed_return_code = _observe_supervisor_without_reaping(process)
+            set_subphase(_FormalSmokeExchangeSubphase.CLEANUP_WAITID)
+            try:
+                observed_return_code = _observe_supervisor_without_reaping(process)
+            except ValueError as exc:
+                record_value_error(exc)
+            except FormalSmokeCleanupError as exc:
+                cleanup_error = exc
 
-        if progress is not None:
-            progress.subphase = _FormalSmokeExchangeSubphase.CLEANUP_KILL
-        cleanup_error = _final_kill_supervisor_group(process)
-        try:
-            if progress is not None:
-                progress.subphase = _FormalSmokeExchangeSubphase.CLEANUP_REAP
-            reaped_return_code = _reap_known_supervisor(
-                process,
-                deadline_monotonic=cleanup_deadline,
-            )
-        except FormalSmokeCleanupError as reap_error:
-            if cleanup_error is not None:
-                raise cleanup_error from reap_error
-            raise
-        if (
-            cleanup_error is None
-            and observed_return_code is not None
-            and reaped_return_code != observed_return_code
-        ):
-            cleanup_error = FormalSmokeCleanupError(
-                "formal smoke supervisor changed status while being reaped"
-            )
-        if cleanup_error is not None:
-            raise cleanup_error
+            if process.state is not _SupervisorLifecycleState.REAPED:
+                set_subphase(_FormalSmokeExchangeSubphase.CLEANUP_KILL)
+                # The non-reaped leader remains the process-group identity anchor.
+                for _attempt in range(2):
+                    try:
+                        group_error = _final_kill_supervisor_group(process)
+                    except ValueError as exc:
+                        record_value_error(exc)
+                        continue
+                    if group_error is not None and cleanup_error is None:
+                        cleanup_error = group_error
+                    break
+                else:
+                    if cleanup_error is None:
+                        cleanup_error = FormalSmokeCleanupError(
+                            "formal smoke supervisor final group cleanup contract failed"
+                        )
+
+                set_subphase(_FormalSmokeExchangeSubphase.CLEANUP_REAP)
+                for _attempt in range(2):
+                    try:
+                        reaped_return_code = _reap_known_supervisor(
+                            process,
+                            deadline_monotonic=cleanup_deadline,
+                        )
+                    except ValueError as exc:
+                        record_value_error(exc)
+                        continue
+                    except FormalSmokeCleanupError as exc:
+                        if cleanup_error is None:
+                            cleanup_error = exc
+                    break
+                else:
+                    if cleanup_error is None:
+                        cleanup_error = FormalSmokeCleanupError(
+                            "formal smoke supervisor reap contract failed"
+                        )
+
+            if (
+                cleanup_error is None
+                and observed_return_code is not None
+                and reaped_return_code != observed_return_code
+            ):
+                cleanup_error = FormalSmokeCleanupError(
+                    "formal smoke supervisor changed status while being reaped"
+                )
     finally:
         for close_descriptor in (process.close_lifetime, process.close_status):
             try:
                 close_descriptor()
             except OSError:
                 pass
-            except ValueError:
-                if progress is not None:
-                    progress.subphase = (
-                        _FormalSmokeExchangeSubphase.CLEANUP_CLOSE_DESCRIPTORS
-                    )
-                raise
+            except ValueError as exc:
+                set_subphase(_FormalSmokeExchangeSubphase.CLEANUP_CLOSE_DESCRIPTORS)
+                record_value_error(exc)
+
+    final_error = cleanup_error or cleanup_diagnostic_error
+    if final_error is not None:
+        if cleanup_diagnostic is not None:
+            raise final_error from cleanup_diagnostic
+        raise final_error
 
 
 def _spawn_formal_smoke_child(
@@ -706,9 +765,7 @@ def _exchange_formal_smoke_child_impl(
                                 "formal smoke request pipe closed"
                             ) from exc
                         if written <= 0:
-                            raise FormalSmokeExecutionError(
-                                "formal smoke request write failed"
-                            )
+                            raise FormalSmokeExecutionError("formal smoke request write failed")
                         request_view = request_view[written:]
                         if not request_view:
                             progress.subphase = _FormalSmokeExchangeSubphase.UNREGISTER_REQUEST
@@ -794,10 +851,11 @@ def _exchange_formal_smoke_child_impl(
                             os.close(descriptor)
     except BaseException as exc:
         failure_subphase = progress.subphase
+        redacted_failure = progress.redacted_error(exc)
         try:
             _cleanup_formal_smoke_supervisor(process, progress=progress)
         except FormalSmokeCleanupError as cleanup_exc:
-            raise cleanup_exc from exc
+            raise cleanup_exc from redacted_failure
         progress.subphase = failure_subphase
         raise
     _cleanup_formal_smoke_supervisor(process, progress=progress)
@@ -1351,8 +1409,7 @@ def _run_attested_formal_smoke(
     ) as exc:
         reason = _formal_smoke_failure_reason(exc)
         raise FormalSmokeExecutionError(
-            "formal smoke attested execution failed "
-            f"(phase={phase.value} reason={reason})"
+            f"formal smoke attested execution failed (phase={phase.value} reason={reason})"
         ) from None
     finally:
         if session is not None:
