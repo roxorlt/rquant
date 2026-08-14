@@ -275,6 +275,10 @@ class _TestTransport:
             saga_id=request.saga_id,
             phase=request.phase,
         )
+        if request.operation_id != effect_operation_id:
+            raise SourceBrokerTransportError(
+                "source operation id is not the deterministic saga phase effect id"
+            )
         with self._lock:
             self.claim_once_calls += 1
             if self.claim_once_unavailable:
@@ -752,6 +756,31 @@ def _signed_source_claim(
     return unsigned.model_copy(update={"signature": security.sign(unsigned.signing_bytes())})
 
 
+def _signed_source_replay(
+    request: SourceBrokerV2ReplayRequest,
+    security: _SourceAuthorityTestSecurity,
+    *,
+    status: SourceBrokerV2ReplayStatus,
+    result: bytes | None = None,
+) -> SourceBrokerV2ReplayResponse:
+    unsigned = SourceBrokerV2ReplayResponse(
+        saga_id=request.saga_id,
+        operation_id=request.operation_id,
+        phase=request.phase,
+        request_hash=request.request_hash,
+        challenge=request.challenge,
+        status=status,
+        result=result,
+        result_hash=(
+            None if result is None else canonical_sha256(strict_canonical_json_loads(result))
+        ),
+        authority_id=security.authority_id,
+        key_id=security.key_id,
+        signature=base64.b64encode(b"0" * 64).decode("ascii"),
+    )
+    return unsigned.model_copy(update={"signature": security.sign(unsigned.signing_bytes())})
+
+
 def _request(tmp_path: Path, *, saga_id: str = "saga-a") -> tuple[object, object, object]:
     authorities: Authorities = create_test_authorities(tmp_path)
     claim = _claim(authorities)
@@ -798,6 +827,10 @@ def test_v2_closed_source_claim_once_contract_is_fenced_and_signed() -> None:
 
     assert response.status is SourceBrokerV2ClaimStatus.DEFINITIVELY_ABSENT
     assert len(response.receipt_hash) == 64
+
+    nondeterministic = request.model_copy(update={"operation_id": "f" * 64})
+    with pytest.raises(SourceBrokerTransportError, match="deterministic"):
+        _TestTransport().claim_once(canonical_model_json_bytes(nondeterministic))
 
 
 @pytest.mark.parametrize(
@@ -2169,6 +2202,7 @@ def test_v2_saga_persists_source_window_grant_and_terminal_observation(
 
 def test_v2_saga_rejects_tampered_historical_source_authority_receipt(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     request, current, quota = _request(tmp_path)
     path = tmp_path / "saga.sqlite3"
@@ -2209,9 +2243,79 @@ def test_v2_saga_rejects_tampered_historical_source_authority_receipt(
     with pytest.raises(SourceBrokerV2SagaIntegrityError, match="source receipt history"):
         restarted.advance(request, now=NOW + timedelta(seconds=2))
 
+    replay_root = tmp_path / "replay-forgery"
+    replay_root.mkdir()
+    replay_request, replay_current, replay_quota = _request(
+        replay_root,
+        saga_id="saga-replay-forgery",
+    )
+    replay_transport = _TestTransport()
+    replay_lineage = _TestLineageAuthority()
+    SourceBrokerV2Saga.for_nonproduction(
+        replay_root / "authority-seed.sqlite3",
+        saga_id="saga-replay-forgery",
+        current_claim_authority=replay_current,
+        quota_adapter=replay_quota,
+        transport=replay_transport,
+        lineage_authority=replay_lineage,
+    ).advance(replay_request, now=NOW + timedelta(seconds=1))
+    original_replay = replay_transport.replay
+    security = replay_transport._security
+    mutations: tuple[tuple[str, dict[str, object], bool], ...] = (
+        (
+            "signature",
+            {"signature": base64.b64encode(b"x" * 64).decode("ascii")},
+            False,
+        ),
+        ("challenge", {"challenge": "a" * 64}, True),
+        ("request-hash", {"request_hash": "b" * 64}, True),
+        ("result-hash", {"result_hash": "c" * 64}, True),
+        ("binding", {"operation_id": "d" * 64}, True),
+    )
+
+    for label, updates, resign in mutations:
+        case_root = replay_root / label
+        case_root.mkdir()
+
+        def forged_replay(
+            payload: bytes,
+            *,
+            deadline: float | None = None,
+            updates: dict[str, object] = updates,
+            resign: bool = resign,
+        ) -> bytes:
+            valid = SourceBrokerV2ReplayResponse.model_validate_json(
+                original_replay(payload, deadline=deadline)
+            )
+            forged = valid.model_copy(update=updates)
+            if resign:
+                forged = forged.model_copy(
+                    update={"signature": security.sign(forged.signing_bytes())}
+                )
+            return canonical_model_json_bytes(forged)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(replay_transport, "replay", forged_replay)
+            forged_saga = SourceBrokerV2Saga.for_nonproduction(
+                case_root / "saga.sqlite3",
+                saga_id="saga-replay-forgery",
+                current_claim_authority=replay_current,
+                quota_adapter=replay_quota,
+                transport=replay_transport,
+                lineage_authority=replay_lineage,
+            )
+            with pytest.raises(SourceBrokerV2SagaIntegrityError):
+                forged_saga.advance(
+                    replay_request,
+                    now=NOW + timedelta(seconds=2),
+                )
+        assert replay_transport.dispatch_calls == 1
+        assert replay_transport.finalize_calls == 1
+
 
 def test_v2_saga_lookup_unavailable_never_dispatches_and_requires_reconcile(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     request, current, quota = _request(tmp_path)
     transport = _TestTransport(claim_once_unavailable=True)
@@ -2232,6 +2336,57 @@ def test_v2_saga_lookup_unavailable_never_dispatches_and_requires_reconcile(
     recovered = saga.reconcile(request, now=NOW + timedelta(seconds=2))
     assert recovered.state is SourceBrokerV2SagaState.COMPLETE
     assert transport.dispatch_calls == 1
+
+    unknown_root = tmp_path / "signed-unknown"
+    unknown_root.mkdir()
+    unknown_request, unknown_current, unknown_quota = _request(
+        unknown_root,
+        saga_id="saga-signed-unknown",
+    )
+    unknown_transport = _TestTransport()
+    unknown_replay_calls = 0
+
+    def signed_unknown_replay(
+        payload: bytes,
+        *,
+        deadline: float | None = None,
+    ) -> bytes:
+        nonlocal unknown_replay_calls
+        del deadline
+        unknown_replay_calls += 1
+        replay_request = SourceBrokerV2ReplayRequest.model_validate_json(payload)
+        return canonical_model_json_bytes(
+            _signed_source_replay(
+                replay_request,
+                unknown_transport._security,
+                status=SourceBrokerV2ReplayStatus.UNKNOWN,
+            )
+        )
+
+    monkeypatch.setattr(unknown_transport, "replay", signed_unknown_replay)
+    unknown_saga = SourceBrokerV2Saga.for_nonproduction(
+        unknown_root / "saga.sqlite3",
+        saga_id="saga-signed-unknown",
+        current_claim_authority=unknown_current,
+        quota_adapter=unknown_quota,
+        transport=unknown_transport,
+        lineage_authority=_TestLineageAuthority(),
+    )
+
+    first_unknown = unknown_saga.advance(
+        unknown_request,
+        now=NOW + timedelta(seconds=1),
+    )
+    second_unknown = unknown_saga.reconcile(
+        unknown_request,
+        now=NOW + timedelta(seconds=2),
+    )
+
+    assert first_unknown.state is SourceBrokerV2SagaState.RECONCILE_REQUIRED
+    assert second_unknown.state is SourceBrokerV2SagaState.RECONCILE_REQUIRED
+    assert unknown_replay_calls == 2
+    assert unknown_transport.claim_once_calls == 0
+    assert unknown_transport.dispatch_calls == 0
 
 
 def test_v2_saga_takeover_waits_for_persisted_source_cooldown(
