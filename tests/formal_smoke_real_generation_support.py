@@ -1035,7 +1035,7 @@ def write_redacted_exact_facts_if_requested(
         generation_id=generation.code_trust_evidence.generation_id,
         content_root_sha256=generation.code_trust_evidence.content_root_sha256,
         receipt_digest=receipt_digest,
-        artifact_digests=RedactedArtifactDigests.model_validate(artifact_digests),
+        artifact_digests=artifact_digests,
     )
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:

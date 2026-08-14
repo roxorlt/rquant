@@ -356,11 +356,50 @@ def _canonical_facts(**updates: object) -> bytes:
     return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
 
 
-def test_real_generation_facts_accept_exact_artifact_digest_contract() -> None:
-    from rquant.strict_json import strict_model_validate_canonical_json
-    from tests.formal_smoke_real_generation_support import RedactedExactFacts
+def test_real_generation_facts_accept_exact_artifact_digest_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
 
-    facts = strict_model_validate_canonical_json(RedactedExactFacts, _canonical_facts())
+    from rquant.strict_json import strict_model_validate_canonical_json
+    from tests.formal_smoke_real_generation_support import (
+        RedactedExactFacts,
+        verify_ci_evidence,
+        write_redacted_exact_facts_if_requested,
+    )
+
+    facts_path = tmp_path / "facts.json"
+    monkeypatch.setenv("RQUANT_FORMAL_SMOKE_EXACT_FACTS_PATH", str(facts_path))
+    generation = SimpleNamespace(
+        code_trust_evidence=SimpleNamespace(
+            generation_id="a" * 64,
+            content_root_sha256="b" * 64,
+        )
+    )
+    receipt = SimpleNamespace(
+        artifacts=(
+            SimpleNamespace(kind="json", sha256="d" * 64),
+            SimpleNamespace(kind="markdown", sha256="e" * 64),
+        )
+    )
+    write_redacted_exact_facts_if_requested(
+        generation=generation,
+        receipt=receipt,
+        receipt_digest="c" * 64,
+    )
+
+    report = tmp_path / "junit.xml"
+    _write_exact_junit(report)
+    verify_ci_evidence(
+        junit=report,
+        facts_path=facts_path,
+        expected_python=f"{sys.version_info.major}.{sys.version_info.minor}",
+    )
+
+    payload = json.loads(facts_path.read_text(encoding="utf-8"))
+    assert set(payload["artifact_digests"]) == {"json", "markdown"}
+    facts = strict_model_validate_canonical_json(RedactedExactFacts, facts_path.read_bytes())
 
     assert facts.artifact_digests.json_sha256 == "d" * 64
     assert facts.artifact_digests.markdown_sha256 == "e" * 64
