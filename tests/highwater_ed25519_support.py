@@ -2,14 +2,24 @@
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 from rquant.strict_json import canonical_json_bytes
 
 ROOT = Path(__file__).resolve().parents[1]
 HELPER = ROOT / "deploy" / "libexec" / "rquant-lab-highwater-authority"
+
+
+def resolve_openssl() -> str:
+    executable = shutil.which("openssl")
+    if executable is None:
+        pytest.skip("openssl is required for Ed25519 test fixtures")
+    return executable
 
 
 def generate_key_pair(root: Path, key_id: str) -> tuple[Path, bytes]:
@@ -18,7 +28,7 @@ def generate_key_pair(root: Path, key_id: str) -> tuple[Path, bytes]:
     public_key = root / f"{key_id}.public.pem"
     subprocess.run(
         [
-            "/opt/homebrew/bin/openssl",
+            resolve_openssl(),
             "genpkey",
             "-algorithm",
             "ED25519",
@@ -31,7 +41,7 @@ def generate_key_pair(root: Path, key_id: str) -> tuple[Path, bytes]:
     private_key.chmod(0o600)
     subprocess.run(
         [
-            "/opt/homebrew/bin/openssl",
+            resolve_openssl(),
             "pkey",
             "-in",
             str(private_key),

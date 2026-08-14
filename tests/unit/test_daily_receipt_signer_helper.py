@@ -16,6 +16,7 @@ import pytest
 
 from rquant.runtime_shadow_validation import _verify_ed25519_signature
 from rquant.strict_json import canonical_json_bytes
+from tests.highwater_ed25519_support import resolve_openssl
 
 ROOT = Path(__file__).resolve().parents[2]
 HELPER = ROOT / "deploy/libexec/rquant-daily-receipt-signer"
@@ -26,9 +27,7 @@ GENESIS_MANIFEST_HASH = "0" * 64
 
 
 def _openssl() -> str:
-    if Path("/opt/homebrew/bin/openssl").exists():
-        return "/opt/homebrew/bin/openssl"
-    return "/usr/bin/openssl"
+    return resolve_openssl()
 
 
 def _generate_private_key(root: Path, *, key_id: str) -> Path:

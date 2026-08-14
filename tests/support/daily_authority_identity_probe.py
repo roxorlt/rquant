@@ -8,9 +8,16 @@ import base64
 import json
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from tests.highwater_ed25519_support import resolve_openssl  # noqa: E402
 
 
 def canonical(value: object) -> bytes:
@@ -48,11 +55,7 @@ def recv_exact(connection: socket.socket, size: int) -> bytes:
 
 
 def sign(private_key: Path, payload: bytes) -> bytes:
-    openssl = (
-        "/opt/homebrew/bin/openssl"
-        if Path("/opt/homebrew/bin/openssl").exists()
-        else "/usr/bin/openssl"
-    )
+    openssl = resolve_openssl()
     with tempfile.TemporaryDirectory(prefix="rquant-identity-probe-", dir="/tmp") as raw:
         root = Path(raw)
         root.chmod(0o700)

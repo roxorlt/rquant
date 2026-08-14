@@ -15,20 +15,21 @@ from rquant.config import settings
 from rquant.lab_daemon import LabDaemonConfigurationError
 from rquant.lab_highwater_authority import PRODUCTION_LAB_HIGHWATER_COMMAND
 from rquant.strict_json import canonical_json_bytes
+from tests.highwater_ed25519_support import resolve_openssl
 
 
 def _trusted_keyring(path: Path) -> Path:
     private_key = path.with_suffix(".private.pem")
     public_key = path.with_suffix(".public.pem")
     subprocess.run(
-        ["/opt/homebrew/bin/openssl", "genpkey", "-algorithm", "ED25519", "-out", str(private_key)],
+        [resolve_openssl(), "genpkey", "-algorithm", "ED25519", "-out", str(private_key)],
         check=True,
         capture_output=True,
     )
     os.chmod(private_key, 0o600)
     subprocess.run(
         [
-            "/opt/homebrew/bin/openssl",
+            resolve_openssl(),
             "pkey",
             "-in",
             str(private_key),
@@ -53,7 +54,7 @@ def _trusted_keyring(path: Path) -> Path:
     os.chmod(message, 0o600)
     signed = subprocess.run(
         [
-            "/opt/homebrew/bin/openssl",
+            resolve_openssl(),
             "pkeyutl",
             "-sign",
             "-rawin",

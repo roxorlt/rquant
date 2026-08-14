@@ -25,6 +25,8 @@ from rquant.lab_highwater_authority import (
     load_highwater_trusted_keys,
 )
 from rquant.strict_json import canonical_json_bytes
+from tests import highwater_ed25519_support
+from tests.highwater_ed25519_support import resolve_openssl
 
 ROOT = Path(__file__).resolve().parents[2]
 HELPER = ROOT / "deploy" / "libexec" / "rquant-lab-highwater-authority"
@@ -42,7 +44,7 @@ def _key_pair(root: Path, key_id: str) -> tuple[Path, bytes]:
             return private_key, public_key.read_bytes()
         subprocess.run(
             [
-                "/opt/homebrew/bin/openssl",
+                resolve_openssl(),
                 "genpkey",
                 "-algorithm",
                 "ED25519",
@@ -55,7 +57,7 @@ def _key_pair(root: Path, key_id: str) -> tuple[Path, bytes]:
         os.chmod(private_key, 0o600)
         subprocess.run(
             [
-                "/opt/homebrew/bin/openssl",
+                resolve_openssl(),
                 "pkey",
                 "-in",
                 str(private_key),
@@ -79,7 +81,7 @@ def _sign(private_key: Path, payload: bytes) -> str:
     message.chmod(0o600)
     result = subprocess.run(
         [
-            "/opt/homebrew/bin/openssl",
+            resolve_openssl(),
             "pkeyutl",
             "-sign",
             "-rawin",
@@ -580,7 +582,22 @@ def test_killed_authority_process_fails_closed(tmp_path: Path) -> None:
         _observe(client)
 
 
-def test_missing_helper_fails_closed(tmp_path: Path) -> None:
+def test_missing_helper_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with monkeypatch.context() as resolver_patch:
+        resolver_patch.setattr(highwater_ed25519_support.shutil, "which", lambda _name: None)
+        resolver_patch.setattr(
+            highwater_ed25519_support.pytest,
+            "skip",
+            lambda reason: (_ for _ in ()).throw(RuntimeError(reason)),
+        )
+        with pytest.raises(RuntimeError) as skipped:
+            highwater_ed25519_support.resolve_openssl()
+        assert "openssl" in str(skipped.value)
+        assert "missing-openssl-value" not in str(skipped.value)
+
     client = _client(tmp_path, command=(str(tmp_path / "missing-helper"),))
     with pytest.raises(LabHighWaterDegradedError, match="unavailable|failed"):
         _observe(client)

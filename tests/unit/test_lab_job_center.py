@@ -77,6 +77,7 @@ from rquant.strategy_job_adapters import (
     NShapeCompareParameters,
     build_adapter_execution_contract,
 )
+from tests.highwater_ed25519_support import resolve_openssl
 
 from .test_lab_finalizer import _ready_scenario
 from .test_lab_jobs import (
@@ -1188,7 +1189,7 @@ def _highwater_key_pair(root: Path, key_id: str) -> tuple[Path, bytes]:
     if not private_key.exists():
         subprocess.run(
             [
-                "/opt/homebrew/bin/openssl",
+                resolve_openssl(),
                 "genpkey",
                 "-algorithm",
                 "ED25519",
@@ -1201,7 +1202,7 @@ def _highwater_key_pair(root: Path, key_id: str) -> tuple[Path, bytes]:
         private_key.chmod(0o600)
         subprocess.run(
             [
-                "/opt/homebrew/bin/openssl",
+                resolve_openssl(),
                 "pkey",
                 "-in",
                 str(private_key),

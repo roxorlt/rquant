@@ -74,6 +74,7 @@ from rquant.runtime_service_builtin import (
 from rquant.runtime_service_entrypoint import RuntimeServiceKind
 from rquant.signal_route_spool import SignalRouteSpool
 from rquant.strict_json import canonical_json_bytes, canonical_model_json_bytes
+from tests.highwater_ed25519_support import resolve_openssl
 
 COMMIT = "a" * 40
 STRATEGY_IDS = ("auction_gap", "growth_board_surge", "n_shape")
@@ -309,9 +310,7 @@ def _by_kind(inputs: ProductionRuntimeProfileInputs):
 
 
 def _openssl() -> str:
-    if Path("/opt/homebrew/bin/openssl").exists():
-        return "/opt/homebrew/bin/openssl"
-    return "/usr/bin/openssl"
+    return resolve_openssl()
 
 
 def _daily_private_key(root: Path, *, key_id: str) -> tuple[Path, str]:

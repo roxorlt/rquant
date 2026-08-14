@@ -27,17 +27,11 @@ from rquant.runtime_shadow_validation import (  # noqa: E402
     _verify_ed25519_signature,
 )
 from rquant.strict_json import canonical_json_bytes, strict_json_loads  # noqa: E402
+from tests.highwater_ed25519_support import resolve_openssl
 
 
 def _openssl() -> str:
-    executable = (
-        "/opt/homebrew/bin/openssl"
-        if Path("/opt/homebrew/bin/openssl").exists()
-        else "/usr/bin/openssl"
-    )
-    if not Path(executable).exists():
-        pytest.skip("openssl is required for Daily socket authority tests")
-    return executable
+    return resolve_openssl()
 
 
 def _private_key(root: Path, *, key_id: str) -> tuple[Path, str]:
