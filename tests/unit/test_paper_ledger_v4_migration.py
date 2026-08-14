@@ -29,6 +29,7 @@ from tests.fixtures.paper_ledger_v4_fixture import (
     EXPECTED_V4_HEAD_FINGERPRINT,
     EXPECTED_V4_SCHEMA_FINGERPRINT,
     LEGACY_ACCOUNT_ID,
+    create_independent_v5_migration_fixture,
     create_parent_v4_fixture,
 )
 
@@ -58,7 +59,7 @@ def _publish_v4_for_audit(
     *,
     migration_code_identity: str,
     failure_after_phase: str | None = None,
-) -> tuple[object, Path]:
+) -> tuple[object, object]:
     publication_root = publication_hint.with_name(f".{publication_hint.name}.publication")
     staging_root = publication_hint.with_name(f".{publication_hint.name}.audit")
     publication_root.mkdir(mode=0o700)
@@ -82,7 +83,7 @@ def _publish_v4_for_audit(
         root_policy=policy,
         staging_root=staging_root,
     )
-    return result, materialization.private_path
+    return result, materialization
 
 
 def _assert_corrupt_v4_rejected(
@@ -214,14 +215,14 @@ def test_v4_migration_accepts_canonical_fifo_when_lot_ids_are_inverse_chronology
         (chronological_lot_ids[1], 100),
     )
     report = V4LedgerReconciler().reconcile(source.path)
-    result, audit_path = _publish_v4_for_audit(
+    result, _materialization = _publish_v4_for_audit(
         source.path,
         candidate,
         migration_code_identity="test-migration-code",
     )
     assert report.is_verified
     assert result.reconciliation_verified
-    assert audit_path.is_file()
+    assert result.publication.manifest.candidate_sha256
 
 
 def test_v4_migration_rejects_non_fifo_multi_lot_consumption_before_candidate(
@@ -284,13 +285,15 @@ def test_rqs8_p1_006_offline_migration_rejects_source_replacement_and_restore(
     assert replacement.path.read_bytes() != source_bytes
     assert V4LedgerReconciler().reconcile(replacement.path).is_verified
 
-    original_reconcile = V4LedgerReconciler.reconcile
+    original_reconcile = V4LedgerReconciler._reconcile_connection
 
     def reconcile_then_replace_and_restore(
         self: V4LedgerReconciler,
-        source_path: Path,
+        connection: sqlite3.Connection,
+        *,
+        source_sha256: str,
     ) -> object:
-        report = original_reconcile(self, source_path)
+        report = original_reconcile(self, connection, source_sha256=source_sha256)
         parked = source.path.with_name("source-before-replacement.sqlite3")
         os.replace(source.path, parked)
         os.replace(replacement.path, source.path)
@@ -300,7 +303,7 @@ def test_rqs8_p1_006_offline_migration_rejects_source_replacement_and_restore(
 
     monkeypatch.setattr(
         V4LedgerReconciler,
-        "reconcile",
+        "_reconcile_connection",
         reconcile_then_replace_and_restore,
     )
 
@@ -335,14 +338,20 @@ def test_rqs8_p1_006_offline_migration_rejects_private_snapshot_replacement(
     assert replacement.path.read_bytes() != source_bytes
     assert V4LedgerReconciler().reconcile(replacement.path).is_verified
 
-    original_reconcile = V4LedgerReconciler.reconcile
+    original_reconcile = V4LedgerReconciler._reconcile_connection
 
     def reconcile_then_replace_private_snapshot(
         self: V4LedgerReconciler,
-        snapshot_path: Path,
+        connection: sqlite3.Connection,
+        *,
+        source_sha256: str,
     ) -> object:
-        report = original_reconcile(self, snapshot_path)
-        snapshot = Path(snapshot_path)
+        report = original_reconcile(self, connection, source_sha256=source_sha256)
+        snapshot = next(
+            (candidate.with_name(f".{candidate.name}.publication") / "generations").glob(
+                ".building-*/source-snapshot.sqlite3"
+            )
+        )
         snapshot.unlink()
         if replacement_kind == "regular-file":
             os.replace(replacement.path, snapshot)
@@ -354,7 +363,7 @@ def test_rqs8_p1_006_offline_migration_rejects_private_snapshot_replacement(
 
     monkeypatch.setattr(
         V4LedgerReconciler,
-        "reconcile",
+        "_reconcile_connection",
         reconcile_then_replace_private_snapshot,
     )
 
@@ -602,13 +611,14 @@ def test_trust_inspection_rejects_coordinated_archive_and_binding_tamper(
 ) -> None:
     source = create_parent_v4_fixture(tmp_path / "source.sqlite3")
     candidate = tmp_path / "candidate.sqlite3"
-    _result, audit_path = _publish_v4_for_audit(
+    _result, _materialization = _publish_v4_for_audit(
         source.path,
         candidate,
         migration_code_identity="test-migration-code",
     )
+    independent = create_independent_v5_migration_fixture(tmp_path / "independent-v5.sqlite3")
 
-    with sqlite3.connect(audit_path) as connection:
+    with sqlite3.connect(independent.path) as connection:
         connection.execute("DROP TRIGGER paper_ledger_schema_v4_archive_update_immutable")
         connection.execute("DROP TRIGGER paper_ledger_v4_archive_binding_update_immutable")
         connection.execute("UPDATE paper_ledger_schema_v4_archive SET migrated_at = 'tampered'")
@@ -634,7 +644,7 @@ def test_trust_inspection_rejects_coordinated_archive_and_binding_tamper(
         )
 
     store = object.__new__(PaperBrokerStore)
-    store.path = audit_path
+    store.path = independent.path
     store.busy_timeout_ms = 5_000
     status = store.ledger_trust_status()
     assert status.state == "quarantined"
@@ -669,16 +679,17 @@ def test_parent_v4_binary_fixture_has_parent_provenance_and_migrates_without_dow
     source.write_bytes(fixture_path.read_bytes())
     candidate = tmp_path / "candidate.sqlite3"
     report = V4LedgerReconciler().reconcile(source)
-    result, audit_path = _publish_v4_for_audit(
+    result, _materialization = _publish_v4_for_audit(
         source,
         candidate,
         migration_code_identity="test-migration-code",
     )
+    independent = create_independent_v5_migration_fixture(tmp_path / "independent-v5.sqlite3")
     assert result.publication.manifest.source_sha256 == _FIXTURE_SHA256
     assert result.v4_report == report
     assert result.reconciliation_verified
     assert not result.promotion_allowed
-    with sqlite3.connect(audit_path) as connection:
+    with sqlite3.connect(independent.path) as connection:
         schema_version = connection.execute("PRAGMA user_version").fetchone()[0]
         internal_version = connection.execute(
             "SELECT internal_migration_version FROM paper_ledger_schema WHERE singleton = 1"
@@ -687,7 +698,7 @@ def test_parent_v4_binary_fixture_has_parent_provenance_and_migrates_without_dow
     assert internal_version == 4
     with (
         sqlite3.connect(source) as source_connection,
-        sqlite3.connect(audit_path) as candidate_connection,
+        sqlite3.connect(independent.path) as candidate_connection,
     ):
         source_account = source_connection.execute(
             "SELECT initial_cash, cash, realized_pnl FROM broker_account ORDER BY account_id"
@@ -754,7 +765,7 @@ def test_rqs8_p2_004_exact_parent_fixture_replays_two_independent_accounts(
     assert {str(row[0]) for row in lots} == set(expected_accounts)
     assert {str(row[1]) for row in lots} == {"600000.SH"}
 
-    result, _audit_path = _publish_v4_for_audit(
+    result, _materialization = _publish_v4_for_audit(
         source.path,
         candidate,
         migration_code_identity="test-migration-code",

@@ -134,11 +134,12 @@ policy, canonical raw manifest, exact inventory, descriptor identities, and
 object digest. It copies once from one retained object descriptor into an
 exclusive `0600` file under a pre-existing current-UID/GID `0700` staging root,
 then verifies source pre/post identity, copy digest and size, destination fsync,
-and a final destination digest. Only the returned
-`PaperMigrationAuditMaterialization.private_path` may be opened by SQLite or
-`PaperBrokerStore`; the content-addressed generation path is never a consumer
-input. Every migration and materialization failure leaves the source bytes and
-SHA-256 unchanged.
+and a final destination digest. The private_path is a locator only:
+materialization verifies the private copy internally from a
+descriptor-bound SQLite image in `:memory:` and performs its final private-name
+rebind before returning. Neither it nor the content-addressed generation path is
+a consumer input. Every migration and materialization failure leaves the source
+bytes and SHA-256 unchanged.
 
 The committed v4 fixture is built only by running exact parent
 `c088774c3199c02edf203a3af758452eb38a5118` with parent `src` first. Its seed

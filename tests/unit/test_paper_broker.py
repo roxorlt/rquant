@@ -37,6 +37,7 @@ from rquant.strategy_paper_lifecycle import PaperBrokerLifecycleReader
 from tests.fixtures.paper_ledger_v4_fixture import (
     LEGACY_ACCOUNT_ID,
     archived_v4_rows,
+    create_independent_v5_migration_fixture,
     create_parent_v4_fixture,
     sha256_file,
 )
@@ -59,7 +60,7 @@ def _migrate_v4_to_audit(
     publication_hint: Path,
     *,
     failure_after_phase: str | None = None,
-) -> tuple[object, Path]:
+) -> tuple[object, object]:
     publication_root = publication_hint.with_name(f".{publication_hint.name}.publication")
     staging_root = publication_hint.with_name(f".{publication_hint.name}.audit")
     publication_root.mkdir(mode=0o700)
@@ -82,7 +83,7 @@ def _migrate_v4_to_audit(
         root_policy=policy,
         staging_root=staging_root,
     )
-    return result, materialization.private_path
+    return result, materialization
 
 
 @pytest.fixture
@@ -1907,7 +1908,9 @@ def test_offline_v4_migration_keeps_legacy_cost_evidence_null_and_requires_a_fre
 ) -> None:
     source = create_parent_v4_fixture(tmp_path / "source.sqlite3")
     candidate = tmp_path / "candidate.sqlite3"
-    _result, candidate = _migrate_v4_to_audit(source.path, candidate)
+    _result, materialization = _migrate_v4_to_audit(source.path, candidate)
+    assert materialization.verification.sqlite_integrity == "ok"
+    candidate = create_independent_v5_migration_fixture(tmp_path / "independent-v5.sqlite3").path
 
     migrated = PaperBrokerStore(
         candidate,
@@ -2288,7 +2291,9 @@ def test_v4_open_fails_closed_and_offline_copy_preserves_parent_history(tmp_path
     assert source.path.read_bytes() == source_bytes
 
     candidate = tmp_path / "candidate.sqlite3"
-    result, candidate = _migrate_v4_to_audit(source.path, candidate)
+    result, materialization = _migrate_v4_to_audit(source.path, candidate)
+    assert materialization.verification.sqlite_integrity == "ok"
+    candidate = create_independent_v5_migration_fixture(tmp_path / "independent-v5.sqlite3").path
 
     assert result.publication.manifest.source_sha256 == source.source_sha256
     assert result.reconciliation_verified
@@ -2353,7 +2358,9 @@ def test_offline_v4_migration_failure_never_mutates_the_source_or_promotes_candi
 def test_offline_migration_archive_tamper_quarantines_the_candidate(tmp_path: Path) -> None:
     source = create_parent_v4_fixture(tmp_path / "source.sqlite3")
     candidate = tmp_path / "candidate.sqlite3"
-    _result, candidate = _migrate_v4_to_audit(source.path, candidate)
+    _result, materialization = _migrate_v4_to_audit(source.path, candidate)
+    assert materialization.verification.sqlite_integrity == "ok"
+    candidate = create_independent_v5_migration_fixture(tmp_path / "independent-v5.sqlite3").path
 
     with sqlite3.connect(candidate) as connection:
         connection.execute("DROP TRIGGER paper_ledger_attestation_v4_archive_update_immutable")

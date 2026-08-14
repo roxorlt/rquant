@@ -6,7 +6,6 @@ import hashlib
 import json
 import os
 import secrets
-import sqlite3
 import stat
 import sys
 from collections.abc import Callable
@@ -14,8 +13,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, TypeAlias
 
-from pydantic import Field, computed_field, field_validator, model_validator
+from pydantic import ConfigDict, Field, computed_field, field_validator, model_validator
 
+from rquant._paper_sqlite_image import (
+    _capture_stable_sqlite_image,
+    _open_memory_sqlite_image,
+    _revalidate_stable_sqlite_image,
+    _StableSQLiteImageBinding,
+)
 from rquant.paper_contracts import Sha256
 from rquant.paper_ledger_v4 import V4LedgerReconciliationReport
 from rquant.private_fs import rename_noreplace_at, rename_noreplace_capability
@@ -39,6 +44,7 @@ PaperMigrationFaultPoint: TypeAlias = Literal[
     "after_sqlite_connections_closed",
     "after_publication_object_first_hash",
     "after_object_noreplace_rename",
+    "after_object_rebind_before_metadata",
     "after_manifest_fsync",
     "before_generation_noreplace_rename",
     "after_generation_rename_before_parent_fsync",
@@ -48,6 +54,7 @@ PaperMigrationFaultPoint: TypeAlias = Literal[
     "before_local_failure_disposition",
     "after_materialization_first_object_hash",
     "during_materialization_copy",
+    "after_private_memory_verification_before_final_rebind",
 ]
 
 MIGRATION_FAULT_POINTS = (
@@ -63,6 +70,7 @@ MIGRATION_FAULT_POINTS = (
     "after_sqlite_connections_closed",
     "after_publication_object_first_hash",
     "after_object_noreplace_rename",
+    "after_object_rebind_before_metadata",
     "after_manifest_fsync",
     "before_generation_noreplace_rename",
     "after_generation_rename_before_parent_fsync",
@@ -80,6 +88,7 @@ RECOVERY_FAULT_POINTS = (
 MATERIALIZATION_FAULT_POINTS = (
     "after_materialization_first_object_hash",
     "during_materialization_copy",
+    "after_private_memory_verification_before_final_rebind",
     "before_local_failure_disposition",
 )
 
@@ -114,6 +123,23 @@ class PublicationFileIdentity(RuntimeContractModel):
     mtime_ns: int = Field(ge=0)
     ctime_ns: int = Field(ge=0)
     file_type: Literal["regular"] = "regular"
+
+
+class _PublicationFullDirectoryIdentityV2(RuntimeContractModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, revalidate_instances="always")
+    contract: Literal["rquant-paper-publication-directory-identity/v2"] = (
+        "rquant-paper-publication-directory-identity/v2"
+    )
+    device: int = Field(ge=0)
+    inode: int = Field(ge=1)
+    uid: int = Field(ge=0)
+    gid: int = Field(ge=0)
+    mode: int = Field(ge=0, le=0o7777)
+    nlink: int = Field(ge=1)
+    size: int = Field(ge=0)
+    mtime_ns: int = Field(ge=0)
+    ctime_ns: int = Field(ge=0)
+    file_type: Literal["directory"] = "directory"
 
 
 class PublicationRootPolicy(RuntimeContractModel):
@@ -319,8 +345,9 @@ class PaperMigrationOrphanState(RuntimeContractModel):
 
 
 class PaperMigrationPostCommitState(RuntimeContractModel):
-    contract: Literal["rquant-paper-migration-post-commit/v1"] = (
-        "rquant-paper-migration-post-commit/v1"
+    model_config = ConfigDict(extra="forbid", frozen=True, revalidate_instances="always")
+    contract: Literal["rquant-paper-migration-post-commit/v2"] = (
+        "rquant-paper-migration-post-commit/v2"
     )
     outcome: Literal["POST_COMMIT_INDETERMINATE"] = "POST_COMMIT_INDETERMINATE"
     publication_state: Literal["GENERATION_RENAMED_UNCONFIRMED"] = "GENERATION_RENAMED_UNCONFIRMED"
@@ -336,27 +363,132 @@ class PaperMigrationPostCommitState(RuntimeContractModel):
     ]
     policy_id: Sha256
     publication_nonce: str = Field(pattern=r"^[0-9a-f]{64}$")
+    building_name: str = Field(pattern=r"^\.building-[0-9a-f]{64}$")
     generation_name: str = Field(pattern=r"^generation-[0-9a-f]{64}$")
     object_name: str = Field(pattern=r"^ledger-[0-9a-f]{64}\.sqlite3$")
     candidate_sha256: Sha256
     expected_manifest_sha256: Sha256
+    building_identity_before_generation_rename: _PublicationFullDirectoryIdentityV2
+    building_identity: _PublicationFullDirectoryIdentityV2
+
+    @model_validator(mode="after")
+    def validate_names_and_transition(self) -> PaperMigrationPostCommitState:
+        if self.building_name != f".building-{self.publication_nonce}":
+            raise ValueError("building name does not match publication nonce")
+        if self.generation_name != f"generation-{self.publication_nonce}":
+            raise ValueError("generation name does not match publication nonce")
+        if self.object_name != f"ledger-{self.candidate_sha256}.sqlite3":
+            raise ValueError("object name does not match candidate digest")
+        before = self.building_identity_before_generation_rename
+        after = self.building_identity
+        if (before.device, before.inode, before.uid, before.gid, before.mode, before.file_type) != (
+            after.device,
+            after.inode,
+            after.uid,
+            after.gid,
+            after.mode,
+            after.file_type,
+        ):
+            raise ValueError("building identity stable fields changed across rename")
+        return self
+
+
+class _PaperMigrationAuditReceiptFactsV2(RuntimeContractModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, revalidate_instances="always")
+    contract: Literal["rquant-paper-migration-audit-receipt-facts/v2"] = (
+        "rquant-paper-migration-audit-receipt-facts/v2"
+    )
+    receipt_sha256: Sha256
+    manifest_sha256: Sha256
+    manifest_identity: PublicationFileIdentity
+    policy_id: Sha256
+    policy_profile: PublicationProfile
+    publication_nonce: str = Field(pattern=r"^[0-9a-f]{64}$")
+    generation_name: str = Field(pattern=r"^generation-[0-9a-f]{64}$")
+    object_name: str = Field(pattern=r"^ledger-[0-9a-f]{64}\.sqlite3$")
+    object_identity: PublicationFileIdentity
+    candidate_sha256: Sha256
+    source_sha256: Sha256
+    v4_reconciliation_report_digest: Sha256
+    migration_attestation_digest: Sha256
+    migration_code_identity: str = Field(min_length=1)
+    migration_algorithm_id: Literal["paper-ledger-v4-to-v5-archive-v2"]
+    target_schema_identity: str = Field(min_length=1)
+    target_schema_version: Literal[5] = 5
+    target_internal_migration_version: Literal[4] = 4
+
+    @model_validator(mode="after")
+    def validate_names(self) -> _PaperMigrationAuditReceiptFactsV2:
+        if self.generation_name != f"generation-{self.publication_nonce}":
+            raise ValueError("generation name does not match receipt nonce")
+        if self.object_name != f"ledger-{self.candidate_sha256}.sqlite3":
+            raise ValueError("object name does not match receipt digest")
+        return self
+
+
+class _PaperMigrationAuditVerificationEvidenceV2(_PaperMigrationAuditReceiptFactsV2):
+    contract: Literal["rquant-paper-migration-audit-verification/v2"] = (
+        "rquant-paper-migration-audit-verification/v2"
+    )
+    sqlite_integrity: Literal["ok"] = "ok"
 
 
 class PaperMigrationAuditMaterialization(RuntimeContractModel):
-    contract: Literal["rquant-paper-migration-audit-materialization/v1"] = (
-        "rquant-paper-migration-audit-materialization/v1"
+    model_config = ConfigDict(extra="forbid", frozen=True, revalidate_instances="always")
+    contract: Literal["rquant-paper-migration-audit-materialization/v2"] = (
+        "rquant-paper-migration-audit-materialization/v2"
     )
+    staging_root: Path
+    staging_root_identity: _PublicationFullDirectoryIdentityV2
+    private_name: str = Field(pattern=r"^paper-migration-audit-[0-9a-f]{64}-[0-9a-f]{64}\.sqlite3$")
+    private_nonce: str = Field(pattern=r"^[0-9a-f]{64}$")
     private_path: Path
+    receipt: _PaperMigrationAuditReceiptFactsV2
     receipt_sha256: Sha256
     source_sha256: Sha256
     materialized_sha256: Sha256
     materialized_size: int = Field(ge=0)
     private_identity: PublicationFileIdentity
+    verification: _PaperMigrationAuditVerificationEvidenceV2
 
-    @field_validator("private_path")
+    @field_validator("staging_root", "private_path")
     @classmethod
-    def validate_private_path(cls, value: Path) -> Path:
+    def validate_absolute_lexical_path(cls, value: Path) -> Path:
         return _absolute_lexical_path(value)
+
+    @model_validator(mode="after")
+    def validate_binding(self) -> PaperMigrationAuditMaterialization:
+        if self.staging_root == Path("/"):
+            raise ValueError("staging root cannot be filesystem root")
+        if "/" in self.private_name or "\\" in self.private_name or ".." in self.private_name:
+            raise ValueError("private name contains a forbidden component")
+        expected_name = (
+            f"paper-migration-audit-{self.receipt.publication_nonce}-{self.private_nonce}.sqlite3"
+        )
+        if self.private_name != expected_name:
+            raise ValueError("private name does not bind receipt and private nonces")
+        if (
+            self.private_path.parent != self.staging_root
+            or self.private_path.name != self.private_name
+        ):
+            raise ValueError("private path does not bind staging root and private name")
+        if self.materialized_size != self.private_identity.size:
+            raise ValueError("materialized size does not match private identity")
+        if self.private_identity.mode != 0o600:
+            raise ValueError("private identity mode is not 0600")
+        if self.staging_root_identity.mode != 0o700:
+            raise ValueError("staging root identity mode is not 0700")
+        if (
+            self.receipt_sha256 != self.receipt.receipt_sha256
+            or self.source_sha256 != self.receipt.source_sha256
+            or self.materialized_sha256 != self.receipt.candidate_sha256
+        ):
+            raise ValueError("top-level audit hashes do not match receipt facts")
+        if self.verification.model_dump(
+            mode="python", exclude={"contract", "sqlite_integrity"}
+        ) != (self.receipt.model_dump(mode="python", exclude={"contract"})):
+            raise ValueError("verification evidence does not exactly match receipt facts")
+        return self
 
 
 class PaperMigrationMaterializationOrphanState(RuntimeContractModel):
@@ -417,6 +549,8 @@ class _PaperMigrationPublicationContext:
     ready_fd: int
     building_path: Path
     ready_path: Path
+    building_identity_before_generation_rename: _PublicationFullDirectoryIdentityV2 | None = None
+    building_identity: _PublicationFullDirectoryIdentityV2 | None = None
 
     def close(self) -> None:
         os.close(self.ready_fd)
@@ -453,6 +587,22 @@ def _directory_identity(metadata: os.stat_result) -> PublicationStableDirectoryI
     )
 
 
+def _full_directory_identity(metadata: os.stat_result) -> _PublicationFullDirectoryIdentityV2:
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise ValueError("publication entry must be a directory")
+    return _PublicationFullDirectoryIdentityV2(
+        device=metadata.st_dev,
+        inode=metadata.st_ino,
+        uid=metadata.st_uid,
+        gid=metadata.st_gid,
+        mode=stat.S_IMODE(metadata.st_mode),
+        nlink=metadata.st_nlink,
+        size=metadata.st_size,
+        mtime_ns=metadata.st_mtime_ns,
+        ctime_ns=metadata.st_ctime_ns,
+    )
+
+
 def _file_identity(metadata: os.stat_result) -> PublicationFileIdentity:
     if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
         raise ValueError("publication entry must be a singly-linked regular file")
@@ -473,6 +623,35 @@ def _same_file_object(
     first: PublicationFileIdentity,
     second: PublicationFileIdentity,
 ) -> bool:
+    return (
+        first.device,
+        first.inode,
+        first.uid,
+        first.gid,
+        first.mode,
+        first.nlink,
+        first.size,
+        first.mtime_ns,
+        first.ctime_ns,
+    ) == (
+        second.device,
+        second.inode,
+        second.uid,
+        second.gid,
+        second.mode,
+        second.nlink,
+        second.size,
+        second.mtime_ns,
+        second.ctime_ns,
+    )
+
+
+def _same_file_object_except_rename_ctime(
+    first: PublicationFileIdentity,
+    second: PublicationFileIdentity,
+) -> bool:
+    """Compare a native no-replace rename handoff before the metadata transition."""
+
     return (
         first.device,
         first.inode,
@@ -557,6 +736,18 @@ def _preflight_platform_primitives() -> tuple[str, str]:
 
 def _validate_directory(
     identity: PublicationStableDirectoryIdentity,
+    *,
+    uid: int,
+    gid: int,
+    mode: int,
+    label: str,
+) -> None:
+    if (identity.uid, identity.gid, identity.mode) != (uid, gid, mode):
+        raise ValueError(f"{label} identity or mode does not match publication policy")
+
+
+def _validate_full_directory(
+    identity: _PublicationFullDirectoryIdentityV2,
     *,
     uid: int,
     gid: int,
@@ -856,14 +1047,24 @@ def _post_commit_state(
     manifest_sha256: str,
     reason: str,
 ) -> PaperMigrationPostCommitState:
+    if (
+        context.building_identity_before_generation_rename is None
+        or context.building_identity is None
+    ):
+        raise ValueError("post-commit state has no retained building bindings")
     return PaperMigrationPostCommitState(
         reason=reason,
         policy_id=context.root.policy.policy_id,
         publication_nonce=context.publication_nonce,
+        building_name=context.building_name,
         generation_name=context.generation_name,
         object_name=object_name,
         candidate_sha256=candidate_sha256,
         expected_manifest_sha256=manifest_sha256,
+        building_identity_before_generation_rename=(
+            context.building_identity_before_generation_rename
+        ),
+        building_identity=context.building_identity,
     )
 
 
@@ -971,7 +1172,8 @@ def _publish_paper_migration_generation(
     context: _PaperMigrationPublicationContext,
     *,
     source_sha256: str,
-    candidate_sha256: str,
+    transformed_fd: int,
+    semantic_binding: _StableSQLiteImageBinding,
     v4_reconciliation_report_digest: str,
     migration_attestation_digest: str,
     migration_code_identity: str,
@@ -984,23 +1186,28 @@ def _publish_paper_migration_generation(
     policy = context.root.policy
     if _inventory(context.ready_fd) != ("transformed.sqlite3",):
         raise ValueError("ready publication inventory is not exact")
-    transformed_fd = _open_regular_at(context.ready_fd, "transformed.sqlite3", writable=True)
     manifest_fd: int | None = None
+    object_fd: int | None = None
     renamed = False
     object_name = ""
-    candidate_digest = candidate_sha256
+    candidate_sha256 = semantic_binding.sha256
+    candidate_digest = semantic_binding.sha256
     manifest_sha256 = "0" * 64
     try:
         transformed_pre = _file_identity(os.fstat(transformed_fd))
+        _validate_file(
+            transformed_pre,
+            uid=policy.owner_uid,
+            gid=context.root.observation.effective_gid,
+            mode=0o600,
+            label="transformed publication object",
+        )
+        _revalidate_stable_sqlite_image(transformed_fd, semantic_binding)
         os.fsync(transformed_fd)
-        observed_digest, observed_size = _hash_fd(transformed_fd)
+        _revalidate_stable_sqlite_image(transformed_fd, semantic_binding)
         transformed_post = _file_identity(os.fstat(transformed_fd))
-        if (
-            transformed_pre != transformed_post
-            or observed_digest != candidate_sha256
-            or observed_size != transformed_pre.size
-        ):
-            raise ValueError("transformed publication object changed while hashed")
+        if transformed_pre != transformed_post or transformed_pre != semantic_binding.identity:
+            raise ValueError("transformed publication object changed while verified")
         _checkpoint(failure_after_phase, "after_publication_object_first_hash")
         object_name = f"ledger-{candidate_sha256}.sqlite3"
         rename_noreplace_at(
@@ -1010,19 +1217,34 @@ def _publish_paper_migration_generation(
             object_name,
         )
         _checkpoint(failure_after_phase, "after_object_noreplace_rename")
-        rebound_fd = _open_regular_at(context.ready_fd, object_name, writable=True)
-        os.close(transformed_fd)
-        transformed_fd = rebound_fd
-        if not _same_file_object(_file_identity(os.fstat(transformed_fd)), transformed_post):
+        object_fd = _open_regular_at(context.ready_fd, object_name, writable=True)
+        rebound_pre = _file_identity(os.fstat(object_fd))
+        rebound_digest, rebound_size = _hash_fd(object_fd)
+        rebound_post = _file_identity(os.fstat(object_fd))
+        if (
+            rebound_pre != rebound_post
+            or not _same_file_object_except_rename_ctime(rebound_pre, semantic_binding.identity)
+            or rebound_digest != candidate_sha256
+            or rebound_size != semantic_binding.identity.size
+        ):
             raise ValueError("publication object identity changed after no-replace rename")
-        rebound_digest, rebound_size = _hash_fd(transformed_fd)
-        if rebound_digest != candidate_sha256 or rebound_size != observed_size:
-            raise ValueError("publication object bytes changed after no-replace rename")
+        _checkpoint(failure_after_phase, "after_object_rebind_before_metadata")
         if policy.profile == "SEPARATED_IDENTITY":
             assert policy.reader_gid is not None
-            os.fchown(transformed_fd, policy.owner_uid, policy.reader_gid)
-        os.fchmod(transformed_fd, policy.object_mode)
-        object_identity = _file_identity(os.fstat(transformed_fd))
+            os.fchown(object_fd, policy.owner_uid, policy.reader_gid)
+        os.fchmod(object_fd, policy.object_mode)
+        final_pre = _file_identity(os.fstat(object_fd))
+        final_digest, final_size = _hash_fd(object_fd)
+        final_post = _file_identity(os.fstat(object_fd))
+        if (
+            final_pre != final_post
+            or final_digest != candidate_sha256
+            or final_size != semantic_binding.identity.size
+            or (final_pre.device, final_pre.inode)
+            != (semantic_binding.identity.device, semantic_binding.identity.inode)
+        ):
+            raise ValueError("publication object changed during final metadata transition")
+        object_identity = final_post
         _validate_file(
             object_identity,
             uid=policy.owner_uid,
@@ -1030,6 +1252,20 @@ def _publish_paper_migration_generation(
             mode=policy.object_mode,
             label="publication object",
         )
+        final_rebind_fd = _open_regular_at(context.ready_fd, object_name)
+        try:
+            final_rebind_pre = _file_identity(os.fstat(final_rebind_fd))
+            final_rebind_digest, final_rebind_size = _hash_fd(final_rebind_fd)
+            final_rebind_post = _file_identity(os.fstat(final_rebind_fd))
+            if (
+                final_rebind_pre != final_rebind_post
+                or final_rebind_pre != object_identity
+                or final_rebind_digest != candidate_sha256
+                or final_rebind_size != semantic_binding.identity.size
+            ):
+                raise ValueError("publication final object binding differs")
+        finally:
+            os.close(final_rebind_fd)
         if policy.profile == "SEPARATED_IDENTITY":
             assert policy.reader_gid is not None
             os.fchown(context.ready_fd, policy.owner_uid, policy.reader_gid)
@@ -1096,10 +1332,10 @@ def _publish_paper_migration_generation(
             raise ValueError("ready generation identity changed before publication")
         if _inventory(context.ready_fd) != (object_name, _MANIFEST_NAME):
             raise ValueError("ready generation inventory is not exact")
-        os.fsync(transformed_fd)
+        os.fsync(object_fd)
         os.fsync(manifest_fd)
         os.fsync(context.ready_fd)
-        if _file_identity(os.fstat(transformed_fd)) != object_identity:
+        if _file_identity(os.fstat(object_fd)) != object_identity:
             raise ValueError("publication object identity changed before publication")
         if _file_identity(os.fstat(manifest_fd)) != manifest_identity:
             raise ValueError("publication manifest identity changed before publication")
@@ -1108,9 +1344,28 @@ def _publish_paper_migration_generation(
         _checkpoint(failure_after_phase, "before_local_failure_disposition")
         _checkpoint(failure_after_phase, "before_generation_noreplace_rename")
 
+        context.building_identity_before_generation_rename = _full_directory_identity(
+            os.fstat(context.building_fd)
+        )
+        _validate_full_directory(
+            context.building_identity_before_generation_rename,
+            uid=policy.owner_uid,
+            gid=policy.group_gid,
+            mode=policy.building_mode,
+            label="publication building directory",
+        )
+
         def mark_generation_renamed() -> None:
             nonlocal renamed
             renamed = True
+            context.building_identity = _full_directory_identity(os.fstat(context.building_fd))
+            _validate_full_directory(
+                context.building_identity,
+                uid=policy.owner_uid,
+                gid=policy.group_gid,
+                mode=policy.building_mode,
+                label="publication building directory",
+            )
 
         rename_noreplace_at(
             context.building_fd,
@@ -1162,6 +1417,7 @@ def _publish_paper_migration_generation(
             failure_after_phase=failure_after_phase,
         )
         os.close(object_fd)
+        object_fd = None
         _checkpoint(failure_after_phase, "before_result_assembly")
         if receipt.manifest_identity != manifest_identity:
             raise ValueError("final publication manifest identity differs")
@@ -1195,7 +1451,8 @@ def _publish_paper_migration_generation(
     finally:
         if manifest_fd is not None:
             os.close(manifest_fd)
-        os.close(transformed_fd)
+        if object_fd is not None:
+            os.close(object_fd)
 
 
 def recover_paper_migration_publication(
@@ -1204,6 +1461,7 @@ def recover_paper_migration_publication(
     root_policy: PublicationRootPolicy,
     failure_after_phase: PaperMigrationFaultPoint | None = None,
 ) -> PaperMigrationPublicationReceipt:
+    state = PaperMigrationPostCommitState.model_validate(state)
     if failure_after_phase not in {None, *RECOVERY_FAULT_POINTS}:
         raise ValueError("unsupported publication recovery failure phase")
     if state.policy_id != root_policy.policy_id:
@@ -1213,17 +1471,20 @@ def recover_paper_migration_publication(
     try:
         root = observe_publication_root(root_policy, create_generations=False)
         building_fd = os.open(
-            f".building-{state.publication_nonce}",
+            state.building_name,
             _required_open_flags(directory=True),
             dir_fd=root.generations_fd,
         )
-        _validate_directory(
-            _directory_identity(os.fstat(building_fd)),
+        building_identity = _full_directory_identity(os.fstat(building_fd))
+        _validate_full_directory(
+            building_identity,
             uid=root_policy.owner_uid,
             gid=root_policy.group_gid,
             mode=root_policy.building_mode,
             label="publication building directory",
         )
+        if building_identity != state.building_identity:
+            raise ValueError("publication building directory differs from post-rename binding")
         os.fsync(building_fd)
         os.fsync(root.generations_fd)
         _checkpoint(failure_after_phase, "after_parent_fsync_before_final_verify")
@@ -1323,6 +1584,7 @@ def materialize_paper_migration_for_audit(
                 generation_identity,
             ),
         )
+        staging_path = _absolute_lexical_path(staging_root)
         private_name = (
             f"paper-migration-audit-{receipt.manifest.publication_nonce}-"
             f"{secrets.token_hex(32)}.sqlite3"
@@ -1381,14 +1643,23 @@ def materialize_paper_migration_for_audit(
             or final_size != copied_size
         ):
             raise ValueError("audit materialization identity or digest differs")
-        private_path = staging_path / private_name
-        connection = sqlite3.connect(f"file:{private_path}?mode=ro", uri=True)
-        connection.row_factory = sqlite3.Row
+        _validate_file(
+            destination_final,
+            uid=os.geteuid(),
+            gid=os.getegid(),
+            mode=0o600,
+            label="audit materialization destination",
+        )
+        private_image = _capture_stable_sqlite_image(destination_fd)
+        _revalidate_stable_sqlite_image(destination_fd, private_image.binding)
+        connection = _open_memory_sqlite_image(private_image)
         try:
             if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
                 raise ValueError("audit materialization SQLite integrity check failed")
+            from rquant.paper_broker import PaperBrokerStore
             from rquant.paper_ledger_migration import validate_migration_attestation
 
+            PaperBrokerStore._verify_v5_migration_in_connection(connection)
             attestation = validate_migration_attestation(connection)
         finally:
             connection.close()
@@ -1403,14 +1674,76 @@ def materialize_paper_migration_for_audit(
             or attestation.target_schema_identity != manifest.target_schema_identity
         ):
             raise ValueError("audit materialization migration attestation differs")
+        _revalidate_stable_sqlite_image(destination_fd, private_image.binding)
+        _validate_file(
+            _file_identity(os.fstat(destination_fd)),
+            uid=os.geteuid(),
+            gid=os.getegid(),
+            mode=0o600,
+            label="audit materialization destination",
+        )
+        os.fsync(destination_fd)
+        os.fsync(staging_fd)
+        staging_identity = _full_directory_identity(os.fstat(staging_fd))
+        _validate_full_directory(
+            staging_identity,
+            uid=os.geteuid(),
+            gid=os.getegid(),
+            mode=0o700,
+            label="audit staging root",
+        )
+        _checkpoint(failure_after_phase, "after_private_memory_verification_before_final_rebind")
+        rebound_fd = _open_regular_at(staging_fd, private_name)
+        try:
+            rebound_pre = _file_identity(os.fstat(rebound_fd))
+            rebound_digest, rebound_size = _hash_fd(rebound_fd)
+            rebound_post = _file_identity(os.fstat(rebound_fd))
+            if (
+                rebound_pre != rebound_post
+                or rebound_pre != private_image.binding.identity
+                or rebound_digest != private_image.binding.sha256
+                or rebound_size != private_image.binding.identity.size
+            ):
+                raise ValueError("audit private final binding differs")
+            if _full_directory_identity(os.fstat(staging_fd)) != staging_identity:
+                raise ValueError("audit staging root changed before result")
+        finally:
+            os.close(rebound_fd)
+        facts = _PaperMigrationAuditReceiptFactsV2(
+            receipt_sha256=verified_receipt.receipt_sha256,
+            manifest_sha256=verified_receipt.manifest_sha256,
+            manifest_identity=verified_receipt.manifest_identity,
+            policy_id=root.policy.policy_id,
+            policy_profile=manifest.policy_profile,
+            publication_nonce=manifest.publication_nonce,
+            generation_name=manifest.generation_name,
+            object_name=manifest.object_name,
+            object_identity=manifest.object_identity,
+            candidate_sha256=manifest.candidate_sha256,
+            source_sha256=manifest.source_sha256,
+            v4_reconciliation_report_digest=manifest.v4_reconciliation_report_digest,
+            migration_attestation_digest=manifest.migration_attestation_digest,
+            migration_code_identity=manifest.migration_code_identity,
+            migration_algorithm_id=manifest.migration_algorithm_id,
+            target_schema_identity=manifest.target_schema_identity,
+        )
+        verification = _PaperMigrationAuditVerificationEvidenceV2(
+            **facts.model_dump(mode="python", exclude={"contract"})
+        )
         _checkpoint(failure_after_phase, "before_local_failure_disposition")
         return PaperMigrationAuditMaterialization(
-            private_path=private_path,
-            receipt_sha256=receipt.receipt_sha256,
+            staging_root=staging_path,
+            staging_root_identity=staging_identity,
+            private_name=private_name,
+            private_nonce=private_name.rsplit("-", maxsplit=1)[1].removesuffix(".sqlite3"),
+            private_path=staging_path / private_name,
+            receipt=facts,
+            receipt_sha256=verified_receipt.receipt_sha256,
             source_sha256=manifest.source_sha256,
-            materialized_sha256=final_sha256,
-            materialized_size=final_size,
-            private_identity=destination_final,
+            materialized_sha256=private_image.binding.sha256,
+            materialized_size=private_image.binding.identity.size,
+            private_identity=private_image.binding.identity,
+            verification=verification,
         )
     except BaseException as exc:
         orphan = None

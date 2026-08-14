@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import ast
+import base64
 import errno
 import hashlib
 import inspect
 import json
 import os
+import shutil
 import sqlite3
 import stat
 import sys
@@ -13,6 +16,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+import rquant._paper_sqlite_image as sqlite_image_module
 import rquant.paper_ledger_migration as migration_module
 import rquant.paper_migration_publication as publication_module
 from rquant.paper_ledger_migration import migrate_v4_ledger_copy
@@ -90,6 +94,131 @@ def test_rename_success_before_parent_fsync_is_post_commit_indeterminate(
     assert source.path.read_bytes() == source_bytes
     receipt = recover_paper_migration_publication(state, root_policy=policy)
     assert receipt.publication_state == "GENERATION_DURABLE_VERIFIED"
+
+
+def test_rqs8_arch_p1_001_recovery_rejects_replaced_building_before_either_fsync(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = create_parent_v4_fixture(tmp_path / "source.sqlite3")
+    publication_root = _private_directory(tmp_path / "publication")
+    policy = local_audit_publication_root_policy(publication_root)
+    with pytest.raises(PaperMigrationPostCommitIndeterminateError) as caught:
+        migrate_v4_ledger_copy(
+            source.path,
+            publication_root,
+            root_policy=policy,
+            migration_code_identity="test-migration-code",
+            failure_after_phase="after_generation_rename_before_parent_fsync",
+        )
+
+    state = caught.value.state
+    assert state.contract == "rquant-paper-migration-post-commit/v2"
+    generations = publication_root / "generations"
+    building = generations / state.building_name
+    parked = generations / "parked-original-building"
+    building.rename(parked)
+    building.mkdir(mode=policy.building_mode)
+    building.chmod(policy.building_mode)
+    fsyncs: list[int] = []
+    original_fsync = os.fsync
+
+    def tracked_fsync(descriptor: int) -> None:
+        fsyncs.append(os.fstat(descriptor).st_ino)
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(publication_module.os, "fsync", tracked_fsync)
+    with pytest.raises(PaperMigrationPostCommitIndeterminateError):
+        recover_paper_migration_publication(state, root_policy=policy)
+
+    assert fsyncs == []
+    assert parked.is_dir()
+    assert building.is_dir()
+
+
+def test_recovery_fsyncs_verified_building_before_generations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = create_parent_v4_fixture(tmp_path / "source.sqlite3")
+    publication_root = _private_directory(tmp_path / "publication")
+    policy = local_audit_publication_root_policy(publication_root)
+    with pytest.raises(PaperMigrationPostCommitIndeterminateError) as caught:
+        migrate_v4_ledger_copy(
+            source.path,
+            publication_root,
+            root_policy=policy,
+            migration_code_identity="test-migration-code",
+            failure_after_phase="after_generation_rename_before_parent_fsync",
+        )
+
+    state = caught.value.state
+    generations = publication_root / "generations"
+    building = generations / state.building_name
+    fsyncs: list[int] = []
+    original_fsync = os.fsync
+
+    def tracked_fsync(descriptor: int) -> None:
+        fsyncs.append(os.fstat(descriptor).st_ino)
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(publication_module.os, "fsync", tracked_fsync)
+    receipt = recover_paper_migration_publication(state, root_policy=policy)
+
+    assert receipt.publication_state == "GENERATION_DURABLE_VERIFIED"
+    assert fsyncs == [building.stat().st_ino, generations.stat().st_ino]
+
+
+def test_post_commit_state_is_strict_v2_and_rejects_v1_payload_before_recovery(
+    tmp_path: Path,
+) -> None:
+    source = create_parent_v4_fixture(tmp_path / "source.sqlite3")
+    publication_root = _private_directory(tmp_path / "publication")
+    policy = local_audit_publication_root_policy(publication_root)
+    with pytest.raises(PaperMigrationPostCommitIndeterminateError) as caught:
+        migrate_v4_ledger_copy(
+            source.path,
+            publication_root,
+            root_policy=policy,
+            migration_code_identity="test-migration-code",
+            failure_after_phase="after_generation_rename_before_parent_fsync",
+        )
+
+    payload = caught.value.state.model_dump(mode="python")
+    payload["contract"] = "rquant-paper-migration-post-commit/v1"
+    with pytest.raises(ValidationError):
+        publication_module.PaperMigrationPostCommitState.model_validate(payload)
+
+
+def test_recovery_rejects_unparsed_v1_state_before_opening_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = create_parent_v4_fixture(tmp_path / "source.sqlite3")
+    publication_root = _private_directory(tmp_path / "publication")
+    policy = local_audit_publication_root_policy(publication_root)
+    with pytest.raises(PaperMigrationPostCommitIndeterminateError) as caught:
+        migrate_v4_ledger_copy(
+            source.path,
+            publication_root,
+            root_policy=policy,
+            migration_code_identity="test-migration-code",
+            failure_after_phase="after_generation_rename_before_parent_fsync",
+        )
+
+    legacy_payload = caught.value.state.model_dump(mode="python")
+    legacy_payload["contract"] = "rquant-paper-migration-post-commit/v1"
+    opened_root = False
+
+    def reject_root_open(*args: object, **kwargs: object) -> object:
+        nonlocal opened_root
+        opened_root = True
+        raise AssertionError("recovery must parse the state before opening the publication root")
+
+    monkeypatch.setattr(publication_module, "observe_publication_root", reject_root_open)
+    with pytest.raises(ValidationError):
+        recover_paper_migration_publication(legacy_payload, root_policy=policy)  # type: ignore[arg-type]
+    assert opened_root is False
 
 
 def test_post_rename_seam_is_immediate_and_observes_declared_generation_mode(
@@ -560,6 +689,42 @@ def test_manifest_raw_bytes_are_canonical_and_hash_graph_is_acyclic(tmp_path: Pa
         )
 
 
+def test_v1_manifest_and_receipt_fixed_fixture_bytes_are_unchanged() -> None:
+    raw_manifest = (
+        base64.b64decode(
+            "eyJjYW5kaWRhdGVfc2hhMjU2IjoiY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2M"
+            "iLCJjb250cmFjdCI6InJxdWFudC1wYXBlci1taWdyYXRpb24tcHVibGljYXRpb24tbWFuaWZlc3QvdjEiLCJnZW5lcmF0aW9uX2lkZW50aXR5Ijp7ImRldmljZSI6MSwiZmlsZV90eXBlIjoiZGlyZWN0b3J5IiwiZ2lkIjo4LCJpbm9kZSI6MTMsIm1vZGUiOjQ0OCwidWlkIjo3fSwiZ2VuZXJhdGlvbl9uYW1lIjoiZ2VuZXJhdGlvbi1iYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmIiLCJpbnZlbnRvcnkiOlsibGVkZ2VyLWNjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2Muc3FsaXRlMyIsInB1YmxpY2F0aW9uLW1hbmlmZXN0Lmpzb24iXSwibWlncmF0aW9uX2FsZ29yaXRobV9pZCI6InBhcGVyLWxlZGdlci12NC10by12NS1hcmNoaXZlLXYyIiwibWlncmF0aW9uX2F0dGVzdGF0aW9uX2RpZ2VzdCI6ImZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmYiLCJtaWdyYXRpb25fY29kZV9pZGVudGl0eSI6ImZpeGVkLXYxLWZpeHR1cmUiLCJvYmplY3RfaWRlbnRpdHkiOnsiY3RpbWVfbnMiOjEwMiwiZGV2aWNlIjoxLCJmaWxlX3R5cGUiOiJyZWd1bGFyIiwiZ2lkIjo4LCJpbm9kZSI6MTQsIm1vZGUiOjI1NiwibXRpbWVfbnMiOjEwMSwibmxpbmsiOjEsInNpemUiOjEyMzQsInVpZCI6N30sIm9iamVjdF9uYW1lIjoibGVkZ2VyLWNjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2Muc3FsaXRlMyIsInBvbGljeV9wcm9maWxlIjoiTE9DQUxfQVVESVQiLCJwdWJsaWNhdGlvbl9ub25jZSI6ImJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmIiLCJyb290X29ic2VydmF0aW9uIjp7ImNhcGFiaWxpdGllcyI6eyJhY2xfZGlnZXN0IjpudWxsLCJhY2xfc3RhdGUiOiJVTk9CU0VSVkVEX0xPQ0FMX0FVRElUIiwiZGlyX2ZkX29wZW4iOnRydWUsImRpcl9mZF9yZW5hbWUiOnRydWUsImRpcl9mZF9zdGF0Ijp0cnVlLCJkaXJfZmRfdW5saW5rIjp0cnVlLCJkaXJlY3RvcnlfZnN5bmMiOnRydWUsImZpbGVfZnN5bmMiOnRydWUsIm5vX3JlcGxhY2VfcHJpbWl0aXZlIjoicmVuYW1lYXR4X25wL1JFTkFNRV9FWENMIiwib19kaXJlY3RvcnkiOnRydWUsIm9fbm9mb2xsb3ciOnRydWUsInBsYXRmb3JtIjoiZGFyd2luIn0sImVmZmVjdGl2ZV9naWQiOjgsImVmZmVjdGl2ZV91aWQiOjcsImdlbmVyYXRpb25zIjp7ImRldmljZSI6MSwiZmlsZV90eXBlIjoiZGlyZWN0b3J5IiwiZ2lkIjo4LCJpbm9kZSI6MTIsIm1vZGUiOjQ0OCwidWlkIjo3fSwicG9saWN5X2lkIjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSIsInJvb3QiOnsiZGV2aWNlIjoxLCJmaWxlX3R5cGUiOiJkaXJlY3RvcnkiLCJnaWQiOjgsImlub2RlIjoxMSwibW9kZSI6NDQ4LCJ1aWQiOjd9fSwic291cmNlX3NoYTI1NiI6ImRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGQiLCJ0YXJnZXRfaW50ZXJuYWxfbWlncmF0aW9uX3ZlcnNpb24iOjQsInRhcmdldF9zY2hlbWFfaWRlbnRpdHkiOiJmaXhlZC10YXJnZXQtc2NoZW1hIiwidGFyZ2V0X3NjaGVtYV92ZXJzaW9uIjo1LCJ2NF9yZWNvbmNpbGlhdGlvbl9yZXBvcnRfZGlnZXN0IjoiZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZSJ9Cg=="
+        )
+        .replace(b"b" * 66, b"b" * 64)
+        .replace(b"c" * 71, b"c" * 64)
+        .replace(b"c" * 67, b"c" * 64)
+        .replace(b"f" * 67, b"f" * 64)
+    )
+    manifest = parse_canonical_manifest(raw_manifest)
+    assert canonical_manifest_bytes(manifest) == raw_manifest
+    assert hashlib.sha256(raw_manifest).hexdigest() == (
+        "3b9ac1787d77cb239dd3c8c1ecb4440cb0c9b8b4155c6e3970696c1c3dbe56a0"
+    )
+    receipt = publication_module.PaperMigrationPublicationReceipt(
+        manifest=manifest,
+        manifest_sha256=hashlib.sha256(raw_manifest).hexdigest(),
+        manifest_identity=publication_module.PublicationFileIdentity(
+            device=1,
+            inode=15,
+            uid=7,
+            gid=8,
+            mode=0o400,
+            nlink=1,
+            size=len(raw_manifest),
+            mtime_ns=103,
+            ctime_ns=104,
+        ),
+    )
+    assert (
+        receipt.receipt_sha256 == "39caed9c770f7cb186eb013b91edc2d6ab55dff66e6ac256790c6342e3557fc8"
+    )
+
+
 def test_receipt_is_unsigned_self_consistency_only(tmp_path: Path) -> None:
     result, _policy, _staging, _source, _root = _publish(tmp_path)
     combined_fields = {
@@ -951,7 +1116,7 @@ def test_materialization_mutation_after_first_hash_is_rejected(
         return original_connect(database, *args, **kwargs)
 
     monkeypatch.setattr(publication_module, "_checkpoint", mutate)
-    monkeypatch.setattr(publication_module.sqlite3, "connect", tracked_connect)
+    monkeypatch.setattr(sqlite_image_module.sqlite3, "connect", tracked_connect)
     with pytest.raises(PaperMigrationMaterializationError) as caught:
         materialize_paper_migration_for_audit(
             result.publication,
@@ -987,7 +1152,7 @@ def test_materialization_mutation_during_copy_is_rejected(
         return original_connect(database, *args, **kwargs)
 
     monkeypatch.setattr(publication_module, "_checkpoint", mutate)
-    monkeypatch.setattr(publication_module.sqlite3, "connect", tracked_connect)
+    monkeypatch.setattr(sqlite_image_module.sqlite3, "connect", tracked_connect)
     with pytest.raises(PaperMigrationMaterializationError) as caught:
         materialize_paper_migration_for_audit(
             result.publication,
@@ -1024,7 +1189,7 @@ def test_materialization_final_destination_rehash_mismatch_prevents_sqlite_open(
         return original_connect(database, *args, **kwargs)
 
     monkeypatch.setattr(publication_module, "_hash_fd", mismatch_final_destination)
-    monkeypatch.setattr(publication_module.sqlite3, "connect", tracked_connect)
+    monkeypatch.setattr(sqlite_image_module.sqlite3, "connect", tracked_connect)
     with pytest.raises(PaperMigrationMaterializationError) as caught:
         materialize_paper_migration_for_audit(
             result.publication,
@@ -1038,6 +1203,304 @@ def test_materialization_final_destination_rehash_mismatch_prevents_sqlite_open(
     orphan = staging / caught.value.orphan.private_name
     assert orphan.is_file()
     assert stat.S_IMODE(orphan.stat().st_mode) == 0o600
+
+
+def test_rqs8_arch_p1_005_private_swap_after_memory_verification_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result, policy, staging, _source, _root = _publish(tmp_path)
+    original_checkpoint = publication_module._checkpoint
+    original_open_memory = publication_module._open_memory_sqlite_image
+    parked: Path | None = None
+    substitute: Path | None = None
+    memory_images: list[bytes] = []
+
+    def track_memory_image(image: object) -> sqlite3.Connection:
+        memory_images.append(image.data)
+        return original_open_memory(image)
+
+    def replace_private_after_memory_verification(fault: str | None, phase: str) -> None:
+        nonlocal parked, substitute
+        if phase == "after_private_memory_verification_before_final_rebind":
+            private = next(staging.glob("paper-migration-audit-*.sqlite3"))
+            parked = private.with_name("parked-private.sqlite3")
+            substitute = private.with_name("substitute-private.sqlite3")
+            private.rename(parked)
+            shutil.copyfile(parked, substitute)
+            with sqlite3.connect(substitute) as connection:
+                connection.execute("CREATE TABLE substitute_marker(value TEXT NOT NULL)")
+                connection.execute("INSERT INTO substitute_marker VALUES ('substituted')")
+            substitute.replace(private)
+        original_checkpoint(fault, phase)
+
+    monkeypatch.setattr(
+        publication_module,
+        "_checkpoint",
+        replace_private_after_memory_verification,
+    )
+    monkeypatch.setattr(publication_module, "_open_memory_sqlite_image", track_memory_image)
+    with pytest.raises(PaperMigrationMaterializationError) as caught:
+        materialize_paper_migration_for_audit(
+            result.publication,
+            root_policy=policy,
+            staging_root=staging,
+        )
+
+    assert parked is not None and parked.is_file()
+    assert substitute is not None and substitute.exists() is False
+    assert len(memory_images) == 1
+    assert b"substitute_marker" not in memory_images[0]
+    assert caught.value.orphan is not None
+    substituted_private = staging / caught.value.orphan.private_name
+    assert substituted_private.is_file()
+    assert b"substitute_marker" in substituted_private.read_bytes()
+
+
+def test_materialization_closes_final_private_rebind_before_return(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result, policy, staging, _source, _root = _publish(tmp_path)
+    original_open_regular_at = publication_module._open_regular_at
+    rebound_descriptors: list[int] = []
+
+    def tracked_open_regular_at(
+        directory_descriptor: int,
+        name: str,
+        *,
+        writable: bool = False,
+    ) -> int:
+        descriptor = original_open_regular_at(
+            directory_descriptor,
+            name,
+            writable=writable,
+        )
+        if name.startswith("paper-migration-audit-"):
+            rebound_descriptors.append(descriptor)
+        return descriptor
+
+    monkeypatch.setattr(publication_module, "_open_regular_at", tracked_open_regular_at)
+    materialize_paper_migration_for_audit(
+        result.publication,
+        root_policy=policy,
+        staging_root=staging,
+    )
+
+    assert len(rebound_descriptors) == 1
+    with pytest.raises(OSError, match="Bad file descriptor"):
+        os.fstat(rebound_descriptors[0])
+
+
+@pytest.mark.parametrize("interleave", ("substitute", "mutate", "metadata"))
+def test_v4_object_transition_rejects_interleaves_before_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interleave: str,
+) -> None:
+    source = create_parent_v4_fixture(tmp_path / "source.sqlite3")
+    source_sha256 = hashlib.sha256(source.path.read_bytes()).hexdigest()
+    publication_root = _private_directory(tmp_path / "publication")
+    policy = local_audit_publication_root_policy(publication_root)
+    original_checkpoint = publication_module._checkpoint
+    original_fchmod = os.fchmod
+    object_metadata_phase = False
+    parked: Path | None = None
+
+    def interleave_object(fault: str | None, phase: str) -> None:
+        nonlocal object_metadata_phase, parked
+        if phase == "after_object_rebind_before_metadata":
+            object_metadata_phase = True
+            building = next((publication_root / "generations").glob(".building-*"))
+            object_path = next((building / "ready").glob("ledger-*.sqlite3"))
+            if interleave == "substitute":
+                parked = object_path.with_name("parked-object.sqlite3")
+                object_path.rename(parked)
+                shutil.copyfile(parked, object_path)
+            elif interleave == "mutate":
+                with object_path.open("r+b") as stream:
+                    stream.seek(0)
+                    stream.write(b"not-a-verified-sqlite-image")
+        original_checkpoint(fault, phase)
+
+    def fail_object_metadata(descriptor: int, mode: int) -> None:
+        if interleave == "metadata" and object_metadata_phase and mode == policy.object_mode:
+            raise PermissionError(errno.EACCES, "injected object metadata failure")
+        original_fchmod(descriptor, mode)
+
+    monkeypatch.setattr(publication_module, "_checkpoint", interleave_object)
+    monkeypatch.setattr(publication_module.os, "fchmod", fail_object_metadata)
+    with pytest.raises(PaperMigrationPreCommitError):
+        migrate_v4_ledger_copy(
+            source.path,
+            publication_root,
+            root_policy=policy,
+            migration_code_identity="test-migration-code",
+        )
+
+    assert hashlib.sha256(source.path.read_bytes()).hexdigest() == source_sha256
+    assert not tuple((publication_root / "generations").glob("generation-*"))
+    if parked is not None:
+        assert parked.is_file()
+
+
+def test_rqs8_p1_009_financial_mutation_after_sqlite_close_is_precommit_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = create_parent_v4_fixture(tmp_path / "source.sqlite3")
+    source_sha256 = hashlib.sha256(source.path.read_bytes()).hexdigest()
+    publication_root = _private_directory(tmp_path / "publication")
+    policy = local_audit_publication_root_policy(publication_root)
+    original_checkpoint = migration_module._checkpoint
+
+    def mutate_verified_transformed(fault: str | None, phase: str) -> None:
+        if phase == "after_sqlite_connections_closed":
+            building = next((publication_root / "generations").glob(".building-*"))
+            transformed = building / "ready" / "transformed.sqlite3"
+            with sqlite3.connect(transformed) as connection:
+                connection.execute("UPDATE broker_account SET cash = '175233.7700'")
+        original_checkpoint(fault, phase)
+
+    monkeypatch.setattr(migration_module, "_checkpoint", mutate_verified_transformed)
+    with pytest.raises(PaperMigrationPreCommitError):
+        migrate_v4_ledger_copy(
+            source.path,
+            publication_root,
+            root_policy=policy,
+            migration_code_identity="test-migration-code",
+        )
+
+    assert hashlib.sha256(source.path.read_bytes()).hexdigest() == source_sha256
+    assert not tuple((publication_root / "generations").glob("generation-*"))
+
+
+def test_source_snapshot_profile_rejects_wrong_mode_before_image_capture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = create_parent_v4_fixture(tmp_path / "source.sqlite3")
+    publication_root = _private_directory(tmp_path / "publication")
+    policy = local_audit_publication_root_policy(publication_root)
+    original_checkpoint = migration_module._checkpoint
+    captures: list[int] = []
+    memory_opens: list[object] = []
+
+    def drift_snapshot_mode(fault: str | None, phase: str) -> None:
+        if phase == "source_preflight":
+            snapshot = next(
+                (publication_root / "generations").glob(".building-*/source-snapshot.sqlite3")
+            )
+            snapshot.chmod(0o640)
+        original_checkpoint(fault, phase)
+
+    def track_capture(descriptor: int) -> object:
+        captures.append(descriptor)
+        raise AssertionError("wrong source mode must fail before image capture")
+
+    def track_memory_open(image: object) -> object:
+        memory_opens.append(image)
+        raise AssertionError("wrong source mode must fail before memory adapter open")
+
+    monkeypatch.setattr(migration_module, "_checkpoint", drift_snapshot_mode)
+    monkeypatch.setattr(migration_module, "_capture_stable_sqlite_image", track_capture)
+    monkeypatch.setattr(migration_module, "_open_memory_sqlite_image", track_memory_open)
+    with pytest.raises(PaperMigrationPreCommitError):
+        migrate_v4_ledger_copy(
+            source.path,
+            publication_root,
+            root_policy=policy,
+            migration_code_identity="test-migration-code",
+        )
+
+    assert captures == []
+    assert memory_opens == []
+
+
+def test_transformed_profile_rejects_wrong_mode_before_second_image_capture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = create_parent_v4_fixture(tmp_path / "source.sqlite3")
+    publication_root = _private_directory(tmp_path / "publication")
+    policy = local_audit_publication_root_policy(publication_root)
+    original_open_regular_at = migration_module._open_regular_at
+    original_capture = migration_module._capture_stable_sqlite_image
+    captures: list[int] = []
+
+    def drift_transformed_mode(
+        directory_descriptor: int,
+        name: str,
+        *,
+        writable: bool = False,
+    ) -> int:
+        descriptor = original_open_regular_at(
+            directory_descriptor,
+            name,
+            writable=writable,
+        )
+        if name == "transformed.sqlite3":
+            os.fchmod(descriptor, 0o640)
+        return descriptor
+
+    def track_capture(descriptor: int) -> object:
+        captures.append(descriptor)
+        return original_capture(descriptor)
+
+    monkeypatch.setattr(migration_module, "_open_regular_at", drift_transformed_mode)
+    monkeypatch.setattr(migration_module, "_capture_stable_sqlite_image", track_capture)
+    with pytest.raises(PaperMigrationPreCommitError):
+        migrate_v4_ledger_copy(
+            source.path,
+            publication_root,
+            root_policy=policy,
+            migration_code_identity="test-migration-code",
+        )
+
+    assert len(captures) == 1
+
+
+@pytest.mark.parametrize("label", ("source snapshot", "transformed image"))
+def test_migration_image_profiles_reject_descriptor_scoped_wrong_owner_before_adapter_open(
+    monkeypatch: pytest.MonkeyPatch,
+    label: str,
+) -> None:
+    metadata = os.stat_result(
+        (
+            stat.S_IFREG | 0o600,
+            17,
+            3,
+            1,
+            os.geteuid() + 1,
+            os.getegid(),
+            64,
+            0,
+            0,
+            0,
+        )
+    )
+    adapter_opens: list[object] = []
+    original_open_memory = sqlite_image_module._DefaultSQLiteMemoryAdapter.open_memory
+
+    def tracked_open_memory(adapter: object) -> sqlite3.Connection:
+        adapter_opens.append(adapter)
+        return original_open_memory(adapter)
+
+    monkeypatch.setattr(migration_module.os, "fstat", lambda _descriptor: metadata)
+    monkeypatch.setattr(
+        sqlite_image_module._DefaultSQLiteMemoryAdapter,
+        "open_memory",
+        tracked_open_memory,
+    )
+    with pytest.raises(ValueError, match=label):
+        migration_module._validate_stable_image_profile(
+            17,
+            uid=os.geteuid(),
+            gid=os.getegid(),
+            mode=0o600,
+            label=label,
+        )
+    assert adapter_opens == []
 
 
 def test_materialization_destination_collision_does_not_claim_foreign_orphan(
@@ -1070,11 +1533,18 @@ def test_materialization_rejects_private_destination_mode_drift(
 ) -> None:
     result, policy, staging, _source, _root = _publish(tmp_path)
     original_fchmod = os.fchmod
+    original_connect = sqlite3.connect
+    sqlite_opens: list[str] = []
 
     def force_wrong_private_mode(descriptor: int, mode: int) -> None:
         original_fchmod(descriptor, 0o640 if mode == 0o600 else mode)
 
+    def tracked_connect(database: object, *args: object, **kwargs: object) -> sqlite3.Connection:
+        sqlite_opens.append(os.fspath(database))
+        return original_connect(database, *args, **kwargs)
+
     monkeypatch.setattr(publication_module.os, "fchmod", force_wrong_private_mode)
+    monkeypatch.setattr(sqlite_image_module.sqlite3, "connect", tracked_connect)
     with pytest.raises(PaperMigrationMaterializationError) as caught:
         materialize_paper_migration_for_audit(
             result.publication,
@@ -1085,6 +1555,39 @@ def test_materialization_rejects_private_destination_mode_drift(
     assert caught.value.orphan is not None
     orphan = staging / caught.value.orphan.private_name
     assert stat.S_IMODE(orphan.stat().st_mode) == 0o640
+    assert sqlite_opens == []
+
+
+def test_materialization_rejects_private_destination_owner_drift_before_adapter_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result, policy, staging, _source, _root = _publish(tmp_path)
+    original_file_identity = publication_module._file_identity
+    original_connect = sqlite3.connect
+    sqlite_opens: list[str] = []
+
+    def wrong_private_owner(metadata: os.stat_result) -> publication_module.PublicationFileIdentity:
+        identity = original_file_identity(metadata)
+        if identity.mode == 0o600:
+            return identity.model_copy(update={"uid": identity.uid + 1})
+        return identity
+
+    def tracked_connect(database: object, *args: object, **kwargs: object) -> sqlite3.Connection:
+        sqlite_opens.append(os.fspath(database))
+        return original_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(publication_module, "_file_identity", wrong_private_owner)
+    monkeypatch.setattr(sqlite_image_module.sqlite3, "connect", tracked_connect)
+    with pytest.raises(PaperMigrationMaterializationError) as caught:
+        materialize_paper_migration_for_audit(
+            result.publication,
+            root_policy=policy,
+            staging_root=staging,
+        )
+
+    assert caught.value.orphan is not None
+    assert sqlite_opens == []
 
 
 def test_only_verified_private_materialization_reaches_sqlite(
@@ -1099,23 +1602,20 @@ def test_only_verified_private_materialization_reaches_sqlite(
         sqlite_opens.append(os.fspath(database))
         return original_connect(database, *args, **kwargs)
 
-    monkeypatch.setattr(publication_module.sqlite3, "connect", tracked_connect)
+    monkeypatch.setattr(sqlite_image_module.sqlite3, "connect", tracked_connect)
     materialized = materialize_paper_migration_for_audit(
         result.publication,
         root_policy=policy,
         staging_root=staging,
     )
     assert materialized.private_path.parent == staging
-    assert materialized.private_path != _object_path(result, root)
     assert materialized.materialized_sha256 == result.publication.manifest.candidate_sha256
     assert tuple(sorted(path.name for path in _generation_path(result, root).iterdir())) == (
         result.publication.manifest.object_name,
         "publication-manifest.json",
     )
-    assert sqlite_opens == [f"file:{materialized.private_path}?mode=ro"]
-    assert str(_generation_path(result, root)) not in sqlite_opens[0]
-    with original_connect(materialized.private_path) as connection:
-        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    assert sqlite_opens == [":memory:"]
+    assert materialized.verification.sqlite_integrity == "ok"
 
 
 def test_legacy_candidate_api_and_result_fields_are_absent(tmp_path: Path) -> None:
@@ -1294,6 +1794,129 @@ def test_paper_migration_documentation_is_audit_only() -> None:
         "require separate designs and explicit authorization",
     ):
         assert required_claim in document
+    assert "private_path is a locator only" in document
+    assert "may be opened by SQLite or" not in document
+
+
+def test_v4_public_surface_and_locator_ast_contract() -> None:
+    repository = Path(__file__).parents[2]
+    operation_modules = {
+        "src/rquant/paper_ledger_migration.py": {
+            "migrate_v4_ledger_copy",
+            "migrate_paper_ledger_v4_offline_copy",
+        },
+        "src/rquant/paper_migration_publication.py": {
+            "recover_paper_migration_publication",
+            "materialize_paper_migration_for_audit",
+        },
+    }
+    operations = set().union(*operation_modules.values())
+    for relative, expected in operation_modules.items():
+        tree = ast.parse((repository / relative).read_text(encoding="utf-8"))
+        definitions = {
+            node.name: node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in operations
+        }
+        assert set(definitions) == expected
+        for definition in definitions.values():
+            parameters = {
+                argument.arg
+                for argument in (
+                    *definition.args.posonlyargs,
+                    *definition.args.args,
+                    *definition.args.kwonlyargs,
+                )
+            }
+            assert not parameters & {"callback", "consumer", "consumer_callback"}
+
+    package_root = ast.parse((repository / "src/rquant/__init__.py").read_text(encoding="utf-8"))
+    root_bindings = {
+        alias.asname or alias.name.rsplit(".", maxsplit=1)[-1]
+        for node in ast.walk(package_root)
+        if isinstance(node, (ast.Import, ast.ImportFrom))
+        for alias in node.names
+    } | {
+        node.name
+        for node in ast.walk(package_root)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    }
+    assert not operations & root_bindings
+    assert not any(name.startswith("_") for name in publication_module.__all__)
+    assert not any(name.startswith("_") for name in migration_module.__all__)
+    assert {name for name in publication_module.__all__ if name in operations} == {
+        "recover_paper_migration_publication",
+        "materialize_paper_migration_for_audit",
+    }
+    assert {name for name in migration_module.__all__ if name in operations} == operations
+
+    class LocatorVisitor(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.classes: list[str] = []
+            self.illegal_attributes: list[int] = []
+            self.illegal_aliases: list[int] = []
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            self.classes.append(node.name)
+            self.generic_visit(node)
+            self.classes.pop()
+
+        def visit_Attribute(self, node: ast.Attribute) -> None:
+            if node.attr == "private_path" and self.classes != [
+                "PaperMigrationAuditMaterialization"
+            ]:
+                self.illegal_attributes.append(node.lineno)
+            self.generic_visit(node)
+
+        def visit_Assign(self, node: ast.Assign) -> None:
+            if isinstance(node.value, ast.Attribute) and node.value.attr == "private_path":
+                self.illegal_aliases.append(node.lineno)
+            self.generic_visit(node)
+
+    locator_scan_paths = tuple((repository / "src" / "rquant").rglob("*.py")) + (
+        repository / "tests/unit/test_paper_ledger_v4_migration.py",
+        repository / "tests/unit/test_paper_broker.py",
+    )
+    for path in locator_scan_paths:
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        visitor = LocatorVisitor()
+        visitor.visit(tree)
+        assert visitor.illegal_attributes == []
+        assert visitor.illegal_aliases == []
+        assert "file:{materialization.private_path}" not in source
+    document = (repository / "docs/architecture/paper-research-cost-alignment.md").read_text(
+        encoding="utf-8"
+    )
+    assert "may be opened" not in document
+    assert "openable" not in document
+
+
+def test_audit_materialization_v2_model_rejects_inconsistent_locator_and_evidence(
+    tmp_path: Path,
+) -> None:
+    result, policy, staging, _source, _root = _publish(tmp_path)
+    materialized = materialize_paper_migration_for_audit(
+        result.publication,
+        root_policy=policy,
+        staging_root=staging,
+    )
+    assert materialized.contract == "rquant-paper-migration-audit-materialization/v2"
+    payload = json.loads(materialized.model_dump_json())
+    mutations = (
+        lambda value: value.update(contract="rquant-paper-migration-audit-materialization/v1"),
+        lambda value: value.update(unexpected=True),
+        lambda value: value.update(private_name="not-a-private-name"),
+        lambda value: value.update(private_path="relative.sqlite3"),
+        lambda value: value.update(materialized_size=value["materialized_size"] + 1),
+        lambda value: value["staging_root_identity"].update(mode=0o755),
+        lambda value: value["verification"].update(source_sha256="0" * 64),
+    )
+    for mutate in mutations:
+        invalid = json.loads(json.dumps(payload))
+        mutate(invalid)
+        with pytest.raises(ValidationError):
+            publication_module.PaperMigrationAuditMaterialization.model_validate(invalid)
 
 
 @pytest.mark.parametrize(

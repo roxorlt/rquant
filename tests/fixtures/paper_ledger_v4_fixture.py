@@ -10,6 +10,9 @@ from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 
+from rquant.paper_broker import PaperBrokerStore
+from rquant.paper_ledger_v4 import V4LedgerReconciler
+
 PARENT_V4_COMMIT = "c088774c3199c02edf203a3af758452eb38a5118"
 EXPECTED_V4_FIXTURE_SHA256 = "250f54945a5b169355649df53c16ef4a172f6d9ca370619371216f2d96c46f82"
 EXPECTED_V4_SCHEMA_FINGERPRINT = "3ae9e0749b1132f8b1e55f15866534e1bcae9a0815fd0d7c6837297fc45dcc70"
@@ -138,6 +141,31 @@ def create_parent_v4_fixture(path: Path) -> ParentV4Fixture:
         predecessor_head_fingerprint=EXPECTED_V4_HEAD_FINGERPRINT,
         historical_rows=historical_rows,
     )
+
+
+def create_independent_v5_migration_fixture(path: Path) -> ParentV4Fixture:
+    """Build a writable V5 test database directly from the frozen V4 seed."""
+
+    fixture = create_parent_v4_fixture(path)
+    report = V4LedgerReconciler().reconcile(path)
+    store = object.__new__(PaperBrokerStore)
+    store.path = path
+    store.account_id = LEGACY_ACCOUNT_ID
+    store.busy_timeout_ms = 5_000
+    with sqlite3.connect(path, isolation_level=None) as connection:
+        connection.row_factory = sqlite3.Row
+        store._ensure_ledger_schema_v5(
+            connection,
+            source_sha256=fixture.source_sha256,
+            v4_reconciliation_report_digest=report.digest,
+            migration_code_identity="test-independent-v5-fixture",
+            source_schema_identity=report.schema_fingerprint,
+        )
+        PaperBrokerStore._verify_v5_migration_in_connection(
+            connection,
+            expected_v4_report=report,
+        )
+    return fixture
 
 
 def archived_v4_rows(path: Path) -> dict[str, tuple[tuple[object, ...], ...]]:

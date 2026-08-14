@@ -679,6 +679,20 @@ class V4LedgerReconciler:
             raise PaperV4ReconciliationError("v4 source cannot be opened read-only") from exc
         connection.row_factory = sqlite3.Row
         try:
+            report = self._reconcile_connection(connection, source_sha256=source_sha256)
+        finally:
+            connection.close()
+        if sha256_file(source) != source_sha256:
+            raise PaperV4ReconciliationError("v4 source changed during reconciliation")
+        return report
+
+    def _reconcile_connection(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        source_sha256: str,
+    ) -> V4LedgerReconciliationReport:
+        try:
             integrity = connection.execute("PRAGMA integrity_check").fetchone()
             if integrity is None or str(integrity[0]).lower() != "ok":
                 raise PaperV4ReconciliationError("v4 source integrity check failed")
@@ -700,8 +714,6 @@ class V4LedgerReconciler:
             reports = tuple(_account_report(connection, account) for account in account_rows)
         except sqlite3.DatabaseError as exc:
             raise PaperV4ReconciliationError("v4 source schema is invalid") from exc
-        finally:
-            connection.close()
         report = V4LedgerReconciliationReport(
             source_sha256=source_sha256,
             schema_version=V4_SCHEMA_VERSION,
@@ -715,8 +727,6 @@ class V4LedgerReconciler:
         if not report.is_verified:
             errors = "; ".join(error for account in reports for error in account.errors)
             raise PaperV4ReconciliationError(f"v4 reconciliation failed: {errors}")
-        if sha256_file(source) != source_sha256:
-            raise PaperV4ReconciliationError("v4 source changed during reconciliation")
         return report
 
 

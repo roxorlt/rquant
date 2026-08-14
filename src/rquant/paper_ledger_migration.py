@@ -10,6 +10,12 @@ import stat
 from dataclasses import dataclass
 from pathlib import Path
 
+from rquant._paper_sqlite_image import (
+    _capture_stable_sqlite_image,
+    _open_memory_sqlite_image,
+    _revalidate_stable_sqlite_image,
+    _StableSQLiteImageError,
+)
 from rquant.paper_contracts import (
     PaperLedgerArchiveBinding,
     PaperLedgerArchiveTableBinding,
@@ -17,7 +23,6 @@ from rquant.paper_contracts import (
 )
 from rquant.paper_ledger_v4 import (
     V4LedgerReconciler,
-    sha256_file,
 )
 from rquant.paper_migration_publication import (
     MIGRATION_FAULT_POINTS,
@@ -29,6 +34,7 @@ from rquant.paper_migration_publication import (
     PaperOfflineMigrationResult,
     PublicationRootPolicy,
     _begin_paper_migration_publication,
+    _open_regular_at,
     _publish_paper_migration_generation,
     materialize_paper_migration_for_audit,
     recover_paper_migration_publication,
@@ -318,6 +324,24 @@ def _validate_private_file(metadata: os.stat_result, *, label: str) -> None:
         raise ValueError(f"{label} identity or mode is not exact")
 
 
+def _validate_stable_image_profile(
+    descriptor: int,
+    *,
+    uid: int,
+    gid: int,
+    mode: int,
+    label: str,
+) -> None:
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_size < 0
+        or (metadata.st_uid, metadata.st_gid, stat.S_IMODE(metadata.st_mode)) != (uid, gid, mode)
+    ):
+        raise ValueError(f"{label} identity or mode is not exact")
+
+
 def _write_descriptor_copy_at(
     source_descriptor: int,
     destination_directory_descriptor: int,
@@ -519,6 +543,7 @@ def migrate_v4_ledger_copy(
     source = Path(source_path).absolute()
     context = None
     source_snapshot: _SourceSnapshot | None = None
+    transformed_fd: int | None = None
     receipt = None
     try:
         context = _begin_paper_migration_publication(
@@ -534,7 +559,35 @@ def migrate_v4_ledger_copy(
             snapshot_name,
         )
         _checkpoint(failure_after_phase, "source_preflight")
-        report = V4LedgerReconciler().reconcile(source_snapshot.path)
+        _validate_stable_image_profile(
+            source_snapshot.descriptor,
+            uid=context.root.observation.effective_uid,
+            gid=context.root.observation.effective_gid,
+            mode=0o600,
+            label="offline migration source snapshot",
+        )
+        source_image = _capture_stable_sqlite_image(source_snapshot.descriptor)
+        if source_image.binding.sha256 != source_snapshot.sha256:
+            raise ValueError("offline migration source snapshot digest differs")
+        source_connection = _open_memory_sqlite_image(source_image)
+        try:
+            report = V4LedgerReconciler()._reconcile_connection(
+                source_connection,
+                source_sha256=source_image.binding.sha256,
+            )
+        finally:
+            source_connection.close()
+        try:
+            _revalidate_stable_sqlite_image(source_snapshot.descriptor, source_image.binding)
+        except _StableSQLiteImageError as exc:
+            raise ValueError("offline migration private snapshot changed or was replaced") from exc
+        _validate_stable_image_profile(
+            source_snapshot.descriptor,
+            uid=context.root.observation.effective_uid,
+            gid=context.root.observation.effective_gid,
+            mode=0o600,
+            label="offline migration source snapshot",
+        )
         if report.source_sha256 != source_snapshot.sha256 or not report.is_verified:
             raise ValueError("offline migration v4 reconciliation report is invalid")
         _assert_source_unchanged(source, source_snapshot.source_identity)
@@ -596,8 +649,17 @@ def migrate_v4_ledger_copy(
                 raise ValueError("offline migration SQLite integrity check failed")
         finally:
             connection.close()
-        readonly = sqlite3.connect(f"file:{temporary}?mode=ro", uri=True)
-        readonly.row_factory = sqlite3.Row
+        transformed_fd = _open_regular_at(context.ready_fd, temporary_name, writable=True)
+        os.fsync(transformed_fd)
+        _validate_stable_image_profile(
+            transformed_fd,
+            uid=root_policy.owner_uid,
+            gid=context.root.observation.effective_gid,
+            mode=0o600,
+            label="offline migration transformed image",
+        )
+        transformed_image = _capture_stable_sqlite_image(transformed_fd)
+        readonly = _open_memory_sqlite_image(transformed_image)
         try:
             PaperBrokerStore._verify_v5_migration_in_connection(
                 readonly,
@@ -608,14 +670,30 @@ def migrate_v4_ledger_copy(
                 raise ValueError("offline migration final SQLite integrity check failed")
         finally:
             readonly.close()
+        _revalidate_stable_sqlite_image(transformed_fd, transformed_image.binding)
+        _validate_stable_image_profile(
+            transformed_fd,
+            uid=root_policy.owner_uid,
+            gid=context.root.observation.effective_gid,
+            mode=0o600,
+            label="offline migration transformed image",
+        )
         _checkpoint(failure_after_phase, "verification")
         _checkpoint(failure_after_phase, "after_sqlite_connections_closed")
+        _revalidate_stable_sqlite_image(transformed_fd, transformed_image.binding)
+        _validate_stable_image_profile(
+            transformed_fd,
+            uid=root_policy.owner_uid,
+            gid=context.root.observation.effective_gid,
+            mode=0o600,
+            label="offline migration transformed image",
+        )
         _assert_source_unchanged(source, source_snapshot.source_identity)
-        candidate_sha256 = sha256_file(temporary)
         receipt = _publish_paper_migration_generation(
             context,
             source_sha256=source_snapshot.sha256,
-            candidate_sha256=candidate_sha256,
+            transformed_fd=transformed_fd,
+            semantic_binding=transformed_image.binding,
             v4_reconciliation_report_digest=report.digest,
             migration_attestation_digest=attestation.digest,
             migration_code_identity=migration_code_identity,
@@ -639,10 +717,15 @@ def migrate_v4_ledger_copy(
                 reason="RESULT_ASSEMBLY_FAILED",
                 policy_id=root_policy.policy_id,
                 publication_nonce=manifest.publication_nonce,
+                building_name=context.building_name,
                 generation_name=manifest.generation_name,
                 object_name=manifest.object_name,
                 candidate_sha256=manifest.candidate_sha256,
                 expected_manifest_sha256=receipt.manifest_sha256,
+                building_identity_before_generation_rename=(
+                    context.building_identity_before_generation_rename
+                ),
+                building_identity=context.building_identity,
             )
             raise PaperMigrationPostCommitIndeterminateError(
                 "paper migration result assembly failed after generation publication",
@@ -665,6 +748,8 @@ def migrate_v4_ledger_copy(
             orphan=orphan,
         ) from exc
     finally:
+        if transformed_fd is not None:
+            os.close(transformed_fd)
         if source_snapshot is not None:
             os.close(source_snapshot.descriptor)
         if context is not None:
