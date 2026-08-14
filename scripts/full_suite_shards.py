@@ -36,7 +36,8 @@ _FULL_SUITE_FIELDS = frozenset({"cases", "skips", "sha256"})
 _SHARD_FIELDS = frozenset({"id", "path", "count", "sha256"})
 _NODEID_FIELDS = frozenset({"nodeid"})
 _COLLECTION_FIELDS = frozenset({"nodeids"})
-_CI_PRIVATE_DIRECTORIES = ("home", "tmp", "data", "parquet", "logs")
+_CI_PRIVATE_DIRECTORIES = ("home", "tmp", "data", "parquet", "logs", "pt")
+MAX_CI_PYTEST_BASETEMP_BYTES = 48
 
 # These are conservative historical weights for files that dominated the former
 # monolithic CI job. Every other file still contributes its case count.
@@ -97,6 +98,7 @@ def _private_ci_environment(root: Path, directories: Mapping[str, Path]) -> dict
         "DUCKDB_READONLY_PATH": str(directories["data"] / "test_ro.duckdb"),
         "PARQUET_DIR": str(directories["parquet"]),
         "LOG_DIR": str(directories["logs"]),
+        "RQUANT_CI_PYTEST_BASETEMP": str(directories["pt"]),
         "RQUANT_DISABLE_DOTENV": "1",
         "TUSHARE_TOKEN_MAIN": CI_DUMMY_TUSHARE_TOKEN,
         "NOTIFY_ENABLED": "false",
@@ -152,13 +154,17 @@ def _create_private_ci_environment(base_dir: Path, *, label: str) -> dict[str, s
     try:
         root = Path(
             tempfile.mkdtemp(
-                prefix=f"rqci.full-suite.{label}.",
+                prefix="rqfs.",
                 dir=canonical_base,
             )
         ).resolve(strict=True)
     except OSError as exc:
         raise ContractError("cannot create private full-suite CI root") from exc
-    return _private_ci_environment(root, _create_private_ci_directories(root))
+    directories = _create_private_ci_directories(root)
+    pytest_basetemp = directories["pt"]
+    if len(os.fsencode(pytest_basetemp)) > MAX_CI_PYTEST_BASETEMP_BYTES:
+        raise ContractError("full-suite pytest basetemp exceeds AF_UNIX path budget")
+    return _private_ci_environment(root, directories)
 
 
 def _append_github_environment(path: Path, environment: dict[str, str]) -> None:

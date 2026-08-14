@@ -117,7 +117,7 @@ jobs:
             --shard "${{ matrix.shard }}" \
             --junitxml "test-results/junit.xml" \
             --selection-evidence "test-results/selection.json" \
-            --basetemp "${RQUANT_CI_ROOT}/pt-full-shard-${{ matrix.shard }}"
+            --basetemp "${RQUANT_CI_PYTEST_BASETEMP}"
 
       - name: Upload full-suite shard evidence
         if: always()

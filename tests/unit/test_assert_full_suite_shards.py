@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import stat
 from pathlib import Path
 
 import pytest
@@ -245,9 +247,10 @@ def test_clean_environment_aggregate_uses_shared_private_collect_setup(
     shard_job, contract_job = workflow.split("  full-suite-contract:\n", maxsplit=1)
     assert setup_command in shard_job.split("  full-suite-shard:\n", maxsplit=1)[1]
     assert setup_command in contract_job.split("  runtime-fd-exec-linux:\n", maxsplit=1)[0]
+    assert workflow.count('--basetemp "${RQUANT_CI_PYTEST_BASETEMP}"') == 1
+    assert "${RQUANT_CI_ROOT}/pt-full-shard-" not in workflow
 
-    workflow_base = tmp_path / "workflow-temp"
-    workflow_base.mkdir(mode=0o700)
+    workflow_base = Path("/private/tmp") if Path("/private/tmp").is_dir() else Path("/tmp")
     github_environment = tmp_path / "github-env"
     assert (
         shards.main(
@@ -268,12 +271,40 @@ def test_clean_environment_aggregate_uses_shared_private_collect_setup(
         for line in github_environment.read_text(encoding="utf-8").splitlines()
     )
     prepared_root = Path(prepared["RQUANT_CI_ROOT"])
+    prepared_basetemp = Path(prepared["RQUANT_CI_PYTEST_BASETEMP"])
     assert prepared_root.parent == workflow_base
     assert prepared_root.resolve(strict=True) == prepared_root
-    assert prepared_root.stat().st_mode & 0o777 == 0o700
+    assert re.fullmatch(r"rqfs\.[A-Za-z0-9_-]{8}", prepared_root.name)
+    assert stat.S_IMODE(prepared_root.stat().st_mode) == 0o700
+    assert prepared_basetemp == prepared_root / "pt"
+    assert prepared_basetemp.resolve(strict=True) == prepared_basetemp
+    assert stat.S_IMODE(prepared_basetemp.stat().st_mode) == 0o700
+    github_runner_basetemp = Path("/home/runner/work/_temp") / prepared_root.name / "pt"
+    assert len(os.fsencode(github_runner_basetemp)) <= shards.MAX_CI_PYTEST_BASETEMP_BYTES
     assert prepared["RQUANT_DISABLE_DOTENV"] == "1"
     assert prepared["TUSHARE_TOKEN_MAIN"] == "0" * 32
     assert prepared["NOTIFY_ENABLED"] == "false"
+
+    second_environment = tmp_path / "github-env-second"
+    assert (
+        shards.main(
+            [
+                "prepare-environment",
+                "--github-env",
+                str(second_environment),
+                "--base-dir",
+                str(workflow_base),
+                "--label",
+                "py3.12-contract",
+            ]
+        )
+        == 0
+    )
+    second = dict(
+        line.split("=", maxsplit=1)
+        for line in second_environment.read_text(encoding="utf-8").splitlines()
+    )
+    assert second["RQUANT_CI_ROOT"] != prepared["RQUANT_CI_ROOT"]
 
 
 @pytest.mark.parametrize("outcome", ("failure", "error"))
