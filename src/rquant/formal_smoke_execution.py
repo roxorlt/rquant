@@ -189,6 +189,57 @@ class _FormalSmokeExchangeSubphase(StrEnum):
     CLEANUP_CLOSE_DESCRIPTORS = "cleanup_close_descriptors"
 
 
+class _FormalSmokeDeadlineError(FormalSmokeExecutionError):
+    def __init__(
+        self,
+        *,
+        phase: str,
+        request_sent: bool,
+        receipt_bytes: int,
+        receipt_eof: bool,
+        status_reported: bool,
+    ) -> None:
+        self.phase = phase
+        self.request_sent = request_sent
+        self.receipt_bytes = receipt_bytes
+        self.receipt_eof = receipt_eof
+        self.status_reported = status_reported
+        facts = (
+            f"phase={phase}",
+            f"request_sent={str(request_sent).lower()}",
+            f"receipt_bytes={receipt_bytes}",
+            f"receipt_eof={str(receipt_eof).lower()}",
+            f"status_reported={str(status_reported).lower()}",
+        )
+        super().__init__(f"formal smoke child deadline expired ({' '.join(facts)})")
+
+    def redacted_copy(self) -> _FormalSmokeDeadlineError:
+        return _FormalSmokeDeadlineError(
+            phase=self.phase,
+            request_sent=self.request_sent,
+            receipt_bytes=self.receipt_bytes,
+            receipt_eof=self.receipt_eof,
+            status_reported=self.status_reported,
+        )
+
+
+@dataclass(frozen=True)
+class _FormalSmokeCleanupEvidence:
+    subphase: _FormalSmokeExchangeSubphase
+    reason: str
+
+    def as_error(self) -> FormalSmokeCleanupError:
+        return FormalSmokeCleanupError(
+            "formal smoke supervisor cleanup failed "
+            f"(subphase={self.subphase.value} reason={self.reason})"
+        )
+
+    def as_note(self) -> str:
+        return (
+            f"formal smoke cleanup evidence (subphase={self.subphase.value} reason={self.reason})"
+        )
+
+
 def _exchange_value_error_reason(subphase: _FormalSmokeExchangeSubphase) -> str:
     if subphase in {
         _FormalSmokeExchangeSubphase.SETUP_REQUEST_PIPE,
@@ -277,6 +328,8 @@ class _FormalSmokeExchangeProgress:
         )
 
     def redacted_error(self, exc: BaseException) -> FormalSmokeExecutionError:
+        if isinstance(exc, _FormalSmokeDeadlineError):
+            return exc.redacted_copy()
         if isinstance(exc, ValueError):
             return self.value_error(exc)
         reason = _formal_smoke_failure_component(exc) or "internal_error"
@@ -306,14 +359,13 @@ class _FormalSmokeExchangeProgress:
             phase = "awaiting_child_status"
         else:
             phase = "awaiting_generation_result"
-        facts = (
-            f"phase={phase}",
-            f"request_sent={str(self.request_sent).lower()}",
-            f"receipt_bytes={self.receipt_bytes}",
-            f"receipt_eof={str(self.receipt_eof).lower()}",
-            f"status_reported={str(self.status_reported).lower()}",
+        return _FormalSmokeDeadlineError(
+            phase=phase,
+            request_sent=self.request_sent,
+            receipt_bytes=self.receipt_bytes,
+            receipt_eof=self.receipt_eof,
+            status_reported=self.status_reported,
         )
-        return FormalSmokeExecutionError(f"formal smoke child deadline expired ({' '.join(facts)})")
 
 
 FormalSmokeExchange = Callable[
@@ -497,9 +549,10 @@ def _cleanup_formal_smoke_supervisor(
     progress: _FormalSmokeExchangeProgress | None = None,
 ) -> None:
     cleanup_deadline = time.monotonic() + _SUPERVISOR_CLEANUP_SECONDS
-    cleanup_error: FormalSmokeCleanupError | None = None
+    cleanup_error: _FormalSmokeCleanupEvidence | None = None
     cleanup_diagnostic: FormalSmokeExecutionError | None = None
-    cleanup_diagnostic_error: FormalSmokeCleanupError | None = None
+    cleanup_diagnostic_error: _FormalSmokeCleanupEvidence | None = None
+    cleanup_evidence: list[_FormalSmokeCleanupEvidence] = []
     request_delivered = False
     observed_return_code: int | None = None
     reaped_return_code: int | None = None
@@ -510,17 +563,29 @@ def _cleanup_formal_smoke_supervisor(
 
     def record_value_error(exc: ValueError) -> None:
         nonlocal cleanup_diagnostic, cleanup_diagnostic_error
+        reason = (
+            "validation_error"
+            if isinstance(exc, ValidationError)
+            else _exchange_value_error_reason(cleanup_progress.subphase)
+        )
+        evidence = _FormalSmokeCleanupEvidence(cleanup_progress.subphase, reason)
+        cleanup_evidence.append(evidence)
         if cleanup_diagnostic is None:
             cleanup_diagnostic = cleanup_progress.value_error(exc)
-            cleanup_diagnostic_error = cleanup_progress.cleanup_value_error(exc)
+            cleanup_diagnostic_error = evidence
+
+    def record_cleanup_error(reason: str) -> None:
+        nonlocal cleanup_error
+        evidence = _FormalSmokeCleanupEvidence(cleanup_progress.subphase, reason)
+        cleanup_evidence.append(evidence)
+        if cleanup_error is None:
+            cleanup_error = evidence
 
     try:
         set_subphase(_FormalSmokeExchangeSubphase.CLEANUP_VALIDATE_ANCHOR)
         if process.process.returncode is not None:
             process.state = _SupervisorLifecycleState.REAPED
-            cleanup_error = FormalSmokeCleanupError(
-                "formal smoke supervisor was already reaped before cleanup"
-            )
+            record_cleanup_error("anchor_already_reaped")
         else:
             try:
                 set_subphase(_FormalSmokeExchangeSubphase.CLEANUP_TEARDOWN_REQUEST)
@@ -562,8 +627,13 @@ def _cleanup_formal_smoke_supervisor(
                 observed_return_code = _observe_supervisor_without_reaping(process)
             except ValueError as exc:
                 record_value_error(exc)
-            except FormalSmokeCleanupError as exc:
-                cleanup_error = exc
+            except FormalSmokeCleanupError:
+                reason = (
+                    "anchor_already_reaped"
+                    if process.state is _SupervisorLifecycleState.REAPED
+                    else "waitid_cleanup_failed"
+                )
+                record_cleanup_error(reason)
 
             if process.state is not _SupervisorLifecycleState.REAPED:
                 set_subphase(_FormalSmokeExchangeSubphase.CLEANUP_KILL)
@@ -574,14 +644,17 @@ def _cleanup_formal_smoke_supervisor(
                     except ValueError as exc:
                         record_value_error(exc)
                         continue
-                    if group_error is not None and cleanup_error is None:
-                        cleanup_error = group_error
+                    if group_error is not None:
+                        if process.state is _SupervisorLifecycleState.GROUP_SIGNAL_DENIED:
+                            reason = "permission_denied"
+                        elif process.state is _SupervisorLifecycleState.REAPED:
+                            reason = "anchor_already_reaped"
+                        else:
+                            reason = "process_group_cleanup_failed"
+                        record_cleanup_error(reason)
                     break
                 else:
-                    if cleanup_error is None:
-                        cleanup_error = FormalSmokeCleanupError(
-                            "formal smoke supervisor final group cleanup contract failed"
-                        )
+                    record_cleanup_error("process_group_cleanup_failed")
 
                 set_subphase(_FormalSmokeExchangeSubphase.CLEANUP_REAP)
                 for _attempt in range(2):
@@ -593,24 +666,18 @@ def _cleanup_formal_smoke_supervisor(
                     except ValueError as exc:
                         record_value_error(exc)
                         continue
-                    except FormalSmokeCleanupError as exc:
-                        if cleanup_error is None:
-                            cleanup_error = exc
+                    except FormalSmokeCleanupError:
+                        record_cleanup_error("process_reap_failed")
                     break
                 else:
-                    if cleanup_error is None:
-                        cleanup_error = FormalSmokeCleanupError(
-                            "formal smoke supervisor reap contract failed"
-                        )
+                    record_cleanup_error("process_reap_failed")
 
             if (
                 cleanup_error is None
                 and observed_return_code is not None
                 and reaped_return_code != observed_return_code
             ):
-                cleanup_error = FormalSmokeCleanupError(
-                    "formal smoke supervisor changed status while being reaped"
-                )
+                record_cleanup_error("status_mismatch")
     finally:
         for close_descriptor in (process.close_lifetime, process.close_status):
             try:
@@ -621,8 +688,11 @@ def _cleanup_formal_smoke_supervisor(
                 set_subphase(_FormalSmokeExchangeSubphase.CLEANUP_CLOSE_DESCRIPTORS)
                 record_value_error(exc)
 
-    final_error = cleanup_error or cleanup_diagnostic_error
-    if final_error is not None:
+    primary_evidence = cleanup_error or cleanup_diagnostic_error
+    if primary_evidence is not None:
+        final_error = primary_evidence.as_error()
+        for evidence in cleanup_evidence:
+            final_error.add_note(evidence.as_note())
         if cleanup_diagnostic is not None:
             raise final_error from cleanup_diagnostic
         raise final_error

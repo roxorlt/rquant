@@ -935,6 +935,59 @@ def test_supervisor_cleanup_state_matrix_preserves_or_loses_group_anchor_once(
             assert ("kill", signal.SIGKILL) not in events
         assert process.state is execution_module._SupervisorLifecycleState.REAPED
 
+    secret_path = "/private/formal-cleanup-secret.py"
+    secret_argv = "--cleanup-token=argv-secret"
+    secret_token = "cleanup-credential-secret"
+    control_read, control_write = os.pipe()
+    status_read, status_write = os.pipe()
+    os.close(control_read)
+    os.close(status_write)
+    dual_failure_process = execution_module._FormalSmokeChildProcess(
+        process=FakePopen([], None),  # type: ignore[arg-type]
+        lifetime_descriptor=control_write,
+        status_descriptor=status_read,
+    )
+
+    def fail_group_cleanup(_process: object) -> object:
+        return execution_module.FormalSmokeCleanupError(f"{secret_path} {secret_argv}")
+
+    def fail_reap(_process: object, *, deadline_monotonic: float) -> int:
+        assert deadline_monotonic > 0
+        raise execution_module.FormalSmokeCleanupError(secret_token)
+
+    with monkeypatch.context() as dual_failure_patch:
+        dual_failure_patch.setattr(
+            execution_module,
+            "_observe_supervisor_without_reaping",
+            lambda _process: None,
+        )
+        dual_failure_patch.setattr(
+            execution_module,
+            "_final_kill_supervisor_group",
+            fail_group_cleanup,
+        )
+        dual_failure_patch.setattr(
+            execution_module,
+            "_reap_known_supervisor",
+            fail_reap,
+        )
+        with pytest.raises(execution_module.FormalSmokeCleanupError) as captured:
+            execution_module._cleanup_formal_smoke_supervisor(dual_failure_process)
+
+    assert str(captured.value) == (
+        "formal smoke supervisor cleanup failed "
+        "(subphase=cleanup_kill reason=process_group_cleanup_failed)"
+    )
+    assert captured.value.__notes__ == [
+        "formal smoke cleanup evidence (subphase=cleanup_kill reason=process_group_cleanup_failed)",
+        "formal smoke cleanup evidence (subphase=cleanup_reap reason=process_reap_failed)",
+    ]
+    rendered = "".join(traceback.format_exception(captured.value))
+    for secret in (secret_path, secret_argv, secret_token):
+        assert secret not in rendered
+    assert dual_failure_process.lifetime_descriptor == -1
+    assert dual_failure_process.status_descriptor == -1
+
 
 def test_already_reaped_supervisor_fails_without_signaling_reused_group(
     monkeypatch: pytest.MonkeyPatch,
@@ -1422,6 +1475,49 @@ def test_cleanup_failure_links_only_redacted_initialization_diagnostic(
     rendered = "".join(traceback.format_exception(captured.value))
     for secret in (secret_path, secret_argv, secret_token):
         assert secret not in rendered
+
+    deadline_progress = execution_module._FormalSmokeExchangeProgress(
+        request_sent=True,
+        receipt_bytes=17,
+        receipt_eof=False,
+        status_reported=False,
+    )
+    deadline_failure = deadline_progress.deadline_error()
+    deadline_failure.__cause__ = ValueError(f"{secret_path} {secret_argv} {secret_token}")
+
+    def fail_with_deadline() -> object:
+        raise deadline_failure
+
+    monkeypatch.setattr(
+        execution_module.selectors,
+        "DefaultSelector",
+        fail_with_deadline,
+    )
+    try:
+        with pytest.raises(
+            execution_module.FormalSmokeCleanupError,
+            match="forced cleanup failure",
+        ) as deadline_captured:
+            execution_module._exchange_formal_smoke_child(
+                object(),  # type: ignore[arg-type]
+                b"request",
+                deadline_monotonic=time.monotonic() + 1,
+            )
+    finally:
+        for descriptor in held_descriptors:
+            with suppress(OSError):
+                os.close(descriptor)
+
+    assert str(deadline_captured.value.__cause__) == (
+        "formal smoke child deadline expired "
+        "(phase=receiving_receipt request_sent=true receipt_bytes=17 "
+        "receipt_eof=false status_reported=false)"
+    )
+    assert deadline_captured.value.__cause__.__cause__ is None
+    assert deadline_captured.value.__suppress_context__ is True
+    deadline_rendered = "".join(traceback.format_exception(deadline_captured.value))
+    for secret in (secret_path, secret_argv, secret_token):
+        assert secret not in deadline_rendered
 
 
 def test_formal_smoke_child_launch_has_no_fork_window_when_thread_starts_after_pipe(
