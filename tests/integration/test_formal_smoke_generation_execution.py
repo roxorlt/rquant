@@ -11,6 +11,7 @@ import time
 from contextlib import suppress
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -324,57 +325,148 @@ def test_receipt_fd_holder_times_out_reaps_process_group_and_cleans_staging(
     from rquant.formal_smoke_execution import FormalSmokeExecutionError
 
     identity_path = tmp_path / "child-process-group.txt"
-    child_processes: list[subprocess.Popen[bytes]] = []
+    script = (
+        "import os, signal, subprocess, sys\n"
+        "request_descriptor = int(sys.argv[1])\n"
+        "receipt_descriptor = int(sys.argv[2])\n"
+        "while os.read(request_descriptor, 65536):\n"
+        "    pass\n"
+        "os.close(request_descriptor)\n"
+        "descendant = subprocess.Popen((\n"
+        "    sys.executable, '-c',\n"
+        "    'import signal,time; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(10)',\n"
+        "), pass_fds=(receipt_descriptor,))\n"
+        "os.close(receipt_descriptor)\n"
+        "with open(sys.argv[3], 'w', encoding='ascii') as target:\n"
+        "    target.write(f'{os.getppid()}:{os.getpgrp()}\\n')\n"
+        "    target.write(f'{descendant.pid}:{os.getpgid(descendant.pid)}\\n')\n"
+    )
 
-    def retain_receipt_fd_forever(
+    class ReceiptHolderLaunch:
+        def __init__(self, request_descriptor: int, receipt_descriptor: int) -> None:
+            self.inherited_descriptors = (
+                os.open(sys.executable, os.O_RDONLY),
+                os.dup(request_descriptor),
+                os.dup(receipt_descriptor),
+            )
+            self.interpreter_descriptor = self.inherited_descriptors[0]
+            self.argv = (
+                sys.executable,
+                "-c",
+                script,
+                str(self.inherited_descriptors[1]),
+                str(self.inherited_descriptors[2]),
+                os.fspath(identity_path),
+            )
+            self.environment = {"PYTHONUNBUFFERED": "1"}
+            self.working_directory = tmp_path
+
+        def __enter__(self) -> ReceiptHolderLaunch:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            for descriptor in self.inherited_descriptors:
+                os.close(descriptor)
+
+    def prepare_receipt_holder_launch(
         _session: object,
         *,
         request_descriptor: int,
         receipt_descriptor: int,
-    ) -> object:
-        script = (
-            "import os, subprocess, sys, time\n"
-            "descendant = subprocess.Popen((\n"
-            "    sys.executable, '-c',\n"
-            "    'import signal,time; "
-            "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(10)',\n"
-            "))\n"
-            "with open(sys.argv[1], 'w', encoding='ascii') as target:\n"
-            "    target.write(f'{os.getpid()}:{os.getpgrp()}\\n')\n"
-            "    target.write(f'{descendant.pid}:{os.getpgid(descendant.pid)}\\n')\n"
-            "time.sleep(30)\n"
-        )
-        process = subprocess.Popen(
-            (
-                sys.executable,
-                "-c",
-                script,
-                os.fspath(identity_path),
-            ),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            close_fds=True,
-            pass_fds=(request_descriptor, receipt_descriptor),
-            start_new_session=True,
-        )
-        child_processes.append(process)
-        return execution_module._FormalSmokeChildProcess(
-            process=process,
-            lifetime_descriptor=-1,
-        )
+    ) -> ReceiptHolderLaunch:
+        return ReceiptHolderLaunch(request_descriptor, receipt_descriptor)
 
-    monkeypatch.setattr(
-        execution_module,
-        "_spawn_formal_smoke_child",
-        retain_receipt_fd_forever,
-    )
+    if os.execve in os.supports_fd:
+        monkeypatch.setattr(
+            execution_module,
+            "prepare_formal_smoke_launch",
+            prepare_receipt_holder_launch,
+        )
+    else:
+
+        def spawn_portable_supervisor(
+            _session: object,
+            *,
+            request_descriptor: int,
+            receipt_descriptor: int,
+        ) -> object:
+            supervisor_script = (
+                "import os, signal, subprocess, sys, time\n"
+                "control_descriptor = int(sys.argv[2])\n"
+                "status_descriptor = int(sys.argv[3])\n"
+                "request_descriptor = int(sys.argv[4])\n"
+                "receipt_descriptor = int(sys.argv[5])\n"
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                "while os.read(request_descriptor, 65536):\n"
+                "    pass\n"
+                "os.close(request_descriptor)\n"
+                "descendant = subprocess.Popen((\n"
+                "    sys.executable, '-c',\n"
+                "    'import signal,time; "
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(10)',\n"
+                "), pass_fds=(receipt_descriptor,))\n"
+                "os.close(receipt_descriptor)\n"
+                "with open(sys.argv[1], 'w', encoding='ascii') as target:\n"
+                "    target.write(f'{os.getpid()}:{os.getpgrp()}\\n')\n"
+                "    target.write(f'{descendant.pid}:{os.getpgid(descendant.pid)}\\n')\n"
+                "os.write(status_descriptor, bytes((0,)))\n"
+                "os.close(status_descriptor)\n"
+                "os.read(control_descriptor, 1)\n"
+                "os.killpg(0, signal.SIGTERM)\n"
+                "time.sleep(0.25)\n"
+                "os.killpg(0, signal.SIGKILL)\n"
+            )
+            control_read, control_write = os.pipe()
+            status_read, status_write = os.pipe()
+            try:
+                process = subprocess.Popen(
+                    (
+                        sys.executable,
+                        "-c",
+                        supervisor_script,
+                        os.fspath(identity_path),
+                        str(control_read),
+                        str(status_write),
+                        str(request_descriptor),
+                        str(receipt_descriptor),
+                    ),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    close_fds=True,
+                    pass_fds=(
+                        request_descriptor,
+                        receipt_descriptor,
+                        control_read,
+                        status_write,
+                    ),
+                    start_new_session=True,
+                )
+            except BaseException:
+                os.close(control_write)
+                os.close(status_read)
+                raise
+            finally:
+                os.close(control_read)
+                os.close(status_write)
+            return execution_module._FormalSmokeChildProcess(
+                process=process,
+                lifetime_descriptor=control_write,
+                status_descriptor=status_read,
+            )
+
+        monkeypatch.setattr(
+            execution_module,
+            "_spawn_formal_smoke_child",
+            spawn_portable_supervisor,
+        )
 
     def exchange(session: object, request_bytes: bytes):
         return execution_module._exchange_formal_smoke_child(
             session,
             request_bytes,
-            deadline_monotonic=time.monotonic() + 0.25,
+            deadline_monotonic=time.monotonic() + 0.75,
         )
 
     started = time.monotonic()
@@ -383,15 +475,13 @@ def test_receipt_fd_holder_times_out_reaps_process_group_and_cleans_staging(
     elapsed = time.monotonic() - started
 
     assert elapsed < 2
-    assert len(child_processes) == 1
-    assert child_processes[0].returncode is not None
     identities = tuple(
         tuple(int(value) for value in line.split(":"))
         for line in identity_path.read_text(encoding="ascii").splitlines()
     )
-    assert identities[0][0] == child_processes[0].pid
     assert all(process_id == process_group for process_id, process_group in identities[:1])
-    assert identities[1][1] == child_processes[0].pid
+    supervisor_pid = identities[0][0]
+    assert identities[1][1] == supervisor_pid
     descendant_pid = identities[1][0]
     descendant_deadline = time.monotonic() + 3
     while time.monotonic() < descendant_deadline:
@@ -403,43 +493,254 @@ def test_receipt_fd_holder_times_out_reaps_process_group_and_cleans_staging(
     else:
         pytest.fail(f"formal smoke descendant {descendant_pid} survived group cleanup")
     with pytest.raises(ChildProcessError):
-        os.waitpid(child_processes[0].pid, os.WNOHANG)
+        os.waitpid(supervisor_pid, os.WNOHANG)
     assert not list((tmp_path / "output").glob("strategy_lab_runs/*"))
     assert not list((tmp_path / "output").glob(".formal-smoke-*"))
 
 
-def test_process_group_leader_is_not_reaped_before_final_group_kill(
+def test_supervisor_cleanup_state_matrix_preserves_or_loses_group_anchor_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from rquant import formal_smoke_execution as execution_module
 
-    events: list[tuple[str, float | int]] = []
+    scenarios = (
+        ("leader-running", None, None, False),
+        ("leader-exited-unreaped", 126, None, False),
+        ("group-esrch", None, ProcessLookupError(), False),
+        ("group-eperm", None, PermissionError(), True),
+    )
 
-    class FakeProcess:
+    class FakePopen:
         pid = 41_041
+
+        def __init__(
+            self,
+            event_log: list[tuple[str, float | int]],
+            observed_return_code: int | None,
+        ) -> None:
+            self.returncode: int | None = None
+            self._event_log = event_log
+            self._observed_return_code = observed_return_code
 
         def wait(self, *, timeout: float | None = None) -> int:
             assert timeout is not None
-            events.append(("wait", timeout))
-            return -signal.SIGKILL
+            self._event_log.append(("wait", timeout))
+            self.returncode = self._observed_return_code or -signal.SIGKILL
+            return self.returncode
 
+    for name, observed_return_code, group_error, expect_error in scenarios:
+        events: list[tuple[str, float | int]] = []
+        control_read, control_write = os.pipe()
+        status_read, status_write = os.pipe()
+        os.close(control_read)
+        os.close(status_write)
+
+        process = execution_module._FormalSmokeChildProcess(
+            process=FakePopen(events, observed_return_code),  # type: ignore[arg-type]
+            lifetime_descriptor=control_write,
+            status_descriptor=status_read,
+        )
+        if observed_return_code is not None:
+            wait_observations = iter(
+                (
+                    SimpleNamespace(
+                        si_pid=process.pid,
+                        si_code=os.CLD_EXITED,
+                        si_status=observed_return_code,
+                    ),
+                )
+            )
+        else:
+            wait_observations = iter((None,))
+
+        def waitid(
+            *_args: object,
+            observations: object = wait_observations,
+        ) -> object | None:
+            return next(observations, None)  # type: ignore[call-overload]
+
+        def killpg(
+            _process_group: int,
+            signum: int,
+            *,
+            event_log: list[tuple[str, float | int]] = events,
+            error: BaseException | None = group_error,
+        ) -> None:
+            event_log.append(("killpg", signum))
+            if error is not None:
+                raise error
+
+        def kill(
+            _pid: int,
+            signum: int,
+            *,
+            event_log: list[tuple[str, float | int]] = events,
+        ) -> None:
+            event_log.append(("kill", signum))
+
+        with monkeypatch.context() as scenario_patch:
+            scenario_patch.setattr(execution_module.os, "waitid", waitid)
+            scenario_patch.setattr(execution_module.os, "killpg", killpg)
+            scenario_patch.setattr(
+                execution_module.os,
+                "kill",
+                kill,
+            )
+            scenario_patch.setattr(execution_module.time, "sleep", lambda _seconds: None)
+
+            if expect_error:
+                with pytest.raises(execution_module.FormalSmokeCleanupError, match="permission"):
+                    execution_module._cleanup_formal_smoke_supervisor(process)
+            else:
+                execution_module._cleanup_formal_smoke_supervisor(process)
+
+        assert events.count(("killpg", signal.SIGKILL)) == 1, name
+        assert next(index for index, event in enumerate(events) if event[0] == "killpg") < next(
+            index for index, event in enumerate(events) if event[0] == "wait"
+        ), name
+        if isinstance(group_error, ProcessLookupError):
+            assert events.count(("killpg", signal.SIGKILL)) == 1
+            assert ("kill", signal.SIGKILL) in events
+        if isinstance(group_error, PermissionError):
+            assert ("kill", signal.SIGKILL) in events
+        assert process.state is execution_module._SupervisorLifecycleState.REAPED
+
+
+def test_already_reaped_supervisor_fails_without_signaling_reused_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant import formal_smoke_execution as execution_module
+
+    control_read, control_write = os.pipe()
+    status_read, status_write = os.pipe()
+    os.close(control_read)
+    os.close(status_write)
+
+    class ReapedPopen:
+        pid = 41_042
+        returncode = 0
+
+    process = execution_module._FormalSmokeChildProcess(
+        process=ReapedPopen(),  # type: ignore[arg-type]
+        lifetime_descriptor=control_write,
+        status_descriptor=status_read,
+    )
+    killpg = pytest.fail
+    monkeypatch.setattr(execution_module.os, "killpg", killpg)
+
+    with pytest.raises(execution_module.FormalSmokeCleanupError, match="reaped"):
+        execution_module._cleanup_formal_smoke_supervisor(process)
+
+    assert process.state is execution_module._SupervisorLifecycleState.REAPED
+
+
+def test_supervisor_owned_teardown_reaps_without_parent_group_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant import formal_smoke_execution as execution_module
+
+    control_read, control_write = os.pipe()
+    status_read, status_write = os.pipe()
+    os.close(status_write)
+
+    class KilledPopen:
+        pid = 41_044
+        returncode: int | None = None
+
+        def wait(self, *, timeout: float | None = None) -> int:
+            assert timeout is not None
+            self.returncode = -signal.SIGKILL
+            return self.returncode
+
+    process = execution_module._FormalSmokeChildProcess(
+        process=KilledPopen(),  # type: ignore[arg-type]
+        lifetime_descriptor=control_write,
+        status_descriptor=status_read,
+        state=execution_module._SupervisorLifecycleState.STATUS_REPORTED,
+    )
+    monkeypatch.setattr(
+        execution_module.os,
+        "waitid",
+        lambda *_args: SimpleNamespace(
+            si_pid=process.pid,
+            si_code=os.CLD_KILLED,
+            si_status=signal.SIGKILL,
+        ),
+    )
     monkeypatch.setattr(
         execution_module.os,
         "killpg",
-        lambda _process_group, signum: events.append(("killpg", signum)),
+        lambda *_args: pytest.fail("parent signaled a supervisor-owned process group"),
     )
+
+    try:
+        execution_module._cleanup_formal_smoke_supervisor(process)
+        assert os.read(control_read, 1) == b"T"
+    finally:
+        os.close(control_read)
+
+    assert process.state is execution_module._SupervisorLifecycleState.REAPED
+
+
+def test_cleanup_failure_is_explicit_and_preserves_exchange_failure_as_cause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant import formal_smoke_execution as execution_module
+
+    held_descriptors: list[int] = []
+
+    class FakePopen:
+        pid = 41_043
+        returncode: int | None = None
+
+    def spawn_without_status(
+        _session: object,
+        *,
+        request_descriptor: int,
+        receipt_descriptor: int,
+    ) -> object:
+        held_descriptors.append(os.dup(request_descriptor))
+        os.close(receipt_descriptor)
+        control_read, control_write = os.pipe()
+        status_read, status_write = os.pipe()
+        held_descriptors.append(control_read)
+        os.close(status_write)
+        return execution_module._FormalSmokeChildProcess(
+            process=FakePopen(),  # type: ignore[arg-type]
+            lifetime_descriptor=control_write,
+            status_descriptor=status_read,
+        )
+
+    def fail_cleanup(process: object) -> None:
+        child = process
+        child.close_lifetime()  # type: ignore[attr-defined]
+        child.close_status()  # type: ignore[attr-defined]
+        raise execution_module.FormalSmokeCleanupError("forced cleanup failure")
+
+    monkeypatch.setattr(execution_module, "_spawn_formal_smoke_child", spawn_without_status)
     monkeypatch.setattr(
-        execution_module.time,
-        "sleep",
-        lambda seconds: events.append(("sleep", seconds)),
+        execution_module,
+        "_cleanup_formal_smoke_supervisor",
+        fail_cleanup,
     )
 
-    execution_module._terminate_process_group(FakeProcess())  # type: ignore[arg-type]
+    try:
+        with pytest.raises(
+            execution_module.FormalSmokeCleanupError,
+            match="forced cleanup failure",
+        ) as captured:
+            execution_module._exchange_formal_smoke_child(
+                object(),  # type: ignore[arg-type]
+                b"request",
+                deadline_monotonic=time.monotonic() + 1,
+            )
+    finally:
+        for descriptor in held_descriptors:
+            with suppress(OSError):
+                os.close(descriptor)
 
-    assert events.count(("sleep", 0.25)) == 1
-    kill_index = events.index(("killpg", signal.SIGKILL))
-    assert kill_index > events.index(("killpg", signal.SIGTERM))
-    assert kill_index < next(index for index, event in enumerate(events) if event[0] == "wait")
+    assert isinstance(captured.value.__cause__, execution_module.FormalSmokeExecutionError)
+    assert "status" in str(captured.value.__cause__)
 
 
 def test_formal_smoke_child_launch_has_no_fork_window_when_thread_starts_after_pipe(
@@ -471,9 +772,7 @@ def test_formal_smoke_child_launch_has_no_fork_window_when_thread_starts_after_p
 
     class FakeProcess:
         pid = 999_999
-
-        def poll(self) -> int | None:
-            return 0 if child_done.is_set() else None
+        returncode: int | None = None
 
     class FakeLaunch:
         def __init__(self, request_descriptor: int, receipt_descriptor: int) -> None:
@@ -514,6 +813,7 @@ def test_formal_smoke_child_launch_has_no_fork_window_when_thread_starts_after_p
         assert isinstance(pass_fds, tuple)
         child_request = os.dup(pass_fds[1])
         child_receipt = os.dup(pass_fds[2])
+        child_status = os.dup(pass_fds[-1])
 
         def exchange_bytes() -> None:
             try:
@@ -524,9 +824,11 @@ def test_formal_smoke_child_launch_has_no_fork_window_when_thread_starts_after_p
                         break
                     request.extend(chunk)
                 os.write(child_receipt, b"receipt:" + bytes(request))
+                os.write(child_status, bytes((0,)))
             finally:
                 os.close(child_request)
                 os.close(child_receipt)
+                os.close(child_status)
                 child_done.set()
 
         child_thread = threading.Thread(target=exchange_bytes, name="formal-smoke-fake-child")
@@ -546,6 +848,19 @@ def test_formal_smoke_child_launch_has_no_fork_window_when_thread_starts_after_p
         prepare_launch,
     )
     monkeypatch.setattr(execution_module.subprocess, "Popen", start_supervisor)
+
+    def finish_fake_supervisor(process: object) -> None:
+        child = process
+        child.close_lifetime()  # type: ignore[attr-defined]
+        child.close_status()  # type: ignore[attr-defined]
+        child.process.returncode = -signal.SIGKILL  # type: ignore[attr-defined]
+        child.state = execution_module._SupervisorLifecycleState.REAPED  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(
+        execution_module,
+        "_cleanup_formal_smoke_supervisor",
+        finish_fake_supervisor,
+    )
 
     try:
         result = execution_module._exchange_formal_smoke_child(

@@ -17,7 +17,9 @@ from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import date
+from enum import StrEnum
 from pathlib import Path, PurePosixPath
+from typing import Protocol, cast
 
 from pydantic import Field, ValidationError
 
@@ -56,9 +58,25 @@ from rquant.strict_json import (
 )
 
 _MAX_RECEIPT_BYTES = 8 * 1024 * 1024
+_SUPERVISOR_CLEANUP_SECONDS = 1.25
+_SUPERVISOR_OWNED_GRACE_SECONDS = 0.5
+_SUPERVISOR_OBSERVE_SECONDS = 0.01
+_SUPERVISOR_TEARDOWN_REQUEST = b"T"
 _DESCRIPTOR_HANDOFF_BOOTSTRAP = "\n".join(
     (
-        "import json, os, select, signal, sys",
+        "import json, os, select, signal, sys, time",
+        "def teardown_group():",
+        "    signal.signal(signal.SIGTERM, signal.SIG_IGN)",
+        "    try:",
+        "        os.killpg(0, signal.SIGTERM)",
+        "    except ProcessLookupError:",
+        "        pass",
+        "    time.sleep(0.25)",
+        "    try:",
+        "        os.killpg(0, signal.SIGKILL)",
+        "    except ProcessLookupError:",
+        "        os._exit(126)",
+        "    os._exit(126)",
         "try:",
         "    descriptor = int(sys.argv[1])",
         "    working_directory = sys.argv[2]",
@@ -66,9 +84,13 @@ _DESCRIPTOR_HANDOFF_BOOTSTRAP = "\n".join(
         "    environment = json.loads(sys.argv[4])",
         "    inherited = json.loads(sys.argv[5])",
         "    lifetime_descriptor = int(sys.argv[6])",
+        "    status_descriptor = int(sys.argv[7])",
+        "    signal.signal(signal.SIGTERM, signal.SIG_IGN)",
         "    generation_pid = os.fork()",
         "    if generation_pid == 0:",
         "        os.close(lifetime_descriptor)",
+        "        os.close(status_descriptor)",
+        "        signal.signal(signal.SIGTERM, signal.SIG_DFL)",
         "        os.chdir(working_directory)",
         "        os.execve(descriptor, arguments, environment)",
         "    for inherited_descriptor in inherited:",
@@ -77,18 +99,27 @@ _DESCRIPTOR_HANDOFF_BOOTSTRAP = "\n".join(
         "        waited, status = os.waitpid(generation_pid, os.WNOHANG)",
         "        if waited == generation_pid:",
         "            code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else 255",
-        "            os._exit(code)",
+        "            break",
         "        readable, _, _ = select.select([lifetime_descriptor], [], [], 0.05)",
-        "        if readable and not os.read(lifetime_descriptor, 1):",
-        "            os.killpg(0, signal.SIGKILL)",
+        "        if readable:",
+        "            os.read(lifetime_descriptor, 1)",
+        "            teardown_group()",
+        "    os.write(status_descriptor, bytes((code,)))",
+        "    os.close(status_descriptor)",
+        "    os.read(lifetime_descriptor, 1)",
+        "    teardown_group()",
         "except BaseException:",
-        "    os._exit(126)",
+        "    teardown_group()",
     )
 )
 
 
 class FormalSmokeExecutionError(RuntimeError):
     """The attested generation did not produce a verifiable formal smoke result."""
+
+
+class FormalSmokeCleanupError(FormalSmokeExecutionError):
+    """The isolated supervisor could not prove that its process group was removed."""
 
 
 class FormalSmokeChildProcessResult(RuntimeContractModel):
@@ -108,23 +139,33 @@ def _exit_code(return_code: int) -> int:
     return return_code
 
 
+class _SupervisorLifecycleState(StrEnum):
+    RUNNING = "running"
+    STATUS_REPORTED = "status_reported"
+    TEARDOWN_REQUESTED = "teardown_requested"
+    GROUP_IDENTITY_LOST = "group_identity_lost"
+    REAPED = "reaped"
+
+
+class _WaitidObservation(Protocol):
+    si_pid: int
+    si_code: int
+    si_status: int
+
+
 @dataclass
 class _FormalSmokeChildProcess:
     process: subprocess.Popen[bytes]
     lifetime_descriptor: int
+    status_descriptor: int
+    state: _SupervisorLifecycleState = _SupervisorLifecycleState.RUNNING
 
     @property
     def pid(self) -> int:
         return self.process.pid
 
-    def poll(self) -> int | None:
-        return self.process.poll()
-
     def wait(self, *, timeout: float | None = None) -> int:
         return self.process.wait(timeout=timeout)
-
-    def send_signal(self, signum: int) -> None:
-        self.process.send_signal(signum)
 
     def close_lifetime(self) -> None:
         if self.lifetime_descriptor == -1:
@@ -132,22 +173,179 @@ class _FormalSmokeChildProcess:
         os.close(self.lifetime_descriptor)
         self.lifetime_descriptor = -1
 
-
-def _terminate_process_group(process: _FormalSmokeChildProcess) -> None:
-    def signal_group(signum: int) -> None:
-        try:
-            os.killpg(process.pid, signum)
-        except ProcessLookupError:
+    def close_status(self) -> None:
+        if self.status_descriptor == -1:
             return
-        except PermissionError:
-            with suppress(PermissionError, ProcessLookupError):
-                os.kill(process.pid, signum)
+        os.close(self.status_descriptor)
+        self.status_descriptor = -1
 
-    signal_group(signal.SIGTERM)
-    time.sleep(0.25)
-    signal_group(signal.SIGKILL)
-    with suppress(subprocess.TimeoutExpired):
-        process.wait(timeout=1)
+
+def _require_nonreaping_wait_support() -> None:
+    required = (
+        "P_PID",
+        "WEXITED",
+        "WNOHANG",
+        "WNOWAIT",
+        "waitid",
+        "CLD_EXITED",
+        "CLD_KILLED",
+        "CLD_DUMPED",
+    )
+    if os.name != "posix" or any(not hasattr(os, name) for name in required):
+        raise FormalSmokeExecutionError(
+            "formal smoke supervisor requires POSIX waitid WNOWAIT support"
+        )
+
+
+def _waitid_return_code(observation: _WaitidObservation) -> int:
+    code = int(observation.si_code)
+    status = int(observation.si_status)
+    if code == os.CLD_EXITED:
+        return status
+    if code in (os.CLD_KILLED, os.CLD_DUMPED):
+        return -status
+    raise FormalSmokeCleanupError(
+        f"formal smoke supervisor returned unexpected wait state {code}"
+    )
+
+
+def _observe_supervisor_without_reaping(
+    process: _FormalSmokeChildProcess,
+) -> int | None:
+    if process.process.returncode is not None:
+        process.state = _SupervisorLifecycleState.REAPED
+        raise FormalSmokeCleanupError(
+            "formal smoke supervisor was already reaped before cleanup"
+        )
+    try:
+        observation = os.waitid(
+            os.P_PID,
+            process.pid,
+            os.WEXITED | os.WNOHANG | os.WNOWAIT,
+        )
+    except ChildProcessError as exc:
+        process.state = _SupervisorLifecycleState.REAPED
+        raise FormalSmokeCleanupError(
+            "formal smoke supervisor identity was already reaped"
+        ) from exc
+    if observation is None:
+        return None
+    observed = cast(_WaitidObservation, observation)
+    if observed.si_pid == 0:
+        return None
+    if observed.si_pid != process.pid:
+        raise FormalSmokeCleanupError("formal smoke supervisor wait identity mismatch")
+    return _waitid_return_code(observed)
+
+
+def _reap_known_supervisor(
+    process: _FormalSmokeChildProcess,
+    *,
+    deadline_monotonic: float,
+) -> int:
+    remaining = max(0.0, deadline_monotonic - time.monotonic())
+    try:
+        return_code = process.wait(timeout=remaining)
+    except subprocess.TimeoutExpired as exc:
+        raise FormalSmokeCleanupError(
+            "formal smoke supervisor did not exit before cleanup deadline"
+        ) from exc
+    process.state = _SupervisorLifecycleState.REAPED
+    return return_code
+
+
+def _kill_known_supervisor(process: _FormalSmokeChildProcess) -> PermissionError | None:
+    try:
+        os.kill(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return None
+    except PermissionError as exc:
+        return exc
+    return None
+
+
+def _fallback_kill_supervisor_group(
+    process: _FormalSmokeChildProcess,
+) -> FormalSmokeCleanupError | None:
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        process.state = _SupervisorLifecycleState.GROUP_IDENTITY_LOST
+        permission_error = _kill_known_supervisor(process)
+        if permission_error is not None:
+            return FormalSmokeCleanupError(
+                "formal smoke supervisor PID cleanup permission denied after group ESRCH"
+            )
+        return None
+    except PermissionError:
+        process.state = _SupervisorLifecycleState.GROUP_IDENTITY_LOST
+        permission_error = _kill_known_supervisor(process)
+        detail = " and PID cleanup was also denied" if permission_error else ""
+        return FormalSmokeCleanupError(
+            f"formal smoke supervisor group cleanup permission denied{detail}"
+        )
+    return None
+
+
+def _cleanup_formal_smoke_supervisor(process: _FormalSmokeChildProcess) -> None:
+    cleanup_deadline = time.monotonic() + _SUPERVISOR_CLEANUP_SECONDS
+    cleanup_error: FormalSmokeCleanupError | None = None
+    request_delivered = False
+    try:
+        if process.process.returncode is not None:
+            process.state = _SupervisorLifecycleState.REAPED
+            raise FormalSmokeCleanupError(
+                "formal smoke supervisor was already reaped before cleanup"
+            )
+        try:
+            request_delivered = (
+                os.write(process.lifetime_descriptor, _SUPERVISOR_TEARDOWN_REQUEST) == 1
+            )
+        except OSError:
+            request_delivered = False
+        finally:
+            with suppress(OSError):
+                process.close_lifetime()
+        if request_delivered:
+            process.state = _SupervisorLifecycleState.TEARDOWN_REQUESTED
+
+        observed_return_code: int | None = None
+        owned_deadline = time.monotonic()
+        if request_delivered:
+            owned_deadline = min(
+                cleanup_deadline,
+                owned_deadline + _SUPERVISOR_OWNED_GRACE_SECONDS,
+            )
+        while True:
+            observed_return_code = _observe_supervisor_without_reaping(process)
+            if observed_return_code is not None or time.monotonic() >= owned_deadline:
+                break
+            time.sleep(
+                min(
+                    _SUPERVISOR_OBSERVE_SECONDS,
+                    max(0.0, owned_deadline - time.monotonic()),
+                )
+            )
+
+        supervisor_cleaned_group = request_delivered and observed_return_code == -signal.SIGKILL
+        if not supervisor_cleaned_group:
+            cleanup_error = _fallback_kill_supervisor_group(process)
+
+        reaped_return_code = _reap_known_supervisor(
+            process,
+            deadline_monotonic=cleanup_deadline,
+        )
+        if supervisor_cleaned_group and reaped_return_code != observed_return_code:
+            cleanup_error = FormalSmokeCleanupError(
+                "formal smoke supervisor changed status while being reaped"
+            )
+        if cleanup_error is not None:
+            raise cleanup_error
+    finally:
+        with suppress(OSError):
+            process.close_lifetime()
+        with suppress(OSError):
+            process.close_status()
 
 
 def _spawn_formal_smoke_child(
@@ -156,12 +354,19 @@ def _spawn_formal_smoke_child(
     request_descriptor: int,
     receipt_descriptor: int,
 ) -> _FormalSmokeChildProcess:
+    _require_nonreaping_wait_support()
     with prepare_formal_smoke_launch(
         session,
         request_descriptor=request_descriptor,
         receipt_descriptor=receipt_descriptor,
     ) as launch:
         lifetime_read, lifetime_write = os.pipe()
+        try:
+            status_read, status_write = os.pipe()
+        except BaseException:
+            os.close(lifetime_read)
+            os.close(lifetime_write)
+            raise
         try:
             command = (
                 sys.executable,
@@ -175,6 +380,7 @@ def _spawn_formal_smoke_child(
                 json.dumps(launch.environment, ensure_ascii=True, separators=(",", ":")),
                 json.dumps(launch.inherited_descriptors, separators=(",", ":")),
                 str(lifetime_read),
+                str(status_write),
             )
             process = subprocess.Popen(
                 command,
@@ -182,18 +388,25 @@ def _spawn_formal_smoke_child(
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 close_fds=True,
-                pass_fds=(*launch.inherited_descriptors, lifetime_read),
+                pass_fds=(
+                    *launch.inherited_descriptors,
+                    lifetime_read,
+                    status_write,
+                ),
                 start_new_session=True,
                 env={},
             )
         except BaseException:
             os.close(lifetime_write)
+            os.close(status_read)
             raise
         finally:
             os.close(lifetime_read)
+            os.close(status_write)
         return _FormalSmokeChildProcess(
             process=process,
             lifetime_descriptor=lifetime_write,
+            status_descriptor=status_read,
         )
 
 
@@ -222,68 +435,100 @@ def _exchange_formal_smoke_child(
     os.close(receipt_write)
     os.set_blocking(request_write, False)
     os.set_blocking(receipt_read, False)
+    os.set_blocking(process.status_descriptor, False)
     selector = selectors.DefaultSelector()
     selector.register(request_write, selectors.EVENT_WRITE, "request")
     selector.register(receipt_read, selectors.EVENT_READ, "receipt")
+    selector.register(process.status_descriptor, selectors.EVENT_READ, "status")
     request_view = memoryview(request_bytes)
     receipt = bytearray()
     receipt_eof = False
+    status_bytes = bytearray()
     child_exit_code: int | None = None
-    completed = False
     try:
-        while child_exit_code is None or not receipt_eof or request_write != -1:
-            if child_exit_code is None:
-                child_exit_code = process.poll()
-            remaining = deadline_monotonic - time.monotonic()
-            if remaining <= 0:
-                raise FormalSmokeExecutionError("formal smoke child deadline expired")
-            for key, _events in selector.select(min(remaining, 0.05)):
-                if key.data == "request":
-                    try:
-                        written = os.write(request_write, request_view)
-                    except BlockingIOError:
-                        continue
-                    if written <= 0:
-                        raise FormalSmokeExecutionError("formal smoke request write failed")
-                    request_view = request_view[written:]
-                    if not request_view:
-                        selector.unregister(request_write)
-                        os.close(request_write)
-                        request_write = -1
-                    continue
-                while True:
-                    try:
-                        chunk = os.read(
-                            receipt_read,
-                            min(64 * 1024, _MAX_RECEIPT_BYTES + 1 - len(receipt)),
-                        )
-                    except BlockingIOError:
-                        break
-                    if not chunk:
-                        selector.unregister(receipt_read)
-                        os.close(receipt_read)
-                        receipt_read = -1
-                        receipt_eof = True
-                        break
-                    receipt.extend(chunk)
-                    if len(receipt) > _MAX_RECEIPT_BYTES:
-                        raise FormalSmokeExecutionError("formal smoke receipt exceeds the limit")
-        assert child_exit_code is not None
-        completed = True
-        return FormalSmokeChildProcessResult(
-            exit_code=_exit_code(child_exit_code),
-            receipt_bytes=bytes(receipt),
-        )
-    finally:
-        selector.close()
-        for descriptor in (request_write, receipt_read):
-            with suppress(OSError):
-                os.close(descriptor)
         try:
-            if not completed:
-                _terminate_process_group(process)
+            while child_exit_code is None or not receipt_eof or request_write != -1:
+                remaining = deadline_monotonic - time.monotonic()
+                if remaining <= 0:
+                    raise FormalSmokeExecutionError("formal smoke child deadline expired")
+                for key, _events in selector.select(min(remaining, 0.05)):
+                    if key.data == "request":
+                        try:
+                            written = os.write(request_write, request_view)
+                        except BlockingIOError:
+                            continue
+                        except BrokenPipeError as exc:
+                            raise FormalSmokeExecutionError(
+                                "formal smoke request pipe closed"
+                            ) from exc
+                        if written <= 0:
+                            raise FormalSmokeExecutionError(
+                                "formal smoke request write failed"
+                            )
+                        request_view = request_view[written:]
+                        if not request_view:
+                            selector.unregister(request_write)
+                            os.close(request_write)
+                            request_write = -1
+                        continue
+                    if key.data == "status":
+                        try:
+                            chunk = os.read(process.status_descriptor, 2)
+                        except BlockingIOError:
+                            continue
+                        if chunk:
+                            status_bytes.extend(chunk)
+                            if len(status_bytes) > 1:
+                                raise FormalSmokeExecutionError(
+                                    "formal smoke supervisor status is invalid"
+                                )
+                            continue
+                        selector.unregister(process.status_descriptor)
+                        process.close_status()
+                        if len(status_bytes) != 1:
+                            raise FormalSmokeExecutionError(
+                                "formal smoke supervisor returned no status"
+                            )
+                        child_exit_code = status_bytes[0]
+                        process.state = _SupervisorLifecycleState.STATUS_REPORTED
+                        continue
+                    while True:
+                        try:
+                            chunk = os.read(
+                                receipt_read,
+                                min(64 * 1024, _MAX_RECEIPT_BYTES + 1 - len(receipt)),
+                            )
+                        except BlockingIOError:
+                            break
+                        if not chunk:
+                            selector.unregister(receipt_read)
+                            os.close(receipt_read)
+                            receipt_read = -1
+                            receipt_eof = True
+                            break
+                        receipt.extend(chunk)
+                        if len(receipt) > _MAX_RECEIPT_BYTES:
+                            raise FormalSmokeExecutionError(
+                                "formal smoke receipt exceeds the limit"
+                            )
+            assert child_exit_code is not None
+            result = FormalSmokeChildProcessResult(
+                exit_code=_exit_code(child_exit_code),
+                receipt_bytes=bytes(receipt),
+            )
         finally:
-            process.close_lifetime()
+            selector.close()
+            for descriptor in (request_write, receipt_read):
+                with suppress(OSError):
+                    os.close(descriptor)
+    except BaseException as exc:
+        try:
+            _cleanup_formal_smoke_supervisor(process)
+        except FormalSmokeCleanupError as cleanup_exc:
+            raise cleanup_exc from exc
+        raise
+    _cleanup_formal_smoke_supervisor(process)
+    return result
 
 
 def _require_output_root(output_dir: Path) -> Path:
