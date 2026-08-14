@@ -9,10 +9,10 @@ import sqlite3
 import subprocess
 import tempfile
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, suppress
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, tzinfo
 from pathlib import Path
 from queue import Empty
 from threading import Barrier, Event, Lock, Thread, current_thread
@@ -82,6 +82,36 @@ from .test_source_operation_contracts import (
 )
 
 NOW = datetime(2026, 8, 5, 4, tzinfo=UTC)
+
+
+class _MutableUtcClock:
+    def __init__(self, current: datetime) -> None:
+        self.current = current
+
+    def now(self, zone: tzinfo | None = UTC) -> datetime:
+        if zone is None:
+            return self.current.replace(tzinfo=None)
+        return self.current.astimezone(zone)
+
+    def advance(self, seconds: float) -> None:
+        self.current += timedelta(seconds=seconds)
+
+    def install_source_broker_clock(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        clock = self
+
+        class FrozenDateTime(datetime):
+            @classmethod
+            def now(cls, zone: tzinfo | None = None) -> datetime:
+                return clock.now(zone)
+
+        monkeypatch.setattr(source_broker_v2_module, "datetime", FrozenDateTime)
+
+
+def _short_unix_socket_directory() -> tempfile.TemporaryDirectory[str]:
+    for root in (Path("/private/tmp"), Path("/tmp")):
+        if root.is_dir() and not root.is_symlink():
+            return tempfile.TemporaryDirectory(prefix="rqv2-", dir=root)
+    raise RuntimeError("no safe POSIX temporary directory is available for Unix sockets")
 
 
 class _SourceAuthorityTestSecurity:
@@ -212,6 +242,7 @@ class _TestTransport:
         lose_dispatch_once: bool = False,
         block_dispatch: bool = False,
         claim_once_unavailable: bool = False,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._security = _source_authority_security()
         self.source_authority_keyring = self._security.keyring
@@ -223,6 +254,7 @@ class _TestTransport:
         self.claim_once_calls = 0
         self.deadlines: list[float | None] = []
         self.claim_once_unavailable = claim_once_unavailable
+        self._clock = clock or (lambda: datetime.now(UTC))
         self.dispatch_entered = Event()
         self.second_dispatch_entered = Event()
         self.release_dispatch = Event()
@@ -262,7 +294,7 @@ class _TestTransport:
                     existing.executor_owner_token_hash == request.executor_owner_token_hash
                     and existing.executor_generation == request.executor_generation
                 )
-                or datetime.now(UTC) >= existing.not_before_takeover_at
+                or self._clock() >= existing.not_before_takeover_at
             ):
                 self._source_claims[request.operation_id] = request
                 status = SourceBrokerV2ClaimStatus.DEFINITIVELY_ABSENT
@@ -284,7 +316,7 @@ class _TestTransport:
             not_before_takeover_at=request.not_before_takeover_at,
             authority_id=self._security.authority_id,
             key_id=self._security.key_id,
-            observed_at=datetime.now(UTC),
+            observed_at=self._clock(),
             status=status,
             result=result,
             result_hash=(
@@ -1181,7 +1213,6 @@ def test_v2_unix_total_deadline_preserves_response_loss_failure_without_retry(
 
 
 def test_v2_unix_client_real_roundtrip_claim_dispatch_finalize_and_replay(
-    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _allow_local_v2_unix_identity(monkeypatch)
@@ -1203,7 +1234,7 @@ def test_v2_unix_client_real_roundtrip_claim_dispatch_finalize_and_replay(
         update={"operation_request_hash": dispatch_request.request_hash}
     )
 
-    with tempfile.TemporaryDirectory(prefix="rqv2-", dir="/private/tmp") as socket_root:
+    with _short_unix_socket_directory() as socket_root:
         socket_path = Path(socket_root) / "s"
         with _V2UnixTestServer(socket_path, transport, max_connections=5):
             client = _real_v2_unix_client(socket_path=socket_path, security=security)
@@ -1286,7 +1317,6 @@ def test_v2_unix_client_real_roundtrip_claim_dispatch_finalize_and_replay(
 
 
 def test_v2_unix_response_loss_restart_recovers_by_signed_lookup_without_redispatch(
-    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _allow_local_v2_unix_identity(monkeypatch)
@@ -1307,7 +1337,7 @@ def test_v2_unix_response_loss_restart_recovers_by_signed_lookup_without_redispa
     claim = _source_claim_request().model_copy(
         update={"operation_request_hash": dispatch_request.request_hash}
     )
-    with tempfile.TemporaryDirectory(prefix="rqv2-", dir="/private/tmp") as socket_root:
+    with _short_unix_socket_directory() as socket_root:
         first_socket = Path(socket_root) / "a"
         with _V2UnixTestServer(
             first_socket,
@@ -1652,11 +1682,26 @@ def test_v2_saga_concurrent_same_attempt_has_one_durable_source_effect(
 
 def test_v2_saga_renews_50ms_lease_while_80ms_dispatch_is_inflight(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     request, current, quota = _request(tmp_path)
     path = tmp_path / "saga.sqlite3"
-    transport = _TestTransport(block_dispatch=True)
+    clock = _MutableUtcClock(datetime.now(UTC))
+    clock.install_source_broker_clock(monkeypatch)
+    transport = _TestTransport(block_dispatch=True, clock=lambda: clock.now())
     lineage = _TestLineageAuthority()
+    heartbeat_renewed = Event()
+    original_heartbeat = SourceBrokerV2Saga._heartbeat_outbox
+
+    def observe_background_heartbeat(
+        saga: SourceBrokerV2Saga,
+        **kwargs: object,
+    ) -> None:
+        original_heartbeat(saga, **kwargs)  # type: ignore[arg-type]
+        if current_thread().name.startswith("rquant-source-broker-v2-heartbeat-"):
+            heartbeat_renewed.set()
+
+    monkeypatch.setattr(SourceBrokerV2Saga, "_heartbeat_outbox", observe_background_heartbeat)
 
     def run() -> object:
         return SourceBrokerV2Saga.for_nonproduction(
@@ -1673,7 +1718,8 @@ def test_v2_saga_renews_50ms_lease_while_80ms_dispatch_is_inflight(
     with ThreadPoolExecutor(max_workers=2) as executor:
         first = executor.submit(run)
         assert transport.dispatch_entered.wait(timeout=5)
-        time.sleep(0.06)
+        clock.advance(0.06)
+        assert heartbeat_renewed.wait(timeout=5)
         second = executor.submit(run)
         try:
             assert not transport.second_dispatch_entered.wait(timeout=0.1)
@@ -1787,7 +1833,9 @@ def test_v2_saga_takeover_waits_for_persisted_source_cooldown(
 ) -> None:
     request, current, quota = _request(tmp_path)
     path = tmp_path / "saga.sqlite3"
-    transport = _TestTransport()
+    clock = _MutableUtcClock(datetime.now(UTC))
+    clock.install_source_broker_clock(monkeypatch)
+    transport = _TestTransport(clock=lambda: clock.now())
     lineage = _TestLineageAuthority()
     first = SourceBrokerV2Saga.for_nonproduction(
         path,
@@ -1809,7 +1857,7 @@ def test_v2_saga_takeover_waits_for_persisted_source_cooldown(
     monkeypatch.setattr(first, "_before_external_effect", crash_before_invoke)
     with pytest.raises(SystemExit, match="before source transport"):
         first.advance(request, now=NOW + timedelta(seconds=1))
-    time.sleep(0.055)
+    clock.advance(0.055)
 
     takeover = SourceBrokerV2Saga.for_nonproduction(
         path,
@@ -1827,7 +1875,7 @@ def test_v2_saga_takeover_waits_for_persisted_source_cooldown(
 
     assert waiting.state is SourceBrokerV2SagaState.RECONCILE_REQUIRED
     assert transport.dispatch_calls == 0
-    time.sleep(0.08)
+    clock.advance(0.08)
     recovered = takeover.reconcile(request, now=NOW + timedelta(seconds=3))
     assert recovered.state is SourceBrokerV2SagaState.COMPLETE
     assert transport.dispatch_calls == 1
@@ -1839,7 +1887,9 @@ def test_v2_saga_heartbeat_failure_late_result_recovers_without_thread_leak(
 ) -> None:
     request, current, quota = _request(tmp_path)
     path = tmp_path / "saga.sqlite3"
-    transport = _TestTransport(block_dispatch=True)
+    clock = _MutableUtcClock(datetime.now(UTC))
+    clock.install_source_broker_clock(monkeypatch)
+    transport = _TestTransport(block_dispatch=True, clock=lambda: clock.now())
     lineage = _TestLineageAuthority()
     first = SourceBrokerV2Saga.for_nonproduction(
         path,
@@ -1854,6 +1904,7 @@ def test_v2_saga_heartbeat_failure_late_result_recovers_without_thread_leak(
         source_takeover_grace_seconds=0.04,
     )
     original_heartbeat = first._heartbeat_outbox
+    heartbeat_failed = Event()
 
     def fail_background_heartbeat(**kwargs: object) -> None:
         if kwargs.get(
@@ -1861,6 +1912,7 @@ def test_v2_saga_heartbeat_failure_late_result_recovers_without_thread_leak(
         ) is SourceBrokerV2OutboxPhase.DISPATCH and current_thread().name.startswith(
             "rquant-source-broker-v2-heartbeat-"
         ):
+            heartbeat_failed.set()
             raise ConnectionError("heartbeat authority unavailable")
         original_heartbeat(**kwargs)  # type: ignore[arg-type]
 
@@ -1875,7 +1927,8 @@ def test_v2_saga_heartbeat_failure_late_result_recovers_without_thread_leak(
         if not transport.dispatch_entered.wait(timeout=5):
             first_future.result(timeout=1)
             pytest.fail("source dispatch was not entered")
-        time.sleep(0.07)
+        assert heartbeat_failed.wait(timeout=5)
+        clock.advance(0.07)
         second = SourceBrokerV2Saga.for_nonproduction(
             path,
             saga_id="saga-a",
@@ -1921,7 +1974,9 @@ def test_v2_saga_owner_crash_before_dispatch_invoke_is_taken_over_after_lease(
 ) -> None:
     request, current, quota = _request(tmp_path)
     path = tmp_path / "saga.sqlite3"
-    transport = _TestTransport()
+    clock = _MutableUtcClock(datetime.now(UTC))
+    clock.install_source_broker_clock(monkeypatch)
+    transport = _TestTransport(clock=lambda: clock.now())
     lineage = _TestLineageAuthority()
     first = SourceBrokerV2Saga.for_nonproduction(
         path,
@@ -1944,7 +1999,7 @@ def test_v2_saga_owner_crash_before_dispatch_invoke_is_taken_over_after_lease(
     with pytest.raises(SystemExit, match="before source invoke"):
         first.advance(request, now=NOW + timedelta(seconds=1))
 
-    time.sleep(0.06)
+    clock.advance(0.06)
     restarted = SourceBrokerV2Saga.for_nonproduction(
         path,
         saga_id="saga-a",
@@ -1974,7 +2029,9 @@ def test_v2_saga_owner_crash_after_dispatch_invoke_recovers_without_redispatch(
 ) -> None:
     request, current, quota = _request(tmp_path)
     path = tmp_path / "saga.sqlite3"
-    transport = _TestTransport()
+    clock = _MutableUtcClock(datetime.now(UTC))
+    clock.install_source_broker_clock(monkeypatch)
+    transport = _TestTransport(clock=lambda: clock.now())
     lineage = _TestLineageAuthority()
     first = SourceBrokerV2Saga.for_nonproduction(
         path,
@@ -1994,7 +2051,7 @@ def test_v2_saga_owner_crash_after_dispatch_invoke_recovers_without_redispatch(
     monkeypatch.setattr(first, "_after_external_effect", crash_after_invoke)
     first_result = first.advance(request, now=NOW + timedelta(seconds=1))
     assert first_result.state is SourceBrokerV2SagaState.RECONCILE_REQUIRED
-    time.sleep(0.06)
+    clock.advance(0.06)
 
     restarted = SourceBrokerV2Saga.for_nonproduction(
         path,
@@ -2108,7 +2165,6 @@ def test_v2_saga_old_local_snapshot_recovers_authority_head_without_redispatch(
     assert first_result.state is SourceBrokerV2SagaState.RECONCILE_REQUIRED
     completed = first.reconcile(request, now=NOW + timedelta(seconds=2))
     assert completed.state is SourceBrokerV2SagaState.COMPLETE
-    time.sleep(0.06)
     with (
         sqlite3.connect(snapshot_path) as source,
         sqlite3.connect(path) as target,
