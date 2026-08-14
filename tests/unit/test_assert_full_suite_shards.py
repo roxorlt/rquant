@@ -56,15 +56,6 @@ LINUX_DARWIN_CONTRACT_NODEIDS = (
     "tests/unit/test_contained_subprocess.py::test_darwin_track_stops_before_next_control_when_hook_activates",
     "tests/unit/test_contained_subprocess.py::test_darwin_track_preserves_first_error_across_later_control_failure",
     "tests/unit/test_contained_subprocess.py::test_darwin_track_rechecks_hooks_after_kernel_handoffs",
-    "tests/unit/test_contained_subprocess.py::test_kqueue_acquisition_accepts_no_execution_hooks_and_rejects_both",
-    "tests/unit/test_contained_subprocess.py::test_darwin_background_capable_command_is_rejected_before_spawn",
-    "tests/unit/test_contained_subprocess.py::test_darwin_native_detacher_is_refused_before_root_can_fork",
-    "tests/unit/test_contained_subprocess.py::test_darwin_pipe_marker_survives_missing_intermediate_and_reparent",
-    "tests/unit/test_contained_subprocess.py::test_darwin_tracker_close_joins_before_closing_live_kqueue",
-    "tests/unit/test_contained_subprocess.py::test_darwin_tracker_retains_queue_after_persistent_close_failure",
-    "tests/unit/test_contained_subprocess.py::test_darwin_tracker_keeps_pipe_marked_grandchild_after_parent_chain_breaks",
-    "tests/unit/test_contained_subprocess.py::test_darwin_pipe_identity_remains_anchored_through_final_inventory",
-    "tests/unit/test_contained_subprocess.py::test_darwin_anchor_dup_is_owned_before_inheritable_update",
     "tests/unit/test_lab_launchd.py::test_lab_launchd_plists_pass_plutil_lint",
 )
 
@@ -236,7 +227,8 @@ def _assert_linux_darwin_contract(repository_root: Path) -> None:
         )
     output = completed.stdout + completed.stderr
     assert completed.returncode == 0, output
-    assert "18 passed, 48 skipped" in output
+    assert "57 passed" in output
+    assert "skipped" not in output
 
 
 def test_validator_aggregates_real_testcases_and_skips(
@@ -367,6 +359,13 @@ def test_clean_environment_aggregate_uses_shared_private_collect_setup(
     )
     assert second["RQUANT_CI_ROOT"] != prepared["RQUANT_CI_ROOT"]
     _assert_linux_darwin_contract(Path(__file__).parents[2])
+    full_suite = json.loads(
+        (Path(__file__).parents[1] / "manifests/full-suite-v1/index.json").read_text(
+            encoding="utf-8"
+        )
+    )["full_suite"]
+    assert full_suite["cases"] == 11144
+    assert full_suite["skips"] == 48
 
 
 @pytest.mark.parametrize("outcome", ("failure", "error"))
