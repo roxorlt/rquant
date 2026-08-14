@@ -9,6 +9,7 @@ from collections.abc import Mapping, Sequence
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from enum import Enum
+from pathlib import PurePath
 from typing import Annotated
 from uuid import UUID
 
@@ -62,6 +63,8 @@ def _canonical_value(value: object) -> object:
         return {"$date": value.isoformat()}
     if isinstance(value, UUID):
         return {"$uuid": str(value)}
+    if isinstance(value, PurePath):
+        return str(value)
     if isinstance(value, Mapping):
         if any(not isinstance(key, str) for key in value):
             raise TypeError("canonical mappings require string keys")

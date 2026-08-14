@@ -77,7 +77,12 @@ patch does not contain a production private key or issue a production anchor.
 Opening a v4 file through `PaperBrokerStore` fails closed with `offline
 migration required`; it never mutates the source. Stop the writer, checkpoint
 the SQLite source (no active WAL, SHM, or journal sidecar), and use
-`migrate_paper_ledger_v4_offline_copy(source_path, candidate_path)`. The API
+`migrate_paper_ledger_v4_offline_copy(source_path, publication_root,
+root_policy=policy)`. The publication root must already exist and the required
+`PublicationRootPolicy` must match it lexically. `LOCAL_AUDIT` requires a
+current-UID/GID `0700` root and creates or revalidates a `0700` `generations`
+directory. `SEPARATED_IDENTITY` is a future, pre-provisioned profile and fails
+closed without its required identity, group, mode, and ACL observations. The API
 first verifies the closed regular source using the frozen
 schema-v4/internal-2 reconciler. That independent replay validates cash, FIFO
 lots and consumptions, realized P&L, receipts, and the predecessor
@@ -98,20 +103,42 @@ Each intent's initial execution ID and request fingerprint must bind one
 initial receipt; a filled initial receipt may coincide only with sequence one
 of its own order, never a later fill or another order's fill.
 Direct migration tests corrupt each lot provenance field, consumption mapping,
-realized P&L, and receipt payload; every case rejects before a candidate exists
-while preserving the corrupt source's pre-attempt hash. The migrator then
+realized P&L, and receipt payload; every case rejects before a generation is
+committed while preserving the corrupt source's pre-attempt hash. The migrator then
 opens the closed regular source with no-follow semantics, descriptor-copies a
 private snapshot before reconciliation, retains that descriptor through the
 transformation copy, and binds the reconciliation report, copied-byte hash, and
 v5 migration attestation to that snapshot. Device/inode/size/mtime/ctime
 identity, descriptor identity, and sidecar absence are rechecked before
 publication, so path replacement, mutation, WAL/SHM/journal appearance, or
-replacement-and-restore races reject and clean up the temporary snapshot and
-candidate. It transforms only the descriptor copy in an explicit transaction
-and hard-links it into the requested offline candidate after verification.
-Every injected or ordinary phase failure, including one immediately after the
-hard-link publication boundary, leaves the source bytes and SHA-256 unchanged
-and publishes no candidate.
+replacement-and-restore races reject. It transforms only the descriptor copy in
+an explicit transaction, closes SQLite in `DELETE` journal mode, requires an
+exact sidecar-free inventory, content-addresses the closed main database, and
+writes an exact canonical manifest. The ready directory is committed with the
+platform's atomic no-replace rename into `generation-<nonce>`.
+
+Rename success is the irreversible boundary. Every later failure preserves the
+generation and raises `PaperMigrationPostCommitIndeterminateError` with typed
+discovery state; recovery accepts only that state plus the configured policy.
+`LOCAL_AUDIT` never destructively cleans a visible building workspace,
+generation, object, manifest, sidecar, substitution, or materialization after a
+failure. Pre-rename failures report a retained orphan instead. There is no
+`current.json`, durable receipt file, signature, authorization claim, or live
+promotion in this protocol.
+
+Normal success returns `PaperOfflineMigrationResult` with the bound v4 report;
+its only publication authority is an in-memory
+`PaperMigrationPublicationReceipt`, never a published path. Audit callers pass
+that receipt to `materialize_paper_migration_for_audit`, which revalidates the
+policy, canonical raw manifest, exact inventory, descriptor identities, and
+object digest. It copies once from one retained object descriptor into an
+exclusive `0600` file under a pre-existing current-UID/GID `0700` staging root,
+then verifies source pre/post identity, copy digest and size, destination fsync,
+and a final destination digest. Only the returned
+`PaperMigrationAuditMaterialization.private_path` may be opened by SQLite or
+`PaperBrokerStore`; the content-addressed generation path is never a consumer
+input. Every migration and materialization failure leaves the source bytes and
+SHA-256 unchanged.
 
 The committed v4 fixture is built only by running exact parent
 `c088774c3199c02edf203a3af758452eb38a5118` with parent `src` first. Its seed

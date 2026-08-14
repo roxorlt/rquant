@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta, timezone
+from pathlib import Path
 from uuid import UUID
 
 import pytest
@@ -62,6 +63,11 @@ def test_canonical_sha256_encodes_uuid_with_an_explicit_type_marker() -> None:
 
     assert canonical_sha256({"job_id": value}) == canonical_sha256({"job_id": UUID(str(value))})
     assert canonical_sha256({"job_id": value}) != canonical_sha256({"job_id": str(value)})
+
+
+def test_canonical_sha256_encodes_paths_as_their_lexical_string() -> None:
+    path = Path("/private/var/example")
+    assert canonical_sha256({"path": path}) == canonical_sha256({"path": str(path)})
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])

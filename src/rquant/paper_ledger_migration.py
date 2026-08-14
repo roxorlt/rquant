@@ -5,15 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import secrets
 import sqlite3
 import stat
-from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
-
-from pydantic import Field, computed_field
 
 from rquant.paper_contracts import (
     PaperLedgerArchiveBinding,
@@ -22,53 +17,35 @@ from rquant.paper_contracts import (
 )
 from rquant.paper_ledger_v4 import (
     V4LedgerReconciler,
-    V4LedgerReconciliationReport,
     sha256_file,
 )
-from rquant.runtime_contracts import RuntimeContractModel, canonical_sha256
+from rquant.paper_migration_publication import (
+    MIGRATION_FAULT_POINTS,
+    PaperMigrationFaultPoint,
+    PaperMigrationOrphanState,
+    PaperMigrationPostCommitIndeterminateError,
+    PaperMigrationPostCommitState,
+    PaperMigrationPreCommitError,
+    PaperOfflineMigrationResult,
+    PublicationRootPolicy,
+    begin_paper_migration_publication,
+    materialize_paper_migration_for_audit,
+    publish_paper_migration_generation,
+    recover_paper_migration_publication,
+)
+from rquant.runtime_contracts import canonical_sha256
 
 MIGRATION_ALGORITHM_ID = "paper-ledger-v4-to-v5-archive-v2"
 TARGET_SCHEMA_IDENTITY = "paper-ledger-schema-v5-internal-4"
 TARGET_SCHEMA_VERSION = 5
 TARGET_INTERNAL_MIGRATION_VERSION = 4
-OFFLINE_MIGRATION_PHASES = (
-    "source_preflight",
-    "source_reconciliation",
-    "schema_additions",
-    "legacy_cost_evidence",
-    "archive",
-    "v5_schema",
-    "archive_protection",
-    "attestation",
-    "verification",
-    "publication",
-)
+OFFLINE_MIGRATION_PHASES = MIGRATION_FAULT_POINTS
 _ARCHIVE_TABLE_SPECS = (
     ("paper_ledger_schema_v4_archive", ("singleton",)),
     ("paper_ledger_attestation_v4_archive", ("revision",)),
     ("paper_ledger_head_marker_v4_archive", ("revision",)),
     ("paper_ledger_tamper_marker_v4_archive", ("tamper_id",)),
 )
-
-
-class PaperOfflineMigrationResult(RuntimeContractModel):
-    source_path: Path
-    candidate_path: Path
-    source_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    candidate_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    v4_report: V4LedgerReconciliationReport
-    migration_attestation_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
-    anchor_state: Literal["CURRENT_HEAD_UNANCHORED", "CURRENT_HEAD_ANCHORED"]
-
-    @computed_field  # type: ignore[prop-decorator]
-    @property
-    def reconciliation_verified(self) -> bool:
-        return self.v4_report.is_verified
-
-    @computed_field  # type: ignore[prop-decorator]
-    @property
-    def promotion_allowed(self) -> bool:
-        return self.reconciliation_verified and self.anchor_state == "CURRENT_HEAD_ANCHORED"
 
 
 @dataclass(frozen=True)
@@ -313,15 +290,6 @@ def _assert_source_unchanged(path: Path, identity: _SourceIdentity) -> None:
         raise ValueError("offline migration source changed or was replaced during migration")
 
 
-def _path_entry_exists(path: Path) -> bool:
-    return os.path.lexists(path)
-
-
-def _unlink_path_entry(path: Path) -> None:
-    with suppress(FileNotFoundError):
-        path.unlink()
-
-
 def _copy_descriptor_bytes(source_descriptor: int, destination_descriptor: int) -> str:
     digest = hashlib.sha256()
     try:
@@ -339,62 +307,108 @@ def _copy_descriptor_bytes(source_descriptor: int, destination_descriptor: int) 
     return digest.hexdigest()
 
 
-def _write_descriptor_copy(
+def _validate_private_file(metadata: os.stat_result, *, label: str) -> None:
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_gid != os.getegid()
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+    ):
+        raise ValueError(f"{label} identity or mode is not exact")
+
+
+def _write_descriptor_copy_at(
     source_descriptor: int,
-    destination: Path,
+    destination_directory_descriptor: int,
+    destination_name: str,
 ) -> str:
     destination_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    destination_flags |= getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_CLOEXEC"):
+        destination_flags |= os.O_CLOEXEC
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise ValueError("offline migration requires O_NOFOLLOW")
+    destination_flags |= os.O_NOFOLLOW
     try:
-        destination_descriptor = os.open(destination, destination_flags, 0o600)
+        destination_descriptor = os.open(
+            destination_name,
+            destination_flags,
+            0o600,
+            dir_fd=destination_directory_descriptor,
+        )
     except OSError as exc:
         raise ValueError("offline migration private snapshot cannot be created") from exc
     try:
-        return _copy_descriptor_bytes(source_descriptor, destination_descriptor)
+        digest = _copy_descriptor_bytes(source_descriptor, destination_descriptor)
+        os.fchmod(destination_descriptor, 0o600)
+        _validate_private_file(
+            os.fstat(destination_descriptor),
+            label="offline migration transformed copy",
+        )
+        os.fsync(destination_descriptor)
+        return digest
     finally:
         os.close(destination_descriptor)
 
 
 def _create_private_snapshot(
     source_descriptor: int,
-    snapshot: Path,
+    snapshot_directory_descriptor: int,
+    snapshot_name: str,
 ) -> tuple[int, str, _SourceIdentity]:
     snapshot_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    snapshot_flags |= getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_CLOEXEC"):
+        snapshot_flags |= os.O_CLOEXEC
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise ValueError("offline migration requires O_NOFOLLOW")
+    snapshot_flags |= os.O_NOFOLLOW
     try:
-        write_descriptor = os.open(snapshot, snapshot_flags, 0o600)
+        write_descriptor = os.open(
+            snapshot_name,
+            snapshot_flags,
+            0o600,
+            dir_fd=snapshot_directory_descriptor,
+        )
     except OSError as exc:
         raise ValueError("offline migration private snapshot cannot be created") from exc
     snapshot_descriptor: int | None = None
     try:
         snapshot_sha256 = _copy_descriptor_bytes(source_descriptor, write_descriptor)
+        os.fchmod(write_descriptor, 0o600)
+        os.fsync(write_descriptor)
         metadata = os.fstat(write_descriptor)
-        if not stat.S_ISREG(metadata.st_mode):
-            raise ValueError("offline migration private snapshot is not a regular file")
+        _validate_private_file(metadata, label="offline migration private snapshot")
         snapshot_identity = _identity_from_metadata(metadata)
-        read_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-        read_flags |= getattr(os, "O_NOFOLLOW", 0)
+        read_flags = os.O_RDONLY | os.O_NOFOLLOW
+        if hasattr(os, "O_CLOEXEC"):
+            read_flags |= os.O_CLOEXEC
         try:
-            snapshot_descriptor = os.open(snapshot, read_flags)
+            snapshot_descriptor = os.open(
+                snapshot_name,
+                read_flags,
+                dir_fd=snapshot_directory_descriptor,
+            )
         except OSError as exc:
             raise ValueError("offline migration private snapshot changed or was replaced") from exc
         write_metadata = os.fstat(write_descriptor)
         read_metadata = os.fstat(snapshot_descriptor)
-        path_metadata = os.lstat(snapshot)
+        _validate_private_file(
+            write_metadata,
+            label="offline migration private snapshot writer",
+        )
+        _validate_private_file(
+            read_metadata,
+            label="offline migration private snapshot reader",
+        )
         if (
-            not stat.S_ISREG(write_metadata.st_mode)
-            or not stat.S_ISREG(read_metadata.st_mode)
-            or not stat.S_ISREG(path_metadata.st_mode)
-            or _identity_from_metadata(write_metadata) != snapshot_identity
+            _identity_from_metadata(write_metadata) != snapshot_identity
             or _identity_from_metadata(read_metadata) != snapshot_identity
-            or _identity_from_metadata(path_metadata) != snapshot_identity
         ):
             raise ValueError("offline migration private snapshot changed or was replaced")
     except BaseException:
         if snapshot_descriptor is not None:
             os.close(snapshot_descriptor)
         os.close(write_descriptor)
-        _unlink_path_entry(snapshot)
         raise
     os.close(write_descriptor)
     assert snapshot_descriptor is not None
@@ -416,10 +430,18 @@ def _assert_private_snapshot_unchanged(snapshot: _SourceSnapshot) -> None:
         raise ValueError("offline migration private snapshot changed or was replaced")
 
 
-def _snapshot_closed_source(source: Path, snapshot: Path) -> _SourceSnapshot:
+def _snapshot_closed_source(
+    source: Path,
+    snapshot: Path,
+    snapshot_directory_descriptor: int,
+    snapshot_name: str,
+) -> _SourceSnapshot:
     expected_identity = _closed_regular_source(source)
-    source_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-    source_flags |= getattr(os, "O_NOFOLLOW", 0)
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise ValueError("offline migration requires O_NOFOLLOW")
+    source_flags = os.O_RDONLY | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        source_flags |= os.O_CLOEXEC
     try:
         source_descriptor = os.open(source, source_flags)
     except OSError as exc:
@@ -433,7 +455,8 @@ def _snapshot_closed_source(source: Path, snapshot: Path) -> _SourceSnapshot:
         _assert_source_sidecars_absent(source)
         snapshot_descriptor, snapshot_sha256, snapshot_identity = _create_private_snapshot(
             source_descriptor,
-            snapshot,
+            snapshot_directory_descriptor,
+            snapshot_name,
         )
         after_copy = os.fstat(source_descriptor)
         after_copy_identity = _identity_from_metadata(after_copy)
@@ -451,20 +474,27 @@ def _snapshot_closed_source(source: Path, snapshot: Path) -> _SourceSnapshot:
     except BaseException:
         if snapshot_descriptor is not None:
             os.close(snapshot_descriptor)
-        _unlink_path_entry(snapshot)
         raise
     finally:
         os.close(source_descriptor)
     return source_snapshot
 
 
-def _copy_private_snapshot(snapshot: _SourceSnapshot, destination: Path) -> None:
+def _copy_private_snapshot(
+    snapshot: _SourceSnapshot,
+    destination_directory_descriptor: int,
+    destination_name: str,
+) -> None:
     _assert_private_snapshot_unchanged(snapshot)
     try:
         os.lseek(snapshot.descriptor, 0, os.SEEK_SET)
     except OSError as exc:
         raise ValueError("offline migration private snapshot descriptor is not usable") from exc
-    copied_sha256 = _write_descriptor_copy(snapshot.descriptor, destination)
+    copied_sha256 = _write_descriptor_copy_at(
+        snapshot.descriptor,
+        destination_directory_descriptor,
+        destination_name,
+    )
     if copied_sha256 != snapshot.sha256:
         raise ValueError("offline migration private snapshot copy hash differs")
     _assert_private_snapshot_unchanged(snapshot)
@@ -477,34 +507,41 @@ def _checkpoint(failure_after_phase: str | None, phase: str) -> None:
 
 def migrate_v4_ledger_copy(
     source_path: Path,
-    candidate_path: Path,
+    publication_root: Path,
     *,
+    root_policy: PublicationRootPolicy,
     migration_code_identity: str,
     target_schema_identity: str = TARGET_SCHEMA_IDENTITY,
-    failure_after_phase: str | None = None,
+    failure_after_phase: PaperMigrationFaultPoint | None = None,
 ) -> PaperOfflineMigrationResult:
     if failure_after_phase not in {None, *OFFLINE_MIGRATION_PHASES}:
         raise ValueError("unsupported offline migration failure phase")
     source = Path(source_path).absolute()
-    candidate = Path(candidate_path).absolute()
-    if source == candidate:
-        raise ValueError("offline migration source and candidate must differ")
-    if _path_entry_exists(candidate):
-        raise ValueError("offline migration candidate already exists")
-    candidate.parent.mkdir(parents=True, exist_ok=True)
-    snapshot = candidate.with_name(f".{candidate.name}.offline-source-{secrets.token_hex(12)}")
-    temporary = candidate.with_name(f".{candidate.name}.offline-migrating-{secrets.token_hex(12)}")
-    promoted = False
+    context = None
     source_snapshot: _SourceSnapshot | None = None
+    receipt = None
     try:
-        source_snapshot = _snapshot_closed_source(source, snapshot)
+        context = begin_paper_migration_publication(
+            publication_root,
+            root_policy=root_policy,
+        )
+        snapshot_name = "source-snapshot.sqlite3"
+        snapshot = context.building_path / snapshot_name
+        source_snapshot = _snapshot_closed_source(
+            source,
+            snapshot,
+            context.building_fd,
+            snapshot_name,
+        )
         _checkpoint(failure_after_phase, "source_preflight")
         report = V4LedgerReconciler().reconcile(source_snapshot.path)
         if report.source_sha256 != source_snapshot.sha256 or not report.is_verified:
             raise ValueError("offline migration v4 reconciliation report is invalid")
         _assert_source_unchanged(source, source_snapshot.source_identity)
         _checkpoint(failure_after_phase, "source_reconciliation")
-        _copy_private_snapshot(source_snapshot, temporary)
+        temporary_name = "transformed.sqlite3"
+        temporary = context.ready_path / temporary_name
+        _copy_private_snapshot(source_snapshot, context.ready_fd, temporary_name)
         from rquant.paper_broker import PaperBrokerStore
 
         store = object.__new__(PaperBrokerStore)
@@ -519,7 +556,17 @@ def migrate_v4_ledger_copy(
             store._ensure_ledger_schema_v5(
                 connection,
                 failure_after_phase=(
-                    None if failure_after_phase == "publication" else failure_after_phase
+                    failure_after_phase
+                    if failure_after_phase
+                    in {
+                        "schema_additions",
+                        "legacy_cost_evidence",
+                        "archive",
+                        "v5_schema",
+                        "archive_protection",
+                        "attestation",
+                    }
+                    else None
                 ),
                 source_sha256=source_snapshot.sha256,
                 v4_reconciliation_report_digest=report.digest,
@@ -537,54 +584,104 @@ def migrate_v4_ledger_copy(
                 expected_v4_report=report,
             )
             attestation = validate_migration_attestation(connection)
+            checkpoint = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            if checkpoint is not None:
+                busy, log_frames, checkpointed_frames = (int(value) for value in checkpoint)
+                if busy != 0 or log_frames != checkpointed_frames:
+                    raise ValueError("offline migration WAL checkpoint is incomplete")
+            journal_mode = str(connection.execute("PRAGMA journal_mode=DELETE").fetchone()[0])
+            if journal_mode.lower() != "delete":
+                raise ValueError("offline migration journal mode did not become DELETE")
+            if str(connection.execute("PRAGMA integrity_check").fetchone()[0]) != "ok":
+                raise ValueError("offline migration SQLite integrity check failed")
         finally:
             connection.close()
+        readonly = sqlite3.connect(f"file:{temporary}?mode=ro", uri=True)
+        readonly.row_factory = sqlite3.Row
+        try:
+            PaperBrokerStore._verify_v5_migration_in_connection(
+                readonly,
+                expected_v4_report=report,
+            )
+            validate_migration_attestation(readonly)
+            if str(readonly.execute("PRAGMA integrity_check").fetchone()[0]) != "ok":
+                raise ValueError("offline migration final SQLite integrity check failed")
+        finally:
+            readonly.close()
         _checkpoint(failure_after_phase, "verification")
+        _checkpoint(failure_after_phase, "after_sqlite_connections_closed")
         _assert_source_unchanged(source, source_snapshot.source_identity)
         candidate_sha256 = sha256_file(temporary)
-        with temporary.open("rb") as stream:
-            os.fsync(stream.fileno())
-        if _path_entry_exists(candidate):
-            raise ValueError("offline migration candidate already exists")
-        os.link(temporary, candidate)
-        promoted = True
-        _checkpoint(failure_after_phase, "publication")
-        temporary.unlink()
-        directory = os.open(candidate.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-        return PaperOfflineMigrationResult(
-            source_path=source,
-            candidate_path=candidate,
+        receipt = publish_paper_migration_generation(
+            context,
             source_sha256=source_snapshot.sha256,
             candidate_sha256=candidate_sha256,
-            v4_report=report,
+            v4_reconciliation_report_digest=report.digest,
             migration_attestation_digest=attestation.digest,
-            anchor_state="CURRENT_HEAD_UNANCHORED",
+            migration_code_identity=migration_code_identity,
+            migration_algorithm_id=MIGRATION_ALGORITHM_ID,
+            target_schema_identity=target_schema_identity,
+            target_schema_version=TARGET_SCHEMA_VERSION,
+            target_internal_migration_version=TARGET_INTERNAL_MIGRATION_VERSION,
+            failure_after_phase=failure_after_phase,
         )
-    except BaseException:
-        _unlink_path_entry(temporary)
-        _unlink_path_entry(snapshot)
-        if promoted and _path_entry_exists(candidate) and not candidate.is_symlink():
-            candidate.unlink()
+        _assert_source_unchanged(source, source_snapshot.source_identity)
+        return PaperOfflineMigrationResult(
+            publication=receipt,
+            v4_report=report,
+        )
+    except PaperMigrationPostCommitIndeterminateError:
         raise
+    except BaseException as exc:
+        if receipt is not None:
+            manifest = receipt.manifest
+            state = PaperMigrationPostCommitState(
+                reason="RESULT_ASSEMBLY_FAILED",
+                policy_id=root_policy.policy_id,
+                publication_nonce=manifest.publication_nonce,
+                generation_name=manifest.generation_name,
+                object_name=manifest.object_name,
+                candidate_sha256=manifest.candidate_sha256,
+                expected_manifest_sha256=receipt.manifest_sha256,
+            )
+            raise PaperMigrationPostCommitIndeterminateError(
+                "paper migration result assembly failed after generation publication",
+                state=state,
+            ) from exc
+        if context is None:
+            if isinstance(exc, PaperMigrationPreCommitError):
+                raise
+            raise PaperMigrationPreCommitError(
+                "paper migration failed before publication workspace creation"
+            ) from exc
+        orphan = PaperMigrationOrphanState(
+            policy_id=root_policy.policy_id,
+            publication_nonce=context.publication_nonce,
+            building_name=context.building_name,
+            failed_phase=failure_after_phase or type(exc).__name__,
+        )
+        raise PaperMigrationPreCommitError(
+            "paper migration failed before generation publication",
+            orphan=orphan,
+        ) from exc
     finally:
         if source_snapshot is not None:
             os.close(source_snapshot.descriptor)
-        _unlink_path_entry(snapshot)
+        if context is not None:
+            context.close()
 
 
 def migrate_paper_ledger_v4_offline_copy(
     source_path: Path,
-    candidate_path: Path,
+    publication_root: Path,
     *,
-    failure_after_phase: str | None = None,
+    root_policy: PublicationRootPolicy,
+    failure_after_phase: PaperMigrationFaultPoint | None = None,
 ) -> PaperOfflineMigrationResult:
     return migrate_v4_ledger_copy(
         source_path,
-        candidate_path,
+        publication_root,
+        root_policy=root_policy,
         migration_code_identity="rquant-stage8-paper-cost-alignment",
         failure_after_phase=failure_after_phase,
     )
@@ -593,13 +690,17 @@ def migrate_paper_ledger_v4_offline_copy(
 __all__ = [
     "MIGRATION_ALGORITHM_ID",
     "OFFLINE_MIGRATION_PHASES",
+    "PaperMigrationFaultPoint",
     "PaperLedgerMigrationAttestation",
     "PaperOfflineMigrationResult",
+    "PublicationRootPolicy",
     "TARGET_INTERNAL_MIGRATION_VERSION",
     "TARGET_SCHEMA_IDENTITY",
     "archive_binding_payload",
+    "materialize_paper_migration_for_audit",
     "migrate_paper_ledger_v4_offline_copy",
     "migrate_v4_ledger_copy",
+    "recover_paper_migration_publication",
     "validate_migration_attestation",
     "write_migration_attestation",
 ]

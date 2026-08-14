@@ -13,9 +13,16 @@ import rquant.paper_ledger_migration as paper_ledger_migration
 from rquant.paper_broker import PaperBrokerStore
 from rquant.paper_ledger_migration import (
     OFFLINE_MIGRATION_PHASES,
-    migrate_v4_ledger_copy,
+)
+from rquant.paper_ledger_migration import (
+    migrate_v4_ledger_copy as _publish_v4_ledger_copy,
 )
 from rquant.paper_ledger_v4 import PaperV4ReconciliationError, V4LedgerReconciler
+from rquant.paper_migration_publication import (
+    PaperMigrationPreCommitError,
+    local_audit_publication_root_policy,
+    materialize_paper_migration_for_audit,
+)
 from rquant.runtime_contracts import canonical_sha256
 from tests.fixtures.paper_ledger_v4_fixture import (
     EXPECTED_V4_ATTESTATION_FINGERPRINT,
@@ -45,9 +52,42 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _publish_v4_for_audit(
+    source_path: Path,
+    publication_hint: Path,
+    *,
+    migration_code_identity: str,
+    failure_after_phase: str | None = None,
+) -> tuple[object, Path]:
+    publication_root = publication_hint.with_name(f".{publication_hint.name}.publication")
+    staging_root = publication_hint.with_name(f".{publication_hint.name}.audit")
+    publication_root.mkdir(mode=0o700)
+    staging_root.mkdir(mode=0o700)
+    publication_root.chmod(0o700)
+    staging_root.chmod(0o700)
+    policy = local_audit_publication_root_policy(publication_root)
+    try:
+        result = _publish_v4_ledger_copy(
+            source_path,
+            publication_root,
+            root_policy=policy,
+            migration_code_identity=migration_code_identity,
+            failure_after_phase=failure_after_phase,
+        )
+    except PaperMigrationPreCommitError as exc:
+        assert exc.__cause__ is not None
+        raise exc.__cause__ from exc
+    materialization = materialize_paper_migration_for_audit(
+        result.publication,
+        root_policy=policy,
+        staging_root=staging_root,
+    )
+    return result, materialization.private_path
+
+
 def _assert_corrupt_v4_rejected(
     source_path: Path,
-    candidate_path: Path,
+    publication_hint: Path,
     *,
     match: str | None = None,
 ) -> None:
@@ -55,26 +95,30 @@ def _assert_corrupt_v4_rejected(
     source_sha256 = _sha256(source_path)
 
     with pytest.raises(PaperV4ReconciliationError, match=match):
-        migrate_v4_ledger_copy(
+        _publish_v4_for_audit(
             source_path,
-            candidate_path,
+            publication_hint,
             migration_code_identity="test-migration-code",
         )
 
     assert source_path.read_bytes() == source_bytes
     assert _sha256(source_path) == source_sha256
-    assert not candidate_path.exists()
+    _assert_precommit_workspace_retained(publication_hint)
 
 
-def _assert_no_offline_migration_artifacts(candidate_path: Path) -> None:
-    assert not os.path.lexists(candidate_path)
-    assert not tuple(candidate_path.parent.glob(f".{candidate_path.name}.offline-source-*"))
-    assert not tuple(candidate_path.parent.glob(f".{candidate_path.name}.offline-migrating-*"))
+def _assert_precommit_workspace_retained(publication_hint: Path) -> None:
+    assert not os.path.lexists(publication_hint)
+    generations = (
+        publication_hint.with_name(f".{publication_hint.name}.publication") / "generations"
+    )
+    assert generations.is_dir()
+    assert tuple(generations.glob(".building-*"))
+    assert not tuple(generations.glob("generation-*"))
 
 
 def _assert_direct_and_offline_v4_rejected(
     source_path: Path,
-    candidate_path: Path,
+    publication_hint: Path,
     *,
     match: str,
 ) -> None:
@@ -87,14 +131,14 @@ def _assert_direct_and_offline_v4_rejected(
     assert _sha256(source_path) == source_sha256
 
     with pytest.raises(PaperV4ReconciliationError, match=match):
-        migrate_v4_ledger_copy(
+        _publish_v4_for_audit(
             source_path,
-            candidate_path,
+            publication_hint,
             migration_code_identity="test-migration-code",
         )
     assert source_path.read_bytes() == source_bytes
     assert _sha256(source_path) == source_sha256
-    _assert_no_offline_migration_artifacts(candidate_path)
+    _assert_precommit_workspace_retained(publication_hint)
 
 
 def _canonical_lot_ids(connection: sqlite3.Connection, account_id: str) -> tuple[str, ...]:
@@ -120,6 +164,26 @@ def _two_account_seed() -> tuple[dict[str, object], ...]:
     )
     assert all(isinstance(account, dict) for account in accounts)
     return tuple(account for account in accounts if isinstance(account, dict))
+
+
+def test_legacy_candidate_link_swap_reproduces_unbound_hash(tmp_path: Path) -> None:
+    """RQS8-P1-008 historical RED is closed by removing link publication."""
+
+    verified = tmp_path / "verified.sqlite3"
+    candidate = tmp_path / "candidate.sqlite3"
+    replacement = tmp_path / "replacement.sqlite3"
+    verified.write_bytes(b"verified immutable bytes")
+    replacement.write_bytes(b"attacker replacement")
+    returned_sha256 = _sha256(verified)
+    os.link(verified, candidate)
+    os.replace(replacement, candidate)
+
+    assert _sha256(candidate) != returned_sha256
+    assert _sha256(verified) == returned_sha256
+    source = Path(paper_ledger_migration.__file__).read_text(encoding="utf-8")
+    assert "os.link" not in source
+    assert "candidate_path" not in source
+    assert "candidate.unlink" not in source
 
 
 def test_v4_migration_accepts_canonical_fifo_when_lot_ids_are_inverse_chronology(
@@ -150,14 +214,14 @@ def test_v4_migration_accepts_canonical_fifo_when_lot_ids_are_inverse_chronology
         (chronological_lot_ids[1], 100),
     )
     report = V4LedgerReconciler().reconcile(source.path)
-    result = migrate_v4_ledger_copy(
+    result, audit_path = _publish_v4_for_audit(
         source.path,
         candidate,
         migration_code_identity="test-migration-code",
     )
     assert report.is_verified
     assert result.reconciliation_verified
-    assert candidate.is_file()
+    assert audit_path.is_file()
 
 
 def test_v4_migration_rejects_non_fifo_multi_lot_consumption_before_candidate(
@@ -241,7 +305,7 @@ def test_rqs8_p1_006_offline_migration_rejects_source_replacement_and_restore(
     )
 
     with pytest.raises(ValueError, match="source.*changed|source.*replaced"):
-        paper_ledger_migration.migrate_v4_ledger_copy(
+        _publish_v4_for_audit(
             source.path,
             candidate,
             migration_code_identity="test-migration-code",
@@ -295,7 +359,7 @@ def test_rqs8_p1_006_offline_migration_rejects_private_snapshot_replacement(
     )
 
     with pytest.raises(ValueError, match="private snapshot changed or was replaced"):
-        migrate_v4_ledger_copy(
+        _publish_v4_for_audit(
             source.path,
             candidate,
             migration_code_identity="test-migration-code",
@@ -303,7 +367,7 @@ def test_rqs8_p1_006_offline_migration_rejects_private_snapshot_replacement(
 
     assert source.path.read_bytes() == source_bytes
     assert _sha256(source.path) == source_sha256
-    _assert_no_offline_migration_artifacts(candidate)
+    _assert_precommit_workspace_retained(candidate)
 
 
 @pytest.mark.parametrize("cross_role", (False, True), ids=("later-fill", "cross-role"))
@@ -352,7 +416,7 @@ def test_rqs8_p2_003_v4_rejects_rebound_initial_execution_receipts(
     with pytest.raises(PaperV4ReconciliationError, match="initial execution"):
         V4LedgerReconciler().reconcile(source.path)
     with pytest.raises(PaperV4ReconciliationError, match="initial execution"):
-        migrate_v4_ledger_copy(
+        _publish_v4_for_audit(
             source.path,
             candidate,
             migration_code_identity="test-migration-code",
@@ -523,7 +587,7 @@ def test_v4_migration_rejects_cash_not_explained_by_independent_replay(
     source_bytes = source.path.read_bytes()
 
     with pytest.raises(PaperV4ReconciliationError, match="reconciliation"):
-        migrate_v4_ledger_copy(
+        _publish_v4_for_audit(
             source.path,
             tmp_path / "candidate.sqlite3",
             migration_code_identity="test-migration-code",
@@ -538,13 +602,13 @@ def test_trust_inspection_rejects_coordinated_archive_and_binding_tamper(
 ) -> None:
     source = create_parent_v4_fixture(tmp_path / "source.sqlite3")
     candidate = tmp_path / "candidate.sqlite3"
-    migrate_v4_ledger_copy(
+    _result, audit_path = _publish_v4_for_audit(
         source.path,
         candidate,
         migration_code_identity="test-migration-code",
     )
 
-    with sqlite3.connect(candidate) as connection:
+    with sqlite3.connect(audit_path) as connection:
         connection.execute("DROP TRIGGER paper_ledger_schema_v4_archive_update_immutable")
         connection.execute("DROP TRIGGER paper_ledger_v4_archive_binding_update_immutable")
         connection.execute("UPDATE paper_ledger_schema_v4_archive SET migrated_at = 'tampered'")
@@ -570,7 +634,7 @@ def test_trust_inspection_rejects_coordinated_archive_and_binding_tamper(
         )
 
     store = object.__new__(PaperBrokerStore)
-    store.path = candidate
+    store.path = audit_path
     store.busy_timeout_ms = 5_000
     status = store.ledger_trust_status()
     assert status.state == "quarantined"
@@ -605,16 +669,16 @@ def test_parent_v4_binary_fixture_has_parent_provenance_and_migrates_without_dow
     source.write_bytes(fixture_path.read_bytes())
     candidate = tmp_path / "candidate.sqlite3"
     report = V4LedgerReconciler().reconcile(source)
-    result = migrate_v4_ledger_copy(
+    result, audit_path = _publish_v4_for_audit(
         source,
         candidate,
         migration_code_identity="test-migration-code",
     )
-    assert result.source_sha256 == _FIXTURE_SHA256
+    assert result.publication.manifest.source_sha256 == _FIXTURE_SHA256
     assert result.v4_report == report
     assert result.reconciliation_verified
     assert not result.promotion_allowed
-    with sqlite3.connect(candidate) as connection:
+    with sqlite3.connect(audit_path) as connection:
         schema_version = connection.execute("PRAGMA user_version").fetchone()[0]
         internal_version = connection.execute(
             "SELECT internal_migration_version FROM paper_ledger_schema WHERE singleton = 1"
@@ -623,7 +687,7 @@ def test_parent_v4_binary_fixture_has_parent_provenance_and_migrates_without_dow
     assert internal_version == 4
     with (
         sqlite3.connect(source) as source_connection,
-        sqlite3.connect(candidate) as candidate_connection,
+        sqlite3.connect(audit_path) as candidate_connection,
     ):
         source_account = source_connection.execute(
             "SELECT initial_cash, cash, realized_pnl FROM broker_account ORDER BY account_id"
@@ -690,7 +754,7 @@ def test_rqs8_p2_004_exact_parent_fixture_replays_two_independent_accounts(
     assert {str(row[0]) for row in lots} == set(expected_accounts)
     assert {str(row[1]) for row in lots} == {"600000.SH"}
 
-    result = migrate_v4_ledger_copy(
+    result, _audit_path = _publish_v4_for_audit(
         source.path,
         candidate,
         migration_code_identity="test-migration-code",
@@ -762,7 +826,7 @@ def test_rqs8_p2_004_v4_rejects_cross_account_lot_and_receipt_corruption(
     with pytest.raises(PaperV4ReconciliationError):
         V4LedgerReconciler().reconcile(source.path)
     with pytest.raises(PaperV4ReconciliationError):
-        migrate_v4_ledger_copy(
+        _publish_v4_for_audit(
             source.path,
             candidate,
             migration_code_identity="test-migration-code",
@@ -770,7 +834,10 @@ def test_rqs8_p2_004_v4_rejects_cross_account_lot_and_receipt_corruption(
     assert not candidate.exists()
 
 
-@pytest.mark.parametrize("failure_after_phase", OFFLINE_MIGRATION_PHASES)
+@pytest.mark.parametrize(
+    "failure_after_phase",
+    OFFLINE_MIGRATION_PHASES[:14],
+)
 def test_all_offline_migration_phase_failures_leave_source_and_candidate_unchanged(
     tmp_path: Path,
     failure_after_phase: str,
@@ -779,8 +846,8 @@ def test_all_offline_migration_phase_failures_leave_source_and_candidate_unchang
     source_bytes = source.path.read_bytes()
     candidate = tmp_path / "candidate.sqlite3"
 
-    with pytest.raises(RuntimeError, match="simulated migration failure"):
-        migrate_v4_ledger_copy(
+    with pytest.raises(RuntimeError, match="simulated (paper )?migration failure"):
+        _publish_v4_for_audit(
             source.path,
             candidate,
             migration_code_identity="test-migration-code",
@@ -792,21 +859,25 @@ def test_all_offline_migration_phase_failures_leave_source_and_candidate_unchang
     assert not candidate.exists()
 
 
-def test_rqs8_p1_006_publication_failure_removes_candidate_and_private_files(
+def test_rqs8_p1_006_postcommit_failure_preserves_published_generation(
     tmp_path: Path,
 ) -> None:
     source = create_parent_v4_fixture(tmp_path / "source.sqlite3")
     source_bytes = source.path.read_bytes()
-    candidate = tmp_path / "candidate.sqlite3"
+    publication_root = tmp_path / "publication"
+    publication_root.mkdir(mode=0o700)
+    publication_root.chmod(0o700)
+    policy = local_audit_publication_root_policy(publication_root)
 
-    with pytest.raises(RuntimeError, match="simulated migration failure after publication"):
-        migrate_v4_ledger_copy(
+    with pytest.raises(paper_ledger_migration.PaperMigrationPostCommitIndeterminateError) as caught:
+        _publish_v4_ledger_copy(
             source.path,
-            candidate,
+            publication_root,
+            root_policy=policy,
             migration_code_identity="test-migration-code",
-            failure_after_phase="publication",
+            failure_after_phase="after_generation_rename_before_parent_fsync",
         )
 
     assert source.path.read_bytes() == source_bytes
     assert _sha256(source.path) == source.source_sha256
-    _assert_no_offline_migration_artifacts(candidate)
+    assert (publication_root / "generations" / caught.value.state.generation_name).is_dir()

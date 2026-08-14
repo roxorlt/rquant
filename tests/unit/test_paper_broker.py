@@ -25,7 +25,14 @@ from rquant.paper_contracts import (
     PaperSellQuantityAuthority,
     PaperSide,
 )
-from rquant.paper_ledger_migration import migrate_paper_ledger_v4_offline_copy
+from rquant.paper_ledger_migration import (
+    migrate_paper_ledger_v4_offline_copy as _publish_paper_ledger_v4_offline_copy,
+)
+from rquant.paper_migration_publication import (
+    PaperMigrationPreCommitError,
+    local_audit_publication_root_policy,
+    materialize_paper_migration_for_audit,
+)
 from rquant.strategy_paper_lifecycle import PaperBrokerLifecycleReader
 from tests.fixtures.paper_ledger_v4_fixture import (
     LEGACY_ACCOUNT_ID,
@@ -45,6 +52,37 @@ BUY_DATE = date(2026, 7, 31)
 NEXT_TRADE_DATE = date(2026, 8, 3)
 PRICE_SNAPSHOT_ID = "b" * 64
 PRODUCER_COMMIT = "c" * 40
+
+
+def _migrate_v4_to_audit(
+    source_path: Path,
+    publication_hint: Path,
+    *,
+    failure_after_phase: str | None = None,
+) -> tuple[object, Path]:
+    publication_root = publication_hint.with_name(f".{publication_hint.name}.publication")
+    staging_root = publication_hint.with_name(f".{publication_hint.name}.audit")
+    publication_root.mkdir(mode=0o700)
+    staging_root.mkdir(mode=0o700)
+    publication_root.chmod(0o700)
+    staging_root.chmod(0o700)
+    policy = local_audit_publication_root_policy(publication_root)
+    try:
+        result = _publish_paper_ledger_v4_offline_copy(
+            source_path,
+            publication_root,
+            root_policy=policy,
+            failure_after_phase=failure_after_phase,
+        )
+    except PaperMigrationPreCommitError as exc:
+        assert exc.__cause__ is not None
+        raise exc.__cause__ from exc
+    materialization = materialize_paper_migration_for_audit(
+        result.publication,
+        root_policy=policy,
+        staging_root=staging_root,
+    )
+    return result, materialization.private_path
 
 
 @pytest.fixture
@@ -1869,7 +1907,7 @@ def test_offline_v4_migration_keeps_legacy_cost_evidence_null_and_requires_a_fre
 ) -> None:
     source = create_parent_v4_fixture(tmp_path / "source.sqlite3")
     candidate = tmp_path / "candidate.sqlite3"
-    migrate_paper_ledger_v4_offline_copy(source.path, candidate)
+    _result, candidate = _migrate_v4_to_audit(source.path, candidate)
 
     migrated = PaperBrokerStore(
         candidate,
@@ -2250,10 +2288,9 @@ def test_v4_open_fails_closed_and_offline_copy_preserves_parent_history(tmp_path
     assert source.path.read_bytes() == source_bytes
 
     candidate = tmp_path / "candidate.sqlite3"
-    result = migrate_paper_ledger_v4_offline_copy(source.path, candidate)
+    result, candidate = _migrate_v4_to_audit(source.path, candidate)
 
-    assert result.source_sha256 == source.source_sha256
-    assert result.candidate_path == candidate
+    assert result.publication.manifest.source_sha256 == source.source_sha256
     assert result.reconciliation_verified
     assert source.path.read_bytes() == source_bytes
     assert sha256_file(source.path) == source.source_sha256
@@ -2300,12 +2337,13 @@ def test_offline_v4_migration_failure_never_mutates_the_source_or_promotes_candi
     source_bytes = source.path.read_bytes()
     candidate = tmp_path / "candidate.sqlite3"
 
-    with pytest.raises(PaperBrokerReconciliationError, match="simulated migration failure"):
-        migrate_paper_ledger_v4_offline_copy(
+    with pytest.raises(Exception, match="simulated migration failure") as caught:
+        _migrate_v4_to_audit(
             source.path,
             candidate,
             failure_after_phase=failure_after_phase,
         )
+    assert isinstance(caught.value, (PaperBrokerReconciliationError, RuntimeError))
 
     assert source.path.read_bytes() == source_bytes
     assert sha256_file(source.path) == source.source_sha256
@@ -2315,7 +2353,7 @@ def test_offline_v4_migration_failure_never_mutates_the_source_or_promotes_candi
 def test_offline_migration_archive_tamper_quarantines_the_candidate(tmp_path: Path) -> None:
     source = create_parent_v4_fixture(tmp_path / "source.sqlite3")
     candidate = tmp_path / "candidate.sqlite3"
-    migrate_paper_ledger_v4_offline_copy(source.path, candidate)
+    _result, candidate = _migrate_v4_to_audit(source.path, candidate)
 
     with sqlite3.connect(candidate) as connection:
         connection.execute("DROP TRIGGER paper_ledger_attestation_v4_archive_update_immutable")
