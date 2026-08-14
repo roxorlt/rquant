@@ -377,7 +377,7 @@ jobs:
           facts="${RQUANT_FORMAL_EXACT_ROOT}/test-results/formal-smoke-real-generation-facts.json"
           junit="${RQUANT_FORMAL_EXACT_ROOT}/test-results/formal-smoke-real-generation.xml"
           export RQUANT_FORMAL_SMOKE_EXACT_FACTS_PATH="${facts}"
-          uv run pytest -p tests.formal_smoke_real_generation_support \
+          uv run python -m pytest -p tests.formal_smoke_real_generation_support \
             -o addopts='' --strict-markers -m linux_exact -rA \
             --basetemp="${RQUANT_FORMAL_EXACT_ROOT}/pytest" \
             --junitxml="${junit}" \

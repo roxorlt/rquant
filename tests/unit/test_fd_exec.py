@@ -557,7 +557,8 @@ def test_real_generation_exact_ci_job_is_no_skip_and_redacted() -> None:
     assert "openssl genpkey -algorithm ED25519" in job
     assert "chmod 700" in job
     assert "-m linux_exact" in job
-    assert "-p tests.formal_smoke_real_generation_support" in job
+    assert "uv run python -m pytest -p tests.formal_smoke_real_generation_support" in job
+    assert "uv run pytest -p tests.formal_smoke_real_generation_support" not in job
     assert "--junitxml=" in job
     assert "verify-ci-evidence" in job
     assert "formal-smoke-real-generation-facts" in job
