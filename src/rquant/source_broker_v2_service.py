@@ -60,6 +60,8 @@ from rquant.source_broker_v2 import (
     SourceBrokerV2WireRequest,
     SourceBrokerV2WireResponse,
     source_authority_signature_payload,
+    source_claim_attempt_id,
+    source_effect_operation_id,
 )
 from rquant.strict_json import (
     StrictJsonError,
@@ -329,6 +331,7 @@ class ExternalDispatchAuthoritySignedResponse(_ServiceModel):
 class _ReconcileFence:
     saga_id: str
     operation_id: str
+    attempt_id: str
     phase: SourceBrokerV2OutboxPhase
     operation_request_hash: str
     claim_binding_hash: str
@@ -1087,6 +1090,7 @@ class SourceBrokerV2ProviderService:
                     external_request_binding_hash TEXT,
                     terminal_at TEXT,
                     unknown_reason TEXT,
+                    active_claim_attempt_id TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
@@ -1122,6 +1126,12 @@ class SourceBrokerV2ProviderService:
                 column="external_request_binding_hash",
                 definition="TEXT",
             )
+            _ensure_sqlite_column(
+                connection,
+                table="source_broker_v2_provider_operation",
+                column="active_claim_attempt_id",
+                definition="TEXT",
+            )
             connection.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS "
                 "source_broker_v2_provider_operation_operation_id_uq "
@@ -1131,6 +1141,71 @@ class SourceBrokerV2ProviderService:
                 "CREATE UNIQUE INDEX IF NOT EXISTS "
                 "source_broker_v2_provider_operation_operation_phase_uq "
                 "ON source_broker_v2_provider_operation(operation_id, phase)"
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS source_broker_v2_provider_claim_attempt (
+                    attempt_id TEXT PRIMARY KEY,
+                    effect_operation_id TEXT NOT NULL,
+                    saga_id TEXT NOT NULL,
+                    phase TEXT NOT NULL,
+                    operation_request_hash TEXT NOT NULL,
+                    claim_binding_hash TEXT NOT NULL,
+                    claim_generation INTEGER NOT NULL,
+                    scheduler_fencing_token INTEGER NOT NULL,
+                    executor_owner_token_hash TEXT NOT NULL,
+                    executor_generation INTEGER NOT NULL,
+                    max_external_deadline TEXT NOT NULL,
+                    not_before_takeover_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(effect_operation_id)
+                        REFERENCES source_broker_v2_provider_operation(operation_id)
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS source_broker_v2_provider_claim_attempt_effect "
+                "ON source_broker_v2_provider_claim_attempt(effect_operation_id, created_at)"
+            )
+            self._upgrade_legacy_claim_attempts(connection)
+
+    def _upgrade_legacy_claim_attempts(
+        self,
+        connection: sqlite3.Connection,
+    ) -> None:
+        rows = connection.execute(
+            "SELECT * FROM source_broker_v2_provider_operation "
+            "WHERE active_claim_attempt_id IS NULL"
+        ).fetchall()
+        for row in rows:
+            attempt_id = source_claim_attempt_id(
+                effect_operation_id=str(row["operation_id"]),
+                executor_owner_token_hash=str(row["executor_owner_token_hash"]),
+                executor_generation=int(row["executor_generation"]),
+                max_external_deadline=_row_datetime(row, "max_external_deadline"),
+                not_before_takeover_at=_row_datetime(row, "not_before_takeover_at"),
+            )
+            self._insert_claim_attempt_from_values(
+                connection,
+                attempt_id=attempt_id,
+                effect_operation_id=str(row["operation_id"]),
+                saga_id=str(row["saga_id"]),
+                phase=str(row["phase"]),
+                operation_request_hash=str(row["operation_request_hash"]),
+                claim_binding_hash=str(row["claim_binding_hash"]),
+                claim_generation=int(row["claim_generation"]),
+                scheduler_fencing_token=int(row["scheduler_fencing_token"]),
+                executor_owner_token_hash=str(row["executor_owner_token_hash"]),
+                executor_generation=int(row["executor_generation"]),
+                max_external_deadline=str(row["max_external_deadline"]),
+                not_before_takeover_at=str(row["not_before_takeover_at"]),
+                created_at=str(row["created_at"]),
+            )
+            connection.execute(
+                "UPDATE source_broker_v2_provider_operation "
+                "SET active_claim_attempt_id = ? WHERE operation_id = ? "
+                "AND active_claim_attempt_id IS NULL",
+                (attempt_id, row["operation_id"]),
             )
 
     def reconcile_abandoned_invocations_after_listener_acquired(
@@ -1208,6 +1283,14 @@ class SourceBrokerV2ProviderService:
         *,
         deadline: float | None,
     ) -> SourceBrokerV2ClaimOnceResponse:
+        expected_effect = source_effect_operation_id(
+            saga_id=request.saga_id,
+            phase=request.phase,
+        )
+        if request.operation_id != expected_effect:
+            raise SourceBrokerTransportError(
+                "source claim operation_id is not the deterministic effect identity"
+            )
         if self._has_reconcile_fence_for_claim(request, deadline=deadline):
             _require_deadline(deadline, stage="before claim response signing")
             return self._signed_claim_response(
@@ -1225,7 +1308,7 @@ class SourceBrokerV2ProviderService:
                     result = None
                     self._insert_claim(connection, request, status=_ACTIVE_STATUS)
                 else:
-                    self._validate_claim_binding(row, request)
+                    self._validate_effect_binding(row, request)
                     status, result = self._claim_status_for_row(connection, row, request)
                 connection.commit()
             except BaseException:
@@ -1258,26 +1341,44 @@ class SourceBrokerV2ProviderService:
             return SourceBrokerV2ClaimStatus.UNKNOWN, None
         if status != _ACTIVE_STATUS:
             raise SourceBrokerTransportError("source operation ledger status is invalid")
-        persisted_takeover = _row_datetime(row, "not_before_takeover_at")
-        if (
-            row["executor_owner_token_hash"] != request.executor_owner_token_hash
-            or row["executor_generation"] != request.executor_generation
-        ) and self._now() < persisted_takeover:
+        active = self._active_claim_attempt(connection, row)
+        request_attempt_id = self._claim_attempt_id(request)
+        existing = self._read_claim_attempt(connection, request_attempt_id)
+        if existing is not None:
+            self._validate_claim_attempt_binding(existing, request)
+            if request_attempt_id != active["attempt_id"]:
+                return SourceBrokerV2ClaimStatus.INFLIGHT, None
+            return SourceBrokerV2ClaimStatus.DEFINITIVELY_ABSENT, None
+        if self._now() < _row_datetime(active, "not_before_takeover_at"):
             return SourceBrokerV2ClaimStatus.INFLIGHT, None
         if (
-            row["executor_owner_token_hash"] != request.executor_owner_token_hash
-            or row["executor_generation"] != request.executor_generation
+            row["provider_started_at"] is not None
+            or row["external_request_binding_hash"] is not None
         ):
-            connection.execute(
-                "UPDATE source_broker_v2_provider_operation SET "
-                "executor_owner_token_hash = ?, executor_generation = ?, updated_at = ? "
-                "WHERE operation_id = ?",
-                (
-                    request.executor_owner_token_hash,
-                    request.executor_generation,
-                    _now_text(self._now()),
-                    request.operation_id,
-                ),
+            self._mark_reconcile(
+                connection,
+                request.operation_id,
+                "provider attempt cannot be replaced before authority reconciliation",
+            )
+            return SourceBrokerV2ClaimStatus.UNKNOWN, None
+        self._insert_claim_attempt(connection, request, attempt_id=request_attempt_id)
+        updated = connection.execute(
+            "UPDATE source_broker_v2_provider_operation "
+            "SET active_claim_attempt_id = ?, updated_at = ? "
+            "WHERE operation_id = ? AND active_claim_attempt_id = ? "
+            "AND status = ? AND provider_started_at IS NULL "
+            "AND external_request_binding_hash IS NULL",
+            (
+                request_attempt_id,
+                _now_text(self._now()),
+                request.operation_id,
+                active["attempt_id"],
+                _ACTIVE_STATUS,
+            ),
+        ).rowcount
+        if updated != 1:
+            raise SourceBrokerTransportError(
+                "source claim attempt activation raced another executor"
             )
         return SourceBrokerV2ClaimStatus.DEFINITIVELY_ABSENT, None
 
@@ -1809,7 +1910,7 @@ class SourceBrokerV2ProviderService:
                 operation_request_hash,
                 saga_id=saga_id,
             )
-            self._validate_claim_receipt_binding(row, claim_receipt)
+            self._validate_claim_receipt_binding(connection, row, claim_receipt)
             status = str(row["status"])
             terminal_loss = False
             if status in _TERMINAL_STATUSES:
@@ -2361,7 +2462,7 @@ class SourceBrokerV2ProviderService:
                     operation_request_hash,
                     saga_id=claim_receipt.saga_id,
                 )
-                self._validate_claim_receipt_binding(row, claim_receipt)
+                self._validate_claim_receipt_binding(connection, row, claim_receipt)
                 status = str(row["status"])
                 if status in _TERMINAL_STATUSES:
                     result = self._row_result(row)
@@ -2476,6 +2577,13 @@ class SourceBrokerV2ProviderService:
         *,
         deadline: float | None,
     ) -> SourceBrokerV2ReplayResponse:
+        if request.operation_id != source_effect_operation_id(
+            saga_id=request.saga_id,
+            phase=request.phase,
+        ):
+            raise SourceBrokerTransportError(
+                "source replay binding conflicts with deterministic effect identity"
+            )
         result: bytes | None = None
         status = SourceBrokerV2ReplayStatus.ABSENT
         process_fence = self._reconcile_fence(request.operation_id)
@@ -2499,13 +2607,17 @@ class SourceBrokerV2ProviderService:
                     saga_id=request.saga_id,
                 )
                 row_status = str(row["status"])
+                active_attempt = self._active_claim_attempt(connection, row)
                 if row_status in _TERMINAL_STATUSES:
                     try:
                         result = self._row_result(row)
                         status = SourceBrokerV2ReplayStatus.FOUND
                     except SourceBrokerTransportError:
                         provider_started = row["provider_started_at"] is not None
-                        authority_request = self._external_authority_request_from_row(row)
+                        authority_request = self._external_authority_request_from_row(
+                            row,
+                            active_attempt,
+                        )
                 else:
                     provider_started = row["provider_started_at"] is not None
                     same_process_invocation = (
@@ -2518,7 +2630,10 @@ class SourceBrokerV2ProviderService:
                         or row_status in {_INVOKING_STATUS, _RECONCILE_STATUS}
                     )
                     if needs_lookup:
-                        authority_request = self._external_authority_request_from_row(row)
+                        authority_request = self._external_authority_request_from_row(
+                            row,
+                            active_attempt,
+                        )
         if authority_request is not None:
             try:
                 observed = self._lookup_external_authority(authority_request, deadline=deadline)
@@ -2568,19 +2683,20 @@ class SourceBrokerV2ProviderService:
     @staticmethod
     def _external_authority_request_from_row(
         row: sqlite3.Row,
+        attempt: sqlite3.Row,
     ) -> ExternalDispatchReserveRequest:
         return ExternalDispatchReserveRequest(
             operation_id=str(row["operation_id"]),
             saga_id=str(row["saga_id"]),
             phase=SourceBrokerV2OutboxPhase(str(row["phase"])),
             operation_request_hash=str(row["operation_request_hash"]),
-            claim_binding_hash=str(row["claim_binding_hash"]),
-            claim_generation=int(row["claim_generation"]),
-            scheduler_fencing_token=int(row["scheduler_fencing_token"]),
-            executor_owner_token_hash=str(row["executor_owner_token_hash"]),
-            executor_generation=int(row["executor_generation"]),
-            max_external_deadline=_row_datetime(row, "max_external_deadline"),
-            not_before_takeover_at=_row_datetime(row, "not_before_takeover_at"),
+            claim_binding_hash=str(attempt["claim_binding_hash"]),
+            claim_generation=int(attempt["claim_generation"]),
+            scheduler_fencing_token=int(attempt["scheduler_fencing_token"]),
+            executor_owner_token_hash=str(attempt["executor_owner_token_hash"]),
+            executor_generation=int(attempt["executor_generation"]),
+            max_external_deadline=_row_datetime(attempt, "max_external_deadline"),
+            not_before_takeover_at=_row_datetime(attempt, "not_before_takeover_at"),
         )
 
     def _signed_claim_response(
@@ -2650,13 +2766,14 @@ class SourceBrokerV2ProviderService:
         status: str,
     ) -> None:
         observed = _now_text(self._now())
+        attempt_id = self._claim_attempt_id(request)
         connection.execute(
             "INSERT INTO source_broker_v2_provider_operation("
             "operation_id, saga_id, phase, operation_request_hash, claim_binding_hash, "
             "claim_generation, scheduler_fencing_token, executor_owner_token_hash, "
             "executor_generation, max_external_deadline, not_before_takeover_at, status, "
-            "created_at, updated_at"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "active_claim_attempt_id, created_at, updated_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 request.operation_id,
                 request.saga_id,
@@ -2670,10 +2787,124 @@ class SourceBrokerV2ProviderService:
                 _now_text(request.max_external_deadline),
                 _now_text(request.not_before_takeover_at),
                 status,
+                attempt_id,
                 observed,
                 observed,
             ),
         )
+        self._insert_claim_attempt(connection, request, attempt_id=attempt_id)
+
+    @staticmethod
+    def _claim_attempt_id(
+        request: SourceBrokerV2ClaimOnceRequest | SourceBrokerV2ClaimOnceResponse,
+    ) -> str:
+        return source_claim_attempt_id(
+            effect_operation_id=request.operation_id,
+            executor_owner_token_hash=request.executor_owner_token_hash,
+            executor_generation=request.executor_generation,
+            max_external_deadline=request.max_external_deadline,
+            not_before_takeover_at=request.not_before_takeover_at,
+        )
+
+    def _insert_claim_attempt(
+        self,
+        connection: sqlite3.Connection,
+        request: SourceBrokerV2ClaimOnceRequest,
+        *,
+        attempt_id: str,
+    ) -> None:
+        self._insert_claim_attempt_from_values(
+            connection,
+            attempt_id=attempt_id,
+            effect_operation_id=request.operation_id,
+            saga_id=request.saga_id,
+            phase=request.phase.value,
+            operation_request_hash=request.operation_request_hash,
+            claim_binding_hash=request.claim_binding_hash,
+            claim_generation=request.claim_generation,
+            scheduler_fencing_token=request.scheduler_fencing_token,
+            executor_owner_token_hash=request.executor_owner_token_hash,
+            executor_generation=request.executor_generation,
+            max_external_deadline=_now_text(request.max_external_deadline),
+            not_before_takeover_at=_now_text(request.not_before_takeover_at),
+            created_at=_now_text(self._now()),
+        )
+
+    def _insert_claim_attempt_from_values(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        attempt_id: str,
+        effect_operation_id: str,
+        saga_id: str,
+        phase: str,
+        operation_request_hash: str,
+        claim_binding_hash: str,
+        claim_generation: int,
+        scheduler_fencing_token: int,
+        executor_owner_token_hash: str,
+        executor_generation: int,
+        max_external_deadline: str,
+        not_before_takeover_at: str,
+        created_at: str,
+    ) -> None:
+        values = (
+            effect_operation_id,
+            saga_id,
+            phase,
+            operation_request_hash,
+            claim_binding_hash,
+            claim_generation,
+            scheduler_fencing_token,
+            executor_owner_token_hash,
+            executor_generation,
+            max_external_deadline,
+            not_before_takeover_at,
+            created_at,
+        )
+        existing = self._read_claim_attempt(connection, attempt_id)
+        if existing is None:
+            connection.execute(
+                "INSERT INTO source_broker_v2_provider_claim_attempt("
+                "attempt_id, effect_operation_id, saga_id, phase, "
+                "operation_request_hash, claim_binding_hash, claim_generation, "
+                "scheduler_fencing_token, executor_owner_token_hash, "
+                "executor_generation, max_external_deadline, "
+                "not_before_takeover_at, created_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (attempt_id, *values),
+            )
+            return
+        if tuple(existing[key] for key in existing.keys()[1:]) != values:
+            raise SourceBrokerTransportError("source claim attempt immutable binding conflicts")
+
+    @staticmethod
+    def _read_claim_attempt(
+        connection: sqlite3.Connection,
+        attempt_id: str,
+    ) -> sqlite3.Row | None:
+        return connection.execute(
+            "SELECT attempt_id, effect_operation_id, saga_id, phase, "
+            "operation_request_hash, claim_binding_hash, claim_generation, "
+            "scheduler_fencing_token, executor_owner_token_hash, "
+            "executor_generation, max_external_deadline, "
+            "not_before_takeover_at, created_at "
+            "FROM source_broker_v2_provider_claim_attempt WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone()
+
+    def _active_claim_attempt(
+        self,
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+    ) -> sqlite3.Row:
+        attempt_id = row["active_claim_attempt_id"]
+        if type(attempt_id) is not str:
+            raise SourceBrokerTransportError("source operation lacks an active claim attempt")
+        attempt = self._read_claim_attempt(connection, attempt_id)
+        if attempt is None or attempt["effect_operation_id"] != row["operation_id"]:
+            raise SourceBrokerTransportError("source operation active claim attempt is invalid")
+        return attempt
 
     def _read_operation(
         self,
@@ -2737,6 +2968,7 @@ class SourceBrokerV2ProviderService:
         fence = _ReconcileFence(
             saga_id=claim_receipt.saga_id,
             operation_id=operation_id,
+            attempt_id=self._claim_attempt_id(claim_receipt),
             phase=phase,
             operation_request_hash=operation_request_hash,
             claim_binding_hash=claim_receipt.claim_binding_hash,
@@ -2863,10 +3095,7 @@ class SourceBrokerV2ProviderService:
             or fence.claim_binding_hash != request.claim_binding_hash
             or fence.claim_generation != request.claim_generation
             or fence.scheduler_fencing_token != request.scheduler_fencing_token
-            or fence.executor_owner_token_hash != request.executor_owner_token_hash
-            or fence.executor_generation != request.executor_generation
-            or _now_text(fence.max_external_deadline) != _now_text(request.max_external_deadline)
-            or _now_text(fence.not_before_takeover_at) != _now_text(request.not_before_takeover_at)
+            or fence.operation_id != request.operation_id
         ):
             raise SourceBrokerTransportError("source operation claim binding conflicts")
 
@@ -2877,11 +3106,13 @@ class SourceBrokerV2ProviderService:
     ) -> None:
         if (
             fence.saga_id != receipt.saga_id
+            or fence.operation_id != receipt.operation_id
             or fence.phase != receipt.phase
             or fence.operation_request_hash != receipt.operation_request_hash
             or fence.claim_binding_hash != receipt.claim_binding_hash
             or fence.claim_generation != receipt.claim_generation
             or fence.scheduler_fencing_token != receipt.scheduler_fencing_token
+            or fence.attempt_id != self._claim_attempt_id(receipt)
             or fence.executor_owner_token_hash != receipt.executor_owner_token_hash
             or fence.executor_generation != receipt.executor_generation
             or _now_text(fence.max_external_deadline) != _now_text(receipt.max_external_deadline)
@@ -2904,7 +3135,7 @@ class SourceBrokerV2ProviderService:
         ):
             raise SourceBrokerTransportError("source operation request binding conflicts")
 
-    def _validate_claim_binding(
+    def _validate_effect_binding(
         self,
         row: sqlite3.Row,
         request: SourceBrokerV2ClaimOnceRequest,
@@ -2916,29 +3147,47 @@ class SourceBrokerV2ProviderService:
             or row["claim_binding_hash"] != request.claim_binding_hash
             or int(row["claim_generation"]) != request.claim_generation
             or int(row["scheduler_fencing_token"]) != request.scheduler_fencing_token
+        ):
+            raise SourceBrokerTransportError("source effect binding conflicts")
+
+    def _validate_claim_attempt_binding(
+        self,
+        row: sqlite3.Row,
+        request: SourceBrokerV2ClaimOnceRequest | SourceBrokerV2ClaimOnceResponse,
+    ) -> None:
+        if (
+            row["attempt_id"] != self._claim_attempt_id(request)
+            or row["effect_operation_id"] != request.operation_id
+            or row["saga_id"] != request.saga_id
+            or row["phase"] != request.phase.value
+            or row["operation_request_hash"] != request.operation_request_hash
+            or row["claim_binding_hash"] != request.claim_binding_hash
+            or int(row["claim_generation"]) != request.claim_generation
+            or int(row["scheduler_fencing_token"]) != request.scheduler_fencing_token
+            or row["executor_owner_token_hash"] != request.executor_owner_token_hash
+            or int(row["executor_generation"]) != request.executor_generation
             or row["max_external_deadline"] != _now_text(request.max_external_deadline)
             or row["not_before_takeover_at"] != _now_text(request.not_before_takeover_at)
         ):
-            raise SourceBrokerTransportError("source operation claim binding conflicts")
+            raise SourceBrokerTransportError("source claim attempt immutable binding conflicts")
 
     def _validate_claim_receipt_binding(
         self,
+        connection: sqlite3.Connection,
         row: sqlite3.Row,
         receipt: SourceBrokerV2ClaimOnceResponse,
     ) -> None:
+        attempt = self._read_claim_attempt(
+            connection,
+            self._claim_attempt_id(receipt),
+        )
         if (
-            row["saga_id"] != receipt.saga_id
-            or row["phase"] != receipt.phase.value
-            or row["operation_request_hash"] != receipt.operation_request_hash
-            or row["claim_binding_hash"] != receipt.claim_binding_hash
-            or int(row["claim_generation"]) != receipt.claim_generation
-            or int(row["scheduler_fencing_token"]) != receipt.scheduler_fencing_token
-            or row["executor_owner_token_hash"] != receipt.executor_owner_token_hash
-            or int(row["executor_generation"]) != receipt.executor_generation
-            or row["max_external_deadline"] != _now_text(receipt.max_external_deadline)
-            or row["not_before_takeover_at"] != _now_text(receipt.not_before_takeover_at)
+            receipt.operation_id != row["operation_id"]
+            or attempt is None
+            or attempt["attempt_id"] != row["active_claim_attempt_id"]
         ):
             raise SourceBrokerTransportError("source operation claim binding conflicts")
+        self._validate_claim_attempt_binding(attempt, receipt)
 
     def _validate_operation_request(
         self,

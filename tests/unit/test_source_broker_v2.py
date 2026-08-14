@@ -60,6 +60,8 @@ from rquant.source_broker_v2 import (
     SourceBrokerV2WireRequest,
     SourceBrokerV2WireResponse,
     source_authority_signature_payload,
+    source_claim_attempt_id,
+    source_effect_operation_id,
 )
 from rquant.source_operation_contracts import CurrentClaimConsumptionV2
 from rquant.source_quota_authority import SourceQuotaParentAuthority
@@ -269,6 +271,10 @@ class _TestTransport:
     def claim_once(self, payload: bytes, *, deadline: float | None = None) -> bytes:
         self.deadlines.append(deadline)
         request = SourceBrokerV2ClaimOnceRequest.model_validate_json(payload)
+        effect_operation_id = source_effect_operation_id(
+            saga_id=request.saga_id,
+            phase=request.phase,
+        )
         with self._lock:
             self.claim_once_calls += 1
             if self.claim_once_unavailable:
@@ -278,15 +284,26 @@ class _TestTransport:
                 if request.phase is SourceBrokerV2OutboxPhase.DISPATCH
                 else self._finalize_results
             )
-            result = results.get(request.operation_id)
+            result = results.get(effect_operation_id)
             existing = self._source_claims.get(request.operation_id)
+            if existing is not None and (
+                existing.saga_id != request.saga_id
+                or existing.phase is not request.phase
+                or existing.operation_request_hash != request.operation_request_hash
+                or existing.claim_binding_hash != request.claim_binding_hash
+                or existing.claim_generation != request.claim_generation
+                or existing.scheduler_fencing_token != request.scheduler_fencing_token
+                or existing.max_external_deadline != request.max_external_deadline
+                or existing.not_before_takeover_at != request.not_before_takeover_at
+            ):
+                raise SourceBrokerTransportError("source operation claim binding conflicts")
             if result is not None:
                 if request.phase is SourceBrokerV2OutboxPhase.DISPATCH:
                     dispatch = SourceBrokerV2DispatchResponse.model_validate_json(result)
                     status = SourceBrokerV2ClaimStatus(dispatch.outcome.value)
                 else:
                     status = SourceBrokerV2ClaimStatus.SUCCESS
-            elif request.operation_id in self._inflight:
+            elif effect_operation_id in self._inflight:
                 status = SourceBrokerV2ClaimStatus.INFLIGHT
             elif (
                 existing is None
@@ -335,7 +352,7 @@ class _TestTransport:
         request: SourceBrokerV2DispatchRequest | SourceBrokerV2FinalizeRequest,
         receipt: SourceBrokerV2ClaimOnceResponse,
     ) -> None:
-        granted = self._source_claims.get(request.operation_id)
+        granted = self._source_claims.get(receipt.operation_id)
         if (
             granted is None
             or receipt.status is not SourceBrokerV2ClaimStatus.DEFINITIVELY_ABSENT
@@ -1758,9 +1775,10 @@ def test_v2_saga_heartbeat_schedule_protects_only_before_lease_expiry(
             return stop.wait(timeout=5)
 
         def observe_first_heartbeat(**kwargs: object) -> None:
-            is_background_dispatch = (
-                kwargs.get("phase") is SourceBrokerV2OutboxPhase.DISPATCH
-                and current_thread().name.startswith("rquant-source-broker-v2-heartbeat-")
+            is_background_dispatch = kwargs.get(
+                "phase"
+            ) is SourceBrokerV2OutboxPhase.DISPATCH and current_thread().name.startswith(
+                "rquant-source-broker-v2-heartbeat-"
             )
             try:
                 original_first_heartbeat(**kwargs)  # type: ignore[arg-type]
@@ -1844,9 +1862,7 @@ def test_v2_saga_heartbeat_schedule_protects_only_before_lease_expiry(
                     )
                     expected_heartbeat = heartbeat_time if expect_renewal else initial_time
                     expected_expiry = (
-                        expected_renewed_boundary
-                        if expect_renewal
-                        else original_lease_boundary
+                        expected_renewed_boundary if expect_renewal else original_lease_boundary
                     )
                     assert observed_at == competitor_time
                     assert datetime.fromisoformat(observed_heartbeat_raw) == expected_heartbeat
@@ -1864,19 +1880,13 @@ def test_v2_saga_heartbeat_schedule_protects_only_before_lease_expiry(
                     else:
                         assert original_lease_boundary < competitor_time < heartbeat_time
                         competitor_result = competitor.result(timeout=10)
-                        assert (
-                            competitor_result.state
-                            is SourceBrokerV2SagaState.RECONCILE_REQUIRED
-                        )
+                        assert competitor_result.state is SourceBrokerV2SagaState.RECONCILE_REQUIRED
                         clock.current = heartbeat_time
                         wake_release.set()
                         assert heartbeat_observed.wait(timeout=5)
                         transport.release_dispatch.set()
                         first_result = first.result(timeout=10)
-                        assert (
-                            first_result.state
-                            is SourceBrokerV2SagaState.RECONCILE_REQUIRED
-                        )
+                        assert first_result.state is SourceBrokerV2SagaState.RECONCILE_REQUIRED
                         assert any(
                             isinstance(error, SourceBrokerV2SagaConflictError)
                             for error in heartbeat_results
@@ -2000,26 +2010,49 @@ def test_v2_saga_persists_source_window_grant_and_terminal_observation(
     )
     finalize_transport = _TestTransport(clock=lambda: clock.now())
     finalize_lineage = _TestLineageAuthority()
-    original_finalize_claim_once = finalize_transport.claim_once
+    from .test_source_broker_v2_service import (
+        _CountingProvider,
+        _FakeExternalDispatchAuthority,
+        _service,
+    )
+
+    finalize_provider = _CountingProvider()
+    finalize_authority = _FakeExternalDispatchAuthority()
+    finalize_claim_operations: list[tuple[SourceBrokerV2OutboxPhase, str]] = []
+    finalize_service, finalize_keyring = _service(
+        finalize_root,
+        provider=finalize_provider,
+        external_authority=finalize_authority,
+        clock=lambda: clock.now(),
+    )
+
+    class _ExpiringProviderTransport:
+        source_authority_keyring = finalize_keyring
+
+        def claim_once(self, payload: bytes, *, deadline: float | None = None) -> bytes:
+            nonlocal finalize_claim_expired
+            claim_request = SourceBrokerV2ClaimOnceRequest.model_validate_json(payload)
+            finalize_claim_operations.append((claim_request.phase, claim_request.operation_id))
+            response = finalize_service.claim_once(payload, deadline=deadline)
+            if (
+                claim_request.phase is SourceBrokerV2OutboxPhase.SOURCE_FINALIZE
+                and not finalize_claim_expired
+            ):
+                finalize_claim_expired = True
+                clock.advance(0.30)
+            return response
+
+        def dispatch(self, payload: bytes, *, deadline: float | None = None) -> bytes:
+            return finalize_service.dispatch(payload, deadline=deadline)
+
+        def finalize(self, payload: bytes, *, deadline: float | None = None) -> bytes:
+            return finalize_service.finalize(payload, deadline=deadline)
+
+        def replay(self, payload: bytes, *, deadline: float | None = None) -> bytes:
+            return finalize_service.replay(payload, deadline=deadline)
+
     finalize_claim_expired = False
-
-    def expire_finalize_after_claim(
-        payload: bytes,
-        *,
-        deadline: float | None = None,
-    ) -> bytes:
-        nonlocal finalize_claim_expired
-        claim_request = SourceBrokerV2ClaimOnceRequest.model_validate_json(payload)
-        response = original_finalize_claim_once(payload, deadline=deadline)
-        if (
-            claim_request.phase is SourceBrokerV2OutboxPhase.SOURCE_FINALIZE
-            and not finalize_claim_expired
-        ):
-            finalize_claim_expired = True
-            clock.advance(0.30)
-        return response
-
-    monkeypatch.setattr(finalize_transport, "claim_once", expire_finalize_after_claim)
+    finalize_transport = _ExpiringProviderTransport()
     finalize_path = finalize_root / "saga.sqlite3"
     finalize_saga = SourceBrokerV2Saga.for_nonproduction(
         finalize_path,
@@ -2036,8 +2069,8 @@ def test_v2_saga_persists_source_window_grant_and_terminal_observation(
     )
 
     assert pending_finalize.state.value == "source_finalize_reconcile_required"
-    assert finalize_transport.dispatch_calls == 1
-    assert finalize_transport.finalize_calls == 0
+    assert finalize_provider.dispatch_calls == 1
+    assert finalize_provider.finalize_calls == 0
     assert finalize_lineage.calls == []
     with sqlite3.connect(finalize_path) as connection:
         finalize_row = connection.execute(
@@ -2059,12 +2092,31 @@ def test_v2_saga_persists_source_window_grant_and_terminal_observation(
 
     assert recovered_finalize.state is SourceBrokerV2SagaState.COMPLETE
     assert recovered_finalize.reconcile_reason is None
-    assert finalize_transport.dispatch_calls == 1
-    assert finalize_transport.finalize_calls == 1
+    assert finalize_provider.dispatch_calls == 1
+    assert finalize_provider.finalize_calls == 1
     assert len(finalize_lineage.calls) == 1
+    assert finalize_claim_operations
+    assert all(
+        operation_id
+        == source_effect_operation_id(
+            saga_id="saga-finalize-expired-before-invoke",
+            phase=phase,
+        )
+        for phase, operation_id in finalize_claim_operations
+    )
     with sqlite3.connect(finalize_path) as connection:
-        renewed_deadline, finalize_status = connection.execute(
-            "SELECT max_external_deadline, status "
+        (
+            active_attempt_id,
+            active_owner_hash,
+            active_generation,
+            active_deadline,
+            active_takeover,
+            finalize_status,
+            effect_operation_id,
+        ) = connection.execute(
+            "SELECT source_attempt_id, source_attempt_owner_hash, "
+            "source_attempt_generation, max_external_deadline, "
+            "not_before_takeover_at, status, operation_id "
             "FROM source_broker_v2_outbox WHERE phase = 'source_finalize'"
         ).fetchone()
         finalize_receipts = dict(
@@ -2073,9 +2125,46 @@ def test_v2_saga_persists_source_window_grant_and_terminal_observation(
                 "WHERE phase = 'source_finalize' GROUP BY status"
             ).fetchall()
         )
-    assert datetime.fromisoformat(str(renewed_deadline)) > first_finalize_deadline
+        local_attempt_table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'source_broker_v2_source_attempt'"
+        ).fetchone()
+    assert local_attempt_table is None
+    assert datetime.fromisoformat(str(active_deadline)) > first_finalize_deadline
+    assert active_attempt_id == source_claim_attempt_id(
+        effect_operation_id=effect_operation_id,
+        executor_owner_token_hash=active_owner_hash,
+        executor_generation=active_generation,
+        max_external_deadline=datetime.fromisoformat(str(active_deadline)),
+        not_before_takeover_at=datetime.fromisoformat(str(active_takeover)),
+    )
     assert finalize_status == "applied"
     assert finalize_receipts == {"DEFINITIVELY_ABSENT": 2, "SUCCESS": 1}
+    with sqlite3.connect(finalize_service.ledger_path) as connection:
+        provider_effect = connection.execute(
+            "SELECT max_external_deadline, active_claim_attempt_id "
+            "FROM source_broker_v2_provider_operation WHERE operation_id = ?",
+            (effect_operation_id,),
+        ).fetchone()
+        provider_attempts = connection.execute(
+            "SELECT attempt_id, executor_owner_token_hash, executor_generation, "
+            "max_external_deadline, not_before_takeover_at "
+            "FROM source_broker_v2_provider_claim_attempt "
+            "WHERE effect_operation_id = ? ORDER BY created_at",
+            (effect_operation_id,),
+        ).fetchall()
+    assert provider_effect == (first_finalize_deadline.isoformat(), active_attempt_id)
+    assert len(provider_attempts) == 2
+    assert provider_attempts[0][0] != provider_attempts[1][0]
+    for attempt_row in provider_attempts:
+        assert attempt_row[0] == source_claim_attempt_id(
+            effect_operation_id=effect_operation_id,
+            executor_owner_token_hash=attempt_row[1],
+            executor_generation=attempt_row[2],
+            max_external_deadline=datetime.fromisoformat(attempt_row[3]),
+            not_before_takeover_at=datetime.fromisoformat(attempt_row[4]),
+        )
+    assert provider_attempts[-1][0] == active_attempt_id
 
 
 def test_v2_saga_rejects_tampered_historical_source_authority_receipt(
@@ -2095,9 +2184,18 @@ def test_v2_saga_rejects_tampered_historical_source_authority_receipt(
     )
     saga.advance(request, now=NOW + timedelta(seconds=1))
     with sqlite3.connect(path) as connection:
+        rowid, raw = connection.execute(
+            "SELECT rowid, receipt_json FROM source_broker_v2_source_receipt ORDER BY rowid LIMIT 1"
+        ).fetchone()
+        receipt = SourceBrokerV2ClaimOnceResponse.model_validate_json(raw)
+        forged = receipt.model_copy(
+            update={"signature": base64.b64encode(b"0" * 64).decode("ascii")}
+        )
+        forged_raw = canonical_model_json_bytes(forged)
         connection.execute(
-            "UPDATE source_broker_v2_source_receipt SET receipt_json = '{}' "
-            "WHERE rowid = (SELECT MIN(rowid) FROM source_broker_v2_source_receipt)"
+            "UPDATE source_broker_v2_source_receipt SET receipt_hash = ?, "
+            "receipt_json = ? WHERE rowid = ?",
+            (forged.receipt_hash, forged_raw.decode("utf-8"), rowid),
         )
 
     restarted = SourceBrokerV2Saga.for_nonproduction(
@@ -2436,6 +2534,33 @@ def test_v2_saga_deleted_local_db_recovers_authority_effects_without_redispatch(
     assert transport.dispatch_calls == 1
     assert transport.finalize_calls == 1
     assert transport.claim_once_calls > 0
+    with sqlite3.connect(path) as connection:
+        observation_json, observation_hash = connection.execute(
+            "SELECT source_observation_json, source_observation_hash "
+            "FROM source_broker_v2_outbox WHERE phase = 'dispatch'"
+        ).fetchone()
+        replay_history = connection.execute(
+            "SELECT receipt_hash, attempt_id, status, receipt_json "
+            "FROM source_broker_v2_source_receipt "
+            "WHERE phase = 'dispatch' AND status = 'FOUND' ORDER BY rowid"
+        ).fetchall()
+    observation = SourceBrokerV2ReplayResponse.model_validate_json(observation_json)
+    assert observation.status is SourceBrokerV2ReplayStatus.FOUND
+    assert observation.receipt_hash == observation_hash
+    assert observation.result is not None
+    assert len(replay_history) == 2
+    replay_receipts = [
+        SourceBrokerV2ReplayResponse.model_validate_json(row[3]) for row in replay_history
+    ]
+    assert all(row[1:3] == (None, "FOUND") for row in replay_history)
+    assert all(
+        row[0] == receipt.receipt_hash
+        for row, receipt in zip(replay_history, replay_receipts, strict=True)
+    )
+    assert len({receipt.challenge for receipt in replay_receipts}) == 2
+    assert all(receipt.operation_id == observation.operation_id for receipt in replay_receipts)
+    assert all(receipt.result_hash == observation.result_hash for receipt in replay_receipts)
+    assert replay_history[-1][3] == observation_json
 
 
 def test_v2_saga_old_local_snapshot_recovers_authority_head_without_redispatch(
@@ -2474,6 +2599,11 @@ def test_v2_saga_old_local_snapshot_recovers_authority_head_without_redispatch(
     assert first_result.state is SourceBrokerV2SagaState.RECONCILE_REQUIRED
     completed = first.reconcile(request, now=NOW + timedelta(seconds=2))
     assert completed.state is SourceBrokerV2SagaState.COMPLETE
+    with sqlite3.connect(snapshot_path) as legacy:
+        legacy.execute("ALTER TABLE source_broker_v2_outbox DROP COLUMN source_attempt_id")
+        legacy.execute("ALTER TABLE source_broker_v2_outbox DROP COLUMN source_attempt_owner_hash")
+        legacy.execute("ALTER TABLE source_broker_v2_outbox DROP COLUMN source_attempt_generation")
+        legacy.execute("ALTER TABLE source_broker_v2_source_receipt DROP COLUMN attempt_id")
     with (
         sqlite3.connect(snapshot_path) as source,
         sqlite3.connect(path) as target,
@@ -2493,6 +2623,17 @@ def test_v2_saga_old_local_snapshot_recovers_authority_head_without_redispatch(
     assert recovered.state is SourceBrokerV2SagaState.COMPLETE
     assert transport.dispatch_calls == 1
     assert transport.claim_once_calls > 0
+    with sqlite3.connect(path) as connection:
+        migrated_attempt = connection.execute(
+            "SELECT source_attempt_id FROM source_broker_v2_outbox WHERE phase = 'dispatch'"
+        ).fetchone()[0]
+        migrated_receipts = connection.execute(
+            "SELECT status, attempt_id FROM source_broker_v2_source_receipt "
+            "WHERE phase = 'dispatch' ORDER BY rowid"
+        ).fetchall()
+    assert type(migrated_attempt) is str
+    assert migrated_receipts[0] == ("DEFINITIVELY_ABSENT", migrated_attempt)
+    assert all(attempt_id is None for status, attempt_id in migrated_receipts if status == "FOUND")
 
 
 def test_v2_saga_rejects_rehashed_forged_claim_receipt_against_authority(

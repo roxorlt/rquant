@@ -45,6 +45,8 @@ from rquant.source_broker_v2 import (
     SourceBrokerV2TransportDeadlineError,
     SourceBrokerV2WireRequest,
     source_authority_signature_payload,
+    source_claim_attempt_id,
+    source_effect_operation_id,
 )
 from rquant.strict_json import (
     canonical_json_bytes,
@@ -103,11 +105,19 @@ def _hash_payload(payload: bytes) -> str:
     return canonical_sha256(strict_json.strict_canonical_json_loads(payload))
 
 
-def _dispatch_request(operation_id: str = "a" * 64) -> SourceBrokerV2DispatchRequest:
+def _dispatch_request(
+    operation_id: str | None = None,
+    *,
+    saga_id: str = "saga-source-v2",
+) -> SourceBrokerV2DispatchRequest:
     payload = _source_payload()
     return SourceBrokerV2DispatchRequest(
-        saga_id="saga-source-v2",
-        operation_id=operation_id,
+        saga_id=saga_id,
+        operation_id=operation_id
+        or source_effect_operation_id(
+            saga_id=saga_id,
+            phase=SourceBrokerV2OutboxPhase.DISPATCH,
+        ),
         call_id="daily-bars",
         attempt_identity_hash=HASHES["attempt"],
         claim_plan_hash=HASHES["claim_plan"],
@@ -149,11 +159,15 @@ def _claim_once_request(
 def _finalize_request(
     dispatch: SourceBrokerV2DispatchResponse,
     *,
-    operation_id: str = "b" * 64,
+    operation_id: str | None = None,
 ) -> SourceBrokerV2FinalizeRequest:
     return SourceBrokerV2FinalizeRequest(
         saga_id=dispatch.saga_id,
-        operation_id=operation_id,
+        operation_id=operation_id
+        or source_effect_operation_id(
+            saga_id=dispatch.saga_id,
+            phase=SourceBrokerV2OutboxPhase.SOURCE_FINALIZE,
+        ),
         dispatch_evidence_hash=dispatch.evidence_hash,
         claim_binding_hash=HASHES["binding"],
     )
@@ -630,6 +644,7 @@ def _service(
     external_authority: object | None = None,
     max_inflight: int = 1,
     event_sink: object | None = None,
+    clock: object | None = None,
 ):
     from rquant.source_broker_v2_service import (
         OpenSslSourceBrokerV2AuthoritySigner,
@@ -664,7 +679,7 @@ def _service(
                 else _FakeExternalDispatchAuthority()
             ),
             busy_timeout_ms=busy_timeout_ms,
-            clock=lambda: NOW,
+            clock=clock or (lambda: NOW),
             max_inflight=max_inflight,
             event_sink=event_sink,
             profile="nonproduction",
@@ -1580,8 +1595,8 @@ def test_claim_conflict_cannot_rebind_takeover_window_or_overwrite_fence(
         max_external_deadline=NOW,
         not_before_takeover_at=NOW,
     )
-    with pytest.raises(SourceBrokerTransportError, match="claim binding conflicts"):
-        _claim(service, malicious)
+    refused = _claim(service, malicious)
+    assert refused.status is SourceBrokerV2ClaimStatus.INFLIGHT
 
     with sqlite3.connect(tmp_path / "source-provider-ledger.sqlite3") as connection:
         row = connection.execute(
@@ -1590,6 +1605,11 @@ def test_claim_conflict_cannot_rebind_takeover_window_or_overwrite_fence(
             "FROM source_broker_v2_provider_operation WHERE operation_id = ?",
             (request.operation_id,),
         ).fetchone()
+        attempts = connection.execute(
+            "SELECT attempt_id FROM source_broker_v2_provider_claim_attempt "
+            "WHERE effect_operation_id = ?",
+            (request.operation_id,),
+        ).fetchall()
 
     assert row == (
         original.executor_owner_token_hash,
@@ -1597,6 +1617,17 @@ def test_claim_conflict_cannot_rebind_takeover_window_or_overwrite_fence(
         original.max_external_deadline.isoformat(),
         original.not_before_takeover_at.isoformat(),
     )
+    assert attempts == [
+        (
+            source_claim_attempt_id(
+                effect_operation_id=request.operation_id,
+                executor_owner_token_hash=original.executor_owner_token_hash,
+                executor_generation=original.executor_generation,
+                max_external_deadline=original.max_external_deadline,
+                not_before_takeover_at=original.not_before_takeover_at,
+            ),
+        )
+    ]
 
 
 def test_takeover_replaces_current_fence_and_rejects_stale_grant_dispatch(
@@ -1617,7 +1648,7 @@ def test_takeover_replaces_current_fence_and_rejects_stale_grant_dispatch(
         request,
         challenge="b" * 64,
         executor_owner_token_hash="e" * 64,
-        executor_generation=4,
+        executor_generation=original_request.executor_generation,
         max_external_deadline=NOW,
         not_before_takeover_at=NOW,
     )
@@ -1641,6 +1672,23 @@ def test_takeover_replaces_current_fence_and_rejects_stale_grant_dispatch(
     )
     assert dispatch.operation_id == request.operation_id
     assert provider.dispatch_calls == 1
+    with sqlite3.connect(tmp_path / "source-provider-ledger.sqlite3") as connection:
+        attempts = connection.execute(
+            "SELECT attempt_id, executor_owner_token_hash, executor_generation "
+            "FROM source_broker_v2_provider_claim_attempt "
+            "WHERE effect_operation_id = ? ORDER BY created_at",
+            (request.operation_id,),
+        ).fetchall()
+    assert len(attempts) == 2
+    assert attempts[0][0] != attempts[1][0]
+    assert attempts[0][1:] == (
+        original_request.executor_owner_token_hash,
+        original_request.executor_generation,
+    )
+    assert attempts[1][1:] == (
+        takeover_request.executor_owner_token_hash,
+        takeover_request.executor_generation,
+    )
 
 
 def test_live_claim_and_replay_do_not_poison_inflight_provider_completion(
@@ -1790,8 +1838,12 @@ def test_global_provider_gate_bounds_blocked_sources_before_authority_reserve(
         max_inflight=1,
         event_sink=events.append,
     )
-    first_request = _dispatch_request("1" * 64).model_copy(update={"call_id": "daily-bars"})
-    second_request = _dispatch_request("2" * 64).model_copy(update={"call_id": "intraday-bars"})
+    first_request = _dispatch_request(saga_id="saga-source-v2-daily").model_copy(
+        update={"call_id": "daily-bars"}
+    )
+    second_request = _dispatch_request(saga_id="saga-source-v2-intraday").model_copy(
+        update={"call_id": "intraday-bars"}
+    )
 
     def envelope_for(request: SourceBrokerV2DispatchRequest) -> bytes:
         claim = _claim(service, _claim_once_request(request))
@@ -1853,8 +1905,8 @@ def test_provider_service_stop_prevents_new_threads_and_reservations(tmp_path: P
         provider=provider,
         external_authority=authority,
     )
-    first_request = _dispatch_request("3" * 64)
-    second_request = _dispatch_request("5" * 64)
+    first_request = _dispatch_request(saga_id="saga-source-v2-stop-active")
+    second_request = _dispatch_request(saga_id="saga-source-v2-stop-refused")
     first_claim = _claim(service, _claim_once_request(first_request))
     second_claim = _claim(service, _claim_once_request(second_request))
     first_envelope = canonical_model_json_bytes(
@@ -1910,7 +1962,7 @@ def test_security_events_are_structured_and_never_include_provider_secrets(
         provider=provider,
         event_sink=events.append,
     )
-    request = _dispatch_request("4" * 64)
+    request = _dispatch_request(saga_id="saga-source-v2-sensitive-failure")
     claim = _claim(service, _claim_once_request(request))
     envelope = canonical_model_json_bytes(
         SourceBrokerV2DispatchEnvelope(request=request, claim_receipt=claim)
@@ -2135,7 +2187,10 @@ def test_replay_signing_uses_remaining_single_request_deadline(tmp_path: Path) -
     service, _keyring = _service(tmp_path, provider=provider, signer=signer)
     request = SourceBrokerV2ReplayRequest(
         saga_id="saga-source-v2",
-        operation_id="c" * 64,
+        operation_id=source_effect_operation_id(
+            saga_id="saga-source-v2",
+            phase=SourceBrokerV2OutboxPhase.DISPATCH,
+        ),
         phase=SourceBrokerV2OutboxPhase.DISPATCH,
         operation_request_hash="d" * 64,
         challenge="e" * 64,
@@ -2462,10 +2517,29 @@ def test_sqlite_ledger_uses_wal_full_sync_busy_timeout_and_unique_operation(
     request = _claim_once_request(_dispatch_request())
     _claim(service, request)
 
+    ledger_path = tmp_path / "source-provider-ledger.sqlite3"
+    with real_connect(ledger_path) as legacy:
+        legacy.execute("PRAGMA foreign_keys=OFF")
+        legacy.execute("DROP TABLE source_broker_v2_provider_claim_attempt")
+        legacy.execute(
+            "ALTER TABLE source_broker_v2_provider_operation DROP COLUMN active_claim_attempt_id"
+        )
+    _migrated, _migrated_keyring = _service(tmp_path)
+
     statements = [statement for connection in connections for statement in connection.statements]
-    with real_connect(tmp_path / "source-provider-ledger.sqlite3") as connection:
+    with real_connect(ledger_path) as connection:
         unique_indexes = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type='index' AND sql LIKE '%operation_id%'"
+        ).fetchall()
+        migrated = connection.execute(
+            "SELECT active_claim_attempt_id FROM source_broker_v2_provider_operation "
+            "WHERE operation_id = ?",
+            (request.operation_id,),
+        ).fetchone()
+        attempts = connection.execute(
+            "SELECT attempt_id FROM source_broker_v2_provider_claim_attempt "
+            "WHERE effect_operation_id = ?",
+            (request.operation_id,),
         ).fetchall()
 
     assert any(statement == "pragma journal_mode=wal" for statement in statements)
@@ -2474,6 +2548,8 @@ def test_sqlite_ledger_uses_wal_full_sync_busy_timeout_and_unique_operation(
     assert any(statement == "pragma busy_timeout=5000" for statement in statements)
     assert any(connection.connect_timeout == 5.0 for connection in connections)
     assert unique_indexes
+    assert migrated is not None
+    assert attempts == [migrated]
 
 
 def test_darwin_or_missing_so_peercred_fails_before_socket_creation(

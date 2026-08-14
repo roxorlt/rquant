@@ -70,6 +70,7 @@ SOURCE_BROKER_V2_MAX_PAYLOAD_BYTES = 256 * 1024
 SOURCE_BROKER_V2_MAX_RECEIPT_BYTES = 512 * 1024
 SOURCE_BROKER_V2_AUTHORITY_PURPOSE = "rquant-source-authority-receipt"
 SOURCE_BROKER_V2_AUTHORITY_NAMESPACE = "rquant-source-authority-receipt/v2"
+SOURCE_BROKER_V2_CLAIM_ATTEMPT_CONTRACT = "rquant-source-broker-claim-attempt/v1"
 _ZERO_HASH = "0" * 64
 _ED25519_SIGNATURE_BYTES = 64
 _PRODUCTION_SAGA_GRAPH_TOKEN = object()
@@ -138,6 +139,53 @@ class SourceBrokerV2OutboxPhase(StrEnum):
     UNKNOWN_BEFORE_DISPATCH = "unknown_before_dispatch"
     RELEASE_UNUSED = "release_unused"
     LINEAGE = "lineage"
+
+
+def source_effect_operation_id(
+    *,
+    saga_id: str,
+    phase: SourceBrokerV2OutboxPhase,
+) -> str:
+    return canonical_sha256(
+        {"contract": SOURCE_BROKER_V2_CONTRACT, "phase": phase.value, "saga_id": saga_id}
+    )
+
+
+def source_claim_attempt_id(
+    *,
+    effect_operation_id: str,
+    executor_owner_token_hash: str,
+    executor_generation: int,
+    max_external_deadline: datetime,
+    not_before_takeover_at: datetime,
+) -> str:
+    if executor_generation < 1:
+        raise ValueError("source claim attempt generation must be positive")
+    return canonical_sha256(
+        {
+            "contract": SOURCE_BROKER_V2_CLAIM_ATTEMPT_CONTRACT,
+            "effect_operation_id": effect_operation_id,
+            "executor_owner_token_hash": executor_owner_token_hash,
+            "executor_generation": executor_generation,
+            "max_external_deadline": _normalize_contract_time(
+                max_external_deadline,
+                label="max_external_deadline",
+            ).isoformat(),
+            "not_before_takeover_at": _normalize_contract_time(
+                not_before_takeover_at,
+                label="not_before_takeover_at",
+            ).isoformat(),
+        }
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _SourceClaimAttempt:
+    attempt_id: str
+    executor_owner_token_hash: str
+    executor_generation: int
+    max_external_deadline: datetime
+    not_before_takeover_at: datetime
 
 
 class SourceBrokerV2DispatchOutcome(StrEnum):
@@ -358,6 +406,10 @@ class SourceBrokerV2ReplayResponse(_StrictV2Model):
 
     def signing_bytes(self) -> bytes:
         return canonical_json_bytes(self.model_dump(mode="json", exclude={"signature"}))
+
+    @property
+    def receipt_hash(self) -> str:
+        return _model_hash(self)
 
 
 class SourceBrokerV2DispatchRequest(_StrictV2Model):
@@ -2086,6 +2138,23 @@ class SourceBrokerV2Saga:
             owner_generation: int,
             _invoke_started: bool,
         ) -> tuple[bytes | None, bytes | None]:
+            replay = self._replay_source_operation(
+                phase=phase,
+                operation_id=operation_id,
+                operation_request_hash=dispatch_request.request_hash,
+            )
+            if replay.status is SourceBrokerV2ReplayStatus.UNKNOWN:
+                raise SourceBrokerV2SagaReconcileRequiredError(
+                    "source authority cannot determine the dispatch outcome"
+                )
+            if replay.status is SourceBrokerV2ReplayStatus.FOUND:
+                self._persist_source_replay_observation(
+                    phase=phase,
+                    operation_id=operation_id,
+                    owner_generation=owner_generation,
+                    response=replay,
+                )
+                return replay.result, None
             source_claim = self._source_claim_once(
                 request=request,
                 phase=phase,
@@ -2205,6 +2274,23 @@ class SourceBrokerV2Saga:
             owner_generation: int,
             _invoke_started: bool,
         ) -> tuple[bytes | None, bytes | None]:
+            replay = self._replay_source_operation(
+                phase=phase,
+                operation_id=operation_id,
+                operation_request_hash=finalize_request.request_hash,
+            )
+            if replay.status is SourceBrokerV2ReplayStatus.UNKNOWN:
+                raise SourceBrokerV2SagaReconcileRequiredError(
+                    "source authority cannot determine the finalize outcome"
+                )
+            if replay.status is SourceBrokerV2ReplayStatus.FOUND:
+                self._persist_source_replay_observation(
+                    phase=phase,
+                    operation_id=operation_id,
+                    owner_generation=owner_generation,
+                    response=replay,
+                )
+                return replay.result, None
             source_claim = self._source_claim_once(
                 request=request,
                 phase=phase,
@@ -2394,14 +2480,15 @@ class SourceBrokerV2Saga:
             ) from exc
         return raw
 
-    def _ensure_source_window(
+    def _ensure_source_attempt(
         self,
         *,
         phase: SourceBrokerV2OutboxPhase,
         operation_id: str,
         owner_generation: int,
-    ) -> tuple[datetime, datetime]:
+    ) -> _SourceClaimAttempt:
         now = datetime.now(UTC)
+        owner_hash = canonical_sha256({"executor_owner_token": self._executor_owner_token})
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
@@ -2410,57 +2497,81 @@ class SourceBrokerV2Saga:
                     operation_id=operation_id,
                     phase=phase,
                 )
-                deadline = _optional_executor_time(
-                    row["max_external_deadline"],
-                    label="source maximum external deadline",
+                attempt = self._source_attempt_from_outbox(
+                    row,
+                    effect_operation_id=operation_id,
                 )
-                takeover_at = _optional_executor_time(
-                    row["not_before_takeover_at"],
-                    label="source takeover boundary",
-                )
-                if deadline is None and takeover_at is None:
-                    deadline = now + timedelta(seconds=self._source_request_deadline_seconds)
-                    takeover_at = deadline + timedelta(seconds=self._source_takeover_grace_seconds)
-                    updated = connection.execute(
-                        "UPDATE source_broker_v2_outbox SET max_external_deadline = ?, "
-                        "not_before_takeover_at = ? WHERE operation_id = ? "
-                        "AND status = 'pending' AND executor_owner_token = ? "
-                        "AND executor_generation = ?",
-                        (
-                            deadline.isoformat(),
-                            takeover_at.isoformat(),
-                            operation_id,
-                            self._executor_owner_token,
-                            owner_generation,
-                        ),
-                    ).rowcount
-                    if updated != 1:
-                        raise SourceBrokerV2SagaConflictError(
-                            "outbox executor lost ownership before source claim"
+                if attempt is None:
+                    prior = self._legacy_claim_observation(row)
+                    if prior is not None:
+                        if (
+                            prior.saga_id != self.saga_id
+                            or prior.operation_id != operation_id
+                            or prior.phase is not phase
+                        ):
+                            raise SourceBrokerV2SagaIntegrityError(
+                                "legacy source attempt evidence is foreign"
+                            )
+                        attempt_owner_hash = prior.executor_owner_token_hash
+                        attempt_generation = prior.executor_generation
+                        deadline = prior.max_external_deadline
+                        takeover_at = prior.not_before_takeover_at
+                    else:
+                        deadline = _optional_executor_time(
+                            row["max_external_deadline"],
+                            label="source maximum external deadline",
                         )
-                elif deadline is None or takeover_at is None:
-                    raise SourceBrokerV2SagaIntegrityError(
-                        "source external timing evidence is incomplete"
+                        takeover_at = _optional_executor_time(
+                            row["not_before_takeover_at"],
+                            label="source takeover boundary",
+                        )
+                        if (deadline is None) != (takeover_at is None):
+                            raise SourceBrokerV2SagaIntegrityError(
+                                "source external timing evidence is incomplete"
+                            )
+                        if deadline is None or (
+                            phase is SourceBrokerV2OutboxPhase.SOURCE_FINALIZE
+                            and takeover_at is not None
+                            and now >= takeover_at
+                        ):
+                            deadline = now + timedelta(
+                                seconds=self._source_request_deadline_seconds
+                            )
+                            takeover_at = deadline + timedelta(
+                                seconds=self._source_takeover_grace_seconds
+                            )
+                        attempt_owner_hash = owner_hash
+                        attempt_generation = owner_generation
+                    if takeover_at is None:
+                        raise SourceBrokerV2SagaIntegrityError(
+                            "source takeover boundary is missing"
+                        )
+                    attempt = _SourceClaimAttempt(
+                        attempt_id=source_claim_attempt_id(
+                            effect_operation_id=operation_id,
+                            executor_owner_token_hash=attempt_owner_hash,
+                            executor_generation=attempt_generation,
+                            max_external_deadline=deadline,
+                            not_before_takeover_at=takeover_at,
+                        ),
+                        executor_owner_token_hash=attempt_owner_hash,
+                        executor_generation=attempt_generation,
+                        max_external_deadline=deadline,
+                        not_before_takeover_at=takeover_at,
                     )
-                elif (
-                    phase is SourceBrokerV2OutboxPhase.SOURCE_FINALIZE
-                    and not bool(row["invoke_started"])
-                    and row["dispatch_started_at"] is None
-                    and now >= takeover_at
-                ):
-                    deadline = now + timedelta(seconds=self._source_request_deadline_seconds)
-                    takeover_at = deadline + timedelta(seconds=self._source_takeover_grace_seconds)
                     updated = connection.execute(
-                        "UPDATE source_broker_v2_outbox SET max_external_deadline = ?, "
-                        "not_before_takeover_at = ?, source_grant_json = NULL, "
-                        "source_grant_hash = NULL, source_observation_json = NULL, "
-                        "source_observation_hash = NULL WHERE operation_id = ? "
-                        "AND status = 'pending' AND executor_owner_token = ? "
-                        "AND executor_generation = ? AND invoke_started = 0 "
-                        "AND dispatch_started_at IS NULL",
+                        "UPDATE source_broker_v2_outbox SET source_attempt_id = ?, "
+                        "source_attempt_owner_hash = ?, source_attempt_generation = ?, "
+                        "max_external_deadline = ?, not_before_takeover_at = ? "
+                        "WHERE operation_id = ? AND status = 'pending' "
+                        "AND executor_owner_token = ? AND executor_generation = ? "
+                        "AND source_attempt_id IS NULL",
                         (
-                            deadline.isoformat(),
-                            takeover_at.isoformat(),
+                            attempt.attempt_id,
+                            attempt.executor_owner_token_hash,
+                            attempt.executor_generation,
+                            attempt.max_external_deadline.isoformat(),
+                            attempt.not_before_takeover_at.isoformat(),
                             operation_id,
                             self._executor_owner_token,
                             owner_generation,
@@ -2468,13 +2579,142 @@ class SourceBrokerV2Saga:
                     ).rowcount
                     if updated != 1:
                         raise SourceBrokerV2SagaConflictError(
-                            "outbox executor lost ownership before finalize window renewal"
+                            "outbox executor lost ownership before source attempt persistence"
                         )
+                has_observation = row["source_observation_json"] is not None
+                has_grant = row["source_grant_json"] is not None
+                invocation_started = bool(row["invoke_started"]) or (
+                    row["dispatch_started_at"] is not None
+                )
+                if (has_observation or has_grant) and not invocation_started:
+                    if now < attempt.not_before_takeover_at:
+                        raise SourceBrokerV2SagaReconcileRequiredError(
+                            "source claim attempt remains fenced until takeover"
+                        )
+                    if phase is not SourceBrokerV2OutboxPhase.SOURCE_FINALIZE:
+                        raise SourceBrokerV2SagaReconcileRequiredError(
+                            "expired source dispatch requires reconciliation"
+                        )
+                    deadline = now + timedelta(seconds=self._source_request_deadline_seconds)
+                    takeover_at = deadline + timedelta(seconds=self._source_takeover_grace_seconds)
+                    replacement = _SourceClaimAttempt(
+                        attempt_id=source_claim_attempt_id(
+                            effect_operation_id=operation_id,
+                            executor_owner_token_hash=owner_hash,
+                            executor_generation=owner_generation,
+                            max_external_deadline=deadline,
+                            not_before_takeover_at=takeover_at,
+                        ),
+                        executor_owner_token_hash=owner_hash,
+                        executor_generation=owner_generation,
+                        max_external_deadline=deadline,
+                        not_before_takeover_at=takeover_at,
+                    )
+                    updated = connection.execute(
+                        "UPDATE source_broker_v2_outbox SET source_attempt_id = ?, "
+                        "source_attempt_owner_hash = ?, source_attempt_generation = ?, "
+                        "max_external_deadline = ?, not_before_takeover_at = ?, "
+                        "source_grant_json = NULL, source_grant_hash = NULL, "
+                        "source_observation_json = NULL, source_observation_hash = NULL "
+                        "WHERE operation_id = ? "
+                        "AND status = 'pending' AND executor_owner_token = ? "
+                        "AND executor_generation = ? AND source_attempt_id = ? "
+                        "AND invoke_started = 0 AND dispatch_started_at IS NULL",
+                        (
+                            replacement.attempt_id,
+                            replacement.executor_owner_token_hash,
+                            replacement.executor_generation,
+                            deadline.isoformat(),
+                            takeover_at.isoformat(),
+                            operation_id,
+                            self._executor_owner_token,
+                            owner_generation,
+                            attempt.attempt_id,
+                        ),
+                    ).rowcount
+                    if updated != 1:
+                        raise SourceBrokerV2SagaConflictError(
+                            "outbox executor lost ownership before source attempt recovery"
+                        )
+                    attempt = replacement
                 connection.commit()
-                return deadline, takeover_at
+                return attempt
             except BaseException:
                 connection.rollback()
                 raise
+
+    def _source_attempt_from_outbox(
+        self,
+        row: sqlite3.Row,
+        *,
+        effect_operation_id: str,
+    ) -> _SourceClaimAttempt | None:
+        values = (
+            row["source_attempt_id"],
+            row["source_attempt_owner_hash"],
+            row["source_attempt_generation"],
+        )
+        if all(value is None for value in values):
+            return None
+        if any(value is None for value in values):
+            raise SourceBrokerV2SagaIntegrityError("source claim attempt evidence is incomplete")
+        attempt_id, owner_hash, generation = values
+        if (
+            type(attempt_id) is not str
+            or type(owner_hash) is not str
+            or type(generation) is not int
+            or generation < 1
+        ):
+            raise SourceBrokerV2SagaIntegrityError("source claim attempt SQLite types are invalid")
+        deadline = _optional_executor_time(
+            row["max_external_deadline"],
+            label="source maximum external deadline",
+        )
+        takeover_at = _optional_executor_time(
+            row["not_before_takeover_at"],
+            label="source takeover boundary",
+        )
+        if deadline is None or takeover_at is None:
+            raise SourceBrokerV2SagaIntegrityError(
+                "source claim attempt timing evidence is incomplete"
+            )
+        expected = source_claim_attempt_id(
+            effect_operation_id=effect_operation_id,
+            executor_owner_token_hash=owner_hash,
+            executor_generation=generation,
+            max_external_deadline=deadline,
+            not_before_takeover_at=takeover_at,
+        )
+        if attempt_id != expected:
+            raise SourceBrokerV2SagaIntegrityError(
+                "source claim attempt identity conflicts with its immutable binding"
+            )
+        return _SourceClaimAttempt(
+            attempt_id=attempt_id,
+            executor_owner_token_hash=owner_hash,
+            executor_generation=generation,
+            max_external_deadline=deadline,
+            not_before_takeover_at=takeover_at,
+        )
+
+    def _legacy_claim_observation(
+        self,
+        row: sqlite3.Row,
+    ) -> SourceBrokerV2ClaimOnceResponse | None:
+        raw = row["source_grant_json"] or row["source_observation_json"]
+        if raw is None:
+            return None
+        if type(raw) is not str:
+            raise SourceBrokerV2SagaIntegrityError(
+                "legacy source attempt evidence has an invalid SQLite type"
+            )
+        try:
+            return strict_model_validate_canonical_json(
+                SourceBrokerV2ClaimOnceResponse,
+                raw.encode("utf-8"),
+            )
+        except (StrictJsonError, ValidationError, ValueError, TypeError):
+            return None
 
     def _source_claim_once(
         self,
@@ -2485,7 +2725,7 @@ class SourceBrokerV2Saga:
         operation_request_hash: str,
         owner_generation: int,
     ) -> SourceBrokerV2ClaimOnceResponse:
-        deadline, takeover_at = self._ensure_source_window(
+        source_attempt = self._ensure_source_attempt(
             phase=phase,
             operation_id=operation_id,
             owner_generation=owner_generation,
@@ -2500,20 +2740,28 @@ class SourceBrokerV2Saga:
             claim_binding_hash=request.claim_issue.binding_hash,
             claim_generation=attempt.claim_generation,
             scheduler_fencing_token=attempt.scheduler_fencing_token,
-            executor_owner_token_hash=canonical_sha256(
-                {"executor_owner_token": self._executor_owner_token}
-            ),
-            executor_generation=owner_generation,
-            max_external_deadline=deadline,
-            not_before_takeover_at=takeover_at,
+            executor_owner_token_hash=source_attempt.executor_owner_token_hash,
+            executor_generation=source_attempt.executor_generation,
+            max_external_deadline=source_attempt.max_external_deadline,
+            not_before_takeover_at=source_attempt.not_before_takeover_at,
         )
         response = self._invoke_source_claim_once(claim_request)
         self._persist_source_claim(
             phase=phase,
             operation_id=operation_id,
             owner_generation=owner_generation,
+            attempt=source_attempt,
             response=response,
         )
+        current_owner_hash = canonical_sha256({"executor_owner_token": self._executor_owner_token})
+        if (
+            response.status is SourceBrokerV2ClaimStatus.DEFINITIVELY_ABSENT
+            and source_attempt.executor_owner_token_hash != current_owner_hash
+            and response.observed_at < source_attempt.not_before_takeover_at
+        ):
+            raise SourceBrokerV2SagaReconcileRequiredError(
+                "source claim attempt remains fenced until takeover"
+            )
         return response
 
     def _invoke_source_claim_once(
@@ -2570,6 +2818,7 @@ class SourceBrokerV2Saga:
         phase: SourceBrokerV2OutboxPhase,
         operation_id: str,
         owner_generation: int,
+        attempt: _SourceClaimAttempt,
         response: SourceBrokerV2ClaimOnceResponse,
     ) -> None:
         raw = canonical_model_json_bytes(response)
@@ -2593,27 +2842,29 @@ class SourceBrokerV2Saga:
                     raise SourceBrokerV2SagaConflictError(
                         "outbox executor lost ownership before source claim persistence"
                     )
-                existing = connection.execute(
-                    "SELECT receipt_json FROM source_broker_v2_source_receipt "
-                    "WHERE receipt_hash = ?",
-                    (receipt_hash,),
-                ).fetchone()
-                if existing is None:
-                    connection.execute(
-                        "INSERT INTO source_broker_v2_source_receipt("
-                        "receipt_hash, operation_id, saga_id, phase, status, receipt_json"
-                        ") VALUES (?, ?, ?, ?, ?, ?)",
-                        (
-                            receipt_hash,
-                            operation_id,
-                            self.saga_id,
-                            phase.value,
-                            response.status.value,
-                            raw.decode("utf-8"),
-                        ),
+                persisted_attempt = self._source_attempt_from_outbox(
+                    row,
+                    effect_operation_id=operation_id,
+                )
+                if persisted_attempt != attempt or (
+                    response.operation_id != operation_id
+                    or response.executor_owner_token_hash != attempt.executor_owner_token_hash
+                    or response.executor_generation != attempt.executor_generation
+                    or response.max_external_deadline != attempt.max_external_deadline
+                    or response.not_before_takeover_at != attempt.not_before_takeover_at
+                ):
+                    raise SourceBrokerV2SagaIntegrityError(
+                        "source claim response rebound its durable attempt"
                     )
-                elif existing["receipt_json"] != raw.decode("utf-8"):
-                    raise SourceBrokerV2SagaIntegrityError("source receipt hash was rebound")
+                self._append_source_receipt(
+                    connection,
+                    phase=phase,
+                    operation_id=operation_id,
+                    attempt_id=attempt.attempt_id,
+                    status=response.status.value,
+                    receipt_hash=receipt_hash,
+                    raw=raw,
+                )
                 assignments = "source_observation_json = ?, source_observation_hash = ?"
                 values: list[object] = [raw.decode("utf-8"), receipt_hash]
                 if response.status is SourceBrokerV2ClaimStatus.DEFINITIVELY_ABSENT:
@@ -2656,22 +2907,38 @@ class SourceBrokerV2Saga:
             return
         if response.result is None:
             raise SourceBrokerV2SagaIntegrityError("terminal source claim omitted its result")
+        expected = self._validate_source_result_binding(
+            phase=phase,
+            operation_id=operation_id,
+            operation_request_hash=operation_request_hash,
+            result_bytes=response.result,
+        )
+        if response.status is not expected:
+            raise SourceBrokerV2SagaIntegrityError(
+                "source terminal status conflicts with its result"
+            )
+
+    def _validate_source_result_binding(
+        self,
+        *,
+        phase: SourceBrokerV2OutboxPhase,
+        operation_id: str,
+        operation_request_hash: str,
+        result_bytes: bytes,
+    ) -> SourceBrokerV2ClaimStatus:
         try:
             if phase is SourceBrokerV2OutboxPhase.DISPATCH:
                 result = strict_model_validate_canonical_json(
                     SourceBrokerV2DispatchResponse,
-                    response.result,
+                    result_bytes,
                 )
                 expected = SourceBrokerV2ClaimStatus(result.outcome.value)
-                if response.status is not expected:
-                    raise ValueError("dispatch terminal status conflicts with its result")
             else:
                 result = strict_model_validate_canonical_json(
                     SourceBrokerV2FinalizeResponse,
-                    response.result,
+                    result_bytes,
                 )
-                if response.status is not SourceBrokerV2ClaimStatus.SUCCESS:
-                    raise ValueError("source finalize cannot terminalize as failure")
+                expected = SourceBrokerV2ClaimStatus.SUCCESS
             if (
                 result.saga_id != self.saga_id
                 or result.operation_id != operation_id
@@ -2680,6 +2947,7 @@ class SourceBrokerV2Saga:
                 raise ValueError("terminal source result is foreign")
         except (StrictJsonError, ValidationError, ValueError, TypeError) as exc:
             raise SourceBrokerV2SagaIntegrityError("source terminal result is invalid") from exc
+        return expected
 
     def _replay_source_operation(
         self,
@@ -2687,7 +2955,7 @@ class SourceBrokerV2Saga:
         phase: SourceBrokerV2OutboxPhase,
         operation_id: str,
         operation_request_hash: str,
-    ) -> bytes | None:
+    ) -> SourceBrokerV2ReplayResponse:
         request = SourceBrokerV2ReplayRequest(
             saga_id=self.saga_id,
             operation_id=operation_id,
@@ -2718,11 +2986,16 @@ class SourceBrokerV2Saga:
             request=request,
             receipt=response,
         )
-        if response.status is SourceBrokerV2ReplayStatus.UNKNOWN:
-            raise SourceBrokerV2SagaReconcileRequiredError(
-                "source authority cannot determine the operation outcome"
+        if response.status is SourceBrokerV2ReplayStatus.FOUND:
+            if response.result is None:
+                raise SourceBrokerV2SagaIntegrityError("found source replay omitted its result")
+            self._validate_source_result_binding(
+                phase=phase,
+                operation_id=operation_id,
+                operation_request_hash=operation_request_hash,
+                result_bytes=response.result,
             )
-        return response.result
+        return response
 
     def _verify_source_result(
         self,
@@ -2743,11 +3016,54 @@ class SourceBrokerV2Saga:
             raise SourceBrokerV2SagaRepairRequiredError(
                 f"applied {phase.value} lacks a native source observation"
             )
-        try:
-            prior = strict_model_validate_canonical_json(
-                SourceBrokerV2ClaimOnceResponse,
-                raw_observation.encode("utf-8"),
+        prior = self._decode_source_observation(raw_observation.encode("utf-8"))
+        if isinstance(prior, SourceBrokerV2ReplayResponse):
+            replay_request = SourceBrokerV2ReplayRequest(
+                saga_id=self.saga_id,
+                operation_id=operation_id,
+                phase=phase,
+                operation_request_hash=operation_request_hash,
+                challenge=prior.challenge,
             )
+            if (
+                prior.saga_id != self.saga_id
+                or prior.operation_id != operation_id
+                or prior.phase is not phase
+                or prior.request_hash != replay_request.request_hash
+                or prior.status is not SourceBrokerV2ReplayStatus.FOUND
+                or prior.result != stored
+            ):
+                raise SourceBrokerV2SagaIntegrityError(
+                    "stored source replay observation is invalid"
+                )
+            self._source_authority_keyring.require_verified_replay(
+                request=replay_request,
+                receipt=prior,
+            )
+            fresh = self._replay_source_operation(
+                phase=phase,
+                operation_id=operation_id,
+                operation_request_hash=operation_request_hash,
+            )
+            if fresh.status is not SourceBrokerV2ReplayStatus.FOUND or fresh.result != stored:
+                raise SourceBrokerV2SagaRepairRequiredError(
+                    f"source authority is not terminal for applied {phase.value} operation"
+                )
+            self._persist_applied_source_observation(
+                phase=phase,
+                operation_id=operation_id,
+                attempt_id=None,
+                response=fresh,
+            )
+            return stored
+        try:
+            if (
+                prior.saga_id != self.saga_id
+                or prior.operation_id != operation_id
+                or prior.phase is not phase
+                or prior.operation_request_hash != operation_request_hash
+            ):
+                raise ValueError("stored source claim observation is foreign")
             lookup = SourceBrokerV2ClaimOnceRequest(
                 saga_id=prior.saga_id,
                 operation_id=prior.operation_id,
@@ -2784,9 +3100,41 @@ class SourceBrokerV2Saga:
         self._persist_applied_source_observation(
             phase=phase,
             operation_id=operation_id,
+            attempt_id=source_claim_attempt_id(
+                effect_operation_id=operation_id,
+                executor_owner_token_hash=response.executor_owner_token_hash,
+                executor_generation=response.executor_generation,
+                max_external_deadline=response.max_external_deadline,
+                not_before_takeover_at=response.not_before_takeover_at,
+            ),
             response=response,
         )
         return stored
+
+    def _decode_source_observation(
+        self,
+        raw: bytes,
+    ) -> SourceBrokerV2ClaimOnceResponse | SourceBrokerV2ReplayResponse:
+        try:
+            decoded = strict_canonical_json_loads(raw)
+            if not isinstance(decoded, Mapping):
+                raise TypeError("source observation is not an object")
+            contract = decoded.get("contract")
+            if contract == "rquant-source-broker-claim-once-response/v2":
+                return strict_model_validate_canonical_json(
+                    SourceBrokerV2ClaimOnceResponse,
+                    raw,
+                )
+            if contract == "rquant-source-broker-replay-response/v2":
+                return strict_model_validate_canonical_json(
+                    SourceBrokerV2ReplayResponse,
+                    raw,
+                )
+            raise ValueError("source observation contract is not allowed")
+        except (StrictJsonError, ValidationError, ValueError, TypeError) as exc:
+            raise SourceBrokerV2SagaIntegrityError(
+                "stored source observation is malformed"
+            ) from exc
 
     def _source_challenge(
         self,
@@ -2809,7 +3157,8 @@ class SourceBrokerV2Saga:
         *,
         phase: SourceBrokerV2OutboxPhase,
         operation_id: str,
-        response: SourceBrokerV2ClaimOnceResponse,
+        attempt_id: str | None,
+        response: SourceBrokerV2ClaimOnceResponse | SourceBrokerV2ReplayResponse,
     ) -> None:
         raw = canonical_model_json_bytes(response)
         receipt_hash = response.receipt_hash
@@ -2825,29 +3174,15 @@ class SourceBrokerV2Saga:
                     raise SourceBrokerV2SagaConflictError(
                         "source verification raced an unapplied outbox"
                     )
-                existing = connection.execute(
-                    "SELECT receipt_json FROM source_broker_v2_source_receipt "
-                    "WHERE receipt_hash = ?",
-                    (receipt_hash,),
-                ).fetchone()
-                if existing is None:
-                    connection.execute(
-                        "INSERT INTO source_broker_v2_source_receipt("
-                        "receipt_hash, operation_id, saga_id, phase, status, receipt_json"
-                        ") VALUES (?, ?, ?, ?, ?, ?)",
-                        (
-                            receipt_hash,
-                            operation_id,
-                            self.saga_id,
-                            phase.value,
-                            response.status.value,
-                            raw.decode("utf-8"),
-                        ),
-                    )
-                elif existing["receipt_json"] != raw.decode("utf-8"):
-                    raise SourceBrokerV2SagaIntegrityError(
-                        "source verification receipt hash was rebound"
-                    )
+                self._append_source_receipt(
+                    connection,
+                    phase=phase,
+                    operation_id=operation_id,
+                    attempt_id=attempt_id,
+                    status=response.status.value,
+                    receipt_hash=receipt_hash,
+                    raw=raw,
+                )
                 connection.execute(
                     "UPDATE source_broker_v2_outbox SET source_observation_json = ?, "
                     "source_observation_hash = ? WHERE operation_id = ? AND status = 'applied'",
@@ -2857,6 +3192,100 @@ class SourceBrokerV2Saga:
             except BaseException:
                 connection.rollback()
                 raise
+
+    def _persist_source_replay_observation(
+        self,
+        *,
+        phase: SourceBrokerV2OutboxPhase,
+        operation_id: str,
+        owner_generation: int,
+        response: SourceBrokerV2ReplayResponse,
+    ) -> None:
+        if response.status is not SourceBrokerV2ReplayStatus.FOUND:
+            raise SourceBrokerV2SagaIntegrityError(
+                "only a found replay can become source observation evidence"
+            )
+        raw = canonical_model_json_bytes(response)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._read_outbox(
+                    connection,
+                    operation_id=operation_id,
+                    phase=phase,
+                )
+                if (
+                    row["status"] != "pending"
+                    or row["executor_owner_token"] != self._executor_owner_token
+                    or row["executor_generation"] != owner_generation
+                ):
+                    raise SourceBrokerV2SagaConflictError(
+                        "outbox executor lost ownership before replay persistence"
+                    )
+                self._append_source_receipt(
+                    connection,
+                    phase=phase,
+                    operation_id=operation_id,
+                    attempt_id=None,
+                    status=response.status.value,
+                    receipt_hash=response.receipt_hash,
+                    raw=raw,
+                )
+                updated = connection.execute(
+                    "UPDATE source_broker_v2_outbox SET source_observation_json = ?, "
+                    "source_observation_hash = ? WHERE operation_id = ? "
+                    "AND status = 'pending' AND executor_owner_token = ? "
+                    "AND executor_generation = ?",
+                    (
+                        raw.decode("utf-8"),
+                        response.receipt_hash,
+                        operation_id,
+                        self._executor_owner_token,
+                        owner_generation,
+                    ),
+                ).rowcount
+                if updated != 1:
+                    raise SourceBrokerV2SagaConflictError(
+                        "outbox executor lost ownership while persisting source replay"
+                    )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+
+    def _append_source_receipt(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        phase: SourceBrokerV2OutboxPhase,
+        operation_id: str,
+        attempt_id: str | None,
+        status: str,
+        receipt_hash: str,
+        raw: bytes,
+    ) -> None:
+        existing = connection.execute(
+            "SELECT operation_id, attempt_id, saga_id, phase, status, receipt_json "
+            "FROM source_broker_v2_source_receipt WHERE receipt_hash = ?",
+            (receipt_hash,),
+        ).fetchone()
+        values = (
+            operation_id,
+            attempt_id,
+            self.saga_id,
+            phase.value,
+            status,
+            raw.decode("utf-8"),
+        )
+        if existing is None:
+            connection.execute(
+                "INSERT INTO source_broker_v2_source_receipt("
+                "receipt_hash, operation_id, attempt_id, saga_id, phase, status, receipt_json"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (receipt_hash, *values),
+            )
+        elif tuple(existing) != values:
+            raise SourceBrokerV2SagaIntegrityError("source receipt hash was rebound")
 
     def _initialize(self) -> None:
         with (
@@ -2897,6 +3326,9 @@ class SourceBrokerV2Saga:
                         dispatch_started_at TEXT,
                         max_external_deadline TEXT,
                         not_before_takeover_at TEXT,
+                        source_attempt_id TEXT,
+                        source_attempt_owner_hash TEXT,
+                        source_attempt_generation INTEGER,
                         source_grant_json TEXT,
                         source_grant_hash TEXT,
                         source_observation_json TEXT,
@@ -2920,6 +3352,8 @@ class SourceBrokerV2Saga:
                     "dispatch_started_at",
                     "max_external_deadline",
                     "not_before_takeover_at",
+                    "source_attempt_id",
+                    "source_attempt_owner_hash",
                     "source_grant_json",
                     "source_grant_hash",
                     "source_observation_json",
@@ -2929,11 +3363,17 @@ class SourceBrokerV2Saga:
                         connection.execute(
                             f"ALTER TABLE source_broker_v2_outbox ADD COLUMN {name} TEXT"
                         )
+                if "source_attempt_generation" not in columns:
+                    connection.execute(
+                        "ALTER TABLE source_broker_v2_outbox "
+                        "ADD COLUMN source_attempt_generation INTEGER"
+                    )
                 connection.execute(
                     """
                     CREATE TABLE IF NOT EXISTS source_broker_v2_source_receipt (
                         receipt_hash TEXT PRIMARY KEY,
                         operation_id TEXT NOT NULL,
+                        attempt_id TEXT,
                         saga_id TEXT NOT NULL,
                         phase TEXT NOT NULL,
                         status TEXT NOT NULL,
@@ -2945,6 +3385,16 @@ class SourceBrokerV2Saga:
                     )
                     """
                 )
+                receipt_columns = {
+                    str(row[1])
+                    for row in connection.execute(
+                        "PRAGMA table_info(source_broker_v2_source_receipt)"
+                    ).fetchall()
+                }
+                if "attempt_id" not in receipt_columns:
+                    connection.execute(
+                        "ALTER TABLE source_broker_v2_source_receipt ADD COLUMN attempt_id TEXT"
+                    )
                 connection.execute(
                     "CREATE INDEX IF NOT EXISTS source_broker_v2_source_receipt_operation "
                     "ON source_broker_v2_source_receipt(operation_id, receipt_hash)"
@@ -2953,6 +3403,7 @@ class SourceBrokerV2Saga:
                     "CREATE INDEX IF NOT EXISTS source_broker_v2_source_receipt_saga "
                     "ON source_broker_v2_source_receipt(saga_id, operation_id)"
                 )
+                self._upgrade_legacy_source_evidence(connection)
                 connection.execute(
                     """
                     CREATE TABLE IF NOT EXISTS source_broker_v2_production_binding (
@@ -2966,6 +3417,70 @@ class SourceBrokerV2Saga:
             except BaseException:
                 connection.rollback()
                 raise
+
+    def _upgrade_legacy_source_evidence(
+        self,
+        connection: sqlite3.Connection,
+    ) -> None:
+        rows = connection.execute(
+            "SELECT * FROM source_broker_v2_outbox WHERE saga_id = ? "
+            "AND phase IN ('dispatch', 'source_finalize') "
+            "AND source_attempt_id IS NULL",
+            (self.saga_id,),
+        ).fetchall()
+        for row in rows:
+            prior = self._legacy_claim_observation(row)
+            if prior is None:
+                continue
+            phase = SourceBrokerV2OutboxPhase(str(row["phase"]))
+            if (
+                prior.saga_id != self.saga_id
+                or prior.operation_id != row["operation_id"]
+                or prior.phase is not phase
+            ):
+                raise SourceBrokerV2SagaIntegrityError("legacy source observation is foreign")
+            attempt_id = source_claim_attempt_id(
+                effect_operation_id=prior.operation_id,
+                executor_owner_token_hash=prior.executor_owner_token_hash,
+                executor_generation=prior.executor_generation,
+                max_external_deadline=prior.max_external_deadline,
+                not_before_takeover_at=prior.not_before_takeover_at,
+            )
+            connection.execute(
+                "UPDATE source_broker_v2_outbox SET source_attempt_id = ?, "
+                "source_attempt_owner_hash = ?, source_attempt_generation = ?, "
+                "max_external_deadline = ?, not_before_takeover_at = ? "
+                "WHERE operation_id = ? AND source_attempt_id IS NULL",
+                (
+                    attempt_id,
+                    prior.executor_owner_token_hash,
+                    prior.executor_generation,
+                    prior.max_external_deadline.isoformat(),
+                    prior.not_before_takeover_at.isoformat(),
+                    prior.operation_id,
+                ),
+            )
+        receipts = connection.execute(
+            "SELECT receipt_hash, receipt_json FROM source_broker_v2_source_receipt "
+            "WHERE saga_id = ? AND attempt_id IS NULL",
+            (self.saga_id,),
+        ).fetchall()
+        for row in receipts:
+            receipt = self._decode_source_observation(str(row["receipt_json"]).encode("utf-8"))
+            if isinstance(receipt, SourceBrokerV2ReplayResponse):
+                continue
+            attempt_id = source_claim_attempt_id(
+                effect_operation_id=receipt.operation_id,
+                executor_owner_token_hash=receipt.executor_owner_token_hash,
+                executor_generation=receipt.executor_generation,
+                max_external_deadline=receipt.max_external_deadline,
+                not_before_takeover_at=receipt.not_before_takeover_at,
+            )
+            connection.execute(
+                "UPDATE source_broker_v2_source_receipt SET attempt_id = ? "
+                "WHERE receipt_hash = ? AND attempt_id IS NULL",
+                (attempt_id, row["receipt_hash"]),
+            )
 
     @contextmanager
     def _schema_init_lock(self) -> Iterator[None]:
@@ -3125,9 +3640,7 @@ class SourceBrokerV2Saga:
                 raise
 
     def _operation_id(self, phase: SourceBrokerV2OutboxPhase) -> str:
-        return canonical_sha256(
-            {"contract": SOURCE_BROKER_V2_CONTRACT, "phase": phase.value, "saga_id": self.saga_id}
-        )
+        return source_effect_operation_id(saga_id=self.saga_id, phase=phase)
 
     def _apply_outbox(
         self,
@@ -3478,14 +3991,41 @@ class SourceBrokerV2Saga:
                         row["dispatch_started_at"],
                         label="source dispatch start",
                     )
-                    max_deadline = _optional_executor_time(
-                        row["max_external_deadline"],
-                        label="source maximum external deadline",
+                    attempt = self._source_attempt_from_outbox(
+                        row,
+                        effect_operation_id=operation_id,
                     )
-                    if max_deadline is None:
+                    raw_grant = row["source_grant_json"]
+                    if attempt is None or type(raw_grant) is not str:
                         raise SourceBrokerV2SagaIntegrityError(
-                            "source invocation lacks its persisted deadline"
+                            "source invocation lacks its persisted grant attempt"
                         )
+                    try:
+                        grant = strict_model_validate_canonical_json(
+                            SourceBrokerV2ClaimOnceResponse,
+                            raw_grant.encode("utf-8"),
+                        )
+                    except (StrictJsonError, ValidationError, ValueError, TypeError) as exc:
+                        raise SourceBrokerV2SagaIntegrityError(
+                            "source invocation grant is malformed"
+                        ) from exc
+                    grant_attempt_id = source_claim_attempt_id(
+                        effect_operation_id=operation_id,
+                        executor_owner_token_hash=grant.executor_owner_token_hash,
+                        executor_generation=grant.executor_generation,
+                        max_external_deadline=grant.max_external_deadline,
+                        not_before_takeover_at=grant.not_before_takeover_at,
+                    )
+                    if (
+                        grant.status is not SourceBrokerV2ClaimStatus.DEFINITIVELY_ABSENT
+                        or grant.operation_id != operation_id
+                        or grant.phase is not phase
+                        or grant_attempt_id != attempt.attempt_id
+                    ):
+                        raise SourceBrokerV2SagaIntegrityError(
+                            "source invocation grant is not bound to the active attempt"
+                        )
+                    max_deadline = grant.max_external_deadline
                     if prior_started_at is None and started_at > max_deadline:
                         raise SourceBrokerV2SagaReconcileRequiredError(
                             "source invocation did not start before its persisted deadline"
@@ -3653,13 +4193,10 @@ class SourceBrokerV2Saga:
                         "post-dispatch state lacks outcome evidence"
                     )
                 stored_reconcile_reason = (
-                    reconcile_reason
-                    if reconcile_reason is not None
-                    else current.reconcile_reason
+                    reconcile_reason if reconcile_reason is not None else current.reconcile_reason
                 )
                 if (
-                    current.state
-                    is SourceBrokerV2SagaState.SOURCE_FINALIZE_RECONCILE_REQUIRED
+                    current.state is SourceBrokerV2SagaState.SOURCE_FINALIZE_RECONCILE_REQUIRED
                     and state is SourceBrokerV2SagaState.SOURCE_FINALIZED
                 ):
                     stored_reconcile_reason = None
@@ -3761,6 +4298,7 @@ class SourceBrokerV2Saga:
             SourceBrokerV2OutboxPhase.DISPATCH,
             SourceBrokerV2OutboxPhase.SOURCE_FINALIZE,
         }
+        source_attempt: _SourceClaimAttempt | None = None
         if source_phase:
             if (max_deadline is None) != (takeover_at is None):
                 raise SourceBrokerV2SagaIntegrityError(
@@ -3775,12 +4313,19 @@ class SourceBrokerV2Saga:
                     raise SourceBrokerV2SagaIntegrityError(
                         "source invocation started after its persisted deadline"
                     )
+            source_attempt = self._source_attempt_from_outbox(
+                row,
+                effect_operation_id=expected_operation_id,
+            )
         elif any(
             row[key] is not None
             for key in (
                 "dispatch_started_at",
                 "max_external_deadline",
                 "not_before_takeover_at",
+                "source_attempt_id",
+                "source_attempt_owner_hash",
+                "source_attempt_generation",
                 "source_grant_json",
                 "source_grant_hash",
                 "source_observation_json",
@@ -3798,27 +4343,56 @@ class SourceBrokerV2Saga:
             if raw_value is not None:
                 if type(raw_value) is not str or type(hash_value) is not str:
                     raise SourceBrokerV2SagaIntegrityError(f"{prefix} SQLite types are invalid")
-                raw_claim = raw_value.encode("utf-8")
-                _require_canonical_json_bytes(raw_claim, label=prefix)
-                if hash_value != canonical_sha256(strict_canonical_json_loads(raw_claim)):
+                raw_receipt = raw_value.encode("utf-8")
+                _require_canonical_json_bytes(raw_receipt, label=prefix)
+                if hash_value != canonical_sha256(strict_canonical_json_loads(raw_receipt)):
                     raise SourceBrokerV2SagaIntegrityError(f"{prefix} hash conflicts")
-                try:
-                    claim = strict_model_validate_canonical_json(
-                        SourceBrokerV2ClaimOnceResponse,
-                        raw_claim,
-                    )
-                except (StrictJsonError, ValidationError, ValueError, TypeError) as exc:
-                    raise SourceBrokerV2SagaIntegrityError(
-                        f"{prefix} receipt is malformed"
-                    ) from exc
+                if prefix == "source_grant":
+                    try:
+                        receipt: SourceBrokerV2ClaimOnceResponse | SourceBrokerV2ReplayResponse = (
+                            strict_model_validate_canonical_json(
+                                SourceBrokerV2ClaimOnceResponse,
+                                raw_receipt,
+                            )
+                        )
+                    except (StrictJsonError, ValidationError, ValueError, TypeError) as exc:
+                        raise SourceBrokerV2SagaIntegrityError(
+                            "source_grant receipt is malformed"
+                        ) from exc
+                else:
+                    receipt = self._decode_source_observation(raw_receipt)
                 if (
-                    claim.saga_id != self.saga_id
-                    or claim.operation_id != expected_operation_id
-                    or claim.phase is not expected_phase
+                    receipt.saga_id != self.saga_id
+                    or receipt.operation_id != expected_operation_id
+                    or receipt.phase is not expected_phase
                 ):
                     raise SourceBrokerV2SagaIntegrityError(f"{prefix} receipt is foreign")
+                if isinstance(receipt, SourceBrokerV2ReplayResponse):
+                    if (
+                        prefix != "source_observation"
+                        or receipt.status is not SourceBrokerV2ReplayStatus.FOUND
+                    ):
+                        raise SourceBrokerV2SagaIntegrityError(
+                            "source replay is not terminal observation evidence"
+                        )
+                    continue
+                if source_attempt is None:
+                    raise SourceBrokerV2SagaIntegrityError(
+                        f"{prefix} claim lacks durable attempt evidence"
+                    )
+                receipt_attempt_id = source_claim_attempt_id(
+                    effect_operation_id=expected_operation_id,
+                    executor_owner_token_hash=receipt.executor_owner_token_hash,
+                    executor_generation=receipt.executor_generation,
+                    max_external_deadline=receipt.max_external_deadline,
+                    not_before_takeover_at=receipt.not_before_takeover_at,
+                )
+                if receipt_attempt_id != source_attempt.attempt_id:
+                    raise SourceBrokerV2SagaIntegrityError(
+                        f"{prefix} claim is not bound to the active attempt"
+                    )
                 if prefix == "source_grant" and (
-                    claim.status is not SourceBrokerV2ClaimStatus.DEFINITIVELY_ABSENT
+                    receipt.status is not SourceBrokerV2ClaimStatus.DEFINITIVELY_ABSENT
                 ):
                     raise SourceBrokerV2SagaIntegrityError(
                         "source grant is not definitive-absence evidence"
@@ -3866,7 +4440,7 @@ class SourceBrokerV2Saga:
                     f"saga state {snapshot.state.value} lacks applied {phase.value} evidence"
                 )
         source_receipts = connection.execute(
-            "SELECT receipt_hash, operation_id, phase, status, receipt_json "
+            "SELECT receipt_hash, operation_id, attempt_id, phase, status, receipt_json "
             "FROM source_broker_v2_source_receipt WHERE saga_id = ?",
             (self.saga_id,),
         ).fetchall()
@@ -3883,22 +4457,90 @@ class SourceBrokerV2Saga:
             ):
                 raise SourceBrokerV2SagaIntegrityError("source receipt SQLite types are invalid")
             try:
-                receipt = strict_model_validate_canonical_json(
-                    SourceBrokerV2ClaimOnceResponse,
-                    row["receipt_json"].encode("utf-8"),
-                )
+                receipt = self._decode_source_observation(row["receipt_json"].encode("utf-8"))
                 phase = SourceBrokerV2OutboxPhase(row["phase"])
-            except (StrictJsonError, ValidationError, ValueError, TypeError) as exc:
+                outbox = present.get(phase.value)
+                if outbox is None:
+                    raise ValueError("source receipt has no outbox operation")
+                if phase is SourceBrokerV2OutboxPhase.DISPATCH:
+                    source_request: (
+                        SourceBrokerV2DispatchRequest | SourceBrokerV2FinalizeRequest
+                    ) = strict_model_validate_canonical_json(
+                        SourceBrokerV2DispatchRequest,
+                        str(outbox["payload_json"]).encode("utf-8"),
+                    )
+                else:
+                    source_request = strict_model_validate_canonical_json(
+                        SourceBrokerV2FinalizeRequest,
+                        str(outbox["payload_json"]).encode("utf-8"),
+                    )
+                if isinstance(receipt, SourceBrokerV2ReplayResponse):
+                    replay_request = SourceBrokerV2ReplayRequest(
+                        saga_id=receipt.saga_id,
+                        operation_id=receipt.operation_id,
+                        phase=receipt.phase,
+                        operation_request_hash=source_request.request_hash,
+                        challenge=receipt.challenge,
+                    )
+                    self._source_authority_keyring.require_verified_replay(
+                        request=replay_request,
+                        receipt=receipt,
+                    )
+                    if receipt.result is None:
+                        raise ValueError("source replay history omitted its result")
+                    self._validate_source_result_binding(
+                        phase=phase,
+                        operation_id=receipt.operation_id,
+                        operation_request_hash=source_request.request_hash,
+                        result_bytes=receipt.result,
+                    )
+                else:
+                    if receipt.operation_request_hash != source_request.request_hash:
+                        raise ValueError("source claim history request is foreign")
+                    self._source_authority_keyring.require_verified_claim(
+                        request=_claim_request_from_receipt(receipt),
+                        receipt=receipt,
+                    )
+                    self._validate_source_terminal_result(
+                        phase=phase,
+                        operation_id=receipt.operation_id,
+                        operation_request_hash=source_request.request_hash,
+                        response=receipt,
+                    )
+            except (
+                SourceBrokerV2SagaIntegrityError,
+                StrictJsonError,
+                ValidationError,
+                ValueError,
+                TypeError,
+            ) as exc:
                 raise SourceBrokerV2SagaIntegrityError(
                     "source receipt history is malformed"
                 ) from exc
+            expected_operation_id = self._operation_id(phase)
+            expected_attempt_id = (
+                None
+                if isinstance(receipt, SourceBrokerV2ReplayResponse)
+                else source_claim_attempt_id(
+                    effect_operation_id=expected_operation_id,
+                    executor_owner_token_hash=receipt.executor_owner_token_hash,
+                    executor_generation=receipt.executor_generation,
+                    max_external_deadline=receipt.max_external_deadline,
+                    not_before_takeover_at=receipt.not_before_takeover_at,
+                )
+            )
             if (
                 row["receipt_hash"] != receipt.receipt_hash
-                or row["operation_id"] != receipt.operation_id
+                or row["operation_id"] != expected_operation_id
+                or row["attempt_id"] != expected_attempt_id
                 or row["status"] != receipt.status.value
                 or receipt.saga_id != self.saga_id
                 or receipt.phase is not phase
-                or receipt.operation_id != self._operation_id(phase)
+                or receipt.operation_id != expected_operation_id
+                or (
+                    isinstance(receipt, SourceBrokerV2ReplayResponse)
+                    and receipt.status is not SourceBrokerV2ReplayStatus.FOUND
+                )
             ):
                 raise SourceBrokerV2SagaIntegrityError("source receipt history binding is invalid")
 
