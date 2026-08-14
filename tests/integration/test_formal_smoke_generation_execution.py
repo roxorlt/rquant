@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from collections.abc import Callable
 from contextlib import suppress
 from datetime import date
@@ -497,6 +498,14 @@ def test_wrapped_outer_failure_reports_only_stable_redacted_phase_and_reason(
     )
     assert secret not in str(raised.value)
     assert raised.value.__cause__ is None
+    assert raised.value.__suppress_context__ is True
+    assert raised.value.__context__ is not None
+    assert secret in str(raised.value.__context__)
+    rendered_traceback = "".join(traceback.format_exception(raised.value))
+    assert secret not in rendered_traceback
+    assert "/private/checkout-b" not in rendered_traceback
+    assert "argv=" not in rendered_traceback
+    assert "synthetic-token" not in rendered_traceback
     assert not list((tmp_path / "output").glob("strategy_lab_runs/*"))
 
 
