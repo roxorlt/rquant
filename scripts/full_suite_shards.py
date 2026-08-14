@@ -13,7 +13,7 @@ import sys
 import tempfile
 import unicodedata
 from collections import defaultdict
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -36,16 +36,7 @@ _FULL_SUITE_FIELDS = frozenset({"cases", "skips", "sha256"})
 _SHARD_FIELDS = frozenset({"id", "path", "count", "sha256"})
 _NODEID_FIELDS = frozenset({"nodeid"})
 _COLLECTION_FIELDS = frozenset({"nodeids"})
-_CI_PRIVATE_DIRECTORIES = ("tmp", "data", "parquet", "logs")
-_SENSITIVE_ENVIRONMENT_SUFFIXES = (
-    "_API_KEY",
-    "_CREDENTIAL",
-    "_CREDENTIALS",
-    "_PASSWORD",
-    "_SECRET",
-    "_TOKEN",
-    "_TOKENS",
-)
+_CI_PRIVATE_DIRECTORIES = ("home", "tmp", "data", "parquet", "logs")
 
 # These are conservative historical weights for files that dominated the former
 # monolithic CI job. Every other file still contributes its case count.
@@ -78,7 +69,7 @@ def _canonical_directory(path: Path, *, label: str) -> Path:
     return resolved
 
 
-def _private_ci_environment(root: Path) -> dict[str, str]:
+def _create_private_ci_directories(root: Path) -> dict[str, Path]:
     canonical_root = _canonical_directory(root, label="full-suite CI root")
     canonical_root.chmod(0o700)
     directories: dict[str, Path] = {}
@@ -90,8 +81,14 @@ def _private_ci_environment(root: Path) -> dict[str, str]:
         except OSError as exc:
             raise ContractError(f"cannot create private full-suite directory: {path}") from exc
         directories[name] = _canonical_directory(path, label="full-suite CI directory")
+    return directories
+
+
+def _private_ci_environment(root: Path, directories: Mapping[str, Path]) -> dict[str, str]:
+    canonical_root = _canonical_directory(root, label="full-suite CI root")
     return {
         "RQUANT_CI_ROOT": str(canonical_root),
+        "HOME": str(directories["home"]),
         "TMPDIR": str(directories["tmp"]),
         "TMP": str(directories["tmp"]),
         "TEMP": str(directories["tmp"]),
@@ -104,6 +101,48 @@ def _private_ci_environment(root: Path) -> dict[str, str]:
         "TUSHARE_TOKEN_MAIN": CI_DUMMY_TUSHARE_TOKEN,
         "NOTIFY_ENABLED": "false",
     }
+
+
+def _pytest_subprocess_environment(
+    private_environment: Mapping[str, str],
+    *,
+    collection_path: Path,
+    path: str,
+) -> dict[str, str]:
+    return {
+        "PATH": path,
+        "HOME": private_environment["HOME"],
+        "TMPDIR": private_environment["TMPDIR"],
+        "TMP": private_environment["TMP"],
+        "TEMP": private_environment["TEMP"],
+        "PYTHONPATH": str(REPOSITORY_ROOT),
+        "PYTHONNOUSERSITE": "1",
+        "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+        "PYTEST_ADDOPTS": "",
+        "RQUANT_CI_ROOT": private_environment["RQUANT_CI_ROOT"],
+        "RQUANT_FULL_SUITE_COLLECTION_PATH": str(collection_path),
+        "DATA_DIR": private_environment["DATA_DIR"],
+        "DUCKDB_PATH": private_environment["DUCKDB_PATH"],
+        "DUCKDB_READONLY_PATH": private_environment["DUCKDB_READONLY_PATH"],
+        "PARQUET_DIR": private_environment["PARQUET_DIR"],
+        "LOG_DIR": private_environment["LOG_DIR"],
+        "RQUANT_DISABLE_DOTENV": private_environment["RQUANT_DISABLE_DOTENV"],
+        "TUSHARE_TOKEN_MAIN": private_environment["TUSHARE_TOKEN_MAIN"],
+        "NOTIFY_ENABLED": private_environment["NOTIFY_ENABLED"],
+    }
+
+
+@contextmanager
+def _isolated_pytest_environment() -> Iterator[dict[str, str]]:
+    with tempfile.TemporaryDirectory(prefix="rquant-full-suite-pytest-") as directory:
+        private_root = Path(directory).resolve(strict=True)
+        directories = _create_private_ci_directories(private_root)
+        private_environment = _private_ci_environment(private_root, directories)
+        yield _pytest_subprocess_environment(
+            private_environment,
+            collection_path=private_root / "collection.json",
+            path=os.environ.get("PATH", os.defpath),
+        )
 
 
 def _create_private_ci_environment(base_dir: Path, *, label: str) -> dict[str, str]:
@@ -119,7 +158,7 @@ def _create_private_ci_environment(base_dir: Path, *, label: str) -> dict[str, s
         ).resolve(strict=True)
     except OSError as exc:
         raise ContractError("cannot create private full-suite CI root") from exc
-    return _private_ci_environment(root)
+    return _private_ci_environment(root, _create_private_ci_directories(root))
 
 
 def _append_github_environment(path: Path, environment: dict[str, str]) -> None:
@@ -133,14 +172,6 @@ def _append_github_environment(path: Path, environment: dict[str, str]) -> None:
                 handle.write(f"{name}={value}\n")
     except OSError as exc:
         raise ContractError(f"cannot write GITHUB_ENV: {path}") from exc
-
-
-def _without_inherited_credentials(environment: dict[str, str]) -> dict[str, str]:
-    return {
-        name: value
-        for name, value in environment.items()
-        if not name.upper().endswith(_SENSITIVE_ENVIRONMENT_SUFFIXES)
-    }
 
 
 def _is_line_control(character: str) -> bool:
@@ -517,9 +548,21 @@ def validate_manifest(
     root: Path,
     *,
     repository_root: Path = REPOSITORY_ROOT,
+    environment: Mapping[str, str] | None = None,
 ) -> tuple[dict[str, Any], tuple[tuple[str, ...], ...]]:
     index, groups = load_manifest(root, repository_root=repository_root)
-    expected = tuple(sorted(collect_nodeids((), repository_root=repository_root)))
+    if environment is None:
+        expected = tuple(sorted(collect_nodeids((), repository_root=repository_root)))
+    else:
+        expected = tuple(
+            sorted(
+                collect_nodeids(
+                    (),
+                    repository_root=repository_root,
+                    environment=environment,
+                )
+            )
+        )
     actual = tuple(sorted(nodeid for group in groups for nodeid in group))
     if len(set(expected)) != len(expected):
         raise ContractError("full-suite collection contains duplicate nodeids")
@@ -553,48 +596,43 @@ def collect_nodeids(
     selector: Sequence[str],
     *,
     repository_root: Path = REPOSITORY_ROOT,
+    environment: Mapping[str, str] | None = None,
 ) -> tuple[str, ...]:
-    with tempfile.TemporaryDirectory(prefix="rquant-full-suite-collect-") as directory:
-        private_root = Path(directory).resolve(strict=True)
-        output = private_root / "collection.json"
-        environment = _without_inherited_credentials(os.environ.copy())
-        environment.update(_private_ci_environment(private_root))
-        environment.pop("PYTEST_ADDOPTS", None)
-        pythonpath_root = str(Path(__file__).resolve().parent.parent)
-        existing_pythonpath = environment.get("PYTHONPATH")
-        environment["PYTHONPATH"] = (
-            pythonpath_root
-            if not existing_pythonpath
-            else os.pathsep.join((pythonpath_root, existing_pythonpath))
-        )
-        environment["RQUANT_FULL_SUITE_COLLECTION_PATH"] = str(output)
-        command = [
-            sys.executable,
-            "-m",
-            "pytest",
-            "--collect-only",
-            "-q",
-            "-p",
-            "scripts.full_suite_shards",
-            *selector,
-        ]
-        completed = subprocess.run(
-            command,
-            cwd=repository_root,
-            check=False,
-            capture_output=True,
-            text=True,
-            env=environment,
-        )
-        if completed.returncode != 0:
-            details = (completed.stderr + completed.stdout)[-1_600:]
-            raise ContractError(f"pytest collection failed: {details}")
-        payload = _read_json(
-            output,
-            maximum=MAX_COLLECTION_BYTES,
-            label="pytest collection evidence",
-        )
-        _require_exact_fields(payload, _COLLECTION_FIELDS, label="pytest collection evidence")
+    if environment is None:
+        with _isolated_pytest_environment() as isolated_environment:
+            return collect_nodeids(
+                selector,
+                repository_root=repository_root,
+                environment=isolated_environment,
+            )
+    output = Path(environment["RQUANT_FULL_SUITE_COLLECTION_PATH"])
+    command = [
+        sys.executable,
+        "-m",
+        "pytest",
+        "--collect-only",
+        "-q",
+        "-p",
+        "scripts.full_suite_shards",
+        *selector,
+    ]
+    completed = subprocess.run(
+        command,
+        cwd=repository_root,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    if completed.returncode != 0:
+        details = (completed.stderr + completed.stdout)[-1_600:]
+        raise ContractError(f"pytest collection failed: {details}")
+    payload = _read_json(
+        output,
+        maximum=MAX_COLLECTION_BYTES,
+        label="pytest collection evidence",
+    )
+    _require_exact_fields(payload, _COLLECTION_FIELDS, label="pytest collection evidence")
     nodeids = payload["nodeids"]
     if type(nodeids) is not list or not all(type(nodeid) is str for nodeid in nodeids):
         raise ContractError("pytest collection hook emitted invalid nodeids")
@@ -680,32 +718,51 @@ def run_shard(
     junitxml: Path | None,
     selection_evidence: Path | None,
     basetemp: Path | None,
+    repository_root: Path = REPOSITORY_ROOT,
 ) -> int:
-    index, groups = validate_manifest(manifest_root)
-    if not 0 <= shard_id < SHARD_COUNT:
-        raise ContractError(f"shard must be between 0 and {SHARD_COUNT - 1}")
-    nodeids = groups[shard_id]
-    with argsfile_for_nodeids(nodeids, directory=manifest_root) as argsfile:
-        selected_nodeids = collect_nodeids((f"@{argsfile}",))
-        if tuple(sorted(nodeids)) != selected_nodeids:
-            raise ContractError(f"shard {shard_id} collection differs from its manifest")
-        if selection_evidence is not None:
-            _write_evidence(selection_evidence, _selection_evidence(index, shard_id))
-        if mode == "check":
-            return 0
-        if junitxml is None or basetemp is None:
-            raise ContractError("run mode requires JUnit and basetemp paths")
-        junitxml.parent.mkdir(parents=True, exist_ok=True)
-        command = [
-            sys.executable,
-            "-m",
-            "pytest",
-            "-q",
-            f"@{argsfile}",
-            f"--junitxml={junitxml}",
-            f"--basetemp={basetemp}",
-        ]
-        completed = subprocess.run(command, check=False)
+    with _isolated_pytest_environment() as environment:
+        index, groups = validate_manifest(
+            manifest_root,
+            repository_root=repository_root,
+            environment=environment,
+        )
+        if not 0 <= shard_id < SHARD_COUNT:
+            raise ContractError(f"shard must be between 0 and {SHARD_COUNT - 1}")
+        nodeids = groups[shard_id]
+        with argsfile_for_nodeids(
+            nodeids,
+            directory=manifest_root,
+            repository_root=repository_root,
+        ) as argsfile:
+            selected_nodeids = collect_nodeids(
+                (f"@{argsfile}",),
+                repository_root=repository_root,
+                environment=environment,
+            )
+            if tuple(sorted(nodeids)) != selected_nodeids:
+                raise ContractError(f"shard {shard_id} collection differs from its manifest")
+            if selection_evidence is not None:
+                _write_evidence(selection_evidence, _selection_evidence(index, shard_id))
+            if mode == "check":
+                return 0
+            if junitxml is None or basetemp is None:
+                raise ContractError("run mode requires JUnit and basetemp paths")
+            junitxml.parent.mkdir(parents=True, exist_ok=True)
+            command = [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-q",
+                f"@{argsfile}",
+                f"--junitxml={junitxml}",
+                f"--basetemp={basetemp}",
+            ]
+            completed = subprocess.run(
+                command,
+                cwd=repository_root,
+                check=False,
+                env=environment,
+            )
     return completed.returncode
 
 

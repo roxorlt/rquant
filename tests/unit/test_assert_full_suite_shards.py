@@ -25,6 +25,15 @@ CLEAN_ENV_NODEIDS = (
     "tests/test_d.py::test_d",
 )
 
+SENTINEL_ENVIRONMENT = {
+    "TUSHARE_TOKEN_BACKUP": "tushare-backup-sentinel",
+    "PUSHDEER_KEYS": "pushdeer-sentinel",
+    "AWS_ACCESS_KEY_ID": "aws-access-key-sentinel",
+    "RQUANT_PANORAMA_GATE_TOKEN": "panorama-gate-sentinel",
+    "GITHUB_ACTIONS": "github-actions-sentinel",
+    "RUNNER_TEMP": "runner-temp-sentinel",
+}
+
 
 def _repository_for_manifest(root: Path) -> Path:
     return root.parent / "repository"
@@ -124,6 +133,20 @@ def _write_clean_environment_repository(root: Path) -> None:
         """from pathlib import Path
 import os
 
+_FORBIDDEN = (
+    "TUSHARE_TOKEN_BACKUP",
+    "PUSHDEER_KEYS",
+    "AWS_ACCESS_KEY_ID",
+    "RQUANT_PANORAMA_GATE_TOKEN",
+    "GITHUB_ACTIONS",
+    "RUNNER_TEMP",
+)
+_present = [name for name in _FORBIDDEN if name in os.environ]
+assert not _present, "forbidden environment variable names: " + ", ".join(_present)
+assert os.environ["PYTHONNOUSERSITE"] == "1"
+assert os.environ["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] == "1"
+assert os.environ["PYTEST_ADDOPTS"] == ""
+
 root = Path(os.environ["RQUANT_CI_ROOT"])
 assert root.is_absolute() and root.resolve(strict=True) == root
 assert os.environ["RQUANT_DISABLE_DOTENV"] == "1"
@@ -133,6 +156,7 @@ for name, relative in {
     "TMPDIR": "tmp",
     "TMP": "tmp",
     "TEMP": "tmp",
+    "HOME": "home",
     "DATA_DIR": "data",
     "DUCKDB_PATH": "data/test.duckdb",
     "DUCKDB_READONLY_PATH": "data/test_ro.duckdb",
@@ -203,6 +227,9 @@ def test_clean_environment_aggregate_uses_shared_private_collect_setup(
     project_environment.update(name for name in os.environ if name.startswith("RQUANT_"))
     for name in project_environment:
         monkeypatch.delenv(name, raising=False)
+    for name, value in SENTINEL_ENVIRONMENT.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("PYTEST_ADDOPTS", "--tb=short")
 
     summary = validator.validate_artifacts(
         manifest_root,

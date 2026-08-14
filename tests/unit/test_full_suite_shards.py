@@ -9,6 +9,61 @@ import pytest
 
 from scripts import full_suite_shards as shards
 
+SENTINEL_ENVIRONMENT = {
+    "TUSHARE_TOKEN_BACKUP": "tushare-backup-sentinel",
+    "PUSHDEER_KEYS": "pushdeer-sentinel",
+    "AWS_ACCESS_KEY_ID": "aws-access-key-sentinel",
+    "RQUANT_PANORAMA_GATE_TOKEN": "panorama-gate-sentinel",
+    "GITHUB_ACTIONS": "github-actions-sentinel",
+    "RUNNER_TEMP": "runner-temp-sentinel",
+}
+
+
+def _write_environment_isolation_repository(root: Path) -> Path:
+    tests_root = root / "tests"
+    tests_root.mkdir(parents=True)
+    forbidden = repr(tuple(SENTINEL_ENVIRONMENT))
+    (tests_root / "conftest.py").write_text(
+        "\n".join(
+            (
+                "import os",
+                f"_FORBIDDEN = {forbidden}",
+                "_present = [name for name in _FORBIDDEN if name in os.environ]",
+                "assert not _present, (",
+                "    'forbidden environment variable names: ' + ', '.join(_present)",
+                ")",
+                "assert os.environ['PYTHONNOUSERSITE'] == '1'",
+                "assert os.environ['PYTEST_DISABLE_PLUGIN_AUTOLOAD'] == '1'",
+                "assert os.environ['PYTEST_ADDOPTS'] == ''",
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+    test_path = tests_root / "test_execution_environment.py"
+    test_path.write_text(
+        "\n".join(
+            (
+                "from pathlib import Path",
+                "import os",
+                f"_FORBIDDEN = {forbidden}",
+                "",
+                "def test_execution_environment():",
+                "    present = [name for name in _FORBIDDEN if name in os.environ]",
+                "    assert not present, (",
+                "        'forbidden environment variable names: ' + ', '.join(present)",
+                "    )",
+                "    assert os.environ['PYTEST_ADDOPTS'] == ''",
+                "    Path(__file__).with_name('execution-proof.txt').write_text(",
+                "        'execution environment isolated\\n', encoding='utf-8'",
+                "    )",
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+    return test_path
+
 
 def _repository_for_manifest(root: Path) -> Path:
     return root.parent / "repository"
@@ -127,36 +182,34 @@ def test_runner_uses_argsfile_and_writes_selection_evidence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    nodeids = (
-        "tests/unit/test_strict_json.py::"
-        "test_canonical_json_uses_one_utf8_non_ascii_representation",
-    )
+    repository_root = (tmp_path / "repository").resolve()
+    test_path = _write_environment_isolation_repository(repository_root)
+    nodeids = ("tests/test_execution_environment.py::test_execution_environment",)
     manifest_root = tmp_path / "manifest"
     index = shards.write_manifest_bundle(
         manifest_root,
         selector=(),
         shard_nodeids=(nodeids, (), (), ()),
         expected_skips=0,
+        repository_root=repository_root,
     )
-    monkeypatch.setattr(shards, "validate_manifest", lambda _root: (index, (nodeids, (), (), ())))
+    for name, value in SENTINEL_ENVIRONMENT.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("PYTEST_ADDOPTS", "--tb=short")
     junit = tmp_path / "result.xml"
     evidence = tmp_path / "selection.json"
 
+    assert shards.collect_nodeids((), repository_root=repository_root) == nodeids
+
     assert (
-        shards.main(
-            [
-                "run",
-                "--manifest-dir",
-                str(manifest_root),
-                "--shard",
-                "0",
-                "--junitxml",
-                str(junit),
-                "--selection-evidence",
-                str(evidence),
-                "--basetemp",
-                str(tmp_path / "pytest-temp"),
-            ]
+        shards.run_shard(
+            manifest_root=manifest_root,
+            shard_id=0,
+            mode="run",
+            junitxml=junit,
+            selection_evidence=evidence,
+            basetemp=tmp_path / "pytest-temp",
+            repository_root=repository_root,
         )
         == 0
     )
@@ -164,6 +217,9 @@ def test_runner_uses_argsfile_and_writes_selection_evidence(
     assert payload["full_digest"] == index["full_suite"]["sha256"]
     assert payload["shard_digest"] == index["shards"][0]["sha256"]
     assert junit.is_file()
+    assert test_path.with_name("execution-proof.txt").read_text(encoding="utf-8") == (
+        "execution environment isolated\n"
+    )
 
 
 def test_lpt_file_weighting_separates_profile_and_recovery_coordinator() -> None:
