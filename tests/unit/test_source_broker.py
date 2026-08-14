@@ -2669,16 +2669,24 @@ def test_slow_provider_heartbeat_prevents_second_broker_takeover(tmp_path: Path)
     )
     plan = signed_plan(authorities)
     request = DailyRequest(trade_date="2026-08-04")
-    heartbeat_renewed = threading.Event()
     second_observed_live_fence = threading.Event()
-    original_renew = first_broker._renew_lease
     original_acquire = second_broker._acquire_lease
 
-    def observe_heartbeat(connection: sqlite3.Connection, guard: object) -> None:
-        original_renew(connection, guard)  # type: ignore[arg-type]
-        reading = clock()
-        if getattr(guard, "table", None) == "broker_call" and reading.monotonic_time >= 1_006.0:
-            heartbeat_renewed.set()
+    def wait_for_persisted_heartbeat() -> tuple[float, float]:
+        deadline = time.monotonic() + 5
+        while True:
+            with sqlite3.connect(state_path) as connection:
+                heartbeat, lease_expires = connection.execute(
+                    "SELECT heartbeat_monotonic, lease_expires_monotonic FROM broker_call"
+                ).fetchone()
+            if heartbeat >= 1_006.0 and lease_expires >= 1_011.0:
+                return float(heartbeat), float(lease_expires)
+            if time.monotonic() >= deadline:
+                pytest.fail(
+                    "provider heartbeat was not durably visible before the lease deadline: "
+                    f"heartbeat={heartbeat}, lease_expires={lease_expires}"
+                )
+            time.sleep(0.01)
 
     def observe_live_fence(
         connection: sqlite3.Connection,
@@ -2697,7 +2705,6 @@ def test_slow_provider_heartbeat_prevents_second_broker_takeover(tmp_path: Path)
             second_observed_live_fence.set()
         return guard
 
-    first_broker._renew_lease = observe_heartbeat  # type: ignore[method-assign]
     second_broker._acquire_lease = observe_live_fence  # type: ignore[method-assign]
     executor = ThreadPoolExecutor(max_workers=2)
     first: Future[SourceCallReceipt] | None = None
@@ -2711,11 +2718,7 @@ def test_slow_provider_heartbeat_prevents_second_broker_takeover(tmp_path: Path)
         )
         assert provider.entered.wait(timeout=5)
         clock.advance(6.0)
-        assert heartbeat_renewed.wait(timeout=5)
-        with sqlite3.connect(state_path) as connection:
-            heartbeat, lease_expires = connection.execute(
-                "SELECT heartbeat_monotonic, lease_expires_monotonic FROM broker_call"
-            ).fetchone()
+        heartbeat, lease_expires = wait_for_persisted_heartbeat()
         assert heartbeat >= 1_006.0
         assert lease_expires >= 1_011.0
         second = executor.submit(

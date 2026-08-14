@@ -114,8 +114,12 @@ def _endpoint(path: Path) -> SocketEndpointPolicy:
 
 @pytest.fixture
 def short_socket_directory() -> Iterator[Path]:
-    with tempfile.TemporaryDirectory(prefix="rq-", dir="/private/tmp") as directory:
-        yield Path(directory)
+    for root in (Path("/private/tmp"), Path("/tmp")):
+        if root.is_dir() and not root.is_symlink():
+            with tempfile.TemporaryDirectory(prefix="rq-", dir=root) as directory:
+                yield Path(directory)
+            return
+    raise RuntimeError("no safe POSIX temporary directory is available for Unix sockets")
 
 
 class _FakeBroker:
