@@ -4,6 +4,26 @@
 
 ## [Unreleased]
 
+### Added
+
+- **工作负载隔离运行时主干**：七条独立流水线（采集、校验与权威发布、盘中特征、策略推理、
+  通知与模拟盘、研究与回测、serving 查询）及持久 Lab Job Center 已具备代码主体；页面提交
+  typed job 后可由 scheduler/worker/checkpoint/ETA 在页面断开后继续执行。
+- **实时与消费边界**：统一 source gateway、PIT feature、独立 strategy runner、signal router/
+  outbox/notifier/paper consumer，以及只读 serving 投影和页面入口均已落地；研究 worker 通过
+  资源准入、配额和可恢复任务边界与实时链路隔离。
+- **可追溯治理能力**：慢变参考数据的双时间版本与修订、schema/特征/策略注册表、样本外晋级、
+  artifact 保留、恢复清单与最小权限 credential capability 已纳入隔离运行时。
+
+### Changed
+
+- **模拟盘发布证据**：paper publication v4 将执行成本证据与不可变 SQLite 镜像绑定，发布前后
+  复核 schema、账本和源文件身份，避免迁移时把可变源库当作已验证输入。
+
+### Fixed
+
+- **午间空量比**：保留空量比结果的固定 schema，午间链路在空数据场景不再丢失该字段。
+
 ### Changed
 
 - **题材梯队推送改版**：午间战报将最强题材与连续连板梯队合并为 Top5，并将下午候选池

@@ -1,14 +1,15 @@
 # rQuant 工作负载解耦与故障隔离架构设计
 
-**状态：** 设计基线，正在按隔离运行时一次性实施
+**状态：** 代码主体完成，本地专项与全量归因完成；Linux CI、云端 systemd、真实交易日 shadow
+仍待验收。旧链路保留用于 shadow 对账，尚未删除或宣称上线。
 **日期：** 2026-07-22
 **适用范围：** 数据采集、盘中监控、信号与通知、盘后生产流水线、研究回补、策略回测、自动优化、模拟盘和页面查询
 **不包含：** 实盘自动下单、Tick/Level2、高频交易、Kafka/PostgreSQL/Kubernetes 等新增基础设施
 
 ## 0. 实施与验收映射
 
-本轮实现不以“文件已创建”为完成条件，而以跨层可恢复行为为准。当前开发分支的
-模块与本设计对应如下：
+本轮实现不以“文件已创建”为完成条件，而以跨层可恢复行为为准。代码主体完成及本地专项与
+全量归因完成，不等同于生产验收或旧链路退役。当前开发分支的模块与本设计对应如下：
 
 | 设计能力 | 实现入口 | 当前证据 |
 |---|---|---|
@@ -18,16 +19,18 @@
 | 独立策略 runner | `strategy_runner.py`、`strategy_live_service.py` | 冻结 StrategySpec、独立状态库、崩溃重放不重复信号 |
 | 信号、通知、模拟盘 | `signal_bus.py`、`notification_worker.py`、`paper_signal_*` | 原子路由、持久 outbox、未知投递、T+1、下一分钟成交及幂等测试 |
 | serving 与只读页面 | `serving_read_models.py`、`serving_publisher.py` | 不可变代际、哈希验证、零写副作用 ServingReader |
-| 慢变参考数据 | `reference_data_registry.py` | ST、停牌、上市、板块、复权和涨跌停制度双时间 as-of 测试 |
-| 实验与晋级 | `experiment_registry.py` | 预注册、外层样本、BH 校正、真实前向证据与晋级门测试 |
-| 灾难恢复 | `recovery_manifest.py` | 全角色快照、哈希恢复、原子指针和故障注入演练 |
-| 密钥最小权限 | `secret_scope.py` | 数据源、通知和无密钥 worker 的 capability 测试 |
+| 研究 worker 与资源准入 | `lab_worker.py`、`resource_admission.py`、`runtime_resource_admission.py` | 资源 class、额度 lease、checkpoint 与实时链路隔离测试 |
+| 慢变参考数据与修订 | `reference_data_registry.py`、`reference_slow_publisher.py` | ST、停牌、上市、板块、复权和涨跌停制度的双时间 as-of、revision/generation 测试 |
+| Schema、定义与晋级 | `runtime_schema_registry.py`、`definition_registry.py`、`experiment_registry.py` | schema 兼容、特征/策略注册、预注册、外层样本、BH 校正与晋级门测试 |
+| 保留与恢复 | `artifact_retention.py`、`recovery_manifest.py` | 受引用保护的保留、全角色快照、哈希恢复、原子指针和故障注入演练 |
+| 密钥最小权限 | `runtime_deployment_bundle.py`、`runtime_credential_sealer_client.py` | 按 service capability 封装 credential；无能力 worker 和明文凭据均 fail closed |
 
-发布前仍必须完成三道总验收：
+发布前剩余三道总验收如下；它们尚未完成，也不构成旧链路删除授权：
 
-1. systemd unit 与 live/serving/research slice 在云端通过原样解析和资源限制检查；
-2. 固定 fixture 从分钟批次到 serving 的端到端回放及六类故障演练全部通过；
-3. 新旧实时链路先影子并行，达到退休门后再移除旧的 `monitor`/`surge-watch` 重叠职责。
+1. Linux CI 完成隔离运行时的目标平台验证；
+2. 云端 systemd unit 与 live/serving/research slice 通过原样解析和资源限制检查；
+3. 新旧实时链路完成真实交易日 shadow 并行，达到退休门后才能移除旧的
+   `monitor`/`surge-watch` 重叠职责。
 
 ## 1. 结论
 

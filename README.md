@@ -113,6 +113,10 @@ DuckDB 是单文件锁。盘中唯一写入者是 monitor；Dashboard、Lab 和�
 期全部验收前，本地 `rquant.duckdb` 仍是分钟/竞价研究数据权威，不得删除。完整步骤见
 [研究数据首次迁云操作手册](docs/deploy/research-cloud-bootstrap.md)。可先用以下命令只读估算：
 
+隔离运行时的当前入口与验收边界见[工作负载解耦设计](docs/architecture/2026-07-22-workload-isolation-design.md)：
+代码主体及本地专项/全量归因已完成，但 Linux CI、云端 systemd 和真实交易日 shadow 仍待验收，
+旧链路继续保留对账；发布门见[受控自动发布](docs/production-release.md)。
+
 ```bash
 rquant research-export --dataset minute_bar \
   --start-date 2025-03-28 --end-date 2026-07-16 --dry-run
