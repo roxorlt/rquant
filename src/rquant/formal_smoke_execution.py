@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import math
@@ -47,6 +48,7 @@ from rquant.formal_smoke_protocol import (
     formal_smoke_receipt_digest,
     formal_smoke_request_digest,
 )
+from rquant.runtime_code_attestation import RuntimeCodeTrustError
 from rquant.runtime_code_generation import (
     RuntimeCodeGenerationCapability,
     RuntimeCodeGenerationError,
@@ -132,6 +134,62 @@ class FormalSmokeCleanupError(FormalSmokeExecutionError):
 class FormalSmokeChildProcessResult(RuntimeContractModel):
     exit_code: int = Field(strict=True, ge=0, le=255)
     receipt_bytes: bytes = Field(max_length=_MAX_RECEIPT_BYTES)
+
+
+class _FormalSmokeOuterPhase(StrEnum):
+    VALIDATE_CAPABILITY = "validate_capability"
+    PREPARE_OUTPUT = "prepare_output"
+    PREPARE_STAGING = "prepare_staging"
+    BUILD_REQUEST = "build_request"
+    BIND_RUNTIME = "bind_runtime"
+    EXCHANGE_CHILD = "exchange_child"
+    VALIDATE_RECEIPT = "validate_receipt"
+    POST_CHILD_LIVENESS = "post_child_liveness"
+    VERIFY_STAGED_ARTIFACTS = "verify_staged_artifacts"
+    PRE_PUBLISH_LIVENESS = "pre_publish_liveness"
+    BUILD_ACCEPTED_RESULT = "build_accepted_result"
+    PUBLISH_ARTIFACTS = "publish_artifacts"
+    POST_PUBLISH_LIVENESS = "post_publish_liveness"
+    VERIFY_PUBLISHED_ARTIFACTS = "verify_published_artifacts"
+    BIND_EXECUTION_RECEIPT = "bind_execution_receipt"
+    CLEANUP_STAGING = "cleanup_staging"
+
+
+def _formal_smoke_failure_component(exc: BaseException) -> str | None:
+    if isinstance(exc, AuthorityPathSecurityError):
+        return "authority_path"
+    if isinstance(exc, FormalRuntimeError):
+        return "formal_runtime"
+    if isinstance(exc, RuntimeCodeGenerationError):
+        return "runtime_generation"
+    if isinstance(exc, RuntimeCodeTrustError):
+        return "runtime_trust"
+    if isinstance(exc, StrictJsonError):
+        return "strict_json"
+    if isinstance(exc, ValidationError):
+        return "validation_error"
+    if isinstance(exc, OSError):
+        error_name = errno.errorcode.get(exc.errno)
+        return "os_error" if error_name is None else f"os_error_{error_name.lower()}"
+    if isinstance(exc, TypeError):
+        return "type_error"
+    if isinstance(exc, ValueError):
+        return "value_error"
+    return None
+
+
+def _formal_smoke_failure_reason(exc: BaseException) -> str:
+    components: list[str] = []
+    observed: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and len(components) < 4 and id(current) not in observed:
+        observed.add(id(current))
+        component = _formal_smoke_failure_component(current)
+        if component is None:
+            break
+        components.append(component)
+        current = current.__cause__
+    return "_".join(components)
 
 
 @dataclass
@@ -1050,16 +1108,20 @@ def _run_attested_formal_smoke(
     """Launch generation A and accept only its fully bound canonical receipt."""
 
     session: FormalRuntimeSession | None = None
+    phase = _FormalSmokeOuterPhase.VALIDATE_CAPABILITY
     try:
         if not isinstance(capability, RuntimeCodeGenerationCapability):
             raise FormalSmokeExecutionError(
                 "formal smoke requires an attested generation capability"
             )
         capability.require_live()
+        phase = _FormalSmokeOuterPhase.PREPARE_OUTPUT
         output = _require_output_root(output_dir)
+        phase = _FormalSmokeOuterPhase.PREPARE_STAGING
         with tempfile.TemporaryDirectory(prefix=".formal-smoke-", dir=output) as raw_staging:
             staging = Path(raw_staging)
             staging.chmod(0o700)
+            phase = _FormalSmokeOuterPhase.BUILD_REQUEST
             request = FormalSmokeExecutionRequest(
                 strategy=strategy,
                 start_date=start_date,
@@ -1074,15 +1136,22 @@ def _run_attested_formal_smoke(
                 artifact_root=output,
                 staging_root=staging,
             )
+            phase = _FormalSmokeOuterPhase.BIND_RUNTIME
             session = bind_formal_smoke_runtime(
                 capability,
                 environment_source=environment_source,
             )
+            phase = _FormalSmokeOuterPhase.EXCHANGE_CHILD
             process_result = exchange(session, canonical_model_json_bytes(request))
+            phase = _FormalSmokeOuterPhase.VALIDATE_RECEIPT
             receipt = _validate_receipt(request, process_result)
+            phase = _FormalSmokeOuterPhase.POST_CHILD_LIVENESS
             _require_live_session(session)
+            phase = _FormalSmokeOuterPhase.VERIFY_STAGED_ARTIFACTS
             staged = _verify_staged_artifacts(request, receipt)
+            phase = _FormalSmokeOuterPhase.PRE_PUBLISH_LIVENESS
             _require_live_session(session)
+            phase = _FormalSmokeOuterPhase.BUILD_ACCEPTED_RESULT
             binding_digest = formal_smoke_receipt_digest(receipt)
             result_values = receipt.result.model_dump(mode="python")
             expected_paths = tuple(
@@ -1096,16 +1165,21 @@ def _run_attested_formal_smoke(
                 execution_receipt=receipt,
                 execution_receipt_digest=binding_digest,
             )
+            phase = _FormalSmokeOuterPhase.PUBLISH_ARTIFACTS
             published = _publish_artifacts(request, receipt, staged)
             try:
+                phase = _FormalSmokeOuterPhase.POST_PUBLISH_LIVENESS
                 _require_live_session(session)
+                phase = _FormalSmokeOuterPhase.VERIFY_PUBLISHED_ARTIFACTS
                 published.require_unchanged()
+                phase = _FormalSmokeOuterPhase.BIND_EXECUTION_RECEIPT
                 _mark_verified_execution(capability, binding_digest)
             except BaseException:
                 published.cleanup()
                 raise
             finally:
                 published.close()
+            phase = _FormalSmokeOuterPhase.CLEANUP_STAGING
             return accepted
     except FormalSmokeExecutionError:
         raise
@@ -1119,7 +1193,11 @@ def _run_attested_formal_smoke(
         ValidationError,
         ValueError,
     ) as exc:
-        raise FormalSmokeExecutionError("formal smoke attested execution failed") from exc
+        reason = _formal_smoke_failure_reason(exc)
+        raise FormalSmokeExecutionError(
+            "formal smoke attested execution failed "
+            f"(phase={phase.value} reason={reason})"
+        ) from None
     finally:
         if session is not None:
             session.close()

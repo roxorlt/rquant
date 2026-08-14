@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import inspect
 import os
@@ -8,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from contextlib import suppress
 from datetime import date
 from pathlib import Path
@@ -25,6 +27,24 @@ from tests.runtime_code_e2e_support import (
 
 def _artifact_digest(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
+
+
+def _runtime_generation_failure(message: str) -> BaseException:
+    from rquant.runtime_code_generation import RuntimeCodeGenerationError
+
+    return RuntimeCodeGenerationError(message)
+
+
+def _formal_runtime_generation_failure(message: str) -> BaseException:
+    from rquant.formal_runtime import FormalRuntimeError
+
+    failure = FormalRuntimeError(message)
+    failure.__cause__ = _runtime_generation_failure(message)
+    return failure
+
+
+def _cross_device_failure(message: str) -> BaseException:
+    return OSError(errno.EXDEV, message)
 
 
 def _success_exchange(*, mutate: str | None = None):
@@ -425,6 +445,59 @@ def test_generation_a_launcher_receipt_and_artifacts_are_the_only_success_identi
     assert result.execution_receipt_digest == capability.execution_binding_digest
     assert "execution-binding-pending" not in capability.audit_events
     assert "execution-binding-verified" in capability.audit_events
+
+
+@pytest.mark.parametrize(
+    ("target", "failure_factory", "expected_phase", "expected_reason"),
+    (
+        (
+            "_require_live_session",
+            _formal_runtime_generation_failure,
+            "post_child_liveness",
+            "formal_runtime_runtime_generation",
+        ),
+        (
+            "_verify_staged_artifacts",
+            OSError,
+            "verify_staged_artifacts",
+            "os_error",
+        ),
+        (
+            "_publish_artifacts",
+            _cross_device_failure,
+            "publish_artifacts",
+            "os_error_exdev",
+        ),
+    ),
+)
+def test_wrapped_outer_failure_reports_only_stable_redacted_phase_and_reason(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target: str,
+    failure_factory: Callable[[str], BaseException],
+    expected_phase: str,
+    expected_reason: str,
+) -> None:
+    from rquant import formal_smoke_execution as execution_module
+    from rquant.formal_smoke_execution import FormalSmokeExecutionError
+
+    secret = "secret argv=/private/checkout-b token=synthetic-token"
+
+    def fail(*_args: object, **_kwargs: object) -> object:
+        raise failure_factory(secret)
+
+    monkeypatch.setattr(execution_module, target, fail)
+
+    with pytest.raises(FormalSmokeExecutionError) as raised:
+        _run(tmp_path, exchange=_success_exchange())
+
+    assert str(raised.value) == (
+        "formal smoke attested execution failed "
+        f"(phase={expected_phase} reason={expected_reason})"
+    )
+    assert secret not in str(raised.value)
+    assert raised.value.__cause__ is None
+    assert not list((tmp_path / "output").glob("strategy_lab_runs/*"))
 
 
 @pytest.mark.parametrize(
