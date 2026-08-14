@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import errno
+import fcntl
 import hashlib
 import inspect
+import json
 import os
+import selectors
 import signal
 import subprocess
 import sys
@@ -46,6 +49,21 @@ def _formal_runtime_generation_failure(message: str) -> BaseException:
 
 def _cross_device_failure(message: str) -> BaseException:
     return OSError(errno.EXDEV, message)
+
+
+def _duplicate_high_descriptor(descriptor: int, *, minimum: int = 2_048) -> int:
+    return int(fcntl.fcntl(descriptor, fcntl.F_DUPFD, minimum))
+
+
+def _read_ready_descriptor(descriptor: int, size: int, *, timeout: float = 3) -> bytes:
+    selector = selectors.DefaultSelector()
+    try:
+        selector.register(descriptor, selectors.EVENT_READ)
+        if not selector.select(timeout):
+            pytest.fail("formal smoke high-descriptor subprocess did not become readable")
+        return os.read(descriptor, size)
+    finally:
+        selector.close()
 
 
 def _success_exchange(*, mutate: str | None = None):
@@ -509,6 +527,37 @@ def test_wrapped_outer_failure_reports_only_stable_redacted_phase_and_reason(
     assert not list((tmp_path / "output").glob("strategy_lab_runs/*"))
 
 
+def test_exchange_value_error_reports_redacted_fixed_subphase(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant import formal_smoke_execution as execution_module
+    from rquant.formal_smoke_execution import FormalSmokeExecutionError
+
+    secret = "secret path=/private/checkout-b argv=--token synthetic-token"
+
+    def fail_pipe() -> tuple[int, int]:
+        raise ValueError(secret)
+
+    monkeypatch.setattr(execution_module.os, "pipe", fail_pipe)
+
+    with pytest.raises(FormalSmokeExecutionError) as raised:
+        execution_module._exchange_formal_smoke_child(
+            object(),  # type: ignore[arg-type]
+            b"request",
+            deadline_monotonic=time.monotonic() + 1,
+        )
+
+    assert str(raised.value) == (
+        "formal smoke child exchange failed "
+        "(subphase=setup_request_pipe reason=pipe_contract)"
+    )
+    assert raised.value.__cause__ is None
+    assert raised.value.__suppress_context__ is True
+    assert raised.value.__context__ is not None
+    assert secret in str(raised.value.__context__)
+    assert secret not in "".join(traceback.format_exception(raised.value))
+
+
 @pytest.mark.parametrize(
     "mutation",
     (
@@ -969,6 +1018,184 @@ def test_supervisor_owned_teardown_still_gets_parent_final_group_kill_before_rea
     assert process.state is execution_module._SupervisorLifecycleState.REAPED
 
 
+def test_teardown_ready_wait_supports_descriptor_above_select_fd_limit() -> None:
+    from rquant import formal_smoke_execution as execution_module
+
+    status_read, status_write = os.pipe()
+    high_status_read = _duplicate_high_descriptor(status_read)
+    os.close(status_read)
+
+    class FakePopen:
+        pid = 41_045
+        returncode: int | None = None
+
+    process = execution_module._FormalSmokeChildProcess(
+        process=FakePopen(),  # type: ignore[arg-type]
+        lifetime_descriptor=-1,
+        status_descriptor=high_status_read,
+    )
+    try:
+        os.write(status_write, b"K")
+        assert execution_module._await_supervisor_teardown_ready(
+            process,
+            deadline_monotonic=time.monotonic() + 1,
+        )
+        assert process.state is execution_module._SupervisorLifecycleState.TEARDOWN_READY
+    finally:
+        os.close(status_write)
+        process.close_status()
+
+
+@pytest.mark.parametrize(
+    ("fault", "expected_subphase", "expected_reason"),
+    (
+        ("teardown-wait", "cleanup_teardown_wait", "selector_contract"),
+        ("waitid", "cleanup_waitid", "waitid_contract"),
+        ("kill", "cleanup_kill", "process_group_contract"),
+        ("reap", "cleanup_reap", "process_reap_contract"),
+    ),
+)
+def test_cleanup_value_error_records_exact_safe_subphase(
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+    expected_subphase: str,
+    expected_reason: str,
+) -> None:
+    from rquant import formal_smoke_execution as execution_module
+
+    secret = f"secret cleanup path=/private/{fault} argv=--token"
+    control_read, control_write = os.pipe()
+    status_read, status_write = os.pipe()
+
+    class FakePopen:
+        pid = 41_046
+        returncode: int | None = None
+
+    process = execution_module._FormalSmokeChildProcess(
+        process=FakePopen(),  # type: ignore[arg-type]
+        lifetime_descriptor=control_write,
+        status_descriptor=status_read,
+    )
+    progress = execution_module._FormalSmokeExchangeProgress()
+
+    def fail(*_args: object, **_kwargs: object) -> object:
+        raise ValueError(secret)
+
+    monkeypatch.setattr(
+        execution_module,
+        "_await_supervisor_teardown_ready",
+        fail if fault == "teardown-wait" else lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        execution_module,
+        "_observe_supervisor_without_reaping",
+        fail if fault == "waitid" else lambda _process: None,
+    )
+    monkeypatch.setattr(
+        execution_module,
+        "_final_kill_supervisor_group",
+        fail if fault == "kill" else lambda _process: None,
+    )
+    monkeypatch.setattr(
+        execution_module,
+        "_reap_known_supervisor",
+        fail if fault == "reap" else lambda _process, **_kwargs: -signal.SIGKILL,
+    )
+
+    try:
+        with pytest.raises(ValueError) as raised:
+            execution_module._cleanup_formal_smoke_supervisor(
+                process,
+                progress=progress,
+            )
+        diagnostic = progress.value_error(raised.value)
+        assert str(diagnostic) == (
+            "formal smoke child exchange failed "
+            f"(subphase={expected_subphase} reason={expected_reason})"
+        )
+        assert secret not in str(diagnostic)
+    finally:
+        os.close(control_read)
+        os.close(status_write)
+
+
+@pytest.mark.skipif(
+    os.execve not in os.supports_fd,
+    reason="descriptor exec is required to exercise the real supervisor bootstrap",
+)
+def test_real_supervisor_bootstrap_handles_high_lifetime_descriptor() -> None:
+    from rquant import formal_smoke_execution as execution_module
+
+    descriptors: list[int] = []
+
+    def high_pipe() -> tuple[int, int]:
+        read_descriptor, write_descriptor = os.pipe()
+        high_read = _duplicate_high_descriptor(read_descriptor)
+        descriptors.append(high_read)
+        high_write = _duplicate_high_descriptor(write_descriptor, minimum=high_read + 1)
+        descriptors.append(high_write)
+        os.close(read_descriptor)
+        os.close(write_descriptor)
+        return high_read, high_write
+
+    receipt_read, receipt_write = high_pipe()
+    lifetime_read, lifetime_write = high_pipe()
+    status_read, status_write = high_pipe()
+    interpreter_source = os.open(sys.executable, os.O_RDONLY)
+    interpreter = _duplicate_high_descriptor(interpreter_source)
+    os.close(interpreter_source)
+    descriptors.append(interpreter)
+    child_code = (
+        "import os,sys; descriptor=int(sys.argv[1]); "
+        "os.write(descriptor,b'receipt'); os.close(descriptor)"
+    )
+    process: subprocess.Popen[bytes] | None = None
+    try:
+        process = subprocess.Popen(
+            (
+                sys.executable,
+                "-I",
+                "-S",
+                "-c",
+                execution_module._DESCRIPTOR_HANDOFF_BOOTSTRAP,
+                str(interpreter),
+                os.getcwd(),
+                json.dumps(
+                    (sys.executable, "-c", child_code, str(receipt_write)),
+                    separators=(",", ":"),
+                ),
+                "{}",
+                json.dumps((interpreter, receipt_write), separators=(",", ":")),
+                str(lifetime_read),
+                str(status_write),
+            ),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            pass_fds=(interpreter, receipt_write, lifetime_read, status_write),
+            start_new_session=True,
+        )
+        for descriptor in (interpreter, receipt_write, lifetime_read, status_write):
+            os.close(descriptor)
+            descriptors.remove(descriptor)
+
+        assert _read_ready_descriptor(receipt_read, len(b"receipt") + 1) == b"receipt"
+        assert _read_ready_descriptor(status_read, 1) == b"\x00"
+        os.write(lifetime_write, b"T")
+        assert _read_ready_descriptor(status_read, 1) == b"K"
+        assert process.wait(timeout=3) == -signal.SIGKILL
+    finally:
+        if process is not None and process.returncode is None:
+            with suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            with suppress(subprocess.TimeoutExpired):
+                process.wait(timeout=1)
+        for descriptor in descriptors:
+            with suppress(OSError):
+                os.close(descriptor)
+
+
 @pytest.mark.parametrize(
     "fault",
     (
@@ -1140,7 +1367,8 @@ def test_cleanup_failure_is_explicit_and_preserves_initialization_failure_as_cau
             status_descriptor=status_read,
         )
 
-    def fail_cleanup(process: object) -> None:
+    def fail_cleanup(process: object, *, progress: object | None = None) -> None:
+        assert progress is not None
         child = process
         child.close_lifetime()  # type: ignore[attr-defined]
         child.close_status()  # type: ignore[attr-defined]
@@ -1290,7 +1518,8 @@ def test_formal_smoke_child_launch_has_no_fork_window_when_thread_starts_after_p
     )
     monkeypatch.setattr(execution_module.subprocess, "Popen", start_supervisor)
 
-    def finish_fake_supervisor(process: object) -> None:
+    def finish_fake_supervisor(process: object, *, progress: object | None = None) -> None:
+        assert progress is not None
         child = process
         child.close_lifetime()  # type: ignore[attr-defined]
         child.close_status()  # type: ignore[attr-defined]

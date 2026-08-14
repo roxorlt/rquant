@@ -7,7 +7,6 @@ import hashlib
 import json
 import math
 import os
-import select
 import selectors
 import signal
 import stat
@@ -65,9 +64,10 @@ _SUPERVISOR_CLEANUP_SECONDS = 1.25
 _SUPERVISOR_OWNED_GRACE_SECONDS = 0.5
 _SUPERVISOR_TEARDOWN_REQUEST = b"T"
 _SUPERVISOR_TEARDOWN_READY = b"K"
+_TEARDOWN_SELECTOR_FACTORY = selectors.DefaultSelector
 _DESCRIPTOR_HANDOFF_BOOTSTRAP = "\n".join(
     (
-        "import json, os, select, signal, sys, time",
+        "import json, os, selectors, signal, sys, time",
         "status_descriptor = -1",
         "def teardown_group():",
         "    signal.signal(signal.SIGTERM, signal.SIG_IGN)",
@@ -103,6 +103,8 @@ _DESCRIPTOR_HANDOFF_BOOTSTRAP = "\n".join(
         "        signal.signal(signal.SIGTERM, signal.SIG_DFL)",
         "        os.chdir(working_directory)",
         "        os.execve(descriptor, arguments, environment)",
+        "    lifetime_selector = selectors.DefaultSelector()",
+        "    lifetime_selector.register(lifetime_descriptor, selectors.EVENT_READ)",
         "    for inherited_descriptor in inherited:",
         "        os.close(inherited_descriptor)",
         "    while True:",
@@ -110,10 +112,10 @@ _DESCRIPTOR_HANDOFF_BOOTSTRAP = "\n".join(
         "        if waited == generation_pid:",
         "            code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else 255",
         "            break",
-        "        readable, _, _ = select.select([lifetime_descriptor], [], [], 0.05)",
-        "        if readable:",
+        "        if lifetime_selector.select(0.05):",
         "            os.read(lifetime_descriptor, 1)",
         "            teardown_group()",
+        "    lifetime_selector.close()",
         "    os.write(status_descriptor, bytes((code,)))",
         "    os.read(lifetime_descriptor, 1)",
         "    teardown_group()",
@@ -155,6 +157,70 @@ class _FormalSmokeOuterPhase(StrEnum):
     CLEANUP_STAGING = "cleanup_staging"
 
 
+class _FormalSmokeExchangeSubphase(StrEnum):
+    VALIDATE_DEADLINE = "validate_deadline"
+    SETUP_REQUEST_PIPE = "setup_request_pipe"
+    SETUP_RECEIPT_PIPE = "setup_receipt_pipe"
+    SPAWN = "spawn"
+    CLOSE_CHILD_ENDPOINTS = "close_child_endpoints"
+    SET_NONBLOCKING_REQUEST = "set_nonblocking_request"
+    SET_NONBLOCKING_RECEIPT = "set_nonblocking_receipt"
+    SET_NONBLOCKING_STATUS = "set_nonblocking_status"
+    CREATE_SELECTOR = "create_selector"
+    REGISTER_REQUEST = "register_request"
+    REGISTER_RECEIPT = "register_receipt"
+    REGISTER_STATUS = "register_status"
+    SELECT_EVENTS = "select_events"
+    WRITE_REQUEST = "write_request"
+    UNREGISTER_REQUEST = "unregister_request"
+    READ_STATUS = "read_status"
+    UNREGISTER_STATUS = "unregister_status"
+    CLOSE_STATUS = "close_status"
+    READ_RECEIPT = "read_receipt"
+    UNREGISTER_RECEIPT = "unregister_receipt"
+    BUILD_RESULT = "build_result"
+    CLOSE_SELECTOR = "close_selector"
+    CLEANUP_VALIDATE_ANCHOR = "cleanup_validate_anchor"
+    CLEANUP_TEARDOWN_REQUEST = "cleanup_teardown_request"
+    CLEANUP_TEARDOWN_WAIT = "cleanup_teardown_wait"
+    CLEANUP_WAITID = "cleanup_waitid"
+    CLEANUP_KILL = "cleanup_kill"
+    CLEANUP_REAP = "cleanup_reap"
+    CLEANUP_CLOSE_DESCRIPTORS = "cleanup_close_descriptors"
+
+
+def _exchange_value_error_reason(subphase: _FormalSmokeExchangeSubphase) -> str:
+    if subphase in {
+        _FormalSmokeExchangeSubphase.SETUP_REQUEST_PIPE,
+        _FormalSmokeExchangeSubphase.SETUP_RECEIPT_PIPE,
+    }:
+        return "pipe_contract"
+    if subphase in {
+        _FormalSmokeExchangeSubphase.CREATE_SELECTOR,
+        _FormalSmokeExchangeSubphase.REGISTER_REQUEST,
+        _FormalSmokeExchangeSubphase.REGISTER_RECEIPT,
+        _FormalSmokeExchangeSubphase.REGISTER_STATUS,
+        _FormalSmokeExchangeSubphase.SELECT_EVENTS,
+        _FormalSmokeExchangeSubphase.UNREGISTER_REQUEST,
+        _FormalSmokeExchangeSubphase.UNREGISTER_STATUS,
+        _FormalSmokeExchangeSubphase.UNREGISTER_RECEIPT,
+        _FormalSmokeExchangeSubphase.CLOSE_SELECTOR,
+        _FormalSmokeExchangeSubphase.CLEANUP_TEARDOWN_WAIT,
+    }:
+        return "selector_contract"
+    if subphase is _FormalSmokeExchangeSubphase.SPAWN:
+        return "spawn_contract"
+    if subphase is _FormalSmokeExchangeSubphase.BUILD_RESULT:
+        return "result_contract"
+    if subphase is _FormalSmokeExchangeSubphase.CLEANUP_WAITID:
+        return "waitid_contract"
+    if subphase is _FormalSmokeExchangeSubphase.CLEANUP_KILL:
+        return "process_group_contract"
+    if subphase is _FormalSmokeExchangeSubphase.CLEANUP_REAP:
+        return "process_reap_contract"
+    return "descriptor_contract"
+
+
 def _formal_smoke_failure_component(exc: BaseException) -> str | None:
     if isinstance(exc, AuthorityPathSecurityError):
         return "authority_path"
@@ -194,10 +260,22 @@ def _formal_smoke_failure_reason(exc: BaseException) -> str:
 
 @dataclass
 class _FormalSmokeExchangeProgress:
+    subphase: _FormalSmokeExchangeSubphase = _FormalSmokeExchangeSubphase.VALIDATE_DEADLINE
     request_sent: bool = False
     receipt_bytes: int = 0
     receipt_eof: bool = False
     status_reported: bool = False
+
+    def value_error(self, exc: ValueError) -> FormalSmokeExecutionError:
+        reason = (
+            "validation_error"
+            if isinstance(exc, ValidationError)
+            else _exchange_value_error_reason(self.subphase)
+        )
+        return FormalSmokeExecutionError(
+            "formal smoke child exchange failed "
+            f"(subphase={self.subphase.value} reason={reason})"
+        )
 
     def deadline_error(self) -> FormalSmokeExecutionError:
         if not self.request_sent:
@@ -389,14 +467,11 @@ def _await_supervisor_teardown_ready(
     remaining = max(0.0, deadline_monotonic - time.monotonic())
     if remaining == 0:
         return False
+    selector: selectors.BaseSelector | None = None
     try:
-        readable, _, _ = select.select(
-            (process.status_descriptor,),
-            (),
-            (),
-            remaining,
-        )
-        if not readable:
+        selector = _TEARDOWN_SELECTOR_FACTORY()
+        selector.register(process.status_descriptor, selectors.EVENT_READ)
+        if not selector.select(remaining):
             return False
         ready = os.read(process.status_descriptor, 1) == _SUPERVISOR_TEARDOWN_READY
         if ready:
@@ -404,19 +479,30 @@ def _await_supervisor_teardown_ready(
         return ready
     except OSError:
         return False
+    finally:
+        if selector is not None:
+            selector.close()
 
 
-def _cleanup_formal_smoke_supervisor(process: _FormalSmokeChildProcess) -> None:
+def _cleanup_formal_smoke_supervisor(
+    process: _FormalSmokeChildProcess,
+    *,
+    progress: _FormalSmokeExchangeProgress | None = None,
+) -> None:
     cleanup_deadline = time.monotonic() + _SUPERVISOR_CLEANUP_SECONDS
     cleanup_error: FormalSmokeCleanupError | None = None
     request_delivered = False
     try:
+        if progress is not None:
+            progress.subphase = _FormalSmokeExchangeSubphase.CLEANUP_VALIDATE_ANCHOR
         if process.process.returncode is not None:
             process.state = _SupervisorLifecycleState.REAPED
             raise FormalSmokeCleanupError(
                 "formal smoke supervisor was already reaped before cleanup"
             )
         try:
+            if progress is not None:
+                progress.subphase = _FormalSmokeExchangeSubphase.CLEANUP_TEARDOWN_REQUEST
             request_delivered = (
                 os.write(process.lifetime_descriptor, _SUPERVISOR_TEARDOWN_REQUEST) == 1
             )
@@ -434,15 +520,23 @@ def _cleanup_formal_smoke_supervisor(process: _FormalSmokeChildProcess) -> None:
                 cleanup_deadline,
                 owned_deadline + _SUPERVISOR_OWNED_GRACE_SECONDS,
             )
+            if progress is not None:
+                progress.subphase = _FormalSmokeExchangeSubphase.CLEANUP_TEARDOWN_WAIT
             _await_supervisor_teardown_ready(
                 process,
                 deadline_monotonic=owned_deadline,
             )
 
+        if progress is not None:
+            progress.subphase = _FormalSmokeExchangeSubphase.CLEANUP_WAITID
         observed_return_code = _observe_supervisor_without_reaping(process)
 
+        if progress is not None:
+            progress.subphase = _FormalSmokeExchangeSubphase.CLEANUP_KILL
         cleanup_error = _final_kill_supervisor_group(process)
         try:
+            if progress is not None:
+                progress.subphase = _FormalSmokeExchangeSubphase.CLEANUP_REAP
             reaped_return_code = _reap_known_supervisor(
                 process,
                 deadline_monotonic=cleanup_deadline,
@@ -462,10 +556,17 @@ def _cleanup_formal_smoke_supervisor(process: _FormalSmokeChildProcess) -> None:
         if cleanup_error is not None:
             raise cleanup_error
     finally:
-        with suppress(OSError):
-            process.close_lifetime()
-        with suppress(OSError):
-            process.close_status()
+        for close_descriptor in (process.close_lifetime, process.close_status):
+            try:
+                close_descriptor()
+            except OSError:
+                pass
+            except ValueError:
+                if progress is not None:
+                    progress.subphase = (
+                        _FormalSmokeExchangeSubphase.CLEANUP_CLOSE_DESCRIPTORS
+                    )
+                raise
 
 
 def _spawn_formal_smoke_child(
@@ -530,18 +631,26 @@ def _spawn_formal_smoke_child(
         )
 
 
-def _exchange_formal_smoke_child(
+def _exchange_formal_smoke_child_impl(
     session: FormalRuntimeSession,
     request_bytes: bytes,
     *,
     deadline_monotonic: float,
+    progress: _FormalSmokeExchangeProgress,
 ) -> FormalSmokeChildProcessResult:
-    progress = _FormalSmokeExchangeProgress()
     if not math.isfinite(deadline_monotonic) or time.monotonic() >= deadline_monotonic:
         raise progress.deadline_error()
+    progress.subphase = _FormalSmokeExchangeSubphase.SETUP_REQUEST_PIPE
     request_read, request_write = os.pipe()
-    receipt_read, receipt_write = os.pipe()
     try:
+        progress.subphase = _FormalSmokeExchangeSubphase.SETUP_RECEIPT_PIPE
+        receipt_read, receipt_write = os.pipe()
+    except BaseException:
+        os.close(request_read)
+        os.close(request_write)
+        raise
+    try:
+        progress.subphase = _FormalSmokeExchangeSubphase.SPAWN
         process = _spawn_formal_smoke_child(
             session,
             request_descriptor=request_read,
@@ -556,16 +665,24 @@ def _exchange_formal_smoke_child(
     result: FormalSmokeChildProcessResult | None = None
     try:
         try:
+            progress.subphase = _FormalSmokeExchangeSubphase.CLOSE_CHILD_ENDPOINTS
             os.close(request_read)
             request_read = -1
             os.close(receipt_write)
             receipt_write = -1
+            progress.subphase = _FormalSmokeExchangeSubphase.SET_NONBLOCKING_REQUEST
             os.set_blocking(request_write, False)
+            progress.subphase = _FormalSmokeExchangeSubphase.SET_NONBLOCKING_RECEIPT
             os.set_blocking(receipt_read, False)
+            progress.subphase = _FormalSmokeExchangeSubphase.SET_NONBLOCKING_STATUS
             os.set_blocking(process.status_descriptor, False)
+            progress.subphase = _FormalSmokeExchangeSubphase.CREATE_SELECTOR
             selector = selectors.DefaultSelector()
+            progress.subphase = _FormalSmokeExchangeSubphase.REGISTER_REQUEST
             selector.register(request_write, selectors.EVENT_WRITE, "request")
+            progress.subphase = _FormalSmokeExchangeSubphase.REGISTER_RECEIPT
             selector.register(receipt_read, selectors.EVENT_READ, "receipt")
+            progress.subphase = _FormalSmokeExchangeSubphase.REGISTER_STATUS
             selector.register(process.status_descriptor, selectors.EVENT_READ, "status")
             request_view = memoryview(request_bytes)
             receipt = bytearray()
@@ -576,9 +693,11 @@ def _exchange_formal_smoke_child(
                 remaining = deadline_monotonic - time.monotonic()
                 if remaining <= 0:
                     raise progress.deadline_error()
+                progress.subphase = _FormalSmokeExchangeSubphase.SELECT_EVENTS
                 for key, _events in selector.select(min(remaining, 0.05)):
                     if key.data == "request":
                         try:
+                            progress.subphase = _FormalSmokeExchangeSubphase.WRITE_REQUEST
                             written = os.write(request_write, request_view)
                         except BlockingIOError:
                             continue
@@ -592,6 +711,7 @@ def _exchange_formal_smoke_child(
                             )
                         request_view = request_view[written:]
                         if not request_view:
+                            progress.subphase = _FormalSmokeExchangeSubphase.UNREGISTER_REQUEST
                             selector.unregister(request_write)
                             os.close(request_write)
                             request_write = -1
@@ -599,6 +719,7 @@ def _exchange_formal_smoke_child(
                         continue
                     if key.data == "status":
                         try:
+                            progress.subphase = _FormalSmokeExchangeSubphase.READ_STATUS
                             chunk = os.read(process.status_descriptor, 2)
                         except BlockingIOError:
                             continue
@@ -608,18 +729,22 @@ def _exchange_formal_smoke_child(
                                 raise FormalSmokeExecutionError(
                                     "formal smoke supervisor status is invalid"
                                 )
+                            progress.subphase = _FormalSmokeExchangeSubphase.UNREGISTER_STATUS
                             selector.unregister(process.status_descriptor)
                             child_exit_code = status_bytes[0]
                             progress.status_reported = True
                             process.state = _SupervisorLifecycleState.STATUS_REPORTED
                             continue
+                        progress.subphase = _FormalSmokeExchangeSubphase.UNREGISTER_STATUS
                         selector.unregister(process.status_descriptor)
+                        progress.subphase = _FormalSmokeExchangeSubphase.CLOSE_STATUS
                         process.close_status()
                         raise FormalSmokeExecutionError(
                             "formal smoke supervisor returned no status"
                         )
                     while True:
                         try:
+                            progress.subphase = _FormalSmokeExchangeSubphase.READ_RECEIPT
                             chunk = os.read(
                                 receipt_read,
                                 min(64 * 1024, _MAX_RECEIPT_BYTES + 1 - len(receipt)),
@@ -627,6 +752,7 @@ def _exchange_formal_smoke_child(
                         except BlockingIOError:
                             break
                         if not chunk:
+                            progress.subphase = _FormalSmokeExchangeSubphase.UNREGISTER_RECEIPT
                             selector.unregister(receipt_read)
                             os.close(receipt_read)
                             receipt_read = -1
@@ -640,6 +766,7 @@ def _exchange_formal_smoke_child(
                                 "formal smoke receipt exceeds the limit"
                             )
             assert child_exit_code is not None
+            progress.subphase = _FormalSmokeExchangeSubphase.BUILD_RESULT
             result = FormalSmokeChildProcessResult(
                 exit_code=_exit_code(child_exit_code),
                 receipt_bytes=bytes(receipt),
@@ -647,7 +774,14 @@ def _exchange_formal_smoke_child(
         finally:
             try:
                 if selector is not None:
-                    selector.close()
+                    previous_subphase = progress.subphase
+                    try:
+                        progress.subphase = _FormalSmokeExchangeSubphase.CLOSE_SELECTOR
+                        selector.close()
+                    except BaseException:
+                        raise
+                    else:
+                        progress.subphase = previous_subphase
             finally:
                 for descriptor in (
                     request_read,
@@ -659,14 +793,36 @@ def _exchange_formal_smoke_child(
                         with suppress(OSError):
                             os.close(descriptor)
     except BaseException as exc:
+        failure_subphase = progress.subphase
         try:
-            _cleanup_formal_smoke_supervisor(process)
+            _cleanup_formal_smoke_supervisor(process, progress=progress)
         except FormalSmokeCleanupError as cleanup_exc:
             raise cleanup_exc from exc
+        progress.subphase = failure_subphase
         raise
-    _cleanup_formal_smoke_supervisor(process)
+    _cleanup_formal_smoke_supervisor(process, progress=progress)
     assert result is not None
     return result
+
+
+def _exchange_formal_smoke_child(
+    session: FormalRuntimeSession,
+    request_bytes: bytes,
+    *,
+    deadline_monotonic: float,
+) -> FormalSmokeChildProcessResult:
+    progress = _FormalSmokeExchangeProgress()
+    try:
+        return _exchange_formal_smoke_child_impl(
+            session,
+            request_bytes,
+            deadline_monotonic=deadline_monotonic,
+            progress=progress,
+        )
+    except FormalSmokeExecutionError:
+        raise
+    except ValueError as exc:
+        raise progress.value_error(exc) from None
 
 
 def _require_output_root(output_dir: Path) -> Path:
