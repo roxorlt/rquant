@@ -547,7 +547,8 @@ def test_real_generation_exact_ci_job_is_no_skip_and_redacted() -> None:
     assert "name: Linux real generation smoke (${{ matrix.python-version }})" in job
     assert "timeout-minutes: 6" in job
     assert 'python-version: ["3.11", "3.12"]' in job
-    assert "${{ runner.temp }}" not in workflow
+    job_declaration = job.split("\n    steps:\n", maxsplit=1)[0]
+    assert "${{ runner.temp }}" not in job_declaration
     assert 'exact_root="${RUNNER_TEMP}/rquant-formal-exact-py${{ matrix.python-version }}"' in job
     assert 'exact_root="${RQUANT_FORMAL_EXACT_ROOT}"' in job
     assert 'printf \'RQUANT_FORMAL_EXACT_ROOT=%s\\n\' "${exact_root}"' in job
@@ -571,4 +572,9 @@ def test_real_generation_exact_ci_job_is_no_skip_and_redacted() -> None:
         "uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
         " # actions/upload-artifact@v4"
     ) in job
+    assert (
+        "path: ${{ runner.temp }}/rquant-formal-exact-py"
+        "${{ matrix.python-version }}/test-results/"
+    ) in job
+    assert "path: ${{ env.RQUANT_FORMAL_EXACT_ROOT }}/test-results/" not in job
     assert "if-no-files-found: error" in job

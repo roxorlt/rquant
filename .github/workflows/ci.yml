@@ -392,5 +392,5 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # actions/upload-artifact@v4
         with:
           name: formal-smoke-real-generation-py${{ matrix.python-version }}
-          path: ${{ env.RQUANT_FORMAL_EXACT_ROOT }}/test-results/
+          path: ${{ runner.temp }}/rquant-formal-exact-py${{ matrix.python-version }}/test-results/
           if-no-files-found: error
