@@ -134,6 +134,36 @@ class FormalSmokeChildProcessResult(RuntimeContractModel):
     receipt_bytes: bytes = Field(max_length=_MAX_RECEIPT_BYTES)
 
 
+@dataclass
+class _FormalSmokeExchangeProgress:
+    request_sent: bool = False
+    receipt_bytes: int = 0
+    receipt_eof: bool = False
+    status_reported: bool = False
+
+    def deadline_error(self) -> FormalSmokeExecutionError:
+        if not self.request_sent:
+            phase = "sending_request"
+        elif self.status_reported and not self.receipt_eof:
+            phase = "awaiting_receipt_eof"
+        elif self.receipt_bytes and not self.receipt_eof:
+            phase = "receiving_receipt"
+        elif self.receipt_eof and not self.status_reported:
+            phase = "awaiting_child_status"
+        else:
+            phase = "awaiting_generation_result"
+        facts = (
+            f"phase={phase}",
+            f"request_sent={str(self.request_sent).lower()}",
+            f"receipt_bytes={self.receipt_bytes}",
+            f"receipt_eof={str(self.receipt_eof).lower()}",
+            f"status_reported={str(self.status_reported).lower()}",
+        )
+        return FormalSmokeExecutionError(
+            f"formal smoke child deadline expired ({' '.join(facts)})"
+        )
+
+
 FormalSmokeExchange = Callable[
     [FormalRuntimeSession, bytes],
     FormalSmokeChildProcessResult,
@@ -448,8 +478,9 @@ def _exchange_formal_smoke_child(
     *,
     deadline_monotonic: float,
 ) -> FormalSmokeChildProcessResult:
+    progress = _FormalSmokeExchangeProgress()
     if not math.isfinite(deadline_monotonic) or time.monotonic() >= deadline_monotonic:
-        raise FormalSmokeExecutionError("formal smoke child deadline expired")
+        raise progress.deadline_error()
     request_read, request_write = os.pipe()
     receipt_read, receipt_write = os.pipe()
     try:
@@ -486,7 +517,7 @@ def _exchange_formal_smoke_child(
             while child_exit_code is None or not receipt_eof or request_write != -1:
                 remaining = deadline_monotonic - time.monotonic()
                 if remaining <= 0:
-                    raise FormalSmokeExecutionError("formal smoke child deadline expired")
+                    raise progress.deadline_error()
                 for key, _events in selector.select(min(remaining, 0.05)):
                     if key.data == "request":
                         try:
@@ -506,6 +537,7 @@ def _exchange_formal_smoke_child(
                             selector.unregister(request_write)
                             os.close(request_write)
                             request_write = -1
+                            progress.request_sent = True
                         continue
                     if key.data == "status":
                         try:
@@ -520,6 +552,7 @@ def _exchange_formal_smoke_child(
                                 )
                             selector.unregister(process.status_descriptor)
                             child_exit_code = status_bytes[0]
+                            progress.status_reported = True
                             process.state = _SupervisorLifecycleState.STATUS_REPORTED
                             continue
                         selector.unregister(process.status_descriptor)
@@ -540,8 +573,10 @@ def _exchange_formal_smoke_child(
                             os.close(receipt_read)
                             receipt_read = -1
                             receipt_eof = True
+                            progress.receipt_eof = True
                             break
                         receipt.extend(chunk)
+                        progress.receipt_bytes = len(receipt)
                         if len(receipt) > _MAX_RECEIPT_BYTES:
                             raise FormalSmokeExecutionError(
                                 "formal smoke receipt exceeds the limit"

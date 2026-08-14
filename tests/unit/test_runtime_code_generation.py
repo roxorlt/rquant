@@ -637,3 +637,102 @@ def test_p0_08_writable_or_symlinked_ancestor_and_code_object_fails(
             runtime_root=runtime_root,
             package=package,
         )
+
+
+def test_live_capability_reuses_verified_generation_but_rechecks_current_promotion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant import runtime_code_generation as generation_module
+    from rquant.runtime_code_generation import RuntimeCodeGenerationError
+    from tests.runtime_code_e2e_support import (
+        build_test_package,
+        install_test_package,
+        open_test_capability,
+    )
+
+    package = build_test_package(tmp_path / "package")
+    trusted_base, runtime_root, _installer = install_test_package(tmp_path, package)
+    real_load = generation_module.require_attested_runtime_generation
+    full_verifications = 0
+
+    def count_full_verification(**kwargs: object) -> object:
+        nonlocal full_verifications
+        full_verifications += 1
+        return real_load(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        generation_module,
+        "require_attested_runtime_generation",
+        count_full_verification,
+    )
+    capability = open_test_capability(
+        trusted_base=trusted_base,
+        runtime_root=runtime_root,
+        package=package,
+    )
+    try:
+        assert full_verifications == 1
+        capability.require_live()
+        assert full_verifications == 1
+
+        package.promotion_state.current_bytes = None
+        with pytest.raises(RuntimeCodeGenerationError, match="promotion"):
+            capability.require_live()
+        assert full_verifications == 1
+    finally:
+        capability.close()
+
+
+def test_live_capability_rejects_unlisted_file_added_after_open(tmp_path: Path) -> None:
+    from rquant.runtime_code_generation import RuntimeCodeGenerationError
+    from tests.runtime_code_e2e_support import (
+        build_test_package,
+        install_test_package,
+        open_test_capability,
+    )
+
+    package = build_test_package(tmp_path / "package")
+    trusted_base, runtime_root, _installer = install_test_package(tmp_path, package)
+    capability = open_test_capability(
+        trusted_base=trusted_base,
+        runtime_root=runtime_root,
+        package=package,
+    )
+    generation = runtime_root / "generations" / package.receipt.generation_id
+    source_root = generation / "release/src/rquant"
+    generation.chmod(0o755)
+    (generation / "release").chmod(0o755)
+    (generation / "release/src").chmod(0o755)
+    source_root.chmod(0o755)
+    injected = source_root / "unlisted.py"
+    injected.write_bytes(b"INJECTED = True\n")
+    injected.chmod(0o444)
+    try:
+        with pytest.raises(RuntimeCodeGenerationError, match="artifact table"):
+            capability.require_live()
+    finally:
+        capability.close()
+
+
+def test_live_capability_rejects_unsafe_ancestor_mode_after_open(tmp_path: Path) -> None:
+    from rquant.runtime_code_generation import RuntimeCodeGenerationError
+    from tests.runtime_code_e2e_support import (
+        build_test_package,
+        install_test_package,
+        open_test_capability,
+    )
+
+    package = build_test_package(tmp_path / "package")
+    trusted_base, runtime_root, _installer = install_test_package(tmp_path, package)
+    capability = open_test_capability(
+        trusted_base=trusted_base,
+        runtime_root=runtime_root,
+        package=package,
+    )
+    trusted_base.chmod(0o777)
+    try:
+        with pytest.raises(RuntimeCodeGenerationError, match="authority path"):
+            capability.require_live()
+    finally:
+        capability.close()

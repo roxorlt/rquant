@@ -156,13 +156,17 @@ class RuntimeCodeGenerationCapability:
         loaded: LoadedRuntimeCodeGeneration,
         pointer_lease: SecureRegularFileLease,
         artifact_leases: tuple[SecureRegularFileLease, ...],
-        reverify: Callable[[], LoadedRuntimeCodeGeneration],
+        require_authority_paths: Callable[[], None],
+        require_exact_tree: Callable[[], None],
+        require_current_promotion: Callable[[], None],
         audit_events: tuple[str, ...],
     ) -> None:
         self.loaded = loaded
         self._pointer_lease = pointer_lease
         self._artifact_leases = artifact_leases
-        self._reverify = reverify
+        self._require_authority_paths = require_authority_paths
+        self._require_exact_tree = require_exact_tree
+        self._require_current_promotion = require_current_promotion
         self._audit_events = audit_events
         self._execution_binding_digest: str | None = None
         self._closed = False
@@ -191,8 +195,14 @@ class RuntimeCodeGenerationCapability:
             raise RuntimeCodeGenerationError("runtime generation selection changed")
         for lease in self._artifact_leases:
             lease.require_unchanged()
-        if self._reverify().evidence != self.evidence:
-            raise RuntimeCodeGenerationError("runtime generation evidence changed")
+        self._require_authority_paths()
+        self._require_exact_tree()
+        try:
+            self._require_current_promotion()
+        except RuntimeCodeTrustError as exc:
+            raise RuntimeCodeGenerationError(
+                "runtime generation promotion is no longer current"
+            ) from exc
 
     def _mark_verified_execution(self, binding_digest: str) -> None:
         """Record a child execution only after its generation receipt was verified."""
@@ -692,7 +702,11 @@ def _evidence(
     )
 
 
-def _walk_generation(generation_root: Path) -> tuple[tuple[Path, ...], tuple[Path, ...]]:
+def _walk_generation(
+    generation_root: Path,
+    *,
+    allowed_owner_uids: frozenset[int],
+) -> tuple[tuple[Path, ...], tuple[Path, ...]]:
     observed_files: list[Path] = []
     observed_directories: list[Path] = []
     for directory, directories, files in os.walk(generation_root, topdown=True, followlinks=False):
@@ -701,6 +715,7 @@ def _walk_generation(generation_root: Path) -> tuple[tuple[Path, ...], tuple[Pat
         if (
             not stat.S_ISDIR(base_stat.st_mode)
             or stat.S_ISLNK(base_stat.st_mode)
+            or base_stat.st_uid not in allowed_owner_uids
             or base_stat.st_mode & 0o022
         ):
             raise RuntimeCodeGenerationError("runtime generation directory is unsafe")
@@ -710,6 +725,7 @@ def _walk_generation(generation_root: Path) -> tuple[tuple[Path, ...], tuple[Pat
             if (
                 not stat.S_ISDIR(child_stat.st_mode)
                 or stat.S_ISLNK(child_stat.st_mode)
+                or child_stat.st_uid not in allowed_owner_uids
                 or child_stat.st_mode & 0o022
             ):
                 raise RuntimeCodeGenerationError("runtime generation contains a special directory")
@@ -720,6 +736,30 @@ def _walk_generation(generation_root: Path) -> tuple[tuple[Path, ...], tuple[Pat
         tuple(sorted(observed_files, key=lambda path: path.as_posix())),
         tuple(sorted(observed_directories, key=lambda path: path.as_posix())),
     )
+
+
+def _require_exact_generation_tree(
+    generation_root: Path,
+    manifest: RuntimeCodeGenerationManifest,
+    *,
+    expected_uid: int,
+) -> None:
+    expected_paths = {artifact.path for artifact in manifest.artifacts}
+    expected_paths.add("generation-manifest.json")
+    expected_directories: set[str] = set()
+    for path in expected_paths:
+        parent = PurePosixPath(path).parent
+        while parent != PurePosixPath("."):
+            expected_directories.add(parent.as_posix())
+            parent = parent.parent
+    observed_files, observed_directories = _walk_generation(
+        generation_root,
+        allowed_owner_uids=frozenset({0, expected_uid}),
+    )
+    if {path.as_posix() for path in observed_files} != expected_paths or {
+        path.as_posix() for path in observed_directories
+    } != expected_directories:
+        raise RuntimeCodeGenerationError("runtime generation artifact table is incomplete")
 
 
 def _require_published_generation(
@@ -741,7 +781,10 @@ def _require_published_generation(
         while parent != PurePosixPath("."):
             expected_directories.add(parent.as_posix())
             parent = parent.parent
-    observed_files, observed_directories = _walk_generation(generation_root)
+    observed_files, observed_directories = _walk_generation(
+        generation_root,
+        allowed_owner_uids=frozenset({0, expected_uid}),
+    )
     if {path.as_posix() for path in observed_files} != expected_paths or {
         path.as_posix() for path in observed_directories
     } != expected_directories:
@@ -808,19 +851,11 @@ def require_attested_runtime_generation(
         )
         if manifest.generation_id != generation_id:
             raise RuntimeCodeGenerationError("runtime generation id does not match pointer")
-        expected_paths = {artifact.path for artifact in manifest.artifacts}
-        expected_paths.add("generation-manifest.json")
-        expected_directories: set[str] = set()
-        for path in expected_paths:
-            parent = PurePosixPath(path).parent
-            while parent != PurePosixPath("."):
-                expected_directories.add(parent.as_posix())
-                parent = parent.parent
-        observed_files, observed_directories = _walk_generation(generation_root)
-        if {path.as_posix() for path in observed_files} != expected_paths or {
-            path.as_posix() for path in observed_directories
-        } != expected_directories:
-            raise RuntimeCodeGenerationError("runtime generation artifact table is incomplete")
+        _require_exact_generation_tree(
+            generation_root,
+            manifest,
+            expected_uid=expected_uid,
+        )
         payloads: dict[str, bytes] = {}
         for artifact in manifest.artifacts:
             payload = _read_generation_file(
@@ -942,6 +977,44 @@ def open_attested_runtime_generation(
         )
 
     loaded = reverify()
+    manifest_bytes = canonical_model_json_bytes(loaded.manifest)
+
+    def require_authority_paths() -> None:
+        try:
+            selected = _read_pointer(
+                runtime_root,
+                trusted_base=trusted_base,
+                name="current",
+                expected_uid=expected_uid,
+                expected_gid=expected_gid,
+            )
+            observed_manifest = _read_generation_file(
+                loaded.generation_root / "generation-manifest.json",
+                trusted_base=trusted_base,
+                expected_uid=expected_uid,
+                expected_gid=expected_gid,
+                max_bytes=_MAX_AUTHORITY_BYTES,
+            )
+        except (AuthorityPathSecurityError, OSError) as exc:
+            raise RuntimeCodeGenerationError(
+                "runtime generation authority path is unsafe"
+            ) from exc
+        if (
+            selected != loaded.evidence.generation_id
+            or observed_manifest != manifest_bytes
+        ):
+            raise RuntimeCodeGenerationError("runtime generation authority path changed")
+
+    def require_exact_tree() -> None:
+        _require_exact_generation_tree(
+            loaded.generation_root,
+            loaded.manifest,
+            expected_uid=loaded.material_uid,
+        )
+
+    def require_current_promotion() -> None:
+        promotion_trust.require_current_receipt(receipt=loaded.promotion_receipt)
+
     pointer_lease: SecureRegularFileLease | None = None
     artifact_leases: list[SecureRegularFileLease] = []
     try:
@@ -956,7 +1029,6 @@ def open_attested_runtime_generation(
         expected_pointer = f"{loaded.evidence.generation_id}\n".encode("ascii")
         if pointer_lease.read_all(max_bytes=_POINTER_BYTES) != expected_pointer:
             raise RuntimeCodeGenerationError("runtime generation changed while opening")
-        manifest_bytes = canonical_model_json_bytes(loaded.manifest)
         generation_files = [
             ("generation-manifest.json", 0o444, manifest_bytes),
         ]
@@ -994,7 +1066,9 @@ def open_attested_runtime_generation(
             loaded=loaded,
             pointer_lease=pointer_lease,
             artifact_leases=tuple(artifact_leases),
-            reverify=reverify,
+            require_authority_paths=require_authority_paths,
+            require_exact_tree=require_exact_tree,
+            require_current_promotion=require_current_promotion,
             audit_events=(
                 "pointer-verified",
                 "attestation-verified",

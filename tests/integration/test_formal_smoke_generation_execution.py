@@ -626,11 +626,16 @@ def test_receipt_fd_holder_times_out_reaps_process_group_and_cleans_staging(
         )
 
     started = time.monotonic()
-    with pytest.raises(FormalSmokeExecutionError, match="deadline"):
+    with pytest.raises(FormalSmokeExecutionError, match="deadline") as raised:
         _run(tmp_path, exchange=exchange)
     elapsed = time.monotonic() - started
 
     assert elapsed < 2
+    assert str(raised.value) == (
+        "formal smoke child deadline expired "
+        "(phase=awaiting_receipt_eof request_sent=true receipt_bytes=0 "
+        "receipt_eof=false status_reported=true)"
+    )
     identities = tuple(
         tuple(int(value) for value in line.split(":"))
         for line in identity_path.read_text(encoding="ascii").splitlines()
