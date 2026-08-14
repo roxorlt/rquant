@@ -484,7 +484,6 @@ def test_darwin_registration_rejects_hooks_before_initialized_queue_side_effects
 
 @pytest.mark.parametrize("hook_kind", ("trace", "profile", "both"))
 @pytest.mark.parametrize("activation_boundary", ("control", "observation"))
-@DARWIN_KQUEUE_TEST
 def test_darwin_register_root_rechecks_hooks_after_registration_handoffs(
     monkeypatch: pytest.MonkeyPatch,
     hook_kind: str,
@@ -542,13 +541,18 @@ def test_darwin_register_root_rechecks_hooks_after_registration_handoffs(
     tracker._queue = Queue()
     tracker._owns_queue = True
     monkeypatch.setattr(contained, "_darwin_process_observation", observe)
-    monkeypatch.setattr(contained.select, "kevent", lambda *_args, **_kwargs: object())
-    monkeypatch.setattr(contained.select, "KQ_FILTER_PROC", 1)
-    monkeypatch.setattr(contained.select, "KQ_EV_ADD", 2)
-    monkeypatch.setattr(contained.select, "KQ_EV_ENABLE", 4)
-    monkeypatch.setattr(contained.select, "KQ_EV_CLEAR", 8)
-    monkeypatch.setattr(contained.select, "KQ_NOTE_FORK", 16)
-    monkeypatch.setattr(contained.select, "KQ_NOTE_EXIT", 32)
+    monkeypatch.setattr(
+        contained.select,
+        "kevent",
+        lambda *_args, **_kwargs: object(),
+        raising=False,
+    )
+    monkeypatch.setattr(contained.select, "KQ_FILTER_PROC", 1, raising=False)
+    monkeypatch.setattr(contained.select, "KQ_EV_ADD", 2, raising=False)
+    monkeypatch.setattr(contained.select, "KQ_EV_ENABLE", 4, raising=False)
+    monkeypatch.setattr(contained.select, "KQ_EV_CLEAR", 8, raising=False)
+    monkeypatch.setattr(contained.select, "KQ_NOTE_FORK", 16, raising=False)
+    monkeypatch.setattr(contained.select, "KQ_NOTE_EXIT", 32, raising=False)
     monkeypatch.setattr(contained.threading, "Thread", Thread)
     try:
         _clear_execution_hooks()
@@ -1444,7 +1448,6 @@ def test_darwin_track_direct_call_rejects_hooks_before_state_changes(
 
 
 @pytest.mark.parametrize("hook_kind", ("trace", "profile", "both"))
-@DARWIN_KQUEUE_TEST
 def test_darwin_register_root_reports_startup_thread_hooks(
     monkeypatch: pytest.MonkeyPatch,
     hook_kind: str,
@@ -1492,13 +1495,18 @@ def test_darwin_register_root_reports_startup_thread_hooks(
     tracker._queue = Queue()
     tracker._owns_queue = True
     monkeypatch.setattr(contained, "_darwin_process_observation", observe)
-    monkeypatch.setattr(contained.select, "kevent", lambda *_args, **_kwargs: object())
-    monkeypatch.setattr(contained.select, "KQ_FILTER_PROC", 1)
-    monkeypatch.setattr(contained.select, "KQ_EV_ADD", 2)
-    monkeypatch.setattr(contained.select, "KQ_EV_ENABLE", 4)
-    monkeypatch.setattr(contained.select, "KQ_EV_CLEAR", 8)
-    monkeypatch.setattr(contained.select, "KQ_NOTE_FORK", 16)
-    monkeypatch.setattr(contained.select, "KQ_NOTE_EXIT", 32)
+    monkeypatch.setattr(
+        contained.select,
+        "kevent",
+        lambda *_args, **_kwargs: object(),
+        raising=False,
+    )
+    monkeypatch.setattr(contained.select, "KQ_FILTER_PROC", 1, raising=False)
+    monkeypatch.setattr(contained.select, "KQ_EV_ADD", 2, raising=False)
+    monkeypatch.setattr(contained.select, "KQ_EV_ENABLE", 4, raising=False)
+    monkeypatch.setattr(contained.select, "KQ_EV_CLEAR", 8, raising=False)
+    monkeypatch.setattr(contained.select, "KQ_NOTE_FORK", 16, raising=False)
+    monkeypatch.setattr(contained.select, "KQ_NOTE_EXIT", 32, raising=False)
     try:
         threading.excepthook = capture_uncaught
         threading.settrace(trace_hook if hook_kind in {"trace", "both"} else None)
@@ -1620,7 +1628,6 @@ def test_darwin_track_preserves_first_error_across_later_control_failure(
 
 @pytest.mark.parametrize("hook_kind", ("none", "trace", "profile", "both"))
 @pytest.mark.parametrize("activation_boundary", ("control", "inventory"))
-@DARWIN_KQUEUE_TEST
 def test_darwin_track_rechecks_hooks_after_kernel_handoffs(
     monkeypatch: pytest.MonkeyPatch,
     hook_kind: str,
@@ -1686,8 +1693,8 @@ def test_darwin_track_rechecks_hooks_after_kernel_handoffs(
     tracker._known[root.pid] = root
     tracker._registered.add(root.pid)
     tracker._deadline = time.monotonic() + 1
-    monkeypatch.setattr(contained.select, "KQ_NOTE_FORK", Event.fflags)
-    monkeypatch.setattr(contained.select, "KQ_NOTE_TRACKERR", 32)
+    monkeypatch.setattr(contained.select, "KQ_NOTE_FORK", Event.fflags, raising=False)
+    monkeypatch.setattr(contained.select, "KQ_NOTE_TRACKERR", 32, raising=False)
     monkeypatch.setattr(contained, "_darwin_process_inventory", inventory)
     monkeypatch.setattr(contained, "_discover_descendants", discover)
     expected_known = dict(tracker._known)

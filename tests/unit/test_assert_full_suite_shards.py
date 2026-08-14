@@ -6,6 +6,8 @@ import json
 import os
 import re
 import stat
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -35,6 +37,36 @@ SENTINEL_ENVIRONMENT = {
     "GITHUB_ACTIONS": "github-actions-sentinel",
     "RUNNER_TEMP": "runner-temp-sentinel",
 }
+
+LINUX_DARWIN_CONTRACT_NODEIDS = (
+    "tests/unit/test_contained_subprocess.py::test_darwin_registration_rejects_hooks_before_initialized_queue_side_effects",
+    "tests/unit/test_contained_subprocess.py::test_darwin_register_root_rechecks_hooks_after_registration_handoffs",
+    "tests/unit/test_contained_subprocess.py::test_darwin_register_root_rejects_non_pristine_tracker_without_side_effects",
+    "tests/unit/test_contained_subprocess.py::test_darwin_register_root_serializes_concurrent_callers",
+    "tests/unit/test_contained_subprocess.py::test_darwin_register_root_discards_tainted_preinitialized_queue_for_retry",
+    "tests/unit/test_contained_subprocess.py::test_darwin_register_root_retains_live_failed_start_and_first_error",
+    "tests/unit/test_contained_subprocess.py::test_darwin_close_reports_join_error_after_safe_queue_cleanup",
+    "tests/unit/test_contained_subprocess.py::test_darwin_close_retains_owner_until_thread_stop_is_verified",
+    "tests/unit/test_contained_subprocess.py::test_darwin_failed_preinitialized_queue_close_blocks_registration_until_retry",
+    "tests/unit/test_contained_subprocess.py::test_darwin_registration_reentrant_close_fails_and_rolls_back",
+    "tests/unit/test_contained_subprocess.py::test_darwin_poll_rejects_hooks_at_every_state_handoff",
+    "tests/unit/test_contained_subprocess.py::test_darwin_registration_rechecks_deadline_after_every_handoff",
+    "tests/unit/test_contained_subprocess.py::test_darwin_track_direct_call_rejects_hooks_before_state_changes",
+    "tests/unit/test_contained_subprocess.py::test_darwin_register_root_reports_startup_thread_hooks",
+    "tests/unit/test_contained_subprocess.py::test_darwin_track_stops_before_next_control_when_hook_activates",
+    "tests/unit/test_contained_subprocess.py::test_darwin_track_preserves_first_error_across_later_control_failure",
+    "tests/unit/test_contained_subprocess.py::test_darwin_track_rechecks_hooks_after_kernel_handoffs",
+    "tests/unit/test_contained_subprocess.py::test_kqueue_acquisition_accepts_no_execution_hooks_and_rejects_both",
+    "tests/unit/test_contained_subprocess.py::test_darwin_background_capable_command_is_rejected_before_spawn",
+    "tests/unit/test_contained_subprocess.py::test_darwin_native_detacher_is_refused_before_root_can_fork",
+    "tests/unit/test_contained_subprocess.py::test_darwin_pipe_marker_survives_missing_intermediate_and_reparent",
+    "tests/unit/test_contained_subprocess.py::test_darwin_tracker_close_joins_before_closing_live_kqueue",
+    "tests/unit/test_contained_subprocess.py::test_darwin_tracker_retains_queue_after_persistent_close_failure",
+    "tests/unit/test_contained_subprocess.py::test_darwin_tracker_keeps_pipe_marked_grandchild_after_parent_chain_breaks",
+    "tests/unit/test_contained_subprocess.py::test_darwin_pipe_identity_remains_anchored_through_final_inventory",
+    "tests/unit/test_contained_subprocess.py::test_darwin_anchor_dup_is_owned_before_inheritable_update",
+    "tests/unit/test_lab_launchd.py::test_lab_launchd_plists_pass_plutil_lint",
+)
 
 
 def _repository_for_manifest(root: Path) -> Path:
@@ -178,6 +210,35 @@ assert settings.log_dir == root / "logs"
     )
 
 
+def _assert_linux_darwin_contract(repository_root: Path) -> None:
+    command = (
+        "import sys; "
+        "sys.platform = 'linux'; "
+        "import pytest; "
+        "raise SystemExit(pytest.main(sys.argv[1:]))"
+    )
+    with shards._isolated_pytest_environment() as environment:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                command,
+                "--noconftest",
+                "-q",
+                *LINUX_DARWIN_CONTRACT_NODEIDS,
+            ],
+            cwd=repository_root,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+    output = completed.stdout + completed.stderr
+    assert completed.returncode == 0, output
+    assert "18 passed, 48 skipped" in output
+
+
 def test_validator_aggregates_real_testcases_and_skips(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -305,6 +366,7 @@ def test_clean_environment_aggregate_uses_shared_private_collect_setup(
         for line in second_environment.read_text(encoding="utf-8").splitlines()
     )
     assert second["RQUANT_CI_ROOT"] != prepared["RQUANT_CI_ROOT"]
+    _assert_linux_darwin_contract(Path(__file__).parents[2])
 
 
 @pytest.mark.parametrize("outcome", ("failure", "error"))

@@ -178,10 +178,14 @@ def test_real_worktree_launcher_rejects_symlinked_venv_before_config(
     assert "relative-data-must-not-be-read" not in output
 
 
-@pytest.mark.skipif(sys.platform != "darwin", reason="plutil is a Darwin tool")
 def test_lab_launchd_plists_pass_plutil_lint() -> None:
     paths = sorted(LAUNCHD_DIR.glob("com.roxor.rquant-lab-*.plist"))
     assert len(paths) == 3
+    if sys.platform != "darwin":
+        for path in paths:
+            with path.open("rb") as stream:
+                plistlib.load(stream)
+        return
     result = subprocess.run(
         ["plutil", "-lint", *(str(path) for path in paths)],
         capture_output=True,
