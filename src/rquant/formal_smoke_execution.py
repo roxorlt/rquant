@@ -9,6 +9,7 @@ import selectors
 import signal
 import stat
 import tempfile
+import threading
 import time
 from collections.abc import Callable, Mapping
 from contextlib import suppress
@@ -107,6 +108,10 @@ def _exchange_formal_smoke_child(
 ) -> FormalSmokeChildProcessResult:
     if not math.isfinite(deadline_monotonic) or time.monotonic() >= deadline_monotonic:
         raise FormalSmokeExecutionError("formal smoke child deadline expired")
+    if threading.active_count() != 1:
+        raise FormalSmokeExecutionError(
+            "formal smoke descriptor fork requires a single-threaded launcher process"
+        )
     request_read, request_write = os.pipe()
     receipt_read, receipt_write = os.pipe()
     try:

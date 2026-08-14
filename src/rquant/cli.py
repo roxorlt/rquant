@@ -1556,7 +1556,6 @@ def cmd_formal_smoke_replay(args: argparse.Namespace) -> int:
     )
     from rquant.formal_smoke_protocol import FormalSmokeBootstrapReference
 
-    setup_logging()
     try:
         capability = open_formal_runtime_capability(
             configuration_path=args.runtime_code_config,

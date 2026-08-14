@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import ast
+import inspect
 import json
+import os
 import subprocess
 import sys
 import time
+from datetime import date
 from pathlib import Path, PurePosixPath
 from xml.etree import ElementTree
 
@@ -536,6 +539,72 @@ def test_real_generation_exact_nodes_freeze_probe_and_180_second_bound() -> None
     success = ast.unparse(exact_tests[_EXACT_TEST_NAMES[0]])
     assert "('release/runtime-site-packages', 'release/src')" in success
     assert "generation.provenance_probe" in success
+
+
+def test_real_generation_outer_cli_isolated_from_authority_threads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests import formal_smoke_real_generation_support as support
+
+    captured: dict[str, object] = {}
+
+    def run_outer(
+        arguments: tuple[str, ...],
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        captured["arguments"] = arguments
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(arguments, 0, '{"status":"ok"}\n', "")
+
+    monkeypatch.setattr(support.subprocess, "run", run_outer)
+    monkeypatch.setattr(
+        "rquant.cli.main",
+        lambda: pytest.fail("formal smoke outer CLI ran in the authority thread process"),
+    )
+    formal_input = support.FormalSmokeInput(
+        strategy="n_shape",
+        start_date=date(2026, 7, 14),
+        end_date=date(2026, 7, 14),
+        audit_run_id="a" * 64,
+        dataset_snapshot_id="b" * 64,
+        dataset_binding_hash="c" * 64,
+    )
+
+    invocation = support.invoke_outer_formal_smoke_cli_from_checkout_b(
+        bootstrap_config=tmp_path / "bootstrap.json",
+        trusted_base=tmp_path,
+        output=tmp_path / "output",
+        formal_input=formal_input,
+        child_environment={"RQUANT_DISABLE_DOTENV": "1"},
+        timeout_seconds=90,
+    )
+
+    arguments = captured["arguments"]
+    assert isinstance(arguments, tuple)
+    assert arguments[:3] == (sys.executable, "-I", "-c")
+    assert "from rquant import cli" in arguments[3]
+    assert arguments[4] == os.fspath(Path(__file__).parents[2] / "src")
+    assert captured["capture_output"] is True
+    assert captured["text"] is True
+    assert captured["check"] is False
+    assert captured["timeout"] <= 120
+    environment = captured["env"]
+    assert isinstance(environment, dict)
+    assert environment["RQUANT_DISABLE_DOTENV"] == "1"
+    assert not any(
+        name.startswith(("GIT_", "PYTHON", "DYLD_", "LD_")) for name in environment
+    )
+    assert invocation.exit_code == 0
+    assert invocation.stdout == '{"status":"ok"}'
+
+
+def test_formal_smoke_cli_does_not_start_async_logging_before_descriptor_exec() -> None:
+    from rquant.cli import cmd_formal_smoke_replay
+
+    source = inspect.getsource(cmd_formal_smoke_replay)
+
+    assert "setup_logging" not in source
 
 
 def test_real_generation_exact_ci_job_is_no_skip_and_redacted() -> None:

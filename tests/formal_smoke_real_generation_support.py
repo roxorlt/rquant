@@ -14,7 +14,7 @@ import sysconfig
 import tarfile
 import threading
 from collections.abc import Iterator, Mapping
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path, PurePosixPath
@@ -599,6 +599,20 @@ _PROVENANCE_PROBE = "\n".join(
     )
 )
 
+_OUTER_CHECKOUT_CLI_BOOTSTRAP = "\n".join(
+    (
+        "import os, sys",
+        "source_root = os.path.realpath(sys.argv[1])",
+        "sys.argv = sys.argv[2:]",
+        "sys.path.insert(0, source_root)",
+        "from rquant import cli",
+        "module_path = os.path.realpath(cli.__file__)",
+        "if os.path.commonpath((module_path, source_root)) != source_root:",
+        "    raise RuntimeError('formal smoke outer CLI escaped checkout B')",
+        "raise SystemExit(cli.main())",
+    )
+)
+
 
 def probe_installed_generation_provenance(
     *,
@@ -907,9 +921,16 @@ def invoke_outer_formal_smoke_cli_from_checkout_b(
     child_environment: Mapping[str, str],
     timeout_seconds: float,
 ) -> CliInvocation:
-    from rquant.cli import main
-
-    arguments = [
+    if not 0 < timeout_seconds <= 105:
+        raise ValueError("formal smoke child timeout must be in (0, 105]")
+    source_root = Path(__file__).resolve().parents[1]
+    source_package = source_root / "src"
+    arguments = (
+        sys.executable,
+        "-I",
+        "-c",
+        _OUTER_CHECKOUT_CLI_BOOTSTRAP,
+        os.fspath(source_package),
         "rquant",
         "formal-smoke-replay",
         "--strategy",
@@ -936,27 +957,39 @@ def invoke_outer_formal_smoke_cli_from_checkout_b(
         str(os.getuid()),
         "--runtime-code-authority-gid",
         str(os.getgid()),
-    ]
-    old_argv = sys.argv
-    old_environment = {name: os.environ.get(name) for name in child_environment}
-    stdout = io.StringIO()
-    stderr = io.StringIO()
+    )
+    routing_prefixes = ("GIT_", "PYTHON", "DYLD_", "LD_")
+    if any(name.startswith(routing_prefixes) for name in child_environment):
+        raise ValueError("formal smoke checkout environment contains a routing variable")
+    environment = {
+        name: value
+        for name, value in os.environ.items()
+        if not name.startswith(routing_prefixes)
+    }
+    environment.update(child_environment)
     try:
-        sys.argv = arguments
-        os.environ.update(child_environment)
-        with redirect_stdout(stdout), redirect_stderr(stderr):
-            exit_code = main()
-    finally:
-        sys.argv = old_argv
-        for name, value in old_environment.items():
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
+        completed = subprocess.run(
+            arguments,
+            cwd=source_root,
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds + 15,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stderr = exc.stderr or ""
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", errors="replace")
+        return CliInvocation(
+            exit_code=124,
+            stdout="",
+            stderr=f"{stderr}formal smoke outer CLI deadline expired\n",
+        )
     return CliInvocation(
-        exit_code=exit_code,
-        stdout=stdout.getvalue().strip(),
-        stderr=stderr.getvalue(),
+        exit_code=completed.returncode,
+        stdout=completed.stdout.strip(),
+        stderr=completed.stderr,
     )
 
 

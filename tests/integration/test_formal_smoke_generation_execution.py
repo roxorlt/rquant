@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import os
+import threading
 import time
 from contextlib import suppress
 from datetime import date
@@ -380,6 +381,35 @@ def test_receipt_fd_holder_times_out_reaps_process_group_and_cleans_staging(
     assert identities[1][1] == direct_children[0]
     assert not list((tmp_path / "output").glob("strategy_lab_runs/*"))
     assert not list((tmp_path / "output").glob(".formal-smoke-*"))
+
+
+def test_formal_smoke_child_fails_before_fork_from_multithreaded_process() -> None:
+    from rquant.formal_smoke_execution import (
+        FormalSmokeExecutionError,
+        _exchange_formal_smoke_child,
+    )
+
+    stop = threading.Event()
+    ready = threading.Event()
+
+    def hold_thread() -> None:
+        ready.set()
+        stop.wait(timeout=5)
+
+    thread = threading.Thread(target=hold_thread, name="formal-smoke-threat-model")
+    thread.start()
+    try:
+        assert ready.wait(timeout=1)
+        with pytest.raises(FormalSmokeExecutionError, match="single-threaded"):
+            _exchange_formal_smoke_child(
+                object(),  # type: ignore[arg-type]
+                b"{}",
+                deadline_monotonic=time.monotonic() + 1,
+            )
+    finally:
+        stop.set()
+        thread.join(timeout=1)
+    assert not thread.is_alive()
 
 
 def test_publication_directory_swap_before_link_fails_closed_in_both_directories(
