@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -1041,6 +1042,25 @@ def test_legacy_deployer_installs_runtime_slices_with_systemd_units() -> None:
     assert "*.{service,timer,socket,slice}" in deployer
 
 
+def test_key_fixture_resolves_openssl_from_linux_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        shutil,
+        "which",
+        lambda name: "/usr/bin/openssl" if name == "openssl" else None,
+    )
+
+    assert _fixture_openssl_binary() == "/usr/bin/openssl"
+
+
+def _fixture_openssl_binary() -> str:
+    binary = shutil.which("openssl")
+    if binary is None:
+        pytest.fail("openssl is required by the runtime infra installer fixture")
+    return binary
+
+
 def _provision_highwater_key_material(root: Path) -> None:
     # macOS creates direct /tmp children with gid 0 even for an unprivileged
     # owner.  Test mode deliberately validates the invoking uid/effective gid,
@@ -1050,7 +1070,7 @@ def _provision_highwater_key_material(root: Path) -> None:
     key_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     private_key = key_dir / "hw-v1.private.pem"
     subprocess.run(
-        ["/opt/homebrew/bin/openssl", "genpkey", "-algorithm", "ED25519", "-out", str(private_key)],
+        [_fixture_openssl_binary(), "genpkey", "-algorithm", "ED25519", "-out", str(private_key)],
         check=True,
         capture_output=True,
     )
@@ -1074,7 +1094,7 @@ def _provision_highwater_key_material(root: Path) -> None:
     canvas_private = canvas_dir / "canvas-v1.private.pem"
     subprocess.run(
         [
-            "/opt/homebrew/bin/openssl",
+            _fixture_openssl_binary(),
             "genpkey",
             "-algorithm",
             "ED25519",
@@ -1102,7 +1122,7 @@ def _provision_highwater_key_material(root: Path) -> None:
     shadow_private = shadow_dir / "shadow-v1.private.pem"
     subprocess.run(
         [
-            "/opt/homebrew/bin/openssl",
+            _fixture_openssl_binary(),
             "genpkey",
             "-algorithm",
             "ED25519",
@@ -1148,7 +1168,7 @@ def _provision_highwater_key_material(root: Path) -> None:
     daily_private = daily_dir / "daily-v1.private.pem"
     subprocess.run(
         [
-            "/opt/homebrew/bin/openssl",
+            _fixture_openssl_binary(),
             "genpkey",
             "-algorithm",
             "ED25519",
@@ -1178,7 +1198,7 @@ def _provision_highwater_key_material(root: Path) -> None:
 def _public_key(private_key: Path) -> str:
     result = subprocess.run(
         [
-            "/opt/homebrew/bin/openssl",
+            _fixture_openssl_binary(),
             "pkey",
             "-in",
             str(private_key),
@@ -1198,7 +1218,7 @@ def _rotate_highwater_key_material(root: Path, *, previous_manifest_hash: str) -
     active_private = key_dir / "hw-v2.private.pem"
     subprocess.run(
         [
-            "/opt/homebrew/bin/openssl",
+            _fixture_openssl_binary(),
             "genpkey",
             "-algorithm",
             "ED25519",
@@ -1238,7 +1258,7 @@ def _rotate_daily_key_material(
     active_private = key_dir / "daily-v2.private.pem"
     subprocess.run(
         [
-            "/opt/homebrew/bin/openssl",
+            _fixture_openssl_binary(),
             "genpkey",
             "-algorithm",
             "ED25519",
