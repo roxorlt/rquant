@@ -70,9 +70,8 @@ jobs:
 
       - name: SourceBroker V2 saga (51 tests)
         run: >-
-          uv run pytest -q
-          --basetemp="${RQUANT_CI_ROOT}/pt-source"
-          tests/unit/test_source_broker_v2.py
+          uv run pytest -q tests/unit/test_source_broker_v2.py
+          --basetemp="$TMPDIR/pt-source"
 
       - name: SourceBroker V2 frozen boundary
         run: uv run python scripts/source_broker_v2_frozen.py
