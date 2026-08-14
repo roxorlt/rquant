@@ -21,6 +21,10 @@ from rquant import contained_subprocess as contained
 _REAL_SIGNAL = signal.signal
 _REAL_PTHREAD_SIGMASK = getattr(signal, "pthread_sigmask", None)
 _MANAGED_TEST_SIGNALS = (signal.SIGINT, signal.SIGTERM)
+DARWIN_KQUEUE_TEST = pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Darwin kqueue contract",
+)
 
 
 def _prepare_unblocked_signal_host() -> tuple[
@@ -415,6 +419,7 @@ def test_linux_enable_subreaper_rejects_hooks_before_lock_and_prctl(
 
 @pytest.mark.parametrize("entrypoint", ("initialize", "register-process", "register-root"))
 @pytest.mark.parametrize("hook_kind", ("trace", "profile", "both"))
+@DARWIN_KQUEUE_TEST
 def test_darwin_registration_rejects_hooks_before_initialized_queue_side_effects(
     monkeypatch: pytest.MonkeyPatch,
     entrypoint: str,
@@ -479,6 +484,7 @@ def test_darwin_registration_rejects_hooks_before_initialized_queue_side_effects
 
 @pytest.mark.parametrize("hook_kind", ("trace", "profile", "both"))
 @pytest.mark.parametrize("activation_boundary", ("control", "observation"))
+@DARWIN_KQUEUE_TEST
 def test_darwin_register_root_rechecks_hooks_after_registration_handoffs(
     monkeypatch: pytest.MonkeyPatch,
     hook_kind: str,
@@ -592,6 +598,7 @@ def _assert_darwin_tracker_pristine(
     assert not getattr(tracker, "_cleanup_pending", False)
 
 
+@DARWIN_KQUEUE_TEST
 def test_darwin_register_root_rejects_non_pristine_tracker_without_side_effects(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -663,6 +670,7 @@ def test_darwin_register_root_rejects_non_pristine_tracker_without_side_effects(
     assert not tracker._stop.is_set()
 
 
+@DARWIN_KQUEUE_TEST
 def test_darwin_register_root_serializes_concurrent_callers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -757,6 +765,7 @@ def test_darwin_register_root_serializes_concurrent_callers(
 
 
 @pytest.mark.parametrize("failure_boundary", ("constructor", "start"))
+@DARWIN_KQUEUE_TEST
 def test_darwin_register_root_discards_tainted_preinitialized_queue_for_retry(
     monkeypatch: pytest.MonkeyPatch,
     failure_boundary: str,
@@ -829,6 +838,7 @@ def test_darwin_register_root_discards_tainted_preinitialized_queue_for_retry(
     _assert_darwin_tracker_pristine(tracker)
 
 
+@DARWIN_KQUEUE_TEST
 def test_darwin_register_root_retains_live_failed_start_and_first_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -905,6 +915,7 @@ def test_darwin_register_root_retains_live_failed_start_and_first_error(
     _assert_darwin_tracker_pristine(tracker)
 
 
+@DARWIN_KQUEUE_TEST
 def test_darwin_close_reports_join_error_after_safe_queue_cleanup() -> None:
     tracker = contained._DarwinKqueueProcessTracker()
     identity = contained.ProcessIdentity(101, (1, 0))
@@ -947,6 +958,7 @@ def test_darwin_close_reports_join_error_after_safe_queue_cleanup() -> None:
 
 
 @pytest.mark.parametrize("stop_state", ("alive", "unverifiable"))
+@DARWIN_KQUEUE_TEST
 def test_darwin_close_retains_owner_until_thread_stop_is_verified(
     stop_state: str,
 ) -> None:
@@ -1009,6 +1021,7 @@ def test_darwin_close_retains_owner_until_thread_stop_is_verified(
     _assert_darwin_tracker_pristine(tracker)
 
 
+@DARWIN_KQUEUE_TEST
 def test_darwin_failed_preinitialized_queue_close_blocks_registration_until_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1085,6 +1098,7 @@ def test_darwin_failed_preinitialized_queue_close_blocks_registration_until_retr
     _assert_darwin_tracker_pristine(tracker)
 
 
+@DARWIN_KQUEUE_TEST
 def test_darwin_registration_reentrant_close_fails_and_rolls_back(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1125,6 +1139,7 @@ def test_darwin_registration_reentrant_close_fails_and_rolls_back(
 
 @pytest.mark.parametrize("hook_kind", ("trace", "profile", "both"))
 @pytest.mark.parametrize("activation_boundary", ("entry", "wait-return"))
+@DARWIN_KQUEUE_TEST
 def test_darwin_poll_rejects_hooks_at_every_state_handoff(
     monkeypatch: pytest.MonkeyPatch,
     hook_kind: str,
@@ -1187,6 +1202,7 @@ def test_darwin_poll_rejects_hooks_at_every_state_handoff(
         ("thread-start", (3, 1, 1, 1, 1)),
     ),
 )
+@DARWIN_KQUEUE_TEST
 def test_darwin_registration_rechecks_deadline_after_every_handoff(
     monkeypatch: pytest.MonkeyPatch,
     boundary: str,
@@ -1376,6 +1392,7 @@ def test_linux_poll_without_hooks_still_inventories_and_binds_descendants(
 
 
 @pytest.mark.parametrize("hook_kind", ("trace", "profile", "both"))
+@DARWIN_KQUEUE_TEST
 def test_darwin_track_direct_call_rejects_hooks_before_state_changes(
     hook_kind: str,
 ) -> None:
@@ -1427,6 +1444,7 @@ def test_darwin_track_direct_call_rejects_hooks_before_state_changes(
 
 
 @pytest.mark.parametrize("hook_kind", ("trace", "profile", "both"))
+@DARWIN_KQUEUE_TEST
 def test_darwin_register_root_reports_startup_thread_hooks(
     monkeypatch: pytest.MonkeyPatch,
     hook_kind: str,
@@ -1519,6 +1537,7 @@ def test_darwin_register_root_reports_startup_thread_hooks(
     assert close_calls == 1
 
 
+@DARWIN_KQUEUE_TEST
 def test_darwin_track_stops_before_next_control_when_hook_activates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1562,6 +1581,7 @@ def test_darwin_track_stops_before_next_control_when_hook_activates(
 
 
 @pytest.mark.parametrize("error_timing", ("before", "during"))
+@DARWIN_KQUEUE_TEST
 def test_darwin_track_preserves_first_error_across_later_control_failure(
     error_timing: str,
 ) -> None:
@@ -1600,6 +1620,7 @@ def test_darwin_track_preserves_first_error_across_later_control_failure(
 
 @pytest.mark.parametrize("hook_kind", ("none", "trace", "profile", "both"))
 @pytest.mark.parametrize("activation_boundary", ("control", "inventory"))
+@DARWIN_KQUEUE_TEST
 def test_darwin_track_rechecks_hooks_after_kernel_handoffs(
     monkeypatch: pytest.MonkeyPatch,
     hook_kind: str,
