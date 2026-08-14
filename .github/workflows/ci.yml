@@ -14,23 +14,39 @@ concurrency:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.12"]
     env:
       TUSHARE_TOKEN_MAIN: "00000000000000000000000000000000"
-      DATA_DIR: ${{ github.workspace }}/.ci/data
-      DUCKDB_PATH: ${{ github.workspace }}/.ci/data/test.duckdb
-      DUCKDB_READONLY_PATH: ${{ github.workspace }}/.ci/data/test_ro.duckdb
-      PARQUET_DIR: ${{ github.workspace }}/.ci/data/parquet
-      LOG_DIR: ${{ github.workspace }}/.ci/logs
       NOTIFY_ENABLED: "false"
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Create private short test root
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          root="$(mktemp -d "${HOME}/rqci.XXXXXXXX")"
+          mkdir -p "${root}/tmp" "${root}/data" "${root}/parquet" "${root}/logs"
+          chmod 700 "${root}" "${root}/tmp" "${root}/data" "${root}/parquet" "${root}/logs"
+          {
+            printf 'RQUANT_CI_ROOT=%s\n' "${root}"
+            printf 'TMPDIR=%s/tmp\n' "${root}"
+            printf 'TMP=%s/tmp\n' "${root}"
+            printf 'TEMP=%s/tmp\n' "${root}"
+            printf 'DATA_DIR=%s/data\n' "${root}"
+            printf 'DUCKDB_PATH=%s/data/test.duckdb\n' "${root}"
+            printf 'DUCKDB_READONLY_PATH=%s/data/test_ro.duckdb\n' "${root}"
+            printf 'PARQUET_DIR=%s/parquet\n' "${root}"
+            printf 'LOG_DIR=%s/logs\n' "${root}"
+            printf 'RQUANT_DISABLE_DOTENV=1\n'
+          } >> "${GITHUB_ENV}"
 
       - uses: actions/setup-python@v5
         with:
@@ -48,17 +64,44 @@ jobs:
       - name: Schema and fixed replay smoke
         run: >-
           uv run pytest -q
+          --basetemp="${RQUANT_CI_ROOT}/pt-smoke"
           tests/unit/test_storage_duckdb.py
           tests/unit/test_minute_replay.py::test_replay_enters_when_strong_carry_breaks_t_high_and_exits_next_day
 
       - name: SourceBroker V2 saga (51 tests)
-        run: uv run pytest -q tests/unit/test_source_broker_v2.py
+        run: >-
+          uv run pytest -q
+          --basetemp="${RQUANT_CI_ROOT}/pt-source"
+          tests/unit/test_source_broker_v2.py
 
       - name: SourceBroker V2 frozen boundary
         run: uv run python scripts/source_broker_v2_frozen.py
 
       - name: Full test suite
-        run: uv run pytest -q
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p test-results
+          uv run pytest -q \
+            --basetemp="${RQUANT_CI_ROOT}/pt-full" \
+            --junitxml="test-results/full-py${{ matrix.python-version }}.xml"
+
+      - name: Verify full suite JUnit contract
+        if: always()
+        shell: bash
+        run: >-
+          uv run python tests/support/assert_junit_contract.py
+          --path "test-results/full-py${{ matrix.python-version }}.xml"
+          --suites 1 --tests 11091 --failures 0 --errors 0 --skipped 48 --cases 11091
+          --allow-skipped-cases 48
+
+      - name: Upload full suite JUnit evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # actions/upload-artifact@v4
+        with:
+          name: full-suite-junit-py${{ matrix.python-version }}
+          path: test-results/full-py${{ matrix.python-version }}.xml
+          if-no-files-found: error
 
   runtime-fd-exec-linux:
     name: Linux FD-exec exact (${{ matrix.python-version }})

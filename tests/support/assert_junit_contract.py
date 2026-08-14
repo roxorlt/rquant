@@ -44,6 +44,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--errors", type=int, required=True)
     parser.add_argument("--skipped", type=int, required=True)
     parser.add_argument("--cases", type=int, required=True)
+    parser.add_argument("--allow-skipped-cases", type=int)
     return parser.parse_args()
 
 
@@ -64,8 +65,16 @@ def main() -> None:
     cases = suite.findall("testcase")
     if len(cases) != args.cases:
         raise ValueError("JUnit testcase count differs from the CI contract")
+    skipped_cases = sum(bool(case.findall("skipped")) for case in cases)
+    if args.allow_skipped_cases is None:
+        if skipped_cases:
+            raise ValueError("JUnit testcase was skipped without explicit allowance")
+    elif args.allow_skipped_cases < 0:
+        raise ValueError("JUnit skipped-case allowance must be nonnegative")
+    elif skipped_cases != args.allow_skipped_cases:
+        raise ValueError("JUnit skipped testcase count differs from the allowance")
     for case in cases:
-        if case.findall("failure") or case.findall("error") or case.findall("skipped"):
+        if case.findall("failure") or case.findall("error"):
             raise ValueError("JUnit testcase is not a passing exact node")
 
 
