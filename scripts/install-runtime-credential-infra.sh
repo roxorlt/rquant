@@ -253,6 +253,24 @@ path_exists() {
     privileged /bin/test -e "$1"
 }
 
+test_stat_metadata() {
+    local macos_format="$1"
+    local linux_format="$2"
+    local path="$3"
+    case "$(/usr/bin/uname -s)" in
+        Darwin)
+            /usr/bin/stat -f "${macos_format}" "${path}"
+            ;;
+        Linux)
+            /usr/bin/stat -c "${linux_format}" "${path}"
+            ;;
+        *)
+            printf 'Unsupported test metadata platform\n' >&2
+            exit 1
+            ;;
+    esac
+}
+
 ensure_sudoers_directory() {
     if ! path_exists "${SUDOERS_DIR}"; then
         if [[ -n "${TEST_ROOT}" ]]; then
@@ -265,7 +283,7 @@ ensure_sudoers_directory() {
 
     local actual expected_owner mode
     if [[ -n "${TEST_ROOT}" ]]; then
-        actual="$(/usr/bin/stat -f '%u:%g:%Lp' "${SUDOERS_DIR}")"
+        actual="$(test_stat_metadata '%u:%g:%Lp' '%u:%g:%a' "${SUDOERS_DIR}")"
         expected_owner="$(/usr/bin/id -u):$(/usr/bin/id -g)"
     else
         actual="$(sudo /usr/bin/stat -c '%u:%g:%a' "${SUDOERS_DIR}")"
@@ -365,7 +383,7 @@ PY
 daily_authority_owner_and_mode() {
     local path="$1"
     if [[ -n "${TEST_ROOT}" ]]; then
-        /usr/bin/stat -f '%u:%g:%Lp:%l' "${path}"
+        test_stat_metadata '%u:%g:%Lp:%l' '%u:%g:%a:%h' "${path}"
     else
         sudo /usr/bin/stat -c '%u:%g:%a:%h' "${path}"
     fi
@@ -1224,7 +1242,7 @@ validate_metadata() {
     local label="$3"
     local actual expected_owner
     if [[ -n "${TEST_ROOT}" ]]; then
-        actual="$(/usr/bin/stat -f '%u:%g:%Lp' "${path}")"
+        actual="$(test_stat_metadata '%u:%g:%Lp' '%u:%g:%a' "${path}")"
         expected_owner="$(/usr/bin/id -u):$(/usr/bin/id -g)"
     else
         actual="$(sudo /usr/bin/stat -c '%u:%g:%a' "${path}")"
@@ -1341,7 +1359,7 @@ export_daily_public_keyring() {
 validate_highwater_public_keyring_metadata() {
     local actual expected_owner
     if [[ -n "${TEST_ROOT}" ]]; then
-        actual="$(/usr/bin/stat -f '%u:%g:%Lp' "${HIGHWATER_PUBLIC_KEYS_FILE}")"
+        actual="$(test_stat_metadata '%u:%g:%Lp' '%u:%g:%a' "${HIGHWATER_PUBLIC_KEYS_FILE}")"
         expected_owner="$(/usr/bin/id -u):$(/usr/bin/id -g)"
     else
         actual="$(sudo /usr/bin/stat -c '%u:%g:%a' "${HIGHWATER_PUBLIC_KEYS_FILE}")"
@@ -1357,7 +1375,7 @@ validate_highwater_public_keyring_metadata() {
 validate_canvas_public_keyring_metadata() {
     local actual expected_owner
     if [[ -n "${TEST_ROOT}" ]]; then
-        actual="$(/usr/bin/stat -f '%u:%g:%Lp' "${CANVAS_PUBLIC_KEYS_FILE}")"
+        actual="$(test_stat_metadata '%u:%g:%Lp' '%u:%g:%a' "${CANVAS_PUBLIC_KEYS_FILE}")"
         expected_owner="$(/usr/bin/id -u):$(/usr/bin/id -g)"
     else
         actual="$(sudo /usr/bin/stat -c '%u:%g:%a' "${CANVAS_PUBLIC_KEYS_FILE}")"
@@ -1373,7 +1391,7 @@ validate_canvas_public_keyring_metadata() {
 validate_shadow_public_keyring_metadata() {
     local actual expected_owner
     if [[ -n "${TEST_ROOT}" ]]; then
-        actual="$(/usr/bin/stat -f '%u:%g:%Lp' "${SHADOW_PUBLIC_KEYS_FILE}")"
+        actual="$(test_stat_metadata '%u:%g:%Lp' '%u:%g:%a' "${SHADOW_PUBLIC_KEYS_FILE}")"
         expected_owner="$(/usr/bin/id -u):$(/usr/bin/id -g)"
     else
         actual="$(sudo /usr/bin/stat -c '%u:%g:%a' "${SHADOW_PUBLIC_KEYS_FILE}")"
@@ -1389,7 +1407,7 @@ validate_shadow_public_keyring_metadata() {
 validate_daily_public_keyring_metadata() {
     local actual expected_owner
     if [[ -n "${TEST_ROOT}" ]]; then
-        actual="$(/usr/bin/stat -f '%u:%g:%Lp' "${DAILY_PUBLIC_KEYS_FILE}")"
+        actual="$(test_stat_metadata '%u:%g:%Lp' '%u:%g:%a' "${DAILY_PUBLIC_KEYS_FILE}")"
         expected_owner="$(/usr/bin/id -u):$(/usr/bin/id -g)"
     else
         actual="$(sudo /usr/bin/stat -c '%u:%g:%a' "${DAILY_PUBLIC_KEYS_FILE}")"
