@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import select
 import selectors
 import signal
 import stat
@@ -60,11 +61,12 @@ from rquant.strict_json import (
 _MAX_RECEIPT_BYTES = 8 * 1024 * 1024
 _SUPERVISOR_CLEANUP_SECONDS = 1.25
 _SUPERVISOR_OWNED_GRACE_SECONDS = 0.5
-_SUPERVISOR_OBSERVE_SECONDS = 0.01
 _SUPERVISOR_TEARDOWN_REQUEST = b"T"
+_SUPERVISOR_TEARDOWN_READY = b"K"
 _DESCRIPTOR_HANDOFF_BOOTSTRAP = "\n".join(
     (
         "import json, os, select, signal, sys, time",
+        "status_descriptor = -1",
         "def teardown_group():",
         "    signal.signal(signal.SIGTERM, signal.SIG_IGN)",
         "    try:",
@@ -72,6 +74,12 @@ _DESCRIPTOR_HANDOFF_BOOTSTRAP = "\n".join(
         "    except ProcessLookupError:",
         "        pass",
         "    time.sleep(0.25)",
+        "    if status_descriptor >= 0:",
+        "        try:",
+        "            os.write(status_descriptor, b'K')",
+        "        except OSError:",
+        "            pass",
+        "    time.sleep(0.75)",
         "    try:",
         "        os.killpg(0, signal.SIGKILL)",
         "    except ProcessLookupError:",
@@ -105,7 +113,6 @@ _DESCRIPTOR_HANDOFF_BOOTSTRAP = "\n".join(
         "            os.read(lifetime_descriptor, 1)",
         "            teardown_group()",
         "    os.write(status_descriptor, bytes((code,)))",
-        "    os.close(status_descriptor)",
         "    os.read(lifetime_descriptor, 1)",
         "    teardown_group()",
         "except BaseException:",
@@ -140,10 +147,15 @@ def _exit_code(return_code: int) -> int:
 
 
 class _SupervisorLifecycleState(StrEnum):
+    """The group identity remains anchored until the sole transition to REAPED."""
+
     RUNNING = "running"
     STATUS_REPORTED = "status_reported"
     TEARDOWN_REQUESTED = "teardown_requested"
+    TEARDOWN_READY = "teardown_ready"
+    FINAL_GROUP_KILL_SENT = "final_group_kill_sent"
     GROUP_IDENTITY_LOST = "group_identity_lost"
+    GROUP_SIGNAL_DENIED = "group_signal_denied"
     REAPED = "reaped"
 
 
@@ -254,37 +266,56 @@ def _reap_known_supervisor(
     return return_code
 
 
-def _kill_known_supervisor(process: _FormalSmokeChildProcess) -> PermissionError | None:
-    try:
-        os.kill(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        return None
-    except PermissionError as exc:
-        return exc
-    return None
-
-
-def _fallback_kill_supervisor_group(
+def _final_kill_supervisor_group(
     process: _FormalSmokeChildProcess,
 ) -> FormalSmokeCleanupError | None:
+    if (
+        process.state is _SupervisorLifecycleState.REAPED
+        or process.process.returncode is not None
+    ):
+        process.state = _SupervisorLifecycleState.REAPED
+        return FormalSmokeCleanupError(
+            "formal smoke supervisor was reaped before final group cleanup"
+        )
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:
         process.state = _SupervisorLifecycleState.GROUP_IDENTITY_LOST
-        permission_error = _kill_known_supervisor(process)
-        if permission_error is not None:
-            return FormalSmokeCleanupError(
-                "formal smoke supervisor PID cleanup permission denied after group ESRCH"
-            )
         return None
     except PermissionError:
-        process.state = _SupervisorLifecycleState.GROUP_IDENTITY_LOST
-        permission_error = _kill_known_supervisor(process)
-        detail = " and PID cleanup was also denied" if permission_error else ""
+        process.state = _SupervisorLifecycleState.GROUP_SIGNAL_DENIED
         return FormalSmokeCleanupError(
-            f"formal smoke supervisor group cleanup permission denied{detail}"
+            "formal smoke supervisor group cleanup permission denied"
         )
+    process.state = _SupervisorLifecycleState.FINAL_GROUP_KILL_SENT
     return None
+
+
+def _await_supervisor_teardown_ready(
+    process: _FormalSmokeChildProcess,
+    *,
+    deadline_monotonic: float,
+) -> bool:
+    if process.status_descriptor == -1:
+        return False
+    remaining = max(0.0, deadline_monotonic - time.monotonic())
+    if remaining == 0:
+        return False
+    try:
+        readable, _, _ = select.select(
+            (process.status_descriptor,),
+            (),
+            (),
+            remaining,
+        )
+        if not readable:
+            return False
+        ready = os.read(process.status_descriptor, 1) == _SUPERVISOR_TEARDOWN_READY
+        if ready:
+            process.state = _SupervisorLifecycleState.TEARDOWN_READY
+        return ready
+    except OSError:
+        return False
 
 
 def _cleanup_formal_smoke_supervisor(process: _FormalSmokeChildProcess) -> None:
@@ -309,33 +340,34 @@ def _cleanup_formal_smoke_supervisor(process: _FormalSmokeChildProcess) -> None:
         if request_delivered:
             process.state = _SupervisorLifecycleState.TEARDOWN_REQUESTED
 
-        observed_return_code: int | None = None
         owned_deadline = time.monotonic()
         if request_delivered:
             owned_deadline = min(
                 cleanup_deadline,
                 owned_deadline + _SUPERVISOR_OWNED_GRACE_SECONDS,
             )
-        while True:
-            observed_return_code = _observe_supervisor_without_reaping(process)
-            if observed_return_code is not None or time.monotonic() >= owned_deadline:
-                break
-            time.sleep(
-                min(
-                    _SUPERVISOR_OBSERVE_SECONDS,
-                    max(0.0, owned_deadline - time.monotonic()),
-                )
+            _await_supervisor_teardown_ready(
+                process,
+                deadline_monotonic=owned_deadline,
             )
 
-        supervisor_cleaned_group = request_delivered and observed_return_code == -signal.SIGKILL
-        if not supervisor_cleaned_group:
-            cleanup_error = _fallback_kill_supervisor_group(process)
+        observed_return_code = _observe_supervisor_without_reaping(process)
 
-        reaped_return_code = _reap_known_supervisor(
-            process,
-            deadline_monotonic=cleanup_deadline,
-        )
-        if supervisor_cleaned_group and reaped_return_code != observed_return_code:
+        cleanup_error = _final_kill_supervisor_group(process)
+        try:
+            reaped_return_code = _reap_known_supervisor(
+                process,
+                deadline_monotonic=cleanup_deadline,
+            )
+        except FormalSmokeCleanupError as reap_error:
+            if cleanup_error is not None:
+                raise cleanup_error from reap_error
+            raise
+        if (
+            cleanup_error is None
+            and observed_return_code is not None
+            and reaped_return_code != observed_return_code
+        ):
             cleanup_error = FormalSmokeCleanupError(
                 "formal smoke supervisor changed status while being reaped"
             )
@@ -431,22 +463,26 @@ def _exchange_formal_smoke_child(
             os.close(descriptor)
         raise
 
-    os.close(request_read)
-    os.close(receipt_write)
-    os.set_blocking(request_write, False)
-    os.set_blocking(receipt_read, False)
-    os.set_blocking(process.status_descriptor, False)
-    selector = selectors.DefaultSelector()
-    selector.register(request_write, selectors.EVENT_WRITE, "request")
-    selector.register(receipt_read, selectors.EVENT_READ, "receipt")
-    selector.register(process.status_descriptor, selectors.EVENT_READ, "status")
-    request_view = memoryview(request_bytes)
-    receipt = bytearray()
-    receipt_eof = False
-    status_bytes = bytearray()
-    child_exit_code: int | None = None
+    selector: selectors.BaseSelector | None = None
+    result: FormalSmokeChildProcessResult | None = None
     try:
         try:
+            os.close(request_read)
+            request_read = -1
+            os.close(receipt_write)
+            receipt_write = -1
+            os.set_blocking(request_write, False)
+            os.set_blocking(receipt_read, False)
+            os.set_blocking(process.status_descriptor, False)
+            selector = selectors.DefaultSelector()
+            selector.register(request_write, selectors.EVENT_WRITE, "request")
+            selector.register(receipt_read, selectors.EVENT_READ, "receipt")
+            selector.register(process.status_descriptor, selectors.EVENT_READ, "status")
+            request_view = memoryview(request_bytes)
+            receipt = bytearray()
+            receipt_eof = False
+            status_bytes = bytearray()
+            child_exit_code: int | None = None
             while child_exit_code is None or not receipt_eof or request_write != -1:
                 remaining = deadline_monotonic - time.monotonic()
                 if remaining <= 0:
@@ -478,20 +514,19 @@ def _exchange_formal_smoke_child(
                             continue
                         if chunk:
                             status_bytes.extend(chunk)
-                            if len(status_bytes) > 1:
+                            if len(status_bytes) != 1:
                                 raise FormalSmokeExecutionError(
                                     "formal smoke supervisor status is invalid"
                                 )
+                            selector.unregister(process.status_descriptor)
+                            child_exit_code = status_bytes[0]
+                            process.state = _SupervisorLifecycleState.STATUS_REPORTED
                             continue
                         selector.unregister(process.status_descriptor)
                         process.close_status()
-                        if len(status_bytes) != 1:
-                            raise FormalSmokeExecutionError(
-                                "formal smoke supervisor returned no status"
-                            )
-                        child_exit_code = status_bytes[0]
-                        process.state = _SupervisorLifecycleState.STATUS_REPORTED
-                        continue
+                        raise FormalSmokeExecutionError(
+                            "formal smoke supervisor returned no status"
+                        )
                     while True:
                         try:
                             chunk = os.read(
@@ -517,10 +552,19 @@ def _exchange_formal_smoke_child(
                 receipt_bytes=bytes(receipt),
             )
         finally:
-            selector.close()
-            for descriptor in (request_write, receipt_read):
-                with suppress(OSError):
-                    os.close(descriptor)
+            try:
+                if selector is not None:
+                    selector.close()
+            finally:
+                for descriptor in (
+                    request_read,
+                    request_write,
+                    receipt_read,
+                    receipt_write,
+                ):
+                    if descriptor != -1:
+                        with suppress(OSError):
+                            os.close(descriptor)
     except BaseException as exc:
         try:
             _cleanup_formal_smoke_supervisor(process)
@@ -528,6 +572,7 @@ def _exchange_formal_smoke_child(
             raise cleanup_exc from exc
         raise
     _cleanup_formal_smoke_supervisor(process)
+    assert result is not None
     return result
 
 

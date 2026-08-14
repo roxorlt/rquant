@@ -180,6 +180,162 @@ def _run(
     return capability, output, result
 
 
+def _pid_is_present(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _assert_pid_disappears(pid: int, *, timeout: float = 3.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _pid_is_present(pid):
+            return
+        time.sleep(0.01)
+    pytest.fail(f"formal smoke process {pid} survived lifecycle cleanup")
+
+
+def _emergency_reap_test_processes(
+    supervisor: subprocess.Popen[bytes] | None,
+    descendant_pid: int | None,
+) -> None:
+    # This runs only after assertions, so a product leak still fails the test.
+    if descendant_pid is not None:
+        with suppress(ProcessLookupError, PermissionError):
+            os.kill(descendant_pid, signal.SIGKILL)
+    if supervisor is not None:
+        with suppress(ProcessLookupError, PermissionError):
+            os.kill(supervisor.pid, signal.SIGKILL)
+        with suppress(ChildProcessError, subprocess.TimeoutExpired):
+            supervisor.wait(timeout=1)
+
+
+def _portable_lifecycle_spawn_factory(
+    execution_module: object,
+    *,
+    identity_path: Path,
+    tracked_descriptors: list[int],
+    supervisor_kills_only_itself: bool,
+):
+    real_pipe = os.pipe
+    real_close = os.close
+    spawned: list[subprocess.Popen[bytes]] = []
+    supervisor_final_signal = (
+        "os.kill(os.getpid(), signal.SIGKILL)"
+        if supervisor_kills_only_itself
+        else "os.killpg(0, signal.SIGKILL)"
+    )
+    supervisor_script = (
+        "import os, select, signal, subprocess, sys, time\n"
+        "identity_path = sys.argv[1]\n"
+        "control_descriptor = int(sys.argv[2])\n"
+        "status_descriptor = int(sys.argv[3])\n"
+        "request_descriptor = int(sys.argv[4])\n"
+        "receipt_descriptor = int(sys.argv[5])\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "descendant = subprocess.Popen((\n"
+        "    sys.executable, '-c',\n"
+        "    'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)',\n"
+        "))\n"
+        "with open(identity_path, 'w', encoding='ascii') as target:\n"
+        "    target.write(f'{os.getpid()}:{os.getpgrp()}\\n')\n"
+        "    target.write(f'{descendant.pid}:{os.getpgid(descendant.pid)}\\n')\n"
+        "def teardown_group():\n"
+        "    try:\n"
+        "        os.killpg(0, signal.SIGTERM)\n"
+        "    except ProcessLookupError:\n"
+        "        pass\n"
+        "    time.sleep(0.1)\n"
+        "    try:\n"
+        "        os.write(status_descriptor, b'K')\n"
+        "    except OSError:\n"
+        "        pass\n"
+        "    time.sleep(0.2)\n"
+        f"    {supervisor_final_signal}\n"
+        "request = bytearray()\n"
+        "while True:\n"
+        "    readable, _, _ = select.select([control_descriptor, request_descriptor], [], [], 1)\n"
+        "    if control_descriptor in readable:\n"
+        "        os.read(control_descriptor, 1)\n"
+        "        teardown_group()\n"
+        "    if request_descriptor in readable:\n"
+        "        chunk = os.read(request_descriptor, 65536)\n"
+        "        if not chunk:\n"
+        "            break\n"
+        "        request.extend(chunk)\n"
+        "try:\n"
+        "    os.write(receipt_descriptor, b'receipt:' + bytes(request))\n"
+        "except BrokenPipeError:\n"
+        "    pass\n"
+        "os.close(receipt_descriptor)\n"
+        "try:\n"
+        "    os.write(status_descriptor, bytes((0,)))\n"
+        "except BrokenPipeError:\n"
+        "    pass\n"
+        "os.read(control_descriptor, 1)\n"
+        "teardown_group()\n"
+    )
+
+    def spawn(
+        _session: object,
+        *,
+        request_descriptor: int,
+        receipt_descriptor: int,
+    ) -> object:
+        control_read, control_write = real_pipe()
+        status_read, status_write = real_pipe()
+        tracked_descriptors.extend(
+            (control_read, control_write, status_read, status_write)
+        )
+        try:
+            process = subprocess.Popen(
+                (
+                    sys.executable,
+                    "-c",
+                    supervisor_script,
+                    os.fspath(identity_path),
+                    str(control_read),
+                    str(status_write),
+                    str(request_descriptor),
+                    str(receipt_descriptor),
+                ),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+                pass_fds=(
+                    request_descriptor,
+                    receipt_descriptor,
+                    control_read,
+                    status_write,
+                ),
+                start_new_session=True,
+            )
+            spawned.append(process)
+        except BaseException:
+            real_close(control_write)
+            real_close(status_read)
+            raise
+        finally:
+            real_close(control_read)
+            real_close(status_write)
+        identity_deadline = time.monotonic() + 1
+        while not identity_path.exists() and time.monotonic() < identity_deadline:
+            time.sleep(0.01)
+        assert identity_path.exists()
+        return execution_module._FormalSmokeChildProcess(
+            process=process,
+            lifetime_descriptor=control_write,
+            status_descriptor=status_read,
+        )
+
+    return spawn, spawned
+
+
 def test_outer_command_is_only_a_verifier_and_launcher() -> None:
     from rquant.cli import cmd_formal_smoke_replay
     from rquant.formal_smoke_execution import run_attested_formal_smoke
@@ -498,6 +654,48 @@ def test_receipt_fd_holder_times_out_reaps_process_group_and_cleans_staging(
     assert not list((tmp_path / "output").glob(".formal-smoke-*"))
 
 
+def test_parent_final_group_kill_removes_descendant_after_supervisor_self_kill_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant import formal_smoke_execution as execution_module
+
+    identity_path = tmp_path / "success-process-group.txt"
+    tracked_descriptors: list[int] = []
+    spawn, spawned = _portable_lifecycle_spawn_factory(
+        execution_module,
+        identity_path=identity_path,
+        tracked_descriptors=tracked_descriptors,
+        supervisor_kills_only_itself=True,
+    )
+    monkeypatch.setattr(execution_module, "_spawn_formal_smoke_child", spawn)
+
+    supervisor: subprocess.Popen[bytes] | None = None
+    descendant_pid: int | None = None
+    try:
+        result = execution_module._exchange_formal_smoke_child(
+            object(),  # type: ignore[arg-type]
+            b"request",
+            deadline_monotonic=time.monotonic() + 2,
+        )
+        identities = tuple(
+            tuple(int(value) for value in line.split(":"))
+            for line in identity_path.read_text(encoding="ascii").splitlines()
+        )
+        supervisor = spawned[0]
+        descendant_pid = identities[1][0]
+
+        assert result.exit_code == 0
+        assert result.receipt_bytes == b"receipt:request"
+        assert identities[0] == (supervisor.pid, supervisor.pid)
+        assert identities[1][1] == supervisor.pid
+        _assert_pid_disappears(descendant_pid)
+        with pytest.raises(ChildProcessError):
+            os.waitpid(supervisor.pid, os.WNOHANG)
+    finally:
+        _emergency_reap_test_processes(supervisor, descendant_pid)
+
+
 def test_supervisor_cleanup_state_matrix_preserves_or_loses_group_anchor_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -600,9 +798,9 @@ def test_supervisor_cleanup_state_matrix_preserves_or_loses_group_anchor_once(
         ), name
         if isinstance(group_error, ProcessLookupError):
             assert events.count(("killpg", signal.SIGKILL)) == 1
-            assert ("kill", signal.SIGKILL) in events
+            assert ("kill", signal.SIGKILL) not in events
         if isinstance(group_error, PermissionError):
-            assert ("kill", signal.SIGKILL) in events
+            assert ("kill", signal.SIGKILL) not in events
         assert process.state is execution_module._SupervisorLifecycleState.REAPED
 
 
@@ -634,7 +832,7 @@ def test_already_reaped_supervisor_fails_without_signaling_reused_group(
     assert process.state is execution_module._SupervisorLifecycleState.REAPED
 
 
-def test_supervisor_owned_teardown_reaps_without_parent_group_signal(
+def test_supervisor_owned_teardown_still_gets_parent_final_group_kill_before_reap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from rquant import formal_smoke_execution as execution_module
@@ -667,10 +865,11 @@ def test_supervisor_owned_teardown_reaps_without_parent_group_signal(
             si_status=signal.SIGKILL,
         ),
     )
+    events: list[tuple[str, int]] = []
     monkeypatch.setattr(
         execution_module.os,
         "killpg",
-        lambda *_args: pytest.fail("parent signaled a supervisor-owned process group"),
+        lambda process_group, signum: events.append(("killpg", signum)),
     )
 
     try:
@@ -679,13 +878,157 @@ def test_supervisor_owned_teardown_reaps_without_parent_group_signal(
     finally:
         os.close(control_read)
 
+    assert events == [("killpg", signal.SIGKILL)]
     assert process.state is execution_module._SupervisorLifecycleState.REAPED
 
 
-def test_cleanup_failure_is_explicit_and_preserves_exchange_failure_as_cause(
+@pytest.mark.parametrize(
+    "fault",
+    (
+        "selector-constructor",
+        "register-request",
+        "register-receipt",
+        "register-status",
+        "set-blocking",
+        "close-child-end",
+    ),
+)
+def test_post_spawn_initialization_failure_cleans_group_and_all_descriptors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+) -> None:
+    from rquant import formal_smoke_execution as execution_module
+
+    class InjectedInitializationError(RuntimeError):
+        pass
+
+    identity_path = tmp_path / f"{fault}-process-group.txt"
+    tracked_descriptors: list[int] = []
+    real_pipe = os.pipe
+    real_close = os.close
+    real_set_blocking = os.set_blocking
+    real_selector = execution_module.selectors.DefaultSelector
+
+    def recording_pipe() -> tuple[int, int]:
+        descriptors = real_pipe()
+        tracked_descriptors.extend(descriptors)
+        return descriptors
+
+    spawn, spawned = _portable_lifecycle_spawn_factory(
+        execution_module,
+        identity_path=identity_path,
+        tracked_descriptors=tracked_descriptors,
+        supervisor_kills_only_itself=False,
+    )
+    monkeypatch.setattr(execution_module.os, "pipe", recording_pipe)
+    monkeypatch.setattr(execution_module, "_spawn_formal_smoke_child", spawn)
+
+    if fault == "selector-constructor":
+
+        def fail_selector_constructor() -> object:
+            raise InjectedInitializationError(fault)
+
+        monkeypatch.setattr(
+            execution_module.selectors,
+            "DefaultSelector",
+            fail_selector_constructor,
+        )
+    elif fault.startswith("register-"):
+        failing_registration = {
+            "register-request": 1,
+            "register-receipt": 2,
+            "register-status": 3,
+        }[fault]
+
+        class FaultingSelector:
+            def __init__(self) -> None:
+                self.delegate = real_selector()
+                self.register_count = 0
+
+            def register(self, *args: object) -> object:
+                self.register_count += 1
+                if self.register_count == failing_registration:
+                    raise InjectedInitializationError(fault)
+                return self.delegate.register(*args)
+
+            def unregister(self, *args: object) -> object:
+                return self.delegate.unregister(*args)
+
+            def select(self, *args: object) -> object:
+                return self.delegate.select(*args)
+
+            def close(self) -> None:
+                self.delegate.close()
+
+        monkeypatch.setattr(
+            execution_module.selectors,
+            "DefaultSelector",
+            FaultingSelector,
+        )
+    elif fault == "set-blocking":
+        set_blocking_failed = False
+
+        def fail_set_blocking(descriptor: int, blocking: bool) -> None:
+            nonlocal set_blocking_failed
+            real_set_blocking(descriptor, blocking)
+            if not set_blocking_failed:
+                set_blocking_failed = True
+                raise InjectedInitializationError(fault)
+
+        monkeypatch.setattr(execution_module.os, "set_blocking", fail_set_blocking)
+    else:
+        close_failed = False
+
+        def fail_close(descriptor: int) -> None:
+            nonlocal close_failed
+            real_close(descriptor)
+            if (
+                not close_failed
+                and tracked_descriptors
+                and descriptor == tracked_descriptors[0]
+            ):
+                close_failed = True
+                raise InjectedInitializationError(fault)
+
+        monkeypatch.setattr(execution_module.os, "close", fail_close)
+
+    supervisor: subprocess.Popen[bytes] | None = None
+    descendant_pid: int | None = None
+    try:
+        with pytest.raises(InjectedInitializationError, match=fault):
+            execution_module._exchange_formal_smoke_child(
+                object(),  # type: ignore[arg-type]
+                b"request",
+                deadline_monotonic=time.monotonic() + 2,
+            )
+        identities = tuple(
+            tuple(int(value) for value in line.split(":"))
+            for line in identity_path.read_text(encoding="ascii").splitlines()
+        )
+        supervisor = spawned[0]
+        descendant_pid = identities[1][0]
+
+        _assert_pid_disappears(descendant_pid)
+        with pytest.raises(ChildProcessError):
+            os.waitpid(supervisor.pid, os.WNOHANG)
+        for descriptor in set(tracked_descriptors):
+            with pytest.raises(OSError):
+                os.fstat(descriptor)
+    finally:
+        _emergency_reap_test_processes(supervisor, descendant_pid)
+        for descriptor in set(tracked_descriptors):
+            with suppress(OSError):
+                real_close(descriptor)
+
+
+def test_cleanup_failure_is_explicit_and_preserves_initialization_failure_as_cause(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from rquant import formal_smoke_execution as execution_module
+
+    class InjectedInitializationError(RuntimeError):
+        pass
 
     held_descriptors: list[int] = []
 
@@ -693,18 +1036,17 @@ def test_cleanup_failure_is_explicit_and_preserves_exchange_failure_as_cause(
         pid = 41_043
         returncode: int | None = None
 
-    def spawn_without_status(
+    def spawn_for_initialization_failure(
         _session: object,
         *,
         request_descriptor: int,
         receipt_descriptor: int,
     ) -> object:
-        held_descriptors.append(os.dup(request_descriptor))
-        os.close(receipt_descriptor)
+        assert request_descriptor >= 0
+        assert receipt_descriptor >= 0
         control_read, control_write = os.pipe()
         status_read, status_write = os.pipe()
-        held_descriptors.append(control_read)
-        os.close(status_write)
+        held_descriptors.extend((control_read, status_write))
         return execution_module._FormalSmokeChildProcess(
             process=FakePopen(),  # type: ignore[arg-type]
             lifetime_descriptor=control_write,
@@ -717,7 +1059,19 @@ def test_cleanup_failure_is_explicit_and_preserves_exchange_failure_as_cause(
         child.close_status()  # type: ignore[attr-defined]
         raise execution_module.FormalSmokeCleanupError("forced cleanup failure")
 
-    monkeypatch.setattr(execution_module, "_spawn_formal_smoke_child", spawn_without_status)
+    def fail_selector_constructor() -> object:
+        raise InjectedInitializationError("forced initialization failure")
+
+    monkeypatch.setattr(
+        execution_module,
+        "_spawn_formal_smoke_child",
+        spawn_for_initialization_failure,
+    )
+    monkeypatch.setattr(
+        execution_module.selectors,
+        "DefaultSelector",
+        fail_selector_constructor,
+    )
     monkeypatch.setattr(
         execution_module,
         "_cleanup_formal_smoke_supervisor",
@@ -739,8 +1093,8 @@ def test_cleanup_failure_is_explicit_and_preserves_exchange_failure_as_cause(
             with suppress(OSError):
                 os.close(descriptor)
 
-    assert isinstance(captured.value.__cause__, execution_module.FormalSmokeExecutionError)
-    assert "status" in str(captured.value.__cause__)
+    assert isinstance(captured.value.__cause__, InjectedInitializationError)
+    assert "initialization" in str(captured.value.__cause__)
 
 
 def test_formal_smoke_child_launch_has_no_fork_window_when_thread_starts_after_pipe(
