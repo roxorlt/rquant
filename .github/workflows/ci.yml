@@ -13,9 +13,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
+  core-preflight:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -27,12 +27,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Create private short test root
+      - name: Create private preflight test root
         shell: bash
         run: |
           set -euo pipefail
           umask 077
-          root="$(mktemp -d "${HOME}/rqci.XXXXXXXX")"
+          root="$(mktemp -d "${HOME}/rqci.preflight.XXXXXXXX")"
           mkdir -p "${root}/tmp" "${root}/data" "${root}/parquet" "${root}/logs"
           chmod 700 "${root}" "${root}/tmp" "${root}/data" "${root}/parquet" "${root}/logs"
           {
@@ -76,30 +76,121 @@ jobs:
       - name: SourceBroker V2 frozen boundary
         run: uv run python scripts/source_broker_v2_frozen.py
 
-      - name: Full test suite
+  full-suite-shard:
+    name: Full suite shard (${{ matrix.python-version }}, ${{ matrix.shard }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+        shard: [0, 1, 2, 3]
+    env:
+      TUSHARE_TOKEN_MAIN: "00000000000000000000000000000000"
+      NOTIFY_ENABLED: "false"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create private shard test root
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          root="$(mktemp -d "${HOME}/rqci.shard.${{ matrix.python-version }}.${{ matrix.shard }}.XXXXXXXX")"
+          mkdir -p "${root}/tmp" "${root}/data" "${root}/parquet" "${root}/logs"
+          chmod 700 "${root}" "${root}/tmp" "${root}/data" "${root}/parquet" "${root}/logs"
+          {
+            printf 'RQUANT_CI_ROOT=%s\n' "${root}"
+            printf 'TMPDIR=%s/tmp\n' "${root}"
+            printf 'TMP=%s/tmp\n' "${root}"
+            printf 'TEMP=%s/tmp\n' "${root}"
+            printf 'DATA_DIR=%s/data\n' "${root}"
+            printf 'DUCKDB_PATH=%s/data/test.duckdb\n' "${root}"
+            printf 'DUCKDB_READONLY_PATH=%s/data/test_ro.duckdb\n' "${root}"
+            printf 'PARQUET_DIR=%s/parquet\n' "${root}"
+            printf 'LOG_DIR=%s/logs\n' "${root}"
+            printf 'RQUANT_DISABLE_DOTENV=1\n'
+          } >> "${GITHUB_ENV}"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install uv
+        run: python -m pip install uv==0.10.11
+
+      - name: Install locked dependencies
+        run: uv sync --frozen
+
+      - name: Collect, verify, and execute fixed shard
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p test-results
-          uv run pytest -q \
-            --basetemp="${RQUANT_CI_ROOT}/pt-full" \
-            --junitxml="test-results/full-py${{ matrix.python-version }}.xml"
+          uv run python scripts/full_suite_shards.py run \
+            --manifest-dir tests/manifests/full-suite-v1 \
+            --shard "${{ matrix.shard }}" \
+            --junitxml "test-results/junit.xml" \
+            --selection-evidence "test-results/selection.json" \
+            --basetemp "${RQUANT_CI_ROOT}/pt-full-shard-${{ matrix.shard }}"
 
-      - name: Verify full suite JUnit contract
-        if: always()
-        shell: bash
-        run: >-
-          uv run python tests/support/assert_junit_contract.py
-          --path "test-results/full-py${{ matrix.python-version }}.xml"
-          --suites 1 --tests 11118 --failures 0 --errors 0 --skipped 48 --cases 11118
-          --allow-skipped-cases 48
-
-      - name: Upload full suite JUnit evidence
+      - name: Upload full-suite shard evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # actions/upload-artifact@v4
         with:
-          name: full-suite-junit-py${{ matrix.python-version }}
-          path: test-results/full-py${{ matrix.python-version }}.xml
+          name: full-suite-evidence-py${{ matrix.python-version }}-shard${{ matrix.shard }}
+          path: test-results/
+          if-no-files-found: error
+
+  full-suite-contract:
+    name: Full suite contract (${{ matrix.python-version }})
+    if: always()
+    needs: [full-suite-shard]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install uv
+        run: python -m pip install uv==0.10.11
+
+      - name: Install locked dependencies
+        run: uv sync --frozen
+
+      - name: Download all shard evidence for this Python version
+        uses: actions/download-artifact@v4
+        with:
+          pattern: full-suite-evidence-py${{ matrix.python-version }}-shard*
+          path: shard-evidence
+          merge-multiple: false
+
+      - name: Verify complete shard JUnit contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p test-results
+          uv run python tests/support/assert_full_suite_shards.py \
+            --manifest-dir tests/manifests/full-suite-v1 \
+            --artifact-dir shard-evidence \
+            --expected-python "${{ matrix.python-version }}" \
+            --summary-json "test-results/full-suite-summary-py${{ matrix.python-version }}.json"
+
+      - name: Upload aggregated full-suite contract
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # actions/upload-artifact@v4
+        with:
+          name: full-suite-contract-py${{ matrix.python-version }}
+          path: test-results/full-suite-summary-py${{ matrix.python-version }}.json
           if-no-files-found: error
 
   runtime-fd-exec-linux:
