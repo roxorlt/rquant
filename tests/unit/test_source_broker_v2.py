@@ -1680,74 +1680,198 @@ def test_v2_saga_concurrent_same_attempt_has_one_durable_source_effect(
     assert transport.dispatch_calls == 1
 
 
-def test_v2_saga_renews_50ms_lease_while_80ms_dispatch_is_inflight(
+def test_v2_saga_heartbeat_schedule_protects_only_before_lease_expiry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    request, current, quota = _request(tmp_path)
-    path = tmp_path / "saga.sqlite3"
-    clock = _MutableUtcClock(datetime.now(UTC))
-    initial_time = clock.now()
-    heartbeat_time = initial_time + timedelta(seconds=0.04)
-    original_lease_boundary = initial_time + timedelta(seconds=0.05)
-    competitor_time = initial_time + timedelta(seconds=0.06)
-    clock.install_source_broker_clock(monkeypatch)
-    transport = _TestTransport(block_dispatch=True, clock=lambda: clock.now())
-    lineage = _TestLineageAuthority()
-    heartbeat_renewed = Event()
     original_heartbeat = SourceBrokerV2Saga._heartbeat_outbox
 
-    def observe_background_heartbeat(
-        saga: SourceBrokerV2Saga,
-        **kwargs: object,
+    def run_schedule(
+        scenario_root: Path,
+        *,
+        heartbeat_delay_seconds: float,
+        expect_renewal: bool,
     ) -> None:
-        is_first_background_heartbeat = (
-            current_thread().name.startswith("rquant-source-broker-v2-heartbeat-")
-            and not heartbeat_renewed.is_set()
-        )
-        if is_first_background_heartbeat:
-            clock.current = heartbeat_time
-        original_heartbeat(saga, **kwargs)  # type: ignore[arg-type]
-        if is_first_background_heartbeat:
-            heartbeat_renewed.set()
+        scenario_root.mkdir()
+        request, current, quota = _request(scenario_root)
+        path = scenario_root / "saga.sqlite3"
+        clock = _MutableUtcClock(datetime.now(UTC))
+        initial_time = clock.now()
+        heartbeat_time = initial_time + timedelta(seconds=heartbeat_delay_seconds)
+        original_lease_boundary = initial_time + timedelta(seconds=0.05)
+        competitor_time = initial_time + timedelta(seconds=0.06)
+        expected_renewed_boundary = heartbeat_time + timedelta(seconds=0.05)
+        transport = _TestTransport(block_dispatch=True, clock=lambda: clock.now())
+        lineage = _TestLineageAuthority()
+        heartbeat_waiting = Event()
+        heartbeat_release = Event()
+        heartbeat_can_return = Event()
+        heartbeat_attempted = Event()
+        competitor_release = Event()
+        competitor_observed_lease = Event()
+        competitor_can_continue = Event()
+        heartbeat_lock = Lock()
+        controlled_heartbeat_claimed = False
+        heartbeat_results: list[BaseException | None] = []
+        competitor_lease_rows: list[tuple[datetime, str | None, str | None]] = []
 
-    monkeypatch.setattr(SourceBrokerV2Saga, "_heartbeat_outbox", observe_background_heartbeat)
+        def saga() -> SourceBrokerV2Saga:
+            return SourceBrokerV2Saga.for_nonproduction(
+                path,
+                saga_id="saga-a",
+                current_claim_authority=current,
+                quota_adapter=quota,
+                transport=transport,
+                lineage_authority=lineage,
+                executor_lease_seconds=0.05,
+                executor_wait_seconds=1.0,
+            )
 
-    def run() -> object:
-        return SourceBrokerV2Saga.for_nonproduction(
-            path,
-            saga_id="saga-a",
-            current_claim_authority=current,
-            quota_adapter=quota,
-            transport=transport,
-            lineage_authority=lineage,
-            executor_lease_seconds=0.05,
-            executor_wait_seconds=0.3,
-        ).advance(request, now=NOW + timedelta(seconds=1))
+        first_saga = saga()
+        competitor_saga = saga()
+        original_competitor_read = competitor_saga._read_outbox
 
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        first = executor.submit(run)
-        assert transport.dispatch_entered.wait(timeout=5)
-        assert heartbeat_renewed.wait(timeout=5)
-        with sqlite3.connect(path) as connection:
-            heartbeat_at_raw, renewed_boundary_raw = connection.execute(
-                "SELECT executor_heartbeat_at, executor_lease_expires_at "
-                "FROM source_broker_v2_outbox WHERE phase = 'dispatch'"
-            ).fetchone()
-        heartbeat_at = datetime.fromisoformat(heartbeat_at_raw)
-        renewed_lease_boundary = datetime.fromisoformat(renewed_boundary_raw)
-        assert heartbeat_at == heartbeat_time
-        assert heartbeat_at < original_lease_boundary < competitor_time < renewed_lease_boundary
-        clock.current = competitor_time
-        second = executor.submit(run)
-        try:
-            assert not transport.second_dispatch_entered.wait(timeout=0.1)
-        finally:
-            transport.release_dispatch.set()
-        results = [first.result(timeout=10), second.result(timeout=10)]
+        def schedule_background_heartbeat(
+            saga: SourceBrokerV2Saga,
+            **kwargs: object,
+        ) -> None:
+            nonlocal controlled_heartbeat_claimed
+            with heartbeat_lock:
+                is_controlled_heartbeat = (
+                    kwargs.get("phase") is SourceBrokerV2OutboxPhase.DISPATCH
+                    and current_thread().name.startswith(
+                        "rquant-source-broker-v2-heartbeat-"
+                    )
+                    and not controlled_heartbeat_claimed
+                )
+                if is_controlled_heartbeat:
+                    controlled_heartbeat_claimed = True
+            if not is_controlled_heartbeat:
+                original_heartbeat(saga, **kwargs)  # type: ignore[arg-type]
+                return
+            heartbeat_waiting.set()
+            if not heartbeat_release.wait(timeout=5):
+                raise TimeoutError("test scheduler did not release the heartbeat")
+            try:
+                original_heartbeat(saga, **kwargs)  # type: ignore[arg-type]
+            except BaseException as exc:
+                heartbeat_results.append(exc)
+                heartbeat_attempted.set()
+                raise
+            else:
+                heartbeat_results.append(None)
+                heartbeat_attempted.set()
+                if not heartbeat_can_return.wait(timeout=5):
+                    raise TimeoutError("test scheduler did not complete the heartbeat tick")
 
-    assert {result.state for result in results} == {SourceBrokerV2SagaState.COMPLETE}
-    assert transport.dispatch_calls == 1
+        def observe_competitor_lease(
+            connection: sqlite3.Connection,
+            *,
+            operation_id: str,
+            phase: SourceBrokerV2OutboxPhase,
+        ) -> sqlite3.Row:
+            row = original_competitor_read(
+                connection,
+                operation_id=operation_id,
+                phase=phase,
+            )
+            if phase is SourceBrokerV2OutboxPhase.DISPATCH and not competitor_lease_rows:
+                heartbeat_raw = row["executor_heartbeat_at"]
+                expiry_raw = row["executor_lease_expires_at"]
+                competitor_lease_rows.append((clock.now(), heartbeat_raw, expiry_raw))
+                competitor_observed_lease.set()
+                if not competitor_can_continue.wait(timeout=5):
+                    raise TimeoutError("test scheduler did not release the competitor")
+            return row
+
+        def run_competitor() -> object:
+            if not competitor_release.wait(timeout=5):
+                raise TimeoutError("test scheduler did not start the competitor")
+            return competitor_saga.advance(request, now=NOW + timedelta(seconds=2))
+
+        with monkeypatch.context() as scenario_patch:
+            clock.install_source_broker_clock(scenario_patch)
+            scenario_patch.setattr(
+                SourceBrokerV2Saga,
+                "_heartbeat_outbox",
+                schedule_background_heartbeat,
+            )
+            scenario_patch.setattr(
+                competitor_saga,
+                "_read_outbox",
+                observe_competitor_lease,
+            )
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                first = executor.submit(
+                    first_saga.advance,
+                    request,
+                    now=NOW + timedelta(seconds=1),
+                )
+                competitor = executor.submit(run_competitor)
+                assert transport.dispatch_entered.wait(timeout=5)
+                assert heartbeat_waiting.wait(timeout=5)
+
+                if expect_renewal:
+                    clock.current = heartbeat_time
+                    heartbeat_release.set()
+                    assert heartbeat_attempted.wait(timeout=5)
+                    assert heartbeat_results == [None]
+
+                clock.current = competitor_time
+                competitor_release.set()
+                assert competitor_observed_lease.wait(timeout=5)
+                observed_at, observed_heartbeat_raw, observed_expiry_raw = (
+                    competitor_lease_rows[0]
+                )
+                expected_heartbeat = heartbeat_time if expect_renewal else initial_time
+                expected_expiry = (
+                    expected_renewed_boundary if expect_renewal else original_lease_boundary
+                )
+                assert observed_at == competitor_time
+                assert datetime.fromisoformat(observed_heartbeat_raw) == expected_heartbeat
+                assert datetime.fromisoformat(observed_expiry_raw) == expected_expiry
+                competitor_can_continue.set()
+
+                if expect_renewal:
+                    assert heartbeat_time < original_lease_boundary
+                    assert competitor_time < expected_renewed_boundary
+                    heartbeat_can_return.set()
+                    transport.release_dispatch.set()
+                    results = [first.result(timeout=10), competitor.result(timeout=10)]
+                    assert {result.state for result in results} == {
+                        SourceBrokerV2SagaState.COMPLETE
+                    }
+                else:
+                    assert original_lease_boundary < competitor_time < heartbeat_time
+                    competitor_result = competitor.result(timeout=10)
+                    assert (
+                        competitor_result.state
+                        is SourceBrokerV2SagaState.RECONCILE_REQUIRED
+                    )
+                    clock.current = heartbeat_time
+                    heartbeat_release.set()
+                    assert heartbeat_attempted.wait(timeout=5)
+                    transport.release_dispatch.set()
+                    first_result = first.result(timeout=10)
+                    assert first_result.state is SourceBrokerV2SagaState.RECONCILE_REQUIRED
+                    assert any(
+                        isinstance(error, SourceBrokerV2SagaConflictError)
+                        for error in heartbeat_results
+                        if error is not None
+                    )
+
+        assert transport.dispatch_calls == 1
+
+    run_schedule(
+        tmp_path / "late-heartbeat",
+        heartbeat_delay_seconds=0.10,
+        expect_renewal=False,
+    )
+    run_schedule(
+        tmp_path / "on-time-heartbeat",
+        heartbeat_delay_seconds=0.04,
+        expect_renewal=True,
+    )
 
 
 def test_v2_saga_persists_source_window_grant_and_terminal_observation(
