@@ -1992,6 +1992,91 @@ def test_v2_saga_persists_source_window_grant_and_terminal_observation(
         ).fetchone()
     assert (invoke_started, dispatch_started, owner, lease_expiry) == (0, None, None, None)
 
+    finalize_root = tmp_path / "finalize-expired-before-invoke"
+    finalize_root.mkdir()
+    finalize_request, finalize_current, finalize_quota = _request(
+        finalize_root,
+        saga_id="saga-finalize-expired-before-invoke",
+    )
+    finalize_transport = _TestTransport(clock=lambda: clock.now())
+    finalize_lineage = _TestLineageAuthority()
+    original_finalize_claim_once = finalize_transport.claim_once
+    finalize_claim_expired = False
+
+    def expire_finalize_after_claim(
+        payload: bytes,
+        *,
+        deadline: float | None = None,
+    ) -> bytes:
+        nonlocal finalize_claim_expired
+        claim_request = SourceBrokerV2ClaimOnceRequest.model_validate_json(payload)
+        response = original_finalize_claim_once(payload, deadline=deadline)
+        if (
+            claim_request.phase is SourceBrokerV2OutboxPhase.SOURCE_FINALIZE
+            and not finalize_claim_expired
+        ):
+            finalize_claim_expired = True
+            clock.advance(0.30)
+        return response
+
+    monkeypatch.setattr(finalize_transport, "claim_once", expire_finalize_after_claim)
+    finalize_path = finalize_root / "saga.sqlite3"
+    finalize_saga = SourceBrokerV2Saga.for_nonproduction(
+        finalize_path,
+        saga_id="saga-finalize-expired-before-invoke",
+        current_claim_authority=finalize_current,
+        quota_adapter=finalize_quota,
+        transport=finalize_transport,
+        lineage_authority=finalize_lineage,
+    )
+
+    pending_finalize = finalize_saga.advance(
+        finalize_request,
+        now=NOW + timedelta(seconds=1),
+    )
+
+    assert pending_finalize.state.value == "source_finalize_reconcile_required"
+    assert finalize_transport.dispatch_calls == 1
+    assert finalize_transport.finalize_calls == 0
+    assert finalize_lineage.calls == []
+    with sqlite3.connect(finalize_path) as connection:
+        finalize_row = connection.execute(
+            "SELECT invoke_started, dispatch_started_at, max_external_deadline, "
+            "not_before_takeover_at, executor_owner_token, executor_lease_expires_at "
+            "FROM source_broker_v2_outbox WHERE phase = 'source_finalize'"
+        ).fetchone()
+    assert finalize_row is not None
+    assert finalize_row[:2] == (0, None)
+    assert finalize_row[4:] == (None, None)
+    first_finalize_deadline = datetime.fromisoformat(str(finalize_row[2]))
+    first_finalize_takeover = datetime.fromisoformat(str(finalize_row[3]))
+    assert first_finalize_deadline < first_finalize_takeover <= clock.now()
+
+    recovered_finalize = finalize_saga.reconcile(
+        finalize_request,
+        now=NOW + timedelta(seconds=2),
+    )
+
+    assert recovered_finalize.state is SourceBrokerV2SagaState.COMPLETE
+    assert recovered_finalize.reconcile_reason is None
+    assert finalize_transport.dispatch_calls == 1
+    assert finalize_transport.finalize_calls == 1
+    assert len(finalize_lineage.calls) == 1
+    with sqlite3.connect(finalize_path) as connection:
+        renewed_deadline, finalize_status = connection.execute(
+            "SELECT max_external_deadline, status "
+            "FROM source_broker_v2_outbox WHERE phase = 'source_finalize'"
+        ).fetchone()
+        finalize_receipts = dict(
+            connection.execute(
+                "SELECT status, COUNT(*) FROM source_broker_v2_source_receipt "
+                "WHERE phase = 'source_finalize' GROUP BY status"
+            ).fetchall()
+        )
+    assert datetime.fromisoformat(str(renewed_deadline)) > first_finalize_deadline
+    assert finalize_status == "applied"
+    assert finalize_receipts == {"DEFINITIVELY_ABSENT": 2, "SUCCESS": 1}
+
 
 def test_v2_saga_rejects_tampered_historical_source_authority_receipt(
     tmp_path: Path,

@@ -116,6 +116,7 @@ class SourceBrokerV2SagaState(StrEnum):
     CALL_TERMINALIZED = "call_terminalized"
     DISPATCH_AUTHORIZED = "dispatch_authorized"
     DISPATCH_OUTCOME = "dispatch_outcome"
+    SOURCE_FINALIZE_RECONCILE_REQUIRED = "source_finalize_reconcile_required"
     SOURCE_FINALIZED = "source_finalized"
     QUOTA_TERMINAL = "quota_terminal"
     PARENT_RELEASED = "parent_released"
@@ -1719,7 +1720,21 @@ class SourceBrokerV2Saga:
             SourceBrokerV2SagaState.DISPATCH_OUTCOME,
             outcome=dispatch.outcome,
         )
-        finalized = self._source_finalize(validated, dispatch=dispatch)
+        try:
+            finalized = self._source_finalize(validated, dispatch=dispatch)
+        except (
+            SourceBrokerV2SagaReconcileRequiredError,
+            SourceBrokerV2SagaUnavailableError,
+            ConnectionError,
+            OSError,
+            TimeoutError,
+        ) as exc:
+            self._transition(
+                SourceBrokerV2SagaState.SOURCE_FINALIZE_RECONCILE_REQUIRED,
+                outcome=dispatch.outcome,
+                reconcile_reason=str(exc),
+            )
+            return self.snapshot()
         self._transition(SourceBrokerV2SagaState.SOURCE_FINALIZED)
         self._quota(
             SourceBrokerV2OutboxPhase.QUOTA_FINALIZE,
@@ -2427,6 +2442,34 @@ class SourceBrokerV2Saga:
                     raise SourceBrokerV2SagaIntegrityError(
                         "source external timing evidence is incomplete"
                     )
+                elif (
+                    phase is SourceBrokerV2OutboxPhase.SOURCE_FINALIZE
+                    and not bool(row["invoke_started"])
+                    and row["dispatch_started_at"] is None
+                    and now >= takeover_at
+                ):
+                    deadline = now + timedelta(seconds=self._source_request_deadline_seconds)
+                    takeover_at = deadline + timedelta(seconds=self._source_takeover_grace_seconds)
+                    updated = connection.execute(
+                        "UPDATE source_broker_v2_outbox SET max_external_deadline = ?, "
+                        "not_before_takeover_at = ?, source_grant_json = NULL, "
+                        "source_grant_hash = NULL, source_observation_json = NULL, "
+                        "source_observation_hash = NULL WHERE operation_id = ? "
+                        "AND status = 'pending' AND executor_owner_token = ? "
+                        "AND executor_generation = ? AND invoke_started = 0 "
+                        "AND dispatch_started_at IS NULL",
+                        (
+                            deadline.isoformat(),
+                            takeover_at.isoformat(),
+                            operation_id,
+                            self._executor_owner_token,
+                            owner_generation,
+                        ),
+                    ).rowcount
+                    if updated != 1:
+                        raise SourceBrokerV2SagaConflictError(
+                            "outbox executor lost ownership before finalize window renewal"
+                        )
                 connection.commit()
                 return deadline, takeover_at
             except BaseException:
@@ -3589,6 +3632,7 @@ class SourceBrokerV2Saga:
                     state
                     in {
                         SourceBrokerV2SagaState.DISPATCH_OUTCOME,
+                        SourceBrokerV2SagaState.SOURCE_FINALIZE_RECONCILE_REQUIRED,
                         SourceBrokerV2SagaState.SOURCE_FINALIZED,
                         SourceBrokerV2SagaState.QUOTA_TERMINAL,
                         SourceBrokerV2SagaState.PARENT_RELEASED,
@@ -3608,6 +3652,17 @@ class SourceBrokerV2Saga:
                     raise SourceBrokerV2SagaIntegrityError(
                         "post-dispatch state lacks outcome evidence"
                     )
+                stored_reconcile_reason = (
+                    reconcile_reason
+                    if reconcile_reason is not None
+                    else current.reconcile_reason
+                )
+                if (
+                    current.state
+                    is SourceBrokerV2SagaState.SOURCE_FINALIZE_RECONCILE_REQUIRED
+                    and state is SourceBrokerV2SagaState.SOURCE_FINALIZED
+                ):
+                    stored_reconcile_reason = None
                 connection.execute(
                     "UPDATE source_broker_v2_saga SET state = ?, "
                     "dispatch_outcome = ?, reconcile_reason = ? "
@@ -3615,9 +3670,7 @@ class SourceBrokerV2Saga:
                     (
                         state.value,
                         None if stored_outcome is None else stored_outcome.value,
-                        reconcile_reason
-                        if reconcile_reason is not None
-                        else current.reconcile_reason,
+                        stored_reconcile_reason,
                         self.saga_id,
                     ),
                 )
@@ -3907,6 +3960,12 @@ _FORWARD_STATES: dict[SourceBrokerV2SagaState, frozenset[SourceBrokerV2SagaState
     ),
     SourceBrokerV2SagaState.DISPATCH_OUTCOME: frozenset(
         {
+            SourceBrokerV2SagaState.SOURCE_FINALIZE_RECONCILE_REQUIRED,
+            SourceBrokerV2SagaState.SOURCE_FINALIZED,
+        }
+    ),
+    SourceBrokerV2SagaState.SOURCE_FINALIZE_RECONCILE_REQUIRED: frozenset(
+        {
             SourceBrokerV2SagaState.SOURCE_FINALIZED,
         }
     ),
@@ -3985,6 +4044,13 @@ _REQUIRED_APPLIED_PHASES: dict[SourceBrokerV2SagaState, tuple[SourceBrokerV2Outb
         SourceBrokerV2OutboxPhase.AUTHORIZE_DISPATCH,
         SourceBrokerV2OutboxPhase.DISPATCH,
     ),
+    SourceBrokerV2SagaState.SOURCE_FINALIZE_RECONCILE_REQUIRED: (
+        SourceBrokerV2OutboxPhase.CLAIM,
+        SourceBrokerV2OutboxPhase.RESERVE_PARENT,
+        SourceBrokerV2OutboxPhase.RECORD_INTENT,
+        SourceBrokerV2OutboxPhase.AUTHORIZE_DISPATCH,
+        SourceBrokerV2OutboxPhase.DISPATCH,
+    ),
     SourceBrokerV2SagaState.SOURCE_FINALIZED: (
         SourceBrokerV2OutboxPhase.CLAIM,
         SourceBrokerV2OutboxPhase.RESERVE_PARENT,
@@ -4040,12 +4106,13 @@ _STATE_RANK: dict[SourceBrokerV2SagaState, int] = {
     SourceBrokerV2SagaState.CALL_TERMINALIZED: 3,
     SourceBrokerV2SagaState.DISPATCH_AUTHORIZED: 3,
     SourceBrokerV2SagaState.DISPATCH_OUTCOME: 4,
-    SourceBrokerV2SagaState.SOURCE_FINALIZED: 5,
-    SourceBrokerV2SagaState.QUOTA_TERMINAL: 6,
-    SourceBrokerV2SagaState.PARENT_RELEASED: 7,
-    SourceBrokerV2SagaState.COMPENSATED: 8,
-    SourceBrokerV2SagaState.LINEAGE_PUBLISHED: 9,
-    SourceBrokerV2SagaState.COMPLETE: 10,
+    SourceBrokerV2SagaState.SOURCE_FINALIZE_RECONCILE_REQUIRED: 5,
+    SourceBrokerV2SagaState.SOURCE_FINALIZED: 6,
+    SourceBrokerV2SagaState.QUOTA_TERMINAL: 7,
+    SourceBrokerV2SagaState.PARENT_RELEASED: 8,
+    SourceBrokerV2SagaState.COMPENSATED: 9,
+    SourceBrokerV2SagaState.LINEAGE_PUBLISHED: 10,
+    SourceBrokerV2SagaState.COMPLETE: 11,
 }
 
 
