@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -333,7 +334,11 @@ def test_receipt_fd_holder_times_out_reaps_process_group_and_cleans_staging(
     ) -> object:
         script = (
             "import os, subprocess, sys, time\n"
-            "descendant = subprocess.Popen((sys.executable, '-c', 'import time; time.sleep(30)'))\n"
+            "descendant = subprocess.Popen((\n"
+            "    sys.executable, '-c',\n"
+            "    'import signal,time; "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(10)',\n"
+            "))\n"
             "with open(sys.argv[1], 'w', encoding='ascii') as target:\n"
             "    target.write(f'{os.getpid()}:{os.getpgrp()}\\n')\n"
             "    target.write(f'{descendant.pid}:{os.getpgid(descendant.pid)}\\n')\n"
@@ -379,7 +384,7 @@ def test_receipt_fd_holder_times_out_reaps_process_group_and_cleans_staging(
 
     assert elapsed < 2
     assert len(child_processes) == 1
-    assert child_processes[0].poll() is not None
+    assert child_processes[0].returncode is not None
     identities = tuple(
         tuple(int(value) for value in line.split(":"))
         for line in identity_path.read_text(encoding="ascii").splitlines()
@@ -387,8 +392,54 @@ def test_receipt_fd_holder_times_out_reaps_process_group_and_cleans_staging(
     assert identities[0][0] == child_processes[0].pid
     assert all(process_id == process_group for process_id, process_group in identities[:1])
     assert identities[1][1] == child_processes[0].pid
+    descendant_pid = identities[1][0]
+    descendant_deadline = time.monotonic() + 3
+    while time.monotonic() < descendant_deadline:
+        try:
+            os.kill(descendant_pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail(f"formal smoke descendant {descendant_pid} survived group cleanup")
+    with pytest.raises(ChildProcessError):
+        os.waitpid(child_processes[0].pid, os.WNOHANG)
     assert not list((tmp_path / "output").glob("strategy_lab_runs/*"))
     assert not list((tmp_path / "output").glob(".formal-smoke-*"))
+
+
+def test_process_group_leader_is_not_reaped_before_final_group_kill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rquant import formal_smoke_execution as execution_module
+
+    events: list[tuple[str, float | int]] = []
+
+    class FakeProcess:
+        pid = 41_041
+
+        def wait(self, *, timeout: float | None = None) -> int:
+            assert timeout is not None
+            events.append(("wait", timeout))
+            return -signal.SIGKILL
+
+    monkeypatch.setattr(
+        execution_module.os,
+        "killpg",
+        lambda _process_group, signum: events.append(("killpg", signum)),
+    )
+    monkeypatch.setattr(
+        execution_module.time,
+        "sleep",
+        lambda seconds: events.append(("sleep", seconds)),
+    )
+
+    execution_module._terminate_process_group(FakeProcess())  # type: ignore[arg-type]
+
+    assert events.count(("sleep", 0.25)) == 1
+    kill_index = events.index(("killpg", signal.SIGKILL))
+    assert kill_index > events.index(("killpg", signal.SIGTERM))
+    assert kill_index < next(index for index, event in enumerate(events) if event[0] == "wait")
 
 
 def test_formal_smoke_child_launch_has_no_fork_window_when_thread_starts_after_pipe(

@@ -134,17 +134,18 @@ class _FormalSmokeChildProcess:
 
 
 def _terminate_process_group(process: _FormalSmokeChildProcess) -> None:
-    for signum in (signal.SIGTERM, signal.SIGKILL):
+    def signal_group(signum: int) -> None:
         try:
             os.killpg(process.pid, signum)
         except ProcessLookupError:
-            continue
+            return
         except PermissionError:
-            with suppress(ProcessLookupError):
-                process.send_signal(signum)
-        if signum == signal.SIGTERM:
-            with suppress(subprocess.TimeoutExpired):
-                process.wait(timeout=0.25)
+            with suppress(PermissionError, ProcessLookupError):
+                os.kill(process.pid, signum)
+
+    signal_group(signal.SIGTERM)
+    time.sleep(0.25)
+    signal_group(signal.SIGKILL)
     with suppress(subprocess.TimeoutExpired):
         process.wait(timeout=1)
 
