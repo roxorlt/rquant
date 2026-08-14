@@ -11,6 +11,7 @@ import shutil
 import sqlite3
 import stat
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -134,6 +135,134 @@ def test_rqs8_arch_p1_001_recovery_rejects_replaced_building_before_either_fsync
     assert fsyncs == []
     assert parked.is_dir()
     assert building.is_dir()
+
+
+def test_rqs8_arch_p1_001_post_rename_capture_failure_is_recovery_blocked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = create_parent_v4_fixture(tmp_path / "source.sqlite3")
+    publication_root = _private_directory(tmp_path / "publication")
+    policy = local_audit_publication_root_policy(publication_root)
+    original_rename = publication_module.rename_noreplace_at
+    original_fsync = os.fsync
+    native_generation_visible = False
+    fsyncs: list[int] = []
+
+    def rename_then_mutate_retained_building(
+        source_fd: int,
+        source_name: str,
+        destination_fd: int,
+        destination_name: str,
+        *,
+        on_success: Callable[[], None] | None = None,
+    ) -> None:
+        if source_name != "ready" or not destination_name.startswith("generation-"):
+            original_rename(
+                source_fd,
+                source_name,
+                destination_fd,
+                destination_name,
+                on_success=on_success,
+            )
+            return
+
+        def mutate_before_success_callback() -> None:
+            nonlocal native_generation_visible
+            native_generation_visible = (
+                publication_root / "generations" / destination_name
+            ).is_dir()
+            assert stat.S_IMODE(os.fstat(source_fd).st_mode) == policy.building_mode
+            os.fchmod(source_fd, 0o600)
+            assert on_success is not None
+            on_success()
+
+        original_rename(
+            source_fd,
+            source_name,
+            destination_fd,
+            destination_name,
+            on_success=mutate_before_success_callback,
+        )
+
+    def tracked_fsync(descriptor: int) -> None:
+        fsyncs.append(os.fstat(descriptor).st_ino)
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(
+        publication_module,
+        "rename_noreplace_at",
+        rename_then_mutate_retained_building,
+    )
+
+    with pytest.raises(PaperMigrationPostCommitIndeterminateError) as caught:
+        migrate_v4_ledger_copy(
+            source.path,
+            publication_root,
+            root_policy=policy,
+            migration_code_identity="test-migration-code",
+        )
+
+    state = caught.value.state
+    assert native_generation_visible is True
+    assert state.reason == "POST_RENAME_BUILDING_IDENTITY_UNAVAILABLE"
+    assert state.recovery_status == "RECOVERY_BLOCKED"
+    assert state.building_identity_before_generation_rename is not None
+    assert state.building_identity is None
+    generations = publication_root / "generations"
+    assert (generations / state.generation_name).is_dir()
+    assert (generations / state.building_name).is_dir()
+
+    monkeypatch.setattr(publication_module.os, "fsync", tracked_fsync)
+    with pytest.raises(PaperMigrationPostCommitIndeterminateError):
+        recover_paper_migration_publication(state, root_policy=policy)
+
+    assert fsyncs == []
+    assert (generations / state.generation_name).is_dir()
+    assert (generations / state.building_name).is_dir()
+    (generations / state.building_name).chmod(policy.building_mode)
+
+
+def test_building_identity_is_captured_before_generation_rename_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = create_parent_v4_fixture(tmp_path / "source.sqlite3")
+    publication_root = _private_directory(tmp_path / "publication")
+    policy = local_audit_publication_root_policy(publication_root)
+    original_begin = migration_module._begin_paper_migration_publication
+    original_checkpoint = publication_module._checkpoint
+    context: publication_module._PaperMigrationPublicationContext | None = None
+    captured_identities: list[publication_module._PublicationFullDirectoryIdentityV2 | None] = []
+
+    def retain_context(
+        *args: object,
+        **kwargs: object,
+    ) -> publication_module._PaperMigrationPublicationContext:
+        nonlocal context
+        context = original_begin(*args, **kwargs)
+        return context
+
+    def inspect_pre_rename_checkpoint(fault: str | None, phase: str) -> None:
+        if phase == "before_generation_noreplace_rename":
+            assert context is not None
+            captured_identities.append(context.building_identity_before_generation_rename)
+        original_checkpoint(fault, phase)
+
+    monkeypatch.setattr(migration_module, "_begin_paper_migration_publication", retain_context)
+    monkeypatch.setattr(publication_module, "_checkpoint", inspect_pre_rename_checkpoint)
+
+    with pytest.raises(PaperMigrationPreCommitError):
+        migrate_v4_ledger_copy(
+            source.path,
+            publication_root,
+            root_policy=policy,
+            migration_code_identity="test-migration-code",
+            failure_after_phase="before_generation_noreplace_rename",
+        )
+
+    assert captured_identities and captured_identities[0] is not None
+    assert not tuple((publication_root / "generations").glob("generation-*"))
 
 
 def test_recovery_fsyncs_verified_building_before_generations(

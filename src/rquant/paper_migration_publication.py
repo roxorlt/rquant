@@ -351,6 +351,7 @@ class PaperMigrationPostCommitState(RuntimeContractModel):
     )
     outcome: Literal["POST_COMMIT_INDETERMINATE"] = "POST_COMMIT_INDETERMINATE"
     publication_state: Literal["GENERATION_RENAMED_UNCONFIRMED"] = "GENERATION_RENAMED_UNCONFIRMED"
+    recovery_status: Literal["RECOVERABLE", "RECOVERY_BLOCKED"] = "RECOVERABLE"
     reason: Literal[
         "SOURCE_PARENT_FSYNC_FAILED",
         "GENERATIONS_FSYNC_FAILED",
@@ -360,6 +361,7 @@ class PaperMigrationPostCommitState(RuntimeContractModel):
         "FINAL_OBJECT_FAILED",
         "RESULT_ASSEMBLY_FAILED",
         "FAULT_INJECTED",
+        "POST_RENAME_BUILDING_IDENTITY_UNAVAILABLE",
     ]
     policy_id: Sha256
     publication_nonce: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -369,7 +371,7 @@ class PaperMigrationPostCommitState(RuntimeContractModel):
     candidate_sha256: Sha256
     expected_manifest_sha256: Sha256
     building_identity_before_generation_rename: _PublicationFullDirectoryIdentityV2
-    building_identity: _PublicationFullDirectoryIdentityV2
+    building_identity: _PublicationFullDirectoryIdentityV2 | None = None
 
     @model_validator(mode="after")
     def validate_names_and_transition(self) -> PaperMigrationPostCommitState:
@@ -381,6 +383,16 @@ class PaperMigrationPostCommitState(RuntimeContractModel):
             raise ValueError("object name does not match candidate digest")
         before = self.building_identity_before_generation_rename
         after = self.building_identity
+        if self.recovery_status == "RECOVERY_BLOCKED":
+            if self.reason != "POST_RENAME_BUILDING_IDENTITY_UNAVAILABLE":
+                raise ValueError("recovery-blocked state has an invalid reason")
+            if after is not None:
+                raise ValueError("recovery-blocked state must not contain a post-rename identity")
+            return self
+        if self.reason == "POST_RENAME_BUILDING_IDENTITY_UNAVAILABLE":
+            raise ValueError("recoverable state has a recovery-blocked reason")
+        if after is None:
+            raise ValueError("recoverable state has no post-rename identity")
         if (before.device, before.inode, before.uid, before.gid, before.mode, before.file_type) != (
             after.device,
             after.inode,
@@ -1068,6 +1080,31 @@ def _post_commit_state(
     )
 
 
+def _recovery_blocked_post_commit_state(
+    context: _PaperMigrationPublicationContext,
+    *,
+    object_name: str,
+    candidate_sha256: str,
+    manifest_sha256: str,
+) -> PaperMigrationPostCommitState:
+    if context.building_identity_before_generation_rename is None:
+        raise RuntimeError("post-rename state has no pre-rename building binding")
+    return PaperMigrationPostCommitState(
+        recovery_status="RECOVERY_BLOCKED",
+        reason="POST_RENAME_BUILDING_IDENTITY_UNAVAILABLE",
+        policy_id=context.root.policy.policy_id,
+        publication_nonce=context.publication_nonce,
+        building_name=context.building_name,
+        generation_name=context.generation_name,
+        object_name=object_name,
+        candidate_sha256=candidate_sha256,
+        expected_manifest_sha256=manifest_sha256,
+        building_identity_before_generation_rename=(
+            context.building_identity_before_generation_rename
+        ),
+    )
+
+
 def _validate_receipt_from_generation(
     root: _PublicationRootHandle,
     *,
@@ -1342,8 +1379,6 @@ def _publish_paper_migration_generation(
         if _directory_identity(os.fstat(context.ready_fd)) != generation_identity:
             raise ValueError("ready generation identity changed before publication")
         _checkpoint(failure_after_phase, "before_local_failure_disposition")
-        _checkpoint(failure_after_phase, "before_generation_noreplace_rename")
-
         context.building_identity_before_generation_rename = _full_directory_identity(
             os.fstat(context.building_fd)
         )
@@ -1354,18 +1389,32 @@ def _publish_paper_migration_generation(
             mode=policy.building_mode,
             label="publication building directory",
         )
+        _checkpoint(failure_after_phase, "before_generation_noreplace_rename")
 
         def mark_generation_renamed() -> None:
             nonlocal renamed
             renamed = True
-            context.building_identity = _full_directory_identity(os.fstat(context.building_fd))
-            _validate_full_directory(
-                context.building_identity,
-                uid=policy.owner_uid,
-                gid=policy.group_gid,
-                mode=policy.building_mode,
-                label="publication building directory",
-            )
+            try:
+                building_identity = _full_directory_identity(os.fstat(context.building_fd))
+                _validate_full_directory(
+                    building_identity,
+                    uid=policy.owner_uid,
+                    gid=policy.group_gid,
+                    mode=policy.building_mode,
+                    label="publication building directory",
+                )
+            except BaseException as exc:
+                state = _recovery_blocked_post_commit_state(
+                    context,
+                    object_name=object_name,
+                    candidate_sha256=candidate_sha256,
+                    manifest_sha256=manifest_sha256,
+                )
+                raise PaperMigrationPostCommitIndeterminateError(
+                    "generation is visible but post-rename building identity is unavailable",
+                    state=state,
+                ) from exc
+            context.building_identity = building_identity
 
         rename_noreplace_at(
             context.building_fd,
@@ -1462,6 +1511,11 @@ def recover_paper_migration_publication(
     failure_after_phase: PaperMigrationFaultPoint | None = None,
 ) -> PaperMigrationPublicationReceipt:
     state = PaperMigrationPostCommitState.model_validate(state)
+    if state.recovery_status == "RECOVERY_BLOCKED":
+        raise PaperMigrationPostCommitIndeterminateError(
+            "paper migration recovery is blocked by unavailable post-rename identity",
+            state=state,
+        )
     if failure_after_phase not in {None, *RECOVERY_FAULT_POINTS}:
         raise ValueError("unsupported publication recovery failure phase")
     if state.policy_id != root_policy.policy_id:
