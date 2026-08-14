@@ -1687,6 +1687,10 @@ def test_v2_saga_renews_50ms_lease_while_80ms_dispatch_is_inflight(
     request, current, quota = _request(tmp_path)
     path = tmp_path / "saga.sqlite3"
     clock = _MutableUtcClock(datetime.now(UTC))
+    initial_time = clock.now()
+    heartbeat_time = initial_time + timedelta(seconds=0.04)
+    original_lease_boundary = initial_time + timedelta(seconds=0.05)
+    competitor_time = initial_time + timedelta(seconds=0.06)
     clock.install_source_broker_clock(monkeypatch)
     transport = _TestTransport(block_dispatch=True, clock=lambda: clock.now())
     lineage = _TestLineageAuthority()
@@ -1697,8 +1701,14 @@ def test_v2_saga_renews_50ms_lease_while_80ms_dispatch_is_inflight(
         saga: SourceBrokerV2Saga,
         **kwargs: object,
     ) -> None:
+        is_first_background_heartbeat = (
+            current_thread().name.startswith("rquant-source-broker-v2-heartbeat-")
+            and not heartbeat_renewed.is_set()
+        )
+        if is_first_background_heartbeat:
+            clock.current = heartbeat_time
         original_heartbeat(saga, **kwargs)  # type: ignore[arg-type]
-        if current_thread().name.startswith("rquant-source-broker-v2-heartbeat-"):
+        if is_first_background_heartbeat:
             heartbeat_renewed.set()
 
     monkeypatch.setattr(SourceBrokerV2Saga, "_heartbeat_outbox", observe_background_heartbeat)
@@ -1718,8 +1728,17 @@ def test_v2_saga_renews_50ms_lease_while_80ms_dispatch_is_inflight(
     with ThreadPoolExecutor(max_workers=2) as executor:
         first = executor.submit(run)
         assert transport.dispatch_entered.wait(timeout=5)
-        clock.advance(0.06)
         assert heartbeat_renewed.wait(timeout=5)
+        with sqlite3.connect(path) as connection:
+            heartbeat_at_raw, renewed_boundary_raw = connection.execute(
+                "SELECT executor_heartbeat_at, executor_lease_expires_at "
+                "FROM source_broker_v2_outbox WHERE phase = 'dispatch'"
+            ).fetchone()
+        heartbeat_at = datetime.fromisoformat(heartbeat_at_raw)
+        renewed_lease_boundary = datetime.fromisoformat(renewed_boundary_raw)
+        assert heartbeat_at == heartbeat_time
+        assert heartbeat_at < original_lease_boundary < competitor_time < renewed_lease_boundary
+        clock.current = competitor_time
         second = executor.submit(run)
         try:
             assert not transport.second_dispatch_entered.wait(timeout=0.1)
