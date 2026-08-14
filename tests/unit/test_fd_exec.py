@@ -177,6 +177,9 @@ def test_paper_publication_ci_job_machine_rejects_skipped_exact_node() -> None:
     report = "test-results/paper-publication-${{ matrix.os }}.xml"
 
     assert "os: [macos-14, ubuntu-24.04]" in job
+    assert 'root="${RUNNER_TEMP}/rquant-paper-publication"' in job
+    assert 'printf \'DATA_DIR=%s/data\\n\' "${root}"' in job
+    assert '>> "${GITHUB_ENV}"' in job
     assert job.count(node) == 1
     assert "pytest -o addopts='' -rA" in job
     assert f'--junitxml="{report}"' in job
@@ -544,9 +547,11 @@ def test_real_generation_exact_ci_job_is_no_skip_and_redacted() -> None:
     assert "name: Linux real generation smoke (${{ matrix.python-version }})" in job
     assert "timeout-minutes: 6" in job
     assert 'python-version: ["3.11", "3.12"]' in job
-    assert "RQUANT_FORMAL_EXACT_ROOT: ${{ runner.temp }}" in job
+    assert "${{ runner.temp }}" not in workflow
+    assert 'exact_root="${RUNNER_TEMP}/rquant-formal-exact-py${{ matrix.python-version }}"' in job
     assert 'exact_root="${RQUANT_FORMAL_EXACT_ROOT}"' in job
-    assert '>> "${GITHUB_ENV}"' not in job
+    assert 'printf \'RQUANT_FORMAL_EXACT_ROOT=%s\\n\' "${exact_root}"' in job
+    assert '>> "${GITHUB_ENV}"' in job
     assert "uv sync --frozen" in job
     assert "openssl genpkey -algorithm ED25519" in job
     assert "chmod 700" in job

@@ -180,14 +180,25 @@ jobs:
     env:
       RQUANT_DISABLE_DOTENV: "1"
       TUSHARE_TOKEN_MAIN: "00000000000000000000000000000000"
-      DATA_DIR: ${{ runner.temp }}/rquant-paper-publication/data
-      DUCKDB_PATH: ${{ runner.temp }}/rquant-paper-publication/data/test.duckdb
-      PARQUET_DIR: ${{ runner.temp }}/rquant-paper-publication/parquet
-      LOG_DIR: ${{ runner.temp }}/rquant-paper-publication/logs
       NOTIFY_ENABLED: "false"
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # actions/checkout@v4
+
+      - name: Create private paper-publication test root
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          root="${RUNNER_TEMP}/rquant-paper-publication"
+          mkdir -p "${root}/data" "${root}/parquet" "${root}/logs"
+          chmod 700 "${root}" "${root}/data" "${root}/parquet" "${root}/logs"
+          {
+            printf 'DATA_DIR=%s/data\n' "${root}"
+            printf 'DUCKDB_PATH=%s/data/test.duckdb\n' "${root}"
+            printf 'PARQUET_DIR=%s/parquet\n' "${root}"
+            printf 'LOG_DIR=%s/logs\n' "${root}"
+          } >> "${GITHUB_ENV}"
 
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # actions/setup-python@v5
         with:
@@ -306,18 +317,29 @@ jobs:
       matrix:
         python-version: ["3.11", "3.12"]
     env:
-      RQUANT_FORMAL_EXACT_ROOT: ${{ runner.temp }}/rquant-formal-exact-py${{ matrix.python-version }}
       RQUANT_DISABLE_DOTENV: "1"
       TUSHARE_TOKEN_MAIN: "00000000000000000000000000000000"
-      DATA_DIR: ${{ runner.temp }}/rquant-formal-exact-py${{ matrix.python-version }}/data
-      DUCKDB_PATH: ${{ runner.temp }}/rquant-formal-exact-py${{ matrix.python-version }}/data/main.duckdb
-      DUCKDB_READONLY_PATH: ${{ runner.temp }}/rquant-formal-exact-py${{ matrix.python-version }}/data/readonly.duckdb
-      PARQUET_DIR: ${{ runner.temp }}/rquant-formal-exact-py${{ matrix.python-version }}/parquet
-      LOG_DIR: ${{ runner.temp }}/rquant-formal-exact-py${{ matrix.python-version }}/logs
       NOTIFY_ENABLED: "false"
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # actions/checkout@v4
+
+      - name: Create private formal-generation test root
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          exact_root="${RUNNER_TEMP}/rquant-formal-exact-py${{ matrix.python-version }}"
+          mkdir -p "${exact_root}/data" "${exact_root}/parquet" "${exact_root}/logs"
+          chmod 700 "${exact_root}" "${exact_root}/data" "${exact_root}/parquet" "${exact_root}/logs"
+          {
+            printf 'RQUANT_FORMAL_EXACT_ROOT=%s\n' "${exact_root}"
+            printf 'DATA_DIR=%s/data\n' "${exact_root}"
+            printf 'DUCKDB_PATH=%s/data/main.duckdb\n' "${exact_root}"
+            printf 'DUCKDB_READONLY_PATH=%s/data/readonly.duckdb\n' "${exact_root}"
+            printf 'PARQUET_DIR=%s/parquet\n' "${exact_root}"
+            printf 'LOG_DIR=%s/logs\n' "${exact_root}"
+          } >> "${GITHUB_ENV}"
 
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # actions/setup-python@v5
         with:
