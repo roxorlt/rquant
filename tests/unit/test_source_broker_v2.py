@@ -1684,8 +1684,6 @@ def test_v2_saga_heartbeat_schedule_protects_only_before_lease_expiry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    original_heartbeat = SourceBrokerV2Saga._heartbeat_outbox
-
     def run_schedule(
         scenario_root: Path,
         *,
@@ -1703,15 +1701,13 @@ def test_v2_saga_heartbeat_schedule_protects_only_before_lease_expiry(
         expected_renewed_boundary = heartbeat_time + timedelta(seconds=0.05)
         transport = _TestTransport(block_dispatch=True, clock=lambda: clock.now())
         lineage = _TestLineageAuthority()
-        heartbeat_waiting = Event()
-        heartbeat_release = Event()
-        heartbeat_can_return = Event()
-        heartbeat_attempted = Event()
+        wake_ready = Event()
+        wake_release = Event()
+        heartbeat_observed = Event()
         competitor_release = Event()
         competitor_observed_lease = Event()
         competitor_can_continue = Event()
-        heartbeat_lock = Lock()
-        controlled_heartbeat_claimed = False
+        heartbeat_intervals: list[float] = []
         heartbeat_results: list[BaseException | None] = []
         competitor_lease_rows: list[tuple[datetime, str | None, str | None]] = []
 
@@ -1729,40 +1725,41 @@ def test_v2_saga_heartbeat_schedule_protects_only_before_lease_expiry(
 
         first_saga = saga()
         competitor_saga = saga()
+        original_first_heartbeat = first_saga._heartbeat_outbox
         original_competitor_read = competitor_saga._read_outbox
 
-        def schedule_background_heartbeat(
-            saga: SourceBrokerV2Saga,
-            **kwargs: object,
-        ) -> None:
-            nonlocal controlled_heartbeat_claimed
-            with heartbeat_lock:
-                is_controlled_heartbeat = (
-                    kwargs.get("phase") is SourceBrokerV2OutboxPhase.DISPATCH
-                    and current_thread().name.startswith(
-                        "rquant-source-broker-v2-heartbeat-"
-                    )
-                    and not controlled_heartbeat_claimed
-                )
-                if is_controlled_heartbeat:
-                    controlled_heartbeat_claimed = True
-            if not is_controlled_heartbeat:
-                original_heartbeat(saga, **kwargs)  # type: ignore[arg-type]
-                return
-            heartbeat_waiting.set()
-            if not heartbeat_release.wait(timeout=5):
-                raise TimeoutError("test scheduler did not release the heartbeat")
+        def controlled_heartbeat_wait(
+            stop: Event,
+            interval: float,
+            *,
+            phase: SourceBrokerV2OutboxPhase,
+        ) -> bool:
+            if phase is not SourceBrokerV2OutboxPhase.DISPATCH:
+                return stop.wait(interval)
+            heartbeat_intervals.append(interval)
+            if len(heartbeat_intervals) == 1:
+                wake_ready.set()
+                if not wake_release.wait(timeout=5):
+                    raise TimeoutError("test scheduler did not release the heartbeat wake")
+                return stop.is_set()
+            return stop.wait(timeout=5)
+
+        def observe_first_heartbeat(**kwargs: object) -> None:
+            is_background_dispatch = (
+                kwargs.get("phase") is SourceBrokerV2OutboxPhase.DISPATCH
+                and current_thread().name.startswith("rquant-source-broker-v2-heartbeat-")
+            )
             try:
-                original_heartbeat(saga, **kwargs)  # type: ignore[arg-type]
+                original_first_heartbeat(**kwargs)  # type: ignore[arg-type]
             except BaseException as exc:
-                heartbeat_results.append(exc)
-                heartbeat_attempted.set()
+                if is_background_dispatch:
+                    heartbeat_results.append(exc)
+                    heartbeat_observed.set()
                 raise
             else:
-                heartbeat_results.append(None)
-                heartbeat_attempted.set()
-                if not heartbeat_can_return.wait(timeout=5):
-                    raise TimeoutError("test scheduler did not complete the heartbeat tick")
+                if is_background_dispatch:
+                    heartbeat_results.append(None)
+                    heartbeat_observed.set()
 
         def observe_competitor_lease(
             connection: sqlite3.Connection,
@@ -1792,9 +1789,14 @@ def test_v2_saga_heartbeat_schedule_protects_only_before_lease_expiry(
         with monkeypatch.context() as scenario_patch:
             clock.install_source_broker_clock(scenario_patch)
             scenario_patch.setattr(
-                SourceBrokerV2Saga,
+                first_saga,
+                "_wait_for_heartbeat",
+                controlled_heartbeat_wait,
+            )
+            scenario_patch.setattr(
+                first_saga,
                 "_heartbeat_outbox",
-                schedule_background_heartbeat,
+                observe_first_heartbeat,
             )
             scenario_patch.setattr(
                 competitor_saga,
@@ -1808,59 +1810,78 @@ def test_v2_saga_heartbeat_schedule_protects_only_before_lease_expiry(
                     now=NOW + timedelta(seconds=1),
                 )
                 competitor = executor.submit(run_competitor)
-                assert transport.dispatch_entered.wait(timeout=5)
-                assert heartbeat_waiting.wait(timeout=5)
+                try:
+                    assert transport.dispatch_entered.wait(timeout=5)
+                    assert wake_ready.wait(timeout=5)
+                    expected_interval = 0.05 / 3
+                    assert heartbeat_intervals == [pytest.approx(expected_interval)]
+                    assert heartbeat_intervals[0] < 0.05
 
-                if expect_renewal:
-                    clock.current = heartbeat_time
-                    heartbeat_release.set()
-                    assert heartbeat_attempted.wait(timeout=5)
-                    assert heartbeat_results == [None]
+                    if expect_renewal:
+                        clock.current = heartbeat_time
+                        wake_release.set()
+                        assert heartbeat_observed.wait(timeout=5)
+                        assert heartbeat_results == [None]
 
-                clock.current = competitor_time
-                competitor_release.set()
-                assert competitor_observed_lease.wait(timeout=5)
-                observed_at, observed_heartbeat_raw, observed_expiry_raw = (
-                    competitor_lease_rows[0]
-                )
-                expected_heartbeat = heartbeat_time if expect_renewal else initial_time
-                expected_expiry = (
-                    expected_renewed_boundary if expect_renewal else original_lease_boundary
-                )
-                assert observed_at == competitor_time
-                assert datetime.fromisoformat(observed_heartbeat_raw) == expected_heartbeat
-                assert datetime.fromisoformat(observed_expiry_raw) == expected_expiry
-                competitor_can_continue.set()
-
-                if expect_renewal:
-                    assert heartbeat_time < original_lease_boundary
-                    assert competitor_time < expected_renewed_boundary
-                    heartbeat_can_return.set()
-                    transport.release_dispatch.set()
-                    results = [first.result(timeout=10), competitor.result(timeout=10)]
-                    assert {result.state for result in results} == {
-                        SourceBrokerV2SagaState.COMPLETE
-                    }
-                else:
-                    assert original_lease_boundary < competitor_time < heartbeat_time
-                    competitor_result = competitor.result(timeout=10)
-                    assert (
-                        competitor_result.state
-                        is SourceBrokerV2SagaState.RECONCILE_REQUIRED
+                    clock.current = competitor_time
+                    competitor_release.set()
+                    assert competitor_observed_lease.wait(timeout=5)
+                    observed_at, observed_heartbeat_raw, observed_expiry_raw = (
+                        competitor_lease_rows[0]
                     )
-                    clock.current = heartbeat_time
-                    heartbeat_release.set()
-                    assert heartbeat_attempted.wait(timeout=5)
-                    transport.release_dispatch.set()
-                    first_result = first.result(timeout=10)
-                    assert first_result.state is SourceBrokerV2SagaState.RECONCILE_REQUIRED
-                    assert any(
-                        isinstance(error, SourceBrokerV2SagaConflictError)
-                        for error in heartbeat_results
-                        if error is not None
+                    expected_heartbeat = heartbeat_time if expect_renewal else initial_time
+                    expected_expiry = (
+                        expected_renewed_boundary
+                        if expect_renewal
+                        else original_lease_boundary
                     )
+                    assert observed_at == competitor_time
+                    assert datetime.fromisoformat(observed_heartbeat_raw) == expected_heartbeat
+                    assert datetime.fromisoformat(observed_expiry_raw) == expected_expiry
+                    competitor_can_continue.set()
+
+                    if expect_renewal:
+                        assert heartbeat_time < original_lease_boundary
+                        assert competitor_time < expected_renewed_boundary
+                        transport.release_dispatch.set()
+                        results = [first.result(timeout=10), competitor.result(timeout=10)]
+                        assert {result.state for result in results} == {
+                            SourceBrokerV2SagaState.COMPLETE
+                        }
+                    else:
+                        assert original_lease_boundary < competitor_time < heartbeat_time
+                        competitor_result = competitor.result(timeout=10)
+                        assert (
+                            competitor_result.state
+                            is SourceBrokerV2SagaState.RECONCILE_REQUIRED
+                        )
+                        clock.current = heartbeat_time
+                        wake_release.set()
+                        assert heartbeat_observed.wait(timeout=5)
+                        transport.release_dispatch.set()
+                        first_result = first.result(timeout=10)
+                        assert (
+                            first_result.state
+                            is SourceBrokerV2SagaState.RECONCILE_REQUIRED
+                        )
+                        assert any(
+                            isinstance(error, SourceBrokerV2SagaConflictError)
+                            for error in heartbeat_results
+                            if error is not None
+                        )
+                finally:
+                    wake_release.set()
+                    competitor_release.set()
+                    competitor_can_continue.set()
+                    transport.release_dispatch.set()
 
         assert transport.dispatch_calls == 1
+        assert heartbeat_intervals
+        assert all(interval == pytest.approx(0.05 / 3) for interval in heartbeat_intervals)
+        assert not any(
+            thread.name.startswith("rquant-source-broker-v2-heartbeat-")
+            for thread in enumerate_threads()
+        )
 
     run_schedule(
         tmp_path / "late-heartbeat",
@@ -1872,6 +1893,13 @@ def test_v2_saga_heartbeat_schedule_protects_only_before_lease_expiry(
         heartbeat_delay_seconds=0.04,
         expect_renewal=True,
     )
+    with pytest.raises(TypeError, match="unexpected keyword argument 'heartbeat_scheduler'"):
+        SourceBrokerV2Saga.for_production(
+            tmp_path / "production.sqlite3",
+            runtime=object(),
+            scheduler_clients=object(),
+            heartbeat_scheduler=object(),  # type: ignore[call-arg]
+        )
 
 
 def test_v2_saga_persists_source_window_grant_and_terminal_observation(

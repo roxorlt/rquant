@@ -3224,6 +3224,16 @@ class SourceBrokerV2Saga:
     def _before_external_effect(self, phase: SourceBrokerV2OutboxPhase) -> None:
         """Test seam after durable ownership but before an external invocation."""
 
+    def _wait_for_heartbeat(
+        self,
+        stop: Event,
+        interval: float,
+        *,
+        phase: SourceBrokerV2OutboxPhase,
+    ) -> bool:
+        del phase
+        return stop.wait(interval)
+
     def _invoke_with_heartbeat(
         self,
         *,
@@ -3239,7 +3249,7 @@ class SourceBrokerV2Saga:
         interval = self._executor_lease_seconds / 3
 
         def renew() -> None:
-            while not stop.wait(interval):
+            while not self._wait_for_heartbeat(stop, interval, phase=phase):
                 try:
                     self._heartbeat_outbox(
                         phase=phase,
