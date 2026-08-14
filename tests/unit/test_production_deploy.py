@@ -2387,13 +2387,12 @@ def test_shell_entrypoint_forwards_complete_runtime_profile_environment(
     fake_python.chmod(0o700)
     inputs = tmp_path / "runtime-inputs.json"
     profiles = tmp_path / "profiles"
-    runtime_root = tmp_path / "runtime"
     environment = {
         **os.environ,
         "RQUANT_DEPLOY_PYTHON": str(fake_python),
         "RQUANT_RUNTIME_PRODUCTION_INPUTS": str(inputs),
         "RQUANT_RUNTIME_PROFILE_OUTPUT_DIR": str(profiles),
-        "RQUANT_RUNTIME_ROOT": str(runtime_root),
+        "RQUANT_RUNTIME_ROOT": "/home/lighthouse/rquant/data/runtime",
     }
 
     result = subprocess.run(
@@ -2413,7 +2412,7 @@ def test_shell_entrypoint_forwards_complete_runtime_profile_environment(
         "--runtime-profile-output-dir",
         str(profiles),
         "--runtime-root",
-        str(runtime_root),
+        "/home/lighthouse/rquant/data/runtime",
     ]
     assert "--runtime-schema-v1-migration-authority" not in arguments
 
@@ -2476,7 +2475,10 @@ def test_shell_entrypoint_rejects_linux_production_without_runtime_profile(
     )
 
     assert result.returncode == 2
-    assert "Linux production requires runtime production inputs" in result.stderr
+    assert (
+        "Linux production requires runtime production inputs, profile output "
+        "directory, and runtime root" in result.stderr
+    )
 
 
 def test_shell_entrypoint_rejects_relocated_linux_production_runtime_root(
@@ -2923,6 +2925,10 @@ def test_process_runner_base_exception_contains_detached_grandchild(
             result = self._process.communicate(*args, **kwargs)
             self.returncode = self._process.returncode
             return result
+
+        def poll(self) -> int | None:
+            self.returncode = self._process.poll()
+            return self.returncode
 
     monkeypatch.setattr(
         production_deploy.subprocess,

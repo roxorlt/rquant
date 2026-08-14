@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 import plistlib
+import shlex
 import shutil
 import signal
 import subprocess
@@ -212,18 +213,31 @@ def _tiny_test_venv(checkout: Path) -> Path:
     venv_root = checkout / ".venv"
     python = venv_root / "bin" / "python"
     python.parent.mkdir(parents=True)
-    shutil.copy2(sys.executable, python)
-    python.chmod(0o700)
+    system_python = checkout / ".test-system-python"
+    _write_test_interpreter(system_python, system_python)
+    _write_test_interpreter(python, system_python)
     version = f"{sys.version_info.major}.{sys.version_info.minor}"
     (venv_root / "pyvenv.cfg").write_text(
         f"home = {Path(sys.base_prefix) / 'bin'}\nversion = {version}\n",
         encoding="utf-8",
     )
     (venv_root / "lib" / f"python{version}" / "site-packages").mkdir(parents=True)
-    python_library = Path(sys.base_prefix) / "lib" / f"libpython{version}.dylib"
-    if python_library.exists():
-        shutil.copy2(python_library, venv_root / "lib" / python_library.name)
     return python
+
+
+def _write_test_interpreter(path: Path, system_python: Path) -> None:
+    path.write_text(
+        "#!/bin/sh\n"
+        "if [ \"${1:-}\" = '-I' ] && [ \"${2:-}\" = '-S' ] && "
+        "[ \"${3:-}\" = '-c' ] && "
+        "[ \"${4:-}\" = 'import sys; print(sys._base_executable)' ]; then\n"
+        f"    printf '%s\\n' {shlex.quote(str(system_python))}\n"
+        "    exit 0\n"
+        "fi\n"
+        f'exec {shlex.quote(sys.executable)} "$@"\n',
+        encoding="utf-8",
+    )
+    path.chmod(0o700)
 
 
 def _git(checkout: Path, *arguments: str) -> str:
@@ -332,31 +346,33 @@ def _checkout(
     python = _tiny_test_venv(checkout)
     rquant = checkout / ".venv" / "bin" / "rquant"
     rquant.write_text(
-        f"#!{python}\n"
-        "import os, sys\n"
-        "if sys.argv[1:] != ['preflight']:\n"
-        "    raise SystemExit(64)\n"
-        "raise SystemExit(int(os.environ.get('PREFLIGHT_EXIT', '0')))\n",
+        "#!/bin/sh\n"
+        'if [ "$#" -ne 1 ] || [ "$1" != \'preflight\' ]; then\n'
+        "    exit 64\n"
+        "fi\n"
+        'exit "${PREFLIGHT_EXIT:-0}"\n',
         encoding="utf-8",
     )
     rquant.chmod(0o700)
     uv = checkout / ".venv" / "bin" / "uv"
     uv.write_text(
-        f"#!{python}\n"
-        "import os, shutil, sys\n"
-        "from pathlib import Path\n"
-        "if sys.argv[1] == 'venv':\n"
-        "    shutil.copytree(\n"
-        "        Path(sys.prefix), Path(sys.argv[-1]), dirs_exist_ok=True, symlinks=True\n"
-        "    )\n"
-        "elif sys.argv[1:3] == ['sync', '--frozen']:\n"
-        "    if target_value := os.environ.get('UV_PROJECT_ENVIRONMENT'):\n"
-        "        target = Path(target_value)\n"
-        "        if not (target / 'pyvenv.cfg').exists():\n"
-        "            shutil.copytree(Path(sys.prefix), target, dirs_exist_ok=True, symlinks=True)\n"
-        "else:\n"
-        "    raise SystemExit(64)\n"
-        "raise SystemExit(int(os.environ.get('UV_SYNC_EXIT', '0')))\n",
+        "#!/bin/sh\n"
+        'for argument in "$@"; do\n'
+        '    target="${argument}"\n'
+        "done\n"
+        "if [ \"${1:-}\" = 'venv' ]; then\n"
+        '    mkdir -p "${target}"\n'
+        '    /bin/cp -R "$(dirname "$0")/.."/. "${target}"/\n'
+        "elif [ \"${1:-}\" = 'sync' ] && [ \"${2:-}\" = '--frozen' ]; then\n"
+        '    if [ -n "${UV_PROJECT_ENVIRONMENT:-}" ] && [ ! -e '
+        '"${UV_PROJECT_ENVIRONMENT}/pyvenv.cfg" ]; then\n'
+        '        mkdir -p "${UV_PROJECT_ENVIRONMENT}"\n'
+        '        /bin/cp -R "$(dirname "$0")/.."/. "${UV_PROJECT_ENVIRONMENT}"/\n'
+        "    fi\n"
+        "else\n"
+        "    exit 64\n"
+        "fi\n"
+        'exit "${UV_SYNC_EXIT:-0}"\n',
         encoding="utf-8",
     )
     uv.chmod(0o700)
@@ -5662,7 +5678,7 @@ def test_initialize_generation_accepts_uv_style_symlinked_python(
 ) -> None:
     checkout, python, lock_path, commit = _checkout(tmp_path, publish_marker=False)
     python.unlink()
-    python.symlink_to(Path(sys.executable).resolve(strict=True))
+    python.symlink_to(checkout / ".test-system-python")
 
     result = subprocess.run(
         _command(
