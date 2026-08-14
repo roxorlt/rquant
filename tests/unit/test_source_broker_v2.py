@@ -1379,9 +1379,14 @@ def test_v2_saga_rejects_non_canonical_sqlite_state_before_external_effect(
     assert issubclass(SourceBrokerV2SagaIntegrityError, RuntimeError)
 
 
-def test_v2_saga_happy_path_persists_all_effects_before_lineage(tmp_path: Path) -> None:
+def test_v2_saga_happy_path_persists_all_effects_before_lineage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     request, current, quota = _request(tmp_path)
-    transport = _TestTransport()
+    clock = _MutableUtcClock(datetime.now(UTC))
+    clock.install_source_broker_clock(monkeypatch)
+    transport = _TestTransport(clock=lambda: clock.now())
     lineage = _TestLineageAuthority()
     saga = SourceBrokerV2Saga.for_nonproduction(
         tmp_path / "saga.sqlite3",
@@ -1568,7 +1573,9 @@ def test_v2_saga_concurrent_same_attempt_has_one_durable_source_effect(
 ) -> None:
     request, current, quota = _request(tmp_path)
     path = tmp_path / "saga.sqlite3"
-    transport = _TestTransport(block_dispatch=True)
+    clock = _MutableUtcClock(datetime.now(UTC))
+    clock.install_source_broker_clock(monkeypatch)
+    transport = _TestTransport(block_dispatch=True, clock=lambda: clock.now())
     lineage = _TestLineageAuthority()
 
     probe = SourceBrokerV2Saga.for_nonproduction(
@@ -1670,7 +1677,13 @@ def test_v2_saga_concurrent_same_attempt_has_one_durable_source_effect(
         first = executor.submit(run)
         second = executor.submit(run)
         start.wait(timeout=5)
-        assert transport.dispatch_entered.wait(timeout=5)
+        dispatch_wait_deadline = time.monotonic() + 5
+        while not transport.dispatch_entered.wait(timeout=0.01):
+            for future in (first, second):
+                if future.done():
+                    future.result()
+            if time.monotonic() >= dispatch_wait_deadline:
+                pytest.fail("concurrent saga workers did not reach source dispatch")
         assert not transport.second_dispatch_entered.wait(timeout=0.25)
         transport.release_dispatch.set()
         results = [first.result(timeout=10), second.result(timeout=10)]
@@ -1904,15 +1917,18 @@ def test_v2_saga_heartbeat_schedule_protects_only_before_lease_expiry(
 
 def test_v2_saga_persists_source_window_grant_and_terminal_observation(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     request, current, quota = _request(tmp_path)
     path = tmp_path / "saga.sqlite3"
+    clock = _MutableUtcClock(datetime.now(UTC))
+    clock.install_source_broker_clock(monkeypatch)
     saga = SourceBrokerV2Saga.for_nonproduction(
         path,
         saga_id="saga-a",
         current_claim_authority=current,
         quota_adapter=quota,
-        transport=_TestTransport(),
+        transport=_TestTransport(clock=lambda: clock.now()),
         lineage_authority=_TestLineageAuthority(),
     )
 
@@ -1938,6 +1954,43 @@ def test_v2_saga_persists_source_window_grant_and_terminal_observation(
     )
     assert started_at <= deadline <= takeover_at
     assert receipt_count == 2
+
+    expired_root = tmp_path / "expired-before-invoke"
+    expired_root.mkdir()
+    expired_request, expired_current, expired_quota = _request(
+        expired_root,
+        saga_id="saga-expired-before-invoke",
+    )
+    expired_transport = _TestTransport(clock=lambda: clock.now())
+    original_claim_once = expired_transport.claim_once
+
+    def expire_after_claim(payload: bytes, *, deadline: float | None = None) -> bytes:
+        response = original_claim_once(payload, deadline=deadline)
+        clock.advance(0.30)
+        return response
+
+    monkeypatch.setattr(expired_transport, "claim_once", expire_after_claim)
+    expired_path = expired_root / "saga.sqlite3"
+    expired_saga = SourceBrokerV2Saga.for_nonproduction(
+        expired_path,
+        saga_id="saga-expired-before-invoke",
+        current_claim_authority=expired_current,
+        quota_adapter=expired_quota,
+        transport=expired_transport,
+        lineage_authority=_TestLineageAuthority(),
+    )
+
+    expired = expired_saga.advance(expired_request, now=NOW + timedelta(seconds=1))
+
+    assert expired.state is SourceBrokerV2SagaState.RECONCILE_REQUIRED
+    assert expired_transport.dispatch_calls == 0
+    with sqlite3.connect(expired_path) as connection:
+        invoke_started, dispatch_started, owner, lease_expiry = connection.execute(
+            "SELECT invoke_started, dispatch_started_at, executor_owner_token, "
+            "executor_lease_expires_at FROM source_broker_v2_outbox "
+            "WHERE phase = 'dispatch'"
+        ).fetchone()
+    assert (invoke_started, dispatch_started, owner, lease_expiry) == (0, None, None, None)
 
 
 def test_v2_saga_rejects_tampered_historical_source_authority_receipt(

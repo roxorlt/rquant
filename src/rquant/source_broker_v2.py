@@ -3425,17 +3425,35 @@ class SourceBrokerV2Saga:
                 if row["status"] == "applied":
                     connection.commit()
                     return
-                if phase in {
+                source_phase = phase in {
                     SourceBrokerV2OutboxPhase.DISPATCH,
                     SourceBrokerV2OutboxPhase.SOURCE_FINALIZE,
-                }:
+                }
+                started_at = datetime.now(UTC)
+                if source_phase:
+                    prior_started_at = _optional_executor_time(
+                        row["dispatch_started_at"],
+                        label="source dispatch start",
+                    )
+                    max_deadline = _optional_executor_time(
+                        row["max_external_deadline"],
+                        label="source maximum external deadline",
+                    )
+                    if max_deadline is None:
+                        raise SourceBrokerV2SagaIntegrityError(
+                            "source invocation lacks its persisted deadline"
+                        )
+                    if prior_started_at is None and started_at > max_deadline:
+                        raise SourceBrokerV2SagaReconcileRequiredError(
+                            "source invocation did not start before its persisted deadline"
+                        )
                     updated = connection.execute(
                         "UPDATE source_broker_v2_outbox SET invoke_started = 1, "
                         "dispatch_started_at = COALESCE(dispatch_started_at, ?) "
                         "WHERE operation_id = ? AND status = 'pending' "
                         "AND executor_owner_token = ? AND executor_generation = ?",
                         (
-                            datetime.now(UTC).isoformat(),
+                            started_at.isoformat(),
                             operation_id,
                             self._executor_owner_token,
                             owner_generation,
