@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -27,6 +28,7 @@ MAX_INDEX_BYTES = 64 * 1024
 MAX_SHARD_MANIFEST_BYTES = 2 * 1024 * 1024
 MAX_MANIFEST_TOTAL_BYTES = 4 * 1024 * 1024
 MAX_COLLECTION_BYTES = MAX_MANIFEST_TOTAL_BYTES
+CI_DUMMY_TUSHARE_TOKEN = "0" * 32
 
 _INDEX_FIELDS = frozenset({"schema_version", "selector", "partition", "full_suite", "shards"})
 _PARTITION_FIELDS = frozenset({"algorithm", "shard_count"})
@@ -34,6 +36,16 @@ _FULL_SUITE_FIELDS = frozenset({"cases", "skips", "sha256"})
 _SHARD_FIELDS = frozenset({"id", "path", "count", "sha256"})
 _NODEID_FIELDS = frozenset({"nodeid"})
 _COLLECTION_FIELDS = frozenset({"nodeids"})
+_CI_PRIVATE_DIRECTORIES = ("tmp", "data", "parquet", "logs")
+_SENSITIVE_ENVIRONMENT_SUFFIXES = (
+    "_API_KEY",
+    "_CREDENTIAL",
+    "_CREDENTIALS",
+    "_PASSWORD",
+    "_SECRET",
+    "_TOKEN",
+    "_TOKENS",
+)
 
 # These are conservative historical weights for files that dominated the former
 # monolithic CI job. Every other file still contributes its case count.
@@ -49,6 +61,86 @@ STATIC_FILE_WEIGHTS = {
 
 class ContractError(ValueError):
     """Raised when checked-in CI selection evidence cannot be trusted."""
+
+
+def _canonical_directory(path: Path, *, label: str) -> Path:
+    if not path.is_absolute():
+        raise ContractError(f"{label} must be absolute")
+    try:
+        metadata = path.lstat()
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise ContractError(f"{label} is unavailable: {path}") from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise ContractError(f"{label} must be a non-symlink directory: {path}")
+    if resolved != path:
+        raise ContractError(f"{label} must be canonical: {path}")
+    return resolved
+
+
+def _private_ci_environment(root: Path) -> dict[str, str]:
+    canonical_root = _canonical_directory(root, label="full-suite CI root")
+    canonical_root.chmod(0o700)
+    directories: dict[str, Path] = {}
+    for name in _CI_PRIVATE_DIRECTORIES:
+        path = canonical_root / name
+        try:
+            path.mkdir(mode=0o700)
+            path.chmod(0o700)
+        except OSError as exc:
+            raise ContractError(f"cannot create private full-suite directory: {path}") from exc
+        directories[name] = _canonical_directory(path, label="full-suite CI directory")
+    return {
+        "RQUANT_CI_ROOT": str(canonical_root),
+        "TMPDIR": str(directories["tmp"]),
+        "TMP": str(directories["tmp"]),
+        "TEMP": str(directories["tmp"]),
+        "DATA_DIR": str(directories["data"]),
+        "DUCKDB_PATH": str(directories["data"] / "test.duckdb"),
+        "DUCKDB_READONLY_PATH": str(directories["data"] / "test_ro.duckdb"),
+        "PARQUET_DIR": str(directories["parquet"]),
+        "LOG_DIR": str(directories["logs"]),
+        "RQUANT_DISABLE_DOTENV": "1",
+        "TUSHARE_TOKEN_MAIN": CI_DUMMY_TUSHARE_TOKEN,
+        "NOTIFY_ENABLED": "false",
+    }
+
+
+def _create_private_ci_environment(base_dir: Path, *, label: str) -> dict[str, str]:
+    if re.fullmatch(r"[A-Za-z0-9.-]+", label) is None:
+        raise ContractError("full-suite CI environment label is invalid")
+    canonical_base = _canonical_directory(base_dir, label="full-suite CI base directory")
+    try:
+        root = Path(
+            tempfile.mkdtemp(
+                prefix=f"rqci.full-suite.{label}.",
+                dir=canonical_base,
+            )
+        ).resolve(strict=True)
+    except OSError as exc:
+        raise ContractError("cannot create private full-suite CI root") from exc
+    return _private_ci_environment(root)
+
+
+def _append_github_environment(path: Path, environment: dict[str, str]) -> None:
+    if "\n" in str(path) or "\r" in str(path):
+        raise ContractError("GITHUB_ENV path contains a line break")
+    try:
+        with path.open("a", encoding="utf-8", newline="\n") as handle:
+            for name, value in environment.items():
+                if any(character in value for character in "\r\n"):
+                    raise ContractError(f"full-suite environment value is invalid: {name}")
+                handle.write(f"{name}={value}\n")
+    except OSError as exc:
+        raise ContractError(f"cannot write GITHUB_ENV: {path}") from exc
+
+
+def _without_inherited_credentials(environment: dict[str, str]) -> dict[str, str]:
+    return {
+        name: value
+        for name, value in environment.items()
+        if not name.upper().endswith(_SENSITIVE_ENVIRONMENT_SUFFIXES)
+    }
 
 
 def _is_line_control(character: str) -> bool:
@@ -463,8 +555,10 @@ def collect_nodeids(
     repository_root: Path = REPOSITORY_ROOT,
 ) -> tuple[str, ...]:
     with tempfile.TemporaryDirectory(prefix="rquant-full-suite-collect-") as directory:
-        output = Path(directory) / "collection.json"
-        environment = os.environ.copy()
+        private_root = Path(directory).resolve(strict=True)
+        output = private_root / "collection.json"
+        environment = _without_inherited_credentials(os.environ.copy())
+        environment.update(_private_ci_environment(private_root))
         environment.pop("PYTEST_ADDOPTS", None)
         pythonpath_root = str(Path(__file__).resolve().parent.parent)
         existing_pythonpath = environment.get("PYTHONPATH")
@@ -621,6 +715,10 @@ def _parse_args(arguments: Sequence[str] | None = None) -> argparse.Namespace:
     generate = commands.add_parser("generate")
     generate.add_argument("--manifest-dir", type=Path, required=True)
     generate.add_argument("--expected-skips", type=int, required=True)
+    prepare_environment = commands.add_parser("prepare-environment")
+    prepare_environment.add_argument("--github-env", type=Path, required=True)
+    prepare_environment.add_argument("--base-dir", type=Path, required=True)
+    prepare_environment.add_argument("--label", required=True)
     run = commands.add_parser("run")
     check = commands.add_parser("check")
     for command in (run, check):
@@ -634,6 +732,10 @@ def _parse_args(arguments: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(arguments: Sequence[str] | None = None) -> int:
     args = _parse_args(arguments)
+    if args.command == "prepare-environment":
+        environment = _create_private_ci_environment(args.base_dir, label=args.label)
+        _append_github_environment(args.github_env, environment)
+        return 0
     if args.command == "generate":
         nodeids = collect_nodeids(())
         write_manifest_bundle(

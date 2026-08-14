@@ -31,8 +31,8 @@ uv run pytest --cov=rquant --cov-report=term-missing
 ## Full Suite CI 分片
 
 默认非网络、非 `linux_exact` 全集由
-`tests/manifests/full-suite-v1/index.json` 固定为 **11143 cases / 48 skips**，并以
-`d0fd4dde7a268c7324f872ae827740e9e3825f470c0706d0e4b705f8b3a2b99f` 绑定完整 nodeid
+`tests/manifests/full-suite-v1/index.json` 固定为 **11144 cases / 48 skips**，并以
+`757c3811f8181b587e558d5eecac8dcfbbe4afdc7b969e57d811128e1bd5e829` 绑定完整 nodeid
 集合。四个 JSONL shard 必须并集精确等于该集合、彼此不重叠；不要手改 nodeid 或 digest。
 
 在改动测试选择面时，使用与 CI 相同的 dummy 配置重生成清单，再审查分配与 digest：
@@ -52,6 +52,9 @@ CI 先由 `core-preflight` 在 Python 3.11/3.12 运行 lint、smoke 与 SourceBr
 selector、校验全量和 shard digest，并仅通过 pytest `@argsfile` 传入 nodeid。每版本的
 `full-suite-contract` 下载全部 4 份 JUnit/selection evidence，缺任一 artifact、版本或
 shard 混入、JUnit 失败/error、case/skip 偏移都会失败。
+
+shard runner 与 contract aggregator 通过同一个 stdlib 环境准备入口创建 canonical 私有
+根目录；默认 collect 会强制 dummy token、禁用 dotenv/通知并清除继承凭据，不读取仓库配置。
 
 v1 manifest 的 selector 固定为空列表。index 与 JSONL 必须是无重复 key、无未知字段的
 canonical JSON；nodeid 文件部分只能指向仓库内非符号链接的 `tests/**/*.py`。单 nodeid

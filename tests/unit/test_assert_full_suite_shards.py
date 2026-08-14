@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,13 @@ NODEIDS = (
     "tests/b.py::test_b",
     "tests/c.py::test_c",
     "tests/d.py::test_d",
+)
+
+CLEAN_ENV_NODEIDS = (
+    "tests/test_a.py::test_a",
+    "tests/test_b.py::test_b",
+    "tests/test_c.py::test_c",
+    "tests/test_d.py::test_d",
 )
 
 
@@ -103,6 +111,47 @@ def _write_artifacts(
         (artifact / "junit.xml").write_text(xml, encoding="utf-8")
 
 
+def _write_clean_environment_repository(root: Path) -> None:
+    tests_root = root / "tests"
+    tests_root.mkdir(parents=True)
+    for nodeid in CLEAN_ENV_NODEIDS:
+        relative, _, test_name = nodeid.partition("::")
+        (root / relative).write_text(
+            f"def {test_name}():\n    assert True\n",
+            encoding="utf-8",
+        )
+    (tests_root / "conftest.py").write_text(
+        """from pathlib import Path
+import os
+
+root = Path(os.environ["RQUANT_CI_ROOT"])
+assert root.is_absolute() and root.resolve(strict=True) == root
+assert os.environ["RQUANT_DISABLE_DOTENV"] == "1"
+assert os.environ["TUSHARE_TOKEN_MAIN"] == "0" * 32
+assert os.environ["NOTIFY_ENABLED"] == "false"
+for name, relative in {
+    "TMPDIR": "tmp",
+    "TMP": "tmp",
+    "TEMP": "tmp",
+    "DATA_DIR": "data",
+    "DUCKDB_PATH": "data/test.duckdb",
+    "DUCKDB_READONLY_PATH": "data/test_ro.duckdb",
+    "PARQUET_DIR": "parquet",
+    "LOG_DIR": "logs",
+}.items():
+    assert Path(os.environ[name]) == root / relative
+
+from rquant.config import settings
+
+assert settings.data_dir == root / "data"
+assert settings.duckdb_path == root / "data/test.duckdb"
+assert settings.parquet_dir == root / "parquet"
+assert settings.log_dir == root / "logs"
+""",
+        encoding="utf-8",
+    )
+
+
 def test_validator_aggregates_real_testcases_and_skips(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -115,6 +164,89 @@ def test_validator_aggregates_real_testcases_and_skips(
     summary = _validate(manifest_root, artifacts, monkeypatch)
 
     assert summary == {"cases": 4, "skipped": 1, "failures": 0, "errors": 0}
+
+
+def test_clean_environment_aggregate_uses_shared_private_collect_setup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository_root = (tmp_path / "clean-repository").resolve()
+    _write_clean_environment_repository(repository_root)
+    manifest_root = tmp_path / "manifest"
+    index = shards.write_manifest_bundle(
+        manifest_root,
+        selector=(),
+        shard_nodeids=tuple((nodeid,) for nodeid in CLEAN_ENV_NODEIDS),
+        expected_skips=1,
+        repository_root=repository_root,
+    )
+    artifacts = tmp_path / "artifacts"
+    _write_artifacts(artifacts, index)
+    project_environment = {
+        "DATA_DIR",
+        "DEEPSEEK_API_KEY",
+        "DUCKDB_PATH",
+        "DUCKDB_READONLY_PATH",
+        "LOG_DIR",
+        "NOTIFY_ENABLED",
+        "PANORAMA_COOKIE_SECRET",
+        "PANORAMA_GATE_TOKEN",
+        "PARQUET_DIR",
+        "PUSHDEER_KEYS",
+        "PUSHPLUS_TOKENS",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "TUSHARE_TOKEN_BACKUP",
+        "TUSHARE_TOKEN_MAIN",
+    }
+    project_environment.update(name for name in os.environ if name.startswith("RQUANT_"))
+    for name in project_environment:
+        monkeypatch.delenv(name, raising=False)
+
+    summary = validator.validate_artifacts(
+        manifest_root,
+        artifacts,
+        expected_python="3.12",
+        repository_root=repository_root,
+    )
+
+    assert summary == {"cases": 4, "skipped": 1, "failures": 0, "errors": 0}
+    workflow = (Path(__file__).parents[2] / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    setup_command = "python scripts/full_suite_shards.py prepare-environment"
+    assert workflow.count(setup_command) == 2
+    shard_job, contract_job = workflow.split("  full-suite-contract:\n", maxsplit=1)
+    assert setup_command in shard_job.split("  full-suite-shard:\n", maxsplit=1)[1]
+    assert setup_command in contract_job.split("  runtime-fd-exec-linux:\n", maxsplit=1)[0]
+
+    workflow_base = tmp_path / "workflow-temp"
+    workflow_base.mkdir(mode=0o700)
+    github_environment = tmp_path / "github-env"
+    assert (
+        shards.main(
+            [
+                "prepare-environment",
+                "--github-env",
+                str(github_environment),
+                "--base-dir",
+                str(workflow_base),
+                "--label",
+                "py3.12-contract",
+            ]
+        )
+        == 0
+    )
+    prepared = dict(
+        line.split("=", maxsplit=1)
+        for line in github_environment.read_text(encoding="utf-8").splitlines()
+    )
+    prepared_root = Path(prepared["RQUANT_CI_ROOT"])
+    assert prepared_root.parent == workflow_base
+    assert prepared_root.resolve(strict=True) == prepared_root
+    assert prepared_root.stat().st_mode & 0o777 == 0o700
+    assert prepared["RQUANT_DISABLE_DOTENV"] == "1"
+    assert prepared["TUSHARE_TOKEN_MAIN"] == "0" * 32
+    assert prepared["NOTIFY_ENABLED"] == "false"
 
 
 @pytest.mark.parametrize("outcome", ("failure", "error"))
