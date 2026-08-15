@@ -8,6 +8,7 @@ import json
 import multiprocessing
 import os
 import random
+import re
 import shutil
 import signal
 import socket
@@ -52,6 +53,7 @@ from rquant.lab_shard_protocol import (
     LabWorkerReport,
     LabWorkerStopped,
 )
+from rquant.lab_worker import LabWorkerFailure
 from rquant.research_run_spec import DatasetSnapshotIdentity, ResearchRunSpec
 from rquant.strategy_job_adapters import (
     LabShardExecutionResult,
@@ -1768,29 +1770,56 @@ def test_result_wire_outbound_gate_matches_parent_receive_limit_without_large_al
     assert not connection.sent
     first = lab_worker._new_wire_session(roots=(Path("/private/tmp"),))
     second = lab_worker._new_wire_session(roots=(Path("/private/tmp"),))
-    accepted: list[object] = []
+    accepted: dict[str, bytes] = {}
+    responses: dict[str, bytes] = {}
 
-    def accept_once() -> None:
-        accepted_connection = first.listener.accept()
-        accepted.append(accepted_connection)
-        accepted_connection.close()
+    def accept_once(name: str, session: object) -> None:
+        accepted_connection = session.listener.accept()
+        try:
+            payload = accepted_connection.recv_bytes()
+            accepted[name] = payload
+            accepted_connection.send_bytes(b"ack:" + payload)
+        finally:
+            accepted_connection.close()
 
-    thread = threading.Thread(target=accept_once)
-    thread.start()
-    authenticated_connection = lab_worker.Client(
-        first.address,
-        family="AF_UNIX",
-        authkey=first.authkey,
-    )
-    authenticated_connection.close()
-    thread.join(timeout=1)
+    def connect_once(name: str, session: object) -> None:
+        authenticated_connection = lab_worker.Client(
+            session.address,
+            family="AF_UNIX",
+            authkey=session.authkey,
+        )
+        try:
+            authenticated_connection.send_bytes(name.encode("ascii"))
+            responses[name] = authenticated_connection.recv_bytes()
+        finally:
+            authenticated_connection.close()
+
+    accept_threads = [
+        threading.Thread(target=accept_once, args=("first", first)),
+        threading.Thread(target=accept_once, args=("second", second)),
+    ]
+    client_threads = [
+        threading.Thread(target=connect_once, args=("first", first)),
+        threading.Thread(target=connect_once, args=("second", second)),
+    ]
+    for thread in accept_threads + client_threads:
+        thread.start()
+    for thread in client_threads + accept_threads:
+        thread.join(timeout=1)
     try:
-        assert not thread.is_alive()
-        assert len(accepted) == 1
+        assert not any(thread.is_alive() for thread in accept_threads + client_threads)
+        assert accepted == {"first": b"first", "second": b"second"}
+        assert responses == {"first": b"ack:first", "second": b"ack:second"}
         assert first.address != second.address
+        assert first.path != second.path
+        assert first.endpoint != second.endpoint
+        assert first.session_identity != second.session_identity
+        assert first.endpoint_identity != second.endpoint_identity
         assert first.path.name.startswith("rqlw-")
-        assert first.path.name.removeprefix("rqlw-").isalnum()
+        assert re.fullmatch(r"rqlw-[0-9a-f]{32}", first.path.name)
+        assert re.fullmatch(r"rqlw-[0-9a-f]{32}", second.path.name)
         assert first.endpoint.name == "wire.sock"
+        assert second.endpoint.name == "wire.sock"
         directory = first.path.lstat()
         endpoint = first.endpoint.lstat()
         directory_fd = os.fstat(first.session_fd)
@@ -1830,6 +1859,47 @@ def test_result_wire_outbound_gate_matches_parent_receive_limit_without_large_al
     try:
         with pytest.raises(lab_worker.LabWireSessionStartupError):
             lab_worker._new_wire_session(roots=(all_bad_root,))
+        authority_claims = LabClaimSpool(tmp_path / "authority-root-fail-claims")
+        authority_reports = LabReportSpool(tmp_path / "authority-root-fail-reports")
+        authority_claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+        authority_claims.publish(authority_claim)
+        authority_worker = _worker(
+            tmp_path,
+            claims=authority_claims,
+            reports=authority_reports,
+            resource_snapshot_provider=StaticResourceSnapshotProvider(_healthy_resource_snapshot()),
+            admission_policy_provider=StaticAdmissionPolicyProvider(_permissive_admission_policy()),
+            require_resource_admission=True,
+        )
+        with monkeypatch.context() as authority_patch:
+            authority_patch.setattr(
+                lab_worker,
+                "_wire_root_candidates",
+                lambda _roots: (all_bad_root,),
+            )
+            with pytest.raises(lab_worker.LabWireSessionStartupError):
+                authority_worker.run_once()
+        assert tuple(entry.claim for entry in authority_claims.pending()) == (authority_claim,)
+        assert authority_reports.pending() == ()
+
+        claims = LabClaimSpool(tmp_path / "all-root-fail-claims")
+        reports = LabReportSpool(tmp_path / "all-root-fail-reports")
+        failed_claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+        claims.publish(failed_claim)
+        worker = _worker(tmp_path, claims=claims, reports=reports)
+        with monkeypatch.context() as startup_patch:
+            startup_patch.setattr(
+                lab_worker,
+                "_wire_root_candidates",
+                lambda _roots: (all_bad_root,),
+            )
+            result = worker.run_once()
+        failure = _reported_failure(reports)
+        assert result.status == "failed"
+        assert failure.phase == "session"
+        assert failure.failure_kind == "session_startup"
+        assert (claims.ack_dir / f"{failed_claim.claim_token}.json").is_file()
+        assert (claims.admitted_dir / f"{failed_claim.claim_token}.json").is_file()
     finally:
         all_bad_root.rmdir()
 
@@ -1915,7 +1985,9 @@ def test_result_wire_outbound_gate_matches_parent_receive_limit_without_large_al
         hard_limit_seconds=1,
         initial_session=lab_worker.TradingSession.CLOSED,
     )
-    assert isinstance(control.startup_error, lab_worker.LabWireSessionStartupError)
+    assert control.session_failure is not None
+    assert control.session_failure.failure_kind == "session_startup"
+    assert isinstance(control.session_failure.error, lab_worker.LabWireSessionStartupError)
     assert control.resource_error is None
 
 
@@ -4285,12 +4357,19 @@ def test_resource_reservation_exists_before_shard_spawn_and_releases_after_succe
     assert store.active_leases() == ()
 
 
-def test_resource_reservation_releases_when_shard_spawn_fails(tmp_path: Path) -> None:
-    from rquant.lab_daemon import LabDaemonConfigurationError
+def test_resource_reservation_releases_when_shard_spawn_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from multiprocessing.process import BaseProcess
+
+    import rquant.lab_worker as lab_worker
     from rquant.runtime_resource_admission import SQLiteResourceReservationStore
 
     claims = LabClaimSpool(tmp_path / "claims")
-    claims.publish(_claim(_nshape_compare_spec(hold_days=(1,))))
+    reports = LabReportSpool(tmp_path / "reports")
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    claims.publish(claim)
     store = SQLiteResourceReservationStore(
         tmp_path / "resource-reservations.sqlite3",
         clock=lambda: NOW,
@@ -4298,17 +4377,60 @@ def test_resource_reservation_releases_when_shard_spawn_fails(tmp_path: Path) ->
     worker = _worker(
         tmp_path,
         claims=claims,
-        registry=UnserializableRegistry(),
+        reports=reports,
+        registry=RecordingRegistry(),
         resource_snapshot_provider=StaticResourceSnapshotProvider(_healthy_resource_snapshot()),
         admission_policy_provider=StaticAdmissionPolicyProvider(_permissive_admission_policy()),
         resource_reservation_store=store,
         require_resource_admission=True,
     )
 
-    with pytest.raises(LabDaemonConfigurationError, match="spawn-serializable"):
-        worker.run_once()
+    original_start = BaseProcess.start
 
+    def fail_shard_spawn(process: BaseProcess) -> None:
+        if process.name.startswith("lab-shard-"):
+            raise OSError("injected shard spawn failure")
+        original_start(process)
+
+    with monkeypatch.context() as spawn_patch:
+        spawn_patch.setattr(BaseProcess, "start", fail_shard_spawn)
+        result = worker.run_once()
+
+    failure = _reported_failure(reports)
+    assert result.status == "failed"
+    assert failure.phase == "session"
+    assert failure.failure_kind == "session_startup"
+    assert "shard spawn failure" in failure.message
     assert store.active_leases() == ()
+
+    authority_claims = LabClaimSpool(tmp_path / "runtime-authority-claims")
+    authority_reports = LabReportSpool(tmp_path / "runtime-authority-reports")
+    authority_claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    authority_claims.publish(authority_claim)
+    authority_worker = _worker(
+        tmp_path,
+        claims=authority_claims,
+        reports=authority_reports,
+        resource_snapshot_provider=StaticResourceSnapshotProvider(_healthy_resource_snapshot()),
+        admission_policy_provider=StaticAdmissionPolicyProvider(_permissive_admission_policy()),
+        require_resource_admission=True,
+    )
+
+    monkeypatch.setattr(
+        authority_worker,
+        "_resource_admission_evaluation",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            lab_worker.LabWireSessionStartupError("runtime authority bind failed")
+        ),
+    )
+
+    authority_result = authority_worker.run_once()
+
+    authority_failure = _reported_failure(authority_reports)
+    assert authority_result.status == "failed"
+    assert authority_failure.phase == "session"
+    assert authority_failure.failure_kind == "session_startup"
+    assert "runtime authority bind failed" in authority_failure.message
 
 
 def test_resource_admission_rejects_a_stale_snapshot_before_claim_consumption(
@@ -5126,15 +5248,18 @@ def test_failed_ack_send_never_executes_adapter_and_reaps_child(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import rquant.lab_worker as lab_worker
-    from rquant.resource_admission import TradingSession
 
     claim = _short_live_claim()
+    claims = LabClaimSpool(tmp_path / "ack-failure-claims")
+    reports = LabReportSpool(tmp_path / "ack-failure-reports")
+    claims.publish(claim)
     adapter_pid_path = tmp_path / "failed-ack-adapter.pid"
     worker = _worker(
         tmp_path,
+        claims=claims,
+        reports=reports,
         registry=SlowPidRegistry(pid_path=adapter_pid_path, delay_seconds=0),
     )
-    validated = worker._validate_closed_claim(claim)
     original_send = lab_worker._send_wire
 
     def fail_ack_send(connection: object, value: object) -> None:
@@ -5142,19 +5267,58 @@ def test_failed_ack_send_never_executes_adapter_and_reaps_child(
             raise OSError("injected ACK send failure")
         original_send(connection, value)
 
-    monkeypatch.setattr(lab_worker, "_send_wire", fail_ack_send)
+    with monkeypatch.context() as ack_patch:
+        ack_patch.setattr(lab_worker, "_send_wire", fail_ack_send)
+        result = worker.run_once()
 
-    control = worker._execute_shard_isolated(
-        claim,
-        validated,
-        runtime_code_sha="1" * 40,
-        hard_limit_seconds=0.1,
-        initial_session=TradingSession.MORNING,
+    failure = _reported_failure(reports)
+    assert result.status == "failed"
+    assert failure.phase == "session"
+    assert failure.failure_kind == "session_startup"
+    assert "ACK send failure" in failure.message
+    assert not adapter_pid_path.exists()
+    assert all(
+        not child.name.startswith("lab-shard-") for child in multiprocessing.active_children()
     )
 
-    assert control.resource_error is not None
-    assert "ACK send failure" in str(control.resource_error)
-    assert not adapter_pid_path.exists()
+    exited_claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    exited_claims = LabClaimSpool(tmp_path / "child-exit-claims")
+    exited_reports = LabReportSpool(tmp_path / "child-exit-reports")
+    exited_claims.publish(exited_claim)
+    exited_pid_path = tmp_path / "child-exit-adapter.pid"
+    exited_worker = _worker(
+        tmp_path,
+        claims=exited_claims,
+        reports=exited_reports,
+        registry=SlowPidRegistry(pid_path=exited_pid_path, delay_seconds=1),
+    )
+    killed_pids: list[int] = []
+
+    def send_ack_then_kill(connection: object, value: object) -> None:
+        original_send(connection, value)
+        if isinstance(value, lab_worker._IsolationStartAck):
+            shard_children = [
+                child
+                for child in multiprocessing.active_children()
+                if child.name.startswith("lab-shard-") and child.pid is not None
+            ]
+            assert len(shard_children) == 1
+            child_pid = shard_children[0].pid
+            assert child_pid is not None
+            killed_pids.append(child_pid)
+            os.kill(child_pid, signal.SIGKILL)
+
+    with monkeypatch.context() as exit_patch:
+        exit_patch.setattr(lab_worker, "_send_wire", send_ack_then_kill)
+        exited_result = exited_worker.run_once()
+
+    exited_failure = _reported_failure(exited_reports)
+    assert exited_result.status == "failed"
+    assert exited_failure.phase == "session"
+    assert exited_failure.failure_kind == "session"
+    assert "isolated shard" in exited_failure.message
+    assert len(killed_pids) == 1
+    _assert_process_gone(killed_pids[0])
     assert all(
         not child.name.startswith("lab-shard-") for child in multiprocessing.active_children()
     )
@@ -5450,9 +5614,13 @@ def test_child_rejects_ack_delivered_after_spec_deadline(
         require_resource_admission=True,
     )
 
-    with pytest.raises(LabDaemonConfigurationError, match="transport failed"):
-        worker.run_once()
+    result = worker.run_once()
 
+    assert result.status == "failed"
+    failure = _reported_failure(reports)
+    assert failure.phase == "session"
+    assert failure.failure_kind == "session"
+    assert "transport failed" in failure.message
     assert not execution_marker.exists()
     assert not worker.sealed_bundle_path(claim).exists()
 
@@ -6577,11 +6745,14 @@ def test_setsid_failure_fails_closed_before_adapter_execution(
         isolation_session_initializer=FailingSessionInitializer(),
     )
 
-    with pytest.raises(LabDaemonConfigurationError, match="setsid denied"):
-        worker.run_once()
+    result = worker.run_once()
 
+    failure = _reported_failure(reports)
+    assert result.status == "failed"
+    assert failure.phase == "session"
+    assert failure.failure_kind == "session_startup"
+    assert "setsid denied" in failure.message
     assert not execution_marker.exists()
-    assert reports.pending() == ()
     assert not worker.sealed_bundle_path(claim).exists()
 
 
@@ -7553,6 +7724,12 @@ def _retry_claim(claim: LabShardClaim) -> LabShardClaim:
 
 def _reports(spool: LabReportSpool):
     return tuple(entry.report for entry in spool.pending())
+
+
+def _reported_failure(spool: LabReportSpool) -> LabWorkerFailure:
+    body = _reports(spool)[-1].body
+    assert isinstance(body, LabShardFailed)
+    return LabWorkerFailure.model_validate_json(body.failure_json)
 
 
 def _sigterm_publication_child(root_value: str, phase: str) -> None:
@@ -10081,8 +10258,10 @@ def test_heartbeat_publish_failure_returns_failed_without_sealing(tmp_path: Path
 
     result = worker.run_once()
 
+    failure = _reported_failure(reports)
     assert result.status == "failed"
-    assert isinstance(_reports(reports)[-1].body, LabShardFailed)
+    assert failure.phase == "fence"
+    assert failure.failure_kind == "fence"
     assert not worker.sealed_bundle_path(claim).exists()
 
 
@@ -10104,6 +10283,9 @@ def test_worker_reports_typed_failure_without_sealing(tmp_path: Path) -> None:
     report = _reports(reports)[-1]
     assert isinstance(report.body, LabShardFailed)
     assert "fixture failed" in report.body.failure_json
+    failure = LabWorkerFailure.model_validate_json(report.body.failure_json)
+    assert failure.phase == "execute"
+    assert failure.failure_kind == "execution"
     assert not worker.sealed_bundle_path(claim).exists()
 
 
@@ -10123,7 +10305,10 @@ def test_worker_deadline_before_execute_fails_without_running_shard(tmp_path: Pa
 
     result = worker.run_once()
 
+    failure = _reported_failure(reports)
     assert result.status == "failed"
+    assert failure.phase == "deadline"
+    assert failure.failure_kind == "deadline"
     assert registry.executions == 0
     assert not worker.sealed_bundle_path(claim).exists()
 
@@ -10150,7 +10335,10 @@ def test_worker_deadline_after_execute_prevents_fence_and_seal(tmp_path: Path) -
 
     result = worker.run_once()
 
+    failure = _reported_failure(reports)
     assert result.status == "failed"
+    assert failure.phase == "deadline"
+    assert failure.failure_kind == "deadline"
     assert not worker.sealed_bundle_path(claim).exists()
     assert not any(isinstance(report.body, LabShardSucceeded) for report in _reports(reports))
 
@@ -10184,7 +10372,10 @@ def test_worker_deadline_during_bundle_write_prevents_atomic_seal(
 
     result = worker.run_once()
 
+    failure = _reported_failure(reports)
     assert result.status == "failed"
+    assert failure.phase == "seal"
+    assert failure.failure_kind == "seal"
     assert not worker.sealed_bundle_path(claim).exists()
     assert not any(isinstance(report.body, LabShardSucceeded) for report in _reports(reports))
 

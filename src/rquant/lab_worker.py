@@ -593,17 +593,21 @@ class LabShardResultManifest(LabWorkerModel):
         return _sha256_bytes(self.canonical_json().encode("utf-8"))
 
 
+_LabWorkerFailureKind = Literal[
+    "claim_validation",
+    "session_startup",
+    "session",
+    "execution",
+    "deadline",
+    "fence",
+    "seal",
+]
+_WireFailureKind = Literal["session_startup", "session"]
+
+
 class LabWorkerFailure(LabWorkerModel):
     phase: Literal["claim", "session", "execute", "deadline", "fence", "seal"]
-    failure_kind: Literal[
-        "claim_validation",
-        "session_startup",
-        "session",
-        "execution",
-        "deadline",
-        "fence",
-        "seal",
-    ]
+    failure_kind: _LabWorkerFailureKind
     error_type: str = Field(min_length=1)
     message: str = Field(min_length=1)
 
@@ -697,11 +701,17 @@ class _IsolationStartAck(LabWireModel):
 
 
 @dataclass(frozen=True)
+class _ClassifiedWireFailure:
+    failure_kind: _WireFailureKind
+    error: Exception
+
+
+@dataclass(frozen=True)
 class _IsolatedExecutionControl:
     outcome: _IsolatedExecutionOutcome | None = None
     stop_reason: str | None = None
     preemption: AdmissionDecision | None = None
-    startup_error: Exception | None = None
+    session_failure: _ClassifiedWireFailure | None = None
     resource_error: Exception | None = None
     heartbeat_error: Exception | None = None
 
@@ -1763,6 +1773,19 @@ def _recv_wire(
 
 class LabWireSessionStartupError(LabDaemonConfigurationError):
     """A private AF_UNIX session could not be created safely."""
+
+
+class LabWireSessionError(RuntimeError):
+    """An authenticated wire session failed after its start ACK."""
+
+
+def _classify_wire_failure(error: Exception) -> _ClassifiedWireFailure:
+    return _ClassifiedWireFailure(
+        failure_kind=(
+            "session_startup" if isinstance(error, LabWireSessionStartupError) else "session"
+        ),
+        error=error,
+    )
 
 
 @dataclass(frozen=True)
@@ -3124,12 +3147,15 @@ class LabWorker:
                 (
                     InterruptedError,
                     TimeoutError,
-                    LabDaemonConfigurationError,
                     LabWireSessionStartupError,
                 ),
             ):
                 raise
-            raise LabWireSessionStartupError(f"{label} startup failed") from exc
+            if isinstance(exc, LabDaemonConfigurationError):
+                raise LabWireSessionStartupError(str(exc) or f"{label} startup failed") from exc
+            raise LabWireSessionStartupError(
+                f"{label} startup failed: {_bounded_exception_message(exc)}"
+            ) from exc
         finally:
             session.cleanup()
 
@@ -3737,20 +3763,35 @@ class LabWorker:
         primary_error: BaseException | None = None
         result: _AuthorityWireResult | None = None
         try:
-            _send_wire(
-                managed_child.child.connection,
-                _IsolationStartAck(
-                    accepted=True,
-                    not_after_monotonic_microseconds=deadline_microseconds,
-                ),
-            )
-            result = self._receive_wire_before_deadline(
-                managed_child.child,
-                model=_AuthorityWireResult,
-                max_bytes=_MAX_CONTROL_WIRE_BYTES,
-                deadline_microseconds=deadline_microseconds,
-                label=label,
-            )
+            try:
+                _send_wire(
+                    managed_child.child.connection,
+                    _IsolationStartAck(
+                        accepted=True,
+                        not_after_monotonic_microseconds=deadline_microseconds,
+                    ),
+                )
+            except (InterruptedError, TimeoutError):
+                raise
+            except Exception as exc:
+                raise LabWireSessionStartupError(
+                    f"{label} start acknowledgement transport failed: "
+                    f"{_bounded_exception_message(exc)}"
+                ) from exc
+            try:
+                result = self._receive_wire_before_deadline(
+                    managed_child.child,
+                    model=_AuthorityWireResult,
+                    max_bytes=_MAX_CONTROL_WIRE_BYTES,
+                    deadline_microseconds=deadline_microseconds,
+                    label=label,
+                )
+            except (InterruptedError, TimeoutError):
+                raise
+            except Exception as exc:
+                raise LabWireSessionError(
+                    f"{label} session transport failed: {_bounded_exception_message(exc)}"
+                ) from exc
             if result.operation != operation:
                 raise LabDaemonConfigurationError(f"{label} operation mismatch")
             if result.error_type is not None:
@@ -3843,20 +3884,35 @@ class LabWorker:
                 operation=operation,
                 owner="direct",
             )
-            _send_wire(
-                managed_child.child.connection,
-                _IsolationStartAck(
-                    accepted=True,
-                    not_after_monotonic_microseconds=deadline_microseconds,
-                ),
-            )
-            result = self._receive_wire_before_deadline(
-                managed_child.child,
-                model=_AuthorityWireResult,
-                max_bytes=_MAX_CONTROL_WIRE_BYTES,
-                deadline_microseconds=deadline_microseconds,
-                label=label,
-            )
+            try:
+                _send_wire(
+                    managed_child.child.connection,
+                    _IsolationStartAck(
+                        accepted=True,
+                        not_after_monotonic_microseconds=deadline_microseconds,
+                    ),
+                )
+            except (InterruptedError, TimeoutError):
+                raise
+            except Exception as exc:
+                raise LabWireSessionStartupError(
+                    f"{label} start acknowledgement transport failed: "
+                    f"{_bounded_exception_message(exc)}"
+                ) from exc
+            try:
+                result = self._receive_wire_before_deadline(
+                    managed_child.child,
+                    model=_AuthorityWireResult,
+                    max_bytes=_MAX_CONTROL_WIRE_BYTES,
+                    deadline_microseconds=deadline_microseconds,
+                    label=label,
+                )
+            except (InterruptedError, TimeoutError):
+                raise
+            except Exception as exc:
+                raise LabWireSessionError(
+                    f"{label} session transport failed: {_bounded_exception_message(exc)}"
+                ) from exc
             if result.operation != operation:
                 raise LabDaemonConfigurationError(f"{label} operation mismatch")
             if result.error_type is not None:
@@ -4536,6 +4592,7 @@ class LabWorker:
         spec: ResearchRunSpec,
         finished: threading.Event,
         preemptions: list[AdmissionDecision],
+        session_failures: list[_ClassifiedWireFailure],
         errors: list[Exception],
     ) -> None:
         resource_recheck_interval_seconds = _microseconds_to_seconds(
@@ -4549,6 +4606,9 @@ class LabWorker:
                     claim,
                     spec,
                 )
+            except (LabWireSessionStartupError, LabWireSessionError) as exc:
+                session_failures.append(_classify_wire_failure(exc))
+                return
             except Exception as exc:
                 errors.append(exc)
                 return
@@ -4758,7 +4818,7 @@ class LabWorker:
         outcome: _IsolatedExecutionOutcome | None = None
         stop_reason: str | None = None
         preemption: AdmissionDecision | None = None
-        startup_error: Exception | None = None
+        session_failure: _ClassifiedWireFailure | None = None
         resource_error: Exception | None = None
         lifecycle_error: BaseException | None = None
         cleanup_errors: list[BaseException] = []
@@ -4767,6 +4827,7 @@ class LabWorker:
         pre_ack_refresh_complete = threading.Event()
         pre_ack_evaluation: _ResourceAdmissionEvaluation | None = None
         pre_ack_stop_reason: str | None = None
+        pre_ack_session_failure: _ClassifiedWireFailure | None = None
         pre_ack_resource_error: Exception | None = None
         child_ready = False
         isolation_start_aborted = False
@@ -4827,7 +4888,7 @@ class LabWorker:
             execution_active: bool,
             wait_for_child_readiness: bool = False,
         ) -> None:
-            nonlocal resource_error, stop_reason
+            nonlocal resource_error, session_failure, stop_reason
             authority_deadline = hard_deadline if execution_active else spec_deadline
             authority_child_deadline = (
                 result_child_deadline if execution_active else spec_child_deadline
@@ -4865,6 +4926,9 @@ class LabWorker:
                         self.isolation_monotonic_microseconds_clock()
                     )
                 return
+            except (LabWireSessionStartupError, LabWireSessionError) as exc:
+                session_failure = _classify_wire_failure(exc)
+                return
             except Exception as exc:
                 resource_error = exc
                 return
@@ -4875,7 +4939,8 @@ class LabWorker:
             )
 
         def refresh_pre_ack_admission() -> None:
-            nonlocal pre_ack_evaluation, pre_ack_resource_error, pre_ack_stop_reason
+            nonlocal pre_ack_evaluation, pre_ack_resource_error, pre_ack_session_failure
+            nonlocal pre_ack_stop_reason
 
             def cancelled() -> bool:
                 return pre_ack_refresh_cancelled.is_set() or self._stop.is_set()
@@ -4915,6 +4980,9 @@ class LabWorker:
                     pre_ack_stop_reason = deadline_stop_reason(
                         self.isolation_monotonic_microseconds_clock()
                     )
+            except (LabWireSessionStartupError, LabWireSessionError) as exc:
+                if not cancelled():
+                    pre_ack_session_failure = _classify_wire_failure(exc)
             except Exception as exc:
                 if not cancelled():
                     pre_ack_resource_error = exc
@@ -4965,6 +5033,8 @@ class LabWorker:
                 if pre_ack_refresh_complete.is_set() and not pre_ack_refresh_cancelled.is_set():
                     if pre_ack_stop_reason is not None:
                         stop_reason = pre_ack_stop_reason
+                    elif pre_ack_session_failure is not None:
+                        session_failure = pre_ack_session_failure
                     elif pre_ack_resource_error is not None:
                         resource_error = pre_ack_resource_error
                     else:
@@ -4983,7 +5053,8 @@ class LabWorker:
                         self.isolation_monotonic_microseconds_clock()
                     )
                 if not any(
-                    value is not None for value in (stop_reason, preemption, resource_error)
+                    value is not None
+                    for value in (stop_reason, preemption, session_failure, resource_error)
                 ):
                     self._during_isolation_start_commit_for_test()
                     if self._stop.is_set() or self._isolation_stop_generation != start_generation:
@@ -4992,14 +5063,22 @@ class LabWorker:
                         # The accepted ACK is the child's adapter-start permit.  Stop
                         # requests serialize on this same gate, so they observe either
                         # a pre-ACK stop or an already committed post-ACK execution.
-                        _send_wire(
-                            child.connection,
-                            _IsolationStartAck(
-                                accepted=True,
-                                not_after_monotonic_microseconds=spec_child_deadline,
-                                execution_limit_microseconds=ack_live_limit_microseconds,
-                            ),
-                        )
+                        try:
+                            _send_wire(
+                                child.connection,
+                                _IsolationStartAck(
+                                    accepted=True,
+                                    not_after_monotonic_microseconds=spec_child_deadline,
+                                    execution_limit_microseconds=ack_live_limit_microseconds,
+                                ),
+                            )
+                        except (InterruptedError, TimeoutError):
+                            raise
+                        except Exception as exc:
+                            raise LabWireSessionStartupError(
+                                "isolated shard start acknowledgement transport failed: "
+                                f"{_bounded_exception_message(exc)}"
+                            ) from exc
                         ack_success_microseconds = self.isolation_monotonic_microseconds_clock()
                         if ack_success_microseconds >= spec_deadline:
                             stop_reason = deadline_stop_reason(ack_success_microseconds)
@@ -5012,7 +5091,10 @@ class LabWorker:
                                 spec_child_deadline,
                                 _monotonic_microseconds() + ack_live_limit_microseconds,
                             )
-            if not any(value is not None for value in (stop_reason, preemption, resource_error)):
+            if not any(
+                value is not None
+                for value in (stop_reason, preemption, session_failure, resource_error)
+            ):
                 heartbeat.start()
                 next_resource_check = (
                     self.isolation_monotonic_microseconds_clock()
@@ -5028,14 +5110,32 @@ class LabWorker:
                     if now >= hard_deadline:
                         stop_reason = deadline_stop_reason(now)
                         break
-                    if child.connection.poll(0):
-                        candidate = self._receive_wire_before_deadline(
-                            child,
-                            model=_IsolatedExecutionWireOutcome,
-                            max_bytes=_MAX_SHARD_RESULT_WIRE_BYTES,
-                            deadline_microseconds=result_child_deadline,
-                            label="isolated shard outcome",
+                    try:
+                        outcome_available = child.connection.poll(0)
+                    except Exception as exc:
+                        session_failure = _classify_wire_failure(
+                            LabWireSessionError(
+                                "isolated shard session poll failed: "
+                                f"{_bounded_exception_message(exc)}"
+                            )
                         )
+                        break
+                    if outcome_available:
+                        try:
+                            candidate = self._receive_wire_before_deadline(
+                                child,
+                                model=_IsolatedExecutionWireOutcome,
+                                max_bytes=_MAX_SHARD_RESULT_WIRE_BYTES,
+                                deadline_microseconds=result_child_deadline,
+                                label="isolated shard outcome",
+                            )
+                        except (InterruptedError, TimeoutError):
+                            raise
+                        except Exception as exc:
+                            raise LabWireSessionError(
+                                "isolated shard outcome transport failed: "
+                                f"{_bounded_exception_message(exc)}"
+                            ) from exc
                         now = self.isolation_monotonic_microseconds_clock()
                         if now >= hard_deadline:
                             stop_reason = deadline_stop_reason(now)
@@ -5051,14 +5151,20 @@ class LabWorker:
                             )
                         break
                     if not child.process.is_alive():
-                        resource_error = RuntimeError(
-                            "isolated shard child exited without an outcome"
+                        session_failure = _classify_wire_failure(
+                            LabWireSessionError("isolated shard child exited without an outcome")
                         )
                         break
                     if self.resource_authority_manifest is not None and now >= next_resource_check:
                         refresh_admission(execution_active=True)
                         if any(
-                            value is not None for value in (stop_reason, preemption, resource_error)
+                            value is not None
+                            for value in (
+                                stop_reason,
+                                preemption,
+                                session_failure,
+                                resource_error,
+                            )
                         ):
                             break
                         next_resource_check = (
@@ -5076,8 +5182,8 @@ class LabWorker:
                 stop_reason = str(exc) or "worker stop requested during isolated shard execution"
             else:
                 stop_reason = deadline_stop_reason(self.isolation_monotonic_microseconds_clock())
-        except LabWireSessionStartupError as exc:
-            startup_error = exc
+        except (LabWireSessionStartupError, LabWireSessionError) as exc:
+            session_failure = _classify_wire_failure(exc)
         except Exception as exc:
             resource_error = exc
         except BaseException as exc:
@@ -5119,7 +5225,11 @@ class LabWorker:
         if fatal_cleanup_errors:
             raise BaseExceptionGroup("isolated shard cleanup failed", cleanup_errors)
         if cleanup_errors:
-            primary_error: Exception | None = resource_error
+            primary_error: Exception | None = (
+                None if session_failure is None else session_failure.error
+            )
+            if primary_error is None:
+                primary_error = resource_error
             if primary_error is None and stop_reason is not None:
                 primary_error = RuntimeError(stop_reason)
             if primary_error is None and preemption is not None:
@@ -5140,7 +5250,7 @@ class LabWorker:
                     message=outcome.message or "isolated shard execution failed",
                 )
             combined = ([primary_error] if primary_error is not None else []) + cleanup_errors
-            resource_error = (
+            combined_error = (
                 combined[0]
                 if len(combined) == 1
                 else ExceptionGroup(
@@ -5148,6 +5258,13 @@ class LabWorker:
                     combined,
                 )
             )
+            if session_failure is not None:
+                session_failure = _ClassifiedWireFailure(
+                    failure_kind=session_failure.failure_kind,
+                    error=combined_error,
+                )
+            else:
+                resource_error = combined_error
             outcome = None
             stop_reason = None
             preemption = None
@@ -5155,7 +5272,7 @@ class LabWorker:
             outcome=outcome,
             stop_reason=stop_reason,
             preemption=preemption,
-            startup_error=startup_error,
+            session_failure=session_failure,
             resource_error=resource_error,
             heartbeat_error=heartbeat_errors[0] if heartbeat_errors else None,
         )
@@ -5874,6 +5991,7 @@ class LabWorker:
         *,
         phase: Literal["claim", "session", "execute", "deadline", "fence", "seal"],
         error: Exception,
+        failure_kind: _LabWorkerFailureKind | None = None,
     ) -> LabWorkerTickResult:
         message = _bounded_exception_message(error)
         error_type = getattr(error, "remote_error_type", type(error).__name__)
@@ -5895,16 +6013,20 @@ class LabWorker:
         failure = LabWorkerFailure(
             phase=phase,
             failure_kind=(
-                "session_startup"
-                if phase == "session" and isinstance(error, LabWireSessionStartupError)
-                else {
-                    "claim": "claim_validation",
-                    "session": "session",
-                    "execute": "execution",
-                    "deadline": "deadline",
-                    "fence": "fence",
-                    "seal": "seal",
-                }[phase]
+                failure_kind
+                if failure_kind is not None
+                else (
+                    "session_startup"
+                    if phase == "session" and isinstance(error, LabWireSessionStartupError)
+                    else {
+                        "claim": "claim_validation",
+                        "session": "session",
+                        "execute": "execution",
+                        "deadline": "deadline",
+                        "fence": "fence",
+                        "seal": "seal",
+                    }[phase]
+                )
             ),
             error_type=error_type,
             message=message,
@@ -6141,6 +6263,7 @@ class LabWorker:
         result: LabShardExecutionResult | None = None
         heartbeat_errors: list[Exception] = []
         resource_preemptions: list[AdmissionDecision] = []
+        session_failures: list[_ClassifiedWireFailure] = []
         resource_errors: list[Exception] = []
         prepared: LabPreparedShardBundle | None = None
         operation_error: Exception | None = None
@@ -6172,9 +6295,10 @@ class LabWorker:
         stop_reason = control.stop_reason
         if control.preemption is not None:
             resource_preemptions.append(control.preemption)
-        if control.startup_error is not None:
+        if control.session_failure is not None:
             operation_phase = "session"
-            operation_error = control.startup_error
+            operation_error = control.session_failure.error
+            session_failures.append(control.session_failure)
         if control.resource_error is not None:
             resource_errors.append(control.resource_error)
         if control.heartbeat_error is not None:
@@ -6200,6 +6324,7 @@ class LabWorker:
             result is not None
             and stop_reason is None
             and not resource_preemptions
+            and not session_failures
             and not resource_errors
             and not heartbeat_errors
             and operation_error is None
@@ -6219,6 +6344,7 @@ class LabWorker:
                     validated.spec,
                     background_finished,
                     resource_preemptions,
+                    session_failures,
                     resource_errors,
                 ),
                 name=f"lab-resource-monitor-{claim.claim_token}",
@@ -6251,6 +6377,7 @@ class LabWorker:
             operation_error is None
             and stop_reason is None
             and not resource_preemptions
+            and not session_failures
             and not resource_errors
             and not heartbeat_errors
             and result is not None
@@ -6344,6 +6471,12 @@ class LabWorker:
                     operation="admission",
                 )
                 resource_errors.append(exc)
+            except (LabWireSessionStartupError, LabWireSessionError) as exc:
+                self._cancel_prestarted_authority_stage(
+                    post_publish_admission_stage,
+                    operation="admission",
+                )
+                session_failures.append(_classify_wire_failure(exc))
             except LabDaemonConfigurationError:
                 self._cancel_prestarted_authority_stage(
                     post_publish_admission_stage,
@@ -6359,6 +6492,30 @@ class LabWorker:
             if self._stop.is_set():
                 stop_reason = "worker stop requested after candidate serialization"
 
+        if resource_errors and isinstance(
+            resource_errors[0],
+            (LabWireSessionStartupError, LabWireSessionError),
+        ):
+            session_failures.append(_classify_wire_failure(resource_errors.pop(0)))
+        if session_failures or (operation_error is not None and operation_phase == "session"):
+            self._cancel_prestarted_authority_stage(
+                post_publish_admission_stage,
+                operation="admission",
+            )
+            self._discard_prepared(prepared)
+            if session_failures:
+                session_failure = session_failures[0]
+            else:
+                session_failure = _ClassifiedWireFailure(
+                    failure_kind="session",
+                    error=operation_error,
+                )
+            return self._failure_result(
+                claim,
+                phase="session",
+                error=session_failure.error,
+                failure_kind=session_failure.failure_kind,
+            )
         if resource_preemptions:
             self._cancel_prestarted_authority_stage(
                 post_publish_admission_stage,
@@ -6617,6 +6774,22 @@ class LabWorker:
             except Exception as rollback_error:
                 return self._failure_result(claim, phase="fence", error=rollback_error)
             return self._failure_result(claim, phase="fence", error=exc)
+        except (LabWireSessionStartupError, LabWireSessionError) as exc:
+            self._cancel_prestarted_authority_stage(
+                post_publish_admission_stage,
+                operation="admission",
+            )
+            try:
+                self._rollback_sealed(claim, bundle)
+            except Exception as rollback_error:
+                return self._failure_result(claim, phase="fence", error=rollback_error)
+            wire_failure = _classify_wire_failure(exc)
+            return self._failure_result(
+                claim,
+                phase="session",
+                error=wire_failure.error,
+                failure_kind=wire_failure.failure_kind,
+            )
         except LabDaemonConfigurationError:
             self._cancel_prestarted_authority_stage(
                 post_publish_admission_stage,
