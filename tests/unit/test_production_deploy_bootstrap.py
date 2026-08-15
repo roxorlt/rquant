@@ -289,6 +289,10 @@ def _checkout(
     shutil.copy2(STRICT_JSON, scripts / STRICT_JSON.name)
     shutil.copy2(AUTHORITY, package / AUTHORITY.name)
     shutil.copy2(
+        ROOT / "src" / "rquant" / "interpreter_trust.py",
+        package / "interpreter_trust.py",
+    )
+    shutil.copy2(
         ROOT / "src" / "rquant" / "contained_subprocess.py",
         package / "contained_subprocess.py",
     )

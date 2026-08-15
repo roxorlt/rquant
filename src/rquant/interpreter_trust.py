@@ -167,6 +167,26 @@ class InterpreterTrustBinding:
             self.close()
             raise
 
+    def launch(
+        self,
+        runner: Callable[..., object],
+        arguments: tuple[str, ...],
+        **kwargs: object,
+    ) -> object:
+        """Start one contained child from this binding's revalidated descriptor."""
+
+        descriptor = self.prepare_exec()
+        inherited = kwargs.pop("pass_fds", ())
+        if not isinstance(inherited, tuple) or not all(type(fd) is int for fd in inherited):
+            self._reject()
+            raise InterpreterTrustError("contained launch descriptors are invalid")
+        return runner(
+            arguments,
+            executable_fd=descriptor,
+            pass_fds=(*inherited, descriptor),
+            **kwargs,
+        )
+
     def close(self) -> None:
         if self.closed:
             return

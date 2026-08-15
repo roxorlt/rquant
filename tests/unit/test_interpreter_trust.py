@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
+import subprocess
+import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -112,3 +116,66 @@ def test_attestation_rejects_fd_hash_mismatch(tmp_path: Path) -> None:
         binding.attest()
 
     assert binding.closed
+
+
+@pytest.mark.parametrize("replace_parent", (False, True))
+def test_contained_launch_executes_attested_descriptor_after_path_replacement(
+    tmp_path: Path,
+    replace_parent: bool,
+) -> None:
+    from rquant.contained_subprocess import ContainedProcessError, run_contained
+    from rquant.fd_exec import descriptor_execution_supported
+    from rquant.interpreter_trust import bind_interpreter
+
+    root = tmp_path / "root"
+    root.mkdir(mode=0o700)
+    target = root / "python"
+    shutil.copy2(Path(sys.executable).resolve(strict=True), target)
+    target.chmod(0o700)
+    marker = tmp_path / "executed"
+    replacement_root = tmp_path / "replacement-root"
+    replacement_root.mkdir(mode=0o700)
+    replacement = replacement_root / "python"
+    replacement.write_text(
+        f"#!/bin/sh\nprintf replacement > {marker!s}\n",
+        encoding="utf-8",
+    )
+    replacement.chmod(0o700)
+    binding = bind_interpreter(
+        _policy(root, target, sha256=hashlib.sha256(target.read_bytes()).hexdigest())
+    )
+    binding.attest()
+    command = [
+        str(target),
+        "-I",
+        "-S",
+        "-c",
+        f"from pathlib import Path; Path({str(marker)!r}).write_text('trusted')",
+    ]
+
+    def launch(arguments: tuple[str, ...], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if replace_parent:
+            root.rename(tmp_path / "replaced-root")
+            replacement_root.rename(root)
+        else:
+            replacement.replace(target)
+        return run_contained(
+            arguments,
+            cwd=root,
+            deadline_monotonic=time.monotonic() + 10,
+            may_spawn_background_descendants=False,
+            **kwargs,
+        )
+
+    try:
+        if descriptor_execution_supported():
+            result = binding.launch(launch, tuple(command))
+            assert isinstance(result, subprocess.CompletedProcess)
+            assert result.returncode == 0, result.stderr
+            assert marker.read_text(encoding="utf-8") == "trusted"
+        else:
+            with pytest.raises(ContainedProcessError, match="descriptor execution"):
+                binding.launch(launch, tuple(command))
+            assert not marker.exists()
+    finally:
+        binding.close()
