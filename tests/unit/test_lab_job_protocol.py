@@ -1521,6 +1521,7 @@ def test_publish_after_ack_returns_existing_receipt_and_rejects_conflict(
 
 def test_command_spool_internal_mutation_fence_prevents_quarantine_and_ack(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = tmp_path / "commands"
     setup = LabCommandSpool(root)
@@ -1559,9 +1560,68 @@ def test_command_spool_internal_mutation_fence_prevents_quarantine_and_ack(
     assert entry.path.exists()
     assert tuple(spool.ack_dir.iterdir()) == ()
 
+    real_fsync = os.fsync
+    real_mkdir = os.mkdir
+    bound_spool = LabCommandSpool(tmp_path / "bound-cleanup-commands")
+    bound_source = bound_spool.pending_dir / f"{uuid4()}.json"
+    bound_source.write_text("bound-source", encoding="utf-8")
+    bound_observed = bound_source.lstat()
+    bound_container: Path | None = None
+    replacement_identity: tuple[int, int] | None = None
+    fail_bound_fsync = False
+    bound_guard_calls = 0
+
+    def replacing_bound_guard() -> None:
+        nonlocal bound_guard_calls, replacement_identity
+        bound_guard_calls += 1
+        if bound_container is None:
+            return
+        os.rmdir(bound_container)
+        real_mkdir(bound_container, 0o700)
+        replacement = bound_container.lstat()
+        replacement_identity = (replacement.st_dev, replacement.st_ino)
+
+    def tracking_bound_mkdir(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        nonlocal bound_container, fail_bound_fsync
+        real_mkdir(path, mode, dir_fd=dir_fd)
+        if str(path).startswith("owned-entry-"):
+            bound_container = bound_spool.quarantine_dir / str(path)
+            fail_bound_fsync = True
+
+    def failing_bound_fsync(descriptor: int) -> None:
+        nonlocal fail_bound_fsync
+        if fail_bound_fsync:
+            fail_bound_fsync = False
+            raise OSError(errno.EIO, "forced bound cleanup")
+        real_fsync(descriptor)
+
+    bound_spool.mutation_guard = replacing_bound_guard
+    with monkeypatch.context() as patch:
+        patch.setattr(lab_job_protocol.os, "mkdir", tracking_bound_mkdir)
+        patch.setattr(lab_job_protocol.os, "fsync", failing_bound_fsync)
+        with pytest.raises(OSError, match="forced bound cleanup"):
+            bound_spool._isolate_owned_entry_locked(
+                bound_source,
+                bound_observed,
+                reason="bound_cleanup_guard_order",
+            )
+
+    assert bound_guard_calls == 2
+    assert bound_container is not None
+    replacement = bound_container.lstat()
+    assert (replacement.st_dev, replacement.st_ino) == replacement_identity
+    assert tuple(bound_container.iterdir()) == ()
+    assert bound_source.read_text(encoding="utf-8") == "bound-source"
+
 
 def test_command_spool_checks_guard_inside_initial_directory_creation(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = tmp_path / "commands"
 
@@ -1572,6 +1632,55 @@ def test_command_spool_checks_guard_inside_initial_directory_creation(
         LabCommandSpool(root, mutation_guard=mutation_guard)
 
     assert not root.exists()
+
+    real_mkdir = os.mkdir
+    real_open = os.open
+    unbound_spool = LabCommandSpool(tmp_path / "unbound-cleanup-commands")
+    unbound_source = unbound_spool.pending_dir / f"{uuid4()}.json"
+    unbound_source.write_text("unbound-source", encoding="utf-8")
+    unbound_observed = unbound_source.lstat()
+    container_created = False
+    unbound_guard_phases: list[bool] = []
+
+    def recording_unbound_guard() -> None:
+        unbound_guard_phases.append(container_created)
+
+    def tracking_unbound_mkdir(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        nonlocal container_created
+        real_mkdir(path, mode, dir_fd=dir_fd)
+        if str(path).startswith("owned-entry-"):
+            container_created = True
+
+    def failing_unbound_container_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if str(path).startswith("owned-entry-") and flags & getattr(os, "O_DIRECTORY", 0):
+            raise OSError(errno.EIO, "forced unbound container open failure", path)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    unbound_spool.mutation_guard = recording_unbound_guard
+    with monkeypatch.context() as patch:
+        patch.setattr(lab_job_protocol.os, "mkdir", tracking_unbound_mkdir)
+        patch.setattr(lab_job_protocol.os, "open", failing_unbound_container_open)
+        with pytest.raises(InvalidCommandEnvelopeError, match="identity changed"):
+            unbound_spool._isolate_owned_entry_locked(
+                unbound_source,
+                unbound_observed,
+                reason="unbound_cleanup_guard_order",
+            )
+
+    assert unbound_guard_phases == [False]
+    assert tuple(unbound_spool.quarantine_dir.iterdir()) == ()
+    assert unbound_source.read_text(encoding="utf-8") == "unbound-source"
 
 
 def test_command_sequence_never_publishes_into_replaced_spool_root(tmp_path: Path) -> None:

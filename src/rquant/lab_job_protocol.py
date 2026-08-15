@@ -1198,12 +1198,14 @@ class LabCommandSpool:
         container: Path,
     ) -> None:
         try:
-            self._guard_mutation()
+            if self._active_lock_descriptor is not None:
+                self._assert_active_lock_authority()
             os.rmdir(container.name, dir_fd=quarantine_fd)
         except OSError:
             pass
-        with suppress(OSError):
-            os.fsync(quarantine_fd)
+        finally:
+            with suppress(OSError):
+                os.fsync(quarantine_fd)
 
     def _discard_bound_empty_isolation_container_locked(
         self,
@@ -1212,6 +1214,7 @@ class LabCommandSpool:
         container: Path,
     ) -> None:
         try:
+            self._guard_mutation()
             anchored = os.fstat(container_fd)
             active = os.stat(
                 container.name,
@@ -1219,12 +1222,12 @@ class LabCommandSpool:
                 follow_symlinks=False,
             )
             if self._stat_matches_bound_entry(anchored, active):
-                self._guard_mutation()
                 os.rmdir(container.name, dir_fd=quarantine_fd)
         except OSError:
             pass
-        with suppress(OSError):
-            os.fsync(quarantine_fd)
+        finally:
+            with suppress(OSError):
+                os.fsync(quarantine_fd)
 
     def _isolate_owned_entry_locked(
         self,
