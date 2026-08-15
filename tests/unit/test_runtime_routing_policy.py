@@ -21,7 +21,10 @@ from rquant.signal_contracts import SignalAction, SignalEnvelope
 from rquant.signal_router_runtime import RoutingDecisionAction
 
 NOW = datetime(2026, 7, 31, 1, 0, tzinfo=UTC)
-READ_AT = datetime.now(UTC) + timedelta(minutes=1)
+
+
+def _observed_at() -> datetime:
+    return datetime.now(UTC)
 
 
 def _policy_payload() -> dict[str, object]:
@@ -82,7 +85,7 @@ def test_loads_frozen_policy_as_target_resolver(tmp_path: Path) -> None:
     resolver = load_frozen_routing_policy(
         path,
         routing_policy_fingerprint=expected,
-        observed_at=READ_AT,
+        observed_at=_observed_at(),
     )
     decision = resolver(_signal())
 
@@ -101,7 +104,7 @@ def test_unknown_strategy_version_or_action_fail_closed(tmp_path: Path) -> None:
     path = tmp_path / "routing-policy.json"
     content = _write_policy(path)
     expected = hashlib.sha256(content).hexdigest()
-    resolver = load_frozen_routing_policy(path, observed_at=READ_AT)
+    resolver = load_frozen_routing_policy(path, observed_at=_observed_at())
 
     for signal in (
         _signal(strategy_id="unknown"),
@@ -144,7 +147,7 @@ def test_disabled_targets_are_ignored_and_enabled_targets_are_canonical(
     )
     _freeze_policy(path, payload)
 
-    decision = load_frozen_routing_policy(path, observed_at=READ_AT)(_signal())
+    decision = load_frozen_routing_policy(path, observed_at=_observed_at())(_signal())
 
     assert decision.targets == (
         DeliveryTarget(recipient_id="admin", channel=DeliveryChannel.PUSHDEER),
@@ -167,7 +170,7 @@ def test_policy_rejects_credentials_and_dynamic_import_fields(
     _freeze_policy(path, payload)
 
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
-        load_frozen_routing_policy(path, observed_at=READ_AT)
+        load_frozen_routing_policy(path, observed_at=_observed_at())
 
 
 def test_policy_rejects_unknown_document_fields(tmp_path: Path) -> None:
@@ -177,7 +180,7 @@ def test_policy_rejects_unknown_document_fields(tmp_path: Path) -> None:
     _freeze_policy(path, payload)
 
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
-        load_frozen_routing_policy(path, observed_at=READ_AT)
+        load_frozen_routing_policy(path, observed_at=_observed_at())
 
 
 def test_explicit_routing_fingerprint_must_match_content(tmp_path: Path) -> None:
@@ -188,7 +191,7 @@ def test_explicit_routing_fingerprint_must_match_content(tmp_path: Path) -> None
         load_frozen_routing_policy(
             path,
             routing_policy_fingerprint="f" * 64,
-            observed_at=READ_AT,
+            observed_at=_observed_at(),
         )
 
 
@@ -207,7 +210,7 @@ def test_duplicate_or_conflicting_target_is_rejected(
     _freeze_policy(path, payload)
 
     with pytest.raises(RoutingPolicyConflictError, match="duplicate or conflicting"):
-        load_frozen_routing_policy(path, observed_at=READ_AT)
+        load_frozen_routing_policy(path, observed_at=_observed_at())
 
 
 def test_policy_requires_absolute_normal_json_path(tmp_path: Path) -> None:
@@ -216,7 +219,7 @@ def test_policy_requires_absolute_normal_json_path(tmp_path: Path) -> None:
 
     for path in (relative, dotted, tmp_path / "routing-policy.txt"):
         with pytest.raises(RoutingPolicyIntegrityError, match="absolute normal JSON"):
-            load_frozen_routing_policy(path, observed_at=READ_AT)
+            load_frozen_routing_policy(path, observed_at=_observed_at())
 
 
 def test_policy_rejects_symlinked_file_or_parent(tmp_path: Path) -> None:
@@ -232,7 +235,7 @@ def test_policy_rejects_symlinked_file_or_parent(tmp_path: Path) -> None:
 
     for path in (linked_file, linked_parent / policy.name):
         with pytest.raises(RoutingPolicyIntegrityError, match="symlink"):
-            load_frozen_routing_policy(path, observed_at=READ_AT)
+            load_frozen_routing_policy(path, observed_at=_observed_at())
 
 
 def test_policy_rejects_writable_or_hardlinked_file(tmp_path: Path) -> None:
@@ -241,24 +244,25 @@ def test_policy_rejects_writable_or_hardlinked_file(tmp_path: Path) -> None:
     writable.chmod(0o644)
 
     with pytest.raises(RoutingPolicyIntegrityError, match="read-only"):
-        load_frozen_routing_policy(writable, observed_at=READ_AT)
+        load_frozen_routing_policy(writable, observed_at=_observed_at())
 
     physical = tmp_path / "physical.json"
     _write_policy(physical)
     alias = tmp_path / "alias.json"
     os.link(physical, alias)
     with pytest.raises(RoutingPolicyIntegrityError, match="single-link"):
-        load_frozen_routing_policy(physical, observed_at=READ_AT)
+        load_frozen_routing_policy(physical, observed_at=_observed_at())
 
 
 def test_policy_rejects_future_timestamp(tmp_path: Path) -> None:
     path = tmp_path / "routing-policy.json"
     _write_policy(path)
-    future = READ_AT + timedelta(hours=1)
+    observed_at = _observed_at()
+    future = observed_at + timedelta(hours=1)
     os.utime(path, (future.timestamp(), future.timestamp()))
 
     with pytest.raises(RoutingPolicyIntegrityError, match="future"):
-        load_frozen_routing_policy(path, observed_at=READ_AT)
+        load_frozen_routing_policy(path, observed_at=observed_at)
 
 
 def test_observed_at_must_be_timezone_aware(tmp_path: Path) -> None:
@@ -281,7 +285,7 @@ def test_policy_rejects_duplicate_json_keys(tmp_path: Path) -> None:
     path.chmod(0o444)
 
     with pytest.raises(RoutingPolicyConflictError, match="duplicate JSON key"):
-        load_frozen_routing_policy(path, observed_at=READ_AT)
+        load_frozen_routing_policy(path, observed_at=_observed_at())
 
 
 def test_policy_rejects_file_changed_while_reading(
@@ -305,13 +309,13 @@ def test_policy_rejects_file_changed_while_reading(
     monkeypatch.setattr(os, "read", mutate_after_read)
 
     with pytest.raises(RoutingPolicyIntegrityError, match="changed while reading"):
-        load_frozen_routing_policy(path, observed_at=READ_AT)
+        load_frozen_routing_policy(path, observed_at=_observed_at())
 
 
 def test_loaded_resolver_is_frozen(tmp_path: Path) -> None:
     path = tmp_path / "routing-policy.json"
     _write_policy(path)
-    resolver = load_frozen_routing_policy(path, observed_at=READ_AT)
+    resolver = load_frozen_routing_policy(path, observed_at=_observed_at())
 
     assert isinstance(resolver, FrozenRoutingPolicyResolver)
     with pytest.raises(FrozenInstanceError):
