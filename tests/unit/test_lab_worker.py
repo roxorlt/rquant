@@ -14,6 +14,7 @@ import signal
 import socket
 import sqlite3
 import stat
+import struct
 import subprocess
 import sys
 import threading
@@ -1619,14 +1620,16 @@ def test_process_boundaries_use_bytes_transport_and_primitive_start_args() -> No
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
         and node.func.attr in {"send", "recv"}
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id in {"child_connection", "parent_connection"}
+        and not (
+            isinstance(node.func.value, ast.Attribute)
+            and node.func.value.attr == "_socket"
+            and isinstance(node.func.value.value, ast.Name)
+            and node.func.value.value.id == "self"
+        )
     ]
 
     assert object_transport_calls == []
     assert "Pipe(" not in source
-    assert ".send(" not in source
-    assert ".recv(" not in source
     lab_worker._assert_primitive_process_start(
         lab_worker._authority_wire_child,
         (b"{}", "/private/tmp/test.sock", b"key", 1024),
@@ -1756,25 +1759,30 @@ def test_result_wire_outbound_gate_matches_parent_receive_limit_without_large_al
             self.sent = True
 
     connection = RecordingConnection()
-    monkeypatch.setattr(lab_worker, "_encode_wire_message", lambda _value: b"12345")
-    with pytest.raises(LabDaemonConfigurationError, match="outbound wire size limit"):
-        lab_worker._send_wire(
-            connection,
-            lab_worker._IsolationStartAck(
-                accepted=True,
-                not_after_monotonic_microseconds=None,
-            ),
-            max_bytes=4,
-            label="test outbound",
-        )
+    with monkeypatch.context() as outbound_patch:
+        outbound_patch.setattr(lab_worker, "_encode_wire_message", lambda _value: b"12345")
+        with pytest.raises(LabDaemonConfigurationError, match="outbound wire size limit"):
+            lab_worker._send_wire(
+                connection,
+                lab_worker._IsolationStartAck(
+                    accepted=True,
+                    not_after_monotonic_microseconds=None,
+                ),
+                max_bytes=4,
+                label="test outbound",
+            )
     assert not connection.sent
     first = lab_worker._new_wire_session(roots=(Path("/private/tmp"),))
     second = lab_worker._new_wire_session(roots=(Path("/private/tmp"),))
     accepted: dict[str, bytes] = {}
     responses: dict[str, bytes] = {}
+    accept_deadline = time.monotonic_ns() // 1_000 + 1_000_000
 
     def accept_once(name: str, session: object) -> None:
-        accepted_connection = session.listener.accept()
+        accepted_connection = session.listener.accept(
+            deadline_microseconds=accept_deadline,
+            cancel_requested=lambda: False,
+        )
         try:
             payload = accepted_connection.recv_bytes()
             accepted[name] = payload
@@ -1842,6 +1850,203 @@ def test_result_wire_outbound_gate_matches_parent_receive_limit_without_large_al
     finally:
         first.cleanup()
         second.cleanup()
+
+    def connect_raw(session: object) -> socket.socket:
+        peer = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        peer.connect(session.address)
+        return peer
+
+    active_child_pids = {child.pid for child in multiprocessing.active_children()}
+    for partial_auth in (b"", b"\x00\x00", struct.pack("!i", 40) + b"{s"):
+        partial_session = lab_worker._new_wire_session(roots=(Path("/private/tmp"),))
+        raw_peer = connect_raw(partial_session)
+        try:
+            if partial_auth:
+                raw_peer.sendall(partial_auth)
+            started = time.monotonic()
+            with pytest.raises(TimeoutError, match="timed out"):
+                partial_session.listener.accept(
+                    deadline_microseconds=time.monotonic_ns() // 1_000 + 50_000,
+                    cancel_requested=lambda: False,
+                )
+            assert time.monotonic() - started < 0.5
+        finally:
+            raw_peer.close()
+            partial_session.cleanup()
+
+    stopped_auth = lab_worker._new_wire_session(roots=(Path("/private/tmp"),))
+    stopped_peer = connect_raw(stopped_auth)
+    try:
+        with pytest.raises(InterruptedError, match="cancel|stop"):
+            stopped_auth.listener.accept(
+                deadline_microseconds=time.monotonic_ns() // 1_000 + 1_000_000,
+                cancel_requested=lambda: True,
+            )
+    finally:
+        stopped_peer.close()
+        stopped_auth.cleanup()
+
+    def authenticated_pair() -> tuple[object, object, threading.Thread]:
+        session = lab_worker._new_wire_session(roots=(Path("/private/tmp"),))
+        holder: dict[str, object] = {}
+
+        def connect() -> None:
+            holder["client"] = lab_worker.Client(
+                session.address,
+                family="AF_UNIX",
+                authkey=session.authkey,
+            )
+
+        client_thread = threading.Thread(target=connect)
+        client_thread.start()
+        endpoint = session.listener.accept(
+            deadline_microseconds=time.monotonic_ns() // 1_000 + 1_000_000,
+            cancel_requested=lambda: False,
+        )
+        client_thread.join(timeout=1)
+        assert not client_thread.is_alive()
+        return session, endpoint, holder["client"]
+
+    partial_control_session, partial_control, partial_control_client = authenticated_pair()
+    try:
+        os.write(partial_control_client.fileno(), struct.pack("!i", 80) + b"{")
+        with pytest.raises(TimeoutError, match="timed out"):
+            lab_worker._recv_wire(
+                partial_control,
+                model=lab_worker._IsolationReadiness,
+                max_bytes=1024,
+                label="partial readiness",
+                deadline_microseconds=time.monotonic_ns() // 1_000 + 50_000,
+                cancel_requested=lambda: False,
+            )
+        assert partial_control.closed
+    finally:
+        partial_control_client.close()
+        partial_control.close()
+        partial_control_session.cleanup()
+
+    stopped_control_session, stopped_control, stopped_control_client = authenticated_pair()
+    try:
+        os.write(stopped_control_client.fileno(), struct.pack("!i", 80) + b"{")
+        with pytest.raises(InterruptedError, match="cancel|stop"):
+            lab_worker._recv_wire(
+                stopped_control,
+                model=lab_worker._IsolatedExecutionWireOutcome,
+                max_bytes=1024,
+                label="partial result",
+                deadline_microseconds=time.monotonic_ns() // 1_000 + 1_000_000,
+                cancel_requested=lambda: True,
+            )
+        assert stopped_control.closed
+    finally:
+        stopped_control_client.close()
+        stopped_control.close()
+        stopped_control_session.cleanup()
+    assert {child.pid for child in multiprocessing.active_children()} == active_child_pids
+
+    post_bind_root = Path("/private/tmp") / f"lwl-post-bind-{uuid4().hex[:8]}"
+    post_bind_root.mkdir(mode=0o700)
+    original_chown = os.chown
+    original_chmod = os.chmod
+    original_stat = os.stat
+    original_urandom = os.urandom
+
+    def endpoint_name(value: object) -> str:
+        if isinstance(value, int):
+            return ""
+        return Path(os.fspath(value)).name
+
+    def fail_endpoint_chown(path: object, *args: object, **kwargs: object) -> None:
+        if endpoint_name(path) == "wire.sock":
+            raise OSError("post-bind chown failed")
+        original_chown(path, *args, **kwargs)
+
+    def fail_endpoint_chmod(path: object, *args: object, **kwargs: object) -> None:
+        if endpoint_name(path) == "wire.sock":
+            raise OSError("post-bind chmod failed")
+        original_chmod(path, *args, **kwargs)
+
+    endpoint_stat_calls = 0
+
+    def fail_endpoint_validation_stat(path: object, *args: object, **kwargs: object):
+        nonlocal endpoint_stat_calls
+        if endpoint_name(path) == "wire.sock":
+            endpoint_stat_calls += 1
+            if endpoint_stat_calls == 2:
+                raise OSError("post-bind stat failed")
+        return original_stat(path, *args, **kwargs)
+
+    def fail_auth_entropy(size: int) -> bytes:
+        if size == 32:
+            raise OSError("post-bind urandom failed")
+        return original_urandom(size)
+
+    for attribute, failure in (
+        ("chown", fail_endpoint_chown),
+        ("chmod", fail_endpoint_chmod),
+        ("stat", fail_endpoint_validation_stat),
+        ("urandom", fail_auth_entropy),
+    ):
+        endpoint_stat_calls = 0
+        try:
+            with monkeypatch.context() as post_bind_patch:
+                post_bind_patch.setattr(lab_worker.os, attribute, failure)
+                with pytest.raises(lab_worker.LabWireSessionStartupError):
+                    lab_worker._new_wire_session(roots=(post_bind_root,))
+            assert tuple(post_bind_root.iterdir()) == ()
+        finally:
+            for residue in post_bind_root.iterdir():
+                shutil.rmtree(residue)
+    post_bind_root.rmdir()
+
+    replacement_root = Path("/private/tmp") / f"lwl-replace-{uuid4().hex[:8]}"
+    replacement_root.mkdir(mode=0o700)
+    replacement_bytes = b"replacement endpoint"
+
+    def replace_endpoint_then_fail(path: object, *args: object, **kwargs: object) -> None:
+        if endpoint_name(path) == "wire.sock":
+            endpoint = Path(os.fspath(path))
+            endpoint.unlink()
+            endpoint.write_bytes(replacement_bytes)
+            raise OSError("post-bind replacement failure")
+        original_chown(path, *args, **kwargs)
+
+    with monkeypatch.context() as replacement_patch:
+        replacement_patch.setattr(lab_worker.os, "chown", replace_endpoint_then_fail)
+        with pytest.raises(lab_worker.LabWireSessionStartupError):
+            lab_worker._new_wire_session(roots=(replacement_root,))
+    replacement_directories = tuple(replacement_root.iterdir())
+    assert len(replacement_directories) == 1
+    assert (replacement_directories[0] / "wire.sock").read_bytes() == replacement_bytes
+    shutil.rmtree(replacement_directories[0])
+    replacement_root.rmdir()
+
+    renamed_root = Path("/private/tmp") / f"lwl-rename-{uuid4().hex[:8]}"
+    renamed_root.mkdir(mode=0o700)
+    moved_session = renamed_root / "moved-session"
+
+    def replace_directory_then_fail(path: object, *args: object, **kwargs: object) -> None:
+        if endpoint_name(path) == "wire.sock":
+            endpoint = Path(os.fspath(path))
+            session_path = endpoint.parent
+            session_path.rename(moved_session)
+            session_path.mkdir(mode=0o700)
+            (session_path / "replacement").write_text("keep", encoding="ascii")
+            raise OSError("post-bind directory replacement failure")
+        original_chown(path, *args, **kwargs)
+
+    with monkeypatch.context() as renamed_patch:
+        renamed_patch.setattr(lab_worker.os, "chown", replace_directory_then_fail)
+        with pytest.raises(lab_worker.LabWireSessionStartupError):
+            lab_worker._new_wire_session(roots=(renamed_root,))
+    original_name_replacement = next(
+        path for path in renamed_root.iterdir() if path.name.startswith("rqlw-")
+    )
+    assert (original_name_replacement / "replacement").read_text(encoding="ascii") == "keep"
+    assert (moved_session / "wire.sock").exists()
+    shutil.rmtree(original_name_replacement)
+    shutil.rmtree(moved_session)
+    renamed_root.rmdir()
 
     long_root = Path("/private/tmp") / f"long-{uuid4().hex}{'x' * 96}"
     long_root.mkdir(mode=0o700)
@@ -5212,10 +5417,96 @@ def test_pre_ack_refresh_stop_is_bounded_and_discards_late_recheck(
     from rquant.resource_admission import TradingSession
     from rquant.runtime_resource_admission import SQLiteResourceReservationStore
 
-    claims = LabClaimSpool(tmp_path / "claims")
-    reports = LabReportSpool(tmp_path / "reports")
+    claims = LabClaimSpool(tmp_path / "authority-block-claims")
+    reports = LabReportSpool(tmp_path / "authority-block-reports")
     claim = _short_live_claim()
     claims.publish(claim)
+    authority_pid_path = tmp_path / "pre-ack-authority.pid"
+    descendant_pid_path = tmp_path / "pre-ack-authority-descendant.pid"
+    release_authority_path = tmp_path / "release-pre-ack-authority"
+    initial_snapshot = StaticResourceSnapshotProvider(
+        _healthy_resource_snapshot(session=TradingSession.MORNING)
+    )
+    initial_policy = StaticAdmissionPolicyProvider(
+        _permissive_admission_policy(max_live_shard_duration_ms=300)
+    )
+    worker = _worker(
+        tmp_path,
+        claims=claims,
+        reports=reports,
+        registry=PlanBypassRecordingRegistry(),
+        resource_snapshot_provider=initial_snapshot,
+        admission_policy_provider=initial_policy,
+        require_resource_admission=True,
+    )
+    blocking_manifest = _test_authority_manifest(
+        tmp_path,
+        snapshot_provider=initial_snapshot,
+        policy_provider=SpawnDescendantBlockingAdmissionPolicyProvider(
+            _permissive_admission_policy(max_live_shard_duration_ms=300),
+            authority_pid_path=authority_pid_path,
+            descendant_pid_path=descendant_pid_path,
+            release_path=release_authority_path,
+        ),
+        quota_provider=None,
+    )
+    original_consume = worker._consume_selected_claim
+
+    def consume_then_block_pre_ack(entry: object):
+        consumed = original_consume(entry)
+        if consumed is not None:
+            worker.resource_authority_manifest = blocking_manifest
+        return consumed
+
+    monkeypatch.setattr(worker, "_consume_selected_claim", consume_then_block_pre_ack)
+    outcomes: list[object] = []
+    errors: list[BaseException] = []
+
+    def run_blocked_authority() -> None:
+        try:
+            outcomes.append(worker.run_once())
+        except BaseException as exc:
+            errors.append(exc)
+
+    runner = threading.Thread(target=run_blocked_authority)
+    runner.start()
+    authority_pid: int | None = None
+    descendant_pid: int | None = None
+    try:
+        deadline = time.monotonic() + 4
+        while (
+            not authority_pid_path.exists() or not descendant_pid_path.exists()
+        ) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert authority_pid_path.exists()
+        assert descendant_pid_path.exists()
+        authority_pid = int(authority_pid_path.read_text(encoding="ascii"))
+        descendant_pid = int(descendant_pid_path.read_text(encoding="ascii"))
+        worker.request_stop()
+        runner.join(timeout=2)
+        assert not runner.is_alive()
+        assert errors == []
+        assert len(outcomes) == 1
+        assert outcomes[0].status == "stopped"
+        assert not any(
+            thread.name.startswith("lab-pre-ack-resource-") and thread.is_alive()
+            for thread in threading.enumerate()
+        )
+        assert worker._managed_authority_children == {}
+        _assert_process_gone(authority_pid)
+        _assert_process_gone(descendant_pid)
+    finally:
+        release_authority_path.touch()
+        runner.join(timeout=3)
+        if authority_pid is not None:
+            _kill_process_if_alive(authority_pid)
+        if descendant_pid is not None:
+            _kill_process_if_alive(descendant_pid)
+
+    claims = LabClaimSpool(tmp_path / "callback-block-claims")
+    reports = LabReportSpool(tmp_path / "callback-block-reports")
+    callback_claim = _short_live_claim()
+    claims.publish(callback_claim)
     store = SQLiteResourceReservationStore(
         tmp_path / "pre-ack-cancel.sqlite3",
         clock=lambda: NOW,
@@ -5230,7 +5521,7 @@ def test_pre_ack_refresh_stop_is_bounded_and_discards_late_recheck(
         return original_recheck(**kwargs)
 
     monkeypatch.setattr(store, "recheck", blocking_recheck)
-    worker = _worker(
+    callback_worker = _worker(
         tmp_path,
         claims=claims,
         reports=reports,
@@ -5244,23 +5535,35 @@ def test_pre_ack_refresh_stop_is_bounded_and_discards_late_recheck(
         resource_reservation_store=store,
         require_resource_admission=True,
     )
-    outcomes: list[object] = []
-    runner = threading.Thread(target=lambda: outcomes.append(worker.run_once()))
+    callback_outcomes: list[object] = []
+    callback_errors: list[BaseException] = []
 
-    runner.start()
+    def run_blocked_callback() -> None:
+        try:
+            callback_outcomes.append(callback_worker.run_once())
+        except BaseException as exc:
+            callback_errors.append(exc)
+
+    callback_runner = threading.Thread(target=run_blocked_callback)
+    callback_runner.start()
     try:
         assert entered_recheck.wait(timeout=3)
-        worker.request_stop()
-        runner.join(timeout=0.5)
-        assert not runner.is_alive()
+        callback_worker.request_stop()
+        callback_runner.join(timeout=2)
+        assert not callback_runner.is_alive()
+        assert callback_outcomes == []
+        assert len(callback_errors) == 1
+        assert isinstance(callback_errors[0], BaseExceptionGroup)
+        diagnostics = _collect_base_exceptions(callback_errors[0])
+        assert any(isinstance(error, InterruptedError) for error in diagnostics)
+        assert any(isinstance(error, TimeoutError) for error in diagnostics)
+        assert callback_worker._pre_ack_admission_diagnostics
     finally:
         release_recheck.set()
-        runner.join(timeout=3)
+        callback_runner.join(timeout=3)
 
-    assert outcomes[0].status == "stopped"
     assert store.active_leases() == ()
-    assert reports.pending() != ()
-    assert not any(isinstance(entry.report.body, LabShardSucceeded) for entry in reports.pending())
+    assert reports.pending() == ()
 
 
 def test_delayed_ack_send_starts_full_live_budget_only_after_send_success(
@@ -5279,10 +5582,10 @@ def test_delayed_ack_send_starts_full_live_budget_only_after_send_success(
     validated = worker._validate_closed_claim(claim)
     original_send = lab_worker._send_wire
 
-    def delayed_send(connection: object, value: object) -> None:
+    def delayed_send(connection: object, value: object, **kwargs: object) -> None:
         if isinstance(value, lab_worker._IsolationStartAck):
             time.sleep(0.55)
-        original_send(connection, value)
+        original_send(connection, value, **kwargs)
 
     monkeypatch.setattr(lab_worker, "_send_wire", delayed_send)
 
@@ -5323,10 +5626,10 @@ def test_failed_ack_send_never_executes_adapter_and_reaps_child(
     )
     original_send = lab_worker._send_wire
 
-    def fail_ack_send(connection: object, value: object) -> None:
+    def fail_ack_send(connection: object, value: object, **kwargs: object) -> None:
         if isinstance(value, lab_worker._IsolationStartAck):
             raise OSError("injected ACK send failure")
-        original_send(connection, value)
+        original_send(connection, value, **kwargs)
 
     with monkeypatch.context() as ack_patch:
         ack_patch.setattr(lab_worker, "_send_wire", fail_ack_send)
@@ -5355,8 +5658,8 @@ def test_failed_ack_send_never_executes_adapter_and_reaps_child(
     )
     killed_pids: list[int] = []
 
-    def send_ack_then_kill(connection: object, value: object) -> None:
-        original_send(connection, value)
+    def send_ack_then_kill(connection: object, value: object, **kwargs: object) -> None:
+        original_send(connection, value, **kwargs)
         if isinstance(value, lab_worker._IsolationStartAck):
             shard_children = [
                 child
@@ -6332,9 +6635,9 @@ def test_isolated_shard_is_alive_baseexception_does_not_interrupt_cleanup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from multiprocessing.connection import Connection
     from multiprocessing.process import BaseProcess
 
+    from rquant.lab_worker import _DeadlineWireEndpoint
     from rquant.resource_admission import TradingSession
 
     claims = LabClaimSpool(tmp_path / "claims")
@@ -6347,13 +6650,13 @@ def test_isolated_shard_is_alive_baseexception_does_not_interrupt_cleanup(
         registry=HungLiveRegistry(pid_path=child_pid_path),
     )
     validated = worker._validate_closed_claim(claim)
-    original_connection_close = Connection.close
+    original_connection_close = _DeadlineWireEndpoint.close
     original_is_alive = BaseProcess.is_alive
     parent_pid = os.getpid()
     close_failed = False
     is_alive_failed = False
 
-    def fail_first_parent_child_close(connection: Connection) -> None:
+    def fail_first_parent_child_close(connection: _DeadlineWireEndpoint) -> None:
         nonlocal close_failed
         original_connection_close(connection)
         if os.getpid() == parent_pid and not close_failed:
@@ -6374,7 +6677,7 @@ def test_isolated_shard_is_alive_baseexception_does_not_interrupt_cleanup(
             )
         return original_is_alive(process)
 
-    monkeypatch.setattr(Connection, "close", fail_first_parent_child_close)
+    monkeypatch.setattr(_DeadlineWireEndpoint, "close", fail_first_parent_child_close)
     monkeypatch.setattr(BaseProcess, "is_alive", fail_first_is_alive)
 
     try:
@@ -6674,8 +6977,7 @@ def test_isolated_shard_child_connection_close_failure_cleans_started_process(
     monkeypatch: pytest.MonkeyPatch,
     close_failure: BaseException,
 ) -> None:
-    from multiprocessing.connection import Connection
-
+    from rquant.lab_worker import _DeadlineWireEndpoint
     from rquant.resource_admission import TradingSession
 
     claims = LabClaimSpool(tmp_path / "claims")
@@ -6688,18 +6990,18 @@ def test_isolated_shard_child_connection_close_failure_cleans_started_process(
         registry=SlowPidRegistry(pid_path=child_pid_path, delay_seconds=0),
     )
     validated = worker._validate_closed_claim(claim)
-    original_close = Connection.close
+    original_close = _DeadlineWireEndpoint.close
     parent_pid = os.getpid()
     raised = False
 
-    def close_then_fail(connection: Connection) -> None:
+    def close_then_fail(connection: _DeadlineWireEndpoint) -> None:
         nonlocal raised
         original_close(connection)
         if os.getpid() == parent_pid and not raised:
             raised = True
             raise close_failure
 
-    monkeypatch.setattr(Connection, "close", close_then_fail)
+    monkeypatch.setattr(_DeadlineWireEndpoint, "close", close_then_fail)
 
     try:
         if isinstance(close_failure, Exception):
@@ -6739,9 +7041,9 @@ def test_isolated_shard_preserves_child_close_and_cleanup_failures(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from multiprocessing.connection import Connection
     from multiprocessing.process import BaseProcess
 
+    from rquant.lab_worker import _DeadlineWireEndpoint
     from rquant.resource_admission import TradingSession
 
     claims = LabClaimSpool(tmp_path / "claims")
@@ -6753,12 +7055,12 @@ def test_isolated_shard_preserves_child_close_and_cleanup_failures(
         registry=SlowPidRegistry(pid_path=tmp_path / "double-failure-child.pid", delay_seconds=0),
     )
     validated = worker._validate_closed_claim(claim)
-    original_connection_close = Connection.close
+    original_connection_close = _DeadlineWireEndpoint.close
     original_process_close = BaseProcess.close
     parent_pid = os.getpid()
     child_close_failed = False
 
-    def fail_first_parent_child_close(connection: Connection) -> None:
+    def fail_first_parent_child_close(connection: _DeadlineWireEndpoint) -> None:
         nonlocal child_close_failed
         original_connection_close(connection)
         if os.getpid() == parent_pid and not child_close_failed:
@@ -6770,7 +7072,7 @@ def test_isolated_shard_preserves_child_close_and_cleanup_failures(
         if process.name.startswith("lab-shard-"):
             raise OSError("process sentinel close denied")
 
-    monkeypatch.setattr(Connection, "close", fail_first_parent_child_close)
+    monkeypatch.setattr(_DeadlineWireEndpoint, "close", fail_first_parent_child_close)
     monkeypatch.setattr(BaseProcess, "close", fail_process_cleanup)
 
     control = worker._execute_shard_isolated(

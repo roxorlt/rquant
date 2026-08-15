@@ -5,12 +5,15 @@ from __future__ import annotations
 import base64
 import errno
 import hashlib
+import hmac
 import multiprocessing
 import os
 import re
+import selectors
 import signal
 import socket
 import stat
+import struct
 import tempfile
 import threading
 import time
@@ -18,7 +21,8 @@ from collections.abc import Callable
 from contextlib import AbstractContextManager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from multiprocessing.connection import Client, Connection, answer_challenge, deliver_challenge
+from multiprocessing.connection import Client, Connection
+from multiprocessing.context import AuthenticationError
 from multiprocessing.process import BaseProcess
 from pathlib import Path
 from types import FrameType
@@ -167,6 +171,11 @@ _MAX_SHARD_RESULT_WIRE_BYTES = MAX_RESULT_WIRE_BYTES
 _AUTHORITY_SPAWN_ALLOWANCE_MICROSECONDS = 750_000
 _PRESTART_AUTHORITY_CLEANUP_RESERVE_MICROSECONDS = 250_000
 _AUTHORITY_CHILD_CLEANUP_BUDGET_MICROSECONDS = 250_000
+_WIRE_CHALLENGE = b"#CHALLENGE#"
+_WIRE_WELCOME = b"#WELCOME#"
+_WIRE_FAILURE = b"#FAILURE#"
+_WIRE_DIGEST_PREFIX = b"{sha256}"
+_WIRE_CHALLENGE_BYTES = 40
 _BUILTIN_SHARD_REGISTRY_ID = "rquant.lab-shard.builtin"
 _BUILTIN_SHARD_REGISTRY_VERSION = 1
 _BUILTIN_SHARD_REGISTRY_HASH = hashlib.sha256(b"rquant:lab-shard:builtin:v1").hexdigest()
@@ -719,7 +728,7 @@ class _IsolatedExecutionControl:
 @dataclass
 class _WireChild:
     process: BaseProcess
-    connection: Connection
+    connection: Connection | _DeadlineWireEndpoint
     group_id: int
     address: str
 
@@ -776,6 +785,18 @@ class _PrestartedAuthorityStage:
         """Compatibility view used only by stage lifecycle assertions."""
 
         return None if self.managed_child is None else self.managed_child.child
+
+
+@dataclass
+class _PreAckAdmissionStage:
+    cancelled: threading.Event
+    completion: threading.Event
+    deadline_microseconds: int
+    thread: threading.Thread | None = None
+    evaluation: _ResourceAdmissionEvaluation | None = None
+    stop_reason: str | None = None
+    session_failure: _ClassifiedWireFailure | None = None
+    resource_error: Exception | None = None
 
 
 class LabIsolatedExecutionError(RuntimeError):
@@ -1740,27 +1761,305 @@ def _validate_outbound_wire_size(
         raise LabDaemonConfigurationError(f"{label} exceeds the outbound wire size limit")
 
 
+class _DeadlineWireEndpoint:
+    """One accepted AF_UNIX stream with deadline-aware framed I/O."""
+
+    def __init__(self, accepted: socket.socket) -> None:
+        accepted.setblocking(False)
+        self._socket = accepted
+        self._selector = selectors.DefaultSelector()
+        self._selector.register(accepted, selectors.EVENT_READ)
+        self._closed = False
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def fileno(self) -> int:
+        return self._socket.fileno()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        selector_error: BaseException | None = None
+        try:
+            self._selector.close()
+        except BaseException as exc:
+            selector_error = exc
+        try:
+            self._socket.close()
+        except BaseException:
+            if selector_error is None:
+                raise
+        if selector_error is not None:
+            raise selector_error
+
+    def _wait(
+        self,
+        events: int,
+        *,
+        deadline_microseconds: int | None,
+        cancel_requested: Callable[[], bool] | None,
+        label: str,
+    ) -> None:
+        while True:
+            if cancel_requested is not None and cancel_requested():
+                raise InterruptedError(f"{label} cancelled")
+            timeout = _microseconds_to_seconds(_RESOURCE_AUTHORITY_POLL_MICROSECONDS)
+            if deadline_microseconds is not None:
+                remaining = deadline_microseconds - _monotonic_microseconds()
+                if remaining <= 0:
+                    raise TimeoutError(f"{label} timed out")
+                timeout = _microseconds_to_seconds(
+                    min(_RESOURCE_AUTHORITY_POLL_MICROSECONDS, remaining)
+                )
+            self._selector.modify(self._socket, events)
+            if self._selector.select(timeout):
+                return
+
+    def _send_exact(
+        self,
+        payload: bytes | bytearray | memoryview,
+        *,
+        deadline_microseconds: int | None,
+        cancel_requested: Callable[[], bool] | None,
+        label: str,
+    ) -> None:
+        view = memoryview(payload)
+        sent = 0
+        try:
+            while sent < len(view):
+                self._wait(
+                    selectors.EVENT_WRITE,
+                    deadline_microseconds=deadline_microseconds,
+                    cancel_requested=cancel_requested,
+                    label=label,
+                )
+                try:
+                    count = self._socket.send(view[sent:])
+                except BlockingIOError:
+                    continue
+                if count == 0:
+                    raise EOFError(f"{label} peer closed during send")
+                sent += count
+        except BaseException:
+            with suppress(BaseException):
+                self.close()
+            raise
+
+    def _recv_exact(
+        self,
+        size: int,
+        *,
+        deadline_microseconds: int | None,
+        cancel_requested: Callable[[], bool] | None,
+        label: str,
+    ) -> bytes:
+        payload = bytearray()
+        try:
+            while len(payload) < size:
+                self._wait(
+                    selectors.EVENT_READ,
+                    deadline_microseconds=deadline_microseconds,
+                    cancel_requested=cancel_requested,
+                    label=label,
+                )
+                try:
+                    chunk = self._socket.recv(size - len(payload))
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    raise EOFError(f"{label} peer closed during receive")
+                payload.extend(chunk)
+        except BaseException:
+            with suppress(BaseException):
+                self.close()
+            raise
+        return bytes(payload)
+
+    def send_bytes(
+        self,
+        payload: bytes,
+        *,
+        deadline_microseconds: int | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
+        label: str = "wire send",
+    ) -> None:
+        size = len(payload)
+        header = struct.pack("!iQ", -1, size) if size > 0x7FFFFFFF else struct.pack("!i", size)
+        self._send_exact(
+            header,
+            deadline_microseconds=deadline_microseconds,
+            cancel_requested=cancel_requested,
+            label=f"{label} header",
+        )
+        self._send_exact(
+            payload,
+            deadline_microseconds=deadline_microseconds,
+            cancel_requested=cancel_requested,
+            label=f"{label} payload",
+        )
+
+    def recv_bytes(
+        self,
+        maxlength: int | None = None,
+        *,
+        deadline_microseconds: int | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
+        label: str = "wire receive",
+    ) -> bytes:
+        header = self._recv_exact(
+            4,
+            deadline_microseconds=deadline_microseconds,
+            cancel_requested=cancel_requested,
+            label=f"{label} header",
+        )
+        size = struct.unpack("!i", header)[0]
+        if size == -1:
+            extended = self._recv_exact(
+                8,
+                deadline_microseconds=deadline_microseconds,
+                cancel_requested=cancel_requested,
+                label=f"{label} extended header",
+            )
+            size = struct.unpack("!Q", extended)[0]
+        if size < 0:
+            with suppress(BaseException):
+                self.close()
+            raise OSError(f"{label} has an invalid frame length")
+        if maxlength is not None and size > maxlength:
+            with suppress(BaseException):
+                self.close()
+            raise OSError(f"{label} exceeds the inbound wire size limit")
+        return self._recv_exact(
+            size,
+            deadline_microseconds=deadline_microseconds,
+            cancel_requested=cancel_requested,
+            label=f"{label} payload",
+        )
+
+    def poll(self, timeout: float = 0.0) -> bool:
+        if self._closed:
+            raise OSError("wire endpoint is closed")
+        self._selector.modify(self._socket, selectors.EVENT_READ)
+        return bool(self._selector.select(max(0.0, timeout)))
+
+    def authenticate_server(
+        self,
+        authkey: bytes,
+        *,
+        deadline_microseconds: int,
+        cancel_requested: Callable[[], bool] | None,
+    ) -> None:
+        challenge = _WIRE_DIGEST_PREFIX + os.urandom(_WIRE_CHALLENGE_BYTES)
+        self.send_bytes(
+            _WIRE_CHALLENGE + challenge,
+            deadline_microseconds=deadline_microseconds,
+            cancel_requested=cancel_requested,
+            label="wire authentication challenge",
+        )
+        response = self.recv_bytes(
+            256,
+            deadline_microseconds=deadline_microseconds,
+            cancel_requested=cancel_requested,
+            label="wire authentication response",
+        )
+        expected = _WIRE_DIGEST_PREFIX + hmac.new(authkey, challenge, "sha256").digest()
+        if not hmac.compare_digest(expected, response):
+            with suppress(BaseException):
+                self.send_bytes(
+                    _WIRE_FAILURE,
+                    deadline_microseconds=deadline_microseconds,
+                    cancel_requested=cancel_requested,
+                    label="wire authentication rejection",
+                )
+            raise AuthenticationError("wire authentication digest was wrong")
+        self.send_bytes(
+            _WIRE_WELCOME,
+            deadline_microseconds=deadline_microseconds,
+            cancel_requested=cancel_requested,
+            label="wire authentication welcome",
+        )
+
+        peer_challenge_frame = self.recv_bytes(
+            256,
+            deadline_microseconds=deadline_microseconds,
+            cancel_requested=cancel_requested,
+            label="wire mutual authentication challenge",
+        )
+        if not peer_challenge_frame.startswith(_WIRE_CHALLENGE):
+            raise AuthenticationError("wire mutual authentication challenge was malformed")
+        peer_challenge = peer_challenge_frame[len(_WIRE_CHALLENGE) :]
+        if not peer_challenge.startswith(_WIRE_DIGEST_PREFIX):
+            raise AuthenticationError("wire mutual authentication digest is not SHA-256")
+        peer_response = (
+            _WIRE_DIGEST_PREFIX
+            + hmac.new(
+                authkey,
+                peer_challenge,
+                "sha256",
+            ).digest()
+        )
+        self.send_bytes(
+            peer_response,
+            deadline_microseconds=deadline_microseconds,
+            cancel_requested=cancel_requested,
+            label="wire mutual authentication response",
+        )
+        welcome = self.recv_bytes(
+            256,
+            deadline_microseconds=deadline_microseconds,
+            cancel_requested=cancel_requested,
+            label="wire mutual authentication welcome",
+        )
+        if welcome != _WIRE_WELCOME:
+            raise AuthenticationError("wire mutual authentication response was rejected")
+
+
 def _send_wire(
-    connection: Connection,
+    connection: Connection | _DeadlineWireEndpoint,
     value: LabWireModel,
     *,
     max_bytes: int = _MAX_CONTROL_WIRE_BYTES,
     label: str = "wire message",
+    deadline_microseconds: int | None = None,
+    cancel_requested: Callable[[], bool] | None = None,
 ) -> None:
     payload = _encode_wire_message(value)
     _validate_outbound_wire_size(len(payload), max_bytes=max_bytes, label=label)
-    connection.send_bytes(payload)
+    if isinstance(connection, _DeadlineWireEndpoint):
+        connection.send_bytes(
+            payload,
+            deadline_microseconds=deadline_microseconds,
+            cancel_requested=cancel_requested,
+            label=label,
+        )
+    else:
+        connection.send_bytes(payload)
 
 
 def _recv_wire(
-    connection: Connection,
+    connection: Connection | _DeadlineWireEndpoint,
     *,
     model: type[WireModelT],
     max_bytes: int,
     label: str,
+    deadline_microseconds: int | None = None,
+    cancel_requested: Callable[[], bool] | None = None,
 ) -> WireModelT:
     try:
-        payload = connection.recv_bytes(maxlength=max_bytes)
+        if isinstance(connection, _DeadlineWireEndpoint):
+            payload = connection.recv_bytes(
+                maxlength=max_bytes,
+                deadline_microseconds=deadline_microseconds,
+                cancel_requested=cancel_requested,
+                label=label,
+            )
+        else:
+            payload = connection.recv_bytes(maxlength=max_bytes)
+    except (InterruptedError, TimeoutError):
+        raise
     except (EOFError, OSError) as exc:
         raise LabDaemonConfigurationError(f"{label} transport failed") from exc
     return _decode_wire_message(
@@ -1822,24 +2121,64 @@ class _RawWireListener:
     """A minimal authenticated listener without Listener's path finalizer."""
 
     def __init__(self, socket_listener: socket.socket, authkey: bytes) -> None:
+        socket_listener.setblocking(False)
         self._socket = socket_listener
         self._authkey = authkey
+        self._selector = selectors.DefaultSelector()
+        self._selector.register(socket_listener, selectors.EVENT_READ)
+        self._closed = False
 
     def fileno(self) -> int:
         return self._socket.fileno()
 
-    def accept(self) -> Connection:
-        accepted, _address = self._socket.accept()
-        connection = Connection(accepted.detach())
+    def accept(
+        self,
+        *,
+        deadline_microseconds: int | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
+    ) -> _DeadlineWireEndpoint:
+        accepted: socket.socket | None = None
         try:
-            deliver_challenge(connection, self._authkey)
-            answer_challenge(connection, self._authkey)
+            while accepted is None:
+                if cancel_requested is not None and cancel_requested():
+                    raise InterruptedError("wire listener accept cancelled")
+                timeout = _microseconds_to_seconds(_RESOURCE_AUTHORITY_POLL_MICROSECONDS)
+                if deadline_microseconds is not None:
+                    remaining = deadline_microseconds - _monotonic_microseconds()
+                    if remaining <= 0:
+                        raise TimeoutError("wire listener accept timed out")
+                    timeout = _microseconds_to_seconds(
+                        min(_RESOURCE_AUTHORITY_POLL_MICROSECONDS, remaining)
+                    )
+                if not self._selector.select(timeout):
+                    continue
+                try:
+                    accepted, _address = self._socket.accept()
+                except BlockingIOError:
+                    continue
+            endpoint = _DeadlineWireEndpoint(accepted)
+            accepted = None
+            endpoint.authenticate_server(
+                self._authkey,
+                deadline_microseconds=(
+                    deadline_microseconds if deadline_microseconds is not None else 2**63 - 1
+                ),
+                cancel_requested=cancel_requested,
+            )
         except BaseException:
-            connection.close()
+            if accepted is not None:
+                accepted.close()
+            if "endpoint" in locals():
+                with suppress(BaseException):
+                    endpoint.close()
             raise
-        return connection
+        return endpoint
 
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._selector.close()
         self._socket.close()
 
 
@@ -1861,50 +2200,122 @@ class _WireSession:
     def address(self) -> str:
         return str(self.endpoint)
 
-    def _session_path_is_original(self) -> bool:
-        try:
-            observed = os.stat(self.path.name, dir_fd=self.root_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            return False
-        return stat.S_ISDIR(observed.st_mode) and self.session_identity.matches(observed)
+    def cleanup(self) -> None:
+        if self._cleaned:
+            return
+        self._cleaned = True
+        _cleanup_wire_session_identity(
+            close_listener=self.listener.close,
+            root_path=self.root_path,
+            session_name=self.path.name,
+            endpoint_name=self.endpoint.name,
+            root_fd=self.root_fd,
+            session_fd=self.session_fd,
+            root_identity=self.root_identity,
+            session_identity=self.session_identity,
+            endpoint_identity=self.endpoint_identity,
+        )
+
+
+@dataclass
+class _ProvisionalWireSessionOwner:
+    root_path: Path
+    session_name: str
+    endpoint_name: str
+    root_fd: int
+    session_fd: int
+    root_identity: _WireFilesystemIdentity
+    session_identity: _WireFilesystemIdentity
+    endpoint_identity: _WireFilesystemIdentity
+    listener_socket: socket.socket
+    _cleaned: bool = False
 
     def cleanup(self) -> None:
         if self._cleaned:
             return
         self._cleaned = True
-        errors: list[BaseException] = []
+        _cleanup_wire_session_identity(
+            close_listener=self.listener_socket.close,
+            root_path=self.root_path,
+            session_name=self.session_name,
+            endpoint_name=self.endpoint_name,
+            root_fd=self.root_fd,
+            session_fd=self.session_fd,
+            root_identity=self.root_identity,
+            session_identity=self.session_identity,
+            endpoint_identity=self.endpoint_identity,
+        )
+
+
+def _cleanup_wire_session_identity(
+    *,
+    close_listener: Callable[[], None],
+    root_path: Path,
+    session_name: str,
+    endpoint_name: str,
+    root_fd: int,
+    session_fd: int,
+    root_identity: _WireFilesystemIdentity,
+    session_identity: _WireFilesystemIdentity,
+    endpoint_identity: _WireFilesystemIdentity,
+) -> None:
+    errors: list[BaseException] = []
+    try:
+        close_listener()
+    except BaseException as exc:
+        errors.append(exc)
+
+    def session_path_is_original() -> bool:
         try:
-            self.listener.close()
-        except BaseException as exc:
-            errors.append(exc)
-        try:
-            if self._session_path_is_original():
-                try:
-                    endpoint = os.stat(
-                        self.endpoint.name,
-                        dir_fd=self.session_fd,
-                        follow_symlinks=False,
-                    )
-                except FileNotFoundError:
-                    endpoint = None
-                if (
-                    endpoint is not None
-                    and stat.S_ISSOCK(endpoint.st_mode)
-                    and self.endpoint_identity.matches(endpoint)
-                ):
-                    os.unlink(self.endpoint.name, dir_fd=self.session_fd)
-                if self._session_path_is_original() and not os.listdir(self.session_fd):
-                    os.rmdir(self.path.name, dir_fd=self.root_fd)
-        except BaseException as exc:
-            errors.append(exc)
-        finally:
-            for descriptor in (self.session_fd, self.root_fd):
-                try:
-                    os.close(descriptor)
-                except BaseException as exc:
-                    errors.append(exc)
-        if errors:
-            raise BaseExceptionGroup("wire session cleanup failed", errors)
+            root_observed = os.stat(root_path, follow_symlinks=False)
+            session_observed = os.stat(
+                session_name,
+                dir_fd=root_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return False
+        return (
+            stat.S_ISDIR(root_observed.st_mode)
+            and root_identity.matches(root_observed)
+            and stat.S_ISDIR(session_observed.st_mode)
+            and session_identity.matches(session_observed)
+        )
+
+    try:
+        if session_path_is_original():
+            try:
+                endpoint = os.stat(
+                    endpoint_name,
+                    dir_fd=session_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                endpoint = None
+            endpoint_removed_or_absent = endpoint is None
+            if (
+                endpoint is not None
+                and stat.S_ISSOCK(endpoint.st_mode)
+                and endpoint_identity.matches(endpoint)
+            ):
+                os.unlink(endpoint_name, dir_fd=session_fd)
+                endpoint_removed_or_absent = True
+            if (
+                endpoint_removed_or_absent
+                and session_path_is_original()
+                and not os.listdir(session_fd)
+            ):
+                os.rmdir(session_name, dir_fd=root_fd)
+    except BaseException as exc:
+        errors.append(exc)
+    finally:
+        for descriptor in (session_fd, root_fd):
+            try:
+                os.close(descriptor)
+            except BaseException as exc:
+                errors.append(exc)
+    if errors:
+        raise BaseExceptionGroup("wire session cleanup failed", errors)
 
 
 def _wire_root_candidates(roots: tuple[Path, ...] | None) -> tuple[Path, ...]:
@@ -1980,6 +2391,7 @@ def _new_wire_session(*, roots: tuple[Path, ...] | None = None) -> _WireSession:
         root_fd: int | None = None
         session_fd: int | None = None
         listener_socket: socket.socket | None = None
+        provisional: _ProvisionalWireSessionOwner | None = None
         session: _WireSession | None = None
         try:
             root_fd, root_identity = _open_wire_root(root)
@@ -1988,10 +2400,41 @@ def _new_wire_session(*, roots: tuple[Path, ...] | None = None) -> _WireSession:
             endpoint = path / "wire.sock"
             listener_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             listener_socket.bind(str(endpoint))
+            provisional_endpoint_stat = os.stat(
+                endpoint.name,
+                dir_fd=session_fd,
+                follow_symlinks=False,
+            )
+            provisional = _ProvisionalWireSessionOwner(
+                root_path=root,
+                session_name=session_name,
+                endpoint_name=endpoint.name,
+                root_fd=root_fd,
+                session_fd=session_fd,
+                root_identity=root_identity,
+                session_identity=session_identity,
+                endpoint_identity=_WireFilesystemIdentity.from_stat(provisional_endpoint_stat),
+                listener_socket=listener_socket,
+            )
             os.chown(endpoint, os.geteuid(), os.getegid(), follow_symlinks=False)
             os.chmod(endpoint, 0o600, follow_symlinks=False)
-            endpoint_stat = os.stat(endpoint, follow_symlinks=False)
+            endpoint_stat = os.stat(
+                endpoint.name,
+                dir_fd=session_fd,
+                follow_symlinks=False,
+            )
             authkey = os.urandom(32)
+            # macOS socket fstat() identifies the socket object, not its filesystem vnode.
+            if (
+                not stat.S_ISSOCK(endpoint_stat.st_mode)
+                or endpoint_stat.st_uid != os.geteuid()
+                or endpoint_stat.st_gid != os.getegid()
+                or stat.S_IMODE(endpoint_stat.st_mode) != 0o600
+                or not provisional.endpoint_identity.matches(endpoint_stat)
+            ):
+                raise LabWireSessionStartupError("wire endpoint identity validation failed")
+            listener_socket.listen(1)
+            listener = _RawWireListener(listener_socket, authkey)
             session = _WireSession(
                 root_path=root,
                 path=path,
@@ -2000,28 +2443,29 @@ def _new_wire_session(*, roots: tuple[Path, ...] | None = None) -> _WireSession:
                 session_fd=session_fd,
                 root_identity=root_identity,
                 session_identity=session_identity,
-                endpoint_identity=_WireFilesystemIdentity.from_stat(endpoint_stat),
-                listener=_RawWireListener(listener_socket, authkey),
+                endpoint_identity=provisional.endpoint_identity,
+                listener=listener,
                 authkey=authkey,
             )
-            # macOS socket fstat() identifies the socket object, not its filesystem vnode.
-            if (
-                not stat.S_ISSOCK(endpoint_stat.st_mode)
-                or endpoint_stat.st_uid != os.geteuid()
-                or endpoint_stat.st_gid != os.getegid()
-                or stat.S_IMODE(endpoint_stat.st_mode) != 0o600
-            ):
-                raise LabWireSessionStartupError("wire endpoint identity validation failed")
-            listener_socket.listen(1)
-            listener_socket.settimeout(
-                _microseconds_to_seconds(_RESOURCE_AUTHORITY_POLL_MICROSECONDS)
-            )
+            provisional._cleaned = True
             return session
         except BaseException as exc:
-            errors.append(exc)
             if session is not None:
-                with suppress(BaseException):
+                try:
                     session.cleanup()
+                except BaseException as cleanup_error:
+                    exc = BaseExceptionGroup(
+                        "wire session startup and cleanup failed",
+                        [exc, cleanup_error],
+                    )
+            elif provisional is not None:
+                try:
+                    provisional.cleanup()
+                except BaseException as cleanup_error:
+                    exc = BaseExceptionGroup(
+                        "wire session startup and cleanup failed",
+                        [exc, cleanup_error],
+                    )
             else:
                 if listener_socket is not None:
                     with suppress(BaseException):
@@ -2034,6 +2478,7 @@ def _new_wire_session(*, roots: tuple[Path, ...] | None = None) -> _WireSession:
                         with suppress(FileNotFoundError):
                             os.rmdir(session_name, dir_fd=root_fd)
                         os.close(root_fd)
+            errors.append(exc)
     raise LabWireSessionStartupError(
         "could not create a private wire session"
     ) from BaseExceptionGroup("wire session startup failures", errors)
@@ -2473,6 +2918,7 @@ class LabWorker:
         self._resource_snapshot_authority_state: LabSnapshotAuthorityState | None = None
         self._managed_authority_children_lock = threading.Lock()
         self._managed_authority_children: dict[int, _ManagedAuthorityChild] = {}
+        self._pre_ack_admission_diagnostics: tuple[str, ...] = ()
 
     def request_stop(self) -> None:
         with self._isolation_start_condition:
@@ -3044,24 +3490,21 @@ class LabWorker:
         deadline_microseconds: int,
         label: str,
         honor_worker_stop: bool = True,
+        cancel_requested: Callable[[], bool] | None = None,
     ) -> WireModelT:
-        while True:
-            if honor_worker_stop and self._stop.is_set():
-                raise InterruptedError(f"worker stop requested during {label}")
-            remaining = deadline_microseconds - _monotonic_microseconds()
-            if remaining <= 0:
-                raise TimeoutError(f"{label} timed out")
-            if child.connection.poll(
-                _microseconds_to_seconds(min(_RESOURCE_AUTHORITY_POLL_MICROSECONDS, remaining))
-            ):
-                return _recv_wire(
-                    child.connection,
-                    model=model,
-                    max_bytes=max_bytes,
-                    label=label,
-                )
-            if not child.process.is_alive():
-                raise LabDaemonConfigurationError(f"{label} process exited without evidence")
+        def cancelled() -> bool:
+            return (honor_worker_stop and self._stop.is_set()) or (
+                cancel_requested is not None and cancel_requested()
+            )
+
+        return _recv_wire(
+            child.connection,
+            model=model,
+            max_bytes=max_bytes,
+            label=label,
+            deadline_microseconds=deadline_microseconds,
+            cancel_requested=cancelled,
+        )
 
     def _start_wire_child(
         self,
@@ -3073,7 +3516,15 @@ class LabWorker:
         label: str,
         max_wire_bytes: int,
         honor_worker_stop_during_readiness: bool = True,
+        cancel_requested: Callable[[], bool] | None = None,
     ) -> _WireChild:
+        def externally_cancelled() -> bool:
+            return (honor_worker_stop_during_readiness and self._stop.is_set()) or (
+                cancel_requested is not None and cancel_requested()
+            )
+
+        if externally_cancelled():
+            raise InterruptedError(f"{label} startup cancelled")
         session = _new_wire_session()
         listener = session.listener
         address = session.address
@@ -3092,23 +3543,25 @@ class LabWorker:
             name=process_name,
             daemon=False,
         )
-        connection: Connection | None = None
+        connection: _DeadlineWireEndpoint | None = None
         started = False
         try:
+            if externally_cancelled():
+                raise InterruptedError(f"{label} startup cancelled")
             process.start()
             started = True
-            while connection is None:
-                if honor_worker_stop_during_readiness and self._stop.is_set():
-                    raise InterruptedError(f"worker stop requested during {label}")
-                if _monotonic_microseconds() >= deadline_microseconds:
-                    raise TimeoutError(f"{label} timed out")
-                try:
-                    connection = listener.accept()
-                except TimeoutError:
-                    if not process.is_alive():
-                        raise LabDaemonConfigurationError(
-                            f"{label} process exited before connecting"
-                        ) from None
+
+            def startup_cancelled() -> bool:
+                if externally_cancelled():
+                    return True
+                if not process.is_alive():
+                    raise LabDaemonConfigurationError(f"{label} process exited before connecting")
+                return False
+
+            connection = listener.accept(
+                deadline_microseconds=deadline_microseconds,
+                cancel_requested=startup_cancelled,
+            )
             provisional = _WireChild(
                 process=process,
                 connection=connection,
@@ -3122,6 +3575,7 @@ class LabWorker:
                 deadline_microseconds=deadline_microseconds,
                 label=f"{label} readiness",
                 honor_worker_stop=honor_worker_stop_during_readiness,
+                cancel_requested=cancel_requested,
             )
             if not readiness.ready:
                 raise LabDaemonConfigurationError(
@@ -3507,6 +3961,7 @@ class LabWorker:
                     deadline_microseconds=deadline_microseconds,
                     label=label,
                     max_wire_bytes=_MAX_CONTROL_WIRE_BYTES,
+                    cancel_requested=stage.cancelled.is_set,
                 )
                 managed_child = self._register_authority_child(
                     child,
@@ -3787,6 +4242,8 @@ class LabWorker:
                         accepted=True,
                         not_after_monotonic_microseconds=deadline_microseconds,
                     ),
+                    deadline_microseconds=deadline_microseconds,
+                    cancel_requested=lambda: stage.cancelled.is_set() or self._stop.is_set(),
                 )
             except (InterruptedError, TimeoutError):
                 raise
@@ -3802,6 +4259,7 @@ class LabWorker:
                     max_bytes=_MAX_CONTROL_WIRE_BYTES,
                     deadline_microseconds=deadline_microseconds,
                     label=label,
+                    cancel_requested=stage.cancelled.is_set,
                 )
             except (InterruptedError, TimeoutError):
                 raise
@@ -3848,6 +4306,7 @@ class LabWorker:
         timeout_microseconds: int,
         not_after_monotonic_microseconds: int | None = None,
         include_spawn_allowance: bool = True,
+        cancellation_requested: Callable[[], bool] | None = None,
     ) -> _AuthorityWireResult:
         manifest = self.resource_authority_manifest
         if manifest is None:
@@ -3895,6 +4354,7 @@ class LabWorker:
                 deadline_microseconds=deadline_microseconds,
                 label=label,
                 max_wire_bytes=_MAX_CONTROL_WIRE_BYTES,
+                cancel_requested=cancellation_requested,
             )
             managed_child = self._register_authority_child(
                 child,
@@ -3908,6 +4368,8 @@ class LabWorker:
                         accepted=True,
                         not_after_monotonic_microseconds=deadline_microseconds,
                     ),
+                    deadline_microseconds=deadline_microseconds,
+                    cancel_requested=cancellation_requested,
                 )
             except (InterruptedError, TimeoutError):
                 raise
@@ -3923,6 +4385,7 @@ class LabWorker:
                     max_bytes=_MAX_CONTROL_WIRE_BYTES,
                     deadline_microseconds=deadline_microseconds,
                     label=label,
+                    cancel_requested=cancellation_requested,
                 )
             except (InterruptedError, TimeoutError):
                 raise
@@ -3981,6 +4444,7 @@ class LabWorker:
             admission_request=request,
             timeout_microseconds=timeout_microseconds * stage_count,
             not_after_monotonic_microseconds=not_after_monotonic_microseconds,
+            cancellation_requested=cancellation_requested,
         )
         return self._admission_evaluation_from_authority_result(
             result,
@@ -4541,6 +5005,24 @@ class LabWorker:
             )
         except TimeoutError as exc:
             raise LabDaemonConfigurationError("resource snapshot provider timed out") from exc
+        except BaseExceptionGroup as exc:
+            if exc.subgroup(TimeoutError) is None:
+                raise
+
+            def replace_timeout(error: BaseException) -> BaseException:
+                if isinstance(error, TimeoutError):
+                    replacement = LabDaemonConfigurationError(
+                        "resource snapshot provider timed out"
+                    )
+                    replacement.__cause__ = error
+                    return replacement
+                if isinstance(error, BaseExceptionGroup):
+                    return error.derive(
+                        tuple(replace_timeout(nested) for nested in error.exceptions)
+                    )
+                return error
+
+            raise replace_timeout(exc) from exc
 
     def _bounded_resource_snapshot_microseconds(
         self,
@@ -4793,6 +5275,49 @@ class LabWorker:
         if errors:
             raise BaseExceptionGroup("isolated process cleanup failed", errors)
 
+    def _finish_pre_ack_admission_stage(
+        self,
+        stage: _PreAckAdmissionStage,
+    ) -> BaseException | None:
+        stage.cancelled.set()
+        thread = stage.thread
+        if thread is None:
+            return LabDaemonConfigurationError("pre-ACK admission stage has no thread")
+        cleanup_deadline = _monotonic_microseconds() + _AUTHORITY_CHILD_CLEANUP_BUDGET_MICROSECONDS
+        try:
+            remaining = cleanup_deadline - _monotonic_microseconds()
+            thread.join(_microseconds_to_seconds(remaining))
+        except BaseException as exc:
+            cleanup_error: BaseException = exc
+        else:
+            cleanup_error = TimeoutError("pre-ACK admission thread cleanup timed out")
+            if not thread.is_alive() and stage.completion.is_set():
+                self._pre_ack_admission_diagnostics = ()
+                return None
+            if not thread.is_alive():
+                cleanup_error = RuntimeError(
+                    "pre-ACK admission thread exited without completion evidence"
+                )
+
+        with self._managed_authority_children_lock:
+            managed_children = tuple(self._managed_authority_children.values())
+        diagnostics = [
+            f"thread={thread.name}",
+            f"thread_alive={thread.is_alive()}",
+            f"completion={stage.completion.is_set()}",
+            f"authority_deadline={stage.deadline_microseconds}",
+        ]
+        for managed in managed_children:
+            with managed.lock:
+                diagnostics.append(
+                    "authority_child="
+                    f"pid:{managed.cached_pid},owner:{managed.owner},"
+                    f"cleanup_in_progress:{managed.cleanup_in_progress},"
+                    f"cleanup_retries:{managed.cleanup_retry_count}"
+                )
+        self._pre_ack_admission_diagnostics = tuple(diagnostics)
+        return cleanup_error
+
     def _execute_shard_isolated(
         self,
         claim: LabShardClaim,
@@ -4842,13 +5367,7 @@ class LabWorker:
         resource_error: Exception | None = None
         lifecycle_error: BaseException | None = None
         cleanup_errors: list[BaseException] = []
-        pre_ack_resource_refresh: threading.Thread | None = None
-        pre_ack_refresh_cancelled = threading.Event()
-        pre_ack_refresh_complete = threading.Event()
-        pre_ack_evaluation: _ResourceAdmissionEvaluation | None = None
-        pre_ack_stop_reason: str | None = None
-        pre_ack_session_failure: _ClassifiedWireFailure | None = None
-        pre_ack_resource_error: Exception | None = None
+        pre_ack_stage: _PreAckAdmissionStage | None = None
         child_ready = False
         isolation_start_aborted = False
 
@@ -4962,17 +5481,18 @@ class LabWorker:
             )
 
         def refresh_pre_ack_admission() -> None:
-            nonlocal pre_ack_evaluation, pre_ack_resource_error, pre_ack_session_failure
-            nonlocal pre_ack_stop_reason
+            if pre_ack_stage is None:  # pragma: no cover - startup invariant
+                raise RuntimeError("pre-ACK admission stage is unavailable")
+            stage = pre_ack_stage
 
             def cancelled() -> bool:
-                return pre_ack_refresh_cancelled.is_set() or self._stop.is_set()
+                return stage.cancelled.is_set() or self._stop.is_set()
 
             try:
                 remaining = spec_deadline - self.isolation_monotonic_microseconds_clock()
                 if remaining <= 0:
                     if not cancelled():
-                        pre_ack_stop_reason = deadline_stop_reason(
+                        stage.stop_reason = deadline_stop_reason(
                             self.isolation_monotonic_microseconds_clock()
                         )
                     return
@@ -5000,31 +5520,37 @@ class LabWorker:
                 )
             except (InterruptedError, TimeoutError):
                 if not cancelled():
-                    pre_ack_stop_reason = deadline_stop_reason(
+                    stage.stop_reason = deadline_stop_reason(
                         self.isolation_monotonic_microseconds_clock()
                     )
             except (LabWireSessionStartupError, LabWireSessionError) as exc:
                 if not cancelled():
-                    pre_ack_session_failure = _classify_wire_failure(exc)
+                    stage.session_failure = _classify_wire_failure(exc)
             except Exception as exc:
                 if not cancelled():
                     if _extract_wire_session_error(exc) is not None:
-                        pre_ack_session_failure = _classify_wire_failure(exc)
+                        stage.session_failure = _classify_wire_failure(exc)
                     else:
-                        pre_ack_resource_error = exc
+                        stage.resource_error = exc
             else:
                 if not cancelled():
-                    pre_ack_evaluation = evaluation
+                    stage.evaluation = evaluation
             finally:
-                pre_ack_refresh_complete.set()
+                stage.completion.set()
 
         try:
             if self.resource_authority_manifest is not None:
+                pre_ack_stage = _PreAckAdmissionStage(
+                    cancelled=threading.Event(),
+                    completion=threading.Event(),
+                    deadline_microseconds=spec_child_deadline,
+                )
                 pre_ack_resource_refresh = threading.Thread(
                     target=refresh_pre_ack_admission,
                     name=f"lab-pre-ack-resource-{claim.claim_token}",
-                    daemon=True,
+                    daemon=False,
                 )
+                pre_ack_stage.thread = pre_ack_resource_refresh
                 pre_ack_resource_refresh.start()
             readiness_deadline = min(
                 spec_child_deadline,
@@ -5038,34 +5564,35 @@ class LabWorker:
                 label="isolated shard",
                 max_wire_bytes=_MAX_CONTROL_WIRE_BYTES,
                 honor_worker_stop_during_readiness=False,
+                cancel_requested=self._stop.is_set,
             )
             with self._isolation_start_condition:
                 child_ready = True
                 self._isolation_start_condition.notify_all()
-            if pre_ack_resource_refresh is not None:
-                while not pre_ack_refresh_complete.is_set():
+            if pre_ack_stage is not None:
+                while not pre_ack_stage.completion.is_set():
                     now = self.isolation_monotonic_microseconds_clock()
                     if self._stop.is_set():
-                        pre_ack_refresh_cancelled.set()
+                        pre_ack_stage.cancelled.set()
                         stop_reason = "worker stop requested before isolated shard start"
                         break
                     if now >= spec_deadline:
-                        pre_ack_refresh_cancelled.set()
+                        pre_ack_stage.cancelled.set()
                         stop_reason = deadline_stop_reason(now)
                         break
-                    pre_ack_refresh_complete.wait(
+                    pre_ack_stage.completion.wait(
                         _microseconds_to_seconds(min(10_000, spec_deadline - now))
                     )
-                if pre_ack_refresh_complete.is_set() and not pre_ack_refresh_cancelled.is_set():
-                    if pre_ack_stop_reason is not None:
-                        stop_reason = pre_ack_stop_reason
-                    elif pre_ack_session_failure is not None:
-                        session_failure = pre_ack_session_failure
-                    elif pre_ack_resource_error is not None:
-                        resource_error = pre_ack_resource_error
+                if pre_ack_stage.completion.is_set() and not pre_ack_stage.cancelled.is_set():
+                    if pre_ack_stage.stop_reason is not None:
+                        stop_reason = pre_ack_stage.stop_reason
+                    elif pre_ack_stage.session_failure is not None:
+                        session_failure = pre_ack_stage.session_failure
+                    elif pre_ack_stage.resource_error is not None:
+                        resource_error = pre_ack_stage.resource_error
                     else:
                         apply_resource_evaluation(
-                            pre_ack_evaluation,
+                            pre_ack_stage.evaluation,
                             self.isolation_monotonic_microseconds_clock(),
                             execution_active=False,
                         )
@@ -5097,6 +5624,8 @@ class LabWorker:
                                     not_after_monotonic_microseconds=spec_child_deadline,
                                     execution_limit_microseconds=ack_live_limit_microseconds,
                                 ),
+                                deadline_microseconds=spec_child_deadline,
+                                cancel_requested=self._stop.is_set,
                             )
                         except (InterruptedError, TimeoutError):
                             raise
@@ -5154,6 +5683,7 @@ class LabWorker:
                                 max_bytes=_MAX_SHARD_RESULT_WIRE_BYTES,
                                 deadline_microseconds=result_child_deadline,
                                 label="isolated shard outcome",
+                                cancel_requested=self._stop.is_set,
                             )
                         except (InterruptedError, TimeoutError):
                             raise
@@ -5218,10 +5748,33 @@ class LabWorker:
         except BaseException as exc:
             lifecycle_error = exc
         finally:
-            pre_ack_refresh_cancelled.set()
+            if pre_ack_stage is not None:
+                pre_ack_stage.cancelled.set()
             with self._isolation_start_condition:
                 isolation_start_aborted = True
                 self._isolation_start_condition.notify_all()
+            if pre_ack_stage is not None:
+                stage_cleanup_error = self._finish_pre_ack_admission_stage(pre_ack_stage)
+                if stage_cleanup_error is not None:
+                    primary_error: BaseException
+                    if lifecycle_error is not None:
+                        primary_error = lifecycle_error
+                    elif session_failure is not None:
+                        primary_error = session_failure.error
+                    elif resource_error is not None:
+                        primary_error = resource_error
+                    elif stop_reason is not None:
+                        primary_error = InterruptedError(stop_reason)
+                    elif preemption is not None:
+                        primary_error = RuntimeError(
+                            "resource admission revoked before isolated shard start"
+                        )
+                    else:
+                        primary_error = RuntimeError("pre-ACK admission stage did not settle")
+                    lifecycle_error = BaseExceptionGroup(
+                        "pre-ACK admission and cleanup failed",
+                        [primary_error, stage_cleanup_error],
+                    )
             try:
                 finished.set()
             except BaseException as exc:
