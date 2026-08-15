@@ -177,18 +177,21 @@ def test_writer_registry_rejects_hardlink_and_unsafe_mode(tmp_path: Path) -> Non
 
 
 def test_descriptor_attestation_prefers_linux_proc_fd(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     original_open = os.open
+    descriptor_directory = tmp_path / "descriptor-directory"
+    descriptor_directory.mkdir()
     opened: list[str] = []
 
-    def open_proc_alias(path: object, flags: int, *args: object) -> int:
+    def open_proc_fixture(path: object, flags: int, *args: object) -> int:
         opened.append(os.fspath(path))
         if os.fspath(path) == "/proc/self/fd":
-            return original_open("/dev/fd", flags, *args)
+            return original_open(descriptor_directory, flags, *args)
         raise AssertionError("/dev/fd fallback must not be opened when /proc/self/fd works")
 
-    monkeypatch.setattr(registry_module.os, "open", open_proc_alias)
+    monkeypatch.setattr(registry_module.os, "open", open_proc_fixture)
 
     registry_module._regular_descriptor_identities()
 

@@ -223,6 +223,26 @@ def _descriptor_is_closed(
     return False
 
 
+def _descriptor_identity_counts(
+    identities: set[tuple[int, int]],
+) -> dict[tuple[int, int], int]:
+    descriptor_root = Path("/proc/self/fd")
+    if not descriptor_root.exists():
+        descriptor_root = Path("/dev/fd")
+    counts = {identity: 0 for identity in identities}
+    for entry in os.listdir(descriptor_root):
+        if not entry.isdigit():
+            continue
+        try:
+            observed = os.fstat(int(entry))
+        except OSError:
+            continue
+        identity = (observed.st_dev, observed.st_ino)
+        if identity in counts:
+            counts[identity] += 1
+    return counts
+
+
 def _recovery_authority(candidate: LabJobArtifactCandidate) -> LabArtifactRecoveryAuthority:
     return LabArtifactRecoveryAuthority(
         job_id=candidate.job_id,
@@ -4283,7 +4303,6 @@ def test_legacy_same_thread_reentry_is_rejected_without_unlocking_outer_flock(
     monkeypatch: pytest.MonkeyPatch,
     nested_instance: str,
 ) -> None:
-    before_descriptors = len(os.listdir("/dev/fd"))
     path = tmp_path / "index" / "legacy.sqlite3"
     source = tmp_path / "legacy.json"
     source.write_text('{"source":true}', encoding="utf-8")
@@ -4293,7 +4312,17 @@ def test_legacy_same_thread_reentry_is_rejected_without_unlocking_outer_flock(
     key = first._process_lock_key
     assert key is not None
     probe_descriptor = os.open(path.with_name(f"{path.name}.lock"), os.O_RDWR)
-    operation_descriptors = len(os.listdir("/dev/fd"))
+    descriptor_attributes = (
+        "_parent_descriptor",
+        "_lock_descriptor",
+        "_authority_descriptor",
+        "_heads_descriptor",
+        "_head_descriptor",
+        "_database_descriptor",
+        "_journal_descriptor",
+        "_cache_quarantine_descriptor",
+        "_authority_quarantine_descriptor",
+    )
     original_flock = lab_artifacts_module.fcntl.flock
     callback_active = False
     callback_count = 0
@@ -4332,12 +4361,37 @@ def test_legacy_same_thread_reentry_is_rejected_without_unlocking_outer_flock(
     assert lab_artifacts_module._LEGACY_PROCESS_LOCKS[key].references == 2
     original_flock(probe_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
     original_flock(probe_descriptor, fcntl.LOCK_UN)
-    assert len(os.listdir("/dev/fd")) == operation_descriptors
+    owned_descriptors = {
+        descriptor
+        for index in (first, second)
+        for attribute in descriptor_attributes
+        if (descriptor := getattr(index, attribute)) >= 0
+    }
+    owned_identities = {
+        descriptor: (observed.st_dev, observed.st_ino)
+        for descriptor in owned_descriptors
+        if (observed := os.fstat(descriptor))
+    }
+    assert len(owned_identities) == len(owned_descriptors)
+    probe_observation = os.fstat(probe_descriptor)
+    probe_identity = (probe_observation.st_dev, probe_observation.st_ino)
+    relevant_identities = set(owned_identities.values()) | {probe_identity}
+    expected_identity_counts = {identity: 0 for identity in relevant_identities}
+    for identity in (*owned_identities.values(), probe_identity):
+        expected_identity_counts[identity] += 1
+    assert _descriptor_identity_counts(relevant_identities) == expected_identity_counts
     os.close(probe_descriptor)
     first.close()
     second.close()
     assert key not in lab_artifacts_module._LEGACY_PROCESS_LOCKS
-    assert len(os.listdir("/dev/fd")) == before_descriptors
+    assert all(
+        getattr(index, attribute) == -1
+        for index in (first, second)
+        for attribute in descriptor_attributes
+    )
+    assert _descriptor_identity_counts(relevant_identities) == {
+        identity: 0 for identity in relevant_identities
+    }
 
 
 @pytest.mark.parametrize("path_variant", ["same", "case_alias"])

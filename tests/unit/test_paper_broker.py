@@ -1415,7 +1415,29 @@ def test_schema_v5_has_first_class_v3_cost_receipts_and_indexed_lookup_plans(
                 "PRAGMA foreign_key_list(paper_ledger_head_marker)"
             ).fetchall()
         }
-        intent_plan = " ".join(
+        intent_index_columns = tuple(
+            row[2]
+            for row in connection.execute(
+                "PRAGMA index_info(idx_paper_intent_account_signal)"
+            ).fetchall()
+        )
+        lot_index_columns = tuple(
+            row[2]
+            for row in connection.execute(
+                "PRAGMA index_info(idx_paper_lot_position_fifo)"
+            ).fetchall()
+        )
+        intent_index_definition = next(
+            (row[2], row[4])
+            for row in connection.execute("PRAGMA index_list(paper_intent)").fetchall()
+            if row[1] == "idx_paper_intent_account_signal"
+        )
+        lot_index_definition = next(
+            (row[2], row[4])
+            for row in connection.execute("PRAGMA index_list(paper_lot)").fetchall()
+            if row[1] == "idx_paper_lot_position_fifo"
+        )
+        intent_plan = tuple(
             str(row[3])
             for row in connection.execute(
                 """
@@ -1426,12 +1448,38 @@ def test_schema_v5_has_first_class_v3_cost_receipts_and_indexed_lookup_plans(
                 (ACCOUNT_ID, "a" * 64),
             ).fetchall()
         )
-        lot_plan = " ".join(
+        lot_plan = tuple(
             str(row[3])
             for row in connection.execute(
                 """
                 EXPLAIN QUERY PLAN
                 SELECT lot_id FROM paper_lot
+                WHERE account_id = ? AND ts_code = ? AND entry_signal_id = ?
+                ORDER BY available_date, acquisition_trade_date,
+                         buy_executed_at, buy_persisted_at, buy_fill_sequence, lot_id
+                """,
+                (ACCOUNT_ID, "600000.SH", "a" * 64),
+            ).fetchall()
+        )
+        forced_intent_plan = tuple(
+            str(row[3])
+            for row in connection.execute(
+                """
+                EXPLAIN QUERY PLAN
+                SELECT intent_id FROM paper_intent
+                INDEXED BY idx_paper_intent_account_signal
+                WHERE account_id = ? AND signal_id = ?
+                """,
+                (ACCOUNT_ID, "a" * 64),
+            ).fetchall()
+        )
+        forced_lot_plan = tuple(
+            str(row[3])
+            for row in connection.execute(
+                """
+                EXPLAIN QUERY PLAN
+                SELECT lot_id FROM paper_lot
+                INDEXED BY idx_paper_lot_position_fifo
                 WHERE account_id = ? AND ts_code = ? AND entry_signal_id = ?
                 ORDER BY available_date, acquisition_trade_date,
                          buy_executed_at, buy_persisted_at, buy_fill_sequence, lot_id
@@ -1472,8 +1520,26 @@ def test_schema_v5_has_first_class_v3_cost_receipts_and_indexed_lookup_plans(
         "cost_provenance_state",
         "persisted_at",
     } <= receipt_columns
-    assert "idx_paper_intent_account_signal" in intent_plan
-    assert "idx_paper_lot_position_fifo" in lot_plan
+    assert intent_index_definition == (1, 1)
+    assert lot_index_definition == (0, 0)
+    assert intent_index_columns == ("account_id", "signal_id")
+    assert lot_index_columns == (
+        "account_id",
+        "ts_code",
+        "entry_signal_id",
+        "available_date",
+        "acquisition_trade_date",
+        "buy_executed_at",
+        "buy_persisted_at",
+        "buy_fill_sequence",
+        "lot_id",
+    )
+    assert any("idx_paper_intent_account_signal" in step for step in forced_intent_plan)
+    assert any("idx_paper_lot_position_fifo" in step for step in forced_lot_plan)
+    assert any(step.startswith("SEARCH paper_intent USING") for step in intent_plan)
+    assert any(step.startswith("SEARCH paper_lot USING") for step in lot_plan)
+    assert not any(step.startswith("SCAN paper_intent") for step in intent_plan)
+    assert not any(step.startswith("SCAN paper_lot") for step in lot_plan)
     assert (
         "paper_ledger_attestation",
         "previous_attestation_fingerprint",
