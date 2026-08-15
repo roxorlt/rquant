@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import builtins
 import hashlib
+import hmac
 import inspect
 import json
 import multiprocessing
@@ -1731,6 +1732,57 @@ def test_recv_wire_rejects_malformed_and_oversize_send_bytes(payload: bytes) -> 
         receiver.close()
         sender.close()
 
+    class SelectorCloseFailure:
+        def __init__(self, selector: object, message: str) -> None:
+            self.selector = selector
+            self.message = message
+
+        def close(self) -> None:
+            self.selector.close()
+            raise OSError(self.message)
+
+    selector_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    selector_listener = lab_worker._RawWireListener(selector_socket, b"selector-close-authkey")
+    selector_listener._selector = SelectorCloseFailure(
+        selector_listener._selector,
+        "selector close denied",
+    )
+    with pytest.raises(OSError, match="selector close denied"):
+        selector_listener.close()
+    assert selector_socket.fileno() == -1
+    selector_listener.close()
+
+    class SocketCloseFailure:
+        def __init__(self) -> None:
+            self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+
+        def setblocking(self, blocking: bool) -> None:
+            self.socket.setblocking(blocking)
+
+        def fileno(self) -> int:
+            return self.socket.fileno()
+
+        def close(self) -> None:
+            self.socket.close()
+            raise OSError("socket close denied")
+
+    failing_socket = SocketCloseFailure()
+    failing_listener = lab_worker._RawWireListener(
+        failing_socket,
+        b"double-close-authkey",
+    )
+    failing_listener._selector = SelectorCloseFailure(
+        failing_listener._selector,
+        "selector close denied",
+    )
+    with pytest.raises(BaseExceptionGroup) as captured:
+        failing_listener.close()
+    close_errors = _collect_base_exceptions(captured.value)
+    assert any("selector close denied" in str(error) for error in close_errors)
+    assert any("socket close denied" in str(error) for error in close_errors)
+    assert failing_socket.fileno() == -1
+    failing_listener.close()
+
 
 def test_result_wire_outbound_gate_matches_parent_receive_limit_without_large_allocation(
     monkeypatch: pytest.MonkeyPatch,
@@ -1776,6 +1828,7 @@ def test_result_wire_outbound_gate_matches_parent_receive_limit_without_large_al
     second = lab_worker._new_wire_session(roots=(Path("/private/tmp"),))
     accepted: dict[str, bytes] = {}
     responses: dict[str, bytes] = {}
+    digest_modes: dict[str, str | None] = {}
     accept_deadline = time.monotonic_ns() // 1_000 + 1_000_000
 
     def accept_once(name: str, session: object) -> None:
@@ -1784,6 +1837,7 @@ def test_result_wire_outbound_gate_matches_parent_receive_limit_without_large_al
             cancel_requested=lambda: False,
         )
         try:
+            digest_modes[name] = accepted_connection._peer_digest_mode
             payload = accepted_connection.recv_bytes()
             accepted[name] = payload
             accepted_connection.send_bytes(b"ack:" + payload)
@@ -1818,6 +1872,7 @@ def test_result_wire_outbound_gate_matches_parent_receive_limit_without_large_al
         assert not any(thread.is_alive() for thread in accept_threads + client_threads)
         assert accepted == {"first": b"first", "second": b"second"}
         assert responses == {"first": b"ack:first", "second": b"ack:second"}
+        assert digest_modes == {"first": "sha256", "second": "sha256"}
         assert first.address != second.address
         assert first.path != second.path
         assert first.endpoint != second.endpoint
@@ -1943,6 +1998,109 @@ def test_result_wire_outbound_gate_matches_parent_receive_limit_without_large_al
         stopped_control.close()
         stopped_control_session.cleanup()
     assert {child.pid for child in multiprocessing.active_children()} == active_child_pids
+
+    def recv_exact(peer: socket.socket, size: int) -> bytes:
+        received = bytearray()
+        while len(received) < size:
+            chunk = peer.recv(size - len(received))
+            if not chunk:
+                raise EOFError("legacy probe peer closed")
+            received.extend(chunk)
+        return bytes(received)
+
+    def recv_frame(peer: socket.socket, *, maximum: int = 1024 * 1024) -> bytes:
+        size = struct.unpack("!i", recv_exact(peer, 4))[0]
+        if size == -1:
+            size = struct.unpack("!Q", recv_exact(peer, 8))[0]
+        assert 0 <= size <= maximum
+        return recv_exact(peer, size)
+
+    def send_frame(peer: socket.socket, payload: bytes) -> None:
+        peer.sendall(struct.pack("!i", len(payload)) + payload)
+
+    legacy_session = lab_worker._new_wire_session(roots=(Path("/private/tmp"),))
+    legacy_peer = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    legacy_peer.settimeout(1)
+    accepted_legacy: dict[str, object] = {}
+    legacy_errors: list[BaseException] = []
+    legacy_deadline = time.monotonic_ns() // 1_000 + 1_000_000
+
+    def accept_legacy() -> None:
+        try:
+            accepted_legacy["endpoint"] = legacy_session.listener.accept(
+                deadline_microseconds=legacy_deadline,
+                cancel_requested=lambda: False,
+            )
+        except BaseException as exc:
+            legacy_errors.append(exc)
+
+    legacy_acceptor = threading.Thread(target=accept_legacy)
+    legacy_acceptor.start()
+    legacy_endpoint = None
+    try:
+        legacy_peer.connect(legacy_session.address)
+        server_challenge_frame = recv_frame(legacy_peer, maximum=256)
+        assert server_challenge_frame.startswith(b"#CHALLENGE#")
+        server_challenge = server_challenge_frame[len(b"#CHALLENGE#") :]
+        assert server_challenge.startswith(b"{sha256}")
+        send_frame(
+            legacy_peer,
+            hmac.new(legacy_session.authkey, server_challenge, "md5").digest(),
+        )
+        assert recv_frame(legacy_peer, maximum=256) == b"#WELCOME#"
+
+        peer_challenge = b"legacy-client-nonce!"
+        assert len(peer_challenge) == 20
+        send_frame(legacy_peer, b"#CHALLENGE#" + peer_challenge)
+        peer_response = recv_frame(legacy_peer, maximum=256)
+        assert (
+            peer_response
+            == hmac.new(
+                legacy_session.authkey,
+                peer_challenge,
+                "md5",
+            ).digest()
+        )
+        send_frame(legacy_peer, b"#WELCOME#")
+        legacy_acceptor.join(timeout=1)
+        assert not legacy_acceptor.is_alive()
+        assert legacy_errors == []
+        legacy_endpoint = accepted_legacy["endpoint"]
+        assert legacy_endpoint._peer_digest_mode == "legacy-md5"
+
+        lab_worker._send_wire(
+            legacy_endpoint,
+            lab_worker._IsolationStartAck(
+                accepted=True,
+                not_after_monotonic_microseconds=legacy_deadline,
+            ),
+            deadline_microseconds=legacy_deadline,
+            cancel_requested=lambda: False,
+        )
+        start_ack = lab_worker._IsolationStartAck.model_validate_json(
+            recv_frame(legacy_peer),
+            strict=True,
+        )
+        assert start_ack.accepted is True
+        assert start_ack.not_after_monotonic_microseconds == legacy_deadline
+
+        for invalid_response in (
+            b"{sha256}" + b"x" * 31,
+            b"x" * 32,
+            b"x" * 16,
+        ):
+            with pytest.raises(lab_worker.AuthenticationError):
+                lab_worker._DeadlineWireEndpoint._verify_authentication_response(
+                    legacy_session.authkey,
+                    server_challenge,
+                    invalid_response,
+                )
+    finally:
+        legacy_peer.close()
+        if legacy_endpoint is not None:
+            legacy_endpoint.close()
+        legacy_session.cleanup()
+        legacy_acceptor.join(timeout=1)
 
     post_bind_root = Path("/private/tmp") / f"lwl-post-bind-{uuid4().hex[:8]}"
     post_bind_root.mkdir(mode=0o700)

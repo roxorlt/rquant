@@ -176,6 +176,9 @@ _WIRE_WELCOME = b"#WELCOME#"
 _WIRE_FAILURE = b"#FAILURE#"
 _WIRE_DIGEST_PREFIX = b"{sha256}"
 _WIRE_CHALLENGE_BYTES = 40
+_WIRE_LEGACY_CHALLENGE_BYTES = 20
+_WIRE_LEGACY_DIGEST_BYTES = 16
+_WIRE_SHA256_DIGEST_BYTES = 32
 _BUILTIN_SHARD_REGISTRY_ID = "rquant.lab-shard.builtin"
 _BUILTIN_SHARD_REGISTRY_VERSION = 1
 _BUILTIN_SHARD_REGISTRY_HASH = hashlib.sha256(b"rquant:lab-shard:builtin:v1").hexdigest()
@@ -612,6 +615,7 @@ _LabWorkerFailureKind = Literal[
     "seal",
 ]
 _WireFailureKind = Literal["session_startup", "session"]
+_WireDigestMode = Literal["legacy-md5", "sha256"]
 
 
 class LabWorkerFailure(LabWorkerModel):
@@ -1770,6 +1774,7 @@ class _DeadlineWireEndpoint:
         self._selector = selectors.DefaultSelector()
         self._selector.register(accepted, selectors.EVENT_READ)
         self._closed = False
+        self._peer_digest_mode: _WireDigestMode | None = None
 
     @property
     def closed(self) -> bool:
@@ -1945,6 +1950,45 @@ class _DeadlineWireEndpoint:
         self._selector.modify(self._socket, selectors.EVENT_READ)
         return bool(self._selector.select(max(0.0, timeout)))
 
+    @staticmethod
+    def _verify_authentication_response(
+        authkey: bytes,
+        challenge: bytes,
+        response: bytes,
+    ) -> _WireDigestMode:
+        if response.startswith(_WIRE_DIGEST_PREFIX):
+            if len(response) != len(_WIRE_DIGEST_PREFIX) + _WIRE_SHA256_DIGEST_BYTES:
+                raise AuthenticationError("wire authentication SHA-256 response length was wrong")
+            mode: _WireDigestMode = "sha256"
+            response_mac = response[len(_WIRE_DIGEST_PREFIX) :]
+            expected = hmac.new(authkey, challenge, "sha256").digest()
+        elif len(response) == _WIRE_LEGACY_DIGEST_BYTES:
+            mode = "legacy-md5"
+            response_mac = response
+            expected = hmac.new(authkey, challenge, "md5").digest()
+        else:
+            raise AuthenticationError("wire authentication response format was unsupported")
+        if len(response_mac) != len(expected) or not hmac.compare_digest(expected, response_mac):
+            raise AuthenticationError("wire authentication digest was wrong")
+        return mode
+
+    @staticmethod
+    def _answer_peer_challenge(
+        authkey: bytes,
+        challenge: bytes,
+        mode: _WireDigestMode,
+    ) -> bytes:
+        if mode == "legacy-md5":
+            if len(challenge) != _WIRE_LEGACY_CHALLENGE_BYTES:
+                raise AuthenticationError("legacy wire authentication challenge length was wrong")
+            return hmac.new(authkey, challenge, "md5").digest()
+        if (
+            not challenge.startswith(_WIRE_DIGEST_PREFIX)
+            or len(challenge) != len(_WIRE_DIGEST_PREFIX) + _WIRE_CHALLENGE_BYTES
+        ):
+            raise AuthenticationError("wire authentication SHA-256 challenge was malformed")
+        return _WIRE_DIGEST_PREFIX + hmac.new(authkey, challenge, "sha256").digest()
+
     def authenticate_server(
         self,
         authkey: bytes,
@@ -1965,8 +2009,13 @@ class _DeadlineWireEndpoint:
             cancel_requested=cancel_requested,
             label="wire authentication response",
         )
-        expected = _WIRE_DIGEST_PREFIX + hmac.new(authkey, challenge, "sha256").digest()
-        if not hmac.compare_digest(expected, response):
+        try:
+            peer_digest_mode = self._verify_authentication_response(
+                authkey,
+                challenge,
+                response,
+            )
+        except AuthenticationError:
             with suppress(BaseException):
                 self.send_bytes(
                     _WIRE_FAILURE,
@@ -1974,7 +2023,8 @@ class _DeadlineWireEndpoint:
                     cancel_requested=cancel_requested,
                     label="wire authentication rejection",
                 )
-            raise AuthenticationError("wire authentication digest was wrong")
+            raise
+        self._peer_digest_mode = peer_digest_mode
         self.send_bytes(
             _WIRE_WELCOME,
             deadline_microseconds=deadline_microseconds,
@@ -1991,15 +2041,10 @@ class _DeadlineWireEndpoint:
         if not peer_challenge_frame.startswith(_WIRE_CHALLENGE):
             raise AuthenticationError("wire mutual authentication challenge was malformed")
         peer_challenge = peer_challenge_frame[len(_WIRE_CHALLENGE) :]
-        if not peer_challenge.startswith(_WIRE_DIGEST_PREFIX):
-            raise AuthenticationError("wire mutual authentication digest is not SHA-256")
-        peer_response = (
-            _WIRE_DIGEST_PREFIX
-            + hmac.new(
-                authkey,
-                peer_challenge,
-                "sha256",
-            ).digest()
+        peer_response = self._answer_peer_challenge(
+            authkey,
+            peer_challenge,
+            peer_digest_mode,
         )
         self.send_bytes(
             peer_response,
@@ -2178,8 +2223,19 @@ class _RawWireListener:
         if self._closed:
             return
         self._closed = True
-        self._selector.close()
-        self._socket.close()
+        errors: list[BaseException] = []
+        try:
+            self._selector.close()
+        except BaseException as exc:
+            errors.append(exc)
+        try:
+            self._socket.close()
+        except BaseException as exc:
+            errors.append(exc)
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise BaseExceptionGroup("wire listener close failed", errors)
 
 
 @dataclass
