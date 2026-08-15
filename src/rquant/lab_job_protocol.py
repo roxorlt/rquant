@@ -1199,76 +1199,77 @@ class LabCommandSpool:
                 os.close(source_fd)
         isolation_id = uuid4()
         container = self.quarantine_dir / f"owned-entry-{isolation_id}.dead"
-        quarantine_fd = self._open_managed_directory(self.quarantine_dir)
-        try:
-            self._guard_mutation()
-            os.mkdir(container.name, mode=0o700, dir_fd=quarantine_fd)
-            os.fsync(quarantine_fd)
-        finally:
-            os.close(quarantine_fd)
-        evidence = _LabOwnedEntryIsolationEvidence(
-            isolation_id=isolation_id,
-            source_area=source_area,
-            source_name=source_name,
-            reason=reason,
-            device=observed.st_dev,
-            inode=observed.st_ino,
-            mode=observed.st_mode,
-            link_count=observed.st_nlink,
-            file_type=file_type,
-            byte_count=max(0, observed.st_size),
-            link_target=expected_link_target,
-            manual_retention=file_type == "directory",
-        )
-        evidence_path = container / "evidence.json"
         bound_regular_descriptor = (
             self._open_bound_regular_entry(source, observed)
             if stat.S_ISREG(observed.st_mode)
             else None
         )
         try:
-            if not self._publish_no_clobber(
-                evidence_path,
-                evidence.canonical_json_bytes(),
-            ):
-                raise RequestContentConflictError(
-                    f"owned isolation evidence already exists: {container.name}"
-                )
-            self._fsync_directory(self.quarantine_dir)
-            self._after_owned_entry_isolation_stage("evidence_written", source, container)
-            if stat.S_ISREG(observed.st_mode) and observed.st_nlink != 1:
-                self._after_hardlink_quarantine_evidence(
-                    LabSpoolFileIdentity(
-                        path=source,
-                        device=observed.st_dev,
-                        inode=observed.st_ino,
-                        link_count=observed.st_nlink,
-                    ),
-                    evidence_path,
-                )
-            destination = self._move_bound_entry_into_container_locked(
-                source,
-                container,
-                observed,
-                expected_link_target=expected_link_target,
-                bound_regular_descriptor=bound_regular_descriptor,
+            quarantine_fd = self._open_managed_directory(self.quarantine_dir)
+            try:
+                self._guard_mutation()
+                os.mkdir(container.name, mode=0o700, dir_fd=quarantine_fd)
+                os.fsync(quarantine_fd)
+            finally:
+                os.close(quarantine_fd)
+            evidence = _LabOwnedEntryIsolationEvidence(
+                isolation_id=isolation_id,
+                source_area=source_area,
+                source_name=source_name,
+                reason=reason,
+                device=observed.st_dev,
+                inode=observed.st_ino,
+                mode=observed.st_mode,
+                link_count=observed.st_nlink,
+                file_type=file_type,
+                byte_count=max(0, observed.st_size),
+                link_target=expected_link_target,
+                manual_retention=file_type == "directory",
             )
-            self._after_owned_entry_isolation_stage("entry_moved", source, container)
-            return LabQuarantinedCommand(path=destination, reason=reason)
-        except InterruptedError:
-            with suppress(OSError, InvalidCommandEnvelopeError, ValueError):
-                self._discard_interrupted_isolation_attempt_locked(
+            evidence_path = container / "evidence.json"
+            try:
+                if not self._publish_no_clobber(
+                    evidence_path,
+                    evidence.canonical_json_bytes(),
+                ):
+                    raise RequestContentConflictError(
+                        f"owned isolation evidence already exists: {container.name}"
+                    )
+                self._fsync_directory(self.quarantine_dir)
+                self._after_owned_entry_isolation_stage("evidence_written", source, container)
+                if stat.S_ISREG(observed.st_mode) and observed.st_nlink != 1:
+                    self._after_hardlink_quarantine_evidence(
+                        LabSpoolFileIdentity(
+                            path=source,
+                            device=observed.st_dev,
+                            inode=observed.st_ino,
+                            link_count=observed.st_nlink,
+                        ),
+                        evidence_path,
+                    )
+                destination = self._move_bound_entry_into_container_locked(
                     source,
                     container,
                     observed,
+                    expected_link_target=expected_link_target,
+                    bound_regular_descriptor=bound_regular_descriptor,
                 )
-            self._fsync_directory(self.quarantine_dir)
-            raise
-        except BaseException:
-            # A prepared bundle is intentionally retained. Startup either resumes the
-            # identity-bound move or prunes an incomplete record within configured limits.
-            self._fsync_directory(self.quarantine_dir)
-            raise
+                self._after_owned_entry_isolation_stage("entry_moved", source, container)
+                return LabQuarantinedCommand(path=destination, reason=reason)
+            except InterruptedError:
+                with suppress(OSError, InvalidCommandEnvelopeError, ValueError):
+                    self._discard_interrupted_isolation_attempt_locked(
+                        source,
+                        container,
+                        observed,
+                    )
+                self._fsync_directory(self.quarantine_dir)
+                raise
+            except BaseException:
+                # A prepared bundle is intentionally retained. Startup either resumes the
+                # identity-bound move or prunes an incomplete record within configured limits.
+                self._fsync_directory(self.quarantine_dir)
+                raise
         finally:
             if bound_regular_descriptor is not None:
                 os.close(bound_regular_descriptor)

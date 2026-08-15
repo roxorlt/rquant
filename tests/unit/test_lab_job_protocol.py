@@ -657,7 +657,141 @@ def test_owned_entry_isolation_primitive_moves_only_bound_directory_entry(
 
 def test_owned_entry_isolation_retention_bounds_complete_and_incomplete_records(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    failure_spool = LabCommandSpool(tmp_path / "open-failure-commands")
+    failure_source = failure_spool.pending_dir / f"{uuid4()}.json"
+    failure_source.write_text("original", encoding="utf-8")
+    failure_observed = failure_source.lstat()
+    failure_identity = (
+        failure_observed.st_dev,
+        failure_observed.st_ino,
+        failure_observed.st_mode,
+        failure_observed.st_nlink,
+        failure_observed.st_size,
+        failure_observed.st_mtime_ns,
+        failure_observed.st_ctime_ns,
+    )
+    real_open = os.open
+    real_close = os.close
+    real_dup = os.dup
+    real_mkdir = os.mkdir
+    live_descriptors: set[int] = set()
+    bound_open_attempts = 0
+
+    def failing_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal bound_open_attempts
+        if path == failure_source.name and flags & os.O_NONBLOCK:
+            bound_open_attempts += 1
+            raise PermissionError(errno.EACCES, "forced bound open failure", path)
+        descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+        live_descriptors.add(descriptor)
+        return descriptor
+
+    def tracking_close(descriptor: int) -> None:
+        live_descriptors.discard(descriptor)
+        real_close(descriptor)
+
+    def tracking_dup(descriptor: int) -> int:
+        duplicated = real_dup(descriptor)
+        live_descriptors.add(duplicated)
+        return duplicated
+
+    def assert_failure_source_unchanged() -> None:
+        current = failure_source.lstat()
+        assert (
+            current.st_dev,
+            current.st_ino,
+            current.st_mode,
+            current.st_nlink,
+            current.st_size,
+            current.st_mtime_ns,
+            current.st_ctime_ns,
+        ) == failure_identity
+        assert failure_source.read_text(encoding="utf-8") == "original"
+
+    monkeypatch.setattr(lab_job_protocol.os, "open", failing_open)
+    monkeypatch.setattr(lab_job_protocol.os, "close", tracking_close)
+    monkeypatch.setattr(lab_job_protocol.os, "dup", tracking_dup)
+
+    for _attempt in range(3):
+        with pytest.raises(PermissionError, match="forced bound open failure"):
+            failure_spool._isolate_owned_entry_locked(
+                failure_source,
+                failure_observed,
+                reason="forced_open_failure",
+            )
+        assert_failure_source_unchanged()
+        assert live_descriptors == set()
+
+    assert bound_open_attempts == 3
+    assert tuple(failure_spool.quarantine_dir.iterdir()) == ()
+
+    def tracking_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+        live_descriptors.add(descriptor)
+        return descriptor
+
+    bound_was_live_at_mkdir = False
+
+    def failing_container_mkdir(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        nonlocal bound_was_live_at_mkdir
+        if str(path).startswith("owned-entry-"):
+            bound_was_live_at_mkdir = any(
+                (os.fstat(descriptor).st_dev, os.fstat(descriptor).st_ino)
+                == (failure_observed.st_dev, failure_observed.st_ino)
+                for descriptor in live_descriptors
+            )
+            raise PermissionError(errno.EACCES, "forced container mkdir failure", path)
+        real_mkdir(path, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(lab_job_protocol.os, "open", tracking_open)
+    monkeypatch.setattr(lab_job_protocol.os, "mkdir", failing_container_mkdir)
+
+    with pytest.raises(PermissionError, match="forced container mkdir failure"):
+        failure_spool._isolate_owned_entry_locked(
+            failure_source,
+            failure_observed,
+            reason="forced_container_failure",
+        )
+    assert bound_was_live_at_mkdir is True
+    assert live_descriptors == set()
+    assert tuple(failure_spool.quarantine_dir.iterdir()) == ()
+    assert_failure_source_unchanged()
+
+    monkeypatch.setattr(lab_job_protocol.os, "open", real_open)
+    monkeypatch.setattr(lab_job_protocol.os, "close", real_close)
+    monkeypatch.setattr(lab_job_protocol.os, "dup", real_dup)
+    monkeypatch.setattr(lab_job_protocol.os, "mkdir", real_mkdir)
+
+    retried = failure_spool._isolate_owned_entry_locked(
+        failure_source,
+        failure_observed,
+        reason="retry_after_open_failure",
+    )
+    assert retried.path.read_text(encoding="utf-8") == "original"
+    assert not os.path.lexists(failure_source)
+    retry_containers = tuple(failure_spool.quarantine_dir.glob("owned-entry-*.dead"))
+    assert retry_containers == (retried.path.parent,)
+    assert (retry_containers[0] / "evidence.json").is_file()
+
     root = tmp_path / "commands"
     spool = LabCommandSpool(root, max_isolation_records=8, max_isolation_bytes=1024 * 1024)
     for index in range(7):
