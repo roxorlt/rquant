@@ -39,8 +39,8 @@ from rquant.signal_bus import RouteReceiptDisposition, SignalRouteReceipt
 from rquant.signal_contracts import SignalAction, SignalEnvelope
 
 NOW = datetime(2026, 7, 31, 2, 31, tzinfo=UTC)
-_CURSOR_KEY = bytes(range(32))
-_WRONG_CURSOR_KEY = bytes(reversed(range(32)))
+_CURSOR_SIGNING_KEY = bytes(range(32))
+_WRONG_CURSOR_SIGNING_KEY = bytes(reversed(range(32)))
 
 
 def test_serving_physical_table_specs_have_a_canonical_fingerprint() -> None:
@@ -498,7 +498,7 @@ def test_nl_projection_paginates_only_after_full_rule_validation() -> None:
         "rule_labels": ("gt(CLOSE[0], 1)",),
         "normalized_plan": {"trade_date": "2026-07-31", "rule": "close_gt_1"},
         "page_size": 1,
-        "cursor_key": _CURSOR_KEY,
+        "signing_key": _CURSOR_SIGNING_KEY,
     }
 
     first = paginate_nl_screen_projection(universe, **kwargs)
@@ -508,6 +508,55 @@ def test_nl_projection_paginates_only_after_full_rule_validation() -> None:
     assert second.rows["ts_code"].tolist() == ["600002.SH"]
     assert first.next_cursor is not None
     assert second.next_cursor is None
+
+
+@pytest.mark.parametrize(
+    ("row_count", "page_size", "expected_page_sizes"),
+    [
+        (4, 1, [1, 1, 1, 1]),
+        (205, 100, [100, 100, 5]),
+    ],
+)
+def test_nl_projection_multi_page_chain_preserves_signing_key_and_row_order(
+    row_count: int,
+    page_size: int,
+    expected_page_sizes: list[int],
+) -> None:
+    universe = pd.DataFrame(
+        {
+            "trade_date": [date(2026, 7, 31)] * row_count,
+            "ts_code": [f"{index:06d}.SH" for index in range(row_count)],
+            "name": [f"样本{index}" for index in range(row_count)],
+            "CLOSE[0]": [float(index + 1) for index in range(row_count)],
+            "PCT_CHG[0]": [0.0] * row_count,
+        }
+    )
+    kwargs = {
+        "generation_id": "a" * 64,
+        "trade_date": "2026-07-31",
+        "rules": (),
+        "rule_labels": (),
+        "normalized_plan": {"trade_date": "2026-07-31", "rule": "all"},
+        "page_size": page_size,
+        "signing_key": _CURSOR_SIGNING_KEY,
+    }
+    cursor: str | None = None
+    page_sizes: list[int] = []
+    observed_codes: list[str] = []
+
+    while True:
+        page = paginate_nl_screen_projection(universe, cursor=cursor, **kwargs)
+        decode_nl_screen_cursor(page.start_cursor, signing_key=_CURSOR_SIGNING_KEY)
+        page_sizes.append(len(page.rows))
+        observed_codes.extend(page.rows["ts_code"].tolist())
+        if page.next_cursor is None:
+            break
+        decode_nl_screen_cursor(page.next_cursor, signing_key=_CURSOR_SIGNING_KEY)
+        cursor = page.next_cursor
+
+    assert page_sizes == expected_page_sizes
+    assert observed_codes == universe["ts_code"].tolist()
+    assert len(observed_codes) == len(set(observed_codes)) == row_count
 
 
 def test_nl_projection_cursor_is_deterministic_and_rejects_query_mismatch() -> None:
@@ -527,7 +576,7 @@ def test_nl_projection_cursor_is_deterministic_and_rejects_query_mismatch() -> N
         "rule_labels": (),
         "normalized_plan": {"trade_date": "2026-07-31", "rule": "all"},
         "page_size": 1,
-        "cursor_key": _CURSOR_KEY,
+        "signing_key": _CURSOR_SIGNING_KEY,
     }
 
     first = paginate_nl_screen_projection(universe, **kwargs)
@@ -544,12 +593,18 @@ def test_nl_projection_cursor_is_deterministic_and_rejects_query_mismatch() -> N
     ]
     assert first.next_cursor is not None
     assert first.start_cursor is not None
-    start = decode_nl_screen_cursor(first.start_cursor, key=_CURSOR_KEY)
+    start = decode_nl_screen_cursor(
+        first.start_cursor,
+        signing_key=_CURSOR_SIGNING_KEY,
+    )
     assert start.last_trade_date is None
     assert start.last_ts_code is None
-    decoded = decode_nl_screen_cursor(first.next_cursor, key=_CURSOR_KEY)
+    decoded = decode_nl_screen_cursor(
+        first.next_cursor,
+        signing_key=_CURSOR_SIGNING_KEY,
+    )
     assert decoded.generation_id == "a" * 64
-    assert encode_nl_screen_cursor(decoded, key=_CURSOR_KEY) == first.next_cursor
+    assert encode_nl_screen_cursor(decoded, signing_key=_CURSOR_SIGNING_KEY) == first.next_cursor
 
     with pytest.raises(NlScreenPageError, match="requires rerun"):
         paginate_nl_screen_projection(
@@ -572,9 +627,13 @@ def _decode_nl_cursor_payload(token: str) -> tuple[dict[str, object], str]:
     return payload, signature_segment
 
 
-def _sign_nl_cursor_payload(payload: dict[str, object], *, key: bytes = _CURSOR_KEY) -> str:
+def _sign_nl_cursor_payload(
+    payload: dict[str, object],
+    *,
+    signing_key: bytes = _CURSOR_SIGNING_KEY,
+) -> str:
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    signature = hmac.new(key, encoded, hashlib.sha256).digest()
+    signature = hmac.new(signing_key, encoded, hashlib.sha256).digest()
     return ".".join(
         (
             urlsafe_b64encode(encoded).decode("ascii").rstrip("="),
@@ -615,7 +674,7 @@ def test_nl_projection_cursor_rejects_payload_signature_tamper_and_wrong_key() -
         rule_labels=(),
         normalized_plan={"trade_date": "2026-07-31", "rule": "all"},
         page_size=1,
-        cursor_key=_CURSOR_KEY,
+        signing_key=_CURSOR_SIGNING_KEY,
     ).next_cursor
     assert cursor is not None
     payload_segment, signature_segment = cursor.split(".")
@@ -623,14 +682,14 @@ def test_nl_projection_cursor_rejects_payload_signature_tamper_and_wrong_key() -
     bitflipped_signature = ("A" if signature_segment[0] != "A" else "B") + signature_segment[1:]
     payload_tamper = _rewrite_nl_cursor(cursor, resign=False, last_ts_code="699999.SH")
 
-    for malformed, key in (
-        (f"{bitflipped_payload}.{signature_segment}", _CURSOR_KEY),
-        (f"{payload_segment}.{bitflipped_signature}", _CURSOR_KEY),
-        (payload_tamper, _CURSOR_KEY),
-        (cursor, _WRONG_CURSOR_KEY),
+    for malformed, signing_key in (
+        (f"{bitflipped_payload}.{signature_segment}", _CURSOR_SIGNING_KEY),
+        (f"{payload_segment}.{bitflipped_signature}", _CURSOR_SIGNING_KEY),
+        (payload_tamper, _CURSOR_SIGNING_KEY),
+        (cursor, _WRONG_CURSOR_SIGNING_KEY),
     ):
         with pytest.raises(NlScreenPageError, match="requires rerun"):
-            decode_nl_screen_cursor(malformed, key=key)
+            decode_nl_screen_cursor(malformed, signing_key=signing_key)
 
 
 def test_nl_projection_cursor_rejects_oversize_and_invalid_signature_length() -> None:
@@ -653,7 +712,7 @@ def test_nl_projection_cursor_rejects_oversize_and_invalid_signature_length() ->
         f"{payload_segment}.{signature_segment}A",
     ):
         with pytest.raises(NlScreenPageError, match="requires rerun"):
-            decode_nl_screen_cursor(malformed, key=_CURSOR_KEY)
+            decode_nl_screen_cursor(malformed, signing_key=_CURSOR_SIGNING_KEY)
 
 
 @pytest.mark.parametrize(
@@ -688,7 +747,7 @@ def test_nl_projection_cursor_schema_rejects_missing_wrong_extra_and_half_keys(
         "rule_labels": (),
         "normalized_plan": {"trade_date": "2026-07-31", "rule": "all"},
         "page_size": 1,
-        "cursor_key": _CURSOR_KEY,
+        "signing_key": _CURSOR_SIGNING_KEY,
     }
     cursor = paginate_nl_screen_projection(universe, **kwargs).next_cursor
     assert cursor is not None
@@ -728,7 +787,7 @@ def test_nl_projection_cursor_rejects_tampered_or_missing_snapshot_key(
         "rule_labels": (),
         "normalized_plan": {"trade_date": "2026-07-31", "rule": "all"},
         "page_size": 1,
-        "cursor_key": _CURSOR_KEY,
+        "signing_key": _CURSOR_SIGNING_KEY,
     }
     cursor = paginate_nl_screen_projection(universe, **kwargs).next_cursor
     assert cursor is not None
@@ -758,7 +817,7 @@ def test_nl_projection_rejects_duplicate_snapshot_keys_and_has_no_phantom_page()
         "rule_labels": ("gt(CLOSE[0], 1)",),
         "normalized_plan": {"trade_date": "2026-07-31"},
         "page_size": 1,
-        "cursor_key": _CURSOR_KEY,
+        "signing_key": _CURSOR_SIGNING_KEY,
     }
 
     page = paginate_nl_screen_projection(universe, **kwargs)

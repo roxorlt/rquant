@@ -94,7 +94,7 @@ from tests.canvas_ed25519_support import create_canvas_ed25519_test_authority
 
 NOW = datetime(2026, 8, 2, 3, 0, tzinfo=UTC)
 COMMIT = "a" * 40
-CURSOR_KEY = bytes(range(32))
+CURSOR_SIGNING_KEY = bytes(range(32))
 
 
 def _projection(
@@ -186,7 +186,7 @@ def test_nl_page_cursor_pins_historical_generation_and_fails_closed_at_budget(
         rule_labels=("gt(CLOSE[0], 1)",),
         normalized_plan=query,
         page_size=1,
-        cursor_key=CURSOR_KEY,
+        signing_key=CURSOR_SIGNING_KEY,
         now=NOW,
     )
     assert first.generation_id == first_generation
@@ -208,7 +208,7 @@ def test_nl_page_cursor_pins_historical_generation_and_fails_closed_at_budget(
         normalized_plan=query,
         page_size=1,
         cursor=first.value.next_cursor,
-        cursor_key=CURSOR_KEY,
+        signing_key=CURSOR_SIGNING_KEY,
         now=NOW + timedelta(seconds=1),
     )
     assert second.generation_id == first_generation
@@ -222,7 +222,7 @@ def test_nl_page_cursor_pins_historical_generation_and_fails_closed_at_budget(
         normalized_plan=query,
         page_size=1,
         cursor=first.value.start_cursor,
-        cursor_key=CURSOR_KEY,
+        signing_key=CURSOR_SIGNING_KEY,
         now=NOW + timedelta(seconds=1),
     )
     assert previous.generation_id == first_generation
@@ -237,7 +237,7 @@ def test_nl_page_cursor_pins_historical_generation_and_fails_closed_at_budget(
             normalized_plan={"trade_date": "2026-07-31", "rule": "all"},
             page_size=1,
             cursor=first.value.next_cursor,
-            cursor_key=CURSOR_KEY,
+            signing_key=CURSOR_SIGNING_KEY,
             now=NOW + timedelta(seconds=1),
         )
 
@@ -259,12 +259,12 @@ def test_nl_page_cursor_pins_historical_generation_and_fails_closed_at_budget(
             rule_labels=(),
             normalized_plan={"trade_date": "2026-07-31", "rule": "all"},
             page_size=1,
-            cursor_key=CURSOR_KEY,
+            signing_key=CURSOR_SIGNING_KEY,
             now=NOW + timedelta(seconds=2),
         )
 
 
-def test_nl_page_session_reset_clears_results_and_rotates_cursor_key() -> None:
+def test_nl_page_session_reset_clears_results_and_rotates_cursor_signing_key() -> None:
     old_frame = pd.DataFrame({"ts_code": ["600000.SH"]})
     state: dict[str, object] = {
         "nl_result_df": old_frame,
@@ -274,13 +274,13 @@ def test_nl_page_session_reset_clears_results_and_rotates_cursor_key() -> None:
         "nl_next_cursor": "next",
         "nl_cursor_history": ["previous"],
         "nl_page_error": "old error",
-        "nl_cursor_key": b"o" * 32,
+        "nl_cursor_signing_key": b"o" * 32,
         "nl_plan_digest": "old",
     }
 
     serving_page_data.reset_nl_screen_page_session(
         state,
-        cursor_key=b"n" * 32,
+        cursor_signing_key=b"n" * 32,
         plan_digest="new",
     )
 
@@ -292,7 +292,7 @@ def test_nl_page_session_reset_clears_results_and_rotates_cursor_key() -> None:
         "nl_next_cursor": None,
         "nl_cursor_history": [],
         "nl_page_error": None,
-        "nl_cursor_key": b"n" * 32,
+        "nl_cursor_signing_key": b"n" * 32,
         "nl_plan_digest": "new",
     }
 
@@ -307,7 +307,7 @@ def test_nl_page_plan_binding_rotates_only_for_semantic_change() -> None:
         "nl_next_cursor": "next",
         "nl_cursor_history": ["previous"],
         "nl_page_error": "old error",
-        "nl_cursor_key": b"o" * 32,
+        "nl_cursor_signing_key": b"o" * 32,
         "nl_plan_digest": "old",
     }
     generated_keys = 0
@@ -320,22 +320,22 @@ def test_nl_page_plan_binding_rotates_only_for_semantic_change() -> None:
     assert serving_page_data.bind_nl_screen_plan_session(
         state,
         plan_digest="new",
-        cursor_key_factory=_new_key,
+        cursor_signing_key_factory=_new_key,
     )
     assert generated_keys == 1
     assert state["nl_result_df"] is None
-    assert state["nl_cursor_key"] == b"n" * 32
+    assert state["nl_cursor_signing_key"] == b"n" * 32
 
     new_frame = pd.DataFrame({"ts_code": ["600001.SH"]})
     state["nl_result_df"] = new_frame
     assert not serving_page_data.bind_nl_screen_plan_session(
         state,
         plan_digest="new",
-        cursor_key_factory=_new_key,
+        cursor_signing_key_factory=_new_key,
     )
     assert generated_keys == 1
     assert state["nl_result_df"] is new_frame
-    assert state["nl_cursor_key"] == b"n" * 32
+    assert state["nl_cursor_signing_key"] == b"n" * 32
 
 
 def test_nl_page_load_error_keeps_history_and_current_page_atomic() -> None:
@@ -434,7 +434,7 @@ def test_nl_page_rejects_naive_now_before_generation_acquire(
             rule_labels=(),
             normalized_plan={"trade_date": "2026-07-31"},
             page_size=1,
-            cursor_key=CURSOR_KEY,
+            signing_key=CURSOR_SIGNING_KEY,
             now=datetime(2026, 8, 2, 3, 0),
         )
     assert acquired == 0
@@ -483,7 +483,7 @@ def test_nl_page_releases_generation_lease_after_query_error(
             rule_labels=(),
             normalized_plan={"trade_date": "2026-07-31"},
             page_size=1,
-            cursor_key=CURSOR_KEY,
+            signing_key=CURSOR_SIGNING_KEY,
             now=NOW,
         )
     assert active_leases == 0

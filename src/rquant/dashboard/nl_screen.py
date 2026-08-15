@@ -85,10 +85,10 @@ try:
         st.session_state.nl_plan_dict = None
     if "nl_history" not in st.session_state:
         st.session_state.nl_history = []
-    if "nl_cursor_key" not in st.session_state:
+    if "nl_cursor_signing_key" not in st.session_state:
         reset_nl_screen_page_session(
             st.session_state,
-            cursor_key=secrets.token_bytes(32),
+            cursor_signing_key=secrets.token_bytes(32),
             plan_digest=None,
         )
     if "nl_result_df" not in st.session_state:
@@ -114,7 +114,7 @@ try:
         bind_nl_screen_plan_session(
             st.session_state,
             plan_digest=plan_digest,
-            cursor_key_factory=lambda: secrets.token_bytes(32),
+            cursor_signing_key_factory=lambda: secrets.token_bytes(32),
         )
 
     nl_query = st.text_input(
@@ -133,7 +133,7 @@ try:
             st.session_state.nl_plan_dict = None
             reset_nl_screen_page_session(
                 st.session_state,
-                cursor_key=secrets.token_bytes(32),
+                cursor_signing_key=secrets.token_bytes(32),
                 plan_digest=None,
             )
             st.rerun()
@@ -217,7 +217,7 @@ try:
                     normalized_plan=plan.model_dump(mode="json"),
                     include_columns=tuple(plan.include_columns),
                     page_size=100,
-                    cursor_key=st.session_state.nl_cursor_key,
+                    signing_key=st.session_state.nl_cursor_signing_key,
                     cursor=cursor,
                 ),
                 navigation=navigation,

@@ -52,7 +52,7 @@ _MAX_PROJECTION_CELL_BYTES = 64 * 1024
 _MAX_OWNER_PROJECTION_BYTES = 7 * 1024 * 1024
 _NL_SCREEN_CURSOR_TYPE = "nl_screen_page"
 _NL_SCREEN_ORDER_VERSION = "trade_date_ts_code_v1"
-_NL_SCREEN_CURSOR_KEY_BYTES = 32
+_NL_SCREEN_CURSOR_SIGNING_KEY_BYTES = 32
 _NL_SCREEN_CURSOR_SIGNATURE_BYTES = 32
 _NL_SCREEN_CURSOR_SIGNATURE_ENCODED_BYTES = 43
 _MAX_NL_SCREEN_CURSOR_PAYLOAD_BYTES = 1_024
@@ -1392,9 +1392,12 @@ def nl_screen_query_digest(
     )
 
 
-def _validate_nl_screen_cursor_key(key: bytes) -> None:
-    if not isinstance(key, bytes) or len(key) != _NL_SCREEN_CURSOR_KEY_BYTES:
-        raise ValueError("nl screen cursor key must be exactly 32 bytes")
+def _validate_nl_screen_cursor_signing_key(signing_key: bytes) -> None:
+    if (
+        not isinstance(signing_key, bytes)
+        or len(signing_key) != _NL_SCREEN_CURSOR_SIGNING_KEY_BYTES
+    ):
+        raise ValueError("nl screen cursor signing key must be exactly 32 bytes")
 
 
 def _encode_cursor_segment(payload: bytes) -> str:
@@ -1406,20 +1409,20 @@ def _decode_cursor_segment(segment: str) -> bytes:
     return b64decode(padded.encode("ascii"), altchars=b"-_", validate=True)
 
 
-def encode_nl_screen_cursor(cursor: NlScreenCursor, *, key: bytes) -> str:
-    _validate_nl_screen_cursor_key(key)
+def encode_nl_screen_cursor(cursor: NlScreenCursor, *, signing_key: bytes) -> str:
+    _validate_nl_screen_cursor_signing_key(signing_key)
     payload = canonical_json_bytes(cursor.model_dump(mode="json"))
     if len(payload) > _MAX_NL_SCREEN_CURSOR_PAYLOAD_BYTES:
         raise NlScreenPageError("nl screen cursor requires rerun: cursor is invalid")
-    signature = hmac.new(key, payload, hashlib.sha256).digest()
+    signature = hmac.new(signing_key, payload, hashlib.sha256).digest()
     token = f"{_encode_cursor_segment(payload)}.{_encode_cursor_segment(signature)}"
     if len(token.encode("ascii")) > _MAX_NL_SCREEN_CURSOR_ENCODED_BYTES:
         raise NlScreenPageError("nl screen cursor requires rerun: cursor is invalid")
     return token
 
 
-def decode_nl_screen_cursor(token: str, *, key: bytes) -> NlScreenCursor:
-    _validate_nl_screen_cursor_key(key)
+def decode_nl_screen_cursor(token: str, *, signing_key: bytes) -> NlScreenCursor:
+    _validate_nl_screen_cursor_signing_key(signing_key)
     invalid = "nl screen cursor requires rerun: cursor is invalid"
     if not isinstance(token, str) or not token:
         raise NlScreenPageError(invalid)
@@ -1441,7 +1444,7 @@ def decode_nl_screen_cursor(token: str, *, key: bytes) -> NlScreenCursor:
         signature = _decode_cursor_segment(signature_segment)
         if len(signature) != _NL_SCREEN_CURSOR_SIGNATURE_BYTES:
             raise ValueError("cursor signature is invalid")
-        expected = hmac.new(key, payload, hashlib.sha256).digest()
+        expected = hmac.new(signing_key, payload, hashlib.sha256).digest()
         if not hmac.compare_digest(expected, signature):
             raise ValueError("cursor signature does not match")
         parsed = strict_canonical_json_loads(payload)
@@ -1540,7 +1543,7 @@ def paginate_nl_screen_projection(
     normalized_plan: Mapping[str, object],
     include_columns: Sequence[str] = (),
     page_size: int,
-    cursor_key: bytes,
+    signing_key: bytes,
     cursor: str | None = None,
 ) -> NlScreenPage:
     """Screen a complete immutable universe, then apply keyset pagination."""
@@ -1548,7 +1551,7 @@ def paginate_nl_screen_projection(
     if type(page_size) is not int or not 1 <= page_size <= 1_000:
         raise ValueError("nl screen page_size must be an integer between 1 and 1000")
     query_digest = nl_screen_query_digest(normalized_plan, include_columns)
-    decoded = None if cursor is None else decode_nl_screen_cursor(cursor, key=cursor_key)
+    decoded = None if cursor is None else decode_nl_screen_cursor(cursor, signing_key=signing_key)
     if decoded is not None:
         validate_nl_screen_cursor(
             decoded,
@@ -1564,7 +1567,7 @@ def paginate_nl_screen_projection(
             last_trade_date=None,
             last_ts_code=None,
         ),
-        key=cursor_key,
+        signing_key=signing_key,
     )
     screened, diagnostics = screen_nl_projection(
         universe,
@@ -1576,14 +1579,17 @@ def paginate_nl_screen_projection(
     requested_date = date.fromisoformat(trade_date)
     if decoded is not None and decoded.last_trade_date is not None:
         assert decoded.last_ts_code is not None
-        cursor_key = (decoded.last_trade_date, decoded.last_ts_code)
+        pagination_last_key: tuple[date, str] = (
+            decoded.last_trade_date,
+            decoded.last_ts_code,
+        )
         snapshot_keys = tuple(
             (requested_date, str(code)) for code in screened["ts_code"].astype("string")
         )
-        if cursor_key not in snapshot_keys:
+        if pagination_last_key not in snapshot_keys:
             raise NlScreenPageError("nl screen cursor requires rerun: snapshot key is missing")
         after = pd.Series(
-            (key > cursor_key for key in snapshot_keys),
+            (snapshot_key > pagination_last_key for snapshot_key in snapshot_keys),
             index=screened.index,
             dtype="boolean",
         )
@@ -1599,7 +1605,7 @@ def paginate_nl_screen_projection(
                 last_trade_date=requested_date,
                 last_ts_code=str(rows.iloc[-1]["ts_code"]),
             ),
-            key=cursor_key,
+            signing_key=signing_key,
         )
     return NlScreenPage(
         rows=rows,

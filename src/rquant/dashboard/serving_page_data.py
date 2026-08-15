@@ -62,11 +62,11 @@ def _page_result(result: ServingFrameResult, value: _ValueT) -> ServingPageResul
 def reset_nl_screen_page_session(
     state: MutableMapping[str, object],
     *,
-    cursor_key: bytes,
+    cursor_signing_key: bytes,
     plan_digest: str | None,
 ) -> None:
-    if not isinstance(cursor_key, bytes) or len(cursor_key) != 32:
-        raise ValueError("nl screen cursor key must be exactly 32 bytes")
+    if not isinstance(cursor_signing_key, bytes) or len(cursor_signing_key) != 32:
+        raise ValueError("nl screen cursor signing key must be exactly 32 bytes")
     state.update(
         {
             "nl_result_df": None,
@@ -76,7 +76,7 @@ def reset_nl_screen_page_session(
             "nl_next_cursor": None,
             "nl_cursor_history": [],
             "nl_page_error": None,
-            "nl_cursor_key": cursor_key,
+            "nl_cursor_signing_key": cursor_signing_key,
             "nl_plan_digest": plan_digest,
         }
     )
@@ -86,13 +86,13 @@ def bind_nl_screen_plan_session(
     state: MutableMapping[str, object],
     *,
     plan_digest: str,
-    cursor_key_factory: Callable[[], bytes],
+    cursor_signing_key_factory: Callable[[], bytes],
 ) -> bool:
     if state.get("nl_plan_digest") == plan_digest:
         return False
     reset_nl_screen_page_session(
         state,
-        cursor_key=cursor_key_factory(),
+        cursor_signing_key=cursor_signing_key_factory(),
         plan_digest=plan_digest,
     )
     return True
@@ -474,7 +474,7 @@ def read_nl_screen_page(
     normalized_plan: Mapping[str, object],
     include_columns: Sequence[str] = (),
     page_size: int,
-    cursor_key: bytes,
+    signing_key: bytes,
     cursor: str | None = None,
     now: datetime | None = None,
     stale_after: timedelta = timedelta(minutes=10),
@@ -482,7 +482,7 @@ def read_nl_screen_page(
     """Read one complete bounded NL universe from a pinned serving generation."""
 
     query_digest = nl_screen_query_digest(normalized_plan, include_columns)
-    decoded = None if cursor is None else decode_nl_screen_cursor(cursor, key=cursor_key)
+    decoded = None if cursor is None else decode_nl_screen_cursor(cursor, signing_key=signing_key)
     if decoded is not None and decoded.query_digest != query_digest:
         raise NlScreenPageError("nl screen cursor requires rerun: query changed")
     observed_at = normalize_aware_utc(now or datetime.now(UTC))
@@ -535,7 +535,7 @@ def read_nl_screen_page(
                 normalized_plan=normalized_plan,
                 include_columns=include_columns,
                 page_size=page_size,
-                cursor_key=cursor_key,
+                signing_key=signing_key,
                 cursor=cursor,
             )
     except NlScreenPageError:
