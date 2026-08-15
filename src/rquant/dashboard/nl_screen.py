@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 from collections.abc import Callable
 from datetime import UTC, datetime
 from datetime import date as _date
@@ -24,12 +25,18 @@ import streamlit as st
 from pydantic import JsonValue, ValidationError
 
 from rquant.config import settings
-from rquant.dashboard.serving_page_data import read_nl_screen_page
+from rquant.dashboard.serving_page_data import (
+    bind_nl_screen_plan_session,
+    load_nl_screen_page_session,
+    read_nl_screen_page,
+    reset_nl_screen_page_session,
+)
 from rquant.dashboard.serving_page_ui import render_serving_state_banner
 from rquant.llm.client import DeepSeekClient, LLMClarificationNeeded, LLMError
 from rquant.llm.dispatch import build_rules
 from rquant.llm.schemas import RuleCall, ScreenPlan
 from rquant.page_control import AppendNlQueryLog, PageControlClient, SaveNlPreset
+from rquant.serving_read_models import nl_screen_query_digest
 
 st.set_page_config(
     page_title="rQuant NL 选股",
@@ -78,6 +85,12 @@ try:
         st.session_state.nl_plan_dict = None
     if "nl_history" not in st.session_state:
         st.session_state.nl_history = []
+    if "nl_cursor_key" not in st.session_state:
+        reset_nl_screen_page_session(
+            st.session_state,
+            cursor_key=secrets.token_bytes(32),
+            plan_digest=None,
+        )
     if "nl_result_df" not in st.session_state:
         st.session_state.nl_result_df = None
     if "nl_diagnostics" not in st.session_state:
@@ -86,8 +99,23 @@ try:
         st.session_state.nl_next_cursor = None
     if "nl_current_cursor" not in st.session_state:
         st.session_state.nl_current_cursor = None
+    if "nl_start_cursor" not in st.session_state:
+        st.session_state.nl_start_cursor = None
     if "nl_cursor_history" not in st.session_state:
         st.session_state.nl_cursor_history = []
+    if "nl_page_error" not in st.session_state:
+        st.session_state.nl_page_error = None
+    if "nl_plan_digest" not in st.session_state:
+        st.session_state.nl_plan_digest = None
+
+    def _bind_nl_plan_state(plan: dict[str, object]) -> None:
+        include_columns = tuple(str(column) for column in plan.get("include_columns", ()))
+        plan_digest = nl_screen_query_digest(plan, include_columns)
+        bind_nl_screen_plan_session(
+            st.session_state,
+            plan_digest=plan_digest,
+            cursor_key_factory=lambda: secrets.token_bytes(32),
+        )
 
     nl_query = st.text_input(
         "输入选股需求（中文）",
@@ -103,10 +131,11 @@ try:
     with nl_col_clear:
         if st.button("🗑 清空", use_container_width=True, key="nl_clear_btn"):
             st.session_state.nl_plan_dict = None
-            st.session_state.nl_result_df = None
-            st.session_state.nl_next_cursor = None
-            st.session_state.nl_current_cursor = None
-            st.session_state.nl_cursor_history = []
+            reset_nl_screen_page_session(
+                st.session_state,
+                cursor_key=secrets.token_bytes(32),
+                plan_digest=None,
+            )
             st.rerun()
 
     if nl_parse_clicked and nl_query.strip():
@@ -158,6 +187,7 @@ try:
 
     nl_plan_dict = st.session_state.nl_plan_dict
     if nl_plan_dict:
+        _bind_nl_plan_state(nl_plan_dict)
 
         def _nl_rules_and_labels(
             plan: ScreenPlan,
@@ -170,23 +200,32 @@ try:
                 )
             return tuple(build_rules(plan)), tuple(labels)
 
-        def _load_nl_page(plan: ScreenPlan, *, cursor: str | None) -> None:
+        def _load_nl_page(
+            plan: ScreenPlan,
+            *,
+            cursor: str | None,
+            navigation: Literal["replace", "next", "previous"],
+        ) -> bool:
             rules, labels = _nl_rules_and_labels(plan)
-            page_result = read_nl_screen_page(
-                os.environ.get("RQUANT_SERVING_ROOT", "data/serving"),
-                trade_date=plan.trade_date,
-                rules=rules,
-                rule_labels=labels,
-                normalized_plan=plan.model_dump(mode="json"),
-                include_columns=tuple(plan.include_columns),
-                page_size=100,
-                cursor=cursor,
+            page_result = load_nl_screen_page_session(
+                st.session_state,
+                load_page=lambda: read_nl_screen_page(
+                    os.environ.get("RQUANT_SERVING_ROOT", "data/serving"),
+                    trade_date=plan.trade_date,
+                    rules=rules,
+                    rule_labels=labels,
+                    normalized_plan=plan.model_dump(mode="json"),
+                    include_columns=tuple(plan.include_columns),
+                    page_size=100,
+                    cursor_key=st.session_state.nl_cursor_key,
+                    cursor=cursor,
+                ),
+                navigation=navigation,
             )
+            if page_result is None:
+                return False
             render_serving_state_banner(st, page_result, label="自然语言选股数据")
-            st.session_state.nl_result_df = page_result.value.rows
-            st.session_state.nl_diagnostics = page_result.value.diagnostics
-            st.session_state.nl_next_cursor = page_result.value.next_cursor
-            st.session_state.nl_current_cursor = page_result.value.start_cursor
+            return True
 
         st.success(f"✅ 解析成功 · trade_date={nl_plan_dict['trade_date']}")
         if nl_plan_dict.get("rationale"):
@@ -290,6 +329,7 @@ try:
                 key="nl_run_date_input",
             )
             nl_plan_dict["trade_date"] = nl_run_date.isoformat()
+            _bind_nl_plan_state(nl_plan_dict)
         with nl_col_run:
             st.markdown("<br>", unsafe_allow_html=True)
             if st.button(
@@ -300,14 +340,20 @@ try:
             ):
                 try:
                     nl_plan_validated = ScreenPlan.model_validate(nl_plan_dict)
-                    st.session_state.nl_cursor_history = []
-                    _load_nl_page(nl_plan_validated, cursor=None)
+                    _load_nl_page(
+                        nl_plan_validated,
+                        cursor=None,
+                        navigation="replace",
+                    )
                 except ValidationError as nl_e:
                     st.error(f"plan 校验失败：{nl_e}")
                     st.session_state.nl_result_df = None
                 except Exception as nl_e:
                     st.error(f"运行失败：{type(nl_e).__name__}: {nl_e}")
                     st.session_state.nl_result_df = None
+
+        if st.session_state.nl_page_error is not None:
+            st.error(st.session_state.nl_page_error)
 
         nl_result_df = st.session_state.nl_result_df
         if nl_result_df is not None:
@@ -343,12 +389,13 @@ try:
                         use_container_width=True,
                         key="nl_previous_page_btn",
                     ):
-                        st.session_state.nl_cursor_history.pop()
-                        _load_nl_page(
+                        loaded = _load_nl_page(
                             ScreenPlan.model_validate(nl_plan_dict),
                             cursor=previous_cursor,
+                            navigation="previous",
                         )
-                        st.rerun()
+                        if loaded:
+                            st.rerun()
                 with nl_next_col:
                     if st.button(
                         "下一页",
@@ -356,14 +403,13 @@ try:
                         use_container_width=True,
                         key="nl_next_page_btn",
                     ):
-                        st.session_state.nl_cursor_history.append(
-                            st.session_state.nl_current_cursor
-                        )
-                        _load_nl_page(
+                        loaded = _load_nl_page(
                             ScreenPlan.model_validate(nl_plan_dict),
                             cursor=st.session_state.nl_next_cursor,
+                            navigation="next",
                         )
-                        st.rerun()
+                        if loaded:
+                            st.rerun()
 
                 st.divider()
                 nl_col_save_input, nl_col_save_btn = st.columns([3, 1])

@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import TracebackType
-from typing import Generic, Self, TypeVar
+from typing import Generic, Literal, Self, TypeVar
 
 import pandas as pd
 
@@ -34,6 +34,8 @@ from rquant.serving_read_models import (
 )
 
 _ValueT = TypeVar("_ValueT")
+NlScreenPageNavigation = Literal["replace", "next", "previous"]
+NL_SCREEN_PAGE_RERUN_REQUIRED = "分页状态已失效，请重新运行筛选。"
 
 
 @dataclass(frozen=True)
@@ -55,6 +57,92 @@ def _page_result(result: ServingFrameResult, value: _ValueT) -> ServingPageResul
         generated_at=result.generated_at,
         value=value,
     )
+
+
+def reset_nl_screen_page_session(
+    state: MutableMapping[str, object],
+    *,
+    cursor_key: bytes,
+    plan_digest: str | None,
+) -> None:
+    if not isinstance(cursor_key, bytes) or len(cursor_key) != 32:
+        raise ValueError("nl screen cursor key must be exactly 32 bytes")
+    state.update(
+        {
+            "nl_result_df": None,
+            "nl_diagnostics": [],
+            "nl_current_cursor": None,
+            "nl_start_cursor": None,
+            "nl_next_cursor": None,
+            "nl_cursor_history": [],
+            "nl_page_error": None,
+            "nl_cursor_key": cursor_key,
+            "nl_plan_digest": plan_digest,
+        }
+    )
+
+
+def bind_nl_screen_plan_session(
+    state: MutableMapping[str, object],
+    *,
+    plan_digest: str,
+    cursor_key_factory: Callable[[], bytes],
+) -> bool:
+    if state.get("nl_plan_digest") == plan_digest:
+        return False
+    reset_nl_screen_page_session(
+        state,
+        cursor_key=cursor_key_factory(),
+        plan_digest=plan_digest,
+    )
+    return True
+
+
+def load_nl_screen_page_session(
+    state: MutableMapping[str, object],
+    *,
+    load_page: Callable[[], ServingPageResult[NlScreenPage]],
+    navigation: NlScreenPageNavigation,
+) -> ServingPageResult[NlScreenPage] | None:
+    history_value = state.get("nl_cursor_history", [])
+    if not isinstance(history_value, list) or not all(
+        isinstance(cursor, str) for cursor in history_value
+    ):
+        raise ValueError("nl screen cursor history is invalid")
+    history = list(history_value)
+    if navigation == "replace":
+        next_history: list[str] = []
+    elif navigation == "next":
+        current = state.get("nl_current_cursor")
+        if not isinstance(current, str) or not current:
+            raise ValueError("nl screen current cursor is invalid")
+        next_history = [*history, current]
+    elif navigation == "previous":
+        if not history:
+            raise ValueError("nl screen cursor history is empty")
+        next_history = history[:-1]
+    else:
+        raise ValueError("nl screen page navigation is invalid")
+
+    try:
+        result = load_page()
+    except NlScreenPageError:
+        state["nl_page_error"] = NL_SCREEN_PAGE_RERUN_REQUIRED
+        return None
+
+    page = result.value
+    state.update(
+        {
+            "nl_result_df": page.rows,
+            "nl_diagnostics": page.diagnostics,
+            "nl_current_cursor": page.start_cursor,
+            "nl_start_cursor": page.start_cursor,
+            "nl_next_cursor": page.next_cursor,
+            "nl_cursor_history": next_history,
+            "nl_page_error": None,
+        }
+    )
+    return result
 
 
 class ServingPageRenderContext:
@@ -386,6 +474,7 @@ def read_nl_screen_page(
     normalized_plan: Mapping[str, object],
     include_columns: Sequence[str] = (),
     page_size: int,
+    cursor_key: bytes,
     cursor: str | None = None,
     now: datetime | None = None,
     stale_after: timedelta = timedelta(minutes=10),
@@ -393,9 +482,11 @@ def read_nl_screen_page(
     """Read one complete bounded NL universe from a pinned serving generation."""
 
     query_digest = nl_screen_query_digest(normalized_plan, include_columns)
-    decoded = None if cursor is None else decode_nl_screen_cursor(cursor)
+    decoded = None if cursor is None else decode_nl_screen_cursor(cursor, key=cursor_key)
     if decoded is not None and decoded.query_digest != query_digest:
         raise NlScreenPageError("nl screen cursor requires rerun: query changed")
+    observed_at = normalize_aware_utc(now or datetime.now(UTC))
+    contract = PAGE_PROJECTION_CONTRACTS["nl_screen_universe"]
     reader = ServingReader(serving_root)
     try:
         lease = (
@@ -407,8 +498,6 @@ def read_nl_screen_page(
         raise NlScreenPageError(
             "nl screen cursor requires rerun: generation is unavailable"
         ) from exc
-    observed_at = normalize_aware_utc(now or datetime.now(UTC))
-    contract = PAGE_PROJECTION_CONTRACTS["nl_screen_universe"]
     try:
         with lease:
             result = query_acquired_serving_frame(
@@ -446,13 +535,24 @@ def read_nl_screen_page(
                 normalized_plan=normalized_plan,
                 include_columns=include_columns,
                 page_size=page_size,
+                cursor_key=cursor_key,
                 cursor=cursor,
             )
     except NlScreenPageError:
         raise
     except Exception as exc:
         raise NlScreenPageError("nl screen serving generation is unavailable") from exc
+    finally:
+        lease.close()
     return _page_result(result, page)
 
 
-__all__ = ["ServingPageRenderContext", "ServingPageResult", "read_nl_screen_page"]
+__all__ = [
+    "NL_SCREEN_PAGE_RERUN_REQUIRED",
+    "ServingPageRenderContext",
+    "ServingPageResult",
+    "bind_nl_screen_plan_session",
+    "load_nl_screen_page_session",
+    "read_nl_screen_page",
+    "reset_nl_screen_page_session",
+]

@@ -10,12 +10,17 @@ import duckdb
 import pandas as pd
 import pytest
 
+import rquant.dashboard.serving_page_data as serving_page_data
 from rquant.config import settings
 from rquant.dashboard.runtime_console_data import (
     ServingFrameState,
     query_serving_frame,
 )
-from rquant.dashboard.serving_page_data import ServingPageRenderContext, read_nl_screen_page
+from rquant.dashboard.serving_page_data import (
+    ServingPageRenderContext,
+    ServingPageResult,
+    read_nl_screen_page,
+)
 from rquant.lab_jobs import LabJobReader, LabJobStore
 from rquant.lab_jobs_serving_authority import LabJobsServingSourceReader
 from rquant.notification_state import NotificationStateStore
@@ -79,6 +84,7 @@ from rquant.serving_page_projection_source import (
 from rquant.serving_publisher import ServingPublisher, ServingReader, ServingTableSpec
 from rquant.serving_read_models import (
     SERVING_TABLE_SPECS,
+    NlScreenPage,
     NlScreenPageError,
     ServingProjectionPayload,
     screen_nl_projection,
@@ -88,6 +94,7 @@ from tests.canvas_ed25519_support import create_canvas_ed25519_test_authority
 
 NOW = datetime(2026, 8, 2, 3, 0, tzinfo=UTC)
 COMMIT = "a" * 40
+CURSOR_KEY = bytes(range(32))
 
 
 def _projection(
@@ -179,6 +186,7 @@ def test_nl_page_cursor_pins_historical_generation_and_fails_closed_at_budget(
         rule_labels=("gt(CLOSE[0], 1)",),
         normalized_plan=query,
         page_size=1,
+        cursor_key=CURSOR_KEY,
         now=NOW,
     )
     assert first.generation_id == first_generation
@@ -200,6 +208,7 @@ def test_nl_page_cursor_pins_historical_generation_and_fails_closed_at_budget(
         normalized_plan=query,
         page_size=1,
         cursor=first.value.next_cursor,
+        cursor_key=CURSOR_KEY,
         now=NOW + timedelta(seconds=1),
     )
     assert second.generation_id == first_generation
@@ -213,6 +222,7 @@ def test_nl_page_cursor_pins_historical_generation_and_fails_closed_at_budget(
         normalized_plan=query,
         page_size=1,
         cursor=first.value.start_cursor,
+        cursor_key=CURSOR_KEY,
         now=NOW + timedelta(seconds=1),
     )
     assert previous.generation_id == first_generation
@@ -227,6 +237,7 @@ def test_nl_page_cursor_pins_historical_generation_and_fails_closed_at_budget(
             normalized_plan={"trade_date": "2026-07-31", "rule": "all"},
             page_size=1,
             cursor=first.value.next_cursor,
+            cursor_key=CURSOR_KEY,
             now=NOW + timedelta(seconds=1),
         )
 
@@ -248,8 +259,234 @@ def test_nl_page_cursor_pins_historical_generation_and_fails_closed_at_budget(
             rule_labels=(),
             normalized_plan={"trade_date": "2026-07-31", "rule": "all"},
             page_size=1,
+            cursor_key=CURSOR_KEY,
             now=NOW + timedelta(seconds=2),
         )
+
+
+def test_nl_page_session_reset_clears_results_and_rotates_cursor_key() -> None:
+    old_frame = pd.DataFrame({"ts_code": ["600000.SH"]})
+    state: dict[str, object] = {
+        "nl_result_df": old_frame,
+        "nl_diagnostics": [("all", 1)],
+        "nl_current_cursor": "current",
+        "nl_start_cursor": "start",
+        "nl_next_cursor": "next",
+        "nl_cursor_history": ["previous"],
+        "nl_page_error": "old error",
+        "nl_cursor_key": b"o" * 32,
+        "nl_plan_digest": "old",
+    }
+
+    serving_page_data.reset_nl_screen_page_session(
+        state,
+        cursor_key=b"n" * 32,
+        plan_digest="new",
+    )
+
+    assert state == {
+        "nl_result_df": None,
+        "nl_diagnostics": [],
+        "nl_current_cursor": None,
+        "nl_start_cursor": None,
+        "nl_next_cursor": None,
+        "nl_cursor_history": [],
+        "nl_page_error": None,
+        "nl_cursor_key": b"n" * 32,
+        "nl_plan_digest": "new",
+    }
+
+
+def test_nl_page_plan_binding_rotates_only_for_semantic_change() -> None:
+    old_frame = pd.DataFrame({"ts_code": ["600000.SH"]})
+    state: dict[str, object] = {
+        "nl_result_df": old_frame,
+        "nl_diagnostics": [("all", 1)],
+        "nl_current_cursor": "current",
+        "nl_start_cursor": "start",
+        "nl_next_cursor": "next",
+        "nl_cursor_history": ["previous"],
+        "nl_page_error": "old error",
+        "nl_cursor_key": b"o" * 32,
+        "nl_plan_digest": "old",
+    }
+    generated_keys = 0
+
+    def _new_key() -> bytes:
+        nonlocal generated_keys
+        generated_keys += 1
+        return b"n" * 32
+
+    assert serving_page_data.bind_nl_screen_plan_session(
+        state,
+        plan_digest="new",
+        cursor_key_factory=_new_key,
+    )
+    assert generated_keys == 1
+    assert state["nl_result_df"] is None
+    assert state["nl_cursor_key"] == b"n" * 32
+
+    new_frame = pd.DataFrame({"ts_code": ["600001.SH"]})
+    state["nl_result_df"] = new_frame
+    assert not serving_page_data.bind_nl_screen_plan_session(
+        state,
+        plan_digest="new",
+        cursor_key_factory=_new_key,
+    )
+    assert generated_keys == 1
+    assert state["nl_result_df"] is new_frame
+    assert state["nl_cursor_key"] == b"n" * 32
+
+
+def test_nl_page_load_error_keeps_history_and_current_page_atomic() -> None:
+    old_frame = pd.DataFrame({"ts_code": ["600001.SH"]})
+    state: dict[str, object] = {
+        "nl_result_df": old_frame,
+        "nl_diagnostics": [("all", 1)],
+        "nl_current_cursor": "current",
+        "nl_start_cursor": "current",
+        "nl_next_cursor": "next",
+        "nl_cursor_history": ["first"],
+        "nl_page_error": None,
+    }
+
+    def _fail_page_load() -> ServingPageResult[NlScreenPage]:
+        raise NlScreenPageError("nl screen cursor requires rerun: generation is unavailable")
+
+    loaded = serving_page_data.load_nl_screen_page_session(
+        state,
+        load_page=_fail_page_load,
+        navigation="previous",
+    )
+
+    assert loaded is None
+    assert state["nl_result_df"] is old_frame
+    assert state["nl_current_cursor"] == "current"
+    assert state["nl_start_cursor"] == "current"
+    assert state["nl_next_cursor"] == "next"
+    assert state["nl_cursor_history"] == ["first"]
+    assert state["nl_page_error"] == serving_page_data.NL_SCREEN_PAGE_RERUN_REQUIRED
+
+
+def test_nl_page_load_success_commits_navigation_history_after_read() -> None:
+    state: dict[str, object] = {
+        "nl_result_df": pd.DataFrame({"ts_code": ["600001.SH"]}),
+        "nl_diagnostics": [],
+        "nl_current_cursor": "source",
+        "nl_start_cursor": "source",
+        "nl_next_cursor": "target",
+        "nl_cursor_history": [],
+        "nl_page_error": "old error",
+    }
+    page = NlScreenPage(
+        rows=pd.DataFrame({"ts_code": ["600002.SH"]}),
+        diagnostics=(("all", 2),),
+        start_cursor="target",
+        next_cursor=None,
+        generation_id="a" * 64,
+        query_digest="b" * 64,
+    )
+    result = ServingPageResult(
+        state=ServingFrameState.READY,
+        detail="available",
+        generation_id="a" * 64,
+        generated_at=NOW,
+        value=page,
+    )
+
+    loaded = serving_page_data.load_nl_screen_page_session(
+        state,
+        load_page=lambda: result,
+        navigation="next",
+    )
+
+    assert loaded is result
+    assert state["nl_result_df"].equals(page.rows)
+    assert state["nl_diagnostics"] == page.diagnostics
+    assert state["nl_current_cursor"] == "target"
+    assert state["nl_start_cursor"] == "target"
+    assert state["nl_next_cursor"] is None
+    assert state["nl_cursor_history"] == ["source"]
+    assert state["nl_page_error"] is None
+
+
+def test_nl_page_rejects_naive_now_before_generation_acquire(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    acquired = 0
+
+    class _Reader:
+        def __init__(self, _root: object) -> None:
+            pass
+
+        def acquire_generation(self) -> object:
+            nonlocal acquired
+            acquired += 1
+            raise AssertionError("generation must not be acquired")
+
+    monkeypatch.setattr(serving_page_data, "ServingReader", _Reader)
+
+    with pytest.raises(ValueError, match="timezone-aware"):
+        read_nl_screen_page(
+            "unused",
+            trade_date="2026-07-31",
+            rules=(),
+            rule_labels=(),
+            normalized_plan={"trade_date": "2026-07-31"},
+            page_size=1,
+            cursor_key=CURSOR_KEY,
+            now=datetime(2026, 8, 2, 3, 0),
+        )
+    assert acquired == 0
+
+
+def test_nl_page_releases_generation_lease_after_query_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    active_leases = 0
+
+    class _Lease:
+        closed = False
+
+        def __enter__(self) -> _Lease:
+            return self
+
+        def __exit__(self, *_error: object) -> None:
+            self.close()
+
+        def close(self) -> None:
+            nonlocal active_leases
+            if not self.closed:
+                active_leases -= 1
+                self.closed = True
+
+    class _Reader:
+        def __init__(self, _root: object) -> None:
+            pass
+
+        def acquire_generation(self) -> _Lease:
+            nonlocal active_leases
+            active_leases += 1
+            return _Lease()
+
+    def _fail_query(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("query failed")
+
+    monkeypatch.setattr(serving_page_data, "ServingReader", _Reader)
+    monkeypatch.setattr(serving_page_data, "query_acquired_serving_frame", _fail_query)
+
+    with pytest.raises(NlScreenPageError, match="serving generation is unavailable"):
+        read_nl_screen_page(
+            "unused",
+            trade_date="2026-07-31",
+            rules=(),
+            rule_labels=(),
+            normalized_plan={"trade_date": "2026-07-31"},
+            page_size=1,
+            cursor_key=CURSOR_KEY,
+            now=NOW,
+        )
+    assert active_leases == 0
 
 
 def _signal_projections() -> tuple[ServingProjectionPayload, ...]:

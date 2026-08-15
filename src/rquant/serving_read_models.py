@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import math
-from base64 import urlsafe_b64decode, urlsafe_b64encode
+from base64 import b64decode, urlsafe_b64encode
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -40,6 +42,7 @@ from rquant.serving_publisher import (
 )
 from rquant.signal_bus import SignalRouteReceipt
 from rquant.signal_contracts import SignalEnvelope
+from rquant.strict_json import canonical_json_bytes, strict_canonical_json_loads
 
 GenerationId = Annotated[StrictStr, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 ProjectionScalar = StrictStr | StrictInt | StrictFloat | StrictBool | None
@@ -49,6 +52,11 @@ _MAX_PROJECTION_CELL_BYTES = 64 * 1024
 _MAX_OWNER_PROJECTION_BYTES = 7 * 1024 * 1024
 _NL_SCREEN_CURSOR_TYPE = "nl_screen_page"
 _NL_SCREEN_ORDER_VERSION = "trade_date_ts_code_v1"
+_NL_SCREEN_CURSOR_KEY_BYTES = 32
+_NL_SCREEN_CURSOR_SIGNATURE_BYTES = 32
+_NL_SCREEN_CURSOR_SIGNATURE_ENCODED_BYTES = 43
+_MAX_NL_SCREEN_CURSOR_PAYLOAD_BYTES = 1_024
+_MAX_NL_SCREEN_CURSOR_ENCODED_BYTES = 2_048
 _DUCKDB_PROJECTION_TYPES: Mapping[ProjectionColumnKind, DuckDBColumnType] = MappingProxyType(
     {
         "string": "VARCHAR",
@@ -1384,23 +1392,65 @@ def nl_screen_query_digest(
     )
 
 
-def encode_nl_screen_cursor(cursor: NlScreenCursor) -> str:
-    payload = cursor.model_dump(mode="json")
-    encoded = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode(
-        "utf-8"
-    )
-    return urlsafe_b64encode(encoded).decode("ascii").rstrip("=")
+def _validate_nl_screen_cursor_key(key: bytes) -> None:
+    if not isinstance(key, bytes) or len(key) != _NL_SCREEN_CURSOR_KEY_BYTES:
+        raise ValueError("nl screen cursor key must be exactly 32 bytes")
 
 
-def decode_nl_screen_cursor(token: str) -> NlScreenCursor:
-    if not isinstance(token, str) or not token:
+def _encode_cursor_segment(payload: bytes) -> str:
+    return urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+
+def _decode_cursor_segment(segment: str) -> bytes:
+    padded = segment + "=" * (-len(segment) % 4)
+    return b64decode(padded.encode("ascii"), altchars=b"-_", validate=True)
+
+
+def encode_nl_screen_cursor(cursor: NlScreenCursor, *, key: bytes) -> str:
+    _validate_nl_screen_cursor_key(key)
+    payload = canonical_json_bytes(cursor.model_dump(mode="json"))
+    if len(payload) > _MAX_NL_SCREEN_CURSOR_PAYLOAD_BYTES:
         raise NlScreenPageError("nl screen cursor requires rerun: cursor is invalid")
+    signature = hmac.new(key, payload, hashlib.sha256).digest()
+    token = f"{_encode_cursor_segment(payload)}.{_encode_cursor_segment(signature)}"
+    if len(token.encode("ascii")) > _MAX_NL_SCREEN_CURSOR_ENCODED_BYTES:
+        raise NlScreenPageError("nl screen cursor requires rerun: cursor is invalid")
+    return token
+
+
+def decode_nl_screen_cursor(token: str, *, key: bytes) -> NlScreenCursor:
+    _validate_nl_screen_cursor_key(key)
+    invalid = "nl screen cursor requires rerun: cursor is invalid"
+    if not isinstance(token, str) or not token:
+        raise NlScreenPageError(invalid)
     try:
-        padded = token + "=" * (-len(token) % 4)
-        payload = json.loads(urlsafe_b64decode(padded.encode("ascii")))
-        return NlScreenCursor.model_validate(payload)
-    except (UnicodeEncodeError, ValueError, json.JSONDecodeError) as exc:
-        raise NlScreenPageError("nl screen cursor requires rerun: cursor is invalid") from exc
+        if len(token) > _MAX_NL_SCREEN_CURSOR_ENCODED_BYTES:
+            raise ValueError("encoded cursor is too large")
+        encoded = token.encode("ascii")
+        if len(encoded) > _MAX_NL_SCREEN_CURSOR_ENCODED_BYTES:
+            raise ValueError("encoded cursor is too large")
+        payload_segment, signature_segment = token.split(".")
+        if (
+            not payload_segment
+            or len(signature_segment) != _NL_SCREEN_CURSOR_SIGNATURE_ENCODED_BYTES
+        ):
+            raise ValueError("cursor signature length is invalid")
+        payload = _decode_cursor_segment(payload_segment)
+        if len(payload) > _MAX_NL_SCREEN_CURSOR_PAYLOAD_BYTES:
+            raise ValueError("decoded cursor payload is too large")
+        signature = _decode_cursor_segment(signature_segment)
+        if len(signature) != _NL_SCREEN_CURSOR_SIGNATURE_BYTES:
+            raise ValueError("cursor signature is invalid")
+        expected = hmac.new(key, payload, hashlib.sha256).digest()
+        if not hmac.compare_digest(expected, signature):
+            raise ValueError("cursor signature does not match")
+        parsed = strict_canonical_json_loads(payload)
+        cursor = NlScreenCursor.model_validate(parsed)
+        if canonical_json_bytes(cursor.model_dump(mode="json")) != payload:
+            raise ValueError("cursor payload is not canonical")
+        return cursor
+    except (UnicodeError, ValueError, TypeError) as exc:
+        raise NlScreenPageError(invalid) from exc
 
 
 def validate_nl_screen_cursor(
@@ -1490,6 +1540,7 @@ def paginate_nl_screen_projection(
     normalized_plan: Mapping[str, object],
     include_columns: Sequence[str] = (),
     page_size: int,
+    cursor_key: bytes,
     cursor: str | None = None,
 ) -> NlScreenPage:
     """Screen a complete immutable universe, then apply keyset pagination."""
@@ -1497,7 +1548,7 @@ def paginate_nl_screen_projection(
     if type(page_size) is not int or not 1 <= page_size <= 1_000:
         raise ValueError("nl screen page_size must be an integer between 1 and 1000")
     query_digest = nl_screen_query_digest(normalized_plan, include_columns)
-    decoded = None if cursor is None else decode_nl_screen_cursor(cursor)
+    decoded = None if cursor is None else decode_nl_screen_cursor(cursor, key=cursor_key)
     if decoded is not None:
         validate_nl_screen_cursor(
             decoded,
@@ -1512,7 +1563,8 @@ def paginate_nl_screen_projection(
             query_digest=query_digest,
             last_trade_date=None,
             last_ts_code=None,
-        )
+        ),
+        key=cursor_key,
     )
     screened, diagnostics = screen_nl_projection(
         universe,
@@ -1546,7 +1598,8 @@ def paginate_nl_screen_projection(
                 query_digest=query_digest,
                 last_trade_date=requested_date,
                 last_ts_code=str(rows.iloc[-1]["ts_code"]),
-            )
+            ),
+            key=cursor_key,
         )
     return NlScreenPage(
         rows=rows,
