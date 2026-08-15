@@ -354,6 +354,12 @@ def _checkout(
         encoding="utf-8",
     )
     rquant.chmod(0o700)
+    console_script = checkout / ".venv" / "bin" / "rquant-test-console"
+    console_script.write_text(
+        f"#!{python}\nraise SystemExit(0)\n",
+        encoding="utf-8",
+    )
+    console_script.chmod(0o700)
     uv = checkout / ".venv" / "bin" / "uv"
     uv.write_text(
         "#!/bin/sh\n"
@@ -5253,9 +5259,20 @@ def test_initialize_generation_publishes_first_marker_without_importing_deployer
     )
 
     assert result.returncode == 0, result.stderr
-    assert marker_path_for_lock(lock_path).is_file()
+    marker_path = marker_path_for_lock(lock_path)
+    assert marker_path.is_file()
     assert not imported.exists()
     assert not ran.exists()
+    marker = ReleaseGenerationMarker.from_payload(
+        json.loads(marker_path.read_text(encoding="utf-8"))
+    )
+    source_launcher = checkout / ".venv" / "bin" / "rquant-test-console"
+    generated_launcher = Path(marker.venv_path) / "bin" / "rquant-test-console"
+    assert source_launcher.read_bytes().splitlines()[0] == f"#!{python}".encode()
+    assert generated_launcher.read_bytes().splitlines()[0] == (
+        f"#!{marker.venv_path}/bin/python".encode()
+    )
+    assert str(checkout / ".venv").encode() not in generated_launcher.read_bytes().splitlines()[0]
 
 
 def test_initialize_generation_does_not_require_launchd_installation(

@@ -2379,6 +2379,11 @@ def test_shell_entrypoint_uses_isolated_stdlib_bootstrap_before_project_import()
 def test_shell_entrypoint_forwards_complete_runtime_profile_environment(
     tmp_path: Path,
 ) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_uname = fake_bin / "uname"
+    fake_uname.write_text("#!/bin/sh\nprintf 'Darwin\\n'\n", encoding="utf-8")
+    fake_uname.chmod(0o700)
     fake_python = tmp_path / "python"
     fake_python.write_text(
         "#!/bin/sh\nprintf '%s\\n' \"$@\"\n",
@@ -2389,7 +2394,9 @@ def test_shell_entrypoint_forwards_complete_runtime_profile_environment(
     profiles = tmp_path / "profiles"
     environment = {
         **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "RQUANT_DEPLOY_PYTHON": str(fake_python),
+        "RQUANT_RELEASE_PROFILE": "macos-lab",
         "RQUANT_RUNTIME_PRODUCTION_INPUTS": str(inputs),
         "RQUANT_RUNTIME_PROFILE_OUTPUT_DIR": str(profiles),
         "RQUANT_RUNTIME_ROOT": "/home/lighthouse/rquant/data/runtime",
@@ -2406,6 +2413,8 @@ def test_shell_entrypoint_forwards_complete_runtime_profile_environment(
 
     assert result.returncode == 0, result.stderr
     arguments = result.stdout.splitlines()
+    assert arguments[arguments.index("--release-profile") + 1] == "macos-lab"
+    assert arguments[arguments.index("--host-platform") + 1] == "darwin"
     assert arguments[-6:] == [
         "--runtime-production-inputs",
         str(inputs),
