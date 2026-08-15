@@ -1004,6 +1004,63 @@ class LabCommandSpool:
             and current.st_nlink == observed.st_nlink
         )
 
+    @classmethod
+    def _require_bound_entry_stat(
+        cls,
+        current: os.stat_result,
+        observed: os.stat_result,
+        source: Path,
+    ) -> None:
+        if cls._stat_matches_bound_entry(current, observed):
+            return
+        if (
+            current.st_dev == observed.st_dev
+            and current.st_ino == observed.st_ino
+            and current.st_nlink != observed.st_nlink
+        ):
+            raise InvalidCommandEnvelopeError(
+                f"owned entry link count changed before isolation: {source.name}"
+            )
+        raise InvalidCommandEnvelopeError(f"owned entry changed before isolation: {source.name}")
+
+    def _open_bound_regular_entry(
+        self,
+        source: Path,
+        observed: os.stat_result,
+    ) -> int:
+        if not stat.S_ISREG(observed.st_mode):
+            raise InvalidCommandEnvelopeError(f"owned entry is not regular: {source.name}")
+        if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_NONBLOCK"):
+            raise InvalidCommandEnvelopeError(
+                "regular entry isolation requires no-follow nonblocking open support"
+            )
+        source_name = self._direct_child_name(source, source.parent)
+        source_fd = self._open_managed_directory(source.parent)
+        descriptor = -1
+        try:
+            flags = (
+                getattr(os, "O_PATH", os.O_RDONLY)
+                | os.O_NOFOLLOW
+                | os.O_NONBLOCK
+                | getattr(os, "O_CLOEXEC", 0)
+            )
+            descriptor = os.open(source_name, flags, dir_fd=source_fd)
+            opened = os.fstat(descriptor)
+            current = os.stat(source_name, dir_fd=source_fd, follow_symlinks=False)
+            if not stat.S_ISREG(opened.st_mode):
+                raise InvalidCommandEnvelopeError(
+                    f"owned entry changed before isolation: {source.name}"
+                )
+            self._require_bound_entry_stat(opened, observed, source)
+            self._require_bound_entry_stat(current, observed, source)
+            return descriptor
+        except BaseException:
+            if descriptor >= 0:
+                os.close(descriptor)
+            raise
+        finally:
+            os.close(source_fd)
+
     @staticmethod
     def _after_owned_entry_isolation_stage(
         _stage: Literal["evidence_written", "entry_moved"],
@@ -1024,24 +1081,21 @@ class LabCommandSpool:
         *,
         expected_link_target: str | None,
         destination_name: str = "entry",
+        bound_regular_descriptor: int | None = None,
     ) -> Path:
         source_name = self._direct_child_name(source, source.parent)
         source_fd = self._open_managed_directory(source.parent)
         container_fd = self._open_managed_directory(container)
         try:
-            current = os.stat(source_name, dir_fd=source_fd, follow_symlinks=False)
-            if not self._stat_matches_bound_entry(current, observed):
-                if (
-                    current.st_dev == observed.st_dev
-                    and current.st_ino == observed.st_ino
-                    and current.st_nlink != observed.st_nlink
-                ):
+            if bound_regular_descriptor is not None:
+                anchored = os.fstat(bound_regular_descriptor)
+                if not stat.S_ISREG(anchored.st_mode):
                     raise InvalidCommandEnvelopeError(
-                        f"owned entry link count changed before isolation: {source.name}"
+                        f"owned entry changed before isolation: {source.name}"
                     )
-                raise InvalidCommandEnvelopeError(
-                    f"owned entry changed before isolation: {source.name}"
-                )
+                self._require_bound_entry_stat(anchored, observed, source)
+            current = os.stat(source_name, dir_fd=source_fd, follow_symlinks=False)
+            self._require_bound_entry_stat(current, observed, source)
             if expected_link_target is not None and (
                 not stat.S_ISLNK(current.st_mode)
                 or os.readlink(source_name, dir_fd=source_fd) != expected_link_target
@@ -1062,6 +1116,18 @@ class LabCommandSpool:
             # a process that can arbitrarily rewrite the spool directory itself.
             if destination_name == "entry":
                 self._before_owned_entry_move(source, container)
+                if bound_regular_descriptor is not None:
+                    anchored = os.fstat(bound_regular_descriptor)
+                    self._require_bound_entry_stat(anchored, observed, source)
+                current = os.stat(source_name, dir_fd=source_fd, follow_symlinks=False)
+                self._require_bound_entry_stat(current, observed, source)
+                if expected_link_target is not None and (
+                    not stat.S_ISLNK(current.st_mode)
+                    or os.readlink(source_name, dir_fd=source_fd) != expected_link_target
+                ):
+                    raise InvalidCommandEnvelopeError(
+                        f"owned symlink target changed before isolation: {source.name}"
+                    )
             self._guard_mutation()
             rename_noreplace_at(
                 source_fd,
@@ -1155,6 +1221,11 @@ class LabCommandSpool:
             manual_retention=file_type == "directory",
         )
         evidence_path = container / "evidence.json"
+        bound_regular_descriptor = (
+            self._open_bound_regular_entry(source, observed)
+            if stat.S_ISREG(observed.st_mode)
+            else None
+        )
         try:
             if not self._publish_no_clobber(
                 evidence_path,
@@ -1180,6 +1251,7 @@ class LabCommandSpool:
                 container,
                 observed,
                 expected_link_target=expected_link_target,
+                bound_regular_descriptor=bound_regular_descriptor,
             )
             self._after_owned_entry_isolation_stage("entry_moved", source, container)
             return LabQuarantinedCommand(path=destination, reason=reason)
@@ -1197,6 +1269,9 @@ class LabCommandSpool:
             # identity-bound move or prunes an incomplete record within configured limits.
             self._fsync_directory(self.quarantine_dir)
             raise
+        finally:
+            if bound_regular_descriptor is not None:
+                os.close(bound_regular_descriptor)
 
     def _load_owned_isolation_evidence_with_stat(
         self,

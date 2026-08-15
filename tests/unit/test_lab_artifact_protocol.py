@@ -1372,21 +1372,51 @@ def test_commit_conflict_temporary_inode_swap_never_moves_replacement(
     )
     temporary = spool._conflict_temporary_path(evidence)
     temporary.write_text("corrupt", encoding="utf-8")
+    original_stat = temporary.lstat()
+    real_open = os.open
+    real_fstat = os.fstat
+    bound_descriptors: dict[int, int] = {}
     replacement_inode: int | None = None
+
+    def audited_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+        opened = real_fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) == (original_stat.st_dev, original_stat.st_ino):
+            bound_descriptors[descriptor] = flags
+        return descriptor
 
     def swap_after_evidence(stage: str, source: Path, _container: Path) -> None:
         nonlocal replacement_inode
         if stage == "evidence_written" and source == temporary:
+            assert bound_descriptors
+            assert any(
+                (real_fstat(descriptor).st_dev, real_fstat(descriptor).st_ino)
+                == (original_stat.st_dev, original_stat.st_ino)
+                for descriptor in bound_descriptors
+            )
             temporary.unlink()
             temporary.write_text("replacement", encoding="utf-8")
             replacement_inode = temporary.stat().st_ino
 
+    monkeypatch.setattr(job_protocol.os, "open", audited_open)
     monkeypatch.setattr(spool, "_after_owned_entry_isolation_stage", swap_after_evidence)
     spool._recover_conflict_evidence_locked()
 
     assert replacement_inode is not None
+    assert replacement_inode != original_stat.st_ino
     assert temporary.read_text(encoding="utf-8") == "replacement"
     assert temporary.stat().st_ino == replacement_inode
+    for descriptor, flags in bound_descriptors.items():
+        assert flags & os.O_NOFOLLOW
+        assert flags & os.O_NONBLOCK
+        with pytest.raises(OSError):
+            real_fstat(descriptor)
     monkeypatch.undo()
     with pytest.raises(RequestContentConflictError, match="different content"):
         spool.publish(conflict)

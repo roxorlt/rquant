@@ -562,6 +562,7 @@ def test_bad_json_can_be_quarantined_without_bare_dict(tmp_path: Path) -> None:
 def test_owned_entry_isolation_primitive_moves_only_bound_directory_entry(
     tmp_path: Path,
     entry_kind: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     if entry_kind == "fifo" and not hasattr(os, "mkfifo"):
         pytest.skip("FIFO is not supported on this platform")
@@ -582,6 +583,31 @@ def test_owned_entry_isolation_primitive_moves_only_bound_directory_entry(
         if entry_kind == "nonempty_directory":
             (source / "manual.txt").write_text("retain manually", encoding="utf-8")
     observed = source.lstat()
+    real_open = os.open
+    real_close = os.close
+    bound_open_flags: list[int] = []
+    live_bound_descriptors: set[int] = set()
+
+    def audited_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) == (observed.st_dev, observed.st_ino):
+            bound_open_flags.append(flags)
+            live_bound_descriptors.add(descriptor)
+        return descriptor
+
+    def audited_close(descriptor: int) -> None:
+        live_bound_descriptors.discard(descriptor)
+        real_close(descriptor)
+
+    monkeypatch.setattr(lab_job_protocol.os, "open", audited_open)
+    monkeypatch.setattr(lab_job_protocol.os, "close", audited_close)
 
     with pytest.raises(InvalidCommandEnvelopeError) as captured:
         spool.load(source)
@@ -618,6 +644,11 @@ def test_owned_entry_isolation_primitive_moves_only_bound_directory_entry(
     if entry_kind == "nonempty_directory":
         assert (isolated.path / "manual.txt").read_text(encoding="utf-8") == "retain manually"
         assert evidence.manual_retention is True
+    if stat.S_ISREG(observed.st_mode):
+        assert any(flags & os.O_NOFOLLOW and flags & os.O_NONBLOCK for flags in bound_open_flags)
+        assert live_bound_descriptors == set()
+    else:
+        assert bound_open_flags == []
 
     restarted = LabCommandSpool(spool.root)
     reconciled = tuple(restarted.quarantine_dir.glob("owned-entry-*.dead/evidence.json"))
@@ -695,6 +726,7 @@ def test_owned_entry_isolation_startup_rebuilds_corrupt_identity_evidence(
 
 def test_owned_entry_isolation_move_is_atomic_no_clobber_when_destination_appears(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class DestinationInjectingSpool(LabCommandSpool):
         def _before_owned_entry_move(self, _source: Path, container: Path) -> None:
@@ -715,6 +747,29 @@ def test_owned_entry_isolation_move_is_atomic_no_clobber_when_destination_appear
     LabCommandSpool(spool.root, max_isolation_records=1, max_isolation_bytes=1)
     assert source.read_text(encoding="utf-8") == "original"
     assert (containers[0] / "entry").read_text(encoding="utf-8") == "injected"
+
+    swap_spool = LabCommandSpool(tmp_path / "swap-commands")
+    swap_source = swap_spool.pending_dir / f"{uuid4()}.json"
+    swap_source.write_text("original", encoding="utf-8")
+    swap_observed = swap_source.lstat()
+
+    def swap_before_move(_source: Path, _container: Path) -> None:
+        swap_source.unlink()
+        swap_source.write_text("replacement", encoding="utf-8")
+
+    monkeypatch.setattr(swap_spool, "_before_owned_entry_move", swap_before_move)
+
+    with pytest.raises(InvalidCommandEnvelopeError, match="changed before isolation"):
+        swap_spool._isolate_owned_entry_locked(
+            swap_source,
+            swap_observed,
+            reason="path_swap",
+        )
+
+    assert swap_source.read_text(encoding="utf-8") == "replacement"
+    swap_containers = tuple(swap_spool.quarantine_dir.glob("owned-entry-*.dead"))
+    assert len(swap_containers) == 1
+    assert not os.path.lexists(swap_containers[0] / "entry")
 
 
 def test_owned_entry_isolation_concurrent_movers_never_overwrite_an_entry(
