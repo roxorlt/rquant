@@ -1206,6 +1206,21 @@ def test_commit_conflict_restart_recovers_and_prunes_owned_incomplete_bundles(
     }
     assert tuple(restarted.quarantine_dir.glob("*.publishing.tmp")) == ()
 
+    owned_container = restarted.quarantine_dir / f"owned-entry-{uuid4()}.dead"
+    owned_container.mkdir(mode=0o700)
+    owned_temporary = owned_container / f".evidence.json.{uuid4().hex}.tmp"
+    owned_temporary.write_bytes(b"artifact-publisher-crash")
+    owned_temporary.chmod(0o600)
+
+    inherited_recovery = LabArtifactCommitSpool(
+        root,
+        max_conflict_records=2,
+        max_conflict_bytes=1024 * 1024,
+    )
+
+    assert not owned_container.exists()
+    assert len(inherited_recovery.conflict_evidence()) == 2
+
 
 def test_commit_conflict_restart_bounds_truncated_owned_temps_and_allows_republish(
     tmp_path: Path,

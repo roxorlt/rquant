@@ -1053,6 +1053,7 @@ def test_owned_entry_isolation_retention_bounds_complete_and_incomplete_records(
 
 def test_owned_entry_isolation_startup_rebuilds_corrupt_identity_evidence(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = tmp_path / "commands"
     spool = LabCommandSpool(root)
@@ -1107,6 +1108,181 @@ def test_owned_entry_isolation_startup_rebuilds_corrupt_identity_evidence(
 
     assert not empty_unpublished.exists()
     assert unknown_marker.read_text(encoding="utf-8") == "retain"
+
+    crash_root = tmp_path / "crash-commands"
+    crash_container_names = tuple(f"owned-entry-{uuid4()}.dead" for _index in range(3))
+    crash_script = """
+import os
+import sys
+from pathlib import Path
+
+from rquant.lab_job_protocol import LabCommandSpool
+
+spool = LabCommandSpool(Path(sys.argv[1]))
+container = spool.quarantine_dir / sys.argv[2]
+container.mkdir(mode=0o700)
+spool.mutation_guard = lambda: os._exit(73)
+spool._publish_no_clobber(container / "evidence.json", b"crash-evidence")
+raise SystemExit(99)
+"""
+    crashed = subprocess.run(
+        [sys.executable, "-c", crash_script, str(crash_root), crash_container_names[0]],
+        check=False,
+        cwd=Path(__file__).parents[2],
+    )
+    assert crashed.returncode == 73
+    for container_name in crash_container_names[1:]:
+        container = crash_root / "quarantine" / container_name
+        container.mkdir(mode=0o700)
+        temporary = container / f".evidence.json.{uuid4().hex}.tmp"
+        temporary.write_bytes(b"crash-evidence")
+        temporary.chmod(0o600)
+
+    real_open = os.open
+    real_close = os.close
+    live_recovery_descriptors: set[int] = set()
+
+    def tracking_recovery_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+        live_recovery_descriptors.add(descriptor)
+        return descriptor
+
+    def tracking_recovery_close(descriptor: int) -> None:
+        live_recovery_descriptors.discard(descriptor)
+        real_close(descriptor)
+
+    monkeypatch.setattr(lab_job_protocol.os, "open", tracking_recovery_open)
+    monkeypatch.setattr(lab_job_protocol.os, "close", tracking_recovery_close)
+    recovered_crashes = LabCommandSpool(
+        crash_root,
+        max_isolation_records=1,
+        max_isolation_bytes=1,
+    )
+
+    assert tuple(recovered_crashes.quarantine_dir.glob("owned-entry-*.dead")) == ()
+    assert live_recovery_descriptors == set()
+    monkeypatch.setattr(lab_job_protocol.os, "open", real_open)
+    monkeypatch.setattr(lab_job_protocol.os, "close", real_close)
+    retry_source = recovered_crashes.pending_dir / f"{uuid4()}.json"
+    retry_source.write_text("{broken", encoding="utf-8")
+    with pytest.raises(InvalidCommandEnvelopeError) as retry_captured:
+        recovered_crashes.load(retry_source)
+    retry_identity = retry_captured.value.file_identity
+    assert retry_identity is not None
+    retried = recovered_crashes.quarantine(retry_identity, reason="retry_after_crash_cleanup")
+    assert retried.path.read_text(encoding="utf-8") == "{broken"
+
+    prepared_root = tmp_path / "prepared-commands"
+    prepared_spool = LabCommandSpool(prepared_root)
+    prepared_source = prepared_spool.pending_dir / f"{uuid4()}.json"
+    prepared_source.write_text("prepared-source", encoding="utf-8")
+    prepared_observed = prepared_source.lstat()
+    prepared_id = uuid4()
+    prepared_container = prepared_spool.quarantine_dir / f"owned-entry-{prepared_id}.dead"
+    prepared_container.mkdir(mode=0o700)
+    prepared_evidence = lab_job_protocol._LabOwnedEntryIsolationEvidence(
+        isolation_id=prepared_id,
+        source_area="pending",
+        source_name=prepared_source.name,
+        reason="recover linked publication temporary",
+        device=prepared_observed.st_dev,
+        inode=prepared_observed.st_ino,
+        mode=prepared_observed.st_mode,
+        link_count=prepared_observed.st_nlink,
+        file_type="regular",
+        byte_count=prepared_observed.st_size,
+    )
+    prepared_temporary = prepared_container / f".evidence.json.{uuid4().hex}.tmp"
+    prepared_temporary.write_bytes(prepared_evidence.canonical_json_bytes())
+    prepared_temporary.chmod(0o600)
+    prepared_target = prepared_container / "evidence.json"
+    os.link(prepared_temporary, prepared_target)
+
+    LabCommandSpool(prepared_root)
+
+    assert not os.path.lexists(prepared_temporary)
+    assert prepared_target.lstat().st_nlink == 1
+    assert not os.path.lexists(prepared_source)
+    assert (prepared_container / "entry").read_text(encoding="utf-8") == "prepared-source"
+
+    retained_root = tmp_path / "retained-crash-commands"
+    retained_spool = LabCommandSpool(retained_root)
+    malformed_container = retained_spool.quarantine_dir / f"owned-entry-{uuid4()}.dead"
+    malformed_container.mkdir(mode=0o700)
+    malformed_temporary = malformed_container / ".evidence.json.not-a-uuid.tmp"
+    malformed_temporary.write_text("malformed", encoding="utf-8")
+    malformed_temporary.chmod(0o600)
+
+    unrelated_source = retained_spool.pending_dir / f"{uuid4()}.json"
+    unrelated_source.write_text("unrelated-source", encoding="utf-8")
+    unrelated_observed = unrelated_source.lstat()
+    unrelated_id = uuid4()
+    unrelated_container = retained_spool.quarantine_dir / f"owned-entry-{unrelated_id}.dead"
+    unrelated_container.mkdir(mode=0o700)
+    unrelated_evidence = lab_job_protocol._LabOwnedEntryIsolationEvidence(
+        isolation_id=unrelated_id,
+        source_area="pending",
+        source_name=unrelated_source.name,
+        reason="retain unrelated publication temporary",
+        device=unrelated_observed.st_dev,
+        inode=unrelated_observed.st_ino,
+        mode=unrelated_observed.st_mode,
+        link_count=unrelated_observed.st_nlink,
+        file_type="regular",
+        byte_count=unrelated_observed.st_size,
+    )
+    unrelated_target = unrelated_container / "evidence.json"
+    unrelated_target.write_bytes(unrelated_evidence.canonical_json_bytes())
+    unrelated_target.chmod(0o600)
+    unrelated_temporary = unrelated_container / f".evidence.json.{uuid4().hex}.tmp"
+    unrelated_temporary.write_bytes(b"replacement")
+    unrelated_temporary.chmod(0o600)
+
+    fifo_container = retained_spool.quarantine_dir / f"owned-entry-{uuid4()}.dead"
+    fifo_container.mkdir(mode=0o700)
+    fifo_temporary = fifo_container / f".evidence.json.{uuid4().hex}.tmp"
+    os.mkfifo(fifo_temporary, mode=0o600)
+    retained_inodes = {
+        malformed_temporary: malformed_temporary.lstat().st_ino,
+        unrelated_target: unrelated_target.lstat().st_ino,
+        unrelated_temporary: unrelated_temporary.lstat().st_ino,
+        fifo_temporary: fifo_temporary.lstat().st_ino,
+    }
+
+    LabCommandSpool(retained_root)
+
+    assert unrelated_source.read_text(encoding="utf-8") == "unrelated-source"
+    assert all(path.lstat().st_ino == inode for path, inode in retained_inodes.items())
+
+    swap_root = tmp_path / "cleanup-swap-commands"
+    swap_spool = LabCommandSpool(swap_root)
+    swap_container = swap_spool.quarantine_dir / f"owned-entry-{uuid4()}.dead"
+    swap_container.mkdir(mode=0o700)
+    swap_temporary = swap_container / f".evidence.json.{uuid4().hex}.tmp"
+    swap_temporary.write_text("original-temporary", encoding="utf-8")
+    swap_temporary.chmod(0o600)
+    replacement_inode: int | None = None
+
+    def replace_publication_temporary() -> None:
+        nonlocal replacement_inode
+        swap_temporary.unlink()
+        swap_temporary.write_text("replacement-temporary", encoding="utf-8")
+        swap_temporary.chmod(0o600)
+        replacement_inode = swap_temporary.lstat().st_ino
+
+    monkeypatch.setattr(swap_spool, "mutation_guard", replace_publication_temporary)
+
+    swap_spool._reconcile_owned_isolation_container_locked(swap_container)
+
+    assert replacement_inode is not None
+    assert swap_temporary.lstat().st_ino == replacement_inode
+    assert swap_temporary.read_text(encoding="utf-8") == "replacement-temporary"
 
 
 def test_owned_entry_isolation_move_is_atomic_no_clobber_when_destination_appears(

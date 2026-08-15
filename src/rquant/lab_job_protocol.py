@@ -310,6 +310,11 @@ class LabCommandSpool:
         r"m(?P<mode>[0-9a-f]+)-n(?P<link_count>[1-9][0-9]*)-"
         r"s(?P<byte_count>[0-9]+)-h(?P<content_hash>[0-9a-f]{64}|unread)\.raw"
     )
+    _OWNED_EVIDENCE_PUBLICATION_TEMP_NAME = re.compile(
+        r"\.evidence\.json\.(?P<publication_id>[0-9a-f]{32})\.tmp"
+    )
+    _OWNED_EVIDENCE_PUBLICATION_TEMP_PREFIX = ".evidence.json."
+    _OWNED_EVIDENCE_MAX_BYTES = 1024 * 1024
 
     def __init__(
         self,
@@ -1403,6 +1408,316 @@ class LabCommandSpool:
         return evidence
 
     @classmethod
+    def _owned_evidence_publication_stat_is_valid(
+        cls,
+        observed: os.stat_result,
+        *,
+        link_count: int,
+    ) -> bool:
+        return (
+            stat.S_ISREG(observed.st_mode)
+            and stat.S_IMODE(observed.st_mode) == 0o600
+            and observed.st_uid == os.getuid()
+            and observed.st_nlink == link_count
+            and 0 <= observed.st_size <= cls._OWNED_EVIDENCE_MAX_BYTES
+        )
+
+    @classmethod
+    def _same_owned_evidence_publication_stat(
+        cls,
+        left: os.stat_result,
+        right: os.stat_result,
+        *,
+        link_count: int,
+    ) -> bool:
+        return (
+            cls._owned_evidence_publication_stat_is_valid(
+                left,
+                link_count=link_count,
+            )
+            and cls._owned_evidence_publication_stat_is_valid(
+                right,
+                link_count=link_count,
+            )
+            and (
+                left.st_dev,
+                left.st_ino,
+                left.st_mode,
+                left.st_uid,
+                left.st_nlink,
+                left.st_size,
+            )
+            == (
+                right.st_dev,
+                right.st_ino,
+                right.st_mode,
+                right.st_uid,
+                right.st_nlink,
+                right.st_size,
+            )
+        )
+
+    def _open_owned_evidence_publication_child(
+        self,
+        container_fd: int,
+        name: str,
+        *,
+        link_count: int,
+    ) -> tuple[int, os.stat_result]:
+        descriptor = -1
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            observed = os.stat(name, dir_fd=container_fd, follow_symlinks=False)
+            if not self._owned_evidence_publication_stat_is_valid(
+                observed,
+                link_count=link_count,
+            ):
+                raise InvalidCommandEnvelopeError(
+                    f"unsafe owned evidence publication temporary: {name}"
+                )
+            descriptor = os.open(name, flags, dir_fd=container_fd)
+            opened = os.fstat(descriptor)
+            active = os.stat(name, dir_fd=container_fd, follow_symlinks=False)
+            if not self._same_owned_evidence_publication_stat(
+                observed,
+                opened,
+                link_count=link_count,
+            ) or not self._same_owned_evidence_publication_stat(
+                opened,
+                active,
+                link_count=link_count,
+            ):
+                raise InvalidCommandEnvelopeError(
+                    f"owned evidence publication temporary changed: {name}"
+                )
+            return descriptor, opened
+        except BaseException:
+            if descriptor >= 0:
+                os.close(descriptor)
+            raise
+
+    @classmethod
+    def _read_owned_evidence_publication_descriptor(
+        cls,
+        descriptor: int,
+        observed: os.stat_result,
+        *,
+        link_count: int,
+    ) -> bytes:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        remaining = observed.st_size
+        chunks: list[bytes] = []
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 64 * 1024))
+            if not chunk:
+                raise InvalidCommandEnvelopeError("owned evidence publication target was truncated")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise InvalidCommandEnvelopeError(
+                "owned evidence publication target exceeded its observed size"
+            )
+        after = os.fstat(descriptor)
+        if not cls._same_owned_evidence_publication_stat(
+            observed,
+            after,
+            link_count=link_count,
+        ):
+            raise InvalidCommandEnvelopeError(
+                "owned evidence publication target changed while reading"
+            )
+        return b"".join(chunks)
+
+    def _validate_linked_owned_evidence_publication(
+        self,
+        container: Path,
+        isolation_match: re.Match[str],
+        evidence_descriptor: int,
+        evidence_stat: os.stat_result,
+    ) -> None:
+        payload = self._read_owned_evidence_publication_descriptor(
+            evidence_descriptor,
+            evidence_stat,
+            link_count=2,
+        )
+        evidence = strict_model_validate_canonical_json(
+            _LabOwnedEntryIsolationEvidence,
+            payload,
+        )
+        if str(evidence.isolation_id) != isolation_match["isolation_id"]:
+            raise InvalidCommandEnvelopeError(
+                f"owned isolation evidence id mismatch: {container.name}"
+            )
+        source = self._owned_source_path(evidence)
+        if source is None or source.name != evidence.source_name:
+            raise InvalidCommandEnvelopeError(
+                f"owned isolation source basename mismatch: {container.name}"
+            )
+        source_stat = self._managed_entry_stat(source, source.parent)
+        if not self._stat_matches_isolation(source_stat, evidence):
+            raise InvalidCommandEnvelopeError(
+                f"owned isolation source identity mismatch: {container.name}"
+            )
+        if (
+            evidence.link_target is not None
+            and self._managed_link_target(source, source.parent) != evidence.link_target
+        ):
+            raise InvalidCommandEnvelopeError(
+                f"owned isolation source link target mismatch: {container.name}"
+            )
+
+    def _unlink_bound_owned_evidence_publication_temporary_locked(
+        self,
+        container_fd: int,
+        temporary_name: str,
+        temporary_descriptor: int,
+        temporary_stat: os.stat_result,
+        *,
+        evidence_descriptor: int | None = None,
+        evidence_stat: os.stat_result | None = None,
+    ) -> bool:
+        link_count = 2 if evidence_descriptor is not None else 1
+        self._guard_mutation()
+        try:
+            anchored_temporary = os.fstat(temporary_descriptor)
+            active_temporary = os.stat(
+                temporary_name,
+                dir_fd=container_fd,
+                follow_symlinks=False,
+            )
+            if not self._same_owned_evidence_publication_stat(
+                temporary_stat,
+                anchored_temporary,
+                link_count=link_count,
+            ) or not self._same_owned_evidence_publication_stat(
+                anchored_temporary,
+                active_temporary,
+                link_count=link_count,
+            ):
+                return False
+            if evidence_descriptor is not None:
+                if evidence_stat is None:
+                    return False
+                anchored_evidence = os.fstat(evidence_descriptor)
+                active_evidence = os.stat(
+                    "evidence.json",
+                    dir_fd=container_fd,
+                    follow_symlinks=False,
+                )
+                if not self._same_owned_evidence_publication_stat(
+                    evidence_stat,
+                    anchored_evidence,
+                    link_count=2,
+                ) or not self._same_owned_evidence_publication_stat(
+                    anchored_evidence,
+                    active_evidence,
+                    link_count=2,
+                ):
+                    return False
+                if not self._same_owned_evidence_publication_stat(
+                    anchored_temporary,
+                    anchored_evidence,
+                    link_count=2,
+                ):
+                    return False
+            os.unlink(temporary_name, dir_fd=container_fd)
+            os.fsync(container_fd)
+            return True
+        except OSError:
+            return False
+
+    def _reconcile_owned_evidence_publication_temporary_locked(
+        self,
+        container: Path,
+        isolation_match: re.Match[str],
+    ) -> Literal["continue", "remove_empty", "stop"]:
+        container_fd = self._open_managed_directory(container)
+        temporary_descriptor = -1
+        evidence_descriptor = -1
+        try:
+            names = frozenset(os.listdir(container_fd))
+            publication_names = tuple(
+                name
+                for name in names
+                if name.startswith(self._OWNED_EVIDENCE_PUBLICATION_TEMP_PREFIX)
+            )
+            if not publication_names:
+                return "continue"
+            if len(publication_names) != 1:
+                return "stop"
+            temporary_name = publication_names[0]
+            temporary_match = self._OWNED_EVIDENCE_PUBLICATION_TEMP_NAME.fullmatch(temporary_name)
+            if temporary_match is None or Path(temporary_name).name != temporary_name:
+                return "stop"
+            publication_id = UUID(hex=temporary_match["publication_id"])
+            if (
+                publication_id.version != 4
+                or publication_id.hex != temporary_match["publication_id"]
+            ):
+                return "stop"
+            if names == {temporary_name}:
+                temporary_descriptor, temporary_stat = self._open_owned_evidence_publication_child(
+                    container_fd,
+                    temporary_name,
+                    link_count=1,
+                )
+                if self._unlink_bound_owned_evidence_publication_temporary_locked(
+                    container_fd,
+                    temporary_name,
+                    temporary_descriptor,
+                    temporary_stat,
+                ):
+                    return "remove_empty"
+                return "stop"
+            if names != {temporary_name, "evidence.json"}:
+                return "stop"
+            temporary_descriptor, temporary_stat = self._open_owned_evidence_publication_child(
+                container_fd,
+                temporary_name,
+                link_count=2,
+            )
+            evidence_descriptor, evidence_stat = self._open_owned_evidence_publication_child(
+                container_fd,
+                "evidence.json",
+                link_count=2,
+            )
+            if not self._same_owned_evidence_publication_stat(
+                temporary_stat,
+                evidence_stat,
+                link_count=2,
+            ):
+                return "stop"
+            self._validate_linked_owned_evidence_publication(
+                container,
+                isolation_match,
+                evidence_descriptor,
+                evidence_stat,
+            )
+            if self._unlink_bound_owned_evidence_publication_temporary_locked(
+                container_fd,
+                temporary_name,
+                temporary_descriptor,
+                temporary_stat,
+                evidence_descriptor=evidence_descriptor,
+                evidence_stat=evidence_stat,
+            ):
+                return "continue"
+            return "stop"
+        except (InvalidCommandEnvelopeError, OSError, ValueError):
+            return "stop"
+        finally:
+            if evidence_descriptor >= 0:
+                os.close(evidence_descriptor)
+            if temporary_descriptor >= 0:
+                os.close(temporary_descriptor)
+            os.close(container_fd)
+
+    @classmethod
     def _invalid_evidence_name(
         cls,
         observed: os.stat_result,
@@ -1515,6 +1830,15 @@ class LabCommandSpool:
                 container_stat,
                 reason="owned isolation namespace occupied by a non-directory entry",
             )
+            return
+        publication_result = self._reconcile_owned_evidence_publication_temporary_locked(
+            container,
+            match,
+        )
+        if publication_result == "stop":
+            return
+        if publication_result == "remove_empty":
+            self._discard_empty_unpublished_isolation_container_locked(container)
             return
         entry = container / "entry"
         try:
