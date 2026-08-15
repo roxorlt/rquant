@@ -38,6 +38,19 @@ _LabSpoolFileType = Literal[
     "other",
 ]
 
+_OwnedIsolationLifecycleState = Literal[
+    "SOURCE_OBSERVED",
+    "SOURCE_BOUND",
+    "CREATED_UNBOUND",
+    "CONTAINER_BOUND",
+    "CONTAINER_DURABLE",
+    "EVIDENCE_PUBLISHING",
+    "PREPARED",
+    "MOVE_UNCERTAIN",
+    "MOVED_DURABLE",
+    "COMPLETE",
+]
+
 
 @dataclass(frozen=True)
 class _ManagedDirectoryIdentity:
@@ -1179,21 +1192,39 @@ class LabCommandSpool:
                 self._remove_owned_isolation_record_locked(record)
                 return
 
-    def _discard_unpublished_isolation_container_locked(
+    def _discard_created_unbound_isolation_container_locked(
+        self,
+        quarantine_fd: int,
+        container: Path,
+    ) -> None:
+        try:
+            self._guard_mutation()
+            os.rmdir(container.name, dir_fd=quarantine_fd)
+        except OSError:
+            pass
+        with suppress(OSError):
+            os.fsync(quarantine_fd)
+
+    def _discard_bound_empty_isolation_container_locked(
         self,
         quarantine_fd: int,
         container_fd: int,
         container: Path,
-        observed: os.stat_result,
     ) -> None:
-        anchored = os.fstat(container_fd)
-        if not self._stat_matches_bound_entry(anchored, observed):
-            return
-        self._remove_bound_directory_entry(
-            quarantine_fd,
-            container.name,
-            observed,
-        )
+        try:
+            anchored = os.fstat(container_fd)
+            active = os.stat(
+                container.name,
+                dir_fd=quarantine_fd,
+                follow_symlinks=False,
+            )
+            if self._stat_matches_bound_entry(anchored, active):
+                self._guard_mutation()
+                os.rmdir(container.name, dir_fd=quarantine_fd)
+        except OSError:
+            pass
+        with suppress(OSError):
+            os.fsync(quarantine_fd)
 
     def _isolate_owned_entry_locked(
         self,
@@ -1215,22 +1246,34 @@ class LabCommandSpool:
                 os.close(source_fd)
         isolation_id = uuid4()
         container = self.quarantine_dir / f"owned-entry-{isolation_id}.dead"
+        lifecycle_state: _OwnedIsolationLifecycleState = "SOURCE_OBSERVED"
         bound_regular_descriptor = (
             self._open_bound_regular_entry(source, observed)
             if stat.S_ISREG(observed.st_mode)
             else None
         )
+        lifecycle_state = "SOURCE_BOUND"
         quarantine_fd = -1
         container_fd = -1
-        created_container_stat: os.stat_result | None = None
-        evidence_publication_started = False
         try:
             quarantine_fd = self._open_managed_directory(self.quarantine_dir)
             self._guard_mutation()
             os.mkdir(container.name, mode=0o700, dir_fd=quarantine_fd)
+            lifecycle_state = "CREATED_UNBOUND"
             container_fd = self._open_managed_directory(container)
-            created_container_stat = os.fstat(container_fd)
+            anchored_container = os.fstat(container_fd)
+            active_container = os.stat(
+                container.name,
+                dir_fd=quarantine_fd,
+                follow_symlinks=False,
+            )
+            if not self._stat_matches_bound_entry(anchored_container, active_container):
+                raise InvalidCommandEnvelopeError(
+                    f"owned isolation container identity changed: {container.name}"
+                )
+            lifecycle_state = "CONTAINER_BOUND"
             os.fsync(quarantine_fd)
+            lifecycle_state = "CONTAINER_DURABLE"
             evidence = _LabOwnedEntryIsolationEvidence(
                 isolation_id=isolation_id,
                 source_area=source_area,
@@ -1246,16 +1289,17 @@ class LabCommandSpool:
                 manual_retention=file_type == "directory",
             )
             evidence_path = container / "evidence.json"
-            evidence_publication_started = True
+            lifecycle_state = "EVIDENCE_PUBLISHING"
+            if not self._publish_no_clobber(
+                evidence_path,
+                evidence.canonical_json_bytes(),
+            ):
+                raise RequestContentConflictError(
+                    f"owned isolation evidence already exists: {container.name}"
+                )
+            self._fsync_directory(self.quarantine_dir)
+            lifecycle_state = "PREPARED"
             try:
-                if not self._publish_no_clobber(
-                    evidence_path,
-                    evidence.canonical_json_bytes(),
-                ):
-                    raise RequestContentConflictError(
-                        f"owned isolation evidence already exists: {container.name}"
-                    )
-                self._fsync_directory(self.quarantine_dir)
                 self._after_owned_entry_isolation_stage("evidence_written", source, container)
                 if stat.S_ISREG(observed.st_mode) and observed.st_nlink != 1:
                     self._after_hardlink_quarantine_evidence(
@@ -1267,6 +1311,7 @@ class LabCommandSpool:
                         ),
                         evidence_path,
                     )
+                lifecycle_state = "MOVE_UNCERTAIN"
                 destination = self._move_bound_entry_into_container_locked(
                     source,
                     container,
@@ -1274,7 +1319,9 @@ class LabCommandSpool:
                     expected_link_target=expected_link_target,
                     bound_regular_descriptor=bound_regular_descriptor,
                 )
+                lifecycle_state = "MOVED_DURABLE"
                 self._after_owned_entry_isolation_stage("entry_moved", source, container)
+                lifecycle_state = "COMPLETE"
                 return LabQuarantinedCommand(path=destination, reason=reason)
             except InterruptedError:
                 with suppress(OSError, InvalidCommandEnvelopeError, ValueError):
@@ -1292,18 +1339,27 @@ class LabCommandSpool:
                 raise
         except BaseException:
             if (
-                created_container_stat is not None
-                and not evidence_publication_started
+                lifecycle_state
+                in {
+                    "CREATED_UNBOUND",
+                    "CONTAINER_BOUND",
+                    "CONTAINER_DURABLE",
+                    "EVIDENCE_PUBLISHING",
+                }
                 and quarantine_fd >= 0
-                and container_fd >= 0
             ):
-                with suppress(OSError, InvalidCommandEnvelopeError):
-                    self._discard_unpublished_isolation_container_locked(
-                        quarantine_fd,
-                        container_fd,
-                        container,
-                        created_container_stat,
-                    )
+                with suppress(OSError, InvalidCommandEnvelopeError, ValueError):
+                    if container_fd >= 0:
+                        self._discard_bound_empty_isolation_container_locked(
+                            quarantine_fd,
+                            container_fd,
+                            container,
+                        )
+                    else:
+                        self._discard_created_unbound_isolation_container_locked(
+                            quarantine_fd,
+                            container,
+                        )
             raise
         finally:
             if container_fd >= 0:
@@ -1422,6 +1478,26 @@ class LabCommandSpool:
             )
         return evidence
 
+    def _discard_empty_unpublished_isolation_container_locked(
+        self,
+        container: Path,
+    ) -> None:
+        quarantine_fd = self._open_managed_directory(self.quarantine_dir)
+        container_fd = -1
+        try:
+            container_fd = self._open_managed_directory(container)
+            if os.listdir(container_fd):
+                return
+            self._discard_bound_empty_isolation_container_locked(
+                quarantine_fd,
+                container_fd,
+                container,
+            )
+        finally:
+            if container_fd >= 0:
+                os.close(container_fd)
+            os.close(quarantine_fd)
+
     def _reconcile_owned_isolation_container_locked(self, container: Path) -> None:
         match = self._OWNED_ISOLATION_NAME.fullmatch(container.name)
         if match is None:
@@ -1446,6 +1522,7 @@ class LabCommandSpool:
             evidence = self._load_owned_isolation_evidence(container)
         except (InvalidCommandEnvelopeError, ValueError):
             if entry_stat is None:
+                self._discard_empty_unpublished_isolation_container_locked(container)
                 return
             evidence_path = container / "evidence.json"
             invalid_evidence: _LabOwnedInvalidEvidenceIdentity | None = None

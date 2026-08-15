@@ -676,6 +676,7 @@ def test_owned_entry_isolation_retention_bounds_complete_and_incomplete_records(
     real_close = os.close
     real_dup = os.dup
     real_fsync = os.fsync
+    real_link = os.link
     real_mkdir = os.mkdir
     live_descriptors: set[int] = set()
     bound_open_attempts = 0
@@ -777,6 +778,157 @@ def test_owned_entry_isolation_retention_bounds_complete_and_incomplete_records(
     assert tuple(failure_spool.quarantine_dir.iterdir()) == ()
     assert_failure_source_unchanged()
 
+    container_open_attempts = 0
+
+    def failing_owned_container_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal container_open_attempts
+        if str(path).startswith("owned-entry-") and flags & getattr(os, "O_DIRECTORY", 0):
+            container_open_attempts += 1
+            raise OSError(errno.EIO, "forced owned container open failure", path)
+        descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+        live_descriptors.add(descriptor)
+        return descriptor
+
+    monkeypatch.setattr(lab_job_protocol.os, "open", failing_owned_container_open)
+    monkeypatch.setattr(lab_job_protocol.os, "mkdir", real_mkdir)
+
+    for _attempt in range(3):
+        with pytest.raises(InvalidCommandEnvelopeError, match="identity changed"):
+            failure_spool._isolate_owned_entry_locked(
+                failure_source,
+                failure_observed,
+                reason="forced_container_open_failure",
+            )
+        assert tuple(failure_spool.quarantine_dir.iterdir()) == ()
+        assert_failure_source_unchanged()
+        assert live_descriptors == set()
+
+    assert container_open_attempts == 3
+
+    monkeypatch.setattr(lab_job_protocol.os, "open", tracking_open)
+
+    def failing_evidence_link(
+        source: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        target: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        **kwargs: object,
+    ) -> None:
+        if str(target) == "evidence.json":
+            raise OSError(errno.EIO, "forced pre-link evidence publication failure")
+        real_link(source, target, **kwargs)
+
+    monkeypatch.setattr(lab_job_protocol.os, "link", failing_evidence_link)
+
+    with pytest.raises(OSError, match="forced pre-link evidence publication failure"):
+        failure_spool._isolate_owned_entry_locked(
+            failure_source,
+            failure_observed,
+            reason="forced_pre_link_publication_failure",
+        )
+    assert tuple(failure_spool.quarantine_dir.iterdir()) == ()
+    assert_failure_source_unchanged()
+    assert live_descriptors == set()
+
+    published_spool = LabCommandSpool(tmp_path / "visible-evidence-commands")
+    published_source = published_spool.pending_dir / f"{uuid4()}.json"
+    published_source.write_text("published-source", encoding="utf-8")
+    published_observed = published_source.lstat()
+    evidence_visible = False
+
+    def tracking_evidence_link(
+        source: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        target: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        **kwargs: object,
+    ) -> None:
+        nonlocal evidence_visible
+        real_link(source, target, **kwargs)
+        if str(target) == "evidence.json":
+            evidence_visible = True
+
+    def failing_visible_evidence_fsync(descriptor: int) -> None:
+        nonlocal evidence_visible
+        if evidence_visible:
+            evidence_visible = False
+            raise OSError(errno.EIO, "forced visible evidence fsync failure")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(lab_job_protocol.os, "link", tracking_evidence_link)
+    monkeypatch.setattr(lab_job_protocol.os, "fsync", failing_visible_evidence_fsync)
+
+    with pytest.raises(OSError, match="forced visible evidence fsync failure"):
+        published_spool._isolate_owned_entry_locked(
+            published_source,
+            published_observed,
+            reason="forced_visible_evidence_fsync_failure",
+        )
+    published_containers = tuple(published_spool.quarantine_dir.glob("owned-entry-*.dead"))
+    assert len(published_containers) == 1
+    assert (published_containers[0] / "evidence.json").is_file()
+    assert not (published_containers[0] / "entry").exists()
+    assert published_source.read_text(encoding="utf-8") == "published-source"
+    assert live_descriptors == set()
+
+    monkeypatch.setattr(lab_job_protocol.os, "link", real_link)
+    monkeypatch.setattr(lab_job_protocol.os, "fsync", real_fsync)
+
+    recovered_published = LabCommandSpool(published_spool.root)
+    assert not published_source.exists()
+    assert (published_containers[0] / "entry").read_text(encoding="utf-8") == ("published-source")
+    assert recovered_published.pending() == ()
+
+    replacement_spool = LabCommandSpool(tmp_path / "replacement-container-commands")
+    replacement_source = replacement_spool.pending_dir / f"{uuid4()}.json"
+    replacement_source.write_text("replacement-source", encoding="utf-8")
+    replacement_observed = replacement_source.lstat()
+    replacement_container: Path | None = None
+    replacement_identity: tuple[int, int] | None = None
+    replace_on_fsync = False
+
+    def replacing_container_mkdir(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        nonlocal replacement_container, replace_on_fsync
+        real_mkdir(path, mode, dir_fd=dir_fd)
+        if str(path).startswith("owned-entry-"):
+            replacement_container = replacement_spool.quarantine_dir / str(path)
+            replace_on_fsync = True
+
+    def replace_then_fail_fsync(descriptor: int) -> None:
+        nonlocal replace_on_fsync, replacement_identity
+        if replace_on_fsync:
+            replace_on_fsync = False
+            assert replacement_container is not None
+            os.rmdir(replacement_container)
+            real_mkdir(replacement_container, 0o700)
+            replacement_stat = replacement_container.lstat()
+            replacement_identity = (replacement_stat.st_dev, replacement_stat.st_ino)
+            raise OSError(errno.EIO, "forced bound container replacement")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(lab_job_protocol.os, "mkdir", replacing_container_mkdir)
+    monkeypatch.setattr(lab_job_protocol.os, "fsync", replace_then_fail_fsync)
+
+    with pytest.raises(OSError, match="forced bound container replacement"):
+        replacement_spool._isolate_owned_entry_locked(
+            replacement_source,
+            replacement_observed,
+            reason="forced_bound_container_replacement",
+        )
+    assert replacement_container is not None
+    replacement_after = replacement_container.lstat()
+    assert (replacement_after.st_dev, replacement_after.st_ino) == replacement_identity
+    assert tuple(replacement_container.iterdir()) == ()
+    assert replacement_source.read_text(encoding="utf-8") == "replacement-source"
+    assert live_descriptors == set()
+
     awaiting_container_fsync = False
     failed_container_fsyncs = 0
 
@@ -865,6 +1017,7 @@ def test_owned_entry_isolation_retention_bounds_complete_and_incomplete_records(
     monkeypatch.setattr(lab_job_protocol.os, "close", real_close)
     monkeypatch.setattr(lab_job_protocol.os, "dup", real_dup)
     monkeypatch.setattr(lab_job_protocol.os, "fsync", real_fsync)
+    monkeypatch.setattr(lab_job_protocol.os, "link", real_link)
     monkeypatch.setattr(lab_job_protocol.os, "mkdir", real_mkdir)
 
     retried = failure_spool._isolate_owned_entry_locked(
@@ -942,6 +1095,18 @@ def test_owned_entry_isolation_startup_rebuilds_corrupt_identity_evidence(
         rebuilt.invalid_evidence.link_count,
     ) == (raw_stat.st_dev, raw_stat.st_ino, raw_stat.st_mode, raw_stat.st_nlink)
     assert restarted.pending() == ()
+
+    empty_unpublished = spool.quarantine_dir / f"owned-entry-{uuid4()}.dead"
+    empty_unpublished.mkdir(mode=0o700)
+    unknown_nonempty = spool.quarantine_dir / f"owned-entry-{uuid4()}.dead"
+    unknown_nonempty.mkdir(mode=0o700)
+    unknown_marker = unknown_nonempty / "unknown-content"
+    unknown_marker.write_text("retain", encoding="utf-8")
+
+    LabCommandSpool(root)
+
+    assert not empty_unpublished.exists()
+    assert unknown_marker.read_text(encoding="utf-8") == "retain"
 
 
 def test_owned_entry_isolation_move_is_atomic_no_clobber_when_destination_appears(
