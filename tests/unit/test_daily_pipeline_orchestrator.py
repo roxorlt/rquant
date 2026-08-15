@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import sys
 import time
 from collections.abc import Callable
+from contextlib import suppress
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -195,9 +197,24 @@ class ProcessAdapter:
         self.command_calls += 1
         child_body = "time.sleep(60)"
         if self._spawn_descendant:
+            descendant_marker = self.marker.with_suffix(".descendant")
+            descendant_body = (
+                "from pathlib import Path; import os, time; "
+                f"target = Path({str(descendant_marker)!r}); "
+                "pending = target.with_name(target.name + '.tmp'); "
+                "pending.write_text("
+                "str(os.getpid()) + ':' + str(os.getpgrp())); "
+                "os.replace(pending, target); "
+                "time.sleep(60)"
+            )
             child_body = (
-                "subprocess.Popen((sys.executable, '-c', 'import time; time.sleep(60)')); "
-                "time.sleep(0.02)"
+                f"descendant_marker = Path({str(descendant_marker)!r}); "
+                f"subprocess.Popen((sys.executable, '-c', {descendant_body!r})); "
+                "deadline = time.monotonic() + 1.0; "
+                'exec("while not descendant_marker.exists():\\n'
+                "    if time.monotonic() >= deadline:\\n"
+                "        raise TimeoutError('descendant pid marker missing')\\n"
+                '    time.sleep(0.001)")'
             )
         return DailyStageProcessSpec(
             argv=(
@@ -269,25 +286,48 @@ def _assert_running_without_terminal_mutation(orchestrator, run_id: str) -> None
     assert orchestrator.ledger.run(run_id).state is DailyRunState.RUNNING
 
 
+def _process_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
 def test_spawn_boundary_lease_loss_does_not_run_command_or_fail_stage(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     adapter = ProcessAdapter(tmp_path / "child-pid")
     orchestrator = _process_orchestrator(tmp_path, adapter)
     run = _create_process_run(orchestrator)
+    lease_loss = LeaseLost("writer lease is stale")
+    adapter_error = RuntimeError("adapter failed during authority loss")
+    authority_group = ExceptionGroup(
+        "heartbeat authority loss",
+        [lease_loss, adapter_error],
+    )
+
+    def lose_authority_as_group(_lease, _attempt):
+        raise authority_group
 
     with monkeypatch.context() as lease_loss_patch:
         lease_loss_patch.setattr(
             orchestrator,
             "_heartbeat",
-            lambda _lease, _attempt: (_ for _ in ()).throw(LeaseLost("writer lease is stale")),
+            lose_authority_as_group,
         )
 
-        with pytest.raises(LeaseLost, match="writer lease"):
+        with pytest.raises(ExceptionGroup, match="heartbeat authority loss") as raised:
             orchestrator.advance(run.run_id, now=NOW)
 
+    assert raised.value is authority_group
+    assert raised.value.exceptions == (lease_loss, adapter_error)
     assert adapter.command_calls == 0
     _assert_running_without_terminal_mutation(orchestrator, run.run_id)
+    _assert_exception_group_without_lease_loss_is_adapter_failure(
+        tmp_path / "ordinary-exception-group",
+        monkeypatch,
+    )
     _assert_injected_monotonic_clock_caps_heartbeat_wait_and_enforces_deadline(
         tmp_path / "monotonic-clock",
         monkeypatch,
@@ -381,6 +421,8 @@ def test_normal_leader_exit_cleans_descendants_before_reporting_child_failure(
     run = _create_process_run(orchestrator)
     started_processes: list[subprocess.Popen[bytes]] = []
     real_popen = subprocess.Popen
+    descendant_marker = adapter.marker.with_suffix(".descendant")
+    descendant_pid: int | None = None
 
     def capture_popen(*args, **kwargs):
         process = real_popen(*args, **kwargs)
@@ -389,13 +431,63 @@ def test_normal_leader_exit_cleans_descendants_before_reporting_child_failure(
 
     monkeypatch.setattr(orchestrator_module.subprocess, "Popen", capture_popen)
 
-    outcome = orchestrator.advance(run.run_id, now=NOW)
+    try:
+        outcome = orchestrator.advance(run.run_id, now=NOW)
 
+        assert outcome is not None
+        assert outcome.disposition == "retry_wait"
+        assert len(started_processes) == 1
+        descendant_pid_text, descendant_pgid_text = descendant_marker.read_text().split(":")
+        descendant_pid = int(descendant_pid_text)
+        descendant_pgid = int(descendant_pgid_text)
+        leader = started_processes[0]
+        assert descendant_pgid == leader.pid
+        assert leader.poll() is not None
+        assert not _process_exists(descendant_pid)
+        with pytest.raises(ProcessLookupError):
+            os.killpg(leader.pid, 0)
+    finally:
+        for process in started_processes:
+            if process.poll() is None:
+                with suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGKILL)
+            with suppress(subprocess.TimeoutExpired):
+                process.wait(timeout=1.0)
+        if descendant_pid is None and descendant_marker.exists():
+            descendant_pid = int(descendant_marker.read_text().split(":", maxsplit=1)[0])
+        if descendant_pid is not None and _process_exists(descendant_pid):
+            with suppress(ProcessLookupError):
+                os.kill(descendant_pid, signal.SIGKILL)
+
+
+def _assert_exception_group_without_lease_loss_is_adapter_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tmp_path.mkdir()
+    adapter = ProcessAdapter(tmp_path / "child-pid")
+    orchestrator = _process_orchestrator(tmp_path, adapter)
+    run = _create_process_run(orchestrator)
+    ordinary_group = ExceptionGroup(
+        "ordinary adapter errors",
+        [RuntimeError("first"), ValueError("second")],
+    )
+
+    def raise_ordinary_group(_lease, _attempt):
+        raise ordinary_group
+
+    with monkeypatch.context() as ordinary_group_patch:
+        ordinary_group_patch.setattr(orchestrator, "_heartbeat", raise_ordinary_group)
+        outcome = orchestrator.advance(run.run_id, now=NOW)
+
+    stage = orchestrator.ledger.stage(run.run_id, "capture")
     assert outcome is not None
     assert outcome.disposition == "retry_wait"
-    assert len(started_processes) == 1
-    with pytest.raises(ProcessLookupError):
-        os.killpg(started_processes[0].pid, 0)
+    assert outcome.failure_code == "adapter_exception"
+    assert stage.state is DailyStageState.RETRY_WAIT
+    assert stage.terminal_receipt_id is None
+    assert stage.last_failure is not None
+    assert stage.last_failure.error_code == "adapter_exception"
 
 
 def _assert_injected_monotonic_clock_caps_heartbeat_wait_and_enforces_deadline(

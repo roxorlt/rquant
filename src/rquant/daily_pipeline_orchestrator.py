@@ -47,6 +47,14 @@ _MAX_SUBPROCESS_OUTPUT_BYTES = 64 * 1024
 _HEARTBEAT_INTERVAL_SECONDS = 2.0
 
 
+def _contains_lease_loss(error: BaseException) -> bool:
+    if isinstance(error, LeaseLost):
+        return True
+    if isinstance(error, BaseExceptionGroup):
+        return any(_contains_lease_loss(nested) for nested in error.exceptions)
+    return False
+
+
 class DailyPipelineOrchestratorError(RuntimeError):
     """The DAG cannot safely continue from its durable state."""
 
@@ -594,6 +602,8 @@ class DailyPipelineOrchestrator:
                 dependency_receipts=dependency_receipts,
             )
         except Exception as exc:
+            if _contains_lease_loss(exc):
+                raise
             return self._fail(
                 lease,
                 attempt,
