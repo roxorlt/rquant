@@ -10,7 +10,9 @@ import os
 import random
 import shutil
 import signal
+import socket
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -1727,6 +1729,7 @@ def test_recv_wire_rejects_malformed_and_oversize_send_bytes(payload: bytes) -> 
 
 def test_result_wire_outbound_gate_matches_parent_receive_limit_without_large_allocation(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     import rquant.lab_worker as lab_worker
     from rquant.strategy_job_adapters import MAX_RESULT_WIRE_BYTES
@@ -1763,6 +1766,157 @@ def test_result_wire_outbound_gate_matches_parent_receive_limit_without_large_al
             label="test outbound",
         )
     assert not connection.sent
+    first = lab_worker._new_wire_session(roots=(Path("/private/tmp"),))
+    second = lab_worker._new_wire_session(roots=(Path("/private/tmp"),))
+    accepted: list[object] = []
+
+    def accept_once() -> None:
+        accepted_connection = first.listener.accept()
+        accepted.append(accepted_connection)
+        accepted_connection.close()
+
+    thread = threading.Thread(target=accept_once)
+    thread.start()
+    authenticated_connection = lab_worker.Client(
+        first.address,
+        family="AF_UNIX",
+        authkey=first.authkey,
+    )
+    authenticated_connection.close()
+    thread.join(timeout=1)
+    try:
+        assert not thread.is_alive()
+        assert len(accepted) == 1
+        assert first.address != second.address
+        assert first.path.name.startswith("rqlw-")
+        assert first.path.name.removeprefix("rqlw-").isalnum()
+        assert first.endpoint.name == "wire.sock"
+        directory = first.path.lstat()
+        endpoint = first.endpoint.lstat()
+        directory_fd = os.fstat(first.session_fd)
+        assert stat.S_ISDIR(directory.st_mode)
+        assert not first.path.is_symlink()
+        assert directory.st_uid == os.geteuid()
+        assert directory.st_gid == os.getegid()
+        assert stat.S_IMODE(directory.st_mode) == 0o700
+        assert (directory.st_dev, directory.st_ino) == (directory_fd.st_dev, directory_fd.st_ino)
+        assert stat.S_ISSOCK(endpoint.st_mode)
+        assert not first.endpoint.is_symlink()
+        assert endpoint.st_uid == os.geteuid()
+        assert endpoint.st_gid == os.getegid()
+        assert stat.S_IMODE(endpoint.st_mode) == 0o600
+        assert first.listener.fileno() >= 0
+        assert (endpoint.st_dev, endpoint.st_ino) == (
+            first.endpoint_identity.device,
+            first.endpoint_identity.inode,
+        )
+    finally:
+        first.cleanup()
+        second.cleanup()
+
+    long_root = Path("/private/tmp") / f"long-{uuid4().hex}{'x' * 96}"
+    long_root.mkdir(mode=0o700)
+    fallback_session = None
+    try:
+        fallback_session = lab_worker._new_wire_session(roots=(long_root, Path("/private/tmp")))
+        assert fallback_session.root_path == Path("/private/tmp")
+    finally:
+        if fallback_session is not None:
+            fallback_session.cleanup()
+        long_root.rmdir()
+
+    all_bad_root = Path("/private/tmp") / f"long-{uuid4().hex}{'x' * 96}"
+    all_bad_root.mkdir(mode=0o700)
+    try:
+        with pytest.raises(lab_worker.LabWireSessionStartupError):
+            lab_worker._new_wire_session(roots=(all_bad_root,))
+    finally:
+        all_bad_root.rmdir()
+
+    replaced_socket = lab_worker._new_wire_session(roots=(Path("/private/tmp"),))
+    replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        os.unlink(replaced_socket.endpoint)
+        replacement.bind(str(replaced_socket.endpoint))
+        replaced_socket.cleanup()
+        assert replaced_socket.path.is_dir()
+        assert replaced_socket.endpoint.exists()
+    finally:
+        replacement.close()
+        if replaced_socket.endpoint.exists():
+            replaced_socket.endpoint.unlink()
+        if replaced_socket.path.exists():
+            replaced_socket.path.rmdir()
+
+    replaced_directory = lab_worker._new_wire_session(roots=(Path("/private/tmp"),))
+    original = replaced_directory.path
+    moved = replaced_directory.root_path / f"moved-session-{uuid4().hex}"
+    os.rename(original, moved)
+    original.mkdir(mode=0o700)
+    try:
+        replaced_directory.cleanup()
+        assert original.is_dir()
+        assert (moved / "wire.sock").exists()
+    finally:
+        (moved / "wire.sock").unlink()
+        moved.rmdir()
+        original.rmdir()
+
+    unknown_child = lab_worker._new_wire_session(roots=(Path("/private/tmp"),))
+    unknown = unknown_child.path / "unknown"
+    unknown.write_text("keep", encoding="ascii")
+    unknown_child.cleanup()
+    unknown_child.cleanup()
+    assert unknown_child.path.is_dir()
+    assert unknown.read_text(encoding="ascii") == "keep"
+    assert not unknown_child.endpoint.exists()
+    unknown.unlink()
+    unknown_child.path.rmdir()
+
+    normal_cleanup = lab_worker._new_wire_session(roots=(Path("/private/tmp"),))
+    normal_path = normal_cleanup.path
+    normal_cleanup.cleanup()
+    normal_cleanup.cleanup()
+    assert not normal_path.exists()
+
+    for phase, expected_kind in (
+        ("claim", "claim_validation"),
+        ("session", "session"),
+        ("execute", "execution"),
+        ("deadline", "deadline"),
+        ("fence", "fence"),
+        ("seal", "seal"),
+    ):
+        failure = lab_worker.LabWorkerFailure.model_validate(
+            {"phase": phase, "error_type": "RuntimeError", "message": "failed"}
+        )
+        assert failure.failure_kind == expected_kind
+        assert '"failure_kind"' in failure.canonical_json()
+    explicit_startup = lab_worker.LabWorkerFailure(
+        phase="session",
+        failure_kind="session_startup",
+        error_type="LabWireSessionStartupError",
+        message="bind failed",
+    )
+    assert explicit_startup.model_dump(mode="json")["failure_kind"] == "session_startup"
+
+    claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+    worker = _worker(tmp_path)
+    validated = worker._validate_closed_claim(claim)
+    monkeypatch.setattr(
+        worker,
+        "_start_wire_child",
+        lambda **_kwargs: (_ for _ in ()).throw(lab_worker.LabWireSessionStartupError("bind")),
+    )
+    control = worker._execute_shard_isolated(
+        claim,
+        validated,
+        runtime_code_sha="1" * 40,
+        hard_limit_seconds=1,
+        initial_session=lab_worker.TradingSession.CLOSED,
+    )
+    assert isinstance(control.startup_error, lab_worker.LabWireSessionStartupError)
+    assert control.resource_error is None
 
 
 class SequenceResourceSnapshotProvider:

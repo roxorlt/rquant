@@ -9,14 +9,16 @@ import multiprocessing
 import os
 import re
 import signal
+import socket
 import stat
+import tempfile
 import threading
 import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from multiprocessing.connection import Client, Connection, Listener
+from multiprocessing.connection import Client, Connection, answer_challenge, deliver_challenge
 from multiprocessing.process import BaseProcess
 from pathlib import Path
 from types import FrameType
@@ -593,8 +595,36 @@ class LabShardResultManifest(LabWorkerModel):
 
 class LabWorkerFailure(LabWorkerModel):
     phase: Literal["claim", "session", "execute", "deadline", "fence", "seal"]
+    failure_kind: Literal[
+        "claim_validation",
+        "session_startup",
+        "session",
+        "execution",
+        "deadline",
+        "fence",
+        "seal",
+    ]
     error_type: str = Field(min_length=1)
     message: str = Field(min_length=1)
+
+    @model_validator(mode="before")
+    @classmethod
+    def add_legacy_failure_kind(cls, value: object) -> object:
+        if not isinstance(value, dict) or "failure_kind" in value:
+            return value
+        phase = value.get("phase")
+        legacy_kinds = {
+            "claim": "claim_validation",
+            "session": "session",
+            "execute": "execution",
+            "deadline": "deadline",
+            "fence": "fence",
+            "seal": "seal",
+        }
+        kind = legacy_kinds.get(phase)
+        if kind is None:
+            return value
+        return {**value, "failure_kind": kind}
 
     def canonical_json(self) -> str:
         return _canonical_json(
@@ -671,6 +701,7 @@ class _IsolatedExecutionControl:
     outcome: _IsolatedExecutionOutcome | None = None
     stop_reason: str | None = None
     preemption: AdmissionDecision | None = None
+    startup_error: Exception | None = None
     resource_error: Exception | None = None
     heartbeat_error: Exception | None = None
 
@@ -1730,20 +1761,242 @@ def _recv_wire(
     )
 
 
-def _new_wire_listener() -> tuple[Listener, str, bytes]:
-    address = f"/private/tmp/rqlw-{uuid4().hex}.sock"
-    authkey = os.urandom(32)
-    listener = Listener(address, family="AF_UNIX", authkey=authkey, backlog=1)
-    os.chmod(address, 0o600)
-    socket_listener = listener._listener._socket
-    socket_listener.settimeout(_microseconds_to_seconds(_RESOURCE_AUTHORITY_POLL_MICROSECONDS))
-    return listener, address, authkey
+class LabWireSessionStartupError(LabDaemonConfigurationError):
+    """A private AF_UNIX session could not be created safely."""
 
 
-def _close_wire_listener(listener: Listener, address: str) -> None:
-    listener.close()
-    with suppress(FileNotFoundError):
-        os.unlink(address)
+@dataclass(frozen=True)
+class _WireFilesystemIdentity:
+    device: int
+    inode: int
+
+    @classmethod
+    def from_stat(cls, observed: os.stat_result) -> _WireFilesystemIdentity:
+        return cls(device=observed.st_dev, inode=observed.st_ino)
+
+    def matches(self, observed: os.stat_result) -> bool:
+        return (observed.st_dev, observed.st_ino) == (self.device, self.inode)
+
+
+class _RawWireListener:
+    """A minimal authenticated listener without Listener's path finalizer."""
+
+    def __init__(self, socket_listener: socket.socket, authkey: bytes) -> None:
+        self._socket = socket_listener
+        self._authkey = authkey
+
+    def fileno(self) -> int:
+        return self._socket.fileno()
+
+    def accept(self) -> Connection:
+        accepted, _address = self._socket.accept()
+        connection = Connection(accepted.detach())
+        try:
+            deliver_challenge(connection, self._authkey)
+            answer_challenge(connection, self._authkey)
+        except BaseException:
+            connection.close()
+            raise
+        return connection
+
+    def close(self) -> None:
+        self._socket.close()
+
+
+@dataclass
+class _WireSession:
+    root_path: Path
+    path: Path
+    endpoint: Path
+    root_fd: int
+    session_fd: int
+    root_identity: _WireFilesystemIdentity
+    session_identity: _WireFilesystemIdentity
+    endpoint_identity: _WireFilesystemIdentity
+    listener: _RawWireListener
+    authkey: bytes
+    _cleaned: bool = False
+
+    @property
+    def address(self) -> str:
+        return str(self.endpoint)
+
+    def _session_path_is_original(self) -> bool:
+        try:
+            observed = os.stat(self.path.name, dir_fd=self.root_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        return stat.S_ISDIR(observed.st_mode) and self.session_identity.matches(observed)
+
+    def cleanup(self) -> None:
+        if self._cleaned:
+            return
+        self._cleaned = True
+        errors: list[BaseException] = []
+        try:
+            self.listener.close()
+        except BaseException as exc:
+            errors.append(exc)
+        try:
+            if self._session_path_is_original():
+                try:
+                    endpoint = os.stat(
+                        self.endpoint.name,
+                        dir_fd=self.session_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    endpoint = None
+                if (
+                    endpoint is not None
+                    and stat.S_ISSOCK(endpoint.st_mode)
+                    and self.endpoint_identity.matches(endpoint)
+                ):
+                    os.unlink(self.endpoint.name, dir_fd=self.session_fd)
+                if self._session_path_is_original() and not os.listdir(self.session_fd):
+                    os.rmdir(self.path.name, dir_fd=self.root_fd)
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            for descriptor in (self.session_fd, self.root_fd):
+                try:
+                    os.close(descriptor)
+                except BaseException as exc:
+                    errors.append(exc)
+        if errors:
+            raise BaseExceptionGroup("wire session cleanup failed", errors)
+
+
+def _wire_root_candidates(roots: tuple[Path, ...] | None) -> tuple[Path, ...]:
+    candidates = roots or (
+        Path(tempfile.gettempdir()),
+        Path("/tmp"),
+        Path("/private/tmp"),
+    )
+    unique: list[Path] = []
+    for candidate in candidates:
+        normalized = Path(candidate)
+        if normalized not in unique:
+            unique.append(normalized)
+    return tuple(unique)
+
+
+def _open_wire_root(root: Path) -> tuple[int, _WireFilesystemIdentity]:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(root, flags)
+    try:
+        observed = os.fstat(descriptor)
+        path_observed = os.stat(root, follow_symlinks=False)
+        mode = stat.S_IMODE(observed.st_mode)
+        current_uid = os.geteuid()
+        shared_root = bool(observed.st_mode & stat.S_ISVTX)
+        root_is_safe = (
+            stat.S_ISDIR(observed.st_mode)
+            and _WireFilesystemIdentity.from_stat(observed).matches(path_observed)
+            and observed.st_uid in {current_uid, 0}
+            and (
+                (shared_root and observed.st_uid in {current_uid, 0})
+                or (not shared_root and observed.st_uid == current_uid and mode == 0o700)
+            )
+        )
+        if not root_is_safe:
+            raise LabWireSessionStartupError("wire session root is not a safe directory")
+        return descriptor, _WireFilesystemIdentity.from_stat(observed)
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _open_wire_session_directory(
+    root_fd: int,
+    session_name: str,
+) -> tuple[int, _WireFilesystemIdentity]:
+    os.mkdir(session_name, mode=0o700, dir_fd=root_fd)
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(session_name, flags, dir_fd=root_fd)
+    try:
+        os.fchown(descriptor, os.geteuid(), os.getegid())
+        os.fchmod(descriptor, 0o700)
+        observed = os.fstat(descriptor)
+        path_observed = os.stat(session_name, dir_fd=root_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(observed.st_mode)
+            or observed.st_uid != os.geteuid()
+            or observed.st_gid != os.getegid()
+            or stat.S_IMODE(observed.st_mode) != 0o700
+            or not _WireFilesystemIdentity.from_stat(observed).matches(path_observed)
+        ):
+            raise LabWireSessionStartupError("wire session directory identity validation failed")
+        return descriptor, _WireFilesystemIdentity.from_stat(observed)
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _new_wire_session(*, roots: tuple[Path, ...] | None = None) -> _WireSession:
+    session_name = f"rqlw-{uuid4().hex}"
+    errors: list[BaseException] = []
+    for root in _wire_root_candidates(roots):
+        root_fd: int | None = None
+        session_fd: int | None = None
+        listener_socket: socket.socket | None = None
+        session: _WireSession | None = None
+        try:
+            root_fd, root_identity = _open_wire_root(root)
+            session_fd, session_identity = _open_wire_session_directory(root_fd, session_name)
+            path = root / session_name
+            endpoint = path / "wire.sock"
+            listener_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener_socket.bind(str(endpoint))
+            os.chown(endpoint, os.geteuid(), os.getegid(), follow_symlinks=False)
+            os.chmod(endpoint, 0o600, follow_symlinks=False)
+            endpoint_stat = os.stat(endpoint, follow_symlinks=False)
+            authkey = os.urandom(32)
+            session = _WireSession(
+                root_path=root,
+                path=path,
+                endpoint=endpoint,
+                root_fd=root_fd,
+                session_fd=session_fd,
+                root_identity=root_identity,
+                session_identity=session_identity,
+                endpoint_identity=_WireFilesystemIdentity.from_stat(endpoint_stat),
+                listener=_RawWireListener(listener_socket, authkey),
+                authkey=authkey,
+            )
+            # macOS socket fstat() identifies the socket object, not its filesystem vnode.
+            if (
+                not stat.S_ISSOCK(endpoint_stat.st_mode)
+                or endpoint_stat.st_uid != os.geteuid()
+                or endpoint_stat.st_gid != os.getegid()
+                or stat.S_IMODE(endpoint_stat.st_mode) != 0o600
+            ):
+                raise LabWireSessionStartupError("wire endpoint identity validation failed")
+            listener_socket.listen(1)
+            listener_socket.settimeout(
+                _microseconds_to_seconds(_RESOURCE_AUTHORITY_POLL_MICROSECONDS)
+            )
+            return session
+        except BaseException as exc:
+            errors.append(exc)
+            if session is not None:
+                with suppress(BaseException):
+                    session.cleanup()
+            else:
+                if listener_socket is not None:
+                    with suppress(BaseException):
+                        listener_socket.close()
+                if session_fd is not None:
+                    with suppress(BaseException):
+                        os.close(session_fd)
+                if root_fd is not None:
+                    with suppress(BaseException):
+                        with suppress(FileNotFoundError):
+                            os.rmdir(session_name, dir_fd=root_fd)
+                        os.close(root_fd)
+    raise LabWireSessionStartupError(
+        "could not create a private wire session"
+    ) from BaseExceptionGroup("wire session startup failures", errors)
 
 
 def _authority_wire_child(
@@ -2781,7 +3034,10 @@ class LabWorker:
         max_wire_bytes: int,
         honor_worker_stop_during_readiness: bool = True,
     ) -> _WireChild:
-        listener, address, authkey = _new_wire_listener()
+        session = _new_wire_session()
+        listener = session.listener
+        address = session.address
+        authkey = session.authkey
         context = multiprocessing.get_context("spawn")
         arguments: tuple[object, ...] = (
             request_bytes,
@@ -2827,15 +3083,16 @@ class LabWorker:
                 label=f"{label} readiness",
                 honor_worker_stop=honor_worker_stop_during_readiness,
             )
-            if (
-                not readiness.ready
-                or process.pid is None
-                or readiness.child_pid != process.pid
-                or readiness.group_id != process.pid
-            ):
+            if not readiness.ready:
                 raise LabDaemonConfigurationError(
                     readiness.message or f"{label} process readiness failed"
                 )
+            if (
+                process.pid is None
+                or readiness.child_pid != process.pid
+                or readiness.group_id != process.pid
+            ):
+                raise LabWireSessionStartupError(f"{label} process identity verification failed")
             try:
                 observed_group_id = os.getpgid(process.pid)
             except ProcessLookupError as exc:
@@ -2850,7 +3107,7 @@ class LabWorker:
                 group_id=observed_group_id,
                 address=address,
             )
-        except BaseException:
+        except BaseException as exc:
             if connection is not None:
                 with suppress(BaseException):
                     connection.close()
@@ -2862,9 +3119,19 @@ class LabWorker:
                     )
             with suppress(BaseException):
                 process.close()
-            raise
+            if isinstance(
+                exc,
+                (
+                    InterruptedError,
+                    TimeoutError,
+                    LabDaemonConfigurationError,
+                    LabWireSessionStartupError,
+                ),
+            ):
+                raise
+            raise LabWireSessionStartupError(f"{label} startup failed") from exc
         finally:
-            _close_wire_listener(listener, address)
+            session.cleanup()
 
     def _close_wire_child(
         self,
@@ -4491,6 +4758,7 @@ class LabWorker:
         outcome: _IsolatedExecutionOutcome | None = None
         stop_reason: str | None = None
         preemption: AdmissionDecision | None = None
+        startup_error: Exception | None = None
         resource_error: Exception | None = None
         lifecycle_error: BaseException | None = None
         cleanup_errors: list[BaseException] = []
@@ -4808,6 +5076,8 @@ class LabWorker:
                 stop_reason = str(exc) or "worker stop requested during isolated shard execution"
             else:
                 stop_reason = deadline_stop_reason(self.isolation_monotonic_microseconds_clock())
+        except LabWireSessionStartupError as exc:
+            startup_error = exc
         except Exception as exc:
             resource_error = exc
         except BaseException as exc:
@@ -4885,6 +5155,7 @@ class LabWorker:
             outcome=outcome,
             stop_reason=stop_reason,
             preemption=preemption,
+            startup_error=startup_error,
             resource_error=resource_error,
             heartbeat_error=heartbeat_errors[0] if heartbeat_errors else None,
         )
@@ -5623,6 +5894,18 @@ class LabWorker:
         )
         failure = LabWorkerFailure(
             phase=phase,
+            failure_kind=(
+                "session_startup"
+                if phase == "session" and isinstance(error, LabWireSessionStartupError)
+                else {
+                    "claim": "claim_validation",
+                    "session": "session",
+                    "execute": "execution",
+                    "deadline": "deadline",
+                    "fence": "fence",
+                    "seal": "seal",
+                }[phase]
+            ),
             error_type=error_type,
             message=message,
         )
@@ -5889,6 +6172,9 @@ class LabWorker:
         stop_reason = control.stop_reason
         if control.preemption is not None:
             resource_preemptions.append(control.preemption)
+        if control.startup_error is not None:
+            operation_phase = "session"
+            operation_error = control.startup_error
         if control.resource_error is not None:
             resource_errors.append(control.resource_error)
         if control.heartbeat_error is not None:
