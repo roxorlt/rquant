@@ -1284,6 +1284,41 @@ raise SystemExit(99)
     assert swap_temporary.lstat().st_ino == replacement_inode
     assert swap_temporary.read_text(encoding="utf-8") == "replacement-temporary"
 
+    container_swap_root = tmp_path / "container-cleanup-swap-commands"
+    container_swap_spool = LabCommandSpool(container_swap_root)
+    original_container = container_swap_spool.quarantine_dir / f"owned-entry-{uuid4()}.dead"
+    original_container.mkdir(mode=0o700)
+    original_temporary = original_container / f".evidence.json.{uuid4().hex}.tmp"
+    original_temporary.write_text("original-container-temporary", encoding="utf-8")
+    original_temporary.chmod(0o600)
+    original_temporary_inode = original_temporary.lstat().st_ino
+    displaced_container = original_container.with_name(f"{original_container.name}.displaced")
+    callback_count = 0
+
+    def replace_container_name_once() -> None:
+        nonlocal callback_count
+        callback_count += 1
+        if callback_count != 1:
+            return
+        original_container.rename(displaced_container)
+        original_container.mkdir(mode=0o700)
+
+    monkeypatch.setattr(
+        container_swap_spool,
+        "mutation_guard",
+        replace_container_name_once,
+    )
+
+    container_swap_spool._reconcile_owned_isolation_container_locked(original_container)
+
+    displaced_temporary = displaced_container / original_temporary.name
+    assert callback_count == 1
+    assert original_container.is_dir()
+    assert tuple(original_container.iterdir()) == ()
+    assert displaced_container.is_dir()
+    assert displaced_temporary.lstat().st_ino == original_temporary_inode
+    assert displaced_temporary.read_text(encoding="utf-8") == "original-container-temporary"
+
 
 def test_owned_entry_isolation_move_is_atomic_no_clobber_when_destination_appears(
     tmp_path: Path,

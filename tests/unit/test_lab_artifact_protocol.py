@@ -1221,6 +1221,34 @@ def test_commit_conflict_restart_recovers_and_prunes_owned_incomplete_bundles(
     assert not owned_container.exists()
     assert len(inherited_recovery.conflict_evidence()) == 2
 
+    swap_container = inherited_recovery.quarantine_dir / f"owned-entry-{uuid4()}.dead"
+    swap_container.mkdir(mode=0o700)
+    swap_temporary = swap_container / f".evidence.json.{uuid4().hex}.tmp"
+    swap_temporary.write_bytes(b"artifact-container-swap")
+    swap_temporary.chmod(0o600)
+    swap_temporary_inode = swap_temporary.lstat().st_ino
+    displaced_container = swap_container.with_name(f"{swap_container.name}.displaced")
+    callback_count = 0
+
+    def replace_artifact_container_name_once() -> None:
+        nonlocal callback_count
+        callback_count += 1
+        if callback_count != 1:
+            return
+        swap_container.rename(displaced_container)
+        swap_container.mkdir(mode=0o700)
+
+    inherited_recovery.mutation_guard = replace_artifact_container_name_once
+
+    inherited_recovery._reconcile_owned_isolation_container_locked(swap_container)
+
+    displaced_temporary = displaced_container / swap_temporary.name
+    assert callback_count == 1
+    assert swap_container.is_dir()
+    assert tuple(swap_container.iterdir()) == ()
+    assert displaced_temporary.lstat().st_ino == swap_temporary_inode
+    assert displaced_temporary.read_bytes() == b"artifact-container-swap"
+
 
 def test_commit_conflict_restart_bounds_truncated_owned_temps_and_allows_republish(
     tmp_path: Path,

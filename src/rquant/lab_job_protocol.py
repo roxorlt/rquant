@@ -1571,75 +1571,84 @@ class LabCommandSpool:
                 f"owned isolation source link target mismatch: {container.name}"
             )
 
-    def _unlink_bound_owned_evidence_publication_temporary_locked(
+    def _owned_evidence_publication_container_is_current(
+        self,
+        quarantine_fd: int,
+        container_fd: int,
+        container_name: str,
+        bound_container_stat: os.stat_result,
+    ) -> bool:
+        try:
+            anchored = os.fstat(container_fd)
+            active = os.stat(
+                container_name,
+                dir_fd=quarantine_fd,
+                follow_symlinks=False,
+            )
+            self._validate_private_directory_stat(
+                anchored,
+                label="owned isolation container",
+            )
+        except (InvalidCommandEnvelopeError, OSError):
+            return False
+        return self._same_stat(
+            bound_container_stat,
+            anchored,
+            include_link_count=False,
+        ) and self._same_stat(
+            anchored,
+            active,
+            include_link_count=False,
+        )
+
+    def _owned_evidence_publication_child_is_current(
         self,
         container_fd: int,
-        temporary_name: str,
-        temporary_descriptor: int,
-        temporary_stat: os.stat_result,
+        child_name: str,
+        child_descriptor: int,
+        bound_child_stat: os.stat_result,
         *,
-        evidence_descriptor: int | None = None,
-        evidence_stat: os.stat_result | None = None,
+        link_count: int,
     ) -> bool:
-        link_count = 2 if evidence_descriptor is not None else 1
-        self._guard_mutation()
         try:
-            anchored_temporary = os.fstat(temporary_descriptor)
-            active_temporary = os.stat(
-                temporary_name,
+            anchored = os.fstat(child_descriptor)
+            active = os.stat(
+                child_name,
                 dir_fd=container_fd,
                 follow_symlinks=False,
             )
-            if not self._same_owned_evidence_publication_stat(
-                temporary_stat,
-                anchored_temporary,
-                link_count=link_count,
-            ) or not self._same_owned_evidence_publication_stat(
-                anchored_temporary,
-                active_temporary,
-                link_count=link_count,
-            ):
-                return False
-            if evidence_descriptor is not None:
-                if evidence_stat is None:
-                    return False
-                anchored_evidence = os.fstat(evidence_descriptor)
-                active_evidence = os.stat(
-                    "evidence.json",
-                    dir_fd=container_fd,
-                    follow_symlinks=False,
-                )
-                if not self._same_owned_evidence_publication_stat(
-                    evidence_stat,
-                    anchored_evidence,
-                    link_count=2,
-                ) or not self._same_owned_evidence_publication_stat(
-                    anchored_evidence,
-                    active_evidence,
-                    link_count=2,
-                ):
-                    return False
-                if not self._same_owned_evidence_publication_stat(
-                    anchored_temporary,
-                    anchored_evidence,
-                    link_count=2,
-                ):
-                    return False
-            os.unlink(temporary_name, dir_fd=container_fd)
-            os.fsync(container_fd)
-            return True
         except OSError:
             return False
+        return self._same_owned_evidence_publication_stat(
+            bound_child_stat,
+            anchored,
+            link_count=link_count,
+        ) and self._same_owned_evidence_publication_stat(
+            anchored,
+            active,
+            link_count=link_count,
+        )
 
-    def _reconcile_owned_evidence_publication_temporary_locked(
+    def _reconcile_owned_evidence_publication_transaction_locked(
         self,
+        quarantine_fd: int,
+        container_fd: int,
         container: Path,
+        bound_container_stat: os.stat_result,
         isolation_match: re.Match[str],
-    ) -> Literal["continue", "remove_empty", "stop"]:
-        container_fd = self._open_managed_directory(container)
+    ) -> Literal["continue", "removed", "preserve"]:
         temporary_descriptor = -1
         evidence_descriptor = -1
         try:
+            if not self._owned_evidence_publication_container_is_current(
+                quarantine_fd,
+                container_fd,
+                container.name,
+                bound_container_stat,
+            ):
+                return "preserve"
+
+            # BOUND -> CLASSIFIED: only exact publisher states are actionable.
             names = frozenset(os.listdir(container_fd))
             publication_names = tuple(
                 name
@@ -1649,73 +1658,109 @@ class LabCommandSpool:
             if not publication_names:
                 return "continue"
             if len(publication_names) != 1:
-                return "stop"
+                return "preserve"
             temporary_name = publication_names[0]
             temporary_match = self._OWNED_EVIDENCE_PUBLICATION_TEMP_NAME.fullmatch(temporary_name)
             if temporary_match is None or Path(temporary_name).name != temporary_name:
-                return "stop"
+                return "preserve"
             publication_id = UUID(hex=temporary_match["publication_id"])
             if (
                 publication_id.version != 4
                 or publication_id.hex != temporary_match["publication_id"]
             ):
-                return "stop"
-            if names == {temporary_name}:
-                temporary_descriptor, temporary_stat = self._open_owned_evidence_publication_child(
-                    container_fd,
-                    temporary_name,
-                    link_count=1,
-                )
-                if self._unlink_bound_owned_evidence_publication_temporary_locked(
-                    container_fd,
-                    temporary_name,
-                    temporary_descriptor,
-                    temporary_stat,
-                ):
-                    return "remove_empty"
-                return "stop"
-            if names != {temporary_name, "evidence.json"}:
-                return "stop"
+                return "preserve"
+            temporary_only = names == {temporary_name}
+            if not temporary_only and names != {temporary_name, "evidence.json"}:
+                return "preserve"
+            link_count = 1 if temporary_only else 2
             temporary_descriptor, temporary_stat = self._open_owned_evidence_publication_child(
                 container_fd,
                 temporary_name,
-                link_count=2,
+                link_count=link_count,
             )
-            evidence_descriptor, evidence_stat = self._open_owned_evidence_publication_child(
+            evidence_stat: os.stat_result | None = None
+            if not temporary_only:
+                evidence_descriptor, evidence_stat = self._open_owned_evidence_publication_child(
+                    container_fd,
+                    "evidence.json",
+                    link_count=2,
+                )
+                if not self._same_owned_evidence_publication_stat(
+                    temporary_stat,
+                    evidence_stat,
+                    link_count=2,
+                ):
+                    return "preserve"
+                self._validate_linked_owned_evidence_publication(
+                    container,
+                    isolation_match,
+                    evidence_descriptor,
+                    evidence_stat,
+                )
+
+            # PRECOMMIT_FENCE -> REVALIDATED: this is the transaction's only callback.
+            self._guard_mutation()
+            if not self._owned_evidence_publication_container_is_current(
+                quarantine_fd,
                 container_fd,
-                "evidence.json",
-                link_count=2,
-            )
-            if not self._same_owned_evidence_publication_stat(
-                temporary_stat,
-                evidence_stat,
-                link_count=2,
-            ):
-                return "stop"
-            self._validate_linked_owned_evidence_publication(
-                container,
-                isolation_match,
-                evidence_descriptor,
-                evidence_stat,
-            )
-            if self._unlink_bound_owned_evidence_publication_temporary_locked(
+                container.name,
+                bound_container_stat,
+            ) or not self._owned_evidence_publication_child_is_current(
                 container_fd,
                 temporary_name,
                 temporary_descriptor,
                 temporary_stat,
-                evidence_descriptor=evidence_descriptor,
-                evidence_stat=evidence_stat,
+                link_count=link_count,
             ):
+                return "preserve"
+            if not temporary_only:
+                if evidence_stat is None or not self._owned_evidence_publication_child_is_current(
+                    container_fd,
+                    "evidence.json",
+                    evidence_descriptor,
+                    evidence_stat,
+                    link_count=2,
+                ):
+                    return "preserve"
+                if not self._same_owned_evidence_publication_stat(
+                    os.fstat(temporary_descriptor),
+                    os.fstat(evidence_descriptor),
+                    link_count=2,
+                ):
+                    return "preserve"
+
+            # MUTATED -> POSTVERIFIED: no callback occurs after the final checks.
+            os.unlink(temporary_name, dir_fd=container_fd)
+            os.fsync(container_fd)
+            if not self._owned_evidence_publication_container_is_current(
+                quarantine_fd,
+                container_fd,
+                container.name,
+                bound_container_stat,
+            ):
+                return "preserve"
+            expected_names = frozenset() if temporary_only else frozenset({"evidence.json"})
+            if frozenset(os.listdir(container_fd)) != expected_names:
+                return "preserve"
+            if not temporary_only:
                 return "continue"
-            return "stop"
+            if not self._owned_evidence_publication_container_is_current(
+                quarantine_fd,
+                container_fd,
+                container.name,
+                bound_container_stat,
+            ):
+                return "preserve"
+            os.rmdir(container.name, dir_fd=quarantine_fd)
+            os.fsync(quarantine_fd)
+            return "removed"
         except (InvalidCommandEnvelopeError, OSError, ValueError):
-            return "stop"
+            return "preserve"
         finally:
             if evidence_descriptor >= 0:
                 os.close(evidence_descriptor)
             if temporary_descriptor >= 0:
                 os.close(temporary_descriptor)
-            os.close(container_fd)
 
     @classmethod
     def _invalid_evidence_name(
@@ -1820,25 +1865,69 @@ class LabCommandSpool:
         match = self._OWNED_ISOLATION_NAME.fullmatch(container.name)
         if match is None:
             return
+        quarantine_fd = self._open_managed_directory(self.quarantine_dir)
+        container_fd = -1
         try:
-            container_stat = self._managed_entry_stat(container, self.quarantine_dir)
-        except FileNotFoundError:
-            return
-        if not stat.S_ISDIR(container_stat.st_mode):
-            self._isolate_owned_entry_locked(
-                container,
-                container_stat,
-                reason="owned isolation namespace occupied by a non-directory entry",
+            try:
+                container_stat = os.stat(
+                    container.name,
+                    dir_fd=quarantine_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                return
+            if not stat.S_ISDIR(container_stat.st_mode):
+                os.close(quarantine_fd)
+                quarantine_fd = -1
+                self._isolate_owned_entry_locked(
+                    container,
+                    container_stat,
+                    reason="owned isolation namespace occupied by a non-directory entry",
+                )
+                return
+            container_fd = os.open(
+                container.name,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0),
+                dir_fd=quarantine_fd,
             )
-            return
-        publication_result = self._reconcile_owned_evidence_publication_temporary_locked(
-            container,
-            match,
-        )
-        if publication_result == "stop":
-            return
-        if publication_result == "remove_empty":
-            self._discard_empty_unpublished_isolation_container_locked(container)
+            opened_container = os.fstat(container_fd)
+            active_container = os.stat(
+                container.name,
+                dir_fd=quarantine_fd,
+                follow_symlinks=False,
+            )
+            self._validate_private_directory_stat(
+                opened_container,
+                label="owned isolation container",
+            )
+            if not self._same_stat(
+                container_stat,
+                opened_container,
+                include_link_count=False,
+            ) or not self._same_stat(
+                opened_container,
+                active_container,
+                include_link_count=False,
+            ):
+                raise InvalidCommandEnvelopeError(
+                    f"owned isolation container identity changed: {container.name}"
+                )
+            publication_result = self._reconcile_owned_evidence_publication_transaction_locked(
+                quarantine_fd,
+                container_fd,
+                container,
+                opened_container,
+                match,
+            )
+        finally:
+            if container_fd >= 0:
+                os.close(container_fd)
+            if quarantine_fd >= 0:
+                os.close(quarantine_fd)
+        if publication_result in {"removed", "preserve"}:
             return
         entry = container / "entry"
         try:
