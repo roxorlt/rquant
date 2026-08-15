@@ -51,7 +51,6 @@ HASH_4 = "4" * 64
 HASH_5 = "5" * 64
 HASH_6 = "6" * 64
 HASH_7 = "7" * 64
-_STAGE_STORE: LabSourceStageStore | None = None
 
 
 class _AcceptAllVerifier(SourceBrokerV2JobOutcomeVerifier):
@@ -115,10 +114,12 @@ def _authority(kind: str) -> SourceBrokerV2AuthorityRef:
     )
 
 
-def _intent(symbol: str = "000001.SZ") -> SourceBrokerV2JobIntentEnvelope:
+def _intent(
+    stage_store: LabSourceStageStore,
+    symbol: str = "000001.SZ",
+) -> SourceBrokerV2JobIntentEnvelope:
     intent = authorized_intent(symbol=symbol)
-    assert _STAGE_STORE is not None
-    stage_authorized_intent(_STAGE_STORE, intent)
+    stage_authorized_intent(stage_store, intent)
     return intent
 
 
@@ -144,26 +145,51 @@ def _outcome(intent: SourceBrokerV2JobIntentEnvelope, *, response_rows: int = 1)
     )
 
 
-def _queue(db_path: Path, *, max_inbox: int = 2) -> SourceBrokerV2SchedulerQueue:
-    global _STAGE_STORE
+def _stage_store(
+    db_path: Path,
+    *,
+    max_inbox: int = 2,
+) -> LabSourceStageStore:
     initialize_source_broker_v2_job_storage(
         db_path,
         busy_timeout_ms=2_000,
         max_inbox=max_inbox,
     )
-    _STAGE_STORE = LabSourceStageStore(
+    return LabSourceStageStore(
         db_path.with_name(f"{db_path.stem}.source-stage.sqlite3"),
         queue_store_path=db_path,
         manifest_keyring=authorities().authorization_keyring,
         authorization_keyring=authorities().authorization_keyring,
     )
+
+
+def _open_queue(
+    db_path: Path,
+    stage_store: LabSourceStageStore,
+    *,
+    max_inbox: int = 2,
+) -> SourceBrokerV2SchedulerQueue:
+    initialize_source_broker_v2_job_storage(
+        db_path,
+        busy_timeout_ms=2_000,
+        max_inbox=max_inbox,
+    )
     return SourceBrokerV2SchedulerQueue(
         db_path,
         manifest_keyring=authorities().authorization_keyring,
         authorization_keyring=authorities().authorization_keyring,
-        stage_store=_STAGE_STORE,
+        stage_store=stage_store,
         busy_timeout_ms=2_000,
     )
+
+
+def _queue(
+    db_path: Path,
+    *,
+    max_inbox: int = 2,
+) -> tuple[SourceBrokerV2SchedulerQueue, LabSourceStageStore]:
+    stage_store = _stage_store(db_path, max_inbox=max_inbox)
+    return _open_queue(db_path, stage_store, max_inbox=max_inbox), stage_store
 
 
 def _create_legacy_job_store(db_path: Path) -> None:
@@ -198,7 +224,7 @@ def _create_legacy_job_store(db_path: Path) -> None:
 
 
 def test_scheduler_queue_has_only_canonical_non_executor_surface(tmp_path: Path) -> None:
-    queue = _queue(tmp_path / "runner.sqlite3")
+    queue, _stage_store = _queue(tmp_path / "runner.sqlite3")
 
     assert {
         name for name in dir(queue) if not name.startswith("_") and callable(getattr(queue, name))
@@ -223,8 +249,8 @@ def test_scheduler_queue_has_only_canonical_non_executor_surface(tmp_path: Path)
 def test_scheduler_queue_is_idempotent_bounded_and_only_returns_verified_published_outcome(
     tmp_path: Path,
 ) -> None:
-    queue = _queue(tmp_path / "runner.sqlite3", max_inbox=1)
-    intent = _intent()
+    queue, stage_store = _queue(tmp_path / "runner.sqlite3", max_inbox=1)
+    intent = _intent(stage_store)
 
     assert queue.enqueue_intent(intent) == intent.operation_id
     assert queue.enqueue_intent(intent) == intent.operation_id
@@ -232,12 +258,12 @@ def test_scheduler_queue_is_idempotent_bounded_and_only_returns_verified_publish
     with pytest.raises(KeyError):
         queue.get_verified_published_outcome(intent.operation_id)
     with pytest.raises(SourceBrokerV2SchedulerQueueBackpressureError):
-        queue.enqueue_intent(_intent("000002.SZ"))
+        queue.enqueue_intent(_intent(stage_store, "000002.SZ"))
 
 
 def test_scheduler_queue_rejects_direct_legacy_envelope_without_writing(tmp_path: Path) -> None:
-    queue = _queue(tmp_path / "runner.sqlite3")
-    authorized = _intent()
+    queue, stage_store = _queue(tmp_path / "runner.sqlite3")
+    authorized = _intent(stage_store)
     legacy = SourceBrokerV2JobIntentEnvelope.model_validate(
         {
             **authorized.model_dump(mode="python"),
@@ -258,12 +284,11 @@ def test_scheduler_queue_rejects_direct_legacy_envelope_without_writing(tmp_path
 def test_scheduler_queue_requires_exact_current_stage_attempt_before_writing(
     tmp_path: Path,
 ) -> None:
-    queue = _queue(tmp_path / "runner.sqlite3")
+    queue, stage_store = _queue(tmp_path / "runner.sqlite3")
     now = datetime.now(UTC)
     payload, claim = authorized_payload_and_claim(now=now, job_id=uuid4(), attempt_id=uuid4())
     intent = authorized_intent_from_payload_and_claim(payload, claim)
-    assert _STAGE_STORE is not None
-    stage_authorized_intent(_STAGE_STORE, intent, now=now)
+    stage_authorized_intent(stage_store, intent, now=now)
     assert queue.enqueue_intent(intent) == intent.operation_id
 
     altered_claims = (
@@ -293,13 +318,13 @@ def test_scheduler_queue_requires_exact_current_stage_attempt_before_writing(
         assert connection.execute("SELECT COUNT(*) FROM source_broker_v2_jobs").fetchone() == (1,)
 
     for candidate in (
-        _STAGE_STORE.path,
-        Path(f"{_STAGE_STORE.path}-wal"),
-        Path(f"{_STAGE_STORE.path}-shm"),
+        stage_store.path,
+        Path(f"{stage_store.path}-wal"),
+        Path(f"{stage_store.path}-shm"),
     ):
         candidate.unlink(missing_ok=True)
     LabSourceStageStore(
-        _STAGE_STORE.path,
+        stage_store.path,
         queue_store_path=queue.db_path,
         manifest_keyring=authorities().authorization_keyring,
         authorization_keyring=authorities().authorization_keyring,
@@ -309,10 +334,10 @@ def test_scheduler_queue_requires_exact_current_stage_attempt_before_writing(
 
 
 def test_scheduler_queue_rejects_conflicting_or_tampered_shared_storage(tmp_path: Path) -> None:
-    queue = _queue(tmp_path / "runner.sqlite3")
-    intent = _intent()
+    queue, stage_store = _queue(tmp_path / "runner.sqlite3")
+    intent = _intent(stage_store)
     queue.enqueue_intent(intent)
-    other = _intent("000002.SZ")
+    other = _intent(stage_store, "000002.SZ")
     with sqlite3.connect(queue.db_path) as connection:
         connection.execute(
             "UPDATE source_broker_v2_jobs SET intent = ? WHERE operation_id = ?",
@@ -321,9 +346,8 @@ def test_scheduler_queue_rejects_conflicting_or_tampered_shared_storage(tmp_path
     with pytest.raises(SourceBrokerV2SchedulerQueueConflictError):
         queue.enqueue_intent(intent)
 
-    queue = _queue(tmp_path / "tampered.sqlite3")
-    assert _STAGE_STORE is not None
-    stage_authorized_intent(_STAGE_STORE, intent)
+    queue, stage_store = _queue(tmp_path / "tampered.sqlite3")
+    stage_authorized_intent(stage_store, intent)
     queue.enqueue_intent(intent)
     with sqlite3.connect(queue.db_path) as connection:
         connection.execute(
@@ -383,8 +407,8 @@ def test_scheduler_queue_initialization_is_concurrent_and_leaves_wal_for_ordinar
 def test_queue_rejects_self_consistent_outcome_without_runner_published_commit(
     tmp_path: Path,
 ) -> None:
-    queue = _queue(tmp_path / "runner.sqlite3", max_inbox=1)
-    intent = _intent()
+    queue, stage_store = _queue(tmp_path / "runner.sqlite3", max_inbox=1)
+    intent = _intent(stage_store)
     queue.enqueue_intent(intent)
     replacement = _outcome(intent, response_rows=999)
     with sqlite3.connect(queue.db_path) as connection:
@@ -473,8 +497,11 @@ def test_legacy_published_row_without_commit_stays_fail_closed_after_migration(
     tmp_path: Path,
 ) -> None:
     db_path = tmp_path / "legacy.sqlite3"
+    stage_store = _stage_store(db_path, max_inbox=3)
+    intent = _intent(stage_store)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("DROP TABLE source_broker_v2_jobs")
     _create_legacy_job_store(db_path)
-    intent = _intent()
     now = datetime.now(UTC).isoformat(timespec="microseconds")
     with sqlite3.connect(db_path) as connection:
         connection.execute(
@@ -499,12 +526,7 @@ def test_legacy_published_row_without_commit_stays_fail_closed_after_migration(
             ),
         )
 
-    initialize_source_broker_v2_job_storage(
-        db_path,
-        busy_timeout_ms=2_000,
-        max_inbox=3,
-    )
-    queue = _queue(db_path, max_inbox=3)
+    queue = _open_queue(db_path, stage_store, max_inbox=3)
     with sqlite3.connect(db_path) as connection:
         commitment = connection.execute(
             "SELECT published_commit_hash FROM source_broker_v2_jobs WHERE operation_id = ?",
