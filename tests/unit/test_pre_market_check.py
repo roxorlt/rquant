@@ -57,12 +57,21 @@ class TestRunAllChecksExitCode:
 
     def test_tushare_warn_does_not_propagate_to_fail(self) -> None:
         """模拟 tushare 接口报错，整套 results 中应该只有 warn 没有 fail。"""
+        from rquant import pre_market_check
         from rquant.pre_market_check import run_all_checks
 
         mock_ts = MagicMock()
         mock_pro = MagicMock()
         mock_pro.user.side_effect = Exception("请指定正确的接口名")
         mock_ts.pro_api.return_value = mock_pro
+        host_which = pre_market_check.shutil.which
+        delegated_lookups: list[str] = []
+
+        def lookup_without_systemctl(name: str) -> str | None:
+            if name == "systemctl":
+                return None
+            delegated_lookups.append(name)
+            return host_which(name)
 
         # This test exercises Tushare warning aggregation, not the host's
         # systemd/keyring capabilities.
@@ -70,11 +79,28 @@ class TestRunAllChecksExitCode:
             patch.dict("sys.modules", {"tushare": mock_ts}),
             patch(
                 "rquant.pre_market_check.shutil.which",
-                return_value=None,
+                side_effect=lookup_without_systemctl,
+            ),
+            patch(
+                "rquant.pre_market_check.check_duckdb_lock",
+                return_value=pre_market_check.CheckResult(
+                    "duckdb_lock", "skip", "isolated host probe"
+                ),
+            ),
+            patch(
+                "rquant.pre_market_check.check_recent_errors",
+                return_value=pre_market_check.CheckResult(
+                    "recent_errors", "skip", "isolated host probe"
+                ),
             ),
         ):
+            assert pre_market_check.shutil.which("systemctl") is None
+            pre_market_check.shutil.which("lsof")
+            pre_market_check.shutil.which("journalctl")
+            pre_market_check.shutil.which("rquant-test-probe")
             results = run_all_checks()
 
+        assert delegated_lookups == ["lsof", "journalctl", "rquant-test-probe"]
         tushare_results = [r for r in results if r.name == "tushare"]
         assert len(tushare_results) == 1
         assert tushare_results[0].status == "warn"

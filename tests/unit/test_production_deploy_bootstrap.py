@@ -559,6 +559,13 @@ def _command(
     finalize_phase: str = "publish",
     lifecycle_mode: str = "uninstalled",
 ) -> list[str]:
+    try:
+        release_profile, host_platform = {
+            "darwin": ("macos-lab", "darwin"),
+            "linux": ("linux-production", "linux"),
+        }[sys.platform]
+    except KeyError as exc:
+        raise AssertionError(f"unsupported test host platform: {sys.platform}") from exc
     command = [
         str(python),
         "-I",
@@ -575,9 +582,9 @@ def _command(
         "--uv-path",
         str(checkout / ".venv" / "bin" / "uv"),
         "--release-profile",
-        "macos-lab",
+        release_profile,
         "--host-platform",
-        "darwin",
+        host_platform,
         "--lab-lifecycle-mode",
         lifecycle_mode,
     ]
@@ -4972,6 +4979,7 @@ def test_generation_preflight_is_clipped_by_end_to_end_deadline(tmp_path: Path) 
 
 def test_env_example_is_strictly_parseable_for_mac_and_linux_profiles(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = _bootstrap_module()
     env_path = tmp_path / ".env"
@@ -4991,6 +4999,19 @@ def test_env_example_is_strictly_parseable_for_mac_and_linux_profiles(
     )
 
     assert controls.get("RQUANT_RELEASE_PROFILE", "") == ""
+    for host_platform, release_profile in (
+        ("darwin", "macos-lab"),
+        ("linux", "linux-production"),
+    ):
+        monkeypatch.setattr(sys, "platform", host_platform)
+        command = _command(
+            ROOT,
+            Path(sys.executable),
+            tmp_path / "deploy.lock",
+            target="a" * 40,
+        )
+        assert command[command.index("--release-profile") + 1] == release_profile
+        assert command[command.index("--host-platform") + 1] == host_platform
 
 
 def test_generation_docs_describe_rebuilt_venv_and_initialize_restart_contract() -> None:
