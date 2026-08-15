@@ -1595,14 +1595,16 @@ def test_installed_finalizer_inherits_outer_generation_and_handoff_locks(
     fcntl.flock(handoff_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     captured: dict[str, object] = {}
     operation_id = "c" * 32
+    interpreter_fd = 97
 
     def fake_process_group(
-        args: list[str],
+        args: tuple[str, ...],
         *,
         cwd: Path,
         deadline_monotonic: float,
         check: bool,
         pass_fds: tuple[int, ...] = (),
+        executable_fd: int | None = None,
         env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         captured.update(
@@ -1611,6 +1613,7 @@ def test_installed_finalizer_inherits_outer_generation_and_handoff_locks(
             deadline_monotonic=deadline_monotonic,
             check=check,
             pass_fds=pass_fds,
+            executable_fd=executable_fd,
             env=env,
         )
         return subprocess.CompletedProcess(
@@ -1638,8 +1641,28 @@ def test_installed_finalizer_inherits_outer_generation_and_handoff_locks(
             "overall_deadline_monotonic": time.monotonic() + 30,
         }
     )
+
+    class Binding:
+        descriptor = interpreter_fd
+
+        def launch(
+            self,
+            runner: object,
+            arguments: tuple[str, ...],
+            **kwargs: object,
+        ) -> object:
+            return runner(
+                arguments,
+                executable_fd=self.descriptor,
+                pass_fds=(*kwargs.pop("pass_fds", ()), self.descriptor),
+                **kwargs,
+            )
+
     try:
-        result = production_deploy.IsolatedGenerationFinalizer(config).finalize(
+        result = production_deploy.IsolatedGenerationFinalizer(
+            config,
+            interpreter_binding=Binding(),
+        ).finalize(
             expected_commit=_sha("b"),
             operation_id=operation_id,
             action="deploy",
@@ -1650,11 +1673,144 @@ def test_installed_finalizer_inherits_outer_generation_and_handoff_locks(
         os.close(generation_fd)
 
     arguments = captured["args"]
-    assert isinstance(arguments, list)
+    assert isinstance(arguments, tuple)
     assert "--finalize-generation" in arguments
     assert arguments[arguments.index("--inherited-handoff-lock-fd") + 1] == str(handoff_fd)
-    assert captured["pass_fds"] == (generation_fd, handoff_fd)
+    assert captured["pass_fds"] == (generation_fd, handoff_fd, interpreter_fd)
+    assert captured["executable_fd"] == interpreter_fd
     assert result["commit"] == _sha("b")
+
+
+def test_process_group_forwards_explicit_executable_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run_contained(
+        args: object,
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        captured.update(args=args, **kwargs)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(production_deploy, "run_contained", fake_run_contained)
+
+    production_deploy._run_process_group(
+        ("/trusted/python", "-V"),
+        cwd=tmp_path,
+        deadline_monotonic=time.monotonic() + 30,
+        check=True,
+        pass_fds=(11,),
+        executable_fd=12,
+    )
+
+    assert captured["args"] == ("/trusted/python", "-V")
+    assert captured["pass_fds"] == (11,)
+    assert captured["executable_fd"] == 12
+
+
+def test_linux_finalizer_without_descriptor_binding_fails_closed(tmp_path: Path) -> None:
+    baseline = _config(tmp_path)
+    config = DeployConfig(
+        **{
+            **baseline.__dict__,
+            "lock_path": tmp_path / "deploy.lock",
+            "lock_fd": 7,
+            "python_path": Path(sys.executable),
+            "platform_name": "linux",
+            "overall_deadline_monotonic": time.monotonic() + 30,
+        }
+    )
+
+    with pytest.raises(PolicyError, match="descriptor binding"):
+        production_deploy.IsolatedGenerationFinalizer(config)
+
+
+def test_finalizer_descriptor_rejection_is_typed(tmp_path: Path) -> None:
+    baseline = _config(tmp_path)
+    config = DeployConfig(
+        **{
+            **baseline.__dict__,
+            "lock_path": tmp_path / "deploy.lock",
+            "lock_fd": 7,
+            "python_path": Path(sys.executable),
+            "platform_name": "linux",
+            "overall_deadline_monotonic": time.monotonic() + 30,
+        }
+    )
+
+    class RejectingBinding:
+        def launch(self, *_args: object, **_kwargs: object) -> object:
+            raise RuntimeError("descriptor execution is unavailable")
+
+    finalizer = production_deploy.IsolatedGenerationFinalizer(
+        config,
+        interpreter_binding=RejectingBinding(),
+    )
+    with pytest.raises(DeployError, match="failed to publish marker"):
+        finalizer.finalize(
+            expected_commit=_sha("b"),
+            operation_id="c" * 32,
+            action="deploy",
+            phase="publish",
+        )
+
+
+def test_main_injects_explicit_binding_into_generation_finalizer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binding = object()
+    captured: dict[str, object] = {}
+
+    def fake_deploy(
+        config: DeployConfig,
+        **kwargs: object,
+    ) -> production_deploy.DeployResult:
+        captured.update(config=config, **kwargs)
+        return production_deploy.DeployResult(
+            "already_current",
+            _sha("a"),
+            _sha("a"),
+            _sha("a"),
+            (),
+            (),
+        )
+
+    monkeypatch.setattr(production_deploy, "deploy", fake_deploy)
+    lock_path = tmp_path / "deploy.lock"
+
+    result = production_deploy.main(
+        [
+            "--target",
+            _sha("a"),
+            "--repo",
+            str(tmp_path),
+            "--deployment-lock-path",
+            str(lock_path),
+            "--deployment-lock-fd",
+            "7",
+            "--startup-generation",
+            _sha("a"),
+            "--trusted-git-path",
+            "/usr/bin/git",
+            "--python-path",
+            str(Path(sys.executable)),
+            "--uv-path",
+            "/usr/bin/true",
+            "--release-profile",
+            "linux-production",
+            "--platform-name",
+            "linux",
+        ],
+        interpreter_binding=binding,
+    )
+
+    assert result == 0
+    finalizer = captured["generation_finalizer"]
+    assert isinstance(finalizer, production_deploy.IsolatedGenerationFinalizer)
+    assert finalizer._interpreter_binding is binding
 
 
 @pytest.mark.parametrize(
@@ -2662,6 +2818,7 @@ def test_subprocess_runner_recovery_inherits_expired_global_deadline(tmp_path: P
 
 def test_isolated_finalizer_recovery_cannot_extend_original_deadline(tmp_path: Path) -> None:
     baseline = _config(tmp_path)
+    binding = object()
     original = production_deploy.IsolatedGenerationFinalizer(
         DeployConfig(
             **{
@@ -2671,11 +2828,13 @@ def test_isolated_finalizer_recovery_cannot_extend_original_deadline(tmp_path: P
                 "python_path": Path(sys.executable),
                 "overall_deadline_monotonic": time.monotonic() - 1,
             }
-        )
+        ),
+        interpreter_binding=binding,
     )
     recovered = original.for_recovery(time.monotonic() + 30)
 
     assert recovered._config.overall_deadline_monotonic < time.monotonic()
+    assert recovered._interpreter_binding is binding
 
 
 def test_subprocess_runner_uses_inherited_end_to_end_deadline(tmp_path: Path) -> None:

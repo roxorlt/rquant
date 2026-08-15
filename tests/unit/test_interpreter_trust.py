@@ -118,6 +118,40 @@ def test_attestation_rejects_fd_hash_mismatch(tmp_path: Path) -> None:
     assert binding.closed
 
 
+def test_binding_revalidates_same_descriptor_for_each_contained_launch(tmp_path: Path) -> None:
+    from rquant.interpreter_trust import InterpreterTrustState, bind_interpreter
+
+    root = tmp_path / "root"
+    root.mkdir(mode=0o700)
+    target = _interpreter(root)
+    binding = bind_interpreter(
+        _policy(root, target, sha256=hashlib.sha256(target.read_bytes()).hexdigest())
+    )
+    binding.attest()
+    launches: list[tuple[int, tuple[int, ...]]] = []
+
+    def launch(
+        _arguments: tuple[str, ...],
+        *,
+        executable_fd: int,
+        pass_fds: tuple[int, ...],
+    ) -> object:
+        launches.append((executable_fd, pass_fds))
+        return object()
+
+    try:
+        binding.launch(launch, (str(target), "-V"))
+        binding.launch(launch, (str(target), "-V"))
+
+        assert launches == [
+            (binding.descriptor, (binding.descriptor,)),
+            (binding.descriptor, (binding.descriptor,)),
+        ]
+        assert binding.state is InterpreterTrustState.READY
+    finally:
+        binding.close()
+
+
 @pytest.mark.parametrize("replace_parent", (False, True))
 def test_contained_launch_executes_attested_descriptor_after_path_replacement(
     tmp_path: Path,

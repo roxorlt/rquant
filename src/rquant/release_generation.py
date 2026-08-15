@@ -1651,18 +1651,21 @@ def _contained_run(
     check: bool = True,
     text: bool = True,
     env: dict[str, str] | None = None,
+    launch_binding: object | None = None,
 ) -> subprocess.CompletedProcess[Any]:
     deadline = _blocking_deadline(cap_seconds, timeout_provider)
     try:
-        return run_contained(
-            arguments,
-            cwd=cwd,
-            deadline_monotonic=deadline,
-            check=check,
-            text=text,
-            env=env,
-            may_spawn_background_descendants=False,
-        )
+        launch_kwargs = {
+            "cwd": cwd,
+            "deadline_monotonic": deadline,
+            "check": check,
+            "text": text,
+            "env": env,
+            "may_spawn_background_descendants": False,
+        }
+        if launch_binding is None:
+            return run_contained(arguments, **launch_kwargs)
+        return launch_binding.launch(run_contained, tuple(arguments), **launch_kwargs)
     except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
         raise ReleaseGenerationError("release generation command failed") from exc
 
@@ -1851,6 +1854,7 @@ def _python_facts(
     python_path: Path,
     *,
     timeout_provider: Callable[[float], float] | None = None,
+    interpreter_binding: object | None = None,
 ) -> tuple[str, str]:
     program = (
         "import json,sys,sysconfig;"
@@ -1866,6 +1870,7 @@ def _python_facts(
             text=True,
             cap_seconds=10,
             timeout_provider=timeout_provider,
+            launch_binding=interpreter_binding,
         )
         payload = strict_json_loads(result.stdout)
         version = str(payload["version"])
@@ -1900,6 +1905,7 @@ def _venv_system_interpreter(
     *,
     preselected_system_python: Path | None = None,
     timeout_provider: Callable[[float], float] | None = None,
+    interpreter_binding: object | None = None,
 ) -> tuple[Path, PathIdentity, str]:
     try:
         result = _contained_run(
@@ -1915,6 +1921,7 @@ def _venv_system_interpreter(
             text=True,
             cap_seconds=10,
             timeout_provider=timeout_provider,
+            launch_binding=interpreter_binding,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise ReleaseGenerationError("deployment system Python cannot be discovered") from exc
@@ -2222,6 +2229,7 @@ def _private_tree_size(
     system_python_sha256: str,
     checkpoint: Callable[[], None] | None = None,
     timeout_provider: Callable[[float], float] | None = None,
+    interpreter_binding: object | None = None,
 ) -> int:
     total = 0
     for current_root, directory_names, file_names in os.walk(root):
@@ -2251,6 +2259,7 @@ def _private_tree_size(
                     system_python_sha256=system_python_sha256,
                     checkpoint=checkpoint,
                     timeout_provider=timeout_provider,
+                    interpreter_binding=interpreter_binding,
                 )
                 continue
             if stat.S_ISREG(observed.st_mode):
@@ -2340,6 +2349,7 @@ def _environment_entry(
     system_python_sha256: str,
     checkpoint: Callable[[], None] | None = None,
     timeout_provider: Callable[[float], float] | None = None,
+    interpreter_binding: object | None = None,
 ) -> dict[str, Any]:
     if checkpoint is not None:
         checkpoint()
@@ -2349,6 +2359,7 @@ def _environment_entry(
         version, _abi = _python_facts(
             system_python,
             timeout_provider=timeout_provider,
+            interpreter_binding=interpreter_binding,
         )
         major_minor = ".".join(version.split(".")[:2])
         allowed = _VENV_RELATIVE_SYMLINKS | {
@@ -2428,6 +2439,7 @@ def _freeze_environment(
     system_python_sha256: str,
     checkpoint: Callable[[], None] | None = None,
     timeout_provider: Callable[[float], float] | None = None,
+    interpreter_binding: object | None = None,
 ) -> None:
     for current_root, directory_names, file_names in os.walk(root, topdown=False):
         if checkpoint is not None:
@@ -2446,6 +2458,7 @@ def _freeze_environment(
                     system_python_identity=system_python_identity,
                     system_python_sha256=system_python_sha256,
                     timeout_provider=timeout_provider,
+                    interpreter_binding=interpreter_binding,
                 )
                 continue
             if not stat.S_ISREG(observed.st_mode) or stat.S_ISLNK(observed.st_mode):
@@ -2464,6 +2477,7 @@ def _freeze_environment(
                     system_python_identity=system_python_identity,
                     system_python_sha256=system_python_sha256,
                     timeout_provider=timeout_provider,
+                    interpreter_binding=interpreter_binding,
                 )
                 continue
             if not stat.S_ISDIR(observed.st_mode) or stat.S_ISLNK(observed.st_mode):
@@ -2519,12 +2533,14 @@ def _environment_manifest(
     uv_binding: dict[str, object] | None,
     checkpoint: Callable[[], None] | None = None,
     timeout_provider: Callable[[float], float] | None = None,
+    interpreter_binding: object | None = None,
 ) -> dict[str, Any]:
     entry_arguments = {
         "system_python": system_python,
         "system_python_identity": system_python_identity,
         "system_python_sha256": system_python_sha256,
         "timeout_provider": timeout_provider,
+        "interpreter_binding": interpreter_binding,
     }
     entries = [_environment_entry(root, root, checkpoint=checkpoint, **entry_arguments)]
     paths: list[Path] = []
@@ -2559,6 +2575,7 @@ def _verify_environment_manifest(
     *,
     checkpoint: Callable[[], None] | None = None,
     timeout_provider: Callable[[float], float] | None = None,
+    interpreter_binding: object | None = None,
 ) -> None:
     if int(manifest.get("schema_version", 0)) != ENVIRONMENT_SCHEMA_VERSION or manifest.get(
         "environment_path"
@@ -2621,6 +2638,7 @@ def _verify_environment_manifest(
             system_python_sha256=system_sha256,
             checkpoint=checkpoint,
             timeout_provider=timeout_provider,
+            interpreter_binding=interpreter_binding,
         )
         if observed != entry:
             raise ReleaseGenerationError("environment generation content changed")
@@ -2651,6 +2669,8 @@ class ReleaseGenerationAuthority:
         gc_grace_seconds: float | None = None,
         minimum_free_bytes: int | None = None,
         uv_path: Path | None = None,
+        uv_launch_binding: object | None = None,
+        interpreter_binding: object | None = None,
         environment_builder: Callable[[Path], None] | None = None,
         immutable_code_root: Path | None = None,
         command_timeout_seconds: float = 900,
@@ -2676,6 +2696,8 @@ class ReleaseGenerationAuthority:
             if self.uv_path is None
             else _trusted_executable_binding(self.uv_path, label="release uv")
         )
+        self.uv_launch_binding = uv_launch_binding
+        self.interpreter_binding = interpreter_binding
         self._environment_builder = environment_builder
         self.immutable_code_root = (
             None
@@ -2725,6 +2747,8 @@ class ReleaseGenerationAuthority:
             gc_grace_seconds=self.gc_grace_seconds,
             minimum_free_bytes=self.minimum_free_bytes,
             uv_path=self.uv_path,
+            uv_launch_binding=self.uv_launch_binding,
+            interpreter_binding=self.interpreter_binding,
             environment_builder=self._environment_builder,
             immutable_code_root=self.immutable_code_root,
             command_timeout_seconds=self.command_timeout_seconds,
@@ -2782,14 +2806,21 @@ class ReleaseGenerationAuthority:
             if remaining <= 0:
                 raise ReleaseGenerationError("immutable release environment build timed out")
             try:
-                result = run_contained(
-                    command,
-                    cwd=self.repo if project_root is None else project_root,
-                    deadline_monotonic=self.overall_deadline_monotonic,
-                    env=environment,
-                    cancellation_check=self._cancellation_check,
-                    may_spawn_background_descendants=False,
-                )
+                launch_kwargs = {
+                    "cwd": self.repo if project_root is None else project_root,
+                    "deadline_monotonic": self.overall_deadline_monotonic,
+                    "env": environment,
+                    "cancellation_check": self._cancellation_check,
+                    "may_spawn_background_descendants": False,
+                }
+                if self.uv_launch_binding is None:
+                    result = run_contained(command, **launch_kwargs)
+                else:
+                    result = self.uv_launch_binding.launch(
+                        run_contained,
+                        tuple(command),
+                        **launch_kwargs,
+                    )
             except ReleaseGenerationError:
                 raise
             except subprocess.TimeoutExpired as exc:
@@ -2805,6 +2836,10 @@ class ReleaseGenerationAuthority:
                     ) from exc
                 raise ReleaseGenerationError(
                     "immutable release environment build timed out or escaped containment"
+                ) from exc
+            except RuntimeError as exc:
+                raise ReleaseGenerationError(
+                    "immutable release environment descriptor launch failed"
                 ) from exc
             if result.returncode != 0:
                 diagnostic = (result.stderr or result.stdout or "no command output").strip()
@@ -2883,6 +2918,7 @@ class ReleaseGenerationAuthority:
             manifest,
             checkpoint=self._checkpoint,
             timeout_provider=self._absolute_command_deadline,
+            interpreter_binding=self.interpreter_binding,
         )
         venv_identity = _identity(venv, label="release venv", directory=True)
         selected_python = venv / "bin" / "python"
@@ -2913,6 +2949,7 @@ class ReleaseGenerationAuthority:
         version, abi = _python_facts(
             selected_python,
             timeout_provider=self._absolute_command_deadline,
+            interpreter_binding=self.interpreter_binding,
         )
         major_minor = ".".join(version.split(".")[:2])
         site_packages = venv / "lib" / f"python{major_minor}" / "site-packages"
@@ -3780,6 +3817,7 @@ class ReleaseGenerationAuthority:
             manifest,
             checkpoint=self._checkpoint,
             timeout_provider=self._absolute_command_deadline,
+            interpreter_binding=self.interpreter_binding,
         )
         self._assert_lock()
         return selector
@@ -4392,6 +4430,7 @@ class ReleaseGenerationAuthority:
         system_python, system_python_identity, system_python_sha256 = _venv_system_interpreter(
             self.python_path,
             timeout_provider=self._absolute_command_deadline,
+            interpreter_binding=self.interpreter_binding,
         )
         source_bytes = _private_tree_size(
             source_venv,
@@ -4400,6 +4439,7 @@ class ReleaseGenerationAuthority:
             system_python_sha256=system_python_sha256,
             checkpoint=self._checkpoint,
             timeout_provider=self._absolute_command_deadline,
+            interpreter_binding=self.interpreter_binding,
         )
         if allow_gc:
             self.garbage_collect_environments(
@@ -4489,6 +4529,7 @@ class ReleaseGenerationAuthority:
                         system_python_sha256=system_python_sha256,
                         checkpoint=self._checkpoint,
                         timeout_provider=self._absolute_command_deadline,
+                        interpreter_binding=self.interpreter_binding,
                     )
                 except BaseException:
                     if staging_path.exists() and not staging_path.is_symlink():
@@ -4504,6 +4545,7 @@ class ReleaseGenerationAuthority:
                     system_python_sha256=system_python_sha256,
                     checkpoint=self._checkpoint,
                     timeout_provider=self._absolute_command_deadline,
+                    interpreter_binding=self.interpreter_binding,
                 )
                 active_environment = _identity(
                     self.environment_root,
@@ -4529,6 +4571,7 @@ class ReleaseGenerationAuthority:
                     uv_binding=self.uv_binding,
                     checkpoint=self._checkpoint,
                     timeout_provider=self._absolute_command_deadline,
+                    interpreter_binding=self.interpreter_binding,
                 )
                 manifest_hash = _payload_hash(manifest, checkpoint=self._checkpoint)
                 root_fd, root_identity = _private_lock_root(self.lock_path.parent)
@@ -4560,6 +4603,7 @@ class ReleaseGenerationAuthority:
                     manifest,
                     checkpoint=self._checkpoint,
                     timeout_provider=self._absolute_command_deadline,
+                    interpreter_binding=self.interpreter_binding,
                 )
                 manifest_hash = _payload_hash(manifest, checkpoint=self._checkpoint)
             selector = EnvironmentSelector(

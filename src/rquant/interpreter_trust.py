@@ -180,12 +180,19 @@ class InterpreterTrustBinding:
         if not isinstance(inherited, tuple) or not all(type(fd) is int for fd in inherited):
             self._reject()
             raise InterpreterTrustError("contained launch descriptors are invalid")
-        return runner(
-            arguments,
-            executable_fd=descriptor,
-            pass_fds=(*inherited, descriptor),
-            **kwargs,
-        )
+        try:
+            result = runner(
+                arguments,
+                executable_fd=descriptor,
+                pass_fds=(*inherited, descriptor),
+                **kwargs,
+            )
+        except BaseException:
+            self._reject()
+            raise
+        self.state = InterpreterTrustState.EXECUTED
+        self.state = InterpreterTrustState.READY
+        return result
 
     def close(self) -> None:
         if self.closed:
