@@ -186,7 +186,7 @@ try:
             st.session_state.nl_result_df = page_result.value.rows
             st.session_state.nl_diagnostics = page_result.value.diagnostics
             st.session_state.nl_next_cursor = page_result.value.next_cursor
-            st.session_state.nl_current_cursor = cursor
+            st.session_state.nl_current_cursor = page_result.value.start_cursor
 
         st.success(f"✅ 解析成功 · trade_date={nl_plan_dict['trade_date']}")
         if nl_plan_dict.get("rationale"):

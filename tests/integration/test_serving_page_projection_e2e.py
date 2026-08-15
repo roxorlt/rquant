@@ -184,6 +184,7 @@ def test_nl_page_cursor_pins_historical_generation_and_fails_closed_at_budget(
     assert first.generation_id == first_generation
     assert first.value.rows["name"].tolist() == ["旧乙"]
     assert first.value.next_cursor is not None
+    assert first.value.start_cursor is not None
 
     _publish_nl_page_generation(
         root,
@@ -203,6 +204,19 @@ def test_nl_page_cursor_pins_historical_generation_and_fails_closed_at_budget(
     )
     assert second.generation_id == first_generation
     assert second.value.rows["name"].tolist() == ["旧丙"]
+
+    previous = read_nl_screen_page(
+        root,
+        trade_date="2026-07-31",
+        rules=(lambda frame: frame["CLOSE[0]"] > 1.0,),
+        rule_labels=("gt(CLOSE[0], 1)",),
+        normalized_plan=query,
+        page_size=1,
+        cursor=first.value.start_cursor,
+        now=NOW + timedelta(seconds=1),
+    )
+    assert previous.generation_id == first_generation
+    assert previous.value.rows["name"].tolist() == ["旧乙"]
 
     with pytest.raises(NlScreenPageError, match="requires rerun"):
         read_nl_screen_page(

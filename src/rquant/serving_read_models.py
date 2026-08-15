@@ -1345,18 +1345,25 @@ class NlScreenPageError(ValueError):
 
 
 class NlScreenCursor(RuntimeContractModel):
-    cursor_type: Literal["nl_screen_page"] = _NL_SCREEN_CURSOR_TYPE
+    cursor_type: Literal["nl_screen_page"]
     generation_id: GenerationId
     query_digest: GenerationId
-    last_trade_date: date
-    last_ts_code: StrictStr = Field(min_length=1)
-    order_version: Literal["trade_date_ts_code_v1"] = _NL_SCREEN_ORDER_VERSION
+    last_trade_date: date | None
+    last_ts_code: StrictStr | None
+    order_version: Literal["trade_date_ts_code_v1"]
+
+    @model_validator(mode="after")
+    def validate_last_key(self) -> Self:
+        if (self.last_trade_date is None) != (self.last_ts_code is None):
+            raise ValueError("nl screen cursor last key must be fully empty or fully populated")
+        return self
 
 
 @dataclass(frozen=True)
 class NlScreenPage:
     rows: pd.DataFrame
     diagnostics: tuple[tuple[str, int], ...]
+    start_cursor: str
     next_cursor: str | None
     generation_id: str
     query_digest: str
@@ -1408,6 +1415,23 @@ def validate_nl_screen_cursor(
         raise NlScreenPageError("nl screen cursor requires rerun: query changed")
     if cursor.order_version != _NL_SCREEN_ORDER_VERSION:
         raise NlScreenPageError("nl screen cursor requires rerun: ordering changed")
+
+
+def _nl_screen_cursor(
+    *,
+    generation_id: str,
+    query_digest: str,
+    last_trade_date: date | None,
+    last_ts_code: str | None,
+) -> NlScreenCursor:
+    return NlScreenCursor(
+        cursor_type=_NL_SCREEN_CURSOR_TYPE,
+        generation_id=generation_id,
+        query_digest=query_digest,
+        last_trade_date=last_trade_date,
+        last_ts_code=last_ts_code,
+        order_version=_NL_SCREEN_ORDER_VERSION,
+    )
 
 
 def screen_nl_projection(
@@ -1480,6 +1504,16 @@ def paginate_nl_screen_projection(
             generation_id=generation_id,
             query_digest=query_digest,
         )
+    start_cursor = encode_nl_screen_cursor(
+        decoded
+        if decoded is not None
+        else _nl_screen_cursor(
+            generation_id=generation_id,
+            query_digest=query_digest,
+            last_trade_date=None,
+            last_ts_code=None,
+        )
+    )
     screened, diagnostics = screen_nl_projection(
         universe,
         trade_date=trade_date,
@@ -1488,15 +1522,26 @@ def paginate_nl_screen_projection(
         include_columns=include_columns,
     )
     requested_date = date.fromisoformat(trade_date)
-    if decoded is not None:
-        after = screened["ts_code"].astype("string").gt(decoded.last_ts_code)
-        screened = screened.loc[after.fillna(False)]
+    if decoded is not None and decoded.last_trade_date is not None:
+        assert decoded.last_ts_code is not None
+        cursor_key = (decoded.last_trade_date, decoded.last_ts_code)
+        snapshot_keys = tuple(
+            (requested_date, str(code)) for code in screened["ts_code"].astype("string")
+        )
+        if cursor_key not in snapshot_keys:
+            raise NlScreenPageError("nl screen cursor requires rerun: snapshot key is missing")
+        after = pd.Series(
+            (key > cursor_key for key in snapshot_keys),
+            index=screened.index,
+            dtype="boolean",
+        )
+        screened = screened.loc[after]
     rows = screened.iloc[:page_size].reset_index(drop=True)
     has_next = len(screened) > len(rows)
     next_cursor = None
     if has_next:
         next_cursor = encode_nl_screen_cursor(
-            NlScreenCursor(
+            _nl_screen_cursor(
                 generation_id=generation_id,
                 query_digest=query_digest,
                 last_trade_date=requested_date,
@@ -1506,6 +1551,7 @@ def paginate_nl_screen_projection(
     return NlScreenPage(
         rows=rows,
         diagnostics=diagnostics,
+        start_cursor=start_cursor,
         next_cursor=next_cursor,
         generation_id=generation_id,
         query_digest=query_digest,

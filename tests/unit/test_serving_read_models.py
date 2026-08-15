@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from base64 import urlsafe_b64decode, urlsafe_b64encode
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
@@ -535,6 +537,10 @@ def test_nl_projection_cursor_is_deterministic_and_rejects_query_mismatch() -> N
         {"ts_code": "600001.SH", "name": "乙", "CLOSE[0]": 2.0, "PCT_CHG[0]": 1.0}
     ]
     assert first.next_cursor is not None
+    assert first.start_cursor is not None
+    start = decode_nl_screen_cursor(first.start_cursor)
+    assert start.last_trade_date is None
+    assert start.last_ts_code is None
     decoded = decode_nl_screen_cursor(first.next_cursor)
     assert decoded.generation_id == "a" * 64
     assert encode_nl_screen_cursor(decoded) == first.next_cursor
@@ -550,6 +556,104 @@ def test_nl_projection_cursor_is_deterministic_and_rejects_query_mismatch() -> N
             universe,
             cursor=first.next_cursor,
             **{**kwargs, "generation_id": "b" * 64},
+        )
+
+
+def _rewrite_nl_cursor(token: str, **updates: object) -> str:
+    padding = "=" * (-len(token) % 4)
+    payload = json.loads(urlsafe_b64decode(f"{token}{padding}"))
+    payload.update(updates)
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return urlsafe_b64encode(encoded).decode("ascii").rstrip("=")
+
+
+@pytest.mark.parametrize(
+    ("updates", "removed"),
+    [
+        ({}, "cursor_type"),
+        ({}, "order_version"),
+        ({"cursor_type": "wrong"}, None),
+        ({"order_version": "wrong"}, None),
+        ({"unexpected": True}, None),
+        ({"last_trade_date": None}, None),
+        ({"last_ts_code": None}, None),
+    ],
+)
+def test_nl_projection_cursor_schema_rejects_missing_wrong_extra_and_half_keys(
+    updates: dict[str, object],
+    removed: str | None,
+) -> None:
+    universe = pd.DataFrame(
+        {
+            "trade_date": [date(2026, 7, 31)] * 2,
+            "ts_code": ["600000.SH", "600001.SH"],
+            "name": ["甲", "乙"],
+            "CLOSE[0]": [1.0, 2.0],
+            "PCT_CHG[0]": [0.0, 1.0],
+        }
+    )
+    kwargs = {
+        "generation_id": "a" * 64,
+        "trade_date": "2026-07-31",
+        "rules": (),
+        "rule_labels": (),
+        "normalized_plan": {"trade_date": "2026-07-31", "rule": "all"},
+        "page_size": 1,
+    }
+    cursor = paginate_nl_screen_projection(universe, **kwargs).next_cursor
+    assert cursor is not None
+    padding = "=" * (-len(cursor) % 4)
+    payload = json.loads(urlsafe_b64decode(f"{cursor}{padding}"))
+    if removed is not None:
+        payload.pop(removed)
+    payload.update(updates)
+    malformed = (
+        urlsafe_b64encode(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        )
+        .decode("ascii")
+        .rstrip("=")
+    )
+
+    with pytest.raises(NlScreenPageError, match="requires rerun"):
+        paginate_nl_screen_projection(universe, cursor=malformed, **kwargs)
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"last_trade_date": "2026-07-30"},
+        {"last_ts_code": "699999.SH"},
+    ],
+)
+def test_nl_projection_cursor_rejects_tampered_or_missing_snapshot_key(
+    updates: dict[str, object],
+) -> None:
+    universe = pd.DataFrame(
+        {
+            "trade_date": [date(2026, 7, 31)] * 2,
+            "ts_code": ["600000.SH", "600001.SH"],
+            "name": ["甲", "乙"],
+            "CLOSE[0]": [1.0, 2.0],
+            "PCT_CHG[0]": [0.0, 1.0],
+        }
+    )
+    kwargs = {
+        "generation_id": "a" * 64,
+        "trade_date": "2026-07-31",
+        "rules": (),
+        "rule_labels": (),
+        "normalized_plan": {"trade_date": "2026-07-31", "rule": "all"},
+        "page_size": 1,
+    }
+    cursor = paginate_nl_screen_projection(universe, **kwargs).next_cursor
+    assert cursor is not None
+
+    with pytest.raises(NlScreenPageError, match="requires rerun"):
+        paginate_nl_screen_projection(
+            universe,
+            cursor=_rewrite_nl_cursor(cursor, **updates),
+            **kwargs,
         )
 
 
