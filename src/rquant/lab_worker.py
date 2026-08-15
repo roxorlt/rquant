@@ -1779,10 +1779,27 @@ class LabWireSessionError(RuntimeError):
     """An authenticated wire session failed after its start ACK."""
 
 
+def _extract_wire_session_error(
+    error: BaseException,
+) -> LabWireSessionStartupError | LabWireSessionError | None:
+    if isinstance(error, (LabWireSessionStartupError, LabWireSessionError)):
+        return error
+    if not isinstance(error, BaseExceptionGroup):
+        return None
+    for nested in error.exceptions:
+        extracted = _extract_wire_session_error(nested)
+        if extracted is not None:
+            return extracted
+    return None
+
+
 def _classify_wire_failure(error: Exception) -> _ClassifiedWireFailure:
+    wire_error = _extract_wire_session_error(error)
+    if wire_error is None:
+        raise ValueError("wire failure classification requires a wire session error")
     return _ClassifiedWireFailure(
         failure_kind=(
-            "session_startup" if isinstance(error, LabWireSessionStartupError) else "session"
+            "session_startup" if isinstance(wire_error, LabWireSessionStartupError) else "session"
         ),
         error=error,
     )
@@ -4610,7 +4627,10 @@ class LabWorker:
                 session_failures.append(_classify_wire_failure(exc))
                 return
             except Exception as exc:
-                errors.append(exc)
+                if _extract_wire_session_error(exc) is not None:
+                    session_failures.append(_classify_wire_failure(exc))
+                else:
+                    errors.append(exc)
                 return
             if decision is not None and decision.outcome is not AdmissionOutcome.ADMITTED:
                 preemptions.append(decision)
@@ -4930,7 +4950,10 @@ class LabWorker:
                 session_failure = _classify_wire_failure(exc)
                 return
             except Exception as exc:
-                resource_error = exc
+                if _extract_wire_session_error(exc) is not None:
+                    session_failure = _classify_wire_failure(exc)
+                else:
+                    resource_error = exc
                 return
             apply_resource_evaluation(
                 evaluation,
@@ -4985,7 +5008,10 @@ class LabWorker:
                     pre_ack_session_failure = _classify_wire_failure(exc)
             except Exception as exc:
                 if not cancelled():
-                    pre_ack_resource_error = exc
+                    if _extract_wire_session_error(exc) is not None:
+                        pre_ack_session_failure = _classify_wire_failure(exc)
+                    else:
+                        pre_ack_resource_error = exc
             else:
                 if not cancelled():
                     pre_ack_evaluation = evaluation
@@ -5185,7 +5211,10 @@ class LabWorker:
         except (LabWireSessionStartupError, LabWireSessionError) as exc:
             session_failure = _classify_wire_failure(exc)
         except Exception as exc:
-            resource_error = exc
+            if _extract_wire_session_error(exc) is not None:
+                session_failure = _classify_wire_failure(exc)
+            else:
+                resource_error = exc
         except BaseException as exc:
             lifecycle_error = exc
         finally:
@@ -6488,15 +6517,17 @@ class LabWorker:
                     post_publish_admission_stage,
                     operation="admission",
                 )
-                resource_errors.append(exc)
+                if _extract_wire_session_error(exc) is not None:
+                    session_failures.append(_classify_wire_failure(exc))
+                else:
+                    resource_errors.append(exc)
             if self._stop.is_set():
                 stop_reason = "worker stop requested after candidate serialization"
 
-        if resource_errors and isinstance(
-            resource_errors[0],
-            (LabWireSessionStartupError, LabWireSessionError),
-        ):
-            session_failures.append(_classify_wire_failure(resource_errors.pop(0)))
+        for index, resource_error in enumerate(resource_errors):
+            if _extract_wire_session_error(resource_error) is not None:
+                session_failures.append(_classify_wire_failure(resource_errors.pop(index)))
+                break
         if session_failures or (operation_error is not None and operation_phase == "session"):
             self._cancel_prestarted_authority_stage(
                 post_publish_admission_stage,
@@ -6802,6 +6833,22 @@ class LabWorker:
                 post_publish_admission_stage,
                 operation="admission",
             )
+            if _extract_wire_session_error(exc) is not None:
+                try:
+                    self._rollback_sealed(claim, bundle)
+                except Exception as rollback_error:
+                    return self._failure_result(
+                        claim,
+                        phase="fence",
+                        error=rollback_error,
+                    )
+                wire_failure = _classify_wire_failure(exc)
+                return self._failure_result(
+                    claim,
+                    phase="session",
+                    error=wire_failure.error,
+                    failure_kind=wire_failure.failure_kind,
+                )
             if self._pending_success is None:
                 try:
                     self._rollback_sealed(claim, bundle)

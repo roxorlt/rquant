@@ -1957,11 +1957,12 @@ def test_result_wire_outbound_gate_matches_parent_receive_limit_without_large_al
         ("fence", "fence"),
         ("seal", "seal"),
     ):
-        failure = lab_worker.LabWorkerFailure.model_validate(
-            {"phase": phase, "error_type": "RuntimeError", "message": "failed"}
+        failure = lab_worker.LabWorkerFailure.model_validate_json(
+            json.dumps({"phase": phase, "error_type": "RuntimeError", "message": "failed"})
         )
         assert failure.failure_kind == expected_kind
         assert '"failure_kind"' in failure.canonical_json()
+        assert json.loads(failure.model_dump_json())["failure_kind"] == expected_kind
     explicit_startup = lab_worker.LabWorkerFailure(
         phase="session",
         failure_kind="session_startup",
@@ -4431,6 +4432,66 @@ def test_resource_reservation_releases_when_shard_spawn_fails(
     assert authority_failure.phase == "session"
     assert authority_failure.failure_kind == "session_startup"
     assert "runtime authority bind failed" in authority_failure.message
+
+    grouped_cases = (
+        (
+            lab_worker.LabWireSessionStartupError("runtime authority ACK transport failed"),
+            "session_startup",
+        ),
+        (
+            lab_worker.LabWireSessionError("runtime authority receive transport failed"),
+            "session",
+        ),
+    )
+    for index, (wire_error, expected_kind) in enumerate(grouped_cases):
+        grouped_claims = LabClaimSpool(tmp_path / f"grouped-authority-{index}-claims")
+        grouped_reports = LabReportSpool(tmp_path / f"grouped-authority-{index}-reports")
+        grouped_claim = _claim(_nshape_compare_spec(hold_days=(1,)))
+        grouped_claims.publish(grouped_claim)
+        grouped_worker = _worker(
+            tmp_path,
+            claims=grouped_claims,
+            reports=grouped_reports,
+            resource_snapshot_provider=StaticResourceSnapshotProvider(_healthy_resource_snapshot()),
+            admission_policy_provider=StaticAdmissionPolicyProvider(_permissive_admission_policy()),
+            require_resource_admission=True,
+        )
+        grouped_error = BaseExceptionGroup(
+            "runtime authority and cleanup failed",
+            [wire_error, OSError("runtime authority cleanup denied")],
+        )
+        monkeypatch.setattr(
+            grouped_worker,
+            "_resource_admission_evaluation",
+            lambda *_args, _error=grouped_error, **_kwargs: (_ for _ in ()).throw(_error),
+        )
+
+        grouped_result = grouped_worker.run_once()
+
+        grouped_failure = _reported_failure(grouped_reports)
+        assert grouped_result.status == "failed"
+        assert grouped_failure.phase == "session"
+        assert grouped_failure.failure_kind == expected_kind
+        assert str(wire_error) in grouped_failure.message
+        assert "runtime authority cleanup denied" in grouped_failure.message
+        assert (grouped_claims.ack_dir / f"{grouped_claim.claim_token}.json").is_file()
+        assert (grouped_claims.admitted_dir / f"{grouped_claim.claim_token}.json").is_file()
+
+    nested_wire_error = lab_worker.LabWireSessionError("nested receive failed")
+    nested_group = BaseExceptionGroup(
+        "outer authority failure",
+        [
+            OSError("outer cleanup failed"),
+            BaseExceptionGroup("nested authority failure", [nested_wire_error]),
+        ],
+    )
+    assert lab_worker._extract_wire_session_error(nested_group) is nested_wire_error
+    assert (
+        lab_worker._extract_wire_session_error(
+            BaseExceptionGroup("cleanup only", [OSError("cleanup failed")])
+        )
+        is None
+    )
 
 
 def test_resource_admission_rejects_a_stale_snapshot_before_claim_consumption(
@@ -10287,6 +10348,35 @@ def test_worker_reports_typed_failure_without_sealing(tmp_path: Path) -> None:
     assert failure.phase == "execute"
     assert failure.failure_kind == "execution"
     assert not worker.sealed_bundle_path(claim).exists()
+
+    invalid_claims = LabClaimSpool(tmp_path / "invalid-claims")
+    invalid_reports = LabReportSpool(tmp_path / "invalid-reports")
+    invalid_definition = type(claim.definition).from_payload(
+        shard_index=claim.definition.shard_index,
+        adapter_id=claim.definition.adapter_id,
+        adapter_version=claim.definition.adapter_version,
+        plan_hash=claim.definition.plan_hash,
+        payload_json="{}",
+        work_plan=claim.definition.work_plan,
+    )
+    invalid_claim = LabShardClaim.model_validate(
+        {**claim.model_dump(mode="python"), "definition": invalid_definition},
+        strict=True,
+    )
+    invalid_claims.publish(invalid_claim)
+    invalid_worker = _worker(
+        tmp_path,
+        claims=invalid_claims,
+        reports=invalid_reports,
+    )
+
+    invalid_result = invalid_worker.run_once()
+
+    invalid_failure = _reported_failure(invalid_reports)
+    assert invalid_result.status == "failed"
+    assert invalid_failure.phase == "claim"
+    assert invalid_failure.failure_kind == "claim_validation"
+    assert '"failure_kind":"claim_validation"' in _reports(invalid_reports)[-1].body.failure_json
 
 
 def test_worker_deadline_before_execute_fails_without_running_shard(tmp_path: Path) -> None:
