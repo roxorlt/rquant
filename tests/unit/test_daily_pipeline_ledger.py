@@ -97,6 +97,23 @@ def test_create_claim_and_complete_only_ready_stage(tmp_path: Path) -> None:
 
 
 def test_lease_expiry_and_fence_mismatch_raise_typed_authority_loss(tmp_path: Path) -> None:
+    expiry_only_root = tmp_path / "expiry-only"
+    expiry_only_root.mkdir()
+    expiry_only_ledger = _ledger(expiry_only_root)
+    expiry_only_lease = expiry_only_ledger.acquire_writer(
+        owner="daily-close",
+        now=NOW,
+        lease_for=timedelta(seconds=1),
+    )
+
+    assert expiry_only_lease.service_owner == "daily-close"
+    assert expiry_only_lease.fencing_token == 1
+    with pytest.raises(LeaseLost, match="writer lease"):
+        expiry_only_ledger.claim_next(
+            expiry_only_lease,
+            now=expiry_only_lease.expires_at + timedelta(microseconds=1),
+        )
+
     ledger = _ledger(tmp_path)
     lease = ledger.acquire_writer(
         owner="daily-close",

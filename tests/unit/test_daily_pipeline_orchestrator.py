@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
+from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -210,7 +212,12 @@ class ProcessAdapter:
         return None
 
 
-def _process_orchestrator(tmp_path: Path, adapter: ProcessAdapter):
+def _process_orchestrator(
+    tmp_path: Path,
+    adapter: ProcessAdapter,
+    *,
+    monotonic_clock: Callable[[], float] = time.monotonic,
+):
     from rquant.daily_pipeline_orchestrator import (
         DailyPipelineDefinition,
         DailyPipelineOrchestrator,
@@ -237,6 +244,7 @@ def _process_orchestrator(tmp_path: Path, adapter: ProcessAdapter):
         adapters=(adapter,),
         source_resolver=StaticSourceResolver(),
         clock=lambda: NOW,
+        monotonic_clock=monotonic_clock,
     )
 
 
@@ -268,17 +276,22 @@ def test_spawn_boundary_lease_loss_does_not_run_command_or_fail_stage(
     orchestrator = _process_orchestrator(tmp_path, adapter)
     run = _create_process_run(orchestrator)
 
-    monkeypatch.setattr(
-        orchestrator,
-        "_heartbeat",
-        lambda _lease, _attempt: (_ for _ in ()).throw(LeaseLost("writer lease is stale")),
-    )
+    with monkeypatch.context() as lease_loss_patch:
+        lease_loss_patch.setattr(
+            orchestrator,
+            "_heartbeat",
+            lambda _lease, _attempt: (_ for _ in ()).throw(LeaseLost("writer lease is stale")),
+        )
 
-    with pytest.raises(LeaseLost, match="writer lease"):
-        orchestrator.advance(run.run_id, now=NOW)
+        with pytest.raises(LeaseLost, match="writer lease"):
+            orchestrator.advance(run.run_id, now=NOW)
 
     assert adapter.command_calls == 0
     _assert_running_without_terminal_mutation(orchestrator, run.run_id)
+    _assert_injected_monotonic_clock_caps_heartbeat_wait_and_enforces_deadline(
+        tmp_path / "monotonic-clock",
+        monkeypatch,
+    )
 
 
 def test_live_child_lease_loss_terminates_and_reaps_its_process_group(
@@ -383,6 +396,85 @@ def test_normal_leader_exit_cleans_descendants_before_reporting_child_failure(
     assert len(started_processes) == 1
     with pytest.raises(ProcessLookupError):
         os.killpg(started_processes[0].pid, 0)
+
+
+def _assert_injected_monotonic_clock_caps_heartbeat_wait_and_enforces_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.daily_pipeline_orchestrator as orchestrator_module
+
+    tmp_path.mkdir()
+    monotonic_values = [
+        100.0,
+        200.0,
+        200.0,
+        229.75,
+        230.000001,
+        230.000001,
+    ]
+    observed_monotonic: list[float] = []
+    values = iter(monotonic_values)
+
+    def monotonic_clock() -> float:
+        value = next(values)
+        observed_monotonic.append(value)
+        return value
+
+    class TimeoutProcess:
+        pid = 12345
+        args = ("controlled-child",)
+        returncode = None
+
+        def __init__(self) -> None:
+            self.wait_timeouts: list[float] = []
+
+        def wait(self, timeout: float) -> int:
+            self.wait_timeouts.append(timeout)
+            raise subprocess.TimeoutExpired(self.args, timeout)
+
+    adapter = ProcessAdapter(tmp_path / "child-pid")
+    orchestrator = _process_orchestrator(
+        tmp_path,
+        adapter,
+        monotonic_clock=monotonic_clock,
+    )
+    run = _create_process_run(orchestrator)
+    process = TimeoutProcess()
+    termination_calls: list[TimeoutProcess] = []
+    heartbeat_calls = 0
+    original_heartbeat = orchestrator._heartbeat
+
+    def record_heartbeat(lease, attempt):
+        nonlocal heartbeat_calls
+        heartbeat_calls += 1
+        return original_heartbeat(lease, attempt)
+
+    monkeypatch.setattr(
+        orchestrator_module.subprocess,
+        "Popen",
+        lambda *args, **kwargs: process,
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_terminate_process_group",
+        lambda observed: termination_calls.append(observed),
+    )
+    monkeypatch.setattr(orchestrator, "_heartbeat", record_heartbeat)
+
+    outcome = orchestrator.advance(run.run_id, now=NOW)
+
+    deadline = monotonic_values[1] + 30
+    assert orchestrator_module._HEARTBEAT_INTERVAL_SECONDS == 2.0
+    assert orchestrator.definition.runtime_spec("capture").budget.max_wall_seconds == 30
+    assert monotonic_values[3] < deadline < monotonic_values[4]
+    assert process.wait_timeouts == pytest.approx([2.0, deadline - monotonic_values[3]])
+    assert observed_monotonic == monotonic_values
+    assert heartbeat_calls == 4
+    assert termination_calls == [process]
+    assert outcome is not None
+    assert outcome.disposition == "failed"
+    assert outcome.failure_code == "resource_budget_exceeded"
 
 
 def test_daily_definition_has_the_isolated_a_to_d_stage_order() -> None:
