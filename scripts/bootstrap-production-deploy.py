@@ -68,6 +68,37 @@ def _load_strict_json() -> tuple[
 ) = _load_strict_json()
 
 
+def _bind_bootstrap_interpreter(path: Path) -> object:
+    """Bind the shell-preselected venv target before importing project code."""
+
+    trust_path = Path(__file__).resolve().parents[1] / "src" / "rquant" / "interpreter_trust.py"
+    spec = importlib.util.spec_from_file_location("_rquant_bootstrap_interpreter_trust", trust_path)
+    if spec is None or spec.loader is None:
+        raise DeployBootstrapError("interpreter trust authority cannot be loaded")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    try:
+        canonical = path.resolve(strict=True)
+        observed = canonical.lstat()
+    except OSError as exc:
+        raise DeployBootstrapError("deployment Python is unavailable") from exc
+    policy = module.InterpreterTrustPolicy(
+        profile="production-deploy-bootstrap",
+        canonical_interpreter=canonical,
+        trusted_anchor=canonical.parent,
+        owner_uid=observed.st_uid,
+        allowed_mode=stat.S_IMODE(observed.st_mode),
+        sha256=hashlib.sha256(canonical.read_bytes()).hexdigest(),
+    )
+    try:
+        binding = module.bind_interpreter(policy)
+        binding.attest()
+        return binding
+    except module.InterpreterTrustError as exc:
+        raise DeployBootstrapError("deployment Python trust binding failed") from exc
+
+
 def _load_contained_runner() -> Callable[..., subprocess.CompletedProcess[object]]:
     path = Path(__file__).resolve().parents[1] / "src" / "rquant" / "contained_subprocess.py"
     spec = importlib.util.spec_from_file_location("_rquant_bootstrap_contained_process", path)
@@ -79,7 +110,10 @@ def _load_contained_runner() -> Callable[..., subprocess.CompletedProcess[object
     return module.run_contained
 
 
-run_contained = _load_contained_runner()
+def run_contained(*args: object, **kwargs: object) -> subprocess.CompletedProcess[object]:
+    """Load the project runner only after the bootstrap interpreter is bound."""
+
+    return _load_contained_runner()(*args, **kwargs)
 
 
 TARGET_PATTERN = re.compile(r"(?:v\d+\.\d+\.\d+|[0-9a-f]{40})")
@@ -3795,6 +3829,7 @@ def main(argv: list[str] | None = None) -> int:
     generation_error_type: type[BaseException] | None = None
     missing_record_type: type[BaseException] | None = None
     handoff: _LabLaunchdHandoff | None = None
+    interpreter_binding: object | None = None
 
     def restore_uncommitted_handoff(active: _LabLaunchdHandoff) -> None:
         if active.action == "deploy" and active.prepared_intent_operation_id:
@@ -3871,6 +3906,7 @@ def main(argv: list[str] | None = None) -> int:
         _trusted_git(git_path)
         python_path = _canonical(args.python_path, label="deployment Python")
         _verified_venv_python(root, python_path)
+        interpreter_binding = _bind_bootstrap_interpreter(python_path)
         uv_path, _uv_binding = _resolve_uv_path(args.uv_path)
         if not 0 < args.command_timeout_seconds <= args.overall_timeout_seconds <= 7200:
             raise DeployBootstrapError("deployment timeout configuration is invalid")
@@ -4617,6 +4653,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Production deploy bootstrap failed: {exc}", file=sys.stderr)
         return finish(2)
     finally:
+        if interpreter_binding is not None:
+            interpreter_binding.close()
         if lock_fd >= 0:
             os.close(lock_fd)
             lock_fd = -1

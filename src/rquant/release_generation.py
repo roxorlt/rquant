@@ -1898,6 +1898,7 @@ def _verified_interpreter(path: Path, *, label: str) -> tuple[Path, PathIdentity
 def _venv_system_interpreter(
     python_path: Path,
     *,
+    preselected_system_python: Path | None = None,
     timeout_provider: Callable[[float], float] | None = None,
 ) -> tuple[Path, PathIdentity, str]:
     try:
@@ -1920,7 +1921,18 @@ def _venv_system_interpreter(
     raw_path = result.stdout.strip()
     if not raw_path:
         raise ReleaseGenerationError("deployment system Python is empty")
-    return _verified_interpreter(Path(raw_path), label="deployment system Python")
+    if preselected_system_python is None:
+        return _verified_interpreter(Path(raw_path), label="deployment system Python")
+    try:
+        expected = preselected_system_python.resolve(strict=True)
+        reported = Path(raw_path).resolve(strict=True)
+    except OSError as exc:
+        raise ReleaseGenerationError("deployment system Python is unavailable") from exc
+    if reported != expected:
+        raise ReleaseGenerationError(
+            "deployment system Python differs from preselected interpreter"
+        )
+    return _verified_interpreter(expected, label="deployment system Python")
 
 
 def _write_all(

@@ -816,6 +816,32 @@ def test_release_generation_marker_binds_checkout_lock_python_and_venv(
     os.close(lock_fd)
 
 
+def test_venv_base_executable_cannot_rebind_preselected_system_interpreter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rquant.release_generation as release_module
+
+    venv_python = tmp_path / "venv-python"
+    selected = tmp_path / "selected-system-python"
+    forged = tmp_path / "forged-system-python"
+    for path in (venv_python, selected, forged):
+        path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        path.chmod(0o700)
+
+    monkeypatch.setattr(
+        release_module,
+        "run_contained",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, f"{forged}\n", ""),
+    )
+
+    with pytest.raises(release_module.ReleaseGenerationError, match="preselected"):
+        release_module._venv_system_interpreter(
+            venv_python,
+            preselected_system_python=selected,
+        )
+
+
 def test_runtime_identity_guard_full_verifies_once_then_uses_constant_authorities(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

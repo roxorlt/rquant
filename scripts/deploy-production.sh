@@ -2,8 +2,13 @@
 set -euo pipefail
 
 PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-PYTHON_BIN="${RQUANT_DEPLOY_PYTHON:-${PROJECT_DIR}/.venv/bin/python}"
+PYTHON_BIN="${PROJECT_DIR}/.venv/bin/python"
 UV_BIN="${RQUANT_DEPLOY_UV:-}"
+
+if [[ -n "${RQUANT_DEPLOY_PYTHON:-}" ]]; then
+    printf 'RQUANT_DEPLOY_PYTHON is not supported\n' >&2
+    exit 2
+fi
 
 if [[ ! -x "${PYTHON_BIN}" ]]; then
     printf 'Deployment Python is not executable: %s\n' "${PYTHON_BIN}" >&2

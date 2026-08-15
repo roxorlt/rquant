@@ -2369,6 +2369,8 @@ def test_shell_entrypoint_uses_isolated_stdlib_bootstrap_before_project_import()
     source = (repo / "scripts" / "deploy-production.sh").read_text(encoding="utf-8")
 
     assert '"${PYTHON_BIN}" -I -S' in source
+    assert 'PYTHON_BIN="${PROJECT_DIR}/.venv/bin/python"' in source
+    assert 'PYTHON_BIN="${RQUANT_DEPLOY_PYTHON:-' not in source
     assert "bootstrap-production-deploy.py" in source
     assert '--uv-path "${UV_BIN}"' in source
     assert '-- "$@"' not in source
@@ -2376,30 +2378,18 @@ def test_shell_entrypoint_uses_isolated_stdlib_bootstrap_before_project_import()
     assert "/../.rquant-deploy" not in source
 
 
-def test_shell_entrypoint_forwards_complete_runtime_profile_environment(
+def test_shell_entrypoint_rejects_environment_interpreter_override(
     tmp_path: Path,
 ) -> None:
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    fake_uname = fake_bin / "uname"
-    fake_uname.write_text("#!/bin/sh\nprintf 'Darwin\\n'\n", encoding="utf-8")
-    fake_uname.chmod(0o700)
     fake_python = tmp_path / "python"
     fake_python.write_text(
-        "#!/bin/sh\nprintf '%s\\n' \"$@\"\n",
+        "#!/bin/sh\nprintf 'untrusted interpreter executed\\n' >&2\nexit 0\n",
         encoding="utf-8",
     )
     fake_python.chmod(0o700)
-    inputs = tmp_path / "runtime-inputs.json"
-    profiles = tmp_path / "profiles"
     environment = {
         **os.environ,
-        "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "RQUANT_DEPLOY_PYTHON": str(fake_python),
-        "RQUANT_RELEASE_PROFILE": "macos-lab",
-        "RQUANT_RUNTIME_PRODUCTION_INPUTS": str(inputs),
-        "RQUANT_RUNTIME_PROFILE_OUTPUT_DIR": str(profiles),
-        "RQUANT_RUNTIME_ROOT": "/home/lighthouse/rquant/data/runtime",
     }
 
     result = subprocess.run(
@@ -2411,30 +2401,16 @@ def test_shell_entrypoint_forwards_complete_runtime_profile_environment(
         check=False,
     )
 
-    assert result.returncode == 0, result.stderr
-    arguments = result.stdout.splitlines()
-    assert arguments[arguments.index("--release-profile") + 1] == "macos-lab"
-    assert arguments[arguments.index("--host-platform") + 1] == "darwin"
-    assert arguments[-6:] == [
-        "--runtime-production-inputs",
-        str(inputs),
-        "--runtime-profile-output-dir",
-        str(profiles),
-        "--runtime-root",
-        "/home/lighthouse/rquant/data/runtime",
-    ]
-    assert "--runtime-schema-v1-migration-authority" not in arguments
+    assert result.returncode == 2
+    assert "RQUANT_DEPLOY_PYTHON is not supported" in result.stderr
+    assert "untrusted interpreter executed" not in result.stderr
 
 
 def test_shell_entrypoint_rejects_partial_runtime_profile_environment(
     tmp_path: Path,
 ) -> None:
-    fake_python = tmp_path / "python"
-    fake_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    fake_python.chmod(0o700)
     environment = {
         **os.environ,
-        "RQUANT_DEPLOY_PYTHON": str(fake_python),
         "RQUANT_RUNTIME_PRODUCTION_INPUTS": str(tmp_path / "runtime-inputs.json"),
     }
 
@@ -2459,13 +2435,9 @@ def test_shell_entrypoint_rejects_linux_production_without_runtime_profile(
     fake_uname = fake_bin / "uname"
     fake_uname.write_text("#!/bin/sh\nprintf 'Linux\\n'\n", encoding="utf-8")
     fake_uname.chmod(0o700)
-    fake_python = tmp_path / "python"
-    fake_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    fake_python.chmod(0o700)
     environment = {
         **os.environ,
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
-        "RQUANT_DEPLOY_PYTHON": str(fake_python),
     }
     for name in (
         "RQUANT_RUNTIME_PRODUCTION_INPUTS",
@@ -2498,13 +2470,9 @@ def test_shell_entrypoint_rejects_relocated_linux_production_runtime_root(
     fake_uname = fake_bin / "uname"
     fake_uname.write_text("#!/bin/sh\nprintf 'Linux\\n'\n", encoding="utf-8")
     fake_uname.chmod(0o700)
-    fake_python = tmp_path / "python"
-    fake_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    fake_python.chmod(0o700)
     environment = {
         **os.environ,
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
-        "RQUANT_DEPLOY_PYTHON": str(fake_python),
         "RQUANT_RUNTIME_PRODUCTION_INPUTS": str(tmp_path / "runtime-inputs.json"),
         "RQUANT_RUNTIME_PROFILE_OUTPUT_DIR": str(tmp_path / "profiles"),
         "RQUANT_RUNTIME_ROOT": "/srv/rquant/data/runtime",

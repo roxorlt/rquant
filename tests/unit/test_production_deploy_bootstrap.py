@@ -6577,3 +6577,15 @@ def test_dirty_release_authority_is_rejected_before_project_import(tmp_path: Pat
     assert "Traceback" not in result.stderr
     assert not imported.exists()
     assert not ran.exists()
+
+
+def test_bootstrap_binds_interpreter_before_loading_project_runner() -> None:
+    source = BOOTSTRAP.read_text(encoding="utf-8")
+
+    assert source.index("def _bind_bootstrap_interpreter") < source.index(
+        "def _load_contained_runner"
+    )
+    assert "run_contained = _load_contained_runner()" not in source
+    assert source.index("interpreter_binding = _bind_bootstrap_interpreter") < source.index(
+        "uv_path, _uv_binding = _resolve_uv_path"
+    )
