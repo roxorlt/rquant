@@ -816,7 +816,6 @@ def _load_database_reference_evidence(
                     {joins}
                     WHERE daily.trade_date = ?
                     ORDER BY daily.trade_date, daily.ts_code
-                    LIMIT 8000
                     """,
                     [prior_trade_date],
                     source_table="daily_state",

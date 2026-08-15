@@ -15,7 +15,7 @@ from rquant.dashboard.runtime_console_data import (
     ServingFrameState,
     query_serving_frame,
 )
-from rquant.dashboard.serving_page_data import ServingPageRenderContext
+from rquant.dashboard.serving_page_data import ServingPageRenderContext, read_nl_screen_page
 from rquant.lab_jobs import LabJobReader, LabJobStore
 from rquant.lab_jobs_serving_authority import LabJobsServingSourceReader
 from rquant.notification_state import NotificationStateStore
@@ -70,15 +70,16 @@ from rquant.runtime_serving_snapshot import (
     ReferenceSlowPayload,
     SourceReadResult,
 )
-from rquant.serving_contracts import FreshnessStatus
+from rquant.serving_contracts import FreshnessStatus, ServingDatasetWatermark
 from rquant.serving_page_projection_source import (
     DuckDBLabPageProjectionSource,
     DuckDBSignalPageProjectionSource,
     SignalPageProjectionProducer,
 )
-from rquant.serving_publisher import ServingPublisher, ServingReader
+from rquant.serving_publisher import ServingPublisher, ServingReader, ServingTableSpec
 from rquant.serving_read_models import (
     SERVING_TABLE_SPECS,
+    NlScreenPageError,
     ServingProjectionPayload,
     screen_nl_projection,
 )
@@ -100,6 +101,141 @@ def _projection(
         available_at=available_at,
         rows=rows,
     )
+
+
+def _publish_nl_page_generation(
+    root: Path,
+    rows: list[dict[str, object]],
+    *,
+    built_at: datetime,
+    source_generation: str,
+) -> str:
+    publisher = ServingPublisher(
+        root,
+        producer_commit=COMMIT,
+        table_specs={
+            "projection_status": ServingTableSpec(sort_keys=("table_name",)),
+            "nl_screen_universe": ServingTableSpec(sort_keys=("trade_date", "ts_code")),
+        },
+    )
+    receipt = publisher.publish(
+        {
+            "projection_status": pd.DataFrame(
+                {
+                    "table_name": ["nl_screen_universe"],
+                    "available": [True],
+                    "reason": [None],
+                    "owner_dataset_id": ["reference_slow_authority"],
+                    "available_at": [built_at],
+                }
+            ),
+            "nl_screen_universe": pd.DataFrame(rows),
+        },
+        watermarks=(
+            ServingDatasetWatermark(
+                dataset_id="reference_slow_authority",
+                generation_id=source_generation,
+                event_time=built_at,
+                published_at=built_at,
+                sequence=1,
+                status=FreshnessStatus.FRESH,
+            ),
+        ),
+        source_generations={"reference_slow_authority": source_generation},
+        built_at=built_at,
+    )
+    return receipt.generation_id
+
+
+def _nl_page_row(ts_code: str, name: str, close: float = 10.0) -> dict[str, object]:
+    return {
+        "trade_date": "2026-07-31",
+        "ts_code": ts_code,
+        "name": name,
+        "CLOSE[0]": close,
+        "PCT_CHG[0]": 1.0,
+    }
+
+
+def test_nl_page_cursor_pins_historical_generation_and_fails_closed_at_budget(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "serving"
+    first_generation = _publish_nl_page_generation(
+        root,
+        [
+            _nl_page_row("600000.SH", "无效", 1.0),
+            _nl_page_row("600001.SH", "旧乙", 2.0),
+            _nl_page_row("600002.SH", "旧丙", 3.0),
+        ],
+        built_at=NOW,
+        source_generation="a" * 64,
+    )
+    query = {"trade_date": "2026-07-31", "rule": "close_gt_1"}
+    first = read_nl_screen_page(
+        root,
+        trade_date="2026-07-31",
+        rules=(lambda frame: frame["CLOSE[0]"] > 1.0,),
+        rule_labels=("gt(CLOSE[0], 1)",),
+        normalized_plan=query,
+        page_size=1,
+        now=NOW,
+    )
+    assert first.generation_id == first_generation
+    assert first.value.rows["name"].tolist() == ["旧乙"]
+    assert first.value.next_cursor is not None
+
+    _publish_nl_page_generation(
+        root,
+        [_nl_page_row("600001.SH", "新乙", 2.0), _nl_page_row("600002.SH", "新丙", 3.0)],
+        built_at=NOW + timedelta(seconds=1),
+        source_generation="b" * 64,
+    )
+    second = read_nl_screen_page(
+        root,
+        trade_date="2026-07-31",
+        rules=(lambda frame: frame["CLOSE[0]"] > 1.0,),
+        rule_labels=("gt(CLOSE[0], 1)",),
+        normalized_plan=query,
+        page_size=1,
+        cursor=first.value.next_cursor,
+        now=NOW + timedelta(seconds=1),
+    )
+    assert second.generation_id == first_generation
+    assert second.value.rows["name"].tolist() == ["旧丙"]
+
+    with pytest.raises(NlScreenPageError, match="requires rerun"):
+        read_nl_screen_page(
+            root,
+            trade_date="2026-07-31",
+            rules=(),
+            rule_labels=(),
+            normalized_plan={"trade_date": "2026-07-31", "rule": "all"},
+            page_size=1,
+            cursor=first.value.next_cursor,
+            now=NOW + timedelta(seconds=1),
+        )
+
+    over_budget = [_nl_page_row(f"{index:06d}.SH", "样本") for index in range(8_001)]
+    _publish_nl_page_generation(
+        root,
+        over_budget,
+        built_at=NOW + timedelta(seconds=2),
+        source_generation="c" * 64,
+    )
+    with pytest.raises(
+        NlScreenPageError,
+        match="candidate universe exceeds registered serving budget",
+    ):
+        read_nl_screen_page(
+            root,
+            trade_date="2026-07-31",
+            rules=(),
+            rule_labels=(),
+            normalized_plan={"trade_date": "2026-07-31", "rule": "all"},
+            page_size=1,
+            now=NOW + timedelta(seconds=2),
+        )
 
 
 def _signal_projections() -> tuple[ServingProjectionPayload, ...]:

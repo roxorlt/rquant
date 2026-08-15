@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import inspect
 import os
 import subprocess
 from datetime import UTC, date, datetime, timedelta
@@ -281,6 +282,13 @@ def test_prior_daily_query_streams_and_fails_closed_at_row_limit(tmp_path: Path)
             monotonic_deadline=10.0,
             monotonic_clock=lambda: 0.0,
         )
+
+
+def test_nl_universe_capture_has_no_prevalidation_limit() -> None:
+    source = inspect.getsource(reference_slow_source_module._load_database_reference_evidence)
+
+    nl_query = source[source.index('"nl_screen_universe"') :]
+    assert "LIMIT 8000" not in nl_query
 
 
 def test_source_frame_fails_closed_before_copy_when_response_exceeds_budget() -> None:

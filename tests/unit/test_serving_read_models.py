@@ -18,12 +18,16 @@ from rquant.serving_publisher import ServingPublisher
 from rquant.serving_read_models import (
     PAGE_PROJECTION_CONTRACTS,
     SERVING_TABLE_SPECS,
+    NlScreenPageError,
     ServingProjectionContract,
     ServingProjectionInput,
     ServingProjectionPayload,
     ServingReadModelInput,
     ServingSignalRecord,
     build_serving_read_models,
+    decode_nl_screen_cursor,
+    encode_nl_screen_cursor,
+    paginate_nl_screen_projection,
     screen_nl_projection,
     serving_physical_table_specs_fingerprint,
 )
@@ -469,3 +473,108 @@ def test_nl_projection_screen_fails_closed_when_feature_is_not_projected() -> No
             rules=(lambda frame: frame["CLOSE[0]"] > frame["MA20[0]"],),
             rule_labels=("gt(CLOSE[0], MA20[0])",),
         )
+
+
+def test_nl_projection_paginates_only_after_full_rule_validation() -> None:
+    universe = pd.DataFrame(
+        {
+            "trade_date": [date(2026, 7, 31)] * 3,
+            "ts_code": ["600000.SH", "600001.SH", "600002.SH"],
+            "name": ["无效", "乙", "丙"],
+            "CLOSE[0]": [1.0, 2.0, 3.0],
+            "PCT_CHG[0]": [0.0, 1.0, 2.0],
+        }
+    )
+    kwargs = {
+        "generation_id": "a" * 64,
+        "trade_date": "2026-07-31",
+        "rules": (lambda frame: frame["CLOSE[0]"] > 1.0,),
+        "rule_labels": ("gt(CLOSE[0], 1)",),
+        "normalized_plan": {"trade_date": "2026-07-31", "rule": "close_gt_1"},
+        "page_size": 1,
+    }
+
+    first = paginate_nl_screen_projection(universe, **kwargs)
+    second = paginate_nl_screen_projection(universe, cursor=first.next_cursor, **kwargs)
+
+    assert first.rows["ts_code"].tolist() == ["600001.SH"]
+    assert second.rows["ts_code"].tolist() == ["600002.SH"]
+    assert first.next_cursor is not None
+    assert second.next_cursor is None
+
+
+def test_nl_projection_cursor_is_deterministic_and_rejects_query_mismatch() -> None:
+    universe = pd.DataFrame(
+        {
+            "trade_date": [date(2026, 7, 31)] * 2,
+            "ts_code": ["600000.SH", "600001.SH"],
+            "name": ["甲", "乙"],
+            "CLOSE[0]": [1.0, 2.0],
+            "PCT_CHG[0]": [0.0, 1.0],
+        }
+    )
+    kwargs = {
+        "generation_id": "a" * 64,
+        "trade_date": "2026-07-31",
+        "rules": (),
+        "rule_labels": (),
+        "normalized_plan": {"trade_date": "2026-07-31", "rule": "all"},
+        "page_size": 1,
+    }
+
+    first = paginate_nl_screen_projection(universe, **kwargs)
+    repeat = paginate_nl_screen_projection(universe, **kwargs)
+    cursor_repeat = paginate_nl_screen_projection(
+        universe,
+        cursor=first.next_cursor,
+        **kwargs,
+    )
+    assert first.next_cursor == repeat.next_cursor
+    assert first.rows.to_dict("records") == repeat.rows.to_dict("records")
+    assert cursor_repeat.rows.to_dict("records") == [
+        {"ts_code": "600001.SH", "name": "乙", "CLOSE[0]": 2.0, "PCT_CHG[0]": 1.0}
+    ]
+    assert first.next_cursor is not None
+    decoded = decode_nl_screen_cursor(first.next_cursor)
+    assert decoded.generation_id == "a" * 64
+    assert encode_nl_screen_cursor(decoded) == first.next_cursor
+
+    with pytest.raises(NlScreenPageError, match="requires rerun"):
+        paginate_nl_screen_projection(
+            universe,
+            cursor=first.next_cursor,
+            **{**kwargs, "normalized_plan": {"trade_date": "2026-07-31", "rule": "none"}},
+        )
+    with pytest.raises(NlScreenPageError, match="requires rerun"):
+        paginate_nl_screen_projection(
+            universe,
+            cursor=first.next_cursor,
+            **{**kwargs, "generation_id": "b" * 64},
+        )
+
+
+def test_nl_projection_rejects_duplicate_snapshot_keys_and_has_no_phantom_page() -> None:
+    universe = pd.DataFrame(
+        {
+            "trade_date": [date(2026, 7, 31)],
+            "ts_code": ["600000.SH"],
+            "name": ["无效"],
+            "CLOSE[0]": [1.0],
+            "PCT_CHG[0]": [0.0],
+        }
+    )
+    kwargs = {
+        "generation_id": "a" * 64,
+        "trade_date": "2026-07-31",
+        "rules": (lambda frame: frame["CLOSE[0]"] > 1.0,),
+        "rule_labels": ("gt(CLOSE[0], 1)",),
+        "normalized_plan": {"trade_date": "2026-07-31"},
+        "page_size": 1,
+    }
+
+    page = paginate_nl_screen_projection(universe, **kwargs)
+    assert page.rows.empty
+    assert page.next_cursor is None
+
+    with pytest.raises(NlScreenPageError, match="duplicate"):
+        paginate_nl_screen_projection(pd.concat([universe, universe]), **kwargs)

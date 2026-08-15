@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Callable
 from datetime import UTC, datetime
 from datetime import date as _date
 from typing import Literal
@@ -23,14 +24,12 @@ import streamlit as st
 from pydantic import JsonValue, ValidationError
 
 from rquant.config import settings
-from rquant.dashboard.runtime_console_data import ServingFrameState
-from rquant.dashboard.serving_page_data import ServingPageRenderContext
+from rquant.dashboard.serving_page_data import read_nl_screen_page
 from rquant.dashboard.serving_page_ui import render_serving_state_banner
 from rquant.llm.client import DeepSeekClient, LLMClarificationNeeded, LLMError
 from rquant.llm.dispatch import build_rules
 from rquant.llm.schemas import RuleCall, ScreenPlan
 from rquant.page_control import AppendNlQueryLog, PageControlClient, SaveNlPreset
-from rquant.serving_read_models import screen_nl_projection
 
 st.set_page_config(
     page_title="rQuant NL 选股",
@@ -38,6 +37,8 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="auto",
 )
+
+_page_serving = None
 
 
 # ── 主体渲染 ──
@@ -48,12 +49,6 @@ if not settings.deepseek_enabled:
     st.error("未配置 `DEEPSEEK_API_KEY`，本页不可用。请在 `.env` 中填入 DeepSeek API key。")
     st.stop()
 
-try:
-    _page_serving = ServingPageRenderContext.open(
-        os.environ.get("RQUANT_SERVING_ROOT", "data/serving")
-    )
-except Exception:
-    _page_serving = None
 try:
     _page_control = PageControlClient()
 
@@ -87,6 +82,12 @@ try:
         st.session_state.nl_result_df = None
     if "nl_diagnostics" not in st.session_state:
         st.session_state.nl_diagnostics = []
+    if "nl_next_cursor" not in st.session_state:
+        st.session_state.nl_next_cursor = None
+    if "nl_current_cursor" not in st.session_state:
+        st.session_state.nl_current_cursor = None
+    if "nl_cursor_history" not in st.session_state:
+        st.session_state.nl_cursor_history = []
 
     nl_query = st.text_input(
         "输入选股需求（中文）",
@@ -103,6 +104,9 @@ try:
         if st.button("🗑 清空", use_container_width=True, key="nl_clear_btn"):
             st.session_state.nl_plan_dict = None
             st.session_state.nl_result_df = None
+            st.session_state.nl_next_cursor = None
+            st.session_state.nl_current_cursor = None
+            st.session_state.nl_cursor_history = []
             st.rerun()
 
     if nl_parse_clicked and nl_query.strip():
@@ -154,6 +158,36 @@ try:
 
     nl_plan_dict = st.session_state.nl_plan_dict
     if nl_plan_dict:
+
+        def _nl_rules_and_labels(
+            plan: ScreenPlan,
+        ) -> tuple[tuple[Callable[[pd.DataFrame], pd.Series], ...], tuple[str, ...]]:
+            labels: list[str] = []
+            for call in plan.flatten_rules():
+                argument_text = ", ".join(f"{key}={value!r}" for key, value in call.args.items())
+                labels.append(
+                    f"{call.name}({argument_text})" if argument_text else f"{call.name}()"
+                )
+            return tuple(build_rules(plan)), tuple(labels)
+
+        def _load_nl_page(plan: ScreenPlan, *, cursor: str | None) -> None:
+            rules, labels = _nl_rules_and_labels(plan)
+            page_result = read_nl_screen_page(
+                os.environ.get("RQUANT_SERVING_ROOT", "data/serving"),
+                trade_date=plan.trade_date,
+                rules=rules,
+                rule_labels=labels,
+                normalized_plan=plan.model_dump(mode="json"),
+                include_columns=tuple(plan.include_columns),
+                page_size=100,
+                cursor=cursor,
+            )
+            render_serving_state_banner(st, page_result, label="自然语言选股数据")
+            st.session_state.nl_result_df = page_result.value.rows
+            st.session_state.nl_diagnostics = page_result.value.diagnostics
+            st.session_state.nl_next_cursor = page_result.value.next_cursor
+            st.session_state.nl_current_cursor = cursor
+
         st.success(f"✅ 解析成功 · trade_date={nl_plan_dict['trade_date']}")
         if nl_plan_dict.get("rationale"):
             st.info(f"💭 {nl_plan_dict['rationale']}")
@@ -266,43 +300,8 @@ try:
             ):
                 try:
                     nl_plan_validated = ScreenPlan.model_validate(nl_plan_dict)
-                    if _page_serving is None:
-                        raise RuntimeError("Serving generation unavailable")
-                    nl_serving = _page_serving.query(
-                        """
-                        SELECT * FROM nl_screen_universe
-                        WHERE trade_date = CAST(? AS DATE)
-                        ORDER BY ts_code
-                        LIMIT 8000
-                        """,
-                        (nl_plan_validated.trade_date,),
-                        max_rows=8_000,
-                        max_result_bytes=6 * 1024 * 1024,
-                        required_projections=("nl_screen_universe",),
-                    )
-                    render_serving_state_banner(st, nl_serving, label="自然语言选股数据")
-                    if nl_serving.state is ServingFrameState.UNAVAILABLE:
-                        raise RuntimeError(nl_serving.detail)
-                    nl_universe = nl_serving.dataframe()
-                    assert isinstance(nl_universe, pd.DataFrame)
-                    nl_rules = tuple(build_rules(nl_plan_validated))
-                    nl_label_values: list[str] = []
-                    for call in nl_plan_validated.flatten_rules():
-                        argument_text = ", ".join(
-                            f"{key}={value!r}" for key, value in call.args.items()
-                        )
-                        nl_label_values.append(
-                            f"{call.name}({argument_text})" if argument_text else f"{call.name}()"
-                        )
-                    nl_df, nl_diag = screen_nl_projection(
-                        nl_universe,
-                        trade_date=nl_plan_validated.trade_date,
-                        rules=nl_rules,
-                        rule_labels=tuple(nl_label_values),
-                        include_columns=tuple(nl_plan_validated.include_columns),
-                    )
-                    st.session_state.nl_result_df = nl_df
-                    st.session_state.nl_diagnostics = nl_diag
+                    st.session_state.nl_cursor_history = []
+                    _load_nl_page(nl_plan_validated, cursor=None)
                 except ValidationError as nl_e:
                     st.error(f"plan 校验失败：{nl_e}")
                     st.session_state.nl_result_df = None
@@ -312,7 +311,7 @@ try:
 
         nl_result_df = st.session_state.nl_result_df
         if nl_result_df is not None:
-            st.markdown(f"### 📊 命中 **{len(nl_result_df)}** 只")
+            st.markdown(f"### 📊 本页命中 **{len(nl_result_df)}** 只")
             if len(nl_result_df) == 0:
                 st.warning("无标的命中。检查规则参数是否过严，或调整 trade_date。")
                 nl_diag = st.session_state.get("nl_diagnostics", [])
@@ -330,6 +329,41 @@ try:
                     use_container_width=True,
                     hide_index=True,
                 )
+
+                nl_prev_col, nl_next_col = st.columns(2)
+                with nl_prev_col:
+                    previous_cursor = (
+                        st.session_state.nl_cursor_history[-1]
+                        if st.session_state.nl_cursor_history
+                        else None
+                    )
+                    if st.button(
+                        "上一页",
+                        disabled=not st.session_state.nl_cursor_history,
+                        use_container_width=True,
+                        key="nl_previous_page_btn",
+                    ):
+                        st.session_state.nl_cursor_history.pop()
+                        _load_nl_page(
+                            ScreenPlan.model_validate(nl_plan_dict),
+                            cursor=previous_cursor,
+                        )
+                        st.rerun()
+                with nl_next_col:
+                    if st.button(
+                        "下一页",
+                        disabled=st.session_state.nl_next_cursor is None,
+                        use_container_width=True,
+                        key="nl_next_page_btn",
+                    ):
+                        st.session_state.nl_cursor_history.append(
+                            st.session_state.nl_current_cursor
+                        )
+                        _load_nl_page(
+                            ScreenPlan.model_validate(nl_plan_dict),
+                            cursor=st.session_state.nl_next_cursor,
+                        )
+                        st.rerun()
 
                 st.divider()
                 nl_col_save_input, nl_col_save_btn = st.columns([3, 1])
@@ -384,6 +418,8 @@ try:
                     st.session_state["nl_query_input"] = h
                     st.rerun()
 
+except Exception:
+    raise
 finally:
     if _page_serving is not None:
         _page_serving.close()

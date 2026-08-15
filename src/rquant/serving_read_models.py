@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+from base64 import urlsafe_b64decode, urlsafe_b64encode
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -46,6 +47,8 @@ ProjectionColumnKind = Literal["string", "int", "float", "bool", "date", "timest
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _MAX_PROJECTION_CELL_BYTES = 64 * 1024
 _MAX_OWNER_PROJECTION_BYTES = 7 * 1024 * 1024
+_NL_SCREEN_CURSOR_TYPE = "nl_screen_page"
+_NL_SCREEN_ORDER_VERSION = "trade_date_ts_code_v1"
 _DUCKDB_PROJECTION_TYPES: Mapping[ProjectionColumnKind, DuckDBColumnType] = MappingProxyType(
     {
         "string": "VARCHAR",
@@ -1337,6 +1340,76 @@ def build_serving_read_models(
     )
 
 
+class NlScreenPageError(ValueError):
+    """A cursor or bounded NL candidate read cannot safely continue."""
+
+
+class NlScreenCursor(RuntimeContractModel):
+    cursor_type: Literal["nl_screen_page"] = _NL_SCREEN_CURSOR_TYPE
+    generation_id: GenerationId
+    query_digest: GenerationId
+    last_trade_date: date
+    last_ts_code: StrictStr = Field(min_length=1)
+    order_version: Literal["trade_date_ts_code_v1"] = _NL_SCREEN_ORDER_VERSION
+
+
+@dataclass(frozen=True)
+class NlScreenPage:
+    rows: pd.DataFrame
+    diagnostics: tuple[tuple[str, int], ...]
+    next_cursor: str | None
+    generation_id: str
+    query_digest: str
+
+
+def nl_screen_query_digest(
+    normalized_plan: Mapping[str, object],
+    include_columns: Sequence[str] = (),
+) -> str:
+    """Bind a cursor to canonical plan and output-column intent."""
+
+    return canonical_sha256(
+        {
+            "contract": "nl-screen-page-query/v1",
+            "plan": dict(normalized_plan),
+            "include_columns": tuple(include_columns),
+        }
+    )
+
+
+def encode_nl_screen_cursor(cursor: NlScreenCursor) -> str:
+    payload = cursor.model_dump(mode="json")
+    encoded = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    return urlsafe_b64encode(encoded).decode("ascii").rstrip("=")
+
+
+def decode_nl_screen_cursor(token: str) -> NlScreenCursor:
+    if not isinstance(token, str) or not token:
+        raise NlScreenPageError("nl screen cursor requires rerun: cursor is invalid")
+    try:
+        padded = token + "=" * (-len(token) % 4)
+        payload = json.loads(urlsafe_b64decode(padded.encode("ascii")))
+        return NlScreenCursor.model_validate(payload)
+    except (UnicodeEncodeError, ValueError, json.JSONDecodeError) as exc:
+        raise NlScreenPageError("nl screen cursor requires rerun: cursor is invalid") from exc
+
+
+def validate_nl_screen_cursor(
+    cursor: NlScreenCursor,
+    *,
+    generation_id: str,
+    query_digest: str,
+) -> None:
+    if cursor.generation_id != generation_id:
+        raise NlScreenPageError("nl screen cursor requires rerun: generation changed")
+    if cursor.query_digest != query_digest:
+        raise NlScreenPageError("nl screen cursor requires rerun: query changed")
+    if cursor.order_version != _NL_SCREEN_ORDER_VERSION:
+        raise NlScreenPageError("nl screen cursor requires rerun: ordering changed")
+
+
 def screen_nl_projection(
     universe: pd.DataFrame,
     *,
@@ -1358,6 +1431,9 @@ def screen_nl_projection(
     normalized_dates = pd.to_datetime(universe["trade_date"], errors="coerce").dt.date
     requested_date = date.fromisoformat(trade_date)
     frame = universe.loc[normalized_dates.eq(requested_date)].copy()
+    candidate_keys = frame.loc[:, ["trade_date", "ts_code"]]
+    if candidate_keys.duplicated().any():
+        raise NlScreenPageError("nl screen snapshot contains duplicate trade_date and ts_code")
     mask = pd.Series(True, index=frame.index, dtype="boolean")
     diagnostics: list[tuple[str, int]] = []
     for rule, label in zip(rules, rule_labels, strict=True):
@@ -1374,9 +1450,66 @@ def screen_nl_projection(
         diagnostics.append((str(label), int(mask.sum())))
 
     result_columns = list(dict.fromkeys((*base_columns, *include_columns)))
-    result = frame.loc[mask.fillna(False), result_columns]
-    result = result.sort_values("ts_code").reset_index(drop=True)
+    selected = frame.loc[mask.fillna(False)]
+    selected = selected.sort_values(["trade_date", "ts_code"], kind="stable")
+    result = selected.loc[:, result_columns].reset_index(drop=True)
     return result, tuple(diagnostics)
+
+
+def paginate_nl_screen_projection(
+    universe: pd.DataFrame,
+    *,
+    generation_id: str,
+    trade_date: str,
+    rules: Sequence[Callable[[pd.DataFrame], pd.Series]],
+    rule_labels: Sequence[str],
+    normalized_plan: Mapping[str, object],
+    include_columns: Sequence[str] = (),
+    page_size: int,
+    cursor: str | None = None,
+) -> NlScreenPage:
+    """Screen a complete immutable universe, then apply keyset pagination."""
+
+    if type(page_size) is not int or not 1 <= page_size <= 1_000:
+        raise ValueError("nl screen page_size must be an integer between 1 and 1000")
+    query_digest = nl_screen_query_digest(normalized_plan, include_columns)
+    decoded = None if cursor is None else decode_nl_screen_cursor(cursor)
+    if decoded is not None:
+        validate_nl_screen_cursor(
+            decoded,
+            generation_id=generation_id,
+            query_digest=query_digest,
+        )
+    screened, diagnostics = screen_nl_projection(
+        universe,
+        trade_date=trade_date,
+        rules=rules,
+        rule_labels=rule_labels,
+        include_columns=include_columns,
+    )
+    requested_date = date.fromisoformat(trade_date)
+    if decoded is not None:
+        after = screened["ts_code"].astype("string").gt(decoded.last_ts_code)
+        screened = screened.loc[after.fillna(False)]
+    rows = screened.iloc[:page_size].reset_index(drop=True)
+    has_next = len(screened) > len(rows)
+    next_cursor = None
+    if has_next:
+        next_cursor = encode_nl_screen_cursor(
+            NlScreenCursor(
+                generation_id=generation_id,
+                query_digest=query_digest,
+                last_trade_date=requested_date,
+                last_ts_code=str(rows.iloc[-1]["ts_code"]),
+            )
+        )
+    return NlScreenPage(
+        rows=rows,
+        diagnostics=diagnostics,
+        next_cursor=next_cursor,
+        generation_id=generation_id,
+        query_digest=query_digest,
+    )
 
 
 __all__ = [
@@ -1385,10 +1518,17 @@ __all__ = [
     "ServingProjectionContract",
     "ServingProjectionInput",
     "ServingProjectionPayload",
+    "NlScreenCursor",
+    "NlScreenPage",
+    "NlScreenPageError",
     "ServingReadModelInput",
     "ServingLabJobRecord",
     "ServingSignalRecord",
     "build_serving_read_models",
+    "decode_nl_screen_cursor",
+    "encode_nl_screen_cursor",
+    "nl_screen_query_digest",
+    "paginate_nl_screen_projection",
     "screen_nl_projection",
     "serving_physical_table_specs_fingerprint",
 ]

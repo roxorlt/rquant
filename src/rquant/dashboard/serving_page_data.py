@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -24,6 +24,14 @@ from rquant.research_gate import (
 )
 from rquant.runtime_contracts import normalize_aware_utc
 from rquant.serving_publisher import ServingGenerationLease, ServingReader
+from rquant.serving_read_models import (
+    PAGE_PROJECTION_CONTRACTS,
+    NlScreenPage,
+    NlScreenPageError,
+    decode_nl_screen_cursor,
+    nl_screen_query_digest,
+    paginate_nl_screen_projection,
+)
 
 _ValueT = TypeVar("_ValueT")
 
@@ -369,4 +377,82 @@ class ServingPageRenderContext:
         )
 
 
-__all__ = ["ServingPageRenderContext", "ServingPageResult"]
+def read_nl_screen_page(
+    serving_root: str | Path,
+    *,
+    trade_date: str,
+    rules: Sequence[Callable[[pd.DataFrame], pd.Series]],
+    rule_labels: Sequence[str],
+    normalized_plan: Mapping[str, object],
+    include_columns: Sequence[str] = (),
+    page_size: int,
+    cursor: str | None = None,
+    now: datetime | None = None,
+    stale_after: timedelta = timedelta(minutes=10),
+) -> ServingPageResult[NlScreenPage]:
+    """Read one complete bounded NL universe from a pinned serving generation."""
+
+    query_digest = nl_screen_query_digest(normalized_plan, include_columns)
+    decoded = None if cursor is None else decode_nl_screen_cursor(cursor)
+    if decoded is not None and decoded.query_digest != query_digest:
+        raise NlScreenPageError("nl screen cursor requires rerun: query changed")
+    reader = ServingReader(serving_root)
+    try:
+        lease = (
+            reader.acquire_generation()
+            if decoded is None
+            else reader.acquire_historical_generation(decoded.generation_id)
+        )
+    except Exception as exc:
+        raise NlScreenPageError(
+            "nl screen cursor requires rerun: generation is unavailable"
+        ) from exc
+    observed_at = normalize_aware_utc(now or datetime.now(UTC))
+    contract = PAGE_PROJECTION_CONTRACTS["nl_screen_universe"]
+    try:
+        with lease:
+            result = query_acquired_serving_frame(
+                lease,
+                """
+                SELECT * FROM nl_screen_universe
+                WHERE trade_date = CAST(? AS DATE)
+                ORDER BY trade_date, ts_code
+                """,
+                (trade_date,),
+                now=observed_at,
+                max_rows=contract.max_rows,
+                max_result_bytes=contract.max_bytes,
+                stale_after=stale_after,
+                required_projections=("nl_screen_universe",),
+            )
+            if result.state is ServingFrameState.UNAVAILABLE:
+                exceeded_budget = (
+                    "exceeded its row budget" in result.detail
+                    or "exceeded its result byte budget" in result.detail
+                )
+                if exceeded_budget:
+                    raise NlScreenPageError(
+                        "nl screen candidate universe exceeds registered serving budget"
+                    )
+                raise NlScreenPageError("nl screen serving generation is unavailable")
+            universe = result.dataframe()
+            assert isinstance(universe, pd.DataFrame)
+            page = paginate_nl_screen_projection(
+                universe,
+                generation_id=lease.manifest.generation_id,
+                trade_date=trade_date,
+                rules=rules,
+                rule_labels=rule_labels,
+                normalized_plan=normalized_plan,
+                include_columns=include_columns,
+                page_size=page_size,
+                cursor=cursor,
+            )
+    except NlScreenPageError:
+        raise
+    except Exception as exc:
+        raise NlScreenPageError("nl screen serving generation is unavailable") from exc
+    return _page_result(result, page)
+
+
+__all__ = ["ServingPageRenderContext", "ServingPageResult", "read_nl_screen_page"]
