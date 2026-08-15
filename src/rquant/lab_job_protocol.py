@@ -1179,6 +1179,22 @@ class LabCommandSpool:
                 self._remove_owned_isolation_record_locked(record)
                 return
 
+    def _discard_unpublished_isolation_container_locked(
+        self,
+        quarantine_fd: int,
+        container_fd: int,
+        container: Path,
+        observed: os.stat_result,
+    ) -> None:
+        anchored = os.fstat(container_fd)
+        if not self._stat_matches_bound_entry(anchored, observed):
+            return
+        self._remove_bound_directory_entry(
+            quarantine_fd,
+            container.name,
+            observed,
+        )
+
     def _isolate_owned_entry_locked(
         self,
         source: Path,
@@ -1204,14 +1220,17 @@ class LabCommandSpool:
             if stat.S_ISREG(observed.st_mode)
             else None
         )
+        quarantine_fd = -1
+        container_fd = -1
+        created_container_stat: os.stat_result | None = None
+        evidence_publication_started = False
         try:
             quarantine_fd = self._open_managed_directory(self.quarantine_dir)
-            try:
-                self._guard_mutation()
-                os.mkdir(container.name, mode=0o700, dir_fd=quarantine_fd)
-                os.fsync(quarantine_fd)
-            finally:
-                os.close(quarantine_fd)
+            self._guard_mutation()
+            os.mkdir(container.name, mode=0o700, dir_fd=quarantine_fd)
+            container_fd = self._open_managed_directory(container)
+            created_container_stat = os.fstat(container_fd)
+            os.fsync(quarantine_fd)
             evidence = _LabOwnedEntryIsolationEvidence(
                 isolation_id=isolation_id,
                 source_area=source_area,
@@ -1227,6 +1246,7 @@ class LabCommandSpool:
                 manual_retention=file_type == "directory",
             )
             evidence_path = container / "evidence.json"
+            evidence_publication_started = True
             try:
                 if not self._publish_no_clobber(
                     evidence_path,
@@ -1270,7 +1290,26 @@ class LabCommandSpool:
                 # identity-bound move or prunes an incomplete record within configured limits.
                 self._fsync_directory(self.quarantine_dir)
                 raise
+        except BaseException:
+            if (
+                created_container_stat is not None
+                and not evidence_publication_started
+                and quarantine_fd >= 0
+                and container_fd >= 0
+            ):
+                with suppress(OSError, InvalidCommandEnvelopeError):
+                    self._discard_unpublished_isolation_container_locked(
+                        quarantine_fd,
+                        container_fd,
+                        container,
+                        created_container_stat,
+                    )
+            raise
         finally:
+            if container_fd >= 0:
+                os.close(container_fd)
+            if quarantine_fd >= 0:
+                os.close(quarantine_fd)
             if bound_regular_descriptor is not None:
                 os.close(bound_regular_descriptor)
 

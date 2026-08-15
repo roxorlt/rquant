@@ -675,6 +675,7 @@ def test_owned_entry_isolation_retention_bounds_complete_and_incomplete_records(
     real_open = os.open
     real_close = os.close
     real_dup = os.dup
+    real_fsync = os.fsync
     real_mkdir = os.mkdir
     live_descriptors: set[int] = set()
     bound_open_attempts = 0
@@ -776,9 +777,94 @@ def test_owned_entry_isolation_retention_bounds_complete_and_incomplete_records(
     assert tuple(failure_spool.quarantine_dir.iterdir()) == ()
     assert_failure_source_unchanged()
 
+    awaiting_container_fsync = False
+    failed_container_fsyncs = 0
+
+    def tracking_container_mkdir(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        nonlocal awaiting_container_fsync
+        real_mkdir(path, mode, dir_fd=dir_fd)
+        if str(path).startswith("owned-entry-"):
+            awaiting_container_fsync = True
+
+    def failing_post_mkdir_fsync(descriptor: int) -> None:
+        nonlocal awaiting_container_fsync, failed_container_fsyncs
+        if awaiting_container_fsync:
+            awaiting_container_fsync = False
+            failed_container_fsyncs += 1
+            raise OSError(errno.EIO, "forced post-mkdir fsync failure")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(lab_job_protocol.os, "mkdir", tracking_container_mkdir)
+    monkeypatch.setattr(lab_job_protocol.os, "fsync", failing_post_mkdir_fsync)
+
+    for _attempt in range(3):
+        with pytest.raises(OSError, match="forced post-mkdir fsync failure"):
+            failure_spool._isolate_owned_entry_locked(
+                failure_source,
+                failure_observed,
+                reason="forced_post_mkdir_fsync_failure",
+            )
+        assert tuple(failure_spool.quarantine_dir.iterdir()) == ()
+        assert_failure_source_unchanged()
+        assert live_descriptors == set()
+
+    assert failed_container_fsyncs == 3
+
+    retained_spool = LabCommandSpool(tmp_path / "nonempty-container-commands")
+    retained_source = retained_spool.pending_dir / f"{uuid4()}.json"
+    retained_source.write_text("retained-source", encoding="utf-8")
+    retained_observed = retained_source.lstat()
+    retained_container: Path | None = None
+    retain_on_fsync = False
+
+    def retaining_container_mkdir(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        nonlocal retained_container, retain_on_fsync
+        real_mkdir(path, mode, dir_fd=dir_fd)
+        if str(path).startswith("owned-entry-"):
+            retained_container = retained_spool.quarantine_dir / str(path)
+            retain_on_fsync = True
+
+    def populate_then_fail_fsync(descriptor: int) -> None:
+        nonlocal retain_on_fsync
+        if retain_on_fsync:
+            retain_on_fsync = False
+            assert retained_container is not None
+            (retained_container / "foreign-entry").write_text(
+                "do not remove",
+                encoding="utf-8",
+            )
+            raise OSError(errno.EIO, "forced nonempty post-mkdir fsync failure")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(lab_job_protocol.os, "mkdir", retaining_container_mkdir)
+    monkeypatch.setattr(lab_job_protocol.os, "fsync", populate_then_fail_fsync)
+
+    with pytest.raises(OSError, match="forced nonempty post-mkdir fsync failure"):
+        retained_spool._isolate_owned_entry_locked(
+            retained_source,
+            retained_observed,
+            reason="forced_nonempty_post_mkdir_fsync_failure",
+        )
+    assert retained_container is not None
+    assert (retained_container / "foreign-entry").read_text(encoding="utf-8") == ("do not remove")
+    assert not (retained_container / "evidence.json").exists()
+    assert retained_source.read_text(encoding="utf-8") == "retained-source"
+    assert live_descriptors == set()
+
     monkeypatch.setattr(lab_job_protocol.os, "open", real_open)
     monkeypatch.setattr(lab_job_protocol.os, "close", real_close)
     monkeypatch.setattr(lab_job_protocol.os, "dup", real_dup)
+    monkeypatch.setattr(lab_job_protocol.os, "fsync", real_fsync)
     monkeypatch.setattr(lab_job_protocol.os, "mkdir", real_mkdir)
 
     retried = failure_spool._isolate_owned_entry_locked(
