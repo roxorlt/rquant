@@ -12,6 +12,7 @@ import signal
 import subprocess
 import time
 from collections.abc import Callable, Mapping
+from contextlib import suppress
 from datetime import date, datetime, timedelta
 from typing import Annotated, Literal, Protocol, Self
 
@@ -31,6 +32,7 @@ from rquant.daily_pipeline_ledger import (
     DailyStageSpec,
     DailyStageState,
     DailyWriterLease,
+    LeaseLost,
     StageFailure,
     StageResult,
 )
@@ -386,6 +388,7 @@ class DailyPipelineOrchestrator:
         adapters: tuple[DailyStageAdapter, ...],
         source_resolver: DailySourceIdentityResolver,
         clock: Callable[[], datetime],
+        monotonic_clock: Callable[[], float] = time.monotonic,
         lease_for: timedelta = _DEFAULT_LEASE_FOR,
         execution_mode: Literal["production", "test_fixture"] = "production",
     ) -> None:
@@ -396,6 +399,7 @@ class DailyPipelineOrchestrator:
         self._definition = DailyPipelineDefinition.model_validate(definition)
         self._source_resolver = source_resolver
         self._clock = clock
+        self._monotonic_clock = monotonic_clock
         self._lease_for = lease_for
         self._execution_mode = execution_mode
         supplied = {adapter.stage_id: adapter for adapter in adapters}
@@ -468,7 +472,7 @@ class DailyPipelineOrchestrator:
         runtime_spec = self._definition.runtime_spec(attempt.stage_id)
         dependency_receipts = context.dependency_receipts
         adapter = self._adapter_for(attempt.stage_id)
-        started = time.monotonic()
+        started = self._monotonic()
         try:
             if self._execution_mode == "test_fixture" and callable(getattr(adapter, "run", None)):
                 return self._advance_fixture_stage(
@@ -490,7 +494,7 @@ class DailyPipelineOrchestrator:
                         message=health.detail,
                         retryable=True,
                         now=observed,
-                        elapsed_seconds=time.monotonic() - started,
+                        elapsed_seconds=self._monotonic() - started,
                         dependency_receipts=dependency_receipts,
                     )
                 if (
@@ -507,7 +511,7 @@ class DailyPipelineOrchestrator:
                         message="stage resource estimate exceeds its declared budget",
                         retryable=False,
                         now=observed,
-                        elapsed_seconds=time.monotonic() - started,
+                        elapsed_seconds=self._monotonic() - started,
                         dependency_receipts=dependency_receipts,
                     )
                 lease = self._heartbeat(lease, attempt)
@@ -545,7 +549,7 @@ class DailyPipelineOrchestrator:
                         message=(f"stage child exited with nonzero status: {observed_exit_status}"),
                         retryable=True,
                         now=self._now(None),
-                        elapsed_seconds=time.monotonic() - started,
+                        elapsed_seconds=self._monotonic() - started,
                         dependency_receipts=dependency_receipts,
                     )
                 result = adapter.reconcile(context, effect_record.intent)
@@ -557,7 +561,7 @@ class DailyPipelineOrchestrator:
                         message="child process exited without an immutable external receipt",
                         retryable=True,
                         now=self._now(None),
-                        elapsed_seconds=time.monotonic() - started,
+                        elapsed_seconds=self._monotonic() - started,
                         dependency_receipts=dependency_receipts,
                     )
                 result = StageResult.model_validate(result)
@@ -567,7 +571,7 @@ class DailyPipelineOrchestrator:
             prepared = self.ledger.prepare_success(lease, attempt, result, now=self._now(None))
             lease = self._heartbeat(lease, attempt)
             receipt = self.ledger.finalize_success(lease, prepared, now=self._now(None))
-            elapsed = time.monotonic() - started
+            elapsed = self._monotonic() - started
             return DailyStageAdvanceOutcome(
                 run_id=run_id,
                 stage_id=attempt.stage_id,
@@ -576,6 +580,8 @@ class DailyPipelineOrchestrator:
                 dependency_receipt_ids=tuple(item.receipt_id for item in dependency_receipts),
                 elapsed_seconds=elapsed,
             )
+        except LeaseLost:
+            raise
         except DailyStageAdapterError as exc:
             return self._fail(
                 lease,
@@ -584,7 +590,7 @@ class DailyPipelineOrchestrator:
                 message=str(exc),
                 retryable=exc.retryable,
                 now=self._now(None),
-                elapsed_seconds=time.monotonic() - started,
+                elapsed_seconds=self._monotonic() - started,
                 dependency_receipts=dependency_receipts,
             )
         except Exception as exc:
@@ -595,7 +601,7 @@ class DailyPipelineOrchestrator:
                 message=type(exc).__name__,
                 retryable=True,
                 now=self._now(None),
-                elapsed_seconds=time.monotonic() - started,
+                elapsed_seconds=self._monotonic() - started,
                 dependency_receipts=dependency_receipts,
             )
 
@@ -736,7 +742,7 @@ class DailyPipelineOrchestrator:
                 message=health.detail,
                 retryable=True,
                 now=context.observed_at,
-                elapsed_seconds=time.monotonic() - started,
+                elapsed_seconds=self._monotonic() - started,
                 dependency_receipts=context.dependency_receipts,
             )
         if (
@@ -753,12 +759,12 @@ class DailyPipelineOrchestrator:
                 message="stage resource estimate exceeds its declared budget",
                 retryable=False,
                 now=context.observed_at,
-                elapsed_seconds=time.monotonic() - started,
+                elapsed_seconds=self._monotonic() - started,
                 dependency_receipts=context.dependency_receipts,
             )
         fixture_run = getattr(adapter, "run", None)
         result = StageResult.model_validate(fixture_run(context))
-        elapsed = time.monotonic() - started
+        elapsed = self._monotonic() - started
         if elapsed > runtime_spec.budget.max_wall_seconds:
             return self._fail(
                 lease,
@@ -802,12 +808,12 @@ class DailyPipelineOrchestrator:
         run: DailyRunRecord,
         observed: datetime,
     ) -> DailyStageAttempt | None:
-        effects = self.ledger.active_effect_attempts(lease, now=observed, run_id=run.run_id)
-        if effects:
+        running = self.ledger.active_running_attempts(lease, now=observed, run_id=run.run_id)
+        if running:
             return self.ledger.adopt_effect_attempt(
                 lease,
-                run_id=effects[0].run_id,
-                stage_id=effects[0].stage_id,
+                run_id=running[0].run_id,
+                stage_id=running[0].stage_id,
                 now=observed,
             )
         return self.ledger.claim_next_for_run(lease, run.run_id, now=observed)
@@ -871,49 +877,83 @@ class DailyPipelineOrchestrator:
             env=environment,
             start_new_session=True,
         )
-        deadline = time.monotonic() + budget.max_wall_seconds
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                self._terminate_process_group(process)
-                raise DailyStageAdapterError(
-                    "resource_budget_exceeded",
-                    "stage child exceeded its maximum wall-clock budget",
-                    retryable=False,
-                )
+        deadline = self._monotonic() + budget.max_wall_seconds
+        try:
+            while True:
+                remaining = deadline - self._monotonic()
+                if remaining <= 0:
+                    self._terminate_process_group(process)
+                    raise DailyStageAdapterError(
+                        "resource_budget_exceeded",
+                        "stage child exceeded its maximum wall-clock budget",
+                        retryable=False,
+                    )
+                try:
+                    observed_exit_status = process.wait(
+                        timeout=min(remaining, _HEARTBEAT_INTERVAL_SECONDS)
+                    )
+                    break
+                except subprocess.TimeoutExpired:
+                    lease = self._heartbeat(lease, attempt)
+                    self._assert_source_identity(context.run)
+            self._terminate_process_group(process)
+        except LeaseLost:
             try:
-                observed_exit_status = process.wait(
-                    timeout=min(remaining, _HEARTBEAT_INTERVAL_SECONDS)
-                )
-                break
-            except subprocess.TimeoutExpired:
-                lease = self._heartbeat(lease, attempt)
-                self._assert_source_identity(context.run)
+                self._terminate_process_group(process)
+            except Exception as cleanup_error:
+                raise LeaseLost(
+                    "writer lease lost and child process group cleanup failed"
+                ) from cleanup_error
+            raise
         self._assert_source_identity(context.run)
         if process.returncode is not None:
             observed_exit_status = process.returncode
         return lease, int(observed_exit_status)
 
+    def _terminate_process_group(self, process: subprocess.Popen[bytes]) -> None:
+        pgid = process.pid
+        with suppress(ProcessLookupError):
+            os.killpg(pgid, signal.SIGTERM)
+        with suppress(subprocess.TimeoutExpired):
+            self._wait_for_process(process, timeout=2.0)
+        if self._process_group_exists(pgid):
+            with suppress(ProcessLookupError):
+                os.killpg(pgid, signal.SIGKILL)
+            try:
+                self._wait_for_process(process, timeout=2.0)
+            except subprocess.TimeoutExpired as exc:
+                raise DailyPipelineOrchestratorError(
+                    "daily stage process group did not terminate"
+                ) from exc
+        self._assert_process_group_absent(pgid)
+
+    def _wait_for_process(self, process: subprocess.Popen[bytes], *, timeout: float) -> int:
+        deadline = self._monotonic() + timeout
+        while True:
+            remaining = deadline - self._monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(process.args, timeout)
+            try:
+                return process.wait(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                if self._monotonic() >= deadline:
+                    raise
+
     @staticmethod
-    def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
-        if process.poll() is not None:
-            return
+    def _process_group_exists(pgid: int) -> bool:
         try:
-            os.killpg(process.pid, signal.SIGTERM)
-            process.wait(timeout=2)
-            return
-        except (ProcessLookupError, subprocess.TimeoutExpired):
-            pass
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
+            os.killpg(pgid, 0)
         except ProcessLookupError:
-            return
-        try:
-            process.wait(timeout=2)
-        except subprocess.TimeoutExpired as exc:
+            return False
+        except OSError as exc:
             raise DailyPipelineOrchestratorError(
-                "daily stage process group did not terminate"
+                "daily stage process group verification failed"
             ) from exc
+        return True
+
+    def _assert_process_group_absent(self, pgid: int) -> None:
+        if self._process_group_exists(pgid):
+            raise DailyPipelineOrchestratorError("daily stage process group was not reaped")
 
     @staticmethod
     def _assert_effect_identity(
@@ -989,6 +1029,9 @@ class DailyPipelineOrchestrator:
 
     def _now(self, supplied: datetime | None) -> datetime:
         return normalize_aware_utc(supplied if supplied is not None else self._clock())
+
+    def _monotonic(self) -> float:
+        return self._monotonic_clock()
 
 
 __all__ = [

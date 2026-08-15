@@ -19,6 +19,7 @@ from rquant.daily_pipeline_ledger import (
     DailyStageSpec,
     DailyStageState,
     DailyWriterLease,
+    LeaseLost,
     StageFailure,
     StageResult,
 )
@@ -93,6 +94,71 @@ def test_create_claim_and_complete_only_ready_stage(tmp_path: Path) -> None:
     publish = ledger.claim_next(lease, now=NOW + timedelta(seconds=2))
     assert publish is not None
     assert publish.stage_id == "publish"
+
+
+def test_lease_expiry_and_fence_mismatch_raise_typed_authority_loss(tmp_path: Path) -> None:
+    ledger = _ledger(tmp_path)
+    lease = ledger.acquire_writer(
+        owner="daily-close",
+        now=NOW,
+        lease_for=timedelta(seconds=1),
+    )
+    ledger.create_run(lease, _spec(), now=NOW)
+
+    assert ledger.claim_next(lease, now=lease.expires_at - timedelta(microseconds=1)) is not None
+    with pytest.raises(LeaseLost, match="writer lease"):
+        ledger.claim_next(lease, now=lease.expires_at)
+
+    replacement = ledger.acquire_writer(
+        owner="daily-close",
+        now=NOW + timedelta(seconds=2),
+        lease_for=timedelta(minutes=5),
+    )
+    with pytest.raises(LeaseLost, match="writer lease"):
+        ledger.claim_next(lease, now=NOW + timedelta(seconds=2))
+    assert replacement.fencing_token == lease.fencing_token + 1
+
+
+def test_new_owner_adopts_expired_running_attempt_without_effect_or_retry_mutation(
+    tmp_path: Path,
+) -> None:
+    ledger = _ledger(tmp_path)
+    old_lease = ledger.acquire_writer(
+        owner="daily-close",
+        now=NOW,
+        lease_for=timedelta(seconds=1),
+    )
+    run = ledger.create_run(
+        old_lease,
+        _spec(stages=(DailyStageSpec(stage_id="capture", max_attempts=2),)),
+        now=NOW,
+    )
+    claimed = ledger.claim_next(old_lease, now=NOW)
+    assert claimed is not None
+
+    new_lease = ledger.acquire_writer(
+        owner="daily-close",
+        now=NOW + timedelta(seconds=2),
+        lease_for=timedelta(minutes=5),
+    )
+    recovery = ledger.recover(new_lease, now=NOW + timedelta(seconds=2))
+    adopted = ledger.adopt_effect_attempt(
+        new_lease,
+        run_id=run.run_id,
+        stage_id="capture",
+        now=NOW + timedelta(seconds=2),
+    )
+
+    stage = ledger.stage(run.run_id, "capture")
+    assert recovery.retried_stage_ids == ()
+    assert recovery.failed_stage_ids == ()
+    assert stage.state is DailyStageState.RUNNING
+    assert stage.attempts == claimed.attempt_number
+    assert stage.last_failure is None
+    assert stage.terminal_receipt_id is None
+    assert adopted is not None
+    assert adopted.attempt_number == claimed.attempt_number
+    assert adopted.fencing_token == new_lease.fencing_token
 
 
 def test_stage_graph_rejects_unknown_dependency() -> None:

@@ -78,7 +78,7 @@ def test_crash_after_receipt_before_state_is_idempotently_recovered(tmp_path: Pa
     assert validate.stage_id == "validate"
 
 
-def test_crash_without_receipt_retries_but_never_skips_dependency(tmp_path: Path) -> None:
+def test_crash_without_receipt_is_adopted_without_skipping_dependency(tmp_path: Path) -> None:
     profile = _profile(tmp_path)
     first = _ledger(profile)
     old_lease = first.acquire_writer(owner="daily-close", now=NOW, lease_for=timedelta(seconds=1))
@@ -90,13 +90,23 @@ def test_crash_without_receipt_retries_but_never_skips_dependency(tmp_path: Path
     next_lease = restarted.acquire_writer(
         owner="daily-close", now=NOW + timedelta(seconds=2), lease_for=timedelta(minutes=1)
     )
-    restarted.recover(next_lease, now=NOW + timedelta(seconds=2))
+    recovery = restarted.recover(next_lease, now=NOW + timedelta(seconds=2))
+    adopted = restarted.adopt_effect_attempt(
+        next_lease,
+        run_id=run.run_id,
+        stage_id="capture",
+        now=NOW + timedelta(seconds=2),
+    )
 
+    capture = restarted.stage(run.run_id, "capture")
     assert restarted.stage(run.run_id, "validate").state is DailyStageState.PENDING
-    retry = restarted.claim_next(next_lease, now=NOW + timedelta(seconds=2))
-    assert retry is not None
-    assert retry.stage_id == "capture"
-    assert retry.attempt_number == 2
+    assert recovery.retried_stage_ids == ()
+    assert capture.state is DailyStageState.RUNNING
+    assert capture.attempts == attempt.attempt_number
+    assert adopted is not None
+    assert adopted.attempt_number == attempt.attempt_number
+    assert adopted.fencing_token == next_lease.fencing_token
+    assert restarted.claim_next(next_lease, now=NOW + timedelta(seconds=2)) is None
 
 
 def test_competing_claims_use_independent_connections_and_only_one_wins(tmp_path: Path) -> None:

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -10,8 +13,11 @@ from rquant.daily_pipeline_ledger import (
     DailyPipelineMode,
     DailyPipelineStorageProfile,
     DailyRunState,
+    DailyStageState,
+    LeaseLost,
     StageResult,
 )
+from rquant.runtime_contracts import canonical_sha256
 
 NOW = datetime(2026, 8, 3, 9, 0, tzinfo=UTC)
 TRADE_DATE = date(2026, 8, 3)
@@ -146,6 +152,237 @@ def _create_run(orchestrator):
         profile_hash="d" * 64,
         now=NOW,
     )
+
+
+class ProcessAdapter:
+    stage_id = "capture"
+
+    def __init__(self, marker: Path, *, spawn_descendant: bool = False) -> None:
+        self.marker = marker
+        self.command_calls = 0
+        self._spawn_descendant = spawn_descendant
+
+    def health(self, _context):
+        from rquant.daily_pipeline_orchestrator import DailyStageHealth
+
+        return DailyStageHealth(ready=True, detail="ready")
+
+    def prepare(self, context):
+        from rquant.daily_pipeline_ledger import DailyStageEffectIntent
+
+        return DailyStageEffectIntent(
+            mode=context.run.spec.mode,
+            idempotency_key=canonical_sha256(
+                {
+                    "contract": "daily-stage-idempotency-key/v3",
+                    "mode": context.run.spec.mode,
+                    "run_id": context.run.run_id,
+                    "stage_id": context.attempt.stage_id,
+                    "input_identity": context.run.input_identity,
+                    "command_manifest_hash": context.run.spec.command_manifest_hash,
+                }
+            ),
+            command_manifest_hash=context.run.spec.command_manifest_hash,
+            adapter_identity="unit-process-adapter/v1",
+            receipt_locator=str(self.marker.with_suffix(".receipt")),
+        )
+
+    def command(self, _context, _effect):
+        from rquant.daily_pipeline_orchestrator import DailyStageProcessSpec
+
+        self.command_calls += 1
+        child_body = "time.sleep(60)"
+        if self._spawn_descendant:
+            child_body = (
+                "subprocess.Popen((sys.executable, '-c', 'import time; time.sleep(60)')); "
+                "time.sleep(0.02)"
+            )
+        return DailyStageProcessSpec(
+            argv=(
+                sys.executable,
+                "-c",
+                "from pathlib import Path; import os, subprocess, sys, time; "
+                f"Path({str(self.marker)!r}).write_text(str(os.getpid())); {child_body}",
+            )
+        )
+
+    def reconcile(self, _context, _effect):
+        return None
+
+
+def _process_orchestrator(tmp_path: Path, adapter: ProcessAdapter):
+    from rquant.daily_pipeline_orchestrator import (
+        DailyPipelineDefinition,
+        DailyPipelineOrchestrator,
+        DailyStageBudget,
+        DailyStageRuntimeSpec,
+    )
+
+    profile = DailyPipelineStorageProfile.create(
+        root=tmp_path.resolve(),
+        mode=DailyPipelineMode.SHADOW,
+        profile_hash="d" * 64,
+    )
+    return DailyPipelineOrchestrator(
+        ledger=DailyPipelineLedger(storage_profile=profile, service_owner="daily-shadow"),
+        service_owner="daily-shadow",
+        definition=DailyPipelineDefinition(
+            stages=(
+                DailyStageRuntimeSpec(
+                    stage_id="capture",
+                    budget=DailyStageBudget(max_wall_seconds=30),
+                ),
+            )
+        ),
+        adapters=(adapter,),
+        source_resolver=StaticSourceResolver(),
+        clock=lambda: NOW,
+    )
+
+
+def _create_process_run(orchestrator):
+    return orchestrator.create_run(
+        mode=DailyPipelineMode.SHADOW,
+        trade_date=TRADE_DATE,
+        source_generation_id=SHA,
+        source_content_hash="c" * 64,
+        command_manifest_hash="e" * 64,
+        code_commit=COMMIT,
+        profile_hash="d" * 64,
+        now=NOW,
+    )
+
+
+def _assert_running_without_terminal_mutation(orchestrator, run_id: str) -> None:
+    stage = orchestrator.ledger.stage(run_id, "capture")
+    assert stage.state is DailyStageState.RUNNING
+    assert stage.terminal_receipt_id is None
+    assert stage.last_failure is None
+    assert orchestrator.ledger.run(run_id).state is DailyRunState.RUNNING
+
+
+def test_spawn_boundary_lease_loss_does_not_run_command_or_fail_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter = ProcessAdapter(tmp_path / "child-pid")
+    orchestrator = _process_orchestrator(tmp_path, adapter)
+    run = _create_process_run(orchestrator)
+
+    monkeypatch.setattr(
+        orchestrator,
+        "_heartbeat",
+        lambda _lease, _attempt: (_ for _ in ()).throw(LeaseLost("writer lease is stale")),
+    )
+
+    with pytest.raises(LeaseLost, match="writer lease"):
+        orchestrator.advance(run.run_id, now=NOW)
+
+    assert adapter.command_calls == 0
+    _assert_running_without_terminal_mutation(orchestrator, run.run_id)
+
+
+def test_live_child_lease_loss_terminates_and_reaps_its_process_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import rquant.daily_pipeline_orchestrator as orchestrator_module
+
+    adapter = ProcessAdapter(tmp_path / "child-pid")
+    orchestrator = _process_orchestrator(tmp_path, adapter)
+    run = _create_process_run(orchestrator)
+    original_heartbeat = orchestrator._heartbeat
+    heartbeat_calls = 0
+    started_processes: list[subprocess.Popen[bytes]] = []
+    real_popen = subprocess.Popen
+
+    def capture_popen(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        started_processes.append(process)
+        return process
+
+    def lose_after_child_started(lease, attempt):
+        nonlocal heartbeat_calls
+        heartbeat_calls += 1
+        if heartbeat_calls == 3:
+            raise LeaseLost("writer lease is stale")
+        return original_heartbeat(lease, attempt)
+
+    monkeypatch.setattr(orchestrator_module, "_HEARTBEAT_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(orchestrator_module.subprocess, "Popen", capture_popen)
+    monkeypatch.setattr(orchestrator, "_heartbeat", lose_after_child_started)
+
+    with pytest.raises(LeaseLost, match="writer lease"):
+        orchestrator.advance(run.run_id, now=NOW)
+
+    assert adapter.command_calls == 1
+    assert len(started_processes) == 1
+    process = started_processes[0]
+    assert process.poll() is not None
+    with pytest.raises(ProcessLookupError):
+        os.killpg(process.pid, 0)
+    _assert_running_without_terminal_mutation(orchestrator, run.run_id)
+
+
+def test_lease_loss_cleanup_failure_remains_a_typed_authority_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rquant.daily_pipeline_orchestrator import DailyPipelineOrchestratorError
+
+    adapter = ProcessAdapter(tmp_path / "child-pid")
+    orchestrator = _process_orchestrator(tmp_path, adapter)
+    run = _create_process_run(orchestrator)
+    original_heartbeat = orchestrator._heartbeat
+    original_terminate = orchestrator._terminate_process_group
+    heartbeat_calls = 0
+
+    def lose_after_child_started(lease, attempt):
+        nonlocal heartbeat_calls
+        heartbeat_calls += 1
+        if heartbeat_calls == 3:
+            raise LeaseLost("writer lease is stale")
+        return original_heartbeat(lease, attempt)
+
+    def terminate_then_report_failure(process):
+        original_terminate(process)
+        raise DailyPipelineOrchestratorError("simulated process-group verification failure")
+
+    import rquant.daily_pipeline_orchestrator as orchestrator_module
+
+    monkeypatch.setattr(orchestrator_module, "_HEARTBEAT_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(orchestrator, "_heartbeat", lose_after_child_started)
+    monkeypatch.setattr(orchestrator, "_terminate_process_group", terminate_then_report_failure)
+
+    with pytest.raises(LeaseLost, match="cleanup failed") as raised:
+        orchestrator.advance(run.run_id, now=NOW)
+
+    assert isinstance(raised.value.__cause__, DailyPipelineOrchestratorError)
+    _assert_running_without_terminal_mutation(orchestrator, run.run_id)
+
+
+def test_normal_leader_exit_cleans_descendants_before_reporting_child_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import rquant.daily_pipeline_orchestrator as orchestrator_module
+
+    adapter = ProcessAdapter(tmp_path / "child-pid", spawn_descendant=True)
+    orchestrator = _process_orchestrator(tmp_path, adapter)
+    run = _create_process_run(orchestrator)
+    started_processes: list[subprocess.Popen[bytes]] = []
+    real_popen = subprocess.Popen
+
+    def capture_popen(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        started_processes.append(process)
+        return process
+
+    monkeypatch.setattr(orchestrator_module.subprocess, "Popen", capture_popen)
+
+    outcome = orchestrator.advance(run.run_id, now=NOW)
+
+    assert outcome is not None
+    assert outcome.disposition == "retry_wait"
+    assert len(started_processes) == 1
+    with pytest.raises(ProcessLookupError):
+        os.killpg(started_processes[0].pid, 0)
 
 
 def test_daily_definition_has_the_isolated_a_to_d_stage_order() -> None:

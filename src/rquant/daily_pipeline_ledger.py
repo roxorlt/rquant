@@ -39,6 +39,10 @@ class DailyPipelineLedgerError(RuntimeError):
     """The durable ledger is unavailable, stale, or internally inconsistent."""
 
 
+class LeaseLost(DailyPipelineLedgerError):  # noqa: N818
+    """The caller no longer owns the writer lease or its fencing authority."""
+
+
 class _CommittedLedgerError(DailyPipelineLedgerError):
     """Internal error for business-rule rejections after durable state was committed."""
 
@@ -1381,7 +1385,7 @@ class DailyPipelineLedger:
                 or writer_expiry is None
                 or writer_expiry <= observed
             ):
-                raise DailyPipelineLedgerError("external receipt writer lease is stale")
+                raise LeaseLost("external receipt writer lease is stale")
             run = self._run_from_row(self._run_row(connection, run_id))
             if run.state is not DailyRunState.RUNNING:
                 raise DailyPipelineLedgerError("external receipt run is not active")
@@ -1394,7 +1398,7 @@ class DailyPipelineLedger:
                 or stage_expiry is None
                 or stage_expiry <= observed
             ):
-                raise DailyPipelineLedgerError("external receipt stage fence is stale")
+                raise LeaseLost("external receipt stage fence is stale")
             effect = self._effect_for_stage(connection, run_id, stage_id)
             if effect is None:
                 raise DailyPipelineLedgerError("external receipt effect is not prepared")
@@ -1694,19 +1698,17 @@ class DailyPipelineLedger:
         stage_id: str,
         now: datetime,
     ) -> DailyStageAttempt | None:
-        """Fence and resume a running stage that owns an effect intent.
+        """Fence and resume a running stage without incrementing its attempt.
 
         Adoption does not increment the attempt number.  The same idempotency
-        key remains authoritative across a crash and therefore a new owner
-        can reconcile a committed external receipt safely.
+        key remains authoritative across a crash; stages without an effect
+        remain on their same attempt so the new owner can prepare once.
         """
         observed = normalize_aware_utc(now)
         with self._transaction() as connection:
             self._validate_lease(connection, lease, observed)
             row = self._stage_row(connection, run_id, stage_id)
             if row["state"] != DailyStageState.RUNNING.value:
-                return None
-            if self._effect_for_stage(connection, run_id, stage_id) is None:
                 return None
             run = self._run_row(connection, run_id)
             self._raise_if_deadline_expired(connection, row, run, observed)
@@ -1754,6 +1756,49 @@ class DailyPipelineLedger:
                 FROM daily_pipeline_stage AS stage
                 JOIN daily_pipeline_effect_intent AS effect
                   ON effect.run_id = stage.run_id AND effect.stage_id = stage.stage_id
+                JOIN daily_pipeline_run AS run ON run.run_id = stage.run_id
+                WHERE stage.state = ? AND run.state = ?{predicate}
+                ORDER BY run.created_at, stage.sequence
+                LIMIT ?
+                """,
+                (
+                    DailyStageState.RUNNING.value,
+                    DailyRunState.RUNNING.value,
+                    *((run_id,) if run_id is not None else ()),
+                    bounded_limit,
+                ),
+            ).fetchall()
+            return tuple(
+                DailyStageAttempt(
+                    mode=DailyPipelineMode(row["run_mode"]),
+                    run_id=row["run_id"],
+                    stage_id=row["stage_id"],
+                    attempt_number=int(row["attempts"]),
+                    fencing_token=int(row["claim_fencing_token"]),
+                    claimed_at=_load_datetime_required(row["claimed_at"]),
+                    lease_expires_at=_load_datetime_required(row["claim_lease_expires_at"]),
+                )
+                for row in rows
+            )
+
+    def active_running_attempts(
+        self,
+        lease: DailyWriterLease,
+        *,
+        now: datetime,
+        run_id: str | None = None,
+        limit: int = _DEFAULT_RECOVERY_LIMIT,
+    ) -> tuple[DailyStageAttempt, ...]:
+        """Return bounded active attempts that a replacement writer may adopt."""
+        observed = normalize_aware_utc(now)
+        bounded_limit = self._validate_recovery_limit(limit)
+        with self._transaction() as connection:
+            self._validate_lease(connection, lease, observed)
+            predicate = "" if run_id is None else " AND stage.run_id = ?"
+            rows = connection.execute(
+                f"""
+                SELECT stage.*, run.mode AS run_mode
+                FROM daily_pipeline_stage AS stage
                 JOIN daily_pipeline_run AS run ON run.run_id = stage.run_id
                 WHERE stage.state = ? AND run.state = ?{predicate}
                 ORDER BY run.created_at, stage.sequence
@@ -1872,7 +1917,7 @@ class DailyPipelineLedger:
             if row["claim_fencing_token"] != lease.fencing_token or (
                 expected_fencing_token is not None and expected_fencing_token != lease.fencing_token
             ):
-                raise DailyPipelineLedgerError("daily stage fencing token is stale")
+                raise LeaseLost("daily stage fencing token is stale")
             if not self._dependencies_succeeded(connection, run_id, stage_id):
                 raise DailyPipelineLedgerError("daily stage dependencies are not complete")
             run = self._run_row(connection, run_id)
@@ -1937,7 +1982,7 @@ class DailyPipelineLedger:
             if int(row["attempts"]) != verified.attempt_number:
                 raise DailyPipelineLedgerError("daily stage receipt attempt is stale")
             if row["claim_fencing_token"] != lease.fencing_token:
-                raise DailyPipelineLedgerError("daily stage fencing token is stale")
+                raise LeaseLost("daily stage fencing token is stale")
             if not self._dependencies_succeeded(connection, verified.run_id, verified.stage_id):
                 raise DailyPipelineLedgerError("daily stage dependencies are not complete")
             run = self._run_row(connection, verified.run_id)
@@ -2240,50 +2285,10 @@ class DailyPipelineLedger:
                     self._refresh_run_state(connection, row["run_id"])
                     finalized.append(prepared.receipt_id)
                     continue
-                # A process may have committed its external idempotent effect
-                # and died before this ledger received the terminal receipt.
-                # The orchestrator must reconcile that immutable receipt before
-                # a stage is ever made claimable again.
-                if self._effect_for_stage(connection, row["run_id"], row["stage_id"]) is not None:
-                    continue
-                lease_expiry = _load_datetime(row["claim_lease_expires_at"])
-                claim_fence = row["claim_fencing_token"]
-                if (
-                    claim_fence == lease.fencing_token
-                    and lease_expiry is not None
-                    and lease_expiry > observed
-                ):
-                    continue
-                if int(row["attempts"]) < int(row["max_attempts"]):
-                    connection.execute(
-                        """
-                        UPDATE daily_pipeline_stage
-                        SET state = ?, next_attempt_at = ?, claimed_at = NULL,
-                            claim_fencing_token = NULL, claim_lease_expires_at = NULL,
-                            failure_code = ?, failure_message = ?
-                        WHERE run_id = ? AND stage_id = ?
-                        """,
-                        (
-                            DailyStageState.RETRY_WAIT.value,
-                            _dump_datetime(observed),
-                            "recovered_after_crash",
-                            "worker lease expired without terminal receipt",
-                            row["run_id"],
-                            row["stage_id"],
-                        ),
-                    )
-                    retried.append(row["stage_id"])
-                else:
-                    self._mark_failed(
-                        connection,
-                        row,
-                        StageFailure(
-                            error_code="recovery_attempts_exhausted",
-                            message="worker crashed after final permitted attempt",
-                        ),
-                    )
-                    self._refresh_run_state(connection, row["run_id"])
-                    failed.append(row["stage_id"])
+                # A replacement writer adopts every nonterminal attempt before
+                # reconciling or preparing its effect.  Recovery must not turn
+                # a lease loss into an old-owner terminal or retry mutation.
+                continue
         return DailyRecoverySummary(
             finalized_receipt_ids=tuple(finalized),
             retried_stage_ids=tuple(retried),
@@ -2332,7 +2337,7 @@ class DailyPipelineLedger:
             or expires != normalize_aware_utc(verified.expires_at)
             or expires <= now
         ):
-            raise DailyPipelineLedgerError("writer lease is stale")
+            raise LeaseLost("writer lease is stale")
 
     @staticmethod
     def _run_row(connection: sqlite3.Connection, run_id: str) -> sqlite3.Row:
@@ -2554,7 +2559,7 @@ class DailyPipelineLedger:
             attempt.fencing_token != lease.fencing_token
             or row["claim_fencing_token"] != lease.fencing_token
         ):
-            raise DailyPipelineLedgerError("daily stage fencing token is stale")
+            raise LeaseLost("daily stage fencing token is stale")
 
     @staticmethod
     def _validate_recovery_limit(limit: int) -> int:

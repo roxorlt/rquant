@@ -13,7 +13,7 @@ from rquant.daily_canonical_publisher import DailyCanonicalPublisher
 from rquant.daily_close_candidate import DailyCloseCandidateStore
 from rquant.daily_close_validation import DailyCloseValidator
 from rquant.daily_ledger_fence import DailyLedgerFenceGuard
-from rquant.daily_pipeline_ledger import DailyPipelineLedgerError, StageResult
+from rquant.daily_pipeline_ledger import LeaseLost, StageResult
 from rquant.daily_pool_stage import DailyDownstreamArtifactStore, DailyPoolStage, DailyScreenStage
 from rquant.daily_summary_stage import DailySummaryStage
 from rquant.delivery_contracts import DeliveryChannel, DeliveryTarget
@@ -44,6 +44,7 @@ class _Adapter:
         self._runner = runner
         self._crash_after_run_once = crash_after_run_once
         self.calls = 0
+        self._completed_attempts: dict[tuple[str, int], StageResult] = {}
 
     def health(self, _context):
         from rquant.daily_pipeline_orchestrator import DailyStageHealth
@@ -52,7 +53,12 @@ class _Adapter:
 
     def run(self, context):
         self.calls += 1
+        key = (context.run.run_id, context.attempt.attempt_number)
+        recovered = self._completed_attempts.get(key)
+        if recovered is not None:
+            return recovered
         result = self._runner(context)
+        self._completed_attempts[key] = result
         if self._crash_after_run_once:
             self._crash_after_run_once = False
             raise SystemExit(f"simulated crash after {self.stage_id} durable side effects")
@@ -340,7 +346,7 @@ def test_real_daily_fixture_reaches_outbox_through_orchestrator_once(
             lease_for=timedelta(minutes=15),
             execution_mode="test_fixture",
         )
-        with pytest.raises(DailyPipelineLedgerError, match="writer lease is stale"):
+        with pytest.raises(LeaseLost, match="writer lease is stale"):
             expiring.advance(run.run_id, now=COMMITTED_AT)
         orchestrator = DailyPipelineOrchestrator(
             ledger=ledger,
