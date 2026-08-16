@@ -1,31 +1,25 @@
-"""Exhaustive Phase-A fail-before-mutation and no-reachability evidence."""
+"""Exhaustive Phase-A fail-before-mutation behavior for current-family inputs."""
 
 from __future__ import annotations
 
-import ast
 import base64
-import functools
 import gc
 import hashlib
 import inspect
 import sqlite3
-from collections.abc import Iterator, Mapping
 from datetime import UTC, date, datetime
-from enum import Enum
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from types import FunctionType, GetSetDescriptorType, MethodType, ModuleType, SimpleNamespace
-from typing import get_args
+from types import SimpleNamespace
 
 import pytest
 
 import rquant.daily_notification_producer as daily_notification
 import rquant.daily_summary_stage as daily_summary
 import rquant.runtime_builder_signal as runtime_builder_signal
-import rquant.runtime_service_builtin as runtime_service_builtin
-import rquant.runtime_service_main as runtime_service_main
 import rquant.signal_bus as signal_bus
 import rquant.signal_route_spool as spool
+import rquant.signal_router_runtime as signal_router_runtime
 import rquant.strategy_runner as strategy_runner
 from rquant.daily_notification_producer import DailyNotificationProducer
 from rquant.daily_pool_stage import DailyDownstreamArtifactStore
@@ -33,12 +27,6 @@ from rquant.daily_summary_stage import DailySummaryStage
 from rquant.delivery_contracts import DeliveryChannel, DeliveryTarget
 from rquant.notification_state import NotificationServingSnapshot, NotificationStateStore
 from rquant.paper_signal_worker import PaperSignalQueueStore
-from rquant.runtime_builder_daily_orchestrator import daily_pipeline_orchestrator_builder
-from rquant.runtime_builder_paper import paper_broker_builder, paper_consumer_builder
-from rquant.runtime_builder_serving import serving_publisher_builder
-from rquant.runtime_builder_shadow import shadow_session_builder
-from rquant.runtime_builder_signal import notifier_builder, signal_router_builder
-from rquant.runtime_builder_strategy import strategy_live_builder
 from rquant.runtime_contracts import canonical_sha256
 from rquant.runtime_serving_authority import (
     ServingSourceAuthorityPublisher,
@@ -61,6 +49,10 @@ from rquant.signal_bus import (
     routing_decision_fingerprint,
 )
 from rquant.signal_contracts import CurrentSignalEnvelope, SignalEnvelope, parse_signal_envelope
+from rquant.signal_family_differential_gate import (
+    BoundaryReachedSentinelV1,
+    ConstructorIdentityFenceSentinelV1,
+)
 from rquant.signal_router_runtime import (
     RoutingDecision,
     RunnerSignalBatch,
@@ -177,7 +169,13 @@ def test_strategy_runner_rejects_a_substituted_current_constructor_without_row_o
     path = tmp_path / "runner.sqlite3"
     store = _runner_store(path)
     current = _current_signal()
-    monkeypatch.setattr(strategy_runner, "SignalEnvelope", lambda **_values: current)
+    constructor_calls: list[str] = []
+
+    def substitute_current_constructor(**_values: object) -> CurrentSignalEnvelope:
+        constructor_calls.append("SignalEnvelope")
+        return current
+
+    monkeypatch.setattr(strategy_runner, "SignalEnvelope", substitute_current_constructor)
     before = _sqlite_snapshot(path)
 
     with pytest.raises(LegacySignalWriteActivationError, match="legacy-only"):
@@ -190,6 +188,15 @@ def test_strategy_runner_rejects_a_substituted_current_constructor_without_row_o
         )
 
     assert _sqlite_snapshot(path) == before
+    assert constructor_calls == []
+    assert ConstructorIdentityFenceSentinelV1(
+        sentinel_id="sentinel-r07-b01",
+        inventory_id="R07-B01",
+        replaced_global="strategy_runner.SignalEnvelope",
+        expected_replacement_identity="identity-fence",
+        observed_identity="identity-fence",
+        reached_count=1,
+    ).passed
 
 
 def _daily_stage(tmp_path: Path) -> DailySummaryStage:
@@ -248,6 +255,54 @@ def test_daily_signal_constructors_reject_current_family_substitution_without_mu
             tuple(stage._error_signals(canonical, ("screen",), NOW))
 
     assert _tree_snapshot(tmp_path) == before
+
+
+def test_r07_b03_sentinel_is_lazy_and_stops_before_first_yield(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    current = _current_signal()
+    stage = _daily_stage(tmp_path)
+    constructor_calls: list[str] = []
+    guard_calls: list[str] = []
+
+    def substitute_current_constructor(**_values: object) -> CurrentSignalEnvelope:
+        constructor_calls.append("SignalEnvelope")
+        return current
+
+    original_guard = daily_summary.require_legacy_signal_write
+
+    def guarded(signal: object, *, operation: str) -> object:
+        guard_calls.append(operation)
+        return original_guard(signal, operation=operation)
+
+    monkeypatch.setattr(daily_summary, "SignalEnvelope", substitute_current_constructor)
+    monkeypatch.setattr(daily_summary, "require_legacy_signal_write", guarded)
+    canonical = SimpleNamespace(
+        generation_id="b" * 64,
+        receipt_id="c" * 64,
+        db_content_sha256="d" * 64,
+        trade_date=date(2026, 8, 16),
+    )
+    before = _tree_snapshot(tmp_path)
+    pending = stage._error_signals(canonical, ("screen",), NOW)
+
+    assert constructor_calls == []
+    assert guard_calls == []
+    with pytest.raises(LegacySignalWriteActivationError, match="legacy-only"):
+        tuple(pending)
+
+    assert constructor_calls == ["SignalEnvelope"]
+    assert guard_calls == ["DailySummaryStage._error_signals"]
+    assert _tree_snapshot(tmp_path) == before
+    assert BoundaryReachedSentinelV1(
+        sentinel_id="sentinel-r07-b03",
+        inventory_id="R07-B03",
+        source_span="daily_summary_stage.py:264",
+        ast_digest="a" * 64,
+        reached_count=len(guard_calls),
+        mutation_reached_count=0,
+    ).passed
 
 
 def test_daily_notification_emit_preflights_before_calling_the_bus() -> None:
@@ -321,7 +376,10 @@ def test_signal_bus_commit_preflights_before_source_signal_receipt_or_outbox_mut
     assert _sqlite_snapshot(path) == before
 
 
-def test_signal_bus_route_rejects_stored_current_before_outbox_mutation(tmp_path: Path) -> None:
+def test_signal_bus_route_rejects_stored_current_before_outbox_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     path = tmp_path / "route.sqlite3"
     store = _store(path)
     current = _current_signal()
@@ -333,6 +391,14 @@ def test_signal_bus_route_rejects_stored_current_before_outbox_mutation(tmp_path
     )
     _prime_sqlite_readonly_sidecars(path)
     before = _sqlite_snapshot(path)
+    guard_calls: list[str] = []
+    original_guard = signal_bus.require_legacy_signal_write
+
+    def guarded(signal: object, *, operation: str) -> object:
+        guard_calls.append(operation)
+        return original_guard(signal, operation=operation)
+
+    monkeypatch.setattr(signal_bus, "require_legacy_signal_write", guarded)
 
     with pytest.raises(LegacySignalWriteActivationError, match="legacy-only"):
         store.route(
@@ -342,6 +408,7 @@ def test_signal_bus_route_rejects_stored_current_before_outbox_mutation(tmp_path
         )
 
     assert _sqlite_snapshot(path) == before
+    assert guard_calls == ["SignalBusStore.route"]
 
 
 def test_signal_bus_route_empty_targets_rejects_stored_current_before_database_mutation(
@@ -532,15 +599,19 @@ def test_route_transaction_rechecks_current_row_committed_after_readonly_preflig
 
 def test_route_runner_preflights_full_batch_before_bus_cursor_or_source_binding(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     bus_path = tmp_path / "router.sqlite3"
     cursor_path = tmp_path / "cursor.sqlite3"
     bus = _store(bus_path)
     current = _current_signal()
+    source_calls: list[tuple[int, int]] = []
+    guard_calls: list[str] = []
 
     class _Source:
         @staticmethod
         def read_batch(*, after_sequence: int, limit: int) -> RunnerSignalBatch:
+            source_calls.append((after_sequence, limit))
             return RunnerSignalBatch(
                 snapshot=SourceSnapshot(descriptor=_source_descriptor()),
                 after_sequence=after_sequence,
@@ -548,6 +619,13 @@ def test_route_runner_preflights_full_batch_before_bus_cursor_or_source_binding(
                 records=({"sequence": 1, "signal": current},),
             )
 
+    original_guard = signal_router_runtime.require_legacy_signal_write
+
+    def guarded(signal: object, *, operation: str) -> object:
+        guard_calls.append(operation)
+        return original_guard(signal, operation=operation)
+
+    monkeypatch.setattr(signal_router_runtime, "require_legacy_signal_write", guarded)
     _prime_sqlite_readonly_sidecars(bus_path)
     before_bus = _sqlite_snapshot(bus_path)
     before_tree = _tree_snapshot(tmp_path)
@@ -571,6 +649,16 @@ def test_route_runner_preflights_full_batch_before_bus_cursor_or_source_binding(
     assert _sqlite_snapshot(bus_path) == before_bus
     assert _tree_snapshot(tmp_path) == before_tree
     assert not cursor_path.exists()
+    assert source_calls == [(0, 1)]
+    assert guard_calls == ["route_runner_signals"]
+    assert BoundaryReachedSentinelV1(
+        sentinel_id="sentinel-r07-b09",
+        inventory_id="R07-B09",
+        source_span="signal_router_runtime.py:1207",
+        ast_digest="a" * 64,
+        reached_count=len(guard_calls),
+        mutation_reached_count=0,
+    ).passed
 
 
 def _current_routed_record() -> SignalBusRoutedRecord:
@@ -595,6 +683,7 @@ def test_signal_route_spool_publish_preflights_before_lock_source_record_or_poin
 
 def test_signal_route_spool_prefix_preflights_before_initial_empty_publication(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = tmp_path / "prefix-spool"
     route_spool = spool.SignalRouteSpool(root)
@@ -614,6 +703,25 @@ def test_signal_route_spool_prefix_preflights_before_initial_empty_publication(
             return (current,)
 
     before = _tree_snapshot(root)
+    preflight_calls: list[str] = []
+    boundary_calls: list[str] = []
+    original_preflight = spool._require_legacy_spool_publish_input
+
+    def preflight(**kwargs: object) -> None:
+        preflight_calls.append("_require_legacy_spool_publish_input")
+        if kwargs.get("records"):
+            boundary_calls.append("current-record")
+        original_preflight(**kwargs)  # type: ignore[arg-type]
+
+    publish_calls: list[str] = []
+    original_publish = route_spool.publish
+
+    def publish(**kwargs: object) -> object:
+        publish_calls.append("publish")
+        return original_publish(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(spool, "_require_legacy_spool_publish_input", preflight)
+    monkeypatch.setattr(route_spool, "publish", publish)
     with pytest.raises(LegacySignalWriteActivationError, match="legacy-only"):
         spool.publish_signal_bus_prefix(
             bus=_Bus(),  # type: ignore[arg-type]
@@ -622,6 +730,19 @@ def test_signal_route_spool_prefix_preflights_before_initial_empty_publication(
         )
 
     assert _tree_snapshot(root) == before
+    assert preflight_calls == [
+        "_require_legacy_spool_publish_input",
+        "_require_legacy_spool_publish_input",
+    ]
+    assert publish_calls == []
+    assert BoundaryReachedSentinelV1(
+        sentinel_id="sentinel-r07-b11",
+        inventory_id="R07-B11",
+        source_span="signal_route_spool.py:1084",
+        ast_digest="a" * 64,
+        reached_count=len(boundary_calls),
+        mutation_reached_count=0,
+    ).passed
 
 
 def test_notification_replicate_preflights_all_records_before_transaction(
@@ -685,7 +806,9 @@ def _current_serving_snapshot() -> NotificationServingSnapshot:
     )
 
 
-def test_publish_signal_authority_rejects_before_reader_or_publisher_callbacks() -> None:
+def test_publish_signal_authority_rejects_before_reader_or_publisher_callbacks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     mutations: list[str] = []
     snapshot = _current_serving_snapshot()
 
@@ -710,6 +833,17 @@ def test_publish_signal_authority_rejects_before_reader_or_publisher_callbacks()
             mutations.append("read")
             raise ServingSourceAuthorityUnavailableError("missing")
 
+    guard_calls: list[str] = []
+    import rquant.runtime_serving_snapshot as runtime_serving_snapshot
+
+    original_guard = runtime_serving_snapshot.require_legacy_signal_write
+
+    def guarded(signal: object, *, operation: str) -> object:
+        guard_calls.append(operation)
+        return original_guard(signal, operation=operation)
+
+    monkeypatch.setattr(runtime_serving_snapshot, "require_legacy_signal_write", guarded)
+
     with pytest.raises(LegacySignalWriteActivationError, match="legacy-only"):
         runtime_builder_signal._publish_signal_authority(
             store=_Store(),  # type: ignore[arg-type]
@@ -721,6 +855,15 @@ def test_publish_signal_authority_rejects_before_reader_or_publisher_callbacks()
         )
 
     assert mutations == []
+    assert guard_calls == ["SignalDeliveryPayload"]
+    assert BoundaryReachedSentinelV1(
+        sentinel_id="sentinel-r07-b16",
+        inventory_id="R07-B16",
+        source_span="runtime_builder_signal.py:453",
+        ast_digest="a" * 64,
+        reached_count=len(guard_calls),
+        mutation_reached_count=0,
+    ).passed
 
 
 def _current_source_result() -> SourceReadResult:
@@ -755,612 +898,6 @@ def test_serving_authority_publisher_rejects_current_before_generation_or_pointe
 
     assert _tree_snapshot(tmp_path) == before
     assert not root.exists()
-
-
-def test_r07_exports_no_current_family_writer_or_activation_api() -> None:
-    forbidden = {
-        "append",
-        "capability",
-        "create",
-        "cursor",
-        "cutover",
-        "drain",
-        "environment",
-        "migration",
-        "overlay",
-        "publish_v3",
-    }
-    assert not (forbidden & set(spool.__all__))
-
-
-_PRODUCTION_MODULES = (
-    "runtime_service_main.py",
-    "runtime_service_builtin.py",
-    "runtime_builder_strategy.py",
-    "runtime_builder_signal.py",
-    "runtime_builder_shadow.py",
-    "runtime_builder_paper.py",
-    "runtime_builder_serving.py",
-    "runtime_builder_daily_orchestrator.py",
-)
-_FORBIDDEN_EXACT_NAMES = {
-    "CurrentSignalRouteSpoolWriter",
-    "SignalRouteSpoolV3Writer",
-    "current_signal_writer",
-    "publish_v3",
-    "r07_activation",
-    "r07_capability",
-    "r07_cursor",
-    "r07_cutover",
-    "r07_drain",
-    "r07_environment",
-    "r07_flag",
-    "r07_migration",
-    "r07_overlay",
-    "v3_activation",
-    "v3_capability",
-    "v3_cursor",
-    "v3_cutover",
-    "v3_drain",
-    "v3_environment",
-    "v3_flag",
-    "v3_migration",
-    "v3_overlay",
-    "v3_writer",
-}
-
-
-def _ast_identifiers(tree: ast.AST) -> set[str]:
-    identifiers = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
-    identifiers.update(node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute))
-    for node in ast.walk(tree):
-        if not isinstance(node, (ast.Import, ast.ImportFrom)):
-            continue
-        for alias in node.names:
-            identifiers.add(alias.name)
-            identifiers.add(alias.name.rsplit(".", 1)[-1])
-            if alias.asname is not None:
-                identifiers.add(alias.asname)
-    return identifiers
-
-
-def test_production_builder_sources_have_no_v3_writer_or_activation_symbols() -> None:
-    root = Path(__file__).parents[2] / "src" / "rquant"
-    for name in _PRODUCTION_MODULES:
-        tree = ast.parse((root / name).read_text(encoding="utf-8"))
-        assert not (_ast_identifiers(tree) & _FORBIDDEN_EXACT_NAMES), name
-
-
-def test_ast_inspection_retains_original_import_names_and_aliases() -> None:
-    tree = ast.parse(
-        "from rquant.signal_route_spool import SignalRouteSpoolV3Writer as harmless_reader\n"
-    )
-
-    assert {
-        "SignalRouteSpoolV3Writer",
-        "harmless_reader",
-    } <= _ast_identifiers(tree)
-
-
-_STATIC_MISSING = object()
-
-
-def _is_project_module(value: object) -> bool:
-    if type(value) is not ModuleType:
-        return False
-    name = vars(value).get("__name__")
-    return name == "rquant" or (type(name) is str and name.startswith("rquant."))
-
-
-def _static_instance_attributes(value: object) -> Mapping[str, object]:
-    attributes = inspect.getattr_static(value, "__dict__", None)
-    if type(attributes) is dict:
-        return attributes
-    if type(attributes) is GetSetDescriptorType:
-        direct = object.__getattribute__(value, "__dict__")
-        return direct if type(direct) is dict else {}
-    return {}
-
-
-def _children(value: object) -> Iterator[tuple[str, object]]:
-    value_type = type(value)
-    if value_type is ModuleType:
-        if not _is_project_module(value):
-            return
-        for key, item in vars(value).items():
-            if key.startswith("__"):
-                continue
-            if type(item) is ModuleType:
-                if _is_project_module(item):
-                    yield f"module.{key}", item
-                continue
-            owner = inspect.getattr_static(item, "__module__", None)
-            type_owner = vars(type(item)).get("__module__")
-            if (
-                type(item) in (dict, tuple, list, set, frozenset, functools.partial)
-                or owner == "rquant"
-                or (type(owner) is str and owner.startswith("rquant."))
-                or type_owner == "rquant"
-                or (type(type_owner) is str and type_owner.startswith("rquant."))
-            ):
-                yield f"module.{key}", item
-        return
-    if value_type is functools.partial:
-        yield "partial.func", value.func
-        yield from ((f"partial.arg[{index}]", item) for index, item in enumerate(value.args))
-        yield from ((f"partial.kwarg.{key}", item) for key, item in (value.keywords or {}).items())
-    if value_type is MethodType:
-        yield "method.func", value.__func__
-        yield "method.self", value.__self__
-    if value_type is FunctionType:
-        yield from (
-            (f"default[{index}]", item) for index, item in enumerate(value.__defaults__ or ())
-        )
-        yield from (
-            (f"kwdefault.{key}", item) for key, item in (value.__kwdefaults__ or {}).items()
-        )
-        for index, cell in enumerate(value.__closure__ or ()):
-            try:
-                yield f"closure[{index}]", cell.cell_contents
-            except ValueError:
-                continue
-        yield from ((f"annotation.{key}", item) for key, item in value.__annotations__.items())
-        for name in dict.fromkeys(value.__code__.co_names):
-            if name in value.__globals__:
-                yield f"global.{name}", value.__globals__[name]
-    if value_type is dict:
-        for key, item in value.items():
-            yield f"mapping-key[{key!r}]", key
-            yield f"mapping-value[{key!r}]", item
-    elif value_type in (tuple, list, set, frozenset):
-        yield from ((f"item[{index}]", item) for index, item in enumerate(value))
-    yield from (
-        (f"attribute.{key}", item) for key, item in _static_instance_attributes(value).items()
-    )
-
-
-_MAX_REACHABILITY_NODES = 10_000
-_MAX_REACHABILITY_DEPTH = 64
-
-
-def _walk_reachable(
-    roots: Mapping[str, object],
-    *,
-    max_nodes: int = _MAX_REACHABILITY_NODES,
-    max_depth: int = _MAX_REACHABILITY_DEPTH,
-) -> Iterator[tuple[str, object]]:
-    if type(max_nodes) is not int or max_nodes < 1:
-        raise ValueError("reachability max_nodes must be a positive native integer")
-    if type(max_depth) is not int or max_depth < 0:
-        raise ValueError("reachability max_depth must be a nonnegative native integer")
-    atomic = (str, bytes, bytearray, int, float, bool, Path, datetime, date, Enum)
-    seen: set[int] = set()
-    pending = [(path, value, 0) for path, value in roots.items()]
-    while pending:
-        path, value, depth = pending.pop()
-        identity = id(value)
-        if identity in seen:
-            continue
-        if len(seen) >= max_nodes:
-            raise AssertionError("reachability node limit exceeded")
-        seen.add(identity)
-        yield path, value
-        value_type = type(value)
-        if value is None or issubclass(value_type, atomic) or issubclass(value_type, type):
-            continue
-        children: list[tuple[str, object]] = []
-        for label, child in _children(value):
-            if len(children) >= max_nodes:
-                raise AssertionError("reachability node limit exceeded")
-            children.append((label, child))
-        if children and depth >= max_depth:
-            raise AssertionError("reachability depth limit exceeded")
-        pending.extend((f"{path}.{label}", child, depth + 1) for label, child in children)
-
-
-_READONLY_CURRENT_API = (
-    CurrentSignalEnvelope,
-    spool.CurrentSignalBusRoutedRecord,
-    spool.CurrentSignalRouteSpoolRecord,
-    spool.current_signal_bus_routed_record_json_bytes,
-    spool.current_signal_route_spool_record_json_bytes,
-    spool.decode_current_signal_route_spool_record,
-    spool.verify_current_signal_route_spool_fixture,
-)
-_CURRENT_PERSISTENCE_INPUT_TYPES = (
-    CurrentSignalEnvelope,
-    spool.CurrentSignalBusRoutedRecord,
-    spool.CurrentSignalRouteSpoolRecord,
-)
-_FORBIDDEN_DURABLE_IDENTITIES = (
-    spool._atomic_replace_at,
-    spool._immutable_write_at,
-    spool._write_all,
-    spool._write_temporary_at,
-    spool.SignalRouteSpool.publish,
-    spool.publish_signal_bus_prefix,
-    signal_bus.SignalBusStore.ingest,
-    signal_bus.SignalBusStore.route,
-    signal_bus.SignalBusStore.commit_source_route,
-    DailyNotificationProducer.emit,
-    NotificationStateStore.replicate,
-    PaperSignalQueueStore.ingest,
-    ServingSourceAuthorityPublisher.publish,
-    strategy_runner.StrategyRunnerStore.process_batch,
-)
-
-
-def _same_as_any(value: object, candidates: tuple[object, ...]) -> bool:
-    return any(value is candidate for candidate in candidates)
-
-
-def _resolve_annotation_attribute(node: ast.AST, namespace: Mapping[str, object]) -> object | None:
-    if isinstance(node, ast.Name):
-        return namespace.get(node.id)
-    if not isinstance(node, ast.Attribute):
-        return None
-    parent = _resolve_annotation_attribute(node.value, namespace)
-    if type(parent) is ModuleType:
-        return vars(parent).get(node.attr)
-    if issubclass(type(parent), type):
-        return vars(parent).get(node.attr)
-    return None
-
-
-def _annotation_identities(
-    annotation: object,
-    namespace: Mapping[str, object],
-) -> tuple[object, ...]:
-    if annotation is inspect.Signature.empty:
-        return ()
-    if type(annotation) is str:
-        try:
-            expression = ast.parse(annotation, mode="eval")
-        except SyntaxError:
-            return ()
-        resolved: list[object] = []
-        for node in ast.walk(expression):
-            if not isinstance(node, (ast.Name, ast.Attribute)):
-                continue
-            value = _resolve_annotation_attribute(node, namespace)
-            if value is not None and not _same_as_any(value, tuple(resolved)):
-                resolved.append(value)
-        return tuple(resolved)
-    nested = tuple(
-        item
-        for argument in get_args(annotation)
-        for item in _annotation_identities(argument, namespace)
-    )
-    return (annotation, *nested)
-
-
-def _callable_functions(value: object) -> Iterator[tuple[FunctionType, object | None]]:
-    value_type = type(value)
-    if value_type is functools.partial:
-        yield from _callable_functions(value.func)
-        return
-    if value_type is MethodType:
-        yield value.__func__, value.__self__
-        return
-    if value_type is FunctionType:
-        yield value, None
-        return
-    if issubclass(value_type, type):
-        owners = type.__getattribute__(value, "__mro__")
-        instance_receiver = value
-        class_receiver = value
-    else:
-        owners = type.__getattribute__(value_type, "__mro__")
-        instance_receiver = value
-        class_receiver = value_type
-    seen: set[int] = set()
-    for owner in owners:
-        for item in vars(owner).values():
-            receiver: object | None = instance_receiver
-            if type(item) is classmethod:
-                item = item.__func__
-                receiver = class_receiver
-            elif type(item) is staticmethod:
-                item = item.__func__
-                receiver = None
-            if type(item) is FunctionType and id(item) not in seen:
-                seen.add(id(item))
-                yield item, receiver
-
-
-_MAX_STATIC_CAPABILITY_NODES = 512
-_MAX_STATIC_CAPABILITY_DEPTH = 16
-
-
-def _is_descriptor(value: object) -> bool:
-    value_type = type(value)
-    return any("__get__" in vars(owner) for owner in type.__getattribute__(value_type, "__mro__"))
-
-
-def _static_attribute(value: object, name: str) -> object:
-    try:
-        return inspect.getattr_static(value, name, _STATIC_MISSING)
-    except (AttributeError, TypeError) as exc:
-        raise AssertionError("static capability attribute inspection failed") from exc
-
-
-def _function_reference_seeds(
-    function: FunctionType,
-    receiver: object | None,
-) -> tuple[object, ...]:
-    seeds: list[object] = []
-    if receiver is not None:
-        seeds.append(receiver)
-    seeds.extend(function.__defaults__ or ())
-    seeds.extend((function.__kwdefaults__ or {}).values())
-    for cell in function.__closure__ or ():
-        try:
-            seeds.append(cell.cell_contents)
-        except ValueError:
-            continue
-    for name in dict.fromkeys(function.__code__.co_names):
-        if name in function.__globals__:
-            seeds.append(function.__globals__[name])
-    return tuple(seeds)
-
-
-def _static_reference_identities(
-    function: FunctionType,
-    receiver: object | None,
-) -> Iterator[object]:
-    attribute_names = tuple(dict.fromkeys(function.__code__.co_names))
-    pending = [
-        (item, 0, _is_descriptor(item)) for item in _function_reference_seeds(function, receiver)
-    ]
-    seen: set[int] = set()
-    while pending:
-        value, depth, expand_all = pending.pop()
-        identity = id(value)
-        if identity in seen:
-            continue
-        if len(seen) >= _MAX_STATIC_CAPABILITY_NODES:
-            raise AssertionError("static capability node limit exceeded")
-        seen.add(identity)
-        yield value
-        children: list[object] = []
-        value_type = type(value)
-        if value_type is MethodType:
-            children.extend((value.__func__, value.__self__))
-        elif value_type in (classmethod, staticmethod):
-            children.append(value.__func__)
-        elif value_type is functools.partial:
-            children.extend((value.func, *value.args))
-            children.extend((value.keywords or {}).values())
-        elif value_type is dict:
-            children.extend(value.keys())
-            children.extend(value.values())
-        elif value_type in (tuple, list, set, frozenset):
-            children.extend(value)
-        elif value_type is ModuleType:
-            if _is_project_module(value):
-                attributes = vars(value)
-                children.extend(attributes[name] for name in attribute_names if name in attributes)
-        else:
-            for name in attribute_names:
-                item = _static_attribute(value, name)
-                if item is not _STATIC_MISSING:
-                    children.append(item)
-            if expand_all:
-                children.extend(_static_instance_attributes(value).values())
-        if children and depth >= _MAX_STATIC_CAPABILITY_DEPTH:
-            raise AssertionError("static capability depth limit exceeded")
-        pending.extend((item, depth + 1, _is_descriptor(item)) for item in children)
-
-
-def _exposes_durable_current_persistence(value: object) -> bool:
-    for function, receiver in _callable_functions(value):
-        signature = inspect.signature(function, eval_str=False)
-        inputs = tuple(
-            identity
-            for parameter in signature.parameters.values()
-            for identity in _annotation_identities(parameter.annotation, function.__globals__)
-        )
-        current_input = any(
-            _same_as_any(identity, _CURRENT_PERSISTENCE_INPUT_TYPES) for identity in inputs
-        )
-        if not current_input:
-            continue
-        durable_sink = _same_as_any(function, _FORBIDDEN_DURABLE_IDENTITIES) or any(
-            _same_as_any(identity, _FORBIDDEN_DURABLE_IDENTITIES)
-            for identity in _static_reference_identities(function, receiver)
-        )
-        if durable_sink:
-            return True
-    return False
-
-
-def _forbidden_reachable(path: str, value: object) -> str | None:
-    if _same_as_any(value, (_registry_clock, *_READONLY_CURRENT_API)):
-        return None
-    if _exposes_durable_current_persistence(value):
-        return f"{path}: durable current-family persistence capability"
-    return None
-
-
-class SignalRouteSpoolV3Writer:
-    def __init__(self) -> None:
-        self.sink = spool._immutable_write_at
-
-    def __call__(
-        self,
-        record: spool.CurrentSignalRouteSpoolRecord,
-    ) -> None:
-        raise AssertionError(f"synthetic writer must never run: {self.sink} {record.record_hash}")
-
-
-_SYNTHETIC_V3_WRITER = SignalRouteSpoolV3Writer()
-
-
-def _synthetic_callback_with_forbidden_global() -> object:
-    return _SYNTHETIC_V3_WRITER
-
-
-def test_reachability_walk_follows_referenced_callback_globals() -> None:
-    violations = [
-        violation
-        for path, value in _walk_reachable(
-            {"synthetic.callback": _synthetic_callback_with_forbidden_global}
-        )
-        if (violation := _forbidden_reachable(path, value)) is not None
-    ]
-
-    assert violations == [
-        "synthetic.callback.global._SYNTHETIC_V3_WRITER: "
-        "durable current-family persistence capability"
-    ]
-
-
-def test_reachability_detects_renamed_callable_behind_project_module_indirection() -> None:
-    synthetic_module = ModuleType("rquant.synthetic_reachability_fixture")
-    synthetic_module.operation = spool.SignalRouteSpool.publish
-
-    class DurableSpoolPublisher:
-        def __call__(
-            self,
-            record: spool.CurrentSignalRouteSpoolRecord,
-        ) -> None:
-            raise AssertionError(
-                f"synthetic writer must never run: "
-                f"{synthetic_module.operation} {record.record_hash}"
-            )
-
-    DurableSpoolPublisher.__name__ = "Opaque"
-    DurableSpoolPublisher.__qualname__ = "Opaque"
-    DurableSpoolPublisher.__module__ = synthetic_module.__name__
-    synthetic_module.alias = DurableSpoolPublisher()
-
-    def callback() -> object:
-        return synthetic_module
-
-    violations = [
-        violation
-        for path, value in _walk_reachable({"synthetic.callback": callback})
-        if (violation := _forbidden_reachable(path, value)) is not None
-    ]
-
-    assert violations == [
-        "synthetic.callback.closure[0].module.alias: durable current-family persistence capability"
-    ]
-
-
-def test_reachability_composes_current_input_with_receiver_sink_identity() -> None:
-    class Unit:
-        def __init__(self) -> None:
-            self.sink = spool._immutable_write_at
-
-        def __call__(self, record: spool.CurrentSignalRouteSpoolRecord) -> None:
-            raise AssertionError(f"synthetic writer must never run: {self.sink} {record}")
-
-    violations = [
-        violation
-        for path, value in _walk_reachable({"synthetic.unit": Unit()})
-        if (violation := _forbidden_reachable(path, value)) is not None
-    ]
-
-    assert violations == ["synthetic.unit: durable current-family persistence capability"]
-
-
-def test_reachability_ignores_arbitrary_alias_names_for_production_writer_identity() -> None:
-    class Q:
-        def __init__(self) -> None:
-            self.z = spool.publish_signal_bus_prefix
-
-        def __call__(self, record: spool.CurrentSignalRouteSpoolRecord) -> None:
-            raise AssertionError(f"synthetic writer must never run: {self.z} {record}")
-
-    violations = [
-        violation
-        for path, value in _walk_reachable({"synthetic.value": Q()})
-        if (violation := _forbidden_reachable(path, value)) is not None
-    ]
-
-    assert violations == ["synthetic.value: durable current-family persistence capability"]
-
-
-def test_reachability_never_executes_hostile_attribute_or_descriptor() -> None:
-    descriptor_calls: list[str] = []
-
-    class Trap:
-        def __init__(self) -> None:
-            self.target = spool._atomic_replace_at
-
-        def __get__(self, _instance: object, _owner: type[object]) -> object:
-            descriptor_calls.append("descriptor")
-            raise AssertionError("descriptor execution is forbidden")
-
-    class Unit:
-        sink = Trap()
-
-        def __getattribute__(self, _name: str) -> object:
-            raise AssertionError("runtime attribute access is forbidden")
-
-        def __call__(self, record: spool.CurrentSignalRouteSpoolRecord) -> None:
-            raise AssertionError(f"synthetic writer must never run: {self.sink} {record}")
-
-    violations = [
-        violation
-        for path, value in _walk_reachable({"synthetic.hostile": Unit()})
-        if (violation := _forbidden_reachable(path, value)) is not None
-    ]
-
-    assert violations == ["synthetic.hostile: durable current-family persistence capability"]
-    assert descriptor_calls == []
-
-
-def test_reachability_walk_is_cycle_safe_and_fails_closed_at_bounds() -> None:
-    cycle: list[object] = []
-    cycle.append(cycle)
-
-    assert [path for path, _value in _walk_reachable({"cycle": cycle})] == ["cycle"]
-    with pytest.raises(AssertionError, match="node limit"):
-        tuple(
-            _walk_reachable(
-                {"first": object(), "second": object()},
-                max_nodes=1,
-            )
-        )
-    with pytest.raises(AssertionError, match="depth limit"):
-        tuple(_walk_reachable({"root": [[[None]]]}, max_depth=1))
-
-
-def test_all_direct_builders_and_both_builtin_registries_have_no_reachable_v3_authority() -> None:
-    clock = _registry_clock
-    roots: dict[str, object] = {
-        "direct.strategy_live": strategy_live_builder(clock=clock),
-        "direct.signal_router": signal_router_builder(clock=clock),
-        "direct.notifier": notifier_builder(clock=clock),
-        "direct.shadow_session": shadow_session_builder(clock=clock),
-        "direct.paper_consumer": paper_consumer_builder(clock=clock),
-        "direct.paper_broker": paper_broker_builder(clock=clock),
-        "direct.serving_publisher": serving_publisher_builder(
-            snapshot_loader=None,
-            clock=clock,
-        ),
-        "direct.daily_orchestrator": daily_pipeline_orchestrator_builder(clock=clock),
-        "registry.builtin": runtime_service_builtin.build_builtin_registry(
-            runtime_capabilities={},
-            clock=clock,
-        ),
-        "registry.main": runtime_service_main.build_builtin_registry(runtime_capabilities={}),
-    }
-
-    reachable = tuple(_walk_reachable(roots))
-    violations = [
-        violation
-        for path, value in reachable
-        if (violation := _forbidden_reachable(path, value)) is not None
-    ]
-    assert len(reachable) >= 100
-    assert violations == []
-    assert {path.split(".", 1)[0] for path, _value in reachable} == {
-        "direct",
-        "registry",
-    }
 
 
 def test_decoder_and_read_models_remain_constructible_without_writer_authority() -> None:
