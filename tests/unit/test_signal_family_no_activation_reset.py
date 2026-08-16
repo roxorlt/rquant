@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import base64
 import functools
+import gc
 import hashlib
 import inspect
 from collections.abc import Iterator, Mapping
@@ -117,6 +118,7 @@ def _tree_snapshot(root: Path) -> tuple[tuple[str, str, bytes], ...]:
 
 
 def _sqlite_snapshot(path: Path) -> tuple[object, ...]:
+    gc.collect()
     database_bytes = _database_bytes_snapshot(path)
     with TemporaryDirectory(prefix="rquant-r07-sqlite-snapshot-") as directory:
         snapshot_root = Path(directory)
@@ -316,6 +318,26 @@ def test_signal_bus_route_rejects_stored_current_before_outbox_mutation(tmp_path
             (DeliveryTarget(recipient_id="admin", channel=DeliveryChannel.PUSHDEER),),
             now=NOW,
         )
+
+    assert _sqlite_snapshot(path) == before
+
+
+def test_signal_bus_route_empty_targets_rejects_stored_current_before_database_mutation(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "route-empty.sqlite3"
+    store = _store(path)
+    current = _current_signal()
+    assert current.signal_id is not None
+    _insert_literal_signal_rows(
+        path,
+        (("current", CurrentSignalEnvelope, current.signal_id, CURRENT_LITERAL),),
+        routed=False,
+    )
+    before = _sqlite_snapshot(path)
+
+    with pytest.raises(LegacySignalWriteActivationError, match="legacy-only"):
+        store.route(current.signal_id, (), now=NOW)
 
     assert _sqlite_snapshot(path) == before
 
@@ -599,19 +621,36 @@ _FORBIDDEN_EXACT_NAMES = {
 }
 
 
+def _ast_identifiers(tree: ast.AST) -> set[str]:
+    identifiers = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+    identifiers.update(node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute))
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        for alias in node.names:
+            identifiers.add(alias.name)
+            identifiers.add(alias.name.rsplit(".", 1)[-1])
+            if alias.asname is not None:
+                identifiers.add(alias.asname)
+    return identifiers
+
+
 def test_production_builder_sources_have_no_v3_writer_or_activation_symbols() -> None:
     root = Path(__file__).parents[2] / "src" / "rquant"
     for name in _PRODUCTION_MODULES:
         tree = ast.parse((root / name).read_text(encoding="utf-8"))
-        identifiers = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
-        identifiers.update(node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute))
-        identifiers.update(
-            alias.asname or alias.name.rsplit(".", 1)[-1]
-            for node in ast.walk(tree)
-            if isinstance(node, (ast.Import, ast.ImportFrom))
-            for alias in node.names
-        )
-        assert not (identifiers & _FORBIDDEN_EXACT_NAMES), name
+        assert not (_ast_identifiers(tree) & _FORBIDDEN_EXACT_NAMES), name
+
+
+def test_ast_inspection_retains_original_import_names_and_aliases() -> None:
+    tree = ast.parse(
+        "from rquant.signal_route_spool import SignalRouteSpoolV3Writer as harmless_reader\n"
+    )
+
+    assert {
+        "SignalRouteSpoolV3Writer",
+        "harmless_reader",
+    } <= _ast_identifiers(tree)
 
 
 def _children(value: object) -> Iterator[tuple[str, object]]:
@@ -635,6 +674,9 @@ def _children(value: object) -> Iterator[tuple[str, object]]:
             except ValueError:
                 continue
         yield from ((f"annotation.{key}", item) for key, item in value.__annotations__.items())
+        for name in dict.fromkeys(value.__code__.co_names):
+            if name in value.__globals__:
+                yield f"global.{name}", value.__globals__[name]
     if isinstance(value, Mapping):
         for key, item in value.items():
             yield f"mapping-key[{key!r}]", key
@@ -649,20 +691,42 @@ def _children(value: object) -> Iterator[tuple[str, object]]:
             yield f"slot.{slot}", getattr(value, slot)
 
 
-def _walk_reachable(roots: Mapping[str, object]) -> Iterator[tuple[str, object]]:
+_MAX_REACHABILITY_NODES = 10_000
+_MAX_REACHABILITY_DEPTH = 64
+
+
+def _walk_reachable(
+    roots: Mapping[str, object],
+    *,
+    max_nodes: int = _MAX_REACHABILITY_NODES,
+    max_depth: int = _MAX_REACHABILITY_DEPTH,
+) -> Iterator[tuple[str, object]]:
+    if type(max_nodes) is not int or max_nodes < 1:
+        raise ValueError("reachability max_nodes must be a positive native integer")
+    if type(max_depth) is not int or max_depth < 0:
+        raise ValueError("reachability max_depth must be a nonnegative native integer")
     atomic = (str, bytes, bytearray, int, float, bool, Path, datetime, date, Enum)
     seen: set[int] = set()
-    pending = list(roots.items())
+    pending = [(path, value, 0) for path, value in roots.items()]
     while pending:
-        path, value = pending.pop()
+        path, value, depth = pending.pop()
         identity = id(value)
         if identity in seen:
             continue
+        if len(seen) >= max_nodes:
+            raise AssertionError("reachability node limit exceeded")
         seen.add(identity)
         yield path, value
         if value is None or isinstance(value, atomic + (ModuleType, type)):
             continue
-        pending.extend((f"{path}.{label}", child) for label, child in _children(value))
+        children: list[tuple[str, object]] = []
+        for label, child in _children(value):
+            if len(children) >= max_nodes:
+                raise AssertionError("reachability node limit exceeded")
+            children.append((label, child))
+        if children and depth >= max_depth:
+            raise AssertionError("reachability depth limit exceeded")
+        pending.extend((f"{path}.{label}", child, depth + 1) for label, child in children)
 
 
 def _forbidden_reachable(path: str, value: object) -> str | None:
@@ -692,6 +756,49 @@ def _forbidden_reachable(path: str, value: object) -> str | None:
     if attribute in _FORBIDDEN_EXACT_NAMES:
         return f"{path}: forbidden attribute"
     return None
+
+
+class SignalRouteSpoolV3Writer:
+    pass
+
+
+_SYNTHETIC_V3_WRITER = SignalRouteSpoolV3Writer()
+
+
+def _synthetic_callback_with_forbidden_global() -> object:
+    return _SYNTHETIC_V3_WRITER
+
+
+def test_reachability_walk_follows_referenced_callback_globals() -> None:
+    violations = [
+        violation
+        for path, value in _walk_reachable(
+            {"synthetic.callback": _synthetic_callback_with_forbidden_global}
+        )
+        if (violation := _forbidden_reachable(path, value)) is not None
+    ]
+
+    assert violations == [
+        "synthetic.callback.global._SYNTHETIC_V3_WRITER: "
+        "unapproved current-family object "
+        "tests.unit.test_signal_family_no_activation_reset.SignalRouteSpoolV3Writer"
+    ]
+
+
+def test_reachability_walk_is_cycle_safe_and_fails_closed_at_bounds() -> None:
+    cycle: list[object] = []
+    cycle.append(cycle)
+
+    assert [path for path, _value in _walk_reachable({"cycle": cycle})] == ["cycle"]
+    with pytest.raises(AssertionError, match="node limit"):
+        tuple(
+            _walk_reachable(
+                {"first": object(), "second": object()},
+                max_nodes=1,
+            )
+        )
+    with pytest.raises(AssertionError, match="depth limit"):
+        tuple(_walk_reachable({"root": [[[None]]]}, max_depth=1))
 
 
 def test_all_direct_builders_and_both_builtin_registries_have_no_reachable_v3_authority() -> None:

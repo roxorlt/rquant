@@ -16,7 +16,7 @@ import rquant.signal_route_spool as spool
 _MANIFEST_PATH = (
     Path(__file__).parents[1] / "fixtures" / "signal_route_spool_v2_differential" / "manifest.json"
 )
-_MANIFEST_SHA256 = "8ee95b73f7d7b82d5ed94cec821f898179fa15acccc240099b23b6477a6ea626"
+_MANIFEST_SHA256 = "f23036927524fe0903b9de4d5fa741666d7ab95dfab7b25016a44fccd1d2fa92"
 
 
 def _manifest() -> dict[str, Any]:

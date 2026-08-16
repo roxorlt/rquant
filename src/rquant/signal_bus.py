@@ -996,12 +996,12 @@ class SignalBusStore:
     ) -> tuple[OutboxRecord, ...]:
         routed_at = _normalize_time(now)
         unique_targets = canonical_delivery_targets(targets)
-        if not unique_targets:
-            return ()
         self._preflight_stored_legacy_signal(
             signal_id,
             operation="SignalBusStore.route",
         )
+        if not unique_targets:
+            return ()
 
         with self._write_transaction() as connection:
             frozen = connection.execute(

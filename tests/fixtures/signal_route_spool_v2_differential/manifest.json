@@ -495,4 +495,3 @@
   "format": "rquant-signal-route-spool-v2-differential/v1",
   "parser": "rquant.signal_route_spool._parse_record"
 }
-

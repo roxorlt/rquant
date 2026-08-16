@@ -94,6 +94,15 @@ def test_ingest_allocates_one_monotonic_sequence_and_exact_retry_is_duplicate(
     assert next_receipt.global_sequence == 2
 
 
+def test_legacy_route_with_empty_targets_remains_a_noop(tmp_path: Path) -> None:
+    store = _store(tmp_path / "signal-bus.sqlite3")
+    signal = _signal()
+    store.ingest(signal, received_at=NOW)
+
+    assert store.route(signal.signal_id, (), now=NOW) == ()
+    assert store.outbox_records(signal_id=signal.signal_id) == ()
+
+
 def test_tampered_model_copy_is_rejected_without_replacing_original(
     tmp_path: Path,
 ) -> None:
