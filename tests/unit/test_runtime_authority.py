@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.machinery
 import inspect
 import multiprocessing
 import os
@@ -261,6 +262,7 @@ def _materialize_generation_slot(
     manifest_profile_id: str | None = None,
     manifest_module: str | None = None,
     extra_files: dict[str, bytes] | None = None,
+    extra_directories: tuple[str, ...] = (),
     omitted_files: tuple[str, ...] = (),
     pyvenv_payload: bytes = b"include-system-site-packages = false\n",
 ) -> RuntimeGenerationSlot:
@@ -293,7 +295,12 @@ def _materialize_generation_slot(
     files.update(extra_files or {})
     for omitted in omitted_files:
         files.pop(omitted, None)
-    directory_paths = set(base_directory_paths)
+    directory_paths = {*base_directory_paths, *extra_directories}
+    for relative in extra_directories:
+        parent = Path(relative).parent
+        while parent != Path("."):
+            directory_paths.add(parent.as_posix())
+            parent = parent.parent
     for relative in files:
         parent = Path(relative).parent
         while parent != Path("."):
@@ -308,6 +315,7 @@ def _materialize_generation_slot(
                 marker,
                 manifest_profile_id,
                 manifest_module,
+                sorted(extra_directories),
                 sorted(files.items()),
             )
         ).encode()
@@ -398,6 +406,43 @@ def _record_for_slot(slot: RuntimeGenerationSlot) -> RuntimeAuthorityRecord:
         current=slot,
         prior=None,
     )
+
+
+def _compatibility_spelling(value: str) -> str:
+    return "".join(
+        chr(ord(character) + 0xFEE0) if "!" <= character <= "~" else character
+        for character in value
+    )
+
+
+def _extension_suffix(fragment: str) -> str:
+    return next(
+        suffix for suffix in importlib.machinery.EXTENSION_SUFFIXES if fragment in suffix.casefold()
+    )
+
+
+def _import_hook_shape(
+    shape: str,
+    import_root: str,
+    module: str,
+) -> tuple[dict[str, bytes], tuple[str, ...]]:
+    if shape == "package":
+        return {f"{import_root}/{module}/__init__.py": b""}, ()
+    if shape == "namespace":
+        return {}, (f"{import_root}/{module}",)
+    if shape == "top-level-pyc":
+        return {f"{import_root}/{module}.pyc": b"bytecode"}, ()
+    if shape == "cache-tag-pyc":
+        return {f"{import_root}/__pycache__/{module}.cpython-311.pyc": b"bytecode"}, ()
+    if shape == "abi3-extension":
+        return {f"{import_root}/{module}{_extension_suffix('abi3')}": b"extension"}, ()
+    if shape == "cpython-extension":
+        return {f"{import_root}/{module}{_extension_suffix('cpython')}": b"extension"}, ()
+    if shape == "casefold-package":
+        return {f"{import_root}/{module.upper()}/__init__.py": b""}, ()
+    if shape == "compatibility-namespace":
+        return {}, (f"{import_root}/{_compatibility_spelling(module)}",)
+    raise AssertionError(f"unknown import-hook fixture shape: {shape}")
 
 
 def _install_profile_fixture(
@@ -1481,30 +1526,138 @@ def test_rta_01_generation_requires_strict_isolated_pyvenv_config(
 
 
 @pytest.mark.parametrize(
-    "hook_path",
+    ("path", "entry_type", "expected"),
+    [
+        ("release/src/sitecustomize", "directory", "sitecustomize"),
+        ("release/src/nested/usercustomize", "directory", "usercustomize"),
+        ("release/src/sitecustomize/__init__.py", "file", "sitecustomize"),
+        ("release/src/sitecustomize.py", "file", "sitecustomize"),
+        ("release/src/usercustomize.pyc", "file", "usercustomize"),
+        (
+            "release/src/__pycache__/sitecustomize.cpython-311.pyc",
+            "file",
+            "sitecustomize",
+        ),
+        ("release/blocked.PTH", "file", ".pth"),
+        ("release/src/sitecustomizer.py", "file", None),
+        ("release/src/usercustomize_backup.pyc", "file", None),
+        ("release/src/sitecustomize.cpython-311.pyc", "file", None),
+        (
+            "release/src/__pycache__/sitecustomized.cpython-311.pyc",
+            "file",
+            None,
+        ),
+        ("release/src/__pycache__/sitecustomize.pyc", "file", None),
+        ("release/src/__pycache__/usercustomize.py", "file", None),
+        ("release/src/sitecustomized/__init__.py", "file", None),
+        ("release/src/safe.pthx", "file", None),
+        ("release/sitecustomize.py", "file", None),
+    ],
+)
+def test_rta_01_import_hook_classifier_models_resolution_without_false_positives(
+    path: str,
+    entry_type: str,
+    expected: str | None,
+) -> None:
+    assert (
+        authority_module._classify_forbidden_import_path(
+            path,
+            entry_type=entry_type,
+            import_roots=(
+                "release/src",
+                "venv/lib/python3.11/site-packages",
+            ),
+            extension_suffixes=tuple(importlib.machinery.EXTENSION_SUFFIXES),
+        )
+        == expected
+    )
+
+
+def test_rta_01_import_hook_classifier_uses_every_runtime_extension_suffix() -> None:
+    for module in ("sitecustomize", "usercustomize"):
+        for suffix in importlib.machinery.EXTENSION_SUFFIXES:
+            assert (
+                authority_module._classify_forbidden_import_path(
+                    f"release/src/{module}{suffix}",
+                    entry_type="file",
+                    import_roots=("release/src",),
+                    extension_suffixes=tuple(importlib.machinery.EXTENSION_SUFFIXES),
+                )
+                == module
+            )
+
+
+@pytest.mark.parametrize("module", ("sitecustomize", "usercustomize"))
+@pytest.mark.parametrize(
+    "import_root",
+    ("release/src", "venv/lib/python3.11/site-packages"),
+)
+@pytest.mark.parametrize(
+    "shape",
     (
-        "venv/lib/python3.11/site-packages/escape.PTH",
-        "release/src/rquant/SiteCustomize.PY",
-        "release/src/rquant/ＳＩＴＥＣＵＳＴＯＭＩＺＥ．ＰＹ",
-        "release/src/rquant/usercustomize.py",
+        "package",
+        "namespace",
+        "top-level-pyc",
+        "cache-tag-pyc",
+        "abi3-extension",
+        "cpython-extension",
+        "casefold-package",
+        "compatibility-namespace",
     ),
 )
-def test_rta_01_generation_rejects_normalized_python_import_hooks(
+def test_rta_01_publication_rejects_every_resolvable_import_hook_shape(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    hook_path: str,
+    module: str,
+    import_root: str,
+    shape: str,
 ) -> None:
     path, generation_root = _install_authority_fixture(tmp_path, monkeypatch)
+    extra_files, extra_directories = _import_hook_shape(shape, import_root, module)
     slot = _materialize_generation_slot(
         generation_root,
-        "hook",
+        f"hook-{module}-{shape}",
         authority_module.RuntimeGenerationLifecycle.ACTIVE,
-        extra_files={hook_path: b"raise SystemExit\n"},
+        extra_files=extra_files,
+        extra_directories=extra_directories,
     )
 
     with pytest.raises(RuntimeAuthorityPublishError, match="import hook"):
         publish_runtime_authority(_record_for_slot(slot))
     assert not path.exists()
+
+
+def test_rta_01_publication_rejects_pth_anywhere_but_allows_similar_names(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path, generation_root = _install_authority_fixture(tmp_path, monkeypatch)
+    blocked = _materialize_generation_slot(
+        generation_root,
+        "blocked-pth",
+        authority_module.RuntimeGenerationLifecycle.ACTIVE,
+        extra_files={"release/blocked.PTH": b"/outside\n"},
+    )
+    with pytest.raises(RuntimeAuthorityPublishError, match="import hook"):
+        publish_runtime_authority(_record_for_slot(blocked))
+    assert not path.exists()
+
+    allowed = _materialize_generation_slot(
+        generation_root,
+        "similar-names",
+        authority_module.RuntimeGenerationLifecycle.ACTIVE,
+        extra_files={
+            "release/sitecustomize.py": b"outside import root\n",
+            "release/src/sitecustomizer.py": b"similar\n",
+            "release/src/usercustomize_backup.pyc": b"similar\n",
+            "release/src/sitecustomize.cpython-311.pyc": b"not top-level sourceless\n",
+            "release/src/__pycache__/sitecustomized.cpython-311.pyc": b"similar\n",
+            "release/src/__pycache__/usercustomize.pyc": b"not cache-tagged\n",
+            "venv/lib/python3.11/site-packages/safe.pthx": b"similar\n",
+        },
+        extra_directories=("release/src/sitecustomized",),
+    )
+    assert publish_runtime_authority(_record_for_slot(allowed)).value == "committed"
 
 
 @pytest.mark.parametrize(

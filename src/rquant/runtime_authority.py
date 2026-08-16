@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import importlib.machinery
 import os
 import re
 import stat
@@ -2000,8 +2001,6 @@ def _validate_generation_manifest_entry(
         raise RuntimeAuthorityPublishError("generation manifest entry path is invalid")
     if entry_type not in profile.manifest_schema.entry_types:
         raise RuntimeAuthorityPublishError("generation manifest entry type is invalid")
-    if entry_type == "file" and _is_forbidden_import_hook(path):
-        raise RuntimeAuthorityPublishError("generation tree contains a forbidden import hook")
     if type(entry["owner_uid"]) is not int or entry["owner_uid"] != RUNTIME_AUTHORITY_OWNER_UID:
         raise RuntimeAuthorityPublishError("generation manifest entry owner is invalid")
     mode = entry["mode"]
@@ -2042,12 +2041,62 @@ def _validate_generation_manifest_entry(
     )
 
 
-def _is_forbidden_import_hook(path: str) -> bool:
-    basename = unicodedata.normalize("NFKC", path.rsplit("/", 1)[-1]).casefold()
-    return basename.endswith(".pth") or basename in {
-        "sitecustomize.py",
-        "usercustomize.py",
-    }
+def _classify_forbidden_import_path(
+    path: str,
+    *,
+    entry_type: str,
+    import_roots: tuple[str, ...],
+    extension_suffixes: tuple[str, ...],
+) -> str | None:
+    parts = tuple(path.split("/"))
+    normalized_parts = tuple(
+        unicodedata.normalize("NFKC", component).casefold() for component in parts
+    )
+    if entry_type == "file" and normalized_parts[-1].endswith(".pth"):
+        return ".pth"
+
+    normalized_suffixes = tuple(
+        unicodedata.normalize("NFKC", suffix).casefold() for suffix in extension_suffixes
+    )
+    for import_root in import_roots:
+        root_parts = tuple(import_root.split("/"))
+        if len(parts) <= len(root_parts) or parts[: len(root_parts)] != root_parts:
+            continue
+        relative_parts = normalized_parts[len(root_parts) :]
+        directory_parts = relative_parts if entry_type == "directory" else relative_parts[:-1]
+        for module in ("sitecustomize", "usercustomize"):
+            if module in directory_parts:
+                return module
+            if entry_type != "file":
+                continue
+            location = _import_candidate_location(relative_parts)
+            if location is None:
+                continue
+            filename = relative_parts[-1]
+            if location == "cache":
+                if _is_cache_tag_bytecode(filename, module):
+                    return module
+                continue
+            if filename in {f"{module}.py", f"{module}.pyc"}:
+                return module
+            if any(filename == f"{module}{suffix}" for suffix in normalized_suffixes):
+                return module
+    return None
+
+
+def _import_candidate_location(relative_parts: tuple[str, ...]) -> str | None:
+    if len(relative_parts) == 1:
+        return "top"
+    if len(relative_parts) == 2 and relative_parts[0] == "__pycache__":
+        return "cache"
+    return None
+
+
+def _is_cache_tag_bytecode(filename: str, module: str) -> bool:
+    if not filename.startswith(f"{module}.") or not filename.endswith(".pyc"):
+        return False
+    tag = filename[len(module) + 1 : -4]
+    return re.fullmatch(r"[a-z0-9_]+(?:-[a-z0-9_]+)+(?:\.opt-[0-9]+)?", tag) is not None
 
 
 def _validate_generation_semantics(
@@ -2056,6 +2105,31 @@ def _validate_generation_semantics(
     slot: RuntimeGenerationSlot,
 ) -> None:
     by_path = {entry.path: entry for entry in entries}
+    role_payloads = tuple(
+        (role, _manifest_role_payload(role, slot.generation_path)) for role in slot.roles.values()
+    )
+    import_roots = tuple(
+        sorted(
+            {
+                path
+                for _role, payload in role_payloads
+                for path in (payload["app_source"], *payload["site_packages"])
+                if type(path) is str
+            }
+        )
+    )
+    for entry in entries:
+        classification = _classify_forbidden_import_path(
+            entry.path,
+            entry_type=entry.entry_type,
+            import_roots=import_roots,
+            extension_suffixes=tuple(importlib.machinery.EXTENSION_SUFFIXES),
+        )
+        if classification is not None:
+            raise RuntimeAuthorityPublishError(
+                f"generation tree contains a forbidden import hook: {classification}"
+            )
+
     pyvenv_entry = by_path.get("pyvenv.cfg")
     if pyvenv_entry is None or pyvenv_entry.entry_type != "file":
         raise RuntimeAuthorityPublishError("generation pyvenv.cfg is missing")
@@ -2072,8 +2146,7 @@ def _validate_generation_semantics(
         raise RuntimeAuthorityPublishError("generation pyvenv.cfg is missing")
     _validate_pyvenv_config(pyvenv_payload)
 
-    for role in slot.roles.values():
-        role_payload = _manifest_role_payload(role, slot.generation_path)
+    for role, role_payload in role_payloads:
         app_source = role_payload["app_source"]
         if type(app_source) is not str:
             raise RuntimeAuthorityPublishError("generation app source is invalid")
