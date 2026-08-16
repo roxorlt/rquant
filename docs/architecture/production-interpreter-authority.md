@@ -756,8 +756,9 @@ with different bytes appends conflict audit evidence and rejects.
 ### Phase C: Root-Derived Verification And Readiness
 
 Phase C is blocked until the successor base channels and staged overlay exist and until an immutable
-in-generation verification manifest, exact service-to-runtime-role bindings, separate root-owned
-verifier process/fixed harness, and root-owned append-only verification store are implemented.
+in-generation verification manifest, exact service-to-runtime-role bindings, externally installed
+fixed root-owned release policy, separate root-owned verifier process/fixed harness, and root-owned
+append-only verification store are implemented.
 
 #### Exact Pair And Callable-Object Allowlist
 
@@ -809,7 +810,7 @@ cannot substitute for that path.
 
 #### Exact Verification Service Bindings
 
-`RESET-REG-P1-02` freezes `VerificationServiceBindingV1` in the immutable, root-approved,
+`RESET-REG-P1-02` freezes `VerificationServiceBindingV1` in the immutable, root-policy-approved,
 in-generation verification manifest. It has exactly:
 
 ```text
@@ -845,9 +846,9 @@ service still requires its own fingerprinted binding.
 Both the tuple and `service_bindings_hash` are fields of the immutable test manifest, and both are
 included in the execution-evidence hash preimage.
 
-These values are declared by the root-approved verification manifest; they are not derived from
-nonexistent executable module/path fields on `RuntimeServiceManifest`. Before child execution, the
-root verifier independently requires each `service_id`, `runtime_service_kind`, and
+These values are declared by the root-policy-approved verification manifest; they are not derived
+from nonexistent executable module/path fields on `RuntimeServiceManifest`. Before child execution,
+the root verifier independently requires each `service_id`, `runtime_service_kind`, and
 `service_manifest_fingerprint` to equal the exact manifest in the validated production profile;
 requires `role_name` to exist and `executable_module` to equal
 `RuntimeGenerationSlot.roles[role_name].module`; resolves the executable source path beneath the
@@ -855,6 +856,125 @@ selected generation without traversal or symlink escape; matches its relative pa
 the full generation manifest; and resolves every `surface_id` to the exact callable-object allowlist
 entry. Missing, duplicate, cross-role, wrong-kind, wrong-module, wrong-path, wrong-source-hash,
 unmanifested, omitted-surface, or extra-surface bindings reject before any child starts.
+
+#### Fixed Root-Owned Release Verification Policy
+
+`RESET-REG-P0-01` is anchored by the separate fixed policy file
+`/etc/rquant/signal-family-verifier-policy-v1.json`. It is outside every generation, quarantine,
+application data root, and `lighthouse` write authority. It is a regular file owned `root:root`,
+has exact mode `0444` and `nlink == 1`, and is reached only by an anchored no-follow open from a
+trusted root directory FD with `O_NOFOLLOW | O_CLOEXEC`. `/`, `/etc`, and `/etc/rquant` must be
+canonical root-owned directories, never symlinks, and not group/world writable; every component's
+device/inode/type/owner/mode is rechecked after open. The file's strict canonical bytes and SHA-256
+are verified before any generation file is opened.
+
+This policy is independent of `production-runtime-profile-v1`; that existing schema and its bytes,
+hashes, parser, and authority remain unchanged. Neither code release, quarantine publication,
+generation selection, nor a `lighthouse` process can create, replace, or amend this policy.
+
+The future `ReleaseVerificationEntryV1` schema has exactly:
+
+```text
+successor_bundle_content_hash
+overlay_content_hash
+verification_manifest_sha256
+vector_set_hash
+expected_result_set_hash
+five_pair_service_binding_set_hash
+verifier_policy_max_age_seconds: null or strict native int >= 1
+entry_hash
+```
+
+All hash fields are strict lowercase SHA-256. The exact entry hash is:
+
+```text
+entry_hash = canonical_sha256(
+  entry.model_dump(mode="json", exclude={"entry_hash"})
+)
+```
+
+The future `SignalFamilyVerifierPolicyV1` schema has exactly:
+
+```text
+schema_version: strict native int == 1
+verifier_policy_id: literal "signal-family-verifier-policy-v1"
+harness_identity: literal "/usr/local/libexec/rquant-signal-family-verifier-harness-v1.pyz"
+harness_sha256: lowercase SHA-256
+release_entries: exact tuple[ReleaseVerificationEntryV1, ...]
+content_hash: lowercase SHA-256
+```
+
+`release_entries` is nonempty, sorted by
+`(successor_bundle_content_hash, overlay_content_hash)`, and has no duplicate release key,
+`entry_hash`, or conflicting entry for the same release key. The exact policy hash is:
+
+```text
+content_hash = canonical_sha256(
+  policy.model_dump(mode="json", exclude={"content_hash"})
+)
+```
+
+The raw policy-file bytes MUST equal
+`rquant.strict_json.canonical_json_bytes(policy.model_dump(mode="json"))` byte-for-byte, with no
+newline. The duplicate-free strict decoder rejects extra or duplicate keys, coerced scalars,
+booleans as integers, mappings/subclasses replacing exact nested models, unsorted/reordered entries,
+unknown versions/IDs/identities, and any entry/hash/content mismatch. The fixed harness is opened
+independently with the same anchored no-follow identity checks, must be `root:root`, mode `0555`,
+`nlink == 1`, and must exactly match both `harness_identity` and `harness_sha256` before launch.
+
+For the immutable in-generation verification/test manifest, the root independently recomputes these
+exact policy-bound preimages. Each vector declaration contains only frozen vector identity and input
+bytes; expected result bytes/hashes are forbidden in the vector tuple and exist only in the separate
+expected-result tuple:
+
+```text
+vector_set_hash = canonical_sha256({
+  "vectors": [
+    vector.model_dump(mode="json")
+    for vector in vectors_sorted_by_vector_id
+  ]
+})
+
+expected_result_set_hash = canonical_sha256({
+  "expected_results": [
+    {
+      "vector_id": result.vector_id,
+      "canonical_result_sha256": result.canonical_result_sha256
+    }
+    for result in expected_results_sorted_by_vector_id
+  ]
+})
+
+five_pair_service_binding_set_hash = canonical_sha256({
+  "pairs": [
+    {
+      "pair_id": pair.pair_id,
+      "producer_service_ids": list(pair.producer_service_ids),
+      "consumer_service_ids": list(pair.consumer_service_ids)
+    }
+    for pair in exact_five_pairs_sorted_by_pair_id
+  ],
+  "service_bindings": [
+    binding.model_dump(mode="json")
+    for binding in service_bindings_sorted_by_service_id
+  ]
+})
+```
+
+The generation verification manifest's raw SHA-256 and its independently recomputed
+`vector_set_hash`, `expected_result_set_hash`, and `five_pair_service_binding_set_hash` MUST equal
+one and only one policy entry selected by the exact successor-bundle and overlay content hashes.
+The entry's optional `verifier_policy_max_age_seconds` is the only policy age cap used by readiness.
+Missing, stale/noncurrent, zero-match, multiple-match, duplicate, or conflicting policy entries fail
+closed before child execution and produce no receipt or readiness record.
+
+A generation may retain its immutable verification/test manifest, vectors, service bindings, and
+expected results for reproducibility, but those bytes grant no authority by location, generation
+membership, self-consistency, or full-manifest inclusion. They become eligible only through the
+single exact external root-policy match above. Policy installation or update is a separate
+root-owned, explicitly user-authorized infrastructure transaction with its own anchored write,
+fsync, atomic replacement, directory-fsync, ownership/mode revalidation, and audit evidence; normal
+code release and quarantine flows cannot perform it.
 
 #### Dedicated signal_family_verification Authority
 
@@ -868,35 +988,53 @@ generation child has exited.
 
 The root verifier performs this sequence:
 
-1. Acquire `rquant.runtime_authority.RuntimeDeploymentLock`, reopen the current runtime authority
-   and validated `RuntimeGenerationSlot`, load the immutable root-approved verification manifest
-   and its immutable test manifest from that generation, validate every
-   `VerificationServiceBindingV1`, and derive the authority operation/sequence,
-   generation/full-manifest/profile, exact service manifests, frozen vectors, policy, and expected
-   canonical results.
-2. Launch the generation-local interpreter as a separate unprivileged `lighthouse` child using a
-   fixed root-owned harness. The child receives a sanitized fixed environment, fixed argv and cwd,
-   no supplementary privilege or escalation path, and closed inherited file descriptors except the
-   canonical request/result IPC pipes. It receives no store descriptor, store path, store
-   capability, verifier-module import path, root module object, or caller-supplied Python path.
-3. The fixed harness imports generation code only in the child and executes every declared
-   family/surface vector through the actual production builders. It emits exactly one bounded
+1. Acquire `rquant.runtime_authority.RuntimeDeploymentLock`, then anchored-open and fully validate
+   `/etc/rquant/signal-family-verifier-policy-v1.json` and its fixed harness. This finishes before
+   opening any generation manifest, test manifest, generation source, or child process.
+2. Reopen the current runtime authority and validated `RuntimeGenerationSlot`, derive the exact
+   successor-bundle and overlay content hashes, and select exactly one matching
+   `ReleaseVerificationEntryV1`. A missing, stale, duplicate, multiple, or conflicting match stops
+   here.
+3. Load the immutable in-generation verification manifest and its immutable test manifest. Require
+   the verification-manifest raw SHA-256 and independently recomputed vector-set,
+   expected-result-set, and five-pair/service-binding-set hashes to equal the selected policy entry;
+   then validate every `VerificationServiceBindingV1` and derive the authority operation/sequence,
+   generation/full-manifest/profile, exact service manifests, policy-bound vectors, and policy age
+   cap.
+4. Build the child request only from the exact vector input bytes whose sorted set produced the
+   policy-authorized `vector_set_hash`. Do not send expected result bytes or expected result hashes
+   to the child. Launch the generation-local interpreter as a separate unprivileged `lighthouse`
+   child using the policy-identified fixed root-owned harness. The child receives a sanitized fixed
+   environment, fixed argv and cwd, no supplementary privilege or escalation path, and closed
+   inherited file descriptors except the canonical request/result IPC pipes. It receives no store
+   descriptor, store path, store capability, verifier-module import path, root module object, or
+   caller-supplied Python path.
+5. The fixed harness imports generation code only in the child and executes every policy-bound
+   family/surface vector through the actual production builders. It cannot add, omit, reorder, or
+   alter vector inputs and cannot supply or change expected results. It emits exactly one bounded
    canonical IPC result and exits; extra output, timeout, signal death, nonzero status, open pipe,
    or inherited-descriptor mismatch rejects.
-4. After child exit, the root process strictly decodes the IPC result and independently validates
-   the expected run/vector identities, exact family/surface set, canonical result bytes and hashes,
-   immutable test-manifest and service-binding tuple/hash, source paths/hashes, full-manifest source
-   closure, service manifests, and verifier policy. Child claims cannot replace root-derived values.
-5. Still under `RuntimeDeploymentLock`, reopen authority and the validated generation slot after
-   all child validation. Any operation, sequence, slot, generation, full-manifest, profile, role, or
-   source change between the initial snapshot, child completion, and append rejects.
-6. Only then may the root process open the protected append store and write the five receipts and
-   readiness transaction itself. The child, caller, and services never append evidence or receipts.
+6. After child exit, the root process strictly decodes the IPC result, validates the exact
+   run/vector/family/surface identities and canonical result bytes/hashes, recomputes the actual
+   result-set hash using the policy's expected-result-set preimage shape, and requires equality with
+   the selected entry's `expected_result_set_hash`. It also independently revalidates the immutable
+   test-manifest and service-binding tuple/hash, source paths/hashes, full-manifest source closure,
+   service manifests, policy content/entry/harness hashes, and policy age cap. Child claims cannot
+   replace root-derived or root-policy-authorized values.
+7. Still under `RuntimeDeploymentLock`, anchored-reopen the external policy and fixed harness and
+   reopen authority and the validated generation slot after all child validation. Any policy
+   content, selected entry, harness, operation, sequence, slot, generation, full-manifest, profile,
+   role, source, successor bundle, or overlay change between the initial snapshot, child
+   completion, and append rejects.
+8. Only then may the root process open the protected append store and write the five receipts and
+   readiness transaction itself. The child, caller, generation, and services never append evidence
+   or receipts.
 
 The child's future `SignalFamilyVectorResultV1` schema is exactly `vector_id`, `pair_id`,
 `family_id`, `surface_id`, `canonical_result_json`, and `canonical_result_sha256`.
 `canonical_result_json` is strict nonempty UTF-8 JSON bounded to 65,536 bytes and its bytes/hash must
-equal the expected test-manifest result. The future `SignalFamilyChildResultV1` schema is exactly:
+equal the root-policy-authorized expected result when the root compares it after child exit. The
+future `SignalFamilyChildResultV1` schema is exactly:
 
 ```text
 schema_version: strict native int == 1
@@ -930,20 +1068,24 @@ SHA256(canonical_json_bytes({
 }))
 ```
 
-The verifier binds that epoch key; verification-manifest hash; exact test-manifest hash; canonical
-execution-result/evidence hash; verifier-policy hash; observed family and surface sets;
-full-manifest/source-closure hash; service-manifest hashes; and the complete authority snapshot.
-Audit records contain identifiers, hashes, timestamps, outcomes, and bounded reason codes only.
-They MUST NOT contain signal payloads, environment values, secrets, credentials, raw exception
-text, or verification vector inputs.
+The canonical execution-evidence hash preimage binds that epoch key;
+verification-manifest hash; exact test-manifest hash; canonical
+vector-set, expected-result-set, and five-pair/service-binding-set hashes; canonical child
+execution-result hash; verifier policy ID/content hash and selected entry hash; fixed harness
+identity/hash; observed family and surface sets; full-manifest/source-closure hash;
+service-manifest hashes; and the complete authority snapshot. The resulting execution-evidence hash
+is not an input to itself. Audit records contain identifiers, hashes, timestamps, outcomes, and
+bounded reason codes only. They MUST NOT contain signal payloads, environment values, secrets,
+credentials, raw exception text, or verification vector inputs.
 
 No public or service API accepts a caller-created attestation, receipt, result, evidence model, or
 append request for persistence. Module privacy, import identity, object identity, sentinels, and
-seals are not privilege boundaries. The root-owned verifier process, fixed root-owned harness,
-root-approved manifest/source closure, OS-separated unprivileged child, append-store ownership/mode,
-bounded IPC validation, and deployment lock form the trust boundary. Copying or forging IPC fields,
-inspecting child modules, importing a public model, or invoking a service-local helper grants no
-append authority.
+seals are not privilege boundaries. The external fixed root-owned policy, root-owned verifier
+process, policy-hashed fixed root-owned harness, policy-matched generation manifest/source closure,
+OS-separated unprivileged child, append-store ownership/mode, bounded IPC validation, and deployment
+lock form the trust boundary. Copying or forging IPC fields, replacing self-consistent generation
+code/manifests/vectors/results, inspecting child modules, importing a public model, or invoking a
+service-local helper grants no append authority without the exact external policy match.
 
 #### Atomic Receipts, Readiness, And Lifecycle
 
@@ -953,8 +1095,9 @@ pair. The receipt uniqueness key is exactly
 exact producer/consumer service-ID tuples, successor declaration hash, overlay hash, authority
 epoch, generation/profile, exact producer evidence, exact reader surfaces, verification manifest,
 result/evidence, verifier policy, service manifests, complete sorted service-binding tuple/hash,
-`participating_service_ids`, test-manifest hash, `verified_at`, and `fresh_until`. An identical
-replay is idempotent; divergent bytes for the same key append conflict audit evidence and reject.
+policy content/entry/harness hashes, `participating_service_ids`, test-manifest hash, `verified_at`,
+and `fresh_until`. An identical replay is idempotent; divergent bytes for the same key append
+conflict audit evidence and reject.
 
 `RESET-REG-P2-01` makes freshness profile-derived from the exact pair map. Resolve one exact
 `RuntimeServiceManifest` for every ID in `participating_service_ids`, reject a missing, duplicate,
@@ -966,8 +1109,8 @@ service_freshness_seconds = min(
   for manifest in exact_participating_service_manifests
 )
 freshness_seconds = (
-  min(service_freshness_seconds, verification_policy.max_age_seconds)
-  if verification_policy.max_age_seconds is specified
+  min(service_freshness_seconds, selected_policy_entry.verifier_policy_max_age_seconds)
+  if selected_policy_entry.verifier_policy_max_age_seconds is specified
   else service_freshness_seconds
 )
 fresh_until = verified_at + freshness_seconds
@@ -982,6 +1125,7 @@ A `READY` decision requires exact five-pair set equality, not a count. It binds 
 declaration hash required by the overlay; overlay content hash; five sorted pair IDs; five sorted
 receipt fingerprints and their aggregate canonical SHA-256; authority epoch, generation, full
 manifest, and profile; `participating_service_ids`; complete service-binding tuple/hash; and
+verifier policy ID/content hash, selected entry hash, fixed harness identity/hash, and
 `verified_at`/`fresh_until`. The verifier writes the receipts, immutable decision, and
 compare-and-swap state in one transaction from one consistent snapshot. A unique key over overlay
 plus authority epoch makes concurrent identical finalization return the same bytes; a divergent
@@ -1011,12 +1155,12 @@ The reset finding ledger is stable:
 | `RESET-R07-P0` | any production-obtainable v3 writer, implicit activation, or mutation before family rejection | exhaustive no-activation inventory and fail-before-mutation evidence |
 | `RESET-R07-P1` | v3 dispatch or canonicalization changes v2 bytes, hashes, models, or public errors | frozen valid/invalid v2 differential corpus with exact equality |
 | `RESET-R07-P2` | mixed-chain, pointer, retry, crash, or orphan recovery exposes a partial or ambiguous prefix | strict transition and complete crash/orphan matrix |
-| `RESET-REG-P0` | caller/service-forged evidence or stale authority can create receipts or `READY` | OS-separated root verifier, strict child IPC, lock revalidation, and root-owned append store |
+| `RESET-REG-P0` | caller/service-forged evidence, generation-self-authorized vectors, or stale authority can create receipts or `READY` | external root policy, OS-separated verifier/child, strict IPC, lock revalidation, and root-owned append store |
 | `RESET-REG-P1` | successor or overlay grafts current semantics onto v2 or declares nonexistent/future models | unchanged-v2 evidence, actual-model descriptors, and successor-before-overlay enforcement |
 | `RESET-REG-P2` | count-only readiness, concurrent divergence, expiry/rollback ambiguity, generation-return replay, or audit leakage | exact set/epoch/CAS/lifecycle tests and bounded audit schema |
 | `RESET-R07-P0-01` | the real top-level production registry can make a v3 write/activation object reachable | construct through `runtime_service_main.build_builtin_registry` and prove exhaustive forbidden-object non-reachability |
 | `RESET-R07-P2-01` | an identical post-link retry can publish a pointer without re-establishing records-directory durability | future v3-only primitive re-fsyncs the records directory; byte conflict rejects before pointer mutation |
-| `RESET-REG-P0-01` | generation code, a service, or forged IPC can acquire append authority inside the verifier | root process never imports generation code; unprivileged child has no store/verifier capability; root validates and writes after child exit |
+| `RESET-REG-P0-01` | generation code, self-consistent manifests/vectors/results, a service, or forged IPC can acquire append authority | fixed external root policy authorizes exact release hashes; root never imports generation code; unprivileged child has no store/verifier capability; root validates and writes after child exit |
 | `RESET-REG-P1-01` | underspecified successor/overlay schemas permit alternate bytes, order, identity, or nonexistent models | four exact schemas, canonical preimages/raw bytes, strict structural rejection, and actual-model prerequisite |
 | `RESET-REG-P1-02` | executable/service/surface claims rely on absent service-manifest fields or cross-role aliases | exact root-approved service bindings checked against profile, slot roles, full manifest, and object allowlist before execution |
 | `RESET-REG-P2-01` | readiness freshness omits a pair participant or assumes a fixed/partial minimum | exact pair-derived service union and minimum stale bound, optionally capped by frozen policy |
@@ -1032,6 +1176,7 @@ The planned red-test matrix is exact:
 | `RESET-REG-P1`, `RESET-REG-P1-01` | `tests/unit/test_signal_family_successor_registry_reset.py` | v2 parser/catalog/bytes/hashes/history are unchanged; exact four-schema field sets, hash preimages, raw canonical bytes, strict duplicate/extra/coercion/order rejection; successor declaration rejects before the actual model exists; v2 semantic/partial/absent/conflicting overlay never becomes ready |
 | `RESET-REG-P0`, `RESET-REG-P1`, `RESET-REG-P1-02` | `tests/integration/test_signal_family_verification_reset.py` | all five pair IDs resolve exact callable objects through real production builders and manifest-backed source hashes; exact service bindings cover the pair-derived service set and reject missing/duplicate/cross-role/wrong module/path/source hash before child execution; only a successful immutable child run can lead the root verifier to persist five receipts |
 | `RESET-REG-P0-01` | `tests/integration/test_signal_family_root_verifier_isolation.py` | child module inspection/import cannot discover or import privileged verifier/store authority; direct store open/append fails; no inherited descriptor/path/capability exists; forged, extra, oversized, noncanonical, or wrong-result IPC rejects; caller/service evidence APIs do not exist; authority change between child completion and root append rejects |
+| `RESET-REG-P0-01` | `tests/integration/test_signal_family_root_policy_anchor.py` | policy is loaded before generation files/child and requires anchored no-follow root ownership, mode `0444`, `nlink == 1`, canonical bytes/content hash, exact harness identity/hash, and one exact entry; self-consistent replacement of generation code, manifest, vectors, and expected results rejects without a separate matching policy update; policy whitespace, duplicate/extra keys, entry reorder, hash tampering, missing/stale/multiple/conflicting entries, release/quarantine update attempts, and policy/harness replacement during child execution reject with no receipt/readiness; an approved exact policy passes only through the isolated root-verifier flow |
 | `RESET-REG-P0`, `RESET-REG-P2`, `RESET-REG-P2-01` | `tests/unit/test_signal_family_readiness_reset.py` | exact five-set equality and pair-derived participating-service union, atomic receipt/decision/CAS, byte-identical concurrency, divergent conflict, profile-derived expiry, lower shadow or serving stale bound controls `fresh_until`, optional policy cap, authority advance/return to same generation, rollback, revoke, and no `ATTESTING`/`ACTIVATED` state |
 | `RESET-REG-P0`, `RESET-REG-P2` | `tests/unit/test_signal_family_verification_audit.py` | audit schema contains only bounded identifiers/hashes/timestamps/outcomes and excludes payloads, vector inputs, environment, secrets, credentials, and raw exception text |
 
@@ -1046,9 +1191,11 @@ These are development prerequisites, not unresolved design questions:
 2. Successor base channels MUST bind actual manifest-covered transport models before an overlay can
    be staged; future qualnames and v2 semantic overlays reject.
 3. The immutable verification manifest, exact `VerificationServiceBindingV1` tuple, fixed root-owned
-   harness, OS-separated root verifier/unprivileged generation child, strict bounded IPC, root-owned
-   append store, and deployment-lock revalidation MUST exist before overlay receipts or `READY` can
-   be emitted. In-process sealing cannot satisfy this blocker.
+   harness, externally installed `/etc/rquant/signal-family-verifier-policy-v1.json`, OS-separated
+   root verifier/unprivileged generation child, strict bounded IPC, root-owned append store, and
+   deployment-lock revalidation MUST exist before overlay receipts or `READY` can be emitted. The
+   policy installation/update is a separate user-authorized root infrastructure transaction;
+   in-process sealing or generation inclusion cannot satisfy this blocker.
 4. No high-watermark freeze, legacy drain, cursor migration, writer cutover, production v3
    publication, capability, environment flag, or activation work is authorized by this reset.
 
