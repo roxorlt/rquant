@@ -29,7 +29,14 @@ from rquant.runtime_shadow_validation import (
     shadow_upstream_snapshot_id,
     verify_completion_attestation,
 )
-from rquant.signal_contracts import SignalAction, SignalEnvelope
+from rquant.signal_contracts import (
+    CurrentSignalEnvelope,
+    GitCommitClaimIdentity,
+    SignalAction,
+    SignalEnvelope,
+    SignalEnvelopeFamily,
+    parse_signal_envelope,
+)
 from rquant.signal_router_runtime import RouteSourceDescriptor, RunnerSignalBatch
 from rquant.strategy_runner import RunnerSignalRecord
 from rquant.strict_json import canonical_json_bytes
@@ -704,10 +711,11 @@ def read_legacy_surge_events_shadow_snapshot(
 
 
 def isolated_signal_observations(
-    signals: Iterable[SignalEnvelope],
+    signals: Iterable[SignalEnvelopeFamily],
     *,
     trade_date: date,
     binding: ShadowStrategyBinding,
+    current_producer_commit: str | None = None,
 ) -> tuple[ShadowObservation, ...]:
     observations: dict[str, ShadowObservation] = {}
     seen_upstream: set[tuple[str, str]] = set()
@@ -747,7 +755,10 @@ def isolated_signal_observations(
             event_time=signal.event_time,
             available_at=signal.available_at,
             availability_basis="observed_completion",
-            producer_commit=signal.producer_commit,
+            producer_commit=_signal_producer_commit(
+                signal,
+                current_producer_commit=current_producer_commit,
+            ),
             upstream_event_id=str(signal.signal_id),
             evidence_id=str(signal.signal_id),
         )
@@ -758,7 +769,7 @@ def isolated_signal_observations(
 
 
 def isolated_signals_to_shadow_observations(
-    signals: Iterable[SignalEnvelope],
+    signals: Iterable[SignalEnvelopeFamily],
     *,
     trade_date: date,
     bindings: Iterable[ShadowStrategyBinding],
@@ -778,6 +789,23 @@ def isolated_signals_to_shadow_observations(
         )
     )
     return tuple(sorted(observations, key=lambda item: (item.event_time, str(item.observation_id))))
+
+
+def _signal_producer_commit(
+    signal: SignalEnvelopeFamily,
+    *,
+    current_producer_commit: str | None,
+) -> str:
+    if type(signal) is SignalEnvelope:
+        return signal.producer_commit
+    if type(signal) is CurrentSignalEnvelope:
+        identity = signal.producer_identity
+        if type(identity) is GitCommitClaimIdentity:
+            return identity.producer_commit
+        if current_producer_commit is not None:
+            return current_producer_commit
+        raise ValueError("full-manifest isolated signal requires an attested producer commit")
+    raise TypeError("isolated shadow source received an unknown signal envelope family")
 
 
 def read_isolated_runner_shadow_snapshot(
@@ -843,7 +871,7 @@ def read_isolated_runner_shadow_snapshot(
         raise ValueError("runner completion receipt has no signal high watermark")
     cursor = 0
     frozen = None
-    visible: list[SignalEnvelope] = []
+    visible: list[SignalEnvelopeFamily] = []
     raw_chain: str | None = None
     raw_record_count = 0
     raw_bytes = 0
@@ -915,7 +943,7 @@ def read_isolated_runner_shadow_snapshot(
                     "sequence": record.sequence,
                 }
             )
-            signal = SignalEnvelope.model_validate(record.signal)
+            signal = parse_signal_envelope(record.signal.model_dump(mode="json"))
             if signal.event_time.date() == trade_date:
                 if signal.available_at > cutoff:
                     raise ValueError("runner signal became available after observed_at")
@@ -956,6 +984,7 @@ def read_isolated_runner_shadow_snapshot(
         visible,
         trade_date=trade_date,
         binding=binding,
+        current_producer_commit=receipt.producer_commit,
     )
     return ShadowRunnerReadSnapshot(
         observations=observations,

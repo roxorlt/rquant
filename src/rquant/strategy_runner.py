@@ -48,7 +48,12 @@ from rquant.runtime_shadow_validation import (
     ShadowSourceCompletionReceipt,
     shadow_completion_receipt_body_sha256,
 )
-from rquant.signal_contracts import SignalAction, SignalEnvelope
+from rquant.signal_contracts import (
+    SignalAction,
+    SignalEnvelope,
+    SignalEnvelopeFamily,
+    parse_signal_envelope,
+)
 from rquant.strategy_candidate_snapshot import candidate_occurrence_id
 from rquant.strategy_spec import StrategyLifecycleState, StrategySpec
 
@@ -354,8 +359,8 @@ class StrategyLifecycleFeatureSource(Protocol):
         self,
         *,
         candidate_id: str,
-        entry_signal: SignalEnvelope,
-        exit_signals: tuple[SignalEnvelope, ...],
+        entry_signal: SignalEnvelopeFamily,
+        exit_signals: tuple[SignalEnvelopeFamily, ...],
         decision_cutoff: datetime,
         market_features: Mapping[str, object],
         market_feature_statuses: Mapping[str, FeatureFieldStatus],
@@ -515,7 +520,7 @@ class StrategyCandidateState(RuntimeContractModel):
 
 class RunnerSignalRecord(RuntimeContractModel):
     sequence: int = Field(ge=1)
-    signal: SignalEnvelope
+    signal: SignalEnvelopeFamily
 
 
 class _RunnerSessionSegment(RuntimeContractModel):
@@ -691,7 +696,7 @@ def _utc_iso(value: datetime) -> str:
 
 
 def _signal_index_values(
-    signal: SignalEnvelope,
+    signal: SignalEnvelopeFamily,
 ) -> tuple[str, str, str | None, str | None, str, str, str]:
     transition = signal.evidence.get("runner_transition")
     occurrence_id: str | None = None
@@ -1354,9 +1359,9 @@ class StrategyRunnerStore:
         return "current"
 
     @staticmethod
-    def _runner_signal_from_row(row: sqlite3.Row) -> SignalEnvelope:
+    def _runner_signal_from_row(row: sqlite3.Row) -> SignalEnvelopeFamily:
         try:
-            signal = SignalEnvelope.model_validate_json(row["payload_json"])
+            signal = parse_signal_envelope(row["payload_json"])
         except (TypeError, ValueError) as exc:
             raise ValueError("runner_signal payload is invalid") from exc
         indexed = _signal_index_values(signal)
@@ -1395,7 +1400,7 @@ class StrategyRunnerStore:
             migrated: list[tuple[object, ...]] = []
             for row in legacy_rows:
                 try:
-                    signal = SignalEnvelope.model_validate_json(row["payload_json"])
+                    signal = parse_signal_envelope(row["payload_json"])
                 except (TypeError, ValueError) as exc:
                     raise ValueError("runner_signal legacy payload is invalid") from exc
                 if row["signal_id"] != signal.signal_id or row["payload_json"] != _json_payload(
@@ -2484,7 +2489,7 @@ class StrategyRunnerStore:
         connection: sqlite3.Connection,
         *,
         state: StrategyCandidateState,
-    ) -> SignalEnvelope | None:
+    ) -> SignalEnvelopeFamily | None:
         row = connection.execute(
             """
             SELECT * FROM runner_signal
@@ -2501,9 +2506,9 @@ class StrategyRunnerStore:
         connection: sqlite3.Connection,
         *,
         state: StrategyCandidateState,
-        entry_signal: SignalEnvelope,
+        entry_signal: SignalEnvelopeFamily,
         decision_cutoff: datetime,
-    ) -> tuple[SignalEnvelope, ...]:
+    ) -> tuple[SignalEnvelopeFamily, ...]:
         rows = connection.execute(
             """
             SELECT * FROM runner_signal

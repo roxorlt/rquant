@@ -30,13 +30,23 @@ from rquant.runtime_shadow_validation import (
     shadow_completion_receipt_body_sha256,
     shadow_session_boundaries,
 )
-from rquant.signal_contracts import SignalAction, SignalEnvelope
+from rquant.signal_contracts import (
+    CurrentSignalEnvelope,
+    SignalAction,
+    SignalEnvelope,
+    SignalEnvelopeFamily,
+    parse_signal_envelope,
+)
 from rquant.signal_router_runtime import (
     RouteSourceDescriptor,
     RunnerSignalBatch,
     SourceSnapshot,
 )
 from rquant.strategy_runner import RunnerSignalRecord
+from tests.unit.test_signal_contracts import (
+    _CURRENT_CANONICAL_FIXTURES,
+    _LEGACY_CANONICAL_FIXTURES,
+)
 
 TRADE_DATE = date(2026, 7, 31)
 COMMIT = "a" * 40
@@ -697,7 +707,7 @@ def test_isolated_adapter_rejects_noncanonical_strategy_version(version: str) ->
 class _RunnerSource:
     def __init__(
         self,
-        signals: tuple[SignalEnvelope, ...],
+        signals: tuple[SignalEnvelopeFamily, ...],
         *,
         mutate_snapshot_after_first_read: bool = False,
         complete_through: datetime | None = None,
@@ -769,6 +779,60 @@ def test_runner_reader_freezes_and_pages_one_complete_source_snapshot() -> None:
 
     assert len(observations) == 4
     assert source.read_count == 2
+
+
+_RUNNER_SIGNAL_FAMILIES = (
+    (
+        "legacy-v1",
+        SignalEnvelope,
+        _LEGACY_CANONICAL_FIXTURES[0][3],
+    ),
+    (
+        "legacy-v2",
+        SignalEnvelope,
+        _LEGACY_CANONICAL_FIXTURES[2][3],
+    ),
+    (
+        "legacy-v3",
+        SignalEnvelope,
+        _LEGACY_CANONICAL_FIXTURES[4][3],
+    ),
+    (
+        "current-git-claim",
+        CurrentSignalEnvelope,
+        _CURRENT_CANONICAL_FIXTURES[0][2],
+    ),
+    (
+        "current-full-manifest",
+        CurrentSignalEnvelope,
+        _CURRENT_CANONICAL_FIXTURES[1][2],
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    ("_name", "expected_type", "literal"),
+    _RUNNER_SIGNAL_FAMILIES,
+    ids=[item[0] for item in _RUNNER_SIGNAL_FAMILIES],
+)
+def test_runner_shadow_reader_accepts_every_verified_signal_family(
+    _name: str,
+    expected_type: type[SignalEnvelopeFamily],
+    literal: bytes,
+) -> None:
+    signal = parse_signal_envelope(literal)
+    assert type(signal) is expected_type
+
+    snapshot = read_isolated_runner_shadow_snapshot(
+        _RunnerSource((signal,)),
+        trade_date=TRADE_DATE,
+        observed_at=EXPORTED_AT,
+        binding=_binding(),
+        expected_calendar_authority_id=SOURCE_CALENDAR_AUTHORITY_ID,
+        attestation_verifier=ATTESTATION_AUTHORITY,
+    )
+
+    assert len(snapshot.raw_input_id) == 64
 
 
 def test_runner_snapshot_binds_frozen_descriptor_and_cutoff() -> None:
