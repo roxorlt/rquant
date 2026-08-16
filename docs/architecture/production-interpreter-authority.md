@@ -12,6 +12,11 @@ record (C). Artifact signing is not part of v1.
 code. This amendment resolves the role/argument/environment contradiction in the original frozen
 text; all other decisions, including the v1 source-authenticity exclusion, remain unchanged.
 
+**Final local design amendment:** `WRAP-DESIGN-P1-01` through `WRAP-DESIGN-P1-04` freeze the
+application-path authority, list-value grammar, `SignalEnvelope` v2 producer identity, and
+dependency order below. These are design closures only; their red tests and implementation must
+precede wrapper or adapter code.
+
 ## Scope And Threat Model
 
 ### Assets
@@ -23,6 +28,9 @@ text; all other decisions, including the v1 source-authenticity exclusion, remai
 - `/var/lib/rquant/runtime-authority/current.json`, rollback generations, and audit evidence.
 - Root privilege exposed by the narrowly authorized publication helper.
 - Production availability across interrupted copy, publish, record update, restart, and rollback.
+- The exact application-path and emitted-environment contract presented to the HYBRID `daily`
+  process.
+- The producer identity persisted in HYBRID daily signals, error outbox rows, and evidence.
 
 Source authenticity is explicitly not a v1 asset. A candidate's claimed commit/tag and manifest
 are untrusted audit metadata. User authorization and GitHub delivery express operational intent;
@@ -42,6 +50,9 @@ they are not evidence accepted by the root helper and do not participate in its 
 5. The root helper trusts only metadata and hashes it recomputes from the root-owned quarantine.
    Candidate manifest/commit fields remain opaque audit strings and cannot grant privileges,
    choose root execution, weaken policy, or determine generation identity.
+6. Mutable application data beneath the frozen `lighthouse` data and log roots is outside the
+   trusted-code TCB. Its paths are strict application inputs, never interpreter, profile,
+   generation, authority, cwd, module, or import authority.
 
 A complete compromise of the `lighthouse` UID is not in scope for protecting that UID's own
 checkout, venv, or processes. That UID remains an actively malicious client when it supplies
@@ -52,6 +63,10 @@ trusted by root. A malicious accepted generation is executed only later with UID
 
 - Environment, `PATH`, Python variables, loader variables, argv, or working-directory injection
   selects an alternate interpreter, profile, wrapper, module, or generation.
+- An application path uses an alias, symlink, nonexistent or wrong leaf, sibling escape, mutable
+  trust-store overlap, or variable-to-path substitution to acquire code/runtime authority.
+- A daily success or error signal truncates a generation hash, reads Git identity from the
+  environment, fabricates a zero commit, or omits the active producer identity from `signal_id`.
 - A source entry changes type or identity during traversal, or uses symlinks, hard links, special
   files, path traversal, duplicate names, or mutable ancestors.
 - Root imports or executes candidate Python while inspecting or copying it.
@@ -92,6 +107,10 @@ trusted by root. A malicious accepted generation is executed only later with UID
 - The production `daily` role maps only to generation-local
   `rquant.production_daily_main`. It accepts no caller arguments or business overrides and runs
   only with the exact application environment policy frozen by the profile.
+- The profile freezes exact application data/log roots and exact variable-to-path mappings. Path
+  validation is anchored and no application path can overlap or select trusted-code storage.
+- Every new signal write uses `SignalEnvelope` schema v2. A HYBRID signal binds the exact current
+  `full_manifest_hash` as its sole producer identity; Git/audit metadata is never substituted.
 - No production path uses `preexec_fn`, a global interpreter FD authority, mutable `current`
   symlinks, checkout imports, pathname fallback, or unintended inherited FDs.
 - Unsupported host facts, failed validation, incomplete durability, ambiguous recovery, and
@@ -108,13 +127,17 @@ trusted by root. A malicious accepted generation is executed only later with UID
 - Proving the integrity of an already-running Python process using only that process.
 - Application database integrity, secret rotation, service sandbox redesign, trading behavior,
   or executing directly from a developer checkout.
+- Trusting the mutable contents of `lighthouse` application data/log roots as executable code or
+  extending root ownership/non-writability requirements to those application-write locations.
 
 ### Blocking Scope
 
 Production deploy and service-start wiring remain blocked until quarantine copying, complete
-generation verification, single-record recovery, the exact runtime wrapper, and Linux/cloud hard
-gates are complete. Root-owned installation, systemd/sudoers changes, and production deployment
-remain separately authorized infrastructure operations. This ADR does not grant that authority.
+generation verification, single-record recovery, the exact runtime wrapper, `SignalEnvelope` v2
+compatibility migration, and Linux/cloud hard gates are complete. Daily adapter/wrapper work is
+additionally blocked on the path and environment contract tests below. Root-owned installation,
+systemd/sudoers changes, and production deployment remain separately authorized infrastructure
+operations. This ADR does not grant that authority.
 
 ## Trusted Computing Base
 
@@ -149,6 +172,13 @@ name tuple is insufficient: every permitted environment name binds required/opti
 grammar class, and v1 bounds. Unknown, duplicate, malformed, non-native scalar, or overridden
 values are rejected. There is no GID alternative, `{root, euid}` policy, environment override,
 argv override, wildcard closure, or runtime-discovered exception.
+
+Profile schema v1 also freezes `application_data_root` as exactly
+`/home/lighthouse/rquant/data` and `application_log_root` as exactly
+`/home/lighthouse/rquant/logs`; both fields participate in `profile_id`. They are application-write
+boundaries, not trusted-code roots. Their ownership and mutability are therefore not promoted into
+the root-owned code TCB, but their spelling, type, identity, and separation from every trusted root
+are validated as specified below.
 
 ## Initial Entry And Environment
 
@@ -229,21 +259,100 @@ NOTIFY_OPS_COOLDOWN_SECONDS
 POOL2_MAX_AGE_DAYS
 ```
 
-The profile binds each name to the following grammar and presence rule. All decoded values are
-strings, the aggregate child environment is at most 64 KiB, and no secret value is logged or
-placed in the profile or authority record.
+The profile binds each name to the following grammar and presence rule. Every raw value is strict
+UTF-8 and is validated without trimming, case conversion, item dropping, or other repair. A
+required scalar rejects both absence and the empty string. An optional scalar maps absence or the
+empty string to one canonical absent value, which is not emitted, and otherwise requires its exact
+canonical representation. No secret value is logged or placed in the profile or authority record.
 
 | Class | Names and presence | Frozen v1 grammar |
 |---|---|---|
 | Locale | `LANG`, `LC_ALL` optional; `TZ` required | locale is exactly `C`, `C.UTF-8`, `en_US.UTF-8`, or `zh_CN.UTF-8`; timezone is exactly `Asia/Shanghai` or `UTC` |
 | Tushare secret | `TUSHARE_TOKEN_MAIN` required; `TUSHARE_TOKEN_BACKUP` optional | printable non-control UTF-8, 32-512 bytes, no NUL/newline or leading/trailing whitespace |
-| Application path | `DATA_DIR`, `DUCKDB_PATH`, `PARQUET_DIR`, `LOG_DIR`, `NOTIFICATION_STATE_PATH` required; `DUCKDB_READONLY_PATH` optional | canonical absolute UTF-8 path, at most 4096 bytes; no tilde, NUL/newline, dot traversal, symlink alias, or escape from profile-frozen `lighthouse` application-data roots |
+| Application path | exact presence and values are frozen below | exact literal mapping plus anchored type/identity validation; there is no general path grammar |
 | Logging/runtime | `LOG_LEVEL`, `APP_ENV` required | level is exactly `DEBUG`, `INFO`, `WARNING`, or `ERROR`; environment is exactly `prod` |
-| Channel secrets | `PUSHDEER_KEYS`, `PUSHPLUS_TOKENS` optional | comma-separated 0-16 items; each non-empty item is printable non-control UTF-8 of 1-512 bytes; no NUL/newline/empty interior item; total at most 8192 bytes |
-| Recipient IDs | corresponding `*_RECIPIENT_IDS` required when a channel token list is non-empty | comma-separated 1-16 items, each 1-128 printable non-control UTF-8 bytes, total at most 2048 bytes; count is one or equals token count |
-| Endpoints | corresponding `*_ENDPOINT` required when a channel token list is non-empty | absolute HTTPS URL, at most 2048 UTF-8 bytes, with host and path, no userinfo, fragment, NUL, or newline |
+| Channel secrets | `PUSHDEER_KEYS`, `PUSHPLUS_TOKENS` optional | raw comma-separated list of 1-16 items; each item is 1-512 bytes of visible ASCII `0x21..0x7e` excluding comma; serialized value is at most 8192 bytes |
+| Recipient IDs | corresponding `*_RECIPIENT_IDS` conditionally required | raw comma-separated list with the channel-list rules; each item matches `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`; at most 16 items and count exactly equals the corresponding key/token count |
+| Endpoints | corresponding `*_ENDPOINT` optional only when its key/token list is present | absence selects that channel's profile-frozen canonical service default; a supplied value follows the exact canonical HTTPS grammar below and is at most 2048 ASCII bytes |
 | Boolean | `NOTIFY_ENABLED`, `NOTIFY_DAILY_SUMMARY`, `NOTIFY_ERROR` required | exactly lowercase `true` or `false` |
 | Integer | `NOTIFICATION_STATE_BUSY_TIMEOUT_MS`, both `NOTIFY_*_COOLDOWN_SECONDS`, and `POOL2_MAX_AGE_DAYS` required | strict unsigned decimal, no sign or leading zero except `0`; timeout 1-600000 ms, cooldown 0-86400 seconds, pool age 1-365 days |
+
+For both channel-secret variables, a nonempty raw CSV rejects leading/trailing ASCII or Unicode
+whitespace, every control or non-ASCII character, a leading/trailing comma, and every empty
+interior item. Parsing never trims or silently drops an item. A recipient variable and endpoint
+must be absent when the corresponding key/token list is absent. When that list is present, the
+recipient variable is required and has exactly the same item count; an absent or empty endpoint
+selects the frozen default before emission. A supplied endpoint is exactly
+`https://<host><path>`: lowercase `https`, no userinfo/port/query/fragment, a lowercase ASCII DNS
+host of at most 253 bytes with no empty label or trailing dot, and an absolute ASCII path matching
+`/(?:[A-Za-z0-9._~-]+(?:/[A-Za-z0-9._~-]+)*)?` with no `.` or `..` segment. Percent escapes,
+Unicode host aliases, repeated slashes, and noncanonical spellings are rejected. Both frozen
+channel defaults are profile fields and participate in `profile_id`.
+
+After optional omissions and endpoint-default insertion, the emitted-environment budget is exactly
+`sum(len(NAME.encode("ascii")) + 1 + len(VALUE.encode("utf-8")) + 1) <= 65536`; the two added bytes
+are `=` and the terminating NUL for each entry. Validation completes before constructing or
+launching the child.
+
+The profile's application mapping is exact:
+
+```text
+application_data_root = /home/lighthouse/rquant/data
+application_log_root = /home/lighthouse/rquant/logs
+
+required DATA_DIR = /home/lighthouse/rquant/data
+required DUCKDB_PATH = /home/lighthouse/rquant/data/rquant.duckdb
+optional DUCKDB_READONLY_PATH = absent | /home/lighthouse/rquant/data/rquant_ro.duckdb
+required PARQUET_DIR = /home/lighthouse/rquant/data/parquet
+required LOG_DIR = /home/lighthouse/rquant/logs
+optional NOTIFICATION_STATE_PATH = absent | /home/lighthouse/rquant/data/notification_state.sqlite3
+```
+
+For either optional path, raw absence or the empty string canonicalizes to absence; every nonempty
+value must equal the listed path byte-for-byte. Before environment emission, the wrapper opens a
+fixed `/` directory FD and walks every nonempty component root-to-leaf with `lstat`/`fstatat`
+no-follow checks and `openat(O_NOFOLLOW | O_CLOEXEC)`; directory components also use
+`O_DIRECTORY`. It compares path and opened-FD device/inode/type identity at each step and again
+before exec. The configured roots cannot be `/`, relative, textual aliases, or contain empty,
+`.`/`..`, tilde, NUL, newline, or redundant-separator components. The two roots and every
+directory-valued mapping must already exist as canonical directories. Existing database/state
+file leaves must be regular files with `nlink == 1`; an absent file leaf is permitted only beneath
+its already verified existing parent.
+
+Containment and overlap use whole path components, not string prefixes. The application roots must
+be disjoint from each other and must neither equal, contain, nor be contained by the fixed profile,
+authority, generation, quarantine, or inbox roots. Symlink aliases, sibling escapes, wrong
+variable-to-path mappings, and identity changes during the walk reject the launch. These mutable
+paths are expected to be writable by `lighthouse`; validation deliberately does not require root
+ownership or root-style non-writability and never treats their contents as trusted code.
+
+The application-path contract has these mandatory red-test rows:
+
+| Fixture | Expected result |
+|---|---|
+| Exact two roots and exact directory mappings exist; each file leaf is absent under its verified parent or is regular with `nlink == 1` | Accept path contract |
+| Either optional path is missing or empty | Canonicalize to one absent representation and omit it |
+| Any required path is missing/empty, or any variable is swapped/rebound to another allowlisted path | Reject before child construction |
+| Root is `/`, relative, tilde-based, redundantly separated, dot/dot-dot-bearing, or a sibling/prefix-confusion escape | Reject before or during anchored walk |
+| Data/log root, `PARQUET_DIR`, or a required parent is nonexistent or not a directory | Reject; an absent file leaf does not excuse an absent parent |
+| Any ancestor, root, directory leaf, or existing file leaf is a symlink/alias | Reject even when it resolves to the expected spelling |
+| An existing file leaf is a directory, hard link (`nlink != 1`), FIFO, socket, device, or other special file | Reject |
+| A component is replaced between pathname check, FD open, identity check, or pre-exec recheck | Reject and close every opened FD |
+| Either application root overlaps the profile/authority/generation/quarantine/inbox root in either direction | Reject |
+| Ordinary mutable fixture roots owned/writable by the runtime UID satisfy all path/type rules | Accept without claiming root-owned trusted-code evidence |
+
+The scalar/list/environment contract has these mandatory red-test rows:
+
+| Boundary | Accept | Reject |
+|---|---|---|
+| Scalar presence | optional absent/empty becomes absence; required canonical nonempty value | required absent/empty; optional noncanonical nonempty value |
+| Backup token | absent/empty `TUSHARE_TOKEN_BACKUP` | invalid nonempty backup or empty required `TUSHARE_TOKEN_MAIN` |
+| Channel item text | visible ASCII non-comma item at exactly 1 or 512 bytes | 0 or 513 bytes; comma in item; ASCII/Unicode whitespace; control; non-ASCII |
+| CSV shape | exactly 1 or 16 nonempty items and value size exactly 8192 bytes when otherwise valid | leading/trailing comma, interior empty item, 17 items, or 8193 bytes |
+| Recipient | 1 or 64 bytes matching the exact regex; count equals key/token count | 65 bytes, bad first/other character, count mismatch, recipient present without key/token list |
+| Endpoint | absent/empty with a present key/token list selects the frozen default; supplied canonical URL at exactly 2048 bytes | supplied without key/token list; 2049 bytes; uppercase/noncanonical host or scheme; port, userinfo, query, fragment, bad/dot path segment, percent/Unicode alias |
+| Representation | exact raw canonical spelling | any value that would become valid only by trimming, case-folding, normalization, dropping, or rewriting |
+| Aggregate emitted environment | sum of UTF-8 bytes of each `NAME=value` plus one NUL per entry is exactly 65536 | the same sum is 65537; names, `=`, NULs, and synthesized endpoint defaults all count |
 
 Application paths affect only `lighthouse`-owned application data. They can never select or alter
 an interpreter, profile, authority record, role, module, cwd, import root, generation, or
@@ -258,6 +367,54 @@ independently validates every copied value against the profile grammar before ex
 checkout `/home/lighthouse/rquant/.env`. This decision does not authorize installing or changing
 the fixed file; secret rotation remains excluded and separately authorized. Any v1 name,
 presence rule, grammar, or bound change requires a new profile/ADR version.
+
+## SignalEnvelope V2 Producer Identity
+
+`SignalEnvelope` schema v2 is a migration, not a truncation or fabricated-provenance convention.
+Every v2 envelope contains exactly one active producer identity:
+
+```text
+legacy: producer_commit = exactly 40 lowercase hexadecimal characters
+        producer_generation_id = absent
+
+HYBRID: producer_commit = absent
+        producer_generation_id = exactly 64 lowercase hexadecimal characters
+                                 equal to current full_manifest_hash
+```
+
+Both fields present and both fields absent are invalid. The all-zero 40-character commit is also
+invalid in v2 because it fabricates provenance rather than identifying a producer. Serialization
+persists `schema_version = 2` and exactly the active field; the inactive field is omitted, not
+serialized as null, zeroes, a truncation, or an audit commit. The deterministic `signal_id`
+identity payload likewise contains `schema_version = 2` and the active field name/value, so legacy
+and HYBRID identities cannot collide or be silently exchanged.
+
+Existing stored schema-v1 envelopes remain readable only through an explicit compatibility
+adapter. That adapter validates the historical v1 shape, preserves its exact stored commit bytes,
+recomputes `signal_id` with the unchanged historical v1 identity payload, and labels the all-zero
+sentinel as unverified legacy data. It does not promote the sentinel to provenance, synthesize a
+generation ID, or rewrite the row as v2. Every consumer branches on schema version and validates
+v1 and v2 separately. All new writes use v2, including legacy-mode new writes, which must provide
+a real nonzero commit under the v2 legacy branch.
+
+The future HYBRID daily adapter and its error/outbox path reopen the fixed current authority and
+use the exact revalidated current `full_manifest_hash` as `producer_generation_id`. They never read
+`RQUANT_CODE_COMMIT`, candidate commit audit metadata, a checkout, or a shortened/zero substitute.
+If exact current identity cannot be obtained, the HYBRID signal write fails closed. The current
+`cli.py::_daily_notification_producer_commit` fallback to 40 zeroes is legacy technical debt to be
+superseded; it is not accepted implementation or evidence for the HYBRID path.
+
+The v2 migration has these mandatory red-test rows:
+
+| Fixture | Expected result |
+|---|---|
+| V2 legacy envelope with one nonzero 40-lowercase-hex commit and no generation ID | Accept and bind that exact field into `signal_id` |
+| V2 HYBRID envelope with no commit and one 64-lowercase-hex current `full_manifest_hash` | Accept and bind that exact field into `signal_id` |
+| Both producer fields, neither field, malformed length/case/hex, or all-zero legacy commit | Reject |
+| Otherwise identical legacy/HYBRID envelopes or two distinct generation hashes | Produce distinct deterministic `signal_id` values |
+| Stored v1 row, including historical all-zero sentinel | Read only through the v1 compatibility branch; preserve bytes and unverified status; never coerce/write as v2 |
+| Any new writer attempts schema v1 or omits the exact v2 identity | Reject before persistence |
+| HYBRID daily success/error fault path persists outbox/evidence | Persist schema v2 and the exact current 64-hex `full_manifest_hash`; Git env, zeroes, truncation, and audit commit mutations have no effect |
 
 ## Root Quarantine And Generation Publication
 
@@ -355,8 +512,9 @@ The wrapper opens the fixed profile and `current.json`, verifies root ownership/
 the record schema, then revalidates the exact current generation path, generation ID,
 `full_manifest_hash`, complete file tree, owner UID, mode, link count, and selected role. Commit is
 read only as untrusted audit metadata. The wrapper constructs the role's exact cwd and fresh
-allowlisted environment, then uses an absolute exec of the fixed generation-local venv Python with
-arguments equivalent to:
+allowlisted environment only after the anchored application-path walk, exact variable mapping,
+scalar/list grammar, pairwise channel rules, and emitted-byte budget all pass. It then uses an
+absolute exec of the fixed generation-local venv Python with arguments equivalent to:
 
 ```text
 <absolute-generation-venv-python> -I -S -c <root-pyz-frozen-bootstrap> \
@@ -398,17 +556,21 @@ UNTRUSTED_REQUEST
   -> AUTHORITY_TEMP_DURABLE
   -> AUTHORITY_ACTIVE(current=new, prior=old)
   -> RUNTIME_REVALIDATED
+  -> APPLICATION_PATHS_VALIDATED
   -> APPLICATION_ENV_VALIDATED
+  -> PRODUCER_IDENTITY_BOUND(schema=2, full_manifest_hash)
   -> DAILY_ADAPTER_BOUND
   -> RUNNING
 ```
 
-Any validation, copy, ownership, mode, hash, fsync, rename, record, wrapper, exec, or health-gate
-failure enters `REJECTED` before `AUTHORITY_ACTIVE`, or `BLOCKED` afterward. Neither state permits
-fallback to checkout/current/PATH. Rollback is one new atomic `current.json` transaction that
+Any validation, copy, ownership, mode, hash, fsync, rename, record, wrapper, application-path,
+environment, producer-identity, exec, or health-gate failure enters `REJECTED` before
+`AUTHORITY_ACTIVE`, or `BLOCKED` afterward. Neither state permits fallback to
+checkout/current/PATH/Git identity. Rollback is one new atomic `current.json` transaction that
 promotes the validated `prior_*` slot and demotes or retires the failed `current_*` slot. It passes
 through `AUTHORITY_TEMP_DURABLE -> AUTHORITY_ACTIVE(current=prior, prior=failed-or-retired) ->
-RUNTIME_REVALIDATED -> RUNNING`, never mutates a generation, and cannot automatically recurse.
+RUNTIME_REVALIDATED -> APPLICATION_PATHS_VALIDATED -> APPLICATION_ENV_VALIDATED ->
+PRODUCER_IDENTITY_BOUND -> RUNNING`, never mutates a generation, and cannot automatically recurse.
 
 ## Crash And Rollback Matrix
 
@@ -469,27 +631,29 @@ stores, or changing systemd/sudoers/production configuration requires separate e
 authorization. This PR may prepare code, tests, and an installer candidate but must not install or
 deploy them.
 
-Implementation proceeds in bounded batches:
+The completed FD-authority cleanup and the existing runtime-authority/quarantine primitives remain
+prerequisites with their own tests; they are not wrapper evidence and are not renumbered into the
+remaining WRAP dependency chain. Remaining work proceeds only in this order:
 
-1. Revert the uncommitted authority WIP and reverse the production FD-launch behavior introduced
-   by `a35c072`, `106b47c`, and `f21f5d9` using ordinary new commits. Do not reset or rewrite those
-   commits; retain unrelated fixes.
-2. Add fixed-profile validation, `/usr/bin/python3.11` closure preflight, root-owned bootstrap and
-   runtime pyz candidates, strict argument/environment contracts, and an installer candidate.
-   Profile tests bind the canonical Python/ELF-loader/stdlib/shared-library/ancestor list and both
-   pyz hashes without runtime policy relaxation.
-3. Add the no-arbitrary-path root helper, anchored quarantine copy, post-copy root-tree rehash,
-   immutable generation publication, and tests proving `full_manifest_hash` is the sole identity
-   while malicious candidate manifest/commit metadata grants no privilege or root execution.
-4. Before wrapper or adapter code, implement this amendment's exact `daily` role mapping,
-   zero-caller-argument adapter tests, profile name-to-grammar schema, fixed-value invocation,
-   dotenv exclusion, and fixed application-environment validation. Legacy
-   `runtime_service_main` or formal-runtime tests are not acceptance evidence.
-5. Add two-slot single `current.json` publication/recovery, one-layer rollback, the complete crash
-   matrix, frozen `-I -S -c` child revalidation/bootstrap, and exact
-   generation/cwd/import/env/site isolation tests.
-6. Add Linux Python 3.11 exact-entry CI with zero skip. After separate infrastructure approval,
-   run the cloud hard gate below. Production wiring remains blocked until it passes.
+1. **Role/environment/identity contracts.** First add red tests, then implement the exact `daily`
+   role mapping, profile application roots and name-to-grammar schema, path/list/aggregate-budget
+   validators, `SignalEnvelope` v2 exclusive identity, v1 read-only compatibility adapter, and
+   explicit dual-version consumer branching. No wrapper, adapter, or deploy entry is added here.
+2. **Executable contract and artifact planning.** After batch 1 is green, freeze the bootstrap and
+   runtime entry contracts and prepare root-owned zipapp/profile schemas, reproducible artifact
+   candidates and hashes, closure preflight, and an installer candidate/plan. This batch performs
+   no installation and no production or systemd change.
+3. **Runtime/deploy entries and daily adapter.** Only after batches 1-2 are green, implement the
+   fixed runtime/deploy entry code, child revalidation/bootstrap, exact generation/cwd/import/env
+   isolation, and generation-local zero-caller-argument `production_daily_main`. Its normal and
+   fault/outbox writes must persist the exact current generation hash under schema v2. Existing
+   `runtime_service_main` and formal-runtime paths remain untouched and are not acceptance evidence.
+4. **Linux/root/cloud gates.** After batch 3 is green locally, add the real Linux Python 3.11/root
+   integration gates with zero skip. Separately authorized infrastructure installation and cloud
+   acceptance follow only after those gates; production wiring remains blocked until they pass.
+
+No later batch may supply a temporary Git/zero identity, generic path grammar, permissive
+environment parser, or legacy entrypoint to compensate for an unfinished earlier contract.
 
 ## macOS And Cloud Acceptance
 
@@ -497,6 +661,11 @@ macOS may validate strict parsing, anchored FD traversal, copy/hash/mode fixture
 rename/fsync models, record recovery, environment stripping, and fail-closed behavior. Fixtures
 freeze the explicit current UID and never claim root-owned production success. Linux-only loader,
 systemd, root ownership, and `/usr/bin/python3.11` evidence remain gaps, not passes.
+
+Local WRAP acceptance follows the batch order above: every application-path and scalar/list row,
+then every `SignalEnvelope` v2/compatibility row, must be red before implementation and green before
+artifact/runtime entry work begins. Runtime-entry tests must then prove the exact daily behavior and
+fault identity. Legacy CLI/formal-runtime execution cannot satisfy any of those gates.
 
 The separately authorized cloud acceptance is a hard gate and must record exact commands/results:
 
@@ -514,10 +683,14 @@ The separately authorized cloud acceptance is a hard gate and must record exact 
 5. Every crash point in the two-slot single-record matrix is fault-injected and recovers only from
    the last durably validated `current.json`. Current/prior promotion is atomic, automatic rollback
    is limited to one layer, and no directory/audit/process inference is accepted.
-6. Wrapper role/path/module/cwd/import/environment injection is rejected. `PATH`, `HOME`,
-   `PYTHON*`, `LD_*`, user site, checkout, mutable `current`, and any environment file other than
-   the fixed root-owned daily application file cannot affect execution. Every allowed application
-   value is revalidated against the profile's exact name-to-grammar policy.
+6. Wrapper role/path/module/cwd/import/environment injection is rejected. The loaded profile has
+   the exact two application roots and variable mappings frozen above; cloud fixtures cover missing
+   roots/parents, wrong mappings, `/`, aliases, dot/sibling escapes, symlink and identity swaps,
+   special or multiply linked leaves, absent permitted file leaves, and overlap with every trusted
+   root. They also cover every scalar/list/endpoint and exact 65536/65537-byte boundary row.
+   `PATH`, `HOME`, `PYTHON*`, `LD_*`, user site, checkout, mutable `current`, and any environment
+   file other than the fixed root-owned daily application file cannot affect execution. Every
+   allowed application value is revalidated against the profile's exact name-to-grammar policy.
    `.pth`, `include-system-site-packages = true`, `sitecustomize`, `usercustomize`, external paths,
    and namespace-package escapes are rejected before `runpy`.
 7. The real `/usr/bin/python3.11` bootstrap and `-I -S -c` runtime entry execute on Linux with zero
@@ -527,14 +700,18 @@ The separately authorized cloud acceptance is a hard gate and must record exact 
 8. Backup restore and both successful and failed rollback paths preserve one valid authority
    record, launch the recorded exact generation, retain evidence, and never fall back to checkout.
 9. The literal `daily` role selects only generation-local `rquant.production_daily_main`; the
-   child sees zero caller arguments and the fixed run-daily behavior. Invalid argv, extra or
-   malformed environment values, dotenv/checkout influence, role/module substitution, and use of
-   commit audit metadata as code identity are rejected. `runtime_service_main` and formal-runtime
-   execution do not count as this gate.
+   child sees zero caller arguments and the fixed run-daily behavior. Success and injected-error
+   paths persist schema-v2 signal/outbox/evidence bytes containing the exact current 64-hex
+   `full_manifest_hash`, and `signal_id` changes with that identity. Invalid argv, extra or malformed
+   environment values, dotenv/checkout/Git influence, zero or truncated identity, role/module
+   substitution, and use of commit audit metadata as authority are rejected. Stored v1 remains
+   readable only through the explicit compatibility branch; new v1 writes fail.
+   `runtime_service_main` and formal-runtime execution do not count as this gate.
 
 ## Closure Ledger
 
 These statuses close architecture findings only; implementation and production gates remain open.
+Stable IDs are not renamed or reclassified.
 
 | Finding | Status | Frozen evidence |
 |---|---|---|
@@ -545,4 +722,8 @@ These statuses close architecture findings only; implementation and production g
 | C-P1-09 | CLOSED | Fixed systemd pyz and generation venv `-I -S -c` bootstrap with manifest-bound paths, `runpy`, and site escape rejection |
 | C-P2-01 | CLOSED | Hard gates test malicious metadata without provenance claims plus `.pth`, system-site, customization, namespace, crash, backup, and rollback boundaries |
 | C-P2-02 | CLOSED | Versioned profile and cloud gate compare the exact canonical Python/ELF/stdlib/shared-library/ancestor closure and pyz hashes without runtime relaxation |
-| WRAP-P1-07 | CLOSED by design amendment; implementation required | Generation-local zero-argument daily adapter, exact role-to-module and environment grammar policy, fixed root-owned application EnvironmentFile boundary, child authority revalidation, and audit-only commit identity |
+| WRAP-P1-07 | CLOSED by amended design; implementation gated | Generation-local zero-argument daily adapter, exact role-to-module/environment policy, fixed EnvironmentFile boundary, child authority revalidation, and generation-hash producer identity; implementation follows the four ordered WRAP batches |
+| WRAP-DESIGN-P1-01 | CLOSED by final design amendment; implementation required | Exact profile data/log roots and variable mappings, anchored path/type/identity checks, trusted-root separation, mutable-data TCB exclusion, and complete path red-test matrix |
+| WRAP-DESIGN-P1-02 | CLOSED by final design amendment; implementation required | Canonical required/optional scalar rules, exact CSV/recipient/endpoint grammars, pairing constraints, 65536-byte emitted-environment budget, and boundary-plus-one red tests |
+| WRAP-DESIGN-P1-03 | CLOSED by final design amendment; implementation required | Schema-v2 exclusive nonzero-commit/current-generation identity, identity-bound `signal_id`, explicit v1 read compatibility, new-write prohibition, and exact fault/outbox hash gate |
+| WRAP-DESIGN-P1-04 | CLOSED by final design amendment; implementation required | Contract and v2 migration first, artifact/profile/installer planning second, runtime/deploy/adapter third, and Linux/root/cloud gates last, with no legacy substitute evidence |
