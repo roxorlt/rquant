@@ -33,8 +33,9 @@ from rquant.signal_bus import (
     SignalBusSourceDescriptor,
     SignalBusStore,
     SignalRouteReceipt,
+    require_legacy_signal_write,
 )
-from rquant.signal_contracts import SignalEnvelope
+from rquant.signal_contracts import parse_signal_envelope
 
 if TYPE_CHECKING:
     from rquant.runtime_serving_snapshot import SignalDeliveryPayload
@@ -572,6 +573,11 @@ class NotificationStateStore(SignalBusStore):
         observed = normalize_aware_utc(observed_at)
         source = SignalBusSourceDescriptor.model_validate(source)
         records = tuple(SignalBusRoutedRecord.model_validate(record) for record in records)
+        for record in records:
+            require_legacy_signal_write(
+                record.signal,
+                operation="NotificationStateStore.replicate",
+            )
         with self._write_transaction() as connection:
             row = connection.execute(
                 "SELECT * FROM notification_replication_source WHERE singleton = 1"
@@ -763,7 +769,7 @@ class NotificationStateStore(SignalBusStore):
 
             selected: list[tuple[ServingSignalRecord, SignalRouteReceipt]] = []
             for row in reversed(rows):
-                signal = SignalEnvelope.model_validate_json(row["payload_json"])
+                signal = parse_signal_envelope(row["payload_json"])
                 route = SignalRouteReceipt.model_validate_json(row["receipt_json"])
                 received_at = normalize_aware_utc(datetime.fromisoformat(row["received_at"]))
                 if (

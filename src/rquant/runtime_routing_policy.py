@@ -19,7 +19,7 @@ from pydantic import Field, StrictBool, StringConstraints
 
 from rquant.delivery_contracts import DeliveryChannel, DeliveryTarget
 from rquant.runtime_contracts import RuntimeContractModel, normalize_aware_utc
-from rquant.signal_contracts import SignalAction, SignalEnvelope
+from rquant.signal_contracts import SignalAction, SignalEnvelopeFamily
 from rquant.signal_router_runtime import RoutingDecision
 
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
@@ -121,7 +121,7 @@ class FrozenRoutingPolicyResolver:
             _routes=frozen_routes,
         )
 
-    def __call__(self, signal: SignalEnvelope) -> RoutingDecision:
+    def __call__(self, signal: SignalEnvelopeFamily) -> RoutingDecision:
         targets = self._routes.get(
             (signal.strategy_id, signal.strategy_version, signal.action),
             (),

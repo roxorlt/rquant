@@ -6,14 +6,14 @@ import hashlib
 import json
 import secrets
 import sqlite3
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Self
 
-from pydantic import Field, StringConstraints, model_validator
+from pydantic import Field, StringConstraints, field_validator, model_validator
 
 from rquant.delivery_contracts import (
     DeliveryChannel,
@@ -29,13 +29,22 @@ from rquant.runtime_contracts import (
     RuntimeContractModel,
     canonical_sha256,
 )
-from rquant.signal_contracts import SignalEnvelope
+from rquant.signal_contracts import (
+    CurrentSignalEnvelope,
+    SignalEnvelope,
+    SignalEnvelopeFamily,
+    parse_signal_envelope,
+)
 
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 
 
 class SignalBusLeaseError(RuntimeError):
     """A stale or unrelated worker attempted to finish a delivery lease."""
+
+
+class LegacySignalWriteActivationError(TypeError):
+    """A current-family signal reached a legacy-only durable writer."""
 
 
 class SignalRouteConflictError(RuntimeError):
@@ -88,20 +97,45 @@ class SignalBusSourceDescriptor(RuntimeContractModel):
         return self
 
 
+def require_legacy_signal_write(
+    signal: SignalEnvelopeFamily,
+    *,
+    operation: str,
+) -> SignalEnvelope:
+    if isinstance(signal, CurrentSignalEnvelope):
+        raise LegacySignalWriteActivationError(
+            f"{operation} is legacy-only in this reader-only release; "
+            "current-family writes are not activated"
+        )
+    if not isinstance(signal, SignalEnvelope):
+        raise TypeError(f"{operation} requires a SignalEnvelope object")
+    return signal
+
+
 class SignalBusSignalRecord(RuntimeContractModel):
     global_sequence: int = Field(ge=1)
     signal_id: Sha256
     payload_hash: Sha256
     payload_json: str = Field(min_length=1)
-    signal: SignalEnvelope
+    signal: SignalEnvelopeFamily
     received_at: AwareUtcDatetime
+
+    @field_validator("signal", mode="before")
+    @classmethod
+    def dispatch_signal_family(cls, value: object) -> SignalEnvelopeFamily:
+        if isinstance(value, (SignalEnvelope, CurrentSignalEnvelope)):
+            return value
+        if isinstance(value, (Mapping, str, bytes, bytearray)):
+            return parse_signal_envelope(value)
+        raise TypeError("signal must be a stored signal envelope")
 
     @model_validator(mode="after")
     def validate_identity(self) -> Self:
         if self.signal.signal_id != self.signal_id:
             raise ValueError("signal_id does not match signal payload")
-        if _signal_payload(self.signal) != self.payload_json:
-            raise ValueError("payload_json is not the canonical signal payload")
+        stored_signal = parse_signal_envelope(self.payload_json)
+        if type(stored_signal) is not type(self.signal) or stored_signal != self.signal:
+            raise ValueError("signal does not match payload_json")
         if self.payload_hash != self.canonical_payload_hash:
             raise ValueError("payload_hash does not match payload_json")
         return self
@@ -525,6 +559,7 @@ class SignalBusStore:
         *,
         received_at: datetime | None = None,
     ) -> RouterReceipt:
+        require_legacy_signal_write(signal, operation="SignalBusStore.ingest")
         received = _normalize_time(received_at or datetime.now(UTC))
         with self._write_transaction() as connection:
             receipt, changed = self._ingest_in_transaction(
@@ -543,6 +578,7 @@ class SignalBusStore:
         *,
         received_at: datetime,
     ) -> tuple[RouterReceipt, bool]:
+        require_legacy_signal_write(signal, operation="SignalBusStore.ingest")
         signal_id = signal.signal_id
         if signal_id is None:
             raise ValueError("signal_id must be materialized before ingest")
@@ -588,8 +624,6 @@ class SignalBusStore:
                 connection.total_changes > before_changes,
             )
 
-        # Existing ids are handled above so conflicting evidence can be retained.
-        SignalEnvelope.model_validate(signal.model_dump(mode="python"))
         cursor = connection.execute(
             """
             INSERT INTO signal_envelope(
@@ -712,7 +746,7 @@ class SignalBusStore:
                     f"signal sequence gap: expected {expected_sequence}, observed {sequence}"
                 )
             expected_sequence += 1
-            signal = SignalEnvelope.model_validate_json(row["payload_json"])
+            signal = parse_signal_envelope(row["payload_json"])
             received_at = _require_time(row["received_at"])
             if signal.available_at > visible_at or received_at > visible_at:
                 break
@@ -722,7 +756,7 @@ class SignalBusStore:
                     signal_id=row["signal_id"],
                     payload_hash=row["payload_hash"],
                     payload_json=row["payload_json"],
-                    signal=signal.model_dump(mode="json"),
+                    signal=signal,
                     received_at=received_at,
                 )
             )
@@ -812,7 +846,7 @@ class SignalBusStore:
                     f"routed signal sequence gap: expected {expected_sequence}, observed {sequence}"
                 )
             expected_sequence += 1
-            signal = SignalEnvelope.model_validate_json(row["payload_json"])
+            signal = parse_signal_envelope(row["payload_json"])
             records.append(
                 SignalBusRoutedRecord(
                     global_sequence=sequence,
@@ -826,11 +860,11 @@ class SignalBusStore:
             )
         return tuple(records)
 
-    def signal(self, identifier: int | str) -> SignalEnvelope | None:
+    def signal(self, identifier: int | str) -> SignalEnvelopeFamily | None:
         payload = self.signal_payload(identifier)
         if payload is None:
             return None
-        return SignalEnvelope.model_validate_json(payload)
+        return parse_signal_envelope(payload)
 
     def signal_payload(self, identifier: int | str) -> str | None:
         column = "global_sequence" if isinstance(identifier, int) else "signal_id"
@@ -935,7 +969,8 @@ class SignalBusStore:
         ).fetchone()
         if signal_row is None:
             raise KeyError(f"signal {signal_id!r} does not exist")
-        signal = SignalEnvelope.model_validate_json(signal_row["payload_json"])
+        signal = parse_signal_envelope(signal_row["payload_json"])
+        require_legacy_signal_write(signal, operation="SignalBusStore.route")
         if routed_at < signal.available_at:
             raise ValueError("signal cannot be routed before available_at")
         expired = routed_at >= signal.expires_at
@@ -1145,6 +1180,7 @@ class SignalBusStore:
         targets: Iterable[DeliveryTarget],
         routed_at: datetime,
     ) -> SignalRouteCommitResult:
+        require_legacy_signal_write(signal, operation="SignalBusStore.commit_source_route")
         request = _SourceRouteCommitRequest(
             descriptor=descriptor,
             routing_policy_fingerprint=routing_policy_fingerprint,

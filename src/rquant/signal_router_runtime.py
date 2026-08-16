@@ -8,7 +8,7 @@ import os
 import sqlite3
 import stat
 import time as monotonic_time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import date, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -34,9 +34,14 @@ from rquant.signal_bus import (
     SignalRouteCursor,
     SignalRouteSequenceError,
     canonical_delivery_targets,
+    require_legacy_signal_write,
     routing_decision_fingerprint,
 )
-from rquant.signal_contracts import SignalEnvelope
+from rquant.signal_contracts import (
+    CurrentSignalEnvelope,
+    SignalEnvelopeFamily,
+    parse_signal_envelope,
+)
 from rquant.strategy_runner import (
     RunnerSignalRecord,
     RunnerSignalRouteDrainEvidence,
@@ -98,10 +103,21 @@ def _preflight_json_text(raw: bytes, *, label: str, maximum_bytes: int) -> str:
     return text
 
 
+def _reject_duplicate_signal_json_keys(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    decoded: dict[str, object] = {}
+    for key, value in pairs:
+        if key in decoded:
+            raise ValueError(f"runner signal payload contains duplicate JSON key: {key}")
+        decoded[key] = value
+    return decoded
+
+
 def _bounded_json_loads(raw: bytes, *, label: str, maximum_bytes: int) -> object:
     text = _preflight_json_text(raw, label=label, maximum_bytes=maximum_bytes)
     try:
-        decoded = json.loads(text)
+        decoded = json.loads(text, object_pairs_hook=_reject_duplicate_signal_json_keys)
     except (TypeError, ValueError, RecursionError) as exc:
         raise ValueError(f"{label} is invalid") from exc
     stack = [decoded]
@@ -194,11 +210,21 @@ class SourceSnapshot(RuntimeContractModel):
     descriptor: RouteSourceDescriptor
 
 
+class CurrentRunnerSignalRecord(RuntimeContractModel):
+    """Reader-only runner record for a current-family stored envelope."""
+
+    sequence: int = Field(ge=1)
+    signal: CurrentSignalEnvelope
+
+
+RouterSignalRecord = RunnerSignalRecord | CurrentRunnerSignalRecord
+
+
 class RunnerSignalBatch(RuntimeContractModel):
     snapshot: SourceSnapshot
     after_sequence: StrictInt = Field(ge=0)
     limit: StrictInt = Field(ge=0)
-    records: tuple[RunnerSignalRecord, ...]
+    records: tuple[RouterSignalRecord, ...]
 
     @model_validator(mode="after")
     def validate_bounds(self) -> Self:
@@ -1037,7 +1063,7 @@ def _query_signal_records(
     high_watermark: int,
     limit: int,
     budget: _RunnerReadBudget,
-) -> tuple[RunnerSignalRecord, ...]:
+) -> tuple[RouterSignalRecord, ...]:
     preflight = connection.execute(
         """
         WITH bounded AS (
@@ -1072,7 +1098,7 @@ def _query_signal_records(
         """,
         (after_sequence, high_watermark, limit),
     )
-    records: list[RunnerSignalRecord] = []
+    records: list[RouterSignalRecord] = []
     consumed = 0
     while True:
         rows = cursor.fetchmany(budget.fetch_size)
@@ -1095,28 +1121,23 @@ def _query_signal_records(
                 maximum_bytes=budget.max_record_bytes,
             )
             try:
-                record = RunnerSignalRecord(
-                    sequence=int(row["sequence"]),
-                    signal=decoded,
+                if not isinstance(decoded, Mapping):
+                    raise TypeError("runner signal payload must be a JSON object")
+                signal = parse_signal_envelope(decoded)
+                record = (
+                    CurrentRunnerSignalRecord(sequence=int(row["sequence"]), signal=signal)
+                    if isinstance(signal, CurrentSignalEnvelope)
+                    else RunnerSignalRecord(sequence=int(row["sequence"]), signal=signal)
                 )
             except (TypeError, ValueError, RecursionError) as exc:
                 raise ValueError("runner signal payload is invalid") from exc
-            canonical = json.dumps(
-                record.signal.model_dump(mode="json"),
-                ensure_ascii=True,
-                allow_nan=False,
-                separators=(",", ":"),
-                sort_keys=True,
-            ).encode("utf-8")
-            if raw != canonical:
-                raise ValueError("runner signal payload is not canonical")
             records.append(record)
     if len(records) != record_count or consumed != raw_bytes:
         raise ValueError("runner signal batch changed after its budget preflight")
     return tuple(records)
 
 
-TargetResolver = Callable[[SignalEnvelope], RoutingDecision]
+TargetResolver = Callable[[SignalEnvelopeFamily], RoutingDecision]
 
 
 class SignalRouteSummary(RuntimeContractModel):
@@ -1213,6 +1234,11 @@ def route_runner_signals(
     if descriptor.source_id != request.source_id:
         raise SignalRouteConflictError(
             "requested source_id does not match the frozen source descriptor"
+        )
+    for record in batch.records:
+        require_legacy_signal_write(
+            record.signal,
+            operation="route_runner_signals",
         )
     cursor = bus.bind_route_source(
         descriptor,

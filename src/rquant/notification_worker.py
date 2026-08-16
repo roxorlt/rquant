@@ -7,12 +7,17 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Annotated, Protocol, Self
 
-from pydantic import Field, StringConstraints, model_validator
+from pydantic import Field, StringConstraints, field_validator, model_validator
 
 from rquant.delivery_contracts import DeliveryChannel, OutboxRecord, OutboxStatus
 from rquant.runtime_contracts import AwareUtcDatetime, RuntimeContractModel
 from rquant.signal_bus import SignalBusStore
-from rquant.signal_contracts import SignalEnvelope
+from rquant.signal_contracts import (
+    CurrentSignalEnvelope,
+    SignalEnvelope,
+    SignalEnvelopeFamily,
+    parse_signal_envelope,
+)
 
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 
@@ -40,9 +45,18 @@ class NotificationItemOutcome(StrEnum):
 
 
 class NotificationDelivery(RuntimeContractModel):
-    signal: SignalEnvelope
+    signal: SignalEnvelopeFamily
     record: OutboxRecord
     deadline: AwareUtcDatetime
+
+    @field_validator("signal", mode="before")
+    @classmethod
+    def dispatch_signal_family(cls, value: object) -> SignalEnvelopeFamily:
+        if isinstance(value, (SignalEnvelope, CurrentSignalEnvelope)):
+            return value
+        if isinstance(value, (Mapping, str, bytes, bytearray)):
+            return parse_signal_envelope(value)
+        raise TypeError("signal must be a stored signal envelope")
 
     @model_validator(mode="after")
     def validate_delivery(self) -> Self:

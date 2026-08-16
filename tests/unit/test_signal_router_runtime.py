@@ -583,10 +583,10 @@ def test_readonly_runner_batch_decodes_only_limit_rows_from_large_backlog(
     real_loads = json.loads
     decoded = 0
 
-    def counting_loads(value: str) -> object:
+    def counting_loads(value: str | bytes, **kwargs: object) -> object:
         nonlocal decoded
         decoded += 1
-        return real_loads(value)
+        return real_loads(value, **kwargs)
 
     monkeypatch.setattr("rquant.signal_router_runtime.json.loads", counting_loads)
 

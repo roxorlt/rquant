@@ -21,7 +21,7 @@ from rquant.notification_worker import (
 )
 from rquant.notify.client import PushDeerClient, PushPlusClient
 from rquant.runtime_contracts import RuntimeContractModel, canonical_sha256
-from rquant.signal_contracts import SignalAction, SignalEnvelope
+from rquant.signal_contracts import SignalAction, SignalEnvelopeFamily
 
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _ACTION_LABELS = {
@@ -286,12 +286,20 @@ def _format_shanghai(value: datetime) -> str:
     return f"{localized:%Y-%m-%d %H:%M:%S} {offset[:3]}:{offset[3:]}"
 
 
-def format_signal_notification(signal: SignalEnvelope) -> tuple[str, str]:
+def _notification_json_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {key: _notification_json_value(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_notification_json_value(item) for item in value]
+    return value
+
+
+def format_signal_notification(signal: SignalEnvelopeFamily) -> tuple[str, str]:
     """Render a stable, readable Markdown representation of a strategy signal."""
 
     action_label = _ACTION_LABELS[signal.action]
     title = f"[rQuant] {signal.candidate_id} {action_label}"
-    evidence = signal.model_dump(mode="json")["evidence"]
+    evidence = _notification_json_value(signal.evidence)
     evidence_json = json.dumps(
         evidence,
         ensure_ascii=False,
