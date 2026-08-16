@@ -14,7 +14,7 @@ from datetime import UTC, date, datetime
 from enum import Enum
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from types import FunctionType, MethodType, ModuleType, SimpleNamespace
+from types import FunctionType, GetSetDescriptorType, MethodType, ModuleType, SimpleNamespace
 from typing import get_args
 
 import pytest
@@ -135,6 +135,20 @@ def _sqlite_snapshot(path: Path) -> tuple[object, ...]:
                 (snapshot_root / name).write_bytes(payload)
         rows = _database_snapshot(snapshot_path)
     return (rows, database_bytes)
+
+
+def _prime_sqlite_readonly_sidecars(path: Path) -> None:
+    gc.collect()
+    connection = sqlite3.connect(
+        f"file:{path}?mode=ro",
+        uri=True,
+        isolation_level=None,
+    )
+    try:
+        connection.execute("PRAGMA query_only = ON")
+        connection.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+    finally:
+        connection.close()
 
 
 def _source_descriptor() -> RouteSourceDescriptor:
@@ -317,6 +331,7 @@ def test_signal_bus_route_rejects_stored_current_before_outbox_mutation(tmp_path
         (("current", CurrentSignalEnvelope, current.signal_id, CURRENT_LITERAL),),
         routed=False,
     )
+    _prime_sqlite_readonly_sidecars(path)
     before = _sqlite_snapshot(path)
 
     with pytest.raises(LegacySignalWriteActivationError, match="legacy-only"):
@@ -341,6 +356,7 @@ def test_signal_bus_route_empty_targets_rejects_stored_current_before_database_m
         (("current", CurrentSignalEnvelope, current.signal_id, CURRENT_LITERAL),),
         routed=False,
     )
+    _prime_sqlite_readonly_sidecars(path)
     before = _sqlite_snapshot(path)
 
     with pytest.raises(LegacySignalWriteActivationError, match="legacy-only"):
@@ -425,6 +441,65 @@ def test_route_readonly_preflight_observes_uncheckpointed_wal_rows_for_both_fami
     assert store.outbox_records() == ()
 
 
+def test_route_empty_target_preflight_sees_wal_committed_during_readonly_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "route-wal-open-race.sqlite3"
+    store = _store(path)
+    current = _current_signal()
+    legacy = parse_signal_envelope(LEGACY_LITERAL)
+    assert current.signal_id is not None
+    assert type(legacy) is SignalEnvelope
+    _insert_literal_signal_rows(
+        path,
+        (("legacy", SignalEnvelope, legacy.signal_id, LEGACY_LITERAL),),
+        routed=False,
+    )
+    gc.collect()
+    assert not path.with_name(f"{path.name}-wal").exists()
+
+    original_connect = store._connect_readonly
+    open_options: list[dict[str, object]] = []
+    writers: list[sqlite3.Connection] = []
+
+    def commit_current_before_open(**options: object) -> sqlite3.Connection:
+        open_options.append(options)
+        if not writers:
+            writer = sqlite3.connect(path, isolation_level=None)
+            writer.execute("PRAGMA wal_autocheckpoint = 0")
+            writer.execute("BEGIN IMMEDIATE")
+            writer.execute(
+                """
+                INSERT INTO signal_envelope(
+                    global_sequence, signal_id, payload_hash, payload_json, received_at
+                ) VALUES (2, ?, ?, ?, ?)
+                """,
+                (
+                    current.signal_id,
+                    hashlib.sha256(CURRENT_LITERAL).hexdigest(),
+                    CURRENT_LITERAL.decode("utf-8"),
+                    NOW.isoformat().replace("+00:00", "Z"),
+                ),
+            )
+            writer.execute("COMMIT")
+            writers.append(writer)
+            assert path.with_name(f"{path.name}-wal").stat().st_size > 0
+        return original_connect(**options)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(store, "_connect_readonly", commit_current_before_open)
+    try:
+        with pytest.raises(LegacySignalWriteActivationError, match="legacy-only"):
+            store.route(current.signal_id, (), now=NOW)
+        assert store.route(legacy.signal_id, (), now=NOW) == ()
+        assert open_options == [{}, {}]
+    finally:
+        for writer in writers:
+            writer.close()
+
+    assert store.outbox_records() == ()
+
+
 def test_route_transaction_rechecks_current_row_committed_after_readonly_preflight(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -473,6 +548,7 @@ def test_route_runner_preflights_full_batch_before_bus_cursor_or_source_binding(
                 records=({"sequence": 1, "signal": current},),
             )
 
+    _prime_sqlite_readonly_sidecars(bus_path)
     before_bus = _sqlite_snapshot(bus_path)
     before_tree = _tree_snapshot(tmp_path)
     with pytest.raises(LegacySignalWriteActivationError, match="legacy-only"):
@@ -766,36 +842,57 @@ def test_ast_inspection_retains_original_import_names_and_aliases() -> None:
     } <= _ast_identifiers(tree)
 
 
+_STATIC_MISSING = object()
+
+
+def _is_project_module(value: object) -> bool:
+    if type(value) is not ModuleType:
+        return False
+    name = vars(value).get("__name__")
+    return name == "rquant" or (type(name) is str and name.startswith("rquant."))
+
+
+def _static_instance_attributes(value: object) -> Mapping[str, object]:
+    attributes = inspect.getattr_static(value, "__dict__", None)
+    if type(attributes) is dict:
+        return attributes
+    if type(attributes) is GetSetDescriptorType:
+        direct = object.__getattribute__(value, "__dict__")
+        return direct if type(direct) is dict else {}
+    return {}
+
+
 def _children(value: object) -> Iterator[tuple[str, object]]:
-    if isinstance(value, ModuleType):
-        if value.__name__ != "rquant" and not value.__name__.startswith("rquant."):
+    value_type = type(value)
+    if value_type is ModuleType:
+        if not _is_project_module(value):
             return
         for key, item in vars(value).items():
             if key.startswith("__"):
                 continue
-            if isinstance(item, ModuleType):
-                if item.__name__ == "rquant" or item.__name__.startswith("rquant."):
+            if type(item) is ModuleType:
+                if _is_project_module(item):
                     yield f"module.{key}", item
                 continue
-            owner = getattr(item, "__module__", None)
-            type_owner = getattr(type(item), "__module__", None)
+            owner = inspect.getattr_static(item, "__module__", None)
+            type_owner = vars(type(item)).get("__module__")
             if (
-                isinstance(item, (Mapping, tuple, list, set, frozenset, functools.partial))
+                type(item) in (dict, tuple, list, set, frozenset, functools.partial)
                 or owner == "rquant"
-                or (isinstance(owner, str) and owner.startswith("rquant."))
+                or (type(owner) is str and owner.startswith("rquant."))
                 or type_owner == "rquant"
-                or (isinstance(type_owner, str) and type_owner.startswith("rquant."))
+                or (type(type_owner) is str and type_owner.startswith("rquant."))
             ):
                 yield f"module.{key}", item
         return
-    if isinstance(value, functools.partial):
+    if value_type is functools.partial:
         yield "partial.func", value.func
         yield from ((f"partial.arg[{index}]", item) for index, item in enumerate(value.args))
         yield from ((f"partial.kwarg.{key}", item) for key, item in (value.keywords or {}).items())
-    if isinstance(value, MethodType):
+    if value_type is MethodType:
         yield "method.func", value.__func__
         yield "method.self", value.__self__
-    if isinstance(value, FunctionType):
+    if value_type is FunctionType:
         yield from (
             (f"default[{index}]", item) for index, item in enumerate(value.__defaults__ or ())
         )
@@ -811,18 +908,15 @@ def _children(value: object) -> Iterator[tuple[str, object]]:
         for name in dict.fromkeys(value.__code__.co_names):
             if name in value.__globals__:
                 yield f"global.{name}", value.__globals__[name]
-    if isinstance(value, Mapping):
+    if value_type is dict:
         for key, item in value.items():
             yield f"mapping-key[{key!r}]", key
             yield f"mapping-value[{key!r}]", item
-    elif isinstance(value, (tuple, list, set, frozenset)):
+    elif value_type in (tuple, list, set, frozenset):
         yield from ((f"item[{index}]", item) for index, item in enumerate(value))
-    attributes = getattr(value, "__dict__", None)
-    if isinstance(attributes, dict):
-        yield from ((f"attribute.{key}", item) for key, item in attributes.items())
-    for slot in getattr(type(value), "__slots__", ()):
-        if isinstance(slot, str) and hasattr(value, slot):
-            yield f"slot.{slot}", getattr(value, slot)
+    yield from (
+        (f"attribute.{key}", item) for key, item in _static_instance_attributes(value).items()
+    )
 
 
 _MAX_REACHABILITY_NODES = 10_000
@@ -851,7 +945,8 @@ def _walk_reachable(
             raise AssertionError("reachability node limit exceeded")
         seen.add(identity)
         yield path, value
-        if value is None or isinstance(value, atomic + (type,)):
+        value_type = type(value)
+        if value is None or issubclass(value_type, atomic) or issubclass(value_type, type):
             continue
         children: list[tuple[str, object]] = []
         for label, child in _children(value):
@@ -877,16 +972,21 @@ _CURRENT_PERSISTENCE_INPUT_TYPES = (
     spool.CurrentSignalBusRoutedRecord,
     spool.CurrentSignalRouteSpoolRecord,
 )
-_DURABLE_PUBLICATION_RESULT_TYPES = (
-    spool.CurrentSignalRouteSpoolRecord,
-    spool.SignalRouteSpoolPointer,
-    spool.SignalRouteSpoolPublishSummary,
-)
-_DURABLE_SPOOL_OPERATIONS = (
+_FORBIDDEN_DURABLE_IDENTITIES = (
     spool._atomic_replace_at,
     spool._immutable_write_at,
     spool._write_all,
     spool._write_temporary_at,
+    spool.SignalRouteSpool.publish,
+    spool.publish_signal_bus_prefix,
+    signal_bus.SignalBusStore.ingest,
+    signal_bus.SignalBusStore.route,
+    signal_bus.SignalBusStore.commit_source_route,
+    DailyNotificationProducer.emit,
+    NotificationStateStore.replicate,
+    PaperSignalQueueStore.ingest,
+    ServingSourceAuthorityPublisher.publish,
+    strategy_runner.StrategyRunnerStore.process_batch,
 )
 
 
@@ -900,9 +1000,9 @@ def _resolve_annotation_attribute(node: ast.AST, namespace: Mapping[str, object]
     if not isinstance(node, ast.Attribute):
         return None
     parent = _resolve_annotation_attribute(node.value, namespace)
-    if isinstance(parent, ModuleType):
+    if type(parent) is ModuleType:
         return vars(parent).get(node.attr)
-    if isinstance(parent, type):
+    if issubclass(type(parent), type):
         return vars(parent).get(node.attr)
     return None
 
@@ -913,7 +1013,7 @@ def _annotation_identities(
 ) -> tuple[object, ...]:
     if annotation is inspect.Signature.empty:
         return ()
-    if isinstance(annotation, str):
+    if type(annotation) is str:
         try:
             expression = ast.parse(annotation, mode="eval")
         except SyntaxError:
@@ -934,78 +1034,142 @@ def _annotation_identities(
     return (annotation, *nested)
 
 
-def _callable_functions(value: object) -> Iterator[FunctionType]:
-    if isinstance(value, functools.partial):
+def _callable_functions(value: object) -> Iterator[tuple[FunctionType, object | None]]:
+    value_type = type(value)
+    if value_type is functools.partial:
         yield from _callable_functions(value.func)
         return
-    if isinstance(value, MethodType):
-        yield value.__func__
+    if value_type is MethodType:
+        yield value.__func__, value.__self__
         return
-    if isinstance(value, FunctionType):
-        yield value
+    if value_type is FunctionType:
+        yield value, None
         return
-    if isinstance(value, type):
-        attributes = vars(value)
+    if issubclass(value_type, type):
+        owners = type.__getattribute__(value, "__mro__")
+        instance_receiver = value
+        class_receiver = value
     else:
-        attributes = vars(type(value)) if callable(value) else {}
-    for item in attributes.values():
-        if isinstance(item, (classmethod, staticmethod)):
-            item = item.__func__
-        if isinstance(item, FunctionType):
-            yield item
+        owners = type.__getattribute__(value_type, "__mro__")
+        instance_receiver = value
+        class_receiver = value_type
+    seen: set[int] = set()
+    for owner in owners:
+        for item in vars(owner).values():
+            receiver: object | None = instance_receiver
+            if type(item) is classmethod:
+                item = item.__func__
+                receiver = class_receiver
+            elif type(item) is staticmethod:
+                item = item.__func__
+                receiver = None
+            if type(item) is FunctionType and id(item) not in seen:
+                seen.add(id(item))
+                yield item, receiver
 
 
-def _function_references(function: FunctionType) -> tuple[object, ...]:
-    referenced: list[object] = []
-    for item in (
-        *(function.__defaults__ or ()),
-        *(function.__kwdefaults__ or {}).values(),
-    ):
-        if not _same_as_any(item, tuple(referenced)):
-            referenced.append(item)
+_MAX_STATIC_CAPABILITY_NODES = 512
+_MAX_STATIC_CAPABILITY_DEPTH = 16
+
+
+def _is_descriptor(value: object) -> bool:
+    value_type = type(value)
+    return any("__get__" in vars(owner) for owner in type.__getattribute__(value_type, "__mro__"))
+
+
+def _static_attribute(value: object, name: str) -> object:
+    try:
+        return inspect.getattr_static(value, name, _STATIC_MISSING)
+    except (AttributeError, TypeError) as exc:
+        raise AssertionError("static capability attribute inspection failed") from exc
+
+
+def _function_reference_seeds(
+    function: FunctionType,
+    receiver: object | None,
+) -> tuple[object, ...]:
+    seeds: list[object] = []
+    if receiver is not None:
+        seeds.append(receiver)
+    seeds.extend(function.__defaults__ or ())
+    seeds.extend((function.__kwdefaults__ or {}).values())
     for cell in function.__closure__ or ():
         try:
-            item = cell.cell_contents
+            seeds.append(cell.cell_contents)
         except ValueError:
             continue
-        if not _same_as_any(item, tuple(referenced)):
-            referenced.append(item)
     for name in dict.fromkeys(function.__code__.co_names):
         if name in function.__globals__:
-            item = function.__globals__[name]
-            if not _same_as_any(item, tuple(referenced)):
-                referenced.append(item)
-    modules = tuple(item for item in referenced if isinstance(item, ModuleType))
-    for module in modules:
-        attributes = vars(module)
-        for name in dict.fromkeys(function.__code__.co_names):
-            item = attributes.get(name)
-            if item is not None and not _same_as_any(item, tuple(referenced)):
-                referenced.append(item)
-    return tuple(referenced)
+            seeds.append(function.__globals__[name])
+    return tuple(seeds)
+
+
+def _static_reference_identities(
+    function: FunctionType,
+    receiver: object | None,
+) -> Iterator[object]:
+    attribute_names = tuple(dict.fromkeys(function.__code__.co_names))
+    pending = [
+        (item, 0, _is_descriptor(item)) for item in _function_reference_seeds(function, receiver)
+    ]
+    seen: set[int] = set()
+    while pending:
+        value, depth, expand_all = pending.pop()
+        identity = id(value)
+        if identity in seen:
+            continue
+        if len(seen) >= _MAX_STATIC_CAPABILITY_NODES:
+            raise AssertionError("static capability node limit exceeded")
+        seen.add(identity)
+        yield value
+        children: list[object] = []
+        value_type = type(value)
+        if value_type is MethodType:
+            children.extend((value.__func__, value.__self__))
+        elif value_type in (classmethod, staticmethod):
+            children.append(value.__func__)
+        elif value_type is functools.partial:
+            children.extend((value.func, *value.args))
+            children.extend((value.keywords or {}).values())
+        elif value_type is dict:
+            children.extend(value.keys())
+            children.extend(value.values())
+        elif value_type in (tuple, list, set, frozenset):
+            children.extend(value)
+        elif value_type is ModuleType:
+            if _is_project_module(value):
+                attributes = vars(value)
+                children.extend(attributes[name] for name in attribute_names if name in attributes)
+        else:
+            for name in attribute_names:
+                item = _static_attribute(value, name)
+                if item is not _STATIC_MISSING:
+                    children.append(item)
+            if expand_all:
+                children.extend(_static_instance_attributes(value).values())
+        if children and depth >= _MAX_STATIC_CAPABILITY_DEPTH:
+            raise AssertionError("static capability depth limit exceeded")
+        pending.extend((item, depth + 1, _is_descriptor(item)) for item in children)
 
 
 def _exposes_durable_current_persistence(value: object) -> bool:
-    for function in _callable_functions(value):
+    for function, receiver in _callable_functions(value):
         signature = inspect.signature(function, eval_str=False)
         inputs = tuple(
             identity
             for parameter in signature.parameters.values()
             for identity in _annotation_identities(parameter.annotation, function.__globals__)
         )
-        results = _annotation_identities(signature.return_annotation, function.__globals__)
-        references = _function_references(function)
         current_input = any(
-            _same_as_any(identity, _CURRENT_PERSISTENCE_INPUT_TYPES)
-            for identity in (*inputs, *references)
+            _same_as_any(identity, _CURRENT_PERSISTENCE_INPUT_TYPES) for identity in inputs
         )
-        durable_output = any(
-            _same_as_any(identity, _DURABLE_PUBLICATION_RESULT_TYPES) for identity in results
+        if not current_input:
+            continue
+        durable_sink = _same_as_any(function, _FORBIDDEN_DURABLE_IDENTITIES) or any(
+            _same_as_any(identity, _FORBIDDEN_DURABLE_IDENTITIES)
+            for identity in _static_reference_identities(function, receiver)
         )
-        durable_operation = any(
-            _same_as_any(identity, _DURABLE_SPOOL_OPERATIONS) for identity in references
-        )
-        if current_input and (durable_output or durable_operation):
+        if durable_sink:
             return True
     return False
 
@@ -1019,11 +1183,14 @@ def _forbidden_reachable(path: str, value: object) -> str | None:
 
 
 class SignalRouteSpoolV3Writer:
+    def __init__(self) -> None:
+        self.sink = spool._immutable_write_at
+
     def __call__(
         self,
         record: spool.CurrentSignalRouteSpoolRecord,
-    ) -> spool.SignalRouteSpoolPointer:
-        raise AssertionError(f"synthetic writer must never run: {record.record_hash}")
+    ) -> None:
+        raise AssertionError(f"synthetic writer must never run: {self.sink} {record.record_hash}")
 
 
 _SYNTHETIC_V3_WRITER = SignalRouteSpoolV3Writer()
@@ -1049,16 +1216,17 @@ def test_reachability_walk_follows_referenced_callback_globals() -> None:
 
 
 def test_reachability_detects_renamed_callable_behind_project_module_indirection() -> None:
-    durable_operation = spool._immutable_write_at
     synthetic_module = ModuleType("rquant.synthetic_reachability_fixture")
+    synthetic_module.operation = spool.SignalRouteSpool.publish
 
     class DurableSpoolPublisher:
         def __call__(
             self,
             record: spool.CurrentSignalRouteSpoolRecord,
-        ) -> spool.SignalRouteSpoolPointer:
+        ) -> None:
             raise AssertionError(
-                f"synthetic writer must never run: {durable_operation} {record.record_hash}"
+                f"synthetic writer must never run: "
+                f"{synthetic_module.operation} {record.record_hash}"
             )
 
     DurableSpoolPublisher.__name__ = "Opaque"
@@ -1078,6 +1246,70 @@ def test_reachability_detects_renamed_callable_behind_project_module_indirection
     assert violations == [
         "synthetic.callback.closure[0].module.alias: durable current-family persistence capability"
     ]
+
+
+def test_reachability_composes_current_input_with_receiver_sink_identity() -> None:
+    class Unit:
+        def __init__(self) -> None:
+            self.sink = spool._immutable_write_at
+
+        def __call__(self, record: spool.CurrentSignalRouteSpoolRecord) -> None:
+            raise AssertionError(f"synthetic writer must never run: {self.sink} {record}")
+
+    violations = [
+        violation
+        for path, value in _walk_reachable({"synthetic.unit": Unit()})
+        if (violation := _forbidden_reachable(path, value)) is not None
+    ]
+
+    assert violations == ["synthetic.unit: durable current-family persistence capability"]
+
+
+def test_reachability_ignores_arbitrary_alias_names_for_production_writer_identity() -> None:
+    class Q:
+        def __init__(self) -> None:
+            self.z = spool.publish_signal_bus_prefix
+
+        def __call__(self, record: spool.CurrentSignalRouteSpoolRecord) -> None:
+            raise AssertionError(f"synthetic writer must never run: {self.z} {record}")
+
+    violations = [
+        violation
+        for path, value in _walk_reachable({"synthetic.value": Q()})
+        if (violation := _forbidden_reachable(path, value)) is not None
+    ]
+
+    assert violations == ["synthetic.value: durable current-family persistence capability"]
+
+
+def test_reachability_never_executes_hostile_attribute_or_descriptor() -> None:
+    descriptor_calls: list[str] = []
+
+    class Trap:
+        def __init__(self) -> None:
+            self.target = spool._atomic_replace_at
+
+        def __get__(self, _instance: object, _owner: type[object]) -> object:
+            descriptor_calls.append("descriptor")
+            raise AssertionError("descriptor execution is forbidden")
+
+    class Unit:
+        sink = Trap()
+
+        def __getattribute__(self, _name: str) -> object:
+            raise AssertionError("runtime attribute access is forbidden")
+
+        def __call__(self, record: spool.CurrentSignalRouteSpoolRecord) -> None:
+            raise AssertionError(f"synthetic writer must never run: {self.sink} {record}")
+
+    violations = [
+        violation
+        for path, value in _walk_reachable({"synthetic.hostile": Unit()})
+        if (violation := _forbidden_reachable(path, value)) is not None
+    ]
+
+    assert violations == ["synthetic.hostile: durable current-family persistence capability"]
+    assert descriptor_calls == []
 
 
 def test_reachability_walk_is_cycle_safe_and_fails_closed_at_bounds() -> None:

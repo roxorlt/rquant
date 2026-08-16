@@ -404,10 +404,9 @@ class SignalBusStore:
             raise
         return connection
 
-    def _connect_readonly(self, *, immutable: bool = False) -> sqlite3.Connection:
-        options = "mode=ro&immutable=1" if immutable else "mode=ro"
+    def _connect_readonly(self) -> sqlite3.Connection:
         connection = sqlite3.connect(
-            f"file:{self.path}?{options}",
+            f"file:{self.path}?mode=ro",
             uri=True,
             timeout=self.busy_timeout_ms / 1_000,
             isolation_level=None,
@@ -423,12 +422,7 @@ class SignalBusStore:
 
     @contextmanager
     def _read_snapshot(self) -> Iterator[sqlite3.Connection]:
-        wal_path = self.path.with_name(f"{self.path.name}-wal")
-        try:
-            wal_has_frames = wal_path.stat().st_size > 0
-        except FileNotFoundError:
-            wal_has_frames = False
-        connection = self._connect_readonly(immutable=not wal_has_frames)
+        connection = self._connect_readonly()
         try:
             connection.execute("BEGIN")
             yield connection
