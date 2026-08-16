@@ -289,10 +289,6 @@ def _checkout(
     shutil.copy2(STRICT_JSON, scripts / STRICT_JSON.name)
     shutil.copy2(AUTHORITY, package / AUTHORITY.name)
     shutil.copy2(
-        ROOT / "src" / "rquant" / "interpreter_trust.py",
-        package / "interpreter_trust.py",
-    )
-    shutil.copy2(
         ROOT / "src" / "rquant" / "contained_subprocess.py",
         package / "contained_subprocess.py",
     )
@@ -4943,54 +4939,6 @@ def test_bootstrap_frozen_sync_timeout_terminates_uv_process_group(tmp_path: Pat
     assert not marker.exists()
 
 
-def test_bootstrap_frozen_sync_uses_bound_uv_descriptor(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    module = _bootstrap_module()
-    uv = tmp_path / "uv"
-    uv.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    uv.chmod(0o700)
-    launches: list[tuple[str, ...]] = []
-
-    class Binding:
-        def launch(
-            self,
-            _runner: object,
-            arguments: tuple[str, ...],
-            **_kwargs: object,
-        ) -> subprocess.CompletedProcess[str]:
-            launches.append(arguments)
-            return subprocess.CompletedProcess(arguments, 0, "", "")
-
-    monkeypatch.setattr(
-        module,
-        "_run_process_group",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("bound uv sync must not launch by path")
-        ),
-    )
-
-    module._run_frozen_sync(
-        tmp_path,
-        uv,
-        executable_binding=Binding(),
-    )
-
-    assert launches == [(str(uv), "sync", "--frozen")]
-
-    class RejectingBinding:
-        def launch(self, *_args: object, **_kwargs: object) -> object:
-            raise RuntimeError("descriptor execution is unavailable")
-
-    with pytest.raises(module.DeployBootstrapError, match="could not run"):
-        module._run_frozen_sync(
-            tmp_path,
-            uv,
-            executable_binding=RejectingBinding(),
-        )
-
-
 def test_bootstrap_runner_timeout_contains_detached_grandchild(tmp_path: Path) -> None:
     module = _bootstrap_module()
     marker = tmp_path / "detached-grandchild-survived"
@@ -6629,18 +6577,3 @@ def test_dirty_release_authority_is_rejected_before_project_import(tmp_path: Pat
     assert "Traceback" not in result.stderr
     assert not imported.exists()
     assert not ran.exists()
-
-
-def test_bootstrap_binds_interpreter_before_loading_project_runner() -> None:
-    source = BOOTSTRAP.read_text(encoding="utf-8")
-
-    assert source.index("def _bind_bootstrap_interpreter") < source.index(
-        "def _load_contained_runner"
-    )
-    assert "run_contained = _load_contained_runner()" not in source
-    assert source.index("interpreter_binding = _bind_bootstrap_interpreter") < source.index(
-        "uv_path, _uv_binding = _resolve_uv_path"
-    )
-    assert 'if args.host_platform == "linux":' in source
-    assert "interpreter_binding=interpreter_binding" in source
-    assert "uv_launch_binding=uv_launch_binding" in source

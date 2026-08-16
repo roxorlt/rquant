@@ -68,42 +68,6 @@ def _load_strict_json() -> tuple[
 ) = _load_strict_json()
 
 
-def _bind_bootstrap_interpreter(
-    path: Path,
-    *,
-    profile: str = "production-deploy-bootstrap",
-    label: str = "deployment Python",
-) -> object:
-    """Bind the shell-preselected venv target before importing project code."""
-
-    trust_path = Path(__file__).resolve().parents[1] / "src" / "rquant" / "interpreter_trust.py"
-    spec = importlib.util.spec_from_file_location("_rquant_bootstrap_interpreter_trust", trust_path)
-    if spec is None or spec.loader is None:
-        raise DeployBootstrapError("interpreter trust authority cannot be loaded")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    try:
-        canonical = path.resolve(strict=True)
-        observed = canonical.lstat()
-    except OSError as exc:
-        raise DeployBootstrapError(f"{label} is unavailable") from exc
-    policy = module.InterpreterTrustPolicy(
-        profile=profile,
-        canonical_interpreter=canonical,
-        trusted_anchor=canonical.parent,
-        owner_uid=observed.st_uid,
-        allowed_mode=stat.S_IMODE(observed.st_mode),
-        sha256=hashlib.sha256(canonical.read_bytes()).hexdigest(),
-    )
-    try:
-        binding = module.bind_interpreter(policy)
-        binding.attest()
-        return binding
-    except module.InterpreterTrustError as exc:
-        raise DeployBootstrapError(f"{label} trust binding failed") from exc
-
-
 def _load_contained_runner() -> Callable[..., subprocess.CompletedProcess[object]]:
     path = Path(__file__).resolve().parents[1] / "src" / "rquant" / "contained_subprocess.py"
     spec = importlib.util.spec_from_file_location("_rquant_bootstrap_contained_process", path)
@@ -115,10 +79,7 @@ def _load_contained_runner() -> Callable[..., subprocess.CompletedProcess[object
     return module.run_contained
 
 
-def run_contained(*args: object, **kwargs: object) -> subprocess.CompletedProcess[object]:
-    """Load the project runner only after the bootstrap interpreter is bound."""
-
-    return _load_contained_runner()(*args, **kwargs)
+run_contained = _load_contained_runner()
 
 
 TARGET_PATTERN = re.compile(r"(?:v\d+\.\d+\.\d+|[0-9a-f]{40})")
@@ -3549,7 +3510,6 @@ def _verify_generation_runtime(
     root: Path,
     python_path: Path,
     *,
-    interpreter_binding: object | None = None,
     overall_deadline_monotonic: float | None = None,
 ) -> None:
     venv = root / ".venv"
@@ -3564,33 +3524,29 @@ def _verify_generation_runtime(
             raise DeployBootstrapError("deployment overall timeout expired")
         timeout_seconds = min(timeout_seconds, remaining)
     try:
-        command = (
-            str(python_path),
-            "-I",
-            "-S",
-            "-c",
-            (
-                "import json,sys,sysconfig;"
-                "print(json.dumps({'version': '.'.join(map(str, sys.version_info[:3])),"
-                "'abi': (sys.implementation.cache_tag or '') + ':' + "
-                "(sysconfig.get_config_var('SOABI') or '')}, sort_keys=True))"
-            ),
+        result = run_contained(
+            [
+                str(python_path),
+                "-I",
+                "-S",
+                "-c",
+                (
+                    "import json,sys,sysconfig;"
+                    "print(json.dumps({'version': '.'.join(map(str, sys.version_info[:3])),"
+                    "'abi': (sys.implementation.cache_tag or '') + ':' + "
+                    "(sysconfig.get_config_var('SOABI') or '')}, sort_keys=True))"
+                ),
+            ],
+            cwd=root,
+            deadline_monotonic=time.monotonic() + timeout_seconds,
+            may_spawn_background_descendants=False,
+            check=True,
+            text=True,
         )
-        launch_kwargs = {
-            "cwd": root,
-            "deadline_monotonic": time.monotonic() + timeout_seconds,
-            "may_spawn_background_descendants": False,
-            "check": True,
-            "text": True,
-        }
-        if interpreter_binding is None:
-            result = run_contained(command, **launch_kwargs)
-        else:
-            result = interpreter_binding.launch(run_contained, command, **launch_kwargs)
         facts = strict_json_loads(result.stdout)
         version = str(facts["version"])
         abi = str(facts["abi"])
-    except (OSError, RuntimeError, subprocess.SubprocessError, StrictJsonError, KeyError) as exc:
+    except (OSError, subprocess.SubprocessError, StrictJsonError, KeyError) as exc:
         raise DeployBootstrapError("release Python ABI cannot be verified") from exc
     if not version or abi == ":":
         raise DeployBootstrapError("release Python ABI is incomplete")
@@ -3645,7 +3601,6 @@ def _run_frozen_sync(
     *,
     timeout_seconds: float = 900,
     overall_deadline_monotonic: float | None = None,
-    executable_binding: object | None = None,
 ) -> None:
     if overall_deadline_monotonic is not None:
         remaining = overall_deadline_monotonic - time.monotonic()
@@ -3653,20 +3608,12 @@ def _run_frozen_sync(
             raise DeployBootstrapError("frozen dependency sync overall timeout expired")
         timeout_seconds = min(timeout_seconds, remaining)
     try:
-        command = (str(uv_path), "sync", "--frozen")
-        launch_kwargs = {
-            "cwd": root,
-            "timeout_seconds": timeout_seconds,
-        }
-        if executable_binding is None:
-            result = _run_process_group(list(command), **launch_kwargs)
-        else:
-            result = executable_binding.launch(
-                _run_process_group,
-                command,
-                **launch_kwargs,
-            )
-    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        result = _run_process_group(
+            [str(uv_path), "sync", "--frozen"],
+            cwd=root,
+            timeout_seconds=timeout_seconds,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
         raise DeployBootstrapError("frozen dependency sync could not run") from exc
     if result.returncode != 0:
         diagnostic = (result.stderr or result.stdout or "no command output").strip()
@@ -3848,8 +3795,6 @@ def main(argv: list[str] | None = None) -> int:
     generation_error_type: type[BaseException] | None = None
     missing_record_type: type[BaseException] | None = None
     handoff: _LabLaunchdHandoff | None = None
-    interpreter_binding: object | None = None
-    uv_launch_binding: object | None = None
 
     def restore_uncommitted_handoff(active: _LabLaunchdHandoff) -> None:
         if active.action == "deploy" and active.prepared_intent_operation_id:
@@ -3926,14 +3871,7 @@ def main(argv: list[str] | None = None) -> int:
         _trusted_git(git_path)
         python_path = _canonical(args.python_path, label="deployment Python")
         _verified_venv_python(root, python_path)
-        interpreter_binding = _bind_bootstrap_interpreter(python_path)
         uv_path, _uv_binding = _resolve_uv_path(args.uv_path)
-        if args.host_platform == "linux":
-            uv_launch_binding = _bind_bootstrap_interpreter(
-                uv_path,
-                profile="production-deploy-uv",
-                label="deployment uv",
-            )
         if not 0 < args.command_timeout_seconds <= args.overall_timeout_seconds <= 7200:
             raise DeployBootstrapError("deployment timeout configuration is invalid")
         computed_deadline = time.monotonic() + args.overall_timeout_seconds
@@ -4233,10 +4171,6 @@ def main(argv: list[str] | None = None) -> int:
                 git_path=git_path,
                 writable=True,
                 uv_path=uv_path,
-                interpreter_binding=(
-                    interpreter_binding if args.host_platform == "linux" else None
-                ),
-                uv_launch_binding=uv_launch_binding,
                 command_timeout_seconds=args.command_timeout_seconds,
                 overall_deadline_monotonic=overall_deadline_monotonic,
             )
@@ -4260,7 +4194,6 @@ def main(argv: list[str] | None = None) -> int:
                             uv_path,
                             timeout_seconds=args.command_timeout_seconds,
                             overall_deadline_monotonic=overall_deadline_monotonic,
-                            executable_binding=uv_launch_binding,
                         )
                         _verify_current_generation_checkout(
                             root,
@@ -4271,9 +4204,6 @@ def main(argv: list[str] | None = None) -> int:
                         _verify_generation_runtime(
                             root,
                             python_path,
-                            interpreter_binding=(
-                                interpreter_binding if args.host_platform == "linux" else None
-                            ),
                             overall_deadline_monotonic=overall_deadline_monotonic,
                         )
                         _run_generation_preflight(
@@ -4303,7 +4233,6 @@ def main(argv: list[str] | None = None) -> int:
                 uv_path,
                 timeout_seconds=args.command_timeout_seconds,
                 overall_deadline_monotonic=overall_deadline_monotonic,
-                executable_binding=uv_launch_binding,
             )
             _verify_current_generation_checkout(
                 root,
@@ -4314,9 +4243,6 @@ def main(argv: list[str] | None = None) -> int:
             _verify_generation_runtime(
                 root,
                 python_path,
-                interpreter_binding=(
-                    interpreter_binding if args.host_platform == "linux" else None
-                ),
                 overall_deadline_monotonic=overall_deadline_monotonic,
             )
             _run_generation_preflight(
@@ -4360,9 +4286,6 @@ def main(argv: list[str] | None = None) -> int:
             _verify_generation_runtime(
                 root,
                 python_path,
-                interpreter_binding=(
-                    interpreter_binding if args.host_platform == "linux" else None
-                ),
                 overall_deadline_monotonic=overall_deadline_monotonic,
             )
             _physical_file(authority_path, label="release generation authority")
@@ -4375,10 +4298,6 @@ def main(argv: list[str] | None = None) -> int:
                 python_path=python_path,
                 git_path=git_path,
                 uv_path=uv_path,
-                interpreter_binding=(
-                    interpreter_binding if args.host_platform == "linux" else None
-                ),
-                uv_launch_binding=uv_launch_binding,
                 command_timeout_seconds=args.command_timeout_seconds,
                 overall_deadline_monotonic=overall_deadline_monotonic,
             ).verify(expected_commit=commit)
@@ -4426,7 +4345,6 @@ def main(argv: list[str] | None = None) -> int:
         _verify_generation_runtime(
             root,
             python_path,
-            interpreter_binding=(interpreter_binding if args.host_platform == "linux" else None),
             overall_deadline_monotonic=overall_deadline_monotonic,
         )
         _physical_file(authority_path, label="release generation authority")
@@ -4444,10 +4362,6 @@ def main(argv: list[str] | None = None) -> int:
                 git_path=git_path,
                 writable=args.recover_generation or args.finalize_generation,
                 uv_path=uv_path,
-                interpreter_binding=(
-                    interpreter_binding if args.host_platform == "linux" else None
-                ),
-                uv_launch_binding=uv_launch_binding,
                 command_timeout_seconds=args.command_timeout_seconds,
                 overall_deadline_monotonic=overall_deadline_monotonic,
             )
@@ -4586,13 +4500,6 @@ def main(argv: list[str] | None = None) -> int:
             )
             if lock_fd >= 0:
                 arguments.extend(["--deployment-lock-fd", str(lock_fd)])
-            if args.host_platform == "linux":
-                return int(
-                    deploy_main(
-                        arguments,
-                        interpreter_binding=interpreter_binding,
-                    )
-                )
             return int(deploy_main(arguments))
 
         deploy_code = invoke_deployer(
@@ -4710,10 +4617,6 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Production deploy bootstrap failed: {exc}", file=sys.stderr)
         return finish(2)
     finally:
-        if interpreter_binding is not None:
-            interpreter_binding.close()
-        if uv_launch_binding is not None:
-            uv_launch_binding.close()
         if lock_fd >= 0:
             os.close(lock_fd)
             lock_fd = -1

@@ -127,12 +127,6 @@ def test_fd_exec_import_graph_is_stdlib_only() -> None:
     assert result.returncode == 0, result.stderr
 
 
-def test_fd_exec_capability_reports_only_supported_descriptor_execution() -> None:
-    from rquant.fd_exec import descriptor_execution_supported
-
-    assert descriptor_execution_supported() is (os.execve in os.supports_fd)
-
-
 @pytest.mark.parametrize(
     "source",
     [

@@ -118,13 +118,12 @@ class GenerationFinalizer(Protocol):
 
 
 def _run_process_group(
-    args: list[str] | tuple[str, ...],
+    args: list[str],
     *,
     cwd: Path,
     deadline_monotonic: float,
     check: bool,
     pass_fds: tuple[int, ...] = (),
-    executable_fd: int | None = None,
     env: dict[str, str] | None = None,
     may_spawn_background_descendants: bool = False,
 ) -> subprocess.CompletedProcess[str]:
@@ -136,7 +135,6 @@ def _run_process_group(
         deadline_monotonic=deadline_monotonic,
         check=check,
         pass_fds=pass_fds,
-        executable_fd=executable_fd,
         env=env,
         may_spawn_background_descendants=may_spawn_background_descendants,
     )
@@ -225,18 +223,10 @@ def _fresh_recovery_runner(runner: Runner) -> Runner:
 
 
 class IsolatedGenerationFinalizer:
-    def __init__(
-        self,
-        config: DeployConfig,
-        *,
-        interpreter_binding: object | None = None,
-    ) -> None:
+    def __init__(self, config: DeployConfig) -> None:
         if config.lock_fd is None or config.lock_path is None or config.python_path is None:
             raise PolicyError("isolated generation finalizer binding is incomplete")
-        if config.platform_name == "linux" and interpreter_binding is None:
-            raise PolicyError("Linux generation finalizer requires descriptor binding")
         self._config = config
-        self._interpreter_binding = interpreter_binding
 
     def for_recovery(self, overall_deadline_monotonic: float) -> IsolatedGenerationFinalizer:
         current = self._config.overall_deadline_monotonic
@@ -248,8 +238,7 @@ class IsolatedGenerationFinalizer:
                     if current is None
                     else min(current, overall_deadline_monotonic)
                 ),
-            ),
-            interpreter_binding=self._interpreter_binding,
+            )
         )
 
     def finalize(
@@ -316,22 +305,15 @@ class IsolatedGenerationFinalizer:
             ]
         )
         try:
-            launch_kwargs = {
-                "cwd": config.repo,
-                "deadline_monotonic": config.overall_deadline_monotonic,
-                "check": True,
-                "pass_fds": tuple(pass_fds),
-            }
-            if self._interpreter_binding is None:
-                completed = _run_process_group(command, **launch_kwargs)
-            else:
-                completed = self._interpreter_binding.launch(
-                    _run_process_group,
-                    tuple(command),
-                    **launch_kwargs,
-                )
+            completed = _run_process_group(
+                command,
+                cwd=config.repo,
+                deadline_monotonic=config.overall_deadline_monotonic,
+                check=True,
+                pass_fds=tuple(pass_fds),
+            )
             payload = json.loads(completed.stdout)
-        except (OSError, RuntimeError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+        except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
             raise DeployError("target generation authority failed to publish marker") from exc
         if payload.get("commit") != expected_commit or payload.get("operation_id") != operation_id:
             raise DeployError("target generation authority returned a mismatched result")
@@ -1700,11 +1682,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(
-    argv: list[str] | None = None,
-    *,
-    interpreter_binding: object | None = None,
-) -> int:
+def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     config = DeployConfig(
         repo=args.repo,
@@ -1734,15 +1712,7 @@ def main(
         runtime_schema_v1_migration_authority=(args.runtime_schema_v1_migration_authority),
     )
     try:
-        generation_finalizer = (
-            None
-            if interpreter_binding is None
-            else IsolatedGenerationFinalizer(
-                config,
-                interpreter_binding=interpreter_binding,
-            )
-        )
-        result = deploy(config, generation_finalizer=generation_finalizer)
+        result = deploy(config)
     except ProtectedWindowError as exc:
         print(f"DEFERRED: {exc}", file=sys.stderr)
         return 75

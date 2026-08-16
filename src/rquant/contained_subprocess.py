@@ -2736,7 +2736,6 @@ def run_contained(
     deadline_monotonic: float,
     check: bool = False,
     pass_fds: tuple[int, ...] = (),
-    executable_fd: int | None = None,
     env: Mapping[str, str] | None = None,
     text: bool = True,
     inventory_provider: Inventory = process_inventory,
@@ -2763,11 +2762,6 @@ def run_contained(
             "contained subprocess execution requires the Python main thread"
         )
     _require_no_execution_hooks()
-    if executable_fd is not None:
-        if type(executable_fd) is not int or executable_fd < 0:
-            raise ContainedProcessError("descriptor execution requires one open descriptor")
-        if os.execve not in os.supports_fd:
-            raise ContainedProcessError("descriptor execution is unavailable on this platform")
     remaining = deadline_monotonic - clock()
     if remaining <= 0:
         raise subprocess.TimeoutExpired(list(args), 0)
@@ -2814,13 +2808,9 @@ def run_contained(
             str(Path(__file__).resolve(strict=True)),
             "--contained-child",
             str(gate_read),
-            *( () if executable_fd is None else ("--executable-fd", str(executable_fd)) ),
             "--",
             *args,
         ]
-        inherited_descriptors = (*pass_fds, gate_read)
-        if executable_fd is not None:
-            inherited_descriptors = (*inherited_descriptors, executable_fd)
         _require_no_execution_hooks()
         process = subprocess.Popen(
             helper_command,
@@ -2829,7 +2819,7 @@ def run_contained(
             stderr=subprocess.PIPE,
             text=text,
             start_new_session=True,
-            pass_fds=inherited_descriptors,
+            pass_fds=(*pass_fds, gate_read),
             env=process_environment,
         )
         os.close(gate_read)
@@ -3186,30 +3176,17 @@ def run_contained(
 
 
 def _contained_child_main(arguments: list[str]) -> int:
-    if len(arguments) < 3:
+    if len(arguments) < 3 or arguments[1] != "--":
         return 127
     gate_fd = int(arguments[0])
-    executable_fd: int | None = None
-    command_start = 2
-    if arguments[1] == "--executable-fd":
-        if len(arguments) < 5 or arguments[3] != "--":
-            return 127
-        executable_fd = int(arguments[2])
-        command_start = 4
-    elif arguments[1] != "--":
-        return 127
-    command = arguments[command_start:]
+    command = arguments[2:]
     if not command:
         return 127
     signal_byte = os.read(gate_fd, 1)
     os.close(gate_fd)
     if signal_byte != b"1":
         return 127
-    if executable_fd is None:
-        os.execvpe(command[0], command, os.environ)
-    if os.execve not in os.supports_fd:
-        return 127
-    os.execve(executable_fd, command, os.environ)
+    os.execvpe(command[0], command, os.environ)
     return 127
 
 
