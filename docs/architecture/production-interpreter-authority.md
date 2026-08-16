@@ -655,7 +655,9 @@ claims only:
 
 It does not claim that the baseline has no latent defect, or that arbitrary aliases, closures,
 callbacks, descriptors, generated code, or future dependency behavior are globally safe. Those are
-baseline risks carried by its prior production approval and preflight. A candidate that needs a
+historical operational risks outside this differential claim; the fact of baseline deployment is
+accepted only through the independent historical trust chain below, never through a prior R07
+approval. A candidate that needs a
 broader claim, a writer, activation, a registry successor, an overlay, a cursor, a drain, or a
 cutover is outside Phase A and blocks.
 
@@ -672,73 +674,131 @@ and deployment blocks until an immutable external attestation with `status=verif
 No fixture, test, candidate commit, CI job, or deployment process may infer or manufacture the
 missing tag, deployment record, artifact, signer, or issuer.
 
+`RawBytesDigestV1` has exactly `algorithm` (literal `sha256`), `size_bytes` (strict native integer
+>= 0), and `sha256` (lowercase 64-hex). It is `SHA256(raw_bytes)` with no prefix, canonical JSON,
+domain wrapper, or text recoding. `StructuredDigestV1` has exactly `algorithm` (literal `sha256`),
+`domain`, `canonical_size_bytes`, and `sha256`. Its preimage is the exact nonempty ASCII `domain`, one
+NUL byte, then the canonical JSON bytes of the declared payload. `domain` is frozen at the field's
+schema declaration as `rquant-r07/<payload-type>/v1`; callers cannot choose it. A structured
+self-digest omits only its own digest field from that payload. These two models are not
+interchangeable. Every digest-bearing field below names one of them explicitly; a bare SHA-256
+string is invalid except for Git's separately identified 40-hex commit, tree, and blob OIDs.
+The notation `StructuredDigestV1[X]` is normative: `X` is the exact case-sensitive ASCII payload
+type token and fixes domain `rquant-r07/X/v1`; its payload is the complete canonical value of type
+`X`, omitting only that value's declared self-digest field when present. A field written with an
+explicit domain uses that literal instead. No runtime type name, module alias, caller-provided
+domain, or alternative spelling may replace either form.
+
+Every model in this section is frozen and extra-forbid. Native construction requires exact model,
+tuple, string, integer, boolean, or null types as declared; booleans never satisfy integers;
+subclasses, coercion, unordered collections, duplicate IDs, duplicate JSON keys, non-UTF-8, floats,
+`NaN`, infinity, and unknown enum values reject. Strict JSON arrays decode to declared immutable
+tuples; objects have exactly the declared field set. Strings compare byte-for-byte without Unicode
+normalization. Canonical bytes are
+`rquant.strict_json.canonical_json_bytes(model_dump(mode="json"))`; object keys use the canonical
+serializer order and every tuple order stated below is semantic. A parser first rejects duplicate
+keys and unknown fields, validates exact primitive types and tuple order, then recomputes every raw
+and structured digest. These rules apply identically to fixtures, evidence, and attestations. Every
+canonical UTC timestamp is exact ASCII `YYYY-MM-DDTHH:MM:SS.ffffffZ`, including six fractional
+digits and terminal `Z`; offsets, omitted fractions, leap seconds, and alternate spellings reject.
+
 `R07ReleaseRefV1` has exactly `tag`, `commit_sha`, and `tree_sha`. `tag` is either an exact annotated
 SemVer tag matching `v[0-9]+\.[0-9]+\.[0-9]+` or null only under `pending_external`; both Git IDs are
 lowercase 40-hex. `R07ArtifactRefV1` has exactly `kind` (`wheel`, `sdist`, or
 `deployment_bundle`), `filename` (ASCII basename), `size_bytes` (strict native integer >= 1), and
-lowercase-hex `sha256`. Artifact entries use the exact semantic order `wheel`, `sdist`, then
-`deployment_bundle`, and contain exactly one of each kind.
+`content_digest` (`RawBytesDigestV1`, whose size equals `size_bytes`). Artifact entries use the exact
+semantic order wheel, sdist, deployment bundle and contain exactly one of each kind.
 
-`R07PrincipalIdentityV1` has exactly `identity_kind` (`github_oidc_subject`,
-`offline_ed25519_key`, or `deployment_authority`), `issuer`, `subject`, and `key_fingerprint_sha256`.
-Every string is nonempty ASCII; the fingerprint is lowercase SHA-256 of the issuer's canonical raw
-public-key bytes. `R07ExternalWriteBoundaryV1`
-has exactly `boundary_id`, `storage_uri_prefix`, `writer`, `approver`, `reader`, `write_mode`,
-`candidate_write_allowed`, and `deployment_write_allowed`. The URI prefix is absolute ASCII `https`
-or `s3`, has a nonempty authority
-and path, and has no userinfo, query, fragment, `.` or `..` segment. `write_mode` is the literal
-`append_once`; both write-allowed flags are false; writer and approver are distinct principal
-identities; and neither equals the candidate CI runner or deployment runtime identity. A baseline
-object URI is the prefix plus `/baseline/<commit_sha>.json`; a release object URI is the prefix plus
+`R07PrincipalIdentityV1` has exactly `principal_id`, `identity_kind` (`github_oidc_subject`,
+`offline_ed25519_key`, or `deployment_authority`), `issuer`, `subject`, `key_id`, and
+`signing_public_key_sha256` (`RawBytesDigestV1`). All five string fields are nonempty ASCII.
+For `offline_ed25519_key`, `signing_public_key_sha256` hashes the exact 32 raw
+issuer-distributed Ed25519 public-key bytes, not a PEM, certificate, key ID, or candidate-supplied
+encoding. Other identity kinds bind the issuer's algorithm-specific canonical verification-key
+bytes but cannot sign an R07 approval, deploy record, or attestation. The verifier has an
+out-of-repository,
+read-only trust map keyed by exact `(issuer, key_id)` whose value is the public-key bytes,
+`principal_id`, `identity_kind`, and `subject`; all five identity fields and the raw digest must
+match that entry before signature verification. No key embedded only in an attestation is trusted.
+
+`R07ExternalWriteBoundaryV1` has exactly `boundary_id`, `storage_uri_prefix`, `writer`, `approver`,
+`reader`, `write_mode`, `candidate_write_allowed`, and `deployment_write_allowed`. Writer, approver,
+and reader are exact `R07PrincipalIdentityV1` objects. The URI prefix is absolute ASCII `https` or
+`s3`, has a nonempty authority and path, and has no userinfo, query, fragment, `.` or `..` segment.
+`write_mode` is literal `append_once`; both write-allowed flags are false; writer, approver, and
+reader are pairwise distinct; and neither writer nor approver equals the candidate CI or deployment
+runtime identity. The external ACL grants create-once permission only to `writer`, approval-record
+creation only to `approver`, and read-only access to `reader`; candidate and deployment principals
+have no write route. A historical baseline URI is the prefix plus
+`/historical-baseline/<commit_sha>.json`; a release URI is the prefix plus
 `/release/<commit_sha>/<status>.json`. Each is outside the repository and deployment checkout and is
-immutable after first successful create. Content identity is the separately verified attestation
-digest; the URI does not contain that digest and therefore creates no self-referential preimage.
+immutable after first successful create.
 
-`BaselineAttestationV1` has exactly:
+The baseline trust root is deliberately independent of R07. `HistoricalTrustRootV1` has exactly
+`schema_version == 1`, `trust_root_id`, `authority`, `write_boundary`, `effective_at`, and
+`trust_root_digest` (`StructuredDigestV1`, domain
+`rquant-r07/HistoricalTrustRootV1/v1`). It is provisioned in the verifier and deployer from a
+separately administered read-only location before candidate bytes are read. It contains no R07
+release proof, approval, attestation, candidate, or baseline-attestation digest. Its authority is
+the externally enrolled root principal; its `authority` equals `write_boundary.writer`. The
+candidate repository, CI principal, deployment runtime, and R07 append store cannot modify this
+root or its `(issuer,key_id)` public-key map.
+
+`HistoricalBaselineMigrationProofV1` has exactly `schema_version == 1`, `source_record_kind`
+(`immutable_deploy_log`, `release_registry`, or `artifact_registry`), `source_record_uri`,
+`source_record_digest` (`RawBytesDigestV1` over exact historical bytes), `release`
+(`R07ReleaseRefV1`), `deployment_artifact` (one deployment-bundle `R07ArtifactRefV1`),
+`observed_deploy_outcome` (literal `deployed`), `migration_verifier` (`R07PrincipalIdentityV1`),
+`verified_at`, and `migration_proof_digest` (`StructuredDigestV1`, domain
+`rquant-r07/HistoricalBaselineMigrationProofV1/v1`). Its evidence is the pre-R07 deployment source
+and artifact bytes; it never cites a prior R07 proof, approval, attestation, fixture, or `DEPLOY.md`
+line. `migration_verifier` is the historical trust-root reader, not the candidate, deployer, writer,
+or approver. The historical source URI is immutable and under the root's external read boundary.
+
+`HistoricalBaselineDeploymentAttestationV1` has exactly:
 
 ```text
 schema_version: strict native int == 1
-status: exact pending_external or verified
-release: exact R07ReleaseRefV1
-deploy_record_sha256: lowercase SHA-256 or null
-deployment_artifact: exact deployment_bundle R07ArtifactRefV1 or null
-signer: exact R07PrincipalIdentityV1 or null
-issuer: exact R07PrincipalIdentityV1 or null
-external_storage_uri: absolute immutable object URI or null
-write_boundary: exact R07ExternalWriteBoundaryV1 or null
-issued_at: canonical UTC timestamp or null
-signature_algorithm: literal ed25519 or null
-signature_base64: canonical padded RFC 4648 or null
-attestation_sha256: lowercase SHA-256
+release: exact nonnull-tag R07ReleaseRefV1
+deployment_artifact: exact deployment_bundle R07ArtifactRefV1
+historical_deploy_record_digest: RawBytesDigestV1
+migration_proof_digest: StructuredDigestV1[HistoricalBaselineMigrationProofV1]
+trust_root_digest: StructuredDigestV1[HistoricalTrustRootV1]
+signer: exact R07PrincipalIdentityV1
+write_boundary: exact R07ExternalWriteBoundaryV1
+external_storage_uri: exact immutable historical-baseline URI
+issued_at: canonical UTC timestamp
+signature_algorithm: literal ed25519
+signature_base64: canonical padded RFC 4648
+attestation_digest: StructuredDigestV1[HistoricalBaselineDeploymentAttestationV1]
 ```
 
-For `pending_external`, `release.commit_sha` and `release.tree_sha` equal the frozen source baseline,
-`release.tag` and every evidence field are null, and the status blocks. For `verified`, no field is
-null; the tag peels to the exact commit/tree; the deploy record names the same tag/commit/tree and
-deployment artifact digest; signer has kind `offline_ed25519_key` and differs from issuer and the
-candidate; the immutable URI is the exact baseline URI above; and the write boundary excludes
-candidate and deployment writes.
-A verified baseline deploy-record digest resolves to exact external `R07DeployRecordV1` bytes under
-that same append-once boundary, with `outcome=deployed` and matching release/artifact fields.
-A partial mixture is invalid. Baseline signature bytes cover ASCII
-`rquant-r07/BaselineAttestationV1/signature/v1\0` followed by canonical bytes with
-`signature_base64` and `attestation_sha256` omitted; `attestation_sha256` then follows the general
-digest rule and includes the verified signature.
+The migration proof, source record, artifact, release, and trust root all bind the same exact
+tag/commit/tree and deployment-bundle bytes;
+`historical_deploy_record_digest == migration_proof.source_record_digest` and
+`migration_proof.migration_verifier == write_boundary.reader`. `signer == write_boundary.writer ==
+HistoricalTrustRootV1.authority`; `write_boundary` equals the one in the trust root; the signer key
+is resolved only through the root's external `(issuer,key_id)` map. Signature bytes cover ASCII
+`rquant-r07/HistoricalBaselineDeploymentAttestationV1/signature/v1\0` followed by canonical bytes
+with `signature_base64` and `attestation_digest` omitted. Verification uses the resolved public-key
+bytes and requires a canonical 64-byte Ed25519 signature before recomputing `attestation_digest`.
+This trust graph is acyclic: the configured root authenticates the historical migration evidence,
+which authenticates the historical deployment attestation, which is referenced by the R07 baseline;
+none points back to an R07 approval or candidate result.
 
-Every model in this section is frozen and extra-forbid. Native construction requires exact model,
-tuple, string, integer, boolean, or null types as declared; booleans never satisfy integers; subclasses,
-coercion, unordered collections, duplicate IDs, duplicate JSON keys, non-UTF-8, floats, `NaN`,
-infinity, and unknown enum values reject. Strict JSON arrays decode to the declared immutable tuples;
-objects must have exactly the declared field set. Strings are compared byte-for-byte without Unicode
-normalization. Canonical bytes are `rquant.strict_json.canonical_json_bytes(model_dump(mode="json"))`.
-For a model `T` with self-digest field `d`, its digest preimage is ASCII
-`rquant-r07/T/v1\0` followed by canonical bytes of the exact object with only `d` omitted. SHA-256 of
-that preimage is `d`. For a model or tuple without a self-digest, an identity field named
-`*_sha256` uses ASCII `rquant-r07/<declared-type>/v1\0` plus its complete canonical bytes. Tuple orders
-stated below are semantic and mandatory even though object keys
-are serializer-sorted. These rules apply identically to fixtures, evidence, and attestations.
-Every canonical UTC timestamp is exact ASCII `YYYY-MM-DDTHH:MM:SS.ffffffZ`, including six fractional
-digits and terminal `Z`; offsets, omitted fractions, leap seconds, and alternate spellings reject.
+`BaselineAttestationV1` has exactly `schema_version == 1`, `status` (`pending_external` or
+`verified`), `release`, `historical_deployment_attestation_digest` (a
+`StructuredDigestV1[HistoricalBaselineDeploymentAttestationV1]` or null), and
+`attestation_digest` (`StructuredDigestV1`, domain `rquant-r07/BaselineAttestationV1/v1`). For
+`pending_external`, release commit/tree equal the frozen source baseline, tag is null, the historical
+digest is null, and release blocks. For `verified`, release is exact nonnull-tagged baseline and its
+only deployment claim is the nonnull historical-attestation digest. The verifier retrieves that
+object from the root-bound immutable URI and validates the complete root -> migration -> historical
+attestation chain above. It may not supplement it with local Git ancestry, a candidate fixture,
+`DEPLOY.md`, a CI artifact, or an R07 approval. A partial mixture, unavailable object, wrong tag
+peel/tree/artifact, raw/structured digest confusion, unauthorized signer, mutable URI, or invalid
+signature blocks. The currently known baseline remains `pending_external`; no real historical
+attestation has been asserted or fabricated by this design.
 
 ##### Complete Repository Diff And Toolchain Manifest
 
@@ -747,7 +807,8 @@ The repository contains one reviewed, non-generated policy fixture
 rewritten by a test, build, manifest generator, or deployment step.
 `R07RepoDiffPolicyV1` has exactly `schema_version == 1`, the frozen `baseline_commit_sha` and
 `baseline_tree_sha`, `allowed_entries` (UTF-8-path-sorted exact `R07RepoDiffPolicyEntryV1`),
-`required_toolchain_roles` (exact `(role,path)`-sorted tuples), and `policy_sha256`. A policy entry
+`required_toolchain_roles` (exact `(role,path)`-sorted tuples), and `policy_digest`
+(`StructuredDigestV1`, domain `rquant-r07/R07RepoDiffPolicyV1/v1`). A policy entry
 has exactly `path`, `allowed_change_kinds`, `classification`, and `allowed_declarations`; it contains
 no candidate commit/tree/blob/content hash and therefore has no self-reference.
 `allowed_change_kinds` is a nonempty duplicate-free subsequence of the exact semantic order `add`,
@@ -763,17 +824,19 @@ baseline_commit_sha: exact frozen lowercase 40-hex commit
 baseline_tree_sha: exact frozen lowercase 40-hex tree
 candidate_commit_sha: lowercase 40-hex commit
 candidate_tree_sha: lowercase 40-hex tree
-policy_sha256: exact R07RepoDiffPolicyV1 digest
+policy_digest: exact StructuredDigestV1[R07RepoDiffPolicyV1]
 entries: nonempty UTF-8-path-sorted tuple[R07RepoDiffEntryV1, ...]
 toolchain_identities: exact (role,path)-sorted tuple[R07ToolchainIdentityV1, ...]
-manifest_sha256: lowercase SHA-256
+manifest_digest: StructuredDigestV1[R07RepoDiffManifestV1]
 ```
 
 Each entry has exactly `path`, `change_kind` (`add`, `modify`, or `delete`),
 `baseline_git_mode`, `candidate_git_mode`, `baseline_blob_oid`, `candidate_blob_oid`,
-`baseline_sha256`, `candidate_sha256`, `classification`, and `declarations`. A side absent under the
+`baseline_content_digest`, `candidate_content_digest`, `classification`, and `declarations`. Both
+content fields are `RawBytesDigestV1` or null. A side absent under the
 declared change kind uses null for all three of its mode/OID/digest fields. Git modes are exact
-six-digit ASCII; blob OIDs are lowercase 40-hex; content hashes are lowercase SHA-256. Renames are
+six-digit ASCII; blob OIDs are lowercase 40-hex; raw content digests bind the exact Git blob bytes.
+Renames are
 always represented as one delete plus one add; similarity/rename heuristics are forbidden. Paths are NFC-normalized
 repository-relative UTF-8, contain no empty, `.`, or `..` segment, symlink, backslash, glob, or
 case-fold collision, and sort by UTF-8 bytes.
@@ -785,12 +848,13 @@ declaration contract. `classification` is exactly one of `production_declaration
 `unrelated_blocked` always blocks and cannot appear in a passing manifest. Source entries contain a
 source-order tuple of `R07AllowedDeclarationV1`; non-source entries use an empty tuple. A declaration
 has exactly `qualified_name`, positive inclusive `span_start_line`, `span_end_line`,
-`normalized_ast_sha256`, and `role`. `role` is exactly `read_only_v3_model`,
+`normalized_ast_digest` (`RawBytesDigestV1`), and `role`. `role` is exactly `read_only_v3_model`,
 `read_only_v3_decoder`, `legacy_boundary_reject_guard`, `proof_verifier`, or `proof_runner`.
 Normalized AST bytes are `ast.dump(node, annotate_fields=True, include_attributes=False)` encoded
 as UTF-8. Ranges do not overlap and cover every changed executable declaration in their file.
 
-`R07ToolchainIdentityV1` has exactly `role`, `path`, `git_mode`, `blob_oid`, `sha256`,
+`R07ToolchainIdentityV1` has exactly `role`, `path`, `git_mode`, `blob_oid`, `content_digest`
+(`RawBytesDigestV1`),
 `entrypoint`, `argv`, and `workflow_job`. `role` is exactly `verifier`, `runner`, `test_entrypoint`,
 `ci_workflow`, `build_frontend`, `deploy_frontend`, `deploy_bootstrap`, or `deploy_engine`. `argv` is
 an exact nonempty tuple of ASCII arguments with no shell expansion; `workflow_job` is nonnull only
@@ -808,7 +872,8 @@ for the workflow identity. The frozen identity set contains:
 | deploy engine | `src/rquant/ops/production_deploy.py::main` |
 
 The verifier resolves each identity directly from the candidate tree and compares mode, blob OID,
-SHA-256, entrypoint, argv, and workflow job. Workflow action references must be full commit SHAs;
+raw content digest, entrypoint, argv, and workflow job. Workflow action references must be full
+commit SHAs;
 the exact checkout, Python setup, evidence upload/download, build, and attestation steps are included
 in the workflow file digest. CI derives the raw NUL-delimited output of
 `git diff-tree -r --no-commit-id --raw -z --no-renames <baseline-tree> <candidate-tree>` for the
@@ -826,20 +891,76 @@ or inspect closures.
 ##### Boundary Behavior Manifest And Mutation Probes
 
 `R07BoundaryBehaviorManifestV1` is the second reviewed fixture in the same directory. It has exactly
-`schema_version == 1`, `probe_specs`, `variant_coverage`, and `manifest_sha256`. `probe_specs` is a
-`probe_id`-sorted tuple of exact `R07BoundaryProbeSpecV1` and contains at least one spec for every
-non-registry row in the Complete No-Activation
-Inventory. `variant_coverage` has exactly three keys, `direct_current`, `stored_current_bytes`, and
-`batch_current`; each value is the exact sorted tuple of inventory IDs whose public API accepts that
-form. Set equality between those tuples and probe forms is mandatory. There is no nearest-entrypoint,
-adapter, `not_applicable`, skip, or synthesized-success rule: each probe invokes the exact public
-entrypoint named by its own inventory row. A row whose API supports multiple forms has one probe per
-form; each form appears at least once in the complete manifest.
+`schema_version == 1`, `fixture_sets` (set-ID-sorted exact `FixtureSetV1`), `probe_specs`,
+`variant_coverage`, and `manifest_digest` (`StructuredDigestV1`, domain
+`rquant-r07/R07BoundaryBehaviorManifestV1/v1`). `probe_specs` is a probe-ID-sorted tuple of exact
+`R07BoundaryProbeSpecV1` and contains at least one spec for every non-registry row in the Complete
+No-Activation Inventory. `variant_coverage` has exactly three keys, `direct_current`,
+`stored_current_bytes`, and `batch_current`; each value is the exact inventory-ID-sorted tuple whose
+public API accepts that form. Set equality between those tuples and probe variants is mandatory.
 
-`R07BoundaryProbeSpecV1` has exactly `probe_id`, `inventory_id`, `public_entrypoint`,
-`argument_bindings`, `current_input`, `call_shape`, `expected_failure`, `mutation_guards`,
-`snapshot_domains`, and `spec_sha256`. `snapshot_domains` is a `domain_id`-sorted tuple of exact
-`R07SnapshotDomainSpecV1`, whose fields are `domain_id`, `kind`, and `fixture_id`.
+`FixtureValueV1` has exactly `fixture_id`, `value_kind` (`raw_bytes`, `strict_json_model`,
+`strict_json_tuple`, `utf8_text`, `strict_integer`, `strict_boolean`, or `null`),
+`python_type_identity`, `codec`, `bytes_base64`, `byte_length`, `raw_digest`, and
+`parsed_value_digest`. `python_type_identity` is an exact import-free ASCII type identity;
+`codec` is exactly `identity`, `utf8`, or `rquant_strict_json_v1`. Base64 is canonical padded RFC
+4648; its decoded bytes equal strict `byte_length` and `raw_digest: RawBytesDigestV1`. Raw values use
+`codec=identity` and null `parsed_value_digest`; all other kinds use their one allowed codec and a
+nonnull `StructuredDigestV1` with domain `rquant-r07/FixtureValueV1/parsed/<value_kind>/v1`. The
+strict parser consumes all bytes exactly once and rejects trailing bytes, duplicate keys, unknown
+fields, coercion, a different runtime type, or noncanonical re-encoding.
+
+Parsing is exhaustive: `raw_bytes`/`identity` returns exact bytes and requires
+`python_type_identity=builtins.bytes`; `strict_json_model` requires one canonical JSON object and a
+pre-registered exact strict decoder keyed by `python_type_identity`; `strict_json_tuple` requires
+one canonical JSON array and `python_type_identity=builtins.tuple`; `utf8_text` is shortest-form UTF-8
+without BOM or surrogate and round-trips byte-identically as `builtins.str`; `strict_integer` is
+ASCII `0` or `-?[1-9][0-9]*` within signed 64-bit range as `builtins.int`; `strict_boolean` is exact
+ASCII `true` or `false` as `builtins.bool`; and `null` is exact ASCII `null` with
+`python_type_identity=builtins.NoneType`. The parsed-value structured payload is exactly
+`{"python_type_identity": <exact string>, "value": <canonical JSON value>}`. A decoder registry is
+frozen in the verifier identity; no dynamic import or fixture-named decoder is permitted.
+
+`FixtureEnvironmentEntryV1` has exactly `name` (ASCII matching `[A-Z][A-Z0-9_]*`) and
+`fixture_id`; entries sort by name. `FixtureSetV1` has exactly `fixture_set_id`, `seed` (strict native
+integer in `[0, 2**64-1]`), `environment`, `values` (fixture-ID-sorted complete tuple of
+`FixtureValueV1`), and `fixture_set_digest` (`StructuredDigestV1`, domain
+`rquant-r07/FixtureSetV1/v1`). Environment entries reference values in that same tuple; duplicate or
+unused environment names reject. The runner starts with an empty process environment, exposes only
+these declared name/value pairs to the probe, seeds its deterministic PRNG with exact `seed`, and
+blocks wall-clock, locale, hostname, network, user home, inherited file descriptors, and undeclared
+environment reads. The tuple is the complete fixture namespace: an ID absent from it cannot be
+resolved from another set, a repository file, a default factory, or runtime state.
+
+`FixtureArgumentRefV1` has exactly `parameter_name` and `fixture_id`.
+`FixtureKeywordRefV1` has exactly `keyword_name`, `parameter_name`, and `fixture_id`; keyword entries
+sort by UTF-8 `keyword_name`. `CallShapeV1` has exactly `callable_qualified_name`,
+`signature_text`, `signature_digest` (`RawBytesDigestV1` over exact ASCII `signature_text`),
+`receiver_fixture_id`, `args`, `kwargs`, and `invocation_mode` (`sync` or `async_await_once`). `args`
+is the exact signature-order tuple of positional `FixtureArgumentRefV1`; `kwargs` is the exact sorted
+tuple of `FixtureKeywordRefV1`; receiver is nonnull only for an instance/class-bound public method.
+Every required and optional public parameter appears exactly once across receiver/args/kwargs;
+defaults, implicit arguments, `*args`, `**kwargs`, duplicate binding, position reordering, unknown
+keywords, partials, adapters, or runtime argument synthesis reject. Binding is checked with
+`inspect.Signature.bind` against the statically attested signature before the callable is invoked.
+
+`R07BoundaryProbeSpecV1` has exactly `probe_id`, `inventory_id`, `public_entrypoint`, `variant`,
+`fixture_set_id`, `fixture_set_digest` (`StructuredDigestV1[FixtureSetV1]`), `call_shape`,
+`current_input_fixture_ids`,
+`expected_failure`, `mutation_guards`, `snapshot_domains`, and `spec_digest`
+(`StructuredDigestV1`, domain `rquant-r07/R07BoundaryProbeSpecV1/v1`). `public_entrypoint` equals
+`call_shape.callable_qualified_name`. Every receiver/argument/current-input/domain fixture ID must
+exist in the one referenced complete fixture set, and the embedded fixture-set digest must match the
+manifest's exact set. `current_input_fixture_ids` is a nonempty tuple: one direct current model for
+`direct_current`, one exact raw stored-byte value for `stored_current_bytes`, and the complete
+ordered batch members for `batch_current`; those same IDs must occur in the bound call shape. A probe
+may not cite an inline value or an ID from another set. `snapshot_domains` is a domain-ID-sorted tuple
+of exact `R07SnapshotDomainSpecV1`, whose fields are `domain_id`, `kind`, and `fixture_id`.
+
+There is no nearest-entrypoint, adapter, `not_applicable`, skip, or synthesized-success rule: each
+probe invokes the exact public entrypoint named by its inventory row with the exact `CallShapeV1`.
+A row whose API supports multiple forms has one probe per form; each form appears at least once in
+the complete manifest.
 
 Execution emits one `BoundaryProbeV1` for each exact spec. It has exactly:
 
@@ -849,18 +970,8 @@ spec: exact R07BoundaryProbeSpecV1
 guard_evidence: operation-id-sorted tuple[R07MutationGuardEvidenceV1, ...]
 domain_snapshots: domain-id-sorted tuple[R07DomainSnapshotEvidenceV1, ...]
 outcome: exact rejected_before_mutation or boundary_mutation
-probe_sha256: lowercase SHA-256
+probe_digest: StructuredDigestV1[BoundaryProbeV1]
 ```
-
-`R07ArgumentBindingV1` has exactly `parameter_name`, `binding_kind` (`positional` or `keyword`),
-`position` (strict native integer >= 0 only for positional), `fixture_id`, and `value_sha256`.
-Bindings equal the inspected public signature: no omitted optional parameter, implicit default,
-extra argument, variadic binding, reordered position, or unknown keyword is allowed.
-`R07CurrentInputFixtureV1` has exactly `fixture_id`, `variant`, `schema_identity`, `bytes_base64`,
-`byte_length`, and `sha256`. Base64 is canonical RFC 4648 with padding; decoding yields exactly
-`byte_length` bytes and the declared hash. Direct-object and batch probes construct their exact
-object/tuple only by the frozen strict decoder from these bytes; stored-byte probes pass these bytes
-unchanged. The fixture bytes and hash are therefore common evidence across all three forms.
 
 `R07ExpectedFailureV1` has exactly `exception_qualified_name`, `category`, `message_token`, and
 `message_match`. The first two are exact nonempty ASCII identities; `message_token` is nonempty
@@ -873,10 +984,12 @@ exception, missing/duplicate token, return value, warning, timeout, or later fai
 `R07MutationGuardEvidenceV1` has exactly `operation_id`, `armed`, and `call_count`; `armed` is true,
 `call_count` is a strict native nonnegative integer, and `rejected_before_mutation` requires zero for
 all guards. `R07DomainSnapshotEvidenceV1` has exactly `domain_id`, `kind`,
-`before_canonical_sha256`, and `after_canonical_sha256`; kind is `sqlite`, `record_directory`,
+`before_snapshot_digest`, and `after_snapshot_digest`; both are `StructuredDigestV1` with domain
+`rquant-r07/R07DomainSnapshotEvidenceV1/<kind>/v1`. Kind is `sqlite`, `record_directory`,
 `pointer_directory`, `outbox`, `queue`, `source`, or `receipt`, and the two digests must be equal.
 SQLite snapshots are canonical ordered tuples of exact schema plus row bytes; filesystem snapshots
-are UTF-8-path-sorted tuples of mode, size, and content hash; logical tables use primary-key order.
+are UTF-8-path-sorted tuples of mode, size, and nested `RawBytesDigestV1`; logical tables use
+primary-key order.
 Probe code may use only test-owned temporary paths/databases declared by the row. Empty guard/domain
 tuples, a missing mutation domain, a nonzero guard, unequal snapshots, or a mutation attempt produces
 `boundary_mutation`.
@@ -884,15 +997,34 @@ tuples, a missing mutation domain, a nonzero guard, unequal snapshots, or a muta
 ##### Registry Root Snapshots
 
 The two registry inventory rows are covered only by `R07RegistryRootManifestV1`, not by a boundary
-probe or object walk. It has exactly `schema_version == 1`, ten `roots` sorted by `root_id`, one
-`forbidden_symbols` tuple sorted by qualified name, and `manifest_sha256`.
+probe or object walk. It has exactly `schema_version == 1`, ten `roots` sorted by `root_id`, ten
+`construction_fixtures` sorted by `root_id`, `fixture_sets` (set-ID-sorted complete tuple of
+`FixtureSetV1`), and `manifest_digest` (`StructuredDigestV1`, domain
+`rquant-r07/R07RegistryRootManifestV1/v1`). Forbidden-definition coverage is intentionally a
+separate manifest and cannot be inferred from these ten root source files.
+
 `RegistryRootSnapshotV1` has exactly `root_id`, `module`, `export`, `signature`,
-`source_relative_path`, `source_file_sha256`, `declaration_span_start_line`,
-`declaration_span_end_line`, `normalized_ast_sha256`, `public_exports`, and `fixture_sha256`.
-`public_exports` is a UTF-8-byte-sorted tuple of exact names. `signature` is canonical ASCII
+`source_relative_path`, `source_file_digest` (`RawBytesDigestV1`),
+`declaration_span_start_line`, `declaration_span_end_line`, `normalized_ast_digest`
+(`RawBytesDigestV1`), `public_exports`, `construction_fixture_digest`
+(`StructuredDigestV1[RootConstructionFixtureV1]`), and `snapshot_digest`
+(`StructuredDigestV1[RegistryRootSnapshotV1]`). `public_exports` is a UTF-8-byte-sorted tuple of
+exact names. `signature` is canonical ASCII
 `(<parameter-kind>:<name>:<annotation-or-none>:<default-or-required>,...)-><return-or-none>` derived
-from the static AST; executable annotations/defaults are forbidden. `fixture_sha256` binds the exact
-root construction fixture without constructing or traversing its result.
+from the static AST; executable annotations/defaults are forbidden.
+
+`RootConstructionFixtureV1` has exactly `fixture_id`, `root_id`, `fixture_set_id`,
+`fixture_set_digest` (`StructuredDigestV1[FixtureSetV1]`), `call_shape` (`CallShapeV1`),
+`expected_return_type_identity`, `expected_public_api_digest` (`StructuredDigestV1` over the exact
+sorted public method/property names and canonical signatures, domain
+`rquant-r07/RootPublicAPI/v1`), and `fixture_digest`
+(`StructuredDigestV1`, domain `rquant-r07/RootConstructionFixtureV1/v1`). Its call shape names the
+same module/export/signature as the paired root snapshot, and every referenced receiver/argument ID
+exists in the one complete fixture set. Root IDs, fixture IDs, and snapshot/fixture pairing are
+bijective. The proof validates source and API snapshots plus these construction inputs; it does not
+invoke the builder, construct its result, inspect a closure, or traverse an object graph.
+Every construction fixture references one manifest fixture set, every referenced value exists in
+that set, and every manifest fixture set is referenced; missing, extra, or cross-set IDs reject.
 
 The ten root IDs are exactly, in UTF-8 byte order:
 
@@ -910,7 +1042,52 @@ registry.main
 ```
 
 They map one-to-one to the two builtin registries plus the eight direct builders named immediately
-above this proof. The forbidden set is exactly:
+above this proof.
+
+`R07ForbiddenDefinitionManifestV1` has exactly `schema_version == 1`, `units`
+(relative-path-sorted exact `ForbiddenDefinitionUnitV1`), `forbidden_symbols` (qualified-name-sorted
+exact tuple), `resolver_identity` (the verifier's exact `R07ToolchainIdentityV1`),
+`resolver_rules_digest` (`StructuredDigestV1[ForbiddenResolverRulesV1]`), and
+`manifest_digest` (`StructuredDigestV1`, domain
+`rquant-r07/R07ForbiddenDefinitionManifestV1/v1`). `ForbiddenDefinitionUnitV1` has exactly
+`unit_id`, `module`, `source_relative_path`, `source_file_digest` (`RawBytesDigestV1`),
+`normalized_module_ast_digest` (`RawBytesDigestV1`), `top_level_definition_names`,
+`resolved_aliases`, `literal_exports`, `literal_registry_keys`, and `unit_digest`
+(`StructuredDigestV1`, domain `rquant-r07/ForbiddenDefinitionUnitV1/v1`). All four name tuples are
+duplicate-free and UTF-8-byte sorted; aliases contain exact `(local_name, qualified_target)` pairs.
+
+The reviewed fixture `tests/fixtures/r07_relational_release/forbidden-resolver-rules-v1.json` is an
+exact `ForbiddenResolverRulesV1` with fields `schema_version == 1`, `parser` (literal
+`cpython_ast`), `feature_version` (exact tuple `(3, 11)`), `mode` (literal `exec`),
+`recognized_top_level_nodes` (exact semantic-order tuple `FunctionDef`, `AsyncFunctionDef`,
+`ClassDef`, `Assign`, `AnnAssign`, `Import`, `ImportFrom`), `literal_collections` (exact tuple
+`tuple`, `list`, `dict`), `alias_scope` (literal `complete_definition_unit_set`),
+`resolution_order` (literal `utf8_path_fixed_point`), `forbidden_observations` (exact tuple
+`definition`, `alias`, `export`, `registry_key`), `unknown_behavior` (literal `block`), and
+`rules_digest` (`StructuredDigestV1`, domain `rquant-r07/ForbiddenResolverRulesV1/v1`). Tuple order
+and spelling are normative. The candidate cannot regenerate or rewrite this fixture during proof
+execution; its exact repo-diff identity and structured digest are externally approved.
+
+The complete Phase A definition-file set is exact and set-equal to:
+
+```text
+src/rquant/runtime_builder_daily_orchestrator.py
+src/rquant/runtime_builder_paper.py
+src/rquant/runtime_builder_serving.py
+src/rquant/runtime_builder_shadow.py
+src/rquant/runtime_builder_signal.py
+src/rquant/runtime_builder_strategy.py
+src/rquant/runtime_service_builtin.py
+src/rquant/runtime_service_main.py
+src/rquant/signal_route_spool.py
+```
+
+Missing, extra, duplicated, renamed, symlinked, or case-colliding units block. This is the complete
+definition universe for the two registries, eight direct builders, legacy spool boundary, and the
+only service modules allowed by the Phase A repo-diff policy to name activation/capability state.
+Any candidate production change outside this set is already blocked by the independently complete
+repository diff; changing this set requires an external policy and manifest revision. The exact
+forbidden-symbol set is:
 
 ```text
 rquant.signal_route_spool.CurrentSignalRouteSpoolWriter
@@ -925,13 +1102,20 @@ rquant.runtime_service_builtin.CURRENT_SIGNAL_HIGH_WATERMARK
 rquant.runtime_service_builtin.CURRENT_SIGNAL_DRAIN_CURSOR
 ```
 
-The static resolver parses only the exact candidate source files named by the root snapshots. It
-resolves module-level `def`, `class`, assignment targets, literal `__all__`, and literal registry
-keys to fully qualified names. A forbidden exact name, alias/export of one, dynamic import, generated
-registration, computed export/key, star import, unknown top-level executable statement, source/API
-digest change outside the repo manifest, or missing/extra root blocks. It does not execute imports,
-evaluate defaults/annotations, inspect bytecode, build a registry, or traverse closures or returned
-objects.
+The frozen resolver reads each exact UTF-8 source file with no import, uses
+`ast.parse(..., mode="exec", feature_version=(3, 11))`, and hashes the exact source bytes plus the
+UTF-8 bytes of `ast.dump(module, annotate_fields=True, include_attributes=False)`. It recognizes only
+module-level `FunctionDef`, `AsyncFunctionDef`, `ClassDef`, simple-name `Assign`/`AnnAssign`, literal
+`Import`/`ImportFrom`, literal string-tuple/list `__all__`, and literal string registry-dict keys. It
+resolves direct import aliases only when their target module is one of the nine exact units; alias
+resolution reaches a fixed point over the sorted unit set and a cycle, unresolved target, or
+ambiguous name blocks. Star imports, relative wildcard imports, computed assignments/exports/keys,
+dynamic import/registration, module `__getattr__`, generated code, executable annotation/default,
+unknown top-level executable statements, and source/AST/name-set drift block. A forbidden exact
+definition, alias, export, or literal registry key blocks. The resolver does not execute imports,
+evaluate expressions, inspect bytecode, instantiate a registry, construct a root, or traverse
+closures or returned objects. `R07RegistryRootManifestV1` and
+`R07ForbiddenDefinitionManifestV1` must both pass; neither substitutes for the other.
 
 ##### Exact Evidence And Artifact Binding
 
@@ -940,44 +1124,52 @@ committed as a self-updating golden file. It has exactly:
 
 ```text
 schema_version: strict native int == 1
-baseline_attestation_sha256: exact verified BaselineAttestationV1 digest
+baseline_attestation_digest: StructuredDigestV1[BaselineAttestationV1]
 candidate: exact nonnull-tag R07ReleaseRefV1
 candidate_ci_identity: exact R07PrincipalIdentityV1
-repo_diff_policy_sha256: lowercase SHA-256
-repo_diff_manifest_sha256: lowercase SHA-256
-boundary_manifest_sha256: lowercase SHA-256
-registry_root_manifest_sha256: lowercase SHA-256
+repo_diff_policy_digest: StructuredDigestV1[R07RepoDiffPolicyV1]
+repo_diff_manifest_digest: StructuredDigestV1[R07RepoDiffManifestV1]
+boundary_manifest_digest: StructuredDigestV1[R07BoundaryBehaviorManifestV1]
+registry_root_manifest_digest: StructuredDigestV1[R07RegistryRootManifestV1]
+forbidden_definition_manifest_digest: StructuredDigestV1[R07ForbiddenDefinitionManifestV1]
 verifier_identity: exact R07ToolchainIdentityV1
 runner_identity: exact R07ToolchainIdentityV1
 ci_workflow_identity: exact R07ToolchainIdentityV1
 build_command_argv: exact nonempty tuple[ASCII str, ...]
-build_command_sha256: lowercase SHA-256
+build_command_digest: StructuredDigestV1[tuple[ASCII str, ...]]
 build_python_minor: literal 3.12
-build_python_executable_sha256: lowercase SHA-256
+build_python_executable_digest: RawBytesDigestV1
 runner_image_identity: exact R07RunnerImageIdentityV1
 python_evidence: exact tuple[R07PythonEvidenceV1, R07PythonEvidenceV1]
 artifacts: exact semantic-order tuple[wheel, sdist, deployment_bundle]
 outcome: exact one of passed, blocked_diff, blocked_artifact, boundary_mutation, blocked_evidence
 failures: canonical sorted tuple[R07RelationalFailureV1, ...]
-result_sha256: lowercase SHA-256
+result_digest: StructuredDigestV1[ReleaseProofResultV1]
 ```
 
-`R07RunnerImageIdentityV1` has exactly `os`, `architecture`, `image`, `image_digest`, and
-`toolchain_lock_sha256`; all are nonempty ASCII and both digests are lowercase SHA-256.
+`R07RunnerImageIdentityV1` has exactly `os`, `architecture`, `image`, `image_manifest_digest`
+(`RawBytesDigestV1` over exact OCI manifest bytes), and `toolchain_lock_digest`
+(`RawBytesDigestV1`); all three string fields are nonempty ASCII.
 `build_command_argv` is exactly `python -I -S scripts/r07-relational-release.py build
 --candidate-commit <commit_sha> --candidate-tree <tree_sha> --output-dir dist/r07`; these are eleven
 array elements with the two attested lowercase Git IDs substituted and no shell. It runs under the
 attested 3.12 executable. The bound runner
 uses the locked build backend to produce the wheel and sdist, then a deployment bundle whose internal
-canonical manifest names those exact two filenames, sizes, and SHA-256 values. Deployment never
+canonical manifest names those exact two filenames, sizes, and raw content digests. Deployment never
 rebuilds any of the three.
-`R07PythonEvidenceV1` has exactly `python_minor`, `python_executable_sha256`, `runner_image_digest`,
-`test_entrypoint_sha256`, `test_command_sha256`, `stdout_sha256`, `junit_sha256`, `collected_count`,
-`passed_count`, `skipped_count`, `deselected_count`, and `passed`. It is ordered 3.11 then 3.12;
+`R07PythonEvidenceV1` has exactly `python_minor`, `python_executable_digest`
+(`RawBytesDigestV1`), `runner_image_manifest_digest` (`RawBytesDigestV1`),
+`test_entrypoint_digest` (`StructuredDigestV1`, domain
+`rquant-r07/R07PythonEvidenceV1/test_entrypoints/v1`), `test_command_digest`
+(`StructuredDigestV1`, domain `rquant-r07/R07PythonEvidenceV1/test_command/v1`),
+`stdout_digest` (`RawBytesDigestV1`), `junit_digest` (`RawBytesDigestV1`), `collected_count`,
+`passed_count`, `skipped_count`, `deselected_count`, `passed`, and `evidence_digest`
+(`StructuredDigestV1[R07PythonEvidenceV1]`). It is ordered 3.11 then 3.12;
 counts are strict native nonnegative integers; `passed=true` requires collected == passed > 0 and
 both excluded counts zero. `R07RelationalFailureV1` has exactly `kind` (`diff`, `artifact`,
-`boundary`, `evidence`, or `baseline`), nonempty canonical `subject`, and `detail_sha256`; entries
-sort by `(kind, subject, detail_sha256)`.
+`boundary`, `evidence`, or `baseline`), nonempty canonical `subject`, and `detail_digest`
+(`StructuredDigestV1`, domain `rquant-r07/R07RelationalFailureV1/detail/v1`); entries sort by
+`(kind, subject, detail_digest.sha256)`.
 
 An external authority, not the candidate workflow or deployment process, converts a passed result
 into `ReleaseAttestationV1`. It has exactly:
@@ -986,75 +1178,95 @@ into `ReleaseAttestationV1`. It has exactly:
 schema_version: strict native int == 1
 status: exact approved_for_deploy or deployed
 release: exact candidate R07ReleaseRefV1
-baseline_attestation_sha256: lowercase SHA-256
-release_proof_result_sha256: lowercase SHA-256
-repo_diff_policy_sha256: lowercase SHA-256
-repo_diff_manifest_sha256: lowercase SHA-256
-boundary_manifest_sha256: lowercase SHA-256
-registry_root_manifest_sha256: lowercase SHA-256
-verifier_identity_sha256: lowercase SHA-256
-runner_identity_sha256: lowercase SHA-256
-ci_workflow_identity_sha256: lowercase SHA-256
-toolchain_identities_sha256: lowercase SHA-256
-runner_image_digest: lowercase SHA-256
-build_command_sha256: lowercase SHA-256
+baseline_attestation_digest: StructuredDigestV1[BaselineAttestationV1]
+release_proof_result_digest: StructuredDigestV1[ReleaseProofResultV1]
+repo_diff_policy_digest: StructuredDigestV1[R07RepoDiffPolicyV1]
+repo_diff_manifest_digest: StructuredDigestV1[R07RepoDiffManifestV1]
+boundary_manifest_digest: StructuredDigestV1[R07BoundaryBehaviorManifestV1]
+registry_root_manifest_digest: StructuredDigestV1[R07RegistryRootManifestV1]
+forbidden_definition_manifest_digest: StructuredDigestV1[R07ForbiddenDefinitionManifestV1]
+verifier_identity_digest: StructuredDigestV1[R07ToolchainIdentityV1]
+runner_identity_digest: StructuredDigestV1[R07ToolchainIdentityV1]
+ci_workflow_identity_digest: StructuredDigestV1[R07ToolchainIdentityV1]
+toolchain_identities_digest: StructuredDigestV1[tuple[R07ToolchainIdentityV1, ...]]
+runner_image_manifest_digest: RawBytesDigestV1
+build_command_digest: StructuredDigestV1[tuple[ASCII str, ...]]
 build_python_minor: literal 3.12
-build_python_executable_sha256: lowercase SHA-256
-python_evidence_sha256: exact tuple[R07PythonEvidenceDigestV1, R07PythonEvidenceDigestV1]
+build_python_executable_digest: RawBytesDigestV1
+python_evidence_digests: exact tuple[R07PythonEvidenceDigestV1, R07PythonEvidenceDigestV1]
 artifacts: exact semantic-order tuple[wheel, sdist, deployment_bundle]
 candidate_ci_identity: exact R07PrincipalIdentityV1
 deployment_runtime_identity: exact R07PrincipalIdentityV1
 approver: exact R07PrincipalIdentityV1
 signer: exact R07PrincipalIdentityV1
-issuer: exact R07PrincipalIdentityV1
 write_boundary: exact R07ExternalWriteBoundaryV1
 external_storage_uri: exact immutable object URI
-approval_record_sha256: lowercase SHA-256
-approved_attestation_sha256: lowercase SHA-256 or null
-deploy_record_sha256: lowercase SHA-256 or null
+approval_record_digest: StructuredDigestV1[R07ApprovalRecordV1]
+approved_attestation_digest: StructuredDigestV1[ReleaseAttestationV1] or null
+deploy_record_digest: StructuredDigestV1[R07DeployRecordV1] or null
 issued_at: canonical UTC timestamp
 signature_algorithm: literal ed25519
 signature_base64: canonical padded RFC 4648
-attestation_sha256: lowercase SHA-256
+attestation_digest: StructuredDigestV1[ReleaseAttestationV1]
 ```
 
 `R07ApprovalRecordV1` has exactly `schema_version == 1`, `approval_id`, `release`,
-`release_proof_result_sha256`, `decision` (literal `approve`), `approver`, `approved_at`, and
-`record_sha256`. `R07DeployRecordV1` has exactly `schema_version == 1`, `deployment_id`, `release`,
-`approved_attestation_sha256`, `deployment_bundle_sha256`, `target_deployment_identity`,
-`previous_release`, `started_at`, `completed_at`, `outcome` (literal `deployed`),
-`deployment_log_sha256`, and `record_sha256`. IDs are nonempty ASCII; times use canonical UTC;
-`completed_at` is not earlier than `started_at`; both record digests use the general domain-separated
-rule. The approval/deploy digest fields in attestations must resolve to exact externally stored record
-bytes of these types under the same append-once write boundary.
+`release_proof_result_digest` (`StructuredDigestV1[ReleaseProofResultV1]`), `decision` (literal
+`approve`), `approver`,
+`approved_at`, `signature_algorithm` (literal `ed25519`), `signature_base64`, and `record_digest`
+(`StructuredDigestV1[R07ApprovalRecordV1]`). Its signature preimage is ASCII
+`rquant-r07/R07ApprovalRecordV1/signature/v1\0` plus canonical bytes with `signature_base64` and
+`record_digest` omitted. `R07DeployRecordV1` has exactly `schema_version == 1`, `deployment_id`,
+`release`, `approved_attestation_digest` (`StructuredDigestV1[ReleaseAttestationV1]`),
+`deployment_bundle_digest`
+(`RawBytesDigestV1`), `target_deployment_identity`, `record_writer`, `previous_release`, `started_at`,
+`completed_at`, `outcome` (literal `deployed`), `deployment_log_digest` (`RawBytesDigestV1`),
+`signature_algorithm`, `signature_base64`, and `record_digest`
+(`StructuredDigestV1[R07DeployRecordV1]`). Its signature uses the equivalent fixed
+`rquant-r07/R07DeployRecordV1/signature/v1\0` preimage. IDs are nonempty ASCII; times use canonical
+UTC; completed time is not earlier than started time. Attestation record digests resolve to exact
+externally stored canonical records under the same append-once boundary.
 
-`R07PythonEvidenceDigestV1` has exactly `python_minor` (`3.11` or `3.12`) and
-`evidence_sha256`; its tuple order is 3.11 then 3.12.
+`R07PythonEvidenceDigestV1` has exactly `python_minor` (`3.11` or `3.12`) and `evidence_digest`
+(`StructuredDigestV1[R07PythonEvidenceV1]`); its tuple order is 3.11 then 3.12.
 
-The two candidate/deployment identity fields equal the CI evidence subject and the deploy target
-identity respectively. Approver, signer, issuer, candidate CI runner, and deployment runtime are
-distinct identities except
-that signer and issuer may be the same only when `identity_kind=offline_ed25519_key`; signer must
-have that identity kind, and `signature_base64` must decode to exactly 64 Ed25519 signature bytes;
-candidate and
-deployment identities are never approver/signer/issuer and have no write permission at the external
-boundary. Signature bytes cover ASCII `rquant-r07/ReleaseAttestationV1/signature/v1\0` followed by
-canonical bytes with `signature_base64` and `attestation_sha256` omitted; `attestation_sha256` then
-uses the general digest rule and includes the signature. `approved_for_deploy` requires null
-`approved_attestation_sha256` and null `deploy_record_sha256`; `deployed` requires both nonnull, with
-`approved_attestation_sha256` naming the exact prior approved object and an
-external deploy record binding the exact tag, commit/tree, deployment-bundle hash, target deployment
-identity, completion outcome, and prior approved attestation digest. No candidate-generated file,
-repository fixture, Git tag, CI artifact, `DEPLOY.md` line, or production-local record can approve
-itself or substitute for the external signer and append-once store.
+Principal and signature mapping is equality-based, not role-name inference:
+
+1. `ReleaseAttestationV1.signer == write_boundary.writer`; `R07DeployRecordV1.record_writer` equals
+   that same writer. Both signatures resolve the writer's exact `(issuer,key_id)` in the external
+   trust map, compare all `R07PrincipalIdentityV1` fields including the actual public-key raw digest,
+   and verify with those resolved bytes. Writer has `identity_kind=offline_ed25519_key`.
+2. `ReleaseAttestationV1.approver == R07ApprovalRecordV1.approver ==
+   write_boundary.approver`. The approval-record signature resolves and verifies the approver's own
+   `(issuer,key_id)` entry. Approver also has `identity_kind=offline_ed25519_key`; writer and
+   approver keys and principal IDs are distinct.
+3. `candidate_ci_identity` equals the CI evidence principal; `deployment_runtime_identity` equals
+   the deploy target principal; both differ from writer, approver, and reader and have no external
+   create, overwrite, delete, ACL, or key-map permission.
+4. Every signed payload decodes to exactly 64 Ed25519 signature bytes. Unknown issuer/key ID,
+   public-key digest mismatch, principal-field mismatch, wrong role mapping, wrong preimage domain,
+   or signature failure rejects before approval or deployment. The issuer is the exact
+   `R07PrincipalIdentityV1.issuer`; there is no separate free-form attestation issuer.
+
+Release-attestation signature bytes cover ASCII
+`rquant-r07/ReleaseAttestationV1/signature/v1\0` followed by canonical bytes with
+`signature_base64` and `attestation_digest` omitted. `attestation_digest` is then recomputed over the
+complete signed object including the signature. `approved_for_deploy` requires null
+`approved_attestation_digest` and null `deploy_record_digest`; `deployed` requires both nonnull, with
+the approved digest naming the exact prior approval attestation and an external deploy record binding
+the exact tag, commit/tree, deployment-bundle raw digest, target deployment identity, completion
+outcome, writer, and prior approval. No candidate-generated file, repository fixture, Git tag, CI
+artifact, `DEPLOY.md` line, or production-local record can approve itself or substitute for the
+external signer, approver, trust map, or append-once store.
 The approval object's URI ends in `/release/<commit_sha>/approved_for_deploy.json`; the deployed
 object's URI ends in `/release/<commit_sha>/deployed.json`. Status/URI mismatch, an existing object
 with different bytes, overwrite, delete, or second create rejects.
 
 The CI build starts from a clean checkout of `candidate.tree_sha`, validates the verified baseline
 attestation plus all literal fixture digests, derives the complete repository diff, runs the exact
-boundary/root/release suites on Python 3.11 and 3.12, and builds wheel, sdist, and deployment bundle
-with the bound argv and image. The result records all three hashes. The external authority verifies
+boundary/root/forbidden-definition/release suites on Python 3.11 and 3.12, and builds wheel, sdist,
+and deployment bundle with the bound argv and image. The result records all three raw artifact
+digests. The external authority verifies
 the result and emits `approved_for_deploy`. Release packaging or deployment cannot regenerate or
 amend a manifest, result, approval, or digest.
 
@@ -1067,10 +1279,12 @@ or artifact copied from another run blocks.
 
 The deploy frontend accepts only the attested annotated tag. Before any checkout or service mutation,
 it proves: the tag peels to the attested commit/tree; the verified baseline attestation digest and
-the repo-policy, repo-diff, boundary, and root-manifest digests equal the proof and approval;
+the repo-policy, repo-diff, boundary, root-manifest, and forbidden-definition-manifest structured
+digests equal the proof and approval;
 verifier, runner, workflow, build command,
 image, Python evidence, wheel, sdist, and deployment-bundle identities equal exactly; the supplied
-bundle bytes hash to the approved deployment-bundle digest; and the approval URI/signature/write
+bundle bytes hash directly to the approved raw deployment-bundle digest; and the approval
+URI/signature/write
 boundary verify. It installs only those bundle bytes. After success, the external authority appends
 the exact deploy record and `deployed` attestation. Production does not recompute approval evidence.
 Any missing `verified` baseline, mismatch, local-only approval, mutable URI, unauthorized writer,
@@ -1091,18 +1305,22 @@ capability-analysis findings directly:
 | `R07-CA-P1-03` | Baseline/candidate Git trees, fixture digests, CI evidence, and built artifact digests are bound into one external result and checked again by deployment. |
 | `R07-CA-P1-04` | `boundary_mutation` and `blocked_diff` replace the incoherent current-plus-sink composition verdict. |
 
-The relational-proof review ledger closes as follows; closure is architectural until its mapped red
-tests pass and the external baseline changes from `pending_external` to `verified`:
+This second relational-proof specification follow-up keeps the ledger IDs stable. P1-02 remains
+`CLOSED` with its complete-repository-diff contract unchanged; this follow-up only strengthens digest
+typing referenced by that contract. The other four closures are architectural until their mapped
+red tests pass, and release remains blocked until the external baseline changes from
+`pending_external` to `verified`:
 
-| Finding | Frozen closure |
-|---|---|
-| `R07-RR-SPEC-P1-01` | `BaselineAttestationV1` distinguishes locally proven Git ancestry from externally attested deployment; absent tag/deploy/artifact/signer evidence is `pending_external` and blocks. |
-| `R07-RR-SPEC-P1-02` | `R07RepoDiffManifestV1` is set-equal to the complete Git tree diff and binds verifier, runner, tests, workflow, build, and deploy identities; no `src/rquant`-only filter remains. |
-| `R07-RR-SPEC-P1-03` | `BoundaryProbeV1` freezes the exact public call, arguments, fixture bytes, expected failure, mutation guards, and canonical before/after snapshots; nearest-entrypoint substitution is removed. |
-| `R07-RR-SPEC-P1-04` | `RegistryRootSnapshotV1` covers the exact ten roots with static module/export/signature/source/fixture evidence and one exact forbidden-symbol resolver, without closure traversal. |
-| `R07-RR-SPEC-P1-05` | `ReleaseProofResultV1` and externally issued `ReleaseAttestationV1` bind the same tag/tree/manifests/toolchain/image/command/interpreter evidence/all three artifacts, prevent candidate self-approval, and require exact deployment matching plus an external deploy record. |
+| Finding | Status | Frozen closure |
+|---|---|---|
+| `R07-RR-SPEC-P1-01` | `CLOSED (spec)` | `HistoricalTrustRootV1` -> `HistoricalBaselineMigrationProofV1` -> `HistoricalBaselineDeploymentAttestationV1` is an acyclic, externally signed deployment trust chain with no prior R07 approval reference; verified `BaselineAttestationV1` only references its digest, while absent real evidence remains `pending_external` and blocks. |
+| `R07-RR-SPEC-P1-02` | `CLOSED (unchanged)` | `R07RepoDiffManifestV1` is set-equal to the complete Git tree diff and binds verifier, runner, tests, workflow, build, and deploy identities; no `src/rquant`-only filter remains. |
+| `R07-RR-SPEC-P1-03` | `CLOSED (spec)` | Strict `FixtureValueV1`/`FixtureSetV1` and `CallShapeV1` freeze raw bytes, parsed type, complete fixture namespace, seed/environment, and exact args/kwargs binding; every probe may cite only IDs in its one attested complete set. |
+| `R07-RR-SPEC-P1-04` | `CLOSED (spec)` | Ten static `RegistryRootSnapshotV1` records and strict `RootConstructionFixtureV1` inputs remain separate from `R07ForbiddenDefinitionManifestV1`, whose exact nine-file universe includes `signal_route_spool.py` and whose frozen resolver blocks forbidden definition/alias/export/key evidence. |
+| `R07-RR-SPEC-P1-05` | `CLOSED (spec)` | Raw bytes and structured digests have disjoint preimages; every principal binds issuer, key ID, and actual public-key digest; writer and approver signatures map by exact principal equality to the external ACL; proof, artifacts, approval, and deploy records remain exactly bound. |
 
-Implementation is limited to the frozen repo-diff policy, boundary manifest, root manifest, external
+Implementation is limited to the frozen repo-diff policy, boundary/fixture manifest, root/fixture
+manifest, forbidden-definition rules and manifest, external historical-baseline evidence, external
 repo-diff evidence, one offline verifier module, one runner, the two named test modules, the one exact
 CI job, build evidence, and fail-closed checks in
 the existing deploy frontend/bootstrap/engine. The external authority supplies attestations through
@@ -1645,11 +1863,11 @@ The reset finding ledger is stable:
 | `RESET-REG-P0` | caller/service-forged evidence, generation-self-authorized vectors, or stale authority can create receipts or `READY` | external root policy, OS-separated verifier/child, strict IPC, lock revalidation, and root-owned append store |
 | `RESET-REG-P1` | successor or overlay grafts current semantics onto v2 or declares nonexistent/future models | unchanged-v2 evidence, actual-model descriptors, and successor-before-overlay enforcement |
 | `RESET-REG-P2` | count-only readiness, concurrent divergence, expiry/rollback ambiguity, generation-return replay, or audit leakage | exact set/epoch/CAS/lifecycle tests and bounded audit schema |
-| `R07-RR-SPEC-P1-01` | Git ancestry is presented as proof that the baseline was deployed | verified external `BaselineAttestationV1`; current `pending_external` blocks until exact tag/deploy record/artifact/signer/issuer/write-boundary evidence exists |
+| `R07-RR-SPEC-P1-01` | Git ancestry or a prior R07 approval is presented as proof that the baseline was deployed | independent externally provisioned `HistoricalTrustRootV1`, migration proof, and historical deployment attestation form an acyclic chain; verified `BaselineAttestationV1` only references that chain and current `pending_external` blocks |
 | `R07-RR-SPEC-P1-02` | a `src/rquant`-only comparison omits workflow, verifier, runner, test, build, deploy, dependency, mode, delete, or rename changes | complete repository tree-diff set equality and exact toolchain identities in `R07RepoDiffManifestV1` |
-| `R07-RR-SPEC-P1-03` | an underspecified or substituted probe rejects after a hidden durable mutation | exact `BoundaryProbeV1` call/fixture/failure/guard/snapshot evidence at the inventory public entrypoint, with no nearest-entrypoint escape |
-| `R07-RR-SPEC-P1-04` | registry roots change API or expose a forbidden writer while object traversal gives ambiguous evidence | exact static `RegistryRootSnapshotV1` set and frozen forbidden-symbol resolver over ten roots |
-| `R07-RR-SPEC-P1-05` | candidate/CI/deployer self-approves mismatched source, tests, image, commands, artifacts, or deployment | externally signed append-once `ReleaseAttestationV1` binding proof result, all three artifacts, exact deploy match, and deployed record |
+| `R07-RR-SPEC-P1-03` | an underspecified call shape, partial fixture namespace, inherited environment, or substituted probe rejects after a hidden durable mutation | exact `CallShapeV1`, complete `FixtureSetV1`, raw fixture bytes/type/digest, deterministic seed/environment, and public-entrypoint guard/snapshot evidence |
+| `R07-RR-SPEC-P1-04` | root-only scanning omits a forbidden definition file or construction input while object traversal gives ambiguous evidence | separate exact ten-root snapshots/fixtures plus exact nine-unit forbidden-definition manifest and frozen static resolver |
+| `R07-RR-SPEC-P1-05` | digest-domain ambiguity or unmapped signer/approver keys lets candidate/CI/deployer self-approve mismatched evidence or deployment | disjoint raw/structured digest schemas, externally resolved issuer/key/public-key identities, exact ACL role equality, signed approval/deploy records, and exact artifact binding |
 | `RESET-R07-P2-01` | an identical post-link retry can publish a pointer without re-establishing records-directory durability | future v3-only primitive re-fsyncs the records directory; byte conflict rejects before pointer mutation |
 | `RESET-REG-P0-01` | generation code, self-consistent manifests/vectors/results, a service, or forged IPC can acquire append authority | fixed external root policy authorizes exact release hashes; root never imports generation code; unprivileged child has no store/verifier capability; root validates and writes after child exit |
 | `RESET-REG-P1-01` | underspecified successor/overlay schemas permit alternate bytes, order, identity, or nonexistent models | four exact schemas, canonical preimages/raw bytes, strict structural rejection, and actual-model prerequisite |
@@ -1663,11 +1881,11 @@ The planned red-test matrix is exact:
 | `RESET-R07-P1` | `tests/fixtures/signal_route_spool_v2_differential/manifest.json`; `tests/unit/test_signal_route_spool_v2_differential.py` | frozen valid and invalid corpus proves untouched v2 bytes, `ensure_ascii=True`, hashes, models, and public error category/sequence before and after dispatcher introduction |
 | `RESET-R07-P1`, `RESET-R07-P2` | `tests/unit/test_current_signal_route_spool_record_v3.py` | exact `E`/`R`/outer bytes and hashes, strict JSON, exact types, all-v2 and one-way mixed chain, v3-first production rejection, isolated decoder-only all-v3 fixture, pointer neutrality, and synthetic crash/orphan/retry state-machine cases without a durable writer |
 | `RESET-R07-P2-01` | future `tests/unit/test_current_signal_route_spool_v3_publication_contract.py` in the separately authorized writer tranche | v3 primitive is separate from byte-identical v2 `_immutable_write_at`; crash after link and before directory fsync makes identical retry fsync the records directory again before pointer work; differing bytes reject before pointer mutation; Phase A/builders cannot import or reach the primitive |
-| `R07-RR-SPEC-P1-01` | `tests/unit/test_signal_family_relational_release.py::TestBaselineAttestation` | the real frozen baseline fixture is `pending_external` because tag/deploy evidence is absent and blocks; partial/null mixtures, fabricated local deploy records, wrong tag peel/tree/artifact, mutable URI, same signer/issuer where forbidden, candidate/deployer write authority, and invalid external signature reject; a synthetic externally verified fixture passes |
+| `R07-RR-SPEC-P1-01` | `tests/unit/test_signal_family_relational_release.py::TestHistoricalBaselineDeploymentAttestation`; `tests/unit/test_signal_family_relational_release.py::TestBaselineAttestation` | the real frozen baseline is `pending_external`; local Git/DEPLOY/R07 approval cannot satisfy it; trust-root cycles/backreferences, candidate-writable roots, wrong historical raw bytes/tag/tree/artifact/migration proof, URI/ACL/signer/key-map/signature mismatches, and partial references reject; one synthetic independent external chain verifies and is the only input accepted by `status=verified` |
 | `R07-RR-SPEC-P1-02` | `tests/unit/test_signal_family_relational_release.py::TestCompleteRepoDiff`; `tests/fixtures/r07_relational_release/repo-diff-policy-v1.json` | exact whole-tree set equality covers mode/blob/content plus add/modify/delete and rename-as-delete-plus-add; mutations to production, docs, tests, fixtures, workflow, verifier, runner, manifests, build/dependency files, deploy frontend/bootstrap/engine, test entrypoints, action pins, argv, or Git modes block; the committed policy cannot contain candidate hashes and the external manifest cannot be written or approved by the candidate |
-| `R07-RR-SPEC-P1-03` | `tests/unit/test_signal_family_relational_boundaries.py` | every non-registry inventory row has exact public-entrypoint probes for its fixed direct/stored-byte/batch coverage; argument, fixture bytes/hash, call shape, exception/category/token, guard, and canonical domain snapshot mutations block; guard counts remain zero and all before/after digests equal on rejection |
-| `R07-RR-SPEC-P1-04` | `tests/unit/test_signal_family_relational_release.py::TestRegistryRootSnapshots` | exact ten-root set, module/export/signature/source declaration/API exports/fixture digest and exact forbidden set pass; missing/extra/renamed roots, forbidden definition/alias/export/literal registry key, dynamic import/registration/export, executable annotation/default, source drift, and unknown statement block without import or construction |
-| `R07-RR-SPEC-P1-05` | `tests/unit/test_signal_family_relational_release.py::TestReleaseBinding`; CI job `r07-relational-release` | canonical model/metamorphic tests give identical bytes to independent builders and reject duplicate/extra/coerced/reordered data; both Python versions have zero skips/deselections; tag/tree/manifests/verifier/runner/workflow/image/build argv/evidence/wheel/sdist/bundle/signature/approval/deploy-record mismatches block before deployment; candidate self-approval and production recomputation reject |
+| `R07-RR-SPEC-P1-03` | `tests/unit/test_signal_family_relational_boundaries.py::TestFixtureSets`; `tests/unit/test_signal_family_relational_boundaries.py::TestExactBoundaryCalls` | every non-registry row has exact direct/stored-byte/batch probes; missing/extra/cross-set IDs, raw bytes/type/parser/digest drift, seed/environment/inheritance drift, args/kwargs/receiver/default/variadic/call-mode changes, expected-failure drift, nonzero guard, or unequal structured snapshots block |
+| `R07-RR-SPEC-P1-04` | `tests/unit/test_signal_family_relational_release.py::TestRegistryRootSnapshots`; `tests/unit/test_signal_family_relational_release.py::TestForbiddenDefinitionManifest` | exact ten roots and strict construction fixtures pass independently from exact nine definition units including `signal_route_spool.py`; unit/source/AST/rules digest drift, missing/extra file, forbidden definition/alias/export/key, dynamic behavior, executable annotation/default, or unknown statement blocks without import, construction, closure, or object traversal |
+| `R07-RR-SPEC-P1-05` | `tests/unit/test_signal_family_relational_release.py::TestDigestDomains`; `tests/unit/test_signal_family_relational_release.py::TestReleaseBinding`; CI job `r07-relational-release` | independent builders produce identical canonical structured bytes; raw-vs-structured substitution and every duplicate/extra/coerced/reordered value reject; unknown issuer/key, public-key digest mismatch, signer != writer, approver != record/boundary approver, candidate/deployer write authority, signature/preimage drift, tag/tree/manifest/image/command/Python/wheel/sdist/bundle/approval/deploy mismatch all block before deployment |
 | `RESET-REG-P1`, `RESET-REG-P1-01` | `tests/unit/test_signal_family_successor_registry_reset.py` | v2 parser/catalog/bytes/hashes/history are unchanged; exact four-schema field sets, hash preimages, raw canonical bytes, strict duplicate/extra/coercion/order rejection; successor declaration rejects before the actual model exists; v2 semantic/partial/absent/conflicting overlay never becomes ready |
 | `RESET-REG-P0`, `RESET-REG-P1`, `RESET-REG-P1-02` | `tests/integration/test_signal_family_verification_reset.py` | all five pair IDs resolve exact callable objects through real production builders and manifest-backed source hashes; exact service bindings cover the pair-derived service set and reject missing/duplicate/cross-role/wrong module/path/source hash before child execution; only a successful immutable child run can lead the root verifier to persist five receipts |
 | `RESET-REG-P0-01` | `tests/integration/test_signal_family_root_verifier_isolation.py` | child module inspection/import cannot discover or import privileged verifier/store authority; direct store open/append fails; no inherited descriptor/path/capability exists; forged, extra, oversized, noncanonical, or wrong-result IPC rejects; caller/service evidence APIs do not exist; authority change between child completion and root append rejects |
