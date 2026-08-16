@@ -47,25 +47,25 @@ def test_probe_runner_disables_dotenv_before_any_rquant_import(
     policy_path = ROOT / "tests/fixtures/r07_differential_gate/policy-v1.json"
     probe_path = tmp_path / "probe"
     code = f"""
+import importlib.util
 import json
 import os
 import sys
 from pathlib import Path
 
+facade_name = "tests.r07_differential_probe_runner"
+facade_spec = importlib.util.find_spec(facade_name)
+assert facade_spec is not None
+assert facade_spec.loader is not None
+runner = importlib.util.module_from_spec(facade_spec)
 before_environment = tuple(os.environ.items())
-before_rquant_modules = {{
-    name
-    for name in sys.modules
-    if name == "rquant" or name.startswith("rquant.")
-}}
-import tests.r07_differential_probe_runner as runner
+before_path = tuple(sys.path)
+before_module_keys = frozenset(sys.modules)
+facade_spec.loader.exec_module(runner)
 assert tuple(os.environ.items()) == before_environment
-after_rquant_modules = {{
-    name
-    for name in sys.modules
-    if name == "rquant" or name.startswith("rquant.")
-}}
-assert after_rquant_modules == before_rquant_modules
+assert tuple(sys.path) == before_path
+assert frozenset(sys.modules) == before_module_keys
+before_modules = tuple((name, id(module)) for name, module in sys.modules.items())
 result = runner.run_boundary_probe_subprocess(
     policy_path=Path({str(policy_path)!r}),
     inventory_id="R07-B01",
@@ -73,8 +73,23 @@ result = runner.run_boundary_probe_subprocess(
     fail_on_dotenv_read=True,
 )
 assert tuple(os.environ.items()) == before_environment
+assert tuple(sys.path) == before_path
+assert tuple((name, id(module)) for name, module in sys.modules.items()) == before_modules
 assert result["inventory_id"] == "R07-B01"
 assert result["passed"] is True
+try:
+    runner.run_boundary_probe_subprocess(
+        policy_path=Path({str(policy_path)!r}),
+        inventory_id="R07-B99",
+        tmp_path=Path({str(probe_path)!r}),
+    )
+except AssertionError:
+    pass
+else:
+    raise AssertionError("invalid inventory must fail")
+assert tuple(os.environ.items()) == before_environment
+assert tuple(sys.path) == before_path
+assert tuple((name, id(module)) for name, module in sys.modules.items()) == before_modules
 print(json.dumps({{"status": "parent-unchanged-child-isolated"}}, sort_keys=True))
 """
     environment = {

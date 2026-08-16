@@ -2661,6 +2661,7 @@
 {"nodeid":"tests/unit/test_signal_family_differential_gate.py::test_normative_baseline_pair_and_candidate_repository_identity"}
 {"nodeid":"tests/unit/test_signal_family_differential_gate.py::test_policy_completeness_rejects_any_declaration_or_universe_omission"}
 {"nodeid":"tests/unit/test_signal_family_differential_gate.py::test_policy_is_canonical_and_binds_requested_baseline"}
+{"nodeid":"tests/unit/test_signal_family_differential_gate.py::test_private_verifier_rejects_self_consistent_fake_and_wrong_binding_wires"}
 {"nodeid":"tests/unit/test_signal_family_differential_gate.py::test_production_declaration_spans_and_normalized_asts_are_exact"}
 {"nodeid":"tests/unit/test_signal_family_differential_gate.py::test_python311_normalizer_runs_when_local_runtime_is_usable_or_records_ci_need"}
 {"nodeid":"tests/unit/test_signal_family_differential_gate.py::test_root_snapshots_are_static_and_cover_ten_roots"}

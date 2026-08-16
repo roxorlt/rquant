@@ -1182,6 +1182,7 @@
 {"nodeid":"tests/unit/test_presets.py::TestScreenPreset::test_preset_is_dataclass"}
 {"nodeid":"tests/unit/test_price_adjustment.py::test_resolve_price_basis_adjustment_detects_discontinuity"}
 {"nodeid":"tests/unit/test_price_adjustment.py::test_resolve_price_basis_adjustment_ignores_small_rounding_noise"}
+{"nodeid":"tests/unit/test_r07_probe_import_isolation.py::test_child_environment_is_empty_derived_and_has_fixed_two_entry_pythonpath"}
 {"nodeid":"tests/unit/test_r07_probe_import_isolation.py::test_probe_runner_disables_dotenv_before_any_rquant_import"}
 {"nodeid":"tests/unit/test_reference_slow_publisher.py::test_builds_complete_bounded_reference_serving_projection_contract"}
 {"nodeid":"tests/unit/test_reference_slow_publisher.py::test_daily_fact_requires_exact_prior_session_adjustment_factor"}
