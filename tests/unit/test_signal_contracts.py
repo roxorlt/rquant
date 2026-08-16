@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
@@ -16,14 +18,130 @@ _HASH_C = "c" * 64
 _COMMIT = "d" * 40
 _ZERO_COMMIT = "0" * 40
 
-_LEGACY_SIGNAL_IDS = {
-    (1, _ZERO_COMMIT): "f9c779c01399c7c6554778335bed19107206b7114c1f54c9e04929296e4e4da2",
-    (1, _COMMIT): "cd7afd6b503b390c268d07ccc10c782ec5c181c97deb39927298d04227e58f4c",
-    (2, _ZERO_COMMIT): "58776536fa077ad048c31d0cd930e48844ea233715eb3962192ddb149d02e157",
-    (2, _COMMIT): "60281eb0d1c2fa8ab0d3a04d6dc385d45905e458f20ed6ed208656e4718635b0",
-    (3, _ZERO_COMMIT): "95f72b6d9c7233438c3b97726aeff7da19b6b9ece2dc7138f1ff520197158744",
-    (3, _COMMIT): "28fdb6371fce685ebefbd43699ee761645280ed80d8ef01dcf8d16f205874c43",
-}
+_LEGACY_CANONICAL_FIXTURES = (
+    (
+        1,
+        _ZERO_COMMIT,
+        "f9c779c01399c7c6554778335bed19107206b7114c1f54c9e04929296e4e4da2",
+        (
+            b'{"action":"b_intent","available_at":"2026-07-31T01:32:00Z",'
+            b'"candidate_id":"600000.SH","dataset_snapshot_id":"bbbbbbbbbbbbbbbbbbbbbbbb'
+            b'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","event_time":"2026-07-31T01:31:00Z",'
+            b'"evidence":{"levels":{"resistance":10.2},"volume_ratio":2.5},'
+            b'"expires_at":"2026-07-31T02:00:00Z","feature_snapshot_id":"cccccccccccccccc'
+            b'cccccccccccccccccccccccccccccccccccccccccccccccc","parameter_fingerprint":"'
+            b'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+            b'"producer_commit":"0000000000000000000000000000000000000000",'
+            b'"reason_codes":["above_vwap","same_minute_volume"],"schema_version":1,'
+            b'"signal_id":"f9c779c01399c7c6554778335bed19107206b7114c1f54c9e04929296e4e4da2",'
+            b'"strategy_id":"n-shape","strategy_version":"2.1.0"}'
+        ),
+    ),
+    (
+        1,
+        _COMMIT,
+        "cd7afd6b503b390c268d07ccc10c782ec5c181c97deb39927298d04227e58f4c",
+        (
+            b'{"action":"b_intent","available_at":"2026-07-31T01:32:00Z",'
+            b'"candidate_id":"600000.SH","dataset_snapshot_id":"bbbbbbbbbbbbbbbbbbbbbbbb'
+            b'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","event_time":"2026-07-31T01:31:00Z",'
+            b'"evidence":{"levels":{"resistance":10.2},"volume_ratio":2.5},'
+            b'"expires_at":"2026-07-31T02:00:00Z","feature_snapshot_id":"cccccccccccccccc'
+            b'cccccccccccccccccccccccccccccccccccccccccccccccc","parameter_fingerprint":"'
+            b'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+            b'"producer_commit":"dddddddddddddddddddddddddddddddddddddddd",'
+            b'"reason_codes":["above_vwap","same_minute_volume"],"schema_version":1,'
+            b'"signal_id":"cd7afd6b503b390c268d07ccc10c782ec5c181c97deb39927298d04227e58f4c",'
+            b'"strategy_id":"n-shape","strategy_version":"2.1.0"}'
+        ),
+    ),
+    (
+        2,
+        _ZERO_COMMIT,
+        "58776536fa077ad048c31d0cd930e48844ea233715eb3962192ddb149d02e157",
+        (
+            b'{"action":"b_intent","available_at":"2026-07-31T01:32:00Z",'
+            b'"candidate_id":"600000.SH","dataset_snapshot_id":"bbbbbbbbbbbbbbbbbbbbbbbb'
+            b'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","event_time":"2026-07-31T01:31:00Z",'
+            b'"evidence":{"levels":{"resistance":10.2},"volume_ratio":2.5},'
+            b'"expires_at":"2026-07-31T02:00:00Z","feature_snapshot_id":"cccccccccccccccc'
+            b'cccccccccccccccccccccccccccccccccccccccccccccccc","parameter_fingerprint":"'
+            b'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+            b'"producer_commit":"0000000000000000000000000000000000000000",'
+            b'"reason_codes":["above_vwap","same_minute_volume"],"schema_version":2,'
+            b'"signal_id":"58776536fa077ad048c31d0cd930e48844ea233715eb3962192ddb149d02e157",'
+            b'"strategy_id":"n-shape","strategy_version":"2.1.0"}'
+        ),
+    ),
+    (
+        2,
+        _COMMIT,
+        "60281eb0d1c2fa8ab0d3a04d6dc385d45905e458f20ed6ed208656e4718635b0",
+        (
+            b'{"action":"b_intent","available_at":"2026-07-31T01:32:00Z",'
+            b'"candidate_id":"600000.SH","dataset_snapshot_id":"bbbbbbbbbbbbbbbbbbbbbbbb'
+            b'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","event_time":"2026-07-31T01:31:00Z",'
+            b'"evidence":{"levels":{"resistance":10.2},"volume_ratio":2.5},'
+            b'"expires_at":"2026-07-31T02:00:00Z","feature_snapshot_id":"cccccccccccccccc'
+            b'cccccccccccccccccccccccccccccccccccccccccccccccc","parameter_fingerprint":"'
+            b'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+            b'"producer_commit":"dddddddddddddddddddddddddddddddddddddddd",'
+            b'"reason_codes":["above_vwap","same_minute_volume"],"schema_version":2,'
+            b'"signal_id":"60281eb0d1c2fa8ab0d3a04d6dc385d45905e458f20ed6ed208656e4718635b0",'
+            b'"strategy_id":"n-shape","strategy_version":"2.1.0"}'
+        ),
+    ),
+    (
+        3,
+        _ZERO_COMMIT,
+        "95f72b6d9c7233438c3b97726aeff7da19b6b9ece2dc7138f1ff520197158744",
+        (
+            b'{"action":"b_intent","available_at":"2026-07-31T01:32:00Z",'
+            b'"candidate_id":"600000.SH","dataset_snapshot_id":"bbbbbbbbbbbbbbbbbbbbbbbb'
+            b'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","event_time":"2026-07-31T01:31:00Z",'
+            b'"evidence":{"levels":{"resistance":10.2},"volume_ratio":2.5},'
+            b'"expires_at":"2026-07-31T02:00:00Z","feature_snapshot_id":"cccccccccccccccc'
+            b'cccccccccccccccccccccccccccccccccccccccccccccccc","parameter_fingerprint":"'
+            b'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+            b'"producer_commit":"0000000000000000000000000000000000000000",'
+            b'"reason_codes":["above_vwap","same_minute_volume"],"schema_version":3,'
+            b'"signal_id":"95f72b6d9c7233438c3b97726aeff7da19b6b9ece2dc7138f1ff520197158744",'
+            b'"strategy_id":"n-shape","strategy_version":"2.1.0"}'
+        ),
+    ),
+    (
+        3,
+        _COMMIT,
+        "28fdb6371fce685ebefbd43699ee761645280ed80d8ef01dcf8d16f205874c43",
+        (
+            b'{"action":"b_intent","available_at":"2026-07-31T01:32:00Z",'
+            b'"candidate_id":"600000.SH","dataset_snapshot_id":"bbbbbbbbbbbbbbbbbbbbbbbb'
+            b'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","event_time":"2026-07-31T01:31:00Z",'
+            b'"evidence":{"levels":{"resistance":10.2},"volume_ratio":2.5},'
+            b'"expires_at":"2026-07-31T02:00:00Z","feature_snapshot_id":"cccccccccccccccc'
+            b'cccccccccccccccccccccccccccccccccccccccccccccccc","parameter_fingerprint":"'
+            b'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+            b'"producer_commit":"dddddddddddddddddddddddddddddddddddddddd",'
+            b'"reason_codes":["above_vwap","same_minute_volume"],"schema_version":3,'
+            b'"signal_id":"28fdb6371fce685ebefbd43699ee761645280ed80d8ef01dcf8d16f205874c43",'
+            b'"strategy_id":"n-shape","strategy_version":"2.1.0"}'
+        ),
+    ),
+)
+_LEGACY_FIXTURE_IDS = (
+    "v1-zero",
+    "v1-commit",
+    "v2-zero",
+    "v2-commit",
+    "v3-zero",
+    "v3-commit",
+)
+_CURRENT_ONLY_CANONICAL_WRITERS: tuple[tuple[str, Callable[[object], bytes]], ...] = (
+    (
+        "current_signal_envelope_json_bytes",
+        signal_contracts.current_signal_envelope_json_bytes,
+    ),
+)
 
 
 def _signal_kwargs() -> dict[str, object]:
@@ -45,33 +163,6 @@ def _signal_kwargs() -> dict[str, object]:
     }
 
 
-def _legacy_canonical_bytes(
-    *,
-    schema_version: int,
-    producer_commit: str,
-    signal_id: str,
-) -> bytes:
-    return canonical_json_bytes(
-        {
-            "schema_version": schema_version,
-            "signal_id": signal_id,
-            "strategy_id": "n-shape",
-            "strategy_version": "2.1.0",
-            "parameter_fingerprint": _HASH_A,
-            "dataset_snapshot_id": _HASH_B,
-            "feature_snapshot_id": _HASH_C,
-            "event_time": "2026-07-31T01:31:00Z",
-            "available_at": "2026-07-31T01:32:00Z",
-            "candidate_id": "600000.SH",
-            "action": "b_intent",
-            "reason_codes": ["above_vwap", "same_minute_volume"],
-            "evidence": {"levels": {"resistance": 10.2}, "volume_ratio": 2.5},
-            "expires_at": "2026-07-31T02:00:00Z",
-            "producer_commit": producer_commit,
-        }
-    )
-
-
 def _current_kwargs(producer_identity: dict[str, object]) -> dict[str, object]:
     kwargs = _signal_kwargs()
     kwargs.pop("schema_version")
@@ -83,44 +174,76 @@ def _current_kwargs(producer_identity: dict[str, object]) -> dict[str, object]:
 
 class TestR01LegacyFamily:
     @pytest.mark.parametrize(
-        ("schema_version", "producer_commit"),
-        tuple(_LEGACY_SIGNAL_IDS),
-        ids=[
-            "v1-zero",
-            "v1-commit",
-            "v2-zero",
-            "v2-commit",
-            "v3-zero",
-            "v3-commit",
-        ],
+        ("schema_version", "producer_commit", "expected_id", "original"),
+        _LEGACY_CANONICAL_FIXTURES,
+        ids=_LEGACY_FIXTURE_IDS,
     )
     def test_roundtrips_historical_ids_and_canonical_bytes(
         self,
         schema_version: int,
         producer_commit: str,
+        expected_id: str,
+        original: bytes,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         legacy_type = signal_contracts.LegacySignalEnvelope
-        expected_id = _LEGACY_SIGNAL_IDS[(schema_version, producer_commit)]
-        original = _legacy_canonical_bytes(
+
+        def fail_if_serialized(*_args: object, **_kwargs: object) -> bytes:
+            raise AssertionError("legacy read path invoked serialization")
+
+        with monkeypatch.context() as serialization_guard:
+            serialization_guard.setattr(
+                signal_contracts,
+                "canonical_json_bytes",
+                fail_if_serialized,
+            )
+            serialization_guard.setattr(
+                signal_contracts,
+                "current_signal_envelope_json_bytes",
+                fail_if_serialized,
+            )
+            serialization_guard.setattr(legacy_type, "model_dump", fail_if_serialized)
+            serialization_guard.setattr(legacy_type, "model_dump_json", fail_if_serialized)
+            parsed = signal_contracts.parse_signal_envelope(original)
+
+        expected_kwargs = _signal_kwargs()
+        expected_kwargs.update(
             schema_version=schema_version,
             producer_commit=producer_commit,
             signal_id=expected_id,
         )
-
-        parsed = signal_contracts.parse_signal_envelope(original)
+        expected = legacy_type(**expected_kwargs)
         mapped = signal_contracts.parse_signal_envelope(parsed.model_dump(mode="python"))
+        serialized = signal_contracts.canonical_json_bytes(parsed.model_dump(mode="json"))
 
         assert type(parsed) is legacy_type
         assert type(mapped) is legacy_type
-        assert mapped == parsed
+        assert mapped == parsed == expected
         assert parsed.signal_id == expected_id
-        assert canonical_json_bytes(parsed.model_dump(mode="json")) == original
+        assert serialized == original
         assert legacy_type.model_validate_json(original) == parsed
         assert legacy_type.model_validate(parsed.model_dump(mode="python")) == parsed
-        assert parsed.legacy_read_status.value == (
-            "legacy_zero_sentinel" if producer_commit == _ZERO_COMMIT else "legacy_commit_claim"
+        assert parsed.legacy_read_status is (
+            signal_contracts.LegacySignalReadStatus.LEGACY_ZERO_SENTINEL
+            if producer_commit == _ZERO_COMMIT
+            else signal_contracts.LegacySignalReadStatus.LEGACY_COMMIT_CLAIM
         )
         assert "legacy_read_status" not in parsed.model_dump(mode="python")
+
+    def test_pretty_json_control_cannot_satisfy_exact_r01_byte_evidence(self) -> None:
+        original = _LEGACY_CANONICAL_FIXTURES[1][3]
+        pretty = json.dumps(
+            json.loads(original),
+            ensure_ascii=True,
+            indent=2,
+            sort_keys=True,
+        ).encode("utf-8")
+
+        assert b"\n" in pretty
+        assert pretty != original
+        assert signal_contracts.parse_signal_envelope(pretty) == (
+            signal_contracts.parse_signal_envelope(original)
+        )
 
     def test_compatibility_name_is_the_explicit_legacy_type(self) -> None:
         assert SignalEnvelope is signal_contracts.LegacySignalEnvelope
@@ -157,11 +280,32 @@ class TestR02WriteBoundary:
         with pytest.raises(ValidationError, match="signal_id"):
             signal_contracts.parse_signal_envelope(kwargs)
 
-    def test_current_canonical_writer_rejects_legacy_objects(self) -> None:
-        legacy = signal_contracts.LegacySignalEnvelope(**_signal_kwargs())
+    @pytest.mark.parametrize(
+        ("schema_version", "producer_commit", "expected_id", "original"),
+        _LEGACY_CANONICAL_FIXTURES,
+        ids=_LEGACY_FIXTURE_IDS,
+    )
+    @pytest.mark.parametrize(
+        "writer",
+        [writer for _name, writer in _CURRENT_ONLY_CANONICAL_WRITERS],
+        ids=[name for name, _writer in _CURRENT_ONLY_CANONICAL_WRITERS],
+    )
+    def test_current_canonical_writers_reject_every_legacy_family_case(
+        self,
+        schema_version: int,
+        producer_commit: str,
+        expected_id: str,
+        original: bytes,
+        writer: Callable[[object], bytes],
+    ) -> None:
+        legacy = signal_contracts.parse_signal_envelope(original)
 
-        with pytest.raises(TypeError, match="CurrentSignalEnvelope"):
-            signal_contracts.current_signal_envelope_json_bytes(legacy)
+        assert legacy.schema_version == schema_version
+        assert legacy.producer_commit == producer_commit
+        assert legacy.signal_id == expected_id
+        with pytest.raises(TypeError, match="CurrentSignalEnvelope") as exc_info:
+            writer(legacy)
+        assert exc_info.type is TypeError
 
 
 class TestR03CurrentProducerIdentity:
