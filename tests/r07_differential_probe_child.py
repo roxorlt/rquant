@@ -120,6 +120,30 @@ from tests.unit.test_strategy_runner import NOW as RUNNER_NOW
 from tests.unit.test_strategy_runner import _entry_decision, _envelope, _frame
 from tests.unit.test_strategy_runner import _store as _runner_store
 
+
+def _assert_rquant_modules_are_from_candidate_source() -> None:
+    entries = os.environ.get("PYTHONPATH", "").split(os.pathsep)
+    if len(entries) != 2 or not entries[0] or not entries[1]:
+        raise AssertionError("child PYTHONPATH must contain exactly source and repository roots")
+    candidate_src = Path(entries[0]).resolve(strict=True)
+    candidate_root = Path(entries[1]).resolve(strict=True)
+    if candidate_src != (candidate_root / "src").resolve(strict=True):
+        raise AssertionError("child PYTHONPATH source root is not first and exact")
+    for name, module in sys.modules.items():
+        if name != "rquant" and not name.startswith("rquant."):
+            continue
+        file_name = getattr(module, "__file__", None)
+        if not isinstance(file_name, str):
+            raise AssertionError(f"rquant module has no concrete file: {name}")
+        resolved = Path(file_name).resolve(strict=True)
+        try:
+            resolved.relative_to(candidate_src)
+        except ValueError as exc:
+            raise AssertionError(f"rquant module escaped candidate source: {name}") from exc
+
+
+_assert_rquant_modules_are_from_candidate_source()
+
 NOW = datetime(2026, 8, 16, 2, 30, tzinfo=UTC)
 ROOT = Path(__file__).parents[1]
 

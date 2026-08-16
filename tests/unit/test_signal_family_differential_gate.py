@@ -25,18 +25,21 @@ from rquant.signal_family_differential_gate import (
     BoundaryProbeResultV1,
     CandidateGateResult,
     PythonRunEvidenceV1,
-    R07DrGateEvidenceV1,
+    R07DrGateEvidenceWireV1,
     R07PolicyV1,
     R07StaticGateResult,
+    VerifiedR07DrGateEvidenceV1,
     canonical_evidence_json_bytes,
     collect_complete_git_diff,
     load_policy,
+    python_run_result_digest,
     resolve_fixture_values,
     verify_boundary_probe_source,
     verify_forbidden_definitions,
     verify_production_declaration,
     verify_r07_static_gate,
     verify_root_snapshot,
+    verify_wire,
 )
 from tests.r07_differential_probe_runner import run_boundary_probe_subprocess
 
@@ -51,7 +54,7 @@ def _run(
     candidate_commit: str,
     candidate_tree: str,
 ) -> PythonRunEvidenceV1:
-    return PythonRunEvidenceV1(
+    run = PythonRunEvidenceV1(
         python_minor=minor,
         job_id=job_id,
         job_run_id=101 if minor == "3.11" else 102,
@@ -63,14 +66,15 @@ def _run(
         passed=7,
         skipped=0,
         deselected=0,
-        result_digest="c" * 64,
+        result_digest="0" * 64,
         outcome="passed",
     )
+    return run.model_copy(update={"result_digest": python_run_result_digest(run)})
 
 
 @dataclass(frozen=True)
 class _EvidenceBundle:
-    evidence: R07DrGateEvidenceV1
+    evidence: VerifiedR07DrGateEvidenceV1
     policy: R07PolicyV1
     candidate_gate: CandidateGateResult
     static_result: R07StaticGateResult
@@ -127,7 +131,7 @@ def evidence_bundle(tmp_path_factory: pytest.TempPathFactory) -> _EvidenceBundle
             candidate_tree=candidate_tree,
         ),
     )
-    evidence = R07DrGateEvidenceV1.from_gate_results(
+    evidence = VerifiedR07DrGateEvidenceV1.from_gate_results(
         repo=ROOT,
         policy=policy,
         candidate_gate=candidate_gate,
@@ -150,9 +154,9 @@ def evidence_bundle(tmp_path_factory: pytest.TempPathFactory) -> _EvidenceBundle
 def test_evidence_uses_exact_fields_and_canonical_self_digest(
     evidence_bundle: _EvidenceBundle,
 ) -> None:
-    assert "candidate_binding_digest" in R07DrGateEvidenceV1.model_fields
-    assert hasattr(R07DrGateEvidenceV1, "from_gate_results")
-    assert not hasattr(R07DrGateEvidenceV1, "with_digest")
+    assert "candidate_binding_digest" in R07DrGateEvidenceWireV1.model_fields
+    assert hasattr(VerifiedR07DrGateEvidenceV1, "from_gate_results")
+    assert not hasattr(VerifiedR07DrGateEvidenceV1, "from_canonical_json")
     assert R07_CI_EVIDENCE_PRODUCER_IMPLEMENTED is False
     evidence = evidence_bundle.evidence
     assert (
@@ -161,12 +165,12 @@ def test_evidence_uses_exact_fields_and_canonical_self_digest(
     raw = canonical_evidence_json_bytes(evidence)
     assert raw == canonical_evidence_json_bytes(evidence)
     assert json.loads(raw)["evidence_digest"] == evidence.evidence_digest
-    with pytest.raises(ValueError, match="verified gate results"):
-        R07DrGateEvidenceV1(**evidence.model_dump(mode="python"))
+    with pytest.raises((TypeError, ValueError)):
+        VerifiedR07DrGateEvidenceV1(**evidence.model_dump(mode="python"))
 
     forged_gate = replace(evidence_bundle.candidate_gate, candidate_tree_sha="0" * 40)
     with pytest.raises(ValueError, match="candidate tree"):
-        R07DrGateEvidenceV1.from_gate_results(
+        VerifiedR07DrGateEvidenceV1.from_gate_results(
             repo=ROOT,
             policy=evidence_bundle.policy,
             candidate_gate=forged_gate,
@@ -177,8 +181,8 @@ def test_evidence_uses_exact_fields_and_canonical_self_digest(
             run_attempt=1,
         )
     forged_diff = replace(evidence_bundle.candidate_gate, diff_digest="0" * 64)
-    with pytest.raises(ValueError, match="exact Git candidate"):
-        R07DrGateEvidenceV1.from_gate_results(
+    with pytest.raises(ValueError, match="wire|recomputed"):
+        VerifiedR07DrGateEvidenceV1.from_gate_results(
             repo=ROOT,
             policy=evidence_bundle.policy,
             candidate_gate=forged_diff,
@@ -189,8 +193,8 @@ def test_evidence_uses_exact_fields_and_canonical_self_digest(
             run_attempt=1,
         )
     forged_static = replace(evidence_bundle.static_result, candidate_tree_sha="0" * 40)
-    with pytest.raises(ValueError, match="static result"):
-        R07DrGateEvidenceV1.from_gate_results(
+    with pytest.raises(ValueError, match="wire|static"):
+        VerifiedR07DrGateEvidenceV1.from_gate_results(
             repo=ROOT,
             policy=evidence_bundle.policy,
             candidate_gate=evidence_bundle.candidate_gate,
@@ -200,6 +204,49 @@ def test_evidence_uses_exact_fields_and_canonical_self_digest(
             workflow_run_id=100,
             run_attempt=1,
         )
+
+
+def test_private_verifier_rejects_self_consistent_fake_and_wrong_binding_wires(
+    evidence_bundle: _EvidenceBundle,
+) -> None:
+    wire = evidence_bundle.evidence.wire
+    fake_commit = "0" * 40
+    fake_tree = "1" * 40
+    fake_runs = tuple(
+        run.model_copy(
+            update={"candidate_commit_sha": fake_commit, "candidate_tree_sha": fake_tree}
+        )
+        for run in wire.python_runs
+    )
+    fake_values = wire.model_dump(mode="python")
+    fake_values.update(
+        {
+            "candidate_commit_sha": fake_commit,
+            "candidate_tree_sha": fake_tree,
+            "candidate_binding_digest": differential_gate._candidate_binding_digest_values(
+                baseline_commit_sha=wire.baseline_commit_sha,
+                baseline_tree_sha=wire.baseline_tree_sha,
+                candidate_commit_sha=fake_commit,
+                candidate_tree_sha=fake_tree,
+                complete_diff_digest=wire.complete_diff_digest,
+            ),
+            "python_runs": fake_runs,
+            "artifact_name": f"r07-dr-gate-{fake_commit}",
+            "evidence_digest": "0" * 64,
+        }
+    )
+    provisional = R07DrGateEvidenceWireV1.model_construct(**fake_values)
+    fake_values["evidence_digest"] = differential_gate._digest_without_field(
+        provisional,
+        "evidence_digest",
+    )
+    fake_wire = R07DrGateEvidenceWireV1.model_validate(fake_values)
+    with pytest.raises(ValueError, match="Git binding"):
+        verify_wire(ROOT, evidence_bundle.policy, fake_wire)
+
+    wrong_binding = wire.model_copy(update={"candidate_binding_digest": "0" * 64})
+    with pytest.raises(ValueError):
+        verify_wire(ROOT, evidence_bundle.policy, wrong_binding)
 
 
 @pytest.mark.parametrize(
@@ -215,7 +262,7 @@ def test_evidence_rejects_extra_coerced_or_incomplete_json(
     evidence_bundle: _EvidenceBundle,
 ) -> None:
     with pytest.raises(ValueError):
-        R07DrGateEvidenceV1.from_canonical_json(
+        R07DrGateEvidenceWireV1.from_canonical_json(
             json.dumps(payload(evidence_bundle.evidence), separators=(",", ":"))
         )
 

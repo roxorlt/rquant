@@ -11,6 +11,36 @@ from pathlib import Path
 ROOT = Path(__file__).parents[2]
 
 
+def test_child_environment_is_empty_derived_and_has_fixed_two_entry_pythonpath(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from tests.r07_differential_probe_runner import _child_environment
+
+    monkeypatch.setenv("PATH", "/poisoned/path")
+    monkeypatch.setenv("UNKNOWN_SECRET", "must-not-cross")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "must-not-cross")
+    monkeypatch.setenv("RQUANT_PRODUCTION_SENTINEL", "must-not-cross")
+    monkeypatch.setenv("LANG", "poisoned-locale")
+    candidate_root = (tmp_path / "candidate").resolve()
+    (candidate_root / "src").mkdir(parents=True)
+    environment_root = tmp_path / "child"
+
+    environment = _child_environment(environment_root, candidate_root=candidate_root)
+
+    assert "PATH" not in environment
+    assert "UNKNOWN_SECRET" not in environment
+    assert "AWS_SECRET_ACCESS_KEY" not in environment
+    assert "RQUANT_PRODUCTION_SENTINEL" not in environment
+    assert environment["LANG"] == "C"
+    assert environment["LC_ALL"] == "C"
+    assert environment["PYTHONPATH"] == os.pathsep.join(
+        (str(candidate_root / "src"), str(candidate_root))
+    )
+    assert environment["PYTHONNOUSERSITE"] == "1"
+    assert environment["PYTHONDONTWRITEBYTECODE"] == "1"
+
+
 def test_probe_runner_disables_dotenv_before_any_rquant_import(
     tmp_path: Path,
 ) -> None:

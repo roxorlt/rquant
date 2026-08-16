@@ -10,10 +10,16 @@ import ast
 import base64
 import copy
 import hashlib
+import io
+import os
 import stat
 import subprocess
+import tarfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from tempfile import TemporaryDirectory
 from typing import Any, Literal, Self
 
 from pydantic import (
@@ -23,7 +29,6 @@ from pydantic import (
     StrictInt,
     StrictStr,
     ValidationError,
-    ValidationInfo,
     model_validator,
 )
 
@@ -34,7 +39,7 @@ BASELINE_TREE_SHA = "4f67e67192855874e82baa13dc343a1d6939bd67"
 _SHA256 = r"^[0-9a-f]{64}$"
 _SHA1 = r"^[0-9a-f]{40}$"
 R07_CI_EVIDENCE_PRODUCER_IMPLEMENTED = False
-_EVIDENCE_VALIDATION_TOKEN = object()
+_VERIFIED_CONSTRUCTION_TOKEN = object()
 
 _EMPTY_VERSION_VARIANT_AST_FIELDS = {
     "FunctionDef": ("type_params",),
@@ -220,6 +225,14 @@ class PythonRunEvidenceV1(_StrictModelMixin, BaseModel):
         return self
 
 
+def python_run_result_digest(value: PythonRunEvidenceV1) -> str:
+    if type(value) is not PythonRunEvidenceV1:
+        raise TypeError("R07 Python run requires the exact model")
+    return hashlib.sha256(
+        canonical_json_bytes(value.model_dump(mode="json", exclude={"result_digest"}))
+    ).hexdigest()
+
+
 def _candidate_binding_digest_values(
     *,
     baseline_commit_sha: str,
@@ -241,7 +254,7 @@ def _candidate_binding_digest_values(
     ).hexdigest()
 
 
-class R07DrGateEvidenceV1(_StrictModelMixin, BaseModel):
+class R07DrGateEvidenceWireV1(_StrictModelMixin, BaseModel):
     schema_version: Literal[1]
     repository: Literal["roxorlt/rquant"]
     workflow_path: Literal[".github/workflows/ci.yml"]
@@ -269,9 +282,7 @@ class R07DrGateEvidenceV1(_StrictModelMixin, BaseModel):
     evidence_digest: StrictStr = Field(pattern=_SHA256)
 
     @model_validator(mode="after")
-    def validate_channel_and_bindings(self, info: ValidationInfo) -> Self:
-        if not info.context or info.context.get("r07_evidence") is not (_EVIDENCE_VALIDATION_TOKEN):
-            raise ValueError("passed R07 evidence requires verified gate results")
+    def validate_channel_and_bindings(self) -> Self:
         expected_jobs = ("r07-differential-gate-py311", "r07-differential-gate-py312")
         expected_minors = ("3.11", "3.12")
         for run, minor, job in zip(self.python_runs, expected_minors, expected_jobs, strict=True):
@@ -306,10 +317,62 @@ class R07DrGateEvidenceV1(_StrictModelMixin, BaseModel):
         decoded = strict_canonical_json_loads(raw)
         if not isinstance(decoded, dict):
             raise ValueError("R07 evidence must be a JSON object")
-        return cls.model_validate_json(
-            raw,
-            context={"r07_evidence": _EVIDENCE_VALIDATION_TOKEN},
-        )
+        if type(decoded.get("python_runs")) is not list:
+            raise ValueError("R07 evidence python_runs must be a JSON array")
+        decoded = {**decoded, "python_runs": tuple(decoded["python_runs"])}
+        return cls.model_validate(decoded)
+
+
+def _digest_without_field(model: Any, field: str) -> str:
+    payload = model.model_dump(mode="json", exclude={field})
+    return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
+
+
+class VerifiedR07DrGateEvidenceV1:
+    """Non-serializable verified typestate created only by the private verifier."""
+
+    __slots__ = ("_wire",)
+
+    def __new__(
+        cls,
+        *,
+        _construction_token: object | None = None,
+        _wire: R07DrGateEvidenceWireV1 | None = None,
+    ) -> Self:
+        if _construction_token is not _VERIFIED_CONSTRUCTION_TOKEN or type(_wire) is not (
+            R07DrGateEvidenceWireV1
+        ):
+            raise TypeError("verified R07 evidence is private verifier output")
+        instance = super().__new__(cls)
+        object.__setattr__(instance, "_wire", _wire)
+        return instance
+
+    def __init__(
+        self,
+        *,
+        _construction_token: object | None = None,
+        _wire: R07DrGateEvidenceWireV1 | None = None,
+    ) -> None:
+        if _construction_token is not _VERIFIED_CONSTRUCTION_TOKEN or type(_wire) is not (
+            R07DrGateEvidenceWireV1
+        ):
+            raise TypeError("verified R07 evidence is private verifier output")
+
+    def __setattr__(self, _name: str, _value: object) -> None:
+        raise AttributeError("verified R07 evidence is immutable")
+
+    @property
+    def wire(self) -> R07DrGateEvidenceWireV1:
+        return self._wire
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._wire, name)
+
+    def model_dump(self, *, mode: str = "python", **kwargs: object) -> dict[str, object]:
+        return self._wire.model_dump(mode=mode, **kwargs)  # type: ignore[arg-type]
+
+    def model_dump_json(self, **kwargs: object) -> str:
+        return self._wire.model_dump_json(**kwargs)
 
     @classmethod
     def from_gate_results(
@@ -324,79 +387,28 @@ class R07DrGateEvidenceV1(_StrictModelMixin, BaseModel):
         workflow_run_id: int,
         run_attempt: int,
     ) -> Self:
-        if type(policy) is not R07PolicyV1:
-            raise ValueError("exact R07PolicyV1 is required")
-        validated_policy = R07PolicyV1.model_validate(policy.model_dump(mode="python"))
-        if validated_policy != policy:
-            raise ValueError("R07 policy failed canonical model validation")
-        if type(candidate_gate) is not CandidateGateResult or not candidate_gate.passed:
-            raise ValueError("passed CandidateGateResult is required")
-        recomputed_gate = verify_candidate_gate(
-            repo,
+        wire = _wire_from_gate_results(
             policy=policy,
-            candidate_commit=candidate_gate.candidate_commit_sha,
-            candidate_tree=candidate_gate.candidate_tree_sha,
+            candidate_gate=candidate_gate,
+            boundary_results=boundary_results,
+            static_result=static_result,
+            python_runs=python_runs,
+            workflow_run_id=workflow_run_id,
+            run_attempt=run_attempt,
         )
-        if recomputed_gate != candidate_gate or not recomputed_gate.passed:
-            raise ValueError("CandidateGateResult does not match exact Git candidate")
-        if type(static_result) is not R07StaticGateResult or not static_result.passed:
-            raise ValueError("passed R07StaticGateResult is required")
-        recomputed_static = verify_r07_static_gate(
-            repo,
-            policy=policy,
-            candidate_commit=candidate_gate.candidate_commit_sha,
-            candidate_tree=candidate_gate.candidate_tree_sha,
-        )
-        if recomputed_static != static_result:
-            raise ValueError("static result does not match exact Git candidate")
-        boundary_result_digest = boundary_probe_results_digest(policy, boundary_results)
-        values: dict[str, Any] = {
-            "schema_version": 1,
-            "repository": "roxorlt/rquant",
-            "workflow_path": ".github/workflows/ci.yml",
-            "event_name": "push",
-            "ref": "refs/heads/main",
-            "producer_job_id": "r07-differential-gate-evidence",
-            "workflow_run_id": workflow_run_id,
-            "run_attempt": run_attempt,
-            "candidate_commit_sha": candidate_gate.candidate_commit_sha,
-            "candidate_tree_sha": candidate_gate.candidate_tree_sha,
-            "baseline_commit_sha": candidate_gate.baseline_commit_sha,
-            "baseline_tree_sha": candidate_gate.baseline_tree_sha,
-            "policy_digest": policy.policy_digest,
-            "complete_diff_digest": candidate_gate.diff_digest,
-            "candidate_binding_digest": candidate_gate.candidate_binding_digest,
-            "boundary_manifest_digest": policy.boundary_manifest_digest,
-            "boundary_result_digest": boundary_result_digest,
-            "root_snapshot_digest": static_result.root_snapshot_digest,
-            "forbidden_definition_digest": static_result.forbidden_definition_digest,
-            "python_runs": python_runs,
-            "artifact_name": f"r07-dr-gate-{candidate_gate.candidate_commit_sha}",
-            "artifact_json_path": "r07-dr-gate/evidence-v1.json",
-            "retention_days": 90,
-            "outcome": "passed",
-            "evidence_digest": "0" * 64,
-        }
-        provisional = cls.model_construct(**values)
-        values["evidence_digest"] = _digest_without_field(provisional, "evidence_digest")
-        return cls.model_validate(
-            values,
-            context={"r07_evidence": _EVIDENCE_VALIDATION_TOKEN},
-        )
+        return _verify_wire(repo, policy, wire)
 
 
-def _digest_without_field(model: Any, field: str) -> str:
-    payload = model.model_dump(mode="json", exclude={field})
-    return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
-
-
-def canonical_evidence_json_bytes(value: R07DrGateEvidenceV1) -> bytes:
-    if type(value) is not R07DrGateEvidenceV1:
-        raise TypeError("R07 evidence requires the exact model")
-    if value.evidence_digest != _digest_without_field(value, "evidence_digest"):
+def canonical_evidence_json_bytes(
+    value: R07DrGateEvidenceWireV1 | VerifiedR07DrGateEvidenceV1,
+) -> bytes:
+    wire = value.wire if type(value) is VerifiedR07DrGateEvidenceV1 else value
+    if type(wire) is not R07DrGateEvidenceWireV1:
+        raise TypeError("R07 evidence requires wire or verified evidence")
+    if wire.evidence_digest != _digest_without_field(wire, "evidence_digest"):
         raise ValueError("evidence_digest does not match canonical evidence")
-    raw = canonical_json_bytes(value.model_dump(mode="json"))
-    if R07DrGateEvidenceV1.from_canonical_json(raw) != value:
+    raw = canonical_json_bytes(wire.model_dump(mode="json"))
+    if R07DrGateEvidenceWireV1.from_canonical_json(raw) != wire:
         raise ValueError("R07 evidence does not round-trip")
     return raw
 
@@ -1106,7 +1118,7 @@ def verify_candidate_gate(
         repo,
         baseline_commit=baseline,
         candidate_commit=candidate,
-        include_untracked=True,
+        include_untracked=False,
     )
     allowed = {
         (entry.path, entry.status, entry.old_mode, entry.new_mode): entry
@@ -1147,6 +1159,245 @@ class R07StaticGateResult:
     root_snapshot_digest: str
     forbidden_definition_digest: str
     checks: tuple[tuple[str, StaticCheckResult], ...]
+
+
+def _wire_from_gate_results(
+    *,
+    policy: R07PolicyV1,
+    candidate_gate: CandidateGateResult,
+    boundary_results: tuple[BoundaryProbeResultV1, ...],
+    static_result: R07StaticGateResult,
+    python_runs: tuple[PythonRunEvidenceV1, PythonRunEvidenceV1],
+    workflow_run_id: int,
+    run_attempt: int,
+) -> R07DrGateEvidenceWireV1:
+    if type(policy) is not R07PolicyV1:
+        raise ValueError("exact R07PolicyV1 is required")
+    if type(candidate_gate) is not CandidateGateResult or not candidate_gate.passed:
+        raise ValueError("passed CandidateGateResult is required")
+    if type(static_result) is not R07StaticGateResult or not static_result.passed:
+        raise ValueError("passed R07StaticGateResult is required")
+    if (static_result.candidate_commit_sha, static_result.candidate_tree_sha) != (
+        candidate_gate.candidate_commit_sha,
+        candidate_gate.candidate_tree_sha,
+    ):
+        raise ValueError("static gate candidate tree binding mismatch")
+    if (
+        type(python_runs) is not tuple
+        or len(python_runs) != 2
+        or any(type(run) is not PythonRunEvidenceV1 for run in python_runs)
+    ):
+        raise ValueError("exact ordered Python run pair is required")
+    if any(
+        (run.candidate_commit_sha, run.candidate_tree_sha)
+        != (candidate_gate.candidate_commit_sha, candidate_gate.candidate_tree_sha)
+        for run in python_runs
+    ):
+        raise ValueError("candidate tree binding mismatch in Python run evidence")
+    boundary_result_digest = boundary_probe_results_digest(policy, boundary_results)
+    values: dict[str, Any] = {
+        "schema_version": 1,
+        "repository": "roxorlt/rquant",
+        "workflow_path": ".github/workflows/ci.yml",
+        "event_name": "push",
+        "ref": "refs/heads/main",
+        "producer_job_id": "r07-differential-gate-evidence",
+        "workflow_run_id": workflow_run_id,
+        "run_attempt": run_attempt,
+        "candidate_commit_sha": candidate_gate.candidate_commit_sha,
+        "candidate_tree_sha": candidate_gate.candidate_tree_sha,
+        "baseline_commit_sha": candidate_gate.baseline_commit_sha,
+        "baseline_tree_sha": candidate_gate.baseline_tree_sha,
+        "policy_digest": policy.policy_digest,
+        "complete_diff_digest": candidate_gate.diff_digest,
+        "candidate_binding_digest": candidate_gate.candidate_binding_digest,
+        "boundary_manifest_digest": policy.boundary_manifest_digest,
+        "boundary_result_digest": boundary_result_digest,
+        "root_snapshot_digest": static_result.root_snapshot_digest,
+        "forbidden_definition_digest": static_result.forbidden_definition_digest,
+        "python_runs": python_runs,
+        "artifact_name": f"r07-dr-gate-{candidate_gate.candidate_commit_sha}",
+        "artifact_json_path": "r07-dr-gate/evidence-v1.json",
+        "retention_days": 90,
+        "outcome": "passed",
+        "evidence_digest": "0" * 64,
+    }
+    provisional = R07DrGateEvidenceWireV1.model_construct(**values)
+    values["evidence_digest"] = _digest_without_field(provisional, "evidence_digest")
+    try:
+        return R07DrGateEvidenceWireV1.model_validate(values)
+    except ValidationError as exc:
+        raise ValueError("wire candidate binding or field validation failed") from exc
+
+
+@contextmanager
+def _materialize_candidate_tree(repo: Path, candidate_commit: str) -> Iterator[Path]:
+    with TemporaryDirectory(prefix="rquant-r07-candidate-") as directory:
+        root = Path(directory).resolve(strict=True)
+        archive = subprocess.run(
+            ["git", "-C", str(repo), "archive", "--format=tar", candidate_commit],
+            check=True,
+            capture_output=True,
+        ).stdout
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as bundle:
+            for member in bundle.getmembers():
+                relative = PurePosixPath(member.name)
+                if (
+                    relative.is_absolute()
+                    or any(part in {"", ".", ".."} for part in relative.parts)
+                    or member.issym()
+                    or member.islnk()
+                    or not (member.isdir() or member.isreg())
+                ):
+                    raise ValueError("candidate archive contains an unsafe path")
+                try:
+                    bundle.extract(member, root, filter="data")
+                except TypeError as exc:
+                    if "filter" not in str(exc):
+                        raise
+                    bundle.extract(member, root)
+        for path in sorted(root.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+            os.chmod(path, 0o555 if path.is_dir() else 0o444)
+        os.chmod(root, 0o555)
+        yield root
+
+
+def _wire_with_recomputed_digests(
+    wire: R07DrGateEvidenceWireV1,
+    *,
+    policy: R07PolicyV1,
+    candidate_gate: CandidateGateResult,
+    static_result: R07StaticGateResult,
+    boundary_result_digest: str,
+) -> R07DrGateEvidenceWireV1:
+    python_runs = tuple(
+        run.model_copy(update={"result_digest": python_run_result_digest(run)})
+        for run in wire.python_runs
+    )
+    values = wire.model_dump(mode="python")
+    values.update(
+        {
+            "policy_digest": policy.policy_digest,
+            "complete_diff_digest": candidate_gate.diff_digest,
+            "candidate_binding_digest": candidate_gate.candidate_binding_digest,
+            "boundary_manifest_digest": policy.boundary_manifest_digest,
+            "boundary_result_digest": boundary_result_digest,
+            "root_snapshot_digest": static_result.root_snapshot_digest,
+            "forbidden_definition_digest": static_result.forbidden_definition_digest,
+            "python_runs": python_runs,
+            "evidence_digest": "0" * 64,
+        }
+    )
+    provisional = R07DrGateEvidenceWireV1.model_construct(**values)
+    values["evidence_digest"] = _digest_without_field(provisional, "evidence_digest")
+    return R07DrGateEvidenceWireV1.model_validate(values)
+
+
+def _verify_wire(
+    repo: Path,
+    policy: R07PolicyV1,
+    wire: R07DrGateEvidenceWireV1,
+) -> VerifiedR07DrGateEvidenceV1:
+    if type(policy) is not R07PolicyV1 or type(wire) is not R07DrGateEvidenceWireV1:
+        raise TypeError("R07 verifier requires exact policy and wire types")
+    try:
+        validated_policy = R07PolicyV1.model_validate(policy.model_dump(mode="python"))
+        validated_wire = R07DrGateEvidenceWireV1.model_validate(wire.model_dump(mode="python"))
+    except ValidationError as exc:
+        raise ValueError("R07 wire or policy failed strict validation") from exc
+    if validated_policy != policy or validated_wire != wire:
+        raise ValueError("R07 wire or policy is not canonically self-consistent")
+
+    try:
+        candidate_gate = verify_candidate_gate(
+            repo,
+            policy=validated_policy,
+            candidate_commit=wire.candidate_commit_sha,
+            candidate_tree=wire.candidate_tree_sha,
+        )
+        if not candidate_gate.passed:
+            raise ValueError("candidate gate did not pass")
+        static_result = verify_r07_static_gate(
+            repo,
+            policy=validated_policy,
+            candidate_commit=wire.candidate_commit_sha,
+            candidate_tree=wire.candidate_tree_sha,
+        )
+        if not static_result.passed:
+            raise ValueError("static gate did not pass")
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise ValueError("wire Git binding does not resolve to exact Git objects") from exc
+
+    if (
+        candidate_gate.candidate_commit_sha != wire.candidate_commit_sha
+        or candidate_gate.candidate_tree_sha != wire.candidate_tree_sha
+        or candidate_gate.baseline_commit_sha != wire.baseline_commit_sha
+        or candidate_gate.baseline_tree_sha != wire.baseline_tree_sha
+    ):
+        raise ValueError("wire Git binding does not match candidate gate")
+    if (
+        static_result.candidate_commit_sha != wire.candidate_commit_sha
+        or static_result.candidate_tree_sha != wire.candidate_tree_sha
+    ):
+        raise ValueError("wire Git binding does not match static gate")
+
+    policy_path = "tests/fixtures/r07_differential_gate/policy-v1.json"
+    with _materialize_candidate_tree(repo, wire.candidate_commit_sha) as candidate_root:
+        candidate_policy_path = candidate_root / policy_path
+        try:
+            candidate_policy_bytes = candidate_policy_path.read_bytes()
+        except OSError as exc:
+            raise ValueError("candidate policy object is unavailable") from exc
+        if candidate_policy_bytes != validated_policy.canonical_bytes:
+            raise ValueError("wire policy is not the exact candidate Git policy object")
+        try:
+            candidate_policy = load_policy(candidate_policy_path)
+        except (OSError, ValidationError, ValueError) as exc:
+            raise ValueError("candidate policy object failed strict validation") from exc
+        if candidate_policy != validated_policy:
+            raise ValueError("candidate policy object does not match supplied policy")
+
+        from tests.r07_differential_probe_runner import run_boundary_probe_subprocess
+
+        with TemporaryDirectory(prefix="rquant-r07-probe-") as probe_directory:
+            probe_root = Path(probe_directory).resolve(strict=True)
+            boundary_results = tuple(
+                BoundaryProbeResultV1.model_validate(
+                    run_boundary_probe_subprocess(
+                        policy_path=candidate_policy_path,
+                        candidate_root=candidate_root,
+                        inventory_id=f"R07-B{index:02d}",
+                        tmp_path=probe_root / f"b{index:02d}",
+                    )
+                )
+                for index in range(1, 18)
+            )
+    if not all(result.passed for result in boundary_results):
+        raise ValueError("one or more R07 boundary probes failed")
+    boundary_digest = boundary_probe_results_digest(validated_policy, boundary_results)
+    expected = _wire_with_recomputed_digests(
+        wire,
+        policy=validated_policy,
+        candidate_gate=candidate_gate,
+        static_result=static_result,
+        boundary_result_digest=boundary_digest,
+    )
+    if expected != wire:
+        raise ValueError("R07 wire does not match recomputed gate evidence")
+    return VerifiedR07DrGateEvidenceV1(
+        _construction_token=_VERIFIED_CONSTRUCTION_TOKEN,
+        _wire=wire,
+    )
+
+
+def verify_wire(
+    repo: Path,
+    policy: R07PolicyV1,
+    wire: R07DrGateEvidenceWireV1,
+) -> VerifiedR07DrGateEvidenceV1:
+    """Verify an observation wire through the sole private R07 verifier."""
+
+    return _verify_wire(repo, policy, wire)
 
 
 def fixture_manifest_digest(
