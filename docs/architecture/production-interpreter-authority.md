@@ -643,6 +643,13 @@ production API nor authorizes a v3 writer, registry, overlay, capability, enviro
 cursor, drain, cutover, mutation, or activation path. It replaces any implication that a best-effort
 Python object walk can prove non-reachability.
 
+**Second reset.** The historical generic graph walk, callable-input grammar, and static
+callable-operation/bytecode contract below are retained only as an audit trail. They are
+superseded in full by the content-addressed constructive proof specified at
+`R07-CA-PROOF-V1` below. No implementation may inspect Python bytecode, simulate a call stack,
+infer Python data flow, or extend the old opcode allowlist. This resolves the 3.12 method-form
+`LOAD_ATTR` review evidence by taking CPython execution opcodes out of the proof boundary.
+
 The threat model is an object returned by an actual Phase A production builder or either actual
 builtin registry that hides a durable current-family persistence capability behind an ordinary
 alias, closure, callback, module indirection, container, or instance field. A writer shaped as a
@@ -769,6 +776,11 @@ the exact callable identity, an argument not declared by that target, any positi
 or any root result not returned by calling the exact target once with the exact materialized
 keyword arguments. Root construction itself must complete without invoking any returned builder,
 service step, adapter, provider, transport, filesystem mutation, or network operation.
+
+##### Superseded Historical Object-Walk And Bytecode Contract
+
+The following retained text is pre-reset audit history only. It is explicitly non-normative under
+`R07-CA-PROOF-V1`; no implementation or test may use it to obtain `complete_clean`.
 
 The proof is deliberately a small, static capability analysis, not a general Python object
 inspector. Before it can report a clean result, it MUST establish a complete proof over the exact
@@ -1033,6 +1045,24 @@ name, annotation spelling, alias, or module path. A current input alone, a legac
 alone, and an unreferenced forbidden object do not constitute a violation; the proof must retain
 the canonical evidence path that composes the two.
 
+##### `R07-CA-PROOF-V1`: Content-Addressed Constructive Proof
+
+The historical mechanisms above are superseded as normative design. Three alternatives were considered: (A) restricted AST/source analysis of production callables is source-stable but still needs general alias, closure, callback, and data-flow semantics; it is rejected. (B) an explicit content-addressed capability manifest plus exact runtime projection freezes roots, source/code identities, injection sites, types, field schemas, and declared edges; it is selected. (C) absence of a public v3 writer symbol/API is useful but insufficient because a v2 durable sink can be captured by an alias, closure, callback, or ordinary instance field; it is rejected as a complete proof.
+
+The selected design is a constructive release proof, not an attempt to decide arbitrary Python semantics. It establishes that the exact content-addressed Phase A artifact builds the exact ten declared roots, each root projects to one complete declared object graph, each code-bearing value matches a declared source/code identity, and no declared value is a current-family persistence capability. Any undeclared value or content/shape mismatch blocks. This is sufficient for Phase A because it contains no current writer primitive, writer API, registry, overlay, environment flag, cursor, drain, cutover, mutation, or activation object. The three current models, strict decoders, and synthetic decoder fixtures are explicit read-only terminals only; v2 remains byte-identical.
+
+The existing `R07NoActivationRootManifestV1` remains the sole builder-construction input. The test adds immutable `R07NoActivationCapabilityManifestV2` with exactly `schema_version` (native int `2`), `root_manifest_sha256`, `phase_a_source_units`, `projection_nodes`, `projection_edges`, `allowed_read_only_terminals`, `forbidden_persistence_identities`, and `manifest_sha256`. Its digest is SHA-256 of canonical JSON excluding `manifest_sha256`; the expected digest is a literal in the test and is never generated or accepted during a test run. A diagnostic generator may emit a candidate but cannot update that literal. Every intentional update is therefore a reviewable manifest diff naming every changed source unit, code identity, projection node, and edge.
+
+`SourceUnitV1` exactly contains `module_name`, `relative_path`, `source_sha256`, `ast_policy_sha256`, and `declared_code_identities`. A code identity records qualified name, source-unit identity, source-span digest, normalized `ast.dump(..., include_attributes=False)` digest, and a declaration digest for immutable code/default/closure metadata: positional-default hashes, keyword-default hashes, free-variable names, and closure-cell positions. It never reads closure values dynamically. An encountered function, method, partial, module, class, or callback must match one declared identity exactly; aliases and field names have no authority.
+
+`ProjectionNodeV1` exactly contains `node_id`, `kind`, `identity`, `type_identity`, and `field_schema`; `ProjectionEdgeV1` exactly contains `from_node_id`, `edge_token`, `to_node_id`, and `edge_kind`. Node kinds are only `root_result`, `plain_instance`, `exact_dict`, `exact_tuple`, `exact_list`, `function_token`, `bound_method_token`, `partial_token`, `module_token`, and `read_only_terminal`. Edge kinds are only `field`, `dict_key`, `sequence_index`, `bound_receiver`, `partial_argument`, and `partial_keyword`. Plain instances declare the complete Unicode-sorted field-name-to-child mapping; dicts declare the complete Unicode-sorted literal string-key mapping; lists/tuples declare every index; methods/partials declare their exact function token and receiver/bindings. Duplicate, unknown, missing, reordered, or extra values block, and all ten root results occur exactly once.
+
+The runtime projection helper calls each exact root once with frozen V1 arguments, then reads only manifest-declared nodes and edges. For an instance it first requires the exact type, ordinary metaclass, no `__slots__`, no overridden `__getattribute__` or `__getattr__`, and no property, member/get-set, or custom descriptor in its MRO. Only then it calls `object.__getattribute__(value, "__dict__")` once, requires an exact `dict`, requires equality with the declared field-key set, and fetches only declared dict keys. It never uses `getattr`, `vars(instance)`, descriptor access, recursive member discovery, `repr`, or user-code execution. Exact dict/list/tuple values must equal their declared schema; any other container blocks. Slots, properties, descriptors, hostile hooks, hostile `__dict__`, or aliases hidden in undeclared fields are `blocked_shape`, never silently clean.
+
+Code-bearing projection values are opaque after exact identity/source/code validation. The helper does not follow callbacks, evaluate annotations, inspect bytecode, or infer whether a closure calls a sink. A closure/module alias/callback cannot hide authority: it is either an undeclared token/edge and blocks, or its code/declaration digest is anchored and any changed capture, resolution, or invocation invalidates the manifest. `forbidden_persistence_identities` is the complete identity-based set of existing durable primitives and entrypoints; it must be absent from current-family declarations. The only allowed current identities are the read-only terminals. A declared-edge mutation inserting a forbidden durable identity is `complete_violation`; a shape mutation, dynamic token, source/code mismatch, or unsupported object is `blocked_shape`.
+
+The AST policy is intentionally tiny and version-independent. It validates only the manifest declaration language and declared source spans: literal records, literal string keys, literal tuple/list/dict values, and direct qualified identity references are allowed. Dynamic attribute/name lookup, subscript-derived identity, calls returning an identity, `eval`, `exec`, dynamic import, generated functions/classes, comprehensions, and mutation in a declaration scope block. It never derives production call/data flow. Python 3.11/3.12 opcode changes, including 3.12 method-form `LOAD_ATTR`, are not inputs to this proof and cannot alter a result. Existing `ProofResultV1`, canonical evidence ordering, and limits below now describe deterministic projection validation only, not recursive Python reachability or operation analysis.
+
 ##### Immutable Proof Result, Ordering, And Bounds
 
 The analyser returns one exact immutable `ProofResultV1`, never a bare violation list or an
@@ -1078,30 +1108,17 @@ Canonical result bytes are
 No alternate serializer, enum spelling, field order, whitespace, or Unicode escaping is accepted
 as result evidence.
 
-Traversal is two-pass. Pass 1 constructs and validates the complete supported graph and emits no
-capability conclusion. Any blocked edge ends pass 1 with the stable blocked result. Only a complete
-pass 1 permits pass 2. Pass 2 first classifies every operation-candidate wrapper input in canonical
-path order; any ambiguous/variadic input with static or potential sink reachability returns its
-stable first `blocked_shape` before capability
-conclusions. A complete input-classification subpass is followed by the operation-contract subpass;
-its first unsupported call also blocks before conclusions. Only complete input and operation
-subpasses compose and sort violations. Thus a violation found early cannot hide a later unsupported
-shape, ambiguous input, or unresolved call.
+Validation is two-pass. Pass 1 constructs every exact root and validates the complete manifest
+projection without a capability conclusion. Any mismatch or unsupported declared shape returns the
+first stable blocked result. Only a complete pass 1 permits pass 2, which checks declared identities
+against the frozen forbidden/allowed sets. A declared forbidden identity returns
+`complete_violation`; nothing is inferred from callable inputs or invocation behavior.
 
-Pass 1 is deterministic depth-first preorder. Roots follow manifest tuple order. Child order is
-fixed as follows:
-
-1. Module member names and statically referenced receiver attribute names sort by Unicode code
-   point. MRO classes run nearest-to-farthest; within each class, member names sort by Unicode code
-   point. Instance-dict attribute names also sort by Unicode code point.
-2. A bound method visits function then receiver. A partial visits function, positional arguments
-   by ascending index, then keyword arguments by Unicode-sorted key.
-3. A function visits positional defaults by ascending parameter position, keyword defaults by
-   Unicode-sorted parameter name, closure cells by ascending cell index, then referenced globals by
-   Unicode-sorted name. Receiver attributes form the final Unicode-sorted function edge group.
-4. A mapping requires exact string keys; for each Unicode-sorted key it visits the key edge then
-   the value edge. A tuple/list visits ascending index. Identical objects are expanded only on their
-   first canonical path; later identity references remain recorded edges but add no children.
+Pass 1 is deterministic depth-first preorder over manifest edges. Roots follow the V1 tuple order;
+nodes follow canonical `node_id`; plain-instance/dict fields follow Unicode code point; sequence
+items follow ascending index; a bound method visits its function then receiver; a partial visits its
+function, positional bindings, then Unicode-sorted keyword bindings. Projection identity references
+are expanded only on their first canonical path; later references are recorded but add no children.
 
 Path tokens are the literal manifest root name, member/key name, or base-10 index appropriate to
 the edge kind. They contain no address, timestamp, mapping insertion position, arbitrary `repr`, or
@@ -1149,51 +1166,44 @@ all of the following against the same analyser used for real builder roots:
    reordered, duplicate, renamed, unknown, or extra roots/arguments reject. Both capability profiles
    accept only their exact key/value tuples; empty, missing, changed, and unknown capability keys
    reject before root construction.
-8. Sink-reachable wrappers cover actual-object and string `Name`/`Attribute` exact-current
-   annotations. Missing annotations, `object`, `Any`, unresolved/forward/executable expressions,
-   unions/generics/protocols/type variables, non-type terminals, and `*args`/`**kwargs` each produce
-   `blocked_shape`. Annotation objects with hostile evaluation hooks and module/class descriptors
-   carry sentinels proving no evaluation or dynamic lookup occurred.
+8. Every source unit/code identity is checked against its content hash, normalized AST digest, and
+   closure/default declaration digest. A changed alias, module reference, closure capture, callback,
+   or source span blocks before a clean result; the test cannot regenerate the expected manifest
+   digest.
 9. Shape-order metamorphics place a hostile `__dict__` property, dynamic attribute hook, slot, and
-   descriptor at every receiver position. Each blocks before the exact native instance dict is
-   read, while a plain inherited native `__dict__` remains supported. Instrumented objects prove
-   only modules/classes reached `vars(...)` and no hostile hook/descriptor ran.
-10. `ProofResultV1` rejects mutation, subclass/mapping/list substitution, mixed outcome/evidence,
-    noncanonical ordering, and unknown enums. Root, attribute, MRO, default, closure, global,
-    mapping, partial, and sequence insertion-order metamorphics retain byte-identical results and
-    the same first blocked evidence.
-11. Operation controls prove that direct global, closure, receiver-literal-attribute, bound-method,
-    and validated-partial calls to every frozen sink compose with a direct current parameter as
-    `complete_violation`, while merely loading/formatting/returning the same sink identity does not.
-    The four reviewer counterexamples are exact fixtures:
-    `globals()[name](record)`, `getattr(owner, name)(record)`,
-    `module.mapping[name](record)`, and `factory()(record)`. Each yields `blocked_shape` with its
-    stable operation detail ID. Each fixture places a side-effect sentinel in the dynamic resolver,
-    factory, returned callable, descriptor, and would-be sink and proves every sentinel remains
-    untouched. Additional fixtures cover `module.__dict__[name]`, `vars`, `locals`, dynamic
-    import/`__import__`, `eval`, `exec`, `compile`, `CALL_FUNCTION_EX`, reassigned local callees,
-    control-flow merges, unknown opcode provenance, transformed current arguments, and exact static
-    sink calls whose arguments are proven current-independent.
+   descriptor at every declared instance position. Each blocks before the one native instance-dict
+   read; a plain inherited native `__dict__` remains supported. Side-effect sentinels prove that no
+   hook, descriptor, getter, iterator, `repr`, or ordinary attribute access executed.
+10. Projection mutations substitute every frozen durable identity through each declared field,
+    dict/list position, closure token, module token, callback token, bound-method token, and partial
+    token. A declared substitution is `complete_violation`; an undeclared/dynamic form is
+    `blocked_shape`. Alias names, module indirection, and closure-cell positions cannot alter that
+    result.
+11. The former reviewer examples `globals()[name](record)`, `getattr(owner, name)(record)`,
+    `module.mapping[name](record)`, `factory()(record)`, plus 3.12 method-form `LOAD_ATTR`, are
+    cross-version golden controls. They are not interpreted. Their declaration/source code must be
+    either exactly represented by an approved opaque token or block as a dynamic/unknown token, and
+    every side-effect sentinel remains untouched on Python 3.11 and 3.12.
+12. `ProofResultV1` rejects mutation, subclass/mapping/list substitution, mixed outcome/evidence,
+    noncanonical ordering, and unknown enums. Projection ordering metamorphics retain byte-identical
+    results and the same first blocked evidence.
 
-The frozen static callable grammar closes the design requirement `R07-SPEC-P1-01`; the exact root
-manifest closes `R07-SPEC-P1-02`; the ordered instance preflight closes `R07-SPEC-P1-03`; and the
-immutable result/order/bound contract closes `R07-SPEC-P1-04`. The design finding
-`R07-SPEC-P1-05` is closed by the static callable-operation contract and its exact adversarial
-matrix. The code-quality finding `R07-CQ-P1-02` closes only when a later implementation has a
-red-to-green proof for every listed mutation and the original reviewer verifies it. This amendment
-does not close that code finding by itself, and it does not relax `RESET-R07-P0`, `RESET-R07-P1`, or
-the frozen v2 byte-identical parser corpus.
+The exact root manifest continues to close `R07-SPEC-P1-02`; deterministic result/order/bounds
+continue to close `R07-SPEC-P1-04`. `R07-SPEC-P1-05` is now closed only by `R07-CA-PROOF-V1`, not by
+the superseded callable-operation contract. The code-quality finding `R07-CQ-P1-02` closes only
+when a later implementation has red-to-green evidence for this new projection contract and the
+original reviewer verifies it. This amendment does not relax `RESET-R07-P0`, `RESET-R07-P1`, or the
+frozen v2 byte-identical parser corpus.
 
 ##### Frozen Design-Review Scope
 
-This is the second and final document revision for the R07 no-activation proof reset. Subsequent
-design review of this reset is limited to a regression introduced by the `R07-SPEC-P1-05` operation
-contract or materially new evidence against an existing stable-ledger invariant. Findings
-`R07-SPEC-P1-01` through `R07-SPEC-P1-04` are closed and MUST NOT be reopened, renamed, split, or
-reissued without such new evidence and an explicit reference to the original ledger ID and failed
-invariant. Editorial restatement, a new counterexample already covered by the frozen grammar, or a
-different name for the same closed condition is not a new finding. Phase B remains outside this
-review scope.
+This is the second and final architecture reset for the R07 no-activation proof. Subsequent review
+is limited to a regression in `R07-CA-PROOF-V1`, a demonstrated manifest/projection escape, or
+materially new evidence against an existing stable-ledger invariant. Findings
+`R07-SPEC-P1-01` through `R07-SPEC-P1-04` remain closed and MUST NOT be reopened, renamed, split, or
+reissued without that evidence and an explicit reference to the original ledger ID and failed
+invariant. A Python bytecode/opcode variation is not new evidence because bytecode is deliberately
+outside the selected proof. Phase B remains outside this review scope.
 
 ### Phase B: Successor Base Registry, Then Staged Overlay
 
@@ -1719,12 +1729,12 @@ The reset finding ledger is stable:
 | `RESET-REG-P1` | successor or overlay grafts current semantics onto v2 or declares nonexistent/future models | unchanged-v2 evidence, actual-model descriptors, and successor-before-overlay enforcement |
 | `RESET-REG-P2` | count-only readiness, concurrent divergence, expiry/rollback ambiguity, generation-return replay, or audit leakage | exact set/epoch/CAS/lifecycle tests and bounded audit schema |
 | `RESET-R07-P0-01` | the real top-level production registry can make a v3 write/activation object reachable | construct through `runtime_service_main.build_builtin_registry` and prove exhaustive forbidden-object non-reachability |
-| `RESET-R07-P0-02` | a best-effort object walk reports clean after silently skipping a slot, property, descriptor, dynamic attribute path, or traversal bound | test-only fail-closed object-shape contract: exact allowed graph, canonical static edges, structured blocked evidence, and adversarial mutations that must violate or block |
+| `RESET-R07-P0-02` | a best-effort object walk reports clean after silently skipping a slot, property, descriptor, dynamic attribute path, alias, closure, callback, undeclared field, or traversal bound | test-only content-addressed constructive proof: exact roots, source/code identities, complete projection schemas, canonical blocked evidence, and adversarial mutations that must violate or block |
 | `R07-SPEC-P1-01` | runtime annotation evaluation or ambiguous callable inputs let a sink-reachable wrapper evade current-input classification | exact static annotation grammar; current/non-current exact classification; ambiguous, variadic, unresolved, missing, `object`, and `Any` inputs block without evaluation |
 | `R07-SPEC-P1-02` | ad hoc/empty root arguments omit an injection position or treat unknown capabilities as proof coverage | immutable exact ten-root manifest, signature equality, every injection parameter bound, exact fixed capability profiles, and reject-unknown policy |
 | `R07-SPEC-P1-03` | shape dispatch calls `vars`/dynamic attributes too early or treats hostile `__dict__`, slots, or descriptors as empty state | normative classification order and complete MRO/static receiver preflight before the single exact native instance-dict read |
 | `R07-SPEC-P1-04` | mutable/underspecified results or nondeterministic traversal change the first block or turn bound exhaustion into clean | frozen result/evidence/path models, exact enums/order, two-pass traversal, and exact inclusive-bound semantics |
-| `R07-SPEC-P1-05` | identity reachability alone cannot prove that a sink is called, while dynamic/factory/subscript callees can evade a name/reference walk | exact non-executing opcode/call grammar, direct-current argument provenance, blocked dynamic operations, and operation side-effect sentinels |
+| `R07-SPEC-P1-05` | a dynamic/opaque callable, alias, closure, callback, or CPython-version-specific execution detail can evade a generic call analysis | `R07-CA-PROOF-V1`: anchored source/code identities plus complete fail-closed projection; tiny AST validation only for declaration syntax, never Python execution/data-flow |
 | `RESET-R07-P2-01` | an identical post-link retry can publish a pointer without re-establishing records-directory durability | future v3-only primitive re-fsyncs the records directory; byte conflict rejects before pointer mutation |
 | `RESET-REG-P0-01` | generation code, self-consistent manifests/vectors/results, a service, or forged IPC can acquire append authority | fixed external root policy authorizes exact release hashes; root never imports generation code; unprivileged child has no store/verifier capability; root validates and writes after child exit |
 | `RESET-REG-P1-01` | underspecified successor/overlay schemas permit alternate bytes, order, identity, or nonexistent models | four exact schemas, canonical preimages/raw bytes, strict structural rejection, and actual-model prerequisite |
@@ -1738,12 +1748,12 @@ The planned red-test matrix is exact:
 | `RESET-R07-P1` | `tests/fixtures/signal_route_spool_v2_differential/manifest.json`; `tests/unit/test_signal_route_spool_v2_differential.py` | frozen valid and invalid corpus proves untouched v2 bytes, `ensure_ascii=True`, hashes, models, and public error category/sequence before and after dispatcher introduction |
 | `RESET-R07-P1`, `RESET-R07-P2` | `tests/unit/test_current_signal_route_spool_record_v3.py` | exact `E`/`R`/outer bytes and hashes, strict JSON, exact types, all-v2 and one-way mixed chain, v3-first production rejection, isolated decoder-only all-v3 fixture, pointer neutrality, and synthetic crash/orphan/retry state-machine cases without a durable writer |
 | `RESET-R07-P2-01` | future `tests/unit/test_current_signal_route_spool_v3_publication_contract.py` in the separately authorized writer tranche | v3 primitive is separate from byte-identical v2 `_immutable_write_at`; crash after link and before directory fsync makes identical retry fsync the records directory again before pointer work; differing bytes reject before pointer mutation; Phase A/builders cannot import or reach the primitive |
-| `RESET-R07-P0`, `RESET-R07-P0-01`, `RESET-R07-P0-02` | `tests/unit/test_signal_family_no_activation_reset.py` | source/API snapshots and mutation probes cover every inventory row and all production builders; construct the registry through `rquant.runtime_service_main.build_builtin_registry` and run the fail-closed object-shape proof over its exact roots. Supported static entries/closures/callbacks/capabilities prove no v3 writer/capability/flag/cursor/drain/cutover object is imported, injected, returned, or reachable; any unsupported shape or bound blocks rather than reports clean; decoder import/construction alone succeeds |
+| `RESET-R07-P0`, `RESET-R07-P0-01`, `RESET-R07-P0-02` | `tests/unit/test_signal_family_no_activation_reset.py` | immutable root + capability manifests construct every production root once and validate an exact projection of every declared node/edge. Source/code identity changes, undeclared values, slots/properties/descriptors/hooks, custom containers, aliases in unknown fields, or limits block; declared forbidden-identity mutations violate; decoder import/construction alone succeeds |
 | `R07-SPEC-P1-01` | `tests/unit/test_signal_family_no_activation_reset.py` | exact object and static string `Name`/`Attribute` current annotations classify; missing, `object`, `Any`, variadic, union/generic/protocol/type-variable, unresolved, executable, and descriptor-backed annotations block; sentinels prove no evaluation/import/dynamic access |
 | `R07-SPEC-P1-02` | `tests/unit/test_signal_family_no_activation_reset.py` | exact canonical root manifest/hash has all ten inventory roots, exact target identities/signatures, every optional injection fixed explicitly, exact six/all capability profiles, and rejection of empty/missing/changed/unknown/reordered/extra roots, arguments, profiles, keys, and values before builder invocation |
 | `R07-SPEC-P1-03` | `tests/unit/test_signal_family_no_activation_reset.py` | shape classification follows the frozen order; only module/class uses `vars`; plain and inherited native instance dicts pass; slot/property/custom-descriptor/dynamic-hook/hostile-`__dict__` shapes block before instance read and execute no user code |
 | `R07-SPEC-P1-04` | `tests/unit/test_signal_family_no_activation_reset.py` | exact immutable `ProofResultV1`/evidence/path schemas and enums, two-pass shape-before-capability behavior, canonical first blocked path under all ordering metamorphics, and exact 10,000/10,001 node, depth-64-child, and 512/513 edge boundaries |
-| `R07-SPEC-P1-05` | `tests/unit/test_signal_family_no_activation_reset.py` | allowed direct global/closure/receiver-attribute/bound/partial call shapes and direct-current sink arguments violate; mere sink reference does not. Exact `globals()[name](record)`, `getattr(owner, name)(record)`, `module.mapping[name](record)`, and `factory()(record)` reviewer fixtures plus module-dict/subscript, dynamic import/eval/exec, call-result, starred-call, merge, and transformed-current variants block with stable detail IDs and untouched side-effect sentinels |
+| `R07-SPEC-P1-05` | `tests/unit/test_signal_family_no_activation_reset.py` | expected content-addressed V2 manifest cannot be regenerated; source/code/closure/default declaration changes block. The reviewer `globals`, `getattr`, subscript, factory, slots/property/descriptor, and 3.11/3.12 method-form controls are opaque-token or blocked-shape goldens with untouched side-effect sentinels; no bytecode interpretation exists |
 | `RESET-REG-P1`, `RESET-REG-P1-01` | `tests/unit/test_signal_family_successor_registry_reset.py` | v2 parser/catalog/bytes/hashes/history are unchanged; exact four-schema field sets, hash preimages, raw canonical bytes, strict duplicate/extra/coercion/order rejection; successor declaration rejects before the actual model exists; v2 semantic/partial/absent/conflicting overlay never becomes ready |
 | `RESET-REG-P0`, `RESET-REG-P1`, `RESET-REG-P1-02` | `tests/integration/test_signal_family_verification_reset.py` | all five pair IDs resolve exact callable objects through real production builders and manifest-backed source hashes; exact service bindings cover the pair-derived service set and reject missing/duplicate/cross-role/wrong module/path/source hash before child execution; only a successful immutable child run can lead the root verifier to persist five receipts |
 | `RESET-REG-P0-01` | `tests/integration/test_signal_family_root_verifier_isolation.py` | child module inspection/import cannot discover or import privileged verifier/store authority; direct store open/append fails; no inherited descriptor/path/capability exists; forged, extra, oversized, noncanonical, or wrong-result IPC rejects; caller/service evidence APIs do not exist; authority change between child completion and root append rejects |
