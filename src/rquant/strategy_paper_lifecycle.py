@@ -28,7 +28,13 @@ from rquant.paper_contracts import (
 )
 from rquant.research_run_spec import ExecutionCostSpec
 from rquant.runtime_contracts import normalize_aware_utc
-from rquant.signal_contracts import SignalAction, SignalEnvelope
+from rquant.signal_contracts import (
+    CurrentSignalEnvelope,
+    SignalAction,
+    SignalEnvelope,
+    SignalEnvelopeFamily,
+    parse_signal_envelope,
+)
 
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _REQUIRED_TABLES = frozenset(
@@ -52,6 +58,15 @@ def _utc_iso(value: datetime) -> str:
 
 class PaperLifecycleIntegrityError(RuntimeError):
     """The paper ledger cannot provide trustworthy lifecycle evidence."""
+
+
+def _validated_signal_family(signal: SignalEnvelopeFamily) -> SignalEnvelopeFamily:
+    if type(signal) not in {SignalEnvelope, CurrentSignalEnvelope}:
+        raise TypeError("paper lifecycle signal must be a known envelope family")
+    parsed = parse_signal_envelope(signal.model_dump(mode="json"))
+    if type(parsed) is not type(signal) or parsed != signal:
+        raise PaperLifecycleIntegrityError("paper lifecycle signal is not canonical")
+    return parsed
 
 
 @dataclass(frozen=True)
@@ -239,8 +254,8 @@ class PaperBrokerLifecycleReader:
         self,
         *,
         candidate_id: str,
-        entry_signal: SignalEnvelope,
-        exit_signals: tuple[SignalEnvelope, ...],
+        entry_signal: SignalEnvelopeFamily,
+        exit_signals: tuple[SignalEnvelopeFamily, ...],
         decision_cutoff: datetime,
         market_features: Mapping[str, object],
         market_feature_statuses: Mapping[str, FeatureFieldStatus],
@@ -248,6 +263,12 @@ class PaperBrokerLifecycleReader:
         previous_high_source_event_time: datetime | None,
         previous_high_available_at: datetime | None,
     ) -> FeatureInstanceEnvelope:
+        entry_signal = _validated_signal_family(entry_signal)
+        if not isinstance(exit_signals, tuple):
+            raise TypeError("exit_signals must be a tuple")
+        exit_signals = tuple(_validated_signal_family(signal) for signal in exit_signals)
+        if len({signal.signal_id for signal in exit_signals}) != len(exit_signals):
+            raise PaperLifecycleIntegrityError("exit signal evidence is duplicated")
         cutoff = normalize_aware_utc(decision_cutoff)
         if entry_signal.candidate_id != candidate_id:
             raise PaperLifecycleIntegrityError("entry signal candidate does not match")
@@ -773,18 +794,17 @@ class PaperBrokerLifecycleReader:
         self,
         connection: sqlite3.Connection,
         *,
-        entry_signal: SignalEnvelope,
-        exit_signals: tuple[SignalEnvelope, ...],
+        entry_signal: SignalEnvelopeFamily,
+        exit_signals: tuple[SignalEnvelopeFamily, ...],
         decision_cutoff: datetime,
         position: _RebuiltPosition,
     ) -> _ExitExecutionEvidence:
         if not isinstance(exit_signals, tuple):
             raise TypeError("exit_signals must be a tuple")
-        visible: list[SignalEnvelope] = []
+        visible: list[SignalEnvelopeFamily] = []
         seen_ids: set[str] = set()
         for signal in exit_signals:
-            if not isinstance(signal, SignalEnvelope):
-                raise TypeError("exit_signals must contain SignalEnvelope values")
+            signal = _validated_signal_family(signal)
             if signal.signal_id in seen_ids:
                 raise PaperLifecycleIntegrityError("exit signal evidence is duplicated")
             seen_ids.add(str(signal.signal_id))
@@ -832,8 +852,8 @@ class PaperBrokerLifecycleReader:
         self,
         connection: sqlite3.Connection,
         *,
-        entry_signal: SignalEnvelope,
-        signal: SignalEnvelope,
+        entry_signal: SignalEnvelopeFamily,
+        signal: SignalEnvelopeFamily,
         decision_cutoff: datetime,
     ) -> _ExitExecutionEvidence:
         rows = connection.execute(
@@ -1123,7 +1143,7 @@ class PaperBrokerLifecycleReader:
 
     @staticmethod
     def _structure_stop(
-        entry_signal: SignalEnvelope,
+        entry_signal: SignalEnvelopeFamily,
         *,
         entry_price: float,
     ) -> tuple[float, tuple[datetime, datetime] | None]:

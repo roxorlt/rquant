@@ -29,11 +29,28 @@ from rquant.paper_execution_constraints import PaperExecutionConstraintAuthority
 from rquant.paper_signal_worker import PaperQuoteSnapshot
 from rquant.research_run_spec import InstrumentContext
 from rquant.runtime_contracts import RuntimeContractModel, normalize_aware_utc
-from rquant.signal_contracts import SignalAction, SignalEnvelope
+from rquant.signal_contracts import (
+    CurrentSignalEnvelope,
+    SignalAction,
+    SignalEnvelope,
+    SignalEnvelopeFamily,
+    parse_signal_envelope,
+)
 
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 CommitSha = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{40}$")]
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
+
+
+def _validated_signal_family(signal: SignalEnvelopeFamily) -> SignalEnvelopeFamily:
+    if type(signal) not in {SignalEnvelope, CurrentSignalEnvelope}:
+        raise TypeError("paper quote signal must be a known envelope family")
+    parsed = parse_signal_envelope(signal.model_dump(mode="json"))
+    if type(parsed) is not type(signal) or parsed != signal:
+        raise PaperQuoteIntegrityError("paper quote signal is not canonical")
+    return parsed
+
+
 _DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
 _FILE_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
 
@@ -287,7 +304,7 @@ class PaperPitQuoteResolver:
 
     def __call__(
         self,
-        signal: SignalEnvelope,
+        signal: SignalEnvelopeFamily,
         observed_at: datetime,
     ) -> PaperQuoteSnapshot:
         return self.resolve(signal, observed_at=observed_at)
@@ -308,10 +325,11 @@ class PaperPitQuoteResolver:
 
     def resolve(
         self,
-        signal: SignalEnvelope,
+        signal: SignalEnvelopeFamily,
         *,
         observed_at: datetime,
     ) -> PaperQuoteSnapshot:
+        signal = _validated_signal_family(signal)
         observed = normalize_aware_utc(observed_at)
         observed_session = self._require_trade_session(observed)
         envelope, payload = self._latest_visible_batch(observed)

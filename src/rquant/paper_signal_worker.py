@@ -9,6 +9,7 @@ from collections.abc import Callable, Mapping
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
+from hashlib import sha256
 from pathlib import Path
 from types import MappingProxyType
 from typing import Annotated, Self
@@ -33,13 +34,19 @@ from rquant.runtime_contracts import (
     canonical_sha256,
     normalize_aware_utc,
 )
-from rquant.signal_contracts import SignalAction, SignalEnvelope
+from rquant.signal_bus import parse_stored_signal
+from rquant.signal_contracts import (
+    SignalAction,
+    SignalEnvelope,
+    SignalEnvelopeFamily,
+    parse_signal_envelope,
+)
 
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 CommitSha = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{40}$")]
 
 
-def _entry_signal_id(signal: SignalEnvelope) -> str | None:
+def _entry_signal_id(signal: SignalEnvelopeFamily) -> str | None:
     if signal.action is SignalAction.B_INTENT:
         return None
     value = signal.evidence.get("entry_signal_id")
@@ -54,7 +61,7 @@ def _entry_signal_id(signal: SignalEnvelope) -> str | None:
     return value
 
 
-def _sell_tranche_fraction(signal: SignalEnvelope) -> Decimal:
+def _sell_tranche_fraction(signal: SignalEnvelopeFamily) -> Decimal:
     if signal.action not in {SignalAction.REDUCE, SignalAction.S_INTENT}:
         raise ValueError("sell tranche is only valid for SELL/REDUCE signals")
     raw = signal.evidence.get("sell_tranche_fraction")
@@ -186,7 +193,7 @@ class PaperQuoteSnapshot(RuntimeContractModel):
 
 
 class PaperSignalQueueRecord(RuntimeContractModel):
-    signal: SignalEnvelope
+    signal: SignalEnvelopeFamily
     status: PaperSignalQueueStatus
     due_at: AwareUtcDatetime
     received_at: AwareUtcDatetime
@@ -254,7 +261,7 @@ class PaperSignalRunSummary(RuntimeContractModel):
     failed_count: int = Field(ge=0)
 
 
-QuoteResolver = Callable[[SignalEnvelope, datetime], PaperQuoteSnapshot]
+QuoteResolver = Callable[[SignalEnvelopeFamily, datetime], PaperQuoteSnapshot]
 
 
 def _json(model: RuntimeContractModel) -> str:
@@ -273,7 +280,7 @@ def _error_text(error: BaseException) -> str:
 
 def _prepared_execution_id(
     *,
-    signal: SignalEnvelope,
+    signal: SignalEnvelopeFamily,
     intent: PaperOrderIntent,
     quote: PaperQuoteSnapshot,
     due_at: datetime,
@@ -348,6 +355,8 @@ class PaperSignalQueueStore:
                 CREATE TABLE IF NOT EXISTS paper_signal_queue (
                     signal_id TEXT PRIMARY KEY,
                     signal_json TEXT NOT NULL,
+                    signal_hash TEXT NOT NULL,
+                    signal_size INTEGER NOT NULL,
                     status TEXT NOT NULL,
                     due_at TEXT NOT NULL,
                     expires_at TEXT NOT NULL,
@@ -378,6 +387,40 @@ class PaperSignalQueueStore:
             }
             if "execution_id" not in queue_columns:
                 connection.execute("ALTER TABLE paper_signal_queue ADD COLUMN execution_id TEXT")
+            if "signal_hash" not in queue_columns:
+                connection.execute("ALTER TABLE paper_signal_queue ADD COLUMN signal_hash TEXT")
+            if "signal_size" not in queue_columns:
+                connection.execute("ALTER TABLE paper_signal_queue ADD COLUMN signal_size INTEGER")
+            signal_rows = connection.execute(
+                "SELECT signal_id, signal_json, signal_hash, signal_size FROM paper_signal_queue"
+            ).fetchall()
+            for signal_row in signal_rows:
+                payload_json = str(signal_row["signal_json"])
+                payload_bytes = payload_json.encode("utf-8")
+                payload_hash = (
+                    sha256(payload_bytes).hexdigest()
+                    if signal_row["signal_hash"] is None
+                    else str(signal_row["signal_hash"])
+                )
+                payload_size = (
+                    len(payload_bytes)
+                    if signal_row["signal_size"] is None
+                    else int(signal_row["signal_size"])
+                )
+                parse_stored_signal(
+                    signal_id=str(signal_row["signal_id"]),
+                    payload_hash=payload_hash,
+                    payload_json=payload_json,
+                    payload_size=payload_size,
+                )
+                if signal_row["signal_hash"] is None or signal_row["signal_size"] is None:
+                    connection.execute(
+                        """
+                        UPDATE paper_signal_queue
+                        SET signal_hash = ?, signal_size = ? WHERE signal_id = ?
+                        """,
+                        (payload_hash, payload_size, signal_row["signal_id"]),
+                    )
             if "expires_at" not in queue_columns:
                 connection.execute("ALTER TABLE paper_signal_queue ADD COLUMN expires_at TEXT")
                 legacy_rows = connection.execute(
@@ -385,8 +428,12 @@ class PaperSignalQueueStore:
                 ).fetchall()
                 for legacy_row in legacy_rows:
                     try:
-                        legacy_signal = SignalEnvelope.model_validate_json(
-                            legacy_row["signal_json"]
+                        payload_json = str(legacy_row["signal_json"])
+                        legacy_signal = parse_stored_signal(
+                            signal_id=str(legacy_row["signal_id"]),
+                            payload_hash=sha256(payload_json.encode("utf-8")).hexdigest(),
+                            payload_json=payload_json,
+                            payload_size=len(payload_json.encode("utf-8")),
                         )
                     except (TypeError, ValueError):
                         continue
@@ -466,19 +513,50 @@ class PaperSignalQueueStore:
 
     def ingest(
         self,
-        signal: SignalEnvelope,
+        signal: SignalEnvelopeFamily,
         *,
         received_at: datetime,
+        payload_json: str | None = None,
+        payload_hash: str | None = None,
+        payload_size: int | None = None,
     ) -> PaperSignalQueueRecord:
+        payload_values = (payload_json, payload_hash, payload_size)
+        if any(value is None for value in payload_values) and any(
+            value is not None for value in payload_values
+        ):
+            raise ValueError("stored paper signal payload metadata must be configured together")
+        if payload_json is None:
+            if type(signal) is not SignalEnvelope:
+                raise TypeError("paper queue direct ingestion requires a SignalEnvelope")
+            parsed_signal = parse_signal_envelope(signal.model_dump(mode="json"))
+            if type(parsed_signal) is not SignalEnvelope:
+                raise TypeError("paper queue direct ingestion requires a SignalEnvelope")
+            signal_json = _json(parsed_signal)
+            signal_hash = sha256(signal_json.encode("utf-8")).hexdigest()
+            signal_size = len(signal_json.encode("utf-8"))
+        else:
+            assert payload_hash is not None and payload_size is not None
+            parsed_signal = parse_stored_signal(
+                signal_id=signal.signal_id,
+                payload_hash=payload_hash,
+                payload_json=payload_json,
+                payload_size=payload_size,
+            )
+            if type(parsed_signal) is not type(signal) or parsed_signal != signal:
+                raise ValueError("stored paper signal does not match supplied signal")
+            signal_json = payload_json
+            signal_hash = payload_hash
+            signal_size = payload_size
         received = normalize_aware_utc(received_at)
-        if received < signal.available_at:
+        if received < parsed_signal.available_at:
             raise ValueError("received_at cannot precede signal available_at")
-        signal_json = _json(signal)
-        due_at = max(signal.available_at, signal.event_time + self.policy.execution_lag)
-        if signal.action not in self.policy.action_quantities:
+        due_at = max(
+            parsed_signal.available_at, parsed_signal.event_time + self.policy.execution_lag
+        )
+        if parsed_signal.action not in self.policy.action_quantities:
             status = PaperSignalQueueStatus.IGNORED
-            error = f"action {signal.action.value} is not executable by paper broker"
-        elif due_at >= signal.expires_at:
+            error = f"action {parsed_signal.action.value} is not executable by paper broker"
+        elif due_at >= parsed_signal.expires_at:
             status = PaperSignalQueueStatus.EXPIRED
             error = "signal expires before earliest paper execution"
         else:
@@ -490,7 +568,7 @@ class PaperSignalQueueStore:
             try:
                 existing = connection.execute(
                     "SELECT * FROM paper_signal_queue WHERE signal_id = ?",
-                    (signal.signal_id,),
+                    (parsed_signal.signal_id,),
                 ).fetchone()
                 if existing is not None:
                     if existing["signal_json"] != signal_json:
@@ -501,18 +579,20 @@ class PaperSignalQueueStore:
                     """
                     INSERT INTO paper_signal_queue(
                         signal_id, signal_json, status, due_at, expires_at,
-                        received_at, updated_at, last_error
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        received_at, updated_at, last_error, signal_hash, signal_size
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        signal.signal_id,
+                        parsed_signal.signal_id,
                         signal_json,
                         status.value,
                         due_at.isoformat(),
-                        signal.expires_at.isoformat(),
+                        parsed_signal.expires_at.isoformat(),
                         received.isoformat(),
                         received.isoformat(),
                         error,
+                        signal_hash,
+                        signal_size,
                     ),
                 )
                 connection.commit()
@@ -520,7 +600,7 @@ class PaperSignalQueueStore:
                 if connection.in_transaction:
                     connection.rollback()
                 raise
-        record = self.record(signal.signal_id)
+        record = self.record(parsed_signal.signal_id)
         assert record is not None
         return record
 
@@ -531,6 +611,15 @@ class PaperSignalQueueStore:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
+                expiring_rows = connection.execute(
+                    """
+                    SELECT * FROM paper_signal_queue
+                    WHERE status = ? AND expires_at <= ?
+                    """,
+                    (PaperSignalQueueStatus.PENDING.value, observed.isoformat()),
+                ).fetchall()
+                for row in expiring_rows:
+                    self._record_from_row(row)
                 connection.execute(
                     """
                     UPDATE paper_signal_queue
@@ -903,7 +992,7 @@ class PaperSignalQueueStore:
 
     def _validate_sell_authority(
         self,
-        signal: SignalEnvelope,
+        signal: SignalEnvelopeFamily,
         authority: PaperSellQuantityAuthority | None,
         *,
         decision_cutoff: datetime,
@@ -972,8 +1061,14 @@ class PaperSignalQueueStore:
 
     @staticmethod
     def _record_from_row(row: sqlite3.Row) -> PaperSignalQueueRecord:
+        signal = parse_stored_signal(
+            signal_id=str(row["signal_id"]),
+            payload_hash=str(row["signal_hash"]),
+            payload_json=str(row["signal_json"]),
+            payload_size=int(row["signal_size"]),
+        )
         return PaperSignalQueueRecord(
-            signal=SignalEnvelope.model_validate_json(row["signal_json"]),
+            signal=signal,
             status=PaperSignalQueueStatus(row["status"]),
             due_at=datetime.fromisoformat(row["due_at"]),
             received_at=datetime.fromisoformat(row["received_at"]),
@@ -1125,7 +1220,7 @@ def run_paper_signal_batch(
 
 def _sell_quantity_authority(
     broker: PaperBrokerStore,
-    signal: SignalEnvelope,
+    signal: SignalEnvelopeFamily,
     *,
     decision_cutoff: datetime,
     trade_date: date,

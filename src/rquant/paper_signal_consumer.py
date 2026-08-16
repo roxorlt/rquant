@@ -27,7 +27,9 @@ from rquant.signal_bus import (
     SignalBusSignalRecord,
     SignalBusSourceDescriptor,
     SignalBusSourceSequenceError,
+    parse_stored_signal,
 )
+from rquant.signal_contracts import SignalEnvelopeFamily
 
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 
@@ -231,6 +233,30 @@ class PaperSignalConsumerStateStore:
                     connection.rollback()
                 raise
 
+    def validate_source(self, descriptor: SignalBusSourceDescriptor) -> PaperSignalConsumerCursor:
+        """Check source continuity without changing consumer state."""
+
+        cursor = self.cursor()
+        if cursor.source_id is None:
+            if descriptor.first_global_sequence != 1:
+                raise PaperSignalConsumerSourceError(
+                    "signal source is truncated before the consumer was initialized"
+                )
+            return cursor
+        if cursor.source_id != descriptor.source_id:
+            raise PaperSignalConsumerSourceError("signal source id changed")
+        if cursor.source_generation_id != descriptor.generation_id:
+            raise PaperSignalConsumerSourceError("signal source generation changed")
+        if cursor.first_global_sequence != descriptor.first_global_sequence:
+            raise PaperSignalConsumerSourceError("signal source start was truncated or changed")
+        if descriptor.high_watermark < cursor.observed_high_watermark:
+            raise PaperSignalConsumerSourceError("signal source high watermark rolled back")
+        if descriptor.high_watermark < cursor.last_global_sequence:
+            raise PaperSignalConsumerSourceError(
+                "signal source high watermark precedes the consumer cursor"
+            )
+        return cursor
+
     def observe_source(
         self,
         descriptor: SignalBusSourceDescriptor,
@@ -300,6 +326,7 @@ class PaperSignalConsumerStateStore:
         *,
         bound_at: datetime,
     ) -> _BindResult:
+        self._verified_record_signal(record)
         bound = normalize_aware_utc(bound_at)
         if record.signal.available_at > bound or record.received_at > bound:
             raise ValueError("future signal cannot be bound by paper consumer")
@@ -375,6 +402,7 @@ class PaperSignalConsumerStateStore:
         *,
         delegated_at: datetime,
     ) -> PaperSignalConsumerReceipt:
+        self._verified_record_signal(record)
         delegated = normalize_aware_utc(delegated_at)
         if queue_record.signal != record.signal:
             raise ValueError("paper queue record does not match the bound signal")
@@ -471,6 +499,12 @@ class PaperSignalConsumerStateStore:
 
     @staticmethod
     def _receipt_from_row(row: sqlite3.Row) -> PaperSignalConsumerReceipt:
+        parse_stored_signal(
+            signal_id=str(row["signal_id"]),
+            payload_hash=str(row["payload_hash"]),
+            payload_json=str(row["payload_json"]),
+            payload_size=len(str(row["payload_json"]).encode("utf-8")),
+        )
         return PaperSignalConsumerReceipt(
             source_generation_id=row["source_generation_id"],
             global_sequence=row["global_sequence"],
@@ -486,6 +520,18 @@ class PaperSignalConsumerStateStore:
                 else None
             ),
         )
+
+    @staticmethod
+    def _verified_record_signal(record: SignalBusSignalRecord) -> SignalEnvelopeFamily:
+        signal = parse_stored_signal(
+            signal_id=record.signal_id,
+            payload_hash=record.payload_hash,
+            payload_json=record.payload_json,
+            payload_size=len(record.payload_json.encode("utf-8")),
+        )
+        if type(signal) is not type(record.signal) or signal != record.signal:
+            raise PaperSignalConsumerSourceError("signal record does not match its stored payload")
+        return signal
 
     def _after_paper_ingest(
         self,
@@ -507,7 +553,7 @@ def consume_signal_bus_to_paper(
     if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
         raise ValueError("limit must be a positive integer")
     descriptor = bus.source_descriptor()
-    starting_cursor = state.observe_source(descriptor, observed_at=observed)
+    starting_cursor = state.validate_source(descriptor)
     try:
         records = bus.signals_after_global_sequence(
             after_sequence=starting_cursor.last_global_sequence,
@@ -517,16 +563,24 @@ def consume_signal_bus_to_paper(
         )
     except SignalBusSourceSequenceError as error:
         raise PaperSignalConsumerSourceError(str(error)) from error
+    verified_records = tuple(state._verified_record_signal(record) for record in records)
+    starting_cursor = state.observe_source(descriptor, observed_at=observed)
 
     delegated_count = 0
     replayed_count = 0
-    for record in records:
+    for record, signal in zip(records, verified_records, strict=True):
         binding = state.bind(record, descriptor, bound_at=observed)
         if binding.replayed:
             replayed_count += 1
         if binding.receipt.status is PaperSignalReceiptStatus.DELEGATED:
             continue
-        queue_record = queue.ingest(record.signal, received_at=observed)
+        queue_record = queue.ingest(
+            signal,
+            received_at=observed,
+            payload_json=record.payload_json,
+            payload_hash=record.payload_hash,
+            payload_size=len(record.payload_json.encode("utf-8")),
+        )
         state._after_paper_ingest(record, queue_record)
         state.complete(
             record,
