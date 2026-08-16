@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from copy import deepcopy
+from datetime import datetime
 from enum import StrEnum
 from types import MappingProxyType
 from typing import Annotated, Literal, Self
@@ -13,6 +15,7 @@ from pydantic import (
     Field,
     JsonValue,
     StringConstraints,
+    WithJsonSchema,
     field_serializer,
     field_validator,
     model_validator,
@@ -46,6 +49,10 @@ CommitSha = Annotated[
     str,
     BeforeValidator(_require_exact_string),
     StringConstraints(pattern=r"^[0-9a-f]{40}$"),
+    WithJsonSchema(
+        {"type": "string", "pattern": r"^[0-9a-f]{40}$"},
+        mode="validation",
+    ),
 ]
 NonzeroCommitSha = Annotated[
     str,
@@ -80,6 +87,89 @@ def _thaw_json(value: object) -> object:
         return {key: _thaw_json(item) for key, item in value.items()}
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         return [_thaw_json(item) for item in value]
+    return value
+
+
+def _detached_snapshot(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {deepcopy(key): _detached_snapshot(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_detached_snapshot(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_detached_snapshot(item) for item in value)
+    return deepcopy(value)
+
+
+def _require_current_json_representation(value: object, *, path: str) -> None:
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ValueError(f"{path} keys must be strings")
+            _require_current_json_representation(item, path=f"{path}.{key}")
+        return
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            _require_current_json_representation(item, path=f"{path}[{index}]")
+        return
+    raise ValueError(f"{path} must use exact JSON value types")
+
+
+def _require_current_representation(value: object) -> object:
+    if not isinstance(value, Mapping):
+        return value
+    if any(not isinstance(key, str) for key in value):
+        raise ValueError("current envelope field names must be strings")
+
+    exact_string_fields = (
+        "envelope_schema",
+        "strategy_id",
+        "strategy_version",
+        "parameter_fingerprint",
+        "dataset_snapshot_id",
+        "feature_snapshot_id",
+        "candidate_id",
+        "action",
+    )
+    for field in exact_string_fields:
+        if field in value:
+            _require_exact_string(value[field])
+    if value.get("signal_id") is not None:
+        _require_exact_string(value["signal_id"])
+
+    for field in ("event_time", "available_at", "expires_at"):
+        if field not in value:
+            continue
+        timestamp = value[field]
+        if isinstance(timestamp, str):
+            _require_exact_string(timestamp)
+        elif not isinstance(timestamp, datetime):
+            raise ValueError(f"{field} must be an exact datetime string or datetime object")
+
+    if "reason_codes" in value:
+        reasons = value["reason_codes"]
+        if not isinstance(reasons, Sequence) or isinstance(
+            reasons,
+            (str, bytes, bytearray),
+        ):
+            raise ValueError("reason_codes must be a sequence of exact strings")
+        for reason in reasons:
+            _require_exact_string(reason)
+
+    if "evidence" in value:
+        evidence = value["evidence"]
+        if not isinstance(evidence, Mapping):
+            raise ValueError("evidence must be a mapping")
+        _require_current_json_representation(evidence, path="evidence")
+
+    identity = value.get("producer_identity")
+    if isinstance(identity, Mapping):
+        if any(not isinstance(key, str) for key in identity):
+            raise ValueError("producer_identity field names must be strings")
+        for field in ("kind", "producer_commit", "producer_generation_id"):
+            if identity.get(field) is not None:
+                _require_exact_string(identity[field])
     return value
 
 
@@ -161,7 +251,7 @@ class _SignalEnvelopeBase(RuntimeContractModel):
         return self
 
 
-class LegacySignalEnvelope(_SignalEnvelopeBase):
+class SignalEnvelope(_SignalEnvelopeBase):
     schema_version: int = Field(ge=1, strict=True)
     signal_id: Sha256 | None = None
     strategy_id: str = Field(min_length=1)
@@ -190,6 +280,10 @@ class LegacySignalEnvelope(_SignalEnvelopeBase):
             **self._common_identity_payload(),
             "producer_commit": self.producer_commit,
         }
+
+
+# Explicit permanent-reader name; SignalEnvelope retains its persisted runtime identity.
+LegacySignalEnvelope = SignalEnvelope
 
 
 class GitCommitClaimIdentity(RuntimeContractModel):
@@ -225,6 +319,11 @@ class CurrentSignalEnvelope(_SignalEnvelopeBase):
     expires_at: AwareUtcDatetime
     producer_identity: ProducerIdentity
 
+    @model_validator(mode="before")
+    @classmethod
+    def validate_exact_representation(cls, value: object) -> object:
+        return _require_current_representation(value)
+
     def _identity_payload(self) -> dict[str, object]:
         return {
             "envelope_schema": self.envelope_schema,
@@ -233,13 +332,11 @@ class CurrentSignalEnvelope(_SignalEnvelopeBase):
         }
 
 
-# Deprecated compatibility name for untouched writers during the reader-only rollout.
-SignalEnvelope = LegacySignalEnvelope
 SignalEnvelopeFamily = LegacySignalEnvelope | CurrentSignalEnvelope
 
 
 def current_signal_envelope_json_bytes(envelope: CurrentSignalEnvelope) -> bytes:
-    if not isinstance(envelope, CurrentSignalEnvelope):
+    if type(envelope) is not CurrentSignalEnvelope:
         raise TypeError("current writer requires a CurrentSignalEnvelope object")
     verified = CurrentSignalEnvelope.model_validate(envelope)
     return canonical_json_bytes(verified.model_dump(mode="json"))
@@ -253,8 +350,11 @@ def parse_signal_envelope(
     )
     if not isinstance(decoded, Mapping):
         raise TypeError("signal envelope payload must be a mapping or JSON object")
-    if "envelope_schema" not in decoded:
-        return LegacySignalEnvelope.model_validate(decoded)
-    if decoded["envelope_schema"] != CURRENT_ENVELOPE_SCHEMA:
+    snapshot = _detached_snapshot(decoded)
+    if not isinstance(snapshot, dict):
+        raise TypeError("signal envelope payload must be a mapping or JSON object")
+    if "envelope_schema" not in snapshot:
+        return LegacySignalEnvelope.model_validate(snapshot)
+    if snapshot["envelope_schema"] != CURRENT_ENVELOPE_SCHEMA:
         raise ValueError("unknown signal envelope_schema")
-    return CurrentSignalEnvelope.model_validate(decoded)
+    return CurrentSignalEnvelope.model_validate(snapshot)

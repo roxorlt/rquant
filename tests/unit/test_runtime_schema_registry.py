@@ -73,7 +73,11 @@ def _manifest(
     )
 
 
-def _bundle(commit: str) -> RuntimeSchemaContractBundle:
+def _bundle(
+    commit: str,
+    *,
+    include_serving_publisher: bool = False,
+) -> RuntimeSchemaContractBundle:
     manifests = (
         _manifest(
             service_id="reference-slow-source",
@@ -131,6 +135,14 @@ def _bundle(commit: str) -> RuntimeSchemaContractBundle:
             commit=commit,
         ),
     )
+    if include_serving_publisher:
+        manifests += (
+            _manifest(
+                service_id="serving-publisher",
+                kind=RuntimeServiceKind.SERVING_PUBLISHER,
+                commit=commit,
+            ),
+        )
     return build_runtime_schema_contract_bundle(manifests, producer_commit=commit)
 
 
@@ -263,6 +275,38 @@ def test_registry_tracks_independent_watchlist_quote_channel() -> None:
     assert channel.payload_model == "rquant.live_contracts.BatchEnvelope"
     assert channel.producer_service_ids == ("watchlist-quote-source",)
     assert {field.name for field in channel.declaration.fields} == set(BatchEnvelope.model_fields)
+
+
+class TestCoreCqP101PersistedRegistryIdentity:
+    def test_signal_declarations_match_the_pre_family_split_registry_identity(self) -> None:
+        bundle = _bundle(OLD_COMMIT, include_serving_publisher=True)
+        strategy_signal = bundle.channel("runtime.strategy_signal.envelope")
+
+        assert strategy_signal.payload_model == "rquant.signal_contracts.SignalEnvelope"
+        assert strategy_signal.declaration.schema_name == "rquant.signal_contracts.SignalEnvelope"
+        assert strategy_signal.physical_schema.object_name == (
+            "rquant.signal_contracts.SignalEnvelope"
+        )
+        assert strategy_signal.declaration.schema_fingerprint == (
+            "1d5b90cf4800f634427abf9aaa4f5cc8072cb045e0a7affe90dd700672e0c198"
+        )
+
+        nested = bundle.channel("runtime.serving.signals")
+        assert nested.declaration.schema_fingerprint == (
+            "992b0b6441c7e77e426645c09d0298fef7f44c7b25c21c15a852fc5b797a4e45"
+        )
+        nested_signal_field = next(
+            field for field in nested.declaration.fields if field.name == "signals"
+        )
+        expected_nested_type = (
+            "json-schema-sha256:a01914d026c58fbf2effb0d853a829bdf8123d6fb9190d189ae5737a65a44b14"
+        )
+        assert nested_signal_field.type_name == expected_nested_type
+        serving_consumer = nested.consumers[0].requirement
+        embedded_consumer_field = next(
+            field for field in serving_consumer.field_capabilities if field.name == "signals"
+        )
+        assert embedded_consumer_field.type_name == expected_nested_type
 
 
 def test_registry_contract_is_hash_bound_and_rejects_tampering() -> None:

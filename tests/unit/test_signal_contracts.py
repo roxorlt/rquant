@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Mapping
 from datetime import UTC, datetime, timedelta, timezone
+from hashlib import sha256
+from threading import Event, Thread
+from typing import Literal
 
 import pytest
 from pydantic import ValidationError
@@ -17,6 +20,47 @@ _HASH_B = "b" * 64
 _HASH_C = "c" * 64
 _COMMIT = "d" * 40
 _ZERO_COMMIT = "0" * 40
+_CURRENT_GIT_SIGNAL_ID = "9d11e27f9efe45dfcf36ae9f413ffe50c979bb986a7e16bedc5cb2443bed186f"
+_CURRENT_MANIFEST_SIGNAL_ID = "7ece0f7a4384cabf7b2892beceb8327504c313c9ab6179425d1b2f029b06c574"
+
+_CURRENT_CANONICAL_FIXTURES = (
+    (
+        "git",
+        _CURRENT_GIT_SIGNAL_ID,
+        (
+            b'{"action":"b_intent","available_at":"2026-07-31T01:32:00Z",'
+            b'"candidate_id":"600000.SH","dataset_snapshot_id":"bbbbbbbbbbbbbbbbbbbbbbbb'
+            b'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","envelope_schema":"rquant.signal-'
+            b'envelope/v1","event_time":"2026-07-31T01:31:00Z","evidence":{"levels":'
+            b'{"resistance":10.2},"volume_ratio":2.5},"expires_at":"2026-07-31T02:00:00Z",'
+            b'"feature_snapshot_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccc'
+            b'cccccccc","parameter_fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+            b'aaaaaaaaaaaaaaaa","producer_identity":{"kind":"git-commit-claim-sha1/v1",'
+            b'"producer_commit":"dddddddddddddddddddddddddddddddddddddddd"},"reason_codes":'
+            b'["above_vwap","same_minute_volume"],"signal_id":"9d11e27f9efe45dfcf36ae9f'
+            b'413ffe50c979bb986a7e16bedc5cb2443bed186f","strategy_id":"n-shape",'
+            b'"strategy_version":"2.1.0"}'
+        ),
+    ),
+    (
+        "manifest",
+        _CURRENT_MANIFEST_SIGNAL_ID,
+        (
+            b'{"action":"b_intent","available_at":"2026-07-31T01:32:00Z",'
+            b'"candidate_id":"600000.SH","dataset_snapshot_id":"bbbbbbbbbbbbbbbbbbbbbbbb'
+            b'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","envelope_schema":"rquant.signal-'
+            b'envelope/v1","event_time":"2026-07-31T01:31:00Z","evidence":{"levels":'
+            b'{"resistance":10.2},"volume_ratio":2.5},"expires_at":"2026-07-31T02:00:00Z",'
+            b'"feature_snapshot_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccc'
+            b'cccccccc","parameter_fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+            b'aaaaaaaaaaaaaaaa","producer_identity":{"kind":"full-manifest-sha256/v1",'
+            b'"producer_generation_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+            b'aaaaaaaaaaaa"},"reason_codes":["above_vwap","same_minute_volume"],'
+            b'"signal_id":"7ece0f7a4384cabf7b2892beceb8327504c313c9ab6179425d1b2f029b06c574",'
+            b'"strategy_id":"n-shape","strategy_version":"2.1.0"}'
+        ),
+    ),
+)
 
 _LEGACY_CANONICAL_FIXTURES = (
     (
@@ -170,6 +214,113 @@ def _current_kwargs(producer_identity: dict[str, object]) -> dict[str, object]:
     kwargs["envelope_schema"] = "rquant.signal-envelope/v1"
     kwargs["producer_identity"] = producer_identity
     return kwargs
+
+
+def _replace_payload_path(
+    payload: dict[str, object],
+    path: tuple[str | int | bytes, ...],
+    value: object,
+) -> None:
+    if path[0] == "reason_codes":
+        reason_codes = payload["reason_codes"]
+        assert isinstance(reason_codes, tuple)
+        payload["reason_codes"] = list(reason_codes)
+    target: object = payload
+    for part in path[:-1]:
+        if isinstance(target, dict):
+            assert isinstance(part, str)
+            target = target[part]
+        elif isinstance(target, list):
+            assert isinstance(part, int)
+            target = target[part]
+        else:
+            raise AssertionError(f"unsupported test mutation path at {part!r}")
+    final = path[-1]
+    if isinstance(target, dict):
+        assert isinstance(final, (str, bytes))
+        target[final] = value
+    elif isinstance(target, list):
+        assert isinstance(final, int)
+        target[final] = value
+    else:
+        raise AssertionError(f"unsupported test mutation target for {final!r}")
+
+
+def _current_json_mapping(producer_identity: dict[str, object]) -> dict[str, object]:
+    payload = _current_kwargs(producer_identity)
+    for field in ("event_time", "available_at", "expires_at"):
+        timestamp = payload[field]
+        assert isinstance(timestamp, datetime)
+        payload[field] = timestamp.isoformat().replace("+00:00", "Z")
+    return payload
+
+
+def _independent_current_digest(producer_identity: dict[str, str]) -> str:
+    identity_payload = {
+        "action": "b_intent",
+        "available_at": {"$datetime": "2026-07-31T01:32:00.000000+00:00"},
+        "candidate_id": "600000.SH",
+        "dataset_snapshot_id": "b" * 64,
+        "envelope_schema": "rquant.signal-envelope/v1",
+        "event_time": {"$datetime": "2026-07-31T01:31:00.000000+00:00"},
+        "evidence": {
+            "levels": {"resistance": {"$float": "10.2"}},
+            "volume_ratio": {"$float": "2.5"},
+        },
+        "expires_at": {"$datetime": "2026-07-31T02:00:00.000000+00:00"},
+        "feature_snapshot_id": "c" * 64,
+        "parameter_fingerprint": "a" * 64,
+        "producer_identity": producer_identity,
+        "reason_codes": ["above_vwap", "same_minute_volume"],
+        "strategy_id": "n-shape",
+        "strategy_version": "2.1.0",
+    }
+    encoded = json.dumps(
+        identity_payload,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return sha256(encoded).hexdigest()
+
+
+class _OneReadDiscriminatorMapping(Mapping[str, object]):
+    def __init__(self, payload: dict[str, object]) -> None:
+        self._payload = payload
+        self.discriminator_reads = 0
+
+    def __getitem__(self, key: str) -> object:
+        if key == "envelope_schema":
+            self.discriminator_reads += 1
+            if self.discriminator_reads > 1:
+                return "rquant.signal-envelope/v999"
+        return self._payload[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._payload)
+
+    def __len__(self) -> int:
+        return len(self._payload)
+
+
+class _FieldlessCurrentSignalEnvelope(signal_contracts.CurrentSignalEnvelope):
+    pass
+
+
+class _ExtendedCurrentSignalEnvelope(signal_contracts.CurrentSignalEnvelope):
+    reviewer_note: str
+
+
+class _AlternateSchemaCurrentSignalEnvelope(signal_contracts.CurrentSignalEnvelope):
+    envelope_schema: Literal["rquant.signal-envelope/v2"]
+
+
+class TestCoreCqP101PersistedRegistryIdentity:
+    def test_legacy_runtime_class_keeps_its_persisted_name_and_alias(self) -> None:
+        assert SignalEnvelope.__module__ == "rquant.signal_contracts"
+        assert SignalEnvelope.__name__ == "SignalEnvelope"
+        assert SignalEnvelope.__qualname__ == "SignalEnvelope"
+        assert signal_contracts.LegacySignalEnvelope is SignalEnvelope
 
 
 class TestR01LegacyFamily:
@@ -539,6 +690,493 @@ class TestR04StructuralDispatcher:
     def test_json_dispatch_rejects_malformed_or_ambiguous_inputs(self, payload: bytes) -> None:
         with pytest.raises((TypeError, ValueError)):
             signal_contracts.parse_signal_envelope(payload)
+
+
+class TestCoreCqP201DetachedMappingDispatch:
+    def test_dispatch_reads_a_side_effecting_mapping_only_into_one_snapshot(self) -> None:
+        source = _current_kwargs({"kind": "git-commit-claim-sha1/v1", "producer_commit": _COMMIT})
+        payload = _OneReadDiscriminatorMapping(source)
+
+        parsed = signal_contracts.parse_signal_envelope(payload)
+
+        assert type(parsed) is signal_contracts.CurrentSignalEnvelope
+        assert payload.discriminator_reads == 1
+
+    def test_concurrent_post_snapshot_mutation_cannot_change_validation(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        source = _current_kwargs({"kind": "git-commit-claim-sha1/v1", "producer_commit": _COMMIT})
+        validation_started = Event()
+        mutation_finished = Event()
+        original_validate = signal_contracts.CurrentSignalEnvelope.model_validate
+
+        def mutate_source() -> None:
+            assert validation_started.wait(timeout=5)
+            identity = source["producer_identity"]
+            assert isinstance(identity, dict)
+            identity["producer_commit"] = _ZERO_COMMIT
+            mutation_finished.set()
+
+        def validate_after_mutation(
+            cls: type[signal_contracts.CurrentSignalEnvelope],
+            payload: object,
+        ) -> signal_contracts.CurrentSignalEnvelope:
+            validation_started.set()
+            assert mutation_finished.wait(timeout=5)
+            return original_validate(payload)
+
+        mutator = Thread(target=mutate_source)
+        mutator.start()
+        monkeypatch.setattr(
+            signal_contracts.CurrentSignalEnvelope,
+            "model_validate",
+            classmethod(validate_after_mutation),
+        )
+        try:
+            parsed = signal_contracts.parse_signal_envelope(source)
+        finally:
+            mutator.join(timeout=5)
+
+        assert not mutator.is_alive()
+        assert type(parsed) is signal_contracts.CurrentSignalEnvelope
+        assert parsed.producer_identity.producer_commit == _COMMIT
+        assert source["producer_identity"] == {
+            "kind": "git-commit-claim-sha1/v1",
+            "producer_commit": _ZERO_COMMIT,
+        }
+
+
+class TestCoreCqP202StrictCurrentRepresentation:
+    @pytest.mark.parametrize(
+        ("identity_kind", "path", "value"),
+        [
+            ("git", ("signal_id",), _CURRENT_GIT_SIGNAL_ID.encode("ascii")),
+            ("git", ("strategy_id",), b"n-shape"),
+            ("git", ("strategy_id",), " n-shape "),
+            ("git", ("strategy_version",), b"2.1.0"),
+            ("git", ("parameter_fingerprint",), _HASH_A.encode("ascii")),
+            ("git", ("parameter_fingerprint",), f" {_HASH_A} "),
+            ("git", ("dataset_snapshot_id",), _HASH_B.encode("ascii")),
+            ("git", ("feature_snapshot_id",), _HASH_C.encode("ascii")),
+            ("git", ("event_time",), 1_785_461_460),
+            ("git", ("available_at",), b"2026-07-31T01:32:00Z"),
+            ("git", ("expires_at",), " 2026-07-31T02:00:00Z "),
+            ("git", ("candidate_id",), b"600000.SH"),
+            ("git", ("candidate_id",), " 600000.SH "),
+            ("git", ("action",), b"b_intent"),
+            ("git", ("reason_codes", 0), b"same_minute_volume"),
+            ("git", ("reason_codes", 1), " above_vwap "),
+            ("git", ("evidence", b"levels"), {"resistance": 10.2}),
+            ("git", ("evidence", "series"), (1, 2)),
+            ("git", ("producer_identity", "kind"), b"git-commit-claim-sha1/v1"),
+            ("git", ("producer_identity", "producer_commit"), _COMMIT.encode("ascii")),
+            (
+                "manifest",
+                ("producer_identity", "kind"),
+                b"full-manifest-sha256/v1",
+            ),
+            (
+                "manifest",
+                ("producer_identity", "producer_generation_id"),
+                _HASH_A.encode("ascii"),
+            ),
+        ],
+        ids=[
+            "signal-id-bytes",
+            "strategy-id-bytes",
+            "strategy-id-padded",
+            "strategy-version-bytes",
+            "parameter-hash-bytes",
+            "parameter-hash-padded",
+            "dataset-hash-bytes",
+            "feature-hash-bytes",
+            "event-time-numeric",
+            "available-time-bytes",
+            "expires-time-padded",
+            "candidate-bytes",
+            "candidate-padded",
+            "action-bytes",
+            "reason-bytes",
+            "reason-padded",
+            "evidence-key-bytes",
+            "evidence-tuple",
+            "git-kind-bytes",
+            "git-commit-bytes",
+            "manifest-kind-bytes",
+            "manifest-generation-bytes",
+        ],
+    )
+    def test_mapping_rejects_normalizing_current_representations(
+        self,
+        identity_kind: str,
+        path: tuple[str | int | bytes, ...],
+        value: object,
+    ) -> None:
+        identity = (
+            {"kind": "git-commit-claim-sha1/v1", "producer_commit": _COMMIT}
+            if identity_kind == "git"
+            else {
+                "kind": "full-manifest-sha256/v1",
+                "producer_generation_id": _HASH_A,
+            }
+        )
+        payload = _current_kwargs(identity)
+        _replace_payload_path(payload, path, value)
+
+        with pytest.raises(ValidationError):
+            signal_contracts.parse_signal_envelope(payload)
+
+    @pytest.mark.parametrize(
+        ("identity_kind", "path", "value"),
+        [
+            ("git", ("envelope_schema",), " rquant.signal-envelope/v1 "),
+            ("git", ("signal_id",), 7),
+            ("git", ("strategy_id",), " n-shape "),
+            ("git", ("strategy_version",), "2.1.0 "),
+            ("git", ("parameter_fingerprint",), f"{_HASH_A} "),
+            ("git", ("dataset_snapshot_id",), f" {_HASH_B}"),
+            ("git", ("feature_snapshot_id",), f"{_HASH_C} "),
+            ("git", ("event_time",), 1_785_461_460),
+            ("git", ("available_at",), True),
+            ("git", ("expires_at",), 1_785_463_200),
+            ("git", ("candidate_id",), "600000.SH "),
+            ("git", ("action",), True),
+            ("git", ("reason_codes", 0), 1),
+            ("git", ("reason_codes", 1), " above_vwap"),
+            ("git", ("evidence", "score"), float("nan")),
+            ("git", ("producer_identity", "kind"), "git-commit-claim-sha1/v1 "),
+            ("git", ("producer_identity", "producer_commit"), f"{_COMMIT} "),
+            (
+                "manifest",
+                ("producer_identity", "kind"),
+                " full-manifest-sha256/v1",
+            ),
+            (
+                "manifest",
+                ("producer_identity", "producer_generation_id"),
+                f" {_HASH_A}",
+            ),
+        ],
+        ids=[
+            "schema-padded",
+            "signal-id-numeric",
+            "strategy-id-padded",
+            "strategy-version-padded",
+            "parameter-hash-padded",
+            "dataset-hash-padded",
+            "feature-hash-padded",
+            "event-time-numeric",
+            "available-time-bool",
+            "expires-time-numeric",
+            "candidate-padded",
+            "action-bool",
+            "reason-numeric",
+            "reason-padded",
+            "evidence-nonfinite",
+            "git-kind-padded",
+            "git-commit-padded",
+            "manifest-kind-padded",
+            "manifest-generation-padded",
+        ],
+    )
+    def test_json_rejects_normalizing_current_representations(
+        self,
+        identity_kind: str,
+        path: tuple[str | int | bytes, ...],
+        value: object,
+    ) -> None:
+        identity = (
+            {"kind": "git-commit-claim-sha1/v1", "producer_commit": _COMMIT}
+            if identity_kind == "git"
+            else {
+                "kind": "full-manifest-sha256/v1",
+                "producer_generation_id": _HASH_A,
+            }
+        )
+        payload = _current_json_mapping(identity)
+        _replace_payload_path(payload, path, value)
+        encoded = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+
+        with pytest.raises((ValidationError, ValueError)):
+            signal_contracts.parse_signal_envelope(encoded)
+
+    @pytest.mark.parametrize(
+        "identity",
+        [
+            {"kind": "git-commit-claim-sha1/v1", "producer_commit": _COMMIT},
+            {
+                "kind": "full-manifest-sha256/v1",
+                "producer_generation_id": _HASH_A,
+            },
+        ],
+        ids=["git", "manifest"],
+    )
+    def test_accepts_aware_python_and_exact_json_datetimes(
+        self,
+        identity: dict[str, object],
+    ) -> None:
+        mapped = signal_contracts.parse_signal_envelope(_current_kwargs(identity))
+        encoded = json.dumps(
+            _current_json_mapping(identity),
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        decoded = signal_contracts.parse_signal_envelope(encoded)
+
+        assert mapped == decoded
+        assert mapped.event_time.tzinfo is UTC
+
+    def test_legacy_mapping_coercion_remains_unchanged(self) -> None:
+        payload = _signal_kwargs()
+        payload["strategy_id"] = b"n-shape"
+        payload["candidate_id"] = " 600000.SH "
+        payload["parameter_fingerprint"] = _HASH_A.encode("ascii")
+        payload["event_time"] = b"2026-07-31T01:31:00Z"
+
+        legacy = signal_contracts.parse_signal_envelope(payload)
+
+        assert type(legacy) is SignalEnvelope
+        assert legacy.strategy_id == "n-shape"
+        assert legacy.candidate_id == "600000.SH"
+        assert legacy.parameter_fingerprint == _HASH_A
+
+
+class TestCoreCqP203ExactCurrentWriterType:
+    @pytest.mark.parametrize(
+        "subclass_type",
+        [_FieldlessCurrentSignalEnvelope, _ExtendedCurrentSignalEnvelope],
+        ids=["fieldless-subclass", "extra-field-subclass"],
+    )
+    def test_writer_rejects_every_current_subclass_before_revalidation(
+        self,
+        subclass_type: type[signal_contracts.CurrentSignalEnvelope],
+    ) -> None:
+        kwargs = _current_kwargs({"kind": "git-commit-claim-sha1/v1", "producer_commit": _COMMIT})
+        if subclass_type is _ExtendedCurrentSignalEnvelope:
+            kwargs["reviewer_note"] = "not part of the wire contract"
+        subclass = subclass_type(**kwargs)
+
+        with pytest.raises(TypeError, match="CurrentSignalEnvelope"):
+            signal_contracts.current_signal_envelope_json_bytes(subclass)
+
+    @pytest.mark.parametrize(
+        "forgery",
+        ["model-construct", "tampered-exact-instance"],
+        ids=["model-construct", "tampered-exact-instance"],
+    )
+    def test_writer_revalidates_and_rejects_forged_exact_instances(
+        self,
+        forgery: str,
+    ) -> None:
+        kwargs = _current_kwargs({"kind": "git-commit-claim-sha1/v1", "producer_commit": _COMMIT})
+        if forgery == "model-construct":
+            kwargs["producer_identity"] = {
+                "kind": "git-commit-claim-sha1/v1",
+                "producer_commit": _ZERO_COMMIT,
+            }
+            forged = signal_contracts.CurrentSignalEnvelope.model_construct(**kwargs)
+        else:
+            forged = signal_contracts.CurrentSignalEnvelope(**kwargs)
+            object.__setattr__(forged, "candidate_id", b"600000.SH")
+
+        with pytest.raises(ValidationError):
+            signal_contracts.current_signal_envelope_json_bytes(forged)
+
+    def test_writer_accepts_an_exact_valid_current_instance(self) -> None:
+        current = signal_contracts.CurrentSignalEnvelope(
+            **_current_kwargs({"kind": "git-commit-claim-sha1/v1", "producer_commit": _COMMIT})
+        )
+
+        payload = signal_contracts.current_signal_envelope_json_bytes(current)
+
+        assert signal_contracts.parse_signal_envelope(payload) == current
+
+
+class TestCoreCqP204IndependentCurrentOracle:
+    @pytest.mark.parametrize(
+        ("identity_kind", "expected_id", "literal"),
+        _CURRENT_CANONICAL_FIXTURES,
+        ids=["git", "manifest"],
+    )
+    def test_literal_current_bytes_and_ids_roundtrip_exactly(
+        self,
+        identity_kind: str,
+        expected_id: str,
+        literal: bytes,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        identity = (
+            {"kind": "git-commit-claim-sha1/v1", "producer_commit": _COMMIT}
+            if identity_kind == "git"
+            else {
+                "kind": "full-manifest-sha256/v1",
+                "producer_generation_id": _HASH_A,
+            }
+        )
+
+        def fail_if_serialized(*_args: object, **_kwargs: object) -> bytes:
+            raise AssertionError("current read path invoked wire serialization")
+
+        with monkeypatch.context() as serialization_guard:
+            serialization_guard.setattr(
+                signal_contracts,
+                "canonical_json_bytes",
+                fail_if_serialized,
+            )
+            serialization_guard.setattr(
+                signal_contracts,
+                "current_signal_envelope_json_bytes",
+                fail_if_serialized,
+            )
+            parsed = signal_contracts.parse_signal_envelope(literal)
+
+        assert type(parsed) is signal_contracts.CurrentSignalEnvelope
+        assert parsed.signal_id == expected_id
+        assert parsed.producer_identity.model_dump(mode="python") == identity
+        assert _independent_current_digest(identity) == expected_id
+        assert signal_contracts.current_signal_envelope_json_bytes(parsed) == literal
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("strategy_id", "n-shape-variant"),
+            ("strategy_version", "2.1.1"),
+            ("parameter_fingerprint", "1" * 64),
+            ("dataset_snapshot_id", "2" * 64),
+            ("feature_snapshot_id", "3" * 64),
+            ("event_time", datetime(2026, 7, 31, 1, 30, 59, tzinfo=UTC)),
+            ("available_at", datetime(2026, 7, 31, 1, 32, 1, tzinfo=UTC)),
+            ("candidate_id", "600001.SH"),
+            ("action", SignalAction.WATCH),
+            ("reason_codes", ("above_vwap", "new_reason", "same_minute_volume")),
+            ("evidence", {"levels": {"resistance": 10.3}, "volume_ratio": 2.5}),
+            ("expires_at", datetime(2026, 7, 31, 2, 0, 1, tzinfo=UTC)),
+        ],
+        ids=[
+            "strategy-id",
+            "strategy-version",
+            "parameter-fingerprint",
+            "dataset-snapshot",
+            "feature-snapshot",
+            "event-time",
+            "available-at",
+            "candidate-id",
+            "action",
+            "reason-codes",
+            "evidence",
+            "expires-at",
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("identity", "expected_id"),
+        [
+            (
+                {"kind": "git-commit-claim-sha1/v1", "producer_commit": _COMMIT},
+                _CURRENT_GIT_SIGNAL_ID,
+            ),
+            (
+                {
+                    "kind": "full-manifest-sha256/v1",
+                    "producer_generation_id": _HASH_A,
+                },
+                _CURRENT_MANIFEST_SIGNAL_ID,
+            ),
+        ],
+        ids=["git", "manifest"],
+    )
+    def test_every_common_identity_field_changes_the_digest(
+        self,
+        identity: dict[str, object],
+        expected_id: str,
+        field: str,
+        value: object,
+    ) -> None:
+        base = signal_contracts.CurrentSignalEnvelope(**_current_kwargs(identity))
+        mutation = _current_kwargs(identity)
+        mutation[field] = value
+        changed = signal_contracts.CurrentSignalEnvelope(**mutation)
+
+        assert base.signal_id == expected_id
+        assert changed.signal_id != expected_id
+
+    @pytest.mark.parametrize(
+        ("identity", "field", "value", "expected_id"),
+        [
+            (
+                {"kind": "git-commit-claim-sha1/v1", "producer_commit": _COMMIT},
+                "producer_commit",
+                "e" * 40,
+                _CURRENT_GIT_SIGNAL_ID,
+            ),
+            (
+                {
+                    "kind": "full-manifest-sha256/v1",
+                    "producer_generation_id": _HASH_A,
+                },
+                "producer_generation_id",
+                "b" * 64,
+                _CURRENT_MANIFEST_SIGNAL_ID,
+            ),
+        ],
+        ids=["git-active-value", "manifest-active-value"],
+    )
+    def test_each_active_producer_identity_value_changes_the_digest(
+        self,
+        identity: dict[str, object],
+        field: str,
+        value: str,
+        expected_id: str,
+    ) -> None:
+        changed_identity = dict(identity)
+        changed_identity[field] = value
+        changed = signal_contracts.CurrentSignalEnvelope(**_current_kwargs(changed_identity))
+
+        assert changed.signal_id != expected_id
+
+    def test_envelope_schema_and_semantically_equal_identity_kinds_change_digest(
+        self,
+    ) -> None:
+        git_identity = {
+            "kind": "git-commit-claim-sha1/v1",
+            "producer_commit": "d" * 40,
+        }
+        manifest_identity = {
+            "kind": "full-manifest-sha256/v1",
+            "producer_generation_id": "d" * 64,
+        }
+        git = signal_contracts.CurrentSignalEnvelope(**_current_kwargs(git_identity))
+        manifest = signal_contracts.CurrentSignalEnvelope(**_current_kwargs(manifest_identity))
+        alternate_kwargs = _current_kwargs(git_identity)
+        alternate_kwargs["envelope_schema"] = "rquant.signal-envelope/v2"
+        alternate = _AlternateSchemaCurrentSignalEnvelope(**alternate_kwargs)
+
+        assert git.signal_id != manifest.signal_id
+        assert git.signal_id != alternate.signal_id
+
+    @pytest.mark.parametrize(
+        ("_identity_kind", "_expected_id", "literal"),
+        _CURRENT_CANONICAL_FIXTURES,
+        ids=["git", "manifest"],
+    )
+    def test_pretty_encoding_cannot_satisfy_current_canonical_bytes(
+        self,
+        _identity_kind: str,
+        _expected_id: str,
+        literal: bytes,
+    ) -> None:
+        pretty = json.dumps(
+            json.loads(literal),
+            ensure_ascii=True,
+            indent=2,
+            sort_keys=True,
+        ).encode("utf-8")
+
+        assert b"\n" in pretty
+        assert pretty != literal
+        assert signal_contracts.parse_signal_envelope(pretty) == (
+            signal_contracts.parse_signal_envelope(literal)
+        )
 
 
 class TestR05CurrentIdentitySeparation:
