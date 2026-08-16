@@ -461,6 +461,265 @@ The architecture-reset R01-R12 red tests are mandatory:
 | R11 | High-watermark replay copies only already-durable legacy canonical bytes at or below the frozen cursor with exact stored IDs/hashes; above-boundary or reserialized legacy input is rejected. |
 | R12 | Authority absence or change between capability creation and persistence fails closed with no signal/outbox row; retry requires a newly revalidated capability. |
 
+## Signal-Family Overlay, Attestation, And R07 Design Freeze
+
+`REG-DESIGN-P1-01` through `REG-DESIGN-P1-06` are a normative, future-only refinement of
+`WRAP-DESIGN-P1-03`. They do not authorize a writer, a rollout, a registry migration, a schema
+migration, a production flag, or a cutover. In particular, the existing R07 language and the
+six-step rollout retain their order: exact v2 preservation precedes any future v3 model work, and
+R07 must be proven before a legacy high-watermark can be frozen. Nothing in this section permits
+starting that future work or inferring its activation from its data model.
+
+### REG-DESIGN-P1-01: Subordinate Overlay, Never A Second Authority
+
+The authoritative base remains the exact `RuntimeSchemaContractBundle` v2. Its parser, catalog,
+canonical bytes, content and physical fingerprints, history, and all v2 acceptance/rejection
+behavior are frozen. A missing overlay means v2-only operation. A reader MUST load and verify the
+exact canonical v2 bundle first; it MUST NOT use an overlay to discover, repair, reinterpret, or
+replace a base bundle.
+
+The future `SignalFamilyOverlay` is separately namespace- and version-scoped and is subordinate to
+one verified v2 bundle. It has exactly these immutable binding fields:
+
+```text
+overlay_namespace, overlay_schema_version, base_bundle_content_hash,
+channel_id, base_channel_declaration_hash, base_channel_content_hash,
+base_physical_schema_fingerprint, accepted_family_ids,
+payload_model_qualname, payload_model_fingerprint,
+profile_derived_producer_service_ids, consumer_service_ids,
+surface_ids, declaration_hash, content_hash
+```
+
+`base_channel_declaration_hash`, `base_channel_content_hash`, and
+`base_physical_schema_fingerprint` bind the unchanged v2 declaration and physical schema. The
+payload model qualname and model fingerprint are both exact bindings, not names chosen by a caller.
+`profile_derived_producer_service_ids`, `consumer_service_ids`, and `surface_ids` are sorted,
+duplicate-free tuples. `accepted_family_ids` is also a sorted, duplicate-free exact tuple. The
+overlay declaration and content hashes are SHA-256 hashes of their respective strict canonical JSON
+preimages, excluding only the field being calculated; the enclosing overlay content hash binds the
+three declarations in sorted `channel_id` order.
+
+There are exactly three declarations, in this exact sorted order:
+
+1. `runtime.strategy_signal.envelope`
+2. `runtime.signal_route.spool-record`
+3. `runtime.serving.signals`
+
+Their accepted-family and payload-model bindings are exact:
+
+| Channel ID | Exact accepted family IDs | Current payload model qualname |
+|---|---|---|
+| `runtime.strategy_signal.envelope` | `rquant.signal-envelope/v1` | `rquant.signal_contracts.CurrentSignalEnvelope` |
+| `runtime.signal_route.spool-record` | `rquant.signal-route-spool-record/v3` | future `rquant.signal_route_spool.CurrentSignalBusRoutedRecord` |
+| `runtime.serving.signals` | `rquant.signal-envelope/v1` | `rquant.runtime_serving_snapshot.SignalDeliveryReadPayload` |
+
+For every row, `payload_model_fingerprint` is the canonical model fingerprint of precisely the
+qualname shown, and the declaration's producer, consumer, and surface tuples must match the exact
+participant/surface rules below. The v3 name in the second row is a future type identifier only;
+it does not exist in the current module and does not permit an import or construction path.
+
+Duplicate, missing, extra, unsorted, or conflicting declarations reject. A byte-identical replay of
+the same canonical overlay is idempotent; a different byte sequence or content hash for the same
+overlay identity is an audited conflict and rejects. The overlay cannot add, remove, or override a
+v2 channel's participants, declaration, physical schema, payload model, or retained history. It can
+only attest the exact family/surface restrictions defined here. Dynamic strategy producers are
+derived from the authoritative profile's `RuntimeServiceKind.STRATEGY_LIVE` manifests; they are not
+reader-receipt identities. `shadow.session.production.v1` is overlay-only and MUST NOT be inserted
+into the v2 catalog.
+
+### REG-DESIGN-P1-02: Exact Participants And Surfaces
+
+The overlay's receipt set is equality-checked, not counted. It contains exactly these five logical
+pairs and no aliases:
+
+| Pair ID | Producer / consumer | Bound declaration |
+|---|---|---|
+| `strategy_signal/router` | profile-derived `STRATEGY_LIVE` / `SIGNAL_ROUTER` | `runtime.strategy_signal.envelope` |
+| `strategy_signal/shadow` | profile-derived `STRATEGY_LIVE` / `shadow.session.production.v1` | `runtime.strategy_signal.envelope` |
+| `spool/notifier` | `SIGNAL_ROUTER` / `NOTIFIER` | `runtime.signal_route.spool-record` |
+| `spool/paper` | `SIGNAL_ROUTER` / `PAPER_BROKER` | `runtime.signal_route.spool-record` |
+| `serving/serving publisher` | `NOTIFIER` / `SERVING_PUBLISHER` | `runtime.serving.signals` |
+
+The following is the complete surface allowlist. Each surface ID is an enum value resolved by the
+trusted verifier to its literal, existing callable qualname. It is not a user-supplied string. A
+missing, added, renamed, aliased, or differently resolved callable rejects the overlay and its
+attestation.
+
+| Surface ID | Exact existing callable qualname |
+|---|---|
+| `router.runner_read` | `rquant.signal_router_runtime.StrategyRunnerSignalSource.read_batch` |
+| `router.route` | `rquant.signal_router_runtime.route_runner_signals` |
+| `shadow.runner_fan_in` | `rquant.runtime_shadow_sources.read_isolated_runner_shadow_snapshot` |
+| `shadow.observation` | `rquant.runtime_shadow_sources.isolated_signals_to_shadow_observations` |
+| `notifier.spool_replicate` | `rquant.notification_state.NotificationStateStore.replicate` |
+| `notifier.serving_result` | `rquant.runtime_builder_signal._signal_source_result` |
+| `paper.spool_to_queue` | `rquant.paper_signal_consumer.consume_signal_bus_to_paper` |
+| `paper.queue_ingest` | `rquant.paper_signal_worker.PaperSignalQueueStore.ingest` |
+| `paper.lifecycle` | `rquant.strategy_paper_lifecycle.PaperBrokerLifecycleReader.resolve` |
+| `serving.source_result` | `rquant.runtime_serving_snapshot.SourceReadResult` |
+| `serving.snapshot_assemble` | `rquant.runtime_serving_snapshot.ServingSnapshotAssembler.assemble` |
+| `serving.read_model_assembly` | `rquant.serving_read_models.build_serving_read_models` |
+
+Each declaration contains precisely this producer set, consumer set, and surface subset; symbolic
+service kinds resolve to the exact current profile manifest service IDs before hashing:
+
+| Channel ID | Exact producers | Exact consumers | Exact surfaces |
+|---|---|---|---|
+| `runtime.strategy_signal.envelope` | profile-derived `STRATEGY_LIVE` services | `SIGNAL_ROUTER`, overlay-only `shadow.session.production.v1` | `router.runner_read`, `router.route`, `shadow.runner_fan_in`, `shadow.observation` |
+| `runtime.signal_route.spool-record` | `SIGNAL_ROUTER` | `NOTIFIER`, `PAPER_BROKER` | `notifier.spool_replicate`, `paper.spool_to_queue`, `paper.queue_ingest`, `paper.lifecycle` |
+| `runtime.serving.signals` | `NOTIFIER` | `SERVING_PUBLISHER` | `notifier.serving_result`, `serving.source_result`, `serving.snapshot_assemble`, `serving.read_model_assembly` |
+
+The union across all three declarations is exactly the allowlist table above. Omission, addition,
+substitution, or aliasing of a participant or surface rejects.
+
+### REG-DESIGN-P1-03: Trusted Attestation Is Derived, Not Claimed
+
+A service receipt is advisory evidence only. It is never an authority input. The trusted release
+verifier reopens the validated current `RuntimeGenerationSlot` and its current runtime authority,
+then derives, rather than accepts from a receipt: authority sequence and operation ID; current
+generation ID and byte-for-byte full-manifest equality; profile ID; role, service, and service
+manifest binding; executable source closure; approved test-manifest binding; and the exact overlay,
+family, declaration, and surface bindings.
+
+The future `SignalFamilyAttestation` has exactly these fields:
+
+```text
+attestation_schema_version, attestation_id, observed_at,
+authority_operation_id, authority_sequence, runtime_generation_id,
+full_manifest_hash, profile_id, role_id, service_id, service_manifest_hash,
+overlay_namespace, overlay_schema_version, overlay_content_hash,
+overlay_declaration_hash, channel_id, accepted_family_ids, surface_ids,
+payload_model_qualname, payload_model_fingerprint,
+source_closure_hash, approved_test_manifest_hash, code_commit
+```
+
+All hashes are lowercase SHA-256 digests over strict canonical JSON or exact bytes identified by
+their field names. Ordered lists are sorted and duplicate-free before hashing. `code_commit` is
+audit metadata only: it can be displayed and compared for audit, but it cannot establish authority,
+generation, source closure, family, or surface eligibility. The verifier obtains every authority
+field from the reopened current authority and full manifest, then compares every derived binding to
+the attestation. A copied, self-issued, stale, wrong-service, wrong-generation, wrong-profile,
+wrong-role, wrong-surface, wrong-test-manifest, or wrong-authority-sequence attestation fails
+closed. The verifier also rejects noncanonical JSON, duplicate keys, coercion, mappings in place of
+the exact model, and subclasses in any strict future model boundary.
+
+### REG-DESIGN-P1-04: R07 Routed Record And Recovery Contract
+
+All existing v2 serializers, parsers, fixture bytes, hashes, `SignalRouteSpoolRecord`, and
+`SignalRouteSpoolPointer` are preserved byte-for-byte. The existing v2 pointer remains
+family-neutral; there is no v3 pointer migration and a pointer never selects a family.
+
+The future `CurrentSignalBusRoutedRecord` is non-self-hashing and contains an exact
+`CurrentSignalEnvelope` only. Let `E = current_signal_envelope_json_bytes(envelope)`. Its
+`payload_json` UTF-8 bytes MUST equal `E` exactly and `envelope_hash = SHA256(E)`. The routed record
+hash uses the existing strict canonical JSON-byte algorithm and covers the receipt, targets,
+timestamps, and envelope exactly. It is not derived from a reparsed, pretty-printed, or normalized
+payload.
+
+The future outer v3 record has exactly these fields:
+
+```text
+schema_version = 3, global_sequence, previous_record_hash, envelope_hash,
+routed_record_hash, record_hash, record
+```
+
+`schema_version` and `global_sequence` are native strict integers; booleans, floats, strings,
+coercion, mappings, subclasses, duplicate keys, and extra fields reject. `record_hash` is SHA-256
+of the strict canonical preimage containing every listed field except `record_hash` itself. The
+structural dispatcher is duplicate-free and never parse-then-coerces. A mixed stream has exactly
+one v2-to-v3 transition and never returns to v2; the first v3 record may chain to the final v2
+record hash. A v3 record cannot appear before a valid v2 prefix and an all-v3 stream is not an R07
+substitute for that transition proof.
+
+Future recovery freezes this crash matrix for the records directory and the unchanged pointer:
+
+| Stage | Required recovery result |
+|---|---|
+| record temporary write | temporary file is never authority and an old pointer ignores it |
+| record file fsync | a retry with identical bytes is accepted; different bytes for the same sequence reject |
+| record link / publication | only one complete immutable record name may become visible |
+| records-directory fsync | a visible record is part of a verified complete prefix only after directory durability |
+| pointer temporary write and fsync | temporary pointer is never authority |
+| pointer replace | visible pointer is accepted only when it validates the complete record prefix it names |
+| root-directory fsync | crash recovery retains the old valid pointer or the new fully validated pointer, never a partial authority |
+
+Recovery ignores orphan records beyond the visible pointer, accepts an identical retry, and records
+an audited conflict for a differing retry. It validates every record in the visible prefix and every
+chain edge before exposing it. Strict decoding rejects Unicode normalization changes, whitespace or
+key-order changes, duplicate keys, numeric coercion, `NaN`/infinite constants, alternate datetime
+spellings, and newline changes whenever the exact canonical bytes require a particular spelling.
+
+### REG-DESIGN-P1-05: Receipt And Readiness Lifecycle
+
+Receipts and their history are append-only. Their uniqueness key is exactly `(overlay_declaration_hash,
+target_runtime_generation_id, channel_id, service_id)`. A byte-identical retry is idempotent. A
+different receipt for that key appends conflict audit evidence and rejects. Acceptance requires
+exact equality of the five-pair set above, current authority sequence, current slot, full manifest,
+profile, overlay, service manifest, audit commit, and freshness window; a count of five is never
+sufficient.
+
+The trusted verifier creates an immutable readiness decision and updates its compare-and-swap state
+in one transaction from one consistent snapshot. The decision binds the sorted selected receipt
+fingerprints and their aggregate canonical SHA-256 hash, the overlay declaration/content hashes,
+and the derived authority/generation/profile values. Concurrent final acknowledgements can create
+only one deterministic decision for that snapshot. Authority advance or receipt expiry invalidates
+readiness before any later use.
+
+The only lifecycle states are:
+
+```text
+DECLARED -> ATTESTING -> READY -> ROLLED_BACK
+DECLARED -> REVOKED
+ATTESTING -> REVOKED
+READY -> REVOKED
+```
+
+There is no `ACTIVATED` state. Rollback and revocation are append-only evidence and disable only
+future activation eligibility; they do not rewrite receipts, decisions, records, or historical
+readability.
+
+### REG-DESIGN-P1-06: No Activation Or Production v3 Writer
+
+R07 is limited to future model, strict decoder, and synthetic-fixture support. It creates no
+production-obtainable v3 publisher, capability, constructor, environment flag, overlay branch,
+cursor/high-watermark behavior, drain behavior, or cutover inference. Runtime builders MUST NOT
+construct or import a v3 writer or fixture. Legacy writes remain unchanged.
+
+The following existing current-family writer boundaries are explicitly fail-before-mutation and
+MUST remain so until a separately approved activation ADR changes this section:
+
+| Boundary | Current status and frozen fail-before-mutation requirement |
+|---|---|
+| `rquant.strategy_runner.StrategyRunnerStore.process_batch` | constructs and persists only `SignalEnvelope`; it has no current-family constructor path |
+| `rquant.signal_bus.SignalBusStore.ingest` | `require_legacy_signal_write` executes before its write transaction |
+| `rquant.signal_bus.SignalBusStore.commit_source_route` | `require_legacy_signal_write` executes before route-source persistence |
+| `rquant.signal_bus.SignalBusStore.route` | parsed `CurrentSignalEnvelope` rejects before any outbox transition |
+| `rquant.signal_router_runtime.route_runner_signals` | every runner record is checked by `require_legacy_signal_write` before route binding/commit |
+| `rquant.notification_state.NotificationStateStore.replicate` | every routed record is checked before the notification write transaction |
+| `rquant.runtime_serving_snapshot.SignalDeliveryPayload` | registry-writer validation calls `require_legacy_signal_write` before it can publish a serving payload |
+| `rquant.paper_signal_worker.PaperSignalQueueStore.ingest` | its direct path already requires the exact legacy `SignalEnvelope`; its supplied stored-byte path is transitively fenced today by `SignalBusStore` and MUST gain the same local current-family rejection before any future implementation could make that path production-obtainable |
+
+The read-capable current-family paths, including `parse_signal_envelope`, stored-record dispatch,
+`CurrentRunnerSignalRecord`, shadow observation, `SourceReadResult` adaptation, and serving
+read-model input, do not constitute an activation path. They cannot grant a writer capability or
+select a family through a spool pointer, cursor, high-watermark, environment, runtime builder, or
+readiness decision.
+
+### Stable Red-Test Matrix
+
+These are planned red tests. They are precise acceptance gates for the future implementation; this
+design freeze adds no tests and does not make any of them green.
+
+| ID | Planned test file | Required assertions |
+|---|---|---|
+| `REG-DESIGN-P1-01` | `tests/unit/test_signal_family_overlay_reg_design.py` | v2 bundle canonical bytes/parser/catalog/fingerprints/history remain unchanged; missing overlay selects v2-only; exactly the three sorted declarations bind the exact base hash/channel/declaration/physical fingerprint/model; duplicate, missing, extra, conflict, and nonidentical replay reject; byte-identical replay is idempotent. |
+| `REG-DESIGN-P1-02` | `tests/unit/test_signal_family_overlay_reg_design.py` | the five-pair set equals the frozen set, dynamic `STRATEGY_LIVE` producers derive from manifests without becoming reader receipts, `shadow.session.production.v1` is absent from v2, and each surface ID resolves only to the listed existing qualname; omission/addition/alias rejects. |
+| `REG-DESIGN-P1-03` | `tests/unit/test_signal_family_attestation_reg_design.py` | trusted verifier derives rather than trusts service fields; copied/self/stale/wrong service/generation/profile/role/surface/test manifest/authority sequence all fail; audit-only `code_commit` mutation cannot establish authority; canonical source-closure, test-manifest, family, and surface hashes bind exactly. |
+| `REG-DESIGN-P1-04` | `tests/unit/test_signal_route_spool_r07_v3.py` | v2 fixture bytes/hashes and v2 pointer are identical; synthetic future v3 validates exact `E`, hashes, strict fields, one-way v2-to-v3 chain, and final-v2 predecessor; duplicates, Unicode/whitespace/key-order/numeric/NaN/datetime/newline variants reject; every crash stage yields only an old or complete verified prefix, ignores an orphan, accepts identical retry, and rejects conflict. |
+| `REG-DESIGN-P1-05` | `tests/unit/test_signal_family_readiness_reg_design.py` | receipt uniqueness uses the four-field key; identical retry is idempotent and conflict is audited/rejected; exact five-pair equality, service-manifest/freshness/authority checks, transactional sorted fingerprint aggregate, deterministic concurrent final acknowledgement, expiry/authority invalidation, and only the frozen lifecycle transitions are enforced. |
+| `REG-DESIGN-P1-06` | `tests/unit/test_signal_family_no_activation_reg_design.py` | no runtime builder imports or constructs a v3 writer/fixture; no flag/capability/overlay/cursor/high-watermark/drain/cutover activates v3; every listed writer boundary, including both `PaperSignalQueueStore.ingest` forms, rejects a current-family write before a durable mutation; legacy writer behavior and all v2 bytes remain unchanged. |
+| `R07` | `tests/unit/test_signal_route_spool_r07_v3.py` | the R07 v2 preservation assertions run before any synthetic-v3 assertions, and the test proves that no production-obtainable v3 write path exists while retaining the existing high-watermark rollout order. |
+
 ## Root Quarantine And Generation Publication
 
 The root helper accepts only a fixed operation schema containing an operation ID and allowlisted
