@@ -345,8 +345,10 @@ class PaperSignalQueueStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
             self._enable_wal(connection)
-            connection.executescript(
-                """
+            try:
+                connection.executescript(
+                    """
+                BEGIN IMMEDIATE;
                 CREATE TABLE IF NOT EXISTS paper_signal_metadata (
                     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
                     policy_fingerprint TEXT NOT NULL,
@@ -380,91 +382,100 @@ class PaperSignalQueueStore:
                     PRIMARY KEY(signal_id, revision)
                 );
                 """
-            )
-            queue_columns = {
-                str(row[1])
-                for row in connection.execute("PRAGMA table_info(paper_signal_queue)").fetchall()
-            }
-            if "execution_id" not in queue_columns:
-                connection.execute("ALTER TABLE paper_signal_queue ADD COLUMN execution_id TEXT")
-            if "signal_hash" not in queue_columns:
-                connection.execute("ALTER TABLE paper_signal_queue ADD COLUMN signal_hash TEXT")
-            if "signal_size" not in queue_columns:
-                connection.execute("ALTER TABLE paper_signal_queue ADD COLUMN signal_size INTEGER")
-            signal_rows = connection.execute(
-                "SELECT signal_id, signal_json, signal_hash, signal_size FROM paper_signal_queue"
-            ).fetchall()
-            for signal_row in signal_rows:
-                payload_json = str(signal_row["signal_json"])
-                payload_bytes = payload_json.encode("utf-8")
-                payload_hash = (
-                    sha256(payload_bytes).hexdigest()
-                    if signal_row["signal_hash"] is None
-                    else str(signal_row["signal_hash"])
                 )
-                payload_size = (
-                    len(payload_bytes)
-                    if signal_row["signal_size"] is None
-                    else int(signal_row["signal_size"])
-                )
-                parse_stored_signal(
-                    signal_id=str(signal_row["signal_id"]),
-                    payload_hash=payload_hash,
-                    payload_json=payload_json,
-                    payload_size=payload_size,
-                )
-                if signal_row["signal_hash"] is None or signal_row["signal_size"] is None:
+                queue_columns = {
+                    str(row[1])
+                    for row in connection.execute(
+                        "PRAGMA table_info(paper_signal_queue)"
+                    ).fetchall()
+                }
+                if "execution_id" not in queue_columns:
                     connection.execute(
-                        """
-                        UPDATE paper_signal_queue
-                        SET signal_hash = ?, signal_size = ? WHERE signal_id = ?
-                        """,
-                        (payload_hash, payload_size, signal_row["signal_id"]),
+                        "ALTER TABLE paper_signal_queue ADD COLUMN execution_id TEXT"
                     )
-            if "expires_at" not in queue_columns:
-                connection.execute("ALTER TABLE paper_signal_queue ADD COLUMN expires_at TEXT")
-                legacy_rows = connection.execute(
-                    "SELECT signal_id, signal_json FROM paper_signal_queue"
+                if "signal_hash" not in queue_columns:
+                    connection.execute("ALTER TABLE paper_signal_queue ADD COLUMN signal_hash TEXT")
+                if "signal_size" not in queue_columns:
+                    connection.execute(
+                        "ALTER TABLE paper_signal_queue ADD COLUMN signal_size INTEGER"
+                    )
+                signal_rows = connection.execute(
+                    """
+                    SELECT signal_id, signal_json, signal_hash, signal_size
+                    FROM paper_signal_queue
+                    """
                 ).fetchall()
-                for legacy_row in legacy_rows:
-                    try:
-                        payload_json = str(legacy_row["signal_json"])
-                        legacy_signal = parse_stored_signal(
-                            signal_id=str(legacy_row["signal_id"]),
-                            payload_hash=sha256(payload_json.encode("utf-8")).hexdigest(),
-                            payload_json=payload_json,
-                            payload_size=len(payload_json.encode("utf-8")),
+                for signal_row in signal_rows:
+                    payload_json = str(signal_row["signal_json"])
+                    payload_bytes = payload_json.encode("utf-8")
+                    payload_hash = (
+                        sha256(payload_bytes).hexdigest()
+                        if signal_row["signal_hash"] is None
+                        else str(signal_row["signal_hash"])
+                    )
+                    payload_size = (
+                        len(payload_bytes)
+                        if signal_row["signal_size"] is None
+                        else int(signal_row["signal_size"])
+                    )
+                    parse_stored_signal(
+                        signal_id=str(signal_row["signal_id"]),
+                        payload_hash=payload_hash,
+                        payload_json=payload_json,
+                        payload_size=payload_size,
+                    )
+                    if signal_row["signal_hash"] is None or signal_row["signal_size"] is None:
+                        connection.execute(
+                            """
+                            UPDATE paper_signal_queue
+                            SET signal_hash = ?, signal_size = ? WHERE signal_id = ?
+                            """,
+                            (payload_hash, payload_size, signal_row["signal_id"]),
                         )
-                    except (TypeError, ValueError):
-                        continue
+                if "expires_at" not in queue_columns:
+                    connection.execute("ALTER TABLE paper_signal_queue ADD COLUMN expires_at TEXT")
+                    legacy_rows = connection.execute(
+                        "SELECT signal_id, signal_json FROM paper_signal_queue"
+                    ).fetchall()
+                    for legacy_row in legacy_rows:
+                        try:
+                            payload_json = str(legacy_row["signal_json"])
+                            legacy_signal = parse_stored_signal(
+                                signal_id=str(legacy_row["signal_id"]),
+                                payload_hash=sha256(payload_json.encode("utf-8")).hexdigest(),
+                                payload_json=payload_json,
+                                payload_size=len(payload_json.encode("utf-8")),
+                            )
+                        except (TypeError, ValueError):
+                            continue
+                        connection.execute(
+                            """
+                            UPDATE paper_signal_queue SET expires_at = ? WHERE signal_id = ?
+                            """,
+                            (legacy_signal.expires_at.isoformat(), legacy_row["signal_id"]),
+                        )
+                history_columns = {
+                    str(row[1])
+                    for row in connection.execute(
+                        "PRAGMA table_info(paper_signal_prepare_history)"
+                    ).fetchall()
+                }
+                if "execution_id" not in history_columns:
                     connection.execute(
-                        "UPDATE paper_signal_queue SET expires_at = ? WHERE signal_id = ?",
-                        (legacy_signal.expires_at.isoformat(), legacy_row["signal_id"]),
+                        "ALTER TABLE paper_signal_prepare_history ADD COLUMN execution_id TEXT"
                     )
-            history_columns = {
-                str(row[1])
-                for row in connection.execute(
-                    "PRAGMA table_info(paper_signal_prepare_history)"
-                ).fetchall()
-            }
-            if "execution_id" not in history_columns:
                 connection.execute(
-                    "ALTER TABLE paper_signal_prepare_history ADD COLUMN execution_id TEXT"
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_signal_execution
+                    ON paper_signal_queue(execution_id) WHERE execution_id IS NOT NULL
+                    """
                 )
-            connection.execute(
-                """
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_signal_execution
-                ON paper_signal_queue(execution_id) WHERE execution_id IS NOT NULL
-                """
-            )
-            connection.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_paper_signal_expiry
-                ON paper_signal_queue(status, expires_at, signal_id)
-                """
-            )
-            connection.execute("BEGIN IMMEDIATE")
-            try:
+                connection.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_paper_signal_expiry
+                    ON paper_signal_queue(status, expires_at, signal_id)
+                    """
+                )
                 row = connection.execute(
                     """
                     SELECT policy_fingerprint, policy_json
@@ -620,6 +631,23 @@ class PaperSignalQueueStore:
                 ).fetchall()
                 for row in expiring_rows:
                     self._record_from_row(row)
+                rows = connection.execute(
+                    """
+                    SELECT * FROM paper_signal_queue
+                    WHERE (
+                        status = ? OR (status = ? AND expires_at > ?)
+                    ) AND due_at <= ?
+                    ORDER BY due_at, signal_id LIMIT ?
+                    """,
+                    (
+                        PaperSignalQueueStatus.PREPARED.value,
+                        PaperSignalQueueStatus.PENDING.value,
+                        observed.isoformat(),
+                        observed.isoformat(),
+                        limit,
+                    ),
+                ).fetchall()
+                records = tuple(self._record_from_row(row) for row in rows)
                 connection.execute(
                     """
                     UPDATE paper_signal_queue
@@ -635,25 +663,12 @@ class PaperSignalQueueStore:
                         observed.isoformat(),
                     ),
                 )
-                rows = connection.execute(
-                    """
-                    SELECT * FROM paper_signal_queue
-                    WHERE status IN (?, ?) AND due_at <= ?
-                    ORDER BY due_at, signal_id LIMIT ?
-                    """,
-                    (
-                        PaperSignalQueueStatus.PENDING.value,
-                        PaperSignalQueueStatus.PREPARED.value,
-                        observed.isoformat(),
-                        limit,
-                    ),
-                ).fetchall()
                 connection.commit()
             except BaseException:
                 if connection.in_transaction:
                     connection.rollback()
                 raise
-        return tuple(self._record_from_row(row) for row in rows)
+        return records
 
     def prepare(
         self,

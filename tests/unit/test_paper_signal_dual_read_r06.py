@@ -179,6 +179,30 @@ def _snapshot(path: Path) -> tuple[tuple[str, tuple[tuple[object, ...], ...]], .
         )
 
 
+def _schema_and_data_snapshot(path: Path) -> tuple[object, ...]:
+    with sqlite3.connect(path) as connection:
+        schema = tuple(
+            connection.execute(
+                """
+                SELECT type, name, tbl_name, sql
+                FROM sqlite_master
+                WHERE name NOT LIKE 'sqlite_%'
+                ORDER BY type, name
+                """
+            )
+        )
+        tables = tuple(
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
+            )
+        )
+        columns = tuple(
+            (table, tuple(connection.execute(f'PRAGMA table_info("{table}")'))) for table in tables
+        )
+    return schema, columns, _snapshot(path)
+
+
 @pytest.mark.parametrize(("_name", "expected_type", "expected_id", "literal"), _FAMILIES)
 def test_paper_consumer_copies_every_verified_signal_family_to_the_queue(
     tmp_path: Path,
@@ -263,6 +287,101 @@ def test_queue_integrity_mismatch_stops_before_quote_or_paper_order_mutation(
 
     assert quote_calls == 0
     assert _snapshot(queue_path) == before
+
+
+def test_due_batch_integrity_failure_does_not_expire_another_row(tmp_path: Path) -> None:
+    queue_path = tmp_path / "queue.sqlite3"
+    queue = _queue(queue_path)
+    expiring = _record(1, _FAMILIES[0][3])
+    corrupt_due = _record(2, _FAMILIES[1][3])
+    for record in (expiring, corrupt_due):
+        queue.ingest(
+            record.signal,
+            received_at=NOW,
+            payload_json=record.payload_json,
+            payload_hash=record.payload_hash,
+            payload_size=len(record.payload_json.encode("utf-8")),
+        )
+    with sqlite3.connect(queue_path) as connection:
+        connection.execute(
+            "UPDATE paper_signal_queue SET expires_at = ? WHERE signal_id = ?",
+            (NOW.isoformat(), expiring.signal_id),
+        )
+        connection.execute(
+            "UPDATE paper_signal_queue SET signal_hash = ? WHERE signal_id = ?",
+            ("0" * 64, corrupt_due.signal_id),
+        )
+    before = _snapshot(queue_path)
+
+    with pytest.raises(RuntimeError, match="stored signal|payload"):
+        queue.due_records(now=NOW, limit=10)
+
+    assert _snapshot(queue_path) == before
+
+
+def test_corrupt_late_legacy_row_rolls_back_the_entire_queue_migration(
+    tmp_path: Path,
+) -> None:
+    queue_path = tmp_path / "legacy-queue.sqlite3"
+    policy = _policy()
+    valid = _record(1, _FAMILIES[0][3])
+    corrupt = _record(2, _FAMILIES[1][3])
+    with sqlite3.connect(queue_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE paper_signal_metadata (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                policy_fingerprint TEXT NOT NULL,
+                policy_json TEXT NOT NULL
+            );
+            CREATE TABLE paper_signal_queue (
+                signal_id TEXT PRIMARY KEY,
+                signal_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                due_at TEXT NOT NULL,
+                received_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                last_error TEXT,
+                quote_json TEXT,
+                intent_json TEXT,
+                order_json TEXT
+            );
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO paper_signal_metadata(
+                singleton, policy_fingerprint, policy_json
+            ) VALUES (1, ?, ?)
+            """,
+            (policy.provenance_fingerprint, policy.model_dump_json()),
+        )
+        for record, signal_id in (
+            (valid, valid.signal_id),
+            (corrupt, "0" * 64),
+        ):
+            connection.execute(
+                """
+                INSERT INTO paper_signal_queue(
+                    signal_id, signal_json, status, due_at,
+                    received_at, updated_at, last_error,
+                    quote_json, intent_json, order_json
+                ) VALUES (?, ?, 'pending', ?, ?, ?, NULL, NULL, NULL, NULL)
+                """,
+                (
+                    signal_id,
+                    record.payload_json,
+                    record.signal.available_at.isoformat(),
+                    NOW.isoformat(),
+                    NOW.isoformat(),
+                ),
+            )
+    before = _schema_and_data_snapshot(queue_path)
+
+    with pytest.raises(RuntimeError, match="stored signal|payload"):
+        PaperSignalQueueStore(queue_path, policy=policy)
+
+    assert _schema_and_data_snapshot(queue_path) == before
 
 
 @pytest.mark.parametrize(("_name", "literal"), _INVALID_CURRENT_PAYLOADS)
