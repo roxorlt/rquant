@@ -824,7 +824,7 @@ merge. Pull request, workflow-dispatch, tag, branch, rerun at another SHA, or pr
 never deployment evidence. The checkout commit must equal the event `after` SHA, its resolved tree is
 recorded, and both Python 3.11 and 3.12 jobs run against that same pair.
 
-`R07DrGateEvidenceV1` is strict canonical JSON with exactly:
+`R07DrGateEvidenceWireV1` is strict canonical JSON with exactly:
 
 ```text
 schema_version: 1
@@ -841,6 +841,7 @@ baseline_commit_sha: exact frozen commit
 baseline_tree_sha: exact frozen tree
 policy_digest: lowercase 64-hex
 complete_diff_digest: lowercase 64-hex
+candidate_binding_digest: lowercase 64-hex over baseline/candidate commit+tree and complete diff
 boundary_manifest_digest: lowercase 64-hex
 boundary_result_digest: lowercase 64-hex
 root_snapshot_digest: lowercase 64-hex
@@ -860,6 +861,31 @@ the 3.11 and 3.12 `job_id` values are exactly `r07-differential-gate-py311` and
 `r07-differential-gate-py312`, and each `job_run_id` is a positive integer.
 `outcome=passed` requires `collected == passed > 0`, `skipped == 0`, and `deselected == 0`. Unknown,
 missing, duplicate, coerced, or additional fields block.
+
+##### Evidence Typestate And Probe Child Environment (Normative)
+
+`R07DrGateEvidenceWireV1` is observation only: its structural bindings, run summaries, digests, and
+`outcome` describe supplied CI bytes but never grant verified or passed authority. Canonical JSON
+parsing returns only this wire type. `VerifiedR07DrGateEvidenceV1` has no public parser or public
+constructor; it is returned only by `verify_wire(repo, policy, wire)` or
+`VerifiedR07DrGateEvidenceV1.from_gate_results(...)`. Both paths re-run the exact candidate, static,
+and B01..B17 boundary gates against the repository and policy before returning the verified value.
+Serialization always emits wire; a later consumer must parse wire and call `verify_wire` again. The
+parser receives no private verification token. Tranche B may accept only the verified type; no
+production writer, public production API, or Phase B capability is introduced here.
+
+The parent probe facade remains stdlib-only, imports no `rquant` module, and neither reads nor
+mutates its own environment. It builds the child map from `{}`. The sole parent-derived loader and
+locale fields are `PATH`, `LANG`, and `LC_ALL`; `PYTHONPATH` is explicitly the checked-out repository
+root, never inherited. The facade explicitly writes `HOME`, `TMPDIR`, `TMP`, `TEMP`, `DATA_DIR`,
+`PARQUET_DIR`, `LOG_DIR`, `DUCKDB_PATH`, `DUCKDB_READONLY_PATH`, `PYTHONNOUSERSITE`,
+`PYTEST_DISABLE_PLUGIN_AUTOLOAD`, `PYTEST_ADDOPTS`, `RQUANT_DISABLE_DOTENV`, a dummy
+`TUSHARE_TOKEN_MAIN`, and `NOTIFY_ENABLED=false`, all under its temporary root. Every other ambient
+name is absent by default, including unknown secrets, cloud credentials, and all production
+`RQUANT_*` settings. Red tests must show that a self-consistent fake wire cannot become verified,
+that legal gate-to-wire-to-parse-to-verify round-trips, that the parent environment and imports are
+unchanged, and that only the listed child fields are visible. Q1/Q2 remain closed and the existing
+trusted CI channel remains unchanged.
 
 The artifact name is exactly `r07-dr-gate-<candidate_commit_sha>`, its internal JSON path is exactly
 `r07-dr-gate/evidence-v1.json`, and GitHub retention is 90 days. The deployment downloader accepts
