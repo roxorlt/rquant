@@ -7,6 +7,7 @@ import hashlib
 import os
 import re
 import stat
+import unicodedata
 from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass, replace
@@ -30,6 +31,10 @@ MAX_MODULE_BYTES = 128
 MAX_ENVIRONMENT_NAMES = 32
 MAX_ENVIRONMENT_NAME_BYTES = 64
 MAX_GENERATION_MANIFEST_BYTES = 16 * 1024 * 1024
+MAX_JSON_NESTING_DEPTH = 64
+MAX_JSON_INTEGER_DIGITS = 20
+FILE_HASH_CHUNK_BYTES = 64 * 1024
+MAX_PYVENV_CONFIG_BYTES = 4096
 
 PRODUCTION_PROFILE_PATH = Path("/etc/rquant/production-runtime-profile.json")
 PRODUCTION_PROFILE_ANCHOR = Path("/etc/rquant")
@@ -62,8 +67,10 @@ PRODUCTION_MANIFEST_SCHEMA = MappingProxyType(
         "directory_modes": (0o555,),
         "file_modes": (0o444, 0o555),
         "max_entries": 100_000,
+        "max_total_bytes": 4_294_967_296,
         "max_file_bytes": 1_073_741_824,
         "max_path_bytes": MAX_PATH_BYTES,
+        "max_depth": 32,
     }
 )
 
@@ -243,7 +250,15 @@ class RuntimeProfileRole:
             type(self.module) is not str
             or not self.module.startswith("rquant.")
             or _MODULE_NAME.fullmatch(self.module) is None
-            or len(self.module.encode("utf-8")) > MAX_MODULE_BYTES
+        ):
+            raise ProductionRuntimeProfileError("runtime profile role module is invalid")
+        if (
+            _utf8_size(
+                self.module,
+                ProductionRuntimeProfileError,
+                "runtime profile role module",
+            )
+            > MAX_MODULE_BYTES
         ):
             raise ProductionRuntimeProfileError("runtime profile role module is invalid")
         names = self.environment_allowlist
@@ -252,8 +267,13 @@ class RuntimeProfileRole:
             or len(names) > MAX_ENVIRONMENT_NAMES
             or any(
                 type(name) is not str
-                or len(name.encode("utf-8")) > MAX_ENVIRONMENT_NAME_BYTES
                 or _ENVIRONMENT_NAME.fullmatch(name) is None
+                or _utf8_size(
+                    name,
+                    ProductionRuntimeProfileError,
+                    "runtime profile environment name",
+                )
+                > MAX_ENVIRONMENT_NAME_BYTES
                 for name in names
             )
             or names != tuple(sorted(set(names)))
@@ -274,8 +294,10 @@ class RuntimeManifestSchema:
     directory_modes: tuple[int, ...]
     file_modes: tuple[int, ...]
     max_entries: int
+    max_total_bytes: int
     max_file_bytes: int
     max_path_bytes: int
+    max_depth: int
 
     def __post_init__(self) -> None:
         if self.payload() != {
@@ -291,9 +313,38 @@ class RuntimeManifestSchema:
             "directory_modes": list(self.directory_modes),
             "file_modes": list(self.file_modes),
             "max_entries": self.max_entries,
+            "max_total_bytes": self.max_total_bytes,
             "max_file_bytes": self.max_file_bytes,
             "max_path_bytes": self.max_path_bytes,
+            "max_depth": self.max_depth,
         }
+
+
+@dataclass
+class _GenerationTreeBudget:
+    schema: RuntimeManifestSchema
+    entries: int = 0
+    total_bytes: int = 0
+
+    def observe_entry(self, path: str) -> None:
+        self.entries += 1
+        if self.entries > self.schema.max_entries:
+            raise RuntimeAuthorityPublishError("generation entry budget exceeded")
+        if len(path.split("/")) > self.schema.max_depth:
+            raise RuntimeAuthorityPublishError("generation path depth budget exceeded")
+
+    def observe_file(self, size: int) -> None:
+        self.require_file_size(size)
+        self.observe_file_bytes(size)
+
+    def require_file_size(self, size: int) -> None:
+        if size > self.schema.max_file_bytes:
+            raise RuntimeAuthorityPublishError("generation file byte budget exceeded")
+
+    def observe_file_bytes(self, size: int) -> None:
+        self.total_bytes += size
+        if self.total_bytes > self.schema.max_total_bytes:
+            raise RuntimeAuthorityPublishError("generation total byte budget exceeded")
 
 
 @dataclass(frozen=True)
@@ -442,7 +493,10 @@ class RuntimeRoleSpec:
         )
         if type(self.module) is not str or _MODULE_NAME.fullmatch(self.module) is None:
             raise RuntimeAuthorityRecordError("runtime role module is invalid")
-        if len(self.module.encode("utf-8")) > MAX_MODULE_BYTES:
+        if (
+            _utf8_size(self.module, RuntimeAuthorityRecordError, "runtime role module")
+            > MAX_MODULE_BYTES
+        ):
             raise RuntimeAuthorityRecordError("runtime role module is too long")
         if (
             not self.site_packages
@@ -507,8 +561,16 @@ class RuntimeGenerationSlot:
         if (
             type(self.commit) is not str
             or not self.commit
-            or len(self.commit.encode("utf-8")) > MAX_COMMIT_BYTES
             or any(ord(character) < 0x20 for character in self.commit)
+        ):
+            raise RuntimeAuthorityRecordError("untrusted commit audit metadata is invalid")
+        if (
+            _utf8_size(
+                self.commit,
+                RuntimeAuthorityRecordError,
+                "untrusted commit audit metadata",
+            )
+            > MAX_COMMIT_BYTES
         ):
             raise RuntimeAuthorityRecordError("untrusted commit audit metadata is invalid")
         if not isinstance(self.roles, Mapping) or not self.roles or len(self.roles) > MAX_ROLES:
@@ -1058,8 +1120,10 @@ def _parse_manifest_schema(payload: object) -> RuntimeManifestSchema:
         directory_modes=tuple(payload["directory_modes"]),
         file_modes=tuple(payload["file_modes"]),
         max_entries=payload["max_entries"],
+        max_total_bytes=payload["max_total_bytes"],
         max_file_bytes=payload["max_file_bytes"],
         max_path_bytes=payload["max_path_bytes"],
+        max_depth=payload["max_depth"],
     )
 
 
@@ -1148,18 +1212,97 @@ def _strict_payload(
         raise error_type(f"{label} is not valid UTF-8") from exc
     if len(encoded) > max_bytes:
         raise error_type(f"{label} is too large")
+    _preflight_json_resources(encoded, error_type=error_type, label=label)
 
     def reject_number(value: str) -> object:
         raise StrictJsonError(f"non-native JSON number: {value}")
 
     try:
-        return strict_json_loads(
+        parsed = strict_json_loads(
             encoded,
             parse_float=reject_number,
             parse_constant=reject_number,
         )
-    except (StrictJsonError, UnicodeDecodeError) as exc:
+        _reject_json_surrogates(parsed, error_type=error_type, label=label)
+        return parsed
+    except error_type:
+        raise
+    except (
+        StrictJsonError,
+        UnicodeDecodeError,
+        UnicodeEncodeError,
+        ValueError,
+        RecursionError,
+    ) as exc:
         raise error_type(f"{label} is not strict JSON") from exc
+
+
+def _preflight_json_resources(
+    encoded: bytes,
+    *,
+    error_type: type[RuntimeAuthorityError],
+    label: str,
+) -> None:
+    depth = 0
+    integer_digits = 0
+    in_string = False
+    escaped = False
+    for byte in encoded:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif byte == ord("\\"):
+                escaped = True
+            elif byte == ord('"'):
+                in_string = False
+            continue
+        if byte == ord('"'):
+            in_string = True
+            integer_digits = 0
+        elif byte in (ord("{"), ord("[")):
+            depth += 1
+            integer_digits = 0
+            if depth > MAX_JSON_NESTING_DEPTH:
+                raise error_type(f"{label} JSON nesting exceeds the fixed limit")
+        elif byte in (ord("}"), ord("]")):
+            depth -= 1
+            integer_digits = 0
+        elif ord("0") <= byte <= ord("9"):
+            integer_digits += 1
+            if integer_digits > MAX_JSON_INTEGER_DIGITS:
+                raise error_type(f"{label} JSON integer exceeds the fixed digit limit")
+        else:
+            integer_digits = 0
+
+
+def _reject_json_surrogates(
+    payload: object,
+    *,
+    error_type: type[RuntimeAuthorityError],
+    label: str,
+) -> None:
+    pending = [payload]
+    while pending:
+        value = pending.pop()
+        if type(value) is str:
+            if any(0xD800 <= ord(character) <= 0xDFFF for character in value):
+                raise error_type(f"{label} contains text that is not valid UTF-8")
+        elif type(value) is list:
+            pending.extend(value)
+        elif type(value) is dict:
+            pending.extend(value.keys())
+            pending.extend(value.values())
+
+
+def _utf8_size(
+    value: str,
+    error_type: type[RuntimeAuthorityError],
+    label: str,
+) -> int:
+    try:
+        return len(value.encode("utf-8"))
+    except (UnicodeEncodeError, ValueError) as exc:
+        raise error_type(f"{label} is not valid UTF-8") from exc
 
 
 def _payload_path(
@@ -1177,14 +1320,19 @@ def _model_path(
     error_type: type[RuntimeAuthorityError],
     label: str,
 ) -> Path:
-    if (
-        not isinstance(value, Path)
-        or not value.is_absolute()
-        or "\x00" in str(value)
-        or len(os.fsencode(value)) > MAX_PATH_BYTES
-    ):
+    if not isinstance(value, Path):
         raise error_type(f"{label} must be one absolute canonical path")
-    canonical = Path(os.path.abspath(value))
+    try:
+        invalid = (
+            not value.is_absolute()
+            or "\x00" in str(value)
+            or len(os.fsencode(value)) > MAX_PATH_BYTES
+        )
+        canonical = Path(os.path.abspath(value))
+    except (UnicodeEncodeError, UnicodeDecodeError, ValueError, OSError) as exc:
+        raise error_type(f"{label} must be one valid UTF-8 canonical path") from exc
+    if invalid:
+        raise error_type(f"{label} must be one absolute canonical path")
     if value != canonical:
         raise error_type(f"{label} must be one absolute canonical path")
     return canonical
@@ -1696,6 +1844,7 @@ def _revalidate_generation_slot(
             manifest_entries,
             profile,
         )
+        _validate_generation_semantics(generation_fd, manifest_entries, slot)
         active_generation = os.stat(
             slot.generation_id,
             dir_fd=generation_root_fd,
@@ -1779,17 +1928,23 @@ def _validate_generation_manifest(
             "generation manifest roles do not match the authority slot"
         )
     entries = data["entries"]
-    if type(entries) is not list or len(entries) > profile.manifest_schema.max_entries:
+    if type(entries) is not list:
         raise RuntimeAuthorityPublishError("generation manifest entries are invalid")
     manifest_entries: list[_GenerationManifestEntry] = []
     entry_types: dict[str, str] = {}
+    declared_budget = _GenerationTreeBudget(profile.manifest_schema)
     for entry in entries:
         parsed = _validate_generation_manifest_entry(entry, profile)
+        declared_budget.observe_entry(parsed.path)
+        if parsed.entry_type == "file":
+            declared_budget.observe_file(parsed.size)
         manifest_entries.append(parsed)
         entry_types[parsed.path] = parsed.entry_type
     observed_paths = [entry.path for entry in manifest_entries]
     if observed_paths != sorted(set(observed_paths)):
         raise RuntimeAuthorityPublishError("generation manifest entries are not canonical")
+    if entry_types.get("pyvenv.cfg") != "file":
+        raise RuntimeAuthorityPublishError("generation manifest is missing pyvenv.cfg")
     required_paths = {role["python_path"]: "file" for role in expected_roles.values()}
     for role in expected_roles.values():
         required_paths[role["working_directory"]] = "directory"
@@ -1845,6 +2000,8 @@ def _validate_generation_manifest_entry(
         raise RuntimeAuthorityPublishError("generation manifest entry path is invalid")
     if entry_type not in profile.manifest_schema.entry_types:
         raise RuntimeAuthorityPublishError("generation manifest entry type is invalid")
+    if entry_type == "file" and _is_forbidden_import_hook(path):
+        raise RuntimeAuthorityPublishError("generation tree contains a forbidden import hook")
     if type(entry["owner_uid"]) is not int or entry["owner_uid"] != RUNTIME_AUTHORITY_OWNER_UID:
         raise RuntimeAuthorityPublishError("generation manifest entry owner is invalid")
     mode = entry["mode"]
@@ -1868,7 +2025,7 @@ def _validate_generation_manifest_entry(
             and type(nlink) is int
             and nlink == 1
             and type(size) is int
-            and 0 <= size <= profile.manifest_schema.max_file_bytes
+            and size >= 0
             and type(sha256) is str
             and _SHA256.fullmatch(sha256) is not None
         )
@@ -1885,6 +2042,91 @@ def _validate_generation_manifest_entry(
     )
 
 
+def _is_forbidden_import_hook(path: str) -> bool:
+    basename = unicodedata.normalize("NFKC", path.rsplit("/", 1)[-1]).casefold()
+    return basename.endswith(".pth") or basename in {
+        "sitecustomize.py",
+        "usercustomize.py",
+    }
+
+
+def _validate_generation_semantics(
+    generation_fd: int,
+    entries: tuple[_GenerationManifestEntry, ...],
+    slot: RuntimeGenerationSlot,
+) -> None:
+    by_path = {entry.path: entry for entry in entries}
+    pyvenv_entry = by_path.get("pyvenv.cfg")
+    if pyvenv_entry is None or pyvenv_entry.entry_type != "file":
+        raise RuntimeAuthorityPublishError("generation pyvenv.cfg is missing")
+    pyvenv_payload = _read_file_at(
+        generation_fd,
+        "pyvenv.cfg",
+        owner_uid=pyvenv_entry.owner_uid,
+        file_mode=pyvenv_entry.mode,
+        max_bytes=MAX_PYVENV_CONFIG_BYTES,
+        error_type=RuntimeAuthorityPublishError,
+        label="generation pyvenv.cfg",
+    )
+    if pyvenv_payload is None:
+        raise RuntimeAuthorityPublishError("generation pyvenv.cfg is missing")
+    _validate_pyvenv_config(pyvenv_payload)
+
+    for role in slot.roles.values():
+        role_payload = _manifest_role_payload(role, slot.generation_path)
+        app_source = role_payload["app_source"]
+        if type(app_source) is not str:
+            raise RuntimeAuthorityPublishError("generation app source is invalid")
+        module_parts = role.module.split(".")
+        module_stem = f"{app_source}/{'/'.join(module_parts)}"
+        module_file = f"{module_stem}.py"
+        package_file = f"{module_stem}/__init__.py"
+        resolutions = [
+            path
+            for path in (module_file, package_file)
+            if by_path.get(path) is not None and by_path[path].entry_type == "file"
+        ]
+        if not resolutions:
+            raise RuntimeAuthorityPublishError(
+                f"allowlisted module {role.module} has no unique regular source"
+            )
+        if len(resolutions) != 1:
+            raise RuntimeAuthorityPublishError(
+                f"allowlisted module {role.module} source is ambiguous"
+            )
+        for depth in range(1, len(module_parts)):
+            package_init = f"{app_source}/{'/'.join(module_parts[:depth])}/__init__.py"
+            parent = by_path.get(package_init)
+            if parent is None or parent.entry_type != "file":
+                raise RuntimeAuthorityPublishError(
+                    f"allowlisted module {role.module} uses a namespace package"
+                )
+
+
+def _validate_pyvenv_config(payload: bytes) -> None:
+    try:
+        text = payload.decode("utf-8")
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise RuntimeAuthorityPublishError("generation pyvenv.cfg is not valid UTF-8") from exc
+    if not text.endswith("\n") or "\r" in text:
+        raise RuntimeAuthorityPublishError("generation pyvenv.cfg is not canonical")
+    values: dict[str, str] = {}
+    for line in text.splitlines():
+        key, separator, value = line.partition("=")
+        normalized_key = unicodedata.normalize("NFKC", key.strip()).casefold()
+        if not separator or not normalized_key or not value.strip():
+            raise RuntimeAuthorityPublishError("generation pyvenv.cfg is malformed")
+        if normalized_key in values:
+            raise RuntimeAuthorityPublishError("generation pyvenv.cfg contains a duplicate key")
+        if normalized_key != "include-system-site-packages":
+            raise RuntimeAuthorityPublishError("generation pyvenv.cfg contains an unknown key")
+        values[normalized_key] = value.strip()
+    if values.get("include-system-site-packages") != "false":
+        raise RuntimeAuthorityPublishError(
+            "generation pyvenv.cfg include-system-site-packages must be false"
+        )
+
+
 def _validate_generation_tree(
     generation_fd: int,
     entries: tuple[_GenerationManifestEntry, ...],
@@ -1892,6 +2134,7 @@ def _validate_generation_tree(
 ) -> tuple[tuple[str, tuple[int, ...]], ...]:
     expected = {entry.path: entry for entry in entries}
     observed: dict[str, tuple[int, ...]] = {}
+    observed_budget = _GenerationTreeBudget(profile.manifest_schema)
     root_before = os.fstat(generation_fd)
     _walk_generation_directory(
         generation_fd,
@@ -1899,6 +2142,7 @@ def _validate_generation_tree(
         expected=expected,
         observed=observed,
         profile=profile,
+        budget=observed_budget,
     )
     root_after = os.fstat(generation_fd)
     if _identity(root_before) != _identity(root_after):
@@ -1917,95 +2161,167 @@ def _walk_generation_directory(
     expected: Mapping[str, _GenerationManifestEntry],
     observed: dict[str, tuple[int, ...]],
     profile: RuntimeClosureProfile,
+    budget: _GenerationTreeBudget,
 ) -> None:
-    for name in sorted(os.listdir(directory_fd)):
-        if not relative_parent and name == GENERATION_MANIFEST_NAME:
-            manifest_stat = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-            _require_file_stat(
-                manifest_stat,
-                owner_uid=RUNTIME_AUTHORITY_OWNER_UID,
-                mode=GENERATION_MANIFEST_MODE,
-                error_type=RuntimeAuthorityPublishError,
-                label="generation manifest",
+    with os.scandir(directory_fd) as iterator:
+        for directory_entry in iterator:
+            _validate_generation_directory_entry(
+                directory_fd,
+                directory_entry,
+                relative_parent=relative_parent,
+                expected=expected,
+                observed=observed,
+                profile=profile,
+                budget=budget,
             )
-            continue
-        relative_path = name if not relative_parent else f"{relative_parent}/{name}"
+
+
+def _validate_generation_directory_entry(
+    directory_fd: int,
+    directory_entry: os.DirEntry[str],
+    *,
+    relative_parent: str,
+    expected: Mapping[str, _GenerationManifestEntry],
+    observed: dict[str, tuple[int, ...]],
+    profile: RuntimeClosureProfile,
+    budget: _GenerationTreeBudget,
+) -> None:
+    name = directory_entry.name
+    if not relative_parent and name == GENERATION_MANIFEST_NAME:
+        manifest_stat = directory_entry.stat(follow_symlinks=False)
+        _require_file_stat(
+            manifest_stat,
+            owner_uid=RUNTIME_AUTHORITY_OWNER_UID,
+            mode=GENERATION_MANIFEST_MODE,
+            error_type=RuntimeAuthorityPublishError,
+            label="generation manifest",
+        )
+        return
+    relative_path = name if not relative_parent else f"{relative_parent}/{name}"
+    try:
+        path_size = _utf8_size(
+            relative_path,
+            RuntimeAuthorityPublishError,
+            "generation tree path",
+        )
+    except RuntimeAuthorityPublishError as exc:
+        raise RuntimeAuthorityPublishError("generation tree path is not valid UTF-8") from exc
+    if path_size > profile.manifest_schema.max_path_bytes:
+        raise RuntimeAuthorityPublishError("generation tree path is too long")
+    budget.observe_entry(relative_path)
+    named = directory_entry.stat(follow_symlinks=False)
+    if not stat.S_ISDIR(named.st_mode) and not stat.S_ISREG(named.st_mode):
+        raise RuntimeAuthorityPublishError("generation tree contains a symlink or special entry")
+    entry = expected.get(relative_path)
+    if entry is None:
+        raise RuntimeAuthorityPublishError(
+            "generation tree contains a path absent from its manifest"
+        )
+    if stat.S_ISDIR(named.st_mode):
+        if entry.entry_type != "directory" or named.st_nlink != entry.nlink:
+            raise RuntimeAuthorityPublishError(
+                "generation tree directory metadata does not match its manifest: "
+                f"{relative_path} has nlink {named.st_nlink}, expected {entry.nlink}"
+            )
+        child_fd = _open_directory_entry(
+            directory_fd,
+            name,
+            named,
+            owner_uid=entry.owner_uid,
+            mode=entry.mode,
+            error_type=RuntimeAuthorityPublishError,
+            label=f"generation tree directory {relative_path}",
+        )
         try:
-            path_size = len(relative_path.encode("utf-8"))
-        except UnicodeEncodeError as exc:
-            raise RuntimeAuthorityPublishError("generation tree path is not valid UTF-8") from exc
-        if path_size > profile.manifest_schema.max_path_bytes:
-            raise RuntimeAuthorityPublishError("generation tree path is too long")
-        named = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-        if not stat.S_ISDIR(named.st_mode) and not stat.S_ISREG(named.st_mode):
-            raise RuntimeAuthorityPublishError(
-                "generation tree contains a symlink or special entry"
+            _walk_generation_directory(
+                child_fd,
+                relative_parent=relative_path,
+                expected=expected,
+                observed=observed,
+                profile=profile,
+                budget=budget,
             )
-        entry = expected.get(relative_path)
-        if entry is None:
-            raise RuntimeAuthorityPublishError(
-                "generation tree contains a path absent from its manifest"
-            )
-        if stat.S_ISDIR(named.st_mode):
-            if entry.entry_type != "directory" or named.st_nlink != entry.nlink:
+            after = os.fstat(child_fd)
+            active = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if _identity(named) != _identity(after) or _identity(named) != _identity(active):
                 raise RuntimeAuthorityPublishError(
-                    "generation tree directory metadata does not match its manifest: "
-                    f"{relative_path} has nlink {named.st_nlink}, expected {entry.nlink}"
+                    "generation tree directory identity changed while validating"
                 )
-            child_fd = _open_directory_entry(
-                directory_fd,
-                name,
-                named,
-                owner_uid=entry.owner_uid,
-                mode=entry.mode,
-                error_type=RuntimeAuthorityPublishError,
-                label=f"generation tree directory {relative_path}",
+        finally:
+            with suppress(OSError):
+                os.close(child_fd)
+    else:
+        if entry.entry_type != "file" or named.st_nlink != entry.nlink:
+            raise RuntimeAuthorityPublishError(
+                "generation tree file metadata does not match its manifest"
             )
-            try:
-                _walk_generation_directory(
-                    child_fd,
-                    relative_parent=relative_path,
-                    expected=expected,
-                    observed=observed,
-                    profile=profile,
-                )
-                after = os.fstat(child_fd)
-                active = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-                if _identity(named) != _identity(after) or _identity(named) != _identity(active):
-                    raise RuntimeAuthorityPublishError(
-                        "generation tree directory identity changed while validating"
-                    )
-            finally:
-                with suppress(OSError):
-                    os.close(child_fd)
-        else:
-            if entry.entry_type != "file" or named.st_nlink != entry.nlink:
-                raise RuntimeAuthorityPublishError(
-                    "generation tree file metadata does not match its manifest"
-                )
-            payload = _read_file_at(
-                directory_fd,
-                name,
-                owner_uid=entry.owner_uid,
-                file_mode=entry.mode,
-                max_bytes=profile.manifest_schema.max_file_bytes,
-                error_type=RuntimeAuthorityPublishError,
-                label=f"generation tree file {relative_path}",
-            )
-            if (
-                payload is None
-                or len(payload) != entry.size
-                or hashlib.sha256(payload).hexdigest() != entry.sha256
-            ):
+        _hash_generation_file_at(
+            directory_fd,
+            name,
+            named=named,
+            entry=entry,
+            budget=budget,
+            label=f"generation tree file {relative_path}",
+        )
+    observed[relative_path] = _identity(named)
+
+
+def _hash_generation_file_at(
+    parent_fd: int,
+    name: str,
+    *,
+    named: os.stat_result,
+    entry: _GenerationManifestEntry,
+    budget: _GenerationTreeBudget,
+    label: str,
+) -> None:
+    _require_file_stat(
+        named,
+        owner_uid=entry.owner_uid,
+        mode=entry.mode,
+        error_type=RuntimeAuthorityPublishError,
+        label=label,
+    )
+    budget.require_file_size(named.st_size)
+    if named.st_size != entry.size:
+        raise RuntimeAuthorityPublishError("generation tree file bytes do not match its manifest")
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY
+            | _required_flag("O_NOFOLLOW", RuntimeAuthorityPublishError)
+            | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_fd,
+        )
+        before = os.fstat(descriptor)
+        if _identity(before) != _identity(named):
+            raise RuntimeAuthorityPublishError(f"{label} identity changed while opening")
+        digest = hashlib.sha256()
+        total = 0
+        while True:
+            chunk = os.read(descriptor, FILE_HASH_CHUNK_BYTES)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > named.st_size:
                 raise RuntimeAuthorityPublishError(
                     "generation tree file bytes do not match its manifest"
                 )
-            active = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-            if _identity(named) != _identity(active):
-                raise RuntimeAuthorityPublishError(
-                    "generation tree file identity changed while validating"
-                )
-        observed[relative_path] = _identity(named)
+            budget.observe_file_bytes(len(chunk))
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+        active = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if _identity(before) != _identity(after) or _identity(before) != _identity(active):
+            raise RuntimeAuthorityPublishError(f"{label} identity changed while reading")
+        if total != entry.size or digest.hexdigest() != entry.sha256:
+            raise RuntimeAuthorityPublishError(
+                "generation tree file bytes do not match its manifest"
+            )
+    finally:
+        if descriptor >= 0:
+            with suppress(OSError):
+                os.close(descriptor)
 
 
 def _consume_generation_evidence(

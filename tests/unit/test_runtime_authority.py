@@ -84,13 +84,8 @@ def _profile_payload() -> dict[str, object]:
             }
         },
         "manifest_schema": {
-            "schema_id": "rquant-full-manifest/v1",
-            "entry_types": ["directory", "file"],
-            "directory_modes": [0o555],
-            "file_modes": [0o444, 0o555],
-            "max_entries": 100_000,
-            "max_file_bytes": 1_073_741_824,
-            "max_path_bytes": 4096,
+            key: list(value) if isinstance(value, tuple) else value
+            for key, value in authority_module.PRODUCTION_MANIFEST_SCHEMA.items()
         },
     }
     return {
@@ -106,6 +101,19 @@ def _profile_bytes(payload: dict[str, object] | None = None) -> bytes:
 def _rehash_profile(payload: dict[str, object]) -> None:
     body = {key: value for key, value in payload.items() if key != "profile_id"}
     payload["profile_id"] = hashlib.sha256(canonical_json_bytes(body)).hexdigest()
+
+
+def _set_manifest_limits(
+    monkeypatch: pytest.MonkeyPatch,
+    **limits: int,
+) -> None:
+    schema = dict(authority_module.PRODUCTION_MANIFEST_SCHEMA)
+    schema.update(limits)
+    monkeypatch.setattr(
+        authority_module,
+        "PRODUCTION_MANIFEST_SCHEMA",
+        MappingProxyType(schema),
+    )
 
 
 def _directory_policy(*directories: Path) -> dict[Path, tuple[int, int]]:
@@ -252,6 +260,9 @@ def _materialize_generation_slot(
     *,
     manifest_profile_id: str | None = None,
     manifest_module: str | None = None,
+    extra_files: dict[str, bytes] | None = None,
+    omitted_files: tuple[str, ...] = (),
+    pyvenv_payload: bytes = b"include-system-site-packages = false\n",
 ) -> RuntimeGenerationSlot:
     relative_role = {
         "python_path": "venv/bin/python",
@@ -263,7 +274,7 @@ def _materialize_generation_slot(
     manifest_role = dict(relative_role)
     if manifest_module is not None:
         manifest_role["module"] = manifest_module
-    directory_paths = (
+    base_directory_paths = (
         "release",
         "release/src",
         "release/src/rquant",
@@ -274,22 +285,42 @@ def _materialize_generation_slot(
         "venv/lib/python3.11/site-packages",
     )
     files = {
+        "pyvenv.cfg": pyvenv_payload,
         "release/src/rquant/__init__.py": b"",
         "release/src/rquant/runtime_service_main.py": b"def main():\n    return 0\n",
         "venv/bin/python": marker.encode("utf-8"),
     }
+    files.update(extra_files or {})
+    for omitted in omitted_files:
+        files.pop(omitted, None)
+    directory_paths = set(base_directory_paths)
+    for relative in files:
+        parent = Path(relative).parent
+        while parent != Path("."):
+            directory_paths.add(parent.as_posix())
+            parent = parent.parent
+    ordered_directories = tuple(
+        sorted(directory_paths, key=lambda path: (len(Path(path).parts), path))
+    )
     fixture_key = hashlib.sha256(
-        f"{marker}:{manifest_profile_id}:{manifest_module}".encode()
+        repr(
+            (
+                marker,
+                manifest_profile_id,
+                manifest_module,
+                sorted(files.items()),
+            )
+        ).encode()
     ).hexdigest()[:16]
     staging = generation_root / f".fixture-{fixture_key}"
     staging.mkdir(mode=0o700)
-    for relative in directory_paths:
+    for relative in ordered_directories:
         (staging / relative).mkdir(mode=0o700)
     for relative, content in files.items():
         target = staging / relative
         target.write_bytes(content)
         target.chmod(0o555 if relative == "venv/bin/python" else 0o444)
-    for relative in reversed(directory_paths):
+    for relative in reversed(ordered_directories):
         (staging / relative).chmod(0o555)
     entries = [
         {
@@ -301,7 +332,7 @@ def _materialize_generation_slot(
             "size": 0,
             "sha256": None,
         }
-        for path in directory_paths
+        for path in ordered_directories
     ]
     entries.extend(
         {
@@ -355,6 +386,17 @@ def _materialize_generation_slot(
                 }
             )
         },
+    )
+
+
+def _record_for_slot(slot: RuntimeGenerationSlot) -> RuntimeAuthorityRecord:
+    return RuntimeAuthorityRecord(
+        schema_version=1,
+        operation_id="1" * 32,
+        sequence=1,
+        state=RuntimeAuthorityState.ACTIVE,
+        current=slot,
+        prior=None,
     )
 
 
@@ -507,6 +549,51 @@ def test_profile_rejects_duplicate_keys_float_constant_and_size_limit() -> None:
         )
     with pytest.raises(ProductionRuntimeProfileError, match="too large"):
         parse_runtime_closure_profile(b" " * (authority_module.MAX_PROFILE_BYTES + 1))
+
+
+@pytest.mark.parametrize(
+    ("payload", "match"),
+    [
+        (b"[" * 65 + b"0" + b"]" * 65, "nesting"),
+        (b'{"sequence":123456789012345678901}', "integer"),
+    ],
+)
+def test_rta_03_public_parsers_reject_json_resource_abuse_with_typed_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    payload: bytes,
+    match: str,
+) -> None:
+    with pytest.raises(ProductionRuntimeProfileError, match=match):
+        parse_runtime_closure_profile(payload)
+
+    _install_profile_fixture(tmp_path, monkeypatch)
+    with pytest.raises(RuntimeAuthorityRecordError, match=match):
+        parse_runtime_authority_record(payload)
+
+
+def test_rta_03_public_parsers_convert_lone_surrogate_path_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile_payload = _profile_bytes().replace(
+        canonical_json_bytes(str(authority_module.PRODUCTION_INBOX_ROOT)),
+        b'"\\ud800"',
+        1,
+    )
+    with pytest.raises(ProductionRuntimeProfileError, match="UTF-8|path"):
+        parse_runtime_closure_profile(profile_payload)
+
+    _path, generation_root = _install_authority_fixture(tmp_path, monkeypatch)
+    record_payload = _record_payload(generation_root)
+    encoded = canonical_json_bytes(record_payload)
+    encoded = encoded.replace(
+        canonical_json_bytes(record_payload["current_generation_path"]),
+        b'"\\ud800"',
+        1,
+    )
+    with pytest.raises(RuntimeAuthorityRecordError, match="UTF-8|path"):
+        parse_runtime_authority_record(encoded)
 
 
 def test_profile_rejects_missing_or_unsafe_ancestor_policy() -> None:
@@ -915,8 +1002,10 @@ def test_hyb1_p1_01_profile_binds_roots_operations_roles_and_manifest() -> None:
             "directory_modes": [0o555],
             "file_modes": [0o444, 0o555],
             "max_entries": 100_000,
+            "max_total_bytes": 4_294_967_296,
             "max_file_bytes": 1_073_741_824,
             "max_path_bytes": 4096,
+            "max_depth": 32,
         },
     )
     _rehash_profile(payload)
@@ -1351,6 +1440,174 @@ def test_hyb1_p1_08_manifest_entries_exactly_cover_materialized_generation(
     assert (generation / "venv/lib/python3.11/site-packages").is_dir()
     assert publish_runtime_authority(record).value == "committed"
     assert path.exists()
+
+
+@pytest.mark.parametrize(
+    ("omitted_files", "pyvenv_payload", "match"),
+    [
+        (("pyvenv.cfg",), b"", "pyvenv"),
+        ((), b"include-system-site-packages = true\n", "include-system-site-packages"),
+        (
+            (),
+            b"include-system-site-packages = false\ninclude-system-site-packages = false\n",
+            "duplicate",
+        ),
+        (
+            (),
+            b"include-system-site-packages = false\nhome = /tmp/untrusted\n",
+            "unknown",
+        ),
+    ],
+)
+def test_rta_01_generation_requires_strict_isolated_pyvenv_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    omitted_files: tuple[str, ...],
+    pyvenv_payload: bytes,
+    match: str,
+) -> None:
+    path, generation_root = _install_authority_fixture(tmp_path, monkeypatch)
+    slot = _materialize_generation_slot(
+        generation_root,
+        "pyvenv",
+        authority_module.RuntimeGenerationLifecycle.ACTIVE,
+        omitted_files=omitted_files,
+        pyvenv_payload=pyvenv_payload,
+    )
+
+    with pytest.raises(RuntimeAuthorityPublishError, match=match):
+        publish_runtime_authority(_record_for_slot(slot))
+    assert not path.exists()
+
+
+@pytest.mark.parametrize(
+    "hook_path",
+    (
+        "venv/lib/python3.11/site-packages/escape.PTH",
+        "release/src/rquant/SiteCustomize.PY",
+        "release/src/rquant/ＳＩＴＥＣＵＳＴＯＭＩＺＥ．ＰＹ",
+        "release/src/rquant/usercustomize.py",
+    ),
+)
+def test_rta_01_generation_rejects_normalized_python_import_hooks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    hook_path: str,
+) -> None:
+    path, generation_root = _install_authority_fixture(tmp_path, monkeypatch)
+    slot = _materialize_generation_slot(
+        generation_root,
+        "hook",
+        authority_module.RuntimeGenerationLifecycle.ACTIVE,
+        extra_files={hook_path: b"raise SystemExit\n"},
+    )
+
+    with pytest.raises(RuntimeAuthorityPublishError, match="import hook"):
+        publish_runtime_authority(_record_for_slot(slot))
+    assert not path.exists()
+
+
+@pytest.mark.parametrize(
+    ("omitted_files", "extra_files", "match"),
+    [
+        (("release/src/rquant/runtime_service_main.py",), {}, "unique"),
+        (("release/src/rquant/__init__.py",), {}, "namespace"),
+        (
+            (),
+            {"release/src/rquant/runtime_service_main/__init__.py": b""},
+            "ambiguous",
+        ),
+    ],
+)
+def test_rta_01_allowlisted_module_has_one_non_namespace_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    omitted_files: tuple[str, ...],
+    extra_files: dict[str, bytes],
+    match: str,
+) -> None:
+    path, generation_root = _install_authority_fixture(tmp_path, monkeypatch)
+    slot = _materialize_generation_slot(
+        generation_root,
+        "module",
+        authority_module.RuntimeGenerationLifecycle.ACTIVE,
+        omitted_files=omitted_files,
+        extra_files=extra_files,
+    )
+
+    with pytest.raises(RuntimeAuthorityPublishError, match=match):
+        publish_runtime_authority(_record_for_slot(slot))
+    assert not path.exists()
+
+
+@pytest.mark.parametrize(
+    ("limits", "extra_files", "match"),
+    [
+        ({"max_entries": 12}, {"release/src/rquant/extra.py": b""}, "entry"),
+        ({"max_total_bytes": 20}, {}, "total"),
+        ({"max_file_bytes": 16}, {}, "file"),
+        (
+            {"max_depth": 4},
+            {"release/src/rquant/nested/deep.py": b""},
+            "depth",
+        ),
+    ],
+)
+def test_rta_02_generation_manifest_and_observed_tree_enforce_budgets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    limits: dict[str, int],
+    extra_files: dict[str, bytes],
+    match: str,
+) -> None:
+    _set_manifest_limits(monkeypatch, **limits)
+    path, generation_root = _install_authority_fixture(tmp_path, monkeypatch)
+    slot = _materialize_generation_slot(
+        generation_root,
+        "budget",
+        authority_module.RuntimeGenerationLifecycle.ACTIVE,
+        extra_files=extra_files,
+    )
+
+    with pytest.raises(RuntimeAuthorityPublishError, match=match):
+        publish_runtime_authority(_record_for_slot(slot))
+    assert not path.exists()
+
+
+def test_rta_02_generation_files_are_hashed_by_bounded_streaming_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path, generation_root = _install_authority_fixture(tmp_path, monkeypatch)
+    slot = _materialize_generation_slot(
+        generation_root,
+        "stream",
+        authority_module.RuntimeGenerationLifecycle.ACTIVE,
+        extra_files={"venv/lib/python3.11/site-packages/payload.bin": b"x" * (256 * 1024)},
+    )
+    read_sizes: list[int] = []
+    collected_generation_files: list[str] = []
+    original_read = authority_module.os.read
+    original_read_file_at = authority_module._read_file_at
+
+    def bounded_read(descriptor: int, size: int) -> bytes:
+        read_sizes.append(size)
+        return original_read(descriptor, size)
+
+    def observe_collected_read(*args: object, **kwargs: object) -> object:
+        label = str(kwargs.get("label", ""))
+        if label.startswith("generation tree file"):
+            collected_generation_files.append(label)
+        return original_read_file_at(*args, **kwargs)
+
+    monkeypatch.setattr(authority_module.os, "read", bounded_read)
+    monkeypatch.setattr(authority_module, "_read_file_at", observe_collected_read)
+
+    assert publish_runtime_authority(_record_for_slot(slot)).value == "committed"
+    assert path.exists()
+    assert read_sizes
+    assert max(read_sizes) <= authority_module.FILE_HASH_CHUNK_BYTES
+    assert not collected_generation_files
 
 
 @pytest.mark.parametrize(
