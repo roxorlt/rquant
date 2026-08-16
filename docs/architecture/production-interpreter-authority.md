@@ -867,25 +867,79 @@ missing, duplicate, coerced, or additional fields block.
 `R07DrGateEvidenceWireV1` is observation only: its structural bindings, run summaries, digests, and
 `outcome` describe supplied CI bytes but never grant verified or passed authority. Canonical JSON
 parsing returns only this wire type. `VerifiedR07DrGateEvidenceV1` has no public parser or public
-constructor; it is returned only by `verify_wire(repo, policy, wire)` or
-`VerifiedR07DrGateEvidenceV1.from_gate_results(...)`. Both paths re-run the exact candidate, static,
-and B01..B17 boundary gates against the repository and policy before returning the verified value.
-Serialization always emits wire; a later consumer must parse wire and call `verify_wire` again. The
-parser receives no private verification token. Tranche B may accept only the verified type; no
-production writer, public production API, or Phase B capability is introduced here.
+constructor. Serialization always emits wire; every later consumer must parse wire and verify it
+again. The parser receives no private verification token.
 
-The parent probe facade remains stdlib-only, imports no `rquant` module, and neither reads nor
-mutates its own environment. It builds the child map from `{}`. The sole parent-derived loader and
-locale fields are `PATH`, `LANG`, and `LC_ALL`; `PYTHONPATH` is explicitly the checked-out repository
-root, never inherited. The facade explicitly writes `HOME`, `TMPDIR`, `TMP`, `TEMP`, `DATA_DIR`,
-`PARQUET_DIR`, `LOG_DIR`, `DUCKDB_PATH`, `DUCKDB_READONLY_PATH`, `PYTHONNOUSERSITE`,
-`PYTEST_DISABLE_PLUGIN_AUTOLOAD`, `PYTEST_ADDOPTS`, `RQUANT_DISABLE_DOTENV`, a dummy
-`TUSHARE_TOKEN_MAIN`, and `NOTIFY_ENABLED=false`, all under its temporary root. Every other ambient
-name is absent by default, including unknown secrets, cloud credentials, and all production
-`RQUANT_*` settings. Red tests must show that a self-consistent fake wire cannot become verified,
-that legal gate-to-wire-to-parse-to-verify round-trips, that the parent environment and imports are
-unchanged, and that only the listed child fields are visible. Q1/Q2 remain closed and the existing
-trusted CI channel remains unchanged.
+`verify_wire(repo, policy, wire)` and `VerifiedR07DrGateEvidenceV1.from_gate_results(...)` both call
+one private verifier; there is no second construction or validation path. `from_gate_results` may
+assemble a wire observation, but it cannot return authority before the same private verifier runs
+these steps in order:
+
+1. Strictly revalidate the wire and policy, resolve the wire's baseline/candidate commit and tree
+   IDs as exact Git objects, require the declared trees to match those commits, require candidate
+   ancestry from the frozen baseline, and read all source and policy inputs from those Git objects,
+   never from the caller's working tree.
+2. Materialize the exact candidate tree into a fresh read-only temporary root and re-run the full
+   candidate diff/allowlist gate, every static root/declaration/forbidden-definition gate, and the
+   ordered B01..B17 boundary probes against that root. A missing, skipped, deselected, partial, or
+   failed gate rejects.
+3. Recompute the canonical `policy_digest`, `complete_diff_digest`, `candidate_binding_digest`,
+   `boundary_manifest_digest`, ordered `boundary_result_digest`, `root_snapshot_digest`,
+   `forbidden_definition_digest`, every deterministic `python_runs.result_digest`, the derived
+   `artifact_name`, and the final `evidence_digest`. Revalidate all fixed channel metadata and all
+   run/candidate cross-bindings.
+4. Compare every recomputed scalar, ordered collection, ID, count, outcome observation, and digest
+   field-for-field with the wire. Any mismatch rejects; only after all comparisons pass may the
+   private verifier inject its non-serializable token and construct `VerifiedR07DrGateEvidenceV1`.
+
+The parent probe facade is stdlib-only and imports no `rquant` module. After preloading the facade's
+declared stdlib dependencies, the outer harness snapshots `tuple(os.environ.items())`, the ordered
+`(module_name, object_identity)` contents of `sys.modules`, and `tuple(sys.path)` immediately before
+facade import and before each probe; all three snapshots must be exactly equal after import and after
+every successful or failed probe. The child environment starts from `{}` and is exactly the
+following mapping, where `candidate_root` is the absolute read-only root materialized from the
+wire's Git tree and `temp_root` is a fresh canonical absolute directory:
+
+```text
+LANG=C
+LC_ALL=C
+PYTHONUTF8=1
+PYTHONIOENCODING=utf-8
+PYTHONPATH=<candidate_root>
+PYTHONNOUSERSITE=1
+PYTHONDONTWRITEBYTECODE=1
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
+PYTEST_ADDOPTS=
+HOME=<temp_root>/home
+TMPDIR=<temp_root>/tmp
+TMP=<temp_root>/tmp
+TEMP=<temp_root>/tmp
+DATA_DIR=<temp_root>/data
+PARQUET_DIR=<temp_root>/parquet
+LOG_DIR=<temp_root>/logs
+DUCKDB_PATH=<temp_root>/data/probe.duckdb
+DUCKDB_READONLY_PATH=<temp_root>/data/probe-ro.duckdb
+RQUANT_DISABLE_DOTENV=1
+TUSHARE_TOKEN_MAIN=00000000000000000000000000000000
+NOTIFY_ENABLED=false
+```
+
+`PATH` and every parent locale, Python, pytest, loader, secret, cloud credential, and production
+`RQUANT_*` value are absent. The child is launched with the canonical absolute path obtained from
+`Path(sys.executable).resolve(strict=True)`, so command lookup never needs parent `PATH`. If a future
+platform requires another loader field, its name and either literal value or absolute read-only
+path derived solely from that resolved interpreter must be added by a reviewed schema revision;
+copying a parent value or falling back to copy-plus-blacklist is forbidden.
+
+R07-01 red tests construct a self-consistent fake wire, tamper each deterministic summary and Git
+binding independently, dirty the caller working tree, and attempt both public entrypoints; none may
+produce verified authority, while an exact gate-to-wire-to-parse-to-verify round-trip must pass
+through the one private verifier. R07-02 red tests seed unknown secrets, cloud credentials,
+production `RQUANT_*`, `PATH`, locale, Python, and pytest sentinels in the parent, then assert the
+child sees the exact mapping above, the absolute resolved interpreter is invoked, and parent
+`os.environ`, `sys.modules`, and `sys.path` remain byte-for-byte/identity-for-identity unchanged on
+import, success, and failure. Tranche B accepts only the verified type; Q1/Q2, the trusted CI
+channel, production APIs/writers, and Phase B scope remain unchanged.
 
 The artifact name is exactly `r07-dr-gate-<candidate_commit_sha>`, its internal JSON path is exactly
 `r07-dr-gate/evidence-v1.json`, and GitHub retention is 90 days. The deployment downloader accepts
