@@ -1221,8 +1221,7 @@ def route_runner_signals(
         routed_at=routed_at,
         limit=limit,
     )
-    cursors.bind(bus)
-    observed_cursor = bus.route_cursor(request.source_id)
+    observed_cursor = bus._route_cursor_snapshot(request.source_id)
     batch = RunnerSignalBatch.model_validate(
         source.read_batch(
             after_sequence=observed_cursor.last_sequence,
@@ -1243,6 +1242,11 @@ def route_runner_signals(
             record.signal,
             operation="route_runner_signals",
         )
+    cursors.bind(bus)
+    confirmed_cursor = bus.route_cursor(request.source_id)
+    if confirmed_cursor.last_sequence != observed_cursor.last_sequence:
+        raise SignalRouteConflictError("router cursor changed during source batch read")
+    observed_cursor = confirmed_cursor
     cursor = bus.bind_route_source(
         descriptor,
         routing_policy_fingerprint=cursors.routing_policy_fingerprint,

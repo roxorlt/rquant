@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Annotated, Self
 
 from pydantic import Field, StringConstraints, field_validator, model_validator
@@ -419,6 +420,32 @@ class SignalBusStore:
             connection.close()
             raise
         return connection
+
+    @contextmanager
+    def _read_snapshot(self) -> Iterator[sqlite3.Connection]:
+        with TemporaryDirectory(prefix="rquant-signal-bus-read-") as directory:
+            snapshot_path = Path(directory) / self.path.name
+            for suffix in ("", "-wal"):
+                source = self.path.with_name(f"{self.path.name}{suffix}")
+                try:
+                    payload = source.read_bytes()
+                except FileNotFoundError:
+                    if not suffix:
+                        raise
+                    continue
+                snapshot_path.with_name(f"{snapshot_path.name}{suffix}").write_bytes(payload)
+            connection = sqlite3.connect(
+                snapshot_path,
+                timeout=self.busy_timeout_ms / 1_000,
+                isolation_level=None,
+            )
+            connection.row_factory = sqlite3.Row
+            try:
+                connection.execute(f"PRAGMA busy_timeout = {self.busy_timeout_ms}")
+                connection.execute("PRAGMA query_only = ON")
+                yield connection
+            finally:
+                connection.close()
 
     @contextmanager
     def _write_transaction(self) -> Iterator[sqlite3.Connection]:
@@ -971,6 +998,10 @@ class SignalBusStore:
         unique_targets = canonical_delivery_targets(targets)
         if not unique_targets:
             return ()
+        self._preflight_stored_legacy_signal(
+            signal_id,
+            operation="SignalBusStore.route",
+        )
 
         with self._write_transaction() as connection:
             frozen = connection.execute(
@@ -998,6 +1029,26 @@ class SignalBusStore:
             if changed:
                 self._before_commit(connection)
             return tuple(self._outbox_from_row(row) for row in rows)
+
+    def _preflight_stored_legacy_signal(self, signal_id: str, *, operation: str) -> None:
+        with self._read_snapshot() as connection:
+            row = connection.execute(
+                """
+                SELECT signal_id, payload_hash, payload_json,
+                       length(CAST(payload_json AS BLOB)) AS payload_size
+                FROM signal_envelope WHERE signal_id = ?
+                """,
+                (signal_id,),
+            ).fetchone()
+        if row is None:
+            return
+        signal = parse_stored_signal(
+            signal_id=str(row["signal_id"]),
+            payload_hash=str(row["payload_hash"]),
+            payload_json=str(row["payload_json"]),
+            payload_size=int(row["payload_size"]),
+        )
+        require_legacy_signal_write(signal, operation=operation)
 
     def _route_in_transaction(
         self,
@@ -1194,6 +1245,19 @@ class SignalBusStore:
         if not normalized:
             raise ValueError("source_id must not be empty")
         with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM signal_route_source WHERE source_id = ?",
+                (normalized,),
+            ).fetchone()
+        if row is None:
+            return SignalRouteCursor(source_id=normalized, last_sequence=0)
+        return self._route_cursor_from_row(row)
+
+    def _route_cursor_snapshot(self, source_id: str) -> SignalRouteCursor:
+        normalized = source_id.strip()
+        if not normalized:
+            raise ValueError("source_id must not be empty")
+        with self._read_snapshot() as connection:
             row = connection.execute(
                 "SELECT * FROM signal_route_source WHERE source_id = ?",
                 (normalized,),

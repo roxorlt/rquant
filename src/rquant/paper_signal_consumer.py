@@ -28,6 +28,7 @@ from rquant.signal_bus import (
     SignalBusSourceDescriptor,
     SignalBusSourceSequenceError,
     parse_stored_signal,
+    require_legacy_signal_write,
 )
 from rquant.signal_contracts import SignalEnvelopeFamily
 
@@ -564,6 +565,11 @@ def consume_signal_bus_to_paper(
     except SignalBusSourceSequenceError as error:
         raise PaperSignalConsumerSourceError(str(error)) from error
     verified_records = tuple(state._verified_record_signal(record) for record in records)
+    for signal in verified_records:
+        require_legacy_signal_write(
+            signal,
+            operation="consume_signal_bus_to_paper",
+        )
     starting_cursor = state.observe_source(descriptor, observed_at=observed)
 
     delegated_count = 0

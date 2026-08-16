@@ -751,6 +751,17 @@ def _validate_result_owner(
         raise ServingSourceAuthorityIntegrityError(
             "result payload_kind does not match publisher owner"
         )
+    if result.dataset_id == "signals" and result.payload.payload_kind == "signal_delivery":
+        from rquant.runtime_serving_snapshot import SignalDeliveryReadPayload
+        from rquant.signal_bus import require_legacy_signal_write
+
+        if not isinstance(result.payload, SignalDeliveryReadPayload):
+            raise TypeError("signals authority requires a SignalDeliveryReadPayload")
+        for record in result.payload.signals:
+            require_legacy_signal_write(
+                record.signal,
+                operation="ServingSourceAuthorityPublisher.publish",
+            )
 
 
 def _validate_pointer_owner(

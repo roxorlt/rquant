@@ -48,6 +48,7 @@ from rquant.runtime_shadow_validation import (
     ShadowSourceCompletionReceipt,
     shadow_completion_receipt_body_sha256,
 )
+from rquant.signal_bus import LegacySignalWriteActivationError, require_legacy_signal_write
 from rquant.signal_contracts import (
     SignalAction,
     SignalEnvelope,
@@ -72,6 +73,7 @@ _CANDIDATE_METADATA_COLUMNS = (
     "candidate_generation_sha256",
     "candidate_snapshot_schema_version",
 )
+_LEGACY_SIGNAL_ENVELOPE_CONSTRUCTOR = SignalEnvelope
 _CANDIDATE_STATE_PRE_HIGH_WATERMARK_SCHEMA = (
     (0, "occurrence_id", "TEXT", 1, 1),
     (1, "candidate_id", "TEXT", 1, 0),
@@ -1775,6 +1777,11 @@ class StrategyRunnerStore:
         observed_at: datetime,
         evaluator: StrategyEvaluator,
     ) -> StrategyBatchResult:
+        if SignalEnvelope is not _LEGACY_SIGNAL_ENVELOPE_CONSTRUCTOR:
+            raise LegacySignalWriteActivationError(
+                "StrategyRunnerStore.process_batch is legacy-only in this reader-only release; "
+                "current-family writes are not activated"
+            )
         observed_at = normalize_aware_utc(observed_at)
         if source_receipt is not None:
             if not isinstance(source_receipt, StrategySourceBatchReceipt):
@@ -1986,21 +1993,24 @@ class StrategyRunnerStore:
                                     else {"lifecycle_feature_fingerprint": lifecycle_fingerprint}
                                 ),
                             }
-                            signal = SignalEnvelope(
-                                schema_version=1,
-                                strategy_id=self.spec.strategy_id,
-                                strategy_version=str(self.spec.version),
-                                parameter_fingerprint=self.spec.parameter_fingerprint,
-                                dataset_snapshot_id=dataset_snapshot_id,
-                                feature_snapshot_id=envelope.content_hash,
-                                event_time=envelope.event_time,
-                                available_at=observed_at,
-                                candidate_id=candidate_id,
-                                action=decision.action,
-                                reason_codes=decision.reason_codes,
-                                evidence=evidence,
-                                expires_at=observed_at + decision.expires_after,  # type: ignore[operator]
-                                producer_commit=self.spec.producer_commit,
+                            signal = require_legacy_signal_write(
+                                SignalEnvelope(
+                                    schema_version=1,
+                                    strategy_id=self.spec.strategy_id,
+                                    strategy_version=str(self.spec.version),
+                                    parameter_fingerprint=self.spec.parameter_fingerprint,
+                                    dataset_snapshot_id=dataset_snapshot_id,
+                                    feature_snapshot_id=envelope.content_hash,
+                                    event_time=envelope.event_time,
+                                    available_at=observed_at,
+                                    candidate_id=candidate_id,
+                                    action=decision.action,
+                                    reason_codes=decision.reason_codes,
+                                    evidence=evidence,
+                                    expires_at=observed_at + decision.expires_after,  # type: ignore[operator]
+                                    producer_commit=self.spec.producer_commit,
+                                ),
+                                operation="StrategyRunnerStore.process_batch",
                             )
                             signal_payload = _json_payload(signal)
                             signal_index_values = _signal_index_values(signal)

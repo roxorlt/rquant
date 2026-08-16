@@ -33,7 +33,7 @@ from rquant.runtime_contracts import (
     canonical_sha256,
     normalize_aware_utc,
 )
-from rquant.signal_bus import SignalBusStore
+from rquant.signal_bus import SignalBusStore, require_legacy_signal_write
 from rquant.signal_contracts import SignalAction, SignalEnvelope
 from rquant.storage.duckdb import DuckDBStore
 
@@ -140,32 +140,35 @@ class DailySummaryStage:
         event_time: datetime | None = None,
     ) -> SignalEnvelope:
         now = normalize_aware_utc(event_time) if event_time is not None else self._now()
-        return SignalEnvelope(
-            schema_version=1,
-            strategy_id="daily-close-summary",
-            strategy_version=self._strategy_version,
-            parameter_fingerprint=canonical_sha256(
-                {
-                    "contract": "daily-summary-parameters/v1",
-                    "strategy_version": self._strategy_version,
-                }
+        return require_legacy_signal_write(
+            SignalEnvelope(
+                schema_version=1,
+                strategy_id="daily-close-summary",
+                strategy_version=self._strategy_version,
+                parameter_fingerprint=canonical_sha256(
+                    {
+                        "contract": "daily-summary-parameters/v1",
+                        "strategy_version": self._strategy_version,
+                    }
+                ),
+                dataset_snapshot_id=canonical_generation_id,
+                feature_snapshot_id=canonical_content_hash,
+                event_time=now,
+                available_at=now,
+                candidate_id=f"daily-summary:{trade_date.isoformat()}",
+                action=SignalAction.WATCH,
+                reason_codes=("daily_summary",),
+                evidence={
+                    "canonical_receipt_id": canonical_receipt_id,
+                    "trade_date": trade_date.isoformat(),
+                    "screen_hits": dict(sorted(screen_hits.items())),
+                    "pool2_active_count": pool2_active_count,
+                    "errors": list(sorted(errors)),
+                },
+                expires_at=now + self._signal_ttl,
+                producer_commit=self._producer_commit,
             ),
-            dataset_snapshot_id=canonical_generation_id,
-            feature_snapshot_id=canonical_content_hash,
-            event_time=now,
-            available_at=now,
-            candidate_id=f"daily-summary:{trade_date.isoformat()}",
-            action=SignalAction.WATCH,
-            reason_codes=("daily_summary",),
-            evidence={
-                "canonical_receipt_id": canonical_receipt_id,
-                "trade_date": trade_date.isoformat(),
-                "screen_hits": dict(sorted(screen_hits.items())),
-                "pool2_active_count": pool2_active_count,
-                "errors": list(sorted(errors)),
-            },
-            expires_at=now + self._signal_ttl,
-            producer_commit=self._producer_commit,
+            operation="DailySummaryStage.build_signal",
         )
 
     def run(
@@ -265,30 +268,33 @@ class DailySummaryStage:
         now: datetime,
     ) -> Iterator[SignalEnvelope]:
         for error in sorted(errors):
-            yield SignalEnvelope(
-                schema_version=1,
-                strategy_id="daily-close-error",
-                strategy_version=self._strategy_version,
-                parameter_fingerprint=canonical_sha256(
-                    {
-                        "contract": "daily-error-parameters/v1",
-                        "strategy_version": self._strategy_version,
-                    }
+            yield require_legacy_signal_write(
+                SignalEnvelope(
+                    schema_version=1,
+                    strategy_id="daily-close-error",
+                    strategy_version=self._strategy_version,
+                    parameter_fingerprint=canonical_sha256(
+                        {
+                            "contract": "daily-error-parameters/v1",
+                            "strategy_version": self._strategy_version,
+                        }
+                    ),
+                    dataset_snapshot_id=canonical.generation_id,
+                    feature_snapshot_id=canonical.db_content_sha256,
+                    event_time=now,
+                    available_at=now,
+                    candidate_id=f"daily-error:{canonical.trade_date.isoformat()}:{error}",
+                    action=SignalAction.WATCH,
+                    reason_codes=("daily_stage_error",),
+                    evidence={
+                        "canonical_receipt_id": canonical.receipt_id,
+                        "trade_date": canonical.trade_date.isoformat(),
+                        "component": error,
+                    },
+                    expires_at=now + self._signal_ttl,
+                    producer_commit=self._producer_commit,
                 ),
-                dataset_snapshot_id=canonical.generation_id,
-                feature_snapshot_id=canonical.db_content_sha256,
-                event_time=now,
-                available_at=now,
-                candidate_id=f"daily-error:{canonical.trade_date.isoformat()}:{error}",
-                action=SignalAction.WATCH,
-                reason_codes=("daily_stage_error",),
-                evidence={
-                    "canonical_receipt_id": canonical.receipt_id,
-                    "trade_date": canonical.trade_date.isoformat(),
-                    "component": error,
-                },
-                expires_at=now + self._signal_ttl,
-                producer_commit=self._producer_commit,
+                operation="DailySummaryStage._error_signals",
             )
 
     def _assert_artifacts(

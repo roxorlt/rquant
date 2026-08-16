@@ -15,7 +15,15 @@ from pathlib import Path
 from threading import RLock
 from typing import Self, TypeAlias
 
-from pydantic import Field, StrictInt, StrictStr, TypeAdapter, field_validator, model_validator
+from pydantic import (
+    ConfigDict,
+    Field,
+    StrictInt,
+    StrictStr,
+    TypeAdapter,
+    field_validator,
+    model_validator,
+)
 
 from rquant.runtime_contracts import AwareUtcDatetime, RuntimeContractModel, normalize_aware_utc
 from rquant.signal_bus import (
@@ -56,6 +64,8 @@ def _require_exact_instance(value: object, expected: type[object], *, field: str
 
 class CurrentSignalBusRoutedRecord(RuntimeContractModel):
     """Strict future routed record, available only to the Phase-A decoder."""
+
+    model_config = ConfigDict(str_strip_whitespace=False)
 
     global_sequence: StrictInt = Field(ge=1)
     signal_id: StrictStr = Field(pattern=_SHA256_PATTERN)
@@ -102,11 +112,13 @@ class CurrentSignalBusRoutedRecord(RuntimeContractModel):
             field="receipt",
         )  # type: ignore[return-value]
 
-    @field_validator("received_at")
+    @field_validator("received_at", mode="before")
     @classmethod
     def validate_utc_received_at(cls, value: datetime) -> datetime:
         if type(value) is not datetime:
             raise TypeError("received_at requires an exact datetime object")
+        if value.tzinfo is None or value.utcoffset() != UTC.utcoffset(value):
+            raise ValueError("received_at must be UTC")
         return normalize_aware_utc(value)
 
     @model_validator(mode="after")
@@ -124,9 +136,11 @@ class CurrentSignalBusRoutedRecord(RuntimeContractModel):
 class CurrentSignalRouteSpoolRecord(RuntimeContractModel):
     """Strict future v3 outer record; deliberately has no publication constructor."""
 
-    schema_version: StrictInt = Field(default=_CURRENT_SCHEMA_VERSION)
+    model_config = ConfigDict(str_strip_whitespace=False)
+
+    schema_version: StrictInt
     global_sequence: StrictInt = Field(ge=1)
-    previous_record_hash: StrictStr | None = Field(default=None, pattern=_SHA256_PATTERN)
+    previous_record_hash: StrictStr | None = Field(pattern=_SHA256_PATTERN)
     envelope_hash: StrictStr = Field(pattern=_SHA256_PATTERN)
     routed_record_hash: StrictStr = Field(pattern=_SHA256_PATTERN)
     record_hash: StrictStr = Field(pattern=_SHA256_PATTERN)
@@ -528,14 +542,16 @@ def current_signal_bus_routed_record_json_bytes(record: CurrentSignalBusRoutedRe
     """Return the exact R preimage bytes for a decoded current routed record."""
 
     _require_exact_instance(record, CurrentSignalBusRoutedRecord, field="record")
-    return _current_bytes(record)
+    validated = CurrentSignalBusRoutedRecord.model_validate(record)
+    return _current_bytes(validated)
 
 
 def current_signal_route_spool_record_json_bytes(record: CurrentSignalRouteSpoolRecord) -> bytes:
     """Return the exact durable v3 bytes for a decoded current outer record."""
 
     _require_exact_instance(record, CurrentSignalRouteSpoolRecord, field="record")
-    return _current_bytes(record)
+    validated = CurrentSignalRouteSpoolRecord.model_validate(record)
+    return _current_bytes(validated)
 
 
 def _decode_current_routed_record(value: object) -> CurrentSignalBusRoutedRecord:

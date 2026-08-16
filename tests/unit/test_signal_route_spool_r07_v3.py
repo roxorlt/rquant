@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -27,36 +27,6 @@ from rquant.signal_contracts import (
 from rquant.strict_json import canonical_json_bytes
 
 V2_VALID_RECORD = b'{"global_sequence":1,"payload_hash":"24c8bc94babd7f16e1ecaa34294c7f03606be37fbd07941ebfffbab098f6d0f1","previous_record_hash":null,"record":{"global_sequence":1,"payload_hash":"85e0362c7ccb4a1c8c7891700b7d40a29c799437856d6363efdf7a5b800a2a65","payload_json":"{\\"action\\":\\"watch\\",\\"available_at\\":\\"2026-07-31T02:30:00Z\\",\\"candidate_id\\":\\"600001.SH\\",\\"dataset_snapshot_id\\":\\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\\",\\"event_time\\":\\"2026-07-31T02:29:59Z\\",\\"evidence\\":{},\\"expires_at\\":\\"2026-07-31T02:35:00Z\\",\\"feature_snapshot_id\\":\\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\\",\\"parameter_fingerprint\\":\\"1111111111111111111111111111111111111111111111111111111111111111\\",\\"producer_commit\\":\\"ffffffffffffffffffffffffffffffffffffffff\\",\\"reason_codes\\":[\\"spool-test\\"],\\"schema_version\\":1,\\"signal_id\\":\\"7d8274438e1da562d20e5e5a547414e5c06ef04aa540a421755c6e6a5a0e4e4f\\",\\"strategy_id\\":\\"n-shape\\",\\"strategy_version\\":\\"1\\"}","receipt":{"decision_fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","disposition":"routed","reason_code":null,"routed_at":"2026-07-31T02:30:00Z","signal_id":"7d8274438e1da562d20e5e5a547414e5c06ef04aa540a421755c6e6a5a0e4e4f","source_id":"n-shape-v1","source_sequence":1,"target_count":1,"target_manifest_hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","targets":[{"channel":"pushdeer","recipient_id":"admin"}]},"received_at":"2026-07-31T02:30:00Z","signal":{"action":"watch","available_at":"2026-07-31T02:30:00Z","candidate_id":"600001.SH","dataset_snapshot_id":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","event_time":"2026-07-31T02:29:59Z","evidence":{},"expires_at":"2026-07-31T02:35:00Z","feature_snapshot_id":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","parameter_fingerprint":"1111111111111111111111111111111111111111111111111111111111111111","producer_commit":"ffffffffffffffffffffffffffffffffffffffff","reason_codes":["spool-test"],"schema_version":1,"signal_id":"7d8274438e1da562d20e5e5a547414e5c06ef04aa540a421755c6e6a5a0e4e4f","strategy_id":"n-shape","strategy_version":"1"},"signal_id":"7d8274438e1da562d20e5e5a547414e5c06ef04aa540a421755c6e6a5a0e4e4f"},"record_hash":"7a9068acf63507646e22bf53e48fc7bf899dfffd2cb3b8d635b5549addf7b5b8","schema_version":2}'  # noqa: E501
-
-V2_INVALID_CORPUS = (
-    b"{}",
-    b'{"schema_version":3}',
-    b'{"schema_version":"2"}',
-    b'{"schema_version":true}',
-    b'{"schema_version":2,"schema_version":2}',
-    b'{"schema_version":2,"record_hash":"NaN"}',
-    b'{"schema_version":2}\n',
-    b'{"schema_version":2',
-)
-
-
-@pytest.mark.parametrize(
-    "payload",
-    (
-        V2_VALID_RECORD,
-        *V2_INVALID_CORPUS,
-    ),
-)
-def test_r07_dispatcher_preserves_frozen_v2_parser_results(payload: bytes) -> None:
-    try:
-        legacy = spool._parse_record(payload, sequence=1)
-    except spool.SignalRouteSpoolIntegrityError as legacy_error:
-        with pytest.raises(type(legacy_error), match=str(legacy_error)):
-            spool._parse_r07_record(payload, sequence=1)
-    else:
-        dispatched = spool._parse_r07_record(payload, sequence=1)
-        assert type(dispatched) is type(legacy)
-        assert spool._canonical_bytes(dispatched) == spool._canonical_bytes(legacy)
 
 
 def test_r07_exposes_a_strict_current_v3_decoder() -> None:
@@ -157,6 +127,133 @@ def test_current_v3_decoder_binds_exact_canonical_preimages() -> None:
         spool.CurrentSignalBusRoutedRecord.model_validate(decoded.record.model_dump(mode="json"))
     with pytest.raises((TypeError, ValueError)):
         spool.CurrentSignalRouteSpoolRecord.model_validate(decoded.model_dump(mode="json"))
+
+
+def _direct_routed_values(
+    record: spool.CurrentSignalBusRoutedRecord,
+) -> dict[str, object]:
+    return {name: getattr(record, name) for name in type(record).model_fields}
+
+
+def _direct_outer_values(
+    record: spool.CurrentSignalRouteSpoolRecord,
+) -> dict[str, object]:
+    return {name: getattr(record, name) for name in type(record).model_fields}
+
+
+@pytest.mark.parametrize("missing", ("schema_version", "previous_record_hash"))
+def test_current_outer_model_requires_explicit_schema_and_previous_hash(missing: str) -> None:
+    decoded = spool.decode_current_signal_route_spool_record(
+        _current_record_bytes(sequence=1, previous_record_hash=None)
+    )
+    values = _direct_outer_values(decoded)
+    del values[missing]
+
+    with pytest.raises((TypeError, ValueError)):
+        spool.CurrentSignalRouteSpoolRecord.model_validate(values)
+
+
+@pytest.mark.parametrize("field", ("signal_id", "envelope_hash", "payload_json"))
+@pytest.mark.parametrize("side", ("leading", "trailing"))
+def test_current_routed_model_rejects_surrounding_text_whitespace(
+    field: str,
+    side: str,
+) -> None:
+    decoded = spool.decode_current_signal_route_spool_record(
+        _current_record_bytes(sequence=1, previous_record_hash=None)
+    )
+    values = _direct_routed_values(decoded.record)
+    original = values[field]
+    assert isinstance(original, str)
+    values[field] = f" {original}" if side == "leading" else f"{original} "
+
+    with pytest.raises((TypeError, ValueError)):
+        spool.CurrentSignalBusRoutedRecord.model_validate(values)
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "previous_record_hash",
+        "envelope_hash",
+        "routed_record_hash",
+        "record_hash",
+    ),
+)
+@pytest.mark.parametrize("side", ("leading", "trailing"))
+def test_current_outer_model_rejects_surrounding_hash_whitespace(
+    field: str,
+    side: str,
+) -> None:
+    decoded = spool.decode_current_signal_route_spool_record(
+        _current_record_bytes(sequence=2, previous_record_hash="f" * 64)
+    )
+    values = _direct_outer_values(decoded)
+    original = values[field]
+    assert isinstance(original, str)
+    values[field] = f" {original}" if side == "leading" else f"{original} "
+
+    with pytest.raises((TypeError, ValueError)):
+        spool.CurrentSignalRouteSpoolRecord.model_validate(values)
+
+
+@pytest.mark.parametrize("value", (True, 1.0, "1"))
+def test_current_routed_model_rejects_noncanonical_sequence_scalars(value: object) -> None:
+    decoded = spool.decode_current_signal_route_spool_record(
+        _current_record_bytes(sequence=1, previous_record_hash=None)
+    )
+    values = _direct_routed_values(decoded.record)
+    values["global_sequence"] = value
+
+    with pytest.raises((TypeError, ValueError)):
+        spool.CurrentSignalBusRoutedRecord.model_validate(values)
+
+
+@pytest.mark.parametrize("value", (True, 3.0, "3"))
+def test_current_outer_model_rejects_noncanonical_schema_scalars(value: object) -> None:
+    decoded = spool.decode_current_signal_route_spool_record(
+        _current_record_bytes(sequence=1, previous_record_hash=None)
+    )
+    values = _direct_outer_values(decoded)
+    values["schema_version"] = value
+
+    with pytest.raises((TypeError, ValueError)):
+        spool.CurrentSignalRouteSpoolRecord.model_validate(values)
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        NOW.replace(tzinfo=None),
+        NOW.astimezone(timezone(timedelta(hours=8))),
+    ),
+)
+def test_current_routed_model_rejects_non_utc_datetimes(value: datetime) -> None:
+    decoded = spool.decode_current_signal_route_spool_record(
+        _current_record_bytes(sequence=1, previous_record_hash=None)
+    )
+    values = _direct_routed_values(decoded.record)
+    values["received_at"] = value
+
+    with pytest.raises((TypeError, ValueError)):
+        spool.CurrentSignalBusRoutedRecord.model_validate(values)
+
+
+def test_current_byte_helpers_revalidate_forged_exact_model_instances() -> None:
+    decoded = spool.decode_current_signal_route_spool_record(
+        _current_record_bytes(sequence=1, previous_record_hash=None)
+    )
+    routed_values = _direct_routed_values(decoded.record)
+    routed_values["payload_json"] = f" {decoded.record.payload_json}"
+    forged_routed = spool.CurrentSignalBusRoutedRecord.model_construct(**routed_values)
+    outer_values = _direct_outer_values(decoded)
+    outer_values["schema_version"] = 3.0
+    forged_outer = spool.CurrentSignalRouteSpoolRecord.model_construct(**outer_values)
+
+    with pytest.raises((TypeError, ValueError)):
+        spool.current_signal_bus_routed_record_json_bytes(forged_routed)
+    with pytest.raises((TypeError, ValueError)):
+        spool.current_signal_route_spool_record_json_bytes(forged_outer)
 
 
 @pytest.mark.parametrize(

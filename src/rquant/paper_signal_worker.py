@@ -34,8 +34,9 @@ from rquant.runtime_contracts import (
     canonical_sha256,
     normalize_aware_utc,
 )
-from rquant.signal_bus import parse_stored_signal
+from rquant.signal_bus import parse_stored_signal, require_legacy_signal_write
 from rquant.signal_contracts import (
+    CurrentSignalEnvelope,
     SignalAction,
     SignalEnvelope,
     SignalEnvelopeFamily,
@@ -536,6 +537,11 @@ class PaperSignalQueueStore:
             value is not None for value in payload_values
         ):
             raise ValueError("stored paper signal payload metadata must be configured together")
+        if type(signal) is CurrentSignalEnvelope:
+            require_legacy_signal_write(
+                signal,
+                operation="PaperSignalQueueStore.ingest",
+            )
         if payload_json is None:
             if type(signal) is not SignalEnvelope:
                 raise TypeError("paper queue direct ingestion requires a SignalEnvelope")

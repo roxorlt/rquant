@@ -56,7 +56,9 @@ def test_producer_persists_idempotent_typed_delivery_outbox(tmp_path: Path) -> N
     assert bus.outbox_record(first.outbox_ids[0]) is not None
 
 
-def test_conflicting_signal_id_is_quarantined_without_borrowing_old_outbox(tmp_path: Path) -> None:
+def test_forged_signal_id_is_rejected_before_quarantine_or_outbox_mutation(
+    tmp_path: Path,
+) -> None:
     bus = SignalBusStore(tmp_path / "signal-bus.sqlite3")
     producer = DailyNotificationProducer(
         signal_bus=bus,
@@ -66,13 +68,13 @@ def test_conflicting_signal_id_is_quarantined_without_borrowing_old_outbox(tmp_p
     first = producer.emit(original, received_at=NOW)
     conflicting = original.model_copy(update={"candidate_id": "daily-summary:tampered"})
 
-    with pytest.raises(DailyNotificationProducerError, match="ingest rejected"):
+    with pytest.raises(ValueError, match="signal_id does not match"):
         producer.emit(conflicting, received_at=NOW + timedelta(seconds=1))
 
     assert bus.outbox_records(signal_id=original.signal_id) == (
         bus.outbox_record(first.outbox_ids[0]),
     )
-    assert len(bus.quarantines(original.signal_id)) == 1
+    assert bus.quarantines(original.signal_id) == ()
 
 
 def test_mismatched_accepted_receipt_cannot_route_another_signal() -> None:

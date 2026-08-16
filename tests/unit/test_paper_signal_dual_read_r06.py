@@ -23,7 +23,11 @@ from rquant.paper_signal_worker import (
     run_paper_signal_batch,
 )
 from rquant.runtime_paper_quote import PaperPitQuoteResolver
-from rquant.signal_bus import SignalBusSignalRecord, SignalBusSourceDescriptor
+from rquant.signal_bus import (
+    LegacySignalWriteActivationError,
+    SignalBusSignalRecord,
+    SignalBusSourceDescriptor,
+)
 from rquant.signal_contracts import (
     CurrentSignalEnvelope,
     SignalEnvelope,
@@ -211,8 +215,25 @@ def test_paper_consumer_copies_every_verified_signal_family_to_the_queue(
     expected_id: str,
     literal: bytes,
 ) -> None:
-    queue = _queue(tmp_path / "queue.sqlite3")
-    state = PaperSignalConsumerStateStore(tmp_path / "consumer.sqlite3")
+    queue_path = tmp_path / "queue.sqlite3"
+    state_path = tmp_path / "consumer.sqlite3"
+    queue = _queue(queue_path)
+    state = PaperSignalConsumerStateStore(state_path)
+
+    if expected_type is CurrentSignalEnvelope:
+        before_queue = _snapshot(queue_path)
+        before_state = _snapshot(state_path)
+        with pytest.raises(LegacySignalWriteActivationError, match="legacy-only"):
+            consume_signal_bus_to_paper(
+                _Source((_record(1, literal),)),  # type: ignore[arg-type]
+                queue,
+                state,
+                observed_at=NOW,
+                limit=1,
+            )
+        assert _snapshot(queue_path) == before_queue
+        assert _snapshot(state_path) == before_state
+        return
 
     summary = consume_signal_bus_to_paper(
         _Source((_record(1, literal),)),  # type: ignore[arg-type]
@@ -241,8 +262,23 @@ def test_queue_integrity_mismatch_stops_before_quote_or_paper_order_mutation(
     tamper: str,
 ) -> None:
     queue_path = tmp_path / "queue.sqlite3"
+    state_path = tmp_path / "consumer.sqlite3"
     queue = _queue(queue_path)
-    state = PaperSignalConsumerStateStore(tmp_path / "consumer.sqlite3")
+    state = PaperSignalConsumerStateStore(state_path)
+    if _expected_type is CurrentSignalEnvelope:
+        before_queue = _snapshot(queue_path)
+        before_state = _snapshot(state_path)
+        with pytest.raises(LegacySignalWriteActivationError, match="legacy-only"):
+            consume_signal_bus_to_paper(
+                _Source((_record(1, literal),)),  # type: ignore[arg-type]
+                queue,
+                state,
+                observed_at=NOW,
+                limit=1,
+            )
+        assert _snapshot(queue_path) == before_queue
+        assert _snapshot(state_path) == before_state
+        return
     consume_signal_bus_to_paper(
         _Source((_record(1, literal),)),  # type: ignore[arg-type]
         queue,

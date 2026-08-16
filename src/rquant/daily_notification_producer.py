@@ -9,8 +9,12 @@ from pydantic import Field, model_validator
 
 from rquant.delivery_contracts import DeliveryTarget, RouterDisposition, RouterReceipt
 from rquant.runtime_contracts import RuntimeContractModel, canonical_sha256, normalize_aware_utc
-from rquant.signal_bus import SignalBusStore, canonical_delivery_targets
-from rquant.signal_contracts import SignalAction, SignalEnvelope
+from rquant.signal_bus import (
+    SignalBusStore,
+    canonical_delivery_targets,
+    require_legacy_signal_write,
+)
+from rquant.signal_contracts import CurrentSignalEnvelope, SignalAction, SignalEnvelope
 
 
 class DailyNotificationOutboxReceipt(RuntimeContractModel):
@@ -57,32 +61,40 @@ def build_daily_error_signal(
         "error_type": error_type,
         "trade_date": trade_date.isoformat(),
     }
-    return SignalEnvelope(
-        schema_version=1,
-        strategy_id="daily-close-error",
-        strategy_version="daily-close-dag/v1",
-        parameter_fingerprint=canonical_sha256(
-            {
-                "contract": "daily-close-error-parameters/v1",
+    return require_legacy_signal_write(
+        SignalEnvelope(
+            schema_version=1,
+            strategy_id="daily-close-error",
+            strategy_version="daily-close-dag/v1",
+            parameter_fingerprint=canonical_sha256(
+                {
+                    "contract": "daily-close-error-parameters/v1",
+                    "component": normalized_component,
+                }
+            ),
+            dataset_snapshot_id=canonical_sha256(
+                {
+                    "contract": "daily-close-error-dataset/v1",
+                    "trade_date": trade_date.isoformat(),
+                }
+            ),
+            feature_snapshot_id=canonical_sha256(identity),
+            event_time=now,
+            available_at=now,
+            candidate_id=(
+                f"daily-error:{trade_date.isoformat()}:{normalized_component}:{error_type}"
+            ),
+            action=SignalAction.WATCH,
+            reason_codes=("daily_stage_error",),
+            evidence={
                 "component": normalized_component,
-            }
+                "error_type": error_type,
+                "trade_date": trade_date.isoformat(),
+            },
+            expires_at=now + ttl,
+            producer_commit=producer_commit,
         ),
-        dataset_snapshot_id=canonical_sha256(
-            {"contract": "daily-close-error-dataset/v1", "trade_date": trade_date.isoformat()}
-        ),
-        feature_snapshot_id=canonical_sha256(identity),
-        event_time=now,
-        available_at=now,
-        candidate_id=f"daily-error:{trade_date.isoformat()}:{normalized_component}:{error_type}",
-        action=SignalAction.WATCH,
-        reason_codes=("daily_stage_error",),
-        evidence={
-            "component": normalized_component,
-            "error_type": error_type,
-            "trade_date": trade_date.isoformat(),
-        },
-        expires_at=now + ttl,
-        producer_commit=producer_commit,
+        operation="build_daily_error_signal",
     )
 
 
@@ -104,6 +116,11 @@ class DailyNotificationProducer:
         *,
         received_at: datetime,
     ) -> DailyNotificationOutboxReceipt:
+        if type(signal) is CurrentSignalEnvelope:
+            require_legacy_signal_write(
+                signal,
+                operation="DailyNotificationProducer.emit",
+            )
         receipt = self._signal_bus.ingest(signal, received_at=received_at)
         if receipt.signal_id != signal.signal_id or receipt.disposition not in {
             RouterDisposition.ACCEPTED,
