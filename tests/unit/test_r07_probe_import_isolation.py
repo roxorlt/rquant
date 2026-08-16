@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 import sys
@@ -46,52 +45,7 @@ def test_probe_runner_disables_dotenv_before_any_rquant_import(
 ) -> None:
     policy_path = ROOT / "tests/fixtures/r07_differential_gate/policy-v1.json"
     probe_path = tmp_path / "probe"
-    code = f"""
-import importlib.util
-import json
-import os
-import sys
-from pathlib import Path
-
-facade_name = "tests.r07_differential_probe_runner"
-facade_spec = importlib.util.find_spec(facade_name)
-assert facade_spec is not None
-assert facade_spec.loader is not None
-runner = importlib.util.module_from_spec(facade_spec)
-before_environment = tuple(os.environ.items())
-before_path = tuple(sys.path)
-before_module_keys = frozenset(sys.modules)
-facade_spec.loader.exec_module(runner)
-assert tuple(os.environ.items()) == before_environment
-assert tuple(sys.path) == before_path
-assert frozenset(sys.modules) == before_module_keys
-before_modules = tuple((name, id(module)) for name, module in sys.modules.items())
-result = runner.run_boundary_probe_subprocess(
-    policy_path=Path({str(policy_path)!r}),
-    inventory_id="R07-B01",
-    tmp_path=Path({str(probe_path)!r}),
-    fail_on_dotenv_read=True,
-)
-assert tuple(os.environ.items()) == before_environment
-assert tuple(sys.path) == before_path
-assert tuple((name, id(module)) for name, module in sys.modules.items()) == before_modules
-assert result["inventory_id"] == "R07-B01"
-assert result["passed"] is True
-try:
-    runner.run_boundary_probe_subprocess(
-        policy_path=Path({str(policy_path)!r}),
-        inventory_id="R07-B99",
-        tmp_path=Path({str(probe_path)!r}),
-    )
-except AssertionError:
-    pass
-else:
-    raise AssertionError("invalid inventory must fail")
-assert tuple(os.environ.items()) == before_environment
-assert tuple(sys.path) == before_path
-assert tuple((name, id(module)) for name, module in sys.modules.items()) == before_modules
-print(json.dumps({{"status": "parent-unchanged-child-isolated"}}, sort_keys=True))
-"""
+    facade_path = ROOT / "tests/r07_differential_probe_runner.py"
     environment = {
         "PATH": os.environ.get("PATH", ""),
         "HOME": str(tmp_path / "home"),
@@ -110,13 +64,76 @@ print(json.dumps({{"status": "parent-unchanged-child-isolated"}}, sort_keys=True
         "NOTIFY_ENABLED": "false",
         "PUSHDEER_KEYS": "must-be-cleared-before-rquant-import",
     }
-    completed = subprocess.run(
-        [sys.executable, "-c", code],
-        cwd=tmp_path,
-        env=environment,
-        capture_output=True,
-        text=True,
-        check=False,
+
+    def run_contract(facade_prefix: bytes) -> subprocess.CompletedProcess[str]:
+        code = f"""
+import os
+import sys
+
+runtime_dependencies = {{"atexit", "json", "pathlib", "subprocess", "tempfile"}}
+assert runtime_dependencies.isdisjoint(sys.modules), sorted(
+    runtime_dependencies.intersection(sys.modules)
+)
+before_environment = tuple(os.environ.items())
+before_path = tuple(sys.path)
+before_modules = tuple((name, id(module)) for name, module in sys.modules.items())
+with open({str(facade_path)!r}, "rb") as facade_file:
+    facade_source = {facade_prefix!r} + facade_file.read()
+runner_namespace = {{
+    "__file__": {str(facade_path)!r},
+    "__name__": "tests.r07_differential_probe_runner",
+}}
+exec(compile(facade_source, {str(facade_path)!r}, "exec"), runner_namespace)
+
+def assert_parent_unchanged(phase):
+    assert tuple(os.environ.items()) == before_environment, phase + ": environment"
+    assert tuple(sys.path) == before_path, phase + ": path"
+    assert (
+        tuple((name, id(module)) for name, module in sys.modules.items())
+        == before_modules
+    ), phase + ": ordered module identities"
+
+assert_parent_unchanged("facade import")
+run_boundary_probe_subprocess = runner_namespace["run_boundary_probe_subprocess"]
+result = run_boundary_probe_subprocess(
+    policy_path={str(policy_path)!r},
+    inventory_id="R07-B01",
+    tmp_path={str(probe_path)!r},
+    fail_on_dotenv_read=True,
+)
+assert_parent_unchanged("B01 success")
+assert result["inventory_id"] == "R07-B01"
+assert result["passed"] is True
+try:
+    run_boundary_probe_subprocess(
+        policy_path={str(policy_path)!r},
+        inventory_id="R07-B99",
+        tmp_path={str(probe_path)!r},
     )
+except AssertionError:
+    pass
+else:
+    raise AssertionError("invalid inventory must fail")
+assert_parent_unchanged("B99 failure")
+print("parent-unchanged-child-isolated")
+"""
+        return subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=tmp_path,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    imported_dependency = run_contract(b"import json\n")
+    assert imported_dependency.returncode != 0
+    assert "facade import: ordered module identities" in imported_dependency.stderr
+
+    replaced_module = run_contract(b'import sys\nsys.modules["os"] = type(sys)("os")\n')
+    assert replaced_module.returncode != 0
+    assert "facade import: ordered module identities" in replaced_module.stderr
+
+    completed = run_contract(b"")
     assert completed.returncode == 0, completed.stdout + completed.stderr
-    assert json.loads(completed.stdout) == {"status": "parent-unchanged-child-isolated"}
+    assert completed.stdout.strip() == "parent-unchanged-child-isolated"
