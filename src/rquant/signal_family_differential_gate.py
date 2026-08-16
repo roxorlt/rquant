@@ -23,6 +23,7 @@ from pydantic import (
     StrictInt,
     StrictStr,
     ValidationError,
+    ValidationInfo,
     model_validator,
 )
 
@@ -32,11 +33,13 @@ BASELINE_COMMIT_SHA = "45d0b57c4c5cbab1700fa5e3c386c6756892a7d6"
 BASELINE_TREE_SHA = "4f67e67192855874e82baa13dc343a1d6939bd67"
 _SHA256 = r"^[0-9a-f]{64}$"
 _SHA1 = r"^[0-9a-f]{40}$"
+R07_CI_EVIDENCE_PRODUCER_IMPLEMENTED = False
+_EVIDENCE_VALIDATION_TOKEN = object()
 
-_VERSION_VARIANT_AST_FIELDS = {
-    "FunctionDef": frozenset({"type_params"}),
-    "AsyncFunctionDef": frozenset({"type_params"}),
-    "ClassDef": frozenset({"type_params"}),
+_EMPTY_VERSION_VARIANT_AST_FIELDS = {
+    "FunctionDef": ("type_params",),
+    "AsyncFunctionDef": ("type_params",),
+    "ClassDef": ("type_params",),
 }
 
 
@@ -44,12 +47,14 @@ def normalized_ast_dump(node: ast.AST) -> str:
     """Return an AST dump stable across the supported Python 3.11/3.12 parsers."""
     normalized = copy.deepcopy(node)
     for candidate in ast.walk(normalized):
-        ignored = _VERSION_VARIANT_AST_FIELDS.get(type(candidate).__name__, frozenset())
-        if ignored:
-            candidate._fields = tuple(field for field in candidate._fields if field not in ignored)
-            for field in ignored:
-                if hasattr(candidate, field):
-                    delattr(candidate, field)
+        for field in _EMPTY_VERSION_VARIANT_AST_FIELDS.get(type(candidate).__name__, ()):
+            if not hasattr(candidate, field):
+                continue
+            value = getattr(candidate, field)
+            if type(value) is not list or value:
+                continue
+            candidate._fields = tuple(item for item in candidate._fields if item != field)
+            delattr(candidate, field)
     return ast.dump(normalized, annotate_fields=True, include_attributes=False)
 
 
@@ -215,6 +220,27 @@ class PythonRunEvidenceV1(_StrictModelMixin, BaseModel):
         return self
 
 
+def _candidate_binding_digest_values(
+    *,
+    baseline_commit_sha: str,
+    baseline_tree_sha: str,
+    candidate_commit_sha: str,
+    candidate_tree_sha: str,
+    complete_diff_digest: str,
+) -> str:
+    return hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "baseline_commit_sha": baseline_commit_sha,
+                "baseline_tree_sha": baseline_tree_sha,
+                "candidate_commit_sha": candidate_commit_sha,
+                "candidate_tree_sha": candidate_tree_sha,
+                "complete_diff_digest": complete_diff_digest,
+            }
+        )
+    ).hexdigest()
+
+
 class R07DrGateEvidenceV1(_StrictModelMixin, BaseModel):
     schema_version: Literal[1]
     repository: Literal["roxorlt/rquant"]
@@ -230,6 +256,7 @@ class R07DrGateEvidenceV1(_StrictModelMixin, BaseModel):
     baseline_tree_sha: Literal[BASELINE_TREE_SHA]
     policy_digest: StrictStr = Field(pattern=_SHA256)
     complete_diff_digest: StrictStr = Field(pattern=_SHA256)
+    candidate_binding_digest: StrictStr = Field(pattern=_SHA256)
     boundary_manifest_digest: StrictStr = Field(pattern=_SHA256)
     boundary_result_digest: StrictStr = Field(pattern=_SHA256)
     root_snapshot_digest: StrictStr = Field(pattern=_SHA256)
@@ -242,7 +269,9 @@ class R07DrGateEvidenceV1(_StrictModelMixin, BaseModel):
     evidence_digest: StrictStr = Field(pattern=_SHA256)
 
     @model_validator(mode="after")
-    def validate_channel_and_bindings(self) -> Self:
+    def validate_channel_and_bindings(self, info: ValidationInfo) -> Self:
+        if not info.context or info.context.get("r07_evidence") is not (_EVIDENCE_VALIDATION_TOKEN):
+            raise ValueError("passed R07 evidence requires verified gate results")
         expected_jobs = ("r07-differential-gate-py311", "r07-differential-gate-py312")
         expected_minors = ("3.11", "3.12")
         for run, minor, job in zip(self.python_runs, expected_minors, expected_jobs, strict=True):
@@ -257,6 +286,15 @@ class R07DrGateEvidenceV1(_StrictModelMixin, BaseModel):
                 raise ValueError("Python run is not bound to the candidate pair")
         if self.artifact_name != f"r07-dr-gate-{self.candidate_commit_sha}":
             raise ValueError("artifact name is not bound to candidate commit")
+        expected_binding = _candidate_binding_digest_values(
+            baseline_commit_sha=self.baseline_commit_sha,
+            baseline_tree_sha=self.baseline_tree_sha,
+            candidate_commit_sha=self.candidate_commit_sha,
+            candidate_tree_sha=self.candidate_tree_sha,
+            complete_diff_digest=self.complete_diff_digest,
+        )
+        if self.candidate_binding_digest != expected_binding:
+            raise ValueError("candidate_binding_digest does not match candidate pair and diff")
         expected = _digest_without_field(self, "evidence_digest")
         if self.evidence_digest != expected:
             raise ValueError("evidence_digest does not match canonical evidence")
@@ -268,14 +306,83 @@ class R07DrGateEvidenceV1(_StrictModelMixin, BaseModel):
         decoded = strict_canonical_json_loads(raw)
         if not isinstance(decoded, dict):
             raise ValueError("R07 evidence must be a JSON object")
-        return cls.model_validate_json(raw)
+        return cls.model_validate_json(
+            raw,
+            context={"r07_evidence": _EVIDENCE_VALIDATION_TOKEN},
+        )
 
     @classmethod
-    def with_digest(cls, **values: Any) -> Self:
-        values["evidence_digest"] = "0" * 64
+    def from_gate_results(
+        cls,
+        *,
+        repo: Path,
+        policy: R07PolicyV1,
+        candidate_gate: CandidateGateResult,
+        boundary_results: tuple[BoundaryProbeResultV1, ...],
+        static_result: R07StaticGateResult,
+        python_runs: tuple[PythonRunEvidenceV1, PythonRunEvidenceV1],
+        workflow_run_id: int,
+        run_attempt: int,
+    ) -> Self:
+        if type(policy) is not R07PolicyV1:
+            raise ValueError("exact R07PolicyV1 is required")
+        validated_policy = R07PolicyV1.model_validate(policy.model_dump(mode="python"))
+        if validated_policy != policy:
+            raise ValueError("R07 policy failed canonical model validation")
+        if type(candidate_gate) is not CandidateGateResult or not candidate_gate.passed:
+            raise ValueError("passed CandidateGateResult is required")
+        recomputed_gate = verify_candidate_gate(
+            repo,
+            policy=policy,
+            candidate_commit=candidate_gate.candidate_commit_sha,
+            candidate_tree=candidate_gate.candidate_tree_sha,
+        )
+        if recomputed_gate != candidate_gate or not recomputed_gate.passed:
+            raise ValueError("CandidateGateResult does not match exact Git candidate")
+        if type(static_result) is not R07StaticGateResult or not static_result.passed:
+            raise ValueError("passed R07StaticGateResult is required")
+        recomputed_static = verify_r07_static_gate(
+            repo,
+            policy=policy,
+            candidate_commit=candidate_gate.candidate_commit_sha,
+            candidate_tree=candidate_gate.candidate_tree_sha,
+        )
+        if recomputed_static != static_result:
+            raise ValueError("static result does not match exact Git candidate")
+        boundary_result_digest = boundary_probe_results_digest(policy, boundary_results)
+        values: dict[str, Any] = {
+            "schema_version": 1,
+            "repository": "roxorlt/rquant",
+            "workflow_path": ".github/workflows/ci.yml",
+            "event_name": "push",
+            "ref": "refs/heads/main",
+            "producer_job_id": "r07-differential-gate-evidence",
+            "workflow_run_id": workflow_run_id,
+            "run_attempt": run_attempt,
+            "candidate_commit_sha": candidate_gate.candidate_commit_sha,
+            "candidate_tree_sha": candidate_gate.candidate_tree_sha,
+            "baseline_commit_sha": candidate_gate.baseline_commit_sha,
+            "baseline_tree_sha": candidate_gate.baseline_tree_sha,
+            "policy_digest": policy.policy_digest,
+            "complete_diff_digest": candidate_gate.diff_digest,
+            "candidate_binding_digest": candidate_gate.candidate_binding_digest,
+            "boundary_manifest_digest": policy.boundary_manifest_digest,
+            "boundary_result_digest": boundary_result_digest,
+            "root_snapshot_digest": static_result.root_snapshot_digest,
+            "forbidden_definition_digest": static_result.forbidden_definition_digest,
+            "python_runs": python_runs,
+            "artifact_name": f"r07-dr-gate-{candidate_gate.candidate_commit_sha}",
+            "artifact_json_path": "r07-dr-gate/evidence-v1.json",
+            "retention_days": 90,
+            "outcome": "passed",
+            "evidence_digest": "0" * 64,
+        }
         provisional = cls.model_construct(**values)
         values["evidence_digest"] = _digest_without_field(provisional, "evidence_digest")
-        return cls.model_validate(values)
+        return cls.model_validate(
+            values,
+            context={"r07_evidence": _EVIDENCE_VALIDATION_TOKEN},
+        )
 
 
 def _digest_without_field(model: Any, field: str) -> str:
@@ -885,17 +992,13 @@ def _candidate_binding_digest(
     baseline_tree: str,
     candidate_tree: str,
 ) -> str:
-    return hashlib.sha256(
-        canonical_json_bytes(
-            {
-                "baseline_commit_sha": complete.baseline_commit_sha,
-                "baseline_tree_sha": baseline_tree,
-                "candidate_commit_sha": complete.candidate_commit_sha,
-                "candidate_tree_sha": candidate_tree,
-                "complete_diff_digest": complete.digest,
-            }
-        )
-    ).hexdigest()
+    return _candidate_binding_digest_values(
+        baseline_commit_sha=complete.baseline_commit_sha,
+        baseline_tree_sha=baseline_tree,
+        candidate_commit_sha=complete.candidate_commit_sha,
+        candidate_tree_sha=candidate_tree,
+        complete_diff_digest=complete.digest,
+    )
 
 
 def _untracked_mode(path: Path) -> str:
@@ -1034,6 +1137,16 @@ def verify_candidate_gate(
 class StaticCheckResult:
     passed: bool
     reasons: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class R07StaticGateResult:
+    passed: bool
+    candidate_commit_sha: str
+    candidate_tree_sha: str
+    root_snapshot_digest: str
+    forbidden_definition_digest: str
+    checks: tuple[tuple[str, StaticCheckResult], ...]
 
 
 def fixture_manifest_digest(
@@ -1478,6 +1591,136 @@ def verify_forbidden_definitions(
         if found:
             reasons.append(f"{module_path}: {','.join(found)}")
     return StaticCheckResult(not reasons, tuple(reasons))
+
+
+def boundary_probe_results_digest(
+    policy: R07PolicyV1,
+    results: tuple[BoundaryProbeResultV1, ...],
+) -> str:
+    expected_probes = tuple(
+        probe for probe in policy.boundary_probes if probe.variant != "static_only"
+    )
+    if len(expected_probes) != 17 or len(results) != len(expected_probes):
+        raise ValueError("boundary results must be the complete B01..B17 set")
+    setups = {setup.setup_id: setup for setup in policy.probe_setups}
+    for expected, result in zip(expected_probes, results, strict=True):
+        if type(result) is not BoundaryProbeResultV1 or not result.passed:
+            raise ValueError(f"{expected.inventory_id}: passed real probe result is required")
+        if result.result_digest != _digest_without_field(result, "result_digest"):
+            raise ValueError(f"{expected.inventory_id}: probe result digest mismatch")
+        setup = setups[expected.setup_id]
+        expected_call_shape_digest = hashlib.sha256(
+            canonical_json_bytes(expected.call_shape.model_dump(mode="json"))
+        ).hexdigest()
+        expected_after_invocation = 0 if expected.expected_exception_phase == "consumption" else 1
+        bindings_match = (
+            result.probe_id == expected.probe_id
+            and result.inventory_id == expected.inventory_id
+            and result.setup_id == expected.setup_id
+            and result.setup_result_digest == setup.setup_result_digest
+            and result.call_shape_digest == expected_call_shape_digest
+            and result.exception_type == expected.expected_exception
+            and result.exception_phase == expected.expected_exception_phase
+            and result.sentinel_id == expected.sentinel_id
+            and result.sentinel_kind == expected.sentinel_kind
+            and result.sentinel_after_invocation == expected_after_invocation
+            and result.sentinel_after_consumption == 1
+            and result.reached_count == 1
+            and set(result.mutation_guard_counts) == set(expected.mutation_expectation.guard_ids)
+            and len(result.mutation_guard_counts) == len(expected.mutation_expectation.guard_ids)
+            and all(count == 0 for count in result.mutation_guard_counts.values())
+            and all(count >= 0 for count in result.setup_call_counts.values())
+            and result.yielded_count == expected.expected_yielded_count
+            and result.before_snapshot_digest == expected.before_snapshot_digest
+            and result.after_snapshot_digest == expected.after_snapshot_digest
+            and result.before_snapshot_digest == result.after_snapshot_digest
+        )
+        if not bindings_match:
+            raise ValueError(f"{expected.inventory_id}: probe result does not match policy")
+    return hashlib.sha256(
+        canonical_json_bytes([result.model_dump(mode="json") for result in results])
+    ).hexdigest()
+
+
+def verify_r07_static_gate(
+    repo: Path,
+    *,
+    policy: R07PolicyV1,
+    candidate_commit: str,
+    candidate_tree: str,
+) -> R07StaticGateResult:
+    resolved_commit = _resolved_commit(repo, candidate_commit)
+    resolved_tree = _resolved_tree(repo, resolved_commit)
+    if resolved_tree != candidate_tree:
+        raise ValueError("static gate candidate tree does not match candidate commit")
+    checks: list[tuple[str, StaticCheckResult]] = [
+        ("policy-completeness", verify_policy_completeness(policy))
+    ]
+    checks.extend(
+        (
+            f"root:{snapshot.qualname}",
+            verify_root_snapshot(repo, resolved_commit, snapshot),
+        )
+        for snapshot in policy.root_snapshots
+    )
+    checks.extend(
+        (
+            f"production:{declaration.module_path}:{declaration.symbol}",
+            verify_production_declaration(repo, resolved_commit, declaration),
+        )
+        for declaration in policy.production_declarations
+    )
+    checks.extend(
+        (
+            f"boundary:{probe.inventory_id}",
+            verify_boundary_probe_source(repo, resolved_commit, probe),
+        )
+        for probe in policy.boundary_probes
+    )
+    checks.extend(
+        (
+            (
+                "top-level-source-closure",
+                verify_top_level_source_closure(
+                    repo,
+                    resolved_commit,
+                    policy.source_file_snapshots,
+                ),
+            ),
+            (
+                "forbidden-definitions",
+                verify_forbidden_definitions(
+                    repo,
+                    resolved_commit,
+                    policy.forbidden_definition_universe,
+                ),
+            ),
+        )
+    )
+    root_snapshot_digest = hashlib.sha256(
+        canonical_json_bytes(
+            [snapshot.model_dump(mode="json") for snapshot in policy.root_snapshots]
+        )
+    ).hexdigest()
+    forbidden_definition_digest = hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "universe": policy.forbidden_definition_universe.model_dump(mode="json"),
+                "source_file_snapshots": [
+                    snapshot.model_dump(mode="json") for snapshot in policy.source_file_snapshots
+                ],
+            }
+        )
+    ).hexdigest()
+    frozen_checks = tuple(checks)
+    return R07StaticGateResult(
+        passed=all(result.passed for _, result in frozen_checks),
+        candidate_commit_sha=resolved_commit,
+        candidate_tree_sha=resolved_tree,
+        root_snapshot_digest=root_snapshot_digest,
+        forbidden_definition_digest=forbidden_definition_digest,
+        checks=frozen_checks,
+    )
 
 
 BOUNDARY_PROBES: tuple[BoundaryProbeV1, ...] = ()

@@ -10,7 +10,7 @@ import os
 import shutil
 import subprocess
 import sys
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pytest
@@ -20,9 +20,14 @@ from rquant.signal_family_differential_gate import (
     BASELINE_COMMIT_SHA,
     BASELINE_TREE_SHA,
     FORBIDDEN_DEFINITION_UNIVERSE,
+    R07_CI_EVIDENCE_PRODUCER_IMPLEMENTED,
     ROOT_SNAPSHOTS,
+    BoundaryProbeResultV1,
+    CandidateGateResult,
     PythonRunEvidenceV1,
     R07DrGateEvidenceV1,
+    R07PolicyV1,
+    R07StaticGateResult,
     canonical_evidence_json_bytes,
     collect_complete_git_diff,
     load_policy,
@@ -30,22 +35,30 @@ from rquant.signal_family_differential_gate import (
     verify_boundary_probe_source,
     verify_forbidden_definitions,
     verify_production_declaration,
+    verify_r07_static_gate,
     verify_root_snapshot,
 )
+from tests.r07_differential_probe_runner import run_boundary_probe_subprocess
 
 ROOT = Path(__file__).parents[2]
 POLICY_PATH = ROOT / "tests" / "fixtures" / "r07_differential_gate" / "policy-v1.json"
 
 
-def _run(minor: str, job_id: str) -> PythonRunEvidenceV1:
+def _run(
+    minor: str,
+    job_id: str,
+    *,
+    candidate_commit: str,
+    candidate_tree: str,
+) -> PythonRunEvidenceV1:
     return PythonRunEvidenceV1(
         python_minor=minor,
         job_id=job_id,
         job_run_id=101 if minor == "3.11" else 102,
         workflow_run_id=100,
         run_attempt=1,
-        candidate_commit_sha="a" * 40,
-        candidate_tree_sha="b" * 40,
+        candidate_commit_sha=candidate_commit,
+        candidate_tree_sha=candidate_tree,
         collected=7,
         passed=7,
         skipped=0,
@@ -55,55 +68,156 @@ def _run(minor: str, job_id: str) -> PythonRunEvidenceV1:
     )
 
 
-def _evidence() -> R07DrGateEvidenceV1:
-    return R07DrGateEvidenceV1.with_digest(
-        schema_version=1,
-        repository="roxorlt/rquant",
-        workflow_path=".github/workflows/ci.yml",
-        event_name="push",
-        ref="refs/heads/main",
-        producer_job_id="r07-differential-gate-evidence",
+@dataclass(frozen=True)
+class _EvidenceBundle:
+    evidence: R07DrGateEvidenceV1
+    policy: R07PolicyV1
+    candidate_gate: CandidateGateResult
+    static_result: R07StaticGateResult
+    boundary_results: tuple[BoundaryProbeResultV1, ...]
+    python_runs: tuple[PythonRunEvidenceV1, PythonRunEvidenceV1]
+
+
+@pytest.fixture(scope="module")
+def evidence_bundle(tmp_path_factory: pytest.TempPathFactory) -> _EvidenceBundle:
+    policy = load_policy(POLICY_PATH)
+    candidate = _head()
+    candidate_tree = subprocess.run(
+        ["git", "-C", str(ROOT), "rev-parse", f"{candidate}^{{tree}}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    candidate_gate = differential_gate.verify_candidate_gate(
+        ROOT,
+        policy=policy,
+        candidate_commit=candidate,
+        candidate_tree=candidate_tree,
+    )
+    assert candidate_gate.passed
+    static_result = verify_r07_static_gate(
+        ROOT,
+        policy=policy,
+        candidate_commit=candidate,
+        candidate_tree=candidate_tree,
+    )
+    assert static_result.passed
+    probe_root = tmp_path_factory.mktemp("r07-evidence-probes")
+    boundary_results = tuple(
+        BoundaryProbeResultV1.model_validate(
+            run_boundary_probe_subprocess(
+                policy_path=POLICY_PATH,
+                inventory_id=f"R07-B{index:02d}",
+                tmp_path=probe_root / f"b{index:02d}",
+            )
+        )
+        for index in range(1, 18)
+    )
+    python_runs = (
+        _run(
+            "3.11",
+            "r07-differential-gate-py311",
+            candidate_commit=candidate,
+            candidate_tree=candidate_tree,
+        ),
+        _run(
+            "3.12",
+            "r07-differential-gate-py312",
+            candidate_commit=candidate,
+            candidate_tree=candidate_tree,
+        ),
+    )
+    evidence = R07DrGateEvidenceV1.from_gate_results(
+        repo=ROOT,
+        policy=policy,
+        candidate_gate=candidate_gate,
+        boundary_results=boundary_results,
+        static_result=static_result,
+        python_runs=python_runs,
         workflow_run_id=100,
         run_attempt=1,
-        candidate_commit_sha="a" * 40,
-        candidate_tree_sha="b" * 40,
-        baseline_commit_sha=BASELINE_COMMIT_SHA,
-        baseline_tree_sha=BASELINE_TREE_SHA,
-        policy_digest="d" * 64,
-        complete_diff_digest="e" * 64,
-        boundary_manifest_digest="f" * 64,
-        boundary_result_digest="0" * 64,
-        root_snapshot_digest="1" * 64,
-        forbidden_definition_digest="2" * 64,
-        python_runs=(
-            _run("3.11", "r07-differential-gate-py311"),
-            _run("3.12", "r07-differential-gate-py312"),
-        ),
-        artifact_name="r07-dr-gate-" + "a" * 40,
-        artifact_json_path="r07-dr-gate/evidence-v1.json",
-        retention_days=90,
-        outcome="passed",
+    )
+    return _EvidenceBundle(
+        evidence=evidence,
+        policy=policy,
+        candidate_gate=candidate_gate,
+        static_result=static_result,
+        boundary_results=boundary_results,
+        python_runs=python_runs,
     )
 
 
-def test_evidence_uses_exact_fields_and_canonical_self_digest() -> None:
-    evidence = _evidence()
+def test_evidence_uses_exact_fields_and_canonical_self_digest(
+    evidence_bundle: _EvidenceBundle,
+) -> None:
+    assert "candidate_binding_digest" in R07DrGateEvidenceV1.model_fields
+    assert hasattr(R07DrGateEvidenceV1, "from_gate_results")
+    assert not hasattr(R07DrGateEvidenceV1, "with_digest")
+    assert R07_CI_EVIDENCE_PRODUCER_IMPLEMENTED is False
+    evidence = evidence_bundle.evidence
+    assert (
+        evidence.candidate_binding_digest == evidence_bundle.candidate_gate.candidate_binding_digest
+    )
     raw = canonical_evidence_json_bytes(evidence)
     assert raw == canonical_evidence_json_bytes(evidence)
     assert json.loads(raw)["evidence_digest"] == evidence.evidence_digest
+    with pytest.raises(ValueError, match="verified gate results"):
+        R07DrGateEvidenceV1(**evidence.model_dump(mode="python"))
+
+    forged_gate = replace(evidence_bundle.candidate_gate, candidate_tree_sha="0" * 40)
+    with pytest.raises(ValueError, match="candidate tree"):
+        R07DrGateEvidenceV1.from_gate_results(
+            repo=ROOT,
+            policy=evidence_bundle.policy,
+            candidate_gate=forged_gate,
+            boundary_results=evidence_bundle.boundary_results,
+            static_result=evidence_bundle.static_result,
+            python_runs=evidence_bundle.python_runs,
+            workflow_run_id=100,
+            run_attempt=1,
+        )
+    forged_diff = replace(evidence_bundle.candidate_gate, diff_digest="0" * 64)
+    with pytest.raises(ValueError, match="exact Git candidate"):
+        R07DrGateEvidenceV1.from_gate_results(
+            repo=ROOT,
+            policy=evidence_bundle.policy,
+            candidate_gate=forged_diff,
+            boundary_results=evidence_bundle.boundary_results,
+            static_result=evidence_bundle.static_result,
+            python_runs=evidence_bundle.python_runs,
+            workflow_run_id=100,
+            run_attempt=1,
+        )
+    forged_static = replace(evidence_bundle.static_result, candidate_tree_sha="0" * 40)
+    with pytest.raises(ValueError, match="static result"):
+        R07DrGateEvidenceV1.from_gate_results(
+            repo=ROOT,
+            policy=evidence_bundle.policy,
+            candidate_gate=evidence_bundle.candidate_gate,
+            boundary_results=evidence_bundle.boundary_results,
+            static_result=forged_static,
+            python_runs=evidence_bundle.python_runs,
+            workflow_run_id=100,
+            run_attempt=1,
+        )
 
 
 @pytest.mark.parametrize(
     "payload",
     [
-        lambda: _evidence().model_dump(mode="json") | {"extra": 1},
-        lambda: _evidence().model_dump(mode="json") | {"retention_days": True},
-        lambda: _evidence().model_dump(mode="json") | {"python_runs": []},
+        lambda evidence: evidence.model_dump(mode="json") | {"extra": 1},
+        lambda evidence: evidence.model_dump(mode="json") | {"retention_days": True},
+        lambda evidence: evidence.model_dump(mode="json") | {"python_runs": []},
     ],
 )
-def test_evidence_rejects_extra_coerced_or_incomplete_json(payload) -> None:
+def test_evidence_rejects_extra_coerced_or_incomplete_json(
+    payload,
+    evidence_bundle: _EvidenceBundle,
+) -> None:
     with pytest.raises(ValueError):
-        R07DrGateEvidenceV1.from_canonical_json(json.dumps(payload(), separators=(",", ":")))
+        R07DrGateEvidenceV1.from_canonical_json(
+            json.dumps(payload(evidence_bundle.evidence), separators=(",", ":"))
+        )
 
 
 def test_composite_fixture_resolves_only_to_prior_ids_and_hashes_resolved_bytes() -> None:
@@ -162,25 +276,33 @@ def _head(repo: Path = ROOT) -> str:
 def test_normalized_ast_dump_treats_synthetic_311_and_312_shapes_as_equal(
     source: str,
 ) -> None:
-    python_312_shape = ast.parse(source).body[0]
-    for node in ast.walk(python_312_shape):
+    empty_type_params_shape = ast.parse(source).body[0]
+    for node in ast.walk(empty_type_params_shape):
         if type(node).__name__ in {"FunctionDef", "AsyncFunctionDef", "ClassDef"}:
             if "type_params" not in node._fields:
                 node._fields = (*node._fields, "type_params")
             node.type_params = []
-    python_311_shape = copy.deepcopy(python_312_shape)
-    for node in ast.walk(python_311_shape):
+    absent_type_params_shape = copy.deepcopy(empty_type_params_shape)
+    for node in ast.walk(absent_type_params_shape):
         if type(node).__name__ in {"FunctionDef", "AsyncFunctionDef", "ClassDef"}:
             node._fields = tuple(field for field in node._fields if field != "type_params")
             if hasattr(node, "type_params"):
                 delattr(node, "type_params")
-    assert ast.dump(python_311_shape, include_attributes=False) != ast.dump(
-        python_312_shape,
+    nonempty_type_params_shape = copy.deepcopy(empty_type_params_shape)
+    for node in ast.walk(nonempty_type_params_shape):
+        if type(node).__name__ in {"FunctionDef", "AsyncFunctionDef", "ClassDef"}:
+            node.type_params = [ast.Name(id="T", ctx=ast.Load())]
+
+    assert ast.dump(absent_type_params_shape, include_attributes=False) != ast.dump(
+        empty_type_params_shape,
         include_attributes=False,
     )
     assert differential_gate.normalized_ast_dump(
-        python_311_shape
-    ) == differential_gate.normalized_ast_dump(python_312_shape)
+        absent_type_params_shape
+    ) == differential_gate.normalized_ast_dump(empty_type_params_shape)
+    assert differential_gate.normalized_ast_dump(
+        nonempty_type_params_shape
+    ) != differential_gate.normalized_ast_dump(empty_type_params_shape)
 
 
 def test_python311_normalizer_runs_when_local_runtime_is_usable_or_records_ci_need() -> None:

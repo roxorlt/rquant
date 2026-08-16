@@ -1,7 +1,8 @@
-"""Pre-import isolation contracts for the executable R07 probe harness."""
+"""Parent/child import isolation contracts for the executable R07 probe harness."""
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -10,20 +11,41 @@ from pathlib import Path
 ROOT = Path(__file__).parents[2]
 
 
-def test_probe_runner_disables_dotenv_before_any_rquant_import(tmp_path: Path) -> None:
-    code = """
+def test_probe_runner_disables_dotenv_before_any_rquant_import(
+    tmp_path: Path,
+) -> None:
+    policy_path = ROOT / "tests/fixtures/r07_differential_gate/policy-v1.json"
+    probe_path = tmp_path / "probe"
+    code = f"""
+import json
 import os
-from pydantic_settings.sources import DotEnvSettingsSource
+import sys
+from pathlib import Path
 
-def fail_dotenv(*_args, **_kwargs):
-    raise AssertionError("dotenv loader reached before probe isolation")
-
-DotEnvSettingsSource.__call__ = fail_dotenv
+before_environment = tuple(os.environ.items())
+before_rquant_modules = {{
+    name
+    for name in sys.modules
+    if name == "rquant" or name.startswith("rquant.")
+}}
 import tests.r07_differential_probe_runner as runner
-assert runner.PREIMPORT_ISOLATED is True
-assert os.environ["RQUANT_DISABLE_DOTENV"] == "1"
-assert "PUSHDEER_KEYS" not in os.environ
-print("preimport-isolated")
+assert tuple(os.environ.items()) == before_environment
+after_rquant_modules = {{
+    name
+    for name in sys.modules
+    if name == "rquant" or name.startswith("rquant.")
+}}
+assert after_rquant_modules == before_rquant_modules
+result = runner.run_boundary_probe_subprocess(
+    policy_path=Path({str(policy_path)!r}),
+    inventory_id="R07-B01",
+    tmp_path=Path({str(probe_path)!r}),
+    fail_on_dotenv_read=True,
+)
+assert tuple(os.environ.items()) == before_environment
+assert result["inventory_id"] == "R07-B01"
+assert result["passed"] is True
+print(json.dumps({{"status": "parent-unchanged-child-isolated"}}, sort_keys=True))
 """
     environment = {
         "PATH": os.environ.get("PATH", ""),
@@ -52,4 +74,4 @@ print("preimport-isolated")
         check=False,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
-    assert completed.stdout.strip() == "preimport-isolated"
+    assert json.loads(completed.stdout) == {"status": "parent-unchanged-child-isolated"}

@@ -15,7 +15,7 @@ import rquant.signal_route_spool as spool
 from rquant.delivery_contracts import DeliveryChannel, DeliveryTarget
 from rquant.signal_bus import LegacySignalWriteActivationError
 from rquant.signal_contracts import CurrentSignalEnvelope, SignalEnvelope, parse_signal_envelope
-from rquant.signal_family_differential_gate import load_policy
+from rquant.signal_family_differential_gate import BoundaryProbeResultV1, load_policy
 from tests.r07_differential_probe_runner import run_boundary_probe_subprocess
 from tests.unit.test_signal_contracts import (
     _CURRENT_CANONICAL_FIXTURES,
@@ -45,11 +45,14 @@ def test_r07_dynamic_boundary_probe(
     tmp_path: Path,
 ) -> None:
     policy = load_policy(POLICY_PATH)
-    result = run_boundary_probe_subprocess(
-        policy=policy,
+    payload = run_boundary_probe_subprocess(
+        policy_path=POLICY_PATH,
         inventory_id=inventory_id,
         tmp_path=tmp_path,
     )
+    result = BoundaryProbeResultV1.model_validate(payload)
+    expected = next(item for item in policy.boundary_probes if item.inventory_id == inventory_id)
+    assert (result.probe_id, result.setup_id) == (expected.probe_id, expected.setup_id)
 
     assert result.passed
     assert result.reached_count == 1

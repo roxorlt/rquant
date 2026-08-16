@@ -167,10 +167,16 @@ def test_boundary_manifest_digest_binds_every_setup_call_and_guard_field(
 
 def test_unified_dynamic_probe_runner_is_the_only_b01_to_b17_evidence_path() -> None:
     runner_path = ROOT / "tests" / "r07_differential_probe_runner.py"
+    child_path = ROOT / "tests" / "r07_differential_probe_child.py"
     assert runner_path.is_file()
-    source = runner_path.read_text(encoding="utf-8")
-    assert "def run_boundary_probe(" in source
-    assert "BoundaryProbeResultV1" in source
+    assert child_path.is_file()
+    facade_source = runner_path.read_text(encoding="utf-8")
+    child_source = child_path.read_text(encoding="utf-8")
+    assert "def run_boundary_probe(" not in facade_source
+    assert "import rquant" not in facade_source
+    assert '"tests.r07_differential_probe_child"' in facade_source
+    assert "def run_boundary_probe(" in child_source
+    assert "BoundaryProbeResultV1" in child_source
 
 
 def test_policy_probe_json_has_no_duplicate_keys() -> None:

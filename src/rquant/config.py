@@ -12,7 +12,7 @@ from typing import Literal
 from urllib.parse import urlsplit
 
 from pydantic import Field, ValidationInfo, field_validator, model_validator
-from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 def _canonical_absolute_path(path: Path, *, label: str) -> Path:
@@ -43,20 +43,6 @@ class Settings(BaseSettings):
         extra="ignore",
         case_sensitive=False,
     )
-
-    @classmethod
-    def settings_customise_sources(
-        cls,
-        settings_cls: type[BaseSettings],
-        init_settings: PydanticBaseSettingsSource,
-        env_settings: PydanticBaseSettingsSource,
-        dotenv_settings: PydanticBaseSettingsSource,
-        file_secret_settings: PydanticBaseSettingsSource,
-    ) -> tuple[PydanticBaseSettingsSource, ...]:
-        del cls, settings_cls
-        if _dotenv_disabled():
-            return (init_settings, env_settings, file_secret_settings)
-        return (init_settings, env_settings, dotenv_settings, file_secret_settings)
 
     tushare_token_main: str = Field(..., min_length=32)
     tushare_token_backup: str | None = Field(default=None)
@@ -728,13 +714,9 @@ class Settings(BaseSettings):
         return derive_gate_token(self.panorama_cookie_secret)
 
 
-def _dotenv_disabled() -> bool:
-    disabled = os.getenv("RQUANT_DISABLE_DOTENV", "").strip().lower()
-    return disabled in {"1", "true", "yes", "on"}
-
-
 def _default_settings_env_file() -> str | None:
-    return None if _dotenv_disabled() else ".env"
+    disabled = os.getenv("RQUANT_DISABLE_DOTENV", "").strip().lower()
+    return None if disabled in {"1", "true", "yes", "on"} else ".env"
 
 
 settings = Settings(_env_file=_default_settings_env_file())  # type: ignore[call-arg]
