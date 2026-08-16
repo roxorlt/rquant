@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import multiprocessing
 import os
+import stat
+from dataclasses import replace
 from pathlib import Path
+from types import MappingProxyType
+from typing import Any
 
 import pytest
 
@@ -65,6 +70,25 @@ def _profile_payload() -> dict[str, object]:
         "shared_libraries": [_file("/usr/lib64/libpython3.11.so.1.0")],
         "deploy_pyz": _file(str(authority_module.PRODUCTION_DEPLOY_PYZ), mode=0o555),
         "runtime_pyz": _file(str(authority_module.PRODUCTION_RUNTIME_PYZ), mode=0o555),
+        "inbox_root": str(authority_module.PRODUCTION_INBOX_ROOT),
+        "quarantine_root": str(authority_module.PRODUCTION_QUARANTINE_ROOT),
+        "generation_root": str(authority_module.PRODUCTION_GENERATION_ROOT),
+        "allowed_operations": ["publish", "rollback"],
+        "roles": {
+            "daily": {
+                "module": "rquant.runtime_service_main",
+                "environment_allowlist": ["LANG", "LC_ALL", "TZ"],
+            }
+        },
+        "manifest_schema": {
+            "schema_id": "rquant-full-manifest/v1",
+            "entry_types": ["directory", "file"],
+            "directory_modes": [0o555],
+            "file_modes": [0o444, 0o555],
+            "max_entries": 100_000,
+            "max_file_bytes": 1_073_741_824,
+            "max_path_bytes": 4096,
+        },
     }
     return {
         "profile_id": hashlib.sha256(canonical_json_bytes(body)).hexdigest(),
@@ -81,6 +105,18 @@ def _rehash_profile(payload: dict[str, object]) -> None:
     payload["profile_id"] = hashlib.sha256(canonical_json_bytes(body)).hexdigest()
 
 
+def _directory_policy(*directories: Path) -> dict[Path, tuple[int, int]]:
+    policy: dict[Path, tuple[int, int]] = {}
+    for directory in directories:
+        current = Path("/")
+        for component in (None, *directory.parts[1:]):
+            if component is not None:
+                current /= component
+            observed = os.stat(current, follow_symlinks=False)
+            policy[current] = (observed.st_uid, stat.S_IMODE(observed.st_mode))
+    return policy
+
+
 def _role_payload(generation: Path) -> dict[str, object]:
     return {
         "python_path": str(generation / "venv" / "bin" / "python"),
@@ -94,15 +130,18 @@ def _role_payload(generation: Path) -> dict[str, object]:
 def _slot_payload(
     generation_root: Path,
     marker: str,
+    *,
+    lifecycle: str = "active",
 ) -> dict[str, object]:
     generation_id = _digest(marker)
     generation = generation_root / generation_id
     return {
+        "lifecycle": lifecycle,
         "generation_id": generation_id,
         "generation_path": str(generation),
         "commit": f"untrusted-{marker}",
         "full_manifest_hash": generation_id,
-        "profile_id": _digest(f"profile-{marker}"),
+        "profile_id": _profile_payload()["profile_id"],
         "roles": {"daily": _role_payload(generation)},
     }
 
@@ -114,16 +153,24 @@ def _record_payload(
     current_marker: str = "current",
     prior_marker: str | None = None,
     state: str = "active",
+    sequence: int = 1,
 ) -> dict[str, object]:
     current = _slot_payload(generation_root, current_marker)
-    prior = None if prior_marker is None else _slot_payload(generation_root, prior_marker)
+    prior_lifecycle = "failed" if state == "rolled_back" else "rollback_ready"
+    prior = (
+        None
+        if prior_marker is None
+        else _slot_payload(generation_root, prior_marker, lifecycle=prior_lifecycle)
+    )
     payload: dict[str, object] = {
         "schema_version": 1,
         "operation_id": operation * 32,
+        "sequence": sequence,
         "state": state,
     }
     for prefix, slot in (("current", current), ("prior", prior)):
         for field in (
+            "lifecycle",
             "generation_id",
             "generation_path",
             "commit",
@@ -142,18 +189,144 @@ def _record(
     current_marker: str = "current",
     prior_marker: str | None = None,
     state: str = "active",
+    sequence: int = 1,
+    durable: bool = True,
 ) -> RuntimeAuthorityRecord:
-    return parse_runtime_authority_record(
-        canonical_json_bytes(
-            _record_payload(
+    if durable:
+        prior_lifecycle = (
+            authority_module.RuntimeGenerationLifecycle.FAILED
+            if state == "rolled_back"
+            else authority_module.RuntimeGenerationLifecycle.ROLLBACK_READY
+        )
+        return RuntimeAuthorityRecord(
+            schema_version=1,
+            operation_id=operation * 32,
+            sequence=sequence,
+            state=RuntimeAuthorityState(state),
+            current=_materialize_generation_slot(
                 generation_root,
-                operation=operation,
-                current_marker=current_marker,
-                prior_marker=prior_marker,
-                state=state,
+                current_marker,
+                authority_module.RuntimeGenerationLifecycle.ACTIVE,
+            ),
+            prior=(
+                None
+                if prior_marker is None
+                else _materialize_generation_slot(
+                    generation_root,
+                    prior_marker,
+                    prior_lifecycle,
+                )
+            ),
+        )
+    payload = _record_payload(
+        generation_root,
+        operation=operation,
+        current_marker=current_marker,
+        prior_marker=prior_marker,
+        state=state,
+        sequence=sequence,
+    )
+    prior_values = tuple(payload[f"prior_{field}"] for field in authority_module._SLOT_FIELDS)
+    prior = (
+        None
+        if all(value is None for value in prior_values)
+        else authority_module._parse_slot(payload, prefix="prior")
+    )
+    return RuntimeAuthorityRecord(
+        schema_version=payload["schema_version"],
+        operation_id=payload["operation_id"],
+        sequence=payload["sequence"],
+        state=RuntimeAuthorityState(payload["state"]),
+        current=authority_module._parse_slot(payload, prefix="current"),
+        prior=prior,
+    )
+
+
+def _materialize_generation_slot(
+    generation_root: Path,
+    marker: str,
+    lifecycle: authority_module.RuntimeGenerationLifecycle,
+    *,
+    manifest_profile_id: str | None = None,
+    manifest_module: str | None = None,
+) -> RuntimeGenerationSlot:
+    relative_role = {
+        "python_path": "venv/bin/python",
+        "module": "rquant.runtime_service_main",
+        "working_directory": "release",
+        "app_source": "release/src",
+        "site_packages": ["venv/lib/python3.11/site-packages"],
+    }
+    manifest_role = dict(relative_role)
+    if manifest_module is not None:
+        manifest_role["module"] = manifest_module
+    directory_paths = (
+        "release",
+        "release/src",
+        "venv",
+        "venv/bin",
+        "venv/lib",
+        "venv/lib/python3.11",
+        "venv/lib/python3.11/site-packages",
+    )
+    executable = marker.encode("utf-8")
+    entries = [
+        {
+            "path": path,
+            "type": "directory",
+            "owner_uid": os.getuid(),
+            "mode": 0o555,
+            "size": 0,
+            "sha256": None,
+        }
+        for path in directory_paths
+    ]
+    entries.append(
+        {
+            "path": "venv/bin/python",
+            "type": "file",
+            "owner_uid": os.getuid(),
+            "mode": 0o555,
+            "size": len(executable),
+            "sha256": hashlib.sha256(executable).hexdigest(),
+        }
+    )
+    manifest = canonical_json_bytes(
+        {
+            "schema_id": "rquant-full-manifest/v1",
+            "profile_id": manifest_profile_id or _profile_payload()["profile_id"],
+            "roles": {"daily": manifest_role},
+            "entries": sorted(entries, key=lambda entry: entry["path"]),
+        },
+        trailing_newline=True,
+    )
+    generation_id = hashlib.sha256(manifest).hexdigest()
+    generation = generation_root / generation_id
+    generation.mkdir(mode=0o700, exist_ok=True)
+    manifest_path = generation / authority_module.GENERATION_MANIFEST_NAME
+    if not manifest_path.exists():
+        manifest_path.write_bytes(manifest)
+        manifest_path.chmod(0o444)
+    return RuntimeGenerationSlot(
+        lifecycle=lifecycle,
+        generation_id=generation_id,
+        generation_path=generation,
+        commit=f"untrusted-{marker}",
+        full_manifest_hash=generation_id,
+        profile_id=_profile_payload()["profile_id"],
+        roles={
+            "daily": authority_module._parse_role(
+                relative_role
+                | {
+                    "python_path": str(generation / relative_role["python_path"]),
+                    "working_directory": str(generation / relative_role["working_directory"]),
+                    "app_source": str(generation / relative_role["app_source"]),
+                    "site_packages": [
+                        str(generation / path) for path in relative_role["site_packages"]
+                    ],
+                }
             )
-        ),
-        generation_root=generation_root,
+        },
     )
 
 
@@ -170,6 +343,11 @@ def _install_profile_fixture(
     monkeypatch.setattr(authority_module, "PRODUCTION_PROFILE_PATH", profile_path)
     monkeypatch.setattr(authority_module, "PRODUCTION_PROFILE_OWNER_UID", os.getuid())
     monkeypatch.setattr(authority_module, "PRODUCTION_PROFILE_DIRECTORY_MODE", 0o700)
+    monkeypatch.setattr(
+        authority_module,
+        "_PRODUCTION_PROFILE_DIRECTORY_POLICY",
+        _directory_policy(anchor),
+    )
     return profile_path
 
 
@@ -183,15 +361,57 @@ def _install_authority_fixture(
     generations = anchor / "generations"
     generations.mkdir(mode=0o700)
     path = anchor / "current.json"
+    lock_path = anchor / "deployment.lock"
     monkeypatch.setattr(authority_module, "RUNTIME_AUTHORITY_ANCHOR", anchor)
     monkeypatch.setattr(authority_module, "RUNTIME_AUTHORITY_PATH", path)
+    monkeypatch.setattr(authority_module, "RUNTIME_AUTHORITY_LOCK_PATH", lock_path)
     monkeypatch.setattr(authority_module, "PRODUCTION_GENERATION_ROOT", generations)
     monkeypatch.setattr(authority_module, "RUNTIME_AUTHORITY_OWNER_UID", os.getuid())
     monkeypatch.setattr(authority_module, "RUNTIME_AUTHORITY_DIRECTORY_MODE", 0o700)
+    monkeypatch.setattr(authority_module, "GENERATION_DIRECTORY_MODE", 0o700)
+    monkeypatch.setattr(
+        authority_module,
+        "_PRODUCTION_RUNTIME_DIRECTORY_POLICY",
+        _directory_policy(anchor, generations),
+    )
+    _install_profile_fixture(tmp_path, monkeypatch)
     if record is not None:
         path.write_bytes(canonical_runtime_authority_bytes(record))
         path.chmod(0o444)
     return path, generations
+
+
+def _publish_worker(
+    record: RuntimeAuthorityRecord,
+    entered_read: Any,
+    release_write: Any,
+    result_queue: Any,
+    pause_after_write: bool,
+) -> None:
+    original_read = authority_module._read_record_at
+    original_write = authority_module._write_all
+
+    def observed_read(*args: object, **kwargs: object) -> object:
+        result = original_read(*args, **kwargs)
+        if kwargs.get("label") == "existing runtime authority record":
+            entered_read.set()
+        return result
+
+    def paused_write(descriptor: int, payload: bytes) -> None:
+        original_write(descriptor, payload)
+        if pause_after_write:
+            entered_read.set()
+            if not release_write.wait(5):
+                raise RuntimeError("test publication barrier timed out")
+
+    authority_module._read_record_at = observed_read
+    authority_module._write_all = paused_write
+    try:
+        result = publish_runtime_authority(record)
+    except Exception as exc:
+        result_queue.put(("error", type(exc).__name__, str(exc)))
+    else:
+        result_queue.put(("ok", result.value))
 
 
 def test_profile_v1_round_trips_and_self_checks_profile_id() -> None:
@@ -219,6 +439,16 @@ def test_profile_v1_round_trips_and_self_checks_profile_id() -> None:
         ),
         (lambda payload: payload["deploy_pyz"].update(mode=0o755), "deploy pyz"),
         (lambda payload: payload["stdlib"].append(payload["stdlib"][0]), "duplicate"),
+        (lambda payload: payload.update(inbox_root="/tmp/inbox"), "inbox root"),
+        (
+            lambda payload: payload.update(allowed_operations=["publish"]),
+            "allowed operations",
+        ),
+        (lambda payload: payload["roles"]["daily"].update(module="os"), "role module"),
+        (
+            lambda payload: payload["manifest_schema"].update(max_entries=1),
+            "manifest schema",
+        ),
     ],
 )
 def test_profile_rejects_tamper_and_non_native_schema(
@@ -299,17 +529,86 @@ def test_production_profile_loader_rejects_unsafe_file_and_ancestor(
         load_production_runtime_profile()
 
 
-def test_record_v1_parses_complete_current_and_nullable_prior(tmp_path: Path) -> None:
-    generation_root = tmp_path / "generations"
-    generation_root.mkdir()
+@pytest.mark.parametrize(
+    "fault",
+    ("grandparent-symlink", "grandparent-mode", "grandparent-owner"),
+)
+def test_hyb1_p1_07_profile_walk_starts_at_root_and_rejects_real_ancestor_fault(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+) -> None:
+    real_root = tmp_path / "real-root"
+    real_root.mkdir(mode=0o700)
+    selected_root = real_root
+    if fault == "grandparent-symlink":
+        selected_root = tmp_path / "linked-root"
+        selected_root.symlink_to(real_root, target_is_directory=True)
+    elif fault == "grandparent-mode":
+        real_root.chmod(0o770)
+    anchor = selected_root / "profile-root"
+    anchor.mkdir(mode=0o700)
+    profile_path = anchor / "production-runtime-profile.json"
+    profile_path.write_bytes(_profile_bytes())
+    profile_path.chmod(0o444)
+    monkeypatch.setattr(authority_module, "PRODUCTION_PROFILE_ANCHOR", anchor)
+    monkeypatch.setattr(authority_module, "PRODUCTION_PROFILE_PATH", profile_path)
+    monkeypatch.setattr(authority_module, "PRODUCTION_PROFILE_OWNER_UID", os.getuid())
+    monkeypatch.setattr(authority_module, "PRODUCTION_PROFILE_DIRECTORY_MODE", 0o700)
+    policy = _directory_policy(anchor)
+    if fault == "grandparent-owner":
+        _owner, mode = policy[real_root]
+        policy[real_root] = (os.getuid() + 1, mode)
+    monkeypatch.setattr(authority_module, "_PRODUCTION_PROFILE_DIRECTORY_POLICY", policy)
+
+    with pytest.raises(ProductionRuntimeProfileError, match="ancestor"):
+        load_production_runtime_profile()
+
+
+def test_hyb1_p1_07_authority_record_walk_rejects_outer_ancestor_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path, generation_root = _install_authority_fixture(tmp_path, monkeypatch)
+    path.write_bytes(canonical_runtime_authority_bytes(_record(generation_root)))
+    path.chmod(0o444)
+    policy = dict(authority_module._PRODUCTION_RUNTIME_DIRECTORY_POLICY)
+    owner, mode = policy[path.parent.parent]
+    policy[path.parent.parent] = (owner + 1, mode)
+    monkeypatch.setattr(authority_module, "_PRODUCTION_RUNTIME_DIRECTORY_POLICY", policy)
+
+    with pytest.raises(RuntimeAuthorityRecordError, match="ancestor"):
+        load_runtime_authority()
+
+
+def test_hyb1_p1_07_generation_root_walk_rejects_group_writable_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path, generation_root = _install_authority_fixture(tmp_path, monkeypatch)
     record = _record(generation_root)
+    generation_root.chmod(0o770)
+
+    with pytest.raises(RuntimeAuthorityPublishError, match="generation root ancestor"):
+        publish_runtime_authority(record)
+    assert not path.exists()
+
+
+def test_record_v1_parses_complete_current_and_nullable_prior(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _path, generation_root = _install_authority_fixture(tmp_path, monkeypatch)
+    record = parse_runtime_authority_record(canonical_json_bytes(_record_payload(generation_root)))
 
     assert record.state is RuntimeAuthorityState.ACTIVE
     assert record.prior is None
     assert record.current.generation_id == record.current.full_manifest_hash
     assert tuple(record.current.roles) == ("daily",)
 
-    with_prior = _record(generation_root, prior_marker="prior")
+    with_prior = parse_runtime_authority_record(
+        canonical_json_bytes(_record_payload(generation_root, prior_marker="prior"))
+    )
     assert with_prior.prior is not None
     assert with_prior.current != with_prior.prior
 
@@ -339,27 +638,27 @@ def test_record_v1_parses_complete_current_and_nullable_prior(tmp_path: Path) ->
 )
 def test_record_rejects_strict_schema_and_path_escape(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     mutation: object,
     match: str,
 ) -> None:
-    generation_root = tmp_path / "generations"
-    generation_root.mkdir()
+    _path, generation_root = _install_authority_fixture(tmp_path, monkeypatch)
     payload = _record_payload(generation_root)
     mutation(payload, generation_root)
 
     with pytest.raises(RuntimeAuthorityRecordError, match=match):
-        parse_runtime_authority_record(
-            canonical_json_bytes(payload),
-            generation_root=generation_root,
-        )
+        parse_runtime_authority_record(canonical_json_bytes(payload))
 
 
-def test_record_rejects_duplicate_current_prior_and_role_escape(tmp_path: Path) -> None:
-    generation_root = tmp_path / "generations"
-    generation_root.mkdir()
+def test_record_rejects_duplicate_current_prior_and_role_escape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _path, generation_root = _install_authority_fixture(tmp_path, monkeypatch)
     payload = _record_payload(generation_root, prior_marker="prior")
     for field in (
         "generation_id",
+        "lifecycle",
         "generation_path",
         "commit",
         "full_manifest_hash",
@@ -368,21 +667,19 @@ def test_record_rejects_duplicate_current_prior_and_role_escape(tmp_path: Path) 
     ):
         payload[f"prior_{field}"] = payload[f"current_{field}"]
     with pytest.raises(RuntimeAuthorityRecordError, match="same generation"):
-        parse_runtime_authority_record(
-            canonical_json_bytes(payload), generation_root=generation_root
-        )
+        parse_runtime_authority_record(canonical_json_bytes(payload))
 
     payload = _record_payload(generation_root)
     payload["current_roles"]["daily"]["app_source"] = str(tmp_path / "outside")
     with pytest.raises(RuntimeAuthorityRecordError, match="role path"):
-        parse_runtime_authority_record(
-            canonical_json_bytes(payload), generation_root=generation_root
-        )
+        parse_runtime_authority_record(canonical_json_bytes(payload))
 
 
-def test_record_rejects_generation_symlink_escape(tmp_path: Path) -> None:
-    generation_root = tmp_path / "generations"
-    generation_root.mkdir()
+def test_record_rejects_generation_symlink_escape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _path, generation_root = _install_authority_fixture(tmp_path, monkeypatch)
     outside = tmp_path / "outside"
     outside.mkdir()
     marker = "current"
@@ -390,14 +687,16 @@ def test_record_rejects_generation_symlink_escape(tmp_path: Path) -> None:
     (generation_root / generation_id).symlink_to(outside, target_is_directory=True)
 
     with pytest.raises(RuntimeAuthorityRecordError, match="symbolic"):
-        _record(generation_root, current_marker=marker)
+        parse_runtime_authority_record(
+            canonical_json_bytes(_record_payload(generation_root, current_marker=marker))
+        )
 
 
 def test_publish_transition_moves_current_to_prior_and_requires_monotonic_operation(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    generation_root = tmp_path / "generations"
-    generation_root.mkdir()
+    _path, generation_root = _install_authority_fixture(tmp_path, monkeypatch)
     old = _record(generation_root, operation="1")
     next_slot = _record(generation_root, operation="2", current_marker="next").current
 
@@ -408,17 +707,21 @@ def test_publish_transition_moves_current_to_prior_and_requires_monotonic_operat
     )
     assert advanced.state is RuntimeAuthorityState.ACTIVE
     assert advanced.current == next_slot
-    assert advanced.prior == old.current
+    assert advanced.prior is not None
+    assert advanced.prior.generation_id == old.current.generation_id
+    assert advanced.prior.lifecycle.value == "rollback_ready"
 
-    with pytest.raises(RuntimeAuthorityRecordError, match="monotonic"):
-        prepare_runtime_authority_publish(old, next_slot, operation_id="0" * 32)
+    with pytest.raises(RuntimeAuthorityRecordError, match="unique"):
+        prepare_runtime_authority_publish(old, next_slot, operation_id=old.operation_id)
     with pytest.raises(RuntimeAuthorityRecordError, match="already recorded"):
         prepare_runtime_authority_publish(old, old.current, operation_id="2" * 32)
 
 
-def test_first_publish_and_single_level_rollback_are_deterministic(tmp_path: Path) -> None:
-    generation_root = tmp_path / "generations"
-    generation_root.mkdir()
+def test_first_publish_and_single_level_rollback_are_deterministic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _path, generation_root = _install_authority_fixture(tmp_path, monkeypatch)
     initial_slot = _record(generation_root).current
     initial = prepare_runtime_authority_publish(None, initial_slot, operation_id="1" * 32)
     assert initial.prior is None
@@ -428,7 +731,9 @@ def test_first_publish_and_single_level_rollback_are_deterministic(tmp_path: Pat
     rolled_back = prepare_runtime_authority_rollback(advanced, operation_id="3" * 32)
     assert rolled_back.state is RuntimeAuthorityState.ROLLED_BACK
     assert rolled_back.current == initial.current
-    assert rolled_back.prior == next_slot
+    assert rolled_back.prior is not None
+    assert rolled_back.prior.generation_id == next_slot.generation_id
+    assert rolled_back.prior.lifecycle.value == "failed"
 
     with pytest.raises(RuntimeAuthorityRollbackError, match="single-level"):
         prepare_runtime_authority_rollback(rolled_back, operation_id="4" * 32)
@@ -497,10 +802,13 @@ def test_atomic_publish_crash_exposes_only_complete_old_or_new(
     monkeypatch.setattr(authority_module, "_fsync_descriptor", fail_fsync)
     monkeypatch.setattr(authority_module, "_replace_record", fail_replace)
 
-    with pytest.raises(RuntimeAuthorityPublishError):
-        publish_runtime_authority(new)
+    if phase == "parent_fsync":
+        assert publish_runtime_authority(new).value == "committed_after_recovery"
+    else:
+        with pytest.raises(RuntimeAuthorityPublishError):
+            publish_runtime_authority(new)
 
-    visible = parse_runtime_authority_record(path.read_bytes(), generation_root=generations)
+    visible = parse_runtime_authority_record(path.read_bytes())
     assert visible == (new if new_visible else old)
 
 
@@ -553,12 +861,490 @@ def test_temp_recovery_cleans_only_exact_operation_without_directory_inference(
 
 def test_runtime_authority_public_models_are_frozen_stdlib_dataclasses() -> None:
     generation_root = Path("/var/lib/rquant/runtime-authority/generations")
-    record = _record(generation_root)
+    record = _record(generation_root, durable=False)
 
     with pytest.raises((AttributeError, TypeError)):
         record.operation_id = "f" * 32
     assert isinstance(record.current, RuntimeGenerationSlot)
     source = Path(authority_module.__file__).read_text(encoding="utf-8")
     assert "pydantic" not in source
-    assert "getenv" not in source
-    assert "environ" not in source
+    assert "os.getenv" not in source
+    assert "os.environ" not in source
+
+
+def test_hyb1_p1_01_profile_binds_roots_operations_roles_and_manifest() -> None:
+    payload = _profile_payload()
+    payload.update(
+        inbox_root="/var/lib/rquant/runtime-authority/inbox",
+        quarantine_root="/var/lib/rquant/runtime-authority/quarantine",
+        generation_root="/var/lib/rquant/runtime-authority/generations",
+        allowed_operations=["publish", "rollback"],
+        roles={
+            "daily": {
+                "module": "rquant.runtime_service_main",
+                "environment_allowlist": ["LANG", "LC_ALL", "TZ"],
+            }
+        },
+        manifest_schema={
+            "schema_id": "rquant-full-manifest/v1",
+            "entry_types": ["directory", "file"],
+            "directory_modes": [0o555],
+            "file_modes": [0o444, 0o555],
+            "max_entries": 100_000,
+            "max_file_bytes": 1_073_741_824,
+            "max_path_bytes": 4096,
+        },
+    )
+    _rehash_profile(payload)
+
+    profile = parse_runtime_closure_profile(canonical_json_bytes(payload))
+
+    assert profile.generation_root == Path("/var/lib/rquant/runtime-authority/generations")
+    assert profile.roles["daily"].module == "rquant.runtime_service_main"
+    assert isinstance(authority_module.PRODUCTION_MANIFEST_SCHEMA, MappingProxyType)
+
+
+def test_hyb1_p1_02_record_parser_has_no_generation_root_override() -> None:
+    assert tuple(inspect.signature(parse_runtime_authority_record).parameters) == ("payload",)
+    assert not inspect.signature(load_production_runtime_profile).parameters
+    assert not inspect.signature(load_runtime_authority).parameters
+
+
+def test_hyb1_p1_03_record_requires_sequence_and_slot_lifecycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _path, generation_root = _install_authority_fixture(tmp_path, monkeypatch)
+    payload = _record_payload(generation_root, prior_marker="prior")
+    payload.update(sequence=7)
+
+    record = parse_runtime_authority_record(canonical_json_bytes(payload))
+
+    assert record.sequence == 7
+    assert record.current.lifecycle.value == "active"
+    assert record.prior is not None
+    assert record.prior.lifecycle.value == "rollback_ready"
+
+
+def test_hyb1_p1_05_operation_id_is_opaque_and_sequence_advances(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _path, generation_root = _install_authority_fixture(tmp_path, monkeypatch)
+    previous = _record(generation_root, operation="f")
+    next_slot = _record(generation_root, current_marker="next").current
+
+    advanced = prepare_runtime_authority_publish(
+        previous,
+        next_slot,
+        operation_id="0" * 32,
+    )
+
+    assert advanced.sequence == previous.sequence + 1
+
+
+def test_hyb1_p1_06_rejects_unbounded_roles_and_noncanonical_temp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path, generation_root = _install_authority_fixture(tmp_path, monkeypatch)
+    payload = _record_payload(generation_root)
+    payload["current_roles"] = {
+        f"role-{index}": _role_payload(generation_root / payload["current_generation_id"])
+        for index in range(65)
+    }
+    with pytest.raises(RuntimeAuthorityRecordError, match="roles"):
+        parse_runtime_authority_record(canonical_json_bytes(payload))
+
+    record = _record(generation_root)
+    original_write = authority_module._write_all
+
+    def write_noncanonical(descriptor: int, encoded: bytes) -> None:
+        original_write(descriptor, encoded + b" ")
+
+    monkeypatch.setattr(authority_module, "_write_all", write_noncanonical)
+    with pytest.raises(RuntimeAuthorityPublishError, match="temporary"):
+        publish_runtime_authority(record)
+    assert not path.exists()
+
+
+def test_hyb1_p1_01_record_roles_match_loaded_profile_exactly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _path, generation_root = _install_authority_fixture(tmp_path, monkeypatch)
+    payload = _record_payload(generation_root)
+    payload["current_roles"]["daily"]["module"] = "os"
+
+    with pytest.raises(RuntimeAuthorityRecordError, match="loaded profile"):
+        parse_runtime_authority_record(canonical_json_bytes(payload))
+
+
+def test_hyb1_p1_03_publication_rejects_sequence_gap_and_invalid_lifecycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path, generation_root = _install_authority_fixture(tmp_path, monkeypatch)
+    old = _record(generation_root)
+    path.write_bytes(canonical_runtime_authority_bytes(old))
+    path.chmod(0o444)
+    next_slot = _record(generation_root, current_marker="next").current
+    advanced = prepare_runtime_authority_publish(old, next_slot, operation_id="2" * 32)
+
+    with pytest.raises(RuntimeAuthorityPublishError, match="sequence"):
+        publish_runtime_authority(replace(advanced, sequence=old.sequence + 2))
+
+    payload = _record_payload(
+        generation_root,
+        current_marker="next",
+        prior_marker="current",
+    )
+    payload["prior_lifecycle"] = "failed"
+    with pytest.raises(RuntimeAuthorityRecordError, match="lifecycles"):
+        parse_runtime_authority_record(canonical_json_bytes(payload))
+
+    failed_slot = replace(
+        next_slot,
+        lifecycle=authority_module.RuntimeGenerationLifecycle.FAILED,
+    )
+    with pytest.raises(RuntimeAuthorityRecordError, match="active"):
+        prepare_runtime_authority_publish(old, failed_slot, operation_id="3" * 32)
+
+
+def test_hyb1_p1_05_publish_is_idempotent_and_detects_operation_conflict(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _path, generation_root = _install_authority_fixture(tmp_path, monkeypatch)
+    record = _record(generation_root)
+
+    assert publish_runtime_authority(record).value == "committed"
+    assert publish_runtime_authority(record).value == "idempotent"
+
+    conflicting = _record(generation_root, current_marker="different")
+    with pytest.raises(RuntimeAuthorityPublishError, match="conflict"):
+        publish_runtime_authority(conflicting)
+
+
+def test_hyb1_p1_05_parent_fsync_failure_recovers_committed_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path, generation_root = _install_authority_fixture(tmp_path, monkeypatch)
+    previous = _record(generation_root)
+    path.write_bytes(canonical_runtime_authority_bytes(previous))
+    path.chmod(0o444)
+    next_slot = _record(generation_root, current_marker="next").current
+    record = prepare_runtime_authority_publish(
+        previous,
+        next_slot,
+        operation_id="2" * 32,
+    )
+    original_fsync = authority_module._fsync_descriptor
+
+    def fail_parent_fsync(descriptor: int, *, phase_name: str) -> None:
+        if phase_name == "parent_fsync":
+            raise OSError("injected parent fsync failure")
+        original_fsync(descriptor, phase_name=phase_name)
+
+    monkeypatch.setattr(authority_module, "_fsync_descriptor", fail_parent_fsync)
+
+    result = publish_runtime_authority(record)
+
+    assert result.value == "committed_after_recovery"
+    assert load_runtime_authority() == record
+
+
+def test_hyb1_p1_04_deployment_lock_serializes_two_processes_from_predecessor_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path, generation_root = _install_authority_fixture(tmp_path, monkeypatch)
+    previous = _record(generation_root)
+    path.write_bytes(canonical_runtime_authority_bytes(previous))
+    path.chmod(0o444)
+    first = prepare_runtime_authority_publish(
+        previous,
+        _record(generation_root, current_marker="first").current,
+        operation_id="2" * 32,
+    )
+    stale_second = prepare_runtime_authority_publish(
+        previous,
+        _record(generation_root, current_marker="second").current,
+        operation_id="3" * 32,
+    )
+    context = multiprocessing.get_context("fork")
+    first_entered = context.Event()
+    second_entered = context.Event()
+    release_first = context.Event()
+    unused_release = context.Event()
+    results = context.Queue()
+    first_process = context.Process(
+        target=_publish_worker,
+        args=(first, first_entered, release_first, results, True),
+    )
+    second_process = context.Process(
+        target=_publish_worker,
+        args=(stale_second, second_entered, unused_release, results, False),
+    )
+    try:
+        first_process.start()
+        assert first_entered.wait(5)
+        second_process.start()
+        assert not second_entered.wait(0.5)
+        release_first.set()
+        first_process.join(5)
+        second_process.join(5)
+        assert first_process.exitcode == 0
+        assert second_process.exitcode == 0
+        observed = sorted(results.get(timeout=1) for _ in range(2))
+        assert observed == [
+            (
+                "error",
+                "RuntimeAuthorityPublishError",
+                "authority sequence must advance by one",
+            ),
+            ("ok", "committed"),
+        ]
+        assert load_runtime_authority() == first
+    finally:
+        release_first.set()
+        for process in (first_process, second_process):
+            if process.is_alive():
+                process.terminate()
+            process.join(1)
+
+
+@pytest.mark.parametrize("fault", ("symlink", "hardlink", "mode", "owner"))
+def test_hyb1_p1_04_deployment_lock_rejects_unsafe_inode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+) -> None:
+    path, generation_root = _install_authority_fixture(tmp_path, monkeypatch)
+    lock_path = authority_module.RUNTIME_AUTHORITY_LOCK_PATH
+    if fault == "symlink":
+        real = lock_path.with_name("real.lock")
+        real.write_bytes(b"")
+        real.chmod(0o600)
+        lock_path.symlink_to(real.name)
+    else:
+        lock_path.write_bytes(b"")
+        lock_path.chmod(0o600)
+        if fault == "hardlink":
+            os.link(lock_path, lock_path.with_name("alias.lock"))
+        elif fault == "mode":
+            lock_path.chmod(0o644)
+        else:
+            monkeypatch.setattr(
+                authority_module,
+                "RUNTIME_AUTHORITY_OWNER_UID",
+                os.getuid() + 1,
+            )
+
+    with pytest.raises(RuntimeAuthorityPublishError, match="deployment lock"):
+        publish_runtime_authority(_record(generation_root, durable=False))
+    assert not path.exists()
+
+
+def test_hyb1_p1_04_deployment_lock_replacement_aborts_before_record_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path, generation_root = _install_authority_fixture(tmp_path, monkeypatch)
+    lock_path = authority_module.RUNTIME_AUTHORITY_LOCK_PATH
+    original_write = authority_module._write_all
+
+    def replace_lock_after_write(descriptor: int, payload: bytes) -> None:
+        original_write(descriptor, payload)
+        displaced = lock_path.with_name("displaced.lock")
+        lock_path.rename(displaced)
+        lock_path.write_bytes(b"")
+        lock_path.chmod(0o600)
+
+    monkeypatch.setattr(authority_module, "_write_all", replace_lock_after_write)
+
+    with pytest.raises(RuntimeAuthorityPublishError, match="lock identity"):
+        publish_runtime_authority(_record(generation_root))
+    assert not path.exists()
+
+
+def test_hyb1_p1_08_publication_rejects_missing_generation_without_side_effect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path, generation_root = _install_authority_fixture(tmp_path, monkeypatch)
+
+    with pytest.raises(RuntimeAuthorityPublishError, match="generation"):
+        publish_runtime_authority(_record(generation_root, durable=False))
+
+    assert not path.exists()
+    assert not list(path.parent.glob(".current.*.tmp"))
+
+
+@pytest.mark.parametrize(
+    "fault",
+    ("missing", "symlink", "hardlink", "mode", "tampered"),
+)
+def test_hyb1_p1_08_publication_rejects_unsafe_or_tampered_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+) -> None:
+    path, generation_root = _install_authority_fixture(tmp_path, monkeypatch)
+    record = _record(generation_root)
+    manifest = record.current.generation_path / authority_module.GENERATION_MANIFEST_NAME
+    if fault == "missing":
+        manifest.unlink()
+    elif fault == "symlink":
+        real = manifest.with_name("real-manifest.json")
+        manifest.rename(real)
+        manifest.symlink_to(real.name)
+    elif fault == "hardlink":
+        os.link(manifest, manifest.with_name("manifest-alias.json"))
+    elif fault == "mode":
+        manifest.chmod(0o644)
+    else:
+        manifest.chmod(0o644)
+        manifest.write_bytes(b"{}\n")
+        manifest.chmod(0o444)
+
+    with pytest.raises(RuntimeAuthorityPublishError, match="manifest"):
+        publish_runtime_authority(record)
+    assert not path.exists()
+    assert not list(path.parent.glob(".current.*.tmp"))
+
+
+@pytest.mark.parametrize("fault", ("profile", "roles"))
+def test_hyb1_p1_08_manifest_must_match_loaded_profile_and_slot_roles(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+) -> None:
+    path, generation_root = _install_authority_fixture(tmp_path, monkeypatch)
+    slot = _materialize_generation_slot(
+        generation_root,
+        fault,
+        authority_module.RuntimeGenerationLifecycle.ACTIVE,
+        manifest_profile_id="0" * 64 if fault == "profile" else None,
+        manifest_module="rquant.wrong_module" if fault == "roles" else None,
+    )
+    record = RuntimeAuthorityRecord(
+        schema_version=1,
+        operation_id="1" * 32,
+        sequence=1,
+        state=RuntimeAuthorityState.ACTIVE,
+        current=slot,
+        prior=None,
+    )
+
+    with pytest.raises(RuntimeAuthorityPublishError, match="manifest"):
+        publish_runtime_authority(record)
+    assert not path.exists()
+
+
+def test_hyb1_p1_08_forward_revalidates_prior_generation_before_activation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path, generation_root = _install_authority_fixture(tmp_path, monkeypatch)
+    previous = _record(generation_root)
+    path.write_bytes(canonical_runtime_authority_bytes(previous))
+    path.chmod(0o444)
+    candidate = prepare_runtime_authority_publish(
+        previous,
+        _record(generation_root, current_marker="next").current,
+        operation_id="2" * 32,
+    )
+    prior_manifest = previous.current.generation_path / authority_module.GENERATION_MANIFEST_NAME
+    prior_manifest.unlink()
+
+    with pytest.raises(RuntimeAuthorityPublishError, match="manifest"):
+        publish_runtime_authority(candidate)
+    assert path.read_bytes() == canonical_runtime_authority_bytes(previous)
+
+
+@pytest.mark.parametrize("replaced", ("manifest", "generation"))
+def test_hyb1_p1_08_expired_evidence_rejects_pre_rename_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replaced: str,
+) -> None:
+    path, generation_root = _install_authority_fixture(tmp_path, monkeypatch)
+    record = _record(generation_root)
+    generation = record.current.generation_path
+    manifest = generation / authority_module.GENERATION_MANIFEST_NAME
+    original_write = authority_module._write_all
+
+    def replace_after_evidence(descriptor: int, payload: bytes) -> None:
+        original_write(descriptor, payload)
+        if replaced == "manifest":
+            original = manifest.with_name("old-manifest.json")
+            manifest.rename(original)
+            manifest.write_bytes(original.read_bytes())
+            manifest.chmod(0o444)
+        else:
+            original = generation.with_name(f"{generation.name}.old")
+            generation.rename(original)
+            generation.mkdir(mode=0o700)
+            replacement = generation / authority_module.GENERATION_MANIFEST_NAME
+            replacement.write_bytes(
+                (original / authority_module.GENERATION_MANIFEST_NAME).read_bytes()
+            )
+            replacement.chmod(0o444)
+
+    monkeypatch.setattr(authority_module, "_write_all", replace_after_evidence)
+
+    with pytest.raises(RuntimeAuthorityPublishError, match="evidence expired"):
+        publish_runtime_authority(record)
+    assert not path.exists()
+    assert len(list(path.parent.glob(".current.*.tmp"))) == 1
+
+
+def test_hyb1_p1_08_durable_evidence_is_private_sealed_and_not_exported(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _path, generation_root = _install_authority_fixture(tmp_path, monkeypatch)
+    slot = _record(generation_root).current
+
+    with pytest.raises(RuntimeAuthorityPublishError, match="cannot be constructed"):
+        authority_module._DurableGenerationEvidence(
+            seal=object(),
+            slot=slot,
+            generation_identity=(),
+            manifest_identity=(),
+        )
+    assert "_DurableGenerationEvidence" not in authority_module.__all__
+
+
+def test_hyb1_p1_06_serializer_and_role_collections_are_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _path, generation_root = _install_authority_fixture(tmp_path, monkeypatch)
+    payload = _record_payload(generation_root)
+    payload["current_roles"]["daily"]["site_packages"] = [
+        str(generation_root / payload["current_generation_id"] / "venv" / f"site-{index}")
+        for index in range(authority_module.MAX_SITE_PACKAGES + 1)
+    ]
+    with pytest.raises(RuntimeAuthorityRecordError, match="site-packages"):
+        parse_runtime_authority_record(canonical_json_bytes(payload))
+
+    payload = _record_payload(generation_root)
+    payload["current_roles"]["daily"]["module"] = "rquant." + "a" * (
+        authority_module.MAX_MODULE_BYTES
+    )
+    with pytest.raises(RuntimeAuthorityRecordError, match="module is too long"):
+        parse_runtime_authority_record(canonical_json_bytes(payload))
+
+    payload = _record_payload(generation_root)
+    payload["current_commit"] = "x" * (authority_module.MAX_COMMIT_BYTES + 1)
+    with pytest.raises(RuntimeAuthorityRecordError, match="commit"):
+        parse_runtime_authority_record(canonical_json_bytes(payload))
+
+    record = _record(generation_root)
+    encoded = canonical_runtime_authority_bytes(record)
+    monkeypatch.setattr(authority_module, "MAX_RECORD_BYTES", len(encoded) - 1)
+    with pytest.raises(RuntimeAuthorityRecordError, match="too large"):
+        canonical_runtime_authority_bytes(record)

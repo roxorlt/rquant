@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import os
 import re
 import stat
 from collections.abc import Mapping
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
@@ -19,29 +20,77 @@ PROFILE_SCHEMA_VERSION = 1
 RECORD_SCHEMA_VERSION = 1
 MAX_PROFILE_BYTES = 1024 * 1024
 MAX_RECORD_BYTES = 512 * 1024
+MAX_PROFILE_ANCESTORS = 256
+MAX_CLOSURE_FILES = 4096
+MAX_ROLES = 32
+MAX_SITE_PACKAGES = 8
+MAX_COMMIT_BYTES = 512
+MAX_PATH_BYTES = 4096
+MAX_MODULE_BYTES = 128
+MAX_ENVIRONMENT_NAMES = 32
+MAX_ENVIRONMENT_NAME_BYTES = 64
+MAX_GENERATION_MANIFEST_BYTES = 16 * 1024 * 1024
 
 PRODUCTION_PROFILE_PATH = Path("/etc/rquant/production-runtime-profile.json")
 PRODUCTION_PROFILE_ANCHOR = Path("/etc/rquant")
 PRODUCTION_PROFILE_OWNER_UID = 0
 PRODUCTION_PROFILE_MODE = 0o444
 PRODUCTION_PROFILE_DIRECTORY_MODE = 0o755
+_PRODUCTION_PROFILE_DIRECTORY_POLICY = MappingProxyType(
+    {
+        Path("/"): (0, 0o755),
+        Path("/etc"): (0, 0o755),
+        PRODUCTION_PROFILE_ANCHOR: (0, PRODUCTION_PROFILE_DIRECTORY_MODE),
+    }
+)
 
 PRODUCTION_SYSTEM_PYTHON = Path("/usr/bin/python3.11")
 PRODUCTION_DEPLOY_PYZ = Path("/usr/local/libexec/rquant-production-deploy.pyz")
 PRODUCTION_RUNTIME_PYZ = Path("/usr/local/libexec/rquant-runtime-exec.pyz")
+PRODUCTION_INBOX_ROOT = Path("/var/lib/rquant/runtime-authority/inbox")
+PRODUCTION_QUARANTINE_ROOT = Path("/var/lib/rquant/runtime-authority/quarantine")
 PRODUCTION_GENERATION_ROOT = Path("/var/lib/rquant/runtime-authority/generations")
+GENERATION_MANIFEST_NAME = "full-manifest.json"
+GENERATION_DIRECTORY_MODE = 0o555
+GENERATION_MANIFEST_MODE = 0o444
+PRODUCTION_ALLOWED_OPERATIONS = ("publish", "rollback")
+PRODUCTION_ROLE_POLICY = (("daily", "rquant.runtime_service_main", ("LANG", "LC_ALL", "TZ")),)
+PRODUCTION_MANIFEST_SCHEMA = MappingProxyType(
+    {
+        "schema_id": "rquant-full-manifest/v1",
+        "entry_types": ("directory", "file"),
+        "directory_modes": (0o555,),
+        "file_modes": (0o444, 0o555),
+        "max_entries": 100_000,
+        "max_file_bytes": 1_073_741_824,
+        "max_path_bytes": MAX_PATH_BYTES,
+    }
+)
 
 RUNTIME_AUTHORITY_PATH = Path("/var/lib/rquant/runtime-authority/current.json")
+RUNTIME_AUTHORITY_LOCK_PATH = Path("/var/lib/rquant/runtime-authority/deployment.lock")
 RUNTIME_AUTHORITY_ANCHOR = Path("/var/lib/rquant/runtime-authority")
 RUNTIME_AUTHORITY_OWNER_UID = 0
+RUNTIME_AUTHORITY_LOCK_MODE = 0o600
 RUNTIME_AUTHORITY_RECORD_MODE = 0o444
 RUNTIME_AUTHORITY_TEMP_MODE = 0o600
 RUNTIME_AUTHORITY_DIRECTORY_MODE = 0o755
+_PRODUCTION_RUNTIME_DIRECTORY_POLICY = MappingProxyType(
+    {
+        Path("/"): (0, 0o755),
+        Path("/var"): (0, 0o755),
+        Path("/var/lib"): (0, 0o755),
+        Path("/var/lib/rquant"): (0, 0o755),
+        RUNTIME_AUTHORITY_ANCHOR: (0, RUNTIME_AUTHORITY_DIRECTORY_MODE),
+        PRODUCTION_GENERATION_ROOT: (0, 0o755),
+    }
+)
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _OPERATION_ID = re.compile(r"[0-9a-f]{32}")
 _ROLE_NAME = re.compile(r"[a-z][a-z0-9_-]{0,63}")
 _MODULE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*")
+_ENVIRONMENT_NAME = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
 
 
 class RuntimeAuthorityError(RuntimeError):
@@ -67,6 +116,62 @@ class RuntimeAuthorityRollbackError(RuntimeAuthorityRecordError):
 class RuntimeAuthorityState(StrEnum):
     ACTIVE = "active"
     ROLLED_BACK = "rolled_back"
+
+
+class RuntimeGenerationLifecycle(StrEnum):
+    ACTIVE = "active"
+    ROLLBACK_READY = "rollback_ready"
+    FAILED = "failed"
+
+
+class RuntimeAuthorityPublishResult(StrEnum):
+    COMMITTED = "committed"
+    IDEMPOTENT = "idempotent"
+    COMMITTED_AFTER_RECOVERY = "committed_after_recovery"
+
+
+@dataclass
+class _DeploymentLockLease:
+    descriptor: int
+    parent_fd: int
+    name: str
+    descriptors: list[int]
+    identity: tuple[int, ...]
+
+    def assert_current(self) -> None:
+        descriptor_identity = _identity(os.fstat(self.descriptor))
+        named_identity = _identity(os.stat(self.name, dir_fd=self.parent_fd, follow_symlinks=False))
+        if descriptor_identity != self.identity or named_identity != self.identity:
+            raise RuntimeAuthorityPublishError("deployment lock identity changed")
+
+    def close(self) -> None:
+        if self.descriptor < 0:
+            return
+        descriptor = self.descriptor
+        self.descriptor = -1
+        with suppress(OSError):
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        with suppress(OSError):
+            os.close(descriptor)
+        _close_descriptors(self.descriptors)
+        self.descriptors.clear()
+
+
+_DURABLE_EVIDENCE_SEAL = object()
+
+
+@dataclass(frozen=True)
+class _DurableGenerationEvidence:
+    seal: object
+    slot: RuntimeGenerationSlot
+    generation_identity: tuple[int, ...]
+    manifest_identity: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if self.seal is not _DURABLE_EVIDENCE_SEAL:
+            raise RuntimeAuthorityPublishError(
+                "durable generation evidence cannot be constructed by callers"
+            )
 
 
 @dataclass(frozen=True)
@@ -113,6 +218,69 @@ class RuntimeFilePolicy:
 
 
 @dataclass(frozen=True)
+class RuntimeProfileRole:
+    module: str
+    environment_allowlist: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.module) is not str
+            or not self.module.startswith("rquant.")
+            or _MODULE_NAME.fullmatch(self.module) is None
+            or len(self.module.encode("utf-8")) > MAX_MODULE_BYTES
+        ):
+            raise ProductionRuntimeProfileError("runtime profile role module is invalid")
+        names = self.environment_allowlist
+        if (
+            not names
+            or len(names) > MAX_ENVIRONMENT_NAMES
+            or any(
+                type(name) is not str
+                or len(name.encode("utf-8")) > MAX_ENVIRONMENT_NAME_BYTES
+                or _ENVIRONMENT_NAME.fullmatch(name) is None
+                for name in names
+            )
+            or names != tuple(sorted(set(names)))
+        ):
+            raise ProductionRuntimeProfileError("runtime profile environment allowlist is invalid")
+
+    def payload(self) -> dict[str, object]:
+        return {
+            "module": self.module,
+            "environment_allowlist": list(self.environment_allowlist),
+        }
+
+
+@dataclass(frozen=True)
+class RuntimeManifestSchema:
+    schema_id: str
+    entry_types: tuple[str, ...]
+    directory_modes: tuple[int, ...]
+    file_modes: tuple[int, ...]
+    max_entries: int
+    max_file_bytes: int
+    max_path_bytes: int
+
+    def __post_init__(self) -> None:
+        if self.payload() != {
+            key: list(value) if isinstance(value, tuple) else value
+            for key, value in PRODUCTION_MANIFEST_SCHEMA.items()
+        }:
+            raise ProductionRuntimeProfileError("runtime manifest schema is not fixed v1")
+
+    def payload(self) -> dict[str, object]:
+        return {
+            "schema_id": self.schema_id,
+            "entry_types": list(self.entry_types),
+            "directory_modes": list(self.directory_modes),
+            "file_modes": list(self.file_modes),
+            "max_entries": self.max_entries,
+            "max_file_bytes": self.max_file_bytes,
+            "max_path_bytes": self.max_path_bytes,
+        }
+
+
+@dataclass(frozen=True)
 class RuntimeClosureProfile:
     profile_id: str
     schema_version: int
@@ -124,6 +292,12 @@ class RuntimeClosureProfile:
     shared_libraries: tuple[RuntimeFilePolicy, ...]
     deploy_pyz: RuntimeFilePolicy
     runtime_pyz: RuntimeFilePolicy
+    inbox_root: Path
+    quarantine_root: Path
+    generation_root: Path
+    allowed_operations: tuple[str, ...]
+    roles: Mapping[str, RuntimeProfileRole]
+    manifest_schema: RuntimeManifestSchema
 
     def __post_init__(self) -> None:
         if type(self.schema_version) is not int or self.schema_version != PROFILE_SCHEMA_VERSION:
@@ -144,6 +318,8 @@ class RuntimeClosureProfile:
             raise ProductionRuntimeProfileError("runtime closure contains duplicate file paths")
         if not self.stdlib or not self.shared_libraries:
             raise ProductionRuntimeProfileError("runtime closure file lists are incomplete")
+        if len(self.ancestors) > MAX_PROFILE_ANCESTORS or len(files) > MAX_CLOSURE_FILES:
+            raise ProductionRuntimeProfileError("runtime profile closure exceeds fixed limits")
         if tuple(sorted(self.stdlib, key=lambda item: str(item.path))) != self.stdlib:
             raise ProductionRuntimeProfileError("runtime stdlib list is not canonical")
         if (
@@ -161,6 +337,31 @@ class RuntimeClosureProfile:
             raise ProductionRuntimeProfileError("deploy pyz policy is not fixed")
         if self.runtime_pyz.path != PRODUCTION_RUNTIME_PYZ or self.runtime_pyz.mode != 0o555:
             raise ProductionRuntimeProfileError("runtime pyz policy is not fixed")
+        roots = (
+            (self.inbox_root, PRODUCTION_INBOX_ROOT, "inbox"),
+            (self.quarantine_root, PRODUCTION_QUARANTINE_ROOT, "quarantine"),
+            (self.generation_root, PRODUCTION_GENERATION_ROOT, "generation"),
+        )
+        for actual, expected, label in roots:
+            if _model_path(actual, ProductionRuntimeProfileError, f"{label} root") != expected:
+                raise ProductionRuntimeProfileError(f"runtime {label} root is not fixed")
+        if self.allowed_operations != PRODUCTION_ALLOWED_OPERATIONS:
+            raise ProductionRuntimeProfileError("runtime allowed operations are not fixed")
+        if not isinstance(self.roles, Mapping) or len(self.roles) > MAX_ROLES:
+            raise ProductionRuntimeProfileError("runtime profile roles are invalid")
+        expected_roles = {
+            name: RuntimeProfileRole(module, environment)
+            for name, module, environment in PRODUCTION_ROLE_POLICY
+        }
+        if dict(self.roles) != expected_roles:
+            raise ProductionRuntimeProfileError("runtime profile role policy is not fixed")
+        object.__setattr__(
+            self,
+            "roles",
+            MappingProxyType(dict(sorted(self.roles.items()))),
+        )
+        if not isinstance(self.manifest_schema, RuntimeManifestSchema):
+            raise ProductionRuntimeProfileError("runtime manifest schema is invalid")
         required_ancestors = {parent for item in files for parent in item.path.parents}
         if set(ancestor_paths) != required_ancestors:
             raise ProductionRuntimeProfileError("runtime ancestor policy does not close every path")
@@ -190,6 +391,12 @@ class RuntimeClosureProfile:
             "shared_libraries": [item.payload() for item in self.shared_libraries],
             "deploy_pyz": self.deploy_pyz.payload(),
             "runtime_pyz": self.runtime_pyz.payload(),
+            "inbox_root": str(self.inbox_root),
+            "quarantine_root": str(self.quarantine_root),
+            "generation_root": str(self.generation_root),
+            "allowed_operations": list(self.allowed_operations),
+            "roles": {name: role.payload() for name, role in self.roles.items()},
+            "manifest_schema": self.manifest_schema.payload(),
         }
 
 
@@ -219,7 +426,13 @@ class RuntimeRoleSpec:
         )
         if type(self.module) is not str or _MODULE_NAME.fullmatch(self.module) is None:
             raise RuntimeAuthorityRecordError("runtime role module is invalid")
-        if not self.site_packages or not all(isinstance(path, Path) for path in self.site_packages):
+        if len(self.module.encode("utf-8")) > MAX_MODULE_BYTES:
+            raise RuntimeAuthorityRecordError("runtime role module is too long")
+        if (
+            not self.site_packages
+            or len(self.site_packages) > MAX_SITE_PACKAGES
+            or not all(isinstance(path, Path) for path in self.site_packages)
+        ):
             raise RuntimeAuthorityRecordError("runtime role site-packages are invalid")
         paths = tuple(
             _model_path(path, RuntimeAuthorityRecordError, "role path")
@@ -250,6 +463,7 @@ class RuntimeRoleSpec:
 
 @dataclass(frozen=True)
 class RuntimeGenerationSlot:
+    lifecycle: RuntimeGenerationLifecycle
     generation_id: str
     generation_path: Path
     commit: str
@@ -258,6 +472,8 @@ class RuntimeGenerationSlot:
     roles: Mapping[str, RuntimeRoleSpec]
 
     def __post_init__(self) -> None:
+        if not isinstance(self.lifecycle, RuntimeGenerationLifecycle):
+            raise RuntimeAuthorityRecordError("runtime generation lifecycle is invalid")
         _require_sha256(self.generation_id, RuntimeAuthorityRecordError, "generation id")
         _require_sha256(
             self.full_manifest_hash,
@@ -275,11 +491,11 @@ class RuntimeGenerationSlot:
         if (
             type(self.commit) is not str
             or not self.commit
-            or len(self.commit.encode("utf-8")) > 512
+            or len(self.commit.encode("utf-8")) > MAX_COMMIT_BYTES
             or any(ord(character) < 0x20 for character in self.commit)
         ):
             raise RuntimeAuthorityRecordError("untrusted commit audit metadata is invalid")
-        if not isinstance(self.roles, Mapping) or not self.roles:
+        if not isinstance(self.roles, Mapping) or not self.roles or len(self.roles) > MAX_ROLES:
             raise RuntimeAuthorityRecordError("runtime roles are incomplete")
         roles: dict[str, RuntimeRoleSpec] = {}
         for name, role in self.roles.items():
@@ -306,6 +522,7 @@ class RuntimeGenerationSlot:
 
     def payload(self) -> dict[str, object]:
         return {
+            "lifecycle": self.lifecycle.value,
             "generation_id": self.generation_id,
             "generation_path": str(self.generation_path),
             "commit": self.commit,
@@ -319,6 +536,7 @@ class RuntimeGenerationSlot:
 class RuntimeAuthorityRecord:
     schema_version: int
     operation_id: str
+    sequence: int
     state: RuntimeAuthorityState
     current: RuntimeGenerationSlot
     prior: RuntimeGenerationSlot | None
@@ -327,6 +545,8 @@ class RuntimeAuthorityRecord:
         if type(self.schema_version) is not int or self.schema_version != RECORD_SCHEMA_VERSION:
             raise RuntimeAuthorityRecordError("runtime authority schema is unsupported")
         _require_operation_id(self.operation_id)
+        if type(self.sequence) is not int or self.sequence < 1:
+            raise RuntimeAuthorityRecordError("runtime authority sequence is invalid")
         if not isinstance(self.state, RuntimeAuthorityState):
             raise RuntimeAuthorityRecordError("runtime authority state is invalid")
         if not isinstance(self.current, RuntimeGenerationSlot):
@@ -335,8 +555,21 @@ class RuntimeAuthorityRecord:
             raise RuntimeAuthorityRecordError("prior runtime slot is invalid")
         if self.prior is not None and self.current.generation_id == self.prior.generation_id:
             raise RuntimeAuthorityRecordError("current and prior name the same generation")
-        if self.state is RuntimeAuthorityState.ROLLED_BACK and self.prior is None:
-            raise RuntimeAuthorityRecordError("rolled-back authority requires a prior slot")
+        prior_lifecycle = None if self.prior is None else self.prior.lifecycle
+        allowed_prior = {
+            RuntimeAuthorityState.ACTIVE: {
+                None,
+                RuntimeGenerationLifecycle.ROLLBACK_READY,
+            },
+            RuntimeAuthorityState.ROLLED_BACK: {RuntimeGenerationLifecycle.FAILED},
+        }
+        if (
+            self.current.lifecycle is not RuntimeGenerationLifecycle.ACTIVE
+            or prior_lifecycle not in allowed_prior[self.state]
+        ):
+            raise RuntimeAuthorityRecordError(
+                "runtime authority state and slot lifecycles are inconsistent"
+            )
 
     def validate_for_root(self, generation_root: Path) -> None:
         self.current.validate_for_root(generation_root)
@@ -347,6 +580,7 @@ class RuntimeAuthorityRecord:
         payload: dict[str, object] = {
             "schema_version": self.schema_version,
             "operation_id": self.operation_id,
+            "sequence": self.sequence,
             "state": self.state.value,
         }
         for prefix, slot in (("current", self.current), ("prior", self.prior)):
@@ -367,10 +601,17 @@ _PROFILE_FIELDS = {
     "shared_libraries",
     "deploy_pyz",
     "runtime_pyz",
+    "inbox_root",
+    "quarantine_root",
+    "generation_root",
+    "allowed_operations",
+    "roles",
+    "manifest_schema",
 }
 _FILE_FIELDS = {"path", "sha256", "owner_uid", "mode"}
 _ANCESTOR_FIELDS = {"path", "owner_uid", "mode"}
 _SLOT_FIELDS = (
+    "lifecycle",
     "generation_id",
     "generation_path",
     "commit",
@@ -381,6 +622,7 @@ _SLOT_FIELDS = (
 _RECORD_FIELDS = {
     "schema_version",
     "operation_id",
+    "sequence",
     "state",
     *(f"{prefix}_{field}" for prefix in ("current", "prior") for field in _SLOT_FIELDS),
 }
@@ -390,6 +632,17 @@ _ROLE_FIELDS = {
     "working_directory",
     "app_source",
     "site_packages",
+}
+_PROFILE_ROLE_FIELDS = {"module", "environment_allowlist"}
+_MANIFEST_FIELDS = set(PRODUCTION_MANIFEST_SCHEMA)
+_GENERATION_MANIFEST_FIELDS = {"schema_id", "profile_id", "roles", "entries"}
+_GENERATION_MANIFEST_ENTRY_FIELDS = {
+    "path",
+    "type",
+    "owner_uid",
+    "mode",
+    "size",
+    "sha256",
 }
 
 
@@ -405,10 +658,14 @@ def parse_runtime_closure_profile(payload: str | bytes | bytearray) -> RuntimeCl
     ancestors = data["ancestors"]
     stdlib = data["stdlib"]
     shared_libraries = data["shared_libraries"]
+    operations = data["allowed_operations"]
+    roles = data["roles"]
     if (
         type(ancestors) is not list
         or type(stdlib) is not list
         or type(shared_libraries) is not list
+        or type(operations) is not list
+        or type(roles) is not dict
     ):
         raise ProductionRuntimeProfileError("runtime profile closure lists are invalid")
     return RuntimeClosureProfile(
@@ -424,15 +681,28 @@ def parse_runtime_closure_profile(payload: str | bytes | bytearray) -> RuntimeCl
         ),
         deploy_pyz=_parse_file(data["deploy_pyz"], label="deploy pyz"),
         runtime_pyz=_parse_file(data["runtime_pyz"], label="runtime pyz"),
+        inbox_root=_payload_path(data["inbox_root"], ProductionRuntimeProfileError, "inbox root"),
+        quarantine_root=_payload_path(
+            data["quarantine_root"],
+            ProductionRuntimeProfileError,
+            "quarantine root",
+        ),
+        generation_root=_payload_path(
+            data["generation_root"],
+            ProductionRuntimeProfileError,
+            "generation root",
+        ),
+        allowed_operations=tuple(operations),
+        roles={name: _parse_profile_role(role) for name, role in roles.items()},
+        manifest_schema=_parse_manifest_schema(data["manifest_schema"]),
     )
 
 
 def load_production_runtime_profile() -> RuntimeClosureProfile:
     payload = _read_trusted_file(
         PRODUCTION_PROFILE_PATH,
-        anchor=PRODUCTION_PROFILE_ANCHOR,
+        directory_policy=_PRODUCTION_PROFILE_DIRECTORY_POLICY,
         owner_uid=PRODUCTION_PROFILE_OWNER_UID,
-        directory_mode=PRODUCTION_PROFILE_DIRECTORY_MODE,
         file_mode=PRODUCTION_PROFILE_MODE,
         max_bytes=MAX_PROFILE_BYTES,
         error_type=ProductionRuntimeProfileError,
@@ -443,8 +713,13 @@ def load_production_runtime_profile() -> RuntimeClosureProfile:
 
 def parse_runtime_authority_record(
     payload: str | bytes | bytearray,
-    *,
-    generation_root: Path | None = None,
+) -> RuntimeAuthorityRecord:
+    return _parse_runtime_authority_record(payload, load_production_runtime_profile())
+
+
+def _parse_runtime_authority_record(
+    payload: str | bytes | bytearray,
+    profile: RuntimeClosureProfile,
 ) -> RuntimeAuthorityRecord:
     data = _strict_payload(
         payload,
@@ -472,34 +747,39 @@ def parse_runtime_authority_record(
     record = RuntimeAuthorityRecord(
         schema_version=data["schema_version"],
         operation_id=data["operation_id"],
+        sequence=data["sequence"],
         state=parsed_state,
         current=current,
         prior=prior,
     )
-    record.validate_for_root(
-        PRODUCTION_GENERATION_ROOT if generation_root is None else generation_root
-    )
+    _validate_record(record, profile)
     return record
 
 
 def canonical_runtime_authority_bytes(record: RuntimeAuthorityRecord) -> bytes:
     if not isinstance(record, RuntimeAuthorityRecord):
         raise RuntimeAuthorityRecordError("runtime authority record model is required")
-    return canonical_json_bytes(record.payload(), trailing_newline=True)
+    payload = canonical_json_bytes(record.payload(), trailing_newline=True)
+    if len(payload) > MAX_RECORD_BYTES:
+        raise RuntimeAuthorityRecordError("runtime authority record is too large")
+    return payload
 
 
 def load_runtime_authority() -> RuntimeAuthorityRecord:
+    profile = load_production_runtime_profile()
     payload = _read_trusted_file(
         RUNTIME_AUTHORITY_PATH,
-        anchor=RUNTIME_AUTHORITY_ANCHOR,
+        directory_policy=_PRODUCTION_RUNTIME_DIRECTORY_POLICY,
         owner_uid=RUNTIME_AUTHORITY_OWNER_UID,
-        directory_mode=RUNTIME_AUTHORITY_DIRECTORY_MODE,
         file_mode=RUNTIME_AUTHORITY_RECORD_MODE,
         max_bytes=MAX_RECORD_BYTES,
         error_type=RuntimeAuthorityRecordError,
         label="runtime authority record",
     )
-    return parse_runtime_authority_record(payload)
+    record = _parse_runtime_authority_record(payload, profile)
+    if payload != canonical_runtime_authority_bytes(record):
+        raise RuntimeAuthorityRecordError("runtime authority record is not canonical")
+    return record
 
 
 def prepare_runtime_authority_publish(
@@ -511,27 +791,41 @@ def prepare_runtime_authority_publish(
     _require_operation_id(operation_id)
     if not isinstance(next_generation, RuntimeGenerationSlot):
         raise RuntimeAuthorityRecordError("next runtime generation is invalid")
+    if next_generation.lifecycle is not RuntimeGenerationLifecycle.ACTIVE:
+        raise RuntimeAuthorityRecordError("next runtime generation must be active")
+    profile = load_production_runtime_profile()
     if previous is None:
-        return RuntimeAuthorityRecord(
+        candidate = RuntimeAuthorityRecord(
             schema_version=RECORD_SCHEMA_VERSION,
             operation_id=operation_id,
+            sequence=1,
             state=RuntimeAuthorityState.ACTIVE,
             current=next_generation,
             prior=None,
         )
-    _require_newer_operation(previous.operation_id, operation_id)
+        _validate_record(candidate, profile)
+        return candidate
+    _validate_record(previous, profile)
+    if operation_id == previous.operation_id:
+        raise RuntimeAuthorityRecordError("operation id must be unique")
     recorded = {previous.current.generation_id}
     if previous.prior is not None:
         recorded.add(previous.prior.generation_id)
     if next_generation.generation_id in recorded:
         raise RuntimeAuthorityRecordError("next generation is already recorded")
-    return RuntimeAuthorityRecord(
+    candidate = RuntimeAuthorityRecord(
         schema_version=RECORD_SCHEMA_VERSION,
         operation_id=operation_id,
+        sequence=previous.sequence + 1,
         state=RuntimeAuthorityState.ACTIVE,
         current=next_generation,
-        prior=previous.current,
+        prior=replace(
+            previous.current,
+            lifecycle=RuntimeGenerationLifecycle.ROLLBACK_READY,
+        ),
     )
+    _validate_publication_transition(previous, candidate, profile)
+    return candidate
 
 
 def prepare_runtime_authority_rollback(
@@ -542,44 +836,70 @@ def prepare_runtime_authority_rollback(
     if not isinstance(previous, RuntimeAuthorityRecord):
         raise RuntimeAuthorityRollbackError("runtime authority record is required")
     _require_operation_id(operation_id)
-    _require_newer_operation(previous.operation_id, operation_id)
+    profile = load_production_runtime_profile()
+    _validate_record(previous, profile)
+    if operation_id == previous.operation_id:
+        raise RuntimeAuthorityRollbackError("operation id must be unique")
     if previous.state is RuntimeAuthorityState.ROLLED_BACK:
         raise RuntimeAuthorityRollbackError("automatic rollback is single-level")
-    if previous.prior is None:
+    if (
+        previous.prior is None
+        or previous.prior.lifecycle is not RuntimeGenerationLifecycle.ROLLBACK_READY
+    ):
         raise RuntimeAuthorityRollbackError("automatic rollback requires a prior generation")
-    return RuntimeAuthorityRecord(
+    candidate = RuntimeAuthorityRecord(
         schema_version=RECORD_SCHEMA_VERSION,
         operation_id=operation_id,
+        sequence=previous.sequence + 1,
         state=RuntimeAuthorityState.ROLLED_BACK,
-        current=previous.prior,
-        prior=previous.current,
+        current=replace(previous.prior, lifecycle=RuntimeGenerationLifecycle.ACTIVE),
+        prior=replace(previous.current, lifecycle=RuntimeGenerationLifecycle.FAILED),
     )
+    _validate_publication_transition(previous, candidate, profile)
+    return candidate
 
 
-def publish_runtime_authority(record: RuntimeAuthorityRecord) -> None:
+def publish_runtime_authority(
+    record: RuntimeAuthorityRecord,
+) -> RuntimeAuthorityPublishResult:
     if not isinstance(record, RuntimeAuthorityRecord):
         raise RuntimeAuthorityPublishError("runtime authority record model is required")
+    profile = load_production_runtime_profile()
     try:
-        record.validate_for_root(PRODUCTION_GENERATION_ROOT)
+        _validate_record(record, profile)
+        payload = canonical_runtime_authority_bytes(record)
     except RuntimeAuthorityRecordError as exc:
         raise RuntimeAuthorityPublishError(
-            "runtime authority record violates production root"
+            "runtime authority record violates the loaded profile"
         ) from exc
-    payload = canonical_runtime_authority_bytes(record)
+    lock_lease: _DeploymentLockLease | None = None
     descriptors: list[int] = []
     temporary_fd = -1
     temporary_name = _temporary_name(record.operation_id)
     try:
+        lock_lease = _acquire_deployment_lock()
+        lock_lease.assert_current()
         descriptors, parent_fd, target_name = _open_trusted_parent(
             RUNTIME_AUTHORITY_PATH,
-            anchor=RUNTIME_AUTHORITY_ANCHOR,
-            owner_uid=RUNTIME_AUTHORITY_OWNER_UID,
-            directory_mode=RUNTIME_AUTHORITY_DIRECTORY_MODE,
+            directory_policy=_PRODUCTION_RUNTIME_DIRECTORY_POLICY,
             error_type=RuntimeAuthorityPublishError,
             label="runtime authority directory",
         )
-        previous = _read_existing_authority(parent_fd, target_name)
-        _require_publish_transition(previous, record)
+        existing = _read_record_at(
+            parent_fd,
+            target_name,
+            profile,
+            missing_ok=True,
+            label="existing runtime authority record",
+        )
+        previous = None if existing is None else existing[0]
+        if previous is not None and previous.operation_id == record.operation_id:
+            if existing[1] == payload:
+                _revalidate_record_generations(record, profile)
+                return RuntimeAuthorityPublishResult.IDEMPOTENT
+            raise RuntimeAuthorityPublishError("authority operation id conflicts")
+        _validate_publication_transition(previous, record, profile)
+        evidence = _revalidate_record_generations(record, profile)
         flags = (
             os.O_WRONLY
             | os.O_CREAT
@@ -608,15 +928,35 @@ def publish_runtime_authority(record: RuntimeAuthorityRecord) -> None:
         _fsync_descriptor(temporary_fd, phase_name="temp_fsync")
         os.close(temporary_fd)
         temporary_fd = -1
-        _require_file_stat(
-            os.stat(temporary_name, dir_fd=parent_fd, follow_symlinks=False),
-            owner_uid=RUNTIME_AUTHORITY_OWNER_UID,
-            mode=RUNTIME_AUTHORITY_RECORD_MODE,
-            error_type=RuntimeAuthorityPublishError,
+        temporary = _read_record_at(
+            parent_fd,
+            temporary_name,
+            profile,
+            missing_ok=False,
             label="runtime authority temporary",
         )
+        if temporary is None or temporary[0] != record or temporary[1] != payload:
+            raise RuntimeAuthorityPublishError("runtime authority temporary content changed")
+        _consume_generation_evidence(evidence, record, profile)
+        lock_lease.assert_current()
         _replace_record(parent_fd, temporary_name)
-        _fsync_descriptor(parent_fd, phase_name="parent_fsync")
+        try:
+            _fsync_descriptor(parent_fd, phase_name="parent_fsync")
+        except OSError:
+            recovered = _read_record_at(
+                parent_fd,
+                target_name,
+                profile,
+                missing_ok=False,
+                label="recovered runtime authority record",
+            )
+            if recovered is not None and recovered[0] == record and recovered[1] == payload:
+                _consume_generation_evidence(evidence, record, profile)
+                lock_lease.assert_current()
+                return RuntimeAuthorityPublishResult.COMMITTED_AFTER_RECOVERY
+            raise
+        lock_lease.assert_current()
+        return RuntimeAuthorityPublishResult.COMMITTED
     except RuntimeAuthorityPublishError:
         raise
     except (OSError, RuntimeAuthorityRecordError) as exc:
@@ -626,6 +966,8 @@ def publish_runtime_authority(record: RuntimeAuthorityRecord) -> None:
             with suppress(OSError):
                 os.close(temporary_fd)
         _close_descriptors(descriptors)
+        if lock_lease is not None:
+            lock_lease.close()
 
 
 def cleanup_runtime_authority_temp(operation_id: str) -> bool:
@@ -635,13 +977,13 @@ def cleanup_runtime_authority_temp(operation_id: str) -> bool:
         raise RuntimeAuthorityPublishError(
             "runtime authority temporary operation is invalid"
         ) from exc
+    lock_lease: _DeploymentLockLease | None = None
     descriptors: list[int] = []
     try:
+        lock_lease = _acquire_deployment_lock()
         descriptors, parent_fd, _target_name = _open_trusted_parent(
             RUNTIME_AUTHORITY_PATH,
-            anchor=RUNTIME_AUTHORITY_ANCHOR,
-            owner_uid=RUNTIME_AUTHORITY_OWNER_UID,
-            directory_mode=RUNTIME_AUTHORITY_DIRECTORY_MODE,
+            directory_policy=_PRODUCTION_RUNTIME_DIRECTORY_POLICY,
             error_type=RuntimeAuthorityPublishError,
             label="runtime authority directory",
         )
@@ -668,6 +1010,37 @@ def cleanup_runtime_authority_temp(operation_id: str) -> bool:
         raise RuntimeAuthorityPublishError("runtime authority temporary cleanup failed") from exc
     finally:
         _close_descriptors(descriptors)
+        if lock_lease is not None:
+            lock_lease.close()
+
+
+def _parse_profile_role(payload: object) -> RuntimeProfileRole:
+    if type(payload) is not dict or set(payload) != _PROFILE_ROLE_FIELDS:
+        raise ProductionRuntimeProfileError("runtime profile role schema is invalid")
+    environment = payload["environment_allowlist"]
+    if type(environment) is not list:
+        raise ProductionRuntimeProfileError("runtime profile environment allowlist is invalid")
+    return RuntimeProfileRole(
+        module=payload["module"],
+        environment_allowlist=tuple(environment),
+    )
+
+
+def _parse_manifest_schema(payload: object) -> RuntimeManifestSchema:
+    if type(payload) is not dict or set(payload) != _MANIFEST_FIELDS:
+        raise ProductionRuntimeProfileError("runtime manifest schema is invalid")
+    collection_fields = ("entry_types", "directory_modes", "file_modes")
+    if any(type(payload[field]) is not list for field in collection_fields):
+        raise ProductionRuntimeProfileError("runtime manifest schema is invalid")
+    return RuntimeManifestSchema(
+        schema_id=payload["schema_id"],
+        entry_types=tuple(payload["entry_types"]),
+        directory_modes=tuple(payload["directory_modes"]),
+        file_modes=tuple(payload["file_modes"]),
+        max_entries=payload["max_entries"],
+        max_file_bytes=payload["max_file_bytes"],
+        max_path_bytes=payload["max_path_bytes"],
+    )
 
 
 def _parse_ancestor(payload: object) -> RuntimeAncestorPolicy:
@@ -699,7 +1072,15 @@ def _parse_slot(payload: dict[str, object], *, prefix: str) -> RuntimeGeneration
     if type(roles) is not dict or not roles:
         raise RuntimeAuthorityRecordError(f"{prefix} slot roles are invalid")
     parsed_roles = {name: _parse_role(role) for name, role in roles.items()}
+    lifecycle = payload[f"{prefix}_lifecycle"]
+    if type(lifecycle) is not str:
+        raise RuntimeAuthorityRecordError(f"{prefix} slot lifecycle is invalid")
+    try:
+        parsed_lifecycle = RuntimeGenerationLifecycle(lifecycle)
+    except ValueError as exc:
+        raise RuntimeAuthorityRecordError(f"{prefix} slot lifecycle is invalid") from exc
     return RuntimeGenerationSlot(
+        lifecycle=parsed_lifecycle,
         generation_id=payload[f"{prefix}_generation_id"],
         generation_path=_payload_path(
             payload[f"{prefix}_generation_path"],
@@ -776,7 +1157,12 @@ def _model_path(
     error_type: type[RuntimeAuthorityError],
     label: str,
 ) -> Path:
-    if not isinstance(value, Path) or not value.is_absolute() or "\x00" in str(value):
+    if (
+        not isinstance(value, Path)
+        or not value.is_absolute()
+        or "\x00" in str(value)
+        or len(os.fsencode(value)) > MAX_PATH_BYTES
+    ):
         raise error_type(f"{label} must be one absolute canonical path")
     canonical = Path(os.path.abspath(value))
     if value != canonical:
@@ -822,11 +1208,6 @@ def _require_sha256(
 def _require_operation_id(value: object) -> None:
     if type(value) is not str or _OPERATION_ID.fullmatch(value) is None:
         raise RuntimeAuthorityRecordError("operation id must be 32 lowercase hexadecimal bytes")
-
-
-def _require_newer_operation(previous: str, candidate: str) -> None:
-    if candidate <= previous:
-        raise RuntimeAuthorityRecordError("operation id must be unique and monotonic")
 
 
 def _identity(observed: os.stat_result) -> tuple[int, ...]:
@@ -885,23 +1266,98 @@ def _require_file_stat(
         raise error_type(f"{label} is unsafe")
 
 
+def _acquire_deployment_lock() -> _DeploymentLockLease:
+    descriptors: list[int] = []
+    descriptor = -1
+    lease: _DeploymentLockLease | None = None
+    acquired = False
+    try:
+        descriptors, parent_fd, name = _open_trusted_parent(
+            RUNTIME_AUTHORITY_LOCK_PATH,
+            directory_policy=_PRODUCTION_RUNTIME_DIRECTORY_POLICY,
+            error_type=RuntimeAuthorityPublishError,
+            label="deployment lock",
+        )
+        base_flags = (
+            os.O_RDWR
+            | _required_flag("O_NOFOLLOW", RuntimeAuthorityPublishError)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        try:
+            descriptor = os.open(
+                name,
+                base_flags | os.O_CREAT | os.O_EXCL,
+                RUNTIME_AUTHORITY_LOCK_MODE,
+                dir_fd=parent_fd,
+            )
+        except FileExistsError:
+            descriptor = os.open(name, base_flags, dir_fd=parent_fd)
+        observed = os.fstat(descriptor)
+        _require_file_stat(
+            observed,
+            owner_uid=RUNTIME_AUTHORITY_OWNER_UID,
+            mode=RUNTIME_AUTHORITY_LOCK_MODE,
+            error_type=RuntimeAuthorityPublishError,
+            label="deployment lock",
+        )
+        named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if _identity(observed) != _identity(named):
+            raise RuntimeAuthorityPublishError("deployment lock identity changed while opening")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        lease = _DeploymentLockLease(
+            descriptor=descriptor,
+            parent_fd=parent_fd,
+            name=name,
+            descriptors=descriptors,
+            identity=_identity(observed),
+        )
+        lease.assert_current()
+        acquired = True
+        return lease
+    except RuntimeAuthorityPublishError:
+        raise
+    except OSError as exc:
+        raise RuntimeAuthorityPublishError("deployment lock is unavailable") from exc
+    finally:
+        if not acquired:
+            if lease is not None:
+                lease.close()
+            else:
+                if descriptor >= 0:
+                    with suppress(OSError):
+                        os.close(descriptor)
+                _close_descriptors(descriptors)
+
+
 def _open_trusted_parent(
     path: Path,
     *,
-    anchor: Path,
-    owner_uid: int,
-    directory_mode: int,
+    directory_policy: Mapping[Path, tuple[int, int]],
     error_type: type[RuntimeAuthorityError],
     label: str,
 ) -> tuple[list[int], int, str]:
     path = _model_path(path, error_type, label)
-    anchor = _model_path(anchor, error_type, f"{label} anchor")
-    try:
-        relative = path.relative_to(anchor)
-    except ValueError as exc:
-        raise error_type(f"{label} path escapes its fixed anchor") from exc
-    if not relative.parts:
-        raise error_type(f"{label} path must be below its anchor")
+    if path.parent == path:
+        raise error_type(f"{label} has no trusted parent")
+    descriptors, parent_fd = _open_trusted_directory(
+        path.parent,
+        directory_policy=directory_policy,
+        error_type=error_type,
+        label=label,
+    )
+    return descriptors, parent_fd, path.name
+
+
+def _open_trusted_directory(
+    path: Path,
+    *,
+    directory_policy: Mapping[Path, tuple[int, int]],
+    error_type: type[RuntimeAuthorityError],
+    label: str,
+) -> tuple[list[int], int]:
+    path = _model_path(path, error_type, f"{label} directory")
+    if not isinstance(directory_policy, Mapping):
+        raise error_type(f"{label} ancestor policy is invalid")
     flags = (
         os.O_RDONLY
         | _required_flag("O_DIRECTORY", error_type)
@@ -910,34 +1366,41 @@ def _open_trusted_parent(
     )
     descriptors: list[int] = []
     try:
-        named_anchor = os.stat(anchor, follow_symlinks=False)
+        current = Path("/")
+        expected = directory_policy.get(current)
+        if expected is None:
+            raise error_type(f"{label} ancestor policy is incomplete")
+        named = os.stat(current, follow_symlinks=False)
         _require_directory_stat(
-            named_anchor,
-            owner_uid=owner_uid,
-            mode=directory_mode,
+            named,
+            owner_uid=expected[0],
+            mode=expected[1],
             error_type=error_type,
-            label=f"{label} anchor",
+            label=f"{label} ancestor {current}",
         )
-        anchor_fd = os.open(anchor, flags)
-        descriptors.append(anchor_fd)
-        if _identity(os.fstat(anchor_fd)) != _identity(named_anchor):
-            raise error_type(f"{label} anchor identity changed")
-        parent_fd = anchor_fd
-        for component in relative.parts[:-1]:
+        parent_fd = os.open(current, flags)
+        descriptors.append(parent_fd)
+        if _identity(os.fstat(parent_fd)) != _identity(named):
+            raise error_type(f"{label} ancestor identity changed")
+        for component in path.parts[1:]:
+            current /= component
+            expected = directory_policy.get(current)
+            if expected is None:
+                raise error_type(f"{label} ancestor policy is incomplete")
             named = os.stat(component, dir_fd=parent_fd, follow_symlinks=False)
             _require_directory_stat(
                 named,
-                owner_uid=owner_uid,
-                mode=directory_mode,
+                owner_uid=expected[0],
+                mode=expected[1],
                 error_type=error_type,
-                label=label,
+                label=f"{label} ancestor {current}",
             )
             child_fd = os.open(component, flags, dir_fd=parent_fd)
             descriptors.append(child_fd)
             if _identity(os.fstat(child_fd)) != _identity(named):
-                raise error_type(f"{label} identity changed")
+                raise error_type(f"{label} ancestor identity changed")
             parent_fd = child_fd
-        return descriptors, parent_fd, relative.parts[-1]
+        return descriptors, parent_fd
     except BaseException:
         _close_descriptors(descriptors)
         raise
@@ -946,43 +1409,82 @@ def _open_trusted_parent(
 def _read_trusted_file(
     path: Path,
     *,
-    anchor: Path,
+    directory_policy: Mapping[Path, tuple[int, int]],
     owner_uid: int,
-    directory_mode: int,
     file_mode: int,
     max_bytes: int,
     error_type: type[RuntimeAuthorityError],
     label: str,
 ) -> bytes:
     descriptors: list[int] = []
-    file_fd = -1
     try:
         descriptors, parent_fd, name = _open_trusted_parent(
             path,
-            anchor=anchor,
-            owner_uid=owner_uid,
-            directory_mode=directory_mode,
+            directory_policy=directory_policy,
             error_type=error_type,
             label=label,
         )
+        payload = _read_file_at(
+            parent_fd,
+            name,
+            owner_uid=owner_uid,
+            file_mode=file_mode,
+            max_bytes=max_bytes,
+            error_type=error_type,
+            label=label,
+        )
+        if payload is None:
+            raise error_type(f"{label} is missing")
+        return payload
+    except error_type:
+        raise
+    except OSError as exc:
+        raise error_type(f"{label} is unavailable") from exc
+    finally:
+        _close_descriptors(descriptors)
+
+
+def _read_file_at(
+    parent_fd: int,
+    name: str,
+    *,
+    owner_uid: int,
+    file_mode: int,
+    max_bytes: int,
+    error_type: type[RuntimeAuthorityError],
+    label: str,
+    missing_ok: bool = False,
+) -> bytes | None:
+    try:
         named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        _require_file_stat(
-            named,
-            owner_uid=owner_uid,
-            mode=file_mode,
-            error_type=error_type,
-            label=label,
-        )
-        file_fd = os.open(
+    except FileNotFoundError:
+        if missing_ok:
+            return None
+        raise error_type(f"{label} is missing") from None
+    _require_file_stat(
+        named,
+        owner_uid=owner_uid,
+        mode=file_mode,
+        error_type=error_type,
+        label=label,
+    )
+    descriptor = -1
+    try:
+        descriptor = os.open(
             name,
             os.O_RDONLY | _required_flag("O_NOFOLLOW", error_type) | getattr(os, "O_CLOEXEC", 0),
             dir_fd=parent_fd,
         )
-        before = os.fstat(file_fd)
+        before = os.fstat(descriptor)
         if _identity(before) != _identity(named):
             raise error_type(f"{label} identity changed while opening")
-        payload = _read_limited(file_fd, max_bytes=max_bytes, error_type=error_type, label=label)
-        after = os.fstat(file_fd)
+        payload = _read_limited(
+            descriptor,
+            max_bytes=max_bytes,
+            error_type=error_type,
+            label=label,
+        )
+        after = os.fstat(descriptor)
         active = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         if _identity(before) != _identity(after) or _identity(before) != _identity(active):
             raise error_type(f"{label} identity changed while reading")
@@ -992,10 +1494,9 @@ def _read_trusted_file(
     except OSError as exc:
         raise error_type(f"{label} is unavailable") from exc
     finally:
-        if file_fd >= 0:
+        if descriptor >= 0:
             with suppress(OSError):
-                os.close(file_fd)
-        _close_descriptors(descriptors)
+                os.close(descriptor)
 
 
 def _read_limited(
@@ -1017,67 +1518,321 @@ def _read_limited(
             raise error_type(f"{label} is too large")
 
 
-def _read_existing_authority(parent_fd: int, target_name: str) -> RuntimeAuthorityRecord | None:
-    try:
-        observed = os.stat(target_name, dir_fd=parent_fd, follow_symlinks=False)
-    except FileNotFoundError:
-        return None
-    _require_file_stat(
-        observed,
+def _read_record_at(
+    parent_fd: int,
+    target_name: str,
+    profile: RuntimeClosureProfile,
+    *,
+    missing_ok: bool,
+    label: str,
+) -> tuple[RuntimeAuthorityRecord, bytes] | None:
+    payload = _read_file_at(
+        parent_fd,
+        target_name,
         owner_uid=RUNTIME_AUTHORITY_OWNER_UID,
-        mode=RUNTIME_AUTHORITY_RECORD_MODE,
+        file_mode=RUNTIME_AUTHORITY_RECORD_MODE,
+        max_bytes=MAX_RECORD_BYTES,
         error_type=RuntimeAuthorityPublishError,
-        label="existing runtime authority record",
+        label=label,
+        missing_ok=missing_ok,
     )
-    descriptor = -1
+    if payload is None:
+        return None
+    record = _parse_runtime_authority_record(payload, profile)
+    if canonical_runtime_authority_bytes(record) != payload:
+        raise RuntimeAuthorityPublishError(f"{label} bytes are not canonical")
+    return record, payload
+
+
+def _validate_record(
+    record: RuntimeAuthorityRecord,
+    profile: RuntimeClosureProfile,
+) -> None:
+    if not isinstance(profile, RuntimeClosureProfile):
+        raise RuntimeAuthorityRecordError("loaded runtime profile is invalid")
+    for slot in (record.current, record.prior):
+        if slot is not None:
+            _validate_slot_against_profile(slot, profile)
+
+
+def _revalidate_record_generations(
+    record: RuntimeAuthorityRecord,
+    profile: RuntimeClosureProfile,
+) -> tuple[_DurableGenerationEvidence, ...]:
+    return tuple(
+        _revalidate_generation_slot(slot, profile)
+        for slot in (record.current, record.prior)
+        if slot is not None
+    )
+
+
+def _revalidate_generation_slot(
+    slot: RuntimeGenerationSlot,
+    profile: RuntimeClosureProfile,
+) -> _DurableGenerationEvidence:
+    descriptors: list[int] = []
+    generation_fd = -1
     try:
-        descriptor = os.open(
-            target_name,
+        _validate_slot_against_profile(slot, profile)
+        descriptors, generation_root_fd = _open_trusted_directory(
+            PRODUCTION_GENERATION_ROOT,
+            directory_policy=_PRODUCTION_RUNTIME_DIRECTORY_POLICY,
+            error_type=RuntimeAuthorityPublishError,
+            label="generation root",
+        )
+        named = os.stat(
+            slot.generation_id,
+            dir_fd=generation_root_fd,
+            follow_symlinks=False,
+        )
+        _require_directory_stat(
+            named,
+            owner_uid=RUNTIME_AUTHORITY_OWNER_UID,
+            mode=GENERATION_DIRECTORY_MODE,
+            error_type=RuntimeAuthorityPublishError,
+            label="durable generation",
+        )
+        generation_fd = os.open(
+            slot.generation_id,
             os.O_RDONLY
+            | _required_flag("O_DIRECTORY", RuntimeAuthorityPublishError)
             | _required_flag("O_NOFOLLOW", RuntimeAuthorityPublishError)
             | getattr(os, "O_CLOEXEC", 0),
-            dir_fd=parent_fd,
+            dir_fd=generation_root_fd,
         )
-        before = os.fstat(descriptor)
-        if _identity(before) != _identity(observed):
-            raise RuntimeAuthorityPublishError("existing runtime authority identity changed")
-        payload = _read_limited(
-            descriptor,
-            max_bytes=MAX_RECORD_BYTES,
+        generation_stat = os.fstat(generation_fd)
+        if _identity(generation_stat) != _identity(named):
+            raise RuntimeAuthorityPublishError("durable generation identity changed while opening")
+        manifest = _read_file_at(
+            generation_fd,
+            GENERATION_MANIFEST_NAME,
+            owner_uid=RUNTIME_AUTHORITY_OWNER_UID,
+            file_mode=GENERATION_MANIFEST_MODE,
+            max_bytes=MAX_GENERATION_MANIFEST_BYTES,
             error_type=RuntimeAuthorityPublishError,
-            label="existing runtime authority record",
+            label="generation manifest",
         )
-        after = os.fstat(descriptor)
-        active = os.stat(target_name, dir_fd=parent_fd, follow_symlinks=False)
-        if _identity(before) != _identity(after) or _identity(before) != _identity(active):
-            raise RuntimeAuthorityPublishError("existing runtime authority identity changed")
-        return parse_runtime_authority_record(payload)
+        if manifest is None:
+            raise RuntimeAuthorityPublishError("generation manifest is missing")
+        _validate_generation_manifest(manifest, slot, profile)
+        active_generation = os.stat(
+            slot.generation_id,
+            dir_fd=generation_root_fd,
+            follow_symlinks=False,
+        )
+        active_manifest = os.stat(
+            GENERATION_MANIFEST_NAME,
+            dir_fd=generation_fd,
+            follow_symlinks=False,
+        )
+        if _identity(generation_stat) != _identity(active_generation):
+            raise RuntimeAuthorityPublishError(
+                "durable generation identity changed while validating"
+            )
+        return _DurableGenerationEvidence(
+            seal=_DURABLE_EVIDENCE_SEAL,
+            slot=slot,
+            generation_identity=_identity(generation_stat),
+            manifest_identity=_identity(active_manifest),
+        )
+    except RuntimeAuthorityPublishError:
+        raise
+    except (OSError, RuntimeAuthorityRecordError) as exc:
+        raise RuntimeAuthorityPublishError("durable generation validation failed") from exc
     finally:
-        if descriptor >= 0:
+        if generation_fd >= 0:
             with suppress(OSError):
-                os.close(descriptor)
+                os.close(generation_fd)
+        _close_descriptors(descriptors)
 
 
-def _require_publish_transition(
+def _validate_slot_against_profile(
+    slot: RuntimeGenerationSlot,
+    profile: RuntimeClosureProfile,
+) -> None:
+    slot.validate_for_root(profile.generation_root)
+    if slot.profile_id != profile.profile_id:
+        raise RuntimeAuthorityRecordError("runtime slot profile id is not active")
+    if set(slot.roles) != set(profile.roles) or any(
+        role.module != profile.roles[name].module for name, role in slot.roles.items()
+    ):
+        raise RuntimeAuthorityRecordError("runtime slot roles do not match the loaded profile")
+
+
+def _validate_generation_manifest(
+    payload: bytes,
+    slot: RuntimeGenerationSlot,
+    profile: RuntimeClosureProfile,
+) -> None:
+    data = _strict_payload(
+        payload,
+        max_bytes=MAX_GENERATION_MANIFEST_BYTES,
+        error_type=RuntimeAuthorityPublishError,
+        label="generation manifest",
+    )
+    if type(data) is not dict or set(data) != _GENERATION_MANIFEST_FIELDS:
+        raise RuntimeAuthorityPublishError("generation manifest schema is invalid")
+    if canonical_json_bytes(data, trailing_newline=True) != payload:
+        raise RuntimeAuthorityPublishError("generation manifest is not canonical")
+    if hashlib.sha256(payload).hexdigest() != slot.full_manifest_hash:
+        raise RuntimeAuthorityPublishError("generation manifest hash does not match slot")
+    if (
+        data["schema_id"] != profile.manifest_schema.schema_id
+        or data["profile_id"] != profile.profile_id
+    ):
+        raise RuntimeAuthorityPublishError("generation manifest does not match the loaded profile")
+    expected_roles = {
+        name: _manifest_role_payload(role, slot.generation_path)
+        for name, role in slot.roles.items()
+    }
+    if type(data["roles"]) is not dict or data["roles"] != expected_roles:
+        raise RuntimeAuthorityPublishError(
+            "generation manifest roles do not match the authority slot"
+        )
+    entries = data["entries"]
+    if type(entries) is not list or len(entries) > profile.manifest_schema.max_entries:
+        raise RuntimeAuthorityPublishError("generation manifest entries are invalid")
+    observed_paths: list[str] = []
+    entry_types: dict[str, str] = {}
+    for entry in entries:
+        path, entry_type = _validate_generation_manifest_entry(entry, profile)
+        observed_paths.append(path)
+        entry_types[path] = entry_type
+    if observed_paths != sorted(set(observed_paths)):
+        raise RuntimeAuthorityPublishError("generation manifest entries are not canonical")
+    required_paths = {role["python_path"]: "file" for role in expected_roles.values()}
+    for role in expected_roles.values():
+        required_paths[role["working_directory"]] = "directory"
+        required_paths[role["app_source"]] = "directory"
+        required_paths.update({path: "directory" for path in role["site_packages"]})
+    if any(entry_types.get(path) != kind for path, kind in required_paths.items()):
+        raise RuntimeAuthorityPublishError(
+            "generation manifest does not cover every runtime role path"
+        )
+
+
+def _manifest_role_payload(
+    role: RuntimeRoleSpec,
+    generation_path: Path,
+) -> dict[str, object]:
+    def relative(path: Path) -> str:
+        try:
+            value = path.relative_to(generation_path)
+        except ValueError as exc:
+            raise RuntimeAuthorityPublishError(
+                "generation manifest role path escapes its generation"
+            ) from exc
+        if not value.parts:
+            raise RuntimeAuthorityPublishError("generation manifest role path is empty")
+        return value.as_posix()
+
+    return {
+        "python_path": relative(role.python_path),
+        "module": role.module,
+        "working_directory": relative(role.working_directory),
+        "app_source": relative(role.app_source),
+        "site_packages": [relative(path) for path in role.site_packages],
+    }
+
+
+def _validate_generation_manifest_entry(
+    entry: object,
+    profile: RuntimeClosureProfile,
+) -> tuple[str, str]:
+    if type(entry) is not dict or set(entry) != _GENERATION_MANIFEST_ENTRY_FIELDS:
+        raise RuntimeAuthorityPublishError("generation manifest entry schema is invalid")
+    path = entry["path"]
+    entry_type = entry["type"]
+    if (
+        type(path) is not str
+        or not path
+        or path.startswith("/")
+        or path == GENERATION_MANIFEST_NAME
+        or len(path.encode("utf-8")) > profile.manifest_schema.max_path_bytes
+        or any(component in {"", ".", ".."} for component in path.split("/"))
+    ):
+        raise RuntimeAuthorityPublishError("generation manifest entry path is invalid")
+    if entry_type not in profile.manifest_schema.entry_types:
+        raise RuntimeAuthorityPublishError("generation manifest entry type is invalid")
+    if type(entry["owner_uid"]) is not int or entry["owner_uid"] != RUNTIME_AUTHORITY_OWNER_UID:
+        raise RuntimeAuthorityPublishError("generation manifest entry owner is invalid")
+    mode = entry["mode"]
+    size = entry["size"]
+    sha256 = entry["sha256"]
+    if entry_type == "directory":
+        valid = (
+            type(mode) is int
+            and mode in profile.manifest_schema.directory_modes
+            and type(size) is int
+            and size == 0
+            and sha256 is None
+        )
+    else:
+        valid = (
+            type(mode) is int
+            and mode in profile.manifest_schema.file_modes
+            and type(size) is int
+            and 0 <= size <= profile.manifest_schema.max_file_bytes
+            and type(sha256) is str
+            and _SHA256.fullmatch(sha256) is not None
+        )
+    if not valid:
+        raise RuntimeAuthorityPublishError("generation manifest entry metadata is invalid")
+    return path, entry_type
+
+
+def _consume_generation_evidence(
+    evidence: tuple[_DurableGenerationEvidence, ...],
+    record: RuntimeAuthorityRecord,
+    profile: RuntimeClosureProfile,
+) -> None:
+    if len(evidence) != 1 + (record.prior is not None):
+        raise RuntimeAuthorityPublishError("durable generation evidence is incomplete")
+    refreshed = _revalidate_record_generations(record, profile)
+    if refreshed != evidence:
+        raise RuntimeAuthorityPublishError("durable generation evidence expired")
+
+
+def _validate_publication_transition(
     previous: RuntimeAuthorityRecord | None,
     candidate: RuntimeAuthorityRecord,
+    profile: RuntimeClosureProfile,
 ) -> None:
+    _validate_record(candidate, profile)
     if previous is None:
         if candidate.state is not RuntimeAuthorityState.ACTIVE or candidate.prior is not None:
             raise RuntimeAuthorityPublishError("first authority record must have no prior slot")
+        if candidate.sequence != 1:
+            raise RuntimeAuthorityPublishError("first authority sequence must be one")
         return
-    try:
-        _require_newer_operation(previous.operation_id, candidate.operation_id)
-    except RuntimeAuthorityRecordError as exc:
-        raise RuntimeAuthorityPublishError("authority operation is not monotonic") from exc
+    _validate_record(previous, profile)
+    if candidate.operation_id == previous.operation_id:
+        raise RuntimeAuthorityPublishError("authority operation id conflicts")
+    if candidate.sequence != previous.sequence + 1:
+        raise RuntimeAuthorityPublishError("authority sequence must advance by one")
     if candidate.state is RuntimeAuthorityState.ACTIVE:
-        valid = candidate.prior == previous.current
+        forbidden = {previous.current.generation_id}
+        if previous.prior is not None:
+            forbidden.add(previous.prior.generation_id)
+        valid = candidate.current.generation_id not in forbidden and candidate.prior == replace(
+            previous.current,
+            lifecycle=RuntimeGenerationLifecycle.ROLLBACK_READY,
+        )
     else:
         valid = (
             previous.state is RuntimeAuthorityState.ACTIVE
             and previous.prior is not None
-            and candidate.current == previous.prior
-            and candidate.prior == previous.current
+            and previous.prior.lifecycle is RuntimeGenerationLifecycle.ROLLBACK_READY
+            and candidate.current
+            == replace(
+                previous.prior,
+                lifecycle=RuntimeGenerationLifecycle.ACTIVE,
+            )
+            and candidate.prior
+            == replace(
+                previous.current,
+                lifecycle=RuntimeGenerationLifecycle.FAILED,
+            )
         )
     if not valid:
         raise RuntimeAuthorityPublishError("authority record is not one valid state transition")
