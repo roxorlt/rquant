@@ -5,13 +5,25 @@ from datetime import UTC, datetime, timedelta, timezone
 import pytest
 from pydantic import ValidationError
 
+from rquant import signal_contracts
 from rquant.runtime_contracts import RuntimeContractModel
 from rquant.signal_contracts import SignalAction, SignalEnvelope
+from rquant.strict_json import canonical_json_bytes
 
 _HASH_A = "a" * 64
 _HASH_B = "b" * 64
 _HASH_C = "c" * 64
 _COMMIT = "d" * 40
+_ZERO_COMMIT = "0" * 40
+
+_LEGACY_SIGNAL_IDS = {
+    (1, _ZERO_COMMIT): "f9c779c01399c7c6554778335bed19107206b7114c1f54c9e04929296e4e4da2",
+    (1, _COMMIT): "cd7afd6b503b390c268d07ccc10c782ec5c181c97deb39927298d04227e58f4c",
+    (2, _ZERO_COMMIT): "58776536fa077ad048c31d0cd930e48844ea233715eb3962192ddb149d02e157",
+    (2, _COMMIT): "60281eb0d1c2fa8ab0d3a04d6dc385d45905e458f20ed6ed208656e4718635b0",
+    (3, _ZERO_COMMIT): "95f72b6d9c7233438c3b97726aeff7da19b6b9ece2dc7138f1ff520197158744",
+    (3, _COMMIT): "28fdb6371fce685ebefbd43699ee761645280ed80d8ef01dcf8d16f205874c43",
+}
 
 
 def _signal_kwargs() -> dict[str, object]:
@@ -31,6 +43,420 @@ def _signal_kwargs() -> dict[str, object]:
         "expires_at": datetime(2026, 7, 31, 2, 0, tzinfo=UTC),
         "producer_commit": _COMMIT,
     }
+
+
+def _legacy_canonical_bytes(
+    *,
+    schema_version: int,
+    producer_commit: str,
+    signal_id: str,
+) -> bytes:
+    return canonical_json_bytes(
+        {
+            "schema_version": schema_version,
+            "signal_id": signal_id,
+            "strategy_id": "n-shape",
+            "strategy_version": "2.1.0",
+            "parameter_fingerprint": _HASH_A,
+            "dataset_snapshot_id": _HASH_B,
+            "feature_snapshot_id": _HASH_C,
+            "event_time": "2026-07-31T01:31:00Z",
+            "available_at": "2026-07-31T01:32:00Z",
+            "candidate_id": "600000.SH",
+            "action": "b_intent",
+            "reason_codes": ["above_vwap", "same_minute_volume"],
+            "evidence": {"levels": {"resistance": 10.2}, "volume_ratio": 2.5},
+            "expires_at": "2026-07-31T02:00:00Z",
+            "producer_commit": producer_commit,
+        }
+    )
+
+
+def _current_kwargs(producer_identity: dict[str, object]) -> dict[str, object]:
+    kwargs = _signal_kwargs()
+    kwargs.pop("schema_version")
+    kwargs.pop("producer_commit")
+    kwargs["envelope_schema"] = "rquant.signal-envelope/v1"
+    kwargs["producer_identity"] = producer_identity
+    return kwargs
+
+
+class TestR01LegacyFamily:
+    @pytest.mark.parametrize(
+        ("schema_version", "producer_commit"),
+        tuple(_LEGACY_SIGNAL_IDS),
+        ids=[
+            "v1-zero",
+            "v1-commit",
+            "v2-zero",
+            "v2-commit",
+            "v3-zero",
+            "v3-commit",
+        ],
+    )
+    def test_roundtrips_historical_ids_and_canonical_bytes(
+        self,
+        schema_version: int,
+        producer_commit: str,
+    ) -> None:
+        legacy_type = signal_contracts.LegacySignalEnvelope
+        expected_id = _LEGACY_SIGNAL_IDS[(schema_version, producer_commit)]
+        original = _legacy_canonical_bytes(
+            schema_version=schema_version,
+            producer_commit=producer_commit,
+            signal_id=expected_id,
+        )
+
+        parsed = signal_contracts.parse_signal_envelope(original)
+        mapped = signal_contracts.parse_signal_envelope(parsed.model_dump(mode="python"))
+
+        assert type(parsed) is legacy_type
+        assert type(mapped) is legacy_type
+        assert mapped == parsed
+        assert parsed.signal_id == expected_id
+        assert canonical_json_bytes(parsed.model_dump(mode="json")) == original
+        assert legacy_type.model_validate_json(original) == parsed
+        assert legacy_type.model_validate(parsed.model_dump(mode="python")) == parsed
+        assert parsed.legacy_read_status.value == (
+            "legacy_zero_sentinel" if producer_commit == _ZERO_COMMIT else "legacy_commit_claim"
+        )
+        assert "legacy_read_status" not in parsed.model_dump(mode="python")
+
+    def test_compatibility_name_is_the_explicit_legacy_type(self) -> None:
+        assert SignalEnvelope is signal_contracts.LegacySignalEnvelope
+
+    @pytest.mark.parametrize("schema_version", [True, 1.0, "1"])
+    def test_requires_a_native_integer_schema_version(self, schema_version: object) -> None:
+        kwargs = _signal_kwargs()
+        kwargs["schema_version"] = schema_version
+
+        with pytest.raises(ValidationError, match="schema_version"):
+            signal_contracts.LegacySignalEnvelope(**kwargs)
+
+    @pytest.mark.parametrize(
+        "extra",
+        [
+            {"envelope_schema": "rquant.signal-envelope/v1"},
+            {"producer_identity": {"kind": "git-commit-claim-sha1/v1"}},
+            {"producer_generation_id": _HASH_A},
+        ],
+    )
+    def test_rejects_current_family_root_fields(self, extra: dict[str, object]) -> None:
+        kwargs = _signal_kwargs()
+        kwargs.update(extra)
+
+        with pytest.raises(ValidationError, match="extra_forbidden"):
+            signal_contracts.LegacySignalEnvelope(**kwargs)
+
+
+class TestR02WriteBoundary:
+    def test_rejects_a_mismatched_stored_legacy_signal_id(self) -> None:
+        kwargs = _signal_kwargs()
+        kwargs["signal_id"] = "0" * 64
+
+        with pytest.raises(ValidationError, match="signal_id"):
+            signal_contracts.parse_signal_envelope(kwargs)
+
+    def test_current_canonical_writer_rejects_legacy_objects(self) -> None:
+        legacy = signal_contracts.LegacySignalEnvelope(**_signal_kwargs())
+
+        with pytest.raises(TypeError, match="CurrentSignalEnvelope"):
+            signal_contracts.current_signal_envelope_json_bytes(legacy)
+
+
+class TestR03CurrentProducerIdentity:
+    @pytest.mark.parametrize(
+        ("identity", "expected_type_name"),
+        [
+            (
+                {
+                    "kind": "git-commit-claim-sha1/v1",
+                    "producer_commit": _COMMIT,
+                },
+                "GitCommitClaimIdentity",
+            ),
+            (
+                {
+                    "kind": "full-manifest-sha256/v1",
+                    "producer_generation_id": _HASH_A,
+                },
+                "FullManifestIdentity",
+            ),
+        ],
+        ids=["git-commit-claim", "full-manifest"],
+    )
+    def test_accepts_each_exact_identity_variant(
+        self,
+        identity: dict[str, object],
+        expected_type_name: str,
+    ) -> None:
+        current = signal_contracts.CurrentSignalEnvelope(**_current_kwargs(identity))
+
+        assert type(current.producer_identity).__name__ == expected_type_name
+        assert current.signal_id is not None
+        assert len(current.signal_id) == 64
+
+    @pytest.mark.parametrize(
+        ("kind", "field", "value"),
+        [
+            ("git-commit-claim-sha1/v1", "producer_commit", "0" * 40),
+            ("git-commit-claim-sha1/v1", "producer_commit", "D" * 40),
+            ("git-commit-claim-sha1/v1", "producer_commit", "d" * 39),
+            ("git-commit-claim-sha1/v1", "producer_commit", "g" * 40),
+            ("git-commit-claim-sha1/v1", "producer_commit", None),
+            ("full-manifest-sha256/v1", "producer_generation_id", "0" * 64),
+            ("full-manifest-sha256/v1", "producer_generation_id", "A" * 64),
+            ("full-manifest-sha256/v1", "producer_generation_id", "a" * 63),
+            ("full-manifest-sha256/v1", "producer_generation_id", "g" * 64),
+            ("full-manifest-sha256/v1", "producer_generation_id", None),
+        ],
+        ids=[
+            "git-zero",
+            "git-uppercase",
+            "git-short",
+            "git-nonhex",
+            "git-null",
+            "manifest-zero",
+            "manifest-uppercase",
+            "manifest-short",
+            "manifest-nonhex",
+            "manifest-null",
+        ],
+    )
+    def test_rejects_noncanonical_or_zero_active_identity_values(
+        self,
+        kind: str,
+        field: str,
+        value: object,
+    ) -> None:
+        identity = {"kind": kind, field: value}
+
+        with pytest.raises(ValidationError, match=field):
+            signal_contracts.CurrentSignalEnvelope(**_current_kwargs(identity))
+
+    @pytest.mark.parametrize(
+        "identity",
+        [
+            {"kind": "git-commit-claim-sha1/v1"},
+            {
+                "kind": "git-commit-claim-sha1/v1",
+                "producer_commit": _COMMIT,
+                "producer_generation_id": _HASH_A,
+            },
+            {
+                "kind": "git-commit-claim-sha1/v1",
+                "producer_commit": _COMMIT,
+                "producer_generation_id": None,
+            },
+            {"kind": "full-manifest-sha256/v1"},
+            {
+                "kind": "full-manifest-sha256/v1",
+                "producer_generation_id": _HASH_A,
+                "producer_commit": _COMMIT,
+            },
+            {
+                "kind": "full-manifest-sha256/v1",
+                "producer_generation_id": _HASH_A,
+                "producer_commit": None,
+            },
+            {
+                "kind": "full-manifest-sha256/v1",
+                "producer_generation_id": _HASH_A,
+                "unexpected": "field",
+            },
+        ],
+        ids=[
+            "git-neither",
+            "git-both",
+            "git-inactive-null",
+            "manifest-neither",
+            "manifest-both",
+            "manifest-inactive-null",
+            "extra-field",
+        ],
+    )
+    def test_rejects_both_neither_inactive_null_or_extra_identity_fields(
+        self,
+        identity: dict[str, object],
+    ) -> None:
+        with pytest.raises(ValidationError, match="missing|extra_forbidden"):
+            signal_contracts.CurrentSignalEnvelope(**_current_kwargs(identity))
+
+    def test_reuses_common_validation_and_deep_evidence_freezing(self) -> None:
+        kwargs = _current_kwargs({"kind": "git-commit-claim-sha1/v1", "producer_commit": _COMMIT})
+        kwargs["reason_codes"] = ("same_minute_volume", "above_vwap")
+        current = signal_contracts.CurrentSignalEnvelope(**kwargs)
+
+        assert current.reason_codes == ("above_vwap", "same_minute_volume")
+        with pytest.raises(TypeError):
+            current.evidence["levels"]["resistance"] = 11.0  # type: ignore[index]
+
+        invalid_time = dict(kwargs)
+        invalid_time["event_time"] = invalid_time["expires_at"]
+        with pytest.raises(ValidationError, match="event_time"):
+            signal_contracts.CurrentSignalEnvelope(**invalid_time)
+
+
+class TestR04StructuralDispatcher:
+    @pytest.mark.parametrize(
+        "identity",
+        [
+            {"kind": "git-commit-claim-sha1/v1", "producer_commit": _COMMIT},
+            {
+                "kind": "full-manifest-sha256/v1",
+                "producer_generation_id": _HASH_A,
+            },
+        ],
+        ids=["mapping-and-json-git", "mapping-and-json-manifest"],
+    )
+    def test_dispatches_mapping_and_json_to_the_exact_current_family(
+        self,
+        identity: dict[str, object],
+    ) -> None:
+        current = signal_contracts.CurrentSignalEnvelope(**_current_kwargs(identity))
+        mapping_payload = current.model_dump(mode="python")
+        json_payload = canonical_json_bytes(current.model_dump(mode="json"))
+
+        mapped = signal_contracts.parse_signal_envelope(mapping_payload)
+        decoded = signal_contracts.parse_signal_envelope(json_payload)
+
+        assert type(mapped) is signal_contracts.CurrentSignalEnvelope
+        assert type(decoded) is signal_contracts.CurrentSignalEnvelope
+        assert mapped == decoded == current
+
+    @pytest.mark.parametrize(
+        "envelope_schema",
+        ["rquant.signal-envelope/v2", None, 1],
+        ids=["unknown", "null", "non-string"],
+    )
+    def test_rejects_unknown_or_nonexact_family_discriminators(
+        self,
+        envelope_schema: object,
+    ) -> None:
+        payload = _current_kwargs({"kind": "git-commit-claim-sha1/v1", "producer_commit": _COMMIT})
+        payload["envelope_schema"] = envelope_schema
+
+        with pytest.raises(
+            (TypeError, ValueError, ValidationError),
+            match="envelope_schema|schema",
+        ):
+            signal_contracts.parse_signal_envelope(payload)
+
+    @pytest.mark.parametrize(
+        "mutation",
+        [
+            {"schema_version": 1},
+            {"producer_commit": _COMMIT},
+            {"producer_generation_id": _HASH_A},
+            {"unexpected": True},
+        ],
+        ids=["legacy-version", "legacy-commit", "root-generation", "extra-root"],
+    )
+    def test_rejects_mixed_or_extra_current_root_keys(
+        self,
+        mutation: dict[str, object],
+    ) -> None:
+        payload = _current_kwargs({"kind": "git-commit-claim-sha1/v1", "producer_commit": _COMMIT})
+        payload.update(mutation)
+
+        with pytest.raises(ValidationError, match="extra_forbidden"):
+            signal_contracts.parse_signal_envelope(payload)
+
+    @pytest.mark.parametrize(
+        "mutation",
+        [
+            {"producer_identity": None},
+            {"producer_identity": {"kind": "unknown/v1"}},
+        ],
+        ids=["neither-family", "unknown-identity-kind"],
+    )
+    def test_rejects_objects_satisfying_no_exact_family(
+        self,
+        mutation: dict[str, object],
+    ) -> None:
+        payload = _current_kwargs({"kind": "git-commit-claim-sha1/v1", "producer_commit": _COMMIT})
+        payload.update(mutation)
+
+        with pytest.raises(ValidationError):
+            signal_contracts.parse_signal_envelope(payload)
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            b'{"envelope_schema":',
+            b"[]",
+            (
+                b'{"envelope_schema":"rquant.signal-envelope/v1",'
+                b'"envelope_schema":"rquant.signal-envelope/v1"}'
+            ),
+        ],
+        ids=["malformed-json", "non-object-json", "duplicate-discriminator"],
+    )
+    def test_json_dispatch_rejects_malformed_or_ambiguous_inputs(self, payload: bytes) -> None:
+        with pytest.raises((TypeError, ValueError)):
+            signal_contracts.parse_signal_envelope(payload)
+
+
+class TestR05CurrentIdentitySeparation:
+    def test_rejects_a_mismatched_current_signal_id(self) -> None:
+        kwargs = _current_kwargs({"kind": "git-commit-claim-sha1/v1", "producer_commit": _COMMIT})
+        kwargs["signal_id"] = "0" * 64
+
+        with pytest.raises(ValidationError, match="signal_id"):
+            signal_contracts.CurrentSignalEnvelope(**kwargs)
+
+    def test_separates_legacy_current_kind_and_active_identity_values(self) -> None:
+        legacy = signal_contracts.LegacySignalEnvelope(**_signal_kwargs())
+        git_d = signal_contracts.CurrentSignalEnvelope(
+            **_current_kwargs({"kind": "git-commit-claim-sha1/v1", "producer_commit": "d" * 40})
+        )
+        git_e = signal_contracts.CurrentSignalEnvelope(
+            **_current_kwargs({"kind": "git-commit-claim-sha1/v1", "producer_commit": "e" * 40})
+        )
+        manifest_d = signal_contracts.CurrentSignalEnvelope(
+            **_current_kwargs(
+                {
+                    "kind": "full-manifest-sha256/v1",
+                    "producer_generation_id": "d" * 64,
+                }
+            )
+        )
+        manifest_e = signal_contracts.CurrentSignalEnvelope(
+            **_current_kwargs(
+                {
+                    "kind": "full-manifest-sha256/v1",
+                    "producer_generation_id": "e" * 64,
+                }
+            )
+        )
+
+        assert (
+            len(
+                {
+                    legacy.signal_id,
+                    git_d.signal_id,
+                    git_e.signal_id,
+                    manifest_d.signal_id,
+                    manifest_e.signal_id,
+                }
+            )
+            == 5
+        )
+
+    def test_current_canonical_writer_roundtrips_only_the_current_family(self) -> None:
+        current = signal_contracts.CurrentSignalEnvelope(
+            **_current_kwargs(
+                {
+                    "kind": "full-manifest-sha256/v1",
+                    "producer_generation_id": _HASH_A,
+                }
+            )
+        )
+
+        payload = signal_contracts.current_signal_envelope_json_bytes(current)
+
+        assert payload == canonical_json_bytes(current.model_dump(mode="json"))
+        assert signal_contracts.parse_signal_envelope(payload) == current
 
 
 def test_signal_id_is_stable_for_evidence_order_and_equivalent_timezones() -> None:
