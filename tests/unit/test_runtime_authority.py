@@ -4,6 +4,8 @@ import hashlib
 import inspect
 import multiprocessing
 import os
+import shutil
+import socket
 import stat
 from dataclasses import replace
 from pathlib import Path
@@ -15,6 +17,7 @@ import pytest
 import rquant.runtime_authority as authority_module
 from rquant.runtime_authority import (
     ProductionRuntimeProfileError,
+    RuntimeAuthorityDurabilityError,
     RuntimeAuthorityPublishError,
     RuntimeAuthorityRecord,
     RuntimeAuthorityRecordError,
@@ -263,33 +266,54 @@ def _materialize_generation_slot(
     directory_paths = (
         "release",
         "release/src",
+        "release/src/rquant",
         "venv",
         "venv/bin",
         "venv/lib",
         "venv/lib/python3.11",
         "venv/lib/python3.11/site-packages",
     )
-    executable = marker.encode("utf-8")
+    files = {
+        "release/src/rquant/__init__.py": b"",
+        "release/src/rquant/runtime_service_main.py": b"def main():\n    return 0\n",
+        "venv/bin/python": marker.encode("utf-8"),
+    }
+    fixture_key = hashlib.sha256(
+        f"{marker}:{manifest_profile_id}:{manifest_module}".encode()
+    ).hexdigest()[:16]
+    staging = generation_root / f".fixture-{fixture_key}"
+    staging.mkdir(mode=0o700)
+    for relative in directory_paths:
+        (staging / relative).mkdir(mode=0o700)
+    for relative, content in files.items():
+        target = staging / relative
+        target.write_bytes(content)
+        target.chmod(0o555 if relative == "venv/bin/python" else 0o444)
+    for relative in reversed(directory_paths):
+        (staging / relative).chmod(0o555)
     entries = [
         {
             "path": path,
             "type": "directory",
             "owner_uid": os.getuid(),
             "mode": 0o555,
+            "nlink": (staging / path).stat().st_nlink,
             "size": 0,
             "sha256": None,
         }
         for path in directory_paths
     ]
-    entries.append(
+    entries.extend(
         {
-            "path": "venv/bin/python",
+            "path": path,
             "type": "file",
             "owner_uid": os.getuid(),
-            "mode": 0o555,
-            "size": len(executable),
-            "sha256": hashlib.sha256(executable).hexdigest(),
+            "mode": 0o555 if path == "venv/bin/python" else 0o444,
+            "nlink": (staging / path).stat().st_nlink,
+            "size": len(content),
+            "sha256": hashlib.sha256(content).hexdigest(),
         }
+        for path, content in files.items()
     )
     manifest = canonical_json_bytes(
         {
@@ -302,11 +326,15 @@ def _materialize_generation_slot(
     )
     generation_id = hashlib.sha256(manifest).hexdigest()
     generation = generation_root / generation_id
-    generation.mkdir(mode=0o700, exist_ok=True)
-    manifest_path = generation / authority_module.GENERATION_MANIFEST_NAME
-    if not manifest_path.exists():
-        manifest_path.write_bytes(manifest)
-        manifest_path.chmod(0o444)
+    manifest_path = staging / authority_module.GENERATION_MANIFEST_NAME
+    manifest_path.write_bytes(manifest)
+    manifest_path.chmod(0o444)
+    if generation.exists():
+        for directory, _subdirectories, _files in os.walk(staging):
+            Path(directory).chmod(0o700)
+        shutil.rmtree(staging)
+    else:
+        staging.rename(generation)
     return RuntimeGenerationSlot(
         lifecycle=lifecycle,
         generation_id=generation_id,
@@ -802,11 +830,8 @@ def test_atomic_publish_crash_exposes_only_complete_old_or_new(
     monkeypatch.setattr(authority_module, "_fsync_descriptor", fail_fsync)
     monkeypatch.setattr(authority_module, "_replace_record", fail_replace)
 
-    if phase == "parent_fsync":
-        assert publish_runtime_authority(new).value == "committed_after_recovery"
-    else:
-        with pytest.raises(RuntimeAuthorityPublishError):
-            publish_runtime_authority(new)
+    with pytest.raises(RuntimeAuthorityPublishError):
+        publish_runtime_authority(new)
 
     visible = parse_runtime_authority_record(path.read_bytes())
     assert visible == (new if new_visible else old)
@@ -856,7 +881,6 @@ def test_temp_recovery_cleans_only_exact_operation_without_directory_inference(
     assert not temp.exists()
     assert unrelated.read_bytes() == b"keep"
     assert not cleanup_runtime_authority_temp(operation_id)
-    assert "listdir" not in Path(authority_module.__file__).read_text(encoding="utf-8")
 
 
 def test_runtime_authority_public_models_are_frozen_stdlib_dataclasses() -> None:
@@ -1041,9 +1065,13 @@ def test_hyb1_p1_05_parent_fsync_failure_recovers_committed_record(
         operation_id="2" * 32,
     )
     original_fsync = authority_module._fsync_descriptor
+    parent_fsync_calls = 0
 
     def fail_parent_fsync(descriptor: int, *, phase_name: str) -> None:
+        nonlocal parent_fsync_calls
         if phase_name == "parent_fsync":
+            parent_fsync_calls += 1
+        if phase_name == "parent_fsync" and parent_fsync_calls == 1:
             raise OSError("injected parent fsync failure")
         original_fsync(descriptor, phase_name=phase_name)
 
@@ -1052,7 +1080,101 @@ def test_hyb1_p1_05_parent_fsync_failure_recovers_committed_record(
     result = publish_runtime_authority(record)
 
     assert result.value == "committed_after_recovery"
+    assert parent_fsync_calls == 2
     assert load_runtime_authority() == record
+
+
+def test_hyb1_p1_05_persistent_parent_fsync_failure_is_typed_blocked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path, generation_root = _install_authority_fixture(tmp_path, monkeypatch)
+    record = _record(generation_root)
+    parent_fsync_calls = 0
+
+    def fail_parent_fsync(_descriptor: int, *, phase_name: str) -> None:
+        nonlocal parent_fsync_calls
+        if phase_name == "parent_fsync":
+            parent_fsync_calls += 1
+            raise OSError("persistent parent fsync failure")
+
+    monkeypatch.setattr(authority_module, "_fsync_descriptor", fail_parent_fsync)
+
+    with pytest.raises(RuntimeAuthorityDurabilityError, match="durability"):
+        publish_runtime_authority(record)
+
+    assert parent_fsync_calls == 2
+    assert path.read_bytes() == canonical_runtime_authority_bytes(record)
+
+
+def test_hyb1_p1_05_blocked_same_operation_retry_fsyncs_and_converges(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _path, generation_root = _install_authority_fixture(tmp_path, monkeypatch)
+    record = _record(generation_root)
+    original_fsync = authority_module._fsync_descriptor
+    parent_fsync_calls = 0
+
+    def fail_twice_then_fsync(descriptor: int, *, phase_name: str) -> None:
+        nonlocal parent_fsync_calls
+        if phase_name == "parent_fsync":
+            parent_fsync_calls += 1
+            if parent_fsync_calls <= 2:
+                raise OSError("blocked parent fsync")
+        original_fsync(descriptor, phase_name=phase_name)
+
+    monkeypatch.setattr(authority_module, "_fsync_descriptor", fail_twice_then_fsync)
+
+    with pytest.raises(RuntimeAuthorityDurabilityError, match="durability"):
+        publish_runtime_authority(record)
+    result = publish_runtime_authority(record)
+
+    assert result.value == "idempotent"
+    assert parent_fsync_calls == 3
+
+
+@pytest.mark.parametrize("tamper", ("operation", "sequence", "prior", "canonical"))
+def test_hyb1_p1_05_parent_fsync_recovery_requires_exact_reopened_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper: str,
+) -> None:
+    path, generation_root = _install_authority_fixture(tmp_path, monkeypatch)
+    previous = _record(generation_root)
+    path.write_bytes(canonical_runtime_authority_bytes(previous))
+    path.chmod(0o444)
+    record = prepare_runtime_authority_publish(
+        previous,
+        _record(generation_root, current_marker="next").current,
+        operation_id="2" * 32,
+    )
+
+    def fail_after_tamper(_descriptor: int, *, phase_name: str) -> None:
+        if phase_name != "parent_fsync":
+            return
+        if tamper == "operation":
+            payload = canonical_runtime_authority_bytes(replace(record, operation_id="f" * 32))
+        elif tamper == "sequence":
+            payload = canonical_runtime_authority_bytes(
+                replace(record, sequence=record.sequence + 1)
+            )
+        elif tamper == "prior":
+            assert record.prior is not None
+            payload = canonical_runtime_authority_bytes(
+                replace(record, prior=replace(record.prior, commit="untrusted-tamper"))
+            )
+        else:
+            payload = canonical_runtime_authority_bytes(record) + b" "
+        path.chmod(0o644)
+        path.write_bytes(payload)
+        path.chmod(0o444)
+        raise OSError("injected parent fsync failure")
+
+    monkeypatch.setattr(authority_module, "_fsync_descriptor", fail_after_tamper)
+
+    with pytest.raises(RuntimeAuthorityPublishError):
+        publish_runtime_authority(record)
 
 
 def test_hyb1_p1_04_deployment_lock_serializes_two_processes_from_predecessor_read(
@@ -1215,6 +1337,95 @@ def test_hyb1_p1_08_publication_rejects_unsafe_or_tampered_manifest(
     assert not list(path.parent.glob(".current.*.tmp"))
 
 
+def test_hyb1_p1_08_manifest_entries_exactly_cover_materialized_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path, generation_root = _install_authority_fixture(tmp_path, monkeypatch)
+    record = _record(generation_root)
+    generation = record.current.generation_path
+
+    assert (generation / "venv/bin/python").is_file()
+    assert (generation / "release").is_dir()
+    assert (generation / "release/src/rquant/runtime_service_main.py").is_file()
+    assert (generation / "venv/lib/python3.11/site-packages").is_dir()
+    assert publish_runtime_authority(record).value == "committed"
+    assert path.exists()
+
+
+@pytest.mark.parametrize(
+    "fault",
+    (
+        "missing",
+        "extra",
+        "symlink",
+        "hardlink",
+        "mode",
+        "bytes",
+        "directory-mode",
+        "fifo",
+        "socket",
+    ),
+)
+def test_hyb1_p1_08_generation_tree_must_exactly_match_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+) -> None:
+    path, generation_root = _install_authority_fixture(tmp_path, monkeypatch)
+    record = _record(generation_root)
+    generation = record.current.generation_path
+    target = generation / "release/src/rquant/runtime_service_main.py"
+    parent = target.parent
+    opened_socket: socket.socket | None = None
+    if fault == "missing":
+        parent.chmod(0o755)
+        target.unlink()
+        parent.chmod(0o555)
+    elif fault == "extra":
+        parent.chmod(0o755)
+        extra = parent / "extra.py"
+        extra.write_bytes(b"pass\n")
+        extra.chmod(0o444)
+        parent.chmod(0o555)
+    elif fault == "symlink":
+        parent.chmod(0o755)
+        target.unlink()
+        target.symlink_to("__init__.py")
+        parent.chmod(0o555)
+    elif fault == "hardlink":
+        parent.chmod(0o755)
+        os.link(target, parent / "alias.py")
+        parent.chmod(0o555)
+    elif fault == "mode":
+        target.chmod(0o644)
+    elif fault == "bytes":
+        target.chmod(0o644)
+        target.write_bytes(b"def main():\n    return 1\n")
+        target.chmod(0o444)
+    elif fault == "directory-mode":
+        (generation / "release/src").chmod(0o755)
+    elif fault == "fifo":
+        parent.chmod(0o755)
+        os.mkfifo(parent / "injected.fifo", mode=0o444)
+        parent.chmod(0o555)
+    else:
+        parent.chmod(0o755)
+        opened_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        monkeypatch.chdir(parent)
+        opened_socket.bind("injected.socket")
+        parent.chmod(0o555)
+
+    try:
+        with pytest.raises(RuntimeAuthorityPublishError, match="generation"):
+            publish_runtime_authority(record)
+    finally:
+        if opened_socket is not None:
+            opened_socket.close()
+
+    assert not path.exists()
+
+
 @pytest.mark.parametrize("fault", ("profile", "roles"))
 def test_hyb1_p1_08_manifest_must_match_loaded_profile_and_slot_roles(
     tmp_path: Path,
@@ -1301,6 +1512,46 @@ def test_hyb1_p1_08_expired_evidence_rejects_pre_rename_replacement(
     assert len(list(path.parent.glob(".current.*.tmp"))) == 1
 
 
+@pytest.mark.parametrize("replaced", ("inode", "bytes", "extra"))
+def test_hyb1_p1_08_evidence_detects_nested_tree_replacement_before_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replaced: str,
+) -> None:
+    path, generation_root = _install_authority_fixture(tmp_path, monkeypatch)
+    record = _record(generation_root)
+    target = record.current.generation_path / "release/src/rquant/runtime_service_main.py"
+    parent = target.parent
+    original_write = authority_module._write_all
+
+    def replace_after_evidence(descriptor: int, payload: bytes) -> None:
+        original_write(descriptor, payload)
+        if replaced == "inode":
+            parent.chmod(0o755)
+            old = target.with_suffix(".old")
+            target.rename(old)
+            target.write_bytes(old.read_bytes())
+            target.chmod(0o444)
+            old.unlink()
+            parent.chmod(0o555)
+        elif replaced == "bytes":
+            target.chmod(0o644)
+            target.write_bytes(b"def main():\n    return 2\n")
+            target.chmod(0o444)
+        else:
+            parent.chmod(0o755)
+            extra = parent / "late.py"
+            extra.write_bytes(b"pass\n")
+            extra.chmod(0o444)
+            parent.chmod(0o555)
+
+    monkeypatch.setattr(authority_module, "_write_all", replace_after_evidence)
+
+    with pytest.raises(RuntimeAuthorityPublishError, match="evidence|generation"):
+        publish_runtime_authority(record)
+    assert not path.exists()
+
+
 def test_hyb1_p1_08_durable_evidence_is_private_sealed_and_not_exported(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1314,6 +1565,7 @@ def test_hyb1_p1_08_durable_evidence_is_private_sealed_and_not_exported(
             slot=slot,
             generation_identity=(),
             manifest_identity=(),
+            tree_identities=(),
         )
     assert "_DurableGenerationEvidence" not in authority_module.__all__
 

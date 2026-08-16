@@ -109,6 +109,10 @@ class RuntimeAuthorityPublishError(RuntimeAuthorityError):
     """Atomic publication or exact temporary recovery failed."""
 
 
+class RuntimeAuthorityDurabilityError(RuntimeAuthorityPublishError):
+    """The visible authority record could not be durably synchronized."""
+
+
 class RuntimeAuthorityRollbackError(RuntimeAuthorityRecordError):
     """The requested automatic rollback violates the one-level contract."""
 
@@ -166,12 +170,24 @@ class _DurableGenerationEvidence:
     slot: RuntimeGenerationSlot
     generation_identity: tuple[int, ...]
     manifest_identity: tuple[int, ...]
+    tree_identities: tuple[tuple[str, tuple[int, ...]], ...]
 
     def __post_init__(self) -> None:
         if self.seal is not _DURABLE_EVIDENCE_SEAL:
             raise RuntimeAuthorityPublishError(
                 "durable generation evidence cannot be constructed by callers"
             )
+
+
+@dataclass(frozen=True)
+class _GenerationManifestEntry:
+    path: str
+    entry_type: str
+    owner_uid: int
+    mode: int
+    nlink: int
+    size: int
+    sha256: str | None
 
 
 @dataclass(frozen=True)
@@ -641,6 +657,7 @@ _GENERATION_MANIFEST_ENTRY_FIELDS = {
     "type",
     "owner_uid",
     "mode",
+    "nlink",
     "size",
     "sha256",
 }
@@ -896,6 +913,7 @@ def publish_runtime_authority(
         if previous is not None and previous.operation_id == record.operation_id:
             if existing[1] == payload:
                 _revalidate_record_generations(record, profile)
+                _fsync_authority_parent(parent_fd, lock_lease)
                 return RuntimeAuthorityPublishResult.IDEMPOTENT
             raise RuntimeAuthorityPublishError("authority operation id conflicts")
         _validate_publication_transition(previous, record, profile)
@@ -942,7 +960,7 @@ def publish_runtime_authority(
         _replace_record(parent_fd, temporary_name)
         try:
             _fsync_descriptor(parent_fd, phase_name="parent_fsync")
-        except OSError:
+        except OSError as exc:
             recovered = _read_record_at(
                 parent_fd,
                 target_name,
@@ -952,9 +970,11 @@ def publish_runtime_authority(
             )
             if recovered is not None and recovered[0] == record and recovered[1] == payload:
                 _consume_generation_evidence(evidence, record, profile)
-                lock_lease.assert_current()
+                _fsync_authority_parent(parent_fd, lock_lease)
                 return RuntimeAuthorityPublishResult.COMMITTED_AFTER_RECOVERY
-            raise
+            raise RuntimeAuthorityDurabilityError(
+                "runtime authority recovery did not find the exact committed record"
+            ) from exc
         lock_lease.assert_current()
         return RuntimeAuthorityPublishResult.COMMITTED
     except RuntimeAuthorityPublishError:
@@ -1223,6 +1243,10 @@ def _identity(observed: os.stat_result) -> tuple[int, ...]:
     )
 
 
+def _inode_identity(observed: os.stat_result) -> tuple[int, int]:
+    return observed.st_dev, observed.st_ino
+
+
 def _required_flag(name: str, error_type: type[RuntimeAuthorityError]) -> int:
     value = getattr(os, name, 0)
     if not value:
@@ -1380,7 +1404,15 @@ def _open_trusted_directory(
         )
         parent_fd = os.open(current, flags)
         descriptors.append(parent_fd)
-        if _identity(os.fstat(parent_fd)) != _identity(named):
+        opened = os.fstat(parent_fd)
+        _require_directory_stat(
+            opened,
+            owner_uid=expected[0],
+            mode=expected[1],
+            error_type=error_type,
+            label=f"{label} ancestor {current}",
+        )
+        if _inode_identity(opened) != _inode_identity(named):
             raise error_type(f"{label} ancestor identity changed")
         for component in path.parts[1:]:
             current /= component
@@ -1388,21 +1420,65 @@ def _open_trusted_directory(
             if expected is None:
                 raise error_type(f"{label} ancestor policy is incomplete")
             named = os.stat(component, dir_fd=parent_fd, follow_symlinks=False)
-            _require_directory_stat(
+            child_fd = _open_directory_entry(
+                parent_fd,
+                component,
                 named,
                 owner_uid=expected[0],
                 mode=expected[1],
                 error_type=error_type,
                 label=f"{label} ancestor {current}",
             )
-            child_fd = os.open(component, flags, dir_fd=parent_fd)
             descriptors.append(child_fd)
-            if _identity(os.fstat(child_fd)) != _identity(named):
-                raise error_type(f"{label} ancestor identity changed")
             parent_fd = child_fd
         return descriptors, parent_fd
     except BaseException:
         _close_descriptors(descriptors)
+        raise
+
+
+def _open_directory_entry(
+    parent_fd: int,
+    name: str,
+    named: os.stat_result,
+    *,
+    owner_uid: int,
+    mode: int,
+    error_type: type[RuntimeAuthorityError],
+    label: str,
+) -> int:
+    _require_directory_stat(
+        named,
+        owner_uid=owner_uid,
+        mode=mode,
+        error_type=error_type,
+        label=label,
+    )
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY
+            | _required_flag("O_DIRECTORY", error_type)
+            | _required_flag("O_NOFOLLOW", error_type)
+            | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_fd,
+        )
+        opened = os.fstat(descriptor)
+        _require_directory_stat(
+            opened,
+            owner_uid=owner_uid,
+            mode=mode,
+            error_type=error_type,
+            label=label,
+        )
+        if _inode_identity(opened) != _inode_identity(named):
+            raise error_type(f"{label} identity changed while opening")
+        return descriptor
+    except BaseException:
+        if descriptor >= 0:
+            with suppress(OSError):
+                os.close(descriptor)
         raise
 
 
@@ -1614,7 +1690,12 @@ def _revalidate_generation_slot(
         )
         if manifest is None:
             raise RuntimeAuthorityPublishError("generation manifest is missing")
-        _validate_generation_manifest(manifest, slot, profile)
+        manifest_entries = _validate_generation_manifest(manifest, slot, profile)
+        tree_identities = _validate_generation_tree(
+            generation_fd,
+            manifest_entries,
+            profile,
+        )
         active_generation = os.stat(
             slot.generation_id,
             dir_fd=generation_root_fd,
@@ -1625,6 +1706,13 @@ def _revalidate_generation_slot(
             dir_fd=generation_fd,
             follow_symlinks=False,
         )
+        _require_file_stat(
+            active_manifest,
+            owner_uid=RUNTIME_AUTHORITY_OWNER_UID,
+            mode=GENERATION_MANIFEST_MODE,
+            error_type=RuntimeAuthorityPublishError,
+            label="generation manifest",
+        )
         if _identity(generation_stat) != _identity(active_generation):
             raise RuntimeAuthorityPublishError(
                 "durable generation identity changed while validating"
@@ -1634,6 +1722,7 @@ def _revalidate_generation_slot(
             slot=slot,
             generation_identity=_identity(generation_stat),
             manifest_identity=_identity(active_manifest),
+            tree_identities=tree_identities,
         )
     except RuntimeAuthorityPublishError:
         raise
@@ -1663,7 +1752,7 @@ def _validate_generation_manifest(
     payload: bytes,
     slot: RuntimeGenerationSlot,
     profile: RuntimeClosureProfile,
-) -> None:
+) -> tuple[_GenerationManifestEntry, ...]:
     data = _strict_payload(
         payload,
         max_bytes=MAX_GENERATION_MANIFEST_BYTES,
@@ -1692,12 +1781,13 @@ def _validate_generation_manifest(
     entries = data["entries"]
     if type(entries) is not list or len(entries) > profile.manifest_schema.max_entries:
         raise RuntimeAuthorityPublishError("generation manifest entries are invalid")
-    observed_paths: list[str] = []
+    manifest_entries: list[_GenerationManifestEntry] = []
     entry_types: dict[str, str] = {}
     for entry in entries:
-        path, entry_type = _validate_generation_manifest_entry(entry, profile)
-        observed_paths.append(path)
-        entry_types[path] = entry_type
+        parsed = _validate_generation_manifest_entry(entry, profile)
+        manifest_entries.append(parsed)
+        entry_types[parsed.path] = parsed.entry_type
+    observed_paths = [entry.path for entry in manifest_entries]
     if observed_paths != sorted(set(observed_paths)):
         raise RuntimeAuthorityPublishError("generation manifest entries are not canonical")
     required_paths = {role["python_path"]: "file" for role in expected_roles.values()}
@@ -1709,6 +1799,7 @@ def _validate_generation_manifest(
         raise RuntimeAuthorityPublishError(
             "generation manifest does not cover every runtime role path"
         )
+    return tuple(manifest_entries)
 
 
 def _manifest_role_payload(
@@ -1738,7 +1829,7 @@ def _manifest_role_payload(
 def _validate_generation_manifest_entry(
     entry: object,
     profile: RuntimeClosureProfile,
-) -> tuple[str, str]:
+) -> _GenerationManifestEntry:
     if type(entry) is not dict or set(entry) != _GENERATION_MANIFEST_ENTRY_FIELDS:
         raise RuntimeAuthorityPublishError("generation manifest entry schema is invalid")
     path = entry["path"]
@@ -1757,12 +1848,15 @@ def _validate_generation_manifest_entry(
     if type(entry["owner_uid"]) is not int or entry["owner_uid"] != RUNTIME_AUTHORITY_OWNER_UID:
         raise RuntimeAuthorityPublishError("generation manifest entry owner is invalid")
     mode = entry["mode"]
+    nlink = entry["nlink"]
     size = entry["size"]
     sha256 = entry["sha256"]
     if entry_type == "directory":
         valid = (
             type(mode) is int
             and mode in profile.manifest_schema.directory_modes
+            and type(nlink) is int
+            and nlink >= 2
             and type(size) is int
             and size == 0
             and sha256 is None
@@ -1771,6 +1865,8 @@ def _validate_generation_manifest_entry(
         valid = (
             type(mode) is int
             and mode in profile.manifest_schema.file_modes
+            and type(nlink) is int
+            and nlink == 1
             and type(size) is int
             and 0 <= size <= profile.manifest_schema.max_file_bytes
             and type(sha256) is str
@@ -1778,7 +1874,138 @@ def _validate_generation_manifest_entry(
         )
     if not valid:
         raise RuntimeAuthorityPublishError("generation manifest entry metadata is invalid")
-    return path, entry_type
+    return _GenerationManifestEntry(
+        path=path,
+        entry_type=entry_type,
+        owner_uid=entry["owner_uid"],
+        mode=mode,
+        nlink=nlink,
+        size=size,
+        sha256=sha256,
+    )
+
+
+def _validate_generation_tree(
+    generation_fd: int,
+    entries: tuple[_GenerationManifestEntry, ...],
+    profile: RuntimeClosureProfile,
+) -> tuple[tuple[str, tuple[int, ...]], ...]:
+    expected = {entry.path: entry for entry in entries}
+    observed: dict[str, tuple[int, ...]] = {}
+    root_before = os.fstat(generation_fd)
+    _walk_generation_directory(
+        generation_fd,
+        relative_parent="",
+        expected=expected,
+        observed=observed,
+        profile=profile,
+    )
+    root_after = os.fstat(generation_fd)
+    if _identity(root_before) != _identity(root_after):
+        raise RuntimeAuthorityPublishError("generation tree root identity changed while validating")
+    if root_before.st_nlink < 2:
+        raise RuntimeAuthorityPublishError("generation tree root directory link count is invalid")
+    if set(observed) != set(expected):
+        raise RuntimeAuthorityPublishError("generation tree does not exactly match manifest paths")
+    return tuple(sorted(observed.items()))
+
+
+def _walk_generation_directory(
+    directory_fd: int,
+    *,
+    relative_parent: str,
+    expected: Mapping[str, _GenerationManifestEntry],
+    observed: dict[str, tuple[int, ...]],
+    profile: RuntimeClosureProfile,
+) -> None:
+    for name in sorted(os.listdir(directory_fd)):
+        if not relative_parent and name == GENERATION_MANIFEST_NAME:
+            manifest_stat = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            _require_file_stat(
+                manifest_stat,
+                owner_uid=RUNTIME_AUTHORITY_OWNER_UID,
+                mode=GENERATION_MANIFEST_MODE,
+                error_type=RuntimeAuthorityPublishError,
+                label="generation manifest",
+            )
+            continue
+        relative_path = name if not relative_parent else f"{relative_parent}/{name}"
+        try:
+            path_size = len(relative_path.encode("utf-8"))
+        except UnicodeEncodeError as exc:
+            raise RuntimeAuthorityPublishError("generation tree path is not valid UTF-8") from exc
+        if path_size > profile.manifest_schema.max_path_bytes:
+            raise RuntimeAuthorityPublishError("generation tree path is too long")
+        named = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(named.st_mode) and not stat.S_ISREG(named.st_mode):
+            raise RuntimeAuthorityPublishError(
+                "generation tree contains a symlink or special entry"
+            )
+        entry = expected.get(relative_path)
+        if entry is None:
+            raise RuntimeAuthorityPublishError(
+                "generation tree contains a path absent from its manifest"
+            )
+        if stat.S_ISDIR(named.st_mode):
+            if entry.entry_type != "directory" or named.st_nlink != entry.nlink:
+                raise RuntimeAuthorityPublishError(
+                    "generation tree directory metadata does not match its manifest: "
+                    f"{relative_path} has nlink {named.st_nlink}, expected {entry.nlink}"
+                )
+            child_fd = _open_directory_entry(
+                directory_fd,
+                name,
+                named,
+                owner_uid=entry.owner_uid,
+                mode=entry.mode,
+                error_type=RuntimeAuthorityPublishError,
+                label=f"generation tree directory {relative_path}",
+            )
+            try:
+                _walk_generation_directory(
+                    child_fd,
+                    relative_parent=relative_path,
+                    expected=expected,
+                    observed=observed,
+                    profile=profile,
+                )
+                after = os.fstat(child_fd)
+                active = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                if _identity(named) != _identity(after) or _identity(named) != _identity(active):
+                    raise RuntimeAuthorityPublishError(
+                        "generation tree directory identity changed while validating"
+                    )
+            finally:
+                with suppress(OSError):
+                    os.close(child_fd)
+        else:
+            if entry.entry_type != "file" or named.st_nlink != entry.nlink:
+                raise RuntimeAuthorityPublishError(
+                    "generation tree file metadata does not match its manifest"
+                )
+            payload = _read_file_at(
+                directory_fd,
+                name,
+                owner_uid=entry.owner_uid,
+                file_mode=entry.mode,
+                max_bytes=profile.manifest_schema.max_file_bytes,
+                error_type=RuntimeAuthorityPublishError,
+                label=f"generation tree file {relative_path}",
+            )
+            if (
+                payload is None
+                or len(payload) != entry.size
+                or hashlib.sha256(payload).hexdigest() != entry.sha256
+            ):
+                raise RuntimeAuthorityPublishError(
+                    "generation tree file bytes do not match its manifest"
+                )
+            active = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if _identity(named) != _identity(active):
+                raise RuntimeAuthorityPublishError(
+                    "generation tree file identity changed while validating"
+                )
+        observed[relative_path] = _identity(named)
 
 
 def _consume_generation_evidence(
@@ -1788,7 +2015,10 @@ def _consume_generation_evidence(
 ) -> None:
     if len(evidence) != 1 + (record.prior is not None):
         raise RuntimeAuthorityPublishError("durable generation evidence is incomplete")
-    refreshed = _revalidate_record_generations(record, profile)
+    try:
+        refreshed = _revalidate_record_generations(record, profile)
+    except RuntimeAuthorityPublishError as exc:
+        raise RuntimeAuthorityPublishError("durable generation evidence expired") from exc
     if refreshed != evidence:
         raise RuntimeAuthorityPublishError("durable generation evidence expired")
 
@@ -1851,6 +2081,20 @@ def _write_all(descriptor: int, payload: bytes) -> None:
         offset += written
 
 
+def _fsync_authority_parent(
+    parent_fd: int,
+    lock_lease: _DeploymentLockLease,
+) -> None:
+    lock_lease.assert_current()
+    try:
+        _fsync_descriptor(parent_fd, phase_name="parent_fsync")
+    except OSError as exc:
+        raise RuntimeAuthorityDurabilityError(
+            "runtime authority durability remains blocked"
+        ) from exc
+    lock_lease.assert_current()
+
+
 def _fsync_descriptor(descriptor: int, *, phase_name: str) -> None:
     del phase_name
     os.fsync(descriptor)
@@ -1875,6 +2119,7 @@ __all__ = [
     "ProductionRuntimeProfileError",
     "RuntimeAncestorPolicy",
     "RuntimeAuthorityError",
+    "RuntimeAuthorityDurabilityError",
     "RuntimeAuthorityPublishError",
     "RuntimeAuthorityRecord",
     "RuntimeAuthorityRecordError",
