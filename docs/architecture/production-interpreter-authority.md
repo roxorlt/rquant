@@ -573,6 +573,26 @@ is accepted only when its bytes are identical; different bytes for the same sequ
 audit evidence and reject. Every visible record and chain edge is verified before exposure. A
 temporary file, orphan, directory listing, latest timestamp, or highest sequence is never authority.
 
+#### Future V3 Hardened Immutable Publication Contract
+
+`RESET-R07-P2-01` freezes a future v3-only hardened immutable publication primitive for the later
+writer tranche. It is a distinct primitive and MUST NOT modify, wrap, dispatch through, or change
+the behavior or bytes of the untouched v2 `rquant.signal_route_spool._immutable_write_at`.
+
+For a v3 record target that already exists after a crash between immutable link and
+records-directory fsync, the future primitive opens and compares the complete existing bytes. If
+they are byte-identical, it MUST fsync the records directory again before any pointer publication
+can begin; merely accepting the existing link is insufficient durability evidence. If the bytes
+differ, it rejects before creating, replacing, or fsyncing any pointer temporary or visible pointer.
+The same directory-fsync obligation applies whether retry observed a freshly created link or an
+identical pre-existing target.
+
+This is a frozen later-writer contract and crash red test, not a Phase A implementation grant.
+Phase A synthetic fixture construction remains read-only/in-memory and cannot import, call, expose,
+or make this primitive reachable through `rquant.runtime_service_main.build_builtin_registry`, its
+builtin factory, any production builder, or any runtime capability. No production v3 writer exists
+in Phase A.
+
 #### Complete No-Activation Inventory
 
 Every current-family production write boundary below remains legacy-only and fails before its first
@@ -598,9 +618,12 @@ local preflight is a required Phase A red test and implementation prerequisite.
 | `rquant.runtime_serving_snapshot.SignalDeliveryPayload` | current-family registry-writer payload rejects before authority publication |
 | `rquant.runtime_builder_signal._publish_signal_authority` | no current-family serving payload may reach authority publication |
 | `rquant.runtime_serving_authority.ServingSourceAuthorityPublisher.publish` | current-family signal payload rejects before generation or pointer filesystem mutation |
-| `rquant.runtime_service_builtin.build_builtin_registry` and all signal-path builders | no builder may import, construct, inject, or return a durable v3 writer, capability, fixture, overlay branch, cursor, drain, or cutover path |
+| `rquant.runtime_service_main.build_builtin_registry` | the actual top-level production registry entrypoint may not import, construct, inject, return, or make reachable a v3 writer, capability, environment flag, cursor, drain, cutover object, fixture publication path, or overlay branch |
+| `rquant.runtime_service_builtin.build_builtin_registry` and all signal-path builders | the implementation factory and builders obey the same reachability prohibition and cannot hide a forbidden object behind a registry entry, closure, protocol, callback, or capability value |
 
 The builder rule covers
+`rquant.runtime_service_main.build_builtin_registry`,
+`rquant.runtime_service_builtin.build_builtin_registry`,
 `rquant.runtime_builder_strategy.strategy_live_builder`,
 `rquant.runtime_builder_signal.signal_router_builder`,
 `rquant.runtime_builder_signal.notifier_builder`,
@@ -627,25 +650,59 @@ their complete schema declarations, and their physical schemas. It rejects a dec
 missing model, a future qualname, a string that does not resolve to the declared class, or a
 descriptor computed from a qualname alone.
 
-For each successor channel, the exact model descriptor hash is:
+`RESET-REG-P1-01` freezes four exact future schemas. In this subsection,
+`canonical_sha256(value)` means
+`SHA256(rquant.strict_json.canonical_json_bytes(value))`. Every SHA-256 field is a strict lowercase
+64-hex string. Every other string is strict, nonempty, and accepted without normalization. Tuple
+fields are exact tuples, sorted by the key stated below, duplicate-free, and nonempty unless this
+section says otherwise.
+
+`SuccessorChannelV1` has exactly:
 
 ```text
-SHA256(canonical_json_bytes({
-  "payload_model": channel.payload_model,
-  "declaration_schema_fingerprint": channel.declaration.schema_fingerprint,
-  "physical_schema_fingerprint":
-      channel.physical_schema.physical_schema_fingerprint
-}))
+channel_id
+payload_model
+declaration_schema_fingerprint
+physical_schema_fingerprint
+model_descriptor_hash
+producer_service_ids
+consumer_service_ids
+channel_hash
 ```
 
-Here `channel.payload_model` is the authoritative string stored by the successor base bundle and
-must resolve to the actual class in the generation source closure. The other two values come from
-that same verified channel object. No overlay supplies or alters any of the three inputs.
+`producer_service_ids` and `consumer_service_ids` are independently sorted unique tuples of exact
+service IDs. `payload_model` is the authoritative qualified model string and MUST resolve inside the
+generation source closure to the actual class before this declaration can exist. Its exact model
+descriptor preimage and hash are:
 
-Only after a successor base bundle is valid may a subordinate staged overlay bind its already
-declared channels. The future overlay bundle schema is exactly
-`overlay_namespace`, `overlay_version`, `base_bundle_content_hash`, sorted
-`declarations`, and `content_hash`. Each declaration schema is exactly:
+```text
+model_descriptor_hash = canonical_sha256({
+  "payload_model": payload_model,
+  "declaration_schema_fingerprint": declaration_schema_fingerprint,
+  "physical_schema_fingerprint": physical_schema_fingerprint
+})
+```
+
+`channel_hash = canonical_sha256(channel.model_dump(mode="json", exclude={"channel_hash"}))`.
+The declaration and physical fingerprints come from the same authoritative successor channel
+contract as `payload_model`; no overlay supplies or alters them.
+
+`SuccessorBundleV1` has exactly:
+
+```text
+schema_version: strict native int == 1
+bundle_namespace: literal "rquant.signal-family.successor"
+channels: exact tuple[SuccessorChannelV1, ...]
+content_hash
+```
+
+`channels` is sorted by `channel_id` and has no duplicate channel ID or hash.
+`content_hash = canonical_sha256(bundle.model_dump(mode="json", exclude={"content_hash"}))`.
+The raw successor authority bytes MUST equal
+`rquant.strict_json.canonical_json_bytes(bundle.model_dump(mode="json"))` byte-for-byte.
+
+Only after that successor bundle is valid may a subordinate staged overlay bind its already
+declared channels. `OverlayDeclarationV1` has exactly:
 
 ```text
 channel_id
@@ -658,21 +715,49 @@ pair_ids
 declaration_hash
 ```
 
-Every tuple is sorted and duplicate-free. `declaration_hash` is the SHA-256 of strict canonical
-declaration bytes excluding itself. `content_hash` binds the exact namespace, version, successor
-base bundle content hash, and complete sorted declaration tuple. Bundle fields and declaration
-fields are distinct schemas; neither accepts the other's fields. The overlay cannot add a channel,
-model, producer, consumer, field, physical schema, or family absent from its successor base.
+`accepted_family_ids` and `pair_ids` are sorted unique tuples. The channel and all four base/model
+hash bindings must equal the referenced `SuccessorChannelV1` and its containing bundle.
+
+```text
+declaration_hash = canonical_sha256(
+  declaration.model_dump(mode="json", exclude={"declaration_hash"})
+)
+```
+
+`OverlayBundleV1` has exactly:
+
+```text
+overlay_namespace: literal "rquant.signal-family.overlay"
+overlay_version: strict native int == 1
+base_bundle_content_hash
+declarations: exact tuple[OverlayDeclarationV1, ...]
+content_hash
+```
+
+`declarations` is sorted by `channel_id` and has no duplicate channel ID or declaration hash.
+`content_hash = canonical_sha256(overlay.model_dump(mode="json", exclude={"content_hash"}))`.
+The raw overlay authority bytes MUST equal
+`rquant.strict_json.canonical_json_bytes(overlay.model_dump(mode="json"))` byte-for-byte. If either
+declaration type is serialized independently, its raw bytes have the same full-model canonical-byte
+equality requirement.
+
+All four schemas use a duplicate-free strict structural decoder. Extra keys, duplicate JSON keys,
+coerced scalar types, booleans as integers, mappings or subclasses in place of exact nested models,
+unsorted tuple variants, aliases, unknown channels, hash mismatch, and noncanonical whitespace,
+Unicode escaping, key order, or newline reject. Bundle and declaration schemas cannot accept each
+other's fields. The overlay cannot add a channel, model, producer, consumer, field, physical schema,
+or family absent from its successor base. A successor or overlay declaration before its actual
+payload model exists rejects.
 
 An absent overlay grants nothing. A partial overlay can be staged but can never become `READY`.
-Byte-identical replay is idempotent. Reuse of an overlay identity or declaration identity with
-different bytes appends conflict audit evidence and rejects.
+Byte-identical replay is idempotent. Reuse of a bundle, channel, overlay, or declaration identity
+with different bytes appends conflict audit evidence and rejects.
 
 ### Phase C: Root-Derived Verification And Readiness
 
 Phase C is blocked until the successor base channels and staged overlay exist and until an immutable
-in-generation verification manifest, exact service-to-runtime-role bindings, root/release verifier,
-and protected append-only verification store are implemented.
+in-generation verification manifest, exact service-to-runtime-role bindings, separate root-owned
+verifier process/fixed harness, and root-owned append-only verification store are implemented.
 
 #### Exact Pair And Callable-Object Allowlist
 
@@ -680,6 +765,26 @@ The receipt set contains exactly these five pair IDs:
 `strategy-router`, `strategy-shadow`, `router-notifier`, `router-paper`, and
 `notifier-serving`. Dynamic services from `RuntimeServiceKind.STRATEGY_LIVE` are producer
 evidence; they never emit or stand in for reader receipts.
+
+Let `STRATEGIES` be the nonempty sorted tuple of every service ID in the validated target production
+profile whose kind is `RuntimeServiceKind.STRATEGY_LIVE`. Let `ROUTER`, `SHADOW`, `NOTIFIER`,
+`PAPER_BROKER`, and `SERVING_PUBLISHER` be the service ID of the target profile's unique manifest
+of kind `SIGNAL_ROUTER`, `SHADOW_SESSION`, `NOTIFIER`, `PAPER_BROKER`, and `SERVING_PUBLISHER`,
+respectively. Missing or duplicate singleton kinds reject. The exact service sides of the pair map
+are:
+
+| Pair ID | Producer service IDs | Consumer service IDs |
+|---|---|---|
+| `strategy-router` | every ID in `STRATEGIES` | `ROUTER` |
+| `strategy-shadow` | every ID in `STRATEGIES` | `SHADOW` |
+| `router-notifier` | `ROUTER` | `NOTIFIER` |
+| `router-paper` | `ROUTER` | `PAPER_BROKER` |
+| `notifier-serving` | `NOTIFIER` | `SERVING_PUBLISHER` |
+
+`participating_service_ids` is exactly the sorted unique union of every producer and consumer
+service ID in those five rows. It therefore includes all dynamic strategy services plus router,
+shadow, notifier, paper broker, and serving publisher. A handwritten subset, static strategy list,
+service count, or service kind in place of those resolved IDs rejects.
 
 The pair-to-surface map is exact. Producer surfaces prove transport production but do not count as
 reader receipts. Reader surfaces are the code exercised for that pair's one verifier-issued receipt.
@@ -692,41 +797,126 @@ reader receipts. Reader surfaces are the code exercised for that pair's one veri
 | `router-paper` | `rquant.signal_route_spool.SignalRouteSpool.publish`; `rquant.signal_route_spool.publish_signal_bus_prefix` | `rquant.signal_route_spool.ReadonlySignalRouteSpool.signals_after_global_sequence`; `rquant.paper_signal_consumer.consume_signal_bus_to_paper`; `rquant.paper_signal_worker.PaperSignalQueueStore.ingest` |
 | `notifier-serving` | `rquant.runtime_builder_signal._publish_signal_authority`; `rquant.runtime_serving_authority.ServingSourceAuthorityPublisher.publish` | `rquant.runtime_serving_authority.ServingSourceAuthorityReader.__call__`; `rquant.runtime_serving_snapshot.ServingSnapshotAssembler.assemble`; `rquant.serving_read_models.build_serving_read_models` |
 
-These entries are callable objects, not free-form receipt strings. The verifier resolves each object
-inside the selected generation with its generation interpreter, derives
-`object.__module__ + "." + object.__qualname__`, and requires equality with the allowlist entry.
-It binds the module's manifest-backed source-relative path and exact source-file hash from the full
-manifest. Aliases, wrappers, monkeypatches, alternate modules, unmanifested files, noncallable
-objects, omitted surfaces, and additional surfaces reject. Verification starts through the actual
-manifest-backed production builders above; direct unit construction cannot substitute for that
-path.
+These entries are callable objects, not free-form receipt strings. The fixed harness resolves each
+object only inside the unprivileged child generation interpreter, derives
+`object.__module__ + "." + object.__qualname__`, and returns its bounded result under the frozen
+surface ID. The root process never imports the object; it independently checks the expected
+qualname, the binding's manifest-backed source-relative path, and exact source-file hash against the
+full manifest and child result. Aliases, wrappers, monkeypatches, alternate modules, unmanifested
+files, noncallable objects, omitted surfaces, and additional surfaces reject. Child verification
+starts through the actual manifest-backed production builders above; direct unit construction
+cannot substitute for that path.
+
+#### Exact Verification Service Bindings
+
+`RESET-REG-P1-02` freezes `VerificationServiceBindingV1` in the immutable, root-approved,
+in-generation verification manifest. It has exactly:
+
+```text
+service_id
+runtime_service_kind
+role_name
+service_manifest_fingerprint
+executable_module
+executable_source_relative_path
+executable_source_sha256
+surface_ids
+binding_hash
+```
+
+`runtime_service_kind` is an exact `RuntimeServiceKind` value. Each surface ID is a member of a
+closed enum whose value is the exact callable qualname shown in the pair-to-surface table, never a
+free-form string. `surface_ids` is the nonempty sorted unique tuple of those enum members assigned
+to that service. The path is a normalized relative POSIX path with no empty, dot, parent, absolute,
+alternate-separator, or symlink-resolved escape component. All strings and hashes are strict; extra
+fields and coercion reject. The exact hash is:
+
+```text
+binding_hash = canonical_sha256(
+  binding.model_dump(mode="json", exclude={"binding_hash"})
+)
+```
+
+The complete service-binding tuple is sorted by `service_id`, has no duplicate service ID or
+binding hash, and covers exactly `participating_service_ids`. Multiple dynamic strategy services
+may share the same declared role and exact surface tuple; such sharing grants no alias and each
+service still requires its own fingerprinted binding.
+`service_bindings_hash` is `canonical_sha256` of the complete full-model dump of that sorted tuple.
+Both the tuple and `service_bindings_hash` are fields of the immutable test manifest, and both are
+included in the execution-evidence hash preimage.
+
+These values are declared by the root-approved verification manifest; they are not derived from
+nonexistent executable module/path fields on `RuntimeServiceManifest`. Before child execution, the
+root verifier independently requires each `service_id`, `runtime_service_kind`, and
+`service_manifest_fingerprint` to equal the exact manifest in the validated production profile;
+requires `role_name` to exist and `executable_module` to equal
+`RuntimeGenerationSlot.roles[role_name].module`; resolves the executable source path beneath the
+selected generation without traversal or symlink escape; matches its relative path and SHA-256 to
+the full generation manifest; and resolves every `surface_id` to the exact callable-object allowlist
+entry. Missing, duplicate, cross-role, wrong-kind, wrong-module, wrong-path, wrong-source-hash,
+unmanifested, omitted-surface, or extra-surface bindings reject before any child starts.
 
 #### Dedicated signal_family_verification Authority
 
 Signal-family readiness MUST NOT reuse self-attested
 `rquant.schema_compatibility.ConsumerCapabilityReceipt`. A dedicated future
-`signal_family_verification` subsystem exposes only verifier-owned operations. The root/release
-verifier:
+`signal_family_verification` subsystem has a separate root-owned verifier process as the sole owner
+and sole writer of the root-owned append store. Filesystem ownership and mode prevent `lighthouse`
+and service processes from opening that store for write. The root verifier MUST NOT import or
+execute any generation code in its own process, and it opens no append-store descriptor before the
+generation child has exited.
 
-1. acquires `rquant.runtime_authority.RuntimeDeploymentLock` and reopens the current runtime
-   authority and validated `RuntimeGenerationSlot`;
-2. loads an immutable verification manifest from that generation and checks its hash and path in
-   the full manifest;
-3. derives the authority operation ID and sequence, generation ID, `full_manifest_hash`, profile
-   ID, exact service manifests, and exact service-to-runtime-role mapping;
-4. executes every declared family/surface vector with the generation interpreter through the actual
-   production builders and validates the strict canonical result bytes and expected hashes;
-5. derives observed exact families and surfaces plus test-manifest, execution-result/evidence,
-   verifier-policy, service-manifest, and full-manifest hashes; and
-6. reopens the authority while still under `RuntimeDeploymentLock`, then appends evidence only if
-   the complete authority snapshot is unchanged.
+The root verifier performs this sequence:
 
-The full manifest is the source closure; no separate caller-claimed source closure can replace it.
-Each service ID maps to exactly one runtime role named in the immutable verification manifest. That
-mapping must equal the selected `RuntimeGenerationSlot.roles`, the service manifest's executable
-module/path, and the full-manifest entries. Missing, duplicate, cross-role, or unmanifested service
-bindings reject. `code_commit` remains audit-only and cannot prove authority, source, service,
-family, surface, or test execution.
+1. Acquire `rquant.runtime_authority.RuntimeDeploymentLock`, reopen the current runtime authority
+   and validated `RuntimeGenerationSlot`, load the immutable root-approved verification manifest
+   and its immutable test manifest from that generation, validate every
+   `VerificationServiceBindingV1`, and derive the authority operation/sequence,
+   generation/full-manifest/profile, exact service manifests, frozen vectors, policy, and expected
+   canonical results.
+2. Launch the generation-local interpreter as a separate unprivileged `lighthouse` child using a
+   fixed root-owned harness. The child receives a sanitized fixed environment, fixed argv and cwd,
+   no supplementary privilege or escalation path, and closed inherited file descriptors except the
+   canonical request/result IPC pipes. It receives no store descriptor, store path, store
+   capability, verifier-module import path, root module object, or caller-supplied Python path.
+3. The fixed harness imports generation code only in the child and executes every declared
+   family/surface vector through the actual production builders. It emits exactly one bounded
+   canonical IPC result and exits; extra output, timeout, signal death, nonzero status, open pipe,
+   or inherited-descriptor mismatch rejects.
+4. After child exit, the root process strictly decodes the IPC result and independently validates
+   the expected run/vector identities, exact family/surface set, canonical result bytes and hashes,
+   immutable test-manifest and service-binding tuple/hash, source paths/hashes, full-manifest source
+   closure, service manifests, and verifier policy. Child claims cannot replace root-derived values.
+5. Still under `RuntimeDeploymentLock`, reopen authority and the validated generation slot after
+   all child validation. Any operation, sequence, slot, generation, full-manifest, profile, role, or
+   source change between the initial snapshot, child completion, and append rejects.
+6. Only then may the root process open the protected append store and write the five receipts and
+   readiness transaction itself. The child, caller, and services never append evidence or receipts.
+
+The child's future `SignalFamilyVectorResultV1` schema is exactly `vector_id`, `pair_id`,
+`family_id`, `surface_id`, `canonical_result_json`, and `canonical_result_sha256`.
+`canonical_result_json` is strict nonempty UTF-8 JSON bounded to 65,536 bytes and its bytes/hash must
+equal the expected test-manifest result. The future `SignalFamilyChildResultV1` schema is exactly:
+
+```text
+schema_version: strict native int == 1
+run_id: lowercase SHA-256
+test_manifest_hash: lowercase SHA-256
+vector_results: exact tuple[SignalFamilyVectorResultV1, ...]
+result_hash: lowercase SHA-256
+```
+
+`vector_results` is bounded by the exact test-manifest vector count, sorted by
+`(pair_id, family_id, surface_id, vector_id)`, and duplicate-free. `result_hash` is
+`canonical_sha256(result.model_dump(mode="json", exclude={"result_hash"}))`. The one IPC response
+is at most 1,048,576 bytes and its raw bytes equal
+`rquant.strict_json.canonical_json_bytes(result.model_dump(mode="json"))` with no newline. Extra or
+duplicate fields, coercion, unknown vectors, unsorted results, trailing bytes, and size excess
+reject.
+
+The full manifest is the source closure; no caller- or child-claimed source closure can replace it.
+`code_commit` remains audit-only and cannot prove authority, source, service, family, surface, or
+test execution.
 
 The authority epoch key is exactly:
 
@@ -747,37 +937,55 @@ Audit records contain identifiers, hashes, timestamps, outcomes, and bounded rea
 They MUST NOT contain signal payloads, environment values, secrets, credentials, raw exception
 text, or verification vector inputs.
 
-No public API accepts a caller-created attestation, receipt, result, or evidence model. Only a
-module-private evidence object carrying an unforgeable module-private seal may reach the protected
-append operation. The root-owned verifier process, root-owned verification manifest and source
-closure, generation interpreter, protected store ownership/mode, and deployment lock form the trust
-boundary. Copying fields, importing a public model, or invoking a service-local helper grants
-nothing.
+No public or service API accepts a caller-created attestation, receipt, result, evidence model, or
+append request for persistence. Module privacy, import identity, object identity, sentinels, and
+seals are not privilege boundaries. The root-owned verifier process, fixed root-owned harness,
+root-approved manifest/source closure, OS-separated unprivileged child, append-store ownership/mode,
+bounded IPC validation, and deployment lock form the trust boundary. Copying or forging IPC fields,
+inspecting child modules, importing a public model, or invoking a service-local helper grants no
+append authority.
 
 #### Atomic Receipts, Readiness, And Lifecycle
 
 One successful immutable verifier run atomically emits exactly five receipts, one for each frozen
 pair. The receipt uniqueness key is exactly
 `(overlay_content_hash, authority_epoch_key, pair_id)`. Each receipt fingerprint binds its pair,
-successor declaration hash, overlay hash, authority epoch, generation/profile, exact producer
-evidence, exact reader surfaces, verification manifest, result/evidence, verifier policy, service
-manifests, test-manifest hash, `verified_at`, and `fresh_until`. An identical replay is idempotent;
-divergent bytes for the same key append conflict audit evidence and reject.
+exact producer/consumer service-ID tuples, successor declaration hash, overlay hash, authority
+epoch, generation/profile, exact producer evidence, exact reader surfaces, verification manifest,
+result/evidence, verifier policy, service manifests, complete sorted service-binding tuple/hash,
+`participating_service_ids`, test-manifest hash, `verified_at`, and `fresh_until`. An identical
+replay is idempotent; divergent bytes for the same key append conflict audit evidence and reject.
 
-Freshness is profile-derived and bounded:
-`freshness_seconds = min(stale_after_seconds)` across the exact participating service manifests,
-subject to the verifier policy's positive maximum. For the current production profile this evaluates
-to 30 seconds because the participating live strategy, router, notifier, and paper services each
-declare a 30-second stale bound; the value is derived again from every target profile and is not a
-portable constant. `fresh_until = verified_at + freshness_seconds`.
+`RESET-REG-P2-01` makes freshness profile-derived from the exact pair map. Resolve one exact
+`RuntimeServiceManifest` for every ID in `participating_service_ids`, reject a missing, duplicate,
+or additional resolution, and compute:
+
+```text
+service_freshness_seconds = min(
+  manifest.stale_after_seconds
+  for manifest in exact_participating_service_manifests
+)
+freshness_seconds = (
+  min(service_freshness_seconds, verification_policy.max_age_seconds)
+  if verification_policy.max_age_seconds is specified
+  else service_freshness_seconds
+)
+fresh_until = verified_at + freshness_seconds
+```
+
+The optional frozen policy maximum is strict, positive, and itself hash-bound. There is no fixed
+30-second assumption and no handwritten partial manifest list. A lower stale bound from shadow or
+serving controls readiness exactly as a lower bound from any strategy, router, notifier, or paper
+broker would.
 
 A `READY` decision requires exact five-pair set equality, not a count. It binds every successor
 declaration hash required by the overlay; overlay content hash; five sorted pair IDs; five sorted
 receipt fingerprints and their aggregate canonical SHA-256; authority epoch, generation, full
-manifest, and profile; and `verified_at`/`fresh_until`. The verifier writes the receipts,
-immutable decision, and compare-and-swap state in one transaction from one consistent snapshot.
-A unique key over overlay plus authority epoch makes concurrent identical finalization return the
-same bytes; a divergent concurrent result appends conflict audit evidence and rejects.
+manifest, and profile; `participating_service_ids`; complete service-binding tuple/hash; and
+`verified_at`/`fresh_until`. The verifier writes the receipts, immutable decision, and
+compare-and-swap state in one transaction from one consistent snapshot. A unique key over overlay
+plus authority epoch makes concurrent identical finalization return the same bytes; a divergent
+concurrent result appends conflict audit evidence and rejects.
 
 The lifecycle is minimal:
 
@@ -803,34 +1011,44 @@ The reset finding ledger is stable:
 | `RESET-R07-P0` | any production-obtainable v3 writer, implicit activation, or mutation before family rejection | exhaustive no-activation inventory and fail-before-mutation evidence |
 | `RESET-R07-P1` | v3 dispatch or canonicalization changes v2 bytes, hashes, models, or public errors | frozen valid/invalid v2 differential corpus with exact equality |
 | `RESET-R07-P2` | mixed-chain, pointer, retry, crash, or orphan recovery exposes a partial or ambiguous prefix | strict transition and complete crash/orphan matrix |
-| `RESET-REG-P0` | caller/service-forged evidence or stale authority can create receipts or `READY` | root-derived sealed verification, lock revalidation, and protected append store |
+| `RESET-REG-P0` | caller/service-forged evidence or stale authority can create receipts or `READY` | OS-separated root verifier, strict child IPC, lock revalidation, and root-owned append store |
 | `RESET-REG-P1` | successor or overlay grafts current semantics onto v2 or declares nonexistent/future models | unchanged-v2 evidence, actual-model descriptors, and successor-before-overlay enforcement |
 | `RESET-REG-P2` | count-only readiness, concurrent divergence, expiry/rollback ambiguity, generation-return replay, or audit leakage | exact set/epoch/CAS/lifecycle tests and bounded audit schema |
+| `RESET-R07-P0-01` | the real top-level production registry can make a v3 write/activation object reachable | construct through `runtime_service_main.build_builtin_registry` and prove exhaustive forbidden-object non-reachability |
+| `RESET-R07-P2-01` | an identical post-link retry can publish a pointer without re-establishing records-directory durability | future v3-only primitive re-fsyncs the records directory; byte conflict rejects before pointer mutation |
+| `RESET-REG-P0-01` | generation code, a service, or forged IPC can acquire append authority inside the verifier | root process never imports generation code; unprivileged child has no store/verifier capability; root validates and writes after child exit |
+| `RESET-REG-P1-01` | underspecified successor/overlay schemas permit alternate bytes, order, identity, or nonexistent models | four exact schemas, canonical preimages/raw bytes, strict structural rejection, and actual-model prerequisite |
+| `RESET-REG-P1-02` | executable/service/surface claims rely on absent service-manifest fields or cross-role aliases | exact root-approved service bindings checked against profile, slot roles, full manifest, and object allowlist before execution |
+| `RESET-REG-P2-01` | readiness freshness omits a pair participant or assumes a fixed/partial minimum | exact pair-derived service union and minimum stale bound, optionally capped by frozen policy |
 
 The planned red-test matrix is exact:
 
 | IDs | Planned test file/evidence | Required assertions |
 |---|---|---|
 | `RESET-R07-P1` | `tests/fixtures/signal_route_spool_v2_differential/manifest.json`; `tests/unit/test_signal_route_spool_v2_differential.py` | frozen valid and invalid corpus proves untouched v2 bytes, `ensure_ascii=True`, hashes, models, and public error category/sequence before and after dispatcher introduction |
-| `RESET-R07-P1`, `RESET-R07-P2` | `tests/unit/test_current_signal_route_spool_record_v3.py` | exact `E`/`R`/outer bytes and hashes, strict JSON, exact types, all-v2 and one-way mixed chain, v3-first production rejection, isolated decoder-only all-v3 fixture, pointer neutrality, and every crash/orphan/retry conflict case |
-| `RESET-R07-P0` | `tests/unit/test_signal_family_no_activation_reset.py` | source/API snapshots and mutation probes cover every inventory row and all production builders; decoder import/construction succeeds while no durable v3 writer/capability/flag/cursor/drain/cutover path exists |
-| `RESET-REG-P1` | `tests/unit/test_signal_family_successor_registry_reset.py` | v2 parser/catalog/bytes/hashes/history are unchanged; v2 channels reject current semantic overlay; successor declaration rejects before the actual model exists; exact model descriptor derives from the verified channel declaration and physical schema; partial/absent/conflicting overlay never becomes ready |
-| `RESET-REG-P0`, `RESET-REG-P1` | `tests/integration/test_signal_family_verification_reset.py` | all five pair IDs resolve the exact callable objects through real production builders and manifest-backed source hashes; caller-forged/public/service-local evidence rejects; only a successful immutable generation-interpreter run under deployment lock persists five receipts |
-| `RESET-REG-P0`, `RESET-REG-P2` | `tests/unit/test_signal_family_readiness_reset.py` | exact five-set equality, atomic receipt/decision/CAS, byte-identical concurrency, divergent conflict, profile-derived expiry, authority advance, authority return to the same generation, rollback, revoke, and no `ATTESTING`/`ACTIVATED` state |
+| `RESET-R07-P1`, `RESET-R07-P2` | `tests/unit/test_current_signal_route_spool_record_v3.py` | exact `E`/`R`/outer bytes and hashes, strict JSON, exact types, all-v2 and one-way mixed chain, v3-first production rejection, isolated decoder-only all-v3 fixture, pointer neutrality, and synthetic crash/orphan/retry state-machine cases without a durable writer |
+| `RESET-R07-P2-01` | future `tests/unit/test_current_signal_route_spool_v3_publication_contract.py` in the separately authorized writer tranche | v3 primitive is separate from byte-identical v2 `_immutable_write_at`; crash after link and before directory fsync makes identical retry fsync the records directory again before pointer work; differing bytes reject before pointer mutation; Phase A/builders cannot import or reach the primitive |
+| `RESET-R07-P0`, `RESET-R07-P0-01` | `tests/unit/test_signal_family_no_activation_reset.py` | source/API snapshots and mutation probes cover every inventory row and all production builders; construct the registry through `rquant.runtime_service_main.build_builtin_registry` and traverse registry entries/closures/protocols/callbacks/capabilities to prove no v3 writer/capability/flag/cursor/drain/cutover object is imported, injected, returned, or reachable; decoder import/construction alone succeeds |
+| `RESET-REG-P1`, `RESET-REG-P1-01` | `tests/unit/test_signal_family_successor_registry_reset.py` | v2 parser/catalog/bytes/hashes/history are unchanged; exact four-schema field sets, hash preimages, raw canonical bytes, strict duplicate/extra/coercion/order rejection; successor declaration rejects before the actual model exists; v2 semantic/partial/absent/conflicting overlay never becomes ready |
+| `RESET-REG-P0`, `RESET-REG-P1`, `RESET-REG-P1-02` | `tests/integration/test_signal_family_verification_reset.py` | all five pair IDs resolve exact callable objects through real production builders and manifest-backed source hashes; exact service bindings cover the pair-derived service set and reject missing/duplicate/cross-role/wrong module/path/source hash before child execution; only a successful immutable child run can lead the root verifier to persist five receipts |
+| `RESET-REG-P0-01` | `tests/integration/test_signal_family_root_verifier_isolation.py` | child module inspection/import cannot discover or import privileged verifier/store authority; direct store open/append fails; no inherited descriptor/path/capability exists; forged, extra, oversized, noncanonical, or wrong-result IPC rejects; caller/service evidence APIs do not exist; authority change between child completion and root append rejects |
+| `RESET-REG-P0`, `RESET-REG-P2`, `RESET-REG-P2-01` | `tests/unit/test_signal_family_readiness_reset.py` | exact five-set equality and pair-derived participating-service union, atomic receipt/decision/CAS, byte-identical concurrency, divergent conflict, profile-derived expiry, lower shadow or serving stale bound controls `fresh_until`, optional policy cap, authority advance/return to same generation, rollback, revoke, and no `ATTESTING`/`ACTIVATED` state |
 | `RESET-REG-P0`, `RESET-REG-P2` | `tests/unit/test_signal_family_verification_audit.py` | audit schema contains only bounded identifiers/hashes/timestamps/outcomes and excludes payloads, vector inputs, environment, secrets, credentials, and raw exception text |
 
 ### Explicit Phase Blockers
 
 These are development prerequisites, not unresolved design questions:
 
-1. Phase A R07 models, strict decoder, v2 differential corpus, mixed-chain verifier,
-   crash/orphan matrix, and exhaustive no-activation tests MUST complete before any successor
-   current-family base contract is implemented.
+1. Phase A R07 models, strict decoder, v2 differential corpus, mixed-chain verifier, synthetic
+   crash/orphan state-machine matrix, and exhaustive no-activation tests MUST complete before any
+   successor current-family base contract is implemented. The future v3 publication primitive and
+   its filesystem crash test remain blocked until a separately authorized writer tranche.
 2. Successor base channels MUST bind actual manifest-covered transport models before an overlay can
    be staged; future qualnames and v2 semantic overlays reject.
-3. The immutable verification manifest, exact service-role bindings, root/release verifier,
-   generation-interpreter execution path, module-private sealed evidence, protected append store,
-   and deployment-lock revalidation MUST exist before overlay receipts or `READY` can be emitted.
+3. The immutable verification manifest, exact `VerificationServiceBindingV1` tuple, fixed root-owned
+   harness, OS-separated root verifier/unprivileged generation child, strict bounded IPC, root-owned
+   append store, and deployment-lock revalidation MUST exist before overlay receipts or `READY` can
+   be emitted. In-process sealing cannot satisfy this blocker.
 4. No high-watermark freeze, legacy drain, cursor migration, writer cutover, production v3
    publication, capability, environment flag, or activation work is authorized by this reset.
 
