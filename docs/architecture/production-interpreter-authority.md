@@ -892,7 +892,9 @@ non-receiver parameter must be statically classified before capability compositi
 | missing annotation, `object`, `Any`, unresolved name/attribute, string or AST outside the grammar, union/optional/annotated/generic/protocol/type variable, or a non-type terminal | `AMBIGUOUS_INPUT` and `blocked_shape` |
 | `*args` or `**kwargs`, whether annotated or not | `VARIADIC_INPUT` and `blocked_shape` |
 
-At least one `CURRENT_EXACT` parameter plus reachability to an exact durable sink forms a violation.
+At least one `CURRENT_EXACT` parameter plus reachability to an exact durable sink forms an
+input/identity composition candidate; it becomes a violation only under the callable-operation
+contract below.
 All-explicit `NONCURRENT_EXACT` parameters plus a durable sink do not form current-family authority.
 Any `AMBIGUOUS_INPUT` or `VARIADIC_INPUT` on that same sink-reachable wrapper blocks the proof before
 it can report clean or a violation. A sink-reachable wrapper with zero non-receiver parameters is
@@ -901,11 +903,131 @@ exact frozen durable-sink object encountered as a terminal,
 without a wrapping callable/input composition, remains a legacy sink alone and is not re-analysed
 as its own wrapper. Return annotations and parameter names do not establish input authority.
 
+##### Static Callable-Operation Contract
+
+`R07-SPEC-P1-05` freezes the final operation layer. Reachability of a sink identity is necessary but
+not sufficient: the analyser must prove how a call site obtains and invokes its callee. It uses
+`dis.get_instructions(function, show_caches=True)` on an exact `FunctionType` and a non-executing
+stack/provenance interpreter. It never calls the function, a callee, a factory, a descriptor, a
+property, a user hook, or a code object; it never imports, evaluates, or executes source or
+annotations.
+
+The candidate set is fail-closed. Every supported callable with a `CURRENT_EXACT` parameter has
+every `CALL` analysed. A callable with an ambiguous/variadic input is also a candidate when it has a
+statically reachable durable sink or any unresolved/dynamic call; that unresolved call is potential
+sink reachability and cannot be used to avoid the input block. An all-`NONCURRENT_EXACT` callable
+with no current parameter is outside the current-family operation composition, except for the
+already frozen legacy-sink terminal rule.
+
+The operation interpreter analyses candidate call sites in ascending bytecode offset. A call slice
+is the single basic-block stack provenance needed to produce that call's callee. It cannot cross a
+jump target, branch, exception-handler boundary, loop edge, yield/await boundary, or another
+unresolved stack merge. The only opcodes permitted inside a call slice are:
+
+```text
+structural: EXTENDED_ARG CACHE RESUME NOP COPY_FREE_VARS PUSH_NULL PRECALL KW_NAMES
+reference:  LOAD_FAST LOAD_CONST LOAD_GLOBAL LOAD_DEREF LOAD_ATTR LOAD_METHOD
+invoke:     CALL
+```
+
+`EXTENDED_ARG`, `CACHE`, `RESUME`, `NOP`, and `COPY_FREE_VARS` carry no provenance. `PUSH_NULL`,
+optional `PRECALL`, and optional `KW_NAMES` must occur only in the exact Python 3.11/3.12 calling
+sequence consumed by the same `CALL`. The `LOAD_GLOBAL` push-null flag is normalized to that same
+single null marker; it grants no additional lookup form. `KW_NAMES` must resolve to an exact tuple
+of unique exact strings whose length does not exceed the `CALL` argument count. Stack depth,
+`CALL.arg`, keyword count, and static provenance must agree exactly or the call blocks. An opcode
+outside this list is not approximated or skipped if it contributes to a callee. In particular
+`LOAD_NAME`, `LOAD_CLASSDEREF`, `LOAD_SUPER_ATTR`,
+`BINARY_SUBSCR`, `CALL_FUNCTION_EX`, `IMPORT_NAME`, `IMPORT_FROM`, `IMPORT_STAR`, `BUILD_*`,
+`UNPACK_*`, `COPY`, `SWAP`, and every jump/async/generator opcode in callee provenance produce
+`blocked_shape`.
+
+The only allowed callee forms are:
+
+```text
+STATIC_BASE ("." LITERAL_ATTRIBUTE)* CALL(...)
+STATIC_PARTIAL CALL(...)
+```
+
+`STATIC_BASE` is exactly one of:
+
+1. `LOAD_GLOBAL literal_name` resolved first from the exact native function-globals dict, otherwise
+   from the function's exact native builtins dict. Absence, a non-dict builtins object, or a value
+   obtained by fallback/dynamic lookup blocks.
+2. `LOAD_DEREF literal_name` resolved to the already captured exact closure-cell content.
+3. `LOAD_FAST receiver_name` only for the statically established bound `self`/`cls` receiver. An
+   arbitrary local, argument, or reassigned receiver used as a callee base blocks. This receiver
+   form must have at least one literal `LOAD_ATTR`/`LOAD_METHOD`; calling the bare receiver blocks.
+
+Each `LITERAL_ATTRIBUTE` comes directly from a `LOAD_ATTR`/`LOAD_METHOD` instruction and is resolved
+through the existing allowed-shape static namespace rules. A module attribute such as
+`rquant_module.literal_sink` may be allowed; `module.__dict__[name]`, `module.mapping[name]`, any
+other subscript, or an attribute from a call result is not. A `STATIC_PARTIAL` must be the already
+validated exact `functools.partial` shape whose underlying function and bindings are static under
+the callable-input contract.
+
+An allowed call target resolves to one exact object identity before the call is classified. A
+static non-sink helper call remains an ordinary graph edge and its exact helper function is analysed
+separately. A mere load, formatting use, comparison, return, container insertion, or log/error
+message containing a durable-sink identity is not a call operation and cannot form a violation.
+Calling an exact partial or bound method whose underlying callable is one of the frozen durable
+sinks counts as calling that exact sink.
+
+For an exact durable-sink call inside a callable with a `CURRENT_EXACT` parameter, argument
+provenance is deliberately small:
+
+```text
+DIRECT_CURRENT   LOAD_FAST of that exact current parameter, optionally named by KW_NAMES
+DIRECT_OTHER     LOAD_FAST of an exact NONCURRENT_EXACT parameter
+STATIC_LITERAL   LOAD_CONST of an exact immutable scalar/null value
+STATIC_IDENTITY  an allowed STATIC_BASE resolved to an exact non-current object
+UNKNOWN_VALUE    every call result, attribute/subscript of an input, container build/unpack,
+                 arithmetic/format/serialization result, stack merge, or unsupported opcode
+```
+
+At least one `DIRECT_CURRENT` argument to the exact durable sink completes the existing identity
+composition and yields `complete_violation`. If no current argument reaches the sink and every
+argument is `DIRECT_OTHER`, `STATIC_LITERAL`, or `STATIC_IDENTITY`, the sink call is statically
+independent of current input and is not a current-family violation. Any `UNKNOWN_VALUE` in that
+sink call yields `blocked_shape`; the analyser does not guess whether a serialized, transformed, or
+factory-produced value contains the current record. Starred positional/keyword arguments always
+block.
+
+The following operation shapes always produce `blocked_shape` before a clean or violation result:
+
+- `globals()[name](record)`, `locals()[name](record)`, or any namespace-call result/subscript used as
+  a callee;
+- `getattr(owner, name)(record)`, `vars(owner)[name](record)`, or any other dynamic attribute/name
+  resolver, even when `name` is constant;
+- `module.__dict__[name](record)`, `module.mapping[name](record)`, or any callee obtained through
+  `BINARY_SUBSCR`;
+- `factory()(record)`, `factory().sink(record)`, or any call result used directly or through an
+  attribute as the next callee;
+- `__import__`, `importlib.import_module`, `eval`, `exec`, or `compile` invocation, and every import
+  opcode, anywhere in an operation-candidate wrapper;
+- a parameter/local used as callee, alias assignment/reassignment whose exact identity cannot be
+  proven, a control-flow stack merge, `CALL_FUNCTION_EX`, or any other unresolved indirect call.
+
+Direct `obj.literal_attr(...)` syntax is the only attribute-call form; direct `mapping[key](...)`
+syntax is never allowed for a callee even when the mapping and key are otherwise static graph
+shapes. Exact calls to `globals`, `locals`, `vars`, `getattr`, `__import__`,
+`importlib.import_module`, `eval`, `exec`, or `compile` are identified by object identity, not
+spelling or alias. Their functions are never executed.
+
+Operation blocking participates in pass 2 after complete graph/shape validation and candidate input
+classification, but before any violation conclusion. Wrappers follow canonical graph-path order;
+their call sites follow ascending bytecode offset. The first unsupported call returns
+`blocked_shape` with the wrapper's canonical path and a stable detail ID of the form
+`r07.call.<reason>/v1#<four-digit-call-ordinal>`. No new `ProofEdgeKindV1` value is introduced.
+Only after every operation-candidate wrapper has a complete operation proof may exact sink
+calls be composed and sorted as violations.
+
 Capability detection is identity-based, not name-based. The test freezes the exact objects in the
 durable-sink set, including the v2 filesystem primitives and all inventory persistence entrypoints.
 It also freezes the exact three current persistence input model identities. A violation exists when
-one supported callable composition both accepts an exact current persistence input and can reach an
-exact durable sink through only allowed static edges. The read-only v3 models, decoder functions,
+one supported callable composition accepts an exact current persistence input, reaches an exact
+durable sink through only allowed static edges, and invokes that sink through the exact static call
+operation with direct current-parameter provenance. The read-only v3 models, decoder functions,
 and synthetic verifier are explicitly allowed terminals and cannot become sinks by name, class
 name, annotation spelling, alias, or module path. A current input alone, a legacy durable sink
 alone, and an unreferenced forbidden object do not constitute a violation; the proof must retain
@@ -958,10 +1080,13 @@ as result evidence.
 
 Traversal is two-pass. Pass 1 constructs and validates the complete supported graph and emits no
 capability conclusion. Any blocked edge ends pass 1 with the stable blocked result. Only a complete
-pass 1 permits pass 2. Pass 2 first classifies every sink-reachable wrapper input in canonical path
-order; any ambiguous/variadic input returns its stable first `blocked_shape` before capability
-conclusions. Only a complete input-classification subpass composes and sorts violations. Thus a
-violation found early cannot hide a later unsupported shape or ambiguous input.
+pass 1 permits pass 2. Pass 2 first classifies every operation-candidate wrapper input in canonical
+path order; any ambiguous/variadic input with static or potential sink reachability returns its
+stable first `blocked_shape` before capability
+conclusions. A complete input-classification subpass is followed by the operation-contract subpass;
+its first unsupported call also blocks before conclusions. Only complete input and operation
+subpasses compose and sort violations. Thus a violation found early cannot hide a later unsupported
+shape, ambiguous input, or unresolved call.
 
 Pass 1 is deterministic depth-first preorder. Roots follow manifest tuple order. Child order is
 fixed as follows:
@@ -1037,14 +1162,38 @@ all of the following against the same analyser used for real builder roots:
     noncanonical ordering, and unknown enums. Root, attribute, MRO, default, closure, global,
     mapping, partial, and sequence insertion-order metamorphics retain byte-identical results and
     the same first blocked evidence.
+11. Operation controls prove that direct global, closure, receiver-literal-attribute, bound-method,
+    and validated-partial calls to every frozen sink compose with a direct current parameter as
+    `complete_violation`, while merely loading/formatting/returning the same sink identity does not.
+    The four reviewer counterexamples are exact fixtures:
+    `globals()[name](record)`, `getattr(owner, name)(record)`,
+    `module.mapping[name](record)`, and `factory()(record)`. Each yields `blocked_shape` with its
+    stable operation detail ID. Each fixture places a side-effect sentinel in the dynamic resolver,
+    factory, returned callable, descriptor, and would-be sink and proves every sentinel remains
+    untouched. Additional fixtures cover `module.__dict__[name]`, `vars`, `locals`, dynamic
+    import/`__import__`, `eval`, `exec`, `compile`, `CALL_FUNCTION_EX`, reassigned local callees,
+    control-flow merges, unknown opcode provenance, transformed current arguments, and exact static
+    sink calls whose arguments are proven current-independent.
 
 The frozen static callable grammar closes the design requirement `R07-SPEC-P1-01`; the exact root
 manifest closes `R07-SPEC-P1-02`; the ordered instance preflight closes `R07-SPEC-P1-03`; and the
-immutable result/order/bound contract closes `R07-SPEC-P1-04`. The code-quality finding
-`R07-CQ-P1-02` closes only when a later implementation has a red-to-green proof for every listed
-mutation and the original reviewer verifies it. This amendment does not close that code finding by
-itself, and it does not relax `RESET-R07-P0`, `RESET-R07-P1`, or the frozen v2 byte-identical parser
-corpus.
+immutable result/order/bound contract closes `R07-SPEC-P1-04`. The design finding
+`R07-SPEC-P1-05` is closed by the static callable-operation contract and its exact adversarial
+matrix. The code-quality finding `R07-CQ-P1-02` closes only when a later implementation has a
+red-to-green proof for every listed mutation and the original reviewer verifies it. This amendment
+does not close that code finding by itself, and it does not relax `RESET-R07-P0`, `RESET-R07-P1`, or
+the frozen v2 byte-identical parser corpus.
+
+##### Frozen Design-Review Scope
+
+This is the second and final document revision for the R07 no-activation proof reset. Subsequent
+design review of this reset is limited to a regression introduced by the `R07-SPEC-P1-05` operation
+contract or materially new evidence against an existing stable-ledger invariant. Findings
+`R07-SPEC-P1-01` through `R07-SPEC-P1-04` are closed and MUST NOT be reopened, renamed, split, or
+reissued without such new evidence and an explicit reference to the original ledger ID and failed
+invariant. Editorial restatement, a new counterexample already covered by the frozen grammar, or a
+different name for the same closed condition is not a new finding. Phase B remains outside this
+review scope.
 
 ### Phase B: Successor Base Registry, Then Staged Overlay
 
@@ -1575,6 +1724,7 @@ The reset finding ledger is stable:
 | `R07-SPEC-P1-02` | ad hoc/empty root arguments omit an injection position or treat unknown capabilities as proof coverage | immutable exact ten-root manifest, signature equality, every injection parameter bound, exact fixed capability profiles, and reject-unknown policy |
 | `R07-SPEC-P1-03` | shape dispatch calls `vars`/dynamic attributes too early or treats hostile `__dict__`, slots, or descriptors as empty state | normative classification order and complete MRO/static receiver preflight before the single exact native instance-dict read |
 | `R07-SPEC-P1-04` | mutable/underspecified results or nondeterministic traversal change the first block or turn bound exhaustion into clean | frozen result/evidence/path models, exact enums/order, two-pass traversal, and exact inclusive-bound semantics |
+| `R07-SPEC-P1-05` | identity reachability alone cannot prove that a sink is called, while dynamic/factory/subscript callees can evade a name/reference walk | exact non-executing opcode/call grammar, direct-current argument provenance, blocked dynamic operations, and operation side-effect sentinels |
 | `RESET-R07-P2-01` | an identical post-link retry can publish a pointer without re-establishing records-directory durability | future v3-only primitive re-fsyncs the records directory; byte conflict rejects before pointer mutation |
 | `RESET-REG-P0-01` | generation code, self-consistent manifests/vectors/results, a service, or forged IPC can acquire append authority | fixed external root policy authorizes exact release hashes; root never imports generation code; unprivileged child has no store/verifier capability; root validates and writes after child exit |
 | `RESET-REG-P1-01` | underspecified successor/overlay schemas permit alternate bytes, order, identity, or nonexistent models | four exact schemas, canonical preimages/raw bytes, strict structural rejection, and actual-model prerequisite |
@@ -1593,6 +1743,7 @@ The planned red-test matrix is exact:
 | `R07-SPEC-P1-02` | `tests/unit/test_signal_family_no_activation_reset.py` | exact canonical root manifest/hash has all ten inventory roots, exact target identities/signatures, every optional injection fixed explicitly, exact six/all capability profiles, and rejection of empty/missing/changed/unknown/reordered/extra roots, arguments, profiles, keys, and values before builder invocation |
 | `R07-SPEC-P1-03` | `tests/unit/test_signal_family_no_activation_reset.py` | shape classification follows the frozen order; only module/class uses `vars`; plain and inherited native instance dicts pass; slot/property/custom-descriptor/dynamic-hook/hostile-`__dict__` shapes block before instance read and execute no user code |
 | `R07-SPEC-P1-04` | `tests/unit/test_signal_family_no_activation_reset.py` | exact immutable `ProofResultV1`/evidence/path schemas and enums, two-pass shape-before-capability behavior, canonical first blocked path under all ordering metamorphics, and exact 10,000/10,001 node, depth-64-child, and 512/513 edge boundaries |
+| `R07-SPEC-P1-05` | `tests/unit/test_signal_family_no_activation_reset.py` | allowed direct global/closure/receiver-attribute/bound/partial call shapes and direct-current sink arguments violate; mere sink reference does not. Exact `globals()[name](record)`, `getattr(owner, name)(record)`, `module.mapping[name](record)`, and `factory()(record)` reviewer fixtures plus module-dict/subscript, dynamic import/eval/exec, call-result, starred-call, merge, and transformed-current variants block with stable detail IDs and untouched side-effect sentinels |
 | `RESET-REG-P1`, `RESET-REG-P1-01` | `tests/unit/test_signal_family_successor_registry_reset.py` | v2 parser/catalog/bytes/hashes/history are unchanged; exact four-schema field sets, hash preimages, raw canonical bytes, strict duplicate/extra/coercion/order rejection; successor declaration rejects before the actual model exists; v2 semantic/partial/absent/conflicting overlay never becomes ready |
 | `RESET-REG-P0`, `RESET-REG-P1`, `RESET-REG-P1-02` | `tests/integration/test_signal_family_verification_reset.py` | all five pair IDs resolve exact callable objects through real production builders and manifest-backed source hashes; exact service bindings cover the pair-derived service set and reject missing/duplicate/cross-role/wrong module/path/source hash before child execution; only a successful immutable child run can lead the root verifier to persist five receipts |
 | `RESET-REG-P0-01` | `tests/integration/test_signal_family_root_verifier_isolation.py` | child module inspection/import cannot discover or import privileged verifier/store authority; direct store open/append fails; no inherited descriptor/path/capability exists; forged, extra, oversized, noncanonical, or wrong-result IPC rejects; caller/service evidence APIs do not exist; authority change between child completion and root append rejects |
