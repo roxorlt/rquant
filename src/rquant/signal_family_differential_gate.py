@@ -8,11 +8,12 @@ from __future__ import annotations
 
 import ast
 import base64
+import copy
 import hashlib
 import stat
 import subprocess
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Literal, Self
 
 from pydantic import (
@@ -31,6 +32,30 @@ BASELINE_COMMIT_SHA = "45d0b57c4c5cbab1700fa5e3c386c6756892a7d6"
 BASELINE_TREE_SHA = "4f67e67192855874e82baa13dc343a1d6939bd67"
 _SHA256 = r"^[0-9a-f]{64}$"
 _SHA1 = r"^[0-9a-f]{40}$"
+
+_VERSION_VARIANT_AST_FIELDS = {
+    "FunctionDef": frozenset({"type_params"}),
+    "AsyncFunctionDef": frozenset({"type_params"}),
+    "ClassDef": frozenset({"type_params"}),
+}
+
+
+def normalized_ast_dump(node: ast.AST) -> str:
+    """Return an AST dump stable across the supported Python 3.11/3.12 parsers."""
+    normalized = copy.deepcopy(node)
+    for candidate in ast.walk(normalized):
+        ignored = _VERSION_VARIANT_AST_FIELDS.get(type(candidate).__name__, frozenset())
+        if ignored:
+            candidate._fields = tuple(field for field in candidate._fields if field not in ignored)
+            for field in ignored:
+                if hasattr(candidate, field):
+                    delattr(candidate, field)
+    return ast.dump(normalized, annotate_fields=True, include_attributes=False)
+
+
+def normalized_ast_sha256(node: ast.AST) -> str:
+    return hashlib.sha256(normalized_ast_dump(node).encode("utf-8")).hexdigest()
+
 
 EXPECTED_ROOT_QUALNAMES = (
     "rquant.runtime_service_main.build_builtin_registry",
@@ -730,6 +755,8 @@ class CandidateGateResult:
     candidate_commit_sha: str
     candidate_tree_sha: str
     diff_digest: str
+    diff_entries: tuple[GitDiffEntry, ...]
+    candidate_binding_digest: str
     blocked_entries: tuple[GitDiffEntry, ...] = ()
     missing_entries: tuple[AllowedDiffEntryV1, ...] = ()
 
@@ -758,6 +785,117 @@ def _resolved_tree(repo: Path, commit: str) -> str:
 
 def _is_lower_hex(value: str, *, length: int) -> bool:
     return len(value) == length and all(character in "0123456789abcdef" for character in value)
+
+
+def _validated_git_path(path: str) -> str:
+    pure = PurePosixPath(path)
+    if (
+        not path
+        or path.startswith("-")
+        or pure.is_absolute()
+        or pure.as_posix() != path
+        or "\\" in path
+        or any(part in {"", ".", ".."} for part in pure.parts)
+    ):
+        raise ValueError(f"invalid repository path: {path!r}")
+    return path
+
+
+def _tree_objects(repo: Path, commit: str) -> dict[str, tuple[str, str, str]]:
+    resolved = _resolved_commit(repo, commit)
+    raw = _git_output(repo, "ls-tree", "-r", "-z", "--full-tree", resolved)
+    objects: dict[str, tuple[str, str, str]] = {}
+    for record in raw.split(b"\0"):
+        if not record:
+            continue
+        metadata, separator, raw_path = record.partition(b"\t")
+        if not separator:
+            raise ValueError("invalid Git tree record")
+        mode, object_type, object_id = metadata.decode("ascii").split(" ")
+        path = _validated_git_path(raw_path.decode("utf-8"))
+        if path in objects:
+            raise ValueError(f"duplicate Git tree path: {path}")
+        if not _is_lower_hex(object_id, length=40):
+            raise ValueError("Git tree object is not a lowercase SHA")
+        objects[path] = (mode, object_type, object_id)
+    return objects
+
+
+def _git_mode_kind(mode: str) -> str:
+    if mode == "000000":
+        return "absent"
+    if mode in {"100644", "100755"}:
+        return "regular"
+    if mode == "120000":
+        return "symlink"
+    if mode == "160000":
+        return "gitlink"
+    raise ValueError(f"unsupported Git mode: {mode}")
+
+
+def _expected_diff_status(
+    old: tuple[str, str, str] | None,
+    new: tuple[str, str, str] | None,
+) -> str:
+    if old is None:
+        return "A"
+    if new is None:
+        return "D"
+    if _git_mode_kind(old[0]) != _git_mode_kind(new[0]):
+        return "T"
+    if old != new:
+        return "M"
+    raise ValueError("raw diff contains an unchanged path")
+
+
+def validate_complete_diff_objects(repo: Path, result: CompleteDiffResult) -> None:
+    baseline = _resolved_commit(repo, result.baseline_commit_sha)
+    candidate = _resolved_commit(repo, result.candidate_commit_sha)
+    baseline_objects = _tree_objects(repo, baseline)
+    candidate_objects = _tree_objects(repo, candidate)
+    seen: set[str] = set()
+    for entry in result.entries:
+        path = _validated_git_path(entry.path)
+        if path in seen:
+            raise ValueError(f"duplicate raw diff entry: {path}")
+        seen.add(path)
+        if entry.status == "?":
+            if entry.old_object != "0" * 40 or entry.new_object != "0" * 40:
+                raise ValueError("untracked diff entry must not claim a Git object")
+            continue
+        old = baseline_objects.get(path)
+        new = candidate_objects.get(path)
+        expected_old = ("000000", "0" * 40) if old is None else (old[0], old[2])
+        expected_new = ("000000", "0" * 40) if new is None else (new[0], new[2])
+        if (entry.old_mode, entry.old_object) != expected_old:
+            raise ValueError(f"raw diff old object or mode mismatch: {path}")
+        if (entry.new_mode, entry.new_object) != expected_new:
+            raise ValueError(f"raw diff new object or mode mismatch: {path}")
+        if old is not None and old[1] not in {"blob", "commit"}:
+            raise ValueError(f"unsupported old Git object type: {path}")
+        if new is not None and new[1] not in {"blob", "commit"}:
+            raise ValueError(f"unsupported new Git object type: {path}")
+        if entry.status != _expected_diff_status(old, new):
+            raise ValueError(f"raw diff status mismatch: {path}")
+
+
+def _candidate_binding_digest(
+    complete: CompleteDiffResult,
+    *,
+    baseline_tree: str,
+    candidate_tree: str,
+) -> str:
+    return hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "baseline_commit_sha": complete.baseline_commit_sha,
+                "baseline_tree_sha": baseline_tree,
+                "candidate_commit_sha": complete.candidate_commit_sha,
+                "candidate_tree_sha": candidate_tree,
+                "complete_diff_digest": complete.digest,
+            }
+        )
+    ).hexdigest()
 
 
 def _untracked_mode(path: Path) -> str:
@@ -828,11 +966,13 @@ def collect_complete_git_diff(
                 )
             )
     ordered = tuple(sorted(entries, key=lambda item: (item.path, item.status)))
-    return CompleteDiffResult(
+    result = CompleteDiffResult(
         baseline_commit_sha=baseline,
         candidate_commit_sha=candidate,
         entries=ordered,
     )
+    validate_complete_diff_objects(repo, result)
+    return result
 
 
 def verify_candidate_gate(
@@ -879,6 +1019,12 @@ def verify_candidate_gate(
         candidate_commit_sha=candidate,
         candidate_tree_sha=observed_candidate_tree,
         diff_digest=complete.digest,
+        diff_entries=complete.entries,
+        candidate_binding_digest=_candidate_binding_digest(
+            complete,
+            baseline_tree=baseline_tree,
+            candidate_tree=observed_candidate_tree,
+        ),
         blocked_entries=blocked,
         missing_entries=missing,
     )
@@ -996,8 +1142,17 @@ def verify_policy_completeness(policy: R07PolicyV1) -> StaticCheckResult:
     return StaticCheckResult(not reasons, tuple(reasons))
 
 
-def _source_for(root: Path, module_path: str) -> str:
-    return (root / module_path).read_text(encoding="utf-8")
+def _source_bytes_for(repo: Path, candidate_commit: str, module_path: str) -> bytes:
+    candidate = _resolved_commit(repo, candidate_commit)
+    path = _validated_git_path(module_path)
+    try:
+        return _git_output(repo, "cat-file", "blob", f"{candidate}:{path}")
+    except subprocess.CalledProcessError as exc:
+        raise OSError(f"candidate source is unavailable: {path}") from exc
+
+
+def _source_for(repo: Path, candidate_commit: str, module_path: str) -> str:
+    return _source_bytes_for(repo, candidate_commit, module_path).decode("utf-8")
 
 
 def _function_node(tree: ast.Module, qualname: str) -> ast.AST | None:
@@ -1012,9 +1167,13 @@ def _function_node(tree: ast.Module, qualname: str) -> ast.AST | None:
     )
 
 
-def verify_root_snapshot(root: Path, snapshot: RootSnapshotV1) -> StaticCheckResult:
+def verify_root_snapshot(
+    repo: Path,
+    candidate_commit: str,
+    snapshot: RootSnapshotV1,
+) -> StaticCheckResult:
     try:
-        source = _source_for(root, snapshot.module_path)
+        source = _source_for(repo, candidate_commit, snapshot.module_path)
         tree = ast.parse(source, filename=snapshot.module_path)
     except (OSError, SyntaxError) as exc:
         return StaticCheckResult(False, (f"source parse failed: {type(exc).__name__}",))
@@ -1025,7 +1184,7 @@ def verify_root_snapshot(root: Path, snapshot: RootSnapshotV1) -> StaticCheckRes
     if segment is None:
         return StaticCheckResult(False, ("declared function source is missing",))
     source_digest = hashlib.sha256(segment.encode()).hexdigest()
-    ast_digest = hashlib.sha256(ast.dump(node, include_attributes=False).encode()).hexdigest()
+    ast_digest = normalized_ast_sha256(node)
     if source_digest != snapshot.source_sha256 or ast_digest != snapshot.ast_sha256:
         return StaticCheckResult(False, ("source or AST snapshot drift",))
     names = {
@@ -1042,11 +1201,12 @@ def verify_root_snapshot(root: Path, snapshot: RootSnapshotV1) -> StaticCheckRes
 
 
 def verify_production_declaration(
-    root: Path,
+    repo: Path,
+    candidate_commit: str,
     declaration: ProductionDeclarationV1,
 ) -> StaticCheckResult:
     try:
-        source = _source_for(root, declaration.module_path)
+        source = _source_for(repo, candidate_commit, declaration.module_path)
         tree = ast.parse(source, filename=declaration.module_path)
     except (OSError, SyntaxError) as exc:
         return StaticCheckResult(False, (f"source parse failed: {type(exc).__name__}",))
@@ -1062,7 +1222,7 @@ def verify_production_declaration(
     if node is None:
         return StaticCheckResult(False, ("declared production symbol is missing",))
     observed_span = f"{node.lineno}:{node.end_lineno}"
-    observed_digest = hashlib.sha256(ast.dump(node, include_attributes=False).encode()).hexdigest()
+    observed_digest = normalized_ast_sha256(node)
     reasons: list[str] = []
     if observed_span != declaration.source_span:
         reasons.append("production declaration source span drift")
@@ -1071,12 +1231,16 @@ def verify_production_declaration(
     return StaticCheckResult(not reasons, tuple(reasons))
 
 
-def verify_boundary_probe_source(root: Path, probe: BoundaryProbeV1) -> StaticCheckResult:
+def verify_boundary_probe_source(
+    repo: Path,
+    candidate_commit: str,
+    probe: BoundaryProbeV1,
+) -> StaticCheckResult:
     try:
         filename, line_text = probe.source_span.rsplit(":", 1)
         line = int(line_text)
         module_path = f"src/rquant/{filename}"
-        source = _source_for(root, module_path)
+        source = _source_for(repo, candidate_commit, module_path)
         tree = ast.parse(source, filename=module_path)
     except (OSError, SyntaxError, ValueError) as exc:
         return StaticCheckResult(False, (f"boundary source parse failed: {type(exc).__name__}",))
@@ -1089,7 +1253,7 @@ def verify_boundary_probe_source(root: Path, probe: BoundaryProbeV1) -> StaticCh
     if not candidates:
         return StaticCheckResult(False, ("boundary source anchor is missing",))
     node = min(candidates, key=lambda item: (item.end_lineno or item.lineno) - item.lineno)
-    observed = hashlib.sha256(ast.dump(node, include_attributes=False).encode()).hexdigest()
+    observed = normalized_ast_sha256(node)
     if observed != probe.boundary_ast_sha256:
         return StaticCheckResult(False, ("boundary AST snapshot drift",))
     return StaticCheckResult(True)
@@ -1187,15 +1351,17 @@ def top_level_declaration_snapshot(node: ast.AST, *, ordinal: int) -> TopLevelDe
         node_kind=type(node).__name__,
         names=_declaration_names(node),
         source_span=f"{node.lineno}:{node.end_lineno}",
-        normalized_ast_sha256=hashlib.sha256(
-            ast.dump(node, include_attributes=False).encode()
-        ).hexdigest(),
+        normalized_ast_sha256=normalized_ast_sha256(node),
         role=_top_level_role(node, ordinal=ordinal),
     )
 
 
-def source_file_snapshot(root: Path, module_path: str) -> SourceFileSnapshotV1:
-    source_bytes = (root / module_path).read_bytes()
+def source_file_snapshot(
+    repo: Path,
+    candidate_commit: str,
+    module_path: str,
+) -> SourceFileSnapshotV1:
+    source_bytes = _source_bytes_for(repo, candidate_commit, module_path)
     source = source_bytes.decode("utf-8")
     tree = ast.parse(source, filename=module_path)
     return SourceFileSnapshotV1(
@@ -1249,15 +1415,16 @@ def _dynamic_top_level_reasons(tree: ast.Module, module_path: str) -> tuple[str,
 
 
 def verify_top_level_source_closure(
-    root: Path,
+    repo: Path,
+    candidate_commit: str,
     snapshots: tuple[SourceFileSnapshotV1, ...] | list[SourceFileSnapshotV1],
 ) -> StaticCheckResult:
     reasons: list[str] = []
     for expected in snapshots:
         try:
-            observed = source_file_snapshot(root, expected.module_path)
+            observed = source_file_snapshot(repo, candidate_commit, expected.module_path)
             tree = ast.parse(
-                _source_for(root, expected.module_path),
+                _source_for(repo, candidate_commit, expected.module_path),
                 filename=expected.module_path,
             )
         except (OSError, SyntaxError, UnicodeDecodeError, ValueError) as exc:
@@ -1272,13 +1439,18 @@ def verify_top_level_source_closure(
 
 
 def verify_forbidden_definitions(
-    root: Path, universe: ForbiddenDefinitionUniverseV1
+    repo: Path,
+    candidate_commit: str,
+    universe: ForbiddenDefinitionUniverseV1,
 ) -> StaticCheckResult:
     reasons: list[str] = []
     forbidden = set(universe.symbols) | set(universe.exports) | set(universe.registry_keys)
     for module_path in universe.source_files:
         try:
-            tree = ast.parse(_source_for(root, module_path), filename=module_path)
+            tree = ast.parse(
+                _source_for(repo, candidate_commit, module_path),
+                filename=module_path,
+            )
         except (OSError, SyntaxError) as exc:
             reasons.append(f"{module_path}: {type(exc).__name__}")
             continue

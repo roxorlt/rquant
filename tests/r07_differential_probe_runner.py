@@ -1,11 +1,36 @@
 """Unified executable harness for the R07 B01..B17 policy probes."""
+# ruff: noqa: E402
 
 from __future__ import annotations
 
+import os
+
+_SENSITIVE_PROBE_ENVIRONMENT = frozenset(
+    {
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "DEEPSEEK_API_KEY",
+        "PANORAMA_COOKIE_SECRET",
+        "PANORAMA_GATE_TOKEN",
+        "PUSHDEER_KEYS",
+        "PUSHPLUS_TOKENS",
+        "RQUANT_PANORAMA_GATE_TOKEN",
+        "TUSHARE_TOKEN_BACKUP",
+    }
+)
+for _name in _SENSITIVE_PROBE_ENVIRONMENT:
+    os.environ.pop(_name, None)
+os.environ["RQUANT_DISABLE_DOTENV"] = "1"
+PREIMPORT_ISOLATED = True
+
+import argparse
 import base64
 import gc
 import hashlib
+import json
 import sqlite3
+import subprocess
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
@@ -57,6 +82,7 @@ from rquant.signal_family_differential_gate import (
     ConstructorIdentityFenceSentinelV1,
     ProbeSetupV1,
     R07PolicyV1,
+    load_policy,
     resolve_fixture_values,
 )
 from rquant.signal_router_runtime import (
@@ -84,6 +110,8 @@ from tests.unit.test_strategy_runner import _entry_decision, _envelope, _frame
 from tests.unit.test_strategy_runner import _store as _runner_store
 
 NOW = datetime(2026, 8, 16, 2, 30, tzinfo=UTC)
+ROOT = Path(__file__).parents[1]
+POLICY_PATH = ROOT / "tests/fixtures/r07_differential_gate/policy-v1.json"
 
 
 @dataclass(frozen=True)
@@ -307,11 +335,17 @@ def _binding_descriptor(value: object) -> object:
         return [_binding_descriptor(item) for item in value]
     if callable(value):
         module = getattr(value, "__module__", "")
+        if module == "__main__":
+            module = "tests.r07_differential_probe_runner"
         qualname = getattr(value, "__qualname__", type(value).__qualname__)
         return {"callable": f"{module}.{qualname}"}
     if value is None or type(value) in (str, bool, int, float):
         return _canonicalize(value)
-    return {"type": f"{type(value).__module__}.{type(value).__qualname__}"}
+    value_type = type(value)
+    module = value_type.__module__
+    if module == "__main__":
+        module = "tests.r07_differential_probe_runner"
+    return {"type": f"{module}.{value_type.__qualname__}"}
 
 
 def _setup_result_digest(harness: _Harness, setup: ProbeSetupV1) -> str:
@@ -930,3 +964,92 @@ def run_boundary_probe(
         after_snapshot_digest=after.digest,
         passed=passed,
     )
+
+
+def _subprocess_environment(environment_root: Path) -> dict[str, str]:
+    roots = {
+        "HOME": environment_root / "home",
+        "TMPDIR": environment_root / "tmp",
+        "TMP": environment_root / "tmp",
+        "TEMP": environment_root / "tmp",
+        "DATA_DIR": environment_root / "data",
+        "PARQUET_DIR": environment_root / "parquet",
+        "LOG_DIR": environment_root / "logs",
+    }
+    for path in set(roots.values()):
+        path.mkdir(parents=True, exist_ok=True)
+    return {
+        "PATH": os.environ.get("PATH", ""),
+        **{name: str(path) for name, path in roots.items()},
+        "PYTHONPATH": str(ROOT),
+        "PYTHONNOUSERSITE": "1",
+        "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+        "PYTEST_ADDOPTS": "",
+        "DUCKDB_PATH": str(environment_root / "data" / "probe.duckdb"),
+        "DUCKDB_READONLY_PATH": str(environment_root / "data" / "probe-ro.duckdb"),
+        "TUSHARE_TOKEN_MAIN": "0" * 32,
+        "NOTIFY_ENABLED": "false",
+    }
+
+
+def run_boundary_probe_subprocess(
+    *,
+    policy: R07PolicyV1,
+    inventory_id: str,
+    tmp_path: Path,
+) -> BoundaryProbeResultV1:
+    with TemporaryDirectory(prefix="rquant-r07-probe-env-", dir=tmp_path.parent) as directory:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "tests.r07_differential_probe_runner",
+                "--inventory-id",
+                inventory_id,
+                "--tmp-path",
+                str(tmp_path),
+                "--policy-path",
+                str(POLICY_PATH),
+            ],
+            cwd=tmp_path,
+            env=_subprocess_environment(Path(directory)),
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+    if completed.returncode != 0:
+        raise AssertionError(completed.stdout + completed.stderr)
+    result = BoundaryProbeResultV1.model_validate_json(completed.stdout)
+    expected = next(item for item in policy.boundary_probes if item.inventory_id == inventory_id)
+    if (result.probe_id, result.setup_id) != (expected.probe_id, expected.setup_id):
+        raise AssertionError("subprocess probe result is not bound to the requested policy row")
+    return result
+
+
+def _parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--inventory-id", required=True)
+    parser.add_argument("--tmp-path", type=Path, required=True)
+    parser.add_argument("--policy-path", type=Path, required=True)
+    return parser.parse_args(arguments)
+
+
+def main(arguments: list[str] | None = None) -> int:
+    args = _parse_args(arguments)
+    policy = load_policy(args.policy_path)
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        result = run_boundary_probe(
+            policy=policy,
+            inventory_id=args.inventory_id,
+            tmp_path=args.tmp_path,
+            monkeypatch=monkeypatch,
+        )
+    finally:
+        monkeypatch.undo()
+    sys.stdout.write(json.dumps(result.model_dump(mode="json"), sort_keys=True))
+    return int(not result.passed)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -12,7 +12,7 @@ from typing import Literal
 from urllib.parse import urlsplit
 
 from pydantic import Field, ValidationInfo, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
 
 def _canonical_absolute_path(path: Path, *, label: str) -> Path:
@@ -43,6 +43,20 @@ class Settings(BaseSettings):
         extra="ignore",
         case_sensitive=False,
     )
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        del cls, settings_cls
+        if _dotenv_disabled():
+            return (init_settings, env_settings, file_secret_settings)
+        return (init_settings, env_settings, dotenv_settings, file_secret_settings)
 
     tushare_token_main: str = Field(..., min_length=32)
     tushare_token_backup: str | None = Field(default=None)
@@ -187,9 +201,7 @@ class Settings(BaseSettings):
     # nginx 只认这一个字面值（不验 hmac 签名），所有已登录用户共用同一 cookie 值。
     # 显式配置优先；为空时从 cookie_secret 确定性派生（见 panorama_gate_token_resolved），
     # 免得再单独配一份、且重启后稳定不变。
-    panorama_gate_token: str = Field(
-        default="", validation_alias="RQUANT_PANORAMA_GATE_TOKEN"
-    )
+    panorama_gate_token: str = Field(default="", validation_alias="RQUANT_PANORAMA_GATE_TOKEN")
 
     @property
     def deepseek_enabled(self) -> bool:
@@ -266,9 +278,7 @@ class Settings(BaseSettings):
         if not normalized:
             return "tushare"
         if normalized not in ("tushare", "akshare"):
-            raise ValueError(
-                f"intraday_quote_source 只允许 'tushare' 或 'akshare'，收到 {v!r}"
-            )
+            raise ValueError(f"intraday_quote_source 只允许 'tushare' 或 'akshare'，收到 {v!r}")
         return normalized
 
     @field_validator("data_dir", "parquet_dir", "log_dir", mode="before")
@@ -412,25 +422,15 @@ class Settings(BaseSettings):
             readonly_path,
         }
         if state_path in operational_paths:
-            raise ValueError(
-                "backfill state path must differ from DuckDB main and readonly paths"
-            )
+            raise ValueError("backfill state path must differ from DuckDB main and readonly paths")
         research_paths = {
             (self.research_db_path or self.data_dir / "research.duckdb").resolve(),
-            (
-                self.research_readonly_db_path
-                or self.data_dir / "research_ro.duckdb"
-            ).resolve(),
+            (self.research_readonly_db_path or self.data_dir / "research_ro.duckdb").resolve(),
             (self.research_lake_dir or self.data_dir / "lake").resolve(),
-            (
-                self.research_staging_dir
-                or self.data_dir / "research_staging"
-            ).resolve(),
+            (self.research_staging_dir or self.data_dir / "research_staging").resolve(),
         }
         if research_paths & operational_paths:
-            raise ValueError(
-                "research paths must differ from DuckDB main and readonly paths"
-            )
+            raise ValueError("research paths must differ from DuckDB main and readonly paths")
         if len(research_paths) != 4:
             raise ValueError("research paths must differ from each other")
         return self
@@ -728,9 +728,13 @@ class Settings(BaseSettings):
         return derive_gate_token(self.panorama_cookie_secret)
 
 
-def _default_settings_env_file() -> str | None:
+def _dotenv_disabled() -> bool:
     disabled = os.getenv("RQUANT_DISABLE_DOTENV", "").strip().lower()
-    return None if disabled in {"1", "true", "yes", "on"} else ".env"
+    return disabled in {"1", "true", "yes", "on"}
+
+
+def _default_settings_env_file() -> str | None:
+    return None if _dotenv_disabled() else ".env"
 
 
 settings = Settings(_env_file=_default_settings_env_file())  # type: ignore[call-arg]

@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import ast
+import copy
 import hashlib
 import json
 import os
 import shutil
 import subprocess
+import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -137,6 +141,88 @@ def _commit(repo: Path, message: str) -> str:
     ).stdout.strip()
 
 
+def _head(repo: Path = ROOT) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+@pytest.mark.parametrize(
+    "source",
+    (
+        "def sample(value: int) -> int:\n    return value\n",
+        "async def sample(value: int) -> int:\n    return value\n",
+        "class Sample:\n    value = 1\n",
+    ),
+    ids=("function", "async-function", "class"),
+)
+def test_normalized_ast_dump_treats_synthetic_311_and_312_shapes_as_equal(
+    source: str,
+) -> None:
+    python_312_shape = ast.parse(source).body[0]
+    for node in ast.walk(python_312_shape):
+        if type(node).__name__ in {"FunctionDef", "AsyncFunctionDef", "ClassDef"}:
+            if "type_params" not in node._fields:
+                node._fields = (*node._fields, "type_params")
+            node.type_params = []
+    python_311_shape = copy.deepcopy(python_312_shape)
+    for node in ast.walk(python_311_shape):
+        if type(node).__name__ in {"FunctionDef", "AsyncFunctionDef", "ClassDef"}:
+            node._fields = tuple(field for field in node._fields if field != "type_params")
+            if hasattr(node, "type_params"):
+                delattr(node, "type_params")
+    assert ast.dump(python_311_shape, include_attributes=False) != ast.dump(
+        python_312_shape,
+        include_attributes=False,
+    )
+    assert differential_gate.normalized_ast_dump(
+        python_311_shape
+    ) == differential_gate.normalized_ast_dump(python_312_shape)
+
+
+def test_python311_normalizer_runs_when_local_runtime_is_usable_or_records_ci_need() -> None:
+    source = "def sample(value: int) -> int:\n    return value\n"
+    expected = differential_gate.normalized_ast_dump(ast.parse(source).body[0])
+    if sys.version_info[:2] == (3, 11):
+        assert differential_gate.normalized_ast_dump(ast.parse(source).body[0]) == expected
+        return
+
+    executable = shutil.which("python3.11")
+    if executable is None:
+        assert "r07-differential-gate-py311" in load_policy(POLICY_PATH).evidence_channel.jobs
+        return
+    completed = subprocess.run(
+        [
+            executable,
+            "-c",
+            (
+                "import ast; "
+                "from rquant.signal_family_differential_gate import normalized_ast_dump; "
+                f"print(normalized_ast_dump(ast.parse({source!r}).body[0]))"
+            ),
+        ],
+        cwd=ROOT,
+        env={
+            "PATH": os.environ.get("PATH", ""),
+            "PYTHONPATH": os.pathsep.join((str(ROOT / "src"), str(ROOT))),
+            "PYTHONNOUSERSITE": "1",
+            "RQUANT_DISABLE_DOTENV": "1",
+            "TUSHARE_TOKEN_MAIN": "0" * 32,
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        assert completed.stderr
+        assert "r07-differential-gate-py311" in load_policy(POLICY_PATH).evidence_channel.jobs
+        return
+    assert completed.stdout.strip() == expected
+
+
 def test_normative_baseline_pair_and_candidate_repository_identity() -> None:
     assert BASELINE_COMMIT_SHA == "45d0b57c4c5cbab1700fa5e3c386c6756892a7d6"
     assert BASELINE_TREE_SHA == "4f67e67192855874e82baa13dc343a1d6939bd67"
@@ -161,6 +247,8 @@ def test_normative_baseline_pair_and_candidate_repository_identity() -> None:
     )
     assert result.passed
     assert result.candidate_tree_sha == candidate_tree
+    assert result.diff_entries
+    assert len(result.candidate_binding_digest) == 64
     with pytest.raises(ValueError, match="candidate tree does not match"):
         differential_gate.verify_candidate_gate(
             ROOT,
@@ -208,6 +296,64 @@ def test_complete_diff_uses_explicit_commit_range_and_raw_change_identity(tmp_pa
     assert ("T", "typed", "100644", "120000") in observed
     assert ("?", "untracked.txt", "000000", "100644") in observed
     assert not any(entry.path == "head-only.txt" for entry in result.entries)
+    differential_gate.validate_complete_diff_objects(repo, result)
+    modified = next(entry for entry in result.entries if entry.path == "modified.txt")
+    assert (
+        modified.old_object
+        == subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", f"{baseline}:modified.txt"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    )
+    assert (
+        modified.new_object
+        == subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", f"{candidate}:modified.txt"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    )
+    forged = replace(
+        result,
+        entries=(
+            replace(modified, new_object="f" * 40),
+            *(entry for entry in result.entries if entry is not modified),
+        ),
+    )
+    with pytest.raises(ValueError, match="object|blob"):
+        differential_gate.validate_complete_diff_objects(repo, forged)
+    forged_status = replace(
+        result,
+        entries=(
+            replace(modified, status="T"),
+            *(entry for entry in result.entries if entry is not modified),
+        ),
+    )
+    with pytest.raises(ValueError, match="status"):
+        differential_gate.validate_complete_diff_objects(repo, forged_status)
+
+
+def test_exact_commit_static_source_ignores_dirty_tracked_worktree(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "init", "--quiet", str(repo)], check=True)
+    module_path = "src/rquant/runtime_service_main.py"
+    source_path = repo / module_path
+    source_path.parent.mkdir(parents=True)
+    source_path.write_text("registry = {}\ndef build_builtin_registry():\n    return registry\n")
+    candidate = _commit(repo, "candidate")
+    snapshot = differential_gate.source_file_snapshot(repo, candidate, module_path)
+
+    source_path.write_text("registry = {}\nv3_writer = object()\n")
+
+    assert differential_gate.source_file_snapshot(repo, candidate, module_path) == snapshot
+    assert differential_gate.verify_top_level_source_closure(
+        repo,
+        candidate,
+        (snapshot,),
+    ).passed
 
 
 def test_actual_candidate_gate_rejects_any_unlisted_change() -> None:
@@ -239,17 +385,21 @@ def test_root_snapshots_are_static_and_cover_ten_roots() -> None:
     assert len(ROOT_SNAPSHOTS) == 10
     assert all(snapshot.module_path.startswith("src/rquant/") for snapshot in ROOT_SNAPSHOTS)
     for snapshot in ROOT_SNAPSHOTS:
-        assert verify_root_snapshot(ROOT, snapshot).passed
+        assert verify_root_snapshot(ROOT, _head(), snapshot).passed
 
 
 def test_forbidden_definition_universe_is_static_source_only() -> None:
     assert "src/rquant/signal_route_spool.py" in FORBIDDEN_DEFINITION_UNIVERSE.source_files
-    assert verify_forbidden_definitions(ROOT, FORBIDDEN_DEFINITION_UNIVERSE).passed
+    assert verify_forbidden_definitions(
+        ROOT,
+        _head(),
+        FORBIDDEN_DEFINITION_UNIVERSE,
+    ).passed
     policy = load_policy(POLICY_PATH)
     assert len(policy.source_file_snapshots) == 9
     verifier = getattr(differential_gate, "verify_top_level_source_closure", None)
     assert verifier is not None
-    assert verifier(ROOT, policy.source_file_snapshots).passed
+    assert verifier(ROOT, _head(), policy.source_file_snapshots).passed
 
 
 @pytest.mark.parametrize(
@@ -275,16 +425,20 @@ def test_top_level_source_closure_blocks_dynamic_and_unlisted_declarations(
     tmp_path: Path,
     tamper: str,
 ) -> None:
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
     policy = load_policy(POLICY_PATH)
     for snapshot in policy.source_file_snapshots:
         source = ROOT / snapshot.module_path
         target = tmp_path / snapshot.module_path
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, target)
+    _commit(tmp_path, "frozen")
     target = tmp_path / "src/rquant/runtime_service_main.py"
     target.write_text(target.read_text(encoding="utf-8") + "\n" + tamper, encoding="utf-8")
+    candidate = _commit(tmp_path, "tamper")
     result = differential_gate.verify_top_level_source_closure(
         tmp_path,
+        candidate,
         policy.source_file_snapshots,
     )
     assert not result.passed
@@ -293,6 +447,7 @@ def test_top_level_source_closure_blocks_dynamic_and_unlisted_declarations(
 def test_forbidden_definition_gate_detects_symbols_and_registry_string_keys(
     tmp_path: Path,
 ) -> None:
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
     module_path = Path("src/rquant/runtime_service_main.py")
     source_path = tmp_path / module_path
     source_path.parent.mkdir(parents=True)
@@ -300,10 +455,11 @@ def test_forbidden_definition_gate_detects_symbols_and_registry_string_keys(
         "v3_writer = object()\nregistry = {'v3_overlay': v3_writer}\n",
         encoding="utf-8",
     )
+    candidate = _commit(tmp_path, "forbidden")
     universe = FORBIDDEN_DEFINITION_UNIVERSE.model_copy(
         update={"source_files": (module_path.as_posix(),)}
     )
-    result = verify_forbidden_definitions(tmp_path, universe)
+    result = verify_forbidden_definitions(tmp_path, candidate, universe)
     assert not result.passed
     assert result.reasons == ("src/rquant/runtime_service_main.py: v3_overlay,v3_writer",)
 
@@ -354,6 +510,7 @@ def test_policy_completeness_rejects_any_declaration_or_universe_omission() -> N
     )
     assert not differential_gate.verify_top_level_source_closure(
         ROOT,
+        _head(),
         (incomplete_snapshot, *policy.source_file_snapshots[1:]),
     ).passed
     changed_probe = policy.boundary_probes[0].model_copy(update={"behavior_test": "wrong"})
@@ -369,13 +526,13 @@ def test_policy_completeness_rejects_any_declaration_or_universe_omission() -> N
 def test_production_declaration_spans_and_normalized_asts_are_exact() -> None:
     policy = load_policy(POLICY_PATH)
     for declaration in policy.production_declarations:
-        assert verify_production_declaration(ROOT, declaration).passed
+        assert verify_production_declaration(ROOT, _head(), declaration).passed
 
 
 def test_boundary_source_spans_and_normalized_asts_are_exact() -> None:
     policy = load_policy(POLICY_PATH)
     for probe in policy.boundary_probes:
-        assert verify_boundary_probe_source(ROOT, probe).passed
+        assert verify_boundary_probe_source(ROOT, _head(), probe).passed
 
 
 def test_policy_is_canonical_and_binds_requested_baseline() -> None:

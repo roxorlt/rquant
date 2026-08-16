@@ -16,7 +16,7 @@ from rquant.delivery_contracts import DeliveryChannel, DeliveryTarget
 from rquant.signal_bus import LegacySignalWriteActivationError
 from rquant.signal_contracts import CurrentSignalEnvelope, SignalEnvelope, parse_signal_envelope
 from rquant.signal_family_differential_gate import load_policy
-from tests.r07_differential_probe_runner import run_boundary_probe
+from tests.r07_differential_probe_runner import run_boundary_probe_subprocess
 from tests.unit.test_signal_contracts import (
     _CURRENT_CANONICAL_FIXTURES,
     _LEGACY_CANONICAL_FIXTURES,
@@ -43,14 +43,12 @@ def _current_signal() -> CurrentSignalEnvelope:
 def test_r07_dynamic_boundary_probe(
     inventory_id: str,
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     policy = load_policy(POLICY_PATH)
-    result = run_boundary_probe(
+    result = run_boundary_probe_subprocess(
         policy=policy,
         inventory_id=inventory_id,
         tmp_path=tmp_path,
-        monkeypatch=monkeypatch,
     )
 
     assert result.passed

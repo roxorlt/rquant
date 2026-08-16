@@ -364,7 +364,7 @@ def test_clean_environment_aggregate_uses_shared_private_collect_setup(
             encoding="utf-8"
         )
     )["full_suite"]
-    assert full_suite["cases"] == 11144
+    assert full_suite["cases"] == 11770
     assert full_suite["skips"] == 48
 
 
@@ -419,3 +419,17 @@ def test_validator_rejects_malformed_junit_and_python_version_mismatch(
     _write_artifacts(artifacts, index, python_version="3.11")
     with pytest.raises(validator.ContractError, match="artifact directories|python"):
         _validate(manifest_root, artifacts, monkeypatch)
+
+
+def test_checked_in_manifest_matches_exact_collection_without_missing_or_duplicate_cases() -> None:
+    manifest_root = Path(__file__).parents[1] / "manifests/full-suite-v1"
+    with shards._isolated_pytest_environment() as environment:
+        index, groups = shards.validate_manifest(
+            manifest_root,
+            repository_root=Path(__file__).parents[2],
+            environment=environment,
+        )
+    nodeids = tuple(nodeid for group in groups for nodeid in group)
+    assert len(nodeids) == index["full_suite"]["cases"]
+    assert len(nodeids) == len(set(nodeids))
+    assert shards.nodeid_digest(nodeids) == index["full_suite"]["sha256"]
