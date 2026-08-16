@@ -157,7 +157,7 @@ def test_evidence_uses_exact_fields_and_canonical_self_digest(
     assert "candidate_binding_digest" in R07DrGateEvidenceWireV1.model_fields
     assert hasattr(VerifiedR07DrGateEvidenceV1, "from_gate_results")
     assert not hasattr(VerifiedR07DrGateEvidenceV1, "from_canonical_json")
-    assert R07_CI_EVIDENCE_PRODUCER_IMPLEMENTED is False
+    assert R07_CI_EVIDENCE_PRODUCER_IMPLEMENTED is True
     evidence = evidence_bundle.evidence
     assert (
         evidence.candidate_binding_digest == evidence_bundle.candidate_gate.candidate_binding_digest

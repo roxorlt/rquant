@@ -25,7 +25,7 @@ jobs:
       NOTIFY_ENABLED: "false"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # actions/checkout@v4
 
       - name: Create private preflight test root
         shell: bash
@@ -48,7 +48,7 @@ jobs:
             printf 'RQUANT_DISABLE_DOTENV=1\n'
           } >> "${GITHUB_ENV}"
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -87,9 +87,9 @@ jobs:
         shard: [0, 1, 2, 3]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -139,9 +139,9 @@ jobs:
         python-version: ["3.11", "3.12"]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -160,7 +160,7 @@ jobs:
         run: uv sync --frozen
 
       - name: Download all shard evidence for this Python version
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # actions/download-artifact@v4
         with:
           pattern: full-suite-evidence-py${{ matrix.python-version }}-shard*
           path: shard-evidence
@@ -184,6 +184,262 @@ jobs:
           name: full-suite-contract-py${{ matrix.python-version }}
           path: test-results/full-suite-summary-py${{ matrix.python-version }}.json
           if-no-files-found: error
+
+  r07-differential-gate-py311:
+    name: R07 differential gate (Python 3.11)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'push' && github.event.after || github.sha }}
+          fetch-depth: 0
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Create private R07 test root
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          root="${RUNNER_TEMP}/rquant-r07-py311"
+          mkdir -p "${root}/tmp" "${root}/data" "${root}/parquet" "${root}/logs"
+          chmod 700 "${root}" "${root}/tmp" "${root}/data" "${root}/parquet" "${root}/logs"
+          {
+            printf 'TMPDIR=%s/tmp\n' "${root}"
+            printf 'TMP=%s/tmp\n' "${root}"
+            printf 'TEMP=%s/tmp\n' "${root}"
+            printf 'DATA_DIR=%s/data\n' "${root}"
+            printf 'DUCKDB_PATH=%s/data/test.duckdb\n' "${root}"
+            printf 'DUCKDB_READONLY_PATH=%s/data/test-ro.duckdb\n' "${root}"
+            printf 'PARQUET_DIR=%s/parquet\n' "${root}"
+            printf 'LOG_DIR=%s/logs\n' "${root}"
+            printf 'RQUANT_DISABLE_DOTENV=1\n'
+            printf 'TUSHARE_TOKEN_MAIN=00000000000000000000000000000000\n'
+            printf 'NOTIFY_ENABLED=false\n'
+          } >> "${GITHUB_ENV}"
+
+      - name: Install uv
+        run: python -m pip install uv==0.10.11
+
+      - name: Install locked dependencies
+        run: uv sync --frozen
+
+      - name: Validate pull request R07 gate without evidence
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tree="$(git rev-parse --verify 'HEAD^{tree}')"
+          uv run python scripts/r07_ci_evidence.py validate \
+            --repo "${GITHUB_WORKSPACE}" \
+            --candidate-commit "${GITHUB_SHA}" \
+            --candidate-tree "${tree}"
+
+      - name: Produce bound Python 3.11 summary
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run python scripts/r07_ci_evidence.py run-python \
+            --repo "${GITHUB_WORKSPACE}" \
+            --python-minor '3.11' \
+            --output "${RUNNER_TEMP}/r07-summary-py311/summary.json" \
+            --repository '${{ github.repository }}' \
+            --workflow-path '.github/workflows/ci.yml' \
+            --event-name '${{ github.event_name }}' \
+            --ref '${{ github.ref }}' \
+            --event-after-sha '${{ github.event.after }}' \
+            --checkout-sha '${{ github.sha }}' \
+            --workflow-run-id '${{ github.run_id }}' \
+            --run-attempt '${{ github.run_attempt }}' \
+            --job-id 'r07-differential-gate-py311' \
+            --job-run-id '${{ job.check_run_id }}'
+
+      - name: Upload Python 3.11 summary
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # actions/upload-artifact@v4
+        with:
+          name: r07-dr-gate-summary-py311-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/r07-summary-py311/summary.json
+          if-no-files-found: error
+          retention-days: 1
+
+  r07-differential-gate-py312:
+    name: R07 differential gate (Python 3.12)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'push' && github.event.after || github.sha }}
+          fetch-depth: 0
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Create private R07 test root
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          root="${RUNNER_TEMP}/rquant-r07-py312"
+          mkdir -p "${root}/tmp" "${root}/data" "${root}/parquet" "${root}/logs"
+          chmod 700 "${root}" "${root}/tmp" "${root}/data" "${root}/parquet" "${root}/logs"
+          {
+            printf 'TMPDIR=%s/tmp\n' "${root}"
+            printf 'TMP=%s/tmp\n' "${root}"
+            printf 'TEMP=%s/tmp\n' "${root}"
+            printf 'DATA_DIR=%s/data\n' "${root}"
+            printf 'DUCKDB_PATH=%s/data/test.duckdb\n' "${root}"
+            printf 'DUCKDB_READONLY_PATH=%s/data/test-ro.duckdb\n' "${root}"
+            printf 'PARQUET_DIR=%s/parquet\n' "${root}"
+            printf 'LOG_DIR=%s/logs\n' "${root}"
+            printf 'RQUANT_DISABLE_DOTENV=1\n'
+            printf 'TUSHARE_TOKEN_MAIN=00000000000000000000000000000000\n'
+            printf 'NOTIFY_ENABLED=false\n'
+          } >> "${GITHUB_ENV}"
+
+      - name: Install uv
+        run: python -m pip install uv==0.10.11
+
+      - name: Install locked dependencies
+        run: uv sync --frozen
+
+      - name: Validate pull request R07 gate without evidence
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tree="$(git rev-parse --verify 'HEAD^{tree}')"
+          uv run python scripts/r07_ci_evidence.py validate \
+            --repo "${GITHUB_WORKSPACE}" \
+            --candidate-commit "${GITHUB_SHA}" \
+            --candidate-tree "${tree}"
+
+      - name: Produce bound Python 3.12 summary
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run python scripts/r07_ci_evidence.py run-python \
+            --repo "${GITHUB_WORKSPACE}" \
+            --python-minor '3.12' \
+            --output "${RUNNER_TEMP}/r07-summary-py312/summary.json" \
+            --repository '${{ github.repository }}' \
+            --workflow-path '.github/workflows/ci.yml' \
+            --event-name '${{ github.event_name }}' \
+            --ref '${{ github.ref }}' \
+            --event-after-sha '${{ github.event.after }}' \
+            --checkout-sha '${{ github.sha }}' \
+            --workflow-run-id '${{ github.run_id }}' \
+            --run-attempt '${{ github.run_attempt }}' \
+            --job-id 'r07-differential-gate-py312' \
+            --job-run-id '${{ job.check_run_id }}'
+
+      - name: Upload Python 3.12 summary
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # actions/upload-artifact@v4
+        with:
+          name: r07-dr-gate-summary-py312-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/r07-summary-py312/summary.json
+          if-no-files-found: error
+          retention-days: 1
+
+  r07-differential-gate-evidence:
+    name: R07 differential gate evidence
+    if: >-
+      ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+          needs.r07-differential-gate-py311.result == 'success' &&
+          needs.r07-differential-gate-py312.result == 'success' }}
+    needs:
+      - r07-differential-gate-py311
+      - r07-differential-gate-py312
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # actions/checkout@v4
+        with:
+          ref: ${{ github.event.after }}
+          fetch-depth: 0
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Create private R07 aggregate root
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          root="${RUNNER_TEMP}/rquant-r07-aggregate"
+          mkdir -p "${root}/tmp" "${root}/data" "${root}/parquet" "${root}/logs"
+          chmod 700 "${root}" "${root}/tmp" "${root}/data" "${root}/parquet" "${root}/logs"
+          {
+            printf 'TMPDIR=%s/tmp\n' "${root}"
+            printf 'TMP=%s/tmp\n' "${root}"
+            printf 'TEMP=%s/tmp\n' "${root}"
+            printf 'DATA_DIR=%s/data\n' "${root}"
+            printf 'DUCKDB_PATH=%s/data/test.duckdb\n' "${root}"
+            printf 'DUCKDB_READONLY_PATH=%s/data/test-ro.duckdb\n' "${root}"
+            printf 'PARQUET_DIR=%s/parquet\n' "${root}"
+            printf 'LOG_DIR=%s/logs\n' "${root}"
+            printf 'RQUANT_DISABLE_DOTENV=1\n'
+            printf 'TUSHARE_TOKEN_MAIN=00000000000000000000000000000000\n'
+            printf 'NOTIFY_ENABLED=false\n'
+          } >> "${GITHUB_ENV}"
+
+      - name: Install uv
+        run: python -m pip install uv==0.10.11
+
+      - name: Install locked dependencies
+        run: uv sync --frozen
+
+      - name: Download Python 3.11 summary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # actions/download-artifact@v4
+        with:
+          name: r07-dr-gate-summary-py311-${{ github.run_id }}-${{ github.run_attempt }}
+          path: r07-input/py311
+
+      - name: Download Python 3.12 summary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # actions/download-artifact@v4
+        with:
+          name: r07-dr-gate-summary-py312-${{ github.run_id }}-${{ github.run_attempt }}
+          path: r07-input/py312
+
+      - name: Aggregate canonical R07 evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run python scripts/r07_ci_evidence.py aggregate \
+            --repo "${GITHUB_WORKSPACE}" \
+            --py311-summary 'r07-input/py311/summary.json' \
+            --py312-summary 'r07-input/py312/summary.json' \
+            --artifact-root 'r07-evidence-artifact-root' \
+            --repository '${{ github.repository }}' \
+            --workflow-path '.github/workflows/ci.yml' \
+            --event-name '${{ github.event_name }}' \
+            --ref '${{ github.ref }}' \
+            --event-after-sha '${{ github.event.after }}' \
+            --checkout-sha '${{ github.sha }}' \
+            --workflow-run-id '${{ github.run_id }}' \
+            --run-attempt '${{ github.run_attempt }}' \
+            --job-id 'r07-differential-gate-evidence' \
+            --job-run-id '${{ job.check_run_id }}'
+
+      - name: Upload canonical R07 evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # actions/upload-artifact@v4
+        with:
+          name: r07-dr-gate-${{ github.event.after }}
+          path: r07-evidence-artifact-root/
+          if-no-files-found: error
+          retention-days: 90
 
   runtime-fd-exec-linux:
     name: Linux FD-exec exact (${{ matrix.python-version }})
