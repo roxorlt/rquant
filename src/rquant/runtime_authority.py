@@ -142,6 +142,9 @@ class RuntimeAuthorityPublishResult(StrEnum):
     COMMITTED_AFTER_RECOVERY = "committed_after_recovery"
 
 
+_DEPLOYMENT_LOCK_SEAL = object()
+
+
 @dataclass
 class _DeploymentLockLease:
     descriptor: int
@@ -169,6 +172,37 @@ class _DeploymentLockLease:
         self.descriptors.clear()
 
 
+class RuntimeDeploymentLock:
+    """Scoped deployment transaction lock without exposing its descriptor."""
+
+    __slots__ = ("__lease",)
+
+    def __init__(
+        self,
+        *,
+        _seal: object | None = None,
+        _lease: _DeploymentLockLease | None = None,
+    ) -> None:
+        if _seal is not _DEPLOYMENT_LOCK_SEAL or _lease is None:
+            raise RuntimeAuthorityPublishError(
+                "runtime deployment lock cannot be constructed by callers"
+            )
+        self.__lease = _lease
+
+    def assert_current(self) -> None:
+        self.__lease.assert_current()
+
+    def close(self) -> None:
+        self.__lease.close()
+
+    def __enter__(self) -> RuntimeDeploymentLock:
+        self.assert_current()
+        return self
+
+    def __exit__(self, _exc_type: object, _exc: object, _traceback: object) -> None:
+        self.close()
+
+
 _DURABLE_EVIDENCE_SEAL = object()
 
 
@@ -190,6 +224,7 @@ class _DurableGenerationEvidence:
 @dataclass(frozen=True)
 class _GenerationManifestEntry:
     path: str
+    normalized_path: str
     entry_type: str
     owner_uid: int
     mode: int
@@ -952,12 +987,12 @@ def publish_runtime_authority(
         raise RuntimeAuthorityPublishError(
             "runtime authority record violates the loaded profile"
         ) from exc
-    lock_lease: _DeploymentLockLease | None = None
+    lock_lease: RuntimeDeploymentLock | None = None
     descriptors: list[int] = []
     temporary_fd = -1
     temporary_name = _temporary_name(record.operation_id)
     try:
-        lock_lease = _acquire_deployment_lock()
+        lock_lease = acquire_runtime_deployment_lock()
         lock_lease.assert_current()
         descriptors, parent_fd, target_name = _open_trusted_parent(
             RUNTIME_AUTHORITY_PATH,
@@ -1060,10 +1095,10 @@ def cleanup_runtime_authority_temp(operation_id: str) -> bool:
         raise RuntimeAuthorityPublishError(
             "runtime authority temporary operation is invalid"
         ) from exc
-    lock_lease: _DeploymentLockLease | None = None
+    lock_lease: RuntimeDeploymentLock | None = None
     descriptors: list[int] = []
     try:
-        lock_lease = _acquire_deployment_lock()
+        lock_lease = acquire_runtime_deployment_lock()
         descriptors, parent_fd, _target_name = _open_trusted_parent(
             RUNTIME_AUTHORITY_PATH,
             directory_policy=_PRODUCTION_RUNTIME_DIRECTORY_POLICY,
@@ -1456,6 +1491,7 @@ def _acquire_deployment_lock() -> _DeploymentLockLease:
             | _required_flag("O_NOFOLLOW", RuntimeAuthorityPublishError)
             | getattr(os, "O_CLOEXEC", 0)
         )
+        created = False
         try:
             descriptor = os.open(
                 name,
@@ -1463,8 +1499,14 @@ def _acquire_deployment_lock() -> _DeploymentLockLease:
                 RUNTIME_AUTHORITY_LOCK_MODE,
                 dir_fd=parent_fd,
             )
+            created = True
         except FileExistsError:
             descriptor = os.open(name, base_flags, dir_fd=parent_fd)
+        if created:
+            observed = os.fstat(descriptor)
+            if observed.st_uid != RUNTIME_AUTHORITY_OWNER_UID:
+                os.fchown(descriptor, RUNTIME_AUTHORITY_OWNER_UID, -1)
+            os.fchmod(descriptor, RUNTIME_AUTHORITY_LOCK_MODE)
         observed = os.fstat(descriptor)
         _require_file_stat(
             observed,
@@ -1500,6 +1542,19 @@ def _acquire_deployment_lock() -> _DeploymentLockLease:
                     with suppress(OSError):
                         os.close(descriptor)
                 _close_descriptors(descriptors)
+
+
+def acquire_runtime_deployment_lock() -> RuntimeDeploymentLock:
+    """Acquire the one lock before opening any mutable runtime transaction tree.
+
+    Lock order is deployment lock first, followed by any inbox, quarantine,
+    generation, or authority-record descriptors. No second advisory lock is used.
+    """
+
+    return RuntimeDeploymentLock(
+        _seal=_DEPLOYMENT_LOCK_SEAL,
+        _lease=_acquire_deployment_lock(),
+    )
 
 
 def _open_trusted_parent(
@@ -1933,9 +1988,15 @@ def _validate_generation_manifest(
         raise RuntimeAuthorityPublishError("generation manifest entries are invalid")
     manifest_entries: list[_GenerationManifestEntry] = []
     entry_types: dict[str, str] = {}
+    normalized_paths: set[str] = set()
     declared_budget = _GenerationTreeBudget(profile.manifest_schema)
     for entry in entries:
         parsed = _validate_generation_manifest_entry(entry, profile)
+        if parsed.normalized_path in normalized_paths:
+            raise RuntimeAuthorityPublishError(
+                "generation manifest contains a duplicate normalized path"
+            )
+        normalized_paths.add(parsed.normalized_path)
         declared_budget.observe_entry(parsed.path)
         if parsed.entry_type == "file":
             declared_budget.observe_file(parsed.size)
@@ -1990,15 +2051,24 @@ def _validate_generation_manifest_entry(
         raise RuntimeAuthorityPublishError("generation manifest entry schema is invalid")
     path = entry["path"]
     entry_type = entry["type"]
-    if (
-        type(path) is not str
-        or not path
-        or path.startswith("/")
-        or path == GENERATION_MANIFEST_NAME
-        or len(path.encode("utf-8")) > profile.manifest_schema.max_path_bytes
-        or any(component in {"", ".", ".."} for component in path.split("/"))
-    ):
+    if type(path) is not str or not path or path.startswith("/"):
         raise RuntimeAuthorityPublishError("generation manifest entry path is invalid")
+    try:
+        if len(path.encode("utf-8")) > profile.manifest_schema.max_path_bytes:
+            raise RuntimeAuthorityPublishError("generation manifest entry path is invalid")
+    except UnicodeEncodeError as exc:
+        raise RuntimeAuthorityPublishError(
+            "generation manifest entry path is not valid UTF-8"
+        ) from exc
+    normalized_components = tuple(
+        _normalize_generation_component(component, "generation manifest entry path")
+        for component in path.split("/")
+    )
+    normalized_path = "/".join(normalized_components)
+    if normalized_path == _NORMALIZED_GENERATION_MANIFEST_NAME:
+        raise RuntimeAuthorityPublishError(
+            "generation manifest entry path is a reserved normalized alias"
+        )
     if entry_type not in profile.manifest_schema.entry_types:
         raise RuntimeAuthorityPublishError("generation manifest entry type is invalid")
     if type(entry["owner_uid"]) is not int or entry["owner_uid"] != RUNTIME_AUTHORITY_OWNER_UID:
@@ -2032,6 +2102,7 @@ def _validate_generation_manifest_entry(
         raise RuntimeAuthorityPublishError("generation manifest entry metadata is invalid")
     return _GenerationManifestEntry(
         path=path,
+        normalized_path=normalized_path,
         entry_type=entry_type,
         owner_uid=entry["owner_uid"],
         mode=mode,
@@ -2207,13 +2278,16 @@ def _validate_generation_tree(
 ) -> tuple[tuple[str, tuple[int, ...]], ...]:
     expected = {entry.path: entry for entry in entries}
     observed: dict[str, tuple[int, ...]] = {}
+    normalized_observed: set[str] = set()
     observed_budget = _GenerationTreeBudget(profile.manifest_schema)
     root_before = os.fstat(generation_fd)
     _walk_generation_directory(
         generation_fd,
         relative_parent="",
+        normalized_parent="",
         expected=expected,
         observed=observed,
+        normalized_observed=normalized_observed,
         profile=profile,
         budget=observed_budget,
     )
@@ -2231,8 +2305,10 @@ def _walk_generation_directory(
     directory_fd: int,
     *,
     relative_parent: str,
+    normalized_parent: str,
     expected: Mapping[str, _GenerationManifestEntry],
     observed: dict[str, tuple[int, ...]],
+    normalized_observed: set[str],
     profile: RuntimeClosureProfile,
     budget: _GenerationTreeBudget,
 ) -> None:
@@ -2242,8 +2318,10 @@ def _walk_generation_directory(
                 directory_fd,
                 directory_entry,
                 relative_parent=relative_parent,
+                normalized_parent=normalized_parent,
                 expected=expected,
                 observed=observed,
+                normalized_observed=normalized_observed,
                 profile=profile,
                 budget=budget,
             )
@@ -2254,8 +2332,10 @@ def _validate_generation_directory_entry(
     directory_entry: os.DirEntry[str],
     *,
     relative_parent: str,
+    normalized_parent: str,
     expected: Mapping[str, _GenerationManifestEntry],
     observed: dict[str, tuple[int, ...]],
+    normalized_observed: set[str],
     profile: RuntimeClosureProfile,
     budget: _GenerationTreeBudget,
 ) -> None:
@@ -2270,6 +2350,17 @@ def _validate_generation_directory_entry(
             label="generation manifest",
         )
         return
+    normalized_name = _normalize_generation_component(name, "generation tree path")
+    normalized_path = (
+        normalized_name if not normalized_parent else f"{normalized_parent}/{normalized_name}"
+    )
+    if not relative_parent and normalized_name == _NORMALIZED_GENERATION_MANIFEST_NAME:
+        raise RuntimeAuthorityPublishError(
+            "generation tree contains a reserved normalized manifest alias"
+        )
+    if normalized_path in normalized_observed:
+        raise RuntimeAuthorityPublishError("generation tree contains a duplicate normalized path")
+    normalized_observed.add(normalized_path)
     relative_path = name if not relative_parent else f"{relative_parent}/{name}"
     try:
         path_size = _utf8_size(
@@ -2309,8 +2400,10 @@ def _validate_generation_directory_entry(
             _walk_generation_directory(
                 child_fd,
                 relative_parent=relative_path,
+                normalized_parent=normalized_path,
                 expected=expected,
                 observed=observed,
+                normalized_observed=normalized_observed,
                 profile=profile,
                 budget=budget,
             )
@@ -2337,6 +2430,32 @@ def _validate_generation_directory_entry(
             label=f"generation tree file {relative_path}",
         )
     observed[relative_path] = _identity(named)
+
+
+_NORMALIZED_GENERATION_MANIFEST_NAME = unicodedata.normalize(
+    "NFKC",
+    GENERATION_MANIFEST_NAME,
+).casefold()
+
+
+def _normalize_generation_component(component: str, label: str) -> str:
+    try:
+        normalized = unicodedata.normalize("NFKC", component).casefold()
+    except (TypeError, ValueError) as exc:
+        raise RuntimeAuthorityPublishError(f"{label} normalization failed") from exc
+    if (
+        not normalized
+        or normalized in {".", ".."}
+        or "/" in normalized
+        or "\\" in normalized
+        or "\x00" in normalized
+    ):
+        raise RuntimeAuthorityPublishError(f"{label} has an invalid normalized component")
+    try:
+        normalized.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise RuntimeAuthorityPublishError(f"{label} is not valid UTF-8") from exc
+    return normalized
 
 
 def _hash_generation_file_at(
@@ -2472,7 +2591,7 @@ def _write_all(descriptor: int, payload: bytes) -> None:
 
 def _fsync_authority_parent(
     parent_fd: int,
-    lock_lease: _DeploymentLockLease,
+    lock_lease: RuntimeDeploymentLock,
 ) -> None:
     lock_lease.assert_current()
     try:
@@ -2515,9 +2634,11 @@ __all__ = [
     "RuntimeAuthorityRollbackError",
     "RuntimeAuthorityState",
     "RuntimeClosureProfile",
+    "RuntimeDeploymentLock",
     "RuntimeFilePolicy",
     "RuntimeGenerationSlot",
     "RuntimeRoleSpec",
+    "acquire_runtime_deployment_lock",
     "canonical_runtime_authority_bytes",
     "cleanup_runtime_authority_temp",
     "load_production_runtime_profile",

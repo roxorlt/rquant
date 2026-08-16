@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-import fcntl
+import ctypes
+import errno
 import hashlib
 import os
 import re
 import stat
+import sys
 import unicodedata
 from collections.abc import Callable, Mapping
 from contextlib import suppress
@@ -71,6 +73,46 @@ def _no_failpoint(_stage: str) -> None:
 
 _FAILPOINT: Callable[[str], None] = _no_failpoint
 _FSYNC_PHASE = ""
+
+
+def _resolve_atomic_rename_noreplace() -> Callable[[int, str, int, str], None] | None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    if sys.platform.startswith("linux"):
+        primitive = getattr(libc, "renameat2", None)
+        flags = 1  # RENAME_NOREPLACE
+    elif sys.platform == "darwin":
+        primitive = getattr(libc, "renameatx_np", None)
+        flags = 4  # RENAME_EXCL
+    else:
+        return None
+    if primitive is None:
+        return None
+    primitive.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    primitive.restype = ctypes.c_int
+
+    def rename(source_fd: int, source: str, target_fd: int, target: str) -> None:
+        ctypes.set_errno(0)
+        result = primitive(
+            source_fd,
+            os.fsencode(source),
+            target_fd,
+            os.fsencode(target),
+            flags,
+        )
+        if result != 0:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error), target)
+
+    return rename
+
+
+_ATOMIC_RENAME_NOREPLACE = _resolve_atomic_rename_noreplace()
 
 
 class RuntimeQuarantineError(RuntimeError):
@@ -174,8 +216,9 @@ class _TreeBudget:
     schema: RuntimeManifestSchema
     entries: int = 0
     total_bytes: int = 0
+    manifest_bytes: int = 0
 
-    def observe_path(self, path: str) -> None:
+    def observe_path(self, path: str, normalized_path: str) -> None:
         self.entries += 1
         if self.entries > self.schema.max_entries:
             raise RuntimeQuarantineError("candidate entry budget exceeded")
@@ -183,6 +226,17 @@ class _TreeBudget:
             raise RuntimeQuarantineError("candidate path depth budget exceeded")
         if _utf8_size(path, "candidate path") > self.schema.max_path_bytes:
             raise RuntimeQuarantineError("candidate path byte budget exceeded")
+        self.manifest_bytes += _utf8_size(
+            normalized_path,
+            "normalized candidate path",
+        )
+        if self.manifest_bytes > MAX_GENERATION_MANIFEST_BYTES:
+            raise RuntimeQuarantineError("candidate manifest byte budget exceeded")
+
+    def observe_manifest_entry(self, entry: _TreeEntry) -> None:
+        self.manifest_bytes += len(canonical_json_bytes(entry.payload())) + 1
+        if self.manifest_bytes > MAX_GENERATION_MANIFEST_BYTES:
+            raise RuntimeQuarantineError("candidate manifest byte budget exceeded")
 
     def observe_file(self, size: int) -> None:
         if type(size) is not int or size < 0 or size > self.schema.max_file_bytes:
@@ -231,6 +285,11 @@ class _CandidateLease:
         self.descriptors.clear()
 
 
+@dataclass
+class _PublicationState:
+    renamed: bool = False
+
+
 def parse_runtime_quarantine_request(
     payload: str | bytes | bytearray,
 ) -> RuntimeQuarantineRequest:
@@ -269,21 +328,23 @@ def publish_runtime_candidate(request: RuntimeQuarantineRequest) -> RuntimeQuara
     candidate_lease: _CandidateLease | None = None
     quarantine_descriptors: list[int] = []
     temporary_fd = -1
+    deployment_lock: authority.RuntimeDeploymentLock | None = None
+    publication_state = _PublicationState()
     try:
+        deployment_lock = authority.acquire_runtime_deployment_lock()
+        deployment_lock.assert_current()
         candidate_lease = _open_candidate(request, profile)
         quarantine_descriptors, quarantine_fd = _open_fixed_root(
             profile.quarantine_root,
             "quarantine root",
         )
         _create_temporary_directory(quarantine_fd, temporary_name)
-        _FAILPOINT("creation")
         temporary_fd = _open_owned_directory_at(
             quarantine_fd,
             temporary_name,
             allowed_modes={TEMP_DIRECTORY_MODE},
             label="operation quarantine",
         )
-        _FAILPOINT("traversal")
         entries = _copy_candidate_tree(candidate_lease, temporary_fd, profile)
         candidate_lease.assert_current()
         roles = _manifest_roles(profile)
@@ -292,6 +353,7 @@ def publish_runtime_candidate(request: RuntimeQuarantineRequest) -> RuntimeQuara
             raise RuntimeQuarantineError("root-derived generation manifest is too large")
         _write_manifest(temporary_fd, manifest_bytes)
         _set_owned_mode(temporary_fd, authority.GENERATION_DIRECTORY_MODE)
+        _FAILPOINT("completed_quarantine_directory_fsync")
         _fsync_descriptor(temporary_fd, "directory")
         _assert_named_identity(
             quarantine_fd,
@@ -306,11 +368,11 @@ def publish_runtime_candidate(request: RuntimeQuarantineRequest) -> RuntimeQuara
         _close_descriptors(quarantine_descriptors)
         quarantine_descriptors.clear()
         _FAILPOINT("close_reopen")
+        _FAILPOINT("first_full_revalidation")
         verified = _revalidate_quarantine(temporary_name, profile)
         if verified != manifest_bytes:
             raise RuntimeQuarantineError("closed quarantine manifest identity changed")
         generation_id = hashlib.sha256(verified).hexdigest()
-        _FAILPOINT("revalidation")
         if _revalidate_quarantine(temporary_name, profile) != verified:
             raise RuntimeQuarantineError("quarantine changed before generation publication")
         status = _publish_verified_quarantine(
@@ -318,12 +380,16 @@ def publish_runtime_candidate(request: RuntimeQuarantineRequest) -> RuntimeQuara
             generation_id,
             verified,
             profile,
+            deployment_lock,
+            publication_state,
         )
         return _result(request, profile, generation_id, status)
     except RuntimeQuarantineError:
         raise
+    except authority.RuntimeAuthorityPublishError as exc:
+        raise RuntimeQuarantineError("deployment lock transaction failed") from exc
     except OSError as exc:
-        if generation_id is not None and manifest_bytes is not None:
+        if publication_state.renamed:
             raise RuntimeQuarantineDurabilityError(
                 "generation publication durability failed"
             ) from exc
@@ -335,6 +401,8 @@ def publish_runtime_candidate(request: RuntimeQuarantineRequest) -> RuntimeQuara
         if candidate_lease is not None:
             candidate_lease.close()
         _close_descriptors(quarantine_descriptors)
+        if deployment_lock is not None:
+            deployment_lock.close()
 
 
 def cleanup_runtime_quarantine(operation_id: str) -> bool:
@@ -342,7 +410,10 @@ def cleanup_runtime_quarantine(operation_id: str) -> bool:
     profile = load_production_runtime_profile()
     _validate_loaded_profile(profile)
     descriptors: list[int] = []
+    deployment_lock: authority.RuntimeDeploymentLock | None = None
     try:
+        deployment_lock = authority.acquire_runtime_deployment_lock()
+        deployment_lock.assert_current()
         descriptors, quarantine_fd = _open_fixed_root(
             profile.quarantine_root,
             "quarantine root",
@@ -352,15 +423,20 @@ def cleanup_runtime_quarantine(operation_id: str) -> bool:
             os.stat(name, dir_fd=quarantine_fd, follow_symlinks=False)
         except FileNotFoundError:
             return False
+        _FAILPOINT("cleanup_before_remove")
         _remove_temporary_tree(quarantine_fd, name)
         _fsync_descriptor(quarantine_fd, "quarantine_parent")
         return True
     except RuntimeQuarantineError:
         raise
+    except authority.RuntimeAuthorityPublishError as exc:
+        raise RuntimeQuarantineError("deployment lock cleanup failed") from exc
     except OSError as exc:
         raise RuntimeQuarantineError("operation quarantine cleanup failed") from exc
     finally:
         _close_descriptors(descriptors)
+        if deployment_lock is not None:
+            deployment_lock.close()
 
 
 def _validate_loaded_profile(profile: RuntimeClosureProfile) -> None:
@@ -592,14 +668,53 @@ def _create_temporary_directory(parent_fd: int, name: str) -> None:
         raise RuntimeQuarantineError(
             "operation quarantine already exists; exact cleanup is required"
         ) from exc
+    _FAILPOINT("temporary_created_before_mode_fix")
+    _apply_exact_created_directory_mode(
+        parent_fd,
+        name,
+        TEMP_DIRECTORY_MODE,
+        label="operation quarantine",
+    )
     descriptor = _open_owned_directory_at(
         parent_fd,
         name,
         allowed_modes={TEMP_DIRECTORY_MODE},
         label="operation quarantine",
-        set_owner=True,
     )
     os.close(descriptor)
+    _FAILPOINT("temporary_directory_ready")
+
+
+def _apply_exact_created_directory_mode(
+    parent_fd: int,
+    name: str,
+    mode: int,
+    *,
+    label: str,
+) -> None:
+    named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    observed_mode = stat.S_IMODE(named.st_mode)
+    if (
+        not stat.S_ISDIR(named.st_mode)
+        or stat.S_ISLNK(named.st_mode)
+        or named.st_uid != authority.RUNTIME_AUTHORITY_OWNER_UID
+        or named.st_nlink < 2
+        or observed_mode & ~mode
+    ):
+        raise RuntimeQuarantineError(f"{label} directory metadata is unsafe")
+    os.chmod(
+        name,
+        mode,
+        dir_fd=parent_fd,
+        follow_symlinks=False,
+    )
+    exact = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    _require_directory_stat(
+        exact,
+        owner_uid=authority.RUNTIME_AUTHORITY_OWNER_UID,
+        modes={mode},
+        label=label,
+    )
 
 
 def _open_owned_directory_at(
@@ -608,7 +723,6 @@ def _open_owned_directory_at(
     *,
     allowed_modes: set[int],
     label: str,
-    set_owner: bool = False,
 ) -> int:
     named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     descriptor = -1
@@ -621,9 +735,6 @@ def _open_owned_directory_at(
             | getattr(os, "O_CLOEXEC", 0),
             dir_fd=parent_fd,
         )
-        if set_owner:
-            _set_owned_mode(descriptor, stat.S_IMODE(named.st_mode))
-            named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         opened = os.fstat(descriptor)
         _require_directory_stat(
             named,
@@ -667,6 +778,7 @@ def _copy_candidate_tree(
         lease.candidate_fd,
         destination_fd,
         relative_parent="",
+        normalized_parent="",
         source_owner_uid=lease.source_owner_uid,
         profile=profile,
         budget=budget,
@@ -682,6 +794,7 @@ def _copy_directory_contents(
     destination_fd: int,
     *,
     relative_parent: str,
+    normalized_parent: str,
     source_owner_uid: int,
     profile: RuntimeClosureProfile,
     budget: _TreeBudget,
@@ -693,14 +806,22 @@ def _copy_directory_contents(
         for directory_entry in iterator:
             name = directory_entry.name
             _require_leaf_name(name)
+            normalized_name = _normalize_tree_component(name)
             relative = name if not relative_parent else f"{relative_parent}/{name}"
-            if not relative_parent and name == authority.GENERATION_MANIFEST_NAME:
+            normalized = (
+                normalized_name
+                if not normalized_parent
+                else f"{normalized_parent}/{normalized_name}"
+            )
+            if not relative_parent and normalized_name == _NORMALIZED_MANIFEST_NAME:
                 raise RuntimeQuarantineError("candidate contains the reserved generation manifest")
-            normalized = unicodedata.normalize("NFKC", relative).casefold()
             if normalized in normalized_paths:
-                raise RuntimeQuarantineError("candidate contains duplicate relative paths")
+                raise RuntimeQuarantineError(
+                    "candidate contains a duplicate normalized relative path"
+                )
             normalized_paths.add(normalized)
-            budget.observe_path(relative)
+            budget.observe_path(relative, normalized)
+            _FAILPOINT(f"candidate_traversal:{relative}")
             named = directory_entry.stat(follow_symlinks=False)
             inode = _inode_identity(named)
             if inode in source_inodes:
@@ -712,6 +833,7 @@ def _copy_directory_contents(
                     destination_fd,
                     name,
                     relative,
+                    normalized,
                     named,
                     source_owner_uid=source_owner_uid,
                     profile=profile,
@@ -733,6 +855,7 @@ def _copy_directory_contents(
                 )
             else:
                 raise RuntimeQuarantineError("candidate contains a symlink or special entry")
+            budget.observe_manifest_entry(entry)
             entries.append(entry)
 
 
@@ -741,6 +864,7 @@ def _copy_source_directory(
     destination_parent_fd: int,
     name: str,
     relative: str,
+    normalized_relative: str,
     named: os.stat_result,
     *,
     source_owner_uid: int,
@@ -772,17 +896,23 @@ def _copy_source_directory(
                 f"candidate directory {relative} identity changed while opening"
             )
         os.mkdir(name, TEMP_DIRECTORY_MODE, dir_fd=destination_parent_fd)
+        _apply_exact_created_directory_mode(
+            destination_parent_fd,
+            name,
+            TEMP_DIRECTORY_MODE,
+            label=f"quarantine directory {relative}",
+        )
         destination_fd = _open_owned_directory_at(
             destination_parent_fd,
             name,
             allowed_modes={TEMP_DIRECTORY_MODE},
             label=f"quarantine directory {relative}",
-            set_owner=True,
         )
         _copy_directory_contents(
             source_fd,
             destination_fd,
             relative_parent=relative,
+            normalized_parent=normalized_relative,
             source_owner_uid=source_owner_uid,
             profile=profile,
             budget=budget,
@@ -865,6 +995,7 @@ def _copy_source_file(
             TEMP_FILE_MODE,
             dir_fd=destination_parent_fd,
         )
+        _set_owned_mode(destination_fd, TEMP_FILE_MODE)
         digest = hashlib.sha256()
         copied = 0
         while True:
@@ -876,12 +1007,13 @@ def _copy_source_file(
                 raise RuntimeQuarantineError(f"candidate file {relative} grew while copying")
             _write_all(destination_fd, chunk)
             digest.update(chunk)
-            _FAILPOINT("copy")
+            _FAILPOINT(f"candidate_copy:{relative}")
         if copied != named.st_size:
             raise RuntimeQuarantineError(f"candidate file {relative} size changed while copying")
         _assert_source_identity(source_parent_fd, name, source_fd, named, relative)
         destination_mode = stat.S_IMODE(named.st_mode)
         _set_owned_mode(destination_fd, destination_mode)
+        _FAILPOINT(f"content_file_fsync:{relative}")
         _fsync_descriptor(destination_fd, "file")
         destination = os.fstat(destination_fd)
         _require_file_stat(
@@ -970,15 +1102,30 @@ def _canonical_manifest(
     entries: tuple[_TreeEntry, ...],
 ) -> bytes:
     _require_role_paths(entries, roles)
-    return canonical_json_bytes(
-        {
-            "schema_id": profile.manifest_schema.schema_id,
-            "profile_id": profile.profile_id,
-            "roles": {name: dict(role) for name, role in roles.items()},
-            "entries": [entry.payload() for entry in entries],
-        },
-        trailing_newline=True,
+    output = bytearray(b'{"entries":[')
+    for index, entry in enumerate(entries):
+        if index:
+            _append_manifest_bytes(output, b",")
+        _append_manifest_bytes(output, canonical_json_bytes(entry.payload()))
+    _append_manifest_bytes(
+        output,
+        b'],"profile_id":' + canonical_json_bytes(profile.profile_id),
     )
+    _append_manifest_bytes(
+        output,
+        b',"roles":' + canonical_json_bytes({name: dict(role) for name, role in roles.items()}),
+    )
+    _append_manifest_bytes(
+        output,
+        b',"schema_id":' + canonical_json_bytes(profile.manifest_schema.schema_id) + b"}\n",
+    )
+    return bytes(output)
+
+
+def _append_manifest_bytes(output: bytearray, payload: bytes) -> None:
+    if len(output) + len(payload) > MAX_GENERATION_MANIFEST_BYTES:
+        raise RuntimeQuarantineError("root-derived generation manifest is too large")
+    output.extend(payload)
 
 
 def _require_role_paths(
@@ -1015,8 +1162,11 @@ def _write_manifest(directory_fd: int, payload: bytes) -> None:
             TEMP_FILE_MODE,
             dir_fd=directory_fd,
         )
+        _set_owned_mode(descriptor, TEMP_FILE_MODE)
+        _FAILPOINT("manifest_write")
         _write_all(descriptor, payload)
         _set_owned_mode(descriptor, authority.GENERATION_MANIFEST_MODE)
+        _FAILPOINT("manifest_fsync")
         _fsync_descriptor(descriptor, "file")
         observed = os.fstat(descriptor)
         _require_file_stat(
@@ -1081,8 +1231,6 @@ def _verify_closed_tree(
         raise RuntimeQuarantineError(f"{label} manifest is invalid") from exc
     if type(decoded) is not dict or set(decoded) != _MANIFEST_FIELDS:
         raise RuntimeQuarantineError(f"{label} manifest schema is invalid")
-    if canonical_json_bytes(decoded, trailing_newline=True) != manifest:
-        raise RuntimeQuarantineError(f"{label} manifest is not canonical")
     roles = _manifest_roles(profile)
     if (
         decoded["schema_id"] != profile.manifest_schema.schema_id
@@ -1112,6 +1260,7 @@ def _scan_owned_tree(
     _scan_owned_directory(
         tree_fd,
         relative_parent="",
+        normalized_parent="",
         profile=profile,
         budget=budget,
         normalized_paths=normalized_paths,
@@ -1125,6 +1274,7 @@ def _scan_owned_directory(
     directory_fd: int,
     *,
     relative_parent: str,
+    normalized_parent: str,
     profile: RuntimeClosureProfile,
     budget: _TreeBudget,
     normalized_paths: set[str],
@@ -1137,12 +1287,23 @@ def _scan_owned_directory(
             if not relative_parent and name == authority.GENERATION_MANIFEST_NAME:
                 continue
             _require_leaf_name(name)
+            normalized_name = _normalize_tree_component(name)
             relative = name if not relative_parent else f"{relative_parent}/{name}"
-            normalized = unicodedata.normalize("NFKC", relative).casefold()
+            normalized = (
+                normalized_name
+                if not normalized_parent
+                else f"{normalized_parent}/{normalized_name}"
+            )
+            if not relative_parent and normalized_name == _NORMALIZED_MANIFEST_NAME:
+                raise RuntimeQuarantineError(
+                    "root-owned tree contains a reserved normalized manifest alias"
+                )
             if normalized in normalized_paths:
-                raise RuntimeQuarantineError("root-owned tree contains duplicate relative paths")
+                raise RuntimeQuarantineError(
+                    "root-owned tree contains a duplicate normalized relative path"
+                )
             normalized_paths.add(normalized)
-            budget.observe_path(relative)
+            budget.observe_path(relative, normalized)
             named = directory_entry.stat(follow_symlinks=False)
             inode = _inode_identity(named)
             if inode in observed_inodes:
@@ -1153,6 +1314,7 @@ def _scan_owned_directory(
                     directory_fd,
                     name,
                     relative,
+                    normalized,
                     named,
                     profile=profile,
                     budget=budget,
@@ -1171,6 +1333,7 @@ def _scan_owned_directory(
                 )
             else:
                 raise RuntimeQuarantineError("root-owned tree contains a symlink or special entry")
+            budget.observe_manifest_entry(entry)
             entries.append(entry)
 
 
@@ -1178,6 +1341,7 @@ def _scan_owned_subdirectory(
     parent_fd: int,
     name: str,
     relative: str,
+    normalized_relative: str,
     named: os.stat_result,
     *,
     profile: RuntimeClosureProfile,
@@ -1210,6 +1374,7 @@ def _scan_owned_subdirectory(
         _scan_owned_directory(
             descriptor,
             relative_parent=relative,
+            normalized_parent=normalized_relative,
             profile=profile,
             budget=budget,
             normalized_paths=normalized_paths,
@@ -1336,6 +1501,8 @@ def _publish_verified_quarantine(
     generation_id: str,
     manifest: bytes,
     profile: RuntimeClosureProfile,
+    deployment_lock: authority.RuntimeDeploymentLock,
+    publication_state: _PublicationState,
 ) -> RuntimeQuarantineStatus:
     quarantine_descriptors: list[int] = []
     generation_descriptors: list[int] = []
@@ -1349,7 +1516,7 @@ def _publish_verified_quarantine(
             profile.generation_root,
             "generation root",
         )
-        fcntl.flock(generation_fd, fcntl.LOCK_EX)
+        deployment_lock.assert_current()
         if _named_entry(generation_fd, generation_id) is not None:
             _verify_existing_generation(
                 generation_fd,
@@ -1366,13 +1533,13 @@ def _publish_verified_quarantine(
                 profile,
             )
             return RuntimeQuarantineStatus.IDEMPOTENT
-        _FAILPOINT("rename")
         final_quarantine_fd = _open_owned_directory_at(
             quarantine_fd,
             temporary_name,
             allowed_modes={authority.GENERATION_DIRECTORY_MODE},
             label="final operation quarantine",
         )
+        _FAILPOINT("final_identity_to_rename")
         final_manifest = _verify_closed_tree(
             final_quarantine_fd,
             profile,
@@ -1386,22 +1553,24 @@ def _publish_verified_quarantine(
             final_quarantine_fd,
             "final operation quarantine",
         )
-        if _named_entry(generation_fd, generation_id) is not None:
-            raise RuntimeQuarantineError("generation appeared before no-overwrite rename")
-        os.rename(
+        deployment_lock.assert_current()
+        _atomic_rename_noreplace(
+            quarantine_fd,
             temporary_name,
+            generation_fd,
             generation_id,
-            src_dir_fd=quarantine_fd,
-            dst_dir_fd=generation_fd,
         )
+        publication_state.renamed = True
+        _FAILPOINT("post_rename_pre_parent_fsync")
         published = os.stat(generation_id, dir_fd=generation_fd, follow_symlinks=False)
         if _identity(published) != _identity(os.fstat(final_quarantine_fd)):
             raise RuntimeQuarantineDurabilityError(
                 "published generation identity changed during rename"
             )
         try:
-            _FAILPOINT("store_parent_fsync")
+            _FAILPOINT("generation_parent_fsync_first")
             _fsync_descriptor(generation_fd, "store_parent")
+            _FAILPOINT("generation_durable_before_authority")
             return RuntimeQuarantineStatus.PUBLISHED
         except OSError:
             try:
@@ -1411,11 +1580,13 @@ def _publish_verified_quarantine(
                     manifest,
                     profile,
                 )
+                _FAILPOINT("generation_parent_fsync_recovery")
                 _fsync_descriptor(generation_fd, "store_parent")
             except (OSError, RuntimeQuarantineError) as recovery_exc:
                 raise RuntimeQuarantineDurabilityError(
                     "published generation parent fsync remains blocked"
                 ) from recovery_exc
+            _FAILPOINT("generation_durable_before_authority")
             return RuntimeQuarantineStatus.PUBLISHED_AFTER_RECOVERY
     finally:
         if final_quarantine_fd >= 0:
@@ -1423,6 +1594,26 @@ def _publish_verified_quarantine(
                 os.close(final_quarantine_fd)
         _close_descriptors(quarantine_descriptors)
         _close_descriptors(generation_descriptors)
+
+
+def _atomic_rename_noreplace(
+    source_parent_fd: int,
+    source_name: str,
+    target_parent_fd: int,
+    target_name: str,
+) -> None:
+    primitive = _ATOMIC_RENAME_NOREPLACE
+    if primitive is None:
+        raise RuntimeQuarantineError("platform lacks an atomic no-replace rename primitive")
+    _FAILPOINT("atomic_rename")
+    try:
+        primitive(source_parent_fd, source_name, target_parent_fd, target_name)
+    except OSError as exc:
+        if exc.errno in {errno.EEXIST, errno.ENOTEMPTY}:
+            raise RuntimeQuarantineError(
+                "generation appeared before atomic no-replace publication"
+            ) from exc
+        raise
 
 
 def _fsync_generation_parent_after_verify(
@@ -1512,7 +1703,9 @@ def _result(
 
 
 def _remove_temporary_tree(parent_fd: int, name: str) -> None:
-    named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if re.fullmatch(r"\.quarantine-[0-9a-f]{32}", name) is None:
+        raise RuntimeQuarantineError("operation quarantine cleanup name is invalid")
+    named = _prepare_operation_residue_for_cleanup(parent_fd, name)
     _require_directory_stat(
         named,
         owner_uid=authority.RUNTIME_AUTHORITY_OWNER_UID,
@@ -1542,6 +1735,48 @@ def _remove_temporary_tree(parent_fd: int, name: str) -> None:
     os.rmdir(name, dir_fd=parent_fd)
 
 
+def _prepare_operation_residue_for_cleanup(
+    parent_fd: int,
+    name: str,
+) -> os.stat_result:
+    named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    mode = stat.S_IMODE(named.st_mode)
+    if (
+        not stat.S_ISDIR(named.st_mode)
+        or stat.S_ISLNK(named.st_mode)
+        or named.st_uid != authority.RUNTIME_AUTHORITY_OWNER_UID
+        or named.st_nlink < 2
+    ):
+        raise RuntimeQuarantineError(
+            "operation quarantine cleanup root directory metadata is unsafe"
+        )
+    allowed = {
+        TEMP_DIRECTORY_MODE,
+        authority.GENERATION_DIRECTORY_MODE,
+        *authority.PRODUCTION_MANIFEST_SCHEMA["directory_modes"],
+    }
+    if mode in allowed:
+        return named
+    if mode & ~TEMP_DIRECTORY_MODE:
+        raise RuntimeQuarantineError(
+            "operation quarantine cleanup root directory metadata is unsafe"
+        )
+    os.chmod(
+        name,
+        TEMP_DIRECTORY_MODE,
+        dir_fd=parent_fd,
+        follow_symlinks=False,
+    )
+    repaired = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    _require_directory_stat(
+        repaired,
+        owner_uid=authority.RUNTIME_AUTHORITY_OWNER_UID,
+        modes={TEMP_DIRECTORY_MODE},
+        label="operation quarantine cleanup root",
+    )
+    return repaired
+
+
 def _remove_directory_contents(directory_fd: int) -> None:
     observed = os.fstat(directory_fd)
     _require_directory_stat(
@@ -1561,6 +1796,7 @@ def _remove_directory_contents(directory_fd: int) -> None:
             _require_leaf_name(name)
             named = entry.stat(follow_symlinks=False)
             if stat.S_ISDIR(named.st_mode):
+                named = _prepare_cleanup_directory_entry(directory_fd, name, named)
                 child_fd = -1
                 try:
                     child_fd = os.open(
@@ -1587,6 +1823,7 @@ def _remove_directory_contents(directory_fd: int) -> None:
                     )
                 os.rmdir(name, dir_fd=directory_fd)
             elif stat.S_ISREG(named.st_mode):
+                named = _prepare_cleanup_file_entry(directory_fd, name, named)
                 _require_file_stat(
                     named,
                     owner_uid=authority.RUNTIME_AUTHORITY_OWNER_UID,
@@ -1609,10 +1846,98 @@ def _remove_directory_contents(directory_fd: int) -> None:
     _fsync_descriptor(directory_fd, "cleanup_directory")
 
 
+def _prepare_cleanup_directory_entry(
+    parent_fd: int,
+    name: str,
+    named: os.stat_result,
+) -> os.stat_result:
+    mode = stat.S_IMODE(named.st_mode)
+    allowed = {
+        TEMP_DIRECTORY_MODE,
+        authority.GENERATION_DIRECTORY_MODE,
+        *authority.PRODUCTION_MANIFEST_SCHEMA["directory_modes"],
+    }
+    if mode in allowed:
+        return named
+    if (
+        not stat.S_ISDIR(named.st_mode)
+        or stat.S_ISLNK(named.st_mode)
+        or named.st_uid != authority.RUNTIME_AUTHORITY_OWNER_UID
+        or named.st_nlink < 2
+        or mode & ~TEMP_DIRECTORY_MODE
+    ):
+        raise RuntimeQuarantineError("operation quarantine cleanup directory metadata is unsafe")
+    os.chmod(
+        name,
+        TEMP_DIRECTORY_MODE,
+        dir_fd=parent_fd,
+        follow_symlinks=False,
+    )
+    repaired = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if _inode_identity(repaired) != _inode_identity(named):
+        raise RuntimeQuarantineError("operation quarantine cleanup directory identity changed")
+    return repaired
+
+
+def _prepare_cleanup_file_entry(
+    parent_fd: int,
+    name: str,
+    named: os.stat_result,
+) -> os.stat_result:
+    mode = stat.S_IMODE(named.st_mode)
+    allowed = {
+        TEMP_FILE_MODE,
+        *authority.PRODUCTION_MANIFEST_SCHEMA["file_modes"],
+    }
+    if mode in allowed:
+        return named
+    if (
+        not stat.S_ISREG(named.st_mode)
+        or stat.S_ISLNK(named.st_mode)
+        or named.st_uid != authority.RUNTIME_AUTHORITY_OWNER_UID
+        or named.st_nlink != 1
+        or mode & ~TEMP_FILE_MODE
+    ):
+        raise RuntimeQuarantineError("operation quarantine cleanup file metadata is unsafe")
+    os.chmod(
+        name,
+        TEMP_FILE_MODE,
+        dir_fd=parent_fd,
+        follow_symlinks=False,
+    )
+    repaired = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if _inode_identity(repaired) != _inode_identity(named):
+        raise RuntimeQuarantineError("operation quarantine cleanup file identity changed")
+    return repaired
+
+
 def _require_leaf_name(name: str) -> None:
     if not name or name in {".", ".."} or "/" in name or "\x00" in name:
         raise RuntimeQuarantineError("filesystem entry name is invalid")
     _utf8_size(name, "filesystem entry name")
+
+
+_NORMALIZED_MANIFEST_NAME = unicodedata.normalize(
+    "NFKC",
+    authority.GENERATION_MANIFEST_NAME,
+).casefold()
+
+
+def _normalize_tree_component(name: str) -> str:
+    try:
+        normalized = unicodedata.normalize("NFKC", name).casefold()
+    except (TypeError, ValueError) as exc:
+        raise RuntimeQuarantineError("filesystem component normalization failed") from exc
+    if (
+        not normalized
+        or normalized in {".", ".."}
+        or "/" in normalized
+        or "\\" in normalized
+        or "\x00" in normalized
+    ):
+        raise RuntimeQuarantineError("normalized filesystem component is invalid")
+    _utf8_size(normalized, "normalized filesystem component")
+    return normalized
 
 
 def _fsync_descriptor(descriptor: int, phase: str) -> None:
@@ -1620,10 +1945,6 @@ def _fsync_descriptor(descriptor: int, phase: str) -> None:
     previous = _FSYNC_PHASE
     _FSYNC_PHASE = phase
     try:
-        if phase == "file":
-            _FAILPOINT("file_fsync")
-        elif phase == "directory":
-            _FAILPOINT("directory_fsync")
         os.fsync(descriptor)
     finally:
         _FSYNC_PHASE = previous

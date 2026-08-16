@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import inspect
+import multiprocessing
 import os
 import shutil
 import socket
 import stat
 import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
@@ -187,6 +190,58 @@ def _request(
     )
 
 
+def _fork_context() -> multiprocessing.context.ForkContext:
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("requires fork to inherit the isolated filesystem policy fixture")
+    return multiprocessing.get_context("fork")
+
+
+def _publish_worker(request: RuntimeQuarantineRequest, result_queue: Any) -> None:
+    try:
+        result = publish_runtime_candidate(request)
+    except BaseException as exc:
+        result_queue.put(("error", type(exc).__name__, str(exc)))
+    else:
+        result_queue.put(("ok", result.status.value, result.generation_id))
+
+
+def _cleanup_worker(operation_id: str, result_queue: Any) -> None:
+    try:
+        result_queue.put(("ok", cleanup_runtime_quarantine(operation_id)))
+    except BaseException as exc:
+        result_queue.put(("error", type(exc).__name__, str(exc)))
+
+
+def _umask_publish_worker(
+    request: RuntimeQuarantineRequest,
+    mask: int,
+    crash_stage: str | None,
+    result_queue: Any,
+) -> None:
+    if crash_stage is not None:
+
+        def crash(stage: str) -> None:
+            if stage == crash_stage:
+                raise SimulatedCrash(stage)
+
+        quarantine_module._FAILPOINT = crash
+    previous = os.umask(mask)
+    try:
+        _publish_worker(request, result_queue)
+    finally:
+        os.umask(previous)
+
+
+def _join_processes(processes: tuple[multiprocessing.Process, ...]) -> None:
+    for process in processes:
+        process.join(5)
+    for process in processes:
+        if process.is_alive():
+            process.terminate()
+            process.join(2)
+    assert all(not process.is_alive() for process in processes)
+
+
 @pytest.fixture
 def quarantine_fixture(
     tmp_path: Path,
@@ -327,12 +382,15 @@ def test_publish_copies_closes_rehashes_and_returns_public_slot(
     )
 
 
-@pytest.mark.skipif(
-    sys.platform != "linux" or os.geteuid() != 0,
-    reason="requires Linux root to prove exact root-owned 0555 directory publication",
+@pytest.mark.skip(
+    reason=(
+        "UNFULFILLED CLOUD GATE: authorized Linux-root harness must publish as UID 0, "
+        "verify exact 0555/single-link metadata, then prove lighthouse cannot write, replace, "
+        "or delete; production installation is separately authorized"
+    )
 )
-def test_linux_root_exact_generation_mode_gate() -> None:
-    assert authority_module.GENERATION_DIRECTORY_MODE == 0o555
+def test_cloud_gate_linux_root_generation_publication_and_lighthouse_denial_unfulfilled() -> None:
+    pytest.fail("cloud integration contract must never be represented by a constant assertion")
 
 
 def test_untrusted_audit_claims_do_not_control_identity_behavior_or_permissions(
@@ -424,7 +482,10 @@ def test_publish_rejects_fixed_anchor_mutation(
         publish_runtime_candidate(_request())
 
 
-@pytest.mark.parametrize("stage", ("revalidation", "rename"))
+@pytest.mark.parametrize(
+    "stage",
+    ("first_full_revalidation", "final_identity_to_rename"),
+)
 def test_quarantine_replacement_after_attestation_is_rejected_before_rename(
     quarantine_fixture: dict[str, Any],
     monkeypatch: pytest.MonkeyPatch,
@@ -593,7 +654,7 @@ def test_copy_is_chunked_and_source_identity_mutation_fails_closed(
 
     def mutate(stage: str) -> None:
         nonlocal mutated
-        if stage != "copy" or mutated:
+        if stage != "candidate_copy:large.bin" or mutated:
             return
         mutated = True
         candidate.chmod(0o755)
@@ -615,27 +676,51 @@ def test_copy_is_chunked_and_source_identity_mutation_fails_closed(
 
 
 @pytest.mark.parametrize(
-    "stage",
+    ("stage", "published_before_crash", "needs_parent_recovery"),
     (
-        "creation",
-        "traversal",
-        "copy",
-        "file_fsync",
-        "directory_fsync",
-        "close_reopen",
-        "revalidation",
-        "rename",
+        ("candidate_traversal:pyvenv.cfg", False, False),
+        ("candidate_copy:pyvenv.cfg", False, False),
+        ("content_file_fsync:pyvenv.cfg", False, False),
+        ("manifest_write", False, False),
+        ("manifest_fsync", False, False),
+        ("completed_quarantine_directory_fsync", False, False),
+        ("close_reopen", False, False),
+        ("first_full_revalidation", False, False),
+        ("final_identity_to_rename", False, False),
+        ("atomic_rename", False, False),
+        ("post_rename_pre_parent_fsync", True, False),
+        ("generation_parent_fsync_recovery", True, True),
+        ("generation_durable_before_authority", True, False),
     ),
 )
-def test_crash_stages_leave_only_exact_operation_quarantine_for_safe_cleanup(
+def test_transition_exact_crash_matrix_preserves_authority_and_converges(
     quarantine_fixture: dict[str, Any],
     monkeypatch: pytest.MonkeyPatch,
     stage: str,
+    published_before_crash: bool,
+    needs_parent_recovery: bool,
 ) -> None:
     _make_candidate(
         quarantine_fixture["inbox"],
         candidate_id="a" * 64,
         candidate_basename="candidate-v1",
+    )
+    active = publish_runtime_candidate(_request(operation_id="a" * 32))
+    record = prepare_runtime_authority_publish(
+        None,
+        active.slot,
+        operation_id="9" * 32,
+    )
+    assert publish_runtime_authority(record).value == "committed"
+    authority_path = Path(authority_module.RUNTIME_AUTHORITY_PATH)
+    authority_before = authority_path.read_bytes()
+    baseline_generations = {path.name for path in quarantine_fixture["generations"].iterdir()}
+
+    _make_candidate(
+        quarantine_fixture["inbox"],
+        candidate_id="a" * 64,
+        candidate_basename="candidate-v1",
+        extra_files={"release/src/rquant/review_fix.py": b"REVIEW_FIX = True\n"},
     )
     crashed = False
 
@@ -646,49 +731,48 @@ def test_crash_stages_leave_only_exact_operation_quarantine_for_safe_cleanup(
             raise SimulatedCrash(stage)
 
     monkeypatch.setattr(quarantine_module, "_FAILPOINT", crash)
+    real_fsync = quarantine_module.os.fsync
+    parent_failed = False
+
+    def fail_first_generation_parent_fsync(descriptor: int) -> None:
+        nonlocal parent_failed
+        if (
+            needs_parent_recovery
+            and quarantine_module._FSYNC_PHASE == "store_parent"
+            and not parent_failed
+        ):
+            parent_failed = True
+            raise OSError("injected first generation parent fsync failure")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(quarantine_module.os, "fsync", fail_first_generation_parent_fsync)
     before = len(os.listdir("/dev/fd"))
     with pytest.raises(SimulatedCrash, match=stage):
         publish_runtime_candidate(_request())
     assert len(os.listdir("/dev/fd")) == before
+    assert authority_path.read_bytes() == authority_before
+    residue = quarantine_fixture["quarantine"] / f".quarantine-{'1' * 32}"
+    generations_after_crash = {path.name for path in quarantine_fixture["generations"].iterdir()}
+    assert residue.exists() is not published_before_crash
+    assert (generations_after_crash != baseline_generations) is published_before_crash
+
     monkeypatch.setattr(quarantine_module, "_FAILPOINT", lambda _stage: None)
-    assert cleanup_runtime_quarantine("1" * 32) is True
+    assert cleanup_runtime_quarantine("1" * 32) is (not published_before_crash)
     assert cleanup_runtime_quarantine("1" * 32) is False
-    assert not any(quarantine_fixture["generations"].iterdir())
-
-
-def test_store_parent_fsync_crash_recovers_as_exact_idempotent_generation(
-    quarantine_fixture: dict[str, Any],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
     _make_candidate(
         quarantine_fixture["inbox"],
         candidate_id="a" * 64,
         candidate_basename="candidate-v1",
+        extra_files={"release/src/rquant/review_fix.py": b"REVIEW_FIX = True\n"},
     )
-    crashed = False
-
-    def crash(stage: str) -> None:
-        nonlocal crashed
-        if stage == "store_parent_fsync" and not crashed:
-            crashed = True
-            raise SimulatedCrash(stage)
-
-    monkeypatch.setattr(quarantine_module, "_FAILPOINT", crash)
-    with pytest.raises(SimulatedCrash, match="store_parent_fsync"):
-        publish_runtime_candidate(_request())
-    published = tuple(quarantine_fixture["generations"].iterdir())
-    assert len(published) == 1
-    assert cleanup_runtime_quarantine("1" * 32) is False
-
-    _make_candidate(
-        quarantine_fixture["inbox"],
-        candidate_id="a" * 64,
-        candidate_basename="candidate-v1",
-    )
-    monkeypatch.setattr(quarantine_module, "_FAILPOINT", lambda _stage: None)
     result = publish_runtime_candidate(_request())
-    assert result.status is RuntimeQuarantineStatus.IDEMPOTENT
-    assert result.slot.generation_path == published[0]
+    expected_status = (
+        RuntimeQuarantineStatus.IDEMPOTENT
+        if published_before_crash
+        else RuntimeQuarantineStatus.PUBLISHED
+    )
+    assert result.status is expected_status
+    assert authority_path.read_bytes() == authority_before
 
 
 def test_parent_fsync_one_failure_revalidates_and_reports_recovery(
@@ -804,3 +888,488 @@ def test_result_is_frozen_and_exposes_no_raw_descriptor_or_private_evidence(
         result.status = RuntimeQuarantineStatus.IDEMPOTENT  # type: ignore[misc]
     assert not any("fd" in name or "evidence" in name for name in result.__dataclass_fields__)
     assert replace(result.slot, commit="audit-only").generation_id == result.generation_id
+
+
+def test_two_publishers_hold_one_lock_before_copy_without_concurrent_amplification(
+    quarantine_fixture: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _fork_context()
+    assert quarantine_fixture["profile"].manifest_schema.max_total_bytes == 4_294_967_296
+    _make_candidate(
+        quarantine_fixture["inbox"],
+        candidate_id="a" * 64,
+        candidate_basename="candidate-v1",
+        extra_files={"large.bin": b"x" * (quarantine_module.COPY_CHUNK_BYTES * 3)},
+    )
+    active = ctx.Value("i", 0)
+    maximum = ctx.Value("i", 0)
+    entered = ctx.Event()
+    release = ctx.Event()
+    seen: set[int] = set()
+
+    def pause_first_copy(stage: str) -> None:
+        if stage != "candidate_copy:large.bin" or os.getpid() in seen:
+            return
+        seen.add(os.getpid())
+        with active.get_lock(), maximum.get_lock():
+            active.value += 1
+            maximum.value = max(maximum.value, active.value)
+        entered.set()
+        if not release.wait(5):
+            raise RuntimeError("copy barrier timed out")
+        with active.get_lock():
+            active.value -= 1
+
+    monkeypatch.setattr(quarantine_module, "_FAILPOINT", pause_first_copy)
+    results = ctx.Queue()
+    first = ctx.Process(target=_publish_worker, args=(_request(), results))
+    second = ctx.Process(
+        target=_publish_worker,
+        args=(_request(operation_id="2" * 32), results),
+    )
+    first.start()
+    assert entered.wait(3)
+    second.start()
+    try:
+        time.sleep(0.25)
+        assert active.value == 1
+        assert maximum.value == 1
+        assert second.is_alive()
+    finally:
+        release.set()
+        _join_processes((first, second))
+
+    outcomes = sorted(results.get(timeout=1) for _ in range(2))
+    assert all(outcome[0] == "ok" for outcome in outcomes)
+    assert {outcome[1] for outcome in outcomes} == {"published", "idempotent"}
+
+
+def test_publish_and_cleanup_share_the_deployment_lock(
+    quarantine_fixture: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _fork_context()
+    _make_candidate(
+        quarantine_fixture["inbox"],
+        candidate_id="a" * 64,
+        candidate_basename="candidate-v1",
+        extra_files={"large.bin": b"x" * (quarantine_module.COPY_CHUNK_BYTES * 2)},
+    )
+    cleanup_id = "2" * 32
+    residue = quarantine_fixture["quarantine"] / f".quarantine-{cleanup_id}"
+    residue.mkdir(mode=0o700)
+    entered = ctx.Event()
+    release = ctx.Event()
+    seen = False
+
+    def pause_copy(stage: str) -> None:
+        nonlocal seen
+        if stage != "candidate_copy:large.bin" or seen:
+            return
+        seen = True
+        entered.set()
+        if not release.wait(5):
+            raise RuntimeError("publish barrier timed out")
+
+    monkeypatch.setattr(quarantine_module, "_FAILPOINT", pause_copy)
+    publish_results = ctx.Queue()
+    cleanup_results = ctx.Queue()
+    publisher = ctx.Process(target=_publish_worker, args=(_request(), publish_results))
+    cleaner = ctx.Process(target=_cleanup_worker, args=(cleanup_id, cleanup_results))
+    publisher.start()
+    assert entered.wait(3)
+    cleaner.start()
+    try:
+        time.sleep(0.25)
+        assert cleaner.is_alive()
+        assert residue.exists()
+    finally:
+        release.set()
+        _join_processes((publisher, cleaner))
+    assert publish_results.get(timeout=1)[0] == "ok"
+    assert cleanup_results.get(timeout=1) == ("ok", True)
+
+
+def test_double_cleanup_is_serialized_and_converges(
+    quarantine_fixture: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _fork_context()
+    operation_id = "3" * 32
+    residue = quarantine_fixture["quarantine"] / f".quarantine-{operation_id}"
+    residue.mkdir(mode=0o700)
+    entered = ctx.Event()
+    release = ctx.Event()
+    seen = False
+
+    def pause_cleanup(stage: str) -> None:
+        nonlocal seen
+        if stage != "cleanup_before_remove" or seen:
+            return
+        seen = True
+        entered.set()
+        if not release.wait(5):
+            raise RuntimeError("cleanup barrier timed out")
+
+    monkeypatch.setattr(quarantine_module, "_FAILPOINT", pause_cleanup)
+    results = ctx.Queue()
+    first = ctx.Process(target=_cleanup_worker, args=(operation_id, results))
+    second = ctx.Process(target=_cleanup_worker, args=(operation_id, results))
+    first.start()
+    assert entered.wait(3)
+    second.start()
+    try:
+        time.sleep(0.25)
+        assert second.is_alive()
+        assert residue.exists()
+    finally:
+        release.set()
+        _join_processes((first, second))
+    assert sorted(results.get(timeout=1) for _ in range(2)) == [("ok", False), ("ok", True)]
+
+
+def test_foreign_generation_directory_flock_cannot_block_publication(
+    quarantine_fixture: dict[str, Any],
+) -> None:
+    ctx = _fork_context()
+    _make_candidate(
+        quarantine_fixture["inbox"],
+        candidate_id="a" * 64,
+        candidate_basename="candidate-v1",
+    )
+    holder = os.open(quarantine_fixture["generations"], os.O_RDONLY)
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    results = ctx.Queue()
+    publisher = ctx.Process(target=_publish_worker, args=(_request(), results))
+    publisher.start()
+    try:
+        publisher.join(2)
+        assert not publisher.is_alive()
+        assert results.get(timeout=1)[0] == "ok"
+    finally:
+        fcntl.flock(holder, fcntl.LOCK_UN)
+        os.close(holder)
+        _join_processes((publisher,))
+
+
+@pytest.mark.parametrize("mask", (0o000, 0o077, 0o777))
+def test_operation_quarantine_mode_is_exact_under_process_umask(
+    quarantine_fixture: dict[str, Any],
+    mask: int,
+) -> None:
+    ctx = _fork_context()
+    _make_candidate(
+        quarantine_fixture["inbox"],
+        candidate_id="a" * 64,
+        candidate_basename="candidate-v1",
+    )
+    results = ctx.Queue()
+    process = ctx.Process(
+        target=_umask_publish_worker,
+        args=(
+            _request(),
+            mask,
+            "candidate_copy:release/src/rquant/runtime_service_main.py",
+            results,
+        ),
+    )
+    process.start()
+    _join_processes((process,))
+    assert results.get(timeout=1)[0:2] == ("error", "SimulatedCrash")
+    residue = quarantine_fixture["quarantine"] / f".quarantine-{'1' * 32}"
+    unfinished_directories = (
+        residue,
+        residue / "release",
+        residue / "release/src",
+        residue / "release/src/rquant",
+    )
+    assert all(
+        stat.S_IMODE(path.stat(follow_symlinks=False).st_mode) == 0o700
+        for path in unfinished_directories
+    )
+    assert (
+        stat.S_IMODE((quarantine_fixture["inbox"].parent / "deployment.lock").stat().st_mode)
+        == 0o600
+    )
+    assert cleanup_runtime_quarantine("1" * 32) is True
+
+
+def test_cleanup_repairs_only_exact_root_owned_mode_zero_operation_residue(
+    quarantine_fixture: dict[str, Any],
+) -> None:
+    ctx = _fork_context()
+    _make_candidate(
+        quarantine_fixture["inbox"],
+        candidate_id="a" * 64,
+        candidate_basename="candidate-v1",
+    )
+    results = ctx.Queue()
+    process = ctx.Process(
+        target=_umask_publish_worker,
+        args=(_request(), 0o777, "temporary_created_before_mode_fix", results),
+    )
+    process.start()
+    _join_processes((process,))
+    assert results.get(timeout=1)[0:2] == ("error", "SimulatedCrash")
+    residue = quarantine_fixture["quarantine"] / f".quarantine-{'1' * 32}"
+    assert stat.S_IMODE(residue.stat(follow_symlinks=False).st_mode) == 0o000
+    assert cleanup_runtime_quarantine("1" * 32) is True
+
+    unsafe = quarantine_fixture["quarantine"] / f".quarantine-{'2' * 32}"
+    unsafe.mkdir(mode=0o777)
+    unsafe.chmod(0o777)
+    with pytest.raises(RuntimeQuarantineError, match="unsafe"):
+        cleanup_runtime_quarantine("2" * 32)
+
+
+@pytest.mark.parametrize(
+    "stage",
+    ("first_full_revalidation", "atomic_rename"),
+)
+def test_pre_visibility_oserror_is_not_misreported_as_durability(
+    quarantine_fixture: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+) -> None:
+    _make_candidate(
+        quarantine_fixture["inbox"],
+        candidate_id="a" * 64,
+        candidate_basename="candidate-v1",
+    )
+
+    def fail(selected: str) -> None:
+        if selected == stage:
+            raise OSError(f"injected {stage}")
+
+    monkeypatch.setattr(quarantine_module, "_FAILPOINT", fail)
+    with pytest.raises(RuntimeQuarantineError) as rejected:
+        publish_runtime_candidate(_request())
+    assert type(rejected.value) is RuntimeQuarantineError
+    assert not any(quarantine_fixture["generations"].iterdir())
+    assert cleanup_runtime_quarantine("1" * 32) is True
+
+    monkeypatch.setattr(quarantine_module, "_FAILPOINT", lambda _stage: None)
+    assert publish_runtime_candidate(_request()).status is RuntimeQuarantineStatus.PUBLISHED
+
+
+@pytest.mark.parametrize("fault", ("deployment-lock", "quarantine-root"))
+def test_lock_and_root_open_failures_are_pre_visibility_and_leave_no_residue(
+    quarantine_fixture: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+) -> None:
+    _make_candidate(
+        quarantine_fixture["inbox"],
+        candidate_id="a" * 64,
+        candidate_basename="candidate-v1",
+    )
+    real_lock = authority_module.acquire_runtime_deployment_lock
+    real_open_root = quarantine_module._open_fixed_root
+
+    if fault == "deployment-lock":
+
+        def reject_lock() -> authority_module.RuntimeDeploymentLock:
+            raise RuntimeAuthorityPublishError("injected deployment lock failure")
+
+        monkeypatch.setattr(authority_module, "acquire_runtime_deployment_lock", reject_lock)
+    else:
+
+        def reject_quarantine_root(
+            path: Path,
+            label: str,
+        ) -> tuple[list[int], int]:
+            if label == "quarantine root":
+                raise OSError("injected quarantine root open failure")
+            return real_open_root(path, label)
+
+        monkeypatch.setattr(quarantine_module, "_open_fixed_root", reject_quarantine_root)
+
+    with pytest.raises(RuntimeQuarantineError) as rejected:
+        publish_runtime_candidate(_request())
+    assert type(rejected.value) is RuntimeQuarantineError
+    assert not any(quarantine_fixture["quarantine"].iterdir())
+    assert not any(quarantine_fixture["generations"].iterdir())
+
+    monkeypatch.setattr(authority_module, "acquire_runtime_deployment_lock", real_lock)
+    monkeypatch.setattr(quarantine_module, "_open_fixed_root", real_open_root)
+    assert publish_runtime_candidate(_request()).status is RuntimeQuarantineStatus.PUBLISHED
+
+
+def test_post_rename_oserror_is_durability_typed_and_retry_is_idempotent(
+    quarantine_fixture: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _make_candidate(
+        quarantine_fixture["inbox"],
+        candidate_id="a" * 64,
+        candidate_basename="candidate-v1",
+    )
+
+    def fail(stage: str) -> None:
+        if stage == "post_rename_pre_parent_fsync":
+            raise OSError("injected post-rename failure")
+
+    monkeypatch.setattr(quarantine_module, "_FAILPOINT", fail)
+    with pytest.raises(RuntimeQuarantineDurabilityError):
+        publish_runtime_candidate(_request())
+    assert len(tuple(quarantine_fixture["generations"].iterdir())) == 1
+    assert cleanup_runtime_quarantine("1" * 32) is False
+
+    _make_candidate(
+        quarantine_fixture["inbox"],
+        candidate_id="a" * 64,
+        candidate_basename="candidate-v1",
+    )
+    monkeypatch.setattr(quarantine_module, "_FAILPOINT", lambda _stage: None)
+    assert publish_runtime_candidate(_request()).status is RuntimeQuarantineStatus.IDEMPOTENT
+
+
+def test_atomic_no_replace_preserves_target_created_in_identity_to_rename_window(
+    quarantine_fixture: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = _make_candidate(
+        quarantine_fixture["inbox"],
+        candidate_id="a" * 64,
+        candidate_basename="candidate-v1",
+    )
+    probe = publish_runtime_candidate(_request(operation_id="0" * 32))
+    generation_id = probe.generation_id
+    for directory, _names, files in os.walk(probe.slot.generation_path):
+        current = Path(directory)
+        current.chmod(0o755)
+        for name in files:
+            (current / name).chmod(0o644)
+    shutil.rmtree(probe.slot.generation_path)
+    _make_candidate(
+        quarantine_fixture["inbox"],
+        candidate_id="a" * 64,
+        candidate_basename="candidate-v1",
+    )
+    target = quarantine_fixture["generations"] / generation_id
+    sentinel = target / "foreign"
+    target_identity: tuple[int, int] | None = None
+
+    def create_target(stage: str) -> None:
+        nonlocal target_identity
+        if stage != "atomic_rename":
+            return
+        target.mkdir(mode=0o755)
+        sentinel.write_bytes(b"must survive")
+        sentinel.chmod(0o444)
+        target.chmod(authority_module.GENERATION_DIRECTORY_MODE)
+        target_identity = (target.stat().st_dev, target.stat().st_ino)
+
+    monkeypatch.setattr(quarantine_module, "_FAILPOINT", create_target)
+    with pytest.raises(RuntimeQuarantineError):
+        publish_runtime_candidate(_request())
+    assert target_identity == (target.stat().st_dev, target.stat().st_ino)
+    assert sentinel.read_bytes() == b"must survive"
+    assert candidate.exists()
+    assert cleanup_runtime_quarantine("1" * 32) is True
+
+
+def test_missing_atomic_no_replace_primitive_fails_closed_with_cleanup_residue(
+    quarantine_fixture: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _make_candidate(
+        quarantine_fixture["inbox"],
+        candidate_id="a" * 64,
+        candidate_basename="candidate-v1",
+    )
+    monkeypatch.setattr(quarantine_module, "_ATOMIC_RENAME_NOREPLACE", None, raising=False)
+    with pytest.raises(RuntimeQuarantineError, match="atomic no-replace"):
+        publish_runtime_candidate(_request())
+    assert not any(quarantine_fixture["generations"].iterdir())
+    assert cleanup_runtime_quarantine("1" * 32) is True
+
+
+@pytest.mark.parametrize(
+    "relative",
+    (
+        "FULL-MANIFEST.JSON",
+        "ｆｕｌｌ－ｍａｎｉｆｅｓｔ．ｊｓｏｎ",
+        "．",
+        "．．",
+        "safe／escape.py",
+    ),
+)
+def test_publisher_rejects_normalized_reserved_dot_and_separator_aliases(
+    quarantine_fixture: dict[str, Any],
+    relative: str,
+) -> None:
+    _make_candidate(
+        quarantine_fixture["inbox"],
+        candidate_id="a" * 64,
+        candidate_basename="candidate-v1",
+        extra_files={relative: b"alias"},
+    )
+    with pytest.raises(RuntimeQuarantineError, match="normalized|reserved|component"):
+        publish_runtime_candidate(_request())
+    assert not any(quarantine_fixture["generations"].iterdir())
+
+
+def test_publisher_accepts_legitimate_nonconfusable_unicode_component(
+    quarantine_fixture: dict[str, Any],
+) -> None:
+    _make_candidate(
+        quarantine_fixture["inbox"],
+        candidate_id="a" * 64,
+        candidate_basename="candidate-v1",
+        extra_files={"release/src/rquant/数据模型.py": b"VALUE = 1\n"},
+    )
+    result = publish_runtime_candidate(_request())
+    assert (result.slot.generation_path / "release/src/rquant/数据模型.py").is_file()
+
+
+def test_manifest_budget_rejects_during_traversal_before_all_long_paths_are_copied(
+    quarantine_fixture: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    long_files = {f"release/src/rquant/{index:03d}_{'x' * 80}.py": b"" for index in range(100)}
+    _make_candidate(
+        quarantine_fixture["inbox"],
+        candidate_id="a" * 64,
+        candidate_basename="candidate-v1",
+        extra_files=long_files,
+    )
+    monkeypatch.setattr(quarantine_module, "MAX_GENERATION_MANIFEST_BYTES", 2_500)
+    traversed: list[str] = []
+
+    def observe(stage: str) -> None:
+        if stage.startswith("candidate_traversal:"):
+            traversed.append(stage)
+
+    monkeypatch.setattr(quarantine_module, "_FAILPOINT", observe)
+    with pytest.raises(RuntimeQuarantineError, match="manifest byte budget"):
+        publish_runtime_candidate(_request())
+    assert 0 < len(traversed) < len(long_files)
+    residue = quarantine_fixture["quarantine"] / f".quarantine-{'1' * 32}"
+    assert not (residue / authority_module.GENERATION_MANIFEST_NAME).exists()
+    assert cleanup_runtime_quarantine("1" * 32) is True
+
+
+def test_manifest_serializer_never_receives_a_duplicate_whole_tree_payload(
+    quarantine_fixture: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _make_candidate(
+        quarantine_fixture["inbox"],
+        candidate_id="a" * 64,
+        candidate_basename="candidate-v1",
+    )
+    real_canonical = quarantine_module.canonical_json_bytes
+
+    def reject_aggregate_entries(
+        value: Any,
+        *,
+        trailing_newline: bool = False,
+    ) -> bytes:
+        if type(value) is dict and type(value.get("entries")) is list:
+            raise AssertionError("whole-tree entries payload was materialized")
+        return real_canonical(value, trailing_newline=trailing_newline)
+
+    monkeypatch.setattr(quarantine_module, "canonical_json_bytes", reject_aggregate_entries)
+    assert publish_runtime_candidate(_request()).status is RuntimeQuarantineStatus.PUBLISHED

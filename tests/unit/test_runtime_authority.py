@@ -262,6 +262,7 @@ def _materialize_generation_slot(
     manifest_profile_id: str | None = None,
     manifest_module: str | None = None,
     extra_files: dict[str, bytes] | None = None,
+    manifest_only_files: tuple[str, ...] = (),
     extra_directories: tuple[str, ...] = (),
     omitted_files: tuple[str, ...] = (),
     pyvenv_payload: bytes = b"include-system-site-packages = false\n",
@@ -317,6 +318,7 @@ def _materialize_generation_slot(
                 manifest_module,
                 sorted(extra_directories),
                 sorted(files.items()),
+                sorted(manifest_only_files),
             )
         ).encode()
     ).hexdigest()[:16]
@@ -353,6 +355,18 @@ def _materialize_generation_slot(
             "sha256": hashlib.sha256(content).hexdigest(),
         }
         for path, content in files.items()
+    )
+    entries.extend(
+        {
+            "path": path,
+            "type": "file",
+            "owner_uid": os.getuid(),
+            "mode": 0o444,
+            "nlink": 1,
+            "size": 0,
+            "sha256": hashlib.sha256(b"").hexdigest(),
+        }
+        for path in manifest_only_files
     )
     manifest = canonical_json_bytes(
         {
@@ -539,6 +553,68 @@ def test_profile_v1_round_trips_and_self_checks_profile_id() -> None:
     assert profile.deploy_pyz.path == authority_module.PRODUCTION_DEPLOY_PYZ
     assert profile.runtime_pyz.path == authority_module.PRODUCTION_RUNTIME_PYZ
     assert len(profile.ancestors) == len({ancestor.path for ancestor in profile.ancestors})
+
+
+def test_deployment_lock_has_a_narrow_public_context_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_authority_fixture(tmp_path, monkeypatch)
+
+    assert "acquire_runtime_deployment_lock" in authority_module.__all__
+    assert "RuntimeDeploymentLock" in authority_module.__all__
+    with authority_module.acquire_runtime_deployment_lock() as lock:
+        lock.assert_current()
+        assert not hasattr(lock, "descriptor")
+        assert not hasattr(lock, "parent_fd")
+    lock.close()
+
+    with pytest.raises(RuntimeAuthorityPublishError, match="cannot be constructed"):
+        authority_module.RuntimeDeploymentLock()
+
+
+@pytest.mark.parametrize(
+    "relative",
+    (
+        "FULL-MANIFEST.JSON",
+        "ｆｕｌｌ－ｍａｎｉｆｅｓｔ．ｊｓｏｎ",
+        "．",
+        "．．",
+        "safe／escape.py",
+        "release/src/rquant/safe.py|release/src/rquant/ｓａｆｅ．ｐｙ",
+    ),
+)
+def test_authority_independently_rejects_normalized_path_aliases(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relative: str,
+) -> None:
+    _path, generation_root = _install_authority_fixture(tmp_path, monkeypatch)
+    aliases = relative.split("|")
+    manifest_only = tuple(alias for alias in aliases if alias == "FULL-MANIFEST.JSON")
+    slot = _materialize_generation_slot(
+        generation_root,
+        f"normalized-alias-{len(aliases)}",
+        authority_module.RuntimeGenerationLifecycle.ACTIVE,
+        extra_files={alias: b"alias" for alias in aliases if alias not in manifest_only},
+        manifest_only_files=manifest_only,
+    )
+    with pytest.raises(RuntimeAuthorityPublishError, match="normalized"):
+        publish_runtime_authority(_record_for_slot(slot))
+
+
+def test_authority_accepts_legitimate_nonconfusable_unicode_component(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _path, generation_root = _install_authority_fixture(tmp_path, monkeypatch)
+    slot = _materialize_generation_slot(
+        generation_root,
+        "legitimate-unicode",
+        authority_module.RuntimeGenerationLifecycle.ACTIVE,
+        extra_files={"release/src/rquant/数据模型.py": b"VALUE = 1\n"},
+    )
+    assert publish_runtime_authority(_record_for_slot(slot)).value == "committed"
 
 
 @pytest.mark.parametrize(
