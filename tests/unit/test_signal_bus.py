@@ -94,7 +94,7 @@ def test_ingest_allocates_one_monotonic_sequence_and_exact_retry_is_duplicate(
     assert next_receipt.global_sequence == 2
 
 
-def test_conflicting_payload_is_quarantined_without_replacing_original(
+def test_tampered_model_copy_is_rejected_without_replacing_original(
     tmp_path: Path,
 ) -> None:
     store = _store(tmp_path / "signal-bus.sqlite3")
@@ -102,15 +102,11 @@ def test_conflicting_payload_is_quarantined_without_replacing_original(
     accepted = store.ingest(original, received_at=NOW)
     conflict = original.model_copy(update={"candidate_id": "000001.SZ"})
 
-    receipt = store.ingest(conflict, received_at=NOW + timedelta(seconds=1))
+    with pytest.raises(ValueError, match="signal_id does not match"):
+        store.ingest(conflict, received_at=NOW + timedelta(seconds=1))
 
-    assert receipt.disposition is RouterDisposition.QUARANTINED
-    assert receipt.global_sequence is None
-    assert "different canonical payload" in (receipt.reason or "")
     assert store.signal(original.signal_id) == original
-    quarantines = store.quarantines(original.signal_id)
-    assert len(quarantines) == 1
-    assert quarantines[0].payload_json != store.signal_payload(original.signal_id)
+    assert store.quarantines(original.signal_id) == ()
     assert store.ingest(original, received_at=NOW).global_sequence == accepted.global_sequence
 
 

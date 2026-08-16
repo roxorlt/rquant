@@ -47,6 +47,10 @@ class LegacySignalWriteActivationError(TypeError):
     """A current-family signal reached a legacy-only durable writer."""
 
 
+class SignalBusIntegrityError(RuntimeError):
+    """Stored signal metadata does not match its exact durable payload bytes."""
+
+
 class SignalRouteConflictError(RuntimeError):
     """An immutable source identity or route receipt was changed."""
 
@@ -102,13 +106,36 @@ def require_legacy_signal_write(
     *,
     operation: str,
 ) -> SignalEnvelope:
-    if isinstance(signal, CurrentSignalEnvelope):
+    if type(signal) is CurrentSignalEnvelope:
         raise LegacySignalWriteActivationError(
             f"{operation} is legacy-only in this reader-only release; "
             "current-family writes are not activated"
         )
-    if not isinstance(signal, SignalEnvelope):
+    if type(signal) is not SignalEnvelope:
         raise TypeError(f"{operation} requires a SignalEnvelope object")
+    validated = parse_signal_envelope(signal.model_dump(mode="python"))
+    if type(validated) is not SignalEnvelope:
+        raise TypeError(f"{operation} requires a SignalEnvelope object")
+    return validated
+
+
+def parse_stored_signal(
+    *,
+    signal_id: str,
+    payload_hash: str,
+    payload_json: str,
+    payload_size: int,
+) -> SignalEnvelopeFamily:
+    """Dispatch and verify one exact stored signal row without reserialization."""
+
+    payload_bytes = payload_json.encode("utf-8")
+    signal = parse_signal_envelope(payload_bytes)
+    if payload_size != len(payload_bytes):
+        raise SignalBusIntegrityError("stored signal payload size does not match payload_json")
+    if payload_hash != hashlib.sha256(payload_bytes).hexdigest():
+        raise SignalBusIntegrityError("stored signal payload hash does not match payload_json")
+    if signal.signal_id != signal_id:
+        raise SignalBusIntegrityError("stored signal_id does not match signal payload")
     return signal
 
 
@@ -559,7 +586,7 @@ class SignalBusStore:
         *,
         received_at: datetime | None = None,
     ) -> RouterReceipt:
-        require_legacy_signal_write(signal, operation="SignalBusStore.ingest")
+        signal = require_legacy_signal_write(signal, operation="SignalBusStore.ingest")
         received = _normalize_time(received_at or datetime.now(UTC))
         with self._write_transaction() as connection:
             receipt, changed = self._ingest_in_transaction(
@@ -578,7 +605,7 @@ class SignalBusStore:
         *,
         received_at: datetime,
     ) -> tuple[RouterReceipt, bool]:
-        require_legacy_signal_write(signal, operation="SignalBusStore.ingest")
+        signal = require_legacy_signal_write(signal, operation="SignalBusStore.ingest")
         signal_id = signal.signal_id
         if signal_id is None:
             raise ValueError("signal_id must be materialized before ingest")
@@ -861,22 +888,43 @@ class SignalBusStore:
         return tuple(records)
 
     def signal(self, identifier: int | str) -> SignalEnvelopeFamily | None:
-        payload = self.signal_payload(identifier)
-        if payload is None:
+        stored = self._stored_signal(identifier)
+        if stored is None:
             return None
-        return parse_signal_envelope(payload)
+        _payload, signal = stored
+        return signal
 
     def signal_payload(self, identifier: int | str) -> str | None:
+        stored = self._stored_signal(identifier)
+        return None if stored is None else stored[0]
+
+    def _stored_signal(
+        self,
+        identifier: int | str,
+    ) -> tuple[str, SignalEnvelopeFamily] | None:
         column = "global_sequence" if isinstance(identifier, int) else "signal_id"
-        connection = self._connect()
+        connection = self._connect_readonly()
         try:
             row = connection.execute(
-                f"SELECT payload_json FROM signal_envelope WHERE {column} = ?",
+                f"""
+                SELECT signal_id, payload_hash, payload_json,
+                       length(CAST(payload_json AS BLOB)) AS payload_size
+                FROM signal_envelope WHERE {column} = ?
+                """,
                 (identifier,),
             ).fetchone()
-            return None if row is None else str(row["payload_json"])
         finally:
             connection.close()
+        if row is None:
+            return None
+        payload = str(row["payload_json"])
+        signal = parse_stored_signal(
+            signal_id=str(row["signal_id"]),
+            payload_hash=str(row["payload_hash"]),
+            payload_json=payload,
+            payload_size=int(row["payload_size"]),
+        )
+        return payload, signal
 
     def quarantines(self, signal_id: str | None = None) -> tuple[QuarantinedSignal, ...]:
         connection = self._connect()
@@ -961,7 +1009,8 @@ class SignalBusStore:
     ) -> tuple[list[sqlite3.Row], bool]:
         signal_row = connection.execute(
             """
-            SELECT global_sequence, payload_json
+            SELECT global_sequence, signal_id, payload_hash, payload_json,
+                   length(CAST(payload_json AS BLOB)) AS payload_size
             FROM signal_envelope
             WHERE signal_id = ?
             """,
@@ -969,8 +1018,19 @@ class SignalBusStore:
         ).fetchone()
         if signal_row is None:
             raise KeyError(f"signal {signal_id!r} does not exist")
-        signal = parse_signal_envelope(signal_row["payload_json"])
-        require_legacy_signal_write(signal, operation="SignalBusStore.route")
+        signal = parse_stored_signal(
+            signal_id=str(signal_row["signal_id"]),
+            payload_hash=str(signal_row["payload_hash"]),
+            payload_json=str(signal_row["payload_json"]),
+            payload_size=int(signal_row["payload_size"]),
+        )
+        if type(signal) is CurrentSignalEnvelope:
+            raise LegacySignalWriteActivationError(
+                "SignalBusStore.route is legacy-only in this reader-only release; "
+                "current-family writes are not activated"
+            )
+        if type(signal) is not SignalEnvelope:
+            raise TypeError("SignalBusStore.route requires a SignalEnvelope object")
         if routed_at < signal.available_at:
             raise ValueError("signal cannot be routed before available_at")
         expired = routed_at >= signal.expires_at
@@ -1180,7 +1240,10 @@ class SignalBusStore:
         targets: Iterable[DeliveryTarget],
         routed_at: datetime,
     ) -> SignalRouteCommitResult:
-        require_legacy_signal_write(signal, operation="SignalBusStore.commit_source_route")
+        signal = require_legacy_signal_write(
+            signal,
+            operation="SignalBusStore.commit_source_route",
+        )
         request = _SourceRouteCommitRequest(
             descriptor=descriptor,
             routing_policy_fingerprint=routing_policy_fingerprint,

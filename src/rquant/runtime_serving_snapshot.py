@@ -37,8 +37,9 @@ from rquant.serving_read_models import (
     ServingProjectionPayload,
     ServingReadModelInput,
     ServingSignalRecord,
+    ServingSignalRegistryRecord,
 )
-from rquant.signal_bus import SignalRouteReceipt
+from rquant.signal_bus import SignalRouteReceipt, require_legacy_signal_write
 
 SIGNALS_DATASET_ID = "signals"
 PAPER_ACCOUNTS_DATASET_ID = "paper_accounts"
@@ -53,6 +54,45 @@ GenerationId = Annotated[StrictStr, StringConstraints(pattern=r"^[0-9a-f]{64}$")
 
 
 class SignalDeliveryPayload(RuntimeContractModel):
+    payload_kind: Literal["signal_delivery"] = "signal_delivery"
+    signals: tuple[ServingSignalRegistryRecord, ...] = ()
+    routes: tuple[SignalRouteReceipt, ...] = ()
+    deliveries: tuple[OutboxRecord, ...] = ()
+    projections: tuple[ServingProjectionPayload, ...] = ()
+
+    @field_validator("signals", mode="before")
+    @classmethod
+    def enforce_legacy_signal_writer(
+        cls,
+        value: object,
+    ) -> object:
+        if not isinstance(value, (tuple, list)):
+            return value
+        validated: list[ServingSignalRegistryRecord] = []
+        for item in value:
+            if type(item) in (ServingSignalRegistryRecord, ServingSignalRecord):
+                sequence = item.global_sequence
+                candidate = item.signal
+            elif isinstance(item, Mapping):
+                record = ServingSignalRecord.model_validate(item)
+                sequence = record.global_sequence
+                candidate = record.signal
+            else:
+                return value
+            signal = require_legacy_signal_write(
+                candidate,
+                operation="SignalDeliveryPayload",
+            )
+            validated.append(
+                ServingSignalRegistryRecord(
+                    global_sequence=sequence,
+                    signal=signal,
+                )
+            )
+        return tuple(validated)
+
+
+class SignalDeliveryReadPayload(RuntimeContractModel):
     payload_kind: Literal["signal_delivery"] = "signal_delivery"
     signals: tuple[ServingSignalRecord, ...] = ()
     routes: tuple[SignalRouteReceipt, ...] = ()
@@ -180,7 +220,7 @@ class ReferenceSlowPayload(ServingReferenceSlowEvidence):
 
 
 SourcePayload = Annotated[
-    SignalDeliveryPayload
+    SignalDeliveryReadPayload
     | PaperAccountsPayload
     | RuntimeHealthPayload
     | LabJobsPayload
@@ -201,6 +241,24 @@ class SourceReadResult(RuntimeContractModel):
     status: FreshnessStatus
     reason: str | None = Field(default=None, min_length=1)
     payload: SourcePayload
+
+    @field_validator("payload", mode="before")
+    @classmethod
+    def adapt_registry_signal_payload(cls, value: object) -> object:
+        if type(value) is not SignalDeliveryPayload:
+            return value
+        return SignalDeliveryReadPayload(
+            signals=tuple(
+                ServingSignalRecord(
+                    global_sequence=record.global_sequence,
+                    signal=record.signal,
+                )
+                for record in value.signals
+            ),
+            routes=value.routes,
+            deliveries=value.deliveries,
+            projections=value.projections,
+        )
 
     @model_validator(mode="after")
     def validate_result(self) -> SourceReadResult:
@@ -231,7 +289,7 @@ ReferenceSlowReader = SourceReader
 
 
 def _payload_is_empty(payload: SourcePayload) -> bool:
-    if isinstance(payload, SignalDeliveryPayload):
+    if isinstance(payload, SignalDeliveryReadPayload):
         return (
             not payload.signals
             and not payload.routes
@@ -291,7 +349,7 @@ class ServingSnapshotAssembler:
     def assemble(self, as_of: AwareUtcDatetime) -> ServingRuntimeSnapshot:
         observed_at = normalize_aware_utc(as_of)
         specifications: tuple[tuple[str, SourceReader, type[RuntimeContractModel]], ...] = (
-            (SIGNALS_DATASET_ID, self.signal_reader, SignalDeliveryPayload),
+            (SIGNALS_DATASET_ID, self.signal_reader, SignalDeliveryReadPayload),
             (
                 PAPER_ACCOUNTS_DATASET_ID,
                 self.paper_accounts_reader,
@@ -340,7 +398,7 @@ class ServingSnapshotAssembler:
         lab_payload = by_dataset[LAB_JOBS_DATASET_ID].payload
         promotion_payload = by_dataset[PROMOTIONS_DATASET_ID].payload
         reference_payload = by_dataset[REFERENCE_SLOW_AUTHORITY_DATASET_ID].payload
-        assert isinstance(signal_payload, SignalDeliveryPayload)
+        assert isinstance(signal_payload, SignalDeliveryReadPayload)
         assert isinstance(paper_payload, PaperAccountsPayload)
         assert isinstance(runtime_payload, RuntimeHealthPayload)
         assert isinstance(lab_payload, LabJobsPayload)
@@ -491,5 +549,6 @@ __all__ = [
     "RuntimeHealthPayload",
     "ServingSnapshotAssembler",
     "SignalDeliveryPayload",
+    "SignalDeliveryReadPayload",
     "SourceReadResult",
 ]

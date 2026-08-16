@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import json
 import sqlite3
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -9,13 +10,14 @@ from pathlib import Path
 
 import pytest
 
+import rquant.runtime_serving_snapshot as runtime_serving_snapshot
 import rquant.signal_bus as signal_bus
 from rquant.delivery_contracts import (
     DeliveryChannel,
     DeliveryTarget,
     OutboxStatus,
 )
-from rquant.notification_state import NotificationStateStore
+from rquant.notification_state import NotificationReplicationError, NotificationStateStore
 from rquant.notification_worker import (
     NotificationDelivery,
     NotificationProvider,
@@ -26,6 +28,7 @@ from rquant.runtime_routing_policy import (
     FrozenRoutingPolicyResolver,
     RoutingPolicyDocument,
 )
+from rquant.serving_read_models import ServingSignalRecord, build_serving_read_models
 from rquant.signal_bus import (
     RouteDecisionKind,
     RouteSourceDescriptor,
@@ -61,6 +64,11 @@ LegacySignalWriteActivationError = getattr(
     signal_bus,
     "LegacySignalWriteActivationError",
     type("MissingLegacySignalWriteActivationError", (TypeError,), {}),
+)
+SignalBusIntegrityError = getattr(
+    signal_bus,
+    "SignalBusIntegrityError",
+    type("MissingSignalBusIntegrityError", (RuntimeError,), {}),
 )
 
 NOW = datetime(2026, 7, 31, 1, 40, tzinfo=UTC)
@@ -101,6 +109,45 @@ _LITERAL_FAMILY_FIXTURES = (
     ),
 )
 _CURRENT_FIXTURES = _LITERAL_FAMILY_FIXTURES[-2:]
+_ALL_LEGACY_WRITE_FIXTURES = tuple(
+    (
+        f"legacy-v{schema_version}-{'zero' if producer_commit == '0' * 40 else 'claim'}",
+        SignalEnvelope,
+        signal_id,
+        literal,
+    )
+    for schema_version, producer_commit, signal_id, literal in _LEGACY_CANONICAL_FIXTURES
+)
+_TAMPER_LEGACY_FIXTURES = _ALL_LEGACY_WRITE_FIXTURES[::2]
+_INVALID_STORED_LITERALS = (
+    ("malformed", b"{"),
+    (
+        "unknown",
+        _CURRENT_FIXTURES[0][3].replace(
+            b'"rquant.signal-envelope/v1"',
+            b'"rquant.signal-envelope/v999"',
+        ),
+    ),
+    (
+        "mixed",
+        _CURRENT_FIXTURES[0][3][:-1]
+        + b',"producer_commit":"dddddddddddddddddddddddddddddddddddddddd"}',
+    ),
+    (
+        "duplicate-key",
+        _CURRENT_FIXTURES[0][3].replace(
+            b'"strategy_id":"n-shape"',
+            b'"strategy_id":"n-shape","strategy_id":"n-shape"',
+        ),
+    ),
+    (
+        "corrupt-payload-id",
+        _CURRENT_FIXTURES[0][3].replace(
+            _CURRENT_FIXTURES[0][2].encode(),
+            b"0" * 64,
+        ),
+    ),
+)
 
 
 def _store(path: Path) -> SignalBusStore:
@@ -243,6 +290,32 @@ def _database_snapshot(path: Path) -> tuple[tuple[str, tuple[tuple[object, ...],
         )
 
 
+def _database_bytes_snapshot(path: Path) -> tuple[tuple[str, bytes], ...]:
+    return tuple(
+        (candidate.name, candidate.read_bytes())
+        for candidate in sorted(path.parent.glob(f"{path.name}*"))
+    )
+
+
+def _insert_notification_receipt(path: Path, *, signal_id: str) -> None:
+    receipt = _route_receipt(signal_id)
+    payload = json.dumps(
+        receipt.model_dump(mode="json"),
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            INSERT INTO notification_source_route_receipt(
+                global_sequence, signal_id, receipt_hash, receipt_json
+            ) VALUES (1, ?, ?, ?)
+            """,
+            (signal_id, hashlib.sha256(payload.encode()).hexdigest(), payload),
+        )
+
+
 def _insert_pending_outbox(
     path: Path,
     *,
@@ -310,10 +383,10 @@ def test_literal_legacy_and_current_rows_roundtrip_every_bus_read_path(
 
 @pytest.mark.parametrize(
     ("_name", "expected_type", "expected_id", "literal"),
-    _CURRENT_FIXTURES,
-    ids=[item[0] for item in _CURRENT_FIXTURES],
+    _LITERAL_FAMILY_FIXTURES,
+    ids=[item[0] for item in _LITERAL_FAMILY_FIXTURES],
 )
-def test_notification_state_worker_formatter_and_policy_keep_current_identity(
+def test_notification_state_worker_formatter_and_policy_keep_family_identity(
     tmp_path: Path,
     _name: str,
     expected_type: type[SignalEnvelopeFamily],
@@ -381,6 +454,62 @@ def test_notification_state_worker_formatter_and_policy_keep_current_identity(
     )
     decision = resolver(delivered)
     assert decision.targets == (target,)
+
+
+@pytest.mark.parametrize(
+    ("_name", "expected_type", "expected_id", "literal"),
+    _LITERAL_FAMILY_FIXTURES,
+    ids=[item[0] for item in _LITERAL_FAMILY_FIXTURES],
+)
+def test_nested_serving_snapshot_reads_every_literal_family(
+    tmp_path: Path,
+    _name: str,
+    expected_type: type[SignalEnvelopeFamily],
+    expected_id: str,
+    literal: bytes,
+) -> None:
+    record = ServingSignalRecord.model_validate({"global_sequence": 1, "signal": literal.decode()})
+    assert type(record.signal) is expected_type
+    assert record.signal.signal_id == expected_id
+
+    read_payload_type = getattr(
+        runtime_serving_snapshot,
+        "SignalDeliveryReadPayload",
+        None,
+    )
+    assert read_payload_type is not None
+    source_read = runtime_serving_snapshot.SourceReadResult.model_validate(
+        {
+            "dataset_id": "signals",
+            "generation_id": GENERATION,
+            "sequence": 1,
+            "event_time": NOW,
+            "published_at": NOW,
+            "status": "fresh",
+            "payload": {
+                "payload_kind": "signal_delivery",
+                "signals": ({"global_sequence": 1, "signal": literal.decode()},),
+            },
+        }
+    )
+    assert type(source_read.payload) is read_payload_type
+    assert type(source_read.payload.signals[0].signal) is expected_type
+    assert source_read.payload.signals[0].signal.signal_id == expected_id
+
+    path = tmp_path / "notification-serving.sqlite3"
+    store = NotificationStateStore(path)
+    _insert_literal_signal_rows(
+        path,
+        ((_name, expected_type, expected_id, literal),),
+        routed=False,
+    )
+    _insert_notification_receipt(path, signal_id=expected_id)
+
+    snapshot = store.serving_snapshot(observed_at=NOW, history_limit=10)
+
+    assert type(snapshot.payload) is read_payload_type
+    assert type(snapshot.payload.signals[0].signal) is expected_type
+    assert snapshot.payload.signals[0].signal.signal_id == expected_id
 
 
 def test_family_consumers_match_legacy_formatting_and_routing_on_common_fields(
@@ -502,8 +631,19 @@ def test_current_bus_and_notification_writers_are_typed_gates_with_zero_mutation
     assert _database_snapshot(notification_path) == before
 
 
-def test_current_router_input_is_gated_before_bus_or_outbox_mutation(tmp_path: Path) -> None:
-    current = parse_signal_envelope(_CURRENT_FIXTURES[0][3])
+@pytest.mark.parametrize(
+    ("_name", "_expected_type", "_expected_id", "literal"),
+    _CURRENT_FIXTURES,
+    ids=[item[0] for item in _CURRENT_FIXTURES],
+)
+def test_current_router_input_is_gated_before_bus_or_outbox_mutation(
+    tmp_path: Path,
+    _name: str,
+    _expected_type: type[SignalEnvelopeFamily],
+    _expected_id: str,
+    literal: bytes,
+) -> None:
+    current = parse_signal_envelope(literal)
     assert type(current) is CurrentSignalEnvelope
     path = tmp_path / "router-bus.sqlite3"
     bus = _store(path)
@@ -547,28 +687,81 @@ def test_current_router_input_is_gated_before_bus_or_outbox_mutation(tmp_path: P
 
 
 @pytest.mark.parametrize(
-    "literal",
-    (
-        b"{",
-        _CURRENT_FIXTURES[0][3].replace(
-            b'"rquant.signal-envelope/v1"',
-            b'"rquant.signal-envelope/v999"',
-        ),
-        _CURRENT_FIXTURES[0][3][:-1]
-        + b',"producer_commit":"dddddddddddddddddddddddddddddddddddddddd"}',
-        _CURRENT_FIXTURES[0][3].replace(
-            b'"strategy_id":"n-shape"',
-            b'"strategy_id":"n-shape","strategy_id":"n-shape"',
-        ),
-        _CURRENT_FIXTURES[0][3].replace(
-            _CURRENT_FIXTURES[0][2].encode(),
-            b"0" * 64,
-        ),
-    ),
-    ids=("malformed", "unknown", "mixed", "duplicate-key", "corrupt-id"),
+    ("_name", "_expected_type", "_expected_id", "literal"),
+    _CURRENT_FIXTURES,
+    ids=[item[0] for item in _CURRENT_FIXTURES],
+)
+def test_registry_serving_payload_keeps_current_writer_gate(
+    _name: str,
+    _expected_type: type[SignalEnvelopeFamily],
+    _expected_id: str,
+    literal: bytes,
+) -> None:
+    current = parse_signal_envelope(literal)
+    record = ServingSignalRecord(global_sequence=1, signal=current)
+
+    with pytest.raises(LegacySignalWriteActivationError, match="reader-only"):
+        runtime_serving_snapshot.SignalDeliveryPayload(signals=(record,))
+
+
+@pytest.mark.parametrize("corruption", ("stored-id", "payload-hash"))
+@pytest.mark.parametrize("operation", ("point", "payload", "route"))
+def test_signal_bus_rejects_durable_identity_or_hash_drift_before_mutation(
+    tmp_path: Path,
+    corruption: str,
+    operation: str,
+) -> None:
+    _name, expected_type, expected_id, literal = _LITERAL_FAMILY_FIXTURES[0]
+    path = tmp_path / f"integrity-{corruption}-{operation}.sqlite3"
+    store = _store(path)
+    _insert_literal_signal_rows(
+        path,
+        ((_name, expected_type, expected_id, literal),),
+        routed=False,
+    )
+    identifier = expected_id
+    with sqlite3.connect(path) as connection:
+        if corruption == "stored-id":
+            identifier = "8" * 64
+            connection.execute(
+                "UPDATE signal_envelope SET signal_id = ? WHERE global_sequence = 1",
+                (identifier,),
+            )
+        else:
+            connection.execute(
+                "UPDATE signal_envelope SET payload_hash = ? WHERE global_sequence = 1",
+                ("8" * 64,),
+            )
+    before = _database_snapshot(path)
+
+    with pytest.raises(SignalBusIntegrityError):
+        if operation == "point":
+            store.signal(identifier)
+        elif operation == "payload":
+            store.signal_payload(identifier)
+        else:
+            store.route(
+                identifier,
+                (
+                    DeliveryTarget(
+                        recipient_id="admin",
+                        channel=DeliveryChannel.PUSHDEER,
+                    ),
+                ),
+                now=NOW,
+            )
+
+    assert _database_snapshot(path) == before
+
+
+@pytest.mark.parametrize(
+    ("_case", "literal"),
+    _INVALID_STORED_LITERALS,
+    ids=[item[0] for item in _INVALID_STORED_LITERALS],
 )
 def test_invalid_stored_json_fails_closed_through_dispatcher(
     tmp_path: Path,
+    _case: str,
     literal: bytes,
 ) -> None:
     path = tmp_path / "invalid.sqlite3"
@@ -589,6 +782,92 @@ def test_invalid_stored_json_fails_closed_through_dispatcher(
             observed_at=NOW,
             limit=1,
         )
+    before = _database_snapshot(path)
+    with pytest.raises((TypeError, ValueError)):
+        store.route(
+            row_id,
+            (DeliveryTarget(recipient_id="admin", channel=DeliveryChannel.PUSHDEER),),
+            now=NOW,
+        )
+    assert _database_snapshot(path) == before
+
+    routed_path = tmp_path / "invalid-routed.sqlite3"
+    routed_store = _store(routed_path)
+    _insert_literal_signal_rows(
+        routed_path,
+        (("invalid", CurrentSignalEnvelope, row_id, literal),),
+        routed=True,
+    )
+    with pytest.raises((TypeError, ValueError)):
+        routed_store.routed_signals_after_global_sequence(
+            after_sequence=0,
+            through_sequence=1,
+            limit=1,
+        )
+
+
+@pytest.mark.parametrize(
+    ("_case", "literal"),
+    _INVALID_STORED_LITERALS,
+    ids=[item[0] for item in _INVALID_STORED_LITERALS],
+)
+def test_nested_serving_and_notification_boundary_reject_invalid_stored_payloads(
+    tmp_path: Path,
+    _case: str,
+    literal: bytes,
+) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        ServingSignalRecord.model_validate({"global_sequence": 1, "signal": literal.decode()})
+
+    path = tmp_path / "invalid-notification-serving.sqlite3"
+    store = NotificationStateStore(path)
+    row_id = "7" * 64
+    _insert_literal_signal_rows(
+        path,
+        (("invalid", CurrentSignalEnvelope, row_id, literal),),
+        routed=False,
+    )
+    _insert_notification_receipt(path, signal_id=row_id)
+
+    with pytest.raises((TypeError, ValueError, sqlite3.DatabaseError)):
+        store.serving_snapshot(observed_at=NOW, history_limit=10)
+
+
+@pytest.mark.parametrize("corruption", ("stored-id", "payload-hash", "receipt-hash"))
+def test_notification_serving_snapshot_rejects_durable_integrity_drift(
+    tmp_path: Path,
+    corruption: str,
+) -> None:
+    name, expected_type, expected_id, literal = _LITERAL_FAMILY_FIXTURES[0]
+    path = tmp_path / f"notification-integrity-{corruption}.sqlite3"
+    store = NotificationStateStore(path)
+    _insert_literal_signal_rows(
+        path,
+        ((name, expected_type, expected_id, literal),),
+        routed=False,
+    )
+    _insert_notification_receipt(path, signal_id=expected_id)
+    with sqlite3.connect(path) as connection:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        if corruption == "stored-id":
+            connection.execute(
+                "UPDATE signal_envelope SET signal_id = ? WHERE global_sequence = 1",
+                ("8" * 64,),
+            )
+        elif corruption == "payload-hash":
+            connection.execute(
+                "UPDATE signal_envelope SET payload_hash = ? WHERE global_sequence = 1",
+                ("8" * 64,),
+            )
+        else:
+            connection.execute("DROP TRIGGER notification_source_route_receipt_immutable_update")
+            connection.execute(
+                "UPDATE notification_source_route_receipt SET receipt_hash = ?",
+                ("8" * 64,),
+            )
+
+    with pytest.raises((SignalBusIntegrityError, NotificationReplicationError, ValueError)):
+        store.serving_snapshot(observed_at=NOW, history_limit=10)
 
 
 def test_runner_reader_rejects_duplicate_signal_keys_through_domain_error(
@@ -620,11 +899,41 @@ def test_runner_reader_rejects_duplicate_signal_keys_through_domain_error(
 
 
 @pytest.mark.parametrize(
-    ("_name", "expected_type", "expected_id", "literal"),
-    _CURRENT_FIXTURES,
-    ids=[item[0] for item in _CURRENT_FIXTURES],
+    ("_case", "literal"),
+    _INVALID_STORED_LITERALS,
+    ids=[item[0] for item in _INVALID_STORED_LITERALS],
 )
-def test_runner_db_reader_returns_exact_current_family(
+def test_runner_reader_rejects_every_invalid_stored_payload(
+    tmp_path: Path,
+    _case: str,
+    literal: bytes,
+) -> None:
+    path = tmp_path / "runner-invalid.sqlite3"
+    signal = parse_signal_envelope(_LITERAL_FAMILY_FIXTURES[0][3])
+    assert type(signal) is SignalEnvelope
+    _write_runner_source(path, signal=signal)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE runner_signal SET signal_id = ?, payload_json = ?",
+            ("7" * 64, literal.decode()),
+        )
+    source = ReadonlyStrategyRunnerSignalSource(
+        source_id="n-shape-v1",
+        path=path,
+        expected_strategy_spec_fingerprint=SPEC,
+        expected_evaluator_contract_fingerprint="2" * 64,
+    )
+
+    with pytest.raises(ValueError, match="runner signal payload is invalid"):
+        source.read_batch(after_sequence=0, limit=1)
+
+
+@pytest.mark.parametrize(
+    ("_name", "expected_type", "expected_id", "literal"),
+    _LITERAL_FAMILY_FIXTURES,
+    ids=[item[0] for item in _LITERAL_FAMILY_FIXTURES],
+)
+def test_runner_db_reader_returns_exact_family(
     tmp_path: Path,
     _name: str,
     expected_type: type[SignalEnvelopeFamily],
@@ -653,10 +962,52 @@ def test_runner_db_reader_returns_exact_current_family(
     assert record.signal.signal_id == expected_id
 
 
+def test_runner_reader_rejects_stored_signal_id_drift_before_downstream_mutation(
+    tmp_path: Path,
+) -> None:
+    runner_path = tmp_path / "runner-id-drift.sqlite3"
+    signal = parse_signal_envelope(_LITERAL_FAMILY_FIXTURES[0][3])
+    assert type(signal) is SignalEnvelope
+    _write_runner_source(runner_path, signal=signal)
+    with sqlite3.connect(runner_path) as connection:
+        connection.execute(
+            "UPDATE runner_signal SET signal_id = ? WHERE sequence = 1",
+            ("8" * 64,),
+        )
+    source = ReadonlyStrategyRunnerSignalSource(
+        source_id="n-shape-v1",
+        path=runner_path,
+        expected_strategy_spec_fingerprint=SPEC,
+        expected_evaluator_contract_fingerprint="2" * 64,
+    )
+    bus_path = tmp_path / "runner-id-drift-bus.sqlite3"
+    bus = _store(bus_path)
+    before = _database_snapshot(bus_path)
+
+    with pytest.raises(ValueError, match="runner signal payload is invalid"):
+        route_runner_signals(
+            source_id="n-shape-v1",
+            source=source,
+            bus=bus,
+            cursors=SignalRouteCursorStore(
+                tmp_path / "runner-id-drift-cursor.sqlite3",
+                routing_policy_fingerprint=POLICY,
+            ),
+            routed_at=NOW,
+            target_resolver=lambda _signal: RoutingDecision.no_target(
+                routing_policy_fingerprint=POLICY,
+                reason_code="r06_no_target",
+            ),
+            limit=1,
+        )
+
+    assert _database_snapshot(bus_path) == before
+
+
 @pytest.mark.parametrize(
     ("_name", "_expected_type", "_expected_id", "literal"),
-    _LITERAL_FAMILY_FIXTURES[:3],
-    ids=[item[0] for item in _LITERAL_FAMILY_FIXTURES[:3]],
+    _ALL_LEGACY_WRITE_FIXTURES,
+    ids=[item[0] for item in _ALL_LEGACY_WRITE_FIXTURES],
 )
 def test_legacy_bus_writer_preserves_literal_canonical_bytes(
     tmp_path: Path,
@@ -674,6 +1025,38 @@ def test_legacy_bus_writer_preserves_literal_canonical_bytes(
     assert store.signal_payload(signal.signal_id).encode() == literal
 
 
+@pytest.mark.parametrize(
+    ("_name", "_expected_type", "_expected_id", "literal"),
+    _TAMPER_LEGACY_FIXTURES,
+    ids=[item[0] for item in _TAMPER_LEGACY_FIXTURES],
+)
+@pytest.mark.parametrize("construction", ("model-copy", "model-construct"))
+def test_legacy_bus_writer_strictly_revalidates_detached_models_before_transaction(
+    tmp_path: Path,
+    _name: str,
+    _expected_type: type[SignalEnvelopeFamily],
+    _expected_id: str,
+    literal: bytes,
+    construction: str,
+) -> None:
+    signal = parse_signal_envelope(literal)
+    assert type(signal) is SignalEnvelope
+    if construction == "model-copy":
+        tampered = signal.model_copy(update={"candidate_id": "000001.SZ"})
+    else:
+        values = signal.model_dump(mode="python")
+        values["candidate_id"] = "000001.SZ"
+        tampered = SignalEnvelope.model_construct(**values)
+    path = tmp_path / f"tampered-{construction}.sqlite3"
+    store = _store(path)
+    before = _database_bytes_snapshot(path)
+
+    with pytest.raises(ValueError):
+        store.ingest(tampered, received_at=NOW)
+
+    assert _database_bytes_snapshot(path) == before
+
+
 def test_allowed_signal_readers_use_dispatcher_without_signal_reserialization() -> None:
     project_root = Path(__file__).parents[2]
     allowed_sources = (
@@ -683,6 +1066,8 @@ def test_allowed_signal_readers_use_dispatcher_without_signal_reserialization() 
         "src/rquant/runtime_notification_providers.py",
         "src/rquant/runtime_routing_policy.py",
         "src/rquant/signal_router_runtime.py",
+        "src/rquant/serving_read_models.py",
+        "src/rquant/runtime_serving_snapshot.py",
     )
     for relative in allowed_sources:
         source = (project_root / relative).read_text()
@@ -697,8 +1082,12 @@ def test_allowed_signal_readers_use_dispatcher_without_signal_reserialization() 
         NotificationDelivery.validate_delivery,
         format_signal_notification,
         _query_signal_records,
+        build_serving_read_models,
     )
     for reader in reader_functions:
         source = inspect.getsource(reader)
         assert "parse_signal_envelope" in source or "signal.model_dump" not in source
         assert "signal.model_dump" not in source
+    assert "json_extract(signal.payload_json" not in inspect.getsource(
+        NotificationStateStore.serving_snapshot
+    )

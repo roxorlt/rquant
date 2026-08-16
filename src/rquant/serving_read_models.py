@@ -41,7 +41,12 @@ from rquant.serving_publisher import (
     validate_serving_column_identifier,
 )
 from rquant.signal_bus import SignalRouteReceipt
-from rquant.signal_contracts import SignalEnvelope
+from rquant.signal_contracts import (
+    CurrentSignalEnvelope,
+    SignalEnvelope,
+    SignalEnvelopeFamily,
+    parse_signal_envelope,
+)
 from rquant.strict_json import canonical_json_bytes, strict_canonical_json_loads
 
 GenerationId = Annotated[StrictStr, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
@@ -772,6 +777,24 @@ class ServingSignalRecord(RuntimeContractModel):
     signal: SignalEnvelope
 
 
+# SignalDeliveryPayload keeps this original class object so its registry schema stays frozen.
+ServingSignalRegistryRecord = ServingSignalRecord
+
+
+class ServingSignalRecord(RuntimeContractModel):
+    global_sequence: int = Field(ge=1)
+    signal: SignalEnvelopeFamily
+
+    @field_validator("signal", mode="before")
+    @classmethod
+    def dispatch_signal_family(cls, value: object) -> SignalEnvelopeFamily:
+        if type(value) in (SignalEnvelope, CurrentSignalEnvelope):
+            return value  # type: ignore[return-value]
+        if isinstance(value, (Mapping, str, bytes, bytearray)):
+            return parse_signal_envelope(value)
+        raise TypeError("signal must be a stored signal envelope")
+
+
 class ServingLabJobRecord(RuntimeContractModel):
     summary: LabJobSummary
     eta: LabEtaEstimate | None = None
@@ -935,8 +958,16 @@ def serving_physical_table_specs_fingerprint() -> str:
     )
 
 
+def _thaw_json_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {key: _thaw_json_value(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_thaw_json_value(item) for item in value]
+    return value
+
+
 def _json(value: object) -> str:
-    jsonable = TypeAdapter(object).dump_python(value, mode="json")
+    jsonable = TypeAdapter(object).dump_python(_thaw_json_value(value), mode="json")
     return json.dumps(jsonable, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
 
 
@@ -998,7 +1029,7 @@ def build_serving_read_models(
                 "available_at": record.signal.available_at,
                 "expires_at": record.signal.expires_at,
                 "reason_codes_json": _json(record.signal.reason_codes),
-                "evidence_json": _json(record.signal.model_dump(mode="json")["evidence"]),
+                "evidence_json": _json(record.signal.evidence),
                 "dataset_snapshot_id": record.signal.dataset_snapshot_id,
                 "feature_snapshot_id": record.signal.feature_snapshot_id,
             }
@@ -1629,6 +1660,7 @@ __all__ = [
     "ServingReadModelInput",
     "ServingLabJobRecord",
     "ServingSignalRecord",
+    "ServingSignalRegistryRecord",
     "build_serving_read_models",
     "decode_nl_screen_cursor",
     "encode_nl_screen_cursor",

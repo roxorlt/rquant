@@ -33,12 +33,13 @@ from rquant.signal_bus import (
     SignalBusSourceDescriptor,
     SignalBusStore,
     SignalRouteReceipt,
+    parse_stored_signal,
     require_legacy_signal_write,
 )
-from rquant.signal_contracts import parse_signal_envelope
+from rquant.signal_contracts import SignalEnvelopeFamily
 
 if TYPE_CHECKING:
-    from rquant.runtime_serving_snapshot import SignalDeliveryPayload
+    from rquant.runtime_serving_snapshot import SignalDeliveryReadPayload
 
 from rquant.serving_read_models import ServingProjectionPayload
 
@@ -318,7 +319,7 @@ class NotificationServingSnapshot:
     returned_signal_count: int
     omitted_signal_count: int
     truncated: bool
-    payload: SignalDeliveryPayload
+    payload: SignalDeliveryReadPayload
     projection_generation_id: str | None = None
     projection_source_receipts: Mapping[str, str] = dataclass_field(default_factory=dict)
 
@@ -695,7 +696,7 @@ class NotificationStateStore(SignalBusStore):
         observed_at: datetime,
         history_limit: int,
     ) -> NotificationServingSnapshot:
-        from rquant.runtime_serving_snapshot import SignalDeliveryPayload
+        from rquant.runtime_serving_snapshot import SignalDeliveryReadPayload
         from rquant.serving_read_models import ServingReadModelInput, ServingSignalRecord
 
         observed = normalize_aware_utc(observed_at)
@@ -733,12 +734,77 @@ class NotificationStateStore(SignalBusStore):
                 )
             )
             observed_text = observed.isoformat(timespec="microseconds").replace("+00:00", "Z")
+            verified: dict[
+                int,
+                tuple[SignalEnvelopeFamily, SignalRouteReceipt, bool],
+            ] = {}
+            callback_errors: list[Exception] = []
+
+            def notification_visible(
+                global_sequence: int,
+                stored_signal_id: str,
+                payload_hash: str,
+                payload_json: str,
+                payload_size: int,
+                received_at_text: str,
+                receipt_signal_id: str,
+                receipt_hash: str,
+                receipt_json: str,
+            ) -> int:
+                sequence = int(global_sequence)
+                cached = verified.get(sequence)
+                if cached is not None:
+                    return int(cached[2])
+                try:
+                    signal = parse_stored_signal(
+                        signal_id=str(stored_signal_id),
+                        payload_hash=str(payload_hash),
+                        payload_json=str(payload_json),
+                        payload_size=int(payload_size),
+                    )
+                    receipt_payload = str(receipt_json)
+                    if hashlib.sha256(receipt_payload.encode()).hexdigest() != str(receipt_hash):
+                        raise NotificationReplicationError(
+                            "stored notification receipt hash does not match its payload"
+                        )
+                    route = SignalRouteReceipt.model_validate_json(receipt_payload)
+                    if (
+                        receipt_signal_id != stored_signal_id
+                        or route.signal_id != receipt_signal_id
+                    ):
+                        raise NotificationReplicationError(
+                            "stored notification receipt signal_id does not match signal payload"
+                        )
+                    received_at = normalize_aware_utc(datetime.fromisoformat(str(received_at_text)))
+                    visible = (
+                        signal.available_at <= observed
+                        and received_at <= observed
+                        and route.routed_at <= observed
+                    )
+                    verified[sequence] = (signal, route, visible)
+                    return int(visible)
+                except Exception as exc:
+                    if not callback_errors:
+                        callback_errors.append(exc)
+                    return 0
+
+            connection.create_function(
+                "rquant_notification_visible",
+                9,
+                notification_visible,
+            )
             visible_predicate = """
-                julianday(signal.received_at) <= julianday(?)
-                AND julianday(json_extract(signal.payload_json, '$.available_at'))
-                    <= julianday(?)
-                AND julianday(json_extract(receipt.receipt_json, '$.routed_at'))
-                    <= julianday(?)
+                rquant_notification_visible(
+                    signal.global_sequence,
+                    signal.signal_id,
+                    signal.payload_hash,
+                    signal.payload_json,
+                    length(CAST(signal.payload_json AS BLOB)),
+                    signal.received_at,
+                    receipt.signal_id,
+                    receipt.receipt_hash,
+                    receipt.receipt_json
+                ) = 1
             """
             visible_row = connection.execute(
                 f"""
@@ -746,39 +812,33 @@ class NotificationStateStore(SignalBusStore):
                 FROM notification_source_route_receipt AS receipt
                 JOIN signal_envelope AS signal
                   ON signal.global_sequence = receipt.global_sequence
-                 AND signal.signal_id = receipt.signal_id
                 WHERE {visible_predicate}
                 """,
-                (observed_text, observed_text, observed_text),
             ).fetchone()
+            if callback_errors:
+                raise callback_errors[0]
             visible_signal_count = 0 if visible_row is None else int(visible_row[0])
             rows = connection.execute(
                 f"""
-                SELECT signal.global_sequence, signal.payload_json, signal.received_at,
-                       receipt.receipt_json
+                SELECT signal.global_sequence
                 FROM notification_source_route_receipt AS receipt
                 JOIN signal_envelope AS signal
                   ON signal.global_sequence = receipt.global_sequence
-                 AND signal.signal_id = receipt.signal_id
                 WHERE {visible_predicate}
                 ORDER BY signal.global_sequence DESC
                 LIMIT ?
                 """,
-                (observed_text, observed_text, observed_text, history_limit),
+                (history_limit,),
             ).fetchall()
+            if callback_errors:
+                raise callback_errors[0]
 
             selected: list[tuple[ServingSignalRecord, SignalRouteReceipt]] = []
             for row in reversed(rows):
-                signal = parse_signal_envelope(row["payload_json"])
-                route = SignalRouteReceipt.model_validate_json(row["receipt_json"])
-                received_at = normalize_aware_utc(datetime.fromisoformat(row["received_at"]))
-                if (
-                    signal.available_at > observed
-                    or received_at > observed
-                    or route.routed_at > observed
-                ):
+                signal, route, visible = verified[int(row["global_sequence"])]
+                if not visible:
                     raise NotificationReplicationError(
-                        "SQL-visible notification evidence is future-dated"
+                        "SQL-visible notification evidence was not dispatcher-visible"
                     )
                 selected.append(
                     (
@@ -831,7 +891,7 @@ class NotificationStateStore(SignalBusStore):
             routes=routes,
             deliveries=deliveries,
         )
-        payload = SignalDeliveryPayload(
+        payload = SignalDeliveryReadPayload(
             signals=coherent.signals,
             routes=coherent.routes,
             deliveries=coherent.deliveries,

@@ -1092,7 +1092,8 @@ def _query_signal_records(
 
     cursor = connection.execute(
         """
-        SELECT sequence, CAST(payload_json AS BLOB) AS payload_bytes FROM runner_signal
+        SELECT sequence, signal_id, CAST(payload_json AS BLOB) AS payload_bytes
+        FROM runner_signal
         WHERE sequence > ? AND sequence <= ?
         ORDER BY sequence LIMIT ?
         """,
@@ -1124,6 +1125,8 @@ def _query_signal_records(
                 if not isinstance(decoded, Mapping):
                     raise TypeError("runner signal payload must be a JSON object")
                 signal = parse_signal_envelope(decoded)
+                if str(row["signal_id"]) != signal.signal_id:
+                    raise ValueError("runner stored signal_id does not match signal payload")
                 record = (
                     CurrentRunnerSignalRecord(sequence=int(row["sequence"]), signal=signal)
                     if isinstance(signal, CurrentSignalEnvelope)

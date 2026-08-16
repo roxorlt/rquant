@@ -39,7 +39,12 @@ GENERATION = "f" * 64
 SPEC = "1" * 64
 
 
-def _signal(seed: str = "a", *, available_at: datetime = NOW) -> SignalEnvelope:
+def _signal(
+    seed: str = "a",
+    *,
+    available_at: datetime = NOW,
+    candidate_id: str = "600000.SH",
+) -> SignalEnvelope:
     return SignalEnvelope(
         schema_version=1,
         strategy_id="n-shape",
@@ -49,7 +54,7 @@ def _signal(seed: str = "a", *, available_at: datetime = NOW) -> SignalEnvelope:
         feature_snapshot_id="c" * 64,
         event_time=available_at - timedelta(seconds=1),
         available_at=available_at,
-        candidate_id="600000.SH",
+        candidate_id=candidate_id,
         action=SignalAction.WATCH,
         reason_codes=("test",),
         evidence={},
@@ -558,21 +563,26 @@ def test_readonly_runner_batch_decodes_only_limit_rows_from_large_backlog(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     path = tmp_path / "runner.sqlite3"
-    signal = _signal()
     _write_runner_source(path)
-    payload = json.dumps(
-        signal.model_dump(mode="json"),
-        ensure_ascii=True,
-        separators=(",", ":"),
-        sort_keys=True,
-    )
+    candidates = (_signal(candidate_id=f"{index:06d}.SZ") for index in range(10_000))
     with sqlite3.connect(path) as connection:
         connection.executemany(
             """
             INSERT INTO runner_signal(signal_id, feature_sequence, payload_json)
             VALUES (?, 0, ?)
             """,
-            ((f"signal-{index}", payload) for index in range(10_000)),
+            (
+                (
+                    candidate.signal_id,
+                    json.dumps(
+                        candidate.model_dump(mode="json"),
+                        ensure_ascii=True,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                )
+                for candidate in candidates
+            ),
         )
     source = ReadonlyStrategyRunnerSignalSource(
         source_id="n-shape-v1",
