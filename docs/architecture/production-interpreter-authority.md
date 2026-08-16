@@ -12,10 +12,11 @@ record (C). Artifact signing is not part of v1.
 code. This amendment resolves the role/argument/environment contradiction in the original frozen
 text; all other decisions, including the v1 source-authenticity exclusion, remain unchanged.
 
-**Final local design amendment:** `WRAP-DESIGN-P1-01` through `WRAP-DESIGN-P1-04` freeze the
-application-path authority, list-value grammar, `SignalEnvelope` v2 producer identity, and
-dependency order below. These are design closures only; their red tests and implementation must
-precede wrapper or adapter code.
+**Approved structural baseline:** `WRAP-DESIGN-P1-01` through `WRAP-DESIGN-P1-04` freeze the
+application-path authority, list-value grammar, signal-envelope family identity, and dependency
+order below. `WRAP-DESIGN-P1-03` now uses the independently approved structural baseline below,
+which supersedes the prior shared-version proposal without changing the HYBRID A+C threat model or
+the other three design closures.
 
 ## Scope And Threat Model
 
@@ -65,7 +66,7 @@ trusted by root. A malicious accepted generation is executed only later with UID
   selects an alternate interpreter, profile, wrapper, module, or generation.
 - An application path uses an alias, symlink, nonexistent or wrong leaf, sibling escape, mutable
   trust-store overlap, or variable-to-path substitution to acquire code/runtime authority.
-- A daily success or error signal truncates a generation hash, reads Git identity from the
+- A new daily success or error signal truncates a generation hash, reads Git identity from the
   environment, fabricates a zero commit, or omits the active producer identity from `signal_id`.
 - A source entry changes type or identity during traversal, or uses symlinks, hard links, special
   files, path traversal, duplicate names, or mutable ancestors.
@@ -109,8 +110,10 @@ trusted by root. A malicious accepted generation is executed only later with UID
   only with the exact application environment policy frozen by the profile.
 - The profile freezes exact application data/log roots and exact variable-to-path mappings. Path
   validation is anchored and no application path can overlap or select trusted-code storage.
-- Every new signal write uses `SignalEnvelope` schema v2. A HYBRID signal binds the exact current
-  `full_manifest_hash` as its sole producer identity; Git/audit metadata is never substituted.
+- After the writer-cutover gate, every normal signal write uses the strict
+  `rquant.signal-envelope/v1` family. A HYBRID signal binds the exact current
+  `full_manifest_hash` through a revalidated authority capability as its sole producer identity;
+  Git/audit metadata and raw identity strings are never substituted.
 - No production path uses `preexec_fn`, a global interpreter FD authority, mutable `current`
   symlinks, checkout imports, pathname fallback, or unintended inherited FDs.
 - Unsupported host facts, failed validation, incomplete durability, ambiguous recovery, and
@@ -133,11 +136,11 @@ trusted by root. A malicious accepted generation is executed only later with UID
 ### Blocking Scope
 
 Production deploy and service-start wiring remain blocked until quarantine copying, complete
-generation verification, single-record recovery, the exact runtime wrapper, `SignalEnvelope` v2
-compatibility migration, and Linux/cloud hard gates are complete. Daily adapter/wrapper work is
-additionally blocked on the path and environment contract tests below. Root-owned installation,
-systemd/sudoers changes, and production deployment remain separately authorized infrastructure
-operations. This ADR does not grant that authority.
+generation verification, single-record recovery, the exact runtime wrapper, signal-family dual
+reading/registry/spool/high-watermark rollout, and Linux/cloud hard gates are complete. Daily
+adapter/wrapper work is additionally blocked on the path, environment, and R01-R12 contract tests
+below. Root-owned installation, systemd/sudoers changes, and production deployment remain
+separately authorized infrastructure operations. This ADR does not grant that authority.
 
 ## Trusted Computing Base
 
@@ -368,53 +371,95 @@ checkout `/home/lighthouse/rquant/.env`. This decision does not authorize instal
 the fixed file; secret rotation remains excluded and separately authorized. Any v1 name,
 presence rule, grammar, or bound change requires a new profile/ADR version.
 
-## SignalEnvelope V2 Producer Identity
+## Signal Envelope Families And Producer Identity
 
-`SignalEnvelope` schema v2 is a migration, not a truncation or fabricated-provenance convention.
-Every v2 envelope contains exactly one active producer identity:
+`WRAP-DESIGN-P1-03` uses two structurally disjoint families. There is no shared-version migration
+model and no parse-then-coerce path between families.
+
+### LegacySignalEnvelope: Permanently Read Only
+
+`LegacySignalEnvelope` is the exact historical root shape. Its `schema_version` is any native
+integer `>= 1`, and `producer_commit` is exactly 40 lowercase hexadecimal characters, including
+the historical all-zero sentinel. `envelope_schema`, `producer_identity`, and
+`producer_generation_id` are absent. The strict legacy parser rejects unknown/mixed fields but
+otherwise preserves the historical schema-version-specific contract.
+
+Legacy parsing preserves the original canonical bytes, legacy `signal_id` algorithm, and stored
+ID exactly. It never rewrites, reserializes, upgrades, normalizes, or invents producer identity.
+The read view adds one nonserialized status: `legacy_commit_claim` for a nonzero commit claim or
+`legacy_zero_sentinel` for the all-zero value. Neither status is authoritative provenance and
+neither can select HYBRID code/runtime identity.
+
+Normal write APIs reject `LegacySignalEnvelope` objects. During the reader-only rollout release,
+already deployed legacy writers may continue using their unchanged old API while new-family write
+APIs remain disabled. Compatibility copying is not a new write: it may reuse only already-durable
+canonical bytes whose store cursor is at or below the frozen legacy high-watermark, with the same
+stored `signal_id` and byte hash. It may not materialize a legacy model into new JSON.
+
+### New Signal Envelope Family
+
+Every new-family root contains exactly:
 
 ```text
-legacy: producer_commit = exactly 40 lowercase hexadecimal characters
-        producer_generation_id = absent
-
-HYBRID: producer_commit = absent
-        producer_generation_id = exactly 64 lowercase hexadecimal characters
-                                 equal to current full_manifest_hash
+envelope_schema = rquant.signal-envelope/v1
+producer_identity = one strict discriminated object
 ```
 
-Both fields present and both fields absent are invalid. The all-zero 40-character commit is also
-invalid in v2 because it fabricates provenance rather than identifying a producer. Serialization
-persists `schema_version = 2` and exactly the active field; the inactive field is omitted, not
-serialized as null, zeroes, a truncation, or an audit commit. The deterministic `signal_id`
-identity payload likewise contains `schema_version = 2` and the active field name/value, so legacy
-and HYBRID identities cannot collide or be silently exchanged.
+The `producer_identity` object is exactly one of:
 
-Existing stored schema-v1 envelopes remain readable only through an explicit compatibility
-adapter. That adapter validates the historical v1 shape, preserves its exact stored commit bytes,
-recomputes `signal_id` with the unchanged historical v1 identity payload, and labels the all-zero
-sentinel as unverified legacy data. It does not promote the sentinel to provenance, synthesize a
-generation ID, or rewrite the row as v2. Every consumer branches on schema version and validates
-v1 and v2 separately. All new writes use v2, including legacy-mode new writes, which must provide
-a real nonzero commit under the v2 legacy branch.
+```json
+{"kind":"git-commit-claim-sha1/v1","producer_commit":"<nonzero 40 lowercase hex>"}
+{"kind":"full-manifest-sha256/v1","producer_generation_id":"<nonzero 64 lowercase hex>"}
+```
 
-The future HYBRID daily adapter and its error/outbox path reopen the fixed current authority and
-use the exact revalidated current `full_manifest_hash` as `producer_generation_id`. They never read
-`RQUANT_CODE_COMMIT`, candidate commit audit metadata, a checkout, or a shortened/zero substitute.
-If exact current identity cannot be obtained, the HYBRID signal write fails closed. The current
-`cli.py::_daily_notification_producer_commit` fallback to 40 zeroes is legacy technical debt to be
-superseded; it is not accepted implementation or evidence for the HYBRID path.
+The new root omits `schema_version`, root `producer_commit`, root `producer_generation_id`, and all
+inactive identity fields. Null is not an absent representation. The Git form remains explicitly a
+claim and does not add source authenticity to the HYBRID threat model.
 
-The v2 migration has these mandatory red-test rows:
+The new `signal_id` hashes the unchanged common identity fields (`strategy_id`,
+`strategy_version`, `parameter_fingerprint`, `dataset_snapshot_id`, `feature_snapshot_id`,
+`event_time`, `available_at`, `candidate_id`, `action`, `reason_codes`, `evidence`, and
+`expires_at`) plus the exact `envelope_schema` and complete canonical `producer_identity` object.
+The identity kind and field name therefore participate in the hash; no inactive/null field does.
 
-| Fixture | Expected result |
+Dispatch is structural and strict:
+
+1. Absent `envelope_schema` dispatches only to strict `LegacySignalEnvelope`; legacy-required
+   fields must be present and every new-family or mixed key is rejected.
+2. Exact `envelope_schema = rquant.signal-envelope/v1` dispatches only to the strict new parser;
+   the legacy root keys and every inactive/null identity field are rejected.
+3. Unknown `envelope_schema`, unknown identity `kind`, both/neither identity values, malformed or
+   all-zero identity values, extra fields, and objects satisfying neither family are rejected.
+
+Normal writers accept only the new family. The HYBRID builder accepts an opaque revalidated
+current-generation capability, never a raw hash/string, environment value, audit commit, or caller
+path. The capability binds the current authority operation, profile, generation, and exact
+`full_manifest_hash`; the persistence boundary rechecks that the authority still names that same
+generation. Missing, stale, or changed authority produces no signal or outbox row. The current
+`cli.py::_daily_notification_producer_commit` zero fallback is forbidden for every new writer and
+is not HYBRID evidence; rows it already durably produced remain readable legacy history.
+
+Canonical envelope JSON is already stored and outbox rows reference `signal_id`, so this family
+split requires no SQLite schema migration. Existing `runtime.signal_route.spool-record` v2 bytes
+and hashes remain byte-for-byte unchanged; spool v3 is emitted only for the new family and hashes
+its exact new canonical envelope bytes.
+
+The architecture-reset R01-R12 red tests are mandatory:
+
+| ID | Frozen red-test evidence |
 |---|---|
-| V2 legacy envelope with one nonzero 40-lowercase-hex commit and no generation ID | Accept and bind that exact field into `signal_id` |
-| V2 HYBRID envelope with no commit and one 64-lowercase-hex current `full_manifest_hash` | Accept and bind that exact field into `signal_id` |
-| Both producer fields, neither field, malformed length/case/hex, or all-zero legacy commit | Reject |
-| Otherwise identical legacy/HYBRID envelopes or two distinct generation hashes | Produce distinct deterministic `signal_id` values |
-| Stored v1 row, including historical all-zero sentinel | Read only through the v1 compatibility branch; preserve bytes and unverified status; never coerce/write as v2 |
-| Any new writer attempts schema v1 or omits the exact v2 identity | Reject before persistence |
-| HYBRID daily success/error fault path persists outbox/evidence | Persist schema v2 and the exact current 64-hex `full_manifest_hash`; Git env, zeroes, truncation, and audit commit mutations have no effect |
+| R01 | Legacy schema versions 1, 2, and 3 with zero and nonzero 40-hex commits read and byte-roundtrip with exact original canonical bytes, legacy `signal_id`, stored ID, and nonserialized status; no serializer/migration runs. |
+| R02 | A legacy row with mismatched stored `signal_id` is rejected; every normal write/canonical-serialize API rejects every `LegacySignalEnvelope`. |
+| R03 | Each valid new identity variant is accepted; malformed length/case/hex, zero value, both/neither identity value, inactive/null field, and extra identity field are rejected. |
+| R04 | Unknown `envelope_schema`/identity kind, mixed legacy/new root keys, and objects satisfying neither family are rejected by the explicit dispatcher. |
+| R05 | Otherwise identical envelopes with Git versus manifest identity, or with distinct active identity values/kinds, have distinct deterministic new `signal_id` values. |
+| R06 | Every direct and nested consumer reads historical rows through the legacy branch and new rows through the new branch; no consumer silently coerces, drops, or fabricates identity. |
+| R07 | Existing spool v2 canonical bytes/hash remain exact for legacy replay; only a new-family envelope can emit spool v3, whose hash covers its exact canonical bytes. |
+| R08 | Reader-only release leaves deployed legacy writers unchanged while new writers are gated; after cutover, normal APIs accept only the new family and no legacy/zero new write succeeds. |
+| R09 | After writer cutover, a CLI failure without a valid new-family authority capability emits typed degraded health and creates no signal/outbox row; it never falls back to 40 zeroes. |
+| R10 | HYBRID daily success and injected-error rows contain the exact capability-bound current `full_manifest_hash`; Git/env/audit/zero mutations do not affect identity. |
+| R11 | High-watermark replay copies only already-durable legacy canonical bytes at or below the frozen cursor with exact stored IDs/hashes; above-boundary or reserialized legacy input is rejected. |
+| R12 | Authority absence or change between capability creation and persistence fails closed with no signal/outbox row; retry requires a newly revalidated capability. |
 
 ## Root Quarantine And Generation Publication
 
@@ -558,7 +603,8 @@ UNTRUSTED_REQUEST
   -> RUNTIME_REVALIDATED
   -> APPLICATION_PATHS_VALIDATED
   -> APPLICATION_ENV_VALIDATED
-  -> PRODUCER_IDENTITY_BOUND(schema=2, full_manifest_hash)
+  -> PRODUCER_IDENTITY_BOUND(envelope_schema=rquant.signal-envelope/v1,
+                             capability=current_generation)
   -> DAILY_ADAPTER_BOUND
   -> RUNNING
 ```
@@ -631,29 +677,36 @@ stores, or changing systemd/sudoers/production configuration requires separate e
 authorization. This PR may prepare code, tests, and an installer candidate but must not install or
 deploy them.
 
-The completed FD-authority cleanup and the existing runtime-authority/quarantine primitives remain
-prerequisites with their own tests; they are not wrapper evidence and are not renumbered into the
-remaining WRAP dependency chain. Remaining work proceeds only in this order:
+The completed FD-authority cleanup and existing runtime-authority/quarantine primitives remain
+prerequisites with their own tests; they are not wrapper evidence. `WRAP-DESIGN-P1-04` retains its
+four macro dependencies: (1) role/path/environment and signal-reader contracts, (2) executable/
+zipapp/profile/installer planning, (3) runtime/deploy entries and the daily adapter, then (4)
+Linux/root/cloud gates. The structural signal rollout below is an additional monotonic activation
+gate, not a replacement order: contract implementation precedes artifact planning, artifacts
+precede runtime/adapter code, new runtime entries remain inert until their rollout stage permits
+them, and cloud gates remain last.
 
-1. **Role/environment/identity contracts.** First add red tests, then implement the exact `daily`
-   role mapping, profile application roots and name-to-grammar schema, path/list/aggregate-budget
-   validators, `SignalEnvelope` v2 exclusive identity, v1 read-only compatibility adapter, and
-   explicit dual-version consumer branching. No wrapper, adapter, or deploy entry is added here.
-2. **Executable contract and artifact planning.** After batch 1 is green, freeze the bootstrap and
-   runtime entry contracts and prepare root-owned zipapp/profile schemas, reproducible artifact
-   candidates and hashes, closure preflight, and an installer candidate/plan. This batch performs
-   no installation and no production or systemd change.
-3. **Runtime/deploy entries and daily adapter.** Only after batches 1-2 are green, implement the
-   fixed runtime/deploy entry code, child revalidation/bootstrap, exact generation/cwd/import/env
-   isolation, and generation-local zero-caller-argument `production_daily_main`. Its normal and
-   fault/outbox writes must persist the exact current generation hash under schema v2. Existing
-   `runtime_service_main` and formal-runtime paths remain untouched and are not acceptance evidence.
-4. **Linux/root/cloud gates.** After batch 3 is green locally, add the real Linux Python 3.11/root
-   integration gates with zero skip. Separately authorized infrastructure installation and cloud
-   acceptance follow only after those gates; production wiring remains blocked until they pass.
+The `WRAP-DESIGN-P1-03` rollout is non-skippable and strictly ordered:
 
-No later batch may supply a temporary Git/zero identity, generic path grammar, permissive
-environment parser, or legacy entrypoint to compensate for an unfinished earlier contract.
+1. Add the dual family dispatcher/reader and R01-R06 red tests, then update every direct and nested
+   consumer. Release reader support only; deployed writers remain legacy and the new writer API is
+   disabled.
+2. Add registry declarations and explicit consumer acknowledgement for exactly
+   `runtime.strategy_signal.envelope`, `runtime.signal_route.spool-record`, and
+   `runtime.serving.signals`. No writer cutover proceeds while any declared consumer lacks new-family
+   acknowledgement.
+3. Preserve every existing spool v2 byte/hash path and add spool v3 emission only for the new
+   family. R07 must prove both branches before any high-watermark is frozen.
+4. Quiesce legacy writers, freeze each registered store's inclusive maximum durable legacy cursor
+   as its immutable high-watermark, drain/replay only exact bytes at or below it, and prove R08/R11.
+   No legacy append is permitted after the watermark.
+5. Cut over the strategy runner, daily summary, and daily error writer paths to new-family-only
+   APIs; remove zero-producing new writes. HYBRID output remains disabled in this step.
+6. Enable HYBRID daily success/error writers only after all registered readers acknowledge the new
+   family. R09/R10/R12 and the exact authority-capability checks must be green first.
+
+No later phase may supply a temporary Git/zero identity, reserialize legacy bytes, broaden the
+dispatcher, or use a legacy entrypoint to compensate for an unfinished earlier gate.
 
 ## macOS And Cloud Acceptance
 
@@ -662,10 +715,11 @@ rename/fsync models, record recovery, environment stripping, and fail-closed beh
 freeze the explicit current UID and never claim root-owned production success. Linux-only loader,
 systemd, root ownership, and `/usr/bin/python3.11` evidence remain gaps, not passes.
 
-Local WRAP acceptance follows the batch order above: every application-path and scalar/list row,
-then every `SignalEnvelope` v2/compatibility row, must be red before implementation and green before
-artifact/runtime entry work begins. Runtime-entry tests must then prove the exact daily behavior and
-fault identity. Legacy CLI/formal-runtime execution cannot satisfy any of those gates.
+Local WRAP acceptance follows the macro and rollout order above: every application-path and
+scalar/list row, then R01-R12 in the structural signal-family order, must be red before
+implementation and green at its stated rollout gate. Runtime-entry tests must then prove the exact
+daily behavior and capability-bound fault identity. Legacy CLI/formal-runtime execution cannot
+satisfy any gate.
 
 The separately authorized cloud acceptance is a hard gate and must record exact commands/results:
 
@@ -701,12 +755,16 @@ The separately authorized cloud acceptance is a hard gate and must record exact 
    record, launch the recorded exact generation, retain evidence, and never fall back to checkout.
 9. The literal `daily` role selects only generation-local `rquant.production_daily_main`; the
    child sees zero caller arguments and the fixed run-daily behavior. Success and injected-error
-   paths persist schema-v2 signal/outbox/evidence bytes containing the exact current 64-hex
-   `full_manifest_hash`, and `signal_id` changes with that identity. Invalid argv, extra or malformed
-   environment values, dotenv/checkout/Git influence, zero or truncated identity, role/module
-   substitution, and use of commit audit metadata as authority are rejected. Stored v1 remains
-   readable only through the explicit compatibility branch; new v1 writes fail.
+   paths persist `rquant.signal-envelope/v1` bytes whose
+   `full-manifest-sha256/v1.producer_generation_id` is the exact capability-bound current 64-hex
+   `full_manifest_hash`, and `signal_id` changes with that complete identity object. Invalid argv,
+   extra or malformed environment values, dotenv/checkout/Git influence, zero/truncated/raw-string
+   identity, role/module substitution, authority change, and commit audit metadata are rejected
+   without a signal/outbox row. All legacy schema versions remain read-only byte-preserved history.
    `runtime_service_main` and formal-runtime execution do not count as this gate.
+10. Registry acknowledgements cover exactly the three declared contracts. Spool v2 bytes/hashes,
+    spool v3 new-family-only emission, frozen per-store high-watermarks, exact legacy replay/drain,
+    new-writer gates, and absence of any SQLite schema migration match R01-R12.
 
 ## Closure Ledger
 
@@ -722,8 +780,8 @@ Stable IDs are not renamed or reclassified.
 | C-P1-09 | CLOSED | Fixed systemd pyz and generation venv `-I -S -c` bootstrap with manifest-bound paths, `runpy`, and site escape rejection |
 | C-P2-01 | CLOSED | Hard gates test malicious metadata without provenance claims plus `.pth`, system-site, customization, namespace, crash, backup, and rollback boundaries |
 | C-P2-02 | CLOSED | Versioned profile and cloud gate compare the exact canonical Python/ELF/stdlib/shared-library/ancestor closure and pyz hashes without runtime relaxation |
-| WRAP-P1-07 | CLOSED by amended design; implementation gated | Generation-local zero-argument daily adapter, exact role-to-module/environment policy, fixed EnvironmentFile boundary, child authority revalidation, and generation-hash producer identity; implementation follows the four ordered WRAP batches |
+| WRAP-P1-07 | CLOSED by amended design; implementation gated | Generation-local zero-argument daily adapter, exact role-to-module/environment policy, fixed EnvironmentFile boundary, child authority revalidation, and capability-bound generation identity; implementation follows the four macro phases and six-step signal rollout |
 | WRAP-DESIGN-P1-01 | CLOSED by final design amendment; implementation required | Exact profile data/log roots and variable mappings, anchored path/type/identity checks, trusted-root separation, mutable-data TCB exclusion, and complete path red-test matrix |
 | WRAP-DESIGN-P1-02 | CLOSED by final design amendment; implementation required | Canonical required/optional scalar rules, exact CSV/recipient/endpoint grammars, pairing constraints, 65536-byte emitted-environment budget, and boundary-plus-one red tests |
-| WRAP-DESIGN-P1-03 | CLOSED by final design amendment; implementation required | Schema-v2 exclusive nonzero-commit/current-generation identity, identity-bound `signal_id`, explicit v1 read compatibility, new-write prohibition, and exact fault/outbox hash gate |
-| WRAP-DESIGN-P1-04 | CLOSED by final design amendment; implementation required | Contract and v2 migration first, artifact/profile/installer planning second, runtime/deploy/adapter third, and Linux/root/cloud gates last, with no legacy substitute evidence |
+| WRAP-DESIGN-P1-03 | CLOSED by structural baseline; implementation required | Permanently read-only byte-preserved `LegacySignalEnvelope`, structurally discriminated new family, capability-only HYBRID identity, R01-R12, registry/spool/high-watermark rollout, and no SQLite migration |
+| WRAP-DESIGN-P1-04 | CLOSED by final design amendment; implementation required | Role/path/environment and signal-family contracts first, artifact/profile/installer planning second, inert runtime/deploy/adapter code third, rollout-gated activation thereafter, and Linux/root/cloud gates last |
