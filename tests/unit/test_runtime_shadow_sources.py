@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -43,10 +44,6 @@ from rquant.signal_router_runtime import (
     SourceSnapshot,
 )
 from rquant.strategy_runner import RunnerSignalRecord
-from tests.unit.test_signal_contracts import (
-    _CURRENT_CANONICAL_FIXTURES,
-    _LEGACY_CANONICAL_FIXTURES,
-)
 
 TRADE_DATE = date(2026, 7, 31)
 COMMIT = "a" * 40
@@ -711,6 +708,8 @@ class _RunnerSource:
         *,
         mutate_snapshot_after_first_read: bool = False,
         complete_through: datetime | None = None,
+        receipt_mutator: Callable[[ShadowSourceCompletionReceipt], ShadowSourceCompletionReceipt]
+        | None = None,
     ) -> None:
         self.records = tuple(
             RunnerSignalRecord(sequence=index, signal=signal)
@@ -718,6 +717,7 @@ class _RunnerSource:
         )
         self.mutate_snapshot_after_first_read = mutate_snapshot_after_first_read
         self.complete_through = complete_through
+        self.receipt_mutator = receipt_mutator
         self.read_count = 0
 
     def _descriptor(self, *, generation: str = "e" * 64) -> RouteSourceDescriptor:
@@ -752,7 +752,7 @@ class _RunnerSource:
 
     def read_completion_receipt(self, *, trade_date: date) -> ShadowSourceCompletionReceipt:
         assert trade_date == TRADE_DATE
-        return _completion_receipt(
+        receipt = _completion_receipt(
             source="isolated",
             source_id="n-shape-v1",
             input_identity=runner_source_raw_input_id(self._descriptor(), self.records),
@@ -760,6 +760,7 @@ class _RunnerSource:
             producer_version="test-runner-v1",
             high_watermark=len(self.records),
         )
+        return receipt if self.receipt_mutator is None else self.receipt_mutator(receipt)
 
 
 def test_runner_reader_freezes_and_pages_one_complete_source_snapshot() -> None:
@@ -785,43 +786,93 @@ _RUNNER_SIGNAL_FAMILIES = (
     (
         "legacy-v1",
         SignalEnvelope,
-        _LEGACY_CANONICAL_FIXTURES[0][3],
+        "682b6153d85a87d1921ceca39186ddee9767f43821abcd753eab2a64f6c294c5",
+        b'{"action":"b_intent","available_at":"2026-07-31T01:33:03Z",'
+        b'"candidate_id":"600001.SH","dataset_snapshot_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",'
+        b'"event_time":"2026-07-31T01:33:00Z","evidence":{"visible_minute":"09:33"},'
+        b'"expires_at":"2026-07-31T01:38:00Z","feature_snapshot_id":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",'
+        b'"parameter_fingerprint":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",'
+        b'"producer_commit":"1111111111111111111111111111111111111111","reason_codes":["entry"],'
+        b'"schema_version":1,"signal_id":"682b6153d85a87d1921ceca39186ddee9767f43821abcd753eab2a64f6c294c5",'
+        b'"strategy_id":"n_shape","strategy_version":"1"}',
+        "1" * 40,
     ),
     (
         "legacy-v2",
         SignalEnvelope,
-        _LEGACY_CANONICAL_FIXTURES[2][3],
+        "f8ac83cf17ed942da787fa3ff01e6577ce766bc0f5f6f75ac5ce4f4d3d32e8c8",
+        b'{"action":"b_intent","available_at":"2026-07-31T01:33:03Z",'
+        b'"candidate_id":"600001.SH","dataset_snapshot_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",'
+        b'"event_time":"2026-07-31T01:33:00Z","evidence":{"visible_minute":"09:33"},'
+        b'"expires_at":"2026-07-31T01:38:00Z","feature_snapshot_id":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",'
+        b'"parameter_fingerprint":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",'
+        b'"producer_commit":"2222222222222222222222222222222222222222","reason_codes":["entry"],'
+        b'"schema_version":2,"signal_id":"f8ac83cf17ed942da787fa3ff01e6577ce766bc0f5f6f75ac5ce4f4d3d32e8c8",'
+        b'"strategy_id":"n_shape","strategy_version":"1"}',
+        "2" * 40,
     ),
     (
         "legacy-v3",
         SignalEnvelope,
-        _LEGACY_CANONICAL_FIXTURES[4][3],
+        "4b433d79ec1b3295fe7a28a33265857db2dff55a340e8d778490f9d86af51b46",
+        b'{"action":"b_intent","available_at":"2026-07-31T01:33:03Z",'
+        b'"candidate_id":"600001.SH","dataset_snapshot_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",'
+        b'"event_time":"2026-07-31T01:33:00Z","evidence":{"visible_minute":"09:33"},'
+        b'"expires_at":"2026-07-31T01:38:00Z","feature_snapshot_id":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",'
+        b'"parameter_fingerprint":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",'
+        b'"producer_commit":"3333333333333333333333333333333333333333","reason_codes":["entry"],'
+        b'"schema_version":3,"signal_id":"4b433d79ec1b3295fe7a28a33265857db2dff55a340e8d778490f9d86af51b46",'
+        b'"strategy_id":"n_shape","strategy_version":"1"}',
+        "3" * 40,
     ),
     (
         "current-git-claim",
         CurrentSignalEnvelope,
-        _CURRENT_CANONICAL_FIXTURES[0][2],
+        "02e7e1cf95457f61dca6af8c8ac0a801444cbb863830d8b82c3560ad8596c8a7",
+        b'{"action":"b_intent","available_at":"2026-07-31T01:33:03Z",'
+        b'"candidate_id":"600001.SH","dataset_snapshot_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",'
+        b'"envelope_schema":"rquant.signal-envelope/v1","event_time":"2026-07-31T01:33:00Z",'
+        b'"evidence":{"visible_minute":"09:33"},"expires_at":"2026-07-31T01:38:00Z",'
+        b'"feature_snapshot_id":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",'
+        b'"parameter_fingerprint":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",'
+        b'"producer_identity":{"kind":"git-commit-claim-sha1/v1","producer_commit":"4444444444444444444444444444444444444444"},'
+        b'"reason_codes":["entry"],"signal_id":"02e7e1cf95457f61dca6af8c8ac0a801444cbb863830d8b82c3560ad8596c8a7",'
+        b'"strategy_id":"n_shape","strategy_version":"1"}',
+        "4" * 40,
     ),
     (
         "current-full-manifest",
         CurrentSignalEnvelope,
-        _CURRENT_CANONICAL_FIXTURES[1][2],
+        "298831dda115021bba050aad016c1c810a98a09e88883c294b22a2785a6352d9",
+        b'{"action":"b_intent","available_at":"2026-07-31T01:33:03Z",'
+        b'"candidate_id":"600001.SH","dataset_snapshot_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",'
+        b'"envelope_schema":"rquant.signal-envelope/v1","event_time":"2026-07-31T01:33:00Z",'
+        b'"evidence":{"visible_minute":"09:33"},"expires_at":"2026-07-31T01:38:00Z",'
+        b'"feature_snapshot_id":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",'
+        b'"parameter_fingerprint":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",'
+        b'"producer_identity":{"kind":"full-manifest-sha256/v1","producer_generation_id":"5555555555555555555555555555555555555555555555555555555555555555"},'
+        b'"reason_codes":["entry"],"signal_id":"298831dda115021bba050aad016c1c810a98a09e88883c294b22a2785a6352d9",'
+        b'"strategy_id":"n_shape","strategy_version":"1"}',
+        COMMIT,
     ),
 )
 
 
 @pytest.mark.parametrize(
-    ("_name", "expected_type", "literal"),
+    ("_name", "expected_type", "expected_id", "literal", "expected_code_commit"),
     _RUNNER_SIGNAL_FAMILIES,
     ids=[item[0] for item in _RUNNER_SIGNAL_FAMILIES],
 )
 def test_runner_shadow_reader_accepts_every_verified_signal_family(
     _name: str,
     expected_type: type[SignalEnvelopeFamily],
+    expected_id: str,
     literal: bytes,
+    expected_code_commit: str,
 ) -> None:
     signal = parse_signal_envelope(literal)
     assert type(signal) is expected_type
+    assert signal.signal_id == expected_id
 
     snapshot = read_isolated_runner_shadow_snapshot(
         _RunnerSource((signal,)),
@@ -832,7 +883,56 @@ def test_runner_shadow_reader_accepts_every_verified_signal_family(
         attestation_verifier=ATTESTATION_AUTHORITY,
     )
 
-    assert len(snapshot.raw_input_id) == 64
+    assert len(snapshot.observations) == 1
+    observation = snapshot.observations[0]
+    assert observation.upstream_event_id == expected_id
+    assert observation.evidence_id == expected_id
+    assert observation.producer_commit == expected_code_commit
+    if _name == "current-full-manifest":
+        attestation = snapshot.completion_receipt.completion_attestation
+        assert attestation is not None
+        assert observation.producer_commit == attestation.claims.producer_commit
+
+
+def _changed_runner_receipt(
+    receipt: ShadowSourceCompletionReceipt,
+) -> ShadowSourceCompletionReceipt:
+    return receipt.model_copy(update={"producer_commit": "9" * 40})
+
+
+def _untrusted_runner_receipt(
+    receipt: ShadowSourceCompletionReceipt,
+) -> ShadowSourceCompletionReceipt:
+    payload = receipt.model_dump(mode="python", exclude={"receipt_id"})
+    attestation = payload["completion_attestation"]
+    assert isinstance(attestation, dict)
+    attestation["attestation_id"] = None
+    attestation["signature"] = "0" * 64
+    return ShadowSourceCompletionReceipt.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "receipt_mutator",
+    (_changed_runner_receipt, _untrusted_runner_receipt),
+    ids=("changed", "untrusted"),
+)
+def test_runner_shadow_reader_rejects_changed_or_untrusted_receipt_before_read(
+    receipt_mutator: Callable[[ShadowSourceCompletionReceipt], ShadowSourceCompletionReceipt],
+) -> None:
+    signal = parse_signal_envelope(_RUNNER_SIGNAL_FAMILIES[-1][3])
+    source = _RunnerSource((signal,), receipt_mutator=receipt_mutator)
+
+    with pytest.raises(ValueError, match="attestation|receipt"):
+        read_isolated_runner_shadow_snapshot(
+            source,
+            trade_date=TRADE_DATE,
+            observed_at=EXPORTED_AT,
+            binding=_binding(),
+            expected_calendar_authority_id=SOURCE_CALENDAR_AUTHORITY_ID,
+            attestation_verifier=ATTESTATION_AUTHORITY,
+        )
+
+    assert source.read_count == 0
 
 
 def test_runner_snapshot_binds_frozen_descriptor_and_cutoff() -> None:
