@@ -706,17 +706,40 @@ bytes, exact parser module and qualname, parsed-model digest, and allowed form (
 model; constructor coercion, alternate parser, legacy fallback, or bytes/object substitution
 blocks.
 
+`CallShapeV1` contains the exact receiver fixture ID or null, positional fixture IDs, sorted
+keyword-to-fixture bindings, and `call_result_action`. The latter is the exact enum `none` or
+`consume_tuple`. `none` invokes the entrypoint once and performs no result iteration.
+`consume_tuple` invokes once, requires an iterator result, then evaluates `tuple(result)` exactly
+once. Lazy evidence records sentinel counts after invocation and after consumption, consumption
+start, yielded count before rejection, and exception phase. A lazy probe passes only when invocation
+has not reached its boundary, consumption starts, and the expected rejection plus single sentinel
+occurs during consumption; returning an unconsumed iterator, consuming twice, or rejecting during
+setup/invocation blocks.
+
 `ProbeSetupV1` contains `setup_id`, an exact ordered tuple of `ProbeSetupStepV1`, and setup-result
-digest. Each step contains `kind`, exact target symbol/row key, and source fixture IDs; `kind` is
-`constructor_replacement`, `preloaded_store_row`, or `composite_batch`. An empty tuple means no
-setup. A constructor replacement may replace only the policy-named constructor and
-must return the parsed `CurrentFixtureV1` value without raising. A preloaded row writes exact
+digest. Each step contains `kind`, exact target receiver/symbol/row/method identity, source fixture
+IDs, and expected invocation binding. `kind` is `receiver`, `constructor_replacement`,
+`preloaded_store_row`, `composite_batch`, or `source_result`. `receiver` constructs the named object
+with policy-listed arguments and isolated temporary paths. `source_result` binds a named method on
+that receiver, verifies its exact args/kwargs when called, and returns the named typed fixture; this
+is the only permitted indirect input mechanism, including `source.read_batch(...)`,
+`bus.routed_signals_after_global_sequence(...)`, and `store.serving_snapshot(...)`. A constructor
+replacement may replace only the policy-named global and must either expose its exact identity to an
+identity fence or return the parsed `CurrentFixtureV1` without raising. A preloaded row writes exact
 current-family bytes under the policy-named test key. A composite batch resolves one ordered
-tuple/list fixture and marks its current-member IDs. Setup runs only against a fresh isolated
-temporary store/filesystem, completes before the before-snapshot, and is included in that snapshot;
-it cannot touch production state or satisfy the expected rejection itself. Installed replacements
-remain fixed through the call and after-snapshot, then are torn down outside the measured interval;
-setup and teardown cannot emit a boundary or mutation sentinel.
+tuple/list fixture and marks its current-member IDs.
+
+Setup runs only against a fresh isolated temporary store/filesystem, completes before the
+before-snapshot, and is included in that snapshot; it cannot touch production state or satisfy the
+expected rejection itself. Installed receivers/replacements remain fixed through the call and
+after-snapshot, then are torn down outside the measured interval. Setup and teardown cannot emit a
+boundary or mutation sentinel.
+
+`ConstructorIdentityFenceSentinelV1` contains `sentinel_id`, `inventory_id`, exact replaced global,
+expected replacement identity, observed identity, and `reached_count`. It passes only when the
+production identity comparison observes that exact replacement object once and rejects before
+invoking it. It proves only that the constructor-identity fence was reached; it MUST NOT claim that
+a current-family object was constructed, parsed, or received by the boundary.
 
 `BoundaryReachedSentinelV1` contains the policy-named `sentinel_id`, `inventory_id`, exact source
 span/AST digest, `reached_count`, and `mutation_reached_count`. Its in-memory hook sits after the
@@ -726,39 +749,45 @@ the first write transaction, mutation-capable open, or durable mutation. A passi
 missing sentinel, duplicate reach, or any mutation-side sentinel blocks.
 
 `BoundaryProbeV1` contains `probe_id`, `inventory_id`, `variant`, `setup_id`, `entrypoint`, exact
-positional fixture IDs, exact keyword-to-fixture bindings, current-member fixture IDs, expected
-exception type/category, sentinel ID, mutation-guard expectation, and before/after snapshot
-digests. Args and kwargs are exact: no defaults, inherited environment, variadics, substitute
-receiver, or alternate public entrypoint is permitted. The frozen matrix is:
+positional fixture IDs, exact keyword-to-fixture bindings, current-member fixture IDs, exact
+`CallShapeV1`, expected exception type/category, `expected_exception_phase` (exactly `invocation` or
+`consumption`), sentinel ID/kind, mutation-guard
+expectation, and before/after snapshot digests. Variants are exactly `constructor_identity`,
+`constructed_current`, `direct_current`, `stored_byte_current`, `batch_current`,
+`source_result_current`, and `static_only`. Args and kwargs are exact: no defaults, inherited
+environment, variadics, substitute receiver, or alternate public entrypoint is permitted. The
+following matrix was checked line-by-line against the named source definitions; source lines are
+review anchors and policy AST/source digests remain the machine authority:
 
-| Inventory | Variant | Setup | Call |
-|---|---|---|---|
-| `R07-B01` | `direct_current` | constructor replacement | `StrategyRunnerStore.process_batch` normal input; replacement returns exact current model |
-| `R07-B02` | `direct_current` | constructor replacement | `DailySummaryStage.build_signal` normal input |
-| `R07-B03` | `batch_current` | constructor replacement plus composite batch | `DailySummaryStage._error_signals` normal error batch |
-| `R07-B04` | `direct_current` | constructor replacement | `build_daily_error_signal` normal error input |
-| `R07-B05` | `direct_current` | none | `DailyNotificationProducer.emit(current_object)` |
-| `R07-B06` | `direct_current` | none | `SignalBusStore.ingest(current_object)` |
-| `R07-B07` | `stored_byte_current` | preloaded store row | `SignalBusStore.route(signal_id)` |
-| `R07-B08` | `direct_current` | none | `SignalBusStore.commit_source_route(current_object, ...)` |
-| `R07-B09` | `batch_current` | composite batch | `route_runner_signals(batch)` |
-| `R07-B10` | `batch_current` | composite batch | `SignalRouteSpool.publish(batch)` |
-| `R07-B11` | `stored_byte_current` | preloaded store row | `publish_signal_bus_prefix(store, ...)` |
-| `R07-B12` | `batch_current` | composite batch | `NotificationStateStore.replicate(batch)` |
-| `R07-B13` | `direct_current` | none | `PaperSignalQueueStore.ingest(current_object)` |
-| `R07-B14` | `stored_byte_current` | preloaded store row | `PaperSignalQueueStore.ingest(stored_bytes)` |
-| `R07-B15` | `direct_current` | none | `SignalDeliveryPayload(current_object, ...)` |
-| `R07-B16` | `direct_current` | none | `_publish_signal_authority(current_payload, ...)` |
-| `R07-B17` | `direct_current` | none | `ServingSourceAuthorityPublisher.publish(current_payload)` |
-| `R07-B18` | `static_only` | root snapshot | `runtime_service_main.build_builtin_registry`; no behavior call |
-| `R07-B19` | `static_only` | ten-root snapshot | builtin registry and all eight signal-path builders; no behavior call |
+| ID | Source entrypoint and signature | Setup and actual input source | Exact call / result action | Sentinel |
+|---|---|---|---|---|
+| `R07-B01` | `strategy_runner.py:1769` `StrategyRunnerStore.process_batch(envelope, frame, *, feature_payload, source_receipt, dataset_snapshot_id, observed_at, evaluator)` | isolated store receiver; replace module global `SignalEnvelope` with exact policy identity only | `receiver.process_batch(envelope, frame, feature_payload=None, source_receipt=None, dataset_snapshot_id=..., observed_at=..., evaluator=...)`; `none` | `constructor_identity_fence`, once; no current object claim |
+| `R07-B02` | `daily_summary_stage.py:130` `DailySummaryStage.build_signal(*, trade_date, canonical_generation_id, canonical_receipt_id, canonical_content_hash, screen_hits, pool2_active_count, errors, event_time)` | stage receiver; constructor replacement returns exact parsed current fixture | `receiver.build_signal(trade_date=..., canonical_generation_id=..., canonical_receipt_id=..., canonical_content_hash=..., screen_hits=..., pool2_active_count=..., errors=..., event_time=...)`; `none` | current boundary at `require_legacy_signal_write`, once |
+| `R07-B03` | `daily_summary_stage.py:264` `DailySummaryStage._error_signals(canonical, errors, now)` | stage receiver; constructor replacement returns exact current fixture for first sorted error | `receiver._error_signals(canonical, errors, now)`, then `consume_tuple`; `yielded_count=0` and exception phase is consumption | current boundary occurs once during consumption, never during invocation |
+| `R07-B04` | `daily_notification_producer.py:41` `build_daily_error_signal(*, component, error, trade_date, observed_at, producer_commit, ttl)` | constructor replacement returns exact parsed current fixture | `build_daily_error_signal(component=..., error=..., trade_date=..., observed_at=..., producer_commit=..., ttl=...)`; `none` | current boundary at `require_legacy_signal_write`, once |
+| `R07-B05` | `daily_notification_producer.py:113` `DailyNotificationProducer.emit(signal, *, received_at)` | producer receiver plus exact current object fixture | `receiver.emit(current, received_at=...)`; `none` | current boundary before bus ingest, once |
+| `R07-B06` | `signal_bus.py:594` `SignalBusStore.ingest(signal, *, received_at=None)` | isolated bus receiver plus exact current object fixture | `receiver.ingest(current, received_at=...)`; `none` | current boundary before `_write_transaction`, once |
+| `R07-B07` | `signal_bus.py:974` `SignalBusStore.route(signal_id, targets, *, now)` | isolated bus receiver with exact current bytes preloaded under `signal_id` during setup and present in the before-snapshot | `receiver.route(signal_id, targets, now=...)`; `none` | stored-current boundary in `_preflight_stored_legacy_signal`, once |
+| `R07-B08` | `signal_bus.py:1278` `SignalBusStore.commit_source_route(*, descriptor, routing_policy_fingerprint, source_sequence, signal, decision_kind, decision_fingerprint, reason_code, targets, routed_at)` | isolated bus receiver plus exact current object fixture | `receiver.commit_source_route(descriptor=..., routing_policy_fingerprint=..., source_sequence=..., signal=current, decision_kind=..., decision_fingerprint=..., reason_code=..., targets=..., routed_at=...)`; `none` | current boundary before request construction/write transaction, once |
+| `R07-B09` | `signal_router_runtime.py:1207` `route_runner_signals(*, source_id, source, bus, cursors, routed_at, target_resolver, limit)` | isolated source/bus/cursor receivers; `source_result` binds `source.read_batch(after_sequence=..., limit=...)` to exact `RunnerSignalBatch` containing `CurrentRunnerSignalRecord` | `route_runner_signals(source_id=..., source=source, bus=bus, cursors=cursors, routed_at=..., target_resolver=..., limit=...)`; `none` | current boundary in batch-record preflight, once |
+| `R07-B10` | `signal_route_spool.py:828` `SignalRouteSpool.publish(*, source, records)` | isolated spool receiver plus exact composite tuple of `CurrentSignalBusRoutedRecord` values | `receiver.publish(source=descriptor, records=batch)`; `none` | exact current routed-record boundary before root open, once |
+| `R07-B11` | `signal_route_spool.py:1084` `publish_signal_bus_prefix(*, bus, spool, limit)` | isolated bus/spool receivers; `source_result` binds `bus.routed_signals_after_global_sequence(after_sequence=..., through_sequence=..., limit=...)` to an exact `CurrentSignalBusRoutedRecord` tuple while real `source_descriptor()` supplies matching bounds | `publish_signal_bus_prefix(bus=bus, spool=spool, limit=...)`; `none` | current spool-input boundary before either `spool.publish`, once |
+| `R07-B12` | `notification_state.py:567` `NotificationStateStore.replicate(source, records, *, observed_at)` | isolated notification receiver plus exact composite tuple of `SignalBusRoutedRecord` values whose `signal` is current-family | `receiver.replicate(descriptor, batch, observed_at=...)`; `none` | current signal boundary before `_write_transaction`, once |
+| `R07-B13` | `paper_signal_worker.py:526` `PaperSignalQueueStore.ingest(signal, *, received_at, payload_json=None, payload_hash=None, payload_size=None)` | isolated paper receiver plus exact current object; payload metadata all null | `receiver.ingest(current, received_at=...)`; `none` | current boundary before direct parsing/SQLite connect, once |
+| `R07-B14` | same `PaperSignalQueueStore.ingest` | isolated paper receiver plus exact current object and its exact stored JSON/hash/size fixtures; no preloaded row | `receiver.ingest(current, received_at=..., payload_json=..., payload_hash=..., payload_size=...)`; `none` | current boundary before stored parsing/SQLite connect, once |
+| `R07-B15` | `runtime_serving_snapshot.py:56` `SignalDeliveryPayload(*, signals, routes=(), deliveries=(), projections=())` | composite tuple of `ServingSignalRecord` values containing exact current signals | `SignalDeliveryPayload(signals=batch, routes=(), deliveries=(), projections=())`; `none` | current boundary in `enforce_legacy_signal_writer`, once |
+| `R07-B16` | `runtime_builder_signal.py:453` `_publish_signal_authority(*, store, publisher, reader, previous_reader, observed_at, history_limit)` | isolated store/publisher/reader receivers; `source_result` binds `store.serving_snapshot(observed_at=..., history_limit=...)` to exact `NotificationServingSnapshot` whose read payload contains a current signal; reader and publisher have zero-call guards, and `previous_reader` is null | `_publish_signal_authority(store=store, publisher=publisher, reader=reader, previous_reader=None, observed_at=..., history_limit=...)`; `none` | current boundary while `_signal_source_result` builds `SignalDeliveryPayload`, once; reader and publisher both remain uncalled |
+| `R07-B17` | `runtime_serving_authority.py:129` `ServingSourceAuthorityPublisher.publish(result)` | isolated publisher receiver plus exact `SourceReadResult` with `SignalDeliveryReadPayload` containing current signal | `receiver.publish(current_source_result)`; `none` | current boundary in `_validate_result_owner` before document/root open, once |
+| `R07-B18` | `runtime_service_main.py:123` `build_builtin_registry(*, runtime_capabilities, artifact_retention_schema_resolver=None, artifact_terminal_lifecycle_factory=None, completion_attestation_signer=None, completion_attestation_active_key_id=None)` | exact static root source/export/signature snapshot | static parse only; `none` | static-snapshot sentinel, once |
+| `R07-B19` | `runtime_service_builtin.py:1125` `build_builtin_registry(...)` plus `strategy_live_builder`, `signal_router_builder`, `notifier_builder`, `shadow_session_builder`, `paper_consumer_builder`, `paper_broker_builder`, `serving_publisher_builder`, and `daily_pipeline_orchestrator_builder` | exact builtin-plus-eight-builder source/export/signature snapshots; together with B18 this is the ten-root set | static parse only; `none` | static-snapshot sentinel, once |
 
 For `R07-B01` through `R07-B17`, setup completes first, then the harness captures every declared
 database, filesystem record/pointer, outbox, and guard surface, invokes the exact call, and captures
-again. Success requires the expected rejection, exact sentinel reach, no write/open guard firing,
-and byte-equal snapshots. `R07-B18` and `R07-B19` pass only the static gate below. Every setup,
-variant, call binding, and sentinel is policy-listed; changing the matrix requires a reviewed policy
-diff.
+again. Every row, including the two static rows, reaches its declared sentinel exactly once; every
+mutation/open/write guard remains zero and every before/after durable snapshot is byte-equal.
+`R07-B18` and `R07-B19` use the static gate below and cannot invoke runtime builders. Every setup,
+variant, call binding, result action, source-result binding, and sentinel is policy-listed; changing
+the matrix requires a reviewed policy diff.
 
 ##### Static Registry And Forbidden-Definition Gate
 
@@ -889,6 +918,10 @@ identity findings are not P1 under this threat model: they defend an excluded ma
 or supply-chain substitution case. They are deliberately removed, not silently omitted. The
 remaining relevant closures are:
 
+This is the second and final local specification revision for `R07-DR-SPEC-P1-01`. Further
+non-convergence requires an architecture reset rather than another local probe exception.
+`R07-DR-SPEC-P1-02`, the threat model, and the trusted CI/deployment channel are unchanged.
+
 | Finding | Status under `R07-DR-GATE-V1` | Closure |
 |---|---|---|
 | `R07-RR-SPEC-P1-01` | superseded | Git baseline ancestry/tree is trusted repository evidence; no historical external deployment attestation is required. |
@@ -897,18 +930,20 @@ remaining relevant closures are:
 | `R07-RR-SPEC-P1-04` | closed by gate | ten root snapshots and the separate forbidden-definition universe are static and complete. |
 | `R07-RR-SPEC-P1-05` | superseded | signatures, external URIs, principals, and artifact attestation are outside the trusted-CI boundary. |
 | `R07-CQ-P1-02` | replacement pending implementation | delete the generic reachability helper; only the diff, behavior, and static gates may pass, then the original reviewer confirms the replacement. |
-| `R07-DR-SPEC-P1-01` | closed by this specification | typed current fixtures, controlled setup, post-setup snapshots, exact boundary sentinel, and the `R07-B01..B19` matrix prevent a setup or early parser failure from masquerading as boundary rejection. |
-| `R07-DR-SPEC-P1-02` | closed by this specification | strict post-merge `push main` evidence, fixed artifact/cache channel, and Release A/B bootstrap make the tested candidate pair mandatory before checkout. |
+| `R07-DR-SPEC-P1-01` | closed by final local specification | constructor-identity fence, exact call-result consumption, controlled receiver/source-result setup, post-setup snapshots, per-row sentinels, and the source-checked `R07-B01..B19` matrix prevent identity-only, lazy, indirect-input, setup, or early parser evidence from masquerading as boundary rejection. |
+| `R07-DR-SPEC-P1-02` | closed by prior specification; unchanged | strict post-merge `push main` evidence, fixed artifact/cache channel, and Release A/B bootstrap make the tested candidate pair mandatory before checkout. |
 
 Red tests must cover an unlisted repo diff; changed mode/rename; changed declaration AST; every
 inventory probe variant; malformed/cyclic/composite batch fixtures; substituted args/kwargs;
-early rejection; every database/filesystem/outbox/pointer snapshot; guard firing; each root
+early rejection; unconsumed or twice-consumed lazy results; wrong receiver/source-result invocation;
+identity-fence object-construction claims; every database/filesystem/outbox/pointer snapshot; guard firing; each root
 signature/export/source change; every forbidden definition/alias/export/key; and Python
 3.11/3.12 disagreement. No test may exercise a current-family durable writer because Phase A has
 none.
 
-Implementation order is: (1) policy plus strict fixture/setup/probe/sentinel models and the complete
-inventory matrix; (2) diff and static resolver; (3) isolated boundary harness and inventory tests;
+Implementation order is: (1) policy plus strict fixture/setup/call-shape/probe/sentinel models and
+the source-checked complete inventory matrix; (2) diff and static resolver; (3) isolated boundary
+harness, receiver/source-result adapters, lazy-consumption evidence, and inventory tests;
 (4) dual-Python post-merge `push main` evidence job and fixed artifact/cache reader; (5) Release A
 verifier/pre-checkout deployment refactor in audited bootstrap-disabled mode; (6) Release B enforced
 policy/evidence validation and rollback tests; (7) original reviewer re-review and removal of the
@@ -1448,7 +1483,7 @@ The reset finding ledger is stable:
 | `R07-DR-P1-02` | a direct, stored-byte, or batch current-family input rejects before its declared boundary or changes a durable surface | exact replayable probe bindings, guard counters, and database/filesystem/outbox/pointer before/after snapshots |
 | `R07-DR-P1-03` | a registry/builder change introduces a writer or activation symbol without runtime object traversal | static ten-root signature/export/source snapshots plus the separate forbidden-definition universe |
 | `R07-DR-P1-04` | production deploys a commit/tree other than the one validated by dual-Python CI | existing exact-target deployer preflight compares its resolved target to passing CI evidence |
-| `R07-DR-SPEC-P1-01` | setup, parser, or argument failure produces the expected exception before the intended boundary and falsely passes unchanged snapshots | exact typed current bytes/parser, controlled isolated setup, post-setup snapshots, reached-before-mutation sentinel, and explicit `R07-B01..B19` setup/call matrix |
+| `R07-DR-SPEC-P1-01` | identity-only, lazy, indirect-source, setup, parser, or argument evidence produces the expected exception without reaching the intended boundary and falsely passes unchanged snapshots | constructor-identity fence with no object claim, exact `CallShapeV1` consumption, controlled receiver/source-result setup, post-setup snapshots, one per-row sentinel, zero guards, and source-checked `R07-B01..B19` matrix |
 | `R07-DR-SPEC-P1-02` | deploy preflight accepts ambiguous/pre-merge evidence or cannot enforce evidence until after checkout | strict post-merge `push main` evidence schema and channel plus audited Release A bootstrap and pre-checkout-enforced Release B transition |
 | `RESET-R07-P2-01` | an identical post-link retry can publish a pointer without re-establishing records-directory durability | future v3-only primitive re-fsyncs the records directory; byte conflict rejects before pointer mutation |
 | `RESET-REG-P0-01` | generation code, self-consistent manifests/vectors/results, a service, or forged IPC can acquire append authority | fixed external root policy authorizes exact release hashes; root never imports generation code; unprivileged child has no store/verifier capability; root validates and writes after child exit |
@@ -1467,7 +1502,7 @@ The planned red-test matrix is exact:
 | `R07-DR-P1-02` | `tests/unit/test_signal_family_differential_boundaries.py` | every inventory row's declared direct/stored-byte/batch form uses exact scalar/bytes/composite fixtures, exact args/kwargs, expected failure, guards, and unchanged database/filesystem/outbox/pointer snapshots; cyclic/malformed/composite drift and early rejection block |
 | `R07-DR-P1-03` | `tests/unit/test_signal_family_differential_gate.py::TestRootSnapshots`; `tests/unit/test_signal_family_differential_gate.py::TestForbiddenDefinitions` | all ten root signatures/exports/source ASTs and the static forbidden-definition universe pass without import, construction, closure traversal, or bytecode analysis; every forbidden definition/alias/export/key blocks |
 | `R07-DR-P1-04` | CI jobs `r07-differential-gate-py311`, `r07-differential-gate-py312`, and `r07-differential-gate-evidence`; `tests/unit/test_production_deploy.py` | Python 3.11 and 3.12 both emit passing ordinary JSON evidence for one exact candidate commit/tree; deploy preflight rejects any requested target whose resolved pair differs |
-| `R07-DR-SPEC-P1-01` | `tests/unit/test_signal_family_differential_boundaries.py::TestProbeSetup`; `::TestBoundaryReachedSentinel`; `::TestCompleteInventoryMatrix` | exact parser/model bytes, constructor replacement, preloaded row, and composite batch setup run only in an isolated temporary store before snapshots; all `R07-B01..B17` calls reach exactly one policy sentinel and zero mutation sentinels; setup exception, early rejection, wrong current member, missing/duplicate sentinel, and any snapshot/guard drift block; `B18..B19` are static-only |
+| `R07-DR-SPEC-P1-01` | `tests/unit/test_signal_family_differential_boundaries.py::TestProbeSetup`; `::TestCallShape`; `::TestBoundaryReachedSentinel`; `::TestCompleteInventoryMatrix` | B01 identity fence observes the exact replacement once and never claims construction; B03 rejects only during one `consume_tuple`; B09 and B16 receive current inputs only through exact source-result calls; all receiver/source-result bindings and B01..B19 matrix rows match source anchors; every row reaches one sentinel, every mutation guard is zero, and all post-setup before/after snapshots are equal; wrong phase/receiver/result/action, setup exception, early rejection, missing/duplicate sentinel, and drift block |
 | `R07-DR-SPEC-P1-02` | `tests/unit/test_signal_family_differential_evidence.py`; `tests/unit/test_production_deploy.py::TestR07Bootstrap` | PR/tag/manual/non-main, failed/partial/skipped, wrong SHA/tree/run/artifact/path/cache, duplicate/extra JSON, and disabled post-bootstrap evidence block; Release A audits bootstrap-disabled once, Release B verifies enforced evidence before checkout, pre-checkout failure leaves services untouched, and post-checkout failure rolls back exactly |
 | `RESET-REG-P1`, `RESET-REG-P1-01` | `tests/unit/test_signal_family_successor_registry_reset.py` | v2 parser/catalog/bytes/hashes/history are unchanged; exact four-schema field sets, hash preimages, raw canonical bytes, strict duplicate/extra/coercion/order rejection; successor declaration rejects before the actual model exists; v2 semantic/partial/absent/conflicting overlay never becomes ready |
 | `RESET-REG-P0`, `RESET-REG-P1`, `RESET-REG-P1-02` | `tests/integration/test_signal_family_verification_reset.py` | all five pair IDs resolve exact callable objects through real production builders and manifest-backed source hashes; exact service bindings cover the pair-derived service set and reject missing/duplicate/cross-role/wrong module/path/source hash before child execution; only a successful immutable child run can lead the root verifier to persist five receipts |
