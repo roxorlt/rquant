@@ -618,8 +618,8 @@ local preflight is a required Phase A red test and implementation prerequisite.
 | `rquant.runtime_serving_snapshot.SignalDeliveryPayload` | current-family registry-writer payload rejects before authority publication |
 | `rquant.runtime_builder_signal._publish_signal_authority` | no current-family serving payload may reach authority publication |
 | `rquant.runtime_serving_authority.ServingSourceAuthorityPublisher.publish` | current-family signal payload rejects before generation or pointer filesystem mutation |
-| `rquant.runtime_service_main.build_builtin_registry` | the actual top-level production registry entrypoint may not import, construct, inject, return, or make reachable a v3 writer, capability, environment flag, cursor, drain, cutover object, fixture publication path, or overlay branch |
-| `rquant.runtime_service_builtin.build_builtin_registry` and all signal-path builders | the implementation factory and builders obey the same reachability prohibition and cannot hide a forbidden object behind a registry entry, closure, protocol, callback, or capability value |
+| `rquant.runtime_service_main.build_builtin_registry` | exact source/API snapshot retains its approved signature and exports; its candidate diff may contain no v3 writer, capability, environment flag, cursor, drain, cutover, fixture-publication, or overlay symbol |
+| `rquant.runtime_service_builtin.build_builtin_registry` and all signal-path builders | each named builder has the same source/API snapshot rule; dynamic loading, generated registration, unknown export, or an unapproved production diff blocks rather than requiring object-graph reachability analysis |
 
 The builder rule covers
 `rquant.runtime_service_main.build_builtin_registry`,
@@ -632,578 +632,179 @@ The builder rule covers
 `rquant.runtime_builder_paper.paper_broker_builder`,
 `rquant.runtime_builder_serving.serving_publisher_builder`, and
 `rquant.runtime_builder_daily_orchestrator.daily_pipeline_orchestrator_builder`.
-Read-only current-envelope parsing, model construction, and synthetic decoder fixtures do not grant
-writer authority.
+It is an exact source/API-diff rule, not a reachability claim about closures, callbacks, or arbitrary
+objects returned by those builders. Read-only current-envelope parsing, model construction, and
+synthetic decoder fixtures do not grant writer authority.
 
-#### R07 No-Activation Test-Only Object-Shape Contract
+#### R07 Relational No-Activation Release Proof
 
-`RESET-R07-P0-02` freezes the proof contract for
-`tests/unit/test_signal_family_no_activation_reset.py`. It is test-only: it neither expands a
-production API nor authorizes a v3 writer, registry, overlay, capability, environment flag,
-cursor, drain, cutover, mutation, or activation path. It replaces any implication that a best-effort
-Python object walk can prove non-reachability.
+`R07-RR-PROOF-V1` is the sole normative Phase A no-activation gate. It is a relational,
+differential release proof, not a proof about arbitrary Python object graphs or program semantics.
+It compares one exact candidate release to one approved, already-deployed baseline and proves two
+claims only:
 
-**Second reset.** The historical generic graph walk, callable-input grammar, and static
-callable-operation/bytecode contract below are retained only as an audit trail. They are
-superseded in full by the content-addressed constructive proof specified at
-`R07-CA-PROOF-V1` below. No implementation may inspect Python bytecode, simulate a call stack,
-infer Python data flow, or extend the old opcode allowlist. This resolves the 3.12 method-form
-`LOAD_ATTR` review evidence by taking CPython execution opcodes out of the proof boundary.
+1. the candidate changes production source only at a frozen set of read-only v3 declarations and
+   existing-boundary rejection guards; and
+2. every inventory boundary rejects current-family input before its first write transaction,
+   mutation-capable filesystem open, or durable mutation.
 
-The threat model is an object returned by an actual Phase A production builder or either actual
-builtin registry that hides a durable current-family persistence capability behind an ordinary
-alias, closure, callback, module indirection, container, or instance field. A writer shaped as a
-callable whose current-family input reaches an existing durable sink is in scope even when its
-field is named `sink`, `z`, or anything else. In particular, a durable capability stored in a
-slot, or returned by a property, is in scope. These are not new threat classes and MUST NOT be
-silently omitted from the proof.
+It does not claim that the baseline has no latent defect, or that arbitrary aliases, closures,
+callbacks, descriptors, generated code, or future dependency behavior are globally safe. Those are
+baseline risks carried by its prior production approval and preflight. A candidate that needs a
+broader claim, a writer, activation, a registry successor, an overlay, a cursor, a drain, or a
+cutover is outside Phase A and blocks.
 
-##### Frozen Root Manifest
+##### Frozen Baseline And Release Identity
 
-The proof does not accept an ad hoc root mapping. Its sole input is one immutable
-`R07NoActivationRootManifestV1` with exactly these fields:
+The baseline is permanently `45d0b57c4c5cbab1700fa5e3c386c6756892a7d6`, whose Git tree is
+`4f67e67192855874e82baa13dc343a1d6939bd67`. It is the last approved pre-R07 commit: it is an
+ancestor of every Phase A candidate, changes only this ADR, and precedes the first R07 production
+change (`461309d`, which changes `src/rquant/signal_route_spool.py`). A release candidate is valid
+only when its commit is a descendant of this baseline and every CI checkout, built artifact, and
+deployment target names the same exact candidate commit and tree.
+
+`R07GitTreeRefV1` has exactly `commit_sha` and `tree_sha`, each a lowercase 40-hex Git object ID.
+`R07ArtifactRefV1` has exactly `kind` (`wheel`, `sdist`, or `deployment_bundle`), `filename`
+(ASCII basename), `size_bytes` (strict native integer >= 1), and lowercase-hex `sha256`. Artifact
+entries are sorted by `(kind, filename)`, unique by that pair, and the deployment bundle is
+mandatory. Every manifest/result model in this section is frozen, extra-forbid, rejects mapping or
+subclass substitution for nested models, and serializes as
+`rquant.strict_json.canonical_json_bytes(model_dump(mode="json"))`; its digest is SHA-256 of those
+bytes with no self-digest field in the preimage.
+
+##### Allowed Production Diff Manifest
+
+The repository contains one reviewed, non-generated fixture
+`tests/fixtures/r07_relational_release/allowed-production-diff-v1.json`. It is an input to CI, never
+rewritten by a test, build, manifest generator, or deployment step. `R07AllowedProductionDiffManifestV1`
+has exactly:
 
 ```text
 schema_version: strict native int == 1
-capability_profiles: exact tuple[R07CapabilityProfileV1, ...]
-roots: exact tuple[R07NoActivationRootV1, ...]
-manifest_sha256: lowercase SHA-256
+baseline: exact R07GitTreeRefV1 == the frozen baseline above
+production_root: literal "src/rquant"
+entries: nonempty Unicode-path-sorted tuple[R07AllowedProductionDiffEntryV1, ...]
 ```
 
-`R07CapabilityProfileV1` has exactly `profile_id`, `entries`, and
-`unknown_key_policy`; `unknown_key_policy` is the literal `reject`.
-`R07CapabilityEntryV1` has exactly `key` and `fixed_value`, both nonempty exact strings.
-`R07NoActivationRootV1` has exactly `root_name`, `builder_target`, and `arguments`.
-`R07RootArgumentV1` has exactly `parameter_name` and `factory_id`. All models are frozen,
-extra-forbid, reject mappings/subclasses in place of exact nested models, and reject duplicate,
-unsorted, missing, or extra entries. `manifest_sha256` is SHA-256 of canonical JSON for the complete
-manifest excluding `manifest_sha256`.
+Each entry has exactly `path`, `change_kind` (`add` or `modify`), `baseline_file_sha256` (null only
+for `add`), `candidate_file_sha256`, and a nonempty source-order tuple of
+`R07AllowedDeclarationV1`. A declaration has exactly `qualified_name`, `span_start_line`,
+`span_end_line`, `normalized_ast_sha256`, and `role`. `role` is exactly one of
+`read_only_v3_model`, `read_only_v3_decoder`, or `legacy_boundary_reject_guard`. The normalized AST
+is the declaration's `ast.dump(include_attributes=False)` UTF-8 bytes. Paths are normalized relative
+paths below `src/rquant`, contain no symlink, `..`, generated source, or glob, and no declaration
+range may overlap another range in its file.
 
-The only argument factory IDs are `none/v1`, `registry-clock/v1`,
-`capabilities-notifier/v1`, and `capabilities-all/v1`. `registry-clock/v1` resolves by exact
-identity to the test's fixed aware-UTC `_registry_clock`. A capability factory returns a fresh
-exact native `dict[str, str]`; the proof hashes and revalidates that dict before root construction,
-after construction, and after graph validation. It may not read `os.environ`, `.env`, a credential
-file, a production capability object, or a caller-supplied mapping. `none/v1` returns exact `None`.
-No other factory, callable, literal, positional argument, omitted default, or caller override is
-accepted.
+CI derives a production diff from the baseline tree to the candidate tree. It blocks when any
+production path is added, removed, renamed, or modified without one exact manifest entry; when a
+file digest, declaration span, AST digest, or role differs; when a declaration contains a public
+writer/activation API; or when `pyproject.toml`, lockfiles, build hooks, package data, generated
+code, import loaders, or dependencies change. The manifest may name only the strict v3 models and
+decoders in `signal_route_spool.py` plus the named local legacy-family rejection guards required by
+the inventory. This deliberately does not infer callable data flow or inspect closures.
 
-The capability-profile tuple order is exactly `capabilities-notifier/v1` then
-`capabilities-all/v1`. The notifier profile contains the following six entries; the all profile
-contains all fourteen entries below. Values are inert test strings and are never used to build or
-call a service step:
+##### Boundary Behavior Manifest And Mutation Probes
+
+`R07BoundaryBehaviorManifestV1` is the second reviewed fixture in the same directory. It has exactly
+`schema_version == 1`, `inventory_rows`, and `manifest_sha256`; its digest is canonical JSON excluding
+`manifest_sha256`. `inventory_rows` is a Unicode-`boundary_id`-sorted tuple with exactly one row for
+each row in the Complete No-Activation Inventory above, including both registry roots. A row has
+exactly `boundary_id`, `target`, `input_cases`, `snapshot_domains`, and `first_mutation_guards`.
+
+An `input_case` has exactly `case_id`, `form` (`direct_current`, `stored_current_bytes`, or
+`batch_current`), and `entrypoint`. Every API family that accepts the form supplies that form; an
+API family that cannot accept it supplies an explicit nearest public rejection entrypoint instead.
+Missing, skipped, synthesized-success, or `not_applicable` cases block. The complete fixture must
+include all three forms and exercise every downstream parser/queue/route form that can receive it.
+
+`snapshot_domains` are exact test-owned SQLite databases, record directories, pointer directories,
+outbox/queue tables, and source/receipt state named by the boundary. `first_mutation_guards` are
+exact named spies on its first write transaction, SQL write, mutation-capable `open`, link, replace,
+fsync, or pointer operation. For each case, the probe records a canonical before/after snapshot and
+asserts all of the following: current-family rejection is the public outcome; every first-mutation
+guard remains uncalled; and every declared database row, file byte, directory entry, pointer, outbox,
+queue, source, and receipt snapshot is byte-identical. A failed guard, a changed snapshot, or a
+mutation attempt is `boundary_mutation`, never a passing rejection.
+
+`R07BoundaryInputCaseV1` has exactly `case_id` (ASCII `boundary_id/form`), `form`, and `entrypoint`
+(a fully qualified existing symbol). `R07SnapshotDomainV1` has exactly `domain_id`, `kind`
+(`sqlite`, `record_directory`, `pointer_directory`, `outbox`, `queue`, `source`, or `receipt`), and
+`canonical_snapshot_sha256`. `R07FirstMutationGuardV1` has exactly `operation_id`, `target`, and
+`operation_kind` (`write_transaction`, `sql_write`, `filesystem_open`, `link`, `replace`, `fsync`, or
+`pointer_write`). Domain IDs, input-case IDs, and operation IDs are unique and sorted. Probe code
+may use only test-owned temporary paths/databases named in its manifest row; a missing guard or
+snapshot domain is an invalid fixture, not an empty assertion.
+
+Registry rows do not construct or inspect arbitrary runtime graphs. They take an exact source/API
+snapshot of the ten named production builders, their signatures, exports, and the absence of the
+forbidden v3 writer/activation symbols. Any dynamic loader, generated registration, unknown export,
+or source/API change outside the allowed diff is a `blocked_diff` result.
+
+##### Exact Evidence And Artifact Binding
+
+CI emits one immutable external `R07RelationalReleaseProofResultV1`, rather than committing a
+self-updating approval file. It has exactly:
 
 ```text
-PUSHDEER_ENDPOINT=https://invalid.rquant.test/pushdeer
-PUSHDEER_KEYS=r07-proof-pushdeer-key-v1
-PUSHDEER_RECIPIENT_IDS=admin:r07-pushdeer
-PUSHPLUS_ENDPOINT=https://invalid.rquant.test/pushplus
-PUSHPLUS_RECIPIENT_IDS=admin:r07-pushplus
-PUSHPLUS_TOKENS=r07-proof-pushplus-token-v1
-RQ_ARTIFACT_RETENTION_WRITER_CREDENTIAL=r07-proof-retention-credential-v1
-RQ_REFERENCE_PUBLICATION_HMAC_KEY_ID=r07-proof-hmac-key-v1
-RQ_REFERENCE_PUBLICATION_HMAC_SECRET_HEX=0000000000000000000000000000000000000000000000000000000000000000
-RQ_REFERENCE_SOURCE_PRIVATE_KEY_BASE64=cjA3LXByb29mLXByaXZhdGUta2V5LXYx
-RQ_REFERENCE_SOURCE_PUBLIC_KEY=r07-proof-public-key-v1
-RQ_REFERENCE_SOURCE_SIGNING_KEY_ID=r07-proof-source-key-v1
-TUSHARE_TOKEN_BACKUP=r07-proof-tushare-backup-v1
-TUSHARE_TOKEN_MAIN=r07-proof-tushare-main-v1
+schema_version: strict native int == 1
+baseline: exact R07GitTreeRefV1
+candidate: exact R07GitTreeRefV1
+allowed_diff_manifest_sha256: lowercase SHA-256
+boundary_manifest_sha256: lowercase SHA-256
+fixture_sha256: lowercase SHA-256
+artifacts: sorted nonempty tuple[R07ArtifactRefV1, ...]
+python_evidence: exact tuple[R07PythonEvidenceV1, R07PythonEvidenceV1]
+outcome: exact one of passed, blocked_diff, blocked_artifact, boundary_mutation, blocked_evidence
+failures: canonical sorted tuple[R07RelationalFailureV1, ...]
+result_sha256: lowercase SHA-256
 ```
 
-Profile entries are sorted by key. A missing fixed key, a changed value, an unknown key, an extra
-capability profile, or a capability mapping supplied to a root that does not declare one rejects
-the manifest before any builder is called. An empty mapping never means "all capabilities" and is
-not a valid factory output.
+`python_evidence` is ordered 3.11 then 3.12. Each item has exactly `python_minor`, `runner_id`,
+`test_command_sha256`, `stdout_sha256`, `junit_sha256`, and `passed`; `passed` must be true only when
+the exact relational suite completes with zero skipped or deselected cases. A passing result has an
+empty failure tuple; every non-passing result has at least one deterministic failure with `kind`,
+`subject`, and `detail_sha256`. `result_sha256` is over the canonical result excluding itself.
 
-The root tuple is exact and ordered as follows. Argument bindings are sorted by the target's
-declared keyword-only parameter order; every injectable parameter is present even when fixed to
-`none/v1`. The target signature must have exactly the listed parameters and no newly added
-injection position before root construction can proceed.
+`R07PythonEvidenceV1.python_minor` is exactly `3.11` or `3.12`; `runner_id` is a nonempty ASCII
+identifier; every evidence digest is lowercase SHA-256. `R07RelationalFailureV1.kind` is exactly
+`diff`, `artifact`, `boundary`, or `evidence`; `subject` is a nonempty canonical manifest ID; and
+`detail_sha256` is lowercase SHA-256. Failure entries sort by `(kind, subject, detail_sha256)`.
+`R07RelationalReleaseProofResultV1` rejects a `passed` result with failures, a non-passing result
+without failures, duplicate artifact/evidence/failure keys, noncanonical ordering, or either missing
+Python version.
 
-| Root | Exact builder target | Exact argument factories |
-|---|---|---|
-| `direct.strategy_live` | `rquant.runtime_builder_strategy.strategy_live_builder` | `clock=registry-clock/v1`; `evaluator_loader=none/v1`; `completion_attestation_signer=none/v1`; `completion_attestation_active_key_id=none/v1` |
-| `direct.signal_router` | `rquant.runtime_builder_signal.signal_router_builder` | `source_loader=none/v1`; `target_resolver=none/v1`; `clock=registry-clock/v1` |
-| `direct.notifier` | `rquant.runtime_builder_signal.notifier_builder` | `provider_loader=none/v1`; `capability_environment=capabilities-notifier/v1`; `clock=registry-clock/v1` |
-| `direct.shadow_session` | `rquant.runtime_builder_shadow.shadow_session_builder` | `clock=registry-clock/v1`; `input_loader=none/v1`; `session_executor=none/v1` |
-| `direct.paper_consumer` | `rquant.runtime_builder_paper.paper_consumer_builder` | `clock=registry-clock/v1` |
-| `direct.paper_broker` | `rquant.runtime_builder_paper.paper_broker_builder` | `clock=registry-clock/v1`; `quote_resolver=none/v1`; `trade_date_resolver=none/v1` |
-| `direct.serving_publisher` | `rquant.runtime_builder_serving.serving_publisher_builder` | `snapshot_loader=none/v1`; `clock=registry-clock/v1` |
-| `direct.daily_orchestrator` | `rquant.runtime_builder_daily_orchestrator.daily_pipeline_orchestrator_builder` | `clock=registry-clock/v1` |
-| `registry.builtin` | `rquant.runtime_service_builtin.build_builtin_registry` | exact full binding block below |
-| `registry.main` | `rquant.runtime_service_main.build_builtin_registry` | exact full binding block below |
+The CI build starts from a clean checkout of `candidate.tree_sha`, validates the two fixtures and
+their literal expected digests, derives the diff against `baseline.tree_sha`, runs the boundary suite
+on Python 3.11 and 3.12, and builds the wheel/sdist/deployment bundle from that same tree. It records
+the resulting artifact hashes in the proof result. Release packaging or deployment may not regenerate
+or amend either manifest or its approved digest. The deployer verifies the exact tag/commit/tree,
+the approved proof-result digest, and the selected deployment-bundle digest before installation; it
+does not recompute approval material on production. A mismatch is `blocked_artifact`.
 
-The two full registry binding blocks are:
+##### Failure Semantics And Superseded Approaches
 
-```text
-registry.builtin:
-  runtime_capabilities=capabilities-all/v1
-  reference_adapter_factory=none/v1
-  auction_adapter_factory=none/v1
-  adapter_factory=none/v1
-  watchlist_quote_provider_factory=none/v1
-  universe_loader=none/v1
-  clock=registry-clock/v1
-  evaluator_loader=none/v1
-  signal_source_loader=none/v1
-  target_resolver=none/v1
-  provider_loader=none/v1
-  paper_quote_resolver=none/v1
-  trade_date_resolver=none/v1
-  serving_snapshot_loader=none/v1
-  daily_close_fetcher=none/v1
-  shadow_input_loader=none/v1
-  shadow_session_executor=none/v1
-  candidate_input_loader=none/v1
-  auction_candidate_input_loader=none/v1
-  artifact_retention_schema_resolver=none/v1
-  artifact_terminal_lifecycle_factory=none/v1
-  completion_attestation_signer=none/v1
-  completion_attestation_active_key_id=none/v1
+The only Phase A proof failures are an allowed-diff breach, an artifact/evidence binding breach, or
+a boundary mutation attempt. They do not claim to establish a general composition from a current
+input to a durable sink. This resolves the former capability-analysis findings directly:
 
-registry.main:
-  runtime_capabilities=capabilities-all/v1
-  artifact_retention_schema_resolver=none/v1
-  artifact_terminal_lifecycle_factory=none/v1
-  completion_attestation_signer=none/v1
-  completion_attestation_active_key_id=none/v1
-```
-
-This ten-entry manifest is in one-to-one correspondence with the ten builder/registry roots in the
-complete no-activation inventory. The proof rejects a missing, duplicate, reordered, renamed, or
-extra root, a target that does not resolve by already-imported module/static namespace lookup to
-the exact callable identity, an argument not declared by that target, any positional invocation,
-or any root result not returned by calling the exact target once with the exact materialized
-keyword arguments. Root construction itself must complete without invoking any returned builder,
-service step, adapter, provider, transport, filesystem mutation, or network operation.
-
-##### Superseded Historical Object-Walk And Bytecode Contract
-
-The following retained text is pre-reset audit history only. It is explicitly non-normative under
-`R07-CA-PROOF-V1`; no implementation or test may use it to obtain `complete_clean`.
-
-The proof is deliberately a small, static capability analysis, not a general Python object
-inspector. Before it can report a clean result, it MUST establish a complete proof over the exact
-manifest root set. The result has exactly one of these outcomes:
-
-```text
-complete_clean       every reachable value satisfies this contract; no violation found
-complete_violation   an exact forbidden capability composition was found
-blocked_shape        a reachable value/edge is not statically supported
-blocked_bound        node/depth/edge budget was exhausted
-```
-
-Only `complete_clean` may satisfy the no-activation gate. Either blocked outcome, an internal
-analyser error, or an incomplete traversal is a test failure, never an empty violation list or a
-skipped branch.
-The contract is intentionally fail-closed: production builders must be refactored to expose a
-supported shape before this Phase A gate can pass; the analyser must not acquire more dynamic
-introspection to accommodate them.
-
-The allowed static graph is limited to the following exact shapes and edges. Classification order
-is normative: null/atomic, exact module, class, exact function/method/partial, exact native
-mapping/sequence, then candidate instance. No later category may rescue a value rejected by an
-earlier category. Only an exact module or a class may be passed to `vars(...)`. All other inspection
-uses `type(...)`, `type.__getattribute__`, `object.__getattribute__`, `inspect.getattr_static`,
-Python bytecode, and exact object identity only. It MUST NOT call user code, invoke a descriptor,
-call a property getter, use ordinary `getattr`, iterate an arbitrary object, evaluate annotations,
-import a module, or use an object's representation in evidence.
-
-| Shape | Allowed statically visible edges |
+| Former finding | Relational-proof resolution |
 |---|---|
-| atomic values | `None`, exact native scalar values, `Path`, date/time values, enums, and exact approved read-only current models/classes; terminal only |
-| mappings and sequences | exact `dict` with string keys, and exact `tuple` or `list`; mapping keys are sorted by Unicode code point and sequence positions are numeric; `set`, `frozenset`, custom mappings, and custom sequences are unsupported |
-| project modules | only an exact, already-imported `rquant` `ModuleType`, through `vars(module)` and only names statically referenced by an allowed function; no import discovery or foreign module traversal |
-| classes | class namespace and MRO may be read with `vars(class)` and `type.__getattribute__`; approved read-only current models/classes are terminals, while a class used as a receiver is subject to the same MRO member rules as an instance |
-| functions and bound methods | exact `FunctionType`, `MethodType`, or `functools.partial`; defaults, keyword defaults, closure cells, explicit globals referenced by bytecode, and statically resolved receiver attribute reads are traversed |
-| plain instances and callable instances | only after the complete instance preflight below, an exact native instance `dict` plus exact Python functions, `staticmethod`, or `classmethod` declared on its MRO |
+| `R07-CA-P1-01` | Closure values, callback captures, aliases, and object graphs are not proof objects; an affected source change is outside the exact diff or its boundary behavior is tested. |
+| `R07-CA-P1-02` | Every fixture, identity, declaration span/AST digest, snapshot, guard, result, and canonical preimage is specified above. |
+| `R07-CA-P1-03` | Baseline/candidate Git trees, fixture digests, CI evidence, and built artifact digests are bound into one external result and checked again by deployment. |
+| `R07-CA-P1-04` | `boundary_mutation` and `blocked_diff` replace the incoherent current-plus-sink composition verdict. |
 
-Candidate-instance preflight is ordered and indivisible:
+The prior generic object walk, callable/bytecode analysis, and content-addressed capability
+projection are retained below only as archived review history. They are not normative, cannot yield
+`complete_clean`, and must be deleted rather than extended when this relational suite is implemented.
 
-1. Capture `value_type = type(value)` and `metaclass = type(value_type)`. Read each metaclass-MRO
-   namespace only with `type.__getattribute__(owner, "__dict__")` and require an exact native
-   `mappingproxy`. Before any `vars(value_type)`, reject a metaclass MRO that defines `__getattr__`
-   or overrides the inherited exact `type.__getattribute__`. Then read `value_type.__mro__` only
-   with `type.__getattribute__`; reject a non-tuple, non-class member, duplicate, or inconsistent
-   MRO. No metaclass descriptor or ordinary class attribute access is executed.
-2. Read each MRO class namespace before the exact `object` base with `vars(class)`, nearest class
-   first; exact `object` is a trusted terminal and its C-level namespace is not expanded. Before
-   touching instance storage, reject any inspected class that defines `__getattr__`, overrides
-   `__getattribute__` from the exact inherited implementation, declares `__slots__`, or contains
-   any unsupported descriptor. Exact
-   Python functions, `staticmethod`, and `classmethod` are the only executable class members
-   allowed. Exact native `__dict__` and `__weakref__` storage markers may be present as terminal
-   structural markers; every other property, custom descriptor, member descriptor, or get/set
-   descriptor blocks regardless of whether current bytecode names it.
-3. Locate `__dict__` by static class/MRO lookup. The only permitted storage marker is the nearest
-   native instance-dictionary descriptor in that MRO; an inherited native marker is allowed, but a
-   nearer replacement by a `property`, custom descriptor, slot/member descriptor, or a missing
-   marker yields `blocked_shape`. This storage marker is not traversed or invoked.
-4. Only after steps 1-3 succeed, read storage once with
-   `object.__getattribute__(value, "__dict__")`. The result must have exact type `dict`, must remain
-   the same exact dict identity through graph validation, and must contain exact string keys.
-   Otherwise the proof blocks. Ordinary `value.__dict__`, `vars(value)`, descriptor access, and
-   fallback to an empty mapping are forbidden.
+#### Historical Note
 
-The native `__dict__` storage marker is the sole structural storage primitive in the contract, not
-a general descriptor handler. No property or descriptor-specific resolution branch may be added.
-An object whose hostile hooks would be bypassed by `object.__getattribute__` still blocks at step 2;
-the bypass is never used to reinterpret an unsupported receiver as safe.
-
-Every other shape is unsupported. This includes `property`, member and get/set descriptors,
-arbitrary descriptors, slot storage, proxy objects, custom containers, dynamic attribute hooks,
-generator/iterator state, `weakref` indirection, C-extension objects outside the atomic allowlist,
-and an unrecognised callable protocol. A descriptor or slot does not become allowed merely because
-the analyser can see its type. The contract permits no descriptor-specific fallback logic. If a
-function statically reads `self.sink` and static lookup encounters a slot or property, the proof
-MUST return `blocked_shape`; it must not execute the getter, inspect a backing convention, or
-pretend the edge has no value. Any unsupported descriptor or dynamic attribute hook anywhere in a
-traversed receiver MRO blocks the receiver shape.
-
-For a supported callable, the analyser determines referenced receiver attributes from static
-bytecode `LOAD_ATTR`/`LOAD_METHOD` operations and resolves them only with static lookup. It does
-not infer behavior from an arbitrary string in `co_names`. A direct callable edge may additionally
-be reached through a partial, bound method, default, keyword default, closure cell, supported
-module global, exact mapping value, or exact sequence element. Graph visits are identity-based and
-cycle-safe. Bounds and canonical traversal order are frozen with `ProofResultV1` below.
-
-##### Static Callable-Input Grammar
-
-Whether a callable "accepts current input" is syntax, not runtime typing. The analyser operates
-only on an exact Python function's code object and exact native `__annotations__` dict. For a bound
-method it analyses `__func__` and statically excludes its exact first receiver parameter. For a
-`staticmethod` it excludes none; for a `classmethod` it excludes the exact first class receiver.
-A partial is reduced against the underlying exact function using only its exact tuple arguments
-and exact string-keyed keyword dict; duplicate binding, binding a variadic parameter, or inability
-to derive the remaining explicit parameter set yields `blocked_shape`.
-
-An explicit non-receiver parameter is an exact current input only when its annotation has one of
-these two forms:
-
-1. The annotation object is exactly one of `CurrentSignalEnvelope`,
-   `CurrentSignalBusRoutedRecord`, or `CurrentSignalRouteSpoolRecord`.
-2. The annotation is an exact string whose complete `ast.parse(..., mode="eval")` body is one
-   `Name` or a nonempty `Attribute` chain. The root name must exist in the function's exact globals
-   dict; every attribute is resolved from an already-imported exact `rquant` module or class with
-   static namespace lookup; the terminal object must be exactly one of those three model
-   identities. Whitespace, comments, calls, subscriptions, literals, unions, tuples, or any other
-   AST form reject as non-exact.
-
-No annotation is evaluated. `typing.get_type_hints`, `eval`, import resolution, ordinary `getattr`,
-forward-reference execution, aliases discovered outside the exact globals dict, and descriptor or
-metaclass access are forbidden. A global alias is acceptable only because static resolution ends
-at the exact model identity; its spelling has no authority.
-
-For a supported wrapper callable from which an exact durable sink is reachable, every remaining
-non-receiver parameter must be statically classified before capability composition:
-
-| Parameter syntax | Classification |
-|---|---|
-| exact current input grammar above | `CURRENT_EXACT` |
-| exact concrete non-current class/type identity resolved by the same grammar, excluding `object`, `typing.Any`, protocols, type variables, unions, generics, and subclasses standing in for a declared base | `NONCURRENT_EXACT` |
-| missing annotation, `object`, `Any`, unresolved name/attribute, string or AST outside the grammar, union/optional/annotated/generic/protocol/type variable, or a non-type terminal | `AMBIGUOUS_INPUT` and `blocked_shape` |
-| `*args` or `**kwargs`, whether annotated or not | `VARIADIC_INPUT` and `blocked_shape` |
-
-At least one `CURRENT_EXACT` parameter plus reachability to an exact durable sink forms an
-input/identity composition candidate; it becomes a violation only under the callable-operation
-contract below.
-All-explicit `NONCURRENT_EXACT` parameters plus a durable sink do not form current-family authority.
-Any `AMBIGUOUS_INPUT` or `VARIADIC_INPUT` on that same sink-reachable wrapper blocks the proof before
-it can report clean or a violation. A sink-reachable wrapper with zero non-receiver parameters is
-`AMBIGUOUS_INPUT` because its accepted input surface is undeclared and therefore also blocks. An
-exact frozen durable-sink object encountered as a terminal,
-without a wrapping callable/input composition, remains a legacy sink alone and is not re-analysed
-as its own wrapper. Return annotations and parameter names do not establish input authority.
-
-##### Static Callable-Operation Contract
-
-`R07-SPEC-P1-05` freezes the final operation layer. Reachability of a sink identity is necessary but
-not sufficient: the analyser must prove how a call site obtains and invokes its callee. It uses
-`dis.get_instructions(function, show_caches=True)` on an exact `FunctionType` and a non-executing
-stack/provenance interpreter. It never calls the function, a callee, a factory, a descriptor, a
-property, a user hook, or a code object; it never imports, evaluates, or executes source or
-annotations.
-
-The candidate set is fail-closed. Every supported callable with a `CURRENT_EXACT` parameter has
-every `CALL` analysed. A callable with an ambiguous/variadic input is also a candidate when it has a
-statically reachable durable sink or any unresolved/dynamic call; that unresolved call is potential
-sink reachability and cannot be used to avoid the input block. An all-`NONCURRENT_EXACT` callable
-with no current parameter is outside the current-family operation composition, except for the
-already frozen legacy-sink terminal rule.
-
-The operation interpreter analyses candidate call sites in ascending bytecode offset. A call slice
-is the single basic-block stack provenance needed to produce that call's callee. It cannot cross a
-jump target, branch, exception-handler boundary, loop edge, yield/await boundary, or another
-unresolved stack merge. The only opcodes permitted inside a call slice are:
-
-```text
-structural: EXTENDED_ARG CACHE RESUME NOP COPY_FREE_VARS PUSH_NULL PRECALL KW_NAMES
-reference:  LOAD_FAST LOAD_CONST LOAD_GLOBAL LOAD_DEREF LOAD_ATTR LOAD_METHOD
-invoke:     CALL
-```
-
-`EXTENDED_ARG`, `CACHE`, `RESUME`, `NOP`, and `COPY_FREE_VARS` carry no provenance. `PUSH_NULL`,
-optional `PRECALL`, and optional `KW_NAMES` must occur only in the exact Python 3.11/3.12 calling
-sequence consumed by the same `CALL`. The `LOAD_GLOBAL` push-null flag is normalized to that same
-single null marker; it grants no additional lookup form. `KW_NAMES` must resolve to an exact tuple
-of unique exact strings whose length does not exceed the `CALL` argument count. Stack depth,
-`CALL.arg`, keyword count, and static provenance must agree exactly or the call blocks. An opcode
-outside this list is not approximated or skipped if it contributes to a callee. In particular
-`LOAD_NAME`, `LOAD_CLASSDEREF`, `LOAD_SUPER_ATTR`,
-`BINARY_SUBSCR`, `CALL_FUNCTION_EX`, `IMPORT_NAME`, `IMPORT_FROM`, `IMPORT_STAR`, `BUILD_*`,
-`UNPACK_*`, `COPY`, `SWAP`, and every jump/async/generator opcode in callee provenance produce
-`blocked_shape`.
-
-The only allowed callee forms are:
-
-```text
-STATIC_BASE ("." LITERAL_ATTRIBUTE)* CALL(...)
-STATIC_PARTIAL CALL(...)
-```
-
-`STATIC_BASE` is exactly one of:
-
-1. `LOAD_GLOBAL literal_name` resolved first from the exact native function-globals dict, otherwise
-   from the function's exact native builtins dict. Absence, a non-dict builtins object, or a value
-   obtained by fallback/dynamic lookup blocks.
-2. `LOAD_DEREF literal_name` resolved to the already captured exact closure-cell content.
-3. `LOAD_FAST receiver_name` only for the statically established bound `self`/`cls` receiver. An
-   arbitrary local, argument, or reassigned receiver used as a callee base blocks. This receiver
-   form must have at least one literal `LOAD_ATTR`/`LOAD_METHOD`; calling the bare receiver blocks.
-
-Each `LITERAL_ATTRIBUTE` comes directly from a `LOAD_ATTR`/`LOAD_METHOD` instruction and is resolved
-through the existing allowed-shape static namespace rules. A module attribute such as
-`rquant_module.literal_sink` may be allowed; `module.__dict__[name]`, `module.mapping[name]`, any
-other subscript, or an attribute from a call result is not. A `STATIC_PARTIAL` must be the already
-validated exact `functools.partial` shape whose underlying function and bindings are static under
-the callable-input contract.
-
-An allowed call target resolves to one exact object identity before the call is classified. A
-static non-sink helper call remains an ordinary graph edge and its exact helper function is analysed
-separately. A mere load, formatting use, comparison, return, container insertion, or log/error
-message containing a durable-sink identity is not a call operation and cannot form a violation.
-Calling an exact partial or bound method whose underlying callable is one of the frozen durable
-sinks counts as calling that exact sink.
-
-For an exact durable-sink call inside a callable with a `CURRENT_EXACT` parameter, argument
-provenance is deliberately small:
-
-```text
-DIRECT_CURRENT   LOAD_FAST of that exact current parameter, optionally named by KW_NAMES
-DIRECT_OTHER     LOAD_FAST of an exact NONCURRENT_EXACT parameter
-STATIC_LITERAL   LOAD_CONST of an exact immutable scalar/null value
-STATIC_IDENTITY  an allowed STATIC_BASE resolved to an exact non-current object
-UNKNOWN_VALUE    every call result, attribute/subscript of an input, container build/unpack,
-                 arithmetic/format/serialization result, stack merge, or unsupported opcode
-```
-
-At least one `DIRECT_CURRENT` argument to the exact durable sink completes the existing identity
-composition and yields `complete_violation`. If no current argument reaches the sink and every
-argument is `DIRECT_OTHER`, `STATIC_LITERAL`, or `STATIC_IDENTITY`, the sink call is statically
-independent of current input and is not a current-family violation. Any `UNKNOWN_VALUE` in that
-sink call yields `blocked_shape`; the analyser does not guess whether a serialized, transformed, or
-factory-produced value contains the current record. Starred positional/keyword arguments always
-block.
-
-The following operation shapes always produce `blocked_shape` before a clean or violation result:
-
-- `globals()[name](record)`, `locals()[name](record)`, or any namespace-call result/subscript used as
-  a callee;
-- `getattr(owner, name)(record)`, `vars(owner)[name](record)`, or any other dynamic attribute/name
-  resolver, even when `name` is constant;
-- `module.__dict__[name](record)`, `module.mapping[name](record)`, or any callee obtained through
-  `BINARY_SUBSCR`;
-- `factory()(record)`, `factory().sink(record)`, or any call result used directly or through an
-  attribute as the next callee;
-- `__import__`, `importlib.import_module`, `eval`, `exec`, or `compile` invocation, and every import
-  opcode, anywhere in an operation-candidate wrapper;
-- a parameter/local used as callee, alias assignment/reassignment whose exact identity cannot be
-  proven, a control-flow stack merge, `CALL_FUNCTION_EX`, or any other unresolved indirect call.
-
-Direct `obj.literal_attr(...)` syntax is the only attribute-call form; direct `mapping[key](...)`
-syntax is never allowed for a callee even when the mapping and key are otherwise static graph
-shapes. Exact calls to `globals`, `locals`, `vars`, `getattr`, `__import__`,
-`importlib.import_module`, `eval`, `exec`, or `compile` are identified by object identity, not
-spelling or alias. Their functions are never executed.
-
-Operation blocking participates in pass 2 after complete graph/shape validation and candidate input
-classification, but before any violation conclusion. Wrappers follow canonical graph-path order;
-their call sites follow ascending bytecode offset. The first unsupported call returns
-`blocked_shape` with the wrapper's canonical path and a stable detail ID of the form
-`r07.call.<reason>/v1#<four-digit-call-ordinal>`. No new `ProofEdgeKindV1` value is introduced.
-Only after every operation-candidate wrapper has a complete operation proof may exact sink
-calls be composed and sorted as violations.
-
-Capability detection is identity-based, not name-based. The test freezes the exact objects in the
-durable-sink set, including the v2 filesystem primitives and all inventory persistence entrypoints.
-It also freezes the exact three current persistence input model identities. A violation exists when
-one supported callable composition accepts an exact current persistence input, reaches an exact
-durable sink through only allowed static edges, and invokes that sink through the exact static call
-operation with direct current-parameter provenance. The read-only v3 models, decoder functions,
-and synthetic verifier are explicitly allowed terminals and cannot become sinks by name, class
-name, annotation spelling, alias, or module path. A current input alone, a legacy durable sink
-alone, and an unreferenced forbidden object do not constitute a violation; the proof must retain
-the canonical evidence path that composes the two.
-
-##### `R07-CA-PROOF-V1`: Content-Addressed Constructive Proof
-
-The historical mechanisms above are superseded as normative design. Three alternatives were considered: (A) restricted AST/source analysis of production callables is source-stable but still needs general alias, closure, callback, and data-flow semantics; it is rejected. (B) an explicit content-addressed capability manifest plus exact runtime projection freezes roots, source/code identities, injection sites, types, field schemas, and declared edges; it is selected. (C) absence of a public v3 writer symbol/API is useful but insufficient because a v2 durable sink can be captured by an alias, closure, callback, or ordinary instance field; it is rejected as a complete proof.
-
-The selected design is a constructive release proof, not an attempt to decide arbitrary Python semantics. It establishes that the exact content-addressed Phase A artifact builds the exact ten declared roots, each root projects to one complete declared object graph, each code-bearing value matches a declared source/code identity, and no declared value is a current-family persistence capability. Any undeclared value or content/shape mismatch blocks. This is sufficient for Phase A because it contains no current writer primitive, writer API, registry, overlay, environment flag, cursor, drain, cutover, mutation, or activation object. The three current models, strict decoders, and synthetic decoder fixtures are explicit read-only terminals only; v2 remains byte-identical.
-
-The existing `R07NoActivationRootManifestV1` remains the sole builder-construction input. The test adds immutable `R07NoActivationCapabilityManifestV2` with exactly `schema_version` (native int `2`), `root_manifest_sha256`, `phase_a_source_units`, `projection_nodes`, `projection_edges`, `allowed_read_only_terminals`, `forbidden_persistence_identities`, and `manifest_sha256`. Its digest is SHA-256 of canonical JSON excluding `manifest_sha256`; the expected digest is a literal in the test and is never generated or accepted during a test run. A diagnostic generator may emit a candidate but cannot update that literal. Every intentional update is therefore a reviewable manifest diff naming every changed source unit, code identity, projection node, and edge.
-
-`SourceUnitV1` exactly contains `module_name`, `relative_path`, `source_sha256`, `ast_policy_sha256`, and `declared_code_identities`. A code identity records qualified name, source-unit identity, source-span digest, normalized `ast.dump(..., include_attributes=False)` digest, and a declaration digest for immutable code/default/closure metadata: positional-default hashes, keyword-default hashes, free-variable names, and closure-cell positions. It never reads closure values dynamically. An encountered function, method, partial, module, class, or callback must match one declared identity exactly; aliases and field names have no authority.
-
-`ProjectionNodeV1` exactly contains `node_id`, `kind`, `identity`, `type_identity`, and `field_schema`; `ProjectionEdgeV1` exactly contains `from_node_id`, `edge_token`, `to_node_id`, and `edge_kind`. Node kinds are only `root_result`, `plain_instance`, `exact_dict`, `exact_tuple`, `exact_list`, `function_token`, `bound_method_token`, `partial_token`, `module_token`, and `read_only_terminal`. Edge kinds are only `field`, `dict_key`, `sequence_index`, `bound_receiver`, `partial_argument`, and `partial_keyword`. Plain instances declare the complete Unicode-sorted field-name-to-child mapping; dicts declare the complete Unicode-sorted literal string-key mapping; lists/tuples declare every index; methods/partials declare their exact function token and receiver/bindings. Duplicate, unknown, missing, reordered, or extra values block, and all ten root results occur exactly once.
-
-The runtime projection helper calls each exact root once with frozen V1 arguments, then reads only manifest-declared nodes and edges. For an instance it first requires the exact type, ordinary metaclass, no `__slots__`, no overridden `__getattribute__` or `__getattr__`, and no property, member/get-set, or custom descriptor in its MRO. Only then it calls `object.__getattribute__(value, "__dict__")` once, requires an exact `dict`, requires equality with the declared field-key set, and fetches only declared dict keys. It never uses `getattr`, `vars(instance)`, descriptor access, recursive member discovery, `repr`, or user-code execution. Exact dict/list/tuple values must equal their declared schema; any other container blocks. Slots, properties, descriptors, hostile hooks, hostile `__dict__`, or aliases hidden in undeclared fields are `blocked_shape`, never silently clean.
-
-Code-bearing projection values are opaque after exact identity/source/code validation. The helper does not follow callbacks, evaluate annotations, inspect bytecode, or infer whether a closure calls a sink. A closure/module alias/callback cannot hide authority: it is either an undeclared token/edge and blocks, or its code/declaration digest is anchored and any changed capture, resolution, or invocation invalidates the manifest. `forbidden_persistence_identities` is the complete identity-based set of existing durable primitives and entrypoints; it must be absent from current-family declarations. The only allowed current identities are the read-only terminals. A declared-edge mutation inserting a forbidden durable identity is `complete_violation`; a shape mutation, dynamic token, source/code mismatch, or unsupported object is `blocked_shape`.
-
-The AST policy is intentionally tiny and version-independent. It validates only the manifest declaration language and declared source spans: literal records, literal string keys, literal tuple/list/dict values, and direct qualified identity references are allowed. Dynamic attribute/name lookup, subscript-derived identity, calls returning an identity, `eval`, `exec`, dynamic import, generated functions/classes, comprehensions, and mutation in a declaration scope block. It never derives production call/data flow. Python 3.11/3.12 opcode changes, including 3.12 method-form `LOAD_ATTR`, are not inputs to this proof and cannot alter a result. Existing `ProofResultV1`, canonical evidence ordering, and limits below now describe deterministic projection validation only, not recursive Python reachability or operation analysis.
-
-##### Immutable Proof Result, Ordering, And Bounds
-
-The analyser returns one exact immutable `ProofResultV1`, never a bare violation list or an
-exception interpreted as success. `ProofOutcomeV1` has exactly four values: `complete_clean`,
-`complete_violation`, `blocked_shape`, and `blocked_bound`. `ProofEdgeKindV1` has exactly:
-`root`, `module_member`, `class_member`, `instance_attribute`, `method_function`, `method_receiver`,
-`partial_function`, `partial_argument`, `partial_keyword`, `default`, `keyword_default`, `closure`,
-`global`, `mapping_key`, `mapping_value`, `sequence_item`, `receiver_attribute`, and `bound`.
-
-The exact models are:
-
-```text
-ProofPathSegmentV1:
-  edge_kind: exact ProofEdgeKindV1
-  token: exact nonempty str
-
-ProofEvidenceV1:
-  root_name: exact manifest root name
-  path: exact nonempty tuple[ProofPathSegmentV1, ...]
-  owner_type: exact module-qualified type name
-  detail_id: exact nonempty stable identifier
-  current_input_identity: exact qualified identity or null
-  durable_sink_identity: exact qualified identity or null
-
-ProofResultV1:
-  schema_version: strict native int == 1
-  root_manifest_sha256: exact manifest SHA-256
-  outcome: exact ProofOutcomeV1
-  evidence: exact tuple[ProofEvidenceV1, ...]
-  visited_node_count: strict native int >= 0
-  max_depth_observed: strict native int >= 0
-```
-
-All four models/enums are frozen and extra-forbid; mappings, lists, subclasses, coerced values,
-unknown enum values, and mutable nested values reject. For `complete_clean`, `evidence` is empty.
-For `complete_violation`, it is nonempty and contains only identity-composition evidence sorted by
-canonical path. For either blocked outcome, it contains exactly the first blocked evidence and the
-two identity fields are null. A shape finding uses `blocked_shape`; exhaustion of an analysis bound
-uses `blocked_bound`. Mixed outcomes or evidence are invalid.
-
-Canonical result bytes are
-`rquant.strict_json.canonical_json_bytes(result.model_dump(mode="json"))`, with no trailing newline.
-No alternate serializer, enum spelling, field order, whitespace, or Unicode escaping is accepted
-as result evidence.
-
-Validation is two-pass. Pass 1 constructs every exact root and validates the complete manifest
-projection without a capability conclusion. Any mismatch or unsupported declared shape returns the
-first stable blocked result. Only a complete pass 1 permits pass 2, which checks declared identities
-against the frozen forbidden/allowed sets. A declared forbidden identity returns
-`complete_violation`; nothing is inferred from callable inputs or invocation behavior.
-
-Pass 1 is deterministic depth-first preorder over manifest edges. Roots follow the V1 tuple order;
-nodes follow canonical `node_id`; plain-instance/dict fields follow Unicode code point; sequence
-items follow ascending index; a bound method visits its function then receiver; a partial visits its
-function, positional bindings, then Unicode-sorted keyword bindings. Projection identity references
-are expanded only on their first canonical path; later references are recorded but add no children.
-
-Path tokens are the literal manifest root name, member/key name, or base-10 index appropriate to
-the edge kind. They contain no address, timestamp, mapping insertion position, arbitrary `repr`, or
-dynamically read value. `owner_type` comes from the statically inspected exact type/class namespace.
-These rules freeze the first blocked edge across runs and Python mapping insertion orders.
-
-The constants are exactly `MAX_REACHABILITY_NODES = 10_000`, `MAX_REACHABILITY_DEPTH = 64`, and
-`MAX_EDGES_PER_NODE = 512`. Root depth is zero. Before accepting a previously unseen node, a
-visited count `>= MAX_REACHABILITY_NODES` blocks; therefore exactly 10,000 unique nodes are allowed
-and the 10,001st blocks. Before accepting another child edge, an edge count
-`>= MAX_EDGES_PER_NODE` blocks; exactly 512 edges are allowed and the 513th blocks. A node at depth
-`>= MAX_REACHABILITY_DEPTH` may be a leaf, but the existence of any child blocks before that child
-is accepted. Bound checks precede identity de-duplication for child edges, so repeated references
-cannot evade the per-node budget. `visited_node_count` and `max_depth_observed` report only nodes
-accepted before completion or the first block.
-
-Evidence MUST contain neither `repr(value)` nor dynamically obtained values. A violation records
-the exact current-input identity and durable-sink identity; a blocked shape records the first
-unsupported static edge. `R07NoActivationProofError` may exist only as an internal programming
-error that fails the test; it cannot be caught and converted to `complete_clean`.
-
-The Phase A adversarial suite is part of this contract, not optional test decoration. It MUST prove
-all of the following against the same analyser used for real builder roots:
-
-1. The unmodified concrete roots yield `complete_clean`, and adding a read-only decoder/model
-   reference keeps that outcome clean.
-2. Renaming a field, wrapping it in a supported dict/list/partial, binding it through a closure,
-   default, keyword default, callback, or statically referenced project-module global cannot turn a
-   known violation into `complete_clean`.
-3. Mutating a supported plain-instance field so that the callable composition reaches every frozen
-   durable sink produces `complete_violation`, with the same result regardless of alias name
-   or supported mapping insertion order.
-4. Replacing that field with `__slots__` storage, a `property`, a custom descriptor, or a receiver
-   with hostile `__getattribute__`/`__getattr__` produces `blocked_shape`; a side-effect
-   sentinel proves that no getter, descriptor, ordinary attribute access, iterator, or `repr()` was
-   executed. These tests must assert the blocked outcome, not merely assert an empty result.
-5. Cycles terminate by identity, while deliberately exceeding each node, depth, and edge bound
-   yields `blocked_bound`. Tests cover the exact allowed boundary and its first rejected successor
-   for all three constants. An unreachable mutation outside the frozen root graph cannot alter
-   a complete result.
-6. Each adversarial mutation first proves that the injected value is on a declared static edge of
-   its test root. This prevents a false-green fixture in which the test places a sink somewhere the
-   analyser was never contracted to visit.
-7. Every manifest root and every listed injection parameter has an identity/signature test. Missing,
-   reordered, duplicate, renamed, unknown, or extra roots/arguments reject. Both capability profiles
-   accept only their exact key/value tuples; empty, missing, changed, and unknown capability keys
-   reject before root construction.
-8. Every source unit/code identity is checked against its content hash, normalized AST digest, and
-   closure/default declaration digest. A changed alias, module reference, closure capture, callback,
-   or source span blocks before a clean result; the test cannot regenerate the expected manifest
-   digest.
-9. Shape-order metamorphics place a hostile `__dict__` property, dynamic attribute hook, slot, and
-   descriptor at every declared instance position. Each blocks before the one native instance-dict
-   read; a plain inherited native `__dict__` remains supported. Side-effect sentinels prove that no
-   hook, descriptor, getter, iterator, `repr`, or ordinary attribute access executed.
-10. Projection mutations substitute every frozen durable identity through each declared field,
-    dict/list position, closure token, module token, callback token, bound-method token, and partial
-    token. A declared substitution is `complete_violation`; an undeclared/dynamic form is
-    `blocked_shape`. Alias names, module indirection, and closure-cell positions cannot alter that
-    result.
-11. The former reviewer examples `globals()[name](record)`, `getattr(owner, name)(record)`,
-    `module.mapping[name](record)`, `factory()(record)`, plus 3.12 method-form `LOAD_ATTR`, are
-    cross-version golden controls. They are not interpreted. Their declaration/source code must be
-    either exactly represented by an approved opaque token or block as a dynamic/unknown token, and
-    every side-effect sentinel remains untouched on Python 3.11 and 3.12.
-12. `ProofResultV1` rejects mutation, subclass/mapping/list substitution, mixed outcome/evidence,
-    noncanonical ordering, and unknown enums. Projection ordering metamorphics retain byte-identical
-    results and the same first blocked evidence.
-
-The exact root manifest continues to close `R07-SPEC-P1-02`; deterministic result/order/bounds
-continue to close `R07-SPEC-P1-04`. `R07-SPEC-P1-05` is now closed only by `R07-CA-PROOF-V1`, not by
-the superseded callable-operation contract. The code-quality finding `R07-CQ-P1-02` closes only
-when a later implementation has red-to-green evidence for this new projection contract and the
-original reviewer verifies it. This amendment does not relax `RESET-R07-P0`, `RESET-R07-P1`, or the
-frozen v2 byte-identical parser corpus.
-
-##### Frozen Design-Review Scope
-
-This is the second and final architecture reset for the R07 no-activation proof. Subsequent review
-is limited to a regression in `R07-CA-PROOF-V1`, a demonstrated manifest/projection escape, or
-materially new evidence against an existing stable-ledger invariant. Findings
-`R07-SPEC-P1-01` through `R07-SPEC-P1-04` remain closed and MUST NOT be reopened, renamed, split, or
-reissued without that evidence and an explicit reference to the original ledger ID and failed
-invariant. A Python bytecode/opcode variation is not new evidence because bytecode is deliberately
-outside the selected proof. Phase B remains outside this review scope.
+Earlier R07 drafts attempted generic object-graph walking, callable/bytecode analysis, and a
+content-addressed capability projection. Review demonstrated that none can soundly prove arbitrary
+Python closure, callback, descriptor, or dynamic-resolution behavior without becoming an unbounded
+interpreter. They are superseded by `R07-RR-PROOF-V1`; their commit history remains available in Git,
+but no historical helper, fixture, result type, or finding may be extended or used as a release gate.
 
 ### Phase B: Successor Base Registry, Then Staged Overlay
 
@@ -1728,13 +1329,9 @@ The reset finding ledger is stable:
 | `RESET-REG-P0` | caller/service-forged evidence, generation-self-authorized vectors, or stale authority can create receipts or `READY` | external root policy, OS-separated verifier/child, strict IPC, lock revalidation, and root-owned append store |
 | `RESET-REG-P1` | successor or overlay grafts current semantics onto v2 or declares nonexistent/future models | unchanged-v2 evidence, actual-model descriptors, and successor-before-overlay enforcement |
 | `RESET-REG-P2` | count-only readiness, concurrent divergence, expiry/rollback ambiguity, generation-return replay, or audit leakage | exact set/epoch/CAS/lifecycle tests and bounded audit schema |
-| `RESET-R07-P0-01` | the real top-level production registry can make a v3 write/activation object reachable | construct through `runtime_service_main.build_builtin_registry` and prove exhaustive forbidden-object non-reachability |
-| `RESET-R07-P0-02` | a best-effort object walk reports clean after silently skipping a slot, property, descriptor, dynamic attribute path, alias, closure, callback, undeclared field, or traversal bound | test-only content-addressed constructive proof: exact roots, source/code identities, complete projection schemas, canonical blocked evidence, and adversarial mutations that must violate or block |
-| `R07-SPEC-P1-01` | runtime annotation evaluation or ambiguous callable inputs let a sink-reachable wrapper evade current-input classification | exact static annotation grammar; current/non-current exact classification; ambiguous, variadic, unresolved, missing, `object`, and `Any` inputs block without evaluation |
-| `R07-SPEC-P1-02` | ad hoc/empty root arguments omit an injection position or treat unknown capabilities as proof coverage | immutable exact ten-root manifest, signature equality, every injection parameter bound, exact fixed capability profiles, and reject-unknown policy |
-| `R07-SPEC-P1-03` | shape dispatch calls `vars`/dynamic attributes too early or treats hostile `__dict__`, slots, or descriptors as empty state | normative classification order and complete MRO/static receiver preflight before the single exact native instance-dict read |
-| `R07-SPEC-P1-04` | mutable/underspecified results or nondeterministic traversal change the first block or turn bound exhaustion into clean | frozen result/evidence/path models, exact enums/order, two-pass traversal, and exact inclusive-bound semantics |
-| `R07-SPEC-P1-05` | a dynamic/opaque callable, alias, closure, callback, or CPython-version-specific execution detail can evade a generic call analysis | `R07-CA-PROOF-V1`: anchored source/code identities plus complete fail-closed projection; tiny AST validation only for declaration syntax, never Python execution/data-flow |
+| `RESET-R07-RR-P0` | a Phase A candidate changes an unapproved production path, dependency/build surface, generated source, loader, or declaration while presenting a self-consistent local fixture | `R07-RR-PROOF-V1`: exact approved baseline/candidate trees, frozen allowed production diff fixture, declaration span/AST/file digests, clean-checkout CI, and deployment artifact binding |
+| `RESET-R07-RR-P1` | an existing persistence boundary accepts direct, stored-byte, or batch current-family input after a transaction or filesystem mutation begins | one-to-one boundary behavior manifest, mutation-capable operation guards, and byte-identical before/after snapshots for each applicable input form |
+| `RESET-R07-RR-P2` | a proof result approves bytes other than CI-tested/deployed bytes, or a skipped/deselected interpreter run masquerades as evidence | external immutable result binds both Python 3.11/3.12 evidence, fixture and manifest digests, wheel/sdist/deployment-bundle hashes, exact tag/commit/tree, and deployment revalidation |
 | `RESET-R07-P2-01` | an identical post-link retry can publish a pointer without re-establishing records-directory durability | future v3-only primitive re-fsyncs the records directory; byte conflict rejects before pointer mutation |
 | `RESET-REG-P0-01` | generation code, self-consistent manifests/vectors/results, a service, or forged IPC can acquire append authority | fixed external root policy authorizes exact release hashes; root never imports generation code; unprivileged child has no store/verifier capability; root validates and writes after child exit |
 | `RESET-REG-P1-01` | underspecified successor/overlay schemas permit alternate bytes, order, identity, or nonexistent models | four exact schemas, canonical preimages/raw bytes, strict structural rejection, and actual-model prerequisite |
@@ -1748,12 +1345,8 @@ The planned red-test matrix is exact:
 | `RESET-R07-P1` | `tests/fixtures/signal_route_spool_v2_differential/manifest.json`; `tests/unit/test_signal_route_spool_v2_differential.py` | frozen valid and invalid corpus proves untouched v2 bytes, `ensure_ascii=True`, hashes, models, and public error category/sequence before and after dispatcher introduction |
 | `RESET-R07-P1`, `RESET-R07-P2` | `tests/unit/test_current_signal_route_spool_record_v3.py` | exact `E`/`R`/outer bytes and hashes, strict JSON, exact types, all-v2 and one-way mixed chain, v3-first production rejection, isolated decoder-only all-v3 fixture, pointer neutrality, and synthetic crash/orphan/retry state-machine cases without a durable writer |
 | `RESET-R07-P2-01` | future `tests/unit/test_current_signal_route_spool_v3_publication_contract.py` in the separately authorized writer tranche | v3 primitive is separate from byte-identical v2 `_immutable_write_at`; crash after link and before directory fsync makes identical retry fsync the records directory again before pointer work; differing bytes reject before pointer mutation; Phase A/builders cannot import or reach the primitive |
-| `RESET-R07-P0`, `RESET-R07-P0-01`, `RESET-R07-P0-02` | `tests/unit/test_signal_family_no_activation_reset.py` | immutable root + capability manifests construct every production root once and validate an exact projection of every declared node/edge. Source/code identity changes, undeclared values, slots/properties/descriptors/hooks, custom containers, aliases in unknown fields, or limits block; declared forbidden-identity mutations violate; decoder import/construction alone succeeds |
-| `R07-SPEC-P1-01` | `tests/unit/test_signal_family_no_activation_reset.py` | exact object and static string `Name`/`Attribute` current annotations classify; missing, `object`, `Any`, variadic, union/generic/protocol/type-variable, unresolved, executable, and descriptor-backed annotations block; sentinels prove no evaluation/import/dynamic access |
-| `R07-SPEC-P1-02` | `tests/unit/test_signal_family_no_activation_reset.py` | exact canonical root manifest/hash has all ten inventory roots, exact target identities/signatures, every optional injection fixed explicitly, exact six/all capability profiles, and rejection of empty/missing/changed/unknown/reordered/extra roots, arguments, profiles, keys, and values before builder invocation |
-| `R07-SPEC-P1-03` | `tests/unit/test_signal_family_no_activation_reset.py` | shape classification follows the frozen order; only module/class uses `vars`; plain and inherited native instance dicts pass; slot/property/custom-descriptor/dynamic-hook/hostile-`__dict__` shapes block before instance read and execute no user code |
-| `R07-SPEC-P1-04` | `tests/unit/test_signal_family_no_activation_reset.py` | exact immutable `ProofResultV1`/evidence/path schemas and enums, two-pass shape-before-capability behavior, canonical first blocked path under all ordering metamorphics, and exact 10,000/10,001 node, depth-64-child, and 512/513 edge boundaries |
-| `R07-SPEC-P1-05` | `tests/unit/test_signal_family_no_activation_reset.py` | expected content-addressed V2 manifest cannot be regenerated; source/code/closure/default declaration changes block. The reviewer `globals`, `getattr`, subscript, factory, slots/property/descriptor, and 3.11/3.12 method-form controls are opaque-token or blocked-shape goldens with untouched side-effect sentinels; no bytecode interpretation exists |
+| `RESET-R07-RR-P0`, `RESET-R07-RR-P2` | `tests/unit/test_signal_family_relational_release.py`; `tests/fixtures/r07_relational_release/*` | fixture models reject self-update, unordered/duplicate/extra/coerced values, incorrect baseline, paths outside `src/rquant`, source/declaration digest drift, generated/import-loader/dependency/build change, candidate/tree/tag mismatch, and artifact/result mismatch; Python 3.11 and 3.12 produce a bound, zero-skip evidence result from the same clean candidate tree |
+| `RESET-R07-RR-P1` | `tests/unit/test_signal_family_relational_boundaries.py` | every Complete No-Activation Inventory row has a unique manifest row and an executable direct/stored-byte/batch rejection case where applicable; spies prove no first write transaction, SQL write, mutation-capable filesystem open/link/replace/fsync/pointer operation; all declared SQLite/file/outbox/queue/source/receipt snapshots remain byte-identical; read-only v3 decoder/model construction remains allowed |
 | `RESET-REG-P1`, `RESET-REG-P1-01` | `tests/unit/test_signal_family_successor_registry_reset.py` | v2 parser/catalog/bytes/hashes/history are unchanged; exact four-schema field sets, hash preimages, raw canonical bytes, strict duplicate/extra/coercion/order rejection; successor declaration rejects before the actual model exists; v2 semantic/partial/absent/conflicting overlay never becomes ready |
 | `RESET-REG-P0`, `RESET-REG-P1`, `RESET-REG-P1-02` | `tests/integration/test_signal_family_verification_reset.py` | all five pair IDs resolve exact callable objects through real production builders and manifest-backed source hashes; exact service bindings cover the pair-derived service set and reject missing/duplicate/cross-role/wrong module/path/source hash before child execution; only a successful immutable child run can lead the root verifier to persist five receipts |
 | `RESET-REG-P0-01` | `tests/integration/test_signal_family_root_verifier_isolation.py` | child module inspection/import cannot discover or import privileged verifier/store authority; direct store open/append fails; no inherited descriptor/path/capability exists; forged, extra, oversized, noncanonical, or wrong-result IPC rejects; caller/service evidence APIs do not exist; authority change between child completion and root append rejects |
