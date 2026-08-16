@@ -11,7 +11,6 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from typing import Annotated, Self
 
 from pydantic import Field, StringConstraints, field_validator, model_validator
@@ -405,9 +404,10 @@ class SignalBusStore:
             raise
         return connection
 
-    def _connect_readonly(self) -> sqlite3.Connection:
+    def _connect_readonly(self, *, immutable: bool = False) -> sqlite3.Connection:
+        options = "mode=ro&immutable=1" if immutable else "mode=ro"
         connection = sqlite3.connect(
-            f"file:{self.path}?mode=ro",
+            f"file:{self.path}?{options}",
             uri=True,
             timeout=self.busy_timeout_ms / 1_000,
             isolation_level=None,
@@ -423,29 +423,19 @@ class SignalBusStore:
 
     @contextmanager
     def _read_snapshot(self) -> Iterator[sqlite3.Connection]:
-        with TemporaryDirectory(prefix="rquant-signal-bus-read-") as directory:
-            snapshot_path = Path(directory) / self.path.name
-            for suffix in ("", "-wal"):
-                source = self.path.with_name(f"{self.path.name}{suffix}")
-                try:
-                    payload = source.read_bytes()
-                except FileNotFoundError:
-                    if not suffix:
-                        raise
-                    continue
-                snapshot_path.with_name(f"{snapshot_path.name}{suffix}").write_bytes(payload)
-            connection = sqlite3.connect(
-                snapshot_path,
-                timeout=self.busy_timeout_ms / 1_000,
-                isolation_level=None,
-            )
-            connection.row_factory = sqlite3.Row
-            try:
-                connection.execute(f"PRAGMA busy_timeout = {self.busy_timeout_ms}")
-                connection.execute("PRAGMA query_only = ON")
-                yield connection
-            finally:
-                connection.close()
+        wal_path = self.path.with_name(f"{self.path.name}-wal")
+        try:
+            wal_has_frames = wal_path.stat().st_size > 0
+        except FileNotFoundError:
+            wal_has_frames = False
+        connection = self._connect_readonly(immutable=not wal_has_frames)
+        try:
+            connection.execute("BEGIN")
+            yield connection
+        finally:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            connection.close()
 
     @contextmanager
     def _write_transaction(self) -> Iterator[sqlite3.Connection]:

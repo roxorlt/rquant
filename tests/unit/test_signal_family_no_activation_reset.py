@@ -8,12 +8,14 @@ import functools
 import gc
 import hashlib
 import inspect
+import sqlite3
 from collections.abc import Iterator, Mapping
 from datetime import UTC, date, datetime
 from enum import Enum
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import FunctionType, MethodType, ModuleType, SimpleNamespace
+from typing import get_args
 
 import pytest
 
@@ -22,6 +24,7 @@ import rquant.daily_summary_stage as daily_summary
 import rquant.runtime_builder_signal as runtime_builder_signal
 import rquant.runtime_service_builtin as runtime_service_builtin
 import rquant.runtime_service_main as runtime_service_main
+import rquant.signal_bus as signal_bus
 import rquant.signal_route_spool as spool
 import rquant.strategy_runner as strategy_runner
 from rquant.daily_notification_producer import DailyNotificationProducer
@@ -57,7 +60,7 @@ from rquant.signal_bus import (
     SignalBusSourceDescriptor,
     routing_decision_fingerprint,
 )
-from rquant.signal_contracts import CurrentSignalEnvelope, parse_signal_envelope
+from rquant.signal_contracts import CurrentSignalEnvelope, SignalEnvelope, parse_signal_envelope
 from rquant.signal_router_runtime import (
     RoutingDecision,
     RunnerSignalBatch,
@@ -67,7 +70,10 @@ from rquant.signal_router_runtime import (
 )
 from rquant.storage.duckdb import DuckDBStore
 from tests.unit.test_paper_signal_dual_read_r06 import _policy as _paper_policy
-from tests.unit.test_signal_contracts import _CURRENT_CANONICAL_FIXTURES
+from tests.unit.test_signal_contracts import (
+    _CURRENT_CANONICAL_FIXTURES,
+    _LEGACY_CANONICAL_FIXTURES,
+)
 from tests.unit.test_signal_dual_read_r06 import (
     GENERATION,
     POLICY,
@@ -92,6 +98,7 @@ from tests.unit.test_strategy_runner import (
 
 NOW = datetime(2026, 8, 16, 2, 30, tzinfo=UTC)
 CURRENT_LITERAL = _CURRENT_CANONICAL_FIXTURES[0][2]
+LEGACY_LITERAL = _LEGACY_CANONICAL_FIXTURES[0][3]
 
 
 def _registry_clock() -> datetime:
@@ -340,6 +347,112 @@ def test_signal_bus_route_empty_targets_rejects_stored_current_before_database_m
         store.route(current.signal_id, (), now=NOW)
 
     assert _sqlite_snapshot(path) == before
+
+
+def test_route_preflight_never_clones_database_or_wal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "route-no-clone.sqlite3"
+    store = _store(path)
+    current = _current_signal()
+    legacy = parse_signal_envelope(LEGACY_LITERAL)
+    assert current.signal_id is not None
+    assert type(legacy) is SignalEnvelope
+    _insert_literal_signal_rows(
+        path,
+        (
+            ("legacy", SignalEnvelope, legacy.signal_id, LEGACY_LITERAL),
+            ("current", CurrentSignalEnvelope, current.signal_id, CURRENT_LITERAL),
+        ),
+        routed=False,
+    )
+
+    def reject_clone(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("route preflight attempted a database clone")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "read_bytes", reject_clone)
+        patch.setattr(signal_bus, "TemporaryDirectory", reject_clone, raising=False)
+        with pytest.raises(LegacySignalWriteActivationError, match="legacy-only"):
+            store.route(current.signal_id, (), now=NOW)
+        assert store.route(legacy.signal_id, (), now=NOW) == ()
+
+    assert store.outbox_records() == ()
+
+
+def test_route_readonly_preflight_observes_uncheckpointed_wal_rows_for_both_families(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "route-wal.sqlite3"
+    store = _store(path)
+    current = _current_signal()
+    legacy = parse_signal_envelope(LEGACY_LITERAL)
+    assert current.signal_id is not None
+    assert type(legacy) is SignalEnvelope
+
+    writer = sqlite3.connect(path, isolation_level=None)
+    try:
+        writer.execute("PRAGMA wal_autocheckpoint = 0")
+        writer.execute("BEGIN IMMEDIATE")
+        for sequence, signal_id, literal in (
+            (1, legacy.signal_id, LEGACY_LITERAL),
+            (2, current.signal_id, CURRENT_LITERAL),
+        ):
+            writer.execute(
+                """
+                INSERT INTO signal_envelope(
+                    global_sequence, signal_id, payload_hash, payload_json, received_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    sequence,
+                    signal_id,
+                    hashlib.sha256(literal).hexdigest(),
+                    literal.decode("utf-8"),
+                    NOW.isoformat().replace("+00:00", "Z"),
+                ),
+            )
+        writer.execute("COMMIT")
+        assert path.with_name(f"{path.name}-wal").stat().st_size > 0
+
+        with pytest.raises(LegacySignalWriteActivationError, match="legacy-only"):
+            store.route(current.signal_id, (), now=NOW)
+        assert store.route(legacy.signal_id, (), now=NOW) == ()
+    finally:
+        writer.close()
+
+    assert store.outbox_records() == ()
+
+
+def test_route_transaction_rechecks_current_row_committed_after_readonly_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "route-recheck.sqlite3"
+    store = _store(path)
+    current = _current_signal()
+    assert current.signal_id is not None
+    original_preflight = store._preflight_stored_legacy_signal
+
+    def insert_after_preflight(signal_id: str, *, operation: str) -> None:
+        original_preflight(signal_id, operation=operation)
+        _insert_literal_signal_rows(
+            path,
+            (("current", CurrentSignalEnvelope, current.signal_id, CURRENT_LITERAL),),
+            routed=False,
+        )
+
+    monkeypatch.setattr(store, "_preflight_stored_legacy_signal", insert_after_preflight)
+    with pytest.raises(LegacySignalWriteActivationError, match="legacy-only"):
+        store.route(
+            current.signal_id,
+            (DeliveryTarget(recipient_id="admin", channel=DeliveryChannel.PUSHDEER),),
+            now=NOW,
+        )
+
+    assert store.signal(current.signal_id) == current
+    assert store.outbox_records() == ()
 
 
 def test_route_runner_preflights_full_batch_before_bus_cursor_or_source_binding(
@@ -654,6 +767,27 @@ def test_ast_inspection_retains_original_import_names_and_aliases() -> None:
 
 
 def _children(value: object) -> Iterator[tuple[str, object]]:
+    if isinstance(value, ModuleType):
+        if value.__name__ != "rquant" and not value.__name__.startswith("rquant."):
+            return
+        for key, item in vars(value).items():
+            if key.startswith("__"):
+                continue
+            if isinstance(item, ModuleType):
+                if item.__name__ == "rquant" or item.__name__.startswith("rquant."):
+                    yield f"module.{key}", item
+                continue
+            owner = getattr(item, "__module__", None)
+            type_owner = getattr(type(item), "__module__", None)
+            if (
+                isinstance(item, (Mapping, tuple, list, set, frozenset, functools.partial))
+                or owner == "rquant"
+                or (isinstance(owner, str) and owner.startswith("rquant."))
+                or type_owner == "rquant"
+                or (isinstance(type_owner, str) and type_owner.startswith("rquant."))
+            ):
+                yield f"module.{key}", item
+        return
     if isinstance(value, functools.partial):
         yield "partial.func", value.func
         yield from ((f"partial.arg[{index}]", item) for index, item in enumerate(value.args))
@@ -717,7 +851,7 @@ def _walk_reachable(
             raise AssertionError("reachability node limit exceeded")
         seen.add(identity)
         yield path, value
-        if value is None or isinstance(value, atomic + (ModuleType, type)):
+        if value is None or isinstance(value, atomic + (type,)):
             continue
         children: list[tuple[str, object]] = []
         for label, child in _children(value):
@@ -729,37 +863,167 @@ def _walk_reachable(
         pending.extend((f"{path}.{label}", child, depth + 1) for label, child in children)
 
 
-def _forbidden_reachable(path: str, value: object) -> str | None:
-    allowed = {
-        _registry_clock,
-        CurrentSignalEnvelope,
-        spool.CurrentSignalBusRoutedRecord,
-        spool.CurrentSignalRouteSpoolRecord,
-        spool.decode_current_signal_route_spool_record,
-        spool.verify_current_signal_route_spool_fixture,
-    }
-    try:
-        if value in allowed:
-            return None
-    except TypeError:
-        pass
-    if isinstance(value, (FunctionType, MethodType, type)):
-        name = f"{value.__module__}.{value.__qualname__}"
+_READONLY_CURRENT_API = (
+    CurrentSignalEnvelope,
+    spool.CurrentSignalBusRoutedRecord,
+    spool.CurrentSignalRouteSpoolRecord,
+    spool.current_signal_bus_routed_record_json_bytes,
+    spool.current_signal_route_spool_record_json_bytes,
+    spool.decode_current_signal_route_spool_record,
+    spool.verify_current_signal_route_spool_fixture,
+)
+_CURRENT_PERSISTENCE_INPUT_TYPES = (
+    CurrentSignalEnvelope,
+    spool.CurrentSignalBusRoutedRecord,
+    spool.CurrentSignalRouteSpoolRecord,
+)
+_DURABLE_PUBLICATION_RESULT_TYPES = (
+    spool.CurrentSignalRouteSpoolRecord,
+    spool.SignalRouteSpoolPointer,
+    spool.SignalRouteSpoolPublishSummary,
+)
+_DURABLE_SPOOL_OPERATIONS = (
+    spool._atomic_replace_at,
+    spool._immutable_write_at,
+    spool._write_all,
+    spool._write_temporary_at,
+)
+
+
+def _same_as_any(value: object, candidates: tuple[object, ...]) -> bool:
+    return any(value is candidate for candidate in candidates)
+
+
+def _resolve_annotation_attribute(node: ast.AST, namespace: Mapping[str, object]) -> object | None:
+    if isinstance(node, ast.Name):
+        return namespace.get(node.id)
+    if not isinstance(node, ast.Attribute):
+        return None
+    parent = _resolve_annotation_attribute(node.value, namespace)
+    if isinstance(parent, ModuleType):
+        return vars(parent).get(node.attr)
+    if isinstance(parent, type):
+        return vars(parent).get(node.attr)
+    return None
+
+
+def _annotation_identities(
+    annotation: object,
+    namespace: Mapping[str, object],
+) -> tuple[object, ...]:
+    if annotation is inspect.Signature.empty:
+        return ()
+    if isinstance(annotation, str):
+        try:
+            expression = ast.parse(annotation, mode="eval")
+        except SyntaxError:
+            return ()
+        resolved: list[object] = []
+        for node in ast.walk(expression):
+            if not isinstance(node, (ast.Name, ast.Attribute)):
+                continue
+            value = _resolve_annotation_attribute(node, namespace)
+            if value is not None and not _same_as_any(value, tuple(resolved)):
+                resolved.append(value)
+        return tuple(resolved)
+    nested = tuple(
+        item
+        for argument in get_args(annotation)
+        for item in _annotation_identities(argument, namespace)
+    )
+    return (annotation, *nested)
+
+
+def _callable_functions(value: object) -> Iterator[FunctionType]:
+    if isinstance(value, functools.partial):
+        yield from _callable_functions(value.func)
+        return
+    if isinstance(value, MethodType):
+        yield value.__func__
+        return
+    if isinstance(value, FunctionType):
+        yield value
+        return
+    if isinstance(value, type):
+        attributes = vars(value)
     else:
-        value_type = type(value)
-        name = f"{value_type.__module__}.{value_type.__qualname__}"
-    lowered = name.lower()
-    family_marker = any(marker in lowered for marker in ("r07", "v3", "current_signal"))
-    if family_marker:
-        return f"{path}: unapproved current-family object {name}"
-    attribute = path.rsplit(".", 1)[-1].removeprefix("attribute.").lower()
-    if attribute in _FORBIDDEN_EXACT_NAMES:
-        return f"{path}: forbidden attribute"
+        attributes = vars(type(value)) if callable(value) else {}
+    for item in attributes.values():
+        if isinstance(item, (classmethod, staticmethod)):
+            item = item.__func__
+        if isinstance(item, FunctionType):
+            yield item
+
+
+def _function_references(function: FunctionType) -> tuple[object, ...]:
+    referenced: list[object] = []
+    for item in (
+        *(function.__defaults__ or ()),
+        *(function.__kwdefaults__ or {}).values(),
+    ):
+        if not _same_as_any(item, tuple(referenced)):
+            referenced.append(item)
+    for cell in function.__closure__ or ():
+        try:
+            item = cell.cell_contents
+        except ValueError:
+            continue
+        if not _same_as_any(item, tuple(referenced)):
+            referenced.append(item)
+    for name in dict.fromkeys(function.__code__.co_names):
+        if name in function.__globals__:
+            item = function.__globals__[name]
+            if not _same_as_any(item, tuple(referenced)):
+                referenced.append(item)
+    modules = tuple(item for item in referenced if isinstance(item, ModuleType))
+    for module in modules:
+        attributes = vars(module)
+        for name in dict.fromkeys(function.__code__.co_names):
+            item = attributes.get(name)
+            if item is not None and not _same_as_any(item, tuple(referenced)):
+                referenced.append(item)
+    return tuple(referenced)
+
+
+def _exposes_durable_current_persistence(value: object) -> bool:
+    for function in _callable_functions(value):
+        signature = inspect.signature(function, eval_str=False)
+        inputs = tuple(
+            identity
+            for parameter in signature.parameters.values()
+            for identity in _annotation_identities(parameter.annotation, function.__globals__)
+        )
+        results = _annotation_identities(signature.return_annotation, function.__globals__)
+        references = _function_references(function)
+        current_input = any(
+            _same_as_any(identity, _CURRENT_PERSISTENCE_INPUT_TYPES)
+            for identity in (*inputs, *references)
+        )
+        durable_output = any(
+            _same_as_any(identity, _DURABLE_PUBLICATION_RESULT_TYPES) for identity in results
+        )
+        durable_operation = any(
+            _same_as_any(identity, _DURABLE_SPOOL_OPERATIONS) for identity in references
+        )
+        if current_input and (durable_output or durable_operation):
+            return True
+    return False
+
+
+def _forbidden_reachable(path: str, value: object) -> str | None:
+    if _same_as_any(value, (_registry_clock, *_READONLY_CURRENT_API)):
+        return None
+    if _exposes_durable_current_persistence(value):
+        return f"{path}: durable current-family persistence capability"
     return None
 
 
 class SignalRouteSpoolV3Writer:
-    pass
+    def __call__(
+        self,
+        record: spool.CurrentSignalRouteSpoolRecord,
+    ) -> spool.SignalRouteSpoolPointer:
+        raise AssertionError(f"synthetic writer must never run: {record.record_hash}")
 
 
 _SYNTHETIC_V3_WRITER = SignalRouteSpoolV3Writer()
@@ -780,8 +1044,39 @@ def test_reachability_walk_follows_referenced_callback_globals() -> None:
 
     assert violations == [
         "synthetic.callback.global._SYNTHETIC_V3_WRITER: "
-        "unapproved current-family object "
-        "tests.unit.test_signal_family_no_activation_reset.SignalRouteSpoolV3Writer"
+        "durable current-family persistence capability"
+    ]
+
+
+def test_reachability_detects_renamed_callable_behind_project_module_indirection() -> None:
+    durable_operation = spool._immutable_write_at
+    synthetic_module = ModuleType("rquant.synthetic_reachability_fixture")
+
+    class DurableSpoolPublisher:
+        def __call__(
+            self,
+            record: spool.CurrentSignalRouteSpoolRecord,
+        ) -> spool.SignalRouteSpoolPointer:
+            raise AssertionError(
+                f"synthetic writer must never run: {durable_operation} {record.record_hash}"
+            )
+
+    DurableSpoolPublisher.__name__ = "Opaque"
+    DurableSpoolPublisher.__qualname__ = "Opaque"
+    DurableSpoolPublisher.__module__ = synthetic_module.__name__
+    synthetic_module.alias = DurableSpoolPublisher()
+
+    def callback() -> object:
+        return synthetic_module
+
+    violations = [
+        violation
+        for path, value in _walk_reachable({"synthetic.callback": callback})
+        if (violation := _forbidden_reachable(path, value)) is not None
+    ]
+
+    assert violations == [
+        "synthetic.callback.closure[0].module.alias: durable current-family persistence capability"
     ]
 
 
