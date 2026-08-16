@@ -680,7 +680,9 @@ digest. It contains:
    `legacy_boundary_reject_guard`);
 4. the complete boundary-probe list and the exact `R07-B01` through `R07-B19` inventory mapping;
 5. the ten registry/builder source-export-signature snapshots and the frozen static forbidden
-   definition universe.
+   definition universe; and
+6. the exact evidence repository/workflow/jobs/artifact/path/retention/cache channel plus deployment
+   mode (`disabled_for_bootstrap` or `enforced`) and optional exact bootstrap predecessor pair.
 
 The policy itself is an ordinary reviewed repository diff. It is neither self-approved nor
 externally signed. An unlisted repository change, a rename, mode change, symlink, generated file,
@@ -698,21 +700,65 @@ value. A batch is one composite tuple/list fixture whose ordered members explici
 current-family members. This removes the former contradiction that required every batch member to
 occupy one top-level call argument.
 
-`BoundaryProbeV1` contains `probe_id`, `inventory_id`, `variant`, `entrypoint`, exact positional
-fixture IDs, exact keyword-to-fixture bindings, `current_member_fixture_ids`, expected exception
-type/category, mutation-guard expectation, and before/after snapshot digest. `variant` is
-`direct_current`, `stored_byte_current`, or `batch_current`; every applicable inventory row has
-the declared variants, and every complete inventory row has at least one probe. Args and kwargs are
-bound exactly as declared: no defaults, environment inheritance, variadics, substitute receiver,
-or alternate public entrypoint is permitted.
+`CurrentFixtureV1` contains `fixture_id`, exact current-model module and qualname, canonical model
+bytes, exact parser module and qualname, parsed-model digest, and allowed form (`object` or
+`stored_bytes`). The parser must consume the exact bytes and return the exact declared current
+model; constructor coercion, alternate parser, legacy fallback, or bytes/object substitution
+blocks.
 
-Before each call the probe captures every declared durable surface: database state, filesystem
-record/pointer state, outbox state, and write/open guard counters. It then invokes the named public
-entrypoint with the resolved fixture values. Success requires the exact expected rejection, no
-write transaction or mutation-capable open guard firing, and byte-equal after snapshots. A probe
-that rejects earlier than its declared boundary, lacks a required surface, changes a snapshot, or
-observes an unexpected exception blocks. Direct, stored-byte, and batch forms are separate
-evidence, not inferred from one another.
+`ProbeSetupV1` contains `setup_id`, an exact ordered tuple of `ProbeSetupStepV1`, and setup-result
+digest. Each step contains `kind`, exact target symbol/row key, and source fixture IDs; `kind` is
+`constructor_replacement`, `preloaded_store_row`, or `composite_batch`. An empty tuple means no
+setup. A constructor replacement may replace only the policy-named constructor and
+must return the parsed `CurrentFixtureV1` value without raising. A preloaded row writes exact
+current-family bytes under the policy-named test key. A composite batch resolves one ordered
+tuple/list fixture and marks its current-member IDs. Setup runs only against a fresh isolated
+temporary store/filesystem, completes before the before-snapshot, and is included in that snapshot;
+it cannot touch production state or satisfy the expected rejection itself. Installed replacements
+remain fixed through the call and after-snapshot, then are torn down outside the measured interval;
+setup and teardown cannot emit a boundary or mutation sentinel.
+
+`BoundaryReachedSentinelV1` contains the policy-named `sentinel_id`, `inventory_id`, exact source
+span/AST digest, `reached_count`, and `mutation_reached_count`. Its in-memory hook sits after the
+target public boundary has received and identified the configured current-family value, but before
+the first write transaction, mutation-capable open, or durable mutation. A passing call observes
+`reached_count == 1` and `mutation_reached_count == 0`; an earlier parser/setup/argument failure,
+missing sentinel, duplicate reach, or any mutation-side sentinel blocks.
+
+`BoundaryProbeV1` contains `probe_id`, `inventory_id`, `variant`, `setup_id`, `entrypoint`, exact
+positional fixture IDs, exact keyword-to-fixture bindings, current-member fixture IDs, expected
+exception type/category, sentinel ID, mutation-guard expectation, and before/after snapshot
+digests. Args and kwargs are exact: no defaults, inherited environment, variadics, substitute
+receiver, or alternate public entrypoint is permitted. The frozen matrix is:
+
+| Inventory | Variant | Setup | Call |
+|---|---|---|---|
+| `R07-B01` | `direct_current` | constructor replacement | `StrategyRunnerStore.process_batch` normal input; replacement returns exact current model |
+| `R07-B02` | `direct_current` | constructor replacement | `DailySummaryStage.build_signal` normal input |
+| `R07-B03` | `batch_current` | constructor replacement plus composite batch | `DailySummaryStage._error_signals` normal error batch |
+| `R07-B04` | `direct_current` | constructor replacement | `build_daily_error_signal` normal error input |
+| `R07-B05` | `direct_current` | none | `DailyNotificationProducer.emit(current_object)` |
+| `R07-B06` | `direct_current` | none | `SignalBusStore.ingest(current_object)` |
+| `R07-B07` | `stored_byte_current` | preloaded store row | `SignalBusStore.route(signal_id)` |
+| `R07-B08` | `direct_current` | none | `SignalBusStore.commit_source_route(current_object, ...)` |
+| `R07-B09` | `batch_current` | composite batch | `route_runner_signals(batch)` |
+| `R07-B10` | `batch_current` | composite batch | `SignalRouteSpool.publish(batch)` |
+| `R07-B11` | `stored_byte_current` | preloaded store row | `publish_signal_bus_prefix(store, ...)` |
+| `R07-B12` | `batch_current` | composite batch | `NotificationStateStore.replicate(batch)` |
+| `R07-B13` | `direct_current` | none | `PaperSignalQueueStore.ingest(current_object)` |
+| `R07-B14` | `stored_byte_current` | preloaded store row | `PaperSignalQueueStore.ingest(stored_bytes)` |
+| `R07-B15` | `direct_current` | none | `SignalDeliveryPayload(current_object, ...)` |
+| `R07-B16` | `direct_current` | none | `_publish_signal_authority(current_payload, ...)` |
+| `R07-B17` | `direct_current` | none | `ServingSourceAuthorityPublisher.publish(current_payload)` |
+| `R07-B18` | `static_only` | root snapshot | `runtime_service_main.build_builtin_registry`; no behavior call |
+| `R07-B19` | `static_only` | ten-root snapshot | builtin registry and all eight signal-path builders; no behavior call |
+
+For `R07-B01` through `R07-B17`, setup completes first, then the harness captures every declared
+database, filesystem record/pointer, outbox, and guard surface, invokes the exact call, and captures
+again. Success requires the expected rejection, exact sentinel reach, no write/open guard firing,
+and byte-equal snapshots. `R07-B18` and `R07-B19` pass only the static gate below. Every setup,
+variant, call binding, and sentinel is policy-listed; changing the matrix requires a reviewed policy
+diff.
 
 ##### Static Registry And Forbidden-Definition Gate
 
@@ -741,12 +787,62 @@ alias, or snapshot drift blocks.
 
 ##### CI Evidence And Deployment Gate
 
-On the exact candidate commit/tree, CI runs the complete diff, boundary, root-snapshot, and
-forbidden-definition gates on Python 3.11 and Python 3.12. It uploads one ordinary canonical JSON
-evidence artifact. `R07DrGateEvidenceV1` contains only the baseline and candidate commit/tree,
-policy digest, complete-diff digest, boundary manifest/result digest, root-snapshot digest,
-forbidden-definition digest, and the two Python run IDs and pass/fail outcomes. `passed` requires
-both Python runs to pass with zero skipped or deselected gate tests.
+The only accepted evidence producer is GitHub Actions workflow `.github/workflows/ci.yml`, test jobs
+`r07-differential-gate-py311` and `r07-differential-gate-py312`, and aggregation job
+`r07-differential-gate-evidence`, triggered by `push` to exact ref `refs/heads/main` after merge.
+Branch protection forbids direct pushes, so the trusted `push main` event identifies a reviewed
+merge. Pull request, workflow-dispatch, tag, branch, rerun at another SHA, or pre-merge evidence is
+never deployment evidence. The checkout commit must equal the event `after` SHA, its resolved tree is
+recorded, and both Python 3.11 and 3.12 jobs run against that same pair.
+
+`R07DrGateEvidenceV1` is strict canonical JSON with exactly:
+
+```text
+schema_version: 1
+repository: roxorlt/rquant
+workflow_path: .github/workflows/ci.yml
+event_name: push
+ref: refs/heads/main
+producer_job_id: r07-differential-gate-evidence
+workflow_run_id: positive integer
+run_attempt: positive integer
+candidate_commit_sha: lowercase 40-hex
+candidate_tree_sha: lowercase 40-hex
+baseline_commit_sha: exact frozen commit
+baseline_tree_sha: exact frozen tree
+policy_digest: lowercase 64-hex
+complete_diff_digest: lowercase 64-hex
+boundary_manifest_digest: lowercase 64-hex
+boundary_result_digest: lowercase 64-hex
+root_snapshot_digest: lowercase 64-hex
+forbidden_definition_digest: lowercase 64-hex
+python_runs: exact ordered pair [3.11, 3.12]
+artifact_name: r07-dr-gate-<candidate_commit_sha>
+artifact_json_path: r07-dr-gate/evidence-v1.json
+retention_days: 90
+outcome: passed
+evidence_digest: lowercase 64-hex over canonical JSON without this field
+```
+
+Each `python_runs` entry has exactly `python_minor`, `job_id`, `job_run_id`, `workflow_run_id`, `run_attempt`,
+`candidate_commit_sha`, `candidate_tree_sha`, `collected`, `passed`, `skipped`, `deselected`,
+`result_digest`, and `outcome`. Both entries must bind the top-level run and candidate pair;
+the 3.11 and 3.12 `job_id` values are exactly `r07-differential-gate-py311` and
+`r07-differential-gate-py312`, and each `job_run_id` is a positive integer.
+`outcome=passed` requires `collected == passed > 0`, `skipped == 0`, and `deselected == 0`. Unknown,
+missing, duplicate, coerced, or additional fields block.
+
+The artifact name is exactly `r07-dr-gate-<candidate_commit_sha>`, its internal JSON path is exactly
+`r07-dr-gate/evidence-v1.json`, and GitHub retention is 90 days. The deployment downloader accepts
+only that artifact from `roxorlt/rquant`. For the exact target SHA it queries the fixed workflow,
+requires one `push main` run identity, and selects the highest completed successful `run_attempt` of
+that run; a second distinct workflow-run ID for the same event/SHA is ambiguous and blocks. It
+then writes the verified bytes atomically to the server cache
+`/home/lighthouse/rquant/var/r07-dr-evidence/<candidate_commit_sha>.json`. The deploy process opens
+that cache read-only and rejects a symlink, non-regular file, commit filename mismatch, canonical
+JSON/digest mismatch, or channel metadata mismatch. A cache entry for any deployed or
+rollback-eligible commit is retained after GitHub's 90-day artifact expiry. This is a fixed input
+inside the trusted CI and server-permission boundary; it is intentionally unsigned.
 
 Merge review and branch protection are the approval boundary. The artifact is evidence for that
 trusted boundary, not a signature, URI chain, or separate authorization service.
@@ -757,10 +853,34 @@ Release deployment continues to use only:
 bash scripts/deploy-production.sh --target <exact-tag-or-full-sha>
 ```
 
-Before checkout or service mutation, deployment preflight verifies that the requested exact target
-resolves to the commit/tree recorded by passing CI evidence. It does not rebuild an artifact,
-accept a branch name, add a production API, or create an R07 writer. Existing deploy audit records
-remain the operational record.
+Deployment uses a two-release bootstrap because the old deployer checks out the target before the
+new evidence verifier can run:
+
+1. **Release A** adds the verifier, downloader/cache reader, target-tree policy reader, and moves
+   target resolution/evidence preflight before checkout or service mutation. Its target policy is
+   `disabled_for_bootstrap`; the existing deploy chain may install it once, and the deploy audit
+   records the exact Release A commit/tree plus `r07_gate=bootstrap_disabled`. While Release A is
+   current, any next target whose target-tree policy is also disabled is rejected.
+2. **Release B** names the exact Release A commit/tree as `bootstrap_predecessor`, sets target-tree
+   policy to `enforced`, and has accepted post-merge `push main` evidence for its own exact
+   commit/tree. The Release A deployer reads Release B's policy from the resolved Git object before
+   checkout, requires the installed pair to equal `bootstrap_predecessor`, verifies the cached
+   evidence, and only then proceeds. Whenever the installed policy is `disabled_for_bootstrap`, the
+   next target must be `enforced` and name that installed pair; every Release B-or-later target must
+   remain `enforced`. Removing or weakening either rule is an allowlist and review failure.
+
+Failure before checkout, including unavailable artifact/cache, failed CI outcome, wrong channel,
+commit/tree/policy/run mismatch, unreadable cache, or disabled post-bootstrap target, leaves the
+current checkout and services untouched and records a failed deployment audit. Failure after
+checkout uses the existing deployer's rollback to the exact previous commit/tree. If Release B
+rolls back automatically to Release A, Release A remains the only bootstrap state and a retry still
+requires Release B's enforced evidence; an explicit later deployment targeting a disabled policy
+is rejected. After Release B succeeds, rollback and forward targets must themselves carry enforced
+evidence. No failure is downgraded to a warning, and no manual cache file, PR artifact, or local test
+result substitutes for the fixed channel.
+
+The deployer does not rebuild an artifact, accept a branch name, add a production API, or create an
+R07 writer. Existing deploy audit records remain the operational record.
 
 ##### Findings, Tests, And Implementation Order
 
@@ -777,6 +897,8 @@ remaining relevant closures are:
 | `R07-RR-SPEC-P1-04` | closed by gate | ten root snapshots and the separate forbidden-definition universe are static and complete. |
 | `R07-RR-SPEC-P1-05` | superseded | signatures, external URIs, principals, and artifact attestation are outside the trusted-CI boundary. |
 | `R07-CQ-P1-02` | replacement pending implementation | delete the generic reachability helper; only the diff, behavior, and static gates may pass, then the original reviewer confirms the replacement. |
+| `R07-DR-SPEC-P1-01` | closed by this specification | typed current fixtures, controlled setup, post-setup snapshots, exact boundary sentinel, and the `R07-B01..B19` matrix prevent a setup or early parser failure from masquerading as boundary rejection. |
+| `R07-DR-SPEC-P1-02` | closed by this specification | strict post-merge `push main` evidence, fixed artifact/cache channel, and Release A/B bootstrap make the tested candidate pair mandatory before checkout. |
 
 Red tests must cover an unlisted repo diff; changed mode/rename; changed declaration AST; every
 inventory probe variant; malformed/cyclic/composite batch fixtures; substituted args/kwargs;
@@ -785,10 +907,12 @@ signature/export/source change; every forbidden definition/alias/export/key; and
 3.11/3.12 disagreement. No test may exercise a current-family durable writer because Phase A has
 none.
 
-Implementation order is: (1) policy and strict fixture/probe models; (2) diff and static resolver;
-(3) boundary harness and inventory tests; (4) CI dual-Python evidence job; (5) deployment preflight
-target-to-evidence check; (6) original reviewer re-review and removal of the retired generic helper.
-This adds no Phase B/C runtime capability.
+Implementation order is: (1) policy plus strict fixture/setup/probe/sentinel models and the complete
+inventory matrix; (2) diff and static resolver; (3) isolated boundary harness and inventory tests;
+(4) dual-Python post-merge `push main` evidence job and fixed artifact/cache reader; (5) Release A
+verifier/pre-checkout deployment refactor in audited bootstrap-disabled mode; (6) Release B enforced
+policy/evidence validation and rollback tests; (7) original reviewer re-review and removal of the
+retired generic helper. This adds no Phase B/C runtime capability.
 
 #### Historical Note
 
@@ -1324,6 +1448,8 @@ The reset finding ledger is stable:
 | `R07-DR-P1-02` | a direct, stored-byte, or batch current-family input rejects before its declared boundary or changes a durable surface | exact replayable probe bindings, guard counters, and database/filesystem/outbox/pointer before/after snapshots |
 | `R07-DR-P1-03` | a registry/builder change introduces a writer or activation symbol without runtime object traversal | static ten-root signature/export/source snapshots plus the separate forbidden-definition universe |
 | `R07-DR-P1-04` | production deploys a commit/tree other than the one validated by dual-Python CI | existing exact-target deployer preflight compares its resolved target to passing CI evidence |
+| `R07-DR-SPEC-P1-01` | setup, parser, or argument failure produces the expected exception before the intended boundary and falsely passes unchanged snapshots | exact typed current bytes/parser, controlled isolated setup, post-setup snapshots, reached-before-mutation sentinel, and explicit `R07-B01..B19` setup/call matrix |
+| `R07-DR-SPEC-P1-02` | deploy preflight accepts ambiguous/pre-merge evidence or cannot enforce evidence until after checkout | strict post-merge `push main` evidence schema and channel plus audited Release A bootstrap and pre-checkout-enforced Release B transition |
 | `RESET-R07-P2-01` | an identical post-link retry can publish a pointer without re-establishing records-directory durability | future v3-only primitive re-fsyncs the records directory; byte conflict rejects before pointer mutation |
 | `RESET-REG-P0-01` | generation code, self-consistent manifests/vectors/results, a service, or forged IPC can acquire append authority | fixed external root policy authorizes exact release hashes; root never imports generation code; unprivileged child has no store/verifier capability; root validates and writes after child exit |
 | `RESET-REG-P1-01` | underspecified successor/overlay schemas permit alternate bytes, order, identity, or nonexistent models | four exact schemas, canonical preimages/raw bytes, strict structural rejection, and actual-model prerequisite |
@@ -1340,7 +1466,9 @@ The planned red-test matrix is exact:
 | `R07-DR-P1-01` | `tests/unit/test_signal_family_differential_gate.py::TestCompleteRepoDiff`; `tests/fixtures/r07_differential_gate/policy-v1.json` | full raw Git diff covers every path, add/modify/delete, mode change, and rename-as-delete-plus-add; unlisted docs/tests/workflows/dependencies/scripts/deploy changes and declaration AST drift block |
 | `R07-DR-P1-02` | `tests/unit/test_signal_family_differential_boundaries.py` | every inventory row's declared direct/stored-byte/batch form uses exact scalar/bytes/composite fixtures, exact args/kwargs, expected failure, guards, and unchanged database/filesystem/outbox/pointer snapshots; cyclic/malformed/composite drift and early rejection block |
 | `R07-DR-P1-03` | `tests/unit/test_signal_family_differential_gate.py::TestRootSnapshots`; `tests/unit/test_signal_family_differential_gate.py::TestForbiddenDefinitions` | all ten root signatures/exports/source ASTs and the static forbidden-definition universe pass without import, construction, closure traversal, or bytecode analysis; every forbidden definition/alias/export/key blocks |
-| `R07-DR-P1-04` | CI job `r07-differential-gate`; `tests/unit/test_production_deploy.py` | Python 3.11 and 3.12 both emit passing ordinary JSON evidence for one exact candidate commit/tree; deploy preflight rejects any requested target whose resolved pair differs |
+| `R07-DR-P1-04` | CI jobs `r07-differential-gate-py311`, `r07-differential-gate-py312`, and `r07-differential-gate-evidence`; `tests/unit/test_production_deploy.py` | Python 3.11 and 3.12 both emit passing ordinary JSON evidence for one exact candidate commit/tree; deploy preflight rejects any requested target whose resolved pair differs |
+| `R07-DR-SPEC-P1-01` | `tests/unit/test_signal_family_differential_boundaries.py::TestProbeSetup`; `::TestBoundaryReachedSentinel`; `::TestCompleteInventoryMatrix` | exact parser/model bytes, constructor replacement, preloaded row, and composite batch setup run only in an isolated temporary store before snapshots; all `R07-B01..B17` calls reach exactly one policy sentinel and zero mutation sentinels; setup exception, early rejection, wrong current member, missing/duplicate sentinel, and any snapshot/guard drift block; `B18..B19` are static-only |
+| `R07-DR-SPEC-P1-02` | `tests/unit/test_signal_family_differential_evidence.py`; `tests/unit/test_production_deploy.py::TestR07Bootstrap` | PR/tag/manual/non-main, failed/partial/skipped, wrong SHA/tree/run/artifact/path/cache, duplicate/extra JSON, and disabled post-bootstrap evidence block; Release A audits bootstrap-disabled once, Release B verifies enforced evidence before checkout, pre-checkout failure leaves services untouched, and post-checkout failure rolls back exactly |
 | `RESET-REG-P1`, `RESET-REG-P1-01` | `tests/unit/test_signal_family_successor_registry_reset.py` | v2 parser/catalog/bytes/hashes/history are unchanged; exact four-schema field sets, hash preimages, raw canonical bytes, strict duplicate/extra/coercion/order rejection; successor declaration rejects before the actual model exists; v2 semantic/partial/absent/conflicting overlay never becomes ready |
 | `RESET-REG-P0`, `RESET-REG-P1`, `RESET-REG-P1-02` | `tests/integration/test_signal_family_verification_reset.py` | all five pair IDs resolve exact callable objects through real production builders and manifest-backed source hashes; exact service bindings cover the pair-derived service set and reject missing/duplicate/cross-role/wrong module/path/source hash before child execution; only a successful immutable child run can lead the root verifier to persist five receipts |
 | `RESET-REG-P0-01` | `tests/integration/test_signal_family_root_verifier_isolation.py` | child module inspection/import cannot discover or import privileged verifier/store authority; direct store open/append fails; no inherited descriptor/path/capability exists; forged, extra, oversized, noncanonical, or wrong-result IPC rejects; caller/service evidence APIs do not exist; authority change between child completion and root append rejects |
