@@ -892,12 +892,15 @@ these steps in order:
    field-for-field with the wire. Any mismatch rejects; only after all comparisons pass may the
    private verifier inject its non-serializable token and construct `VerifiedR07DrGateEvidenceV1`.
 
-The parent probe facade is stdlib-only and imports no `rquant` module. After preloading the facade's
-declared stdlib dependencies, the outer harness snapshots `tuple(os.environ.items())`, the ordered
-`(module_name, object_identity)` contents of `sys.modules`, and `tuple(sys.path)` immediately before
-facade import and before each probe; all three snapshots must be exactly equal after import and after
-every successful or failed probe. The child environment starts from `{}` and is exactly the
-following mapping, where `candidate_root` is the absolute read-only root materialized from the
+The parent probe facade is stdlib-only. Immediately before importing it, the outer harness records
+`tuple(os.environ.items())`, `tuple(sys.path)`, and an ordered tuple of
+`(module_name, object_identity)` for every loaded `rquant` module. Facade import must leave the
+environment and path snapshots equal
+and must introduce or replace no `rquant` module. After that import completes, the harness freezes
+the full ordered `(module_name, object_identity)` contents of `sys.modules` plus the environment and
+path snapshots as the parent baseline. Every probe must begin and end at exactly that baseline,
+including failure paths. The child environment starts from `{}` and is exactly the following
+mapping, where `read_only_candidate_root` is the absolute read-only root materialized from the
 wire's Git tree and `temp_root` is a fresh canonical absolute directory:
 
 ```text
@@ -905,7 +908,7 @@ LANG=C
 LC_ALL=C
 PYTHONUTF8=1
 PYTHONIOENCODING=utf-8
-PYTHONPATH=<candidate_root>
+PYTHONPATH=<read_only_candidate_root>/src
 PYTHONNOUSERSITE=1
 PYTHONDONTWRITEBYTECODE=1
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
@@ -924,6 +927,16 @@ TUSHARE_TOKEN_MAIN=00000000000000000000000000000000
 NOTIFY_ENABLED=false
 ```
 
+When the child entrypoint imports the checked-in `tests` facade, `PYTHONPATH` is instead exactly
+`<read_only_candidate_root>/src<os.pathsep><read_only_candidate_root>`; the source root is always
+first, the repository root is always second, and no third entry or empty segment is permitted.
+Immediately after child startup and after loading its declared `rquant` modules, but before any
+probe setup or gate evaluation, it resolves `rquant.__file__` and every loaded module whose name is
+`rquant` or starts with `rquant.`. Each module must have a concrete file and every resolved path must
+be contained by `<read_only_candidate_root>/src`; a missing path, symlink escape, shadow package, or
+module loaded from the repository root, parent environment, site packages, or another checkout
+rejects.
+
 `PATH` and every parent locale, Python, pytest, loader, secret, cloud credential, and production
 `RQUANT_*` value are absent. The child is launched with the canonical absolute path obtained from
 `Path(sys.executable).resolve(strict=True)`, so command lookup never needs parent `PATH`. If a future
@@ -936,10 +949,14 @@ binding independently, dirty the caller working tree, and attempt both public en
 produce verified authority, while an exact gate-to-wire-to-parse-to-verify round-trip must pass
 through the one private verifier. R07-02 red tests seed unknown secrets, cloud credentials,
 production `RQUANT_*`, `PATH`, locale, Python, and pytest sentinels in the parent, then assert the
-child sees the exact mapping above, the absolute resolved interpreter is invoked, and parent
-`os.environ`, `sys.modules`, and `sys.path` remain byte-for-byte/identity-for-identity unchanged on
-import, success, and failure. Tranche B accepts only the verified type; Q1/Q2, the trusted CI
-channel, production APIs/writers, and Phase B scope remain unchanged.
+child sees the exact mapping above and the exact two-entry `PYTHONPATH` only when the `tests` facade
+is required. They inject shadow `rquant` modules at the repository root, in site packages, and from
+another checkout and require each path attestation to reject. They also assert the absolute resolved
+interpreter is invoked, facade import changes neither parent environment/path nor the loaded
+`rquant` set, and the post-import parent `os.environ`, full `sys.modules`, and `sys.path` baselines
+remain byte-for-byte/identity-for-identity equal around successful and failed probes. Tranche B
+accepts only the verified type; Q1/Q2, the trusted CI channel, production APIs/writers, and Phase B
+scope remain unchanged.
 
 The artifact name is exactly `r07-dr-gate-<candidate_commit_sha>`, its internal JSON path is exactly
 `r07-dr-gate/evidence-v1.json`, and GitHub retention is 90 days. The deployment downloader accepts
