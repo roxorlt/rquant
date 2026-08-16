@@ -8,6 +8,10 @@ migration is complete.
 with root-quarantined, completely hashed immutable generations and one atomic runtime authority
 record (C). Artifact signing is not part of v1.
 
+**WRAP-P1-07 amendment:** The production `daily` role is frozen below before wrapper or adapter
+code. This amendment resolves the role/argument/environment contradiction in the original frozen
+text; all other decisions, including the v1 source-authenticity exclusion, remain unchanged.
+
 ## Scope And Threat Model
 
 ### Assets
@@ -85,6 +89,9 @@ trusted by root. A malicious accepted generation is executed only later with UID
   prior generation slots so one atomic write contains both forward and rollback authority.
 - Systemd always starts the fixed root-owned runtime wrapper. The wrapper revalidates one exact
   generation and executes only an allowlisted role from that generation.
+- The production `daily` role maps only to generation-local
+  `rquant.production_daily_main`. It accepts no caller arguments or business overrides and runs
+  only with the exact application environment policy frozen by the profile.
 - No production path uses `preexec_fn`, a global interpreter FD authority, mutable `current`
   symlinks, checkout imports, pathname fallback, or unintended inherited FDs.
 - Unsupported host facts, failed validation, incomplete durability, ambiguous recovery, and
@@ -119,6 +126,8 @@ The residual TCB is:
 - `/usr/local/libexec/rquant-production-deploy.pyz`, owner `root:root`, exact mode `0555`;
 - `/usr/local/libexec/rquant-runtime-exec.pyz`, owner `root:root`, exact mode `0555`;
 - `/etc/rquant/production-runtime-profile.json`, owner `root:root`, exact mode `0444`;
+- `/etc/rquant/rquant-daily.env`, a fixed regular single-link `root:root` application-value file
+  with exact mode `0400`, whose names and values are filtered by the runtime wrapper; and
 - the narrow root-owned quarantine/publication helper and immutable generation store.
 
 The versioned profile freezes a canonical file list for `/usr/bin/python3.11`, its ELF interpreter,
@@ -134,10 +143,12 @@ schema, root ownership, exact-mode, ancestry, or no-override policy. The install
 or substitutes another Python or dynamically broadens the closure.
 
 The profile is non-secret strict JSON. It freezes schema/platform, profile ID, the complete runtime
-closure above, generation/inbox/quarantine roots, allowed operations, allowed runtime
-roles/modules, environment allowlists, and manifest schema. Unknown, duplicate, malformed,
-non-native scalar, or overridden values are rejected. There is no GID alternative, `{root, euid}`
-policy, environment override, argv override, wildcard closure, or runtime-discovered exception.
+closure above, generation/inbox/quarantine roots, allowed operations, exact role-to-module/cwd/
+import mappings, each role's exact environment name-to-grammar policy, and manifest schema. A bare
+name tuple is insufficient: every permitted environment name binds required/optional presence,
+grammar class, and v1 bounds. Unknown, duplicate, malformed, non-native scalar, or overridden
+values are rejected. There is no GID alternative, `{root, euid}` policy, environment override,
+argv override, wildcard closure, or runtime-discovered exception.
 
 ## Initial Entry And Environment
 
@@ -161,6 +172,92 @@ exec. `-I -S` and the generation-local installed package layout determine import
 
 The initial OS launcher remains residual TCB. The pyz does not claim to prove the integrity of its
 own already-running Python process.
+
+## WRAP-P1-07 Daily Role And Application Environment
+
+The profile contains exactly one production mapping for this service:
+
+```text
+role daily -> module rquant.production_daily_main -> caller argv count 0
+```
+
+The adapter is generation-local and manifest-covered. The frozen bootstrap receives only the
+literal role `daily`; immediately before `runpy` it sets module-visible `sys.argv` to exactly
+`["rquant.production_daily_main"]`. The adapter rejects any other `sys.argv` shape and exposes no
+argument parser. It computes the trade date from the current date in `Asia/Shanghai`, selects all
+presets, enables ingestion, and disables minute backfill, equivalent to
+`rquant run-daily --skip-minute-backfill`. A fixed `90` may remain only as an inert compatibility
+default on a skipped minute-backfill path; callers cannot supply or alter it. The adapter may call
+an existing typed or CLI function internally with these fixed values, but accepts no checkout,
+manifest path, control root, commit, generation, module, cwd, environment map, or other business
+override.
+
+The adapter runs only after the immutable current generation is fully revalidated. It derives
+runtime/code identity solely from the current authority slot and root-recomputed
+`full_manifest_hash`, never from a Git checkout. Candidate commit remains audit-only and cannot
+become code identity. Dotenv loading is disabled for this path; neither a generation `.env` nor
+`/home/lighthouse/rquant/.env` is read.
+
+The `daily` child environment contains no names outside this exact v1 set:
+
+```text
+LANG
+LC_ALL
+TZ
+TUSHARE_TOKEN_MAIN
+TUSHARE_TOKEN_BACKUP
+DATA_DIR
+DUCKDB_PATH
+DUCKDB_READONLY_PATH
+PARQUET_DIR
+LOG_DIR
+LOG_LEVEL
+APP_ENV
+PUSHDEER_KEYS
+PUSHDEER_RECIPIENT_IDS
+PUSHDEER_ENDPOINT
+PUSHPLUS_TOKENS
+PUSHPLUS_RECIPIENT_IDS
+PUSHPLUS_ENDPOINT
+NOTIFICATION_STATE_PATH
+NOTIFICATION_STATE_BUSY_TIMEOUT_MS
+NOTIFY_ENABLED
+NOTIFY_DAILY_SUMMARY
+NOTIFY_ERROR
+NOTIFY_ERROR_COOLDOWN_SECONDS
+NOTIFY_OPS_COOLDOWN_SECONDS
+POOL2_MAX_AGE_DAYS
+```
+
+The profile binds each name to the following grammar and presence rule. All decoded values are
+strings, the aggregate child environment is at most 64 KiB, and no secret value is logged or
+placed in the profile or authority record.
+
+| Class | Names and presence | Frozen v1 grammar |
+|---|---|---|
+| Locale | `LANG`, `LC_ALL` optional; `TZ` required | locale is exactly `C`, `C.UTF-8`, `en_US.UTF-8`, or `zh_CN.UTF-8`; timezone is exactly `Asia/Shanghai` or `UTC` |
+| Tushare secret | `TUSHARE_TOKEN_MAIN` required; `TUSHARE_TOKEN_BACKUP` optional | printable non-control UTF-8, 32-512 bytes, no NUL/newline or leading/trailing whitespace |
+| Application path | `DATA_DIR`, `DUCKDB_PATH`, `PARQUET_DIR`, `LOG_DIR`, `NOTIFICATION_STATE_PATH` required; `DUCKDB_READONLY_PATH` optional | canonical absolute UTF-8 path, at most 4096 bytes; no tilde, NUL/newline, dot traversal, symlink alias, or escape from profile-frozen `lighthouse` application-data roots |
+| Logging/runtime | `LOG_LEVEL`, `APP_ENV` required | level is exactly `DEBUG`, `INFO`, `WARNING`, or `ERROR`; environment is exactly `prod` |
+| Channel secrets | `PUSHDEER_KEYS`, `PUSHPLUS_TOKENS` optional | comma-separated 0-16 items; each non-empty item is printable non-control UTF-8 of 1-512 bytes; no NUL/newline/empty interior item; total at most 8192 bytes |
+| Recipient IDs | corresponding `*_RECIPIENT_IDS` required when a channel token list is non-empty | comma-separated 1-16 items, each 1-128 printable non-control UTF-8 bytes, total at most 2048 bytes; count is one or equals token count |
+| Endpoints | corresponding `*_ENDPOINT` required when a channel token list is non-empty | absolute HTTPS URL, at most 2048 UTF-8 bytes, with host and path, no userinfo, fragment, NUL, or newline |
+| Boolean | `NOTIFY_ENABLED`, `NOTIFY_DAILY_SUMMARY`, `NOTIFY_ERROR` required | exactly lowercase `true` or `false` |
+| Integer | `NOTIFICATION_STATE_BUSY_TIMEOUT_MS`, both `NOTIFY_*_COOLDOWN_SECONDS`, and `POOL2_MAX_AGE_DAYS` required | strict unsigned decimal, no sign or leading zero except `0`; timeout 1-600000 ms, cooldown 0-86400 seconds, pool age 1-365 days |
+
+Application paths affect only `lighthouse`-owned application data. They can never select or alter
+an interpreter, profile, authority record, role, module, cwd, import root, generation, or
+manifest. `PATH`, `HOME`, every `PYTHON*`, every `LD_*`, `RQUANT_CODE_COMMIT`, Tushare login
+username/password/cookie fields, deploy/Lab/LLM/panorama/backup/upload variables, and arbitrary
+`RQUANT_*` names are explicitly excluded and never copied to the child.
+
+Production systemd may source application values only from the fixed
+`/etc/rquant/rquant-daily.env`, a regular single-link `root:root` file with exact mode `0400` and
+root-owned non-writable ancestors. The wrapper discards every non-allowlisted incoming name and
+independently validates every copied value against the profile grammar before exec. It never loads
+checkout `/home/lighthouse/rquant/.env`. This decision does not authorize installing or changing
+the fixed file; secret rotation remains excluded and separately authorized. Any v1 name,
+presence rule, grammar, or bound change requires a new profile/ADR version.
 
 ## Root Quarantine And Generation Publication
 
@@ -216,9 +313,11 @@ schema contains exactly:
 - an explicit absent-prior representation for first install, with no omitted or inferred fields.
 
 Each roles value binds the role's generation-local Python, module, working directory, application
-source root, and site-packages roots. Both generation paths must be canonical descendants of the
-frozen store and all current/prior fields must validate as complete self-consistent slots. Commit
-fields never select content and are excluded from generation identity and trust decisions.
+source root, site-packages roots, caller-argv policy, and exact environment name-to-grammar policy.
+For `daily`, the module is only `rquant.production_daily_main` and the argv policy is zero caller
+arguments. Both generation paths must be canonical descendants of the frozen store and all
+current/prior fields must validate as complete self-consistent slots. Commit fields never select
+content and are excluded from generation identity and trust decisions.
 
 After a generation is durable, the helper creates a same-directory temporary record with
 create-new/no-follow semantics, validates its exact schema, sets root ownership and exact mode,
@@ -247,8 +346,10 @@ Each production unit has a fixed root-owned command equivalent to:
 ```
 
 The unit runs as UID `lighthouse`. `<allowlisted-role>` is a literal unit-owned value, not caller
-input. Units require no dynamic drop-in or `daemon-reload` per generation. They do not load an
-`EnvironmentFile` that can override Python, module, profile, generation, cwd, or import behavior.
+input. Units require no dynamic drop-in or `daemon-reload` per generation. The `daily` unit may
+load only the fixed root-owned `/etc/rquant/rquant-daily.env` application-value file described
+above; no `EnvironmentFile` value can override Python, module, profile, generation, cwd, import,
+or authority behavior.
 
 The wrapper opens the fixed profile and `current.json`, verifies root ownership/modes/ancestry and
 the record schema, then revalidates the exact current generation path, generation ID,
@@ -262,11 +363,15 @@ arguments equivalent to:
   <allowlisted-role>
 ```
 
-`<root-pyz-frozen-bootstrap>` is code frozen inside the already verified root-owned runtime pyz;
-it is not generation or record text. It receives only the allowlisted role, inserts only the
-absolute application source and site-packages paths bound by `current_roles` and covered by the
-root-recomputed manifest, verifies each inserted path is canonical and inside the current
-generation, then invokes the allowlisted module with `runpy`.
+`FROZEN_BOOTSTRAP` is the `<root-pyz-frozen-bootstrap>` code frozen inside the already verified
+root-owned runtime pyz; it is not generation or record text. The child bootstrap reopens the
+fixed profile and `current.json` and independently repeats strict record, current-slot, generation,
+`full_manifest_hash`, role, import-root, cwd, and application-environment validation. Record paths
+are data only and are never interpolated into bootstrap code, environment, or argv. The bootstrap
+selects the role mapping and environment grammar from the root-owned profile subject to its frozen
+minimum schema, receives only the literal role, inserts only manifest-covered canonical source
+and site-packages paths inside the current generation, sets the selected module's `sys.argv` as
+specified above, and invokes only that module with `runpy`.
 
 The generation-local Python, `pyvenv.cfg`, module tree, cwd, application source, and site-packages
 are manifest-covered and root-owned. `pyvenv.cfg` must contain exactly
@@ -276,6 +381,9 @@ outside the two approved roots, and unexpected site-packages entry. The fresh en
 `PATH`, all `PYTHON*`, all `LD_*`, user-site/home import influence, and every site/import override.
 The wrapper never uses ordinary `-m` site startup, dereferences a `current` symlink, imports from
 the checkout, searches `PATH`, or accepts a module/path override.
+
+Existing `rquant.runtime_service_main` and formal-runtime paths remain untouched legacy behavior.
+They are not the HYBRID `daily` adapter and cannot satisfy or provide evidence for this decision.
 
 ## State Machine
 
@@ -290,6 +398,8 @@ UNTRUSTED_REQUEST
   -> AUTHORITY_TEMP_DURABLE
   -> AUTHORITY_ACTIVE(current=new, prior=old)
   -> RUNTIME_REVALIDATED
+  -> APPLICATION_ENV_VALIDATED
+  -> DAILY_ADAPTER_BOUND
   -> RUNNING
 ```
 
@@ -371,10 +481,14 @@ Implementation proceeds in bounded batches:
 3. Add the no-arbitrary-path root helper, anchored quarantine copy, post-copy root-tree rehash,
    immutable generation publication, and tests proving `full_manifest_hash` is the sole identity
    while malicious candidate manifest/commit metadata grants no privilege or root execution.
-4. Add two-slot single `current.json` publication/recovery, one-layer rollback, the complete crash
-   matrix, frozen `-I -S -c` role bootstrap, and exact generation/cwd/import/env/site isolation
-   tests.
-5. Add Linux Python 3.11 exact-entry CI with zero skip. After separate infrastructure approval,
+4. Before wrapper or adapter code, implement this amendment's exact `daily` role mapping,
+   zero-caller-argument adapter tests, profile name-to-grammar schema, fixed-value invocation,
+   dotenv exclusion, and fixed application-environment validation. Legacy
+   `runtime_service_main` or formal-runtime tests are not acceptance evidence.
+5. Add two-slot single `current.json` publication/recovery, one-layer rollback, the complete crash
+   matrix, frozen `-I -S -c` child revalidation/bootstrap, and exact
+   generation/cwd/import/env/site isolation tests.
+6. Add Linux Python 3.11 exact-entry CI with zero skip. After separate infrastructure approval,
    run the cloud hard gate below. Production wiring remains blocked until it passes.
 
 ## macOS And Cloud Acceptance
@@ -400,8 +514,10 @@ The separately authorized cloud acceptance is a hard gate and must record exact 
 5. Every crash point in the two-slot single-record matrix is fault-injected and recovers only from
    the last durably validated `current.json`. Current/prior promotion is atomic, automatic rollback
    is limited to one layer, and no directory/audit/process inference is accepted.
-6. Wrapper role/path/module/cwd/import/environment injection is rejected. `PATH`, `PYTHON*`,
-   `LD_*`, user site, checkout, mutable `current`, and `EnvironmentFile` cannot affect execution.
+6. Wrapper role/path/module/cwd/import/environment injection is rejected. `PATH`, `HOME`,
+   `PYTHON*`, `LD_*`, user site, checkout, mutable `current`, and any environment file other than
+   the fixed root-owned daily application file cannot affect execution. Every allowed application
+   value is revalidated against the profile's exact name-to-grammar policy.
    `.pth`, `include-system-site-packages = true`, `sitecustomize`, `usercustomize`, external paths,
    and namespace-package escapes are rejected before `runpy`.
 7. The real `/usr/bin/python3.11` bootstrap and `-I -S -c` runtime entry execute on Linux with zero
@@ -410,6 +526,11 @@ The separately authorized cloud acceptance is a hard gate and must record exact 
    blocks and requires a new ADR/profile version and authorized infrastructure publication.
 8. Backup restore and both successful and failed rollback paths preserve one valid authority
    record, launch the recorded exact generation, retain evidence, and never fall back to checkout.
+9. The literal `daily` role selects only generation-local `rquant.production_daily_main`; the
+   child sees zero caller arguments and the fixed run-daily behavior. Invalid argv, extra or
+   malformed environment values, dotenv/checkout influence, role/module substitution, and use of
+   commit audit metadata as code identity are rejected. `runtime_service_main` and formal-runtime
+   execution do not count as this gate.
 
 ## Closure Ledger
 
@@ -424,3 +545,4 @@ These statuses close architecture findings only; implementation and production g
 | C-P1-09 | CLOSED | Fixed systemd pyz and generation venv `-I -S -c` bootstrap with manifest-bound paths, `runpy`, and site escape rejection |
 | C-P2-01 | CLOSED | Hard gates test malicious metadata without provenance claims plus `.pth`, system-site, customization, namespace, crash, backup, and rollback boundaries |
 | C-P2-02 | CLOSED | Versioned profile and cloud gate compare the exact canonical Python/ELF/stdlib/shared-library/ancestor closure and pyz hashes without runtime relaxation |
+| WRAP-P1-07 | CLOSED by design amendment; implementation required | Generation-local zero-argument daily adapter, exact role-to-module and environment grammar policy, fixed root-owned application EnvironmentFile boundary, child authority revalidation, and audit-only commit identity |
