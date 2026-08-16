@@ -2,20 +2,27 @@
 
 from __future__ import annotations
 
+import base64
 import json
+from pathlib import Path
 
 import pytest
 
+from rquant.signal_contracts import CurrentSignalEnvelope, parse_signal_envelope
 from rquant.signal_family_differential_gate import (
     BOUNDARY_PROBES,
     BoundaryProbeV1,
     BoundaryReachedSentinelV1,
     CallShapeV1,
-    CurrentFixtureV1,
     FixtureValueV1,
     ProbeSetupV1,
+    load_policy,
     strict_fixture_value,
 )
+from tests.unit.test_signal_contracts import _CURRENT_CANONICAL_FIXTURES
+
+ROOT = Path(__file__).parents[2]
+POLICY_PATH = ROOT / "tests" / "fixtures" / "r07_differential_gate" / "policy-v1.json"
 
 
 def test_complete_inventory_has_immutable_b01_to_b19_order() -> None:
@@ -24,6 +31,21 @@ def test_complete_inventory_has_immutable_b01_to_b19_order() -> None:
     )
     assert BOUNDARY_PROBES[-2].variant == "static_only"
     assert BOUNDARY_PROBES[-1].variant == "static_only"
+
+
+def test_boundary_manifest_contains_real_current_fixture_and_no_result_placeholders() -> None:
+    expected_bytes = _CURRENT_CANONICAL_FIXTURES[0][2]
+    assert "setup_result_digest" not in ProbeSetupV1.model_fields
+    assert "before_snapshot_digest" not in BoundaryProbeV1.model_fields
+    assert "after_snapshot_digest" not in BoundaryProbeV1.model_fields
+    policy = load_policy(POLICY_PATH)
+    fixtures = {fixture.fixture_id: fixture for fixture in policy.current_fixtures}
+    assert fixtures
+    for fixture in fixtures.values():
+        raw = base64.b64decode(fixture.canonical_model_bytes, validate=True)
+        assert raw == expected_bytes
+        parsed = parse_signal_envelope(raw)
+        assert type(parsed) is CurrentSignalEnvelope
 
 
 def test_fixture_value_requires_exact_kind_and_canonical_digest() -> None:
@@ -67,11 +89,12 @@ def test_call_shape_has_sorted_keywords_and_one_result_action() -> None:
 
 
 def test_sentinel_requires_exactly_one_boundary_reach_and_zero_mutations() -> None:
+    probe = next(item for item in BOUNDARY_PROBES if item.inventory_id == "R07-B06")
     sentinel = BoundaryReachedSentinelV1(
         sentinel_id="sentinel.r07-b06",
         inventory_id="R07-B06",
-        source_span="signal_bus.py:594",
-        ast_digest="a" * 64,
+        source_span=probe.source_span,
+        ast_digest=probe.boundary_ast_sha256,
         reached_count=1,
         mutation_reached_count=0,
     )
@@ -82,11 +105,14 @@ def test_sentinel_requires_exactly_one_boundary_reach_and_zero_mutations() -> No
 def test_boundary_probe_requires_exact_exception_phase_and_snapshot_contract() -> None:
     probe = next(item for item in BOUNDARY_PROBES if item.inventory_id == "R07-B03")
     assert isinstance(probe, BoundaryProbeV1)
-    assert probe.call_shape.call_result_action == "consume_tuple"
+    assert probe.call_result_action == "consume_tuple"
+    assert probe.current_fixture_id == "current.object"
+    assert (
+        probe.behavior_test == "tests/unit/test_signal_family_no_activation_reset.py::"
+        "test_r07_b03_sentinel_is_lazy_and_stops_before_first_yield"
+    )
     assert probe.expected_exception_phase == "consumption"
     assert probe.expected_yielded_count == 0
-    assert isinstance(probe.current_fixture, CurrentFixtureV1)
-    assert isinstance(probe.setup, ProbeSetupV1)
 
 
 def test_policy_probe_json_has_no_duplicate_keys() -> None:

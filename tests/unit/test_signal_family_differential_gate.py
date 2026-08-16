@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 from pathlib import Path
 
 import pytest
 
+import rquant.signal_family_differential_gate as differential_gate
 from rquant.signal_family_differential_gate import (
     BASELINE_COMMIT_SHA,
     BASELINE_TREE_SHA,
@@ -20,7 +22,9 @@ from rquant.signal_family_differential_gate import (
     collect_complete_git_diff,
     load_policy,
     resolve_fixture_values,
+    verify_boundary_probe_source,
     verify_forbidden_definitions,
+    verify_production_declaration,
     verify_root_snapshot,
 )
 
@@ -106,11 +110,8 @@ def test_composite_fixture_resolves_only_to_prior_ids_and_hashes_resolved_bytes(
     ).hexdigest()
 
 
-def test_complete_diff_rejects_unlisted_file_in_isolated_repo(tmp_path: Path) -> None:
-    repo = tmp_path / "repo"
-    subprocess.run(["git", "init", "--quiet", str(repo)], check=True)
-    (repo / "tracked.txt").write_text("base\n", encoding="utf-8")
-    subprocess.run(["git", "-C", str(repo), "add", "tracked.txt"], check=True)
+def _commit(repo: Path, message: str) -> str:
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
     subprocess.run(
         [
             "git",
@@ -123,13 +124,114 @@ def test_complete_diff_rejects_unlisted_file_in_isolated_repo(tmp_path: Path) ->
             "commit",
             "--quiet",
             "-m",
-            "base",
+            message,
         ],
         check=True,
     )
-    (repo / "unlisted.txt").write_text("blocked\n", encoding="utf-8")
-    result = collect_complete_git_diff(repo, allowed_paths={"tracked.txt"})
-    assert result.blocked_paths == ("unlisted.txt",)
+    return subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def test_normative_baseline_pair_and_candidate_repository_identity() -> None:
+    assert BASELINE_COMMIT_SHA == "45d0b57c4c5cbab1700fa5e3c386c6756892a7d6"
+    assert BASELINE_TREE_SHA == "4f67e67192855874e82baa13dc343a1d6939bd67"
+    candidate = subprocess.run(
+        ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    candidate_tree = subprocess.run(
+        ["git", "-C", str(ROOT), "rev-parse", f"{candidate}^{{tree}}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    policy = load_policy(POLICY_PATH)
+    result = differential_gate.verify_candidate_gate(
+        ROOT,
+        policy=policy,
+        candidate_commit=candidate,
+        candidate_tree=candidate_tree,
+    )
+    assert result.passed
+    assert result.candidate_tree_sha == candidate_tree
+    with pytest.raises(ValueError, match="candidate tree does not match"):
+        differential_gate.verify_candidate_gate(
+            ROOT,
+            policy=policy,
+            candidate_commit=candidate,
+            candidate_tree="0" * 40,
+        )
+
+
+def test_complete_diff_uses_explicit_commit_range_and_raw_change_identity(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "init", "--quiet", str(repo)], check=True)
+    for name in ("modified.txt", "deleted.txt", "renamed.txt", "mode.txt", "typed"):
+        (repo / name).write_text(f"{name}\n", encoding="utf-8")
+    baseline = _commit(repo, "baseline")
+
+    (repo / "modified.txt").write_text("changed\n", encoding="utf-8")
+    (repo / "deleted.txt").unlink()
+    (repo / "renamed.txt").rename(repo / "renamed-new.txt")
+    (repo / "added.txt").write_text("added\n", encoding="utf-8")
+    os.chmod(repo / "mode.txt", 0o755)
+    (repo / "typed").unlink()
+    (repo / "typed").symlink_to("modified.txt")
+    candidate = _commit(repo, "candidate")
+    (repo / "head-only.txt").write_text("not in candidate\n", encoding="utf-8")
+    _commit(repo, "later head")
+    (repo / "modified.txt").write_text("dirty worktree only\n", encoding="utf-8")
+    (repo / "untracked.txt").write_text("blocked\n", encoding="utf-8")
+
+    result = collect_complete_git_diff(
+        repo,
+        baseline_commit=baseline,
+        candidate_commit=candidate,
+        include_untracked=True,
+    )
+    observed = {
+        (entry.status, entry.path, entry.old_mode, entry.new_mode) for entry in result.entries
+    }
+    assert ("A", "added.txt", "000000", "100644") in observed
+    assert ("M", "modified.txt", "100644", "100644") in observed
+    assert ("D", "deleted.txt", "100644", "000000") in observed
+    assert ("D", "renamed.txt", "100644", "000000") in observed
+    assert ("A", "renamed-new.txt", "000000", "100644") in observed
+    assert ("M", "mode.txt", "100644", "100755") in observed
+    assert ("T", "typed", "100644", "120000") in observed
+    assert ("?", "untracked.txt", "000000", "100644") in observed
+    assert not any(entry.path == "head-only.txt" for entry in result.entries)
+
+
+def test_actual_candidate_gate_rejects_any_unlisted_change() -> None:
+    candidate = subprocess.run(
+        ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    candidate_tree = subprocess.run(
+        ["git", "-C", str(ROOT), "rev-parse", f"{candidate}^{{tree}}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    policy = load_policy(POLICY_PATH)
+    narrowed = policy.model_copy(update={"allowed_diff": policy.allowed_diff[:-1]})
+    result = differential_gate.verify_candidate_gate(
+        ROOT,
+        policy=narrowed,
+        candidate_commit=candidate,
+        candidate_tree=candidate_tree,
+    )
+    assert not result.passed
+    assert result.blocked_entries or result.missing_entries
 
 
 def test_root_snapshots_are_static_and_cover_ten_roots() -> None:
@@ -142,6 +244,82 @@ def test_root_snapshots_are_static_and_cover_ten_roots() -> None:
 def test_forbidden_definition_universe_is_static_source_only() -> None:
     assert "src/rquant/signal_route_spool.py" in FORBIDDEN_DEFINITION_UNIVERSE.source_files
     assert verify_forbidden_definitions(ROOT, FORBIDDEN_DEFINITION_UNIVERSE).passed
+
+
+def test_forbidden_definition_gate_detects_symbols_and_registry_string_keys(
+    tmp_path: Path,
+) -> None:
+    module_path = Path("src/rquant/runtime_service_main.py")
+    source_path = tmp_path / module_path
+    source_path.parent.mkdir(parents=True)
+    source_path.write_text(
+        "v3_writer = object()\nregistry = {'v3_overlay': v3_writer}\n",
+        encoding="utf-8",
+    )
+    universe = FORBIDDEN_DEFINITION_UNIVERSE.model_copy(
+        update={"source_files": (module_path.as_posix(),)}
+    )
+    result = verify_forbidden_definitions(tmp_path, universe)
+    assert not result.passed
+    assert result.reasons == ("src/rquant/runtime_service_main.py: v3_overlay,v3_writer",)
+
+
+def test_policy_completeness_rejects_any_declaration_or_universe_omission() -> None:
+    policy = load_policy(POLICY_PATH)
+    assert policy.production_declarations
+    assert all(declaration.module_path for declaration in policy.production_declarations)
+    assert all(declaration.symbol for declaration in policy.production_declarations)
+    assert all(declaration.source_span for declaration in policy.production_declarations)
+    assert all(declaration.normalized_ast_sha256 for declaration in policy.production_declarations)
+    assert all(declaration.role for declaration in policy.production_declarations)
+    assert policy.root_snapshots and all(snapshot.exports for snapshot in policy.root_snapshots)
+    universe = policy.forbidden_definition_universe
+    assert (
+        universe.source_files and universe.symbols and universe.exports and universe.registry_keys
+    )
+    assert policy.fixtures_digest == differential_gate.fixture_manifest_digest(
+        policy.fixtures,
+        policy.current_fixtures,
+    )
+    duplicated_diff = policy.model_copy(
+        update={"allowed_diff": (*policy.allowed_diff, policy.allowed_diff[0])}
+    )
+    assert not differential_gate.verify_policy_completeness(duplicated_diff).passed
+
+    for field in ("source_files", "symbols", "exports", "registry_keys"):
+        value = getattr(universe, field)
+        narrowed_universe = universe.model_copy(update={field: value[:-1]})
+        narrowed = policy.model_copy(update={"forbidden_definition_universe": narrowed_universe})
+        assert not differential_gate.verify_policy_completeness(narrowed).passed
+
+    narrowed = policy.model_copy(
+        update={"production_declarations": policy.production_declarations[:-1]}
+    )
+    assert not differential_gate.verify_policy_completeness(narrowed).passed
+    narrowed = policy.model_copy(update={"root_snapshots": policy.root_snapshots[:-1]})
+    assert not differential_gate.verify_policy_completeness(narrowed).passed
+    narrowed = policy.model_copy(update={"current_fixtures": policy.current_fixtures[:-1]})
+    assert not differential_gate.verify_policy_completeness(narrowed).passed
+    changed_probe = policy.boundary_probes[0].model_copy(update={"behavior_test": "wrong"})
+    narrowed = policy.model_copy(
+        update={"boundary_probes": (changed_probe, *policy.boundary_probes[1:])}
+    )
+    assert not differential_gate.verify_policy_completeness(narrowed).passed
+    tampered_fixture = policy.fixtures[0].model_copy(update={"sha256": "0" * 64})
+    tampered = policy.model_copy(update={"fixtures": (tampered_fixture, *policy.fixtures[1:])})
+    assert not differential_gate.verify_policy_completeness(tampered).passed
+
+
+def test_production_declaration_spans_and_normalized_asts_are_exact() -> None:
+    policy = load_policy(POLICY_PATH)
+    for declaration in policy.production_declarations:
+        assert verify_production_declaration(ROOT, declaration).passed
+
+
+def test_boundary_source_spans_and_normalized_asts_are_exact() -> None:
+    policy = load_policy(POLICY_PATH)
+    for probe in policy.boundary_probes:
+        assert verify_boundary_probe_source(ROOT, probe).passed
 
 
 def test_policy_is_canonical_and_binds_requested_baseline() -> None:
