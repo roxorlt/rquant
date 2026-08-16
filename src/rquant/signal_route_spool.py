@@ -13,27 +13,166 @@ from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import RLock
-from typing import Self
+from typing import Self, TypeAlias
 
-from pydantic import Field, model_validator
+from pydantic import Field, StrictInt, StrictStr, TypeAdapter, field_validator, model_validator
 
-from rquant.runtime_contracts import RuntimeContractModel, normalize_aware_utc
+from rquant.runtime_contracts import AwareUtcDatetime, RuntimeContractModel, normalize_aware_utc
 from rquant.signal_bus import (
+    LegacySignalWriteActivationError,
     SignalBusRoutedRecord,
     SignalBusSignalRecord,
     SignalBusSourceDescriptor,
     SignalBusStore,
+    SignalRouteReceipt,
+    require_legacy_signal_write,
 )
+from rquant.signal_contracts import CurrentSignalEnvelope, current_signal_envelope_json_bytes
+from rquant.strict_json import StrictJsonError, canonical_json_bytes, strict_canonical_json_loads
 
 _SCHEMA_VERSION = 2
 _MAX_METADATA_BYTES = 64 * 1024
 _MAX_RECORD_BYTES = 4 * 1024 * 1024
 _DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
 _READ_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+_CURRENT_SCHEMA_VERSION = 3
+_SHA256_PATTERN = r"^[0-9a-f]{64}$"
+_UTC_DATETIME = TypeAdapter(datetime)
 
 
 class SignalRouteSpoolIntegrityError(RuntimeError):
     """The immutable routed-signal stream is missing, changed, or unsafe."""
+
+
+def _current_bytes(value: RuntimeContractModel) -> bytes:
+    return canonical_json_bytes(value.model_dump(mode="json"))
+
+
+def _require_exact_instance(value: object, expected: type[object], *, field: str) -> object:
+    if type(value) is not expected:
+        raise TypeError(f"{field} requires an exact {expected.__name__} object")
+    return value
+
+
+class CurrentSignalBusRoutedRecord(RuntimeContractModel):
+    """Strict future routed record, available only to the Phase-A decoder."""
+
+    global_sequence: StrictInt = Field(ge=1)
+    signal_id: StrictStr = Field(pattern=_SHA256_PATTERN)
+    envelope_hash: StrictStr = Field(pattern=_SHA256_PATTERN)
+    payload_json: StrictStr = Field(min_length=1)
+    envelope: CurrentSignalEnvelope
+    received_at: AwareUtcDatetime
+    receipt: SignalRouteReceipt
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_substituted_nested_models(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            raise TypeError("current routed record must be an object")
+        if "envelope" in value:
+            _require_exact_instance(
+                value["envelope"],
+                CurrentSignalEnvelope,
+                field="envelope",
+            )
+        if "receipt" in value:
+            _require_exact_instance(
+                value["receipt"],
+                SignalRouteReceipt,
+                field="receipt",
+            )
+        return value
+
+    @field_validator("envelope")
+    @classmethod
+    def validate_exact_envelope(cls, value: CurrentSignalEnvelope) -> CurrentSignalEnvelope:
+        return _require_exact_instance(
+            value,
+            CurrentSignalEnvelope,
+            field="envelope",
+        )  # type: ignore[return-value]
+
+    @field_validator("receipt")
+    @classmethod
+    def validate_exact_receipt(cls, value: SignalRouteReceipt) -> SignalRouteReceipt:
+        return _require_exact_instance(
+            value,
+            SignalRouteReceipt,
+            field="receipt",
+        )  # type: ignore[return-value]
+
+    @field_validator("received_at")
+    @classmethod
+    def validate_utc_received_at(cls, value: datetime) -> datetime:
+        if type(value) is not datetime:
+            raise TypeError("received_at requires an exact datetime object")
+        return normalize_aware_utc(value)
+
+    @model_validator(mode="after")
+    def validate_current_identity(self) -> Self:
+        envelope_bytes = current_signal_envelope_json_bytes(self.envelope)
+        if self.signal_id != self.envelope.signal_id or self.signal_id != self.receipt.signal_id:
+            raise ValueError("current routed record signal identity does not match")
+        if self.payload_json.encode("utf-8") != envelope_bytes:
+            raise ValueError("current routed record payload_json is not exact envelope bytes")
+        if self.envelope_hash != _sha256_bytes(envelope_bytes):
+            raise ValueError("current routed record envelope hash does not match envelope bytes")
+        return self
+
+
+class CurrentSignalRouteSpoolRecord(RuntimeContractModel):
+    """Strict future v3 outer record; deliberately has no publication constructor."""
+
+    schema_version: StrictInt = Field(default=_CURRENT_SCHEMA_VERSION)
+    global_sequence: StrictInt = Field(ge=1)
+    previous_record_hash: StrictStr | None = Field(default=None, pattern=_SHA256_PATTERN)
+    envelope_hash: StrictStr = Field(pattern=_SHA256_PATTERN)
+    routed_record_hash: StrictStr = Field(pattern=_SHA256_PATTERN)
+    record_hash: StrictStr = Field(pattern=_SHA256_PATTERN)
+    record: CurrentSignalBusRoutedRecord
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_substituted_record(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            raise TypeError("current route spool record must be an object")
+        if "record" in value:
+            _require_exact_instance(
+                value["record"],
+                CurrentSignalBusRoutedRecord,
+                field="record",
+            )
+        return value
+
+    @field_validator("record")
+    @classmethod
+    def validate_exact_record(
+        cls,
+        value: CurrentSignalBusRoutedRecord,
+    ) -> CurrentSignalBusRoutedRecord:
+        return _require_exact_instance(
+            value,
+            CurrentSignalBusRoutedRecord,
+            field="record",
+        )  # type: ignore[return-value]
+
+    @model_validator(mode="after")
+    def validate_current_hashes(self) -> Self:
+        if self.schema_version != _CURRENT_SCHEMA_VERSION:
+            raise ValueError("unsupported current routed-signal record schema")
+        if self.global_sequence != self.record.global_sequence:
+            raise ValueError("current routed-signal wrapper sequence does not match payload")
+        if self.envelope_hash != self.record.envelope_hash:
+            raise ValueError("current routed-signal wrapper envelope hash does not match payload")
+        if self.routed_record_hash != _sha256_bytes(
+            current_signal_bus_routed_record_json_bytes(self.record)
+        ):
+            raise ValueError("current routed-signal record hash does not match payload")
+        preimage = canonical_json_bytes(self.model_dump(mode="json", exclude={"record_hash"}))
+        if self.record_hash != _sha256_bytes(preimage):
+            raise ValueError("current routed-signal outer record hash does not match")
+        return self
 
 
 def _canonical_object_bytes(value: object) -> bytes:
@@ -382,6 +521,116 @@ def _parse_record(payload: bytes, *, sequence: int) -> SignalRouteSpoolRecord:
         ) from exc
 
 
+R07RouteSpoolRecord: TypeAlias = SignalRouteSpoolRecord | CurrentSignalRouteSpoolRecord
+
+
+def current_signal_bus_routed_record_json_bytes(record: CurrentSignalBusRoutedRecord) -> bytes:
+    """Return the exact R preimage bytes for a decoded current routed record."""
+
+    _require_exact_instance(record, CurrentSignalBusRoutedRecord, field="record")
+    return _current_bytes(record)
+
+
+def current_signal_route_spool_record_json_bytes(record: CurrentSignalRouteSpoolRecord) -> bytes:
+    """Return the exact durable v3 bytes for a decoded current outer record."""
+
+    _require_exact_instance(record, CurrentSignalRouteSpoolRecord, field="record")
+    return _current_bytes(record)
+
+
+def _decode_current_routed_record(value: object) -> CurrentSignalBusRoutedRecord:
+    if not isinstance(value, dict):
+        raise TypeError("current routed record must be a JSON object")
+    envelope_value = value.get("envelope")
+    receipt_value = value.get("receipt")
+    received_at = value.get("received_at")
+    if not isinstance(envelope_value, dict) or not isinstance(receipt_value, dict):
+        raise TypeError("current routed record nested models must be JSON objects")
+    received = _UTC_DATETIME.validate_python(received_at)
+    return CurrentSignalBusRoutedRecord.model_validate(
+        {
+            **value,
+            "envelope": CurrentSignalEnvelope.model_validate(envelope_value),
+            "received_at": received,
+            "receipt": SignalRouteReceipt.model_validate(receipt_value),
+        }
+    )
+
+
+def decode_current_signal_route_spool_record(payload: bytes) -> CurrentSignalRouteSpoolRecord:
+    """Strictly decode one canonical, duplicate-free, non-self-authenticating v3 record."""
+
+    try:
+        decoded = strict_canonical_json_loads(payload)
+        if not isinstance(decoded, dict):
+            raise TypeError("current route spool record must be a JSON object")
+        record_value = decoded.get("record")
+        if not isinstance(record_value, dict):
+            raise TypeError("current route spool record payload must be a JSON object")
+        record = CurrentSignalRouteSpoolRecord.model_validate(
+            {
+                **decoded,
+                "record": _decode_current_routed_record(record_value),
+            }
+        )
+        if current_signal_route_spool_record_json_bytes(record) != payload:
+            raise StrictJsonError("current route spool record is not canonical")
+        return record
+    except (StrictJsonError, TypeError, ValueError) as exc:
+        raise SignalRouteSpoolIntegrityError(
+            "current routed-signal record hash or payload is invalid"
+        ) from exc
+
+
+def _parse_r07_record(payload: bytes, *, sequence: int) -> R07RouteSpoolRecord:
+    """Try the byte-preserved v2 parser before the future strict v3 decoder."""
+
+    try:
+        return _parse_record(payload, sequence=sequence)
+    except SignalRouteSpoolIntegrityError as legacy_error:
+        try:
+            return decode_current_signal_route_spool_record(payload)
+        except SignalRouteSpoolIntegrityError:
+            raise legacy_error from None
+
+
+def verify_current_signal_route_spool_fixture(
+    payloads: tuple[bytes, ...],
+    *,
+    first_sequence: int = 1,
+    allow_isolated_current_fixture: bool = False,
+) -> tuple[R07RouteSpoolRecord, ...]:
+    """Verify an in-memory R07 fixture; it never opens or mutates a spool."""
+
+    if type(first_sequence) is not int or first_sequence < 1:
+        raise ValueError("first_sequence must be a positive native integer")
+    if type(allow_isolated_current_fixture) is not bool:
+        raise TypeError("allow_isolated_current_fixture must be a bool")
+    verified: list[R07RouteSpoolRecord] = []
+    previous_hash: str | None = None
+    current_started = False
+    legacy_count = 0
+    for sequence, payload in enumerate(payloads, start=first_sequence):
+        if type(payload) is not bytes:
+            raise TypeError("fixture record bytes must be exact bytes")
+        record = _parse_r07_record(payload, sequence=sequence)
+        if record.global_sequence != sequence:
+            raise SignalRouteSpoolIntegrityError(f"routed-signal sequence gap at {sequence}")
+        if isinstance(record, SignalRouteSpoolRecord):
+            if current_started:
+                raise SignalRouteSpoolIntegrityError("legacy v2 record follows current v3 record")
+            legacy_count += 1
+        else:
+            if not current_started and legacy_count == 0 and not allow_isolated_current_fixture:
+                raise SignalRouteSpoolIntegrityError("production route spool cannot start with v3")
+            current_started = True
+        if record.previous_record_hash != previous_hash:
+            raise SignalRouteSpoolIntegrityError(f"routed-signal hash chain mismatch at {sequence}")
+        previous_hash = record.record_hash
+        verified.append(record)
+    return tuple(verified)
+
+
 def _validate_source_identity(
     identity: SignalBusSourceDescriptor,
     pointer: SignalRouteSpoolPointer,
@@ -498,6 +747,29 @@ def _load_verified_snapshot(
     return identity, pointer, entries
 
 
+def _require_legacy_spool_publish_input(
+    *,
+    source: SignalBusSourceDescriptor,
+    records: tuple[SignalBusRoutedRecord, ...],
+) -> None:
+    if type(source) is not SignalBusSourceDescriptor:
+        raise TypeError("SignalRouteSpool.publish requires a SignalBusSourceDescriptor object")
+    if type(records) is not tuple:
+        raise TypeError("SignalRouteSpool.publish requires a tuple of routed records")
+    for record in records:
+        if type(record) is CurrentSignalBusRoutedRecord:
+            raise LegacySignalWriteActivationError(
+                "SignalRouteSpool.publish is legacy-only in this reader-only release; "
+                "current-family writes are not activated"
+            )
+        if type(record) is not SignalBusRoutedRecord:
+            raise TypeError("SignalRouteSpool.publish requires SignalBusRoutedRecord objects")
+        require_legacy_signal_write(
+            record.signal,
+            operation="SignalRouteSpool.publish",
+        )
+
+
 class SignalRouteSpool:
     """Publish one global routed-signal sequence through atomic immutable files."""
 
@@ -543,6 +815,7 @@ class SignalRouteSpool:
         source: SignalBusSourceDescriptor,
         records: tuple[SignalBusRoutedRecord, ...],
     ) -> SignalRouteSpoolPointer:
+        _require_legacy_spool_publish_input(source=source, records=records)
         root_descriptor = _open_root_directory(self.paths.root)
         try:
             records_descriptor = _open_records_directory(root_descriptor)
@@ -636,6 +909,29 @@ class SignalRouteSpool:
         if pointer.source.model_copy(update={"high_watermark": 0}) != identity:
             raise SignalRouteSpoolIntegrityError("route spool source generation changed")
         return pointer
+
+    def _published_high_watermark(self, *, source: SignalBusSourceDescriptor) -> int:
+        """Read the existing v2 pointer without binding or mutating the spool."""
+
+        _require_legacy_spool_publish_input(source=source, records=())
+        root_descriptor = _open_root_directory(self.paths.root)
+        try:
+            records_descriptor = _open_records_directory(root_descriptor)
+            try:
+                if not _file_exists_at(root_descriptor, "source.json"):
+                    return source.first_global_sequence - 1
+                identity, pointer, _ = _load_verified_snapshot(
+                    root_descriptor,
+                    records_descriptor,
+                    reject_unpublished_records=False,
+                )
+                if identity != source.model_copy(update={"high_watermark": 0}):
+                    raise SignalRouteSpoolIntegrityError("route spool source generation changed")
+                return pointer.source.high_watermark
+            finally:
+                os.close(records_descriptor)
+        finally:
+            os.close(root_descriptor)
 
 
 class ReadonlySignalRouteSpool:
@@ -778,12 +1074,16 @@ def publish_signal_bus_prefix(
     if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
         raise ValueError("limit must be a positive integer")
     source = bus.source_descriptor()
-    pointer = spool.publish(source=source, records=())
+    published_high_watermark = spool._published_high_watermark(source=source)
     records = bus.routed_signals_after_global_sequence(
-        after_sequence=pointer.source.high_watermark,
+        after_sequence=published_high_watermark,
         through_sequence=source.high_watermark,
         limit=limit,
     )
+    _require_legacy_spool_publish_input(source=source, records=records)
+    pointer = spool.publish(source=source, records=())
+    if pointer.source.high_watermark != published_high_watermark:
+        raise SignalRouteSpoolIntegrityError("route spool pointer changed before publication")
     updated = spool.publish(source=source, records=records)
     return SignalRouteSpoolPublishSummary(
         source_generation_id=source.generation_id,
@@ -794,11 +1094,17 @@ def publish_signal_bus_prefix(
 
 
 __all__ = [
+    "CurrentSignalBusRoutedRecord",
+    "CurrentSignalRouteSpoolRecord",
     "ReadonlySignalRouteSpool",
     "SignalRouteSpool",
     "SignalRouteSpoolIntegrityError",
     "SignalRouteSpoolPointer",
     "SignalRouteSpoolPublishSummary",
     "SignalRouteSpoolRecord",
+    "current_signal_bus_routed_record_json_bytes",
+    "current_signal_route_spool_record_json_bytes",
+    "decode_current_signal_route_spool_record",
     "publish_signal_bus_prefix",
+    "verify_current_signal_route_spool_fixture",
 ]
