@@ -353,8 +353,8 @@ def publish_runtime_candidate(request: RuntimeQuarantineRequest) -> RuntimeQuara
             raise RuntimeQuarantineError("root-derived generation manifest is too large")
         _write_manifest(temporary_fd, manifest_bytes)
         _set_owned_mode(temporary_fd, authority.GENERATION_DIRECTORY_MODE)
-        _FAILPOINT("completed_quarantine_directory_fsync")
         _fsync_descriptor(temporary_fd, "directory")
+        _FAILPOINT("completed_quarantine_directory_fsync")
         _assert_named_identity(
             quarantine_fd,
             temporary_name,
@@ -368,8 +368,11 @@ def publish_runtime_candidate(request: RuntimeQuarantineRequest) -> RuntimeQuara
         _close_descriptors(quarantine_descriptors)
         quarantine_descriptors.clear()
         _FAILPOINT("close_reopen")
-        _FAILPOINT("first_full_revalidation")
-        verified = _revalidate_quarantine(temporary_name, profile)
+        verified = _revalidate_quarantine(
+            temporary_name,
+            profile,
+            transition_hook="first_full_revalidation",
+        )
         if verified != manifest_bytes:
             raise RuntimeQuarantineError("closed quarantine manifest identity changed")
         generation_id = hashlib.sha256(verified).hexdigest()
@@ -1183,7 +1186,12 @@ def _write_manifest(directory_fd: int, payload: bytes) -> None:
                 os.close(descriptor)
 
 
-def _revalidate_quarantine(name: str, profile: RuntimeClosureProfile) -> bytes:
+def _revalidate_quarantine(
+    name: str,
+    profile: RuntimeClosureProfile,
+    *,
+    transition_hook: str | None = None,
+) -> bytes:
     descriptors: list[int] = []
     tree_fd = -1
     try:
@@ -1197,6 +1205,8 @@ def _revalidate_quarantine(name: str, profile: RuntimeClosureProfile) -> bytes:
             allowed_modes={authority.GENERATION_DIRECTORY_MODE},
             label="closed operation quarantine",
         )
+        if transition_hook is not None:
+            _FAILPOINT(transition_hook)
         return _verify_closed_tree(tree_fd, profile, label="closed operation quarantine")
     finally:
         if tree_fd >= 0:
@@ -1539,7 +1549,6 @@ def _publish_verified_quarantine(
             allowed_modes={authority.GENERATION_DIRECTORY_MODE},
             label="final operation quarantine",
         )
-        _FAILPOINT("final_identity_to_rename")
         final_manifest = _verify_closed_tree(
             final_quarantine_fd,
             profile,
@@ -1554,6 +1563,7 @@ def _publish_verified_quarantine(
             "final operation quarantine",
         )
         deployment_lock.assert_current()
+        _FAILPOINT("final_identity_to_rename")
         _atomic_rename_noreplace(
             quarantine_fd,
             temporary_name,

@@ -482,14 +482,9 @@ def test_publish_rejects_fixed_anchor_mutation(
         publish_runtime_candidate(_request())
 
 
-@pytest.mark.parametrize(
-    "stage",
-    ("first_full_revalidation", "final_identity_to_rename"),
-)
-def test_quarantine_replacement_after_attestation_is_rejected_before_rename(
+def test_quarantine_mutation_during_first_full_revalidation_is_rejected(
     quarantine_fixture: dict[str, Any],
     monkeypatch: pytest.MonkeyPatch,
-    stage: str,
 ) -> None:
     _make_candidate(
         quarantine_fixture["inbox"],
@@ -500,7 +495,7 @@ def test_quarantine_replacement_after_attestation_is_rejected_before_rename(
 
     def mutate(selected: str) -> None:
         nonlocal mutated
-        if selected != stage or mutated:
+        if selected != "first_full_revalidation" or mutated:
             return
         mutated = True
         temporary = quarantine_fixture["quarantine"] / f".quarantine-{'1' * 32}"
@@ -513,6 +508,47 @@ def test_quarantine_replacement_after_attestation_is_rejected_before_rename(
     with pytest.raises(RuntimeQuarantineError, match="manifest|changed"):
         publish_runtime_candidate(_request())
     assert not any(quarantine_fixture["generations"].iterdir())
+
+
+def test_final_identity_check_rejects_quarantine_path_replacement(
+    quarantine_fixture: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _make_candidate(
+        quarantine_fixture["inbox"],
+        candidate_id="a" * 64,
+        candidate_basename="candidate-v1",
+    )
+    temporary = quarantine_fixture["quarantine"] / f".quarantine-{'1' * 32}"
+    displaced = quarantine_fixture["quarantine"] / "displaced-for-identity-check"
+    real_assert_named_identity = quarantine_module._assert_named_identity
+    mutated = False
+
+    def replace_before_identity_check(
+        parent_fd: int,
+        name: str,
+        descriptor: int,
+        label: str,
+    ) -> None:
+        nonlocal mutated
+        if label == "final operation quarantine" and not mutated:
+            mutated = True
+            temporary.rename(displaced)
+            temporary.mkdir(mode=authority_module.GENERATION_DIRECTORY_MODE)
+            temporary.chmod(authority_module.GENERATION_DIRECTORY_MODE)
+        real_assert_named_identity(parent_fd, name, descriptor, label)
+
+    monkeypatch.setattr(
+        quarantine_module,
+        "_assert_named_identity",
+        replace_before_identity_check,
+    )
+    with pytest.raises(RuntimeQuarantineError, match="identity"):
+        publish_runtime_candidate(_request())
+    assert not any(quarantine_fixture["generations"].iterdir())
+    assert cleanup_runtime_quarantine("1" * 32) is True
+    displaced.rename(temporary)
+    assert cleanup_runtime_quarantine("1" * 32) is True
 
 
 def test_runtime_authority_independently_revalidates_published_generation(
@@ -715,6 +751,10 @@ def test_transition_exact_crash_matrix_preserves_authority_and_converges(
     authority_path = Path(authority_module.RUNTIME_AUTHORITY_PATH)
     authority_before = authority_path.read_bytes()
     baseline_generations = {path.name for path in quarantine_fixture["generations"].iterdir()}
+    unrelated_operation_id = "2" * 32
+    unrelated = quarantine_fixture["quarantine"] / f".quarantine-{unrelated_operation_id}"
+    unrelated.mkdir(mode=0o700)
+    unrelated_identity = (unrelated.stat().st_dev, unrelated.stat().st_ino)
 
     _make_candidate(
         quarantine_fixture["inbox"],
@@ -755,10 +795,16 @@ def test_transition_exact_crash_matrix_preserves_authority_and_converges(
     generations_after_crash = {path.name for path in quarantine_fixture["generations"].iterdir()}
     assert residue.exists() is not published_before_crash
     assert (generations_after_crash != baseline_generations) is published_before_crash
+    expected_residue = {unrelated.name}
+    if not published_before_crash:
+        expected_residue.add(residue.name)
+    assert {path.name for path in quarantine_fixture["quarantine"].iterdir()} == expected_residue
+    assert (unrelated.stat().st_dev, unrelated.stat().st_ino) == unrelated_identity
 
     monkeypatch.setattr(quarantine_module, "_FAILPOINT", lambda _stage: None)
     assert cleanup_runtime_quarantine("1" * 32) is (not published_before_crash)
     assert cleanup_runtime_quarantine("1" * 32) is False
+    assert (unrelated.stat().st_dev, unrelated.stat().st_ino) == unrelated_identity
     _make_candidate(
         quarantine_fixture["inbox"],
         candidate_id="a" * 64,
@@ -773,6 +819,127 @@ def test_transition_exact_crash_matrix_preserves_authority_and_converges(
     )
     assert result.status is expected_status
     assert authority_path.read_bytes() == authority_before
+    assert (unrelated.stat().st_dev, unrelated.stat().st_ino) == unrelated_identity
+    assert cleanup_runtime_quarantine(unrelated_operation_id) is True
+    assert cleanup_runtime_quarantine(unrelated_operation_id) is False
+
+
+@pytest.mark.parametrize(
+    "stage",
+    (
+        "completed_quarantine_directory_fsync",
+        "first_full_revalidation",
+        "final_identity_to_rename",
+    ),
+)
+def test_transition_hook_runs_after_its_named_operation(
+    quarantine_fixture: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+) -> None:
+    _make_candidate(
+        quarantine_fixture["inbox"],
+        candidate_id="a" * 64,
+        candidate_basename="candidate-v1",
+    )
+    state: dict[str, Any] = {
+        "completed_directory_fsynced": False,
+        "operation_quarantine_fd": -1,
+        "first_revalidation_fd": -1,
+        "final_verified": False,
+        "final_identity_checked": False,
+        "hook_calls": 0,
+    }
+    real_fsync_descriptor = quarantine_module._fsync_descriptor
+    real_open_owned_directory = quarantine_module._open_owned_directory_at
+    real_verify_closed_tree = quarantine_module._verify_closed_tree
+    real_assert_named_identity = quarantine_module._assert_named_identity
+
+    def observe_fsync(descriptor: int, phase: str) -> None:
+        real_fsync_descriptor(descriptor, phase)
+        if phase == "directory" and descriptor == state["operation_quarantine_fd"]:
+            state["completed_directory_fsynced"] = True
+
+    def observe_open_owned_directory(
+        parent_fd: int,
+        name: str,
+        *,
+        allowed_modes: set[int],
+        label: str,
+    ) -> int:
+        descriptor = real_open_owned_directory(
+            parent_fd,
+            name,
+            allowed_modes=allowed_modes,
+            label=label,
+        )
+        if label == "operation quarantine":
+            state["operation_quarantine_fd"] = descriptor
+        elif label == "closed operation quarantine":
+            state["first_revalidation_fd"] = descriptor
+        return descriptor
+
+    def observe_verify_closed_tree(
+        tree_fd: int,
+        profile: authority_module.RuntimeClosureProfile,
+        *,
+        label: str,
+    ) -> bytes:
+        result = real_verify_closed_tree(tree_fd, profile, label=label)
+        if label == "final operation quarantine":
+            state["final_verified"] = True
+        return result
+
+    def observe_assert_named_identity(
+        parent_fd: int,
+        name: str,
+        descriptor: int,
+        label: str,
+    ) -> None:
+        real_assert_named_identity(parent_fd, name, descriptor, label)
+        if label == "final operation quarantine":
+            state["final_identity_checked"] = True
+
+    def inspect_transition(selected: str) -> None:
+        if selected != stage:
+            return
+        state["hook_calls"] += 1
+        if stage == "completed_quarantine_directory_fsync":
+            assert state["completed_directory_fsynced"] is True
+        elif stage == "first_full_revalidation":
+            descriptor = state["first_revalidation_fd"]
+            assert descriptor >= 0
+            os.fstat(descriptor)
+        else:
+            assert state["final_verified"] is True
+            assert state["final_identity_checked"] is True
+        raise SimulatedCrash(stage)
+
+    monkeypatch.setattr(quarantine_module, "_fsync_descriptor", observe_fsync)
+    monkeypatch.setattr(
+        quarantine_module,
+        "_open_owned_directory_at",
+        observe_open_owned_directory,
+    )
+    monkeypatch.setattr(quarantine_module, "_verify_closed_tree", observe_verify_closed_tree)
+    monkeypatch.setattr(
+        quarantine_module,
+        "_assert_named_identity",
+        observe_assert_named_identity,
+    )
+    monkeypatch.setattr(quarantine_module, "_FAILPOINT", inspect_transition)
+    before = len(os.listdir("/dev/fd"))
+    with pytest.raises(SimulatedCrash, match=stage):
+        publish_runtime_candidate(_request())
+    assert state["hook_calls"] == 1
+    assert len(os.listdir("/dev/fd")) == before
+    descriptor = state["first_revalidation_fd"]
+    if descriptor >= 0:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+    monkeypatch.setattr(quarantine_module, "_FAILPOINT", lambda _stage: None)
+    assert cleanup_runtime_quarantine("1" * 32) is True
+    assert cleanup_runtime_quarantine("1" * 32) is False
 
 
 def test_parent_fsync_one_failure_revalidates_and_reports_recovery(
@@ -1248,7 +1415,6 @@ def test_atomic_no_replace_preserves_target_created_in_identity_to_rename_window
         candidate_basename="candidate-v1",
     )
     target = quarantine_fixture["generations"] / generation_id
-    sentinel = target / "foreign"
     target_identity: tuple[int, int] | None = None
 
     def create_target(stage: str) -> None:
@@ -1256,8 +1422,6 @@ def test_atomic_no_replace_preserves_target_created_in_identity_to_rename_window
         if stage != "atomic_rename":
             return
         target.mkdir(mode=0o755)
-        sentinel.write_bytes(b"must survive")
-        sentinel.chmod(0o444)
         target.chmod(authority_module.GENERATION_DIRECTORY_MODE)
         target_identity = (target.stat().st_dev, target.stat().st_ino)
 
@@ -1265,9 +1429,33 @@ def test_atomic_no_replace_preserves_target_created_in_identity_to_rename_window
     with pytest.raises(RuntimeQuarantineError):
         publish_runtime_candidate(_request())
     assert target_identity == (target.stat().st_dev, target.stat().st_ino)
-    assert sentinel.read_bytes() == b"must survive"
+    assert not any(target.iterdir())
     assert candidate.exists()
+    residue = quarantine_fixture["quarantine"] / f".quarantine-{'1' * 32}"
+    assert {path.name for path in quarantine_fixture["quarantine"].iterdir()} == {residue.name}
+    assert stat.S_IMODE(residue.stat().st_mode) == authority_module.GENERATION_DIRECTORY_MODE
     assert cleanup_runtime_quarantine("1" * 32) is True
+    assert cleanup_runtime_quarantine("1" * 32) is False
+    target.chmod(0o755)
+    target.rmdir()
+
+
+def test_plain_rename_control_overwrites_an_empty_target(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    source.mkdir()
+    (source / "candidate").write_bytes(b"candidate")
+    target.mkdir()
+    target_identity = (target.stat().st_dev, target.stat().st_ino)
+
+    parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.rename("source", "target", src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+    finally:
+        os.close(parent_fd)
+
+    assert (target.stat().st_dev, target.stat().st_ino) != target_identity
+    assert (target / "candidate").read_bytes() == b"candidate"
 
 
 def test_missing_atomic_no_replace_primitive_fails_closed_with_cleanup_residue(
