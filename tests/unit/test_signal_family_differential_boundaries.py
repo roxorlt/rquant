@@ -35,10 +35,26 @@ def test_complete_inventory_has_immutable_b01_to_b19_order() -> None:
 
 def test_boundary_manifest_contains_real_current_fixture_and_no_result_placeholders() -> None:
     expected_bytes = _CURRENT_CANONICAL_FIXTURES[0][2]
-    assert "setup_result_digest" not in ProbeSetupV1.model_fields
-    assert "before_snapshot_digest" not in BoundaryProbeV1.model_fields
-    assert "after_snapshot_digest" not in BoundaryProbeV1.model_fields
+    assert "setup_result_digest" in ProbeSetupV1.model_fields
+    assert {
+        "setup_id",
+        "positional_fixture_ids",
+        "keyword_fixture_ids",
+        "current_member_fixture_ids",
+        "call_shape",
+        "call_result_action",
+        "sentinel_id",
+        "sentinel_kind",
+        "mutation_expectation",
+        "before_snapshot_digest",
+        "after_snapshot_digest",
+    } <= BoundaryProbeV1.model_fields.keys()
     policy = load_policy(POLICY_PATH)
+    assert policy.probe_setups
+    assert policy.boundary_manifest_digest
+    assert all(setup.setup_result_digest != "0" * 64 for setup in policy.probe_setups)
+    assert all(probe.before_snapshot_digest != "0" * 64 for probe in policy.boundary_probes)
+    assert all(probe.after_snapshot_digest != "0" * 64 for probe in policy.boundary_probes)
     fixtures = {fixture.fixture_id: fixture for fixture in policy.current_fixtures}
     assert fixtures
     for fixture in fixtures.values():
@@ -106,13 +122,55 @@ def test_boundary_probe_requires_exact_exception_phase_and_snapshot_contract() -
     probe = next(item for item in BOUNDARY_PROBES if item.inventory_id == "R07-B03")
     assert isinstance(probe, BoundaryProbeV1)
     assert probe.call_result_action == "consume_tuple"
-    assert probe.current_fixture_id == "current.object"
+    assert probe.current_member_fixture_ids == ("current.object",)
     assert (
         probe.behavior_test == "tests/unit/test_signal_family_no_activation_reset.py::"
-        "test_r07_b03_sentinel_is_lazy_and_stops_before_first_yield"
+        "test_r07_dynamic_boundary_probe[R07-B03]"
     )
     assert probe.expected_exception_phase == "consumption"
     assert probe.expected_yielded_count == 0
+    assert probe.setup_id == "setup-r07-b03"
+    assert probe.call_shape.call_result_action == "consume_tuple"
+    assert probe.call_shape.positional_fixture_ids == probe.positional_fixture_ids
+    assert probe.call_shape.keyword_fixture_ids == probe.keyword_fixture_ids
+    assert probe.sentinel_id == "sentinel-r07-b03"
+    assert probe.before_snapshot_digest == probe.after_snapshot_digest
+
+
+@pytest.mark.parametrize(
+    ("target", "field", "value"),
+    [
+        ("setup", "setup_result_digest", "0" * 64),
+        ("probe", "positional_fixture_ids", ("tampered",)),
+        ("probe", "keyword_fixture_ids", {"tampered": "fixture"}),
+        ("probe", "call_result_action", "consume_tuple"),
+        ("probe", "sentinel_id", "sentinel-tampered"),
+        ("probe", "mutation_expectation", None),
+    ],
+)
+def test_boundary_manifest_digest_binds_every_setup_call_and_guard_field(
+    target: str,
+    field: str,
+    value: object,
+) -> None:
+    policy = load_policy(POLICY_PATH)
+    if target == "setup":
+        changed = policy.probe_setups[0].model_copy(update={field: value})
+        tampered = policy.model_copy(update={"probe_setups": (changed, *policy.probe_setups[1:])})
+    else:
+        changed = policy.boundary_probes[0].model_copy(update={field: value})
+        tampered = policy.model_copy(
+            update={"boundary_probes": (changed, *policy.boundary_probes[1:])}
+        )
+    assert not tampered.validate_boundary_manifest().passed
+
+
+def test_unified_dynamic_probe_runner_is_the_only_b01_to_b17_evidence_path() -> None:
+    runner_path = ROOT / "tests" / "r07_differential_probe_runner.py"
+    assert runner_path.is_file()
+    source = runner_path.read_text(encoding="utf-8")
+    assert "def run_boundary_probe(" in source
+    assert "BoundaryProbeResultV1" in source
 
 
 def test_policy_probe_json_has_no_duplicate_keys() -> None:

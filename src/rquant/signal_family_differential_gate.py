@@ -75,6 +75,11 @@ EXPECTED_PRODUCTION_DECLARATIONS = (
         "_require_legacy_spool_publish_input",
         "legacy_boundary_reject_guard",
     ),
+    (
+        "src/rquant/strategy_runner.py",
+        "_legacy_signal_constructor_identity_matches",
+        "legacy_boundary_reject_guard",
+    ),
 )
 EXPECTED_FORBIDDEN_SOURCE_FILES = (
     "src/rquant/runtime_builder_daily_orchestrator.py",
@@ -145,23 +150,10 @@ EXPECTED_CURRENT_FIXTURE_DECLARATIONS = (
 )
 _BOUNDARY_BEHAVIOR_FILE = "tests/unit/test_signal_family_no_activation_reset.py"
 EXPECTED_BOUNDARY_BEHAVIOR_TESTS = (
-    f"{_BOUNDARY_BEHAVIOR_FILE}::test_strategy_runner_rejects_a_substituted_current_constructor_without_row_or_byte_mutation",
-    f"{_BOUNDARY_BEHAVIOR_FILE}::test_daily_signal_constructors_reject_current_family_substitution_without_mutation[summary]",
-    f"{_BOUNDARY_BEHAVIOR_FILE}::test_r07_b03_sentinel_is_lazy_and_stops_before_first_yield",
-    f"{_BOUNDARY_BEHAVIOR_FILE}::test_daily_signal_constructors_reject_current_family_substitution_without_mutation[cli-error]",
-    f"{_BOUNDARY_BEHAVIOR_FILE}::test_daily_notification_emit_preflights_before_calling_the_bus",
-    f"{_BOUNDARY_BEHAVIOR_FILE}::test_signal_bus_ingest_preflights_before_database_mutation",
-    f"{_BOUNDARY_BEHAVIOR_FILE}::test_signal_bus_route_rejects_stored_current_before_outbox_mutation",
-    f"{_BOUNDARY_BEHAVIOR_FILE}::test_signal_bus_commit_preflights_before_source_signal_receipt_or_outbox_mutation",
-    f"{_BOUNDARY_BEHAVIOR_FILE}::test_route_runner_preflights_full_batch_before_bus_cursor_or_source_binding",
-    f"{_BOUNDARY_BEHAVIOR_FILE}::test_signal_route_spool_publish_preflights_before_lock_source_record_or_pointer",
-    f"{_BOUNDARY_BEHAVIOR_FILE}::test_signal_route_spool_prefix_preflights_before_initial_empty_publication",
-    f"{_BOUNDARY_BEHAVIOR_FILE}::test_notification_replicate_preflights_all_records_before_transaction",
-    f"{_BOUNDARY_BEHAVIOR_FILE}::test_paper_queue_ingest_forms_preflight_before_queue_transaction[direct]",
-    f"{_BOUNDARY_BEHAVIOR_FILE}::test_paper_queue_ingest_forms_preflight_before_queue_transaction[stored-bytes]",
-    f"{_BOUNDARY_BEHAVIOR_FILE}::test_signal_delivery_payload_rejects_current_before_authority_input_exists",
-    f"{_BOUNDARY_BEHAVIOR_FILE}::test_publish_signal_authority_rejects_before_reader_or_publisher_callbacks",
-    f"{_BOUNDARY_BEHAVIOR_FILE}::test_serving_authority_publisher_rejects_current_before_generation_or_pointer_files",
+    *(
+        f"{_BOUNDARY_BEHAVIOR_FILE}::test_r07_dynamic_boundary_probe[R07-B{index:02d}]"
+        for index in range(1, 18)
+    ),
     "tests/unit/test_signal_family_differential_gate.py::test_root_snapshots_are_static_and_cover_ten_roots",
     "tests/unit/test_signal_family_differential_gate.py::test_forbidden_definition_universe_is_static_source_only",
 )
@@ -405,6 +397,7 @@ class ProbeSetupStepV1(_StrictModelMixin, BaseModel):
 class ProbeSetupV1(_StrictModelMixin, BaseModel):
     setup_id: StrictStr
     steps: tuple[ProbeSetupStepV1, ...]
+    setup_result_digest: StrictStr = Field(pattern=_SHA256)
 
 
 class BoundaryReachedSentinelV1(_StrictModelMixin, BaseModel):
@@ -435,6 +428,18 @@ class ConstructorIdentityFenceSentinelV1(_StrictModelMixin, BaseModel):
         )
 
 
+class MutationExpectationV1(_StrictModelMixin, BaseModel):
+    guard_ids: tuple[StrictStr, ...]
+    expected_total_count: Literal[0]
+    before_after_equal: Literal[True]
+
+    @model_validator(mode="after")
+    def validate_guards(self) -> Self:
+        if len(self.guard_ids) != len(set(self.guard_ids)):
+            raise ValueError("mutation guard IDs must be unique")
+        return self
+
+
 class BoundaryProbeV1(_StrictModelMixin, BaseModel):
     probe_id: StrictStr
     inventory_id: StrictStr
@@ -447,16 +452,81 @@ class BoundaryProbeV1(_StrictModelMixin, BaseModel):
         "source_result_current",
         "static_only",
     ]
+    setup_id: StrictStr
     entrypoint: StrictStr
     behavior_test: StrictStr
-    current_fixture_id: StrictStr | None
+    positional_fixture_ids: tuple[StrictStr, ...]
+    keyword_fixture_ids: dict[StrictStr, StrictStr]
+    current_member_fixture_ids: tuple[StrictStr, ...]
+    call_shape: CallShapeV1
     call_result_action: Literal["none", "consume_tuple"]
     expected_exception: StrictStr
     expected_exception_phase: Literal["invocation", "consumption"]
+    sentinel_id: StrictStr
     sentinel_kind: Literal["constructor_identity_fence", "boundary_reached", "static_snapshot"]
+    mutation_expectation: MutationExpectationV1
+    before_snapshot_digest: StrictStr = Field(pattern=_SHA256)
+    after_snapshot_digest: StrictStr = Field(pattern=_SHA256)
     source_span: StrictStr
     boundary_ast_sha256: StrictStr = Field(pattern=_SHA256)
     expected_yielded_count: StrictInt = Field(ge=0)
+
+    @model_validator(mode="after")
+    def validate_call_shape(self) -> Self:
+        if self.positional_fixture_ids != self.call_shape.positional_fixture_ids:
+            raise ValueError("probe positional fixtures do not match call shape")
+        if self.keyword_fixture_ids != self.call_shape.keyword_fixture_ids:
+            raise ValueError("probe keyword fixtures do not match call shape")
+        if self.call_result_action != self.call_shape.call_result_action:
+            raise ValueError("probe result action does not match call shape")
+        if self.variant == "static_only":
+            if self.current_member_fixture_ids or self.sentinel_kind != "static_snapshot":
+                raise ValueError("static probe has dynamic fixture or sentinel")
+        elif self.variant != "constructor_identity" and not self.current_member_fixture_ids:
+            raise ValueError("dynamic probe must name its current-family members")
+        if self.expected_exception_phase == "consumption" and self.call_result_action != (
+            "consume_tuple"
+        ):
+            raise ValueError("consumption exception requires consume_tuple")
+        object.__setattr__(
+            self, "keyword_fixture_ids", dict(sorted(self.keyword_fixture_ids.items()))
+        )
+        return self
+
+
+class BoundaryProbeResultV1(_StrictModelMixin, BaseModel):
+    probe_id: StrictStr
+    inventory_id: StrictStr
+    setup_id: StrictStr
+    setup_result_digest: StrictStr = Field(pattern=_SHA256)
+    call_shape_digest: StrictStr = Field(pattern=_SHA256)
+    exception_type: StrictStr
+    exception_phase: Literal["invocation", "consumption"]
+    sentinel_id: StrictStr
+    sentinel_kind: Literal["constructor_identity_fence", "boundary_reached"]
+    sentinel_after_invocation: StrictInt = Field(ge=0)
+    sentinel_after_consumption: StrictInt = Field(ge=0)
+    reached_count: StrictInt = Field(ge=0)
+    mutation_guard_counts: dict[StrictStr, StrictInt]
+    setup_call_counts: dict[StrictStr, StrictInt]
+    yielded_count: StrictInt = Field(ge=0)
+    before_snapshot_digest: StrictStr = Field(pattern=_SHA256)
+    after_snapshot_digest: StrictStr = Field(pattern=_SHA256)
+    passed: bool
+    result_digest: StrictStr = Field(pattern=_SHA256)
+
+    @model_validator(mode="after")
+    def validate_result_digest(self) -> Self:
+        if self.result_digest != _digest_without_field(self, "result_digest"):
+            raise ValueError("boundary result digest mismatch")
+        return self
+
+    @classmethod
+    def with_digest(cls, **values: Any) -> Self:
+        values["result_digest"] = "0" * 64
+        provisional = cls.model_construct(**values)
+        values["result_digest"] = _digest_without_field(provisional, "result_digest")
+        return cls.model_validate(values)
 
 
 class RootSnapshotV1(_StrictModelMixin, BaseModel):
@@ -493,6 +563,41 @@ class ForbiddenDefinitionUniverseV1(_StrictModelMixin, BaseModel):
     registry_keys: tuple[StrictStr, ...]
 
 
+class TopLevelDeclarationV1(_StrictModelMixin, BaseModel):
+    ordinal: StrictInt = Field(ge=0)
+    node_kind: StrictStr
+    names: tuple[StrictStr, ...]
+    source_span: StrictStr = Field(pattern=r"^[1-9][0-9]*:[1-9][0-9]*$")
+    normalized_ast_sha256: StrictStr = Field(pattern=_SHA256)
+    role: Literal[
+        "module_docstring",
+        "import",
+        "assignment",
+        "function",
+        "class",
+        "registration",
+        "export",
+        "conditional",
+        "statement",
+    ]
+
+
+class SourceFileSnapshotV1(_StrictModelMixin, BaseModel):
+    module_path: StrictStr
+    source_sha256: StrictStr = Field(pattern=_SHA256)
+    declarations: tuple[TopLevelDeclarationV1, ...]
+
+    @model_validator(mode="after")
+    def validate_declarations(self) -> Self:
+        if not self.declarations:
+            raise ValueError("source file declaration closure must not be empty")
+        if tuple(item.ordinal for item in self.declarations) != tuple(
+            range(len(self.declarations))
+        ):
+            raise ValueError("top-level declaration ordinals must be complete and ordered")
+        return self
+
+
 class AllowedDiffEntryV1(_StrictModelMixin, BaseModel):
     path: StrictStr = Field(min_length=1)
     status: Literal["A", "M", "D", "T"]
@@ -520,6 +625,17 @@ class EvidenceChannelV1(_StrictModelMixin, BaseModel):
     retention_days: Literal[90]
 
 
+def boundary_manifest_digest(
+    probe_setups: tuple[ProbeSetupV1, ...],
+    boundary_probes: tuple[BoundaryProbeV1, ...],
+) -> str:
+    payload = {
+        "probe_setups": [setup.model_dump(mode="json") for setup in probe_setups],
+        "boundary_probes": [probe.model_dump(mode="json") for probe in boundary_probes],
+    }
+    return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
+
+
 class R07PolicyV1(_StrictModelMixin, BaseModel):
     schema_version: Literal[1]
     baseline_commit_sha: Literal[BASELINE_COMMIT_SHA]
@@ -531,15 +647,29 @@ class R07PolicyV1(_StrictModelMixin, BaseModel):
     fixtures_digest: StrictStr = Field(pattern=_SHA256)
     root_snapshots: tuple[RootSnapshotV1, ...]
     forbidden_definition_universe: ForbiddenDefinitionUniverseV1
+    source_file_snapshots: tuple[SourceFileSnapshotV1, ...]
+    probe_setups: tuple[ProbeSetupV1, ...]
     boundary_probes: tuple[BoundaryProbeV1, ...]
+    boundary_manifest_digest: StrictStr = Field(pattern=_SHA256)
     evidence_channel: EvidenceChannelV1
     policy_digest: StrictStr = Field(pattern=_SHA256)
 
     @model_validator(mode="after")
     def validate_digest(self) -> Self:
+        if self.boundary_manifest_digest != boundary_manifest_digest(
+            self.probe_setups,
+            self.boundary_probes,
+        ):
+            raise ValueError("boundary_manifest_digest does not match canonical probes")
         if self.policy_digest != _digest_without_field(self, "policy_digest"):
             raise ValueError("policy_digest does not match canonical policy")
         return self
+
+    def validate_boundary_manifest(self) -> StaticCheckResult:
+        observed = boundary_manifest_digest(self.probe_setups, self.boundary_probes)
+        if observed != self.boundary_manifest_digest:
+            return StaticCheckResult(False, ("boundary manifest digest mismatch",))
+        return StaticCheckResult(True)
 
     @property
     def canonical_bytes(self) -> bytes:
@@ -798,6 +928,12 @@ def verify_policy_completeness(policy: R07PolicyV1) -> StaticCheckResult:
         reasons.append("forbidden export universe mismatch")
     if universe.registry_keys != EXPECTED_FORBIDDEN_REGISTRY_KEYS:
         reasons.append("forbidden registry-key universe mismatch")
+    if tuple(snapshot.module_path for snapshot in policy.source_file_snapshots) != (
+        EXPECTED_FORBIDDEN_SOURCE_FILES
+    ):
+        reasons.append("source-file snapshot universe mismatch")
+    if any(not snapshot.declarations for snapshot in policy.source_file_snapshots):
+        reasons.append("source-file declaration closure must not be empty")
     if not policy.fixtures or not policy.current_fixtures:
         reasons.append("fixture manifests must not be empty")
     else:
@@ -827,14 +963,36 @@ def verify_policy_completeness(policy: R07PolicyV1) -> StaticCheckResult:
     expected_ids = tuple(f"R07-B{index:02d}" for index in range(1, 20))
     if tuple(probe.inventory_id for probe in policy.boundary_probes) != expected_ids:
         reasons.append("boundary inventory mismatch")
+    expected_setup_ids = tuple(f"setup-r07-b{index:02d}" for index in range(1, 20))
+    if tuple(setup.setup_id for setup in policy.probe_setups) != expected_setup_ids:
+        reasons.append("probe setup inventory mismatch")
+    if tuple(probe.setup_id for probe in policy.boundary_probes) != expected_setup_ids:
+        reasons.append("probe-to-setup binding mismatch")
     if tuple(probe.behavior_test for probe in policy.boundary_probes) != (
         EXPECTED_BOUNDARY_BEHAVIOR_TESTS
     ):
         reasons.append("boundary behavior-test universe mismatch")
-    fixture_ids = {fixture.fixture_id for fixture in policy.current_fixtures}
+    fixture_ids = {fixture.fixture_id for fixture in policy.fixtures} | {
+        fixture.fixture_id for fixture in policy.current_fixtures
+    }
+    for setup in policy.probe_setups:
+        for step in setup.steps:
+            missing = set(step.fixture_ids) - fixture_ids
+            if missing:
+                reasons.append(f"{setup.setup_id}: missing setup fixture {sorted(missing)[0]}")
     for probe in policy.boundary_probes:
-        if probe.variant != "static_only" and probe.current_fixture_id not in fixture_ids:
-            reasons.append(f"{probe.inventory_id}: missing current fixture")
+        referenced = (
+            set(probe.positional_fixture_ids)
+            | set(probe.keyword_fixture_ids.values())
+            | set(probe.current_member_fixture_ids)
+        )
+        if probe.call_shape.receiver_fixture_id is not None:
+            referenced.add(probe.call_shape.receiver_fixture_id)
+        missing = referenced - fixture_ids
+        if missing:
+            reasons.append(f"{probe.inventory_id}: missing call fixture {sorted(missing)[0]}")
+    if not policy.validate_boundary_manifest().passed:
+        reasons.append("boundary manifest digest mismatch")
     return StaticCheckResult(not reasons, tuple(reasons))
 
 
@@ -941,6 +1099,176 @@ def _signature_text(node: ast.AST) -> str:
     if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
         return ""
     return ast.unparse(node.args)
+
+
+def _target_names(node: ast.AST) -> tuple[str, ...]:
+    if isinstance(node, ast.Name):
+        return (node.id,)
+    if isinstance(node, (ast.Tuple, ast.List)):
+        return tuple(name for item in node.elts for name in _target_names(item))
+    if isinstance(node, ast.Subscript):
+        return (_subscript_root_name(node),)
+    return ()
+
+
+def _subscript_root_name(node: ast.Subscript) -> str:
+    value: ast.AST = node.value
+    while isinstance(value, (ast.Attribute, ast.Subscript)):
+        value = value.value
+    return value.id if isinstance(value, ast.Name) else ""
+
+
+def _declaration_names(node: ast.AST) -> tuple[str, ...]:
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return (node.name,)
+    if isinstance(node, (ast.Import, ast.ImportFrom)):
+        return tuple(alias.asname or alias.name.split(".", 1)[0] for alias in node.names)
+    if isinstance(node, ast.Assign):
+        return tuple(name for target in node.targets for name in _target_names(target))
+    if isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+        return _target_names(node.target)
+    return ()
+
+
+def _is_registry_statement(node: ast.AST) -> bool:
+    targets: tuple[ast.AST, ...] = ()
+    if isinstance(node, ast.Assign):
+        targets = tuple(node.targets)
+    elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+        targets = (node.target,)
+    if any(
+        isinstance(target, ast.Subscript) and "registry" in _subscript_root_name(target).lower()
+        for target in targets
+    ):
+        return True
+    if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+        called = node.value.func
+        name = called.attr if isinstance(called, ast.Attribute) else getattr(called, "id", "")
+        return "register" in name.lower()
+    return False
+
+
+def _is_export_statement(node: ast.AST) -> bool:
+    if isinstance(node, ast.Assign):
+        return any("__all__" in _target_names(target) for target in node.targets)
+    if isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+        return "__all__" in _target_names(node.target)
+    return False
+
+
+def _top_level_role(node: ast.AST, *, ordinal: int) -> str:
+    if (
+        ordinal == 0
+        and isinstance(node, ast.Expr)
+        and isinstance(node.value, ast.Constant)
+        and type(node.value.value) is str
+    ):
+        return "module_docstring"
+    if isinstance(node, (ast.Import, ast.ImportFrom)):
+        return "import"
+    if _is_export_statement(node):
+        return "export"
+    if _is_registry_statement(node):
+        return "registration"
+    if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+        return "assignment"
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return "function"
+    if isinstance(node, ast.ClassDef):
+        return "class"
+    if isinstance(node, (ast.If, ast.Try, ast.With, ast.Match)):
+        return "conditional"
+    return "statement"
+
+
+def top_level_declaration_snapshot(node: ast.AST, *, ordinal: int) -> TopLevelDeclarationV1:
+    return TopLevelDeclarationV1(
+        ordinal=ordinal,
+        node_kind=type(node).__name__,
+        names=_declaration_names(node),
+        source_span=f"{node.lineno}:{node.end_lineno}",
+        normalized_ast_sha256=hashlib.sha256(
+            ast.dump(node, include_attributes=False).encode()
+        ).hexdigest(),
+        role=_top_level_role(node, ordinal=ordinal),
+    )
+
+
+def source_file_snapshot(root: Path, module_path: str) -> SourceFileSnapshotV1:
+    source_bytes = (root / module_path).read_bytes()
+    source = source_bytes.decode("utf-8")
+    tree = ast.parse(source, filename=module_path)
+    return SourceFileSnapshotV1(
+        module_path=module_path,
+        source_sha256=hashlib.sha256(source_bytes).hexdigest(),
+        declarations=tuple(
+            top_level_declaration_snapshot(node, ordinal=ordinal)
+            for ordinal, node in enumerate(tree.body)
+        ),
+    )
+
+
+def _dynamic_top_level_reasons(tree: ast.Module, module_path: str) -> tuple[str, ...]:
+    reasons: list[str] = []
+    declared = {name for node in tree.body for name in _declaration_names(node) if name}
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        for candidate in ast.walk(node):
+            if isinstance(candidate, ast.Call):
+                called = candidate.func
+                if isinstance(called, ast.Name) and called.id == "__import__":
+                    reasons.append(f"{module_path}: dynamic import")
+                if (
+                    isinstance(called, ast.Attribute)
+                    and called.attr == "import_module"
+                    and isinstance(called.value, ast.Name)
+                    and called.value.id == "importlib"
+                ):
+                    reasons.append(f"{module_path}: dynamic import")
+            if isinstance(candidate, ast.Subscript) and isinstance(candidate.ctx, ast.Store):
+                root_name = _subscript_root_name(candidate)
+                if "registry" not in root_name.lower():
+                    continue
+                key = candidate.slice
+                if not (isinstance(key, ast.Constant) and type(key.value) is str):
+                    reasons.append(f"{module_path}: dynamic registration key")
+                if root_name not in declared:
+                    reasons.append(f"{module_path}: unresolved registry alias {root_name}")
+        if _is_export_statement(node) and isinstance(node, (ast.Assign, ast.AnnAssign)):
+            value = node.value
+            if not (
+                isinstance(value, (ast.Tuple, ast.List))
+                and all(
+                    isinstance(item, ast.Constant) and type(item.value) is str
+                    for item in value.elts
+                )
+            ):
+                reasons.append(f"{module_path}: dynamic export")
+    return tuple(dict.fromkeys(reasons))
+
+
+def verify_top_level_source_closure(
+    root: Path,
+    snapshots: tuple[SourceFileSnapshotV1, ...] | list[SourceFileSnapshotV1],
+) -> StaticCheckResult:
+    reasons: list[str] = []
+    for expected in snapshots:
+        try:
+            observed = source_file_snapshot(root, expected.module_path)
+            tree = ast.parse(
+                _source_for(root, expected.module_path),
+                filename=expected.module_path,
+            )
+        except (OSError, SyntaxError, UnicodeDecodeError, ValueError) as exc:
+            reasons.append(f"{expected.module_path}: {type(exc).__name__}")
+            continue
+        reasons.extend(_dynamic_top_level_reasons(tree, expected.module_path))
+        if observed.source_sha256 != expected.source_sha256:
+            reasons.append(f"{expected.module_path}: source digest drift")
+        if observed.declarations != expected.declarations:
+            reasons.append(f"{expected.module_path}: top-level declaration closure drift")
+    return StaticCheckResult(not reasons, tuple(dict.fromkeys(reasons)))
 
 
 def verify_forbidden_definitions(

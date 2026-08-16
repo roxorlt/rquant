@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -104,9 +105,9 @@ def test_evidence_rejects_extra_coerced_or_incomplete_json(payload) -> None:
 def test_composite_fixture_resolves_only_to_prior_ids_and_hashes_resolved_bytes() -> None:
     fixtures = load_policy(POLICY_PATH).fixtures
     resolved = resolve_fixture_values(fixtures)
-    assert resolved["current.batch"]
+    assert resolved["batch.current-routed"] == ("record.current-routed",)
     assert hashlib.sha256(
-        json.dumps(resolved["current.batch"], separators=(",", ":")).encode()
+        json.dumps(resolved["batch.current-routed"], separators=(",", ":")).encode()
     ).hexdigest()
 
 
@@ -244,6 +245,49 @@ def test_root_snapshots_are_static_and_cover_ten_roots() -> None:
 def test_forbidden_definition_universe_is_static_source_only() -> None:
     assert "src/rquant/signal_route_spool.py" in FORBIDDEN_DEFINITION_UNIVERSE.source_files
     assert verify_forbidden_definitions(ROOT, FORBIDDEN_DEFINITION_UNIVERSE).passed
+    policy = load_policy(POLICY_PATH)
+    assert len(policy.source_file_snapshots) == 9
+    verifier = getattr(differential_gate, "verify_top_level_source_closure", None)
+    assert verifier is not None
+    assert verifier(ROOT, policy.source_file_snapshots).passed
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "registry[''.join(('v3_', 'writer'))] = object()\n",
+        "def unrelated_top_level_function() -> None:\n    return None\n",
+        "unrelated_top_level_assignment = 1\n",
+        "dynamic_module = __import__('rquant.signal_route_spool')\n",
+        "__all__ = tuple(name for name in ('build_builtin_registry',))\n",
+        "registry['legacy'] = unresolved_registry_alias\n",
+    ],
+    ids=(
+        "computed-v3-writer",
+        "function",
+        "assign",
+        "dynamic-import",
+        "dynamic-export",
+        "unresolved-alias",
+    ),
+)
+def test_top_level_source_closure_blocks_dynamic_and_unlisted_declarations(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    policy = load_policy(POLICY_PATH)
+    for snapshot in policy.source_file_snapshots:
+        source = ROOT / snapshot.module_path
+        target = tmp_path / snapshot.module_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
+    target = tmp_path / "src/rquant/runtime_service_main.py"
+    target.write_text(target.read_text(encoding="utf-8") + "\n" + tamper, encoding="utf-8")
+    result = differential_gate.verify_top_level_source_closure(
+        tmp_path,
+        policy.source_file_snapshots,
+    )
+    assert not result.passed
 
 
 def test_forbidden_definition_gate_detects_symbols_and_registry_string_keys(
@@ -300,6 +344,18 @@ def test_policy_completeness_rejects_any_declaration_or_universe_omission() -> N
     assert not differential_gate.verify_policy_completeness(narrowed).passed
     narrowed = policy.model_copy(update={"current_fixtures": policy.current_fixtures[:-1]})
     assert not differential_gate.verify_policy_completeness(narrowed).passed
+    narrowed = policy.model_copy(
+        update={"source_file_snapshots": policy.source_file_snapshots[:-1]}
+    )
+    assert not differential_gate.verify_policy_completeness(narrowed).passed
+    first_snapshot = policy.source_file_snapshots[0]
+    incomplete_snapshot = first_snapshot.model_copy(
+        update={"declarations": first_snapshot.declarations[:-1]}
+    )
+    assert not differential_gate.verify_top_level_source_closure(
+        ROOT,
+        (incomplete_snapshot, *policy.source_file_snapshots[1:]),
+    ).passed
     changed_probe = policy.boundary_probes[0].model_copy(update={"behavior_test": "wrong"})
     narrowed = policy.model_copy(
         update={"boundary_probes": (changed_probe, *policy.boundary_probes[1:])}

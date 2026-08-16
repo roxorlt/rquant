@@ -74,6 +74,15 @@ _CANDIDATE_METADATA_COLUMNS = (
     "candidate_snapshot_schema_version",
 )
 _LEGACY_SIGNAL_ENVELOPE_CONSTRUCTOR = SignalEnvelope
+
+
+def _legacy_signal_constructor_identity_matches(
+    candidate: object,
+    expected: object,
+) -> bool:
+    return candidate is expected
+
+
 _CANDIDATE_STATE_PRE_HIGH_WATERMARK_SCHEMA = (
     (0, "occurrence_id", "TEXT", 1, 1),
     (1, "candidate_id", "TEXT", 1, 0),
@@ -1777,7 +1786,10 @@ class StrategyRunnerStore:
         observed_at: datetime,
         evaluator: StrategyEvaluator,
     ) -> StrategyBatchResult:
-        if SignalEnvelope is not _LEGACY_SIGNAL_ENVELOPE_CONSTRUCTOR:
+        if not _legacy_signal_constructor_identity_matches(
+            SignalEnvelope,
+            _LEGACY_SIGNAL_ENVELOPE_CONSTRUCTOR,
+        ):
             raise LegacySignalWriteActivationError(
                 "StrategyRunnerStore.process_batch is legacy-only in this reader-only release; "
                 "current-family writes are not activated"
