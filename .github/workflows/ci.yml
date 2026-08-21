@@ -10,7 +10,9 @@ permissions:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Every push to main must keep its own run: a cancelled run produces no R07
+  # evidence artifact, and that commit could then never be a deployment target.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   core-preflight:

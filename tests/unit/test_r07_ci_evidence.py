@@ -409,6 +409,8 @@ def test_workflow_has_static_dual_python_jobs_and_strict_aggregate_contract() ->
     aggregate = jobs[expected[2]]
     assert "matrix" not in py311.get("strategy", {})
     assert "matrix" not in py312.get("strategy", {})
+    assert "matrix" not in aggregate.get("strategy", {})
+    assert "strategy" not in aggregate
     assert aggregate["needs"] == [expected[0], expected[1]]
     assert "github.event_name == 'push'" in aggregate["if"]
     assert "github.ref == 'refs/heads/main'" in aggregate["if"]
@@ -484,3 +486,73 @@ def test_exact_gate_reports_every_executed_check_instead_of_a_constant(
         gate_execution.policy.boundary_probes
     )
     assert len(gate_execution.boundary_results) == ci_evidence._BOUNDARY_PROBE_COUNT
+
+
+def test_workflow_never_cancels_push_to_main_runs() -> None:
+    concurrency = _workflow()["concurrency"]
+
+    assert type(concurrency) is dict
+    assert concurrency["group"] == "ci-${{ github.workflow }}-${{ github.ref }}"
+    assert concurrency["cancel-in-progress"] == "${{ github.event_name == 'pull_request' }}"
+
+
+def test_workflow_guards_every_summary_step_on_push_to_main_only() -> None:
+    jobs = _workflow()["jobs"]
+    push_main = "github.event_name == 'push' && github.ref == 'refs/heads/main'"
+    guarded: list[str] = []
+    for job_id in ("r07-differential-gate-py311", "r07-differential-gate-py312"):
+        for step in jobs[job_id]["steps"]:
+            name = str(step.get("name", ""))
+            if name.startswith(("Produce bound Python", "Upload Python")):
+                assert step["if"] == push_main, (job_id, name, step.get("if"))
+                guarded.append(f"{job_id}:{name}")
+            elif name.startswith("Validate pull request"):
+                assert step["if"] == "github.event_name == 'pull_request'"
+            else:
+                assert "if" not in step, (job_id, name)
+
+    assert guarded == [
+        "r07-differential-gate-py311:Produce bound Python 3.11 summary",
+        "r07-differential-gate-py311:Upload Python 3.11 summary",
+        "r07-differential-gate-py312:Produce bound Python 3.12 summary",
+        "r07-differential-gate-py312:Upload Python 3.12 summary",
+    ]
+
+
+def test_workflow_scopes_summary_artifacts_to_one_run_attempt() -> None:
+    jobs = _workflow()["jobs"]
+    scope = "${{ github.run_id }}-${{ github.run_attempt }}"
+    uploaded = {
+        "r07-differential-gate-py311": f"r07-dr-gate-summary-py311-{scope}",
+        "r07-differential-gate-py312": f"r07-dr-gate-summary-py312-{scope}",
+    }
+    for job_id, expected_name in uploaded.items():
+        upload = next(
+            step
+            for step in jobs[job_id]["steps"]
+            if str(step.get("uses", "")).startswith("actions/upload-artifact@")
+        )
+        assert upload["with"]["name"] == expected_name
+        assert upload["with"]["retention-days"] == 1
+
+    downloads = [
+        step["with"]["name"]
+        for step in jobs["r07-differential-gate-evidence"]["steps"]
+        if str(step.get("uses", "")).startswith("actions/download-artifact@")
+    ]
+    assert downloads == list(uploaded.values())
+
+
+def test_artifact_writer_rejects_a_bare_observation_wire(
+    tmp_path: Path,
+    evidence_bundle: _EvidenceBundle,
+) -> None:
+    artifact_root = tmp_path / "artifact-root"
+
+    with pytest.raises(TypeError):
+        ci_evidence.write_verified_evidence_artifact(
+            artifact_root,
+            evidence_bundle.evidence.wire,
+        )
+
+    assert not artifact_root.exists()
