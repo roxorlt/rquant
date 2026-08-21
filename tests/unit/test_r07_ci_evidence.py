@@ -231,13 +231,19 @@ def test_python_summary_event_ref_sha_and_job_gating_fails_without_output(
 @pytest.mark.parametrize(
     "mutation",
     (
-        lambda value: value | {"extra": "blocked"},
-        lambda value: {key: item for key, item in value.items() if key != "run_attempt"},
-        lambda value: value | {"collected": True},
-        lambda value: value | {"passed": 19},
-        lambda value: value | {"skipped": 1},
-        lambda value: value | {"deselected": 1},
-        lambda value: value | {"result_digest": "0" * 64},
+        pytest.param(lambda value: value | {"extra": "blocked"}, id="extra-field"),
+        pytest.param(
+            lambda value: {key: item for key, item in value.items() if key != "run_attempt"},
+            id="missing-run-attempt",
+        ),
+        pytest.param(lambda value: value | {"collected": True}, id="bool-coerced-collected"),
+        pytest.param(lambda value: value | {"passed": 19}, id="passed-below-collected"),
+        pytest.param(lambda value: value | {"skipped": 1}, id="nonzero-skipped"),
+        pytest.param(lambda value: value | {"deselected": 1}, id="nonzero-deselected"),
+        pytest.param(
+            lambda value: value | {"result_digest": "0" * 64},
+            id="tampered-result-digest",
+        ),
     ),
 )
 def test_python_summary_parser_rejects_missing_extra_coerced_or_tampered_fields(
