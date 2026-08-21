@@ -433,3 +433,54 @@ def test_workflow_pins_every_action_to_a_full_commit_sha() -> None:
     ]
     assert uses
     assert all(re.fullmatch(r"[^@]+@[0-9a-f]{40}", value) for value in uses)
+
+
+@pytest.fixture(scope="module")
+def gate_execution() -> ci_evidence._GateExecution:
+    commit, tree = _actual_identity()
+    return ci_evidence._execute_exact_gate(ROOT, candidate_commit=commit, candidate_tree=tree)
+
+
+def test_gate_execution_counts_derive_from_the_executed_check_inventory() -> None:
+    assert not hasattr(ci_evidence, "_GATE_CHECK_COUNT")
+    execution = ci_evidence._GateExecution(
+        policy=None,
+        candidate_gate=None,
+        boundary_results=(),
+        static_result=None,
+        executed_checks=("policy-load", "candidate-diff-gate", "static:policy-completeness"),
+    )
+
+    assert execution.collected == 3
+    assert execution.passed == 3
+    assert execution.skipped == 0
+    assert execution.deselected == 0
+
+
+def test_exact_gate_reports_every_executed_check_instead_of_a_constant(
+    gate_execution: ci_evidence._GateExecution,
+) -> None:
+    expected = (
+        ("policy-load:tests/fixtures/r07_differential_gate/policy-v1.json",)
+        + ("candidate-diff-gate",)
+        + tuple(f"static:{name}" for name, _result in gate_execution.static_result.checks)
+        + tuple(
+            f"boundary-probe:{result.inventory_id}" for result in gate_execution.boundary_results
+        )
+        + ("boundary-probe-results-digest",)
+    )
+
+    assert gate_execution.executed_checks == expected
+    assert len(set(expected)) == len(expected)
+    assert gate_execution.collected == gate_execution.passed == len(expected)
+    assert gate_execution.skipped == gate_execution.deselected == 0
+    assert gate_execution.collected == ci_evidence._expected_gate_check_total(
+        gate_execution.policy
+    )
+    assert gate_execution.collected != 20
+    assert len(gate_execution.static_result.checks) == 3 + len(
+        gate_execution.policy.root_snapshots
+    ) + len(gate_execution.policy.production_declarations) + len(
+        gate_execution.policy.boundary_probes
+    )
+    assert len(gate_execution.boundary_results) == ci_evidence._BOUNDARY_PROBE_COUNT

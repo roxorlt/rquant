@@ -39,7 +39,12 @@ _PYTHON_JOBS = {
 }
 _AGGREGATE_JOB = "r07-differential-gate-evidence"
 _POLICY_RELATIVE_PATH = Path("tests/fixtures/r07_differential_gate/policy-v1.json")
-_GATE_CHECK_COUNT = 20
+_BOUNDARY_PROBE_COUNT = 17
+_FIXED_STATIC_CHECK_NAMES = (
+    "policy-completeness",
+    "top-level-source-closure",
+    "forbidden-definitions",
+)
 _MAX_SUMMARY_BYTES = 16 * 1024
 
 
@@ -49,10 +54,38 @@ class _GateExecution:
     candidate_gate: CandidateGateResult
     boundary_results: tuple[BoundaryProbeResultV1, ...]
     static_result: R07StaticGateResult
-    collected: int = _GATE_CHECK_COUNT
-    passed: int = _GATE_CHECK_COUNT
-    skipped: int = 0
-    deselected: int = 0
+    executed_checks: tuple[str, ...]
+
+    @property
+    def collected(self) -> int:
+        return len(self.executed_checks)
+
+    @property
+    def passed(self) -> int:
+        return len(self.executed_checks)
+
+    @property
+    def skipped(self) -> int:
+        return 0
+
+    @property
+    def deselected(self) -> int:
+        return 0
+
+
+def _expected_gate_check_total(policy: R07PolicyV1) -> int:
+    """Ordered checks one _execute_exact_gate run must complete for a frozen policy."""
+
+    return (
+        1  # policy load from the candidate Git tree
+        + 1  # complete raw diff and allowlist gate
+        + len(_FIXED_STATIC_CHECK_NAMES)
+        + len(policy.root_snapshots)
+        + len(policy.production_declarations)
+        + len(policy.boundary_probes)
+        + _BOUNDARY_PROBE_COUNT
+        + 1  # boundary probe results digest
+    )
 
 
 class GitHubRunContextV1(BaseModel):
@@ -255,6 +288,7 @@ def _execute_exact_gate(
     candidate_commit: str,
     candidate_tree: str,
 ) -> _GateExecution:
+    executed: list[str] = []
     with differential_gate._materialize_candidate_tree(repo, candidate_commit) as candidate_root:
         try:
             run_boundary_probe_subprocess = differential_gate._load_candidate_probe_runner(
@@ -264,6 +298,7 @@ def _execute_exact_gate(
             raise ValueError("R07 candidate probe runner facade is unavailable") from exc
         policy_path = candidate_root / _POLICY_RELATIVE_PATH
         policy = load_policy(policy_path)
+        executed.append(f"policy-load:{_POLICY_RELATIVE_PATH.as_posix()}")
         candidate_gate = verify_candidate_gate(
             repo,
             policy=policy,
@@ -272,6 +307,7 @@ def _execute_exact_gate(
         )
         if not candidate_gate.passed:
             raise ValueError("R07 candidate diff gate did not pass")
+        executed.append("candidate-diff-gate")
         static_result = verify_r07_static_gate(
             repo,
             policy=policy,
@@ -280,6 +316,7 @@ def _execute_exact_gate(
         )
         if not static_result.passed:
             raise ValueError("R07 B18/B19 static gate did not pass")
+        executed.extend(f"static:{name}" for name, _result in static_result.checks)
         with TemporaryDirectory(prefix="rquant-r07-ci-probes-") as directory:
             probe_root = Path(directory).resolve(strict=True)
             boundary_results = tuple(
@@ -291,14 +328,24 @@ def _execute_exact_gate(
                         tmp_path=probe_root / f"b{index:02d}",
                     )
                 )
-                for index in range(1, 18)
+                for index in range(1, _BOUNDARY_PROBE_COUNT + 1)
             )
+        if not all(result.passed for result in boundary_results):
+            raise ValueError("R07 boundary probe did not pass")
+        executed.extend(f"boundary-probe:{result.inventory_id}" for result in boundary_results)
         boundary_probe_results_digest(policy, boundary_results)
+        executed.append("boundary-probe-results-digest")
+    executed_checks = tuple(executed)
+    if len(set(executed_checks)) != len(executed_checks):
+        raise ValueError("R07 gate check inventory is not unique")
+    if len(executed_checks) != _expected_gate_check_total(policy):
+        raise ValueError("R07 gate check inventory does not match the frozen policy")
     return _GateExecution(
         policy=policy,
         candidate_gate=candidate_gate,
         boundary_results=boundary_results,
         static_result=static_result,
+        executed_checks=executed_checks,
     )
 
 
