@@ -709,3 +709,22 @@ def test_policy_is_canonical_and_binds_requested_baseline() -> None:
     assert policy.baseline_commit_sha == BASELINE_COMMIT_SHA
     assert policy.baseline_tree_sha == BASELINE_TREE_SHA
     assert policy.canonical_bytes == POLICY_PATH.read_bytes()
+
+
+def test_production_category_is_reserved_for_declaration_scanned_sources() -> None:
+    policy = load_policy(POLICY_PATH)
+    production_paths = {
+        entry.path for entry in policy.allowed_diff if entry.category == "production"
+    }
+    assert production_paths
+    assert all(path.startswith("src/rquant/") for path in production_paths)
+    scanned = {declaration.module_path for declaration in policy.production_declarations}
+    scanned |= set(policy.forbidden_definition_universe.source_files)
+    scanned |= {snapshot.module_path for snapshot in policy.source_file_snapshots}
+    assert scanned
+    assert all(path.startswith("src/rquant/") for path in scanned)
+    architecture_paths = {
+        entry.path for entry in policy.allowed_diff if entry.category == "architecture"
+    }
+    assert "scripts/r07_ci_evidence.py" in architecture_paths
+    assert ".github/workflows/ci.yml" in architecture_paths
