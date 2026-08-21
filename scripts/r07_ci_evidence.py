@@ -3,17 +3,15 @@
 from __future__ import annotations
 
 import argparse
-import importlib
 import os
 import stat
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Self, cast
+from typing import Self
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, model_validator
 
@@ -251,33 +249,19 @@ def _checkout_identity(repo: Path) -> tuple[Path, str, str]:
     return repository, commit, tree
 
 
-def _load_probe_runner(repo: Path) -> Callable[..., dict[str, object]]:
-    repository = Path(repo).resolve(strict=True)
-    expected = (repository / "tests" / "r07_differential_probe_runner.py").resolve(strict=True)
-    before_path = tuple(sys.path)
-    sys.path.insert(0, str(repository))
-    try:
-        module = importlib.import_module("tests.r07_differential_probe_runner")
-    finally:
-        sys.path[:] = before_path
-    module_path = Path(module.__file__ or "").resolve(strict=True)
-    if module_path != expected:
-        raise ValueError("R07 probe runner did not resolve from the exact candidate repository")
-    runner = getattr(module, "run_boundary_probe_subprocess", None)
-    if not callable(runner):
-        raise ValueError("R07 probe runner facade is missing its fixed entrypoint")
-    return cast(Callable[..., dict[str, object]], runner)
-
-
 def _execute_exact_gate(
     repo: Path,
     *,
     candidate_commit: str,
     candidate_tree: str,
 ) -> _GateExecution:
-    run_boundary_probe_subprocess = _load_probe_runner(repo)
-
     with differential_gate._materialize_candidate_tree(repo, candidate_commit) as candidate_root:
+        try:
+            run_boundary_probe_subprocess = differential_gate._load_candidate_probe_runner(
+                candidate_root
+            )
+        except (ImportError, OSError, SyntaxError, ValueError) as exc:
+            raise ValueError("R07 candidate probe runner facade is unavailable") from exc
         policy_path = candidate_root / _POLICY_RELATIVE_PATH
         policy = load_policy(policy_path)
         candidate_gate = verify_candidate_gate(

@@ -10,17 +10,18 @@ import ast
 import base64
 import copy
 import hashlib
+import importlib.util
 import io
 import os
 import stat
 import subprocess
 import tarfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
-from typing import Any, Literal, Self
+from typing import Any, Literal, Self, cast
 
 from pydantic import (
     BaseModel,
@@ -1262,6 +1263,26 @@ def _materialize_candidate_tree(repo: Path, candidate_commit: str) -> Iterator[P
         yield root
 
 
+def _load_candidate_probe_runner(candidate_root: Path) -> Callable[..., dict[str, object]]:
+    """Load the probe facade from the candidate Git tree, never from the caller's worktree."""
+
+    module_path = Path(candidate_root) / "tests" / "r07_differential_probe_runner.py"
+    if not stat.S_ISREG(module_path.lstat().st_mode):
+        raise ValueError("candidate probe runner facade is not a regular file")
+    spec = importlib.util.spec_from_file_location(
+        "rquant._r07_candidate_probe_runner",
+        module_path.resolve(strict=True),
+    )
+    if spec is None or spec.loader is None:
+        raise ValueError("candidate probe runner facade has no importable spec")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    runner = getattr(module, "run_boundary_probe_subprocess", None)
+    if not callable(runner):
+        raise ValueError("candidate probe runner facade is missing its fixed entrypoint")
+    return cast("Callable[..., dict[str, object]]", runner)
+
+
 def _wire_with_recomputed_digests(
     wire: R07DrGateEvidenceWireV1,
     *,
@@ -1325,7 +1346,7 @@ def _verify_wire(
         )
         if not static_result.passed:
             raise ValueError("static gate did not pass")
-    except (OSError, subprocess.CalledProcessError) as exc:
+    except (ImportError, OSError, subprocess.CalledProcessError) as exc:
         raise ValueError("wire Git binding does not resolve to exact Git objects") from exc
 
     if (
@@ -1357,7 +1378,10 @@ def _verify_wire(
         if candidate_policy != validated_policy:
             raise ValueError("candidate policy object does not match supplied policy")
 
-        from tests.r07_differential_probe_runner import run_boundary_probe_subprocess
+        try:
+            run_boundary_probe_subprocess = _load_candidate_probe_runner(candidate_root)
+        except (ImportError, OSError, SyntaxError, ValueError) as exc:
+            raise ValueError("candidate probe runner facade is unavailable") from exc
 
         with TemporaryDirectory(prefix="rquant-r07-probe-") as probe_directory:
             probe_root = Path(probe_directory).resolve(strict=True)

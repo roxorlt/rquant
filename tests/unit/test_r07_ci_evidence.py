@@ -104,30 +104,51 @@ def test_r07_ci_evidence_producer_is_present_and_complete() -> None:
     assert R07_CI_EVIDENCE_PRODUCER_IMPLEMENTED is True
 
 
-def test_direct_script_runtime_loads_exact_repository_probe_facade(tmp_path: Path) -> None:
+def test_direct_script_runtime_loads_candidate_tree_probe_facade(tmp_path: Path) -> None:
     site_packages = (
         Path(sys.prefix)
         / "lib"
         / f"python{sys.version_info.major}.{sys.version_info.minor}"
         / "site-packages"
     ).resolve(strict=True)
-    bootstrap = (
-        "import importlib.util, sys; "
-        "from pathlib import Path; "
-        f"path = Path({str(PRODUCER_PATH)!r}); "
-        "spec = importlib.util.spec_from_file_location('r07_ci_direct', path); "
-        "module = importlib.util.module_from_spec(spec); "
-        "sys.modules[spec.name] = module; "
-        "spec.loader.exec_module(module); "
-        f"runner = module._load_probe_runner(Path({str(ROOT)!r})); "
-        "print(Path(runner.__code__.co_filename).resolve())"
-    )
+    commit, _tree = _actual_identity()
+    temporary_root = tmp_path / "tmp"
+    temporary_root.mkdir()
+    bootstrap = f"""
+import importlib.util
+import sys
+from pathlib import Path
+
+producer = Path({str(PRODUCER_PATH)!r})
+spec = importlib.util.spec_from_file_location("r07_ci_direct", producer)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+gate = module.differential_gate
+with gate._materialize_candidate_tree(Path({str(ROOT)!r}), {commit!r}) as candidate_root:
+    runner = gate._load_candidate_probe_runner(candidate_root)
+    loaded = Path(runner.__code__.co_filename).resolve()
+    expected = (candidate_root / "tests" / "r07_differential_probe_runner.py").resolve()
+    assert loaded == expected, (loaded, expected)
+    assert loaded.read_bytes() == (
+        Path({str(ROOT)!r}) / "tests" / "r07_differential_probe_runner.py"
+    ).read_bytes()
+
+assert "tests" not in sys.modules
+assert "tests.r07_differential_probe_runner" not in sys.modules
+assert {str(ROOT)!r} not in sys.path
+print("candidate-tree-facade")
+"""
     completed = subprocess.run(
-        [str(Path(sys.executable).resolve(strict=True)), "-c", bootstrap],
+        [sys.executable, "-c", bootstrap],
         cwd=tmp_path,
         env={
             "LANG": "C",
             "LC_ALL": "C",
+            "TMPDIR": str(temporary_root),
+            "TMP": str(temporary_root),
+            "TEMP": str(temporary_root),
             "PYTHONPATH": os.pathsep.join((str(ROOT / "src"), str(site_packages))),
             "PYTHONNOUSERSITE": "1",
             "PYTHONDONTWRITEBYTECODE": "1",
@@ -139,10 +160,8 @@ def test_direct_script_runtime_loads_exact_repository_probe_facade(tmp_path: Pat
         text=True,
     )
 
-    assert completed.returncode == 0, completed.stderr
-    assert Path(completed.stdout.strip()) == (
-        ROOT / "tests" / "r07_differential_probe_runner.py"
-    ).resolve(strict=True)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert completed.stdout.strip() == "candidate-tree-facade"
 
 
 @pytest.mark.parametrize(
