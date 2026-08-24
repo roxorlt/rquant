@@ -84,6 +84,29 @@ class TestChildContainment:
 
         assert tuple(sorted(observed)) == root_verifier.SIGNAL_FAMILY_CHILD_ENV_KEYS
 
+    def test_the_child_configuration_environment_is_root_fixed_and_cwd_anchored(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """WP4-c round 1: `rquant.config` builds a `Settings` at import, so the child needs
+        those five keys to construct any notifier or serving builder. The root chooses the
+        values; the caller's own environment can never reach the child."""
+
+        for key in root_verifier.CHILD_CONFIGURATION_ENV_KEYS:
+            monkeypatch.setenv(key, f"/leaked/{key}")
+        cwd = tmp_path / "child"
+        cwd.mkdir()
+
+        passed = root_verifier.child_environment(cwd=cwd, request_fd=3, result_fd=4)
+
+        assert set(root_verifier.CHILD_CONFIGURATION_ENV_KEYS).issubset(passed)
+        for value in passed.values():
+            assert "/leaked/" not in value
+        for key in root_verifier.CHILD_CONFIGURATION_PATH_ENV_KEYS:
+            assert Path(passed[key]).is_relative_to(cwd)
+        assert passed["TUSHARE_TOKEN_MAIN"] == root_verifier.CHILD_ABSENT_CREDENTIAL_VALUE
+
     def test_the_child_receives_no_python_path_and_runs_isolated(
         self,
         tmp_path: Path,
@@ -125,6 +148,47 @@ class TestChildContainment:
         assert cwd.exists() is False
         assert world.store_root not in cwd.parents
         assert world.generation_path not in cwd.parents
+
+    def test_the_child_cwd_has_no_group_or_world_writable_ancestor(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """WP4-c round 1: a sticky ancestor is what blocks the serving-authority readers.
+
+        `runtime_serving_authority` walks an authority root's whole ancestry and refuses any
+        group- or world-writable node, so a child cwd created by a bare `tempfile.mkdtemp()`
+        makes three reader surfaces unreachable the moment `TMPDIR` is unset and the default
+        temp root is a sticky `1777` `/tmp`. macOS hides this — its per-user temp root is
+        `0700` — so the property is asserted on the reported ancestry rather than inferred
+        from a run that happened to succeed.
+        """
+
+        world = build_world(tmp_path)
+        _verifier(world).run()
+        report = world.read_report()
+
+        writable = [
+            (path, oct(mode))
+            for path, mode, _uid in report["cwd_ancestor_modes"]
+            if mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ]
+        assert writable == []
+
+    def test_the_child_cwd_lives_in_the_verifier_owned_workspace(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        world = build_world(tmp_path)
+        _verifier(world).run()
+        report = world.read_report()
+
+        cwd = Path(report["cwd"])
+        workspace = world.anchors.child_workspace_root
+
+        assert workspace in cwd.parents
+        assert workspace.is_dir()
+        assert stat.S_IMODE(workspace.stat().st_mode) == 0o700
+        assert list(workspace.iterdir()) == []
 
     def test_the_child_holds_only_the_standard_streams_and_the_two_ipc_pipes(
         self,

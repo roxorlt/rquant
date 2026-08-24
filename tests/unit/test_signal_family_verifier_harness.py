@@ -18,6 +18,7 @@ import hashlib
 import os
 import sys
 import zipfile
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -247,10 +248,7 @@ class TestRequestParsing:
 
     def test_a_tampered_vector_input_breaks_its_own_identity(self) -> None:
         decoded = _canonical.strict_canonical_loads(_request_payload(harness_vectors()))
-        decoded["vectors"][0]["input_json"] = decoded["vectors"][0]["input_json"].replace(
-            '"limit":10',
-            '"limit":11',
-        )
+        decoded["vectors"][0]["input_json"] = decoded["vectors"][1]["input_json"]
 
         with pytest.raises(_request.ChildRequestError, match="canonical content"):
             _request.parse_child_request(_canonical.canonical_json_bytes(decoded))
@@ -286,7 +284,7 @@ class TestRequestParsing:
     def test_a_producer_surface_vector_rejects(self) -> None:
         decoded = _canonical.strict_canonical_loads(_request_payload(harness_vectors()))
         vector = dict(decoded["vectors"][0])
-        vector["surface_id"] = "rquant.signal_route_spool.publish_signal_bus_prefix"
+        vector["surface_id"] = PRODUCER_SURFACES[vector["pair_id"]][0].value
         vector["vector_id"] = _canonical.canonical_sha256(
             {key: vector[key] for key in ("family_id", "input_json", "pair_id", "surface_id")}
         )
@@ -506,6 +504,54 @@ class TestWorkspace:
         assert live == workspace.scratch
         assert harness.tree_digest(live) == harness.tree_digest(workspace.state)
         assert workspace.live_root(writes=False) == workspace.state
+
+
+class TestServingAuthorityAncestryRule:
+    """Why the child cwd had to move: the rule that made three surfaces unreachable."""
+
+    @staticmethod
+    def _publish(root: Path) -> None:
+        from rquant.runtime_contracts import canonical_sha256
+        from rquant.runtime_serving_authority import ServingSourceAuthorityPublisher
+        from rquant.runtime_serving_snapshot import SignalDeliveryPayload, SourceReadResult
+        from rquant.serving_contracts import FreshnessStatus
+
+        published = datetime(2026, 8, 24, 7, 29, tzinfo=UTC)
+        values: dict[str, Any] = {
+            "dataset_id": "signals",
+            "sequence": 1,
+            "event_time": published,
+            "published_at": published,
+            "status": FreshnessStatus.FRESH,
+            "reason": None,
+            "payload": SignalDeliveryPayload(),
+        }
+        values["generation_id"] = canonical_sha256(values)
+        ServingSourceAuthorityPublisher(
+            root=root,
+            producer_commit="a" * 40,
+            dataset_id="signals",
+            payload_kind="signal_delivery",
+            clock=lambda: published,
+        ).publish(SourceReadResult.model_validate(values))
+
+    def test_a_group_or_world_writable_ancestor_is_refused(self, tmp_path: Path) -> None:
+        from rquant.runtime_serving_authority import ServingSourceAuthorityIntegrityError
+
+        sticky = tmp_path / "sticky"
+        sticky.mkdir(mode=0o777)
+        sticky.chmod(0o1777)
+
+        with pytest.raises(ServingSourceAuthorityIntegrityError, match="unsafe"):
+            self._publish(sticky / "authority")
+
+    def test_a_private_ancestor_chain_is_accepted(self, tmp_path: Path) -> None:
+        private = tmp_path / "private"
+        private.mkdir(mode=0o700)
+
+        self._publish(private / "authority")
+
+        assert (private / "authority").is_dir()
 
 
 # ---------------------------------------------------------------------------------------

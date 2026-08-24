@@ -54,6 +54,7 @@ PROFILE_ID = "d" * 64
 POLICY_RELATIVE_PATH = "etc/rquant/signal-family-verifier-policy-v1.json"
 HARNESS_RELATIVE_PATH = "usr/local/libexec/rquant-signal-family-verifier-harness-v1.pyz"
 STORE_RELATIVE_PATH = "var/lib/rquant/signal-family-verification"
+CHILD_WORKSPACE_RELATIVE_PATH = "var/lib/rquant/signal-family-verifier-workspace"
 GENERATIONS_RELATIVE_PATH = "srv/rquant/generations"
 _PROFILE_DOCUMENT_RELATIVE_PATH = "signal-family/profile-service-manifests-v1.json"
 
@@ -123,6 +124,27 @@ def canonical(value):
     ).encode("utf-8")
 
 
+def cwd_ancestor_modes():
+    import stat as stat_module
+
+    entries = []
+    node = os.getcwd()
+    while True:
+        observed = os.stat(node)
+        entries.append(
+            [
+                node,
+                stat_module.S_IMODE(observed.st_mode),
+                observed.st_uid,
+            ]
+        )
+        parent = os.path.dirname(node)
+        if parent == node:
+            break
+        node = parent
+    return entries
+
+
 def open_descriptors():
     observed = []
     for candidate in range(0, 256):
@@ -148,6 +170,7 @@ def write_report(request_fd, result_fd, request_bytes):
     report = {{
         "argv": list(sys.argv),
         "cwd": os.getcwd(),
+        "cwd_ancestor_modes": cwd_ancestor_modes(),
         "cwd_entries": sorted(os.listdir(".")),
         "environ": {{key: os.environ[key] for key in sorted(os.environ)}},
         "executable": sys.executable,
@@ -424,6 +447,7 @@ class VerifierWorld:
     policy_path: Path
     harness_path: Path
     store_root: Path
+    child_workspace_root: Path
     generation_path: Path
     report_path: Path
     anchors: Any
@@ -868,6 +892,7 @@ def build_world(
         policy_path=policy_path,
         harness_path=harness_path,
         store_root=store_root,
+        child_workspace_root=root / CHILD_WORKSPACE_RELATIVE_PATH,
         expected_owner_uid=os.getuid(),
         # macOS gives a new file the group of its parent directory rather than the
         # caller's, so the replica's owning group is read back rather than assumed.
@@ -880,6 +905,7 @@ def build_world(
         policy_path=policy_path,
         harness_path=harness_path,
         store_root=store_root,
+        child_workspace_root=root / CHILD_WORKSPACE_RELATIVE_PATH,
         generation_path=generation_path,
         report_path=report_path,
         anchors=anchors,
