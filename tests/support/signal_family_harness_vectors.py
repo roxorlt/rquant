@@ -1,0 +1,281 @@
+"""The v1 Phase C vector set, shared by the harness unit suite and the offline world.
+
+One vector per reader surface the harness actually exercises. Every vector is a pure value:
+paths are declared as `@workspace/...` (the materialized declaration) or `@runtime/...`
+(what the production builder owns), so the same bytes work inside any child cwd, and the
+canonical result never carries a random temporary path.
+
+The expected results are *not* produced here. The policy author derives them by running the
+same exercise functions the child runs; `expected_results_for` does exactly that and is used
+only on the policy side, never inside the child.
+"""
+
+from __future__ import annotations
+
+import hashlib
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
+from pathlib import Path
+from typing import Any
+
+from rquant.delivery_contracts import DeliveryChannel, DeliveryTarget
+from rquant.signal_bus import (
+    RouteReceiptDisposition,
+    SignalBusRoutedRecord,
+    SignalBusSourceDescriptor,
+    SignalRouteReceipt,
+)
+from rquant.signal_contracts import SignalAction, SignalEnvelope
+from rquant.signal_family_successor_registry import ACCEPTED_FAMILY_IDS
+from rquant.signal_family_verification import SignalFamilyVectorV1, SurfaceId
+from rquant.strict_json import canonical_json_bytes
+from tests.paper_cost_fixtures import paper_execution_cost_spec
+
+FAMILY_ID = ACCEPTED_FAMILY_IDS[0]
+OBSERVED_AT = datetime(2026, 8, 24, 7, 30, tzinfo=UTC)
+PRODUCER_COMMIT = "f" * 40
+SOURCE_GENERATION_ID = "3" * 64
+ROUTE_SOURCE_ID = "n-shape-v1"
+
+_SPOOL_ROOT = "@workspace/signal-spool"
+
+
+def _observed_at_text() -> str:
+    return OBSERVED_AT.isoformat().replace("+00:00", "Z")
+
+
+def _signal(seed: str, action: SignalAction) -> SignalEnvelope:
+    return SignalEnvelope(
+        schema_version=1,
+        strategy_id="n-shape",
+        strategy_version="1",
+        parameter_fingerprint=seed * 64,
+        dataset_snapshot_id="d" * 64,
+        feature_snapshot_id="e" * 64,
+        event_time=OBSERVED_AT - timedelta(seconds=120),
+        available_at=OBSERVED_AT - timedelta(seconds=60),
+        candidate_id="600000.SH",
+        action=action,
+        reason_codes=("wp4c-vector",),
+        evidence={},
+        expires_at=OBSERVED_AT + timedelta(minutes=30),
+        producer_commit=PRODUCER_COMMIT,
+    )
+
+
+def _routed_record(sequence: int, signal: SignalEnvelope) -> SignalBusRoutedRecord:
+    payload_json = signal.model_dump_json()
+    receipt = SignalRouteReceipt(
+        source_id=ROUTE_SOURCE_ID,
+        source_sequence=sequence,
+        signal_id=signal.signal_id,
+        decision_fingerprint="1" * 64,
+        disposition=RouteReceiptDisposition.ROUTED,
+        target_manifest_hash="2" * 64,
+        targets=(DeliveryTarget(recipient_id="admin", channel=DeliveryChannel.PUSHDEER),),
+        target_count=1,
+        routed_at=OBSERVED_AT - timedelta(seconds=30),
+    )
+    return SignalBusRoutedRecord(
+        global_sequence=sequence,
+        signal_id=signal.signal_id,
+        payload_hash=hashlib.sha256(payload_json.encode("utf-8")).hexdigest(),
+        payload_json=payload_json,
+        signal=signal,
+        received_at=OBSERVED_AT - timedelta(seconds=45),
+        receipt=receipt,
+    )
+
+
+def spool_state(*, actions: tuple[SignalAction, ...]) -> dict[str, Any]:
+    """A routed-signal prefix declared as data; the harness publishes it with the spool."""
+
+    records = [
+        _routed_record(index, _signal(chr(ord("a") + index - 1), action))
+        for index, action in enumerate(actions, start=1)
+    ]
+    descriptor = SignalBusSourceDescriptor(
+        generation_id=SOURCE_GENERATION_ID,
+        high_watermark=len(records),
+    )
+    return {
+        "records": [record.model_dump(mode="json") for record in records],
+        "root": _SPOOL_ROOT,
+        "source": descriptor.model_dump(mode="json"),
+    }
+
+
+_CALENDAR_CONTENT = canonical_json_bytes(
+    [{"cal_date": "2026-08-24", "exchange": "SSE", "is_open": True}]
+).decode("utf-8")
+_CALENDAR_SHA256 = hashlib.sha256(_CALENDAR_CONTENT.encode("utf-8")).hexdigest()
+
+
+def _paper_broker_service() -> dict[str, Any]:
+    return {
+        "interval_seconds": 1.0,
+        "plane": "live",
+        "producer_commit": PRODUCER_COMMIT,
+        "service_id": "paper-broker",
+        "service_kind": "paper_broker",
+        "settings": {
+            "account_id": "paper-main",
+            "broker_path": "@runtime/broker.sqlite3",
+            "buy_quantity": 1_000,
+            "consumer_state_path": "@runtime/paper-consumer.sqlite3",
+            "execution_constraint_root": "@workspace/execution-constraints",
+            "execution_cost_spec": paper_execution_cost_spec().model_dump(mode="json"),
+            "execution_lag_seconds": 60,
+            "initial_cash": str(Decimal("100000")),
+            "limit": 10,
+            "queue_path": "@runtime/paper-queue.sqlite3",
+            "raw_spool_root": "@workspace/raw-spool",
+            "reduce_quantity": 500,
+            "sell_quantity": 1_000,
+            "signal_spool_root": _SPOOL_ROOT,
+            "trade_calendar_path": "@workspace/trade-calendar.json",
+            "trade_calendar_sha256": _CALENDAR_SHA256,
+        },
+        "stale_after_seconds": 180.0,
+    }
+
+
+def _paper_state(*, actions: tuple[SignalAction, ...]) -> dict[str, Any]:
+    return {
+        "directories": ["@workspace/raw-spool", "@workspace/execution-constraints"],
+        "files": [{"content": _CALENDAR_CONTENT, "path": "@workspace/trade-calendar.json"}],
+        "spool": spool_state(actions=actions),
+    }
+
+
+def _envelope(
+    *,
+    call: dict[str, Any],
+    service: dict[str, Any],
+    state: dict[str, Any],
+) -> str:
+    return canonical_json_bytes(
+        {
+            "call": call,
+            "observed_at": _observed_at_text(),
+            "schema_version": 1,
+            "service": service,
+            "state": state,
+        }
+    ).decode("utf-8")
+
+
+_READ_BOUNDS: dict[str, Any] = {"after_sequence": 0, "limit": 10, "through_sequence": 1}
+
+
+def vector_specifications() -> tuple[tuple[str, SurfaceId, str], ...]:
+    """`(pair_id, surface_id, input_json)` for every surface the harness exercises."""
+
+    paper_state = _paper_state(actions=(SignalAction.B_INTENT,))
+    return (
+        (
+            "router-paper",
+            SurfaceId.READONLY_SIGNAL_ROUTE_SPOOL_SIGNALS_AFTER_GLOBAL_SEQUENCE,
+            _envelope(
+                call=dict(_READ_BOUNDS),
+                service=_paper_broker_service(),
+                state=paper_state,
+            ),
+        ),
+        (
+            "router-paper",
+            SurfaceId.CONSUME_SIGNAL_BUS_TO_PAPER,
+            _envelope(
+                call={"limit": 10},
+                service=_paper_broker_service(),
+                state=paper_state,
+            ),
+        ),
+        (
+            "router-paper",
+            SurfaceId.PAPER_SIGNAL_QUEUE_STORE_INGEST,
+            _envelope(
+                call={**_READ_BOUNDS, "global_sequence": 1},
+                service=_paper_broker_service(),
+                state=paper_state,
+            ),
+        ),
+    )
+
+
+def blocked_surface_vector(surface_id: SurfaceId) -> tuple[SignalFamilyVectorV1, str]:
+    """A vector for a surface the harness refuses, plus a placeholder expected result.
+
+    The placeholder exists only so a policy can be minted around this vector. The child
+    never produces it: it rejects the whole run rather than inventing an observation for a
+    surface it cannot reach, which is exactly what this vector is here to prove.
+    """
+
+    from rquant.signal_family_verification import READER_SURFACES
+
+    pair_id = next(
+        pair for pair, surfaces in READER_SURFACES.items() if surface_id in surfaces
+    )
+    vector = SignalFamilyVectorV1.create(
+        pair_id=pair_id,
+        family_id=FAMILY_ID,
+        surface_id=surface_id,
+        input_json=canonical_json_bytes({"unreachable": True}).decode("utf-8"),
+    )
+    return vector, canonical_json_bytes({"unreachable": True}).decode("utf-8")
+
+
+def harness_vectors() -> tuple[SignalFamilyVectorV1, ...]:
+    """The sorted duplicate-free vector tuple the policy hashes."""
+
+    built = [
+        SignalFamilyVectorV1.create(
+            pair_id=pair_id,
+            family_id=FAMILY_ID,
+            surface_id=surface_id,
+            input_json=input_json,
+        )
+        for pair_id, surface_id, input_json in vector_specifications()
+    ]
+    return tuple(sorted(built, key=lambda vector: vector.vector_id))
+
+
+def expected_results_for(
+    vectors: tuple[SignalFamilyVectorV1, ...],
+    root: Path,
+) -> dict[str, str]:
+    """Policy-side derivation: run the same exercise the child runs and keep the bytes.
+
+    This never runs inside the child. It exists because whoever signs the external policy
+    has to know the expected result before the child is ever launched.
+    """
+
+    from rquant.signal_family_verifier_harness import RequestVector, exercise_vector
+
+    results: dict[str, str] = {}
+    for index, vector in enumerate(vectors):
+        request_vector = RequestVector(
+            vector_id=vector.vector_id,
+            pair_id=vector.pair_id,
+            family_id=vector.family_id,
+            surface_id=vector.surface_id.value,
+            input_json=vector.input_json,
+        )
+        workspace_root = root / f"expected-{index:02d}"
+        workspace_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        results[vector.vector_id] = canonical_json_bytes(
+            exercise_vector(request_vector, workspace_root)
+        ).decode("utf-8")
+    return results
+
+
+__all__ = [
+    "FAMILY_ID",
+    "blocked_surface_vector",
+    "OBSERVED_AT",
+    "PRODUCER_COMMIT",
+    "expected_results_for",
+    "harness_vectors",
+    "spool_state",
+    "vector_specifications",
+]
