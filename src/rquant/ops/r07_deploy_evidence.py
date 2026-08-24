@@ -29,6 +29,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StrictInt,
     StrictStr,
     ValidationError,
     model_validator,
@@ -131,6 +132,13 @@ class _ResolvedPolicyState(_StrictModelMixin, BaseModel):
     @property
     def pair(self) -> BootstrapPredecessorV1:
         return BootstrapPredecessorV1(commit_sha=self.commit_sha, tree_sha=self.tree_sha)
+
+
+class ResolvedRunIdentityV1(_StrictModelMixin, BaseModel):
+    """The one push-main run identity and attempt the fixed channel resolved for a target."""
+
+    workflow_run_id: StrictInt = Field(gt=0)
+    run_attempt: StrictInt = Field(gt=0)
 
 
 class InstalledPolicyState(_ResolvedPolicyState):
@@ -453,8 +461,15 @@ def bind_evidence_wire(
     commit_sha: str,
     tree_sha: str,
     policy: R07PolicyV1,
+    run_identity: ResolvedRunIdentityV1 | None = None,
 ) -> R07DrGateEvidenceWireV1:
-    """Parse canonical evidence bytes and bind them to the exact target and policy."""
+    """Parse canonical evidence bytes and bind them to the exact target, policy, and run.
+
+    ``run_identity`` is the pair the fixed channel just resolved from the GitHub API. It is
+    supplied on the download path, which is the only path that can observe it; a retained cache
+    entry was bound to its own resolved pair before it was written, and the artifact it came from
+    is allowed to have expired by then.
+    """
 
     try:
         wire = R07DrGateEvidenceWireV1.from_canonical_json(raw)
@@ -468,6 +483,13 @@ def bind_evidence_wire(
         raise R07EvidenceError("evidence artifact name is not bound to the target commit")
     if wire.policy_digest != policy.policy_digest:
         raise R07EvidenceError("evidence policy digest is not the target policy digest")
+    if run_identity is not None and (wire.workflow_run_id, wire.run_attempt) != (
+        run_identity.workflow_run_id,
+        run_identity.run_attempt,
+    ):
+        raise R07EvidenceError(
+            "evidence does not name the resolved push main run identity and attempt"
+        )
     try:
         verify_channel_binding(policy, wire)
     except (TypeError, ValueError) as exc:
@@ -637,20 +659,19 @@ def _select_artifact_url(
 
 def _extract_artifact_json(archive: bytes) -> bytes:
     try:
-        with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
-            names = bundle.namelist()
-            if names != [EVIDENCE_ARTIFACT_JSON_PATH]:
-                raise R07EvidenceError(
-                    "the artifact must contain exactly the fixed evidence JSON path"
-                )
-            info = bundle.getinfo(EVIDENCE_ARTIFACT_JSON_PATH)
-            if info.file_size > _MAX_RESPONSE_BYTES:
-                raise R07EvidenceError("the artifact evidence entry is implausibly large")
-            return bundle.read(EVIDENCE_ARTIFACT_JSON_PATH)
+        bundle = zipfile.ZipFile(io.BytesIO(archive))
     except (zipfile.BadZipFile, OSError, ValueError) as exc:
-        if isinstance(exc, R07EvidenceError):
-            raise
         raise R07EvidenceError("the downloaded artifact is not a readable zip archive") from exc
+    with bundle:
+        if bundle.namelist() != [EVIDENCE_ARTIFACT_JSON_PATH]:
+            raise R07EvidenceError("the artifact must contain exactly the fixed evidence JSON path")
+        info = bundle.getinfo(EVIDENCE_ARTIFACT_JSON_PATH)
+        if info.file_size > _MAX_RESPONSE_BYTES:
+            raise R07EvidenceError("the artifact evidence entry is implausibly large")
+        try:
+            return bundle.read(EVIDENCE_ARTIFACT_JSON_PATH)
+        except (zipfile.BadZipFile, OSError, ValueError) as exc:
+            raise R07EvidenceError("the artifact evidence entry is unreadable") from exc
 
 
 def download_evidence_bytes(
@@ -660,8 +681,13 @@ def download_evidence_bytes(
     token_provider: TokenProvider,
     clock: Callable[[], float] = time.monotonic,
     budget_seconds: float = _DOWNLOAD_BUDGET_SECONDS,
-) -> bytes:
-    """Fetch the fixed artifact for one exact target SHA from the fixed workflow channel."""
+) -> tuple[bytes, ResolvedRunIdentityV1]:
+    """Fetch the fixed artifact for one exact target SHA from the fixed workflow channel.
+
+    Returns the artifact bytes together with the run identity and the highest completed
+    successful attempt that were resolved for them, so the caller can bind the accepted evidence
+    to that exact pair.
+    """
 
     token = token_provider.token()
     deadline = _DownloadDeadline(clock, budget_seconds)
@@ -676,7 +702,10 @@ def download_evidence_bytes(
     )
     runs = _json_list(runs_payload, "workflow_runs", label="workflow runs")
     run_id = _select_workflow_run(runs, commit_sha)
-    _select_run_attempt(runs, run_id)
+    identity = ResolvedRunIdentityV1(
+        workflow_run_id=run_id,
+        run_attempt=_select_run_attempt(runs, run_id),
+    )
     deadline.check()
     artifacts_payload = _json_object(
         transport.get(
@@ -701,7 +730,11 @@ def download_evidence_bytes(
         raise R07EvidenceError("the downloaded artifact is bound to another candidate commit")
     if wire.artifact_name != f"r07-dr-gate-{commit_sha}":
         raise R07EvidenceError("the downloaded artifact name is not bound to the target commit")
-    return raw
+    if (wire.workflow_run_id, wire.run_attempt) != (identity.workflow_run_id, identity.run_attempt):
+        raise R07EvidenceError(
+            "the downloaded artifact does not name the resolved push main run identity and attempt"
+        )
+    return raw, identity
 
 
 class R07DeployEvidenceGate:
@@ -796,7 +829,7 @@ class R07DeployEvidenceGate:
             policy=policy,
         )
         if cached is None:
-            raw = download_evidence_bytes(
+            raw, identity = download_evidence_bytes(
                 commit_sha=commit_sha,
                 transport=self._transport,
                 token_provider=self._token_provider,
@@ -807,6 +840,7 @@ class R07DeployEvidenceGate:
                 commit_sha=commit_sha,
                 tree_sha=tree_sha,
                 policy=policy,
+                run_identity=identity,
             )
             self._verify(repo, policy, downloaded)
             write_cached_evidence(

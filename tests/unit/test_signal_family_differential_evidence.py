@@ -344,7 +344,14 @@ TREE_B = "d" * 40
 RUN_ID = 4242
 
 
-def _valid_wire_bytes(commit_sha: str, tree_sha: str, *, policy: R07PolicyV1) -> bytes:
+def _valid_wire_bytes(
+    commit_sha: str,
+    tree_sha: str,
+    *,
+    policy: R07PolicyV1,
+    workflow_run_id: int = RUN_ID,
+    run_attempt: int = 2,
+) -> bytes:
     total = expected_gate_check_total(policy)
     runs = tuple(
         PythonRunEvidenceV1.model_validate(
@@ -352,8 +359,8 @@ def _valid_wire_bytes(commit_sha: str, tree_sha: str, *, policy: R07PolicyV1) ->
                 "python_minor": minor,
                 "job_id": job_id,
                 "job_run_id": index + 1,
-                "workflow_run_id": RUN_ID,
-                "run_attempt": 2,
+                "workflow_run_id": workflow_run_id,
+                "run_attempt": run_attempt,
                 "candidate_commit_sha": commit_sha,
                 "candidate_tree_sha": tree_sha,
                 "collected": total,
@@ -379,8 +386,8 @@ def _valid_wire_bytes(commit_sha: str, tree_sha: str, *, policy: R07PolicyV1) ->
         "event_name": "push",
         "ref": "refs/heads/main",
         "producer_job_id": EXACT_JOBS[2],
-        "workflow_run_id": RUN_ID,
-        "run_attempt": 2,
+        "workflow_run_id": workflow_run_id,
+        "run_attempt": run_attempt,
         "candidate_commit_sha": commit_sha,
         "candidate_tree_sha": tree_sha,
         "baseline_commit_sha": BASELINE_COMMIT_SHA,
@@ -875,19 +882,20 @@ def _download(
     clock: object | None = None,
 ) -> bytes:
     transport = _FakeTransport(responses)
-    return r07_deploy_evidence.download_evidence_bytes(
+    raw, _identity = r07_deploy_evidence.download_evidence_bytes(
         commit_sha=COMMIT_B,
         transport=transport,
         token_provider=token_provider or _FakeTokenProvider(),
         clock=clock or (lambda: 0.0),
     )
+    return raw
 
 
 def test_downloader_reads_only_the_fixed_repository_workflow_and_artifact() -> None:
     responses = _channel_responses()
     transport = _FakeTransport(responses)
 
-    raw = r07_deploy_evidence.download_evidence_bytes(
+    raw, identity = r07_deploy_evidence.download_evidence_bytes(
         commit_sha=COMMIT_B,
         transport=transport,
         token_provider=_FakeTokenProvider(),
@@ -895,6 +903,10 @@ def test_downloader_reads_only_the_fixed_repository_workflow_and_artifact() -> N
     )
 
     assert raw == _valid_wire_bytes(COMMIT_B, TREE_B, policy=_policy())
+    assert identity == r07_deploy_evidence.ResolvedRunIdentityV1(
+        workflow_run_id=RUN_ID,
+        run_attempt=2,
+    )
     assert transport.requests[0].startswith(
         "https://api.github.com/repos/roxorlt/rquant/actions/workflows/ci.yml/runs"
     )
@@ -919,15 +931,74 @@ def test_downloader_never_echoes_the_token_in_its_rejection() -> None:
 
 
 def test_downloader_selects_the_highest_successful_attempt_of_one_run() -> None:
+    highest = _valid_wire_bytes(COMMIT_B, TREE_B, policy=_policy(), run_attempt=9)
     responses = _channel_responses(
         runs=[
             _run_payload(run_attempt=1),
             _run_payload(run_attempt=3),
-            _run_payload(run_attempt=4, conclusion="failure"),
-        ]
+            _run_payload(run_attempt=9),
+            _run_payload(run_attempt=10, conclusion="failure"),
+        ],
+        archive=_artifact_zip({"r07-dr-gate/evidence-v1.json": highest}),
     )
 
-    assert _download(responses) == _valid_wire_bytes(COMMIT_B, TREE_B, policy=_policy())
+    assert _download(responses) == highest
+
+
+@pytest.mark.parametrize(
+    ("claimed_attempt", "claimed_run_id"),
+    [
+        pytest.param(2, RUN_ID, id="lower-attempt"),
+        pytest.param(10, RUN_ID, id="higher-attempt"),
+        pytest.param(9, RUN_ID + 1, id="other-run-id"),
+        pytest.param(9, 999999, id="unrelated-run-id"),
+    ],
+)
+def test_downloader_rejects_evidence_that_claims_another_run_identity(
+    claimed_attempt: int,
+    claimed_run_id: int,
+) -> None:
+    claimed = _valid_wire_bytes(
+        COMMIT_B,
+        TREE_B,
+        policy=_policy(),
+        workflow_run_id=claimed_run_id,
+        run_attempt=claimed_attempt,
+    )
+    responses = _channel_responses(
+        runs=[_run_payload(run_attempt=1), _run_payload(run_attempt=9)],
+        archive=_artifact_zip({"r07-dr-gate/evidence-v1.json": claimed}),
+    )
+
+    with pytest.raises(r07_deploy_evidence.R07EvidenceError, match="run"):
+        _download(responses)
+
+
+def test_bind_evidence_wire_requires_the_resolved_run_identity() -> None:
+    policy = _policy()
+    raw = _valid_wire_bytes(COMMIT_B, TREE_B, policy=policy, run_attempt=9)
+    identity = r07_deploy_evidence.ResolvedRunIdentityV1(
+        workflow_run_id=RUN_ID,
+        run_attempt=9,
+    )
+
+    bound = r07_deploy_evidence.bind_evidence_wire(
+        raw,
+        commit_sha=COMMIT_B,
+        tree_sha=TREE_B,
+        policy=policy,
+        run_identity=identity,
+    )
+    assert bound.run_attempt == 9
+
+    with pytest.raises(r07_deploy_evidence.R07EvidenceError, match="run"):
+        r07_deploy_evidence.bind_evidence_wire(
+            raw,
+            commit_sha=COMMIT_B,
+            tree_sha=TREE_B,
+            policy=policy,
+            run_identity=identity.model_copy(update={"run_attempt": 3}),
+        )
 
 
 @pytest.mark.parametrize(
