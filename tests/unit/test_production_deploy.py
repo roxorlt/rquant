@@ -38,6 +38,7 @@ from rquant.ops.production_deploy import (
 from rquant.release_generation import DeploymentIntent
 from tests.unit.test_signal_family_differential_evidence import (
     _enforced_policy_bytes,
+    _release_repo,
     _valid_wire_bytes,
 )
 
@@ -1535,22 +1536,6 @@ def test_recovery_atomically_adopts_prepared_only_intent_before_rebinding(
     responses = _base_responses()
     expected_target = prepared.target_sha if recovery_action == "resume" else prepared.previous_sha
     responses[("git", "rev-parse", "HEAD")] = (0, f"{expected_target}\n")
-    if recovery_action == "rollback":
-        enforced = _r07_policy_bytes(enforced_predecessor=(_sha("9"), _sha("8")))
-        responses.update(
-            _r07_responses(
-                installed_sha=expected_target,
-                target_sha=expected_target,
-                installed_policy=enforced,
-                target_policy=enforced,
-            )
-        )
-        _seed_r07_cache(
-            tmp_path,
-            commit_sha=expected_target,
-            tree_sha=R07_TARGET_TREE,
-            policy=enforced,
-        )
 
     with pytest.raises(PolicyError, match="durably committed"):
         deploy(
@@ -1558,7 +1543,6 @@ def test_recovery_atomically_adopts_prepared_only_intent_before_rebinding(
             runner=FakeRunner(responses),
             generation_authority=authority,
             generation_finalizer=FakeGenerationFinalizer(),
-            r07_evidence_gate=_r07_gate(tmp_path),
         )
 
     assert authority.events[0] == ("intent_adopted", prepared.operation_id)
@@ -2021,7 +2005,6 @@ def test_recovery_audit_failure_prevents_invalidation_and_external_mutation(
     assert runner.calls == [
         ("git", "rev-parse", "--abbrev-ref", "HEAD"),
         ("git", "status", "--porcelain", "--untracked-files=no"),
-        ("git", "rev-parse", "HEAD"),
     ]
 
 
@@ -3073,18 +3056,60 @@ class _StaticTokenProvider:
         return "ghs-test-token"
 
 
+class _InProcessR07Gate:
+    """Drive the real gate in process and hand the deployer its canonical decision."""
+
+    def __init__(self, gate: r07_deploy_evidence.R07DeployEvidenceGate) -> None:
+        self._gate = gate
+
+    @property
+    def cache_dir(self) -> Path:
+        return self._gate.cache_dir
+
+    def evaluate(
+        self,
+        *,
+        repo: Path,
+        runner: object,
+        git_path: Path,
+        installed_commit_sha: str,
+        target_commit_sha: str,
+    ) -> production_deploy.R07GateDecision:
+        decision = self._gate.evaluate(
+            repo=repo,
+            runner=runner,
+            git_path=git_path,
+            installed_commit_sha=installed_commit_sha,
+            target_commit_sha=target_commit_sha,
+        )
+        return production_deploy.r07_decision_from_payload(json.loads(decision.model_dump_json()))
+
+
 def _r07_gate(
     tmp_path: Path,
     *,
     verifier: object | None = None,
     transport: object | None = None,
-) -> object:
-    return r07_deploy_evidence.R07DeployEvidenceGate(
-        cache_dir=tmp_path / "var" / "r07-dr-evidence",
-        transport=transport or _EmptyTransport(),
-        token_provider=_StaticTokenProvider(),
-        clock=lambda: 0.0,
-        verifier=verifier or _RecordingVerifier(),
+) -> _InProcessR07Gate:
+    return _InProcessR07Gate(
+        r07_deploy_evidence.R07DeployEvidenceGate(
+            cache_dir=tmp_path / "var" / "r07-dr-evidence",
+            transport=transport or _EmptyTransport(),
+            token_provider=_StaticTokenProvider(),
+            clock=lambda: 0.0,
+            verifier=verifier or _RecordingVerifier(),
+        )
+    )
+
+
+@pytest.fixture(autouse=True)
+def _in_process_r07_gate(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Keep the real decision table but skip the isolated child in unit tests."""
+
+    monkeypatch.setattr(
+        production_deploy,
+        "_build_r07_evidence_gate",
+        lambda config: _r07_gate(tmp_path),
     )
 
 
@@ -3319,7 +3344,7 @@ class TestR07Bootstrap:
             if path.is_file()
         } == before
 
-    def test_recovery_rollback_target_passes_the_same_gate(self, tmp_path: Path) -> None:
+    def test_recovery_replays_only_the_recorded_intent_pair(self, tmp_path: Path) -> None:
         authority = FakeGenerationAuthority()
         authority.begin_deployment_intent(
             previous_sha=_sha("a"),
@@ -3333,23 +3358,15 @@ class TestR07Bootstrap:
         )
         responses = _base_responses()
         responses[("git", "rev-parse", "HEAD")] = (0, f"{_sha('b')}\n")
-        responses.update(
-            _r07_responses(
-                installed_sha=_sha("b"),
-                target_sha=_sha("a"),
-                installed_policy=_r07_policy_bytes(),
-                target_policy=None,
-            )
-        )
         baseline = _config(tmp_path)
-        config = DeployConfig(
-            **{**baseline.__dict__, "recovery_action": "rollback", "target": _sha("a")}
+        wrong_target = DeployConfig(
+            **{**baseline.__dict__, "recovery_action": "rollback", "target": _sha("c")}
         )
         runner = FakeRunner(responses)
 
-        with pytest.raises(PolicyError, match="R07"):
+        with pytest.raises(PolicyError, match="recorded deployment intent"):
             deploy(
-                config,
+                wrong_target,
                 runner=runner,
                 generation_authority=authority,
                 generation_finalizer=FakeGenerationFinalizer(),
@@ -3359,7 +3376,23 @@ class TestR07Bootstrap:
         assert not any(call[:2] == ("git", "reset") for call in runner.calls)
         assert not any(call[0] == "systemctl" for call in runner.calls)
         assert authority.intent is not None and authority.intent.stage == "planned"
-        assert _audit_records(config)[-1]["status"] == "r07_gate_failed"
+
+        recorded = DeployConfig(
+            **{**baseline.__dict__, "recovery_action": "rollback", "target": _sha("a")}
+        )
+        recovery_runner = FakeRunner(responses)
+
+        result = deploy(
+            recorded,
+            runner=recovery_runner,
+            generation_authority=authority,
+            generation_finalizer=FakeGenerationFinalizer(),
+            r07_evidence_gate=_r07_gate(tmp_path),
+        )
+
+        assert result.status == "recovered"
+        assert result.r07_gate == "recorded_intent"
+        assert _audit_records(recorded)[-1]["r07_gate"] == "recorded_intent"
 
     def test_real_checkout_stays_at_head_when_the_target_declares_no_policy(
         self,
@@ -3429,15 +3462,110 @@ class TestR07Bootstrap:
     def test_default_gate_pins_the_production_cache_and_private_verifier(
         self,
         tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        monkeypatch.undo()
         gate = production_deploy._build_r07_evidence_gate(_config(tmp_path))
 
+        assert type(gate) is production_deploy.IsolatedR07EvidenceGate
         assert gate.cache_dir == production_deploy.LINUX_PRODUCTION_EVIDENCE_CACHE_DIR
         assert gate.cache_dir == Path("/home/lighthouse/rquant/var/r07-dr-evidence")
-        assert (
-            r07_deploy_evidence.DEFAULT_EVIDENCE_VERIFIER
-            is differential_gate.verify_wire
+        assert r07_deploy_evidence.DEFAULT_EVIDENCE_VERIFIER is differential_gate.verify_wire
+
+    def test_deployer_still_imports_without_site_packages(self) -> None:
+        program = (
+            "import sys;"
+            f"sys.path.insert(0, {str(ROOT / 'src')!r});"
+            "import rquant.ops.production_deploy as module;"
+            "print(module.__file__)"
         )
+        isolated = subprocess.run(
+            [sys.executable, "-I", "-S", "-c", program],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        pydantic = subprocess.run(
+            [sys.executable, "-I", "-S", "-c", "import pydantic"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert isolated.returncode == 0, isolated.stderr
+        assert pydantic.returncode != 0
+
+    def test_isolated_gate_child_reports_the_release_a_decision(self, tmp_path: Path) -> None:
+        repo, pre_r07, release_a, _release_b = _release_repo(tmp_path)
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                str(ROOT / production_deploy.R07_DEPLOY_GATE_SCRIPT),
+                "--repo",
+                str(repo),
+                "--trusted-git-path",
+                "/usr/bin/git",
+                "--evidence-cache-dir",
+                str(tmp_path / "var" / "r07-dr-evidence"),
+                "--installed-commit",
+                pre_r07,
+                "--target-commit",
+                release_a,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert completed.returncode == 0, completed.stderr
+        decision = production_deploy.r07_decision_from_payload(json.loads(completed.stdout))
+        assert decision.allowed is True
+        assert decision.gate == "bootstrap_disabled"
+        assert decision.target_commit_sha == release_a
+
+    def test_isolated_gate_child_reports_a_rejected_decision(self, tmp_path: Path) -> None:
+        repo, pre_r07, release_a, _release_b = _release_repo(tmp_path)
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                str(ROOT / production_deploy.R07_DEPLOY_GATE_SCRIPT),
+                "--repo",
+                str(repo),
+                "--trusted-git-path",
+                "/usr/bin/git",
+                "--evidence-cache-dir",
+                str(tmp_path / "var" / "r07-dr-evidence"),
+                "--installed-commit",
+                release_a,
+                "--target-commit",
+                pre_r07,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert completed.returncode == 0, completed.stderr
+        decision = production_deploy.r07_decision_from_payload(json.loads(completed.stdout))
+        assert decision.allowed is False
+        assert decision.gate == "rejected"
+        assert "pre-R07" in decision.reason
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            pytest.param({}, id="empty"),
+            pytest.param({"allowed": True}, id="partial"),
+            pytest.param("rejected", id="not-an-object"),
+        ],
+    )
+    def test_a_malformed_child_decision_is_refused(self, payload: object) -> None:
+        with pytest.raises(PolicyError, match="R07 deployment gate"):
+            production_deploy.r07_decision_from_payload(payload)
 
     def test_linux_production_refuses_another_evidence_cache_directory(
         self,

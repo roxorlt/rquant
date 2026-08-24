@@ -29,11 +29,6 @@ from typing import Protocol
 from zoneinfo import ZoneInfo
 
 from rquant.contained_subprocess import run_contained
-from rquant.ops.r07_deploy_evidence import (
-    LINUX_PRODUCTION_EVIDENCE_CACHE_DIR,
-    R07DeployDecision,
-    R07DeployEvidenceGate,
-)
 from rquant.release_generation import (
     ALL_LONG_RUNNING_SERVICES as _ALL_LONG_RUNNING_SERVICES,
 )
@@ -60,6 +55,65 @@ build_change_plan = build_deployment_change_plan
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 TARGET_PATTERN = re.compile(r"(?:v\d+\.\d+\.\d+|[0-9a-f]{40})")
 LINUX_PRODUCTION_RUNTIME_ROOT = Path("/home/lighthouse/rquant/data/runtime")
+LINUX_PRODUCTION_EVIDENCE_CACHE_DIR = Path("/home/lighthouse/rquant/var/r07-dr-evidence")
+R07_DEPLOY_GATE_SCRIPT = "scripts/r07_deploy_gate.py"
+_R07_DECISION_FIELDS = (
+    "allowed",
+    "gate",
+    "reason",
+    "requires_evidence",
+    "installed_mode",
+    "target_mode",
+    "installed_commit_sha",
+    "installed_tree_sha",
+    "target_commit_sha",
+    "target_tree_sha",
+)
+
+
+@dataclass(frozen=True)
+class R07GateDecision:
+    """One resolved Release A/B decision, as the deployer consumes it."""
+
+    allowed: bool
+    gate: str
+    reason: str
+    requires_evidence: bool
+    installed_mode: str
+    target_mode: str
+    installed_commit_sha: str
+    installed_tree_sha: str
+    target_commit_sha: str
+    target_tree_sha: str
+
+    def audit_fields(self) -> dict[str, str]:
+        return {
+            "r07_gate": self.gate,
+            "r07_reason": self.reason,
+            "r07_installed_mode": self.installed_mode,
+            "r07_target_mode": self.target_mode,
+            "r07_installed_commit_sha": self.installed_commit_sha,
+            "r07_installed_tree_sha": self.installed_tree_sha,
+            "r07_target_commit_sha": self.target_commit_sha,
+            "r07_target_tree_sha": self.target_tree_sha,
+        }
+
+
+def r07_decision_from_payload(payload: object) -> R07GateDecision:
+    """Parse the isolated gate child's canonical JSON decision, rejecting anything else."""
+
+    if not isinstance(payload, dict) or set(payload) != set(_R07_DECISION_FIELDS):
+        raise PolicyError("R07 deployment gate returned an unexpected decision record")
+    for field_name in ("allowed", "requires_evidence"):
+        if type(payload[field_name]) is not bool:
+            raise PolicyError("R07 deployment gate decision flags must be exact booleans")
+    for field_name in _R07_DECISION_FIELDS[1:3] + _R07_DECISION_FIELDS[4:]:
+        if type(payload[field_name]) is not str:
+            raise PolicyError("R07 deployment gate decision fields must be exact strings")
+    decision = R07GateDecision(**payload)  # type: ignore[arg-type]
+    if decision.allowed == (decision.gate == "rejected"):
+        raise PolicyError("R07 deployment gate decision is internally inconsistent")
+    return decision
 
 
 class R07EvidenceGate(Protocol):
@@ -74,7 +128,7 @@ class R07EvidenceGate(Protocol):
         git_path: Path,
         installed_commit_sha: str,
         target_commit_sha: str,
-    ) -> R07DeployDecision: ...
+    ) -> R07GateDecision: ...
 
 
 class PolicyError(RuntimeError):
@@ -706,8 +760,99 @@ def _resolve_r07_evidence_cache_dir(config: DeployConfig) -> Path:
     return configured or config.repo / "var" / "r07-dr-evidence"
 
 
-def _build_r07_evidence_gate(config: DeployConfig) -> R07DeployEvidenceGate:
-    return R07DeployEvidenceGate(cache_dir=_resolve_r07_evidence_cache_dir(config))
+class IsolatedR07EvidenceGate:
+    """Run the R07 gate with the release interpreter, outside the ``-I -S`` deployer."""
+
+    def __init__(self, config: DeployConfig, cache_dir: Path) -> None:
+        self._config = config
+        self._cache_dir = cache_dir
+
+    @property
+    def cache_dir(self) -> Path:
+        return self._cache_dir
+
+    def evaluate(
+        self,
+        *,
+        repo: Path,
+        runner: Runner,
+        git_path: Path,
+        installed_commit_sha: str,
+        target_commit_sha: str,
+    ) -> R07GateDecision:
+        del runner  # the child resolves Git objects itself with the trusted binary
+        config = self._config
+        script = Path(__file__).resolve().parents[3] / R07_DEPLOY_GATE_SCRIPT
+        command = [
+            str(config.python_path or sys.executable),
+            "-I",
+            str(script),
+            "--repo",
+            str(repo),
+            "--trusted-git-path",
+            str(git_path),
+            "--evidence-cache-dir",
+            str(self._cache_dir),
+            "--installed-commit",
+            installed_commit_sha,
+            "--target-commit",
+            target_commit_sha,
+        ]
+        deadline = config.overall_deadline_monotonic
+        if deadline is None:
+            deadline = monotonic_time.monotonic() + config.overall_timeout_seconds
+        try:
+            completed = _run_process_group(
+                command,
+                cwd=repo,
+                deadline_monotonic=deadline,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            return _r07_unavailable_decision(
+                installed_commit_sha,
+                target_commit_sha,
+                f"the R07 deployment gate could not run: {type(exc).__name__}",
+            )
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout or "no output").strip()
+            return _r07_unavailable_decision(
+                installed_commit_sha,
+                target_commit_sha,
+                f"the R07 deployment gate failed ({completed.returncode}): {detail[:500]}",
+            )
+        try:
+            payload = json.loads(completed.stdout)
+        except json.JSONDecodeError:
+            return _r07_unavailable_decision(
+                installed_commit_sha,
+                target_commit_sha,
+                "the R07 deployment gate returned invalid JSON",
+            )
+        return r07_decision_from_payload(payload)
+
+
+def _r07_unavailable_decision(
+    installed_commit_sha: str,
+    target_commit_sha: str,
+    reason: str,
+) -> R07GateDecision:
+    return R07GateDecision(
+        allowed=False,
+        gate="rejected",
+        reason=reason,
+        requires_evidence=False,
+        installed_mode="unresolved",
+        target_mode="unresolved",
+        installed_commit_sha=installed_commit_sha,
+        installed_tree_sha="",
+        target_commit_sha=target_commit_sha,
+        target_tree_sha="",
+    )
+
+
+def _build_r07_evidence_gate(config: DeployConfig) -> IsolatedR07EvidenceGate:
+    return IsolatedR07EvidenceGate(config, _resolve_r07_evidence_cache_dir(config))
 
 
 def _require_r07_evidence(
@@ -718,7 +863,7 @@ def _require_r07_evidence(
     target: str,
     previous_sha: str,
     target_sha: str,
-) -> R07DeployDecision:
+) -> R07GateDecision:
     """Resolve the Release A/B gate before any checkout or service mutation."""
 
     decision = gate.evaluate(
@@ -774,7 +919,7 @@ def _append_audit(
     result: DeployResult,
     *,
     error: str = "",
-    r07_decision: R07DeployDecision | None = None,
+    r07_decision: R07GateDecision | None = None,
 ) -> None:
     path = _audit_path(config)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1091,8 +1236,16 @@ def _recover_locked(
     runner: Runner,
     authority: GenerationAuthority,
     finalizer: GenerationFinalizer,
-    gate: R07EvidenceGate,
 ) -> DeployResult:
+    """Continue one recorded deployment transaction.
+
+    Recovery never chooses a target: it replays the exact recorded intent, whose pair the
+    deployment R07 gate already accepted before any mutation, and whose rollback leg the
+    specification assigns to "the existing deployer's rollback to the exact previous commit and
+    tree". Re-running the Release A/B table here would make a crashed rollout unrecoverable
+    while Release A is current, so the audit records the recorded-intent provenance instead.
+    """
+
     action = config.recovery_action
     if action not in {"resume", "rollback"}:
         raise PolicyError("recovery action must be resume or rollback")
@@ -1138,22 +1291,10 @@ def _recover_locked(
     dirty = _stdout(runner, [git, "status", "--porcelain", "--untracked-files=no"])
     if dirty:
         raise PolicyError("tracked production worktree changes must be resolved before recovery")
-    current_sha = _stdout(runner, [git, "rev-parse", "HEAD"])
-    decision: R07DeployDecision | None = None
-    if action == "rollback":
-        # A resume finishes the exact target the deployment gate already accepted; a rollback
-        # names a different commit and tree, so it passes the same Release A/B table again.
-        decision = _require_r07_evidence(
-            config,
-            runner,
-            gate,
-            target=config.target,
-            previous_sha=current_sha,
-            target_sha=expected_target,
-        )
     intent = _advance_intent(config, authority, intent, "recovery_started")
     if requires_handoff and config.handoff_operation_id != intent.handoff_operation_id:
         raise PolicyError("deployment handoff rebound was not durably committed before mutation")
+    current_sha = _stdout(runner, [git, "rev-parse", "HEAD"])
     if (
         action == "rollback"
         and config.runtime_root is not None
@@ -1183,10 +1324,9 @@ def _recover_locked(
         intent.changed_files,
         completed.restarted_services,
         plan.handoff_daemons,
-        "" if decision is None else decision.gate,
-        "" if decision is None else decision.target_tree_sha,
+        "recorded_intent",
     )
-    _append_audit(config, result, r07_decision=decision)
+    _append_audit(config, result)
     return result
 
 
@@ -1240,7 +1380,7 @@ def _deploy_locked(
     if config.recovery_action is not None:
         if generation_authority is None or generation_finalizer is None:
             raise PolicyError("deployment recovery requires persistent generation authority")
-        return _recover_locked(config, runner, generation_authority, generation_finalizer, gate)
+        return _recover_locked(config, runner, generation_authority, generation_finalizer)
     target = validate_target(config.target)
     git_path = config.git_path
     if not git_path.is_absolute():
@@ -1615,6 +1755,7 @@ def deploy(
         raise PolicyError(
             f"Linux production runtime root must be exactly {LINUX_PRODUCTION_RUNTIME_ROOT}"
         )
+    _resolve_r07_evidence_cache_dir(config)
     for path, label in (
         (config.runtime_production_inputs, "runtime production inputs"),
         (config.runtime_profile_output_dir, "runtime profile output directory"),

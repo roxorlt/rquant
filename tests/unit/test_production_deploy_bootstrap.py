@@ -39,6 +39,10 @@ BOOTSTRAP = ROOT / "scripts" / "bootstrap-production-deploy.py"
 AUTHORITY = ROOT / "src" / "rquant" / "release_generation.py"
 STRICT_JSON = ROOT / "scripts" / "strict_json.py"
 PRODUCTION_DEPLOYER = ROOT / "src" / "rquant" / "ops" / "production_deploy.py"
+R07_DEPLOY_EVIDENCE = ROOT / "src" / "rquant" / "ops" / "r07_deploy_evidence.py"
+R07_DIFFERENTIAL_GATE = ROOT / "src" / "rquant" / "signal_family_differential_gate.py"
+R07_DEPLOY_GATE_SCRIPT = ROOT / "scripts" / "r07_deploy_gate.py"
+R07_POLICY_RELATIVE_PATH = "tests/fixtures/r07_differential_gate/policy-v1.json"
 TRUSTED_GIT = Path("/usr/bin/git")
 _ORIGINAL_OS_WALK = os.walk
 _READINESS_A = ("a" * 32, "b" * 64, "a" * 40)
@@ -306,6 +310,9 @@ def _checkout(
     (ops / "__init__.py").write_text("", encoding="utf-8")
     if real_deployer:
         shutil.copy2(PRODUCTION_DEPLOYER, ops / PRODUCTION_DEPLOYER.name)
+        shutil.copy2(R07_DEPLOY_EVIDENCE, ops / R07_DEPLOY_EVIDENCE.name)
+        shutil.copy2(R07_DIFFERENTIAL_GATE, package / R07_DIFFERENTIAL_GATE.name)
+        shutil.copy2(R07_DEPLOY_GATE_SCRIPT, scripts / R07_DEPLOY_GATE_SCRIPT.name)
     else:
         (ops / "production_deploy.py").write_text(
             "from __future__ import annotations\n"
@@ -461,12 +468,22 @@ def _checkout(
     return checkout, python, lock_path, commit
 
 
+def _commit_r07_release_a_policy(checkout: Path) -> None:
+    """Give the target commit the bootstrap-disabled R07 policy the deploy gate reads."""
+
+    destination = checkout / R07_POLICY_RELATIVE_PATH
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes((ROOT / R07_POLICY_RELATIVE_PATH).read_bytes())
+    _git(checkout, "add", R07_POLICY_RELATIVE_PATH)
+
+
 def _commit_next_release(checkout: Path) -> str:
     (checkout / "pyproject.toml").write_text(
         '[project]\nname = "rquant"\nversion = "0.99.1"\n',
         encoding="utf-8",
     )
     (checkout / "uv.lock").write_text("version = 2\n", encoding="utf-8")
+    _commit_r07_release_a_policy(checkout)
     _git(checkout, "add", "pyproject.toml", "uv.lock")
     _git(
         checkout,
