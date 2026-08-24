@@ -25,6 +25,7 @@ import pytest
 
 from rquant import signal_family_root_verifier as root_verifier
 from rquant import signal_family_verification as verification
+from rquant.runtime_authority import GENERATION_MANIFEST_NAME
 from rquant.runtime_service_entrypoint import RuntimeServiceKind
 from rquant.strict_json import canonical_json_bytes
 from tests.integration.signal_family_verifier_world import (
@@ -33,13 +34,14 @@ from tests.integration.signal_family_verifier_world import (
     VerifierWorld,
     build_world,
     digest,
+    full_manifest_payload,
     production_authority_record,
     profile_document,
     profile_manifests,
     rewrite_policy,
     rewrite_profile_document,
     snapshot_with,
-    write_full_manifest,
+    write_full_manifest_bytes,
 )
 
 pytestmark = pytest.mark.integration
@@ -641,11 +643,19 @@ def _production_verifier(world: VerifierWorld) -> root_verifier.RootVerifier:
     )
 
 
-def _replace_profile_document(world: VerifierWorld, payload: bytes) -> None:
-    """Swap the profile document and re-publish the closure entry that names it.
+def _replace_profile_document(
+    world: VerifierWorld,
+    payload: bytes,
+    *,
+    republish_slot: bool = True,
+) -> None:
+    """Swap the profile document and republish the whole generation around it.
 
-    Without the matching full-manifest entry the gateway's source-closure check fires
-    first, which would hide the fingerprint binding this test is about.
+    Every enclosing binding is repaired on purpose — the closure entry that names the
+    document, the full manifest that carries that entry, and (when `republish_slot`) the
+    slot identity that authenticates the manifest. That models an attacker who controls
+    the generation tree completely, so what is left standing is the one binding under
+    test: the policy-anchored `service_manifest_fingerprint`.
     """
 
     rewrite_profile_document(world, payload)
@@ -653,16 +663,24 @@ def _replace_profile_document(world: VerifierWorld, payload: bytes) -> None:
     entries[root_verifier.PROFILE_SERVICE_MANIFESTS_RELATIVE_PATH] = hashlib.sha256(
         payload
     ).hexdigest()
-    write_full_manifest(world.generation_path, entries, profile_id=PROFILE_ID)
-    world.gateway.snapshots = [
-        snapshot_with(
-            world,
-            full_manifest_entries=entries,
-            profile_document_sha256=entries[
-                root_verifier.PROFILE_SERVICE_MANIFESTS_RELATIVE_PATH
-            ],
-        )
-    ]
+    manifest_bytes = full_manifest_payload(
+        world.generation_path,
+        entries,
+        profile_id=PROFILE_ID,
+    )
+    write_full_manifest_bytes(world.generation_path, manifest_bytes)
+    generation_id = hashlib.sha256(manifest_bytes).hexdigest()
+    changes: dict[str, Any] = {
+        "full_manifest_entries": entries,
+        "profile_document_sha256": entries[
+            root_verifier.PROFILE_SERVICE_MANIFESTS_RELATIVE_PATH
+        ],
+    }
+    if republish_slot:
+        changes["generation_id"] = generation_id
+        changes["full_manifest_hash"] = generation_id
+        changes["full_manifest_sha256"] = generation_id
+    world.gateway.snapshots = [snapshot_with(world, **changes)]
 
 
 class TestProductionAuthorityGateway:
@@ -797,6 +815,88 @@ class TestProductionAuthorityGateway:
             match="PARTICIPANT_RESOLUTION_INVALID",
         ):
             _production_verifier(world).run()
+
+    def test_the_generation_identity_is_the_hash_of_its_own_full_manifest(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The closure document authenticates itself, or it authenticates nothing.
+
+        `RuntimeGenerationSlot.validate_for_root` only checks the manifest's *path*, so
+        without this equality every `_require_manifested` call would be measuring against
+        a declaration the generation tree can rewrite at will.
+        """
+
+        world = build_world(tmp_path)
+        slot = world.gateway.snapshots[0].slot
+        payload = (slot.generation_path / GENERATION_MANIFEST_NAME).read_bytes()
+
+        assert hashlib.sha256(payload).hexdigest() == slot.full_manifest_hash
+        assert slot.full_manifest_hash == slot.generation_id
+        assert world.gateway.snapshots[0].full_manifest_sha256 == slot.full_manifest_hash
+
+    def test_a_full_manifest_the_slot_does_not_identify_rejects(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        world = build_world(tmp_path)
+        target = world.generation_path / GENERATION_MANIFEST_NAME
+        entries = dict(world.gateway.snapshots[0].full_manifest_entries)
+        entries[verification.TEST_MANIFEST_RELATIVE_PATH] = digest("grafted-declaration")
+        target.chmod(0o644)
+        target.write_bytes(
+            full_manifest_payload(world.generation_path, entries, profile_id=PROFILE_ID)
+        )
+        target.chmod(0o444)
+
+        with pytest.raises(
+            root_verifier.SignalFamilyRootVerifierError,
+            match="FULL_MANIFEST_HASH_MISMATCH",
+        ):
+            _production_verifier(world).run()
+        assert world.report_path.exists() is False
+        assert _rows(world, "receipts") == []
+
+    def test_a_rewritten_closure_declaration_no_longer_launders_a_forged_document(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Repairing the declaration is exactly what the manifest hash now forbids.
+
+        Before the closure document authenticated itself, swapping a generation file and
+        then editing its full-manifest row was enough to satisfy every membership check.
+        """
+
+        world = build_world(tmp_path)
+        _replace_profile_document(
+            world,
+            profile_document(profile_manifests({"notifier": 41.0})),
+            republish_slot=False,
+        )
+        with pytest.raises(
+            root_verifier.SignalFamilyRootVerifierError,
+            match="FULL_MANIFEST_HASH_MISMATCH",
+        ):
+            _production_verifier(world).run()
+        assert world.report_path.exists() is False
+
+    def test_a_gateway_reported_manifest_hash_that_is_not_the_slot_identity_rejects(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """And the verifier checks it too, for any gateway that ever hands it one."""
+
+        world = build_world(tmp_path)
+        world.gateway.snapshots = [
+            snapshot_with(world, full_manifest_sha256=digest("another-closure"))
+        ]
+        with pytest.raises(
+            root_verifier.SignalFamilyRootVerifierError,
+            match="FULL_MANIFEST_HASH_MISMATCH",
+        ):
+            _verifier(world).run()
+        assert world.report_path.exists() is False
+        assert _rows(world, "receipts") == []
 
     def test_the_production_gateway_binds_no_profile_id_equation(self) -> None:
         """The document is never hashed against `slot.profile_id`.

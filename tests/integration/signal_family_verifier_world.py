@@ -626,10 +626,12 @@ def build_world(
             parent.chmod(0o755)
 
     manifests = profile_manifests(stale_overrides)
-    generation_id = digest("generation")
     generations = root / GENERATIONS_RELATIVE_PATH
     generations.mkdir(mode=0o755, parents=True, exist_ok=True)
-    generation_path = generations / generation_id
+    # The generation is assembled under a staging name because its identity is the
+    # SHA-256 of its own `full-manifest.json`, which cannot be known until every file it
+    # covers exists. The directory is renamed to that identity once the manifest is built.
+    generation_path = generations / "staging"
     generation_path.mkdir(mode=0o755)
     (generation_path / "site-packages").mkdir(mode=0o755)
     interpreter_dir = generation_path / "bin"
@@ -696,7 +698,17 @@ def build_world(
     profile_document_sha256 = full_manifest_entries[
         verifier.PROFILE_SERVICE_MANIFESTS_RELATIVE_PATH
     ]
-    write_full_manifest(generation_path, full_manifest_entries, profile_id=profile_id)
+    full_manifest_bytes = full_manifest_payload(
+        generation_path,
+        full_manifest_entries,
+        profile_id=profile_id,
+    )
+    generation_id = hashlib.sha256(full_manifest_bytes).hexdigest()
+    staged = generation_path
+    generation_path = generations / generation_id
+    staged.rename(generation_path)
+    interpreter = generation_path / "bin" / "python"
+    write_full_manifest_bytes(generation_path, full_manifest_bytes)
 
     report_path = tmp_path / "child-report.json"
     harness_path = root / HARNESS_RELATIVE_PATH
@@ -745,6 +757,7 @@ def build_world(
         slot=slot,
         profile_manifests=manifests,
         full_manifest_entries=full_manifest_entries,
+        full_manifest_sha256=generation_id,
         profile_document_sha256=profile_document_sha256,
     )
     gateway = StubAuthorityGateway(snapshots=[snapshot])
@@ -812,15 +825,19 @@ def profile_document(manifests: Sequence[RuntimeServiceManifest]) -> bytes:
     )
 
 
-def write_full_manifest(
+def full_manifest_payload(
     generation_path: Path,
     entries: Mapping[str, str],
     *,
     profile_id: str,
 ) -> bytes:
-    """Write the generation's `full-manifest.json` in the shape the root parser reads."""
+    """The generation's `full-manifest.json` bytes, in the shape the root parser reads.
 
-    payload = canonical_json_bytes(
+    Its SHA-256 is the generation identity, so it is built before the generation
+    directory is named and never contains an entry for itself.
+    """
+
+    return canonical_json_bytes(
         {
             "entries": [
                 {
@@ -839,6 +856,11 @@ def write_full_manifest(
             "schema_id": "runtime-generation-manifest-v1",
         }
     )
+
+
+def write_full_manifest_bytes(generation_path: Path, payload: bytes) -> bytes:
+    """Publish one already-built full manifest into its generation."""
+
     target = generation_path / GENERATION_MANIFEST_NAME
     if target.exists():
         target.chmod(0o644)

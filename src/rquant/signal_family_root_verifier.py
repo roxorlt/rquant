@@ -153,6 +153,7 @@ def _rejection_events() -> Mapping[SignalFamilyReasonCode, SignalFamilyAuditEven
         ("HARNESS_", event.POLICY_VALIDATED),
         ("STORE_", event.RECEIPT_APPENDED),
         ("ENTRY_", event.ENTRY_SELECTED),
+        ("FULL_MANIFEST_", event.MANIFEST_VALIDATED),
         ("VERIFICATION_MANIFEST_", event.MANIFEST_VALIDATED),
         ("TEST_MANIFEST_", event.MANIFEST_VALIDATED),
         ("VECTOR_SET_", event.MANIFEST_VALIDATED),
@@ -277,6 +278,7 @@ class GenerationAuthoritySnapshot:
     slot: RuntimeGenerationSlot
     profile_manifests: tuple[RuntimeServiceManifest, ...]
     full_manifest_entries: Mapping[str, str]
+    full_manifest_sha256: str
     profile_document_sha256: str
 
     def identity(self) -> tuple[Any, ...]:
@@ -304,6 +306,7 @@ class GenerationAuthoritySnapshot:
                 )
             ),
             tuple(sorted(self.full_manifest_entries.items())),
+            self.full_manifest_sha256,
             self.profile_document_sha256,
         )
 
@@ -1953,6 +1956,14 @@ class RootVerifier:
                 relative,
                 hashlib.sha256(payload).hexdigest(),
             )
+        # The source closure only means something once the document that carries it has
+        # been authenticated, so the root requires that of any gateway before it treats a
+        # single `full_manifest_entries` row as a fact about the generation.
+        if authority.full_manifest_sha256 != authority.slot.full_manifest_hash:
+            raise _reject(
+                SignalFamilyReasonCode.FULL_MANIFEST_HASH_MISMATCH,
+                "the parsed full generation manifest is not the one the slot identifies",
+            )
         # The document that carried the profile's service manifests into this process is
         # held down by the same source closure as every other generation file it names.
         self._require_manifested(
@@ -2249,8 +2260,10 @@ class ProductionRuntimeAuthorityGateway:
     from one root-owned canonical generation document. That document is not self-
     authorizing; two independent bindings hold it down:
 
-    * it is an entry of the full generation manifest, whose hash is `full_manifest_hash`
-      and therefore part of both the slot validation and the authority epoch key; and
+    * it is an entry of the full generation manifest, and that manifest's own raw bytes
+      must hash to `RuntimeGenerationSlot.full_manifest_hash`, which is the slot identity
+      and an input to the authority epoch key — so the closure is authenticated before
+      any membership claim inside it is believed; and
     * every `manifest_fingerprint` inside it must equal the `service_manifest_fingerprint`
       of the matching `VerificationServiceBindingV1`, and that binding tuple is anchored
       by the external root policy through `five_pair_service_binding_set_hash`. Forging a
@@ -2288,8 +2301,18 @@ class ProductionRuntimeAuthorityGateway:
             slot.generation_path,
             GENERATION_MANIFEST_NAME,
             max_bytes=MAX_HARNESS_BYTES,
-            reason=SignalFamilyReasonCode.BINDING_UNMANIFESTED,
+            reason=SignalFamilyReasonCode.FULL_MANIFEST_HASH_MISMATCH,
         )
+        # The full manifest is the source closure (L1473-1475), so it authenticates
+        # nothing until it authenticates itself: `full_manifest_hash` is the slot's own
+        # identity and an input to the authority epoch key, and the document that claims
+        # to be that closure must hash to it before a single one of its entries is read.
+        manifest_sha256 = hashlib.sha256(manifest_payload).hexdigest()
+        if manifest_sha256 != slot.full_manifest_hash:
+            raise _reject(
+                SignalFamilyReasonCode.FULL_MANIFEST_HASH_MISMATCH,
+                "the full generation manifest is not the one the slot identifies",
+            )
         entries = _parse_full_manifest_entries(manifest_payload)
         profile_payload = _read_generation_file(
             slot.generation_path,
@@ -2310,6 +2333,7 @@ class ProductionRuntimeAuthorityGateway:
             slot=slot,
             profile_manifests=_parse_profile_manifests(profile_payload),
             full_manifest_entries=entries,
+            full_manifest_sha256=manifest_sha256,
             profile_document_sha256=profile_sha256,
         )
 

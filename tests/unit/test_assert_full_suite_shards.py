@@ -364,7 +364,7 @@ def test_clean_environment_aggregate_uses_shared_private_collect_setup(
             encoding="utf-8"
         )
     )["full_suite"]
-    assert full_suite["cases"] == 12507
+    assert full_suite["cases"] == 12511
     assert full_suite["skips"] == 48
 
 
