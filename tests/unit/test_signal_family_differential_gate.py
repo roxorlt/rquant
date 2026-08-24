@@ -755,3 +755,6 @@ def test_production_category_is_reserved_for_declaration_scanned_sources() -> No
     }
     assert "scripts/r07_ci_evidence.py" in architecture_paths
     assert ".github/workflows/ci.yml" in architecture_paths
+    # The deploy-time gate entrypoint runs in the production chain but lives outside the
+    # declaration-scanned universe, so it keeps the same category as the CI producer script.
+    assert "scripts/r07_deploy_gate.py" in architecture_paths
