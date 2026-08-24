@@ -24,6 +24,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from rquant.signal_family_root_verifier import (  # noqa: E402
+    PRODUCTION_CHILD_WORKSPACE_ROOT,
     PRODUCTION_HARNESS_PATH,
     PRODUCTION_OWNER_GID,
     PRODUCTION_OWNER_UID,
@@ -48,6 +49,7 @@ def production_anchors(*, child_uid: int, child_gid: int) -> VerifierAnchors:
         policy_path=PRODUCTION_POLICY_PATH,
         harness_path=PRODUCTION_HARNESS_PATH,
         store_root=PRODUCTION_STORE_ROOT,
+        child_workspace_root=PRODUCTION_CHILD_WORKSPACE_ROOT,
         expected_owner_uid=PRODUCTION_OWNER_UID,
         expected_owner_gid=PRODUCTION_OWNER_GID,
         child_uid=child_uid,

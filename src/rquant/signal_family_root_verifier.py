@@ -104,6 +104,15 @@ PRODUCTION_POLICY_TRUSTED_ROOT: Final[Path] = Path("/")
 PRODUCTION_POLICY_PATH: Final[Path] = Path(VERIFIER_POLICY_PATH)
 PRODUCTION_HARNESS_PATH: Final[Path] = Path(HARNESS_IDENTITY)
 PRODUCTION_STORE_ROOT: Final[Path] = Path("/var/lib/rquant/signal-family-verification")
+#: WP4-c round 1. The child's empty private cwd is created inside this root-owned `0700`
+#: directory instead of the process default temp root. `runtime_serving_authority` refuses
+#: an authority whose ancestry holds a group- or world-writable node, and the production
+#: default temp root is a sticky `1777` `/tmp`, which made three reader surfaces
+#: unreachable from inside the isolated cwd. The workspace holds no evidence and no
+#: capability: it is a parent directory, never the store.
+PRODUCTION_CHILD_WORKSPACE_ROOT: Final[Path] = Path(
+    "/var/lib/rquant/signal-family-verifier-workspace"
+)
 PRODUCTION_OWNER_UID: Final[int] = 0
 PRODUCTION_OWNER_GID: Final[int] = 0
 
@@ -124,16 +133,39 @@ CHILD_RESULT_ENV_KEY: Final[str] = "RQUANT_SIGNAL_FAMILY_RESULT_FD"
 #: The complete environment the unprivileged child receives, key for key. The two file
 #: descriptor keys carry numbers, never the request itself, which travels only on the pipe.
 SIGNAL_FAMILY_CHILD_ENV_KEYS: Final[tuple[str, ...]] = (
+    "DATA_DIR",
+    "DUCKDB_PATH",
     "HOME",
     "LANG",
     "LC_ALL",
+    "LOG_DIR",
+    "PARQUET_DIR",
     "PATH",
     "PWD",
     CHILD_REQUEST_ENV_KEY,
     CHILD_RESULT_ENV_KEY,
     "TMPDIR",
+    "TUSHARE_TOKEN_MAIN",
 )
 CHILD_PATH_VALUE: Final[str] = "/usr/bin:/bin"
+
+#: WP4-c round 1. `rquant.config` constructs a process-wide `Settings` at import time, and
+#: every production builder that reaches a notification provider or a serving authority
+#: imports it, so a child without these five keys cannot enter those builders at all. The
+#: root chooses every value: the four paths are anchored inside the child's own cwd, and the
+#: credential slot carries a fixed non-credential literal. Nothing is read from the caller's
+#: environment, so no operator configuration and no real token can reach the child.
+CHILD_CONFIGURATION_PATH_ENV_KEYS: Final[tuple[str, ...]] = (
+    "DATA_DIR",
+    "DUCKDB_PATH",
+    "LOG_DIR",
+    "PARQUET_DIR",
+)
+CHILD_ABSENT_CREDENTIAL_VALUE: Final[str] = "rquant-signal-family-verifier-no-credential"
+CHILD_CONFIGURATION_ENV_KEYS: Final[tuple[str, ...]] = (
+    *CHILD_CONFIGURATION_PATH_ENV_KEYS,
+    "TUSHARE_TOKEN_MAIN",
+)
 
 _GENERATION_DOCUMENTS: Final[tuple[str, ...]] = (
     OVERLAY_BUNDLE_RELATIVE_PATH,
@@ -234,6 +266,7 @@ class VerifierAnchors:
     policy_path: Path
     harness_path: Path
     store_root: Path
+    child_workspace_root: Path
     expected_owner_uid: int
     expected_owner_gid: int
     child_uid: int
@@ -245,6 +278,7 @@ class VerifierAnchors:
             ("policy_path", self.policy_path),
             ("harness_path", self.harness_path),
             ("store_root", self.store_root),
+            ("child_workspace_root", self.child_workspace_root),
         ):
             if not isinstance(value, Path) or not value.is_absolute():
                 raise ValueError(f"{label} must be one absolute path")
@@ -258,6 +292,13 @@ class VerifierAnchors:
                 raise ValueError(f"{label} must live beneath the anchored trusted root")
         if self.store_root in (self.policy_path.parent, self.harness_path.parent):
             raise ValueError("the anchors must not share the store root")
+        # The child owns its cwd, so the workspace may never be the store or contain it.
+        if self.child_workspace_root == self.store_root:
+            raise ValueError("the child workspace must not be the store root")
+        if self.child_workspace_root in self.store_root.parents:
+            raise ValueError("the child workspace must not contain the store root")
+        if self.store_root in self.child_workspace_root.parents:
+            raise ValueError("the child workspace must not live beneath the store root")
         for label, value in (
             ("expected_owner_uid", self.expected_owner_uid),
             ("expected_owner_gid", self.expected_owner_gid),
@@ -383,15 +424,21 @@ def build_child_argv(interpreter: Path, harness_path: Path) -> tuple[str, str, s
 def child_environment(*, cwd: Path, request_fd: int, result_fd: int) -> dict[str, str]:
     """The sanitized fixed environment. Nothing is inherited from the root process."""
 
+    data_directory = cwd / "data"
     environment = {
+        "DATA_DIR": str(data_directory),
+        "DUCKDB_PATH": str(data_directory / "rquant.duckdb"),
         "HOME": str(cwd),
         "LANG": "C",
         "LC_ALL": "C",
+        "LOG_DIR": str(cwd / "logs"),
+        "PARQUET_DIR": str(data_directory / "parquet"),
         "PATH": CHILD_PATH_VALUE,
         "PWD": str(cwd),
         CHILD_REQUEST_ENV_KEY: str(request_fd),
         CHILD_RESULT_ENV_KEY: str(result_fd),
         "TMPDIR": str(cwd),
+        "TUSHARE_TOKEN_MAIN": CHILD_ABSENT_CREDENTIAL_VALUE,
     }
     if tuple(sorted(environment)) != SIGNAL_FAMILY_CHILD_ENV_KEYS:  # pragma: no cover
         raise _reject(
@@ -399,6 +446,74 @@ def child_environment(*, cwd: Path, request_fd: int, result_fd: int) -> dict[str
             "the child environment drifted from its frozen allowlist",
         )
     return environment
+
+
+def open_child_workspace_root(root: Path, *, expected_uid: int) -> Path:
+    """Create and validate the private parent the child's cwd is carved out of.
+
+    The walk is anchored and no-follow from `/`, and it applies the same trust rule
+    `rquant.runtime_serving_authority` applies to an authority root: every ancestor must be
+    a real directory owned by root or by this process, with no group or other write bit. A
+    child cwd whose ancestry fails that rule cannot host a serving authority, which is what
+    made three reader surfaces unreachable before WP4-c round 1.
+    """
+
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    with suppress(FileExistsError, OSError):
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptors: list[int] = []
+    try:
+        try:
+            descriptor = os.open(os.path.sep, directory_flags)
+        except OSError as error:  # pragma: no cover - the filesystem root always opens
+            raise _reject(
+                SignalFamilyReasonCode.CHILD_LAUNCH_FAILED,
+                "the filesystem root is unavailable",
+            ) from error
+        descriptors.append(descriptor)
+        for component in root.parts[1:]:
+            try:
+                child = os.open(component, directory_flags, dir_fd=descriptor)
+            except OSError as error:
+                raise _reject(
+                    SignalFamilyReasonCode.CHILD_LAUNCH_FAILED,
+                    "the child workspace ancestry is unavailable or is a symlink",
+                ) from error
+            descriptors.append(child)
+            descriptor = child
+        for opened in descriptors:
+            observed = os.fstat(opened)
+            if not stat.S_ISDIR(observed.st_mode):  # pragma: no cover - O_DIRECTORY covers it
+                raise _reject(
+                    SignalFamilyReasonCode.CHILD_LAUNCH_FAILED,
+                    "a child workspace ancestor is not a directory",
+                )
+            if observed.st_uid not in (0, expected_uid):
+                raise _reject(
+                    SignalFamilyReasonCode.CHILD_LAUNCH_FAILED,
+                    "a child workspace ancestor is owned by an untrusted account",
+                )
+            if observed.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                raise _reject(
+                    SignalFamilyReasonCode.CHILD_LAUNCH_FAILED,
+                    "a child workspace ancestor is group or world writable",
+                )
+        leaf = os.fstat(descriptors[-1])
+        if leaf.st_uid != expected_uid or stat.S_IMODE(leaf.st_mode) != 0o700:
+            raise _reject(
+                SignalFamilyReasonCode.CHILD_LAUNCH_FAILED,
+                "the child workspace root is not a private directory this verifier owns",
+            )
+        return root
+    finally:
+        for opened in reversed(descriptors):
+            with suppress(OSError):  # pragma: no cover - descriptors are freshly opened
+                os.close(opened)
 
 
 @dataclass(frozen=True)
@@ -1384,9 +1499,15 @@ class RootVerifier:
             target_uid=self._anchors.child_uid,
             target_gid=self._anchors.child_gid,
         )
+        workspace = open_child_workspace_root(
+            self._anchors.child_workspace_root,
+            expected_uid=self._anchors.expected_owner_uid,
+        )
         request_read, request_write = os.pipe()
         result_read, result_write = os.pipe()
-        cwd = Path(tempfile.mkdtemp(prefix="rquant-signal-family-child-"))
+        cwd = Path(
+            tempfile.mkdtemp(prefix="rquant-signal-family-child-", dir=str(workspace))
+        )
         process: subprocess.Popen[bytes] | None = None
         try:
             os.chmod(cwd, 0o700)
