@@ -760,6 +760,48 @@ def test_frozen_legacy_immutable_write_skips_the_second_records_directory_fsync(
     assert model.conflict_audit == []
 
 
+def test_frozen_v2_immutable_write_matches_the_observed_dialect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bind the frozen-v2-observed dialect to the untouched v2 primitive itself."""
+
+    records = tmp_path / "records"
+    records.mkdir()
+    descriptor = os.open(records, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    fsynced: list[int] = []
+    real_fsync = os.fsync
+
+    def counting_fsync(target: int) -> None:
+        fsynced.append(target)
+        real_fsync(target)
+
+    try:
+        monkeypatch.setattr(os, "fsync", counting_fsync)
+        payload = b'{"probe":1}'
+        spool._immutable_write_at(descriptor, "x.json", payload, label="probe", max_bytes=64)
+        fresh_link = list(fsynced)
+        fsynced.clear()
+        spool._immutable_write_at(descriptor, "x.json", payload, label="probe", max_bytes=64)
+        identical_retry = list(fsynced)
+        before = sorted(path.name for path in records.iterdir())
+        with pytest.raises(spool.SignalRouteSpoolIntegrityError, match="immutable probe changed"):
+            spool._immutable_write_at(
+                descriptor,
+                "x.json",
+                payload + b" ",
+                label="probe",
+                max_bytes=64,
+            )
+    finally:
+        os.close(descriptor)
+
+    assert descriptor in fresh_link
+    assert descriptor not in identical_retry
+    assert sorted(path.name for path in records.iterdir()) == before == ["x.json"]
+    assert (records / "x.json").read_bytes() == payload
+
+
 def _legacy_envelope(seed: str) -> SignalEnvelope:
     return SignalEnvelope(
         schema_version=1,
