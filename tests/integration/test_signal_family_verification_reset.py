@@ -427,10 +427,7 @@ class TestManifestAndBindings:
             service_manifest_fingerprint=digest("forged-fingerprint"),
         )
 
-    def test_a_binding_whose_source_path_escapes_the_generation_rejects(
-        self,
-        tmp_path: Path,
-    ) -> None:
+    def test_a_binding_whose_source_path_is_absent_rejects(self, tmp_path: Path) -> None:
         world = build_world(tmp_path)
         self._reject_with_binding_change(
             world,
@@ -438,6 +435,65 @@ class TestManifestAndBindings:
             reason="BINDING_WRONG_PATH",
             executable_source_relative_path="src/rquant/absent_module.py",
         )
+
+    def test_a_binding_whose_source_path_is_a_symlink_escape_rejects(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        import os
+
+        world = build_world(tmp_path)
+        outside = tmp_path / "outside-source.py"
+        outside.write_bytes(b"# outside the generation\n")
+        os.symlink(outside, world.generation_path / "src" / "rquant" / "escaped.py")
+        self._reject_with_binding_change(
+            world,
+            index=0,
+            reason="BINDING_WRONG_PATH",
+            executable_source_relative_path="src/rquant/escaped.py",
+        )
+
+    def test_a_generation_without_one_interpreter_for_every_role_rejects(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        import os
+
+        from rquant.runtime_authority import RuntimeGenerationSlot, RuntimeRoleSpec
+
+        world = build_world(tmp_path)
+        second = world.generation_path / "bin" / "python-second"
+        os.symlink(__import__("sys").executable, second)
+        slot = world.gateway.snapshots[0].slot
+        roles = dict(slot.roles)
+        original = roles["serving"]
+        roles["serving"] = RuntimeRoleSpec(
+            python_path=second,
+            module=original.module,
+            working_directory=original.working_directory,
+            app_source=original.app_source,
+            site_packages=original.site_packages,
+        )
+        world.gateway.snapshots = [
+            snapshot_with(
+                world,
+                roles=RuntimeGenerationSlot(
+                    lifecycle=slot.lifecycle,
+                    generation_id=slot.generation_id,
+                    generation_path=slot.generation_path,
+                    commit=slot.commit,
+                    full_manifest_hash=slot.full_manifest_hash,
+                    profile_id=slot.profile_id,
+                    roles=roles,
+                ).roles,
+            )
+        ]
+        with pytest.raises(
+            root_verifier.SignalFamilyRootVerifierError,
+            match="CHILD_LAUNCH_FAILED",
+        ):
+            _verifier(world).run()
+        assert world.report_path.exists() is False
 
     @staticmethod
     def _reject_with_binding_change(
@@ -802,6 +858,71 @@ class TestAppendStore:
         assert recorded <= {state.value for state in verification.SignalFamilyReadinessState}
         assert "ATTESTING" not in recorded
         assert "ACTIVATED" not in recorded
+
+    def test_every_rejection_carries_a_bounded_audit_record(self, tmp_path: Path) -> None:
+        world = build_world(tmp_path)
+        world.policy_path.chmod(0o644)
+        with pytest.raises(root_verifier.SignalFamilyRootVerifierError) as raised:
+            _verifier(world).run()
+
+        record = raised.value.audit_record
+        assert record is not None
+        assert record.outcome is verification.SignalFamilyAuditOutcome.REJECTED
+        assert record.reason_code is verification.SignalFamilyReasonCode.POLICY_ANCHOR_INVALID
+        assert record.event is verification.SignalFamilyAuditEvent.POLICY_VALIDATED
+        payload = record.model_dump(mode="json")
+        assert set(payload) == set(
+            verification.SignalFamilyVerificationAuditRecordV1.model_fields
+        )
+        assert str(world.policy_path) not in canonical_json_bytes(payload).decode("utf-8")
+
+    def test_every_bounded_reason_code_names_one_audit_event(self) -> None:
+        covered = {
+            code: root_verifier._REJECTION_EVENTS[code]
+            for code in verification.SignalFamilyReasonCode
+        }
+        assert len(covered) == len(verification.SignalFamilyReasonCode)
+        assert all(
+            isinstance(event, verification.SignalFamilyAuditEvent)
+            for event in covered.values()
+        )
+
+    def test_the_production_gateway_rejects_a_malformed_source_closure(self) -> None:
+        with pytest.raises(
+            root_verifier.SignalFamilyRootVerifierError,
+            match="BINDING_UNMANIFESTED",
+        ):
+            root_verifier._parse_full_manifest_entries(
+                canonical_json_bytes({"entries": "not-an-array"})
+            )
+
+    def test_the_production_gateway_rejects_a_malformed_profile_document(self) -> None:
+        with pytest.raises(
+            root_verifier.SignalFamilyRootVerifierError,
+            match="PARTICIPANT_RESOLUTION_INVALID",
+        ):
+            root_verifier._parse_profile_manifests(
+                canonical_json_bytes({"service_manifests": [{"service_id": "x"}]})
+            )
+
+    def test_the_production_gateway_parses_an_exact_source_closure(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        world = build_world(tmp_path)
+        payload = canonical_json_bytes(
+            {
+                "entries": [
+                    {"path": relative, "sha256": digest_value}
+                    for relative, digest_value in sorted(
+                        world.gateway.snapshots[0].full_manifest_entries.items()
+                    )
+                ]
+            }
+        )
+        assert root_verifier._parse_full_manifest_entries(payload) == dict(
+            world.gateway.snapshots[0].full_manifest_entries
+        )
 
     def test_audit_rows_carry_only_bounded_identifiers_and_reason_codes(
         self,

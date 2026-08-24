@@ -143,6 +143,49 @@ _GENERATION_DOCUMENTS: Final[tuple[str, ...]] = (
 )
 
 
+def _rejection_events() -> Mapping[SignalFamilyReasonCode, SignalFamilyAuditEvent]:
+    """Which step each bounded reason code belongs to, for its rejection audit record."""
+
+    code = SignalFamilyReasonCode
+    event = SignalFamilyAuditEvent
+    by_prefix: tuple[tuple[str, SignalFamilyAuditEvent], ...] = (
+        ("POLICY_", event.POLICY_VALIDATED),
+        ("HARNESS_", event.POLICY_VALIDATED),
+        ("STORE_", event.RECEIPT_APPENDED),
+        ("ENTRY_", event.ENTRY_SELECTED),
+        ("VERIFICATION_MANIFEST_", event.MANIFEST_VALIDATED),
+        ("TEST_MANIFEST_", event.MANIFEST_VALIDATED),
+        ("VECTOR_SET_", event.MANIFEST_VALIDATED),
+        ("EXPECTED_RESULT_SET_", event.MANIFEST_VALIDATED),
+        ("FIVE_PAIR_", event.MANIFEST_VALIDATED),
+        ("BINDING_", event.BINDING_VALIDATED),
+        ("PAIR_SET_", event.BINDING_VALIDATED),
+        ("PARTICIPANT_", event.BINDING_VALIDATED),
+        ("CHILD_LAUNCH", event.CHILD_LAUNCHED),
+        ("CHILD_", event.CHILD_RESULT_VALIDATED),
+        ("RESULT_SET_", event.CHILD_RESULT_VALIDATED),
+        ("AUTHORITY_", event.AUTHORITY_REVALIDATED),
+        ("DEPLOYMENT_LOCK_", event.AUTHORITY_REVALIDATED),
+        ("RECEIPT_", event.RECEIPT_APPENDED),
+        ("DECISION_", event.DECISION_FINALIZED),
+        ("READINESS_", event.READINESS_DECLARED),
+    )
+    mapping: dict[SignalFamilyReasonCode, SignalFamilyAuditEvent] = {}
+    for member in code:
+        for prefix, chosen in by_prefix:
+            if member.value.startswith(prefix):
+                mapping[member] = chosen
+                break
+        else:  # pragma: no cover - the prefix table covers the closed enum
+            raise RuntimeError(f"no audit event covers the reason code: {member.value}")
+    return mapping
+
+
+_REJECTION_EVENTS: Final[Mapping[SignalFamilyReasonCode, SignalFamilyAuditEvent]] = (
+    _rejection_events()
+)
+
+
 class SignalFamilyRootVerifierError(RuntimeError):
     """One bounded rejection. The message never carries a payload or an exception text."""
 
@@ -1419,6 +1462,22 @@ class RootVerifier:
     def run(self) -> VerifierRunResult:
         """The eight steps of authority.md L1409-1449, in that order and no other."""
 
+        try:
+            return self._run()
+        except SignalFamilyRootVerifierError as error:
+            if error.audit_record is None:
+                # Every rejection carries bounded evidence even though it can never be
+                # appended: authority.md L1404-1405 forbids opening the store before the
+                # child exits, and a step that rejects earlier never gets that far.
+                error.audit_record = SignalFamilyVerificationAuditRecordV1.create(
+                    event=_REJECTION_EVENTS[error.reason_code],
+                    outcome=SignalFamilyAuditOutcome.REJECTED,
+                    reason_code=error.reason_code,
+                    recorded_at=self._clock(),
+                )
+            raise
+
+    def _run(self) -> VerifierRunResult:
         lock = self._gateway.acquire_deployment_lock()
         try:
             # 1. The external anchors, before any generation file is opened.
@@ -1503,6 +1562,20 @@ class RootVerifier:
             # 7. Still under the lock: reopen the anchors and the authority.
             self._assert_lock(lock)
             reopened_policy = self._load_policy()
+            # Ruling O8 calls both halves of this comparison "stale". The entry is
+            # checked first so that a changed authorization for this exact release is
+            # named as such, and a change anywhere else in the policy or its harness is
+            # named as the broader replacement it is.
+            reopened_entry = self._select_entry(
+                reopened_policy.policy,
+                successor_hash,
+                overlay_hash,
+            )
+            if reopened_entry.entry_hash != entry.entry_hash:
+                raise _reject(
+                    SignalFamilyReasonCode.ENTRY_STALE,
+                    "the selected release entry changed during the run",
+                )
             if (
                 reopened_policy.raw_sha256 != policy_snapshot.raw_sha256
                 or reopened_policy.policy.content_hash != policy_snapshot.policy.content_hash
@@ -1515,16 +1588,6 @@ class RootVerifier:
                 raise _reject(
                     SignalFamilyReasonCode.POLICY_CHANGED_DURING_RUN,
                     "the external policy or its fixed harness changed during the run",
-                )
-            reopened_entry = self._select_entry(
-                reopened_policy.policy,
-                successor_hash,
-                overlay_hash,
-            )
-            if reopened_entry.entry_hash != entry.entry_hash:
-                raise _reject(
-                    SignalFamilyReasonCode.ENTRY_STALE,
-                    "the selected release entry changed during the run",
                 )
             reopened_authority = self._gateway.load_snapshot()
             if reopened_authority.identity() != authority.identity():

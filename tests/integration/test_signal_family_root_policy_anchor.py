@@ -454,7 +454,7 @@ class TestSelfConsistentReplacement:
 
 
 class TestReplacementDuringChildExecution:
-    def test_a_policy_replaced_while_the_child_runs_rejects(
+    def test_a_selected_entry_replaced_while_the_child_runs_rejects_as_stale(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
@@ -488,7 +488,7 @@ class TestReplacementDuringChildExecution:
         monkeypatch.setattr(root_verifier.RootVerifier, "_run_child", swapping_child)
         with pytest.raises(
             root_verifier.SignalFamilyRootVerifierError,
-            match="POLICY_CHANGED_DURING_RUN",
+            match="ENTRY_STALE",
         ):
             _verifier(world).run()
         assert _rows(world, "receipts") == []
@@ -518,7 +518,7 @@ class TestReplacementDuringChildExecution:
             _verifier(world).run()
         assert _rows(world, "receipts") == []
 
-    def test_a_policy_entry_swapped_while_the_child_runs_rejects_as_stale(
+    def test_an_unrelated_policy_entry_added_while_the_child_runs_rejects(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
