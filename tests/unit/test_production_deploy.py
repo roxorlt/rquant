@@ -3361,6 +3361,71 @@ class TestR07Bootstrap:
         assert authority.intent is not None and authority.intent.stage == "planned"
         assert _audit_records(config)[-1]["status"] == "r07_gate_failed"
 
+    def test_real_checkout_stays_at_head_when_the_target_declares_no_policy(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / "prod"
+        origin = tmp_path / "origin.git"
+        trusted_git = Path("/usr/bin/git")
+        repo.mkdir()
+
+        def git(*args: str) -> str:
+            return subprocess.run(
+                [str(trusted_git), *args],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+
+        git("init", "-b", "main")
+        git("config", "user.name", "rQuant CI")
+        git("config", "user.email", "rquant@example.invalid")
+        (repo / "src" / "rquant").mkdir(parents=True)
+        (repo / "pyproject.toml").write_text(
+            '[project]\nname = "rquant"\nversion = "0.13.2"\n',
+            encoding="utf-8",
+        )
+        preflight = repo / "src" / "rquant" / "preflight.py"
+        preflight.write_text("BASELINE = True\n", encoding="utf-8")
+        git("add", ".")
+        git("commit", "-m", "base")
+        base_sha = git("rev-parse", "HEAD")
+        preflight.write_text("BASELINE = False\n", encoding="utf-8")
+        git("add", "src/rquant/preflight.py")
+        git("commit", "-m", "target")
+        git("tag", "-a", "v0.13.2", "-m", "release")
+        subprocess.run(
+            [str(trusted_git), "clone", "--bare", str(repo), str(origin)],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        git("reset", "--hard", base_sha)
+        git("remote", "add", "origin", str(origin))
+        config = DeployConfig(
+            repo=repo,
+            target="v0.13.2",
+            now=datetime(2026, 7, 13, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+            uv_bin="/usr/bin/true",
+            rquant_bin="/usr/bin/true",
+            audit_path=tmp_path / "audit.jsonl",
+            lock_path=tmp_path / "deploy.lock",
+            git_path=trusted_git,
+            release_profile="macos-lab",
+            platform_name="darwin",
+        )
+
+        with pytest.raises(PolicyError, match="pre-R07"):
+            deploy(config)
+
+        assert git("rev-parse", "HEAD") == base_sha
+        assert preflight.read_text(encoding="utf-8") == "BASELINE = True\n"
+        record = _audit_records(config)[-1]
+        assert record["status"] == "r07_gate_failed"
+        assert record["r07_gate"] == "rejected"
+
     def test_default_gate_pins_the_production_cache_and_private_verifier(
         self,
         tmp_path: Path,

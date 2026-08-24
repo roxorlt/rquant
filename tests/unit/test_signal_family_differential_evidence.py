@@ -775,6 +775,26 @@ def test_cache_read_rejects_non_canonical_bytes(tmp_path: Path, mutate) -> None:
         )
 
 
+def test_cache_read_rejects_duplicate_json_keys(tmp_path: Path) -> None:
+    directory = _cache_dir(tmp_path)
+    policy = _policy()
+    raw = _valid_wire_bytes(COMMIT_B, TREE_B, policy=policy)
+    duplicated = raw.replace(
+        b'{"artifact_json_path"',
+        b'{"artifact_json_path":"r07-dr-gate/evidence-v1.json","artifact_json_path"',
+        1,
+    )
+    (directory / f"{COMMIT_B}.json").write_bytes(duplicated)
+
+    with pytest.raises(r07_deploy_evidence.R07EvidenceError):
+        r07_deploy_evidence.read_cached_evidence(
+            cache_dir=directory,
+            commit_sha=COMMIT_B,
+            tree_sha=TREE_B,
+            policy=policy,
+        )
+
+
 def test_cache_read_rejects_a_tampered_evidence_digest(tmp_path: Path) -> None:
     directory = _cache_dir(tmp_path)
     policy = _policy()
@@ -1012,6 +1032,19 @@ def test_downloader_rejects_a_non_zip_archive() -> None:
 def test_downloader_rejects_artifact_bytes_that_are_not_bound_evidence(mutate) -> None:
     raw = mutate(_valid_wire_bytes(COMMIT_B, TREE_B, policy=_policy()))
     archive = _artifact_zip({"r07-dr-gate/evidence-v1.json": raw})
+
+    with pytest.raises(r07_deploy_evidence.R07EvidenceError):
+        _download(_channel_responses(archive=archive))
+
+
+def test_downloader_rejects_duplicate_json_keys() -> None:
+    raw = _valid_wire_bytes(COMMIT_B, TREE_B, policy=_policy())
+    duplicated = raw.replace(
+        b'{"artifact_json_path"',
+        b'{"artifact_json_path":"r07-dr-gate/evidence-v1.json","artifact_json_path"',
+        1,
+    )
+    archive = _artifact_zip({"r07-dr-gate/evidence-v1.json": duplicated})
 
     with pytest.raises(r07_deploy_evidence.R07EvidenceError):
         _download(_channel_responses(archive=archive))
