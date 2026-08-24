@@ -68,15 +68,6 @@ def _schema() -> dict[str, Any]:
     return verification.SignalFamilyVerificationAuditRecordV1.model_json_schema()
 
 
-def _property_schema(name: str) -> dict[str, Any]:
-    schema = _schema()
-    prop = schema["properties"][name]
-    if "$ref" in prop:
-        ref = prop["$ref"].rsplit("/", 1)[-1]
-        return schema["$defs"][ref]
-    return prop
-
-
 def _accepted_string_forms(prop: dict[str, Any], schema: dict[str, Any]) -> list[str]:
     """Classify every non-null branch a string field will accept."""
 

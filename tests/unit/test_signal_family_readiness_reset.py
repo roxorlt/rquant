@@ -19,7 +19,7 @@ from __future__ import annotations
 import hashlib
 import re
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, get_args
 
 import pytest
 
@@ -380,6 +380,10 @@ def test_pair_ids_are_the_frozen_phase_b_five() -> None:
         "strategy-router",
         "strategy-shadow",
     )
+
+
+def test_the_pair_id_literal_cannot_drift_from_the_frozen_phase_b_tuple() -> None:
+    assert get_args(verification.PairIdField) == successor.PAIR_IDS
 
 
 def test_surface_enum_is_closed_over_the_exact_pair_to_surface_table() -> None:

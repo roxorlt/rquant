@@ -49,6 +49,11 @@ PairIdField = Literal[
     "strategy-shadow",
 ]
 
+# The literal above cannot be built from a tuple, so drift from the frozen Phase B pair
+# tuple would otherwise go unnoticed until a receipt bound the wrong five pairs.
+if get_args(PairIdField) != PAIR_IDS:
+    raise RuntimeError("the pair id literal drifted from the frozen Phase B pair tuple")
+
 # The fixed external anchors. They are declared here for the root verifier to compare
 # against; nothing in this module opens, creates, or amends either path.
 VERIFIER_POLICY_PATH = "/etc/rquant/signal-family-verifier-policy-v1.json"
