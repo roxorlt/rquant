@@ -222,7 +222,8 @@ class TestStrictPolicyBytes:
     def test_a_duplicate_object_key_rejects(self, tmp_path: Path) -> None:
         world = build_world(tmp_path)
         raw = world.policy_path.read_bytes()
-        injected = raw.replace(b'{"harness_identity"', b'{"harness_identity":"x","harness_identity"', 1)
+        assert raw.startswith(b'{"content_hash":"')
+        injected = b'{"content_hash":"' + b"0" * 64 + b'",' + raw[1:]
         write_policy_bytes(world, injected)
 
         _assert_policy_rejection(world, "POLICY_BYTES_NONCANONICAL")

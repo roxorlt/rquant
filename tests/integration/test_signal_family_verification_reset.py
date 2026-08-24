@@ -190,8 +190,23 @@ class TestEightStepSequence:
         import subprocess
         import sys
 
-        surfaces = sorted(
-            {surface.value.rsplit(".", 2)[0] for surface in verification.SurfaceId}
+        surfaces = [
+            "rquant.notification_state",
+            "rquant.paper_signal_consumer",
+            "rquant.paper_signal_worker",
+            "rquant.runtime_builder_shadow",
+            "rquant.runtime_builder_signal",
+            "rquant.runtime_serving_authority",
+            "rquant.runtime_serving_snapshot",
+            "rquant.runtime_shadow_sources",
+            "rquant.serving_read_models",
+            "rquant.signal_route_spool",
+            "rquant.signal_router_runtime",
+            "rquant.strategy_runner",
+        ]
+        assert all(
+            any(surface.value.startswith(f"{module}.") for module in surfaces)
+            for surface in verification.SurfaceId
         )
         program = (
             "import sys\n"
@@ -641,15 +656,41 @@ class TestAppendStore:
     def test_concurrent_identical_finalization_returns_one_set_of_bytes(
         self,
         tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        """Two runs race the store transaction from two connections.
+
+        The child launches are serialized because `subprocess`'s `preexec_fn` is not safe
+        in the presence of threads, and the production verifier is single-threaded. What
+        the two threads actually race is the `BEGIN IMMEDIATE` transaction and its unique
+        key over overlay plus authority epoch, which is the property under test.
+        """
+
         world = build_world(tmp_path)
         outcomes: list[Any] = []
         errors: list[BaseException] = []
+        launch_lock = threading.Lock()
         barrier = threading.Barrier(2)
+        original_child = root_verifier.RootVerifier._run_child
+        original_finalize = root_verifier.SignalFamilyVerificationStore.finalize
+
+        def serialized_child(self: Any, *args: Any, **kwargs: Any) -> Any:
+            with launch_lock:
+                return original_child(self, *args, **kwargs)
+
+        def racing_finalize(self: Any, *args: Any, **kwargs: Any) -> Any:
+            barrier.wait(timeout=60)
+            return original_finalize(self, *args, **kwargs)
+
+        monkeypatch.setattr(root_verifier.RootVerifier, "_run_child", serialized_child)
+        monkeypatch.setattr(
+            root_verifier.SignalFamilyVerificationStore,
+            "finalize",
+            racing_finalize,
+        )
 
         def finalize() -> None:
             try:
-                barrier.wait(timeout=30)
                 outcomes.append(_verifier(world).run())
             except BaseException as error:  # pragma: no cover - surfaced by the assert
                 errors.append(error)
@@ -658,7 +699,7 @@ class TestAppendStore:
         for thread in threads:
             thread.start()
         for thread in threads:
-            thread.join(timeout=120)
+            thread.join(timeout=180)
 
         assert errors == []
         assert len(outcomes) == 2

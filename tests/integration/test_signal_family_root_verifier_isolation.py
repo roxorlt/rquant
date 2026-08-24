@@ -61,15 +61,28 @@ def _rows(world: VerifierWorld, table: str) -> list[tuple[Any, ...]]:
 
 
 class TestChildContainment:
+    #: CoreFoundation stamps this into every process it initializes on macOS. The root
+    #: never passes it; it appears inside the child after exec and is outside any
+    #: launcher's control, so it is excluded from the exactness assertion by name.
+    PLATFORM_INJECTED_ENV_KEYS = frozenset({"__CF_USER_TEXT_ENCODING"})
+
     def test_the_child_environment_is_exactly_the_frozen_allowlist(
         self,
         tmp_path: Path,
     ) -> None:
         world = build_world(tmp_path)
+        passed = root_verifier.child_environment(
+            cwd=tmp_path,
+            request_fd=3,
+            result_fd=4,
+        )
+        assert tuple(sorted(passed)) == root_verifier.SIGNAL_FAMILY_CHILD_ENV_KEYS
+
         _verifier(world).run()
         report = world.read_report()
+        observed = set(report["environ"]) - self.PLATFORM_INJECTED_ENV_KEYS
 
-        assert tuple(sorted(report["environ"])) == root_verifier.SIGNAL_FAMILY_CHILD_ENV_KEYS
+        assert tuple(sorted(observed)) == root_verifier.SIGNAL_FAMILY_CHILD_ENV_KEYS
 
     def test_the_child_receives_no_python_path_and_runs_isolated(
         self,
@@ -402,7 +415,8 @@ class TestNoCallerAppendAuthority:
 
     def test_a_group_writable_store_root_rejects(self, tmp_path: Path) -> None:
         world = build_world(tmp_path)
-        world.store_root.mkdir(mode=0o770, parents=True)
+        world.store_root.mkdir(parents=True)
+        os.chmod(world.store_root, 0o770)
         with pytest.raises(
             root_verifier.SignalFamilyRootVerifierError,
             match="STORE_ANCHOR_INVALID",

@@ -221,8 +221,8 @@ def main():
     request_fd = int(os.environ["RQUANT_SIGNAL_FAMILY_REQUEST_FD"])
     result_fd = int(os.environ["RQUANT_SIGNAL_FAMILY_RESULT_FD"])
     raw_request = read_request(request_fd)
-    os.close(request_fd)
     write_report(request_fd, result_fd, raw_request)
+    os.close(request_fd)
     if MODE == "timeout":
         import time
 
@@ -234,9 +234,8 @@ def main():
     if MODE == "missing_vector":
         results = results[:-1]
     if MODE == "unknown_vector":
-        clone = dict(results[0])
-        clone["vector_id"] = "f" * 64
-        results = results + [clone]
+        results[0] = dict(results[0])
+        results[0]["vector_id"] = "f" * 64
     if MODE == "unsorted":
         results = list(reversed(results))
     if MODE == "wrong_result":
@@ -248,7 +247,9 @@ def main():
         )
     body = build_body(request, results)
     if MODE == "forged_hash":
-        body = body.replace(b'"result_hash":"', b'"result_hash":"0', 1)[:-1]
+        parsed = json.loads(body)
+        parsed["result_hash"] = "0" * 64
+        body = canonical(parsed)
     if MODE == "trailing":
         body = body + b"\\n"
     if MODE == "oversized":
@@ -739,7 +740,9 @@ def build_world(
         harness_path=harness_path,
         store_root=store_root,
         expected_owner_uid=os.getuid(),
-        expected_owner_gid=os.getgid(),
+        # macOS gives a new file the group of its parent directory rather than the
+        # caller's, so the replica's owning group is read back rather than assumed.
+        expected_owner_gid=root.stat().st_gid,
         child_uid=os.getuid(),
         child_gid=os.getgid(),
     )

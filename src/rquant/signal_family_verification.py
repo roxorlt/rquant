@@ -241,6 +241,23 @@ def _decode_object(payload: bytes | str) -> dict[str, Any]:
     return decoded
 
 
+def _decode_model_items(value: object, model: type[BaseModel], *, field: str) -> tuple[Any, ...]:
+    """Rebuild a frozen tuple of exact nested models from its decoded JSON array.
+
+    The strict base rejects a mapping substituted for an exact nested model, so a
+    document that only ever exists on disk needs this inverse of its canonical dump.
+    """
+
+    if type(value) is not list:
+        raise SignalFamilyVerificationError(f"{field} must be a JSON array")
+    items: list[Any] = []
+    for item in value:
+        if type(item) is not dict:
+            raise SignalFamilyVerificationError(f"{field} must contain exact objects")
+        items.append(model.model_validate(item))
+    return tuple(items)
+
+
 def _tuple_item_type(annotation: Any) -> Any:
     args = get_args(annotation)
     return args[0] if args else None
@@ -1023,6 +1040,22 @@ class SignalFamilyTestManifestV1(_PhaseCStrictModel):
         return cls(**values, content_hash=canonical_sha256(preimage))
 
 
+    @classmethod
+    def from_canonical_json(cls, payload: bytes | str) -> Self:
+        """The inverse of `test_manifest_canonical_json_bytes`, for the root verifier."""
+
+        values = dict(_decode_object(payload))
+        for field, model in (
+            ("vectors", SignalFamilyVectorV1),
+            ("expected_results", SignalFamilyExpectedResultV1),
+            ("pairs", PairBindingV1),
+            ("service_bindings", VerificationServiceBindingV1),
+        ):
+            if field in values:
+                values[field] = _decode_model_items(values[field], model, field=field)
+        return cls.model_validate(values)
+
+
 def test_manifest_canonical_json_bytes(manifest: SignalFamilyTestManifestV1) -> bytes:
     _require_exact_instance(manifest, SignalFamilyTestManifestV1, field="test manifest")
     return canonical_json_bytes(manifest.model_dump(mode="json"))
@@ -1077,6 +1110,12 @@ class SignalFamilyVerificationManifestV1(_PhaseCStrictModel):
             ),
         }
         return cls(**values, content_hash=canonical_sha256(values))
+
+    @classmethod
+    def from_canonical_json(cls, payload: bytes | str) -> Self:
+        """The inverse of `verification_manifest_canonical_json_bytes`."""
+
+        return cls.model_validate(_decode_object(payload))
 
 
 def verification_manifest_canonical_json_bytes(
@@ -2073,6 +2112,7 @@ class SignalFamilyReasonCode(StrEnum):
     BINDING_SURFACE_MISMATCH = "BINDING_SURFACE_MISMATCH"
     PAIR_SET_INCOMPLETE = "PAIR_SET_INCOMPLETE"
     PARTICIPANT_RESOLUTION_INVALID = "PARTICIPANT_RESOLUTION_INVALID"
+    STORE_ANCHOR_INVALID = "STORE_ANCHOR_INVALID"
     CHILD_LAUNCH_FAILED = "CHILD_LAUNCH_FAILED"
     CHILD_TIMEOUT = "CHILD_TIMEOUT"
     CHILD_SIGNAL_DEATH = "CHILD_SIGNAL_DEATH"
