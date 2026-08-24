@@ -1,0 +1,783 @@
+"""`RESET-REG-P0` / `RESET-REG-P1` / `RESET-REG-P1-02`: the eight-step verifier sequence.
+
+The root verifier of authority.md L1407-1449 is exercised end to end against a replica of
+its production anchors: an externally installed root-owned policy, a policy-hashed fixed
+harness, an immutable in-generation verification/test manifest, an OS-separated child, and
+a root-owned append store. WP4-b proves the protocol with a stub harness that replays one
+frozen result per vector; the real production-builder harness belongs to WP4-c.
+
+Every rejection row names the exact step it stops at, carries a bounded reason code, and
+leaves no receipt and no readiness record behind. Variants that touch a hashed field always
+recompute the affected `*_hash` so the rule under test is the first failing check.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import sqlite3
+import threading
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from rquant import signal_family_root_verifier as root_verifier
+from rquant import signal_family_verification as verification
+from rquant.runtime_service_entrypoint import RuntimeServiceKind
+from rquant.strict_json import canonical_json_bytes
+from tests.integration.signal_family_verifier_world import (
+    OTHER_OPERATION_ID,
+    VerifierWorld,
+    build_world,
+    digest,
+    profile_manifests,
+    rewrite_policy,
+    snapshot_with,
+)
+
+pytestmark = pytest.mark.integration
+
+VERIFIED_AT = datetime(2026, 8, 24, 7, 30, 15, 250000, tzinfo=UTC)
+
+
+def _clock() -> datetime:
+    return VERIFIED_AT
+
+
+def _verifier(world: VerifierWorld, **overrides: Any) -> root_verifier.RootVerifier:
+    return root_verifier.RootVerifier(
+        anchors=overrides.pop("anchors", world.anchors),
+        authority_gateway=overrides.pop("authority_gateway", world.gateway),
+        clock=overrides.pop("clock", _clock),
+        **overrides,
+    )
+
+
+def _rows(world: VerifierWorld, table: str) -> list[tuple[Any, ...]]:
+    if not world.store_database.exists():
+        return []
+    connection = sqlite3.connect(f"file:{world.store_database}?mode=ro", uri=True)
+    try:
+        return list(connection.execute(f"SELECT * FROM {table}"))
+    finally:
+        connection.close()
+
+
+def _assert_no_evidence(world: VerifierWorld) -> None:
+    assert _rows(world, "receipts") == []
+    assert _rows(world, "decisions") == []
+    assert [row for row in _rows(world, "readiness_state")] == []
+
+
+# ---------------------------------------------------------------------------------------
+# The eight-step happy path
+# ---------------------------------------------------------------------------------------
+
+
+class TestEightStepSequence:
+    def test_one_successful_run_persists_exactly_five_receipts_and_one_decision(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        world = build_world(tmp_path)
+        result = _verifier(world).run()
+
+        assert result.outcome == "persisted"
+        assert result.state is verification.SignalFamilyReadinessState.READY
+        assert tuple(receipt.pair_id for receipt in result.receipts) == verification.PAIR_IDS
+        assert len(result.receipts) == 5
+        assert result.decision.pair_ids == verification.PAIR_IDS
+        assert result.decision.overlay_content_hash == world.overlay_content_hash
+        assert result.decision.authority_epoch_key == world.authority_epoch_key
+        assert len(_rows(world, "receipts")) == 5
+        assert len(_rows(world, "decisions")) == 1
+
+    def test_receipts_bind_the_pair_derived_participants_and_the_frozen_surfaces(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        world = build_world(tmp_path)
+        result = _verifier(world).run()
+
+        participating = verification.participating_service_ids(world.profile_manifests)
+        for receipt in result.receipts:
+            assert receipt.participating_service_ids == participating
+            assert receipt.reader_surface_ids == verification.READER_SURFACES[receipt.pair_id]
+            assert receipt.producer_surface_ids == verification.PRODUCER_SURFACES[receipt.pair_id]
+            assert receipt.service_bindings_hash == world.test_manifest.service_bindings_hash
+
+    def test_freshness_follows_the_lowest_participating_stale_bound(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        world = build_world(tmp_path, stale_overrides={"serving-publisher": 12.0})
+        result = _verifier(world).run()
+
+        expected = verification.canonical_timestamp(VERIFIED_AT + timedelta(seconds=12.0))
+        assert result.decision.fresh_until == expected
+
+    def test_the_optional_policy_cap_lowers_freshness_below_the_profile_minimum(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        world = build_world(tmp_path, policy_max_age_seconds=9)
+        result = _verifier(world).run()
+
+        expected = verification.canonical_timestamp(VERIFIED_AT + timedelta(seconds=9.0))
+        assert result.decision.fresh_until == expected
+
+    def test_the_decision_binds_every_overlay_declaration_and_channel_hash(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        world = build_world(tmp_path)
+        result = _verifier(world).run()
+
+        overlay = canonical_json_bytes(
+            __import__("json").loads(
+                (
+                    world.generation_path / verification.OVERLAY_BUNDLE_RELATIVE_PATH
+                ).read_bytes()
+            )
+        )
+        assert overlay  # the overlay document is canonical on disk
+        assert len(result.decision.successor_declaration_hashes) == 3
+        assert len(result.decision.successor_channel_hashes) == 3
+
+    def test_the_deployment_lock_is_held_across_the_whole_run_and_released(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        world = build_world(tmp_path)
+        _verifier(world).run()
+
+        assert world.gateway.lock.asserted >= 2
+        assert world.gateway.lock.closed is True
+
+    def test_the_store_is_opened_only_after_the_child_has_exited(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        world = build_world(tmp_path)
+        events: list[str] = []
+        original_child = root_verifier.RootVerifier._run_child
+        original_open = root_verifier.SignalFamilyVerificationStore.open
+
+        def traced_child(self: Any, *args: Any, **kwargs: Any) -> Any:
+            events.append("child-start")
+            try:
+                return original_child(self, *args, **kwargs)
+            finally:
+                events.append("child-exit")
+
+        def traced_open(*args: Any, **kwargs: Any) -> Any:
+            events.append("store-open")
+            return original_open(*args, **kwargs)
+
+        monkeypatch.setattr(root_verifier.RootVerifier, "_run_child", traced_child)
+        monkeypatch.setattr(
+            root_verifier.SignalFamilyVerificationStore,
+            "open",
+            staticmethod(traced_open),
+        )
+        _verifier(world).run()
+
+        assert events == ["child-start", "child-exit", "store-open"]
+
+    def test_the_root_process_never_imports_generation_surface_modules(self) -> None:
+        import subprocess
+        import sys
+
+        surfaces = sorted(
+            {surface.value.rsplit(".", 2)[0] for surface in verification.SurfaceId}
+        )
+        program = (
+            "import sys\n"
+            "import rquant.signal_family_root_verifier as verifier\n"
+            f"surfaces = {surfaces!r}\n"
+            "leaked = sorted(name for name in surfaces if name in sys.modules)\n"
+            "assert verifier is not None\n"
+            "print(';'.join(leaked))\n"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", program],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        assert completed.stdout.strip() == ""
+
+
+# ---------------------------------------------------------------------------------------
+# Step 2: exactly one policy entry
+# ---------------------------------------------------------------------------------------
+
+
+class TestEntrySelection:
+    def test_a_release_key_the_policy_never_names_stops_before_the_child(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        world = build_world(tmp_path)
+        entry = verification.ReleaseVerificationEntryV1.create(
+            successor_bundle_content_hash=digest("other-successor"),
+            overlay_content_hash=digest("other-overlay"),
+            verification_manifest_sha256=world.entry.verification_manifest_sha256,
+            vector_set_hash=world.entry.vector_set_hash,
+            expected_result_set_hash=world.entry.expected_result_set_hash,
+            five_pair_service_binding_set_hash=(
+                world.entry.five_pair_service_binding_set_hash
+            ),
+            verifier_policy_max_age_seconds=None,
+        )
+        rewrite_policy(
+            world,
+            verification.SignalFamilyVerifierPolicyV1.create(
+                harness_sha256=world.policy.harness_sha256,
+                release_entries=(entry,),
+            ),
+        )
+        with pytest.raises(root_verifier.SignalFamilyRootVerifierError, match="ENTRY_MISSING"):
+            _verifier(world).run()
+        assert world.report_path.exists() is False
+        _assert_no_evidence(world)
+
+    def test_an_entry_that_names_another_verification_manifest_rejects(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        world = build_world(tmp_path)
+        entry = verification.ReleaseVerificationEntryV1.create(
+            successor_bundle_content_hash=world.successor_bundle_content_hash,
+            overlay_content_hash=world.overlay_content_hash,
+            verification_manifest_sha256=digest("another-manifest"),
+            vector_set_hash=world.entry.vector_set_hash,
+            expected_result_set_hash=world.entry.expected_result_set_hash,
+            five_pair_service_binding_set_hash=(
+                world.entry.five_pair_service_binding_set_hash
+            ),
+            verifier_policy_max_age_seconds=None,
+        )
+        rewrite_policy(
+            world,
+            verification.SignalFamilyVerifierPolicyV1.create(
+                harness_sha256=world.policy.harness_sha256,
+                release_entries=(entry,),
+            ),
+        )
+        with pytest.raises(
+            root_verifier.SignalFamilyRootVerifierError,
+            match="VERIFICATION_MANIFEST_HASH_MISMATCH",
+        ):
+            _verifier(world).run()
+        assert world.report_path.exists() is False
+
+
+# ---------------------------------------------------------------------------------------
+# Step 3: the in-generation manifests and the exact service bindings
+# ---------------------------------------------------------------------------------------
+
+
+class TestManifestAndBindings:
+    @pytest.mark.parametrize(
+        ("field_name", "reason"),
+        (
+            ("vector_set_hash", "VECTOR_SET_HASH_MISMATCH"),
+            ("expected_result_set_hash", "EXPECTED_RESULT_SET_HASH_MISMATCH"),
+            ("five_pair_service_binding_set_hash", "FIVE_PAIR_SET_HASH_MISMATCH"),
+        ),
+    )
+    def test_a_policy_entry_set_hash_that_the_generation_does_not_produce_rejects(
+        self,
+        tmp_path: Path,
+        field_name: str,
+        reason: str,
+    ) -> None:
+        world = build_world(tmp_path)
+        values = {
+            "successor_bundle_content_hash": world.successor_bundle_content_hash,
+            "overlay_content_hash": world.overlay_content_hash,
+            "verification_manifest_sha256": world.verification_manifest_sha256,
+            "vector_set_hash": world.entry.vector_set_hash,
+            "expected_result_set_hash": world.entry.expected_result_set_hash,
+            "five_pair_service_binding_set_hash": (
+                world.entry.five_pair_service_binding_set_hash
+            ),
+            "verifier_policy_max_age_seconds": None,
+        }
+        values[field_name] = digest(f"drifted:{field_name}")
+        rewrite_policy(
+            world,
+            verification.SignalFamilyVerifierPolicyV1.create(
+                harness_sha256=world.policy.harness_sha256,
+                release_entries=(verification.ReleaseVerificationEntryV1.create(**values),),
+            ),
+        )
+        with pytest.raises(root_verifier.SignalFamilyRootVerifierError, match=reason):
+            _verifier(world).run()
+        assert world.report_path.exists() is False
+        _assert_no_evidence(world)
+
+    def test_a_test_manifest_the_verification_manifest_does_not_name_rejects(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        world = build_world(tmp_path)
+        target = world.generation_path / verification.TEST_MANIFEST_RELATIVE_PATH
+        target.chmod(0o644)
+        target.write_bytes(canonical_json_bytes({"schema_version": 1}))
+        target.chmod(0o444)
+        with pytest.raises(
+            root_verifier.SignalFamilyRootVerifierError,
+            match="TEST_MANIFEST_HASH_MISMATCH",
+        ):
+            _verifier(world).run()
+        assert world.report_path.exists() is False
+
+    def test_a_generation_document_outside_the_full_manifest_rejects(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        world = build_world(tmp_path)
+        snapshot = world.gateway.snapshots[0]
+        entries = dict(snapshot.full_manifest_entries)
+        del entries[verification.TEST_MANIFEST_RELATIVE_PATH]
+        world.gateway.snapshots = [snapshot_with(world, full_manifest_entries=entries)]
+        with pytest.raises(
+            root_verifier.SignalFamilyRootVerifierError,
+            match="BINDING_UNMANIFESTED",
+        ):
+            _verifier(world).run()
+        assert world.report_path.exists() is False
+
+    def test_a_binding_whose_module_is_not_the_slot_role_module_rejects(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        world = build_world(tmp_path)
+        self._reject_with_binding_change(
+            world,
+            index=0,
+            reason="BINDING_WRONG_MODULE",
+            executable_module="rquant.serving_read_models",
+        )
+
+    def test_a_binding_whose_source_hash_drifts_from_the_generation_rejects(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        world = build_world(tmp_path)
+        self._reject_with_binding_change(
+            world,
+            index=0,
+            reason="BINDING_WRONG_SOURCE_HASH",
+            executable_source_sha256=digest("drifted-source"),
+        )
+
+    def test_a_binding_whose_role_belongs_to_another_service_rejects(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        world = build_world(tmp_path)
+        self._reject_with_binding_change(
+            world,
+            index=0,
+            reason="BINDING_CROSS_ROLE",
+            role_name="serving",
+        )
+
+    def test_a_binding_whose_kind_is_not_the_profile_kind_rejects(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        world = build_world(tmp_path)
+        self._reject_with_binding_change(
+            world,
+            index=0,
+            reason="BINDING_WRONG_KIND",
+            runtime_service_kind=RuntimeServiceKind.FEATURE_LIVE,
+        )
+
+    def test_a_binding_whose_fingerprint_is_not_the_profile_manifest_rejects(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        world = build_world(tmp_path)
+        self._reject_with_binding_change(
+            world,
+            index=0,
+            reason="BINDING_MISSING",
+            service_manifest_fingerprint=digest("forged-fingerprint"),
+        )
+
+    def test_a_binding_whose_source_path_escapes_the_generation_rejects(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        world = build_world(tmp_path)
+        self._reject_with_binding_change(
+            world,
+            index=0,
+            reason="BINDING_WRONG_PATH",
+            executable_source_relative_path="src/rquant/absent_module.py",
+        )
+
+    @staticmethod
+    def _reject_with_binding_change(
+        world: VerifierWorld,
+        *,
+        index: int,
+        reason: str,
+        **changes: Any,
+    ) -> None:
+        original = world.bindings[index]
+        values: dict[str, Any] = {
+            "service_id": original.service_id,
+            "runtime_service_kind": original.runtime_service_kind,
+            "role_name": original.role_name,
+            "service_manifest_fingerprint": original.service_manifest_fingerprint,
+            "executable_module": original.executable_module,
+            "executable_source_relative_path": original.executable_source_relative_path,
+            "executable_source_sha256": original.executable_source_sha256,
+            "surface_ids": original.surface_ids,
+        }
+        values.update(changes)
+        replaced = verification.VerificationServiceBindingV1.create(**values)
+        bindings = tuple(
+            replaced if position == index else binding
+            for position, binding in enumerate(world.bindings)
+        )
+        _republish_generation(world, bindings=bindings)
+        with pytest.raises(root_verifier.SignalFamilyRootVerifierError, match=reason):
+            _verifier(world).run()
+        assert world.report_path.exists() is False
+
+
+def _republish_generation(
+    world: VerifierWorld,
+    *,
+    bindings: tuple[verification.VerificationServiceBindingV1, ...] | None = None,
+    vectors: tuple[verification.SignalFamilyVectorV1, ...] | None = None,
+) -> None:
+    """Rewrite the immutable generation documents and the policy that authorizes them.
+
+    The policy entry is reminted from the same profile-derived and raw-byte inputs, so a
+    rejection under test is never masked by an entry the generation no longer matches.
+    """
+
+    resolved_bindings = world.test_manifest.service_bindings if bindings is None else bindings
+    resolved_vectors = world.test_manifest.vectors if vectors is None else vectors
+    expected_results = tuple(
+        verification.SignalFamilyExpectedResultV1(
+            vector_id=vector.vector_id,
+            canonical_result_sha256=hashlib.sha256(
+                world.replay[vector.vector_id].encode("utf-8")
+            ).hexdigest(),
+        )
+        for vector in resolved_vectors
+        if vector.vector_id in world.replay
+    )
+    test_manifest = verification.SignalFamilyTestManifestV1.create(
+        vectors=resolved_vectors,
+        expected_results=expected_results,
+        profile_manifests=world.profile_manifests,
+        service_bindings=resolved_bindings,
+    )
+    test_bytes = verification.test_manifest_canonical_json_bytes(test_manifest)
+    test_sha256 = hashlib.sha256(test_bytes).hexdigest()
+    verification_manifest = verification.SignalFamilyVerificationManifestV1.create(
+        successor_bundle_content_hash=world.successor_bundle_content_hash,
+        overlay_content_hash=world.overlay_content_hash,
+        test_manifest_sha256=test_sha256,
+        test_manifest=test_manifest,
+    )
+    verification_bytes = verification.verification_manifest_canonical_json_bytes(
+        verification_manifest
+    )
+    documents = {
+        verification.TEST_MANIFEST_RELATIVE_PATH: test_bytes,
+        verification.VERIFICATION_MANIFEST_RELATIVE_PATH: verification_bytes,
+    }
+    entries = dict(world.gateway.snapshots[0].full_manifest_entries)
+    for relative, payload in documents.items():
+        target = world.generation_path / relative
+        target.chmod(0o644)
+        target.write_bytes(payload)
+        target.chmod(0o444)
+        entries[relative] = hashlib.sha256(payload).hexdigest()
+    world.gateway.snapshots = [snapshot_with(world, full_manifest_entries=entries)]
+    entry = verification.ReleaseVerificationEntryV1.create(
+        successor_bundle_content_hash=world.successor_bundle_content_hash,
+        overlay_content_hash=world.overlay_content_hash,
+        verification_manifest_sha256=entries[
+            verification.VERIFICATION_MANIFEST_RELATIVE_PATH
+        ],
+        vector_set_hash=verification.vector_set_hash(resolved_vectors),
+        expected_result_set_hash=verification.expected_result_set_hash(expected_results),
+        five_pair_service_binding_set_hash=verification.five_pair_service_binding_set_hash(
+            world.profile_manifests,
+            resolved_bindings,
+        ),
+        verifier_policy_max_age_seconds=None,
+    )
+    rewrite_policy(
+        world,
+        verification.SignalFamilyVerifierPolicyV1.create(
+            harness_sha256=world.policy.harness_sha256,
+            release_entries=(entry,),
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------------------
+# Step 7: the authority snapshot may not move under the run
+# ---------------------------------------------------------------------------------------
+
+
+class TestAuthorityRevalidation:
+    @pytest.mark.parametrize(
+        ("changes", "reason"),
+        (
+            ({"sequence": 4}, "AUTHORITY_EPOCH_CHANGED"),
+            ({"operation_id": OTHER_OPERATION_ID}, "AUTHORITY_EPOCH_CHANGED"),
+            ({"profile_id": "e" * 64}, "AUTHORITY_EPOCH_CHANGED"),
+        ),
+    )
+    def test_an_authority_change_between_child_exit_and_append_rejects(
+        self,
+        tmp_path: Path,
+        changes: dict[str, Any],
+        reason: str,
+    ) -> None:
+        world = build_world(tmp_path)
+        world.gateway.snapshots = [
+            world.gateway.snapshots[0],
+            snapshot_with(world, **changes),
+        ]
+        with pytest.raises(root_verifier.SignalFamilyRootVerifierError, match=reason):
+            _verifier(world).run()
+        _assert_no_evidence(world)
+
+    def test_a_profile_change_between_child_exit_and_append_rejects(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        world = build_world(tmp_path)
+        drifted = profile_manifests({"notifier": 33.0})
+        world.gateway.snapshots = [
+            world.gateway.snapshots[0],
+            snapshot_with(world, profile_manifests=drifted),
+        ]
+        with pytest.raises(
+            root_verifier.SignalFamilyRootVerifierError,
+            match="AUTHORITY_EPOCH_CHANGED",
+        ):
+            _verifier(world).run()
+        _assert_no_evidence(world)
+
+    def test_a_lost_deployment_lock_rejects_before_any_append(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        world = build_world(tmp_path)
+        world.gateway.lock.identity_changes = True
+        with pytest.raises(
+            root_verifier.SignalFamilyRootVerifierError,
+            match="DEPLOYMENT_LOCK_LOST",
+        ):
+            _verifier(world).run()
+        _assert_no_evidence(world)
+
+
+# ---------------------------------------------------------------------------------------
+# Step 8: the append store, its transaction, and the lifecycle
+# ---------------------------------------------------------------------------------------
+
+
+class TestAppendStore:
+    def test_the_store_directory_and_database_are_private_to_their_owner(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        import stat as stat_module
+
+        world = build_world(tmp_path)
+        _verifier(world).run()
+
+        directory_mode = stat_module.S_IMODE(world.store_root.stat().st_mode)
+        database_mode = stat_module.S_IMODE(world.store_database.stat().st_mode)
+        assert directory_mode == root_verifier.STORE_DIRECTORY_MODE
+        assert database_mode == root_verifier.STORE_FILE_MODE
+
+    def test_the_run_declares_the_key_before_the_compare_and_swap(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        world = build_world(tmp_path)
+        _verifier(world).run()
+
+        rows = _rows(world, "readiness_state")
+        assert len(rows) == 1
+        assert rows[0][0] == world.overlay_content_hash
+        assert rows[0][1] == world.authority_epoch_key
+        assert rows[0][2] == verification.SignalFamilyReadinessState.READY.value
+
+    def test_an_identical_replay_returns_the_same_bytes_and_appends_nothing(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        world = build_world(tmp_path)
+        first = _verifier(world).run()
+        second = _verifier(world).run()
+
+        assert second.outcome == "idempotent"
+        assert second.decision_bytes == first.decision_bytes
+        assert len(_rows(world, "receipts")) == 5
+        assert len(_rows(world, "decisions")) == 1
+        assert _rows(world, "conflict_audit") == []
+
+    def test_concurrent_identical_finalization_returns_one_set_of_bytes(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        world = build_world(tmp_path)
+        outcomes: list[Any] = []
+        errors: list[BaseException] = []
+        barrier = threading.Barrier(2)
+
+        def finalize() -> None:
+            try:
+                barrier.wait(timeout=30)
+                outcomes.append(_verifier(world).run())
+            except BaseException as error:  # pragma: no cover - surfaced by the assert
+                errors.append(error)
+
+        threads = [threading.Thread(target=finalize) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=120)
+
+        assert errors == []
+        assert len(outcomes) == 2
+        assert outcomes[0].decision_bytes == outcomes[1].decision_bytes
+        assert sorted(result.outcome for result in outcomes) == ["idempotent", "persisted"]
+        assert len(_rows(world, "receipts")) == 5
+        assert len(_rows(world, "decisions")) == 1
+
+    def test_divergent_bytes_for_one_key_append_conflict_evidence_and_reject(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        world = build_world(tmp_path)
+        _verifier(world).run()
+        with pytest.raises(
+            root_verifier.SignalFamilyRootVerifierError,
+            match="DECISION_CONFLICT",
+        ):
+            _verifier(
+                world,
+                clock=lambda: VERIFIED_AT + timedelta(seconds=1),
+            ).run()
+
+        conflicts = _rows(world, "conflict_audit")
+        assert len(conflicts) == 1
+        assert len(_rows(world, "decisions")) == 1
+
+    def test_a_new_authority_epoch_never_revives_the_previous_readiness(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        world = build_world(tmp_path)
+        _verifier(world).run()
+        advanced = snapshot_with(world, sequence=4)
+        world.gateway.snapshots = [advanced, advanced]
+        result = _verifier(world).run()
+
+        assert result.outcome == "persisted"
+        states = {row[1]: row[2] for row in _rows(world, "readiness_state")}
+        assert len(states) == 2
+        assert set(states.values()) == {verification.SignalFamilyReadinessState.READY.value}
+        assert world.authority_epoch_key in states
+        assert len(_rows(world, "receipts")) == 10
+
+    def test_revoke_disables_future_eligibility_without_deleting_history(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        world = build_world(tmp_path)
+        _verifier(world).run()
+        state = _verifier(world).revoke(
+            overlay_content_hash=world.overlay_content_hash,
+            authority_epoch_key=world.authority_epoch_key,
+        )
+
+        assert state is verification.SignalFamilyReadinessState.REVOKED
+        assert verification.is_activation_eligible(state) is False
+        assert len(_rows(world, "receipts")) == 5
+        assert len(_rows(world, "decisions")) == 1
+
+    def test_rollback_moves_ready_to_rolled_back_and_is_append_only(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        world = build_world(tmp_path)
+        _verifier(world).run()
+        state = _verifier(world).rollback(
+            overlay_content_hash=world.overlay_content_hash,
+            authority_epoch_key=world.authority_epoch_key,
+        )
+
+        assert state is verification.SignalFamilyReadinessState.ROLLED_BACK
+        assert len(_rows(world, "decisions")) == 1
+        assert len(_rows(world, "audit")) >= 2
+
+    def test_a_revoked_key_cannot_be_rolled_back(self, tmp_path: Path) -> None:
+        world = build_world(tmp_path)
+        _verifier(world).run()
+        _verifier(world).revoke(
+            overlay_content_hash=world.overlay_content_hash,
+            authority_epoch_key=world.authority_epoch_key,
+        )
+        with pytest.raises(
+            root_verifier.SignalFamilyRootVerifierError,
+            match="READINESS_TRANSITION_INVALID",
+        ):
+            _verifier(world).rollback(
+                overlay_content_hash=world.overlay_content_hash,
+                authority_epoch_key=world.authority_epoch_key,
+            )
+
+    def test_the_store_never_records_an_attesting_or_activated_state(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        world = build_world(tmp_path)
+        _verifier(world).run()
+
+        recorded = {row[2] for row in _rows(world, "readiness_state")}
+        assert recorded <= {state.value for state in verification.SignalFamilyReadinessState}
+        assert "ATTESTING" not in recorded
+        assert "ACTIVATED" not in recorded
+
+    def test_audit_rows_carry_only_bounded_identifiers_and_reason_codes(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        import json
+
+        world = build_world(tmp_path)
+        _verifier(world).run()
+
+        allowed = set(
+            verification.SignalFamilyVerificationAuditRecordV1.model_fields
+        )
+        for row in _rows(world, "audit"):
+            record = json.loads(row[1])
+            assert set(record) == allowed
+            assert record["reason_code"] in {
+                None,
+                *(code.value for code in verification.SignalFamilyReasonCode),
+            }
