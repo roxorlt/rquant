@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -38,8 +39,13 @@ from rquant.ops.production_deploy import (
 from rquant.release_generation import DeploymentIntent
 from rquant.strict_json import canonical_json_bytes
 from tests.unit.test_signal_family_differential_evidence import (
+    RUN_ID,
+    _artifact_payload,
+    _artifact_zip,
     _enforced_policy_bytes,
+    _FakeTransport,
     _release_repo,
+    _run_payload,
     _valid_wire_bytes,
 )
 
@@ -3116,6 +3122,32 @@ def _in_process_r07_gate(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Non
     )
 
 
+def _r07_channel_transport(*, commit_sha: str, tree_sha: str, policy: bytes) -> _FakeTransport:
+    """A fake GitHub channel serving exactly one bound artifact for the target commit."""
+
+    parsed = r07_deploy_evidence.parse_policy_blob(policy)
+    archive_url = "https://api.github.com/artifact/91/zip"
+    return _FakeTransport(
+        {
+            r07_deploy_evidence.workflow_runs_url(commit_sha): json.dumps(
+                {"workflow_runs": [_run_payload(head_sha=commit_sha)]}
+            ).encode(),
+            r07_deploy_evidence.run_artifacts_url(RUN_ID): json.dumps(
+                {"artifacts": [_artifact_payload(name=f"r07-dr-gate-{commit_sha}")]}
+            ).encode(),
+            archive_url: _artifact_zip(
+                {
+                    "r07-dr-gate/evidence-v1.json": _valid_wire_bytes(
+                        commit_sha,
+                        tree_sha,
+                        policy=parsed,
+                    )
+                }
+            ),
+        }
+    )
+
+
 def _seed_r07_cache(tmp_path: Path, *, commit_sha: str, tree_sha: str, policy: bytes) -> Path:
     parsed = r07_deploy_evidence.parse_policy_blob(policy)
     return r07_deploy_evidence.write_cached_evidence(
@@ -3123,6 +3155,16 @@ def _seed_r07_cache(tmp_path: Path, *, commit_sha: str, tree_sha: str, policy: b
         commit_sha=commit_sha,
         payload=_valid_wire_bytes(commit_sha, tree_sha, policy=parsed),
     )
+
+
+def _repository_bytes(root: Path, cache_dir: Path) -> dict[str, bytes]:
+    """Every file under the deployment worktree, excluding the retained evidence cache."""
+
+    return {
+        str(path.relative_to(root)): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file() and cache_dir not in path.parents
+    }
 
 
 def _audit_records(config: DeployConfig) -> list[dict[str, object]]:
@@ -3329,23 +3371,45 @@ class TestR07Bootstrap:
         responses = _base_responses()
         runner = FakeRunner(responses)
         config = _config(tmp_path, dry_run=True)
-        before = {
-            str(path.relative_to(tmp_path)): path.read_bytes()
-            for path in tmp_path.rglob("*")
-            if path.is_file()
-        }
+        gate = _r07_gate(tmp_path)
+        before = _repository_bytes(tmp_path, gate.cache_dir)
 
-        result = deploy(config, runner=runner, r07_evidence_gate=_r07_gate(tmp_path))
+        result = deploy(config, runner=runner, r07_evidence_gate=gate)
 
         assert result.status == "dry_run"
         assert result.r07_gate == "bootstrap_disabled"
         assert result.r07_target_tree_sha == R07_TARGET_TREE
         assert not any(call[:2] == ("git", "merge") for call in runner.calls)
-        assert {
-            str(path.relative_to(tmp_path)): path.read_bytes()
-            for path in tmp_path.rglob("*")
-            if path.is_file()
-        } == before
+        assert _repository_bytes(tmp_path, gate.cache_dir) == before
+
+    def test_dry_run_downloads_and_caches_enforced_evidence(self, tmp_path: Path) -> None:
+        enforced = _r07_policy_bytes(enforced_predecessor=(_sha("a"), R07_INSTALLED_TREE))
+        responses = _base_responses()
+        responses.update(
+            _r07_responses(installed_policy=_r07_policy_bytes(), target_policy=enforced)
+        )
+        transport = _r07_channel_transport(
+            commit_sha=_sha("b"),
+            tree_sha=R07_TARGET_TREE,
+            policy=enforced,
+        )
+        verifier = _RecordingVerifier()
+        gate = _r07_gate(tmp_path, verifier=verifier, transport=transport)
+        config = _config(tmp_path, dry_run=True)
+        runner = FakeRunner(responses)
+        before = _repository_bytes(tmp_path, gate.cache_dir)
+
+        result = deploy(config, runner=runner, r07_evidence_gate=gate)
+
+        assert result.status == "dry_run"
+        assert result.r07_gate == "enforced"
+        assert (gate.cache_dir / f"{_sha('b')}.json").is_file()
+        assert verifier.calls == [_sha("b"), _sha("b")]
+        assert transport.requests
+        assert not any(call[:2] == ("git", "merge") for call in runner.calls)
+        assert not any(call[0] in {"systemctl", "sudo"} for call in runner.calls)
+        assert _repository_bytes(tmp_path, gate.cache_dir) == before
+        assert _audit_records(config) == []
 
     def test_recovery_replays_only_the_recorded_intent_pair(self, tmp_path: Path) -> None:
         authority = FakeGenerationAuthority()
@@ -3461,6 +3525,187 @@ class TestR07Bootstrap:
         record = _audit_records(config)[-1]
         assert record["status"] == "r07_gate_failed"
         assert record["r07_gate"] == "rejected"
+
+    @staticmethod
+    def _release_chain_checkout(tmp_path: Path) -> tuple[Path, str, str, str]:
+        """A real production-shaped checkout with pre-R07, Release A, and Release B commits."""
+
+        repo = tmp_path / "prod"
+        origin = tmp_path / "origin.git"
+        trusted_git = Path("/usr/bin/git")
+        repo.mkdir()
+
+        def git(*args: str) -> str:
+            return subprocess.run(
+                [str(trusted_git), *args],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+
+        git("init", "-b", "main")
+        git("config", "user.name", "rQuant CI")
+        git("config", "user.email", "rquant@example.invalid")
+        (repo / "src" / "rquant").mkdir(parents=True)
+        (repo / "pyproject.toml").write_text(
+            '[project]\nname = "rquant"\nversion = "0.13.2"\n',
+            encoding="utf-8",
+        )
+        preflight = repo / "src" / "rquant" / "preflight.py"
+        preflight.write_text("BASELINE = True\n", encoding="utf-8")
+        git("add", ".")
+        git("commit", "-m", "pre-r07")
+        pre_r07 = git("rev-parse", "HEAD")
+        policy_path = repo / R07_POLICY_RELATIVE_PATH
+        policy_path.parent.mkdir(parents=True)
+        policy_path.write_bytes(_r07_policy_bytes())
+        git("add", R07_POLICY_RELATIVE_PATH)
+        git("commit", "-m", "release a")
+        release_a = git("rev-parse", "HEAD")
+        release_a_tree = git("rev-parse", "--verify", f"{release_a}^{{tree}}")
+        policy_path.write_bytes(
+            _r07_policy_bytes(enforced_predecessor=(release_a, release_a_tree))
+        )
+        git("add", R07_POLICY_RELATIVE_PATH)
+        git("commit", "-m", "release b")
+        release_b = git("rev-parse", "HEAD")
+        subprocess.run(
+            [str(trusted_git), "clone", "--bare", str(repo), str(origin)],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        git("reset", "--hard", pre_r07)
+        git("remote", "add", "origin", str(origin))
+        return repo, pre_r07, release_a, release_b
+
+    @staticmethod
+    def _lab_config(repo: Path, tmp_path: Path, target: str) -> DeployConfig:
+        return DeployConfig(
+            repo=repo,
+            target=target,
+            now=datetime(2026, 7, 13, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+            uv_bin="/usr/bin/true",
+            rquant_bin="/usr/bin/true",
+            audit_path=tmp_path / "audit.jsonl",
+            lock_path=tmp_path / "deploy.lock",
+            git_path=Path("/usr/bin/git"),
+            release_profile="macos-lab",
+            platform_name="darwin",
+        )
+
+    def test_isolated_gate_installs_release_a_and_blocks_release_b_without_a_token(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.undo()
+        monkeypatch.delenv(r07_deploy_evidence.EVIDENCE_TOKEN_VARIABLE, raising=False)
+        repo, _pre_r07, release_a, release_b = self._release_chain_checkout(tmp_path)
+
+        installed = deploy(self._lab_config(repo, tmp_path, release_a))
+
+        assert installed.status == "deployed"
+        assert installed.r07_gate == "bootstrap_disabled"
+        assert (
+            subprocess.run(
+                ["/usr/bin/git", "rev-parse", "HEAD"],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+            == release_a
+        )
+
+        with pytest.raises(PolicyError, match="R07"):
+            deploy(self._lab_config(repo, tmp_path, release_b))
+
+        assert (
+            subprocess.run(
+                ["/usr/bin/git", "rev-parse", "HEAD"],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+            == release_a
+        )
+        records = _audit_records(self._lab_config(repo, tmp_path, release_b))
+        assert records[0]["r07_gate"] == "bootstrap_disabled"
+        assert records[-1]["status"] == "r07_gate_failed"
+        assert "RQUANT_GITHUB_EVIDENCE_TOKEN" in str(records[-1]["error"])
+
+    @pytest.mark.parametrize(
+        ("outcome", "expected"),
+        [
+            pytest.param("nonzero", "failed \\(3\\)", id="nonzero-exit"),
+            pytest.param("timeout", "could not run", id="timeout"),
+            pytest.param("garbage", "unusable decision", id="invalid-json"),
+            pytest.param("empty", "unusable decision", id="no-output"),
+        ],
+    )
+    def test_isolated_gate_refuses_every_child_failure(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        outcome: str,
+        expected: str,
+    ) -> None:
+        monkeypatch.undo()
+        calls: list[list[str]] = []
+
+        def fake_process_group(args: list[str], **kwargs: object):  # noqa: ANN202
+            calls.append(args)
+            if outcome == "timeout":
+                raise subprocess.TimeoutExpired(args, 1)
+            if outcome == "nonzero":
+                return subprocess.CompletedProcess(args, 3, stdout="", stderr="boom")
+            payload = "not json at all" if outcome == "garbage" else ""
+            return subprocess.CompletedProcess(args, 0, stdout=payload, stderr="")
+
+        monkeypatch.setattr(production_deploy, "_run_process_group", fake_process_group)
+        gate = production_deploy._build_r07_evidence_gate(_config(tmp_path))
+
+        decision = gate.evaluate(
+            repo=tmp_path,
+            runner=FakeRunner({}),
+            git_path=Path("/usr/bin/git"),
+            installed_commit_sha=_sha("a"),
+            target_commit_sha=_sha("b"),
+        )
+
+        assert decision.allowed is False
+        assert decision.gate == "rejected"
+        assert re.search(expected, decision.reason)
+        assert decision.installed_commit_sha == _sha("a")
+        assert decision.target_tree_sha == ""
+        assert calls and calls[0][1] == "-I"
+        assert calls[0][2].endswith("scripts/r07_deploy_gate.py")
+
+    def test_lab_evidence_cache_stays_outside_the_deployment_worktree(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / "prod"
+        baseline = _config(tmp_path)
+        config = DeployConfig(
+            **{
+                **baseline.__dict__,
+                "repo": repo,
+                "release_profile": "macos-lab",
+                "platform_name": "darwin",
+                "runtime_production_inputs": None,
+                "runtime_profile_output_dir": None,
+                "runtime_root": None,
+            }
+        )
+
+        resolved = production_deploy._resolve_r07_evidence_cache_dir(config)
+
+        assert resolved == tmp_path / ".rquant-deploy" / "r07-dr-evidence"
+        assert repo not in resolved.parents
 
     def test_default_gate_pins_the_production_cache_and_private_verifier(
         self,

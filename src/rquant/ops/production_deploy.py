@@ -787,7 +787,9 @@ def _resolve_r07_evidence_cache_dir(config: DeployConfig) -> Path:
                 f"{LINUX_PRODUCTION_EVIDENCE_CACHE_DIR}"
             )
         return LINUX_PRODUCTION_EVIDENCE_CACHE_DIR
-    return configured or config.repo / "var" / "r07-dr-evidence"
+    # The Lab default lives beside the deployment lock root, never inside the worktree the
+    # deployer fast-forwards.
+    return configured or config.repo.parent / ".rquant-deploy" / "r07-dr-evidence"
 
 
 class IsolatedR07EvidenceGate:
@@ -851,7 +853,14 @@ class IsolatedR07EvidenceGate:
                 target_commit_sha,
                 f"the R07 deployment gate failed ({completed.returncode}): {detail[:500]}",
             )
-        return r07_decision_from_child_output(completed.stdout)
+        try:
+            return r07_decision_from_child_output(completed.stdout)
+        except PolicyError as exc:
+            return _r07_unavailable_decision(
+                installed_commit_sha,
+                target_commit_sha,
+                f"the R07 deployment gate returned an unusable decision: {exc}",
+            )
 
 
 def _r07_unavailable_decision(
