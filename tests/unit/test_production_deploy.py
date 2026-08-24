@@ -10,6 +10,7 @@ import signal
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -26,6 +27,7 @@ from rquant.ops.production_deploy import (
     LINUX_PRODUCTION_RUNTIME_ROOT,
     DeployConfig,
     DeployError,
+    DeployResult,
     PolicyError,
     ProtectedWindowError,
     SubprocessRunner,
@@ -3637,6 +3639,34 @@ class TestR07Bootstrap:
         assert records[-1]["status"] == "r07_gate_failed"
         assert "RQUANT_GITHUB_EVIDENCE_TOKEN" in str(records[-1]["error"])
 
+    @staticmethod
+    def _child_failure_process_group(
+        outcome: str,
+        calls: list[list[str]],
+    ) -> Callable[..., subprocess.CompletedProcess[bytes]]:
+        failures: dict[str, Exception] = {
+            "timeout": subprocess.TimeoutExpired(["gate"], 1),
+            "contained": ContainedProcessError("kernel process tracker cleanup is pending"),
+            "oserror": OSError("interpreter is unavailable"),
+            "subprocess-error": subprocess.SubprocessError("spawn refused"),
+            "unicode": UnicodeDecodeError("ascii", b"\xe7", 0, 1, "ordinal not in range"),
+        }
+
+        def fake_process_group(
+            args: list[str],
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[bytes]:
+            calls.append(args)
+            failure = failures.get(outcome)
+            if failure is not None:
+                raise failure
+            if outcome == "nonzero":
+                return subprocess.CompletedProcess(args, 3, stdout=b"", stderr=b"boom")
+            payload = b"not json at all" if outcome == "garbage" else b""
+            return subprocess.CompletedProcess(args, 0, stdout=payload, stderr=b"")
+
+        return fake_process_group
+
     @pytest.mark.parametrize(
         ("outcome", "expected"),
         [
@@ -3644,6 +3674,10 @@ class TestR07Bootstrap:
             pytest.param("timeout", "could not run", id="timeout"),
             pytest.param("garbage", "unusable decision", id="invalid-json"),
             pytest.param("empty", "unusable decision", id="no-output"),
+            pytest.param("contained", "could not run", id="contained-process-error"),
+            pytest.param("oserror", "could not run", id="os-error"),
+            pytest.param("subprocess-error", "could not run", id="subprocess-error"),
+            pytest.param("unicode", "could not run", id="undecodable-output"),
         ],
     )
     def test_isolated_gate_refuses_every_child_failure(
@@ -3656,16 +3690,11 @@ class TestR07Bootstrap:
         monkeypatch.undo()
         calls: list[list[str]] = []
 
-        def fake_process_group(args: list[str], **kwargs: object):  # noqa: ANN202
-            calls.append(args)
-            if outcome == "timeout":
-                raise subprocess.TimeoutExpired(args, 1)
-            if outcome == "nonzero":
-                return subprocess.CompletedProcess(args, 3, stdout="", stderr="boom")
-            payload = "not json at all" if outcome == "garbage" else ""
-            return subprocess.CompletedProcess(args, 0, stdout=payload, stderr="")
-
-        monkeypatch.setattr(production_deploy, "_run_process_group", fake_process_group)
+        monkeypatch.setattr(
+            production_deploy,
+            "_run_process_group",
+            self._child_failure_process_group(outcome, calls),
+        )
         gate = production_deploy._build_r07_evidence_gate(_config(tmp_path))
 
         decision = gate.evaluate(
@@ -3684,16 +3713,191 @@ class TestR07Bootstrap:
         assert calls and calls[0][1] == "-I"
         assert calls[0][2].endswith("scripts/r07_deploy_gate.py")
 
-    def test_lab_evidence_cache_stays_outside_the_deployment_worktree(
+    @pytest.mark.parametrize(
+        "outcome",
+        [
+            pytest.param("contained", id="contained-process-error"),
+            pytest.param("oserror", id="os-error"),
+            pytest.param("subprocess-error", id="subprocess-error"),
+            pytest.param("unicode", id="undecodable-output"),
+        ],
+    )
+    def test_a_child_launch_failure_is_refused_and_audited(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        outcome: str,
+    ) -> None:
+        monkeypatch.undo()
+        monkeypatch.setattr(
+            production_deploy,
+            "_run_process_group",
+            self._child_failure_process_group(outcome, []),
+        )
+        config = _config(tmp_path)
+        runner = FakeRunner(_base_responses())
+
+        with pytest.raises(PolicyError, match="R07 deployment evidence gate refused"):
+            deploy(config, runner=runner)
+
+        records = _audit_records(config)
+        assert len(records) == 1
+        assert records[0]["status"] == "r07_gate_failed"
+        assert records[0]["r07_gate"] == "rejected"
+        assert records[0]["r07_installed_mode"] == "unresolved"
+        assert not any(call[:2] in {("git", "merge"), ("git", "reset")} for call in runner.calls)
+        assert not any(call[0] in {"systemctl", "sudo", "uv"} for call in runner.calls)
+
+    def test_a_refused_gate_exits_as_a_policy_refusal(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        monkeypatch.undo()
+
+        def refuse(config: DeployConfig, **kwargs: object) -> DeployResult:
+            raise PolicyError("R07 deployment evidence gate refused the target: child failed")
+
+        monkeypatch.setattr(production_deploy, "deploy", refuse)
+
+        code = production_deploy.main(
+            [
+                "--target",
+                _sha("b"),
+                "--repo",
+                str(tmp_path),
+                "--deployment-lock-path",
+                str(tmp_path / "deploy.lock"),
+                "--startup-generation",
+                _sha("a"),
+                "--trusted-git-path",
+                "/usr/bin/git",
+                "--python-path",
+                sys.executable,
+                "--uv-path",
+                "/usr/bin/true",
+                "--release-profile",
+                "linux-production",
+                "--platform-name",
+                "linux",
+            ]
+        )
+
+        assert code == 2
+        assert "REFUSED: R07 deployment evidence gate refused" in capsys.readouterr().err
+
+    def test_the_child_decision_is_read_as_bytes_and_decoded_as_utf8(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.undo()
+        reason = "R07 policy objects could not be resolved: 版本 mismatch"
+        payload = canonical_json_bytes(
+            self._child_decision_payload(
+                allowed=False,
+                gate="rejected",
+                reason=reason,
+                installed_commit_sha="",
+                installed_tree_sha="",
+                target_commit_sha="",
+                target_tree_sha="",
+            )
+        )
+        requested: list[object] = []
+
+        def fake_process_group(
+            args: list[str],
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[bytes]:
+            requested.append(kwargs.get("text", True))
+            if kwargs.get("text", True) is not False:
+                raise UnicodeDecodeError("ascii", payload, 0, 1, "ordinal not in range(128)")
+            return subprocess.CompletedProcess(args, 0, stdout=payload, stderr=b"")
+
+        monkeypatch.setattr(production_deploy, "_run_process_group", fake_process_group)
+        gate = production_deploy._build_r07_evidence_gate(_config(tmp_path))
+
+        decision = gate.evaluate(
+            repo=tmp_path,
+            runner=FakeRunner({}),
+            git_path=Path("/usr/bin/git"),
+            installed_commit_sha=_sha("a"),
+            target_commit_sha=_sha("b"),
+        )
+
+        assert requested == [False]
+        assert decision.allowed is False
+        assert decision.reason == reason
+
+    def test_a_non_ascii_child_reason_survives_a_c_locale_child(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.undo()
+        monkeypatch.setenv("LC_ALL", "C")
+        monkeypatch.setenv("LANG", "C")
+        monkeypatch.delenv("PYTHONUTF8", raising=False)
+        repo, _pre_r07, release_a, _release_b = _release_repo(tmp_path)
+        policy_path = repo / R07_POLICY_RELATIVE_PATH
+        policy_path.write_bytes('{"schema_version":"\u7248\u672c"}'.encode())
+        subprocess.run(
+            ["/usr/bin/git", "add", R07_POLICY_RELATIVE_PATH],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            [
+                "/usr/bin/git",
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "user.name=test",
+                "commit",
+                "--quiet",
+                "-m",
+                "broken policy",
+            ],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+        )
+        broken_commit = subprocess.run(
+            ["/usr/bin/git", "rev-parse", "HEAD"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        gate = production_deploy._build_r07_evidence_gate(_config(tmp_path))
+
+        decision = gate.evaluate(
+            repo=repo,
+            runner=FakeRunner({}),
+            git_path=Path("/usr/bin/git"),
+            installed_commit_sha=release_a,
+            target_commit_sha=broken_commit,
+        )
+
+        assert decision.allowed is False
+        assert decision.gate == "rejected"
+        assert "\u7248\u672c" in decision.reason
+
+    def test_lab_evidence_cache_follows_the_deployment_lock_root(
         self,
         tmp_path: Path,
     ) -> None:
-        repo = tmp_path / "prod"
+        repo = tmp_path / "checkouts" / "rquant"
+        lock_root = tmp_path / "state" / ".rquant-deploy"
         baseline = _config(tmp_path)
         config = DeployConfig(
             **{
                 **baseline.__dict__,
                 "repo": repo,
+                "lock_path": lock_root / "rquant.lock",
                 "release_profile": "macos-lab",
                 "platform_name": "darwin",
                 "runtime_production_inputs": None,
@@ -3704,7 +3908,31 @@ class TestR07Bootstrap:
 
         resolved = production_deploy._resolve_r07_evidence_cache_dir(config)
 
-        assert resolved == tmp_path / ".rquant-deploy" / "r07-dr-evidence"
+        assert resolved == lock_root / "r07-dr-evidence"
+        assert repo not in resolved.parents
+        assert repo.parent not in resolved.parents
+
+    def test_lab_evidence_cache_defaults_beside_the_default_lock(self, tmp_path: Path) -> None:
+        repo = tmp_path / "checkouts" / "rquant"
+        baseline = _config(tmp_path)
+        config = DeployConfig(
+            **{
+                **baseline.__dict__,
+                "repo": repo,
+                "lock_path": None,
+                "release_profile": "macos-lab",
+                "platform_name": "darwin",
+                "runtime_production_inputs": None,
+                "runtime_profile_output_dir": None,
+                "runtime_root": None,
+            }
+        )
+
+        resolved = production_deploy._resolve_r07_evidence_cache_dir(config)
+
+        assert resolved == production_deploy._deployment_lock_path(config).parent / (
+            "r07-dr-evidence"
+        )
         assert repo not in resolved.parents
 
     def test_default_gate_pins_the_production_cache_and_private_verifier(
@@ -3843,6 +4071,27 @@ class TestR07Bootstrap:
         with pytest.raises(PolicyError, match="R07 deployment gate"):
             production_deploy.r07_decision_from_child_output(raw)
 
+    def test_an_unresolved_rejection_may_omit_the_commit_and_tree_ids(self) -> None:
+        raw = canonical_json_bytes(
+            self._child_decision_payload(
+                allowed=False,
+                gate="rejected",
+                reason="R07 policy objects could not be resolved",
+                requires_evidence=False,
+                installed_mode="unresolved",
+                target_mode="unresolved",
+                installed_commit_sha="",
+                installed_tree_sha="",
+                target_commit_sha="",
+                target_tree_sha="",
+            )
+        )
+
+        decision = production_deploy.r07_decision_from_child_output(raw)
+
+        assert decision.allowed is False
+        assert decision.target_commit_sha == ""
+
     def test_a_duplicate_child_decision_key_cannot_flip_the_verdict(self) -> None:
         rejected = canonical_json_bytes(
             self._child_decision_payload(
@@ -3896,6 +4145,10 @@ class TestR07Bootstrap:
             pytest.param({"installed_commit_sha": _sha("a")[:39]}, id="short-commit"),
             pytest.param({"allowed": "true"}, id="string-flag"),
             pytest.param({"reason": 7}, id="numeric-reason"),
+            pytest.param({"target_tree_sha": ""}, id="allowed-without-target-tree"),
+            pytest.param({"target_commit_sha": ""}, id="allowed-without-target-commit"),
+            pytest.param({"installed_tree_sha": ""}, id="allowed-without-installed-tree"),
+            pytest.param({"installed_commit_sha": ""}, id="allowed-without-installed-commit"),
         ],
     )
     def test_an_out_of_contract_child_decision_is_refused(

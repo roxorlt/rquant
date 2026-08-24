@@ -523,6 +523,54 @@ def _installed_pair() -> BootstrapPredecessorV1:
     return BootstrapPredecessorV1(commit_sha=COMMIT_A, tree_sha=TREE_A)
 
 
+@pytest.mark.parametrize(
+    "field",
+    [
+        pytest.param("installed_commit_sha", id="installed-commit"),
+        pytest.param("installed_tree_sha", id="installed-tree"),
+        pytest.param("target_commit_sha", id="target-commit"),
+        pytest.param("target_tree_sha", id="target-tree"),
+    ],
+)
+def test_an_allowed_decision_requires_every_commit_and_tree_id(field: str) -> None:
+    values = {
+        "allowed": True,
+        "gate": "bootstrap_disabled",
+        "reason": "Release A bootstrap install from a pre-R07 checkout",
+        "requires_evidence": False,
+        "installed_mode": "absent",
+        "target_mode": "disabled_for_bootstrap",
+        "installed_commit_sha": COMMIT_A,
+        "installed_tree_sha": TREE_A,
+        "target_commit_sha": COMMIT_B,
+        "target_tree_sha": TREE_B,
+    }
+    r07_deploy_evidence.R07DeployDecision.model_validate(values)
+
+    with pytest.raises(ValidationError):
+        r07_deploy_evidence.R07DeployDecision.model_validate({**values, field: ""})
+
+
+def test_an_unresolved_rejection_may_omit_the_commit_and_tree_ids() -> None:
+    decision = r07_deploy_evidence.R07DeployDecision.model_validate(
+        {
+            "allowed": False,
+            "gate": "rejected",
+            "reason": "R07 policy objects could not be resolved",
+            "requires_evidence": False,
+            "installed_mode": "unresolved",
+            "target_mode": "unresolved",
+            "installed_commit_sha": "",
+            "installed_tree_sha": "",
+            "target_commit_sha": "",
+            "target_tree_sha": "",
+        }
+    )
+
+    assert decision.allowed is False
+    assert decision.audit_fields()["r07_target_commit_sha"] == ""
+
+
 def test_decision_allows_release_a_once_from_a_pre_r07_checkout() -> None:
     decision = r07_deploy_evidence.decide_r07_deployment(
         _installed(None),

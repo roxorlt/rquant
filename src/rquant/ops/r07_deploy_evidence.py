@@ -168,6 +168,15 @@ class R07DeployDecision(_StrictModelMixin, BaseModel):
             raise ValueError("an R07 decision is allowed exactly when it is not rejected")
         if self.requires_evidence and self.gate != "enforced":
             raise ValueError("only an enforced R07 target consumes channel evidence")
+        if self.allowed and not all(
+            (
+                self.installed_commit_sha,
+                self.installed_tree_sha,
+                self.target_commit_sha,
+                self.target_tree_sha,
+            )
+        ):
+            raise ValueError("an allowed R07 decision must name every commit and tree ID")
         return self
 
     def audit_fields(self) -> dict[str, str]:

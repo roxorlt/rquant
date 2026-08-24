@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Protocol
 from zoneinfo import ZoneInfo
 
-from rquant.contained_subprocess import run_contained
+from rquant.contained_subprocess import ContainedProcessError, run_contained
 from rquant.release_generation import (
     ALL_LONG_RUNNING_SERVICES as _ALL_LONG_RUNNING_SERVICES,
 )
@@ -134,8 +134,12 @@ def r07_decision_from_child_output(raw: str | bytes) -> R07GateDecision:
         raise PolicyError("R07 deployment gate returned an unknown gate verdict")
     for field_name in _R07_DECISION_SHA_FIELDS:
         value = payload[field_name]
-        if value and R07_DECISION_SHA_PATTERN.fullmatch(str(value)) is None:
+        if value and R07_DECISION_SHA_PATTERN.fullmatch(value) is None:
             raise PolicyError("R07 deployment gate decision commit and tree IDs must be 40-hex")
+        if not value and payload["allowed"]:
+            raise PolicyError(
+                "R07 deployment gate allowed a verdict without every commit and tree ID"
+            )
     decision = R07GateDecision(**payload)  # type: ignore[arg-type]
     if decision.allowed == (decision.gate == "rejected"):
         raise PolicyError("R07 deployment gate decision is internally inconsistent")
@@ -229,6 +233,7 @@ def _run_process_group(
     check: bool,
     pass_fds: tuple[int, ...] = (),
     env: dict[str, str] | None = None,
+    text: bool = True,
     may_spawn_background_descendants: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     if monotonic_time.monotonic() >= deadline_monotonic:
@@ -240,6 +245,7 @@ def _run_process_group(
         check=check,
         pass_fds=pass_fds,
         env=env,
+        text=text,
         may_spawn_background_descendants=may_spawn_background_descendants,
     )
 
@@ -776,6 +782,12 @@ def _prepare_job_center_authority(
     runner.run(command)
 
 
+def _deployment_lock_path(config: DeployConfig) -> Path:
+    """The exact deployment lock this rollout coordinates on."""
+
+    return config.lock_path or config.repo.parent / ".rquant-deploy" / f"{config.repo.name}.lock"
+
+
 def _resolve_r07_evidence_cache_dir(config: DeployConfig) -> Path:
     """The retained evidence cache directory, pinned exactly on Linux production."""
 
@@ -787,9 +799,9 @@ def _resolve_r07_evidence_cache_dir(config: DeployConfig) -> Path:
                 f"{LINUX_PRODUCTION_EVIDENCE_CACHE_DIR}"
             )
         return LINUX_PRODUCTION_EVIDENCE_CACHE_DIR
-    # The Lab default lives beside the deployment lock root, never inside the worktree the
-    # deployer fast-forwards.
-    return configured or config.repo.parent / ".rquant-deploy" / "r07-dr-evidence"
+    # The Lab default lives inside the deployment lock root, never inside the worktree the
+    # deployer fast-forwards and never in a fresh directory beside the checkout.
+    return configured or _deployment_lock_path(config).parent / "r07-dr-evidence"
 
 
 class IsolatedR07EvidenceGate:
@@ -834,20 +846,29 @@ class IsolatedR07EvidenceGate:
         if deadline is None:
             deadline = monotonic_time.monotonic() + config.overall_timeout_seconds
         try:
+            # The child writes canonical UTF-8 bytes; decoding them here instead of inside
+            # subprocess keeps a non-ASCII reason readable under any server locale.
             completed = _run_process_group(
                 command,
                 cwd=repo,
                 deadline_monotonic=deadline,
                 check=False,
+                text=False,
             )
-        except (OSError, subprocess.SubprocessError) as exc:
+        except (
+            ContainedProcessError,
+            OSError,
+            subprocess.SubprocessError,
+            UnicodeDecodeError,
+        ) as exc:
             return _r07_unavailable_decision(
                 installed_commit_sha,
                 target_commit_sha,
                 f"the R07 deployment gate could not run: {type(exc).__name__}",
             )
         if completed.returncode != 0:
-            detail = (completed.stderr or completed.stdout or "no output").strip()
+            raw_detail = completed.stderr or completed.stdout or b"no output"
+            detail = _decoded_child_output(raw_detail).strip()
             return _r07_unavailable_decision(
                 installed_commit_sha,
                 target_commit_sha,
@@ -861,6 +882,14 @@ class IsolatedR07EvidenceGate:
                 target_commit_sha,
                 f"the R07 deployment gate returned an unusable decision: {exc}",
             )
+
+
+def _decoded_child_output(raw: bytes | str) -> str:
+    """Decode the isolated gate child's output as UTF-8, never as the ambient locale."""
+
+    if isinstance(raw, str):
+        return raw
+    return raw.decode("utf-8", errors="replace")
 
 
 def _r07_unavailable_decision(
@@ -1869,7 +1898,7 @@ def deploy(
         overall_timeout_seconds=effective_config.overall_timeout_seconds,
         overall_deadline_monotonic=effective_config.overall_deadline_monotonic,
     )
-    lock_path = effective_config.lock_path or (repo.parent / ".rquant-deploy" / f"{repo.name}.lock")
+    lock_path = _deployment_lock_path(effective_config)
     if effective_config.lock_fd is not None:
         try:
             opened = os.fstat(effective_config.lock_fd)
