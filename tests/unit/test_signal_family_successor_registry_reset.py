@@ -4,6 +4,11 @@ Covers `RESET-REG-P1` and `RESET-REG-P1-01`: the four frozen schemas, their cano
 preimages and raw bytes, the strict structural rejection matrix, the actual-model
 prerequisite, and the fact that a partial, absent, or conflicting overlay never becomes
 ready while v2 stays untouched.
+
+Every rejection case makes its own rule the first failing check — variants that change a
+hashed field recompute the affected `channel_hash` / `content_hash` / `declaration_hash`
+so a hash mismatch cannot stand in for the rule under test — and pins the exact rejection
+reason with `match=`, so two different rules can never satisfy one another's assertion.
 """
 
 from __future__ import annotations
@@ -37,6 +42,7 @@ CLOSURE_FILES = frozenset(
     }
 )
 PRODUCER_COMMIT = "a" * 40
+OTHER_PRODUCER_COMMIT = "b" * 40
 
 _CHANNEL_SERVICES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "signal-bus-routed-record/current": (
@@ -53,12 +59,22 @@ _CHANNEL_SERVICES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     ),
 }
 
+# The hash field each frozen schema derives from the rest of its own canonical content.
+_HASH_FIELD = {
+    "channel": "channel_hash",
+    "bundle": "content_hash",
+    "declaration": "declaration_hash",
+    "overlay": "content_hash",
+}
+
 
 def _closure(
     files: frozenset[str] = CLOSURE_FILES,
+    *,
+    producer_commit: str = PRODUCER_COMMIT,
 ) -> successor.SuccessorGenerationSourceClosureV1:
     return successor.SuccessorGenerationSourceClosureV1(
-        producer_commit=PRODUCER_COMMIT,
+        producer_commit=producer_commit,
         source_closure=files,
     )
 
@@ -68,13 +84,14 @@ def _channel(
     *,
     producers: tuple[str, ...] | None = None,
     consumers: tuple[str, ...] | None = None,
+    closure: successor.SuccessorGenerationSourceClosureV1 | None = None,
 ) -> successor.SuccessorChannelV1:
     declared_producers, declared_consumers = _CHANNEL_SERVICES[channel_id]
     return successor.SuccessorChannelV1.create(
         channel_id,
         producer_service_ids=declared_producers if producers is None else producers,
         consumer_service_ids=declared_consumers if consumers is None else consumers,
-        closure=_closure(),
+        closure=_closure() if closure is None else closure,
     )
 
 
@@ -143,6 +160,14 @@ def _recanonical(value: dict[str, Any]) -> bytes:
     return canonical_json_bytes(value)
 
 
+def _rehashed(form: str, value: dict[str, Any]) -> bytes:
+    """Re-derive the schema's own hash so it can never mask the rule under test."""
+
+    field = _HASH_FIELD[form]
+    preimage = {key: item for key, item in value.items() if key != field}
+    return canonical_json_bytes({**preimage, field: successor._canonical_sha256(preimage)})
+
+
 def _with_space(payload: bytes) -> bytes:
     return payload.replace(b":", b": ", 1)
 
@@ -171,12 +196,15 @@ def _with_duplicate_key(payload: bytes) -> bytes:
 
 
 NONCANONICAL_MUTATORS = (
-    ("whitespace", _with_space),
-    ("unicode-escape", _with_unicode_escape),
-    ("key-order", _with_reordered_keys),
-    ("newline", _with_trailing_newline),
-    ("duplicate-key", _with_duplicate_key),
+    ("whitespace", _with_space, "persistent JSON is not canonical"),
+    ("unicode-escape", _with_unicode_escape, "persistent JSON is not canonical"),
+    ("key-order", _with_reordered_keys, "persistent JSON is not canonical"),
+    ("newline", _with_trailing_newline, "persistent JSON is not canonical"),
+    ("duplicate-key", _with_duplicate_key, "duplicate JSON key"),
 )
+
+_EXTRA_KEY = "Extra inputs are not permitted"
+_NOT_AN_OBJECT = "successor authority payload must be a JSON object"
 
 
 def _raw_forms() -> dict[str, tuple[bytes, Any]]:
@@ -283,20 +311,35 @@ def test_frozen_namespaces_and_versions_are_exact() -> None:
 
 
 @pytest.mark.parametrize(
-    ("form", "field", "value"),
+    ("form", "field", "value", "reason"),
     (
-        ("bundle", "bundle_namespace", "rquant.signal-family.overlay"),
-        ("bundle", "schema_version", 2),
-        ("overlay", "overlay_namespace", "rquant.signal-family.successor"),
-        ("overlay", "overlay_version", 2),
+        (
+            "bundle",
+            "bundle_namespace",
+            "rquant.signal-family.overlay",
+            "Input should be 'rquant.signal-family.successor'",
+        ),
+        ("bundle", "schema_version", 2, "unsupported successor bundle schema version"),
+        (
+            "overlay",
+            "overlay_namespace",
+            "rquant.signal-family.successor",
+            "Input should be 'rquant.signal-family.overlay'",
+        ),
+        ("overlay", "overlay_version", 2, "unsupported overlay bundle version"),
     ),
 )
-def test_wrong_namespace_or_version_rejects(form: str, field: str, value: Any) -> None:
+def test_wrong_namespace_or_version_rejects(
+    form: str,
+    field: str,
+    value: Any,
+    reason: str,
+) -> None:
     payload, decode = _raw_forms()[form]
     decoded = _decoded(payload)
     decoded[field] = value
-    with pytest.raises(REJECTIONS):
-        decode(_recanonical(decoded))
+    with pytest.raises(REJECTIONS, match=reason):
+        decode(_rehashed(form, decoded))
 
 
 # --------------------------------------------------------------------------------------
@@ -382,11 +425,11 @@ def test_canonical_bytes_serializers_require_the_exact_model() -> None:
         pass
 
     subclass = _BundleSubclass.model_construct(**dict(bundle))
-    with pytest.raises(REJECTIONS):
+    with pytest.raises(TypeError, match="requires an exact SuccessorBundleV1 object"):
         successor.successor_bundle_canonical_json_bytes(subclass)
-    with pytest.raises(REJECTIONS):
+    with pytest.raises(TypeError, match="requires an exact SuccessorChannelV1 object"):
         successor.successor_channel_canonical_json_bytes(bundle)  # type: ignore[arg-type]
-    with pytest.raises(REJECTIONS):
+    with pytest.raises(TypeError, match="requires an exact OverlayBundleV1 object"):
         successor.overlay_bundle_canonical_json_bytes(bundle)  # type: ignore[arg-type]
 
 
@@ -397,9 +440,9 @@ def test_canonical_bytes_serializers_require_the_exact_model() -> None:
 
 @pytest.mark.parametrize("form", ("channel", "bundle", "declaration", "overlay"))
 @pytest.mark.parametrize("mutator", NONCANONICAL_MUTATORS, ids=lambda item: item[0])
-def test_noncanonical_representations_reject(form: str, mutator: tuple[str, Any]) -> None:
+def test_noncanonical_representations_reject(form: str, mutator: tuple[str, Any, str]) -> None:
     payload, decode = _raw_forms()[form]
-    with pytest.raises(REJECTIONS):
+    with pytest.raises(REJECTIONS, match=mutator[2]):
         decode(mutator[1](payload))
 
 
@@ -408,8 +451,8 @@ def test_extra_keys_reject(form: str) -> None:
     payload, decode = _raw_forms()[form]
     decoded = _decoded(payload)
     decoded["unexpected_field"] = "x"
-    with pytest.raises(REJECTIONS):
-        decode(_recanonical(decoded))
+    with pytest.raises(REJECTIONS, match=_EXTRA_KEY):
+        decode(_rehashed(form, decoded))
 
 
 @pytest.mark.parametrize("form", ("channel", "bundle", "declaration", "overlay"))
@@ -418,39 +461,39 @@ def test_aliased_field_names_reject(form: str) -> None:
     decoded = _decoded(payload)
     first = sorted(decoded)[0]
     decoded["".join(part.capitalize() for part in first.split("_"))] = decoded.pop(first)
-    with pytest.raises(REJECTIONS):
+    with pytest.raises(REJECTIONS, match=_EXTRA_KEY):
         decode(_recanonical(decoded))
 
 
 @pytest.mark.parametrize("form", ("channel", "bundle", "declaration", "overlay"))
-def test_non_object_payloads_reject(form: str) -> None:
+@pytest.mark.parametrize("payload", (b"[]", b'"x"', b"1", b"null"))
+def test_non_object_payloads_reject(form: str, payload: bytes) -> None:
     _, decode = _raw_forms()[form]
-    for payload in (b"[]", b'"x"', b"1", b"null"):
-        with pytest.raises(REJECTIONS):
-            decode(payload)
+    with pytest.raises(REJECTIONS, match=_NOT_AN_OBJECT):
+        decode(payload)
 
 
 @pytest.mark.parametrize(
-    ("form", "field", "value"),
+    ("form", "field", "value", "reason"),
     (
-        ("channel", "channel_id", 1),
-        ("channel", "declaration_schema_fingerprint", 0),
-        ("channel", "producer_service_ids", "signal-router"),
-        ("bundle", "schema_version", "1"),
-        ("bundle", "schema_version", 1.0),
-        ("bundle", "channels", {}),
-        ("declaration", "pair_ids", "strategy-router"),
-        ("declaration", "base_bundle_content_hash", 0),
-        ("overlay", "overlay_version", "1"),
-        ("overlay", "declarations", {}),
+        ("channel", "channel_id", 1, "Input should be a valid string"),
+        ("channel", "declaration_schema_fingerprint", 0, "Input should be a valid string"),
+        ("channel", "producer_service_ids", "signal-router", "must be a JSON array"),
+        ("bundle", "schema_version", "1", "Input should be a valid integer"),
+        ("bundle", "schema_version", 1.0, "Input should be a valid integer"),
+        ("bundle", "channels", {}, "channels must be a JSON array"),
+        ("declaration", "pair_ids", "strategy-router", "must be a JSON array"),
+        ("declaration", "base_bundle_content_hash", 0, "Input should be a valid string"),
+        ("overlay", "overlay_version", "1", "Input should be a valid integer"),
+        ("overlay", "declarations", {}, "declarations must be a JSON array"),
     ),
 )
-def test_coerced_scalar_types_reject(form: str, field: str, value: Any) -> None:
+def test_coerced_scalar_types_reject(form: str, field: str, value: Any, reason: str) -> None:
     payload, decode = _raw_forms()[form]
     decoded = _decoded(payload)
     decoded[field] = value
-    with pytest.raises(REJECTIONS):
-        decode(_recanonical(decoded))
+    with pytest.raises(REJECTIONS, match=reason):
+        decode(_rehashed(form, decoded))
 
 
 @pytest.mark.parametrize(
@@ -461,8 +504,8 @@ def test_booleans_are_not_accepted_as_integers(form: str, field: str) -> None:
     payload, decode = _raw_forms()[form]
     decoded = _decoded(payload)
     decoded[field] = True
-    with pytest.raises(REJECTIONS):
-        decode(_recanonical(decoded))
+    with pytest.raises(REJECTIONS, match="Input should be a valid integer"):
+        decode(_rehashed(form, decoded))
 
 
 def test_mappings_or_subclasses_cannot_replace_the_exact_nested_models() -> None:
@@ -475,20 +518,22 @@ def test_mappings_or_subclasses_cannot_replace_the_exact_nested_models() -> None
     class _DeclarationSubclass(successor.OverlayDeclarationV1):
         pass
 
+    channel_reason = "channels requires an exact SuccessorChannelV1 object"
+    declaration_reason = "declarations requires an exact OverlayDeclarationV1 object"
     channel_mapping = MappingProxyType(bundle.channels[0].model_dump(mode="json"))
-    with pytest.raises(REJECTIONS):
+    with pytest.raises(TypeError, match=channel_reason):
         successor.SuccessorBundleV1.create(channels=(channel_mapping,))  # type: ignore[arg-type]
-    with pytest.raises(REJECTIONS):
+    with pytest.raises(TypeError, match=channel_reason):
         successor.SuccessorBundleV1.create(
             channels=(_ChannelSubclass.model_construct(**dict(bundle.channels[0])),)
         )
     declaration_mapping = MappingProxyType(overlay.declarations[0].model_dump(mode="json"))
-    with pytest.raises(REJECTIONS):
+    with pytest.raises(TypeError, match=declaration_reason):
         successor.OverlayBundleV1.create(
             base_bundle_content_hash=bundle.content_hash,
             declarations=(declaration_mapping,),  # type: ignore[arg-type]
         )
-    with pytest.raises(REJECTIONS):
+    with pytest.raises(TypeError, match=declaration_reason):
         successor.OverlayBundleV1.create(
             base_bundle_content_hash=bundle.content_hash,
             declarations=(_DeclarationSubclass.model_construct(**dict(overlay.declarations[0])),),
@@ -496,70 +541,130 @@ def test_mappings_or_subclasses_cannot_replace_the_exact_nested_models() -> None
 
 
 @pytest.mark.parametrize(
-    ("form", "field"),
+    ("form", "field", "reason"),
     (
-        ("channel", "producer_service_ids"),
-        ("channel", "consumer_service_ids"),
-        ("declaration", "pair_ids"),
-        ("bundle", "channels"),
-        ("overlay", "declarations"),
+        (
+            "channel",
+            "producer_service_ids",
+            "producer_service_ids must be sorted and duplicate-free",
+        ),
+        (
+            "channel",
+            "consumer_service_ids",
+            "consumer_service_ids must be sorted and duplicate-free",
+        ),
+        ("declaration", "pair_ids", "pair_ids must be sorted and duplicate-free"),
+        (
+            "declaration",
+            "accepted_family_ids",
+            "accepted_family_ids must be sorted and duplicate-free",
+        ),
+        ("bundle", "channels", "successor bundle channels must be sorted and duplicate-free"),
+        ("overlay", "declarations", "overlay declarations must be sorted and duplicate-free"),
     ),
 )
-def test_unsorted_and_duplicated_tuple_variants_reject(form: str, field: str) -> None:
+def test_duplicated_tuple_variants_reject_for_the_duplicate_rule(
+    form: str,
+    field: str,
+    reason: str,
+) -> None:
+    """A repeated entry must fail the sort/duplicate rule, not a stale hash."""
+
+    payload, decode = _raw_forms()[form]
+    decoded = _decoded(payload)
+    items = decoded[field]
+    decoded[field] = [items[0], items[0]]
+    with pytest.raises(REJECTIONS, match=reason):
+        decode(_rehashed(form, decoded))
+
+
+@pytest.mark.parametrize(
+    ("form", "field", "reason"),
+    (
+        (
+            "channel",
+            "producer_service_ids",
+            "producer_service_ids must be sorted and duplicate-free",
+        ),
+        (
+            "channel",
+            "consumer_service_ids",
+            "consumer_service_ids must be sorted and duplicate-free",
+        ),
+        ("declaration", "pair_ids", "pair_ids must be sorted and duplicate-free"),
+        ("bundle", "channels", "successor bundle channels must be sorted and duplicate-free"),
+        ("overlay", "declarations", "overlay declarations must be sorted and duplicate-free"),
+    ),
+)
+def test_unsorted_tuple_variants_reject_for_the_order_rule(
+    form: str,
+    field: str,
+    reason: str,
+) -> None:
+    """A reversed but otherwise self-consistent payload must fail on order alone."""
+
     payload, decode = _raw_forms()[form]
     decoded = _decoded(payload)
     items = decoded[field]
     assert len(items) >= 2, f"{form}.{field} fixture must carry at least two entries"
     decoded[field] = list(reversed(items))
-    with pytest.raises(REJECTIONS):
-        decode(_recanonical(decoded))
-    decoded[field] = [items[0], items[0]]
-    with pytest.raises(REJECTIONS):
-        decode(_recanonical(decoded))
-
-
-def test_duplicate_accepted_family_ids_reject() -> None:
-    payload, decode = _raw_forms()["declaration"]
-    decoded = _decoded(payload)
-    decoded["accepted_family_ids"] = [CURRENT_ENVELOPE_SCHEMA, CURRENT_ENVELOPE_SCHEMA]
-    with pytest.raises(REJECTIONS):
-        decode(_recanonical(decoded))
+    reversed_bytes = _rehashed(form, decoded)
+    # The reversed payload is byte-canonical and hash-consistent: only order is wrong.
+    assert json.loads(reversed_bytes)[_HASH_FIELD[form]] != _decoded(payload)[_HASH_FIELD[form]]
+    with pytest.raises(REJECTIONS, match=reason):
+        decode(reversed_bytes)
 
 
 @pytest.mark.parametrize(
-    ("form", "field"),
+    ("form", "field", "reason"),
     (
-        ("channel", "producer_service_ids"),
-        ("channel", "consumer_service_ids"),
-        ("declaration", "pair_ids"),
-        ("declaration", "accepted_family_ids"),
-        ("bundle", "channels"),
-        ("overlay", "declarations"),
+        ("channel", "producer_service_ids", "producer_service_ids must be nonempty"),
+        ("channel", "consumer_service_ids", "consumer_service_ids must be nonempty"),
+        ("declaration", "pair_ids", "pair_ids must be nonempty"),
+        ("declaration", "accepted_family_ids", "accepted_family_ids must be nonempty"),
+        ("bundle", "channels", "successor bundle must declare at least one channel"),
+        ("overlay", "declarations", "overlay bundle must declare at least one channel"),
     ),
 )
-def test_empty_tuple_fields_reject(form: str, field: str) -> None:
+def test_empty_tuple_fields_reject(form: str, field: str, reason: str) -> None:
     payload, decode = _raw_forms()[form]
     decoded = _decoded(payload)
     decoded[field] = []
-    with pytest.raises(REJECTIONS):
-        decode(_recanonical(decoded))
+    with pytest.raises(REJECTIONS, match=reason):
+        decode(_rehashed(form, decoded))
 
 
 @pytest.mark.parametrize(
-    ("form", "field"),
+    ("form", "field", "reason"),
     (
-        ("channel", "model_descriptor_hash"),
-        ("channel", "channel_hash"),
-        ("bundle", "content_hash"),
-        ("declaration", "declaration_hash"),
-        ("overlay", "content_hash"),
+        (
+            "channel",
+            "model_descriptor_hash",
+            "successor channel descriptor hash does not match its preimage",
+        ),
+        ("channel", "channel_hash", "successor channel hash does not match its canonical content"),
+        (
+            "bundle",
+            "content_hash",
+            "successor bundle content hash does not match its canonical content",
+        ),
+        (
+            "declaration",
+            "declaration_hash",
+            "overlay declaration hash does not match its canonical content",
+        ),
+        (
+            "overlay",
+            "content_hash",
+            "overlay bundle content hash does not match its canonical content",
+        ),
     ),
 )
-def test_hash_mismatch_rejects(form: str, field: str) -> None:
+def test_hash_mismatch_rejects(form: str, field: str, reason: str) -> None:
     payload, decode = _raw_forms()[form]
     decoded = _decoded(payload)
     decoded[field] = "f" * 64
-    with pytest.raises(REJECTIONS):
+    with pytest.raises(REJECTIONS, match=reason):
         decode(_recanonical(decoded))
 
 
@@ -572,13 +677,13 @@ def test_hash_mismatch_rejects(form: str, field: str) -> None:
         ("overlay", "content_hash"),
     ),
 )
-def test_non_lowercase_hex_digests_reject(form: str, field: str) -> None:
+@pytest.mark.parametrize("value", ("F" * 64, "f" * 63, "f" * 65, ""))
+def test_non_lowercase_hex_digests_reject(form: str, field: str, value: str) -> None:
     payload, decode = _raw_forms()[form]
     decoded = _decoded(payload)
-    for value in ("F" * 64, "f" * 63, "f" * 65, ""):
-        decoded[field] = value
-        with pytest.raises(REJECTIONS):
-            decode(_recanonical(decoded))
+    decoded[field] = value
+    with pytest.raises(REJECTIONS, match="String should match pattern"):
+        decode(_recanonical(decoded))
 
 
 @pytest.mark.parametrize("form", ("channel", "declaration"))
@@ -586,16 +691,22 @@ def test_unknown_channel_rejects(form: str) -> None:
     payload, decode = _raw_forms()[form]
     decoded = _decoded(payload)
     decoded["channel_id"] = "runtime.strategy_signal.envelope"
-    with pytest.raises(REJECTIONS):
-        decode(_recanonical(decoded))
+    with pytest.raises(
+        REJECTIONS,
+        match="unknown successor transport channel: runtime.strategy_signal.envelope",
+    ):
+        decode(_rehashed(form, decoded))
 
 
 def test_channel_payload_model_must_match_its_frozen_binding() -> None:
     payload, decode = _raw_forms()["channel"]
     decoded = _decoded(payload)
     decoded["payload_model"] = "rquant.signal_contracts.CurrentSignalEnvelope"
-    with pytest.raises(REJECTIONS):
-        decode(_recanonical(decoded))
+    with pytest.raises(
+        REJECTIONS,
+        match="successor channel payload model is not its frozen binding",
+    ):
+        decode(_rehashed("channel", decoded))
 
 
 def test_bundle_and_declaration_schemas_do_not_accept_each_other_fields() -> None:
@@ -605,21 +716,21 @@ def test_bundle_and_declaration_schemas_do_not_accept_each_other_fields() -> Non
     declaration_payload = _decoded(
         successor.overlay_declaration_canonical_json_bytes(overlay.declarations[0])
     )
-    with pytest.raises(REJECTIONS):
+    with pytest.raises(REJECTIONS, match=_EXTRA_KEY):
         successor.OverlayDeclarationV1.from_canonical_json(_recanonical(bundle_payload))
-    with pytest.raises(REJECTIONS):
+    with pytest.raises(REJECTIONS, match=_EXTRA_KEY):
         successor.SuccessorBundleV1.from_canonical_json(
             _recanonical(declaration_payload), closure=_closure()
         )
-    with pytest.raises(REJECTIONS):
+    with pytest.raises(REJECTIONS, match=_EXTRA_KEY):
         successor.OverlayBundleV1.from_canonical_json(_recanonical(bundle_payload))
-    with pytest.raises(REJECTIONS):
+    with pytest.raises(REJECTIONS, match=_EXTRA_KEY):
         successor.SuccessorChannelV1.from_canonical_json(
             _recanonical(declaration_payload), closure=_closure()
         )
     merged = dict(declaration_payload)
     merged["schema_version"] = 1
-    with pytest.raises(REJECTIONS):
+    with pytest.raises(REJECTIONS, match=_EXTRA_KEY):
         successor.OverlayDeclarationV1.from_canonical_json(_recanonical(merged))
 
 
@@ -644,8 +755,8 @@ def test_overlay_declaration_cannot_carry_base_only_or_new_fields(field: str) ->
     payload, decode = _raw_forms()["declaration"]
     decoded = _decoded(payload)
     decoded[field] = ["x"] if field.endswith("_ids") else "x"
-    with pytest.raises(REJECTIONS):
-        decode(_recanonical(decoded))
+    with pytest.raises(REJECTIONS, match=_EXTRA_KEY):
+        decode(_rehashed("declaration", decoded))
 
 
 def test_overlay_cannot_bind_a_channel_absent_from_its_base() -> None:
@@ -664,22 +775,34 @@ def test_overlay_cannot_bind_a_channel_absent_from_its_base() -> None:
             ),
         ),
     )
-    with pytest.raises(REJECTIONS):
+    with pytest.raises(
+        REJECTIONS,
+        match="channel is absent from the successor base: signal-route-spool-record/current",
+    ):
         registry.stage_overlay(successor.overlay_bundle_canonical_json_bytes(stray))
     assert registry.staged_overlay() is None
     assert records == []
 
 
 @pytest.mark.parametrize(
-    "field",
+    ("field", "reason"),
     (
-        "base_bundle_content_hash",
-        "base_declaration_fingerprint",
-        "base_physical_fingerprint",
-        "model_descriptor_hash",
+        (
+            "base_bundle_content_hash",
+            "overlay declaration names a different successor base bundle",
+        ),
+        (
+            "base_declaration_fingerprint",
+            "overlay declaration descriptor hash does not match its base",
+        ),
+        (
+            "base_physical_fingerprint",
+            "overlay declaration descriptor hash does not match its base",
+        ),
+        ("model_descriptor_hash", "overlay declaration descriptor hash does not match its base"),
     ),
 )
-def test_overlay_declaration_rebinding_a_base_hash_rejects(field: str) -> None:
+def test_overlay_declaration_rebinding_a_base_hash_rejects(field: str, reason: str) -> None:
     registry, _ = _registry()
     bundle = _bundle()
     registry.register_successor_bundle(successor.successor_bundle_canonical_json_bytes(bundle))
@@ -690,17 +813,55 @@ def test_overlay_declaration_rebinding_a_base_hash_rejects(field: str) -> None:
     declaration.pop("declaration_hash")
     declaration["declaration_hash"] = successor._canonical_sha256(declaration)
     decoded["declarations"] = [declaration, *decoded["declarations"][1:]]
-    decoded.pop("content_hash")
-    decoded["content_hash"] = successor._canonical_sha256(decoded)
-    with pytest.raises(REJECTIONS):
-        registry.stage_overlay(_recanonical(decoded))
+    with pytest.raises(REJECTIONS, match=reason):
+        registry.stage_overlay(_rehashed("overlay", decoded))
     assert registry.staged_overlay() is None
+
+
+def test_a_self_consistent_declaration_for_another_generation_fails_the_base_binding() -> None:
+    """Only the registry can catch a declaration that is valid but binds other bytes."""
+
+    registry, records = _registry()
+    bundle = _bundle()
+    registry.register_successor_bundle(successor.successor_bundle_canonical_json_bytes(bundle))
+    foreign_channel = _channel(
+        "signal-envelope/current",
+        closure=_closure(producer_commit=OTHER_PRODUCER_COMMIT),
+    )
+    assert (
+        foreign_channel.declaration_schema_fingerprint
+        != bundle.channel("signal-envelope/current").declaration_schema_fingerprint
+    )
+    foreign = successor.OverlayBundleV1.create(
+        base_bundle_content_hash=bundle.content_hash,
+        declarations=(
+            successor.OverlayDeclarationV1.create(
+                channel=foreign_channel,
+                base_bundle_content_hash=bundle.content_hash,
+                accepted_family_ids=successor.ACCEPTED_FAMILY_IDS,
+                pair_ids=("strategy-router",),
+            ),
+        ),
+    )
+    raw = successor.overlay_bundle_canonical_json_bytes(foreign)
+    # The declaration decodes on its own; only the base binding rejects it.
+    assert successor.OverlayBundleV1.from_canonical_json(raw) == foreign
+    with pytest.raises(
+        REJECTIONS,
+        match="overlay declaration does not bind its base channel: signal-envelope/current",
+    ):
+        registry.stage_overlay(raw)
+    assert registry.staged_overlay() is None
+    assert records == []
 
 
 def test_overlay_cannot_accept_a_legacy_or_unknown_family() -> None:
     bundle = _bundle()
     for family in ("rquant.signal-envelope/v0", "legacy", "runtime.strategy_signal.envelope"):
-        with pytest.raises(REJECTIONS):
+        with pytest.raises(
+            REJECTIONS,
+            match="overlay declaration accepts a family absent from the current family",
+        ):
             _declaration(bundle, "signal-envelope/current", accepted_family_ids=(family,))
 
 
@@ -720,9 +881,9 @@ def test_pair_ids_are_the_frozen_five_and_accept_only_sorted_subsets() -> None:
     bundle = _bundle()
     assert _declaration(bundle, "signal-envelope/current", pair_ids=("strategy-router",))
     assert _declaration(bundle, "signal-envelope/current", pair_ids=successor.PAIR_IDS)
-    with pytest.raises(REJECTIONS):
+    with pytest.raises(REJECTIONS, match="overlay declaration binds an unknown pair id"):
         _declaration(bundle, "signal-envelope/current", pair_ids=("strategy-live",))
-    with pytest.raises(REJECTIONS):
+    with pytest.raises(REJECTIONS, match="pair_ids must be sorted and duplicate-free"):
         _declaration(
             bundle,
             "signal-envelope/current",
@@ -761,13 +922,21 @@ def test_successor_channel_ids_are_disjoint_from_the_v2_catalog() -> None:
 
 
 def test_channel_id_and_payload_model_must_match_the_frozen_binding() -> None:
-    with pytest.raises(REJECTIONS):
+    with pytest.raises(
+        REJECTIONS,
+        match="channel signal-envelope/current is bound to "
+        "rquant.signal_contracts.CurrentSignalEnvelope, not "
+        "rquant.signal_route_spool.CurrentSignalRouteSpoolRecord",
+    ):
         successor.resolve_successor_channel_descriptor(
             "signal-envelope/current",
             "rquant.signal_route_spool.CurrentSignalRouteSpoolRecord",
             closure=_closure(),
         )
-    with pytest.raises(REJECTIONS):
+    with pytest.raises(
+        REJECTIONS,
+        match="unknown successor transport channel: runtime.strategy_signal.envelope",
+    ):
         successor.resolve_successor_channel_descriptor(
             "runtime.strategy_signal.envelope",
             "rquant.signal_contracts.SignalEnvelope",
@@ -776,33 +945,55 @@ def test_channel_id_and_payload_model_must_match_the_frozen_binding() -> None:
 
 
 @pytest.mark.parametrize(
-    "qualname",
+    ("qualname", "reason"),
     (
-        "rquant.signal_contracts.FutureCurrentSignalEnvelope",
-        "rquant.signal_family_future_module.CurrentSignalEnvelope",
-        "rquant.signal_contracts.CurrentSignalEnvelope.Future",
-        "rquant.signal_contracts.parse_signal_envelope",
-        "rquant.signal_contracts.CURRENT_ENVELOPE_SCHEMA",
-        "rquant.signal_contracts.LegacySignalEnvelope",
-        "CurrentSignalEnvelope",
-        "",
+        (
+            "rquant.signal_contracts.FutureCurrentSignalEnvelope",
+            "payload_model does not resolve to a declared class",
+        ),
+        (
+            "rquant.signal_family_future_module.CurrentSignalEnvelope",
+            "payload_model does not resolve to a declared class",
+        ),
+        (
+            "rquant.signal_contracts.CurrentSignalEnvelope.Future",
+            "payload_model does not resolve to a declared class",
+        ),
+        (
+            "rquant.signal_contracts.parse_signal_envelope",
+            "payload_model must name a declared payload class",
+        ),
+        (
+            "rquant.signal_contracts.CURRENT_ENVELOPE_SCHEMA",
+            "payload_model must name a declared payload class",
+        ),
+        (
+            "rquant.signal_contracts.LegacySignalEnvelope",
+            "payload_model is an alias for rquant.signal_contracts.SignalEnvelope",
+        ),
+        ("CurrentSignalEnvelope", "payload_model is not a qualified name"),
+        ("", "payload_model must be a nonempty string"),
     ),
 )
-def test_missing_future_or_unresolvable_payload_models_reject(qualname: str) -> None:
-    with pytest.raises(REJECTIONS):
+def test_missing_future_or_unresolvable_payload_models_reject(qualname: str, reason: str) -> None:
+    with pytest.raises(REJECTIONS, match=reason):
         successor.resolve_payload_model(qualname, closure=_closure())
 
 
 def test_payload_model_outside_the_generation_source_closure_rejects() -> None:
     narrow = _closure(frozenset({"src/rquant/signal_contracts.py"}))
+    reason = (
+        "payload_model is not covered by the generation source closure: "
+        "src/rquant/signal_route_spool.py"
+    )
     assert successor.resolve_payload_model(
         "rquant.signal_contracts.CurrentSignalEnvelope", closure=narrow
     )
-    with pytest.raises(REJECTIONS):
+    with pytest.raises(REJECTIONS, match=reason):
         successor.resolve_payload_model(
             "rquant.signal_route_spool.CurrentSignalBusRoutedRecord", closure=narrow
         )
-    with pytest.raises(REJECTIONS):
+    with pytest.raises(REJECTIONS, match=reason):
         successor.SuccessorChannelV1.create(
             "signal-route-spool-record/current",
             producer_service_ids=("signal-router",),
@@ -831,7 +1022,11 @@ def test_a_descriptor_computed_from_a_qualname_alone_rejects() -> None:
         }
     )
     values["channel_hash"] = successor._canonical_sha256(values)
-    with pytest.raises(REJECTIONS):
+    with pytest.raises(
+        REJECTIONS,
+        match="successor channel descriptor does not match the actual model: "
+        "signal-envelope/current",
+    ):
         successor.SuccessorChannelV1.from_canonical_json(_recanonical(values), closure=_closure())
 
 
@@ -861,10 +1056,7 @@ def test_a_different_producer_commit_changes_the_declaration_fingerprint() -> No
     other = successor.resolve_successor_channel_descriptor(
         "signal-envelope/current",
         successor.SUCCESSOR_CHANNEL_BINDINGS["signal-envelope/current"],
-        closure=successor.SuccessorGenerationSourceClosureV1(
-            producer_commit="b" * 40,
-            source_closure=CLOSURE_FILES,
-        ),
+        closure=_closure(producer_commit=OTHER_PRODUCER_COMMIT),
     )
     assert first.declaration_schema_fingerprint != other.declaration_schema_fingerprint
     assert first.physical_schema_fingerprint == other.physical_schema_fingerprint
@@ -888,7 +1080,10 @@ def test_absent_overlay_grants_nothing() -> None:
 def test_overlay_before_its_successor_bundle_rejects() -> None:
     registry, records = _registry()
     overlay = _overlay(_bundle())
-    with pytest.raises(REJECTIONS):
+    with pytest.raises(
+        REJECTIONS,
+        match="an overlay cannot be staged before its successor bundle is registered",
+    ):
         registry.stage_overlay(successor.overlay_bundle_canonical_json_bytes(overlay))
     assert registry.staged_overlay() is None
     assert records == []
@@ -951,7 +1146,10 @@ def test_conflicting_bundle_identity_appends_audit_and_rejects() -> None:
         _channel("signal-route-spool-record/current"),
     )
     second = _bundle(channels=divergent_channels)
-    with pytest.raises(REJECTIONS):
+    with pytest.raises(
+        successor.SuccessorConflictError,
+        match="a different successor bundle is already registered for this identity",
+    ):
         registry.register_successor_bundle(successor.successor_bundle_canonical_json_bytes(second))
     assert registry.successor_bundle() == first
     assert [record.identity_kind for record in records] == ["bundle", "channel"]
@@ -976,7 +1174,10 @@ def test_conflicting_overlay_identity_appends_audit_and_rejects() -> None:
             for channel in bundle.channels
         ),
     )
-    with pytest.raises(REJECTIONS):
+    with pytest.raises(
+        successor.SuccessorConflictError,
+        match="a different overlay is already staged for this successor base",
+    ):
         registry.stage_overlay(successor.overlay_bundle_canonical_json_bytes(divergent))
     assert registry.staged_overlay() == staged
     assert [record.identity_kind for record in records] == [
@@ -1008,7 +1209,7 @@ def test_conflict_audit_records_are_bounded_identifiers_only() -> None:
     dumped = record.model_dump(mode="json")
     assert set(dumped) == {"identity_kind", "identity", "existing_hash", "attempted_hash"}
     assert all(isinstance(value, str) for value in dumped.values())
-    with pytest.raises(REJECTIONS):
+    with pytest.raises(REJECTIONS, match="Input should be 'bundle', 'channel'"):
         successor.SuccessorConflictAuditRecordV1(
             identity_kind="payload",
             identity="x",
@@ -1022,7 +1223,10 @@ def test_registry_rejects_an_unknown_base_bundle_hash() -> None:
     bundle = _bundle()
     other = _bundle(channels=(_channel("signal-envelope/current"),))
     registry.register_successor_bundle(successor.successor_bundle_canonical_json_bytes(bundle))
-    with pytest.raises(REJECTIONS):
+    with pytest.raises(
+        REJECTIONS,
+        match="the staged overlay does not name the registered successor bundle",
+    ):
         registry.stage_overlay(successor.overlay_bundle_canonical_json_bytes(_overlay(other)))
     assert registry.staged_overlay() is None
     assert records == []
@@ -1039,7 +1243,10 @@ def test_registry_rejects_a_bundle_whose_model_is_outside_the_injected_closure()
         closure=_closure(frozenset({"src/rquant/signal_contracts.py"})),
         audit_sink=_ListSink(),
     )
-    with pytest.raises(REJECTIONS):
+    with pytest.raises(
+        successor.SuccessorRegistryError,
+        match="payload_model is not covered by the generation source closure",
+    ):
         narrow.register_successor_bundle(successor.successor_bundle_canonical_json_bytes(_bundle()))
     assert narrow.successor_bundle() is None
     assert records == []
