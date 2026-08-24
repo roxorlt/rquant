@@ -408,6 +408,7 @@ CRASH_MATRIX_EXPECTATIONS: dict[str, dict[str, object]] = {
         "prefixes": ((1,),),
         "orphans": ((),),
         "temporaries": 1,
+        "durable_temporaries": 0,
         "pointer_temp_staged": False,
         "durable": (1,),
     },
@@ -416,6 +417,7 @@ CRASH_MATRIX_EXPECTATIONS: dict[str, dict[str, object]] = {
         "prefixes": ((1,),),
         "orphans": ((),),
         "temporaries": 1,
+        "durable_temporaries": 1,
         "pointer_temp_staged": False,
         "durable": (1,),
     },
@@ -424,6 +426,7 @@ CRASH_MATRIX_EXPECTATIONS: dict[str, dict[str, object]] = {
         "prefixes": ((1,),),
         "orphans": ((2,),),
         "temporaries": 0,
+        "durable_temporaries": 0,
         "pointer_temp_staged": False,
         "durable": (1,),
     },
@@ -432,6 +435,7 @@ CRASH_MATRIX_EXPECTATIONS: dict[str, dict[str, object]] = {
         "prefixes": ((1,),),
         "orphans": ((2,),),
         "temporaries": 0,
+        "durable_temporaries": 0,
         "pointer_temp_staged": False,
         "durable": (1, 2),
     },
@@ -440,6 +444,7 @@ CRASH_MATRIX_EXPECTATIONS: dict[str, dict[str, object]] = {
         "prefixes": ((1,),),
         "orphans": ((2,),),
         "temporaries": 0,
+        "durable_temporaries": 0,
         "pointer_temp_staged": True,
         "durable": (1, 2),
     },
@@ -448,6 +453,7 @@ CRASH_MATRIX_EXPECTATIONS: dict[str, dict[str, object]] = {
         "prefixes": ((1,),),
         "orphans": ((2,),),
         "temporaries": 0,
+        "durable_temporaries": 0,
         "pointer_temp_staged": True,
         "durable": (1, 2),
     },
@@ -456,6 +462,7 @@ CRASH_MATRIX_EXPECTATIONS: dict[str, dict[str, object]] = {
         "prefixes": ((1,), (1, 2)),
         "orphans": ((2,), ()),
         "temporaries": 0,
+        "durable_temporaries": 0,
         "pointer_temp_staged": False,
         "durable": (1, 2),
     },
@@ -464,6 +471,7 @@ CRASH_MATRIX_EXPECTATIONS: dict[str, dict[str, object]] = {
         "prefixes": ((1, 2),),
         "orphans": ((),),
         "temporaries": 0,
+        "durable_temporaries": 0,
         "pointer_temp_staged": False,
         "durable": (1, 2),
     },
@@ -512,6 +520,8 @@ def test_synthetic_crash_matrix_recovers_every_frozen_durability_boundary(
         observation.orphan_sequences for observation in outcome.observations
     ) == expected["orphans"]
     assert len(outcome.ignored_temporary_names) == expected["temporaries"]
+    assert len(outcome.durable_temporary_names) == expected["durable_temporaries"]
+    assert set(outcome.durable_temporary_names) <= set(outcome.ignored_temporary_names)
     assert (model.pointer_temp is not None) is expected["pointer_temp_staged"]
     assert outcome.durable_sequences == expected["durable"]
     assert outcome.conflict_audit == ()
@@ -626,6 +636,38 @@ def test_a_record_temporary_retry_reuses_only_byte_identical_content(dialect: st
 
 
 @pytest.mark.parametrize("dialect", SPOOL_DIALECTS)
+def test_a_record_temporary_retry_cannot_reuse_content_before_its_fsync(dialect: str) -> None:
+    """L563 binds reuse to crash point 2: an unfsynced temporary is not reusable."""
+
+    model = _model_at_first_pointer(dialect)
+    drive_publication(
+        model,
+        images=MATRIX_IMAGES[1:2],
+        pointer=POINTER_AT_SECOND,
+        crash_point="record-temporary-write",
+    )
+    first_temporary = tuple(model.temporaries)[0]
+    assert model.recover().durable_temporary_names == ()
+
+    reused = model.retry_record_temporary(MATRIX_IMAGES[1])
+
+    assert reused != first_temporary
+    assert sorted(model.temporaries) == sorted((first_temporary, reused))
+    assert model.recover().durable_temporary_names == ()
+
+    model.fsync_record_temporary(2)
+    outcome = model.recover()
+
+    assert outcome.durable_temporary_names == (reused,)
+    assert first_temporary not in outcome.durable_temporary_names
+    if dialect == CURRENT_SPEC_DIALECT:
+        assert model.retry_record_temporary(MATRIX_IMAGES[1]) == reused
+    else:
+        assert model.retry_record_temporary(MATRIX_IMAGES[1]) != reused
+    assert model.recover().admissible_pointers == (POINTER_AT_FIRST,)
+
+
+@pytest.mark.parametrize("dialect", SPOOL_DIALECTS)
 def test_conflicting_record_bytes_reject_before_any_pointer_mutation(dialect: str) -> None:
     model = _model_at_first_pointer(dialect)
     drive_publication(
@@ -717,6 +759,40 @@ def test_hardened_publication_contract_refsyncs_records_before_pointer_work() ->
     assert model.recover().observations[0].verified_prefix == (1, 2)
 
 
+def test_hardened_publication_contract_blocks_a_retry_before_the_first_directory_fsync() -> (
+    None
+):
+    """L582-583 literal window: crash between immutable link and records-directory fsync."""
+
+    model = _model_at_first_pointer(CURRENT_SPEC_DIALECT)
+    drive_publication(
+        model,
+        images=MATRIX_IMAGES[1:2],
+        pointer=POINTER_AT_SECOND,
+        crash_point="immutable-record-link",
+    )
+    assert record_name(2) in model.linked_names
+    assert record_name(2) not in model.records_dir_fsynced
+    assert model.recover().durable_sequences == (1,)
+
+    model.stage_record_temporary(MATRIX_IMAGES[1])
+    model.link_record(2)
+
+    assert record_name(2) not in model.records_dir_fsynced
+    with pytest.raises(SyntheticSpoolRecoveryError, match="records directory must be fsynced"):
+        model.stage_pointer_temporary(POINTER_AT_SECOND)
+    assert model.pointer_temp is None
+    assert model.pointer_visible == POINTER_AT_FIRST
+    assert model.root_fsynced is True
+    assert model.conflict_audit == []
+
+    model.fsync_records_directory()
+    model.stage_pointer_temporary(POINTER_AT_SECOND)
+
+    assert model.pointer_temp == POINTER_AT_SECOND
+    assert model.recover().durable_sequences == (1, 2)
+
+
 def test_hardened_publication_contract_rejects_differing_bytes_before_pointer_work() -> None:
     model = _model_at_first_pointer(CURRENT_SPEC_DIALECT)
     drive_publication(
@@ -760,31 +836,46 @@ def test_frozen_legacy_immutable_write_skips_the_second_records_directory_fsync(
     assert model.conflict_audit == []
 
 
-def test_frozen_v2_immutable_write_matches_the_observed_dialect(
+# Each proposition is answered twice: once by running the untouched v2 primitives, once
+# by the synthetic model. The frozen v2 dialect answers "no" to all four; the frozen
+# later-writer dialect answers "yes" to all four. That makes the divergence table itself
+# a machine-checked artifact instead of prose.
+FROZEN_V2_DIALECT_FACTS: dict[str, bool] = {
+    "byte_conflict_records_audit_evidence": False,
+    "identical_retry_refsyncs_the_records_directory": False,
+    "pointer_publication_requires_records_directory_durability": False,
+    "retry_reuses_the_existing_temporary_name": False,
+}
+
+
+def _observed_frozen_v2_facts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Bind the frozen-v2-observed dialect to the untouched v2 primitive itself."""
+) -> dict[str, bool]:
+    """Answer every proposition by executing the untouched v2 code, never by reading it."""
 
-    records = tmp_path / "records"
-    records.mkdir()
-    descriptor = os.open(records, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    probe = tmp_path / "primitive"
+    probe.mkdir()
+    descriptor = os.open(probe, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    probe_inode = os.stat(probe).st_ino
     fsynced: list[int] = []
     real_fsync = os.fsync
 
     def counting_fsync(target: int) -> None:
-        fsynced.append(target)
+        fsynced.append(os.fstat(target).st_ino)
         real_fsync(target)
 
+    payload = b'{"probe":1}'
+    monkeypatch.setattr(os, "fsync", counting_fsync)
     try:
-        monkeypatch.setattr(os, "fsync", counting_fsync)
-        payload = b'{"probe":1}'
         spool._immutable_write_at(descriptor, "x.json", payload, label="probe", max_bytes=64)
-        fresh_link = list(fsynced)
+        assert probe_inode in fsynced, "control: a fresh immutable link fsyncs the directory"
+
         fsynced.clear()
         spool._immutable_write_at(descriptor, "x.json", payload, label="probe", max_bytes=64)
-        identical_retry = list(fsynced)
-        before = sorted(path.name for path in records.iterdir())
+        identical_retry_refsyncs = probe_inode in fsynced
+
+        before = sorted(path.name for path in probe.iterdir())
         with pytest.raises(spool.SignalRouteSpoolIntegrityError, match="immutable probe changed"):
             spool._immutable_write_at(
                 descriptor,
@@ -793,13 +884,115 @@ def test_frozen_v2_immutable_write_matches_the_observed_dialect(
                 label="probe",
                 max_bytes=64,
             )
+        conflict_records_audit = sorted(path.name for path in probe.iterdir()) != before
+
+        first = spool._write_temporary_at(descriptor, "y.json", payload)
+        second = spool._write_temporary_at(descriptor, "y.json", payload)
+        retry_reuses_temporary = first == second
+        os.unlink(first, dir_fd=descriptor)
+        os.unlink(second, dir_fd=descriptor)
     finally:
         os.close(descriptor)
 
-    assert descriptor in fresh_link
-    assert descriptor not in identical_retry
-    assert sorted(path.name for path in records.iterdir()) == before == ["x.json"]
-    assert (records / "x.json").read_bytes() == payload
+    # A real publish over a byte-identical pre-existing record: v2 takes the early-return
+    # branch of _immutable_write_at, so the records directory is never fsynced, yet the
+    # visible pointer still advances over that record.
+    root = tmp_path / "gate-spool"
+    donor = tmp_path / "gate-donor"
+    _publish_legacy_records(donor, first=1, last=2)
+    _publish_legacy_records(root, first=1, last=1)
+    orphan_name = spool._SignalRouteSpoolPaths.record_name(2)
+    (root / "records" / orphan_name).write_bytes((donor / "records" / orphan_name).read_bytes())
+    records_inode = os.stat(root / "records").st_ino
+    fsynced.clear()
+    _publish_legacy_records(root, first=2, last=2)
+    publication_fsynced_records = records_inode in fsynced
+    advanced = spool.ReadonlySignalRouteSpool(root).source_descriptor().high_watermark
+
+    assert advanced == 2, "control: the publish must actually expose the pre-existing record"
+    assert (probe / "x.json").read_bytes() == payload
+    return {
+        "byte_conflict_records_audit_evidence": conflict_records_audit,
+        "identical_retry_refsyncs_the_records_directory": identical_retry_refsyncs,
+        "pointer_publication_requires_records_directory_durability": publication_fsynced_records,
+        "retry_reuses_the_existing_temporary_name": retry_reuses_temporary,
+    }
+
+
+def _model_dialect_facts(dialect: str) -> dict[str, bool]:
+    """Answer the same propositions from the synthetic model, in the same shape."""
+
+    refsync_model = _model_at_first_pointer(dialect)
+    drive_publication(
+        refsync_model,
+        images=MATRIX_IMAGES[1:2],
+        pointer=POINTER_AT_SECOND,
+        crash_point="records-directory-fsync",
+    )
+    refsync_model.stage_record_temporary(MATRIX_IMAGES[1])
+    refsync_model.link_record(2)
+
+    audit_model = _model_at_first_pointer(dialect)
+    drive_publication(
+        audit_model,
+        images=MATRIX_IMAGES[1:2],
+        pointer=POINTER_AT_SECOND,
+        crash_point="records-directory-fsync",
+    )
+    audit_model.stage_record_temporary(
+        replace(MATRIX_IMAGES[1], payload=MATRIX_IMAGES[1].payload + b" ")
+    )
+    with pytest.raises(SyntheticSpoolRecoveryError):
+        audit_model.link_record(2)
+
+    retry_model = _model_at_first_pointer(dialect)
+    drive_publication(
+        retry_model,
+        images=MATRIX_IMAGES[1:2],
+        pointer=POINTER_AT_SECOND,
+        crash_point="record-temporary-fsync",
+    )
+    staged = tuple(retry_model.temporaries)[0]
+
+    gate_model = _model_at_first_pointer(dialect)
+    gate_model.stage_record_temporary(MATRIX_IMAGES[1])
+    gate_model.fsync_record_temporary(2)
+    gate_model.link_record(2)
+    try:
+        gate_model.stage_pointer_temporary(POINTER_AT_SECOND)
+    except SyntheticSpoolRecoveryError:
+        publication_requires_durability = True
+    else:
+        publication_requires_durability = False
+
+    return {
+        "byte_conflict_records_audit_evidence": bool(audit_model.conflict_audit),
+        "identical_retry_refsyncs_the_records_directory": (
+            record_name(2) not in refsync_model.records_dir_fsynced
+        ),
+        "pointer_publication_requires_records_directory_durability": (
+            publication_requires_durability
+        ),
+        "retry_reuses_the_existing_temporary_name": (
+            retry_model.retry_record_temporary(MATRIX_IMAGES[1]) == staged
+        ),
+    }
+
+
+def test_frozen_v2_immutable_write_matches_the_observed_dialect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bind both dialects to executed behaviour, and pin their exact divergence."""
+
+    observed = _observed_frozen_v2_facts(tmp_path, monkeypatch)
+
+    assert observed == FROZEN_V2_DIALECT_FACTS
+    assert _model_dialect_facts(FROZEN_LEGACY_DIALECT) == observed
+    assert _model_dialect_facts(CURRENT_SPEC_DIALECT) == dict.fromkeys(
+        FROZEN_V2_DIALECT_FACTS,
+        True,
+    )
 
 
 def _legacy_envelope(seed: str) -> SignalEnvelope:

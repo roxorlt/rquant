@@ -18,11 +18,13 @@ later-writer contract disagree at two boundaries:
     endorsed as spec-compliant.
 
 ``v3-spec``
-    what L582-588 freezes for the separately authorized later writer tranche. A retry
-    may reuse a temporary only for byte-identical content; observing an existing
-    byte-identical target withdraws durability evidence until the records directory is
-    fsynced again; a byte conflict appends conflict audit evidence and rejects before
-    any pointer temporary or visible pointer is created, replaced or fsynced.
+    what L563 and L582-588 freeze for the separately authorized later writer tranche. A
+    retry may reuse a temporary only when that temporary was already fsynced *and* its
+    content is byte-identical -- an unfsynced temporary carries no reusable content, so
+    the retry stages a fresh one. Observing an existing byte-identical immutable target
+    withdraws durability evidence until the records directory is fsynced again, and a
+    byte conflict appends conflict audit evidence and rejects before any pointer
+    temporary or visible pointer is created, replaced or fsynced.
 """
 
 from __future__ import annotations
@@ -108,6 +110,7 @@ class SpoolRecoveryObservation:
 class SpoolRecoveryOutcome:
     observations: tuple[SpoolRecoveryObservation, ...]
     ignored_temporary_names: tuple[str, ...]
+    durable_temporary_names: tuple[str, ...]
     durable_sequences: tuple[int, ...]
     conflict_audit: tuple[SpoolConflictAuditEntry, ...]
 
@@ -150,13 +153,16 @@ class SyntheticSpoolDurabilityModel:
         self._durable_temporaries.add(temporary)
 
     def retry_record_temporary(self, image: SpoolRecordImage) -> str:
-        """Row 2 retry: only byte-identical content may be reused."""
+        """Row 2 retry: only an already fsynced, byte-identical temporary may be reused."""
 
         staged = self._staged.get(image.sequence)
         if staged is None:
             return self.stage_record_temporary(image)
         temporary, existing = staged
         if self.dialect == FROZEN_LEGACY_DIALECT:
+            return self.stage_record_temporary(image)
+        if temporary not in self._durable_temporaries:
+            # A temporary that never reached crash point 2 carries no reusable content.
             return self.stage_record_temporary(image)
         if existing.payload != image.payload:
             raise SyntheticSpoolRecoveryError(
@@ -261,6 +267,9 @@ class SyntheticSpoolDurabilityModel:
         return SpoolRecoveryOutcome(
             observations=tuple(observations),
             ignored_temporary_names=tuple(sorted(self.temporaries)),
+            durable_temporary_names=tuple(
+                sorted(name for name in self.temporaries if name in self._durable_temporaries)
+            ),
             durable_sequences=durable,
             conflict_audit=tuple(self.conflict_audit),
         )
