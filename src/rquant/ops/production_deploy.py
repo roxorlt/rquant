@@ -48,6 +48,7 @@ from rquant.release_generation import (
 from rquant.release_generation import (
     deployment_timers_for_services as _timers_for_services,
 )
+from rquant.strict_json import StrictJsonError, strict_canonical_json_loads
 
 ALL_LONG_RUNNING_SERVICES = _ALL_LONG_RUNNING_SERVICES
 ChangePlan = DeploymentChangePlan
@@ -57,6 +58,14 @@ TARGET_PATTERN = re.compile(r"(?:v\d+\.\d+\.\d+|[0-9a-f]{40})")
 LINUX_PRODUCTION_RUNTIME_ROOT = Path("/home/lighthouse/rquant/data/runtime")
 LINUX_PRODUCTION_EVIDENCE_CACHE_DIR = Path("/home/lighthouse/rquant/var/r07-dr-evidence")
 R07_DEPLOY_GATE_SCRIPT = "scripts/r07_deploy_gate.py"
+R07_DECISION_GATES = ("bootstrap_disabled", "enforced", "rejected")
+R07_DECISION_SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
+_R07_DECISION_SHA_FIELDS = (
+    "installed_commit_sha",
+    "installed_tree_sha",
+    "target_commit_sha",
+    "target_tree_sha",
+)
 _R07_DECISION_FIELDS = (
     "allowed",
     "gate",
@@ -99,10 +108,21 @@ class R07GateDecision:
         }
 
 
-def r07_decision_from_payload(payload: object) -> R07GateDecision:
-    """Parse the isolated gate child's canonical JSON decision, rejecting anything else."""
+def r07_decision_from_child_output(raw: str | bytes) -> R07GateDecision:
+    """Parse the isolated gate child's stdout as one untrusted canonical JSON decision.
 
-    if not isinstance(payload, dict) or set(payload) != set(_R07_DECISION_FIELDS):
+    The child is treated as an untrusted input boundary: the bytes must be exactly canonical
+    JSON with no duplicate key, no reordering, no surrounding whitespace, and no second record,
+    and every field must match its exact contract before the deployer acts on the verdict.
+    """
+
+    try:
+        payload = strict_canonical_json_loads(raw)
+    except (StrictJsonError, UnicodeDecodeError) as exc:
+        raise PolicyError(
+            "R07 deployment gate did not return one canonical JSON decision record"
+        ) from exc
+    if type(payload) is not dict or set(payload) != set(_R07_DECISION_FIELDS):
         raise PolicyError("R07 deployment gate returned an unexpected decision record")
     for field_name in ("allowed", "requires_evidence"):
         if type(payload[field_name]) is not bool:
@@ -110,9 +130,19 @@ def r07_decision_from_payload(payload: object) -> R07GateDecision:
     for field_name in _R07_DECISION_FIELDS[1:3] + _R07_DECISION_FIELDS[4:]:
         if type(payload[field_name]) is not str:
             raise PolicyError("R07 deployment gate decision fields must be exact strings")
+    if payload["gate"] not in R07_DECISION_GATES:
+        raise PolicyError("R07 deployment gate returned an unknown gate verdict")
+    for field_name in _R07_DECISION_SHA_FIELDS:
+        value = payload[field_name]
+        if value and R07_DECISION_SHA_PATTERN.fullmatch(str(value)) is None:
+            raise PolicyError("R07 deployment gate decision commit and tree IDs must be 40-hex")
     decision = R07GateDecision(**payload)  # type: ignore[arg-type]
     if decision.allowed == (decision.gate == "rejected"):
         raise PolicyError("R07 deployment gate decision is internally inconsistent")
+    if decision.requires_evidence and decision.gate != "enforced":
+        raise PolicyError(
+            "R07 deployment gate returned a non-enforced verdict that consumes evidence"
+        )
     return decision
 
 
@@ -821,15 +851,7 @@ class IsolatedR07EvidenceGate:
                 target_commit_sha,
                 f"the R07 deployment gate failed ({completed.returncode}): {detail[:500]}",
             )
-        try:
-            payload = json.loads(completed.stdout)
-        except json.JSONDecodeError:
-            return _r07_unavailable_decision(
-                installed_commit_sha,
-                target_commit_sha,
-                "the R07 deployment gate returned invalid JSON",
-            )
-        return r07_decision_from_payload(payload)
+        return r07_decision_from_child_output(completed.stdout)
 
 
 def _r07_unavailable_decision(
@@ -844,11 +866,17 @@ def _r07_unavailable_decision(
         requires_evidence=False,
         installed_mode="unresolved",
         target_mode="unresolved",
-        installed_commit_sha=installed_commit_sha,
+        installed_commit_sha=_reportable_sha(installed_commit_sha),
         installed_tree_sha="",
-        target_commit_sha=target_commit_sha,
+        target_commit_sha=_reportable_sha(target_commit_sha),
         target_tree_sha="",
     )
+
+
+def _reportable_sha(value: str) -> str:
+    """Never invent a commit ID for the audit: an unresolvable one is recorded as absent."""
+
+    return value if R07_DECISION_SHA_PATTERN.fullmatch(value) else ""
 
 
 def _build_r07_evidence_gate(config: DeployConfig) -> IsolatedR07EvidenceGate:

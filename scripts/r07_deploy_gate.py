@@ -12,7 +12,7 @@ boundary-probe harness out of the live deployment interpreter.
 from __future__ import annotations
 
 import argparse
-import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -26,6 +26,7 @@ from rquant.ops.r07_deploy_evidence import (  # noqa: E402
 from rquant.ops.r07_deploy_evidence import (  # noqa: E402
     UrllibEvidenceTransport as _UrllibEvidenceTransport,
 )
+from rquant.strict_json import canonical_json_bytes  # noqa: E402
 
 
 class _TrustedGitRunner:
@@ -35,9 +36,12 @@ class _TrustedGitRunner:
         self._repo = repo
         self._git_path = git_path
 
-    def run(self, args: list[str], *, check: bool = True):  # noqa: ANN201 - CompletedProcess[str]
-        import subprocess
-
+    def run(
+        self,
+        args: list[str],
+        *,
+        check: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
         if not args or Path(args[0]) != self._git_path:
             raise R07EvidenceError("the R07 deployment gate runs only the trusted Git binary")
         return subprocess.run(
@@ -73,8 +77,8 @@ def main(argv: list[str] | None = None) -> int:
         installed_commit_sha=args.installed_commit,
         target_commit_sha=args.target_commit,
     )
-    payload = decision.model_dump(mode="json")
-    sys.stdout.write(json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+    sys.stdout.buffer.write(canonical_json_bytes(decision.model_dump(mode="json")))
+    sys.stdout.buffer.flush()
     return 0
 
 

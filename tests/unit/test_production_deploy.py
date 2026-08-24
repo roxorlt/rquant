@@ -36,6 +36,7 @@ from rquant.ops.production_deploy import (
     validate_target,
 )
 from rquant.release_generation import DeploymentIntent
+from rquant.strict_json import canonical_json_bytes
 from tests.unit.test_signal_family_differential_evidence import (
     _enforced_policy_bytes,
     _release_repo,
@@ -3082,7 +3083,9 @@ class _InProcessR07Gate:
             installed_commit_sha=installed_commit_sha,
             target_commit_sha=target_commit_sha,
         )
-        return production_deploy.r07_decision_from_payload(json.loads(decision.model_dump_json()))
+        return production_deploy.r07_decision_from_child_output(
+            canonical_json_bytes(decision.model_dump(mode="json"))
+        )
 
 
 def _r07_gate(
@@ -3520,7 +3523,7 @@ class TestR07Bootstrap:
         )
 
         assert completed.returncode == 0, completed.stderr
-        decision = production_deploy.r07_decision_from_payload(json.loads(completed.stdout))
+        decision = production_deploy.r07_decision_from_child_output(completed.stdout)
         assert decision.allowed is True
         assert decision.gate == "bootstrap_disabled"
         assert decision.target_commit_sha == release_a
@@ -3550,22 +3553,125 @@ class TestR07Bootstrap:
         )
 
         assert completed.returncode == 0, completed.stderr
-        decision = production_deploy.r07_decision_from_payload(json.loads(completed.stdout))
+        decision = production_deploy.r07_decision_from_child_output(completed.stdout)
         assert decision.allowed is False
         assert decision.gate == "rejected"
         assert "pre-R07" in decision.reason
 
+    @staticmethod
+    def _child_decision_payload(**overrides: object) -> dict[str, object]:
+        values: dict[str, object] = {
+            "allowed": True,
+            "gate": "bootstrap_disabled",
+            "reason": "Release A bootstrap install from a pre-R07 checkout",
+            "requires_evidence": False,
+            "installed_mode": "absent",
+            "target_mode": "disabled_for_bootstrap",
+            "installed_commit_sha": _sha("a"),
+            "installed_tree_sha": R07_INSTALLED_TREE,
+            "target_commit_sha": _sha("b"),
+            "target_tree_sha": R07_TARGET_TREE,
+        }
+        values.update(overrides)
+        return values
+
+    def test_a_canonical_child_decision_is_accepted(self) -> None:
+        raw = canonical_json_bytes(self._child_decision_payload())
+
+        decision = production_deploy.r07_decision_from_child_output(raw)
+
+        assert decision.allowed is True
+        assert decision.gate == "bootstrap_disabled"
+        assert decision.target_tree_sha == R07_TARGET_TREE
+
     @pytest.mark.parametrize(
-        "payload",
+        "raw",
         [
-            pytest.param({}, id="empty"),
-            pytest.param({"allowed": True}, id="partial"),
-            pytest.param("rejected", id="not-an-object"),
+            pytest.param(b"", id="empty-output"),
+            pytest.param(b"rejected", id="not-json"),
+            pytest.param(b'"rejected"', id="not-an-object"),
+            pytest.param(b"{}", id="no-keys"),
+            pytest.param(b'{"allowed":true}', id="partial-keys"),
         ],
     )
-    def test_a_malformed_child_decision_is_refused(self, payload: object) -> None:
+    def test_a_malformed_child_decision_is_refused(self, raw: bytes) -> None:
         with pytest.raises(PolicyError, match="R07 deployment gate"):
-            production_deploy.r07_decision_from_payload(payload)
+            production_deploy.r07_decision_from_child_output(raw)
+
+    def test_a_duplicate_child_decision_key_cannot_flip_the_verdict(self) -> None:
+        rejected = canonical_json_bytes(
+            self._child_decision_payload(
+                allowed=False,
+                gate="rejected",
+                reason="target declares no R07 policy",
+            )
+        )
+        flipped = rejected.replace(b'{"allowed":false', b'{"allowed":false,"allowed":true', 1)
+
+        with pytest.raises(PolicyError, match="R07 deployment gate"):
+            production_deploy.r07_decision_from_child_output(flipped)
+
+    @pytest.mark.parametrize(
+        "mutate",
+        [
+            pytest.param(lambda raw: raw + b"\n", id="trailing-newline"),
+            pytest.param(lambda raw: raw + b'{"allowed":true}', id="second-record"),
+            pytest.param(lambda raw: b" " + raw, id="leading-space"),
+            pytest.param(
+                lambda raw: json.dumps(json.loads(raw), indent=2).encode(),
+                id="pretty-printed",
+            ),
+            pytest.param(
+                lambda raw: json.dumps(
+                    dict(reversed(list(json.loads(raw).items()))),
+                    separators=(",", ":"),
+                ).encode(),
+                id="unsorted-keys",
+            ),
+        ],
+    )
+    def test_a_non_canonical_child_decision_is_refused(self, mutate) -> None:
+        raw = mutate(canonical_json_bytes(self._child_decision_payload()))
+
+        with pytest.raises(PolicyError, match="R07 deployment gate"):
+            production_deploy.r07_decision_from_child_output(raw)
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            pytest.param({"gate": "totally-made-up"}, id="bogus-gate"),
+            pytest.param({"gate": "Rejected"}, id="miscased-gate"),
+            pytest.param(
+                {"requires_evidence": True, "gate": "bootstrap_disabled"},
+                id="evidence-without-enforcement",
+            ),
+            pytest.param({"allowed": False}, id="allowed-contradicts-gate"),
+            pytest.param({"target_commit_sha": "not-a-sha"}, id="non-hex-commit"),
+            pytest.param({"target_tree_sha": _sha("a").upper()}, id="uppercase-tree"),
+            pytest.param({"installed_commit_sha": _sha("a")[:39]}, id="short-commit"),
+            pytest.param({"allowed": "true"}, id="string-flag"),
+            pytest.param({"reason": 7}, id="numeric-reason"),
+        ],
+    )
+    def test_an_out_of_contract_child_decision_is_refused(
+        self,
+        overrides: dict[str, object],
+    ) -> None:
+        raw = canonical_json_bytes(self._child_decision_payload(**overrides))
+
+        with pytest.raises(PolicyError, match="R07 deployment gate"):
+            production_deploy.r07_decision_from_child_output(raw)
+
+    def test_both_audit_field_sets_stay_identical(self) -> None:
+        stdlib_fields = production_deploy.R07GateDecision(
+            **self._child_decision_payload()  # type: ignore[arg-type]
+        ).audit_fields()
+        pydantic_fields = r07_deploy_evidence.R07DeployDecision(
+            **self._child_decision_payload()  # type: ignore[arg-type]
+        ).audit_fields()
+
+        assert set(stdlib_fields) == set(pydantic_fields)
+        assert stdlib_fields == pydantic_fields
 
     def test_linux_production_refuses_another_evidence_cache_directory(
         self,

@@ -48,6 +48,7 @@ from rquant.signal_family_differential_gate import (
 from rquant.strict_json import strict_canonical_json_loads
 
 _SHA1 = r"^[0-9a-f]{40}$"
+_SHA1_OR_ABSENT = r"^(|[0-9a-f]{40})$"
 _SHA256 = r"^[0-9a-f]{64}$"
 GITHUB_API_ROOT = "https://api.github.com"
 EVIDENCE_REPOSITORY = "roxorlt/rquant"
@@ -156,10 +157,10 @@ class R07DeployDecision(_StrictModelMixin, BaseModel):
     requires_evidence: bool
     installed_mode: StrictStr
     target_mode: StrictStr
-    installed_commit_sha: StrictStr = Field(pattern=_SHA1)
-    installed_tree_sha: StrictStr = Field(pattern=_SHA1)
-    target_commit_sha: StrictStr = Field(pattern=_SHA1)
-    target_tree_sha: StrictStr = Field(pattern=_SHA1)
+    installed_commit_sha: StrictStr = Field(pattern=_SHA1_OR_ABSENT)
+    installed_tree_sha: StrictStr = Field(pattern=_SHA1_OR_ABSENT)
+    target_commit_sha: StrictStr = Field(pattern=_SHA1_OR_ABSENT)
+    target_tree_sha: StrictStr = Field(pattern=_SHA1_OR_ABSENT)
 
     @model_validator(mode="after")
     def validate_outcome(self) -> Self:
@@ -872,9 +873,11 @@ class R07DeployEvidenceGate:
 
 
 def _reportable_sha(value: str) -> str:
+    """Never invent a commit ID for the audit: an unresolvable one is recorded as absent."""
+
     if len(value) == 40 and all(char in "0123456789abcdef" for char in value):
         return value
-    return "0" * 40
+    return ""
 
 
 def _unreadable_decision(
@@ -890,7 +893,7 @@ def _unreadable_decision(
         installed_mode="unresolved",
         target_mode="unresolved",
         installed_commit_sha=_reportable_sha(installed_commit_sha),
-        installed_tree_sha="0" * 40,
+        installed_tree_sha="",
         target_commit_sha=_reportable_sha(target_commit_sha),
-        target_tree_sha="0" * 40,
+        target_tree_sha="",
     )
