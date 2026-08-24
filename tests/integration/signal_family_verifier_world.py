@@ -17,9 +17,11 @@ from __future__ import annotations
 
 import hashlib
 import os
+import platform
 import shutil
 import stat
 import sys
+import sysconfig
 import zipapp
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -315,6 +317,66 @@ def build_harness(
 
 
 # ---------------------------------------------------------------------------------------
+# The real WP4-c harness, and the importable generation it needs
+# ---------------------------------------------------------------------------------------
+
+
+def repository_root() -> Path:
+    """The checkout that owns `src/rquant`, derived from the imported package itself."""
+
+    return Path(verification.__file__).resolve().parent.parent.parent
+
+
+def build_real_harness(destination: Path) -> bytes:
+    """Build the production harness zipapp with its own deterministic build script."""
+
+    import importlib.util
+
+    script = repository_root() / "scripts" / "build-signal-family-verifier-harness.py"
+    spec = importlib.util.spec_from_file_location("_wp4c_harness_builder", script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.build_harness(repository_root(), destination)
+    return destination.read_bytes()
+
+
+def make_generation_importable(generation_path: Path) -> None:
+    """Give the generation-local interpreter a real importable `rquant`.
+
+    The child is launched as `<generation>/bin/python -I <harness>.pyz` with a sanitized
+    environment, so nothing on the caller's side can put the generation on the child's
+    path: the interpreter has to resolve it by itself. Turning the generation into a venv
+    whose `pyvenv.cfg` sits beside `bin/python` is what does that, and a single path
+    configuration file inside its site directory names the closure the generation ships.
+    Opt-in, because the default world exists to prove the child can import *nothing*.
+    """
+
+    version = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    site_packages = generation_path / "lib" / version / "site-packages"
+    site_packages.mkdir(mode=0o755, parents=True, exist_ok=True)
+    (generation_path / "pyvenv.cfg").write_text(
+        "\n".join(
+            (
+                f"home = {Path(sys.base_prefix) / 'bin'}",
+                "include-system-site-packages = false",
+                f"version_info = {platform.python_version()}",
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+    closure = (
+        str(repository_root() / "src"),
+        str(sysconfig.get_paths()["purelib"]),
+    )
+    (site_packages / "_generation_closure.pth").write_text(
+        "\n".join((*closure, "")),
+        encoding="utf-8",
+    )
+
+
+# ---------------------------------------------------------------------------------------
 # The replica world
 # ---------------------------------------------------------------------------------------
 
@@ -603,6 +665,8 @@ def build_world(
     tmp_path: Path,
     *,
     harness_mode: str = "ok",
+    harness: str = "stub",
+    blocked_surface_id: Any | None = None,
     policy_max_age_seconds: int | None = None,
     stale_overrides: Mapping[str, float] | None = None,
     run_id_override: str | None = None,
@@ -611,7 +675,20 @@ def build_world(
     operation_id: str = OPERATION_ID,
     profile_id: str = PROFILE_ID,
 ) -> VerifierWorld:
-    """Assemble one complete replica: policy, harness, generation, authority, anchors."""
+    """Assemble one complete replica: policy, harness, generation, authority, anchors.
+
+    `harness="stub"` keeps the WP4-b protocol replayer, whose child imports nothing.
+    `harness="real"` installs the WP4-c production harness zipapp instead, replaces the
+    synthetic vectors with the ones that harness actually exercises, and makes the
+    generation importable so the child can reach the production builders.
+    """
+
+    if harness not in {"stub", "real"}:
+        raise ValueError("harness must be 'stub' or 'real'")
+    if harness == "real" and harness_mode != "ok":
+        raise ValueError("the real harness has no injected failure modes")
+    if blocked_surface_id is not None and harness != "real":
+        raise ValueError("a blocked-surface vector only means something to the real harness")
 
     from rquant import signal_family_root_verifier as verifier
 
@@ -641,8 +718,29 @@ def build_world(
 
     source_hashes = _write_generation_sources(generation_path)
     bindings = _bindings(manifests, source_hashes)
-    vectors = _vectors(manifests)
-    replay = _replay(vectors)
+    if harness == "real":
+        from tests.support.signal_family_harness_vectors import (
+            blocked_surface_vector,
+            expected_results_for,
+            harness_vectors,
+        )
+
+        vectors = harness_vectors()
+        # The policy author derives the expected results by running the same exercise the
+        # child will run. The child is never told any of this; the root compares after exit.
+        policy_scratch = tmp_path / "policy-expected"
+        policy_scratch.mkdir(mode=0o700, parents=True)
+        derived = dict(expected_results_for(vectors, policy_scratch))
+        if blocked_surface_id is not None:
+            blocked_vector, placeholder = blocked_surface_vector(blocked_surface_id)
+            vectors = tuple(
+                sorted((*vectors, blocked_vector), key=lambda vector: vector.vector_id)
+            )
+            derived[blocked_vector.vector_id] = placeholder
+        replay: Mapping[str, str] = derived
+    else:
+        vectors = _vectors(manifests)
+        replay = _replay(vectors)
     expected_results = tuple(
         verification.SignalFamilyExpectedResultV1(
             vector_id=vector.vector_id,
@@ -712,14 +810,18 @@ def build_world(
 
     report_path = tmp_path / "child-report.json"
     harness_path = root / HARNESS_RELATIVE_PATH
-    harness_bytes = build_harness(
-        harness_path,
-        mode=harness_mode,
-        replay=replay,
-        report_path=report_path,
-        run_id_override=run_id_override,
-        test_manifest_hash_override=test_manifest_hash_override,
-    )
+    if harness == "real":
+        make_generation_importable(generation_path)
+        harness_bytes = build_real_harness(harness_path)
+    else:
+        harness_bytes = build_harness(
+            harness_path,
+            mode=harness_mode,
+            replay=replay,
+            report_path=report_path,
+            run_id_override=run_id_override,
+            test_manifest_hash_override=test_manifest_hash_override,
+        )
 
     # A1: every policy field is minted from a profile-derived or raw-byte value. The
     # declaration-side manifest `create()` helpers never produce one of these hashes.

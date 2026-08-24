@@ -25,6 +25,7 @@ import pytest
 
 from rquant import signal_family_root_verifier as root_verifier
 from rquant import signal_family_verification as verification
+from rquant import signal_family_verifier_harness as harness
 from rquant.runtime_authority import GENERATION_MANIFEST_NAME
 from rquant.runtime_service_entrypoint import RuntimeServiceKind
 from rquant.strict_json import canonical_json_bytes
@@ -1438,3 +1439,92 @@ class TestAppendStore:
                 None,
                 *(code.value for code in verification.SignalFamilyReasonCode),
             }
+
+
+# ---------------------------------------------------------------------------------------
+# The real WP4-c harness, in place of the WP4-b protocol replayer
+# ---------------------------------------------------------------------------------------
+
+
+class TestProductionHarness:
+    """The eight steps again, with the real harness zipapp exercising real builders.
+
+    Every earlier case in this file uses the stub harness, which replays frozen bytes and
+    proves the protocol. These cases swap in the artifact `scripts/build-signal-family-
+    verifier-harness.py` produces: an unprivileged child that imports the generation, builds
+    each reader through its production `runtime_builder_*` factory, and derives its own
+    results. The root is unchanged, so a green run here means the two halves agree on bytes
+    neither of them was told in advance.
+    """
+
+    def test_the_real_harness_completes_the_eight_step_sequence(self, tmp_path: Path) -> None:
+        world = build_world(tmp_path, harness="real")
+
+        result = _verifier(world).run()
+
+        assert result.outcome == "persisted"
+        assert result.state is verification.SignalFamilyReadinessState.READY
+        assert tuple(receipt.pair_id for receipt in result.receipts) == verification.PAIR_IDS
+        assert len(_rows(world, "receipts")) == 5
+        assert len(_rows(world, "decisions")) == 1
+
+    def test_the_real_harness_answers_exactly_the_policy_authorized_vectors(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        world = build_world(tmp_path, harness="real")
+
+        _verifier(world).run()
+
+        assert tuple(sorted(world.replay)) == tuple(
+            sorted(vector.vector_id for vector in world.test_manifest.vectors)
+        )
+        assert {vector.surface_id.value for vector in world.test_manifest.vectors} == set(
+            harness.IMPLEMENTED_SURFACE_IDS
+        )
+
+    def test_every_real_result_names_the_surface_and_its_production_builder(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        import json
+
+        world = build_world(tmp_path, harness="real")
+
+        _verifier(world).run()
+
+        by_id = {vector.vector_id: vector for vector in world.test_manifest.vectors}
+        for vector_id, payload in world.replay.items():
+            observed = json.loads(payload)
+            assert observed["surface_id"] == by_id[vector_id].surface_id.value
+            assert observed["builder"].startswith("rquant.runtime_builder_")
+            assert observed["state_unchanged"] is True
+
+    def test_a_blocked_surface_vector_fails_closed_without_evidence(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The harness refuses a surface it cannot reach rather than inventing a result."""
+
+        world = build_world(
+            tmp_path,
+            harness="real",
+            blocked_surface_id=verification.SurfaceId.ROUTE_RUNNER_SIGNALS,
+        )
+
+        with pytest.raises(root_verifier.SignalFamilyRootVerifierError) as error:
+            _verifier(world).run()
+
+        assert (
+            error.value.audit_record.reason_code
+            is verification.SignalFamilyReasonCode.CHILD_NONZERO_EXIT
+        )
+        _assert_no_evidence(world)
+
+    def test_the_real_harness_pyz_is_the_policy_hashed_artifact(self, tmp_path: Path) -> None:
+        world = build_world(tmp_path, harness="real")
+
+        assert world.policy.harness_sha256 == hashlib.sha256(
+            world.harness_path.read_bytes()
+        ).hexdigest()
+        assert world.harness_path.stat().st_mode & 0o222 == 0
