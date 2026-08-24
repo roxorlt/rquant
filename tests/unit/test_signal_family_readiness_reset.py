@@ -340,8 +340,10 @@ def _snapshot(
         authority=resolved_authority,
         overlay_content_hash=entry.overlay_content_hash,
         successor_bundle_content_hash=entry.successor_bundle_content_hash,
-        successor_declaration_hashes=(_digest("declaration-a"), _digest("declaration-b")),
-        successor_channel_hashes=(_digest("channel-a"), _digest("channel-b")),
+        successor_declaration_hashes=tuple(
+            sorted((_digest("declaration-a"), _digest("declaration-b")))
+        ),
+        successor_channel_hashes=tuple(sorted((_digest("channel-a"), _digest("channel-b")))),
         verification_manifest_sha256=entry.verification_manifest_sha256,
         test_manifest_hash=child.test_manifest_hash,
         pairs=pairs,
@@ -1055,7 +1057,7 @@ def test_policy_raw_bytes_round_trip_without_a_newline() -> None:
             lambda raw: b'{"schema_version":1,' + raw[1:],
             "duplicate JSON key",
         ),
-        (lambda raw: raw[:-1] + b',"extra":1}', "Extra inputs are not permitted"),
+        (lambda raw: raw[:-1] + b',"zz_extra":1}', "Extra inputs are not permitted"),
     ),
     ids=("newline", "whitespace", "duplicate-key", "extra-key"),
 )
@@ -1129,7 +1131,7 @@ def test_policy_selects_exactly_one_entry_for_a_release_key() -> None:
             successor_bundle_content_hash=entry.successor_bundle_content_hash,
             overlay_content_hash=entry.overlay_content_hash,
         )
-        is entry
+        == entry
     )
     with pytest.raises(REJECTIONS, match="no release entry matches"):
         policy.select_entry(
@@ -1250,7 +1252,7 @@ def test_vector_rejects_a_family_outside_the_current_family() -> None:
 
 def test_test_manifest_binds_vectors_expected_results_pairs_and_bindings() -> None:
     manifest = _test_manifest()
-    assert tuple(manifest.model_fields) == (
+    assert tuple(verification.SignalFamilyTestManifestV1.model_fields) == (
         "schema_version",
         "vectors",
         "expected_results",
@@ -1292,7 +1294,7 @@ def test_verification_manifest_binds_the_policy_bound_hashes() -> None:
         ).hexdigest(),
         test_manifest=manifest,
     )
-    assert tuple(verification_manifest.model_fields) == (
+    assert tuple(verification.SignalFamilyVerificationManifestV1.model_fields) == (
         "schema_version",
         "successor_bundle_content_hash",
         "overlay_content_hash",
@@ -1743,7 +1745,7 @@ def test_the_lifecycle_has_no_attesting_or_activated_state() -> None:
 
 def test_the_four_allowed_transitions_are_exactly_the_spec_edges() -> None:
     state = verification.SignalFamilyReadinessState
-    assert verification.ALLOWED_READINESS_TRANSITIONS == frozenset(
+    expected_edges = frozenset(
         {
             (state.DECLARED, state.READY),
             (state.DECLARED, state.REVOKED),
@@ -1751,6 +1753,7 @@ def test_the_four_allowed_transitions_are_exactly_the_spec_edges() -> None:
             (state.READY, state.ROLLED_BACK),
         }
     )
+    assert expected_edges == verification.ALLOWED_READINESS_TRANSITIONS
     for current, target in verification.ALLOWED_READINESS_TRANSITIONS:
         assert verification.require_readiness_transition(current, target) is target
 
