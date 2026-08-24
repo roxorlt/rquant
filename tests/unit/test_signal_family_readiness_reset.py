@@ -1813,3 +1813,121 @@ def test_the_model_layer_exposes_no_append_persist_or_store_entry_point() -> Non
     assert not [
         name for name in exported if any(token in name.lower() for token in banned)
     ]
+
+
+# --------------------------------------------------------------------------------------
+# Fix round 1: the four P2 invariants the model layer must close itself
+# --------------------------------------------------------------------------------------
+
+
+def test_execution_evidence_preimage_binds_the_binding_tuple_and_its_hash() -> None:
+    """`WP4A-SPEC-01`: L1274-1276 puts both the sorted tuple and its hash in the preimage."""
+
+    snapshot = _snapshot()
+    preimage = verification.execution_evidence_preimage(
+        authority=snapshot.authority,
+        verification_manifest_sha256=snapshot.verification_manifest_sha256,
+        test_manifest_hash=snapshot.test_manifest_hash,
+        vector_set_hash=snapshot.vector_set_hash,
+        expected_result_set_hash=snapshot.expected_result_set_hash,
+        five_pair_service_binding_set_hash=snapshot.five_pair_service_binding_set_hash,
+        child_result_hash=snapshot.child_result_hash,
+        verifier_policy_id=snapshot.verifier_policy_id,
+        verifier_policy_content_hash=snapshot.verifier_policy_content_hash,
+        selected_entry_hash=snapshot.selected_entry_hash,
+        harness_identity=snapshot.harness_identity,
+        harness_sha256=snapshot.harness_sha256,
+        observed_family_ids=snapshot.observed_family_ids,
+        observed_surface_ids=snapshot.observed_surface_ids,
+        service_manifest_fingerprints=snapshot.service_manifest_fingerprints,
+        service_bindings=snapshot.service_bindings,
+        service_bindings_hash=snapshot.service_bindings_hash,
+    )
+    assert preimage["service_bindings_hash"] == snapshot.service_bindings_hash
+    assert preimage["service_bindings"] == [
+        binding.model_dump(mode="json") for binding in snapshot.service_bindings
+    ]
+    assert "execution_evidence_hash" not in preimage
+
+
+def test_binding_set_hash_helpers_reject_unsorted_or_duplicate_bindings() -> None:
+    """`WP4A-SPEC-02`: all four preimage helpers reject disordered input, not just two."""
+
+    manifests = _profile_manifests()
+    bindings = _bindings()
+    reversed_bindings = tuple(reversed(bindings))
+    duplicated = (*bindings[:-1], bindings[-2])
+    for candidate in (reversed_bindings, duplicated):
+        with pytest.raises(
+            REJECTIONS,
+            match="service bindings must be sorted by service_id and duplicate-free",
+        ):
+            verification.service_bindings_hash(candidate)
+        with pytest.raises(
+            REJECTIONS,
+            match="service bindings must be sorted by service_id and duplicate-free",
+        ):
+            verification.five_pair_service_binding_set_hash(manifests, candidate)
+
+
+def test_decision_schema_pins_receipt_fingerprints_to_exactly_five() -> None:
+    """`WP4A-SPEC-03`: the count is a schema invariant, not only a builder invariant."""
+
+    snapshot = _snapshot()
+    decision = verification.build_readiness_decision(
+        snapshot,
+        verification.build_pair_receipts(snapshot),
+    )
+    payload = decision.model_dump(mode="json")
+    payload["receipt_fingerprints"] = payload["receipt_fingerprints"][:3]
+    payload["receipt_fingerprint_set_hash"] = verification.receipt_fingerprint_set_hash(
+        tuple(payload["receipt_fingerprints"])
+    )
+    payload.pop("decision_hash")
+    payload["decision_hash"] = verification.canonical_sha256(payload)
+    with pytest.raises(REJECTIONS, match="requires exactly five receipt fingerprints"):
+        verification.SignalFamilyReadinessDecisionV1.model_validate(payload)
+
+
+def test_handwritten_pairs_reach_no_public_five_pair_verdict() -> None:
+    """`WP4A-SPEC-04`: every public pair verdict starts from the validated profile."""
+
+    assert not hasattr(verification, "require_exact_five_pairs")
+    forged = tuple(
+        verification.PairBindingV1(
+            pair_id=pair.pair_id,
+            producer_service_ids=("attacker.svc",),
+            consumer_service_ids=pair.consumer_service_ids,
+        )
+        if pair.pair_id == "router-notifier"
+        else pair
+        for pair in _pairs()
+    )
+    for call in (
+        lambda: verification.participating_service_ids(forged),
+        lambda: verification.expected_surface_ids(forged),
+        lambda: verification.require_pair_derived_participants(forged, ("attacker.svc",)),
+        lambda: verification.require_pair_derived_surfaces(
+            forged,
+            "attacker.svc",
+            (verification.SurfaceId.SIGNAL_ROUTE_SPOOL_PUBLISH,),
+        ),
+        lambda: verification.five_pair_service_binding_set_hash(forged, _bindings()),
+    ):
+        with pytest.raises(REJECTIONS, match="exact RuntimeServiceManifest"):
+            call()
+
+
+def test_snapshot_rejects_a_test_manifest_whose_pairs_are_not_profile_derived() -> None:
+    """`WP4A-SPEC-04`: declared pairs never stand in for the profile-resolved pair map."""
+
+    intruder = tuple(
+        ("attacker.svc", kind, stale) if service_id == "notifier" else (service_id, kind, stale)
+        for service_id, kind, stale in _PARTICIPANTS
+    )
+    alien = _profile_manifests(participants=intruder)
+    alien_pairs = verification.resolve_pair_bindings(alien)
+    assert "attacker.svc" in verification.participating_service_ids(alien)
+    assert alien_pairs != _pairs()
+    with pytest.raises(REJECTIONS, match="pairs are not derived from the validated profile"):
+        _snapshot(profile_manifests=_profile_manifests(), declared_profile_manifests=alien)
