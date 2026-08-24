@@ -49,6 +49,7 @@ from rquant.runtime_authority import (
 )
 from rquant.runtime_service_entrypoint import RuntimeServiceManifest
 from rquant.signal_family_verification import (
+    ALLOWED_READINESS_TRANSITIONS,
     HARNESS_IDENTITY,
     MAX_IPC_RESPONSE_BYTES,
     OVERLAY_BUNDLE_RELATIVE_PATH,
@@ -82,7 +83,6 @@ from rquant.signal_family_verification import (
     observed_result_set_hash,
     participating_service_ids,
     require_pair_derived_surfaces,
-    require_readiness_transition,
     resolve_participating_service_manifests,
     service_freshness_seconds,
     vector_set_hash,
@@ -277,6 +277,7 @@ class GenerationAuthoritySnapshot:
     slot: RuntimeGenerationSlot
     profile_manifests: tuple[RuntimeServiceManifest, ...]
     full_manifest_entries: Mapping[str, str]
+    profile_document_sha256: str
 
     def identity(self) -> tuple[Any, ...]:
         """Everything step 7 compares between the first and the second reopen."""
@@ -303,6 +304,7 @@ class GenerationAuthoritySnapshot:
                 )
             ),
             tuple(sorted(self.full_manifest_entries.items())),
+            self.profile_document_sha256,
         )
 
 
@@ -449,35 +451,136 @@ def child_privilege_plan(
     return None
 
 
-def _child_preexec(
-    plan: ChildPrivilegePlan | None,
-    *,
-    keep: tuple[int, ...],
-) -> Callable[[], None]:
-    """Drop privilege and close every descriptor `close_fds` would leave behind.
+def child_descriptor_limit() -> int:
+    """The upper bound of the descriptor sweep on this host."""
 
-    `subprocess` closes inherited descriptors after this callback, so the `closerange`
-    sweep is the belt-and-braces half of the pair: even if the interpreter's own sweep
-    were bypassed, nothing but the standard streams and the two IPC pipes survives.
+    configured = os.sysconf("SC_OPEN_MAX") if hasattr(os, "sysconf") else 0
+    return max(int(configured or 0), 4096)
+
+
+def child_descriptor_sweep(
+    pass_fds: Sequence[int],
+    *,
+    limit: int,
+) -> tuple[tuple[int, int], ...]:
+    """The exact `closerange` intervals that leave only 0/1/2 and the two IPC pipes.
+
+    `subprocess` closes inherited descriptors *after* `preexec_fn` runs, so this sweep is
+    the belt-and-braces half of the pair: even with the interpreter's own sweep bypassed,
+    nothing but the standard streams and the retained pipes survives into the child.
     """
 
-    retained = tuple(sorted(set(keep)))
-    limit = max(os.sysconf("SC_OPEN_MAX") if hasattr(os, "sysconf") else 4096, 4096)
+    retained = tuple(sorted(set(pass_fds)))
+    if any(type(descriptor) is not int or descriptor < 3 for descriptor in retained):
+        raise _reject(
+            SignalFamilyReasonCode.CHILD_LAUNCH_FAILED,
+            "a retained child descriptor is a standard stream or is not a descriptor",
+        )
+    if type(limit) is not int or limit <= (retained[-1] if retained else 2):
+        raise _reject(
+            SignalFamilyReasonCode.CHILD_LAUNCH_FAILED,
+            "the descriptor sweep bound does not exceed every retained descriptor",
+        )
+    ranges: list[tuple[int, int]] = []
+    low = 3
+    for descriptor in retained:
+        if descriptor > low:
+            ranges.append((low, descriptor))
+        low = descriptor + 1
+    ranges.append((low, limit))
+    return tuple(ranges)
+
+
+#: The three identity syscalls a privilege drop is allowed to make, in order.
+PRIVILEGE_SYSCALL_NAMES: Final[tuple[str, ...]] = ("setgroups", "setresgid", "setresuid")
+
+
+def child_privilege_calls(
+    plan: ChildPrivilegePlan | None,
+) -> tuple[tuple[str, tuple[Any, ...]], ...]:
+    """The exact ordered syscalls one plan performs. No plan performs none."""
+
+    if plan is None:
+        return ()
+    calls: list[tuple[str, tuple[Any, ...]]] = []
+    if plan.clear_supplementary_groups:
+        calls.append(("setgroups", ([],)))
+    calls.append(("setresgid", plan.setresgid))
+    calls.append(("setresuid", plan.setresuid))
+    return tuple(calls)
+
+
+def _platform_privilege_syscalls() -> dict[str, Callable[..., None]]:
+    return {
+        name: call
+        for name in PRIVILEGE_SYSCALL_NAMES
+        if (call := getattr(os, name, None)) is not None
+    }
+
+
+def child_privilege_applier(
+    plan: ChildPrivilegePlan | None,
+    *,
+    syscalls: Mapping[str, Callable[..., None]] | None = None,
+) -> Callable[[], None]:
+    """Turn one plan into the callable that performs it, dispatching through a fixed table.
+
+    The table is looked up rather than called inline so the drop is observable without a
+    real identity change: macOS has no `setresuid` at all, and a host that does have one
+    must not actually drop privilege inside a unit test.
+    """
+
+    calls = child_privilege_calls(plan)
+    table = _platform_privilege_syscalls() if syscalls is None else dict(syscalls)
 
     def apply() -> None:
-        if plan is not None:
-            if plan.clear_supplementary_groups:
-                os.setgroups([])
-            os.setresgid(*plan.setresgid)
-            os.setresuid(*plan.setresuid)
-        low = 3
-        for descriptor in retained:
-            if descriptor > low:
-                os.closerange(low, descriptor)
-            low = max(low, descriptor + 1)
-        os.closerange(low, limit)
+        for name, arguments in calls:
+            call = table.get(name)
+            if call is None:
+                raise _reject(
+                    SignalFamilyReasonCode.CHILD_LAUNCH_FAILED,
+                    "this platform cannot perform the child privilege drop",
+                )
+            call(*arguments)
 
+    apply.privilege_calls = calls  # type: ignore[attr-defined]
     return apply
+
+
+class ChildPreexec(Protocol):
+    """The callable `Popen` runs between fork and exec, with its plan kept inspectable."""
+
+    privilege_plan: ChildPrivilegePlan | None
+    privilege_calls: tuple[tuple[str, tuple[Any, ...]], ...]
+    descriptor_sweep: tuple[tuple[int, int], ...]
+    pass_fds: tuple[int, ...]
+
+    def __call__(self) -> None: ...
+
+
+def build_child_preexec(
+    plan: ChildPrivilegePlan | None,
+    *,
+    pass_fds: Sequence[int],
+    limit: int,
+    syscalls: Mapping[str, Callable[..., None]] | None = None,
+) -> ChildPreexec:
+    """Bind the privilege drop and the descriptor sweep into one inspectable callable."""
+
+    retained = tuple(sorted(set(pass_fds)))
+    sweep = child_descriptor_sweep(retained, limit=limit)
+    drop = child_privilege_applier(plan, syscalls=syscalls)
+
+    def apply() -> None:
+        drop()
+        for low, high in sweep:
+            os.closerange(low, high)
+
+    apply.privilege_plan = plan  # type: ignore[attr-defined]
+    apply.privilege_calls = drop.privilege_calls  # type: ignore[attr-defined]
+    apply.descriptor_sweep = sweep  # type: ignore[attr-defined]
+    apply.pass_fds = retained  # type: ignore[attr-defined]
+    return apply  # type: ignore[return-value]
 
 
 @dataclass
@@ -541,6 +644,28 @@ _SCHEMA: Final[tuple[str, ...]] = (
     )
     """,
 )
+
+
+def allowed_readiness_sources(
+    target: SignalFamilyReadinessState,
+) -> tuple[str, ...]:
+    """The exact states the frozen lifecycle permits as the source of one transition."""
+
+    if not isinstance(target, SignalFamilyReadinessState):
+        raise TypeError("a readiness transition requires an exact readiness state")
+    sources = tuple(
+        sorted(
+            source.value
+            for source, allowed in ALLOWED_READINESS_TRANSITIONS
+            if allowed is target
+        )
+    )
+    if not sources:
+        raise _reject(
+            SignalFamilyReasonCode.READINESS_TRANSITION_INVALID,
+            "the frozen lifecycle reaches that state from nowhere",
+        )
+    return sources
 
 
 class SignalFamilyVerificationStore:
@@ -861,35 +986,23 @@ class SignalFamilyVerificationStore:
         """Append-only revoke or rollback. History is never deleted, only superseded."""
 
         stamp = canonical_timestamp(recorded_at)
+        sources = allowed_readiness_sources(target)
+        placeholders = ", ".join("?" for _ in sources)
         self._connection.execute("BEGIN IMMEDIATE")
         try:
-            row = self._connection.execute(
-                "SELECT state FROM readiness_state "
-                "WHERE overlay_content_hash = ? AND authority_epoch_key = ?",
-                (overlay_content_hash, authority_epoch_key),
-            ).fetchone()
-            if row is None:
-                raise _reject(
-                    SignalFamilyReasonCode.READINESS_TRANSITION_INVALID,
-                    "no readiness record exists for this overlay and epoch",
-                )
-            current = SignalFamilyReadinessState(row[0])
-            try:
-                require_readiness_transition(current, target)
-            except SignalFamilyVerificationError as error:
-                raise _reject(
-                    SignalFamilyReasonCode.READINESS_TRANSITION_INVALID,
-                    "the requested readiness transition is not allowed",
-                ) from error
+            # The frozen lifecycle edge is the SQL predicate, not a prior read: a state
+            # this transition may not start from simply matches no row, so a blind write
+            # cannot be substituted for the guard.
             swapped = self._connection.execute(
                 "UPDATE readiness_state SET state = ?, updated_at = ? "
-                "WHERE overlay_content_hash = ? AND authority_epoch_key = ? AND state = ?",
-                (target.value, stamp, overlay_content_hash, authority_epoch_key, current.value),
+                "WHERE overlay_content_hash = ? AND authority_epoch_key = ? "
+                f"AND state IN ({placeholders})",  # noqa: S608 - placeholders only
+                (target.value, stamp, overlay_content_hash, authority_epoch_key, *sources),
             ).rowcount
-            if swapped != 1:  # pragma: no cover - the immediate transaction serializes
+            if swapped != 1:
                 raise _reject(
                     SignalFamilyReasonCode.READINESS_TRANSITION_INVALID,
-                    "the readiness compare-and-swap lost its expected state",
+                    "no readiness record in an allowed source state matches this key",
                 )
             self.append_audit(
                 SignalFamilyVerificationAuditRecordV1.create(
@@ -1290,7 +1403,11 @@ class RootVerifier:
                     stderr=subprocess.PIPE,
                     close_fds=True,
                     pass_fds=(request_read, result_write),
-                    preexec_fn=_child_preexec(plan, keep=(request_read, result_write)),
+                    preexec_fn=build_child_preexec(
+                        plan,
+                        pass_fds=(request_read, result_write),
+                        limit=child_descriptor_limit(),
+                    ),
                 )
             except OSError as error:
                 raise _reject(
@@ -1547,17 +1664,18 @@ class RootVerifier:
                 test_manifest_sha256=plan.test_manifest_sha256,
                 entry=entry,
             )
-            revalidated = self._load_generation_plan(
+            # L1441-1443: the root revalidates the immutable manifests, the binding
+            # tuple, the source paths and hashes, the full-manifest closure, the service
+            # manifests, and the policy age cap *again* after the child exits. Every
+            # equality inside this second derivation is against the one policy entry both
+            # derivations share, so the derivation itself is the enforcement: anything
+            # that moved under the running child rejects here, by its own reason code.
+            self._load_generation_plan(
                 authority=authority,
                 entry=entry,
                 successor=successor,
                 overlay=overlay,
             )
-            if revalidated.identity != plan.identity:
-                raise _reject(
-                    SignalFamilyReasonCode.AUTHORITY_EPOCH_CHANGED,
-                    "the generation revalidation diverged from the initial snapshot",
-                )
 
             # 7. Still under the lock: reopen the anchors and the authority.
             self._assert_lock(lock)
@@ -1809,10 +1927,16 @@ class RootVerifier:
                 SignalFamilyReasonCode.EXPECTED_RESULT_SET_HASH_MISMATCH,
                 "the recomputed expected result set hash is not the one the policy authorizes",
             )
-        derived_pairs = five_pair_service_binding_set_hash(
-            authority.profile_manifests,
-            test_manifest.service_bindings,
-        )
+        try:
+            derived_pairs = five_pair_service_binding_set_hash(
+                authority.profile_manifests,
+                test_manifest.service_bindings,
+            )
+        except SignalFamilyVerificationError as error:
+            raise _reject(
+                SignalFamilyReasonCode.PARTICIPANT_RESOLUTION_INVALID,
+                "the validated profile and binding tuple do not form the five pair set",
+            ) from error
         if derived_pairs != entry.five_pair_service_binding_set_hash:
             raise _reject(
                 SignalFamilyReasonCode.FIVE_PAIR_SET_HASH_MISMATCH,
@@ -1829,8 +1953,15 @@ class RootVerifier:
                 relative,
                 hashlib.sha256(payload).hexdigest(),
             )
+        # The document that carried the profile's service manifests into this process is
+        # held down by the same source closure as every other generation file it names.
+        self._require_manifested(
+            authority,
+            PROFILE_SERVICE_MANIFESTS_RELATIVE_PATH,
+            authority.profile_document_sha256,
+        )
         self._validate_bindings(authority, test_manifest)
-        participating = participating_service_ids(authority.profile_manifests)
+        participating = self._participating(authority)
         resolved = resolve_participating_service_manifests(
             authority.profile_manifests,
             participating,
@@ -1867,17 +1998,19 @@ class RootVerifier:
                 entry.verifier_policy_max_age_seconds,
             ),
             interpreter=next(iter(interpreters)),
-            identity=(
-                verification_sha256,
-                test_sha256,
-                derived_vectors,
-                derived_expected,
-                derived_pairs,
-                declaration_hashes,
-                channel_hashes,
-                authority_snapshot.authority_epoch_key,
-            ),
         )
+
+    @staticmethod
+    def _participating(authority: GenerationAuthoritySnapshot) -> tuple[str, ...]:
+        """The pair-derived participant union, with a bounded code on a bad profile."""
+
+        try:
+            return participating_service_ids(authority.profile_manifests)
+        except SignalFamilyVerificationError as error:
+            raise _reject(
+                SignalFamilyReasonCode.PARTICIPANT_RESOLUTION_INVALID,
+                "the validated profile does not resolve the exact five pair rows",
+            ) from error
 
     @staticmethod
     def _require_manifested(
@@ -1955,7 +2088,7 @@ class RootVerifier:
         test_manifest: SignalFamilyTestManifestV1,
     ) -> None:
         bindings = test_manifest.service_bindings
-        participating = participating_service_ids(authority.profile_manifests)
+        participating = self._participating(authority)
         service_ids = tuple(binding.service_id for binding in bindings)
         if list(service_ids) != sorted(service_ids):
             raise _reject(
@@ -2113,26 +2246,43 @@ class ProductionRuntimeAuthorityGateway:
 
     The spec never freezes how the validated production profile's `RuntimeServiceManifest`
     tuple reaches a root process that may not import a builder, so this gateway reads it
-    from one root-owned canonical generation document and requires its raw SHA-256 to
-    equal `RuntimeGenerationSlot.profile_id`. That binding is as strong as the manifest
-    and source-closure bindings around it, and it keeps every generation module out of
-    the root interpreter. See the WP4-b report for the open spec question.
+    from one root-owned canonical generation document. That document is not self-
+    authorizing; two independent bindings hold it down:
+
+    * it is an entry of the full generation manifest, whose hash is `full_manifest_hash`
+      and therefore part of both the slot validation and the authority epoch key; and
+    * every `manifest_fingerprint` inside it must equal the `service_manifest_fingerprint`
+      of the matching `VerificationServiceBindingV1`, and that binding tuple is anchored
+      by the external root policy through `five_pair_service_binding_set_hash`. Forging a
+      manifest therefore requires a fingerprint preimage.
+
+    It is deliberately *not* hashed against `RuntimeGenerationSlot.profile_id`:
+    `RuntimeClosureProfile` fixes `profile_id` as the hash of the runtime closure body,
+    which carries no service manifests at all, so that equation could only hold on a
+    SHA-256 collision.
     """
 
-    __slots__ = ()
+    __slots__ = ("_authority_loader",)
+
+    def __init__(self, *, authority_loader: Callable[[], Any] | None = None) -> None:
+        self._authority_loader = authority_loader
 
     def acquire_deployment_lock(self) -> DeploymentLockHandle:
         from rquant.runtime_authority import acquire_runtime_deployment_lock
 
         return acquire_runtime_deployment_lock()
 
-    def load_snapshot(self) -> GenerationAuthoritySnapshot:
-        from rquant.runtime_authority import (
-            GENERATION_MANIFEST_NAME,
-            load_runtime_authority,
-        )
+    def _load_record(self) -> Any:
+        if self._authority_loader is not None:
+            return self._authority_loader()
+        from rquant.runtime_authority import load_runtime_authority
 
-        record = load_runtime_authority()
+        return load_runtime_authority()
+
+    def load_snapshot(self) -> GenerationAuthoritySnapshot:
+        from rquant.runtime_authority import GENERATION_MANIFEST_NAME
+
+        record = self._load_record()
         slot = record.current
         manifest_payload = _read_generation_file(
             slot.generation_path,
@@ -2147,10 +2297,11 @@ class ProductionRuntimeAuthorityGateway:
             max_bytes=MAX_GENERATION_DOCUMENT_BYTES,
             reason=SignalFamilyReasonCode.PARTICIPANT_RESOLUTION_INVALID,
         )
-        if hashlib.sha256(profile_payload).hexdigest() != slot.profile_id:
+        profile_sha256 = hashlib.sha256(profile_payload).hexdigest()
+        if entries.get(PROFILE_SERVICE_MANIFESTS_RELATIVE_PATH) != profile_sha256:
             raise _reject(
-                SignalFamilyReasonCode.PARTICIPANT_RESOLUTION_INVALID,
-                "the profile service manifest document is not the validated profile",
+                SignalFamilyReasonCode.BINDING_UNMANIFESTED,
+                "the profile service manifest document is outside the source closure",
             )
         return GenerationAuthoritySnapshot(
             operation_id=record.operation_id,
@@ -2159,6 +2310,7 @@ class ProductionRuntimeAuthorityGateway:
             slot=slot,
             profile_manifests=_parse_profile_manifests(profile_payload),
             full_manifest_entries=entries,
+            profile_document_sha256=profile_sha256,
         )
 
 
@@ -2218,12 +2370,19 @@ def _parse_profile_manifests(payload: bytes) -> tuple[RuntimeServiceManifest, ..
             "the profile service manifest document declares no manifests",
         )
     try:
-        return tuple(RuntimeServiceManifest.model_validate(row) for row in rows)
+        manifests = tuple(RuntimeServiceManifest.model_validate(row) for row in rows)
     except (ValueError, TypeError) as error:
         raise _reject(
             SignalFamilyReasonCode.PARTICIPANT_RESOLUTION_INVALID,
             "a profile service manifest does not satisfy its frozen schema",
         ) from error
+    service_ids = tuple(manifest.service_id for manifest in manifests)
+    if len(set(service_ids)) != len(service_ids):
+        raise _reject(
+            SignalFamilyReasonCode.PARTICIPANT_RESOLUTION_INVALID,
+            "the profile service manifest document repeats one service id",
+        )
+    return manifests
 
 
 @dataclass(frozen=True)
@@ -2236,4 +2395,3 @@ class _GenerationPlan:
     channel_hashes: tuple[str, ...]
     freshness_seconds: float
     interpreter: Path
-    identity: tuple[Any, ...]

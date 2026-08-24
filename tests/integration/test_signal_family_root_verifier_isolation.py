@@ -340,6 +340,282 @@ class TestBoundedIpc:
 
 
 # ---------------------------------------------------------------------------------------
+# The launch wiring itself, not just the plan objects
+# ---------------------------------------------------------------------------------------
+
+
+class TestChildLaunchWiring:
+    def test_the_descriptor_sweep_covers_every_gap_around_the_two_pipes(self) -> None:
+        assert root_verifier.child_descriptor_sweep((7, 9), limit=20) == (
+            (3, 7),
+            (8, 9),
+            (10, 20),
+        )
+        assert root_verifier.child_descriptor_sweep((3, 4), limit=12) == ((5, 12),)
+        assert root_verifier.child_descriptor_sweep((), limit=8) == ((3, 8),)
+
+    def test_the_descriptor_sweep_rejects_a_standard_stream_or_a_bad_bound(self) -> None:
+        for keep, limit in (((2, 5), 20), ((5,), 5), ((-1,), 20)):
+            with pytest.raises(
+                root_verifier.SignalFamilyRootVerifierError,
+                match="CHILD_LAUNCH_FAILED",
+            ):
+                root_verifier.child_descriptor_sweep(keep, limit=limit)
+
+    def test_the_child_is_launched_with_the_exact_containment_wiring(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """`preexec_fn` must actually reach `Popen`, carrying the sweep and the drop.
+
+        `close_fds=True` would hide a missing descriptor sweep, and on an unprivileged
+        macOS host a missing privilege drop is a no-op, so neither is observable from
+        the child. The launch arguments themselves are.
+        """
+
+        world = build_world(tmp_path)
+        captured: dict[str, Any] = {}
+        original = root_verifier.subprocess.Popen
+
+        def recording_popen(*args: Any, **kwargs: Any) -> Any:
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(root_verifier.subprocess, "Popen", recording_popen)
+        _verifier(world).run()
+
+        kwargs = captured["kwargs"]
+        preexec = kwargs["preexec_fn"]
+        assert callable(preexec)
+        assert kwargs["close_fds"] is True
+        assert kwargs["stdin"] is root_verifier.subprocess.DEVNULL
+        assert kwargs["stdout"] is root_verifier.subprocess.PIPE
+        assert kwargs["stderr"] is root_verifier.subprocess.PIPE
+        assert tuple(sorted(kwargs["env"])) == root_verifier.SIGNAL_FAMILY_CHILD_ENV_KEYS
+        assert set(kwargs["pass_fds"]) == {
+            int(kwargs["env"][root_verifier.CHILD_REQUEST_ENV_KEY]),
+            int(kwargs["env"][root_verifier.CHILD_RESULT_ENV_KEY]),
+        }
+        assert captured["args"][0] == root_verifier.build_child_argv(
+            world.gateway.snapshots[0].slot.roles["router"].python_path,
+            world.harness_path,
+        )
+        assert preexec.descriptor_sweep == root_verifier.child_descriptor_sweep(
+            tuple(kwargs["pass_fds"]),
+            limit=root_verifier.child_descriptor_limit(),
+        )
+        assert preexec.privilege_plan == root_verifier.child_privilege_plan(
+            current_uid=os.geteuid(),
+            current_gid=os.getegid(),
+            target_uid=world.anchors.child_uid,
+            target_gid=world.anchors.child_gid,
+        )
+        assert preexec.pass_fds == tuple(sorted(kwargs["pass_fds"]))
+        assert preexec.privilege_calls == root_verifier.child_privilege_calls(
+            preexec.privilege_plan
+        )
+
+    def test_the_launch_plan_carries_the_privilege_drop_when_the_verifier_is_root(
+        self,
+    ) -> None:
+        plan = root_verifier.child_privilege_plan(
+            current_uid=0,
+            current_gid=0,
+            target_uid=1000,
+            target_gid=1000,
+        )
+        preexec = root_verifier.build_child_preexec(plan, pass_fds=(7, 9), limit=20)
+
+        assert preexec.privilege_plan is plan
+        assert preexec.descriptor_sweep == ((3, 7), (8, 9), (10, 20))
+        assert preexec.privilege_plan.clear_supplementary_groups is True
+        assert preexec.privilege_calls == root_verifier.child_privilege_calls(plan)
+
+    def test_the_preexec_body_performs_the_drop_and_then_the_sweep(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Execute the callable itself, so a body that skips either half is visible.
+
+        The identity syscalls are dispatched through an injected table and the sweep
+        through `os.closerange`, so nothing here changes this process: the assertion is
+        on the exact ordered trace the child would have produced.
+        """
+
+        trace: list[tuple[str, tuple[Any, ...]]] = []
+
+        def record(name: str) -> Any:
+            def call(*arguments: Any) -> None:
+                trace.append((name, arguments))
+
+            return call
+
+        plan = root_verifier.child_privilege_plan(
+            current_uid=0,
+            current_gid=0,
+            target_uid=1000,
+            target_gid=1000,
+        )
+        preexec = root_verifier.build_child_preexec(
+            plan,
+            pass_fds=(7, 9),
+            limit=20,
+            syscalls={name: record(name) for name in root_verifier.PRIVILEGE_SYSCALL_NAMES},
+        )
+        monkeypatch.setattr(root_verifier.os, "closerange", record("closerange"))
+        preexec()
+
+        assert trace == [
+            ("setgroups", ([],)),
+            ("setresgid", (1000, 1000, 1000)),
+            ("setresuid", (1000, 1000, 1000)),
+            ("closerange", (3, 7)),
+            ("closerange", (8, 9)),
+            ("closerange", (10, 20)),
+        ]
+
+    def test_the_preexec_body_still_sweeps_when_no_identity_change_is_possible(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        trace: list[tuple[int, int]] = []
+        monkeypatch.setattr(
+            root_verifier.os,
+            "closerange",
+            lambda low, high: trace.append((low, high)),
+        )
+        root_verifier.build_child_preexec(None, pass_fds=(5,), limit=12)()
+
+        assert trace == [(3, 5), (6, 12)]
+
+    def test_the_privilege_calls_are_the_exact_ordered_triple(self) -> None:
+        plan = root_verifier.child_privilege_plan(
+            current_uid=0,
+            current_gid=0,
+            target_uid=1000,
+            target_gid=1000,
+        )
+        assert root_verifier.child_privilege_calls(plan) == (
+            ("setgroups", ([],)),
+            ("setresgid", (1000, 1000, 1000)),
+            ("setresuid", (1000, 1000, 1000)),
+        )
+        assert root_verifier.child_privilege_calls(None) == ()
+
+    def test_a_platform_without_the_drop_syscalls_refuses_to_launch(self) -> None:
+        plan = root_verifier.child_privilege_plan(
+            current_uid=0,
+            current_gid=0,
+            target_uid=1000,
+            target_gid=1000,
+        )
+        applier = root_verifier.child_privilege_applier(plan, syscalls={})
+        with pytest.raises(
+            root_verifier.SignalFamilyRootVerifierError,
+            match="CHILD_LAUNCH_FAILED",
+        ):
+            applier()
+
+    def test_a_launch_without_a_preexec_callable_is_impossible_to_build(self) -> None:
+        with pytest.raises(
+            root_verifier.SignalFamilyRootVerifierError,
+            match="CHILD_LAUNCH_FAILED",
+        ):
+            root_verifier.build_child_preexec(None, pass_fds=(1, 4), limit=20)
+
+
+# ---------------------------------------------------------------------------------------
+# The root's own import closure
+# ---------------------------------------------------------------------------------------
+
+
+class TestRootImportClosure:
+    #: Everything `import rquant.signal_family_root_verifier` is permitted to pull in.
+    #: `rquant.signal_contracts` is present because WP4-a's `ACCEPTED_FAMILY_IDS` reads
+    #: `CURRENT_ENVELOPE_SCHEMA` from the contract module at import time rather than
+    #: restating the literal. It is the root's own installed package, never a module
+    #: under the selected generation, and no pair-to-surface entry names it.
+    ALLOWED_MODULES = (
+        "rquant",
+        "rquant.authority_path_security",
+        "rquant.runtime_authority",
+        "rquant.runtime_contracts",
+        "rquant.runtime_service_control",
+        "rquant.runtime_service_entrypoint",
+        "rquant.signal_contracts",
+        "rquant.signal_family_root_verifier",
+        "rquant.signal_family_successor_registry",
+        "rquant.signal_family_verification",
+        "rquant.strict_json",
+    )
+
+    #: Nothing here may ever appear: the twelve pair-to-surface modules, the builder and
+    #: harness layers, and the production profile that would drag a builder in with it.
+    FORBIDDEN_MODULES = (
+        "rquant.notification_state",
+        "rquant.paper_signal_consumer",
+        "rquant.paper_signal_worker",
+        "rquant.runtime_builder_daily_orchestrator",
+        "rquant.runtime_builder_paper",
+        "rquant.runtime_builder_serving",
+        "rquant.runtime_builder_shadow",
+        "rquant.runtime_builder_signal",
+        "rquant.runtime_builder_strategy",
+        "rquant.runtime_definition_bootstrap",
+        "rquant.runtime_production_profile",
+        "rquant.runtime_serving_authority",
+        "rquant.runtime_serving_snapshot",
+        "rquant.runtime_service_builtin",
+        "rquant.runtime_shadow_sources",
+        "rquant.serving_read_models",
+        "rquant.signal_route_spool",
+        "rquant.signal_router_runtime",
+        "rquant.strategy_runner",
+    )
+
+    @staticmethod
+    def _observed_closure() -> tuple[str, ...]:
+        import json
+        import subprocess
+
+        program = (
+            "import json, sys\n"
+            "import rquant.signal_family_root_verifier as verifier\n"
+            "assert verifier is not None\n"
+            "print(json.dumps(sorted(n for n in sys.modules if n.split('.')[0] == 'rquant')))\n"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", program],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return tuple(json.loads(completed.stdout))
+
+    def test_the_root_import_closure_is_exactly_the_allowed_module_set(self) -> None:
+        assert self._observed_closure() == self.ALLOWED_MODULES
+
+    def test_no_forbidden_module_reaches_the_root_interpreter(self) -> None:
+        observed = set(self._observed_closure())
+
+        assert observed.isdisjoint(self.FORBIDDEN_MODULES)
+
+    def test_every_pair_to_surface_module_is_on_the_forbidden_list(self) -> None:
+        declared = {
+            surface.value.rsplit(".", 1)[0]
+            for surface in verification.SurfaceId
+        }
+        modules = {
+            name if name in self.FORBIDDEN_MODULES else name.rsplit(".", 1)[0]
+            for name in declared
+        }
+
+        assert modules <= set(self.FORBIDDEN_MODULES)
+
+
+# ---------------------------------------------------------------------------------------
 # No caller-reachable append authority
 # ---------------------------------------------------------------------------------------
 

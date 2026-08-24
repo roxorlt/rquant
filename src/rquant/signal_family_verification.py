@@ -1039,7 +1039,6 @@ class SignalFamilyTestManifestV1(_PhaseCStrictModel):
             preimage[name] = [item.model_dump(mode="json") for item in values[name]]
         return cls(**values, content_hash=canonical_sha256(preimage))
 
-
     @classmethod
     def from_canonical_json(cls, payload: bytes | str) -> Self:
         """The inverse of `test_manifest_canonical_json_bytes`, for the root verifier."""

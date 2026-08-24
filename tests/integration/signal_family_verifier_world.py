@@ -28,6 +28,9 @@ from typing import Any
 
 from rquant import signal_family_verification as verification
 from rquant.runtime_authority import (
+    GENERATION_MANIFEST_NAME,
+    RECORD_SCHEMA_VERSION,
+    RuntimeAuthorityRecord,
     RuntimeAuthorityState,
     RuntimeGenerationLifecycle,
     RuntimeGenerationSlot,
@@ -50,6 +53,7 @@ POLICY_RELATIVE_PATH = "etc/rquant/signal-family-verifier-policy-v1.json"
 HARNESS_RELATIVE_PATH = "usr/local/libexec/rquant-signal-family-verifier-harness-v1.pyz"
 STORE_RELATIVE_PATH = "var/lib/rquant/signal-family-verification"
 GENERATIONS_RELATIVE_PATH = "srv/rquant/generations"
+_PROFILE_DOCUMENT_RELATIVE_PATH = "signal-family/profile-service-manifests-v1.json"
 
 _PARTICIPANTS: tuple[tuple[str, RuntimeServiceKind, float], ...] = (
     ("strategy.alpha.v1", RuntimeServiceKind.STRATEGY_LIVE, 90.0),
@@ -373,6 +377,9 @@ class VerifierWorld:
     bindings: tuple[verification.VerificationServiceBindingV1, ...]
     replay: Mapping[str, str]
     authority_epoch_key: str
+    profile_document_sha256: str
+    operation_id: str
+    sequence: int
 
     @property
     def store_database(self) -> Path:
@@ -667,7 +674,9 @@ def build_world(
     verification_manifest_bytes = verification.verification_manifest_canonical_json_bytes(
         verification_manifest
     )
+    profile_document_bytes = profile_document(manifests)
     documents = {
+        verifier.PROFILE_SERVICE_MANIFESTS_RELATIVE_PATH: profile_document_bytes,
         verification.SUCCESSOR_BUNDLE_RELATIVE_PATH: successor_bytes,
         verification.OVERLAY_BUNDLE_RELATIVE_PATH: overlay_bytes,
         verification.VERIFICATION_MANIFEST_RELATIVE_PATH: verification_manifest_bytes,
@@ -684,6 +693,10 @@ def build_world(
     verification_manifest_sha256 = full_manifest_entries[
         verification.VERIFICATION_MANIFEST_RELATIVE_PATH
     ]
+    profile_document_sha256 = full_manifest_entries[
+        verifier.PROFILE_SERVICE_MANIFESTS_RELATIVE_PATH
+    ]
+    write_full_manifest(generation_path, full_manifest_entries, profile_id=profile_id)
 
     report_path = tmp_path / "child-report.json"
     harness_path = root / HARNESS_RELATIVE_PATH
@@ -732,6 +745,7 @@ def build_world(
         slot=slot,
         profile_manifests=manifests,
         full_manifest_entries=full_manifest_entries,
+        profile_document_sha256=profile_document_sha256,
     )
     gateway = StubAuthorityGateway(snapshots=[snapshot])
     anchors = verifier.VerifierAnchors(
@@ -772,7 +786,87 @@ def build_world(
             full_manifest_hash=generation_id,
             profile_id=profile_id,
         ),
+        profile_document_sha256=profile_document_sha256,
+        operation_id=operation_id,
+        sequence=sequence,
     )
+
+
+def profile_document(manifests: Sequence[RuntimeServiceManifest]) -> bytes:
+    """The root-owned generation document that carries the profile's service manifests.
+
+    Its authority comes from two places at once: it is an entry of the full generation
+    manifest, and every `manifest_fingerprint` inside it must equal the
+    `service_manifest_fingerprint` of the matching service binding, which the external
+    root policy anchors through `five_pair_service_binding_set_hash`.
+    """
+
+    return canonical_json_bytes(
+        {
+            "schema_version": 1,
+            "service_manifests": [
+                manifest.model_dump(mode="json")
+                for manifest in sorted(manifests, key=lambda item: item.service_id)
+            ],
+        }
+    )
+
+
+def write_full_manifest(
+    generation_path: Path,
+    entries: Mapping[str, str],
+    *,
+    profile_id: str,
+) -> bytes:
+    """Write the generation's `full-manifest.json` in the shape the root parser reads."""
+
+    payload = canonical_json_bytes(
+        {
+            "entries": [
+                {
+                    "mode": 292,
+                    "nlink": 1,
+                    "owner_uid": os.getuid(),
+                    "path": relative,
+                    "sha256": digest_value,
+                    "size": (generation_path / relative).stat().st_size,
+                    "type": "file",
+                }
+                for relative, digest_value in sorted(entries.items())
+            ],
+            "profile_id": profile_id,
+            "roles": {},
+            "schema_id": "runtime-generation-manifest-v1",
+        }
+    )
+    target = generation_path / GENERATION_MANIFEST_NAME
+    if target.exists():
+        target.chmod(0o644)
+    target.write_bytes(payload)
+    target.chmod(0o444)
+    return payload
+
+
+def production_authority_record(world: VerifierWorld) -> RuntimeAuthorityRecord:
+    """The `load_runtime_authority()`-shaped record the production gateway consumes."""
+
+    return RuntimeAuthorityRecord(
+        schema_version=RECORD_SCHEMA_VERSION,
+        operation_id=world.operation_id,
+        sequence=world.sequence,
+        state=RuntimeAuthorityState.ACTIVE,
+        current=world.gateway.snapshots[0].slot,
+        prior=None,
+    )
+
+
+def rewrite_profile_document(world: VerifierWorld, payload: bytes) -> None:
+    """Replace the in-generation profile document without touching the full manifest."""
+
+    target = world.generation_path / _PROFILE_DOCUMENT_RELATIVE_PATH
+    target.chmod(0o644)
+    target.write_bytes(payload)
+    target.chmod(0o444)
 
 
 def rewrite_policy(

@@ -14,6 +14,7 @@ recompute the affected `*_hash` so the rule under test is the first failing chec
 from __future__ import annotations
 
 import hashlib
+import os
 import sqlite3
 import threading
 from datetime import UTC, datetime, timedelta
@@ -28,12 +29,17 @@ from rquant.runtime_service_entrypoint import RuntimeServiceKind
 from rquant.strict_json import canonical_json_bytes
 from tests.integration.signal_family_verifier_world import (
     OTHER_OPERATION_ID,
+    PROFILE_ID,
     VerifierWorld,
     build_world,
     digest,
+    production_authority_record,
+    profile_document,
     profile_manifests,
     rewrite_policy,
+    rewrite_profile_document,
     snapshot_with,
+    write_full_manifest,
 )
 
 pytestmark = pytest.mark.integration
@@ -600,6 +606,395 @@ def _republish_generation(
             release_entries=(entry,),
         ),
     )
+
+
+# ---------------------------------------------------------------------------------------
+# The production authority gateway: the one path a real deployment takes
+# ---------------------------------------------------------------------------------------
+
+
+class _ProductionGatewayWithStubLock(root_verifier.ProductionRuntimeAuthorityGateway):
+    """The real `load_snapshot()` with only the deployment lock stubbed.
+
+    `acquire_runtime_deployment_lock()` binds `/var/lib/rquant/...`, which no macOS
+    development host has. Everything the gateway does with the generation — reading the
+    full manifest, reading the profile service-manifest document, requiring the document
+    to be part of the source closure, and decoding both — runs for real here.
+    """
+
+    def __init__(self, *, authority_loader: Any, lock: Any) -> None:
+        super().__init__(authority_loader=authority_loader)
+        self._lock = lock
+
+    def acquire_deployment_lock(self) -> Any:
+        return self._lock
+
+
+def _production_verifier(world: VerifierWorld) -> root_verifier.RootVerifier:
+    return root_verifier.RootVerifier(
+        anchors=world.anchors,
+        authority_gateway=_ProductionGatewayWithStubLock(
+            authority_loader=lambda: production_authority_record(world),
+            lock=world.gateway.lock,
+        ),
+        clock=_clock,
+    )
+
+
+def _replace_profile_document(world: VerifierWorld, payload: bytes) -> None:
+    """Swap the profile document and re-publish the closure entry that names it.
+
+    Without the matching full-manifest entry the gateway's source-closure check fires
+    first, which would hide the fingerprint binding this test is about.
+    """
+
+    rewrite_profile_document(world, payload)
+    entries = dict(world.gateway.snapshots[0].full_manifest_entries)
+    entries[root_verifier.PROFILE_SERVICE_MANIFESTS_RELATIVE_PATH] = hashlib.sha256(
+        payload
+    ).hexdigest()
+    write_full_manifest(world.generation_path, entries, profile_id=PROFILE_ID)
+    world.gateway.snapshots = [
+        snapshot_with(
+            world,
+            full_manifest_entries=entries,
+            profile_document_sha256=entries[
+                root_verifier.PROFILE_SERVICE_MANIFESTS_RELATIVE_PATH
+            ],
+        )
+    ]
+
+
+class TestProductionAuthorityGateway:
+    def test_the_production_gateway_reaches_five_receipts(self, tmp_path: Path) -> None:
+        world = build_world(tmp_path)
+        result = _production_verifier(world).run()
+
+        assert result.outcome == "persisted"
+        assert tuple(receipt.pair_id for receipt in result.receipts) == verification.PAIR_IDS
+        assert len(_rows(world, "receipts")) == 5
+        assert len(_rows(world, "decisions")) == 1
+
+    def test_the_production_gateway_derives_the_same_snapshot_as_the_offline_stub(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        world = build_world(tmp_path)
+        gateway = _ProductionGatewayWithStubLock(
+            authority_loader=lambda: production_authority_record(world),
+            lock=world.gateway.lock,
+        )
+        assert gateway.load_snapshot().identity() == world.gateway.snapshots[0].identity()
+
+    def test_a_profile_document_outside_the_source_closure_rejects(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        world = build_world(tmp_path)
+        rewrite_profile_document(
+            world,
+            profile_document(profile_manifests({"notifier": 41.0})),
+        )
+        with pytest.raises(
+            root_verifier.SignalFamilyRootVerifierError,
+            match="BINDING_UNMANIFESTED",
+        ):
+            _production_verifier(world).run()
+        assert world.report_path.exists() is False
+        assert _rows(world, "receipts") == []
+
+    def test_the_gateway_itself_refuses_a_document_outside_the_source_closure(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The gateway is the layer that reads the document, so it checks it."""
+
+        world = build_world(tmp_path)
+        rewrite_profile_document(
+            world,
+            profile_document(profile_manifests({"notifier": 41.0})),
+        )
+        gateway = _ProductionGatewayWithStubLock(
+            authority_loader=lambda: production_authority_record(world),
+            lock=world.gateway.lock,
+        )
+        with pytest.raises(
+            root_verifier.SignalFamilyRootVerifierError,
+            match="BINDING_UNMANIFESTED",
+        ):
+            gateway.load_snapshot()
+
+    def test_the_verifier_itself_refuses_a_document_outside_the_source_closure(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """And so does the verifier, for any gateway that ever hands it one.
+
+        The two checks are deliberately independent: a gateway is an injected component,
+        so the root does not take its word for the closure membership of the document
+        that decided which services participate.
+        """
+
+        world = build_world(tmp_path)
+        world.gateway.snapshots = [
+            snapshot_with(world, profile_document_sha256=digest("unmanifested-document"))
+        ]
+        with pytest.raises(
+            root_verifier.SignalFamilyRootVerifierError,
+            match="BINDING_UNMANIFESTED",
+        ):
+            _verifier(world).run()
+        assert world.report_path.exists() is False
+        assert _rows(world, "receipts") == []
+
+    def test_a_profile_document_the_bindings_do_not_fingerprint_rejects(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A forged service manifest must require a `manifest_fingerprint` preimage.
+
+        The bindings carry the exact fingerprints, and the external policy anchors the
+        binding tuple through `five_pair_service_binding_set_hash`, so swapping a
+        manifest inside the document cannot be made to agree with the policy.
+        """
+
+        world = build_world(tmp_path)
+        _replace_profile_document(world, profile_document(profile_manifests({"notifier": 41.0})))
+        with pytest.raises(
+            root_verifier.SignalFamilyRootVerifierError,
+            match="BINDING_MISSING",
+        ):
+            _production_verifier(world).run()
+        assert world.report_path.exists() is False
+
+    def test_a_profile_document_missing_a_participant_rejects(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        world = build_world(tmp_path)
+        reduced = tuple(
+            manifest
+            for manifest in world.profile_manifests
+            if manifest.service_id != "notifier"
+        )
+        _replace_profile_document(world, profile_document(reduced))
+        with pytest.raises(
+            root_verifier.SignalFamilyRootVerifierError,
+            match="PARTICIPANT_RESOLUTION_INVALID",
+        ):
+            _production_verifier(world).run()
+        assert world.report_path.exists() is False
+
+    def test_a_profile_document_repeating_a_service_id_rejects(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        world = build_world(tmp_path)
+        doubled = (*world.profile_manifests, world.profile_manifests[0])
+        _replace_profile_document(world, profile_document(doubled))
+        with pytest.raises(
+            root_verifier.SignalFamilyRootVerifierError,
+            match="PARTICIPANT_RESOLUTION_INVALID",
+        ):
+            _production_verifier(world).run()
+
+    def test_the_production_gateway_binds_no_profile_id_equation(self) -> None:
+        """The document is never hashed against `slot.profile_id`.
+
+        `RuntimeClosureProfile` fixes `profile_id` as the hash of the runtime closure
+        body, which has no `service_manifests` key at all, so such an equation could
+        only hold on a SHA-256 collision.
+        """
+
+        source = Path(root_verifier.__file__).read_text(encoding="utf-8")
+        equations = [
+            line
+            for line in source.splitlines()
+            if "profile_id" in line and ("profile_payload" in line or "profile_sha256" in line)
+        ]
+
+        assert equations == []
+
+
+# ---------------------------------------------------------------------------------------
+# The readiness compare-and-swap guards
+# ---------------------------------------------------------------------------------------
+
+
+def _seed_readiness(world: VerifierWorld, state: str) -> None:
+    store = root_verifier.SignalFamilyVerificationStore.open(
+        world.store_root,
+        owner_uid=os.getuid(),
+    )
+    store.close()
+    connection = sqlite3.connect(str(world.store_database))
+    try:
+        connection.execute(
+            "INSERT INTO readiness_state "
+            "(overlay_content_hash, authority_epoch_key, state, updated_at) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                world.overlay_content_hash,
+                world.authority_epoch_key,
+                state,
+                verification.canonical_timestamp(VERIFIED_AT),
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+class TestReadinessCompareAndSwapGuards:
+    def test_a_key_already_revoked_cannot_be_swapped_to_ready(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The append transaction may only promote a key it observes as `DECLARED`.
+
+        The store row here is what an out-of-band revocation leaves behind: a readiness
+        record that is not `DECLARED` and no decision. A blind write would silently
+        resurrect it as `READY`.
+        """
+
+        world = build_world(tmp_path)
+        _seed_readiness(world, verification.SignalFamilyReadinessState.REVOKED.value)
+        with pytest.raises(
+            root_verifier.SignalFamilyRootVerifierError,
+            match="READINESS_TRANSITION_INVALID",
+        ):
+            _verifier(world).run()
+
+        states = {row[2] for row in _rows(world, "readiness_state")}
+        assert states == {verification.SignalFamilyReadinessState.REVOKED.value}
+        assert _rows(world, "decisions") == []
+        assert _rows(world, "receipts") == []
+
+    def test_a_key_already_rolled_back_cannot_be_swapped_to_ready(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        world = build_world(tmp_path)
+        _seed_readiness(world, verification.SignalFamilyReadinessState.ROLLED_BACK.value)
+        with pytest.raises(
+            root_verifier.SignalFamilyRootVerifierError,
+            match="READINESS_TRANSITION_INVALID",
+        ):
+            _verifier(world).run()
+        assert _rows(world, "decisions") == []
+
+    def test_a_key_already_ready_cannot_be_swapped_again(self, tmp_path: Path) -> None:
+        world = build_world(tmp_path)
+        _seed_readiness(world, verification.SignalFamilyReadinessState.READY.value)
+        with pytest.raises(
+            root_verifier.SignalFamilyRootVerifierError,
+            match="READINESS_TRANSITION_INVALID",
+        ):
+            _verifier(world).run()
+        assert _rows(world, "decisions") == []
+
+    def test_revoke_on_an_absent_key_rejects(self, tmp_path: Path) -> None:
+        world = build_world(tmp_path)
+        with pytest.raises(
+            root_verifier.SignalFamilyRootVerifierError,
+            match="READINESS_TRANSITION_INVALID",
+        ):
+            _verifier(world).revoke(
+                overlay_content_hash=world.overlay_content_hash,
+                authority_epoch_key=world.authority_epoch_key,
+            )
+
+    def test_rollback_on_a_declared_key_rejects(self, tmp_path: Path) -> None:
+        """`DECLARED -> ROLLED_BACK` is not one of the four frozen edges."""
+
+        world = build_world(tmp_path)
+        _seed_readiness(world, verification.SignalFamilyReadinessState.DECLARED.value)
+        with pytest.raises(
+            root_verifier.SignalFamilyRootVerifierError,
+            match="READINESS_TRANSITION_INVALID",
+        ):
+            _verifier(world).rollback(
+                overlay_content_hash=world.overlay_content_hash,
+                authority_epoch_key=world.authority_epoch_key,
+            )
+        states = {row[2] for row in _rows(world, "readiness_state")}
+        assert states == {verification.SignalFamilyReadinessState.DECLARED.value}
+
+    def test_revoke_on_a_declared_key_is_the_frozen_edge_that_passes(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        world = build_world(tmp_path)
+        _seed_readiness(world, verification.SignalFamilyReadinessState.DECLARED.value)
+        state = _verifier(world).revoke(
+            overlay_content_hash=world.overlay_content_hash,
+            authority_epoch_key=world.authority_epoch_key,
+        )
+        assert state is verification.SignalFamilyReadinessState.REVOKED
+
+
+# ---------------------------------------------------------------------------------------
+# Step 6: the root re-derives the generation plan after the child exits
+# ---------------------------------------------------------------------------------------
+
+
+class TestPostChildRederivation:
+    def test_a_test_manifest_replaced_while_the_child_runs_rejects_after_exit(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Step 6 must load the immutable manifests again, not reuse step 3's objects."""
+
+        world = build_world(tmp_path)
+        original = root_verifier.RootVerifier._run_child
+        target = world.generation_path / verification.TEST_MANIFEST_RELATIVE_PATH
+
+        def swapping_child(self: Any, *args: Any, **kwargs: Any) -> Any:
+            try:
+                return original(self, *args, **kwargs)
+            finally:
+                target.chmod(0o644)
+                target.write_bytes(canonical_json_bytes({"schema_version": 1}))
+                target.chmod(0o444)
+
+        monkeypatch.setattr(root_verifier.RootVerifier, "_run_child", swapping_child)
+        with pytest.raises(
+            root_verifier.SignalFamilyRootVerifierError,
+            match="TEST_MANIFEST_HASH_MISMATCH",
+        ):
+            _verifier(world).run()
+
+        assert world.report_path.exists() is True
+        assert _rows(world, "receipts") == []
+        assert _rows(world, "decisions") == []
+
+    def test_a_binding_source_replaced_while_the_child_runs_rejects_after_exit(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        world = build_world(tmp_path)
+        original = root_verifier.RootVerifier._run_child
+        target = world.generation_path / "src" / "rquant" / "strategy_runner.py"
+
+        def swapping_child(self: Any, *args: Any, **kwargs: Any) -> Any:
+            try:
+                return original(self, *args, **kwargs)
+            finally:
+                target.chmod(0o644)
+                target.write_bytes(b"# swapped under the running child\n")
+                target.chmod(0o444)
+
+        monkeypatch.setattr(root_verifier.RootVerifier, "_run_child", swapping_child)
+        with pytest.raises(
+            root_verifier.SignalFamilyRootVerifierError,
+            match="BINDING_WRONG_SOURCE_HASH",
+        ):
+            _verifier(world).run()
+
+        assert world.report_path.exists() is True
+        assert _rows(world, "receipts") == []
 
 
 # ---------------------------------------------------------------------------------------
