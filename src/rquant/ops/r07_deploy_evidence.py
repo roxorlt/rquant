@@ -837,6 +837,12 @@ class R07DeployEvidenceGate:
             raise R07EvidenceError(f"the private verifier refused the evidence: {exc}") from exc
 
 
+def _reportable_sha(value: str) -> str:
+    if len(value) == 40 and all(char in "0123456789abcdef" for char in value):
+        return value
+    return "0" * 40
+
+
 def _unreadable_decision(
     installed_commit_sha: str,
     target_commit_sha: str,
@@ -849,8 +855,8 @@ def _unreadable_decision(
         requires_evidence=False,
         installed_mode="unresolved",
         target_mode="unresolved",
-        installed_commit_sha=installed_commit_sha,
+        installed_commit_sha=_reportable_sha(installed_commit_sha),
         installed_tree_sha="0" * 40,
-        target_commit_sha=target_commit_sha,
+        target_commit_sha=_reportable_sha(target_commit_sha),
         target_tree_sha="0" * 40,
     )

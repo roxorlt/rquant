@@ -29,6 +29,11 @@ from typing import Protocol
 from zoneinfo import ZoneInfo
 
 from rquant.contained_subprocess import run_contained
+from rquant.ops.r07_deploy_evidence import (
+    LINUX_PRODUCTION_EVIDENCE_CACHE_DIR,
+    R07DeployDecision,
+    R07DeployEvidenceGate,
+)
 from rquant.release_generation import (
     ALL_LONG_RUNNING_SERVICES as _ALL_LONG_RUNNING_SERVICES,
 )
@@ -55,6 +60,21 @@ build_change_plan = build_deployment_change_plan
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 TARGET_PATTERN = re.compile(r"(?:v\d+\.\d+\.\d+|[0-9a-f]{40})")
 LINUX_PRODUCTION_RUNTIME_ROOT = Path("/home/lighthouse/rquant/data/runtime")
+
+
+class R07EvidenceGate(Protocol):
+    @property
+    def cache_dir(self) -> Path: ...
+
+    def evaluate(
+        self,
+        *,
+        repo: Path,
+        runner: Runner,
+        git_path: Path,
+        installed_commit_sha: str,
+        target_commit_sha: str,
+    ) -> R07DeployDecision: ...
 
 
 class PolicyError(RuntimeError):
@@ -349,6 +369,7 @@ class DeployConfig:
     runtime_profile_output_dir: Path | None = None
     runtime_root: Path | None = None
     runtime_schema_v1_migration_authority: Path | None = None
+    r07_evidence_cache_dir: Path | None = None
 
 
 @dataclass
@@ -367,6 +388,8 @@ class DeployResult:
     changed_files: tuple[str, ...]
     restart_services: tuple[str, ...]
     handoff_daemons: tuple[str, ...] = ()
+    r07_gate: str = ""
+    r07_target_tree_sha: str = ""
 
 
 def validate_target(target: str) -> str:
@@ -669,6 +692,64 @@ def _prepare_job_center_authority(
     runner.run(command)
 
 
+def _resolve_r07_evidence_cache_dir(config: DeployConfig) -> Path:
+    """The retained evidence cache directory, pinned exactly on Linux production."""
+
+    configured = config.r07_evidence_cache_dir
+    if config.release_profile == LINUX_RELEASE_PROFILE:
+        if configured is not None and configured != LINUX_PRODUCTION_EVIDENCE_CACHE_DIR:
+            raise PolicyError(
+                "Linux production R07 evidence cache directory must be exactly "
+                f"{LINUX_PRODUCTION_EVIDENCE_CACHE_DIR}"
+            )
+        return LINUX_PRODUCTION_EVIDENCE_CACHE_DIR
+    return configured or config.repo / "var" / "r07-dr-evidence"
+
+
+def _build_r07_evidence_gate(config: DeployConfig) -> R07DeployEvidenceGate:
+    return R07DeployEvidenceGate(cache_dir=_resolve_r07_evidence_cache_dir(config))
+
+
+def _require_r07_evidence(
+    config: DeployConfig,
+    runner: Runner,
+    gate: R07EvidenceGate,
+    *,
+    target: str,
+    previous_sha: str,
+    target_sha: str,
+) -> R07DeployDecision:
+    """Resolve the Release A/B gate before any checkout or service mutation."""
+
+    decision = gate.evaluate(
+        repo=config.repo,
+        runner=runner,
+        git_path=config.git_path,
+        installed_commit_sha=previous_sha,
+        target_commit_sha=target_sha,
+    )
+    if decision.allowed:
+        return decision
+    if not config.dry_run:
+        _append_audit(
+            config,
+            DeployResult(
+                "r07_gate_failed",
+                previous_sha,
+                target_sha,
+                target,
+                (),
+                (),
+                (),
+                decision.gate,
+                decision.target_tree_sha,
+            ),
+            error=decision.reason,
+            r07_decision=decision,
+        )
+    raise PolicyError(f"R07 deployment evidence gate refused the target: {decision.reason}")
+
+
 def _check_ancestor(
     runner: Runner,
     git_path: Path,
@@ -688,7 +769,13 @@ def _audit_path(config: DeployConfig) -> Path:
     return config.audit_path or config.repo / "logs" / "production-deploy.jsonl"
 
 
-def _append_audit(config: DeployConfig, result: DeployResult, *, error: str = "") -> None:
+def _append_audit(
+    config: DeployConfig,
+    result: DeployResult,
+    *,
+    error: str = "",
+    r07_decision: R07DeployDecision | None = None,
+) -> None:
     path = _audit_path(config)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -697,6 +784,7 @@ def _append_audit(config: DeployConfig, result: DeployResult, *, error: str = ""
         "changed_files": list(result.changed_files),
         "restart_services": list(result.restart_services),
         "error": error,
+        **({} if r07_decision is None else r07_decision.audit_fields()),
     }
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=True, sort_keys=True) + "\n")
@@ -1003,6 +1091,7 @@ def _recover_locked(
     runner: Runner,
     authority: GenerationAuthority,
     finalizer: GenerationFinalizer,
+    gate: R07EvidenceGate,
 ) -> DeployResult:
     action = config.recovery_action
     if action not in {"resume", "rollback"}:
@@ -1049,10 +1138,22 @@ def _recover_locked(
     dirty = _stdout(runner, [git, "status", "--porcelain", "--untracked-files=no"])
     if dirty:
         raise PolicyError("tracked production worktree changes must be resolved before recovery")
+    current_sha = _stdout(runner, [git, "rev-parse", "HEAD"])
+    decision: R07DeployDecision | None = None
+    if action == "rollback":
+        # A resume finishes the exact target the deployment gate already accepted; a rollback
+        # names a different commit and tree, so it passes the same Release A/B table again.
+        decision = _require_r07_evidence(
+            config,
+            runner,
+            gate,
+            target=config.target,
+            previous_sha=current_sha,
+            target_sha=expected_target,
+        )
     intent = _advance_intent(config, authority, intent, "recovery_started")
     if requires_handoff and config.handoff_operation_id != intent.handoff_operation_id:
         raise PolicyError("deployment handoff rebound was not durably committed before mutation")
-    current_sha = _stdout(runner, [git, "rev-parse", "HEAD"])
     if (
         action == "rollback"
         and config.runtime_root is not None
@@ -1082,8 +1183,10 @@ def _recover_locked(
         intent.changed_files,
         completed.restarted_services,
         plan.handoff_daemons,
+        "" if decision is None else decision.gate,
+        "" if decision is None else decision.target_tree_sha,
     )
-    _append_audit(config, result)
+    _append_audit(config, result, r07_decision=decision)
     return result
 
 
@@ -1132,11 +1235,12 @@ def _deploy_locked(
     runner: Runner,
     generation_authority: GenerationAuthority | None,
     generation_finalizer: GenerationFinalizer | None,
+    gate: R07EvidenceGate,
 ) -> DeployResult:
     if config.recovery_action is not None:
         if generation_authority is None or generation_finalizer is None:
             raise PolicyError("deployment recovery requires persistent generation authority")
-        return _recover_locked(config, runner, generation_authority, generation_finalizer)
+        return _recover_locked(config, runner, generation_authority, generation_finalizer, gate)
     target = validate_target(config.target)
     git_path = config.git_path
     if not git_path.is_absolute():
@@ -1177,6 +1281,14 @@ def _deploy_locked(
             or not change_plan.changed_files
         ):
             raise PolicyError("prepared deployment intent binding is invalid")
+        decision = _require_r07_evidence(
+            config,
+            runner,
+            gate,
+            target=target,
+            previous_sha=previous_sha,
+            target_sha=target_sha,
+        )
     else:
         if not config.dry_run:
             runner.run([git, "fetch", "--tags", "origin", "main"])
@@ -1201,9 +1313,27 @@ def _deploy_locked(
             "target is not contained in origin/main",
         )
         previous_sha = _stdout(runner, [git, "rev-parse", "HEAD"])
+        decision = _require_r07_evidence(
+            config,
+            runner,
+            gate,
+            target=target,
+            previous_sha=previous_sha,
+            target_sha=target_sha,
+        )
 
         if previous_sha == target_sha:
-            result = DeployResult("already_current", previous_sha, target_sha, target, (), (), ())
+            result = DeployResult(
+                "already_current",
+                previous_sha,
+                target_sha,
+                target,
+                (),
+                (),
+                (),
+                decision.gate,
+                decision.target_tree_sha,
+            )
             if config.dry_run:
                 _verify_dry_run_consistency(
                     config,
@@ -1218,7 +1348,7 @@ def _deploy_locked(
                 runner.run(
                     [config.rquant_bin, "preflight", "--runtime-root", str(config.runtime_root)]
                 )
-                _append_audit(config, result)
+                _append_audit(config, result, r07_decision=decision)
             return result
 
         _check_ancestor(
@@ -1266,6 +1396,8 @@ def _deploy_locked(
             change_plan.changed_files,
             change_plan.restart_services,
             change_plan.handoff_daemons,
+            decision.gate,
+            decision.target_tree_sha,
         )
         return result
 
@@ -1387,8 +1519,10 @@ def _deploy_locked(
             change_plan.changed_files,
             completed.restarted_services,
             change_plan.handoff_daemons,
+            decision.gate,
+            decision.target_tree_sha,
         )
-        _append_audit(config, result)
+        _append_audit(config, result, r07_decision=decision)
         return result
 
     restarted: list[str] = []
@@ -1445,8 +1579,10 @@ def _deploy_locked(
         change_plan.changed_files,
         tuple(restarted),
         change_plan.handoff_daemons,
+        decision.gate,
+        decision.target_tree_sha,
     )
-    _append_audit(config, result)
+    _append_audit(config, result, r07_decision=decision)
     return result
 
 
@@ -1456,6 +1592,7 @@ def deploy(
     runner: Runner | None = None,
     generation_authority: GenerationAuthority | None = None,
     generation_finalizer: GenerationFinalizer | None = None,
+    r07_evidence_gate: R07EvidenceGate | None = None,
 ) -> DeployResult:
     validate_release_profile(config.release_profile, config.platform_name)
     runtime_profile_values = (
@@ -1482,6 +1619,7 @@ def deploy(
         (config.runtime_production_inputs, "runtime production inputs"),
         (config.runtime_profile_output_dir, "runtime profile output directory"),
         (config.runtime_root, "runtime root"),
+        (config.r07_evidence_cache_dir, "R07 evidence cache directory"),
         (
             config.runtime_schema_v1_migration_authority,
             "runtime schema v1 migration authority",
@@ -1543,7 +1681,9 @@ def deploy(
         runtime_profile_output_dir=config.runtime_profile_output_dir,
         runtime_root=config.runtime_root,
         runtime_schema_v1_migration_authority=(config.runtime_schema_v1_migration_authority),
+        r07_evidence_cache_dir=config.r07_evidence_cache_dir,
     )
+    effective_gate = r07_evidence_gate or _build_r07_evidence_gate(effective_config)
     effective_runner = runner or SubprocessRunner(
         repo,
         trusted_git_path=effective_config.git_path,
@@ -1634,6 +1774,7 @@ def deploy(
             effective_runner,
             generation_authority,
             generation_finalizer,
+            effective_gate,
         )
     coordination = (
         _deployment_preview_coordination(lock_path)
@@ -1646,6 +1787,7 @@ def deploy(
             effective_runner,
             generation_authority,
             generation_finalizer,
+            effective_gate,
         )
 
 

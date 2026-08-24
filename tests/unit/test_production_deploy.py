@@ -16,6 +16,8 @@ from zoneinfo import ZoneInfo
 import pytest
 
 import rquant.ops.production_deploy as production_deploy
+import rquant.ops.r07_deploy_evidence as r07_deploy_evidence
+import rquant.signal_family_differential_gate as differential_gate
 from rquant.contained_subprocess import ContainedProcessError
 from rquant.ops.production_deploy import (
     ALL_LONG_RUNNING_SERVICES,
@@ -34,6 +36,10 @@ from rquant.ops.production_deploy import (
     validate_target,
 )
 from rquant.release_generation import DeploymentIntent
+from tests.unit.test_signal_family_differential_evidence import (
+    _enforced_policy_bytes,
+    _valid_wire_bytes,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -385,6 +391,7 @@ def _base_responses(target: str = "v0.13.2") -> dict[tuple[str, ...], tuple[int,
             0,
             f'[project]\nname = "rquant"\nversion = "{target[1:]}"\n',
         )
+    responses.update(_r07_responses())
     return responses
 
 
@@ -1212,21 +1219,36 @@ def test_runtime_profile_dry_run_leaves_filesystem_byte_identical(tmp_path: Path
 
 
 def test_already_current_dry_run_profiles_target_without_writing(tmp_path: Path) -> None:
+    enforced = _r07_policy_bytes(enforced_predecessor=(_sha("b"), R07_TARGET_TREE))
     responses = _base_responses()
     responses[("git", "rev-parse", "HEAD")] = (0, f"{_sha('b')}\n")
+    responses.update(
+        _r07_responses(installed_sha=_sha("b"), installed_policy=enforced, target_policy=enforced)
+    )
+    responses[("git", "rev-parse", "--verify", f"{_sha('b')}^{{tree}}")] = (
+        0,
+        f"{R07_TARGET_TREE}\n",
+    )
     lock_path = tmp_path / "deploy.lock"
     lock_path.write_bytes(b"stable-lock")
     lock_path.chmod(0o600)
     baseline = _config(tmp_path, dry_run=True)
     config = DeployConfig(**{**baseline.__dict__, "lock_path": lock_path})
     runner = FakeRunner(responses)
+    _seed_r07_cache(
+        tmp_path,
+        commit_sha=_sha("b"),
+        tree_sha=R07_TARGET_TREE,
+        policy=enforced,
+    )
+    gate = _r07_gate(tmp_path)
 
     before = {
         str(path.relative_to(tmp_path)): path.read_bytes()
         for path in tmp_path.rglob("*")
         if path.is_file()
     }
-    result = deploy(config, runner=runner)
+    result = deploy(config, runner=runner, r07_evidence_gate=gate)
     after = {
         str(path.relative_to(tmp_path)): path.read_bytes()
         for path in tmp_path.rglob("*")
@@ -1234,6 +1256,7 @@ def test_already_current_dry_run_profiles_target_without_writing(tmp_path: Path)
     }
 
     assert result.status == "already_current"
+    assert result.r07_gate == "enforced"
     assert any(call[:2] == ("rquant", "runtime-production-profile") for call in runner.calls)
     assert after == before
 
@@ -1512,6 +1535,22 @@ def test_recovery_atomically_adopts_prepared_only_intent_before_rebinding(
     responses = _base_responses()
     expected_target = prepared.target_sha if recovery_action == "resume" else prepared.previous_sha
     responses[("git", "rev-parse", "HEAD")] = (0, f"{expected_target}\n")
+    if recovery_action == "rollback":
+        enforced = _r07_policy_bytes(enforced_predecessor=(_sha("9"), _sha("8")))
+        responses.update(
+            _r07_responses(
+                installed_sha=expected_target,
+                target_sha=expected_target,
+                installed_policy=enforced,
+                target_policy=enforced,
+            )
+        )
+        _seed_r07_cache(
+            tmp_path,
+            commit_sha=expected_target,
+            tree_sha=R07_TARGET_TREE,
+            policy=enforced,
+        )
 
     with pytest.raises(PolicyError, match="durably committed"):
         deploy(
@@ -1519,6 +1558,7 @@ def test_recovery_atomically_adopts_prepared_only_intent_before_rebinding(
             runner=FakeRunner(responses),
             generation_authority=authority,
             generation_finalizer=FakeGenerationFinalizer(),
+            r07_evidence_gate=_r07_gate(tmp_path),
         )
 
     assert authority.events[0] == ("intent_adopted", prepared.operation_id)
@@ -1981,6 +2021,7 @@ def test_recovery_audit_failure_prevents_invalidation_and_external_mutation(
     assert runner.calls == [
         ("git", "rev-parse", "--abbrev-ref", "HEAD"),
         ("git", "status", "--porcelain", "--untracked-files=no"),
+        ("git", "rev-parse", "HEAD"),
     ]
 
 
@@ -2814,7 +2855,10 @@ def test_real_git_repository_deploys_annotated_fast_forward_tag(
     base_sha = git("rev-parse", "HEAD")
 
     preflight.write_text("BASELINE = False\n", encoding="utf-8")
-    git("add", "src/rquant/preflight.py")
+    policy_dir = repo / "tests" / "fixtures" / "r07_differential_gate"
+    policy_dir.mkdir(parents=True)
+    (policy_dir / "policy-v1.json").write_bytes(_r07_policy_bytes())
+    git("add", "src/rquant/preflight.py", R07_POLICY_RELATIVE_PATH)
     git("commit", "-m", "target")
     target_sha = git("rev-parse", "HEAD")
     git("tag", "-a", "v0.13.2", "-m", "release")
@@ -2854,6 +2898,8 @@ def test_real_git_repository_deploys_annotated_fast_forward_tag(
     result = deploy(config)
 
     assert result.status == "deployed"
+    assert result.r07_gate == "bootstrap_disabled"
+    assert result.r07_target_tree_sha == git("rev-parse", "--verify", f"{target_sha}^{{tree}}")
     assert result.target_sha == target_sha
     assert git("rev-parse", "HEAD") == target_sha
     assert not fake_git_called.exists()
@@ -2956,3 +3002,386 @@ def test_process_runner_base_exception_contains_detached_grandchild(
     time.sleep(0.5)
 
     assert not marker.exists()
+
+
+R07_POLICY_RELATIVE_PATH = "tests/fixtures/r07_differential_gate/policy-v1.json"
+R07_INSTALLED_TREE = _sha("e")
+R07_TARGET_TREE = _sha("d")
+R07_INSTALLED_BLOB = _sha("1")
+R07_TARGET_BLOB = _sha("2")
+
+
+def _r07_policy_bytes(*, enforced_predecessor: tuple[str, str] | None = None) -> bytes:
+    if enforced_predecessor is None:
+        return (ROOT / R07_POLICY_RELATIVE_PATH).read_bytes()
+    commit_sha, tree_sha = enforced_predecessor
+    return _enforced_policy_bytes(commit_sha, tree_sha)
+
+
+def _r07_responses(
+    *,
+    installed_sha: str = _sha("a"),
+    target_sha: str = _sha("b"),
+    installed_policy: bytes | None = None,
+    target_policy: bytes | None = b"",
+) -> dict[tuple[str, ...], tuple[int, str]]:
+    """Git object responses for the installed and target R07 policy reads."""
+
+    resolved_target = _r07_policy_bytes() if target_policy == b"" else target_policy
+    responses: dict[tuple[str, ...], tuple[int, str]] = {
+        ("git", "rev-parse", "--verify", f"{installed_sha}^{{tree}}"): (
+            0,
+            f"{R07_INSTALLED_TREE}\n",
+        ),
+        ("git", "rev-parse", "--verify", f"{target_sha}^{{tree}}"): (0, f"{R07_TARGET_TREE}\n"),
+    }
+    for sha, payload, blob in (
+        (installed_sha, installed_policy, R07_INSTALLED_BLOB),
+        (target_sha, resolved_target, R07_TARGET_BLOB),
+    ):
+        listing = (
+            "" if payload is None else f"100644 blob {blob}\t{R07_POLICY_RELATIVE_PATH}\n"
+        )
+        responses[
+            ("git", "ls-tree", "--full-tree", sha, "--", R07_POLICY_RELATIVE_PATH)
+        ] = (0, listing)
+        if payload is not None:
+            responses[("git", "cat-file", "blob", blob)] = (0, payload.decode("utf-8"))
+    return responses
+
+
+class _RecordingVerifier:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def __call__(self, repo: Path, policy: object, wire: object) -> object:
+        self.calls.append(wire.candidate_commit_sha)
+        return object()
+
+
+class _EmptyTransport:
+    def __init__(self) -> None:
+        self.requests: list[str] = []
+
+    def get(self, url: str, *, token: str, accept: str) -> bytes:
+        self.requests.append(url)
+        raise r07_deploy_evidence.R07EvidenceError("the evidence channel is unavailable")
+
+
+class _StaticTokenProvider:
+    def token(self) -> str:
+        return "ghs-test-token"
+
+
+def _r07_gate(
+    tmp_path: Path,
+    *,
+    verifier: object | None = None,
+    transport: object | None = None,
+) -> object:
+    return r07_deploy_evidence.R07DeployEvidenceGate(
+        cache_dir=tmp_path / "var" / "r07-dr-evidence",
+        transport=transport or _EmptyTransport(),
+        token_provider=_StaticTokenProvider(),
+        clock=lambda: 0.0,
+        verifier=verifier or _RecordingVerifier(),
+    )
+
+
+def _seed_r07_cache(tmp_path: Path, *, commit_sha: str, tree_sha: str, policy: bytes) -> Path:
+    parsed = r07_deploy_evidence.parse_policy_blob(policy)
+    return r07_deploy_evidence.write_cached_evidence(
+        cache_dir=tmp_path / "var" / "r07-dr-evidence",
+        commit_sha=commit_sha,
+        payload=_valid_wire_bytes(commit_sha, tree_sha, policy=parsed),
+    )
+
+
+def _audit_records(config: DeployConfig) -> list[dict[str, object]]:
+    assert config.audit_path is not None
+    if not config.audit_path.exists():
+        return []
+    return [
+        json.loads(line)
+        for line in config.audit_path.read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+
+
+class TestR07Bootstrap:
+    """Release A/B evidence gate on the exact-target deployment chain."""
+
+    def test_release_a_installs_once_and_audits_the_bootstrap_pair(self, tmp_path: Path) -> None:
+        responses = _base_responses()
+        runner = FakeRunner(responses)
+        config = _config(tmp_path)
+
+        result = deploy(config, runner=runner, r07_evidence_gate=_r07_gate(tmp_path))
+
+        assert result.status == "deployed"
+        assert result.r07_gate == "bootstrap_disabled"
+        assert result.r07_target_tree_sha == R07_TARGET_TREE
+        record = _audit_records(config)[-1]
+        assert record["r07_gate"] == "bootstrap_disabled"
+        assert record["r07_target_commit_sha"] == _sha("b")
+        assert record["r07_target_tree_sha"] == R07_TARGET_TREE
+        assert record["r07_installed_mode"] == "absent"
+        assert record["r07_target_mode"] == "disabled_for_bootstrap"
+
+    def test_release_b_deploys_only_with_verified_enforced_evidence(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        enforced = _r07_policy_bytes(enforced_predecessor=(_sha("a"), R07_INSTALLED_TREE))
+        responses = _base_responses()
+        responses.update(
+            _r07_responses(installed_policy=_r07_policy_bytes(), target_policy=enforced)
+        )
+        _seed_r07_cache(
+            tmp_path,
+            commit_sha=_sha("b"),
+            tree_sha=R07_TARGET_TREE,
+            policy=enforced,
+        )
+        verifier = _RecordingVerifier()
+        runner = FakeRunner(responses)
+        config = _config(tmp_path)
+
+        result = deploy(
+            config,
+            runner=runner,
+            r07_evidence_gate=_r07_gate(tmp_path, verifier=verifier),
+        )
+
+        assert result.status == "deployed"
+        assert result.r07_gate == "enforced"
+        assert verifier.calls == [_sha("b")]
+        assert _audit_records(config)[-1]["r07_gate"] == "enforced"
+
+    @pytest.mark.parametrize(
+        ("installed_policy", "target_policy", "expected"),
+        [
+            pytest.param("disabled", "disabled", "bootstrap", id="disabled-to-disabled"),
+            pytest.param("disabled", None, "pre-R07", id="disabled-to-absent"),
+            pytest.param(None, None, "pre-R07", id="absent-to-absent"),
+            pytest.param(None, "enforced", "predecessor", id="absent-to-enforced"),
+            pytest.param(
+                "disabled",
+                "enforced-other",
+                "predecessor",
+                id="disabled-to-enforced-wrong-predecessor",
+            ),
+            pytest.param("enforced", "disabled", "bootstrap", id="enforced-to-disabled"),
+            pytest.param("enforced", None, "pre-R07", id="enforced-to-absent"),
+        ],
+    )
+    def test_rejected_transitions_never_reach_checkout_or_services(
+        self,
+        tmp_path: Path,
+        installed_policy: str | None,
+        target_policy: str | None,
+        expected: str,
+    ) -> None:
+        payloads = {
+            None: None,
+            "disabled": _r07_policy_bytes(),
+            "enforced": _r07_policy_bytes(
+                enforced_predecessor=(_sha("a"), R07_INSTALLED_TREE)
+            ),
+            "enforced-other": _r07_policy_bytes(
+                enforced_predecessor=(_sha("9"), _sha("8"))
+            ),
+        }
+        responses = _base_responses()
+        responses.update(
+            _r07_responses(
+                installed_policy=payloads[installed_policy],
+                target_policy=payloads[target_policy],
+            )
+        )
+        runner = FakeRunner(responses)
+        config = _config(tmp_path)
+
+        with pytest.raises(PolicyError, match="R07"):
+            deploy(config, runner=runner, r07_evidence_gate=_r07_gate(tmp_path))
+
+        assert expected in str(_audit_records(config)[-1]["error"])
+        assert _audit_records(config)[-1]["status"] == "r07_gate_failed"
+        assert not any(call[:2] == ("git", "merge") for call in runner.calls)
+        assert not any(call[:2] == ("git", "reset") for call in runner.calls)
+        assert not any(call[0] in {"systemctl", "sudo"} for call in runner.calls)
+        assert not any("uv" in call[0] for call in runner.calls)
+
+    def test_unavailable_evidence_channel_blocks_before_checkout(self, tmp_path: Path) -> None:
+        enforced = _r07_policy_bytes(enforced_predecessor=(_sha("a"), R07_INSTALLED_TREE))
+        responses = _base_responses()
+        responses.update(
+            _r07_responses(installed_policy=_r07_policy_bytes(), target_policy=enforced)
+        )
+        transport = _EmptyTransport()
+        runner = FakeRunner(responses)
+        config = _config(tmp_path)
+
+        with pytest.raises(PolicyError, match="R07"):
+            deploy(
+                config,
+                runner=runner,
+                r07_evidence_gate=_r07_gate(tmp_path, transport=transport),
+            )
+
+        assert transport.requests
+        assert not any(call[:2] == ("git", "merge") for call in runner.calls)
+        assert _audit_records(config)[-1]["status"] == "r07_gate_failed"
+
+    def test_evidence_for_another_commit_never_satisfies_the_target(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        enforced = _r07_policy_bytes(enforced_predecessor=(_sha("a"), R07_INSTALLED_TREE))
+        responses = _base_responses()
+        responses.update(
+            _r07_responses(installed_policy=_r07_policy_bytes(), target_policy=enforced)
+        )
+        _seed_r07_cache(
+            tmp_path,
+            commit_sha=_sha("c"),
+            tree_sha=R07_TARGET_TREE,
+            policy=enforced,
+        )
+        runner = FakeRunner(responses)
+        config = _config(tmp_path)
+
+        with pytest.raises(PolicyError, match="R07"):
+            deploy(config, runner=runner, r07_evidence_gate=_r07_gate(tmp_path))
+
+        assert not any(call[:2] == ("git", "merge") for call in runner.calls)
+
+    def test_cached_evidence_for_another_tree_is_rejected(self, tmp_path: Path) -> None:
+        enforced = _r07_policy_bytes(enforced_predecessor=(_sha("a"), R07_INSTALLED_TREE))
+        responses = _base_responses()
+        responses.update(
+            _r07_responses(installed_policy=_r07_policy_bytes(), target_policy=enforced)
+        )
+        _seed_r07_cache(
+            tmp_path,
+            commit_sha=_sha("b"),
+            tree_sha=R07_INSTALLED_TREE,
+            policy=enforced,
+        )
+        runner = FakeRunner(responses)
+
+        with pytest.raises(PolicyError, match="R07"):
+            deploy(_config(tmp_path), runner=runner, r07_evidence_gate=_r07_gate(tmp_path))
+
+        assert not any(call[:2] == ("git", "merge") for call in runner.calls)
+
+    def test_already_current_bootstrap_target_is_rejected(self, tmp_path: Path) -> None:
+        responses = _base_responses()
+        responses[("git", "rev-parse", "HEAD")] = (0, f"{_sha('b')}\n")
+        responses.update(
+            _r07_responses(
+                installed_sha=_sha("b"),
+                installed_policy=_r07_policy_bytes(),
+            )
+        )
+        runner = FakeRunner(responses)
+
+        with pytest.raises(PolicyError, match="R07"):
+            deploy(_config(tmp_path), runner=runner, r07_evidence_gate=_r07_gate(tmp_path))
+
+        assert not any(
+            call[:2] in {("rquant", "preflight"), ("rquant", "runtime-production-profile")}
+            for call in runner.calls
+        )
+
+    def test_dry_run_reports_the_decision_without_mutating_the_checkout(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        responses = _base_responses()
+        runner = FakeRunner(responses)
+        config = _config(tmp_path, dry_run=True)
+        before = {
+            str(path.relative_to(tmp_path)): path.read_bytes()
+            for path in tmp_path.rglob("*")
+            if path.is_file()
+        }
+
+        result = deploy(config, runner=runner, r07_evidence_gate=_r07_gate(tmp_path))
+
+        assert result.status == "dry_run"
+        assert result.r07_gate == "bootstrap_disabled"
+        assert result.r07_target_tree_sha == R07_TARGET_TREE
+        assert not any(call[:2] == ("git", "merge") for call in runner.calls)
+        assert {
+            str(path.relative_to(tmp_path)): path.read_bytes()
+            for path in tmp_path.rglob("*")
+            if path.is_file()
+        } == before
+
+    def test_recovery_rollback_target_passes_the_same_gate(self, tmp_path: Path) -> None:
+        authority = FakeGenerationAuthority()
+        authority.begin_deployment_intent(
+            previous_sha=_sha("a"),
+            target_sha=_sha("b"),
+            target_ref="v0.13.2",
+            changed_files=("src/rquant/preflight.py",),
+            restart_services=(),
+            active_services=(),
+            active_timers=(),
+            marker_generation="marker-a",
+        )
+        responses = _base_responses()
+        responses[("git", "rev-parse", "HEAD")] = (0, f"{_sha('b')}\n")
+        responses.update(
+            _r07_responses(
+                installed_sha=_sha("b"),
+                target_sha=_sha("a"),
+                installed_policy=_r07_policy_bytes(),
+                target_policy=None,
+            )
+        )
+        baseline = _config(tmp_path)
+        config = DeployConfig(
+            **{**baseline.__dict__, "recovery_action": "rollback", "target": _sha("a")}
+        )
+        runner = FakeRunner(responses)
+
+        with pytest.raises(PolicyError, match="R07"):
+            deploy(
+                config,
+                runner=runner,
+                generation_authority=authority,
+                generation_finalizer=FakeGenerationFinalizer(),
+                r07_evidence_gate=_r07_gate(tmp_path),
+            )
+
+        assert not any(call[:2] == ("git", "reset") for call in runner.calls)
+        assert not any(call[0] == "systemctl" for call in runner.calls)
+        assert authority.intent is not None and authority.intent.stage == "planned"
+        assert _audit_records(config)[-1]["status"] == "r07_gate_failed"
+
+    def test_default_gate_pins_the_production_cache_and_private_verifier(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        gate = production_deploy._build_r07_evidence_gate(_config(tmp_path))
+
+        assert gate.cache_dir == production_deploy.LINUX_PRODUCTION_EVIDENCE_CACHE_DIR
+        assert gate.cache_dir == Path("/home/lighthouse/rquant/var/r07-dr-evidence")
+        assert (
+            r07_deploy_evidence.DEFAULT_EVIDENCE_VERIFIER
+            is differential_gate.verify_wire
+        )
+
+    def test_linux_production_refuses_another_evidence_cache_directory(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        baseline = _config(tmp_path)
+        config = DeployConfig(
+            **{**baseline.__dict__, "r07_evidence_cache_dir": tmp_path / "var"}
+        )
+
+        with pytest.raises(PolicyError, match="evidence cache"):
+            deploy(config, runner=FakeRunner(_base_responses()))
