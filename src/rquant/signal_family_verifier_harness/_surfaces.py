@@ -11,16 +11,16 @@ cannot substitute for that path*. So every exercise here does the same four thin
    bind the frozen surface to it, proving `bound.__func__` is the object ruling O2 resolved;
 4. call it with the vector's arguments and project the return into bounded canonical JSON.
 
-Step three is the part that cannot be faked. `paper_broker_builder` and its siblings build
-their readers during `build(manifest)` and close over them, so reading the cell by name is
-how the child gets *the builder's* object rather than one of its own.
+Step three is the part that cannot be faked. `notifier_builder`, `paper_broker_builder`,
+and `serving_publisher_builder` build their readers during `build(manifest)` and close over
+them, so reading the cell by name is how the child gets *the builder's* object rather than
+one of its own.
 
-Three of the thirteen reader surfaces are exercised. `BLOCKED_SURFACE_REASONS` names the
-other ten and says exactly what stops each of them; a vector that asks for one is refused
-rather than answered with a substitute. Every blocked reason is a property of the child the
-root actually launches — a sanitized eight-key environment and a `mkdtemp` cwd under a
-sticky temp root — not of a development machine, so none of them can be papered over by
-running the exercise somewhere friendlier.
+Eight of the thirteen reader surfaces are exercised. `BLOCKED_SURFACE_REASONS` names the
+other five and says exactly what stops each of them; a vector that asks for one is refused
+rather than answered with a substitute. The five that remain all need producer-side state
+no bounded vector can carry — an audited runner-state SQLite, a signed legacy shadow export
+— and none of them can be reached by running the exercise somewhere friendlier.
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Final
 
-from ._canonical import canonical_json_bytes, canonical_sha256
+from ._canonical import canonical_json_bytes, canonical_sha256, sha256_hex
 from ._request import RequestVector
 from ._resolve import bound_surface, resolve_surface
 from ._workspace import VectorWorkspace, WorkspaceError, tree_digest
@@ -53,21 +53,10 @@ _SERVICE_KEYS: Final[tuple[str, ...]] = (
     "stale_after_seconds",
 )
 
-#: The ten reader surfaces this harness version refuses to answer, and why. Each reason is a
+#: The five reader surfaces this harness version refuses to answer, and why. Each reason is a
 #: delivery gap recorded in `wp4c-report.md`, not a silent omission: the child rejects the
 #: whole run rather than returning a substitute observation.
 BLOCKED_SURFACE_REASONS: Final[dict[str, str]] = {
-    "rquant.signal_route_spool.ReadonlySignalRouteSpool.routed_after_global_sequence": (
-        "notifier_builder always imports rquant.runtime_notification_providers when no "
-        "provider loader is injected, and that module reaches rquant.config, which builds a "
-        "process-wide Settings at import and demands DATA_DIR / DUCKDB_PATH / PARQUET_DIR / "
-        "LOG_DIR / TUSHARE_TOKEN_MAIN; the child's frozen eight-key environment carries none "
-        "of them"
-    ),
-    "rquant.notification_state.NotificationStateStore.replicate": (
-        "the store is only reachable through notifier_builder, so it is blocked by the same "
-        "import-time rquant.config Settings construction"
-    ),
     "rquant.signal_router_runtime.ReadonlyStrategyRunnerSignalSource.read_batch": (
         "the reader opens a runner-state SQLite whose audited runner_metadata / "
         "runner_source_identity / runner_signal schema only StrategyRunnerStore.process_batch "
@@ -89,18 +78,6 @@ BLOCKED_SURFACE_REASONS: Final[dict[str, str]] = {
     ),
     "rquant.runtime_shadow_sources.isolated_signal_observations": (
         "same accepted-export precondition as _FilesystemRunnerSource.read_completed_batch"
-    ),
-    "rquant.runtime_serving_authority.ServingSourceAuthorityReader.__call__": (
-        "runtime_serving_authority walks the authority root's whole parent chain and refuses "
-        "any group- or world-writable ancestor; the child's cwd is a mkdtemp under a sticky "
-        "1777 temp root, so no authority can be materialized inside the isolated cwd"
-    ),
-    "rquant.runtime_serving_snapshot.ServingSnapshotAssembler.assemble": (
-        "the assembler is only built once six source authorities exist, which the sticky-cwd "
-        "parent-chain rule blocks"
-    ),
-    "rquant.serving_read_models.build_serving_read_models": (
-        "its input is the assembler's snapshot, which the sticky-cwd parent-chain rule blocks"
     ),
 }
 
@@ -130,6 +107,12 @@ class ExerciseContext:
         value = self.call.get(name)
         if type(value) is not int:
             raise SurfaceExerciseError(f"vector call.{name} must be an integer")
+        return value
+
+    def text(self, name: str) -> str:
+        value = self.call.get(name)
+        if type(value) is not str or not value:
+            raise SurfaceExerciseError(f"vector call.{name} must be a nonempty string")
         return value
 
 
@@ -199,6 +182,62 @@ def _closure_value(step: Any, name: str, expected: type[Any]) -> Any:
     return value
 
 
+def _notifier_step(context: ExerciseContext, spec: SurfaceSpec) -> Any:
+    from rquant.runtime_builder_signal import notifier_builder
+
+    manifest = _service_manifest(context, spec)
+    try:
+        return notifier_builder(clock=lambda: context.observed_at)(manifest)
+    except (TypeError, ValueError) as exc:
+        raise SurfaceExerciseError("the notifier production builder refused the vector") from exc
+
+
+def _serving_publisher_step(context: ExerciseContext, spec: SurfaceSpec) -> Any:
+    from rquant.runtime_builder_serving import serving_publisher_builder
+
+    manifest = _service_manifest(context, spec)
+    try:
+        return serving_publisher_builder(
+            snapshot_loader=None,
+            clock=lambda: context.observed_at,
+        )(manifest)
+    except (TypeError, ValueError) as exc:
+        raise SurfaceExerciseError(
+            "the serving publisher production builder refused the vector"
+        ) from exc
+
+
+def _closure_assembler(step: Any) -> Any:
+    """The assembler the serving builder wired, taken through its own bound loader.
+
+    `serving_publisher_builder` keeps only `assembler.assemble` in the closure, which is the
+    strongest form of this evidence available: the bound method carries both the object the
+    builder constructed and the function it is bound to.
+    """
+
+    from rquant.runtime_serving_snapshot import ServingSnapshotAssembler
+
+    code = getattr(step, "__code__", None)
+    cells = getattr(step, "__closure__", None)
+    if code is None or cells is None:  # pragma: no cover - builders return closures
+        raise SurfaceExerciseError("the production builder did not return a closure step")
+    names = tuple(code.co_freevars)
+    if "resolved_snapshot_loader" not in names:
+        raise SurfaceExerciseError("the serving builder step does not capture its loader")
+    loader = cells[names.index("resolved_snapshot_loader")].cell_contents
+    assembler = getattr(loader, "__self__", None)
+    if type(assembler) is not ServingSnapshotAssembler:
+        raise SurfaceExerciseError(
+            "the serving builder did not wire a ServingSnapshotAssembler; an injected "
+            "snapshot loader cannot substitute for the owner-authority path"
+        )
+    if loader.__func__ is not resolve_surface(
+        "rquant.runtime_serving_snapshot.ServingSnapshotAssembler.assemble"
+    ):
+        raise SurfaceExerciseError("the serving builder's loader is not the frozen assemble")
+    return assembler
+
+
 def _paper_broker_step(context: ExerciseContext, spec: SurfaceSpec) -> Any:
     from rquant.runtime_builder_paper import paper_broker_builder
 
@@ -228,12 +267,161 @@ def _records_projection(records: tuple[Any, ...]) -> dict[str, Any]:
     }
 
 
+#: `ServingSnapshotAssembler` keeps one reader per owner dataset; the vector names which
+#: one the `__call__` surface is exercised on.
+_READER_ATTRIBUTE_BY_DATASET: Final[dict[str, str]] = {
+    "lab_jobs": "lab_jobs_reader",
+    "paper_accounts": "paper_accounts_reader",
+    "promotions": "promotions_reader",
+    "reference_slow_authority": "reference_slow_reader",
+    "runtime_health": "runtime_health_reader",
+    "signals": "signal_reader",
+}
+
+
+def _snapshot_projection(snapshot: Any) -> dict[str, Any]:
+    """A serving snapshot carries every owner payload, so only its identity is returned."""
+
+    return {
+        "observed_at": snapshot.read_model.observed_at.isoformat().replace("+00:00", "Z"),
+        "snapshot_sha256": canonical_sha256(snapshot.model_dump(mode="json")),
+        "source_generations": dict(snapshot.source_generations),
+        "watermarks": [
+            {
+                "dataset_id": watermark.dataset_id,
+                "generation_id": watermark.generation_id,
+                "sequence": watermark.sequence,
+                "status": watermark.status.value,
+            }
+            for watermark in snapshot.watermarks
+        ],
+    }
+
+
 def _read_bounds(context: ExerciseContext) -> dict[str, int]:
     return {
         "after_sequence": context.integer("after_sequence"),
         "through_sequence": context.integer("through_sequence"),
         "limit": context.integer("limit"),
     }
+
+
+# ---------------------------------------------------------------------------------------
+# router-notifier
+# ---------------------------------------------------------------------------------------
+
+
+def _exercise_routed_after_global_sequence(context: ExerciseContext) -> ExerciseOutcome:
+    from rquant.signal_route_spool import ReadonlySignalRouteSpool
+
+    spec = SURFACE_SPECS[context.vector.surface_id]
+    step = _notifier_step(context, spec)
+    source = _closure_value(step, "source", ReadonlySignalRouteSpool)
+    runtime_digest = tree_digest(context.workspace.runtime)
+    bounds = _read_bounds(context)
+    surface = bound_surface(source, context.vector.surface_id)
+    records = surface(observed_at=context.observed_at, **bounds)
+    return ExerciseOutcome(
+        observation={
+            "bounds": bounds,
+            "source_descriptor": source.source_descriptor().model_dump(mode="json"),
+            **_records_projection(records),
+        },
+        runtime_digest_before_call=runtime_digest,
+    )
+
+
+def _exercise_notification_state_replicate(context: ExerciseContext) -> ExerciseOutcome:
+    from rquant.notification_state import NotificationStateStore
+    from rquant.signal_route_spool import ReadonlySignalRouteSpool
+
+    spec = SURFACE_SPECS[context.vector.surface_id]
+    step = _notifier_step(context, spec)
+    source = _closure_value(step, "source", ReadonlySignalRouteSpool)
+    store = _closure_value(step, "store", NotificationStateStore)
+    bounds = _read_bounds(context)
+    descriptor = source.source_descriptor()
+    records = source.routed_after_global_sequence(observed_at=context.observed_at, **bounds)
+    runtime_digest = tree_digest(context.workspace.runtime)
+    surface = bound_surface(store, context.vector.surface_id)
+    summary = surface(descriptor, records, observed_at=context.observed_at)
+    return ExerciseOutcome(
+        observation={
+            "bounds": bounds,
+            "replicated_input_count": len(records),
+            "summary": summary.model_dump(mode="json"),
+        },
+        runtime_digest_before_call=runtime_digest,
+    )
+
+
+# ---------------------------------------------------------------------------------------
+# notifier-serving
+# ---------------------------------------------------------------------------------------
+
+
+def _exercise_serving_authority_reader(context: ExerciseContext) -> ExerciseOutcome:
+    step = _serving_publisher_step(context, SURFACE_SPECS[context.vector.surface_id])
+    assembler = _closure_assembler(step)
+    dataset_id = context.text("dataset_id")
+    reader = getattr(assembler, f"{_READER_ATTRIBUTE_BY_DATASET[dataset_id]}", None)
+    if reader is None:
+        raise SurfaceExerciseError("vector call.dataset_id names no assembler reader")
+    runtime_digest = tree_digest(context.workspace.runtime)
+    surface = bound_surface(reader, context.vector.surface_id)
+    read = surface(context.observed_at)
+    return ExerciseOutcome(
+        observation={
+            "dataset_id": read.dataset_id,
+            "expected_dataset_id": dataset_id,
+            "generation_id": read.generation_id,
+            "payload_sha256": canonical_sha256(read.payload.model_dump(mode="json")),
+            "reason": read.reason,
+            "sequence": read.sequence,
+            "status": read.status.value,
+        },
+        runtime_digest_before_call=runtime_digest,
+    )
+
+
+def _exercise_serving_snapshot_assemble(context: ExerciseContext) -> ExerciseOutcome:
+    step = _serving_publisher_step(context, SURFACE_SPECS[context.vector.surface_id])
+    assembler = _closure_assembler(step)
+    runtime_digest = tree_digest(context.workspace.runtime)
+    surface = bound_surface(assembler, context.vector.surface_id)
+    snapshot = surface(context.observed_at)
+    return ExerciseOutcome(
+        observation=_snapshot_projection(snapshot),
+        runtime_digest_before_call=runtime_digest,
+    )
+
+
+def _exercise_build_serving_read_models(context: ExerciseContext) -> ExerciseOutcome:
+    step = _serving_publisher_step(context, SURFACE_SPECS[context.vector.surface_id])
+    assembler = _closure_assembler(step)
+    snapshot = assembler.assemble(context.observed_at)
+    runtime_digest = tree_digest(context.workspace.runtime)
+    surface = resolve_surface(context.vector.surface_id)
+    tables = surface(snapshot.read_model)
+    # The read models are pandas frames whose cells are not all JSON scalars, so each one is
+    # reduced to its column order, its row count, and a digest of its CSV rendering, which is
+    # a deterministic function of the frame's content. Only that summary leaves the child.
+    rendered = {
+        name: {
+            "columns": [str(column) for column in frame.columns],
+            "content_sha256": sha256_hex(frame.to_csv(index=False).encode("utf-8")),
+            "row_count": int(len(frame.index)),
+        }
+        for name, frame in tables.items()
+    }
+    return ExerciseOutcome(
+        observation={
+            "row_counts": {name: value["row_count"] for name, value in rendered.items()},
+            "table_names": sorted(rendered),
+            "tables_sha256": canonical_sha256(rendered),
+        },
+        runtime_digest_before_call=runtime_digest,
+    )
 
 
 # ---------------------------------------------------------------------------------------
@@ -329,6 +517,36 @@ def _exercise_paper_queue_ingest(context: ExerciseContext) -> ExerciseOutcome:
 
 
 SURFACE_SPECS: Final[dict[str, SurfaceSpec]] = {
+    "rquant.signal_route_spool.ReadonlySignalRouteSpool.routed_after_global_sequence": SurfaceSpec(
+        builder="rquant.runtime_builder_signal.notifier_builder",
+        service_kind="notifier",
+        writes=False,
+        exercise=_exercise_routed_after_global_sequence,
+    ),
+    "rquant.notification_state.NotificationStateStore.replicate": SurfaceSpec(
+        builder="rquant.runtime_builder_signal.notifier_builder",
+        service_kind="notifier",
+        writes=True,
+        exercise=_exercise_notification_state_replicate,
+    ),
+    "rquant.runtime_serving_authority.ServingSourceAuthorityReader.__call__": SurfaceSpec(
+        builder="rquant.runtime_builder_serving.serving_publisher_builder",
+        service_kind="serving_publisher",
+        writes=False,
+        exercise=_exercise_serving_authority_reader,
+    ),
+    "rquant.runtime_serving_snapshot.ServingSnapshotAssembler.assemble": SurfaceSpec(
+        builder="rquant.runtime_builder_serving.serving_publisher_builder",
+        service_kind="serving_publisher",
+        writes=False,
+        exercise=_exercise_serving_snapshot_assemble,
+    ),
+    "rquant.serving_read_models.build_serving_read_models": SurfaceSpec(
+        builder="rquant.runtime_builder_serving.serving_publisher_builder",
+        service_kind="serving_publisher",
+        writes=False,
+        exercise=_exercise_build_serving_read_models,
+    ),
     "rquant.signal_route_spool.ReadonlySignalRouteSpool.signals_after_global_sequence": SurfaceSpec(
         builder="rquant.runtime_builder_paper.paper_broker_builder",
         service_kind="paper_broker",
@@ -380,6 +598,78 @@ def _publish_declared_spool(workspace: VectorWorkspace, declared: Mapping[str, A
         raise SurfaceExerciseError("vector spool state is not a publishable prefix") from exc
 
 
+_SERVING_PAYLOAD_ATTRIBUTE_BY_DATASET: Final[dict[str, str]] = {
+    "lab_jobs": "LabJobsPayload",
+    "paper_accounts": "PaperAccountsPayload",
+    "promotions": "PromotionsPayload",
+    "reference_slow_authority": "ReferenceSlowPayload",
+    "runtime_health": "RuntimeHealthPayload",
+    "signals": "SignalDeliveryPayload",
+}
+
+
+def _publish_declared_serving_authorities(
+    workspace: VectorWorkspace,
+    declared: Mapping[str, Any],
+) -> None:
+    """Materialize the six owner authorities through the pair's own producer surface.
+
+    `ServingSourceAuthorityPublisher.publish` is producer-surface evidence for
+    `notifier-serving` (`authority.md` L1218), so using it to lay down the vector's declared
+    state keeps the reader side honest: the assembler reads exactly what a real publisher
+    wrote, byte for byte, and not a hand-built directory.
+    """
+
+    from rquant import runtime_serving_snapshot as snapshot_models
+    from rquant.runtime_contracts import canonical_sha256
+    from rquant.runtime_serving_authority import ServingSourceAuthorityPublisher
+    from rquant.runtime_serving_snapshot import SourceReadResult
+    from rquant.serving_contracts import FreshnessStatus
+
+    expected = ("datasets", "producer_commit", "published_at", "root")
+    if type(declared) is not dict or tuple(sorted(declared)) != expected:
+        raise SurfaceExerciseError(
+            "vector serving_authorities must be exactly {datasets, producer_commit, "
+            "published_at, root}"
+        )
+    if type(declared["datasets"]) is not list or not declared["datasets"]:
+        raise SurfaceExerciseError("vector serving_authorities datasets must be a nonempty array")
+    root = workspace.declared_path(declared["root"], live=workspace.state)
+    published_at = _parse_observed_at(declared["published_at"])
+    for entry in declared["datasets"]:
+        if type(entry) is not dict or tuple(sorted(entry)) != ("dataset_id", "payload", "sequence"):
+            raise SurfaceExerciseError(
+                "each declared authority must be exactly {dataset_id, payload, sequence}"
+            )
+        dataset_id = entry["dataset_id"]
+        attribute = _SERVING_PAYLOAD_ATTRIBUTE_BY_DATASET.get(dataset_id)
+        if attribute is None:
+            raise SurfaceExerciseError("vector names an authority dataset outside the six owners")
+        try:
+            payload = getattr(snapshot_models, attribute).model_validate(entry["payload"])
+            values: dict[str, Any] = {
+                "dataset_id": dataset_id,
+                "sequence": entry["sequence"],
+                "event_time": published_at,
+                "published_at": published_at,
+                "status": FreshnessStatus.FRESH,
+                "reason": None,
+                "payload": payload,
+            }
+            values["generation_id"] = canonical_sha256(values)
+            ServingSourceAuthorityPublisher(
+                root=root / dataset_id,
+                producer_commit=declared["producer_commit"],
+                dataset_id=dataset_id,
+                payload_kind=payload.payload_kind,
+                clock=lambda: published_at,
+            ).publish(SourceReadResult.model_validate(values))
+        except (TypeError, ValueError) as exc:
+            raise SurfaceExerciseError(
+                f"vector serving authority {dataset_id} is not publishable"
+            ) from exc
+
+
 def _parse_observed_at(value: Any) -> datetime:
     from rquant.runtime_contracts import normalize_aware_utc
 
@@ -420,6 +710,9 @@ def exercise_vector(vector: RequestVector, root: Path) -> dict[str, Any]:
     spool = declared_state.get("spool")
     if spool is not None:
         _publish_declared_spool(workspace, spool)
+    authorities = declared_state.get("serving_authorities")
+    if authorities is not None:
+        _publish_declared_serving_authorities(workspace, authorities)
 
     state_before = tree_digest(workspace.state)
     context = ExerciseContext(

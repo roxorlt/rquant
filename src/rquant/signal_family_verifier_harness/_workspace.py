@@ -134,7 +134,7 @@ class VectorWorkspace:
 
         if type(state) is not dict:
             raise WorkspaceError("vector state must be a JSON object")
-        unknown = set(state) - {"directories", "files", "spool"}
+        unknown = set(state) - {"directories", "files", "serving_authorities", "spool"}
         if unknown:
             raise WorkspaceError(f"vector state carries unknown keys: {sorted(unknown)}")
         self._make_directories(state.get("directories", []))

@@ -111,6 +111,87 @@ _CALENDAR_CONTENT = canonical_json_bytes(
 _CALENDAR_SHA256 = hashlib.sha256(_CALENDAR_CONTENT.encode("utf-8")).hexdigest()
 
 
+def _notifier_service() -> dict[str, Any]:
+    return {
+        "interval_seconds": 1.0,
+        "plane": "live",
+        "producer_commit": PRODUCER_COMMIT,
+        "service_id": "notifier",
+        "service_kind": "notifier",
+        "settings": {
+            "batch_limit": 10,
+            "lease_seconds": 60,
+            "notification_state_path": "@runtime/notification-state.sqlite3",
+            "signal_spool_root": _SPOOL_ROOT,
+            "worker_id": "wp4c-notifier",
+        },
+        "stale_after_seconds": 75.0,
+    }
+
+
+_AUTHORITY_ROOT = "@workspace/serving-authorities"
+_AUTHORITY_PUBLISHED_AT = "2026-08-24T07:29:00Z"
+_OWNER_DATASETS: tuple[str, ...] = (
+    "lab_jobs",
+    "paper_accounts",
+    "promotions",
+    "reference_slow_authority",
+    "runtime_health",
+    "signals",
+)
+
+
+def _authority_payload(dataset_id: str) -> dict[str, Any]:
+    if dataset_id != "reference_slow_authority":
+        return {}
+    return {
+        "reference_generation_id": "9" * 64,
+        "revision": 1,
+        "price_basis": "raw_session",
+        "adjustment_basis": "tushare_adj_factor",
+        "available_at": _AUTHORITY_PUBLISHED_AT,
+    }
+
+
+def _serving_state() -> dict[str, Any]:
+    return {
+        "directories": [_AUTHORITY_ROOT],
+        "files": [],
+        "serving_authorities": {
+            "datasets": [
+                {
+                    "dataset_id": dataset_id,
+                    "payload": _authority_payload(dataset_id),
+                    "sequence": 1,
+                }
+                for dataset_id in _OWNER_DATASETS
+            ],
+            "producer_commit": PRODUCER_COMMIT,
+            "published_at": _AUTHORITY_PUBLISHED_AT,
+            "root": _AUTHORITY_ROOT,
+        },
+    }
+
+
+def _serving_publisher_service() -> dict[str, Any]:
+    return {
+        "interval_seconds": 1.0,
+        "plane": "serving",
+        "producer_commit": PRODUCER_COMMIT,
+        "service_id": "serving-publisher",
+        "service_kind": "serving_publisher",
+        "settings": {
+            "schema_version": 3,
+            "serving_root": "@runtime/serving",
+            "source_authorities": [
+                {"dataset_id": dataset_id, "root": f"{_AUTHORITY_ROOT}/{dataset_id}"}
+                for dataset_id in _OWNER_DATASETS
+            ],
+        },
+        "stale_after_seconds": 50.0,
+    }
+
+
 def _paper_broker_service() -> dict[str, Any]:
     return {
         "interval_seconds": 1.0,
@@ -172,7 +253,58 @@ def vector_specifications() -> tuple[tuple[str, SurfaceId, str], ...]:
     """`(pair_id, surface_id, input_json)` for every surface the harness exercises."""
 
     paper_state = _paper_state(actions=(SignalAction.B_INTENT,))
+    notifier_state = {
+        "directories": [],
+        "files": [],
+        "spool": spool_state(actions=(SignalAction.WATCH,)),
+    }
+    serving_state = _serving_state()
     return (
+        (
+            "router-notifier",
+            SurfaceId.READONLY_SIGNAL_ROUTE_SPOOL_ROUTED_AFTER_GLOBAL_SEQUENCE,
+            _envelope(
+                call=dict(_READ_BOUNDS),
+                service=_notifier_service(),
+                state=notifier_state,
+            ),
+        ),
+        (
+            "router-notifier",
+            SurfaceId.NOTIFICATION_STATE_STORE_REPLICATE,
+            _envelope(
+                call=dict(_READ_BOUNDS),
+                service=_notifier_service(),
+                state=notifier_state,
+            ),
+        ),
+        (
+            "notifier-serving",
+            SurfaceId.SERVING_SOURCE_AUTHORITY_READER_CALL,
+            _envelope(
+                call={"dataset_id": "signals"},
+                service=_serving_publisher_service(),
+                state=serving_state,
+            ),
+        ),
+        (
+            "notifier-serving",
+            SurfaceId.SERVING_SNAPSHOT_ASSEMBLER_ASSEMBLE,
+            _envelope(
+                call={},
+                service=_serving_publisher_service(),
+                state=serving_state,
+            ),
+        ),
+        (
+            "notifier-serving",
+            SurfaceId.BUILD_SERVING_READ_MODELS,
+            _envelope(
+                call={},
+                service=_serving_publisher_service(),
+                state=serving_state,
+            ),
+        ),
         (
             "router-paper",
             SurfaceId.READONLY_SIGNAL_ROUTE_SPOOL_SIGNALS_AFTER_GLOBAL_SEQUENCE,

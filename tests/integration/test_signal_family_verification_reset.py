@@ -1521,6 +1521,44 @@ class TestProductionHarness:
         )
         _assert_no_evidence(world)
 
+    def test_the_two_unblocked_pairs_are_exercised_in_the_child(self, tmp_path: Path) -> None:
+        """WP4-c round 1: the child cwd move and the widened environment, proven end to end.
+
+        `router-notifier` needed `rquant.config` to be constructible and `notifier-serving`
+        needed an authority root with no world-writable ancestor. Both now run inside the
+        real child, so their surfaces appear in a result set the root accepted.
+        """
+
+        import json
+
+        world = build_world(tmp_path, harness="real")
+
+        _verifier(world).run()
+
+        by_id = {vector.vector_id: vector for vector in world.test_manifest.vectors}
+        pairs = {vector.pair_id for vector in by_id.values()}
+        assert {"router-notifier", "notifier-serving", "router-paper"} == pairs
+
+        builders = {
+            json.loads(payload)["builder"]
+            for vector_id, payload in world.replay.items()
+            if by_id[vector_id].pair_id in {"router-notifier", "notifier-serving"}
+        }
+        assert builders == {
+            "rquant.runtime_builder_signal.notifier_builder",
+            "rquant.runtime_builder_serving.serving_publisher_builder",
+        }
+
+    def test_the_remaining_blocked_set_is_exactly_the_two_producer_bound_pairs(self) -> None:
+        """The activity gap this harness still has, stated as a contract rather than prose."""
+
+        assert set(harness.BLOCKED_SURFACE_REASONS) == {
+            surface.value
+            for pair_id in ("strategy-router", "strategy-shadow")
+            for surface in verification.READER_SURFACES[pair_id]
+        }
+        assert len(harness.IMPLEMENTED_SURFACE_IDS) == 8
+
     def test_the_real_harness_pyz_is_the_policy_hashed_artifact(self, tmp_path: Path) -> None:
         world = build_world(tmp_path, harness="real")
 
