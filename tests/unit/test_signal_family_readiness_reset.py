@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any, get_args
 
@@ -173,7 +174,7 @@ def _pairs() -> tuple[verification.PairBindingV1, ...]:
 
 def _binding(
     manifest: RuntimeServiceManifest,
-    pairs: tuple[verification.PairBindingV1, ...],
+    surfaces: Mapping[str, tuple[verification.SurfaceId, ...]],
 ) -> verification.VerificationServiceBindingV1:
     kind = manifest.service_kind
     return verification.VerificationServiceBindingV1.create(
@@ -184,17 +185,20 @@ def _binding(
         executable_module=_MODULE_BY_KIND[kind],
         executable_source_relative_path=_SOURCE_BY_KIND[kind],
         executable_source_sha256=_digest(f"source:{_SOURCE_BY_KIND[kind]}"),
-        surface_ids=verification.expected_surface_ids(pairs)[manifest.service_id],
+        surface_ids=surfaces[manifest.service_id],
     )
 
 
 def _bindings(
-    pairs: tuple[verification.PairBindingV1, ...] | None = None,
+    manifests: tuple[RuntimeServiceManifest, ...] | None = None,
 ) -> tuple[verification.VerificationServiceBindingV1, ...]:
-    resolved = _pairs() if pairs is None else pairs
-    participating = verification.participating_service_ids(resolved)
-    by_id = {manifest.service_id: manifest for manifest in _profile_manifests()}
-    return tuple(_binding(by_id[service_id], resolved) for service_id in participating)
+    profile = _profile_manifests() if manifests is None else manifests
+    surfaces = verification.expected_surface_ids(profile)
+    by_id = {manifest.service_id: manifest for manifest in profile}
+    return tuple(
+        _binding(by_id[service_id], surfaces)
+        for service_id in verification.participating_service_ids(profile)
+    )
 
 
 def _vectors() -> tuple[verification.SignalFamilyVectorV1, ...]:
@@ -231,7 +235,7 @@ def _test_manifest() -> verification.SignalFamilyTestManifestV1:
     return verification.SignalFamilyTestManifestV1.create(
         vectors=_vectors(),
         expected_results=_expected_results(),
-        pairs=_pairs(),
+        profile_manifests=_profile_manifests(),
         service_bindings=_bindings(),
     )
 
@@ -282,6 +286,7 @@ def _entry(
     *,
     max_age: int | None = None,
     manifest: verification.SignalFamilyTestManifestV1 | None = None,
+    profile: tuple[RuntimeServiceManifest, ...] | None = None,
 ) -> verification.ReleaseVerificationEntryV1:
     resolved = _test_manifest() if manifest is None else manifest
     return verification.ReleaseVerificationEntryV1.create(
@@ -291,7 +296,7 @@ def _entry(
         vector_set_hash=verification.vector_set_hash(resolved.vectors),
         expected_result_set_hash=verification.expected_result_set_hash(resolved.expected_results),
         five_pair_service_binding_set_hash=verification.five_pair_service_binding_set_hash(
-            resolved.pairs,
+            _profile_manifests() if profile is None else profile,
             resolved.service_bindings,
         ),
         verifier_policy_max_age_seconds=max_age,
@@ -313,24 +318,26 @@ def _snapshot(
     max_age: int | None = None,
     stale_overrides: dict[str, float] | None = None,
     verified_at: datetime = VERIFIED_AT,
+    profile_manifests: tuple[RuntimeServiceManifest, ...] | None = None,
+    declared_profile_manifests: tuple[RuntimeServiceManifest, ...] | None = None,
 ) -> verification.SignalFamilyVerificationSnapshotV1:
-    manifests = _profile_manifests(stale_overrides)
-    pairs = verification.resolve_pair_bindings(manifests)
-    bindings = _bindings(pairs)
+    manifests = _profile_manifests(stale_overrides) if profile_manifests is None else (
+        profile_manifests
+    )
+    declared = manifests if declared_profile_manifests is None else declared_profile_manifests
     test_manifest = verification.SignalFamilyTestManifestV1.create(
         vectors=_vectors(),
         expected_results=_expected_results(),
-        pairs=pairs,
-        service_bindings=bindings,
+        profile_manifests=declared,
+        service_bindings=_bindings(declared),
     )
-    entry = _entry(max_age=max_age, manifest=test_manifest)
+    entry = _entry(max_age=max_age, manifest=test_manifest, profile=declared)
     policy = _policy((entry,))
     resolved_authority = _authority() if authority is None else authority
     child = _child_result()
-    participating = verification.participating_service_ids(pairs)
     service_manifests = verification.resolve_participating_service_manifests(
         manifests,
-        participating,
+        verification.participating_service_ids(manifests),
     )
     freshness = verification.freshness_seconds(
         verification.service_freshness_seconds(service_manifests),
@@ -346,12 +353,11 @@ def _snapshot(
         successor_channel_hashes=tuple(sorted((_digest("channel-a"), _digest("channel-b")))),
         verification_manifest_sha256=entry.verification_manifest_sha256,
         test_manifest_hash=child.test_manifest_hash,
-        pairs=pairs,
+        profile_manifests=manifests,
         test_manifest=test_manifest,
         child_result=child,
         policy=policy,
         selected_entry=entry,
-        service_manifests=service_manifests,
         verified_at=verified_at,
         freshness_seconds=freshness,
     )
@@ -554,8 +560,9 @@ def test_expected_result_set_hash_matches_the_literal_spec_preimage() -> None:
 
 
 def test_five_pair_service_binding_set_hash_matches_the_literal_spec_preimage() -> None:
-    pairs = _pairs()
-    bindings = _bindings(pairs)
+    manifests = _profile_manifests()
+    pairs = verification.resolve_pair_bindings(manifests)
+    bindings = _bindings(manifests)
     expected = hashlib.sha256(
         canonical_json_bytes(
             {
@@ -573,7 +580,7 @@ def test_five_pair_service_binding_set_hash_matches_the_literal_spec_preimage() 
             }
         )
     ).hexdigest()
-    assert verification.five_pair_service_binding_set_hash(pairs, bindings) == expected
+    assert verification.five_pair_service_binding_set_hash(manifests, bindings) == expected
 
 
 def test_service_bindings_hash_is_the_full_model_dump_of_the_sorted_tuple() -> None:
@@ -622,11 +629,17 @@ def test_set_hash_preimages_reject_unsorted_input(preimage: str, reason: str) ->
             verification.expected_result_set_hash(tuple(reversed(results)))
 
 
-def test_five_pair_set_hash_rejects_a_pair_tuple_that_is_not_the_exact_five() -> None:
-    pairs = _pairs()
-    bindings = _bindings(pairs)
-    with pytest.raises(REJECTIONS, match="exactly the five frozen pair ids"):
-        verification.five_pair_service_binding_set_hash(pairs[:4], bindings)
+def test_five_pair_set_hash_rejects_a_profile_that_is_not_the_exact_five() -> None:
+    bindings = _bindings()
+    incomplete = _profile_manifests(
+        participants=tuple(
+            row for row in _PARTICIPANTS if row[1] is not RuntimeServiceKind.NOTIFIER
+        )
+    )
+    with pytest.raises(REJECTIONS, match="exactly one notifier service"):
+        verification.five_pair_service_binding_set_hash(incomplete, bindings)
+    with pytest.raises(REJECTIONS, match="exact RuntimeServiceManifest"):
+        verification.five_pair_service_binding_set_hash(_pairs(), bindings)
 
 
 # --------------------------------------------------------------------------------------
@@ -685,6 +698,8 @@ def test_execution_evidence_hash_is_not_an_input_to_itself() -> None:
         observed_family_ids=snapshot.observed_family_ids,
         observed_surface_ids=snapshot.observed_surface_ids,
         service_manifest_fingerprints=snapshot.service_manifest_fingerprints,
+        service_bindings=snapshot.service_bindings,
+        service_bindings_hash=snapshot.service_bindings_hash,
     )
     serialized = canonical_json_bytes(preimage).decode("utf-8")
     assert snapshot.execution_evidence_hash not in serialized
@@ -713,6 +728,8 @@ def test_execution_evidence_preimage_binds_every_required_input() -> None:
         observed_family_ids=snapshot.observed_family_ids,
         observed_surface_ids=snapshot.observed_surface_ids,
         service_manifest_fingerprints=snapshot.service_manifest_fingerprints,
+        service_bindings=snapshot.service_bindings,
+        service_bindings_hash=snapshot.service_bindings_hash,
     )
     assert set(preimage) == {
         "authority_epoch_key",
@@ -726,6 +743,8 @@ def test_execution_evidence_preimage_binds_every_required_input() -> None:
         "observed_family_ids",
         "observed_surface_ids",
         "selected_entry_hash",
+        "service_bindings",
+        "service_bindings_hash",
         "service_manifest_fingerprints",
         "test_manifest_hash",
         "vector_set_hash",
@@ -778,8 +797,9 @@ def test_pair_map_resolves_exactly_the_five_frozen_rows_from_the_profile() -> No
 
 
 def test_participating_service_ids_is_the_sorted_unique_union_of_the_five_rows() -> None:
-    pairs = _pairs()
-    assert verification.participating_service_ids(pairs) == (
+    manifests = _profile_manifests()
+    pairs = verification.resolve_pair_bindings(manifests)
+    assert verification.participating_service_ids(manifests) == (
         "notifier",
         "paper-broker",
         "serving-publisher",
@@ -795,7 +815,7 @@ def test_participating_service_ids_is_the_sorted_unique_union_of_the_five_rows()
             for service_id in (*pair.producer_service_ids, *pair.consumer_service_ids)
         }
     )
-    assert list(verification.participating_service_ids(pairs)) == union
+    assert list(verification.participating_service_ids(manifests)) == union
     assert "feature-live" not in union
     assert "paper-consumer" not in union
 
@@ -870,15 +890,15 @@ def test_pair_resolution_rejects_substitutes_for_resolved_manifests(
 
 
 def test_participating_union_rejects_a_handwritten_subset() -> None:
-    pairs = _pairs()
+    manifests = _profile_manifests()
     with pytest.raises(REJECTIONS, match="participating service ids are not pair-derived"):
-        verification.require_pair_derived_participants(pairs, ("notifier", "signal-router"))
+        verification.require_pair_derived_participants(manifests, ("notifier", "signal-router"))
     assert (
         verification.require_pair_derived_participants(
-            pairs,
-            verification.participating_service_ids(pairs),
+            manifests,
+            verification.participating_service_ids(manifests),
         )
-        == verification.participating_service_ids(pairs)
+        == verification.participating_service_ids(manifests)
     )
 
 
@@ -936,7 +956,7 @@ def test_dynamic_strategy_services_may_share_a_role_and_surface_tuple_but_not_a_
     ),
 )
 def test_binding_rejects_an_escaping_executable_source_path(path: str) -> None:
-    pairs = _pairs()
+    manifests = _profile_manifests()
     with pytest.raises(REJECTIONS, match="executable source path"):
         verification.VerificationServiceBindingV1.create(
             service_id="signal-router",
@@ -946,14 +966,14 @@ def test_binding_rejects_an_escaping_executable_source_path(path: str) -> None:
             executable_module="rquant.signal_router_runtime",
             executable_source_relative_path=path,
             executable_source_sha256=_digest("source"),
-            surface_ids=verification.expected_surface_ids(pairs)["signal-router"],
+            surface_ids=verification.expected_surface_ids(manifests)["signal-router"],
         )
 
 
 def test_binding_tuple_covers_exactly_the_participating_service_ids() -> None:
-    pairs = _pairs()
-    bindings = _bindings(pairs)
-    participating = verification.participating_service_ids(pairs)
+    manifests = _profile_manifests()
+    bindings = _bindings(manifests)
+    participating = verification.participating_service_ids(manifests)
     assert verification.validate_service_bindings(bindings, participating) == bindings
     assert tuple(binding.service_id for binding in bindings) == participating
 
@@ -968,9 +988,9 @@ def test_binding_tuple_covers_exactly_the_participating_service_ids() -> None:
     ),
 )
 def test_binding_tuple_rejects_structural_drift(mutation: str, reason: str) -> None:
-    pairs = _pairs()
-    bindings = _bindings(pairs)
-    participating = verification.participating_service_ids(pairs)
+    manifests = _profile_manifests()
+    bindings = _bindings(manifests)
+    participating = verification.participating_service_ids(manifests)
     if mutation == "drop":
         candidate = bindings[1:]
     elif mutation == "extra":
@@ -994,15 +1014,15 @@ def test_binding_tuple_rejects_structural_drift(mutation: str, reason: str) -> N
 
 
 def test_expected_surface_ids_reject_an_omitted_or_additional_surface() -> None:
-    pairs = _pairs()
-    expected = verification.expected_surface_ids(pairs)
+    manifests = _profile_manifests()
+    expected = verification.expected_surface_ids(manifests)
     router = expected["signal-router"]
     assert len(router) == 4
     with pytest.raises(REJECTIONS, match="surface ids are not the exact pair-derived set"):
-        verification.require_pair_derived_surfaces(pairs, "signal-router", router[:-1])
+        verification.require_pair_derived_surfaces(manifests, "signal-router", router[:-1])
     with pytest.raises(REJECTIONS, match="surface ids are not the exact pair-derived set"):
         verification.require_pair_derived_surfaces(
-            pairs,
+            manifests,
             "signal-router",
             tuple(
                 sorted(
@@ -1011,12 +1031,14 @@ def test_expected_surface_ids_reject_an_omitted_or_additional_surface() -> None:
                 )
             ),
         )
-    assert verification.require_pair_derived_surfaces(pairs, "signal-router", router) == router
+    assert (
+        verification.require_pair_derived_surfaces(manifests, "signal-router", router)
+        == router
+    )
 
 
 def test_every_frozen_surface_is_assigned_to_exactly_one_participating_service() -> None:
-    pairs = _pairs()
-    expected = verification.expected_surface_ids(pairs)
+    expected = verification.expected_surface_ids(_profile_manifests())
     seen: list[verification.SurfaceId] = []
     for surfaces in expected.values():
         seen.extend(surfaces)
@@ -1283,7 +1305,7 @@ def test_test_manifest_rejects_expected_results_that_do_not_pair_with_vectors() 
         verification.SignalFamilyTestManifestV1.create(
             vectors=vectors,
             expected_results=results[:-1],
-            pairs=_pairs(),
+            profile_manifests=_profile_manifests(),
             service_bindings=_bindings(),
         )
 
@@ -1314,7 +1336,7 @@ def test_verification_manifest_binds_the_policy_bound_hashes() -> None:
     )
     assert verification_manifest.five_pair_service_binding_set_hash == (
         verification.five_pair_service_binding_set_hash(
-            manifest.pairs,
+            _profile_manifests(),
             manifest.service_bindings,
         )
     )
@@ -1436,8 +1458,7 @@ def test_vector_result_rejects_an_oversized_or_mismatched_canonical_result() -> 
 
 def test_freshness_is_the_minimum_stale_bound_of_the_participating_manifests() -> None:
     manifests = _profile_manifests()
-    pairs = verification.resolve_pair_bindings(manifests)
-    participating = verification.participating_service_ids(pairs)
+    participating = verification.participating_service_ids(manifests)
     resolved = verification.resolve_participating_service_manifests(manifests, participating)
     assert tuple(manifest.service_id for manifest in resolved) == participating
     assert verification.service_freshness_seconds(resolved) == 45.0
@@ -1462,20 +1483,18 @@ def test_the_lowest_participant_bound_controls_freshness(
     expected: float,
 ) -> None:
     manifests = _profile_manifests({service_id: stale})
-    pairs = verification.resolve_pair_bindings(manifests)
     resolved = verification.resolve_participating_service_manifests(
         manifests,
-        verification.participating_service_ids(pairs),
+        verification.participating_service_ids(manifests),
     )
     assert verification.service_freshness_seconds(resolved) == expected
 
 
 def test_a_nonparticipating_service_never_controls_freshness() -> None:
     manifests = _profile_manifests({"feature-live": 0.5, "paper-consumer": 0.25})
-    pairs = verification.resolve_pair_bindings(manifests)
     resolved = verification.resolve_participating_service_manifests(
         manifests,
-        verification.participating_service_ids(pairs),
+        verification.participating_service_ids(manifests),
     )
     assert verification.service_freshness_seconds(resolved) == 45.0
 
@@ -1488,10 +1507,9 @@ def test_the_optional_policy_cap_lowers_but_never_raises_freshness() -> None:
 
 def test_there_is_no_fixed_thirty_second_freshness_assumption() -> None:
     manifests = _profile_manifests({service_id: 300.0 for service_id, _, _ in _PARTICIPANTS})
-    pairs = verification.resolve_pair_bindings(manifests)
     resolved = verification.resolve_participating_service_manifests(
         manifests,
-        verification.participating_service_ids(pairs),
+        verification.participating_service_ids(manifests),
     )
     assert verification.service_freshness_seconds(resolved) == 300.0
     assert verification.freshness_seconds(300.0, None) == 300.0
@@ -1499,8 +1517,7 @@ def test_there_is_no_fixed_thirty_second_freshness_assumption() -> None:
 
 def test_participating_manifest_resolution_rejects_missing_duplicate_or_extra() -> None:
     manifests = _profile_manifests()
-    pairs = verification.resolve_pair_bindings(manifests)
-    participating = verification.participating_service_ids(pairs)
+    participating = verification.participating_service_ids(manifests)
     with pytest.raises(REJECTIONS, match="no manifest resolves service id"):
         verification.resolve_participating_service_manifests(
             tuple(m for m in manifests if m.service_id != "notifier"),

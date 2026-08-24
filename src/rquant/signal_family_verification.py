@@ -400,7 +400,10 @@ def resolve_pair_bindings(
     )
 
 
-def require_exact_five_pairs(pairs: Sequence[PairBindingV1]) -> tuple[PairBindingV1, ...]:
+def _require_exact_five_pairs(pairs: Sequence[PairBindingV1]) -> tuple[PairBindingV1, ...]:
+    """Structural exactness only. It is deliberately private: a caller-supplied pair
+    tuple is declared data, and no public entry point may turn one into a verdict."""
+
     resolved = _require_exact_items(pairs, PairBindingV1, field="pairs")
     if tuple(pair.pair_id for pair in resolved) != PAIR_IDS:
         raise SignalFamilyVerificationError(
@@ -409,10 +412,8 @@ def require_exact_five_pairs(pairs: Sequence[PairBindingV1]) -> tuple[PairBindin
     return resolved
 
 
-def participating_service_ids(pairs: Sequence[PairBindingV1]) -> tuple[str, ...]:
-    """The sorted unique union of every producer and consumer ID in the five rows."""
-
-    resolved = require_exact_five_pairs(pairs)
+def _participating_service_ids(pairs: Sequence[PairBindingV1]) -> tuple[str, ...]:
+    resolved = _require_exact_five_pairs(pairs)
     union: set[str] = set()
     for pair in resolved:
         union.update(pair.producer_service_ids)
@@ -420,24 +421,34 @@ def participating_service_ids(pairs: Sequence[PairBindingV1]) -> tuple[str, ...]
     return tuple(sorted(union))
 
 
+def participating_service_ids(
+    manifests: Sequence[RuntimeServiceManifest],
+) -> tuple[str, ...]:
+    """The sorted unique union of every producer and consumer ID in the five rows.
+
+    It starts from the validated target production profile, never from a pair tuple a
+    caller supplies, so a handwritten row can never widen the union.
+    """
+
+    return _participating_service_ids(resolve_pair_bindings(manifests))
+
+
 def require_pair_derived_participants(
-    pairs: Sequence[PairBindingV1],
+    manifests: Sequence[RuntimeServiceManifest],
     claimed: tuple[str, ...],
 ) -> tuple[str, ...]:
     """Reject a handwritten subset, static list, count, or kind in place of the union."""
 
-    derived = participating_service_ids(pairs)
+    derived = participating_service_ids(manifests)
     if type(claimed) is not tuple or claimed != derived:
         raise SignalFamilyVerificationError("participating service ids are not pair-derived")
     return derived
 
 
-def expected_surface_ids(
+def _expected_surface_ids(
     pairs: Sequence[PairBindingV1],
 ) -> Mapping[str, tuple[SurfaceId, ...]]:
-    """The exact surface tuple each participating service owns under the frozen pair map."""
-
-    resolved = require_exact_five_pairs(pairs)
+    resolved = _require_exact_five_pairs(pairs)
     assigned: dict[str, set[SurfaceId]] = {}
     for pair in resolved:
         for service_id in pair.producer_service_ids:
@@ -452,14 +463,20 @@ def expected_surface_ids(
     )
 
 
-def require_pair_derived_surfaces(
+def expected_surface_ids(
+    manifests: Sequence[RuntimeServiceManifest],
+) -> Mapping[str, tuple[SurfaceId, ...]]:
+    """The exact surface tuple each participating service owns under the frozen pair map."""
+
+    return _expected_surface_ids(resolve_pair_bindings(manifests))
+
+
+def _require_pair_derived_surfaces(
     pairs: Sequence[PairBindingV1],
     service_id: str,
     claimed: tuple[SurfaceId, ...],
 ) -> tuple[SurfaceId, ...]:
-    """Reject an omitted or additional surface for one participating service."""
-
-    expected = expected_surface_ids(pairs).get(service_id)
+    expected = _expected_surface_ids(pairs).get(service_id)
     if expected is None:
         raise SignalFamilyVerificationError(
             "surface ids are not the exact pair-derived set for a nonparticipating service"
@@ -467,6 +484,20 @@ def require_pair_derived_surfaces(
     if type(claimed) is not tuple or tuple(claimed) != expected:
         raise SignalFamilyVerificationError("surface ids are not the exact pair-derived set")
     return expected
+
+
+def require_pair_derived_surfaces(
+    manifests: Sequence[RuntimeServiceManifest],
+    service_id: str,
+    claimed: tuple[SurfaceId, ...],
+) -> tuple[SurfaceId, ...]:
+    """Reject an omitted or additional surface for one participating service."""
+
+    return _require_pair_derived_surfaces(
+        resolve_pair_bindings(manifests),
+        service_id,
+        claimed,
+    )
 
 
 # --------------------------------------------------------------------------------------
@@ -559,14 +590,30 @@ class VerificationServiceBindingV1(_PhaseCStrictModel):
         return cls(**values, binding_hash=canonical_sha256(preimage))
 
 
-def service_bindings_hash(bindings: Sequence[VerificationServiceBindingV1]) -> str:
-    """`canonical_sha256` of the complete full-model dump of the sorted binding tuple."""
+def _require_sorted_bindings(
+    bindings: Sequence[VerificationServiceBindingV1],
+) -> tuple[VerificationServiceBindingV1, ...]:
+    """Both binding preimages hash a tuple the spec calls sorted; disorder rejects."""
 
     resolved = _require_exact_items(
         bindings,
         VerificationServiceBindingV1,
         field="service_bindings",
     )
+    if not resolved:
+        raise SignalFamilyVerificationError("service bindings must be nonempty")
+    service_ids = tuple(binding.service_id for binding in resolved)
+    if list(service_ids) != sorted(set(service_ids)):
+        raise SignalFamilyVerificationError(
+            "service bindings must be sorted by service_id and duplicate-free"
+        )
+    return resolved
+
+
+def service_bindings_hash(bindings: Sequence[VerificationServiceBindingV1]) -> str:
+    """`canonical_sha256` of the complete full-model dump of the sorted binding tuple."""
+
+    resolved = _require_sorted_bindings(bindings)
     return canonical_sha256([binding.model_dump(mode="json") for binding in resolved])
 
 
@@ -873,16 +920,12 @@ def expected_result_set_hash(results: Sequence[SignalFamilyExpectedResultV1]) ->
     return canonical_sha256(_expected_result_preimage(resolved))
 
 
-def five_pair_service_binding_set_hash(
+def _five_pair_service_binding_set_hash(
     pairs: Sequence[PairBindingV1],
     bindings: Sequence[VerificationServiceBindingV1],
 ) -> str:
-    resolved_pairs = require_exact_five_pairs(pairs)
-    resolved_bindings = _require_exact_items(
-        bindings,
-        VerificationServiceBindingV1,
-        field="service_bindings",
-    )
+    resolved_pairs = _require_exact_five_pairs(pairs)
+    resolved_bindings = _require_sorted_bindings(bindings)
     return canonical_sha256(
         {
             "pairs": [
@@ -898,6 +941,15 @@ def five_pair_service_binding_set_hash(
             ],
         }
     )
+
+
+def five_pair_service_binding_set_hash(
+    manifests: Sequence[RuntimeServiceManifest],
+    bindings: Sequence[VerificationServiceBindingV1],
+) -> str:
+    """The pair side is resolved from the validated profile, never declared by a caller."""
+
+    return _five_pair_service_binding_set_hash(resolve_pair_bindings(manifests), bindings)
 
 
 class SignalFamilyTestManifestV1(_PhaseCStrictModel):
@@ -931,11 +983,11 @@ class SignalFamilyTestManifestV1(_PhaseCStrictModel):
             raise SignalFamilyVerificationError(
                 "expected results must pair one to one with vectors"
             )
-        pairs = require_exact_five_pairs(self.pairs)
-        participating = participating_service_ids(pairs)
+        pairs = _require_exact_five_pairs(self.pairs)
+        participating = _participating_service_ids(pairs)
         validate_service_bindings(self.service_bindings, participating)
         for binding in self.service_bindings:
-            require_pair_derived_surfaces(pairs, binding.service_id, binding.surface_ids)
+            _require_pair_derived_surfaces(pairs, binding.service_id, binding.surface_ids)
         if self.service_bindings_hash != service_bindings_hash(self.service_bindings):
             raise SignalFamilyVerificationError(
                 "service bindings hash does not match its canonical content"
@@ -954,14 +1006,14 @@ class SignalFamilyTestManifestV1(_PhaseCStrictModel):
         *,
         vectors: tuple[SignalFamilyVectorV1, ...],
         expected_results: tuple[SignalFamilyExpectedResultV1, ...],
-        pairs: tuple[PairBindingV1, ...],
+        profile_manifests: Sequence[RuntimeServiceManifest],
         service_bindings: tuple[VerificationServiceBindingV1, ...],
     ) -> Self:
         values: dict[str, Any] = {
             "schema_version": 1,
             "vectors": tuple(vectors),
             "expected_results": tuple(expected_results),
-            "pairs": tuple(pairs),
+            "pairs": resolve_pair_bindings(profile_manifests),
             "service_bindings": tuple(service_bindings),
             "service_bindings_hash": service_bindings_hash(service_bindings),
         }
@@ -1019,7 +1071,7 @@ class SignalFamilyVerificationManifestV1(_PhaseCStrictModel):
             "test_manifest_sha256": test_manifest_sha256,
             "vector_set_hash": vector_set_hash(test_manifest.vectors),
             "expected_result_set_hash": expected_result_set_hash(test_manifest.expected_results),
-            "five_pair_service_binding_set_hash": five_pair_service_binding_set_hash(
+            "five_pair_service_binding_set_hash": _five_pair_service_binding_set_hash(
                 test_manifest.pairs,
                 test_manifest.service_bindings,
             ),
@@ -1342,10 +1394,18 @@ def execution_evidence_preimage(
     observed_family_ids: tuple[str, ...],
     observed_surface_ids: tuple[SurfaceId, ...],
     service_manifest_fingerprints: tuple[str, ...],
+    service_bindings: Sequence[VerificationServiceBindingV1],
+    service_bindings_hash: str,
 ) -> dict[str, Any]:
-    """The canonical execution-evidence preimage; its own hash is never an input."""
+    """The canonical execution-evidence preimage; its own hash is never an input.
+
+    L1274-1276 puts both the complete sorted binding tuple and `service_bindings_hash`
+    in this preimage, while the L1489-1495 enumeration omits them. The two readings are
+    satisfied together by carrying both literally, which is also the stricter binding.
+    """
 
     _require_exact_instance(authority, AuthoritySnapshotV1, field="authority")
+    resolved_bindings = _require_sorted_bindings(service_bindings)
     return {
         "authority_epoch_key": authority.authority_epoch_key,
         "authority_snapshot": authority.model_dump(mode="json"),
@@ -1361,6 +1421,8 @@ def execution_evidence_preimage(
             for surface in observed_surface_ids
         ],
         "selected_entry_hash": selected_entry_hash,
+        "service_bindings": [binding.model_dump(mode="json") for binding in resolved_bindings],
+        "service_bindings_hash": service_bindings_hash,
         "service_manifest_fingerprints": list(service_manifest_fingerprints),
         "test_manifest_hash": test_manifest_hash,
         "vector_set_hash": vector_set_hash,
@@ -1482,6 +1544,7 @@ class SignalFamilyVerificationSnapshotV1(_PhaseCStrictModel):
     observed_surface_ids: tuple[SurfaceId, ...]
     pairs: tuple[PairBindingV1, ...]
     participating_service_ids: tuple[StrictStr, ...]
+    service_bindings: tuple[VerificationServiceBindingV1, ...]
     service_binding_hashes: tuple[Sha256, ...]
     service_bindings_hash: Sha256
     service_manifest_fingerprints: tuple[Sha256, ...]
@@ -1492,11 +1555,19 @@ class SignalFamilyVerificationSnapshotV1(_PhaseCStrictModel):
 
     @model_validator(mode="after")
     def validate_identity(self) -> Self:
-        require_exact_five_pairs(self.pairs)
-        require_pair_derived_participants(self.pairs, self.participating_service_ids)
-        if len(self.service_binding_hashes) != len(self.participating_service_ids):
+        pairs = _require_exact_five_pairs(self.pairs)
+        if _participating_service_ids(pairs) != self.participating_service_ids:
+            raise SignalFamilyVerificationError("participating service ids are not pair-derived")
+        validate_service_bindings(self.service_bindings, self.participating_service_ids)
+        if self.service_binding_hashes != tuple(
+            binding.binding_hash for binding in self.service_bindings
+        ):
             raise SignalFamilyVerificationError(
-                "service binding hashes must cover every participating service"
+                "service binding hashes do not match the sorted binding tuple"
+            )
+        if self.service_bindings_hash != service_bindings_hash(self.service_bindings):
+            raise SignalFamilyVerificationError(
+                "service bindings hash does not match the sorted binding tuple"
             )
         if len(self.service_manifest_fingerprints) != len(self.participating_service_ids):
             raise SignalFamilyVerificationError(
@@ -1527,6 +1598,8 @@ class SignalFamilyVerificationSnapshotV1(_PhaseCStrictModel):
             observed_family_ids=self.observed_family_ids,
             observed_surface_ids=self.observed_surface_ids,
             service_manifest_fingerprints=self.service_manifest_fingerprints,
+            service_bindings=self.service_bindings,
+            service_bindings_hash=self.service_bindings_hash,
         ):
             raise SignalFamilyVerificationError(
                 "execution evidence hash does not match its canonical preimage"
@@ -1550,12 +1623,11 @@ class SignalFamilyVerificationSnapshotV1(_PhaseCStrictModel):
         successor_channel_hashes: tuple[str, ...],
         verification_manifest_sha256: str,
         test_manifest_hash: str,
-        pairs: tuple[PairBindingV1, ...],
+        profile_manifests: Sequence[RuntimeServiceManifest],
         test_manifest: SignalFamilyTestManifestV1,
         child_result: SignalFamilyChildResultV1,
         policy: SignalFamilyVerifierPolicyV1,
         selected_entry: ReleaseVerificationEntryV1,
-        service_manifests: Sequence[RuntimeServiceManifest],
         verified_at: datetime,
         freshness_seconds: float,
     ) -> Self:
@@ -1585,14 +1657,14 @@ class SignalFamilyVerificationSnapshotV1(_PhaseCStrictModel):
             raise SignalFamilyVerificationError(
                 "child result does not name the immutable test manifest"
             )
-        resolved_pairs = require_exact_five_pairs(pairs)
+        resolved_pairs = resolve_pair_bindings(profile_manifests)
         if test_manifest.pairs != resolved_pairs:
             raise SignalFamilyVerificationError(
-                "test manifest pairs differ from the resolved pair map"
+                "test manifest pairs are not derived from the validated profile"
             )
         derived_vector_set = vector_set_hash(test_manifest.vectors)
         derived_expected_set = expected_result_set_hash(test_manifest.expected_results)
-        derived_pair_set = five_pair_service_binding_set_hash(
+        derived_pair_set = _five_pair_service_binding_set_hash(
             resolved_pairs,
             test_manifest.service_bindings,
         )
@@ -1604,9 +1676,9 @@ class SignalFamilyVerificationSnapshotV1(_PhaseCStrictModel):
             raise SignalFamilyVerificationError(
                 "selected entry does not authorize the recomputed manifest set hashes"
             )
-        participating = participating_service_ids(resolved_pairs)
+        participating = _participating_service_ids(resolved_pairs)
         resolved_manifests = resolve_participating_service_manifests(
-            service_manifests,
+            profile_manifests,
             participating,
         )
         expiry = fresh_until(verified_at, freshness_seconds)
@@ -1631,6 +1703,7 @@ class SignalFamilyVerificationSnapshotV1(_PhaseCStrictModel):
             "observed_surface_ids": observed_surface_ids(child_result.vector_results),
             "pairs": resolved_pairs,
             "participating_service_ids": participating,
+            "service_bindings": test_manifest.service_bindings,
             "service_binding_hashes": tuple(
                 binding.binding_hash for binding in test_manifest.service_bindings
             ),
@@ -1657,10 +1730,15 @@ class SignalFamilyVerificationSnapshotV1(_PhaseCStrictModel):
             observed_family_ids=values["observed_family_ids"],
             observed_surface_ids=values["observed_surface_ids"],
             service_manifest_fingerprints=values["service_manifest_fingerprints"],
+            service_bindings=test_manifest.service_bindings,
+            service_bindings_hash=test_manifest.service_bindings_hash,
         )
         preimage = dict(values)
         preimage["authority"] = authority.model_dump(mode="json")
         preimage["pairs"] = [pair.model_dump(mode="json") for pair in resolved_pairs]
+        preimage["service_bindings"] = [
+            binding.model_dump(mode="json") for binding in test_manifest.service_bindings
+        ]
         preimage["observed_surface_ids"] = [
             surface.value for surface in values["observed_surface_ids"]
         ]
@@ -1844,6 +1922,10 @@ class SignalFamilyReadinessDecisionV1(_PhaseCStrictModel):
         if self.pair_ids != PAIR_IDS:
             raise SignalFamilyVerificationError(
                 "a READY decision requires exactly the five frozen pair ids"
+            )
+        if len(self.receipt_fingerprints) != len(PAIR_IDS):
+            raise SignalFamilyVerificationError(
+                "a READY decision requires exactly five receipt fingerprints"
             )
         if self.receipt_fingerprint_set_hash != receipt_fingerprint_set_hash(
             self.receipt_fingerprints
