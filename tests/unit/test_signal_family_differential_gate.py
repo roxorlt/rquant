@@ -31,6 +31,7 @@ from rquant.signal_family_differential_gate import (
     VerifiedR07DrGateEvidenceV1,
     canonical_evidence_json_bytes,
     collect_complete_git_diff,
+    expected_gate_check_total,
     load_policy,
     python_run_result_digest,
     resolve_fixture_values,
@@ -45,6 +46,7 @@ from tests.r07_differential_probe_runner import run_boundary_probe_subprocess
 
 ROOT = Path(__file__).parents[2]
 POLICY_PATH = ROOT / "tests" / "fixtures" / "r07_differential_gate" / "policy-v1.json"
+_GATE_CHECK_TOTAL = expected_gate_check_total(load_policy(POLICY_PATH))
 
 
 def _run(
@@ -62,8 +64,8 @@ def _run(
         run_attempt=1,
         candidate_commit_sha=candidate_commit,
         candidate_tree_sha=candidate_tree,
-        collected=7,
-        passed=7,
+        collected=_GATE_CHECK_TOTAL,
+        passed=_GATE_CHECK_TOTAL,
         skipped=0,
         deselected=0,
         result_digest="0" * 64,
@@ -247,6 +249,31 @@ def test_private_verifier_rejects_self_consistent_fake_and_wrong_binding_wires(
     wrong_binding = wire.model_copy(update={"candidate_binding_digest": "0" * 64})
     with pytest.raises(ValueError):
         verify_wire(ROOT, evidence_bundle.policy, wrong_binding)
+
+
+def test_private_verifier_requires_policy_derived_python_run_counts(
+    evidence_bundle: _EvidenceBundle,
+) -> None:
+    wire = evidence_bundle.evidence.wire
+    assert wire.python_runs[0].collected == _GATE_CHECK_TOTAL
+    forged_runs = tuple(
+        run.model_copy(update={"collected": 1, "passed": 1}) for run in wire.python_runs
+    )
+    forged_runs = tuple(
+        run.model_copy(update={"result_digest": python_run_result_digest(run)})
+        for run in forged_runs
+    )
+    values = wire.model_dump(mode="python")
+    values.update({"python_runs": forged_runs, "evidence_digest": "0" * 64})
+    provisional = R07DrGateEvidenceWireV1.model_construct(**values)
+    values["evidence_digest"] = differential_gate._digest_without_field(
+        provisional,
+        "evidence_digest",
+    )
+    forged_wire = R07DrGateEvidenceWireV1.model_validate(values)
+
+    with pytest.raises(ValueError, match="check count"):
+        verify_wire(ROOT, evidence_bundle.policy, forged_wire)
 
 
 @pytest.mark.parametrize(

@@ -17,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, model_v
 
 import rquant.signal_family_differential_gate as differential_gate
 from rquant.signal_family_differential_gate import (
+    BOUNDARY_PROBE_COUNT,
     BoundaryProbeResultV1,
     CandidateGateResult,
     PythonRunEvidenceV1,
@@ -25,6 +26,7 @@ from rquant.signal_family_differential_gate import (
     VerifiedR07DrGateEvidenceV1,
     boundary_probe_results_digest,
     canonical_evidence_json_bytes,
+    expected_gate_check_total,
     load_policy,
     python_run_result_digest,
     verify_candidate_gate,
@@ -39,12 +41,6 @@ _PYTHON_JOBS = {
 }
 _AGGREGATE_JOB = "r07-differential-gate-evidence"
 _POLICY_RELATIVE_PATH = Path("tests/fixtures/r07_differential_gate/policy-v1.json")
-_BOUNDARY_PROBE_COUNT = 17
-_FIXED_STATIC_CHECK_NAMES = (
-    "policy-completeness",
-    "top-level-source-closure",
-    "forbidden-definitions",
-)
 _MAX_SUMMARY_BYTES = 16 * 1024
 
 
@@ -71,21 +67,6 @@ class _GateExecution:
     @property
     def deselected(self) -> int:
         return 0
-
-
-def _expected_gate_check_total(policy: R07PolicyV1) -> int:
-    """Ordered checks one _execute_exact_gate run must complete for a frozen policy."""
-
-    return (
-        1  # policy load from the candidate Git tree
-        + 1  # complete raw diff and allowlist gate
-        + len(_FIXED_STATIC_CHECK_NAMES)
-        + len(policy.root_snapshots)
-        + len(policy.production_declarations)
-        + len(policy.boundary_probes)
-        + _BOUNDARY_PROBE_COUNT
-        + 1  # boundary probe results digest
-    )
 
 
 class GitHubRunContextV1(BaseModel):
@@ -328,7 +309,7 @@ def _execute_exact_gate(
                         tmp_path=probe_root / f"b{index:02d}",
                     )
                 )
-                for index in range(1, _BOUNDARY_PROBE_COUNT + 1)
+                for index in range(1, BOUNDARY_PROBE_COUNT + 1)
             )
         if not all(result.passed for result in boundary_results):
             raise ValueError("R07 boundary probe did not pass")
@@ -338,7 +319,7 @@ def _execute_exact_gate(
     executed_checks = tuple(executed)
     if len(set(executed_checks)) != len(executed_checks):
         raise ValueError("R07 gate check inventory is not unique")
-    if len(executed_checks) != _expected_gate_check_total(policy):
+    if len(executed_checks) != expected_gate_check_total(policy):
         raise ValueError("R07 gate check inventory does not match the frozen policy")
     return _GateExecution(
         policy=policy,

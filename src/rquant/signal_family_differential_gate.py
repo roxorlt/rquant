@@ -37,6 +37,19 @@ from rquant.strict_json import canonical_json_bytes, strict_canonical_json_loads
 
 BASELINE_COMMIT_SHA = "45d0b57c4c5cbab1700fa5e3c386c6756892a7d6"
 BASELINE_TREE_SHA = "4f67e67192855874e82baa13dc343a1d6939bd67"
+POLICY_RELATIVE_PATH = "tests/fixtures/r07_differential_gate/policy-v1.json"
+R07_EVIDENCE_CACHE_DIR = "/home/lighthouse/rquant/var/r07-dr-evidence"
+BOUNDARY_PROBE_COUNT = 17
+FIXED_STATIC_CHECK_NAMES = (
+    "policy-completeness",
+    "top-level-source-closure",
+    "forbidden-definitions",
+)
+EVIDENCE_CHANNEL_JOBS = (
+    "r07-differential-gate-py311",
+    "r07-differential-gate-py312",
+    "r07-differential-gate-evidence",
+)
 _SHA256 = r"^[0-9a-f]{64}$"
 _SHA1 = r"^[0-9a-f]{40}$"
 R07_CI_EVIDENCE_PRODUCER_IMPLEMENTED = True
@@ -755,19 +768,36 @@ class AllowedDiffEntryV1(_StrictModelMixin, BaseModel):
         return (self.path, self.status, self.old_mode, self.new_mode)
 
 
+class BootstrapPredecessorV1(_StrictModelMixin, BaseModel):
+    """The exact installed Release A pair an enforced target must name."""
+
+    commit_sha: StrictStr = Field(pattern=_SHA1)
+    tree_sha: StrictStr = Field(pattern=_SHA1)
+
+
 class EvidenceChannelV1(_StrictModelMixin, BaseModel):
     repository: Literal["roxorlt/rquant"]
     workflow_path: Literal[".github/workflows/ci.yml"]
     jobs: tuple[
-        Literal[
-            "r07-differential-gate-py311",
-            "r07-differential-gate-py312",
-            "r07-differential-gate-evidence",
-        ],
-        ...,
+        Literal["r07-differential-gate-py311"],
+        Literal["r07-differential-gate-py312"],
+        Literal["r07-differential-gate-evidence"],
     ]
     artifact_json_path: Literal["r07-dr-gate/evidence-v1.json"]
     retention_days: Literal[90]
+    cache_path: Literal["/home/lighthouse/rquant/var/r07-dr-evidence"]
+    deployment_mode: Literal["disabled_for_bootstrap", "enforced"]
+    bootstrap_predecessor: BootstrapPredecessorV1 | None
+
+    @model_validator(mode="after")
+    def validate_deployment_mode(self) -> Self:
+        if self.deployment_mode == "enforced" and self.bootstrap_predecessor is None:
+            raise ValueError("enforced R07 policy must name an exact bootstrap predecessor")
+        if self.deployment_mode == "disabled_for_bootstrap" and (
+            self.bootstrap_predecessor is not None
+        ):
+            raise ValueError("bootstrap-disabled R07 policy must not name a predecessor")
+        return self
 
 
 def boundary_manifest_digest(
@@ -819,6 +849,61 @@ class R07PolicyV1(_StrictModelMixin, BaseModel):
     @property
     def canonical_bytes(self) -> bytes:
         return canonical_json_bytes(self.model_dump(mode="json"))
+
+
+def expected_gate_check_total(policy: R07PolicyV1) -> int:
+    """Ordered checks one exact gate run must complete for a frozen policy."""
+
+    if type(policy) is not R07PolicyV1:
+        raise TypeError("exact R07PolicyV1 is required")
+    return (
+        1  # policy load from the candidate Git tree
+        + 1  # complete raw diff and allowlist gate
+        + len(FIXED_STATIC_CHECK_NAMES)
+        + len(policy.root_snapshots)
+        + len(policy.production_declarations)
+        + len(policy.boundary_probes)
+        + BOUNDARY_PROBE_COUNT
+        + 1  # boundary probe results digest
+    )
+
+
+def verify_channel_binding(policy: R07PolicyV1, wire: R07DrGateEvidenceWireV1) -> None:
+    """Compare the policy evidence channel field-for-field with the wire observation."""
+
+    if type(policy) is not R07PolicyV1 or type(wire) is not R07DrGateEvidenceWireV1:
+        raise TypeError("R07 channel binding requires exact policy and wire types")
+    channel = policy.evidence_channel
+    if channel.jobs != EVIDENCE_CHANNEL_JOBS:
+        raise ValueError("R07 policy channel jobs are not the exact ordered triple")
+    if channel.cache_path != R07_EVIDENCE_CACHE_DIR:
+        raise ValueError("R07 policy channel cache path is not the fixed server directory")
+    observed = (
+        wire.repository,
+        wire.workflow_path,
+        wire.artifact_json_path,
+        wire.retention_days,
+        wire.python_runs[0].job_id,
+        wire.python_runs[1].job_id,
+        wire.producer_job_id,
+    )
+    declared = (
+        channel.repository,
+        channel.workflow_path,
+        channel.artifact_json_path,
+        channel.retention_days,
+        channel.jobs[0],
+        channel.jobs[1],
+        channel.jobs[2],
+    )
+    if observed != declared:
+        raise ValueError("R07 wire channel metadata does not match the policy channel")
+    expected_total = expected_gate_check_total(policy)
+    for run in wire.python_runs:
+        if (run.collected, run.passed) != (expected_total, expected_total):
+            raise ValueError("R07 Python run check count does not match the frozen policy")
+        if (run.skipped, run.deselected) != (0, 0):
+            raise ValueError("R07 Python run check count must exclude skips and deselects")
 
 
 def load_policy(path: Path) -> R07PolicyV1:
@@ -1328,6 +1413,7 @@ def _verify_wire(
         raise ValueError("R07 wire or policy failed strict validation") from exc
     if validated_policy != policy or validated_wire != wire:
         raise ValueError("R07 wire or policy is not canonically self-consistent")
+    verify_channel_binding(validated_policy, validated_wire)
 
     try:
         candidate_gate = verify_candidate_gate(

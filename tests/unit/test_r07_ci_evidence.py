@@ -482,7 +482,7 @@ def test_exact_gate_reports_every_executed_check_instead_of_a_constant(
     assert len(set(expected)) == len(expected)
     assert gate_execution.collected == gate_execution.passed == len(expected)
     assert gate_execution.skipped == gate_execution.deselected == 0
-    assert gate_execution.collected == ci_evidence._expected_gate_check_total(
+    assert gate_execution.collected == ci_evidence.expected_gate_check_total(
         gate_execution.policy
     )
     assert gate_execution.collected != 20
@@ -491,7 +491,7 @@ def test_exact_gate_reports_every_executed_check_instead_of_a_constant(
     ) + len(gate_execution.policy.production_declarations) + len(
         gate_execution.policy.boundary_probes
     )
-    assert len(gate_execution.boundary_results) == ci_evidence._BOUNDARY_PROBE_COUNT
+    assert len(gate_execution.boundary_results) == ci_evidence.BOUNDARY_PROBE_COUNT
 
 
 def test_workflow_never_cancels_push_to_main_runs() -> None:
