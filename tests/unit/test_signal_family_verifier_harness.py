@@ -493,6 +493,46 @@ class TestWorkspace:
 
         assert harness.tree_digest(workspace.state) != before
 
+    def test_sqlite_scratch_files_do_not_move_the_digest(self, tmp_path: Path) -> None:
+        """A store the builder opened creates and unlinks these on its own schedule.
+
+        Digesting them would let the read-only verdict — and therefore the canonical result
+        the policy hashed — depend on when SQLite happened to close a connection.
+        """
+
+        workspace = self._workspace(tmp_path)
+        workspace.materialize(
+            {"directories": [], "files": [{"content": "a", "path": "@workspace/db.sqlite3"}]}
+        )
+        before = harness.tree_digest(workspace.state)
+        for suffix in harness.VOLATILE_SUFFIXES:
+            (workspace.state / f"db.sqlite3{suffix}").write_bytes(b"scratch")
+
+        assert harness.tree_digest(workspace.state) == before
+
+    def test_a_file_that_vanishes_mid_walk_does_not_raise(self, tmp_path: Path) -> None:
+        """The other half of the same race: an entry `os.walk` listed is already gone."""
+
+        workspace = self._workspace(tmp_path)
+        workspace.materialize(
+            {"directories": [], "files": [{"content": "a", "path": "@workspace/kept.txt"}]}
+        )
+        doomed = workspace.state / "doomed.txt"
+        doomed.write_bytes(b"gone")
+        real_read_bytes = Path.read_bytes
+
+        def vanishing(self: Path) -> bytes:
+            if self.name == "doomed.txt":
+                self.unlink()
+                raise FileNotFoundError(2, "No such file or directory", str(self))
+            return real_read_bytes(self)
+
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(Path, "read_bytes", vanishing)
+            digest = harness.tree_digest(workspace.state)
+
+        assert digest == harness.tree_digest(workspace.state)
+
     def test_a_writer_runs_against_a_copy_of_the_declaration(self, tmp_path: Path) -> None:
         workspace = self._workspace(tmp_path)
         workspace.materialize(

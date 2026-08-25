@@ -41,8 +41,17 @@ class WorkspaceError(ValueError):
     """A vector asked the harness to touch something outside its own scratch tree."""
 
 
+#: SQLite's own scratch files. A store that a production builder opened creates and unlinks
+#: `-shm` / `-wal` / `-journal` on its own schedule — a connection being closed by the
+#: garbage collector is enough — so they can appear and disappear between the two snapshots
+#: without anything having written a byte of durable state. Digesting them would make the
+#: read-only verdict, and therefore the canonical result, depend on that timing. The durable
+#: database file itself is always digested, so a real write is still caught.
+VOLATILE_SUFFIXES: Final[tuple[str, ...]] = ("-journal", "-shm", "-wal")
+
+
 def tree_digest(root: Path) -> str:
-    """One order-independent digest over every regular file the tree holds."""
+    """One order-independent digest over the durable regular files the tree holds."""
 
     if not root.exists():
         return canonical_sha256({"entries": [], "present": False})
@@ -50,26 +59,23 @@ def tree_digest(root: Path) -> str:
     for directory, directory_names, file_names in os.walk(root):
         directory_names.sort()
         for name in sorted(file_names):
-            path = Path(directory) / name
-            observed = path.lstat()
-            if not stat.S_ISREG(observed.st_mode):
-                entries.append(
-                    {
-                        "mode": stat.S_IMODE(observed.st_mode),
-                        "path": str(path.relative_to(root)),
-                        "regular": False,
-                        "sha256": "",
-                        "size": 0,
-                    }
-                )
+            if name.endswith(VOLATILE_SUFFIXES):
                 continue
+            path = Path(directory) / name
+            try:
+                observed = path.lstat()
+                payload = path.read_bytes() if stat.S_ISREG(observed.st_mode) else b""
+            except FileNotFoundError:
+                # The same race in its other form: an entry `os.walk` listed is already gone.
+                continue
+            regular = stat.S_ISREG(observed.st_mode)
             entries.append(
                 {
                     "mode": stat.S_IMODE(observed.st_mode),
                     "path": str(path.relative_to(root)),
-                    "regular": True,
-                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-                    "size": observed.st_size,
+                    "regular": regular,
+                    "sha256": hashlib.sha256(payload).hexdigest() if regular else "",
+                    "size": observed.st_size if regular else 0,
                 }
             )
     entries.sort(key=lambda entry: entry["path"])
@@ -177,6 +183,7 @@ def require_declared_sequence(value: Any, *, field: str) -> Sequence[Any]:
 
 __all__ = [
     "MAX_MATERIALIZED_FILES",
+    "VOLATILE_SUFFIXES",
     "MAX_MATERIALIZED_FILE_BYTES",
     "RUNTIME_PREFIX",
     "WORKSPACE_PREFIX",

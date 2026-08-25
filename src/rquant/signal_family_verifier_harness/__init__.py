@@ -57,6 +57,7 @@ from ._surfaces import (
     exercise_vector,
 )
 from ._workspace import (
+    VOLATILE_SUFFIXES,
     VectorWorkspace,
     WorkspaceError,
     tree_digest,
@@ -72,6 +73,7 @@ __all__ = [
     "RequestVector",
     "SurfaceExerciseError",
     "SurfaceResolutionError",
+    "VOLATILE_SUFFIXES",
     "VectorWorkspace",
     "WorkspaceError",
     "bound_surface",
