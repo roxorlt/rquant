@@ -16,6 +16,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import os
+import stat
 import sys
 import zipfile
 from datetime import UTC, datetime
@@ -35,8 +36,15 @@ from rquant.signal_family_verification import (
 from rquant.signal_family_verifier_harness import __main__ as harness_main
 from rquant.signal_family_verifier_harness import _canonical, _request, _resolve, _surfaces
 from rquant.strict_json import canonical_json_bytes as generation_canonical_json_bytes
+from tests.support import signal_family_private_root as _private_root
 from tests.support.signal_family_harness_vectors import harness_vectors
 
+# The Phase C ancestry walks refuse a group- or world-writable ancestor, and pytest's own
+# `tmp_path` is rooted at `TMPDIR`, which defaults to a sticky `/tmp` on Linux. Rebinding both
+# fixture names here roots every temporary directory in a verified-private `$HOME` root for
+# this module only, and fails loudly with the offending directory if that root is not private.
+signal_family_private_root = _private_root.signal_family_private_root
+tmp_path = _private_root.tmp_path
 REPOSITORY_ROOT = Path(__file__).resolve().parent.parent.parent
 BUILD_SCRIPT = REPOSITORY_ROOT / "scripts" / "build-signal-family-verifier-harness.py"
 
@@ -923,6 +931,44 @@ class TestServingLoaderProvenance:
         loader = types.MethodType(ServingSnapshotAssembler.assemble, assembler)
 
         assert _surfaces._closure_assembler(self._step_with_loader(loader)) is assembler
+
+
+class TestPrivateTemporaryRoot:
+    """M-01: the precondition the suite depended on is now expressed in the suite."""
+
+    def test_the_guard_names_the_writable_ancestor(self, tmp_path: Path) -> None:
+        loose = tmp_path / "loose"
+        loose.mkdir(mode=0o755)
+        loose.chmod(0o777)
+        inner = loose / "inner"
+        inner.mkdir(mode=0o700)
+
+        offenders = _private_root.unsafe_ancestors(inner)
+
+        assert [node for node, _mode in offenders] == [loose]
+        with pytest.raises(pytest.fail.Exception, match="world-writable ancestor"):
+            _private_root.require_private_ancestry(inner)
+
+    def test_a_private_chain_passes_the_guard(self, tmp_path: Path) -> None:
+        assert _private_root.unsafe_ancestors(tmp_path) == ()
+        _private_root.require_private_ancestry(tmp_path)
+
+    def test_the_session_root_is_private_and_outside_tmpdir(
+        self,
+        signal_family_private_root: Path,
+    ) -> None:
+        """`$HOME`, not `TMPDIR` — `TMPDIR` is the thing that cannot be trusted here."""
+
+        assert stat.S_IMODE(signal_family_private_root.stat().st_mode) == 0o700
+        assert signal_family_private_root.parent == Path.home()
+        assert _private_root.unsafe_ancestors(signal_family_private_root) == ()
+
+    def test_tmp_path_is_rooted_in_the_session_root(
+        self,
+        tmp_path: Path,
+        signal_family_private_root: Path,
+    ) -> None:
+        assert signal_family_private_root in tmp_path.parents
 
 
 class TestWorkspaceAccessClass:

@@ -44,7 +44,14 @@ from tests.integration.signal_family_verifier_world import (
     snapshot_with,
     write_full_manifest_bytes,
 )
+from tests.support import signal_family_private_root as _private_root
 
+# The Phase C ancestry walks refuse a group- or world-writable ancestor, and pytest's own
+# `tmp_path` is rooted at `TMPDIR`, which defaults to a sticky `/tmp` on Linux. Rebinding both
+# fixture names here roots every temporary directory in a verified-private `$HOME` root for
+# this module only, and fails loudly with the offending directory if that root is not private.
+signal_family_private_root = _private_root.signal_family_private_root
+tmp_path = _private_root.tmp_path
 pytestmark = pytest.mark.integration
 
 VERIFIED_AT = datetime(2026, 8, 24, 7, 30, 15, 250000, tzinfo=UTC)
