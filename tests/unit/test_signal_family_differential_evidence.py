@@ -1680,3 +1680,231 @@ def test_gate_rejects_an_unavailable_evidence_channel(tmp_path: Path) -> None:
 
 def test_gate_default_verifier_is_the_single_private_verifier() -> None:
     assert r07_deploy_evidence.DEFAULT_EVIDENCE_VERIFIER is differential_gate.verify_wire
+
+
+# ---------------------------------------------------------------------------------------
+# Cache trust boundary (Codex round-2 order 2026-08-25, item P1-2)
+# ---------------------------------------------------------------------------------------
+
+
+def _run_identity_responses(
+    commit_sha: str,
+    *,
+    runs: list[dict[str, object]] | None = None,
+) -> dict[str, bytes]:
+    """Only the workflow-runs query: a cache hit never downloads the artifact again."""
+
+    payload = [_run_payload(head_sha=commit_sha)] if runs is None else runs
+    return {
+        r07_deploy_evidence.workflow_runs_url(commit_sha): json.dumps(
+            {"total_count": len(payload), "workflow_runs": payload}
+        ).encode()
+    }
+
+
+def _plant_cache_entry(
+    repo: Path,
+    tmp_path: Path,
+    commit_sha: str,
+    *,
+    workflow_run_id: int = RUN_ID,
+    run_attempt: int = 2,
+    cache_dir: Path | None = None,
+) -> Path:
+    """Write a byte-legal, digest-consistent entry the way a deploy-user attacker could."""
+
+    directory = cache_dir or tmp_path / "var" / "r07-dr-evidence"
+    tree_sha = _git(repo, "rev-parse", "--verify", f"{commit_sha}^{{tree}}")
+    return r07_deploy_evidence.write_cached_evidence(
+        cache_dir=directory,
+        commit_sha=commit_sha,
+        payload=_valid_wire_bytes(
+            commit_sha,
+            tree_sha,
+            policy=_target_policy_of(repo, commit_sha),
+            workflow_run_id=workflow_run_id,
+            run_attempt=run_attempt,
+        ),
+    )
+
+
+def _evaluate_release_b(
+    gate: object,
+    repo: Path,
+    release_a: str,
+    release_b: str,
+) -> object:
+    return gate.evaluate(
+        repo=repo,
+        runner=_RealGitRunner(repo),
+        git_path=Path("/usr/bin/git"),
+        installed_commit_sha=release_a,
+        target_commit_sha=release_b,
+    )
+
+
+def test_planted_cache_entry_is_refused_when_github_cannot_confirm_the_run(
+    tmp_path: Path,
+) -> None:
+    """The headline P1-2 red test: a plausible planted entry is not evidence of a CI run."""
+
+    repo, _pre_r07, release_a, release_b = _release_repo(tmp_path)
+    _plant_cache_entry(repo, tmp_path, release_b)
+    gate, transport, verifier = _gate(tmp_path, responses={})
+
+    decision = _evaluate_release_b(gate, repo, release_a, release_b)
+
+    assert decision.allowed is False
+    assert decision.gate == "rejected"
+    assert transport.requests == [r07_deploy_evidence.workflow_runs_url(release_b)]
+    assert verifier.calls == []
+
+
+def test_planted_cache_entry_naming_an_unknown_run_identity_is_refused(
+    tmp_path: Path,
+) -> None:
+    repo, _pre_r07, release_a, release_b = _release_repo(tmp_path)
+    _plant_cache_entry(repo, tmp_path, release_b, workflow_run_id=777_001)
+    gate, _transport, verifier = _gate(
+        tmp_path,
+        responses=_run_identity_responses(release_b),
+    )
+
+    decision = _evaluate_release_b(gate, repo, release_a, release_b)
+
+    assert decision.allowed is False
+    assert decision.gate == "rejected"
+    assert "run identity" in decision.reason
+    assert verifier.calls == []
+
+
+def test_planted_cache_entry_naming_a_superseded_attempt_is_refused(tmp_path: Path) -> None:
+    repo, _pre_r07, release_a, release_b = _release_repo(tmp_path)
+    _plant_cache_entry(repo, tmp_path, release_b, run_attempt=1)
+    gate, _transport, verifier = _gate(
+        tmp_path,
+        responses=_run_identity_responses(
+            release_b,
+            runs=[
+                _run_payload(head_sha=release_b, run_attempt=1),
+                _run_payload(head_sha=release_b, run_attempt=2),
+            ],
+        ),
+    )
+
+    decision = _evaluate_release_b(gate, repo, release_a, release_b)
+
+    assert decision.allowed is False
+    assert decision.gate == "rejected"
+    assert verifier.calls == []
+
+
+def test_cache_hit_is_blocked_when_the_target_has_no_single_push_main_run(
+    tmp_path: Path,
+) -> None:
+    repo, _pre_r07, release_a, release_b = _release_repo(tmp_path)
+    _plant_cache_entry(repo, tmp_path, release_b)
+    gate, _transport, verifier = _gate(
+        tmp_path,
+        responses=_run_identity_responses(
+            release_b,
+            runs=[
+                _run_payload(head_sha=release_b, id=RUN_ID),
+                _run_payload(head_sha=release_b, id=RUN_ID + 1),
+            ],
+        ),
+    )
+
+    decision = _evaluate_release_b(gate, repo, release_a, release_b)
+
+    assert decision.allowed is False
+    assert decision.gate == "rejected"
+    assert verifier.calls == []
+
+
+def test_cache_hit_reverifies_the_run_identity_and_skips_only_the_artifact_download(
+    tmp_path: Path,
+) -> None:
+    """The control: a retained entry whose run identity still confirms is accepted."""
+
+    repo, _pre_r07, release_a, release_b = _release_repo(tmp_path)
+    _plant_cache_entry(repo, tmp_path, release_b)
+    gate, transport, verifier = _gate(
+        tmp_path,
+        responses=_run_identity_responses(release_b),
+    )
+
+    decision = _evaluate_release_b(gate, repo, release_a, release_b)
+
+    assert decision.allowed is True
+    assert decision.gate == "enforced"
+    assert transport.requests == [r07_deploy_evidence.workflow_runs_url(release_b)]
+    assert verifier.calls == [release_b]
+
+
+def test_cache_entry_reached_through_a_symlinked_ancestor_is_refused(tmp_path: Path) -> None:
+    """``O_NOFOLLOW`` on the final component never covered a swapped parent directory."""
+
+    repo, _pre_r07, release_a, release_b = _release_repo(tmp_path)
+    real = tmp_path / "real"
+    real.mkdir()
+    (tmp_path / "var").symlink_to(real, target_is_directory=True)
+    _plant_cache_entry(repo, tmp_path, release_b)
+    gate, _transport, verifier = _gate(
+        tmp_path,
+        responses=_run_identity_responses(release_b),
+    )
+
+    decision = _evaluate_release_b(gate, repo, release_a, release_b)
+
+    assert decision.allowed is False
+    assert decision.gate == "rejected"
+    assert verifier.calls == []
+
+
+def test_group_writable_cache_entry_is_refused(tmp_path: Path) -> None:
+    repo, _pre_r07, release_a, release_b = _release_repo(tmp_path)
+    entry = _plant_cache_entry(repo, tmp_path, release_b)
+    entry.chmod(0o664)
+    gate, _transport, verifier = _gate(
+        tmp_path,
+        responses=_run_identity_responses(release_b),
+    )
+
+    decision = _evaluate_release_b(gate, repo, release_a, release_b)
+
+    assert decision.allowed is False
+    assert decision.gate == "rejected"
+    assert verifier.calls == []
+
+
+def test_group_writable_cache_directory_is_refused(tmp_path: Path) -> None:
+    repo, _pre_r07, release_a, release_b = _release_repo(tmp_path)
+    entry = _plant_cache_entry(repo, tmp_path, release_b)
+    entry.parent.chmod(0o775)
+    gate, _transport, verifier = _gate(
+        tmp_path,
+        responses=_run_identity_responses(release_b),
+    )
+
+    decision = _evaluate_release_b(gate, repo, release_a, release_b)
+
+    assert decision.allowed is False
+    assert decision.gate == "rejected"
+    assert verifier.calls == []
+
+
+def test_hard_linked_cache_entry_is_refused(tmp_path: Path) -> None:
+    repo, _pre_r07, release_a, release_b = _release_repo(tmp_path)
+    entry = _plant_cache_entry(repo, tmp_path, release_b)
+    os.link(entry, tmp_path / "second-name.json")
+    gate, _transport, verifier = _gate(
+        tmp_path,
+        responses=_run_identity_responses(release_b),
+    )
+
+    decision = _evaluate_release_b(gate, repo, release_a, release_b)
+
+    assert decision.allowed is False
+    assert decision.gate == "rejected"
+    assert verifier.calls == []
