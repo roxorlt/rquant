@@ -41,13 +41,12 @@ class WorkspaceError(ValueError):
     """A vector asked the harness to touch something outside its own scratch tree."""
 
 
-#: SQLite's own scratch files. A store that a production builder opened creates and unlinks
-#: `-shm` / `-wal` / `-journal` on its own schedule — a connection being closed by the
-#: garbage collector is enough — so they can appear and disappear between the two snapshots
-#: without anything having written a byte of durable state. Digesting them would make the
-#: read-only verdict, and therefore the canonical result, depend on that timing. The durable
-#: database file itself is always digested, so a real write is still caught.
-VOLATILE_SUFFIXES: Final[tuple[str, ...]] = ("-journal", "-shm", "-wal")
+#: SQLite's shared-memory index. A store a production builder opened creates and unlinks it
+#: on its own schedule — a connection closed by the garbage collector is enough — and it
+#: carries no content, only the WAL index. Everything that does carry content, including the
+#: `-wal` and `-journal` files themselves, stays in the digest, so a read-only surface that
+#: wrote a single byte anywhere is still caught.
+VOLATILE_SUFFIXES: Final[tuple[str, ...]] = ("-shm",)
 
 
 def tree_digest(root: Path) -> str:

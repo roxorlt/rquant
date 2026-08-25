@@ -655,7 +655,39 @@ class TestSurfaceExercises:
         result = _exercise(vector, tmp_path)
 
         assert result["declared_writer"] is False
-        assert result["runtime_unchanged"] is True
+        assert result["state_unchanged"] is True
+
+    def test_a_read_only_surface_that_writes_is_refused(self, tmp_path: Path) -> None:
+        """The verdict is enforced, not reported, so this is how it has to be observed."""
+
+        surface_id = SurfaceId.READONLY_SIGNAL_ROUTE_SPOOL_SIGNALS_AFTER_GLOBAL_SEQUENCE.value
+        vector = next(
+            item for item in harness_vectors() if item.surface_id.value == surface_id
+        )
+        real_tree_digest = _surfaces.tree_digest
+        seen: list[str] = []
+
+        def drifting(root: Path) -> str:
+            digest = real_tree_digest(root)
+            seen.append(digest)
+            return f"{digest}-{len(seen)}" if root.name == "runtime" else digest
+
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(_surfaces, "tree_digest", drifting)
+            with pytest.raises(_surfaces.SurfaceExerciseError, match="read-only surface"):
+                _exercise(vector, tmp_path)
+
+    def test_no_result_field_depends_on_sqlite_checkpoint_timing(self, tmp_path: Path) -> None:
+        """A writer's runtime tree is not byte-stable across processes; nothing may report it."""
+
+        for surface_id in harness.IMPLEMENTED_SURFACE_IDS:
+            vector = next(
+                item for item in harness_vectors() if item.surface_id.value == surface_id
+            )
+            root = tmp_path / surface_id.rsplit(".", 1)[1]
+            root.mkdir()
+
+            assert "runtime_unchanged" not in _exercise(vector, root)
 
     def test_a_writer_surface_is_declared_as_one(self, tmp_path: Path) -> None:
         surface_id = SurfaceId.CONSUME_SIGNAL_BUS_TO_PAPER.value

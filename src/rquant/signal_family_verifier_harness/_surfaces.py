@@ -727,15 +727,16 @@ def exercise_vector(vector: RequestVector, root: Path) -> dict[str, Any]:
     runtime_after = tree_digest(workspace.runtime)
     if state_before != state_after:
         raise SurfaceExerciseError("the surface modified the vector's materialized declaration")
-    runtime_unchanged = outcome.runtime_digest_before_call == runtime_after
-    if not spec.writes and not runtime_unchanged:
+    if not spec.writes and outcome.runtime_digest_before_call != runtime_after:
         raise SurfaceExerciseError("a read-only surface modified the builder's runtime tree")
+    # The read-only verdict is enforced, never reported. Whether a *writer* left the runtime
+    # tree byte-identical depends on when SQLite last checkpointed, which differs between the
+    # policy author's process and the child's, so it can never be part of a frozen result.
     result: dict[str, Any] = {
         "schema_version": 1,
         "builder": spec.builder,
         "declared_writer": spec.writes,
         "observation": outcome.observation,
-        "runtime_unchanged": runtime_unchanged,
         "state_unchanged": True,
         "surface_id": surface_id,
     }
