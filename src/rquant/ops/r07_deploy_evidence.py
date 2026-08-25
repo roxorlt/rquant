@@ -758,12 +758,17 @@ class R07DeployEvidenceGate:
         token_provider: TokenProvider | None = None,
         clock: Callable[[], float] = time.monotonic,
         verifier: EvidenceVerifier = DEFAULT_EVIDENCE_VERIFIER,
+        require_declared_cache_path: bool = False,
     ) -> None:
         self._cache_dir = Path(cache_dir)
         self._transport = transport or UrllibEvidenceTransport()
         self._token_provider = token_provider or EnvironmentTokenProvider()
         self._clock = clock
         self._verifier = verifier
+        # Lab rollouts keep their cache beside the deployment lock; the server has exactly one
+        # declared directory, and the deployer that pins it cannot import this module to read
+        # the literal, so the pinned mode compares its own path against the target policy.
+        self._require_declared_cache_path = require_declared_cache_path
 
     @property
     def cache_dir(self) -> Path:
@@ -793,6 +798,19 @@ class R07DeployEvidenceGate:
             )
         except (R07EvidenceError, ValidationError, ValueError, OSError) as exc:
             return _unreadable_decision(installed_commit_sha, target_commit_sha, exc)
+        if self._require_declared_cache_path and target_policy is not None:
+            declared = Path(target_policy.evidence_channel.cache_path)
+            if self._cache_dir != declared:
+                return _decision(
+                    cast("InstalledPolicyState", installed_state),
+                    cast("TargetPolicyState", target_state),
+                    allowed=False,
+                    gate="rejected",
+                    reason=(
+                        f"the evidence cache directory {self._cache_dir} is not the one the "
+                        f"target R07 policy declares ({declared})"
+                    ),
+                )
         decision = decide_r07_deployment(
             cast("InstalledPolicyState", installed_state),
             cast("TargetPolicyState", target_state),

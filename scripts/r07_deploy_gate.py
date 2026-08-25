@@ -58,6 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repo", type=Path, required=True)
     parser.add_argument("--trusted-git-path", type=Path, required=True)
     parser.add_argument("--evidence-cache-dir", type=Path, required=True)
+    parser.add_argument("--require-declared-cache-dir", action="store_true")
     parser.add_argument("--installed-commit", required=True)
     parser.add_argument("--target-commit", required=True)
     return parser
@@ -69,6 +70,7 @@ def main(argv: list[str] | None = None) -> int:
     gate = R07DeployEvidenceGate(
         cache_dir=args.evidence_cache_dir,
         transport=_UrllibEvidenceTransport(),
+        require_declared_cache_path=args.require_declared_cache_dir,
     )
     decision = gate.evaluate(
         repo=repo,

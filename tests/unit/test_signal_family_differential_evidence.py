@@ -1449,17 +1449,107 @@ def _gate(
     *,
     responses: dict[str, bytes] | None = None,
     verifier: object | None = None,
+    cache_dir: Path | None = None,
+    require_declared_cache_path: bool = False,
 ) -> tuple[object, _FakeTransport, object]:
     transport = _FakeTransport(responses or {})
     resolved_verifier = verifier or _FakeVerifier()
     gate = r07_deploy_evidence.R07DeployEvidenceGate(
-        cache_dir=tmp_path / "var" / "r07-dr-evidence",
+        cache_dir=cache_dir or tmp_path / "var" / "r07-dr-evidence",
         transport=transport,
         token_provider=_FakeTokenProvider(),
         clock=lambda: 0.0,
         verifier=resolved_verifier,
+        require_declared_cache_path=require_declared_cache_path,
     )
     return gate, transport, resolved_verifier
+
+
+def test_pinned_gate_rejects_a_cache_directory_the_policy_never_declared(
+    tmp_path: Path,
+) -> None:
+    repo, _pre_r07, release_a, release_b = _release_repo(tmp_path)
+    gate, transport, verifier = _gate(
+        tmp_path,
+        responses=_gate_responses(repo, release_b),
+        require_declared_cache_path=True,
+    )
+
+    decision = gate.evaluate(
+        repo=repo,
+        runner=_RealGitRunner(repo),
+        git_path=Path("/usr/bin/git"),
+        installed_commit_sha=release_a,
+        target_commit_sha=release_b,
+    )
+
+    assert decision.allowed is False
+    assert decision.gate == "rejected"
+    assert r07_deploy_evidence.LINUX_PRODUCTION_EVIDENCE_CACHE_DIR.name in decision.reason
+    assert transport.requests == []
+    assert verifier.calls == []
+    assert not (tmp_path / "var" / "r07-dr-evidence").exists()
+
+
+def test_pinned_gate_rejects_an_undeclared_cache_directory_on_release_a_too(
+    tmp_path: Path,
+) -> None:
+    """Release A never reads the cache, but a drifted path is a defect before it matters."""
+
+    repo, pre_r07, release_a, _release_b = _release_repo(tmp_path)
+    gate, _transport, _verifier = _gate(tmp_path, require_declared_cache_path=True)
+
+    decision = gate.evaluate(
+        repo=repo,
+        runner=_RealGitRunner(repo),
+        git_path=Path("/usr/bin/git"),
+        installed_commit_sha=pre_r07,
+        target_commit_sha=release_a,
+    )
+
+    assert decision.allowed is False
+    assert decision.gate == "rejected"
+
+
+def test_pinned_gate_accepts_exactly_the_declared_cache_directory(tmp_path: Path) -> None:
+    repo, pre_r07, release_a, _release_b = _release_repo(tmp_path)
+    declared = Path(_target_policy_of(repo, release_a).evidence_channel.cache_path)
+    gate, transport, verifier = _gate(
+        tmp_path,
+        cache_dir=declared,
+        require_declared_cache_path=True,
+    )
+
+    decision = gate.evaluate(
+        repo=repo,
+        runner=_RealGitRunner(repo),
+        git_path=Path("/usr/bin/git"),
+        installed_commit_sha=pre_r07,
+        target_commit_sha=release_a,
+    )
+
+    assert decision.allowed is True
+    assert decision.gate == "bootstrap_disabled"
+    assert transport.requests == []
+    assert verifier.calls == []
+    assert not declared.exists()
+
+
+def test_an_unpinned_gate_still_uses_the_lab_cache_directory(tmp_path: Path) -> None:
+    repo, _pre_r07, release_a, release_b = _release_repo(tmp_path)
+    gate, _transport, verifier = _gate(tmp_path, responses=_gate_responses(repo, release_b))
+
+    decision = gate.evaluate(
+        repo=repo,
+        runner=_RealGitRunner(repo),
+        git_path=Path("/usr/bin/git"),
+        installed_commit_sha=release_a,
+        target_commit_sha=release_b,
+    )
+
+    assert decision.allowed is True
+    assert verifier.calls
+    assert (tmp_path / "var" / "r07-dr-evidence").exists()
 
 
 def test_gate_installs_release_a_once_without_touching_the_evidence_channel(

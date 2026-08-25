@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -38,7 +39,11 @@ from rquant.ops.production_deploy import (
     validate_release_profile,
     validate_target,
 )
-from rquant.release_generation import DeploymentIntent
+from rquant.release_generation import (
+    LINUX_RELEASE_PROFILE,
+    MACOS_LAB_RELEASE_PROFILE,
+    DeploymentIntent,
+)
 from rquant.strict_json import canonical_json_bytes
 from tests.unit.test_signal_family_differential_evidence import (
     RUN_ID,
@@ -3947,6 +3952,86 @@ class TestR07Bootstrap:
         assert gate.cache_dir == production_deploy.LINUX_PRODUCTION_EVIDENCE_CACHE_DIR
         assert gate.cache_dir == Path("/home/lighthouse/rquant/var/r07-dr-evidence")
         assert r07_deploy_evidence.DEFAULT_EVIDENCE_VERIFIER is differential_gate.verify_wire
+
+    def test_the_production_cache_literal_is_the_same_in_every_copy(self) -> None:
+        """The `-I -S` deployer cannot import the gate module, so it hand-copies the path."""
+
+        assert (
+            production_deploy.LINUX_PRODUCTION_EVIDENCE_CACHE_DIR
+            == r07_deploy_evidence.LINUX_PRODUCTION_EVIDENCE_CACHE_DIR
+        )
+        assert Path(
+            differential_gate.R07_EVIDENCE_CACHE_DIR
+        ) == production_deploy.LINUX_PRODUCTION_EVIDENCE_CACHE_DIR
+
+    def test_the_isolated_gate_pins_the_declared_cache_only_on_linux_production(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        commands: list[list[str]] = []
+
+        class _Completed:
+            returncode = 0
+            stderr = b""
+
+            def __init__(self, stdout: bytes) -> None:
+                self.stdout = stdout
+
+        payload = canonical_json_bytes(self._child_decision_payload())
+
+        def _capture(command: list[str], **_kwargs: object) -> _Completed:
+            commands.append(command)
+            return _Completed(payload)
+
+        monkeypatch.setattr(production_deploy, "_run_process_group", _capture)
+
+        profiles = ((LINUX_RELEASE_PROFILE, True), (MACOS_LAB_RELEASE_PROFILE, False))
+        for profile, expected in profiles:
+            config = replace(_config(tmp_path), release_profile=profile)
+            gate = production_deploy.IsolatedR07EvidenceGate(config, tmp_path / "cache")
+            gate.evaluate(
+                repo=tmp_path,
+                runner=FakeRunner(_base_responses()),
+                git_path=Path("/usr/bin/git"),
+                installed_commit_sha=_sha("a"),
+                target_commit_sha=_sha("b"),
+            )
+            assert ("--require-declared-cache-dir" in commands[-1]) is expected
+
+    def test_isolated_gate_child_rejects_an_undeclared_cache_directory(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        repo, pre_r07, release_a, _release_b = _release_repo(tmp_path)
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                str(ROOT / production_deploy.R07_DEPLOY_GATE_SCRIPT),
+                "--repo",
+                str(repo),
+                "--trusted-git-path",
+                "/usr/bin/git",
+                "--evidence-cache-dir",
+                str(tmp_path / "var" / "r07-dr-evidence"),
+                "--require-declared-cache-dir",
+                "--installed-commit",
+                pre_r07,
+                "--target-commit",
+                release_a,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert completed.returncode == 0, completed.stderr
+        decision = production_deploy.r07_decision_from_child_output(completed.stdout)
+        assert decision.allowed is False
+        assert decision.gate == "rejected"
+        assert "cache" in decision.reason
 
     def test_deployer_still_imports_without_site_packages(self) -> None:
         program = (

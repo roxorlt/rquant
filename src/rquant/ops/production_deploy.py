@@ -842,6 +842,11 @@ class IsolatedR07EvidenceGate:
             "--target-commit",
             target_commit_sha,
         ]
+        if config.release_profile == LINUX_RELEASE_PROFILE:
+            # Production has exactly one declared cache directory, and this module hand-copies
+            # the literal because the `-I -S` deployer cannot import the policy models. Ask the
+            # child to compare our path against the target policy so the two can never drift.
+            command.append("--require-declared-cache-dir")
         deadline = config.overall_deadline_monotonic
         if deadline is None:
             deadline = monotonic_time.monotonic() + config.overall_timeout_seconds
