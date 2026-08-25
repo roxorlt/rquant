@@ -925,6 +925,66 @@ class TestServingLoaderProvenance:
         assert _surfaces._closure_assembler(self._step_with_loader(loader)) is assembler
 
 
+class TestWorkspaceAccessClass:
+    """The reviewer's access-class experiment, fixed as a case.
+
+    A uid switch is not available under pytest, so the production question — "what can the
+    `lighthouse` child do with a root-owned workspace?" — is modelled by putting the same
+    bits in the *owner* class and running the real exercises beneath them. The kernel applies
+    the owner class to us exactly as it would apply the other class to the child, so the
+    outcome per bit pattern is the production outcome.
+
+    This is the case fix round 1 was missing. `0711` satisfied every bit-level assertion made
+    at the time and still failed all eight surfaces, because both ancestry walks open every
+    component with `O_RDONLY | O_DIRECTORY` and read-only on a directory needs the read bit.
+    """
+
+    @staticmethod
+    def _exercise_all(gate: Path, visitor_bits: int) -> tuple[int, int]:
+        """Run all eight surfaces beneath a gate carrying `visitor_bits`; return (ok, failed)."""
+
+        gate.mkdir(mode=0o700, parents=True, exist_ok=True)
+        workspace = gate / "workspace"
+        workspace.mkdir(mode=0o700, exist_ok=True)
+        gate.chmod(visitor_bits)
+        succeeded = 0
+        failed = 0
+        try:
+            for index, vector in enumerate(harness_vectors()):
+                root = workspace / f"run-{index:02d}"
+                try:
+                    root.mkdir(mode=0o700)
+                    _exercise(vector, root)
+                except Exception:  # noqa: BLE001 - the failure mode is the measurement
+                    failed += 1
+                else:
+                    succeeded += 1
+        finally:
+            gate.chmod(0o700)
+        return succeeded, failed
+
+    def test_execute_only_fails_every_surface(self, tmp_path: Path) -> None:
+        """`--x` for the visitor, i.e. the `0711` that fix round 1 shipped."""
+
+        succeeded, failed = self._exercise_all(tmp_path / "gate-x", 0o100)
+
+        assert succeeded == 0
+        assert failed == len(harness.IMPLEMENTED_SURFACE_IDS) == 8
+
+    def test_read_and_execute_passes_every_surface(self, tmp_path: Path) -> None:
+        """`r-x` for the visitor, i.e. the `0715` this round ships."""
+
+        succeeded, failed = self._exercise_all(tmp_path / "gate-rx", 0o500)
+
+        assert failed == 0
+        assert succeeded == len(harness.IMPLEMENTED_SURFACE_IDS) == 8
+
+    def test_the_frozen_mode_carries_the_bits_the_experiment_selected(self) -> None:
+        from rquant.signal_family_root_verifier import CHILD_WORKSPACE_MODE
+
+        assert CHILD_WORKSPACE_MODE & 0o007 == 0o005
+
+
 # ---------------------------------------------------------------------------------------
 # The child entry point
 # ---------------------------------------------------------------------------------------

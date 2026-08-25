@@ -663,10 +663,14 @@ class TestChildWorkspaceAnchorBoundary:
                 child_uid=os.getuid(),
             )
 
-    @pytest.mark.parametrize("mode", [0o700, 0o755, 0o701, 0o710])
+    @pytest.mark.parametrize("mode", [0o700, 0o711, 0o755, 0o701, 0o710])
     def test_a_workspace_with_the_wrong_mode_rejects(self, tmp_path: Path, mode: int) -> None:
-        """`0700` is in this list on purpose: it is the round 1 value that production cannot
-        traverse, so re-adopting it must now fail loudly rather than silently."""
+        """`0700` and `0711` are in this list because both shipped and both were unusable.
+
+        `0700` denies the child traversal; `0711` grants traversal but not the `O_RDONLY`
+        open that both ancestry walks perform on every component. Re-adopting either must
+        now fail loudly instead of passing every bit-level check and failing in production.
+        """
 
         workspace = tmp_path / "workspace"
         workspace.mkdir(mode=0o755)

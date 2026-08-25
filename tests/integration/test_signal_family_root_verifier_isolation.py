@@ -190,16 +190,14 @@ class TestChildContainment:
         assert stat.S_IMODE(workspace.stat().st_mode) == root_verifier.CHILD_WORKSPACE_MODE
         assert list(workspace.iterdir()) == []
 
-    def test_the_workspace_is_traversable_by_a_dropped_privilege_child(
-        self,
-        tmp_path: Path,
-    ) -> None:
+    def test_the_workspace_admits_a_dropped_privilege_child(self, tmp_path: Path) -> None:
         """The production shape, read off the privilege-plan seam rather than assumed.
 
         Locally the verifier and the child share a uid, so `child_privilege_plan` returns
         `None` and the drop never happens — the failure mode this guards is structurally
-        invisible in any same-uid test. The seam is therefore driven with the production
-        identities (root verifier, `lighthouse` child) and the mode is judged against them.
+        invisible in any same-uid test. The seam is driven with the production identities
+        (root verifier, `lighthouse` child) so the mode is judged against the class of bits
+        that will actually apply: `other`.
         """
 
         plan = root_verifier.child_privilege_plan(
@@ -210,18 +208,22 @@ class TestChildContainment:
         )
         assert plan is not None, "production drops privilege; the mode must survive that"
 
+        other = root_verifier.CHILD_WORKSPACE_MODE & 0o007
+        assert other == stat.S_IROTH | stat.S_IXOTH
+
+    def test_the_workspace_mode_grants_read_and_traversal_without_write(self) -> None:
+        """What the two ancestry walks actually need: `O_RDONLY | O_DIRECTORY` on the way in.
+
+        Execute alone is not enough — `0711` passed every bit-level check in fix round 1 and
+        still failed all eight surfaces, because opening a directory read-only requires the
+        read bit. What must hold is read plus execute for the child's class, and no write bit
+        for anyone but the owner, which is what both ancestry rules refuse.
+        """
+
         mode = root_verifier.CHILD_WORKSPACE_MODE
-        assert root_verifier.workspace_admits_child(mode, workspace_uid=0, child_uid=1000)
-        assert not root_verifier.workspace_admits_child(0o700, workspace_uid=0, child_uid=1000)
-        assert root_verifier.workspace_admits_child(0o700, workspace_uid=0, child_uid=0)
 
-    def test_the_workspace_mode_grants_traversal_without_enumeration(self) -> None:
-        """`0711` is exactly: others may pass through, and may not list or write."""
-
-        mode = root_verifier.CHILD_WORKSPACE_MODE
-
+        assert mode & stat.S_IROTH
         assert mode & stat.S_IXOTH
-        assert not mode & stat.S_IROTH
         assert not mode & (stat.S_IWGRP | stat.S_IWOTH)
         assert mode & stat.S_IRWXU == stat.S_IRWXU
 

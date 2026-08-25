@@ -114,12 +114,23 @@ PRODUCTION_STORE_ROOT: Final[Path] = Path("/var/lib/rquant/signal-family-verific
 PRODUCTION_CHILD_WORKSPACE_ROOT: Final[Path] = Path(
     "/var/lib/rquant/signal-family-verifier-workspace"
 )
-#: Root-owned, traversable by the unprivileged child, enumerable by nobody else. `0700` was
-#: the round 1 value and it is unusable in production: the child runs as `lighthouse`, and
-#: without the other execute bit every absolute path under the workspace is `EACCES` the
-#: moment the privilege drop lands. `0711` has no group or other write bit, so
-#: `runtime_serving_authority`'s ancestry rule still accepts it.
-CHILD_WORKSPACE_MODE: Final[int] = 0o711
+#: Root-owned, `r-x` for everyone else. Two earlier values were both unusable in production,
+#: where the child runs as `lighthouse` while this directory stays owned by root:
+#:
+#: * `0700` (round 1) denied traversal outright — every absolute path under the workspace was
+#:   `EACCES` the moment the privilege drop landed;
+#: * `0711` (fix round 1) granted traversal but not `open`. The two ancestry walks the child
+#:   must pass — `runtime_serving_authority._open_existing_directory_chain` and the
+#:   same-shaped walk in `signal_route_spool` — open *every* component with
+#:   `O_RDONLY | O_DIRECTORY`, and `O_RDONLY` on a directory needs the read bit. All eight
+#:   reader surfaces failed under it.
+#:
+#: `0715` grants read and execute and no write, so both of those walks accept it and so does
+#: this module's own ancestry rule. The cost is that the child may `ls` this one directory
+#: and see the random per-run names beside its own; each run directory is itself `0700` and
+#: owned by that child, and the verifier holds `RuntimeDeploymentLock` throughout, so there
+#: is normally nothing beside it to see.
+CHILD_WORKSPACE_MODE: Final[int] = 0o715
 PRODUCTION_OWNER_UID: Final[int] = 0
 PRODUCTION_OWNER_GID: Final[int] = 0
 
@@ -456,25 +467,6 @@ def child_environment(*, cwd: Path, request_fd: int, result_fd: int) -> dict[str
     return environment
 
 
-def workspace_admits_child(mode: int, *, workspace_uid: int, child_uid: int) -> bool:
-    """Can a process running as `child_uid` traverse a workspace with this mode?
-
-    POSIX resolves an absolute path one component at a time and needs the execute bit on
-    every one of them. The harness addresses everything by absolute path — `VectorWorkspace`
-    roots itself at `os.getcwd()` and rebases every declared path into
-    `RuntimeServiceManifest.settings` — so a workspace the child cannot traverse means the
-    child cannot open its own cwd after the privilege drop, no matter that it was chowned to
-    it. In production the verifier is root and the child is `lighthouse`, so it is the
-    *other* execute bit that decides.
-    """
-
-    if type(mode) is not int or type(workspace_uid) is not int or type(child_uid) is not int:
-        raise TypeError("workspace admission takes an integer mode and two integer uids")
-    if workspace_uid == child_uid:
-        return bool(mode & stat.S_IXUSR)
-    return bool(mode & stat.S_IXOTH)
-
-
 def open_child_workspace_root(root: Path, *, expected_uid: int, child_uid: int) -> Path:
     """Create and validate the private parent the child's cwd is carved out of.
 
@@ -484,10 +476,9 @@ def open_child_workspace_root(root: Path, *, expected_uid: int, child_uid: int) 
     child cwd whose ancestry fails that rule cannot host a serving authority, which is what
     made three reader surfaces unreachable before WP4-c round 1.
 
-    The leaf is `0711`, not `0700`: traversable by the unprivileged child, and readable by
-    nobody but the verifier that owns it, so the child can enter the one directory it was
-    given without being able to enumerate any other run's. `0711` carries no group or other
-    write bit, so the serving-authority ancestry rule still holds over it.
+    The leaf is `CHILD_WORKSPACE_MODE`, whose value carries the whole production argument;
+    see its definition. `child_uid` is taken so the caller's intent is on the record even
+    though the exact-mode check is what enforces it.
     """
 
     directory_flags = (
@@ -553,15 +544,6 @@ def open_child_workspace_root(root: Path, *, expected_uid: int, child_uid: int) 
             raise _reject(
                 SignalFamilyReasonCode.CHILD_LAUNCH_FAILED,
                 "the child workspace root is not a private directory this verifier owns",
-            )
-        if not workspace_admits_child(
-            leaf_mode,
-            workspace_uid=leaf.st_uid,
-            child_uid=child_uid,
-        ):  # pragma: no cover - the exact-mode check above already implies this
-            raise _reject(
-                SignalFamilyReasonCode.CHILD_LAUNCH_FAILED,
-                "the child workspace root cannot be traversed by the unprivileged child",
             )
         return root
     finally:
