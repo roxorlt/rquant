@@ -28,11 +28,13 @@ HASH_PATTERN = r"^[0-9a-f]{64}$"
 TIMESTAMP_PATTERN = r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$"
 
 # Every decoy is exactly the kind of value authority.md L1495-1497 forbids in audit records.
+# Hosts and addresses here stay inside RFC 5737 documentation space: a decoy must never
+# name a real production asset.
 DECOYS: tuple[tuple[str, str], ...] = (
     ("raw-exception-text", "Traceback (most recent call last): KeyError: 'tushare_token'"),
     ("environment-value", "PUSHDEER_KEYS=pdxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"),
     ("secret", "sk-live-51H9dEadBeEfCafeBabe0123456789"),
-    ("credential", "lighthouse:hunter2@82.156.0.68"),
+    ("credential", "lighthouse:hunter2@203.0.113.5"),
     ("signal-payload", '{"ts_code":"600519.SH","side":"buy","qty":100}'),
     ("vector-input", '{"pair":"router-paper","surface":"consume_signal_bus_to_paper"}'),
     ("free-form-reason", "the notifier reader surface raised while reading the spool"),
