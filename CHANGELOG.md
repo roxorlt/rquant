@@ -15,6 +15,36 @@
 - **可追溯治理能力**：慢变参考数据的双时间版本与修订、schema/特征/策略注册表、样本外晋级、
   artifact 保留、恢复清单与最小权限 credential capability 已纳入隔离运行时。
 
+> 以下 R07 / signal-family 条目全部属于 **Release A**（policy `deployment_mode=disabled_for_bootstrap`）：
+> 代码与测试已合入，但**未激活、未部署**，也不授予任何 activation。Successor contract、overlay
+> receipt、`READY`、high-watermark、drain/replay 与切流仍是显式 non-pass，需要后续阶段或单独授权的
+> activation amendment。
+
+- **R07 冻结 CI 证据链（WP1）**：differential gate 在 CI 中产出与 commit / tree / run identity 绑定的
+  `r07-dr-gate/evidence-v1.json`，双 Python 各一个 job 加一个聚合 evidence job；证据的检查计数从实际
+  执行的检查派生，probe 从物化的 candidate tree 加载。
+
+- **Release A/B 部署证据门（WP2）**：`src/rquant/ops/r07_deploy_evidence.py` 与
+  `scripts/r07_deploy_gate.py` 在任何 checkout、merge 或服务重启之前解析 installed / target 两侧的
+  R07 policy，按 Release A（bootstrap 安装，一次性，不消费证据）/ Release B（`enforced`，必须声明精确
+  predecessor 并核验下载的证据）决策表放行或拒绝。部署器本身跑在 `-I -S` 下，gate 在隔离子进程里用
+  release 解释器执行，子进程的任何失败都会被拒绝并写入审计。
+
+- **Phase B successor registry 与 staged overlay（WP3）**：五对 signal family 的 successor 契约与
+  staged overlay 以 canonical JSON 与内容哈希落库，registry 只读、拒绝重复与乱序，overlay 停留在
+  staged 状态，不产生任何 v3 writer 或 activation 路径。
+
+- **Phase C 根验证层与 harness（WP4）**：`signal_family_verification` 模型层、`signal_family_root_verifier`
+  根验证器（外部 root-owned policy 的 anchored no-follow 校验、bounded IPC、privilege drop、private
+  child workspace、append-only SQLite 收据存储、bounded audit evidence）与固定的
+  `signal_family_verifier_harness` zipapp（可复现构建）。真实 harness 覆盖 13 个 surface 中的 8 个；
+  `strategy-router` ×2 与 `strategy-shadow` ×3 因 producer 侧状态无法装进有界 vector 而 BLOCKED，
+  真实 harness 因此**不产生五对 READY**。
+
+- **spool ticket 崩溃与 orphan 矩阵（WP5）**：`tests/support/signal_route_spool_crash_matrix.py` 以合成
+  状态机固定 two-slot 单记录矩阵的每一个崩溃点与 orphan 行为，并把观察到的 v2 dialect 事实绑定到未被
+  改动的原语上；不发生 SQLite migration。
+
 ### Changed
 
 - **CI 全集分片**：原 90 分钟单 job 拆为 Python 3.11/3.12 的 core preflight 与 4 个
@@ -27,16 +57,31 @@
 - **模拟盘发布证据**：paper publication v4 将执行成本证据与不可变 SQLite 镜像绑定，发布前后
   复核 schema、账本和源文件身份，避免迁移时把可变源库当作已验证输入。
 
-### Fixed
-
-- **午间空量比**：保留空量比结果的固定 schema，午间链路在空数据场景不再丢失该字段。
-
-### Changed
-
 - **题材梯队推送改版**：午间战报将最强题材与连续连板梯队合并为 Top5，并将下午候选池
   调整为适合手机阅读的三行分隔格式；30 分钟脉搏新增题材梯队 Top5，展示涨停数、完整
   连续板位、最高标的，以及相较前一脉搏的 `↑` / `↓` / 持平 / 新晋（每日首槽不显示
   排名变化）。项目版本从 `0.28.1` 更新到 `0.28.2`。
+
+- **R07 CI 证据生产链修复**：differential gate 的 summary 计数改为从实际执行的检查派生而不是
+  写死常量；boundary probe runner 通过 facade 从物化的 candidate Git tree 加载（ImportError 计入
+  拒绝集）；frozen policy 增加 `evidence_channel`（仓库、workflow、三个 job、artifact 内部路径、
+  保留天数、服务器缓存目录、`deployment_mode`、`bootstrap_predecessor`）；push-to-main 的 CI run
+  退出 `cancel-in-progress`，避免被取消的 run 让该 commit 永远无法成为部署目标。
+
+- **子进程工作区的祖先与权限类规则**：`open_child_workspace_root` 沿祖先链拒绝 group/world 可写
+  节点的规则改由真实 verifier 路径覆盖；工作区模式保持 `0715`，但当子进程与工作区同属一个 group
+  时（POSIX 在首个匹配的权限类停止判定，group 位 `--x` 缺少读权限）直接拒绝启动，而不是让八个
+  reader surface 再次静默失效。
+
+- **部署证据缓存目录与 policy 绑定**：`-I -S` 部署器手抄的服务器缓存目录字面量与 gate 模块的常量
+  由测试互相钉死；Linux 生产 profile 下 gate 会拒绝任何不等于 `policy.evidence_channel.cache_path`
+  的 `--evidence-cache-dir`。
+
+- **项目版本**：从 `0.29.0` 更新到 `0.30.0`。
+
+### Fixed
+
+- **午间空量比**：保留空量比结果的固定 schema，午间链路在空数据场景不再丢失该字段。
 
 ### Fixed
 

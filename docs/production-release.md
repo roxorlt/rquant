@@ -120,6 +120,44 @@
 专项或全量归因结果替代生产验收。实施映射与退休门见
 [工作负载解耦设计](architecture/2026-07-22-workload-isolation-design.md)。
 
+## R07 Release A / Release B 两阶段部署门
+
+从 `v0.30.0` 起，受控部署器在**任何** checkout、merge、`_stop_timers` 或 systemctl 之前，
+先解析 installed 与 target 两侧的 `tests/fixtures/r07_differential_gate/policy-v1.json`
+（从 Git object 读，不读工作树），再按下表决定放行还是拒绝。gate 本身跑在隔离子进程里用
+release 解释器执行，因为部署器自己在 `-I -S` 下无法 import policy 模型；子进程的任何失败都是
+拒绝加审计，不是降级。
+
+| installed policy | target policy | 决定 |
+|---|---|---|
+| absent（pre-R07 checkout） | `disabled_for_bootstrap` | 允许一次，即 **Release A** 安装路径；audit 记 `r07_gate=bootstrap_disabled` 与精确 target commit/tree；不下载也不校验 evidence |
+| absent | `enforced` | 拒绝：没有可声明的 predecessor |
+| absent | absent | 拒绝：部署器存在即说明 R07 已进入链路，不得退回 pre-R07 |
+| `disabled_for_bootstrap` | `disabled_for_bootstrap`（含同 commit） | 拒绝：装过 A 之后下一个目标只能是 B |
+| `disabled_for_bootstrap` | absent | 拒绝 |
+| `disabled_for_bootstrap` | `enforced` 且 predecessor 精确等于 installed 的 (commit, tree)，且 evidence 通过 | 允许，即 **Release B** |
+| `disabled_for_bootstrap` | `enforced` 但 predecessor 不符 | 拒绝 |
+| `enforced` | `enforced` 且 evidence 通过（前滚与回滚同此） | 允许 |
+| `enforced` | `disabled_for_bootstrap` 或 absent | 拒绝 |
+
+`_recover_locked` 的 rollback target 走同一张表。
+
+**Release A（本阶段）**：policy 的 `deployment_mode=disabled_for_bootstrap`、
+`bootstrap_predecessor=null`。它只把 R07 决策链路装进生产，不消费任何 CI 证据，因此
+不需要 `RQUANT_GITHUB_EVIDENCE_TOKEN`。
+
+**Release B（下一次部署）**：policy 必须是 `enforced`，且 `bootstrap_predecessor` 精确声明
+Release A 的 commit 与 tree SHA。部署器会按 `evidence_channel` 声明的仓库、workflow、三个
+job 与 artifact 内部路径，向 GitHub 取该 target commit 的 `r07-dr-gate/evidence-v1.json`，
+用完整的私有 verifier 校验两次——写 cache 之前一次，读 cache 之后一次——然后才放行。证据缓存
+固定在云服务器 82.156.0.68（lighthouse 用户）的 `/home/lighthouse/rquant/var/r07-dr-evidence`；
+Linux 生产 profile 下部署器会要求这个目录精确等于 policy 声明的 `cache_path`。
+服务器缺 token 或无网络时结果是 **blocked**，不是降级放行。
+
+合版方式对这条链路是硬约束：R07 冻结 baseline 必须留在 `origin/main` 的祖先链上，所以带 R07
+policy 的 PR **只能用 "Create a merge commit"**；squash 或 rebase 会让 main 上任何 commit 永远
+过不了 ancestry 检查，Release B 也就永远拿不到证据。
+
 ## 一次性安装
 
 首次需要恢复可用的受控 SSH，并由 root 安装最小 sudoers 白名单：

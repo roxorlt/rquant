@@ -5,6 +5,46 @@
 
 ---
 
+## v0.30.0 Release A 上线前置条件（尚未部署，非部署记录）
+
+**状态**：`cc/workload-isolation-continuation` 分支的 R07 / signal-family 工作已开 PR，等待
+Codex 最终验收。**尚未 merge、尚未打 tag、尚未部署**，云服务器 82.156.0.68（lighthouse 用户）
+上没有发生任何变更。本节记录的是这次发布**之前**必须逐条满足的条件，不是一条部署记录；
+真正部署后再按本文件的既有格式追加 `## YYYY-MM-DD · v0.30.0 · 标题`。
+
+1. **合版方式只能是 "Create a merge commit"**。R07 冻结 baseline `45d0b57c` 不在
+   `origin/main` 的祖先链上，squash 或 rebase merge 会让 main 上任何 commit 永远过不了
+   `verify_wire` 的 ancestry 检查，Release B 也就永远拿不到部署证据。merge 之后立刻核对
+   `git merge-base --is-ancestor 45d0b57c origin/main` 返回 0。
+2. **第一次真实 push-to-main run 之后**核对 WP1-SPEC-06 / SPEC-12：evidence 里的
+   `job.check_run_id` 与 artifact 内部路径必须与真实 GitHub API 返回一致（本地只用 fake
+   transport 验证过）。
+3. **服务器 `.env` 增加 `RQUANT_GITHUB_EVIDENCE_TOKEN`**。这属于生产密钥变更，需要用户单独
+   明确授权；Release A 本身不消费证据，这个 token 是 Release B 才需要的。
+4. **Release A 之后的下一次部署只能是 Release B**：`deployment_mode=enforced`，并且
+   `bootstrap_predecessor` 精确声明 Release A 的 commit 与 tree SHA。中间不允许插入其他
+   部署目标。
+5. **云端只读核对**：对每一个 live generation 核对
+   `sha256(full-manifest.json) == slot.full_manifest_hash`。只读操作，走
+   `open_readonly_store()` / 只读副本，不碰主库写锁。
+6. **云端 child 访问实验**：以真实 `lighthouse` 身份对 `0715` 的 child workspace 做
+   `O_RDONLY | O_DIRECTORY` 打开，并确认 `id -g lighthouse != 0`——工作区的 group 位是
+   `--x`，子进程一旦落进 group 类就会丢掉读权限（验证器现在会直接拒绝这种身份配对）。
+7. **root verifier 必须从 root-owned 树运行**。当前入口脚本
+   `scripts/signal-family-root-verifier.py` 会把自己所在 checkout 的 `src` 插进 `sys.path`；
+   若从 `/home/lighthouse/rquant/` 以 root 运行，root 就会执行 lighthouse 可写的代码。
+   policy / harness / store 的安装是**单独授权的事务**，不能借受控发布器绕过。
+8. **规格 errata 未决**：family taxonomy 单元素域、bundle/overlay identity 语义、
+   producer/consumer id 域、profile-service-manifests 文档绑定、`strategy-router` /
+   `strategy-shadow` 五个 surface 的向量语义、WP5 Q1–Q4、wire schema 在 3.11/3.12 的可见性、
+   退休门的交易日数字，全部等 Codex 裁决；在此之前真实 harness 不产生五对 `READY`，
+   Phase C activation 也不成立。
+
+**回滚**：本分支没有产生任何生产变更，因此没有回滚基线。PR 未合并前直接关闭 PR 即可；
+已合并但未部署时，生产仍停在上一次部署的 commit，无需任何动作。
+
+---
+
 ## 2026-08-04 · v0.28.3 · 爆量历史搜索与触发日趋势标记
 
 **状态**：PR #151 经 Python 3.11/3.12 CI 全绿后 squash merge；annotated tag
