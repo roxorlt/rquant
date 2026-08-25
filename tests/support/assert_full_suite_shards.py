@@ -4,11 +4,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree
 
-from scripts import full_suite_shards as shards
+# Run as a script, `sys.path[0]` is this file's directory, so the repository root — and with
+# it the `scripts` package — is not importable. The CI aggregation step invokes this file by
+# path, so the root goes on the path here rather than being left to the caller.
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPOSITORY_ROOT))
+
+from scripts import full_suite_shards as shards  # noqa: E402
 
 SCHEMA_VERSION = 1
 ContractError = shards.ContractError
