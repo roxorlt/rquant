@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+import rquant.signal_family_differential_gate as differential_gate
 from rquant.signal_family_differential_gate import R07_CI_EVIDENCE_PRODUCER_IMPLEMENTED
 from scripts import r07_ci_evidence as ci_evidence
 from tests.unit.test_signal_family_differential_gate import (
@@ -571,7 +572,9 @@ def test_exact_gate_reports_every_executed_check_instead_of_a_constant(
         gate_execution.policy
     )
     assert gate_execution.collected != 20
-    assert len(gate_execution.static_result.checks) == 3 + len(
+    assert len(gate_execution.static_result.checks) == len(
+        differential_gate.FIXED_STATIC_CHECK_NAMES
+    ) + len(
         gate_execution.policy.root_snapshots
     ) + len(gate_execution.policy.production_declarations) + len(
         gate_execution.policy.boundary_probes

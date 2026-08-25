@@ -163,7 +163,7 @@ def test_expected_gate_check_total_derives_from_the_frozen_policy() -> None:
     assert expected_gate_check_total(policy) == (
         1
         + 1
-        + 3
+        + len(differential_gate.FIXED_STATIC_CHECK_NAMES)
         + len(policy.root_snapshots)
         + len(policy.production_declarations)
         + len(policy.boundary_probes)

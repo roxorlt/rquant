@@ -302,6 +302,8 @@ def test_private_verifier_rejects_self_consistent_fake_and_wrong_binding_wires(
                 complete_diff_digest=wire.complete_diff_digest,
             ),
             "python_runs": fake_runs,
+            "merge_tree_sha": fake_tree,
+            "candidate_parent_commits": (BASELINE_COMMIT_SHA, fake_commit),
             "artifact_name": f"r07-dr-gate-{fake_commit}",
             "evidence_digest": "0" * 64,
         }

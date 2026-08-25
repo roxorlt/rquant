@@ -411,7 +411,13 @@ class R07DrGateEvidenceWireV1(_StrictModelMixin, BaseModel):
             raise ValueError("R07 evidence must be a JSON object")
         if type(decoded.get("python_runs")) is not list:
             raise ValueError("R07 evidence python_runs must be a JSON array")
-        decoded = {**decoded, "python_runs": tuple(decoded["python_runs"])}
+        if type(decoded.get("candidate_parent_commits")) is not list:
+            raise ValueError("R07 evidence candidate_parent_commits must be a JSON array")
+        decoded = {
+            **decoded,
+            "python_runs": tuple(decoded["python_runs"]),
+            "candidate_parent_commits": tuple(decoded["candidate_parent_commits"]),
+        }
         return cls.model_validate(decoded)
 
 
