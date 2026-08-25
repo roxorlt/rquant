@@ -20,6 +20,7 @@ from rquant.signal_family_differential_gate import (
     BASELINE_COMMIT_SHA,
     BASELINE_TREE_SHA,
     FORBIDDEN_DEFINITION_UNIVERSE,
+    HISTORICAL_BASELINE_COMMIT_SHA,
     R07_CI_EVIDENCE_PRODUCER_IMPLEMENTED,
     ROOT_SNAPSHOTS,
     BoundaryProbeResultV1,
@@ -29,13 +30,22 @@ from rquant.signal_family_differential_gate import (
     R07PolicyV1,
     R07StaticGateResult,
     VerifiedR07DrGateEvidenceV1,
+    boundary_probe_results_digest,
+    candidate_gate_digest,
     canonical_evidence_json_bytes,
+    check_inventory_digest,
     collect_complete_git_diff,
     expected_gate_check_total,
+    gate_check_inventory,
     load_policy,
+    parse_git_version,
     python_run_result_digest,
+    require_merge_tree_git_version,
     resolve_fixture_values,
+    resolve_merge_provenance,
+    static_gate_result_digest,
     verify_boundary_probe_source,
+    verify_diff_scope_forbidden_definitions,
     verify_forbidden_definitions,
     verify_production_declaration,
     verify_r07_static_gate,
@@ -55,6 +65,7 @@ def _run(
     *,
     candidate_commit: str,
     candidate_tree: str,
+    gate_digests: dict[str, str],
 ) -> PythonRunEvidenceV1:
     run = PythonRunEvidenceV1(
         python_minor=minor,
@@ -68,10 +79,58 @@ def _run(
         passed=_GATE_CHECK_TOTAL,
         skipped=0,
         deselected=0,
+        candidate_gate_digest=gate_digests["candidate_gate_digest"],
+        static_result_digest=gate_digests["static_result_digest"],
+        boundary_result_digest=gate_digests["boundary_result_digest"],
+        check_inventory_digest=gate_digests["check_inventory_digest"],
         result_digest="0" * 64,
         outcome="passed",
     )
     return run.model_copy(update={"result_digest": python_run_result_digest(run)})
+
+
+def _synthetic_merge_candidate(repo: Path = ROOT) -> str:
+    """Write the exact object GitHub's "Create a merge commit" would create for this branch.
+
+    The commit is dangling: no ref moves, no working tree changes, and its fixed identity
+    keeps the object content-addressed and stable across runs.
+    """
+
+    head = _head(repo)
+    tree = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--verify", f"{head}^{{tree}}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    environment = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "r07-merge-fixture",
+        "GIT_AUTHOR_EMAIL": "r07@example.invalid",
+        "GIT_COMMITTER_NAME": "r07-merge-fixture",
+        "GIT_COMMITTER_EMAIL": "r07@example.invalid",
+        "GIT_AUTHOR_DATE": "2026-01-01T00:00:00+00:00",
+        "GIT_COMMITTER_DATE": "2026-01-01T00:00:00+00:00",
+    }
+    return subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "commit-tree",
+            tree,
+            "-p",
+            BASELINE_COMMIT_SHA,
+            "-p",
+            head,
+            "-m",
+            "Merge pull request into main",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+    ).stdout.strip()
 
 
 @dataclass(frozen=True)
@@ -87,7 +146,7 @@ class _EvidenceBundle:
 @pytest.fixture(scope="module")
 def evidence_bundle(tmp_path_factory: pytest.TempPathFactory) -> _EvidenceBundle:
     policy = load_policy(POLICY_PATH)
-    candidate = _head()
+    candidate = _synthetic_merge_candidate()
     candidate_tree = subprocess.run(
         ["git", "-C", str(ROOT), "rev-parse", f"{candidate}^{{tree}}"],
         check=True,
@@ -119,18 +178,28 @@ def evidence_bundle(tmp_path_factory: pytest.TempPathFactory) -> _EvidenceBundle
         )
         for index in range(1, 18)
     )
+    gate_digests = {
+        "candidate_gate_digest": candidate_gate_digest(candidate_gate),
+        "static_result_digest": static_gate_result_digest(static_result),
+        "boundary_result_digest": boundary_probe_results_digest(policy, boundary_results),
+        "check_inventory_digest": check_inventory_digest(
+            gate_check_inventory(policy, static_result, boundary_results)
+        ),
+    }
     python_runs = (
         _run(
             "3.11",
             "r07-differential-gate-py311",
             candidate_commit=candidate,
             candidate_tree=candidate_tree,
+            gate_digests=gate_digests,
         ),
         _run(
             "3.12",
             "r07-differential-gate-py312",
             candidate_commit=candidate,
             candidate_tree=candidate_tree,
+            gate_digests=gate_digests,
         ),
     )
     evidence = VerifiedR07DrGateEvidenceV1.from_gate_results(
@@ -274,6 +343,70 @@ def test_private_verifier_requires_policy_derived_python_run_counts(
 
     with pytest.raises(ValueError, match="check count"):
         verify_wire(ROOT, evidence_bundle.policy, forged_wire)
+
+
+def test_verified_evidence_binds_the_final_merge_tree_and_its_exact_parents(
+    evidence_bundle: _EvidenceBundle,
+) -> None:
+    wire = evidence_bundle.evidence.wire
+
+    assert wire.merge_base_commit_sha == BASELINE_COMMIT_SHA
+    assert wire.merge_base_tree_sha == BASELINE_TREE_SHA
+    assert wire.candidate_parent_commits == (BASELINE_COMMIT_SHA, _head())
+    assert wire.merge_tree_sha == wire.candidate_tree_sha
+    assert (
+        subprocess.run(
+            ["git", "-C", str(ROOT), "merge-tree", "--write-tree", BASELINE_COMMIT_SHA, _head()],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == wire.merge_tree_sha
+    )
+
+
+def test_private_verifier_refuses_a_candidate_that_is_not_a_merge_commit() -> None:
+    parents = subprocess.run(
+        ["git", "-C", str(ROOT), "rev-list", "--parents", "-n", "1", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.split()
+
+    assert len(parents) == 2  # the branch tip itself has exactly one parent
+
+    with pytest.raises(ValueError, match="two-parent merge commit"):
+        resolve_merge_provenance(
+            ROOT,
+            candidate_commit=_head(),
+            merge_base_commit=BASELINE_COMMIT_SHA,
+        )
+
+
+def test_wire_rejects_divergent_dual_python_gate_digests(
+    evidence_bundle: _EvidenceBundle,
+) -> None:
+    wire = evidence_bundle.evidence.wire
+    diverged = wire.python_runs[1].model_copy(update={"boundary_result_digest": "9" * 64})
+    diverged = diverged.model_copy(
+        update={"result_digest": python_run_result_digest(diverged)}
+    )
+    values = wire.model_dump(mode="python")
+    values.update(
+        {"python_runs": (wire.python_runs[0], diverged), "evidence_digest": "0" * 64}
+    )
+    provisional = R07DrGateEvidenceWireV1.model_construct(**values)
+    values["evidence_digest"] = differential_gate._digest_without_field(
+        provisional,
+        "evidence_digest",
+    )
+
+    with pytest.raises(ValueError, match="diverge"):
+        R07DrGateEvidenceWireV1.model_validate(values)
+
+    forged = R07DrGateEvidenceWireV1.model_construct(**values)
+    with pytest.raises(ValueError, match="strict validation"):
+        verify_wire(ROOT, evidence_bundle.policy, forged)
 
 
 @pytest.mark.parametrize(
@@ -420,8 +553,11 @@ def test_python311_normalizer_runs_when_local_runtime_is_usable_or_records_ci_ne
 
 
 def test_normative_baseline_pair_and_candidate_repository_identity() -> None:
-    assert BASELINE_COMMIT_SHA == "45d0b57c4c5cbab1700fa5e3c386c6756892a7d6"
-    assert BASELINE_TREE_SHA == "4f67e67192855874e82baa13dc343a1d6939bd67"
+    # Amended per Codex round-2 order 2026-08-25, item P1-1: the frozen baseline is the
+    # actual merge base of origin/main and the candidate, not a branch-local ancestor.
+    assert BASELINE_COMMIT_SHA == "9699827be09ca22479f6741e820722399fe40244"
+    assert BASELINE_TREE_SHA == "56bf300f296815acca414a1c7f5c2769ee5d466a"
+    assert HISTORICAL_BASELINE_COMMIT_SHA == "45d0b57c4c5cbab1700fa5e3c386c6756892a7d6"
     candidate = subprocess.run(
         ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
         check=True,
@@ -452,6 +588,276 @@ def test_normative_baseline_pair_and_candidate_repository_identity() -> None:
             candidate_commit=candidate,
             candidate_tree="0" * 40,
         )
+
+
+def test_frozen_baseline_is_the_actual_merge_base_of_origin_main_and_the_candidate() -> None:
+    merge_base = subprocess.run(
+        ["git", "-C", str(ROOT), "merge-base", "origin/main", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    assert merge_base == BASELINE_COMMIT_SHA
+    assert (
+        subprocess.run(
+            ["git", "-C", str(ROOT), "rev-parse", "--verify", f"{BASELINE_COMMIT_SHA}^{{tree}}"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == BASELINE_TREE_SHA
+    )
+    diff_paths = collect_complete_git_diff(
+        ROOT,
+        baseline_commit=BASELINE_COMMIT_SHA,
+        candidate_commit=_head(),
+        include_untracked=False,
+    ).entries
+
+    assert len(diff_paths) == len(load_policy(POLICY_PATH).allowed_diff)
+
+
+def test_candidate_gate_requires_the_historical_baseline_to_remain_an_ancestor() -> None:
+    policy = load_policy(POLICY_PATH)
+    assert (
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(ROOT),
+                "merge-base",
+                "--is-ancestor",
+                HISTORICAL_BASELINE_COMMIT_SHA,
+                BASELINE_COMMIT_SHA,
+            ],
+            check=False,
+            capture_output=True,
+        ).returncode
+        != 0
+    )
+
+    with pytest.raises(ValueError, match="historical baseline"):
+        differential_gate.verify_candidate_gate(
+            ROOT,
+            policy=policy,
+            candidate_commit=BASELINE_COMMIT_SHA,
+            candidate_tree=BASELINE_TREE_SHA,
+        )
+
+
+def test_candidate_gate_blocks_when_one_allowlist_entry_is_missing() -> None:
+    policy = load_policy(POLICY_PATH)
+    candidate = _head()
+    candidate_tree = subprocess.run(
+        ["git", "-C", str(ROOT), "rev-parse", "--verify", f"{candidate}^{{tree}}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    narrowed = policy.model_copy(update={"allowed_diff": policy.allowed_diff[:-1]})
+
+    result = differential_gate.verify_candidate_gate(
+        ROOT,
+        policy=narrowed,
+        candidate_commit=candidate,
+        candidate_tree=candidate_tree,
+    )
+
+    assert not result.passed
+    assert len(result.blocked_entries) == 1
+    assert result.blocked_entries[0].policy_key == policy.allowed_diff[-1].policy_key
+
+
+def _merge_fixture_repo(root: Path) -> dict[str, str]:
+    """A miniature origin/main plus feature branch with a real merge and a squash commit."""
+
+    subprocess.run(["git", "init", "--quiet", "--initial-branch=main", str(root)], check=True)
+    (root / "base.txt").write_text("base\n", encoding="utf-8")
+    base = _commit(root, "base")
+    (root / "main-only.txt").write_text("main\n", encoding="utf-8")
+    main_tip = _commit(root, "main tip")
+    subprocess.run(
+        ["git", "-C", str(root), "checkout", "--quiet", "-b", "feature", main_tip],
+        check=True,
+    )
+    (root / "feature.txt").write_text("feature\n", encoding="utf-8")
+    feature = _commit(root, "feature")
+    subprocess.run(["git", "-C", str(root), "checkout", "--quiet", "main"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "user.name=test",
+            "merge",
+            "--no-ff",
+            "--quiet",
+            "-m",
+            "merge feature",
+            feature,
+        ],
+        check=True,
+    )
+    merge = _head(root)
+    subprocess.run(["git", "-C", str(root), "checkout", "--quiet", "-B", "squash", main_tip], check=True)
+    subprocess.run(["git", "-C", str(root), "merge", "--squash", feature], check=True)
+    squash = _commit(root, "squashed feature")
+    return {"base": base, "main_tip": main_tip, "feature": feature, "merge": merge, "squash": squash}
+
+
+def test_merge_provenance_accepts_a_real_merge_and_rejects_a_squash(tmp_path: Path) -> None:
+    repo = tmp_path / "merge-repo"
+    identities = _merge_fixture_repo(repo)
+
+    provenance = resolve_merge_provenance(
+        repo,
+        candidate_commit=identities["merge"],
+        merge_base_commit=identities["main_tip"],
+    )
+
+    merge_tree = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--verify", f"{identities['merge']}^{{tree}}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert provenance.candidate_parent_commits == (identities["main_tip"], identities["feature"])
+    assert provenance.merge_tree_sha == merge_tree
+    assert provenance.merge_base_commit_sha == identities["main_tip"]
+
+    with pytest.raises(ValueError, match="two-parent merge commit"):
+        resolve_merge_provenance(
+            repo,
+            candidate_commit=identities["squash"],
+            merge_base_commit=identities["main_tip"],
+        )
+
+    with pytest.raises(ValueError, match="first parent"):
+        resolve_merge_provenance(
+            repo,
+            candidate_commit=identities["merge"],
+            merge_base_commit=identities["base"],
+        )
+
+
+def test_merge_provenance_rejects_a_declared_tree_or_parent_that_git_does_not_produce(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "merge-repo"
+    identities = _merge_fixture_repo(repo)
+    resolved = resolve_merge_provenance(
+        repo,
+        candidate_commit=identities["merge"],
+        merge_base_commit=identities["main_tip"],
+    )
+
+    assert (
+        differential_gate.verify_merge_provenance(
+            repo,
+            candidate_commit=identities["merge"],
+            candidate_tree=resolved.merge_tree_sha,
+            merge_base_commit=identities["main_tip"],
+            merge_base_tree=resolved.merge_base_tree_sha,
+            declared_parents=resolved.candidate_parent_commits,
+            declared_merge_tree=resolved.merge_tree_sha,
+        )
+        == resolved
+    )
+    with pytest.raises(ValueError, match="merge tree"):
+        differential_gate.verify_merge_provenance(
+            repo,
+            candidate_commit=identities["merge"],
+            candidate_tree="0" * 40,
+            merge_base_commit=identities["main_tip"],
+            merge_base_tree=resolved.merge_base_tree_sha,
+            declared_parents=resolved.candidate_parent_commits,
+            declared_merge_tree="0" * 40,
+        )
+    with pytest.raises(ValueError, match="parent"):
+        differential_gate.verify_merge_provenance(
+            repo,
+            candidate_commit=identities["merge"],
+            candidate_tree=resolved.merge_tree_sha,
+            merge_base_commit=identities["main_tip"],
+            merge_base_tree=resolved.merge_base_tree_sha,
+            declared_parents=(identities["main_tip"], identities["main_tip"]),
+            declared_merge_tree=resolved.merge_tree_sha,
+        )
+
+
+def test_merge_tree_replay_requires_a_git_that_can_write_it() -> None:
+    assert parse_git_version("git version 2.39.2 (Apple Git-143)") == (2, 39, 2)
+    assert parse_git_version("git version 2.43.0\n") == (2, 43, 0)
+    require_merge_tree_git_version("git version 2.38.0")
+
+    with pytest.raises(ValueError, match="2.38"):
+        require_merge_tree_git_version("git version 2.37.9")
+    with pytest.raises(ValueError, match="Git version"):
+        require_merge_tree_git_version("not a git version")
+
+
+def test_diff_scope_forbidden_definition_scan_covers_every_diffed_source_file(
+    tmp_path: Path,
+) -> None:
+    policy = load_policy(POLICY_PATH)
+    scanned = differential_gate.diff_scope_source_paths(policy)
+
+    assert len(scanned) > len(policy.forbidden_definition_universe.source_files)
+    assert set(policy.forbidden_definition_universe.source_files) <= set(scanned)
+    assert all(
+        path.startswith("src/rquant/") and path.endswith(".py") for path in scanned
+    )
+    assert verify_diff_scope_forbidden_definitions(ROOT, _head(), policy).passed
+
+    repo = tmp_path / "scope-repo"
+    module_path = "src/rquant/runtime_builder_signal.py"
+    source_path = repo / module_path
+    source_path.parent.mkdir(parents=True)
+    source_path.write_text("def current_signal_writer() -> None:\n    return None\n", encoding="utf-8")
+    candidate = _commit(repo, "forbidden definition outside the frozen nine")
+    narrowed = policy.model_copy(
+        update={
+            "allowed_diff": (
+                policy.allowed_diff[0].model_copy(
+                    update={"path": module_path, "category": "production"}
+                ),
+            )
+        }
+    )
+    result = verify_diff_scope_forbidden_definitions(repo, candidate, narrowed)
+
+    assert not result.passed
+    assert "current_signal_writer" in result.reasons[0]
+
+
+def test_static_gate_counts_the_diff_scope_check_in_the_frozen_inventory() -> None:
+    policy = load_policy(POLICY_PATH)
+
+    assert differential_gate.FIXED_STATIC_CHECK_NAMES == (
+        "policy-completeness",
+        "top-level-source-closure",
+        "forbidden-definitions",
+        "diff-scope-forbidden-definitions",
+    )
+    assert expected_gate_check_total(policy) == 60
+    static_result = verify_r07_static_gate(
+        ROOT,
+        policy=policy,
+        candidate_commit=_head(),
+        candidate_tree=subprocess.run(
+            ["git", "-C", str(ROOT), "rev-parse", "--verify", "HEAD^{tree}"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip(),
+    )
+
+    assert static_result.passed
+    assert "diff-scope-forbidden-definitions" in dict(static_result.checks)
 
 
 def test_complete_diff_uses_explicit_commit_range_and_raw_change_identity(tmp_path: Path) -> None:

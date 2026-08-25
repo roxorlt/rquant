@@ -48,11 +48,20 @@ def _context(
     )
 
 
+GATE_DIGESTS = ci_evidence.PythonRunGateDigests(
+    candidate_gate_digest="1" * 64,
+    static_result_digest="2" * 64,
+    boundary_result_digest="3" * 64,
+    check_inventory_digest="4" * 64,
+)
+
+
 def _emit_summary(
     path: Path,
     *,
     minor: str = "3.11",
     context: ci_evidence.GitHubRunContextV1 | None = None,
+    gate_digests: ci_evidence.PythonRunGateDigests = GATE_DIGESTS,
 ) -> None:
     ci_evidence.emit_python_run_summary(
         path,
@@ -64,6 +73,7 @@ def _emit_summary(
         passed=20,
         skipped=0,
         deselected=0,
+        gate_digests=gate_digests,
     )
 
 
@@ -396,6 +406,81 @@ def test_aggregate_rejects_duplicate_summary_input_path(tmp_path: Path) -> None:
             py312_summary_path=summary_path,
             artifact_root=tmp_path / "artifact-root",
         )
+
+
+def test_aggregate_rejects_dual_python_gate_digest_divergence(tmp_path: Path) -> None:
+    py311_path = tmp_path / "py311.json"
+    py312_path = tmp_path / "py312.json"
+    _emit_summary(py311_path)
+    _emit_summary(
+        py312_path,
+        minor="3.12",
+        context=_context(job_id="r07-differential-gate-py312").model_copy(
+            update={"job_run_id": 102}
+        ),
+        gate_digests=ci_evidence.PythonRunGateDigests(
+            candidate_gate_digest=GATE_DIGESTS.candidate_gate_digest,
+            static_result_digest=GATE_DIGESTS.static_result_digest,
+            boundary_result_digest="9" * 64,
+            check_inventory_digest=GATE_DIGESTS.check_inventory_digest,
+        ),
+    )
+    context = _context(job_id="r07-differential-gate-evidence").model_copy(
+        update={"job_run_id": 103}
+    )
+
+    with pytest.raises(ValueError, match="diverge"):
+        ci_evidence.validate_python_run_pair(
+            context,
+            (
+                ci_evidence.load_python_run_summary(py311_path),
+                ci_evidence.load_python_run_summary(py312_path),
+            ),
+            observed_commit_sha=COMMIT_SHA,
+            observed_tree_sha=TREE_SHA,
+        )
+
+
+def test_push_main_without_a_merge_commit_produces_no_summary(tmp_path: Path) -> None:
+    """Ruling 9 equivalent enforcement: a squashed or direct push to main yields no evidence."""
+
+    commit, _tree = _actual_identity()
+    output = tmp_path / "summary.json"
+    minor = f"{sys.version_info.major}.{sys.version_info.minor}"
+    arguments = [
+        "run-python",
+        "--repo",
+        str(ROOT),
+        "--python-minor",
+        minor,
+        "--output",
+        str(output),
+        "--repository",
+        "roxorlt/rquant",
+        "--workflow-path",
+        ".github/workflows/ci.yml",
+        "--event-name",
+        "push",
+        "--ref",
+        "refs/heads/main",
+        "--event-after-sha",
+        commit,
+        "--checkout-sha",
+        commit,
+        "--workflow-run-id",
+        "100",
+        "--run-attempt",
+        "1",
+        "--job-id",
+        f"r07-differential-gate-py{minor.replace('.', '')}",
+        "--job-run-id",
+        "101",
+    ]
+
+    with pytest.raises(ValueError, match="two-parent merge commit"):
+        ci_evidence.main(arguments)
+
+    assert not output.exists()
 
 
 def test_workflow_has_static_dual_python_jobs_and_strict_aggregate_contract() -> None:
