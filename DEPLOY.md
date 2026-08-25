@@ -38,7 +38,9 @@ Codex 最终验收。**尚未 merge、尚未打 tag、尚未部署**，云服务
    用 `RQUANT_GITHUB_EVIDENCE_TOKEN` 查一次 workflow runs 并要求与缓存条目自称的
    `workflow_run_id` / `run_attempt` 完全一致，因此**离线部署不可行**；GitHub 不可达时结果是
    blocked，不降级放行。缓存目录及其全部祖先必须由部署身份（lighthouse）拥有、无 group/other
-   写位、无 symlink，否则同样 blocked。
+   写位、无 symlink，否则同样 blocked。GitHub 的 workflow run 历史保留 400 天（artifact 默认
+   90 天过期，两者独立），所以缓存在 artifact 过期后仍可核验；但 commit 超过 400 天后 run 记录
+   被归档删除，该 commit 的缓存条目将永久无法核验，回滚到那么早的目标只能重新跑一次 CI。
 9. **规格 errata 未决**：family taxonomy 单元素域、bundle/overlay identity 语义、
    producer/consumer id 域、profile-service-manifests 文档绑定、`strategy-router` /
    `strategy-shadow` 五个 surface 的向量语义、WP5 Q1–Q4、wire schema 在 3.11/3.12 的可见性、
