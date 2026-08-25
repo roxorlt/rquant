@@ -51,6 +51,7 @@ from tests.unit.test_signal_family_differential_evidence import (
     _artifact_zip,
     _enforced_policy_bytes,
     _FakeTransport,
+    _lab_trust,
     _release_repo,
     _run_payload,
     _valid_wire_bytes,
@@ -1256,7 +1257,9 @@ def test_already_current_dry_run_profiles_target_without_writing(tmp_path: Path)
         tree_sha=R07_TARGET_TREE,
         policy=enforced,
     )
-    gate = _r07_gate(tmp_path)
+    # A retained entry still owes the fixed channel its run identity, so the cache hit is
+    # served the workflow-runs query and nothing else.
+    gate = _r07_gate(tmp_path, transport=_r07_run_identity_transport(_sha("b")))
 
     before = {
         str(path.relative_to(tmp_path)): path.read_bytes()
@@ -3129,7 +3132,21 @@ def _r07_gate(
             token_provider=_StaticTokenProvider(),
             clock=lambda: 0.0,
             verifier=verifier or _RecordingVerifier(),
+            # `/tmp` is sticky on Linux, so the walk is rooted at the test directory.
+            cache_trust=_lab_trust(tmp_path),
         )
+    )
+
+
+def _r07_run_identity_transport(commit_sha: str) -> _FakeTransport:
+    """The one query a cache hit still owes the fixed channel: whose run is this target?"""
+
+    return _FakeTransport(
+        {
+            r07_deploy_evidence.workflow_runs_url(commit_sha): json.dumps(
+                {"workflow_runs": [_run_payload(head_sha=commit_sha)]}
+            ).encode()
+        }
     )
 
 
@@ -3238,16 +3255,18 @@ class TestR07Bootstrap:
         verifier = _RecordingVerifier()
         runner = FakeRunner(responses)
         config = _config(tmp_path)
+        transport = _r07_run_identity_transport(_sha("b"))
 
         result = deploy(
             config,
             runner=runner,
-            r07_evidence_gate=_r07_gate(tmp_path, verifier=verifier),
+            r07_evidence_gate=_r07_gate(tmp_path, verifier=verifier, transport=transport),
         )
 
         assert result.status == "deployed"
         assert result.r07_gate == "enforced"
         assert verifier.calls == [_sha("b")]
+        assert transport.requests == [r07_deploy_evidence.workflow_runs_url(_sha("b"))]
         assert _audit_records(config)[-1]["r07_gate"] == "enforced"
 
     @pytest.mark.parametrize(
@@ -3366,6 +3385,44 @@ class TestR07Bootstrap:
             deploy(_config(tmp_path), runner=runner, r07_evidence_gate=_r07_gate(tmp_path))
 
         assert not any(call[:2] == ("git", "merge") for call in runner.calls)
+
+    def test_a_deploy_user_planted_cache_entry_never_deploys(self, tmp_path: Path) -> None:
+        """`lighthouse` owns the cache directory, so a plausible entry is a claim, not evidence.
+
+        The planted bytes are canonical, digest-consistent, bound to the exact target commit and
+        tree, and replay cleanly through the private verifier. Only the fixed channel can say
+        whether the target ever ran on `push main`, and here it cannot.
+        """
+
+        enforced = _r07_policy_bytes(enforced_predecessor=(_sha("a"), R07_INSTALLED_TREE))
+        responses = _base_responses()
+        responses.update(
+            _r07_responses(installed_policy=_r07_policy_bytes(), target_policy=enforced)
+        )
+        planted = _seed_r07_cache(
+            tmp_path,
+            commit_sha=_sha("b"),
+            tree_sha=R07_TARGET_TREE,
+            policy=enforced,
+        )
+        verifier = _RecordingVerifier()
+        runner = FakeRunner(responses)
+        transport = _EmptyTransport()
+        config = _config(tmp_path)
+
+        with pytest.raises(PolicyError, match="R07"):
+            deploy(
+                config,
+                runner=runner,
+                r07_evidence_gate=_r07_gate(tmp_path, verifier=verifier, transport=transport),
+            )
+
+        assert planted.is_file()
+        assert verifier.calls == []
+        assert transport.requests == [r07_deploy_evidence.workflow_runs_url(_sha("b"))]
+        assert not any(call[:2] == ("git", "merge") for call in runner.calls)
+        assert not any(call[0] in {"systemctl", "sudo"} for call in runner.calls)
+        assert _audit_records(config)[-1]["r07_gate"] == "rejected"
 
     def test_already_current_bootstrap_target_is_rejected(self, tmp_path: Path) -> None:
         responses = _base_responses()

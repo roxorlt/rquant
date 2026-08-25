@@ -683,6 +683,30 @@ def _cache_dir(tmp_path: Path) -> Path:
     return directory
 
 
+def _lab_trust(
+    root: Path,
+    *,
+    allow_sticky_ancestors: bool = False,
+) -> r07_deploy_evidence.EvidenceCacheTrustV1:
+    """Root the ancestor walk at the test directory: ``/tmp`` itself is sticky on Linux."""
+
+    return r07_deploy_evidence.EvidenceCacheTrustV1.for_deployment_process(
+        trusted_root=root,
+        allow_sticky_ancestors=allow_sticky_ancestors,
+    )
+
+
+def _identity(
+    *,
+    workflow_run_id: int = RUN_ID,
+    run_attempt: int = 2,
+) -> r07_deploy_evidence.ResolvedRunIdentityV1:
+    return r07_deploy_evidence.ResolvedRunIdentityV1(
+        workflow_run_id=workflow_run_id,
+        run_attempt=run_attempt,
+    )
+
+
 def test_cache_write_is_atomic_and_world_readable(tmp_path: Path) -> None:
     directory = tmp_path / "nested" / "r07-dr-evidence"
     payload = _valid_wire_bytes(COMMIT_B, TREE_B, policy=_policy())
@@ -707,6 +731,8 @@ def test_cache_read_returns_none_for_a_missing_entry(tmp_path: Path) -> None:
             commit_sha=COMMIT_B,
             tree_sha=TREE_B,
             policy=_policy(),
+            run_identity=_identity(),
+            trust=_lab_trust(tmp_path),
         )
         is None
     )
@@ -726,6 +752,8 @@ def test_cache_read_accepts_the_exact_bound_entry(tmp_path: Path) -> None:
         commit_sha=COMMIT_B,
         tree_sha=TREE_B,
         policy=policy,
+        run_identity=_identity(),
+        trust=_lab_trust(tmp_path),
     )
 
     assert wire is not None
@@ -745,6 +773,8 @@ def test_cache_read_rejects_a_symlinked_entry(tmp_path: Path) -> None:
             commit_sha=COMMIT_B,
             tree_sha=TREE_B,
             policy=_policy(),
+            run_identity=_identity(),
+            trust=_lab_trust(tmp_path),
         )
 
 
@@ -758,6 +788,8 @@ def test_cache_read_rejects_a_directory_entry(tmp_path: Path) -> None:
             commit_sha=COMMIT_B,
             tree_sha=TREE_B,
             policy=_policy(),
+            run_identity=_identity(),
+            trust=_lab_trust(tmp_path),
         )
 
 
@@ -771,6 +803,8 @@ def test_cache_read_rejects_a_fifo_entry(tmp_path: Path) -> None:
             commit_sha=COMMIT_B,
             tree_sha=TREE_B,
             policy=_policy(),
+            run_identity=_identity(),
+            trust=_lab_trust(tmp_path),
         )
 
 
@@ -787,6 +821,8 @@ def test_cache_read_rejects_an_entry_named_for_another_commit(tmp_path: Path) ->
             commit_sha=COMMIT_B,
             tree_sha=TREE_B,
             policy=policy,
+            run_identity=_identity(),
+            trust=_lab_trust(tmp_path),
         )
 
 
@@ -803,6 +839,8 @@ def test_cache_read_rejects_a_tree_that_is_not_the_target_tree(tmp_path: Path) -
             commit_sha=COMMIT_B,
             tree_sha=TREE_B,
             policy=policy,
+            run_identity=_identity(),
+            trust=_lab_trust(tmp_path),
         )
 
 
@@ -827,6 +865,8 @@ def test_cache_read_rejects_non_canonical_bytes(tmp_path: Path, mutate) -> None:
             commit_sha=COMMIT_B,
             tree_sha=TREE_B,
             policy=policy,
+            run_identity=_identity(),
+            trust=_lab_trust(tmp_path),
         )
 
 
@@ -847,6 +887,8 @@ def test_cache_read_rejects_duplicate_json_keys(tmp_path: Path) -> None:
             commit_sha=COMMIT_B,
             tree_sha=TREE_B,
             policy=policy,
+            run_identity=_identity(),
+            trust=_lab_trust(tmp_path),
         )
 
 
@@ -866,6 +908,8 @@ def test_cache_read_rejects_a_tampered_evidence_digest(tmp_path: Path) -> None:
             commit_sha=COMMIT_B,
             tree_sha=TREE_B,
             policy=policy,
+            run_identity=_identity(),
+            trust=_lab_trust(tmp_path),
         )
 
 
@@ -883,6 +927,8 @@ def test_cache_read_rejects_a_policy_digest_from_another_policy(tmp_path: Path) 
             commit_sha=COMMIT_B,
             tree_sha=TREE_B,
             policy=policy,
+            run_identity=_identity(),
+            trust=_lab_trust(tmp_path),
         )
 
 
@@ -908,6 +954,8 @@ def test_cache_read_rejects_channel_metadata_drift(tmp_path: Path) -> None:
             commit_sha=COMMIT_B,
             tree_sha=TREE_B,
             policy=tampered,
+            run_identity=_identity(),
+            trust=_lab_trust(tmp_path),
         )
 
 
@@ -1451,6 +1499,7 @@ def _gate(
     verifier: object | None = None,
     cache_dir: Path | None = None,
     require_declared_cache_path: bool = False,
+    cache_trust: object | None = None,
 ) -> tuple[object, _FakeTransport, object]:
     transport = _FakeTransport(responses or {})
     resolved_verifier = verifier or _FakeVerifier()
@@ -1461,6 +1510,7 @@ def _gate(
         clock=lambda: 0.0,
         verifier=resolved_verifier,
         require_declared_cache_path=require_declared_cache_path,
+        cache_trust=cache_trust or _lab_trust(tmp_path),
     )
     return gate, transport, resolved_verifier
 
@@ -1594,9 +1644,11 @@ def test_gate_verifies_release_b_evidence_before_and_after_the_cache_write(
     assert len(transport.requests) == 3
 
 
-def test_gate_reuses_a_retained_cache_entry_without_any_network_call(
+def test_gate_reuses_a_retained_cache_entry_but_never_its_run_identity_claim(
     tmp_path: Path,
 ) -> None:
+    """The retained entry saves the artifact download; the identity question is asked again."""
+
     repo, _pre_r07, release_a, release_b = _release_repo(tmp_path)
     gate, transport, verifier = _gate(tmp_path, responses=_gate_responses(repo, release_b))
     gate.evaluate(
@@ -1618,7 +1670,7 @@ def test_gate_reuses_a_retained_cache_entry_without_any_network_call(
     )
 
     assert decision.allowed is True
-    assert transport.requests == []
+    assert transport.requests == [r07_deploy_evidence.workflow_runs_url(release_b)]
     assert verifier.calls == [release_b]
 
 
@@ -1908,3 +1960,168 @@ def test_hard_linked_cache_entry_is_refused(tmp_path: Path) -> None:
     assert decision.allowed is False
     assert decision.gate == "rejected"
     assert verifier.calls == []
+
+
+def test_cache_entry_owned_by_another_identity_is_refused(tmp_path: Path) -> None:
+    """The expected owner is configurable so a root-owned cache is a value change, not a fork."""
+
+    directory = _cache_dir(tmp_path)
+    policy = _policy()
+    r07_deploy_evidence.write_cached_evidence(
+        cache_dir=directory,
+        commit_sha=COMMIT_B,
+        payload=_valid_wire_bytes(COMMIT_B, TREE_B, policy=policy),
+    )
+    foreign = r07_deploy_evidence.EvidenceCacheTrustV1(
+        trusted_root=tmp_path,
+        expected_uid=os.geteuid() + 1,
+        expected_gids=(os.getegid(), 0),
+        allow_sticky_ancestors=False,
+    )
+
+    with pytest.raises(r07_deploy_evidence.R07EvidenceError, match="trusted regular file"):
+        r07_deploy_evidence.read_cached_evidence(
+            cache_dir=directory,
+            commit_sha=COMMIT_B,
+            tree_sha=TREE_B,
+            policy=policy,
+            run_identity=_identity(),
+            trust=foreign,
+        )
+
+
+def test_cache_entry_larger_than_one_plausible_wire_is_refused(tmp_path: Path) -> None:
+    directory = _cache_dir(tmp_path)
+    policy = _policy()
+    entry = directory / f"{COMMIT_B}.json"
+    entry.write_bytes(_valid_wire_bytes(COMMIT_B, TREE_B, policy=policy) + b" " * (64 * 1024))
+    entry.chmod(0o644)
+
+    assert entry.stat().st_size > 64 * 1024
+    with pytest.raises(r07_deploy_evidence.R07EvidenceError, match="trusted regular file"):
+        r07_deploy_evidence.read_cached_evidence(
+            cache_dir=directory,
+            commit_sha=COMMIT_B,
+            tree_sha=TREE_B,
+            policy=policy,
+            run_identity=_identity(),
+            trust=_lab_trust(tmp_path),
+        )
+
+
+def test_a_sticky_ancestor_is_tolerated_only_under_an_explicit_lab_root(tmp_path: Path) -> None:
+    sticky = tmp_path / "sticky"
+    sticky.mkdir()
+    directory = sticky / "r07-dr-evidence"
+    policy = _policy()
+    r07_deploy_evidence.write_cached_evidence(
+        cache_dir=directory,
+        commit_sha=COMMIT_B,
+        payload=_valid_wire_bytes(COMMIT_B, TREE_B, policy=policy),
+    )
+    sticky.chmod(0o1777)
+
+    with pytest.raises(r07_deploy_evidence.R07EvidenceError, match="trusted regular file"):
+        r07_deploy_evidence.read_cached_evidence(
+            cache_dir=directory,
+            commit_sha=COMMIT_B,
+            tree_sha=TREE_B,
+            policy=policy,
+            run_identity=_identity(),
+            trust=_lab_trust(tmp_path),
+        )
+
+    wire = r07_deploy_evidence.read_cached_evidence(
+        cache_dir=directory,
+        commit_sha=COMMIT_B,
+        tree_sha=TREE_B,
+        policy=policy,
+        run_identity=_identity(),
+        trust=_lab_trust(tmp_path, allow_sticky_ancestors=True),
+    )
+
+    assert wire is not None
+    assert wire.candidate_commit_sha == COMMIT_B
+
+
+def test_a_world_writable_ancestor_without_the_sticky_bit_is_never_tolerated(
+    tmp_path: Path,
+) -> None:
+    loose = tmp_path / "loose"
+    loose.mkdir()
+    directory = loose / "r07-dr-evidence"
+    policy = _policy()
+    r07_deploy_evidence.write_cached_evidence(
+        cache_dir=directory,
+        commit_sha=COMMIT_B,
+        payload=_valid_wire_bytes(COMMIT_B, TREE_B, policy=policy),
+    )
+    loose.chmod(0o777)
+
+    for trust in (_lab_trust(tmp_path), _lab_trust(tmp_path, allow_sticky_ancestors=True)):
+        with pytest.raises(r07_deploy_evidence.R07EvidenceError, match="trusted regular file"):
+            r07_deploy_evidence.read_cached_evidence(
+                cache_dir=directory,
+                commit_sha=COMMIT_B,
+                tree_sha=TREE_B,
+                policy=policy,
+                run_identity=_identity(),
+                trust=trust,
+            )
+
+
+def test_linux_production_cache_trust_never_tolerates_a_sticky_ancestor() -> None:
+    with pytest.raises(ValidationError, match="sticky"):
+        r07_deploy_evidence.EvidenceCacheTrustV1(
+            trusted_root=Path("/"),
+            expected_uid=os.geteuid(),
+            expected_gids=(os.getegid(),),
+            allow_sticky_ancestors=True,
+        )
+
+
+def test_the_default_deployment_cache_trust_is_the_process_identity_rooted_at_slash() -> None:
+    trust = r07_deploy_evidence.EvidenceCacheTrustV1.for_deployment_process()
+
+    assert trust.trusted_root == Path("/")
+    assert trust.expected_uid == os.geteuid()
+    assert trust.allow_sticky_ancestors is False
+
+
+def test_the_cache_trusted_root_must_be_absolute_and_canonical(tmp_path: Path) -> None:
+    for root in (Path("relative/root"), tmp_path / ".." / tmp_path.name):
+        with pytest.raises(ValidationError, match="canonical"):
+            r07_deploy_evidence.EvidenceCacheTrustV1(
+                trusted_root=root,
+                expected_uid=os.geteuid(),
+                expected_gids=(os.getegid(),),
+                allow_sticky_ancestors=False,
+            )
+
+
+def test_the_gate_defaults_to_the_production_cache_trust(tmp_path: Path) -> None:
+    gate = r07_deploy_evidence.R07DeployEvidenceGate(
+        cache_dir=tmp_path / "var" / "r07-dr-evidence",
+        transport=_FakeTransport({}),
+        token_provider=_FakeTokenProvider(),
+    )
+
+    assert gate.cache_trust == r07_deploy_evidence.EvidenceCacheTrustV1.for_deployment_process()
+
+
+def test_the_cache_write_leaves_no_group_writable_ancestor_behind(tmp_path: Path) -> None:
+    """The read walk refuses a group-writable parent, so the writer may not create one."""
+
+    directory = tmp_path / "nested" / "deeper" / "r07-dr-evidence"
+    previous = os.umask(0o000)
+    try:
+        r07_deploy_evidence.write_cached_evidence(
+            cache_dir=directory,
+            commit_sha=COMMIT_B,
+            payload=_valid_wire_bytes(COMMIT_B, TREE_B, policy=_policy()),
+        )
+    finally:
+        os.umask(previous)
+
+    for created in (tmp_path / "nested", tmp_path / "nested" / "deeper", directory):
+        assert stat.S_IMODE(created.lstat().st_mode) == 0o755
