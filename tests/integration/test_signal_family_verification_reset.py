@@ -1657,6 +1657,52 @@ class TestProductionHarness:
             )
         ) == ()
 
+    def test_the_offline_world_does_not_prove_the_generation_source_closure(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """WP4C-SPEC-06, recorded as a contract rather than left implicit.
+
+        The root checks each binding's `executable_source_sha256` against the full manifest,
+        and in this replica that hash belongs to a one-line placeholder written into the
+        generation. The child, meanwhile, resolves `rquant` through the generation
+        interpreter's path configuration, which points at the repository's own `src/`. So the
+        bytes the manifest authenticates and the bytes the child executes are different
+        files, and this world proves the protocol and the builder path — not "the full
+        manifest is the source closure".
+
+        Closing it means writing the real source closure into the generation, which is
+        deliberately out of scope for this round; §9 carries it as an open item. This case
+        exists so the gap fails loudly the day someone believes it is already closed.
+        """
+
+        import importlib
+        import inspect
+
+        world = build_world(tmp_path, harness="real")
+
+        divergent = 0
+        for binding in world.bindings:
+            manifested = world.generation_path / binding.executable_source_relative_path
+            assert manifested.is_file()
+            assert (
+                hashlib.sha256(manifested.read_bytes()).hexdigest()
+                == binding.executable_source_sha256
+            )
+
+            imported = Path(inspect.getfile(importlib.import_module(binding.executable_module)))
+            assert imported.is_file()
+            if (
+                hashlib.sha256(imported.read_bytes()).hexdigest()
+                != binding.executable_source_sha256
+            ):
+                divergent += 1
+
+        assert divergent == len(world.bindings), (
+            "every binding is expected to diverge today; a match would mean the world "
+            "started materializing the real closure and this case must be replaced"
+        )
+
     def test_the_real_harness_pyz_is_the_policy_hashed_artifact(self, tmp_path: Path) -> None:
         world = build_world(tmp_path, harness="real")
 

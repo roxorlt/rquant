@@ -23,6 +23,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import stat
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -565,6 +566,181 @@ class TestReplacementDuringChildExecution:
 # ---------------------------------------------------------------------------------------
 # The anchors themselves are a boundary, not a switch
 # ---------------------------------------------------------------------------------------
+
+
+class TestChildWorkspaceAnchorBoundary:
+    """WP4C-SPEC-05: every store-root exclusion and every workspace reject, with a case.
+
+    The seven guards round 1 added were hand-probed and correct but had no negative test, so
+    nothing would have noticed them being deleted. O5's discipline for the WP4-b anchors —
+    symlink, mode, ownership, group-writability, type — is applied to them here.
+    """
+
+    @staticmethod
+    def _anchors(world: Any, **overrides: Any) -> root_verifier.VerifierAnchors:
+        values: dict[str, Any] = {
+            "policy_trusted_root": world.root,
+            "policy_path": world.policy_path,
+            "harness_path": world.harness_path,
+            "store_root": world.store_root,
+            "child_workspace_root": world.child_workspace_root,
+            "expected_owner_uid": os.getuid(),
+            "expected_owner_gid": world.root.stat().st_gid,
+            "child_uid": os.getuid(),
+            "child_gid": os.getgid(),
+        }
+        values.update(overrides)
+        return root_verifier.VerifierAnchors(**values)
+
+    def test_a_workspace_that_is_the_store_root_rejects(self, tmp_path: Path) -> None:
+        world = build_world(tmp_path)
+
+        with pytest.raises(ValueError, match="must not be the store root"):
+            self._anchors(world, child_workspace_root=world.store_root)
+
+    def test_a_workspace_that_contains_the_store_root_rejects(self, tmp_path: Path) -> None:
+        world = build_world(tmp_path)
+
+        with pytest.raises(ValueError, match="must not contain the store root"):
+            self._anchors(world, child_workspace_root=world.store_root.parent)
+
+    def test_a_workspace_beneath_the_store_root_rejects(self, tmp_path: Path) -> None:
+        world = build_world(tmp_path)
+
+        with pytest.raises(ValueError, match="must not live beneath the store root"):
+            self._anchors(world, child_workspace_root=world.store_root / "workspace")
+
+    def test_the_world_anchors_keep_the_workspace_and_the_store_disjoint(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        world = build_world(tmp_path)
+        workspace = world.anchors.child_workspace_root
+
+        assert workspace != world.store_root
+        assert workspace not in world.store_root.parents
+        assert world.store_root not in workspace.parents
+
+    def test_a_symlinked_ancestor_rejects(self, tmp_path: Path) -> None:
+        real = tmp_path / "real"
+        real.mkdir(mode=0o755)
+        link = tmp_path / "link"
+        link.symlink_to(real, target_is_directory=True)
+
+        with pytest.raises(root_verifier.SignalFamilyRootVerifierError, match="symlink"):
+            root_verifier.open_child_workspace_root(
+                link / "workspace",
+                expected_uid=os.getuid(),
+                child_uid=os.getuid(),
+            )
+
+    def test_a_group_writable_ancestor_rejects(self, tmp_path: Path) -> None:
+        loose = tmp_path / "loose"
+        loose.mkdir(mode=0o755)
+        loose.chmod(0o775)  # `mkdir` would have masked this with the umask
+
+        with pytest.raises(
+            root_verifier.SignalFamilyRootVerifierError,
+            match="group or world writable",
+        ):
+            root_verifier.open_child_workspace_root(
+                loose / "workspace",
+                expected_uid=os.getuid(),
+                child_uid=os.getuid(),
+            )
+
+    def test_an_ancestor_owned_by_an_untrusted_account_rejects(self, tmp_path: Path) -> None:
+        private = tmp_path / "private"
+        private.mkdir(mode=0o755)
+
+        with pytest.raises(
+            root_verifier.SignalFamilyRootVerifierError,
+            match="untrusted account",
+        ):
+            root_verifier.open_child_workspace_root(
+                private / "workspace",
+                expected_uid=os.getuid() + 4242,
+                child_uid=os.getuid(),
+            )
+
+    @pytest.mark.parametrize("mode", [0o700, 0o755, 0o701, 0o710])
+    def test_a_workspace_with_the_wrong_mode_rejects(self, tmp_path: Path, mode: int) -> None:
+        """`0700` is in this list on purpose: it is the round 1 value that production cannot
+        traverse, so re-adopting it must now fail loudly rather than silently."""
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir(mode=0o755)
+        workspace.chmod(mode)
+
+        with pytest.raises(
+            root_verifier.SignalFamilyRootVerifierError,
+            match="private directory this verifier owns",
+        ):
+            root_verifier.open_child_workspace_root(
+                workspace,
+                expected_uid=os.getuid(),
+                child_uid=os.getuid(),
+            )
+
+    def test_a_non_directory_component_rejects(self, tmp_path: Path) -> None:
+        """A file where a parent directory should be is refused at creation, not walked."""
+
+        blocker = tmp_path / "blocker"
+        blocker.write_text("not a directory", encoding="utf-8")
+
+        with pytest.raises(
+            root_verifier.SignalFamilyRootVerifierError,
+            match="could not be created",
+        ):
+            root_verifier.open_child_workspace_root(
+                blocker / "workspace",
+                expected_uid=os.getuid(),
+                child_uid=os.getuid(),
+            )
+
+    def test_a_missing_parent_rejects_instead_of_being_created(self, tmp_path: Path) -> None:
+        with pytest.raises(
+            root_verifier.SignalFamilyRootVerifierError,
+            match="could not be created",
+        ):
+            root_verifier.open_child_workspace_root(
+                tmp_path / "absent" / "workspace",
+                expected_uid=os.getuid(),
+                child_uid=os.getuid(),
+            )
+
+    def test_a_fresh_workspace_is_created_at_the_frozen_mode(self, tmp_path: Path) -> None:
+        """`os.mkdir` masks its mode with the umask, so the mode is set explicitly."""
+
+        workspace = tmp_path / "workspace"
+        previous = os.umask(0o077)
+        try:
+            resolved = root_verifier.open_child_workspace_root(
+                workspace,
+                expected_uid=os.getuid(),
+                child_uid=os.getuid(),
+            )
+        finally:
+            os.umask(previous)
+
+        assert resolved == workspace
+        assert stat.S_IMODE(workspace.stat().st_mode) == root_verifier.CHILD_WORKSPACE_MODE
+
+    def test_an_existing_workspace_is_validated_not_normalized(self, tmp_path: Path) -> None:
+        """A mode somebody else set is a misconfiguration to report, not one to repair."""
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir(mode=0o755)
+        workspace.chmod(0o777)
+
+        with pytest.raises(root_verifier.SignalFamilyRootVerifierError):
+            root_verifier.open_child_workspace_root(
+                workspace,
+                expected_uid=os.getuid(),
+                child_uid=os.getuid(),
+            )
+
+        assert stat.S_IMODE(workspace.stat().st_mode) == 0o777
 
 
 class TestAnchorBoundary:

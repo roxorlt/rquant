@@ -433,6 +433,45 @@ class TestSurfaceResolution:
         with pytest.raises(_resolve.SurfaceResolutionError, match="not bound to"):
             _resolve.bound_surface(object(), surface_id)
 
+    def test_a_same_named_lambda_on_the_instance_rejects(self) -> None:
+        """Reviewer mutation M5, closed: attribute presence is not identity.
+
+        Deleting the `__func__ is resolve_surface(id)` half of `bound_surface` left the whole
+        suite green, because the only negative case passed a bare `object()` and was caught
+        by the presence half. This is the case that needed the identity half.
+        """
+
+        from rquant.paper_signal_worker import PaperSignalQueueStore
+
+        surface_id = SurfaceId.PAPER_SIGNAL_QUEUE_STORE_INGEST.value
+        instance = object.__new__(PaperSignalQueueStore)
+        instance.ingest = lambda *args, **kwargs: {"forged": True}  # type: ignore[method-assign]
+
+        with pytest.raises(_resolve.SurfaceResolutionError, match="not bound to"):
+            _resolve.bound_surface(instance, surface_id)
+
+    def test_a_subclass_override_rejects(self) -> None:
+        """The other shape of the same substitution: same qualname, different function."""
+
+        from rquant.paper_signal_worker import PaperSignalQueueStore
+
+        surface_id = SurfaceId.PAPER_SIGNAL_QUEUE_STORE_INGEST.value
+
+        class Substituted(PaperSignalQueueStore):
+            def ingest(self, *args: Any, **kwargs: Any) -> Any:  # type: ignore[override]
+                return {"forged": True}
+
+        with pytest.raises(_resolve.SurfaceResolutionError, match="not bound to"):
+            _resolve.bound_surface(object.__new__(Substituted), surface_id)
+
+    def test_the_genuine_binding_is_the_resolved_function_itself(self) -> None:
+        from rquant.paper_signal_worker import PaperSignalQueueStore
+
+        surface_id = SurfaceId.PAPER_SIGNAL_QUEUE_STORE_INGEST.value
+        bound = _resolve.bound_surface(object.__new__(PaperSignalQueueStore), surface_id)
+
+        assert bound.__func__ is _resolve.resolve_surface(surface_id)
+
     def test_binding_a_dunder_surface_uses_the_type_slot(self) -> None:
         from rquant.runtime_serving_authority import ServingSourceAuthorityReader
 
@@ -677,6 +716,47 @@ class TestSurfaceExercises:
             with pytest.raises(_surfaces.SurfaceExerciseError, match="read-only surface"):
                 _exercise(vector, tmp_path)
 
+    def test_a_surface_that_rewrites_the_declaration_is_refused(self, tmp_path: Path) -> None:
+        """Reviewer mutation M4a, closed: `state_unchanged` is enforced, not reported.
+
+        Turning the raise into a reported `False` left every case green, because nothing
+        exercised the branch. A vector's materialized declaration is the input the policy
+        hashed; a surface that rewrites it has invalidated the run, so the whole run stops
+        rather than describing what happened.
+        """
+
+        surface_id = SurfaceId.READONLY_SIGNAL_ROUTE_SPOOL_ROUTED_AFTER_GLOBAL_SEQUENCE.value
+        vector = next(
+            item for item in harness_vectors() if item.surface_id.value == surface_id
+        )
+        real_tree_digest = _surfaces.tree_digest
+        seen = 0
+
+        def drifting(root: Path) -> str:
+            nonlocal seen
+            digest = real_tree_digest(root)
+            if root.name != "state":
+                return digest
+            seen += 1
+            return f"{digest}-{seen}"
+
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(_surfaces, "tree_digest", drifting)
+            with pytest.raises(_surfaces.SurfaceExerciseError, match="materialized declaration"):
+                _exercise(vector, tmp_path)
+
+    def test_every_result_reports_the_declaration_as_intact(self, tmp_path: Path) -> None:
+        """The field is a constant because the alternative is a rejection, never a `False`."""
+
+        for surface_id in harness.IMPLEMENTED_SURFACE_IDS:
+            vector = next(
+                item for item in harness_vectors() if item.surface_id.value == surface_id
+            )
+            root = tmp_path / f"state-{surface_id.rsplit('.', 1)[1]}"
+            root.mkdir()
+
+            assert _exercise(vector, root)["state_unchanged"] is True
+
     def test_no_result_field_depends_on_sqlite_checkpoint_timing(self, tmp_path: Path) -> None:
         """A writer's runtime tree is not byte-stable across processes; nothing may report it."""
 
@@ -764,6 +844,85 @@ class TestSurfaceExercises:
 
         with pytest.raises(_surfaces.SurfaceExerciseError, match="does not own"):
             _surfaces.exercise_vector(broken, tmp_path)
+
+
+class TestServingLoaderProvenance:
+    """Reviewer mutation M8, closed: an injected snapshot loader is not the owner path."""
+
+    @staticmethod
+    def _injected_step(tmp_path: Path) -> Any:
+        from rquant.runtime_builder_serving import serving_publisher_builder
+        from rquant.runtime_service_control import RuntimeServicePlane
+        from rquant.runtime_service_entrypoint import RuntimeServiceKind, RuntimeServiceManifest
+
+        def fake_loader(as_of: datetime) -> Any:  # pragma: no cover - never invoked
+            raise AssertionError("the fake loader must never be reached")
+
+        manifest = RuntimeServiceManifest(
+            service_id="serving-publisher",
+            service_kind=RuntimeServiceKind.SERVING_PUBLISHER,
+            plane=RuntimeServicePlane.SERVING,
+            interval_seconds=1.0,
+            stale_after_seconds=50.0,
+            producer_commit="f" * 40,
+            settings={
+                "schema_version": 3,
+                "serving_root": str(tmp_path / "serving"),
+            },
+        )
+        return serving_publisher_builder(
+            snapshot_loader=fake_loader,
+            clock=lambda: datetime(2026, 8, 24, 7, 30, tzinfo=UTC),
+        )(manifest)
+
+    def test_an_injected_loader_cannot_stand_in_for_the_assembler(self, tmp_path: Path) -> None:
+        step = self._injected_step(tmp_path)
+
+        with pytest.raises(_surfaces.SurfaceExerciseError, match="ServingSnapshotAssembler"):
+            _surfaces._closure_assembler(step)
+
+    @staticmethod
+    def _step_with_loader(loader: Any) -> Any:
+        """A step closure shaped exactly like the serving builder's, holding one loader."""
+
+        resolved_snapshot_loader = loader
+
+        def step() -> Any:  # pragma: no cover - only its closure cell is read
+            return resolved_snapshot_loader
+
+        return step
+
+    def test_a_loader_bound_to_the_wrong_function_rejects(self) -> None:
+        """`__self__` alone is not enough: the bound function must be the frozen `assemble`.
+
+        This is the mutation the `__self__` check cannot see — a genuine assembler carrying
+        somebody else's implementation.
+        """
+
+        import types
+
+        from rquant.runtime_serving_snapshot import ServingSnapshotAssembler
+
+        assembler = object.__new__(ServingSnapshotAssembler)
+
+        def substituted(self: Any, as_of: Any) -> Any:  # pragma: no cover - never invoked
+            raise AssertionError("the substituted assemble must never be reached")
+
+        loader = types.MethodType(substituted, assembler)
+        assert type(loader.__self__) is ServingSnapshotAssembler
+
+        with pytest.raises(_surfaces.SurfaceExerciseError, match="frozen assemble"):
+            _surfaces._closure_assembler(self._step_with_loader(loader))
+
+    def test_the_genuine_owner_path_loader_is_accepted(self) -> None:
+        import types
+
+        from rquant.runtime_serving_snapshot import ServingSnapshotAssembler
+
+        assembler = object.__new__(ServingSnapshotAssembler)
+        loader = types.MethodType(ServingSnapshotAssembler.assemble, assembler)
+
+        assert _surfaces._closure_assembler(self._step_with_loader(loader)) is assembler
 
 
 # ---------------------------------------------------------------------------------------
