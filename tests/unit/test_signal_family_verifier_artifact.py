@@ -30,6 +30,16 @@ BUILD_SCRIPT = ROOT / "scripts" / "build-signal-family-verifier-artifact.py"
 LEGACY_ENTRY_SCRIPT = ROOT / "scripts" / "signal-family-root-verifier.py"
 
 
+@pytest.fixture(autouse=True)
+def _restore_readonly_trees(tmp_path: Path):  # type: ignore[no-untyped-def]
+    """Every tree here is `0555`; hand pytest a removable directory back."""
+
+    yield
+    for path in sorted(tmp_path.rglob("*"), reverse=True):
+        if path.is_dir() and not path.is_symlink():
+            path.chmod(0o755)
+
+
 def _tree(root: Path) -> Path:
     """A miniature installed tree with the shape the real one has."""
 
@@ -64,11 +74,11 @@ def _verify(root: Path, entries: tuple[artifact.TreeEntry, ...], identifier: str
 
 class TestInstallLocations:
     def test_the_install_locations_are_the_frozen_constants(self) -> None:
-        assert artifact.ARTIFACT_INSTALL_ROOT == Path(
-            "/usr/local/lib/rquant-signal-family-verifier"
+        assert Path("/usr/local/lib/rquant-signal-family-verifier") == (
+            artifact.ARTIFACT_INSTALL_ROOT
         )
-        assert artifact.ARTIFACT_ENTRY_PATH == Path(
-            "/usr/local/libexec/rquant-signal-family-verifier-v1.pyz"
+        assert Path("/usr/local/libexec/rquant-signal-family-verifier-v1.pyz") == (
+            artifact.ARTIFACT_ENTRY_PATH
         )
 
     def test_the_install_plan_binds_path_owner_and_mode_for_every_target(self) -> None:
@@ -175,6 +185,7 @@ class TestInstalledTreeVerification:
         site = root / "lib" / "python3.11" / "site-packages"
         site.chmod(0o755)
         (site / "sitecustomize.py").write_text("import os\n", encoding="utf-8")
+        site.chmod(0o555)
 
         with pytest.raises(artifact.VerifierArtifactError, match="unmanifested"):
             _verify(root, entries, identifier)
@@ -184,6 +195,7 @@ class TestInstalledTreeVerification:
         target = root / "lib" / "python3.11" / "site-packages" / "typing_extensions.py"
         target.parent.chmod(0o755)
         target.unlink()
+        target.parent.chmod(0o555)
 
         with pytest.raises(artifact.VerifierArtifactError, match="missing"):
             _verify(root, entries, identifier)
@@ -215,15 +227,17 @@ class TestInstalledTreeVerification:
         target.unlink()
         target.symlink_to(tmp_path / "elsewhere.py")
         (tmp_path / "elsewhere.py").write_text("VALUE = 2\n", encoding="utf-8")
+        target.parent.chmod(0o555)
 
         with pytest.raises(artifact.VerifierArtifactError, match="regular file"):
             _verify(root, entries, identifier)
 
     def test_a_hardlinked_member_refuses_to_start(self, tmp_path: Path) -> None:
+        """The second link lives outside the tree, which is where an attacker would put it."""
+
         root, entries, identifier = _installed(tmp_path)
         target = root / "lib" / "python3.11" / "site-packages" / "typing_extensions.py"
-        target.parent.chmod(0o755)
-        os.link(target, target.parent / "alias.py")
+        os.link(target, tmp_path / "alias.py")
 
         with pytest.raises(artifact.VerifierArtifactError, match="single link"):
             _verify(root, entries, identifier)
@@ -232,7 +246,7 @@ class TestInstalledTreeVerification:
         root, entries, identifier = _installed(tmp_path)
         root.chmod(0o575)
 
-        with pytest.raises(artifact.VerifierArtifactError, match="mode"):
+        with pytest.raises(artifact.VerifierArtifactError, match="writable"):
             _verify(root, entries, identifier)
 
     def test_a_group_writable_ancestor_refuses_to_start(self, tmp_path: Path) -> None:
@@ -486,3 +500,145 @@ class TestDeterministicBuild:
         assert _frozen_manifest.CONTENT_ID == ""
         with pytest.raises(artifact.VerifierArtifactError, match="not been built"):
             _frozen_manifest.require_frozen_manifest()
+
+
+class TestBuiltEntryEndToEnd:
+    """Run the real built archive against a real tree, without installing anything.
+
+    The archive is executed with `-I -S` exactly as the production unit would, but its
+    install root is redirected onto a tree this test owns through the same keyword seam
+    `VerifierAnchors` uses. Production `main` passes nothing, so the frozen literals are
+    the only values a production run can see.
+    """
+
+    PROBE = (
+        "import json, sys\n"
+        "from pathlib import Path\n"
+        # A zipapp puts its own archive at `sys.path[0]`; `-c` has to do it by hand.
+        "sys.path.insert(0, sys.argv[2])\n"
+        "BASELINE = list(sys.path)\n"
+        "from rquant_signal_family_verifier_entry import __main__ as boot\n"
+        "from rquant_signal_family_verifier_entry._artifact import VerifierArtifactError\n"
+        "try:\n"
+        "    cli = boot.bind_verified_tree(\n"
+        "        install_root=Path(sys.argv[1]),\n"
+        "        entry_path=Path(sys.argv[2]),\n"
+        "        expected_owner_uid=int(sys.argv[3]),\n"
+        "        expected_owner_gid=int(sys.argv[4]),\n"
+        "    )\n"
+        "except VerifierArtifactError as error:\n"
+        "    print(json.dumps({'outcome': 'rejected', 'detail': str(error)}))\n"
+        "    raise SystemExit(0)\n"
+        "import rquant.signal_family_root_verifier as verifier\n"
+        "print(json.dumps({\n"
+        "    'outcome': 'bound',\n"
+        "    'verifier_file': verifier.__file__,\n"
+        "    'cli': cli.__name__,\n"
+        "    'sys_path': list(sys.path),\n"
+        "    'baseline': BASELINE,\n"
+        "}))\n"
+    )
+
+    @staticmethod
+    def _build(tmp_path: Path) -> dict[str, object]:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(BUILD_SCRIPT),
+                "--repository-root",
+                str(ROOT),
+                "--source-venv",
+                str(ROOT / ".venv"),
+                "--output-root",
+                str(tmp_path / "staging"),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stderr
+        return json.loads(completed.stdout)
+
+    def _run(self, built: dict[str, object], install_root: Path) -> dict[str, object]:
+        entry = Path(str(built["entry_path"]))
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-S",
+                "-c",
+                self.PROBE,
+                str(install_root),
+                str(entry),
+                str(os.getuid()),
+                str(install_root.stat().st_gid),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            env={"PATH": "/usr/bin:/bin"},
+        )
+        assert completed.returncode == 0, completed.stderr
+        return json.loads(completed.stdout)
+
+    @pytest.fixture()
+    def built(self, tmp_path: Path) -> tuple[dict[str, object], Path]:
+        report = self._build(tmp_path)
+        install_root = tmp_path / "install"
+        install_root.mkdir(mode=0o755)
+        artifact.relocate_frozen_tree(
+            Path(str(report["tree_root"])),
+            install_root / str(report["content_id"]),
+        )
+        return report, install_root
+
+    def test_the_built_entry_binds_only_the_verified_tree(
+        self,
+        built: tuple[dict[str, object], Path],
+    ) -> None:
+        report, install_root = built
+        tree = install_root / str(report["content_id"])
+
+        observed = self._run(report, install_root)
+
+        assert observed["outcome"] == "bound", observed
+        assert Path(str(observed["verifier_file"])).is_relative_to(tree)
+        assert str(ROOT / "src") not in observed["sys_path"]  # type: ignore[operator]
+        baseline = set(observed["baseline"])  # type: ignore[arg-type]
+        for entry in observed["sys_path"]:  # type: ignore[union-attr]
+            assert str(entry) in baseline or Path(str(entry)).is_relative_to(tree), entry
+        assert str(tree / "lib" / "python3.11" / "site-packages") in observed["sys_path"]  # type: ignore[operator]
+
+    def test_one_flipped_byte_in_the_installed_tree_refuses_to_start(
+        self,
+        built: tuple[dict[str, object], Path],
+    ) -> None:
+        report, install_root = built
+        tree = install_root / str(report["content_id"])
+        target = tree / "lib" / "python3.11" / "site-packages" / "rquant" / "strict_json.py"
+        target.parent.chmod(0o755)
+        target.chmod(0o644)
+        target.write_bytes(target.read_bytes() + b"\n")
+        target.chmod(0o444)
+        target.parent.chmod(0o555)
+
+        observed = self._run(report, install_root)
+
+        assert observed["outcome"] == "rejected"
+        assert "hash changed" in str(observed["detail"])
+
+    def test_a_checkout_module_smuggled_into_the_tree_refuses_to_start(
+        self,
+        built: tuple[dict[str, object], Path],
+    ) -> None:
+        report, install_root = built
+        tree = install_root / str(report["content_id"])
+        site = tree / "lib" / "python3.11" / "site-packages"
+        site.chmod(0o755)
+        (site / "sitecustomize.py").write_text("import os\n", encoding="utf-8")
+        site.chmod(0o555)
+
+        observed = self._run(report, install_root)
+
+        assert observed["outcome"] == "rejected"
+        assert "unmanifested" in str(observed["detail"])
