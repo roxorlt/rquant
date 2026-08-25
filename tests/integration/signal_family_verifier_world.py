@@ -691,6 +691,7 @@ def build_world(
     harness_mode: str = "ok",
     harness: str = "stub",
     blocked_surface_id: Any | None = None,
+    vector_pair_ids: tuple[str, ...] | None = None,
     policy_max_age_seconds: int | None = None,
     stale_overrides: Mapping[str, float] | None = None,
     run_id_override: str | None = None,
@@ -713,6 +714,8 @@ def build_world(
         raise ValueError("the real harness has no injected failure modes")
     if blocked_surface_id is not None and harness != "real":
         raise ValueError("a blocked-surface vector only means something to the real harness")
+    if vector_pair_ids is not None and not vector_pair_ids:
+        raise ValueError("a restricted vector set must still name at least one pair")
 
     from rquant import signal_family_root_verifier as verifier
 
@@ -750,6 +753,10 @@ def build_world(
         )
 
         vectors = harness_vectors()
+        if vector_pair_ids is not None:
+            vectors = tuple(
+                vector for vector in vectors if vector.pair_id in vector_pair_ids
+            )
         # The policy author derives the expected results by running the same exercise the
         # child will run. The child is never told any of this; the root compares after exit.
         policy_scratch = tmp_path / "policy-expected"
@@ -764,6 +771,10 @@ def build_world(
         replay: Mapping[str, str] = derived
     else:
         vectors = _vectors(manifests)
+        if vector_pair_ids is not None:
+            vectors = tuple(
+                vector for vector in vectors if vector.pair_id in vector_pair_ids
+            )
         replay = _replay(vectors)
     expected_results = tuple(
         verification.SignalFamilyExpectedResultV1(

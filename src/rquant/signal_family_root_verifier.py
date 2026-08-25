@@ -80,6 +80,7 @@ from rquant.signal_family_verification import (
     expected_result_set_hash,
     five_pair_service_binding_set_hash,
     freshness_seconds,
+    missing_pair_surface_coverage,
     observed_result_set_hash,
     participating_service_ids,
     require_pair_derived_surfaces,
@@ -113,6 +114,12 @@ PRODUCTION_STORE_ROOT: Final[Path] = Path("/var/lib/rquant/signal-family-verific
 PRODUCTION_CHILD_WORKSPACE_ROOT: Final[Path] = Path(
     "/var/lib/rquant/signal-family-verifier-workspace"
 )
+#: Root-owned, traversable by the unprivileged child, enumerable by nobody else. `0700` was
+#: the round 1 value and it is unusable in production: the child runs as `lighthouse`, and
+#: without the other execute bit every absolute path under the workspace is `EACCES` the
+#: moment the privilege drop lands. `0711` has no group or other write bit, so
+#: `runtime_serving_authority`'s ancestry rule still accepts it.
+CHILD_WORKSPACE_MODE: Final[int] = 0o711
 PRODUCTION_OWNER_UID: Final[int] = 0
 PRODUCTION_OWNER_GID: Final[int] = 0
 
@@ -193,6 +200,7 @@ def _rejection_events() -> Mapping[SignalFamilyReasonCode, SignalFamilyAuditEven
         ("FIVE_PAIR_", event.MANIFEST_VALIDATED),
         ("BINDING_", event.BINDING_VALIDATED),
         ("PAIR_SET_", event.BINDING_VALIDATED),
+        ("PAIR_SURFACE_", event.CHILD_RESULT_VALIDATED),
         ("PARTICIPANT_", event.BINDING_VALIDATED),
         ("CHILD_LAUNCH", event.CHILD_LAUNCHED),
         ("CHILD_", event.CHILD_RESULT_VALIDATED),
@@ -448,7 +456,26 @@ def child_environment(*, cwd: Path, request_fd: int, result_fd: int) -> dict[str
     return environment
 
 
-def open_child_workspace_root(root: Path, *, expected_uid: int) -> Path:
+def workspace_admits_child(mode: int, *, workspace_uid: int, child_uid: int) -> bool:
+    """Can a process running as `child_uid` traverse a workspace with this mode?
+
+    POSIX resolves an absolute path one component at a time and needs the execute bit on
+    every one of them. The harness addresses everything by absolute path — `VectorWorkspace`
+    roots itself at `os.getcwd()` and rebases every declared path into
+    `RuntimeServiceManifest.settings` — so a workspace the child cannot traverse means the
+    child cannot open its own cwd after the privilege drop, no matter that it was chowned to
+    it. In production the verifier is root and the child is `lighthouse`, so it is the
+    *other* execute bit that decides.
+    """
+
+    if type(mode) is not int or type(workspace_uid) is not int or type(child_uid) is not int:
+        raise TypeError("workspace admission takes an integer mode and two integer uids")
+    if workspace_uid == child_uid:
+        return bool(mode & stat.S_IXUSR)
+    return bool(mode & stat.S_IXOTH)
+
+
+def open_child_workspace_root(root: Path, *, expected_uid: int, child_uid: int) -> Path:
     """Create and validate the private parent the child's cwd is carved out of.
 
     The walk is anchored and no-follow from `/`, and it applies the same trust rule
@@ -456,6 +483,11 @@ def open_child_workspace_root(root: Path, *, expected_uid: int) -> Path:
     a real directory owned by root or by this process, with no group or other write bit. A
     child cwd whose ancestry fails that rule cannot host a serving authority, which is what
     made three reader surfaces unreachable before WP4-c round 1.
+
+    The leaf is `0711`, not `0700`: traversable by the unprivileged child, and readable by
+    nobody but the verifier that owns it, so the child can enter the one directory it was
+    given without being able to enumerate any other run's. `0711` carries no group or other
+    write bit, so the serving-authority ancestry rule still holds over it.
     """
 
     directory_flags = (
@@ -464,8 +496,20 @@ def open_child_workspace_root(root: Path, *, expected_uid: int) -> Path:
         | getattr(os, "O_NOFOLLOW", 0)
         | getattr(os, "O_CLOEXEC", 0)
     )
-    with suppress(FileExistsError, OSError):
-        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        os.mkdir(root, CHILD_WORKSPACE_MODE)
+    except FileExistsError:
+        # An existing workspace is validated, never normalized: silently repairing a mode
+        # someone else set would hide exactly the misconfiguration this walk exists to catch.
+        pass
+    except OSError as error:
+        raise _reject(
+            SignalFamilyReasonCode.CHILD_LAUNCH_FAILED,
+            "the child workspace root could not be created",
+        ) from error
+    else:
+        # `os.mkdir` masks its mode with the process umask, which the verifier does not own.
+        os.chmod(root, CHILD_WORKSPACE_MODE)
     descriptors: list[int] = []
     try:
         try:
@@ -504,10 +548,20 @@ def open_child_workspace_root(root: Path, *, expected_uid: int) -> Path:
                     "a child workspace ancestor is group or world writable",
                 )
         leaf = os.fstat(descriptors[-1])
-        if leaf.st_uid != expected_uid or stat.S_IMODE(leaf.st_mode) != 0o700:
+        leaf_mode = stat.S_IMODE(leaf.st_mode)
+        if leaf.st_uid != expected_uid or leaf_mode != CHILD_WORKSPACE_MODE:
             raise _reject(
                 SignalFamilyReasonCode.CHILD_LAUNCH_FAILED,
                 "the child workspace root is not a private directory this verifier owns",
+            )
+        if not workspace_admits_child(
+            leaf_mode,
+            workspace_uid=leaf.st_uid,
+            child_uid=child_uid,
+        ):  # pragma: no cover - the exact-mode check above already implies this
+            raise _reject(
+                SignalFamilyReasonCode.CHILD_LAUNCH_FAILED,
+                "the child workspace root cannot be traversed by the unprivileged child",
             )
         return root
     finally:
@@ -1502,6 +1556,7 @@ class RootVerifier:
         workspace = open_child_workspace_root(
             self._anchors.child_workspace_root,
             expected_uid=self._anchors.expected_owner_uid,
+            child_uid=self._anchors.child_uid,
         )
         request_read, request_write = os.pipe()
         result_read, result_write = os.pipe()
@@ -1788,6 +1843,12 @@ class RootVerifier:
                 test_manifest_sha256=plan.test_manifest_sha256,
                 entry=entry,
             )
+            # Ruling C1 / L1208-1209: a reader surface is *the code exercised* for that
+            # pair's one receipt, so a pair whose readers never ran has nothing to issue a
+            # receipt about. The gate is on the child's own results, not on the manifest's
+            # declaration, and it covers all five pairs at once: partial coverage yields no
+            # receipt and no readiness, only a bounded rejection.
+            self._require_pair_surface_coverage(child_result)
             # L1441-1443: the root revalidates the immutable manifests, the binding
             # tuple, the source paths and hashes, the full-manifest closure, the service
             # manifests, and the policy age cap *again* after the child exits. Every
@@ -2317,6 +2378,16 @@ class RootVerifier:
                 ) from error
 
     # -- step 6 in detail -------------------------------------------------------------
+
+    @staticmethod
+    def _require_pair_surface_coverage(child_result: SignalFamilyChildResultV1) -> None:
+        """Every frozen pair must have executed every one of its reader surfaces."""
+
+        if missing_pair_surface_coverage(child_result.vector_results):
+            raise _reject(
+                SignalFamilyReasonCode.PAIR_SURFACE_COVERAGE_MISSING,
+                "a frozen pair has reader surfaces no executed vector covered",
+            )
 
     @staticmethod
     def _validate_child_result(

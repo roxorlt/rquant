@@ -1457,16 +1457,29 @@ class TestProductionHarness:
     neither of them was told in advance.
     """
 
-    def test_the_real_harness_completes_the_eight_step_sequence(self, tmp_path: Path) -> None:
+    def test_the_real_harness_is_refused_for_the_pairs_it_cannot_exercise(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Ruling C1: 8/13 coverage is not five-pair readiness, and no longer pretends to be.
+
+        The rejection reason is what makes this case load-bearing. Reaching
+        `PAIR_SURFACE_COVERAGE_MISSING` means the child's eight results already satisfied
+        every identity, ordering, and hash check — including `expected_result_set_hash` —
+        and the only thing left to fail was coverage of `strategy-router` and
+        `strategy-shadow`, whose readers no vector can reach yet (R3/R4).
+        """
+
         world = build_world(tmp_path, harness="real")
 
-        result = _verifier(world).run()
+        with pytest.raises(root_verifier.SignalFamilyRootVerifierError) as error:
+            _verifier(world).run()
 
-        assert result.outcome == "persisted"
-        assert result.state is verification.SignalFamilyReadinessState.READY
-        assert tuple(receipt.pair_id for receipt in result.receipts) == verification.PAIR_IDS
-        assert len(_rows(world, "receipts")) == 5
-        assert len(_rows(world, "decisions")) == 1
+        assert (
+            error.value.audit_record.reason_code
+            is verification.SignalFamilyReasonCode.PAIR_SURFACE_COVERAGE_MISSING
+        )
+        _assert_no_evidence(world)
 
     def test_the_real_harness_answers_exactly_the_policy_authorized_vectors(
         self,
@@ -1474,7 +1487,8 @@ class TestProductionHarness:
     ) -> None:
         world = build_world(tmp_path, harness="real")
 
-        _verifier(world).run()
+        with pytest.raises(root_verifier.SignalFamilyRootVerifierError):
+            _verifier(world).run()
 
         assert tuple(sorted(world.replay)) == tuple(
             sorted(vector.vector_id for vector in world.test_manifest.vectors)
@@ -1491,7 +1505,8 @@ class TestProductionHarness:
 
         world = build_world(tmp_path, harness="real")
 
-        _verifier(world).run()
+        with pytest.raises(root_verifier.SignalFamilyRootVerifierError):
+            _verifier(world).run()
 
         by_id = {vector.vector_id: vector for vector in world.test_manifest.vectors}
         for vector_id, payload in world.replay.items():
@@ -1499,6 +1514,36 @@ class TestProductionHarness:
             assert observed["surface_id"] == by_id[vector_id].surface_id.value
             assert observed["builder"].startswith("rquant.runtime_builder_")
             assert observed["state_unchanged"] is True
+
+    def test_the_two_unblocked_pairs_are_exercised_in_the_child(self, tmp_path: Path) -> None:
+        """WP4-c round 1: the child cwd move and the widened environment, proven end to end.
+
+        `router-notifier` needed `rquant.config` to be constructible and `notifier-serving`
+        needed an authority root with no world-writable ancestor. Both now run inside the
+        real child; the run still stops at the coverage gate, but it stops *after* those
+        results were produced and accepted byte for byte.
+        """
+
+        import json
+
+        world = build_world(tmp_path, harness="real")
+
+        with pytest.raises(root_verifier.SignalFamilyRootVerifierError):
+            _verifier(world).run()
+
+        by_id = {vector.vector_id: vector for vector in world.test_manifest.vectors}
+        pairs = {vector.pair_id for vector in by_id.values()}
+        assert {"router-notifier", "notifier-serving", "router-paper"} == pairs
+
+        builders = {
+            json.loads(payload)["builder"]
+            for vector_id, payload in world.replay.items()
+            if by_id[vector_id].pair_id in {"router-notifier", "notifier-serving"}
+        }
+        assert builders == {
+            "rquant.runtime_builder_signal.notifier_builder",
+            "rquant.runtime_builder_serving.serving_publisher_builder",
+        }
 
     def test_a_blocked_surface_vector_fails_closed_without_evidence(
         self,
@@ -1521,34 +1566,6 @@ class TestProductionHarness:
         )
         _assert_no_evidence(world)
 
-    def test_the_two_unblocked_pairs_are_exercised_in_the_child(self, tmp_path: Path) -> None:
-        """WP4-c round 1: the child cwd move and the widened environment, proven end to end.
-
-        `router-notifier` needed `rquant.config` to be constructible and `notifier-serving`
-        needed an authority root with no world-writable ancestor. Both now run inside the
-        real child, so their surfaces appear in a result set the root accepted.
-        """
-
-        import json
-
-        world = build_world(tmp_path, harness="real")
-
-        _verifier(world).run()
-
-        by_id = {vector.vector_id: vector for vector in world.test_manifest.vectors}
-        pairs = {vector.pair_id for vector in by_id.values()}
-        assert {"router-notifier", "notifier-serving", "router-paper"} == pairs
-
-        builders = {
-            json.loads(payload)["builder"]
-            for vector_id, payload in world.replay.items()
-            if by_id[vector_id].pair_id in {"router-notifier", "notifier-serving"}
-        }
-        assert builders == {
-            "rquant.runtime_builder_signal.notifier_builder",
-            "rquant.runtime_builder_serving.serving_publisher_builder",
-        }
-
     def test_the_remaining_blocked_set_is_exactly_the_two_producer_bound_pairs(self) -> None:
         """The activity gap this harness still has, stated as a contract rather than prose."""
 
@@ -1558,6 +1575,87 @@ class TestProductionHarness:
             for surface in verification.READER_SURFACES[pair_id]
         }
         assert len(harness.IMPLEMENTED_SURFACE_IDS) == 8
+
+    @pytest.mark.parametrize(
+        "covered",
+        [
+            ("router-paper",),
+            ("router-paper", "router-notifier"),
+            ("notifier-serving", "router-notifier", "router-paper", "strategy-router"),
+        ],
+    )
+    def test_partial_pair_coverage_yields_no_receipt_and_no_readiness(
+        self,
+        tmp_path: Path,
+        covered: tuple[str, ...],
+    ) -> None:
+        """Reviewer mutation M6, closed: fewer than five covered pairs cannot reach READY.
+
+        The stub harness is used so the case tests the *gate* rather than which surfaces the
+        real harness happens to implement — every vector it is handed is answered, so the
+        only thing missing is the pairs the restricted set never names.
+        """
+
+        world = build_world(tmp_path, vector_pair_ids=covered)
+
+        with pytest.raises(root_verifier.SignalFamilyRootVerifierError) as error:
+            _verifier(world).run()
+
+        assert (
+            error.value.audit_record.reason_code
+            is verification.SignalFamilyReasonCode.PAIR_SURFACE_COVERAGE_MISSING
+        )
+        _assert_no_evidence(world)
+
+    def test_one_missing_surface_inside_a_covered_pair_still_rejects(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Coverage is per surface, not per pair: four of five pairs whole is not enough."""
+
+        world = build_world(tmp_path)
+        dropped = verification.READER_SURFACES["router-paper"][0]
+        kept = tuple(
+            vector for vector in world.test_manifest.vectors if vector.surface_id is not dropped
+        )
+        assert len(kept) == len(world.test_manifest.vectors) - 1
+
+        shortfall = verification.missing_pair_surface_coverage(
+            tuple(
+                verification.SignalFamilyVectorResultV1.create(
+                    vector_id=vector.vector_id,
+                    pair_id=vector.pair_id,
+                    family_id=vector.family_id,
+                    surface_id=vector.surface_id,
+                    canonical_result_json="{}",
+                )
+                for vector in kept
+            )
+        )
+
+        assert shortfall == (("router-paper", (dropped,)),)
+
+    def test_full_five_pair_coverage_still_reaches_ready(self, tmp_path: Path) -> None:
+        """The gate admits what it should: the unrestricted stub world is unchanged."""
+
+        world = build_world(tmp_path)
+
+        result = _verifier(world).run()
+
+        assert result.state is verification.SignalFamilyReadinessState.READY
+        assert len(result.receipts) == 5
+        assert verification.missing_pair_surface_coverage(
+            tuple(
+                verification.SignalFamilyVectorResultV1.create(
+                    vector_id=vector.vector_id,
+                    pair_id=vector.pair_id,
+                    family_id=vector.family_id,
+                    surface_id=vector.surface_id,
+                    canonical_result_json="{}",
+                )
+                for vector in world.test_manifest.vectors
+            )
+        ) == ()
 
     def test_the_real_harness_pyz_is_the_policy_hashed_artifact(self, tmp_path: Path) -> None:
         world = build_world(tmp_path, harness="real")

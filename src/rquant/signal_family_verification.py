@@ -1321,6 +1321,51 @@ def observed_surface_ids(
     )
 
 
+def observed_pair_surface_ids(
+    results: Sequence[SignalFamilyVectorResultV1],
+) -> Mapping[str, tuple[SurfaceId, ...]]:
+    """Reduce the child's results to the reader surfaces each pair actually executed."""
+
+    resolved = _require_exact_items(
+        results,
+        SignalFamilyVectorResultV1,
+        field="vector_results",
+    )
+    observed: dict[str, set[SurfaceId]] = {}
+    for result in resolved:
+        observed.setdefault(result.pair_id, set()).add(result.surface_id)
+    return MappingProxyType(
+        {
+            pair_id: tuple(sorted(surfaces, key=lambda surface: surface.value))
+            for pair_id, surfaces in sorted(observed.items())
+        }
+    )
+
+
+def missing_pair_surface_coverage(
+    results: Sequence[SignalFamilyVectorResultV1],
+) -> tuple[tuple[str, tuple[SurfaceId, ...]], ...]:
+    """The reader surfaces the run owes, per pair, in frozen order.
+
+    `authority.md` L1208-1209 says reader surfaces are *the code exercised* for that pair's
+    one verifier-issued receipt. A pair whose readers never ran has nothing to issue a
+    receipt about, so this is the predicate the root gates on: for every one of the five
+    frozen pairs, the executed surface set must cover `READER_SURFACES[pair_id]` exactly.
+    An empty result means full coverage.
+    """
+
+    observed = observed_pair_surface_ids(results)
+    shortfall: list[tuple[str, tuple[SurfaceId, ...]]] = []
+    for pair_id in PAIR_IDS:
+        executed = set(observed.get(pair_id, ()))
+        missing = tuple(
+            surface for surface in READER_SURFACES[pair_id] if surface not in executed
+        )
+        if missing:
+            shortfall.append((pair_id, missing))
+    return tuple(shortfall)
+
+
 # --------------------------------------------------------------------------------------
 # Authority epoch and execution evidence
 # --------------------------------------------------------------------------------------
@@ -2111,6 +2156,7 @@ class SignalFamilyReasonCode(StrEnum):
     BINDING_UNMANIFESTED = "BINDING_UNMANIFESTED"
     BINDING_SURFACE_MISMATCH = "BINDING_SURFACE_MISMATCH"
     PAIR_SET_INCOMPLETE = "PAIR_SET_INCOMPLETE"
+    PAIR_SURFACE_COVERAGE_MISSING = "PAIR_SURFACE_COVERAGE_MISSING"
     PARTICIPANT_RESOLUTION_INVALID = "PARTICIPANT_RESOLUTION_INVALID"
     STORE_ANCHOR_INVALID = "STORE_ANCHOR_INVALID"
     CHILD_LAUNCH_FAILED = "CHILD_LAUNCH_FAILED"

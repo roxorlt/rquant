@@ -187,8 +187,70 @@ class TestChildContainment:
 
         assert workspace in cwd.parents
         assert workspace.is_dir()
-        assert stat.S_IMODE(workspace.stat().st_mode) == 0o700
+        assert stat.S_IMODE(workspace.stat().st_mode) == root_verifier.CHILD_WORKSPACE_MODE
         assert list(workspace.iterdir()) == []
+
+    def test_the_workspace_is_traversable_by_a_dropped_privilege_child(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The production shape, read off the privilege-plan seam rather than assumed.
+
+        Locally the verifier and the child share a uid, so `child_privilege_plan` returns
+        `None` and the drop never happens — the failure mode this guards is structurally
+        invisible in any same-uid test. The seam is therefore driven with the production
+        identities (root verifier, `lighthouse` child) and the mode is judged against them.
+        """
+
+        plan = root_verifier.child_privilege_plan(
+            current_uid=0,
+            current_gid=0,
+            target_uid=1000,
+            target_gid=1000,
+        )
+        assert plan is not None, "production drops privilege; the mode must survive that"
+
+        mode = root_verifier.CHILD_WORKSPACE_MODE
+        assert root_verifier.workspace_admits_child(mode, workspace_uid=0, child_uid=1000)
+        assert not root_verifier.workspace_admits_child(0o700, workspace_uid=0, child_uid=1000)
+        assert root_verifier.workspace_admits_child(0o700, workspace_uid=0, child_uid=0)
+
+    def test_the_workspace_mode_grants_traversal_without_enumeration(self) -> None:
+        """`0711` is exactly: others may pass through, and may not list or write."""
+
+        mode = root_verifier.CHILD_WORKSPACE_MODE
+
+        assert mode & stat.S_IXOTH
+        assert not mode & stat.S_IROTH
+        assert not mode & (stat.S_IWGRP | stat.S_IWOTH)
+        assert mode & stat.S_IRWXU == stat.S_IRWXU
+
+    def test_a_workspace_without_the_traversal_bit_denies_absolute_paths(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The mechanism itself, demonstrated with real syscalls under one uid.
+
+        A uid switch is not available here, but the kernel rule that bites in production is
+        not about identity — it is that resolving an absolute path needs the execute bit on
+        every component. Removing the owner's own execute bit reproduces exactly that, and
+        shows what the child would hit under `0700` once it is no longer root.
+        """
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir(mode=0o711)
+        child_cwd = workspace / "child"
+        child_cwd.mkdir(mode=0o700)
+        (child_cwd / "state.txt").write_text("hi", encoding="utf-8")
+
+        assert (child_cwd / "state.txt").read_text(encoding="utf-8") == "hi"
+
+        workspace.chmod(0o600)
+        try:
+            with pytest.raises(PermissionError):
+                (child_cwd / "state.txt").read_text(encoding="utf-8")
+        finally:
+            workspace.chmod(0o711)
 
     def test_the_child_holds_only_the_standard_streams_and_the_two_ipc_pipes(
         self,
