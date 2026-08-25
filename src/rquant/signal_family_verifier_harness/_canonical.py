@@ -6,6 +6,12 @@ check has to survive a generation whose `strict_json` has been replaced. These f
 functions therefore reproduce the same bytes independently, and
 `tests/unit/test_signal_family_verifier_harness.py` pins them against the generation module
 so the two can never drift.
+
+This is not the only canonical hash in the repository, and the difference is load bearing:
+`rquant.runtime_contracts.canonical_sha256` encodes with `ensure_ascii=True` because the v2
+serving authority froze those bytes, while this contract encodes with `ensure_ascii=False`.
+The two digests diverge on any non-ASCII payload, so a v2 identity must be produced by the
+v2 helper (imported under an explicit `v2_` alias) and never by these functions.
 """
 
 from __future__ import annotations

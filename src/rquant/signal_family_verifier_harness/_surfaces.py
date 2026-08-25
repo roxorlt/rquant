@@ -621,7 +621,7 @@ def _publish_declared_serving_authorities(
     """
 
     from rquant import runtime_serving_snapshot as snapshot_models
-    from rquant.runtime_contracts import canonical_sha256
+    from rquant.runtime_contracts import canonical_sha256 as v2_canonical_sha256
     from rquant.runtime_serving_authority import ServingSourceAuthorityPublisher
     from rquant.runtime_serving_snapshot import SourceReadResult
     from rquant.serving_contracts import FreshnessStatus
@@ -656,7 +656,7 @@ def _publish_declared_serving_authorities(
                 "reason": None,
                 "payload": payload,
             }
-            values["generation_id"] = canonical_sha256(values)
+            values["generation_id"] = v2_canonical_sha256(values)
             ServingSourceAuthorityPublisher(
                 root=root / dataset_id,
                 producer_commit=declared["producer_commit"],
