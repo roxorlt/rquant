@@ -685,6 +685,25 @@ def _slot(
     )
 
 
+def _without_surfaces(
+    vectors: tuple[verification.SignalFamilyVectorV1, ...],
+    dropped: Sequence[Any],
+) -> tuple[verification.SignalFamilyVectorV1, ...]:
+    """Remove named reader surfaces from a vector set, keeping the frozen order.
+
+    Pair-granularity filtering cannot express "this pair ran all but one of its readers",
+    which is the case the coverage gate has to be shown refusing.
+    """
+
+    if not dropped:
+        return vectors
+    excluded = set(dropped)
+    kept = tuple(vector for vector in vectors if vector.surface_id not in excluded)
+    if len(kept) != len(vectors) - len(excluded):
+        raise ValueError("a dropped surface is not present in the vector set")
+    return kept
+
+
 def build_world(
     tmp_path: Path,
     *,
@@ -692,6 +711,7 @@ def build_world(
     harness: str = "stub",
     blocked_surface_id: Any | None = None,
     vector_pair_ids: tuple[str, ...] | None = None,
+    drop_surface_ids: tuple[Any, ...] = (),
     policy_max_age_seconds: int | None = None,
     stale_overrides: Mapping[str, float] | None = None,
     run_id_override: str | None = None,
@@ -716,6 +736,8 @@ def build_world(
         raise ValueError("a blocked-surface vector only means something to the real harness")
     if vector_pair_ids is not None and not vector_pair_ids:
         raise ValueError("a restricted vector set must still name at least one pair")
+    if drop_surface_ids and len(set(drop_surface_ids)) != len(drop_surface_ids):
+        raise ValueError("the dropped surface set must be duplicate-free")
 
     from rquant import signal_family_root_verifier as verifier
 
@@ -757,6 +779,7 @@ def build_world(
             vectors = tuple(
                 vector for vector in vectors if vector.pair_id in vector_pair_ids
             )
+        vectors = _without_surfaces(vectors, drop_surface_ids)
         # The policy author derives the expected results by running the same exercise the
         # child will run. The child is never told any of this; the root compares after exit.
         policy_scratch = tmp_path / "policy-expected"
@@ -775,6 +798,7 @@ def build_world(
             vectors = tuple(
                 vector for vector in vectors if vector.pair_id in vector_pair_ids
             )
+        vectors = _without_surfaces(vectors, drop_surface_ids)
         replay = _replay(vectors)
     expected_results = tuple(
         verification.SignalFamilyExpectedResultV1(

@@ -1611,29 +1611,49 @@ class TestProductionHarness:
         self,
         tmp_path: Path,
     ) -> None:
-        """Coverage is per surface, not per pair: four of five pairs whole is not enough."""
+        """Coverage is per surface, not per pair: four pairs whole and one short still fails.
 
-        world = build_world(tmp_path)
+        Fix round 1 asserted this against `missing_pair_surface_coverage` alone and never ran
+        the verifier, so nothing proved the root consulted the predicate for a shortfall this
+        shape. It runs the whole eight-step sequence now.
+        """
+
         dropped = verification.READER_SURFACES["router-paper"][0]
-        kept = tuple(
-            vector for vector in world.test_manifest.vectors if vector.surface_id is not dropped
-        )
-        assert len(kept) == len(world.test_manifest.vectors) - 1
+        world = build_world(tmp_path, drop_surface_ids=(dropped,))
 
-        shortfall = verification.missing_pair_surface_coverage(
-            tuple(
-                verification.SignalFamilyVectorResultV1.create(
-                    vector_id=vector.vector_id,
-                    pair_id=vector.pair_id,
-                    family_id=vector.family_id,
-                    surface_id=vector.surface_id,
-                    canonical_result_json="{}",
-                )
-                for vector in kept
-            )
+        assert {vector.pair_id for vector in world.test_manifest.vectors} == set(
+            verification.PAIR_IDS
         )
+        assert dropped not in {vector.surface_id for vector in world.test_manifest.vectors}
 
-        assert shortfall == (("router-paper", (dropped,)),)
+        with pytest.raises(root_verifier.SignalFamilyRootVerifierError) as error:
+            _verifier(world).run()
+
+        assert (
+            error.value.audit_record.reason_code
+            is verification.SignalFamilyReasonCode.PAIR_SURFACE_COVERAGE_MISSING
+        )
+        _assert_no_evidence(world)
+
+    @pytest.mark.parametrize("pair_id", list(verification.PAIR_IDS))
+    def test_dropping_any_single_reader_surface_rejects(
+        self,
+        tmp_path: Path,
+        pair_id: str,
+    ) -> None:
+        """One missing surface anywhere in the five pairs is enough to withhold every receipt."""
+
+        dropped = verification.READER_SURFACES[pair_id][-1]
+        world = build_world(tmp_path, drop_surface_ids=(dropped,))
+
+        with pytest.raises(root_verifier.SignalFamilyRootVerifierError) as error:
+            _verifier(world).run()
+
+        assert (
+            error.value.audit_record.reason_code
+            is verification.SignalFamilyReasonCode.PAIR_SURFACE_COVERAGE_MISSING
+        )
+        _assert_no_evidence(world)
 
     def test_full_five_pair_coverage_still_reaches_ready(self, tmp_path: Path) -> None:
         """The gate admits what it should: the unrestricted stub world is unchanged."""
@@ -1657,23 +1677,28 @@ class TestProductionHarness:
             )
         ) == ()
 
-    def test_the_offline_world_does_not_prove_the_generation_source_closure(
+    def test_the_root_authenticates_every_binding_source_against_the_manifest(
         self,
         tmp_path: Path,
     ) -> None:
-        """WP4C-SPEC-06, recorded as a contract rather than left implicit.
+        """WP4C-SPEC-06: the property that must not regress, plus the boundary it leaves open.
 
-        The root checks each binding's `executable_source_sha256` against the full manifest,
-        and in this replica that hash belongs to a one-line placeholder written into the
-        generation. The child, meanwhile, resolves `rquant` through the generation
-        interpreter's path configuration, which points at the repository's own `src/`. So the
-        bytes the manifest authenticates and the bytes the child executes are different
-        files, and this world proves the protocol and the builder path — not "the full
-        manifest is the source closure".
+        The invariant asserted here is the one the root enforces and that must hold however
+        the world evolves: every binding's `executable_source_sha256` is the hash of the file
+        actually sitting at its manifested path inside the generation.
 
-        Closing it means writing the real source closure into the generation, which is
-        deliberately out of scope for this round; §9 carries it as an open item. This case
-        exists so the gap fails loudly the day someone believes it is already closed.
+        The boundary is separate and is *recorded*, not asserted as a failure trigger. This
+        replica writes one-line placeholders at those paths while
+        `make_generation_importable` points the child's interpreter at the repository's own
+        `src/`, so the bytes the manifest authenticates and the bytes the child executes are
+        different files. The real-harness end-to-end therefore proves the protocol and the
+        builder path — not "the full manifest is the source closure". Materializing the true
+        closure is out of scope for this round and is §9 question 6.
+
+        Fix round 1 asserted `divergent == len(bindings)`, which would have turned red on the
+        day the gap was closed. What is checked instead is that the world is internally
+        consistent — wholly placeholder or wholly real, never a half-migrated mixture — so
+        closing the gap passes and a partial migration fails.
         """
 
         import importlib
@@ -1681,7 +1706,7 @@ class TestProductionHarness:
 
         world = build_world(tmp_path, harness="real")
 
-        divergent = 0
+        divergent: list[str] = []
         for binding in world.bindings:
             manifested = world.generation_path / binding.executable_source_relative_path
             assert manifested.is_file()
@@ -1696,11 +1721,11 @@ class TestProductionHarness:
                 hashlib.sha256(imported.read_bytes()).hexdigest()
                 != binding.executable_source_sha256
             ):
-                divergent += 1
+                divergent.append(binding.executable_module)
 
-        assert divergent == len(world.bindings), (
-            "every binding is expected to diverge today; a match would mean the world "
-            "started materializing the real closure and this case must be replaced"
+        assert len(divergent) in {0, len(world.bindings)}, (
+            "the offline world must be wholly placeholder-sourced or wholly real-sourced; "
+            f"a mixture hides which bindings are authenticated: {sorted(divergent)}"
         )
 
     def test_the_real_harness_pyz_is_the_policy_hashed_artifact(self, tmp_path: Path) -> None:
