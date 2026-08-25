@@ -639,6 +639,7 @@ class TestChildWorkspaceAnchorBoundary:
                 link / "workspace",
                 expected_uid=os.getuid(),
                 child_uid=os.getuid(),
+                child_gid=os.getgid(),
             )
 
     def test_a_group_writable_ancestor_rejects(self, tmp_path: Path) -> None:
@@ -654,7 +655,46 @@ class TestChildWorkspaceAnchorBoundary:
                 loose / "workspace",
                 expected_uid=os.getuid(),
                 child_uid=os.getuid(),
+                child_gid=os.getgid(),
             )
+
+    def test_a_workspace_whose_group_is_the_child_group_rejects(self, tmp_path: Path) -> None:
+        """WP4C-Q-08: `0715` grants the group `--x`, and POSIX stops at the first match.
+
+        Owner, then group, then other — the first class the accessor belongs to decides, and
+        a later, more generous class never rescues it. So a child that shares the workspace's
+        group gets execute without read, `O_RDONLY | O_DIRECTORY` fails, and all eight reader
+        surfaces go silently unreachable again. The mode stays `0715`; the walk refuses the
+        identity pairing that would land in the group class.
+        """
+
+        workspace = tmp_path / "workspace"
+
+        with pytest.raises(
+            root_verifier.SignalFamilyRootVerifierError,
+            match="CHILD_LAUNCH_FAILED",
+        ) as raised:
+            root_verifier.open_child_workspace_root(
+                workspace,
+                expected_uid=os.getuid(),
+                child_uid=os.getuid() + 4242,
+                child_gid=os.getgid(),
+            )
+
+        assert "group" in str(raised.value)
+
+    def test_a_workspace_the_child_reaches_as_other_is_accepted(self, tmp_path: Path) -> None:
+        workspace = tmp_path / "workspace"
+
+        resolved = root_verifier.open_child_workspace_root(
+            workspace,
+            expected_uid=os.getuid(),
+            child_uid=os.getuid() + 4242,
+            child_gid=os.getgid() + 4242,
+        )
+
+        assert resolved == workspace
+        assert stat.S_IMODE(workspace.stat().st_mode) == root_verifier.CHILD_WORKSPACE_MODE
 
     def test_an_ancestor_owned_by_an_untrusted_account_rejects(self, tmp_path: Path) -> None:
         private = tmp_path / "private"
@@ -668,6 +708,7 @@ class TestChildWorkspaceAnchorBoundary:
                 private / "workspace",
                 expected_uid=os.getuid() + 4242,
                 child_uid=os.getuid(),
+                child_gid=os.getgid(),
             )
 
     @pytest.mark.parametrize("mode", [0o700, 0o711, 0o755, 0o701, 0o710])
@@ -691,6 +732,7 @@ class TestChildWorkspaceAnchorBoundary:
                 workspace,
                 expected_uid=os.getuid(),
                 child_uid=os.getuid(),
+                child_gid=os.getgid(),
             )
 
     def test_a_non_directory_component_rejects(self, tmp_path: Path) -> None:
@@ -707,6 +749,7 @@ class TestChildWorkspaceAnchorBoundary:
                 blocker / "workspace",
                 expected_uid=os.getuid(),
                 child_uid=os.getuid(),
+                child_gid=os.getgid(),
             )
 
     def test_a_missing_parent_rejects_instead_of_being_created(self, tmp_path: Path) -> None:
@@ -718,6 +761,7 @@ class TestChildWorkspaceAnchorBoundary:
                 tmp_path / "absent" / "workspace",
                 expected_uid=os.getuid(),
                 child_uid=os.getuid(),
+                child_gid=os.getgid(),
             )
 
     def test_a_fresh_workspace_is_created_at_the_frozen_mode(self, tmp_path: Path) -> None:
@@ -730,6 +774,7 @@ class TestChildWorkspaceAnchorBoundary:
                 workspace,
                 expected_uid=os.getuid(),
                 child_uid=os.getuid(),
+                child_gid=os.getgid(),
             )
         finally:
             os.umask(previous)
@@ -749,6 +794,7 @@ class TestChildWorkspaceAnchorBoundary:
                 workspace,
                 expected_uid=os.getuid(),
                 child_uid=os.getuid(),
+                child_gid=os.getgid(),
             )
 
         assert stat.S_IMODE(workspace.stat().st_mode) == 0o777

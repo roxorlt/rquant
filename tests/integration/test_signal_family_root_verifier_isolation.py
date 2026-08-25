@@ -17,6 +17,7 @@ import os
 import sqlite3
 import stat
 import sys
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -45,7 +46,7 @@ VERIFIED_AT = datetime(2026, 8, 24, 7, 30, 15, 250000, tzinfo=UTC)
 
 def _verifier(world: VerifierWorld, **overrides: Any) -> root_verifier.RootVerifier:
     return root_verifier.RootVerifier(
-        anchors=world.anchors,
+        anchors=overrides.pop("anchors", world.anchors),
         authority_gateway=world.gateway,
         clock=lambda: VERIFIED_AT,
         **overrides,
@@ -180,6 +181,35 @@ class TestChildContainment:
             if mode & (stat.S_IWGRP | stat.S_IWOTH)
         ]
         assert writable == []
+
+    def test_a_group_writable_workspace_ancestor_stops_the_run_before_the_child(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The rejection itself, not the property of a fixture that happened to be private.
+
+        `test_the_child_cwd_has_no_group_or_world_writable_ancestor` reads the ancestry the
+        child reported, so it can only observe a run that already succeeded. Removing the
+        ancestry rule from `open_child_workspace_root` leaves that assertion green. This
+        drives the real verifier at a workspace under a `0775` parent and requires the run to
+        stop with `CHILD_LAUNCH_FAILED` before any child process exists.
+        """
+
+        world = build_world(tmp_path)
+        loose = tmp_path / "loose"
+        loose.mkdir(mode=0o755)
+        loose.chmod(0o775)  # `mkdir` would have masked this with the umask
+        anchors = replace(world.anchors, child_workspace_root=loose / "workspace")
+
+        with pytest.raises(
+            root_verifier.SignalFamilyRootVerifierError,
+            match="CHILD_LAUNCH_FAILED",
+        ) as raised:
+            _verifier(world, anchors=anchors).run()
+
+        assert "group or world writable" in str(raised.value)
+        assert world.report_path.exists() is False
+        assert list((loose / "workspace").iterdir()) == []
 
     def test_the_child_cwd_lives_in_the_verifier_owned_workspace(
         self,

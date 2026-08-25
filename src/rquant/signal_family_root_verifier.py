@@ -467,7 +467,13 @@ def child_environment(*, cwd: Path, request_fd: int, result_fd: int) -> dict[str
     return environment
 
 
-def open_child_workspace_root(root: Path, *, expected_uid: int, child_uid: int) -> Path:
+def open_child_workspace_root(
+    root: Path,
+    *,
+    expected_uid: int,
+    child_uid: int,
+    child_gid: int,
+) -> Path:
     """Create and validate the private parent the child's cwd is carved out of.
 
     The walk is anchored and no-follow from `/`, and it applies the same trust rule
@@ -477,8 +483,10 @@ def open_child_workspace_root(root: Path, *, expected_uid: int, child_uid: int) 
     made three reader surfaces unreachable before WP4-c round 1.
 
     The leaf is `CHILD_WORKSPACE_MODE`, whose value carries the whole production argument;
-    see its definition. `child_uid` is taken so the caller's intent is on the record even
-    though the exact-mode check is what enforces it.
+    see its definition. `child_uid` and `child_gid` decide which permission class the child
+    lands in, and POSIX stops at the first class that matches: a child that shares the
+    leaf's group is judged by the group bits and never reaches the more generous `other`
+    ones, so that pairing is refused rather than silently losing the read bit.
     """
 
     directory_flags = (
@@ -544,6 +552,11 @@ def open_child_workspace_root(root: Path, *, expected_uid: int, child_uid: int) 
             raise _reject(
                 SignalFamilyReasonCode.CHILD_LAUNCH_FAILED,
                 "the child workspace root is not a private directory this verifier owns",
+            )
+        if child_uid != leaf.st_uid and child_gid == leaf.st_gid:
+            raise _reject(
+                SignalFamilyReasonCode.CHILD_LAUNCH_FAILED,
+                "the child shares the child workspace group, so the group bits would apply",
             )
         return root
     finally:
@@ -1539,6 +1552,7 @@ class RootVerifier:
             self._anchors.child_workspace_root,
             expected_uid=self._anchors.expected_owner_uid,
             child_uid=self._anchors.child_uid,
+            child_gid=self._anchors.child_gid,
         )
         request_read, request_write = os.pipe()
         result_read, result_write = os.pipe()
