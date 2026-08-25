@@ -967,8 +967,18 @@ then writes the verified bytes atomically to the server cache
 `/home/lighthouse/rquant/var/r07-dr-evidence/<candidate_commit_sha>.json`. The deploy process opens
 that cache read-only and rejects a symlink, non-regular file, commit filename mismatch, canonical
 JSON/digest mismatch, or channel metadata mismatch. A cache entry for any deployed or
-rollback-eligible commit is retained after GitHub's 90-day artifact expiry. This is a fixed input
-inside the trusted CI and server-permission boundary; it is intentionally unsigned.
+rollback-eligible commit is retained after GitHub's 90-day artifact expiry. Amended per Codex
+round-2 order 2026-08-25, item P1-2: the cache is not a trusted input, because the deployment
+user owns that directory and can write a plausible entry itself. A cache hit re-resolves the one
+push `main` run identity and highest successful attempt from the fixed channel and binds the
+retained bytes to that pair exactly as a fresh download is bound; run metadata outlives the
+90-day artifact expiry, and an unreachable channel, an unknown run, a superseded attempt, or an
+ambiguous run blocks rather than falls back. The entry and every ancestor from the trusted root
+— `/` under `linux-production`, which never exempts a sticky directory — are walked without
+following symlinks and must be a directory or regular file owned by the expected deployment
+identity, with no group or other write bit, exactly one link, and at most 64 KiB. The entry
+itself stays unsigned: this replaces an assumed server-permission boundary with an enforced one
+and does not restore the removed signer, Ed25519, or attestation findings.
 
 Merge review and branch protection are the approval boundary. The artifact is evidence for that
 trusted boundary, not a signature, URI chain, or separate authorization service.

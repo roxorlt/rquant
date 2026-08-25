@@ -34,7 +34,12 @@ Codex 最终验收。**尚未 merge、尚未打 tag、尚未部署**，云服务
    `scripts/signal-family-root-verifier.py` 会把自己所在 checkout 的 `src` 插进 `sys.path`；
    若从 `/home/lighthouse/rquant/` 以 root 运行，root 就会执行 lighthouse 可写的代码。
    policy / harness / store 的安装是**单独授权的事务**，不能借受控发布器绕过。
-8. **规格 errata 未决**：family taxonomy 单元素域、bundle/overlay identity 语义、
+8. **R07 证据缓存命中也需要网络与 token**：缓存命中不再跳过 GitHub run 身份核验，部署器仍会
+   用 `RQUANT_GITHUB_EVIDENCE_TOKEN` 查一次 workflow runs 并要求与缓存条目自称的
+   `workflow_run_id` / `run_attempt` 完全一致，因此**离线部署不可行**；GitHub 不可达时结果是
+   blocked，不降级放行。缓存目录及其全部祖先必须由部署身份（lighthouse）拥有、无 group/other
+   写位、无 symlink，否则同样 blocked。
+9. **规格 errata 未决**：family taxonomy 单元素域、bundle/overlay identity 语义、
    producer/consumer id 域、profile-service-manifests 文档绑定、`strategy-router` /
    `strategy-shadow` 五个 surface 的向量语义、WP5 Q1–Q4、wire schema 在 3.11/3.12 的可见性、
    退休门的交易日数字，全部等 Codex 裁决；在此之前真实 harness 不产生五对 `READY`，
