@@ -2467,14 +2467,29 @@ def test_shell_entrypoint_forwards_complete_runtime_profile_environment(
 def test_shell_entrypoint_rejects_partial_runtime_profile_environment(
     tmp_path: Path,
 ) -> None:
+    """The together-or-not-at-all rule, on the branch that can actually reach it.
+
+    Linux production refuses a missing runtime profile earlier and with its own message,
+    so the platform is pinned to Darwin the same way the Linux cases pin theirs. Without
+    that, the test only passes on a macOS host and fails on every Linux runner.
+    """
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_uname = fake_bin / "uname"
+    fake_uname.write_text("#!/bin/sh\nprintf 'Darwin\\n'\n", encoding="utf-8")
+    fake_uname.chmod(0o700)
     fake_python = tmp_path / "python"
     fake_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     fake_python.chmod(0o700)
     environment = {
         **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "RQUANT_DEPLOY_PYTHON": str(fake_python),
         "RQUANT_RUNTIME_PRODUCTION_INPUTS": str(tmp_path / "runtime-inputs.json"),
     }
+    for name in ("RQUANT_RUNTIME_PROFILE_OUTPUT_DIR", "RQUANT_RUNTIME_ROOT"):
+        environment.pop(name, None)
 
     result = subprocess.run(
         [str(ROOT / "scripts" / "deploy-production.sh"), "--target", "v0.99.0"],
