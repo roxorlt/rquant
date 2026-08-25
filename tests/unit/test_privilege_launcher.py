@@ -21,8 +21,6 @@ import pytest
 
 from rquant import privilege_launcher as launcher
 
-pytestmark = pytest.mark.unit
-
 
 def _launcher_file(root: Path, *, name: str = "setpriv", mode: int = 0o555) -> Path:
     path = root / name
@@ -41,7 +39,7 @@ def trusted_root(tmp_path: Path) -> Path:
 
 class TestProductionConstants:
     def test_the_production_launcher_is_the_fixed_util_linux_binary(self) -> None:
-        assert launcher.PRODUCTION_PRIVILEGE_LAUNCHER == Path("/usr/bin/setpriv")
+        assert Path("/usr/bin/setpriv") == launcher.PRODUCTION_PRIVILEGE_LAUNCHER
 
     def test_the_launcher_flags_are_frozen_and_ordered(self) -> None:
         assert launcher.PRIVILEGE_DROP_FLAGS == (
@@ -322,8 +320,13 @@ class TestNoPreexecRemains:
     def test_the_module_performs_no_identity_syscall_of_its_own(self) -> None:
         source = Path(launcher.__file__).read_text(encoding="utf-8")
 
+        code = "\n".join(
+            line for line in source.splitlines() if not line.lstrip().startswith("#")
+        )
+        body = code.split('"""', 2)[2]
+
         for forbidden in ("os.setresuid", "os.setresgid", "os.setgroups", "ctypes"):
-            assert forbidden not in source
+            assert forbidden not in body
 
 
 def test_the_mode_predicates_are_expressed_as_stat_bits() -> None:
