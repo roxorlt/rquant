@@ -172,6 +172,15 @@ def test_expected_gate_check_total_derives_from_the_frozen_policy() -> None:
     )
 
 
+GATE_DIGEST_FIELDS = {
+    "candidate_gate_digest": "a" * 64,
+    "static_result_digest": "b" * 64,
+    "boundary_result_digest": "0" * 64,
+    "check_inventory_digest": "c" * 64,
+}
+MERGE_PARENT_SHA = "e" * 40
+
+
 def _run(job_id: str, minor: str, *, collected: int) -> PythonRunEvidenceV1:
     return PythonRunEvidenceV1.model_construct(
         python_minor=minor,
@@ -185,6 +194,7 @@ def _run(job_id: str, minor: str, *, collected: int) -> PythonRunEvidenceV1:
         passed=collected,
         skipped=0,
         deselected=0,
+        **GATE_DIGEST_FIELDS,
         result_digest="0" * 64,
         outcome="passed",
     )
@@ -205,6 +215,10 @@ def _wire(**overrides: object) -> R07DrGateEvidenceWireV1:
         "candidate_tree_sha": "b" * 40,
         "baseline_commit_sha": BASELINE_COMMIT_SHA,
         "baseline_tree_sha": BASELINE_TREE_SHA,
+        "merge_base_commit_sha": BASELINE_COMMIT_SHA,
+        "merge_base_tree_sha": BASELINE_TREE_SHA,
+        "candidate_parent_commits": (BASELINE_COMMIT_SHA, MERGE_PARENT_SHA),
+        "merge_tree_sha": "b" * 40,
         "policy_digest": "0" * 64,
         "complete_diff_digest": "0" * 64,
         "candidate_binding_digest": "0" * 64,
@@ -367,6 +381,10 @@ def _valid_wire_bytes(
                 "passed": total,
                 "skipped": 0,
                 "deselected": 0,
+                "candidate_gate_digest": "a" * 64,
+                "static_result_digest": "b" * 64,
+                "boundary_result_digest": "3" * 64,
+                "check_inventory_digest": "c" * 64,
                 "result_digest": "0" * 64,
                 "outcome": "passed",
             }
@@ -392,6 +410,10 @@ def _valid_wire_bytes(
         "candidate_tree_sha": tree_sha,
         "baseline_commit_sha": BASELINE_COMMIT_SHA,
         "baseline_tree_sha": BASELINE_TREE_SHA,
+        "merge_base_commit_sha": BASELINE_COMMIT_SHA,
+        "merge_base_tree_sha": BASELINE_TREE_SHA,
+        "candidate_parent_commits": (BASELINE_COMMIT_SHA, MERGE_PARENT_SHA),
+        "merge_tree_sha": tree_sha,
         "policy_digest": policy.policy_digest,
         "complete_diff_digest": "1" * 64,
         "candidate_binding_digest": differential_gate._candidate_binding_digest_values(
@@ -1463,6 +1485,56 @@ def _gate(
         require_declared_cache_path=require_declared_cache_path,
     )
     return gate, transport, resolved_verifier
+
+
+class _OldGitRunner(_RealGitRunner):
+    """A deployment host whose Git predates ``merge-tree --write-tree``."""
+
+    def run(
+        self,
+        args: list[str],
+        *,
+        check: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
+        if args[1:] == ["--version"]:
+            return subprocess.CompletedProcess(args, 0, stdout="git version 2.34.1\n", stderr="")
+        return super().run(args, check=check)
+
+
+def test_enforced_target_is_refused_when_git_cannot_replay_merge_provenance(
+    tmp_path: Path,
+) -> None:
+    repo, _pre_r07, release_a, release_b = _release_repo(tmp_path)
+    gate, transport, verifier = _gate(tmp_path, responses=_gate_responses(repo, release_b))
+
+    decision = gate.evaluate(
+        repo=repo,
+        runner=_OldGitRunner(repo),
+        git_path=Path("/usr/bin/git"),
+        installed_commit_sha=release_a,
+        target_commit_sha=release_b,
+    )
+
+    assert not decision.allowed
+    assert decision.gate == "rejected"
+    assert "merge provenance" in decision.reason
+    assert transport.requests == []
+    assert verifier.calls == []
+
+
+def test_git_version_preflight_accepts_only_a_merge_tree_capable_git(tmp_path: Path) -> None:
+    repo, _pre_r07, _release_a, _release_b = _release_repo(tmp_path)
+
+    assert r07_deploy_evidence.require_merge_tree_capable_git(
+        runner=_RealGitRunner(repo),
+        git_path=Path("/usr/bin/git"),
+    )[:2] >= (2, 38)
+
+    with pytest.raises(r07_deploy_evidence.R07EvidenceError, match="merge provenance"):
+        r07_deploy_evidence.require_merge_tree_capable_git(
+            runner=_OldGitRunner(repo),
+            git_path=Path("/usr/bin/git"),
+        )
 
 
 def test_pinned_gate_rejects_a_cache_directory_the_policy_never_declared(

@@ -35,8 +35,16 @@ from pydantic import (
 
 from rquant.strict_json import canonical_json_bytes, strict_canonical_json_loads
 
-BASELINE_COMMIT_SHA = "45d0b57c4c5cbab1700fa5e3c386c6756892a7d6"
-BASELINE_TREE_SHA = "4f67e67192855874e82baa13dc343a1d6939bd67"
+# Amended per Codex round-2 order 2026-08-25, item P1-1: the frozen baseline is the exact
+# merge base of origin/main and the candidate, so baseline..candidate is the complete pull
+# request merge face rather than a branch-local subset.
+BASELINE_COMMIT_SHA = "9699827be09ca22479f6741e820722399fe40244"
+BASELINE_TREE_SHA = "56bf300f296815acca414a1c7f5c2769ee5d466a"
+# The pre-amendment baseline. It is not an origin/main ancestor, so it can no longer anchor
+# the diff, but the Git hard constraint requires it to stay reachable from every candidate.
+HISTORICAL_BASELINE_COMMIT_SHA = "45d0b57c4c5cbab1700fa5e3c386c6756892a7d6"
+# ``git merge-tree --write-tree`` is the offline merge-provenance replay; it landed in 2.38.
+MINIMUM_MERGE_TREE_GIT_VERSION = (2, 38)
 POLICY_RELATIVE_PATH = "tests/fixtures/r07_differential_gate/policy-v1.json"
 R07_EVIDENCE_CACHE_DIR = "/home/lighthouse/rquant/var/r07-dr-evidence"
 BOUNDARY_PROBE_COUNT = 17
@@ -44,6 +52,7 @@ FIXED_STATIC_CHECK_NAMES = (
     "policy-completeness",
     "top-level-source-closure",
     "forbidden-definitions",
+    "diff-scope-forbidden-definitions",
 )
 EVIDENCE_CHANNEL_JOBS = (
     "r07-differential-gate-py311",
@@ -229,6 +238,12 @@ class PythonRunEvidenceV1(_StrictModelMixin, BaseModel):
     passed: StrictInt = Field(gt=0)
     skipped: StrictInt = Field(ge=0)
     deselected: StrictInt = Field(ge=0)
+    # Amended per Codex round-2 order 2026-08-25, ruling 6: each interpreter publishes the
+    # exact gate outputs it observed, so a 3.11/3.12 divergence is visible on the wire.
+    candidate_gate_digest: StrictStr = Field(pattern=_SHA256)
+    static_result_digest: StrictStr = Field(pattern=_SHA256)
+    boundary_result_digest: StrictStr = Field(pattern=_SHA256)
+    check_inventory_digest: StrictStr = Field(pattern=_SHA256)
     result_digest: StrictStr = Field(pattern=_SHA256)
     outcome: Literal["passed"]
 
@@ -245,6 +260,40 @@ def python_run_result_digest(value: PythonRunEvidenceV1) -> str:
     return hashlib.sha256(
         canonical_json_bytes(value.model_dump(mode="json", exclude={"result_digest"}))
     ).hexdigest()
+
+
+PYTHON_RUN_GATE_DIGEST_FIELDS = (
+    "candidate_gate_digest",
+    "static_result_digest",
+    "boundary_result_digest",
+    "check_inventory_digest",
+)
+
+
+def parse_git_version(text: str) -> tuple[int, int, int]:
+    """Parse ``git --version`` output into an exact comparable triple."""
+
+    if type(text) is not str:
+        raise TypeError("Git version output must be text")
+    fields = text.strip().split()
+    if len(fields) < 3 or fields[0] != "git" or fields[1] != "version":
+        raise ValueError("Git version output is not recognizable")
+    numbers = fields[2].split(".")[:3]
+    if not numbers or any(not part.isdigit() for part in numbers):
+        raise ValueError("Git version output is not recognizable")
+    triple = tuple(int(part) for part in numbers)
+    return (*triple, 0, 0)[:3]  # type: ignore[return-value]
+
+
+def require_merge_tree_git_version(text: str) -> tuple[int, int, int]:
+    """Fail closed unless this Git can write the merge tree the verifier replays."""
+
+    version = parse_git_version(text)
+    if version[:2] < MINIMUM_MERGE_TREE_GIT_VERSION:
+        raise ValueError(
+            "R07 merge provenance requires Git 2.38 or newer for merge-tree --write-tree"
+        )
+    return version
 
 
 def _candidate_binding_digest_values(
@@ -281,6 +330,13 @@ class R07DrGateEvidenceWireV1(_StrictModelMixin, BaseModel):
     candidate_tree_sha: StrictStr = Field(pattern=_SHA1)
     baseline_commit_sha: Literal[BASELINE_COMMIT_SHA]
     baseline_tree_sha: Literal[BASELINE_TREE_SHA]
+    # Amended per Codex round-2 order 2026-08-25, item P1-1 and ruling 9: the wire binds the
+    # final merge tree to its exact two parents, so the structure a merge commit must have is
+    # replayable offline from Git alone.
+    merge_base_commit_sha: StrictStr = Field(pattern=_SHA1)
+    merge_base_tree_sha: StrictStr = Field(pattern=_SHA1)
+    candidate_parent_commits: tuple[StrictStr, StrictStr]
+    merge_tree_sha: StrictStr = Field(pattern=_SHA1)
     policy_digest: StrictStr = Field(pattern=_SHA256)
     complete_diff_digest: StrictStr = Field(pattern=_SHA256)
     candidate_binding_digest: StrictStr = Field(pattern=_SHA256)
@@ -309,6 +365,28 @@ class R07DrGateEvidenceWireV1(_StrictModelMixin, BaseModel):
                 self.candidate_tree_sha,
             ):
                 raise ValueError("Python run is not bound to the candidate pair")
+        first, second = self.python_runs
+        for field in PYTHON_RUN_GATE_DIGEST_FIELDS:
+            if getattr(first, field) != getattr(second, field):
+                raise ValueError(
+                    "R07 gate outputs diverge between Python 3.11 and 3.12: " + field
+                )
+        if self.boundary_result_digest != first.boundary_result_digest:
+            raise ValueError("boundary result digest is not the digest both Python runs observed")
+        if self.merge_base_commit_sha != self.baseline_commit_sha:
+            raise ValueError("merge base commit is not the frozen baseline commit")
+        if self.merge_base_tree_sha != self.baseline_tree_sha:
+            raise ValueError("merge base tree is not the frozen baseline tree")
+        if any(
+            not _is_lower_hex(parent, length=40) for parent in self.candidate_parent_commits
+        ):
+            raise ValueError("candidate parents must be lowercase 40-hex commits")
+        if self.candidate_parent_commits[0] != self.merge_base_commit_sha:
+            raise ValueError("first candidate parent is not the recorded merge base")
+        if self.candidate_parent_commits[0] == self.candidate_parent_commits[1]:
+            raise ValueError("candidate parents must be two distinct commits")
+        if self.merge_tree_sha != self.candidate_tree_sha:
+            raise ValueError("merge tree is not the candidate tree")
         if self.artifact_name != f"r07-dr-gate-{self.candidate_commit_sha}":
             raise ValueError("artifact name is not bound to candidate commit")
         expected_binding = _candidate_binding_digest_values(
@@ -401,12 +479,18 @@ class VerifiedR07DrGateEvidenceV1:
         workflow_run_id: int,
         run_attempt: int,
     ) -> Self:
+        merge_provenance = resolve_merge_provenance(
+            repo,
+            candidate_commit=candidate_gate.candidate_commit_sha,
+            merge_base_commit=candidate_gate.baseline_commit_sha,
+        )
         wire = _wire_from_gate_results(
             policy=policy,
             candidate_gate=candidate_gate,
             boundary_results=boundary_results,
             static_result=static_result,
             python_runs=python_runs,
+            merge_provenance=merge_provenance,
             workflow_run_id=workflow_run_id,
             run_attempt=run_attempt,
         )
@@ -1176,6 +1260,110 @@ def collect_complete_git_diff(
     return result
 
 
+@dataclass(frozen=True)
+class MergeProvenanceResult:
+    """The exact two-parent structure the final merge tree must have."""
+
+    merge_base_commit_sha: str
+    merge_base_tree_sha: str
+    candidate_parent_commits: tuple[str, str]
+    merge_tree_sha: str
+
+
+def _repo_git_version(repo: Path) -> tuple[int, int, int]:
+    return require_merge_tree_git_version(_git_output(repo, "--version").decode())
+
+
+def _is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
+    return (
+        subprocess.run(
+            ["git", "-C", str(repo), "merge-base", "--is-ancestor", ancestor, descendant],
+            check=False,
+            capture_output=True,
+        ).returncode
+        == 0
+    )
+
+
+def resolve_merge_provenance(
+    repo: Path,
+    *,
+    candidate_commit: str,
+    merge_base_commit: str,
+) -> MergeProvenanceResult:
+    """Resolve the candidate's merge structure from Git objects alone.
+
+    Amended per Codex round-2 order 2026-08-25, item P1-1 and ruling 9. A deployable
+    candidate must be the merge commit GitHub writes for a reviewed pull request: exactly two
+    parents, the first being the pre-merge ``main`` tip that is also the frozen merge base,
+    and a tree that is exactly what merging those two parents produces. A squash or a direct
+    push has one parent and can never satisfy this, which is the technically enforced
+    equivalent of the branch protection this repository does not have.
+    """
+
+    _repo_git_version(repo)
+    resolved = _resolved_commit(repo, candidate_commit)
+    base = _resolved_commit(repo, merge_base_commit)
+    listed = _git_output(repo, "rev-list", "--parents", "-n", "1", resolved).decode().split()
+    if not listed or listed[0] != resolved:
+        raise ValueError("candidate commit does not resolve to itself in the Git object store")
+    parents = tuple(listed[1:])
+    if len(parents) != 2:
+        raise ValueError(
+            "R07 candidate must be a two-parent merge commit; "
+            f"observed {len(parents)} parent(s)"
+        )
+    if parents[0] == parents[1]:
+        raise ValueError("R07 candidate parents must be two distinct commits")
+    first, second = (_resolved_commit(repo, parent) for parent in parents)
+    if first != base:
+        raise ValueError("R07 candidate first parent is not the recorded merge base")
+    if not _is_ancestor(repo, first, second):
+        raise ValueError("R07 candidate merge base is not an ancestor of the pull request head")
+    written = subprocess.run(
+        ["git", "-C", str(repo), "merge-tree", "--write-tree", first, second],
+        check=False,
+        capture_output=True,
+    )
+    merge_tree = written.stdout.decode().strip().splitlines()[0] if written.stdout else ""
+    if written.returncode != 0 or not _is_lower_hex(merge_tree, length=40):
+        raise ValueError("R07 candidate parents do not merge to one exact tree")
+    return MergeProvenanceResult(
+        merge_base_commit_sha=first,
+        merge_base_tree_sha=_resolved_tree(repo, first),
+        candidate_parent_commits=(first, second),
+        merge_tree_sha=merge_tree,
+    )
+
+
+def verify_merge_provenance(
+    repo: Path,
+    *,
+    candidate_commit: str,
+    candidate_tree: str,
+    merge_base_commit: str,
+    merge_base_tree: str,
+    declared_parents: tuple[str, str],
+    declared_merge_tree: str,
+) -> MergeProvenanceResult:
+    """Compare a declared merge structure field-for-field with the one Git produces."""
+
+    resolved = resolve_merge_provenance(
+        repo,
+        candidate_commit=candidate_commit,
+        merge_base_commit=merge_base_commit,
+    )
+    if tuple(declared_parents) != resolved.candidate_parent_commits:
+        raise ValueError("declared candidate parent commits are not the Git parents")
+    if declared_merge_tree != resolved.merge_tree_sha:
+        raise ValueError("declared merge tree is not the tree those parents merge to")
+    if merge_base_tree != resolved.merge_base_tree_sha:
+        raise ValueError("declared merge base tree is not the merge base commit tree")
+    if candidate_tree != resolved.merge_tree_sha:
+        raise ValueError("candidate tree is not the final merge tree")
+    return resolved
+
+
 def verify_candidate_gate(
     repo: Path,
     *,
@@ -1193,13 +1381,14 @@ def verify_candidate_gate(
         raise ValueError("candidate tree does not match candidate commit")
     if baseline_tree != policy.baseline_tree_sha:
         raise ValueError("policy baseline tree does not match its commit")
-    ancestry = subprocess.run(
-        ["git", "-C", str(repo), "merge-base", "--is-ancestor", baseline, candidate],
-        check=False,
-        capture_output=True,
-    )
-    if ancestry.returncode != 0:
-        raise ValueError("candidate commit does not descend from the policy baseline")
+    # Amended per Codex round-2 order 2026-08-25, item P1-1: the baseline is the merge base,
+    # so requiring it to be a candidate ancestor is the same as requiring
+    # merge_base(origin/main, candidate) to remain exactly this commit.
+    if not _is_ancestor(repo, baseline, candidate):
+        raise ValueError("candidate commit does not descend from the policy baseline merge base")
+    # Codex Git hard constraint 3: the pre-amendment baseline must stay reachable.
+    if not _is_ancestor(repo, HISTORICAL_BASELINE_COMMIT_SHA, candidate):
+        raise ValueError("historical baseline is no longer an ancestor of the candidate")
     complete = collect_complete_git_diff(
         repo,
         baseline_commit=baseline,
@@ -1247,6 +1436,84 @@ class R07StaticGateResult:
     checks: tuple[tuple[str, StaticCheckResult], ...]
 
 
+def candidate_gate_digest(result: CandidateGateResult) -> str:
+    """Digest the complete candidate diff gate outcome, not only its diff digest."""
+
+    if type(result) is not CandidateGateResult:
+        raise TypeError("exact CandidateGateResult is required")
+    payload = {
+        "passed": result.passed,
+        "baseline_commit_sha": result.baseline_commit_sha,
+        "baseline_tree_sha": result.baseline_tree_sha,
+        "candidate_commit_sha": result.candidate_commit_sha,
+        "candidate_tree_sha": result.candidate_tree_sha,
+        "complete_diff_digest": result.diff_digest,
+        "candidate_binding_digest": result.candidate_binding_digest,
+        "diff_entries": [
+            {
+                "status": entry.status,
+                "path": entry.path,
+                "old_mode": entry.old_mode,
+                "new_mode": entry.new_mode,
+                "old_object": entry.old_object,
+                "new_object": entry.new_object,
+            }
+            for entry in result.diff_entries
+        ],
+        "blocked_entries": [entry.path for entry in result.blocked_entries],
+        "missing_entries": [entry.path for entry in result.missing_entries],
+    }
+    return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
+
+
+def static_gate_result_digest(result: R07StaticGateResult) -> str:
+    """Digest every named static check outcome, so a version split cannot hide in a count."""
+
+    if type(result) is not R07StaticGateResult:
+        raise TypeError("exact R07StaticGateResult is required")
+    payload = {
+        "passed": result.passed,
+        "candidate_commit_sha": result.candidate_commit_sha,
+        "candidate_tree_sha": result.candidate_tree_sha,
+        "root_snapshot_digest": result.root_snapshot_digest,
+        "forbidden_definition_digest": result.forbidden_definition_digest,
+        "checks": [
+            {"name": name, "passed": check.passed, "reasons": list(check.reasons)}
+            for name, check in result.checks
+        ],
+    }
+    return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
+
+
+def gate_check_inventory(
+    policy: R07PolicyV1,
+    static_result: R07StaticGateResult,
+    boundary_results: tuple[BoundaryProbeResultV1, ...],
+) -> tuple[str, ...]:
+    """The exact ordered check inventory one gate run must complete for a frozen policy."""
+
+    if type(policy) is not R07PolicyV1 or type(static_result) is not R07StaticGateResult:
+        raise TypeError("exact policy and static gate result are required")
+    inventory = (
+        f"policy-load:{POLICY_RELATIVE_PATH}",
+        "candidate-diff-gate",
+        *(f"static:{name}" for name, _result in static_result.checks),
+        *(f"boundary-probe:{result.inventory_id}" for result in boundary_results),
+        "boundary-probe-results-digest",
+    )
+    if len(set(inventory)) != len(inventory):
+        raise ValueError("R07 gate check inventory is not unique")
+    if len(inventory) != expected_gate_check_total(policy):
+        raise ValueError("R07 gate check inventory does not match the frozen policy")
+    return inventory
+
+
+def check_inventory_digest(inventory: tuple[str, ...]) -> str:
+    if type(inventory) is not tuple or any(type(name) is not str for name in inventory):
+        raise TypeError("check inventory must be an exact tuple of names")
+    return hashlib.sha256(canonical_json_bytes(list(inventory))).hexdigest()
+
+
 def _wire_from_gate_results(
     *,
     policy: R07PolicyV1,
@@ -1254,6 +1521,7 @@ def _wire_from_gate_results(
     boundary_results: tuple[BoundaryProbeResultV1, ...],
     static_result: R07StaticGateResult,
     python_runs: tuple[PythonRunEvidenceV1, PythonRunEvidenceV1],
+    merge_provenance: MergeProvenanceResult,
     workflow_run_id: int,
     run_attempt: int,
 ) -> R07DrGateEvidenceWireV1:
@@ -1294,6 +1562,10 @@ def _wire_from_gate_results(
         "candidate_tree_sha": candidate_gate.candidate_tree_sha,
         "baseline_commit_sha": candidate_gate.baseline_commit_sha,
         "baseline_tree_sha": candidate_gate.baseline_tree_sha,
+        "merge_base_commit_sha": merge_provenance.merge_base_commit_sha,
+        "merge_base_tree_sha": merge_provenance.merge_base_tree_sha,
+        "candidate_parent_commits": merge_provenance.candidate_parent_commits,
+        "merge_tree_sha": merge_provenance.merge_tree_sha,
         "policy_digest": policy.policy_digest,
         "complete_diff_digest": candidate_gate.diff_digest,
         "candidate_binding_digest": candidate_gate.candidate_binding_digest,
@@ -1375,14 +1647,29 @@ def _wire_with_recomputed_digests(
     candidate_gate: CandidateGateResult,
     static_result: R07StaticGateResult,
     boundary_result_digest: str,
+    check_inventory: tuple[str, ...],
+    merge_provenance: MergeProvenanceResult,
 ) -> R07DrGateEvidenceWireV1:
+    recomputed_run_digests = {
+        "candidate_gate_digest": candidate_gate_digest(candidate_gate),
+        "static_result_digest": static_gate_result_digest(static_result),
+        "boundary_result_digest": boundary_result_digest,
+        "check_inventory_digest": check_inventory_digest(check_inventory),
+    }
+    python_runs = tuple(
+        run.model_copy(update=recomputed_run_digests) for run in wire.python_runs
+    )
     python_runs = tuple(
         run.model_copy(update={"result_digest": python_run_result_digest(run)})
-        for run in wire.python_runs
+        for run in python_runs
     )
     values = wire.model_dump(mode="python")
     values.update(
         {
+            "merge_base_commit_sha": merge_provenance.merge_base_commit_sha,
+            "merge_base_tree_sha": merge_provenance.merge_base_tree_sha,
+            "candidate_parent_commits": merge_provenance.candidate_parent_commits,
+            "merge_tree_sha": merge_provenance.merge_tree_sha,
             "policy_digest": policy.policy_digest,
             "complete_diff_digest": candidate_gate.diff_digest,
             "candidate_binding_digest": candidate_gate.candidate_binding_digest,
@@ -1432,6 +1719,15 @@ def _verify_wire(
         )
         if not static_result.passed:
             raise ValueError("static gate did not pass")
+        merge_provenance = verify_merge_provenance(
+            repo,
+            candidate_commit=wire.candidate_commit_sha,
+            candidate_tree=wire.candidate_tree_sha,
+            merge_base_commit=wire.merge_base_commit_sha,
+            merge_base_tree=wire.merge_base_tree_sha,
+            declared_parents=wire.candidate_parent_commits,
+            declared_merge_tree=wire.merge_tree_sha,
+        )
     except (ImportError, OSError, subprocess.CalledProcessError) as exc:
         raise ValueError("wire Git binding does not resolve to exact Git objects") from exc
 
@@ -1491,6 +1787,8 @@ def _verify_wire(
         candidate_gate=candidate_gate,
         static_result=static_result,
         boundary_result_digest=boundary_digest,
+        check_inventory=gate_check_inventory(validated_policy, static_result, boundary_results),
+        merge_provenance=merge_provenance,
     )
     if expected != wire:
         raise ValueError("R07 wire does not match recomputed gate evidence")
@@ -1830,14 +2128,13 @@ def top_level_declaration_snapshot(node: ast.AST, *, ordinal: int) -> TopLevelDe
     )
 
 
-def source_file_snapshot(
-    repo: Path,
-    candidate_commit: str,
+def source_file_snapshot_from_source(
     module_path: str,
+    source_bytes: bytes,
 ) -> SourceFileSnapshotV1:
-    source_bytes = _source_bytes_for(repo, candidate_commit, module_path)
-    source = source_bytes.decode("utf-8")
-    tree = ast.parse(source, filename=module_path)
+    """Snapshot one module's top-level declaration closure from exact source bytes."""
+
+    tree = ast.parse(source_bytes.decode("utf-8"), filename=module_path)
     return SourceFileSnapshotV1(
         module_path=module_path,
         source_sha256=hashlib.sha256(source_bytes).hexdigest(),
@@ -1845,6 +2142,17 @@ def source_file_snapshot(
             top_level_declaration_snapshot(node, ordinal=ordinal)
             for ordinal, node in enumerate(tree.body)
         ),
+    )
+
+
+def source_file_snapshot(
+    repo: Path,
+    candidate_commit: str,
+    module_path: str,
+) -> SourceFileSnapshotV1:
+    return source_file_snapshot_from_source(
+        module_path,
+        _source_bytes_for(repo, candidate_commit, module_path),
     )
 
 
@@ -1954,6 +2262,111 @@ def verify_forbidden_definitions(
     return StaticCheckResult(not reasons, tuple(reasons))
 
 
+def diff_scope_source_paths(policy: R07PolicyV1) -> tuple[str, ...]:
+    """Every candidate source file the reviewed diff touches, in canonical order."""
+
+    if type(policy) is not R07PolicyV1:
+        raise TypeError("exact R07PolicyV1 is required")
+    return tuple(
+        sorted(
+            {
+                entry.path
+                for entry in policy.allowed_diff
+                if entry.status != "D"
+                and entry.path.startswith("src/rquant/")
+                and entry.path.endswith(".py")
+            }
+        )
+    )
+
+
+def _definition_scope(tree: ast.Module) -> tuple[set[str], set[str], set[str]]:
+    definitions: set[str] = set()
+    exports: set[str] = set()
+    registry_keys: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            definitions.add(node.name)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            definitions.update(
+                alias.asname or alias.name.rsplit(".", 1)[-1] for alias in node.names
+            )
+        elif isinstance(node, ast.Assign):
+            names = tuple(name for target in node.targets for name in _target_names(target))
+            definitions.update(names)
+            if "__all__" in names and isinstance(node.value, (ast.Tuple, ast.List)):
+                exports.update(
+                    item.value
+                    for item in node.value.elts
+                    if isinstance(item, ast.Constant) and type(item.value) is str
+                )
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+            definitions.update(_target_names(node.target))
+        if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.ctx, ast.Store)
+            and "registry" in _subscript_root_name(node).lower()
+            and isinstance(node.slice, ast.Constant)
+            and type(node.slice.value) is str
+        ):
+            registry_keys.add(node.slice.value)
+        if isinstance(node, ast.Call):
+            called = node.func
+            name = called.attr if isinstance(called, ast.Attribute) else getattr(called, "id", "")
+            if "register" in name.lower():
+                registry_keys.update(
+                    argument.value
+                    for argument in node.args
+                    if isinstance(argument, ast.Constant) and type(argument.value) is str
+                )
+                registry_keys.update(
+                    keyword.value.value
+                    for keyword in node.keywords
+                    if isinstance(keyword.value, ast.Constant)
+                    and type(keyword.value.value) is str
+                )
+    return definitions, exports, registry_keys
+
+
+def verify_diff_scope_forbidden_definitions(
+    repo: Path,
+    candidate_commit: str,
+    policy: R07PolicyV1,
+) -> StaticCheckResult:
+    """Scan every diffed candidate source file for a forbidden definition, export, or key.
+
+    Amended per Codex round-2 order 2026-08-25, item P1-1. The ten frozen root snapshots and
+    the nine-file forbidden universe keep their exact per-file closure; this check adds the
+    breadth the merge face needs, asserting that none of the sources the pull request touches
+    *defines* a writer/activation symbol, exports one, or registers one under a literal key.
+    Mentioning a forbidden name is not a definition, which is why the policy module that
+    declares the universe is not a hit.
+    """
+
+    if type(policy) is not R07PolicyV1:
+        raise TypeError("exact R07PolicyV1 is required")
+    universe = policy.forbidden_definition_universe
+    reasons: list[str] = []
+    for module_path in diff_scope_source_paths(policy):
+        try:
+            tree = ast.parse(
+                _source_for(repo, candidate_commit, module_path),
+                filename=module_path,
+            )
+        except (OSError, SyntaxError, UnicodeDecodeError) as exc:
+            reasons.append(f"{module_path}: {type(exc).__name__}")
+            continue
+        definitions, exports, registry_keys = _definition_scope(tree)
+        found = sorted(
+            (set(universe.symbols) & definitions)
+            | (set(universe.exports) & exports)
+            | (set(universe.registry_keys) & registry_keys)
+        )
+        if found:
+            reasons.append(f"{module_path}: {','.join(found)}")
+    return StaticCheckResult(not reasons, tuple(reasons))
+
+
 def boundary_probe_results_digest(
     policy: R07PolicyV1,
     results: tuple[BoundaryProbeResultV1, ...],
@@ -2055,6 +2468,10 @@ def verify_r07_static_gate(
                     resolved_commit,
                     policy.forbidden_definition_universe,
                 ),
+            ),
+            (
+                "diff-scope-forbidden-definitions",
+                verify_diff_scope_forbidden_definitions(repo, resolved_commit, policy),
             ),
         )
     )

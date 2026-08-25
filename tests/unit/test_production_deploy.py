@@ -3041,6 +3041,7 @@ def _r07_responses(
 
     resolved_target = _r07_policy_bytes() if target_policy == b"" else target_policy
     responses: dict[tuple[str, ...], tuple[int, str]] = {
+        ("git", "--version"): (0, "git version 2.43.0\n"),
         ("git", "rev-parse", "--verify", f"{installed_sha}^{{tree}}"): (
             0,
             f"{R07_INSTALLED_TREE}\n",

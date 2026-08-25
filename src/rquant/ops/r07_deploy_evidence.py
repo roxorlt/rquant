@@ -41,6 +41,7 @@ from rquant.signal_family_differential_gate import (
     BootstrapPredecessorV1,
     R07DrGateEvidenceWireV1,
     R07PolicyV1,
+    require_merge_tree_git_version,
     verify_channel_binding,
     verify_policy_completeness,
     verify_wire,
@@ -313,6 +314,25 @@ def _git_stdout(
     if completed.returncode != 0:
         raise R07EvidenceError(f"{label} could not be resolved from the Git object store")
     return completed.stdout
+
+
+def require_merge_tree_capable_git(
+    *,
+    runner: CommandRunner,
+    git_path: Path,
+) -> tuple[int, int, int]:
+    """Fail closed unless the deployment Git can replay the candidate's merge provenance.
+
+    Amended per Codex round-2 order 2026-08-25, item P1-1. The private verifier recomputes
+    ``git merge-tree --write-tree`` over the candidate's two parents, which needs Git 2.38 or
+    newer. An older Git cannot check the binding at all, so it is a refusal, never a warning.
+    """
+
+    version = _git_stdout(runner, git_path, ["--version"], label="Git version")
+    try:
+        return require_merge_tree_git_version(version)
+    except (TypeError, ValueError) as exc:
+        raise R07EvidenceError(f"the deployment Git cannot replay merge provenance: {exc}") from exc
 
 
 def resolve_tree_sha(
@@ -817,6 +837,16 @@ class R07DeployEvidenceGate:
         )
         if not decision.requires_evidence:
             return decision
+        try:
+            require_merge_tree_capable_git(runner=runner, git_path=git_path)
+        except R07EvidenceError as exc:
+            return _decision(
+                cast("InstalledPolicyState", installed_state),
+                cast("TargetPolicyState", target_state),
+                allowed=False,
+                gate="rejected",
+                reason=f"enforced evidence was refused: {exc}",
+            )
         if target_policy is None:  # pragma: no cover - enforced targets always parse a policy
             raise R07EvidenceError("an enforced target must resolve its policy Git object")
         try:

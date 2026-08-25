@@ -298,6 +298,10 @@ def test_verify_wire_rejects_forged_wire_without_caller_tests_import(
             passed=7,
             skipped=0,
             deselected=0,
+            candidate_gate_digest="a" * 64,
+            static_result_digest="b" * 64,
+            boundary_result_digest="4" * 64,
+            check_inventory_digest="c" * 64,
             result_digest="0" * 64,
             outcome="passed",
         )
@@ -316,6 +320,10 @@ def test_verify_wire_rejects_forged_wire_without_caller_tests_import(
         "candidate_tree_sha": tree,
         "baseline_commit_sha": BASELINE_COMMIT_SHA,
         "baseline_tree_sha": BASELINE_TREE_SHA,
+        "merge_base_commit_sha": BASELINE_COMMIT_SHA,
+        "merge_base_tree_sha": BASELINE_TREE_SHA,
+        "candidate_parent_commits": (BASELINE_COMMIT_SHA, commit),
+        "merge_tree_sha": tree,
         "policy_digest": "1" * 64,
         "complete_diff_digest": "2" * 64,
         "candidate_binding_digest": differential_gate._candidate_binding_digest_values(

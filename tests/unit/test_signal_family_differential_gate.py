@@ -814,6 +814,7 @@ def test_diff_scope_forbidden_definition_scan_covers_every_diffed_source_file(
     assert verify_diff_scope_forbidden_definitions(ROOT, _head(), policy).passed
 
     repo = tmp_path / "scope-repo"
+    subprocess.run(["git", "init", "--quiet", str(repo)], check=True)
     module_path = "src/rquant/runtime_builder_signal.py"
     source_path = repo / module_path
     source_path.parent.mkdir(parents=True)

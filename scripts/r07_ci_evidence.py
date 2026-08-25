@@ -18,17 +18,24 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, model_v
 import rquant.signal_family_differential_gate as differential_gate
 from rquant.signal_family_differential_gate import (
     BOUNDARY_PROBE_COUNT,
+    PYTHON_RUN_GATE_DIGEST_FIELDS,
     BoundaryProbeResultV1,
     CandidateGateResult,
+    MergeProvenanceResult,
     PythonRunEvidenceV1,
     R07PolicyV1,
     R07StaticGateResult,
     VerifiedR07DrGateEvidenceV1,
     boundary_probe_results_digest,
+    candidate_gate_digest,
     canonical_evidence_json_bytes,
+    check_inventory_digest,
     expected_gate_check_total,
+    gate_check_inventory,
     load_policy,
     python_run_result_digest,
+    resolve_merge_provenance,
+    static_gate_result_digest,
     verify_candidate_gate,
     verify_r07_static_gate,
 )
@@ -45,12 +52,45 @@ _MAX_SUMMARY_BYTES = 16 * 1024
 
 
 @dataclass(frozen=True)
+class PythonRunGateDigests:
+    """The exact gate outputs one interpreter observed (Codex round-2 ruling 6)."""
+
+    candidate_gate_digest: str
+    static_result_digest: str
+    boundary_result_digest: str
+    check_inventory_digest: str
+
+    def as_fields(self) -> dict[str, str]:
+        values = {
+            "candidate_gate_digest": self.candidate_gate_digest,
+            "static_result_digest": self.static_result_digest,
+            "boundary_result_digest": self.boundary_result_digest,
+            "check_inventory_digest": self.check_inventory_digest,
+        }
+        if tuple(values) != PYTHON_RUN_GATE_DIGEST_FIELDS:
+            raise ValueError("R07 per-run gate digest fields drifted from the frozen wire")
+        return values
+
+
+@dataclass(frozen=True)
 class _GateExecution:
     policy: R07PolicyV1
     candidate_gate: CandidateGateResult
     boundary_results: tuple[BoundaryProbeResultV1, ...]
     static_result: R07StaticGateResult
     executed_checks: tuple[str, ...]
+
+    @property
+    def gate_digests(self) -> PythonRunGateDigests:
+        return PythonRunGateDigests(
+            candidate_gate_digest=candidate_gate_digest(self.candidate_gate),
+            static_result_digest=static_gate_result_digest(self.static_result),
+            boundary_result_digest=boundary_probe_results_digest(
+                self.policy,
+                self.boundary_results,
+            ),
+            check_inventory_digest=check_inventory_digest(self.executed_checks),
+        )
 
     @property
     def collected(self) -> int:
@@ -120,6 +160,28 @@ def _require_push_main_context(
         raise ValueError("R07 evidence job ID does not match the fixed producer")
 
 
+def require_push_main_merge_provenance(
+    repo: Path,
+    *,
+    candidate_commit: str,
+) -> MergeProvenanceResult:
+    """A push to main only produces evidence when it is a reviewed two-parent merge.
+
+    Amended per Codex round-2 order 2026-08-25, ruling 9. This repository has no branch
+    protection, so the trusted ``push main`` event alone proves nothing. Requiring the pushed
+    commit to be the merge commit GitHub writes for a pull request — first parent the previous
+    main tip and frozen merge base, tree exactly what merging the two parents produces — is the
+    equivalent enforcement, and unlike a GitHub API answer it is replayable offline by every
+    later consumer. A squash or a direct push has one parent and produces no evidence at all.
+    """
+
+    return resolve_merge_provenance(
+        repo,
+        candidate_commit=candidate_commit,
+        merge_base_commit=differential_gate.BASELINE_COMMIT_SHA,
+    )
+
+
 def canonical_python_run_summary_bytes(summary: PythonRunEvidenceV1) -> bytes:
     if type(summary) is not PythonRunEvidenceV1:
         raise TypeError("exact PythonRunEvidenceV1 is required")
@@ -178,11 +240,14 @@ def emit_python_run_summary(
     passed: int,
     skipped: int,
     deselected: int,
+    gate_digests: PythonRunGateDigests,
 ) -> PythonRunEvidenceV1:
     try:
         expected_job = _PYTHON_JOBS[python_minor]
     except KeyError as exc:
         raise ValueError("R07 Python minor must be exactly 3.11 or 3.12") from exc
+    if type(gate_digests) is not PythonRunGateDigests:
+        raise TypeError("exact PythonRunGateDigests is required")
     _require_push_main_context(
         context,
         expected_job_id=expected_job,
@@ -200,6 +265,7 @@ def emit_python_run_summary(
         "passed": passed,
         "skipped": skipped,
         "deselected": deselected,
+        **gate_digests.as_fields(),
         "result_digest": "0" * 64,
         "outcome": "passed",
     }
@@ -316,9 +382,9 @@ def _execute_exact_gate(
         executed.extend(f"boundary-probe:{result.inventory_id}" for result in boundary_results)
         boundary_probe_results_digest(policy, boundary_results)
         executed.append("boundary-probe-results-digest")
-    executed_checks = tuple(executed)
-    if len(set(executed_checks)) != len(executed_checks):
-        raise ValueError("R07 gate check inventory is not unique")
+    executed_checks = gate_check_inventory(policy, static_result, boundary_results)
+    if executed_checks != tuple(executed):
+        raise ValueError("R07 gate check inventory does not match the executed order")
     if len(executed_checks) != expected_gate_check_total(policy):
         raise ValueError("R07 gate check inventory does not match the frozen policy")
     return _GateExecution(
@@ -346,6 +412,11 @@ def validate_python_run_pair(
         raise ValueError("R07 aggregate requires exactly two Python summaries")
     expected = tuple(_PYTHON_JOBS.items())
     validated: list[PythonRunEvidenceV1] = []
+    for field in PYTHON_RUN_GATE_DIGEST_FIELDS:
+        if getattr(runs[0], field, None) != getattr(runs[1], field, None):
+            raise ValueError(
+                "R07 gate outputs diverge between Python 3.11 and 3.12: " + field
+            )
     for run, (minor, job_id) in zip(runs, expected, strict=True):
         if type(run) is not PythonRunEvidenceV1:
             raise ValueError("R07 aggregate requires exact PythonRunEvidenceV1 values")
@@ -388,6 +459,7 @@ def aggregate_evidence_from_summaries(
         expected_job_id=_AGGREGATE_JOB,
         observed_commit_sha=commit,
     )
+    require_push_main_merge_provenance(repository, candidate_commit=commit)
     runs = validate_python_run_pair(
         context,
         (
@@ -402,6 +474,12 @@ def aggregate_evidence_from_summaries(
         candidate_commit=commit,
         candidate_tree=tree,
     )
+    aggregate_digests = execution.gate_digests.as_fields()
+    for field, value in aggregate_digests.items():
+        if getattr(runs[0], field) != value:
+            raise ValueError(
+                "R07 aggregate re-execution does not reproduce the Python run digest: " + field
+            )
     evidence = VerifiedR07DrGateEvidenceV1.from_gate_results(
         repo=repository,
         policy=execution.policy,
@@ -485,6 +563,7 @@ def main(arguments: list[str] | None = None) -> int:
             expected_job_id=_PYTHON_JOBS.get(args.python_minor, ""),
             observed_commit_sha=commit,
         )
+        require_push_main_merge_provenance(repository, candidate_commit=commit)
         execution = _execute_exact_gate(
             repository,
             candidate_commit=commit,
@@ -500,6 +579,7 @@ def main(arguments: list[str] | None = None) -> int:
             passed=execution.passed,
             skipped=execution.skipped,
             deselected=execution.deselected,
+            gate_digests=execution.gate_digests,
         )
         return 0
     aggregate_evidence_from_summaries(
