@@ -869,21 +869,25 @@ class TestNoCallerAppendAuthority:
 
 
 class TestProductionEntryPoint:
+    """The entry point moved into the installed artifact; the checkout copy refuses.
+
+    Codex round-2 P1-4. `scripts/signal-family-root-verifier.py` used to insert the
+    checkout's `src` at `sys.path[0]`; the production entry is now
+    `rquant.signal_family_verifier_entry._cli`, which the build packages into the fixed
+    root-owned pyz and which is reached only after the installed tree has been verified.
+    """
+
     @staticmethod
     def _entry_module() -> Any:
-        import importlib.util
+        from rquant.signal_family_verifier_entry import _cli
 
-        path = Path(root_verifier.__file__).resolve().parents[2]
-        script = path / "scripts" / "signal-family-root-verifier.py"
-        spec = importlib.util.spec_from_file_location("signal_family_root_verifier_cli", script)
-        assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = module
-        try:
-            spec.loader.exec_module(module)
-        finally:
-            del sys.modules[spec.name]
-        return module
+        return _cli
+
+    @staticmethod
+    def _checkout_script() -> Path:
+        return Path(root_verifier.__file__).resolve().parents[2] / "scripts" / (
+            "signal-family-root-verifier.py"
+        )
 
     def test_the_entry_point_hardcodes_the_four_production_anchors(self) -> None:
         module = self._entry_module()
@@ -895,6 +899,7 @@ class TestProductionEntryPoint:
         assert anchors.store_root == Path("/var/lib/rquant/signal-family-verification")
         assert anchors.expected_owner_uid == 0
         assert anchors.expected_owner_gid == 0
+        assert anchors.privilege_launcher_path == Path("/usr/bin/setpriv")
 
     def test_the_entry_point_reads_no_environment_override(self) -> None:
         module = self._entry_module()
@@ -905,6 +910,25 @@ class TestProductionEntryPoint:
         assert "--policy" not in source
         assert "--harness" not in source
         assert "--store" not in source
+
+    def test_the_checkout_entry_script_refuses_to_run_the_verifier(self) -> None:
+        import subprocess
+
+        completed = subprocess.run(
+            [sys.executable, str(self._checkout_script()), "verify"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert completed.returncode != 0
+        assert "mutable checkout" in completed.stderr
+
+    def test_the_checkout_entry_script_imports_nothing_from_the_checkout(self) -> None:
+        source = self._checkout_script().read_text(encoding="utf-8")
+
+        assert "sys.path.insert" not in source
+        assert "from rquant." not in source
 
     def test_the_entry_point_offers_exactly_verify_revoke_and_rollback(self) -> None:
         module = self._entry_module()

@@ -547,8 +547,10 @@ class TestBuiltEntryEndToEnd:
                 str(BUILD_SCRIPT),
                 "--repository-root",
                 str(ROOT),
+                # The tree ships this interpreter's own dependencies: a `pydantic_core`
+                # built for another ABI would not import in the subprocess below.
                 "--source-venv",
-                str(ROOT / ".venv"),
+                str(Path(sys.prefix)),
                 "--output-root",
                 str(tmp_path / "staging"),
             ],
