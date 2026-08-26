@@ -337,8 +337,10 @@ Amended per Codex round-2 order 2026-08-25, ruling 5。`signal_envelope` 是 app
 1. **单调**：ingest 路径只在新序号更大时抬高水位（SQL 里带
    `CAST(metadata_value AS INTEGER) < ?` 守卫），任何路径都不得降低它。
 2. **不自动纠正**：发现水位与实际行不一致时，代码**不回写**修正值——一次静默纠正会把一次可
-   审计的事故变成一次无痕的数据改写。唯一的例外是水位键**整个缺失**时的一次性 bootstrap
-   seeding（老库迁移路径），它不修改任何已存在的值。
+   审计的事故变成一次无痕的数据改写。水位键**整个缺失**同样不许被重新推导：只有
+   `signal_envelope` 一行都没有的全新库才允许种初值 `0`；表里已有行却缺水位键，直接
+   fail closed。否则「删掉一行 metadata」会比「篡改它」更容易过关——按被截断后的
+   `MAX(global_sequence)` 重种会把水位**向下**移动，且无异常无审计。
 3. **fail closed**：`SignalBusStore` 在**打开时**和 `source_descriptor()` **读出时**都校验这条
    等式，不一致就抛 `SignalBusWatermarkError`，既不打开也不交出水位。
 
@@ -353,6 +355,10 @@ uv run rquant signal-bus-recover --database <signal_bus.sqlite3 绝对路径> \
 行审计（acknowledge 原文、修复前水位、观察到的最大序号、修复后水位、时间）。水位**高于**实际
 行时它拒绝执行：append-only 的表不会缩短，那意味着真实数据丢失，要走备份恢复而不是改元数据。
 没有任何环境变量或开关可以绕过 `--acknowledge`。
+
+**水位键缺失也走同一个入口**：这是唯一能重建该行的途径，重建值同样是实际最大序号，审计行的
+「修复前水位」记为 NULL（本来就没有前值）。恢复不可能凭空找回丢失的数字，所以真正被记下来的是
+「某个人接受了这个数字」——那正是静默重种从来不产生的东西。
 
 ### 9.2 通知服务
 

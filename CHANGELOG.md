@@ -64,10 +64,13 @@
 - **`rquant signal-bus-recover`（Codex 第二轮裁决 5）**：`signal_high_watermark` 现在有三条成立
   的不变量——单调、不自动纠正、与 `signal_envelope` 实际最大序号不一致时 fail closed。
   `SignalBusStore` 在打开时与 `source_descriptor()` 读出时各校验一次，抛
-  `SignalBusWatermarkError`。唯一修复路径是新 CLI
+  `SignalBusWatermarkError`。水位键**整个缺失**同样 fail closed——只有 `signal_envelope` 为空的
+  全新库才允许种初值，表里已有行却缺键时不得按（可能已被截断的）`MAX(global_sequence)` 重种，
+  否则删掉一行 metadata 会比篡改它更容易过关，且把水位向下移动而无异常无审计。唯一修复路径是新 CLI
   `rquant signal-bus-recover --database <path> --acknowledge <reason>`：理由原样写入 append-only
-  的 `signal_bus_watermark_recovery` 审计表，只把水位**抬高**到实际最大序号，水位高于实际行时
-  拒绝（那是数据丢失，要走备份恢复），无任何环境变量旁路。
+  的 `signal_bus_watermark_recovery` 审计表，只把水位**抬高**到实际最大序号（缺键时按实际最大
+  序号重建该行，审计行的「修复前水位」记 NULL），水位高于实际行时拒绝（那是数据丢失，要走备份
+  恢复），无任何环境变量旁路。
 
 ### Changed
 

@@ -355,7 +355,7 @@ _WATERMARK_RECOVERY_TABLE = """
 CREATE TABLE IF NOT EXISTS signal_bus_watermark_recovery (
     recovery_id INTEGER PRIMARY KEY AUTOINCREMENT,
     acknowledgement TEXT NOT NULL,
-    previous_watermark INTEGER NOT NULL CHECK(previous_watermark >= 0),
+    previous_watermark INTEGER CHECK(previous_watermark IS NULL OR previous_watermark >= 0),
     observed_max_sequence INTEGER NOT NULL CHECK(observed_max_sequence >= 0),
     recovered_watermark INTEGER NOT NULL CHECK(recovered_watermark >= 0),
     recovered_at TEXT NOT NULL
@@ -364,10 +364,14 @@ CREATE TABLE IF NOT EXISTS signal_bus_watermark_recovery (
 
 
 class SignalBusWatermarkRecovery(RuntimeContractModel):
-    """One explicit, acknowledged, upward-only repair of the persisted high watermark."""
+    """One explicit, acknowledged, upward-only repair of the persisted high watermark.
+
+    `previous_watermark` is `None` for the one case that has no previous value: the
+    watermark row itself was lost, so the repair rebuilds the row instead of raising it.
+    """
 
     acknowledgement: str = Field(min_length=1)
-    previous_watermark: int = Field(ge=0)
+    previous_watermark: int | None = Field(ge=0)
     observed_max_sequence: int = Field(ge=0)
     recovered_watermark: int = Field(ge=0)
     recovered_at: AwareUtcDatetime
@@ -376,7 +380,9 @@ class SignalBusWatermarkRecovery(RuntimeContractModel):
     def validate_repair(self) -> Self:
         if self.recovered_watermark != self.observed_max_sequence:
             raise ValueError("recovery must set the watermark to the observed max sequence")
-        if self.recovered_watermark <= self.previous_watermark:
+        if self.previous_watermark is not None and (
+            self.recovered_watermark <= self.previous_watermark
+        ):
             raise ValueError("recovery never lowers or repeats the high watermark")
         return self
 
@@ -600,15 +606,6 @@ class SignalBusStore:
                     metadata_value TEXT NOT NULL
                 );
 
-                CREATE TABLE IF NOT EXISTS signal_bus_watermark_recovery (
-                    recovery_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    acknowledgement TEXT NOT NULL,
-                    previous_watermark INTEGER NOT NULL CHECK(previous_watermark >= 0),
-                    observed_max_sequence INTEGER NOT NULL CHECK(observed_max_sequence >= 0),
-                    recovered_watermark INTEGER NOT NULL CHECK(recovered_watermark >= 0),
-                    recovered_at TEXT NOT NULL
-                );
-
                 CREATE TABLE IF NOT EXISTS signal_route_source (
                     source_id TEXT PRIMARY KEY,
                     generation_id TEXT NOT NULL,
@@ -639,6 +636,7 @@ class SignalBusStore:
                 ON signal_route_receipt(source_id, source_sequence);
                 """
             )
+            connection.execute(_WATERMARK_RECOVERY_TABLE)
             connection.execute(
                 """
                 INSERT OR IGNORE INTO signal_bus_metadata(metadata_key, metadata_value)
@@ -653,16 +651,24 @@ class SignalBusStore:
                 """,
                 (secrets.token_hex(32),),
             )
-            observed_max = connection.execute(
-                "SELECT COALESCE(MAX(global_sequence), 0) AS value FROM signal_envelope"
-            ).fetchone()
-            connection.execute(
-                """
-                INSERT OR IGNORE INTO signal_bus_metadata(metadata_key, metadata_value)
-                VALUES ('signal_high_watermark', ?)
-                """,
-                (str(int(observed_max["value"])),),
-            )
+            persisted, observed_max = _read_high_watermark_state(connection)
+            if persisted is None:
+                # Only a genuinely empty store may seed its own watermark. Deriving one
+                # from `MAX(global_sequence)` on a store that already holds rows is a
+                # silent self-correction, and if those rows were truncated it moves the
+                # watermark *down* with no exception and no audit row. Rebuilding a lost
+                # watermark is `recover_signal_bus_high_watermark`, nothing else.
+                if observed_max:
+                    raise SignalBusWatermarkError(
+                        "signal bus high watermark row is missing from a store that already "
+                        f"holds signal rows through {observed_max}"
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO signal_bus_metadata(metadata_key, metadata_value)
+                    VALUES ('signal_high_watermark', '0')
+                    """
+                )
             observed = connection.execute(
                 """
                 SELECT metadata_value
@@ -672,9 +678,9 @@ class SignalBusStore:
             ).fetchone()
             if observed is None or observed["metadata_value"] != self.retry_policy_fingerprint:
                 raise ValueError("retry policy does not match the persisted signal bus policy")
-            # The `INSERT OR IGNORE` above only seeds a store that has no watermark row at
-            # all; an existing row is never rewritten. Opening a store whose watermark
-            # already disagrees with its rows fails closed here.
+            # The seeding above only ever runs on an empty store, and an existing row is
+            # never rewritten. Opening a store whose watermark already disagrees with its
+            # rows fails closed here.
             _require_consistent_high_watermark(connection)
         finally:
             connection.close()
@@ -2207,9 +2213,13 @@ def recover_signal_bus_high_watermark(
     * the operator must pass a nonempty acknowledgement, which is recorded verbatim; there
       is no environment variable, flag file, or any other bypass;
     * it only ever raises the watermark to the observed maximum `global_sequence`, so
-      monotonicity holds even through recovery; and
+      monotonicity holds even through recovery;
     * a watermark *above* the durable rows is refused. `signal_envelope` is append-only, so
-      that state means rows were lost and needs a restore, not a metadata edit.
+      that state means rows were lost and needs a restore, not a metadata edit; and
+    * a *missing* watermark row on a non-empty store is rebuilt here and only here, with
+      `previous_watermark` recorded as absent. `_initialize` deliberately refuses to
+      re-derive it, because deriving it from possibly truncated rows would move the
+      watermark down with no exception and no audit row.
 
     It opens the database directly rather than through `SignalBusStore`, because a store
     whose watermark disagrees with its rows deliberately refuses to open at all.
@@ -2227,25 +2237,41 @@ def recover_signal_bus_high_watermark(
         connection.execute("BEGIN IMMEDIATE")
         try:
             persisted, observed = _read_high_watermark_state(connection)
-            if persisted is None:
-                raise SignalBusWatermarkError("signal bus high watermark is missing")
             if persisted == observed:
                 raise SignalBusWatermarkError(
                     f"signal bus high watermark is already consistent at {persisted}"
                 )
-            if persisted > observed:
+            if persisted is not None and persisted > observed:
                 raise SignalBusWatermarkError(
                     "watermark recovery never lowers the high watermark: "
                     f"metadata {persisted}, rows {observed}"
                 )
-            connection.execute(
-                """
-                UPDATE signal_bus_metadata
-                SET metadata_value = ?
-                WHERE metadata_key = 'signal_high_watermark'
-                """,
-                (str(observed),),
+            # Built before the write, so the model's own invariants gate the repair rather
+            # than describing one that already committed.
+            recovery = SignalBusWatermarkRecovery(
+                acknowledgement=reason,
+                previous_watermark=persisted,
+                observed_max_sequence=observed,
+                recovered_watermark=observed,
+                recovered_at=recovered_at,
             )
+            if persisted is None:
+                connection.execute(
+                    """
+                    INSERT INTO signal_bus_metadata(metadata_key, metadata_value)
+                    VALUES ('signal_high_watermark', ?)
+                    """,
+                    (str(observed),),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE signal_bus_metadata
+                    SET metadata_value = ?
+                    WHERE metadata_key = 'signal_high_watermark'
+                    """,
+                    (str(observed),),
+                )
             connection.execute(
                 """
                 INSERT INTO signal_bus_watermark_recovery(
@@ -2256,7 +2282,13 @@ def recover_signal_bus_high_watermark(
                     recovered_at
                 ) VALUES (?, ?, ?, ?, ?)
                 """,
-                (reason, persisted, observed, observed, _encode_time(recovered_at)),
+                (
+                    recovery.acknowledgement,
+                    recovery.previous_watermark,
+                    recovery.observed_max_sequence,
+                    recovery.recovered_watermark,
+                    _encode_time(recovery.recovered_at),
+                ),
             )
             connection.execute("COMMIT")
         except BaseException:
@@ -2264,10 +2296,4 @@ def recover_signal_bus_high_watermark(
             raise
     finally:
         connection.close()
-    return SignalBusWatermarkRecovery(
-        acknowledgement=reason,
-        previous_watermark=persisted,
-        observed_max_sequence=observed,
-        recovered_watermark=observed,
-        recovered_at=recovered_at,
-    )
+    return recovery
