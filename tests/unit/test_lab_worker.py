@@ -80,17 +80,23 @@ NOW = datetime(2026, 7, 24, 0, 1, tzinfo=UTC)
 # literals were a fast developer machine's, and raising the literals only moves
 # the cliff.
 #
-# _OBSERVE_REFERENCE_SECONDS is what one bare interpreter start costs on the
-# machine those literals were written on. A slower host scales every
-# observation window up in proportion; a faster one changes nothing (the scale
-# floors at 1.0).
-_OBSERVE_REFERENCE_SECONDS = 0.01
+# The measurement has to be the cost that actually varies. A bare interpreter
+# start does not: GitHub's x64 runner starts one as fast as this laptop, and
+# calibrating on it left the scale at exactly 1.0 while 30 cases stayed red.
+# What a spawned child really pays is starting an interpreter *and re-importing
+# this module* - pandas, pyarrow and the whole rquant surface - so that is what
+# gets measured. _OBSERVE_REFERENCE_SECONDS is the cost the literals were sized
+# against - half of what this module's import costs on the development machine
+# today, because the module has roughly doubled since those numbers were
+# written and they are marginal even here. Every observation window is that
+# many child start-ups; a slower host gets proportionally more.
+_OBSERVE_REFERENCE_SECONDS = 0.35
 _observe_scale = 1.0
 
 
 @pytest.fixture(scope="module", autouse=True)
 def _calibrate_observation_budgets() -> None:
-    """Measure interpreter start-up once, before any case in this module runs.
+    """Measure one child's start-up-and-import once, before any case runs.
 
     Measuring lazily inside whichever case happens to call `_observe` first is
     not safe here: these cases install signal handlers, patch multiprocessing
@@ -98,14 +104,18 @@ def _calibrate_observation_budgets() -> None:
     A module fixture pays the cost once, in pytest's own context.
     """
     global _observe_scale
+    root = Path(__file__).parents[2]
+    environment = {**os.environ, "PYTHONPATH": str(root)}
     samples: list[float] = []
-    for _ in range(3):
+    for _ in range(2):
         started = time.monotonic()
         subprocess.run(
-            [sys.executable, "-I", "-S", "-c", "pass"],
+            [sys.executable, "-c", "import tests.unit.test_lab_worker"],
+            cwd=root,
+            env=environment,
             check=True,
             capture_output=True,
-            timeout=120,
+            timeout=600,
         )
         samples.append(time.monotonic() - started)
     _observe_scale = max(1.0, min(samples) / _OBSERVE_REFERENCE_SECONDS)
