@@ -212,6 +212,45 @@ RQUANT_DAILY_ORCHESTRATOR_INSTANCE=<instance> \
 
 两个 flag 都要求 `RQUANT_DAILY_ORCHESTRATOR_INSTANCE` 合法（非法字符/路径分隔符直接 `exit 1`，不触发任何 `systemctl` 调用）。`--accept-daily-orchestrator-timer` 不检查 active/waiting 或 NEXT；`--start-daily-orchestrator-timer` 才检查 active/waiting 与 NEXT，任一不满足即 `exit 2`。
 
+## 受保护 runtime unit 的固定 root-owned wrapper（Codex round-2 P1-3）
+
+本分支新增的 25 个受保护 runtime unit **不再**直接跑 checkout 的解释器。每个 unit 的
+`ExecStart` 都是同一条固定命令，只带一个 unit 自己写死的 role 字面量：
+
+```
+ExecStart=/usr/bin/python3.11 -I -S \
+  /usr/local/libexec/rquant-runtime-exec.pyz --role <allowlisted-role>
+```
+
+research 平面的 6 个 unit 在前面保留 `/usr/local/libexec/rquant-workload-arbiter research -- `
+前缀，其余部分一字不差。
+
+三处旧输入被彻底移除，原因见 `docs/architecture/production-interpreter-authority.md`
+L1707-1751：
+
+- `EnvironmentFile=/home/lighthouse/rquant/data/runtime/current/runtime.env` —— 该文件由它
+  所配置的应用自己写（`runtime_deployment_bundle.py`），`lighthouse` 可写，却承载了
+  `--expected-commit` 与 `--expected-generation`；
+- `--manifest .../current/manifests/%i.json` —— 路径经模板实例名插值，而 `current` 本身是
+  symlink，L1751 明文禁止 wrapper 解引用它；
+- `.venv/bin/python -m rquant.runtime_service_main` —— 可变 checkout 的解释器与模块。
+
+wrapper 只从两份 root-owned 文档取值：固定 profile 与
+`/var/lib/rquant/runtime-authority/current.json`。generation、解释器、模块、cwd 与允许的
+环境变量名全部由它们决定，代码身份按 generation full manifest 逐文件校验。`%i` 只保留在
+systemd 自己的沙箱指令（`ReadWritePaths=` 等）里，wrapper 从不读它。
+
+**部署前置（本轮不做，需要单独授权）**：
+
+1. 用 `python scripts/build-runtime-exec-pyz.py --output …` 构建 pyz，装到
+   `/usr/local/libexec/rquant-runtime-exec.pyz`，`root:root`，`0555`；
+2. 把它的 SHA-256 写进生产 profile 的 `runtime_pyz`；
+3. 生产 profile 的 `roles` 必须声明这 25 个 unit 用到的全部 role（当前 profile 只冻结了
+   `daily` 一个），每个 role 绑定 module / cwd / app_source / site-packages 与环境白名单。
+   缺任何一个，对应 unit 会 fail closed（退出码 78），不会降级；
+4. 逐个 unit 跑 `systemd-analyze verify`，并确认 `systemctl show -p ExecStart` 读回的正是
+   上面那条固定命令。
+
 ## 安装步骤
 
 服务器跑：

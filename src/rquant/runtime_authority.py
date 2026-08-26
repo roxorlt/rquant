@@ -13,7 +13,7 @@ from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from enum import StrEnum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 
 from rquant.strict_json import StrictJsonError, canonical_json_bytes, strict_json_loads
@@ -60,7 +60,285 @@ GENERATION_MANIFEST_NAME = "full-manifest.json"
 GENERATION_DIRECTORY_MODE = 0o555
 GENERATION_MANIFEST_MODE = 0o444
 PRODUCTION_ALLOWED_OPERATIONS = ("publish", "rollback")
-PRODUCTION_ROLE_POLICY = (("daily", "rquant.runtime_service_main", ("LANG", "LC_ALL", "TZ")),)
+#: The environment names every runtime role is allowed to receive. The wrapper builds the
+#: child environment from an empty dictionary and copies only these, so the set is the
+#: complete answer to "what can a unit's own `Environment=` line reach".
+_RUNTIME_ROLE_ENVIRONMENT = ("LANG", "LC_ALL", "TZ")
+_RUNTIME_SERVICE_MODULE = "rquant.runtime_service_main"
+
+#: Every role `/usr/local/libexec/rquant-runtime-exec.pyz` will execute, as
+#: `(name, module, environment_allowlist, instanced)`.
+#:
+#: Amended per Codex round-2 order 2026-08-25, item P1-3: before this, the policy froze the
+#: single `daily` role, so all 25 protected units failed closed at role selection and none
+#: could start. Extending it changes `profile_id`, which is a deliberate profile version
+#: step for Release A rather than a side effect — `profile_id` is bound into `current.json`,
+#: every generation's full manifest and the R07 policy, so the new profile must be published
+#: as its own authorized infrastructure transaction.
+#:
+#: `instanced` says whether the role is served by a systemd template. The concrete instance
+#: labels are *not* frozen here: `runtime_deployment_bundle` derives them from each service
+#: manifest as `svc-<sha256>` at deployment time, so they cannot be known at code-freeze.
+#: What is frozen is the shape — an instanced role must carry at least one label, a
+#: non-instanced role none — and the labels themselves live in the root-owned profile
+#: document, where a caller cannot reach them. The wrapper then accepts `%i` only if it is
+#: already in that list, which keeps the template label a lookup key rather than an
+#: authority value (ruling D-2).
+@dataclass(frozen=True)
+class RuntimeRolePolicy:
+    """One frozen role entry: what it runs, and the exact caller argv it is given.
+
+    `control_root` is the root-owned prefix the wrapper appends the authorised instance
+    label to. An empty one means the role takes no caller argv at all — the `daily` HYBRID
+    adapter of `authority.md` L200, whose mapping is "caller argv count 0".
+    """
+
+    name: str
+    module: str
+    environment_allowlist: tuple[str, ...]
+    instanced: bool
+    service_kind: str = ""
+    control_root: str = ""
+    once: bool = False
+    #: Extra frozen literals appended to the derived argv. They come from this policy and
+    #: nowhere else, which is how two roles can share one module and still be told apart.
+    module_arguments: tuple[str, ...] = ()
+
+
+PRODUCTION_ROLE_POLICY: tuple[RuntimeRolePolicy, ...] = (
+    RuntimeRolePolicy(
+        "artifact_retention",
+        _RUNTIME_SERVICE_MODULE,
+        _RUNTIME_ROLE_ENVIRONMENT,
+        instanced=True,
+        service_kind="artifact_retention",
+        control_root="/home/lighthouse/rquant/data/runtime/control/artifact-retention",
+        once=True,
+    ),
+    RuntimeRolePolicy(
+        "auction_match_source",
+        _RUNTIME_SERVICE_MODULE,
+        _RUNTIME_ROLE_ENVIRONMENT,
+        instanced=True,
+        service_kind="auction_match_source",
+        control_root="/home/lighthouse/rquant/data/runtime/control/auction-match-sources",
+        once=False,
+    ),
+    RuntimeRolePolicy(
+        "auction_universe_publisher",
+        _RUNTIME_SERVICE_MODULE,
+        _RUNTIME_ROLE_ENVIRONMENT,
+        instanced=True,
+        service_kind="auction_universe_publisher",
+        control_root="/home/lighthouse/rquant/data/runtime/control/auction-universe-publishers",
+        once=False,
+    ),
+    RuntimeRolePolicy(
+        "candidate_publisher",
+        _RUNTIME_SERVICE_MODULE,
+        _RUNTIME_ROLE_ENVIRONMENT,
+        instanced=True,
+        service_kind="candidate_publisher",
+        control_root="/home/lighthouse/rquant/data/runtime/control/candidates",
+        once=False,
+    ),
+    RuntimeRolePolicy(
+        "daily",
+        _RUNTIME_SERVICE_MODULE,
+        _RUNTIME_ROLE_ENVIRONMENT,
+        instanced=False,
+    ),
+    RuntimeRolePolicy(
+        "daily_close_source",
+        _RUNTIME_SERVICE_MODULE,
+        _RUNTIME_ROLE_ENVIRONMENT,
+        instanced=True,
+        service_kind="daily_close_source",
+        control_root="/home/lighthouse/rquant/data/runtime/control/daily-close-sources",
+        once=False,
+    ),
+    RuntimeRolePolicy(
+        "daily_pipeline_orchestrator",
+        _RUNTIME_SERVICE_MODULE,
+        _RUNTIME_ROLE_ENVIRONMENT,
+        instanced=True,
+        service_kind="daily_pipeline_orchestrator",
+        control_root="/home/lighthouse/rquant/data/runtime/control/daily-orchestrators",
+        once=True,
+    ),
+    RuntimeRolePolicy(
+        "feature_live",
+        _RUNTIME_SERVICE_MODULE,
+        _RUNTIME_ROLE_ENVIRONMENT,
+        instanced=True,
+        service_kind="feature_live",
+        control_root="/home/lighthouse/rquant/data/runtime/control/features",
+        once=False,
+    ),
+    RuntimeRolePolicy(
+        "lab_artifact_catalog",
+        _RUNTIME_SERVICE_MODULE,
+        _RUNTIME_ROLE_ENVIRONMENT,
+        instanced=True,
+        service_kind="lab_artifact_catalog",
+        control_root="/home/lighthouse/rquant/data/runtime/control/artifact-catalogs",
+        once=False,
+    ),
+    RuntimeRolePolicy(
+        "lab_jobs_publisher",
+        _RUNTIME_SERVICE_MODULE,
+        _RUNTIME_ROLE_ENVIRONMENT,
+        instanced=True,
+        service_kind="lab_jobs_publisher",
+        control_root="/home/lighthouse/rquant/data/runtime/control/lab-jobs-publishers",
+        once=False,
+    ),
+    RuntimeRolePolicy(
+        "market_minute_source",
+        _RUNTIME_SERVICE_MODULE,
+        _RUNTIME_ROLE_ENVIRONMENT,
+        instanced=True,
+        service_kind="market_minute_source",
+        control_root="/home/lighthouse/rquant/data/runtime/control/market-minute-sources",
+        once=False,
+    ),
+    RuntimeRolePolicy(
+        "notifier",
+        _RUNTIME_SERVICE_MODULE,
+        _RUNTIME_ROLE_ENVIRONMENT,
+        instanced=True,
+        service_kind="notifier",
+        control_root="/home/lighthouse/rquant/data/runtime/control/notifiers",
+        once=False,
+    ),
+    RuntimeRolePolicy(
+        "page_control",
+        "rquant.page_control_service",
+        _RUNTIME_ROLE_ENVIRONMENT,
+        instanced=True,
+        control_root="/home/lighthouse/rquant/data/runtime/control/page-control",
+    ),
+    RuntimeRolePolicy(
+        "paper_broker",
+        _RUNTIME_SERVICE_MODULE,
+        _RUNTIME_ROLE_ENVIRONMENT,
+        instanced=True,
+        service_kind="paper_broker",
+        control_root="/home/lighthouse/rquant/data/runtime/control/paper-brokers",
+        once=False,
+    ),
+    RuntimeRolePolicy(
+        "paper_constraint_publisher",
+        _RUNTIME_SERVICE_MODULE,
+        _RUNTIME_ROLE_ENVIRONMENT,
+        instanced=True,
+        service_kind="paper_constraint_publisher",
+        control_root="/home/lighthouse/rquant/data/runtime/control/paper-constraints",
+        once=False,
+    ),
+    RuntimeRolePolicy(
+        "promotions_publisher",
+        _RUNTIME_SERVICE_MODULE,
+        _RUNTIME_ROLE_ENVIRONMENT,
+        instanced=True,
+        service_kind="promotions_publisher",
+        control_root="/home/lighthouse/rquant/data/runtime/control/promotions-publishers",
+        once=False,
+    ),
+    RuntimeRolePolicy(
+        "reference_slow_publisher",
+        _RUNTIME_SERVICE_MODULE,
+        _RUNTIME_ROLE_ENVIRONMENT,
+        instanced=True,
+        service_kind="reference_slow_publisher",
+        control_root="/home/lighthouse/rquant/data/runtime/control/reference-slow-publishers",
+        once=False,
+    ),
+    RuntimeRolePolicy(
+        "reference_slow_source",
+        _RUNTIME_SERVICE_MODULE,
+        _RUNTIME_ROLE_ENVIRONMENT,
+        instanced=True,
+        service_kind="reference_slow_source",
+        control_root="/home/lighthouse/rquant/data/runtime/control/reference-slow-sources",
+        once=False,
+    ),
+    RuntimeRolePolicy(
+        "runtime_health_publisher",
+        _RUNTIME_SERVICE_MODULE,
+        _RUNTIME_ROLE_ENVIRONMENT,
+        instanced=True,
+        service_kind="runtime_health_publisher",
+        control_root="/home/lighthouse/rquant/data/runtime/control/runtime-health-publishers",
+        once=False,
+    ),
+    RuntimeRolePolicy(
+        "runtime_recovery",
+        "rquant.runtime_recovery_service",
+        _RUNTIME_ROLE_ENVIRONMENT,
+        instanced=True,
+        control_root="/home/lighthouse/rquant/data/runtime/control/recovery",
+        module_arguments=("--mode", "execute"),
+    ),
+    RuntimeRolePolicy(
+        "runtime_recovery_rehearsal",
+        "rquant.runtime_recovery_service",
+        _RUNTIME_ROLE_ENVIRONMENT,
+        instanced=True,
+        control_root="/home/lighthouse/rquant/data/runtime/control/recovery",
+        module_arguments=("--mode", "rehearse"),
+    ),
+    RuntimeRolePolicy(
+        "serving_publisher",
+        _RUNTIME_SERVICE_MODULE,
+        _RUNTIME_ROLE_ENVIRONMENT,
+        instanced=True,
+        service_kind="serving_publisher",
+        control_root="/home/lighthouse/rquant/data/runtime/control/serving-publishers",
+        once=False,
+    ),
+    RuntimeRolePolicy(
+        "shadow_session",
+        _RUNTIME_SERVICE_MODULE,
+        _RUNTIME_ROLE_ENVIRONMENT,
+        instanced=True,
+        service_kind="shadow_session",
+        control_root="/home/lighthouse/rquant/data/runtime/control/shadow-sessions",
+        once=False,
+    ),
+    RuntimeRolePolicy(
+        "signal_router",
+        _RUNTIME_SERVICE_MODULE,
+        _RUNTIME_ROLE_ENVIRONMENT,
+        instanced=True,
+        service_kind="signal_router",
+        control_root="/home/lighthouse/rquant/data/runtime/control/signal-routers",
+        once=False,
+    ),
+    RuntimeRolePolicy(
+        "strategy_live",
+        _RUNTIME_SERVICE_MODULE,
+        _RUNTIME_ROLE_ENVIRONMENT,
+        instanced=True,
+        service_kind="strategy_live",
+        control_root="/home/lighthouse/rquant/data/runtime/control/strategies",
+        once=False,
+    ),
+    RuntimeRolePolicy(
+        "watchlist_quote_source",
+        _RUNTIME_SERVICE_MODULE,
+        _RUNTIME_ROLE_ENVIRONMENT,
+        instanced=True,
+        service_kind="watchlist_quote_source",
+        control_root="/home/lighthouse/rquant/data/runtime/control/watchlist-quote-sources",
+        once=False,
+    ),
+)
+
+#: The frozen grammar of a systemd template label. `runtime_deployment_bundle` already
+#: derives exactly this shape from each service manifest.
+_ROLE_INSTANCE = re.compile(r"svc-[0-9a-f]{64}")
+MAX_ROLE_INSTANCES = 64
 PRODUCTION_MANIFEST_SCHEMA = MappingProxyType(
     {
         "schema_id": "rquant-full-manifest/v1",
@@ -280,6 +558,18 @@ class RuntimeFilePolicy:
 class RuntimeProfileRole:
     module: str
     environment_allowlist: tuple[str, ...]
+    #: The systemd template labels this role may be started as. Empty for a role served by
+    #: a non-template unit. A caller may only choose among these; it can never introduce one.
+    instances: tuple[str, ...] = ()
+    #: `--expected-kind` for the role's module, or empty to omit the flag.
+    service_kind: str = ""
+    #: Root-owned prefix of the role's control root. The wrapper appends the authorised
+    #: instance label. Empty means the role receives no caller argv at all.
+    control_root: str = ""
+    #: Whether the role's module is invoked with `--once` (the oneshot units).
+    once: bool = False
+    #: Extra frozen literals appended to the derived argv, from the root-owned policy.
+    module_arguments: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -315,11 +605,62 @@ class RuntimeProfileRole:
             or names != tuple(sorted(set(names)))
         ):
             raise ProductionRuntimeProfileError("runtime profile environment allowlist is invalid")
+        instances = self.instances
+        if (
+            not isinstance(instances, tuple)
+            or len(instances) > MAX_ROLE_INSTANCES
+            or any(
+                type(instance) is not str or _ROLE_INSTANCE.fullmatch(instance) is None
+                for instance in instances
+            )
+            or instances != tuple(sorted(set(instances)))
+        ):
+            raise ProductionRuntimeProfileError("runtime profile role instances are invalid")
+        if type(self.service_kind) is not str or (
+            self.service_kind and _ROLE_NAME.fullmatch(self.service_kind) is None
+        ):
+            raise ProductionRuntimeProfileError("runtime profile role service kind is invalid")
+        if type(self.once) is not bool:
+            raise ProductionRuntimeProfileError("runtime profile role once flag is invalid")
+        extra = self.module_arguments
+        if (
+            not isinstance(extra, tuple)
+            or len(extra) > 8
+            or any(
+                type(item) is not str
+                or not item
+                or any(ord(character) < 0x20 for character in item)
+                for item in extra
+            )
+        ):
+            raise ProductionRuntimeProfileError(
+                "runtime profile role module arguments are invalid"
+            )
+        control = self.control_root
+        if type(control) is not str:
+            raise ProductionRuntimeProfileError("runtime profile role control root is invalid")
+        if control and (
+            not control.startswith("/")
+            or control != os.path.abspath(control)
+            or ".." in PurePosixPath(control).parts
+            or _utf8_size(
+                control,
+                ProductionRuntimeProfileError,
+                "runtime profile role control root",
+            )
+            > MAX_PATH_BYTES
+        ):
+            raise ProductionRuntimeProfileError("runtime profile role control root is invalid")
 
     def payload(self) -> dict[str, object]:
         return {
             "module": self.module,
             "environment_allowlist": list(self.environment_allowlist),
+            "instances": list(self.instances),
+            "service_kind": self.service_kind,
+            "control_root": self.control_root,
+            "once": self.once,
+            "module_arguments": list(self.module_arguments),
         }
 
 
@@ -452,12 +793,30 @@ class RuntimeClosureProfile:
             raise ProductionRuntimeProfileError("runtime allowed operations are not fixed")
         if not isinstance(self.roles, Mapping) or len(self.roles) > MAX_ROLES:
             raise ProductionRuntimeProfileError("runtime profile roles are invalid")
-        expected_roles = {
-            name: RuntimeProfileRole(module, environment)
-            for name, module, environment in PRODUCTION_ROLE_POLICY
-        }
-        if dict(self.roles) != expected_roles:
+        # The frozen policy fixes the role set, each role's module and environment
+        # allowlist, and whether the role is instanced. It deliberately does not fix the
+        # instance labels: those are derived per deployment from the service manifests, so
+        # the policy pins their shape and the root-owned profile document carries the list.
+        expected = {entry.name: entry for entry in PRODUCTION_ROLE_POLICY}
+        if set(self.roles) != set(expected):
             raise ProductionRuntimeProfileError("runtime profile role policy is not fixed")
+        for name, role in self.roles.items():
+            entry = expected[name]
+            if not isinstance(role, RuntimeProfileRole):
+                raise ProductionRuntimeProfileError("runtime profile role policy is not fixed")
+            if (
+                role.module != entry.module
+                or role.environment_allowlist != entry.environment_allowlist
+                or role.service_kind != entry.service_kind
+                or role.control_root != entry.control_root
+                or role.once != entry.once
+                or role.module_arguments != entry.module_arguments
+            ):
+                raise ProductionRuntimeProfileError("runtime profile role policy is not fixed")
+            if bool(role.instances) is not entry.instanced:
+                raise ProductionRuntimeProfileError(
+                    "runtime profile role instance policy is not fixed"
+                )
         object.__setattr__(
             self,
             "roles",
@@ -747,7 +1106,15 @@ _ROLE_FIELDS = {
     "app_source",
     "site_packages",
 }
-_PROFILE_ROLE_FIELDS = {"module", "environment_allowlist"}
+_PROFILE_ROLE_FIELDS = {
+    "module",
+    "environment_allowlist",
+    "instances",
+    "service_kind",
+    "control_root",
+    "once",
+    "module_arguments",
+}
 _MANIFEST_FIELDS = set(PRODUCTION_MANIFEST_SCHEMA)
 _GENERATION_MANIFEST_FIELDS = {"schema_id", "profile_id", "roles", "entries"}
 _GENERATION_MANIFEST_ENTRY_FIELDS = {
@@ -1138,7 +1505,15 @@ def _parse_profile_role(payload: object) -> RuntimeProfileRole:
     environment = payload["environment_allowlist"]
     if type(environment) is not list:
         raise ProductionRuntimeProfileError("runtime profile environment allowlist is invalid")
+    instances = payload["instances"]
+    if type(instances) is not list:
+        raise ProductionRuntimeProfileError("runtime profile role instances are invalid")
     return RuntimeProfileRole(
+        instances=tuple(instances),
+        service_kind=payload["service_kind"],
+        control_root=payload["control_root"],
+        once=payload["once"],
+        module_arguments=tuple(payload["module_arguments"]),
         module=payload["module"],
         environment_allowlist=tuple(environment),
     )

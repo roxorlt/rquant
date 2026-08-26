@@ -215,3 +215,84 @@ def test_maintenance_lock_wait_is_bounded(tmp_path: Path) -> None:
 
     assert maintenance.returncode == MAINTENANCE_TIMEOUT
     assert 0.15 <= time.monotonic() - started < 1.0
+
+
+# ---------------------------------------------------------------------------------------
+# P1-5 / ruling D-6: the arbiter no longer runs Python between fork and exec
+# ---------------------------------------------------------------------------------------
+
+
+def _arbiter_source() -> str:
+    return ARBITER.read_text(encoding="utf-8")
+
+
+def test_the_arbiter_never_passes_a_python_callable_to_popen() -> None:
+    """The `ctypes` `prctl` call inside `preexec_fn` was the most dangerous of the pair.
+
+    It allocated, opened a shared library and raised in a forked child that holds a copy
+    of the parent's allocator locks without the parent's threads. `setpriv --pdeathsig`
+    performs the same `PR_SET_PDEATHSIG` in C, before the exec, from a root-owned binary.
+    """
+
+    code = "\n".join(
+        line
+        for line in _arbiter_source().splitlines()
+        if not line.lstrip().startswith("#")
+    )
+
+    assert "preexec_fn" not in code
+    assert "ctypes" not in code
+    assert "_linux_parent_death_signal" not in code
+
+
+def test_the_arbiter_wraps_the_child_in_the_parent_death_launcher_on_linux() -> None:
+    source = _arbiter_source()
+
+    assert "PRIVILEGE_LAUNCHER = \"/usr/bin/setpriv\"" in source
+    assert '"--pdeathsig"' in source
+    assert '"SIGKILL"' in source
+
+
+def test_the_arbiter_launcher_argv_matches_the_shared_launcher_contract() -> None:
+    """The arbiter cannot import `rquant`, so its argv is restated. Pin the two together."""
+
+    import importlib.util
+
+    from rquant import privilege_launcher
+
+    spec = importlib.util.spec_from_loader(
+        "rquant_workload_arbiter_under_test",
+        loader=importlib.machinery.SourceFileLoader(
+            "rquant_workload_arbiter_under_test",
+            str(ARBITER),
+        ),
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    command = ["/usr/bin/env", "true"]
+    assert tuple(module.parent_death_argv(command, platform="linux")) == (
+        privilege_launcher.build_parent_death_argv(
+            launcher_path=privilege_launcher.PRODUCTION_PRIVILEGE_LAUNCHER,
+            command=command,
+        )
+    )
+
+
+def test_the_arbiter_leaves_a_non_linux_command_unwrapped() -> None:
+    import importlib.util
+
+    spec = importlib.util.spec_from_loader(
+        "rquant_workload_arbiter_under_test",
+        loader=importlib.machinery.SourceFileLoader(
+            "rquant_workload_arbiter_under_test",
+            str(ARBITER),
+        ),
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    command = ["/usr/bin/env", "true"]
+    assert module.parent_death_argv(command, platform="darwin") == command

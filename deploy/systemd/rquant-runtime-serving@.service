@@ -9,10 +9,9 @@ Type=simple
 User=lighthouse
 Group=lighthouse
 WorkingDirectory=/home/lighthouse/rquant
-EnvironmentFile=/home/lighthouse/rquant/data/runtime/current/runtime.env
 Environment=APP_ENV=prod RQUANT_DISABLE_DOTENV=1
 Slice=rquant-serving.slice
-ExecStart=/home/lighthouse/rquant/.venv/bin/python -m rquant.runtime_service_main --manifest /home/lighthouse/rquant/data/runtime/current/manifests/%i.json --control-root /home/lighthouse/rquant/data/runtime/control/serving-publishers/%i --expected-commit ${RQUANT_RUNTIME_COMMIT} --expected-generation ${RQUANT_RUNTIME_GENERATION} --expected-kind serving_publisher
+ExecStart=/usr/bin/python3.11 -I -S /usr/local/libexec/rquant-runtime-exec.pyz --role serving_publisher --instance %i
 
 Restart=on-failure
 RestartSec=20s

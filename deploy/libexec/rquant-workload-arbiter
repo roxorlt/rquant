@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import ctypes
 import fcntl
 import json
 import os
@@ -13,7 +12,6 @@ import stat
 import subprocess
 import sys
 import time
-from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
 from typing import Literal
@@ -41,19 +39,35 @@ class ArbiterError(RuntimeError):
     pass
 
 
-def _linux_parent_death_signal() -> Callable[[], None] | None:
-    if not sys.platform.startswith("linux"):
-        return None
-    parent_pid = os.getpid()
+#: Codex round-2 P1-5 / ruling D-6. The arbiter used to reach `prctl(PR_SET_PDEATHSIG)`
+#: through a foreign-function call inside `preexec_fn` — allocating, opening a shared
+#: library and raising in a forked child that holds a copy of the parent's allocator locks
+#: without the parent's threads. `setpriv --pdeathsig` performs the same `prctl` in C, from
+#: a root-owned util-linux binary, before the exec. The argv is restated here rather than
+#: imported because this helper is installed at `/usr/local/libexec` and must not depend on
+#: the checkout; `tests/unit/test_workload_plane_arbiter.py` pins it to
+#: `rquant.privilege_launcher.build_parent_death_argv`.
+PRIVILEGE_LAUNCHER = "/usr/bin/setpriv"
+PARENT_DEATH_SIGNAL_NAME = "SIGKILL"
 
-    def configure() -> None:
-        libc = ctypes.CDLL(None, use_errno=True)
-        if libc.prctl(1, signal.SIGKILL) != 0:
-            os._exit(70)
-        if os.getppid() != parent_pid:
-            os.kill(os.getpid(), signal.SIGKILL)
 
-    return configure
+def parent_death_argv(command: list[str], *, platform: str = sys.platform) -> list[str]:
+    """Wrap `command` so the kernel kills it when this arbiter dies.
+
+    The launcher exists only on Linux, which is the only platform the production arbiter
+    runs on. Elsewhere the command is executed directly and the parent-death guarantee is
+    the caller's own signal forwarding, exactly as before.
+    """
+
+    if not platform.startswith("linux"):
+        return command
+    return [
+        PRIVILEGE_LAUNCHER,
+        "--pdeathsig",
+        PARENT_DEATH_SIGNAL_NAME,
+        "--",
+        *command,
+    ]
 
 
 def _prepare_root(test_root: Path | None) -> tuple[Path, bool]:
@@ -332,10 +346,9 @@ def _run_child(command: list[str], *, plane: Plane, preempt_grace: float) -> int
     }
     try:
         child = subprocess.Popen(
-            command,
+            parent_death_argv(command),
             env=environment,
             start_new_session=True,
-            preexec_fn=_linux_parent_death_signal(),
         )
         while child.poll() is None:
             if interrupted and time.monotonic() - interrupted_at >= preempt_grace:

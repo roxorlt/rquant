@@ -510,16 +510,16 @@ class TestBoundedIpc:
 
 
 class TestChildLaunchWiring:
-    def test_the_descriptor_sweep_covers_every_gap_around_the_two_pipes(self) -> None:
-        assert root_verifier.child_descriptor_sweep((7, 9), limit=20) == (
-            (3, 7),
-            (8, 9),
-            (10, 20),
-        )
-        assert root_verifier.child_descriptor_sweep((3, 4), limit=12) == ((5, 12),)
-        assert root_verifier.child_descriptor_sweep((), limit=8) == ((3, 8),)
+    """P1-5: the launch carries a `setpriv` launcher, and no `preexec_fn` at all."""
 
-    def test_the_descriptor_sweep_rejects_a_standard_stream_or_a_bad_bound(self) -> None:
+    def test_the_retained_descriptor_set_is_the_streams_plus_the_two_pipes(self) -> None:
+        assert root_verifier.child_descriptor_sweep((7, 9), limit=20) == (0, 1, 2, 7, 9)
+        assert root_verifier.child_descriptor_sweep((3, 4), limit=12) == (0, 1, 2, 3, 4)
+        assert root_verifier.child_descriptor_sweep((), limit=8) == (0, 1, 2)
+
+    def test_the_retained_descriptor_set_rejects_a_standard_stream_or_a_bad_bound(
+        self,
+    ) -> None:
         for keep, limit in (((2, 5), 20), ((5,), 5), ((-1,), 20)):
             with pytest.raises(
                 root_verifier.SignalFamilyRootVerifierError,
@@ -532,11 +532,11 @@ class TestChildLaunchWiring:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """`preexec_fn` must actually reach `Popen`, carrying the sweep and the drop.
+        """No `preexec_fn` reaches `Popen`, and `close_fds` plus `pass_fds` do the sweep.
 
-        `close_fds=True` would hide a missing descriptor sweep, and on an unprivileged
-        macOS host a missing privilege drop is a no-op, so neither is observable from
-        the child. The launch arguments themselves are.
+        The Python callable that used to run between `fork` and `exec` is gone (Codex
+        round-2 P1-5). What remains observable at the launch seam is the argv, the fixed
+        environment, the two retained descriptors, and the absence of the callable.
         """
 
         world = build_world(tmp_path)
@@ -552,8 +552,7 @@ class TestChildLaunchWiring:
         _verifier(world).run()
 
         kwargs = captured["kwargs"]
-        preexec = kwargs["preexec_fn"]
-        assert callable(preexec)
+        assert "preexec_fn" not in kwargs
         assert kwargs["close_fds"] is True
         assert kwargs["stdin"] is root_verifier.subprocess.DEVNULL
         assert kwargs["stdout"] is root_verifier.subprocess.PIPE
@@ -567,128 +566,108 @@ class TestChildLaunchWiring:
             world.gateway.snapshots[0].slot.roles["router"].python_path,
             world.harness_path,
         )
-        assert preexec.descriptor_sweep == root_verifier.child_descriptor_sweep(
+        assert root_verifier.child_descriptor_sweep(
             tuple(kwargs["pass_fds"]),
             limit=root_verifier.child_descriptor_limit(),
-        )
-        assert preexec.privilege_plan == root_verifier.child_privilege_plan(
-            current_uid=os.geteuid(),
-            current_gid=os.getegid(),
-            target_uid=world.anchors.child_uid,
-            target_gid=world.anchors.child_gid,
-        )
-        assert preexec.pass_fds == tuple(sorted(kwargs["pass_fds"]))
-        assert preexec.privilege_calls == root_verifier.child_privilege_calls(
-            preexec.privilege_plan
-        )
+        ) == (0, 1, 2, *sorted(kwargs["pass_fds"]))
 
-    def test_the_launch_plan_carries_the_privilege_drop_when_the_verifier_is_root(
+    def test_the_launch_argv_is_wrapped_in_the_launcher_when_the_verifier_is_root(
         self,
+        tmp_path: Path,
     ) -> None:
-        plan = root_verifier.child_privilege_plan(
-            current_uid=0,
-            current_gid=0,
-            target_uid=1000,
-            target_gid=1000,
-        )
-        preexec = root_verifier.build_child_preexec(plan, pass_fds=(7, 9), limit=20)
+        """The production shape: `setpriv` performs the drop, not a Python callable.
 
-        assert preexec.privilege_plan is plan
-        assert preexec.descriptor_sweep == ((3, 7), (8, 9), (10, 20))
-        assert preexec.privilege_plan.clear_supplementary_groups is True
-        assert preexec.privilege_calls == root_verifier.child_privilege_calls(plan)
-
-    def test_the_preexec_body_performs_the_drop_and_then_the_sweep(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """Execute the callable itself, so a body that skips either half is visible.
-
-        The identity syscalls are dispatched through an injected table and the sweep
-        through `os.closerange`, so nothing here changes this process: the assertion is
-        on the exact ordered trace the child would have produced.
+        Locally the verifier and the child share a uid, so the real launch never drops.
+        The seam is driven with the production identities and a launcher this test owns.
         """
 
-        trace: list[tuple[str, tuple[Any, ...]]] = []
-
-        def record(name: str) -> Any:
-            def call(*arguments: Any) -> None:
-                trace.append((name, arguments))
-
-            return call
-
+        world = build_world(tmp_path)
+        binary = world.root / "usr" / "bin" / "setpriv"
+        binary.parent.mkdir(parents=True, exist_ok=True)
+        binary.write_text('#!/bin/sh\nexec "$@"\n', encoding="utf-8")
+        binary.chmod(0o555)
         plan = root_verifier.child_privilege_plan(
             current_uid=0,
             current_gid=0,
             target_uid=1000,
             target_gid=1000,
         )
-        preexec = root_verifier.build_child_preexec(
+        assert plan is not None
+
+        argv = root_verifier.build_launch_argv(
             plan,
-            pass_fds=(7, 9),
-            limit=20,
-            syscalls={name: record(name) for name in root_verifier.PRIVILEGE_SYSCALL_NAMES},
+            command=("/gen/bin/python", "-I", "/opt/harness.pyz"),
+            launcher_path=binary,
+            expected_owner_uid=os.getuid(),
+            expected_owner_gid=binary.stat().st_gid,
+            trusted_root=world.root,
         )
-        monkeypatch.setattr(root_verifier.os, "closerange", record("closerange"))
-        preexec()
 
-        assert trace == [
-            ("setgroups", ([],)),
-            ("setresgid", (1000, 1000, 1000)),
-            ("setresuid", (1000, 1000, 1000)),
-            ("closerange", (3, 7)),
-            ("closerange", (8, 9)),
-            ("closerange", (10, 20)),
-        ]
+        assert argv == (
+            str(binary),
+            "--reuid",
+            "1000",
+            "--regid",
+            "1000",
+            "--clear-groups",
+            "--no-new-privs",
+            "--",
+            "/gen/bin/python",
+            "-I",
+            "/opt/harness.pyz",
+        )
 
-    def test_the_preexec_body_still_sweeps_when_no_identity_change_is_possible(
+    def test_a_launch_without_a_plan_executes_the_command_unwrapped(
         self,
-        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
     ) -> None:
-        trace: list[tuple[int, int]] = []
-        monkeypatch.setattr(
-            root_verifier.os,
-            "closerange",
-            lambda low, high: trace.append((low, high)),
+        world = build_world(tmp_path)
+
+        argv = root_verifier.build_launch_argv(
+            None,
+            command=("/gen/bin/python", "-I", "/opt/harness.pyz"),
+            launcher_path=world.root / "usr" / "bin" / "setpriv",
+            expected_owner_uid=os.getuid(),
+            expected_owner_gid=os.getgid(),
+            trusted_root=world.root,
         )
-        root_verifier.build_child_preexec(None, pass_fds=(5,), limit=12)()
 
-        assert trace == [(3, 5), (6, 12)]
+        assert argv == ("/gen/bin/python", "-I", "/opt/harness.pyz")
 
-    def test_the_privilege_calls_are_the_exact_ordered_triple(self) -> None:
+    def test_a_root_launch_without_a_usable_launcher_refuses(self, tmp_path: Path) -> None:
+        world = build_world(tmp_path)
         plan = root_verifier.child_privilege_plan(
             current_uid=0,
             current_gid=0,
             target_uid=1000,
             target_gid=1000,
         )
-        assert root_verifier.child_privilege_calls(plan) == (
-            ("setgroups", ([],)),
-            ("setresgid", (1000, 1000, 1000)),
-            ("setresuid", (1000, 1000, 1000)),
-        )
-        assert root_verifier.child_privilege_calls(None) == ()
 
-    def test_a_platform_without_the_drop_syscalls_refuses_to_launch(self) -> None:
-        plan = root_verifier.child_privilege_plan(
-            current_uid=0,
-            current_gid=0,
-            target_uid=1000,
-            target_gid=1000,
-        )
-        applier = root_verifier.child_privilege_applier(plan, syscalls={})
         with pytest.raises(
             root_verifier.SignalFamilyRootVerifierError,
             match="CHILD_LAUNCH_FAILED",
         ):
-            applier()
+            root_verifier.build_launch_argv(
+                plan,
+                command=("/gen/bin/python",),
+                launcher_path=world.root / "usr" / "bin" / "setpriv",
+                expected_owner_uid=os.getuid(),
+                expected_owner_gid=os.getgid(),
+                trusted_root=world.root,
+            )
 
-    def test_a_launch_without_a_preexec_callable_is_impossible_to_build(self) -> None:
-        with pytest.raises(
-            root_verifier.SignalFamilyRootVerifierError,
-            match="CHILD_LAUNCH_FAILED",
-        ):
-            root_verifier.build_child_preexec(None, pass_fds=(1, 4), limit=20)
+    def test_the_privilege_launcher_anchor_is_the_fixed_util_linux_binary(self) -> None:
+        assert Path("/usr/bin/setpriv") == root_verifier.PRODUCTION_PRIVILEGE_LAUNCHER
+
+    def test_no_production_path_still_carries_a_python_preexec_callable(self) -> None:
+        """P1-5, structurally: the symbol and the keyword are gone from the module."""
+
+        source = Path(root_verifier.__file__).read_text(encoding="utf-8")
+
+        assert "preexec_fn=" not in source
+        assert "build_child_preexec" not in source
+        assert not hasattr(root_verifier, "build_child_preexec")
+        assert not hasattr(root_verifier, "child_privilege_applier")
 
 
 # ---------------------------------------------------------------------------------------
@@ -705,6 +684,7 @@ class TestRootImportClosure:
     ALLOWED_MODULES = (
         "rquant",
         "rquant.authority_path_security",
+        "rquant.privilege_launcher",
         "rquant.runtime_authority",
         "rquant.runtime_contracts",
         "rquant.runtime_service_control",
@@ -889,21 +869,25 @@ class TestNoCallerAppendAuthority:
 
 
 class TestProductionEntryPoint:
+    """The entry point moved into the installed artifact; the checkout copy refuses.
+
+    Codex round-2 P1-4. `scripts/signal-family-root-verifier.py` used to insert the
+    checkout's `src` at `sys.path[0]`; the production entry is now
+    `rquant.signal_family_verifier_entry._cli`, which the build packages into the fixed
+    root-owned pyz and which is reached only after the installed tree has been verified.
+    """
+
     @staticmethod
     def _entry_module() -> Any:
-        import importlib.util
+        from rquant.signal_family_verifier_entry import _cli
 
-        path = Path(root_verifier.__file__).resolve().parents[2]
-        script = path / "scripts" / "signal-family-root-verifier.py"
-        spec = importlib.util.spec_from_file_location("signal_family_root_verifier_cli", script)
-        assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = module
-        try:
-            spec.loader.exec_module(module)
-        finally:
-            del sys.modules[spec.name]
-        return module
+        return _cli
+
+    @staticmethod
+    def _checkout_script() -> Path:
+        return Path(root_verifier.__file__).resolve().parents[2] / "scripts" / (
+            "signal-family-root-verifier.py"
+        )
 
     def test_the_entry_point_hardcodes_the_four_production_anchors(self) -> None:
         module = self._entry_module()
@@ -915,6 +899,7 @@ class TestProductionEntryPoint:
         assert anchors.store_root == Path("/var/lib/rquant/signal-family-verification")
         assert anchors.expected_owner_uid == 0
         assert anchors.expected_owner_gid == 0
+        assert anchors.privilege_launcher_path == Path("/usr/bin/setpriv")
 
     def test_the_entry_point_reads_no_environment_override(self) -> None:
         module = self._entry_module()
@@ -925,6 +910,25 @@ class TestProductionEntryPoint:
         assert "--policy" not in source
         assert "--harness" not in source
         assert "--store" not in source
+
+    def test_the_checkout_entry_script_refuses_to_run_the_verifier(self) -> None:
+        import subprocess
+
+        completed = subprocess.run(
+            [sys.executable, str(self._checkout_script()), "verify"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert completed.returncode != 0
+        assert "mutable checkout" in completed.stderr
+
+    def test_the_checkout_entry_script_imports_nothing_from_the_checkout(self) -> None:
+        source = self._checkout_script().read_text(encoding="utf-8")
+
+        assert "sys.path.insert" not in source
+        assert "from rquant." not in source
 
     def test_the_entry_point_offers_exactly_verify_revoke_and_rollback(self) -> None:
         module = self._entry_module()

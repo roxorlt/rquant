@@ -45,11 +45,95 @@ Codex 最终验收。**尚未 merge、尚未打 tag、尚未部署**，云服务
 8. **云端 child 访问实验**：以真实 `lighthouse` 身份对 `0715` 的 child workspace 做
    `O_RDONLY | O_DIRECTORY` 打开，并确认 `id -g lighthouse != 0`——工作区的 group 位是
    `--x`，子进程一旦落进 group 类就会丢掉读权限（验证器现在会直接拒绝这种身份配对）。
-9. **root verifier 必须从 root-owned 树运行**。当前入口脚本
-   `scripts/signal-family-root-verifier.py` 会把自己所在 checkout 的 `src` 插进 `sys.path`；
-   若从 `/home/lighthouse/rquant/` 以 root 运行，root 就会执行 lighthouse 可写的代码。
-   policy / harness / store 的安装是**单独授权的事务**，不能借受控发布器绕过。
-10. **R07 证据缓存命中也需要网络与 token**：缓存命中不再跳过 GitHub run 身份核验，部署器仍会
+9. **root verifier 必须从 root-owned 树运行**（Codex round-2 P1-4 已落地，安装仍待授权）。
+   `scripts/signal-family-root-verifier.py` 现在直接拒绝运行并退出 78；生产入口改为固定的
+   root-owned 制品对，由 `scripts/build-signal-family-verifier-artifact.py` 构建：
+
+   ```bash
+   # --source-venv 必须显式指向**目标解释器**的 venv：制品树里带原生扩展
+   # （pydantic_core 的 .so），用别的 ABI/平台构建出来的树在生产 python3.11 上 import 不了，
+   # 而 content-id 是这棵树的哈希，所以构建主机不同 → TCB 锚点不同。
+   python scripts/build-signal-family-verifier-artifact.py \
+     --output-root <staging> \
+     --source-venv /home/lighthouse/rquant/.venv \
+     --python-version "$(/usr/bin/python3.11 -c 'import platform;print(platform.python_version())')" \
+     --target-platform linux
+   # 打印 content_id / entry_sha256 / manifest_entries 及安装位置
+   # 构建脚本现在自己 guard：源 venv 的解释器版本 / ABI tag / 平台与目标不一致就构建失败，
+   # 不会再产出一棵装着 cpython-313-darwin 扩展却声称 3.11 的树。下面这条只是人工复核。
+   find <staging>/<content-id> -name '*.so'   # 必须是 linux 的 ABI tag
+   ```
+
+   安装是**单独授权的 root 事务**，不能借受控发布器绕过。逐条核对：
+
+   - 树装到 `/usr/local/lib/rquant-signal-family-verifier/<content-id>/`，`root:root`，
+     目录 `0555`、文件 `0444`（源可执行的为 `0555`），每个文件 `nlink == 1`；
+   - 入口装到 `/usr/local/libexec/rquant-signal-family-verifier-v1.pyz`，`root:root`，
+     `0555`，`nlink == 1`，SHA-256 与构建输出一致（两次构建必须字节相同）；
+   - 运行 `/usr/bin/python3.11 -I -S /usr/local/libexec/rquant-signal-family-verifier-v1.pyz`
+     应能通过树校验；树里任何一个字节被改、多一个文件、少一个文件、mode 放宽或换了属主，
+     都必须退 78 且不启动；
+   - 回滚 = 把入口换回上一个 content id 的构建产物，旧树不删；两棵树可以共存。
+
+10. **`/usr/bin/setpriv` 必须存在且进 TCB**（Codex round-2 P1-5）。root verifier 与
+   `rquant-workload-arbiter` 的降权/父进程死亡信号都改由它执行，不再有任何 `preexec_fn`。
+   OpenCloudOS 9.2 上部署前核对：
+
+   ```bash
+   /usr/bin/setpriv --version                 # util-linux ≥ 2.33（--pdeathsig 需要）
+   stat -c '%U:%G %a %h' /usr/bin/setpriv     # root:root，无 g/o 写位，nlink 1
+   sha256sum /usr/bin/setpriv                 # 记入 TCB 清单
+   ```
+
+   缺失或不满足属主/权限时，root verifier 会拒绝启动（fail closed），不会退回旧路径。
+
+11. **`/usr/local/libexec/rquant-runtime-exec.pyz` 必须先安装，profile 必须先声明全部 role**
+   （Codex round-2 P1-3）。本分支新增的 25 个受保护 runtime unit 已改为固定命令
+   `/usr/bin/python3.11 -I -S /usr/local/libexec/rquant-runtime-exec.pyz --role <literal>`，
+   不再读 `data/runtime/current/runtime.env`，也不再接受 `%i` 插值的 manifest 路径。部署前：
+
+   ```bash
+   python scripts/build-runtime-exec-pyz.py --output <staging>/rquant-runtime-exec.pyz
+   # 装到 /usr/local/libexec/，root:root，0555；SHA-256 写进 profile 的 runtime_pyz
+   for u in /etc/systemd/system/rquant-runtime-*.service \
+            /etc/systemd/system/rquant-artifact-retention.service \
+            /etc/systemd/system/rquant-page-control.service; do
+     systemd-analyze verify "$u"
+     systemctl show -p ExecStart "$(basename "$u")"
+   done
+   ```
+
+   **`PRODUCTION_ROLE_POLICY` 已在本轮扩到 26 个 role**（Codex round-2 P1-2），`profile_id`
+   随之改变——这是刻意的 profile 版本演进，不是副作用。新版 profile 必须逐个 role 声明
+   module / 环境白名单 / **instance 白名单**；instanced role 的 `instances` 至少一项且形如
+   `svc-<64 hex>`，非 instanced role 必须为空。concrete 标签由
+   `runtime_deployment_bundle` 从各 service manifest 派生，不冻结在代码里。
+   `current.json` 的 slot 也必须声明同一组 role（`_validate_slot_against_profile` 要求相等）。
+   profile 版本变更本身是单独授权的基础设施事务；`profile_id` 同时被 slot、generation
+   full-manifest 与 R07 policy 冻结，三者必须一起换代。
+
+12. **每个实例的 service manifest 必须落在 generation 里**。wrapper 不再从 unit 接收
+   `--manifest`，而是从权威记录派生：`<generation>/manifests/<instance>.json`，并要求这条
+   相对路径是该 generation full-manifest 里的一个 `file` 条目——于是它和其余代码一样被逐字节
+   校验。`--control-root` 由 profile 的 per-role `control_root` 前缀拼上已授权的实例标签，
+   `--expected-commit` / `--expected-generation` 来自 `current.json` 的 current slot；
+   `--expected-kind` / `--once` 由 profile role 策略决定。既有的
+   `rquant.runtime_service_main` **不需要任何改动**，它收到的正是原来由 unit 传的那组参数，
+   只是来源换成了 root-owned 记录。
+
+   发布 generation 时必须把 service manifest 写进 `<generation>/manifests/` 并纳入
+   full-manifest（旧位置 `data/runtime/current/manifests/` 由应用自己可写，已不再被读取）。
+   `current.json` 的 `current_commit` 必须是 40 位十六进制 commit sha，否则 wrapper 退 78——
+   该值只是转发给既有模块的 `--expected-commit`，wrapper 自身仍不据它做任何判定。
+
+   `rquant-runtime-recovery@` / `rquant-runtime-recovery-rehearsal@` 的
+   `--expected-profile-generation %i` 已移除，generation 同样来自 `current.json`。
+
+13. **`deploy/libexec/rquant-workload-arbiter` 的 pdeathsig 竞态**：`setpriv --pdeathsig`
+   在 fork 与 exec 之间设置 `PR_SET_PDEATHSIG`，与旧实现一样存在「父进程恰在此窗口内死亡」
+   的极小竞态；旧实现额外做的 `getppid()` 复查随 `preexec_fn` 一并移除。这是刻意的取舍：
+   ruling D-6 优先消除 fork/exec 之间跑 Python 的死锁面。
+14. **R07 证据缓存命中也需要网络与 token**：缓存命中不再跳过 GitHub run 身份核验，部署器仍会
    用 `RQUANT_GITHUB_EVIDENCE_TOKEN` 查一次 workflow runs 解析出当前的 `workflow_run_id` /
    `run_attempt`，因此**离线部署不可行**；GitHub 不可达、token 缺失、该 commit 没有唯一一个
    push-main run 时结果都是 blocked，不降级放行。缓存目录及其全部祖先必须由 root 或部署身份（lighthouse）拥有、无
@@ -63,7 +147,7 @@ Codex 最终验收。**尚未 merge、尚未打 tag、尚未部署**，云服务
    （artifact 默认 90 天过期，两者独立设置），所以缓存在 artifact 过期后仍可核验；但 commit 超过
    400 天后 run 记录被归档删除，重下载与重核验都不再可能，该目标只能先在 main 上重新触发一次
    CI（或用一个更新的等价 commit）才能部署。
-11. **规格 errata 未决**：family taxonomy 单元素域、bundle/overlay identity 语义、
+15. **规格 errata 未决**：family taxonomy 单元素域、bundle/overlay identity 语义、
    producer/consumer id 域、profile-service-manifests 文档绑定、`strategy-router` /
    `strategy-shadow` 五个 surface 的向量语义、WP5 Q1–Q4、wire schema 在 3.11/3.12 的可见性、
    退休门的交易日数字，全部等 Codex 裁决；在此之前真实 harness 不产生五对 `READY`，

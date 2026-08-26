@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import math
 import os
 import sqlite3
 import stat
+import sys
 import threading
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -3070,3 +3072,67 @@ def load_verified_recovery_service_receipts(
             raise RecoveryServiceIntegrityError("immutable recovery receipt differs")
         receipts.append(receipt)
     return tuple(receipts)
+
+
+# ---------------------------------------------------------------------------------------
+# Runtime wrapper entry point
+# ---------------------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """The arguments the fixed root-owned runtime wrapper derives for the recovery roles.
+
+    Every value comes from the two root-owned documents. `--mode` is the role's own frozen
+    literal in `PRODUCTION_ROLE_POLICY`, which is what distinguishes `runtime_recovery` from
+    `runtime_recovery_rehearsal`: both map to this module, and neither takes the choice from
+    the caller.
+    """
+
+    parser = argparse.ArgumentParser(description="Run one rQuant runtime recovery pass")
+    parser.add_argument("--manifest", required=True, type=Path)
+    parser.add_argument("--control-root", required=True, type=Path)
+    parser.add_argument("--expected-commit", required=True)
+    parser.add_argument("--expected-generation", required=True)
+    parser.add_argument("--mode", required=True, choices=("execute", "rehearse"))
+    return parser
+
+
+def runtime_root_for(control_root: Path) -> Path:
+    """`<runtime root>/control/recovery/<instance>` -> `<runtime root>`.
+
+    The control root is the profile's own root-owned prefix plus the authorised instance
+    label, so this is a fixed arithmetic on a validated value, not a guess about a caller
+    supplied path.
+    """
+
+    parents = control_root.parents
+    if len(parents) < 3 or control_root.parent.name != "recovery":
+        raise ValueError("recovery control root does not sit under a runtime control root")
+    return parents[2]
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Consume the derived arguments, or exit non-zero.
+
+    Before this existed the module had no entry point at all: `runpy.run_module` imported it
+    and returned, so a oneshot recovery unit would have reported success without performing
+    a single recovery step. Silence is the dangerous failure mode here, which is why an
+    unusable argument set has to be a non-zero exit rather than a no-op.
+    """
+
+    from rquant.cli import cmd_runtime_recovery_production
+
+    arguments = build_parser().parse_args(argv)
+    return int(
+        cmd_runtime_recovery_production(
+            argparse.Namespace(
+                runtime_root=runtime_root_for(arguments.control_root),
+                expected_profile_generation=arguments.expected_generation,
+                production_recovery_action=arguments.mode,
+            )
+        )
+    )
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

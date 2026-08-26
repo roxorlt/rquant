@@ -43,6 +43,14 @@ from rquant.authority_path_security import (
     AuthorityPathSecurityError,
     open_secure_regular_file_lease,
 )
+from rquant.privilege_launcher import (
+    PRODUCTION_PRIVILEGE_LAUNCHER,
+    PrivilegeLauncherError,
+    assert_descriptor_closure,
+    build_privilege_drop_argv,
+    descriptor_limit,
+    verify_privilege_launcher,
+)
 from rquant.runtime_authority import (
     RuntimeAuthorityState,
     RuntimeGenerationSlot,
@@ -290,6 +298,10 @@ class VerifierAnchors:
     expected_owner_gid: int
     child_uid: int
     child_gid: int
+    #: The narrow root-owned launcher that performs the privilege drop (P1-5). It is only
+    #: consulted when this process is root and the child is not, so an unprivileged
+    #: offline run never touches it and macOS, which ships no `setpriv`, never needs one.
+    privilege_launcher_path: Path = PRODUCTION_PRIVILEGE_LAUNCHER
 
     def __post_init__(self) -> None:
         for label, value in (
@@ -298,6 +310,7 @@ class VerifierAnchors:
             ("harness_path", self.harness_path),
             ("store_root", self.store_root),
             ("child_workspace_root", self.child_workspace_root),
+            ("privilege_launcher_path", self.privilege_launcher_path),
         ):
             if not isinstance(value, Path) or not value.is_absolute():
                 raise ValueError(f"{label} must be one absolute path")
@@ -619,53 +632,45 @@ def child_privilege_plan(
 
 
 def child_descriptor_limit() -> int:
-    """The upper bound of the descriptor sweep on this host."""
+    """The upper bound of the descriptor space on this host."""
 
-    configured = os.sysconf("SC_OPEN_MAX") if hasattr(os, "sysconf") else 0
-    return max(int(configured or 0), 4096)
+    return descriptor_limit()
 
 
 def child_descriptor_sweep(
     pass_fds: Sequence[int],
     *,
     limit: int,
-) -> tuple[tuple[int, int], ...]:
-    """The exact `closerange` intervals that leave only 0/1/2 and the two IPC pipes.
+) -> tuple[int, ...]:
+    """The exact descriptor set the child may inherit: 0/1/2 plus the two IPC pipes.
 
-    `subprocess` closes inherited descriptors *after* `preexec_fn` runs, so this sweep is
-    the belt-and-braces half of the pair: even with the interpreter's own sweep bypassed,
-    nothing but the standard streams and the retained pipes survives into the child.
+    Codex round-2 P1-5 removed the `preexec_fn` this function used to feed. `subprocess`
+    performs the sweep itself, in C, at the point the callable would have run, so a second
+    Python-level `closerange` loop bought nothing and cost the fork/exec deadlock risk
+    `authority.md` L1841-1843 records. What survives is the arithmetic, kept as a pure
+    computation the launch asserts against the descriptors it actually passes: a bound that
+    does not cover every retained descriptor, or a retained standard stream, refuses here
+    rather than leaking a capability into the child.
     """
 
-    retained = tuple(sorted(set(pass_fds)))
-    if any(type(descriptor) is not int or descriptor < 3 for descriptor in retained):
+    try:
+        return assert_descriptor_closure(pass_fds=pass_fds, limit=limit)
+    except PrivilegeLauncherError as error:
         raise _reject(
             SignalFamilyReasonCode.CHILD_LAUNCH_FAILED,
-            "a retained child descriptor is a standard stream or is not a descriptor",
-        )
-    if type(limit) is not int or limit <= (retained[-1] if retained else 2):
-        raise _reject(
-            SignalFamilyReasonCode.CHILD_LAUNCH_FAILED,
-            "the descriptor sweep bound does not exceed every retained descriptor",
-        )
-    ranges: list[tuple[int, int]] = []
-    low = 3
-    for descriptor in retained:
-        if descriptor > low:
-            ranges.append((low, descriptor))
-        low = descriptor + 1
-    ranges.append((low, limit))
-    return tuple(ranges)
+            str(error),
+        ) from error
 
 
-#: The three identity syscalls a privilege drop is allowed to make, in order.
+#: The three identity syscalls a privilege drop performs. They are named here for the
+#: audit trail only; `setpriv` is what actually performs them, in C, before the exec.
 PRIVILEGE_SYSCALL_NAMES: Final[tuple[str, ...]] = ("setgroups", "setresgid", "setresuid")
 
 
 def child_privilege_calls(
     plan: ChildPrivilegePlan | None,
 ) -> tuple[tuple[str, tuple[Any, ...]], ...]:
-    """The exact ordered syscalls one plan performs. No plan performs none."""
+    """The exact ordered identity changes one plan describes. No plan performs none."""
 
     if plan is None:
         return ()
@@ -677,77 +682,44 @@ def child_privilege_calls(
     return tuple(calls)
 
 
-def _platform_privilege_syscalls() -> dict[str, Callable[..., None]]:
-    return {
-        name: call
-        for name in PRIVILEGE_SYSCALL_NAMES
-        if (call := getattr(os, name, None)) is not None
-    }
-
-
-def child_privilege_applier(
+def build_launch_argv(
     plan: ChildPrivilegePlan | None,
     *,
-    syscalls: Mapping[str, Callable[..., None]] | None = None,
-) -> Callable[[], None]:
-    """Turn one plan into the callable that performs it, dispatching through a fixed table.
+    command: Sequence[str],
+    launcher_path: Path,
+    expected_owner_uid: int,
+    expected_owner_gid: int,
+    trusted_root: Path = Path("/"),
+) -> tuple[str, ...]:
+    """The argv `Popen` receives: the command, wrapped in the launcher when a drop is due.
 
-    The table is looked up rather than called inline so the drop is observable without a
-    real identity change: macOS has no `setresuid` at all, and a host that does have one
-    must not actually drop privilege inside a unit test.
+    A plan means this process is root and the child must not be. The drop is performed by
+    `/usr/bin/setpriv`, a root-owned util-linux binary identified as a TCB file before it
+    is executed — never by Python running between `fork` and `exec`. When there is no plan
+    the verifier already runs as the child identity and the command is executed directly.
     """
 
-    calls = child_privilege_calls(plan)
-    table = _platform_privilege_syscalls() if syscalls is None else dict(syscalls)
-
-    def apply() -> None:
-        for name, arguments in calls:
-            call = table.get(name)
-            if call is None:
-                raise _reject(
-                    SignalFamilyReasonCode.CHILD_LAUNCH_FAILED,
-                    "this platform cannot perform the child privilege drop",
-                )
-            call(*arguments)
-
-    apply.privilege_calls = calls  # type: ignore[attr-defined]
-    return apply
-
-
-class ChildPreexec(Protocol):
-    """The callable `Popen` runs between fork and exec, with its plan kept inspectable."""
-
-    privilege_plan: ChildPrivilegePlan | None
-    privilege_calls: tuple[tuple[str, tuple[Any, ...]], ...]
-    descriptor_sweep: tuple[tuple[int, int], ...]
-    pass_fds: tuple[int, ...]
-
-    def __call__(self) -> None: ...
-
-
-def build_child_preexec(
-    plan: ChildPrivilegePlan | None,
-    *,
-    pass_fds: Sequence[int],
-    limit: int,
-    syscalls: Mapping[str, Callable[..., None]] | None = None,
-) -> ChildPreexec:
-    """Bind the privilege drop and the descriptor sweep into one inspectable callable."""
-
-    retained = tuple(sorted(set(pass_fds)))
-    sweep = child_descriptor_sweep(retained, limit=limit)
-    drop = child_privilege_applier(plan, syscalls=syscalls)
-
-    def apply() -> None:
-        drop()
-        for low, high in sweep:
-            os.closerange(low, high)
-
-    apply.privilege_plan = plan  # type: ignore[attr-defined]
-    apply.privilege_calls = drop.privilege_calls  # type: ignore[attr-defined]
-    apply.descriptor_sweep = sweep  # type: ignore[attr-defined]
-    apply.pass_fds = retained  # type: ignore[attr-defined]
-    return apply  # type: ignore[return-value]
+    argv = tuple(str(item) for item in command)
+    if plan is None:
+        return argv
+    try:
+        identity = verify_privilege_launcher(
+            launcher_path,
+            expected_owner_uid=expected_owner_uid,
+            expected_owner_gid=expected_owner_gid,
+            trusted_root=trusted_root,
+        )
+        return build_privilege_drop_argv(
+            launcher_path=identity.path,
+            target_uid=plan.setresuid[0],
+            target_gid=plan.setresgid[0],
+            command=argv,
+        )
+    except PrivilegeLauncherError as error:
+        raise _reject(
+            SignalFamilyReasonCode.CHILD_LAUNCH_FAILED,
+            str(error),
+        ) from error
 
 
 @dataclass
@@ -1554,6 +1526,13 @@ class RootVerifier:
             child_uid=self._anchors.child_uid,
             child_gid=self._anchors.child_gid,
         )
+        launch_argv = build_launch_argv(
+            plan,
+            command=build_child_argv(interpreter, harness_path),
+            launcher_path=self._anchors.privilege_launcher_path,
+            expected_owner_uid=self._anchors.expected_owner_uid,
+            expected_owner_gid=self._anchors.expected_owner_gid,
+        )
         request_read, request_write = os.pipe()
         result_read, result_write = os.pipe()
         cwd = Path(
@@ -1565,8 +1544,12 @@ class RootVerifier:
             if plan is not None:
                 os.chown(cwd, self._anchors.child_uid, self._anchors.child_gid)
             try:
+                child_descriptor_sweep(
+                    (request_read, result_write),
+                    limit=child_descriptor_limit(),
+                )
                 process = subprocess.Popen(  # noqa: S603 - fixed argv, sanitized env
-                    build_child_argv(interpreter, harness_path),
+                    launch_argv,
                     cwd=str(cwd),
                     env=child_environment(
                         cwd=cwd,
@@ -1578,11 +1561,6 @@ class RootVerifier:
                     stderr=subprocess.PIPE,
                     close_fds=True,
                     pass_fds=(request_read, result_write),
-                    preexec_fn=build_child_preexec(
-                        plan,
-                        pass_fds=(request_read, result_write),
-                        limit=child_descriptor_limit(),
-                    ),
                 )
             except OSError as error:
                 raise _reject(

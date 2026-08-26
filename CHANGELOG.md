@@ -45,6 +45,30 @@
   状态机固定 two-slot 单记录矩阵的每一个崩溃点与 orphan 行为，并把观察到的 v2 dialect 事实绑定到未被
   改动的原语上；不发生 SQLite migration。
 
+### Security
+
+> 以下四项对应 Codex 第二轮工单 P1-3 / P1-4 / P1-5 与裁决 7。均为**代码与测试**，
+> 不安装、不部署；root-owned 路径的安装仍是单独授权的基础设施事务，前置条件见 `DEPLOY.md`。
+
+- **root verifier 改为 root-owned 内容寻址制品（P1-4）**：新增
+  `scripts/build-signal-family-verifier-artifact.py`，确定性构建「venv 形态安装树 + 固定入口
+  pyz」。树装在 `/usr/local/lib/rquant-signal-family-verifier/<content-id>/`，content-id 是树
+  manifest 规范字节的 SHA-256；入口 pyz 把该 manifest 冻结在自身内部，启动时逐文件校验属主、
+  mode、link count 与哈希，任何一个字节被改、多一个文件、少一个文件都拒绝启动。
+  `scripts/signal-family-root-verifier.py` 从 checkout 运行时直接退 78。
+- **狭窄 root-owned launcher 取代全部 `preexec_fn`（P1-5）**：新增 `rquant.privilege_launcher`；
+  root verifier 与 `deploy/libexec/rquant-workload-arbiter` 都改用 `/usr/bin/setpriv`
+  （`--reuid/--regid/--clear-groups/--no-new-privs`，arbiter 用 `--pdeathsig SIGKILL`）。
+  fd 关闭交给 `close_fds=True` + `pass_fds`，原来的 Python sweep 保留为纯计算断言。
+- **固定 root-owned runtime wrapper（P1-3）**：新增 `rquant.runtime_exec_wrapper` 与
+  `scripts/build-runtime-exec-pyz.py`，实现规格 L1707-1826 的
+  `/usr/local/libexec/rquant-runtime-exec.pyz`。25 个受保护 runtime unit 的 `ExecStart` 改为
+  `/usr/bin/python3.11 -I -S /usr/local/libexec/rquant-runtime-exec.pyz --role <literal>`；
+  `EnvironmentFile=.../current/runtime.env`、`%i` 插值的 manifest 路径与 checkout 解释器全部移除。
+- **TCB 清单补齐（裁决 7）**：`docs/architecture/production-interpreter-authority.md` 的 TCB 节
+  以引用式修订补入 verifier 安装树与入口 pyz、`/usr/bin/setpriv`、verifier policy、harness 与
+  append store 的路径、属主、mode 与安装校验方式。
+
 ### Changed
 
 - **CI 全集分片**：原 90 分钟单 job 拆为 Python 3.11/3.12 的 core preflight 与 4 个

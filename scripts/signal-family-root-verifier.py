@@ -1,118 +1,41 @@
 #!/usr/bin/env python3
-"""The production entry point of the root-owned signal-family verifier.
+"""The checkout copy of the root verifier entry point. It refuses to run.
 
-The four anchors of authority.md L1280-1291 and L1401-1405 are written here as literals
-and nowhere else. There is no environment variable, no flag, and no configuration file
-that can move the policy, the harness, or the store: the offline suite reaches those
-locations only by constructing `VerifierAnchors` itself, which is exactly the injection
-ruling O5 allows and exactly the injection this file never performs.
+Codex round-2 P1-4: the root verifier must never run from a mutable checkout. This file used
+to insert `<checkout>/src` at `sys.path[0]` and import the verifier from it, which put the
+whole privileged sequence — the anchored policy open, the deployment lock, the append store —
+under the authority of whatever bytes happened to be in a `lighthouse`-writable working tree.
 
-This script installs nothing. Creating or updating
-`/etc/rquant/signal-family-verifier-policy-v1.json`, the fixed harness, or
-`/var/lib/rquant/signal-family-verification` is a separate root infrastructure
-transaction that needs its own explicit user authorization (authority.md L1389-1395,
-L1621-1626). Running this verifier against anchors that do not already exist fails closed.
+The production entry point is now the fixed root-owned archive built by
+`scripts/build-signal-family-verifier-artifact.py`:
+
+    /usr/bin/python3.11 -I -S \
+      /usr/local/libexec/rquant-signal-family-verifier-v1.pyz verify
+
+Installing that archive and its content-addressed tree under `/usr/local` is a separate root
+infrastructure transaction with its own explicit user authorization (`authority.md`
+L1389-1395). This script exists only so that running the old path fails loudly instead of
+silently doing the dangerous thing.
 """
 
 from __future__ import annotations
 
-import json
-import pwd
 import sys
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
-from rquant.signal_family_root_verifier import (  # noqa: E402
-    PRODUCTION_CHILD_WORKSPACE_ROOT,
-    PRODUCTION_HARNESS_PATH,
-    PRODUCTION_OWNER_GID,
-    PRODUCTION_OWNER_UID,
-    PRODUCTION_POLICY_PATH,
-    PRODUCTION_POLICY_TRUSTED_ROOT,
-    PRODUCTION_STORE_ROOT,
-    ProductionRuntimeAuthorityGateway,
-    RootVerifier,
-    SignalFamilyRootVerifierError,
-    VerifierAnchors,
-)
-
-SUBCOMMANDS: tuple[str, ...] = ("verify", "revoke", "rollback")
-UNPRIVILEGED_CHILD_ACCOUNT = "lighthouse"
+INSTALLED_ENTRY = "/usr/local/libexec/rquant-signal-family-verifier-v1.pyz"
+REFUSAL_EXIT_CODE = 78
 
 
-def production_anchors(*, child_uid: int, child_gid: int) -> VerifierAnchors:
-    """The four fixed anchors, hardcoded. Nothing overrides them."""
-
-    return VerifierAnchors(
-        policy_trusted_root=PRODUCTION_POLICY_TRUSTED_ROOT,
-        policy_path=PRODUCTION_POLICY_PATH,
-        harness_path=PRODUCTION_HARNESS_PATH,
-        store_root=PRODUCTION_STORE_ROOT,
-        child_workspace_root=PRODUCTION_CHILD_WORKSPACE_ROOT,
-        expected_owner_uid=PRODUCTION_OWNER_UID,
-        expected_owner_gid=PRODUCTION_OWNER_GID,
-        child_uid=child_uid,
-        child_gid=child_gid,
+def main() -> int:
+    sys.stderr.write(
+        "the signal-family root verifier refuses to run from a mutable checkout\n"
+        f"run the installed root-owned artifact instead:\n"
+        f"  /usr/bin/python3.11 -I -S {INSTALLED_ENTRY} <verify|revoke|rollback>\n"
+        "build it with scripts/build-signal-family-verifier-artifact.py; installing it is a\n"
+        "separately authorized root infrastructure transaction\n"
     )
-
-
-def build_verifier() -> RootVerifier:
-    account = pwd.getpwnam(UNPRIVILEGED_CHILD_ACCOUNT)
-    return RootVerifier(
-        anchors=production_anchors(child_uid=account.pw_uid, child_gid=account.pw_gid),
-        authority_gateway=ProductionRuntimeAuthorityGateway(),
-    )
-
-
-def main(argv: list[str]) -> int:
-    if len(argv) < 2 or argv[1] not in SUBCOMMANDS:
-        sys.stderr.write(f"usage: signal-family-root-verifier.py {{{'|'.join(SUBCOMMANDS)}}}\n")
-        return 2
-    command = argv[1]
-    verifier = build_verifier()
-    try:
-        if command == "verify":
-            result = verifier.run()
-            outcome = {
-                "command": command,
-                "outcome": result.outcome,
-                "state": result.state.value,
-                "overlay_content_hash": result.decision.overlay_content_hash,
-                "authority_epoch_key": result.decision.authority_epoch_key,
-                "decision_hash": result.decision.decision_hash,
-                "receipt_fingerprints": list(result.decision.receipt_fingerprints),
-            }
-        else:
-            if len(argv) != 4:
-                sys.stderr.write(
-                    f"usage: signal-family-root-verifier.py {command} "
-                    "<overlay_content_hash> <authority_epoch_key>\n"
-                )
-                return 2
-            transition = verifier.revoke if command == "revoke" else verifier.rollback
-            state = transition(
-                overlay_content_hash=argv[2],
-                authority_epoch_key=argv[3],
-            )
-            outcome = {
-                "command": command,
-                "state": state.value,
-                "overlay_content_hash": argv[2],
-                "authority_epoch_key": argv[3],
-            }
-    except SignalFamilyRootVerifierError as error:
-        sys.stdout.write(
-            json.dumps(
-                {"command": command, "outcome": "rejected", "reason_code": error.reason_code.value},
-                sort_keys=True,
-            )
-            + "\n"
-        )
-        return 1
-    sys.stdout.write(json.dumps(outcome, sort_keys=True) + "\n")
-    return 0
+    return REFUSAL_EXIT_CODE
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv))
+    raise SystemExit(main())

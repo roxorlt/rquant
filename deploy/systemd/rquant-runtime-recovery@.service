@@ -14,7 +14,7 @@ WorkingDirectory=/home/lighthouse/rquant
 Slice=rquant-research.slice
 Environment=RQUANT_DISABLE_DOTENV=1
 RuntimeDirectory=rquant/runtime-recovery/%i
-ExecStart=/usr/local/libexec/rquant-workload-arbiter research -- /home/lighthouse/rquant/.venv/bin/rquant runtime-recovery-production execute --runtime-root /home/lighthouse/rquant/data/runtime --expected-profile-generation %i
+ExecStart=/usr/local/libexec/rquant-workload-arbiter research -- /usr/bin/python3.11 -I -S /usr/local/libexec/rquant-runtime-exec.pyz --role runtime_recovery --instance %i
 Restart=no
 TimeoutStartSec=infinity
 TimeoutStopSec=30s

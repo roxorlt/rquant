@@ -1219,7 +1219,7 @@ class TestAppendStore:
     ) -> None:
         """Two runs race the store transaction from two connections.
 
-        The child launches are serialized because `subprocess`'s `preexec_fn` is not safe
+        The child launches are serialized because a concurrent `Popen` is not safe
         in the presence of threads, and the production verifier is single-threaded. What
         the two threads actually race is the `BEGIN IMMEDIATE` transaction and its unique
         key over overlay plus authority epoch, which is the property under test.
