@@ -49,6 +49,26 @@
   retry 不二次 fsync 记录目录、byte conflict 不写 conflict audit），不是 v2 的合规状态；这两条义务只对
   未来的 v3-only 原语成立。
 
+- **signal-family 声明域冻结（Codex 第二轮裁决 2）**：新增叶子模块
+  `src/rquant/signal_family_constants.py`（不 import 任何 `rquant` 模块），冻结三个
+  current-family channel（`channel_id` 在类型层就是 `Literal` 闭集）、唯一 accepted family、
+  successor/overlay 两个 namespace、五个 pair id，以及参与者 service id 的语法
+  （`^[a-z][a-z0-9]*(-[a-z0-9]+)*$`、≤ 64 字符）、namespace 与「按 channel 按方向」的角色域。
+  bundle identity 就是 namespace，overlay identity 是 `(overlay_namespace,
+  base_bundle_content_hash)`，冲突审计记录从这两个属性取 identity。原模块按历史名字全部
+  re-export，下游 `signal_family_verification` 与 harness vectors 不受影响。该语法**不**下推到
+  `RuntimeServiceManifest.service_id` / `PairBindingV1`——生产 profile 现有 id（如
+  `signal-router.all-strategies.v1`、`strategy.n_shape.v1`）带点和下划线，不满足该语法，对齐属于
+  生产拓扑变更，需单独授权。
+
+- **`rquant signal-bus-recover`（Codex 第二轮裁决 5）**：`signal_high_watermark` 现在有三条成立
+  的不变量——单调、不自动纠正、与 `signal_envelope` 实际最大序号不一致时 fail closed。
+  `SignalBusStore` 在打开时与 `source_descriptor()` 读出时各校验一次，抛
+  `SignalBusWatermarkError`。唯一修复路径是新 CLI
+  `rquant signal-bus-recover --database <path> --acknowledge <reason>`：理由原样写入 append-only
+  的 `signal_bus_watermark_recovery` 审计表，只把水位**抬高**到实际最大序号，水位高于实际行时
+  拒绝（那是数据丢失，要走备份恢复），无任何环境变量旁路。
+
 ### Changed
 
 - **CI 全集分片**：原 90 分钟单 job 拆为 Python 3.11/3.12 的 core preflight 与 4 个
@@ -60,6 +80,22 @@
 
 - **模拟盘发布证据**：paper publication v4 将执行成本证据与不可变 SQLite 镜像绑定，发布前后
   复核 schema、账本和源文件身份，避免迁移时把可变源库当作已验证输入。
+
+- **部署 recovery provenance（Codex 第二轮裁决 8）**：`_recover_locked` **不重跑** Release A/B
+  决策表，只重放此前已被接受并持久化的精确 intent pair；audit 行除 `r07_gate=recorded_intent`
+  外新增 `recovery_action`、`recovery_intent_operation_id`、`recovery_intent_stage`、
+  `recovery_intent_target_ref` 与该 intent 记录的 previous/target SHA。`docs/production-release.md`
+  原先写「rollback target 走同一张表」，与代码和裁决矛盾，已改正。
+
+- **旧链路退休门量化（Codex 第二轮裁决 6）**：设计文档新增 §18.1，冻结「切流前 ≥ 10 个有效交易
+  日 shadow + 切流后 ≥ 10 个有效交易日观察、合计 ≥ 20 日」，并给出样本量、严重偏差阈值和回滚演练
+  要求（后三组数字标注为 Claude 提案、待 Codex 确认）。原 Phase 2「5-10 个交易日」与 Phase 6
+  「10-20 个交易日」两处互相矛盾的数字改为引用该节。
+
+- **替代权威 identity 写成规范（Codex 第二轮裁决 3）**：`full manifest membership +
+  policy-anchored service_manifest_fingerprint` 从 gateway docstring 升格为规格条款，并补上 step 7
+  对 `full_manifest_sha256`、`profile_document_sha256`、单条 full-manifest entry 与
+  `manifest_fingerprint` 漂移的红测。
 
 - **题材梯队推送改版**：午间战报将最强题材与连续连板梯队合并为 Top5，并将下午候选池
   调整为适合手机阅读的三行分隔格式；30 分钟脉搏新增题材梯队 Top5，展示涨停数、完整
