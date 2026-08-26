@@ -1015,6 +1015,35 @@ def _diff_scope_scan(tmp_path: Path, name: str, source: str) -> object:
             id="name-alias-assignment",
         ),
         pytest.param(
+            "walrus-target",
+            "if (publish_v3 := object()):\n    pass\n",
+            "publish_v3",
+            id="walrus-target-binding",
+        ),
+        pytest.param(
+            "walrus-alias",
+            (
+                "from rquant import signal_route_spool\n"
+                "\n"
+                "if (safe := signal_route_spool.publish_v3):\n"
+                "    pass\n"
+            ),
+            "publish_v3",
+            id="walrus-alias-binding",
+        ),
+        pytest.param(
+            "dict-literal-symbol-key",
+            'HANDLERS = {"publish_v3": None}\n',
+            "publish_v3",
+            id="dict-literal-symbol-key",
+        ),
+        pytest.param(
+            "dict-literal-registry-key",
+            'HANDLERS = {"r07_overlay": None}\n',
+            "r07_overlay",
+            id="dict-literal-registry-key",
+        ),
+        pytest.param(
             "annotated-exports",
             '__all__: list[str] = ["publish_v3"]\n',
             "publish_v3",
