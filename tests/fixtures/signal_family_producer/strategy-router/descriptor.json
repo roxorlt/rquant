@@ -1,0 +1,14 @@
+{
+  "candidate_id": "600000.SH",
+  "evaluator_contract_fingerprint": "2222222222222222222222222222222222222222222222222222222222222222",
+  "producer_commit": "ffffffffffffffffffffffffffffffffffffffff",
+  "routing_policy_fingerprint": "ad5d8a83cf9c171b5ecda61c9c4d4931a1216d47d2511eec3d30b78337c81a18",
+  "runner_state_dump_sha256": "543160141937425888fe37e29f043034792e0a104d3900e3eeddc04a689fd571",
+  "signal_high_watermark": 1,
+  "source_generation_id": "7777777777777777777777777777777777777777777777777777777777777777",
+  "source_id": "n-shape-v1",
+  "strategy_id": "n-shape",
+  "strategy_registration_fingerprint": "1111111111111111111111111111111111111111111111111111111111111111",
+  "strategy_spec_fingerprint": "dd467e4c66d1b740a058b250f1932de5335f3a248670212696e8d45f530fcf2e",
+  "strategy_version": "1"
+}

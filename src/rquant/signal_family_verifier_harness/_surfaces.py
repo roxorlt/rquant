@@ -16,11 +16,22 @@ and `serving_publisher_builder` build their readers during `build(manifest)` and
 them, so reading the cell by name is how the child gets *the builder's* object rather than
 one of its own.
 
-Eight of the thirteen reader surfaces are exercised. `BLOCKED_SURFACE_REASONS` names the
-other five and says exactly what stops each of them; a vector that asks for one is refused
-rather than answered with a substitute. The five that remain all need producer-side state
-no bounded vector can carry — an audited runner-state SQLite, a signed legacy shadow export
-— and none of them can be reached by running the exercise somewhere friendlier.
+Ten of the thirteen reader surfaces are exercised. Two of those ten — the `strategy-router`
+pair — need producer-side state no bounded vector can carry, and they get it through the
+ruling E-1 fixture channel: the immutable test manifest names an in-generation, full-manifest
+covered, policy-hashed runner-state SQL dump and routing policy, the root checks both before
+and after this child runs, and `VectorWorkspace` copies them into the vector's own tree and
+rebuilds the database there. The fixture is producer output — `scripts/build-signal-family-
+producer-fixtures.py` drives the real `StrategyRunnerStore.process_batch` — never a
+hand-written table.
+
+`BLOCKED_SURFACE_REASONS` names the remaining three and says exactly what stops each of them;
+a vector that asks for one is refused rather than answered with a substitute. All three are
+`strategy-shadow` readers whose only production path runs through
+`FilesystemShadowSessionInputLoader` under `LegacyShadowFilesystemPolicy(mode="linux-production")`,
+which `legacy_shadow_export._validate_mount_policy` refuses on any non-Linux host — so on a
+Darwin build host the production path cannot be entered at all, and no fixture makes it
+reachable.
 """
 
 from __future__ import annotations
@@ -32,7 +43,7 @@ from pathlib import Path
 from typing import Any, Final
 
 from ._canonical import canonical_json_bytes, canonical_sha256, sha256_hex
-from ._request import RequestVector
+from ._request import AuthorizedGenerationFile, RequestVector
 from ._resolve import bound_surface, resolve_surface
 from ._workspace import VectorWorkspace, WorkspaceError, tree_digest
 
@@ -57,27 +68,23 @@ _SERVICE_KEYS: Final[tuple[str, ...]] = (
 #: delivery gap recorded in `wp4c-report.md`, not a silent omission: the child rejects the
 #: whole run rather than returning a substitute observation.
 BLOCKED_SURFACE_REASONS: Final[dict[str, str]] = {
-    "rquant.signal_router_runtime.ReadonlyStrategyRunnerSignalSource.read_batch": (
-        "the reader opens a runner-state SQLite whose audited runner_metadata / "
-        "runner_source_identity / runner_signal schema only StrategyRunnerStore.process_batch "
-        "can legitimately produce, and that producer needs a full StrategySpec, "
-        "FeatureBatchEnvelope, feature frame, and StrategyEvaluator that no bounded vector "
-        "carries"
-    ),
-    "rquant.signal_router_runtime.route_runner_signals": (
-        "the router step reads through the same runner-state SQLite as read_batch, so it is "
-        "blocked by the same missing producer path"
-    ),
     "rquant.runtime_builder_shadow._FilesystemRunnerSource.read_completed_batch": (
-        "FilesystemShadowSessionInputLoader.load only constructs the source from an accepted "
-        "legacy shadow export, which requires Ed25519 completion and report attestations the "
-        "harness cannot mint without holding signing keys"
+        "shadow_session_builder constructs this source only through "
+        "FilesystemShadowSessionInputLoader.load with the production LegacyShadowFilesystemPolicy "
+        "mode linux-production, and legacy_shadow_export._validate_mount_policy refuses that "
+        "mode outright unless sys.platform == 'linux', so the production reader path cannot be "
+        "entered at all on a Darwin build host and a fixture published for it would need the "
+        "equally Linux-gated production publisher"
     ),
     "rquant.runtime_shadow_sources.read_isolated_runner_shadow_snapshot": (
-        "same accepted-export precondition as _FilesystemRunnerSource.read_completed_batch"
+        "reached in production only through the same shadow_session_builder input loader as "
+        "_FilesystemRunnerSource.read_completed_batch, so the linux-production mount predicate "
+        "blocks it identically"
     ),
     "rquant.runtime_shadow_sources.isolated_signal_observations": (
-        "same accepted-export precondition as _FilesystemRunnerSource.read_completed_batch"
+        "reached in production only through the same shadow_session_builder input loader as "
+        "_FilesystemRunnerSource.read_completed_batch, so the linux-production mount predicate "
+        "blocks it identically"
     ),
 }
 
@@ -182,6 +189,28 @@ def _closure_value(step: Any, name: str, expected: type[Any]) -> Any:
     return value
 
 
+def _closure_callable(step: Any, name: str) -> Any:
+    """Take one callable collaborator the production builder resolved into its closure.
+
+    `_closure_value` pins an exact class, which is the stronger check where the builder keeps
+    an object. A router builder keeps *functions* — the source loader it wired and the frozen
+    routing policy resolver — so the type check here is that the cell holds something callable
+    and that its identity came from the builder rather than from this module.
+    """
+
+    code = getattr(step, "__code__", None)
+    cells = getattr(step, "__closure__", None)
+    if code is None or cells is None:  # pragma: no cover - builders return closures
+        raise SurfaceExerciseError("the production builder did not return a closure step")
+    names = tuple(code.co_freevars)
+    if name not in names:
+        raise SurfaceExerciseError(f"the production builder step does not capture {name}")
+    value = cells[names.index(name)].cell_contents
+    if not callable(value):
+        raise SurfaceExerciseError(f"the production builder captured a noncallable {name}")
+    return value
+
+
 def _notifier_step(context: ExerciseContext, spec: SurfaceSpec) -> Any:
     from rquant.runtime_builder_signal import notifier_builder
 
@@ -236,6 +265,44 @@ def _closure_assembler(step: Any) -> Any:
     ):
         raise SurfaceExerciseError("the serving builder's loader is not the frozen assemble")
     return assembler
+
+
+def _signal_router_step(context: ExerciseContext, spec: SurfaceSpec) -> Any:
+    """Build the router in its default manifest-authority mode, with nothing injected.
+
+    `signal_router_builder` refuses to combine injected dependencies with manifest authority,
+    so passing neither is the only way to reach the branch that constructs a real
+    `ReadonlyStrategyRunnerSignalSource` over the runner-state database and loads the frozen
+    routing policy from disk. That branch is the production one.
+    """
+
+    from rquant.runtime_builder_signal import signal_router_builder
+
+    manifest = _service_manifest(context, spec)
+    try:
+        return signal_router_builder(clock=lambda: context.observed_at)(manifest)
+    except (TypeError, ValueError) as exc:
+        raise SurfaceExerciseError(
+            "the signal router production builder refused the vector"
+        ) from exc
+
+
+def _router_source(context: ExerciseContext, step: Any) -> Any:
+    """The reader the router builder wired for the vector's own source id."""
+
+    from rquant.signal_router_runtime import ReadonlyStrategyRunnerSignalSource
+
+    loader = _closure_callable(step, "resolved_source_loader")
+    try:
+        source = loader(context.text("source_id"))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise SurfaceExerciseError("the router builder has no source for that id") from exc
+    if type(source) is not ReadonlyStrategyRunnerSignalSource:
+        raise SurfaceExerciseError(
+            "the router builder did not wire a ReadonlyStrategyRunnerSignalSource; an "
+            "injected source loader cannot substitute for the manifest-authority path"
+        )
+    return source
 
 
 def _paper_broker_step(context: ExerciseContext, spec: SurfaceSpec) -> Any:
@@ -425,6 +492,83 @@ def _exercise_build_serving_read_models(context: ExerciseContext) -> ExerciseOut
 
 
 # ---------------------------------------------------------------------------------------
+# strategy-router
+# ---------------------------------------------------------------------------------------
+
+
+def _runner_batch_projection(batch: Any) -> dict[str, Any]:
+    """A runner batch carries whole signal envelopes, so only its identity is returned."""
+
+    descriptor = batch.snapshot.descriptor
+    return {
+        "count": len(batch.records),
+        "descriptor": descriptor.model_dump(mode="json"),
+        "records_sha256": canonical_sha256(
+            [record.model_dump(mode="json") for record in batch.records]
+        ),
+        "sequences": [record.sequence for record in batch.records],
+        "signal_ids": [record.signal.signal_id for record in batch.records],
+    }
+
+
+def _exercise_runner_source_read_batch(context: ExerciseContext) -> ExerciseOutcome:
+    spec = SURFACE_SPECS[context.vector.surface_id]
+    step = _signal_router_step(context, spec)
+    source = _router_source(context, step)
+    runtime_digest = tree_digest(context.workspace.runtime)
+    after_sequence = context.integer("after_sequence")
+    limit = context.integer("limit")
+    surface = bound_surface(source, context.vector.surface_id)
+    batch = surface(after_sequence=after_sequence, limit=limit)
+    return ExerciseOutcome(
+        observation={
+            "after_sequence": after_sequence,
+            "batch": _runner_batch_projection(batch),
+            "limit": limit,
+            "source_id": source.source_id,
+        },
+        runtime_digest_before_call=runtime_digest,
+    )
+
+
+def _exercise_route_runner_signals(context: ExerciseContext) -> ExerciseOutcome:
+    from rquant.signal_bus import SignalBusStore
+    from rquant.signal_router_runtime import SignalRouteCursorStore
+
+    spec = SURFACE_SPECS[context.vector.surface_id]
+    step = _signal_router_step(context, spec)
+    source = _router_source(context, step)
+    bus = _closure_value(step, "bus", SignalBusStore)
+    cursors = _closure_value(step, "cursors", SignalRouteCursorStore)
+    resolver = _closure_callable(step, "resolved_target_resolver")
+    runtime_digest = tree_digest(context.workspace.runtime)
+    limit = context.integer("limit")
+    surface = resolve_surface(context.vector.surface_id)
+    summary = surface(
+        source_id=source.source_id,
+        source=source,
+        bus=bus,
+        cursors=cursors,
+        routed_at=context.observed_at,
+        target_resolver=resolver,
+        limit=limit,
+    )
+    return ExerciseOutcome(
+        observation={
+            "collaborators": [
+                type(source).__name__,
+                type(bus).__name__,
+                type(cursors).__name__,
+                type(resolver).__name__,
+            ],
+            "limit": limit,
+            "summary": summary.model_dump(mode="json"),
+        },
+        runtime_digest_before_call=runtime_digest,
+    )
+
+
+# ---------------------------------------------------------------------------------------
 # router-paper
 # ---------------------------------------------------------------------------------------
 
@@ -565,6 +709,18 @@ SURFACE_SPECS: Final[dict[str, SurfaceSpec]] = {
         writes=True,
         exercise=_exercise_paper_queue_ingest,
     ),
+    "rquant.signal_router_runtime.ReadonlyStrategyRunnerSignalSource.read_batch": SurfaceSpec(
+        builder="rquant.runtime_builder_signal.signal_router_builder",
+        service_kind="signal_router",
+        writes=False,
+        exercise=_exercise_runner_source_read_batch,
+    ),
+    "rquant.signal_router_runtime.route_runner_signals": SurfaceSpec(
+        builder="rquant.runtime_builder_signal.signal_router_builder",
+        service_kind="signal_router",
+        writes=True,
+        exercise=_exercise_route_runner_signals,
+    ),
 }
 
 IMPLEMENTED_SURFACE_IDS: Final[tuple[str, ...]] = tuple(sorted(SURFACE_SPECS))
@@ -681,8 +837,20 @@ def _parse_observed_at(value: Any) -> datetime:
         raise SurfaceExerciseError("vector observed_at is not an aware UTC timestamp") from exc
 
 
-def exercise_vector(vector: RequestVector, root: Path) -> dict[str, Any]:
-    """Run one vector through its production builder and return its canonical result."""
+def exercise_vector(
+    vector: RequestVector,
+    root: Path,
+    *,
+    generation_root: Path | None = None,
+    authorized_fixtures: Mapping[str, AuthorizedGenerationFile] | None = None,
+) -> dict[str, Any]:
+    """Run one vector through its production builder and return its canonical result.
+
+    `generation_root` and `authorized_fixtures` are the root-derived halves of the ruling
+    E-1 fixture channel. They are keyword-only and default to nothing so that a vector which
+    declares no fixture cannot be affected by them, and a vector which does declare one
+    cannot be answered at all unless the root supplied the authorization first.
+    """
 
     surface_id = vector.surface_id
     if surface_id in BLOCKED_SURFACE_REASONS:
@@ -702,7 +870,12 @@ def exercise_vector(vector: RequestVector, root: Path) -> dict[str, Any]:
     if type(declared_state) is not dict:
         raise SurfaceExerciseError("vector state must be a JSON object")
 
-    workspace = VectorWorkspace(root, vector.vector_id)
+    workspace = VectorWorkspace(
+        root,
+        vector.vector_id,
+        generation_root=generation_root,
+        authorized_fixtures=authorized_fixtures,
+    )
     try:
         workspace.materialize(declared_state)
     except WorkspaceError as exc:
@@ -732,12 +905,17 @@ def exercise_vector(vector: RequestVector, root: Path) -> dict[str, Any]:
     # The read-only verdict is enforced, never reported. Whether a *writer* left the runtime
     # tree byte-identical depends on when SQLite last checkpointed, which differs between the
     # policy author's process and the child's, so it can never be part of a frozen result.
+    # 裁决 4 / ruling E-3: the frozen result shape carries no `state_unchanged`. The
+    # child still fails fast above when a surface disturbs its own materialized
+    # declaration, but the enforceable claim — that the in-generation producer state the
+    # vector read is byte-identical before and after this run — is the root's, taken from
+    # its own digest of the generation on both sides of the child. A constant `true` here
+    # would have been the child vouching for itself.
     result: dict[str, Any] = {
         "schema_version": 1,
         "builder": spec.builder,
         "declared_writer": spec.writes,
         "observation": outcome.observation,
-        "state_unchanged": True,
         "surface_id": surface_id,
     }
     canonical_json_bytes(result)

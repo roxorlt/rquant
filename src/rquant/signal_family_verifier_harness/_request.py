@@ -29,6 +29,10 @@ MAX_RESPONSE_BYTES: Final[int] = 1_048_576
 MAX_CANONICAL_RESULT_BYTES: Final[int] = 65_536
 #: `signal_family_verification.MAX_VECTOR_INPUT_BYTES`.
 MAX_VECTOR_INPUT_BYTES: Final[int] = 65_536
+#: `signal_family_verification.MAX_GENERATION_FIXTURE_BYTES`.
+MAX_GENERATION_FIXTURE_BYTES: Final[int] = 1_048_576
+#: `signal_family_verification.MAX_GENERATION_FIXTURE_FILES`.
+MAX_GENERATION_FIXTURE_FILES: Final[int] = 32
 
 #: `signal_family_successor_registry.PAIR_IDS`.
 PAIR_IDS: Final[tuple[str, ...]] = (
@@ -92,11 +96,14 @@ PRODUCER_SURFACES: Final[dict[str, tuple[str, ...]]] = {
 }
 
 _REQUEST_KEYS: Final[tuple[str, ...]] = (
+    "generation_files",
+    "generation_root",
     "run_id",
     "schema_version",
     "test_manifest_hash",
     "vectors",
 )
+_GENERATION_FILE_KEYS: Final[tuple[str, ...]] = ("mode", "relative_path", "sha256", "size")
 _VECTOR_KEYS: Final[tuple[str, ...]] = (
     "family_id",
     "input_json",
@@ -144,12 +151,33 @@ class RequestVector:
 
 
 @dataclass(frozen=True)
+class AuthorizedGenerationFile:
+    """One in-generation producer fixture the root already checked and now authorizes.
+
+    The child treats this as the whole of what it may copy out of the generation: a vector
+    that names a `(relative_path, sha256)` pair absent from this tuple names something the
+    root never validated, and the run is refused rather than answered.
+    """
+
+    relative_path: str
+    sha256: str
+    size: int
+    mode: int
+
+
+@dataclass(frozen=True)
 class ChildRequest:
     """The complete bounded request, already checked against every frozen rule."""
 
     run_id: str
     test_manifest_hash: str
     vectors: tuple[RequestVector, ...]
+    generation_root: str
+    generation_files: tuple[AuthorizedGenerationFile, ...]
+
+    @property
+    def authorized_fixtures(self) -> dict[str, AuthorizedGenerationFile]:
+        return {entry.relative_path: entry for entry in self.generation_files}
 
 
 def _parse_vector(raw: Any) -> RequestVector:
@@ -187,6 +215,28 @@ def _parse_vector(raw: Any) -> RequestVector:
     return vector
 
 
+def _parse_generation_file(raw: Any) -> AuthorizedGenerationFile:
+    if type(raw) is not dict or tuple(sorted(raw)) != _GENERATION_FILE_KEYS:
+        raise ChildRequestError("generation file fields are not the exact frozen set")
+    relative_path = raw["relative_path"]
+    size = raw["size"]
+    mode = raw["mode"]
+    if type(relative_path) is not str or not relative_path:
+        raise ChildRequestError("generation file relative_path must be a nonempty string")
+    if type(size) is not int or type(size) is bool or size < 1:
+        raise ChildRequestError("generation file size must be a positive integer")
+    if size > MAX_GENERATION_FIXTURE_BYTES:
+        raise ChildRequestError("generation file size exceeds its bounded value")
+    if type(mode) is not int or type(mode) is bool or not 0 <= mode <= 0o777 or mode & 0o222:
+        raise ChildRequestError("generation file mode must be a read-only POSIX mode")
+    return AuthorizedGenerationFile(
+        relative_path=relative_path,
+        sha256=_require_sha256(raw["sha256"], field="generation file sha256"),
+        size=size,
+        mode=mode,
+    )
+
+
 def parse_child_request(payload: bytes) -> ChildRequest:
     """Decode and fully validate the one request the child is allowed to act on."""
 
@@ -213,6 +263,18 @@ def parse_child_request(payload: bytes) -> ChildRequest:
     identifiers = [vector.vector_id for vector in vectors]
     if identifiers != sorted(set(identifiers)):
         raise ChildRequestError("vectors must be sorted by vector_id and duplicate-free")
+    raw_files = decoded["generation_files"]
+    if type(raw_files) is not list or len(raw_files) > MAX_GENERATION_FIXTURE_FILES:
+        raise ChildRequestError("the request generation file tuple is not bounded")
+    generation_files = tuple(_parse_generation_file(raw) for raw in raw_files)
+    paths = [entry.relative_path for entry in generation_files]
+    if paths != sorted(set(paths)):
+        raise ChildRequestError(
+            "generation files must be sorted by relative_path and duplicate-free"
+        )
+    generation_root = decoded["generation_root"]
+    if type(generation_root) is not str or not generation_root.startswith("/"):
+        raise ChildRequestError("the request generation root must be an absolute path")
     return ChildRequest(
         run_id=_require_sha256(decoded["run_id"], field="run_id"),
         test_manifest_hash=_require_sha256(
@@ -220,6 +282,8 @@ def parse_child_request(payload: bytes) -> ChildRequest:
             field="test_manifest_hash",
         ),
         vectors=vectors,
+        generation_root=generation_root,
+        generation_files=generation_files,
     )
 
 
@@ -270,12 +334,15 @@ def build_child_response(request: ChildRequest, results: dict[str, Any]) -> byte
 __all__ = [
     "ACCEPTED_FAMILY_IDS",
     "MAX_CANONICAL_RESULT_BYTES",
+    "MAX_GENERATION_FIXTURE_BYTES",
+    "MAX_GENERATION_FIXTURE_FILES",
     "MAX_REQUEST_BYTES",
     "MAX_RESPONSE_BYTES",
     "MAX_VECTOR_INPUT_BYTES",
     "PAIR_IDS",
     "PRODUCER_SURFACES",
     "READER_SURFACES",
+    "AuthorizedGenerationFile",
     "ChildRequest",
     "ChildRequestError",
     "RequestVector",

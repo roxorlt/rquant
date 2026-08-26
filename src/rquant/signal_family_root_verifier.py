@@ -59,6 +59,7 @@ from rquant.runtime_service_entrypoint import RuntimeServiceManifest
 from rquant.signal_family_verification import (
     ALLOWED_READINESS_TRANSITIONS,
     HARNESS_IDENTITY,
+    MAX_GENERATION_FIXTURE_BYTES,
     MAX_IPC_RESPONSE_BYTES,
     OVERLAY_BUNDLE_RELATIVE_PATH,
     PAIR_IDS,
@@ -71,6 +72,7 @@ from rquant.signal_family_verification import (
     SignalFamilyAuditEvent,
     SignalFamilyAuditOutcome,
     SignalFamilyChildResultV1,
+    SignalFamilyGenerationFileV1,
     SignalFamilyReadinessDecisionV1,
     SignalFamilyReadinessState,
     SignalFamilyReasonCode,
@@ -212,6 +214,8 @@ def _rejection_events() -> Mapping[SignalFamilyReasonCode, SignalFamilyAuditEven
         ("STORE_", event.RECEIPT_APPENDED),
         ("ENTRY_", event.ENTRY_SELECTED),
         ("FULL_MANIFEST_", event.MANIFEST_VALIDATED),
+        ("GENERATION_FIXTURE_", event.MANIFEST_VALIDATED),
+        ("GENERATION_STATE_", event.AUTHORITY_REVALIDATED),
         ("VERIFICATION_MANIFEST_", event.MANIFEST_VALIDATED),
         ("TEST_MANIFEST_", event.MANIFEST_VALIDATED),
         ("VECTOR_SET_", event.MANIFEST_VALIDATED),
@@ -429,11 +433,22 @@ def build_child_request(
     run_id: str,
     test_manifest_hash: str,
     vectors: Sequence[SignalFamilyVectorV1],
+    generation_root: Path,
+    generation_files: Sequence[SignalFamilyGenerationFileV1],
 ) -> bytes:
-    """The request carries vector identity and input bytes, never an expected result."""
+    """The request carries vector identity and input bytes, never an expected result.
+
+    Ruling E-1 adds the fixture channel to this request, and it stays root-derived on both
+    halves: the generation root is the path the root itself resolved from the authority
+    snapshot, and the fixture tuple is the one the root has already checked against the full
+    manifest and the generation bytes. A vector that names a generation file outside this
+    tuple has named something no root check covers, so the child refuses it.
+    """
 
     payload = {
         "schema_version": 1,
+        "generation_files": [entry.model_dump(mode="json") for entry in generation_files],
+        "generation_root": str(generation_root),
         "run_id": run_id,
         "test_manifest_hash": test_manifest_hash,
         "vectors": [vector.model_dump(mode="json") for vector in vectors],
@@ -1269,6 +1284,29 @@ def _read_generation_file(
 ) -> bytes:
     """Resolve beneath the selected generation with no traversal and no symlink escape."""
 
+    return _open_generation_file(
+        generation_path,
+        relative,
+        max_bytes=max_bytes,
+        reason=reason,
+    ).payload
+
+
+@dataclass(frozen=True)
+class _GenerationFile:
+    payload: bytes
+    mode: int
+
+
+def _open_generation_file(
+    generation_path: Path,
+    relative: str,
+    *,
+    max_bytes: int,
+    reason: SignalFamilyReasonCode,
+) -> _GenerationFile:
+    """The same anchored walk, returning the post-open mode the fixture channel compares."""
+
     parts = _validate_relative(relative)
     directory_flags = (
         os.O_RDONLY
@@ -1308,11 +1346,91 @@ def _read_generation_file(
             payload += chunk
             if len(payload) > max_bytes:
                 raise _reject(reason, "the generation file is oversized")
-        return payload
+        return _GenerationFile(payload=payload, mode=stat.S_IMODE(observed.st_mode))
     finally:
         for descriptor in reversed(descriptors):
             with suppress(OSError):  # pragma: no cover - descriptors are freshly opened
                 os.close(descriptor)
+
+
+def _verify_generation_fixtures(
+    generation_path: Path,
+    full_manifest_entries: Mapping[str, str],
+    files: Sequence[SignalFamilyGenerationFileV1],
+) -> None:
+    """Ruling E-1: a fixture is authorized only where three independent records agree.
+
+    The immutable test manifest declares `(relative_path, sha256, size, mode)`, the full
+    generation manifest carries the same path and digest inside the source closure the
+    generation identity covers, and the bytes on disk are read through the same anchored,
+    no-follow, no-traversal walk every other generation file goes through — with the mode
+    observed *after* the open rather than promised before it. Any disagreement rejects; a
+    fixture the full manifest never listed is not generation content at all.
+    """
+
+    for declared in files:
+        opened = _open_generation_file(
+            generation_path,
+            declared.relative_path,
+            max_bytes=MAX_GENERATION_FIXTURE_BYTES,
+            reason=SignalFamilyReasonCode.GENERATION_FIXTURE_INVALID,
+        )
+        if (
+            hashlib.sha256(opened.payload).hexdigest() != declared.sha256
+            or len(opened.payload) != declared.size
+            or opened.mode != declared.mode
+        ):
+            raise _reject(
+                SignalFamilyReasonCode.GENERATION_FIXTURE_INVALID,
+                "a generation fixture does not match its immutable declaration",
+            )
+        if full_manifest_entries.get(declared.relative_path) != declared.sha256:
+            raise _reject(
+                SignalFamilyReasonCode.GENERATION_FIXTURE_INVALID,
+                "a generation fixture is absent from the full manifest source closure",
+            )
+
+
+def _generation_state_digest(
+    generation_path: Path,
+    files: Sequence[SignalFamilyGenerationFileV1],
+) -> str:
+    """Ruling E-3 / 裁决 4: what the producer state *is*, not what the child says it is.
+
+    This deliberately measures rather than validates. It is taken once before the child is
+    launched and once after it exits, and the two values must be equal; a fixture that was
+    rewritten, truncated, chmodded, or removed while the child ran therefore rejects on the
+    comparison, before the declaration-checking pass would have called it invalid. A file
+    that is gone folds in as absent rather than raising, because "it disappeared" is exactly
+    the change this has to be able to see.
+
+    The child is never told either value, which is the whole point: the constant
+    `state_unchanged` it used to report asserted stability by announcing it.
+    """
+
+    entries: list[dict[str, Any]] = []
+    for declared in files:
+        try:
+            opened: _GenerationFile | None = _open_generation_file(
+                generation_path,
+                declared.relative_path,
+                max_bytes=MAX_GENERATION_FIXTURE_BYTES,
+                reason=SignalFamilyReasonCode.GENERATION_STATE_CHANGED,
+            )
+        except SignalFamilyRootVerifierError:
+            opened = None
+        entries.append(
+            {
+                "mode": -1 if opened is None else opened.mode,
+                "present": opened is not None,
+                "relative_path": declared.relative_path,
+                "sha256": (
+                    "" if opened is None else hashlib.sha256(opened.payload).hexdigest()
+                ),
+                "size": -1 if opened is None else len(opened.payload),
+            }
+        )
+    return _canonical_sha256({"generation_files": entries})
 
 
 def _decode_hashed_document(
@@ -1802,6 +1920,8 @@ class RootVerifier:
                 run_id=run_id,
                 test_manifest_hash=plan.test_manifest_sha256,
                 vectors=plan.test_manifest.vectors,
+                generation_root=plan.generation_path,
+                generation_files=plan.test_manifest.generation_files,
             )
             raw_result = self._run_child(
                 interpreter=plan.interpreter,
@@ -1817,6 +1937,23 @@ class RootVerifier:
                 test_manifest_sha256=plan.test_manifest_sha256,
                 entry=entry,
             )
+            # Ruling E-3 / 裁决 4: state stability is *compared*, never reported. The child
+            # never sees either digest, so a surface that wrote through to the producer
+            # state it was handed is caught by the root's own arithmetic rather than by a
+            # constant the child chose to emit. It comes first among the post-child checks
+            # because it decides whether the results are about the state the policy
+            # authorized at all; coverage and completeness only matter after that.
+            if (
+                _generation_state_digest(
+                    plan.generation_path,
+                    plan.test_manifest.generation_files,
+                )
+                != plan.generation_state_digest
+            ):
+                raise _reject(
+                    SignalFamilyReasonCode.GENERATION_STATE_CHANGED,
+                    "the in-generation fixture state changed while the child ran",
+                )
             # Ruling C1 / L1208-1209: a reader surface is *the code exercised* for that
             # pair's one receipt, so a pair whose readers never ran has nothing to issue a
             # receipt about. The gate is on the child's own results, not on the manifest's
@@ -2128,6 +2265,15 @@ class RootVerifier:
             authority.profile_document_sha256,
         )
         self._validate_bindings(authority, test_manifest)
+        _verify_generation_fixtures(
+            generation,
+            authority.full_manifest_entries,
+            test_manifest.generation_files,
+        )
+        generation_state_digest = _generation_state_digest(
+            generation,
+            test_manifest.generation_files,
+        )
         participating = self._participating(authority)
         resolved = resolve_participating_service_manifests(
             authority.profile_manifests,
@@ -2165,6 +2311,8 @@ class RootVerifier:
                 entry.verifier_policy_max_age_seconds,
             ),
             interpreter=next(iter(interpreters)),
+            generation_path=generation,
+            generation_state_digest=generation_state_digest,
         )
 
     @staticmethod
@@ -2585,3 +2733,5 @@ class _GenerationPlan:
     channel_hashes: tuple[str, ...]
     freshness_seconds: float
     interpreter: Path
+    generation_path: Path
+    generation_state_digest: str

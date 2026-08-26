@@ -767,13 +767,19 @@ def build_world(
 
     source_hashes = _write_generation_sources(generation_path)
     bindings = _bindings(manifests, source_hashes)
+    generation_files: tuple[verification.SignalFamilyGenerationFileV1, ...] = ()
     if harness == "real":
         from tests.support.signal_family_harness_vectors import (
             blocked_surface_vector,
             expected_results_for,
             harness_vectors,
+            install_generation_fixtures,
         )
 
+        # The ruling E-1 fixture set is generation content like any other: it is copied in
+        # before the full manifest is built, so `full-manifest.json` covers it and the
+        # generation identity — the SHA-256 of that manifest — depends on its bytes.
+        generation_files = install_generation_fixtures(generation_path)
         vectors = harness_vectors()
         if vector_pair_ids is not None:
             vectors = tuple(
@@ -784,7 +790,13 @@ def build_world(
         # child will run. The child is never told any of this; the root compares after exit.
         policy_scratch = tmp_path / "policy-expected"
         policy_scratch.mkdir(mode=0o700, parents=True)
-        derived = dict(expected_results_for(vectors, policy_scratch))
+        derived = dict(
+            expected_results_for(
+                vectors,
+                policy_scratch,
+                generation_root=generation_path,
+            )
+        )
         if blocked_surface_id is not None:
             blocked_vector, placeholder = blocked_surface_vector(blocked_surface_id)
             vectors = tuple(
@@ -814,12 +826,13 @@ def build_world(
         expected_results=expected_results,
         profile_manifests=manifests,
         service_bindings=bindings,
+        generation_files=generation_files,
     )
 
     successor = _successor_bundle(manifests)
     overlay = _overlay_bundle(successor)
     signal_family = generation_path / "signal-family"
-    signal_family.mkdir(mode=0o755)
+    signal_family.mkdir(mode=0o755, exist_ok=True)
     successor_bytes = canonical_json_bytes(successor)
     overlay_bytes = canonical_json_bytes(overlay)
     test_manifest_bytes = verification.test_manifest_canonical_json_bytes(test_manifest)
@@ -847,6 +860,8 @@ def build_world(
         target.chmod(0o444)
 
     full_manifest_entries = dict(source_hashes)
+    for declared in generation_files:
+        full_manifest_entries[declared.relative_path] = declared.sha256
     for relative, payload in documents.items():
         full_manifest_entries[relative] = hashlib.sha256(payload).hexdigest()
     verification_manifest_sha256 = full_manifest_entries[

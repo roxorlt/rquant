@@ -18,12 +18,16 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
+import sqlite3
 import stat
 from collections.abc import Mapping, Sequence
+from contextlib import suppress
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Final
 
 from ._canonical import canonical_sha256
+from ._request import AuthorizedGenerationFile
 
 #: Vector paths are declared workspace-relative so the vector bytes never carry the child's
 #: randomly named cwd, which would make every result nondeterministic. `@workspace/` names
@@ -35,6 +39,28 @@ RUNTIME_PREFIX: Final[str] = "@runtime/"
 #: One vector may not materialize an unbounded fixture tree.
 MAX_MATERIALIZED_FILES: Final[int] = 512
 MAX_MATERIALIZED_FILE_BYTES: Final[int] = 262_144
+#: `signal_family_verification.MAX_GENERATION_FIXTURE_BYTES`.
+MAX_GENERATION_FIXTURE_BYTES: Final[int] = 1_048_576
+
+#: The exact key set of one `generation_files` declaration and one `sqlite_sources` entry.
+_GENERATION_FILE_KEYS: Final[tuple[str, ...]] = (
+    "mode",
+    "modified_at",
+    "path",
+    "sha256",
+    "source_relative_path",
+)
+_SQLITE_SOURCE_KEYS: Final[tuple[str, ...]] = ("mode", "path", "script_path")
+_STATE_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "directories",
+        "files",
+        "generation_files",
+        "serving_authorities",
+        "spool",
+        "sqlite_sources",
+    }
+)
 
 
 class WorkspaceError(ValueError):
@@ -84,12 +110,23 @@ def tree_digest(root: Path) -> str:
 class VectorWorkspace:
     """One vector's private corner of the child's cwd."""
 
-    def __init__(self, root: Path, vector_id: str) -> None:
+    def __init__(
+        self,
+        root: Path,
+        vector_id: str,
+        *,
+        generation_root: Path | None = None,
+        authorized_fixtures: Mapping[str, AuthorizedGenerationFile] | None = None,
+    ) -> None:
         resolved = Path(os.getcwd()).resolve() if root is None else Path(root).resolve()
         self.root = resolved / f"vector-{vector_id[:16]}"
         self.state = self.root / "state"
         self.scratch = self.root / "scratch"
         self.runtime = self.root / "runtime"
+        self.generation_root = None if generation_root is None else Path(generation_root)
+        self.authorized_fixtures: Mapping[str, AuthorizedGenerationFile] = (
+            {} if authorized_fixtures is None else dict(authorized_fixtures)
+        )
         for directory in (self.root, self.state, self.runtime):
             directory.mkdir(mode=0o700, parents=True, exist_ok=False)
 
@@ -139,11 +176,13 @@ class VectorWorkspace:
 
         if type(state) is not dict:
             raise WorkspaceError("vector state must be a JSON object")
-        unknown = set(state) - {"directories", "files", "serving_authorities", "spool"}
+        unknown = set(state) - _STATE_KEYS
         if unknown:
             raise WorkspaceError(f"vector state carries unknown keys: {sorted(unknown)}")
         self._make_directories(state.get("directories", []))
         self._write_files(state.get("files", []))
+        self._copy_generation_files(state.get("generation_files", []))
+        self._build_sqlite_sources(state.get("sqlite_sources", []))
 
     def _make_directories(self, declared: Any) -> None:
         if type(declared) is not list:
@@ -173,6 +212,164 @@ class VectorWorkspace:
             target.write_bytes(payload)
             target.chmod(0o600)
 
+    def _copy_generation_files(self, declared: Any) -> None:
+        """Copy each authorized in-generation fixture into this vector's own state tree.
+
+        Ruling E-1 is explicit that the child works on a copy: the generation itself is
+        read-only root-owned state the run must leave byte-identical, and a production
+        builder handed a path inside it would be reading the evidence the root is about to
+        re-digest. So every fixture is read once, re-hashed against the *root-authorized*
+        tuple rather than against the vector's own claim, and written into `state/` at the
+        declared read-only mode and modification time.
+        """
+
+        if type(declared) is not list:
+            raise WorkspaceError("vector state generation_files must be an array")
+        if len(declared) > MAX_MATERIALIZED_FILES:
+            raise WorkspaceError("vector state declares too many generation files")
+        if declared and self.generation_root is None:
+            raise WorkspaceError("this harness run carries no authorized generation root")
+        for entry in declared:
+            if type(entry) is not dict or tuple(sorted(entry)) != _GENERATION_FILE_KEYS:
+                raise WorkspaceError(
+                    "each declared generation file must be exactly "
+                    "{mode, modified_at, path, sha256, source_relative_path}"
+                )
+            relative = entry["source_relative_path"]
+            if type(relative) is not str:
+                raise WorkspaceError("generation fixture source_relative_path must be a string")
+            authorized = self.authorized_fixtures.get(relative)
+            if authorized is None:
+                raise WorkspaceError(
+                    "vector names a generation fixture the root did not authorize"
+                )
+            if entry["sha256"] != authorized.sha256 or entry["mode"] != authorized.mode:
+                raise WorkspaceError(
+                    "vector fixture declaration disagrees with the authorized fixture"
+                )
+            assert self.generation_root is not None
+            payload = _read_generation_bytes(self.generation_root, relative)
+            if (
+                hashlib.sha256(payload).hexdigest() != authorized.sha256
+                or len(payload) != authorized.size
+            ):
+                raise WorkspaceError("a generation fixture does not hash to its authorized value")
+            target = self._resolve_declared(entry["path"], base=self.state)
+            target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            target.write_bytes(payload)
+            target.chmod(authorized.mode)
+            stamp = _declared_epoch_seconds(entry["modified_at"])
+            os.utime(target, (stamp, stamp), follow_symlinks=False)
+
+    def _build_sqlite_sources(self, declared: Any) -> None:
+        """Rebuild one SQLite database from a canonical SQL text dump inside the child.
+
+        Ruling E-2: the authoritative form of a producer database fixture is its canonical
+        SQL dump, not its page bytes. The dump is what the generation carries and what the
+        root hashes, and the database only ever exists inside this vector's own workspace,
+        so no SQLite parser is pulled into the root and no page layout has to be reproduced.
+        """
+
+        if type(declared) is not list:
+            raise WorkspaceError("vector state sqlite_sources must be an array")
+        if len(declared) > MAX_MATERIALIZED_FILES:
+            raise WorkspaceError("vector state declares too many sqlite sources")
+        for entry in declared:
+            if type(entry) is not dict or tuple(sorted(entry)) != _SQLITE_SOURCE_KEYS:
+                raise WorkspaceError(
+                    "each declared sqlite source must be exactly {mode, path, script_path}"
+                )
+            mode = entry["mode"]
+            if type(mode) is not int or type(mode) is bool or not 0 <= mode <= 0o777:
+                raise WorkspaceError("declared sqlite source mode must be a POSIX mode")
+            script = self._resolve_declared(entry["script_path"], base=self.state)
+            target = self._resolve_declared(entry["path"], base=self.state)
+            if target.exists():
+                raise WorkspaceError("a declared sqlite source would overwrite an existing file")
+            try:
+                payload = script.read_text(encoding="utf-8")
+            except OSError as exc:
+                raise WorkspaceError("a declared sqlite source script is unavailable") from exc
+            target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            connection = sqlite3.connect(target, isolation_level=None)
+            try:
+                connection.executescript(payload)
+            except sqlite3.Error as exc:
+                raise WorkspaceError("a declared sqlite source script is not replayable") from exc
+            finally:
+                connection.close()
+            target.chmod(mode)
+
+
+def _declared_epoch_seconds(value: Any) -> int:
+    """One declared RFC 3339 UTC instant, as whole seconds since the epoch.
+
+    The modification time is part of the declaration because production readers check it:
+    `runtime_routing_policy` refuses a frozen policy whose mtime is in the future relative
+    to the observation instant, and a file this child just wrote is always newer than the
+    vector's frozen `observed_at` unless the vector says what it should be.
+    """
+
+    if type(value) is not str:
+        raise WorkspaceError("a declared modification time must be an RFC 3339 string")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise WorkspaceError("a declared modification time is not RFC 3339") from exc
+    if parsed.tzinfo is None:
+        raise WorkspaceError("a declared modification time must carry an offset")
+    return int(parsed.timestamp())
+
+
+def _read_generation_bytes(root: Path, relative: str) -> bytes:
+    """Open one generation file with no traversal, no symlink, and a bounded read."""
+
+    parts = relative.split("/")
+    if not relative or relative.startswith("/") or any(part in {"", ".", ".."} for part in parts):
+        raise WorkspaceError("a generation fixture path must be a normalized relative path")
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    descriptors: list[int] = []
+    try:
+        try:
+            parent = os.open(root, directory_flags)
+        except OSError as exc:
+            raise WorkspaceError("the generation root is unavailable to the child") from exc
+        descriptors.append(parent)
+        for component in parts[:-1]:
+            try:
+                child = os.open(component, directory_flags, dir_fd=parent)
+            except OSError as exc:
+                raise WorkspaceError("a generation fixture directory is unavailable") from exc
+            descriptors.append(child)
+            parent = child
+        try:
+            descriptor = os.open(
+                parts[-1],
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=parent,
+            )
+        except OSError as exc:
+            raise WorkspaceError("a generation fixture is unavailable") from exc
+        descriptors.append(descriptor)
+        observed = os.fstat(descriptor)
+        if not stat.S_ISREG(observed.st_mode) or observed.st_size > MAX_GENERATION_FIXTURE_BYTES:
+            raise WorkspaceError("a generation fixture is not a bounded regular file")
+        payload = b""
+        while chunk := os.read(descriptor, 65536):
+            payload += chunk
+            if len(payload) > MAX_GENERATION_FIXTURE_BYTES:
+                raise WorkspaceError("a generation fixture is oversized")
+        return payload
+    finally:
+        for descriptor in reversed(descriptors):
+            with suppress(OSError):  # pragma: no cover - descriptors are freshly opened
+                os.close(descriptor)
+
 
 def require_declared_sequence(value: Any, *, field: str) -> Sequence[Any]:
     if type(value) is not list:
@@ -181,6 +378,7 @@ def require_declared_sequence(value: Any, *, field: str) -> Sequence[Any]:
 
 
 __all__ = [
+    "MAX_GENERATION_FIXTURE_BYTES",
     "MAX_MATERIALIZED_FILES",
     "VOLATILE_SUFFIXES",
     "MAX_MATERIALIZED_FILE_BYTES",
