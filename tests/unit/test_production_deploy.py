@@ -3484,6 +3484,70 @@ class TestR07Bootstrap:
         assert result.r07_gate == "recorded_intent"
         assert _audit_records(recorded)[-1]["r07_gate"] == "recorded_intent"
 
+    def test_recovery_audit_records_the_replayed_intent_provenance(self, tmp_path: Path) -> None:
+        """Codex round-2 ruling 8: recovery must name the exact intent it replayed.
+
+        ``r07_gate=recorded_intent`` only says the Release A/B table was skipped. The audit
+        row also has to identify *which* persisted intent was replayed and in which
+        direction, so a reader can prove after the fact that no new pair was chosen.
+        """
+
+        authority = FakeGenerationAuthority()
+        authority.begin_deployment_intent(
+            previous_sha=_sha("a"),
+            target_sha=_sha("b"),
+            target_ref="v0.13.2",
+            changed_files=("src/rquant/preflight.py",),
+            restart_services=(),
+            active_services=(),
+            active_timers=(),
+            marker_generation="marker-a",
+        )
+        assert authority.intent is not None
+        operation_id = authority.intent.operation_id
+        responses = _base_responses()
+        responses[("git", "rev-parse", "HEAD")] = (0, f"{_sha('b')}\n")
+        baseline = _config(tmp_path)
+        recorded = DeployConfig(
+            **{**baseline.__dict__, "recovery_action": "rollback", "target": _sha("a")}
+        )
+
+        result = deploy(
+            recorded,
+            runner=FakeRunner(responses),
+            generation_authority=authority,
+            generation_finalizer=FakeGenerationFinalizer(),
+            r07_evidence_gate=_r07_gate(tmp_path),
+        )
+
+        assert result.status == "recovered"
+        record = _audit_records(recorded)[-1]
+        assert record["r07_gate"] == "recorded_intent"
+        assert record["recovery_action"] == "rollback"
+        assert record["recovery_intent_operation_id"] == operation_id
+        assert record["recovery_intent_stage"] == "recovery_started"
+        assert record["recovery_intent_target_ref"] == "v0.13.2"
+        assert record["previous_sha"] == _sha("a")
+        assert record["target_sha"] == _sha("a")
+
+    def test_non_recovery_audit_rows_carry_no_recovery_provenance(self, tmp_path: Path) -> None:
+        """An ordinary deployment never claims a replayed intent."""
+
+        config = _config(tmp_path)
+        runner = FakeRunner(_base_responses())
+
+        deploy(
+            config,
+            runner=runner,
+            generation_authority=FakeGenerationAuthority(),
+            generation_finalizer=FakeGenerationFinalizer(),
+            r07_evidence_gate=_r07_gate(tmp_path),
+        )
+
+        record = _audit_records(config)[-1]
+        assert record["status"] == "deployed"
+        assert not any(key.startswith("recovery_") for key in record)
+
     def test_real_checkout_stays_at_head_when_the_target_declares_no_policy(
         self,
         tmp_path: Path,
