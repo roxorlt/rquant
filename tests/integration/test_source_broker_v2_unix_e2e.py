@@ -424,6 +424,22 @@ def _start_server(script: Path, endpoint: SocketEndpointPolicy) -> subprocess.Po
     raise AssertionError(f"SourceBroker v2 server did not start\n{stdout!r}\n{stderr!r}")
 
 
+def _assert_only_probe_audit_on_stderr(raw: bytes) -> None:
+    """Fail on anything the daemon printed except its own security audit lines.
+
+    `_start_server`'s readiness probe opens a connection and closes it without
+    sending a frame, and the service audits every unframed connection as a
+    transport event. Those lines are expected output; a traceback or any other
+    chatter is not.
+    """
+    residual = [
+        line
+        for line in raw.decode("utf-8", "replace").splitlines()
+        if "source_broker_v2_security_event" not in line
+    ]
+    assert residual == [], residual
+
+
 def _endpoint_accepts_probe_connection(endpoint: SocketEndpointPolicy) -> bool:
     if not endpoint.path.exists():
         return False
@@ -930,7 +946,7 @@ def test_linux_kill_restart_after_provider_start_requires_reconcile_not_second_d
     first_stdout, first_stderr = first.communicate(timeout=3)
     assert first.returncode == -signal.SIGKILL
     assert first_stdout == b""
-    assert first_stderr == b""
+    _assert_only_probe_audit_on_stderr(first_stderr)
     blocked_stdout, blocked_stderr = blocked.communicate(timeout=3)
     assert blocked.returncode == 7, (blocked_stdout, blocked_stderr)
     assert blocked_stdout == b""
