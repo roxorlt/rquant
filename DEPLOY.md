@@ -35,12 +35,19 @@ Codex 最终验收。**尚未 merge、尚未打 tag、尚未部署**，云服务
    若从 `/home/lighthouse/rquant/` 以 root 运行，root 就会执行 lighthouse 可写的代码。
    policy / harness / store 的安装是**单独授权的事务**，不能借受控发布器绕过。
 8. **R07 证据缓存命中也需要网络与 token**：缓存命中不再跳过 GitHub run 身份核验，部署器仍会
-   用 `RQUANT_GITHUB_EVIDENCE_TOKEN` 查一次 workflow runs 并要求与缓存条目自称的
-   `workflow_run_id` / `run_attempt` 完全一致，因此**离线部署不可行**；GitHub 不可达时结果是
-   blocked，不降级放行。缓存目录及其全部祖先必须由部署身份（lighthouse）拥有、无 group/other
-   写位、无 symlink，否则同样 blocked。GitHub 的 workflow run 历史保留 400 天（artifact 默认
-   90 天过期，两者独立），所以缓存在 artifact 过期后仍可核验；但 commit 超过 400 天后 run 记录
-   被归档删除，该 commit 的缓存条目将永久无法核验，回滚到那么早的目标只能重新跑一次 CI。
+   用 `RQUANT_GITHUB_EVIDENCE_TOKEN` 查一次 workflow runs 解析出当前的 `workflow_run_id` /
+   `run_attempt`，因此**离线部署不可行**；GitHub 不可达、token 缺失、该 commit 没有唯一一个
+   push-main run 时结果都是 blocked，不降级放行。缓存目录及其全部祖先必须由 root 或部署身份（lighthouse）拥有、无
+   group/other 写位、无 symlink；缓存条目本身还必须由部署身份拥有、单链接、不超过 64 KiB，
+   否则同样 blocked。
+   **重跑 attempt 后旧缓存自动失效**：在 main 上对已部署 commit 点 Re-run all jobs 会产生新
+   attempt，GitHub 的 run 列表只返回当前 attempt，旧缓存条目从此对不上。这种「身份不一致」不
+   算失败，部署器会当作 cache miss 重新下载当前 attempt 的 artifact、全量重验后原子覆盖旧条目，
+   无需人工 `rm` 缓存文件。
+   **400 天以上历史不可核验 → blocked，且无补救**：GitHub 的 workflow run 历史保留 400 天
+   （artifact 默认 90 天过期，两者独立设置），所以缓存在 artifact 过期后仍可核验；但 commit 超过
+   400 天后 run 记录被归档删除，重下载与重核验都不再可能，该目标只能先在 main 上重新触发一次
+   CI（或用一个更新的等价 commit）才能部署。
 9. **规格 errata 未决**：family taxonomy 单元素域、bundle/overlay identity 语义、
    producer/consumer id 域、profile-service-manifests 文档绑定、`strategy-router` /
    `strategy-shadow` 五个 surface 的向量语义、WP5 Q1–Q4、wire schema 在 3.11/3.12 的可见性、

@@ -972,10 +972,15 @@ round-2 order 2026-08-25, item P1-2: the cache is not a trusted input, because t
 user owns that directory and can write a plausible entry itself. A cache hit re-resolves the one
 push `main` run identity and highest successful attempt from the fixed channel and binds the
 retained bytes to that pair exactly as a fresh download is bound; GitHub retains workflow run
-history for 400 days, well beyond the 90-day artifact expiry, and an unreachable channel, an
-unknown run, a superseded attempt, or an ambiguous run blocks rather than falls back. A cache
-entry older than that run history is unverifiable and therefore blocks: a rollback that far back
-re-runs the channel instead of trusting retained bytes. The entry and every ancestor from the trusted root
+history for 400 days, well beyond the 90-day artifact expiry. Not knowing the answer blocks: an
+unreachable channel, a missing token, no push `main` run for the target, and an ambiguous second
+run all refuse, and so does an unreadable, unsafely owned, or otherwise unbound entry. Knowing an
+answer the entry disagrees with does not block: a retained entry naming a run or attempt the
+channel no longer resolves — the shape a re-run of all jobs leaves behind — is stale rather than
+false, so the deployer treats it as a cache miss, downloads the evidence the channel resolves
+now, verifies it in full, and atomically replaces the entry. A cache entry older than the run
+history is unverifiable and therefore blocks: a rollback that far back re-runs the channel
+instead of trusting retained bytes. The entry and every ancestor from the trusted root
 — `/` under `linux-production`, which never exempts a sticky directory — are walked without
 following symlinks and must be a directory or regular file owned by the expected deployment
 identity, with no group or other write bit, exactly one link, and at most 64 KiB. The entry
