@@ -43,7 +43,11 @@
 
 - **spool ticket 崩溃与 orphan 矩阵（WP5）**：`tests/support/signal_route_spool_crash_matrix.py` 以合成
   状态机固定 two-slot 单记录矩阵的每一个崩溃点与 orphan 行为，并把观察到的 v2 dialect 事实绑定到未被
-  改动的原语上；不发生 SQLite migration。
+  改动的原语上；不发生 SQLite migration。**证据定性（Codex 第二轮裁决 5）**：该矩阵是**合成内存状态
+  机**产出的 Phase A 证据，只证明冻结契约本身，**不构成真实持久 writer 的崩溃/持久化证据**——Phase A
+  根本没有 current-family durable writer。`frozen-v2-observed` dialect 记录的是 v2 的观察事实（identical
+  retry 不二次 fsync 记录目录、byte conflict 不写 conflict audit），不是 v2 的合规状态；这两条义务只对
+  未来的 v3-only 原语成立。
 
 ### Changed
 

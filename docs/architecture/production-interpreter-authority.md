@@ -588,6 +588,15 @@ The same directory-fsync obligation applies whether retry observed a freshly cre
 identical pre-existing target.
 
 This is a frozen later-writer contract and crash red test, not a Phase A implementation grant.
+Amended per Codex round-2 order 2026-08-25, ruling 5: the two obligations above —
+re-fsyncing the records directory after an identical post-link retry, and appending conflict
+audit evidence before rejecting differing bytes — are **v3-only**. The untouched v2
+`_immutable_write_at` does neither, and that is its frozen *observed* semantics, not a v2
+compliance claim; v2 keeps only the frozen observation semantics and its bytes do not move.
+The Phase A evidence for the v3 obligations is a **synthetic in-memory state machine**
+(`tests/support/signal_route_spool_crash_matrix.py`, dialects `frozen-v2-observed` and
+`v3-spec`). It is evidence about the frozen contract only and MUST NOT be reported as
+evidence about a real durable current-family writer, because Phase A has none.
 Phase A synthetic fixture construction remains read-only/in-memory and cannot import, call, expose,
 or make this primitive reachable through `rquant.runtime_service_main.build_builtin_registry`, its
 builtin factory, any production builder, or any runtime capability. No production v3 writer exists
@@ -1692,8 +1701,8 @@ The planned red-test matrix is exact:
 | IDs | Planned test file/evidence | Required assertions |
 |---|---|---|
 | `RESET-R07-P1` | `tests/fixtures/signal_route_spool_v2_differential/manifest.json`; `tests/unit/test_signal_route_spool_v2_differential.py` | frozen valid and invalid corpus proves untouched v2 bytes, `ensure_ascii=True`, hashes, models, and public error category/sequence before and after dispatcher introduction |
-| `RESET-R07-P1`, `RESET-R07-P2` | `tests/unit/test_current_signal_route_spool_record_v3.py` | exact `E`/`R`/outer bytes and hashes, strict JSON, exact types, all-v2 and one-way mixed chain, v3-first production rejection, isolated decoder-only all-v3 fixture, pointer neutrality, and synthetic crash/orphan/retry state-machine cases without a durable writer |
-| `RESET-R07-P2-01` | future `tests/unit/test_current_signal_route_spool_v3_publication_contract.py` in the separately authorized writer tranche | v3 primitive is separate from byte-identical v2 `_immutable_write_at`; crash after link and before directory fsync makes identical retry fsync the records directory again before pointer work; differing bytes reject before pointer mutation; Phase A/builders cannot import or reach the primitive |
+| `RESET-R07-P1`, `RESET-R07-P2` | `tests/unit/test_signal_route_spool_r07_v3.py`; `tests/unit/test_signal_route_spool_r07_v3_fixtures.py` (Amended per Codex round-2 order 2026-08-25, ruling 5: the planned name `test_current_signal_route_spool_record_v3.py` was never the delivered file name) | exact `E`/`R`/outer bytes and hashes, strict JSON, exact types, all-v2 and one-way mixed chain, v3-first production rejection, isolated decoder-only all-v3 fixture, pointer neutrality, and synthetic crash/orphan/retry state-machine cases without a durable writer |
+| `RESET-R07-P2-01` | Amended per Codex round-2 order 2026-08-25, ruling 5: no file of that name exists or may be created in Phase A. The frozen v3-only contract is asserted today as the `v3-spec` dialect of the synthetic model in `tests/support/signal_route_spool_crash_matrix.py`, exercised from `tests/unit/test_signal_route_spool_r07_v3.py`; the real publication-contract test belongs to the separately authorized writer tranche and its file name is not fixed here | v3 primitive is separate from byte-identical v2 `_immutable_write_at`; crash after link and before directory fsync makes identical retry fsync the records directory again before pointer work; differing bytes reject before pointer mutation; Phase A/builders cannot import or reach the primitive |
 | `R07-DR-P1-01` | `tests/unit/test_signal_family_differential_gate.py::TestCompleteRepoDiff`; `tests/fixtures/r07_differential_gate/policy-v1.json` | full raw Git diff covers every path, add/modify/delete, mode change, and rename-as-delete-plus-add; unlisted docs/tests/workflows/dependencies/scripts/deploy changes and declaration AST drift block |
 | `R07-DR-P1-02` | `tests/unit/test_signal_family_differential_boundaries.py` | every inventory row's declared direct/stored-byte/batch form uses exact scalar/bytes/composite fixtures, exact args/kwargs, expected failure, guards, and unchanged database/filesystem/outbox/pointer snapshots; cyclic/malformed/composite drift and early rejection block |
 | `R07-DR-P1-03` | `tests/unit/test_signal_family_differential_gate.py::TestRootSnapshots`; `tests/unit/test_signal_family_differential_gate.py::TestForbiddenDefinitions` | all ten root signatures/exports/source ASTs and the static forbidden-definition universe pass without import, construction, closure traversal, or bytecode analysis; every forbidden definition/alias/export/key blocks |
