@@ -138,6 +138,35 @@ def _child_startups(count: float) -> float:
     return _observe(_CHILD_STARTUP_SECONDS * count)
 
 
+def _probe_ceiling(timeout_seconds: float) -> float:
+    """The ceiling a standalone probe declares: its timeout plus one child.
+
+    Read from the worker's own budget rather than copied as a literal. The
+    subject of the cases that use it is "the probe is bounded and reaps what it
+    started", and the bound they are entitled to assert is exactly the one the
+    module publishes - a copied number goes stale the moment the published one
+    is resized, which is what just happened to it.
+    """
+    from rquant.lab_worker import _AUTHORITY_SPAWN_ALLOWANCE_MICROSECONDS
+
+    return timeout_seconds + _AUTHORITY_SPAWN_ALLOWANCE_MICROSECONDS / 1_000_000
+
+
+def _deadline_reachable_in(count: float) -> timedelta:
+    """A ResearchRunSpec deadline a run can actually *reach* on this host.
+
+    For the cases that force the deadline with an injected clock at an exact
+    point - after execute, mid bundle write, at the atomic rename - the literal
+    is not the subject; the injection is. All the literal has to do is leave
+    enough real time to get there, and getting there costs a shard child
+    start-up. Written as one flat second it was a fast machine's number, and on
+    a slower host the run hit the real deadline while the child was still
+    importing, so the tick came back 'stopped' instead of producing the failure
+    the injection exists to produce.
+    """
+    return timedelta(seconds=_child_startups(count))
+
+
 # The shared temporary root the wire-session tests bind AF_UNIX sockets under.
 # "/tmp" resolves to the macOS spelling of that directory and stays "/tmp" on
 # Linux; the tests used to hard-code the macOS path, which Linux does not have.
@@ -1439,7 +1468,7 @@ def test_rejected_resource_authority_state_cannot_admit_worker_execution(
 
 
 @pytest.mark.parametrize("hook", ("spawn_probe_provider", "accept_probe_state"))
-@pytest.mark.parametrize("termination", ("stop", "deadline-800ms"))
+@pytest.mark.parametrize("termination", ("stop", "deadline"))
 def test_snapshot_hook_blocking_is_bounded_before_adapter_execution(
     tmp_path: Path,
     hook: Literal["spawn_probe_provider", "accept_probe_state"],
@@ -1448,8 +1477,14 @@ def test_snapshot_hook_blocking_is_bounded_before_adapter_execution(
     from rquant.runtime_resource_admission import SQLiteResourceReservationStore
 
     spec = _nshape_compare_spec(hold_days=(1,))
-    if termination == "deadline-800ms":
-        spec = spec.model_copy(update={"deadline": NOW + timedelta(milliseconds=800)})
+    # A deadline can only bound the blocked hook once the hook is running, and
+    # the hook runs in a spawned probe child. The literal eight hundred
+    # milliseconds this used to carry is shorter than one child start-up on a
+    # slow host, so the child was killed mid-import and never wrote the entry
+    # marker the case waits for.
+    spec_deadline = _deadline_reachable_in(1)
+    if termination == "deadline":
+        spec = spec.model_copy(update={"deadline": NOW + spec_deadline})
     claim = _claim(spec)
     claims = LabClaimSpool(tmp_path / "claims")
     registry = RecordingRegistry()
@@ -1498,7 +1533,10 @@ def test_snapshot_hook_blocking_is_bounded_before_adapter_execution(
         assert int(hook_pid_path.read_text(encoding="ascii")) != os.getpid()
         if termination == "stop":
             worker.request_stop()
-        runner.join(timeout=_observe(1.6))
+        termination_budget = _observe(1.6) + (
+            0.0 if termination == "stop" else spec_deadline.total_seconds()
+        )
+        runner.join(timeout=termination_budget)
         bounded = not runner.is_alive()
         elapsed = time.monotonic() - started
     finally:
@@ -1507,7 +1545,7 @@ def test_snapshot_hook_blocking_is_bounded_before_adapter_execution(
         runner.join(timeout=_observe(2))
 
     assert bounded
-    assert elapsed < _observe(1.6)
+    assert elapsed < termination_budget
     assert failures == []
     assert outcomes[0].status == "stopped"
     assert registry.executions == 0
@@ -4069,9 +4107,13 @@ def test_child_result_with_blocking_reduce_is_never_pickled_and_remains_bounded(
 ) -> None:
     reduce_marker = tmp_path / "malicious-result.reduce"
     registry = MaliciousResultRegistry(reduce_marker=reduce_marker)
-    spec = _nshape_compare_spec(hold_days=(1,)).model_copy(
-        update={"deadline": NOW + timedelta(milliseconds=800)}
-    )
+    # The deadline is what bounds the blocking __reduce__, so the shard child
+    # has to be up and executing before it fires; eight hundred milliseconds is
+    # less than one child start-up on a slow host and the tick came back
+    # 'stopped' from the deadline instead of 'failed' from the adversarial
+    # result.
+    spec_deadline = _deadline_reachable_in(1)
+    spec = _nshape_compare_spec(hold_days=(1,)).model_copy(update={"deadline": NOW + spec_deadline})
     claims = LabClaimSpool(tmp_path / "claims")
     claims.publish(_claim(spec))
     worker = _worker(tmp_path, claims=claims, registry=registry)
@@ -4081,7 +4123,7 @@ def test_child_result_with_blocking_reduce_is_never_pickled_and_remains_bounded(
     elapsed = time.monotonic() - started
 
     assert result.status == "failed"
-    assert elapsed < _observe(1.5)
+    assert elapsed < spec_deadline.total_seconds() + _observe(0.7)
     assert registry.executions == 1
     assert not reduce_marker.exists()
 
@@ -6768,7 +6810,7 @@ def test_resource_probe_timeout_kills_spawned_descendant_process_group(tmp_path:
             worker._bounded_resource_snapshot(timeout_seconds=1.5)
         elapsed = time.monotonic() - started
 
-        assert elapsed < _observe(2.2)
+        assert elapsed < _probe_ceiling(1.5) + _observe(0.7)
         assert probe_pid_path.is_file()
         assert descendant_pid_path.is_file()
         _assert_process_gone(int(probe_pid_path.read_text(encoding="ascii")))
@@ -10986,7 +11028,7 @@ def test_worker_deadline_before_execute_fails_without_running_shard(tmp_path: Pa
 def test_worker_deadline_after_execute_prevents_fence_and_seal(tmp_path: Path) -> None:
     deadline_reached = multiprocessing.get_context("spawn").Value("b", False)
     spec = _nshape_compare_spec(hold_days=(1,)).model_copy(
-        update={"deadline": NOW + timedelta(milliseconds=1000)}
+        update={"deadline": NOW + _deadline_reachable_in(2)}
     )
 
     claims = LabClaimSpool(tmp_path / "claims")
@@ -11019,7 +11061,7 @@ def test_worker_deadline_during_bundle_write_prevents_atomic_seal(
 ) -> None:
     clock = [NOW]
     spec = _nshape_compare_spec(hold_days=(1,)).model_copy(
-        update={"deadline": NOW + timedelta(milliseconds=1000)}
+        update={"deadline": NOW + _deadline_reachable_in(2)}
     )
     claims = LabClaimSpool(tmp_path / "claims")
     reports = LabReportSpool(tmp_path / "reports")
@@ -11086,7 +11128,7 @@ def test_deadline_triggered_at_atomic_rename_rolls_back_before_success(
 
     clock = [NOW]
     spec = _nshape_compare_spec(hold_days=(1,)).model_copy(
-        update={"deadline": NOW + timedelta(milliseconds=1000)}
+        update={"deadline": NOW + _deadline_reachable_in(2)}
     )
     claims = LabClaimSpool(tmp_path / "claims")
     reports = LabReportSpool(tmp_path / "reports")

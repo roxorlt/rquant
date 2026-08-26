@@ -162,13 +162,32 @@ _LIVE_TRADING_SESSIONS = frozenset(
 )
 _CHILD_TERMINATE_GRACE_MICROSECONDS = 50_000
 _CHILD_OUTCOME_EXIT_GRACE_MICROSECONDS = 250_000
-_ISOLATION_READY_TIMEOUT_MICROSECONDS = 2_000_000
+# Every child this module starts is a `spawn` child: a fresh CPython that has
+# to import `rquant.lab_worker` - pandas, pyarrow, duckdb, the whole rquant
+# surface - before it can connect back.  That import is a property of the host
+# rather than of the work the child then does, and it is the largest single
+# term in every start-up budget below, so both budgets are named as one fact
+# instead of guessed twice.
+#
+# Measured with the child stamping CLOCK_MONOTONIC on entry and again after the
+# import (CI diagnostic job on 017d808, artifact `diag-x64-probe`):
+# 0.02s boot + 0.46s import = 0.48s on the development Mac, but
+# 0.04s boot + 1.50s import = 1.55s on an *idle* ubuntu-24.04 x64 runner - and
+# a runner that is simultaneously executing a shard pays more.  The same run
+# timed a complete `_start_wire_child` authority round trip at 1.56s there
+# against 0.50s here.  The previous 750ms allowance and 2s readiness timeout
+# were the Mac numbers with a little margin; on the runner they sat below the
+# real cost, so `listener.accept` timed out during boot, every authority stage
+# failed before it ran, and `run_once()` returned 'stopped' with no test-side
+# window involved at all.  2.5x the measured runner cost is the floor now.
+_CHILD_INTERPRETER_START_MICROSECONDS = 4_000_000
+_ISOLATION_READY_TIMEOUT_MICROSECONDS = _CHILD_INTERPRETER_START_MICROSECONDS
 _PROCESS_CLEANUP_RETRIES = 3
 _RESOURCE_RESERVATION_LOCK_WAIT_MAX_MICROSECONDS = 50_000
 _RESOURCE_AUTHORITY_POLL_MICROSECONDS = 10_000
 _MAX_CONTROL_WIRE_BYTES = 1024 * 1024
 _MAX_SHARD_RESULT_WIRE_BYTES = MAX_RESULT_WIRE_BYTES
-_AUTHORITY_SPAWN_ALLOWANCE_MICROSECONDS = 750_000
+_AUTHORITY_SPAWN_ALLOWANCE_MICROSECONDS = _CHILD_INTERPRETER_START_MICROSECONDS
 _PRESTART_AUTHORITY_CLEANUP_RESERVE_MICROSECONDS = 250_000
 _AUTHORITY_CHILD_CLEANUP_BUDGET_MICROSECONDS = 250_000
 _WIRE_CHALLENGE = b"#CHALLENGE#"
@@ -2900,18 +2919,33 @@ class LabWorker:
         self.lease_extension_seconds = lease_extension_seconds
         self.poll_interval_microseconds = poll_interval_ms * 1_000
         self.receipt_timeout_microseconds = receipt_timeout_microseconds
+        # One authority round trip: start the child, then let the provider run
+        # for its own timeout.  Every admission budget below is a whole number
+        # of these, because every one of them pays for a child before it pays
+        # for any work.  They used to be written as `min(probe timeout, spawn
+        # allowance)` or as `probe timeout * 2 + one allowance`, both of which
+        # read as round trips only while the two terms are the same size; once
+        # the allowance was sized against a real host it was the smaller term
+        # that got reserved, which is not enough to start anything.
+        self.authority_round_trip_budget_microseconds = (
+            resource_probe_timeout_microseconds + _AUTHORITY_SPAWN_ALLOWANCE_MICROSECONDS
+        )
         # This is deliberately only the pre-publication admission budget.  Receipt
-        # convergence and background cleanup have their own bounded phases.
+        # convergence and background cleanup have their own bounded phases.  Two
+        # round trips fit in it: the initial admission and the recheck.  The old
+        # form left the second one nowhere to run on a host where starting a
+        # child costs more than the probe timeout, so
+        # `_remaining_prepublication_budget_microseconds` raised and the tick
+        # came back 'stopped' before the shard was ever spawned.
         self.prepublication_admission_budget_microseconds = max(
             receipt_timeout_microseconds * 2,
-            resource_probe_timeout_microseconds * 2 + _AUTHORITY_SPAWN_ALLOWANCE_MICROSECONDS,
+            self.authority_round_trip_budget_microseconds * 2,
         )
         # The post-seal check has its own rollback-safety phase.  It must be
-        # long enough to acquire fresh evidence, but cannot reopen a full
-        # pre-publication-sized wait after the bundle is already sealed.
-        self.post_publish_rollback_safety_budget_microseconds = min(
-            resource_probe_timeout_microseconds,
-            _AUTHORITY_SPAWN_ALLOWANCE_MICROSECONDS,
+        # long enough to acquire fresh evidence - one round trip - but cannot
+        # reopen a full pre-publication-sized wait after the bundle is sealed.
+        self.post_publish_rollback_safety_budget_microseconds = (
+            self.authority_round_trip_budget_microseconds
         )
         self.quarantine_reconcile_interval_microseconds = quarantine_reconcile_interval_microseconds
         self._uses_local_receipt_waiter = receipt_waiter is None
@@ -4582,10 +4616,7 @@ class LabWorker:
         )
         if remaining_microseconds is None:  # pragma: no cover - guarded above
             return self.resource_probe_timeout_microseconds
-        final_probe_reserve_microseconds = min(
-            self.resource_probe_timeout_microseconds,
-            _AUTHORITY_SPAWN_ALLOWANCE_MICROSECONDS,
-        )
+        final_probe_reserve_microseconds = self.authority_round_trip_budget_microseconds
         available_microseconds = remaining_microseconds - final_probe_reserve_microseconds
         if available_microseconds <= 0:
             raise TimeoutError("pre-publication admission deadline has no final authority reserve")
@@ -4917,10 +4948,7 @@ class LabWorker:
             operation="resource reservation transaction",
         )
         if remaining_tick_budget is not None:
-            remaining_tick_budget -= min(
-                self.resource_probe_timeout_microseconds,
-                _AUTHORITY_SPAWN_ALLOWANCE_MICROSECONDS,
-            )
+            remaining_tick_budget -= self.authority_round_trip_budget_microseconds
         transaction_timeout_microseconds = min(
             operation_timeout_microseconds,
             remaining_tick_budget
@@ -5089,7 +5117,12 @@ class LabWorker:
         *,
         timeout_microseconds: int,
         not_after_monotonic_microseconds: int | None = None,
-        include_spawn_allowance: bool = False,
+        # A standalone probe has not paid for the child yet, so `timeout` means
+        # here what it means everywhere else in this module: the provider's own
+        # budget, with the interpreter start on top.  Defaulting it off made
+        # `resource_probe_timeout_seconds` mean two different things at two
+        # call sites, and the narrower one could not cover a child start.
+        include_spawn_allowance: bool = True,
     ) -> ResourceSnapshot:
         result = self._run_authority_stage(
             operation="snapshot",
