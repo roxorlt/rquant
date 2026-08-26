@@ -166,8 +166,15 @@ def recompute_expectation_set() -> Outcome:
 
     The vector set is host-scoped, and deliberately so: the three `strategy-shadow` readers
     are reachable only where their production reader path is, so this reports ten vectors off
-    Linux and thirteen on it. What it enforces is the same either way — the derivation must
-    reproduce, or the policy it feeds cannot be trusted.
+    Linux and thirteen on it.
+
+    Reproducibility is asserted *within one generation*, which is the only place it can mean
+    anything. The `strategy-shadow` fixture is signed by a keypair minted for that generation
+    and discarded with it, so two independently built generations legitimately carry
+    different public keys and therefore different vectors — that is the point of never
+    checking a key in. What must hold, and what is checked here, is that a policy author who
+    derives the expected results twice against the generation they are about to sign gets the
+    same answer both times.
     """
 
     sys.path.insert(0, str(REPOSITORY_ROOT))
@@ -183,31 +190,32 @@ def recompute_expectation_set() -> Outcome:
         install_generation_fixtures,
     )
 
-    derived: list[tuple[str, str]] = []
-    vectors = ()
-    for attempt in range(2):
-        scratch = _private_scratch(f"rquant-recompute-expected-{attempt}-")
-        try:
-            generation = scratch / "generation"
-            generation.mkdir(mode=0o700)
-            installed = install_generation_fixtures(generation)
-            vectors = harness_vectors(installed.shadow_descriptor)
-            results = expected_results_for(vectors, scratch, installed=installed)
-        finally:
-            _remove_sealed_tree(scratch)
-        expected = tuple(
-            SignalFamilyExpectedResultV1(
-                vector_id=vector.vector_id,
-                canonical_result_sha256=hashlib.sha256(
-                    results[vector.vector_id].encode("utf-8")
-                ).hexdigest(),
+    staging = _private_scratch("rquant-recompute-expected-")
+    try:
+        generation = staging / "generation"
+        generation.mkdir(mode=0o700)
+        installed = install_generation_fixtures(generation)
+        vectors = harness_vectors(installed.shadow_descriptor)
+        derived: list[tuple[str, str]] = []
+        for attempt in range(2):
+            workspace = staging / f"derive-{attempt}"
+            workspace.mkdir(mode=0o700)
+            results = expected_results_for(vectors, workspace, installed=installed)
+            expected = tuple(
+                SignalFamilyExpectedResultV1(
+                    vector_id=vector.vector_id,
+                    canonical_result_sha256=hashlib.sha256(
+                        results[vector.vector_id].encode("utf-8")
+                    ).hexdigest(),
+                )
+                for vector in vectors
             )
-            for vector in vectors
-        )
-        derived.append((vector_set_hash(vectors), expected_result_set_hash(expected)))
+            derived.append((vector_set_hash(vectors), expected_result_set_hash(expected)))
+    finally:
+        _remove_sealed_tree(staging)
     if derived[0] != derived[1]:
         raise SystemExit(
-            "the Phase C expectation set is not reproducible: "
+            "the Phase C expectation set is not reproducible within one generation: "
             f"{derived[0]} then {derived[1]}"
         )
     vectors_hash, results_hash = derived[0]
