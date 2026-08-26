@@ -41,6 +41,7 @@ from rquant.release_generation import (
     validate_lab_handoff_supersede_chain,
 )
 from rquant.strict_json import canonical_json_bytes
+from tests.support.verified_system_interpreter import materialize_system_interpreter
 
 _ORIGINAL_OS_WALK = os.walk
 
@@ -708,8 +709,9 @@ def _generation(tmp_path: Path) -> tuple[Path, Path, str, Path]:
     if library.exists():
         (venv / "lib").mkdir()
         shutil.copy2(library, venv / "lib" / library.name)
+    system_home = materialize_system_interpreter(tmp_path / "system-python")
     (venv / "pyvenv.cfg").write_text(
-        f"home = {Path(sys.base_prefix) / 'bin'}\nversion = {python_version}\n",
+        f"home = {system_home}\nversion = {python_version}\n",
         encoding="utf-8",
     )
     site_packages = (
@@ -1061,8 +1063,12 @@ def test_real_minimal_uv_venv_is_accepted_for_initialization_and_deployment(
     shutil.rmtree(repo / ".venv")
     cache = tmp_path / "uv-cache"
     monkeypatch.setenv("UV_CACHE_DIR", str(cache))
+    # The venv must be built from an interpreter the test owns: CI's hosted
+    # tool-cache interpreter is root-owned and mode 0777, which
+    # _verified_interpreter rejects.
+    system_python = materialize_system_interpreter(tmp_path / "system-python") / "python"
     subprocess.run(
-        [str(uv_path), "venv", "--python", sys.executable, str(repo / ".venv")],
+        [str(uv_path), "venv", "--python", str(system_python), str(repo / ".venv")],
         cwd=repo,
         check=True,
         env={**os.environ, "UV_CACHE_DIR": str(cache)},

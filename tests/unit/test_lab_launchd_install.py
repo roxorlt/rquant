@@ -22,6 +22,7 @@ from rquant.lab_launchd_install import (
 )
 from rquant.release_generation import ReleaseGenerationAuthority, marker_path_for_lock
 from rquant.strict_json import canonical_json_bytes
+from tests.support.verified_system_interpreter import materialize_system_interpreter
 
 ROOT = Path(__file__).resolve().parents[2]
 TRUSTED_GIT = Path("/usr/bin/git")
@@ -198,8 +199,9 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, str]:
     (venv / "bin" / "rquant").write_text(f"#!{venv / 'bin' / 'python'}\n", encoding="utf-8")
     (venv / "bin" / "rquant").chmod(0o700)
     version = f"{sys.version_info.major}.{sys.version_info.minor}"
+    system_home = materialize_system_interpreter(tmp_path / "system-python")
     (venv / "pyvenv.cfg").write_text(
-        f"home = {Path(sys.base_prefix) / 'bin'}\nversion = {version}\n", encoding="utf-8"
+        f"home = {system_home}\nversion = {version}\n", encoding="utf-8"
     )
     (venv / "lib" / f"python{version}" / "site-packages").mkdir(parents=True)
     python_library = Path(sys.base_prefix) / "lib" / f"libpython{version}.dylib"
