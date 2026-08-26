@@ -2768,6 +2768,12 @@ class ReleaseGenerationAuthority:
             **os.environ,
             "VIRTUAL_ENV": str(destination),
             "UV_PROJECT_ENVIRONMENT": str(destination),
+            # uv defaults to hardlinking from its cache on Linux (it clones on
+            # APFS), and _environment_entry rejects any generation file with
+            # st_nlink != 1 - an immutable generation must not share inodes with
+            # a mutable cache. scripts/install-resource-authority-infra.sh pins
+            # the same mode for the authority runtime.
+            "UV_LINK_MODE": "copy",
         }
         commands = (
             [
