@@ -37,6 +37,10 @@ tmp_path = _private_root.tmp_path
 ROOT = Path(__file__).resolve().parents[2]
 BUILD_SCRIPT = ROOT / "scripts" / "build-signal-family-verifier-artifact.py"
 LEGACY_ENTRY_SCRIPT = ROOT / "scripts" / "signal-family-root-verifier.py"
+#: The build guard requires the source venv and the declared target to agree, so a test that
+#: ships this interpreter's own dependencies has to declare this interpreter.
+RUNNING_PYTHON_VERSION = ".".join(str(part) for part in sys.version_info[:3])
+RUNNING_PLATFORM = "darwin" if sys.platform == "darwin" else "linux"
 
 
 @pytest.fixture(autouse=True)
@@ -589,9 +593,14 @@ class TestBuiltEntryEndToEnd:
                 "--repository-root",
                 str(ROOT),
                 # The tree ships this interpreter's own dependencies: a `pydantic_core`
-                # built for another ABI would not import in the subprocess below.
+                # built for another ABI would not import in the subprocess below, and the
+                # build guard refuses to emit one.
                 "--source-venv",
                 str(Path(sys.prefix)),
+                "--python-version",
+                RUNNING_PYTHON_VERSION,
+                "--target-platform",
+                RUNNING_PLATFORM,
                 "--output-root",
                 str(tmp_path / "staging"),
             ],
@@ -724,6 +733,10 @@ class TestIsolatedStartupIsEnforced:
                 str(ROOT),
                 "--source-venv",
                 str(Path(sys.prefix)),
+                "--python-version",
+                RUNNING_PYTHON_VERSION,
+                "--target-platform",
+                RUNNING_PLATFORM,
                 "--output-root",
                 str(tmp_path / "staging"),
             ],
@@ -744,3 +757,110 @@ class TestIsolatedStartupIsEnforced:
 
         assert ran.returncode == 78
         assert "isolated" in ran.stderr or "site processing" in ran.stderr
+
+
+class TestSourceVenvGuard:
+    """R2D-SPEC-03: a tree whose native extensions cannot load must not be built at all.
+
+    The tree carries `pydantic_core`'s compiled `.so` and its `pyvenv.cfg` declares the
+    interpreter meant to load it. Building from one interpreter while declaring another
+    produced an artifact that no production host could import — and a different content id,
+    which is the TCB anchor. The build now refuses instead of emitting it.
+    """
+
+    @staticmethod
+    def _venv(root: Path, *, version: str, extension: str | None) -> Path:
+        major_minor = ".".join(version.split(".")[:2])
+        site = root / f"lib/python{major_minor}/site-packages"
+        (site / "pydantic_core").mkdir(parents=True)
+        (site / "pydantic_core" / "__init__.py").write_text("VALUE = 1\n", encoding="utf-8")
+        if extension is not None:
+            (site / "pydantic_core" / extension).write_bytes(b"\x7fELF")
+        (root / "pyvenv.cfg").write_text(
+            f"home = /usr/bin\ninclude-system-site-packages = false\nversion = {version}\n",
+            encoding="utf-8",
+        )
+        return root
+
+    def _build(
+        self,
+        tmp_path: Path,
+        source: Path,
+        *,
+        python_version: str,
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                sys.executable,
+                str(BUILD_SCRIPT),
+                "--repository-root",
+                str(ROOT),
+                "--source-venv",
+                str(source),
+                "--output-root",
+                str(tmp_path / "out"),
+                "--third-party",
+                "pydantic_core",
+                "--python-version",
+                python_version,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def test_a_matching_source_venv_builds(self, tmp_path: Path) -> None:
+        source = self._venv(
+            tmp_path / "src",
+            version="3.11.15",
+            extension="_pydantic_core.cpython-311-x86_64-linux-gnu.so",
+        )
+
+        completed = self._build(tmp_path, source, python_version="3.11.15")
+
+        assert completed.returncode == 0, completed.stderr
+
+    def test_a_foreign_abi_extension_fails_the_build(self, tmp_path: Path) -> None:
+        source = self._venv(
+            tmp_path / "src",
+            version="3.11.15",
+            extension="_pydantic_core.cpython-313-darwin.so",
+        )
+
+        completed = self._build(tmp_path, source, python_version="3.11.15")
+
+        assert completed.returncode != 0
+        assert "another interpreter" in completed.stderr
+        assert not list((tmp_path / "out").glob("*/pyvenv.cfg"))
+
+    def test_a_foreign_platform_extension_fails_the_build(self, tmp_path: Path) -> None:
+        source = self._venv(
+            tmp_path / "src",
+            version="3.11.15",
+            extension="_pydantic_core.cpython-311-darwin.so",
+        )
+
+        completed = self._build(tmp_path, source, python_version="3.11.15")
+
+        assert completed.returncode != 0
+        assert "another platform" in completed.stderr
+
+    def test_a_version_mismatch_fails_the_build(self, tmp_path: Path) -> None:
+        source = self._venv(tmp_path / "src", version="3.13.12", extension=None)
+
+        completed = self._build(tmp_path, source, python_version="3.11.15")
+
+        assert completed.returncode != 0
+        assert "no lib/python3.11/site-packages" in completed.stderr
+
+    def test_a_declared_version_mismatch_fails_the_build(self, tmp_path: Path) -> None:
+        source = self._venv(tmp_path / "src", version="3.11.15", extension=None)
+        (source / "pyvenv.cfg").write_text(
+            "home = /usr/bin\ninclude-system-site-packages = false\nversion = 3.13.12\n",
+            encoding="utf-8",
+        )
+
+        completed = self._build(tmp_path, source, python_version="3.11.15")
+
+        assert completed.returncode != 0
+        assert "declares Python 3.13.12" in completed.stderr

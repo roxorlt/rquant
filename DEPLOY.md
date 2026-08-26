@@ -41,8 +41,11 @@ Codex 最终验收。**尚未 merge、尚未打 tag、尚未部署**，云服务
    python scripts/build-signal-family-verifier-artifact.py \
      --output-root <staging> \
      --source-venv /home/lighthouse/rquant/.venv \
-     --python-version "$(/usr/bin/python3.11 -c 'import platform;print(platform.python_version())')"
+     --python-version "$(/usr/bin/python3.11 -c 'import platform;print(platform.python_version())')" \
+     --target-platform linux
    # 打印 content_id / entry_sha256 / manifest_entries 及安装位置
+   # 构建脚本现在自己 guard：源 venv 的解释器版本 / ABI tag / 平台与目标不一致就构建失败，
+   # 不会再产出一棵装着 cpython-313-darwin 扩展却声称 3.11 的树。下面这条只是人工复核。
    find <staging>/<content-id> -name '*.so'   # 必须是 linux 的 ABI tag
    ```
 

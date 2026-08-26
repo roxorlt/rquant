@@ -682,6 +682,10 @@ def derive_module_argv(
         raise _reject("the runtime profile role once flag is invalid")
     if once:
         argv.append("--once")
+    extra = profile_role.get("module_arguments")
+    if type(extra) is not list or any(type(item) is not str or not item for item in extra):
+        raise _reject("the runtime profile role module arguments are invalid")
+    argv.extend(extra)
     return tuple(argv)
 
 
@@ -765,6 +769,22 @@ def resolve_launch(
         generation_path=generation_path,
         manifest_entries=entries,
     )
+    module_source = module_source_relative_path(
+        spec["module"],
+        app_source=spec["app_source"],
+        generation_path=generation_path,
+    )
+    if module_source not in {
+        entry["path"] for entry in entries if entry["type"] == "file"
+    }:
+        raise _reject("the role module source is not covered by the generation full manifest")
+    with open(  # noqa: PTH123 - stdlib-only wrapper
+        os.path.join(generation_path, module_source), encoding="utf-8"
+    ) as stream:
+        assert_module_entry_contract(
+            stream.read(MAX_MANIFEST_BYTES),
+            expects_argv=bool(module_argv),
+        )
     return {
         "role": role,
         "instance": instance,
@@ -784,6 +804,7 @@ def resolve_launch(
         "working_directory": spec["working_directory"],
         "app_source": spec["app_source"],
         "site_packages": list(site_packages),
+        "module_source": module_source,
         "environment": environment,
     }
 
@@ -841,6 +862,69 @@ def child_import_paths(
             continue
         raise _reject(f"the runtime child inherited a foreign import path: {entry}")
     return (launch["app_source"], *launch["site_packages"], *kept)
+
+
+# ---------------------------------------------------------------------------------------
+# The module's own entry point
+# ---------------------------------------------------------------------------------------
+
+
+def module_source_relative_path(module: str, *, app_source: str, generation_path: str) -> str:
+    """Where the role's module has to live, derived from the manifest-covered import root."""
+
+    if type(module) is not str or not module or module.startswith("."):
+        raise _reject("the role module name is invalid")
+    parts = module.split(".")
+    if any(not part.isidentifier() for part in parts):
+        raise _reject("the role module name is invalid")
+    prefix = generation_path.rstrip("/") + "/"
+    if not app_source.startswith(prefix):
+        raise _reject("the role application source is outside the selected generation")
+    return "/".join((app_source[len(prefix):].strip("/"), *parts)) + ".py"
+
+
+def assert_module_entry_contract(source: str, *, expects_argv: bool) -> None:
+    """Refuse a module that has no usable entry point, or one that ignores its arguments.
+
+    `runpy.run_module(..., run_name="__main__")` imports the module and returns. A module
+    with no `if __name__ == "__main__":` block therefore *succeeds silently* — a oneshot
+    unit would report success without having done anything, which is worse than the exit 78
+    a missing role produces. A module whose `main` takes only keyword arguments is the same
+    hazard one step later: the derived argv is built, handed over, and quietly dropped.
+
+    Both are caught here, statically, from the generation's own manifest-covered source. No
+    import happens: the check must not execute generation code in order to decide whether
+    generation code may be executed.
+    """
+
+    import ast
+
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as error:
+        raise _reject("the role module source does not parse") from error
+
+    entry: ast.FunctionDef | ast.AsyncFunctionDef | None = None
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name == "main":
+            entry = node
+    if entry is None:
+        raise _reject("the role module defines no main entry point")
+    if expects_argv and not (entry.args.posonlyargs or entry.args.args):
+        raise _reject("the role module main entry point accepts no positional arguments")
+
+    for node in tree.body:
+        if not isinstance(node, ast.If):
+            continue
+        test = ast.dump(node.test)
+        if "__name__" not in test or "__main__" not in test:
+            continue
+        if any(
+            isinstance(inner, ast.Name) and inner.id == "main"
+            for inner in ast.walk(node)
+        ):
+            return
+    raise _reject("the role module has no __main__ entry that invokes main")
 
 
 def child_argv(launch: dict[str, Any], bootstrap: str) -> tuple[str, ...]:

@@ -100,6 +100,9 @@ class RuntimeRolePolicy:
     service_kind: str = ""
     control_root: str = ""
     once: bool = False
+    #: Extra frozen literals appended to the derived argv. They come from this policy and
+    #: nowhere else, which is how two roles can share one module and still be told apart.
+    module_arguments: tuple[str, ...] = ()
 
 
 PRODUCTION_ROLE_POLICY: tuple[RuntimeRolePolicy, ...] = (
@@ -275,6 +278,7 @@ PRODUCTION_ROLE_POLICY: tuple[RuntimeRolePolicy, ...] = (
         _RUNTIME_ROLE_ENVIRONMENT,
         instanced=True,
         control_root="/home/lighthouse/rquant/data/runtime/control/recovery",
+        module_arguments=("--mode", "execute"),
     ),
     RuntimeRolePolicy(
         "runtime_recovery_rehearsal",
@@ -282,6 +286,7 @@ PRODUCTION_ROLE_POLICY: tuple[RuntimeRolePolicy, ...] = (
         _RUNTIME_ROLE_ENVIRONMENT,
         instanced=True,
         control_root="/home/lighthouse/rquant/data/runtime/control/recovery",
+        module_arguments=("--mode", "rehearse"),
     ),
     RuntimeRolePolicy(
         "serving_publisher",
@@ -563,6 +568,8 @@ class RuntimeProfileRole:
     control_root: str = ""
     #: Whether the role's module is invoked with `--once` (the oneshot units).
     once: bool = False
+    #: Extra frozen literals appended to the derived argv, from the root-owned policy.
+    module_arguments: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -615,6 +622,20 @@ class RuntimeProfileRole:
             raise ProductionRuntimeProfileError("runtime profile role service kind is invalid")
         if type(self.once) is not bool:
             raise ProductionRuntimeProfileError("runtime profile role once flag is invalid")
+        extra = self.module_arguments
+        if (
+            not isinstance(extra, tuple)
+            or len(extra) > 8
+            or any(
+                type(item) is not str
+                or not item
+                or any(ord(character) < 0x20 for character in item)
+                for item in extra
+            )
+        ):
+            raise ProductionRuntimeProfileError(
+                "runtime profile role module arguments are invalid"
+            )
         control = self.control_root
         if type(control) is not str:
             raise ProductionRuntimeProfileError("runtime profile role control root is invalid")
@@ -639,6 +660,7 @@ class RuntimeProfileRole:
             "service_kind": self.service_kind,
             "control_root": self.control_root,
             "once": self.once,
+            "module_arguments": list(self.module_arguments),
         }
 
 
@@ -788,6 +810,7 @@ class RuntimeClosureProfile:
                 or role.service_kind != entry.service_kind
                 or role.control_root != entry.control_root
                 or role.once != entry.once
+                or role.module_arguments != entry.module_arguments
             ):
                 raise ProductionRuntimeProfileError("runtime profile role policy is not fixed")
             if bool(role.instances) is not entry.instanced:
@@ -1090,6 +1113,7 @@ _PROFILE_ROLE_FIELDS = {
     "service_kind",
     "control_root",
     "once",
+    "module_arguments",
 }
 _MANIFEST_FIELDS = set(PRODUCTION_MANIFEST_SCHEMA)
 _GENERATION_MANIFEST_FIELDS = {"schema_id", "profile_id", "roles", "entries"}
@@ -1489,6 +1513,7 @@ def _parse_profile_role(payload: object) -> RuntimeProfileRole:
         service_kind=payload["service_kind"],
         control_root=payload["control_root"],
         once=payload["once"],
+        module_arguments=tuple(payload["module_arguments"]),
         module=payload["module"],
         environment_allowlist=tuple(environment),
     )

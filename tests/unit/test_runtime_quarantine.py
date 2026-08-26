@@ -103,6 +103,7 @@ def _profile_payload(
                 "service_kind": entry.service_kind,
                 "control_root": entry.control_root,
                 "once": entry.once,
+                "module_arguments": list(entry.module_arguments),
             }
             for entry in authority_module.PRODUCTION_ROLE_POLICY
         },

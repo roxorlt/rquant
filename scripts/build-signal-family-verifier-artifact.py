@@ -66,6 +66,14 @@ DEFAULT_THIRD_PARTY: Final[tuple[str, ...]] = (
     "typing_extensions",
     "typing_inspection",
 )
+#: The production host the artifact is installed on. A macOS-built extension can never load
+#: there, so the default is the deployment target rather than the build host. The offline
+#: suite passes its own platform to exercise the entry archive on a developer machine.
+DEFAULT_TARGET_PLATFORM: Final[str] = "linux"
+_FOREIGN_PLATFORM_TAGS: Final[dict[str, tuple[str, ...]]] = {
+    "linux": ("-darwin", "-win32", "-win_amd64"),
+    "darwin": ("-linux-gnu", "-win32", "-win_amd64"),
+}
 PYVENV_TEMPLATE: Final[str] = (
     "home = {home}\n"
     "include-system-site-packages = false\n"
@@ -120,6 +128,71 @@ def _copy_package(source: Path, target: Path) -> None:
         destination = target / path.relative_to(source)
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(path, destination)
+
+
+class ArtifactBuildError(SystemExit):
+    """The build refuses rather than producing a tree that cannot import."""
+
+
+def assert_source_venv_matches_target(
+    *,
+    source_venv: Path,
+    python_version: str,
+    target_platform: str = DEFAULT_TARGET_PLATFORM,
+) -> None:
+    """Refuse a source venv whose interpreter does not match the declared target.
+
+    The tree carries native extensions — `pydantic_core` ships a compiled `.so` — and the
+    installed `pyvenv.cfg` declares the interpreter that is meant to load them. Building
+    from a 3.13/macOS venv while declaring 3.11 produced a tree holding
+    `_pydantic_core.cpython-313-darwin.so` under `lib/python3.11/site-packages`: unimportable
+    by the production interpreter, and a different content id, which is the TCB anchor. The
+    build now fails instead of emitting it.
+    """
+
+    major_minor = ".".join(python_version.split(".")[:2])
+    site = source_venv / f"lib/python{major_minor}/site-packages"
+    if not site.is_dir():
+        available = sorted(
+            path.parent.name for path in source_venv.glob("lib/python3.*/site-packages")
+        )
+        raise ArtifactBuildError(
+            f"the source venv has no {site.relative_to(source_venv)}; "
+            f"--python-version says {python_version} but the venv holds {available or 'nothing'}"
+        )
+    config = source_venv / "pyvenv.cfg"
+    if config.is_file():
+        declared = {
+            key.strip(): value.strip()
+            for key, _, value in (
+                line.partition("=") for line in config.read_text(encoding="utf-8").splitlines()
+            )
+            if key.strip()
+        }
+        observed = declared.get("version") or declared.get("version_info", "")
+        if observed and not observed.startswith(major_minor):
+            raise ArtifactBuildError(
+                f"the source venv declares Python {observed}, "
+                f"but --python-version says {python_version}"
+            )
+
+    expected_tag = f"cpython-{major_minor.replace('.', '')}"
+    for extension in sorted(site.rglob("*.so")):
+        name = extension.name
+        if "cpython-" not in name:
+            continue
+        if expected_tag not in name:
+            raise ArtifactBuildError(
+                f"the source venv holds a native extension built for another interpreter: "
+                f"{extension.relative_to(source_venv)} does not carry {expected_tag}"
+            )
+        foreign = _FOREIGN_PLATFORM_TAGS.get(target_platform, ())
+        if any(tag in name for tag in foreign):
+            raise ArtifactBuildError(
+                f"the source venv holds a native extension for another platform: "
+                f"{extension.relative_to(source_venv)} cannot load on a "
+                f"{target_platform} host"
+            )
 
 
 def materialize_tree(
@@ -257,6 +330,11 @@ def build(arguments: argparse.Namespace) -> dict[str, object]:
         modules = list(measured_closure(repository_root, Path(sys.executable)))
     third_party = list(arguments.third_party) or list(DEFAULT_THIRD_PARTY)
 
+    assert_source_venv_matches_target(
+        source_venv=arguments.source_venv.resolve(),
+        python_version=arguments.python_version,
+        target_platform=arguments.target_platform,
+    )
     staging = output_root / ".staging"
     if staging.exists():
         shutil.rmtree(staging)
@@ -327,6 +405,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--third-party", action="append", default=[])
     parser.add_argument("--interpreter-home", default="/usr/bin")
     parser.add_argument("--python-version", default="3.11.15")
+    parser.add_argument("--target-platform", default=DEFAULT_TARGET_PLATFORM)
     return parser
 
 

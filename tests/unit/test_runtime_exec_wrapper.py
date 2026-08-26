@@ -59,16 +59,24 @@ import textwrap
 import marker
 import rquant
 
-print(json.dumps({
-    "outcome": "ran",
-    "textwrap": textwrap.dedent("  x").strip(),
-    "rquant_file": rquant.__file__,
-    "rquant_origin": rquant.ORIGIN,
-    "marker_file": marker.__file__,
-    "argv": sys.argv,
-    "cwd": os.getcwd(),
-    "sys_path": sys.path,
-}))
+
+def main(argv=None):
+    print(json.dumps({
+        "outcome": "ran",
+        "textwrap": textwrap.dedent("  x").strip(),
+        "rquant_file": rquant.__file__,
+        "rquant_origin": rquant.ORIGIN,
+        "marker_file": marker.__file__,
+        "argv": sys.argv,
+        "main_argv": list(argv or []),
+        "cwd": os.getcwd(),
+        "sys_path": sys.path,
+    }))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
 """
 
 
@@ -89,7 +97,9 @@ class World:
         profile_role_overrides: dict[str, Any] | None = None,
         whole_policy: bool = False,
         omit_manifest_for: frozenset[str] = frozenset(),
+        module_source: str = CHILD_PROBE,
     ) -> None:
+        self.module_source = module_source
         self.omit_manifest_for = omit_manifest_for
         self.whole_policy = whole_policy
         self.profile_role_overrides = dict(profile_role_overrides or {})
@@ -132,7 +142,8 @@ class World:
         package = staging / "app" / "rquant"
         package.mkdir()
         (package / "__init__.py").write_text('ORIGIN = "generation"\n', encoding="utf-8")
-        (package / "runtime_service_main.py").write_text(CHILD_PROBE, encoding="utf-8")
+        for module in sorted(self._policy_modules()):
+            (package / f"{module}.py").write_text(self.module_source, encoding="utf-8")
         (staging / "app" / "main.py").write_text("VALUE = 2\n", encoding="utf-8")
         # Per-instance service manifests live inside the generation, so they are covered by
         # its full manifest and hash-verified with the rest of the code.
@@ -234,6 +245,11 @@ class World:
             "manifest_schema": {"schema_id": "rquant-full-manifest/v1"},
         }
 
+    def _policy_modules(self) -> set[str]:
+        return {
+            role["module"].rsplit(".", 1)[-1] for role in self._profile_roles().values()
+        }
+
     def _all_instances(self) -> set[str]:
         labels: set[str] = set()
         for role in self._profile_roles().values():
@@ -250,6 +266,7 @@ class World:
                     "service_kind": ROLE,
                     "control_root": CONTROL_ROOT,
                     "once": False,
+                    "module_arguments": [],
                     **self.profile_role_overrides,
                 }
             }
@@ -270,6 +287,7 @@ class World:
                 "service_kind": entry.service_kind,
                 "control_root": entry.control_root,
                 "once": entry.once,
+                "module_arguments": list(entry.module_arguments),
             }
             for entry in PRODUCTION_ROLE_POLICY
         }
@@ -1096,19 +1114,29 @@ class TestDerivedModuleArgv:
     """
 
     @staticmethod
-    def _parser() -> Any:
-        from rquant.runtime_service_main import build_parser
+    def _real_parser(module: str) -> Any:
+        """Each role's own module parser — not one fixed parser for all of them.
 
-        return build_parser()
+        Three different modules are behind the 26 roles, and two of them did not have an
+        entry point at all before this round. Validating everything against
+        `runtime_service_main`'s parser hid exactly that.
+        """
 
-    def test_every_service_role_argv_is_accepted_by_the_real_module_parser(
+        import importlib
+
+        imported = importlib.import_module(module)
+        builder = getattr(imported, "build_parser", None)
+        assert callable(builder), f"{module} exposes no build_parser"
+        return builder()
+
+    def test_every_role_argv_is_accepted_by_its_own_module_parser(
         self,
         tmp_path: Path,
     ) -> None:
         from rquant.runtime_authority import PRODUCTION_ROLE_POLICY
 
         world = _build_world(tmp_path, whole_policy=True)
-        accepted = 0
+        accepted: dict[str, int] = {}
         skipped: list[str] = []
 
         for entry in PRODUCTION_ROLE_POLICY:
@@ -1122,21 +1150,44 @@ class TestDerivedModuleArgv:
                     # count 0". It is the one role with no unit in this package.
                     skipped.append(entry.name)
                     continue
-                parsed = self._parser().parse_args(list(argv))
+                parsed = self._real_parser(entry.module).parse_args(list(argv))
                 assert str(parsed.manifest).endswith(f"/manifests/{label}.json")
                 assert str(parsed.control_root).endswith(f"/{label}")
                 assert parsed.expected_generation == world.generation_path.name
-                assert parsed.once is entry.once
+                if entry.module_arguments:
+                    assert parsed.mode == entry.module_arguments[1]
                 if entry.service_kind:
                     assert [kind.value for kind in parsed.expected_kind] == [
                         entry.service_kind
                     ]
-                else:
-                    assert parsed.expected_kind is None
-                accepted += 1
+                accepted[entry.name] = accepted.get(entry.name, 0) + 1
 
         assert skipped == ["daily"]
-        assert accepted == 2 * sum(1 for e in PRODUCTION_ROLE_POLICY if e.instanced)
+        assert len(accepted) == len(PRODUCTION_ROLE_POLICY) - 1
+        assert sum(accepted.values()) == 2 * sum(
+            1 for e in PRODUCTION_ROLE_POLICY if e.instanced
+        )
+
+    def test_each_policy_module_really_exposes_the_entry_the_wrapper_assumes(self) -> None:
+        """The three modules behind the 26 roles each have a real, argv-reading entry."""
+
+        import importlib
+        import inspect
+
+        from rquant.runtime_authority import PRODUCTION_ROLE_POLICY
+
+        for module in sorted({entry.module for entry in PRODUCTION_ROLE_POLICY}):
+            imported = importlib.import_module(module)
+            entry = getattr(imported, "main", None)
+            assert callable(entry), module
+            parameters = list(inspect.signature(entry).parameters.values())
+            assert parameters, f"{module}.main takes no positional argv"
+            assert parameters[0].kind in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            ), f"{module}.main ignores argv"
+            source = inspect.getsource(imported)
+            assert '__name__ == "__main__"' in source, module
 
     def test_the_derived_paths_are_verbatim_from_the_authority_records(
         self,
@@ -1262,3 +1313,109 @@ class TestDerivedModuleArgv:
         assert argv[argv.index("--manifest") + 1].endswith(f"/manifests/{INSTANCES[0]}.json")
         assert argv[argv.index("--control-root") + 1] == f"{CONTROL_ROOT}/{INSTANCES[0]}"
         assert argv[argv.index("--expected-kind") + 1] == ROLE
+
+
+# ---------------------------------------------------------------------------------------
+# R2D-SPEC-08: a module with no entry, or one that ignores argv, must be refused
+# ---------------------------------------------------------------------------------------
+
+
+class TestModuleEntryContract:
+    """`runpy.run_module` imports and returns, so a module with no `__main__` block
+    *succeeds silently*. For a oneshot unit that is worse than exit 78: systemd records a
+    clean run of a recovery pass that never happened. A `main` that takes only keyword
+    arguments is the same hazard one step later — the derived argv is built, handed over
+    and quietly dropped. Both are refused before any generation code is executed.
+    """
+
+    WITH_ENTRY = (
+        "import sys\n\n\ndef main(argv=None):\n    return 0\n\n\n"
+        'if __name__ == "__main__":\n    raise SystemExit(main(sys.argv[1:]))\n'
+    )
+    NO_ENTRY = "VALUE = 1\n\n\ndef helper():\n    return 0\n"
+    KEYWORD_ONLY = (
+        "def main(*, runtime_root=None):\n    return 0\n\n\n"
+        'if __name__ == "__main__":\n    main()\n'
+    )
+    NO_GUARD = "def main(argv=None):\n    return 0\n"
+
+    def test_a_conforming_module_is_accepted(self) -> None:
+        _verify.assert_module_entry_contract(self.WITH_ENTRY, expects_argv=True)
+
+    def test_a_module_without_a_main_entry_refuses(self) -> None:
+        with pytest.raises(_verify.RuntimeExecError, match="defines no main entry point"):
+            _verify.assert_module_entry_contract(self.NO_ENTRY, expects_argv=True)
+
+    def test_a_main_that_ignores_argv_refuses(self) -> None:
+        with pytest.raises(
+            _verify.RuntimeExecError,
+            match="accepts no positional arguments",
+        ):
+            _verify.assert_module_entry_contract(self.KEYWORD_ONLY, expects_argv=True)
+
+    def test_a_module_without_a_dunder_main_block_refuses(self) -> None:
+        with pytest.raises(_verify.RuntimeExecError, match="no __main__ entry"):
+            _verify.assert_module_entry_contract(self.NO_GUARD, expects_argv=True)
+
+    def test_a_module_that_does_not_parse_refuses(self) -> None:
+        with pytest.raises(_verify.RuntimeExecError, match="does not parse"):
+            _verify.assert_module_entry_contract("def main(:\n", expects_argv=True)
+
+    def test_the_source_path_is_derived_from_the_manifest_covered_import_root(self) -> None:
+        assert (
+            _verify.module_source_relative_path(
+                "rquant.runtime_service_main",
+                app_source="/gen/abc/app",
+                generation_path="/gen/abc",
+            )
+            == "app/rquant/runtime_service_main.py"
+        )
+
+    def test_a_module_name_that_is_not_an_identifier_path_refuses(self) -> None:
+        for hostile in ("", ".rquant", "rquant..x", "rquant./etc/passwd", "rquant.x-y"):
+            with pytest.raises(_verify.RuntimeExecError, match="module name is invalid"):
+                _verify.module_source_relative_path(
+                    hostile,
+                    app_source="/gen/abc/app",
+                    generation_path="/gen/abc",
+                )
+
+    def test_a_role_whose_module_has_no_entry_is_refused_end_to_end(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The wrapper refuses rather than exec-ing into a module that would no-op."""
+
+        starved = _build_world(tmp_path, module_source=self.NO_ENTRY)
+
+        with pytest.raises(_verify.RuntimeExecError, match="defines no main entry point"):
+            starved.resolve()
+
+    def test_a_role_whose_entry_ignores_argv_is_refused_end_to_end(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        deaf = _build_world(tmp_path, module_source=self.KEYWORD_ONLY)
+
+        with pytest.raises(
+            _verify.RuntimeExecError,
+            match="accepts no positional arguments",
+        ):
+            deaf.resolve()
+
+    def test_an_unmanifested_module_source_is_refused(self, world: World) -> None:
+        """The module the role names has to be one of the hash-verified files."""
+
+        record = json.loads(world.authority_path.read_bytes())
+        record["current_roles"][ROLE]["module"] = "rquant.absent_module"
+        world.rewrite(world.authority_path, _canonical(record))
+        document = json.loads(world.profile_path.read_bytes())
+        body = {key: value for key, value in document.items() if key != "profile_id"}
+        body["roles"][ROLE]["module"] = "rquant.absent_module"
+        document = {"profile_id": hashlib.sha256(_canonical(body)).hexdigest(), **body}
+        world.rewrite(world.profile_path, _canonical(document))
+        record["current_profile_id"] = document["profile_id"]
+        world.rewrite(world.authority_path, _canonical(record))
+
+        with pytest.raises(_verify.RuntimeExecError):
+            world.resolve()

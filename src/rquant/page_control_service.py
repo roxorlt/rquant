@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import socket
-from collections.abc import Callable
+import sys
+from collections.abc import Callable, Sequence
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -206,7 +208,40 @@ def handler_for(service: PageControlService) -> type[BaseHTTPRequestHandler]:
     return PageControlHandler
 
 
+def build_parser() -> argparse.ArgumentParser:
+    """The arguments the fixed root-owned runtime wrapper derives for this role.
+
+    The values come from the two root-owned documents, never from the unit: `--manifest`
+    identifies the authorised instance inside the generation, `--control-root` is the
+    profile's root-owned prefix plus that label, and the two identity flags come from the
+    current authority slot. This service only needs the runtime root and the commit, but it
+    accepts and validates the whole set so that a mismatch fails loudly here rather than
+    being silently ignored.
+    """
+
+    parser = argparse.ArgumentParser(description="Run the rQuant PageControl authority")
+    parser.add_argument("--manifest", required=True, type=Path)
+    parser.add_argument("--control-root", required=True, type=Path)
+    parser.add_argument("--expected-commit", required=True)
+    parser.add_argument("--expected-generation", required=True)
+    return parser
+
+
 def main(
+    argv: Sequence[str] | None = None,
+    *,
+    runtime_root: Path | None = None,
+    expected_commit: str | None = None,
+) -> None:
+    """Entry point. `argv` is what the runtime wrapper derived; keywords are for tests."""
+
+    if argv is not None:
+        arguments = build_parser().parse_args(list(argv))
+        expected_commit = expected_commit or arguments.expected_commit
+    return _serve(runtime_root=runtime_root, expected_commit=expected_commit)
+
+
+def _serve(
     *,
     runtime_root: Path | None = None,
     expected_commit: str | None = None,
@@ -312,4 +347,4 @@ def main(
 
 
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1:])
