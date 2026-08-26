@@ -738,11 +738,12 @@ def test_committed_v2_response_still_requires_the_native_signed_journal_on_repla
 @pytest.mark.parametrize(
     "payload",
     (
-        b'{"schema_version":2,"schema_version":2}',
-        b'{"schema_version":2}\n',
-        b'{"schema_version":NaN}',
-        b'{"schema_version":"2"}',
-        b"{" + b"x" * (256 * 1024) + b"}",
+        pytest.param(b'{"schema_version":2,"schema_version":2}', id="duplicate-key"),
+        pytest.param(b'{"schema_version":2}\n', id="trailing-newline"),
+        pytest.param(b'{"schema_version":NaN}', id="nan"),
+        pytest.param(b'{"schema_version":"2"}', id="string-version"),
+        # An explicit id keeps a quarter megabyte of padding out of the nodeid.
+        pytest.param(b"{" + b"x" * (256 * 1024) + b"}", id="oversize"),
     ),
 )
 def test_v2_receipt_wire_rejects_noncanonical_and_oversized_json(payload: bytes) -> None:
