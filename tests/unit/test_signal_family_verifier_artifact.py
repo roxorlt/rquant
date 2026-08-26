@@ -24,6 +24,15 @@ from pathlib import Path
 import pytest
 
 from rquant.signal_family_verifier_entry import _artifact as artifact
+from tests.support import signal_family_private_root as _private_root
+
+# These modules walk real ancestor chains and refuse a group- or world-writable directory.
+# pytest's `tmp_path` is rooted at `TMPDIR`, which on Linux defaults to a sticky `1777`
+# `/tmp`, so a bare `pytest` run would fail here with messages that never mention the
+# temporary directory. Rebinding both fixture names roots every temporary directory of this
+# module in a verified-private `$HOME` root.
+signal_family_private_root = _private_root.signal_family_private_root
+tmp_path = _private_root.tmp_path
 
 ROOT = Path(__file__).resolve().parents[2]
 BUILD_SCRIPT = ROOT / "scripts" / "build-signal-family-verifier-artifact.py"
@@ -257,6 +266,38 @@ class TestInstalledTreeVerification:
                 _verify(root, entries, identifier)
         finally:
             tmp_path.chmod(0o700)
+
+    def test_a_single_node_with_a_foreign_owner_refuses(self, tmp_path: Path) -> None:
+        """Mutation M10: the per-node ownership rule, not just the tree root's.
+
+        An unprivileged process cannot `chown` one file away from itself, so the observed
+        owner is injected for exactly one node. Production reads `lstat` and nothing else.
+        """
+
+        root, entries, identifier = _installed(tmp_path)
+        target = root / "lib" / "python3.11" / "site-packages" / "typing_extensions.py"
+
+        def observed(path: Path, info: os.stat_result) -> tuple[int, int]:
+            if path == target:
+                return (info.st_uid + 4242, info.st_gid)
+            return (info.st_uid, info.st_gid)
+
+        with pytest.raises(artifact.VerifierArtifactError, match="unexpected owner"):
+            artifact.verify_installed_tree(
+                root,
+                manifest=entries,
+                expected_content_id=identifier,
+                expected_owner_uid=os.getuid(),
+                expected_owner_gid=root.stat().st_gid,
+                observed_owner=observed,
+            )
+
+    def test_the_injected_owner_seam_is_absent_from_the_production_bootstrap(self) -> None:
+        source = Path(
+            Path(artifact.__file__).parent / "__main__.py"
+        ).read_text(encoding="utf-8")
+
+        assert "observed_owner" not in source
 
     def test_a_content_id_that_does_not_match_the_manifest_refuses(
         self,
@@ -644,3 +685,62 @@ class TestBuiltEntryEndToEnd:
 
         assert observed["outcome"] == "rejected"
         assert "unmanifested" in str(observed["detail"])
+
+
+class TestIsolatedStartupIsEnforced:
+    """Mutation M9: `-I -S` is the premise the whole checkout-refusal argument rests on."""
+
+    def test_the_startup_check_refuses_a_non_isolated_interpreter(self) -> None:
+        class Flags:
+            isolated = 0
+            no_site = 1
+
+        with pytest.raises(artifact.VerifierArtifactError, match=r"isolated"):
+            artifact.assert_isolated_startup(Flags())
+
+    def test_the_startup_check_refuses_an_interpreter_with_site_processing(self) -> None:
+        class Flags:
+            isolated = 1
+            no_site = 0
+
+        with pytest.raises(artifact.VerifierArtifactError, match="site processing"):
+            artifact.assert_isolated_startup(Flags())
+
+    def test_the_startup_check_accepts_an_isolated_interpreter(self) -> None:
+        class Flags:
+            isolated = 1
+            no_site = 1
+
+        artifact.assert_isolated_startup(Flags())
+
+    def test_the_built_entry_refuses_to_run_without_isolation(self, tmp_path: Path) -> None:
+        """Run the real archive without `-I -S`; it must refuse instead of bootstrapping."""
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(BUILD_SCRIPT),
+                "--repository-root",
+                str(ROOT),
+                "--source-venv",
+                str(Path(sys.prefix)),
+                "--output-root",
+                str(tmp_path / "staging"),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stderr
+        entry = Path(str(json.loads(completed.stdout)["entry_path"]))
+
+        ran = subprocess.run(
+            [sys.executable, str(entry), "verify"],
+            capture_output=True,
+            text=True,
+            check=False,
+            env={"PATH": "/usr/bin:/bin"},
+        )
+
+        assert ran.returncode == 78
+        assert "isolated" in ran.stderr or "site processing" in ran.stderr

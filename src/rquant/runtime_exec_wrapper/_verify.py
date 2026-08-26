@@ -32,6 +32,7 @@ import json
 import os
 import stat
 import sys
+from collections.abc import Sequence
 from typing import Any
 
 SCHEMA_VERSION = 1
@@ -414,8 +415,21 @@ def current_slot(record: dict[str, Any]) -> dict[str, Any]:
     return slot
 
 
-def select_role(role: str, *, profile: dict[str, Any], slot: dict[str, Any]) -> dict[str, Any]:
-    """Bind the unit's literal role to the one mapping both the record and profile declare."""
+def select_role(
+    role: str,
+    *,
+    profile: dict[str, Any],
+    slot: dict[str, Any],
+    instance: str | None = None,
+) -> dict[str, Any]:
+    """Bind the unit's literal role to the one mapping both the record and profile declare.
+
+    `instance` is the systemd template label. It never names a path, a manifest or a
+    generation: it is looked up in the root-owned profile's per-role instance allowlist and
+    is refused unless it is already there. A caller can therefore only choose *among* the
+    instances the root-owned policy already authorised, which is what keeps `%i` a label
+    rather than an authority value (ruling D-2).
+    """
 
     if type(role) is not str or role not in PROTECTED_ROLES:
         raise _reject("the requested role is not an allowlisted unit-owned literal")
@@ -427,6 +441,18 @@ def select_role(role: str, *, profile: dict[str, Any], slot: dict[str, Any]) -> 
     profile_role = profile["roles"][role]
     if type(profile_role) is not dict or spec["module"] != profile_role.get("module"):
         raise _reject("the role module differs between the record and the profile")
+    declared = profile_role.get("instances")
+    if type(declared) is not list:
+        raise _reject("the runtime profile role declares no instance allowlist")
+    if declared != sorted(set(declared)) or any(type(item) is not str for item in declared):
+        raise _reject("the runtime profile role instance allowlist is not canonical")
+    if declared:
+        if instance is None:
+            raise _reject("the requested role requires an instance label")
+        if instance not in declared:
+            raise _reject("the requested instance is not in the root-owned allowlist")
+    elif instance is not None:
+        raise _reject("the requested role accepts no instance label")
     return spec
 
 
@@ -577,6 +603,7 @@ def build_child_environment(
 def resolve_launch(
     role: str,
     *,
+    instance: str | None = None,
     profile_path: str = PROFILE_PATH,
     authority_path: str = AUTHORITY_PATH,
     generation_root: str = GENERATION_ROOT,
@@ -615,7 +642,7 @@ def resolve_launch(
     slot = current_slot(record)
     if slot["profile_id"] != profile["profile_id"]:
         raise _reject("the current generation was published under another profile")
-    spec = select_role(role, profile=profile, slot=slot)
+    spec = select_role(role, profile=profile, slot=slot, instance=instance)
     generation_path = generation_paths(slot, generation_root=generation_root)
     entries = load_generation_manifest(
         generation_path=generation_path,
@@ -648,6 +675,8 @@ def resolve_launch(
     )
     return {
         "role": role,
+        "instance": instance,
+        "module_argv": () if instance is None else ("--instance", instance),
         "generation_id": slot["generation_id"],
         "generation_path": generation_path,
         "profile_id": profile["profile_id"],
@@ -662,26 +691,115 @@ def resolve_launch(
     }
 
 
+def assert_isolated_startup(flags: Any) -> None:
+    """Refuse unless this interpreter was started with `-I -S`.
+
+    This is what makes the inherited `sys.path` trustworthy rather than merely present.
+    With isolated mode and site processing both off, `PYTHONPATH`, the user site directory,
+    the working directory and every `.pth` hook are gone before the first byte of this
+    module runs, so the baseline the interpreter contributes is its own standard library and
+    nothing else. `child_argv` always passes both flags; this asserts the promise held.
+    """
+
+    if not getattr(flags, "isolated", 0):
+        raise _reject("the runtime child must run under an isolated interpreter (-I)")
+    if not getattr(flags, "no_site", 0):
+        raise _reject("the runtime child must run with site processing disabled (-S)")
+
+
+def child_import_paths(
+    launch: dict[str, Any],
+    *,
+    baseline: Sequence[str],
+    interpreter_roots: Sequence[str],
+) -> tuple[str, ...]:
+    """Insert the manifest-covered generation paths ahead of the interpreter's own.
+
+    `authority.md` L1735-1743 says the bootstrap *inserts* the generation's canonical source
+    and site-packages paths. Replacing `sys.path` outright would also delete the standard
+    library: the generation is a venv, and a venv holds no `textwrap`, no `lib-dynload`, no
+    `_sqlite3`. The child would then die on its first uncached stdlib import.
+
+    So the baseline stays, and it is checked rather than trusted: with `-I -S` in force every
+    surviving entry must live under one of the interpreter's own roots (`sys.base_prefix` and
+    `sys.base_exec_prefix` — two, because a relocatable build puts `lib-dynload` under the
+    second). A checkout path, an application data path or an empty (working-directory) entry
+    is refused, not filtered: if one is present the isolation promise has already been broken
+    somewhere upstream and continuing would import unverified code.
+    """
+
+    roots = tuple(root.rstrip("/") for root in interpreter_roots if root)
+    if not roots:
+        raise _reject("the runtime child has no interpreter root to anchor its import path")
+    generation = launch["generation_path"]
+    kept: list[str] = []
+    for entry in baseline:
+        if not entry:
+            raise _reject("the runtime child inherited the working directory on its path")
+        if entry == generation or entry.startswith(generation + "/"):
+            # Re-added below, in the exact manifest-covered order.
+            continue
+        if any(entry == root or entry.startswith(root + "/") for root in roots):
+            kept.append(entry)
+            continue
+        raise _reject(f"the runtime child inherited a foreign import path: {entry}")
+    return (launch["app_source"], *launch["site_packages"], *kept)
+
+
 def child_argv(launch: dict[str, Any], bootstrap: str) -> tuple[str, ...]:
     """The exact child argv of `authority.md` L1729-1734. The role is data, never code."""
 
-    return (launch["python_path"], "-I", "-S", "-c", bootstrap, launch["role"])
+    argv = [launch["python_path"], "-I", "-S", "-c", bootstrap, launch["role"]]
+    if launch["instance"] is not None:
+        argv.append(launch["instance"])
+    return tuple(argv)
 
 
-def child_main(role: str) -> int:
+def child_main(
+    role: str,
+    instance: str | None = None,
+    *,
+    profile_path: str = PROFILE_PATH,
+    authority_path: str = AUTHORITY_PATH,
+    generation_root: str = GENERATION_ROOT,
+    trusted_root: str = TRUSTED_ROOT,
+    expected_owner_uid: int = OWNER_UID,
+) -> int:
     """The frozen bootstrap's entry point, executed inside the generation interpreter.
 
     It reopens the fixed profile and record and repeats every validation from scratch, then
     inserts only manifest-covered canonical paths inside the current generation and invokes
     the profile-selected module through `runpy`.
+
+    The five keyword arguments are the same injection seam the root verifier's anchors use
+    (ruling O5): the offline suite drives this function against a world it built and owns,
+    and the frozen trailer — the only production caller — passes nothing, so the fixed
+    literals are the only values a production child can ever see.
     """
 
     import runpy
 
-    launch = resolve_launch(role, source_environment=dict(os.environ))
+    assert_isolated_startup(sys.flags)
+    baseline = tuple(sys.path)
+    launch = resolve_launch(
+        role,
+        instance=instance,
+        profile_path=profile_path,
+        authority_path=authority_path,
+        generation_root=generation_root,
+        trusted_root=trusted_root,
+        expected_owner_uid=expected_owner_uid,
+        source_environment=dict(os.environ),
+    )
     os.chdir(launch["working_directory"])
-    sys.path = [launch["app_source"], *launch["site_packages"]]
-    sys.argv = [launch["module"]]
+    sys.path = list(
+        child_import_paths(
+            launch,
+            baseline=baseline,
+            interpreter_roots=(sys.base_prefix, sys.base_exec_prefix),
+        )
+    )
+    sys.argv = [launch["module"], *launch["module_argv"]]
     runpy.run_module(launch["module"], run_name="__main__", alter_sys=True)
     return 0
 
@@ -689,7 +807,10 @@ def child_main(role: str) -> int:
 #: The trailer appended to this module's own source to make the child bootstrap. It carries
 #: no interpolated value: the role arrives in `argv`, exactly as `authority.md` L1735-1743
 #: requires, and no record path, manifest path or environment value is ever spliced in.
-CHILD_TRAILER = "\n\nimport sys as _sys\n\nraise SystemExit(child_main(_sys.argv[1]))\n"
+CHILD_TRAILER = (
+    "\n\nimport sys as _sys\n\n"
+    "raise SystemExit(child_main(*_sys.argv[1:3]))\n"
+)
 
 
 def frozen_bootstrap() -> str:

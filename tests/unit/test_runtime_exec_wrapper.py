@@ -30,11 +30,45 @@ import pytest
 
 from rquant.runtime_exec_wrapper import __main__ as wrapper_main
 from rquant.runtime_exec_wrapper import _verify
+from tests.support import signal_family_private_root as _private_root
+
+# These modules walk real ancestor chains and refuse a group- or world-writable directory.
+# pytest's `tmp_path` is rooted at `TMPDIR`, which on Linux defaults to a sticky `1777`
+# `/tmp`, so a bare `pytest` run would fail here with messages that never mention the
+# temporary directory. Rebinding both fixture names roots every temporary directory of this
+# module in a verified-private `$HOME` root.
+signal_family_private_root = _private_root.signal_family_private_root
+tmp_path = _private_root.tmp_path
 
 ROOT = Path(__file__).resolve().parents[2]
 BUILD_SCRIPT = ROOT / "scripts" / "build-runtime-exec-pyz.py"
 ROLE = "strategy_live"
 MODULE = "rquant.runtime_service_main"
+INSTANCES = ("svc-" + "a" * 64, "svc-" + "b" * 64)
+
+#: What the generation's own module prints when the frozen bootstrap actually reaches it.
+#: `textwrap` is a pure-stdlib module the wrapper itself never imports, so it is only
+#: importable here if the child kept the interpreter's own baseline on `sys.path`.
+CHILD_PROBE = """\
+import json
+import os
+import sys
+import textwrap
+
+import marker
+import rquant
+
+print(json.dumps({
+    "outcome": "ran",
+    "textwrap": textwrap.dedent("  x").strip(),
+    "rquant_file": rquant.__file__,
+    "rquant_origin": rquant.ORIGIN,
+    "marker_file": marker.__file__,
+    "argv": sys.argv,
+    "cwd": os.getcwd(),
+    "sys_path": sys.path,
+}))
+"""
 
 
 def _canonical(value: Any, *, newline: bool = False) -> bytes:
@@ -47,7 +81,8 @@ def _canonical(value: Any, *, newline: bool = False) -> bytes:
 class World:
     """A complete root-owned runtime world, rooted at `tmp_path`."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, *, profile_role_overrides: dict[str, Any] | None = None) -> None:
+        self.profile_role_overrides = dict(profile_role_overrides or {})
         self.root = root
         self.trusted_root = root
         self.profile_path = root / "etc" / "rquant" / "production-runtime-profile.json"
@@ -82,6 +117,12 @@ class World:
         (staging / "cwd").mkdir()
         (venv / "bin" / "python").write_text("#!/bin/sh\nexec /usr/bin/true\n", encoding="utf-8")
         (venv / "lib" / "site-packages" / "marker.py").write_text("VALUE = 1\n", encoding="utf-8")
+        # A real, importable `rquant.runtime_service_main` inside the generation. The child
+        # must reach this one and the standard library, and never the checkout's copy.
+        package = staging / "app" / "rquant"
+        package.mkdir()
+        (package / "__init__.py").write_text('ORIGIN = "generation"\n', encoding="utf-8")
+        (package / "runtime_service_main.py").write_text(CHILD_PROBE, encoding="utf-8")
         (staging / "app" / "main.py").write_text("VALUE = 2\n", encoding="utf-8")
         (staging / "pyvenv.cfg").write_text(
             "home = /usr/bin\ninclude-system-site-packages = false\nversion = 3.11.15\n",
@@ -171,7 +212,14 @@ class World:
             "quarantine_root": "/var/lib/rquant/runtime-authority/quarantine",
             "generation_root": str(self.generation_root),
             "allowed_operations": ["publish", "rollback"],
-            "roles": {ROLE: {"module": MODULE, "environment_allowlist": ["LANG", "LC_ALL", "TZ"]}},
+            "roles": {
+                ROLE: {
+                    "module": MODULE,
+                    "environment_allowlist": ["LANG", "LC_ALL", "TZ"],
+                    "instances": list(INSTANCES),
+                    **self.profile_role_overrides,
+                }
+            },
             "manifest_schema": {"schema_id": "rquant-full-manifest/v1"},
         }
 
@@ -234,6 +282,7 @@ class World:
 
     def resolve(self, role: str = ROLE, **overrides: Any) -> dict[str, Any]:
         arguments: dict[str, Any] = {
+            "instance": INSTANCES[0],
             "profile_path": str(self.profile_path),
             "authority_path": str(self.authority_path),
             "generation_root": str(self.generation_root),
@@ -261,12 +310,24 @@ def _restore_readonly(tmp_path: Path):  # type: ignore[no-untyped-def]
             path.chmod(0o755)
 
 
-@pytest.fixture()
-def world(tmp_path: Path) -> World:
-    built = World(tmp_path / "root")
-    (tmp_path / "root").mkdir()
+def _build_world(tmp_path: Path, **overrides: Any) -> World:
+    """A fresh, internally consistent world. Profile mutations rebuild everything.
+
+    Changing a profile role changes `profile_id`, which the record and the generation
+    manifest both carry, so a mutation cannot be patched in afterwards — the world is built
+    from the mutated policy instead, exactly as a real profile version would be.
+    """
+
+    root = tmp_path / f"root-{len(list(tmp_path.iterdir()))}"
+    root.mkdir()
+    built = World(root, **overrides)
     built.build()
     return built
+
+
+@pytest.fixture()
+def world(tmp_path: Path) -> World:
+    return _build_world(tmp_path)
 
 
 # ---------------------------------------------------------------------------------------
@@ -275,8 +336,13 @@ def world(tmp_path: Path) -> World:
 
 
 class TestArgumentTransport:
-    def test_the_wrapper_accepts_exactly_one_role_flag(self) -> None:
-        assert wrapper_main.parse_role(["pyz", "--role", ROLE]) == ROLE
+    def test_the_wrapper_accepts_a_role_literal_with_an_optional_instance_label(
+        self,
+    ) -> None:
+        assert wrapper_main.parse_role(["pyz", "--role", ROLE]) == (ROLE, None)
+        assert wrapper_main.parse_role(
+            ["pyz", "--role", ROLE, "--instance", INSTANCES[0]]
+        ) == (ROLE, INSTANCES[0])
 
     @pytest.mark.parametrize(
         "argv",
@@ -286,6 +352,11 @@ class TestArgumentTransport:
             ["pyz", "--role"],
             ["pyz", "--role", ROLE, "--manifest", "/x.json"],
             ["pyz", "--expected-kind", ROLE],
+            ["pyz", "--role", ROLE, "--instance"],
+            ["pyz", "--role", ROLE, "--control-root", "/x"],
+            ["pyz", "--role", ROLE, "--instance", "../escape"],
+            ["pyz", "--role", ROLE, "--instance", "UPPER"],
+            ["pyz", "--role", ROLE, "--instance", ""],
         ],
     )
     def test_the_wrapper_refuses_any_other_argument_shape(self, argv: list[str]) -> None:
@@ -372,7 +443,15 @@ class TestResolveLaunch:
 
         argv = _verify.child_argv(launch, "BOOTSTRAP")
 
-        assert argv == (launch["python_path"], "-I", "-S", "-c", "BOOTSTRAP", ROLE)
+        assert argv == (
+            launch["python_path"],
+            "-I",
+            "-S",
+            "-c",
+            "BOOTSTRAP",
+            ROLE,
+            INSTANCES[0],
+        )
 
     def test_an_unknown_role_refuses(self, world: World) -> None:
         with pytest.raises(_verify.RuntimeExecError, match="allowlisted"):
@@ -381,6 +460,67 @@ class TestResolveLaunch:
     def test_a_role_the_generation_does_not_declare_refuses(self, world: World) -> None:
         with pytest.raises(_verify.RuntimeExecError, match="does not declare"):
             world.resolve("notifier")
+
+    def test_a_role_the_profile_does_not_declare_refuses(self, world: World) -> None:
+        """Mutation M5: the slot may declare a role the root-owned profile has not."""
+
+        record = json.loads(world.authority_path.read_bytes())
+        record["current_roles"]["notifier"] = record["current_roles"][ROLE]
+        world.rewrite(world.authority_path, _canonical(record))
+
+        with pytest.raises(
+            _verify.RuntimeExecError,
+            match="the runtime profile does not declare",
+        ):
+            world.resolve("notifier")
+
+    def test_a_module_that_differs_between_the_record_and_the_profile_refuses(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Mutation M6: the two root-owned documents must agree on what will be executed."""
+
+        diverged = _build_world(
+            tmp_path,
+            profile_role_overrides={"module": "rquant.other_service_main"},
+        )
+
+        with pytest.raises(_verify.RuntimeExecError, match="module differs"):
+            diverged.resolve()
+
+    def test_an_instance_outside_the_root_owned_allowlist_refuses(
+        self,
+        world: World,
+    ) -> None:
+        with pytest.raises(_verify.RuntimeExecError, match="not in the root-owned allowlist"):
+            world.resolve(instance="svc-" + "c" * 64)
+
+    def test_an_instanced_role_without_a_label_refuses(self, world: World) -> None:
+        with pytest.raises(_verify.RuntimeExecError, match="requires an instance label"):
+            world.resolve(instance=None)
+
+    def test_a_non_canonical_instance_allowlist_refuses(self, tmp_path: Path) -> None:
+        unsorted = _build_world(
+            tmp_path,
+            profile_role_overrides={"instances": [INSTANCES[1], INSTANCES[0]]},
+        )
+
+        with pytest.raises(_verify.RuntimeExecError, match="allowlist is not canonical"):
+            unsorted.resolve()
+
+    def test_each_authorised_instance_resolves_to_its_own_launch(self, world: World) -> None:
+        """Two instances of one role differ exactly in their authorised label, nowhere else."""
+
+        first = world.resolve(instance=INSTANCES[0])
+        second = world.resolve(instance=INSTANCES[1])
+
+        assert first["instance"] == INSTANCES[0]
+        assert second["instance"] == INSTANCES[1]
+        assert first["module_argv"] == ("--instance", INSTANCES[0])
+        assert second["module_argv"] == ("--instance", INSTANCES[1])
+        assert first != second
+        for shared in ("role", "module", "python_path", "generation_id", "working_directory"):
+            assert first[shared] == second[shared]
 
     def test_a_tampered_profile_refuses(self, world: World) -> None:
         document = json.loads(world.profile_path.read_bytes())
@@ -533,61 +673,180 @@ class TestFrozenBootstrap:
     def test_the_bootstrap_interpolates_nothing(self) -> None:
         assert "{" not in _verify.CHILD_TRAILER
         assert "%" not in _verify.CHILD_TRAILER
-        assert "_sys.argv[1]" in _verify.CHILD_TRAILER
+        assert "_sys.argv[1:3]" in _verify.CHILD_TRAILER
 
     def test_the_bootstrap_compiles(self) -> None:
         compile(_verify.frozen_bootstrap(), "<frozen-bootstrap>", "exec")
 
-    def test_the_bootstrap_repeats_the_validation_in_the_child(self, world: World) -> None:
-        """Run the real frozen bootstrap and let it refuse a world it cannot verify."""
+    @staticmethod
+    def _run_bootstrap(world: World, call: str, *arguments: str) -> str:
+        """Execute the real frozen bootstrap in a `-I -S` child, exactly as the wrapper does."""
 
-        program = _verify.frozen_bootstrap().replace(
-            "raise SystemExit(child_main(_sys.argv[1]))",
-            "raise SystemExit(_probe(_sys.argv[1]))",
-        )
-        probe = (
-            "\ndef _probe(role):\n"
-            "    import json as _json, sys as _s\n"
-            "    try:\n"
-            "        launch = resolve_launch(\n"
-            "            role,\n"
-            "            profile_path=_s.argv[2],\n"
-            "            authority_path=_s.argv[3],\n"
-            "            generation_root=_s.argv[4],\n"
-            "            trusted_root=_s.argv[5],\n"
-            "            expected_owner_uid=int(_s.argv[6]),\n"
-            "        )\n"
-            "    except RuntimeExecError as error:\n"
-            "        print(_json.dumps({'outcome': 'rejected', 'detail': str(error)}))\n"
-            "        return 0\n"
-            "    print(_json.dumps({'outcome': 'resolved', 'module': launch['module']}))\n"
-            "    return 0\n"
-        )
+        # Swap only the trailer, never the module body: `CHILD_TRAILER`'s own text also
+        # appears inside `_verify.py` as a string literal, so a blind replace corrupts it.
+        source = _verify.frozen_bootstrap()
+        body = source[: -len(_verify.CHILD_TRAILER)]
+        program = f"{body}\n\nimport sys as _sys\n\n{call}"
         completed = subprocess.run(
-            [
-                sys.executable,
-                "-I",
-                "-S",
-                "-c",
-                program.replace(
-                    "\nimport sys as _sys\n", probe + "\nimport sys as _sys\n"
-                ),
-                ROLE,
-                str(world.profile_path),
-                str(world.authority_path),
-                str(world.generation_root),
-                str(world.trusted_root),
-                str(world.owner_uid),
-            ],
+            [sys.executable, "-I", "-S", "-c", program, *arguments],
             capture_output=True,
             text=True,
             check=False,
             env={"PATH": "/usr/bin:/bin"},
         )
         assert completed.returncode == 0, completed.stderr
-        observed = json.loads(completed.stdout)
+        return completed.stdout
+
+    def test_the_bootstrap_repeats_the_validation_in_the_child(self, world: World) -> None:
+        """Run the real frozen bootstrap and let it revalidate a world it was not told about."""
+
+        call = (
+            "import json as _json\n"
+            "try:\n"
+            "    _launch = resolve_launch(\n"
+            "        _sys.argv[1],\n"
+            "        instance=_sys.argv[2],\n"
+            "        profile_path=_sys.argv[3],\n"
+            "        authority_path=_sys.argv[4],\n"
+            "        generation_root=_sys.argv[5],\n"
+            "        trusted_root=_sys.argv[6],\n"
+            "        expected_owner_uid=int(_sys.argv[7]),\n"
+            "    )\n"
+            "except RuntimeExecError as _error:\n"
+            "    print(_json.dumps({'outcome': 'rejected', 'detail': str(_error)}))\n"
+            "    raise SystemExit(0)\n"
+            "print(_json.dumps({'outcome': 'resolved', 'module': _launch['module']}))\n"
+        )
+        observed = json.loads(
+            self._run_bootstrap(
+                world,
+                call,
+                ROLE,
+                INSTANCES[0],
+                str(world.profile_path),
+                str(world.authority_path),
+                str(world.generation_root),
+                str(world.trusted_root),
+                str(world.owner_uid),
+            )
+        )
 
         assert observed == {"outcome": "resolved", "module": MODULE}
+
+    def test_the_child_reaches_the_standard_library_and_the_generation_module(
+        self,
+        world: World,
+    ) -> None:
+        """R2D-SPEC-01: `child_main` must insert its paths, not replace `sys.path`.
+
+        The generation is a venv, and a venv holds no standard library. Replacing
+        `sys.path` with `[app_source, *site_packages]` left the child unable to import
+        `textwrap` — or `_sqlite3`, or `zlib` — and it died on the first uncached stdlib
+        import. This runs the real frozen bootstrap all the way into the generation's own
+        module and reads back what it could actually reach.
+        """
+
+        call = (
+            "raise SystemExit(child_main(\n"
+            "    _sys.argv[1],\n"
+            "    _sys.argv[2],\n"
+            "    profile_path=_sys.argv[3],\n"
+            "    authority_path=_sys.argv[4],\n"
+            "    generation_root=_sys.argv[5],\n"
+            "    trusted_root=_sys.argv[6],\n"
+            "    expected_owner_uid=int(_sys.argv[7]),\n"
+            "))\n"
+        )
+        observed = json.loads(
+            self._run_bootstrap(
+                world,
+                call,
+                ROLE,
+                INSTANCES[0],
+                str(world.profile_path),
+                str(world.authority_path),
+                str(world.generation_root),
+                str(world.trusted_root),
+                str(world.owner_uid),
+            )
+        )
+
+        assert observed["outcome"] == "ran"
+        assert observed["textwrap"] == "x"
+        assert observed["marker_file"].startswith(str(world.generation_path) + "/")
+        assert observed["cwd"] == str(world.generation_path / "cwd")
+        # `runpy(alter_sys=True)` rewrites argv[0] to the module's own file, which is
+        # itself proof the module came out of the generation.
+        assert observed["argv"][0].startswith(str(world.generation_path / "app") + "/")
+        assert observed["argv"][1:] == ["--instance", INSTANCES[0]]
+
+    def test_the_child_imports_rquant_from_the_generation_not_the_checkout(
+        self,
+        world: World,
+    ) -> None:
+        call = (
+            "raise SystemExit(child_main(\n"
+            "    _sys.argv[1], _sys.argv[2],\n"
+            "    profile_path=_sys.argv[3], authority_path=_sys.argv[4],\n"
+            "    generation_root=_sys.argv[5], trusted_root=_sys.argv[6],\n"
+            "    expected_owner_uid=int(_sys.argv[7]),\n"
+            "))\n"
+        )
+        observed = json.loads(
+            self._run_bootstrap(
+                world,
+                call,
+                ROLE,
+                INSTANCES[0],
+                str(world.profile_path),
+                str(world.authority_path),
+                str(world.generation_root),
+                str(world.trusted_root),
+                str(world.owner_uid),
+            )
+        )
+
+        assert observed["rquant_origin"] == "generation"
+        assert observed["rquant_file"].startswith(str(world.generation_path / "app") + "/")
+        assert not observed["rquant_file"].startswith(str(ROOT / "src"))
+        assert str(ROOT / "src") not in observed["sys_path"]
+        for entry in observed["sys_path"]:
+            assert entry, "the child must not inherit the working directory"
+
+    def test_the_child_import_paths_keep_the_interpreter_baseline(self, world: World) -> None:
+        launch = world.resolve()
+        baseline = ("/usr/lib/python311.zip", "/usr/lib/python3.11")
+
+        paths = _verify.child_import_paths(
+            launch,
+            baseline=baseline,
+            interpreter_roots=("/usr", "/usr"),
+        )
+
+        assert paths == (launch["app_source"], *launch["site_packages"], *baseline)
+
+    def test_the_child_import_paths_refuse_a_foreign_entry(self, world: World) -> None:
+        launch = world.resolve()
+
+        for hostile in ("", "/home/lighthouse/rquant/src", "/tmp"):
+            with pytest.raises(_verify.RuntimeExecError):
+                _verify.child_import_paths(
+                    launch,
+                    baseline=("/usr/lib/python3.11", hostile),
+                    interpreter_roots=("/usr",),
+                )
+
+    def test_the_child_refuses_an_interpreter_that_is_not_isolated(self) -> None:
+        class Flags:
+            isolated = 0
+            no_site = 1
+
+        with pytest.raises(_verify.RuntimeExecError, match=r"isolated"):
+            _verify.assert_isolated_startup(Flags())
+
+        Flags.isolated, Flags.no_site = 1, 0
+        with pytest.raises(_verify.RuntimeExecError, match="site processing"):
+            _verify.assert_isolated_startup(Flags())
 
 
 # ---------------------------------------------------------------------------------------

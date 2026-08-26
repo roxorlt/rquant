@@ -27,7 +27,7 @@ import json
 import os
 import shutil
 import stat
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Final, Literal
@@ -320,8 +320,15 @@ def verify_installed_tree(
     expected_content_id: str,
     expected_owner_uid: int,
     expected_owner_gid: int,
+    observed_owner: Callable[[Path, os.stat_result], tuple[int, int]] | None = None,
 ) -> None:
-    """Refuse to start unless the installed tree is exactly the manifest, byte for byte."""
+    """Refuse to start unless the installed tree is exactly the manifest, byte for byte.
+
+    `observed_owner` is the offline suite's only way to make a *single* node present a
+    foreign owner: an unprivileged process cannot `chown` one file away from itself, so
+    without this seam the per-node ownership rule has no negative test at all and a mutation
+    that deletes it survives. Production never passes it — `lstat` is then the sole source.
+    """
 
     _require_content_id(expected_content_id)
     if content_id(manifest) != expected_content_id:
@@ -355,7 +362,10 @@ def verify_installed_tree(
             raise _reject(f"the artifact tree node is not a single link: {relative}")
         if stat.S_IMODE(info.st_mode) != entry.mode:
             raise _reject(f"the artifact tree node mode changed: {relative}")
-        if info.st_uid != expected_owner_uid or info.st_gid != expected_owner_gid:
+        node_uid, node_gid = (
+            (info.st_uid, info.st_gid) if observed_owner is None else observed_owner(path, info)
+        )
+        if node_uid != expected_owner_uid or node_gid != expected_owner_gid:
             raise _reject(f"the artifact tree node has an unexpected owner: {relative}")
         if entry.entry_type == "file":
             if path.name in _FORBIDDEN_NAMES or path.name.endswith(".pth"):
