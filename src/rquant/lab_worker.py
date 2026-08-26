@@ -2356,12 +2356,16 @@ def _cleanup_wire_session_identity(
             ):
                 os.unlink(endpoint_name, dir_fd=session_fd)
                 endpoint_removed_or_absent = True
-            if (
-                endpoint_removed_or_absent
-                and session_path_is_original()
-                and not os.listdir(session_fd)
-            ):
-                os.rmdir(session_name, dir_fd=root_fd)
+            if endpoint_removed_or_absent and session_path_is_original():
+                # A directory fd keeps a readdir cursor, and tmpfs (the usual
+                # /tmp on RHEL-family hosts, and one of the wire session root
+                # candidates) reports an empty listing once that cursor is past
+                # the entries - including entries created after the fd was
+                # opened. Rewind so this emptiness check is a real observation
+                # and not a stale cursor that would try to rmdir a live session.
+                os.lseek(session_fd, 0, os.SEEK_SET)
+                if not os.listdir(session_fd):
+                    os.rmdir(session_name, dir_fd=root_fd)
     except BaseException as exc:
         errors.append(exc)
     finally:

@@ -7,6 +7,7 @@ import hmac
 import inspect
 import json
 import multiprocessing
+import multiprocessing.connection
 import os
 import random
 import re
@@ -71,6 +72,17 @@ from tests.unit.test_strategy_job_adapters import (
 )
 
 NOW = datetime(2026, 7, 24, 0, 1, tzinfo=UTC)
+# The shared temporary root the wire-session tests bind AF_UNIX sockets under.
+# "/tmp" resolves to the macOS spelling of that directory and stays "/tmp" on
+# Linux; the tests used to hard-code the macOS path, which Linux does not have.
+SHARED_TMP_ROOT = Path("/tmp").resolve(strict=True)
+# CPython's multiprocessing client only offers the SHA-256 challenge from 3.12
+# on; on 3.11 it answers the legacy MD5 challenge, which the wire listener still
+# accepts and reports as "legacy-md5". The negotiated mode is therefore a
+# property of the running stdlib, not a constant.
+STDLIB_WIRE_DIGEST_MODE = (
+    "sha256" if hasattr(multiprocessing.connection, "_ALLOWED_DIGESTS") else "legacy-md5"
+)
 
 
 def test_stop_signal_wakes_an_active_waiter_immediately() -> None:
@@ -1633,17 +1645,17 @@ def test_process_boundaries_use_bytes_transport_and_primitive_start_args() -> No
     assert "Pipe(" not in source
     lab_worker._assert_primitive_process_start(
         lab_worker._authority_wire_child,
-        (b"{}", "/private/tmp/test.sock", b"key", 1024),
+        (b"{}", f"{SHARED_TMP_ROOT}/test.sock", b"key", 1024),
     )
     with pytest.raises(LabDaemonConfigurationError, match="target is not registered"):
         lab_worker._assert_primitive_process_start(
             lambda: None,
-            (b"{}", "/private/tmp/test.sock", b"key", 1024),
+            (b"{}", f"{SHARED_TMP_ROOT}/test.sock", b"key", 1024),
         )
     with pytest.raises(LabDaemonConfigurationError, match="primitive wire values"):
         lab_worker._assert_primitive_process_start(
             lab_worker._shard_wire_child,
-            (b"{}", "/private/tmp/test.sock", object(), 1024),
+            (b"{}", f"{SHARED_TMP_ROOT}/test.sock", object(), 1024),
         )
 
 
@@ -1692,10 +1704,13 @@ def test_parent_rejects_unregistered_adapter_registry_without_truthiness_call(
 @pytest.mark.parametrize(
     "payload",
     (
-        b"{",
-        b'{"message_type":"readiness", "ready":true}',
-        b'{"message_type":"unknown"}',
-        b"x" * (1024 * 1024 + 1),
+        pytest.param(b"{", id="truncated"),
+        pytest.param(b'{"message_type":"readiness", "ready":true}', id="noncanonical"),
+        pytest.param(b'{"message_type":"unknown"}', id="unknown-type"),
+        # Without an explicit id pytest names the case after the payload, which
+        # puts a megabyte of "x" in the nodeid, the shard manifest and the JUnit
+        # report.
+        pytest.param(b"x" * (1024 * 1024 + 1), id="oversize"),
     ),
 )
 def test_wire_decoder_rejects_malformed_noncanonical_and_oversize_bytes(
@@ -1714,7 +1729,10 @@ def test_wire_decoder_rejects_malformed_noncanonical_and_oversize_bytes(
         )
 
 
-@pytest.mark.parametrize("payload", (b"{", b"x" * 1025))
+@pytest.mark.parametrize(
+    "payload",
+    (pytest.param(b"{", id="truncated"), pytest.param(b"x" * 1025, id="oversize")),
+)
 def test_recv_wire_rejects_malformed_and_oversize_send_bytes(payload: bytes) -> None:
     import rquant.lab_worker as lab_worker
 
@@ -1824,8 +1842,8 @@ def test_result_wire_outbound_gate_matches_parent_receive_limit_without_large_al
                 label="test outbound",
             )
     assert not connection.sent
-    first = lab_worker._new_wire_session(roots=(Path("/private/tmp"),))
-    second = lab_worker._new_wire_session(roots=(Path("/private/tmp"),))
+    first = lab_worker._new_wire_session(roots=(SHARED_TMP_ROOT,))
+    second = lab_worker._new_wire_session(roots=(SHARED_TMP_ROOT,))
     accepted: dict[str, bytes] = {}
     responses: dict[str, bytes] = {}
     digest_modes: dict[str, str | None] = {}
@@ -1872,7 +1890,10 @@ def test_result_wire_outbound_gate_matches_parent_receive_limit_without_large_al
         assert not any(thread.is_alive() for thread in accept_threads + client_threads)
         assert accepted == {"first": b"first", "second": b"second"}
         assert responses == {"first": b"ack:first", "second": b"ack:second"}
-        assert digest_modes == {"first": "sha256", "second": "sha256"}
+        assert digest_modes == {
+            "first": STDLIB_WIRE_DIGEST_MODE,
+            "second": STDLIB_WIRE_DIGEST_MODE,
+        }
         assert first.address != second.address
         assert first.path != second.path
         assert first.endpoint != second.endpoint
@@ -1913,7 +1934,7 @@ def test_result_wire_outbound_gate_matches_parent_receive_limit_without_large_al
 
     active_child_pids = {child.pid for child in multiprocessing.active_children()}
     for partial_auth in (b"", b"\x00\x00", struct.pack("!i", 40) + b"{s"):
-        partial_session = lab_worker._new_wire_session(roots=(Path("/private/tmp"),))
+        partial_session = lab_worker._new_wire_session(roots=(SHARED_TMP_ROOT,))
         raw_peer = connect_raw(partial_session)
         try:
             if partial_auth:
@@ -1929,7 +1950,7 @@ def test_result_wire_outbound_gate_matches_parent_receive_limit_without_large_al
             raw_peer.close()
             partial_session.cleanup()
 
-    stopped_auth = lab_worker._new_wire_session(roots=(Path("/private/tmp"),))
+    stopped_auth = lab_worker._new_wire_session(roots=(SHARED_TMP_ROOT,))
     stopped_peer = connect_raw(stopped_auth)
     try:
         with pytest.raises(InterruptedError, match="cancel|stop"):
@@ -1942,7 +1963,7 @@ def test_result_wire_outbound_gate_matches_parent_receive_limit_without_large_al
         stopped_auth.cleanup()
 
     def authenticated_pair() -> tuple[object, object, threading.Thread]:
-        session = lab_worker._new_wire_session(roots=(Path("/private/tmp"),))
+        session = lab_worker._new_wire_session(roots=(SHARED_TMP_ROOT,))
         holder: dict[str, object] = {}
 
         def connect() -> None:
@@ -2018,7 +2039,7 @@ def test_result_wire_outbound_gate_matches_parent_receive_limit_without_large_al
     def send_frame(peer: socket.socket, payload: bytes) -> None:
         peer.sendall(struct.pack("!i", len(payload)) + payload)
 
-    legacy_session = lab_worker._new_wire_session(roots=(Path("/private/tmp"),))
+    legacy_session = lab_worker._new_wire_session(roots=(SHARED_TMP_ROOT,))
     legacy_peer = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     legacy_peer.settimeout(1)
     accepted_legacy: dict[str, object] = {}
@@ -2102,7 +2123,7 @@ def test_result_wire_outbound_gate_matches_parent_receive_limit_without_large_al
         legacy_session.cleanup()
         legacy_acceptor.join(timeout=1)
 
-    post_bind_root = Path("/private/tmp") / f"lwl-post-bind-{uuid4().hex[:8]}"
+    post_bind_root = SHARED_TMP_ROOT / f"lwl-post-bind-{uuid4().hex[:8]}"
     post_bind_root.mkdir(mode=0o700)
     original_chown = os.chown
     original_chmod = os.chmod
@@ -2157,7 +2178,7 @@ def test_result_wire_outbound_gate_matches_parent_receive_limit_without_large_al
                 shutil.rmtree(residue)
     post_bind_root.rmdir()
 
-    replacement_root = Path("/private/tmp") / f"lwl-replace-{uuid4().hex[:8]}"
+    replacement_root = SHARED_TMP_ROOT / f"lwl-replace-{uuid4().hex[:8]}"
     replacement_root.mkdir(mode=0o700)
     replacement_bytes = b"replacement endpoint"
 
@@ -2179,7 +2200,7 @@ def test_result_wire_outbound_gate_matches_parent_receive_limit_without_large_al
     shutil.rmtree(replacement_directories[0])
     replacement_root.rmdir()
 
-    renamed_root = Path("/private/tmp") / f"lwl-rename-{uuid4().hex[:8]}"
+    renamed_root = SHARED_TMP_ROOT / f"lwl-rename-{uuid4().hex[:8]}"
     renamed_root.mkdir(mode=0o700)
     moved_session = renamed_root / "moved-session"
 
@@ -2206,18 +2227,18 @@ def test_result_wire_outbound_gate_matches_parent_receive_limit_without_large_al
     shutil.rmtree(moved_session)
     renamed_root.rmdir()
 
-    long_root = Path("/private/tmp") / f"long-{uuid4().hex}{'x' * 96}"
+    long_root = SHARED_TMP_ROOT / f"long-{uuid4().hex}{'x' * 96}"
     long_root.mkdir(mode=0o700)
     fallback_session = None
     try:
-        fallback_session = lab_worker._new_wire_session(roots=(long_root, Path("/private/tmp")))
-        assert fallback_session.root_path == Path("/private/tmp")
+        fallback_session = lab_worker._new_wire_session(roots=(long_root, SHARED_TMP_ROOT))
+        assert fallback_session.root_path == SHARED_TMP_ROOT
     finally:
         if fallback_session is not None:
             fallback_session.cleanup()
         long_root.rmdir()
 
-    all_bad_root = Path("/private/tmp") / f"long-{uuid4().hex}{'x' * 96}"
+    all_bad_root = SHARED_TMP_ROOT / f"long-{uuid4().hex}{'x' * 96}"
     all_bad_root.mkdir(mode=0o700)
     try:
         with pytest.raises(lab_worker.LabWireSessionStartupError):
@@ -2266,7 +2287,7 @@ def test_result_wire_outbound_gate_matches_parent_receive_limit_without_large_al
     finally:
         all_bad_root.rmdir()
 
-    replaced_socket = lab_worker._new_wire_session(roots=(Path("/private/tmp"),))
+    replaced_socket = lab_worker._new_wire_session(roots=(SHARED_TMP_ROOT,))
     replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         os.unlink(replaced_socket.endpoint)
@@ -2281,7 +2302,7 @@ def test_result_wire_outbound_gate_matches_parent_receive_limit_without_large_al
         if replaced_socket.path.exists():
             replaced_socket.path.rmdir()
 
-    replaced_directory = lab_worker._new_wire_session(roots=(Path("/private/tmp"),))
+    replaced_directory = lab_worker._new_wire_session(roots=(SHARED_TMP_ROOT,))
     original = replaced_directory.path
     moved = replaced_directory.root_path / f"moved-session-{uuid4().hex}"
     os.rename(original, moved)
@@ -2295,7 +2316,7 @@ def test_result_wire_outbound_gate_matches_parent_receive_limit_without_large_al
         moved.rmdir()
         original.rmdir()
 
-    unknown_child = lab_worker._new_wire_session(roots=(Path("/private/tmp"),))
+    unknown_child = lab_worker._new_wire_session(roots=(SHARED_TMP_ROOT,))
     unknown = unknown_child.path / "unknown"
     unknown.write_text("keep", encoding="ascii")
     unknown_child.cleanup()
@@ -2306,7 +2327,7 @@ def test_result_wire_outbound_gate_matches_parent_receive_limit_without_large_al
     unknown.unlink()
     unknown_child.path.rmdir()
 
-    normal_cleanup = lab_worker._new_wire_session(roots=(Path("/private/tmp"),))
+    normal_cleanup = lab_worker._new_wire_session(roots=(SHARED_TMP_ROOT,))
     normal_path = normal_cleanup.path
     normal_cleanup.cleanup()
     normal_cleanup.cleanup()
