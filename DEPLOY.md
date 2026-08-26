@@ -12,29 +12,44 @@ Codex 最终验收。**尚未 merge、尚未打 tag、尚未部署**，云服务
 上没有发生任何变更。本节记录的是这次发布**之前**必须逐条满足的条件，不是一条部署记录；
 真正部署后再按本文件的既有格式追加 `## YYYY-MM-DD · v0.30.0 · 标题`。
 
-1. **合版方式只能是 "Create a merge commit"**。R07 冻结 baseline `45d0b57c` 不在
-   `origin/main` 的祖先链上，squash 或 rebase merge 会让 main 上任何 commit 永远过不了
-   `verify_wire` 的 ancestry 检查，Release B 也就永远拿不到部署证据。merge 之后立刻核对
-   `git merge-base --is-ancestor 45d0b57c origin/main` 返回 0。
-2. **第一次真实 push-to-main run 之后**核对 WP1-SPEC-06 / SPEC-12：evidence 里的
+1. **合版方式只能是 "Create a merge commit"**（技术强制，非约定）。R07 证据的 merge-provenance
+   检查要求候选 commit 恰有两个 parent、第一 parent 等于冻结 merge base `9699827b`、且
+   `git merge-tree --write-tree <parent1> <parent2>` 等于候选 tree；squash 与 rebase 只有一个
+   parent，CI 的 push-to-main 路径会直接拒绝产出证据，Release B 也就永远拿不到部署证据。
+   （实测：squash 提交的 tree 与 merge 提交完全相同，只有 parent 结构能区分两者。）
+   merge 之后立刻核对 `git merge-base --is-ancestor 45d0b57c origin/main` 返回 0——
+   `45d0b57c` 现在是 **historical baseline**，门禁仍单独要求它是候选祖先。
+2. **合并前 `origin/main` 必须仍冻结在 `9699827b`**。冻结 baseline 是
+   `merge_base(origin/main, candidate)`，764 条 allowlist 与 merge-tree 等式都以此为前提。
+   若在 PR #155 落地前先合了别的 PR，必须重跑
+   `uv run python scripts/r07_policy_regenerate.py --repo "$PWD"`，并同步改
+   `BASELINE_COMMIT_SHA` / `BASELINE_TREE_SHA` 与
+   `docs/architecture/production-interpreter-authority.md`，否则门禁全表失配。
+   合并前最后再跑一次 `scripts/r07_policy_regenerate.py --check` 确认 RC=0。
+3. **云服务器 82.156.0.68（lighthouse 用户）的 `/usr/bin/git --version` 必须 ≥ 2.38**。
+   私有 verifier 用 `git merge-tree --write-tree` 离线重放 merge provenance，该子命令自 2.38
+   起才可用；低于 2.38 时 Release B 的部署器会以
+   `the deployment Git cannot replay merge provenance` fail closed（不降级为 warning）。
+   部署前在云端执行 `git --version` 核对并把结果写进本节。
+4. **第一次真实 push-to-main run 之后**核对 WP1-SPEC-06 / SPEC-12：evidence 里的
    `job.check_run_id` 与 artifact 内部路径必须与真实 GitHub API 返回一致（本地只用 fake
    transport 验证过）。
-3. **服务器 `.env` 增加 `RQUANT_GITHUB_EVIDENCE_TOKEN`**。这属于生产密钥变更，需要用户单独
+5. **服务器 `.env` 增加 `RQUANT_GITHUB_EVIDENCE_TOKEN`**。这属于生产密钥变更，需要用户单独
    明确授权；Release A 本身不消费证据，这个 token 是 Release B 才需要的。
-4. **Release A 之后的下一次部署只能是 Release B**：`deployment_mode=enforced`，并且
+6. **Release A 之后的下一次部署只能是 Release B**：`deployment_mode=enforced`，并且
    `bootstrap_predecessor` 精确声明 Release A 的 commit 与 tree SHA。中间不允许插入其他
    部署目标。
-5. **云端只读核对**：对每一个 live generation 核对
+7. **云端只读核对**：对每一个 live generation 核对
    `sha256(full-manifest.json) == slot.full_manifest_hash`。只读操作，走
    `open_readonly_store()` / 只读副本，不碰主库写锁。
-6. **云端 child 访问实验**：以真实 `lighthouse` 身份对 `0715` 的 child workspace 做
+8. **云端 child 访问实验**：以真实 `lighthouse` 身份对 `0715` 的 child workspace 做
    `O_RDONLY | O_DIRECTORY` 打开，并确认 `id -g lighthouse != 0`——工作区的 group 位是
    `--x`，子进程一旦落进 group 类就会丢掉读权限（验证器现在会直接拒绝这种身份配对）。
-7. **root verifier 必须从 root-owned 树运行**。当前入口脚本
+9. **root verifier 必须从 root-owned 树运行**。当前入口脚本
    `scripts/signal-family-root-verifier.py` 会把自己所在 checkout 的 `src` 插进 `sys.path`；
    若从 `/home/lighthouse/rquant/` 以 root 运行，root 就会执行 lighthouse 可写的代码。
    policy / harness / store 的安装是**单独授权的事务**，不能借受控发布器绕过。
-8. **规格 errata 未决**：family taxonomy 单元素域、bundle/overlay identity 语义、
+10. **规格 errata 未决**：family taxonomy 单元素域、bundle/overlay identity 语义、
    producer/consumer id 域、profile-service-manifests 文档绑定、`strategy-router` /
    `strategy-shadow` 五个 surface 的向量语义、WP5 Q1–Q4、wire schema 在 3.11/3.12 的可见性、
    退休门的交易日数字，全部等 Codex 裁决；在此之前真实 harness 不产生五对 `READY`，

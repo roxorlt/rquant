@@ -649,7 +649,10 @@ a new release-signing system.
 
 ##### Threat Model And Trust Boundary
 
-The gate trusts the user-controlled Git repository and history, GitHub branch protection and CI,
+Amended per Codex round-2 order 2026-08-25, ruling 9: this repository has no branch protection,
+so the trust base names GitHub Actions CI only; the push-side structural enforcement that stands in
+for it is the merge provenance defined under CI Evidence And Deployment Gate.
+The gate trusts the user-controlled Git repository and history, GitHub Actions CI,
 the Codex implementation/review process, the existing exact-target
 `scripts/deploy-production.sh` chain, and the server operating-system permission boundary. It
 prevents an accidental candidate regression that adds a current-family writer or activation path,
@@ -847,9 +850,13 @@ equivalent enforcement is structural. A `push main` produces evidence only when 
 is the merge commit a reviewed pull request merge writes: exactly two parents, the first parent
 equal to the frozen merge base that was the pre-merge `main` tip, the merge base an ancestor of the
 second parent, and a tree exactly equal to `git merge-tree --write-tree <parent1> <parent2>`. A
-squash, rebase, or direct push has one parent and produces no evidence at all. Unlike a GitHub API
-answer, every part of this is replayable offline from Git objects by each later consumer; a pull
-request number may be recorded as a CI-time audit note but is never authority. Pull request,
+squash, rebase, or direct push has one parent and produces no evidence at all. What this enforces is
+the commit's *structure*: it excludes squash, rebase, and fast-forward direct pushes, but it does
+not by itself prove that a review happened, because someone with push access can build a commit of
+the same shape locally. Review itself still rests on repository permissions and human merge review,
+and enabling GitHub branch protection is what would add the missing push-side enforcement. Unlike a
+GitHub API answer, every part of this is replayable offline from Git objects by each later
+consumer; a pull request number may be recorded as a CI-time audit note but is never authority. Pull request,
 workflow-dispatch, tag, branch, rerun at another SHA, or pre-merge evidence is never deployment
 evidence. The checkout commit must equal the event `after` SHA, its resolved tree is
 recorded, and both Python 3.11 and 3.12 jobs run against that same pair.
@@ -1026,9 +1033,11 @@ inside the trusted CI and server-permission boundary; it is intentionally unsign
 
 Amended per Codex round-2 order 2026-08-25, ruling 9. Merge review is the approval boundary, and
 this repository has no branch protection enforcing it; the technically enforced part is the
-merge-provenance requirement above, which admits only the two-parent merge commit a pull request
-merge writes and is replayable offline. Enabling GitHub branch protection would add the missing
-push-side enforcement; until then no document may claim it exists. The artifact is evidence for
+merge-provenance requirement above, which is a check on commit shape. It admits only a two-parent
+merge commit whose first parent is the frozen merge base and whose tree is the exact merge of its
+parents, and it is replayable offline, so it excludes squash, rebase, and fast-forward direct
+pushes; it does not prove on its own that the merge was reviewed. Enabling GitHub branch protection
+would add the missing push-side enforcement; until then no document may claim it exists. The artifact is evidence for
 that boundary, not a signature, URI chain, or separate authorization service.
 
 Release deployment continues to use only:
