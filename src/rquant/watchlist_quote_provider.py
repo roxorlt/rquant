@@ -19,6 +19,10 @@ import pandas as pd
 SnapshotLoader = Callable[[], pd.DataFrame]
 ProviderStartedCallback = Callable[[datetime], None]
 _WorkerMessage = tuple[object, ...]
+# SIGKILL has already been delivered by the time this budget is used, so the
+# only thing left to wait for is the kernel reporting the exit. The caller's
+# grace sizes the polite stages; a loaded runner needs more than that here.
+_FINAL_REAP_TIMEOUT_SECONDS = 5.0
 
 
 def _load_akshare_spot_snapshot() -> pd.DataFrame:
@@ -280,6 +284,10 @@ class AkshareSinaWatchlistQuoteProvider:
             process.join(timeout=self._termination_grace_seconds)
         if process_group_owned:
             _signal_process_group(pid, signal.SIGKILL)
+        if process.exitcode is None:
+            process.join(
+                timeout=max(self._termination_grace_seconds, _FINAL_REAP_TIMEOUT_SECONDS)
+            )
         if process.exitcode is None:
             raise RuntimeError("watchlist quote provider worker could not be reaped")
         process.close()
