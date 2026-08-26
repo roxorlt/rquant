@@ -828,12 +828,13 @@ source file the reviewed diff adds or modifies and blocks when one *binds* a for
 exports one, or registers one under a literal key, so the source files outside the frozen
 nine-file snapshot universe are no longer outside the static gate. Binding means a definition at
 any nesting depth, an import of the name under either its original or its renamed form, an
-assignment target or an alias assignment that rebinds the name, a string entry of `__all__`
-including its annotated and augmented forms, a literal registry subscript key, or a literal
-argument to a `register*` call. Mentioning a forbidden name in a comment, docstring, string
-constant, or literal name list binds nothing and does not block; a dynamic `setattr`,
-`globals()` write, or plain dict literal key is likewise outside this check, and remains covered
-for the nine snapshot files by their mention-level universe. The fixed static checks are therefore exactly `policy-completeness`,
+assignment target or an alias assignment that rebinds the name, including the walrus form, a
+string entry of `__all__` including its annotated and augmented forms, a literal registry
+subscript key, a literal argument to a `register*` call, or a string key of a dict literal.
+Mentioning a forbidden name in a comment, docstring, string constant, or literal name list binds
+nothing and does not block; a dynamic `setattr` or `globals()` write is likewise outside this
+check, because its only static evidence is a string literal, and both remain covered for the nine
+snapshot files by their mention-level universe. The fixed static checks are therefore exactly `policy-completeness`,
 `top-level-source-closure`, `forbidden-definitions`, and `diff-scope-forbidden-definitions`. The resolver parses source only; it never imports a module,
 constructs a registry, executes a descriptor, traverses an object graph or closure, or analyzes
 bytecode. Unknown executable top-level behavior, dynamic import/registration/export, unresolved

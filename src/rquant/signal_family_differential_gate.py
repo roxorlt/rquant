@@ -1296,11 +1296,13 @@ def resolve_merge_provenance(
     """Resolve the candidate's merge structure from Git objects alone.
 
     Amended per Codex round-2 order 2026-08-25, item P1-1 and ruling 9. A deployable
-    candidate must be the merge commit GitHub writes for a reviewed pull request: exactly two
-    parents, the first being the pre-merge ``main`` tip that is also the frozen merge base,
-    and a tree that is exactly what merging those two parents produces. A squash or a direct
-    push has one parent and can never satisfy this, which is the technically enforced
-    equivalent of the branch protection this repository does not have.
+    candidate must have the shape a pull request merge produces: exactly two parents, the
+    first being the pre-merge ``main`` tip that is also the frozen merge base, and a tree that
+    is exactly what merging those two parents produces. A squash, a rebase, or a
+    fast-forward direct push has one parent and can never satisfy this. What this checks is
+    the commit's structure; it does not prove the merge was reviewed, since a commit of the
+    same shape can be built locally. It is the structural stand-in for the branch protection
+    this repository does not have, and unlike a GitHub API answer it replays offline.
     """
 
     _repo_git_version(repo)
@@ -2301,10 +2303,11 @@ def _string_constants(value: ast.AST | None) -> tuple[str, ...]:
     return ()
 
 
-def _definition_scope(tree: ast.Module) -> tuple[set[str], set[str], set[str]]:
+def _definition_scope(tree: ast.Module) -> tuple[set[str], set[str], set[str], set[str]]:
     definitions: set[str] = set()
     exports: set[str] = set()
     registry_keys: set[str] = set()
+    literal_keys: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             # ast.walk reaches nested definitions, so a method or a closure-local class
@@ -2328,6 +2331,19 @@ def _definition_scope(tree: ast.Module) -> tuple[set[str], set[str], set[str]]:
             definitions.update(_bound_value_names(node.value))
             if "__all__" in names:
                 exports.update(_string_constants(node.value))
+        elif isinstance(node, ast.NamedExpr):
+            # A walrus is an assignment expression: it binds its target wherever it appears,
+            # and its right-hand side can alias a forbidden name just like a plain assignment.
+            definitions.update(_target_names(node.target))
+            definitions.update(_bound_value_names(node.value))
+        elif isinstance(node, ast.Dict):
+            # A string key in a dict literal is a registration position: it is how a dispatch
+            # or handler table names the thing it binds.
+            literal_keys.update(
+                key.value
+                for key in node.keys
+                if isinstance(key, ast.Constant) and type(key.value) is str
+            )
         if (
             isinstance(node, ast.Subscript)
             and isinstance(node.ctx, ast.Store)
@@ -2350,7 +2366,7 @@ def _definition_scope(tree: ast.Module) -> tuple[set[str], set[str], set[str]]:
                     for keyword in node.keywords
                     if isinstance(keyword.value, ast.Constant) and type(keyword.value.value) is str
                 )
-    return definitions, exports, registry_keys
+    return definitions, exports, registry_keys, literal_keys
 
 
 def verify_diff_scope_forbidden_definitions(
@@ -2381,11 +2397,13 @@ def verify_diff_scope_forbidden_definitions(
         except (OSError, SyntaxError, UnicodeDecodeError) as exc:
             reasons.append(f"{module_path}: {type(exc).__name__}")
             continue
-        definitions, exports, registry_keys = _definition_scope(tree)
+        definitions, exports, registry_keys, literal_keys = _definition_scope(tree)
+        forbidden = set(universe.symbols) | set(universe.exports) | set(universe.registry_keys)
         found = sorted(
             (set(universe.symbols) & definitions)
             | (set(universe.exports) & exports)
             | (set(universe.registry_keys) & registry_keys)
+            | (forbidden & literal_keys)
         )
         if found:
             reasons.append(f"{module_path}: {','.join(found)}")

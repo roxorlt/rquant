@@ -165,14 +165,16 @@ def require_push_main_merge_provenance(
     *,
     candidate_commit: str,
 ) -> MergeProvenanceResult:
-    """A push to main only produces evidence when it is a reviewed two-parent merge.
+    """A push to main only produces evidence when the pushed commit is a two-parent merge.
 
     Amended per Codex round-2 order 2026-08-25, ruling 9. This repository has no branch
     protection, so the trusted ``push main`` event alone proves nothing. Requiring the pushed
-    commit to be the merge commit GitHub writes for a pull request — first parent the previous
-    main tip and frozen merge base, tree exactly what merging the two parents produces — is the
-    equivalent enforcement, and unlike a GitHub API answer it is replayable offline by every
-    later consumer. A squash or a direct push has one parent and produces no evidence at all.
+    commit to have the shape a pull request merge produces — first parent the previous main tip
+    and frozen merge base, tree exactly what merging the two parents produces — is the
+    structural stand-in for it, and unlike a GitHub API answer it is replayable offline by every
+    later consumer. A squash, a rebase, or a fast-forward direct push has one parent and
+    produces no evidence at all. This is a check on commit structure; it does not prove the
+    merge was reviewed.
     """
 
     return resolve_merge_provenance(
