@@ -1449,7 +1449,7 @@ def test_snapshot_hook_blocking_is_bounded_before_adapter_execution(
 
     spec = _nshape_compare_spec(hold_days=(1,))
     if termination == "deadline-800ms":
-        spec = spec.model_copy(update={"deadline": NOW + timedelta(seconds=_observe(0.8))})
+        spec = spec.model_copy(update={"deadline": NOW + timedelta(milliseconds=800)})
     claim = _claim(spec)
     claims = LabClaimSpool(tmp_path / "claims")
     registry = RecordingRegistry()
@@ -3568,11 +3568,11 @@ def _worker(
     v2_claim_publication_enabled: bool = False,
     heartbeat_interval_seconds: float = 60.0,
     resource_recheck_interval_seconds: float = 1.0,
-    # None means "one spawn's worth, measured on this host". Flat inflation was
-    # the wrong fix: raising these to 10.0 / 5.0 fixed one CI case and broke
-    # four whose subject is the timeout, because they inherited the default.
-    # Cases that exercise a timeout still pass their own value and are not
-    # scaled.
+    # Back to the original values. Raising them to 10.0 / 5.0 fixed one CI case
+    # and broke four whose subject is the timeout they inherited, and scaling
+    # them by the host has the same failure mode: a longer budget means the
+    # recheck or timeout under test never fires inside the run. Only budgets
+    # that *observe* are scaled; budgets that *gate behaviour* are not.
     resource_probe_timeout_seconds: float | None = None,
     lease_extension_seconds: int = 30,
     quarantine_reconcile_interval_seconds: float = 300.0,
@@ -3635,15 +3635,13 @@ def _worker(
         heartbeat_interval_seconds=heartbeat_interval_seconds,
         resource_recheck_interval_seconds=resource_recheck_interval_seconds,
         resource_probe_timeout_seconds=(
-            _observe(1.0)
-            if resource_probe_timeout_seconds is None
-            else resource_probe_timeout_seconds
+            1.0 if resource_probe_timeout_seconds is None else resource_probe_timeout_seconds
         ),
         lease_extension_seconds=lease_extension_seconds,
         quarantine_reconcile_interval_seconds=quarantine_reconcile_interval_seconds,
         poll_interval_ms=5,
         receipt_timeout_seconds=(
-            _observe(0.2) if receipt_timeout_seconds is None else receipt_timeout_seconds
+            0.2 if receipt_timeout_seconds is None else receipt_timeout_seconds
         ),
         receipt_waiter=receipt_waiter,
         verified_code_sha_provider=verified_code_sha_provider,
@@ -4010,7 +4008,7 @@ def test_parent_never_reduces_unregistered_authority_or_adapter_objects(
         execution_marker=execution_marker,
     )
     spec = _nshape_compare_spec(hold_days=(1,)).model_copy(
-        update={"deadline": NOW + timedelta(seconds=_observe(0.8))}
+        update={"deadline": NOW + timedelta(milliseconds=800)}
     )
     claim = _claim(spec)
     claims = LabClaimSpool(tmp_path / "claims")
@@ -4072,7 +4070,7 @@ def test_child_result_with_blocking_reduce_is_never_pickled_and_remains_bounded(
     reduce_marker = tmp_path / "malicious-result.reduce"
     registry = MaliciousResultRegistry(reduce_marker=reduce_marker)
     spec = _nshape_compare_spec(hold_days=(1,)).model_copy(
-        update={"deadline": NOW + timedelta(seconds=_observe(0.8))}
+        update={"deadline": NOW + timedelta(milliseconds=800)}
     )
     claims = LabClaimSpool(tmp_path / "claims")
     claims.publish(_claim(spec))
@@ -4474,7 +4472,7 @@ def test_blocked_initial_policy_gate_is_bounded_and_never_executes_adapter(
 
     spec = _nshape_compare_spec(hold_days=(1,))
     if termination == "deadline":
-        spec = spec.model_copy(update={"deadline": NOW + timedelta(seconds=_observe(2.0))})
+        spec = spec.model_copy(update={"deadline": NOW + timedelta(milliseconds=2000)})
     claim = _short_claim_for_spec(spec)
     claims = LabClaimSpool(tmp_path / "claims")
     reports = LabReportSpool(tmp_path / "reports")
@@ -10988,7 +10986,7 @@ def test_worker_deadline_before_execute_fails_without_running_shard(tmp_path: Pa
 def test_worker_deadline_after_execute_prevents_fence_and_seal(tmp_path: Path) -> None:
     deadline_reached = multiprocessing.get_context("spawn").Value("b", False)
     spec = _nshape_compare_spec(hold_days=(1,)).model_copy(
-        update={"deadline": NOW + timedelta(seconds=_observe(1.0))}
+        update={"deadline": NOW + timedelta(milliseconds=1000)}
     )
 
     claims = LabClaimSpool(tmp_path / "claims")
@@ -11021,7 +11019,7 @@ def test_worker_deadline_during_bundle_write_prevents_atomic_seal(
 ) -> None:
     clock = [NOW]
     spec = _nshape_compare_spec(hold_days=(1,)).model_copy(
-        update={"deadline": NOW + timedelta(seconds=_observe(1.0))}
+        update={"deadline": NOW + timedelta(milliseconds=1000)}
     )
     claims = LabClaimSpool(tmp_path / "claims")
     reports = LabReportSpool(tmp_path / "reports")
@@ -11088,7 +11086,7 @@ def test_deadline_triggered_at_atomic_rename_rolls_back_before_success(
 
     clock = [NOW]
     spec = _nshape_compare_spec(hold_days=(1,)).model_copy(
-        update={"deadline": NOW + timedelta(seconds=_observe(1.0))}
+        update={"deadline": NOW + timedelta(milliseconds=1000)}
     )
     claims = LabClaimSpool(tmp_path / "claims")
     reports = LabReportSpool(tmp_path / "reports")
