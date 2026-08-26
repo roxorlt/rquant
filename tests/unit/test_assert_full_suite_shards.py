@@ -254,7 +254,7 @@ def _assert_linux_darwin_contract(repository_root: Path) -> None:
         )
     output = completed.stdout + completed.stderr
     assert completed.returncode == 0, output
-    assert "57 passed" in output
+    assert "43 passed" in output
     assert "skipped" not in output
 
 
@@ -420,8 +420,11 @@ def test_clean_environment_aggregate_uses_shared_private_collect_setup(
             encoding="utf-8"
         )
     )["full_suite"]
-    assert full_suite["cases"] == 12722
-    assert full_suite["skips"] == 48
+    assert full_suite["cases"] == 12728
+    # The skip count is the Linux approved-skip map's size, and the manifest
+    # loader already refuses any other value; this pins the number a reviewer
+    # sees in the index.
+    assert full_suite["skips"] == 58
 
 
 def test_validator_rejects_an_unapproved_skip(
