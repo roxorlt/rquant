@@ -17,6 +17,18 @@ The fix is to give the fixtures a base interpreter they own: copy the real base
 executable into a test-owned directory (mode 0700, fresh inode, single link) and
 symlink the standard library next to it so the copy still starts and reports the
 right version/ABI. The production predicate set is untouched.
+
+This does not work on a macOS *framework* build, and cannot be made to. Such an
+interpreter links `.../Python.framework/Versions/X.Y/Python` by absolute install
+name, so CPython derives `sys._base_executable` from the framework's own
+`bin/pythonX.Y` and never consults the fixture's `pyvenv.cfg` home - measured
+three ways (a bare private copy, a private copy with prefix symlinks, and a full
+fixture venv), all three report the framework path. On GitHub's macos-14 image
+that path is root-owned and 0775, so it fails `owned-by-caller` and
+`no-group-or-other-write`: 30 failed / 4 passed in `test_lab_launchd_install.py`
+against 34 passed on a non-framework build. The Darwin lane therefore pins a
+uv-managed (non-framework) interpreter; see the comment on that job in
+`.github/workflows/ci.yml`.
 """
 
 from __future__ import annotations
