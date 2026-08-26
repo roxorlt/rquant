@@ -7396,6 +7396,26 @@ def test_kernel_track_error_fails_closed_and_stops_root(tmp_path: Path) -> None:
     assert tracker.closed
 
 
+def _contained_run_baseline_seconds(cwd: Path) -> float:
+    """Measure one trivial contained run so budgets can track the host.
+
+    `run_contained` reports a deadline that expires as `TimeoutExpired` and a
+    containment violation as `ContainedProcessError`. A case that wants the
+    second outcome has to give detection more room than the run itself needs,
+    and "more room" is a property of the machine: a fixed 0.6s let the deadline
+    win on a shared x64 runner and turned a containment assertion into a
+    timeout.
+    """
+    started = time.monotonic()
+    contained.run_contained(
+        [sys.executable, "-c", "pass"],
+        cwd=cwd,
+        deadline_monotonic=time.monotonic() + 120,
+        may_spawn_background_descendants=False,
+    )
+    return time.monotonic() - started
+
+
 def test_immediate_setsid_descendant_never_escapes_over_repeated_trials(
     tmp_path: Path,
 ) -> None:
@@ -7409,6 +7429,13 @@ def test_immediate_setsid_descendant_never_escapes_over_repeated_trials(
     )
     markers: list[Path] = []
 
+    # The trial starts a CPython that spawns a second one and exits; containment
+    # then has to notice the orphan and kill it. Budget that as a multiple of
+    # what one contained run costs here, plus the descendant's own 0.08s sleep,
+    # so the assertion stays "containment caught it" on every machine instead of
+    # decaying into "the deadline expired first".
+    per_trial_budget = max(0.6, 6 * _contained_run_baseline_seconds(tmp_path) + 0.3)
+
     trials = 1 if sys.platform == "darwin" else 25
     for trial in range(trials):
         marker = tmp_path / f"escaped-{trial}"
@@ -7418,7 +7445,7 @@ def test_immediate_setsid_descendant_never_escapes_over_repeated_trials(
             contained.run_contained(
                 [sys.executable, "-c", child, str(marker), str(started)],
                 cwd=tmp_path,
-                deadline_monotonic=time.monotonic() + 0.6,
+                deadline_monotonic=time.monotonic() + per_trial_budget,
                 may_spawn_background_descendants=True,
             )
         assert started.exists() is (sys.platform != "darwin")
