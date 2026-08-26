@@ -14,7 +14,6 @@ from __future__ import annotations
 import io
 import json
 import os
-import stat
 import subprocess
 import time
 import urllib.error
@@ -29,12 +28,17 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StrictBool,
     StrictInt,
     StrictStr,
     ValidationError,
     model_validator,
 )
 
+from rquant.authority_path_security import (
+    AuthorityPathSecurityError,
+    open_secure_regular_file_lease,
+)
 from rquant.signal_family_differential_gate import (
     POLICY_RELATIVE_PATH,
     R07_EVIDENCE_CACHE_DIR,
@@ -62,8 +66,13 @@ DEFAULT_EVIDENCE_VERIFIER = verify_wire
 _DOWNLOAD_BUDGET_SECONDS = 600.0
 _REQUEST_TIMEOUT_SECONDS = 60.0
 _MAX_RESPONSE_BYTES = 32 * 1024 * 1024
+# One evidence wire is a few kilobytes; the retained cache never needs the artifact bound.
+_MAX_CACHE_ENTRY_BYTES = 64 * 1024
 _CACHE_FILE_MODE = 0o644
 _CACHE_DIR_MODE = 0o755
+#: Every mode a retained entry may carry: readable, never group- or world-writable. ``0o444``
+#: is listed for the root-owned cache a later install transaction may put in place.
+_CACHE_ENTRY_ALLOWED_MODES = frozenset({0o400, 0o440, 0o444, 0o600, 0o640, 0o644})
 
 DeploymentMode = Literal["disabled_for_bootstrap", "enforced"]
 PolicyRole = Literal["installed", "target"]
@@ -71,6 +80,17 @@ PolicyRole = Literal["installed", "target"]
 
 class R07EvidenceError(RuntimeError):
     """The R07 deployment evidence channel refused the requested target."""
+
+
+class R07StaleRunIdentityError(R07EvidenceError):
+    """Evidence names a workflow run and attempt the fixed channel no longer resolves.
+
+    On the download path this is a hard refusal: the artifact just fetched must name the run it
+    was fetched from. On the cache path it means the retained bytes went stale — re-running all
+    jobs supersedes the attempt an entry was written for, and GitHub's run list then reports only
+    the current attempt — so the deployer treats the entry as a miss and downloads what the
+    channel resolves now, rather than blocking a target that is still perfectly deployable.
+    """
 
 
 class CommandRunner(Protocol):
@@ -141,6 +161,53 @@ class ResolvedRunIdentityV1(_StrictModelMixin, BaseModel):
 
     workflow_run_id: StrictInt = Field(gt=0)
     run_attempt: StrictInt = Field(gt=0)
+
+
+class EvidenceCacheTrustV1(_StrictModelMixin, BaseModel):
+    """The filesystem identity the deployer requires of the retained evidence cache.
+
+    The expected owner is a field rather than a literal so that a later root-owned cache
+    install only changes the value the deployer passes, never the walk itself. It is not read
+    from the R07 policy: the policy pins where the cache lives, this pins who may have written
+    it, and the deployment process only ever trusts its own effective identity.
+    """
+
+    trusted_root: Path
+    expected_uid: StrictInt = Field(ge=0)
+    expected_gids: tuple[StrictInt, ...]
+    allow_sticky_ancestors: StrictBool = False
+
+    @model_validator(mode="after")
+    def validate_trust(self) -> Self:
+        if (
+            not self.trusted_root.is_absolute()
+            or Path(os.path.abspath(self.trusted_root)) != self.trusted_root
+        ):
+            raise ValueError("the evidence cache trusted root must be an absolute canonical path")
+        if not self.expected_gids:
+            raise ValueError("the evidence cache trust must name at least one expected group")
+        if self.allow_sticky_ancestors and self.trusted_root == Path("/"):
+            raise ValueError(
+                "sticky evidence cache ancestors are tolerated only under an explicit lab "
+                "or test root, never under the Linux production filesystem root"
+            )
+        return self
+
+    @classmethod
+    def for_deployment_process(
+        cls,
+        *,
+        trusted_root: Path = Path("/"),
+        allow_sticky_ancestors: bool = False,
+    ) -> Self:
+        """Trust exactly the identity this deployment process runs as, rooted at ``/``."""
+
+        return cls(
+            trusted_root=trusted_root,
+            expected_uid=os.geteuid(),
+            expected_gids=(os.getegid(), 0),
+            allow_sticky_ancestors=allow_sticky_ancestors,
+        )
 
 
 class InstalledPolicyState(_ResolvedPolicyState):
@@ -438,8 +505,17 @@ def write_cached_evidence(*, cache_dir: Path, commit_sha: str, payload: bytes) -
 
     target = cache_entry_path(cache_dir, commit_sha)
     directory = Path(cache_dir)
+    # ``mkdir(parents=True)`` creates the intermediate directories with the ambient umask, and
+    # the hardened reader refuses a group-writable ancestor. Only directories this call brings
+    # into existence are re-moded; anything already on the server is left exactly as it is.
+    created: list[Path] = []
+    probe = directory
+    while not probe.exists() and probe != probe.parent:
+        created.append(probe)
+        probe = probe.parent
     directory.mkdir(parents=True, mode=_CACHE_DIR_MODE, exist_ok=True)
-    os.chmod(directory, _CACHE_DIR_MODE)
+    for made in created:
+        os.chmod(made, _CACHE_DIR_MODE)
     temporary = directory / f".{commit_sha}.json.tmp"
     descriptor = os.open(
         temporary,
@@ -464,25 +540,45 @@ def write_cached_evidence(*, cache_dir: Path, commit_sha: str, payload: bytes) -
     return target
 
 
-def _read_cache_bytes(path: Path) -> bytes | None:
+def read_cache_entry_bytes(
+    *,
+    cache_dir: Path,
+    commit_sha: str,
+    trust: EvidenceCacheTrustV1,
+) -> bytes | None:
+    """Read one retained cache entry through a descriptor-bound walk of every ancestor.
+
+    An absent entry is a cache miss. Anything present is refused unless the trusted root, every
+    ancestor below it, and the entry itself are non-symlinked directories/regular files owned by
+    an allowed identity with no group or other write bit, the entry has exactly one link, is
+    owned by the expected deployment identity, and is no larger than one plausible wire.
+    """
+
+    path = cache_entry_path(cache_dir, commit_sha)
     try:
-        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        os.lstat(path)
     except FileNotFoundError:
         return None
     except OSError as exc:
-        raise R07EvidenceError(
-            "evidence cache entry is a symlink or is otherwise unreadable"
-        ) from exc
+        raise R07EvidenceError("evidence cache entry is unreadable") from exc
     try:
-        info = os.fstat(descriptor)
-        if not stat.S_ISREG(info.st_mode):
-            raise R07EvidenceError("evidence cache entry is not a regular file")
-        if info.st_size > _MAX_RESPONSE_BYTES:
-            raise R07EvidenceError("evidence cache entry is implausibly large")
-        with os.fdopen(descriptor, "rb", closefd=False) as handle:
-            return handle.read()
-    finally:
-        os.close(descriptor)
+        with open_secure_regular_file_lease(
+            path,
+            trusted_root=trust.trusted_root,
+            allowed_ancestor_uids=frozenset({0, trust.expected_uid}),
+            expected_uid=trust.expected_uid,
+            expected_gid=trust.expected_gids[0],
+            allowed_final_uids=frozenset({trust.expected_uid}),
+            allowed_final_gids=frozenset(trust.expected_gids),
+            allowed_modes=_CACHE_ENTRY_ALLOWED_MODES,
+            max_bytes=_MAX_CACHE_ENTRY_BYTES,
+            allow_sticky_world_writable_ancestors=trust.allow_sticky_ancestors,
+        ) as lease:
+            return lease.read_all(max_bytes=_MAX_CACHE_ENTRY_BYTES)
+    except (AuthorityPathSecurityError, ValueError, OSError) as exc:
+        raise R07EvidenceError(
+            f"evidence cache entry is not a trusted regular file: {exc}"
+        ) from exc
 
 
 def bind_evidence_wire(
@@ -491,14 +587,14 @@ def bind_evidence_wire(
     commit_sha: str,
     tree_sha: str,
     policy: R07PolicyV1,
-    run_identity: ResolvedRunIdentityV1 | None = None,
+    run_identity: ResolvedRunIdentityV1,
 ) -> R07DrGateEvidenceWireV1:
     """Parse canonical evidence bytes and bind them to the exact target, policy, and run.
 
-    ``run_identity`` is the pair the fixed channel just resolved from the GitHub API. It is
-    supplied on the download path, which is the only path that can observe it; a retained cache
-    entry was bound to its own resolved pair before it was written, and the artifact it came from
-    is allowed to have expired by then.
+    ``run_identity`` is the pair the fixed channel resolved from the GitHub API for this exact
+    target, and it is mandatory on every path. A retained cache entry is bytes on a filesystem
+    the deployment user can write, so its self-declared workflow run and attempt are a claim to
+    check, never a fact to accept (Amended per Codex round-2 order 2026-08-25, item P1-2).
     """
 
     try:
@@ -513,11 +609,11 @@ def bind_evidence_wire(
         raise R07EvidenceError("evidence artifact name is not bound to the target commit")
     if wire.policy_digest != policy.policy_digest:
         raise R07EvidenceError("evidence policy digest is not the target policy digest")
-    if run_identity is not None and (wire.workflow_run_id, wire.run_attempt) != (
+    if (wire.workflow_run_id, wire.run_attempt) != (
         run_identity.workflow_run_id,
         run_identity.run_attempt,
     ):
-        raise R07EvidenceError(
+        raise R07StaleRunIdentityError(
             "evidence does not name the resolved push main run identity and attempt"
         )
     try:
@@ -533,13 +629,25 @@ def read_cached_evidence(
     commit_sha: str,
     tree_sha: str,
     policy: R07PolicyV1,
+    run_identity: ResolvedRunIdentityV1,
+    trust: EvidenceCacheTrustV1,
 ) -> R07DrGateEvidenceWireV1 | None:
-    """Open the retained cache entry read-only and reject anything but exact bound evidence."""
+    """Open the retained cache entry read-only and reject anything but exact bound evidence.
 
-    raw = _read_cache_bytes(cache_entry_path(cache_dir, commit_sha))
+    The caller must already have resolved the run identity from the fixed channel: reading a
+    retained entry never grants the cheaper trust of skipping that resolution.
+    """
+
+    raw = read_cache_entry_bytes(cache_dir=cache_dir, commit_sha=commit_sha, trust=trust)
     if raw is None:
         return None
-    return bind_evidence_wire(raw, commit_sha=commit_sha, tree_sha=tree_sha, policy=policy)
+    return bind_evidence_wire(
+        raw,
+        commit_sha=commit_sha,
+        tree_sha=tree_sha,
+        policy=policy,
+        run_identity=run_identity,
+    )
 
 
 def workflow_runs_url(commit_sha: str) -> str:
@@ -704,6 +812,54 @@ def _extract_artifact_json(archive: bytes) -> bytes:
             raise R07EvidenceError("the artifact evidence entry is unreadable") from exc
 
 
+def _resolve_run_identity(
+    *,
+    commit_sha: str,
+    transport: EvidenceTransport,
+    token: str,
+    deadline: _DownloadDeadline,
+) -> ResolvedRunIdentityV1:
+    deadline.check()
+    runs_payload = _json_object(
+        transport.get(
+            workflow_runs_url(commit_sha),
+            token=token,
+            accept="application/vnd.github+json",
+        ),
+        label="workflow runs",
+    )
+    runs = _json_list(runs_payload, "workflow_runs", label="workflow runs")
+    run_id = _select_workflow_run(runs, commit_sha)
+    return ResolvedRunIdentityV1(
+        workflow_run_id=run_id,
+        run_attempt=_select_run_attempt(runs, run_id),
+    )
+
+
+def resolve_run_identity(
+    *,
+    commit_sha: str,
+    transport: EvidenceTransport,
+    token_provider: TokenProvider,
+    clock: Callable[[], float] = time.monotonic,
+    budget_seconds: float = _DOWNLOAD_BUDGET_SECONDS,
+) -> ResolvedRunIdentityV1:
+    """Resolve the one push-main run identity and attempt for a target without downloading it.
+
+    This is exactly the resolution the downloader performs, minus the artifact fetch, so that a
+    cache hit is charged the same identity question as a fresh download. GitHub retains workflow
+    run metadata independently of the 90-day artifact expiry, so an entry retained for a
+    rollback-eligible commit stays answerable after its artifact is gone.
+    """
+
+    return _resolve_run_identity(
+        commit_sha=commit_sha,
+        transport=transport,
+        token=token_provider.token(),
+        deadline=_DownloadDeadline(clock, budget_seconds),
+    )
+
+
 def download_evidence_bytes(
     *,
     commit_sha: str,
@@ -721,21 +877,13 @@ def download_evidence_bytes(
 
     token = token_provider.token()
     deadline = _DownloadDeadline(clock, budget_seconds)
-    deadline.check()
-    runs_payload = _json_object(
-        transport.get(
-            workflow_runs_url(commit_sha),
-            token=token,
-            accept="application/vnd.github+json",
-        ),
-        label="workflow runs",
+    identity = _resolve_run_identity(
+        commit_sha=commit_sha,
+        transport=transport,
+        token=token,
+        deadline=deadline,
     )
-    runs = _json_list(runs_payload, "workflow_runs", label="workflow runs")
-    run_id = _select_workflow_run(runs, commit_sha)
-    identity = ResolvedRunIdentityV1(
-        workflow_run_id=run_id,
-        run_attempt=_select_run_attempt(runs, run_id),
-    )
+    run_id = identity.workflow_run_id
     deadline.check()
     artifacts_payload = _json_object(
         transport.get(
@@ -779,12 +927,16 @@ class R07DeployEvidenceGate:
         clock: Callable[[], float] = time.monotonic,
         verifier: EvidenceVerifier = DEFAULT_EVIDENCE_VERIFIER,
         require_declared_cache_path: bool = False,
+        cache_trust: EvidenceCacheTrustV1 | None = None,
     ) -> None:
         self._cache_dir = Path(cache_dir)
         self._transport = transport or UrllibEvidenceTransport()
         self._token_provider = token_provider or EnvironmentTokenProvider()
         self._clock = clock
         self._verifier = verifier
+        # Production walks the retained cache from the filesystem root and never tolerates a
+        # sticky ancestor; a lab or test rollout hands in its own root explicitly.
+        self._cache_trust = cache_trust or EvidenceCacheTrustV1.for_deployment_process()
         # Lab rollouts keep their cache beside the deployment lock; the server has exactly one
         # declared directory, and the deployer that pins it cannot import this module to read
         # the literal, so the pinned mode compares its own path against the target policy.
@@ -793,6 +945,10 @@ class R07DeployEvidenceGate:
     @property
     def cache_dir(self) -> Path:
         return self._cache_dir
+
+    @property
+    def cache_trust(self) -> EvidenceCacheTrustV1:
+        return self._cache_trust
 
     def evaluate(
         self,
@@ -880,40 +1036,73 @@ class R07DeployEvidenceGate:
         commit_sha: str,
         tree_sha: str,
     ) -> R07DrGateEvidenceWireV1:
-        cached = read_cached_evidence(
+        retained = read_cache_entry_bytes(
             cache_dir=self._cache_dir,
             commit_sha=commit_sha,
-            tree_sha=tree_sha,
-            policy=policy,
+            trust=self._cache_trust,
         )
-        if cached is None:
-            raw, identity = download_evidence_bytes(
+        if retained is not None:
+            # A cache hit saves the artifact download, never the identity question: the fixed
+            # channel is asked again which push-main run and attempt owns this exact target. An
+            # unreachable channel, a missing token, or a target with no single push-main run
+            # blocks here — nothing below can recover from not knowing the answer.
+            identity = resolve_run_identity(
                 commit_sha=commit_sha,
                 transport=self._transport,
                 token_provider=self._token_provider,
                 clock=self._clock,
             )
-            downloaded = bind_evidence_wire(
-                raw,
-                commit_sha=commit_sha,
-                tree_sha=tree_sha,
-                policy=policy,
-                run_identity=identity,
-            )
-            self._verify(repo, policy, downloaded)
-            write_cached_evidence(
-                cache_dir=self._cache_dir,
-                commit_sha=commit_sha,
-                payload=raw,
-            )
-            cached = read_cached_evidence(
-                cache_dir=self._cache_dir,
-                commit_sha=commit_sha,
-                tree_sha=tree_sha,
-                policy=policy,
-            )
-            if cached is None:
-                raise R07EvidenceError("the retained evidence cache entry disappeared")
+            try:
+                cached = bind_evidence_wire(
+                    retained,
+                    commit_sha=commit_sha,
+                    tree_sha=tree_sha,
+                    policy=policy,
+                    run_identity=identity,
+                )
+            except R07StaleRunIdentityError:
+                # The channel answered, and the answer is not the run these bytes were written
+                # for. That is staleness, not a verdict: fall through to the download path,
+                # which re-verifies everything from scratch and replaces the entry. Every other
+                # refusal — unreadable entry, wrong commit or tree, wrong policy, channel drift
+                # — still blocks, because those say the deployment host is not what it should be.
+                pass
+            else:
+                self._verify(repo, policy, cached)
+                return cached
+        raw, identity = download_evidence_bytes(
+            commit_sha=commit_sha,
+            transport=self._transport,
+            token_provider=self._token_provider,
+            clock=self._clock,
+        )
+        downloaded = bind_evidence_wire(
+            raw,
+            commit_sha=commit_sha,
+            tree_sha=tree_sha,
+            policy=policy,
+            run_identity=identity,
+        )
+        self._verify(repo, policy, downloaded)
+        write_cached_evidence(
+            cache_dir=self._cache_dir,
+            commit_sha=commit_sha,
+            payload=raw,
+        )
+        rewritten = read_cache_entry_bytes(
+            cache_dir=self._cache_dir,
+            commit_sha=commit_sha,
+            trust=self._cache_trust,
+        )
+        if rewritten is None:
+            raise R07EvidenceError("the retained evidence cache entry disappeared")
+        cached = bind_evidence_wire(
+            rewritten,
+            commit_sha=commit_sha,
+            tree_sha=tree_sha,
+            policy=policy,
+            run_identity=identity,
+        )
         self._verify(repo, policy, cached)
         return cached
 

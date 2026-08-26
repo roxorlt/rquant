@@ -1029,8 +1029,26 @@ then writes the verified bytes atomically to the server cache
 `/home/lighthouse/rquant/var/r07-dr-evidence/<candidate_commit_sha>.json`. The deploy process opens
 that cache read-only and rejects a symlink, non-regular file, commit filename mismatch, canonical
 JSON/digest mismatch, or channel metadata mismatch. A cache entry for any deployed or
-rollback-eligible commit is retained after GitHub's 90-day artifact expiry. This is a fixed input
-inside the trusted CI and server-permission boundary; it is intentionally unsigned.
+rollback-eligible commit is retained after GitHub's 90-day artifact expiry. Amended per Codex
+round-2 order 2026-08-25, item P1-2: the cache is not a trusted input, because the deployment
+user owns that directory and can write a plausible entry itself. A cache hit re-resolves the one
+push `main` run identity and highest successful attempt from the fixed channel and binds the
+retained bytes to that pair exactly as a fresh download is bound; GitHub retains workflow run
+history for 400 days, well beyond the 90-day artifact expiry. Not knowing the answer blocks: an
+unreachable channel, a missing token, no push `main` run for the target, and an ambiguous second
+run all refuse, and so does an unreadable, unsafely owned, or otherwise unbound entry. Knowing an
+answer the entry disagrees with does not block: a retained entry naming a run or attempt the
+channel no longer resolves — the shape a re-run of all jobs leaves behind — is stale rather than
+false, so the deployer treats it as a cache miss, downloads the evidence the channel resolves
+now, verifies it in full, and atomically replaces the entry. A cache entry older than the run
+history is unverifiable and therefore blocks: a rollback that far back re-runs the channel
+instead of trusting retained bytes. The entry and every ancestor from the trusted root
+— `/` under `linux-production`, which never exempts a sticky directory — are walked without
+following symlinks. Every ancestor must be a directory owned by root or by the deployment
+identity with no group or other write bit; the entry itself must be a regular file owned by the
+deployment identity, with no group or other write bit, exactly one link, and at most 64 KiB.
+The entry itself stays unsigned: this replaces an assumed server-permission boundary with an
+enforced one and does not restore the removed signer, Ed25519, or attestation findings.
 
 Amended per Codex round-2 order 2026-08-25, ruling 9. Merge review is the approval boundary, and
 this repository has no branch protection enforcing it; the technically enforced part is the

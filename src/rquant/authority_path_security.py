@@ -164,12 +164,14 @@ def _validate_directory(
     *,
     allowed_owner_uids: frozenset[int],
     label: str,
+    allow_sticky_world_writable: bool = False,
 ) -> None:
+    sticky_exempt = bool(allow_sticky_world_writable and metadata.st_mode & stat.S_ISVTX)
     if (
         not stat.S_ISDIR(metadata.st_mode)
         or stat.S_ISLNK(metadata.st_mode)
         or metadata.st_uid not in allowed_owner_uids
-        or metadata.st_mode & 0o022
+        or (metadata.st_mode & 0o022 and not sticky_exempt)
     ):
         raise AuthorityPathSecurityError(f"{label} ancestor is unsafe")
 
@@ -295,11 +297,19 @@ def open_secure_regular_file_lease(
     allowed_modes: frozenset[int],
     max_bytes: int,
     min_bytes: int = 1,
+    allow_sticky_world_writable_ancestors: bool = False,
 ) -> SecureRegularFileLease:
-    """Open a bounded regular file while retaining every bound descriptor."""
+    """Open a bounded regular file while retaining every bound descriptor.
+
+    ``allow_sticky_world_writable_ancestors`` tolerates the group/other write bits of a
+    ``S_ISVTX`` directory, which is the shape of a lab or test root under ``/tmp``. It is
+    refused outright for the filesystem root so a production walk can never be relaxed.
+    """
 
     if max_bytes < 1 or min_bytes < 0 or min_bytes > max_bytes or not allowed_modes:
         raise ValueError("secure file policy is invalid")
+    if allow_sticky_world_writable_ancestors and Path(os.path.abspath(trusted_root)) == Path("/"):
+        raise ValueError("sticky ancestors are tolerated only under an explicit lab or test root")
     relative_parts = _canonical_relative(path, trusted_root)
     allowed = allowed_ancestor_uids or frozenset({0, expected_uid})
     final_uids = allowed_final_uids or frozenset({expected_uid})
@@ -318,7 +328,12 @@ def open_secure_regular_file_lease(
         parent = os.open(trusted_root, directory_flags)
         descriptors.append(parent)
         root_opened = os.fstat(parent)
-        _validate_directory(root_opened, allowed_owner_uids=allowed, label="trusted root")
+        _validate_directory(
+            root_opened,
+            allowed_owner_uids=allowed,
+            label="trusted root",
+            allow_sticky_world_writable=allow_sticky_world_writable_ancestors,
+        )
         if stat.S_ISLNK(root_named.st_mode) or (root_named.st_dev, root_named.st_ino) != (
             root_opened.st_dev,
             root_opened.st_ino,
@@ -333,6 +348,7 @@ def open_secure_regular_file_lease(
                     named,
                     allowed_owner_uids=allowed,
                     label="protected path",
+                    allow_sticky_world_writable=allow_sticky_world_writable_ancestors,
                 )
                 if (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino):
                     raise AuthorityPathSecurityError("protected path ancestor identity changed")

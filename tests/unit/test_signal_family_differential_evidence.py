@@ -705,6 +705,30 @@ def _cache_dir(tmp_path: Path) -> Path:
     return directory
 
 
+def _lab_trust(
+    root: Path,
+    *,
+    allow_sticky_ancestors: bool = False,
+) -> r07_deploy_evidence.EvidenceCacheTrustV1:
+    """Root the ancestor walk at the test directory: ``/tmp`` itself is sticky on Linux."""
+
+    return r07_deploy_evidence.EvidenceCacheTrustV1.for_deployment_process(
+        trusted_root=root,
+        allow_sticky_ancestors=allow_sticky_ancestors,
+    )
+
+
+def _identity(
+    *,
+    workflow_run_id: int = RUN_ID,
+    run_attempt: int = 2,
+) -> r07_deploy_evidence.ResolvedRunIdentityV1:
+    return r07_deploy_evidence.ResolvedRunIdentityV1(
+        workflow_run_id=workflow_run_id,
+        run_attempt=run_attempt,
+    )
+
+
 def test_cache_write_is_atomic_and_world_readable(tmp_path: Path) -> None:
     directory = tmp_path / "nested" / "r07-dr-evidence"
     payload = _valid_wire_bytes(COMMIT_B, TREE_B, policy=_policy())
@@ -729,6 +753,8 @@ def test_cache_read_returns_none_for_a_missing_entry(tmp_path: Path) -> None:
             commit_sha=COMMIT_B,
             tree_sha=TREE_B,
             policy=_policy(),
+            run_identity=_identity(),
+            trust=_lab_trust(tmp_path),
         )
         is None
     )
@@ -748,6 +774,8 @@ def test_cache_read_accepts_the_exact_bound_entry(tmp_path: Path) -> None:
         commit_sha=COMMIT_B,
         tree_sha=TREE_B,
         policy=policy,
+        run_identity=_identity(),
+        trust=_lab_trust(tmp_path),
     )
 
     assert wire is not None
@@ -767,6 +795,8 @@ def test_cache_read_rejects_a_symlinked_entry(tmp_path: Path) -> None:
             commit_sha=COMMIT_B,
             tree_sha=TREE_B,
             policy=_policy(),
+            run_identity=_identity(),
+            trust=_lab_trust(tmp_path),
         )
 
 
@@ -780,6 +810,8 @@ def test_cache_read_rejects_a_directory_entry(tmp_path: Path) -> None:
             commit_sha=COMMIT_B,
             tree_sha=TREE_B,
             policy=_policy(),
+            run_identity=_identity(),
+            trust=_lab_trust(tmp_path),
         )
 
 
@@ -793,6 +825,8 @@ def test_cache_read_rejects_a_fifo_entry(tmp_path: Path) -> None:
             commit_sha=COMMIT_B,
             tree_sha=TREE_B,
             policy=_policy(),
+            run_identity=_identity(),
+            trust=_lab_trust(tmp_path),
         )
 
 
@@ -809,6 +843,8 @@ def test_cache_read_rejects_an_entry_named_for_another_commit(tmp_path: Path) ->
             commit_sha=COMMIT_B,
             tree_sha=TREE_B,
             policy=policy,
+            run_identity=_identity(),
+            trust=_lab_trust(tmp_path),
         )
 
 
@@ -825,6 +861,8 @@ def test_cache_read_rejects_a_tree_that_is_not_the_target_tree(tmp_path: Path) -
             commit_sha=COMMIT_B,
             tree_sha=TREE_B,
             policy=policy,
+            run_identity=_identity(),
+            trust=_lab_trust(tmp_path),
         )
 
 
@@ -849,6 +887,8 @@ def test_cache_read_rejects_non_canonical_bytes(tmp_path: Path, mutate) -> None:
             commit_sha=COMMIT_B,
             tree_sha=TREE_B,
             policy=policy,
+            run_identity=_identity(),
+            trust=_lab_trust(tmp_path),
         )
 
 
@@ -869,6 +909,8 @@ def test_cache_read_rejects_duplicate_json_keys(tmp_path: Path) -> None:
             commit_sha=COMMIT_B,
             tree_sha=TREE_B,
             policy=policy,
+            run_identity=_identity(),
+            trust=_lab_trust(tmp_path),
         )
 
 
@@ -888,6 +930,8 @@ def test_cache_read_rejects_a_tampered_evidence_digest(tmp_path: Path) -> None:
             commit_sha=COMMIT_B,
             tree_sha=TREE_B,
             policy=policy,
+            run_identity=_identity(),
+            trust=_lab_trust(tmp_path),
         )
 
 
@@ -905,6 +949,8 @@ def test_cache_read_rejects_a_policy_digest_from_another_policy(tmp_path: Path) 
             commit_sha=COMMIT_B,
             tree_sha=TREE_B,
             policy=policy,
+            run_identity=_identity(),
+            trust=_lab_trust(tmp_path),
         )
 
 
@@ -930,6 +976,8 @@ def test_cache_read_rejects_channel_metadata_drift(tmp_path: Path) -> None:
             commit_sha=COMMIT_B,
             tree_sha=TREE_B,
             policy=tampered,
+            run_identity=_identity(),
+            trust=_lab_trust(tmp_path),
         )
 
 
@@ -1473,6 +1521,7 @@ def _gate(
     verifier: object | None = None,
     cache_dir: Path | None = None,
     require_declared_cache_path: bool = False,
+    cache_trust: object | None = None,
 ) -> tuple[object, _FakeTransport, object]:
     transport = _FakeTransport(responses or {})
     resolved_verifier = verifier or _FakeVerifier()
@@ -1483,6 +1532,7 @@ def _gate(
         clock=lambda: 0.0,
         verifier=resolved_verifier,
         require_declared_cache_path=require_declared_cache_path,
+        cache_trust=cache_trust or _lab_trust(tmp_path),
     )
     return gate, transport, resolved_verifier
 
@@ -1666,9 +1716,11 @@ def test_gate_verifies_release_b_evidence_before_and_after_the_cache_write(
     assert len(transport.requests) == 3
 
 
-def test_gate_reuses_a_retained_cache_entry_without_any_network_call(
+def test_gate_reuses_a_retained_cache_entry_but_never_its_run_identity_claim(
     tmp_path: Path,
 ) -> None:
+    """The retained entry saves the artifact download; the identity question is asked again."""
+
     repo, _pre_r07, release_a, release_b = _release_repo(tmp_path)
     gate, transport, verifier = _gate(tmp_path, responses=_gate_responses(repo, release_b))
     gate.evaluate(
@@ -1690,7 +1742,7 @@ def test_gate_reuses_a_retained_cache_entry_without_any_network_call(
     )
 
     assert decision.allowed is True
-    assert transport.requests == []
+    assert transport.requests == [r07_deploy_evidence.workflow_runs_url(release_b)]
     assert verifier.calls == [release_b]
 
 
@@ -1752,3 +1804,524 @@ def test_gate_rejects_an_unavailable_evidence_channel(tmp_path: Path) -> None:
 
 def test_gate_default_verifier_is_the_single_private_verifier() -> None:
     assert r07_deploy_evidence.DEFAULT_EVIDENCE_VERIFIER is differential_gate.verify_wire
+
+
+# ---------------------------------------------------------------------------------------
+# Cache trust boundary (Codex round-2 order 2026-08-25, item P1-2)
+# ---------------------------------------------------------------------------------------
+
+
+def _run_identity_responses(
+    commit_sha: str,
+    *,
+    runs: list[dict[str, object]] | None = None,
+) -> dict[str, bytes]:
+    """Only the workflow-runs query: a cache hit never downloads the artifact again."""
+
+    payload = [_run_payload(head_sha=commit_sha)] if runs is None else runs
+    return {
+        r07_deploy_evidence.workflow_runs_url(commit_sha): json.dumps(
+            {"total_count": len(payload), "workflow_runs": payload}
+        ).encode()
+    }
+
+
+def _plant_cache_entry(
+    repo: Path,
+    tmp_path: Path,
+    commit_sha: str,
+    *,
+    workflow_run_id: int = RUN_ID,
+    run_attempt: int = 2,
+    cache_dir: Path | None = None,
+) -> Path:
+    """Write a byte-legal, digest-consistent entry the way a deploy-user attacker could."""
+
+    directory = cache_dir or tmp_path / "var" / "r07-dr-evidence"
+    tree_sha = _git(repo, "rev-parse", "--verify", f"{commit_sha}^{{tree}}")
+    return r07_deploy_evidence.write_cached_evidence(
+        cache_dir=directory,
+        commit_sha=commit_sha,
+        payload=_valid_wire_bytes(
+            commit_sha,
+            tree_sha,
+            policy=_target_policy_of(repo, commit_sha),
+            workflow_run_id=workflow_run_id,
+            run_attempt=run_attempt,
+        ),
+    )
+
+
+def _evaluate_release_b(
+    gate: object,
+    repo: Path,
+    release_a: str,
+    release_b: str,
+) -> object:
+    return gate.evaluate(
+        repo=repo,
+        runner=_RealGitRunner(repo),
+        git_path=Path("/usr/bin/git"),
+        installed_commit_sha=release_a,
+        target_commit_sha=release_b,
+    )
+
+
+def test_planted_cache_entry_is_refused_when_github_cannot_confirm_the_run(
+    tmp_path: Path,
+) -> None:
+    """The headline P1-2 red test: a plausible planted entry is not evidence of a CI run."""
+
+    repo, _pre_r07, release_a, release_b = _release_repo(tmp_path)
+    _plant_cache_entry(repo, tmp_path, release_b)
+    gate, transport, verifier = _gate(tmp_path, responses={})
+
+    decision = _evaluate_release_b(gate, repo, release_a, release_b)
+
+    assert decision.allowed is False
+    assert decision.gate == "rejected"
+    assert transport.requests == [r07_deploy_evidence.workflow_runs_url(release_b)]
+    assert verifier.calls == []
+
+
+def test_planted_cache_entry_naming_an_unknown_run_identity_is_overwritten(
+    tmp_path: Path,
+) -> None:
+    """A disagreeing entry is stale bytes, not a verdict: the channel simply re-supplies them."""
+
+    repo, _pre_r07, release_a, release_b = _release_repo(tmp_path)
+    entry = _plant_cache_entry(repo, tmp_path, release_b, workflow_run_id=777_001)
+    planted = entry.read_bytes()
+    gate, _transport, verifier = _gate(tmp_path, responses=_gate_responses(repo, release_b))
+
+    decision = _evaluate_release_b(gate, repo, release_a, release_b)
+
+    assert decision.allowed is True
+    assert decision.gate == "enforced"
+    retained = entry.read_bytes()
+    assert retained != planted
+    assert json.loads(retained)["workflow_run_id"] == RUN_ID
+    assert verifier.calls == [release_b, release_b]
+
+
+def test_planted_cache_entry_naming_an_unknown_run_identity_blocks_without_an_artifact(
+    tmp_path: Path,
+) -> None:
+    """Falling back to the download path is not a way through when the channel cannot supply."""
+
+    repo, _pre_r07, release_a, release_b = _release_repo(tmp_path)
+    _plant_cache_entry(repo, tmp_path, release_b, workflow_run_id=777_001)
+    gate, _transport, verifier = _gate(
+        tmp_path,
+        responses=_run_identity_responses(release_b),
+    )
+
+    decision = _evaluate_release_b(gate, repo, release_a, release_b)
+
+    assert decision.allowed is False
+    assert decision.gate == "rejected"
+    assert verifier.calls == []
+
+
+def test_a_superseded_cache_attempt_is_replaced_by_a_fresh_download(tmp_path: Path) -> None:
+    """`Re-run all jobs` supersedes attempt 1; the entry written for it must not brick rollback.
+
+    GitHub's run list reports only the current attempt, so attempt 1 becomes invisible and the
+    retained entry can never match again. Treating that as a miss re-downloads the evidence the
+    channel resolves now and atomically replaces the entry, leaving no stale bytes behind.
+    """
+
+    repo, _pre_r07, release_a, release_b = _release_repo(tmp_path)
+    entry = _plant_cache_entry(repo, tmp_path, release_b, run_attempt=1)
+    superseded = entry.read_bytes()
+    assert json.loads(superseded)["run_attempt"] == 1
+    gate, transport, verifier = _gate(tmp_path, responses=_gate_responses(repo, release_b))
+
+    decision = _evaluate_release_b(gate, repo, release_a, release_b)
+
+    assert decision.allowed is True
+    assert decision.gate == "enforced"
+    retained = entry.read_bytes()
+    assert retained != superseded
+    assert json.loads(retained)["run_attempt"] == 2
+    assert [path.name for path in sorted(entry.parent.iterdir())] == [f"{release_b}.json"]
+    assert verifier.calls == [release_b, release_b]
+    assert transport.requests == [
+        r07_deploy_evidence.workflow_runs_url(release_b),
+        r07_deploy_evidence.workflow_runs_url(release_b),
+        r07_deploy_evidence.run_artifacts_url(RUN_ID),
+        "https://api.github.com/artifact/91/zip",
+    ]
+
+
+def test_a_superseded_cache_attempt_still_blocks_when_the_artifact_has_expired(
+    tmp_path: Path,
+) -> None:
+    repo, _pre_r07, release_a, release_b = _release_repo(tmp_path)
+    entry = _plant_cache_entry(repo, tmp_path, release_b, run_attempt=1)
+    superseded = entry.read_bytes()
+    gate, _transport, verifier = _gate(
+        tmp_path,
+        responses=_run_identity_responses(release_b),
+    )
+
+    decision = _evaluate_release_b(gate, repo, release_a, release_b)
+
+    assert decision.allowed is False
+    assert decision.gate == "rejected"
+    assert entry.read_bytes() == superseded
+    assert verifier.calls == []
+
+
+def test_cache_hit_is_blocked_when_the_target_has_no_single_push_main_run(
+    tmp_path: Path,
+) -> None:
+    repo, _pre_r07, release_a, release_b = _release_repo(tmp_path)
+    _plant_cache_entry(repo, tmp_path, release_b)
+    gate, _transport, verifier = _gate(
+        tmp_path,
+        responses=_run_identity_responses(
+            release_b,
+            runs=[
+                _run_payload(head_sha=release_b, id=RUN_ID),
+                _run_payload(head_sha=release_b, id=RUN_ID + 1),
+            ],
+        ),
+    )
+
+    decision = _evaluate_release_b(gate, repo, release_a, release_b)
+
+    assert decision.allowed is False
+    assert decision.gate == "rejected"
+    assert verifier.calls == []
+
+
+def test_cache_hit_reverifies_the_run_identity_and_skips_only_the_artifact_download(
+    tmp_path: Path,
+) -> None:
+    """The control: a retained entry whose run identity still confirms is accepted."""
+
+    repo, _pre_r07, release_a, release_b = _release_repo(tmp_path)
+    _plant_cache_entry(repo, tmp_path, release_b)
+    gate, transport, verifier = _gate(
+        tmp_path,
+        responses=_run_identity_responses(release_b),
+    )
+
+    decision = _evaluate_release_b(gate, repo, release_a, release_b)
+
+    assert decision.allowed is True
+    assert decision.gate == "enforced"
+    assert transport.requests == [r07_deploy_evidence.workflow_runs_url(release_b)]
+    assert verifier.calls == [release_b]
+
+
+def test_cache_entry_reached_through_a_symlinked_ancestor_is_refused(tmp_path: Path) -> None:
+    """``O_NOFOLLOW`` on the final component never covered a swapped parent directory."""
+
+    repo, _pre_r07, release_a, release_b = _release_repo(tmp_path)
+    real = tmp_path / "real"
+    real.mkdir()
+    (tmp_path / "var").symlink_to(real, target_is_directory=True)
+    _plant_cache_entry(repo, tmp_path, release_b)
+    gate, _transport, verifier = _gate(
+        tmp_path,
+        responses=_run_identity_responses(release_b),
+    )
+
+    decision = _evaluate_release_b(gate, repo, release_a, release_b)
+
+    assert decision.allowed is False
+    assert decision.gate == "rejected"
+    assert verifier.calls == []
+
+
+def test_group_writable_cache_entry_is_refused(tmp_path: Path) -> None:
+    repo, _pre_r07, release_a, release_b = _release_repo(tmp_path)
+    entry = _plant_cache_entry(repo, tmp_path, release_b)
+    entry.chmod(0o664)
+    gate, _transport, verifier = _gate(
+        tmp_path,
+        responses=_run_identity_responses(release_b),
+    )
+
+    decision = _evaluate_release_b(gate, repo, release_a, release_b)
+
+    assert decision.allowed is False
+    assert decision.gate == "rejected"
+    assert verifier.calls == []
+
+
+def test_group_writable_cache_directory_is_refused(tmp_path: Path) -> None:
+    repo, _pre_r07, release_a, release_b = _release_repo(tmp_path)
+    entry = _plant_cache_entry(repo, tmp_path, release_b)
+    entry.parent.chmod(0o775)
+    gate, _transport, verifier = _gate(
+        tmp_path,
+        responses=_run_identity_responses(release_b),
+    )
+
+    decision = _evaluate_release_b(gate, repo, release_a, release_b)
+
+    assert decision.allowed is False
+    assert decision.gate == "rejected"
+    assert verifier.calls == []
+
+
+def test_hard_linked_cache_entry_is_refused(tmp_path: Path) -> None:
+    repo, _pre_r07, release_a, release_b = _release_repo(tmp_path)
+    entry = _plant_cache_entry(repo, tmp_path, release_b)
+    os.link(entry, tmp_path / "second-name.json")
+    gate, _transport, verifier = _gate(
+        tmp_path,
+        responses=_run_identity_responses(release_b),
+    )
+
+    decision = _evaluate_release_b(gate, repo, release_a, release_b)
+
+    assert decision.allowed is False
+    assert decision.gate == "rejected"
+    assert verifier.calls == []
+
+
+def test_cache_entry_owned_by_another_identity_is_refused(tmp_path: Path) -> None:
+    """The expected owner is configurable so a root-owned cache is a value change, not a fork."""
+
+    directory = _cache_dir(tmp_path)
+    policy = _policy()
+    r07_deploy_evidence.write_cached_evidence(
+        cache_dir=directory,
+        commit_sha=COMMIT_B,
+        payload=_valid_wire_bytes(COMMIT_B, TREE_B, policy=policy),
+    )
+    foreign = r07_deploy_evidence.EvidenceCacheTrustV1(
+        trusted_root=tmp_path,
+        expected_uid=os.geteuid() + 1,
+        expected_gids=(os.getegid(), 0),
+        allow_sticky_ancestors=False,
+    )
+
+    with pytest.raises(r07_deploy_evidence.R07EvidenceError, match="trusted regular file"):
+        r07_deploy_evidence.read_cached_evidence(
+            cache_dir=directory,
+            commit_sha=COMMIT_B,
+            tree_sha=TREE_B,
+            policy=policy,
+            run_identity=_identity(),
+            trust=foreign,
+        )
+
+
+def test_cache_entry_larger_than_one_plausible_wire_is_refused(tmp_path: Path) -> None:
+    directory = _cache_dir(tmp_path)
+    policy = _policy()
+    entry = directory / f"{COMMIT_B}.json"
+    entry.write_bytes(_valid_wire_bytes(COMMIT_B, TREE_B, policy=policy) + b" " * (64 * 1024))
+    entry.chmod(0o644)
+
+    assert entry.stat().st_size > 64 * 1024
+    with pytest.raises(r07_deploy_evidence.R07EvidenceError, match="trusted regular file"):
+        r07_deploy_evidence.read_cached_evidence(
+            cache_dir=directory,
+            commit_sha=COMMIT_B,
+            tree_sha=TREE_B,
+            policy=policy,
+            run_identity=_identity(),
+            trust=_lab_trust(tmp_path),
+        )
+
+
+def test_a_sticky_ancestor_is_tolerated_only_under_an_explicit_lab_root(tmp_path: Path) -> None:
+    sticky = tmp_path / "sticky"
+    sticky.mkdir()
+    directory = sticky / "r07-dr-evidence"
+    policy = _policy()
+    r07_deploy_evidence.write_cached_evidence(
+        cache_dir=directory,
+        commit_sha=COMMIT_B,
+        payload=_valid_wire_bytes(COMMIT_B, TREE_B, policy=policy),
+    )
+    sticky.chmod(0o1777)
+
+    with pytest.raises(r07_deploy_evidence.R07EvidenceError, match="trusted regular file"):
+        r07_deploy_evidence.read_cached_evidence(
+            cache_dir=directory,
+            commit_sha=COMMIT_B,
+            tree_sha=TREE_B,
+            policy=policy,
+            run_identity=_identity(),
+            trust=_lab_trust(tmp_path),
+        )
+
+    wire = r07_deploy_evidence.read_cached_evidence(
+        cache_dir=directory,
+        commit_sha=COMMIT_B,
+        tree_sha=TREE_B,
+        policy=policy,
+        run_identity=_identity(),
+        trust=_lab_trust(tmp_path, allow_sticky_ancestors=True),
+    )
+
+    assert wire is not None
+    assert wire.candidate_commit_sha == COMMIT_B
+
+
+def test_a_world_writable_ancestor_without_the_sticky_bit_is_never_tolerated(
+    tmp_path: Path,
+) -> None:
+    loose = tmp_path / "loose"
+    loose.mkdir()
+    directory = loose / "r07-dr-evidence"
+    policy = _policy()
+    r07_deploy_evidence.write_cached_evidence(
+        cache_dir=directory,
+        commit_sha=COMMIT_B,
+        payload=_valid_wire_bytes(COMMIT_B, TREE_B, policy=policy),
+    )
+    loose.chmod(0o777)
+
+    for trust in (_lab_trust(tmp_path), _lab_trust(tmp_path, allow_sticky_ancestors=True)):
+        with pytest.raises(r07_deploy_evidence.R07EvidenceError, match="trusted regular file"):
+            r07_deploy_evidence.read_cached_evidence(
+                cache_dir=directory,
+                commit_sha=COMMIT_B,
+                tree_sha=TREE_B,
+                policy=policy,
+                run_identity=_identity(),
+                trust=trust,
+            )
+
+
+def test_linux_production_cache_trust_never_tolerates_a_sticky_ancestor() -> None:
+    with pytest.raises(ValidationError, match="sticky"):
+        r07_deploy_evidence.EvidenceCacheTrustV1(
+            trusted_root=Path("/"),
+            expected_uid=os.geteuid(),
+            expected_gids=(os.getegid(),),
+            allow_sticky_ancestors=True,
+        )
+
+
+def test_the_default_deployment_cache_trust_is_the_process_identity_rooted_at_slash() -> None:
+    trust = r07_deploy_evidence.EvidenceCacheTrustV1.for_deployment_process()
+
+    assert trust.trusted_root == Path("/")
+    assert trust.expected_uid == os.geteuid()
+    assert trust.allow_sticky_ancestors is False
+
+
+def test_the_cache_trusted_root_must_be_absolute_and_canonical(tmp_path: Path) -> None:
+    for root in (Path("relative/root"), tmp_path / ".." / tmp_path.name):
+        with pytest.raises(ValidationError, match="canonical"):
+            r07_deploy_evidence.EvidenceCacheTrustV1(
+                trusted_root=root,
+                expected_uid=os.geteuid(),
+                expected_gids=(os.getegid(),),
+                allow_sticky_ancestors=False,
+            )
+
+
+def test_the_gate_defaults_to_the_production_cache_trust(tmp_path: Path) -> None:
+    gate = r07_deploy_evidence.R07DeployEvidenceGate(
+        cache_dir=tmp_path / "var" / "r07-dr-evidence",
+        transport=_FakeTransport({}),
+        token_provider=_FakeTokenProvider(),
+    )
+
+    assert gate.cache_trust == r07_deploy_evidence.EvidenceCacheTrustV1.for_deployment_process()
+
+
+def test_the_cache_write_leaves_no_group_writable_ancestor_behind(tmp_path: Path) -> None:
+    """The read walk refuses a group-writable parent, so the writer may not create one."""
+
+    directory = tmp_path / "nested" / "deeper" / "r07-dr-evidence"
+    previous = os.umask(0o000)
+    try:
+        r07_deploy_evidence.write_cached_evidence(
+            cache_dir=directory,
+            commit_sha=COMMIT_B,
+            payload=_valid_wire_bytes(COMMIT_B, TREE_B, policy=_policy()),
+        )
+    finally:
+        os.umask(previous)
+
+    for created in (tmp_path / "nested", tmp_path / "nested" / "deeper", directory):
+        assert stat.S_IMODE(created.lstat().st_mode) == 0o755
+
+
+# ---------------------------------------------------------------------------------------
+# The other half of the degradation boundary: only staleness may become a cache miss
+# ---------------------------------------------------------------------------------------
+
+
+def _plant_cache_bytes(tmp_path: Path, commit_sha: str, payload: bytes) -> Path:
+    """Write arbitrary bytes through the real writer, so modes and atomicity are the real ones."""
+
+    return r07_deploy_evidence.write_cached_evidence(
+        cache_dir=tmp_path / "var" / "r07-dr-evidence",
+        commit_sha=commit_sha,
+        payload=payload,
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        pytest.param("candidate_tree_sha", "0" * 40, id="tree"),
+        pytest.param("policy_digest", "1" * 64, id="policy-digest"),
+    ],
+)
+def test_a_wrongly_bound_cache_entry_blocks_and_is_never_redownloaded(
+    tmp_path: Path,
+    field: str,
+    value: str,
+) -> None:
+    """Everything the channel *can* answer is available here, and it still must not be asked.
+
+    A retained entry that is not bound to this target says the deployment host is not what it
+    should be. Unlike a superseded attempt, that is not staleness, so it blocks where it stands
+    instead of being quietly repaired by a download.
+    """
+
+    repo, _pre_r07, release_a, release_b = _release_repo(tmp_path)
+    tree_sha = _git(repo, "rev-parse", "--verify", f"{release_b}^{{tree}}")
+    payload = json.loads(
+        _valid_wire_bytes(release_b, tree_sha, policy=_target_policy_of(repo, release_b))
+    )
+    payload[field] = value
+    entry = _plant_cache_bytes(
+        tmp_path,
+        release_b,
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(),
+    )
+    planted = entry.read_bytes()
+    gate, transport, verifier = _gate(tmp_path, responses=_gate_responses(repo, release_b))
+
+    decision = _evaluate_release_b(gate, repo, release_a, release_b)
+
+    assert decision.allowed is False
+    assert decision.gate == "rejected"
+    assert entry.read_bytes() == planted
+    assert verifier.calls == []
+    assert transport.requests == [r07_deploy_evidence.workflow_runs_url(release_b)]
+
+
+def test_a_filesystem_noncompliant_cache_entry_blocks_even_when_the_channel_could_supply(
+    tmp_path: Path,
+) -> None:
+    """A group-writable entry is refused before the channel is asked anything at all."""
+
+    repo, _pre_r07, release_a, release_b = _release_repo(tmp_path)
+    entry = _plant_cache_entry(repo, tmp_path, release_b)
+    entry.chmod(0o664)
+    planted = entry.read_bytes()
+    gate, transport, verifier = _gate(tmp_path, responses=_gate_responses(repo, release_b))
+
+    decision = _evaluate_release_b(gate, repo, release_a, release_b)
+
+    assert decision.allowed is False
+    assert decision.gate == "rejected"
+    assert entry.read_bytes() == planted
+    assert stat.S_IMODE(entry.lstat().st_mode) == 0o664
+    assert verifier.calls == []
+    assert transport.requests == []
