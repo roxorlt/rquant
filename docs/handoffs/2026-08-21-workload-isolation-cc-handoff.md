@@ -168,6 +168,25 @@ cce9ea76 test(r07): harden cold-start probe evidence
 - 所有持久化前后不变量、fsync/atomic pointer、SQLite generation ownership 必须可验证。
 - 不得借此实现或激活生产 v3 writer；未来 v3 publication primitive 仍需单独授权。
 
+> **本轮撤回（Codex round-2 order 2026-08-25，裁决 1）**
+>
+> 上面 WP5 小节的原文保留不改，但其中两项要求已由 Codex 在第二轮工单里**撤回**，不再是本次
+> 交付的验收条件：
+>
+> 1. 「完成未决的 ticket/claim/finalize 状态机」——该状态机在规格与代码里都没有锚点，属于本
+>    交接文档单方面引入的新要求。
+> 2. 「SQLite generation ownership」——同样没有规格/代码锚点。
+>
+> **保留有效的部分**：既有的 job/shard claim-finalize 语义与既有的 immutable generation 语义
+> 一字不改，继续按原样验收；崩溃、orphan、retry、duplicate、conflict、concurrency 覆盖要求
+> 保留；fsync/atomic pointer 的可验证性要求保留；「不得实现或激活生产 v3 writer」保留。
+>
+> **再引入的门槛**：若将来确实需要新的 ticket/claim/finalize 状态机或 SQLite generation
+> ownership 语义，必须另开 ADR 并单独获得授权，不能借这份交接文档的历史措辞引入。
+>
+> WP5 的实际交付已按 `wp5-rulings.md` R1 执行（两项均未实现），因此本条撤回**不产生任何代码
+> 变更**，只是把交接文档与实际交付和 Codex 裁决对齐。
+
 ### WP6：最终回归、合版和上线
 
 - 精确更新 full-suite manifest。
