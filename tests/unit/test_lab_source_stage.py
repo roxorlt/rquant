@@ -964,7 +964,14 @@ def test_job_store_fence_verifier_rejects_forged_stale_and_replaced_authorities(
     _unlink_sqlite_family(jobs_path)
     replacement_store = LabJobStore(jobs_path)
     replacement_store.initialize()
-    with pytest.raises(Exception, match="scheduler fence receipt authority changed"):
+    # ext4 hands the just-freed inode back, so a store recreated at the same
+    # path can present the same (device, inode) generation the receipt recorded
+    # and the verifier reaches its lease check first. Either way the fence must
+    # refuse the receipt.
+    with pytest.raises(
+        Exception,
+        match="scheduler fence receipt (authority changed|lease is missing)",
+    ):
         JobStoreSchedulerFenceVerifier(replacement_store).verify_current(
             receipt,
             binding=binding,

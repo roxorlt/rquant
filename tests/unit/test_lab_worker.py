@@ -3482,10 +3482,15 @@ def _worker(
     v2_claim_publication_enabled: bool = False,
     heartbeat_interval_seconds: float = 60.0,
     resource_recheck_interval_seconds: float = 1.0,
-    resource_probe_timeout_seconds: float = 1.0,
+    # Spawning the probe provider is a full CPython start-up; one second is a
+    # fast developer machine's budget, not a shared CI runner's. Cases that
+    # exercise the timeout itself pass their own value.
+    resource_probe_timeout_seconds: float = 10.0,
     lease_extension_seconds: int = 30,
     quarantine_reconcile_interval_seconds: float = 300.0,
-    receipt_timeout_seconds: float = 0.2,
+    # Same reasoning as resource_probe_timeout_seconds: the receipt round trip
+    # crosses a process boundary.
+    receipt_timeout_seconds: float = 5.0,
     exploratory_store_factory=_store_factory,
     metadata_store_factory=None,
     lake_root: Path | None = None,
@@ -5582,6 +5587,9 @@ def test_receipt_phase_does_not_consume_prepublication_budget(
         ),
         require_resource_admission=True,
         monotonic_clock=lambda: clock_microseconds[0] / 1_000_000,
+        # This case is about the receipt budget itself, so it pins the value
+        # instead of inheriting the helper's CI-sized default.
+        receipt_timeout_seconds=0.2,
     )
     assert worker._receipt_wait_timeout_seconds() == pytest.approx(0.2)
 
