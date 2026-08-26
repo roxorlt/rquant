@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -26,6 +27,7 @@ from rquant.release_generation import (
     ReleaseGenerationCommit,
     ReleaseGenerationError,
     ReleaseGenerationMarker,
+    _interpreter_identity_failures,
     _read_private_json,
     _verified_interpreter,
     _write_private_json,
@@ -796,6 +798,75 @@ def _publish_initialized(
         transaction_kind="initialization",
     )
     return marker
+
+
+_OK_MODE = stat.S_IFREG | 0o700
+
+
+def _identity_stat(
+    *,
+    mode: int = _OK_MODE,
+    nlink: int = 1,
+    uid: int | None = None,
+) -> os.stat_result:
+    """Build the exact metadata `_interpreter_identity_failures` inspects."""
+    return os.stat_result(
+        (mode, 1, 1, nlink, os.getuid() if uid is None else uid, 0, 1, 0, 0, 0)
+    )
+
+
+@pytest.mark.parametrize(
+    ("observed", "expected"),
+    (
+        pytest.param(_identity_stat(), (), id="accepted"),
+        pytest.param(
+            _identity_stat(mode=stat.S_IFDIR | 0o700),
+            ("regular-file",),
+            id="regular-file",
+        ),
+        # A symlink is never a regular file, so this predicate cannot fail on
+        # its own; pinning the pair still fails if the clause is deleted.
+        pytest.param(
+            _identity_stat(mode=stat.S_IFLNK | 0o700),
+            ("regular-file", "not-a-symlink"),
+            id="not-a-symlink",
+        ),
+        pytest.param(
+            _identity_stat(uid=os.getuid() + 1),
+            ("owned-by-caller",),
+            id="owned-by-caller",
+        ),
+        pytest.param(_identity_stat(nlink=2), ("single-link",), id="single-link"),
+        pytest.param(
+            _identity_stat(mode=stat.S_IFREG | 0o720),
+            ("no-group-or-other-write",),
+            id="group-write",
+        ),
+        pytest.param(
+            _identity_stat(mode=stat.S_IFREG | 0o702),
+            ("no-group-or-other-write",),
+            id="other-write",
+        ),
+        pytest.param(
+            _identity_stat(mode=stat.S_IFREG | 0o600),
+            ("owner-executable",),
+            id="owner-executable",
+        ),
+    ),
+)
+def test_interpreter_identity_predicates_each_have_a_red_case(
+    observed: os.stat_result,
+    expected: tuple[str, ...],
+) -> None:
+    """Delete any one predicate and exactly one of these cases turns red.
+
+    P1-7's first prohibition is that this identity check must not be relaxed,
+    and this work package refactored it. The end-to-end cases only reach three
+    of the six predicates, so the guarantee lives here: the helper is pure, so
+    every predicate can be pinned from constructed metadata without a second
+    uid and without root.
+    """
+    assert _interpreter_identity_failures(observed) == expected
 
 
 def test_verified_interpreter_rejection_names_every_failed_predicate(tmp_path: Path) -> None:
