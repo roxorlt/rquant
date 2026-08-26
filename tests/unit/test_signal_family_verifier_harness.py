@@ -1189,11 +1189,11 @@ class TestGenerationFixtureChannel:
             )
 
     @pytest.mark.parametrize(
-        "script",
+        ("script", "escaped_name"),
         [
-            "ATTACH DATABASE '/tmp/rquant-escape.db' AS escape;",
-            "CREATE TABLE t(a);\nVACUUM INTO '/tmp/rquant-escape-vacuum.db';",
-            "DETACH DATABASE main;",
+            ("ATTACH DATABASE '{escaped}' AS other;", "attached.db"),
+            ("CREATE TABLE t(a);\nVACUUM INTO '{escaped}';", "vacuumed.db"),
+            ("DETACH DATABASE main;", None),
         ],
         ids=["attach", "vacuum-into", "detach"],
     )
@@ -1201,25 +1201,31 @@ class TestGenerationFixtureChannel:
         self,
         tmp_path: Path,
         script: str,
+        escaped_name: str | None,
     ) -> None:
         """Reviewer finding `R2E-SPEC-02`: `executescript` is not a closed operation.
 
         `ATTACH DATABASE` and `VACUUM INTO` both name a path of the script's choosing, so a
         replay is only contained if the statement kinds are. The authorizer permits exactly
         the actions a canonical dump of the producer schema performs and denies the rest.
+
+        The attach alias is `other` on purpose. Reviewer finding `R2E-SPEC-08`: the first
+        version of this case used `AS escape`, and `ESCAPE` is a SQLite keyword — the
+        statement failed to parse, so the case passed whether or not the authorizer was
+        installed and proved nothing about `ATTACH`. With a non-reserved alias the statement
+        parses, reaches the authorizer, and removing the authorizer turns this case red.
         """
 
         from rquant.signal_family_verifier_harness._workspace import replay_sql_script
 
         target = tmp_path / "replayed.sqlite3"
-        escape = Path("/tmp/rquant-escape.db")
-        vacuum_escape = Path("/tmp/rquant-escape-vacuum.db")
+        escaped = tmp_path / (escaped_name or "unreferenced.db")
+        payload = script.format(escaped=escaped)
 
         with pytest.raises(_surfaces.WorkspaceError, match="not replayable"):
-            replay_sql_script(target, script)
+            replay_sql_script(target, payload)
 
-        assert not escape.exists()
-        assert not vacuum_escape.exists()
+        assert not escaped.exists()
 
     def test_the_authorizer_still_admits_the_real_producer_dump(self, tmp_path: Path) -> None:
         """The closed action set is derived from this dump, so it has to keep replaying it."""
