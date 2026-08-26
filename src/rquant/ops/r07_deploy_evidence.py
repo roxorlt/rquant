@@ -81,6 +81,17 @@ class R07EvidenceError(RuntimeError):
     """The R07 deployment evidence channel refused the requested target."""
 
 
+class R07StaleRunIdentityError(R07EvidenceError):
+    """Evidence names a workflow run and attempt the fixed channel no longer resolves.
+
+    On the download path this is a hard refusal: the artifact just fetched must name the run it
+    was fetched from. On the cache path it means the retained bytes went stale — re-running all
+    jobs supersedes the attempt an entry was written for, and GitHub's run list then reports only
+    the current attempt — so the deployer treats the entry as a miss and downloads what the
+    channel resolves now, rather than blocking a target that is still perfectly deployable.
+    """
+
+
 class CommandRunner(Protocol):
     def run(
         self,
@@ -582,7 +593,7 @@ def bind_evidence_wire(
         run_identity.workflow_run_id,
         run_identity.run_attempt,
     ):
-        raise R07EvidenceError(
+        raise R07StaleRunIdentityError(
             "evidence does not name the resolved push main run identity and attempt"
         )
     try:
@@ -995,50 +1006,68 @@ class R07DeployEvidenceGate:
         commit_sha: str,
         tree_sha: str,
     ) -> R07DrGateEvidenceWireV1:
-        raw = read_cache_entry_bytes(
+        retained = read_cache_entry_bytes(
             cache_dir=self._cache_dir,
             commit_sha=commit_sha,
             trust=self._cache_trust,
         )
-        if raw is None:
-            raw, identity = download_evidence_bytes(
-                commit_sha=commit_sha,
-                transport=self._transport,
-                token_provider=self._token_provider,
-                clock=self._clock,
-            )
-            downloaded = bind_evidence_wire(
-                raw,
-                commit_sha=commit_sha,
-                tree_sha=tree_sha,
-                policy=policy,
-                run_identity=identity,
-            )
-            self._verify(repo, policy, downloaded)
-            write_cached_evidence(
-                cache_dir=self._cache_dir,
-                commit_sha=commit_sha,
-                payload=raw,
-            )
-            raw = read_cache_entry_bytes(
-                cache_dir=self._cache_dir,
-                commit_sha=commit_sha,
-                trust=self._cache_trust,
-            )
-            if raw is None:
-                raise R07EvidenceError("the retained evidence cache entry disappeared")
-        else:
+        if retained is not None:
             # A cache hit saves the artifact download, never the identity question: the fixed
-            # channel is asked again which push-main run and attempt owns this exact target,
-            # and an unreachable or disagreeing channel blocks the deployment.
+            # channel is asked again which push-main run and attempt owns this exact target. An
+            # unreachable channel, a missing token, or a target with no single push-main run
+            # blocks here — nothing below can recover from not knowing the answer.
             identity = resolve_run_identity(
                 commit_sha=commit_sha,
                 transport=self._transport,
                 token_provider=self._token_provider,
                 clock=self._clock,
             )
-        cached = bind_evidence_wire(
+            try:
+                cached = bind_evidence_wire(
+                    retained,
+                    commit_sha=commit_sha,
+                    tree_sha=tree_sha,
+                    policy=policy,
+                    run_identity=identity,
+                )
+            except R07StaleRunIdentityError:
+                # The channel answered, and the answer is not the run these bytes were written
+                # for. That is staleness, not a verdict: fall through to the download path,
+                # which re-verifies everything from scratch and replaces the entry. Every other
+                # refusal — unreadable entry, wrong commit or tree, wrong policy, channel drift
+                # — still blocks, because those say the deployment host is not what it should be.
+                pass
+            else:
+                self._verify(repo, policy, cached)
+                return cached
+        raw, identity = download_evidence_bytes(
+            commit_sha=commit_sha,
+            transport=self._transport,
+            token_provider=self._token_provider,
+            clock=self._clock,
+        )
+        downloaded = bind_evidence_wire(
             raw,
+            commit_sha=commit_sha,
+            tree_sha=tree_sha,
+            policy=policy,
+            run_identity=identity,
+        )
+        self._verify(repo, policy, downloaded)
+        write_cached_evidence(
+            cache_dir=self._cache_dir,
+            commit_sha=commit_sha,
+            payload=raw,
+        )
+        rewritten = read_cache_entry_bytes(
+            cache_dir=self._cache_dir,
+            commit_sha=commit_sha,
+            trust=self._cache_trust,
+        )
+        if rewritten is None:
+            raise R07EvidenceError("the retained evidence cache entry disappeared")
+        cached = bind_evidence_wire(
+            rewritten,
             commit_sha=commit_sha,
             tree_sha=tree_sha,
             policy=policy,
