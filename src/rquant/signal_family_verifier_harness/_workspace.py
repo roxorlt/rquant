@@ -135,6 +135,10 @@ class VectorWorkspace:
         self.authorized_fixtures: Mapping[str, AuthorizedGenerationFile] = (
             {} if authorized_fixtures is None else dict(authorized_fixtures)
         )
+        #: Every path `_copy_generation_files` wrote, so a later step can require that a file
+        #: it is about to execute came from the root-verified fixture set rather than from
+        #: text the vector inlined.
+        self.materialized_fixtures: set[Path] = set()
         for directory in (self.root, self.state, self.runtime):
             directory.mkdir(mode=0o700, parents=True, exist_ok=False)
 
@@ -147,15 +151,51 @@ class VectorWorkspace:
             shutil.copytree(self.state, self.scratch)
         return self.scratch
 
+    def authorized_generation_directories(self) -> frozenset[str]:
+        """The only directories a `@generation/` path may name, derived from the fixture set.
+
+        Reviewer finding `R2E-SPEC-01`: "a directory that contains an authorized fixture" is
+        satisfied by *every ancestor* of one, which walked all the way up to `signal-family/`
+        — and that directory also holds the immutable test manifest and the successor and
+        overlay bundles, none of which are `generation_files` entries and none of which the
+        root checks per byte or folds into its before/after digest.
+
+        The set here is the fixture set's own directory closure and nothing above it: the
+        `dirname` chain of each entry, truncated at the deepest directory common to all of
+        them. `@generation/signal-family` is above that root and is refused. A fixture set
+        whose entries share no directory at all authorizes no directory at all.
+        """
+
+        paths = tuple(sorted(self.authorized_fixtures))
+        if not paths:
+            return frozenset()
+        common = tuple(paths[0].split("/")[:-1])
+        for path in paths[1:]:
+            parts = tuple(path.split("/")[:-1])
+            limit = min(len(common), len(parts))
+            index = 0
+            while index < limit and common[index] == parts[index]:
+                index += 1
+            common = common[:index]
+        if not common:
+            return frozenset()
+        directories: set[str] = set()
+        for path in paths:
+            parts = path.split("/")[:-1]
+            for depth in range(len(common), len(parts) + 1):
+                directories.add("/".join(parts[:depth]))
+        return frozenset(directories)
+
     def generation_path(self, value: str) -> Path:
         """Resolve one `@generation/` path, bounded by what the root actually authorized.
 
         The root checks individual files, not directories, so a bare prefix would let a
-        vector point a production builder at any generation path at all. The rule here is
-        the tightest one the declaration set supports: the target must either *be* an
-        authorized fixture or be a directory that contains one. Everything a surface reads
-        through this prefix is therefore inside the tuple the root verified before the child
-        started and re-digests after it exits.
+        vector point a production builder at any generation path at all. The target must
+        therefore either *be* an authorized fixture or be one of the directories
+        `authorized_generation_directories` derives from the fixture set itself, and no
+        component of the resolved path may be a symbolic link — the whole point of reading
+        an export in place is that the bytes the root digested are the bytes the surface
+        opens, and a symlink anywhere in the walk breaks that.
         """
 
         if self.generation_root is None:
@@ -166,12 +206,50 @@ class VectorWorkspace:
             raise WorkspaceError("generation paths must name something inside the generation")
         if any(part in {"", ".", ".."} for part in parts):
             raise WorkspaceError("generation paths must not contain dot components")
-        authorized = tuple(self.authorized_fixtures)
-        if relative not in authorized and not any(
-            candidate.startswith(f"{relative}/") for candidate in authorized
+        if (
+            relative not in self.authorized_fixtures
+            and relative not in self.authorized_generation_directories()
         ):
             raise WorkspaceError("vector names a generation path the root did not authorize")
+        self._require_unlinked_generation_path(parts)
         return self.generation_root.joinpath(*parts)
+
+    def _require_unlinked_generation_path(self, parts: Sequence[str]) -> None:
+        """Walk the path from the generation root with `O_NOFOLLOW`, refusing any symlink."""
+
+        assert self.generation_root is not None
+        directory_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        descriptors: list[int] = []
+        try:
+            try:
+                parent = os.open(self.generation_root, directory_flags)
+            except OSError as exc:
+                raise WorkspaceError("the generation root is unavailable to the child") from exc
+            descriptors.append(parent)
+            for index, component in enumerate(parts):
+                try:
+                    observed = os.stat(component, dir_fd=parent, follow_symlinks=False)
+                except OSError as exc:
+                    raise WorkspaceError("a generation path component is unavailable") from exc
+                if stat.S_ISLNK(observed.st_mode):
+                    raise WorkspaceError("generation paths must not traverse a symbolic link")
+                if index == len(parts) - 1:
+                    return
+                try:
+                    child = os.open(component, directory_flags, dir_fd=parent)
+                except OSError as exc:
+                    raise WorkspaceError("a generation path component is unavailable") from exc
+                descriptors.append(child)
+                parent = child
+        finally:
+            for descriptor in reversed(descriptors):
+                with suppress(OSError):  # pragma: no cover - descriptors are freshly opened
+                    os.close(descriptor)
 
     def _resolve_declared(self, value: str, *, base: Path) -> Path:
         prefix = RUNTIME_PREFIX if value.startswith(RUNTIME_PREFIX) else WORKSPACE_PREFIX
@@ -298,6 +376,7 @@ class VectorWorkspace:
             target.chmod(authorized.mode)
             stamp = _declared_epoch_seconds(entry["modified_at"])
             os.utime(target, (stamp, stamp), follow_symlinks=False)
+            self.materialized_fixtures.add(target)
 
     def _build_sqlite_sources(self, declared: Any) -> None:
         """Rebuild one SQLite database from a canonical SQL text dump inside the child.
@@ -306,6 +385,14 @@ class VectorWorkspace:
         SQL dump, not its page bytes. The dump is what the generation carries and what the
         root hashes, and the database only ever exists inside this vector's own workspace,
         so no SQLite parser is pulled into the root and no page layout has to be reproduced.
+
+        Reviewer finding `R2E-SPEC-02`: that authority was a convention rather than a rule.
+        The script path resolved anywhere under `@workspace/`, including text the vector had
+        just inlined through `state.files`, so "what the generation carries and what the root
+        hashes" was not what got executed. It now must be one of the files
+        `_copy_generation_files` wrote — a root-verified, policy-hashed fixture — and the
+        replay itself runs under an authorizer that permits only the statement kinds a
+        canonical dump of this schema needs.
         """
 
         if type(declared) is not list:
@@ -322,6 +409,10 @@ class VectorWorkspace:
                 raise WorkspaceError("declared sqlite source mode must be a POSIX mode")
             script = self._resolve_declared(entry["script_path"], base=self.state)
             target = self._resolve_declared(entry["path"], base=self.state)
+            if script not in self.materialized_fixtures:
+                raise WorkspaceError(
+                    "a declared sqlite source script is not an authorized generation fixture"
+                )
             if target.exists():
                 raise WorkspaceError("a declared sqlite source would overwrite an existing file")
             try:
@@ -329,13 +420,7 @@ class VectorWorkspace:
             except OSError as exc:
                 raise WorkspaceError("a declared sqlite source script is unavailable") from exc
             target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            connection = sqlite3.connect(target, isolation_level=None)
-            try:
-                connection.executescript(payload)
-            except sqlite3.Error as exc:
-                raise WorkspaceError("a declared sqlite source script is not replayable") from exc
-            finally:
-                connection.close()
+            replay_sql_script(target, payload)
             target.chmod(mode)
 
 
@@ -357,6 +442,51 @@ def _declared_epoch_seconds(value: Any) -> int:
     if parsed.tzinfo is None:
         raise WorkspaceError("a declared modification time must carry an offset")
     return int(parsed.timestamp())
+
+
+#: The only SQLite authorizer actions a canonical dump of the producer schema performs,
+#: measured against the checked-in `strategy-router` dump rather than guessed. Everything
+#: else is denied, which is what keeps `ATTACH DATABASE` and `VACUUM INTO` — the two ways a
+#: replayed script could reach a file outside this workspace — from running at all.
+_REPLAY_ALLOWED_SQLITE_ACTIONS: Final[frozenset[int]] = frozenset(
+    {
+        sqlite3.SQLITE_CREATE_INDEX,
+        sqlite3.SQLITE_CREATE_TABLE,
+        sqlite3.SQLITE_DELETE,
+        sqlite3.SQLITE_INSERT,
+        sqlite3.SQLITE_READ,
+        sqlite3.SQLITE_REINDEX,
+        sqlite3.SQLITE_TRANSACTION,
+        sqlite3.SQLITE_UPDATE,
+    }
+)
+
+
+def replay_sql_script(target: Path, payload: str) -> None:
+    """Replay one canonical SQL dump into a new database, under a closed authorizer."""
+
+    connection = sqlite3.connect(target, isolation_level=None)
+    try:
+        connection.set_authorizer(_replay_authorizer)
+        connection.executescript(payload)
+    except sqlite3.Error as exc:
+        raise WorkspaceError("a declared sqlite source script is not replayable") from exc
+    finally:
+        connection.close()
+
+
+def _replay_authorizer(
+    action: int,
+    _first: str | None,
+    _second: str | None,
+    _database: str | None,
+    _trigger: str | None,
+) -> int:
+    return (
+        sqlite3.SQLITE_OK
+        if action in _REPLAY_ALLOWED_SQLITE_ACTIONS
+        else sqlite3.SQLITE_DENY
+    )
 
 
 def _read_generation_bytes(root: Path, relative: str) -> bytes:
@@ -417,6 +547,7 @@ def require_declared_sequence(value: Any, *, field: str) -> Sequence[Any]:
 
 __all__ = [
     "GENERATION_PREFIX",
+    "replay_sql_script",
     "MAX_GENERATION_FIXTURE_BYTES",
     "MAX_MATERIALIZED_FILES",
     "VOLATILE_SUFFIXES",

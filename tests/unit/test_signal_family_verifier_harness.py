@@ -1136,8 +1136,14 @@ class TestGenerationFixtureChannel:
         with pytest.raises(WorkspaceError, match=expected):
             _read_generation_bytes(_generation_root(tmp_path), relative)
 
-    def test_a_sqlite_source_that_is_not_replayable_is_refused(self, tmp_path: Path) -> None:
-        """Ruling E-2: the dump is authoritative, so a dump that will not replay is fatal."""
+    def test_an_inlined_sqlite_script_is_refused(self, tmp_path: Path) -> None:
+        """Reviewer finding `R2E-SPEC-02`: the executed script must be generation content.
+
+        Before this was enforced, `script_path` resolved anywhere under `@workspace/`,
+        including bytes the same vector had just written through `state.files`. Ruling E-2's
+        claim — that the authoritative dump is the one the generation carries and the root
+        hashes — was then a convention, not a rule.
+        """
 
         def mutate(payload: dict[str, Any]) -> None:
             payload["state"]["generation_files"] = [
@@ -1146,8 +1152,31 @@ class TestGenerationFixtureChannel:
                 if entry["path"].endswith(".json")
             ]
             payload["state"]["files"] = [
-                {"content": "this is not SQL;", "path": "@workspace/runner-state-v1.sql"}
+                {"content": "CREATE TABLE t(a);", "path": "@workspace/runner-state-v1.sql"}
             ]
+
+        broken = self._rebuild(self._router_vector(tmp_path), mutate)
+
+        with pytest.raises(
+            _surfaces.SurfaceExerciseError,
+            match="not an authorized generation fixture",
+        ):
+            _surfaces.exercise_vector(
+                broken,
+                tmp_path,
+                generation_root=_generation_root(tmp_path),
+                authorized_fixtures=authorized_fixtures(),
+            )
+
+    def test_a_sqlite_source_that_is_not_replayable_is_refused(self, tmp_path: Path) -> None:
+        """Ruling E-2: the dump is authoritative, so a dump that will not replay is fatal.
+
+        The script here *is* an authorized generation fixture — it is the frozen routing
+        policy, which is JSON — so it passes the source check and fails on its content.
+        """
+
+        def mutate(payload: dict[str, Any]) -> None:
+            payload["state"]["sqlite_sources"][0]["script_path"] = "@workspace/routing-policy.json"
 
         broken = self._rebuild(self._router_vector(tmp_path), mutate)
 
@@ -1158,6 +1187,182 @@ class TestGenerationFixtureChannel:
                 generation_root=_generation_root(tmp_path),
                 authorized_fixtures=authorized_fixtures(),
             )
+
+    @pytest.mark.parametrize(
+        "script",
+        [
+            "ATTACH DATABASE '/tmp/rquant-escape.db' AS escape;",
+            "CREATE TABLE t(a);\nVACUUM INTO '/tmp/rquant-escape-vacuum.db';",
+            "DETACH DATABASE main;",
+        ],
+        ids=["attach", "vacuum-into", "detach"],
+    )
+    def test_a_replayed_script_cannot_reach_outside_its_workspace(
+        self,
+        tmp_path: Path,
+        script: str,
+    ) -> None:
+        """Reviewer finding `R2E-SPEC-02`: `executescript` is not a closed operation.
+
+        `ATTACH DATABASE` and `VACUUM INTO` both name a path of the script's choosing, so a
+        replay is only contained if the statement kinds are. The authorizer permits exactly
+        the actions a canonical dump of the producer schema performs and denies the rest.
+        """
+
+        from rquant.signal_family_verifier_harness._workspace import replay_sql_script
+
+        target = tmp_path / "replayed.sqlite3"
+        escape = Path("/tmp/rquant-escape.db")
+        vacuum_escape = Path("/tmp/rquant-escape-vacuum.db")
+
+        with pytest.raises(_surfaces.WorkspaceError, match="not replayable"):
+            replay_sql_script(target, script)
+
+        assert not escape.exists()
+        assert not vacuum_escape.exists()
+
+    def test_the_authorizer_still_admits_the_real_producer_dump(self, tmp_path: Path) -> None:
+        """The closed action set is derived from this dump, so it has to keep replaying it."""
+
+        from rquant.signal_family_verifier_harness._workspace import replay_sql_script
+
+        script = (
+            PRODUCER_FIXTURE_ROOT / "strategy-router" / "runner-state-v1.sql"
+        ).read_text(encoding="utf-8")
+        target = tmp_path / "replayed.sqlite3"
+
+        replay_sql_script(target, script)
+
+        import sqlite3
+
+        connection = sqlite3.connect(target)
+        try:
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+        finally:
+            connection.close()
+        assert {"runner_metadata", "runner_source_identity", "runner_signal"} <= tables
+
+    # -- reviewer finding R2E-SPEC-01: the `@generation/` boundary ---------------------
+
+    @staticmethod
+    def _workspace_over(root: Path) -> Any:
+        installed = _installed_fixtures(root)
+        return _surfaces.VectorWorkspace(
+            root,
+            "f" * 64,
+            generation_root=installed.generation_root,
+            authorized_fixtures=installed.authorized(),
+        )
+
+    def test_the_authorized_directory_set_stops_at_the_fixture_root(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The closure is the fixture set's own directories, never an ancestor of them."""
+
+        workspace = self._workspace_over(tmp_path)
+        entries = tuple(workspace.authorized_fixtures)
+
+        directories = workspace.authorized_generation_directories()
+
+        assert f"{GENERATION_FIXTURE_PREFIX}/strategy-router" in directories
+        assert "signal-family" not in directories
+        assert "" not in directories
+        # Every authorized directory is a `dirname` of some fixture, and every fixture's own
+        # directory is authorized. The closure is exactly the fixture set's, nothing wider.
+        chains = {
+            "/".join(entry.split("/")[:depth])
+            for entry in entries
+            for depth in range(1, len(entry.split("/")))
+        }
+        assert directories <= chains
+        assert {entry.rsplit("/", 1)[0] for entry in entries} <= directories
+        assert all(
+            candidate.startswith(GENERATION_FIXTURE_PREFIX) for candidate in directories
+        )
+
+    @pytest.mark.parametrize(
+        ("declared", "expected"),
+        [
+            ("@generation/signal-family", "did not authorize"),
+            ("@generation/signal-family/test-manifest-v1.json", "did not authorize"),
+            ("@generation/src/rquant/strategy_runner.py", "did not authorize"),
+            ("@generation/../etc/rquant", "dot components"),
+            ("@generation//etc", "inside the generation"),
+        ],
+        ids=["ancestor-directory", "non-entry-sibling", "unrelated-tree", "parent", "absolute"],
+    )
+    def test_a_generation_path_outside_the_fixture_set_is_refused(
+        self,
+        tmp_path: Path,
+        declared: str,
+        expected: str,
+    ) -> None:
+        """Reviewer finding `R2E-SPEC-01` and mutation M2, closed.
+
+        `@generation/signal-family` is the one that matters: that directory also holds the
+        immutable test manifest and the successor and overlay bundles, none of which are
+        `generation_files` entries, so none of them is byte-checked by the root or covered by
+        its before/after digest. Deleting the boundary used to leave every case green.
+        """
+
+        workspace = self._workspace_over(tmp_path)
+
+        with pytest.raises(_surfaces.WorkspaceError, match=expected):
+            workspace.generation_path(declared)
+
+    def test_a_generation_directory_inside_the_fixture_set_is_accepted(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The shadow readers need directories, not files, so the rule cannot be file-only."""
+
+        workspace = self._workspace_over(tmp_path)
+        declared = f"@generation/{GENERATION_FIXTURE_PREFIX}/strategy-router"
+
+        resolved = workspace.generation_path(declared)
+
+        assert resolved == workspace.generation_root / GENERATION_FIXTURE_PREFIX / (
+            "strategy-router"
+        )
+        assert resolved.is_dir()
+
+    def test_a_generation_path_through_a_symbolic_link_is_refused(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Reading in place only means anything if the walk cannot be redirected.
+
+        The link is planted inside a throwaway generation so the shared one, which every
+        other case in this module reads, is left exactly as the root digested it.
+        """
+
+        generation = tmp_path / "linked-generation"
+        generation.mkdir(mode=0o700)
+        installed = install_generation_fixtures(generation)
+        directory = generation / GENERATION_FIXTURE_PREFIX / "strategy-router"
+        target = directory / "runner-state-v1.sql"
+        linked = directory / "linked-state.sql"
+        linked.symlink_to(target)
+        authorized = dict(installed.authorized())
+        relative = f"{GENERATION_FIXTURE_PREFIX}/strategy-router/linked-state.sql"
+        authorized[relative] = authorized[
+            f"{GENERATION_FIXTURE_PREFIX}/strategy-router/runner-state-v1.sql"
+        ]
+        workspace = _surfaces.VectorWorkspace(
+            tmp_path / "linked-workspace",
+            "e" * 64,
+            generation_root=generation,
+            authorized_fixtures=authorized,
+        )
+
+        with pytest.raises(_surfaces.WorkspaceError, match="symbolic link"):
+            workspace.generation_path(f"@generation/{relative}")
 
 
 class TestProducerFixtureBuild:
