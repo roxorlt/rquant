@@ -95,6 +95,15 @@ _PROVIDER_ENTRY_WATCHDOG_SECONDS = 30
 # orderings between them (prologue < deadline < prologue + provider sleep) hold
 # at every scale precisely because none of the three is scaled alone.
 _PROLOGUE_REFERENCE_SECONDS = 0.0125
+# Two cases need a deadline that lands *after* the prologue and *before* the
+# provider returns from an 80ms sleep - an admissible window of one to about
+# seven measured prologues. Twenty milliseconds sat at the very bottom of it:
+# 1.6 prologues, which is inside the spread between a warm sample (7ms) and a
+# cold one (12ms) on the machine that wrote it, so the lower bound held by
+# luck. Forty puts the deadline at the middle of the window - half the
+# provider's sleep - which is the same invariant with margin on both sides
+# rather than none on one.
+_PROVIDER_RACE_DEADLINE_SECONDS = 0.04
 # The calibration dispatch is not under test and must not be the thing that
 # fails when the host is slow, so it gets a watchdog rather than a budget.
 _PROLOGUE_CALIBRATION_DEADLINE_SECONDS = 120.0
@@ -738,40 +747,80 @@ def _claim(service: object, request: SourceBrokerV2ClaimOnceRequest):
     return response
 
 
-@pytest.fixture(scope="module", autouse=True)
-def _calibrate_dispatch_prologue(tmp_path_factory: pytest.TempPathFactory) -> None:
-    """Time what a dispatch spends before the provider, once, in this process.
+class _EntryStampProvider(_CountingProvider):
+    """Records when the service actually handed the call to the provider."""
 
-    The measurement has to happen here rather than in each case: it is a full
-    signed dispatch, and the cases that need it are holding blocking providers
-    by the time they would ask. Taking the slowest of three samples keeps the
-    scale on the conservative side of a host that is still degrading.
+    def __init__(self) -> None:
+        super().__init__()
+        self.dispatch_entered_at: float | None = None
+        self.finalize_entered_at: float | None = None
+
+    def dispatch(self, request: SourceBrokerV2DispatchRequest):
+        self.dispatch_entered_at = time.monotonic()
+        return super().dispatch(request)
+
+    def finalize(self, request: SourceBrokerV2FinalizeRequest):
+        self.finalize_entered_at = time.monotonic()
+        return super().finalize(request)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _calibrate_provider_prologue(tmp_path_factory: pytest.TempPathFactory) -> None:
+    """Time what a call spends before the provider, once, in this process.
+
+    Both phases are measured and the larger wins: finalize verifies a second
+    claim receipt and writes more ledger rows than dispatch, and it is the
+    finalize case that went red. The measurement has to happen at module scope
+    rather than inside each case - it is a full signed round trip, and the
+    cases that need it are holding blocking providers by the time they would
+    ask. Taking the slowest of three keeps the scale on the conservative side
+    of a host that is still degrading.
     """
     global _prologue_scale
 
-    class _EntryStampProvider(_CountingProvider):
-        def __init__(self) -> None:
-            super().__init__()
-            self.entered_at: float | None = None
-
-        def dispatch(self, request: SourceBrokerV2DispatchRequest):
-            self.entered_at = time.monotonic()
-            return super().dispatch(request)
-
-    root = tmp_path_factory.mktemp("dispatch-prologue-calibration")
+    root = tmp_path_factory.mktemp("provider-prologue-calibration")
     samples: list[float] = []
     for index in range(3):
         provider = _EntryStampProvider()
         service, _keyring = _service(root / f"calibration-{index}", provider=provider)
-        request = _dispatch_request(saga_id=f"saga-source-v2-calibration-{index}")
+        request = _dispatch_request()
         claim = _claim(service, _claim_once_request(request))
         envelope = canonical_model_json_bytes(
             SourceBrokerV2DispatchEnvelope(request=request, claim_receipt=claim)
         )
         started = time.monotonic()
-        service.dispatch(envelope, deadline=started + _PROLOGUE_CALIBRATION_DEADLINE_SECONDS)
-        entered = provider.entered_at
+        raw = service.dispatch(
+            envelope,
+            deadline=started + _PROLOGUE_CALIBRATION_DEADLINE_SECONDS,
+        )
+        entered = provider.dispatch_entered_at
         assert entered is not None, "calibration dispatch never reached the provider"
+        samples.append(entered - started)
+
+        dispatch = SourceBrokerV2DispatchResponse.model_validate_json(raw)
+        finalize_request = _finalize_request(dispatch)
+        finalize_claim = _claim(
+            service,
+            _claim_once_request(
+                _dispatch_request(operation_id=finalize_request.operation_id),
+                challenge=HASHES["final_challenge"],
+                phase=SourceBrokerV2OutboxPhase.SOURCE_FINALIZE,
+                operation_request_hash=finalize_request.request_hash,
+            ),
+        )
+        finalize_envelope = canonical_model_json_bytes(
+            SourceBrokerV2FinalizeEnvelope(
+                request=finalize_request,
+                claim_receipt=finalize_claim,
+            )
+        )
+        started = time.monotonic()
+        service.finalize(
+            finalize_envelope,
+            deadline=started + _PROLOGUE_CALIBRATION_DEADLINE_SECONDS,
+        )
+        entered = provider.finalize_entered_at
+        assert entered is not None, "calibration finalize never reached the provider"
         samples.append(entered - started)
     _prologue_scale = max(1.0, max(samples) / _PROLOGUE_REFERENCE_SECONDS)
 
@@ -2099,7 +2148,10 @@ def test_blocked_provider_finalize_returns_at_deadline_without_auto_repeat(
 
     started = time.monotonic()
     with pytest.raises(SourceBrokerV2TransportDeadlineError, match="deadline"):
-        service.finalize(envelope, deadline=time.monotonic() + _host(0.02))
+        service.finalize(
+            envelope,
+            deadline=time.monotonic() + _host(_PROVIDER_RACE_DEADLINE_SECONDS),
+        )
     assert time.monotonic() - started < _host(0.2)
 
     replay_request = SourceBrokerV2ReplayRequest(
@@ -2228,7 +2280,10 @@ def test_provider_result_after_deadline_requires_reconcile_not_terminal_replay(
     )
 
     with pytest.raises(SourceBrokerV2TransportDeadlineError, match="deadline"):
-        service.dispatch(envelope, deadline=time.monotonic() + _host(0.02))
+        service.dispatch(
+            envelope,
+            deadline=time.monotonic() + _host(_PROVIDER_RACE_DEADLINE_SECONDS),
+        )
 
     replay_request = SourceBrokerV2ReplayRequest(
         saga_id=request.saga_id,

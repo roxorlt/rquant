@@ -27,6 +27,15 @@ from rquant.source_broker import (
 )
 from tests.unit.test_adapter_manifest import OpenSslSigningClient
 
+# Watchdogs for four spawned competitors, not subjects: what the case they
+# guard asserts is that exactly one of them commits the operation. Each is a
+# fresh CPython importing the rquant surface, measured at 1.5s on an *idle*
+# ubuntu-24.04 x64 CI runner against 0.5s on the development machine (CI
+# diagnostic job on 017d808), and four of them start at once on four vCPUs
+# while the parent is still running. Ten and fifteen seconds were a fast
+# machine's numbers and the runner missed them.
+_COMPETITOR_WATCHDOG_SECONDS = 120
+
 
 class _SQLiteMonotonicCheckpointStore:
     def __init__(
@@ -301,7 +310,7 @@ def _competing_advance_process(
             ),
         )
         ready.put("ready")
-        if not gate.wait(timeout=10):
+        if not gate.wait(timeout=_COMPETITOR_WATCHDOG_SECONDS):
             raise RuntimeError("multiprocess start gate timed out")
         output.put(("ok", _advance(authority).model_dump_json()))
     except BaseException as exc:
@@ -951,11 +960,11 @@ def test_competing_processes_commit_one_operation_exactly_once(tmp_path: Path) -
     for process in processes:
         process.start()
     for _ in processes:
-        assert ready.get(timeout=15) == "ready"
+        assert ready.get(timeout=_COMPETITOR_WATCHDOG_SECONDS) == "ready"
     gate.set()
-    results = [output.get(timeout=15) for _ in processes]
+    results = [output.get(timeout=_COMPETITOR_WATCHDOG_SECONDS) for _ in processes]
     for process in processes:
-        process.join(timeout=15)
+        process.join(timeout=_COMPETITOR_WATCHDOG_SECONDS)
         assert process.exitcode == 0
 
     assert {status for status, _payload in results} == {"ok"}
