@@ -39,6 +39,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -53,6 +54,9 @@ POLICY_PATH: Final[Path] = (
     REPOSITORY_ROOT / "tests" / "fixtures" / "r07_differential_gate" / "policy-v1.json"
 )
 MANIFEST_DIRECTORY: Final[Path] = REPOSITORY_ROOT / "tests" / "manifests" / "full-suite-v1"
+SHARD_CONTRACT_TEST: Final[Path] = (
+    REPOSITORY_ROOT / "tests" / "unit" / "test_assert_full_suite_shards.py"
+)
 FIXTURE_ROOT: Final[Path] = (
     REPOSITORY_ROOT / "tests" / "fixtures" / "signal_family_producer"
 )
@@ -324,14 +328,42 @@ def recompute_policy(*, write: bool) -> Outcome:
 # ---------------------------------------------------------------------------------------
 
 
+def _backfill_shard_baseline(full_suite: dict[str, Any], *, write: bool) -> bool:
+    """Keep the contract case's frozen baseline in step with the manifest it guards.
+
+    The literal exists so a silently shrinking suite is caught, which means it has to be
+    updated deliberately whenever the manifest is regenerated. Doing it here rather than by
+    hand is the difference between "the count moved because the suite grew" and "the count
+    moved because someone edited a number until the test passed".
+    """
+
+    source = SHARD_CONTRACT_TEST.read_text(encoding="utf-8")
+    updated = source
+    for field in ("cases", "skips"):
+        updated = re.sub(
+            rf'assert full_suite\["{field}"\] == \d+',
+            f'assert full_suite["{field}"] == {full_suite[field]}',
+            updated,
+        )
+    if updated == source:
+        return False
+    if write:
+        SHARD_CONTRACT_TEST.write_text(updated, encoding="utf-8")
+    return True
+
+
 def recompute_shard_manifest(*, write: bool, expected_skips: int) -> Outcome:
     index_path = MANIFEST_DIRECTORY / "index.json"
     before = json.loads(index_path.read_bytes())["full_suite"]
     if not write:
+        drifted = _backfill_shard_baseline(before, write=False)
         return Outcome(
             "full-suite manifest",
-            False,
-            f"not regenerated (--write not given); {before['cases']} cases",
+            drifted,
+            (
+                f"not regenerated (--write not given); {before['cases']} cases"
+                + ("; contract baseline is stale" if drifted else "")
+            ),
         )
     shards = _load_script("full_suite_shards")
     code = shards.main(
@@ -346,11 +378,15 @@ def recompute_shard_manifest(*, write: bool, expected_skips: int) -> Outcome:
     if code != 0:
         raise SystemExit(f"full_suite_shards generate exited {code}")
     after = json.loads(index_path.read_bytes())["full_suite"]
-    changed = before != after
+    baseline_moved = _backfill_shard_baseline(after, write=True)
+    changed = before != after or baseline_moved
     return Outcome(
         "full-suite manifest",
         changed,
-        f"{before['cases']} -> {after['cases']} cases, {after['skips']} skips",
+        (
+            f"{before['cases']} -> {after['cases']} cases, {after['skips']} skips"
+            + ("; contract baseline backfilled" if baseline_moved else "")
+        ),
     )
 
 
