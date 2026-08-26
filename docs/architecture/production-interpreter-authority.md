@@ -1165,8 +1165,9 @@ channel_hash
 ```
 
 `producer_service_ids` and `consumer_service_ids` are independently sorted unique tuples of exact
-service IDs. `payload_model` is the authoritative qualified model string and MUST resolve inside the
-generation source closure to the actual class before this declaration can exist. Its exact model
+service IDs, frozen as specified in *Frozen Declaration Domain* below. `payload_model` is the
+authoritative qualified model string and MUST resolve inside the generation source closure to the
+actual class before this declaration can exist. Its exact model
 descriptor preimage and hash are:
 
 ```text
@@ -1301,6 +1302,47 @@ full manifest and child result. Aliases, wrappers, monkeypatches, alternate modu
 files, noncallable objects, omitted surfaces, and additional surfaces reject. Child verification
 starts through the actual manifest-backed production builders above; direct unit construction
 cannot substitute for that path.
+
+#### Frozen Declaration Domain
+
+Amended per Codex round-2 order 2026-08-25, ruling 2. The four schemas above previously accepted
+any nonempty string as a participant service ID, and their channel, family, and identity sets were
+described only in prose. The following sets are now frozen, and all of them live in the leaf module
+`rquant.signal_family_constants` so they can be named by `Literal` annotations without an import
+cycle. Widening any of them requires a new ADR.
+
+**Channels.** The closed set is exactly `signal-envelope/current`,
+`signal-bus-routed-record/current`, and `signal-route-spool-record/current`, each bound to the one
+class it already names. `channel_id` is that closed set at the type layer on both
+`SuccessorChannelV1` and `OverlayDeclarationV1`, and the binding map is immutable.
+
+**Family.** `accepted_family_ids` is frozen to the single current family
+`rquant.signal-envelope/v1`. Legacy envelopes carry no such discriminant and can never appear.
+
+**Bundle identity.** A successor bundle's identity is its namespace
+`rquant.signal-family.successor` and nothing else: exactly one successor base may be registered, so
+a second bundle with different bytes is a conflict on that one identity.
+
+**Overlay identity.** An overlay's identity is the pair
+`(overlay_namespace, base_bundle_content_hash)`. One overlay may be staged per successor base, so
+the same namespace over a different base is a *different* identity rather than a conflict, and the
+conflict audit record spells the identity as `overlay_namespace:base_bundle_content_hash`.
+
+**Participant service IDs.** Every entry of `producer_service_ids` and `consumer_service_ids` MUST
+match the grammar `^[a-z][a-z0-9]*(-[a-z0-9]+)*$` and be at most 64 characters, and MUST name a role
+in the frozen domain: the five exact Phase C role IDs `signal-router`, `shadow-session`, `notifier`,
+`paper-broker`, `serving-publisher`, or the dynamic strategy domain `strategy-live-<segment>`. The
+role domain is per channel and per direction, derived from the frozen five pair rows: strategy
+services produce envelopes; the router and the shadow session consume them; the router produces
+routed and spool records; the notifier and the paper broker consume them. A consumer-only role in a
+producer tuple, a producer-only role in a consumer tuple, a legal role on the wrong channel, an
+unknown role, a case or underscore variant, and an over-length ID all reject.
+
+This domain governs the Phase B declaration schemas only. It is deliberately not propagated to
+`RuntimeServiceManifest.service_id` or `PairBindingV1`: the live production profile issues IDs such
+as `signal-router.all-strategies.v1` and `strategy.n_shape.v1`, which contain dots and underscores
+and do not satisfy the grammar above. Aligning the live topology with this grammar would be a
+production change and requires its own authorization.
 
 #### Exact Verification Service Bindings
 
