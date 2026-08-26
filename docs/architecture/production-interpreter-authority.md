@@ -157,6 +157,48 @@ The residual TCB is:
   with exact mode `0400`, whose names and values are filtered by the runtime wrapper; and
 - the narrow root-owned quarantine/publication helper and immutable generation store.
 
+*Amended per Codex round-2 order 2026-08-25, item ruling-7.* The residual TCB additionally
+includes the signal-family verification chain and the privilege launcher. Each entry binds a
+canonical absolute path, exact owner, exact mode and the installation check that proves them,
+in the field shape frozen above:
+
+- `/usr/local/lib/rquant-signal-family-verifier/<content-id>/`, the root verifier's
+  content-addressed installation tree, owner `root:root`, directories exact mode `0555`,
+  regular files exact mode `0444` (`0555` where the source is executable), every file a
+  single link. `<content-id>` is the SHA-256 of the tree manifest's canonical bytes, and that
+  manifest — one entry per node, binding relative path, type, mode and SHA-256 — is frozen
+  inside the entry archive below. Installation verification recomputes every file hash, the
+  complete node set, owner, mode and link count, and the content id itself; any extra,
+  missing, relaxed, foreign-owned, symlinked or second-linked node rejects before the
+  verifier starts. The root verifier never runs from a mutable checkout: its checkout entry
+  point refuses, and the installed entry admits only this tree onto `sys.path`.
+- `/usr/local/libexec/rquant-signal-family-verifier-v1.pyz`, the fixed root-owned entry
+  archive, owner `root:root`, exact mode `0555`, `nlink == 1`, pinned by SHA-256. It is a
+  regular file, never a symlink into the tree, and it is byte-reproducible from its sources.
+- `/usr/bin/setpriv`, the narrow root-owned privilege launcher (util-linux), owner
+  `root:root`, `nlink == 1`, no group or world write bit, owner-executable, reached through a
+  non-writable ancestor chain, optionally pinned by SHA-256. It replaces the Python
+  `preexec_fn` in every production launch path; see the Descriptor Policy section below.
+- `/etc/rquant/signal-family-verifier-policy-v1.json`, the fixed root-owned release
+  verification policy already specified below, owner `root:root`, exact mode `0444`,
+  `nlink == 1`, reached only by an anchored no-follow open from a trusted root directory FD.
+- `/usr/local/libexec/rquant-signal-family-verifier-harness-v1.pyz`, the fixed harness the
+  policy pins by `harness_sha256`, owner `root:root`, exact mode `0555`, `nlink == 1`,
+  byte-reproducible from its sources.
+- `/var/lib/rquant/signal-family-verification`, the root-owned append store, owner
+  `root:root`, directory exact mode `0700`, database file exact mode `0600`. Filesystem
+  ownership and mode are what prevent `lighthouse` and every service process from opening it
+  for write; the root verifier is its sole writer and opens no descriptor into it before the
+  generation child has exited.
+- `/usr/local/libexec/rquant-runtime-exec.pyz` (already listed above) is the fixed runtime
+  wrapper every protected runtime unit executes. Its role allowlist is a frozen literal set
+  inside the archive; a unit supplies one role literal and no other input, and the wrapper
+  reads no environment file and no caller-supplied manifest path.
+
+Installing, replacing or rolling back any of these is a separate root-owned, explicitly
+user-authorized infrastructure transaction. Normal code release and quarantine flows cannot
+perform it.
+
 The versioned profile freezes a canonical file list for `/usr/bin/python3.11`, its ELF interpreter,
 standard library, every loaded shared library, both pyz files, and every required ancestor. Each
 file entry binds canonical absolute path, SHA256, exact owner and mode; each ancestor entry binds
@@ -1826,6 +1868,17 @@ typed resource capabilities. Ownership, inheritance, and closure are local and a
 The superseded implementation's `preexec_fn`, helper/target interpreter FD inheritance, leaked
 descriptors, and unused global authority surface are still removed from production paths. Their
 deadlock and capability-leak risks are independent of the revised trust decision.
+
+*Amended per Codex round-2 order 2026-08-25, item P1-5.* No production path passes a Python
+callable to `subprocess`. Privilege drops are performed by `/usr/bin/setpriv` with the exact
+flag sequence `--reuid <uid> --regid <gid> --clear-groups --no-new-privs --`, and the
+workload arbiter's parent-death signal by `--pdeathsig SIGKILL --`; the binary is identified
+as a TCB file before it is executed. Descriptor closure is `close_fds=True` plus an explicit
+`pass_fds` for the canonical IPC pipes, swept by CPython's own C helper; the retained set is
+asserted against the descriptors actually passed, and a bound that does not cover them
+refuses the launch. This does not weaken the threat model: it removes the fork/exec deadlock
+surface named above while keeping the identity change, the supplementary-group clear and
+`no-new-privs`, which the previous callable did not set at all.
 
 ## Rejected Alternatives
 

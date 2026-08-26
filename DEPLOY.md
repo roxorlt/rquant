@@ -30,11 +30,67 @@ Codex 最终验收。**尚未 merge、尚未打 tag、尚未部署**，云服务
 6. **云端 child 访问实验**：以真实 `lighthouse` 身份对 `0715` 的 child workspace 做
    `O_RDONLY | O_DIRECTORY` 打开，并确认 `id -g lighthouse != 0`——工作区的 group 位是
    `--x`，子进程一旦落进 group 类就会丢掉读权限（验证器现在会直接拒绝这种身份配对）。
-7. **root verifier 必须从 root-owned 树运行**。当前入口脚本
-   `scripts/signal-family-root-verifier.py` 会把自己所在 checkout 的 `src` 插进 `sys.path`；
-   若从 `/home/lighthouse/rquant/` 以 root 运行，root 就会执行 lighthouse 可写的代码。
-   policy / harness / store 的安装是**单独授权的事务**，不能借受控发布器绕过。
-8. **规格 errata 未决**：family taxonomy 单元素域、bundle/overlay identity 语义、
+7. **root verifier 必须从 root-owned 树运行**（Codex round-2 P1-4 已落地，安装仍待授权）。
+   `scripts/signal-family-root-verifier.py` 现在直接拒绝运行并退出 78；生产入口改为固定的
+   root-owned 制品对，由 `scripts/build-signal-family-verifier-artifact.py` 构建：
+
+   ```bash
+   python scripts/build-signal-family-verifier-artifact.py --output-root <staging>
+   # 打印 content_id / entry_sha256 / manifest_entries 及安装位置
+   ```
+
+   安装是**单独授权的 root 事务**，不能借受控发布器绕过。逐条核对：
+
+   - 树装到 `/usr/local/lib/rquant-signal-family-verifier/<content-id>/`，`root:root`，
+     目录 `0555`、文件 `0444`（源可执行的为 `0555`），每个文件 `nlink == 1`；
+   - 入口装到 `/usr/local/libexec/rquant-signal-family-verifier-v1.pyz`，`root:root`，
+     `0555`，`nlink == 1`，SHA-256 与构建输出一致（两次构建必须字节相同）；
+   - 运行 `/usr/bin/python3.11 -I -S /usr/local/libexec/rquant-signal-family-verifier-v1.pyz`
+     应能通过树校验；树里任何一个字节被改、多一个文件、少一个文件、mode 放宽或换了属主，
+     都必须退 78 且不启动；
+   - 回滚 = 把入口换回上一个 content id 的构建产物，旧树不删；两棵树可以共存。
+
+8. **`/usr/bin/setpriv` 必须存在且进 TCB**（Codex round-2 P1-5）。root verifier 与
+   `rquant-workload-arbiter` 的降权/父进程死亡信号都改由它执行，不再有任何 `preexec_fn`。
+   OpenCloudOS 9.2 上部署前核对：
+
+   ```bash
+   /usr/bin/setpriv --version                 # util-linux ≥ 2.33（--pdeathsig 需要）
+   stat -c '%U:%G %a %h' /usr/bin/setpriv     # root:root，无 g/o 写位，nlink 1
+   sha256sum /usr/bin/setpriv                 # 记入 TCB 清单
+   ```
+
+   缺失或不满足属主/权限时，root verifier 会拒绝启动（fail closed），不会退回旧路径。
+
+9. **`/usr/local/libexec/rquant-runtime-exec.pyz` 必须先安装，profile 必须先声明全部 role**
+   （Codex round-2 P1-3）。本分支新增的 25 个受保护 runtime unit 已改为固定命令
+   `/usr/bin/python3.11 -I -S /usr/local/libexec/rquant-runtime-exec.pyz --role <literal>`，
+   不再读 `data/runtime/current/runtime.env`，也不再接受 `%i` 插值的 manifest 路径。部署前：
+
+   ```bash
+   python scripts/build-runtime-exec-pyz.py --output <staging>/rquant-runtime-exec.pyz
+   # 装到 /usr/local/libexec/，root:root，0555；SHA-256 写进 profile 的 runtime_pyz
+   for u in /etc/systemd/system/rquant-runtime-*.service \
+            /etc/systemd/system/rquant-artifact-retention.service \
+            /etc/systemd/system/rquant-page-control.service; do
+     systemd-analyze verify "$u"
+     systemctl show -p ExecStart "$(basename "$u")"
+   done
+   ```
+
+   **生产 profile 当前只冻结了 `daily` 一个 role**；25 个 unit 用到的 role 必须在新版
+   profile 里逐个声明（module / cwd / app_source / site-packages / 环境白名单），否则对应
+   unit 会 fail closed 退 78。profile 版本变更本身是单独授权的基础设施事务。
+
+10. **`rquant-runtime-recovery@` / `rquant-runtime-recovery-rehearsal@` 语义变更**：
+   `--expected-profile-generation %i` 已移除，generation 改由 root-owned `current.json`
+   决定。安装前确认对应 role 的 module 能从权威记录读取 generation，而不是从 argv。
+
+11. **`deploy/libexec/rquant-workload-arbiter` 的 pdeathsig 竞态**：`setpriv --pdeathsig`
+   在 fork 与 exec 之间设置 `PR_SET_PDEATHSIG`，与旧实现一样存在「父进程恰在此窗口内死亡」
+   的极小竞态；旧实现额外做的 `getppid()` 复查随 `preexec_fn` 一并移除。这是刻意的取舍：
+   ruling D-6 优先消除 fork/exec 之间跑 Python 的死锁面。
+12. **规格 errata 未决**：family taxonomy 单元素域、bundle/overlay identity 语义、
    producer/consumer id 域、profile-service-manifests 文档绑定、`strategy-router` /
    `strategy-shadow` 五个 surface 的向量语义、WP5 Q1–Q4、wire schema 在 3.11/3.12 的可见性、
    退休门的交易日数字，全部等 Codex 裁决；在此之前真实 harness 不产生五对 `READY`，
