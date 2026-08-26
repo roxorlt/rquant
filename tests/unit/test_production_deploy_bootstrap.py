@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+import rquant.lab_launchd_install as lab_launchd_install
 from rquant.release_generation import (
     DeploymentIntent,
     EnvironmentSelector,
@@ -170,6 +171,92 @@ def _publish_handoff_generation_authority(
     module._atomic_private_json(intent_path_for_lock(lock_path), asdict(intent))
     module._atomic_private_json(commit_path_for_lock(lock_path), asdict(committed))
     return intent
+
+
+_FAKE_LAUNCHCTL = """#!/bin/sh
+# Hermetic stand-in for launchd's control binary. `print` reports whether a
+# label is loaded (113 is launchd's "no such service"), `bootstrap`/`bootout`
+# toggle that state and `kickstart` only succeeds for a loaded label.
+state={state}
+mkdir -p "$state/loaded"
+printf '%s\\n' "$*" >> "$state/calls.log"
+label_of() {{
+    printf '%s' "${{1##*/}}"
+}}
+case "${{1:-}}" in
+print)
+    [ -e "$state/loaded/$(label_of "${{2:-}}")" ] && exit 0
+    exit 113
+    ;;
+bootout)
+    rm -f "$state/loaded/$(label_of "${{2:-}}")"
+    exit 0
+    ;;
+bootstrap)
+    plist="${{3:-}}"
+    base="${{plist##*/}}"
+    : > "$state/loaded/${{base%.plist}}"
+    exit 0
+    ;;
+kickstart)
+    [ -e "$state/loaded/$(label_of "${{2:-}}")" ] && exit 0
+    exit 113
+    ;;
+esac
+exit 64
+"""
+
+
+_FAKE_PLUTIL_LINT = """import plistlib
+import sys
+
+if len(sys.argv) != 3 or sys.argv[1] != "-lint":
+    sys.exit(64)
+target = sys.argv[2]
+try:
+    with open(target, "rb") as handle:
+        plistlib.load(handle)
+except Exception as exc:
+    print(f"{target}: {exc}", file=sys.stderr)
+    sys.exit(1)
+print(f"{target}: OK")
+"""
+
+_FAKE_PLUTIL = """#!/bin/sh
+exec {python} {script} "$@"
+"""
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_launchd_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point the Lab installer at fake launchctl/plutil binaries.
+
+    Both tools ship only with Darwin, so on Linux every installer call died
+    with `FileNotFoundError: '/bin/launchctl'` (36 nodeids, with
+    '/usr/bin/plutil' waiting behind it); on Darwin the launchctl calls reached
+    the developer's real user domain and could boot out a live Lab agent. The
+    fakes are real executables driven through the same `run_contained` path, so
+    the tests exercise the installer for real on both platforms. The plutil
+    stand-in lints with plistlib, which is the parser the installer already
+    runs against the same bytes one line earlier.
+    """
+    state = tmp_path / "launchd-domain"
+    (state / "loaded").mkdir(parents=True)
+    fake = tmp_path / "fake-launchctl"
+    fake.write_text(_FAKE_LAUNCHCTL.format(state=shlex.quote(str(state))), encoding="utf-8")
+    fake.chmod(0o700)
+    monkeypatch.setattr(lab_launchd_install, "LAUNCHCTL_PATH", str(fake))
+
+    lint = tmp_path / "fake-plutil-lint.py"
+    lint.write_text(_FAKE_PLUTIL_LINT, encoding="utf-8")
+    plutil = tmp_path / "fake-plutil"
+    plutil.write_text(
+        _FAKE_PLUTIL.format(python=shlex.quote(sys.executable), script=shlex.quote(str(lint))),
+        encoding="utf-8",
+    )
+    plutil.chmod(0o700)
+    monkeypatch.setattr(lab_launchd_install, "PLUTIL_PATH", str(plutil))
+    return fake
 
 
 @pytest.fixture(autouse=True)
@@ -723,7 +810,7 @@ def test_lab_handoff_dry_run_models_labels_without_stopping_daemons(
     module, root, lock_path = _handoff_fixture(tmp_path)
     _install_lab_handoff(module, root, lock_path)
     calls: list[list[str]] = []
-    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_host_platform", lambda: "darwin")
 
     def fake_launchctl(
         arguments: list[str],
@@ -762,7 +849,7 @@ def test_handoff_rebinds_committed_generation_plists_after_transition_crash(
 ) -> None:
     module, root, lock_path = _handoff_fixture(tmp_path)
     _install_lab_handoff(module, root, lock_path)
-    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_host_platform", lambda: "darwin")
     loaded = set(module.LAB_LAUNCHD_LABELS)
 
     def fake_launchctl(
@@ -863,7 +950,7 @@ def test_lab_handoff_dry_run_requires_every_installed_label_loaded(
             stderr="",
         )
 
-    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_host_platform", lambda: "darwin")
     monkeypatch.setattr(module, "_launchctl", fake_launchctl)
     handoff = module._LabLaunchdHandoff(root=root, lock_path=lock_path, timeout_seconds=1)
     try:
@@ -915,7 +1002,7 @@ def test_lab_handoff_rejects_invalid_or_changed_target_before_bootout(
             loaded.remove(label)
         return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
 
-    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_host_platform", lambda: "darwin")
     monkeypatch.setattr(module, "_launchctl", fake_launchctl)
     invalid = module._LabLaunchdHandoff(root=root, lock_path=lock_path, timeout_seconds=1)
     try:
@@ -962,7 +1049,7 @@ def test_lab_handoff_persists_typed_intent_before_first_bootout(
 ) -> None:
     module, root, lock_path = _handoff_fixture(tmp_path)
     _install_lab_handoff(module, root, lock_path)
-    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_host_platform", lambda: "darwin")
     loaded = set(module.LAB_LAUNCHD_LABELS)
     prepared_operation = "7" * 32
     prepared_path = lock_path.with_name(f"{lock_path.stem}.intent.prepared.json")
@@ -1032,7 +1119,7 @@ def test_prepared_only_transaction_is_detected_and_materialized_for_recovery(
 ) -> None:
     module, root, lock_path = _handoff_fixture(tmp_path)
     _install_lab_handoff(module, root, lock_path)
-    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_host_platform", lambda: "darwin")
     original_operation = "1" * 32
     prepared = _handoff_deployment_intent(
         module,
@@ -1106,7 +1193,7 @@ def test_prepared_only_recovery_preserves_prior_completed_active_proof(
 ) -> None:
     module, root, lock_path = _handoff_fixture(tmp_path)
     _install_lab_handoff(module, root, lock_path)
-    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_host_platform", lambda: "darwin")
     loaded = set(module.LAB_LAUNCHD_LABELS)
 
     def fake_launchctl(
@@ -1197,7 +1284,7 @@ def test_pre_deployer_abort_restores_previous_without_completed_target_proof(
 ) -> None:
     module, root, lock_path = _handoff_fixture(tmp_path)
     _install_lab_handoff(module, root, lock_path)
-    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_host_platform", lambda: "darwin")
     loaded = set(module.LAB_LAUNCHD_LABELS)
     previous_sha = "a" * 40
     target_sha = "b" * 40
@@ -1275,7 +1362,7 @@ def test_prepared_abort_restores_partial_stop_after_prepare_failure(
 ) -> None:
     module, root, lock_path = _handoff_fixture(tmp_path)
     _install_lab_handoff(module, root, lock_path)
-    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_host_platform", lambda: "darwin")
     loaded = set(module.LAB_LAUNCHD_LABELS)
     bootouts = 0
 
@@ -1361,7 +1448,7 @@ def test_handoff_never_completes_with_readiness_from_a_different_code_generation
 ) -> None:
     module, root, lock_path = _handoff_fixture(tmp_path)
     _install_lab_handoff(module, root, lock_path)
-    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_host_platform", lambda: "darwin")
     loaded = set(module.LAB_LAUNCHD_LABELS)
 
     def fake_launchctl(
@@ -1430,7 +1517,7 @@ def test_incomplete_handoff_resume_is_deferred_without_writes_in_protected_windo
             loaded.remove(label)
         return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
 
-    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_host_platform", lambda: "darwin")
     monkeypatch.setattr(module, "_launchctl", fake_launchctl)
     first = module._LabLaunchdHandoff(root=root, lock_path=lock_path, timeout_seconds=1)
     first.prepare(
@@ -1463,6 +1550,7 @@ def test_incomplete_handoff_resume_is_deferred_without_writes_in_protected_windo
 
 
 @pytest.mark.parametrize("dry_run", (False, True))
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS Lab lifecycle deploy bootstrap")
 def test_protected_incomplete_handoff_defers_before_fetch_or_ref_mutation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1513,7 +1601,7 @@ def test_protected_incomplete_handoff_defers_before_fetch_or_ref_mutation(
     refs_before = snapshot(refs)
     fetch_before = None if not fetch_head.exists() else (fetch_head.read_bytes(), fetch_head.stat())
     authority_before = _tree_snapshot(lock_path.parent)
-    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_host_platform", lambda: "darwin")
     monkeypatch.setattr(module, "_is_protected_handoff_window", lambda _now=None: True)
     monkeypatch.chdir(checkout)
     command = _command(checkout, python, lock_path, lifecycle_mode="installed")[4:]
@@ -1553,7 +1641,7 @@ def test_installed_bootstrap_missing_installation_fails_before_any_namespace_or_
     index_before = (index.read_bytes(), index.stat())
     git_before = _tree_snapshot(checkout / ".git")
     tree_before = _tree_snapshot(tmp_path)
-    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_host_platform", lambda: "darwin")
     monkeypatch.setattr(module, "_is_protected_handoff_window", lambda _now=None: False)
     monkeypatch.chdir(checkout)
 
@@ -1584,7 +1672,7 @@ def test_installed_bootstrap_tampered_prepared_sentinel_fails_before_fetch_or_ha
     sentinel.chmod(0o600)
     git_before = _tree_snapshot(checkout / ".git")
     authority_before = _tree_snapshot(lock_path.parent)
-    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_host_platform", lambda: "darwin")
     monkeypatch.setattr(module, "_is_protected_handoff_window", lambda _now=None: False)
     monkeypatch.chdir(checkout)
 
@@ -1636,7 +1724,7 @@ def test_installed_target_policy_rejects_privileged_launchd_diff_before_bootout(
     launchctl_calls: list[list[str]] = []
     run_marker = tmp_path / "deployer-ran"
     monkeypatch.setenv("RUN_MARKER", str(run_marker))
-    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_host_platform", lambda: "darwin")
     monkeypatch.setattr(module, "_is_protected_handoff_window", lambda _now=None: False)
     monkeypatch.setattr(
         module,
@@ -1664,6 +1752,7 @@ def test_installed_target_policy_rejects_privileged_launchd_diff_before_bootout(
     assert _git(checkout, "rev-parse", "HEAD") == previous
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS Lab lifecycle deploy bootstrap")
 def test_installed_already_current_returns_before_handoff_or_launchd_mutation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1672,7 +1761,7 @@ def test_installed_already_current_returns_before_handoff_or_launchd_mutation(
     checkout, python, lock_path, current = _checkout(tmp_path)
     module = _bootstrap_module()
     launchctl_calls: list[list[str]] = []
-    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_host_platform", lambda: "darwin")
     monkeypatch.setattr(module, "_is_protected_handoff_window", lambda _now=None: False)
     monkeypatch.setattr(
         module,
@@ -1701,6 +1790,7 @@ def test_installed_already_current_returns_before_handoff_or_launchd_mutation(
     assert '"status": "already_current"' in capsys.readouterr().out
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS Lab lifecycle deploy bootstrap")
 def test_installed_already_current_with_incomplete_handoff_requires_explicit_recovery(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1731,7 +1821,7 @@ def test_installed_already_current_with_incomplete_handoff_requires_explicit_rec
     module._atomic_private_json(handoff_path, payload)
     before = handoff_path.read_bytes()
     launchctl_calls: list[list[str]] = []
-    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_host_platform", lambda: "darwin")
     monkeypatch.setattr(module, "_is_protected_handoff_window", lambda _now=None: False)
     monkeypatch.setattr(
         module,
@@ -1765,6 +1855,7 @@ def test_installed_already_current_with_incomplete_handoff_requires_explicit_rec
     }
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS Lab lifecycle deploy bootstrap")
 def test_installed_empty_change_plan_returns_before_handoff_or_intent_mutation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1788,7 +1879,7 @@ def test_installed_empty_change_plan_returns_before_handoff_or_intent_mutation(
     launchctl_calls: list[list[str]] = []
     intent_path = intent_path_for_lock(lock_path)
     intent_before = intent_path.read_bytes() if intent_path.exists() else None
-    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_host_platform", lambda: "darwin")
     monkeypatch.setattr(module, "_is_protected_handoff_window", lambda _now=None: False)
     monkeypatch.setattr(
         module,
@@ -1817,6 +1908,7 @@ def test_installed_empty_change_plan_returns_before_handoff_or_intent_mutation(
     assert not list(lock_path.parent.glob(f"{lock_path.stem}.lab-handoff*"))
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS Lab lifecycle deploy bootstrap")
 def test_installed_rollout_commits_only_after_generation_bound_readiness(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1863,7 +1955,7 @@ def test_installed_rollout_commits_only_after_generation_bound_readiness(
         assert not commit_path_for_lock(lock_path).exists()
         return module._release_readiness_expectation(lock_path)
 
-    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_host_platform", lambda: "darwin")
     monkeypatch.setattr(module, "_is_protected_handoff_window", lambda _now=None: False)
     monkeypatch.setattr(module, "_launchctl", fake_launchctl)
     monkeypatch.setattr(module, "_wait_for_lab_readiness", ready)
@@ -1931,6 +2023,7 @@ def test_installed_rollout_commits_only_after_generation_bound_readiness(
         ("completed", "stable"),
     ),
 )
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS Lab lifecycle deploy bootstrap")
 def test_explicit_resume_converges_readiness_commit_crash_windows(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1964,7 +2057,7 @@ def test_explicit_resume_converges_readiness_commit_crash_windows(
             loaded.add(Path(arguments[-1]).stem)
         return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
 
-    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_host_platform", lambda: "darwin")
     monkeypatch.setattr(module, "_is_protected_handoff_window", lambda _now=None: False)
     monkeypatch.setattr(module, "_launchctl", fake_launchctl)
     monkeypatch.setattr(
@@ -2065,6 +2158,7 @@ def test_explicit_resume_converges_readiness_commit_crash_windows(
     assert final_handoff is not None and final_handoff["stage"] == "completed"
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS Lab lifecycle deploy bootstrap")
 def test_installed_readiness_failure_rolls_back_previous_generation_and_labels(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2110,7 +2204,7 @@ def test_installed_readiness_failure_rolls_back_previous_generation_and_labels(
         assert expected[2] == previous
         return expected
 
-    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_host_platform", lambda: "darwin")
     monkeypatch.setattr(module, "_is_protected_handoff_window", lambda _now=None: False)
     monkeypatch.setattr(module, "_launchctl", fake_launchctl)
     monkeypatch.setattr(module, "_wait_for_lab_readiness", ready)
@@ -2253,7 +2347,7 @@ def test_lab_handoff_restores_all_managed_daemons_and_verifies_readiness(
         stdout = "state = running\n" if action == "print" and returncode == 0 else ""
         return subprocess.CompletedProcess(arguments, returncode, stdout=stdout, stderr="")
 
-    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_host_platform", lambda: "darwin")
     monkeypatch.setattr(module, "_launchctl", fake_launchctl)
     monkeypatch.setattr(module, "_wait_for_lab_readiness", lambda **_kwargs: _READINESS_A)
     handoff = module._LabLaunchdHandoff(
@@ -2302,7 +2396,7 @@ def test_lab_handoff_prepares_exact_target_before_first_bootout(
         loaded.remove(label)
         return subprocess.CompletedProcess(arguments, 0)
 
-    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_host_platform", lambda: "darwin")
     monkeypatch.setattr(module, "_launchctl", fake_launchctl)
     handoff = module._LabLaunchdHandoff(
         root=root,
@@ -2353,7 +2447,7 @@ def test_lab_handoff_target_candidate_failure_leaves_current_daemons_loaded(
         mutations.append(action)
         return subprocess.CompletedProcess(arguments, 0)
 
-    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_host_platform", lambda: "darwin")
     monkeypatch.setattr(module, "_launchctl", fake_launchctl)
     handoff = module._LabLaunchdHandoff(root=root, lock_path=lock_path, timeout_seconds=1)
 
@@ -2410,7 +2504,7 @@ def test_lab_handoff_fails_before_bootout_when_any_managed_daemon_is_missing(
             stderr="",
         )
 
-    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_host_platform", lambda: "darwin")
     monkeypatch.setattr(module, "_launchctl", fake_launchctl)
     handoff = module._LabLaunchdHandoff(root=root, lock_path=lock_path, timeout_seconds=1)
     try:
@@ -2457,7 +2551,7 @@ def test_lab_handoff_failure_path_restarts_prior_daemons_and_has_bounded_lock_wa
         stdout = "state = running\n" if action == "print" and returncode == 0 else ""
         return subprocess.CompletedProcess(arguments, returncode, stdout=stdout, stderr="")
 
-    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_host_platform", lambda: "darwin")
     monkeypatch.setattr(module, "_launchctl", fake_launchctl)
     monkeypatch.setattr(
         module,
@@ -2524,7 +2618,7 @@ def test_lab_handoff_command_timeout_restores_already_stopped_daemons(
             loaded.add(Path(arguments[-1]).stem)
         return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
 
-    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_host_platform", lambda: "darwin")
     monkeypatch.setattr(module, "_launchctl", fake_launchctl)
     monkeypatch.setattr(module, "_wait_for_lab_readiness", lambda **_kwargs: _READINESS_A)
     handoff = module._LabLaunchdHandoff(root=root, lock_path=lock_path, timeout_seconds=0.1)
@@ -2585,7 +2679,7 @@ def test_lab_handoff_bootout_transition_is_crash_recoverable_at_every_boundary(
                 self.crashed = True
                 raise RuntimeError(f"crash:{stage}:{label}")
 
-    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_host_platform", lambda: "darwin")
     monkeypatch.setattr(module, "_launchctl", fake_launchctl)
     monkeypatch.setattr(module, "_wait_for_lab_readiness", lambda **_kwargs: _READINESS_A)
     first = CrashHandoff(root=root, lock_path=lock_path, timeout_seconds=1)
@@ -2797,7 +2891,7 @@ def test_lab_handoff_refuses_to_stop_daemons_in_protected_window(
     module, root, lock_path = _handoff_fixture(tmp_path)
     _install_lab_handoff(module, root, lock_path)
     calls: list[list[str]] = []
-    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_host_platform", lambda: "darwin")
     monkeypatch.setattr(
         module,
         "_launchctl",
@@ -2827,7 +2921,7 @@ def test_lab_handoff_requires_explicit_installation_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module, root, lock_path = _handoff_fixture(tmp_path)
-    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_host_platform", lambda: "darwin")
     handoff = module._LabLaunchdHandoff(root=root, lock_path=lock_path, timeout_seconds=1)
 
     with pytest.raises(module.DeployBootstrapError, match="installation state"):
@@ -2873,7 +2967,7 @@ def test_lab_handoff_recovery_accepts_partial_loaded_state(
         bootstrapped.append(label)
         return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
 
-    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_host_platform", lambda: "darwin")
     monkeypatch.setattr(module, "_launchctl", fake_launchctl)
     monkeypatch.setattr(module, "_wait_for_lab_readiness", lambda **_kwargs: _READINESS_A)
     operation_id = "e" * 32
@@ -3000,7 +3094,7 @@ def test_recovery_supersedes_recorded_deploy_handoff_from_partial_stage(
             loaded.remove(label)
         return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
 
-    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_host_platform", lambda: "darwin")
     monkeypatch.setattr(module, "_launchctl", fake_launchctl)
     supersedes = module._superseding_handoff_operation_id(
         root=root,
@@ -3100,7 +3194,7 @@ def test_recovery_validates_active_physical_supersede_chain_before_mutation(
             absent=True,
         )
     launchctl_calls: list[list[str]] = []
-    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_host_platform", lambda: "darwin")
     monkeypatch.setattr(
         module,
         "_launchctl",
@@ -3176,7 +3270,7 @@ def test_recovery_rejects_superseded_deploy_handoff_binding_drift(
         module._stable_record_path(lock_path, "lab-handoff"),
         payload,
     )
-    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_host_platform", lambda: "darwin")
     monkeypatch.setattr(
         module,
         "_launchctl",
@@ -3352,7 +3446,7 @@ def test_same_action_recovery_validates_intent_and_preserves_supersede_chain(
     ):
         intent = intent.advance(stage=next_stage)
     module._atomic_private_json(intent_path_for_lock(lock_path), asdict(intent))
-    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_host_platform", lambda: "darwin")
 
     supersedes = module._superseding_handoff_operation_id(
         root=root,
@@ -3491,7 +3585,7 @@ def test_superseding_rollback_stops_partial_target_labels_before_previous_restor
             loaded.add(Path(arguments[-1]).stem)
         return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
 
-    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_host_platform", lambda: "darwin")
     monkeypatch.setattr(module, "_launchctl", fake_launchctl)
     installation = module._read_lab_installation_state(root=root, lock_path=lock_path)
     module._atomic_private_json(
@@ -3655,7 +3749,7 @@ def test_recovery_retry_recognizes_persisted_successor_before_intent_rebind(
             loaded.remove(label)
         return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
 
-    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_host_platform", lambda: "darwin")
     monkeypatch.setattr(module, "_launchctl", fake_launchctl)
     recovery = module._LabLaunchdHandoff(
         root=root,
@@ -3761,7 +3855,7 @@ def test_opposite_recovery_persists_exact_a_b_c_chain_before_first_bootout(
             loaded.discard(label)
         return subprocess.CompletedProcess(arguments, 0, "", "")
 
-    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_host_platform", lambda: "darwin")
     monkeypatch.setattr(module, "_launchctl", fake_launchctl)
     rollback = module._LabLaunchdHandoff(
         root=root,
@@ -3854,7 +3948,7 @@ def test_opposite_retry_recovers_physical_successor_before_intent_rebind(
         def _after_handoff_successor_published(self) -> None:
             raise RuntimeError("crash after physical successor")
 
-    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_host_platform", lambda: "darwin")
     monkeypatch.setattr(module, "_launchctl", fake_launchctl)
     first = CrashAfterSuccessor(root=root, lock_path=lock_path, timeout_seconds=1)
     with pytest.raises(RuntimeError, match="physical successor"):
@@ -3922,7 +4016,7 @@ def test_handoff_writer_rejects_invalid_partial_state_before_publication(
 ) -> None:
     module, root, lock_path = _handoff_fixture(tmp_path)
     _install_lab_handoff(module, root, lock_path)
-    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_host_platform", lambda: "darwin")
     handoff = module._LabLaunchdHandoff(root=root, lock_path=lock_path, timeout_seconds=1)
     installation = module._read_lab_installation_state(root=root, lock_path=lock_path)
     handoff.installation_identity = module._lab_installation_identity(lock_path, installation)
@@ -3974,7 +4068,7 @@ def test_completed_handoff_proof_survives_consecutive_installed_releases(
             loaded.add(Path(arguments[-1]).stem)
         return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
 
-    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_host_platform", lambda: "darwin")
     monkeypatch.setattr(module, "_launchctl", fake_launchctl)
     monkeypatch.setattr(
         module,
@@ -4039,7 +4133,7 @@ def test_completed_handoff_crash_boundaries_converge_idempotently(
 ) -> None:
     module, root, lock_path = _handoff_fixture(tmp_path)
     _install_lab_handoff(module, root, lock_path)
-    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_host_platform", lambda: "darwin")
     handoff = module._LabLaunchdHandoff(root=root, lock_path=lock_path, timeout_seconds=1)
     installation = module._read_lab_installation_state(root=root, lock_path=lock_path)
     handoff.installation = installation
@@ -4103,7 +4197,7 @@ def test_completed_handoff_convergence_rejects_forged_proof_without_mutation(
 ) -> None:
     module, root, lock_path = _handoff_fixture(tmp_path)
     _install_lab_handoff(module, root, lock_path)
-    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_host_platform", lambda: "darwin")
     handoff = module._LabLaunchdHandoff(root=root, lock_path=lock_path, timeout_seconds=1)
     installation = module._read_lab_installation_state(root=root, lock_path=lock_path)
     handoff.installation_identity = module._lab_installation_identity(lock_path, installation)
@@ -4162,7 +4256,7 @@ def test_completed_handoff_convergence_cross_checks_generation_authority(
 ) -> None:
     module, root, lock_path = _handoff_fixture(tmp_path)
     _install_lab_handoff(module, root, lock_path)
-    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_host_platform", lambda: "darwin")
     handoff = module._LabLaunchdHandoff(root=root, lock_path=lock_path, timeout_seconds=1)
     installation = module._read_lab_installation_state(root=root, lock_path=lock_path)
     handoff.installation_identity = module._lab_installation_identity(lock_path, installation)
@@ -4246,7 +4340,7 @@ def test_completed_handoff_proof_is_exact_and_bound_to_current_installation(
 ) -> None:
     module, root, lock_path = _handoff_fixture(tmp_path)
     _install_lab_handoff(module, root, lock_path)
-    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_host_platform", lambda: "darwin")
     handoff = module._LabLaunchdHandoff(root=root, lock_path=lock_path, timeout_seconds=1)
     installation = module._read_lab_installation_state(root=root, lock_path=lock_path)
     handoff.installation_identity = module._lab_installation_identity(lock_path, installation)
@@ -4375,7 +4469,7 @@ def test_successful_lab_handoff_restore_uses_original_overall_deadline(
             loaded.add(Path(arguments[-1]).stem)
         return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
 
-    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_host_platform", lambda: "darwin")
     monkeypatch.setattr(module, "_launchctl", fake_launchctl)
     monkeypatch.setattr(module, "_wait_for_lab_readiness", lambda **_kwargs: _READINESS_A)
     handoff = module._LabLaunchdHandoff(
@@ -4596,7 +4690,7 @@ def test_nonzero_deployer_uses_real_superseding_handoff_recovery_proof(
 ) -> None:
     module, root, lock_path = _handoff_fixture(tmp_path)
     _install_lab_handoff(module, root, lock_path)
-    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_host_platform", lambda: "darwin")
     loaded = set(module.LAB_LAUNCHD_LABELS)
 
     def fake_launchctl(
@@ -4693,7 +4787,7 @@ def test_recovery_readiness_failure_rolls_back_through_superseded_handoff_chain(
 ) -> None:
     module, root, lock_path = _handoff_fixture(tmp_path)
     _install_lab_handoff(module, root, lock_path)
-    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setattr(module, "_host_platform", lambda: "darwin")
     source_operation = "4" * 32
     prior_operation = "3" * 32
     loaded = set(module.LAB_LAUNCHD_LABELS)
@@ -5166,6 +5260,7 @@ def test_normal_deploy_fetches_before_resolving_first_seen_annotated_tag(
     assert _git(checkout, "rev-parse", "v1.0.0^{commit}") == target
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS Lab lifecycle deploy bootstrap")
 def test_installed_already_current_dry_run_does_not_require_loaded_labels(
     tmp_path: Path,
 ) -> None:
@@ -5967,6 +6062,10 @@ def test_initialize_generation_refuses_replaying_a_committed_initialization(
 
 
 @pytest.mark.parametrize("recovery_action", ["resume", "rollback"])
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Linux deploy bootstrap recovery needs the production runtime profile",
+)
 def test_recover_generation_republishes_only_exact_verified_target(
     tmp_path: Path,
     recovery_action: str,
@@ -6002,6 +6101,10 @@ def test_recover_generation_republishes_only_exact_verified_target(
 
 
 @pytest.mark.parametrize("failure_env", [{"UV_SYNC_EXIT": "1"}, {"PREFLIGHT_EXIT": "1"}])
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Linux deploy bootstrap recovery needs the production runtime profile",
+)
 def test_recover_generation_failure_stays_unpublished_and_can_restart(
     tmp_path: Path,
     failure_env: dict[str, str],
@@ -6053,6 +6156,10 @@ def test_recover_generation_failure_stays_unpublished_and_can_restart(
     assert marker.is_file()
 
 
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Linux deploy bootstrap recovery needs the production runtime profile",
+)
 def test_recover_generation_resumes_fast_forward_target_after_interruption(
     tmp_path: Path,
 ) -> None:
@@ -6089,6 +6196,10 @@ def test_recover_generation_resumes_fast_forward_target_after_interruption(
     assert marker_path_for_lock(lock_path).is_file()
 
 
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Linux deploy bootstrap recovery needs the production runtime profile",
+)
 def test_recover_generation_rolls_back_to_verified_previous_release(
     tmp_path: Path,
 ) -> None:
@@ -6125,6 +6236,10 @@ def test_recover_generation_rolls_back_to_verified_previous_release(
     assert marker_path_for_lock(lock_path).is_file()
 
 
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Linux deploy bootstrap recovery needs the production runtime profile",
+)
 def test_recovery_target_remains_pinned_when_origin_main_advances(tmp_path: Path) -> None:
     checkout, python, lock_path, previous = _checkout(tmp_path, real_deployer=True)
     target = _commit_next_release(checkout)
@@ -6173,6 +6288,10 @@ def test_recovery_target_remains_pinned_when_origin_main_advances(tmp_path: Path
     assert _git(checkout, "rev-parse", "HEAD") == target
 
 
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Linux deploy bootstrap recovery needs the production runtime profile",
+)
 def test_recovery_uses_recorded_commit_after_tag_deleted_and_origin_rewritten(
     tmp_path: Path,
 ) -> None:
@@ -6302,6 +6421,7 @@ def test_target_checkout_authority_publishes_its_marker_schema(tmp_path: Path) -
     assert marker["schema_version"] == 2
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS Lab lifecycle deploy bootstrap")
 def test_installed_publish_finalizer_inherits_outer_handoff_without_relocking(
     tmp_path: Path,
 ) -> None:
@@ -6370,6 +6490,10 @@ def test_installed_publish_finalizer_inherits_outer_handoff_without_relocking(
     assert json.loads(result.stdout)["status"] == "generation_publish"
 
 
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Linux deploy bootstrap recovery needs the production runtime profile",
+)
 def test_rollback_uses_previous_checkout_marker_schema(tmp_path: Path) -> None:
     checkout, python, lock_path, previous = _checkout(tmp_path, real_deployer=True)
     authority_path = checkout / "src" / "rquant" / "release_generation.py"
