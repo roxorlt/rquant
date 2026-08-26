@@ -1812,9 +1812,31 @@ def test_planted_cache_entry_is_refused_when_github_cannot_confirm_the_run(
     assert verifier.calls == []
 
 
-def test_planted_cache_entry_naming_an_unknown_run_identity_is_refused(
+def test_planted_cache_entry_naming_an_unknown_run_identity_is_overwritten(
     tmp_path: Path,
 ) -> None:
+    """A disagreeing entry is stale bytes, not a verdict: the channel simply re-supplies them."""
+
+    repo, _pre_r07, release_a, release_b = _release_repo(tmp_path)
+    entry = _plant_cache_entry(repo, tmp_path, release_b, workflow_run_id=777_001)
+    planted = entry.read_bytes()
+    gate, _transport, verifier = _gate(tmp_path, responses=_gate_responses(repo, release_b))
+
+    decision = _evaluate_release_b(gate, repo, release_a, release_b)
+
+    assert decision.allowed is True
+    assert decision.gate == "enforced"
+    retained = entry.read_bytes()
+    assert retained != planted
+    assert json.loads(retained)["workflow_run_id"] == RUN_ID
+    assert verifier.calls == [release_b, release_b]
+
+
+def test_planted_cache_entry_naming_an_unknown_run_identity_blocks_without_an_artifact(
+    tmp_path: Path,
+) -> None:
+    """Falling back to the download path is not a way through when the channel cannot supply."""
+
     repo, _pre_r07, release_a, release_b = _release_repo(tmp_path)
     _plant_cache_entry(repo, tmp_path, release_b, workflow_run_id=777_001)
     gate, _transport, verifier = _gate(
@@ -1826,28 +1848,56 @@ def test_planted_cache_entry_naming_an_unknown_run_identity_is_refused(
 
     assert decision.allowed is False
     assert decision.gate == "rejected"
-    assert "run identity" in decision.reason
     assert verifier.calls == []
 
 
-def test_planted_cache_entry_naming_a_superseded_attempt_is_refused(tmp_path: Path) -> None:
+def test_a_superseded_cache_attempt_is_replaced_by_a_fresh_download(tmp_path: Path) -> None:
+    """`Re-run all jobs` supersedes attempt 1; the entry written for it must not brick rollback.
+
+    GitHub's run list reports only the current attempt, so attempt 1 becomes invisible and the
+    retained entry can never match again. Treating that as a miss re-downloads the evidence the
+    channel resolves now and atomically replaces the entry, leaving no stale bytes behind.
+    """
+
     repo, _pre_r07, release_a, release_b = _release_repo(tmp_path)
-    _plant_cache_entry(repo, tmp_path, release_b, run_attempt=1)
+    entry = _plant_cache_entry(repo, tmp_path, release_b, run_attempt=1)
+    superseded = entry.read_bytes()
+    assert json.loads(superseded)["run_attempt"] == 1
+    gate, transport, verifier = _gate(tmp_path, responses=_gate_responses(repo, release_b))
+
+    decision = _evaluate_release_b(gate, repo, release_a, release_b)
+
+    assert decision.allowed is True
+    assert decision.gate == "enforced"
+    retained = entry.read_bytes()
+    assert retained != superseded
+    assert json.loads(retained)["run_attempt"] == 2
+    assert [path.name for path in sorted(entry.parent.iterdir())] == [f"{release_b}.json"]
+    assert verifier.calls == [release_b, release_b]
+    assert transport.requests == [
+        r07_deploy_evidence.workflow_runs_url(release_b),
+        r07_deploy_evidence.workflow_runs_url(release_b),
+        r07_deploy_evidence.run_artifacts_url(RUN_ID),
+        "https://api.github.com/artifact/91/zip",
+    ]
+
+
+def test_a_superseded_cache_attempt_still_blocks_when_the_artifact_has_expired(
+    tmp_path: Path,
+) -> None:
+    repo, _pre_r07, release_a, release_b = _release_repo(tmp_path)
+    entry = _plant_cache_entry(repo, tmp_path, release_b, run_attempt=1)
+    superseded = entry.read_bytes()
     gate, _transport, verifier = _gate(
         tmp_path,
-        responses=_run_identity_responses(
-            release_b,
-            runs=[
-                _run_payload(head_sha=release_b, run_attempt=1),
-                _run_payload(head_sha=release_b, run_attempt=2),
-            ],
-        ),
+        responses=_run_identity_responses(release_b),
     )
 
     decision = _evaluate_release_b(gate, repo, release_a, release_b)
 
     assert decision.allowed is False
     assert decision.gate == "rejected"
+    assert entry.read_bytes() == superseded
     assert verifier.calls == []
 
 
