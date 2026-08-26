@@ -53,6 +53,12 @@ markers = [
     "exact_timeout(seconds): executable wall-clock bound for a complete exact test protocol",
 ]
 addopts = "-v --strict-markers -m 'not network and not linux_exact'"
+# A hung test used to burn the whole 45-minute CI job and leave no evidence
+# (3.12 shard 0 was cancelled mid-run with no JUnit). pytest's faulthandler
+# dumps every thread's stack after this many seconds and exits, which turns
+# a hang into a diagnosable failure. The slowest observed case is ~65s, so
+# ten minutes cannot fire on a healthy run.
+faulthandler_timeout = 600
 
 [dependency-groups]
 dev = [

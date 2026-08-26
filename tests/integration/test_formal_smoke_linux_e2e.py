@@ -409,7 +409,10 @@ def _invoke_real_cli(
     configuration_path: Path,
     trusted_base: Path,
     output: Path,
-    timeout_seconds: float = 5,
+    # The child is a fresh CPython that imports the whole generation, so a
+    # five-second wall clock is a fast developer machine's budget; keep the
+    # bound, size it for a shared runner.
+    timeout_seconds: float = 60,
 ) -> int:
     from rquant.cli import main
 

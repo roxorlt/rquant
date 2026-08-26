@@ -69,6 +69,20 @@ def _repository_for_manifest(root: Path) -> Path:
     return root.parent / "repository"
 
 
+def _write_approved_skips(root: Path) -> None:
+    """Every manifest carries an approved-skip map; these fixtures approve none."""
+    root.mkdir(parents=True, exist_ok=True)
+    shards.approved_skips_path(root).write_text(
+        json.dumps(
+            {"platforms": {"darwin": {}, "linux": {}}, "schema_version": 1},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def _write_bundle(root: Path, groups: tuple[tuple[str, ...], ...]) -> dict[str, object]:
     repository_root = _repository_for_manifest(root)
     for nodeid in (nodeid for group in groups for nodeid in group):
@@ -77,11 +91,11 @@ def _write_bundle(root: Path, groups: tuple[tuple[str, ...], ...]) -> dict[str, 
         path.parent.mkdir(parents=True, exist_ok=True)
         if not path.exists():
             path.write_text("def test_case():\n    assert True\n", encoding="utf-8")
+    _write_approved_skips(root)
     return shards.write_manifest_bundle(
         root,
         selector=(),
         shard_nodeids=groups,
-        expected_skips=0,
         repository_root=repository_root,
     )
 
@@ -111,7 +125,9 @@ def test_manifest_rejects_duplicate_missing_and_extra_nodeids(
     )
 
     shard = manifest_root / "shard-1.jsonl"
-    shard.write_bytes(_canonical_bytes({"nodeid": nodeids[0]}))
+    shard.write_bytes(
+        _canonical_bytes({"nodeid": nodeids[0], "junit": shards.junit_identity(nodeids[0])})
+    )
     index = json.loads((manifest_root / "index.json").read_text(encoding="utf-8"))
     index["shards"][1]["sha256"] = shards.nodeid_digest((nodeids[0],))
     (manifest_root / "index.json").write_bytes(_canonical_bytes(index))
@@ -157,11 +173,11 @@ def test_runner_detects_default_collect_drift_before_execution(
     repository_root = _test_repository(tmp_path, "tests/test_small.py")
     nodeids = ("tests/test_small.py::test_one",)
     manifest_root = tmp_path / "manifest"
+    _write_approved_skips(manifest_root)
     shards.write_manifest_bundle(
         manifest_root,
         selector=(),
         shard_nodeids=(nodeids, (), (), ()),
-        expected_skips=0,
         repository_root=repository_root,
     )
 
@@ -186,11 +202,11 @@ def test_runner_uses_argsfile_and_writes_selection_evidence(
     test_path = _write_environment_isolation_repository(repository_root)
     nodeids = ("tests/test_execution_environment.py::test_execution_environment",)
     manifest_root = tmp_path / "manifest"
+    _write_approved_skips(manifest_root)
     index = shards.write_manifest_bundle(
         manifest_root,
         selector=(),
         shard_nodeids=(nodeids, (), (), ()),
-        expected_skips=0,
         repository_root=repository_root,
     )
     for name, value in SENTINEL_ENVIRONMENT.items():
@@ -386,14 +402,17 @@ def test_manifest_line_and_total_size_limits_fail_closed(tmp_path: Path) -> None
 
     prefix = "tests/test_size.py::test_case["
     suffix = "]"
-    payload_size = shards.MAX_NODEID_BYTES - len(prefix) - len(suffix)
+    # Each record repeats the nodeid in its JUnit identity, so size the nodeids
+    # to sit just under the per-shard cap: four of them then exceed the total.
+    nodeid_size = shards.MAX_SHARD_MANIFEST_BYTES // 2 - 128
+    payload_size = nodeid_size - len(prefix) - len(suffix)
     nodeids = tuple(prefix + (str(index) + "x" * (payload_size - 1)) + suffix for index in range(4))
+    _write_approved_skips(tmp_path / "oversized-manifest")
     with pytest.raises(shards.ContractError, match="total size"):
         shards.write_manifest_bundle(
             tmp_path / "oversized-manifest",
             selector=(),
             shard_nodeids=tuple((nodeid,) for nodeid in nodeids),
-            expected_skips=0,
             repository_root=repository_root,
         )
 
@@ -405,11 +424,11 @@ def test_validate_manifest_collects_only_the_default_universe(
     repository_root = _test_repository(tmp_path, "tests/test_default.py")
     manifest_root = tmp_path / "manifest"
     nodeids = ("tests/test_default.py::test_case",)
+    _write_approved_skips(manifest_root)
     shards.write_manifest_bundle(
         manifest_root,
         selector=(),
         shard_nodeids=(nodeids, (), (), ()),
-        expected_skips=0,
         repository_root=repository_root,
     )
     calls: list[tuple[str, ...]] = []
