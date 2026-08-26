@@ -358,10 +358,23 @@ class TestChildContainment:
             ),
             test_manifest_hash=world.test_manifest_sha256,
             vectors=world.test_manifest.vectors,
+            generation_root=world.generation_path,
+            generation_files=world.test_manifest.generation_files,
         )
         assert hashlib.sha256(request).hexdigest() == report["request_sha256"]
         decoded = json.loads(request)
-        assert set(decoded) == {"schema_version", "run_id", "test_manifest_hash", "vectors"}
+        assert set(decoded) == {
+            "generation_files",
+            "generation_root",
+            "schema_version",
+            "run_id",
+            "test_manifest_hash",
+            "vectors",
+        }
+        # Ruling E-1: the fixture half of the request is root-derived too. It names paths
+        # and digests the root already checked, never a result the child could compare with.
+        for entry in decoded["generation_files"]:
+            assert set(entry) == {"relative_path", "sha256", "size", "mode"}
         for vector in decoded["vectors"]:
             assert set(vector) == {
                 "vector_id",

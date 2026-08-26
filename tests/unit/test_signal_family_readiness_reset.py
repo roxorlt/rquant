@@ -1282,6 +1282,7 @@ def test_test_manifest_binds_vectors_expected_results_pairs_and_bindings() -> No
         "schema_version",
         "vectors",
         "expected_results",
+        "generation_files",
         "pairs",
         "service_bindings",
         "service_bindings_hash",

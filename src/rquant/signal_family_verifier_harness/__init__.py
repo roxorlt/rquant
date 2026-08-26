@@ -39,6 +39,7 @@ from ._canonical import (
 from ._request import (
     MAX_REQUEST_BYTES,
     MAX_RESPONSE_BYTES,
+    AuthorizedGenerationFile,
     ChildRequest,
     ChildRequestError,
     RequestVector,
@@ -68,6 +69,7 @@ __all__ = [
     "IMPLEMENTED_SURFACE_IDS",
     "MAX_REQUEST_BYTES",
     "MAX_RESPONSE_BYTES",
+    "AuthorizedGenerationFile",
     "ChildRequest",
     "ChildRequestError",
     "RequestVector",

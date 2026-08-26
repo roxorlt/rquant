@@ -58,9 +58,16 @@ def run_child(request_bytes: bytes, *, workspace_root: Path) -> bytes:
     """Turn the request bytes into the one canonical response, or raise."""
 
     request = parse_child_request(request_bytes)
+    authorized = request.authorized_fixtures
+    generation_root = Path(request.generation_root)
     results: dict[str, Any] = {}
     for vector in request.vectors:
-        results[vector.vector_id] = exercise_vector(vector, workspace_root)
+        results[vector.vector_id] = exercise_vector(
+            vector,
+            workspace_root,
+            generation_root=generation_root,
+            authorized_fixtures=authorized,
+        )
     return build_child_response(request, results)
 
 

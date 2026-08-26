@@ -45,6 +45,7 @@ from tests.integration.signal_family_verifier_world import (
     write_full_manifest_bytes,
 )
 from tests.support import signal_family_private_root as _private_root
+from tests.support.signal_family_harness_vectors import shadow_fixture_supported
 
 # The Phase C ancestry walks refuse a group- or world-writable ancestor, and pytest's own
 # `tmp_path` is rooted at `TMPDIR`, which defaults to a sticky `/tmp` on Linux. Rebinding both
@@ -1507,6 +1508,52 @@ class TestAppendStore:
 # ---------------------------------------------------------------------------------------
 
 
+#: Reachability of the `strategy-shadow` readers is a platform fact about production code,
+#: not about this suite: `shadow_session_builder` enters them through
+#: `FilesystemShadowSessionInputLoader` under
+#: `LegacyShadowFilesystemPolicy(mode="linux-production")`, and
+#: `legacy_shadow_export._validate_mount_policy` refuses that mode off Linux. On Linux the
+#: real harness covers all five pairs and reaches READY; elsewhere it covers four and the C1
+#: coverage gate refuses, which is what the pair of cases below assert respectively.
+_SHADOW_REACHABLE = shadow_fixture_supported()
+linux_only = pytest.mark.skipif(
+    not _SHADOW_REACHABLE,
+    reason=(
+        "the strategy-shadow production reader path runs under "
+        "LegacyShadowFilesystemPolicy(mode='linux-production'), which "
+        "legacy_shadow_export._validate_mount_policy refuses off Linux"
+    ),
+)
+darwin_only = pytest.mark.skipif(
+    _SHADOW_REACHABLE,
+    reason="this case describes a host where the shadow production reader path is closed",
+)
+
+
+def _run_real_harness(world: VerifierWorld) -> None:
+    """Run the real-harness world and accept the one platform-dependent outcome.
+
+    Where the `strategy-shadow` production reader path can be entered the run reaches READY;
+    where it cannot, it stops at the C1 coverage gate. Both are correct, and neither is what
+    the cases using this helper are about — they are about the results the child produced,
+    which the root has already validated byte for byte either way.
+    """
+
+    try:
+        outcome = _verifier(world).run()
+    except root_verifier.SignalFamilyRootVerifierError as error:
+        if _SHADOW_REACHABLE:
+            raise
+        assert error.audit_record is not None
+        assert (
+            error.audit_record.reason_code
+            is verification.SignalFamilyReasonCode.PAIR_SURFACE_COVERAGE_MISSING
+        )
+        return
+    assert _SHADOW_REACHABLE
+    assert outcome.state is verification.SignalFamilyReadinessState.READY
+
+
 class TestProductionHarness:
     """The eight steps again, with the real harness zipapp exercising real builders.
 
@@ -1518,17 +1565,43 @@ class TestProductionHarness:
     neither of them was told in advance.
     """
 
+    @linux_only
+    def test_the_real_harness_reaches_five_pair_readiness(self, tmp_path: Path) -> None:
+        """P1-6: thirteen of thirteen reader surfaces, through their real builders, READY.
+
+        Nothing in this run is replayed. The child imported the generation, built each
+        reader through its production `runtime_builder_*` factory — including the two
+        `strategy-router` readers over an in-generation runner-state database and the three
+        `strategy-shadow` readers over four accepted legacy shadow exports — and derived its
+        own results. The root then recomputed `expected_result_set_hash` from bytes it was
+        never told in advance, required exact five-pair surface coverage, compared its own
+        before/after digest of the fixture set, and only then issued five receipts.
+        """
+
+        world = build_world(tmp_path, harness="real")
+
+        result = _verifier(world).run()
+
+        assert result.state is verification.SignalFamilyReadinessState.READY
+        assert len(result.receipts) == 5
+        assert {receipt.pair_id for receipt in result.receipts} == set(verification.PAIR_IDS)
+        assert len({receipt.receipt_fingerprint for receipt in result.receipts}) == 5
+        assert len(world.test_manifest.vectors) == 13
+        assert len(_rows(world, "receipts")) == 5
+        assert len(_rows(world, "decisions")) == 1
+
+    @darwin_only
     def test_the_real_harness_is_refused_for_the_pairs_it_cannot_exercise(
         self,
         tmp_path: Path,
     ) -> None:
-        """Ruling C1: 8/13 coverage is not five-pair readiness, and no longer pretends to be.
+        """Ruling C1: partial coverage is not five-pair readiness, and never pretends to be.
 
         The rejection reason is what makes this case load-bearing. Reaching
-        `PAIR_SURFACE_COVERAGE_MISSING` means the child's eight results already satisfied
-        every identity, ordering, and hash check — including `expected_result_set_hash` —
-        and the only thing left to fail was coverage of `strategy-router` and
-        `strategy-shadow`, whose readers no vector can reach yet (R3/R4).
+        `PAIR_SURFACE_COVERAGE_MISSING` means the child's results already satisfied every
+        identity, ordering, and hash check — including `expected_result_set_hash` — and the
+        only thing left to fail was coverage of `strategy-shadow`, whose three readers the
+        production `shadow_session_builder` path cannot reach on this platform.
         """
 
         world = build_world(tmp_path, harness="real")
@@ -1548,15 +1621,20 @@ class TestProductionHarness:
     ) -> None:
         world = build_world(tmp_path, harness="real")
 
-        with pytest.raises(root_verifier.SignalFamilyRootVerifierError):
-            _verifier(world).run()
+        _run_real_harness(world)
 
         assert tuple(sorted(world.replay)) == tuple(
             sorted(vector.vector_id for vector in world.test_manifest.vectors)
         )
-        assert {vector.surface_id.value for vector in world.test_manifest.vectors} == set(
-            harness.IMPLEMENTED_SURFACE_IDS
-        )
+        reachable = set(harness.IMPLEMENTED_SURFACE_IDS)
+        if not _SHADOW_REACHABLE:
+            reachable -= {
+                surface.value
+                for surface in verification.READER_SURFACES["strategy-shadow"]
+            }
+        assert {
+            vector.surface_id.value for vector in world.test_manifest.vectors
+        } == reachable
 
     def test_every_real_result_names_the_surface_and_its_production_builder(
         self,
@@ -1566,51 +1644,125 @@ class TestProductionHarness:
 
         world = build_world(tmp_path, harness="real")
 
-        with pytest.raises(root_verifier.SignalFamilyRootVerifierError):
-            _verifier(world).run()
+        _run_real_harness(world)
 
         by_id = {vector.vector_id: vector for vector in world.test_manifest.vectors}
         for vector_id, payload in world.replay.items():
             observed = json.loads(payload)
             assert observed["surface_id"] == by_id[vector_id].surface_id.value
             assert observed["builder"].startswith("rquant.runtime_builder_")
-            assert observed["state_unchanged"] is True
+            # 裁决 4: the child never claims state stability; the root compares digests.
+            assert "state_unchanged" not in observed
 
-    def test_the_two_unblocked_pairs_are_exercised_in_the_child(self, tmp_path: Path) -> None:
-        """WP4-c round 1: the child cwd move and the widened environment, proven end to end.
+    def test_the_unblocked_pairs_are_exercised_in_the_child(self, tmp_path: Path) -> None:
+        """WP4-c round 1 plus ruling E-1, proven end to end.
 
         `router-notifier` needed `rquant.config` to be constructible and `notifier-serving`
-        needed an authority root with no world-writable ancestor. Both now run inside the
-        real child; the run still stops at the coverage gate, but it stops *after* those
-        results were produced and accepted byte for byte.
+        needed an authority root with no world-writable ancestor. `strategy-router` needed
+        producer state no bounded vector can carry, which now arrives through the
+        in-generation fixture channel. All four pairs run inside the real child; the run
+        still stops at the coverage gate, but it stops *after* those results were produced
+        and accepted byte for byte.
         """
 
         import json
 
         world = build_world(tmp_path, harness="real")
 
-        with pytest.raises(root_verifier.SignalFamilyRootVerifierError):
-            _verifier(world).run()
+        _run_real_harness(world)
 
         by_id = {vector.vector_id: vector for vector in world.test_manifest.vectors}
         pairs = {vector.pair_id for vector in by_id.values()}
-        assert {"router-notifier", "notifier-serving", "router-paper"} == pairs
+        expected_pairs = {
+            "router-notifier",
+            "notifier-serving",
+            "router-paper",
+            "strategy-router",
+        }
+        if _SHADOW_REACHABLE:
+            expected_pairs.add("strategy-shadow")
+        assert expected_pairs == pairs
 
         builders = {
             json.loads(payload)["builder"]
             for vector_id, payload in world.replay.items()
-            if by_id[vector_id].pair_id in {"router-notifier", "notifier-serving"}
+            if by_id[vector_id].pair_id
+            in {"router-notifier", "notifier-serving", "strategy-router"}
         }
         assert builders == {
             "rquant.runtime_builder_signal.notifier_builder",
+            "rquant.runtime_builder_signal.signal_router_builder",
             "rquant.runtime_builder_serving.serving_publisher_builder",
         }
 
-    def test_a_blocked_surface_vector_fails_closed_without_evidence(
+    def test_the_router_readers_run_over_the_in_generation_producer_fixture(
         self,
         tmp_path: Path,
     ) -> None:
-        """The harness refuses a surface it cannot reach rather than inventing a result."""
+        """Ruling E-1 end to end: the fixture is generation content the root vouches for.
+
+        The two `strategy-router` readers cannot answer at all unless the child found the
+        runner-state dump and the frozen routing policy inside the generation, rebuilt the
+        database from the dump, and handed the resulting paths to the real
+        `signal_router_builder`. So a matching `source_generation_id` in both results is
+        producer state that travelled the whole channel: build script, generation tree, full
+        manifest, policy hash, root check, request, child copy, production builder.
+        """
+
+        import json
+
+        from tests.support.signal_family_harness_vectors import (
+            generation_fixture_declarations,
+            producer_fixture_descriptor,
+        )
+
+        world = build_world(tmp_path, harness="real")
+
+        _run_real_harness(world)
+
+        descriptor = producer_fixture_descriptor()
+        declared = generation_fixture_declarations()
+        published = {
+            fixture.relative_path: fixture
+            for fixture in world.test_manifest.generation_files
+        }
+        entries = world.gateway.snapshots[0].full_manifest_entries
+        for fixture in declared:
+            assert published[fixture.relative_path] == fixture
+            assert entries[fixture.relative_path] == fixture.sha256
+            assert (world.generation_path / fixture.relative_path).is_file()
+
+        by_id = {vector.vector_id: vector for vector in world.test_manifest.vectors}
+        observed = {
+            by_id[vector_id].surface_id.value: json.loads(payload)["observation"]
+            for vector_id, payload in world.replay.items()
+            if by_id[vector_id].pair_id == "strategy-router"
+        }
+        assert set(observed) == {
+            surface.value
+            for surface in verification.READER_SURFACES["strategy-router"]
+        }
+        read_batch = observed[
+            verification.SurfaceId.READONLY_STRATEGY_RUNNER_SIGNAL_SOURCE_READ_BATCH.value
+        ]
+        route = observed[verification.SurfaceId.ROUTE_RUNNER_SIGNALS.value]
+        assert read_batch["batch"]["descriptor"]["generation_id"] == (
+            descriptor["source_generation_id"]
+        )
+        assert read_batch["batch"]["count"] == descriptor["signal_high_watermark"]
+        assert route["summary"]["source_generation_id"] == descriptor["source_generation_id"]
+        assert route["summary"]["routed_count"] == 1
+
+    def test_a_vector_the_harness_cannot_answer_fails_closed_without_evidence(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A vector the child cannot answer stops the run rather than inventing a result.
+
+        The vector names a real reader surface with an input the exercise cannot use. The
+        child does not fall back to a placeholder, a partial result, or a skipped vector: it
+        exits nonzero and silent, and the root refuses the whole run with no evidence.
+        """
 
         world = build_world(
             tmp_path,
@@ -1627,15 +1779,169 @@ class TestProductionHarness:
         )
         _assert_no_evidence(world)
 
-    def test_the_remaining_blocked_set_is_exactly_the_two_producer_bound_pairs(self) -> None:
-        """The activity gap this harness still has, stated as a contract rather than prose."""
+    # -- ruling E-1 and E-3: the in-generation fixture channel ----------------------
 
-        assert set(harness.BLOCKED_SURFACE_REASONS) == {
+    @staticmethod
+    def _rewrite_fixture(world: VerifierWorld, payload: bytes) -> Path:
+        """Rewrite the first declared fixture in place, keeping its read-only mode."""
+
+        declared = world.test_manifest.generation_files[0]
+        target = world.generation_path / declared.relative_path
+        target.chmod(0o644)
+        target.write_bytes(payload)
+        target.chmod(declared.mode)
+        return target
+
+    def test_a_generation_fixture_whose_bytes_moved_is_refused(self, tmp_path: Path) -> None:
+        """Ruling E-1: the bytes on disk are checked, not the declaration's word for them."""
+
+        world = build_world(tmp_path, harness="real")
+        self._rewrite_fixture(world, b'{"default_no_target_reason":"substituted","rules":[]}')
+
+        with pytest.raises(root_verifier.SignalFamilyRootVerifierError) as error:
+            _verifier(world).run()
+
+        assert (
+            error.value.audit_record.reason_code
+            is verification.SignalFamilyReasonCode.GENERATION_FIXTURE_INVALID
+        )
+        _assert_no_evidence(world)
+
+    def test_a_generation_fixture_whose_mode_moved_is_refused(self, tmp_path: Path) -> None:
+        """A writable fixture is not the read-only generation content the manifest declared."""
+
+        world = build_world(tmp_path, harness="real")
+        declared = world.test_manifest.generation_files[0]
+        (world.generation_path / declared.relative_path).chmod(0o644)
+
+        with pytest.raises(root_verifier.SignalFamilyRootVerifierError) as error:
+            _verifier(world).run()
+
+        assert (
+            error.value.audit_record.reason_code
+            is verification.SignalFamilyReasonCode.GENERATION_FIXTURE_INVALID
+        )
+        _assert_no_evidence(world)
+
+    def test_a_fixture_outside_the_full_manifest_closure_is_refused(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Membership in the source closure is the third of the three agreeing records."""
+
+        world = build_world(tmp_path, harness="real")
+        declared = world.test_manifest.generation_files[0]
+        snapshot = world.gateway.snapshots[0]
+        entries = dict(snapshot.full_manifest_entries)
+        del entries[declared.relative_path]
+        world.gateway.snapshots[0] = snapshot_with(world, full_manifest_entries=entries)
+
+        with pytest.raises(root_verifier.SignalFamilyRootVerifierError) as error:
+            _verifier(world).run()
+
+        assert (
+            error.value.audit_record.reason_code
+            is verification.SignalFamilyReasonCode.GENERATION_FIXTURE_INVALID
+        )
+        _assert_no_evidence(world)
+
+    def test_a_fixture_that_moves_while_the_child_runs_is_refused(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """裁决 4, the enforcing half: the root compares its own before and after digests.
+
+        The child cannot be the witness here — that was the whole objection to the constant
+        `state_unchanged` — so the movement is staged *while the child runs* and the root has
+        to catch it on its own arithmetic. The mutation is byte-for-byte the same size and
+        mode, so nothing but the digest comparison can see it.
+        """
+
+        world = build_world(tmp_path, harness="real")
+        original = root_verifier.RootVerifier._run_child
+        declared = world.test_manifest.generation_files[0]
+        payload = (world.generation_path / declared.relative_path).read_bytes()
+        moved = payload[:-2] + b"} " if payload.endswith(b"]}") else payload[:-1] + b" "
+
+        def running_child(self: Any, **kwargs: Any) -> bytes:
+            result = original(self, **kwargs)
+            self_test = world.generation_path / declared.relative_path
+            self_test.chmod(0o644)
+            self_test.write_bytes(moved)
+            self_test.chmod(declared.mode)
+            return result
+
+        monkeypatch.setattr(root_verifier.RootVerifier, "_run_child", running_child)
+
+        with pytest.raises(root_verifier.SignalFamilyRootVerifierError) as error:
+            _verifier(world).run()
+
+        assert len(moved) == len(payload)
+        assert (
+            error.value.audit_record.reason_code
+            is verification.SignalFamilyReasonCode.GENERATION_STATE_CHANGED
+        )
+        _assert_no_evidence(world)
+
+    def test_the_state_digest_sees_a_fixture_that_disappeared(self, tmp_path: Path) -> None:
+        """"It is gone" is a change, so the measuring pass folds absence in rather than raising."""
+
+        world = build_world(tmp_path, harness="real")
+        declared = world.test_manifest.generation_files
+        before = root_verifier._generation_state_digest(world.generation_path, declared)
+        (world.generation_path / declared[0].relative_path).unlink()
+
+        after = root_verifier._generation_state_digest(world.generation_path, declared)
+
+        assert before != after
+
+    def test_every_reader_surface_has_an_exercise(self) -> None:
+        """P1-6: thirteen of thirteen, and the blocked map is empty rather than excused."""
+
+        assert harness.BLOCKED_SURFACE_REASONS == {}
+        assert set(harness.IMPLEMENTED_SURFACE_IDS) == {
             surface.value
-            for pair_id in ("strategy-router", "strategy-shadow")
-            for surface in verification.READER_SURFACES[pair_id]
+            for surfaces in verification.READER_SURFACES.values()
+            for surface in surfaces
         }
-        assert len(harness.IMPLEMENTED_SURFACE_IDS) == 8
+        assert len(harness.IMPLEMENTED_SURFACE_IDS) == 13
+
+    def test_shadow_reachability_is_a_platform_fact_about_production_code(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Why the shadow cases are Linux-only, stated as an assertion rather than prose.
+
+        `shadow_session_builder` builds `FilesystemShadowSessionInputLoader()` with nothing
+        injected, and that loader defaults to `LegacyShadowFilesystemPolicy(mode=
+        "linux-production")`. Every `load_accepted_legacy_shadow_export` call it makes runs
+        `validate_legacy_shadow_filesystem_contract` first, which consults
+        `/proc/self/mountinfo` on Linux and refuses outright anywhere else. The harness
+        implements all three readers either way; what the platform decides is whether their
+        production path can be entered at all.
+        """
+
+        import sys
+
+        from rquant.legacy_shadow_export import (
+            LegacyShadowExportError,
+            LegacyShadowFilesystemPolicy,
+            validate_legacy_shadow_filesystem_contract,
+        )
+
+        policy = LegacyShadowFilesystemPolicy(mode="linux-production")
+        if sys.platform == "linux":
+            # The private root the Phase C suites already require is on a real local mount,
+            # which is exactly the condition the predicate exists to establish.
+            assert (
+                validate_legacy_shadow_filesystem_contract(tmp_path, policy=policy).filesystem
+                == "local-posix"
+            )
+        else:
+            with pytest.raises(LegacyShadowExportError, match="Linux mount verification"):
+                validate_legacy_shadow_filesystem_contract(tmp_path, policy=policy)
+        assert shadow_fixture_supported() == (sys.platform == "linux")
 
     @pytest.mark.parametrize(
         "covered",

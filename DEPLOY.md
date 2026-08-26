@@ -148,10 +148,25 @@ Codex 最终验收。**尚未 merge、尚未打 tag、尚未部署**，云服务
    400 天后 run 记录被归档删除，重下载与重核验都不再可能，该目标只能先在 main 上重新触发一次
    CI（或用一个更新的等价 commit）才能部署。
 15. **规格 errata 未决**：family taxonomy 单元素域、bundle/overlay identity 语义、
-   producer/consumer id 域、profile-service-manifests 文档绑定、`strategy-router` /
-   `strategy-shadow` 五个 surface 的向量语义、WP5 Q1–Q4、wire schema 在 3.11/3.12 的可见性、
-   退休门的交易日数字，全部等 Codex 裁决；在此之前真实 harness 不产生五对 `READY`，
-   Phase C activation 也不成立。
+   producer/consumer id 域、profile-service-manifests 文档绑定、WP5 Q1–Q4、wire schema
+   在 3.11/3.12 的可见性、退休门的交易日数字，全部等 Codex 裁决。
+   （`strategy-router` / `strategy-shadow` 五个 surface 的向量语义已在 R2-E 落地：13 个
+   reader surface 全部经真实 production builder 产出，离线 harness 世界在 Linux 上产出
+   五对 `READY`。这不改变「本轮不安装、不激活」——Phase C activation 仍不成立。）
+16. **Phase C 在真实生产 generation 上能否跑通：未决，且当前代码形态下不成立**。
+   `strategy-shadow` 的三个 reader 只能经 `FilesystemShadowSessionInputLoader` 读一份
+   accepted legacy shadow export，而 `legacy_shadow_export._open_child_directory_at`
+   要求 export 的 session 目录 `st_uid == os.geteuid()`（**不是** 文件那样的
+   `{0, euid}`），`_ensure_private_root` 又把 export 根 `fchmod` 到 `0700`。合起来：
+   **export 只能被与发布者同 uid 的进程读**。离线世界里发布者与 child 同 uid 所以能跑通；
+   生产 generation 是 root-owned、Phase C child 是非特权 lighthouse，这条路走不通。
+
+   **不要**按「构建后交给 root 并置 0555」去补救——交给 root 之后
+   `st_uid != geteuid()` 必然成立，shadow reader 会 100% 被拒。三条候选路径交 Codex 裁决：
+   ①generation 内的 shadow export 由 lighthouse 而非 root 拥有（弱化 generation 不可变性）；
+   ②Phase C child 以发布者 uid 运行（改变 child 身份模型）；
+   ③修改 `_open_child_directory_at` 的 owner 谓词接受 `{0, euid}`（TCB 变更，需单独授权）。
+   在裁决落地并实测之前，「Phase C 能在生产 generation 上产出 READY」没有证据。
 
 **回滚**：本分支没有产生任何生产变更，因此没有回滚基线。PR 未合并前直接关闭 PR 即可；
 已合并但未部署时，生产仍停在上一次部署的 commit，无需任何动作。

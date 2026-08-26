@@ -71,6 +71,12 @@ MAX_VECTOR_INPUT_BYTES = 65_536
 MAX_CANONICAL_RESULT_BYTES = 65_536
 MAX_IPC_RESPONSE_BYTES = 1_048_576
 
+# One in-generation producer fixture is bounded well below the root's generic source cap:
+# the fixture channel exists to carry producer state a bounded vector cannot inline, not to
+# hand the child an unbounded tree. `MAX_GENERATION_FIXTURE_FILES` bounds the tuple itself.
+MAX_GENERATION_FIXTURE_BYTES = 1_048_576
+MAX_GENERATION_FIXTURE_FILES = 32
+
 
 class SignalFamilyVerificationError(ValueError):
     """A Phase C declaration, preimage, or transition violated its frozen contract."""
@@ -969,12 +975,66 @@ def five_pair_service_binding_set_hash(
     return _five_pair_service_binding_set_hash(resolve_pair_bindings(manifests), bindings)
 
 
+class SignalFamilyGenerationFileV1(_PhaseCStrictModel):
+    """One in-generation producer fixture the test manifest authorizes the child to copy.
+
+    Ruling E-1 froze this tuple. A vector that needs producer-side state no bounded
+    `input_json` can carry — an audited runner-state database, a frozen routing policy —
+    names the file here instead, and the file itself lives in the generation under the same
+    full-manifest source closure as every other generation file. The root checks
+    membership, bytes, size, and mode before the child starts and again after it exits; the
+    child copies the file into its own private workspace and rechecks the digest before any
+    production builder is allowed to see it. Nothing here is a path the child chose.
+    """
+
+    relative_path: StrictStr
+    sha256: Sha256
+    size: StrictInt = Field(ge=1, le=MAX_GENERATION_FIXTURE_BYTES)
+    mode: StrictInt = Field(ge=0, le=0o777)
+
+    @model_validator(mode="after")
+    def validate_identity(self) -> Self:
+        _validate_relative_source_path(self.relative_path)
+        if self.mode & 0o222:
+            raise SignalFamilyVerificationError(
+                "a generation fixture must be declared read-only"
+            )
+        return self
+
+    @classmethod
+    def _from_decoded(cls, decoded: dict[str, Any]) -> Self:
+        return cls.model_validate(decoded)
+
+
+def _require_sorted_generation_files(
+    files: Sequence[SignalFamilyGenerationFileV1],
+) -> tuple[SignalFamilyGenerationFileV1, ...]:
+    """Sorted by relative path and duplicate-free, so the tuple has one canonical form."""
+
+    resolved = _require_exact_items(
+        files,
+        SignalFamilyGenerationFileV1,
+        field="generation_files",
+    )
+    if len(resolved) > MAX_GENERATION_FIXTURE_FILES:
+        raise SignalFamilyVerificationError(
+            "generation files exceed the bounded fixture count"
+        )
+    paths = tuple(entry.relative_path for entry in resolved)
+    if list(paths) != sorted(set(paths)):
+        raise SignalFamilyVerificationError(
+            "generation files must be sorted by relative_path and duplicate-free"
+        )
+    return resolved
+
+
 class SignalFamilyTestManifestV1(_PhaseCStrictModel):
     """The immutable in-generation test manifest the root policy authorizes by hash."""
 
     schema_version: StrictInt
     vectors: tuple[SignalFamilyVectorV1, ...]
     expected_results: tuple[SignalFamilyExpectedResultV1, ...]
+    generation_files: tuple[SignalFamilyGenerationFileV1, ...]
     pairs: tuple[PairBindingV1, ...]
     service_bindings: tuple[VerificationServiceBindingV1, ...]
     service_bindings_hash: Sha256
@@ -1000,6 +1060,7 @@ class SignalFamilyTestManifestV1(_PhaseCStrictModel):
             raise SignalFamilyVerificationError(
                 "expected results must pair one to one with vectors"
             )
+        _require_sorted_generation_files(self.generation_files)
         pairs = _require_exact_five_pairs(self.pairs)
         participating = _participating_service_ids(pairs)
         validate_service_bindings(self.service_bindings, participating)
@@ -1025,17 +1086,25 @@ class SignalFamilyTestManifestV1(_PhaseCStrictModel):
         expected_results: tuple[SignalFamilyExpectedResultV1, ...],
         profile_manifests: Sequence[RuntimeServiceManifest],
         service_bindings: tuple[VerificationServiceBindingV1, ...],
+        generation_files: tuple[SignalFamilyGenerationFileV1, ...] = (),
     ) -> Self:
         values: dict[str, Any] = {
             "schema_version": 1,
             "vectors": tuple(vectors),
             "expected_results": tuple(expected_results),
+            "generation_files": tuple(generation_files),
             "pairs": resolve_pair_bindings(profile_manifests),
             "service_bindings": tuple(service_bindings),
             "service_bindings_hash": service_bindings_hash(service_bindings),
         }
         preimage = dict(values)
-        for name in ("vectors", "expected_results", "pairs", "service_bindings"):
+        for name in (
+            "vectors",
+            "expected_results",
+            "generation_files",
+            "pairs",
+            "service_bindings",
+        ):
             preimage[name] = [item.model_dump(mode="json") for item in values[name]]
         return cls(**values, content_hash=canonical_sha256(preimage))
 
@@ -1047,6 +1116,7 @@ class SignalFamilyTestManifestV1(_PhaseCStrictModel):
         for field, model in (
             ("vectors", SignalFamilyVectorV1),
             ("expected_results", SignalFamilyExpectedResultV1),
+            ("generation_files", SignalFamilyGenerationFileV1),
             ("pairs", PairBindingV1),
             ("service_bindings", VerificationServiceBindingV1),
         ):
@@ -2141,6 +2211,8 @@ class SignalFamilyReasonCode(StrEnum):
     ENTRY_CONFLICTING = "ENTRY_CONFLICTING"
     ENTRY_STALE = "ENTRY_STALE"
     FULL_MANIFEST_HASH_MISMATCH = "FULL_MANIFEST_HASH_MISMATCH"
+    GENERATION_FIXTURE_INVALID = "GENERATION_FIXTURE_INVALID"
+    GENERATION_STATE_CHANGED = "GENERATION_STATE_CHANGED"
     VERIFICATION_MANIFEST_HASH_MISMATCH = "VERIFICATION_MANIFEST_HASH_MISMATCH"
     TEST_MANIFEST_HASH_MISMATCH = "TEST_MANIFEST_HASH_MISMATCH"
     VECTOR_SET_HASH_MISMATCH = "VECTOR_SET_HASH_MISMATCH"

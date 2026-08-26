@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import json
 import os
+import re
 import stat
 import sys
 import zipfile
@@ -37,7 +39,43 @@ from rquant.signal_family_verifier_harness import __main__ as harness_main
 from rquant.signal_family_verifier_harness import _canonical, _request, _resolve, _surfaces
 from rquant.strict_json import canonical_json_bytes as generation_canonical_json_bytes
 from tests.support import signal_family_private_root as _private_root
-from tests.support.signal_family_harness_vectors import harness_vectors
+from tests.support.signal_family_harness_vectors import (
+    GENERATION_FIXTURE_PREFIX,
+    PRODUCER_FIXTURE_ROOT,
+    authorized_fixtures,
+    generation_fixture_declarations,
+    harness_vectors,
+    install_generation_fixtures,
+    shadow_fixture_supported,
+)
+
+#: The three `strategy-shadow` readers are reachable only where the production reader path
+#: is: `shadow_session_builder` enters them through `FilesystemShadowSessionInputLoader`
+#: under `LegacyShadowFilesystemPolicy(mode="linux-production")`, and
+#: `legacy_shadow_export._validate_mount_policy` refuses that mode off Linux. The harness
+#: implements all thirteen; these cases are the ones that need the fixture to exist.
+SHADOW_SURFACE_IDS = frozenset(
+    surface.value for surface in READER_SURFACES["strategy-shadow"]
+)
+linux_only = pytest.mark.skipif(
+    not shadow_fixture_supported(),
+    reason=(
+        "the strategy-shadow production reader path runs under "
+        "LegacyShadowFilesystemPolicy(mode='linux-production'), which "
+        "legacy_shadow_export._validate_mount_policy refuses off Linux"
+    ),
+)
+
+
+def _surface_params() -> list[Any]:
+    return [
+        pytest.param(
+            surface_id,
+            marks=[linux_only] if surface_id in SHADOW_SURFACE_IDS else [],
+            id=surface_id,
+        )
+        for surface_id in harness.IMPLEMENTED_SURFACE_IDS
+    ]
 
 # The Phase C ancestry walks refuse a group- or world-writable ancestor, and pytest's own
 # `tmp_path` is rooted at `TMPDIR`, which defaults to a sticky `/tmp` on Linux. Rebinding both
@@ -48,8 +86,17 @@ tmp_path = _private_root.tmp_path
 REPOSITORY_ROOT = Path(__file__).resolve().parent.parent.parent
 BUILD_SCRIPT = REPOSITORY_ROOT / "scripts" / "build-signal-family-verifier-harness.py"
 
+_MATERIALIZING_STATE_KEYS = (
+    "directories",
+    "files",
+    "generation_files",
+    "serving_authorities",
+    "spool",
+    "sqlite_sources",
+)
 RUN_ID = "a" * 64
 TEST_MANIFEST_HASH = "c" * 64
+POLICY_DIGEST_PATTERN = re.compile(r"policy_digest[= ][0-9a-f]{8}")
 
 
 def _load_build_script() -> Any:
@@ -72,9 +119,24 @@ def _request_vector(vector: Any) -> harness.RequestVector:
     )
 
 
-def _request_payload(vectors: tuple[Any, ...]) -> bytes:
+GENERATION_ROOT = "/srv/rquant/generations/harness-request-fixture"
+
+
+def _request_payload(
+    vectors: tuple[Any, ...],
+    *,
+    generation_root: str = GENERATION_ROOT,
+    generation_files: tuple[dict[str, Any], ...] | None = None,
+) -> bytes:
+    declared = (
+        [entry.model_dump(mode="json") for entry in generation_fixture_declarations()]
+        if generation_files is None
+        else list(generation_files)
+    )
     return _canonical.canonical_json_bytes(
         {
+            "generation_files": declared,
+            "generation_root": generation_root,
             "run_id": RUN_ID,
             "schema_version": 1,
             "test_manifest_hash": TEST_MANIFEST_HASH,
@@ -170,6 +232,13 @@ class TestSurfaceCoverageBookkeeping:
         for surface_id, reason in harness.BLOCKED_SURFACE_REASONS.items():
             assert surface_id in self._all_reader_surfaces()
             assert len(reason) > 40
+
+    def test_every_reader_surface_is_implemented(self) -> None:
+        """P1-6: thirteen of thirteen, with nothing standing in for a missing exercise."""
+
+        assert set(harness.IMPLEMENTED_SURFACE_IDS) == self._all_reader_surfaces()
+        assert len(harness.IMPLEMENTED_SURFACE_IDS) == 13
+        assert harness.BLOCKED_SURFACE_REASONS == {}
 
     def test_no_producer_surface_has_an_exercise(self) -> None:
         producers = {
@@ -646,44 +715,108 @@ class TestServingAuthorityAncestryRule:
 # ---------------------------------------------------------------------------------------
 
 
+_FIXTURE_CACHE: dict[Path, Any] = {}
+
+
+def _session_root(root: Path) -> Path:
+    """The private session root `tmp_path` was carved out of."""
+
+    candidate = root.resolve()
+    home = Path.home().resolve()
+    while candidate.parent != home and candidate.parent != candidate:
+        candidate = candidate.parent
+    return candidate
+
+
+def _installed_fixtures(root: Path) -> Any:
+    """One generation tree per session, shared by every exercise in this module.
+
+    The `strategy-shadow` half is published in place by the production export publishers,
+    which is neither cheap nor repeatable inside one directory, so it is built once.
+    """
+
+    session = _session_root(root)
+    cached = _FIXTURE_CACHE.get(session)
+    if cached is None:
+        generation = session / "harness-generation"
+        generation.mkdir(mode=0o700, exist_ok=True)
+        cached = install_generation_fixtures(generation)
+        _FIXTURE_CACHE[session] = cached
+    return cached
+
+
+def _generation_root(root: Path) -> Path:
+    return _installed_fixtures(root).generation_root
+
+
+def _harness_vectors(root: Path) -> tuple[Any, ...]:
+    from tests.support.signal_family_harness_vectors import harness_vectors
+
+    return harness_vectors(_installed_fixtures(root).shadow_descriptor)
+
+
+def _workspace_reading_vectors(root: Path) -> tuple[Any, ...]:
+    """The vectors that materialize something into the workspace before their surface runs."""
+
+    selected = []
+    for vector in _harness_vectors(root):
+        state = json.loads(vector.input_json)["state"]
+        if any(state.get(key) for key in _MATERIALIZING_STATE_KEYS):
+            selected.append(vector)
+    return tuple(selected)
+
+
+def _reachable_surface_ids() -> tuple[str, ...]:
+    """The surfaces whose production path can be entered on this host."""
+
+    if shadow_fixture_supported():
+        return harness.IMPLEMENTED_SURFACE_IDS
+    return tuple(
+        surface_id
+        for surface_id in harness.IMPLEMENTED_SURFACE_IDS
+        if surface_id not in SHADOW_SURFACE_IDS
+    )
+
+
+def _vector_for(surface_id: str, root: Path) -> Any:
+    return next(
+        item for item in _harness_vectors(root) if item.surface_id.value == surface_id
+    )
+
+
 def _exercise(vector: Any, root: Path) -> dict[str, Any]:
-    return _surfaces.exercise_vector(_request_vector(vector), root)
+    installed = _installed_fixtures(root)
+    return _surfaces.exercise_vector(
+        _request_vector(vector),
+        root,
+        generation_root=installed.generation_root,
+        authorized_fixtures=installed.authorized(),
+    )
 
 
 class TestSurfaceExercises:
-    @pytest.mark.parametrize(
-        "surface_id",
-        list(harness.IMPLEMENTED_SURFACE_IDS),
-    )
+    @pytest.mark.parametrize("surface_id", _surface_params())
     def test_each_surface_runs_through_its_production_builder(
         self,
         tmp_path: Path,
         surface_id: str,
     ) -> None:
-        vector = next(
-            item for item in harness_vectors() if item.surface_id.value == surface_id
-        )
+        vector = _vector_for(surface_id, tmp_path)
 
         result = _exercise(vector, tmp_path)
 
         assert result["surface_id"] == surface_id
         assert result["builder"] == _surfaces.SURFACE_SPECS[surface_id].builder
-        assert result["state_unchanged"] is True
         assert result["schema_version"] == 1
         assert result["observation"]
 
-    @pytest.mark.parametrize(
-        "surface_id",
-        list(harness.IMPLEMENTED_SURFACE_IDS),
-    )
+    @pytest.mark.parametrize("surface_id", _surface_params())
     def test_each_surface_is_byte_identical_on_a_second_run(
         self,
         tmp_path: Path,
         surface_id: str,
     ) -> None:
-        vector = next(
-            item for item in harness_vectors() if item.surface_id.value == surface_id
-        )
+        vector = _vector_for(surface_id, tmp_path)
         first = (tmp_path / "first").resolve()
         second = (tmp_path / "second").resolve()
         first.mkdir()
@@ -695,22 +828,17 @@ class TestSurfaceExercises:
 
     def test_a_read_only_surface_leaves_the_builder_runtime_alone(self, tmp_path: Path) -> None:
         surface_id = SurfaceId.READONLY_SIGNAL_ROUTE_SPOOL_SIGNALS_AFTER_GLOBAL_SEQUENCE.value
-        vector = next(
-            item for item in harness_vectors() if item.surface_id.value == surface_id
-        )
+        vector = _vector_for(surface_id, tmp_path)
 
         result = _exercise(vector, tmp_path)
 
         assert result["declared_writer"] is False
-        assert result["state_unchanged"] is True
 
     def test_a_read_only_surface_that_writes_is_refused(self, tmp_path: Path) -> None:
         """The verdict is enforced, not reported, so this is how it has to be observed."""
 
         surface_id = SurfaceId.READONLY_SIGNAL_ROUTE_SPOOL_SIGNALS_AFTER_GLOBAL_SEQUENCE.value
-        vector = next(
-            item for item in harness_vectors() if item.surface_id.value == surface_id
-        )
+        vector = _vector_for(surface_id, tmp_path)
         real_tree_digest = _surfaces.tree_digest
         seen: list[str] = []
 
@@ -725,18 +853,18 @@ class TestSurfaceExercises:
                 _exercise(vector, tmp_path)
 
     def test_a_surface_that_rewrites_the_declaration_is_refused(self, tmp_path: Path) -> None:
-        """Reviewer mutation M4a, closed: `state_unchanged` is enforced, not reported.
+        """Reviewer mutation M4a, closed: state stability is enforced, not reported.
 
         Turning the raise into a reported `False` left every case green, because nothing
         exercised the branch. A vector's materialized declaration is the input the policy
         hashed; a surface that rewrites it has invalidated the run, so the whole run stops
-        rather than describing what happened.
+        rather than describing what happened. 裁决 4 then removed the reported field
+        entirely: the enforceable half of the claim is the root's before/after digest of the
+        generation, and this fail-fast is the child's own earlier, narrower half.
         """
 
         surface_id = SurfaceId.READONLY_SIGNAL_ROUTE_SPOOL_ROUTED_AFTER_GLOBAL_SEQUENCE.value
-        vector = next(
-            item for item in harness_vectors() if item.surface_id.value == surface_id
-        )
+        vector = _vector_for(surface_id, tmp_path)
         real_tree_digest = _surfaces.tree_digest
         seen = 0
 
@@ -753,25 +881,36 @@ class TestSurfaceExercises:
             with pytest.raises(_surfaces.SurfaceExerciseError, match="materialized declaration"):
                 _exercise(vector, tmp_path)
 
-    def test_every_result_reports_the_declaration_as_intact(self, tmp_path: Path) -> None:
-        """The field is a constant because the alternative is a rejection, never a `False`."""
+    def test_no_result_claims_its_own_state_stability(self, tmp_path: Path) -> None:
+        """裁决 4: the frozen result shape carries no `state_unchanged`, in any form.
 
-        for surface_id in harness.IMPLEMENTED_SURFACE_IDS:
-            vector = next(
-                item for item in harness_vectors() if item.surface_id.value == surface_id
-            )
+        A child that reports a constant `true` has reported nothing. The claim now lives
+        with the root, which digests the in-generation fixture set before and after this
+        child runs and compares the two values the child never sees.
+        """
+
+        frozen = {
+            "builder",
+            "declared_writer",
+            "observation",
+            "schema_version",
+            "surface_id",
+        }
+        for surface_id in _reachable_surface_ids():
+            vector = _vector_for(surface_id, tmp_path)
             root = tmp_path / f"state-{surface_id.rsplit('.', 1)[1]}"
             root.mkdir()
 
-            assert _exercise(vector, root)["state_unchanged"] is True
+            result = _exercise(vector, root)
+
+            assert set(result) == frozen
+            assert "state_unchanged" not in result
 
     def test_no_result_field_depends_on_sqlite_checkpoint_timing(self, tmp_path: Path) -> None:
         """A writer's runtime tree is not byte-stable across processes; nothing may report it."""
 
-        for surface_id in harness.IMPLEMENTED_SURFACE_IDS:
-            vector = next(
-                item for item in harness_vectors() if item.surface_id.value == surface_id
-            )
+        for surface_id in _reachable_surface_ids():
+            vector = _vector_for(surface_id, tmp_path)
             root = tmp_path / surface_id.rsplit(".", 1)[1]
             root.mkdir()
 
@@ -779,9 +918,7 @@ class TestSurfaceExercises:
 
     def test_a_writer_surface_is_declared_as_one(self, tmp_path: Path) -> None:
         surface_id = SurfaceId.CONSUME_SIGNAL_BUS_TO_PAPER.value
-        vector = next(
-            item for item in harness_vectors() if item.surface_id.value == surface_id
-        )
+        vector = _vector_for(surface_id, tmp_path)
 
         result = _exercise(vector, tmp_path)
 
@@ -790,9 +927,7 @@ class TestSurfaceExercises:
 
     def test_the_spool_reader_reports_the_published_prefix(self, tmp_path: Path) -> None:
         surface_id = SurfaceId.READONLY_SIGNAL_ROUTE_SPOOL_SIGNALS_AFTER_GLOBAL_SEQUENCE.value
-        vector = next(
-            item for item in harness_vectors() if item.surface_id.value == surface_id
-        )
+        vector = _vector_for(surface_id, tmp_path)
 
         observation = _exercise(vector, tmp_path)["observation"]
 
@@ -800,16 +935,30 @@ class TestSurfaceExercises:
         assert observation["global_sequences"] == [1]
         assert observation["source_descriptor"]["high_watermark"] == 1
 
-    @pytest.mark.parametrize("surface_id", sorted(harness.BLOCKED_SURFACE_REASONS))
-    def test_a_blocked_surface_refuses_instead_of_substituting(
+    def test_the_blocked_surface_map_is_empty_and_still_fails_closed(
         self,
         tmp_path: Path,
-        surface_id: str,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        """All thirteen are exercised, and the refusal mechanism is still wired.
+
+        `BLOCKED_SURFACE_REASONS` is empty, so there is no real surface to parametrize over.
+        The property it protects has not gone away though: a surface that reaches the frozen
+        allowlist without a working exercise must be refused, not answered with a substitute.
+        Declaring one here proves the branch still rejects.
+        """
+
+        assert harness.BLOCKED_SURFACE_REASONS == {}
+        surface_id = SurfaceId.ISOLATED_SIGNAL_OBSERVATIONS.value
         pair_id = next(
             pair
             for pair, surfaces in READER_SURFACES.items()
             if surface_id in {surface.value for surface in surfaces}
+        )
+        monkeypatch.setitem(
+            _surfaces.BLOCKED_SURFACE_REASONS,
+            surface_id,
+            "a delivery gap declared by this case, to prove the branch still refuses",
         )
         vector = harness.RequestVector(
             vector_id="0" * 64,
@@ -852,6 +1001,499 @@ class TestSurfaceExercises:
 
         with pytest.raises(_surfaces.SurfaceExerciseError, match="does not own"):
             _surfaces.exercise_vector(broken, tmp_path)
+
+
+class TestGenerationFixtureChannel:
+    """Ruling E-1, from the child's side: nothing is copied that the root did not authorize.
+
+    The root has already checked every fixture against the immutable test manifest and the
+    full generation manifest by the time the request is built, so the child's job is narrow
+    and total: copy only what the request authorizes, verify the bytes it actually read
+    against the *authorized* digest rather than against the vector's own claim, and refuse
+    the whole run otherwise. These cases are the refusals.
+    """
+
+    @staticmethod
+    def _router_vector(root: Path) -> Any:
+        return _vector_for(
+            SurfaceId.READONLY_STRATEGY_RUNNER_SIGNAL_SOURCE_READ_BATCH.value,
+            root,
+        )
+
+    @staticmethod
+    def _rebuild(vector: Any, mutate: Any) -> harness.RequestVector:
+        payload = _canonical.strict_canonical_loads(vector.input_json.encode("utf-8"))
+        mutate(payload)
+        return harness.RequestVector(
+            vector_id=vector.vector_id,
+            pair_id=vector.pair_id,
+            family_id=vector.family_id,
+            surface_id=vector.surface_id.value,
+            input_json=_canonical.canonical_json_bytes(payload).decode("utf-8"),
+        )
+
+    def test_the_router_reader_runs_over_the_copied_fixture(self, tmp_path: Path) -> None:
+        """The happy path, and the proof that the copy is what the builder actually opened."""
+
+        result = _exercise(self._router_vector(tmp_path), tmp_path)
+        workspace = next(tmp_path.glob("vector-*"))
+
+        assert result["builder"] == "rquant.runtime_builder_signal.signal_router_builder"
+        assert result["observation"]["batch"]["count"] == 1
+        copied = workspace / "state" / "runner-state-v1.sql"
+        assert stat.S_IMODE(copied.stat().st_mode) == 0o444
+        assert int(copied.stat().st_mtime) == 1_787_554_800
+        assert (workspace / "state" / "runner-state.sqlite3").is_file()
+
+    def test_a_vector_naming_an_unauthorized_fixture_is_refused(self, tmp_path: Path) -> None:
+        def mutate(payload: dict[str, Any]) -> None:
+            payload["state"]["generation_files"][0]["source_relative_path"] = (
+                f"{GENERATION_FIXTURE_PREFIX}/strategy-router/not-authorized.json"
+            )
+
+        broken = self._rebuild(self._router_vector(tmp_path), mutate)
+
+        with pytest.raises(_surfaces.SurfaceExerciseError, match="did not authorize"):
+            _surfaces.exercise_vector(
+                broken,
+                tmp_path,
+                generation_root=_generation_root(tmp_path),
+                authorized_fixtures=authorized_fixtures(),
+            )
+
+    def test_a_vector_that_restates_the_digest_wrongly_is_refused(self, tmp_path: Path) -> None:
+        """The vector may repeat the authorized digest; it may not contradict it."""
+
+        def mutate(payload: dict[str, Any]) -> None:
+            payload["state"]["generation_files"][0]["sha256"] = "0" * 64
+
+        broken = self._rebuild(self._router_vector(tmp_path), mutate)
+
+        with pytest.raises(_surfaces.SurfaceExerciseError, match="disagrees"):
+            _surfaces.exercise_vector(
+                broken,
+                tmp_path,
+                generation_root=_generation_root(tmp_path),
+                authorized_fixtures=authorized_fixtures(),
+            )
+
+    def test_generation_bytes_that_do_not_hash_to_the_authorization_are_refused(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The child re-hashes what it read, so a substituted generation file cannot pass.
+
+        The substitution needs its own generation: the shared one is what every other case
+        in this module reads, and poisoning it would make this case's failure everyone's.
+        """
+
+        generation = tmp_path / "substituted-generation"
+        generation.mkdir(mode=0o700)
+        install_generation_fixtures(generation)
+        target = generation / generation_fixture_declarations()[0].relative_path
+        target.chmod(0o644)
+        target.write_bytes(b'{"default_no_target_reason":"substituted","rules":[]}')
+        target.chmod(0o444)
+
+        with pytest.raises(_surfaces.SurfaceExerciseError, match="authorized value"):
+            _surfaces.exercise_vector(
+                _request_vector(self._router_vector(tmp_path)),
+                tmp_path,
+                generation_root=generation,
+                authorized_fixtures=authorized_fixtures(),
+            )
+
+    def test_a_run_with_no_authorized_root_cannot_answer_a_fixture_vector(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """No root-side authorization means no fixture, not a fixture read from somewhere else."""
+
+        with pytest.raises(_surfaces.SurfaceExerciseError, match="authorized generation root"):
+            _surfaces.exercise_vector(_request_vector(self._router_vector(tmp_path)), tmp_path)
+
+    @pytest.mark.parametrize(
+        ("relative", "expected"),
+        [
+            ("../escape.json", "normalized relative path"),
+            ("signal-family/./fixtures.json", "normalized relative path"),
+            ("/etc/rquant/policy.json", "normalized relative path"),
+        ],
+    )
+    def test_a_traversing_fixture_path_is_refused(
+        self,
+        tmp_path: Path,
+        relative: str,
+        expected: str,
+    ) -> None:
+        """Even an authorized-looking path must still be a normalized relative one."""
+
+        from rquant.signal_family_verifier_harness._workspace import (
+            WorkspaceError,
+            _read_generation_bytes,
+        )
+
+        with pytest.raises(WorkspaceError, match=expected):
+            _read_generation_bytes(_generation_root(tmp_path), relative)
+
+    def test_an_inlined_sqlite_script_is_refused(self, tmp_path: Path) -> None:
+        """Reviewer finding `R2E-SPEC-02`: the executed script must be generation content.
+
+        Before this was enforced, `script_path` resolved anywhere under `@workspace/`,
+        including bytes the same vector had just written through `state.files`. Ruling E-2's
+        claim — that the authoritative dump is the one the generation carries and the root
+        hashes — was then a convention, not a rule.
+        """
+
+        def mutate(payload: dict[str, Any]) -> None:
+            payload["state"]["generation_files"] = [
+                entry
+                for entry in payload["state"]["generation_files"]
+                if entry["path"].endswith(".json")
+            ]
+            payload["state"]["files"] = [
+                {"content": "CREATE TABLE t(a);", "path": "@workspace/runner-state-v1.sql"}
+            ]
+
+        broken = self._rebuild(self._router_vector(tmp_path), mutate)
+
+        with pytest.raises(
+            _surfaces.SurfaceExerciseError,
+            match="not an authorized generation fixture",
+        ):
+            _surfaces.exercise_vector(
+                broken,
+                tmp_path,
+                generation_root=_generation_root(tmp_path),
+                authorized_fixtures=authorized_fixtures(),
+            )
+
+    def test_a_sqlite_source_that_is_not_replayable_is_refused(self, tmp_path: Path) -> None:
+        """Ruling E-2: the dump is authoritative, so a dump that will not replay is fatal.
+
+        The script here *is* an authorized generation fixture — it is the frozen routing
+        policy, which is JSON — so it passes the source check and fails on its content.
+        """
+
+        def mutate(payload: dict[str, Any]) -> None:
+            payload["state"]["sqlite_sources"][0]["script_path"] = "@workspace/routing-policy.json"
+
+        broken = self._rebuild(self._router_vector(tmp_path), mutate)
+
+        with pytest.raises(_surfaces.SurfaceExerciseError, match="not replayable"):
+            _surfaces.exercise_vector(
+                broken,
+                tmp_path,
+                generation_root=_generation_root(tmp_path),
+                authorized_fixtures=authorized_fixtures(),
+            )
+
+    @pytest.mark.parametrize(
+        ("script", "escaped_name"),
+        [
+            ("ATTACH DATABASE '{escaped}' AS other;", "attached.db"),
+            ("CREATE TABLE t(a);\nVACUUM INTO '{escaped}';", "vacuumed.db"),
+            ("DETACH DATABASE main;", None),
+        ],
+        ids=["attach", "vacuum-into", "detach"],
+    )
+    def test_a_replayed_script_cannot_reach_outside_its_workspace(
+        self,
+        tmp_path: Path,
+        script: str,
+        escaped_name: str | None,
+    ) -> None:
+        """Reviewer finding `R2E-SPEC-02`: `executescript` is not a closed operation.
+
+        `ATTACH DATABASE` and `VACUUM INTO` both name a path of the script's choosing, so a
+        replay is only contained if the statement kinds are. The authorizer permits exactly
+        the actions a canonical dump of the producer schema performs and denies the rest.
+
+        The attach alias is `other` on purpose. Reviewer finding `R2E-SPEC-08`: the first
+        version of this case used `AS escape`, and `ESCAPE` is a SQLite keyword — the
+        statement failed to parse, so the case passed whether or not the authorizer was
+        installed and proved nothing about `ATTACH`. With a non-reserved alias the statement
+        parses, reaches the authorizer, and removing the authorizer turns this case red.
+        """
+
+        from rquant.signal_family_verifier_harness._workspace import replay_sql_script
+
+        target = tmp_path / "replayed.sqlite3"
+        escaped = tmp_path / (escaped_name or "unreferenced.db")
+        payload = script.format(escaped=escaped)
+
+        with pytest.raises(_surfaces.WorkspaceError, match="not replayable"):
+            replay_sql_script(target, payload)
+
+        assert not escaped.exists()
+
+    def test_the_authorizer_still_admits_the_real_producer_dump(self, tmp_path: Path) -> None:
+        """The closed action set is derived from this dump, so it has to keep replaying it."""
+
+        from rquant.signal_family_verifier_harness._workspace import replay_sql_script
+
+        script = (
+            PRODUCER_FIXTURE_ROOT / "strategy-router" / "runner-state-v1.sql"
+        ).read_text(encoding="utf-8")
+        target = tmp_path / "replayed.sqlite3"
+
+        replay_sql_script(target, script)
+
+        import sqlite3
+
+        connection = sqlite3.connect(target)
+        try:
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+        finally:
+            connection.close()
+        assert {"runner_metadata", "runner_source_identity", "runner_signal"} <= tables
+
+    # -- reviewer finding R2E-SPEC-01: the `@generation/` boundary ---------------------
+
+    @staticmethod
+    def _workspace_over(root: Path) -> Any:
+        installed = _installed_fixtures(root)
+        return _surfaces.VectorWorkspace(
+            root,
+            "f" * 64,
+            generation_root=installed.generation_root,
+            authorized_fixtures=installed.authorized(),
+        )
+
+    def test_the_authorized_directory_set_stops_at_the_fixture_root(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The closure is the fixture set's own directories, never an ancestor of them."""
+
+        workspace = self._workspace_over(tmp_path)
+        entries = tuple(workspace.authorized_fixtures)
+
+        directories = workspace.authorized_generation_directories()
+
+        assert f"{GENERATION_FIXTURE_PREFIX}/strategy-router" in directories
+        assert "signal-family" not in directories
+        assert "" not in directories
+        # Every authorized directory is a `dirname` of some fixture, and every fixture's own
+        # directory is authorized. The closure is exactly the fixture set's, nothing wider.
+        chains = {
+            "/".join(entry.split("/")[:depth])
+            for entry in entries
+            for depth in range(1, len(entry.split("/")))
+        }
+        assert directories <= chains
+        assert {entry.rsplit("/", 1)[0] for entry in entries} <= directories
+        assert all(
+            candidate.startswith(GENERATION_FIXTURE_PREFIX) for candidate in directories
+        )
+
+    @pytest.mark.parametrize(
+        ("declared", "expected"),
+        [
+            ("@generation/signal-family", "did not authorize"),
+            ("@generation/signal-family/test-manifest-v1.json", "did not authorize"),
+            ("@generation/src/rquant/strategy_runner.py", "did not authorize"),
+            ("@generation/../etc/rquant", "dot components"),
+            ("@generation//etc", "inside the generation"),
+        ],
+        ids=["ancestor-directory", "non-entry-sibling", "unrelated-tree", "parent", "absolute"],
+    )
+    def test_a_generation_path_outside_the_fixture_set_is_refused(
+        self,
+        tmp_path: Path,
+        declared: str,
+        expected: str,
+    ) -> None:
+        """Reviewer finding `R2E-SPEC-01` and mutation M2, closed.
+
+        `@generation/signal-family` is the one that matters: that directory also holds the
+        immutable test manifest and the successor and overlay bundles, none of which are
+        `generation_files` entries, so none of them is byte-checked by the root or covered by
+        its before/after digest. Deleting the boundary used to leave every case green.
+        """
+
+        workspace = self._workspace_over(tmp_path)
+
+        with pytest.raises(_surfaces.WorkspaceError, match=expected):
+            workspace.generation_path(declared)
+
+    def test_a_generation_directory_inside_the_fixture_set_is_accepted(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The shadow readers need directories, not files, so the rule cannot be file-only."""
+
+        workspace = self._workspace_over(tmp_path)
+        declared = f"@generation/{GENERATION_FIXTURE_PREFIX}/strategy-router"
+
+        resolved = workspace.generation_path(declared)
+
+        assert resolved == workspace.generation_root / GENERATION_FIXTURE_PREFIX / (
+            "strategy-router"
+        )
+        assert resolved.is_dir()
+
+    def test_a_generation_path_through_a_symbolic_link_is_refused(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Reading in place only means anything if the walk cannot be redirected.
+
+        The link is planted inside a throwaway generation so the shared one, which every
+        other case in this module reads, is left exactly as the root digested it.
+        """
+
+        generation = tmp_path / "linked-generation"
+        generation.mkdir(mode=0o700)
+        installed = install_generation_fixtures(generation)
+        directory = generation / GENERATION_FIXTURE_PREFIX / "strategy-router"
+        target = directory / "runner-state-v1.sql"
+        linked = directory / "linked-state.sql"
+        linked.symlink_to(target)
+        authorized = dict(installed.authorized())
+        relative = f"{GENERATION_FIXTURE_PREFIX}/strategy-router/linked-state.sql"
+        authorized[relative] = authorized[
+            f"{GENERATION_FIXTURE_PREFIX}/strategy-router/runner-state-v1.sql"
+        ]
+        workspace = _surfaces.VectorWorkspace(
+            tmp_path / "linked-workspace",
+            "e" * 64,
+            generation_root=generation,
+            authorized_fixtures=authorized,
+        )
+
+        with pytest.raises(_surfaces.WorkspaceError, match="symbolic link"):
+            workspace.generation_path(f"@generation/{relative}")
+
+
+class TestProducerFixtureBuild:
+    """The fixture set is producer output, checked in, and byte-reproducible."""
+
+    @staticmethod
+    def _build_script() -> Any:
+        import importlib.util
+
+        script = REPOSITORY_ROOT / "scripts" / "build-signal-family-producer-fixtures.py"
+        spec = importlib.util.spec_from_file_location("_wpe_fixture_builder", script)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_two_builds_produce_the_same_bytes(self, tmp_path: Path) -> None:
+        module = self._build_script()
+        first = tmp_path / "first"
+        second = tmp_path / "second"
+
+        module.build_fixtures(first)
+        module.build_fixtures(second)
+
+        produced = sorted(path.relative_to(first) for path in first.rglob("*") if path.is_file())
+        assert produced
+        for relative in produced:
+            assert (first / relative).read_bytes() == (second / relative).read_bytes()
+
+    def test_the_checked_in_fixtures_are_what_the_script_produces(self, tmp_path: Path) -> None:
+        """A hand-edited fixture would be producer state nothing produced."""
+
+        module = self._build_script()
+        rebuilt = tmp_path / "rebuilt"
+
+        module.build_fixtures(rebuilt)
+
+        for declared in generation_fixture_declarations():
+            name = declared.relative_path.rsplit("/", 2)[-2:]
+            assert hashlib.sha256(
+                (rebuilt / name[0] / name[1]).read_bytes()
+            ).hexdigest() == declared.sha256
+
+    def test_the_seeded_identity_ddl_matches_the_production_initializer(self) -> None:
+        """Seeding the identity row means creating the table production would have created."""
+
+        import inspect
+
+        from rquant.strategy_runner import StrategyRunnerStore
+
+        module = self._build_script()
+        source = inspect.getsource(StrategyRunnerStore._initialize)
+        normalized = " ".join(module.RUNNER_SOURCE_IDENTITY_DDL.split())
+
+        assert normalized in " ".join(source.split())
+
+    def test_the_fixture_carries_no_private_key_material(self) -> None:
+        """No fixture in this set is signed, so none of it may carry a key at all."""
+
+        for declared in generation_fixture_declarations():
+            payload = (
+                PRODUCER_FIXTURE_ROOT
+                / declared.relative_path[len(GENERATION_FIXTURE_PREFIX) + 1 :]
+            ).read_bytes()
+            assert b"PRIVATE KEY" not in payload
+            assert b"BEGIN PGP" not in payload
+            assert b"ssh-ed25519" not in payload
+
+
+class TestRecomputeExpectations:
+    """Ruling E-7: one command, and running it twice changes nothing."""
+
+    @staticmethod
+    def _module() -> Any:
+        import importlib.util
+
+        script = REPOSITORY_ROOT / "scripts" / "signal_family_recompute_expectations.py"
+        spec = importlib.util.spec_from_file_location("_wpe_recompute", script)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        # `dataclasses` resolves its owner through `sys.modules`, so the module has to be
+        # registered before it executes or the first decorated class raises.
+        sys.modules["_wpe_recompute"] = module
+        spec.loader.exec_module(module)
+        return module
+
+    def test_the_policy_recomputation_is_idempotent(self) -> None:
+        module = self._module()
+
+        first = module.recompute_policy(write=False)
+        second = module.recompute_policy(write=False)
+
+        assert first == second
+        assert POLICY_DIGEST_PATTERN.search(first.detail) is not None
+
+    @pytest.mark.parametrize(
+        ("path", "category"),
+        [
+            ("src/rquant/signal_family_verification.py", "production"),
+            ("tests/fixtures/signal_family_producer/x.sql", "fixture"),
+            ("tests/manifests/full-suite-v1/index.json", "fixture"),
+            ("tests/unit/test_signal_family_verifier_harness.py", "test"),
+            ("tests/support/signal_family_harness_vectors.py", "test"),
+            ("deploy/systemd/rquant-runtime-router.service", "architecture"),
+            ("scripts/signal_family_recompute_expectations.py", "architecture"),
+            ("docs/architecture/production-interpreter-authority.md", "architecture"),
+        ],
+    )
+    def test_the_category_rule_reproduces_the_frozen_assignments(
+        self,
+        path: str,
+        category: str,
+    ) -> None:
+        """Ruling B-3 fixed `deploy/` at architecture; the rest follows the existing policy."""
+
+        assert self._module()._category(path) == category
+
+    def test_the_recomputation_never_writes_without_being_asked(self) -> None:
+        module = self._module()
+        before = module.POLICY_PATH.read_bytes()
+
+        module.recompute_policy(write=False)
+        module.recompute_producer_fixtures(write=False)
+
+        assert module.POLICY_PATH.read_bytes() == before
 
 
 class TestServingLoaderProvenance:
@@ -981,13 +1623,21 @@ class TestWorkspaceAccessClass:
     outcome per bit pattern is the production outcome.
 
     This is the case fix round 1 was missing. `0711` satisfied every bit-level assertion made
-    at the time and still failed all eight surfaces, because both ancestry walks open every
+    at the time and still failed every surface, because both ancestry walks open every
     component with `O_RDONLY | O_DIRECTORY` and read-only on a directory needs the read bit.
     """
 
     @staticmethod
     def _exercise_all(gate: Path, visitor_bits: int) -> tuple[int, int]:
-        """Run all eight surfaces beneath a gate carrying `visitor_bits`; return (ok, failed)."""
+        """Run every workspace-reading surface beneath a gate; return (ok, failed).
+
+        The experiment measures what the *workspace* access class does to a surface, so it
+        only covers surfaces that read the workspace. The three `strategy-shadow` readers
+        read an in-generation export in place and materialize nothing, so the gate has
+        nothing to deny them and including them would measure nothing. Membership is derived
+        from each vector's declared state rather than named, so a future vector that starts
+        materializing state is covered automatically.
+        """
 
         gate.mkdir(mode=0o700, parents=True, exist_ok=True)
         workspace = gate / "workspace"
@@ -996,7 +1646,7 @@ class TestWorkspaceAccessClass:
         succeeded = 0
         failed = 0
         try:
-            for index, vector in enumerate(harness_vectors()):
+            for index, vector in enumerate(_workspace_reading_vectors(gate)):
                 root = workspace / f"run-{index:02d}"
                 try:
                     root.mkdir(mode=0o700)
@@ -1015,7 +1665,7 @@ class TestWorkspaceAccessClass:
         succeeded, failed = self._exercise_all(tmp_path / "gate-x", 0o100)
 
         assert succeeded == 0
-        assert failed == len(harness.IMPLEMENTED_SURFACE_IDS) == 8
+        assert failed == len(_workspace_reading_vectors(tmp_path / "gate-x"))
 
     def test_read_and_execute_passes_every_surface(self, tmp_path: Path) -> None:
         """`r-x` for the visitor, i.e. the `0715` this round ships."""
@@ -1023,7 +1673,7 @@ class TestWorkspaceAccessClass:
         succeeded, failed = self._exercise_all(tmp_path / "gate-rx", 0o500)
 
         assert failed == 0
-        assert succeeded == len(harness.IMPLEMENTED_SURFACE_IDS) == 8
+        assert succeeded == len(_workspace_reading_vectors(tmp_path / "gate-rx"))
 
     def test_the_frozen_mode_carries_the_bits_the_experiment_selected(self) -> None:
         from rquant.signal_family_root_verifier import CHILD_WORKSPACE_MODE
@@ -1038,9 +1688,17 @@ class TestWorkspaceAccessClass:
 
 class TestChildEntryPoint:
     def test_run_child_answers_every_vector_exactly_once(self, tmp_path: Path) -> None:
-        vectors = harness_vectors()
+        installed = _installed_fixtures(tmp_path)
+        vectors = _harness_vectors(tmp_path)
+        request = _request_payload(
+            vectors,
+            generation_root=str(installed.generation_root),
+            generation_files=tuple(
+                declared.model_dump(mode="json") for declared in installed.declarations
+            ),
+        )
 
-        payload = harness_main.run_child(_request_payload(vectors), workspace_root=tmp_path)
+        payload = harness_main.run_child(request, workspace_root=tmp_path)
         decoded = _canonical.strict_canonical_loads(payload)
 
         assert len(decoded["vector_results"]) == len(vectors)
@@ -1051,8 +1709,18 @@ class TestChildEntryPoint:
     def test_the_response_satisfies_the_frozen_child_result_model(self, tmp_path: Path) -> None:
         from rquant.signal_family_verification import SignalFamilyChildResultV1
 
-        vectors = harness_vectors()
-        payload = harness_main.run_child(_request_payload(vectors), workspace_root=tmp_path)
+        installed = _installed_fixtures(tmp_path)
+        vectors = _harness_vectors(tmp_path)
+        payload = harness_main.run_child(
+            _request_payload(
+                vectors,
+                generation_root=str(installed.generation_root),
+                generation_files=tuple(
+                    declared.model_dump(mode="json") for declared in installed.declarations
+                ),
+            ),
+            workspace_root=tmp_path,
+        )
 
         result = SignalFamilyChildResultV1.from_canonical_ipc_bytes(
             payload,
