@@ -843,6 +843,105 @@ def test_diff_scope_forbidden_definition_scan_covers_every_diffed_source_file(
     assert "current_signal_writer" in result.reasons[0]
 
 
+def _diff_scope_scan(tmp_path: Path, name: str, source: str) -> object:
+    """Run the diff-scope forbidden-definition scan over one synthetic candidate module."""
+
+    repo = tmp_path / name
+    subprocess.run(["git", "init", "--quiet", str(repo)], check=True)
+    module_path = "src/rquant/runtime_builder_signal.py"
+    source_path = repo / module_path
+    source_path.parent.mkdir(parents=True)
+    source_path.write_text(source, encoding="utf-8")
+    candidate = _commit(repo, "candidate")
+    policy = load_policy(POLICY_PATH)
+    narrowed = policy.model_copy(
+        update={
+            "allowed_diff": (
+                policy.allowed_diff[0].model_copy(
+                    update={"path": module_path, "category": "production"}
+                ),
+            )
+        }
+    )
+    return verify_diff_scope_forbidden_definitions(repo, candidate, narrowed)
+
+
+@pytest.mark.parametrize(
+    ("name", "source", "expected"),
+    (
+        pytest.param(
+            "nested-def",
+            "class Builder:\n    def publish_v3(self) -> None:\n        return None\n",
+            "publish_v3",
+            id="nested-method-definition",
+        ),
+        pytest.param(
+            "nested-class",
+            "def factory() -> None:\n    class CurrentSignalRouteSpoolWriter:\n        pass\n",
+            "CurrentSignalRouteSpoolWriter",
+            id="nested-class-definition",
+        ),
+        pytest.param(
+            "renamed-import",
+            "from rquant.signal_route_spool import publish_v3 as safe_publish\n",
+            "publish_v3",
+            id="import-renamed-away",
+        ),
+        pytest.param(
+            "alias-assignment",
+            "from rquant import signal_route_spool\n\nsafe = signal_route_spool.publish_v3\n",
+            "publish_v3",
+            id="attribute-alias-assignment",
+        ),
+        pytest.param(
+            "alias-name-assignment",
+            "def _load():\n    return None\n\n\npublish_v3 = _load\nsafe = publish_v3\n",
+            "publish_v3",
+            id="name-alias-assignment",
+        ),
+        pytest.param(
+            "annotated-exports",
+            '__all__: list[str] = ["publish_v3"]\n',
+            "publish_v3",
+            id="annotated-all-export",
+        ),
+        pytest.param(
+            "augmented-exports",
+            '__all__ = ["ok"]\n__all__ += ["publish_v3"]\n',
+            "publish_v3",
+            id="augmented-all-reexport",
+        ),
+    ),
+)
+def test_diff_scope_scan_blocks_nested_alias_and_reexport_bindings(
+    tmp_path: Path,
+    name: str,
+    source: str,
+    expected: str,
+) -> None:
+    result = _diff_scope_scan(tmp_path, name, source)
+
+    assert not result.passed
+    assert expected in result.reasons[0]
+
+
+def test_diff_scope_scan_still_ignores_mentions_that_bind_nothing(tmp_path: Path) -> None:
+    """The declared semantic boundary: mentioning a forbidden name is not a definition."""
+
+    source = (
+        '"""This module must never define publish_v3 or v3_writer."""\n'
+        "\n"
+        "# r07_overlay and CurrentSignalRouteSpoolWriter are forbidden here.\n"
+        'NOTE = "r07_activation is a forbidden registry key"\n'
+        'FORBIDDEN_NAMES = ("publish_v3", "v3_writer")\n'
+    )
+
+    result = _diff_scope_scan(tmp_path, "mentions-only", source)
+
+    assert result.passed
+    assert result.reasons == ()
+
+
 def test_static_gate_counts_the_diff_scope_check_in_the_frozen_inventory() -> None:
     policy = load_policy(POLICY_PATH)
 
