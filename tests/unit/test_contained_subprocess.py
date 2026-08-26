@@ -668,6 +668,7 @@ def test_darwin_register_root_rejects_non_pristine_tracker_without_side_effects(
     assert not tracker._stop.is_set()
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin kqueue registration contract")
 def test_darwin_register_root_serializes_concurrent_callers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -762,6 +763,7 @@ def test_darwin_register_root_serializes_concurrent_callers(
 
 
 @pytest.mark.parametrize("failure_boundary", ("constructor", "start"))
+@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin kqueue registration contract")
 def test_darwin_register_root_discards_tainted_preinitialized_queue_for_retry(
     monkeypatch: pytest.MonkeyPatch,
     failure_boundary: str,
@@ -834,6 +836,7 @@ def test_darwin_register_root_discards_tainted_preinitialized_queue_for_retry(
     _assert_darwin_tracker_pristine(tracker)
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin kqueue registration contract")
 def test_darwin_register_root_retains_live_failed_start_and_first_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1014,6 +1017,7 @@ def test_darwin_close_retains_owner_until_thread_stop_is_verified(
     _assert_darwin_tracker_pristine(tracker)
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin kqueue registration contract")
 def test_darwin_failed_preinitialized_queue_close_blocks_registration_until_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1090,6 +1094,7 @@ def test_darwin_failed_preinitialized_queue_close_blocks_registration_until_retr
     _assert_darwin_tracker_pristine(tracker)
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin kqueue registration contract")
 def test_darwin_registration_reentrant_close_fails_and_rolls_back(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1192,6 +1197,7 @@ def test_darwin_poll_rejects_hooks_at_every_state_handoff(
         ("thread-start", (3, 1, 1, 1, 1)),
     ),
 )
+@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin kqueue registration contract")
 def test_darwin_registration_rechecks_deadline_after_every_handoff(
     monkeypatch: pytest.MonkeyPatch,
     boundary: str,
