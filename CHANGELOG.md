@@ -103,6 +103,9 @@
 - **Source Broker 拒绝理由丢失**：客户端写请求撞 EPIPE 时先读取对端已排队的 failure 帧，
   被拒绝的 peer 现在能拿到服务端明写的原因，而不是通用 transport 失败。
 
+- **盯盘行情 worker 收尸**：最后一次进程组 SIGKILL 之后补一次等待再判定。原来这一级发完
+  信号就直接读 `exitcode`，只会被组信号杀死的 worker 必然被误报成「could not be reaped」。
+
 - **午间空量比**：保留空量比结果的固定 schema，午间链路在空数据场景不再丢失该字段。
 
 ### Fixed
