@@ -44,6 +44,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
@@ -93,6 +94,16 @@ def _load_script(name: str) -> ModuleType:
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def _remove_sealed_tree(root: Path) -> None:
+    """Remove a scratch tree that may contain a sealed 0555 shadow export session."""
+
+    for path in sorted(root.rglob("*"), reverse=True):
+        if path.is_dir():
+            with suppress(OSError):  # pragma: no cover - best effort before rmtree
+                path.chmod(0o700)
+    shutil.rmtree(root, ignore_errors=True)
 
 
 def _private_scratch(prefix: str) -> Path:
@@ -151,7 +162,13 @@ def recompute_producer_fixtures(*, write: bool) -> Outcome:
 
 
 def recompute_expectation_set() -> Outcome:
-    """Derive the two policy-bound hashes twice and require the derivation to be stable."""
+    """Derive the two policy-bound hashes twice and require the derivation to be stable.
+
+    The vector set is host-scoped, and deliberately so: the three `strategy-shadow` readers
+    are reachable only where their production reader path is, so this reports ten vectors off
+    Linux and thirteen on it. What it enforces is the same either way — the derivation must
+    reproduce, or the policy it feeds cannot be trusted.
+    """
 
     sys.path.insert(0, str(REPOSITORY_ROOT))
     sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
@@ -163,16 +180,21 @@ def recompute_expectation_set() -> Outcome:
     from tests.support.signal_family_harness_vectors import (
         expected_results_for,
         harness_vectors,
+        install_generation_fixtures,
     )
 
-    vectors = harness_vectors()
     derived: list[tuple[str, str]] = []
+    vectors = ()
     for attempt in range(2):
         scratch = _private_scratch(f"rquant-recompute-expected-{attempt}-")
         try:
-            results = expected_results_for(vectors, scratch)
+            generation = scratch / "generation"
+            generation.mkdir(mode=0o700)
+            installed = install_generation_fixtures(generation)
+            vectors = harness_vectors(installed.shadow_descriptor)
+            results = expected_results_for(vectors, scratch, installed=installed)
         finally:
-            shutil.rmtree(scratch, ignore_errors=True)
+            _remove_sealed_tree(scratch)
         expected = tuple(
             SignalFamilyExpectedResultV1(
                 vector_id=vector.vector_id,
@@ -193,7 +215,7 @@ def recompute_expectation_set() -> Outcome:
         "phase C expectation set",
         False,
         (
-            f"{len(vectors)} vectors; vector_set_hash={vectors_hash}; "
+            f"{len(vectors)} vectors on {sys.platform}; vector_set_hash={vectors_hash}; "
             f"expected_result_set_hash={results_hash}"
         ),
     )
