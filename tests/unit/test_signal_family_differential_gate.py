@@ -89,11 +89,36 @@ def _run(
     return run.model_copy(update={"result_digest": python_run_result_digest(run)})
 
 
-def _synthetic_merge_candidate(repo: Path = ROOT) -> str:
+def _shared_clone(destination: Path) -> Path:
+    """Clone the repository under test so no test ever writes into its object store.
+
+    ``--shared`` points the clone at the original object database through an alternate, so
+    the clone costs milliseconds and still resolves every existing object, while anything a
+    test writes lands only in the throwaway clone.
+    """
+
+    subprocess.run(
+        [
+            "git",
+            "clone",
+            "--quiet",
+            "--shared",
+            "--no-checkout",
+            str(ROOT),
+            str(destination),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return destination
+
+
+def _synthetic_merge_candidate(repo: Path) -> str:
     """Write the exact object GitHub's "Create a merge commit" would create for this branch.
 
     The commit is dangling: no ref moves, no working tree changes, and its fixed identity
-    keeps the object content-addressed and stable across runs.
+    keeps the object content-addressed and stable across runs. It is written into a
+    throwaway clone, never into the repository under test.
     """
 
     head = _head(repo)
@@ -136,6 +161,7 @@ def _synthetic_merge_candidate(repo: Path = ROOT) -> str:
 @dataclass(frozen=True)
 class _EvidenceBundle:
     evidence: VerifiedR07DrGateEvidenceV1
+    repo: Path
     policy: R07PolicyV1
     candidate_gate: CandidateGateResult
     static_result: R07StaticGateResult
@@ -146,22 +172,23 @@ class _EvidenceBundle:
 @pytest.fixture(scope="module")
 def evidence_bundle(tmp_path_factory: pytest.TempPathFactory) -> _EvidenceBundle:
     policy = load_policy(POLICY_PATH)
-    candidate = _synthetic_merge_candidate()
+    repo = _shared_clone(tmp_path_factory.mktemp("r07-candidate-repo") / "clone")
+    candidate = _synthetic_merge_candidate(repo)
     candidate_tree = subprocess.run(
-        ["git", "-C", str(ROOT), "rev-parse", f"{candidate}^{{tree}}"],
+        ["git", "-C", str(repo), "rev-parse", f"{candidate}^{{tree}}"],
         check=True,
         capture_output=True,
         text=True,
     ).stdout.strip()
     candidate_gate = differential_gate.verify_candidate_gate(
-        ROOT,
+        repo,
         policy=policy,
         candidate_commit=candidate,
         candidate_tree=candidate_tree,
     )
     assert candidate_gate.passed
     static_result = verify_r07_static_gate(
-        ROOT,
+        repo,
         policy=policy,
         candidate_commit=candidate,
         candidate_tree=candidate_tree,
@@ -203,7 +230,7 @@ def evidence_bundle(tmp_path_factory: pytest.TempPathFactory) -> _EvidenceBundle
         ),
     )
     evidence = VerifiedR07DrGateEvidenceV1.from_gate_results(
-        repo=ROOT,
+        repo=repo,
         policy=policy,
         candidate_gate=candidate_gate,
         boundary_results=boundary_results,
@@ -214,6 +241,7 @@ def evidence_bundle(tmp_path_factory: pytest.TempPathFactory) -> _EvidenceBundle
     )
     return _EvidenceBundle(
         evidence=evidence,
+        repo=repo,
         policy=policy,
         candidate_gate=candidate_gate,
         static_result=static_result,
@@ -242,7 +270,7 @@ def test_evidence_uses_exact_fields_and_canonical_self_digest(
     forged_gate = replace(evidence_bundle.candidate_gate, candidate_tree_sha="0" * 40)
     with pytest.raises(ValueError, match="candidate tree"):
         VerifiedR07DrGateEvidenceV1.from_gate_results(
-            repo=ROOT,
+            repo=evidence_bundle.repo,
             policy=evidence_bundle.policy,
             candidate_gate=forged_gate,
             boundary_results=evidence_bundle.boundary_results,
@@ -254,7 +282,7 @@ def test_evidence_uses_exact_fields_and_canonical_self_digest(
     forged_diff = replace(evidence_bundle.candidate_gate, diff_digest="0" * 64)
     with pytest.raises(ValueError, match="wire|recomputed"):
         VerifiedR07DrGateEvidenceV1.from_gate_results(
-            repo=ROOT,
+            repo=evidence_bundle.repo,
             policy=evidence_bundle.policy,
             candidate_gate=forged_diff,
             boundary_results=evidence_bundle.boundary_results,
@@ -266,7 +294,7 @@ def test_evidence_uses_exact_fields_and_canonical_self_digest(
     forged_static = replace(evidence_bundle.static_result, candidate_tree_sha="0" * 40)
     with pytest.raises(ValueError, match="wire|static"):
         VerifiedR07DrGateEvidenceV1.from_gate_results(
-            repo=ROOT,
+            repo=evidence_bundle.repo,
             policy=evidence_bundle.policy,
             candidate_gate=evidence_bundle.candidate_gate,
             boundary_results=evidence_bundle.boundary_results,
@@ -315,11 +343,11 @@ def test_private_verifier_rejects_self_consistent_fake_and_wrong_binding_wires(
     )
     fake_wire = R07DrGateEvidenceWireV1.model_validate(fake_values)
     with pytest.raises(ValueError, match="Git binding"):
-        verify_wire(ROOT, evidence_bundle.policy, fake_wire)
+        verify_wire(evidence_bundle.repo, evidence_bundle.policy, fake_wire)
 
     wrong_binding = wire.model_copy(update={"candidate_binding_digest": "0" * 64})
     with pytest.raises(ValueError):
-        verify_wire(ROOT, evidence_bundle.policy, wrong_binding)
+        verify_wire(evidence_bundle.repo, evidence_bundle.policy, wrong_binding)
 
 
 def test_private_verifier_requires_policy_derived_python_run_counts(
@@ -344,7 +372,7 @@ def test_private_verifier_requires_policy_derived_python_run_counts(
     forged_wire = R07DrGateEvidenceWireV1.model_validate(values)
 
     with pytest.raises(ValueError, match="check count"):
-        verify_wire(ROOT, evidence_bundle.policy, forged_wire)
+        verify_wire(evidence_bundle.repo, evidence_bundle.policy, forged_wire)
 
 
 def test_verified_evidence_binds_the_final_merge_tree_and_its_exact_parents(
@@ -358,12 +386,44 @@ def test_verified_evidence_binds_the_final_merge_tree_and_its_exact_parents(
     assert wire.merge_tree_sha == wire.candidate_tree_sha
     assert (
         subprocess.run(
-            ["git", "-C", str(ROOT), "merge-tree", "--write-tree", BASELINE_COMMIT_SHA, _head()],
+            [
+                "git",
+                "-C",
+                str(evidence_bundle.repo),
+                "merge-tree",
+                "--write-tree",
+                BASELINE_COMMIT_SHA,
+                _head(),
+            ],
             check=True,
             capture_output=True,
             text=True,
         ).stdout.strip()
         == wire.merge_tree_sha
+    )
+    # R2B-SPEC-09: the candidate object lives only in the throwaway clone.
+    assert (
+        subprocess.run(
+            ["git", "-C", str(ROOT), "cat-file", "-e", f"{wire.candidate_commit_sha}^{{commit}}"],
+            check=False,
+            capture_output=True,
+        ).returncode
+        != 0
+    )
+    assert (
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(evidence_bundle.repo),
+                "cat-file",
+                "-e",
+                f"{wire.candidate_commit_sha}^{{commit}}",
+            ],
+            check=False,
+            capture_output=True,
+        ).returncode
+        == 0
     )
 
 
@@ -382,6 +442,61 @@ def test_private_verifier_refuses_a_candidate_that_is_not_a_merge_commit() -> No
             ROOT,
             candidate_commit=_head(),
             merge_base_commit=BASELINE_COMMIT_SHA,
+        )
+
+
+def test_candidate_gate_requires_the_merge_base_to_be_a_candidate_ancestor(
+    tmp_path: Path,
+) -> None:
+    """The merge-base ancestry check is load bearing on its own, not only through provenance."""
+
+    repo = _shared_clone(tmp_path / "unrelated")
+    unrelated = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "commit-tree",
+            BASELINE_TREE_SHA,
+            "-m",
+            "a commit that never descended from the frozen merge base",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "GIT_AUTHOR_NAME": "r07-unrelated",
+            "GIT_AUTHOR_EMAIL": "r07@example.invalid",
+            "GIT_COMMITTER_NAME": "r07-unrelated",
+            "GIT_COMMITTER_EMAIL": "r07@example.invalid",
+            "GIT_AUTHOR_DATE": "2026-01-01T00:00:00+00:00",
+            "GIT_COMMITTER_DATE": "2026-01-01T00:00:00+00:00",
+        },
+    ).stdout.strip()
+    assert (
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "merge-base",
+                "--is-ancestor",
+                BASELINE_COMMIT_SHA,
+                unrelated,
+            ],
+            check=False,
+            capture_output=True,
+        ).returncode
+        != 0
+    )
+
+    with pytest.raises(ValueError, match="does not descend from the policy baseline merge base"):
+        differential_gate.verify_candidate_gate(
+            repo,
+            policy=load_policy(POLICY_PATH),
+            candidate_commit=unrelated,
+            candidate_tree=BASELINE_TREE_SHA,
         )
 
 
@@ -404,7 +519,7 @@ def test_wire_rejects_divergent_dual_python_gate_digests(
 
     forged = R07DrGateEvidenceWireV1.model_construct(**values)
     with pytest.raises(ValueError, match="strict validation"):
-        verify_wire(ROOT, evidence_bundle.policy, forged)
+        verify_wire(evidence_bundle.repo, evidence_bundle.policy, forged)
 
 
 @pytest.mark.parametrize(
