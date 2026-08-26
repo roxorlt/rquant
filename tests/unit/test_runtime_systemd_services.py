@@ -37,10 +37,48 @@ TEMPLATES = (
 RUNTIME_ROOT = "/home/lighthouse/rquant/data/runtime"
 CURRENT_ROOT = f"{RUNTIME_ROOT}/current"
 CONTROL_ROOT = f"{RUNTIME_ROOT}/control"
-ENVIRONMENT_FILE = f"{CURRENT_ROOT}/runtime.env"
 CREDENTIAL_FILE = "/etc/credstore.encrypted/rquant-runtime/instances/%i/current.cred"
-EXPECTED_EXECUTABLE = "/home/lighthouse/rquant/.venv/bin/python"
-EXPECTED_MODULE = "rquant.runtime_service_main"
+#: Codex round-2 P1-3: every protected runtime unit now executes the fixed root-owned
+#: wrapper instead of a checkout interpreter, and takes nothing from the unit but a role
+#: literal. `%i` may still appear in systemd's own sandbox directives — those are path
+#: grants systemd applies, not authority values the wrapper reads (ruling D-2).
+WRAPPER_COMMAND = (
+    "/usr/bin/python3.11 -I -S /usr/local/libexec/rquant-runtime-exec.pyz --role"
+)
+ARBITER_PREFIX = "/usr/local/libexec/rquant-workload-arbiter research -- "
+FORBIDDEN_EXECUTABLE = "/home/lighthouse/rquant/.venv/bin/python"
+RETIRED_MODULE = "rquant.runtime_service_main"
+TEMPLATE_ROLES = {
+    "reference-slow-source": "reference_slow_source",
+    "reference-slow-publisher": "reference_slow_publisher",
+    "auction-universe": "auction_universe_publisher",
+    "auction-match": "auction_match_source",
+    "market-minute": "market_minute_source",
+    "watchlist-quote": "watchlist_quote_source",
+    "feature": "feature_live",
+    "candidate": "candidate_publisher",
+    "strategy": "strategy_live",
+    "signal-router": "signal_router",
+    "notifier": "notifier",
+    "paper-constraint": "paper_constraint_publisher",
+    "paper-broker": "paper_broker",
+    "daily-close": "daily_close_source",
+    "runtime-health": "runtime_health_publisher",
+    "shadow": "shadow_session",
+    "lab-jobs": "lab_jobs_publisher",
+    "artifact-catalog": "lab_artifact_catalog",
+    "promotions": "promotions_publisher",
+    "serving": "serving_publisher",
+}
+#: Every unit this branch adds that a protected role covers, and the role it names.
+PROTECTED_UNIT_ROLES = {
+    **{f"rquant-runtime-{name}@.service": role for name, role in TEMPLATE_ROLES.items()},
+    "rquant-artifact-retention.service": "artifact_retention",
+    "rquant-runtime-daily-orchestrator@.service": "daily_pipeline_orchestrator",
+    "rquant-runtime-recovery@.service": "runtime_recovery",
+    "rquant-runtime-recovery-rehearsal@.service": "runtime_recovery_rehearsal",
+    "rquant-page-control.service": "page_control",
+}
 RETENTION_INSTANCE = "svc-248ba9b29fdc243fcd4f7d09641fbdedd61871ffeea693ea4eb26f36f264b349"
 REQUIRED_INACCESSIBLE_PATHS = {
     "lab-jobs": frozenset({"/etc/rquant/lab-claim-finalizer-runtime"}),
@@ -68,9 +106,9 @@ def test_artifact_retention_oneshot_and_timer_are_static_production_contracts() 
         "capabilities.json:/etc/credstore.encrypted/rquant-runtime/instances/"
         f"{RETENTION_INSTANCE}/current.cred"
     )
-    assert f"manifests/{RETENTION_INSTANCE}.json" in unit["ExecStart"]
-    assert "--expected-kind artifact_retention" in unit["ExecStart"]
-    assert "--once" in unit["ExecStart"]
+    assert unit["ExecStart"] == f"{ARBITER_PREFIX}{WRAPPER_COMMAND} artifact_retention"
+    assert f"manifests/{RETENTION_INSTANCE}.json" not in unit["ExecStart"]
+    assert "EnvironmentFile" not in unit
     assert set(unit["ReadWritePaths"].split()) == {
         f"{CONTROL_ROOT}/artifact-retention/{RETENTION_INSTANCE}",
         f"{RUNTIME_ROOT}/research/artifact-retention/{RETENTION_INSTANCE}",
@@ -95,8 +133,8 @@ def test_page_control_has_a_loopback_production_unit() -> None:
     service = parser["Service"]
     assert "APP_ENV=prod" in service["Environment"]
     assert "RQUANT_DISABLE_DOTENV=1" in service["Environment"]
-    assert service["EnvironmentFile"] == ENVIRONMENT_FILE
-    assert "rquant.page_control_service" in service["ExecStart"]
+    assert "EnvironmentFile" not in service
+    assert service["ExecStart"] == f"{WRAPPER_COMMAND} page_control"
     assert "RQUANT_PAGE_CONTROL_HOST=127.0.0.1" in service["Environment"]
     assert "RQUANT_PAGE_CONTROL_PORT=8767" in service["Environment"]
     assert service["Restart"] == "on-failure"
@@ -113,7 +151,7 @@ def test_daily_close_source_is_a_dedicated_least_privilege_live_unit() -> None:
     service = parser["Service"]
     assert service["Type"] == "simple"
     assert service["Slice"] == "rquant-live.slice"
-    assert "--expected-kind daily_close_source" in service["ExecStart"]
+    assert service["ExecStart"].endswith(f"{WRAPPER_COMMAND} daily_close_source")
     assert set(service["ReadWritePaths"].split()) == {
         f"{CONTROL_ROOT}/daily-close-sources/%i",
         f"{RUNTIME_ROOT}/live/daily-close",
@@ -132,7 +170,7 @@ def test_watchlist_quote_has_an_independent_least_privilege_live_unit() -> None:
     service = parser["Service"]
 
     assert service["Slice"] == "rquant-live.slice"
-    assert "--expected-kind watchlist_quote_source" in service["ExecStart"]
+    assert service["ExecStart"].endswith(f"{WRAPPER_COMMAND} watchlist_quote_source")
     assert "LoadCredentialEncrypted" not in service
     assert set(service["ReadWritePaths"].split()) == {
         f"{CONTROL_ROOT}/watchlist-quote-sources/%i",
@@ -155,7 +193,7 @@ def test_shadow_session_is_a_readonly_legacy_consumer_with_its_own_report_root()
     service = parser["Service"]
     assert service["Type"] == "simple"
     assert service["Slice"] == "rquant-research.slice"
-    assert "--expected-kind shadow_session" in service["ExecStart"]
+    assert service["ExecStart"].endswith(f"{WRAPPER_COMMAND} shadow_session")
     assert set(service["ReadWritePaths"].split()) == {
         f"{CONTROL_ROOT}/shadow-sessions/%i",
         f"{RUNTIME_ROOT}/research/shadow-reports",
@@ -183,8 +221,7 @@ def test_daily_orchestrator_is_an_unenabled_shadow_fan_in_oneshot() -> None:
     unit = service["Service"]
     assert unit["Type"] == "oneshot"
     assert unit["Slice"] == "rquant-research.slice"
-    assert "--expected-kind daily_pipeline_orchestrator" in unit["ExecStart"]
-    assert "--once" in unit["ExecStart"]
+    assert unit["ExecStart"].endswith(f"{WRAPPER_COMMAND} daily_pipeline_orchestrator")
     assert unit["Restart"] == "no"
     assert unit["NoNewPrivileges"] == "true"
     assert unit["PrivateTmp"] == "true"
@@ -326,9 +363,9 @@ def _is_readonly_path_covered(readonly: set[str], required: str) -> bool:
 
 
 @pytest.mark.parametrize("plane", TEMPLATES)
-def test_runtime_template_has_fixed_identity_entrypoint_and_manifest(
-    plane: str,
-) -> None:
+def test_runtime_template_runs_the_fixed_root_owned_wrapper(plane: str) -> None:
+    """Codex round-2 P1-3: no checkout interpreter, no mutable env file, no `%i` authority."""
+
     parser = _load(plane)
     unit = parser["Unit"]
     service = parser["Service"]
@@ -338,7 +375,7 @@ def test_runtime_template_has_fixed_identity_entrypoint_and_manifest(
     assert service["User"] == "lighthouse"
     assert service["Group"] == "lighthouse"
     assert service["WorkingDirectory"] == "/home/lighthouse/rquant"
-    assert service["EnvironmentFile"] == ENVIRONMENT_FILE
+    assert "EnvironmentFile" not in service
     assert service["Environment"] == "APP_ENV=prod RQUANT_DISABLE_DOTENV=1"
     expected_plane = (
         "live"
@@ -353,60 +390,61 @@ def test_runtime_template_has_fixed_identity_entrypoint_and_manifest(
 
     command = service["ExecStart"]
     if plane in DEDICATED_RESEARCH_TEMPLATES:
-        arbiter = "/usr/local/libexec/rquant-workload-arbiter research -- "
-        assert command.startswith(arbiter)
-        command = command.removeprefix(arbiter)
-    assert command.startswith(f"{EXPECTED_EXECUTABLE} -m {EXPECTED_MODULE} ")
-    assert f"--manifest {CURRENT_ROOT}/manifests/%i.json" in command
-    expected_control = {
-        "reference-slow-source": f"{CONTROL_ROOT}/reference-slow-sources/%i",
-        "reference-slow-publisher": f"{CONTROL_ROOT}/reference-slow-publishers/%i",
-        "auction-universe": f"{CONTROL_ROOT}/auction-universe-publishers/%i",
-        "auction-match": f"{CONTROL_ROOT}/auction-match-sources/%i",
-        "candidate": f"{CONTROL_ROOT}/candidates/%i",
-        "market-minute": f"{CONTROL_ROOT}/market-minute-sources/%i",
-        "watchlist-quote": f"{CONTROL_ROOT}/watchlist-quote-sources/%i",
-        "daily-close": f"{CONTROL_ROOT}/daily-close-sources/%i",
-        "shadow": f"{CONTROL_ROOT}/shadow-sessions/%i",
-        "feature": f"{CONTROL_ROOT}/features/%i",
-        "strategy": f"{CONTROL_ROOT}/strategies/%i",
-        "signal-router": f"{CONTROL_ROOT}/signal-routers/%i",
-        "notifier": f"{CONTROL_ROOT}/notifiers/%i",
-        "paper-constraint": f"{CONTROL_ROOT}/paper-constraints/%i",
-        "paper-broker": f"{CONTROL_ROOT}/paper-brokers/%i",
-        "runtime-health": f"{CONTROL_ROOT}/runtime-health-publishers/%i",
-        "lab-jobs": f"{CONTROL_ROOT}/lab-jobs-publishers/%i",
-        "artifact-catalog": f"{CONTROL_ROOT}/artifact-catalogs/%i",
-        "promotions": f"{CONTROL_ROOT}/promotions-publishers/%i",
-        "serving": f"{CONTROL_ROOT}/serving-publishers/%i",
-    }.get(plane, CONTROL_ROOT)
-    assert f"--control-root {expected_control}" in command
-    assert "--expected-commit ${RQUANT_RUNTIME_COMMIT}" in command
-    assert "--expected-generation ${RQUANT_RUNTIME_GENERATION}" in command
-    expected_kinds = {
-        "reference-slow-source": {"reference_slow_source"},
-        "reference-slow-publisher": {"reference_slow_publisher"},
-        "auction-universe": {"auction_universe_publisher"},
-        "auction-match": {"auction_match_source"},
-        "market-minute": {"market_minute_source"},
-        "watchlist-quote": {"watchlist_quote_source"},
-        "daily-close": {"daily_close_source"},
-        "shadow": {"shadow_session"},
-        "feature": {"feature_live"},
-        "serving": {"serving_publisher"},
-        "candidate": {"candidate_publisher"},
-        "strategy": {"strategy_live"},
-        "signal-router": {"signal_router"},
-        "notifier": {"notifier"},
-        "paper-constraint": {"paper_constraint_publisher"},
-        "paper-broker": {"paper_broker"},
-        "runtime-health": {"runtime_health_publisher"},
-        "lab-jobs": {"lab_jobs_publisher"},
-        "artifact-catalog": {"lab_artifact_catalog"},
-        "promotions": {"promotions_publisher"},
-    }.get(plane, set())
-    observed_kinds = {part.split()[0] for part in command.split("--expected-kind ")[1:]}
-    assert observed_kinds == expected_kinds
+        assert command.startswith(ARBITER_PREFIX)
+        command = command.removeprefix(ARBITER_PREFIX)
+    assert command == f"{WRAPPER_COMMAND} {TEMPLATE_ROLES[plane]}"
+
+
+@pytest.mark.parametrize("plane", TEMPLATES)
+def test_runtime_template_carries_no_retired_authority_input(plane: str) -> None:
+    """The three things P1-3 names, absent from the command line entirely."""
+
+    command = _load(plane)["Service"]["ExecStart"]
+
+    assert FORBIDDEN_EXECUTABLE not in command
+    assert RETIRED_MODULE not in command
+    assert CURRENT_ROOT not in command
+    assert "%i" not in command
+    assert "${" not in command
+    for retired in ("--manifest", "--control-root", "--expected-commit", "--expected-generation"):
+        assert retired not in command
+
+
+def test_every_protected_unit_names_a_wrapper_allowlisted_role() -> None:
+    """The unit's literal and the wrapper's frozen allowlist are the same closed set."""
+
+    from rquant.runtime_exec_wrapper._verify import PROTECTED_ROLES
+
+    for name, role in sorted(PROTECTED_UNIT_ROLES.items()):
+        parser = configparser.ConfigParser(interpolation=None, strict=True)
+        parser.optionxform = str
+        parser.read_string((SYSTEMD / name).read_text(encoding="utf-8"))
+        command = parser["Service"]["ExecStart"]
+
+        assert role in PROTECTED_ROLES, role
+        assert command.endswith(f"{WRAPPER_COMMAND} {role}"), name
+
+
+def test_no_new_unit_still_reads_the_application_written_runtime_environment() -> None:
+    """`data/runtime/current/runtime.env` is written by the application it configures."""
+
+    offenders = [
+        path.name
+        for path in sorted(SYSTEMD.glob("*.service"))
+        if "data/runtime/current/runtime.env" in path.read_text(encoding="utf-8")
+    ]
+
+    assert offenders == []
+
+
+def test_no_protected_unit_executes_a_checkout_interpreter() -> None:
+    offenders = [
+        name
+        for name in sorted(PROTECTED_UNIT_ROLES)
+        if FORBIDDEN_EXECUTABLE in (SYSTEMD / name).read_text(encoding="utf-8")
+    ]
+
+    assert offenders == []
 
 
 @pytest.mark.parametrize("plane", TEMPLATES)
@@ -497,21 +535,15 @@ def test_only_capability_live_instances_load_one_encrypted_systemd_credential() 
     promotions = _load("promotions")["Service"]
     serving = _load("serving")["Service"]
 
-    assert market_minute["EnvironmentFile"] == ENVIRONMENT_FILE
-    assert reference_slow_source["EnvironmentFile"] == ENVIRONMENT_FILE
     assert reference_slow_source["LoadCredentialEncrypted"] == (
         f"capabilities.json:{CREDENTIAL_FILE}"
     )
     assert reference_slow_publisher["LoadCredentialEncrypted"] == (
         f"capabilities.json:{CREDENTIAL_FILE}"
     )
-    assert auction_match["EnvironmentFile"] == ENVIRONMENT_FILE
     assert auction_match["LoadCredentialEncrypted"] == (f"capabilities.json:{CREDENTIAL_FILE}")
     assert market_minute["LoadCredentialEncrypted"] == (f"capabilities.json:{CREDENTIAL_FILE}")
     assert notifier["LoadCredentialEncrypted"] == f"capabilities.json:{CREDENTIAL_FILE}"
-    assert candidate["EnvironmentFile"] == ENVIRONMENT_FILE
-    assert strategy["EnvironmentFile"] == ENVIRONMENT_FILE
-    assert serving["EnvironmentFile"] == ENVIRONMENT_FILE
     for service in (
         auction_universe,
         watchlist_quote,
@@ -691,12 +723,12 @@ def test_recovery_oneshot_is_isolated_bounded_and_does_not_control_live(
         "-/var/lib/rquant/runtime-recovery/restores"
     )
     command = service["ExecStart"]
-    arbiter = "/usr/local/libexec/rquant-workload-arbiter research -- "
-    assert command.startswith(arbiter)
-    assert command.removeprefix(arbiter) == (
-        "/home/lighthouse/rquant/.venv/bin/rquant runtime-recovery-production "
-        f"{action} --runtime-root {RUNTIME_ROOT} --expected-profile-generation %i"
-    )
+    assert command.startswith(ARBITER_PREFIX)
+    # P1-3 / ruling D-2: the generation is no longer a `%i` argument the caller chooses.
+    # The wrapper reads it out of the root-owned `current.json` and refuses anything else.
+    role = "runtime_recovery" if action == "execute" else "runtime_recovery_rehearsal"
+    assert command.removeprefix(ARBITER_PREFIX) == f"{WRAPPER_COMMAND} {role}"
+    assert "--expected-profile-generation" not in command
     assert set(service["SuccessExitStatus"].split()) == {"0", "75"}
     for duplicated in (
         "--publication-root",
